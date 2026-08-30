@@ -36,10 +36,11 @@ impl TxDataPublisherHandle {
     }
 }
 
-/// Per-shard TxData subscriber. Yields `(TxDataLoc, TxEnvelope)` — the envelope
-/// paired with its publisher `session_id` + `BPosition`, so the sequencer can
-/// stamp `TxRef.tx_data_session_id` and the executor can key its join buffer on
-/// `(shard, session, position)` under concurrent ingress publishers.
+/// Per-shard TxData subscriber. Yields `(TxDataLoc, TxEnvelope)`: the
+/// envelope paired with its publisher `session_id` and `BPosition`, so the
+/// sequencer can stamp `TxRef.tx_data_session_id` and the executor can key
+/// its join buffer on `(shard, session, position)` under concurrent
+/// ingress publishers.
 pub struct TxDataSubscriberHandle {
     rx: UnboundedReceiver<(TxDataLoc, TxEnvelope)>,
 }

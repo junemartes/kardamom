@@ -9,7 +9,7 @@ import org.agrona.ExpandableArrayBuffer;
 
 /**
  * Ingress-envelope frame builders and offer-with-retry helpers shared by the
- * service tests. Frame layouts come from {@link SealerWire} — this class only
+ * service tests. Frame layouts come from {@link SealerWire}. This class only
  * assembles bytes; it never parses them.
  */
 final class IngressFrames {
@@ -25,18 +25,19 @@ final class IngressFrames {
         id[1] = (byte) ((n >>> 8) & 0xFF);
         id[2] = (byte) ((n >>> 16) & 0xFF);
         id[3] = (byte) ((n >>> 24) & 0xFF);
-        id[31] = (byte) 0x5A; // marker so an all-zero id (a likely bug) is distinguishable
+        id[31] = (byte) 0x5A; // Marker so an all-zero id, a likely bug, is easy to spot.
         return id;
     }
 
     /**
      * Offer one app envelope {@code kind(1) | sender(20) | nonce(8) |
-     * canonical_id(32) | payload} to the cluster. The sender is ZERO and the
-     * nonce 0, so the record is contiguity-guard-exempt (the TestCluster tests
-     * exercise failover/replay, not the guard); the payload is the 32-byte id
-     * itself (the service relays {@code [canonical_id|payload]} verbatim from
-     * {@link SealerWire#RELAY_OFFSET}). Retries on back-pressure with a yield
-     * (no sleep), so the offer is deterministic, not timing-based.
+     * canonical_id(32) | payload} to the cluster. The sender is zero and the
+     * nonce is 0, so the record is exempt from the contiguity guard. The
+     * TestCluster tests exercise failover and replay, not the guard. The
+     * payload is the 32-byte id itself; the service relays
+     * {@code [canonical_id|payload]} verbatim from
+     * {@link SealerWire#RELAY_OFFSET}. On back-pressure, the method retries
+     * with a yield, not a sleep, so the offer stays deterministic.
      */
     static void offerIngress(final AeronCluster client, final byte[] canonicalId32) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
@@ -61,9 +62,9 @@ final class IngressFrames {
     }
 
     /**
-     * Offer until accepted, treating CLOSED / MAX_POSITION_EXCEEDED as terminal.
-     * BACK_PRESSURED / ADMIN_ACTION / NOT_CONNECTED drain egress and retry with
-     * a yield — deterministic, not timing-based.
+     * Offer until accepted, treating CLOSED and MAX_POSITION_EXCEEDED as
+     * terminal. On BACK_PRESSURED, ADMIN_ACTION, or NOT_CONNECTED, drain
+     * egress and retry with a yield, so the offer stays deterministic.
      */
     static void offerFully(
             final AeronCluster client, final ExpandableArrayBuffer buf, final int length) {
@@ -98,8 +99,8 @@ final class IngressFrames {
     }
 
     /**
-     * A complete single-record ingress frame (batch-embeddable): guard header
-     * ({@code sender20}/{@code nonce}), a canonical id tagged with
+     * A complete single-record ingress frame that a batch can embed: a guard
+     * header ({@code sender20} and {@code nonce}), a canonical id tagged with
      * {@code idTag}, and a 1-byte payload.
      */
     static byte[] recordFrame(final int idTag, final byte[] sender20, final long nonce) {

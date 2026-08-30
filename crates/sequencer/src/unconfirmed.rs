@@ -1,41 +1,43 @@
-//! #85 publish-confirmation ledger.
+//! Publish-confirmation ledger.
 //!
-//! An `Accepted` offer only proves the bytes landed on the Aeron publication
-//! buffer, NOT that the Raft cluster committed them — a leader kill voids
-//! the dead-leader window and the uncommitted tail, and continuing from the
-//! optimistically advanced nonce state seals a canonical GAP. Every
-//! published ref is retained here until a receipt for its sender at/above
-//! its nonce proves canonical commitment (skip receipts count — ordering is
-//! the claim); entries older than `resync.confirm_timeout_ms` are rewound
-//! via `reinsert_for_retry` and re-published — the cluster dedup absorbs
-//! copies that DID commit, and voided ones get ordered.
+//! An `Accepted` offer only proves the bytes landed on the Aeron
+//! publication buffer. It does not prove the Raft cluster committed them.
+//! A leader kill voids the dead-leader window and the uncommitted tail.
+//! Continuing from the optimistically advanced nonce state would seal a
+//! canonical gap.
+//!
+//! Every published ref is retained here until a receipt for its sender, at
+//! or above its nonce, proves canonical commitment (skip receipts count:
+//! ordering is the claim). Entries older than `resync.confirm_timeout_ms`
+//! are rewound through `reinsert_for_retry` and republished. The cluster
+//! dedup absorbs copies that did commit, and voided ones get ordered.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 
-/// Key into the #85 publish-confirmation ledger.
+/// Key into the publish-confirmation ledger.
 pub(crate) type UnconfirmedKey = (Address, u64);
 
-/// Published-but-UNCONFIRMED refs (#85): see the module docs for why an
-/// accepted offer is not a commitment. Owned by the sequencer loop; all
-/// methods are single-threaded map/queue bookkeeping.
+/// Published-but-unconfirmed refs. See the module docs for why an
+/// accepted offer is not a commitment. The sequencer loop owns this; all
+/// methods are single-threaded map and queue bookkeeping.
 pub(crate) struct UnconfirmedLedger<T> {
-    /// (sender, nonce) → (ref metadata, published-at). BTreeMap so
-    /// per-sender ranges trim cheaply on confirmation and rewinds see
-    /// ascending nonce order.
+    /// Maps (sender, nonce) to (ref metadata, published-at). This is a
+    /// BTreeMap, so per-sender ranges trim cheaply on confirmation, and
+    /// rewinds see ascending nonce order.
     entries: BTreeMap<UnconfirmedKey, (T, Instant)>,
-    /// Publish-order expiry queue over `entries`, with LAZY deletion:
-    /// confirmations remove from the map only; a popped queue entry counts
-    /// as stale unless the map still holds the key WITH THE SAME
-    /// published-at instant (a key can be re-queued by a reject-path rewind
-    /// while its old queue entry is still buffered — timestamp equality
-    /// disambiguates). Front-peek makes the confirm-timeout sweep O(1) when
-    /// nothing has expired — the steady state — and amortized O(1) per
-    /// entry overall; the previous full-map scan was O(rate ×
-    /// receipt-latency) per iteration on the publish hot path, and worst
-    /// exactly when the system was already in failover recovery.
+    /// Publish-order expiry queue over `entries`, with lazy deletion. A
+    /// confirmation removes from the map only. A popped queue entry counts
+    /// as stale unless the map still holds the key with the same
+    /// published-at instant. (A reject-path rewind can re-queue a key
+    /// while its old queue entry is still buffered, so timestamp equality
+    /// tells the two apart.) Front-peek makes the confirm-timeout sweep
+    /// O(1) when nothing has expired, the steady state, and amortized O(1)
+    /// per entry overall. The old full-map scan was O(rate times
+    /// receipt-latency) per iteration on the publish hot path, and it was
+    /// worst exactly when the system was already in failover recovery.
     expiry: VecDeque<(Instant, UnconfirmedKey)>,
 }
 
@@ -60,11 +62,11 @@ impl<T> UnconfirmedLedger<T> {
         self.expiry.push_back((at, (sender, nonce)));
     }
 
-    /// A receipt at `confirmed` proves every one of OUR published refs for
-    /// that sender at nonce <= `confirmed` survived into the committed
-    /// canonical stream (per-sender order is preserved end to end) — drop
-    /// them from the ledger. Their expiry-queue slots are deleted lazily by
-    /// `sweep_expired`.
+    /// A receipt at `confirmed` proves that every one of this sequencer's
+    /// published refs for that sender, at a nonce at or below `confirmed`,
+    /// survived into the committed canonical stream (per-sender order is
+    /// preserved end to end). Drop them from the ledger. `sweep_expired`
+    /// lazily deletes their expiry-queue slots.
     pub(crate) fn confirm_through(&mut self, sender: Address, confirmed: u64) {
         let keys: Vec<_> = self
             .entries
@@ -76,24 +78,25 @@ impl<T> UnconfirmedLedger<T> {
         }
     }
 
-    /// #85 fix B, committed-proof case — a sealer contiguity reject with
-    /// nonce < expected: the ref sealed long ago (the guard's expected
-    /// advanced past it) and its dedup entry aged out of the window. Drop
-    /// the ledger entry exactly like a receipt confirmation. Without this,
-    /// an entry with no confirming receipt (a sender whose ONLY tx is
-    /// nonce 0: nonce-0 receipts are deposit-indistinguishable and never
-    /// confirm) republishes every confirm-timeout FOREVER once the dedup
-    /// horizon rolls past it (observed live: the smoke-gate accounts,
-    /// 128+ rejects/run). Returns whether the entry was present.
+    /// The committed-proof case: a sealer contiguity reject with a nonce
+    /// below expected. The ref sealed long ago (the guard's expected value
+    /// advanced past it), and its dedup entry aged out of the window. Drop
+    /// the ledger entry exactly like a receipt confirmation.
+    ///
+    /// Without this, an entry with no confirming receipt (a sender whose
+    /// only transaction is nonce 0: nonce-0 receipts cannot be told apart
+    /// from deposits, so they never confirm) would republish on every
+    /// confirm timeout forever, once the dedup horizon rolls past it.
+    /// Returns whether the entry was present.
     pub(crate) fn drop_committed(&mut self, sender: Address, nonce: u64) -> bool {
         self.entries.remove(&(sender, nonce)).is_some()
     }
 
-    /// Sealer contiguity gap: refs for `sender` at `expected..nonce-1`
-    /// vanished (voided offers). They are all in the ledger; take every
-    /// retained ref at nonce >= `expected` for immediate republish instead
-    /// of waiting out the confirm timeout. Returned in rewind-safe order
-    /// (see `take_descending`).
+    /// A sealer contiguity gap: refs for `sender` at `expected..nonce-1`
+    /// vanished (voided offers). They are all in the ledger. Take every
+    /// retained ref at a nonce at or above `expected`, for immediate
+    /// republish instead of waiting out the confirm timeout. Returns them
+    /// in rewind-safe order (see `take_descending`).
     pub(crate) fn take_gap_rewinds(
         &mut self,
         sender: Address,
@@ -107,20 +110,20 @@ impl<T> UnconfirmedLedger<T> {
         self.take_descending(keys)
     }
 
-    /// Take refs whose confirmation has not arrived within `timeout` — the
+    /// Take refs whose confirmation has not arrived within `timeout`. The
     /// offer may have landed in a dead leader's void. The caller rewinds
-    /// them via `reinsert_for_retry` so the next `drain_pending`
-    /// re-publishes them; the cluster's first-seen dedup absorbs every copy
-    /// that DID commit, and voided ones get ordered — no gap, no loss (this
-    /// also un-wedges a sender whose refs vanished entirely: the ledger
-    /// keeps re-offering until a receipt confirms). At most `max` per call,
-    /// bounding the sweep per loop iteration.
+    /// them through `reinsert_for_retry`, so the next `drain_pending`
+    /// republishes them. The cluster's first-seen dedup absorbs every copy
+    /// that did commit, and voided ones get ordered: no gap, no loss. This
+    /// also un-wedges a sender whose refs vanished entirely, since the
+    /// ledger keeps re-offering until a receipt confirms. Takes at most
+    /// `max` per call, to bound the sweep per loop iteration.
     ///
     /// Expiry-queue mechanics: O(1) front-peek when nothing has expired
     /// (the steady state), amortized O(1) per entry overall. Entries whose
-    /// map slot was confirmed away — or re-queued by a reject-path rewind
-    /// with a NEWER published-at — are stale and skipped (lazy deletion).
-    /// Returned in rewind-safe order (see `take_descending`).
+    /// map slot was confirmed away, or re-queued by a reject-path rewind
+    /// with a newer published-at, are stale and skipped (lazy deletion).
+    /// Returns them in rewind-safe order (see `take_descending`).
     pub(crate) fn sweep_expired(
         &mut self,
         timeout: Duration,
@@ -147,12 +150,12 @@ impl<T> UnconfirmedLedger<T> {
         self.take_descending(stale)
     }
 
-    /// Remove `keys` (ascending nonce per sender) from the map, returning
-    /// `(key, meta)` in DESCENDING nonce order: `reinsert_for_retry` sets
-    /// the sender's rewind floor on every call, so the LAST call per sender
-    /// must carry the LOWEST nonce (same discipline as `flush_drained`'s
-    /// backpressure rebuffer) — ascending order would strand the lower
-    /// nonces beneath the floor forever.
+    /// Remove `keys` (ascending nonce per sender) from the map. Returns
+    /// `(key, meta)` in descending nonce order. `reinsert_for_retry` sets
+    /// the sender's rewind floor on every call, so the last call per sender
+    /// must carry the lowest nonce (the same discipline as
+    /// `flush_drained`'s backpressure rebuffer). Ascending order would
+    /// strand the lower nonces beneath the floor forever.
     fn take_descending(&mut self, keys: Vec<UnconfirmedKey>) -> Vec<(UnconfirmedKey, T)> {
         keys.into_iter()
             .rev()
@@ -177,16 +180,16 @@ mod tests {
             l.record_published(a, n, n * 10);
         }
         assert_eq!(l.len(), 4);
-        // A receipt at nonce 2 confirms nonces 0..=2 (skip receipts count —
-        // ordering is the claim); nonce 3 stays unconfirmed.
+        // A receipt at nonce 2 confirms nonces 0..=2 (skip receipts count:
+        // ordering is the claim). Nonce 3 stays unconfirmed.
         l.confirm_through(a, 2);
         assert_eq!(l.len(), 1);
         // Everything past the timeout: only the unconfirmed entry rewinds.
         let expired = l.sweep_expired(Duration::ZERO, Instant::now(), 256);
         assert_eq!(expired, vec![((a, 3), 30)]);
         assert_eq!(l.len(), 0);
-        // Confirmed entries' queue slots were lazily deleted on the way — a
-        // second sweep finds nothing.
+        // Confirmed entries' queue slots were lazily deleted along the
+        // way. A second sweep finds nothing.
         assert!(
             l.sweep_expired(Duration::ZERO, Instant::now(), 256)
                 .is_empty()
@@ -217,10 +220,10 @@ mod tests {
             l.record_published(a, n, n);
         }
         l.record_published(other, 7, 99);
-        // Sealer expected nonce 6: everything at/above the gap start is
-        // taken; nonce 5 (below `expected`) and other senders stay.
+        // Sealer expected nonce 6. Everything at or above the gap start is
+        // taken. Nonce 5 (below `expected`) and other senders stay.
         let taken = l.take_gap_rewinds(a, 6);
-        // DESCENDING nonce order — the LAST entry carries the LOWEST nonce
+        // Descending nonce order: the last entry carries the lowest nonce,
         // so the caller's reinsert loop leaves the rewind floor there.
         assert_eq!(taken, vec![((a, 8), 8), ((a, 7), 7), ((a, 6), 6)]);
         assert_eq!(l.len(), 2);
@@ -241,9 +244,9 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(l.len(), 5);
-        // All entries past the timeout, but the per-call bound caps the
-        // sweep at `max` (oldest first off the queue); the remainder waits
-        // for the next iteration.
+        // All entries are past the timeout, but the per-call bound caps
+        // the sweep at `max` (oldest first off the queue). The remainder
+        // waits for the next iteration.
         let first = l.sweep_expired(Duration::ZERO, Instant::now(), 2);
         assert_eq!(first, vec![((a, 1), 1), ((a, 0), 0)]);
         let rest = l.sweep_expired(Duration::ZERO, Instant::now(), 256);
@@ -255,9 +258,10 @@ mod tests {
     fn requeued_key_yields_a_single_rewind() {
         let mut l = UnconfirmedLedger::new();
         let a = addr(1);
-        // A key can sit in the expiry queue twice (rewind + republish
-        // re-records it); lazy deletion must yield the live entry exactly
-        // once — the queue slot whose timestamp mismatches the map is stale.
+        // A key can sit in the expiry queue twice (a rewind and republish
+        // re-records it). Lazy deletion must yield the live entry exactly
+        // once: the queue slot whose timestamp does not match the map is
+        // stale.
         l.record_published(a, 0, 1);
         l.record_published(a, 0, 2);
         assert_eq!(l.len(), 1);

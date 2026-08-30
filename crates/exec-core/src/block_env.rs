@@ -1,15 +1,15 @@
-//! Build a deterministic revm `BlockEnv` / `CfgEnv` for a single executed tx.
+//! Build a deterministic revm `BlockEnv` and `CfgEnv` for one executed tx.
 //!
 //! Spec invariant I3: every field is a pure function of the canonical
-//! tx_ordering input. No wall clocks, no entropy.
+//! tx_ordering input. There is no wall clock and no entropy.
 //!
-//! Every parameter here is deliberate (W1b of
-//! `docs/agents/l1-client-suite-port-spec.md`): kardamom supports exactly one
-//! hardfork — the latest — pinned as [`SPEC_ID`], and nothing rides a silent
-//! revm default. `BlockEnv` is built as a full struct literal so a revm
-//! upgrade that adds a field is a compile error (a forced decision, not a
-//! silently-adopted default). `CfgEnv` is `#[non_exhaustive]`, so its
-//! effective values are pinned by the `cfg_pinning` tests below instead.
+//! Every parameter here is a deliberate choice (see W1b in
+//! `docs/agents/l1-client-suite-port-spec.md`). Kardamom supports exactly one
+//! hardfork, the latest, pinned as [`SPEC_ID`]. No field uses a silent revm
+//! default. `BlockEnv` uses a full struct literal, so a revm upgrade that
+//! adds a field causes a compile error, not a silent default. `CfgEnv` is
+//! `#[non_exhaustive]`, so the `cfg_pinning` tests pin its effective values
+//! instead.
 
 use alloy_primitives::{Address, B256, U256};
 use kardamom_types::BlockBoundaryStart;
@@ -19,33 +19,33 @@ use revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE;
 use revm::primitives::eip7825;
 use revm::primitives::hardfork::SpecId;
 
-/// The one hardfork kardamom executes. There is no fork schedule: the chain
+/// The one hardfork kardamom executes. There is no fork schedule. The chain
 /// is born at genesis on the latest mainnet fork and stays there. A fork
-/// upgrade is a single PR that bumps this constant plus the EEST fixture tag
+/// upgrade is a single PR that bumps this constant and the EEST fixture tag
 /// (and, per the fork-bump checklist in the spec, revisits `BlockEnv.slot_num`
-/// once EIP-7843/Amsterdam is the pin).
+/// once EIP-7843/Amsterdam becomes the pin).
 ///
-/// This must be assigned explicitly: `CfgEnv::default()` inherits revm's
-/// `SpecId::default()`, which tracks whatever fork upstream considers current
-/// — semantics would shift under a routine `cargo update` with no diff here.
+/// Assign this explicitly. `CfgEnv::default()` inherits revm's
+/// `SpecId::default()`, which tracks whatever fork upstream treats as
+/// current. Without this constant, semantics could shift on a routine
+/// `cargo update` with no diff here.
 ///
-/// Spec-surface note (zk guest builds — gap 1, CLOSED by revm 38): the
-/// 0x0A KZG point-evaluation precompile is registered UNCONDITIONALLY with
-/// a backend cascade — `c-kzg` (live builds, via feature unification) →
-/// `blst` → a pure-Rust arkworks fallback. The `no_std` guest build
-/// therefore carries 0x0A through arkworks (it has compiled through the
-/// riscv32 gate since the revm 38 upgrade); backend equivalence is revm's
-/// tested contract (shared c-kzg-4844 vectors), and the host side is
-/// EEST-attested. In-guest pairing cost is a 3c performance question, not
-/// a soundness one. (revm's own doc comment on `Precompiles::cancun` still
-/// claims c-kzg gating — stale; the registration code is unconditional.)
+/// Zk-guest note: the 0x0A KZG point-evaluation precompile is registered
+/// unconditionally, with a backend cascade of `c-kzg` (live builds), then
+/// `blst`, then a pure-Rust arkworks fallback. The `no_std` guest build uses
+/// the arkworks backend. Backend equivalence is part of revm's tested
+/// contract (shared c-kzg-4844 vectors), and the host side is EEST-attested.
+/// In-guest pairing cost is a performance question, not a soundness one.
+/// Revm's own doc comment on `Precompiles::cancun` still claims c-kzg
+/// gating; that comment is stale. The registration code is unconditional.
 pub const SPEC_ID: SpecId = SpecId::OSAKA;
 
-/// Fixed per-block gas limit (v0: no dynamic adjustment).
+/// Fixed per-block gas limit. Version 0 has no dynamic adjustment.
 pub const BLOCK_GAS_LIMIT: u64 = 30_000_000;
 
-/// Per-block execution context derived from the sealer's BlockBoundaryStart.
-/// Stable for every tx in the block; rebuilt at each boundary.
+/// Per-block execution context, built from the sealer's BlockBoundaryStart.
+/// It stays the same for every tx in the block, and is rebuilt at each
+/// boundary.
 #[derive(Debug, Clone, Copy)]
 pub struct ExecEnv {
     pub chain_id: u64,
@@ -63,65 +63,71 @@ impl ExecEnv {
     }
 
     pub fn block_env(&self) -> BlockEnv {
-        // Full struct literal on purpose — see the module doc. Do NOT add
-        // `..Default::default()` back: silent defaults are how we ended up
-        // with fees crediting `address(0)` and a Prague blob constant under
-        // an Osaka spec without anyone deciding either.
+        // This is a full struct literal on purpose. See the module doc.
+        // Do not add `..Default::default()` back. Silent defaults caused
+        // fees to credit `address(0)` and a Prague blob constant under an
+        // Osaka spec, with no one deciding either value.
         BlockEnv {
             number: U256::from(self.block_number),
-            // V0 fee sink: with `basefee = 0`, the full `gas_price × gas_used`
-            // of every tx is a priority fee paid to the beneficiary. Zero
-            // address = documented burn. Revisit if fees become real
-            // (fee-vault predeploy), not by flipping this silently.
+            // Version 0 fee sink. With `basefee = 0`, the full
+            // `gas_price * gas_used` of every tx is a priority fee paid to
+            // the beneficiary. The zero address means a documented burn.
+            // Revisit this with a fee-vault predeploy if fees become real.
+            // Do not change it silently.
             beneficiary: Address::ZERO,
             timestamp: U256::from(self.l2_timestamp),
             gas_limit: BLOCK_GAS_LIMIT,
             basefee: 0,
-            // Unused post-merge: DIFFICULTY (0x44) resolves to `prevrandao`.
+            // Unused after the merge. DIFFICULTY (0x44) resolves to
+            // `prevrandao`.
             difficulty: U256::ZERO,
-            // V0 choice: prevrandao = zero. Deterministic and trivially
-            // documented; a per-block hash chain is a v1 follow-up.
+            // Version 0 choice: `prevrandao` is zero. This is deterministic
+            // and simple to document. A per-block hash chain is a
+            // version-1 follow-up.
             prevrandao: Some(B256::ZERO),
-            // Kardamom carries no blob transactions (type-3 is rejected at
-            // ingress and `max_blobs_per_tx = 0` in `cfg_env`), so this only
-            // feeds the BLOBBASEFEE opcode: excess 0 ⇒ blob gasprice 1 for
-            // ANY update fraction, making the Prague constant inert — but it
-            // is written out so a future blob decision starts from an
-            // explicit value, not a revm default.
+            // Kardamom carries no blob transactions. Ingress rejects type-3
+            // txs, and `cfg_env` sets `max_blobs_per_tx = 0`. So this field
+            // only feeds the BLOBBASEFEE opcode: an excess of 0 gives a
+            // blob gas price of 1 for any update fraction, so the Prague
+            // constant has no effect. It is written out anyway, so a
+            // future blob decision starts from an explicit value, not a
+            // revm default.
             blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new(
                 0,
                 BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE,
             )),
-            // EIP-7843 (Amsterdam) slot number — inert at the Osaka pin.
-            // Fork-bump checklist item: derive deliberately when Amsterdam
-            // becomes `SPEC_ID`.
+            // EIP-7843 (Amsterdam) slot number. It has no effect at the
+            // Osaka pin. Fork-bump checklist: derive this value on purpose
+            // when Amsterdam becomes `SPEC_ID`.
             slot_num: 0,
         }
     }
 
-    /// CfgEnv is `#[non_exhaustive]`; field-by-field assignment is required.
-    /// The effective values — including the spec-derived ones we deliberately
-    /// leave as `None` (code-size limits) — are pinned by `cfg_pinning`.
+    /// `CfgEnv` is `#[non_exhaustive]`, so this assigns fields one by one.
+    /// The `cfg_pinning` tests pin the effective values, including the
+    /// spec-derived ones this code deliberately leaves as `None` (code-size
+    /// limits).
     pub fn cfg_env(&self) -> CfgEnv {
-        // `new_with_spec`, NOT `default()` + `c.spec = …`: the per-opcode gas
-        // table is built from the spec at construction and is NOT rebuilt on
-        // a later `spec` assignment. With assign-after-default, a revm bump
-        // that moves the default spec would leave us executing OSAKA rules
-        // over the *new* default's gas table. `cfg_pinning` asserts the
-        // table matches `GasParams::new_spec(SPEC_ID)`.
+        // Use `new_with_spec`, not `default()` plus `c.spec = ...`. Revm
+        // builds the per-opcode gas table from the spec at construction, and
+        // does not rebuild it on a later `spec` assignment. Assign-after-
+        // default would let a revm bump move the default spec, and this
+        // code would then run OSAKA rules over the new default's gas
+        // table. `cfg_pinning` checks that the table matches
+        // `GasParams::new_spec(SPEC_ID)`.
         let mut c = CfgEnv::new_with_spec(SPEC_ID);
         c.chain_id = self.chain_id;
-        // EIP-7825: revm has enforced this cap since the Osaka default
-        // (`None` ⇒ spec default) — adopt it explicitly. The ingress rejects
-        // over-cap submissions early with a clear error; a tx that reaches
-        // the canonical stream anyway becomes a deterministic invalid-skip.
+        // EIP-7825: revm enforces this cap by default since Osaka (`None`
+        // means the spec default). Set it explicitly here. Ingress rejects
+        // over-cap submissions early, with a clear error. A tx that still
+        // reaches the canonical stream becomes a deterministic invalid-skip.
         c.tx_gas_limit_cap = Some(eip7825::TX_GAS_LIMIT_CAP);
-        // No blob transactions on kardamom: with `None` revm SKIPS the
-        // max-blob check entirely; `Some(0)` makes any type-3 tx that slips
+        // Kardamom has no blob transactions. With `None`, revm skips the
+        // max-blob check entirely. `Some(0)` makes any type-3 tx that slips
         // past ingress deterministically invalid.
         c.max_blobs_per_tx = Some(0);
-        // Reachable only through BLOBBASEFEE given the two settings above —
-        // see the `blob_excess_gas_and_price` comment in `block_env`.
+        // Reachable only through BLOBBASEFEE, given the two settings above.
+        // See the `blob_excess_gas_and_price` comment in `block_env`.
         c.blob_base_fee_update_fraction = Some(BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE);
         c
     }

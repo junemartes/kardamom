@@ -1,5 +1,5 @@
-//! Per-IP token-bucket rate limit. Runs before any expensive work so abusive
-//! clients are rejected at near-zero CPU cost.
+//! Per-IP token-bucket rate limit. It runs before any costly work, so
+//! abusive clients get rejected at near-zero CPU cost.
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -25,7 +25,8 @@ impl std::fmt::Display for RateLimited {
 
 impl std::error::Error for RateLimited {}
 
-/// Per-IP `governor` token bucket. New IPs get a fresh limiter on first hit.
+/// Per-IP `governor` token bucket. A new IP gets a fresh limiter on its first
+/// call.
 pub struct PerIpLimiter {
     quota: Quota,
     buckets: Arc<DashMap<IpAddr, Arc<DirectLimiter>>>,
@@ -64,7 +65,7 @@ mod tests {
         assert!(lim.check(ip).is_ok());
         assert!(lim.check(ip).is_ok());
         assert!(lim.check(ip).is_ok());
-        // Fourth in the same tick exceeds burst of 3.
+        // The fourth call in the same tick goes over the burst of 3.
         assert!(lim.check(ip).is_err());
     }
 

@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 # =============================================================================
-# local-cluster.sh — run the container cluster-e2e LOCALLY on Docker Desktop.
+# local-cluster.sh — runs the container cluster-e2e suite locally on Docker Desktop.
 # =============================================================================
 #
-# Dev-machine analogue of .github/workflows/cluster-e2e.yml. The workflow runs
-# `cargo build --release` + ci-cluster.sh directly on a GitHub ubuntu-24.04
-# runner; this script reproduces that on a laptop where the only Linux "host" is
+# This script is the dev-machine analogue of
+# .github/workflows/cluster-e2e.yml. That workflow runs `cargo build
+# --release` and ci-cluster.sh directly on a GitHub ubuntu-24.04 runner.
+# This script reproduces that on a laptop, where the only Linux "host" is
 # the Docker Desktop VM:
 #
-#   1. Builds the service binaries in a REPRODUCIBLE builder image
-#      (docker/local-build.Dockerfile) that captures the build deps the runner
-#      image provides implicitly (cmake>=3.30, libclang, rustfmt, a JDK), and
-#      stages them under target/release exactly where ci-cluster.sh expects.
-#   2. Builds a runner-surrogate "orchestrator" (docker/orchestrator.Dockerfile)
-#      with the docker CLI + ansible + nomad.
-#   3. Ensures the Docker daemon trusts the in-cluster registry (plain HTTP).
-#   4. Runs the UNMODIFIED ci-cluster.sh from the orchestrator (sharing the VM's
-#      network namespace + docker socket, so node containers are siblings on the
-#      VM daemon — the topology ci-cluster.sh assumes on a runner).
+#   1. Builds the service binaries in a reproducible builder image
+#      (docker/local-build.Dockerfile). This image provides the build
+#      dependencies the runner image gives implicitly (cmake 3.30 or
+#      later, libclang, rustfmt, a JDK). The script stages the binaries
+#      under target/release, where ci-cluster.sh expects them.
+#   2. Builds a runner-surrogate "orchestrator" image
+#      (docker/orchestrator.Dockerfile), with the docker CLI, ansible, and
+#      nomad.
+#   3. Makes sure the Docker daemon trusts the in-cluster registry (plain
+#      HTTP).
+#   4. Runs the unmodified ci-cluster.sh from the orchestrator. It shares
+#      the VM's network namespace and docker socket, so node containers
+#      are siblings on the VM daemon. This matches the topology
+#      ci-cluster.sh assumes on a runner.
 #
 # Usage:
 #   deploy/cluster/scripts/local-cluster.sh            # build + bring up
@@ -25,9 +30,10 @@
 #   deploy/cluster/scripts/local-cluster.sh build      # only build binaries + images
 #   deploy/cluster/scripts/local-cluster.sh up         # only run ci-cluster.sh
 #
-# NOTE: the orchestrator ships foundry `cast`, so smoke.sh uses its preferred
-# signed-tx Path A (like CI). Run with KEEP=1 and inspect the cluster (or
-# `docker exec kardamom-orch ...`) for the multi-host Aeron work.
+# The orchestrator ships foundry `cast`, so smoke.sh uses its preferred
+# signed-tx path (Path A), the same path CI uses. To inspect the cluster
+# for the multi-host Aeron work, run with KEEP=1, or use `docker exec
+# kardamom-orch ...`.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,8 +50,9 @@ build_binaries() {
   docker volume create kardamom-ltarget >/dev/null
   docker volume create kardamom-cargo-registry >/dev/null
   log "building service binaries in the builder (host arch)"
-  # Mount the registry cache at a SUB-path so it doesn't shadow the image's
-  # toolchain at /root/.cargo/bin; persist build outputs via CARGO_TARGET_DIR.
+  # Mount the registry cache at a sub-path, so it does not shadow the
+  # image's toolchain at /root/.cargo/bin. Save build outputs through
+  # CARGO_TARGET_DIR.
   docker run --rm \
     -v "${ROOT}:/work" \
     -v kardamom-cargo-registry:/root/.cargo/registry \
@@ -57,11 +64,13 @@ build_binaries() {
         -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
         -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
         --bins
-      # The sustained-load + chaos harness ci-cluster.sh runs from target/release.
+      # ci-cluster.sh runs the sustained-load and chaos harness from
+      # target/release.
       cargo build --release -p kardamom-bench --bin kardamom-load
-      # Stage exactly where ci-cluster.sh looks: the binaries in target/release,
-      # and libaeron*.so under a build/*/out/build/lib path it greps for.
-      # (kardamom-recorder removed — durability is archive-at-the-sealer.)
+      # Stage files exactly where ci-cluster.sh looks: binaries in
+      # target/release, and libaeron*.so under a build/*/out/build/lib
+      # path it greps for. kardamom-recorder is removed; durability now
+      # happens at the sealer archive.
       mkdir -p /work/target/release/build/aeronstage/out/build/lib
       for b in ingress sequencer executor validator da-watcher batcher; do
         cp -f "/ltarget/release/kardamom-$b" /work/target/release/
@@ -80,13 +89,15 @@ build_orchestrator() {
 }
 
 ensure_registry_trusted() {
-  # Informational only — never fatal. ci-cluster.sh pushes via REGISTRY_PUSH_NODE
-  # (engine-to-engine: `docker save | docker exec control-0 docker load`, then the
-  # push runs INSIDE control-0 against its own registry). The host/VM docker daemon
-  # never sends registry traffic, so its insecure-registry trust is irrelevant here
-  # — only the in-node dockers need it, and Ansible configures those. (The old hard
-  # gate was also racy: a transient `docker info` hiccup during a Docker Desktop
-  # restart aborted the whole run before it began.)
+  # This check is informational only, and never fails the build.
+  # ci-cluster.sh pushes through REGISTRY_PUSH_NODE: it saves the image and
+  # loads it engine-to-engine (`docker save | docker exec control-0 docker
+  # load`), then pushes from inside control-0 against its own registry.
+  # The host/VM docker daemon never sends registry traffic, so its
+  # insecure-registry trust does not matter here. Only the in-node dockers
+  # need that trust, and Ansible configures those. An earlier hard gate
+  # here was also racy: a transient `docker info` hiccup during a Docker
+  # Desktop restart aborted the whole run before it started.
   if docker info 2>/dev/null | grep -q "${REGISTRY_CIDR}"; then
     log "host daemon trusts insecure registry ${REGISTRY_CIDR} (not required for the in-node push)"
   else
@@ -104,12 +115,14 @@ run_cluster() {
     -v "${ROOT}:/work" \
     kardamom-orchestrator:latest >/dev/null
   log "running ci-cluster.sh inside orchestrator (KEEP=${KEEP:-0})"
-  # REGISTRY_PUSH_NODE makes ci-cluster.sh's push_image() side-step Docker
-  # Desktop's HTTP proxy (which can't reach the VM-internal registry IP and would
-  # otherwise hang the push): the image is loaded engine-to-engine into cp1's inner
-  # docker and pushed from there, co-located with the registry. No-op on CI.
-  # Forward the load/chaos tuning knobs (each `-e VAR` passes the current value
-  # if set, else is a no-op) so a dev can dial the local run down/up.
+  # REGISTRY_PUSH_NODE makes ci-cluster.sh's push_image() skip Docker
+  # Desktop's HTTP proxy. That proxy cannot reach the VM-internal registry
+  # IP, and would otherwise hang the push. Instead, the image loads
+  # engine-to-engine into cp1's inner docker, and the push runs from
+  # there, next to the registry. This setting is a no-op on CI.
+  # Forward the load and chaos tuning knobs. Each `-e VAR` passes the
+  # current value if set, or is a no-op otherwise. This lets a developer
+  # adjust the local run.
   docker exec -e KEEP="${KEEP:-0}" -e REGISTRY_PUSH_NODE=control-0 \
     -e LOAD_DURATION_S -e LOAD_TARGET_TPS -e LOAD_SENDERS -e LOAD_MAX_GAP \
     -e CHAOS_TPS -e CHAOS_CASE_S -e CHAOS_CASES \

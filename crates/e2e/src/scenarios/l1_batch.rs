@@ -1,14 +1,15 @@
-//! l1-batch (#39): the live batcher's L2 → L1 round trip.
+//! l1-batch: the live batcher's L2 to L1 round trip.
 //!
-//! Asserts, against the in-cluster anvil L1, that the batcher service is
-//! actually settling the chain: `lastBatchIndex` advances while we watch
-//! (live posting, not a stale backlog), the `BatchPosted` history is dense —
-//! batch indices 1..N, block ranges contiguous from block 1 with no gap and
-//! no overlap (the exact precondition `kardamom-reconstruct`'s concatenating
-//! decoder relies on) — and L1 coverage tracks the executor's head. Root
-//! parity of the reconstructed state is the chain-semantics-e2e drill's job
-//! (`s8_da_parity_batcher_matches_validator`); this case pins the service
-//! wiring in the cluster.
+//! Checks, against the in-cluster anvil L1, that the batcher service is
+//! actually settling the chain. `lastBatchIndex` advances while the test
+//! watches it (live posting, not a stale backlog). The `BatchPosted`
+//! history is dense: batch indices run 1..N, and block ranges are
+//! contiguous from block 1, with no gap and no overlap (the exact
+//! precondition that `kardamom-reconstruct`'s concatenating decoder needs).
+//! L1 coverage also tracks the executor's head. Root parity of the
+//! reconstructed state is the job of the chain-semantics-e2e drill
+//! (`s8_da_parity_batcher_matches_validator`). This case only checks the
+//! service wiring in the cluster.
 
 use std::time::Duration;
 
@@ -21,9 +22,9 @@ use kardamom_batcher::settlement::IKardamomL2Settlement;
 use super::Target;
 use crate::harness::metrics::poll_until;
 
-/// How far (in L2 blocks) L1 coverage may trail the executor's head. The
-/// batcher groups 5 blocks per batch with a 3 s flush, so steady-state lag is
-/// a handful of blocks; 60 tolerates a slow L1 round trip under CI load.
+/// How far, in L2 blocks, L1 coverage may trail the executor's head. The
+/// batcher groups 5 blocks per batch with a 3 s flush. So the normal lag is
+/// a few blocks. A value of 60 tolerates a slow L1 round trip under CI load.
 const COVERAGE_SLACK_BLOCKS: f64 = 60.0;
 
 pub async fn l1_batch(t: &Target, l1_rpc: &str, settlement: Address) -> Result<()> {
@@ -33,8 +34,9 @@ pub async fn l1_batch(t: &Target, l1_rpc: &str, settlement: Address) -> Result<(
         .with_context(|| format!("connect L1 RPC {l1_rpc}"))?;
     let contract = IKardamomL2Settlement::new(settlement, &provider);
 
-    // 1. Live posting: the CAS counter must advance by ≥2 while we watch —
-    //    one advance could be a lone startup post; two proves a loop.
+    // 1. Live posting: the CAS counter must advance by 2 or more while the
+    //    test watches it. One advance could be a lone startup post; two
+    //    advances prove a loop.
     let start = contract
         .lastBatchIndex()
         .call()

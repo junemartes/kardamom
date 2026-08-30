@@ -25,22 +25,22 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 /**
- * Snapshot I/O regression tests against a REAL embedded media driver.
+ * Snapshot I/O regression tests against a real embedded media driver.
  *
  * <ul>
- *   <li><b>F12.1</b> — a realistic snapshot (dedup window ≫ MTU) arrives as
- *       many fragments; {@code readSnapshot} must reassemble ALL of them, not
- *       truncate at the first.</li>
- *   <li><b>F12.2</b> — an empty snapshot image must be FATAL, never a silent
+ *   <li>A realistic snapshot, with a dedup window much larger
+ *       than the MTU, arrives as many fragments. {@code readSnapshot} must
+ *       reassemble all of them, not stop at the first.</li>
+ *   <li>An empty snapshot image must be fatal, never a silent
  *       restart at genesis.</li>
- *   <li><b>F07.1</b> — a member restored from snapshot must answer a
- *       pre-snapshot replay request with REPLAY_UNAVAILABLE (its retention is
- *       not snapshotted), not a bogus REPLAY_DONE.</li>
+ *   <li>A member restored from a snapshot must answer a
+ *       pre-snapshot replay request with REPLAY_UNAVAILABLE, because its
+ *       retention is not snapshotted, not with a false REPLAY_DONE.</li>
  * </ul>
  *
- * <p>The channel pins {@code mtu=4096} so fragmentation is guaranteed
- * regardless of driver defaults; {@code term-length=1m} keeps the whole
- * snapshot inside the publication window so the writes need no concurrent
+ * <p>The channel pins {@code mtu=4096}, so fragmentation always happens,
+ * regardless of driver defaults. {@code term-length=1m} keeps the whole
+ * snapshot inside the publication window, so the writes need no concurrent
  * drain.</p>
  */
 @Timeout(value = 60, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
@@ -68,8 +68,9 @@ class SnapshotRestoreTest {
 
     @Test
     void snapshotLargerThanMtuRoundTrips() {
-        // 5000 ids ⇒ a ~160KB snapshot: ~40 fragments at mtu=4096, and TWO
-        // messages through writeSnapshot (maxMessageLength = term/8 = 128KB).
+        // 5000 ids make a snapshot of about 160KB: about 40 fragments at
+        // mtu=4096, and two messages through writeSnapshot
+        // (maxMessageLength = term/8 = 128KB).
         final CanonicalSealerState original = new CanonicalSealerState(8192);
         for (int i = 0; i < 5000; i++) {
             original.onRecord(canonicalId(i), new byte[0]);
@@ -86,7 +87,7 @@ class SnapshotRestoreTest {
         assertEquals(original.canonicalCount(), restored.canonicalCount());
         assertEquals(original.blockNumber(), restored.blockNumber());
         assertEquals(original.dedupSize(), restored.dedupSize());
-        // Behavioural check: a snapshotted id still dedups, a fresh one relays.
+        // Behavior check: a snapshotted id still dedups; a fresh id relays.
         assertFalse(restored.firstSeen(canonicalId(4999)), "snapshotted id must still dedup");
         assertTrue(restored.firstSeen(canonicalId(5001)), "unseen id must be fresh");
     }
@@ -96,7 +97,7 @@ class SnapshotRestoreTest {
         try (Subscription sub = aeron.addSubscription(CHANNEL, 1002);
              ExclusivePublication pub = aeron.addExclusivePublication(CHANNEL, 1002)) {
             final Image image = awaitImage(sub, pub);
-            pub.close(); // end-of-stream with ZERO bytes written
+            pub.close(); // End-of-stream with zero bytes written.
             final IllegalStateException e =
                     assertThrows(IllegalStateException.class, () -> SnapshotIo.readSnapshot(image, IDLE));
             assertTrue(e.getMessage().contains("empty"), "must name the empty image: " + e.getMessage());
@@ -126,8 +127,8 @@ class SnapshotRestoreTest {
             final SealerClusteredService service = new SealerClusteredService(64, 250, 0);
             service.onStart(cluster, image);
 
-            // A cursor anywhere before the restore point must be REFUSED —
-            // the retained deque is empty, so a DONE here would be a silent gap.
+            // A cursor before the restore point must be refused: the retained
+            // deque is empty, so a DONE here would hide a gap.
             final StubSession behind = cluster.addSession(7);
             service.onSessionMessage(behind, 0, IngressFrames.replayRequest(0, 1), 0, 17, null);
             assertEquals(1, behind.offered.size(), "exactly one control frame");
@@ -136,9 +137,9 @@ class SnapshotRestoreTest {
             assertEquals(count, longAt(behind.offered.get(0), 1), "floor index = restored canonicalCount");
             assertEquals(block, longAt(behind.offered.get(0), 9), "floor block = restored blockNumber");
 
-            // A client already AT the restore point needs nothing replayed:
-            // that request is honestly complete (DONE), proving the floors are
-            // exact rather than merely conservative.
+            // A client already at the restore point needs nothing replayed.
+            // That request completes with DONE, which proves the floors are
+            // exact, not just conservative.
             final StubSession caughtUp = cluster.addSession(8);
             service.onSessionMessage(caughtUp, 0, IngressFrames.replayRequest(count, block), 0, 17, null);
             assertEquals(1, caughtUp.offered.size(), "exactly one control frame");
@@ -147,7 +148,7 @@ class SnapshotRestoreTest {
         }
     }
 
-    // --- harness -----------------------------------------------------------
+    // Harness helpers.
 
     /** Write {@code snapshot} on a fresh stream, close the pub, read it back. */
     private byte[] writeAndRead(final byte[] snapshot, final int streamId) {

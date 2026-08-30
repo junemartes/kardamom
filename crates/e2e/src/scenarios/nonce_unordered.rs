@@ -1,12 +1,12 @@
-//! S3 — `nonces_unordered_all_land`.
+//! `nonces_unordered_all_land`.
 //!
-//! K senders × N nonces each, submitted over real JSON-RPC in a per-sender
-//! shuffled order, all in flight concurrently. The chain must accept every
-//! one of them: the sequencer's per-sender reorder buffer absorbs arbitrary
-//! disorder within its window, the pipeline executes each sender densely
-//! ascending from 0, and no health counter (past-nonce drops, buffer
-//! evictions) moves. Every existing nonce-order test feeds the sequencer
-//! in-process; this is the same guarantee observed through
+//! K senders each submit N nonces over real JSON-RPC, in a shuffled order
+//! per sender, all in flight at the same time. The chain must accept every
+//! transaction: the sequencer's per-sender reorder buffer absorbs any
+//! disorder within its window, the pipeline executes each sender in dense
+//! ascending order from 0, and no health counter moves (no past-nonce
+//! drops, no buffer evictions). Every other nonce-order test feeds the
+//! sequencer in-process. This test proves the same guarantee through
 //! `eth_sendRawTransaction`.
 
 use std::time::Duration;
@@ -20,8 +20,8 @@ use crate::harness::l2::{self, SignedTransfer};
 pub struct Params {
     pub senders: usize,
     pub txs_per_sender: usize,
-    /// First dev-mnemonic account index to use (senders occupy
-    /// `sender_base..sender_base+senders`).
+    /// First dev-mnemonic account index to use. Senders occupy the range
+    /// `sender_base..sender_base+senders`.
     pub sender_base: usize,
     pub shuffle_seed: u64,
 }
@@ -46,8 +46,8 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         .await
         .unwrap_or(0.0);
 
-    // Sign per-sender dense nonce runs, then shuffle each run independently
-    // (seed offset per sender so orderings differ).
+    // Sign a dense nonce run for each sender, then shuffle each run on its
+    // own (a per-sender seed offset makes the orders differ).
     let mut planned: Vec<SignedTransfer> = Vec::with_capacity(p.senders * p.txs_per_sender);
     for (i, signer) in signers[p.sender_base..].iter().enumerate() {
         let mut run: Vec<SignedTransfer> = (0..p.txs_per_sender)
@@ -57,9 +57,9 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         planned.extend(run);
     }
 
-    // Fire everything concurrently. Each submit parks server-side until its
-    // receipt lands, so the whole batch resolves only when every sender's
-    // run has been reassembled and executed.
+    // Send everything at the same time. Each submit call waits on the
+    // server until its receipt lands. So the whole batch finishes only
+    // after the pipeline reassembles and executes every sender's run.
     let mut set = tokio::task::JoinSet::new();
     for tx in planned {
         let rpc = t.rpc.clone();
@@ -92,8 +92,8 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
     }
     anyhow::ensure!(landed == total, "landed {landed}/{total}");
 
-    // Executor applied exactly the batch (bounded wait for the counter to
-    // catch up with the last acks).
+    // The executor applied exactly the batch. Wait, with a time limit, for
+    // the counter to catch up with the last acks.
     t.wait_executor_applied(applied_before + total as f64, Duration::from_secs(30))
         .await?;
     let applied_after = t.executor_metric(super::EXEC_TX_APPLIED).await?;
@@ -103,11 +103,12 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         applied_before
     );
 
-    // No past-nonce drops, no reorder-buffer sheds: disorder was absorbed,
-    // not worked around.
+    // No past-nonce drops and no reorder-buffer sheds: the pipeline
+    // absorbed the disorder, it did not work around it.
     baseline.assert_flat(t, "unordered batch").await?;
 
-    // Receipts are individually queryable (spot-check one per sender).
+    // Each receipt is queryable on its own. Spot-check one receipt per
+    // sender.
     for i in 0..p.senders {
         let signer = &signers[p.sender_base + i];
         let probe = l2::sign_transfer(signer, t.chain_id, 0, to, 1)?;

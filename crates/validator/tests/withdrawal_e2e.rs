@@ -1,19 +1,21 @@
-//! Cross-language tests of the permissioned withdrawal flow against anvil:
-//! the Rust attester + withdrawals tree (`kardamom_types::withdrawals`) +
-//! `kardamom-deployer` interoperating with the real Solidity contracts.
+//! Cross-language tests of the permissioned withdrawal flow against
+//! anvil: the Rust attester and withdrawals tree
+//! (`kardamom_types::withdrawals`), and `kardamom-deployer` working with
+//! the real Solidity contracts.
 //!
 //! [`attester_posts_output_matching_rust_root`] (always runs) covers the
-//! deterministic interop: deploy oracle + lockbox through the factory (with the
-//! oracle address *predicted* and wired into the lockbox init in one atomic
-//! batch), fund the lockbox, have the attester post an output, and assert the
-//! on-chain output root equals the one computed in Rust.
+//! deterministic interop: deploy the oracle and lockbox through the
+//! factory, with the oracle address predicted and wired into the lockbox
+//! init in one atomic batch. Fund the lockbox, have the attester post an
+//! output, and check that the on-chain output root equals the one
+//! computed in Rust.
 //!
-//! [`full_withdrawal_finalize_and_challenge`] (`#[ignore]`) walks the full
-//! finalize + challenge round-trip. It is ignored because the post-time-warp
-//! `finalizeWithdrawal` confirmation is subject to an alloy/anvil receipt-watcher
-//! timing flake (the same class of flake the deployer's `multi_l2` e2e is ignored
-//! for); the L1 protocol itself is covered deterministically by the Foundry
-//! `WithdrawalFlow.t.sol` end-to-end test. Run locally with `--ignored`.
+//! [`full_withdrawal_finalize_and_challenge`] (`#[ignore]`) walks the
+//! full finalize and challenge round trip. It is ignored because the
+//! post-time-warp `finalizeWithdrawal` confirmation hits an alloy/anvil
+//! receipt-watcher timing flake. The L1 protocol itself is covered
+//! deterministically by the Foundry `WithdrawalFlow.t.sol` end-to-end
+//! test. Run this test locally with `--ignored`.
 //!
 //! All tests skip gracefully if anvil is unavailable.
 
@@ -72,17 +74,17 @@ fn wallet_provider(anvil: &alloy_node_bindings::AnvilInstance, key: &str) -> imp
     let p = ProviderBuilder::new()
         .wallet(signer)
         .connect_http(anvil.endpoint_url());
-    // alloy's default HTTP poll interval is slow; tighten it so `get_receipt`
-    // returns promptly against the local node.
+    // alloy's default HTTP poll interval is slow. Tighten it, so
+    // `get_receipt` returns promptly against the local node.
     p.client()
         .set_poll_interval(std::time::Duration::from_millis(50));
     p
 }
 
-/// Spawn anvil (interval mining so the receipt watcher always sees fresh
-/// blocks), deploy the factory + oracle + lockbox, and return the anvil handle
-/// (kept alive by the caller) plus the deployed oracle/lockbox addresses.
-/// Returns `None` if anvil is unavailable.
+/// Spawn anvil, with interval mining so the receipt watcher always sees
+/// fresh blocks. Deploy the factory, oracle, and lockbox, and return the
+/// anvil handle (kept alive by the caller) plus the deployed oracle and
+/// lockbox addresses. Returns `None` if anvil is unavailable.
 async fn setup() -> Option<(alloy_node_bindings::AnvilInstance, Address, Address)> {
     let anvil = alloy_node_bindings::Anvil::new()
         .block_time(1)
@@ -116,8 +118,8 @@ async fn setup() -> Option<(alloy_node_bindings::AnvilInstance, Address, Address
     let deployer = Deployer::new(deploy_provider.clone(), DEV_OWNER);
     deployer.ensure_factory(DEV_OWNER).await.unwrap();
 
-    // Predict the oracle proxy address, wire it into the lockbox init, deploy
-    // both atomically.
+    // Predict the oracle proxy address, wire it into the lockbox init,
+    // and deploy both atomically.
     let oracle_init = encode_oracle_init_args(ATTESTER_ADDR, CHALLENGER_ADDR, WINDOW);
     let predicted_oracle = deployer.predict_proxy_address(
         L2_CHAIN_ID,
@@ -156,8 +158,8 @@ async fn setup() -> Option<(alloy_node_bindings::AnvilInstance, Address, Address
         .find(|e| e.id == ContractId::EthLockbox.id())
         .unwrap()
         .proxy;
-    // The factory's CREATE2 address must match the Rust prediction used to wire
-    // the lockbox — otherwise the lockbox would point at the wrong oracle.
+    // The factory's CREATE2 address must match the Rust prediction used
+    // to wire the lockbox, or the lockbox would point at the wrong oracle.
     assert_eq!(
         oracle_addr, predicted_oracle,
         "predicted oracle address must match deployed"
@@ -183,11 +185,11 @@ async fn attester_posts_output_matching_rust_root() {
     let attester_provider = wallet_provider(&anvil, ATTESTER_KEY);
     let read_provider = deposit_provider(&anvil);
 
-    // The lockbox must point at the oracle (proves the predicted-address wiring).
+    // The lockbox must point at the oracle: this proves the predicted-address wiring.
     let lockbox = ETHLockbox::new(lockbox_addr, attester_provider.clone());
     assert_eq!(lockbox.outputOracle().call().await.unwrap(), oracle_addr);
 
-    // Fund the lockbox via a deposit (the on-ramp).
+    // Fund the lockbox through a deposit, the on-ramp.
     lockbox
         .depositETH(
             address!("0000000000000000000000000000000000001234"),
@@ -206,7 +208,7 @@ async fn attester_posts_output_matching_rust_root() {
         U256::from(5_000_000_000_000_000_000u128)
     );
 
-    // Build an output committing a 2-withdrawal tree and post it as the attester.
+    // Build an output that commits a 2-withdrawal tree, and post it as the attester.
     let l2_sender = address!("00000000000000000000000000000000000000AA");
     let recipient = address!("00000000000000000000000000000000000000CC");
     let leaves = vec![
@@ -223,8 +225,8 @@ async fn attester_posts_output_matching_rust_root() {
         .await
         .expect("attester posts output");
 
-    // Cross-language assertion: the on-chain output root equals the Rust-computed
-    // one, and the attester recorded exactly one output.
+    // Cross-language check: the on-chain output root equals the
+    // Rust-computed one, and the attester recorded exactly one output.
     let oracle = WithdrawalOutputOracle::new(oracle_addr, read_provider);
     assert_eq!(oracle.outputCount().call().await.unwrap(), U256::from(1u64));
     assert_eq!(
@@ -260,7 +262,7 @@ async fn full_withdrawal_finalize_and_challenge() {
         .await
         .unwrap();
 
-    // Post an output committing a single withdrawal of 1 wei to `recipient`.
+    // Post an output that commits a single withdrawal of 1 wei to `recipient`.
     let l2_sender = address!("00000000000000000000000000000000000000AA");
     let recipient = address!("00000000000000000000000000000000000000CC");
     let value = U256::from(1_000_000_000_000_000_000u128);
@@ -299,7 +301,7 @@ async fn full_withdrawal_finalize_and_challenge() {
         .await;
     assert!(early.is_err(), "finalize before window must revert");
 
-    // Advance past the window, then finalize → recipient paid.
+    // Advance past the window, then finalize: the recipient gets paid.
     let _: serde_json::Value = attester_provider
         .raw_request("evm_increaseTime".into(), (WINDOW + 10,))
         .await
@@ -315,7 +317,7 @@ async fn full_withdrawal_finalize_and_challenge() {
         .unwrap();
     assert_eq!(read_provider.get_balance(recipient).await.unwrap(), value);
 
-    // Challenge path: a second (bad) output is deleted and can never finalize.
+    // Challenge path: delete a second, bad output, and it can never finalize.
     let bad_leaves = vec![withdrawals::withdrawal_leaf(
         U256::from(2u64),
         l2_sender,

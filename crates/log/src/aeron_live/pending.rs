@@ -16,23 +16,24 @@ use crate::error::LogError;
 use crate::offer_retry::offer_code_str;
 use kardamom_types::BPosition;
 
-/// Escalating idle wait — the Rust analogue of Aeron's `BackoffIdleStrategy`,
-/// which is what keeps the Java sealer stack's duty-cycle threads cheap.
+/// Escalating idle wait. This is the Rust analogue of Aeron's
+/// `BackoffIdleStrategy`, which is what keeps the Java sealer stack's
+/// duty-cycle threads cheap.
 ///
-/// Poll loops here wait on a channel with a SHORT timeout (the data-plane
-/// poll cadence), and profiling showed that cadence dominating the
-/// sequencer's CPU: three Aeron runtimes per process waking every 100µs cost
-/// ~66% of the process's cycles at 2k tx/s — nearly all of it crossbeam's
-/// pre-park spin (`sched_yield` storms), not work. The fix mirrors the
-/// sealer's: stay at the base cadence while the loop is DOING something, and
-/// once it has observed `grace` consecutive empty iterations, double the
-/// wait per iteration up to `cap`; any work snaps it back to base.
+/// Poll loops here wait on a channel with a short timeout (the data-plane
+/// poll cadence). Profiling showed that cadence dominating the sequencer's
+/// CPU: three Aeron runtimes per process waking every 100 microseconds
+/// cost about 66% of the process's cycles at 2k tx/s, almost all of it
+/// crossbeam's pre-park spin (`sched_yield` storms), not work. The fix
+/// mirrors the sealer's: stay at the base cadence while the loop is doing
+/// something, and once it has seen `grace` consecutive empty iterations,
+/// double the wait per iteration up to `cap`. Any work snaps it back to base.
 ///
-/// Latency safety: senders wake the channel wait IMMEDIATELY regardless of
-/// the timeout, so command/publish latency is untouched. Only the first
-/// inbound data-plane fragment after a quiet spell can wait up to `cap`;
-/// under steady traffic every poll finds fragments and the cadence never
-/// leaves base.
+/// Latency safety: senders wake the channel wait immediately regardless of
+/// the timeout, so command/publish latency stays unaffected. Only the
+/// first inbound data-plane fragment after a quiet spell can wait up to
+/// `cap`. Under steady traffic, every poll finds fragments, and the
+/// cadence never leaves base.
 pub struct IdleBackoff {
     base: Duration,
     cap: Duration,
@@ -50,7 +51,7 @@ impl IdleBackoff {
         }
     }
 
-    /// The loop did work this iteration — snap back to the base cadence.
+    /// The loop did work this iteration. Snap back to the base cadence.
     pub fn reset(&mut self) {
         self.streak = 0;
     }
@@ -68,43 +69,47 @@ impl IdleBackoff {
 
 /// A publish awaiting delivery on the Aeron thread.
 ///
-/// Why this queue exists: the Aeron thread is **single-threaded** and shared by
-/// every publication *and* subscription on a process. If a publish is offered
-/// in a blocking spin/sleep loop (the old `offer_blocking`, up to
+/// Why this queue exists: the Aeron thread is single-threaded and shared
+/// by every publication and subscription in a process. If a publish is
+/// offered in a blocking spin/sleep loop (the old `offer_blocking`, up to
 /// [`OFFER_TIMEOUT`](crate::offer_retry::OFFER_TIMEOUT)), that same thread
-/// stops polling its subscriptions for the
-/// whole back-pressure window. In the cluster that starves the executor's
-/// `tx_ordering` subscription long enough (> Aeron's MIN flow-control receiver
-/// timeout, ~2 s) that the sealer drops it from flow control, advances, and the
-/// subscription's image develops an unfillable gap and goes end-of-stream — a
-/// permanent freeze (the executor uses `no_unavailable_image_handler` and never
-/// re-subscribes). A *must-deliver publish* must never starve a *must-deliver
-/// subscribe*.
+/// stops polling its subscriptions for the whole back-pressure window. In
+/// the cluster that starves the executor's `tx_ordering` subscription long
+/// enough (more than Aeron's minimum flow-control receiver timeout, about
+/// 2 s) that the sealer drops it from flow control and advances. The
+/// subscription's image then develops an unfillable gap and goes
+/// end-of-stream: a permanent freeze, since the executor uses
+/// `no_unavailable_image_handler` and never re-subscribes. A must-deliver
+/// publish must never starve a must-deliver subscribe.
 ///
-/// So a back-pressured offer is parked here and retried **one attempt per loop
-/// iteration** instead of blocking: the poll loop keeps draining subscriptions
-/// between attempts. Per-publication FIFO order is preserved (a publication with
-/// an older pending frame is not skipped ahead).
+/// So a back-pressured offer is parked here and retried one attempt per
+/// loop iteration instead of blocking. The poll loop keeps draining
+/// subscriptions between attempts. Per-publication FIFO order is
+/// preserved: a publication with an older pending frame is not skipped
+/// ahead.
 pub(super) struct PendingPublish {
     pub(super) pub_id: u32,
     pub(super) bytes: AlignedVec,
-    /// `Some` for an ack'd publish (`publish_bytes`); `None` for best-effort.
+    /// `Some` for an acknowledged publish (`publish_bytes`); `None` for
+    /// best effort.
     pub(super) ack: Option<CbSender<Result<BPosition, LogError>>>,
-    /// Give up (ack an error / log) once this instant passes — bounds a publish
-    /// to a never-connecting subscriber, matching the old blocking deadline.
+    /// Give up (ack an error, or log) once this instant passes. Bounds a
+    /// publish to a never-connecting subscriber, matching the old blocking
+    /// deadline.
     pub(super) deadline: Instant,
 }
 
 /// Attempt one offer for each pending publish, oldest first, preserving
-/// per-publication FIFO order: once a publication back-pressures this pass, its
-/// later frames are held too so the stream never reorders. Successful and
-/// expired (past-deadline) entries are removed; transiently-failing entries are
-/// retained for the next loop iteration.
+/// per-publication FIFO order. Once a publication back-pressures this
+/// pass, its later frames are held too, so the stream never reorders.
+/// Successful and expired (past-deadline) entries are removed;
+/// transiently failing entries are retained for the next loop iteration.
 ///
-/// Crucially this performs **one** offer attempt per entry and returns — it
-/// never spins/sleeps — so the caller (`super::thread::run_aeron_thread`) goes
-/// straight back to polling subscriptions. That is what stops a back-pressured
-/// publish from starving a subscription image (see [`PendingPublish`]).
+/// This performs one offer attempt per entry and returns. It never spins
+/// or sleeps, so the caller (`super::thread::run_aeron_thread`) goes
+/// straight back to polling subscriptions. That is what stops a
+/// back-pressured publish from starving a subscription image (see
+/// [`PendingPublish`]).
 pub(super) fn drain_pending(pubs: &[Pub], pending: &mut VecDeque<PendingPublish>) {
     drain_pending_inner(pending, Instant::now(), |item| {
         match pubs.get(item.pub_id as usize) {
@@ -119,17 +124,19 @@ pub(super) fn drain_pending(pubs: &[Pub], pending: &mut VecDeque<PendingPublish>
 
 /// Outcome of attempting one offer for a [`PendingPublish`].
 enum OfferResult {
-    /// The publication id is not registered (programming error / use-after-close).
+    /// The publication id is not registered (a programming error or a
+    /// use-after-close).
     UnknownPub,
-    /// Aeron's raw offer return: `>= 0` is a stream position, `< 0` a status code.
+    /// Aeron's raw offer return: `>= 0` is a stream position, `< 0` is a
+    /// status code.
     Code(i64),
 }
 
 /// Resolve a failed pending publish: ack `msg` as the error for a
-/// must-deliver publish, or warn (tagged with the `pub_id`) for best-effort.
-/// The three failure paths in [`drain_pending_inner`] (expired-in-queue,
-/// unknown publication, offer deadline) all funnel through here so the
-/// ack-or-warn split cannot drift between them.
+/// must-deliver publish, or warn (tagged with the `pub_id`) for best
+/// effort. The three failure paths in [`drain_pending_inner`] (expired in
+/// queue, unknown publication, offer deadline) all funnel through here, so
+/// the ack-or-warn split cannot drift between them.
 fn fail_item(item: &mut PendingPublish, msg: String) {
     match item.ack.take() {
         Some(ack) => {
@@ -139,9 +146,10 @@ fn fail_item(item: &mut PendingPublish, msg: String) {
     }
 }
 
-/// Pure core of [`drain_pending`], with the Aeron offer injected so the FIFO /
-/// deadline / back-pressure decisions are unit-testable without a media driver.
-/// `now` is threaded in for the same reason (deterministic deadline checks).
+/// Pure core of [`drain_pending`], with the Aeron offer injected so the
+/// FIFO, deadline, and back-pressure decisions are unit-testable without a
+/// media driver. `now` is threaded in for the same reason (deterministic
+/// deadline checks).
 fn drain_pending_inner<F>(pending: &mut VecDeque<PendingPublish>, now: Instant, mut offer: F)
 where
     F: FnMut(&PendingPublish) -> OfferResult,
@@ -149,23 +157,24 @@ where
     if pending.is_empty() {
         return;
     }
-    // Publications that already back-pressured this pass; their remaining frames
-    // wait so we never deliver a stream out of order.
+    // Publications that already back-pressured this pass. Their remaining
+    // frames wait, so a stream is never delivered out of order.
     let mut blocked: Vec<u32> = Vec::new();
     let mut keep: VecDeque<PendingPublish> = VecDeque::with_capacity(pending.len());
 
     while let Some(mut item) = pending.pop_front() {
         if blocked.contains(&item.pub_id) {
-            // Deadlines are enforced on EVERY retained entry each pass — not
-            // only when an entry reaches the head. Frames parked behind a
-            // blocked head would otherwise expire one-by-one (~OFFER_TIMEOUT
-            // each), so a caller ≥2 deep could hit its ack timeout while its
-            // frame was still queued — and then have the frame delivered late
-            // once the subscriber connected, after the caller already treated
-            // the publish as failed (and possibly re-submitted). Expiring on
-            // time here (OFFER_TIMEOUT < publish_bytes's ack timeout) means
-            // every ack resolves before its caller gives up, so a
-            // reported-failed publish is never delivered afterwards.
+            // Deadlines are enforced on every retained entry each pass, not
+            // only when an entry reaches the head. Otherwise frames parked
+            // behind a blocked head would expire one by one (about
+            // OFFER_TIMEOUT each), so a caller two or more deep could hit
+            // its ack timeout while its frame was still queued, and then
+            // have the frame delivered late once the subscriber connected,
+            // after the caller already treated the publish as failed (and
+            // possibly resubmitted). Expiring on time here (OFFER_TIMEOUT
+            // is shorter than publish_bytes's ack timeout) means every ack
+            // resolves before its caller gives up, so a reported-failed
+            // publish is never delivered afterwards.
             if now >= item.deadline {
                 fail_item(
                     &mut item,
@@ -179,26 +188,29 @@ where
         }
         match offer(&item) {
             OfferResult::UnknownPub => {
-                // Fail/log immediately, never retry.
+                // Fail or log immediately; never retry.
                 let msg = format!("publish: unknown pub_id {}", item.pub_id);
                 fail_item(&mut item, msg);
             }
             OfferResult::Code(code) if code >= 0 => {
-                // Delivered. Ack the stream position; best-effort needs no ack.
-                // Don't block this pub_id: a later frame for it may also go now.
+                // Delivered. Ack the stream position; best effort needs no
+                // ack. Do not block this pub_id: a later frame for it may
+                // also go now.
                 if let Some(ack) = item.ack.take() {
                     let _ = ack.send(Ok(decode_position(code)));
                 }
             }
             OfferResult::Code(code) if now >= item.deadline => {
-                // Gave up (e.g. a subscriber that never joined). Surface the error
-                // so an ack'd must-deliver caller can decide to re-submit.
+                // Gave up, for example on a subscriber that never joined.
+                // Surface the error, so an acknowledged must-deliver caller
+                // can decide to resubmit.
                 let msg = format!("aeron offer failed: {} ({code})", offer_code_str(code));
                 fail_item(&mut item, msg);
             }
             OfferResult::Code(_) => {
-                // Transient NOT_CONNECTED / BACK_PRESSURED: hold this frame and
-                // every later frame on the same publication; retry next iteration.
+                // Transient NOT_CONNECTED or BACK_PRESSURED: hold this
+                // frame and every later frame on the same publication;
+                // retry next iteration.
                 blocked.push(item.pub_id);
                 keep.push_back(item);
             }
@@ -210,11 +222,12 @@ where
 // ---------------------------------------------------------------------------
 // Unit tests for the publish-retry scheduler (no media driver required).
 //
-// These pin the behaviour that fixes the cluster `tx_ordering` freeze: a
-// back-pressured publish is *parked and retried*, never blocking the loop, and
-// per-publication FIFO order is preserved across retries. The matching real-
-// Aeron end-to-end proof (a back-pressured publish must not delay a live
-// subscription's delivery) lives in `tests/offer_starvation.rs`.
+// These pin the behavior that fixes the cluster `tx_ordering` freeze: a
+// back-pressured publish is parked and retried, never blocking the loop,
+// and per-publication FIFO order is preserved across retries. The
+// matching real-Aeron end-to-end proof (a back-pressured publish must not
+// delay a live subscription's delivery) lives in
+// `tests/offer_starvation.rs`.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -222,9 +235,10 @@ mod drain_pending_tests {
     use super::*;
     use crossbeam_channel::Receiver as CbReceiver;
 
-    /// Build a pending publish with a one-byte payload tagged `marker` (so a test
-    /// can identify which frame an offer is being asked about) and a deadline
-    /// `dl_ms` from `base`. Returns the entry and its ack receiver.
+    /// Build a pending publish with a one-byte payload tagged `marker` (so
+    /// a test can identify which frame an offer is being asked about) and
+    /// a deadline `dl_ms` from `base`. Returns the entry and its ack
+    /// receiver.
     fn pending(
         pub_id: u32,
         marker: u8,
@@ -261,9 +275,9 @@ mod drain_pending_tests {
 
     #[test]
     fn back_pressure_retains_frame_for_next_iteration() {
-        // The crux of the fix: a back-pressured offer (whose deadline has NOT
-        // passed) is kept in the queue and retried — never dropped, never
-        // blocking. The ack must stay pending.
+        // The crux of the fix: a back-pressured offer (whose deadline has
+        // not passed) is kept in the queue and retried. It is never
+        // dropped and never blocks. The ack must stay pending.
         let now = Instant::now();
         let (p, rx) = pending(0, 0xAA, now, 5_000);
         let mut q = VecDeque::from([p]);
@@ -281,9 +295,10 @@ mod drain_pending_tests {
 
     #[test]
     fn preserves_per_publication_fifo_under_back_pressure() {
-        // Two frames on pub 0 (A then B). The first attempt back-pressures A; B
-        // must NOT be offered ahead of A (would reorder the stream). We assert by
-        // recording which markers the offer fn is asked about.
+        // Two frames on pub 0 (A then B). The first attempt back-pressures
+        // A; B must not be offered ahead of A, which would reorder the
+        // stream. This asserts by recording which markers the offer fn is
+        // asked about.
         let now = Instant::now();
         let (a, _ra) = pending(0, 0xA1, now, 5_000);
         let (b, _rb) = pending(0, 0xB2, now, 5_000);
@@ -306,7 +321,7 @@ mod drain_pending_tests {
 
     #[test]
     fn independent_publications_do_not_block_each_other() {
-        // Pub 0 back-pressures but pub 1 is fine — pub 1 must still deliver.
+        // Pub 0 back-pressures, but pub 1 is fine; pub 1 must still deliver.
         let now = Instant::now();
         let (a, ra) = pending(0, 0xA1, now, 5_000);
         let (b, rb) = pending(1, 0xB2, now, 5_000);
@@ -331,8 +346,9 @@ mod drain_pending_tests {
 
     #[test]
     fn expired_frame_acks_an_error_and_is_dropped() {
-        // A frame still failing once its deadline has passed must error out (so a
-        // must-deliver caller can re-submit) rather than spin forever.
+        // A frame still failing once its deadline has passed must error
+        // out, so a must-deliver caller can resubmit, rather than spin
+        // forever.
         let now = Instant::now();
         let (p, rx) = pending(0, 0xAA, now, 0 /* deadline == now */);
         let mut q = VecDeque::from([p]);
@@ -354,11 +370,11 @@ mod drain_pending_tests {
 
     #[test]
     fn queued_frame_behind_blocked_head_expires_at_its_own_deadline() {
-        // F16.5 regression: a frame parked BEHIND a blocked head must have its
-        // deadline evaluated every pass — not only once it reaches the head.
-        // Otherwise a caller could hit its ack timeout while the frame is
-        // still queued, and the frame would be delivered late after the
-        // caller already treated the publish as failed.
+        // Regression test: a frame parked behind a blocked head must have
+        // its deadline evaluated every pass, not only once it reaches the
+        // head. Otherwise a caller could hit its ack timeout while the
+        // frame is still queued, and the frame would be delivered late
+        // after the caller already treated the publish as failed.
         let now = Instant::now();
         let (head, head_rx) = pending(0, 0xA1, now, 5_000); // head: not yet expired
         let (tail, tail_rx) = pending(0, 0xB2, now, 0); // tail: deadline == now
@@ -369,8 +385,9 @@ mod drain_pending_tests {
             offered.push(item.bytes.as_slice()[0]);
             OfferResult::Code(-2) // head back-pressures
         });
-        // Only the head was offered; the expired tail must NOT be offered
-        // (that would deliver it out of FIFO order after the caller gave up).
+        // Only the head was offered. The expired tail must not be
+        // offered; that would deliver it out of FIFO order after the
+        // caller gave up.
         assert_eq!(offered, vec![0xA1]);
         assert_eq!(q.len(), 1, "only the unexpired head is retained");
         assert_eq!(q[0].bytes.as_slice()[0], 0xA1);
@@ -422,11 +439,11 @@ mod drain_pending_tests {
         assert_eq!(b.idle_wait(), base);
         assert_eq!(b.idle_wait(), base);
         assert_eq!(b.idle_wait(), base);
-        // Past grace: doubles per idle iteration…
+        // Past grace: doubles per idle iteration,
         assert_eq!(b.idle_wait(), Duration::from_micros(200));
         assert_eq!(b.idle_wait(), Duration::from_micros(400));
         assert_eq!(b.idle_wait(), Duration::from_micros(800));
-        // …and clamps at the cap, staying there.
+        // and clamps at the cap, staying there.
         assert_eq!(b.idle_wait(), cap);
         for _ in 0..100 {
             assert_eq!(b.idle_wait(), cap);

@@ -1,41 +1,47 @@
-//! Attribution-granularity ladder (spec: bal-attribution-parallel-validation).
+//! Attribution-granularity ladder.
+//! See docs/agents/bal-attribution-parallel-validation-spec.md.
 //!
-//! `quantize` collapses per-tx BAL indices into K-tx chunks (chunk-final
-//! value wins). It lives in the ENGINE so the executor (producing quantized
-//! frames) and the validator (recomputing claims for verification at the
-//! same granularity) share one implementation — divergence checking is a
-//! structural equality, so the two sides must transform identically by
-//! construction, not by parallel maintenance.
+//! `quantize` collapses per-tx BAL indices into chunks of K txs. The last
+//! value in each chunk wins. This function lives in the engine so the
+//! executor (which produces quantized frames) and the validator (which
+//! recomputes claims at the same granularity) share one implementation.
+//! Divergence checking is a structural equality check, so both sides must
+//! transform data the same way by construction, not by separate
+//! maintenance.
 
 use alloc::vec::Vec;
 
-/// Merge per-tx BAL FRAGMENTS — each captured independently by a parallel
-/// worker via the same `Bal::update_account` call the streaming path makes
-/// — into one block BAL. Fragments MUST be supplied in ascending canonical
-/// (bal-index) order: per-key write lists are index-ordered by
-/// construction only when the append order is the canonical order, and
-/// the dedup rule below compares against the last KEPT write.
-/// Account insertion order is irrelevant
-/// (`into_alloy_bal` sorts by address; storage keys live in a BTreeMap),
-/// so the merged artifact is wire-identical to a single sequential
-/// capture.
+/// Merge per-tx BAL fragments into one block BAL. Each fragment is captured
+/// independently by a parallel worker, through the same
+/// `Bal::update_account` call the streaming path uses.
 ///
-/// This lives in the ENGINE core for the same reason `quantize` does: the
-/// executor's parallel (Block-STM) capture and the sequential capture must
-/// transform identically by construction — the validator's cross-check is
-/// structural equality on the published artifact.
+/// Supply fragments in ascending canonical (bal-index) order. Per-key write
+/// lists are index-ordered by construction only when the append order
+/// matches the canonical order, and the dedup rule below compares against
+/// the last kept write.
+///
+/// Account insertion order does not matter. `into_alloy_bal` sorts by
+/// address, and storage keys live in a `BTreeMap`. So the merged result is
+/// wire-identical to a single sequential capture.
+///
+/// This function lives in the engine core for the same reason `quantize`
+/// does. The executor's parallel (Block-STM) capture and the sequential
+/// capture must transform data the same way by construction. The
+/// validator's cross-check is a structural equality check on the published
+/// artifact.
 #[must_use]
 pub fn merge_bal_fragments(
     fragments: impl IntoIterator<Item = revm::state::bal::Bal>,
 ) -> revm::state::bal::Bal {
-    // Append `src`'s writes replaying the SEQUENTIAL capture's dedup rule:
-    // a write at a NEW index is recorded only when its value differs from
-    // the last recorded one (`BalWrites::update_with_key`) — context a
-    // per-tx fragment cannot have (its list saw only its own tx). Without
-    // this, an unchanged-value write (a deposit touching the fee sink, a
-    // slot rewritten to its previous value) appears in the merged artifact
-    // but not in the sequential one. `key` mirrors revm's comparison
-    // domain: whole value for nonce/balance/storage, code HASH for code.
+    // Append `src`'s writes, replaying the sequential capture's dedup rule.
+    // A write at a new index is recorded only when its value differs from
+    // the last recorded one (`BalWrites::update_with_key`). A per-tx
+    // fragment cannot know this on its own, since its list saw only its
+    // own tx. Without this step, an unchanged-value write (for example, a
+    // deposit that touches the fee sink, or a slot rewritten to its
+    // previous value) would appear in the merged result but not in the
+    // sequential one. `key` mirrors revm's comparison: the whole value for
+    // nonce, balance, and storage, and the code hash for code.
     fn append<T: Clone + PartialEq, K: PartialEq + ?Sized>(
         dst: &mut revm::state::bal::BalWrites<T>,
         src: revm::state::bal::BalWrites<T>,
@@ -75,13 +81,14 @@ pub fn merge_bal_fragments(
     out
 }
 
-/// Chunk ordinal for a 1-based bal index at granularity `k`.
+/// The chunk number for a 1-based BAL index, at granularity `k`.
 #[must_use]
 pub fn chunk_of(index: u64, k: u64) -> u64 {
     if index == 0 { 0 } else { index.div_ceil(k) }
 }
 
-/// Quantize an EIP-7928 access list to `k`-tx chunks. `k <= 1` is identity.
+/// Quantize an EIP-7928 access list into chunks of `k` txs. `k <= 1` returns
+/// the list unchanged.
 #[must_use]
 pub fn quantize(bal: alloy_eip7928::BlockAccessList, k: u16) -> alloy_eip7928::BlockAccessList {
     if k <= 1 {
@@ -97,7 +104,7 @@ pub fn quantize(bal: alloy_eip7928::BlockAccessList, k: u16) -> alloy_eip7928::B
             for c in slot.changes.iter() {
                 let ci = chunk_of(c.block_access_index, k);
                 match seen.get(&ci) {
-                    // Later write in the same chunk wins (chunk-final value).
+                    // The later write in the same chunk wins. This is the chunk-final value.
                     Some(&pos) => {
                         kept[pos] = alloy_eip7928::StorageChange {
                             block_access_index: ci,
@@ -122,8 +129,8 @@ pub fn quantize(bal: alloy_eip7928::BlockAccessList, k: u16) -> alloy_eip7928::B
     out
 }
 
-/// Quantize the index of each change and keep only the LAST entry per chunk
-/// (entries are index-ascending as revm emits them).
+/// Quantize the index of each change, and keep only the last entry per
+/// chunk. Revm emits entries in ascending index order.
 fn dedup_changes<T>(changes: &mut Vec<T>, k: u64, index_of: impl Fn(&mut T) -> &mut u64) {
     let mut i = 0;
     while i < changes.len() {
@@ -133,7 +140,7 @@ fn dedup_changes<T>(changes: &mut Vec<T>, k: u64, index_of: impl Fn(&mut T) -> &
             *idx = ci;
             ci
         };
-        // Remove a previous entry with the same chunk (this one is later).
+        // Remove a previous entry with the same chunk. This entry is later.
         if i > 0 {
             let prev = *index_of(&mut changes[i - 1]);
             if prev == ci {
@@ -180,7 +187,7 @@ mod tests {
             post_balance: U256::from(3),
         });
         let out = quantize(vec![acct], 5);
-        // indices 1,4 -> chunk 1 (keep 40); 6 -> chunk 2.
+        // Indices 1 and 4 go to chunk 1 (keep 40). Index 6 goes to chunk 2.
         assert_eq!(
             out[0].storage_changes[0].changes,
             vec![
@@ -194,7 +201,7 @@ mod tests {
                 },
             ]
         );
-        // balances 2,3 -> chunk 1, keep LAST (3).
+        // Balances at indices 2 and 3 go to chunk 1. Keep the last one (3).
         assert_eq!(out[0].balance_changes.len(), 1);
         assert_eq!(out[0].balance_changes[0].post_balance, U256::from(3));
         assert_eq!(out[0].balance_changes[0].block_access_index, 1);

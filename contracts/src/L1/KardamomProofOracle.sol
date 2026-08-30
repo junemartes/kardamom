@@ -13,7 +13,7 @@ interface ISP1Verifier {
     ) external view;
 }
 
-/// @notice The settlement surface the oracle cross-reads (spec PR 4/PR 5).
+/// @notice The settlement contract that the oracle reads batch data from.
 interface IKardamomL2Settlement {
     function batches(uint64 index)
         external
@@ -24,56 +24,58 @@ interface IKardamomL2Settlement {
 }
 
 /// @title KardamomProofOracle
-/// @notice The zk root chain, v2 (spec: no-std-exec-core, PR 5): one root
-///         chain, two ways to advance it.
+/// @notice The zk root chain. It has one root chain and two ways to
+///         advance it.
 ///
 ///         VALIDITY mode (`submitBatchProof`): a batch validity proof
-///         advances the root immediately — PR 4 semantics, kept for
-///         operators that want instant finality.
+///         advances the root at once. Use this mode for instant finality.
 ///
-///         OPTIMISTIC mode: a bonded `claimBatch` carries PER-BLOCK
-///         attestations — `(post_root, records_digest)` per block, pinned
-///         to the settlement's stored records commitment by a claim-time
-///         fold check — and finalizes after an unchallenged window.
-///         `challengeBlock` targets the FIRST divergent block with a
-///         SINGLE-BLOCK proof: at the first divergence the claimed parent
-///         root is still honest, so the refuting proof always exists (no
-///         bisection). A won challenge slashes the bond to the challenger,
-///         cascade-cancels dependent pending claims (refunds — their fault
-///         was a wrong base), and REWINDS: the root chain stays at the last
-///         finalized root and the batch reopens for an honest claim.
+///         OPTIMISTIC mode: a bonded `claimBatch` call carries one
+///         attestation per block: `(post_root, records_digest)`. A
+///         claim-time fold check pins each attestation to the settlement's
+///         stored records commitment. The claim finalizes after an
+///         unchallenged window.
+///         `challengeBlock` targets the first divergent block with a
+///         single-block proof. At the first divergence, the claimed parent
+///         root is still honest, so the refuting proof always exists. The
+///         oracle needs no bisection step. A won challenge slashes the
+///         bond to the challenger, cancels dependent pending claims with
+///         refunds (their claims used a wrong base), and rewinds the
+///         chain: the root chain stays at the last finalized root, and the
+///         batch reopens for an honest claim.
 ///
-///         Bond refunds and slash rewards are PULL payments (`withdraw`).
-/// @dev    Single-block public values (160 bytes, 5x32): preStateRoot ||
-///         postStateRoot || blockNumber(u256) || recordsDigest ||
-///         balCommitment. Batch public values as in PR 4.
+///         Bond refunds and slash rewards use pull payments (`withdraw`).
+/// @dev    A single-block public value set is 160 bytes (5 x 32 bytes):
+///         preStateRoot, postStateRoot, blockNumber (u256), recordsDigest,
+///         and balCommitment.
 contract KardamomProofOracle is KardamomUUPSBase {
     struct Claim {
         address claimer;
         uint96 bond;
         uint64 claimedAt;
-        /// @dev The root this claim chains from (parent claim's final root,
-        ///      or `stateRoot` for the first pending claim).
+        /// @dev The root this claim starts from. It is the parent claim's
+        ///      final root, or `stateRoot` for the first pending claim.
         bytes32 preRoot;
-        /// @dev `blockRoots[last]` — what `stateRoot` becomes on finalize.
+        /// @dev `blockRoots[last]`. This becomes `stateRoot` when the claim
+        ///      finalizes.
         bytes32 finalRoot;
-        /// @dev keccak(abi.encode(blockRoots, blockDigests)) — the
-        ///      challenge re-derives it from calldata arrays.
+        /// @dev keccak(abi.encode(blockRoots, blockDigests)). The challenge
+        ///      function re-derives this value from calldata arrays.
         bytes32 seqHash;
     }
 
     IKardamomL2Settlement public settlement;
     ISP1Verifier public verifier;
-    /// @notice The BATCH guest's verifying key (validity mode).
+    /// @notice The verifying key for the batch guest program (validity mode).
     bytes32 public batchVKey;
-    /// @notice The SINGLE-BLOCK guest's verifying key (dispute mode).
+    /// @notice The verifying key for the single-block guest program (dispute mode).
     bytes32 public blockVKey;
-    /// @notice The proven/finalized running L2 state root.
+    /// @notice The proven and finalized running L2 state root.
     bytes32 public stateRoot;
-    /// @notice Index of the last FINALIZED batch (by proof or by window).
+    /// @notice Index of the last finalized batch. Finalized by proof or by window.
     uint64 public lastFinalizedBatch;
-    /// @notice Index of the highest pending claim (== lastFinalizedBatch
-    ///         when nothing is pending).
+    /// @notice Index of the highest pending claim. Equals `lastFinalizedBatch`
+    ///         when no claim is pending.
     uint64 public highestClaimedBatch;
     /// @notice Challenge window in seconds.
     uint64 public challengeWindow;
@@ -153,8 +155,9 @@ contract KardamomProofOracle is KardamomUUPSBase {
     // Optimistic mode
     // ------------------------------------------------------------------
 
-    /// @notice Claim a posted batch with per-block attestations. Bonded;
-    ///         permissionless; claims chain ahead of finalization.
+    /// @notice Claim a posted batch with one attestation per block. The
+    ///         caller posts a bond. Anyone can call this function. Claims
+    ///         can chain ahead of finalization.
     function claimBatch(
         uint64 batchIndex,
         bytes32[] calldata blockRoots,
@@ -172,8 +175,8 @@ contract KardamomProofOracle is KardamomUUPSBase {
         if (blockRoots.length != blocksInBatch || blockDigests.length != blocksInBatch) {
             revert LengthMismatch();
         }
-        // The anti-smuggling check: the claimed per-block record partition
-        // must fold to EXACTLY the commitment the batcher posted.
+        // This check stops smuggling. The claimed per-block record
+        // partition must fold to exactly the commitment the batcher posted.
         if (_foldDigests(blockDigests) != postedCommitment) revert DigestFoldMismatch();
 
         bytes32 preRoot =
@@ -193,7 +196,7 @@ contract KardamomProofOracle is KardamomUUPSBase {
         );
     }
 
-    /// @notice Finalize the next claim once its window elapsed unchallenged.
+    /// @notice Finalize the next claim after its window ends unchallenged.
     function finalizeBatch(uint64 batchIndex) external {
         if (batchIndex != lastFinalizedBatch + 1) revert NonSequentialBatch();
         Claim memory c = claims[batchIndex];
@@ -207,10 +210,11 @@ contract KardamomProofOracle is KardamomUUPSBase {
         emit BatchFinalized(batchIndex, stateRoot, false);
     }
 
-    /// @notice Refute a pending claim at its FIRST divergent block with a
-    ///         single-block validity proof. Slashes the claim's bond to the
-    ///         challenger, cascade-cancels dependent claims (refunded), and
-    ///         REWINDS — `stateRoot` does not move; the batch reopens.
+    /// @notice Refute a pending claim at its first divergent block. Use a
+    ///         single-block validity proof. This slashes the claim's bond
+    ///         to the challenger, cancels dependent claims with refunds,
+    ///         and rewinds the chain: `stateRoot` does not move, and the
+    ///         batch reopens.
     function challengeBlock(
         uint64 batchIndex,
         uint64 blockOffset,
@@ -234,8 +238,9 @@ contract KardamomProofOracle is KardamomUUPSBase {
         _resolveChallenge(batchIndex, blockOffset, blockRoots[blockOffset], provenRoot, c);
     }
 
-    /// @dev The won-challenge effects: slash to the challenger, cascade-
-    ///      cancel dependents with refunds, REWIND (stateRoot untouched).
+    /// @dev The effects of a won challenge: slash the bond to the
+    ///      challenger, cancel dependent claims with refunds, and rewind
+    ///      the chain. `stateRoot` does not change.
     function _resolveChallenge(
         uint64 batchIndex,
         uint64 blockOffset,
@@ -269,12 +274,12 @@ contract KardamomProofOracle is KardamomUUPSBase {
     }
 
     // ------------------------------------------------------------------
-    // Validity mode (PR 4, kept)
+    // Validity mode
     // ------------------------------------------------------------------
 
-    /// @notice Verify one batch's validity proof and advance the root
-    ///         immediately. Only when no claims are pending — the two modes
-    ///         do not interleave mid-chain.
+    /// @notice Verify one batch's validity proof and advance the root at
+    ///         once. This works only when no claims are pending. The two
+    ///         modes do not mix mid-chain.
     function submitBatchProof(uint64 batchIndex, bytes calldata publicValues, bytes calldata proof)
         external
     {
@@ -306,11 +311,12 @@ contract KardamomProofOracle is KardamomUUPSBase {
         emit BatchFinalized(batchIndex, postRoot, true);
     }
 
-    /// @dev The refutation preconditions, isolated so `challengeBlock`'s
-    ///      frame stays shallow: decode the 160-byte public values, anchor
-    ///      the pre-root into the claimed sequence (first-divergence rule),
-    ///      pin block number and records digest, and require disagreement.
-    ///      Returns the proven post root for the event.
+    /// @dev Checks the refutation preconditions. This function is separate
+    ///      to keep `challengeBlock`'s stack frame small. It decodes the
+    ///      160-byte public values, anchors the pre-root into the claimed
+    ///      sequence (the first-divergence rule), checks the block number
+    ///      and records digest, and requires disagreement with the claim.
+    ///      It returns the proven post root for the event.
     function _checkRefutation(
         bytes32 claimPreRoot,
         uint64 batchIndex,
@@ -331,7 +337,7 @@ contract KardamomProofOracle is KardamomUUPSBase {
         return post;
     }
 
-    /// @dev keccak("KBAT" || d_0 || .. || d_n-1) — byte-identical to
+    /// @dev keccak("KBAT" || d_0 || .. || d_n-1). This is byte-identical to
     ///      `kardamom_types::batch_records_commitment`.
     function _foldDigests(bytes32[] calldata digests) internal pure returns (bytes32) {
         bytes memory buf = new bytes(4 + digests.length * 32);

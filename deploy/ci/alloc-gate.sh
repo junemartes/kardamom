@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# CI allocation-regression gate: runs the three DHAT harnesses and fails if
-# allocs/op or bytes/op exceed the committed ceilings (perf/alloc-baselines.env).
-# Wall time is printed for the record but NEVER gated (machine-dependent).
+# This CI gate checks for allocation regressions. It runs the three DHAT
+# harnesses. It fails if allocs/op or bytes/op exceed the ceilings in
+# perf/alloc-baselines.env. The script prints wall time for reference. It
+# does not gate on wall time, because wall time depends on the machine.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 source perf/alloc-baselines.env
@@ -9,9 +10,9 @@ source perf/alloc-baselines.env
 run() { # <name> <dir> <test> <env...>
   local name=$1 dir=$2 test=$3; shift 3
   local raw="/tmp/alloc-gate-$name.log"
-  # Keep the FULL cargo output (stderr included): a compile or runtime
-  # failure must be printed, never swallowed — the first version piped
-  # stderr to /dev/null and a broken build failed the job with zero output.
+  # Keep the full cargo output, including stderr. A compile or runtime
+  # failure must show in the log. An earlier version sent stderr to
+  # /dev/null, so a broken build failed the job with no output.
   if ! (cd "$dir" && env "$@" cargo test --test "$test" --release -- --ignored --nocapture) >"$raw" 2>&1; then
     echo "== $name: HARNESS FAILED (cargo test exit != 0); last 40 lines:"
     tail -40 "$raw"

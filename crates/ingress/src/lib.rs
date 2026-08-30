@@ -1,19 +1,20 @@
-//! Ingress proxy (S1).
+//! Ingress proxy.
 //!
-//! Terminates client connections (JSON-RPC over HTTP+WS plus an optional
-//! length-prefixed RLP TCP/UDS binary line protocol), batches secp256k1
-//! sender recovery, partitions tx publication on `ingress[keccak(sender) % M]`,
-//! parks responses until both the quorum fsync watermark advances past the
-//! tx's B-position and a matching receipt arrives on the receipt-cache
-//! channel, and answers retries from an in-memory receipt cache.
+//! The proxy ends client connections. It supports JSON-RPC over HTTP and WS.
+//! It also supports an optional length-prefixed RLP TCP/UDS binary protocol.
+//! The proxy batches secp256k1 sender recovery. It sends each tx to
+//! `ingress[keccak(sender) % M]`. It holds each response until the quorum
+//! fsync watermark passes the tx's B-position and a matching receipt
+//! arrives on the receipt-cache channel. It answers retries from an
+//! in-memory receipt cache.
 //!
-//! The proxy is **the only place** that computes either `TxEnvelope.sender`
-//! or `TxEnvelope.tx_hash`. Both are produced together
-//! at the sig-verify boundary (ECDSA recovery + a single `keccak256(raw_tx)`
-//! pass) and published into the envelope before any downstream consumer
-//! observes the tx. Downstream code may trust both fields unconditionally.
+//! The proxy is the only place that computes `TxEnvelope.sender` and
+//! `TxEnvelope.tx_hash`. The sig-verify step produces both values together:
+//! one ECDSA recovery and one `keccak256(raw_tx)` pass. The proxy writes
+//! both fields into the envelope before any other code sees the tx.
+//! Downstream code can trust both fields without a check.
 //!
-//! Stateless w.r.t. canonical truth — adding or removing a proxy is safe at
+//! The proxy holds no canonical state. You can add or remove a proxy at
 //! any time.
 
 pub mod aeron_adapters;

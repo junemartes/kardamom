@@ -1,14 +1,15 @@
 //! Top-level batcher loop.
 //!
 //! - Pulls records from a stream-like source (segment reader or live archive).
-//! - Feeds [`BatchAccumulator`] which yields [`ClosedBlock`]s at every
+//! - Feeds [`BatchAccumulator`], which yields a [`ClosedBlock`] at every
 //!   `BlockBoundaryStart`.
-//! - For each closed block (or group of blocks — configurable via
-//!   `blocks_per_batch`), encodes KAR1, optionally zstd-compresses, packs into
-//!   blobs, and hands the packed batch to a [`Sender`] for L1 broadcast.
+//! - For each closed block, or group of blocks (set by `blocks_per_batch`),
+//!   encodes KAR1, compresses with zstd if enabled, packs the result into
+//!   blobs, and hands the batch to a [`Sender`] for L1 broadcast.
 //!
-//! Single-instance for v1: there is no election or standby. If the batcher
-//! process dies the L2 stops settling blocks until an operator restarts it.
+//! This is a single-instance design for v1. There is no election or standby.
+//! If the batcher process dies, the L2 stops settling blocks until an
+//! operator restarts it.
 
 use alloy_eips::eip4844::Blob;
 use metrics::counter;
@@ -19,8 +20,8 @@ use crate::compress::{DEFAULT_LEVEL, encode_zstd};
 use crate::error::BatcherError;
 use crate::frame::{BlockFrame, Kar1Payload, TxFrame, encode as frame_encode};
 
-/// Metric names. Use `metrics::Recorder` to scrape; the runtime wires up a
-/// Prometheus exporter via `metrics-exporter-prometheus`.
+/// Metric names. Use `metrics::Recorder` to scrape them. The runtime sets up
+/// a Prometheus exporter with `metrics-exporter-prometheus`.
 pub mod metric_names {
     pub const BLOCKS_OBSERVED: &str = "kardamom_batcher_blocks_observed_total";
     pub const BATCHES_POSTED: &str = "kardamom_batcher_batches_posted_total";
@@ -54,17 +55,16 @@ pub struct PostedBatch {
     pub blobs: Vec<Blob>,
     pub l2_block_start: u64,
     pub l2_block_end: u64,
-    /// Batch records commitment (spec: PR 4): the fold of per-block digests
-    /// over the batch's L2 tx identities, computed with the SAME
-    /// `kardamom-types::prover` primitives the batch guest uses. Stored by
-    /// the settlement contract; the proof oracle requires the proof's
-    /// public values to carry it.
+    /// The batch records commitment: the fold of per-block digests over the
+    /// batch's L2 tx identities. It uses the same `kardamom-types::prover`
+    /// primitives as the batch guest. The settlement contract stores it, and
+    /// the proof's public values must carry it for the proof oracle.
     pub records_commitment: alloy_primitives::B256,
 }
 
-/// Sink for posted batches. The production impl wraps an alloy provider and
-/// builds a 4844 transaction (see [`crate::settlement`]); the test impl just
-/// captures.
+/// A sink for posted batches. The production version wraps an alloy
+/// provider and builds a 4844 transaction (see [`crate::settlement`]). The
+/// test version only captures the batch.
 pub trait Sender {
     fn post(&mut self, batch: PostedBatch) -> Result<(), BatcherError>;
 }
@@ -81,8 +81,8 @@ impl Sender for MockSender {
     }
 }
 
-/// In-process Batcher state. Generic over the `Sender` so tests can substitute
-/// [`MockSender`] for the real settlement client.
+/// In-process batcher state. It is generic over `Sender`, so tests can use
+/// [`MockSender`] instead of the real settlement client.
 pub struct Batcher<S> {
     cfg: BatcherConfig,
     accumulator: BatchAccumulator,
@@ -109,9 +109,9 @@ impl<S: Sender> Batcher<S> {
         &self.sender
     }
 
-    /// Called by the reader thread whenever a `ClosedBlock` becomes available.
-    /// If we have enough blocks to form a batch, builds the blobs and forwards
-    /// to the sender.
+    /// The reader thread calls this method when a `ClosedBlock` becomes
+    /// available. If enough blocks are ready to form a batch, this method
+    /// builds the blobs and sends them to the sender.
     pub fn on_closed_block(&mut self, block: ClosedBlock) -> Result<(), BatcherError> {
         counter!(metric_names::BLOCKS_OBSERVED).increment(1);
         self.pending_blocks.push(block);
@@ -128,9 +128,10 @@ impl<S: Sender> Batcher<S> {
     }
 }
 
-/// Pure helper: turn a group of `ClosedBlock`s into a `PostedBatch`.
+/// A pure helper that turns a group of `ClosedBlock`s into a `PostedBatch`.
 ///
-/// Encode KAR1 → optionally zstd-compress → pack into ≤6 blobs.
+/// Steps: encode KAR1, compress with zstd if enabled, then pack into at
+/// most 6 blobs.
 pub fn pack_blocks(
     cfg: &BatcherConfig,
     blocks: &[ClosedBlock],
@@ -187,9 +188,9 @@ fn build_payload(blocks: &[ClosedBlock]) -> Kar1Payload {
                 .collect(),
         })
         .collect();
-    // `compressed = false` in the framing header: the outer zstd layer (if any)
-    // wraps the framed buffer transparently, so the reader detects compression
-    // via the zstd magic. See `recon::is_zstd`.
+    // Set `compressed = false` in the framing header. The outer zstd layer,
+    // if any, wraps the framed buffer without changing it. The reader
+    // detects compression by the zstd magic bytes. See `recon::is_zstd`.
     Kar1Payload {
         blocks: block_frames,
         compressed: false,

@@ -9,38 +9,40 @@ pub struct SequencerConfig {
     pub partition_count: u32,
     /// This process's partition index (`0..partition_count`).
     pub partition_index: u32,
-    /// Stable identifier for this sequencer process. Embedded in every
-    /// [`kardamom_types::TxRef`] this sequencer writes onto tx_ordering so
-    /// downstream consumers can route the ref back to the correct
+    /// Stable identifier for this sequencer process. This sequencer embeds
+    /// the id in every [`kardamom_types::TxRef`] it writes onto tx_ordering.
+    /// This lets downstream consumers route the ref back to the correct
     /// per-sequencer tx_data archive.
     ///
-    /// **Invariant:** `sequencer_id` matches `partition_index` for the
-    /// default M=8 deployment (one sequencer per partition). The field is
-    /// kept separate so a future asymmetric layout (e.g. multiple
+    /// Invariant: `sequencer_id` matches `partition_index` in the default
+    /// M=8 deployment (one sequencer per partition). The field stays
+    /// separate so a future asymmetric layout (for example, multiple
     /// sequencers per partition for hot-standby pre-allocation) can change
-    /// it without affecting the partition router. The CLI/TOML may omit
-    /// it; if absent, it defaults to `partition_index as u8`.
+    /// it without affecting the partition router. The CLI or TOML config
+    /// may omit this field. If it is absent, it defaults to
+    /// `partition_index as u8`.
     pub sequencer_id: u8,
     /// Per-sender future-nonce buffer capacity. Default 16.
     pub max_pending_per_sender: usize,
-    /// UNUSED (accepted for config compatibility): the stream-adaptive
-    /// nonce-floor fast-forward this bounded was removed — it adopted
-    /// client-abandoned nonce gaps into the canonical stream, which every
-    /// executor fail-stops on (see `PartitionState`'s note). The key still
-    /// parses so deployed TOMLs carrying it keep loading.
+    /// This field is unused. It is accepted only for config compatibility.
+    /// It used to bound the stream-adaptive nonce-floor fast-forward. That
+    /// feature was removed: it adopted client-abandoned nonce gaps into the
+    /// canonical stream, and every executor fail-stops on that (see the
+    /// note on `PartitionState`). The key still parses, so deployed TOML
+    /// files that carry it keep loading.
     #[serde(default = "default_nonce_floor_lag_ms")]
     pub nonce_floor_lag_ms: u64,
-    /// Optional CPU core to pin this process to. `None` = no pin.
+    /// Optional CPU core to pin this process to. `None` means no pin.
     pub core_id: Option<usize>,
     /// Backpressure behaviour when tx_ordering blocks.
     pub backpressure_policy: BackpressurePolicy,
-    /// Aeron Cluster (Raft) sealer client config. tx_ordering ALWAYS goes to the
-    /// cluster ingress — there is no longer a non-cluster path.
+    /// Aeron Cluster (Raft) sealer client config. tx_ordering always goes
+    /// to the cluster ingress. There is no non-cluster path.
     #[serde(default)]
     pub cluster: ClusterConfig,
-    /// Lag detection + receipt-floor resync knobs
-    /// (docs/agents/sequencer-lag-resync-spec.md). `resync.dedup_capacity`
-    /// MUST equal the cluster's `-Dkardamom.cluster.dedupCapacity`.
+    /// Lag detection and receipt-floor resync settings. See
+    /// docs/agents/sequencer-lag-resync-spec.md. `resync.dedup_capacity`
+    /// must equal the cluster's `-Dkardamom.cluster.dedupCapacity`.
     #[serde(default)]
     pub resync: crate::resync::ResyncConfig,
 }
@@ -49,8 +51,8 @@ fn default_nonce_floor_lag_ms() -> u64 {
     5_000
 }
 
-// The `[cluster]` TOML section has ONE definition, shared by every cluster
-// client and re-exported from `kardamom-cluster-adapter`.
+// The `[cluster]` TOML section has one definition. Every cluster client
+// shares it, re-exported from `kardamom-cluster-adapter`.
 pub use kardamom_cluster_adapter::ClusterConfig;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -91,21 +93,21 @@ impl SequencerConfig {
     }
 
     /// Rotate the shard assignment for a racing-replica group:
-    /// `partition_index ← (partition_index + offset) % partition_count`,
-    /// with `sequencer_id` always following the rotated partition.
+    /// `partition_index = (partition_index + offset) % partition_count`.
+    /// `sequencer_id` always follows the rotated partition.
     ///
-    /// A second replica group passes `offset = 1` so each node serves a
-    /// different shard per group, guaranteeing the two replicas of any
-    /// shard land on distinct nodes.
+    /// A second replica group passes `offset = 1`. Then each node serves a
+    /// different shard per group. This guarantees that the two replicas of
+    /// any shard land on distinct nodes.
     ///
-    /// `sequencer_id` is unconditionally re-derived: the tx_data
-    /// subscription is keyed on `sequencer_id` while the wrong-shard guard
-    /// filters on `partition_index`, so a rotated replica with a diverging
-    /// explicit id would subscribe to one shard's stream and drop every
-    /// envelope as wrong-shard — and its twin would stamp a different
-    /// `TxRef.shard_id`, breaking the byte-identical-replica dedup
-    /// argument. The binary rejects `--sequencer-id` combined with
-    /// `--partition-offset` for the same reason.
+    /// This function always re-derives `sequencer_id`. The tx_data
+    /// subscription is keyed on `sequencer_id`, but the wrong-shard guard
+    /// filters on `partition_index`. So a rotated replica with a different
+    /// explicit id would subscribe to one shard's stream, and drop every
+    /// envelope as wrong-shard. Its twin would also stamp a different
+    /// `TxRef.shard_id`, which breaks the byte-identical-replica dedup
+    /// design. For the same reason, the binary rejects `--sequencer-id`
+    /// combined with `--partition-offset`.
     pub fn rotate_partition(&mut self, offset: u32) {
         let m = self.partition_count.max(1);
         self.partition_index = (self.partition_index + offset) % m;
@@ -164,8 +166,8 @@ mod tests {
         assert_eq!(cfg.sequencer_id, 0);
         cfg.validate().unwrap();
 
-        // Rotating the peer node's raw index 0 lands on the other shard, so
-        // node-0 serves {a: shard 0, b: shard 1} and node-1 the reverse.
+        // Rotating the peer node's raw index 0 lands on the other shard.
+        // So node-0 serves {a: shard 0, b: shard 1}, and node-1 the reverse.
         let mut peer = SequencerConfig {
             partition_count: 2,
             partition_index: 0,
@@ -179,9 +181,9 @@ mod tests {
 
     #[test]
     fn rotate_partition_overrides_explicit_sequencer_id() {
-        // A diverging explicit id would subscribe to tx_data stream 7 while
-        // the wrong-shard guard filters on partition 1 — dropping everything.
-        // Rotation therefore always re-derives sequencer_id.
+        // A different explicit id would subscribe to tx_data stream 7,
+        // while the wrong-shard guard filters on partition 1. This drops
+        // everything. So rotation always re-derives sequencer_id.
         let mut cfg = SequencerConfig {
             partition_count: 2,
             partition_index: 0,

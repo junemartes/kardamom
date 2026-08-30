@@ -1,9 +1,8 @@
 //! Example: an external `BenchWorkflow` driven from a downstream crate.
 //!
-//! Implements a read-only `eth_blockNumber` workload that needs no
-//! presigned txs and no contracts. Demonstrates the minimum surface an
-//! external workflow has to provide to drop into `Benchmark<W>` and
-//! `Harness<W>`.
+//! It runs a read-only `eth_blockNumber` workload. This workload needs no
+//! presigned transactions and no contracts. The example shows the minimum
+//! surface an external workflow needs for `Benchmark<W>` and `Harness<W>`.
 //!
 //! Run against the in-process harness:
 //!   `cargo run --release --example custom_workflow -p kardamom-bench`
@@ -38,7 +37,7 @@ impl BenchWorkflow for BlockNumberWorkflow {
     }
 
     fn genesis_alloc(&self, _n_tasks: u32) -> anyhow::Result<Vec<AllocEntry>> {
-        // No accounts, no contracts: `eth_blockNumber` just reads a counter.
+        // `eth_blockNumber` only reads a counter. It needs no accounts and no contracts.
         Ok(Vec::new())
     }
 
@@ -48,8 +47,8 @@ impl BenchWorkflow for BlockNumberWorkflow {
         n_tasks: u32,
         txs_per_task: u32,
     ) -> anyhow::Result<Prepared<Self::Item>> {
-        // No real warmup needed for `eth_blockNumber` — but produce a few
-        // unit markers so the harness exercises the warmup path.
+        // `eth_blockNumber` needs no real warmup. Produce unit markers so the
+        // harness still exercises the warmup path.
         let warmup = vec![(); 64];
         let main = (0..n_tasks)
             .map(|_| vec![(); txs_per_task as usize])
@@ -65,8 +64,8 @@ impl BenchWorkflow for BlockNumberWorkflow {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // `Harness::run` installs its own tracing subscriber (with the flame
-    // layer), so we don't init one here.
+    // `Harness::run` installs its own tracing subscriber, with the flame layer.
+    // Do not init a subscriber here.
 
     let bench = Benchmark {
         workflow: BlockNumberWorkflow,

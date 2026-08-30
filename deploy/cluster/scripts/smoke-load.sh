@@ -1,88 +1,95 @@
 #!/usr/bin/env bash
 # =============================================================================
-# smoke-load.sh — EXHAUSTIVE load smoke for the kardamom cluster.
+# smoke-load.sh — runs an exhaustive load smoke test for the kardamom cluster.
 # =============================================================================
 #
-# The basic smoke (scripts/smoke.sh) sends a SINGLE tx and checks one receipt.
-# That is too weak to catch the sustained-load freezes we are chasing. This
-# script instead drives a SUSTAINED stream of transactions through ingress for
-# a configurable duration/rate and asserts two properties the cluster must hold
-# under load:
+# The basic smoke test (scripts/smoke.sh) sends a single tx and checks
+# one receipt. That is too weak to catch the sustained-load freezes
+# this script chases. Instead, this script drives a sustained stream of
+# transactions through ingress, for a configurable duration and rate,
+# and checks two properties the cluster must hold under load:
 #
-#   1. MUST-DELIVER  — every submitted tx gets a receipt back within a timeout.
-#                      (This is the durability/quorum property; a frozen or
-#                      lossy pipeline shows up as missing receipts.)
+#   1. Must-deliver: every submitted tx gets a receipt back within a
+#      timeout. This is the durability and quorum property. A frozen
+#      or lossy pipeline shows up as missing receipts.
 #
-#   2. KEEP-PACE     — the executor(s) keep up with the sealer: the
-#                      executor-vs-sealer block-number gap stays bounded AND
-#                      every executor's block number STRICTLY ADVANCES over the
-#                      run (no frozen executor).
+#   2. Keep-pace: the executors keep up with the sealer. The
+#      executor-vs-sealer block-number gap stays bounded, and every
+#      executor's block number strictly advances over the run, so no
+#      executor freezes.
 #
-# It prints a clear summary (submitted / receipted / missing, receipt-latency
-# p50/p99, per-executor final block gap) and exits non-zero on ANY failure.
+# It prints a clear summary (submitted, receipted, missing,
+# receipt-latency p50/p99, per-executor final block gap), and exits
+# non-zero on any failure.
 #
 # ---------------------------------------------------------------------------
-# HOW IT TALKS TO THE CLUSTER
+# How this script talks to the cluster
 # ---------------------------------------------------------------------------
-#  * Transactions: pre-signed OFFLINE with foundry `cast mktx` (explicit
-#    --nonce/--chain/--gas-price/--gas-limit, no RPC round-trip), then
-#    submitted to ingress via `eth_sendRawTransaction` over curl, and receipts
-#    polled via `eth_getTransactionReceipt`. We pre-sign rather than use
-#    `cast send` because ingress does NOT implement `eth_getTransactionCount`
-#    (it returns an error — see crates/ingress/src/json_rpc.rs), so cast's
-#    auto-nonce fill would fail. Nonces are therefore managed ENTIRELY locally:
-#    sequential per sender, starting at SMOKE_NONCE_START (0 on a fresh chain).
+#  * Transactions: this script pre-signs each tx offline with foundry
+#    `cast mktx`, passing --nonce, --chain, --gas-price, and --gas-limit
+#    explicitly, with no RPC round trip. It then submits each tx to
+#    ingress through `eth_sendRawTransaction` over curl, and polls
+#    receipts through `eth_getTransactionReceipt`. It pre-signs instead
+#    of using `cast send`, because ingress does not implement
+#    `eth_getTransactionCount`; it returns an error (see
+#    crates/ingress/src/json_rpc.rs), so cast's auto-nonce fill would
+#    fail. So this script manages nonces entirely on its own: sequential
+#    per sender, starting at SMOKE_NONCE_START (0 on a fresh chain).
 #
-#  * Throughput: spread across multiple sender accounts (the 16 well-known
-#    Anvil/Hardhat test-mnemonic accounts, all prefunded in
-#    config/genesis/dev.toml). More senders => more in-flight nonces => higher
-#    achievable TPS without nonce-gap stalls.
+#  * Throughput: load spreads across multiple sender accounts, the 16
+#    well-known Anvil/Hardhat test-mnemonic accounts, all prefunded in
+#    config/genesis/dev.toml. More senders give more in-flight nonces,
+#    for higher achievable TPS without nonce-gap stalls.
 #
-#  * Metrics: the executor/sealer Prometheus exporters bind 127.0.0.1 INSIDE
-#    their service container, which runs with host networking inside the node
-#    container (Nomad docker driver / DinD). So they are reachable from the
-#    node container's loopback. We scrape them exactly the way smoke.sh /
-#    ci-cluster.sh reach nodes: `docker exec kardamom-<node> curl 127.0.0.1:<port>`.
-#    Defaults (from the binaries' --metrics-addr defaults):
+#  * Metrics: the executor and sealer Prometheus exporters bind
+#    127.0.0.1 inside their service container, which runs with host
+#    networking inside the node container (Nomad docker driver, DinD).
+#    So they are reachable from the node container's loopback. This
+#    script scrapes them the same way smoke.sh and ci-cluster.sh reach
+#    nodes: `docker exec kardamom-<node> curl 127.0.0.1:<port>`.
+#    Defaults, from the binaries' --metrics-addr defaults:
 #       executor  kardamom-executor-0  127.0.0.1:9004  kardamom_executor_block_number
 #       sealer    kardamom-executor-0  127.0.0.1:9004  kardamom_sealer_block_number
-#    The clustered sealer (Java Aeron Cluster) has no Prometheus endpoint;
-#    executors re-export its boundary stream from cluster egress, so the
-#    sealer block metric is read from an executor node.
+#    The clustered sealer (Java Aeron Cluster) has no Prometheus
+#    endpoint. The executors re-export its boundary stream from cluster
+#    egress, so this script reads the sealer block metric from an
+#    executor node.
 #
 # ---------------------------------------------------------------------------
-# ENV KNOBS (all optional; sane defaults)
+# Environment variables (all optional, with reasonable defaults)
 # ---------------------------------------------------------------------------
 #   RPC_URL            ingress JSON-RPC          (default http://192.168.56.31:8545)
 #   CHAIN_ID           L2 chain id               (default 412346)
 #   SMOKE_DURATION_S   send for this many seconds(default 60)
 #   SMOKE_TPS          target tx/sec             (default 5)
-#   SMOKE_TX_COUNT     fixed tx count; if set it OVERRIDES duration*tps
+#   SMOKE_TX_COUNT     fixed tx count; overrides duration*tps if set
 #   SMOKE_SENDERS      number of sender accounts (default 4, max 16)
-#   SMOKE_SENDER_OFFSET  index of the first sender account in the 16-key table
-#                        (default 0). Set to 1 to reserve account #0 for the
-#                        single-tx smoke (scripts/smoke.sh) so their nonces do
-#                        not collide when both run against the same chain.
-#   SMOKE_NONCE_START  first nonce per sender    (default 0 — fresh chain)
+#   SMOKE_SENDER_OFFSET  index of the first sender account in the 16-key
+#                        table (default 0). Set to 1 to reserve account #0
+#                        for the single-tx smoke (scripts/smoke.sh), so
+#                        their nonces do not collide when both run against
+#                        the same chain.
+#   SMOKE_NONCE_START  first nonce per sender    (default 0, a fresh chain)
 #   SMOKE_RECEIPT_TIMEOUT_S  per-run receipt drain timeout (default 90)
 #   SMOKE_MAX_GAP      max allowed executor-behind-sealer block gap (default 5)
 #   GAS_PRICE          legacy gas price (wei)    (default 1000000000)
 #   VALUE              wei per transfer          (default 1)
 #   TO                 sink address              (default 0x...dEaD)
 #
-#   Node/metrics overrides (verify against a live cluster — see RETURN notes):
+#   Node and metrics overrides (verify these against a live cluster):
 #   EXECUTOR_NODES     space-separated node-container names that run an executor
 #                                  (default "kardamom-executor-0 ...-1 ...-2")
 #   SEALER_NODE        node-container to read the re-exported sealer metric
 #                                  from (default kardamom-executor-0)
 #   EXECUTOR_METRICS_PORT  (default 9004)
-#   SEALER_METRICS_PORT    (default 9004 — the executor exporter)
+#   SEALER_METRICS_PORT    (default 9004, the executor exporter)
 #   EXECUTOR_BLOCK_METRIC  (default kardamom_executor_block_number)
 #   SEALER_BLOCK_METRIC    (default kardamom_sealer_block_number)
-#   METRICS_VIA_DOCKER 1 => scrape via `docker exec <node> curl 127.0.0.1:port`
-#                      0 => scrape <node-ip>:port directly over the network
-#                           (only works if the exporter is bound to a routable
-#                           addr; by default it is NOT — it binds 127.0.0.1).
+#   METRICS_VIA_DOCKER 1 = scrape through `docker exec <node> curl 127.0.0.1:port`
+#                      0 = scrape <node-ip>:port directly over the network.
+#                          This works only if the exporter binds to a
+#                          routable address; by default it does not, since
+#                          it binds 127.0.0.1.
 #                      (default 1)
 #
 # Usage:
@@ -92,11 +99,12 @@
 # =============================================================================
 set -euo pipefail
 
-# This script uses associative arrays (declare -A), which need bash >= 4.
-# The CI orchestrator (the Linux runner that runs ci-cluster.sh / has cast +
-# docker + nomad) ships bash 5.x, so this is satisfied there. macOS' stock
-# /bin/bash is 3.2 — if you run this locally on a Mac, use Homebrew bash
-# (`brew install bash`). Fail fast with a clear message rather than a cryptic
+# This script uses associative arrays (declare -A), which need bash 4
+# or later. The CI orchestrator, the Linux runner that runs
+# ci-cluster.sh and has cast, docker, and nomad, ships bash 5.x, so
+# this is satisfied there. macOS' stock /bin/bash is 3.2. If you run
+# this locally on a Mac, use Homebrew bash (`brew install bash`). Fail
+# fast with a clear message, instead of a cryptic
 # `declare: -A: invalid option` later.
 if (( BASH_VERSINFO[0] < 4 )); then
   echo "ERROR: smoke-load.sh needs bash >= 4 (found ${BASH_VERSION})." >&2
@@ -108,8 +116,9 @@ log()  { echo "==> $*"; }
 warn() { echo "WARN: $*" >&2; }
 fail() { echo "RESULT: FAIL — $*" >&2; exit 1; }
 
-# Shared node-class model + Prometheus scrape/parse helpers. Neither lib
-# defines log/fail — the "RESULT: FAIL" contract above stays this script's.
+# Shared node-class model and Prometheus scrape and parse helpers.
+# Neither library defines log or fail; the "RESULT: FAIL" contract
+# above stays this script's own.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=deploy/cluster/scripts/lib-topology.sh
 source "${SCRIPT_DIR}/lib-topology.sh"
@@ -131,14 +140,16 @@ GAS_PRICE="${GAS_PRICE:-1000000000}"
 VALUE="${VALUE:-1}"
 TO="${TO:-0x000000000000000000000000000000000000dEaD}"
 
-# EXECUTOR_NODES (env-string override honored), SEALER_NODE,
-# EXECUTOR_METRICS_PORT and EXECUTOR_BLOCK_METRIC come from lib-topology.sh.
+# EXECUTOR_NODES (its env-string override works here), SEALER_NODE,
+# EXECUTOR_METRICS_PORT, and EXECUTOR_BLOCK_METRIC come from
+# lib-topology.sh.
 SEALER_METRICS_PORT="${SEALER_METRICS_PORT:-9004}"
 SEALER_BLOCK_METRIC="${SEALER_BLOCK_METRIC:-kardamom_sealer_block_number}"
 METRICS_VIA_DOCKER="${METRICS_VIA_DOCKER:-1}"
 
-# 16 well-known test-mnemonic accounts ("test test ... junk"), all prefunded
-# 1000 ETH in config/genesis/dev.toml. Index = account number. Public dev keys.
+# 16 well-known test-mnemonic accounts ("test test ... junk"), all
+# prefunded with 1000 ETH in config/genesis/dev.toml. Index equals
+# account number. These are public dev keys.
 SENDER_KEYS=(
   0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
   0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
@@ -158,12 +169,13 @@ SENDER_KEYS=(
   0x8166f546bab6da521a8369cab06c5d2b9e46670292d85c875ee9ec20e84ffb61
 )
 
-# Validate the sender offset and clamp the sender count to [1, 16], keeping the
-# offset+count window inside the 16-key table so senders never wrap back onto a
-# reserved low account (e.g. account #0, reserved for scripts/smoke.sh).
-# A NEGATIVE offset is a hard error rather than a clamp: silently clamping to 0
-# would land the load back on exactly the reserved account the knob exists to
-# avoid, reintroducing the nonce collision with no diagnostic.
+# Validate the sender offset, and clamp the sender count to [1, 16].
+# This keeps the offset-plus-count window inside the 16-key table, so
+# senders never wrap back onto a reserved low account, such as account
+# #0, reserved for scripts/smoke.sh. A negative offset is a hard error,
+# not a clamp. Silently clamping to 0 would land the load back on
+# exactly the reserved account this setting exists to avoid, and
+# reintroduce the nonce collision with no diagnostic.
 if (( SMOKE_SENDER_OFFSET < 0 )); then
   fail "SMOKE_SENDER_OFFSET=${SMOKE_SENDER_OFFSET} is negative (offset 0 is the reserved smoke account; pass 0..$(( ${#SENDER_KEYS[@]} - 1 )))"
 fi
@@ -233,10 +245,11 @@ ingress_block_number() {
 # ---------------------------------------------------------------------------
 
 # Fetch a node's /metrics body. $1=node-container $2=ip $3=port
-# METRICS_VIA_DOCKER keeps its documented either/or semantics (1 = docker-exec
-# ONLY, 0 = direct bridge ONLY — no silent fallback to the other transport,
-# which could scrape the wrong endpoint and surface as a bogus verdict);
-# fetch_metrics (lib-metrics.sh) skips whichever leg gets an empty argument.
+# METRICS_VIA_DOCKER keeps its documented either-or meaning: 1 means
+# docker-exec only, 0 means direct bridge only. There is no silent
+# fallback to the other transport, which could scrape the wrong
+# endpoint and produce a bogus verdict. fetch_metrics (lib-metrics.sh)
+# skips whichever leg gets an empty argument.
 scrape_metrics() {
   local node="$1" ip="$2" port="$3"
   if [[ "${METRICS_VIA_DOCKER}" == "1" ]]; then
@@ -246,8 +259,9 @@ scrape_metrics() {
   fi
 }
 
-# Read a node's block-number metric as an integer (empty if unavailable).
-# prom_value (lib-metrics.sh) int-truncates float/scientific gauge renderings.
+# Read a node's block-number metric as an integer, empty if
+# unavailable. prom_value (lib-metrics.sh) truncates a float or
+# scientific-notation gauge render to an int.
 # $1=node $2=ip $3=port $4=metric-name
 read_block_metric() {
   local body
@@ -256,12 +270,13 @@ read_block_metric() {
   prom_value "${body}" "$4" first
 }
 
-# Node -> IP map, generated from the node-class model in group_vars/all.yml
-# via lib-topology.sh's topology_load (the same single source of truth
-# ci-cluster.sh materialises the cluster from: <class>-<i> gets
-# ip_prefix.<ip_start+i>). Only needed when METRICS_VIA_DOCKER=0 (direct
-# bridge scrapes); an unmappable node is a hard error there — falling back to
-# 127.0.0.1 would scrape the WRONG host and surface as a bogus METRIC-MISSING.
+# Build a node-to-IP map, generated from the node-class model in
+# group_vars/all.yml, through lib-topology.sh's topology_load. This is
+# the same single source of truth ci-cluster.sh builds the cluster
+# from: <class>-<i> gets ip_prefix.<ip_start+i>. This map is only
+# needed when METRICS_VIA_DOCKER=0, for direct bridge scrapes. An
+# unmappable node is a hard error there; falling back to 127.0.0.1
+# would scrape the wrong host and produce a bogus METRIC-MISSING.
 if [[ "${METRICS_VIA_DOCKER}" != "1" ]]; then
   topology_load \
     || fail "METRICS_VIA_DOCKER=0 needs ${TOPOLOGY_GROUP_VARS} to derive node IPs"
@@ -278,8 +293,9 @@ node_ip() {
 # ---------------------------------------------------------------------------
 # 1. PRE-SIGN all txs offline (cast mktx, explicit nonce — no RPC round-trip).
 # ---------------------------------------------------------------------------
-# Round-robin senders; nonces are sequential PER sender starting at
-# SMOKE_NONCE_START. raw_txs[i] holds the i-th signed raw tx, sent in order.
+# Round-robin the senders. Nonces are sequential per sender, starting
+# at SMOKE_NONCE_START. raw_txs[i] holds the i-th signed raw tx, sent
+# in order.
 log "pre-signing ${TX_TOTAL} txs across ${SMOKE_SENDERS} sender(s)..."
 declare -a RAW_TXS=()
 declare -a SENDER_NONCE=()
@@ -288,8 +304,9 @@ for ((s=0; s<SMOKE_SENDERS; s++)); do SENDER_NONCE[s]=$SMOKE_NONCE_START; done
 for ((i=0; i<TX_TOTAL; i++)); do
   s=$(( i % SMOKE_SENDERS ))
   nonce=${SENDER_NONCE[s]}
-  # Logical sender `s` maps to key index `SMOKE_SENDER_OFFSET + s` so the run can
-  # start above reserved accounts (per-sender nonces are tracked by `s`).
+  # Logical sender `s` maps to key index `SMOKE_SENDER_OFFSET + s`, so
+  # the run can start above reserved accounts. Per-sender nonces are
+  # tracked by `s`.
   raw="$(cast mktx "${TO}" \
         --value "${VALUE}" \
         --private-key "${SENDER_KEYS[$(( SMOKE_SENDER_OFFSET + s ))]}" \
@@ -323,9 +340,10 @@ echo "    baseline ingress eth_blockNumber = ${INGRESS_BASE_BLOCK:-<unavailable>
 # ---------------------------------------------------------------------------
 # 3. SUBMIT the stream, pacing to ~SMOKE_TPS, recording submit time per tx.
 # ---------------------------------------------------------------------------
-# We submit one tx per "slot". With a fixed SMOKE_TX_COUNT (and no explicit
-# duration) we still pace at SMOKE_TPS. submit_ts[i]/hash[i] track each tx;
-# a per-tx interval keeps the offered load at the target rate.
+# This submits one tx per "slot". With a fixed SMOKE_TX_COUNT and no
+# explicit duration, it still paces at SMOKE_TPS. submit_ts[i] and
+# hash[i] track each tx. A per-tx interval keeps the offered load at
+# the target rate.
 log "submitting stream at ~${SMOKE_TPS} tx/s..."
 declare -a TX_HASH=()
 declare -a SUBMIT_TS=()
@@ -370,8 +388,9 @@ for ((i=0; i<${#RAW_TXS[@]}; i++)); do
     log "  submitted $((i+1))/${#RAW_TXS[@]} (ok=${SUBMIT_OK} err=${SUBMIT_ERR})"
   fi
 
-  # Pace: sleep until the next slot, accounting for elapsed time so we don't
-  # drift slower than the target rate. Only when an interval is configured.
+  # Pace by sleeping until the next slot, accounting for elapsed time,
+  # so the rate does not drift slower than the target. This runs only
+  # when an interval is configured.
   if [[ "${INTERVAL}" != "0" ]] && (( i + 1 < ${#RAW_TXS[@]} )); then
     target="$(awk -v s="${RUN_START}" -v n="$((i+1))" -v iv="${INTERVAL}" 'BEGIN{printf "%.6f", s + n*iv}')"
     sleep_for="$(awk -v t="${target}" -v now="$(date +%s.%N)" 'BEGIN{d=t-now; if (d<0) d=0; printf "%.6f", d}')"
@@ -385,10 +404,11 @@ ACHIEVED_TPS="$(awk -v n="${SUBMIT_OK}" -v t="${SUBMIT_ELAPSED}" 'BEGIN{ if (t>0
 log "submission done: ok=${SUBMIT_OK} err=${SUBMIT_ERR} in ${SUBMIT_ELAPSED}s (~${ACHIEVED_TPS} tx/s)"
 
 # ---------------------------------------------------------------------------
-# 4. MUST-DELIVER: drain receipts for every accepted tx within the timeout.
+# 4. Must-deliver: drain receipts for every accepted tx within the timeout.
 # ---------------------------------------------------------------------------
-# We poll eth_getTransactionReceipt for each accepted hash until present or the
-# global drain timeout elapses. Receipt latency = first-seen-time - submit-time.
+# This polls eth_getTransactionReceipt for each accepted hash, until
+# it is present or the global drain timeout elapses. Receipt latency
+# equals first-seen time minus submit time.
 log "draining receipts (timeout ${SMOKE_RECEIPT_TIMEOUT_S}s)..."
 declare -a LATENCY=()       # seconds, float, for txs that got a receipt
 RECEIPTED=0
@@ -406,7 +426,8 @@ receipt_for() {
 }
 
 receipt_status() {
-  # null result -> empty (not yet mined). Otherwise the status hex (0x1/0x0).
+  # A null result means empty, not yet mined. Otherwise, this is the
+  # status hex (0x1 or 0x0).
   if (( HAVE_JQ )); then
     printf '%s' "$1" | jq -r 'if .result==null then "" else (.result.status // "0x?") end' 2>/dev/null || true
   else
@@ -448,7 +469,7 @@ done
 
 MISSING=$(( SUBMIT_OK - RECEIPTED ))
 
-# Receipt-latency p50/p99 over the receipted txs.
+# Compute receipt-latency p50 and p99 over the receipted txs.
 LAT_P50="n/a"; LAT_P99="n/a"; LAT_MAX="n/a"
 if (( ${#LATENCY[@]} > 0 )); then
   read -r LAT_P50 LAT_P99 LAT_MAX < <(
@@ -464,17 +485,18 @@ if (( ${#LATENCY[@]} > 0 )); then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. KEEP-PACE: re-read block metrics; assert advance + bounded gap.
+# 5. Keep-pace: re-read block metrics, and assert advance and bounded gap.
 # ---------------------------------------------------------------------------
-# Give the pipeline a brief settle window so the last in-flight blocks commit
-# before we read the final gauges.
+# Give the pipeline a brief settle window, so the last in-flight
+# blocks commit before this reads the final gauges.
 log "settling 3s before final metric read..."
 sleep 3
 
 SEALER_FINAL="$(read_block_metric "${SEALER_NODE}" "$(node_ip "${SEALER_NODE}")" "${SEALER_METRICS_PORT}" "${SEALER_BLOCK_METRIC}")"
 INGRESS_FINAL_BLOCK="$(ingress_block_number)"
 
-# Failures are accumulated as node-name lists and acted on in the verdict.
+# This collects failures as node-name lists, and acts on them in the
+# verdict.
 FROZEN_NODES=""
 GAP_FAIL_NODES=""
 METRIC_MISSING=0
@@ -501,7 +523,8 @@ for node in "${EXECUTOR_NODES[@]}"; do
   verdict="OK"
   if [[ -n "${SEALER_FINAL}" ]]; then
     gap=$(( SEALER_FINAL - fin ))
-    # gap can be slightly negative if the executor read raced ahead; treat <0 as 0.
+    # The gap can be slightly negative if the executor read raced
+    # ahead. Treat a negative gap as 0.
     (( gap < 0 )) && gap=0
     if (( gap > SMOKE_MAX_GAP )); then
       verdict="GAP>${SMOKE_MAX_GAP}"
@@ -509,9 +532,9 @@ for node in "${EXECUTOR_NODES[@]}"; do
     fi
   fi
 
-  # Frozen check: if the sealer produced blocks during the run (so there was
-  # work to keep up with) but this executor did not advance at all, it is
-  # frozen. Only assert when we have both baselines.
+  # Frozen check: if the sealer produced blocks during the run, so
+  # there was work to keep up with, but this executor did not advance
+  # at all, it is frozen. This asserts only when both baselines exist.
   if [[ "${advanced}" != "?" && -n "${SEALER_BASE}" && -n "${SEALER_FINAL}" ]]; then
     sealer_adv=$(( SEALER_FINAL - SEALER_BASE ))
     if (( sealer_adv > 0 && advanced <= 0 )); then
@@ -525,7 +548,7 @@ for node in "${EXECUTOR_NODES[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# 6. SUMMARY + verdict
+# 6. Summary and verdict
 # ---------------------------------------------------------------------------
 echo
 echo "================= SMOKE-LOAD SUMMARY ================="
@@ -544,7 +567,7 @@ echo "max allowed gap    : ${SMOKE_MAX_GAP}"
 echo "====================================================="
 echo
 
-# --- verdict: any of these is a FAIL ---------------------------------------
+# --- verdict: any of these is a failure ---------------------------------------
 FAILED=0
 if (( SUBMIT_OK == 0 )); then
   echo "FAIL: ingress accepted ZERO txs (pipeline not reachable / not accepting)." >&2

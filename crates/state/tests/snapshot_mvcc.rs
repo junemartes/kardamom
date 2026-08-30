@@ -27,14 +27,14 @@ fn pre_n_snapshot_keeps_pre_n_view() {
         U256::from(999u64)
     );
 
-    // Apply block 2 — overwrites the slot.
+    // Apply block 2. This overwrites the slot.
     writer
         .delta_tx
         .send(common::simple_delta(2, addr, 200, 7, 12345))
         .unwrap();
     let snap_at_2 = writer.snapshot_rx.recv().unwrap();
 
-    // The OLD snapshot must still see the OLD values.
+    // The old snapshot must still see the old values.
     assert_eq!(
         snap_at_1.storage(addr, common::slot_key(7)).unwrap(),
         U256::from(999u64),
@@ -47,7 +47,7 @@ fn pre_n_snapshot_keeps_pre_n_view() {
         "pre-N snapshot must still see pre-N account balance"
     );
 
-    // The NEW snapshot sees the NEW values.
+    // The new snapshot sees the new values.
     assert_eq!(
         snap_at_2.storage(addr, common::slot_key(7)).unwrap(),
         U256::from(12345u64)

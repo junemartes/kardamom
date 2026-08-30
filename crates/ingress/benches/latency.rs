@@ -1,4 +1,4 @@
-//! End-to-end latency: client → proxy → mock executor → receipt.
+//! End-to-end latency. The path is: client, proxy, mock executor, receipt.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,7 +87,8 @@ fn bench_e2e_latency(c: &mut Criterion) {
         proxy
     });
 
-    // Pre-sign 1000 unique-sender txs so signing isn't on the hot path.
+    // Sign 1000 unique-sender txs ahead of time, so signing is not on the
+    // hot path.
     let pre: Vec<Bytes> = (0..1000)
         .map(|_| sign(&PrivateKeySigner::random(), 0))
         .collect();

@@ -1,5 +1,6 @@
-//! Reconstruction round-trip: encode → pack → unpack → decode should yield
-//! the original block frames. Mirrors the §6 conformance hook.
+//! Reconstruction round-trip: encode, pack, unpack, then decode should
+//! yield the original block frames. This mirrors the section 6 conformance
+//! hook.
 
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
@@ -90,10 +91,10 @@ fn roundtrip_five_blocks_grouped() {
     assert_eq!(reconstructed, expected_frames(&blocks));
 }
 
-/// P0: a DA store returning right-length WRONG bytes must be caught before
-/// reconstruction, not silently rebuilt into a wrong chain. The versioned
-/// hash is only a filename to the store — L1's commitment is the authority,
-/// so `recover_blocks` recomputes it.
+/// A DA store that returns wrong bytes of the right length must be caught
+/// before reconstruction, not silently rebuilt into a wrong chain. The
+/// versioned hash is only a filename to the store. L1's commitment is the
+/// authority, so `recover_blocks` recomputes it.
 #[test]
 fn corrupted_da_blob_is_rejected_against_its_commitment() {
     use kardamom_batcher::da_store::{BlobSource, FsBlobStore};
@@ -102,8 +103,8 @@ fn corrupted_da_blob_is_rejected_against_its_commitment() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsBlobStore::open(dir.path()).unwrap();
 
-    // Pack a real payload and register it under its TRUE versioned hash (the
-    // same helper the post path uses to derive what L1 commits to).
+    // Pack a real payload and register it under its true versioned hash.
+    // Use the same helper the post path uses to derive what L1 commits to.
     let blobs = kardamom_batcher::blob::pack_to_blobs(b"kardamom da integrity").unwrap();
     let sidecar = kardamom_batcher::l1::build_sidecar(blobs.clone()).unwrap();
     let vh = sidecar.versioned_hashes().next().unwrap();
@@ -113,9 +114,10 @@ fn corrupted_da_blob_is_rejected_against_its_commitment() {
     let good = store.fetch_blob(vh).unwrap();
     verify_blob_against_hash(vh, &good).expect("untouched blob must verify");
 
-    // Now corrupt the stored bytes in place, preserving length — the exact
-    // shape a size check cannot see. Field elements keep their high byte
-    // zero (BLS modulus), so flip a low byte inside the payload region.
+    // Now corrupt the stored bytes in place, keeping the length the same.
+    // This is exactly the shape a size check cannot see. Field elements
+    // keep their high byte zero (BLS modulus), so flip a low byte inside
+    // the payload region.
     let mut corrupt = good;
     corrupt[1234] ^= 0x01;
     store.put(vh, &corrupt).unwrap();

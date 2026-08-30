@@ -1,20 +1,19 @@
-//! Validator-side witness capture + stateless re-execution (spec:
-//! no-std-exec-core, phase 2).
+//! Validator-side witness capture and stateless re-execution.
 //!
 //! The validator is one of the state DB's three consumers, so witness
-//! collection lives HERE — the batcher stays state-free, and a witness-fed
+//! collection lives here. The batcher stays state-free, and a witness-fed
 //! prover downstream needs no state access at all.
 //!
 //! [`capture_block_witness`] runs the ordinary sequential block re-execution
-//! with a [`WitnessRecorder`] interposed at the snapshot seam, returning both
+//! with a [`WitnessRecorder`] placed at the snapshot seam. It returns both
 //! the execution output and the pre-state slice it read.
 //! [`reexecute_stateless`] replays the same records over nothing but that
-//! witness — the zk-guest execution shape. The two outputs must be
-//! IDENTICAL; `tests/stateless_reexec.rs` holds the round-trip contract.
-//! Since phase 3 the driver itself lives in the `no_std` exec core
-//! (`kardamom_exec_core::stateless`) and the stateless entry additionally
-//! re-derives every tx's identity (keccak tx_hash + k256 sender recovery);
-//! these wrappers are the validator-facing seam.
+//! witness, the zk-guest execution shape. The two outputs must be
+//! identical; `tests/stateless_reexec.rs` holds the round-trip contract.
+//! Since phase 3, the driver itself lives in the `no_std` exec core
+//! (`kardamom_exec_core::stateless`), and the stateless entry also
+//! re-derives every tx's identity (keccak tx_hash and k256 sender
+//! recovery). These wrappers are the validator-facing seam.
 
 use kardamom_engine::actor::BlockExecOutput;
 use kardamom_engine::witness::WitnessRecorder;
@@ -23,10 +22,10 @@ use kardamom_types::{ExecutionWitness, StateDatabase};
 
 use kardamom_engine::actor::BufferedRecord;
 
-/// Re-execute a block sequentially while capturing the pre-state witness
-/// AND the block's raw (granularity-1) access list. Returns the execution
-/// output, the canonical witness (keyed by `env.block_number`), and the BAL
-/// — the full prover input set for one block.
+/// Re-execute a block sequentially. Capture the pre-state witness and the
+/// block's raw (granularity-1) access list. Returns the execution output,
+/// the canonical witness (keyed by `env.block_number`), and the BAL: the
+/// full prover input set for one block.
 pub fn capture_block_witness<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
@@ -46,18 +45,19 @@ pub fn capture_block_witness<S: StateDatabase>(
     Ok((out, recorder.into_witness(env.block_number), bal))
 }
 
-/// Anchor a captured witness to the committed trie (spec: phase 3b): stamp
+/// Anchor a captured witness to the committed trie. Stamp
 /// `pre_state_root`, then build the [`WitnessProofs`] node set by
-/// RECOMPUTE-GUIDED COMPLETION — run the guest's own verify + post-root
-/// recompute, and resolve each named `MissingNode` by re-walking the stored
-/// trie with that position as a proof-retainer target. Completeness holds
-/// by construction: this function returning `Ok` IS the proof that the
-/// guest's identical recompute will succeed on the returned set.
+/// recompute-guided completion: run the guest's own verify and post-root
+/// recompute, and resolve each named `MissingNode` by walking the stored
+/// trie again with that position as a proof-retainer target. Completeness
+/// holds by construction: if this function returns `Ok`, that is the proof
+/// that the guest's identical recompute will succeed on the returned set.
 ///
-/// `tx` must be a read view of the COMMITTED state the witness was captured
-/// against — the root after block N-1, stamped here into the witness. The
-/// caller obtains it when the parent's commit settles (never block capture
-/// on an fsync; proving is asynchronous and batch-aligned).
+/// `tx` must be a read view of the committed state the witness was
+/// captured against: the root after block N-1, stamped here into the
+/// witness. The caller obtains it when the parent's commit settles. Never
+/// block capture on an fsync; proving runs asynchronously, aligned to
+/// batches.
 ///
 /// Returns the canonical proof set and the recomputed post-state root.
 pub fn anchor_block_witness<K: kardamom_state::trie::cursor::ReadKind>(
@@ -76,7 +76,7 @@ pub fn anchor_block_witness<K: kardamom_state::trie::cursor::ReadKind>(
 
     witness.pre_state_root = Some(pre_state_root);
 
-    // Initial targets: the read set + the write set, per trie.
+    // Initial targets: the read set and the write set, for each trie.
     let mut acct_targets: BTreeSet<Nibbles> = BTreeSet::new();
     let mut slot_targets: BTreeMap<alloy_primitives::Address, BTreeSet<Nibbles>> = BTreeMap::new();
     for a in &witness.accounts {
@@ -99,9 +99,9 @@ pub fn anchor_block_witness<K: kardamom_state::trie::cursor::ReadKind>(
             .insert(Nibbles::unpack(keccak256(key)));
     }
 
-    // Each round adds at least one NEW target; a repeat means the walk
-    // cannot supply what the recompute demands — a real incompleteness, not
-    // a fixed-point step. Fail closed rather than spin.
+    // Each round must add at least one new target. A repeat means the walk
+    // cannot supply what the recompute needs: a real incompleteness, not a
+    // fixed-point step. Fail rather than loop forever.
     loop {
         let mut nodes: Vec<bytes::Bytes> = Vec::new();
         let targets: Vec<Nibbles> = acct_targets.iter().copied().collect();
@@ -127,7 +127,7 @@ pub fn anchor_block_witness<K: kardamom_state::trie::cursor::ReadKind>(
             .map_err(|e| ExecutorError::State(format!("storage proof walk {addr}: {e}")))?;
             nodes.append(&mut snodes);
         }
-        // Canonical wire form: sorted by keccak, unique.
+        // Canonical wire form: sort by keccak hash, and remove duplicates.
         let mut keyed: Vec<(alloy_primitives::B256, bytes::Bytes)> =
             nodes.into_iter().map(|n| (keccak256(&n), n)).collect();
         keyed.sort_by_key(|(h, _)| *h);
@@ -161,11 +161,12 @@ pub fn anchor_block_witness<K: kardamom_state::trie::cursor::ReadKind>(
     }
 }
 
-/// Replay `records` over NOTHING but a witness — no state DB, no snapshot.
-/// Fail-closed three times over (phase 3): every tx record's identity is
-/// re-derived from its raw bytes (keccak tx_hash + k256 sender recovery),
-/// any read the witness does not cover aborts, and the recomputed access
-/// list must equal `expected_bal` at the frame's `granularity`.
+/// Replay `records` over nothing but a witness: no state DB, no snapshot.
+/// Three checks must all pass (phase 3): every tx record's identity is
+/// re-derived from its raw bytes (keccak tx_hash and k256 sender
+/// recovery), any read the witness does not cover aborts execution, and
+/// the recomputed access list must equal `expected_bal` at the frame's
+/// `granularity`.
 pub fn reexecute_stateless(
     witness: &ExecutionWitness,
     parent: Option<&PendingDelta>,

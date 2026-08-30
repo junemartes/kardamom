@@ -1,19 +1,20 @@
-//! S1/S2 — the L1↔L2 bridge round-trip.
+//! The L1-to-L2 bridge round trip.
 //!
-//! S1 ([`deposit_round_trip`]): `depositETH` on L1 → the da-watcher sees the
-//! finalized log → the sequencer orders a `DepositRef` → the executor mints
-//! and executes → a receipt keyed by the OP-style `source_hash` surfaces on
-//! L2. The credit is then proven **behaviourally**: the freshly-minted
-//! account spends its funds. (The ingress deliberately does not serve
-//! `eth_getBalance`, so "the money arrived" has to be demonstrated by using
-//! it — which is a stronger statement anyway.)
+//! [`deposit_round_trip`](deposit_round_trip): `depositETH` runs on L1. The da-watcher sees
+//! the finalized log. The sequencer orders a `DepositRef`. The executor
+//! mints funds and executes. A receipt, keyed by the OP-style `source_hash`,
+//! appears on L2. The test then proves the credit by behavior: the
+//! freshly-minted account spends its funds. (The ingress deliberately does
+//! not serve `eth_getBalance`, so the test must show "the money arrived" by
+//! using it, which is a stronger proof anyway.)
 //!
-//! S2 ([`withdrawal_round_trip`]): `initiateWithdrawal` on the L2 predeploy →
-//! the validator's attester posts an output root to the L1 oracle → warp past
-//! the finalization window → the test rebuilds the withdrawal leaf set and
-//! its Merkle proof (nothing in production builds user proofs today — that
-//! gap is exactly what this pins) → `finalizeWithdrawal` pays out on L1, and
-//! a replay of the same withdrawal reverts.
+//! [`withdrawal_round_trip`](withdrawal_round_trip): `initiateWithdrawal` runs on the L2
+//! predeploy. The validator's attester posts an output root to the L1
+//! oracle. The test warps past the finalization window, then rebuilds the
+//! withdrawal leaf set and its Merkle proof (nothing in production builds
+//! user proofs today, and this gap is exactly what the test pins down).
+//! `finalizeWithdrawal` pays out on L1, and a replay of the same withdrawal
+//! reverts.
 
 use std::time::Duration;
 
@@ -33,7 +34,7 @@ const DEPOSIT_WEI: u128 = 1_000_000_000_000_000_000;
 
 pub struct DepositParams {
     /// Dev-mnemonic index of the fresh L2 account the deposit mints to. It
-    /// must be otherwise unfunded so the later spend proves the mint landed.
+    /// must have no other funds, so the later spend proves the mint landed.
     pub beneficiary: usize,
     /// Dev-mnemonic index that receives the beneficiary's spend.
     pub payee: usize,
@@ -62,8 +63,8 @@ pub async fn deposit_round_trip(t: &Target, l1: &L1, p: DepositParams) -> Result
         .deposit_eth(beneficiary.address, U256::from(DEPOSIT_WEI))
         .await
         .context("depositETH")?;
-    // The da-watcher only reads FINALIZED logs; with --slots-in-an-epoch 1 a
-    // few blocks advance the finalized cursor past the deposit.
+    // The da-watcher reads only finalized logs. With `--slots-in-an-epoch 1`,
+    // a few blocks advance the finalized cursor past the deposit.
     l1.mine(6).await?;
 
     // --- L2: the deposit surfaces as a receipt keyed by source_hash. ------
@@ -84,7 +85,7 @@ pub async fn deposit_round_trip(t: &Target, l1: &L1, p: DepositParams) -> Result
 
     // --- The credit is real: the minted account spends it. ---------------
     // A transfer from an account that started with nothing can only succeed
-    // if the mint landed AND the executor's nonce/balance view agrees.
+    // if the mint landed and the executor's nonce and balance view agree.
     let spend = l2::sign_transfer(beneficiary, t.chain_id, 0, payee, 1_000)?;
     let out = t.rpc.send_raw(&spend.raw).await;
     let hash = out
@@ -94,8 +95,9 @@ pub async fn deposit_round_trip(t: &Target, l1: &L1, p: DepositParams) -> Result
     let spend_receipt = await_l2_receipt(t, spend.hash, "the spend").await?;
     assert_receipt_ok(&spend_receipt, "the spend")?;
 
-    // The deposit itself is not a regular tx (no nonce, gas price 0), so the
-    // applied counter moves by exactly the one spend beyond it.
+    // The deposit itself is not a regular transaction (it has no nonce, and
+    // gas price 0). So the applied counter moves by exactly one spend
+    // beyond it.
     t.wait_executor_applied(applied_before + 1.0, Duration::from_secs(15))
         .await
         .context("executor applied the spend")?;
@@ -103,8 +105,8 @@ pub async fn deposit_round_trip(t: &Target, l1: &L1, p: DepositParams) -> Result
 }
 
 /// Everything needed to finalize an initiated withdrawal on L1. Produced by
-/// [`initiate_withdrawal`], consumed by [`finalize_withdrawal`]; between the
-/// two the runner must stop the block clock (see [`finalize_withdrawal`]).
+/// [`initiate_withdrawal`], consumed by [`finalize_withdrawal`]. See
+/// [`finalize_withdrawal`] for a timing constraint between the two calls.
 pub struct WithdrawalTicket {
     pub nonce: U256,
     pub sender: Address,
@@ -116,19 +118,20 @@ pub struct WithdrawalTicket {
 
 #[derive(Default)]
 pub struct WithdrawalParams {
-    /// Dev-mnemonic index of the L2 account initiating the withdrawal. Must
-    /// be prefunded by the genesis in use (`chains/dev-withdrawals.toml`
-    /// funds index 0 only).
+    /// Dev-mnemonic index of the L2 account that starts the withdrawal. The
+    /// genesis in use must prefund it (`chains/dev-withdrawals.toml` funds
+    /// only index 0).
     pub withdrawer: usize,
 }
 
-/// L2 half: call `initiateWithdrawal` on the predeploy and rebuild the
-/// withdrawal's leaf set + Merkle proof from the emitted event.
+/// L2 half: call `initiateWithdrawal` on the predeploy, then rebuild the
+/// withdrawal's leaf set and Merkle proof from the emitted event.
 ///
-/// Rebuilding here is not a shortcut — it is the point. Nothing in
-/// production serves withdrawal proofs (the attester drops its leaves after
-/// posting, and `withdrawal_proof` has no caller outside tests), so a real
-/// withdrawer must reconstruct exactly this. The scenario pins that gap.
+/// Rebuilding the proof here is not a shortcut, it is the point. Nothing
+/// in production serves withdrawal proofs: the attester drops its leaves
+/// after posting, and `withdrawal_proof` has no caller outside tests. So a
+/// real withdrawer must reconstruct exactly this. The scenario pins down
+/// that gap.
 pub async fn initiate_withdrawal(
     t: &Target,
     l1: &L1,
@@ -142,10 +145,10 @@ pub async fn initiate_withdrawal(
     let recipient = Address::from([0x5Au8; 20]);
     let value = U256::from(DEPOSIT_WEI / 4);
 
-    // Fund the bridge first. `ETHLockbox` pays withdrawals out of ETH that was
-    // actually deposited — it is an escrow, not a mint — so a withdrawal with
-    // no backing deposit reverts on `finalizeWithdrawal`. Depositing here
-    // makes this a genuine round-trip: L1 → L2 → L1.
+    // Fund the bridge first. `ETHLockbox` pays withdrawals out of ETH that
+    // was actually deposited. It is an escrow, not a mint, so a
+    // withdrawal with no backing deposit reverts on `finalizeWithdrawal`.
+    // Depositing here makes this a genuine round trip: L1 to L2 to L1.
     let (block_hash, log_index) = l1
         .deposit_eth(withdrawer.address, U256::from(DEPOSIT_WEI))
         .await
@@ -204,21 +207,20 @@ pub async fn initiate_withdrawal(
 }
 
 /// L1 half: match the withdrawal to its attested output, warp past the
-/// finalization window, finalize, and check the payout + replay protection.
+/// finalization window, finalize, and check the payout and replay
+/// protection.
 ///
-/// `finalizeWithdrawal` needs the state root the attester committed to, and
-/// nothing exposes historical roots — so this matches against the
-/// validator's CURRENT root. That is sound because the chain quiesces on its
-/// own: blocks are committed only when they carry transactions (empty
-/// boundaries do not commit), so once the withdrawal's block lands and no
-/// further traffic follows, the validator's head root stays put and is
-/// exactly the root the attester attested.
+/// `finalizeWithdrawal` needs the state root the attester committed to, but
+/// nothing exposes historical roots. So this function samples the
+/// validator's state root over time and tests every distinct root it saw
+/// against every posted output (see the sampler below for why the current
+/// root alone is not enough).
 ///
-/// Do NOT stop the block clock before calling. The withdrawal's receipt is
-/// published when the tx EXECUTES, but its block is committed only at the
-/// next sealer boundary — freezing on receipt strands the tx in an
-/// uncommitted block, so it never reaches a state root and the attester
-/// never covers it.
+/// Do not stop the block clock before calling this function. The
+/// withdrawal's receipt is published when the transaction executes, but
+/// its block commits only at the next sealer boundary. Freezing on receipt
+/// strands the transaction in an uncommitted block, so it never reaches a
+/// state root, and the attester never covers it.
 pub async fn finalize_withdrawal(
     l1: &L1,
     ticket: WithdrawalTicket,
@@ -235,29 +237,30 @@ pub async fn finalize_withdrawal(
 
     let oracle = WithdrawalOutputOracle::new(l1.oracle, l1.provider());
 
-    // The attester carries this withdrawal's leaf in exactly ONE posted
-    // output: a post pairs the arriving state root with `leaves_through`,
-    // then `mark_attested` DROPS those leaves (and `on_leaves` refuses to
-    // re-add them for an already-attested block). So there is a single
-    // (state_root, withdrawals_root) pair on chain that can ever match, and
-    // its root is whichever one the feeder happened to deliver alongside —
-    // not necessarily the root that is still head by the time we look.
+    // The attester carries this withdrawal's leaf in exactly one posted
+    // output. A post pairs the arriving state root with `leaves_through`,
+    // then `mark_attested` drops those leaves (and `on_leaves` refuses to
+    // re-add them for an already-attested block). So exactly one
+    // (state_root, withdrawals_root) pair on chain can ever match. Its
+    // root is whichever root the feeder happened to deliver alongside it,
+    // which is not necessarily the root that is still head by the time
+    // this code looks.
     //
-    // Sampling only the CURRENT head root therefore raced: once a later
-    // block committed, the head moved off the attested root and no future
-    // post could match, so the remaining poll budget was dead time.
-    // Instead, remember every root the validator is observed at (cheap,
-    // 100 ms cadence, off the poll's own cadence so a fast block can't slip
-    // between two samples) and test them all. Proving against a historical
-    // root is exactly what `finalizeWithdrawal` expects — it takes the
-    // `state_root` as an explicit argument.
+    // Sampling only the current head root would race: once a later block
+    // commits, the head moves off the attested root, and no future post
+    // can match. The remaining poll time would then be wasted. Instead,
+    // this code remembers every root the validator was observed at (a
+    // cheap 100 ms sample, off the poll's own cadence, so a fast block
+    // cannot slip between two samples) and tests them all. Proving
+    // against a historical root is exactly what `finalizeWithdrawal`
+    // expects: it takes `state_root` as an explicit argument.
     let observed: std::sync::Arc<std::sync::Mutex<Vec<B256>>> = Default::default();
-    // Keep the most recent read error: a validator that died takes its mdbx
-    // env down unsteadily, and the resulting `MDBX_WANNA_RECOVERY` on the
-    // read-only open is the signal that separates "the stack fell over" from
-    // "the withdrawal was never attested". It used to surface directly
-    // because the poll read the root itself; now the sampler owns that read,
-    // so it has to carry the error out to the failure message.
+    // Keep the most recent read error. A validator that died leaves its
+    // mdbx environment in an unsteady state. The resulting
+    // `MDBX_WANNA_RECOVERY` error, on the read-only open, is the signal
+    // that tells "the stack fell over" apart from "the withdrawal was
+    // never attested". The sampler owns this read, so it must carry the
+    // error out to the failure message.
     let last_err: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
     let sampler_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = {
@@ -323,8 +326,9 @@ pub async fn finalize_withdrawal(
     let (output_index, state_root) = found.with_context(|| {
         let roots = observed.lock().expect("observed roots poisoned").len();
         match last_err.lock().expect("sampler error poisoned").as_deref() {
-            // A read error means the stack fell over, not that attestation
-            // is broken — say so instead of blaming the attester.
+            // A read error means the stack fell over. It does not mean
+            // attestation is broken, so say so instead of blaming the
+            // attester.
             Some(e) => format!(
                 "could not track the validator's state roots ({roots} sampled before the last \
                  failure) — the validator's state DB became unreadable, which is what an unclean \
@@ -361,14 +365,14 @@ pub async fn finalize_withdrawal(
             U256::ZERO,
             proof.clone(),
         )
-        // Explicit gas: skip estimation, which is where the alloy/anvil
-        // post-warp flake in `withdrawal_e2e.rs` bites.
+        // Use explicit gas to skip estimation. Gas estimation is where the
+        // alloy/anvil post-warp flake in `withdrawal_e2e.rs` bites.
         .gas(2_000_000)
         .send()
         .await
         .context("send finalizeWithdrawal")?;
     let tx_hash = *pending.tx_hash();
-    // Poll the receipt manually rather than using alloy's watcher (same
+    // Poll the receipt by hand instead of using alloy's watcher (same
     // flake).
     let receipt = poll_until(
         "finalizeWithdrawal receipt",
@@ -391,10 +395,10 @@ pub async fn finalize_withdrawal(
         "recipient balance {before} -> {after}, expected +{value}"
     );
 
-    // Replaying the same withdrawal must fail: the lockbox flags the leaf on
-    // finalize (`AlreadyFinalized`). With explicit gas there is no pre-flight
-    // estimation, so the revert surfaces in the RECEIPT, not at send time —
-    // and the recipient must not be paid twice.
+    // Replaying the same withdrawal must fail. The lockbox flags the leaf
+    // on finalize (`AlreadyFinalized`). With explicit gas there is no
+    // pre-flight estimation, so the revert appears in the receipt, not at
+    // send time. The recipient must not be paid twice.
     let replay = lockbox
         .finalizeWithdrawal(
             wtx,
@@ -408,7 +412,7 @@ pub async fn finalize_withdrawal(
         .send()
         .await;
     match replay {
-        Err(_) => {} // rejected outright — also acceptable
+        Err(_) => {} // an outright rejection is also acceptable
         Ok(pending) => {
             let hash = *pending.tx_hash();
             let receipt = poll_until(

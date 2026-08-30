@@ -1,11 +1,11 @@
-//! `ClusterRefPublisher` — the sequencer's `TxOrderingRefPublisher` backed by
-//! cluster ingress.
+//! `ClusterRefPublisher`: the sequencer's `TxOrderingRefPublisher`, backed
+//! by cluster ingress.
 //!
-//! Plugged into the sequencer in place of the Aeron `kardamom_log` publisher in
-//! cluster mode. The sequencer actor is unchanged: it still calls
-//! `try_publish_ref` / `try_publish_epoch`, and a back-pressured (or
-//! not-yet-connected) cluster offer surfaces as `SequencerError::Backpressure`
-//! so the existing rewind/retry path applies.
+//! This replaces the Aeron `kardamom_log` publisher in cluster mode. The
+//! sequencer actor is unchanged: it still calls `try_publish_ref` and
+//! `try_publish_epoch`. A back-pressured, or not-yet-connected, cluster
+//! offer surfaces as `SequencerError::Backpressure`, so the existing
+//! rewind-and-retry path applies.
 
 use kardamom_types::{EpochRecord, TxRef};
 
@@ -19,10 +19,11 @@ use kardamom_cluster_adapter::{
     LiveCluster, LiveClusterConfig, LiveEgress, LiveError, LiveIngress, live,
 };
 
-/// Cloning shares the single underlying cluster session: each clone holds a
-/// clone of the ingress (a `Sender<OfferReq>`), so offers from every clone
-/// serialise through the one session thread — correct single-writer behaviour
-/// for the sequencer's main loop + deposit pump publishing concurrently.
+/// Cloning this struct shares the one underlying cluster session. Each
+/// clone holds a clone of the ingress (a `Sender<OfferReq>`), so offers
+/// from every clone serialize through the one session thread. This gives
+/// correct single-writer behavior when the sequencer's main loop and
+/// deposit pump publish at the same time.
 #[derive(Clone)]
 pub struct ClusterRefPublisher<I: ClusterIngress + Clone> {
     ingress: I,
@@ -36,9 +37,9 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
     fn offer(&mut self, bytes: &[u8]) -> Result<(), SequencerError> {
         match self.ingress.offer(bytes) {
             OfferOutcome::Accepted => Ok(()),
-            // Both back-pressure and a transient disconnect map to the
-            // sequencer's recoverable back-pressure: rewind and retry. Failover
-            // / reconnect is handled inside the cluster client.
+            // Both backpressure and a transient disconnect map to the
+            // sequencer's recoverable backpressure: rewind and retry. The
+            // cluster client handles failover and reconnect internally.
             OfferOutcome::BackPressured | OfferOutcome::NotConnected => {
                 Err(SequencerError::Backpressure)
             }
@@ -82,10 +83,11 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
     }
 
     fn try_publish_epoch(&mut self, e: &EpochRecord) -> Result<(), SequencerError> {
-        // KIND_ORIGIN_RECORD, not a plain record: the sealer must close the
-        // open block and adopt this epoch's L1 number before relaying it.
-        // Epochs are never batched — one per L1 block, and each one forces a
-        // boundary, so there is nothing to amortize.
+        // This uses KIND_ORIGIN_RECORD, not a plain record. The sealer
+        // must close the open block and adopt this epoch's L1 number
+        // before it relays the record. Epochs are never batched: there is
+        // one per L1 block, and each one forces a boundary, so there is
+        // nothing to amortize.
         let bytes = wire::encode_ingress_epoch(e)
             .map_err(|err| SequencerError::EncodeFailed(format!("epoch: {err}")))?;
         self.offer(&bytes)
@@ -93,7 +95,7 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
 }
 
 /// Connect to the cluster and wrap ingress as a `TxOrderingRefPublisher`.
-/// The returned `LiveCluster` guard MUST be kept alive while the publisher is used.
+/// Keep the returned `LiveCluster` guard alive while the publisher is in use.
 pub fn cluster_ref_publisher(
     rt: kardamom_log::aeron_live::AeronRuntime,
     cfg: LiveClusterConfig,
@@ -102,23 +104,24 @@ pub fn cluster_ref_publisher(
     Ok((cluster, ClusterRefPublisher::new(ingress)))
 }
 
-/// [`cluster_ref_publisher`], but KEEPING the egress receiver. The cluster
-/// broadcasts every relayed record and boundary to publisher sessions too
-/// (load-bearing for the executors' broadcast; previously discarded here) —
-/// the boundary frames carry `end_tx_idx`, the global canonical count the
-/// lag-resync watermark trigger runs on
-/// (docs/agents/sequencer-lag-resync-spec.md). Dropping the returned
-/// `LiveEgress` restores the old discard behaviour.
+/// Like [`cluster_ref_publisher`], but keeps the egress receiver. The
+/// cluster also broadcasts every relayed record and boundary to publisher
+/// sessions. This broadcast is load-bearing for the executors; this
+/// function used to discard it. The boundary frames carry `end_tx_idx`,
+/// the global canonical count that the lag-resync watermark trigger runs
+/// on (see docs/agents/sequencer-lag-resync-spec.md). Drop the returned
+/// `LiveEgress` to restore the old discard behavior.
 pub fn cluster_ref_publisher_with_egress(
     rt: kardamom_log::aeron_live::AeronRuntime,
     cfg: LiveClusterConfig,
 ) -> Result<(LiveCluster, ClusterRefPublisher<LiveIngress>, LiveEgress), LiveError> {
-    // Boundaries + contiguity rejects ONLY: line-rate record frames are
-    // dropped at the session thread instead of being allocated + channelled
-    // to a receiver that discards them (the session thread also services the
-    // publish offers). The reject frames (#85 fix B) are the sealer telling
-    // THIS publisher a known sender's ref would seal a nonce gap — the
-    // watermark thread forwards them into the rewind path.
+    // Only boundaries and contiguity rejects pass through. Line-rate record
+    // frames are dropped at the session thread, instead of being allocated
+    // and channelled to a receiver that discards them (the session thread
+    // also services the publish offers). A reject frame is the sealer
+    // telling this publisher that a known sender's ref would seal a nonce
+    // gap. The watermark thread forwards reject frames into the rewind
+    // path.
     let (cluster, ingress, egress) = live::connect_with_egress_kind_filter(
         rt,
         cfg,
@@ -161,12 +164,12 @@ mod tests {
         pubr.try_publish_ref(&r, sender, 9).unwrap();
         let sent = ingress.accepted();
         assert_eq!(sent.len(), 1);
-        // The guard header carries the sender + nonce for the sealer.
+        // The guard header carries the sender and nonce for the sealer.
         assert_eq!(
             kardamom_cluster_adapter::wire::ingress_sender_nonce(&sent[0]).unwrap(),
             (sender, 9)
         );
-        // The Java service relays from the canonical id; that round-trips
+        // The Java service relays from the canonical id. That round-trips
         // back to the same TxRef.
         let (_cid, relayed) = split_ingress(&sent[0]).unwrap();
         match decode_egress(&encode_egress_record(0, relayed)).unwrap() {
@@ -175,9 +178,9 @@ mod tests {
         }
     }
 
-    /// An epoch must go out as KIND_ORIGIN_RECORD, not a plain record: the
-    /// kind byte is what makes the sealer close the block and adopt the
-    /// origin, so getting it wrong would silently strand deposits mid-block.
+    /// An epoch must go out as KIND_ORIGIN_RECORD, not a plain record.
+    /// The kind byte makes the sealer close the block and adopt the origin.
+    /// Getting it wrong would silently strand deposits mid-block.
     #[test]
     fn publishes_epoch_as_an_origin_record_envelope() {
         let ingress = FakeIngress::new();
@@ -201,7 +204,7 @@ mod tests {
             4_242,
             "the sealer reads the origin from this fixed offset"
         );
-        // Marker + 1 deposit.
+        // Marker plus 1 deposit.
         assert_eq!(u32::from_le_bytes(sent[0][41..45].try_into().unwrap()), 2);
     }
 

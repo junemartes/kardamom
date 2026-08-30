@@ -1,4 +1,4 @@
-//! S13 — L1-governed upgrades: feature flags activated from L1.
+//! L1-governed upgrades: feature flags activated from L1.
 //!
 //! The full chain under test, end to end:
 //!
@@ -12,18 +12,18 @@
 //!   → every subsequent block close records a health beacon
 //! ```
 //!
-//! Three scenarios: [`activates_immediately`] (activation 0 — the flag is live
-//! from the block carrying the upgrade), [`activates_at_timestamp`] (scheduled
-//! — nothing happens until the chain's own clock reaches T), and
-//! [`authority_is_enforced`] (neither an L1 stranger nor an L2 user can reach
-//! the flag store).
+//! Three scenarios: [`activates_immediately`] (activation 0: the flag is
+//! live from the block that carries the upgrade), [`activates_at_timestamp`]
+//! (scheduled: nothing happens until the chain's own clock reaches T), and
+//! [`authority_is_enforced`] (neither an L1 stranger nor an L2 user can
+//! reach the flag store).
 //!
-//! **Assertions are exact, not "eventually".** The beacon count, the head
-//! block and the activation word all come from ONE mdbx snapshot
-//! ([`read_chain_state`]), and headers + storage commit in a single write
-//! transaction, so `beats == head - first_active_block + 1` holds precisely.
-//! A greater-than-zero check would pass just as well against a beacon that
-//! fired once and stopped — which is the actual failure mode worth catching.
+//! The checks are exact, not "eventually". The beacon count, the head
+//! block, and the activation word all come from one mdbx snapshot
+//! ([`read_chain_state`]). Headers and storage commit in a single write
+//! transaction, so `beats == head - first_active_block + 1` holds exactly.
+//! A greater-than-zero check would also pass for a beacon that fired once
+//! and then stopped, which is the real failure this test must catch.
 
 use std::path::Path;
 use std::time::Duration;
@@ -39,7 +39,7 @@ use crate::harness::l1::{DEPOSITOR_KEY, L1};
 use crate::harness::l2::{self, DerivedSigner};
 use crate::harness::metrics::poll_until;
 
-/// The health check — feature 1. Matches
+/// The health check, feature 1. This matches
 /// `kardamom_exec_core::features::FEATURE_HEALTH_CHECK` and
 /// `KardamomChainState.FEATURE_HEALTH_CHECK`.
 const FEATURE_HEALTH_CHECK: u64 = 1;
@@ -47,9 +47,9 @@ const FEATURE_HEALTH_CHECK: u64 = 1;
 /// A feature id that is never scheduled, used by the negative controls.
 const FEATURE_UNUSED: u64 = 2;
 
-/// How far ahead of "now" a scheduled activation is set. Blocks close every
-/// 250 ms, so this leaves several blocks provably inactive before T while
-/// keeping the scenario short.
+/// How far ahead of "now" a scheduled activation is set. Blocks close
+/// every 250 ms. This leaves several blocks that are provably inactive
+/// before T, while keeping the scenario short.
 const SCHEDULE_AHEAD_MS: u64 = 4_000;
 
 pub struct Params {
@@ -63,7 +63,8 @@ impl Default for Params {
     }
 }
 
-/// Wait until `state_dir` has committed at least `block` and return the view.
+/// Wait until `state_dir` has committed at least `block`, then return
+/// the view.
 async fn state_at_or_past(state_dir: &Path, block: u64, what: &str) -> Result<ChainStateView> {
     poll_until(
         &format!("{what} committed through block {block}"),
@@ -77,8 +78,8 @@ async fn state_at_or_past(state_dir: &Path, block: u64, what: &str) -> Result<Ch
     .await
 }
 
-/// Assert the beacon beat in EVERY block from `first_active` through the
-/// snapshot's head, and that it carries that head block's own identity.
+/// Check that the beacon beat in every block from `first_active` through
+/// the snapshot's head, and that it carries the head block's own identity.
 fn assert_beat_every_block(v: &ChainStateView, first_active: u64, role: &str) -> Result<()> {
     let expected = v
         .block_number
@@ -93,8 +94,9 @@ fn assert_beat_every_block(v: &ChainStateView, first_active: u64, role: &str) ->
          stopped firing after activation",
         v.block_number
     );
-    // The beacon's own fields pin the packing against real chain data: a
-    // mis-shifted field would still count correctly but name the wrong block.
+    // The beacon's own fields check the packing against real chain data. A
+    // shifted field would still count correctly, but it would name the
+    // wrong block.
     anyhow::ensure!(
         beacon_block == v.block_number,
         "{role}: beacon names block {beacon_block}, head is {}",
@@ -108,12 +110,13 @@ fn assert_beat_every_block(v: &ChainStateView, first_active: u64, role: &str) ->
     Ok(())
 }
 
-/// The validator independently reached the same conclusion.
+/// The validator reached the same conclusion on its own.
 ///
-/// This is the real proof of activation parity: the validator re-executes every
-/// block and compares its own write set against the executor's published one,
-/// so identical beacons on both sides mean both roles activated the feature at
-/// the same block. A divergence here is a fail-stop, not a flaky assert.
+/// This is the real proof of activation parity. The validator re-executes
+/// every block and compares its own write set against the executor's
+/// published one. So identical beacons on both sides mean both roles
+/// activated the feature at the same block. A divergence here stops the
+/// test; it is not a flaky check.
 async fn assert_validator_agrees(
     t: &Target,
     validator_state_dir: &Path,
@@ -150,8 +153,8 @@ async fn assert_validator_agrees(
     Ok(())
 }
 
-/// Send an upgrade transaction and wait for its system deposit to execute on
-/// L2. Returns the block the `setFeature` landed in.
+/// Send an upgrade transaction, then wait for its system deposit to
+/// execute on L2. Returns the block where `setFeature` landed.
 async fn upgrade_and_await(
     t: &Target,
     l1: &L1,
@@ -168,13 +171,13 @@ async fn upgrade_and_await(
         "the upgrade transaction did not advance the L1 nonce"
     );
 
-    // The watcher only reads FINALIZED logs; --slots-in-an-epoch 1 means a few
-    // blocks carry the cursor past the upgrade.
+    // The watcher reads only finalized logs. With `--slots-in-an-epoch 1`, a
+    // few blocks carry the cursor past the upgrade.
     l1.mine(6).await?;
 
-    // The system deposit is keyed by the DOMAIN-1 source hash. Using the
-    // user-deposit hash here would poll forever — that difference is the
-    // domain separation doing its job.
+    // The system deposit uses the domain-1 source hash as its key. The
+    // user-deposit hash would poll forever here. That difference shows the
+    // domain separation is working.
     let source_hash = kardamom_da_watcher::source_hash_system(block_hash, log_index);
     let receipt = await_l2_receipt(t, source_hash, "the upgrade transaction").await?;
     assert_receipt_ok(&receipt, "the upgrade transaction")?;
@@ -188,11 +191,11 @@ async fn upgrade_and_await(
 }
 
 // ---------------------------------------------------------------------------
-// S13a — immediate activation
+// Immediate activation
 // ---------------------------------------------------------------------------
 
-/// The requested full-flow exercise: multisig-authorized L1 transaction turns
-/// a protocol feature on, and it stays on for every subsequent block.
+/// The full-flow exercise: a multisig-authorized L1 transaction turns on
+/// a protocol feature, and it stays on for every later block.
 pub async fn activates_immediately(
     t: &Target,
     l1: &L1,
@@ -206,19 +209,19 @@ pub async fn activates_immediately(
         "the feature must start unscheduled and unfired: {before:?}"
     );
 
-    // --- L1 → L2: schedule with activation 0 (immediately). --------------
+    // --- L1 to L2: schedule with activation 0 (immediately). --------------
     let activation_block = upgrade_and_await(t, l1, FEATURE_HEALTH_CHECK, 0).await?;
 
-    // --- Let a few more blocks close, then take ONE consistent read. -----
+    // --- Let a few more blocks close, then take one consistent read. -----
     let v = state_at_or_past(executor_state_dir, activation_block + 3, "executor").await?;
     anyhow::ensure!(
         !v.activation.is_zero(),
         "setFeature did not write an activation timestamp: {v:?}"
     );
 
-    // An immediate upgrade resolves to the executing block's timestamp, which
-    // is strictly below its own boundary's stamp — so the upgrade's OWN block
-    // is the first beating block.
+    // An immediate upgrade resolves to the executing block's timestamp. That
+    // timestamp is strictly below its own boundary's stamp. So the
+    // upgrade's own block is the first block that beats.
     assert_beat_every_block(&v, activation_block, "executor")?;
 
     assert_validator_agrees(t, validator_state_dir, activation_block, v.block_number).await?;
@@ -226,11 +229,12 @@ pub async fn activates_immediately(
 }
 
 // ---------------------------------------------------------------------------
-// S13b — scheduled activation
+// Scheduled activation
 // ---------------------------------------------------------------------------
 
-/// A scheduled upgrade must do nothing until the chain's own clock reaches the
-/// activation time, then fire from the first block at or after it.
+/// A scheduled upgrade must do nothing until the chain's own clock
+/// reaches the activation time. It then fires from the first block at or
+/// after that time.
 pub async fn activates_at_timestamp(
     t: &Target,
     l1: &L1,
@@ -243,10 +247,10 @@ pub async fn activates_at_timestamp(
         "the feature must start unscheduled and unfired: {before:?}"
     );
 
-    // The chain's clock is the sealer's leader clock in MILLISECONDS, so the
-    // schedule is anchored to the chain's own notion of now — reading it off
-    // the head block rather than from wall-clock keeps the two in the same
-    // frame even if the host clock and the sealer's disagree.
+    // The chain's clock is the sealer's leader clock, in milliseconds. So
+    // the schedule anchors to the chain's own idea of "now". Reading it
+    // from the head block, not the wall clock, keeps the two in the same
+    // frame even if the host clock and the sealer's clock disagree.
     let head_ts = super::derivation::read_block_origins(executor_state_dir)?
         .last()
         .map(|b| b.l2_timestamp)
@@ -256,12 +260,12 @@ pub async fn activates_at_timestamp(
     let scheduled_block = upgrade_and_await(t, l1, FEATURE_HEALTH_CHECK, activation_ts).await?;
 
     // --- Scheduled is not active. ----------------------------------------
-    // Wait for the scheduling block to COMMIT before reading state. A receipt
-    // is published when its transaction executes, but the block reaches mdbx
-    // only at the next sealer boundary — reading straight off the receipt sees
-    // `activation == 0` and reads as a product failure. (This is the same trap
-    // `derivation::await_block_origins_through` documents; it survived a
-    // single-test run and only surfaced under the full suite's timing.)
+    // Wait for the scheduling block to commit before reading state. A
+    // receipt is published when its transaction executes, but the block
+    // reaches mdbx only at the next sealer boundary. Reading straight off
+    // the receipt would see `activation == 0` and look like a product
+    // failure. `derivation::await_block_origins_through` documents the
+    // same trap.
     let pending = state_at_or_past(executor_state_dir, scheduled_block, "executor").await?;
     anyhow::ensure!(
         pending.activation == U256::from(activation_ts),
@@ -270,10 +274,11 @@ pub async fn activates_at_timestamp(
         pending.activation
     );
 
-    // "Scheduled is not yet active" is only assertable while no committed
-    // block has reached T. Headers are read AFTER the state, so they cover at
-    // least the blocks that state view saw — the comparison is sound even
-    // though the two reads are separate transactions.
+    // The check "scheduled but not yet active" only holds while no
+    // committed block has reached T. This code reads headers after the
+    // state, so the headers cover at least the blocks the state view saw.
+    // The comparison is sound even though the two reads use separate
+    // transactions.
     let so_far = super::derivation::read_block_origins(executor_state_dir)?;
     let reached_t = so_far
         .iter()
@@ -306,8 +311,8 @@ pub async fn activates_at_timestamp(
         "a FUTURE activation must not fire in the block that scheduled it \
          (first active {first_active}, scheduled in {scheduled_block})"
     );
-    // The predecessor must be strictly before T — otherwise `first_active` is
-    // not actually the first.
+    // The block before it must be strictly before T. Otherwise
+    // `first_active` is not really the first.
     if let Some(prev) = headers.iter().find(|b| b.block_number == first_active - 1) {
         anyhow::ensure!(
             prev.l2_timestamp < activation_ts,
@@ -325,12 +330,13 @@ pub async fn activates_at_timestamp(
 }
 
 // ---------------------------------------------------------------------------
-// S13c — authority
+// Authority
 // ---------------------------------------------------------------------------
 
-/// Neither side of the flag store is reachable without authority: not the L1
-/// entry point (any address but the factory owner), and not the L2 predeploy
-/// (any sender but the derivation pipeline's system address).
+/// Neither side of the flag store is reachable without authority. Not
+/// the L1 entry point (any address except the factory owner), and not
+/// the L2 predeploy (any sender except the derivation pipeline's system
+/// address).
 pub async fn authority_is_enforced(
     t: &Target,
     l1: &L1,
@@ -352,9 +358,9 @@ pub async fn authority_is_enforced(
     );
 
     // --- L2: a user transaction cannot write the flag store. -------------
-    // setFeature(FEATURE_UNUSED, 0) sent as an ordinary L2 transaction. It
-    // reaches the predeploy and reverts on the sender check, which is exactly
-    // the defence-in-depth the contract exists to provide.
+    // setFeature(FEATURE_UNUSED, 0) is sent as an ordinary L2 transaction.
+    // It reaches the predeploy and reverts on the sender check. This is
+    // the defense-in-depth the contract exists to provide.
     let signers: Vec<DerivedSigner> = l2::dev_signers(p.intruder as u32 + 1)?;
     let intruder = &signers[p.intruder];
     let calldata = kardamom_types::upgrades::encode_set_feature(U256::from(FEATURE_UNUSED), 0);
@@ -378,8 +384,8 @@ pub async fn authority_is_enforced(
         "a user transaction was allowed to write the feature-flag store: {receipt}"
     );
 
-    // The chain state is untouched: no activation, and — since the health
-    // check was never scheduled in this scenario — no beacon either.
+    // The chain state is untouched: no activation, and no beacon either,
+    // since this scenario never scheduled the health check.
     let v = read_chain_state(executor_state_dir)?;
     anyhow::ensure!(
         v.activation.is_zero() && v.beats() == 0,

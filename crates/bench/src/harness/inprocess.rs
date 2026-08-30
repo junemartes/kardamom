@@ -1,6 +1,6 @@
-//! In-process ingress stand-in: the real `IngressProxy` over in-memory
-//! [`MockChannels`] plus a trivial "fake executor" that reflects every
-//! published `TxEnvelope` straight back as a success `Receipt`.
+//! This is an in-process ingress stand-in: the real `IngressProxy` over
+//! in-memory [`MockChannels`], with a simple fake executor that reflects
+//! every published `TxEnvelope` straight back as a success `Receipt`.
 
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 
@@ -9,21 +9,23 @@ use kardamom_types::{AckPolicy, BPosition, Receipt};
 
 use crate::config::{MAX_IN_FLIGHT_SLACK, REQUEST_TIMEOUT};
 
-/// Spin up an in-process [`IngressProxy`] over in-memory [`MockChannels`] plus
-/// a trivial "fake executor" that turns every published `TxEnvelope` straight
-/// into a success `Receipt`. Returns a jsonrpsee client pointed at the proxy's
-/// ephemeral loopback port and a handle that stops everything on
-/// [`InProcessIngress::shutdown`].
+/// Start an in-process [`IngressProxy`] over in-memory [`MockChannels`],
+/// with a simple fake executor that turns every published `TxEnvelope`
+/// straight into a success `Receipt`. Returns a jsonrpsee client that
+/// points at the proxy's ephemeral loopback port, and a handle that
+/// stops everything on [`InProcessIngress::shutdown`].
 ///
-/// This is the decoupled stand-in backing the profiling
-/// [`Harness`](crate::harness::Harness) and the crate's smoke tests after
-/// `kardamom-node` was removed: it exercises the real ingress hot path (sig
-/// recovery, routing, RPC framing, receipt release) without a live Aeron media
-/// driver or the real sequencer/executor/sealer. The full in-process Aeron
-/// pipeline harness is tracked as a follow-up.
+/// This is the stand-in behind the profiling
+/// [`Harness`](crate::harness::Harness) and the crate's smoke tests,
+/// used since the removal of `kardamom-node`. It exercises the real
+/// ingress hot path (signature recovery, routing, RPC framing, receipt
+/// release) with no live Aeron media driver and no real sequencer,
+/// executor, or sealer. A full in-process Aeron pipeline harness is a
+/// follow-up item.
 ///
-/// `ack_policy` is forced to [`AckPolicy::OnOffer`] so a submission is released
-/// on receipt arrival alone — there is no recorder/quorum watermark here.
+/// `ack_policy` is forced to [`AckPolicy::OnOffer`], so a submission is
+/// released as soon as its receipt arrives. There is no recorder or
+/// quorum watermark here.
 pub async fn spawn_inprocess_ingress(
     chain_id: u64,
     shards: u32,
@@ -32,10 +34,10 @@ pub async fn spawn_inprocess_ingress(
     let (mock, shard_rxs) = MockChannels::new(shards as usize);
     let receipt_tx = mock.receipt_bus.clone();
 
-    // One fake-executor task per shard: drain published envelopes and reflect a
-    // success receipt back onto the receipt bus so the proxy releases the
-    // parked submission. `from`/`nonce` mirror exactly what the proxy parked on
-    // (it keys pending submissions by `(sender, nonce)`).
+    // One fake-executor task runs per shard. It drains published envelopes and
+    // sends a success receipt back on the receipt bus, so the proxy releases
+    // the parked submission. `from` and `nonce` match what the proxy parked
+    // on, because it keys pending submissions by `(sender, nonce)`.
     let mut fake_exec = Vec::with_capacity(shard_rxs.len());
     for (shard, mut rx) in shard_rxs.into_iter().enumerate() {
         let receipt_tx = receipt_tx.clone();
@@ -56,8 +58,8 @@ pub async fn spawn_inprocess_ingress(
                     from: env.sender,
                     ..Default::default()
                 };
-                // A send error means the broadcast bus has no receivers, i.e.
-                // the proxy is gone — nothing left to release.
+                // A send error means the broadcast bus has no receivers.
+                // The proxy is gone, so there is nothing left to release.
                 if receipt_tx.send(receipt).is_err() {
                     break;
                 }
@@ -82,8 +84,9 @@ pub async fn spawn_inprocess_ingress(
     Ok((client, InProcessIngress { handle, fake_exec }))
 }
 
-/// Owns the in-process ingress server and the fake-executor reflector tasks.
-/// Call [`InProcessIngress::shutdown`] (or drop it) to tear them down.
+/// Owns the in-process ingress server and the fake-executor reflector
+/// tasks. Call [`InProcessIngress::shutdown`], or drop this value, to
+/// tear them down.
 pub struct InProcessIngress {
     handle: IngressHandle,
     fake_exec: Vec<tokio::task::JoinHandle<()>>,
@@ -100,10 +103,11 @@ impl InProcessIngress {
     }
 }
 
-/// Decode the tx nonce from raw envelope bytes the same way the ingress proxy
-/// does (`alloy_consensus::TxEnvelope::decode`), so the synthesized receipt's
-/// `(from, nonce)` matches the parked-submission key. Returns `None` if the
-/// bytes don't decode (the proxy would already have rejected such a tx).
+/// Decode the transaction nonce from raw envelope bytes, the same way the
+/// ingress proxy does it, with `alloy_consensus::TxEnvelope::decode`. This
+/// keeps the synthesized receipt's `(from, nonce)` matching the
+/// parked-submission key. Returns `None` if the bytes do not decode; the
+/// proxy would already have rejected such a transaction.
 fn decode_nonce(raw: &[u8]) -> Option<u64> {
     use alloy_consensus::transaction::Transaction;
     use alloy_rlp::Decodable;

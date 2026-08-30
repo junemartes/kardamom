@@ -1,14 +1,14 @@
-//! L1 source trait — the seam between the watcher and the L1 RPC.
+//! L1 source trait: the seam between the watcher and the L1 RPC.
 //!
-//! Two reads:
-//!   * `finalized_block_number()` — the latest L1 block tagged `finalized`.
-//!   * `lockbox_logs(lockbox, from, to)` — `DepositInitiated` **and**
-//!     `UpgradeInitiated` events emitted by `lockbox` in the inclusive range
+//! It provides two reads:
+//!   * `finalized_block_number()`: the latest L1 block tagged `finalized`.
+//!   * `lockbox_logs(lockbox, from, to)`: the `DepositInitiated` and
+//!     `UpgradeInitiated` events that `lockbox` emits in the inclusive range
 //!     `[from, to]`, in canonical `(block, log_index)` order.
 //!
-//! Errors split between transport/decode failures ([`L1SourceError`]) and
-//! "L1 has no finalized block yet" — the latter is classified separately so
-//! the watcher can debug-log instead of marking the tick as an error.
+//! Errors split into transport/decode failures ([`L1SourceError`]) and "L1
+//! has no finalized block yet". The second case gets its own variant, so the
+//! watcher can log at `debug` level instead of marking the tick as an error.
 
 use alloy_primitives::{Address, B256};
 use async_trait::async_trait;
@@ -18,21 +18,23 @@ use async_trait::async_trait;
 // definition.
 pub use kardamom_types::epoch::{DepositLog, LockboxLog, UpgradeLog};
 
-/// Errors that can surface from an `L1Source`. Exclusively transport- or
-/// decode-level; semantic deposit failures (overflow, dedup) come back from
-/// downstream consumers once the deposit reaches the executor.
+/// Errors that can come from an `L1Source`. These are only transport- or
+/// decode-level errors. A semantic deposit failure, such as overflow or a
+/// duplicate, comes back from a downstream consumer once the deposit
+/// reaches the executor.
 #[derive(Debug, thiserror::Error)]
 pub enum L1SourceError {
     /// Provider/transport error (HTTP failure, connection reset, etc).
     #[error("L1 provider error: {0}")]
     Provider(String),
-    /// ABI/RLP/etc decode failure of a log returned by the provider.
+    /// Decode failure (ABI, RLP, or similar) for a log the provider returns.
     #[error("L1 log decode error: {0}")]
     Decode(String),
-    /// The L1 has not yet produced a finalized block. Expected on a freshly-
-    /// started chain (e.g. anvil before the first 128 blocks); distinct from
-    /// a transport failure so the watcher can log at `debug` instead of
-    /// inflating the `err` tick counter.
+    /// The L1 has not yet produced a finalized block. This is expected on a
+    /// freshly started chain, for example anvil before its first 128
+    /// blocks. It is a separate variant from a transport failure, so the
+    /// watcher can log at `debug` level instead of inflating the `err` tick
+    /// counter.
     #[error("L1 has no finalized block yet")]
     NotFinalized,
 }
@@ -43,18 +45,18 @@ pub trait L1Source: Send + Sync + 'static {
     /// Latest finalized L1 block number.
     async fn finalized_block_number(&self) -> Result<u64, L1SourceError>;
 
-    /// `(hash, parent_hash)` of L1 block `number`, from ONE round trip.
+    /// `(hash, parent_hash)` of L1 block `number`, from one round trip.
     ///
-    /// The hash is needed because an epoch must be emitted for EVERY finalized
-    /// L1 block, including ones with no deposits — and a block with no logs has
-    /// no log to carry its hash. The hash is what the epoch's canonical id
-    /// derives from, so it cannot be skipped or synthesised.
+    /// The hash is needed because the watcher must emit an epoch for every
+    /// finalized L1 block, including a block with no deposits. A block with
+    /// no logs has no log to carry its hash. The hash is what the epoch's
+    /// canonical id derives from, so it cannot be skipped or made up.
     ///
-    /// The parent hash rides along because the verifier CHAINS consecutive
-    /// origins: block N's parent must be block N-1's hash. Both live in the
-    /// same header, so chaining costs no extra request — and it forces a lying
-    /// L1 endpoint to fabricate a consistent chain rather than isolated
-    /// blocks. See issue #163.
+    /// The parent hash comes along because the verifier chains consecutive
+    /// origins: block N's parent must be block N-1's hash. Both values live
+    /// in the same header, so chaining costs no extra request. It also
+    /// forces a lying L1 endpoint to fabricate a consistent chain, instead
+    /// of isolated blocks.
     async fn block_ids(&self, number: u64) -> Result<(B256, B256), L1SourceError>;
 
     /// Hash of L1 block `number`. Convenience over [`Self::block_ids`].
@@ -62,15 +64,15 @@ pub trait L1Source: Send + Sync + 'static {
         Ok(self.block_ids(number).await?.0)
     }
 
-    /// Lockbox logs — `DepositInitiated` and `UpgradeInitiated` — emitted by
-    /// `lockbox` in the inclusive block range `[from_block, to_block]`. Order
-    /// within the response is the canonical (block, log_index) order.
+    /// Lockbox logs (`DepositInitiated` and `UpgradeInitiated`) that
+    /// `lockbox` emits in the inclusive block range `[from_block, to_block]`.
+    /// The response order is the canonical (block, log_index) order.
     ///
-    /// Both event kinds MUST come back from one query. Fetching them
-    /// separately and merging would let a partial failure drop one kind
-    /// silently, and the producer and verifier would then derive different
-    /// epochs from the same L1 block — the exact divergence
-    /// `derive_epoch` exists to make impossible.
+    /// Both event kinds must come back from one query. Fetching them
+    /// separately and merging the results could let a partial failure drop
+    /// one kind without an error. Then the producer and the verifier would
+    /// derive different epochs from the same L1 block. `derive_epoch` exists
+    /// to make that divergence impossible.
     async fn lockbox_logs(
         &self,
         lockbox: Address,
@@ -87,16 +89,17 @@ pub mod fakes {
     use super::*;
 
     /// In-memory `L1Source` driven by a scripted queue. Tests push expected
-    /// `(tip, logs)` pairs in order; each `process_once` consumes one pair.
+    /// `(tip, logs)` pairs in order. Each `process_once` call consumes one
+    /// pair.
     pub struct MockL1Source {
-        /// Pre-scripted outcomes for `finalized_block_number()` calls
-        /// (FIFO). `Ok(tip)` returns the tip; `Err` returns the error.
+        /// Pre-scripted outcomes for `finalized_block_number()` calls, in
+        /// FIFO order. `Ok(tip)` returns the tip; `Err` returns the error.
         pub tips: Mutex<VecDeque<Result<u64, L1SourceError>>>,
-        /// Pre-scripted outcomes for `lockbox_logs(...)` calls (FIFO).
+        /// Pre-scripted outcomes for `lockbox_logs(...)` calls, in FIFO order.
         pub logs: Mutex<VecDeque<Result<Vec<LockboxLog>, L1SourceError>>>,
-        /// Hash returned for a given block number. Unlisted numbers get a
-        /// deterministic filler (`repeat_byte(number)`) so tests that don't
-        /// care about hashes don't have to populate this.
+        /// Hash to return for a given block number. An unlisted number gets
+        /// a deterministic filler (`repeat_byte(number)`), so a test that
+        /// does not care about hashes does not have to fill this in.
         pub hashes: Mutex<std::collections::BTreeMap<u64, B256>>,
         /// If set, `block_hash` fails with this provider error instead.
         pub block_hash_fails: Mutex<bool>,
@@ -163,9 +166,9 @@ pub mod fakes {
                     .copied()
                     .unwrap_or_else(|| Self::filler_hash(n))
             };
-            // Filler hashes chain by construction — block N's parent is the
-            // filler for N-1 — so a mock chain is self-consistent unless a
-            // test deliberately breaks it.
+            // Filler hashes chain by construction: block N's parent is the
+            // filler for N-1. So a mock chain stays self-consistent unless
+            // a test deliberately breaks it.
             Ok((at(number), at(number.saturating_sub(1))))
         }
 

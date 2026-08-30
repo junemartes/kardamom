@@ -11,8 +11,8 @@ fn mk(cfg: ResyncConfig) -> (ResyncController, Sender<FloorUpdate>, SharedWaterm
 }
 
 fn calm_down(c: &mut ResyncController, w: &SharedWatermark, t: &mut Instant) {
-    // Boundaries flowing (count advancing), no lag flag, no stall: the
-    // exit hold elapses across a few observes.
+    // Boundaries flow (the count advances). No lag flag, no stall.
+    // The exit hold elapses across a few observe calls.
     for i in 1..=6u64 {
         w.store(c.last_watermark + i);
         *t += Duration::from_millis(500);
@@ -46,14 +46,14 @@ fn feed_lag_flag_enters_even_if_raised_while_loop_was_blocked() {
     let (mut c, _tx, w) = mk(ResyncConfig::default());
     let mut t = Instant::now();
     calm_down(&mut c, &w, &mut t);
-    // The FEED thread observed a 30 s boundary-arrival gap while the
-    // publish loop was blocked in a session offer; the flag is sticky
-    // and consumed on the loop's next turn — however late.
+    // The FEED thread saw a 30 second boundary-arrival gap while the
+    // publish loop was blocked in a session offer. The flag is sticky.
+    // The loop consumes it on its next turn, however late that is.
     w.flag_lag(30_000);
     t += Duration::from_millis(70_000);
     c.observe(t);
     assert!(c.active(), "sticky lag flag must enter resync");
-    // A second, smaller gap flagged before consumption must not shadow
+    // A second, smaller gap flagged before consumption must not hide
     // a larger one (fetch_max).
     w.flag_lag(12_000);
     w.flag_lag(3_000);
@@ -62,9 +62,9 @@ fn feed_lag_flag_enters_even_if_raised_while_loop_was_blocked() {
 
 #[test]
 fn idle_boundaries_do_not_thrash() {
-    // Idle traffic: boundaries arrive but the count never advances. The
-    // controller must stay OUT of resync (silence is judged by boundary
-    // ARRIVAL in the feed thread, not by count changes here).
+    // Idle traffic: boundaries arrive, but the count never advances. The
+    // controller must stay out of resync. Silence is judged by boundary
+    // arrival in the feed thread, not by count changes here.
     let (mut c, _tx, w) = mk(ResyncConfig::default());
     let mut t = Instant::now();
     calm_down(&mut c, &w, &mut t);
@@ -120,9 +120,9 @@ fn floor_updates_raise_and_report() {
 
 #[test]
 fn skip_receipts_confirm_but_never_raise_floors() {
-    // #85 + #92: a skip receipt proves the ref was ORDERED (a valid
-    // publish confirmation) while proving no nonce was consumed (NOT
-    // floor evidence).
+    // A skip receipt proves the ref was ordered (a valid publish
+    // confirmation), while it proves no nonce was consumed. It is not
+    // floor evidence.
     let (mut c, tx, _w) = mk(ResyncConfig::default());
     tx.send(FloorUpdate {
         deposit: false,
@@ -139,9 +139,10 @@ fn skip_receipts_confirm_but_never_raise_floors() {
 
 #[test]
 fn deposit_receipts_neither_confirm_nor_raise() {
-    // Deposits carry a filler nonce 0 and consume no L2 nonce: they must
-    // neither confirm a same-sender nonce-0 TxRef nor raise the floor.
-    // Marked by tx_type, NOT inferred from the nonce (#124).
+    // Deposits carry a filler nonce 0 and consume no L2 nonce. A deposit
+    // must not confirm a same-sender nonce-0 TxRef, and must not raise the
+    // floor. The code marks this by tx_type, not by inferring from the
+    // nonce.
     let (mut c, tx, _w) = mk(ResyncConfig::default());
     tx.send(FloorUpdate {
         deposit: true,
@@ -154,11 +155,11 @@ fn deposit_receipts_neither_confirm_nor_raise() {
     assert!(raised.is_empty() && confirmations.is_empty());
 }
 
-/// The #124 loop, pinned: a GENUINE nonce-0 tx must confirm its ref (and
-/// raise the floor to 1). While nonce 0 was excluded wholesale, a one-tx
-/// sender's ref could never be confirmed, so the #85 ledger re-offered it
-/// every confirm-timeout forever — rewinding that sender's nonce floor on
-/// every sweep for the life of the process.
+/// This test pins a regression: a genuine nonce-0 transaction must confirm
+/// its ref, and raise the floor to 1. When nonce 0 was excluded wholesale,
+/// a one-transaction sender's ref could never confirm. The unconfirmed
+/// ledger then re-offered it on every confirm timeout, forever, rewinding
+/// that sender's nonce floor on every sweep for the life of the process.
 #[test]
 fn genuine_nonce_zero_tx_confirms_and_raises() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
@@ -178,8 +179,8 @@ fn genuine_nonce_zero_tx_confirms_and_raises() {
     assert_eq!(raised, vec![(s(1), 1)], "and prove execution through 0");
 }
 
-/// A nonce-0 SKIP receipt (#92) confirms the publish but is not floor
-/// evidence — the two exclusions are independent.
+/// A nonce-0 skip receipt confirms the publish, but is not floor
+/// evidence. The two exclusions are independent.
 #[test]
 fn nonce_zero_skip_confirms_without_raising() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
@@ -198,15 +199,16 @@ fn nonce_zero_skip_confirms_without_raising() {
 #[test]
 fn contiguity_rejects_split_drops_from_rewinds() {
     let (mut c, _tx, reject_tx, _w) = resync_channel(ResyncConfig::default(), 0);
-    // Gap rejects (nonce >= expected): a rejected batch produces one per
-    // entry; the drain collapses them to ONE rewind per sender at the
-    // lowest expected.
+    // Gap rejects (nonce >= expected): a rejected batch produces one
+    // reject per entry. The drain collapses them into one rewind per
+    // sender, at the lowest expected value.
     reject_tx.send((s(1), 9, 7)).unwrap();
     reject_tx.send((s(1), 8, 5)).unwrap();
     reject_tx.send((s(1), 12, 9)).unwrap();
     reject_tx.send((s(2), 3, 3)).unwrap();
-    // Committed-proof reject (nonce < expected): the ref sealed long ago
-    // and its dedup entry aged out — confirm-by-reject, drop the entry.
+    // Committed-proof reject (nonce < expected): the ref sealed long ago,
+    // and its dedup entry aged out. This confirms by reject, so drop the
+    // entry.
     reject_tx.send((s(3), 0, 1)).unwrap();
     let (drops, mut rewinds) = c.drain_contiguity_rejects();
     rewinds.sort();
@@ -226,7 +228,7 @@ fn floors_are_monotonic() {
         skip_reason: None,
     })
     .unwrap();
-    // A LOWER receipt later (late-arriving multicast frame) must not
+    // A lower receipt arriving later (a late multicast frame) must not
     // regress the floor.
     tx.send(FloorUpdate {
         deposit: false,

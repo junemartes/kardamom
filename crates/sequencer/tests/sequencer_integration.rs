@@ -1,12 +1,13 @@
-//! End-to-end sequencer behaviour against a scripted tx_data
-//! subscription and in-memory tx_ordering / receipt-cache publishers
-//! (MDS topology). Asserts:
+//! End-to-end sequencer test against a scripted tx_data subscription and
+//! in-memory tx_ordering and receipt-cache publishers (MDS topology).
+//! This test checks:
 //!  * Canonical order on tx_ordering (the `TxRef` sequence) matches a
-//!    per-sender nonce-ascending sequence.
+//!    per-sender, nonce-ascending sequence.
 //!  * Each ref's `tx_data_position` matches the position the proxy supplied
 //!    on the scripted tx_data subscription.
 //!  * Duplicates are dropped and reported on the receipt-cache channel.
-//!  * Future-nonce txs are buffered and drained when the prior arrives.
+//!  * Future-nonce transactions are buffered, and drain when the prior
+//!    nonce arrives.
 
 use std::collections::HashMap;
 
@@ -55,7 +56,7 @@ fn signed_envelope(signer: &PrivateKeySigner, nonce: u64, correlation_id: u64) -
     }
 }
 
-/// Synthesize an A-position for each scripted envelope so refs carry a
+/// Build an A-position for each scripted envelope. This gives refs a
 /// unique pointer back to the simulated tx_data.
 fn pos_n(n: u64) -> BPosition {
     BPosition {
@@ -79,8 +80,8 @@ fn integration_1000_txs_100_senders_with_chaos() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(0xDEAD_BEEF);
     let signers: Vec<_> = (1..=100u64).map(signer).collect();
 
-    // Each sender contributes 10 in-order nonces; shuffle the arrival order to
-    // exercise the future buffer.
+    // Each sender contributes 10 in-order nonces. Shuffle the arrival order
+    // to exercise the future buffer.
     let mut stream: Vec<(usize, u64)> = Vec::new();
     for i in 0..signers.len() {
         for n in 0..10u64 {
@@ -90,8 +91,8 @@ fn integration_1000_txs_100_senders_with_chaos() {
     stream.shuffle(&mut rng);
 
     let mut channel_a = ScriptedTxData::default();
-    // sender_at_pos: tx_data_position → (sender, nonce). Used to validate that
-    // each published TxRef's tx_data_position points back to the expected envelope.
+    // sender_at_pos maps tx_data_position to (sender, nonce). It checks that
+    // each published TxRef's tx_data_position points back to the right envelope.
     let mut sender_at_pos: HashMap<BPosition, (Address, u64)> = HashMap::new();
     for (correlation, (i, n)) in stream.iter().enumerate() {
         let position = pos_n(correlation as u64);
@@ -121,9 +122,9 @@ fn integration_1000_txs_100_senders_with_chaos() {
         "every in-order input should produce a TxRef on B"
     );
 
-    // For each ref, look up the (sender, nonce) the proxy fed into tx_data
-    // at that position. Then verify per-sender the nonces emerge in
-    // ascending order 0..10.
+    // For each ref, look up the (sender, nonce) that the proxy fed into
+    // tx_data at that position. Then check that, for each sender, the
+    // nonces come out in ascending order from 0 to 10.
     let mut per_sender: HashMap<Address, Vec<u64>> = HashMap::new();
     for r in &refs {
         assert_eq!(r.shard_id, cfg.sequencer_id);
@@ -170,7 +171,7 @@ fn integration_duplicates_are_reported() {
     channel_a
         .queue
         .push_back((TxDataLoc::new(0, pos_n(1)), signed_envelope(&s, 1, 101)));
-    // Three duplicates of nonce 0 arriving AFTER nonce 1 has been processed.
+    // Three duplicates of nonce 0 arrive after nonce 1 is processed.
     channel_a
         .queue
         .push_back((TxDataLoc::new(0, pos_n(2)), signed_envelope(&s, 0, 200)));
@@ -188,9 +189,9 @@ fn integration_duplicates_are_reported() {
     assert_eq!(b.refs.lock().unwrap().len(), 2);
     let errs = rc.errors.lock().unwrap();
     assert_eq!(errs.len(), 3, "all 3 past-nonce submissions emit a TxError");
-    // All 3 errors are for the same (sender, nonce=0) — they're distinct
-    // submissions but indistinguishable at the TxError layer (correlation_id
-    // was dropped when the receipt-cache channel was retired).
+    // All 3 errors are for the same (sender, nonce=0). They are distinct
+    // submissions, but the TxError layer cannot tell them apart:
+    // correlation_id was dropped when the receipt-cache channel was retired.
     for err in errs.iter() {
         assert_eq!(err.sender, s.address());
         assert_eq!(err.nonce, 0);
@@ -203,11 +204,11 @@ fn integration_duplicates_are_reported() {
 
 #[test]
 fn integration_bounded_buffer_evicts_oldest() {
-    // Send nonces 100..110 (10 futures) with max_pending=4. Then no
-    // contiguous nonce-0 arrives — the futures stay buffered, but the
-    // buffer's cap=4 evicts the oldest 6, so when we eventually feed
-    // nonce 0 we'd only see refs for 0 + the surviving futures.
-    // This test asserts no publishes happen in the all-future phase.
+    // Send nonces 100..110 (10 future nonces) with max_pending=4. No
+    // contiguous nonce 0 arrives, so the futures stay buffered. The
+    // buffer's cap of 4 evicts the oldest 6. So if nonce 0 arrived later,
+    // only refs for 0 and the surviving futures would appear. This test
+    // checks that no publishes happen in the all-future phase.
     let cfg = SequencerConfig {
         partition_count: 1,
         partition_index: 0,

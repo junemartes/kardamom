@@ -1,35 +1,36 @@
-//! CREATE2 address derivation and ERC-7955 / kardamom factory constants.
+//! CREATE2 address derivation and ERC-7955/kardamom factory constants.
 //!
-//! All pure math, no I/O. The factory proxy address is computed lazily from
-//! the build-time-embedded factory impl creation bytecode (see [`crate::embedded`])
-//! and the canonical owner.
+//! This module does only math, with no I/O. It computes the factory proxy
+//! address lazily, from the factory impl creation bytecode embedded at
+//! build time (see [`crate::embedded`]) and the canonical owner.
 
 use alloy_primitives::{Address, B256, Bytes, address, b256, keccak256};
 use alloy_sol_types::{SolCall, SolValue, sol};
 
-// Local binding for the factory's `initialize(address)`. Lives here (not in
-// IKardamomFactory.sol) because it's on the concrete impl and used only for
-// building bootstrap calldata.
+// Local binding for the factory's `initialize(address)`. It lives here, not
+// in IKardamomFactory.sol, because it belongs to the concrete impl and is
+// used only to build bootstrap calldata.
 sol! {
     function initialize(address owner) external;
 }
 
 /// ERC-7955 permissionless CREATE2 factory.
-/// Canonical address on every EIP-7702-supporting chain (mainnet since Pectra).
+/// This is the canonical address on every chain that supports EIP-7702
+/// (mainnet, since the Pectra upgrade).
 /// Spec: https://github.com/safe-research/erc-7955
 pub const ERC7955_FACTORY: Address = address!("C0DEb853af168215879d284cc8B4d0A645fA9b0E");
 
-/// ERC-7955 factory runtime bytecode (29 bytes). Used by tests that inject it via
-/// `anvil_setCode`; not used at runtime.
+/// ERC-7955 factory runtime bytecode (29 bytes). Tests inject this through
+/// `anvil_setCode`. It is not used at runtime.
 pub const ERC7955_RUNTIME_HEX: &str =
     "60203d3d3582360380843d373d34f5806019573d813d933efd5b3d52f33d52";
 
-/// Salt for the kardamom factory impl, deployed via ERC-7955.
+/// Salt for the kardamom factory impl, deployed through ERC-7955.
 pub fn factory_impl_salt() -> B256 {
     keccak256(b"kardamom.factory.impl.v1")
 }
 
-/// Salt for the kardamom factory proxy, deployed via ERC-7955.
+/// Salt for the kardamom factory proxy, deployed through ERC-7955.
 pub fn factory_proxy_salt() -> B256 {
     keccak256(b"kardamom.factory.proxy.v1")
 }
@@ -39,7 +40,8 @@ pub fn factory_init_data(owner: Address) -> Bytes {
     Bytes::from(initializeCall { owner }.abi_encode())
 }
 
-/// Build the full proxy initcode = `ERC1967Proxy.creationCode || abi.encode(impl, initData)`.
+/// Build the full proxy initcode: `ERC1967Proxy.creationCode` plus
+/// `abi.encode(impl, initData)`.
 pub fn proxy_full_initcode(
     proxy_creation_code: &Bytes,
     impl_addr: Address,
@@ -56,8 +58,9 @@ pub fn factory_impl_address(impl_initcode: &Bytes) -> Address {
     ERC7955_FACTORY.create2(factory_impl_salt(), keccak256(impl_initcode))
 }
 
-/// Factory proxy address: CREATE2 from ERC-7955 with the factory proxy salt, parameterized
-/// by the canonical `owner` (baked into the proxy initcode via `initialize(address)`).
+/// Factory proxy address: CREATE2 from ERC-7955 with the factory proxy salt.
+/// This depends on the canonical `owner`, baked into the proxy initcode
+/// through `initialize(address)`.
 pub fn factory_proxy_address(
     proxy_creation_code: &Bytes,
     impl_addr: Address,
@@ -68,18 +71,19 @@ pub fn factory_proxy_address(
     ERC7955_FACTORY.create2_from_code(factory_proxy_salt(), &full)
 }
 
-/// App impl address (deployed via the kardamom factory, not via ERC-7955).
+/// App impl address, deployed through the kardamom factory, not through ERC-7955.
 pub fn app_impl_address(factory: Address, impl_salt: B256, impl_initcode: &Bytes) -> Address {
     factory.create2(impl_salt, keccak256(impl_initcode))
 }
 
-/// App proxy address: the factory CREATE2's `ERC1967Proxy(impl, initData)` with
-/// `proxy_salt`. Mirrors `KardamomFactoryV1._deployUUPS`, so callers can predict
-/// a contract's address before it is deployed (e.g. to wire one contract's
-/// address into another's init data within the same atomic batch).
+/// App proxy address. The factory does a CREATE2 of `ERC1967Proxy(impl,
+/// initData)` with `proxy_salt`. This mirrors `KardamomFactoryV1._deployUUPS`,
+/// so callers can predict a contract's address before it is deployed. For
+/// example, use this to pass one contract's address into another contract's
+/// init data, within the same atomic batch.
 ///
-/// NOTE: the proxy address depends on `init_data` (it is part of the proxy
-/// constructor args), so predict with the *exact* init data the deploy will use.
+/// The proxy address depends on `init_data`, since it is part of the proxy
+/// constructor args. Predict with the exact init data the deploy will use.
 pub fn app_proxy_address(
     factory: Address,
     proxy_creation_code: &Bytes,
@@ -108,10 +112,10 @@ mod tests {
     fn factory_init_data_is_initialize_address_selector() {
         let owner = address!("00000000000000000000000000000000000000aa");
         let data = factory_init_data(owner);
-        assert_eq!(data.len(), 36); // 4-byte selector + 32-byte address arg
+        assert_eq!(data.len(), 36); // 4-byte selector plus a 32-byte address argument
         let sel = &keccak256(b"initialize(address)")[..4];
         assert_eq!(&data[..4], sel);
-        // last 20 bytes of the 32-byte arg are the address itself
+        // The last 20 bytes of the 32-byte argument are the address.
         assert_eq!(&data[16..36], owner.as_slice());
     }
 

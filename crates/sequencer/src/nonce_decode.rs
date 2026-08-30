@@ -6,19 +6,25 @@ use alloy_rlp::Decodable;
 
 use crate::error::SequencerError;
 
-/// Decode the nonce out of an RLP-encoded alloy `TxEnvelope`. The proxy
-/// already verified the envelope is well-formed, but we re-decode here so
-/// the sequencer doesn't need to be passed the nonce as a side channel.
-/// Extract the nonce WITHOUT materializing the envelope. The full
-/// `ConsensusEnvelope::decode` allocates a calldata copy per tx (128B/tx in
-/// the service allocation profile) to read one integer. This walks the RLP
-/// headers directly: legacy = rlp([nonce, gas_price, ...]) → field 0;
-/// typed (0x01 2930 / 0x02 1559 / 0x03 4844) = type byte ‖
-/// rlp([chain_id, nonce, ...]) → field 1. Zero allocation.
+/// Decode the nonce from an RLP-encoded alloy `TxEnvelope`.
 ///
-/// Falls back to the full decode for anything it does not positively
-/// recognize, so acceptance is EXACTLY the old behaviour (the equivalence
-/// test drives both paths over every tx type).
+/// The proxy already checked that the envelope is well-formed. This
+/// function re-decodes it so the sequencer does not need the nonce passed
+/// in as a side channel.
+///
+/// This extracts the nonce without building the full envelope. The full
+/// `ConsensusEnvelope::decode` call allocates a calldata copy per
+/// transaction (128 bytes/tx in the service allocation profile) just to
+/// read one integer. This function walks the RLP headers directly:
+/// - Legacy: `rlp([nonce, gas_price, ...])`, nonce is field 0.
+/// - Typed (0x01 2930, 0x02 1559, 0x03 4844): type byte, then
+///   `rlp([chain_id, nonce, ...])`, nonce is field 1.
+///
+/// This path allocates nothing.
+///
+/// It falls back to the full decode for any format it does not recognize.
+/// So acceptance matches the old behavior exactly. An equivalence test
+/// runs both paths over every transaction type.
 pub(crate) fn decode_nonce(raw_tx: &bytes::Bytes) -> Result<u64, SequencerError> {
     if let Some(n) = peek_nonce(raw_tx.as_ref()) {
         return Ok(n);
@@ -28,7 +34,8 @@ pub(crate) fn decode_nonce(raw_tx: &bytes::Bytes) -> Result<u64, SequencerError>
     Ok(env.nonce())
 }
 
-/// RLP walk for the nonce. `None` ⇒ caller falls back to the full decode.
+/// Walk the RLP structure for the nonce. Returns `None` if the caller
+/// should fall back to the full decode.
 fn peek_nonce(b: &[u8]) -> Option<u64> {
     // (payload_start, skip_fields) for the list holding the nonce.
     let (mut i, skip) = match b.first()? {
@@ -65,10 +72,11 @@ fn peek_nonce(b: &[u8]) -> Option<u64> {
         }
         return Some(v);
     }
-    None // nonce can't be a list / >8 bytes; full decode will reject
+    None // the nonce cannot be a list or over 8 bytes; the full decode rejects it
 }
 
-/// Advance past one RLP item starting at `i`; `None` on truncation.
+/// Advance past one RLP item that starts at `i`. Returns `None` if the
+/// data is truncated.
 fn skip_rlp_item(b: &[u8], i: usize) -> Option<usize> {
     let p = *b.get(i)?;
     Some(match p {
@@ -98,9 +106,9 @@ fn skip_rlp_item(b: &[u8], i: usize) -> Option<usize> {
 mod nonce_tests {
     use super::*;
 
-    /// The nonce peek must agree with the full decode for every tx type and
-    /// nonce width — acceptance identical by construction (peek falls back
-    /// on anything unrecognized).
+    /// The nonce peek must agree with the full decode, for every
+    /// transaction type and nonce width. Acceptance is identical by
+    /// construction: peek falls back on anything it does not recognize.
     #[test]
     fn peek_nonce_matches_full_decode() {
         use alloy_consensus::{SignableTransaction, TxEip1559, TxEip2930, TxLegacy};
@@ -174,7 +182,7 @@ mod nonce_tests {
             assert_eq!(peek_nonce(&raw), Some(nonce), "2930 nonce {nonce}");
             assert_eq!(decode_nonce(&raw).unwrap(), nonce);
         }
-        // Garbage must ERROR through the fallback, not panic.
+        // Garbage input must return an error through the fallback, not panic.
         assert!(decode_nonce(&bytes::Bytes::from_static(&[0xde, 0xad])).is_err());
         assert!(decode_nonce(&bytes::Bytes::new()).is_err());
     }

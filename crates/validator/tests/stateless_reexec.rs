@@ -1,15 +1,16 @@
-//! Phase-2 stateless re-execution contract (spec: no-std-exec-core).
+//! Stateless re-execution contract.
 //!
-//! Replaying a block from its captured witness ALONE must reproduce the
-//! recorded execution exactly: same receipts, same delta, same post-state
-//! root (via the pure trie oracle). The witness must be minimal (only
-//! touched keys) and fail-closed (a tampered/incomplete witness aborts the
-//! replay instead of warping it).
+//! Replaying a block from its captured witness alone must reproduce the
+//! recorded execution exactly: the same receipts, delta, and post-state
+//! root (through the pure trie oracle). The witness must be minimal
+//! (only touched keys) and must reject bad input (a tampered or
+//! incomplete witness aborts the replay instead of running it wrong).
 //!
-//! The block mixes the three read/write shapes: a plain transfer (account
-//! reads + fresh-account creation), a contract call (code load + storage
-//! read + storage write), and a deposit (mint pre-credit + proven-absent
-//! recipient) — so the witness carries every table.
+//! The block mixes the three read/write shapes: a plain transfer
+//! (account reads and fresh-account creation), a contract call (code
+//! load, storage read, and storage write), and a deposit (mint
+//! pre-credit and a proven-absent recipient), so the witness carries
+//! every table.
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
@@ -24,18 +25,18 @@ use kardamom_validator::witness::{capture_block_witness, reexecute_stateless};
 
 const CHAIN_ID: u64 = 412346;
 const DEAD: Address = address!("000000000000000000000000000000000000dEaD");
-/// Pre-seeded contract: slot0 = SLOAD(0) + 1 (a genuine snapshot storage
-/// READ feeding a WRITE), then falls off the end (STOP).
+/// Pre-seeded contract: slot0 = SLOAD(0) + 1, a genuine snapshot storage
+/// read feeding a write, then falls off the end (STOP).
 const CONTRACT: Address = address!("00000000000000000000000000000000000000Cc");
 const CONTRACT_CODE: [u8; 9] = [0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55];
-/// Untouched genesis account — must NOT appear in the witness.
+/// Untouched genesis account. Must not appear in the witness.
 const DECOY: Address = address!("00000000000000000000000000000000000000dd");
-/// Aliased L1 sender + fresh L2 recipient for the deposit.
+/// Aliased L1 sender and fresh L2 recipient for the deposit.
 const DEP_FROM: Address = address!("1111111111111111111111111111111111112222");
 const DEP_TO: Address = address!("00000000000000000000000000000000000000eE");
 
 fn signer() -> PrivateKeySigner {
-    // Anvil dev key #0 — public, dev only.
+    // This is Anvil dev key #0: public, for dev use only.
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
         .parse()
         .unwrap()
@@ -121,9 +122,9 @@ fn env() -> ExecEnv {
     }
 }
 
-/// Post-state root from genesis + a delta, via the pure trie oracle.
+/// Post-state root from genesis plus a delta, through the pure trie oracle.
 fn oracle_root(delta: &PendingDelta) -> B256 {
-    // Genesis account set the mock was built from.
+    // This is the genesis account set the mock was built from.
     let code_hash = keccak256(CONTRACT_CODE);
     let mut accounts: std::collections::BTreeMap<Address, (u64, U256, B256)> = [
         (signer().address(), (0, eth(1000), B256::ZERO)),
@@ -167,8 +168,9 @@ fn oracle_root(delta: &PendingDelta) -> B256 {
 fn stateless_replay_reproduces_recorded_execution() {
     let recs = records();
 
-    // Reference execution + witness + BAL capture in one pass (the recorder
-    // is a transparent decorator — asserted implicitly by replay equality).
+    // Reference execution, witness, and BAL capture in one pass. The
+    // recorder is a transparent decorator; replay equality checks this
+    // implicitly.
     let snap = genesis();
     let (reference, witness, raw_bal) = capture_block_witness(&snap, None, &recs, env()).unwrap();
     assert!(
@@ -177,8 +179,8 @@ fn stateless_replay_reproduces_recorded_execution() {
     );
     assert!(!raw_bal.is_empty(), "setup: block must produce a BAL");
 
-    // Stateless replay: witness only, no state DB — with the published BAL
-    // as a PROOF INPUT (granularity 1 = per-tx frames).
+    // Stateless replay: witness only, no state DB, with the published
+    // BAL as a proof input (granularity 1 means per-tx frames).
     let stateless = reexecute_stateless(&witness, None, &recs, env(), &raw_bal, 1).unwrap();
 
     assert_eq!(reference.receipts, stateless.receipts, "receipts diverged");
@@ -195,7 +197,7 @@ fn stateless_replay_reproduces_recorded_execution() {
         "code writes diverged"
     );
 
-    // Post-state roots via the pure trie oracle.
+    // Post-state roots through the pure trie oracle.
     let root_ref = oracle_root(&reference.delta);
     let root_stateless = oracle_root(&stateless.delta);
     assert_eq!(root_ref, root_stateless, "post-state roots diverged");
@@ -212,7 +214,7 @@ fn stateless_replay_reproduces_recorded_execution() {
         "contract call did not write storage"
     );
 
-    // Witness minimality: only touched keys — never the decoy.
+    // Witness minimality: only touched keys, never the decoy.
     assert!(
         witness.accounts.iter().all(|a| a.address != DECOY),
         "untouched genesis account leaked into the witness"
@@ -241,8 +243,9 @@ fn stateless_replay_reproduces_recorded_execution() {
             .any(|s| s.address == CONTRACT && s.key == B256::ZERO && s.value == U256::from(7u64))
     );
 
-    // Digest is stable across capture repetitions (canonical ordering), and
-    // so is the BAL commitment the proof would bind as a public output.
+    // The digest is stable across capture repetitions (canonical
+    // ordering), and so is the BAL commitment the proof would bind as a
+    // public output.
     let (_, witness2, raw_bal2) = capture_block_witness(&genesis(), None, &recs, env()).unwrap();
     assert_eq!(witness.digest(), witness2.digest());
     assert_eq!(
@@ -250,7 +253,7 @@ fn stateless_replay_reproduces_recorded_execution() {
         kardamom_engine::stateless::bal_commitment(&raw_bal2)
     );
 
-    // Quantized frames (K > 1) verify through the same shared ladder.
+    // Quantized frames (K > 1) also verify through the same shared ladder.
     let quantized = kardamom_engine::bal_ladder::quantize(raw_bal.clone(), 2);
     reexecute_stateless(&witness, None, &recs, env(), &quantized, 2)
         .expect("stateless replay must verify against a K=2-quantized frame");
@@ -261,8 +264,8 @@ fn forged_bal_fails_closed() {
     let recs = records();
     let (_, witness, raw_bal) = capture_block_witness(&genesis(), None, &recs, env()).unwrap();
 
-    // Bump one claimed post-balance: the recomputed BAL can no longer equal
-    // the input, and the replay must refuse to attest it.
+    // Bump one claimed post-balance. The recomputed BAL can no longer
+    // equal the input, so the replay must refuse to attest it.
     let mut forged = raw_bal.clone();
     let mut tampered = false;
     for acct in forged.iter_mut() {
@@ -279,7 +282,7 @@ fn forged_bal_fails_closed() {
         "forged BAL must be refused as a divergence, got: {err:?}"
     );
 
-    // Granularity mismatch is ALSO a refusal: a K=2 frame never equals a
+    // A granularity mismatch is also refused: a K=2 frame never equals a
     // per-tx recomputation quantized at K=1.
     let quantized = kardamom_engine::bal_ladder::quantize(raw_bal, 2);
     assert!(reexecute_stateless(&witness, None, &recs, env(), &quantized, 1).is_err());
@@ -290,7 +293,7 @@ fn incomplete_witness_fails_closed() {
     let recs = records();
     let (_, witness, bal) = capture_block_witness(&genesis(), None, &recs, env()).unwrap();
 
-    // Drop the sender's account entry: the replay must ERROR, not execute
+    // Drop the sender's account entry: the replay must error, not run
     // against a defaulted account.
     let mut tampered = witness.clone();
     tampered

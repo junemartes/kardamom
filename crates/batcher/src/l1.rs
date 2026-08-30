@@ -1,18 +1,20 @@
-//! Live L1 data-availability I/O: post packed batches as real EIP-4844 blob
-//! transactions to `KardamomL2Settlement`, and read them back for
-//! reconstruction.
+//! Live L1 data-availability I/O.
 //!
-//! The write path ([`post_batch`]) builds a trusted-setup-backed blob sidecar
-//! from the batcher's packed blobs, records each blob in the DA store keyed by
-//! its KZG versioned hash, and sends the `postBatch(prevIndex, versionedHashes,
-//! start, end)` transaction with the sidecar attached. L1 thereby holds the
-//! ordering + commitments; the DA store holds the bytes.
+//! This module posts packed batches as real EIP-4844 blob transactions to
+//! `KardamomL2Settlement`, and reads them back for reconstruction.
 //!
-//! The read path ([`read_posted_batches`] + [`recover_blocks`]) walks the
-//! `BatchPosted` event log in index order, fetches each batch's blobs from a
-//! [`BlobSource`] by the versioned hashes L1 committed to, and decodes them back
-//! into the ordered [`BlockFrame`] stream — the input to
-//! [`crate::reexec::reconstruct_state`].
+//! The write path ([`post_batch`]) builds a trusted-setup-backed blob
+//! sidecar from the batcher's packed blobs. It records each blob in the DA
+//! store, keyed by its KZG versioned hash. It sends the
+//! `postBatch(prevIndex, versionedHashes, start, end)` transaction with the
+//! sidecar attached. L1 holds the ordering and commitments. The DA store
+//! holds the bytes.
+//!
+//! The read path ([`read_posted_batches`] and [`recover_blocks`]) walks the
+//! `BatchPosted` event log in index order. It fetches each batch's blobs
+//! from a [`BlobSource`], using the versioned hashes L1 committed to. It
+//! decodes the blobs back into the ordered [`BlockFrame`] stream, the input
+//! to [`crate::reexec::reconstruct_state`].
 
 use alloy_consensus::BlobTransactionSidecarVariant;
 use alloy_eips::eip4844::BlobTransactionSidecar;
@@ -30,8 +32,9 @@ use crate::frame::BlockFrame;
 use crate::recon::reconstruct;
 use crate::settlement::IKardamomL2Settlement;
 
-/// Blob-gas fee cap for posted batches. Deliberately generous; the DA sink is
-/// not latency-sensitive and blob base fees are tiny on an idle chain.
+/// The blob-gas fee cap for posted batches. This is generous on purpose.
+/// The DA sink is not latency-sensitive, and blob base fees are tiny on an
+/// idle chain.
 pub const DEFAULT_MAX_FEE_PER_BLOB_GAS: u128 = 1_000_000_000; // 1 gwei
 
 /// One posted batch as recovered from an on-chain `BatchPosted` event.
@@ -44,24 +47,26 @@ pub struct BatchDescriptor {
     pub l2_block_end: u64,
 }
 
-/// Build a real 4844 sidecar (KZG commitments + proofs via the env trusted
-/// setup) from already-packed blobs.
+/// Build a real 4844 sidecar (KZG commitments and proofs from the env
+/// trusted setup) from already-packed blobs.
 pub fn build_sidecar(
     blobs: Vec<alloy_eips::eip4844::Blob>,
 ) -> Result<BlobTransactionSidecar, BatcherError> {
-    // `try_from_blobs` (no settings) is test-only gated; the production entry
-    // point takes the trusted setup explicitly. `EnvKzgSettings::Default` is the
-    // mainnet KZG ceremony output baked into alloy.
+    // `try_from_blobs` (with no settings) is gated to test-only use. The
+    // production entry point takes the trusted setup explicitly.
+    // `EnvKzgSettings::Default` is the mainnet KZG ceremony output built
+    // into alloy.
     BlobTransactionSidecar::try_from_blobs_with_settings(blobs, EnvKzgSettings::Default.get())
         .map_err(|e| BatcherError::L1(format!("build blob sidecar: {e}")))
 }
 
-/// Post one packed batch to L1 as an EIP-4844 blob transaction, recording its
-/// blobs in `da_store` keyed by versioned hash.
+/// Post one packed batch to L1 as an EIP-4844 blob transaction. Record its
+/// blobs in `da_store`, keyed by versioned hash.
 ///
 /// `provider` must be wallet-filled with the authorized batcher EOA.
-/// `prev_batch_index` is the contract's current `lastBatchIndex` (CAS replay
-/// guard). Returns the new batch index on success.
+/// `prev_batch_index` is the contract's current `lastBatchIndex` (a
+/// compare-and-swap guard against replay). Returns the new batch index on
+/// success.
 pub async fn post_batch<P: Provider>(
     provider: &P,
     settlement: Address,
@@ -79,8 +84,8 @@ pub async fn post_batch<P: Provider>(
         )));
     }
 
-    // Record the bytes in the DA layer *before* the commitment lands on L1, so a
-    // reconstructor that sees the event can always find the blobs.
+    // Record the bytes in the DA layer before the commitment lands on L1. A
+    // reconstructor that sees the event can then always find the blobs.
     for (blob, vh) in batch.blobs.iter().zip(versioned_hashes.iter()) {
         da_store.put(*vh, blob)?;
     }
@@ -113,8 +118,8 @@ pub async fn post_batch<P: Provider>(
     Ok(prev_batch_index + 1)
 }
 
-/// Read all `BatchPosted` events from `settlement` at or after `from_block`,
-/// returned in ascending batch-index order.
+/// Read all `BatchPosted` events from `settlement`, at or after
+/// `from_block`. Returns them in ascending batch-index order.
 pub async fn read_posted_batches<P: Provider>(
     provider: &P,
     settlement: Address,
@@ -144,10 +149,10 @@ pub async fn read_posted_batches<P: Provider>(
     Ok(out)
 }
 
-/// Recover the ordered [`BlockFrame`] stream for `descriptors` by fetching each
-/// batch's blobs from `source` (by the versioned hashes L1 committed to) and
-/// decoding them. `descriptors` must be in ascending index order (as returned
-/// by [`read_posted_batches`]).
+/// Recover the ordered [`BlockFrame`] stream for `descriptors`. Fetch each
+/// batch's blobs from `source`, using the versioned hashes L1 committed to,
+/// and decode them. `descriptors` must be in ascending index order, as
+/// [`read_posted_batches`] returns them.
 pub fn recover_blocks<S: BlobSource>(
     descriptors: &[BatchDescriptor],
     source: &S,
@@ -166,23 +171,25 @@ pub fn recover_blocks<S: BlobSource>(
     Ok(blocks)
 }
 
-/// Prove that `blob`'s bytes are the ones L1 committed to as `versioned_hash`:
-/// recompute the KZG commitment and derive its versioned hash.
+/// Prove that `blob`'s bytes are the ones L1 committed to as
+/// `versioned_hash`. Recompute the KZG commitment and derive its versioned
+/// hash.
 ///
-/// The DA store is an UNTRUSTED boundary — it is keyed by versioned hash but
+/// The DA store is an untrusted boundary. It is keyed by versioned hash, but
 /// nothing about a filesystem (or a future networked store) guarantees the
-/// bytes behind a name. Without this, a store returning right-length wrong
-/// bytes was silently accepted and `kardamom-reconstruct` rebuilt a WRONG
-/// chain from it — from the layer that exists to be the last-resort backstop
-/// when every in-cluster durable copy is gone. The hash is already in the
-/// `BatchPosted` event, so the check costs one commitment per blob on a
+/// bytes behind a name match the key. Without this check, a store that
+/// returns wrong bytes of the right length would be accepted, and
+/// `kardamom-reconstruct` would rebuild the wrong chain from it. This
+/// matters because the DA store is the last-resort backstop when every
+/// in-cluster durable copy is gone. The hash is already in the
+/// `BatchPosted` event, so the check costs one commitment per blob, on a
 /// recovery path that runs at most once per incident.
 pub fn verify_blob_against_hash(
     versioned_hash: B256,
     blob: &alloy_eips::eip4844::Blob,
 ) -> Result<(), BatcherError> {
-    // Recomputed through the SAME helper that produced the hash on the post
-    // path, so producer and verifier can never drift apart.
+    // This recomputes through the same helper that produced the hash on the
+    // post path. So producer and verifier can never drift apart.
     let sidecar = build_sidecar(vec![*blob])?;
     let got = sidecar.versioned_hashes().next().ok_or_else(|| {
         BatcherError::Corruption("sidecar produced no versioned hash".to_string())

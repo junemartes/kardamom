@@ -1,12 +1,12 @@
-//! `kardamom_sendRawTransactionAsync` + `kardamom_subscribeReceipts`:
+//! `kardamom_sendRawTransactionAsync` and `kardamom_subscribeReceipts`:
 //! fast-ack submission with push receipt delivery.
 //!
 //! The Eth-compatible `eth_sendRawTransaction` parks its HTTP connection
-//! until the receipt arrives, so in-flight txs ≈ held connections and the
-//! server's connection cap becomes the throughput ceiling. These tests pin
-//! the decoupled contract: the async submit acks with the tx hash *before*
-//! any receipt exists, and receipts stream (deduped, filterable) over one
-//! WebSocket subscription.
+//! until the receipt arrives. So in-flight txs are about equal to held
+//! connections, and the server's connection cap becomes the throughput
+//! ceiling. These tests check the decoupled contract: the async submit
+//! acks with the tx hash before any receipt exists, and receipts stream,
+//! deduped and filterable, over one WebSocket subscription.
 
 mod common;
 
@@ -62,9 +62,9 @@ fn receipt_for(sender: Address, nonce: u64, tx_hash: B256, idx: i32) -> Receipt 
     }
 }
 
-/// With `pending_shed_depth: 0` (shed-everything test hook) every submission
-/// must be rejected with the retryable Overloaded error instead of parking —
-/// overload becomes degradation, not a wedge.
+/// With `pending_shed_depth: 0`, a shed-everything test hook, every
+/// submission must get the retryable Overloaded error instead of being
+/// parked. Overload must become graceful degradation, not a backlog.
 #[tokio::test]
 async fn overloaded_ingress_sheds_submissions_with_a_clear_error() {
     let cfg = IngressConfig {
@@ -93,9 +93,8 @@ async fn overloaded_ingress_sheds_submissions_with_a_clear_error() {
     );
 }
 
-/// The async submit must return the canonical tx hash without any receipt
-/// having been published — i.e. it must not park like
-/// `eth_sendRawTransaction` does.
+/// The async submit must return the canonical tx hash before any receipt
+/// is published. It must not park, unlike `eth_sendRawTransaction`.
 #[tokio::test]
 async fn async_submit_acks_before_any_receipt_exists() {
     let (_mock, mut rx, local, _handle) = start_stack().await;
@@ -106,8 +105,9 @@ async fn async_submit_acks_before_any_receipt_exists() {
     let signer = PrivateKeySigner::random();
     let (env, raw, _addr) = common::sign_legacy_tx(&signer, 0);
 
-    // 2s bound: generous for an in-process round trip, far below the parked
-    // path's receipt timeout — a regression to parking fails the test.
+    // A 2s bound is generous for an in-process round trip, and far below
+    // the parked path's receipt timeout. A regression to parking fails
+    // this test.
     let hash: B256 = tokio::time::timeout(
         Duration::from_secs(2),
         client.request("kardamom_sendRawTransactionAsync", rpc_params![raw]),
@@ -117,7 +117,7 @@ async fn async_submit_acks_before_any_receipt_exists() {
     .expect("submit should succeed");
     assert_eq!(hash, *env.tx_hash(), "ack carries the canonical tx hash");
 
-    // The envelope must actually be on a tx_data shard.
+    // The envelope must be on a tx_data shard.
     let mut published = None;
     for shard_rx in &mut rx {
         if let Ok(e) = shard_rx.try_recv() {
@@ -129,9 +129,9 @@ async fn async_submit_acks_before_any_receipt_exists() {
     assert_eq!(published.tx_hash, hash);
 }
 
-/// Receipts stream over the subscription exactly once per tx (the raw MDS
-/// fan-in delivers up to N replica copies; subscribers must see one), and
-/// the optional sender filter drops foreign senders.
+/// Receipts stream over the subscription exactly once per tx. The raw MDS
+/// fan-in delivers up to N replica copies, but subscribers must see only
+/// one. The optional sender filter drops receipts from other senders.
 #[tokio::test]
 async fn subscription_streams_deduped_and_filtered_receipts() {
     let (mock, _rx, local, _handle) = start_stack().await;
@@ -151,8 +151,9 @@ async fn subscription_streams_deduped_and_filtered_receipts() {
         .await
         .unwrap();
 
-    // Foreign sender (filtered), then a duplicate replica copy of the
-    // watched receipt around the real one — only ONE event must come out.
+    // This sends a receipt from another sender, which gets filtered, then
+    // a duplicate replica copy around the watched receipt. Only one event
+    // must come out for the watched receipt.
     let h_other = B256::repeat_byte(0x01);
     let h_watch = B256::repeat_byte(0x02);
     let h_watch2 = B256::repeat_byte(0x03);
@@ -164,7 +165,7 @@ async fn subscription_streams_deduped_and_filtered_receipts() {
         .unwrap();
     mock.receipt_bus
         .send(receipt_for(watched, 0, h_watch, 2))
-        .unwrap(); // replica duplicate
+        .unwrap(); // Replica duplicate.
     mock.receipt_bus
         .send(receipt_for(watched, 1, h_watch2, 3))
         .unwrap();
@@ -193,8 +194,9 @@ async fn subscription_streams_deduped_and_filtered_receipts() {
     );
 }
 
-/// Sequencer rejections surface as `txError` frames so an async submitter
-/// learns its tx will never receipt (instead of waiting forever).
+/// Sequencer rejections surface as `txError` frames, so an async
+/// submitter learns its tx will never receipt, instead of waiting
+/// forever.
 #[tokio::test]
 async fn subscription_streams_tx_errors() {
     let (mock, _rx, local, _handle) = start_stack().await;

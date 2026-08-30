@@ -1,35 +1,35 @@
-//! L1 **epoch** derivation — the single definition of "which deposits does
-//! L1 block N contain, and in what order".
+//! L1 epoch derivation. This is the single definition of "which deposits
+//! does L1 block N contain, and in what order".
 //!
 //! This lives in `kardamom-types`, not in the DA watcher, on purpose. Under
-//! `docs/agents/l1-origin-deposit-derivation-spec.md` the same rule is run by
-//! two parties for opposite reasons: the **producer** (the DA watcher) emits
-//! an epoch's deposits into the canonical stream, and the **verifier** (the
-//! validator, later the executor) re-derives them from L1 and rejects a chain
-//! that disagrees. A verifier running a second, subtly different copy of the
-//! rule would verify nothing — so there is exactly one copy, here.
+//! `docs/agents/l1-origin-deposit-derivation-spec.md`, two parties run the
+//! same rule for opposite reasons. The producer, the DA watcher, emits an
+//! epoch's deposits into the canonical stream. The verifier (the
+//! validator, and later the executor) re-derives them from L1 and rejects
+//! a chain that disagrees. A verifier running a second, subtly different
+//! copy of the rule would verify nothing. So there is exactly one copy, here.
 //!
 //! Contents:
 //!
-//!   * [`source_hash`] / [`source_hash_system`] — keccak over `(domain ||
-//!     keccak(rlp[l1_block_hash, l1_log_index]))`. Domain 0 = user deposit,
-//!     domain 1 = system tx. The canonical id used by downstream consumers to
-//!     dedup deposits.
-//!   * [`alias_l1_address`] — `L1 + 0x1111...1111` mod 2^160. Avoids
-//!     collisions between L1 contracts and L2 contracts at the same address.
-//!     EOAs round-trip harmlessly (their L2 alias is just a different EOA
-//!     address).
+//!   * [`source_hash`] and [`source_hash_system`] — keccak over `(domain ||
+//!     keccak(rlp[l1_block_hash, l1_log_index]))`. Domain 0 is a user
+//!     deposit; domain 1 is a system transaction. This is the canonical id
+//!     downstream consumers use to dedup deposits.
+//!   * [`alias_l1_address`] — `L1 + 0x1111...1111` mod 2^160. This avoids
+//!     collisions between L1 contracts and L2 contracts at the same
+//!     address. An EOA round-trips harmlessly; its L2 alias is just a
+//!     different EOA address.
 //!   * [`DepositLog`] — the decoded shape of one `DepositInitiated` L1 log.
-//!   * [`UpgradeLog`] — the decoded shape of one `UpgradeInitiated` L1 log (an
-//!     **upgrade transaction**), and [`LockboxLog`], the union the watcher
+//!   * [`UpgradeLog`] — the decoded shape of one `UpgradeInitiated` L1 log,
+//!     an upgrade transaction, and [`LockboxLog`], the union the watcher
 //!     reads off the single lockbox address.
-//!   * [`deposit_from_log`] / [`upgrade_from_log`] / [`derive_epoch`] —
-//!     log(s) → [`Deposit`](crate::Deposit)s.
+//!   * [`deposit_from_log`], [`upgrade_from_log`], and [`derive_epoch`] —
+//!     turn one or more logs into [`Deposit`](crate::Deposit)s.
 //!   * [`EpochRecord`] — an epoch as it travels on the canonical stream.
 //!
-//! Ported verbatim from PR #10's `crates/node/src/deposit.rs`; the
+//! This is ported verbatim from `crates/node/src/deposit.rs`. The
 //! algorithm is OP-compatible and pinned by the contracts' bytecode-hash
-//! CI gate, so the implementation here must stay byte-identical.
+//! CI gate, so this implementation must stay byte-identical.
 
 use alloc::vec::Vec;
 
@@ -44,12 +44,13 @@ use crate::wire;
 /// Source-hash domain for an ordinary user deposit (`ETHLockbox.depositETH`).
 pub const DOMAIN_USER_DEPOSIT: u64 = 0;
 
-/// Source-hash domain for a **system transaction** — today, the upgrade
-/// transaction (`ETHLockbox.initiateUpgrade`).
+/// Source-hash domain for a system transaction. Today, this is only the
+/// upgrade transaction (`ETHLockbox.initiateUpgrade`).
 ///
-/// Domain separation is what keeps a system deposit's id disjoint from a user
-/// deposit's even when both are derived from the same `(block_hash, log_index)`
-/// position, which is exactly what the downstream first-seen dedup keys on.
+/// Domain separation keeps a system deposit's id disjoint from a user
+/// deposit's id, even when both derive from the same `(block_hash,
+/// log_index)` position. The downstream first-seen dedup keys on exactly
+/// this.
 pub const DOMAIN_SYSTEM_TX: u64 = 1;
 
 /// Compute the OP-style source hash for a user deposit:
@@ -62,20 +63,21 @@ pub fn source_hash(l1_block_hash: B256, l1_log_index: u64) -> B256 {
     source_hash_in_domain(DOMAIN_USER_DEPOSIT, l1_block_hash, l1_log_index)
 }
 
-/// Source hash for a system transaction — same construction as [`source_hash`]
-/// under [`DOMAIN_SYSTEM_TX`].
+/// Source hash for a system transaction. Same construction as
+/// [`source_hash`], under [`DOMAIN_SYSTEM_TX`].
 pub fn source_hash_system(l1_block_hash: B256, l1_log_index: u64) -> B256 {
     source_hash_in_domain(DOMAIN_SYSTEM_TX, l1_block_hash, l1_log_index)
 }
 
-/// The shared construction behind both domains. One body so a change to the
-/// hashing scheme cannot apply to user deposits and system txs unevenly.
+/// The shared construction behind both domains. One body means a change to
+/// the hashing scheme cannot apply unevenly to user deposits and system
+/// transactions.
 fn source_hash_in_domain(domain: u64, l1_block_hash: B256, l1_log_index: u64) -> B256 {
     let inner = encode_list_two(&l1_block_hash, &l1_log_index);
     let deposit_id_hash = keccak256(&inner);
 
-    // domain = 0u64 encodes as RLP 0x80 (canonical empty-string form for
-    // integer zero); domain = 1u64 encodes as the single byte 0x01.
+    // `domain = 0u64` encodes as RLP `0x80`, the canonical empty-string form
+    // for integer zero. `domain = 1u64` encodes as the single byte `0x01`.
     let outer = encode_list_two(&domain, &deposit_id_hash);
     keccak256(&outer)
 }
@@ -94,9 +96,10 @@ fn encode_list_two<A: Encodable, B: Encodable>(a: &A, b: &B) -> Vec<u8> {
 }
 
 /// Add the OP-style aliasing offset `0x1111...1111` to an L1 sender,
-/// wrapping at uint160. EOAs round-trip harmlessly; L1 contracts shift to
-/// avoid colliding with L2 contracts at the same address. The DA watcher
-/// applies this — the L2 executor never sees the un-aliased L1 sender.
+/// wrapping at uint160. An EOA round-trips harmlessly. An L1 contract
+/// shifts, to avoid colliding with an L2 contract at the same address. The
+/// DA watcher applies this; the L2 executor never sees the un-aliased L1
+/// sender.
 pub fn alias_l1_address(l1: Address) -> Address {
     const OFFSET: [u8; 20] = [
         0x11, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -118,70 +121,75 @@ pub fn alias_l1_address(l1: Address) -> Address {
 
 /// One decoded `DepositInitiated` L1 log.
 ///
-/// Pure data: the transport that produced it (an RPC `eth_getLogs`, an
-/// archive replay, a test fixture) is not this type's business, which is what
-/// lets the producer and the verifier share [`derive_epoch`].
+/// This is pure data. The transport that produced it, an RPC
+/// `eth_getLogs` call, an archive replay, or a test fixture, is not this
+/// type's business. This is what lets the producer and the verifier share
+/// [`derive_epoch`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DepositLog {
-    /// Number of the L1 block this log was emitted in. Not part of
-    /// `source_hash` — it is the key the watcher groups logs by when it
+    /// Number of the L1 block this log was emitted in. This is not part of
+    /// `source_hash`. It is the key the watcher groups logs by, when it
     /// splits a multi-block log query into one epoch per L1 block.
     pub block_number: u64,
     /// Hash of the L1 block this log was emitted in. Feeds `source_hash`.
     pub block_hash: B256,
-    /// Position of this log within the L1 block. Feeds `source_hash`, and is
-    /// the ORDERING key within an epoch.
+    /// Position of this log within the L1 block. Feeds `source_hash`, and
+    /// is the ordering key within an epoch.
     pub log_index: u64,
     /// L1 sender (un-aliased).
     pub from: Address,
     /// L2 recipient of the credited mint.
     pub to: Address,
-    /// Amount minted on L2 (and forwarded as `value` in the inner EVM call).
-    /// Wire type on L1 is `uint256`; decoders reject `mint > u128::MAX`.
+    /// Amount minted on L2, also forwarded as `value` in the inner EVM
+    /// call. The wire type on L1 is `uint256`. A decoder rejects
+    /// `mint > u128::MAX`.
     pub mint: u128,
     /// Gas limit for the inner EVM call.
     pub gas_limit: u64,
-    /// Optional calldata for the inner EVM call. Alloy's `Bytes` — this is
-    /// the shape the L1 ABI decoder yields; `Deposit::input` is the wire
-    /// shape and `deposit_from_log` converts.
+    /// Optional calldata for the inner EVM call. This uses alloy's
+    /// `Bytes`, the shape the L1 ABI decoder yields. `Deposit::input` is
+    /// the wire shape; `deposit_from_log` converts between them.
     pub data: AlloyBytes,
 }
 
-/// One decoded `UpgradeInitiated` L1 log — the **upgrade transaction**.
+/// One decoded `UpgradeInitiated` L1 log: the upgrade transaction.
 ///
-/// Emitted by `ETHLockbox.initiateUpgrade`, which is gated to the L1 factory
-/// owner, so merely being in this list means the instruction was authorized on
-/// L1. Derivation reproduces it verbatim; it never re-checks the authority,
-/// because L1 already did and every node sees the same finalized logs.
+/// `ETHLockbox.initiateUpgrade` emits this, and only the L1 factory owner
+/// can call it. So appearing in this list already means L1 authorized the
+/// instruction. Derivation reproduces it verbatim. It never re-checks the
+/// authority, because L1 already did, and every node sees the same
+/// finalized logs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpgradeLog {
     /// Number of the L1 block this log was emitted in.
     pub block_number: u64,
     /// Hash of the L1 block this log was emitted in. Feeds `source_hash`.
     pub block_hash: B256,
-    /// Position of this log within the L1 block. Feeds `source_hash`, and is
-    /// the ORDERING key within an epoch — shared with deposits, since both
-    /// kinds come from the same contract and interleave in one log stream.
+    /// Position of this log within the L1 block. Feeds `source_hash`, and
+    /// is the ordering key within an epoch. This key is shared with
+    /// deposits, since both kinds come from the same contract and
+    /// interleave in one log stream.
     pub log_index: u64,
     /// The feature flag to schedule.
     pub feature_id: U256,
-    /// Activation time in epoch-**milliseconds** (this chain's block-timestamp
-    /// unit); `0` means "activate immediately", resolved on L2 to the
+    /// Activation time in epoch milliseconds, this chain's block-timestamp
+    /// unit. `0` means "activate immediately", resolved on L2 to the
     /// activating block's timestamp.
     pub activation_timestamp: u64,
 }
 
-/// A decoded log from the lockbox — the one L1 contract the watcher reads.
+/// A decoded log from the lockbox, the one L1 contract the watcher reads.
 ///
-/// Both variants derive into a [`Deposit`]; they differ in the source-hash
-/// domain, the sender, and whether `is_system_transaction` is set. Keeping them
-/// in one ordered list is what makes deposits and upgrades interleave by L1 log
-/// index, so an upgrade cannot jump ahead of a deposit that L1 ordered first.
+/// Both variants derive into a [`Deposit`]. They differ in the
+/// source-hash domain, the sender, and whether `is_system_transaction` is
+/// set. Keeping them in one ordered list makes deposits and upgrades
+/// interleave by L1 log index. This way an upgrade cannot jump ahead of a
+/// deposit that L1 ordered first.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LockboxLog {
-    /// `DepositInitiated` — a user bridging ETH.
+    /// `DepositInitiated`: a user bridging ETH.
     Deposit(DepositLog),
-    /// `UpgradeInitiated` — an authorized upgrade transaction.
+    /// `UpgradeInitiated`: an authorized upgrade transaction.
     Upgrade(UpgradeLog),
 }
 
@@ -202,7 +210,8 @@ impl LockboxLog {
         }
     }
 
-    /// Position of this log within its L1 block — the epoch ordering key.
+    /// Position of this log within its L1 block. This is the epoch
+    /// ordering key.
     pub fn log_index(&self) -> u64 {
         match self {
             Self::Deposit(l) => l.log_index,
@@ -226,32 +235,34 @@ impl From<UpgradeLog> for LockboxLog {
 /// One L1 epoch's contribution to the L2 chain, as it travels on the
 /// canonical stream.
 ///
-/// Atomic by construction: the origin and its deposits are one record, so a
-/// partially-delivered epoch (origin ordered, deposits lost) cannot happen —
-/// which is what lets the no-skipping rule be enforced. Carrying the deposits
-/// by VALUE rather than as refs also removes the ref↔envelope join that makes
-/// a lost `tx_deposits` envelope fatal today.
+/// This is atomic by construction. The origin and its deposits are one
+/// record, so a partially delivered epoch, with the origin ordered but
+/// deposits lost, cannot happen. This is what lets the no-skipping rule
+/// hold. Carrying the deposits by value, instead of as references, also
+/// removes the reference-to-envelope join that makes a lost `tx_deposits`
+/// envelope fatal today.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct EpochRecord {
-    /// L1 block number this epoch corresponds to. Becomes the `l1_origin` of
-    /// the L2 blocks it opens.
+    /// L1 block number for this epoch. This becomes the `l1_origin` of the
+    /// L2 blocks it opens.
     pub l1_number: u64,
-    /// Hash of that L1 block. Only meaningful because the origin is required
-    /// to be at or below L1 finality, so a number maps to one hash forever
-    /// and no L1-reorg handling is needed.
+    /// Hash of that L1 block. This is meaningful only because the origin
+    /// must be at or below L1 finality. So a number maps to one hash
+    /// forever, and no L1-reorg handling is needed.
     #[rkyv(with = wire::B256Bytes)]
     pub l1_hash: B256,
-    /// The epoch's deposits in log-index order. EMPTY IS NORMAL and must
-    /// still be emitted: the no-skipping rule is only enforceable if every
+    /// The epoch's deposits, in log-index order. An empty list is normal
+    /// and must still be emitted. The no-skipping rule only holds if every
     /// epoch appears.
     pub deposits: Vec<Deposit>,
 }
 
 impl EpochRecord {
-    /// Canonical id for cluster dedup. Racing producers that observe the same
-    /// L1 block derive byte-identical records, so first-seen dedup collapses
-    /// them — the property the cluster already relies on for `DepositRef`.
+    /// Canonical id for cluster dedup. Racing producers that observe the
+    /// same L1 block derive byte-identical records, so first-seen dedup
+    /// collapses them. The cluster already relies on this property for
+    /// `DepositRef`.
     pub fn canonical_id(&self) -> B256 {
         keccak256(self.l1_hash.as_slice())
     }
@@ -262,14 +273,14 @@ pub fn deposit_from_log(log: &DepositLog) -> Deposit {
     Deposit {
         source_hash: source_hash(log.block_hash, log.log_index),
         from: alias_l1_address(log.from),
-        // Deposits from the ETHLockbox always target an L2 recipient
-        // (CREATE deposits would need a different L1 event shape and are
-        // not currently produced by the lockbox).
+        // Deposits from the ETHLockbox always target an L2 recipient. A
+        // CREATE deposit would need a different L1 event shape, and the
+        // lockbox does not produce one today.
         to: Some(log.to),
         mint: log.mint,
-        // For ETH-bridge deposits `value` == `mint` (the minted ETH is
-        // forwarded to the recipient). When the lockbox evolves to support
-        // mint-without-forward, decouple here.
+        // For ETH-bridge deposits, `value` equals `mint`: the minted ETH is
+        // forwarded to the recipient. If the lockbox later supports
+        // mint-without-forward, decouple these here.
         value: U256::from(log.mint),
         gas_limit: log.gas_limit,
         is_system_transaction: false,
@@ -279,16 +290,18 @@ pub fn deposit_from_log(log: &DepositLog) -> Deposit {
 
 /// Build the L2 system deposit for one L1 upgrade log.
 ///
-/// Deliberately unlike [`deposit_from_log`] in three ways, each load-bearing:
+/// This is deliberately unlike [`deposit_from_log`] in three ways. Each
+/// one matters:
 ///
-///  * the sender is the fixed [`SYSTEM_UPGRADER`](crate::upgrades::SYSTEM_UPGRADER)
-///    and is **not** aliased — aliasing exists to keep L1 senders from colliding
-///    with L2 addresses, whereas this sender is *defined* on L2 and is the thing
-///    the predeploy authorizes against;
-///  * `mint`/`value` are zero: an upgrade moves no ETH (and the lockbox's
-///    `initiateUpgrade` is not payable, so there is none to move);
-///  * `is_system_transaction` is set — the first real use of the field, which
-///    the wire type has carried as `false` since v0.
+///  * The sender is the fixed
+///    [`SYSTEM_UPGRADER`](crate::upgrades::SYSTEM_UPGRADER), and is not
+///    aliased. Aliasing exists to keep L1 senders from colliding with L2
+///    addresses. This sender is instead defined on L2, and is the value
+///    the predeploy authorizes against.
+///  * `mint` and `value` are zero. An upgrade moves no ETH; the lockbox's
+///    `initiateUpgrade` is not payable, so there is none to move.
+///  * `is_system_transaction` is set. This is the first real use of the
+///    field, which the wire type has carried as `false` since v0.
 pub fn upgrade_from_log(log: &UpgradeLog) -> Deposit {
     Deposit {
         source_hash: source_hash_system(log.block_hash, log.log_index),
@@ -312,21 +325,21 @@ pub fn deposit_from_lockbox_log(log: &LockboxLog) -> Deposit {
     }
 }
 
-/// THE derivation rule: L1 block `(l1_number, l1_hash)` plus its lockbox logs
-/// (`DepositInitiated` **and** `UpgradeInitiated`) → the epoch the L2 chain
-/// must contain.
+/// The derivation rule. Takes an L1 block `(l1_number, l1_hash)` and its
+/// lockbox logs (`DepositInitiated` and `UpgradeInitiated`), and returns
+/// the epoch the L2 chain must contain.
 ///
-/// Entries are ordered by **log index**, which is also what `source_hash`
-/// commits to, so the order is a property of L1 rather than of whoever
-/// happened to read it. `logs` may arrive in any order; callers need not
-/// pre-sort. Logs from a different block than `l1_hash` are a programming
-/// error and are rejected rather than silently mixed in.
+/// Entries are ordered by log index. This is also what `source_hash`
+/// commits to, so the order is a property of L1, not of whoever happened
+/// to read it. `logs` may arrive in any order; a caller does not need to
+/// pre-sort them. A log from a different block than `l1_hash` is a
+/// programming error, and is rejected rather than silently mixed in.
 ///
-/// Both log kinds share one index space because they are emitted by one
-/// contract: an upgrade and a deposit in the same L1 block land in the L2 block
-/// in the order L1 put them in, and `DuplicateLogIndex` catches a caller that
-/// merged two log sets incorrectly — including one that fetched deposits and
-/// upgrades in separate queries and double-counted a position.
+/// Both log kinds share one index space, because one contract emits both.
+/// An upgrade and a deposit in the same L1 block land in the L2 block in
+/// the order L1 put them in. `DuplicateLogIndex` catches a caller that
+/// merged two log sets incorrectly, including one that fetched deposits
+/// and upgrades in separate queries and double-counted a position.
 pub fn derive_epoch(
     l1_number: u64,
     l1_hash: B256,
@@ -358,9 +371,9 @@ pub fn derive_epoch(
     })
 }
 
-/// Why an epoch could not be derived. Both variants indicate the caller fed
-/// logs that do not belong together, which for a VERIFIER is a rejection and
-/// for a PRODUCER is a bug.
+/// Why an epoch could not be derived. Both variants mean the caller fed
+/// logs that do not belong together. For a verifier this is a rejection.
+/// For a producer this is a bug.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EpochError {
     #[error("log from L1 block {found} in an epoch for {expected}")]
@@ -434,7 +447,7 @@ mod tests {
 
     #[test]
     fn epoch_orders_by_log_index_regardless_of_input_order() {
-        // The order is a property of L1, not of whoever read the logs — a
+        // The order is a property of L1, not of whoever read the logs. A
         // verifier that fetched them in a different order must derive the
         // same epoch, byte for byte.
         let block = B256::repeat_byte(0x77);
@@ -450,8 +463,8 @@ mod tests {
 
     #[test]
     fn empty_epoch_is_valid_and_must_still_exist() {
-        // Rule 2 (no skipping) is only enforceable if depositless epochs are
-        // still emitted, so deriving one is explicitly not an error.
+        // The no-skipping rule only holds if depositless epochs are still
+        // emitted. So deriving one is explicitly not an error.
         let block = B256::repeat_byte(0x33);
         let e = derive_epoch(12, block, &[]).unwrap();
         assert!(e.deposits.is_empty());
@@ -470,7 +483,7 @@ mod tests {
     #[test]
     fn duplicate_log_index_is_rejected() {
         // Two logs at the same index would produce two deposits with the
-        // SAME source_hash — a dedup collision that must never reach the
+        // same source_hash. This dedup collision must never reach the
         // canonical stream.
         let block = B256::repeat_byte(0x04);
         let err = derive_epoch(1, block, &[log(block, 3, 1, 5), log(block, 3, 2, 6)]).unwrap_err();
@@ -482,7 +495,7 @@ mod tests {
 
     #[test]
     fn epoch_derivation_is_deterministic_across_callers() {
-        // The producer/verifier equality this whole design rests on.
+        // The producer-verifier equality this whole design rests on.
         let block = B256::repeat_byte(0x55);
         let logs = [log(block, 2, 9, 7), log(block, 0, 8, 3)];
         assert_eq!(
@@ -520,9 +533,10 @@ mod tests {
 
     #[test]
     fn system_domain_separates_from_the_user_domain_at_the_same_position() {
-        // The whole point of the domain byte: a deposit and an upgrade at the
-        // same (block, log_index) — impossible today, but the dedup key must
-        // not rely on that — get different ids.
+        // This is the whole point of the domain byte. A deposit and an
+        // upgrade at the same (block, log_index) get different ids. That
+        // collision is impossible today, but the dedup key must not rely on
+        // that.
         let block = B256::repeat_byte(0x91);
         assert_ne!(source_hash(block, 3), source_hash_system(block, 3));
     }
@@ -549,9 +563,9 @@ mod tests {
 
     #[test]
     fn upgrade_sender_is_not_aliased() {
-        // Aliasing exists to separate L1 senders from L2 addresses; the system
-        // sender is defined ON L2 and is what the predeploy authorizes against,
-        // so aliasing it would break every upgrade.
+        // Aliasing exists to separate L1 senders from L2 addresses. The
+        // system sender is defined on L2, and is what the predeploy
+        // authorizes against. Aliasing it would break every upgrade.
         let block = B256::repeat_byte(0x22);
         let e = derive_epoch(1, block, &[upgrade_log(block, 0, 1, 0)]).unwrap();
         assert_eq!(e.deposits[0].from, crate::upgrades::SYSTEM_UPGRADER);
@@ -574,8 +588,8 @@ mod tests {
 
     #[test]
     fn deposits_and_upgrades_interleave_in_l1_log_order() {
-        // One contract, one log stream: an upgrade must not jump ahead of a
-        // deposit L1 ordered first, in either input order.
+        // One contract, one log stream. An upgrade must not jump ahead of a
+        // deposit that L1 ordered first, no matter the input order.
         let block = B256::repeat_byte(0x24);
         let forward = derive_epoch(
             6,
@@ -630,8 +644,8 @@ mod tests {
 
     #[test]
     fn upgrade_derivation_is_deterministic_across_callers() {
-        // Same producer/verifier equality the user-deposit path relies on: the
-        // validator re-derives upgrades from L1 and fail-stops on any diff.
+        // Same producer-verifier equality the user-deposit path relies on.
+        // The validator re-derives upgrades from L1 and fail-stops on any diff.
         let block = B256::repeat_byte(0x28);
         let logs = [upgrade_log(block, 1, 3, 999), log(block, 0, 4, 1)];
         assert_eq!(
@@ -642,16 +656,18 @@ mod tests {
 
     #[test]
     fn system_source_hash_known_vector() {
-        // Anchored like the user-deposit vector above: the id a system deposit
-        // dedups on is consensus-visible, so a change must be deliberate.
+        // This is anchored like the user-deposit vector above. The id a
+        // system deposit dedups on is consensus-visible, so a change must be
+        // deliberate.
         //
-        // Cross-checked against a hand-built RLP encoding rather than captured
-        // from this implementation, so the vector is independent evidence:
+        // This is cross-checked against a hand-built RLP encoding, not
+        // captured from this implementation, so the vector is independent
+        // evidence:
         //   inner = e2 a0 <32-byte block hash> 2a          (list, payload 34)
         //   outer = e2 01 a0 keccak(inner)                 (domain 1 is a bare
         //                                                   0x01 byte, not 0x81 0x01)
         // The same procedure with domain 0 (encoded 0x80) reproduces the
-        // user-domain vector below, which confirms the method.
+        // user-domain vector below. This confirms the method.
         let h = source_hash_system(
             b256!("0000000000000000000000000000000000000000000000000000000000000001"),
             42,
@@ -664,12 +680,11 @@ mod tests {
 
     #[test]
     fn source_hash_known_vector_matches_op_form() {
-        // Anchored output for a fixed (l1_block_hash, log_index) pair —
-        // changes to the algorithm flip this and force a code-review
-        // conversation. The value below was captured from the first run
-        // against the OP-aligned algorithm ported from PR #10's
-        // `crates/node/src/deposit.rs` (whose own conformance is pinned by
-        // the contracts' bytecode-hash CI gate).
+        // This is the anchored output for a fixed (l1_block_hash, log_index)
+        // pair. A change to the algorithm flips this value and forces a
+        // code-review conversation. This vector comes from the OP-aligned
+        // algorithm in `crates/node/src/deposit.rs`, whose conformance is
+        // pinned by the contracts' bytecode-hash CI gate.
         let h = source_hash(
             b256!("0000000000000000000000000000000000000000000000000000000000000001"),
             42,

@@ -1,12 +1,12 @@
-//! Differential test: actor's receipt for each tx must match a naïve
-//! single-threaded `revm` loop's receipt for the same tx.
+//! Differential test: the actor's receipt for each tx must match a
+//! naive single-threaded `revm` loop's receipt for the same tx.
 //!
-//! v0 corpus: transfers, a contract `SSTORE`, a revert. Mainnet-vector
-//! corpus is a v1 follow-up.
+//! v0 corpus: transfers, a contract `SSTORE`, and a revert. A
+//! mainnet-vector corpus is a v1 follow-up.
 //!
-//! Post-S4-arch-update wiring: M=1 tx_data + 1 tx_ordering; the demux
-//! doesn't affect determinism but the public Executor::run signature
-//! changed.
+//! Wiring after the join-buffer architecture update: M=1 tx_data, plus one
+//! tx_ordering. The demux does not affect determinism, but the public
+//! `Executor::run` signature changed.
 
 use std::thread;
 use std::time::Duration;
@@ -99,8 +99,9 @@ fn bpos(off: i32) -> BPosition {
     }
 }
 
-/// Build a proxy-style `kardamom_types::TxEnvelope` (raw_tx, sender, tx_hash
-/// populated). The naïve reference decodes back to alloy for revm.
+/// Build a proxy-style `kardamom_types::TxEnvelope` (with raw_tx,
+/// sender, and tx_hash filled in). The naive reference decodes it back
+/// to alloy for revm.
 fn legacy(
     signer: &PrivateKeySigner,
     to: APTxKind,
@@ -200,8 +201,8 @@ fn actor_receipts_match_naive_reference() {
         .code(sstore_hash, Bytes::copy_from_slice(sstore_code.as_ref()))
         .code(revert_hash, Bytes::copy_from_slice(revert_code.as_ref()))
         .build();
-    // Actor fixture: separate snapshot so the in-place CacheDB the
-    // reference path mutates can't bleed into the actor's reads.
+    // Actor fixture: a separate snapshot, so the in-place CacheDB that
+    // the reference path mutates cannot bleed into the actor's reads.
     let snap_actor = MockStateDatabase::builder()
         .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
         .account(sstore_addr, U256::ZERO, 1, sstore_hash)
@@ -258,8 +259,9 @@ fn actor_receipts_match_naive_reference() {
         bpos(pairs.len() as i32),
         TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
             block_number: 1,
-            // end_tx_idx = cumulative COUNT of canonical records (= number of
-            // txs applied), encoded via bpos (== BPosition::from_index here).
+            // end_tx_idx equals the cumulative count of canonical records
+            // (the number of txs applied), encoded with bpos (the same as
+            // BPosition::from_index here).
             end_tx_idx: bpos(pairs.len() as i32),
             l2_timestamp: 1_700_000_000,
             l1_origin: 0,
@@ -312,5 +314,5 @@ fn actor_receipts_match_naive_reference() {
     }
 }
 
-// TODO(S4 v1): import a mainnet-style tx corpus (historical Uniswap swaps,
+// TODO(v1): import a mainnet-style tx corpus (historical Uniswap swaps,
 // USDC transfers) and re-run this assertion.

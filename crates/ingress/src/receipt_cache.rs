@@ -1,15 +1,16 @@
-//! In-memory tx_receipts index used by the ingress proxy.
+//! In-memory tx_receipts index that the ingress proxy uses.
 //!
-//! Two views over the same receipts, populated by the proxy's tx_receipts
-//! watcher (executor → ingress) via [`ReceiptCache::insert`]:
+//! This gives two views over the same receipts. The proxy's tx_receipts
+//! watcher, from executor to ingress, fills both through
+//! [`ReceiptCache::insert`]:
 //!
-//! - `(Address, u64) → Receipt` for retry-dedup in `submit_raw`.
-//! - `B256 → Receipt` for answering `eth_getTransactionReceipt(tx_hash)`
-//!   without joining against the state DB.
+//! - `(Address, u64) -> Receipt` for retry-dedup in `submit_raw`.
+//! - `B256 -> Receipt` to answer `eth_getTransactionReceipt(tx_hash)`
+//!   without a join against the state DB.
 //!
-//! Because the enriched `types::Receipt` now carries `from`, `nonce`, and
-//! `tx_hash` directly, one tx_receipts subscription feeds both indexes —
-//! the old `CachedReceipt` side-channel is no longer needed.
+//! The enriched `types::Receipt` now carries `from`, `nonce`, and
+//! `tx_hash` directly. So one tx_receipts subscription feeds both
+//! indexes, and the old `CachedReceipt` side channel is no longer needed.
 
 use std::sync::Arc;
 
@@ -18,10 +19,11 @@ use dashmap::DashMap;
 
 use kardamom_types::Receipt;
 
-/// Bounded FIFO eviction. Duplicates outside the window will re-submit and
-/// the sequencer dedupes via the past-nonce path; misses on
-/// `eth_getTransactionReceipt` for evicted entries return `null` (a future
-/// v1 fallback can hit the state DB).
+/// Bounded. Eviction order is arbitrary, because DashMap does not expose
+/// insertion order. An evicted sender resubmits, and the sequencer dedupes
+/// the resubmit through the past-nonce path. A lookup on
+/// `eth_getTransactionReceipt` for an evicted entry returns `null`. A
+/// future v1 fallback can query the state DB instead.
 pub struct ReceiptCache {
     by_sender_nonce: Arc<DashMap<(Address, u64), std::sync::Arc<Receipt>>>,
     by_tx_hash: Arc<DashMap<B256, std::sync::Arc<Receipt>>>,
@@ -38,14 +40,15 @@ impl ReceiptCache {
         }
     }
 
-    /// Insert one receipt into both indexes. Eviction is arbitrary (DashMap
-    /// doesn't expose FIFO); duplicate (sender, nonce) entries overwrite the
-    /// older row.
+    /// Inserts one receipt into both indexes. Eviction order is
+    /// arbitrary, because DashMap does not expose insertion order. A
+    /// duplicate (sender, nonce) entry overwrites the older row.
     pub fn insert(&self, receipt: Receipt) {
         self.evict_if_full(&self.by_sender_nonce);
         self.evict_if_full(&self.by_tx_hash);
-        // ONE allocation shared by both indexes (each previously stored a
-        // full Receipt clone — logs and all).
+        // This is one allocation shared by both indexes. Before this
+        // change, each index stored its own full Receipt clone, logs
+        // included.
         let receipt = std::sync::Arc::new(receipt);
         self.by_sender_nonce
             .insert((receipt.from, receipt.nonce), receipt.clone());
@@ -57,17 +60,19 @@ impl ReceiptCache {
         map: &DashMap<K, std::sync::Arc<Receipt>>,
     ) {
         if map.len() >= self.capacity {
-            // Copy a victim key out and DROP the iterator BEFORE `remove()`.
-            // DashMap's `Iter` holds a read-guard on the shard it is positioned
-            // on, and `remove()` needs that shard's write-guard — so removing
-            // while the iterator is still alive self-deadlocks on that shard
-            // (read held + write requested, same thread). The previous
-            // `if .. && let Some(entry) = map.iter().next() { .. map.remove(..) }`
-            // form kept the `map.iter()` temporary alive to the end of the
-            // block (let-chain temporary lifetime), so it deadlocked the
-            // tx_receipts watcher the moment the cache first reached capacity —
-            // freezing receipt delivery on that replica until restart. Binding
-            // the key in its own statement drops the iterator at the `;`.
+            // Copy a victim key out, and drop the iterator before calling
+            // `remove()`. DashMap's `Iter` holds a read guard on the
+            // shard it is positioned on. `remove()` needs that shard's
+            // write guard. So removing an entry while the iterator is
+            // still alive deadlocks that shard against itself: a read
+            // guard held, and a write guard requested, on the same
+            // thread. The previous form,
+            // `if .. && let Some(entry) = map.iter().next() { .. map.remove(..) }`,
+            // kept the `map.iter()` temporary alive to the end of the
+            // block. That deadlocked the tx_receipts watcher the first
+            // time the cache reached capacity, and froze receipt delivery
+            // on that replica until restart. Binding the key in its own
+            // statement drops the iterator at the `;`.
             let victim = map.iter().next().map(|e| *e.key());
             if let Some(key) = victim {
                 map.remove(&key);
@@ -122,22 +127,24 @@ mod tests {
         c.insert(make_receipt(s, 1, h, 1));
         assert_eq!(c.lookup(s, 1).unwrap().tx_idx.term_offset, 1);
         assert!(c.lookup(s, 2).is_none());
-        // Same entry also indexed by tx_hash.
+        // The same entry is also indexed by tx_hash.
         assert_eq!(c.lookup_by_tx_hash(h).unwrap().tx_hash, h);
         assert!(c.lookup_by_tx_hash(B256::repeat_byte(0x22)).is_none());
     }
 
-    // Regression: inserting past capacity must EVICT, not deadlock. The old
-    // `evict_if_full` held a DashMap iterator (shard read-guard) across
-    // `remove()` (shard write-guard) and self-deadlocked the moment the cache
-    // first filled — which froze the ingress tx_receipts watcher under sustained
-    // load (cluster-e2e ingress-churn freeze). This test would hang on the old
-    // code; the harness timeout turns that hang into a visible failure.
+    // Regression test: inserting past capacity must evict an entry, not
+    // deadlock. The old `evict_if_full` held a DashMap iterator, a shard
+    // read guard, across `remove()`, which needs the shard's write guard.
+    // This deadlocked the first time the cache filled up, and froze the
+    // ingress tx_receipts watcher under sustained load. This test hangs
+    // on the old code; the harness timeout turns that hang into a visible
+    // failure.
     #[tokio::test(flavor = "current_thread")]
     async fn insert_past_capacity_evicts_without_deadlock() {
         let cap = 64usize;
         let c = ReceiptCache::new(cap);
-        // Insert well past capacity. Distinct (sender, nonce, tx_hash) each time.
+        // Insert well past capacity, with a distinct (sender, nonce,
+        // tx_hash) each time.
         for i in 0..(cap as u64 * 4) {
             let b = (i % 251) as u8;
             c.insert(make_receipt(
@@ -147,13 +154,14 @@ mod tests {
                 i as i32,
             ));
         }
-        // Bounded: never exceeds capacity (FIFO/arbitrary eviction kept it in check).
+        // Bounded: the cache never exceeds capacity, since eviction keeps
+        // it in check.
         assert!(
             c.len() <= cap,
             "cache must stay bounded: {} > {cap}",
             c.len()
         );
-        // Still usable: the most recent insert is retrievable.
+        // Still usable: the cache can retrieve the most recent insert.
         let last = (cap as u64 * 4) - 1;
         assert!(
             c.lookup(Address::repeat_byte(((last % 251) as u8) ^ 0x5a), last)

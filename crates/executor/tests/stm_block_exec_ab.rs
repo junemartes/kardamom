@@ -1,9 +1,9 @@
-//! MERGE GATE for --parallel-execution (scheduler unification B2): the
-//! Block-STM block-at-a-time strategy must be BYTE-IDENTICAL to the
-//! sequential capture driver — receipts, delta, and the published BAL's
-//! RLP — on blocks with real fees, deposits interleaved between tx runs,
-//! and an invalid-skip. The validator's live cross-check fail-stops on any
-//! drift; this test is the offline form of that gate.
+//! Merge gate for `--parallel-execution` (scheduler unification B2). The
+//! Block-STM block-at-a-time strategy must be byte-identical to the
+//! sequential capture driver: receipts, delta, and the published BAL's
+//! RLP, on blocks with real fees, deposits interleaved between tx runs,
+//! and an invalid skip. The validator's live cross-check fail-stops on
+//! any drift. This test is the offline form of that gate.
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_network::TxSignerSync;
@@ -28,8 +28,8 @@ fn tx_record(
 ) -> BufferedRecord {
     let mut inner = TxLegacy {
         chain_id: Some(1),
-        // REAL fees: a zero gas price hides fee-sink attribution bugs
-        // completely (the sink is the one account STM tracks specially).
+        // Real fees: a zero gas price would fully hide fee-sink attribution
+        // bugs (the sink is the one account STM tracks specially).
         gas_price: 1_000_000_000,
         nonce,
         gas_limit: 100_000,
@@ -90,9 +90,9 @@ fn stm_strategy_matches_sequential_capture_byte_for_byte() {
         .account(bob.address(), U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
         .build();
 
-    // Records: tx-run, deposit, tx-run, deposit, tx-run — with an
-    // invalid-skip in the middle (nonce gap => NonceTooHigh) so the
-    // skip-hole parity is exercised too.
+    // Records: tx-run, deposit, tx-run, deposit, tx-run, with an invalid
+    // skip in the middle (a nonce gap causes NonceTooHigh). This also
+    // exercises skip-hole parity.
     let mut records: Vec<BufferedRecord> = Vec::new();
     let mut i = 0u64;
     let mut a_nonce = 0u64;
@@ -128,7 +128,7 @@ fn stm_strategy_matches_sequential_capture_byte_for_byte() {
         l2_timestamp: 1_700_000_000,
     };
 
-    // A: the sequential capture driver — the streaming path's semantics.
+    // A: the sequential capture driver, the streaming path's semantics.
     let seq = kardamom_engine::stateless::execute_block_capture(&snap, None, &records, env)
         .expect("sequential");
 
@@ -155,8 +155,8 @@ fn stm_strategy_matches_sequential_capture_byte_for_byte() {
         );
 
         // The published artifact: raw granularity-1 BAL RLP. Raw equality
-        // implies quantized equality at every K through the shared
-        // quantize().
+        // implies quantized equality at every K, through the shared
+        // `quantize`.
         let a = seq
             .bal
             .clone()

@@ -1,19 +1,19 @@
 //! Offline Aeron Archive segment reader.
 //!
-//! S0: the batcher reads from on-disk Aeron Archive segment files. It
-//! does not subscribe to tx_receipts, does not talk to the live sequencer.
+//! Today, the batcher reads on-disk Aeron Archive segment files. It does not
+//! subscribe to tx_receipts. It does not talk to the live sequencer.
 //!
-//! ## architecture: split data and ordering
+//! ## Architecture: split data and ordering
 //!
-//! After the on-disk archives carry **two different payload types**:
+//! The on-disk archives carry two different payload types:
 //!
 //! - **TxOrdering** segments carry [`TxOrderingMessage`] records (`TxRef +
-//!   BoundaryStart`) — the canonical orderer.
-//! - **Per-sequencer TxData** segments carry full [`TxEnvelope`] records —
-//!   the bulk transaction data.
+//!   BoundaryStart`). This is the canonical orderer data.
+//! - **Per-sequencer TxData** segments carry full [`TxEnvelope`] records.
+//!   This is the bulk transaction data.
 //!
-//! The simplified on-disk frame format the batcher uses for v0 is one
-//! length-prefixed rkyv archive per record:
+//! The batcher uses a simplified on-disk frame format for v0: one
+//! length-prefixed rkyv archive per record.
 //!
 //! ```text
 //!   length      u32 LE      total frame length including this header
@@ -24,12 +24,13 @@
 //!   pad         zero, to next 8-byte boundary
 //! ```
 //!
-//! The header is type-agnostic; the payload type is determined by *which
-//! archive* the segment file came from (tx_ordering vs tx_data[i]). The
-//! reader is generic over the payload type so it can deserialise either.
+//! The header does not depend on the payload type. The payload type depends
+//! on which archive the segment file came from (tx_ordering or tx_data[i]).
+//! The reader is generic over the payload type, so it can deserialize either
+//! one.
 //!
-//! The active segment may end mid-frame; the reader truncates at the last
-//! full frame.
+//! The active segment can end mid-frame. The reader stops at the last full
+//! frame.
 
 use std::fs::File;
 use std::io::Read;
@@ -42,22 +43,23 @@ use rkyv::rancor;
 
 use crate::error::BatcherError;
 
-const FRAME_HEADER_LEN: usize = 4 + 4 + 4 + 4; // 16 bytes (length, reserved, term_id, term_offset)
+const FRAME_HEADER_LEN: usize = 4 + 4 + 4 + 4; // 16 bytes: length, reserved, term_id, term_offset
 const FRAME_ALIGN: usize = 8;
 
-/// One decoded record from a typed segment file. The position is the
-/// fragment's start position on the originating Aeron stream — for tx_data
-/// segments this is the position a sequencer recorded in [`TxRef::tx_data_position`].
+/// One decoded record from a typed segment file. The position is the start
+/// position of the fragment on the originating Aeron stream. For tx_data
+/// segments, this is the position a sequencer recorded in
+/// [`TxRef::tx_data_position`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedRecord<T> {
     pub position: BPosition,
     pub value: T,
 }
 
-/// Generic offline reader over an archive segment file. The type parameter
-/// `T` is the rkyv-archived payload carried by every frame in this segment.
-/// For tx_ordering archives use `T = TxOrderingMessage`; for tx_data archives
-/// use `T = TxEnvelope`.
+/// A generic offline reader for an archive segment file. The type parameter
+/// `T` is the rkyv-archived payload in every frame of this segment. Use
+/// `T = TxOrderingMessage` for tx_ordering archives. Use `T = TxEnvelope`
+/// for tx_data archives.
 pub struct TypedSegmentReader<T> {
     bytes: Vec<u8>,
     pos: usize,
@@ -106,10 +108,11 @@ where
         let buf = &self.bytes[self.pos..];
         let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         if len == 0 {
-            // A pre-allocated / not-yet-written tail is zero-filled. A zero
-            // length followed by ANY non-zero byte is a damaged header with
-            // real data behind it — corruption, not a live tail. Without this
-            // check a mid-file length wipe silently truncates the stream.
+            // A pre-allocated tail that is not yet written is zero-filled. A
+            // zero length followed by any non-zero byte means a damaged
+            // header with real data behind it. This is corruption, not a
+            // live tail. Without this check, a length wipe in the middle of
+            // the file would silently truncate the stream.
             if buf.iter().any(|&b| b != 0) {
                 let at = self.pos;
                 self.pos = self.bytes.len(); // fuse the iterator
@@ -120,7 +123,7 @@ where
             return None;
         }
         if len < FRAME_HEADER_LEN {
-            // No legitimate frame is smaller than its own header.
+            // A frame cannot be smaller than its own header.
             let at = self.pos;
             self.pos = self.bytes.len(); // fuse the iterator
             return Some(Err(BatcherError::Corruption(format!(
@@ -128,10 +131,11 @@ where
             ))));
         }
         if self.pos + len > self.bytes.len() {
-            // Truncated active segment (a frame mid-write at the tail) — stop.
+            // Stop here. The active segment is truncated by a frame
+            // mid-write at the tail.
             return None;
         }
-        // bytes 4..8 reserved
+        // Bytes 4 to 8 are reserved.
         let term_id = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let term_offset = i32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
         let payload = &buf[FRAME_HEADER_LEN..len];
@@ -171,11 +175,11 @@ where
     rkyv::from_bytes::<T, rancor::Error>(bytes).map_err(|e| BatcherError::Codec(e.to_string()))
 }
 
-/// Append one frame to `out`. Helper used by tests and the future writer-side
-/// adapter; encodes one record in the simplified KAR1-internal segment format.
+/// Append one frame to `out`. Tests and the future writer-side adapter use
+/// this helper. It encodes one record in the simplified KAR1 segment format.
 ///
-/// The frame is type-agnostic: caller writes the same way for tx_data
-/// (T = TxEnvelope) and tx_ordering (T = TxOrderingMessage).
+/// The frame does not depend on the type. The caller writes tx_data
+/// (`T = TxEnvelope`) and tx_ordering (`T = TxOrderingMessage`) the same way.
 pub fn append_frame<T>(out: &mut Vec<u8>, position: BPosition, value: &T)
 where
     T: for<'a> rkyv::Serialize<
@@ -189,11 +193,11 @@ where
     let payload = rkyv::to_bytes::<rancor::Error>(value).expect("rkyv encode");
     let total: u32 = (FRAME_HEADER_LEN + payload.len()) as u32;
     out.extend_from_slice(&total.to_le_bytes());
-    out.extend_from_slice(&[0u8; 4]); // reserved (was: stream_kind + 3 reserved bytes; collapsed in)
+    out.extend_from_slice(&[0u8; 4]); // reserved
     out.extend_from_slice(&position.term_id.to_le_bytes());
     out.extend_from_slice(&position.term_offset.to_le_bytes());
     out.extend_from_slice(payload.as_slice());
-    // pad to 8-byte alignment
+    // Pad to the 8-byte boundary.
     while !out.len().is_multiple_of(FRAME_ALIGN) {
         out.push(0);
     }

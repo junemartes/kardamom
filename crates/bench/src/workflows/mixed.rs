@@ -1,5 +1,5 @@
-//! `MixedWorkflow` — interleaves signed transfers and `eth_call`s per a
-//! configured ratio. Stresses the read and write paths together.
+//! `MixedWorkflow` interleaves signed transfers and `eth_call`s, at a
+//! configured ratio. It stresses the read and write paths together.
 
 use alloy_primitives::{Address, Bytes, TxKind, U256};
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionRequest};
@@ -21,21 +21,22 @@ const SEND_RAW: &str = "eth_sendRawTransaction";
 const CALL: &str = "eth_call";
 const METHODS: &[&str] = &[SEND_RAW, CALL];
 
-/// Built-in workflow: interleaves signed transfers and `eth_call`s per
-/// the configured ratio. Stresses read and write paths together.
+/// A built-in workflow that interleaves signed transfers and `eth_call`s,
+/// at the configured ratio. It stresses the read and write paths together.
 #[derive(Debug, Clone)]
 pub struct MixedWorkflow {
-    /// BIP-39 phrase the signers are derived from.
+    /// The BIP-39 phrase the signers are derived from.
     pub mnemonic: String,
-    /// Balance each prefunded signer EOA gets in genesis.
+    /// The balance each prefunded signer EOA gets in genesis.
     pub signer_balance: U256,
-    /// Address of the contract that will be the `to` of every `eth_call`.
+    /// The address of the contract that is the `to` value of every
+    /// `eth_call`.
     pub contract: Address,
-    /// Bytecode deployed at `contract` in the in-process genesis.
+    /// The bytecode deployed at `contract` in the in-process genesis.
     pub contract_code: Bytes,
-    /// Number of transfers per (transfers + calls) cycle.
+    /// The number of transfers in each transfers-plus-calls cycle.
     pub transfers_per_cycle: u32,
-    /// Number of `eth_call`s per (transfers + calls) cycle.
+    /// The number of `eth_call`s in each transfers-plus-calls cycle.
     pub calls_per_cycle: u32,
 }
 
@@ -52,11 +53,12 @@ impl Default for MixedWorkflow {
     }
 }
 
-/// Per-item work unit for [`MixedWorkflow`].
+/// A per-item work unit for [`MixedWorkflow`].
 pub enum MixedItem {
     /// A pre-signed value transfer, EIP-2718 encoded.
     Transfer(Bytes),
-    /// An `eth_call` to the workflow's `contract` — no per-item state.
+    /// An `eth_call` to the workflow's `contract`. This variant carries
+    /// no per-item state.
     Call,
 }
 
@@ -96,7 +98,7 @@ impl BenchWorkflow for MixedWorkflow {
         }
 
         let chain_id = preflight_chain_id(client).await?;
-        // Verify the call target is deployed.
+        // Check that the call target is deployed.
         let req = TransactionRequest {
             to: Some(TxKind::Call(self.contract)),
             ..Default::default()
@@ -114,8 +116,7 @@ impl BenchWorkflow for MixedWorkflow {
 
         let signers = mnemonic::derive_signers(&self.mnemonic, n_tasks)?;
 
-        // Same transfers-per-cap ratio as the original main calculation,
-        // applied to both warmup and main.
+        // Apply the same transfers-per-cap ratio to both warmup and main.
         let transfers_per_task = (txs_per_task as usize)
             .saturating_mul(self.transfers_per_cycle as usize)
             / cycle_total as usize;
@@ -123,9 +124,10 @@ impl BenchWorkflow for MixedWorkflow {
             .saturating_mul(self.transfers_per_cycle as usize)
             / cycle_total as usize;
 
-        // Warmup transfers: round-robin presign across all signers at
-        // nonces 0..warmup_transfers_per_task. Main transfers per signer
-        // resume at that nonce. Interleave each phase into its own queue.
+        // Warmup transfers: presign in rotation across all signers, at
+        // nonces 0 to warmup_transfers_per_task. Main transfers for each
+        // signer resume at that nonce. Interleave each phase into its
+        // own queue.
         let warmup_presigned = if warmup_transfers_per_task > 0 {
             presign_transfers(
                 &signers,
@@ -190,8 +192,8 @@ impl BenchWorkflow for MixedWorkflow {
     }
 }
 
-/// Interleave presigned transfers with `Call` markers per the mix ratio,
-/// up to `cap` items total.
+/// Interleave presigned transfers with `Call` markers, at the mix
+/// ratio, up to `cap` items in total.
 fn interleave(
     presigned: Vec<Bytes>,
     cap: usize,
@@ -233,7 +235,8 @@ mod tests {
 
     #[test]
     fn interleave_default_mix_respects_ratio_and_cap() {
-        // 1:4 with cap 10, 100 presigned available. Expect 2 transfers, 8 calls.
+        // Ratio 1:4, cap 10, 100 presigned items available.
+        // Expect 2 transfers and 8 calls.
         let presigned: Vec<Bytes> = (0..100).map(|_| Bytes::from_static(&[0])).collect();
         let out = interleave(presigned, 10, 1, 4);
         assert_eq!(out.len(), 10);
@@ -249,8 +252,8 @@ mod tests {
 
     #[test]
     fn interleave_stops_when_presigned_exhausted() {
-        // 3:0 with cap 100 but only 4 presigned: out = 4 transfers, then stop
-        // (the calls_per_cycle == 0 path doesn't help refill).
+        // Ratio 3:0, cap 100, only 4 presigned items. Output is 4 transfers,
+        // then it stops: a calls_per_cycle of 0 gives no items to refill with.
         let presigned: Vec<Bytes> = (0..4).map(|_| Bytes::from_static(&[0])).collect();
         let out = interleave(presigned, 100, 3, 0);
         assert_eq!(out.len(), 4);
@@ -259,8 +262,8 @@ mod tests {
 
     #[test]
     fn interleave_cap_mid_cycle_truncates_cleanly() {
-        // cap=3 mid-cycle: 1 transfer, then 2 calls (cycle was 1:4 but cap hit
-        // before the 4-call run completes).
+        // cap=3, mid-cycle: 1 transfer, then 2 calls. The cycle is 1:4, but
+        // the cap is hit before the 4-call run finishes.
         let presigned = vec![Bytes::from_static(&[0])];
         let out = interleave(presigned, 3, 1, 4);
         assert_eq!(out.len(), 3);

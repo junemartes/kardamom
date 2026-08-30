@@ -1,14 +1,13 @@
-//! Engine-side test fixtures that couple `kardamom-exec-core`'s
+//! Engine-side test fixtures. They connect `kardamom-exec-core`'s
 //! `MockStateDatabase` to the actor's commit seam.
 //!
-//! The mock itself (plus `StaticSnapshotSource` / `MutatingSnapshotSource`)
-//! lives in `kardamom-exec-core::state` — it only depends on the
-//! `kardamom-types` traits. `WriterApplyingQueue` stays HERE because it
-//! implements [`StateWriterQueue`], an actor seam that has no place in the
-//! `no_std` core.
+//! The mock, plus `StaticSnapshotSource` and `MutatingSnapshotSource`, lives
+//! in `kardamom-exec-core::state`. It depends only on the `kardamom-types`
+//! traits. `WriterApplyingQueue` stays here. It implements
+//! [`StateWriterQueue`], an actor seam that has no place in the `no_std` core.
 
-// Re-exported so pre-split `crate::state::…` / `kardamom_engine::state::…`
-// paths keep resolving.
+// This re-export keeps old `crate::state::…` and `kardamom_engine::state::…`
+// paths working.
 pub use kardamom_exec_core::state::{
     MockStateDatabase, MockStateError, MutatingSnapshotSource, StaticSnapshotSource,
 };
@@ -17,10 +16,10 @@ use kardamom_types::{BlockBoundary, BlockDelta};
 use crate::actor::StateWriterQueue;
 use crate::error::ExecutorError;
 
-/// State-writer queue that applies each submitted `BlockDelta` directly to
-/// the shared `MockStateDatabase`. Pair with `MutatingSnapshotSource` so the
-/// exec thread observes block N's writes when it opens its snapshot for
-/// block N+1.
+/// State-writer queue. It applies each submitted `BlockDelta` directly to the
+/// shared `MockStateDatabase`. Pair it with `MutatingSnapshotSource`. Then the
+/// exec thread sees block N's writes when it opens its snapshot for block
+/// N+1.
 #[derive(Debug, Clone)]
 pub struct WriterApplyingQueue {
     db: MockStateDatabase,

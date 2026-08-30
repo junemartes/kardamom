@@ -1,6 +1,6 @@
-//! Shared test helpers used by the `kardamom-ingress` integration tests.
-//! Lives in `tests/common/mod.rs` so cargo treats it as a module (not a
-//! test binary).
+//! Shared test helpers for the `kardamom-ingress` integration tests. This
+//! file lives at `tests/common/mod.rs`, so cargo treats it as a module,
+//! not a test binary.
 
 #![allow(dead_code)]
 
@@ -10,8 +10,8 @@ use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use k256::ecdsa::{RecoveryId, signature::hazmat::PrehashSigner};
 
-/// Sign a fresh legacy tx with `signer` at `nonce` and return both the
-/// decoded envelope and its RLP bytes plus the signer address.
+/// Signs a fresh legacy tx with `signer` at `nonce`. Returns the decoded
+/// envelope, its RLP bytes, and the signer address.
 pub fn sign_legacy_tx(signer: &PrivateKeySigner, nonce: u64) -> (TxEnvelope, Bytes, Address) {
     let addr = signer.address();
     let tx = TxLegacy {
@@ -35,12 +35,12 @@ pub fn sign_legacy_tx(signer: &PrivateKeySigner, nonce: u64) -> (TxEnvelope, Byt
     (env, Bytes::from(buf), addr)
 }
 
-/// Sign a fresh legacy tx and return only the RLP bytes.
+/// Signs a fresh legacy tx and returns only the RLP bytes.
 pub fn sign_legacy(signer: &PrivateKeySigner, nonce: u64) -> Bytes {
     sign_legacy_tx(signer, nonce).1
 }
 
-/// Sign a legacy tx with an explicit gas limit (protocol-limit tests).
+/// Signs a legacy tx with an explicit gas limit, for protocol-limit tests.
 pub fn sign_legacy_with_gas(signer: &PrivateKeySigner, nonce: u64, gas_limit: u64) -> Bytes {
     let tx = TxLegacy {
         chain_id: Some(1),
@@ -62,7 +62,7 @@ pub fn sign_legacy_with_gas(signer: &PrivateKeySigner, nonce: u64, gas_limit: u6
     Bytes::from(buf)
 }
 
-/// Sign a minimal EIP-4844 (type-3) tx and return the encoded bytes.
+/// Signs a minimal EIP-4844 (type-3) tx and returns the encoded bytes.
 pub fn sign_eip4844(signer: &PrivateKeySigner, nonce: u64) -> Bytes {
     let tx = alloy_consensus::TxEip4844 {
         chain_id: 1,

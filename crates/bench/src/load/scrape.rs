@@ -1,26 +1,26 @@
-//! Cluster metric scraping for the load harness.
+//! This module scrapes cluster metrics for the load harness.
 //!
-//! Service Prometheus exporters bind loopback *inside* each service
-//! container (which runs host-net inside the DinD node container), so the
-//! only way to reach them from the orchestrator/host is
-//! `docker exec <node> curl 127.0.0.1:<port>/metrics`. A `direct` mode
-//! (plain `curl http://<node>:<port>`) is provided as a fallback for setups
-//! that rebind the exporters to a routable address.
+//! Each service's Prometheus exporter binds to loopback inside its own
+//! container, which runs on host-net inside the DinD node container.
+//! So the only way to reach an exporter from the orchestrator or host
+//! is `docker exec <node> curl 127.0.0.1:<port>/metrics`. A `direct`
+//! mode, plain `curl http://<node>:<port>`, is a fallback for a setup
+//! that rebinds the exporters to a routable address.
 
 use std::collections::BTreeSet;
 
 use tokio::process::Command;
 
-// Default metrics ports (the services' --metrics-addr defaults).
+// The default metrics ports. These match each service's --metrics-addr default.
 const PORT_EXECUTOR: u16 = 9004;
 const PORT_INGRESS: u16 = 9006;
 const PORT_SEQUENCER: u16 = 9001;
 
-// Exact Prometheus metric names exposed by each service.
+// The exact Prometheus metric names each service exposes.
 const M_EXECUTOR_BLOCK: &str = "kardamom_executor_block_number";
-// The clustered sealer has no Prometheus endpoint; each executor re-exports
-// the sealer's boundary stream as it decodes cluster egress, so the
-// kardamom_sealer_* series are read off the executor endpoints.
+// The clustered sealer has no Prometheus endpoint of its own. Each executor
+// re-exports the sealer's boundary stream as it decodes cluster egress, so
+// the code reads the kardamom_sealer_* series from the executor endpoints.
 const M_SEALER_BLOCK: &str = "kardamom_sealer_block_number";
 const M_SEALER_BOUNDARIES: &str = "kardamom_sealer_boundaries_emitted_total";
 const M_INGRESS_RECEIVED: &str = "kardamom_ingress_tx_received_total";
@@ -35,52 +35,55 @@ const M_SERVICE_UP: &str = "kardamom_service_up";
 /// A point-in-time read of the cluster's pipeline metrics.
 #[derive(Debug, Default, Clone)]
 pub struct MetricsSnapshot {
-    /// `(node, executor_block_number)` per scraped executor node.
+    /// `(node, executor_block_number)` for each scraped executor node.
     pub executor_blocks: Vec<(String, Option<u64>)>,
-    /// Sealer's last sealed block number (most-advanced executor observation
-    /// of the cluster's boundary stream).
+    /// The sealer's last sealed block number. This is the most advanced
+    /// executor observation of the cluster's boundary stream.
     pub sealer_block: Option<u64>,
-    /// Sealer block-boundaries counter (liveness during chaos), observed the
-    /// same way.
+    /// The sealer's block-boundaries counter, for liveness during chaos,
+    /// observed the same way.
     pub sealer_boundaries: Option<u64>,
-    /// Ingress: total submissions received.
+    /// Ingress: the total submissions received.
     pub ingress_received: Option<u64>,
-    /// Ingress: submissions that returned a receipt.
+    /// Ingress: the submissions that returned a receipt.
     pub ingress_accepted: Option<u64>,
-    /// Ingress: submissions rejected (summed over all `reason` labels).
+    /// Ingress: the submissions rejected, summed over all `reason` labels.
     pub ingress_rejected: Option<u64>,
-    /// Ingress: current pending-tx queue depth.
+    /// Ingress: the current pending-transaction queue depth.
     pub ingress_queue_depth: Option<u64>,
-    /// Sequencer: txs dropped for a past nonce (summed over partitions).
+    /// Sequencer: transactions dropped for a past nonce, summed over
+    /// partitions.
     pub seq_dropped_past: Option<u64>,
-    /// Sequencer: pending-buffer evictions (summed over partitions).
+    /// Sequencer: pending-buffer evictions, summed over partitions.
     pub seq_evictions: Option<u64>,
-    /// Sequencer: backpressure events (summed over partitions).
+    /// Sequencer: backpressure events, summed over partitions.
     pub seq_backpressure: Option<u64>,
-    /// `(label, up)` for each service a scrape was ATTEMPTED for: `Some(1)` =
-    /// exporter reports up, `Some(0)` = exporter reports down OR the scrape
-    /// itself failed (unreachable counts as down — the end-of-run liveness
-    /// gate must not pass just because an exporter vanished), `None` =
-    /// scraped but the metric was absent. A service missing from this list
-    /// was never scraped (not in the scrape set).
+    /// `(label, up)` for each service a scrape was attempted for.
+    /// `Some(1)` means the exporter reports up. `Some(0)` means the
+    /// exporter reports down, or the scrape itself failed: an
+    /// unreachable service counts as down, so the end-of-run liveness
+    /// gate does not pass just because an exporter vanished. `None`
+    /// means the scrape succeeded but the metric was absent. A service
+    /// missing from this list was never scraped, because it was not in
+    /// the scrape set.
     pub service_up: Vec<(String, Option<u64>)>,
 }
 
-/// Which services to scrape and the node-container names for each.
+/// The services to scrape, and the node-container names for each.
 #[derive(Debug, Clone)]
 pub struct Scraper {
-    /// `docker exec <node> curl 127.0.0.1:<port>` when true; direct
-    /// `curl http://<node>:<port>` when false.
+    /// When true, use `docker exec <node> curl 127.0.0.1:<port>`.
+    /// When false, use a direct `curl http://<node>:<port>`.
     pub via_docker: bool,
-    /// Lowercased service names to scrape: any of executor/ingress/sequencer.
-    /// (The sealer values ride the executor scrape — the clustered sealer has
-    /// no endpoint of its own.)
+    /// The lowercased service names to scrape: any of executor, ingress,
+    /// or sequencer. The sealer values ride along with the executor
+    /// scrape, since the clustered sealer has no endpoint of its own.
     pub scrape: BTreeSet<String>,
-    /// Executor node-container names.
+    /// The executor node-container names.
     pub executor_nodes: Vec<String>,
-    /// Ingress node-container name.
+    /// The ingress node-container name.
     pub ingress_node: String,
-    /// Sequencer node-container names.
+    /// The sequencer node-container names.
     pub sequencer_nodes: Vec<String>,
 }
 
@@ -89,7 +92,7 @@ impl Scraper {
         self.scrape.contains(svc)
     }
 
-    /// Fetch one node's `/metrics` body, or `None` if unreachable.
+    /// Fetch one node's `/metrics` body. Returns `None` if unreachable.
     async fn fetch(&self, node: &str, port: u16) -> Option<String> {
         let url = format!("http://127.0.0.1:{port}/metrics");
         let out = if self.via_docker {
@@ -125,12 +128,13 @@ impl Scraper {
                 };
                 snap.executor_blocks
                     .push((node.clone(), g(M_EXECUTOR_BLOCK)));
-                // Sealer output as re-exported by this executor from cluster
-                // egress; keep the most-advanced observation across nodes so a
-                // single stalled executor doesn't mask sealer progress.
+                // This is sealer output, re-exported by this executor from
+                // cluster egress. Keep the most advanced observation across
+                // nodes, so a single stalled executor does not hide sealer
+                // progress.
                 snap.sealer_block = snap.sealer_block.max(g(M_SEALER_BLOCK));
                 snap.sealer_boundaries = snap.sealer_boundaries.max(g(M_SEALER_BOUNDARIES));
-                // A failed scrape is an explicit DOWN, not a missing value.
+                // A failed scrape counts as an explicit down, not a missing value.
                 let up = if body.is_some() {
                     g(M_SERVICE_UP)
                 } else {
@@ -141,9 +145,10 @@ impl Scraper {
         }
         if self.wants("ingress") {
             let body = self.fetch(&self.ingress_node, PORT_INGRESS).await;
-            // Absent-counter-on-a-scraped-body means ZERO (metrics-rs emits a
-            // counter only after its first increment); `None` means the
-            // scrape itself failed — same distinction as the sequencer block.
+            // An absent counter on a scraped body means zero. The metrics-rs
+            // library emits a counter only after its first increment. `None`
+            // means the scrape itself failed. This is the same distinction
+            // used for the sequencer block.
             let g = |m: &str| {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 body.as_deref()
@@ -153,7 +158,7 @@ impl Scraper {
             snap.ingress_accepted = g(M_INGRESS_ACCEPTED);
             snap.ingress_rejected = g(M_INGRESS_REJECTED);
             snap.ingress_queue_depth = g(M_INGRESS_QUEUE);
-            // A failed scrape is an explicit DOWN, not a missing value.
+            // A failed scrape counts as an explicit down, not a missing value.
             let up = if body.is_some() {
                 g(M_SERVICE_UP)
             } else {
@@ -169,18 +174,18 @@ impl Scraper {
             for node in &self.sequencer_nodes {
                 let body = self.fetch(node, PORT_SEQUENCER).await;
                 if body.is_none() {
-                    // A failed scrape is an explicit DOWN entry — previously
-                    // the node was silently missing from service_up, so an
-                    // unreachable sequencer passed the liveness gate.
+                    // A failed scrape is an explicit down entry. Before this
+                    // change, the node was silently missing from service_up,
+                    // so an unreachable sequencer passed the liveness gate.
                     snap.service_up.push((format!("sequencer@{node}"), Some(0)));
                 }
                 if let Some(body) = body {
-                    // A SUCCESSFULLY scraped body with an ABSENT counter means
-                    // ZERO events, not "unknown": metrics-rs counters only
-                    // appear in the exposition after their first increment, so
-                    // requiring the sample line made every clean run report
-                    // `None` and the drop-accounting row was permanently
-                    // uninformative. `None` now means "no sequencer scraped".
+                    // A successfully scraped body with an absent counter means
+                    // zero events, not unknown: metrics-rs counters appear in
+                    // the exposition only after their first increment.
+                    // Requiring the sample line made every clean run report
+                    // `None`, so the drop-accounting row was never useful.
+                    // `None` now means no sequencer was scraped.
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     {
                         d += sum_metric(&body, M_SEQ_DROPPED).unwrap_or(0.0) as u64;
@@ -207,8 +212,8 @@ impl Scraper {
     }
 }
 
-/// Sum the values of all samples of `name` in a Prometheus text body
-/// (i.e. across every label set). Returns `None` if no sample matches.
+/// Sum the values of every sample of `name` in a Prometheus text body,
+/// across every label set. Returns `None` if no sample matches.
 #[must_use]
 pub fn sum_metric(body: &str, name: &str) -> Option<f64> {
     let mut total = 0.0_f64;
@@ -227,7 +232,7 @@ pub fn sum_metric(body: &str, name: &str) -> Option<f64> {
         };
         let next = rest.chars().next();
         if !matches!(next, Some('{') | Some(' ') | Some('\t')) {
-            continue; // e.g. `name_suffix ...` — not our metric
+            continue; // For example, `name_suffix ...`. Not our metric.
         }
         // The value is the field after the (optional) `{...}` label block.
         let after_labels = if next == Some('{') {
@@ -275,7 +280,7 @@ kardamom_executor_block_apply_duration_seconds_count 7
 
     #[test]
     fn sum_across_label_sets() {
-        // 3 + 4 partitions; 2 + 1 reasons.
+        // 3 + 4 for partitions; 2 + 1 for reasons.
         assert_eq!(
             sum_metric(SAMPLE, "kardamom_sequencer_tx_dropped_past_total"),
             Some(7.0)
@@ -296,7 +301,7 @@ kardamom_executor_block_apply_duration_seconds_count 7
 
     #[test]
     fn prefix_collision_not_matched() {
-        // Requesting the block_number must NOT match block_apply_duration.
+        // A request for block_number must not match block_apply_duration.
         assert_eq!(sum_metric(SAMPLE, "kardamom_executor_block"), None);
     }
 

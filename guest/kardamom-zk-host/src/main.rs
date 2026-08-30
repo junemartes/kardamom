@@ -1,18 +1,19 @@
 //! Execute the kardamom guest ELF in SP1's executor (no proving) against a
 //! fixture emitted by the validator's `witness_anchoring` test
 //! (`KARDAMOM_EMIT_PROVER_FIXTURE=dir cargo test -p kardamom-validator
-//! --test witness_anchoring`), and assert the guest's committed public
-//! values equal the host-side expectation BYTE FOR BYTE — the guest/host
+//! --test witness_anchoring`), and check that the guest's committed public
+//! values equal the host-side expectation byte for byte: the guest/host
 //! round-trip contract of phase 3c.
 //!
 //! Usage: kardamom-zk-host [--prove] <fixture-dir> [elf-path]
-//! Exit 0 = outputs identical; nonzero = divergence or execution failure.
+//! Exit 0 means the outputs are identical; nonzero means divergence or an
+//! execution failure.
 //!
-//! `--prove` generates and VERIFIES a real SP1 core proof instead of just
-//! executing — the first actual validity proof of a kardamom block. The
+//! `--prove` generates and verifies a real SP1 core proof instead of just
+//! executing: the first actual validity proof of a kardamom block. The
 //! proof is written to `<fixture-dir>/proof.bin`. CPU proving of an
-//! unpatched ~8M-cycle block is minutes-scale; this mode is a milestone
-//! and a benchmark, not the production prover loop.
+//! unpatched block of about 8M cycles takes minutes; this mode is a
+//! milestone and a benchmark, not the production prover loop.
 
 use std::sync::Arc;
 
@@ -143,7 +144,7 @@ fn batch_main(
     });
     anyhow::ensure!(first >= 1 && last >= first, "bad block range");
 
-    // Assemble the batch input + derive the expected outputs from the
+    // Assemble the batch input and derive the expected outputs from the
     // spooled per-block frames (the submitter's cross-check; the guest
     // recomputes everything independently).
     let mut blocks = Vec::new();

@@ -1,6 +1,6 @@
-//! Per-IP rate-limit integration. Drives the proxy's `submit_raw` entry
-//! point with garbage bytes and asserts that `IngressError::RateLimited`
-//! surfaces after the burst is exhausted.
+//! Per-IP rate-limit integration test. It calls the proxy's `submit_raw`
+//! entry point with garbage bytes. It checks that `IngressError::RateLimited`
+//! occurs after the burst runs out.
 
 use std::time::Duration;
 
@@ -23,16 +23,16 @@ async fn third_call_from_same_ip_is_rate_limited() {
 
     let ip = "10.0.0.7".parse().unwrap();
     let garbage = Bytes::from(vec![0xc0u8]);
-    // First two pass the limiter (then fail at decode).
+    // The first two calls pass the limiter, then fail at decode.
     let r1 = proxy.submit_raw(ip, garbage.clone()).await;
     assert!(matches!(r1.unwrap_err(), IngressError::Decode(_)));
     let r2 = proxy.submit_raw(ip, garbage.clone()).await;
     assert!(matches!(r2.unwrap_err(), IngressError::Decode(_)));
-    // Third in the same burst window is rate-limited.
+    // The third call in the same burst window is rate-limited.
     let r3 = proxy.submit_raw(ip, garbage.clone()).await;
     assert!(matches!(r3.unwrap_err(), IngressError::RateLimited(_)));
 
-    // After ~1.1s the per-sec replenishment should let it through again.
+    // After about 1.1s, the per-second replenishment lets the call through.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let r4 = proxy.submit_raw(ip, garbage).await;
     assert!(matches!(r4.unwrap_err(), IngressError::Decode(_)));

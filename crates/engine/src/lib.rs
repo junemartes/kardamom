@@ -1,17 +1,19 @@
 //! Kardamom role-agnostic execution engine.
 //!
-//! The execution core shared by the sequencer-side `kardamom-executor` and the
-//! `kardamom-validator`: M per-sequencer **tx_data** readers + the canonical
-//! **tx_ordering** reader joined by reference, per-tx revm execution, write-set
-//! / `BlockDelta` accumulation, and the reader→exec→commit orchestration. The
-//! commit stage is generalized over the existing [`StateWriterQueue`] and
-//! [`TxReceiptsPublication`] seams, so each role decides what happens at each
-//! tx and block close (the executor publishes receipts + a BAL; the validator
-//! builds an MPT state root and cross-checks itself).
+//! This is the execution core for `kardamom-executor` and
+//! `kardamom-validator`. It has M per-sequencer **tx_data** readers and one
+//! canonical **tx_ordering** reader. The readers join by reference. The
+//! engine runs revm execution for each tx, and builds the write-set and
+//! `BlockDelta`. It manages the reader-to-exec-to-commit flow.
 //!
-//! Block-STM is out of scope for v0; v1 will replace the single execution
-//! thread with parallel workers behind the same `TxDataSubscription` /
-//! `TxOrderingSubscription` interfaces.
+//! The commit stage works through the [`StateWriterQueue`] and
+//! [`TxReceiptsPublication`] seams. Each role decides what to do at each tx
+//! and block close. The executor publishes receipts and a BAL. The
+//! validator builds an MPT state root and checks it.
+//!
+//! Block-STM is out of scope for v0. In v1, parallel workers will replace
+//! the single execution thread. They will use the same
+//! `TxDataSubscription` and `TxOrderingSubscription` interfaces.
 
 pub mod actor;
 pub mod bin_support;
@@ -22,9 +24,9 @@ pub mod replay;
 pub mod shadow;
 pub mod state;
 
-// The pure state-transition slice lives in `kardamom-exec-core` (`no_std`,
-// zk-guest-linkable). Module re-exports keep every pre-split path working:
-// `kardamom_engine::executor::…`, `crate::delta::…` etc. all still resolve.
+// The pure state-transition slice lives in `kardamom-exec-core` (a `no_std`,
+// zk-guest-linkable crate). These re-exports keep old paths working, such as
+// `kardamom_engine::executor::…` and `crate::delta::…`.
 pub use kardamom_exec_core::{
     anchor, bal_ladder, block_env, delta, error, exec_types, executor, features, stateless, witness,
 };
@@ -47,7 +49,7 @@ pub use reader::{
 };
 pub use replay::{ReplayBlock, ReplayError, ReplayOutcome, replay_blocks};
 pub use state::WriterApplyingQueue;
-// Shared types re-exported from the `types` crate so callers can pull them via
+// These types come from the `types` crate. Callers can use them through
 // `kardamom_engine::*` without a separate dependency line.
 pub use ::kardamom_types::{
     AccountChange, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, Receipt,

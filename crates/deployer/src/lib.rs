@@ -1,9 +1,10 @@
 //! Stateless Rust deployer for kardamom L1 contracts.
 //!
-//! All upgrade state is on-chain: the deployer reads build-time-embedded creation
-//! bytecode (see [`embedded`]), builds `DeploymentSpec[]`, and submits one
-//! `applyDeployments` tx through the factory. No local manifest, no
-//! per-environment state files, no runtime artifact I/O.
+//! All upgrade state stays on-chain. The deployer reads creation bytecode
+//! embedded at build time (see [`embedded`]), builds a `DeploymentSpec[]`,
+//! and sends one `applyDeployments` transaction through the factory. It uses
+//! no local manifest, no per-environment state file, and no runtime
+//! artifact I/O.
 
 pub mod addresses;
 pub mod deployer;

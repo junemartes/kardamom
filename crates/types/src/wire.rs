@@ -1,12 +1,13 @@
 //! rkyv `with` adapters for alloy-primitives types.
 //!
-//! alloy's `Address`, `B256`, `U256`, and `bytes::Bytes` do not derive
-//! `rkyv::Archive` upstream. We provide thin `with` wrappers that archive each
-//! as a fixed-size byte array (or, for `Bytes`, a length-prefixed byte slice).
-//! Annotate a field with `#[rkyv(with = wire::AddressBytes)]` (etc.) to opt in.
+//! alloy's `Address`, `B256`, `U256`, and `bytes::Bytes` types do not
+//! derive `rkyv::Archive` upstream. This module provides thin `with`
+//! wrappers that archive each as a fixed-size byte array, or for `Bytes`,
+//! as a length-prefixed byte slice. Annotate a field with
+//! `#[rkyv(with = wire::AddressBytes)]`, or the matching wrapper, to opt in.
 //!
-//! This keeps wire types ergonomic (`pub sender: Address`) while keeping rkyv
-//! happy and the on-wire format stable.
+//! This keeps wire types easy to use (`pub sender: Address`), while keeping
+//! rkyv working and the on-wire format stable.
 
 use alloc::vec::Vec;
 
@@ -151,9 +152,9 @@ where
 /// rkyv `with` adapter that archives `bytes::Bytes` as a `Vec<u8>`.
 ///
 /// rkyv 0.8 ships a `bytes-1` feature that derives `Archive` for `Bytes`
-/// directly, but that produces an `ArchivedBytes` newtype which is awkward to
-/// expose. Adapting through `Vec<u8>` keeps the archived view as a plain byte
-/// slice that downstream tooling can read trivially.
+/// directly. But that produces an `ArchivedBytes` newtype, which is awkward
+/// to expose. Adapting through `Vec<u8>` keeps the archived view as a plain
+/// byte slice, so downstream tooling can read it directly.
 pub struct BytesVec;
 
 impl ArchiveWith<Bytes> for BytesVec {

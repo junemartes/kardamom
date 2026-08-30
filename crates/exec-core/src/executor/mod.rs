@@ -1,25 +1,27 @@
 //! Per-tx revm execution. Adapted from `crates/node/src/executor.rs::execute`.
 //!
 //! Differences from the node executor:
-//! - Reads come from a snapshot-backed `StateDatabase` via a `DatabaseRef`
-//!   adapter, layered through revm's `CacheDB` so writes from earlier txs in
-//!   the same block are observed.
+//!
+//! - Reads come from a snapshot-backed `StateDatabase`, through a
+//!   `DatabaseRef` adapter, layered through revm's `CacheDB`. This lets
+//!   writes from earlier txs in the same block be observed.
 //! - Writes are captured into a per-tx `WriteSet` (built from revm's
-//!   `EvmState` output) and merged into the running `PendingDelta` by the
+//!   `EvmState` output), and merged into the running `PendingDelta` by the
 //!   actor.
 //!
-//!this module does **not** compute `tx_hash`. It copies
-//! `tx_hash` (and `sender`) directly from the inbound `kardamom_types::
-//! TxEnvelope`, which the proxy (S1) populated at the system boundary.
+//! This module does not compute `tx_hash`. It copies `tx_hash` (and
+//! `sender`) directly from the inbound `kardamom_types::TxEnvelope`, which
+//! the proxy populated at the system boundary.
 //!
-//! Module layout (pure split of the former single-file `executor.rs`):
-//! - `db`: snapshot-backed `DatabaseRef` adapters + the shared
+//! Module layout (a plain split of the former single-file `executor.rs`):
+//!
+//! - `db`: snapshot-backed `DatabaseRef` adapters, and the shared
 //!   view-composition primitive (`seed_cache_layer`).
 //! - `tx_env`: envelope decoding and `TxEnv` derivation.
-//! - `scope`: [`ExecScope`] (per-block EVM + cache) and the per-call
+//! - `scope`: [`ExecScope`] (per-block EVM and cache), and the per-call
 //!   [`execute_tx`] wrapper, including the deterministic invalid-skip path.
 //! - `deposit`: OP-aligned deposit execution.
-//! - `write_set`: `WriteSet` extraction from revm state and BAL recording.
+//! - `write_set`: `WriteSet` extraction from revm state, and BAL recording.
 
 mod db;
 mod deposit;

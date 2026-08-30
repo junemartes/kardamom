@@ -1,5 +1,5 @@
-//! Tx envelope. `sender` and `tx_hash` are *always* populated by the proxy.
-//! Downstream code trusts both fields unconditionally.
+//! Transaction envelope. The proxy always sets `sender` and `tx_hash`.
+//! Downstream code trusts both fields without a check.
 
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
@@ -13,12 +13,12 @@ pub struct TxEnvelope {
     pub correlation_id: u64,
     #[rkyv(with = wire::BytesVec)]
     pub raw_tx: Bytes,
-    /// Recovered by the proxy from the secp256k1 signature at decode time.
-    /// CFT trust boundary: every downstream consumer treats this as authoritative.
+    /// The proxy recovers this from the secp256k1 signature at decode time.
+    /// This is the CFT trust boundary: every consumer treats this field as authoritative.
     #[rkyv(with = wire::AddressBytes)]
     pub sender: Address,
-    /// `keccak256(raw_tx)` computed by the proxy alongside sig verification.
-    /// Never recomputed downstream; propagates unchanged into `Receipt.tx_hash`.
+    /// The proxy computes this as `keccak256(raw_tx)` during signature verification.
+    /// Downstream code never recomputes it. It propagates unchanged into `Receipt.tx_hash`.
     #[rkyv(with = wire::B256Bytes)]
     pub tx_hash: B256,
 }

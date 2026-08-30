@@ -1,15 +1,15 @@
 //! Length-prefixed RLP binary line protocol over TCP and Unix Domain
 //! Sockets.
 //!
-//! Frame format (big-endian):
-//! - `u32 len` — payload length in bytes (≤ 1 MiB)
-//! - `len` bytes — RLP-encoded `TxEnvelope`
+//! Frame format, big-endian:
+//! - `u32 len`: payload length in bytes, at most 1 MiB.
+//! - `len` bytes: RLP-encoded `TxEnvelope`.
 //!
 //! Reply frame:
-//! - `u8 status` — 0=ok, 1=rate-limited, 2=decode, 3=sig, 4=timeout,
-//!   5=duplicate, 9=internal
-//! - `u32 payload_len`
-//! - `payload_len` bytes — on ok, the 32-byte `tx_hash`; on error, the
+//! - `u8 status`: 0 = ok, 1 = rate-limited, 2 = decode, 3 = sig,
+//!   4 = timeout, 5 = duplicate, 9 = internal.
+//! - `u32 payload_len`.
+//! - `payload_len` bytes: on ok, the 32-byte `tx_hash`; on error, the
 //!   UTF-8 error message.
 
 #![cfg(feature = "binary-protocol")]
@@ -64,14 +64,15 @@ where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
 {
-    // Bind eagerly so binding errors surface immediately.
+    // Bind now, so a bind error shows up right away.
     let listener = UnixListener::bind(path)?;
     Ok(tokio::spawn(async move {
         loop {
             let (sock, _) = listener.accept().await?;
             let proxy = proxy.clone();
             tokio::spawn(async move {
-                // UDS has no IP; use loopback for the rate-limit key.
+                // A UDS connection has no IP, so this uses loopback as the
+                // rate-limit key.
                 let _ = handle_connection(sock, IpAddr::V4(Ipv4Addr::LOCALHOST), proxy).await;
             });
         }
@@ -91,7 +92,7 @@ where
     loop {
         let mut len_buf = [0u8; 4];
         if sock.read_exact(&mut len_buf).await.is_err() {
-            return Ok(()); // peer closed
+            return Ok(()); // The peer closed the connection.
         }
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_FRAME_BYTES {
@@ -157,7 +158,7 @@ mod tests {
             handle_connection(sock, peer.ip(), p2).await.unwrap();
         });
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        // Send an empty RLP list `0xc0`.
+        // Send an empty RLP list, `0xc0`.
         client.write_all(&1u32.to_be_bytes()).await.unwrap();
         client.write_all(&[0xc0]).await.unwrap();
         let mut status = [0u8; 1];

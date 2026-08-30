@@ -1,26 +1,25 @@
-//! Port-collision contract for `init` (#122): an `AddrInUse` bind gets a
-//! BOUNDED retry — a squatting socket is usually a wedged predecessor
-//! seconds from being reaped, and dying instantly converts a transient
-//! squat into a permanent outage under a mode=fail restart policy (the
-//! validator strand, reproduced in #122). Two halves:
+//! Port-collision contract for `init`: an `AddrInUse` bind gets a bounded
+//! retry. A squatting socket is usually a wedged predecessor seconds from
+//! being reaped, and dying instantly would turn a transient squat into a
+//! permanent outage under a `mode = "fail"` restart policy. Two halves:
 //!
-//! - squatter HELD past the retry budget → init still fails (never Ok with
-//!   a dead /metrics — the original fail-fast contract, now budgeted);
-//! - squatter RELEASED mid-retry → init succeeds and /metrics answers.
+//! - squatter held past the retry budget: init still fails (never `Ok`
+//!   with a dead /metrics; the original fail-fast contract, now budgeted);
+//! - squatter released mid-retry: init succeeds and /metrics answers.
 //!
-//! Retry knobs are env-tunable; these tests shrink them. Env vars are
-//! process-global, so both halves live in ONE test body (cargo runs tests
-//! in threads).
+//! Retry knobs are tunable through env vars; these tests shrink them. Env
+//! vars are process-global, so both halves live in one test body (cargo
+//! runs tests in threads).
 
 #[tokio::test(flavor = "multi_thread")]
 async fn init_retries_addr_in_use_then_fails_or_recovers() {
-    // SAFETY: no other test in this binary reads these vars concurrently.
+    // SAFETY: no other test in this binary reads these vars at the same time.
     unsafe {
         std::env::set_var("KARDAMOM_OBS_BIND_RETRIES", "4");
         std::env::set_var("KARDAMOM_OBS_BIND_RETRY_DELAY_MS", "100");
     }
 
-    // Half 1: squatter held for the whole budget → init fails (bounded).
+    // Half 1: squatter held for the whole budget, so init fails (bounded).
     let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = blocker.local_addr().unwrap();
     let t0 = std::time::Instant::now();
@@ -37,9 +36,10 @@ async fn init_retries_addr_in_use_then_fails_or_recovers() {
         "the bounded retry budget must actually be spent before failing"
     );
 
-    // Half 2: squatter released after ~2 retry periods → init recovers.
-    // (A fresh port: the global recorder from a successful init can only be
-    // installed once per process, so this half must be the SUCCESSFUL one.)
+    // Half 2: squatter released after about 2 retry periods, so init
+    // recovers. This uses a fresh port: the global recorder from a
+    // successful init installs only once per process, so this half must
+    // be the successful one.
     let blocker2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr2 = blocker2.local_addr().unwrap();
     let releaser = tokio::spawn(async move {
@@ -61,7 +61,7 @@ async fn init_retries_addr_in_use_then_fails_or_recovers() {
             &mut String::new(),
         )
     });
-    // Connectivity is enough — the recorder installed and the listener owns
-    // the port the squatter vacated.
+    // Connectivity is enough proof: the recorder installed, and the
+    // listener owns the port the squatter vacated.
     let _ = body.await;
 }

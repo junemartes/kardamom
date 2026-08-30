@@ -1,13 +1,13 @@
-//! `ClusterTxOrderingSubscription` — the executor's `TxOrderingSubscription`
+//! `ClusterTxOrderingSubscription`: the executor's `TxOrderingSubscription`,
 //! backed by cluster egress.
 //!
-//! Plugged into the executor's tx_ordering reader thread in cluster mode. The
-//! reader is unchanged: it calls `next()` and gets canonical-ordered
-//! `(BPosition, TxOrderingMessage)` records. Leader failover / reconnect is
-//! handled inside the cluster client, so the reader never sees an image
-//! rotation. The cluster has already deduped and totally ordered the stream;
-//! the executor's own `DedupWindow` still provides idempotency across any
-//! reconnect overlap.
+//! This plugs into the executor's tx_ordering reader thread in cluster mode.
+//! The reader is unchanged: it calls `next()` and gets canonical-ordered
+//! `(BPosition, TxOrderingMessage)` records. The cluster client handles
+//! leader failover and reconnect, so the reader never sees an image
+//! rotation. The cluster has already deduped and totally ordered the
+//! stream. The executor's own `DedupWindow` still gives idempotency across
+//! any reconnect overlap.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,10 +23,10 @@ use kardamom_cluster_adapter::wire::{self, EgressItem};
 
 use kardamom_cluster_adapter::{LiveCluster, LiveClusterConfig, LiveEgress, LiveError, live};
 
-/// Shared delivery cursor: the next canonical record index + boundary block
-/// number this consumer expects. Written by the subscription on every
-/// delivery; read by the live session thread to compose the `REPLAY_FROM`
-/// request it sends on every (re)connect.
+/// Shared delivery cursor: the next canonical record index and boundary
+/// block number this consumer expects. The subscription writes it on every
+/// delivery. The live session thread reads it to build the `REPLAY_FROM`
+/// request it sends on every connect or reconnect.
 #[derive(Clone)]
 pub struct ReplayCursor {
     pub next_index: Arc<AtomicU64>,
@@ -48,28 +48,29 @@ impl ReplayCursor {
     }
 }
 
-/// Bound on the out-of-order catch-up buffers — a replay bigger than this
-/// cannot be reordered in memory and fails loudly instead of ballooning.
+/// Bound on the out-of-order catch-up buffers. A replay bigger than this
+/// cannot be reordered in memory, and fails loudly instead of growing
+/// without limit.
 const MAX_PENDING: usize = 1 << 20;
 
 pub struct ClusterTxOrderingSubscription<E: ClusterEgress> {
     egress: E,
     cursor: ReplayCursor,
-    /// Out-of-order buffers, keyed by canonical index / block number. Frames
+    /// Out-of-order buffers, keyed by canonical index or block number. Frames
     /// arrive out of order only around a session re-establishment, when the
     /// service's replay interleaves with live broadcasts.
     pending_records: BTreeMap<u64, TxOrderingMessage>,
     pending_boundaries: BTreeMap<u64, BlockBoundaryStart>,
-    /// True while a replay is outstanding (a key gap was observed). In this
-    /// mode a record may only be delivered once the boundary at `next_block`
-    /// proves it precedes it (`end_tx_idx > index`); in live mode frames
-    /// arrive in emission order, so an absent boundary is a FUTURE boundary.
+    /// True while a replay is outstanding, after a key gap was seen. In this
+    /// mode, a record may be delivered only once the boundary at `next_block`
+    /// proves it comes before it (`end_tx_idx > index`). In live mode, frames
+    /// arrive in emission order, so an absent boundary is a future boundary.
     catching_up: bool,
     /// Whether deliveries re-export the sealer's boundary stream as
-    /// `kardamom_sealer_*` metrics. Only ONE role per host should emit them
-    /// (the executor — the blessed observation point the probes/dashboards
-    /// scrape); the validator shares this subscription but suppresses the
-    /// emission so its exporter doesn't publish a second, lagging copy of the
+    /// `kardamom_sealer_*` metrics. Only one role per host should emit them:
+    /// the executor, the chosen point probes and dashboards scrape. The
+    /// validator shares this subscription, but suppresses the emission. This
+    /// stops its exporter from publishing a second, lagging copy of the
     /// series (see `crate::metrics`).
     emit_sealer_metrics: bool,
 }
@@ -96,7 +97,7 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
         self
     }
 
-    /// Deliver the next in-order item from the buffers, if provably next.
+    /// Deliver the next in-order item from the buffers, if it is provably next.
     fn try_deliver(&mut self) -> Option<(BPosition, TxOrderingMessage)> {
         let ni = self.cursor.next_index.load(Ordering::Relaxed);
         let nb = self.cursor.next_block.load(Ordering::Relaxed);
@@ -105,9 +106,9 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
         {
             let b = self.pending_boundaries.remove(&nb).unwrap();
             self.cursor.next_block.store(nb + 1, Ordering::Relaxed);
-            // The clustered sealer has no Prometheus endpoint; the EXECUTOR
+            // The clustered sealer has no Prometheus endpoint. The executor
             // re-exports its boundary stream here (see `crate::metrics`). The
-            // validator constructs this subscription with the emission
+            // validator builds this subscription with the emission
             // suppressed.
             if self.emit_sealer_metrics {
                 metrics::counter!(crate::metrics::SEALER_BOUNDARIES_TOTAL).increment(1);
@@ -115,17 +116,18 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
             }
             return Some((b.end_tx_idx, TxOrderingMessage::BoundaryStart(b)));
         }
-        // A record is deliverable when nothing proves an earlier boundary is
-        // missing: either the boundary at `next_block` is buffered and closes
-        // AFTER this record, or we are in live mode (in-order arrival).
+        // A record can be delivered when nothing proves an earlier boundary
+        // is missing: either the boundary at `next_block` is buffered and
+        // closes after this record, or we are in live mode, with in-order
+        // arrival.
         let record_is_next = match self.pending_boundaries.get(&nb) {
             Some(b) => b.end_tx_idx.as_index() > ni,
             None => !self.catching_up,
         };
         if record_is_next && let Some(msg) = self.pending_records.remove(&ni) {
-            // Almost every record is one slot wide; an epoch claims the marker
-            // plus one slot per deposit, so the cursor must skip the whole
-            // range or the next record reads as a gap.
+            // Almost every record is one slot wide. An epoch claims the marker
+            // plus one slot per deposit. So the cursor must skip the whole
+            // range, or the next record reads as a gap.
             self.cursor
                 .next_index
                 .store(ni + slot_width(&msg), Ordering::Relaxed);
@@ -134,7 +136,7 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
         None
     }
 
-    /// Classify one egress item into the buffers (dedup + gap detection).
+    /// Classify one egress item into the buffers: dedup and gap detection.
     fn ingest(&mut self, item: EgressItem) -> Result<(), ExecutorError> {
         let ni = self.cursor.next_index.load(Ordering::Relaxed);
         let nb = self.cursor.next_block.load(Ordering::Relaxed);
@@ -144,8 +146,8 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
                     return Ok(()); // replay/live overlap duplicate
                 }
                 if index > ni && !self.catching_up {
-                    // A key gap can only follow a session re-establishment;
-                    // the session thread has already sent REPLAY_FROM(cursor).
+                    // A key gap can only follow a session re-establishment.
+                    // The session thread has already sent REPLAY_FROM(cursor).
                     tracing::info!(
                         expected = ni,
                         got = index,
@@ -159,24 +161,26 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
                 if b.block_number < nb {
                     return Ok(());
                 }
-                // Canonical-order guard (boundary-only gap across a session
-                // reconnect): a boundary we still owe downstream
+                // Canonical-order guard, for a boundary-only gap across a
+                // session reconnect. A boundary we still owe downstream
                 // (block_number >= next_block) that seals at a record count
-                // BELOW the delivery cursor proves we already delivered
-                // records that canonically FOLLOW it — the missed boundary
-                // was emitted during a session outage, the reconnect's first
-                // live frame was exactly the next-index record (no key gap ⇒
-                // no catch-up), and the replayed boundary arrived too late.
-                // Delivering it now would seal its block with a later
-                // block's records inside: a silent canonical-order
-                // divergence between replicas. Fail-stop instead — a restart
-                // resumes from the persisted cursor and the REPLAY_FROM on
-                // connect re-delivers the whole window in order. (Entering
-                // catch-up on every session re-establishment would PREVENT
-                // the inversion, but the session thread lives in
-                // kardamom-cluster-adapter and exposes no reconnect signal;
-                // within one Aeron session frames are ordered, so this
-                // condition has no false positives.)
+                // below the delivery cursor proves we already delivered
+                // records that canonically follow it. The missed boundary
+                // was emitted during a session outage. The reconnect's
+                // first live frame was exactly the next-index record (no
+                // key gap, so no catch-up), and the replayed boundary
+                // arrived too late. Delivering it now would seal its block
+                // with a later block's records inside: a silent
+                // canonical-order divergence between replicas. Fail-stop
+                // instead. A restart resumes from the persisted cursor, and
+                // the REPLAY_FROM on connect re-delivers the whole window
+                // in order.
+                //
+                // Entering catch-up on every session re-establishment would
+                // prevent the inversion. But the session thread lives in
+                // kardamom-cluster-adapter and exposes no reconnect signal.
+                // Frames within one Aeron session are ordered, so this
+                // condition has no false positives.
                 if b.end_tx_idx.as_index() < ni {
                     tracing::error!(
                         block = b.block_number,
@@ -202,9 +206,9 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
             EgressItem::ReplayDone { .. } => {
                 self.catching_up = false;
             }
-            // Contiguity rejects (#85 fix B) are offered to the offering
-            // sequencer session only; an executor session cannot receive one
-            // — ignore defensively.
+            // Contiguity rejects are offered only to the offering sequencer
+            // session. An executor session cannot receive one. Ignore it
+            // defensively.
             EgressItem::ContiguityReject { .. } => {}
             EgressItem::ReplayUnavailable {
                 oldest_index,
@@ -238,8 +242,9 @@ impl<E: ClusterEgress> TxOrderingSubscription for ClusterTxOrderingSubscription<
             match wire::decode_egress(&bytes) {
                 Ok(item) => self.ingest(item)?,
                 Err(e) => {
-                    // A malformed frame is dropped (logged); the cluster stream
-                    // is authoritative, so this should never happen in practice.
+                    // A malformed frame is dropped, and logged. The cluster
+                    // stream is authoritative, so this should never happen in
+                    // practice.
                     tracing::warn!(error = %e, "dropping malformed cluster egress frame");
                 }
             }
@@ -247,23 +252,24 @@ impl<E: ClusterEgress> TxOrderingSubscription for ClusterTxOrderingSubscription<
     }
 }
 
-// The `[cluster]` TOML section (shared by every role that connects to the
-// cluster) has ONE definition, in `kardamom-cluster-adapter` next to the
-// `LiveClusterConfig` it maps onto; re-exported here so the existing
-// `kardamom_engine::reader::cluster::ClusterConfig` paths (executor,
-// validator) keep resolving.
+// The `[cluster]` TOML section is shared by every role that connects to
+// the cluster. It has one definition, in `kardamom-cluster-adapter`, next
+// to the `LiveClusterConfig` it maps onto. This re-export keeps the old
+// `kardamom_engine::reader::cluster::ClusterConfig` paths (executor and
+// validator) working.
 pub use kardamom_cluster_adapter::ClusterConfig;
 
 /// Connect to the cluster and wrap egress as a `TxOrderingSubscription`.
-/// The returned `LiveCluster` guard MUST be kept alive while the subscription is used.
+/// Keep the returned `LiveCluster` guard alive while the subscription is
+/// used.
 ///
-/// `cursor` is the consumer's resume point — `(records applied, next block)`
-/// from the persistent state on crash recovery, [`ReplayCursor::genesis`] on a
-/// fresh start. The session thread sends `REPLAY_FROM(cursor)` on EVERY
-/// session establishment (first connect and every re-connect), so the
-/// canonical stream is gapless across session loss: the service re-offers the
-/// retained frames the consumer missed, and the subscription's catch-up
-/// ordering merges them with live broadcasts.
+/// `cursor` is the consumer's resume point: `(records applied, next block)`
+/// from the persistent state on crash recovery, or [`ReplayCursor::genesis`]
+/// on a fresh start. The session thread sends `REPLAY_FROM(cursor)` on
+/// every session establishment, both first connect and every reconnect. So
+/// the canonical stream has no gaps across session loss: the service
+/// re-offers the retained frames the consumer missed, and the
+/// subscription's catch-up ordering merges them with live broadcasts.
 pub fn cluster_tx_ordering_subscription(
     rt: kardamom_log::aeron_live::AeronRuntime,
     cfg: LiveClusterConfig,

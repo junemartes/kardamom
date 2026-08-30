@@ -3,23 +3,25 @@ package io.kardamom.sealer;
 import java.util.Arrays;
 
 /**
- * A first-seen application record that the sealer relays onto the canonical
- * stream. Immutable value class.
+ * A first-seen application record that the sealer relays onto the
+ * canonical stream. This is an immutable value class.
  *
- * <p>Port of the Rust republish loop's per-survivor output (see
- * {@code crates/sealer/src/bin/kardamom-sealer.rs}): each deduped record gets a
- * 0-based canonical {@code index} (the cumulative count of records republished
- * BEFORE it) and the opaque {@code payload} is relayed verbatim — never parsed.</p>
+ * <p>This class is a port of the Rust republish loop's per-survivor output
+ * (see {@code crates/sealer/src/bin/kardamom-sealer.rs}). Each deduped
+ * record gets a 0-based canonical {@code index} — the cumulative count of
+ * records republished before it — and the opaque {@code payload} is
+ * relayed as-is, never parsed.</p>
  */
 public final class Relayed {
     /**
      * 0-based canonical index assigned to this record: the value of
-     * {@code canonicalCount} immediately before it was counted. After N
-     * first-seen records, indices run 0..N-1 and {@code canonicalCount == N}.
+     * {@code canonicalCount} right before this record was counted. After N
+     * first-seen records, indices run from 0 to N-1, and
+     * {@code canonicalCount == N}.
      */
     public final long index;
 
-    /** Opaque application payload, relayed byte-for-byte. Never inspected. */
+    /** Opaque application payload. It is relayed byte-for-byte and never inspected. */
     public final byte[] payload;
 
     public Relayed(long index, byte[] payload) {

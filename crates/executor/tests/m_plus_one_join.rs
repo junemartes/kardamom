@@ -1,21 +1,21 @@
-//! integration tests for the M+1
-//! tx_data/tx_ordering reader topology + join-by-ref semantics.
+//! Integration tests for the M+1 tx_data and tx_ordering reader topology,
+//! and join-by-ref semantics.
 //!
-//! Uses the `kardamom-kardamom_log::testing::Fake*` in-memory pub/sub fakes so we
-//! exercise the exact wire types (`TxEnvelope`, `TxOrderingMessage`,
-//! `TxRef`) and rkyv codec the production Aeron path uses, without the
-//! testcontainers dependency. Real-Aeron coverage of the same topology
-//! lives in `tests/docker_aeron_e2e.rs`.
+//! Uses the `kardamom_log::testing::Fake*` in-memory pub/sub fakes, so
+//! this exercises the exact wire types (`TxEnvelope`, `TxOrderingMessage`,
+//! `TxRef`) and rkyv codec that the production Aeron path uses, without
+//! the testcontainers dependency. Real-Aeron coverage of the same
+//! topology lives in `tests/docker_aeron_e2e.rs`.
 //!
 //! Tests:
-//! - `m4_canonical_b_order_drives_receipts`: M=4 sequencer fakes each
-//!   publish 50 envelopes onto their tx_data; tx_ordering publishes the
-//!   refs in an arbitrary interleaving. Assert the executor processes
-//!   all 200 txs in B's canonical order and emits 200 receipts in the
-//!   same order.
-//! - `tx_ref_arriving_before_envelope_still_joins`: race test —
-//!   simulates A-publisher lag of ~30 ms; the tx_ordering reader must
-//!   spin and pick up the envelope once it lands.
+//! - `m4_canonical_b_order_drives_receipts`: four sequencer fakes each
+//!   publish 50 envelopes onto their tx_data. tx_ordering publishes the
+//!   refs in an arbitrary interleaving. The test checks that the
+//!   executor processes all 200 txs in B's canonical order, and emits
+//!   200 receipts in the same order.
+//! - `tx_ref_arriving_before_envelope_still_joins`: a race test. It
+//!   simulates about 30 ms of A-publisher lag. The tx_ordering reader
+//!   must spin and pick up the envelope once it lands.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,14 +48,14 @@ use kardamom_log::testing::{
 };
 
 /// Bridge a `FakeTxDataSubscription` into a `TxDataSubscription`. The
-/// real-Aeron equivalent is `kardamom_log::TxDataSubscriber` opened directly on a
-/// dedicated OS thread (one Aeron client per thread, since the client is
-/// `!Send + !Sync`).
+/// real-Aeron equivalent is `kardamom_log::TxDataSubscriber`, opened
+/// directly on a dedicated OS thread (one Aeron client per thread,
+/// because the client is `!Send + !Sync`).
 struct FakeTxDataSubAdapter {
     sequencer_id: u8,
     sub: FakeTxDataSubscription,
-    /// Set by the test driver once it has finished publishing; the
-    /// subscription becomes "closed" when both the bus is drained AND this
+    /// Set by the test driver once it has finished publishing. The
+    /// subscription becomes "closed" when the bus is drained and this
     /// flag is set, mimicking Aeron's notion of an EOS.
     closed: Arc<AtomicBool>,
 }
@@ -175,10 +175,10 @@ fn m4_canonical_b_order_drives_receipts() {
     const TXS_PER_SEQ: u64 = 50;
     const TOTAL: u64 = (M as u64) * TXS_PER_SEQ;
 
-    // M signers, one per sequencer. Each publishes its own nonce-stream
-    // of transfers — no inter-signer dependencies, so the executor's
-    // sequential revm path can re-order them freely. The constraint we
-    // assert is: receipts come out in **tx_ordering canonical order**.
+    // M signers, one per sequencer. Each publishes its own nonce-stream of
+    // transfers. There are no inter-signer dependencies, so the executor's
+    // sequential revm path can reorder them freely. The test checks one
+    // constraint: receipts come out in tx_ordering canonical order.
     let signers: Vec<PrivateKeySigner> = (0..M)
         .map(|i| {
             PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(0xA0 + i)).unwrap()
@@ -195,8 +195,8 @@ fn m4_canonical_b_order_drives_receipts() {
     let snap = snap_builder.build();
 
     let bus = FakeBus::new();
-    // Per-sequencer tx_data pub/sub pairs. Channel URI / stream-id match
-    // the `ChannelsConfig::tx_data_channel_template` convention.
+    // Per-sequencer tx_data pub/sub pairs. The channel URI and stream ID
+    // match the `ChannelsConfig::tx_data_channel_template` convention.
     let mut a_pubs: Vec<FakeTxDataPublication> = Vec::with_capacity(M as usize);
     let mut tx_data_sub_handles: Vec<FakeTxDataSubscription> = Vec::with_capacity(M as usize);
     for sid in 0..M {
@@ -209,11 +209,13 @@ fn m4_canonical_b_order_drives_receipts() {
     let tx_ordering_sub_handle = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
 
     // Phase 1: every sequencer publishes its envelopes onto tx_data.
-    // Record (sid, tx_data_position, tx_hash) so we can assert canonical order.
+    // Record `(sid, tx_data_position, tx_hash)`, so the test can check
+    // canonical order.
     let mut plan: Vec<(u8, BPosition, alloy_primitives::B256)> = Vec::new();
     let mut by_sid_nonce: Vec<u64> = vec![0; M as usize];
-    // We want 50 txs per sequencer. Publish them sequencer-by-sequencer
-    // for simplicity (the fake bus is single-publisher per stream).
+    // The test wants 50 txs per sequencer. Publish them
+    // sequencer-by-sequencer for simplicity (the fake bus allows only
+    // one publisher per stream).
     for sid in 0..M {
         for _ in 0..TXS_PER_SEQ {
             let nonce = by_sid_nonce[sid as usize];
@@ -227,11 +229,11 @@ fn m4_canonical_b_order_drives_receipts() {
     assert_eq!(plan.len(), TOTAL as usize);
 
     // Phase 2: interleave the per-A plan into an arbitrary canonical
-    // order and publish refs onto tx_ordering. Per-sequencer FIFO must be
-    // preserved (tx_data is exclusive per publisher, refs land on B
-    // in A-publish order — see), so the interleaving is a
-    // **merge** of M ordered queues, not a global shuffle. Inter-stream
-    // interleaving is chosen at random.
+    // order, and publish refs onto tx_ordering. Per-sequencer FIFO order
+    // must stay intact (tx_data is exclusive per publisher, and refs
+    // land on B in A-publish order). So the interleaving is a merge of M
+    // ordered queues, not a global shuffle. The interleaving between
+    // streams is chosen at random.
     let mut per_sid: Vec<std::collections::VecDeque<(u8, BPosition, alloy_primitives::B256)>> =
         vec![std::collections::VecDeque::new(); M as usize];
     for entry in &plan {
@@ -254,12 +256,13 @@ fn m4_canonical_b_order_drives_receipts() {
             .publish_ref(&TxRef::new(*h, *sid, *pos_a, 0))
             .expect("publish ref");
     }
-    // Sealer-emitted boundary: closes block 1. end_tx_idx is the cumulative
-    // COUNT of canonical records (TxRef/DepositRef) through this block — the
-    // publisher- and position-independent alignment key the executor matches
-    // against its own processed-record count. Every plan entry is a distinct
-    // tx (unique sender/nonce ⇒ unique tx_hash), so no dedup drops occur and
-    // the count is exactly `plan.len()`.
+    // Sealer-emitted boundary: closes block 1. end_tx_idx is the
+    // cumulative count of canonical records (TxRef or DepositRef)
+    // through this block. This is the publisher- and
+    // position-independent alignment key that the executor matches
+    // against its own processed-record count. Every plan entry is a
+    // distinct tx (a unique sender and nonce give a unique tx_hash), so
+    // no dedup drops happen, and the count is exactly `plan.len()`.
     let end_tx_idx = BPosition::from_index(plan.len() as u64);
     b_pub
         .publish_boundary(&BlockBoundaryStart {
@@ -302,10 +305,10 @@ fn m4_canonical_b_order_drives_receipts() {
         ..Default::default()
     };
 
-    // Mark each fake subscription "closed" after a small drain delay —
-    // the entire bus is already populated so this just lets the
-    // subscribers see EOF instead of blocking forever once they've
-    // consumed everything.
+    // Mark each fake subscription "closed" after a small drain delay. The
+    // whole bus is already populated, so this just lets the subscribers
+    // see EOF, instead of blocking forever once they have consumed
+    // everything.
     let a_closed_for_signaler = a_closed.clone();
     let b_closed_for_signaler = b_closed.clone();
     thread::spawn(move || {
@@ -346,7 +349,7 @@ fn m4_canonical_b_order_drives_receipts() {
             }
             Ok(CMessage::BlockBoundary(_)) => {
                 boundaries += 1;
-                break; // single block — done
+                break; // one block, done
             }
             Err(_) => break,
         }
@@ -372,9 +375,9 @@ fn m4_canonical_b_order_drives_receipts() {
 #[test]
 fn tx_ref_arriving_before_envelope_still_joins() {
     // Single-sequencer mini-scenario: publish the ref onto tx_ordering
-    // immediately; delay the envelope on tx_data by ~30 ms. The join
-    // buffer's bounded wait should pick it up well within the default
-    // 100 ms timeout.
+    // immediately, and delay the envelope on tx_data by about 30 ms. The
+    // join buffer's bounded wait should pick it up well within the
+    // default 100 ms timeout.
 
     let signer = PrivateKeySigner::random();
     let to = address!("00000000000000000000000000000000000ABCDE");
@@ -403,22 +406,23 @@ fn tx_ref_arriving_before_envelope_still_joins() {
     let a_inserter = thread::spawn(move || {
         thread::sleep(Duration::from_millis(30));
         let _a_pub_late = FakeTxDataPublication::open(&bus_clone, 0, "aeron:ipc?alias=a-0", 2000);
-        // Use the original pub handle captured before; reopening would
-        // grab the same underlying stream. Either works.
+        // Use the original pub handle captured before. Reopening would
+        // grab the same underlying stream; either way works.
         let _ = _a_pub_late.publish(&env_clone).expect("publish A late");
     });
 
-    // Meanwhile, immediately stake out the tx_data_position we'll claim in
-    // the ref. The fake's `publish` advances `next_offset` by the
-    // payload length, so we need to know what BPosition the A publish
-    // will land at. The fake bus is fresh, so the first envelope's
-    // start position is 0 → BPosition { term_id: 0, term_offset: 0 }.
+    // Meanwhile, stake out immediately the tx_data_position that the ref
+    // will claim. The fake's `publish` advances `next_offset` by the
+    // payload length, so the test needs to know what `BPosition` the A
+    // publish will land at. The fake bus is fresh, so the first
+    // envelope's start position is 0: `BPosition { term_id: 0,
+    // term_offset: 0 }`.
     //
-    // (If the fake's offset convention changes, we can also assert this
-    // by checking what `a_pub.publish(...)` returned. For this test we
-    // need a deterministic position to ref *before* the publish, so we
-    // rely on the fake's well-defined zero-init.)
-    drop(a_pub); // we won't use this handle; the inserter has its own.
+    // (If the fake's offset convention changes, the test could instead
+    // check what `a_pub.publish(...)` returned. This test needs a
+    // deterministic position to reference before the publish happens,
+    // so it relies on the fake's well-defined zero-init.)
+    drop(a_pub); // This handle goes unused; the inserter has its own.
 
     let tx_data_position = BPosition {
         term_id: 0,
@@ -435,7 +439,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
     b_pub
         .publish_boundary(&BlockBoundaryStart {
             block_number: 1,
-            // One canonical record applied ⇒ cumulative count 1.
+            // One canonical record applied, so the cumulative count is 1.
             end_tx_idx: BPosition::from_index(1),
             l2_timestamp: 1_700_000_000,
             l1_origin: 0,
@@ -458,9 +462,9 @@ fn tx_ref_arriving_before_envelope_still_joins() {
     };
     let (c_tx, c_rx) = bounded::<CMessage>(8);
 
-    // After the inserter has had time to fire and the executor has had
-    // time to consume, signal "EOF" on both subscriptions so the
-    // executor returns. We give a generous 500 ms.
+    // After the inserter has had time to fire, and the executor has had
+    // time to consume, signal "EOF" on both subscriptions, so the
+    // executor returns. This gives a generous 500 ms.
     let a_closed_signaler = a_closed.clone();
     let b_closed_signaler = b_closed.clone();
     thread::spawn(move || {

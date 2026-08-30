@@ -1,11 +1,12 @@
 //! Spawns the Aeron Media Driver and the Aeron Archive as child processes.
 //!
 //! The Aeron client (rusteron) talks to the Media Driver over shared-memory
-//! ring buffers in `aeron_dir`. The Archive talks to the Media Driver the same
-//! way. We do not embed either — they are Java/C++ processes we drive.
+//! ring buffers in `aeron_dir`. The Archive talks to the Media Driver the
+//! same way. This crate does not embed either. Both are Java/C++ processes
+//! that this crate starts and drives.
 //!
-//! Restart policy: V0 is "if any child dies, log loudly and exit". Production-
-//! grade restart is a follow-up.
+//! Restart policy: version 0 logs loudly and exits if any child dies.
+//! Production-grade restart is a follow-up task.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -30,8 +31,9 @@ impl Supervisor {
         }
     }
 
-    /// Spawn Media Driver, wait for its readiness file, then spawn Archive.
-    /// Returns once both are up. Background task supervises restarts.
+    /// Spawn the Media Driver, wait for its readiness file, then spawn the
+    /// Archive. Returns once both are up. A background task supervises
+    /// restarts.
     pub async fn start(&mut self) -> Result<(), LogError> {
         std::fs::create_dir_all(&self.cfg.aeron_dir)?;
         std::fs::create_dir_all(&self.cfg.archive_dir)?;
@@ -39,7 +41,7 @@ impl Supervisor {
         let md = spawn_media_driver(&self.cfg.media_driver_cmd, &self.cfg).await?;
         info!(pid = md.id(), "media driver started");
 
-        // Wait for the Media Driver to create its CnC file before launching the Archive.
+        // Wait for the Media Driver to create its CnC file before starting the Archive.
         wait_for_path(&self.cfg.aeron_dir.join("cnc.dat"), Duration::from_secs(5)).await?;
 
         let arch = spawn_archive(&self.cfg.archive_cmd, &self.cfg).await?;
@@ -78,11 +80,11 @@ async fn spawn_media_driver(argv: &[String], cfg: &AeronConfig) -> Result<Child,
         .map_err(|e| LogError::Supervisor(format!("spawn {exe}: {e}")))
 }
 
-/// Spawn the Aeron Archive daemon, exporting `fileSyncLevel` both as the C
+/// Spawn the Aeron Archive daemon. This sets `fileSyncLevel` both as the C
 /// archive's env var (`AERON_ARCHIVE_FILE_SYNC_LEVEL`) and as the Java
-/// archive's system property (`-Daeron.archive.file.sync.level=N`) appended
-/// to argv. This way the same config works whether the operator points
-/// `archive_cmd` at the native binary or `java -jar aeron-archive.jar`.
+/// archive's system property (`-Daeron.archive.file.sync.level=N`) on argv.
+/// The same config then works whether `archive_cmd` points at the native
+/// binary or at `java -jar aeron-archive.jar`.
 async fn spawn_archive(argv: &[String], cfg: &AeronConfig) -> Result<Child, LogError> {
     let (exe, args) = argv
         .split_first()
@@ -122,8 +124,8 @@ async fn wait_for_path(path: &std::path::Path, timeout: Duration) -> Result<(), 
 }
 
 async fn supervise(mut children: Vec<Child>, mut shutdown: oneshot::Receiver<()>) {
-    // V0: if any child dies, log loudly and exit. Production-grade restart
-    // policy is a follow-up; for now the operator restarts the process.
+    // Version 0: if any child dies, log loudly and exit. Production-grade
+    // restart policy is a follow-up. For now, the operator restarts the process.
     tokio::select! {
         _ = &mut shutdown => {
             for c in children.iter_mut() {

@@ -1,6 +1,6 @@
-//! The batch verifier's contract: every submitted transaction gets its own
-//! correct answer regardless of how the ring is chunked, and the recovery
-//! work does not run on the async runtime's threads.
+//! The batch verifier's contract. Every submitted transaction gets its own
+//! correct answer, no matter how the ring is chunked. The recovery work
+//! does not run on the async runtime's threads.
 
 use std::time::Duration;
 
@@ -39,9 +39,9 @@ mod fixtures {
     }
 }
 
-/// Every caller gets the sender that signed ITS transaction — chunking must
-/// never cross responses. Run at several batch sizes so both the
-/// single-chunk path and the fanned-out path are covered.
+/// Every caller gets the sender that signed its own transaction. Chunking
+/// must never cross responses. This test runs at several batch sizes, to
+/// cover both the single-chunk path and the fanned-out path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_caller_gets_its_own_sender() {
     for n in [1usize, 3, 8, 64, 100, 200] {
@@ -83,8 +83,8 @@ async fn batched_callers_never_cross_answers() {
     let b = tokio::spawn(async move { vb.recover(bad_env, bad_raw).await });
     let (gs, _) = g.await.unwrap().expect("valid tx must recover");
     assert_eq!(gs, good_addr);
-    // The other transaction in the same batch must resolve to ITS OWN
-    // signer — chunking must never cross responses.
+    // The other transaction in the same batch must resolve to its own
+    // signer. Chunking must never cross responses.
     let (bs, _) = b.await.unwrap().expect("second tx must recover");
     assert_ne!(bs, good_addr, "batch crossed two callers' answers");
     assert_eq!(bs, bad_addr);
@@ -92,16 +92,18 @@ async fn batched_callers_never_cross_answers() {
 
 /// The reactor must stay responsive while recovery runs.
 ///
-/// 256 recoveries are ~10.7ms of CPU. On a single-threaded runtime that
-/// is 10.7ms of stall if the work runs on the runtime's own thread —
-/// which is exactly what the sequential in-task loop did. With recovery
-/// on the blocking pool a 1ms timer still fires on time. The threshold
-/// sits between those two worlds: this test FAILS on the old code.
+/// 256 recoveries take about 10.7ms of CPU time. On a single-threaded
+/// runtime, that is 10.7ms of stall if the work runs on the runtime's own
+/// thread. That is exactly what the old sequential in-task loop did. With
+/// recovery on the blocking pool, a 1ms timer still fires on time. The
+/// threshold sits between these two cases, so this test fails on the old
+/// code.
 ///
-/// Parallelism 1 on purpose: the assert measures where the work runs, not
-/// how fast. With 4 blocking threads on a 2-core CI host the OS deschedules
-/// the runtime thread and the timer fires 10-50ms late — a CPU-contention
-/// stall that reads as the bug this test guards against.
+/// This test uses parallelism 1 on purpose. The assert checks where the
+/// work runs, not how fast. With 4 blocking threads on a 2-core CI host,
+/// the OS can deschedule the runtime thread, and the timer then fires
+/// 10-50ms late. That CPU-contention stall would look like the bug this
+/// test guards against.
 #[tokio::test(flavor = "current_thread")]
 async fn recovery_does_not_block_the_reactor() {
     let v = std::sync::Arc::new(BatchVerifier::with_parallelism(
@@ -128,17 +130,18 @@ async fn recovery_does_not_block_the_reactor() {
     );
 }
 
-/// What the fan-out actually buys. ECDSA recovery is ~42µs of pure CPU per
-/// transaction and cannot be batched mathematically (every signature
-/// recovers a DISTINCT public key — there is no shared-scalar trick as with
-/// Ed25519 batch verification), so the only win available is running the
-/// recoveries at the same time. This measures a full ring through the
-/// verifier at parallelism 1 vs the machine's width.
+/// What the fan-out actually buys. ECDSA recovery costs about 42µs of pure
+/// CPU per transaction. It cannot be batched mathematically, because every
+/// signature recovers a distinct public key. There is no shared-scalar
+/// trick here, unlike with Ed25519 batch verification. So the only
+/// available gain is running the recoveries at the same time. This test
+/// measures a full ring through the verifier, at parallelism 1 against the
+/// machine's width.
 ///
-/// Reports numbers rather than asserting a speedup: on a loaded or
-/// single-core CI runner there is nothing to win, and a timing threshold
-/// would be a flake. The correctness assertion — every caller gets its own
-/// sender — holds either way.
+/// This test reports numbers instead of asserting a speedup. On a loaded
+/// or single-core CI runner, there is nothing to gain, and a timing
+/// threshold would be flaky. The correctness check, that every caller
+/// gets its own sender, holds either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fanning_out_a_full_ring_scales_with_cores() {
     const RING: usize = 256;

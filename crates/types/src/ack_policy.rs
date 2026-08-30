@@ -3,18 +3,19 @@
 //!
 //! Picks one of four points along the durability ladder:
 //!
-//! | variant                  | waits for                                    | survives                          |
-//! |--------------------------|----------------------------------------------|-----------------------------------|
-//! | `OnOffer`                | receipt arrival only                         | process crash                     |
-//! | `OnLocalFsync`           | this node's recorder having fsynced the byte | single-node power loss            |
-//! | `OnQuorum` *(default)*   | Q-of-N recorders having fsynced the byte     | coordinated process crash, not DC |
-//! | `OnLocalFsyncAndQuorum`  | both of the above (whichever is slower)      | belt-and-suspenders               |
+//!   * `OnOffer` — waits for receipt arrival only. Survives a process crash.
+//!   * `OnLocalFsync` — waits for this node's recorder to fsync the byte.
+//!     Survives single-node power loss.
+//!   * `OnQuorum` (the default) — waits for Q-of-N recorders to fsync the
+//!     byte. Survives a coordinated process crash, but not a data-center loss.
+//!   * `OnLocalFsyncAndQuorum` — waits for both of the above, whichever is
+//!     slower. This is the strictest of the four options.
 //!
-//! In the typical N=3, Q=2 healthy case the local node's own watermark counts
-//! toward the quorum, so `OnQuorum` implies local fsync — making
-//! `OnLocalFsyncAndQuorum` equivalent to `OnQuorum` in steady state. The
-//! "and" variant only differs when local lags quorum, which can happen
-//! transiently around recorder restarts.
+//! In the typical healthy case (N=3, Q=2), the local node's own watermark
+//! counts toward the quorum. So `OnQuorum` implies local fsync, and
+//! `OnLocalFsyncAndQuorum` behaves the same as `OnQuorum` in steady state.
+//! The "and" variant differs only when local fsync lags the quorum. This can
+//! happen for a short time around recorder restarts.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
 pub enum AckPolicy {
@@ -25,20 +26,20 @@ pub enum AckPolicy {
     /// Wait until Q-of-N recorders have fsynced past the tx's B-position.
     #[default]
     OnQuorum,
-    /// Wait until both this node's local fsync *and* the Q-of-N quorum have
-    /// caught up. Stricter than either alone in transient states.
+    /// Wait until both this node's local fsync and the Q-of-N quorum catch
+    /// up. This is stricter than either alone during transient states.
     OnLocalFsyncAndQuorum,
 }
 
 impl AckPolicy {
-    /// Whether the ack gate needs to subscribe to the local recorder's
-    /// per-recorder `FsyncWatermark` stream.
+    /// Returns true if the ack gate must subscribe to the recorder's
+    /// `FsyncWatermark` stream.
     pub fn requires_local_fsync(self) -> bool {
         matches!(self, Self::OnLocalFsync | Self::OnLocalFsyncAndQuorum)
     }
 
-    /// Whether the ack gate needs to subscribe to the shared `QuorumWatermark`
-    /// stream.
+    /// Returns true if the ack gate must subscribe to the shared
+    /// `QuorumWatermark` stream.
     pub fn requires_quorum(self) -> bool {
         matches!(self, Self::OnQuorum | Self::OnLocalFsyncAndQuorum)
     }

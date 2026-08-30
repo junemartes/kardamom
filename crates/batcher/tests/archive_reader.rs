@@ -68,7 +68,7 @@ fn reads_two_interleaved_b_records() {
 
 #[test]
 fn reads_per_sequencer_a_records() {
-    // TxData carries raw `TxEnvelope` records — no enum wrapper.
+    // TxData carries raw `TxEnvelope` records. There is no enum wrapper.
     let mut buf = Vec::new();
     append_frame(&mut buf, pos(0), &tx(1));
     append_frame(&mut buf, pos(128), &tx(2));
@@ -89,7 +89,7 @@ fn reads_per_sequencer_a_records() {
 fn truncated_active_segment_stops_cleanly() {
     let mut buf = Vec::new();
     append_frame(&mut buf, pos(0), &tx(99));
-    buf.extend_from_slice(&[0xFFu8; 4]); // partial frame header — too short
+    buf.extend_from_slice(&[0xFFu8; 4]); // a partial frame header, too short
 
     let mut f = NamedTempFile::new().unwrap();
     f.write_all(&buf).unwrap();
@@ -108,9 +108,9 @@ fn segment_path_uses_canonical_layout() {
 
 #[test]
 fn zeroed_header_with_data_behind_is_corruption() {
-    // A wiped length field mid-file previously read as a clean live tail —
-    // silent data loss. With real frames behind the zeroed header it must
-    // surface as Corruption.
+    // A wiped length field in the middle of a file must not read as a
+    // clean live tail: that would be silent data loss. With real frames
+    // behind the zeroed header, this must surface as Corruption.
     let mut buf = Vec::new();
     append_frame(&mut buf, pos(0), &tx(1));
     let wipe_at = buf.len();
@@ -132,8 +132,8 @@ fn zeroed_header_with_data_behind_is_corruption() {
 
 #[test]
 fn zero_filled_tail_still_stops_cleanly() {
-    // The legitimate case the corruption check must NOT flag: a pre-allocated
-    // zero-filled tail after the last real frame.
+    // The legitimate case the corruption check must not flag: a
+    // pre-allocated, zero-filled tail after the last real frame.
     let mut buf = Vec::new();
     append_frame(&mut buf, pos(0), &tx(1));
     buf.extend_from_slice(&[0u8; 256]);

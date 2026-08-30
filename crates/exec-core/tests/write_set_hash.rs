@@ -1,11 +1,11 @@
 //! `WriteSet::hash` is the determinism witness every replica compares, so
 //! its byte sequence is a consensus contract. The implementation has two
-//! paths — a stack-buffered fast path and a streaming fallback for write
-//! sets carrying bytecode — and they must be indistinguishable.
+//! paths: a stack-buffered fast path, and a streaming fallback for write
+//! sets carrying bytecode. The two must be indistinguishable.
 //!
-//! These tests recompute the documented sequence independently and compare,
-//! so they pin the CONTRACT rather than merely checking the two paths
-//! agree with each other.
+//! These tests recompute the documented sequence independently, and
+//! compare it. So they pin the contract itself, not just whether the two
+//! paths agree with each other.
 
 use alloy_primitives::{Address, B256, Keccak256, U256, address};
 use kardamom_exec_core::delta::WriteSet;
@@ -113,9 +113,9 @@ fn empty_write_set_matches_the_contract() {
     assert_eq!(ws.hash(), expected(&ws));
 }
 
-/// The shape of a plain transfer: sender, recipient, fee sink — the case
-/// the stack buffer exists for, and the one the STM commit tail hashes
-/// once per transaction.
+/// The shape of a plain transfer: sender, recipient, fee sink. This is
+/// the case the stack buffer exists for, and the one the STM commit
+/// tail hashes once per transaction.
 #[test]
 fn transfer_shaped_write_set_matches_the_contract() {
     let mut ws = WriteSet::default();
@@ -143,8 +143,8 @@ fn defi_shaped_write_set_matches_the_contract() {
     assert_eq!(ws.hash(), expected(&ws));
 }
 
-/// A CREATE carries bytecode, which overflows the inline buffer and takes
-/// the streaming fallback — the two paths must agree.
+/// A CREATE carries bytecode, which overflows the inline buffer and
+/// takes the streaming fallback. The two paths must agree.
 #[test]
 fn code_carrying_write_set_takes_the_fallback_and_still_matches() {
     let mut ws = WriteSet::default();
@@ -173,10 +173,10 @@ fn matches_across_the_inline_boundary() {
     }
 }
 
-/// Sanity: the hash actually distinguishes different content (a buffered
-/// implementation that silently truncated would still pass the equality
-/// tests above if `expected` shared the bug — it does not, but this pins
-/// the property directly).
+/// Sanity check: the hash actually distinguishes different content. A
+/// buffered implementation that silently truncated would still pass the
+/// equality tests above, if `expected` shared the same bug. It does
+/// not, but this test pins the property directly.
 #[test]
 fn distinct_write_sets_hash_differently() {
     let mut a = WriteSet::default();

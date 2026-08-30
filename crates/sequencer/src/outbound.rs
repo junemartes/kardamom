@@ -1,29 +1,29 @@
 //! Outbound channel abstractions.
 //!
-//! Under the MDS topology the sequencer **does not** publish
-//! to tx_data — that's the proxy's job. The sequencer is purely a
-//! reader-of-A + publisher-of-B-refs: for each envelope observed on its
-//! shard's tx_data (via [`crate::inbound::TxDataSubscriber`]), if the
-//! nonce gate matches, it publishes a tiny [`kardamom_types::TxRef`] onto
-//! the canonical orderer tx_ordering
-//! ([`TxOrderingRefPublisher`]) — Aeron *concurrent* multi-publisher, ordered
-//! with refs from the other P-1 sequencers in this shard's group and
-//! sealer-emitted `BlockBoundaryStart` markers.
+//! Under the MDS topology, the sequencer does not publish to tx_data.
+//! That is the proxy's job. The sequencer only reads A and publishes
+//! B-refs: for each envelope it sees on its shard's tx_data (through
+//! [`crate::inbound::TxDataSubscriber`]), if the nonce gate matches, it
+//! publishes a tiny [`kardamom_types::TxRef`] onto the canonical orderer
+//! tx_ordering ([`TxOrderingRefPublisher`]). This is an Aeron concurrent
+//! multi-publisher stream, ordered together with refs from the other P-1
+//! sequencers in this shard's group and sealer-emitted
+//! `BlockBoundaryStart` markers.
 //!
-//! Pending-buffer state is advanced once the B publish succeeds. If B
-//! back-pressures, the state machine is rewound via
-//! [`crate::state::PartitionState::reinsert_for_retry`] and the error
+//! Pending-buffer state advances once the B publish succeeds. If B applies
+//! backpressure, the state machine rewinds through
+//! [`crate::state::PartitionState::reinsert_for_retry`], and the error
 //! bubbles up.
 //!
-//! In addition the sequencer emits a [`types::TxError`] on the dedicated
-//! `tx_errors` channel ([`TxErrorPublisher`]) when an inbound tx fails the
-//! nonce gate (past-nonce / duplicate today; more variants in the future).
-//! Ingress consumes that channel and releases the parked client immediately
-//! with a JSON-RPC error.
+//! The sequencer also emits a [`types::TxError`] on the dedicated
+//! `tx_errors` channel ([`TxErrorPublisher`]) when an inbound transaction
+//! fails the nonce gate (today: past-nonce or duplicate; more variants may
+//! come later). Ingress reads that channel and releases the parked client
+//! right away with a JSON-RPC error.
 //!
-//! All surfaces are traits so unit tests can use the in-memory fakes
-//! (no Aeron media driver required); production wiring binds them to the
-//! real `kardamom_log::publisher` types.
+//! All surfaces are traits, so unit tests can use the in-memory fakes (no
+//! Aeron media driver needed). Production wiring binds them to the real
+//! `kardamom_log::publisher` types.
 
 pub mod cluster;
 
@@ -32,18 +32,18 @@ use kardamom_types::{EpochRecord, TxError, TxRef};
 
 use crate::error::SequencerError;
 
-/// TxOrdering publisher contract — the canonical orderer. Publishes tiny
-/// [`TxRef`]s for L2 txs (~41 B) into Aeron's concurrent multi-publisher
-/// stream, plus whole [`EpochRecord`]s for L1 epochs. Both lanes share the
-/// tx_ordering channel so deposits and regular txs interleave in canonical
-/// order.
+/// TxOrdering publisher contract, the canonical orderer. Publishes tiny
+/// [`TxRef`]s for L2 transactions (about 41 bytes) into Aeron's concurrent
+/// multi-publisher stream, plus whole [`EpochRecord`]s for L1 epochs. Both
+/// lanes share the tx_ordering channel, so deposits and regular
+/// transactions interleave in canonical order.
 ///
-/// A blocked transport must surface as `Err(SequencerError::Backpressure)`
+/// A blocked transport must surface as `Err(SequencerError::Backpressure)`,
 /// so the state machine can rewind.
 pub trait TxOrderingRefPublisher: Send {
-    /// `sender`/`nonce` ride the ingress frame's guard header for the
-    /// sealer's per-sender contiguity guard (#85 fix B); they are not part
-    /// of the relayed record.
+    /// `sender` and `nonce` ride the ingress frame's guard header, for
+    /// the sealer's per-sender contiguity guard. They are not part of the
+    /// relayed record.
     fn try_publish_ref(
         &mut self,
         r: &TxRef,
@@ -51,12 +51,13 @@ pub trait TxOrderingRefPublisher: Send {
         nonce: u64,
     ) -> Result<(), SequencerError>;
 
-    /// Publish a run of refs, amortizing per-offer overhead where the
+    /// Publish a run of refs. This amortizes per-offer overhead where the
     /// transport supports it. Returns `(published, error)`: the first
-    /// `published` refs are durably offered; an error applies to the rest.
-    /// The default loops singles (fakes and non-batching transports keep
-    /// exact semantics); the cluster transport packs the whole slice into
-    /// ONE `KIND_BATCH` app message (all-or-nothing per call).
+    /// `published` refs are durably offered, and an error applies to the
+    /// rest. The default loops over single refs (fakes and non-batching
+    /// transports keep exact semantics). The cluster transport packs the
+    /// whole slice into one `KIND_BATCH` app message (all-or-nothing per
+    /// call).
     fn try_publish_ref_batch(
         &mut self,
         refs: &[(TxRef, Address, u64)],
@@ -70,18 +71,19 @@ pub trait TxOrderingRefPublisher: Send {
     }
 
     /// Publish an [`EpochRecord`] observed on `tx_deposits` as an
-    /// ORIGIN-ADVANCING record: the sealer closes the open block, adopts the
-    /// epoch's L1 number, then relays it, so the epoch's deposits lead a
-    /// block. Same backpressure semantics as `try_publish_ref` — epochs
-    /// aren't nonce-gated and have no pending state to rewind, so on
-    /// `Backpressure` the caller retries the same epoch next tick.
+    /// origin-advancing record. The sealer closes the open block, adopts
+    /// the epoch's L1 number, then relays it, so the epoch's deposits lead
+    /// a block. This has the same backpressure semantics as
+    /// `try_publish_ref`. Epochs are not nonce-gated and have no pending
+    /// state to rewind, so on `Backpressure` the caller retries the same
+    /// epoch on the next tick.
     fn try_publish_epoch(&mut self, e: &EpochRecord) -> Result<(), SequencerError>;
 }
 
-/// TxErrors channel publisher. Best-effort: errors are logged by the
-/// caller and not propagated, because the canonical state has already
-/// advanced (or the inbound tx was rejected and there's nothing to roll
-/// back).
+/// TxErrors channel publisher. This is best-effort: the caller logs
+/// errors and does not propagate them. The canonical state has already
+/// advanced, or the inbound transaction was rejected, so there is nothing
+/// to roll back.
 pub trait TxErrorPublisher: Send {
     fn publish_error(&mut self, e: TxError);
 }
@@ -98,9 +100,9 @@ pub mod fakes {
 
     use super::*;
 
-    /// In-memory tx_ordering publisher. Records every published `TxRef` and
-    /// `EpochRecord` in arrival order so tests can assert the canonical
-    /// sequence.
+    /// In-memory tx_ordering publisher. Records every published `TxRef`
+    /// and `EpochRecord` in arrival order, so tests can check the
+    /// canonical sequence.
     #[derive(Default, Clone)]
     pub struct InMemoryTxOrderingRefPublisher {
         pub refs: Arc<Mutex<Vec<TxRef>>>,

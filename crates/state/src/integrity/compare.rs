@@ -1,5 +1,5 @@
-//! Deep table-level comparison between two state DBs — [`deep_compare`] and
-//! its receipt field-diff helper.
+//! Deep table-level comparison between two state DBs: [`deep_compare`]
+//! and its receipt field-diff helper.
 
 use crate::env::StateEnv;
 use crate::error::StateError;
@@ -12,11 +12,15 @@ use crate::schema::{
     TABLE_TX_HASH_INDEX, decode_receipt_value,
 };
 
-/// Byte-level comparison of the chain-state tables of two DBs (an executor's
-/// and a validator's, canonically). Returns human-readable differences —
-/// empty means the two databases hold identical chain state. Trie tables and
-/// per-node meta (fsync watermark, state_root) are deliberately excluded:
-/// only the validator maintains a trie, and the sweep verifies it.
+/// A byte-level comparison of the chain-state tables of two DBs.
+/// Canonically, one is an executor's DB and the other is a validator's.
+///
+/// Returns human-readable differences. An empty result means the two
+/// databases hold identical chain state.
+///
+/// This comparison excludes trie tables and per-node meta, such as the
+/// fsync watermark and `state_root`. Only the validator maintains a
+/// trie, and [`super::sweep`] verifies it.
 pub fn deep_compare(a: &StateEnv, b: &StateEnv) -> Result<Vec<String>, StateError> {
     const SHARED_TABLES: &[&str] = &[
         TABLE_ACCOUNTS,
@@ -60,10 +64,10 @@ pub fn deep_compare(a: &StateEnv, b: &StateEnv) -> Result<Vec<String>, StateErro
                         continue;
                     }
                     if va != vb {
-                        // Byte lengths alone say nothing about WHAT diverged —
+                        // Byte lengths alone do not say what diverged.
                         // "224 vs 224 bytes" is the shape a fixed-width field
                         // mismatch takes, and chasing it from CI logs is
-                        // guesswork. Receipts decode, so name the fields.
+                        // guesswork. Receipts decode, so name the fields instead.
                         let detail = if *table == TABLE_RECEIPTS {
                             receipt_field_diff(va, vb)
                         } else {
@@ -108,8 +112,8 @@ pub fn deep_compare(a: &StateEnv, b: &StateEnv) -> Result<Vec<String>, StateErro
         }
     }
 
-    // Shared meta cursors must agree (per-node keys — fsync watermark,
-    // state_root — excluded by design).
+    // Shared meta cursors must agree. Per-node keys, such as the fsync
+    // watermark and `state_root`, are excluded by design.
     let ma = ta.open_db(Some(TABLE_META))?;
     let mb = tb.open_db(Some(TABLE_META))?;
     for key in [
@@ -133,10 +137,12 @@ pub fn deep_compare(a: &StateEnv, b: &StateEnv) -> Result<Vec<String>, StateErro
     Ok(diffs)
 }
 
-/// Field-level diff of two encoded receipts, for the deep-compare report.
+/// A field-level diff of two encoded receipts, for the deep-compare
+/// report.
 ///
-/// Returns `None` when either side does not decode — the caller then falls
-/// back to the byte-length message, which is still true, just uninformative.
+/// Returns `None` when either side does not decode. The caller then
+/// falls back to the byte-length message, which is still true, just
+/// less informative.
 fn receipt_field_diff(a: &[u8], b: &[u8]) -> Option<String> {
     let ra = decode_receipt_value(a).ok()?;
     let rb = decode_receipt_value(b).ok()?;
@@ -169,8 +175,8 @@ fn receipt_field_diff(a: &[u8], b: &[u8]) -> Option<String> {
         ));
     }
     if fields.is_empty() {
-        // Decoded equal but the bytes differ: an encoding difference, which
-        // is itself worth saying out loud rather than reporting as "no diff".
+        // The decoded values are equal, but the bytes differ. This encoding
+        // difference is worth reporting, instead of saying there is no diff.
         return Some(format!(
             "receipts decode EQUAL but encode differently ({} vs {} bytes) — an \
              encoding-level divergence",

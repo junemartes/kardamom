@@ -1,20 +1,22 @@
-//! S7 — `divergence_detection_is_not_vacuous`.
+//! `divergence_detection_is_not_vacuous`.
 //!
-//! S6 asserting `validator_divergence_total == 0` only means something if a
-//! genuinely divergent stream would have tripped it. This scenario proves
-//! the tripwire: feed the validator a corrupt BAL over the real `tx_bal`
-//! channel and require the documented fail-stop — the halting log line and
-//! `std::process::exit(2)`.
+//! The validator-consistency check confirms
+//! `validator_divergence_total == 0`. That check means
+//! something only if a genuinely divergent stream would trip it. This
+//! scenario proves the tripwire: it feeds the validator a corrupt BAL over
+//! the real `tx_bal` channel, and requires the documented fail-stop: the
+//! halting log line and `std::process::exit(2)`.
 //!
-//! Determinism: the executor is SIGSTOPped first, so no genuine BAL competes
-//! with the injected frame for the target blocks (the sealer keeps stamping
-//! boundaries; the validator keeps re-executing and asking for BALs). The
-//! injected blocks stay within the validator's backlog lookbehind so
-//! catch-up mode cannot skip them as unverified.
+//! For determinism, the executor is SIGSTOPped first, so no genuine BAL
+//! competes with the injected frame for the target blocks (the sealer
+//! keeps stamping boundaries, and the validator keeps re-executing and
+//! asking for BALs). The injected blocks stay within the validator's
+//! backlog lookbehind, so catch-up mode cannot skip them as unverified.
 //!
-//! Target-L only by design: it drives process signals and raw Aeron
-//! publications, which the Target-C runner cannot reach from outside the
-//! cluster. (Closes the `docs/failure-modes.md` "divergence injection" gap.)
+//! This test runs only on Target-L, by design: it sends process signals
+//! and raw Aeron publications, which the Target-C runner cannot reach from
+//! outside the cluster. (This closes the `docs/failure-modes.md`
+//! "divergence injection" gap.)
 
 use std::time::Duration;
 
@@ -26,8 +28,8 @@ use crate::harness::metrics::poll_until;
 use crate::harness::{LocalStack, inject, l2};
 
 pub async fn corrupt_bal_halts_validator(stack: &mut LocalStack, t: &Target) -> Result<()> {
-    // A little genuine traffic first, so the halt provably happens on a
-    // validator that was verifying happily until the corruption.
+    // Send a little genuine traffic first. This proves the halt happens on
+    // a validator that was verifying happily until the corruption.
     let signers = l2::dev_signers(2)?;
     let to = Address::from([0x77u8; 20]);
     for n in 0..4u64 {
@@ -55,12 +57,12 @@ pub async fn corrupt_bal_halts_validator(stack: &mut LocalStack, t: &Target) -> 
         .unwrap_or(0.0);
     anyhow::ensure!(divergence_before == 0.0, "diverged before injection");
 
-    // Freeze the executor; inject corrupt BALs for the validator's next few
-    // blocks (within the backlog lookbehind — see the module docs).
+    // Freeze the executor, then inject corrupt BALs for the validator's next
+    // few blocks (within the backlog lookbehind; see the module docs).
     //
-    // Polled, not single-shot: the committed-block gauge is set by an async
-    // snapshot poller and can lag the FIRST verified block by a beat since
-    // the #129 pipeline let verification run ahead of the durable commit.
+    // Use a poll, not a single read. An async snapshot poller sets the
+    // committed-block gauge, and it can lag the first verified block by a
+    // beat, because verification can run ahead of the durable commit.
     let committed = poll_until(
         "validator committed gauge",
         Duration::from_secs(10),
@@ -99,26 +101,28 @@ pub async fn corrupt_bal_halts_validator(stack: &mut LocalStack, t: &Target) -> 
     Ok(())
 }
 
-/// S11 — a forged epoch must halt the validator.
+/// A forged epoch must halt the validator.
 ///
-/// The counterpart to S7 for the deposit path: S10a-e prove an HONEST producer
-/// builds a derivable chain, but "a sequencer cannot drop a deposit without
-/// producing a chain verifiers reject" is only true if someone actually
-/// rejects. This drill injects an epoch L1 never produced and requires the
+/// This is the counterpart to the divergence-detection test for the
+/// deposit path. The derivation tests prove that an honest producer
+/// builds a derivable chain. But the claim
+/// "a sequencer cannot drop a deposit without producing a chain that
+/// verifiers reject" is only true if verifiers actually reject it. This
+/// drill injects an epoch that L1 never produced, and requires the
 /// validator to notice.
 ///
-/// Uses a bogus `l1_hash` rather than a doctored deposit set: the canonical id
-/// is `keccak(l1_hash)`, so the forgery cannot be swallowed by cluster dedup,
-/// and the validator's very first check against L1 — does this block have this
-/// hash — fails. Same class of fault as a dropped deposit, deterministic to
-/// stage.
+/// This uses a bogus `l1_hash`, not a doctored deposit set. The canonical
+/// id is `keccak(l1_hash)`, so cluster dedup cannot swallow the forgery,
+/// and the validator's first check against L1 (does this block have this
+/// hash) fails. This is the same class of fault as a dropped deposit, but
+/// easier to stage on demand.
 pub async fn forged_epoch_halts_validator(
     stack: &LocalStack,
     t: &Target,
     l1: &crate::harness::l1::L1,
 ) -> Result<()> {
-    // Warm up: the halt must provably land on a validator that was verifying
-    // happily, not on one that never started.
+    // Warm up. The halt must land on a validator that was verifying happily,
+    // not on one that never started.
     poll_until(
         "validator verifying (warmup)",
         Duration::from_secs(30),
@@ -140,8 +144,8 @@ pub async fn forged_epoch_halts_validator(
         "diverged before injection"
     );
 
-    // Freeze the honest producer so its epoch for this L1 block cannot race
-    // the forgery, then forge one origin PAST where the chain has got to
+    // Freeze the honest producer, so its epoch for this L1 block cannot race
+    // the forgery. Then forge one origin past where the chain has reached
     // (the sealer only accepts an advancing origin).
     anyhow::ensure!(
         stack.suspend_da_watcher(),
@@ -150,8 +154,9 @@ pub async fn forged_epoch_halts_validator(
     let tip = l1.finalized_block_number().await?;
     crate::harness::inject::publish_forged_epoch(&stack.aeron_dir(), tip + 50).await?;
 
-    // The verdict is deferred by one epoch on purpose (the L1 read runs off
-    // the exec thread), so keep honest epochs coming to carry it through.
+    // The verdict is deferred by one epoch on purpose, because the L1 read
+    // runs off the exec thread. Keep honest epochs coming to carry it
+    // through.
     l1.mine(12).await?;
 
     poll_until(
@@ -169,9 +174,9 @@ pub async fn forged_epoch_halts_validator(
     .await
     .context("validator must reject an epoch L1 never produced")?;
 
-    // And it must be recorded as an epoch fault specifically — a divergence
-    // from some unrelated check would pass the line above while proving
-    // nothing about epoch verification.
+    // It must also be recorded as an epoch fault specifically. A
+    // divergence from some unrelated check would pass the line above,
+    // while proving nothing about epoch verification.
     let faults = t
         .validator_metric(super::VALIDATOR_EPOCH_FAULTS)
         .await
@@ -183,17 +188,17 @@ pub async fn forged_epoch_halts_validator(
     Ok(())
 }
 
-/// S12 — the validator reads L1 through an interposed endpoint, and rejects it
-/// when it lies.
+/// The validator reads L1 through an interposed endpoint, and
+/// rejects it when the endpoint lies.
 ///
-/// Production points `--l1-rpc-url` at a light client rather than a raw RPC
-/// (issue #163), but the real client needs a beacon chain and our L1 is anvil,
-/// so it cannot run here. What this covers is the half that is ours: the
+/// Production points `--l1-rpc-url` at a light client, not a raw RPC. The
+/// real light client needs a beacon chain, and this test's L1 is anvil, so
+/// it cannot run here. This test covers the half that is ours: the
 /// contract between the validator and whatever serves it L1 data.
 ///
-/// `fault` selects the lie. `Fault::None` is the baseline — verification must
-/// still SUCCEED through an interposed endpoint, or the lying cases prove
-/// nothing about detection and only that something broke.
+/// `fault` selects the lie. `Fault::None` is the baseline: verification
+/// must still succeed through an interposed endpoint. Otherwise the lying
+/// cases would prove nothing about detection, only that something broke.
 pub async fn verified_l1_endpoint(
     stack: &mut LocalStack,
     t: &Target,
@@ -201,7 +206,8 @@ pub async fn verified_l1_endpoint(
 ) -> Result<()> {
     use crate::harness::l1_verified::Fault;
 
-    // Warm up: the verdict must land on a validator that was verifying happily.
+    // Warm up. The verdict must land on a validator that was verifying
+    // happily.
     poll_until(
         "validator verifying (warmup)",
         Duration::from_secs(30),
@@ -223,8 +229,9 @@ pub async fn verified_l1_endpoint(
         "diverged before the fault was armed"
     );
 
-    // Non-vacuity: the validator must actually be reading through the mock.
-    // Without this the whole scenario could pass with the endpoint bypassed.
+    // Non-vacuity check: the validator must actually read through the
+    // mock. Without this check, the whole scenario could pass with the
+    // endpoint bypassed.
     anyhow::ensure!(
         stack.verified_l1().context("mock verified L1")?.served() > 0,
         "validator never queried the interposed endpoint — it is not in the L1 path"
@@ -261,8 +268,8 @@ pub async fn verified_l1_endpoint(
         return Ok(());
     }
 
-    // Arm the lie from the next L1 block on, so already-verified epochs stay
-    // verified and the fault lands on fresh ones.
+    // Arm the lie starting at the next L1 block, so already-verified
+    // epochs stay verified, and the fault lands only on fresh ones.
     let from = stack.l1().context("l1")?.finalized_block_number().await? + 1;
     let served_at_arm = stack.verified_l1().context("mock verified L1")?.served();
     let verified_at_arm = t
@@ -277,11 +284,12 @@ pub async fn verified_l1_endpoint(
             Fault::BrokenParentChain { .. } => Fault::BrokenParentChain { from_block: from },
             other => other,
         });
-    // SwallowLogs is only a lie if there is a log to swallow. Arm FIRST, then
-    // make the deposit: the da-watcher reads anvil directly, so it builds an
-    // epoch that CARRIES the deposit, while the validator's interposed view
-    // reports none. Without this ordering the epoch is empty on both sides and
-    // the case passes while testing nothing.
+    // SwallowLogs is only a lie if there is a log to swallow. Arm the
+    // fault first, then make the deposit. The da-watcher reads anvil
+    // directly, so it builds an epoch that carries the deposit, while the
+    // validator's interposed view reports none. With the wrong order, the
+    // epoch would be empty on both sides, and the case would pass while
+    // testing nothing.
     if fault == Fault::SwallowLogs {
         let signers = l2::dev_signers(3)?;
         stack
@@ -296,13 +304,13 @@ pub async fn verified_l1_endpoint(
     }
     stack.l1().context("l1")?.mine(16).await?;
 
-    // Assert on the EXIT, not on a metric. The fail-stop kills the process, so
-    // its /metrics goes with it — polling a gauge here reads the halt we are
-    // waiting for as `unwrap_or(0.0)`, i.e. as "no divergence", and the
-    // scenario times out while the validator has been dead and correct the
-    // whole time. (Observed exactly that; the same scrape-failure-as-zero trap
-    // the lag-resync work hit.) Exit code 2 is the divergence fail-stop, and
-    // the log line names the reason.
+    // Check the exit code, not a metric. The fail-stop kills the process,
+    // so its /metrics endpoint goes with it. Polling a gauge here would
+    // read the halt as `unwrap_or(0.0)`, meaning "no divergence", and the
+    // scenario would time out while the validator was dead and correct the
+    // whole time. This is the same scrape-failure-as-zero trap the
+    // lag-resync work hit. Exit code 2 is the divergence fail-stop, and the
+    // log line names the reason.
     let served_since_arm = stack
         .verified_l1()
         .context("mock verified L1")?
@@ -323,9 +331,9 @@ pub async fn verified_l1_endpoint(
         "validator exited with {code:?}, expected the divergence fail-stop's exit 2"
     );
 
-    // And it must have halted on an EPOCH fault: exiting 2 for some unrelated
-    // divergence would satisfy the check above while proving nothing about L1
-    // verification.
+    // It must also have halted on an epoch fault. Exiting with code 2 for
+    // some unrelated divergence would pass the check above, while proving
+    // nothing about L1 verification.
     let log = stack
         .validator_log()
         .context("read validator log for the halt reason")?;

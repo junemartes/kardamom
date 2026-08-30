@@ -1,20 +1,22 @@
-//! The full optimistic path with a REAL proof and the REAL SP1 verifier
-//! (spec: no-std-exec-core, PR 5). Unlike `optimistic_e2e` (mock verifier,
+//! The full optimistic path with a real proof and the real SP1 verifier.
+//! See the no-std-exec-core spec. Unlike `optimistic_e2e` (mock verifier,
 //! flow plumbing), this verifies a genuine SP1 Groth16 proof of a real
 //! kardamom block against the vendored SP1 verifier (circuit v6.1.0) on
-//! anvil — the crux the user asked for: "generate a proof, submit it on
-//! chain, and ensure the contract accepts it."
+//! anvil. This is the core case: generate a proof, submit it on chain, and
+//! check the contract accepts it.
 //!
-//! Two cases, one shared real proof (proving is expensive; the fixture is
-//! committed — see fixtures/README.md):
+//! Two cases share one real proof, because proving is expensive; the
+//! fixture is committed (see fixtures/README.md):
 //!
-//!   A. A FALSE block claim (wrong root) is challenged with the real proof;
-//!      the real verifier accepts, the bond is slashed, the chain rewinds.
-//!   B. The OPPOSITE — an HONEST claim (the true root) cannot be griefed:
-//!      the same real proof reproduces the claimed root, so `challengeBlock`
-//!      reverts `ProofAgreesWithClaim` before the verifier is even reached.
+//!   A. A false block claim (wrong root) is challenged with the real proof.
+//!      The real verifier accepts it, the bond is slashed, and the chain
+//!      rewinds.
+//!   B. The opposite: an honest claim (the true root) cannot be griefed.
+//!      The same real proof reproduces the claimed root, so
+//!      `challengeBlock` reverts with `ProofAgreesWithClaim` before the
+//!      verifier is even reached.
 //!
-//! Skips cleanly if the fixtures are absent (unregenerated) or anvil is
+//! Skips cleanly if the fixtures are absent (not yet generated) or anvil is
 //! unavailable.
 
 use alloy_node_bindings::Anvil;
@@ -48,9 +50,10 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// The single-block public outputs the guest committed (160-byte layout,
-/// shared with BatchPublicOutputs field-for-field: pre, post, blockNumber,
-/// records_digest slot as `records_commitment`, bal slot dropped here).
+/// The single-block public outputs the guest committed. This is a 160-byte
+/// layout, sharing fields with BatchPublicOutputs: pre, post,
+/// blockNumber, the records_digest slot as `records_commitment`, and the
+/// bal slot dropped here.
 struct BlockPv {
     pre: B256,
     post: B256,
@@ -60,10 +63,11 @@ struct BlockPv {
 }
 
 fn load_block_pv(bytes: Vec<u8>) -> BlockPv {
-    // The single-block PublicOutputs layout: pre || post || block_number(u256)
-    // || records_digest || bal_commitment. Decode via BatchPublicOutputs'
-    // matching prefix (first/last u256 fields differ semantically but the
-    // byte slots we need — pre, post, word@64, word@96 — line up).
+    // The single-block PublicOutputs layout is pre, post,
+    // block_number (u256), records_digest, bal_commitment, in that order.
+    // Decode it with BatchPublicOutputs' matching prefix. The first and
+    // last u256 fields differ in meaning, but the byte slots this needs
+    // (pre, post, word at 64, word at 96) line up.
     let pre = B256::from_slice(&bytes[0..32]);
     let post = B256::from_slice(&bytes[32..64]);
     let block_number = U256::from_be_slice(&bytes[64..96]).to::<u64>();
@@ -133,9 +137,10 @@ async fn real_groth16_proof_accepted_on_chain_challenge_and_grief_rejected() {
         let _: serde_json::Value = provider.raw_request(req.0.into(), req.1).await.unwrap();
     }
 
-    // --- Deploy the REAL SP1 verifier, settlement, and oracle v2 wired to
-    // BOTH (batch + block vkey = the fixture's guest vkey; genesis = the
-    // block's proven PRE root, so the offset-0 pre-root check lines up).
+    // --- Deploy the real SP1 verifier, settlement, and oracle v2, wired
+    // to both. The batch and block vkey are the fixture's guest vkey.
+    // Genesis is the block's proven pre-root, so the offset-0 pre-root
+    // check lines up.
     let verifier = SP1Verifier::deploy(provider.clone()).await.unwrap();
     assert_eq!(
         verifier.VERSION().call().await.unwrap(),
@@ -187,8 +192,8 @@ async fn real_groth16_proof_accepted_on_chain_challenge_and_grief_rejected() {
     let oracle = IKardamomProofOracle::new(oracle_addr, provider.clone());
     let settlement = IKardamomL2Settlement::new(settlement_addr, provider.clone());
 
-    // The batch covers exactly the proven block; its records commitment is
-    // the fold of the block's digest (from the proof's public values).
+    // The batch covers exactly the proven block. Its records commitment is
+    // the fold of the block's digest, from the proof's public values.
     let commitment = fold_one(pv.records_digest);
     settlement
         .postBatch(
@@ -220,8 +225,9 @@ async fn real_groth16_proof_accepted_on_chain_challenge_and_grief_rejected() {
         .await
         .unwrap();
 
-    // The challenger submits the REAL proof at offset 0. The contract checks
-    // preconditions, then calls the REAL SP1 verifier — which must accept.
+    // The challenger submits the real proof at offset 0. The contract
+    // checks preconditions, then calls the real SP1 verifier, which must
+    // accept.
     let receipt = oracle
         .challengeBlock(
             1,
@@ -241,7 +247,8 @@ async fn real_groth16_proof_accepted_on_chain_challenge_and_grief_rejected() {
         receipt.status(),
         "the real SP1 verifier must ACCEPT the real groth16 proof on chain"
     );
-    // Slashed + rewound: the batch reopened, the root is untouched (genesis).
+    // Slashed and rewound: the batch reopened, and the root is untouched
+    // (genesis).
     assert_eq!(oracle.highestClaimedBatch().call().await.unwrap(), 0);
     assert_eq!(oracle.stateRoot().call().await.unwrap(), pv.pre);
 
@@ -257,12 +264,13 @@ async fn real_groth16_proof_accepted_on_chain_challenge_and_grief_rejected() {
         .get_receipt()
         .await
         .unwrap();
-    // A griefer submits the SAME real proof. Its proven post == the claimed
-    // root, so the contract rejects on `ProofAgreesWithClaim` BEFORE the
-    // verifier — an honest proposer cannot be challenged even with a valid
-    // proof. `.send()` returns Ok for a tx that reverts on chain (the revert
-    // surfaces in the receipt), so assert the receipt reverted — OR, if the
-    // node simulated and rejected at submit, an Err is equally acceptable.
+    // A griefer submits the same real proof. Its proven post matches the
+    // claimed root, so the contract rejects with `ProofAgreesWithClaim`
+    // before the verifier runs. An honest proposer cannot be challenged,
+    // even with a valid proof. `.send()` returns `Ok` for a tx that
+    // reverts on chain (the revert shows up in the receipt), so check that
+    // the receipt reverted. An `Err`, from the node simulating and
+    // rejecting at submit, is equally acceptable.
     let grief = oracle
         .challengeBlock(
             1,

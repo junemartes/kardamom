@@ -1,7 +1,7 @@
-//! The write-set encoding is a CONSENSUS contract (per-tx determinism
-//! witness). These tests pin the properties that make it one: the two
-//! sink paths agree, the encoding is injective across every field's
-//! compaction, and the compaction actually bought permutations.
+//! The write-set encoding is a consensus contract (the per-tx
+//! determinism witness). These tests pin the properties that make it
+//! one: the two sink paths agree, the encoding is injective across every
+//! field's compaction, and the compaction actually saves permutations.
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use kardamom_exec_core::delta::WriteSet;
@@ -25,11 +25,12 @@ fn addr(i: u8) -> Address {
     Address::with_last_byte(i)
 }
 
-/// A set too big for the stack buffer takes the streaming path; one that
-/// fits takes the buffered path. Growing a set across that boundary must
-/// not change how equal prefixes hash — i.e. the paths encode the same
-/// bytes. (Set with code always streams, so pairing an identical set
-/// with and without a code entry exercises both.)
+/// A set too big for the stack buffer takes the streaming path. A set
+/// that fits takes the buffered path. Growing a set across that
+/// boundary must not change how equal prefixes hash. That is, both
+/// paths encode the same bytes. (A set with code always streams, so
+/// pairing an identical set with and without a code entry exercises
+/// both paths.)
 #[test]
 fn buffered_and_streaming_paths_agree() {
     let accounts: Vec<_> = (1..=3u8)
@@ -43,17 +44,17 @@ fn buffered_and_streaming_paths_agree() {
     let storage: Vec<_> = (1..=40u8)
         .map(|i| ((addr(9), B256::with_last_byte(i)), U256::from(i)))
         .collect();
-    // 40 slots blows past INLINE -> streaming; 2 slots fits -> buffered.
+    // 40 slots exceed INLINE, so this streams. 2 slots fit, so this buffers.
     let big = ws(&accounts, &storage, &[]);
     let small = ws(&accounts, &storage[..2], &[]);
     // Each must equal a fresh recomputation (determinism), and the two
-    // must differ (they describe different sets).
+    // must differ, since they describe different sets.
     assert_eq!(big.hash(), ws(&accounts, &storage, &[]).hash());
     assert_eq!(small.hash(), ws(&accounts, &storage[..2], &[]).hash());
     assert_ne!(big.hash(), small.hash());
 }
 
-/// Injectivity across the compactions: minimal-width integers, the
+/// Injectivity across the compactions. Minimal-width integers, the
 /// code-hash tag, and the repeated-address flag must never let two
 /// different write sets collide.
 #[test]
@@ -73,7 +74,7 @@ fn encoding_is_injective_across_compactions() {
         "bal 0x0100",
     );
     push(ws(&[(addr(1), (0, U256::ZERO, ke))], &[], &[]), "bal 0");
-    // Nonce vs balance must not be confusable.
+    // Nonce and balance must not be confusable.
     push(ws(&[(addr(1), (1, U256::ZERO, ke))], &[], &[]), "nonce 1");
     push(
         ws(&[(addr(1), (128, U256::ZERO, ke))], &[], &[]),
@@ -92,7 +93,7 @@ fn encoding_is_injective_across_compactions() {
         ),
         "code explicit",
     );
-    // Same-address run vs distinct addresses (the bit6 flag).
+    // A same-address run versus distinct addresses (the bit6 flag).
     push(
         ws(
             &[],
@@ -115,17 +116,17 @@ fn encoding_is_injective_across_compactions() {
         ),
         "two slots, two addresses",
     );
-    // Counts must be covered: an empty set differs from every above.
+    // Counts must be covered: an empty set differs from every set above.
     push(ws(&[], &[], &[]), "empty");
 }
 
-/// The point of the change: a plain transfer's witness must fit in ONE
-/// keccak permutation (<= 136 bytes absorbed). Asserted structurally so
-/// a future field addition that silently costs a permutation fails here
-/// rather than in a benchmark months later.
+/// The point of the change: a plain transfer's witness must fit in one
+/// keccak permutation (136 bytes or fewer absorbed). This is asserted
+/// structurally, so a future field addition that silently costs a
+/// permutation fails here, rather than in a benchmark much later.
 #[test]
 fn transfer_witness_fits_one_permutation() {
-    // sender, recipient, fee sink: real-shaped balances and nonces.
+    // Sender, recipient, fee sink: real-shaped balances and nonces.
     let accounts: Vec<_> = (1..=3u8)
         .map(|i| {
             (

@@ -1,18 +1,21 @@
-//! Peer-to-peer checkpoint transfer: a minimal HTTP server that publishes a
-//! node's newest state checkpoint, and a client that fetches one from a peer.
+//! Peer-to-peer checkpoint transfer. A minimal HTTP server publishes a
+//! node's newest state checkpoint. A client fetches one from a peer.
 //!
-//! This is the network half of "restore-from-peer" ([`crate::checkpoint`]):
-//! executor replicas are deterministic state machines at the same block, so any
-//! replica's checkpoint is a valid restore source for another. The consumer is
-//! the resync fallback — a node whose replay cursor aged out of the cluster's
-//! bounded retention window (`REPLAY_UNAVAILABLE`) can only be repaired with
-//! state from at-or-above the retention floor, which by construction never
-//! exists locally (a local checkpoint's block is always <= the local cursor).
+//! This is the network half of "restore-from-peer" ([`crate::checkpoint`]).
+//! Executor replicas are deterministic state machines at the same block, so
+//! any replica's checkpoint is a valid restore source for another.
 //!
-//! The protocol is deliberately tiny (HTTP/1.0 GET, one request per
-//! connection, no HTTP dependency). The server is a tokio task (one task per
-//! connection; the checkpoint lookup runs on `spawn_blocking`); the client is
-//! std-sync because its callers are sync startup/repair code:
+//! The consumer is the resync fallback. A node whose replay cursor aged out
+//! of the cluster's bounded retention window (`REPLAY_UNAVAILABLE`) can only
+//! be repaired with state at or above the retention floor. Such state never
+//! exists locally, because a local checkpoint's block is always at most the
+//! local cursor.
+//!
+//! The protocol is deliberately small: HTTP/1.0 GET, one request per
+//! connection, and no HTTP dependency. The server runs as a tokio task, one
+//! task per connection. The checkpoint lookup runs on `spawn_blocking`. The
+//! client stays std-sync, because its callers are sync startup and repair
+//! code:
 //!
 //! ```text
 //! GET /checkpoint/latest HTTP/1.0
@@ -24,9 +27,10 @@
 //! <mdbx image>
 //! ```
 //!
-//! `404` when the serving node has no checkpoint yet. Only complete checkpoints
-//! are ever visible under `checkpoint-*` names (compact-to-tmp + rename), so a
-//! served image is always a full, consistent snapshot.
+//! The server returns `404` when it has no checkpoint yet. Only complete
+//! checkpoints are visible under `checkpoint-*` names, because each one is
+//! built in a temp directory and then renamed into place. So a served image
+//! is always a full, consistent snapshot.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -43,16 +47,20 @@ use alloy_primitives::B256;
 use crate::checkpoint::{CheckpointInfo, checkpoint_data_file, checkpoint_name, latest_checkpoint};
 use crate::error::StateError;
 
-/// Per-socket read/write timeout. Transfers stream in bounded chunks, so this
-/// caps per-syscall stalls (a dead peer), not total transfer time.
+/// The read/write timeout for each socket. Transfers stream in bounded
+/// chunks, so this caps per-syscall stalls, such as a dead peer. It does
+/// not cap total transfer time.
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Cap on request/response head size — nothing legitimate comes close.
+/// The maximum size for a request or response head. No legitimate one
+/// comes close to this limit.
 const MAX_HEAD: usize = 4096;
 
-/// Removes the wrapped tmp dir on drop; set the field to `None` to defuse
-/// once the dir has been published. Keeps every fetch refusal path
-/// crash-clean without a per-arm cleanup line.
+/// Removes the wrapped temp directory on drop. Set the field to `None`
+/// to defuse the guard once the directory has been published.
+///
+/// This keeps every fetch-refusal path crash-clean, without a cleanup
+/// line in each branch.
 struct TmpDirGuard<'a>(Option<&'a Path>);
 
 impl Drop for TmpDirGuard<'_> {
@@ -63,18 +71,19 @@ impl Drop for TmpDirGuard<'_> {
     }
 }
 
-/// A running checkpoint server: the bound address (useful when binding port
-/// 0) and the accept-loop task. Dropping the handle does NOT stop the
-/// server; abort the task to stop it.
+/// A running checkpoint server. It holds the bound address (useful when
+/// binding to port 0) and the accept-loop task. Dropping the handle does
+/// not stop the server. Call `task.abort()` to stop it.
 pub struct CheckpointServer {
     pub addr: SocketAddr,
     pub task: tokio::task::JoinHandle<()>,
 }
 
-/// Serve the newest checkpoint under `checkpoints_dir` on `addr`, forever, as
-/// a tokio task (one task per connection). Binding happens before the task
-/// spawns so a bad address fails startup loudly rather than logging from a
-/// background task. Must be called inside a tokio runtime.
+/// Serve the newest checkpoint under `checkpoints_dir` on `addr`, forever.
+/// This runs as a tokio task, one task per connection. Binding happens
+/// before the task spawns. So a bad address fails startup with a clear
+/// error, instead of only logging from a background task. Call this inside
+/// a tokio runtime.
 pub fn serve_checkpoints(
     addr: SocketAddr,
     checkpoints_dir: PathBuf,
@@ -127,9 +136,9 @@ fn prepare_response(
             return Err(SERVER_ERROR);
         }
     };
-    // Serve the manifest fields as headers so the peer can verify the bytes
-    // it receives (and refuse a foreign chain) without a second round trip.
-    // A checkpoint we cannot describe is one we must not hand out.
+    // Serve the manifest fields as headers, so the peer can verify the
+    // bytes it receives, and refuse a foreign chain, without a second
+    // round trip. We must not hand out a checkpoint we cannot describe.
     let manifest = match crate::checkpoint::read_manifest(&ckpt.path) {
         Ok(m) => m,
         Err(e) => {
@@ -193,14 +202,18 @@ async fn serve_one(stream: tokio::net::TcpStream, checkpoints_dir: &Path) -> std
 }
 
 /// Fetch the newest checkpoint from `peer` (`host:port`) into
-/// `checkpoints_dir`, returning its info. `Ok(None)` when the peer has no
-/// checkpoint, or its newest is below `min_block` (the advertised block is in
-/// the response head, so a useless image is never downloaded). An
-/// already-present same-block checkpoint is returned without a transfer.
+/// `checkpoints_dir`, and return its info.
 ///
-/// The image lands under the hidden `.checkpoint-<block>.fetch.tmp` name and is
-/// renamed into place only when the full advertised length arrived, preserving
-/// the "visible checkpoints are complete" invariant for any concurrent reader.
+/// Returns `Ok(None)` when the peer has no checkpoint, or its newest
+/// checkpoint is below `min_block`. The advertised block is in the
+/// response head, so this function never downloads a useless image. If a
+/// checkpoint for the same block already exists locally, this function
+/// returns it without a transfer.
+///
+/// The image lands under the hidden `.checkpoint-<block>.fetch.tmp` name.
+/// It is renamed into place only after the full advertised length
+/// arrives. This preserves the invariant that a visible checkpoint is
+/// always complete, for any concurrent reader.
 pub fn fetch_latest_checkpoint(
     peer: &str,
     checkpoints_dir: &Path,
@@ -241,32 +254,34 @@ pub fn fetch_latest_checkpoint(
         StateError::Recovery(format!("checkpoint peer {peer}: missing content-length"))
     })?;
     if block < min_block {
-        // Too old to be useful (e.g. below the cluster's retention floor) —
-        // don't download the body.
+        // Too old to be useful, for example below the cluster's retention
+        // floor. Do not download the body.
         return Ok(None);
     }
 
     std::fs::create_dir_all(checkpoints_dir)?;
     let dest = checkpoints_dir.join(checkpoint_name(block));
     if dest.exists() {
-        // Already have this exact checkpoint — nothing to transfer. Logged
-        // because this is a RECOVERY decision point: the retention-overrun
-        // chaos case once read a silent short-circuit here as "the repair
-        // path never ran" while the node recovered fine.
+        // Already have this exact checkpoint locally, so there is nothing
+        // to transfer. This is a recovery decision point, so we log it: a
+        // silent skip here can look like the repair path never ran, even
+        // though the node is fine.
         info!(
             block,
             peer, "peer's newest checkpoint already present locally; skipping transfer"
         );
         return Ok(Some(CheckpointInfo { block, path: dest }));
     }
-    // Build the same shape `create_checkpoint` produces — a directory holding
-    // `mdbx.dat` + `MANIFEST` — under a hidden tmp name, so the checkpoint we
-    // publish is self-contained and re-verifiable from disk.
+    // Build the same shape that `create_checkpoint` produces: a directory
+    // holding `mdbx.dat` and `MANIFEST`, under a hidden temp name. This
+    // makes the published checkpoint self-contained and re-verifiable
+    // from disk.
     let tmp = checkpoints_dir.join(format!(".{}.fetch.tmp", checkpoint_name(block)));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
-    // Every refusal below must leave no half-fetched tmp entry behind; the
-    // guard replaces the per-arm cleanup and is defused only by the publish.
+    // Every refusal below must leave no half-fetched temp entry behind.
+    // This guard replaces a cleanup line in each branch, and only the
+    // publish step defuses it.
     let mut tmp_guard = TmpDirGuard(Some(&tmp));
     let tmp_data = tmp.join("mdbx.dat");
     let mut out = std::fs::File::create(&tmp_data)?;
@@ -279,12 +294,11 @@ pub fn fetch_latest_checkpoint(
     out.sync_all()?;
     drop(out);
 
-    // Integrity + chain identity BEFORE the image becomes visible — the
-    // shared refusal checks (`checkpoint::check_image_identity`). Without
-    // this the transfer was plain HTTP with a length check: silent bit rot,
-    // a lying peer, or a checkpoint from a previous chain all became this
-    // node's state (the recovery-C incident: a stale checkpoint wedged a
-    // fresh node into an endless replay request loop).
+    // Check integrity and chain identity before the image becomes visible,
+    // using the shared refusal checks (`checkpoint::check_image_identity`).
+    // Without this check, this transfer was plain HTTP with only a length
+    // check. Silent bit rot, a lying peer, or a checkpoint from a
+    // different chain could all become this node's state.
     let got = crate::checkpoint::file_keccak(&tmp_data)?;
     let Some(want) = keccak else {
         return Err(StateError::Recovery(format!(
@@ -307,8 +321,9 @@ pub fn fetch_latest_checkpoint(
         expected_genesis,
     )?;
 
-    // Persist the manifest INSIDE the checkpoint dir so a LATER restore
-    // re-verifies from disk rather than trusting that this fetch happened.
+    // Store the manifest inside the checkpoint directory. This lets a
+    // later restore re-verify from disk, instead of trusting that this
+    // fetch happened correctly.
     let manifest = crate::checkpoint::CheckpointManifest {
         block,
         image_keccak: got,
@@ -325,10 +340,12 @@ pub fn fetch_latest_checkpoint(
     Ok(Some(CheckpointInfo { block, path: dest }))
 }
 
-/// Fetch from each peer in turn and keep the newest checkpoint at or above
-/// `min_block`. Individual peer failures are logged and skipped — one live
-/// peer is enough. As the best-so-far rises, later peers advertising nothing
-/// newer are skipped without downloading.
+/// Fetch from each peer in turn, and keep the newest checkpoint at or
+/// above `min_block`.
+///
+/// This function logs and skips individual peer failures; one live peer
+/// is enough. As the best-so-far block rises, later peers with nothing
+/// newer are skipped without a download.
 pub fn fetch_best_checkpoint(
     peers: &[String],
     checkpoints_dir: &Path,
@@ -418,8 +435,8 @@ mod tests {
         write_checkpoint_as(dir, block, contents, B256::repeat_byte(0x6E))
     }
 
-    /// Write an image + a manifest that HONESTLY describes it, under a given
-    /// chain identity.
+    /// Write an image and a manifest that correctly describes it, under a
+    /// given chain identity.
     fn write_checkpoint_as(dir: &Path, block: u64, contents: &[u8], genesis: B256) -> PathBuf {
         let p = dir.join(checkpoint_name(block));
         std::fs::create_dir_all(&p).unwrap();
@@ -471,7 +488,7 @@ mod tests {
             .unwrap();
         assert_eq!(got.block, 7);
         assert_eq!(image_bytes(&got.path), b"newest image bytes");
-        // No tmp residue.
+        // No temp files remain.
         assert!(
             std::fs::read_dir(local.path()).unwrap().all(|e| !e
                 .unwrap()
@@ -505,7 +522,7 @@ mod tests {
 
         let local = tempfile::tempdir().unwrap();
         let peers = vec![
-            "127.0.0.1:1".to_string(), // dead peer: connection refused, skipped
+            "127.0.0.1:1".to_string(), // A dead peer: connection is refused, so it is skipped.
             addr_a.to_string(),
             addr_b.to_string(),
         ];
@@ -525,8 +542,8 @@ mod tests {
         write_checkpoint(served.path(), 6, b"below the floor");
         let addr = serve_ephemeral(served.path().to_path_buf());
         let local = tempfile::tempdir().unwrap();
-        // Peer's newest (6) is below the required floor (10): skipped, nothing
-        // written locally.
+        // The peer's newest checkpoint (block 6) is below the required
+        // floor (block 10). It is skipped, and nothing is written locally.
         assert!(
             fetch(addr, local.path().to_path_buf(), 10)
                 .await
@@ -549,7 +566,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.block, 4);
-        // The local copy is kept, not overwritten by the peer's.
+        // The local copy is kept. The peer's copy does not overwrite it.
         assert_eq!(image_bytes(&got.path), b"local bytes");
     }
 }

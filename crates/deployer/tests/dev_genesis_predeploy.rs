@@ -1,13 +1,13 @@
-//! Pins the ERC-7955 predeploy entry in `chains/dev.toml`:
+//! Checks the ERC-7955 predeploy entry in `chains/dev.toml`. The entry:
 //!   * exists at the canonical [`ERC7955_FACTORY`] address,
-//!   * carries bytecode byte-equal to [`ERC7955_RUNTIME_HEX`].
+//!   * has bytecode that is byte-equal to [`ERC7955_RUNTIME_HEX`].
 //!
-//! Regression target: anyone editing `chains/dev.toml` (or the rust constants)
-//! who drifts the two breaks this test before breaking a real dev chain.
+//! If `chains/dev.toml` and the Rust constants drift apart, this test fails
+//! before a real dev chain breaks.
 //!
-//! Asserts directly against the parsed genesis alloc (the canonical source the
-//! cluster executor seeds its state from) rather than round-tripping through a
-//! node — `chains/dev.toml` is exactly what gets predeployed.
+//! The test checks the parsed genesis alloc directly, instead of round-tripping
+//! through a node. The alloc is the canonical source the cluster executor uses
+//! to seed its state, and it is exactly what `chains/dev.toml` predeploys.
 
 use std::path::PathBuf;
 

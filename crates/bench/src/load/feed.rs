@@ -1,5 +1,6 @@
-//! Subscribe-mode receipt feed: one WebSocket subscription (filtered to the
-//! run's senders) confirming txs into the shared tracker.
+//! This is the subscribe-mode receipt feed: one WebSocket subscription,
+//! filtered to the run's senders, that confirms transactions into the
+//! shared tracker.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,10 +11,11 @@ use jsonrpsee::rpc_params;
 use crate::load::json_hex_u64;
 use crate::load::tracker::Tracker;
 
-/// Subscribe-mode receipt feed: one WebSocket subscription (filtered to the
-/// run's senders) confirming txs into the shared tracker. Reconnects forever
-/// — chaos restarts the ingress under it — and the drain's HTTP polling
-/// settles anything that slipped through a gap. Aborted by the caller.
+/// The subscribe-mode receipt feed: one WebSocket subscription, filtered
+/// to the run's senders, that confirms transactions into the shared
+/// tracker. It reconnects without limit, because chaos mode restarts the
+/// ingress under it, and the drain's HTTP polling settles anything that
+/// slipped through a gap. The caller aborts this task.
 pub(crate) async fn receipt_feed_task(
     ws_url: String,
     senders: Vec<Address>,

@@ -1,55 +1,62 @@
 # shellcheck shell=bash
 # =============================================================================
-# chaos-cases-cluster.sh — CLUSTERED-SEALER (Raft) cases.
+# chaos-cases-cluster.sh — clustered-sealer (Raft) cases.
 # =============================================================================
-# SOURCED into chaos.sh's shell (never executed as a child). This file must
-# NOT install traps (chaos.sh owns the single EXIT trap).
+# This file is sourced into chaos.sh's shell, never run as a child
+# process. This file must not install traps; chaos.sh owns the single
+# EXIT trap.
 #
-# Progress is measured at the EXECUTOR (the Java cluster node has no
-# Prometheus endpoint); the cluster commits blocks out its egress, the
-# executor applies them, so executor_progress() advancing == cluster liveness.
+# This suite measures progress at the executor, since the Java cluster
+# node has no Prometheus endpoint. The cluster commits blocks out its
+# egress, and the executor applies them. So executor_progress()
+# advancing means the cluster is alive.
 
 case_cluster_leader_kill() {
-  # HARD-kill the inner cluster container on the CURRENT leader's node. The
-  # 3-member Raft quorum must survive losing the leader and KEEP COMMITTING — the
-  # executor's block gauge resumes advancing once the cluster has a live leader
-  # again. This REPLACES the documented single-sealer hard-kill SPOF gap (#58):
-  # a single sealer crash froze the pipeline; the Raft cluster does not.
+  # Hard-kill the inner cluster container on the current leader's node.
+  # The 3-member Raft quorum must survive losing the leader, and keep
+  # committing. The executor's block gauge resumes advancing once the
+  # cluster has a live leader again. This case replaces an earlier gap:
+  # a single sealer crash used to freeze the pipeline; the Raft cluster
+  # does not.
   #
-  # NOTE: we assert the pipeline keeps progressing, NOT that the leader's memberId
-  # changed. A hard-killed leader's Nomad task can restart fast and RE-WIN the
-  # election (it has the most up-to-date log), so requiring a different memberId
-  # is racy and wrong — "the cluster still commits" is the real resilience proof
-  # (it requires a live leader + quorum regardless of which member leads).
+  # This case checks that the pipeline keeps progressing, not that the
+  # leader's memberId changed. A hard-killed leader's Nomad task can
+  # restart fast and win the election again, since it has the most
+  # up-to-date log. So requiring a different memberId would be flaky and
+  # wrong. "The cluster still commits" is the real proof of resilience:
+  # it needs a live leader and quorum, regardless of which member leads.
   local old_leader leader_node
   old_leader="$(cluster_leader)"
   leader_node="kardamom-sealer-${old_leader}"
   log "cluster-leader-kill: current leader memberId=${old_leader} on ${leader_node}; hard-killing its cluster container"
   inject_hard "${leader_node}" "${CLUSTER_TASK}"
-  # Quorum re-establishes a leader (a different member, or the restarted one
-  # re-winning) → the pipeline resumes committing. assert_executor_progress polls
-  # up to its timeout, covering the election + client redirect window.
+  # Quorum re-establishes a leader, either a different member or the
+  # restarted one winning again. The pipeline resumes committing.
+  # assert_executor_progress polls up to its timeout, covering the
+  # election and client redirect window.
   assert_executor_progress
   log "cluster-leader-kill: pipeline resumed committing after leader kill (now leader memberId=$(cluster_leader 2>/dev/null || echo '?'))"
-  # The killed member's Nomad task restarts (force_pull re-pulls the image) and
-  # rejoins, returning the cluster job to 3 running.
+  # The killed member's Nomad task restarts, with force_pull
+  # re-pulling the image, and rejoins. The cluster job returns to 3
+  # running.
   assert_count "${CLUSTER_TASK}" 3 "${CHAOS_RESTART_SLO_S}"
 }
 
 case_cluster_follower_kill() {
-  # HARD-kill a member that is NOT the leader. Quorum (2/3) is unaffected, so
-  # the pipeline must keep progressing with NO stall — the executor's block
-  # gauge advances throughout. (No new election is required; the leader is
-  # untouched.) The killed member's task then restarts and rejoins (3/3).
+  # Hard-kill a member that is not the leader. Quorum (2/3) is
+  # unaffected, so the pipeline must keep progressing with no stall; the
+  # executor's block gauge advances throughout. No new election is
+  # needed, since the leader is untouched. The killed member's task then
+  # restarts and rejoins (3/3).
   local leader follower fk_r0 fk_t fk_logs still
   leader="$(cluster_leader)"
   # Pick any memberId in 0..2 that isn't the leader.
   for follower in 0 1 2; do [ "${follower}" != "${leader}" ] && break; done
-  # A snapshot must exist BEFORE the kill: an intact-dir restart is where
-  # the sealer's snapshot RESTORE path actually runs (Aeron 1.44 static
-  # membership replays a BLANK member from log position 0 instead — see
-  # cluster-member-rejoin), and before the in-process scheduler existed
-  # this path had never executed outside unit tests.
+  # A snapshot must exist before the kill. An intact-dir restart is
+  # where the sealer's snapshot restore path actually runs. Aeron 1.44
+  # static membership instead replays a blank member from log position
+  # 0 (see cluster-member-rejoin). Before the in-process scheduler
+  # existed, this path had never run outside unit tests.
   log "cluster-follower-kill: leader=memberId=${leader}; waiting for a cluster snapshot"
   fk_t=0
   while :; do
@@ -62,19 +69,21 @@ case_cluster_follower_kill() {
   fk_r0="$(count_log_lines "${CLUSTER_TASK}" "sealer snapshot RESTORED memberId=${follower}" --stdout-only)"
   log "cluster-follower-kill: snapshot present (member ${follower} restore count ${fk_r0}); killing FOLLOWER memberId=${follower} on kardamom-sealer-${follower}"
   inject_hard "kardamom-sealer-${follower}" "${CLUSTER_TASK}"
-  # Quorum holds (2/3): the executor must keep applying blocks with no stall.
+  # Quorum holds (2/3). The executor must keep applying blocks with no
+  # stall.
   assert_executor_progress
-  # Leader must be UNCHANGED (a follower loss does not trigger re-election).
+  # The leader must stay unchanged; a follower loss does not trigger a
+  # re-election.
   still="$(cluster_leader)"
   [ "${still}" = "${leader}" ] \
     && log "cluster-follower-kill: leader unchanged (memberId=${leader}) — quorum held" \
     || log "cluster-follower-kill: WARN leader changed (${leader} -> ${still}); quorum still held, progress OK"
   # Killed follower's task restarts and rejoins (3/3).
   assert_count "${CLUSTER_TASK}" 3 "${CHAOS_RESTART_SLO_S}"
-  # The restarted member's dirs are INTACT, so it must recover by loading
-  # its local latest snapshot — bounded restart time — not by replaying
-  # the whole lifetime log. Count-increase, because earlier restarts in
-  # this shard may have restored already.
+  # The restarted member's directories are intact, so it must recover
+  # by loading its local latest snapshot, a bounded restart time, not by
+  # replaying the whole lifetime log. This checks a count increase,
+  # since earlier restarts in this shard may have already restored.
   wait_log_count_gt "${CLUSTER_TASK}" "sealer snapshot RESTORED memberId=${follower}" \
     "${fk_r0}" 180 10 \
     "cluster-follower-kill: restarted member never logged 'sealer snapshot RESTORED' — the snapshot restore path did not run on an intact-dir restart" \
@@ -83,36 +92,37 @@ case_cluster_follower_kill() {
 }
 
 case_cluster_member_rejoin() {
-  # BLANK-member catch-up drill — the "join mid-way with an empty state"
-  # edge for the RAFT MEMBERS themselves. A follower's cluster dir AND
-  # archive are wiped after its kill, so the restarted member owns
-  # NOTHING. Under Aeron 1.44 STATIC membership a blank member is caught
-  # up by replicating and replaying the leader's LOG FROM POSITION 0 —
-  # snapshots are NOT transferred to blank members (they bound the
-  # restart time of members whose dirs survive; that path is asserted by
-  # cluster-follower-kill). Full log replay is deterministic, so the
-  # correct outcome here is: a FRESH-at-genesis service start, the whole
-  # log replayed (proven via the post-wipe snapshot position reaching the
-  # wipe-time head), 3/3 running,
-  # pipeline unaffected throughout (quorum 2/3 held). First run of this case
-  # proved exactly that (the wiped member replayed to the live head and
-  # resumed serving replay sessions). NOTE the cost this documents: a
-  # blank member's rejoin time grows with the lifetime log — bounding it
-  # needs log purge after snapshot, tracked as audit follow-up.
+  # This is the blank-member catch-up drill: the "join mid-way with an
+  # empty state" edge case for the Raft members themselves. A follower's
+  # cluster directory and archive are wiped after its kill, so the
+  # restarted member owns nothing. Under Aeron 1.44 static membership, a
+  # blank member catches up by replicating and replaying the leader's
+  # log from position 0. Snapshots are not transferred to blank members;
+  # they only bound the restart time of members whose directories
+  # survive, the path cluster-follower-kill checks. Full log replay is
+  # deterministic, so the correct outcome here is: a fresh-at-genesis
+  # service start, the whole log replayed (proven by the post-wipe
+  # snapshot position reaching the wipe-time head), 3/3 running, and the
+  # pipeline unaffected throughout, since quorum (2/3) held. This case
+  # documents a cost: a blank member's rejoin time grows with the
+  # lifetime log. Bounding it needs a log purge after snapshot, tracked
+  # as a follow-up.
   local leader follower f0 f1 t head_at_wipe catchup_block first_block=0 moved=0
   leader="$(cluster_leader)"
   for follower in 0 1 2; do [ "${follower}" != "${leader}" ] && break; done
 
-  # Baseline BEFORE the wipe (a count, not presence: bring-up also logs a
-  # fresh start).
+  # Take a baseline before the wipe. This is a count, not a presence
+  # check, since bring-up also logs a fresh start.
   f0="$(count_log_lines "${CLUSTER_TASK}" "sealer state FRESH at genesis memberId=${follower}" --stdout-only)"
-  # Head at wipe time — the position the blank member must replay back to
-  # before this case may pass (see the catch-up proof below). A REAL reading is
-  # mandatory: executor_progress prints empty when every scrape fails (metric
-  # blackouts are routine right after the previous case's kill), and defaulting
-  # that to 0 would make the proof below vacuous all over again — "replayed to
-  # block >= 0" is satisfied by a member that has done nothing but log
-  # FRESH at genesis. Read it BEFORE any injection, so failing here is clean.
+  # Get the head position at wipe time. This is the position the
+  # blank member must replay back to, before this case can pass (see
+  # the catch-up proof below). A real reading is required.
+  # executor_progress prints empty when every scrape fails, which is
+  # routine right after the previous case's kill. Defaulting that to 0
+  # would make the proof below meaningless again: "replayed to block >=
+  # 0" is true even for a member that has done nothing but log fresh at
+  # genesis. Read this before any injection, so a failure here is
+  # clean.
   head_at_wipe="$(executor_progress || true)"
   { [ -n "${head_at_wipe}" ] && [ "${head_at_wipe}" -gt 0 ]; } \
     || fail "cluster-member-rejoin: could not read the executor head before the wipe (got '${head_at_wipe}') — refusing to run: the catch-up proof needs a real target position or it proves nothing"
@@ -123,64 +133,67 @@ case_cluster_member_rejoin() {
     'rm -rf /opt/kardamom/cluster/* /opt/kardamom/archive/*' \
     || fail "cluster-member-rejoin: could not wipe memberId=${follower} state"
 
-  # Quorum (2/3) holds: the pipeline keeps committing throughout.
+  # Quorum (2/3) holds. The pipeline keeps committing throughout.
   assert_executor_progress
   # The wiped member's task restarts and the job returns to 3/3.
   assert_count "${CLUSTER_TASK}" 3 "${CHAOS_RESTART_SLO_S}"
 
-  # The restarted member must (a) start BLANK — fresh-at-genesis count
+  # The restarted member must start blank. The fresh-at-genesis count
   # grew, proving the wipe took and this is genuinely the empty-state
-  # path — and (b) finish the full log replay.
+  # path. It must also finish the full log replay.
   #
-  # CATCH-UP PROOF (corrected 2026-08-07). The old proof was "the member
-  # logged a NEW 'snapshot TAKEN'", justified as "members snapshot at the
-  # same replicated log position, so a post-rejoin TAKEN means it replayed
-  # to there". That reasoning is INVERTED, and it made this case vacuous.
-  # The SNAPSHOT action is itself an entry in the replicated log, so a
-  # blank member replaying from position 0 RE-EXECUTES every historical
-  # snapshot action and emits `TAKEN block=30`, `TAKEN block=60`, ... as it
-  # goes. Those lines are emitted BECAUSE it is still catching up, not
-  # because it finished. Measured: the case passed in 0s while the member
-  # was ~10 minutes of replay behind the head.
+  # This is the catch-up proof. An earlier version of this check looked
+  # for a new "snapshot TAKEN" log line, on the theory that members
+  # snapshot at the same replicated log position, so a post-rejoin TAKEN
+  # line means it replayed to that point. That reasoning was backward,
+  # and made the check meaningless. The snapshot action is itself an
+  # entry in the replicated log, so a blank member replaying from
+  # position 0 re-executes every historical snapshot action, emitting
+  # `TAKEN block=30`, `TAKEN block=60`, and so on as it goes. Those
+  # lines appear because the member is still catching up, not because
+  # it finished.
   #
-  # That vacuity had teeth: the suite moved on to the next case with one
-  # member minutes from converged. cluster-quorum-loss-recover then kills
-  # sealer-1+sealer-2 (hardcoded), so when the wipe had landed on sealer-0
-  # the ONLY survivor was the un-caught-up member — and the pipeline stayed
-  # flat for the whole remaining replay, blowing that case's SLO. Which
-  # member got wiped depends on who was leader here, so it failed roughly
-  # every other run: the coin flip behind the rotating-shard flakiness.
+  # That gap had real consequences. The suite moved on to the next case
+  # with one member minutes from converged. cluster-quorum-loss-recover
+  # then kills sealer-1 and sealer-2, so when the wipe had landed on
+  # sealer-0, the only survivor was the un-caught-up member. The
+  # pipeline stayed flat for the rest of the replay, and that case
+  # missed its SLO. Which member gets wiped depends on who was leader
+  # here, so this failed roughly every other run.
   #
-  # The real proof is positional: the member's LATEST POST-WIPE snapshot
-  # block must reach the live head. Scoped to lines after the last FRESH
-  # marker so pre-wipe history cannot satisfy it. Replay measured at ~12.5
-  # blocks/s on this host, so CLUSTER_REJOIN_SLO_S covers the log this
-  # suite builds — and a member that never converges now fails HERE, where
-  # the diagnosis is obvious, instead of as a mystery stall two cases
-  # later. (What "never converges" looks like in practice: issue #195, a
-  # join wedge in Election.init/awaitLocalSocketsClosed with the member
-  # frozen INACTIVE after a fast partial replay.)
+  # The real proof is positional: the member's latest post-wipe snapshot
+  # block must reach the live head. This check only looks at lines after
+  # the last FRESH marker, so pre-wipe history cannot satisfy it. Replay
+  # runs at about 12.5 blocks per second on this host, so
+  # CLUSTER_REJOIN_SLO_S covers the log this suite builds. A member that
+  # never converges now fails here, where the cause is clear, instead of
+  # as a mystery stall in a later case. A member that never converges
+  # can get stuck in a join wedge: it fails to bind its catch-up
+  # endpoint, never receives the rest of the log, and stays inactive
+  # after a fast partial replay.
   t=0
   while :; do
     f1="$(count_log_lines "${CLUSTER_TASK}" "sealer state FRESH at genesis memberId=${follower}" --stdout-only)"
-    # Latest TAKEN block emitted AFTER the most recent FRESH-at-genesis for
-    # this member (i.e. from the post-wipe boot only).
+    # Get the latest TAKEN block emitted after the most recent
+    # FRESH-at-genesis for this member, so only the post-wipe boot
+    # counts.
     catchup_block="$(cluster_alloc_logs | awk -v m="${follower}" '
         $0 ~ ("FRESH at genesis memberId=" m) { seen = 1; last = "" }
         seen && $0 ~ ("snapshot TAKEN memberId=" m) { last = $0 }
         END { print last }' \
       | grep -oE 'block=[0-9]+' | cut -d= -f2 || true)"
     catchup_block="${catchup_block:-0}"
-    # Track the FIRST non-zero position and whether it ever moved: the two
-    # failure modes look identical in a single end-of-window number but need
-    # different responses, and measurement says they are cleanly separable
-    # (2026-08-10, 10 runs) — a converging member reaches the head in 10-40s,
-    # a wedged one parks on its first position and never moves again.
+    # Track the first non-zero position, and whether it ever moved. The
+    # two failure modes look identical in a single end-of-window number,
+    # but need different responses. A converging member reaches the
+    # head in 10 to 40 seconds. A wedged member parks on its first
+    # position and never moves again.
     [ "${catchup_block}" -gt 0 ] && [ "${first_block:-0}" -eq 0 ] && first_block="${catchup_block}"
     [ "${catchup_block}" -gt "${first_block:-0}" ] && moved=1
-    # Converged when the replayed position reaches the head observed at
-    # wipe time (the head keeps advancing under load; reaching the wipe-time
-    # head proves the whole pre-existing log was replayed).
+    # The member has converged once its replayed position reaches the
+    # head observed at wipe time. The head keeps advancing under load,
+    # so reaching the wipe-time head proves the whole pre-existing log
+    # was replayed.
     [ "${f1}" -gt "${f0}" ] && [ "${catchup_block}" -ge "${head_at_wipe}" ] && break
     sleep 10; t=$(( t + 10 ))
     if [ "${t}" -ge "${CLUSTER_REJOIN_SLO_S}" ]; then
@@ -196,35 +209,41 @@ case_cluster_member_rejoin() {
 }
 
 case_cluster_quorum_loss_recover() {
-  # Kill TWO WHOLE sealer NODE containers (docker kill the kardamom-sealer-X
-  # containers themselves, not the inner task): Nomad on those nodes is gone
-  # too, so the inner cluster tasks CANNOT restart there → only 1 member left →
-  # Raft quorum (needs 2/3) is LOST. The pipeline MUST stall (no false progress:
-  # the executor's block gauge stays flat). Then bring ONE node back (docker
-  # start): quorum (2/3) returns, a leader is re-elected, progress RESUMES, and
-  # the backlog drains gaplessly (load verdict PASS). Generous SLOs: a node
-  # restart re-pulls images, so use CHAOS_RESCHEDULE_SLO_S for the rejoin.
+  # Kill two whole sealer node containers: docker kill the
+  # kardamom-sealer-X containers themselves, not just the inner task.
+  # Nomad on those nodes is gone too, so the inner cluster tasks cannot
+  # restart there, leaving only 1 member. Raft quorum, which needs 2/3,
+  # is lost. The pipeline must stall, with no false progress: the
+  # executor's block gauge stays flat. Then bring one node back with
+  # docker start. Quorum (2/3) returns, a leader is re-elected, progress
+  # resumes, and the backlog drains with no gaps (load verdict PASS).
+  # These SLOs are generous, since a node restart re-pulls images, so
+  # this uses CHAOS_RESCHEDULE_SLO_S for the rejoin.
   local victims=(kardamom-sealer-1 kardamom-sealer-2)
   log "cluster-quorum-loss-recover: docker kill TWO sealer nodes (${victims[*]}) → quorum lost (1/3 up)"
   kill_node "${victims[@]}"
-  # Quorum lost → the pipeline must STALL (no commits, executor gauge flat).
+  # Quorum is lost, so the pipeline must stall: no commits, and the
+  # executor gauge stays flat.
   assert_executor_stalled 15
   log "cluster-quorum-loss-recover: docker start ${victims[0]} (quorum 2/3 returns)"
   docker start "${victims[0]}" >/dev/null || fail "could not restart node ${victims[0]}"
-  # Its cluster task reschedules + rejoins → quorum restored. Give it the
-  # reschedule SLO (image re-pull). count_running counts the `cluster` allocs.
+  # Its cluster task reschedules and rejoins, restoring quorum. Give
+  # it the reschedule SLO, to allow for an image re-pull. count_running
+  # counts the `cluster` allocs.
   assert_count "${CLUSTER_TASK}" 2 "${CHAOS_RESCHEDULE_SLO_S}"
-  # With quorum back, the executor must resume applying blocks (drains backlog).
-  # WIDE timeout — this is the one case where the clients' cluster SESSIONS
-  # die (a >15s total outage exceeds the session timeout; leader-kill keeps
-  # sessions alive via NewLeaderEvent redirect). Observed on CI: re-election
-  # + client session re-establishment alone takes ~50s after the node
-  # restart, and the reopened sessions then replay the canonical stream from
-  # the log before NEW commits surface on the executor's block gauge. 60s
-  # timed out reproducibly (3/3 runs, sessions reopening ~40s in); 180s
-  # covers re-election + reconnect + replay with margin.
+  # With quorum back, the executor must resume applying blocks and
+  # drain the backlog. This case uses a wide timeout: it is the one case
+  # where the clients' cluster sessions die, since an outage over 15
+  # seconds exceeds the session timeout (leader-kill instead keeps
+  # sessions alive through a NewLeaderEvent redirect). Re-election plus
+  # client session re-establishment alone can take about 50 seconds
+  # after the node restart. The reopened sessions then replay the
+  # canonical stream from the log before new commits show up on the
+  # executor's block gauge. 60 seconds timed out reliably in testing;
+  # 180 seconds covers re-election, reconnect, and replay with margin.
   assert_executor_progress 180
-  # Restore the second node too so the suite leaves a healthy 3/3 cluster for
-  # any subsequent cases (best-effort; not asserted as part of this case's SLO).
+  # Restore the second node too, so the suite leaves a healthy 3/3
+  # cluster for later cases. This is best-effort, and not part of this
+  # case's SLO.
   docker start "${victims[1]}" >/dev/null 2>&1 || true
 }

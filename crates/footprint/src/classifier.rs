@@ -1,35 +1,32 @@
-//! Footprint classifier: per `(to, selector)`, learn which state cells a
-//! call touches, from the slot addresses the BAL already reports.
+//! Footprint classifier: for each `(to, selector)` pair, learn which state
+//! cells a call touches, from the slot addresses the BAL already reports.
 //!
-//! HISTORY, because the simplification is the interesting part: this began
-//! by recovering mapping base-slots through keccak INVERSION — testing
-//! observed slots against `keccak(pad(sender|arg) ++ pad(p))` for small
-//! `p` — so that a mapping entry could be predicted for a caller never
-//! seen before. That machinery was measured and REMOVED: it changed no
-//! schedule on any workload (identical critical-path ratios, zero missed
-//! pairs, on uniswap at 96/24/12 senders, plain transfers, and the
-//! CLOB-heavy worst case), while costing 93% of all CPU before caching.
+//! An earlier version recovered mapping base slots by keccak inversion:
+//! it tested observed slots against `keccak(pad(sender|arg) ++ pad(p))` for
+//! small `p`, so a mapping entry could be predicted for a caller never seen
+//! before. Measurement removed this: it changed no schedule on any
+//! workload, while it cost most of the CPU time before caching.
 //!
-//! Two txs share a derived key only when they touch the SAME mapping
-//! entry, and in practice such pairs already share something the cheap
-//! tiers predict — the pool's fixed reserve slots, or their own sender
-//! accounts. So derived keys generated cells that never matched between
-//! transactions: pure cost, no edges.
+//! Two txs share a derived key only when they touch the same mapping
+//! entry. In practice such pairs already share something the cheap tiers
+//! predict: the pool's fixed reserve slots, or their own sender accounts.
+//! So derived keys produced cells that never matched between transactions:
+//! cost with no benefit.
 //!
 //! What remains needs no hashing at all:
-//! - TIER 1, from the envelope: the sender's account cell, and the
-//!   recipient's when value moves.
-//! - TIER 3, from the BAL: slot addresses a selector touches on most
-//!   calls. A fixed slot has the SAME address every call, so the observed
-//!   hash IS the key.
+//! - Tier 1, from the envelope: the sender's account cell, and the
+//!   recipient's account cell when value moves.
+//! - Tier 3, from the BAL: slot addresses a selector touches on most
+//!   calls. A fixed slot has the same address every call, so the observed
+//!   hash is the key.
 //!
-//! The cost of being wrong is bounded and self-reporting: a footprint the
-//! classifier cannot predict becomes a missed edge, which the engine
-//! repairs by wounding that one tx, and which the P1 shadow counts as
-//! `footprint_false_independent_total`. If a workload ever appears whose
-//! contention IS a shared mapping entry with nothing else in common (many
-//! txs crediting one recipient; an airdrop claim), that counter is where
-//! it will show up first.
+//! The cost of a wrong prediction is bounded and visible: a footprint the
+//! classifier cannot predict becomes a missed edge. The engine repairs this
+//! by wounding that one tx, and the shadow scheduler counts it as
+//! `footprint_false_independent_total`. If a workload's contention is a
+//! shared mapping entry with nothing else in common (for example, many
+//! txs crediting one recipient, as in an airdrop claim), this counter is
+//! where it shows up first.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -37,43 +34,45 @@ use alloy_primitives::{Address, B256};
 
 use crate::{Cell, TxObs};
 
-/// A SCHEDULING key: the identity of a contention domain.
+/// A scheduling key: the identity of a contention domain.
 ///
 /// Two txs conflict when they name the same key, which is all the
 /// scheduler ever asks. Both variants come straight from what is already
 /// known — the envelope, or a slot address the BAL reported — so building
-/// one costs no hashing at all.
+/// one needs no hashing at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DomainKey {
-    /// Account cell (balance+nonce): tier-1 sender/recipient, fee sink.
+    /// Account cell (balance and nonce): tier-1 sender or recipient, or a
+    /// fee sink.
     Account(Address),
     /// A slot this selector touches on most calls, at the address the BAL
     /// reported. Fixed slots have the same address every call, so the
-    /// observed hash IS the key — no formula, no inversion.
+    /// observed hash is the key — no formula, no inversion.
     Fixed(Address, B256),
 }
 
-/// Learned footprint of one `(to, selector)`.
+/// Learned footprint of one `(to, selector)` pair.
 #[derive(Debug, Default, Clone)]
 pub struct SelectorStats {
     pub observations: u64,
     /// Slot addresses seen, with counts. A slot present on most calls is
-    /// FIXED (predicted); one that appears rarely is footprint this
+    /// fixed (predicted). One that appears rarely is footprint this
     /// classifier does not model — a missed edge at worst, wound-repaired.
     pub slot_seen: BTreeMap<(Address, B256), u64>,
-    /// Total slot-observations (denominator for shares).
+    /// Total slot observations (denominator for shares).
     pub slot_obs: u64,
     /// Accounts touched, with counts — the fee-sink-style hot accounts.
     pub account_seen: BTreeMap<Address, u64>,
 }
 
-/// Live-stats entry cap (spec "Stats footprint"): bounded cardinality
-/// whose eviction is free BY CONSTRUCTION — a cold selector schedules as
-/// `Tail` with or without stats, so entries the cap refuses lose nothing.
+/// Live-stats entry cap (spec "Stats footprint"): a bounded cardinality
+/// whose eviction costs nothing by construction. A cold selector schedules
+/// as `Tail` with or without stats, so entries the cap refuses lose nothing.
 const MAX_SELECTORS: usize = 16_384;
 
-/// Aggregate stats over observations. Batch (`learn`) for the offline lab,
-/// incremental (`learn_obs`) for the live shadow — one code path.
+/// Aggregate stats over observations. `learn` runs in batch for the offline
+/// lab; `learn_obs` runs incrementally for the live shadow. Both share one
+/// code path.
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
     pub by_selector: HashMap<(Address, [u8; 4]), SelectorStats>,
@@ -89,9 +88,9 @@ impl Stats {
     }
 
     /// Fold one observation into the stats: one map operation per touched
-    /// cell, no hashing. At the entry cap, unseen selectors are NOT
-    /// inserted — they stay cold and schedule as `Tail`, which is exactly
-    /// what eviction would cost.
+    /// cell, no hashing. At the entry cap, an unseen selector is not
+    /// inserted. It stays cold and schedules as `Tail`, at the same cost
+    /// eviction would have.
     pub fn learn_obs(&mut self, o: &TxObs) {
         let (Some(to), Some(sel)) = (o.to, o.selector) else {
             return;
@@ -115,30 +114,30 @@ impl Stats {
     }
 
     /// Predict the cell set of a holdout observation from learned
-    /// formulas + fixed slots. Returns None when the selector was never
-    /// trained (cold — Tail in the scheduler).
+    /// formulas and fixed slots. Returns `None` when the selector was never
+    /// trained (cold — `Tail` in the scheduler).
     pub fn predict(&self, o: &TxObs) -> Option<BTreeSet<Cell>> {
         let mut cells = BTreeSet::new();
-        // Tier-1 exact (always available from the envelope).
+        // Tier 1, exact: always available from the envelope.
         cells.insert(Cell::Account(o.sender));
         if o.has_value
             && let Some(to) = o.to
         {
             cells.insert(Cell::Account(to));
         }
-        // A selector-less tx (native transfer / create) is FULLY covered
-        // by tier-1 — exact, no stats needed, never cold.
+        // A tx with no selector (native transfer or create) is fully
+        // covered by tier 1: exact, no stats needed, never cold.
         let (Some(to), Some(sel)) = (o.to, o.selector) else {
             return Some(cells);
         };
         let e = self.by_selector.get(&(to, sel))?;
-        // Fixed slots: seen in >=60% of observations.
+        // Fixed slots: seen in at least 60% of observations.
         for ((addr, slot), n) in &e.slot_seen {
             if *n * 10 >= e.observations * 6 {
                 cells.insert(Cell::Slot(*addr, *slot));
             }
         }
-        // Frequently-touched accounts (fee-sink style) predict as touched.
+        // Frequently touched accounts (fee-sink style) predict as touched.
         for (a, n) in &e.account_seen {
             if *n * 10 >= e.observations * 6 {
                 cells.insert(Cell::Account(*a));
@@ -147,11 +146,12 @@ impl Stats {
         Some(cells)
     }
 
-    /// Predict the SCHEDULING domains of a tx — the hot-path predictor.
+    /// Predict the scheduling domains of a tx: the hot-path predictor.
     /// Same structure as [`Stats::predict`] (same tiers, same cold
-    /// semantics: `None` = untrained selector = ⊤), but it names mapping
-    /// entries symbolically instead of hashing them, which is what keeps
-    /// admission cheap enough to stay off the critical path.
+    /// semantics: `None` means an untrained selector conflicts with
+    /// everything), but it names mapping entries symbolically instead of
+    /// hashing them. This keeps admission cheap enough to stay off the
+    /// critical path.
     pub fn predict_domains(&self, o: &TxObs) -> Option<Vec<DomainKey>> {
         let mut keys: Vec<DomainKey> = Vec::with_capacity(8);
         keys.push(DomainKey::Account(o.sender));
@@ -161,8 +161,8 @@ impl Stats {
             keys.push(DomainKey::Account(to));
         }
         let (Some(to), Some(sel)) = (o.to, o.selector) else {
-            // Selector-less (native transfer / create): tier-1 is the
-            // whole footprint — exact, never cold.
+            // A tx with no selector (native transfer or create): tier 1 is
+            // the whole footprint, exact and never cold.
             keys.sort_unstable();
             keys.dedup();
             return Some(keys);
@@ -208,7 +208,7 @@ mod tests {
 
     const POOL: Address = address!("00000000000000000000000000000000000000E0");
     const SEL: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
-    /// A slot every call of this selector touches — a pool's reserves.
+    /// A slot every call of this selector touches: a pool's reserves.
     const RESERVES: B256 = B256::with_last_byte(3);
 
     fn addr(i: u8) -> Address {
@@ -217,7 +217,7 @@ mod tests {
         Address::from(b)
     }
 
-    /// A swap-shaped observation: the sender's account, plus the pool's
+    /// A swap-shaped observation: the sender's account, and the pool's
     /// fixed reserve slot that every call touches.
     fn swap_obs(index: u64, sender: Address) -> TxObs {
         TxObs {
@@ -234,8 +234,8 @@ mod tests {
         }
     }
 
-    /// The property the whole design rests on now: a slot touched by most
-    /// calls is predicted from its OBSERVED address, for a caller the
+    /// The property the whole design rests on: a slot touched by most
+    /// calls is predicted from its observed address, even for a caller the
     /// classifier has never seen.
     #[test]
     fn fixed_slot_predicts_for_an_unseen_sender() {
@@ -256,8 +256,8 @@ mod tests {
         assert!(d.contains(&DomainKey::Account(addr(200))));
     }
 
-    /// Two calls of the same selector name the same fixed domain — which
-    /// is what chains them — while their sender domains stay distinct.
+    /// Two calls of the same selector name the same fixed domain. This is
+    /// what chains them, while their sender domains stay distinct.
     #[test]
     fn same_domain_for_the_pool_distinct_for_senders() {
         let mut stats = Stats::default();
@@ -274,9 +274,9 @@ mod tests {
         );
     }
 
-    /// A slot seen on only a few calls is NOT predicted — the classifier
-    /// does not model it, so it becomes a missed edge the engine wounds
-    /// rather than a false one that serialises.
+    /// A slot seen on only a few calls is not predicted. The classifier
+    /// does not model it, so it becomes a missed edge the engine wounds,
+    /// rather than a false one that forces serial order.
     #[test]
     fn rare_slot_is_not_predicted() {
         let mut stats = Stats::default();

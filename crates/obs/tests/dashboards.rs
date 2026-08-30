@@ -1,7 +1,7 @@
 //! Static validity check for every dashboard JSON shipped in
-//! `deploy/grafana/provisioning/dashboards-json/`. Cheap to run, catches
-//! typos at authoring time (mis-spelled metric names, missing `host` filter,
-//! drift from schema 38).
+//! `deploy/grafana/provisioning/dashboards-json/`. This is cheap to run and
+//! catches authoring mistakes: misspelled metric names, a missing `host`
+//! filter, or drift from schema 38.
 
 use std::path::PathBuf;
 
@@ -39,9 +39,9 @@ fn every_dashboard_is_present_valid_and_schema_38() {
                 "{path:?} panel[{i}] missing title"
             );
             // Every PromQL target must be kardamom-scoped: either a
-            // kardamom_* metric or a kardamom-* job selector (e.g. the
-            // overview's `up{job=~"kardamom-.+"}` liveness panel). Text
-            // panels have no targets (skip them).
+            // kardamom_* metric or a kardamom-* job selector (for example,
+            // the overview's `up{job=~"kardamom-.+"}` liveness panel). Text
+            // panels have no targets, so skip them.
             let panel_type = p["type"].as_str().unwrap_or("");
             if panel_type == "text" {
                 continue;

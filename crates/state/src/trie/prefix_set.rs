@@ -1,11 +1,12 @@
-//! The set of changed key-prefixes for one block, used by the walker to decide
-//! which subtries to descend into vs skip.
+//! The set of changed key-prefixes for one block. The walker uses this
+//! to decide which subtries to descend into, and which to skip.
 
 use alloy_primitives::B256;
 use alloy_trie::Nibbles;
 
-/// Sorted, deduped set of changed keys (as full nibble paths). `contains_prefix`
-/// answers "does any changed key live under this subtrie path?".
+/// A sorted, deduplicated set of changed keys, as full nibble paths.
+/// `contains_prefix` answers: does any changed key live under this
+/// subtrie path?
 #[derive(Debug, Default, Clone)]
 pub struct PrefixSet {
     keys: Vec<Nibbles>,
@@ -23,8 +24,8 @@ impl PrefixSet {
         Self { keys }
     }
 
-    /// Build from nibble paths directly — proof-generation targets may be
-    /// PARTIAL paths (a node position from the capture fixed point), which
+    /// Build from nibble paths directly. Proof-generation targets may be
+    /// partial paths, a node position from the capture fixed point, which
     /// force the walker to descend exactly that far.
     pub fn from_nibbles(it: impl IntoIterator<Item = Nibbles>) -> Self {
         let mut keys: Vec<Nibbles> = it.into_iter().collect();
@@ -37,9 +38,10 @@ impl PrefixSet {
         self.keys.is_empty()
     }
 
-    /// True iff some changed key starts with `prefix` (i.e. the subtrie rooted at
-    /// `prefix` contains a change). Keys are sorted, so the changed keys under
-    /// `prefix` form a contiguous range; check the first key `>= prefix`.
+    /// Returns true if some changed key starts with `prefix`. This means
+    /// the subtrie rooted at `prefix` contains a change. Keys are sorted,
+    /// so the changed keys under `prefix` form a contiguous range. This
+    /// checks the first key that is `>= prefix`.
     pub fn contains_prefix(&self, prefix: &Nibbles) -> bool {
         let i = self.keys.partition_point(|k| k < prefix);
         self.keys.get(i).is_some_and(|k| k.starts_with(prefix))
@@ -57,13 +59,13 @@ mod tests {
     #[test]
     fn contains_prefix_matches_changed_keys() {
         let ps = PrefixSet::from_b256s([h(0xab), h(0xcd)]);
-        // 0xab... -> first nibble 0xa
+        // 0xab... has first nibble 0xa.
         assert!(ps.contains_prefix(&Nibbles::from_nibbles([0xa])));
         assert!(ps.contains_prefix(&Nibbles::from_nibbles([0xa, 0xb])));
         assert!(ps.contains_prefix(&Nibbles::from_nibbles([0xc])));
-        // no changed key under 0x0
+        // No changed key is under 0x0.
         assert!(!ps.contains_prefix(&Nibbles::from_nibbles([0x0])));
-        // empty prefix (root) always matches when non-empty
+        // The empty prefix, the root, always matches when the set is not empty.
         assert!(ps.contains_prefix(&Nibbles::new()));
     }
 

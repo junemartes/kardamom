@@ -1,8 +1,9 @@
-//! THE P2 invariant (spec "Invariants" #1): byte-identical receipts +
-//! delta vs sequential execution — same write-set hashes (accumulator
-//! fixup included), same cumulative gas, same logs — regardless of
-//! schedule quality, worker count, or interleaving. Prediction quality
-//! may only ever cost throughput (fallback), never bytes.
+//! Invariant #1: receipts and the delta must
+//! be byte-identical to sequential execution. This means the same
+//! write-set hashes (accumulator fixup included), the same cumulative
+//! gas, and the same logs, regardless of schedule quality, worker count,
+//! or interleaving. Prediction quality may only ever cost throughput
+//! (fallback), never bytes.
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
@@ -19,8 +20,9 @@ use kardamom_stm::execute::{execute_block_sequential, execute_block_stm};
 use kardamom_types::{BPosition, TxEnvelope};
 
 const CHAIN_ID: u64 = 412346;
-/// SLOAD s0, PUSH1 1, ADD, PUSH1 0, SSTORE, STOP — an RMW counter: the
-/// result depends on execution order, so any ordering bug changes bytes.
+/// SLOAD s0, PUSH1 1, ADD, PUSH1 0, SSTORE, STOP: a read-modify-write
+/// counter. The result depends on execution order, so any ordering bug
+/// changes the bytes.
 const COUNTER: Address = Address::with_last_byte(0xC0);
 const COUNTER_CODE: [u8; 10] = [0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00];
 const COUNTER_SEL: [u8; 4] = [0xAA, 0xBB, 0xCC, 0xDD];
@@ -105,8 +107,8 @@ fn assert_identical(
     assert_eq!(seq.1.code, stm_delta.code, "{label}: delta code must match");
 }
 
-/// Stats that KNOW the counter selector writes the fixed slot 0 — the
-/// trained/predicted-conflict path (chained, no fallback expected).
+/// Stats that know the counter selector writes the fixed slot 0: the
+/// trained, predicted-conflict path. Expect a chain, and no fallback.
 fn counter_stats() -> Stats {
     let obs: Vec<TxObs> = (0..4)
         .map(|i| TxObs {
@@ -129,8 +131,8 @@ fn counter_stats() -> Stats {
 fn transfers_byte_identical_across_worker_counts() {
     let sg = signers(4);
     let database = db(&sg);
-    // Interleaved same-sender chains + cross transfers, value flows that
-    // depend on order within a chain.
+    // Interleaved same-sender chains and cross transfers, with value
+    // flows that depend on order within a chain.
     let envs = vec![
         tx(&sg[0], 0, TxKind::Call(sg[1].address()), 500, &[]),
         tx(&sg[1], 0, TxKind::Call(sg[2].address()), 300, &[]),
@@ -159,8 +161,8 @@ fn transfers_byte_identical_across_worker_counts() {
 fn trained_contention_chains_and_matches() {
     let sg = signers(3);
     let database = db(&sg);
-    // Three RMW increments of the SAME slot from distinct senders — the
-    // canonical order is the only correct result (1, 2, 3).
+    // Three read-modify-write increments of the same slot from distinct
+    // senders. The canonical order is the only correct result (1, 2, 3).
     let envs = vec![
         tx(&sg[0], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL),
         tx(&sg[1], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL),
@@ -175,10 +177,10 @@ fn trained_contention_chains_and_matches() {
             !out.fallback,
             "trained fixed-slot conflict must schedule as a chain, not convict"
         );
-        // The new expression of "the counter chain exists": all three
-        // contending txs hash to the SAME domain, so they land on ONE
-        // worker queue and execute in canonical FIFO order — no
-        // cross-thread coordination needed for the common conflict.
+        // This shows the counter chain exists: all three contending
+        // transactions hash to the same domain, so they land on one
+        // worker queue and execute in canonical FIFO order. No
+        // cross-thread coordination is needed for this common conflict.
         assert_eq!(
             out.dispatch.iter().filter(|c| **c > 0).count(),
             1,
@@ -193,7 +195,7 @@ fn trained_contention_chains_and_matches() {
             &format!("counter w={workers}"),
         );
     }
-    // Final state check against the semantics: slot0 == 3.
+    // Final state check against the semantics: slot 0 must equal 3.
     let key = (COUNTER, B256::ZERO);
     assert_eq!(seq.1.storage.get(&key), Some(&U256::from(3u64)));
 }
@@ -202,8 +204,8 @@ fn trained_contention_chains_and_matches() {
 fn cold_calls_are_barriers_and_match() {
     let sg = signers(3);
     let database = db(&sg);
-    // No stats at all: the counter calls are COLD (selector never seen) —
-    // barriers serialize them at their canonical positions.
+    // No stats at all: the counter calls are cold (their selector was
+    // never seen). Barriers serialize them at their canonical positions.
     let envs = vec![
         tx(&sg[0], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL),
         tx(&sg[1], 0, TxKind::Call(sg[2].address()), 100, &[]),
@@ -219,9 +221,10 @@ fn cold_calls_are_barriers_and_match() {
 
 #[test]
 fn wrongly_trained_stats_still_produce_identical_bytes() {
-    // Stats claim the counter writes a SENDER-DERIVED slot (false: it
-    // writes fixed slot 0) ⇒ predicted-independent ⇒ races are possible;
-    // validation + fallback must keep the bytes identical on every rep.
+    // Stats falsely claim the counter writes a sender-derived slot (it
+    // actually writes fixed slot 0), so the predictor sees the
+    // transactions as independent and races become possible. Validation
+    // and fallback must keep the bytes identical on every repetition.
     let sg = signers(4);
     let database = db(&sg);
     let lying_stats = {
@@ -269,8 +272,9 @@ fn wrongly_trained_stats_still_produce_identical_bytes() {
             &format!("lying stats rep={rep}"),
         );
     }
-    // Not asserted — a fast machine may win every race — but visible when
-    // it happens: the fallback path itself produced identical bytes above.
+    // Not asserted, since a fast machine may win every race, but visible
+    // when it happens: the fallback path itself produced identical bytes
+    // above.
     eprintln!("lying-stats reps: {fallbacks}/25 fell back");
 }
 
@@ -278,7 +282,7 @@ fn wrongly_trained_stats_still_produce_identical_bytes() {
 fn deploy_then_call_in_one_block_matches() {
     let sg = signers(2);
     let database = db(&sg);
-    // Init code deploying the SLOAD runtime [60 00 54 00]:
+    // Init code that deploys the SLOAD runtime [60 00 54 00]:
     // PUSH4 runtime, PUSH1 0, MSTORE, PUSH1 4, PUSH1 28, RETURN.
     let init: &[u8] = &[
         0x63, 0x60, 0x00, 0x54, 0x00, 0x60, 0x00, 0x52, 0x60, 0x04, 0x60, 0x1c, 0xf3,
@@ -286,10 +290,10 @@ fn deploy_then_call_in_one_block_matches() {
     let created = sg[0].address().create(0);
     let envs = vec![
         tx(&sg[0], 0, TxKind::Create, 0, init),
-        // A different sender calls the just-created contract — the
-        // in-block deploy-then-call shape (the burst-block lesson). The
-        // predictor cannot see the dependency (tier-2 stats don't exist
-        // for a brand-new address); validation must catch any race.
+        // A different sender calls the just-created contract: the
+        // in-block deploy-then-call shape. The predictor cannot see the
+        // dependency, since tier-2 stats do not exist for a brand-new
+        // address, so validation must catch any race.
         tx(&sg[1], 0, TxKind::Call(created), 0, &[]),
     ];
     let recs = records(envs);
@@ -332,20 +336,20 @@ fn base_delta_layer_is_visible() {
     assert_identical(&seq, &out.receipts, &out.delta, "base layer");
 }
 
-/// The scheduler's structural invariant: every admitted tx occupies
-/// exactly ONE node and leaves the graph exactly ONCE. Registering twice
-/// is unreachable through the public API (the local index comes from the
-/// session's own counter, so no caller can name an occupied slot), and
-/// leaving twice is counted rather than assumed — `double_exit` must be
-/// zero, because a second exit would strand every edge registered in
-/// between and hang the block.
+/// The scheduler's structural invariant: every admitted transaction
+/// occupies exactly one node and leaves the graph exactly once.
+/// Registering twice is unreachable through the public API, because the
+/// local index comes from the session's own counter, so no caller can
+/// name an occupied slot. Leaving twice is counted rather than assumed:
+/// `double_exit` must be zero, since a second exit would strand every
+/// edge registered in between and hang the block.
 #[test]
 fn each_tx_occupies_one_node_and_exits_once() {
     use kardamom_stm::execute::{PoolConfig, with_pool};
     let sg = signers(4);
     let database = db(&sg);
     // Same sender repeatedly (one chain), distinct senders (independent),
-    // and cold calls (barriers) — every admission path in one block.
+    // and cold calls (barriers): every admission path in one block.
     let envs = vec![
         tx(&sg[0], 0, TxKind::Call(sg[1].address()), 10, &[]),
         tx(&sg[0], 1, TxKind::Call(sg[2].address()), 10, &[]),
@@ -383,10 +387,11 @@ fn each_tx_occupies_one_node_and_exits_once() {
     assert_eq!(out.double_exit, 0, "no tx may leave the graph twice");
 }
 
-/// Every admitted tx leaves the graph, so a block always drains — and if a
-/// future change ever strands an edge, `seal` fail-stops with diagnostics
-/// instead of freezing the exec thread. This pins the healthy path: a
-/// block with barriers, chains and independent work drains promptly.
+/// Every admitted transaction leaves the graph, so a block always drains.
+/// If a future change ever strands an edge, `seal` fail-stops with
+/// diagnostics instead of freezing the execution thread. This test pins
+/// the healthy path: a block with barriers, chains, and independent work
+/// drains promptly.
 #[test]
 fn every_block_drains() {
     use kardamom_stm::execute::{PoolConfig, with_pool};
@@ -428,16 +433,15 @@ fn every_block_drains() {
     assert_identical(&seq, &out.receipts, &out.delta, "drain");
 }
 
-/// The pool must never be a pessimization. Plain transfers cost far less
-/// per transaction than parallel execution costs to coordinate, so once
-/// the pool has MEASURED that, it declines the block and runs it
-/// sequentially — and the result is still byte-identical, because
-/// declining routes through the sequential executor itself rather than a
-/// second implementation of it.
+/// The pool must never make things worse. Plain transfers cost far less
+/// per transaction than parallel execution costs to coordinate. Once the
+/// pool measures that, it declines the block and runs it sequentially.
+/// The result is still byte-identical, because declining routes through
+/// the sequential executor itself, not a second implementation of it.
 ///
-/// The threshold is INJECTED rather than left at its measured default:
-/// the gate is a timing decision, and a test that depends on how loaded
-/// the machine is would pass alone and fail in a parallel test run — as
+/// The threshold is injected rather than left at its measured default.
+/// The gate is a timing decision, and a test that depends on how loaded
+/// the machine is would pass alone and fail in a parallel test run, as
 /// the first version of this test did.
 #[test]
 fn cheap_blocks_are_declined_and_still_match() {
@@ -462,8 +466,8 @@ fn cheap_blocks_are_declined_and_still_match() {
         PoolConfig {
             workers: 4,
             prune_batch: 8,
-            // No amount of work per tx is ever "worth it" — so the only
-            // block that runs in parallel is the one taken before any
+            // No amount of work per transaction is ever "worth it", so the
+            // only block that runs in parallel is the one taken before any
             // measurement exists.
             parallel_worth_ns: u64::MAX,
             ..Default::default()
@@ -496,17 +500,17 @@ fn cheap_blocks_are_declined_and_still_match() {
 
     assert!(declined, "the pool should have declined rather than lose");
     assert_identical(&seq2, &receipts, &delta, "declined block");
-    // The trap door: a declined block MUST still teach the pool what a
-    // transaction costs, or one cheap block disables the engine for the
-    // rest of the run.
+    // The trap door: a declined block must still teach the pool what a
+    // transaction costs. Otherwise one cheap block disables the engine
+    // for the rest of the run.
     assert!(
         learned > 0,
         "declining stopped the measurement — the gate can never reopen"
     );
 }
 
-/// With the gate wide open the pool always executes in parallel, so the
-/// decline path is a policy and not a silent behaviour change.
+/// With the gate wide open, the pool always executes in parallel, so the
+/// decline path is a policy choice, not a silent change in behavior.
 #[test]
 fn an_open_gate_never_declines() {
     use kardamom_stm::execute::{PoolConfig, with_pool};
@@ -548,11 +552,12 @@ fn an_open_gate_never_declines() {
     );
 }
 
-/// EAGER CHAIN MODE: a hot domain's chain must stream into its owner's
-/// FIFO at admission — ordered by queue position, not by edges — and
-/// still be byte-identical. The RMW counter makes any ordering mistake
-/// visible in state (the final count and every intermediate receipt
-/// depend on execution order), so this cannot pass by luck.
+/// Eager chain mode: a hot domain's chain must stream into its owner's
+/// FIFO at admission, ordered by queue position instead of by edges, and
+/// still be byte-identical. The read-modify-write counter makes any
+/// ordering mistake visible in state, since the final count and every
+/// intermediate receipt depend on execution order, so this cannot pass
+/// by luck.
 #[test]
 fn hot_chain_streams_through_the_fifo() {
     let sg = signers(3);
@@ -567,19 +572,19 @@ fn hot_chain_streams_through_the_fifo() {
     let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
     let stats = counter_stats();
     for workers in [1, 4] {
-        // The classification asserts below need the STREAMING shape: the
-        // feed admitting links while their predecessors are still queued.
+        // The classification asserts below need the streaming shape: the
+        // feed admits links while their predecessors are still queued.
         // Workers legitimately outrun the feed when the host deschedules
-        // the feed thread — predecessors then complete before admission
-        // (the engine's "p already finished and published — no edge
-        // needed" path) and both counters degrade with no engine fault.
-        // Correctness is asserted on EVERY attempt; the streaming shape
-        // on at least one.
+        // the feed thread. Predecessors then complete before admission
+        // (the engine's "p already finished and published, no edge
+        // needed" path), and both counters degrade with no engine fault.
+        // Correctness is asserted on every attempt; the streaming shape
+        // is asserted on at least one.
         let mut shaped = false;
         for _attempt in 0..20 {
-            // This test pins the LEGACY FIFO scheduler's mechanics
-            // (eager coverage, single-worker domains); the bag scheduler
-            // has neither and is pinned by `bag_hot_chain_byte_identical`.
+            // This test pins the legacy FIFO scheduler's mechanics
+            // (eager coverage, single-worker domains). The bag scheduler
+            // has neither; it is pinned by `bag_hot_chain_byte_identical`.
             let out = kardamom_stm::execute::with_pool(
                 kardamom_stm::execute::PoolConfig {
                     workers,
@@ -610,9 +615,10 @@ fn hot_chain_streams_through_the_fifo() {
                 &out.delta,
                 &format!("eager chain w={workers}"),
             );
-            // The point of eager mode: links seen PENDING on the same
-            // worker are FIFO-covered, not edged — 23 counter links +
-            // sender links, minus whatever completed at admission.
+            // The point of eager mode: links seen pending on the same
+            // worker are FIFO-covered, not edged. That is 23 counter
+            // links plus sender links, minus whatever completed at
+            // admission.
             if out.fifo_covered >= 20 && out.edges <= 4 {
                 shaped = true;
                 break;
@@ -627,17 +633,19 @@ fn hot_chain_streams_through_the_fifo() {
     assert_eq!(seq.1.storage.get(&key), Some(&U256::from(24u64)));
 }
 
-/// STREAMING RELEASE (spec P3): `submit_streaming` ships the folded
-/// delta before receipts — and, speculatively, before the validation
-/// verdict. Invariants pinned here, per rep and mode:
-/// - wounds == 0  ⇒ exactly ONE release, not corrected;
-/// - wounds  > 0  ⇒ speculative mode sends TWO (stale speculative, then
-///   corrected), conservative sends ONE (already-final);
-/// - the LAST release always byte-equals the outcome's delta;
-/// - receipts + delta stay byte-identical to sequential in every case.
+/// Streaming release: `submit_streaming` ships the folded delta
+/// before receipts, and in speculative mode, before the validation
+/// verdict. Invariants pinned here, for each repetition and mode:
+/// - wounds == 0 means exactly one release, not corrected;
+/// - wounds > 0 means speculative mode sends two releases (a stale
+///   speculative one, then a corrected one); conservative mode sends
+///   one, already final;
+/// - the last release always byte-equals the outcome's delta;
+/// - receipts and the delta stay byte-identical to sequential execution
+///   in every case.
 ///
-/// The lying-stats generator makes wounds actually fire across reps, so
-/// the correction leg is exercised for real, not vacuously.
+/// The lying-stats generator makes wounds fire across repetitions, so
+/// the correction leg is tested for real, not just in theory.
 #[test]
 fn streaming_release_and_wound_correction() {
     let sg = signers(4);
@@ -679,9 +687,9 @@ fn streaming_release_and_wound_correction() {
         let mut wound_reps = 0usize;
         let mut reps = 0usize;
         // Hunt for the wound leg: races are timing-dependent, and a fast
-        // machine may win every one (the sibling lying-stats test's
-        // note) — so rep until a wound is seen or the budget runs out,
-        // asserting the protocol on every rep either way.
+        // machine may win every one, as noted in the sibling lying-stats
+        // test. Repeat until a wound appears or the budget runs out,
+        // asserting the protocol on every repetition either way.
         for rep in 0..200 {
             let (out, releases) = kardamom_stm::execute::with_pool(
                 kardamom_stm::execute::PoolConfig {
@@ -745,21 +753,21 @@ fn streaming_release_and_wound_correction() {
                 break; // wound leg exercised and a full base run done
             }
         }
-        // Not asserted — a fast machine may win every race — but loud
-        // when the correction leg went unexercised.
+        // Not asserted, since a fast machine may win every race, but loud
+        // when the correction leg never ran.
         eprintln!("streaming spec={speculative}: {wound_reps}/{reps} reps wounded");
     }
 }
 
-/// THE P3b ADVERSARIAL CASE (spec "Wound-abort adversarial"): block 2
-/// is built, fed, and submitted with DEFERRED layers while block 1
-/// still executes, binds on block 1's speculative release, and runs
-/// while block 1 is still validating. When the lying-stats race fires a wound in block
-/// 1, the speculative release was wrong — the consumer aborts block 2,
-/// rebuilds it on the `corrected` release, and both blocks must come
-/// out byte-identical to the sequential chain. When no wound fires,
-/// block 2's speculative run IS the answer — asserted identical too,
-/// which is what makes the gamble sound: either way, bytes.
+/// The speculative-release adversarial case: block 2 is
+/// built, fed, and submitted with deferred layers while block 1 still
+/// executes. It binds on block 1's speculative release and runs while
+/// block 1 is still validating. When the lying-stats race fires a wound
+/// in block 1, the speculative release was wrong: the consumer aborts
+/// block 2, rebuilds it on the `corrected` release, and both blocks must
+/// come out byte-identical to the sequential chain. When no wound fires,
+/// block 2's speculative run is the answer, also asserted identical.
+/// Either way, this is what makes the gamble sound: the bytes match.
 #[test]
 fn speculative_pipeline_wound_aborts_and_recovers() {
     let sg = signers(4);
@@ -788,10 +796,10 @@ fn speculative_pipeline_wound_aborts_and_recovers() {
             .collect();
         Stats::learn(&obs)
     };
-    // Block 1: the wound-prone racing increments. Block 2: four MORE
-    // increments from the same senders — its every receipt depends on
-    // block 1's final counter value, so a stale layer cannot pass the
-    // byte-identical assert.
+    // Block 1: the wound-prone racing increments. Block 2: four more
+    // increments from the same senders. Every one of its receipts
+    // depends on block 1's final counter value, so a stale layer cannot
+    // pass the byte-identical assert.
     let recs1 = records(
         (0..4)
             .map(|i| tx(&sg[i], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL))
@@ -844,10 +852,10 @@ fn speculative_pipeline_wound_aborts_and_recovers() {
                 }
                 let (d1tx, d1rx) = std::sync::mpsc::channel();
                 let ticket1 = sess1.submit_streaming(d1tx, true).unwrap();
-                // THE PRODUCTION SEQUENCING (late-bound layers): block 2
-                // is built, fed, and SUBMITTED while block 1 still
-                // executes — before its read base exists. Workers gate
-                // on the bind.
+                // The production sequencing (late-bound layers): block 2
+                // is built, fed, and submitted while block 1 still
+                // executes, before its read base exists. Workers wait
+                // for the bind.
                 let (mut sess2, binder2) = pool
                     .begin_block_deferred(
                         vec![database.clone(); 4],
@@ -861,7 +869,7 @@ fn speculative_pipeline_wound_aborts_and_recovers() {
                 }
                 let (d2tx, _d2rx) = std::sync::mpsc::channel();
                 let ticket2 = sess2.submit_streaming(d2tx, true).unwrap();
-                // The SPECULATIVE release: block 1 is still validating.
+                // The speculative release: block 1 is still validating.
                 let rel1 = d1rx.recv().expect("speculative release");
                 assert!(!rel1.corrected, "{label}: first release is speculative");
                 binder2.bind(vec![rel1.delta.clone()]).unwrap();
@@ -875,9 +883,9 @@ fn speculative_pipeline_wound_aborts_and_recovers() {
                     assert!(d1rx.try_recv().is_err(), "{label}: no extra release");
                 } else {
                     wound_reps += 1;
-                    // The release was WRONG. Unwind block 2 entirely:
-                    // abort, discard its ticket (Ok or Err — either is
-                    // garbage), rebuild on the corrected delta.
+                    // The release was wrong. Unwind block 2 entirely:
+                    // abort, discard its ticket (Ok or Err, either is
+                    // garbage), and rebuild on the corrected delta.
                     let corrected = d1rx.recv().expect("corrected release");
                     assert!(corrected.corrected, "{label}: wound re-issues");
                     pool.abort_active();
@@ -897,7 +905,7 @@ fn speculative_pipeline_wound_aborts_and_recovers() {
 }
 
 /// A deferred session whose consumer never binds must not hang: abort
-/// resolves its ticket (error or stale-Ok), loudly and promptly.
+/// resolves its ticket (error or stale Ok), loudly and promptly.
 #[test]
 fn deferred_never_bound_aborts_cleanly() {
     let sg = signers(2);
@@ -936,11 +944,11 @@ fn deferred_never_bound_aborts_cleanly() {
     );
 }
 
-/// MV-AS-LAYER (spec P3b): block 2 binds on block 1's EARLY release —
-/// the mv cache itself, shipped before block 1's fold, hash, or
-/// validation ran. Wound in block 1 ⇒ the corrected DELTA release
-/// arrives, block 2 aborts and rebuilds on the delta layer (never the
-/// stale mv). Byte-identical to the sequential chain in every path.
+/// Mv-as-layer: block 2 binds on block 1's early release, the
+/// mv cache itself, shipped before block 1's fold, hash, or validation
+/// ran. A wound in block 1 means the corrected delta release arrives,
+/// block 2 aborts, and it rebuilds on the delta layer, never the stale
+/// mv. Byte-identical to the sequential chain on every path.
 #[test]
 fn mv_as_layer_pipeline_wound_aborts_and_recovers() {
     let sg = signers(4);
@@ -996,7 +1004,7 @@ fn mv_as_layer_pipeline_wound_aborts_and_recovers() {
                 ..Default::default()
             },
             |pool| {
-                // Block 1: early mv release + fold delta release.
+                // Block 1: early mv release, then fold delta release.
                 let mut sess1 = pool
                     .begin_block(database.clone(), PendingDelta::new(), env(), &lying_stats)
                     .unwrap();
@@ -1020,7 +1028,8 @@ fn mv_as_layer_pipeline_wound_aborts_and_recovers() {
                 }
                 let (d2tx, _d2rx) = std::sync::mpsc::channel();
                 let ticket2 = sess2.submit_streaming(d2tx, true).unwrap();
-                // The EARLY release: block 1's mv, pre-fold, pre-verdict.
+                // The early release: block 1's mv, before the fold and
+                // before the verdict.
                 let rel1 = mv1_rx.recv().expect("early mv release");
                 binder2
                     .bind_with(
@@ -1037,7 +1046,7 @@ fn mv_as_layer_pipeline_wound_aborts_and_recovers() {
                 } else {
                     wound_reps += 1;
                     // The mv layer is stale. Unwind block 2 onto the
-                    // CORRECTED delta.
+                    // corrected delta.
                     let first = d1rx.recv().expect("first delta release");
                     let corrected = if first.corrected {
                         first
@@ -1073,11 +1082,11 @@ fn mv_as_layer_pipeline_wound_aborts_and_recovers() {
     eprintln!("mv-layer: {wound_reps}/{reps} reps wounded");
 }
 
-/// BAG SCHEDULER (flag-gated v1): one shared runnable set, no
-/// per-worker queues, no stealing, no eager coverage — every shape that
+/// Bag scheduler (flag-gated v1): one shared runnable set, no
+/// per-worker queues, no stealing, no eager coverage. Every shape that
 /// pins the FIFO scheduler must stay byte-identical under the bag too:
-/// chains (every dependency an edge), racing lying-stats reps, and
-/// plain transfers, across worker counts.
+/// chains (every dependency is an edge), racing lying-stats repetitions,
+/// and plain transfers, across worker counts.
 #[test]
 fn bag_scheduler_byte_identical() {
     let sg = signers(4);
@@ -1179,8 +1188,8 @@ fn bag_scheduler_byte_identical() {
     }
 }
 
-/// The bag scheduler on the SAME hot chain: no coverage, no single-
-/// worker domain — just edges + chain-local hand-off. Must stay
+/// The bag scheduler on the same hot chain: no coverage, no
+/// single-worker domain, only edges and chain-local hand-off. Must stay
 /// byte-identical with zero wounds at every worker count.
 #[test]
 fn bag_hot_chain_byte_identical() {
@@ -1209,11 +1218,12 @@ fn bag_hot_chain_byte_identical() {
     assert_eq!(seq.1.storage.get(&key), Some(&U256::from(24u64)));
 }
 
-/// SHARDED ADMISSION: dependency discovery split across cell-space
+/// Sharded admission: dependency discovery split across cell-space
 /// shards must produce the same bytes as the serial feed. The shapes
-/// that matter are the ones where a shard boundary could hide an edge:
-/// a hot single-cell chain (all txs in ONE shard), transfers (two cells
-/// per tx, usually different shards), and racing lying-stats reps.
+/// that matter are the ones where a shard boundary could hide an edge: a
+/// hot single-cell chain (all transactions in one shard), transfers (two
+/// cells per transaction, usually in different shards), and racing
+/// lying-stats repetitions.
 #[test]
 fn sharded_admission_byte_identical() {
     let sg = signers(4);
@@ -1241,8 +1251,9 @@ fn sharded_admission_byte_identical() {
         )
     };
 
-    // 1. Hot chain: 24 increments of ONE slot — every tx's conflict cell
-    //    lands in the same shard, so one shard carries the whole chain.
+    // 1. Hot chain: 24 increments of one slot. Every transaction's
+    //    conflict cell lands in the same shard, so one shard carries the
+    //    whole chain.
     let recs = records(
         (0..8u64)
             .flat_map(|n| sg.iter().take(3).map(move |s| (s, n)).collect::<Vec<_>>())
@@ -1264,8 +1275,9 @@ fn sharded_admission_byte_identical() {
         }
     }
 
-    // 2. Transfers: two cells per tx, so most txs span shards and the
-    //    per-batch guard is what keeps them from dispatching early.
+    // 2. Transfers: two cells per transaction, so most transactions span
+    //    shards, and the per-batch guard is what keeps them from
+    //    dispatching early.
     let recs2 = records(vec![
         tx(&sg[0], 0, TxKind::Call(sg[1].address()), 500, &[]),
         tx(&sg[1], 0, TxKind::Call(sg[2].address()), 300, &[]),
@@ -1287,11 +1299,11 @@ fn sharded_admission_byte_identical() {
         }
     }
 
-    // 3. TABLE PRESSURE: a block big enough to fill the per-shard
-    //    tables. The 24-tx cases above pass even with a broken probe
-    //    walk (they never fill a table); this one is what catches a
-    //    mis-sized shard table — the real bug it was written for made
-    //    `upsert` spin forever at k=3.
+    // 3. Table pressure: a block big enough to fill the per-shard
+    //    tables. The 24-transaction cases above pass even with a broken
+    //    probe walk, since they never fill a table. This case catches a
+    //    mis-sized shard table: the bug it was written for made `upsert`
+    //    spin forever at k=3.
     let many: Vec<TxEnvelope> = (0..1500u64)
         .map(|n| {
             let s = &sg[(n % 4) as usize];

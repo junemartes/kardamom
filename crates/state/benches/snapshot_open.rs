@@ -1,4 +1,5 @@
-//! Measure RO snapshot open latency. Target: <100 µs on a quiet host.
+//! Measure read-only snapshot open latency. Target: under 100
+//! microseconds on a quiet host.
 
 use std::time::Duration;
 

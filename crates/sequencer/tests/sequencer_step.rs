@@ -1,4 +1,4 @@
-//! Driver-level tests for `Sequencer::run_once` + `run`.
+//! Driver-level tests for `Sequencer::run_once` and `run`.
 
 use alloy_consensus::{SignableTransaction, TxEnvelope as ConsensusEnvelope, TxLegacy};
 use alloy_network::TxSignerSync;
@@ -53,9 +53,9 @@ fn one_partition_cfg() -> SequencerConfig {
     }
 }
 
-/// Monotonically synthesize a `BPosition` for the in-memory subscription so
-/// every observed envelope has a distinct A-position (the way Aeron-archive
-/// fragment offsets do in production).
+/// Build an increasing `BPosition` for the in-memory subscription, so
+/// every observed envelope has a distinct A-position. This is the way
+/// Aeron-archive fragment offsets work in production.
 fn pos(offset: i32) -> BPosition {
     BPosition {
         term_id: 0,
@@ -157,7 +157,7 @@ fn b_backpressure_rewinds_state_and_retry_succeeds() {
     ));
     assert_eq!(b.refs.lock().unwrap().len(), 0, "B never accepted the ref");
 
-    // Recover B; the next run_once drains the rebuffered nonce 0 onto B.
+    // Recover B. The next run_once drains the rebuffered nonce 0 onto B.
     *b.fail_with_backpressure.lock().unwrap() = false;
     assert!(seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
     let refs = b.refs.lock().unwrap();
@@ -235,11 +235,12 @@ fn run_returns_when_channel_a_disconnected() {
     assert!(result.is_ok(), "{result:?}");
 }
 
-// CI first-record audit: the DEGENERATE single-tx-after-idle case. The smoke
-// test sends exactly ONE tx; if the retry of a backpressured ref were gated on
-// fresh ingress (which never comes), that lone ref would wedge forever. The
-// retry must be driven by run_once's drain-pending sweep alone, across
-// MULTIPLE consecutive backpressured passes, and publish exactly once.
+// CI first-record audit: the degenerate single-transaction-after-idle
+// case. The smoke test sends exactly one transaction. If the retry of a
+// backpressured ref were gated on fresh ingress, which never comes, that
+// lone ref would wedge forever. The retry must come from run_once's
+// drain-pending sweep alone, across multiple consecutive backpressured
+// passes, and publish exactly once.
 #[test]
 fn single_tx_after_idle_survives_repeated_backpressure_without_new_ingress() {
     let s = signer(40);
@@ -251,8 +252,9 @@ fn single_tx_after_idle_survives_repeated_backpressure_without_new_ingress() {
     let mut rc = InMemoryTxErrorPublisher::default();
     let mut seq = Sequencer::new(one_partition_cfg());
 
-    // Ingress pass hits backpressure; then several ingress-EMPTY passes keep
-    // hitting backpressure — each must rewind and keep the ref pending.
+    // The ingress pass hits backpressure. Then several ingress-empty
+    // passes keep hitting backpressure. Each must rewind and keep the
+    // ref pending.
     for _ in 0..4 {
         let r = seq.run_once(&mut channel_a, &mut b, &mut rc);
         assert!(
@@ -262,8 +264,8 @@ fn single_tx_after_idle_survives_repeated_backpressure_without_new_ingress() {
         assert!(b.refs.lock().unwrap().is_empty(), "nothing accepted yet");
     }
 
-    // Publisher recovers: the ref publishes from drain-pending with NO new
-    // ingress, exactly once.
+    // The publisher recovers. The ref publishes from drain-pending, with
+    // no new ingress, exactly once.
     *b.fail_with_backpressure.lock().unwrap() = false;
     assert!(seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
     let refs = b.refs.lock().unwrap();

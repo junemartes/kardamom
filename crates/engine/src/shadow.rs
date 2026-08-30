@@ -1,23 +1,27 @@
-//! P1 footprint SHADOW scheduler (spec: block-stm-executor §P1).
+//! Footprint shadow scheduler.
 //!
-//! At each boundary the exec thread hands this thread the block's per-tx
-//! captures (envelope clone, gas, `TouchSet` reads, `WriteSet`-derived
-//! write cells) over a bounded `try_send` channel — the same discipline as
-//! the BAL publisher handoff: the shadow must NEVER back-pressure
-//! execution, and a dropped block costs one block of measurement, not the
-//! chain. Everything heavier than a few `Vec` pushes (envelope decode,
-//! prediction, O(pairs) grading, training) happens here, off the hot path.
+//! At each boundary, the exec thread sends this thread the block's per-tx
+//! captures: envelope clone, gas, `TouchSet` reads, and `WriteSet`-derived
+//! write cells. It uses a bounded `try_send` channel, the same as the BAL
+//! publisher handoff. The shadow must never back-pressure execution. A
+//! dropped block costs one block of measurement, not the chain. All heavy
+//! work (envelope decode, prediction, O(pairs) grading, training) happens
+//! here, off the hot path.
 //!
-//! Per block, in order: (1) predict with stats trained on PRIOR blocks
-//! only, (2) grade the prediction against the block's actual cells
-//! ([`kardamom_footprint::grade::grade_block`] — P0-identical semantics),
-//! (3) emit metrics + a summary log line, (4) train on the block. A block
-//! never grades against stats that already saw it, so the cold-start curve
-//! in the emitted series is the real no-persistence cost the spec wants
-//! priced.
+//! Per block, in order:
+//!   1. Predict, using stats trained only on prior blocks.
+//!   2. Grade the prediction against the block's actual cells
+//!      ([`kardamom_footprint::grade::grade_block`], with offline-identical
+//!      semantics).
+//!   3. Emit metrics and a summary log line.
+//!   4. Train on the block.
 //!
-//! Execution stays sequential; nothing here feeds back into scheduling.
-//! Enabled by `KARDAMOM_FOOTPRINT_SHADOW=1` on the EXECUTOR role only.
+//! A block never grades against stats that already saw it. So the
+//! cold-start curve in the emitted series is the real no-persistence cost
+//! the spec wants to price.
+//!
+//! Execution stays sequential. Nothing here feeds back into scheduling.
+//! The executor role enables this with `KARDAMOM_FOOTPRINT_SHADOW=1`.
 
 use std::collections::HashSet;
 
@@ -30,23 +34,22 @@ use kardamom_footprint::grade::grade_block;
 use kardamom_footprint::{Cell, TxObs, envelope_view};
 use kardamom_types::TxEnvelope;
 
-/// The fee sink — every tx credits it (P0: universal write cell), and the
-/// `Accumulator` strategy services it by deferred commutative folding, so
-/// it is excluded from conflict analysis (spec "The graph index" #4).
-/// Mirrors `kardamom_exec_core::block_env`: beneficiary = address(0),
-/// basefee = 0 — the V0 documented burn.
+/// The fee sink. Every tx credits it (a universal write cell). The
+/// `Accumulator` strategy services it with deferred commutative folding.
+/// So conflict analysis excludes it. This
+/// mirrors `kardamom_exec_core::block_env`: beneficiary = address(0),
+/// basefee = 0, the documented V0 burn.
 pub const FEE_SINK: Address = Address::ZERO;
 
-/// Pair-grading cap per block. Grading is O(n²) set intersections; CI-scale
-/// blocks are ≤~600 txs and saturated dev-host blocks ~2,700 — the cap
-/// keeps a pathological burst block from wedging the shadow thread for
-/// seconds. Truncation is REPORTED (`graded < txs` in the summary line),
-/// never silent.
+/// Pair-grading cap per block. Grading does O(n²) set intersections. CI-scale
+/// blocks have at most ~600 txs; saturated dev-host blocks have ~2,700. This
+/// cap stops a burst block from wedging the shadow thread for seconds.
+/// Truncation is always reported (`graded < txs` in the summary line).
 const GRADE_CAP: usize = 2_048;
 
-/// One executed tx's capture, assembled on the exec thread at near-zero
-/// cost: the envelope's byte payload is refcounted, the cell extraction is
-/// one pass over the (small) `WriteSet`.
+/// One executed tx's capture. The exec thread builds this at near-zero
+/// cost: the envelope's byte payload is refcounted, and cell extraction is
+/// one pass over the small `WriteSet`.
 pub struct ShadowTxCapture {
     pub envelope: TxEnvelope,
     pub gas_used: u64,
@@ -58,15 +61,15 @@ pub struct ShadowTxCapture {
 pub struct ShadowBlock {
     pub block_number: u64,
     pub captures: Vec<ShadowTxCapture>,
-    /// Serial-lane records (deposits) in the block: not modeled by the
-    /// predictor (spec strategy #1 — they take the serial barrier lane),
-    /// counted so block totals reconcile in the summary line.
+    /// Count of serial-lane records (deposits) in the block. The predictor
+    /// does not model these (they use the serial barrier lane). This
+    /// count lets block totals match in the summary line.
     pub serial_records: u32,
 }
 
-/// Extract the write cells of one tx from its `WriteSet` — the exact cell
-/// model the P0 capture used: an `Account` cell per written account tuple,
-/// a `Slot` cell per storage write. (Reads ride in via [`TouchSet`].)
+/// Extract the write cells of one tx from its `WriteSet`. This is the same
+/// cell model the offline capture used: one `Account` cell per written account,
+/// one `Slot` cell per storage write. Reads come in through [`TouchSet`].
 pub fn write_cells(ws: &WriteSet) -> Vec<Cell> {
     let mut cells = Vec::with_capacity(ws.accounts.len() + ws.storage.len());
     for (addr, _) in ws.accounts.iter() {
@@ -78,10 +81,10 @@ pub fn write_cells(ws: &WriteSet) -> Vec<Cell> {
     cells
 }
 
-/// Read `KARDAMOM_FOOTPRINT_SHADOW`; when `1`, spawn the shadow thread and
-/// return the exec side's sender. The thread exits when the executor drops
-/// the sender (channel disconnect) — no join handle needed: it owns no
-/// state anyone waits for.
+/// Read `KARDAMOM_FOOTPRINT_SHADOW`. If it is `1`, spawn the shadow thread
+/// and return the exec side's sender. The thread exits when the executor
+/// drops the sender. No join handle is needed, because the thread owns no
+/// state that anything waits for.
 pub fn spawn_from_env() -> Option<Sender<ShadowBlock>> {
     if std::env::var("KARDAMOM_FOOTPRINT_SHADOW").ok().as_deref() != Some("1") {
         return None;
@@ -104,13 +107,14 @@ fn run_shadow(rx: Receiver<ShadowBlock>) {
     }
 }
 
-/// Grade one block, emit its metrics + summary line, then train. Public
-/// (crate) so the actor tests can drive it without a thread.
+/// Grade one block, emit its metrics and summary line, then train. This is
+/// crate-public so the actor tests can call it without a thread.
 pub(crate) fn process_block(block: ShadowBlock, stats: &mut Stats, exclude: &HashSet<Cell>) {
     let block_number = block.block_number;
-    // The P2 Accumulator-guard signal: a BALANCE-opcode read against the
-    // accumulator-marked fee sink would force materialization at runtime —
-    // expected ~never; measured here so P2 knows the price of the guard.
+    // This is the Accumulator-guard signal. A BALANCE-opcode read against
+    // the accumulator-marked fee sink would force materialization at
+    // runtime. This should almost never happen. It is measured here to
+    // track the price of the guard.
     let accumulator_reads = block
         .captures
         .iter()
@@ -129,9 +133,9 @@ pub(crate) fn process_block(block: ShadowBlock, stats: &mut Stats, exclude: &Has
                 .iter()
                 .map(|(a, k)| Cell::Slot(*a, *k))
                 .collect();
-            // Account reads (BALANCE/EXTCODE* subjects) stay OUT of the
-            // conflict cells for parity with the P0 yardstick — see the
-            // note on `kardamom_footprint::Cell`.
+            // Account reads (BALANCE/EXTCODE* subjects) stay out of the
+            // conflict cells, for parity with the offline yardstick. See the note
+            // on `kardamom_footprint::Cell`.
             reads.sort_unstable();
             reads.dedup();
             let mut writes = c.write_cells;
@@ -188,7 +192,7 @@ pub(crate) fn process_block(block: ShadowBlock, stats: &mut Stats, exclude: &Has
         "footprint shadow block graded"
     );
 
-    // Train AFTER grading: the next block predicts with this one folded in.
+    // Train after grading. The next block's prediction includes this one.
     for o in &obs {
         stats.learn_obs(o);
     }

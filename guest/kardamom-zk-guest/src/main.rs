@@ -1,12 +1,12 @@
-//! The kardamom zkVM guest (spec: no-std-exec-core, phase 3c).
+//! The kardamom zkVM guest.
 //!
 //! Reads one rkyv [`ProverInput`] frame, rebuilds the exec-core record
-//! list, and runs [`execute_block_anchored`] — the SAME monomorphized
-//! function the validator's stateless re-execution runs. Everything
-//! fail-closed happens in there (record identity, witness completeness,
-//! BAL equality, MPT anchoring on both ends); this file is I/O.
+//! list, and runs [`execute_block_anchored`]: the same monomorphized
+//! function the validator's stateless re-execution runs. All fail-closed
+//! logic (record identity, witness completeness, BAL equality, MPT
+//! anchoring on both ends) lives there. This file only handles I/O.
 //!
-//! Committed output: the 104-byte [`PublicOutputs`] layout —
+//! Committed output: the 104-byte [`PublicOutputs`] layout,
 //! `pre_state_root || post_state_root || bal_commitment || block_number`.
 //!
 //! [`ProverInput`]: kardamom_types::ProverInput

@@ -5,10 +5,10 @@ use std::collections::BTreeMap;
 
 use alloy_primitives::{Address, B256, U256};
 
-/// Latest value written STRICTLY BEFORE `bal_index` in an ordered
-/// `(bal_index, value)` claim list — the seed a batch starting at that
-/// index must observe. `None` ⇒ no earlier claim; the pre-block snapshot
-/// value stands.
+/// Latest value written strictly before `bal_index` in an ordered
+/// `(bal_index, value)` claim list. This is the seed a batch starting at
+/// that index must observe. `None` means no earlier claim exists, so the
+/// pre-block snapshot value stands.
 fn latest_before<'a, K: Ord, T>(
     map: &'a BTreeMap<K, Vec<(u64, T)>>,
     key: &K,
@@ -37,28 +37,28 @@ fn last_in_range<K: Copy + Ord, T, U>(
         .collect()
 }
 
-/// A BAL claim indexed for seeding: per (address, slot) and per account
-/// field, the ordered `(bal_index, value)` writes the executor claimed.
+/// A BAL claim indexed for seeding: for each address and slot, and for
+/// each account field, the ordered `(bal_index, value)` writes the
+/// executor claimed.
 ///
-/// `bal_index` follows revm's convention: 0 = pre-execution, 1..=n = txs in
-/// block order (or chunk ordinals when the frame's granularity K > 1).
+/// `bal_index` follows revm's convention: 0 is pre-execution, and 1..=n
+/// are txs in block order (or chunk numbers when the frame's granularity
+/// K > 1).
 #[derive(Debug, Default, Clone)]
 pub struct ClaimIndex {
-    /// (address, slot) → ordered (bal_index, post-value).
+    /// Maps (address, slot) to ordered (bal_index, post-value) pairs.
     pub storage: BTreeMap<(Address, B256), Vec<(u64, U256)>>,
-    /// address → ordered (bal_index, post-balance).
+    /// Maps address to ordered (bal_index, post-balance) pairs.
     pub balance: BTreeMap<Address, Vec<(u64, U256)>>,
-    /// address → ordered (bal_index, post-nonce).
+    /// Maps address to ordered (bal_index, post-nonce) pairs.
     pub nonce: BTreeMap<Address, Vec<(u64, u64)>>,
-    /// Read-only slots per account (attribution only; not seeds).
+    /// Read-only slots per account. Used for attribution only, not for seeds.
     pub reads: BTreeMap<Address, Vec<B256>>,
-    /// address → ordered (bal_index, deployed code). CODE IS A SEED: a
-    /// CREATE in chunk i followed by a CALL in chunk j > i (one block)
-    /// must seed chunk j with the BYTECODE, not just the account entry —
-    /// the original spec excluded code from attribution reasoning from
-    /// the wave-DAG model (ordering), which the seeded model does not
-    /// have. Without this every cross-chunk call to a same-block contract
-    /// no-ops against empty code (the burst-block divergence).
+    /// Maps address to ordered (bal_index, deployed code) pairs. Code is
+    /// also a seed: a CREATE in chunk i, followed by a CALL in chunk j >
+    /// i in one block, must seed chunk j with the bytecode, not only the
+    /// account entry. Without this, every cross-chunk call to a
+    /// same-block contract sees empty code instead of running it.
     pub code: BTreeMap<Address, Vec<(u64, bytes::Bytes)>>,
 }
 
@@ -121,9 +121,9 @@ impl ClaimIndex {
         out
     }
 
-    /// Latest claimed storage value written STRICTLY BEFORE `bal_index`,
-    /// i.e. the seed a batch starting at that index must observe. `None`
-    /// ⇒ no earlier claim; the pre-block snapshot value stands.
+    /// Latest claimed storage value written strictly before `bal_index`,
+    /// the seed a batch starting at that index must observe. `None` means
+    /// no earlier claim exists, so the pre-block snapshot value stands.
     pub fn storage_seed(&self, addr: Address, slot: B256, before: u64) -> Option<U256> {
         latest_before(&self.storage, &(addr, slot), before).copied()
     }
@@ -133,7 +133,7 @@ impl ClaimIndex {
         latest_before(&self.balance, &addr, before).copied()
     }
 
-    /// Latest claimed CODE strictly before `bal_index`.
+    /// Latest claimed code strictly before `bal_index`.
     pub fn code_seed(&self, addr: Address, before: u64) -> Option<&bytes::Bytes> {
         latest_before(&self.code, &addr, before)
     }
@@ -143,9 +143,9 @@ impl ClaimIndex {
         latest_before(&self.nonce, &addr, before).copied()
     }
 
-    /// The claim set attributable to bal indices in `[from, to]` — what a
-    /// batch covering those indices must have produced, as a WriteSet-shaped
-    /// map for comparison against re-execution.
+    /// The claim set attributable to bal indices in `[from, to]`: what a
+    /// batch covering those indices must have produced, as a
+    /// WriteSet-shaped map for comparison against re-execution.
     pub fn claims_in_range(&self, from: u64, to: u64) -> ClaimSlice {
         ClaimSlice {
             storage: last_in_range(&self.storage, from, to, |v| *v),
@@ -162,13 +162,13 @@ pub struct ClaimSlice {
     pub storage: BTreeMap<(Address, B256), U256>,
     pub balance: BTreeMap<Address, U256>,
     pub nonce: BTreeMap<Address, u64>,
-    /// keccak of the unit-final claimed code (bytes stay out of the
-    /// comparison struct; the hash pins them).
+    /// The keccak hash of the unit-final claimed code. The bytes stay out
+    /// of the comparison struct; the hash pins them.
     pub code: BTreeMap<Address, B256>,
 }
 
-/// One claimed-vs-recomputed pass of [`ClaimSlice::diff_summary`]: the
-/// first key whose claimed value the recomputation contradicts (or lacks).
+/// One claimed-vs-recomputed pass of [`ClaimSlice::diff_summary`]. Finds
+/// the first key whose claimed value the recomputation contradicts or lacks.
 fn first_mismatch<K: Ord, V: PartialEq + std::fmt::Display>(
     field: &str,
     claimed: &BTreeMap<K, V>,
@@ -195,7 +195,7 @@ fn first_mismatch<K: Ord, V: PartialEq + std::fmt::Display>(
     None
 }
 
-/// The reverse pass: the first recomputed write the claims never mention.
+/// The reverse pass: find the first recomputed write the claims never mention.
 fn first_unclaimed<K: Ord, V: std::fmt::Display>(
     field: &str,
     verb: &str,
@@ -214,9 +214,9 @@ impl ClaimSlice {
     pub fn diff_summary(&self, other: &Self) -> String {
         let slot_key = |k: &(Address, B256)| format!("{:?}/{:?}", k.0, k.1);
         let addr_key = |a: &Address| format!("{a:?}");
-        // Pass order is load-bearing for message stability: storage both
-        // ways, then balance/nonce mismatches before their unclaimed
-        // passes, then code — exactly the pre-split order.
+        // Keep this pass order: it is load-bearing for message stability.
+        // Check storage both ways, then balance and nonce mismatches
+        // before their unclaimed passes, then code.
         first_mismatch("storage", &self.storage, &other.storage, slot_key)
             .or_else(|| {
                 first_unclaimed(
@@ -291,7 +291,7 @@ mod tests {
         assert_eq!(batch_ranges(3, 5), vec![(1, 3)]);
         assert_eq!(batch_ranges(10, 5), vec![(1, 5), (6, 10)]);
         assert_eq!(batch_ranges(12, 5), vec![(1, 5), (6, 10), (11, 12)]);
-        // Contiguous, no gaps, no overlap.
+        // Ranges must be contiguous, with no gaps and no overlap.
         let r = batch_ranges(97, 10);
         assert_eq!(r.first().unwrap().0, 1);
         assert_eq!(r.last().unwrap().1, 97);
@@ -322,15 +322,15 @@ mod tests {
             (addr(1), slot(9), 4, 40),
             (addr(1), slot(9), 7, 70),
         ]);
-        // A batch starting at tx1 sees no earlier claim → snapshot value.
+        // A batch starting at tx1 sees no earlier claim, so it uses the snapshot value.
         assert_eq!(idx.storage_seed(addr(1), slot(9), 1), None);
-        // A batch starting at tx4 must see tx1's value, NOT tx4's own.
+        // A batch starting at tx4 must see tx1's value, not tx4's own.
         assert_eq!(idx.storage_seed(addr(1), slot(9), 4), Some(U256::from(10)));
-        // A batch starting at tx6 sees tx4's.
+        // A batch starting at tx6 sees tx4's value.
         assert_eq!(idx.storage_seed(addr(1), slot(9), 6), Some(U256::from(40)));
-        // Later than every claim → the last one.
+        // Later than every claim: the seed is the last one.
         assert_eq!(idx.storage_seed(addr(1), slot(9), 99), Some(U256::from(70)));
-        // Untouched slot → no seed.
+        // An untouched slot has no seed.
         assert_eq!(idx.storage_seed(addr(2), slot(9), 5), None);
     }
 
@@ -341,10 +341,10 @@ mod tests {
             (addr(1), slot(9), 4, 40),
             (addr(1), slot(9), 7, 70),
         ]);
-        // Batch covering tx1..=5 must claim tx4's value (the last in range).
+        // A batch covering tx1..=5 must claim tx4's value, the last one in range.
         let s = idx.claims_in_range(1, 5);
         assert_eq!(s.storage.get(&(addr(1), slot(9))), Some(&U256::from(40)));
-        // Batch covering tx6..=10 claims tx7's.
+        // A batch covering tx6..=10 claims tx7's value.
         let s = idx.claims_in_range(6, 10);
         assert_eq!(s.storage.get(&(addr(1), slot(9))), Some(&U256::from(70)));
         // A range with no writes claims nothing for that slot.
@@ -362,7 +362,7 @@ mod tests {
         let msg = a.diff_summary(&b);
         assert!(msg.contains("claimed 5"), "{msg}");
         assert!(msg.contains("recomputed 6"), "{msg}");
-        // An unclaimed write is also caught.
+        // The check also catches an unclaimed write.
         let mut c = a.clone();
         c.storage.insert((addr(3), slot(4)), U256::from(9));
         assert!(a.diff_summary(&c).contains("unclaimed write"));

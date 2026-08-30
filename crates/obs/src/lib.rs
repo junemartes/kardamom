@@ -9,9 +9,9 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 
 pub mod bin;
 
-/// [`init`] with the version/git-sha incantation filled in at the CALL
-/// site, so each binary stamps its own crate version (a plain helper fn
-/// would bake in kardamom-obs's).
+/// [`init`] with the version and git-sha values filled in at the call
+/// site, so each binary stamps its own crate version. A plain helper
+/// function would bake in kardamom-obs's version instead.
 ///
 /// ```ignore
 /// kardamom_obs::init_service!("ingress", args.metrics_addr, &args.host_id).await?;
@@ -29,8 +29,8 @@ macro_rules! init_service {
     };
 }
 
-/// Whether an exporter build failure is a TCP bind `AddrInUse` (the ONLY
-/// retryable class — #122). Checked structurally through the error chain,
+/// Check whether an exporter build failure is a TCP bind `AddrInUse` error,
+/// the only retryable class. This checks the error chain structurally,
 /// with a string fallback in case the exporter crate stringifies the io
 /// error instead of sourcing it.
 fn is_addr_in_use(e: &anyhow::Error) -> bool {
@@ -76,28 +76,28 @@ pub async fn init(
     tokio::runtime::Handle::try_current()
         .context("kardamom_obs::init requires an ambient tokio runtime")?;
 
-    // The exporter runs as a task on the service's runtime (the one tokio
-    // runtime in the process). A dedicated thread + private runtime was the
-    // earlier design (#76: keep /metrics answering when the service runtime
-    // wedges); it was removed to keep one runtime for the async shell.
+    // The exporter runs as a task on the service's runtime. This is the
+    // one tokio runtime in the process. An earlier design used a dedicated
+    // thread and a private runtime, to keep /metrics answering when the
+    // service runtime wedged. The team removed that design to keep one
+    // runtime for the async shell.
     //
     // Fail-fast includes the HTTP bind: metrics-exporter-prometheus (0.18)
     // binds the TCP listener synchronously inside `build()`, so a port
-    // collision surfaces as an init error rather than a healthy-looking
-    // service with no /metrics. Pinned by the init_port_in_use integration
-    // test — if a dependency upgrade moves the bind into the exporter
-    // future's first poll, that test fails and the bind must be made eager
-    // here (e.g. pre-bind a std TcpListener).
-    // #122: EADDRINUSE gets a BOUNDED retry; every other bind/build error
-    // stays fail-fast. A port squatter is usually a wedged or frozen
-    // predecessor seconds away from being reaped by its supervisor — dying
-    // instantly burns one restart attempt per squat, and under a
-    // `mode = "fail"` restart policy (the validator: 5 attempts, then stay
-    // down) that converts a transient squat into a PERMANENT outage
-    // (reproduced end-to-end in #122: frozen validator holds :9006, every
-    // replacement dies at bind, alloc stranded). The default budget
-    // (24 × 5 s = 2 min) outlives a supervisor reap cycle; tests shrink it
-    // via the env knobs.
+    // collision surfaces as an init error, rather than as a healthy-looking
+    // service with no /metrics. The init_port_in_use integration test pins
+    // this: if a dependency upgrade moves the bind into the exporter
+    // future's first poll, that test fails, and the bind must be made
+    // eager here again (for example, by pre-binding a std TcpListener).
+    //
+    // An `AddrInUse` error gets a bounded retry; every other bind or build
+    // error stays fail-fast. A port squatter is usually a wedged or frozen
+    // predecessor seconds away from being reaped by its supervisor. Dying
+    // instantly would burn one restart attempt per squat, and under a
+    // `mode = "fail"` restart policy (the validator allows 5 attempts, then
+    // stays down), that would turn a transient squat into a permanent
+    // outage. The default budget (24 x 5 s = 2 min) outlives a supervisor
+    // reap cycle; tests shrink it through the env knobs below.
     let bind_retries: u32 = std::env::var("KARDAMOM_OBS_BIND_RETRIES")
         .ok()
         .and_then(|v| v.parse().ok())

@@ -1,9 +1,9 @@
-//! SBE codec for the Aeron Cluster **client session protocol**.
+//! SBE codec for the Aeron Cluster client session protocol.
 //!
 //! Hand-written to match the vendored `io.aeron.cluster.codecs` schema
-//! (`aeron-cluster-codecs.xml`, `id="111" version="16"`, little-endian). Only
-//! the client-facing subset is implemented — what a client sends to ingress and
-//! receives on egress:
+//! (`aeron-cluster-codecs.xml`, `id="111" version="16"`, little-endian).
+//! Only the client-facing subset is implemented: what a client sends to
+//! ingress and receives on egress:
 //!
 //! | message               | template | dir     | root block |
 //! |-----------------------|----------|---------|------------|
@@ -15,10 +15,11 @@
 //! | NewLeaderEvent        | 6        | egress  | 20         |
 //!
 //! Every SBE message is `[messageHeader(8)][root block][var-length fields…]`.
-//! `messageHeader` = `blockLength:u16, templateId:u16, schemaId:u16,
-//! version:u16`. Var fields are `length:u32` + bytes. Decoders locate the
-//! var section via the *sender's* `blockLength` (from the header), so newer
-//! servers that append optional trailing fixed fields decode correctly.
+//! `messageHeader` is `blockLength:u16, templateId:u16, schemaId:u16,
+//! version:u16`. A var field is `length:u32` plus bytes. A decoder locates
+//! the var section using the sender's `blockLength` (from the header), so a
+//! newer server that appends optional trailing fixed fields still decodes
+//! correctly.
 
 use thiserror::Error;
 
@@ -55,7 +56,7 @@ pub enum EventCode {
     Redirect = 2,
     AuthenticationRejected = 3,
     Closed = 4,
-    /// Unknown / future code, preserved verbatim.
+    /// Unknown or future code, kept unchanged.
     #[num_enum(catch_all)]
     Unknown(i32),
 }
@@ -101,9 +102,9 @@ fn need(buf: &[u8], at: usize, n: usize) -> Result<&[u8], DecodeError> {
     })
 }
 
-// Exact-width LE reads come from [`crate::bytes`] (shared with the
-// app-envelope codec in `kardamom-cluster-adapter`); a `None` maps to this
-// codec's own [`DecodeError::TooShort`] with this codec's offsets.
+// Exact-width LE reads come from [`crate::bytes`], shared with the
+// app-envelope codec in `kardamom-cluster-adapter`. A `None` maps to this
+// codec's own [`DecodeError::TooShort`], with this codec's offsets.
 
 fn too_short(buf: &[u8], at: usize, need: usize) -> DecodeError {
     DecodeError::TooShort {
@@ -126,8 +127,8 @@ fn rd_i64(buf: &[u8], at: usize) -> Result<i64, DecodeError> {
     crate::bytes::i64_le(buf, at).ok_or_else(|| too_short(buf, at, 8))
 }
 
-/// Read a var-length field (`length:u32` + bytes) starting at `at` in `body`.
-/// Returns the bytes and the offset just past them.
+/// Read a var-length field (`length:u32` plus bytes) starting at `at` in
+/// `body`. Return the bytes and the offset just past them.
 fn rd_var(body: &[u8], at: usize) -> Result<(&[u8], usize), DecodeError> {
     let len = rd_u32(body, at)? as usize;
     let start = at + 4;
@@ -150,7 +151,7 @@ fn put_var(buf: &mut Vec<u8>, bytes: &[u8]) {
 // ── SessionConnectRequest (ingress) ─────────────────────────────────────────
 
 /// Encode a `SessionConnectRequest`. `app_version` is the client's semantic
-/// protocol version; `response_channel` is the client's egress channel URI.
+/// protocol version. `response_channel` is the client's egress channel URI.
 pub fn encode_session_connect_request(
     correlation_id: i64,
     response_stream_id: i32,
@@ -207,8 +208,8 @@ pub fn decode_session_connect_request(buf: &[u8]) -> Result<SessionConnectReques
 
 // ── SessionKeepAlive / SessionCloseRequest (ingress) ────────────────────────
 
-/// Encode the two-i64 body shared by KeepAlive / CloseRequest (the encode-side
-/// mirror of [`decode_two_i64`]).
+/// Encode the two-i64 body shared by KeepAlive and CloseRequest. This is
+/// the encode-side mirror of [`decode_two_i64`].
 fn encode_two_i64(block_length: u16, template_id: u16, a: i64, b: i64) -> Vec<u8> {
     let mut buf = Vec::new();
     put_header(&mut buf, block_length, template_id);
@@ -235,7 +236,7 @@ pub fn encode_session_close_request(leadership_term_id: i64, cluster_session_id:
     )
 }
 
-/// Decode the two-i64 body shared by KeepAlive / CloseRequest. Returns
+/// Decode the two-i64 body shared by KeepAlive and CloseRequest. Return
 /// `(leadership_term_id, cluster_session_id)`.
 pub fn decode_two_i64(buf: &[u8], want_template: u16) -> Result<(i64, i64), DecodeError> {
     let h = MessageHeader::decode(buf)?;
@@ -285,12 +286,13 @@ pub struct SessionEvent {
     pub leadership_term_id: i64,
     pub leader_member_id: i32,
     pub code: EventCode,
-    /// Detail string — error text, or the ingress-endpoints list on REDIRECT.
+    /// Detail string: error text, or the ingress-endpoints list on a redirect.
     pub detail: String,
 }
 
-/// Encode a minimal `SessionEvent` (root block = 32; optional trailing fields
-/// omitted). Primarily for tests and a future in-Rust cluster mock.
+/// Encode a minimal `SessionEvent`, with root block 32 and no optional
+/// trailing fields. This is mainly for tests and a future in-Rust cluster
+/// mock.
 pub fn encode_session_event(ev: &SessionEvent) -> Vec<u8> {
     let mut b = Vec::new();
     put_header(&mut b, BLOCK_SESSION_EVENT_MIN, TEMPLATE_SESSION_EVENT);
@@ -309,8 +311,8 @@ fn decode_session_event(h: &MessageHeader, body: &[u8]) -> Result<SessionEvent, 
     let leadership_term_id = rd_i64(body, 16)?;
     let leader_member_id = rd_i32(body, 24)?;
     let code = EventCode::from(rd_i32(body, 28)?);
-    // Optional trailing fixed fields (version, leaderHeartbeatTimeoutNs) are
-    // skipped via the sender's blockLength.
+    // Skip optional trailing fixed fields (version, leaderHeartbeatTimeoutNs),
+    // using the sender's blockLength.
     let (detail, _) = rd_var(body, h.block_length as usize)?;
     Ok(SessionEvent {
         cluster_session_id,
@@ -358,7 +360,7 @@ fn decode_new_leader_event(h: &MessageHeader, body: &[u8]) -> Result<NewLeaderEv
 
 // ── Egress dispatch ─────────────────────────────────────────────────────────
 
-/// A decoded egress frame from the cluster. `Other` preserves the template id
+/// A decoded egress frame from the cluster. `Other` keeps the template id
 /// for any message the client does not act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Egress<'a> {
@@ -502,9 +504,10 @@ mod tests {
 
     #[test]
     fn session_event_decodes_with_newer_server_block_length() {
-        // Simulate a v16 server: root block = 44 (adds optional `version` i32
-        // and `leaderHeartbeatTimeoutNs` i64 after `code`). Our decoder must
-        // still find `detail` via the sender's blockLength.
+        // Simulate a v16 server, with root block 44. This adds an optional
+        // `version` field (i32) and `leaderHeartbeatTimeoutNs` (i64) after
+        // `code`. The decoder must still find `detail`, using the sender's
+        // blockLength.
         let mut b = Vec::new();
         put_header(&mut b, 44, TEMPLATE_SESSION_EVENT);
         b.extend_from_slice(&99i64.to_le_bytes()); // clusterSessionId
@@ -539,8 +542,8 @@ mod tests {
 
     #[test]
     fn unknown_template_is_preserved_not_an_error() {
-        // TimerEvent (template 20) is not a client-facing message; the egress
-        // decoder should surface it as `Other`, not fail.
+        // TimerEvent (template 20) is not a client-facing message. The
+        // egress decoder should return it as `Other`, not fail.
         let mut b = Vec::new();
         put_header(&mut b, 8, 20);
         b.extend_from_slice(&0i64.to_le_bytes());

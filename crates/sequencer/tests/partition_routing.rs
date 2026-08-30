@@ -1,4 +1,4 @@
-//! Integration test pinning partition_for distribution + cross-crate parity.
+//! Integration test for partition_for distribution and cross-crate parity.
 
 use alloy_primitives::Address;
 use kardamom_sequencer::partition::{partition_for, validate_partition_count};
@@ -13,8 +13,8 @@ fn partition_distributes_roughly_uniformly() {
         let addr = Address::from(bytes);
         counts[partition_for(addr, m) as usize] += 1;
     }
-    // Each partition should see between ~800 and ~1500 of the 10k addresses
-    // (loose chi-square slack; this catches a routing bug, not keccak quality).
+    // Each partition gets between ~800 and ~1500 of the 10,000 addresses.
+    // This loose margin catches a routing bug. It does not test keccak quality.
     for c in counts {
         assert!(c > 800 && c < 1500, "partition imbalance: {counts:?}");
     }

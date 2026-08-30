@@ -1,26 +1,28 @@
-//! Witness MPT anchoring (spec: no-std-exec-core, phase 3b).
+//! Witness MPT anchoring.
 //!
-//! Phase 2's witness is fail-closed but UNANCHORED: `WitnessDb` refuses
-//! reads the witness doesn't carry, but nothing ties what it DOES carry to
-//! the chain's actual pre-state — a prover could witness a fictional state
-//! and prove a fictional, internally consistent block. This module makes
-//! the witness self-authenticating against `pre_state_root` and closes the
-//! loop with a post-state root, giving the proof its public outputs:
-//! `(pre_state_root, post_state_root, bal_commitment, block_number)` — an
+//! Phase 2's witness fails closed, but is not anchored. `WitnessDb`
+//! refuses reads the witness does not carry, but nothing ties what it
+//! does carry to the chain's real pre-state. A prover could witness a
+//! fictional state and prove a fictional, but internally consistent,
+//! block. This module makes the witness self-authenticating against
+//! `pre_state_root`, and closes the loop with a post-state root. This
+//! gives the proof its public outputs:
+//! `(pre_state_root, post_state_root, bal_commitment, block_number)`, an
 //! inductive root chain from genesis.
 //!
-//! - [`verify_witness_anchored`] runs BEFORE the first EVM step: every
-//!   witness account and slot is proven present (with exactly the witnessed
-//!   value) or absent under `pre_state_root`, by walking the carried node
-//!   set from the root. Reaching the leaf IS the inclusion proof; reaching
-//!   a divergence is the exclusion proof. Code needs no proof —
-//!   `keccak256(bytes) == code_hash` and the hash sits inside a proven
+//! - [`verify_witness_anchored`] runs before the first EVM step. It proves
+//!   every witness account and slot present (with exactly the witnessed
+//!   value) or absent, under `pre_state_root`, by walking the carried node
+//!   set from the root. Reaching the leaf is the inclusion proof; reaching
+//!   a divergence is the exclusion proof. Code needs no proof: it checks
+//!   `keccak256(bytes) == code_hash`, and the hash sits inside a proven
 //!   account leaf.
-//! - [`recompute_post_root`] runs AFTER execution: apply the block's merged
-//!   delta to the partial trie and re-hash. Correct IFF every node the
-//!   delta's writes restructure is present — reads carry their own paths;
-//!   deletion-collapse siblings are the capture fixed point's job, and a
-//!   gap surfaces as a precise [`AnchorError::MissingNode`].
+//! - [`recompute_post_root`] runs after execution. It applies the block's
+//!   merged delta to the partial trie and re-hashes. This is correct only
+//!   if every node the delta's writes restructure is present. Reads carry
+//!   their own paths. Deletion-collapse siblings are the capture fixed
+//!   point's job, and a gap surfaces as a precise
+//!   [`AnchorError::MissingNode`].
 //!
 //! Everything here is `no_std`: the guest runs this exact code.
 
@@ -42,21 +44,21 @@ use crate::error::ExecutorError;
 
 pub use sparse::{Lookup, SparseTrie};
 
-/// Why a witness could not be anchored. Converted into
-/// [`ExecutorError::WitnessUnanchored`] at the driver boundary;
-/// [`MissingNode`](AnchorError::MissingNode) additionally drives the
-/// capture-side fixed point, which matches on it BY NAME.
+/// Why a witness could not be anchored. This converts into
+/// [`ExecutorError::WitnessUnanchored`] at the driver boundary.
+/// [`MissingNode`](AnchorError::MissingNode) also drives the capture-side
+/// fixed point, which matches on it by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnchorError {
     /// The witness carries no `pre_state_root` to anchor against.
     NoPreStateRoot,
     /// The node set is not in canonical wire form (sorted by hash, unique).
     ProofSetNotCanonical,
-    /// A walk needed a node the set does not carry. On the capture side
-    /// this is the fixed point's work item — `path` is the node's nibble
+    /// A walk needed a node the set does not carry. On the capture side,
+    /// this is the fixed point's work item. `path` is the node's nibble
     /// position (what a live-trie proof retainer targets; hashes are not
-    /// addressable there), and `account` names the storage trie it belongs
-    /// to (`None` = the account trie). In the guest it is fatal.
+    /// addressable there). `account` names the storage trie it belongs
+    /// to (`None` means the account trie). In the guest, this is fatal.
     MissingNode {
         hash: B256,
         path: alloy_trie::Nibbles,
@@ -64,19 +66,23 @@ pub enum AnchorError {
     },
     /// A carried node failed to RLP-decode.
     NodeDecode { hash: B256 },
-    /// The trie refutes a witness entry (wrong value, or present-vs-absent
-    /// disagreement). The witness or the root is lying.
+    /// The trie refutes a witness entry (a wrong value, or a
+    /// present-versus-absent disagreement). The witness or the root is
+    /// lying.
     Refuted { what: String },
-    /// Structurally impossible shape for a secure (fixed-width-key) trie —
-    /// a malformed node set, not a state disagreement.
+    /// A shape that is structurally impossible for a secure
+    /// (fixed-width-key) trie. This is a malformed node set, not a state
+    /// disagreement.
     Malformed(&'static str),
-    /// The delta empties an account that existed pre-state. Live execution
-    /// cannot produce this (selfdestruct is specced out; draining a balance
-    /// bumps the sender's nonce), so v0 fails closed instead of carrying
-    /// account-trie deletion machinery. Documented in the spec.
+    /// The delta empties an account that existed pre-state. Live
+    /// execution cannot produce this (selfdestruct is specced out, and
+    /// draining a balance bumps the sender's nonce), so version 0 fails
+    /// closed instead of carrying account-trie deletion machinery. This
+    /// is documented in the spec.
     AccountDeleteUnsupported { address: Address },
-    /// The delta writes state for an account the witness never read —
-    /// impossible under first-touch capture, so the witness is incomplete.
+    /// The delta writes state for an account the witness never read.
+    /// This is impossible under first-touch capture, so the witness is
+    /// incomplete.
     WriteWithoutRead { address: Address },
 }
 
@@ -86,9 +92,10 @@ impl From<AnchorError> for ExecutorError {
     }
 }
 
-/// Content-addressed view over a [`WitnessProofs`] node set: every node
-/// keyed by `keccak256(node bytes)`. Construction enforces the canonical
-/// wire form so there is exactly one valid encoding of a given set.
+/// A content-addressed view over a [`WitnessProofs`] node set. Every node
+/// is keyed by `keccak256(node bytes)`. Construction enforces the
+/// canonical wire form, so there is exactly one valid encoding of a
+/// given set.
 pub struct NodeStore<'p> {
     nodes: BTreeMap<B256, &'p [u8]>,
 }
@@ -110,10 +117,10 @@ impl<'p> NodeStore<'p> {
         Ok(Self { nodes })
     }
 
-    /// Expand the node reference at nibble position `at`: inline references
-    /// decode in place; hash references are fetched (verified by
-    /// construction — the key IS the hash) and decoded. A miss names both
-    /// the hash and `at`, the retainer-addressable half.
+    /// Expand the node reference at nibble position `at`. An inline
+    /// reference decodes in place. A hash reference is fetched (verified
+    /// by construction, since the key is the hash) and decoded. A miss
+    /// names both the hash and `at`, the retainer-addressable half.
     pub(crate) fn resolve(
         &self,
         r: &RlpNode,
@@ -137,8 +144,8 @@ impl<'p> NodeStore<'p> {
     }
 }
 
-/// Stamp `account` onto a storage-trie walk's [`AnchorError::MissingNode`]
-/// so the capture side knows WHICH trie to target.
+/// Stamp `account` onto a storage-trie walk's [`AnchorError::MissingNode`],
+/// so the capture side knows which trie to target.
 fn in_storage_trie(account: Address, e: AnchorError) -> AnchorError {
     match e {
         AnchorError::MissingNode {
@@ -154,16 +161,17 @@ fn in_storage_trie(account: Address, e: AnchorError) -> AnchorError {
     }
 }
 
-/// The pre-state the anchor walk PROVED, per witnessed account: `Some` with
-/// the exact trie leaf for included accounts, `None` for proven-absent.
-/// Feeds the post-root recompute (pre storage roots, untouched fields).
+/// The pre-state the anchor walk proved, per witnessed account. `Some`
+/// carries the exact trie leaf for an included account; `None` means
+/// proven absent. This feeds the post-root recompute (pre storage roots,
+/// untouched fields).
 pub struct ProvenPre {
     pub accounts: BTreeMap<Address, Option<TrieAccount>>,
 }
 
-/// Verify every witness entry against `pre_state_root` over the carried
-/// node set. Returns the proven pre-state on success. Fail-closed: any
-/// missing node, undecodable node, or disagreement aborts.
+/// Verify every witness entry against `pre_state_root`, over the carried
+/// node set. Returns the proven pre-state on success. This fails closed:
+/// any missing node, undecodable node, or disagreement aborts.
 pub fn verify_witness_anchored(
     witness: &ExecutionWitness,
     proofs: &WitnessProofs,
@@ -185,11 +193,12 @@ pub fn verify_witness_anchored(
                         what: format!("account {} witnessed absent but included", acct.address),
                     });
                 }
-                // #161's normalization rule, applied at the anchor too: the
-                // state table stores "no code" as ZERO, the trie leaf always
-                // uses KECCAK_EMPTY, and execution treats them identically —
-                // so the witness (a capture of table reads) compares under
-                // the same mapping the recompute already writes with.
+                // The same normalization rule applies at the anchor. The
+                // state table stores "no code" as ZERO, but the trie leaf
+                // always uses KECCAK_EMPTY, and execution treats the two
+                // identically. So the witness (a capture of table reads)
+                // compares under the same mapping the recompute already
+                // writes with.
                 let witness_code_hash = if acct.code_hash == B256::ZERO {
                     KECCAK_EMPTY
                 } else {
@@ -206,12 +215,13 @@ pub fn verify_witness_anchored(
                 proven.insert(acct.address, Some(ta));
             }
             Lookup::Absent => {
-                // The state TABLE may keep an EIP-161-EMPTY account as a row
-                // (a touched-with-zero-fee coinbase is the live shape) while
-                // the trie rightly excludes it. Execution semantics treat
-                // empty and absent identically, so the anchor does too: a
-                // witnessed-but-empty account is CONSISTENT with exclusion.
-                // Anything non-empty witnessed present stays refuted.
+                // The state table may keep an EIP-161-empty account as a
+                // row (a touched, zero-fee coinbase is the live shape),
+                // while the trie rightly excludes it. Execution semantics
+                // treat empty and absent the same, so the anchor does
+                // too: a witnessed-but-empty account is consistent with
+                // exclusion. Anything non-empty witnessed as present
+                // still gets refuted.
                 let empty = acct.nonce == 0
                     && acct.balance.is_zero()
                     && (acct.code_hash == B256::ZERO || acct.code_hash == KECCAK_EMPTY);
@@ -225,8 +235,8 @@ pub fn verify_witness_anchored(
         }
     }
 
-    // Storage tries are walked per account, from the PROVEN storage root —
-    // never from anything the witness claims directly.
+    // Storage tries are walked per account, from the proven storage
+    // root, never from anything the witness claims directly.
     let mut storage_tries: BTreeMap<Address, SparseTrie<'_, '_>> = BTreeMap::new();
     for slot in &witness.storage {
         let Some(pre) = proven.get(&slot.address) else {
@@ -268,8 +278,8 @@ pub fn verify_witness_anchored(
         }
     }
 
-    // Code integrity: recompute every carried blob's hash. Its BINDING to
-    // state is the account leaf's code_hash, already proven above.
+    // Code integrity: recompute every carried blob's hash. Its binding
+    // to state is the account leaf's code_hash, already proven above.
     for entry in &witness.code {
         if keccak256(&entry.code) != entry.code_hash {
             return Err(AnchorError::Refuted {
@@ -281,17 +291,18 @@ pub fn verify_witness_anchored(
     Ok(ProvenPre { accounts: proven })
 }
 
-/// Apply the block's merged delta to the anchored partial trie and re-hash:
-/// the post-state root, computed from `pre_state_root` + the node set + the
-/// delta alone.
+/// Apply the block's merged delta to the anchored partial trie, and
+/// re-hash: the post-state root, computed from `pre_state_root`, the
+/// node set, and the delta alone.
 ///
-/// Storage first (each touched account's storage trie → new storage root),
-/// then the account trie (changed fields from the delta, untouched fields
-/// from the PROVEN pre leaf, storage roots from step one). EIP-161 mirror
-/// of the live trie: an account whose post-state is empty is absent — a
-/// no-op for accounts that were already absent, and fail-closed
+/// This processes storage first (each touched account's storage trie
+/// becomes a new storage root), then the account trie (changed fields
+/// from the delta, untouched fields from the proven pre leaf, storage
+/// roots from the first step). This mirrors the live trie's EIP-161
+/// rule: an account whose post-state is empty is absent. This is a
+/// no-op for accounts that were already absent, and fails closed with
 /// [`AnchorError::AccountDeleteUnsupported`] for pre-existing ones (live
-/// execution cannot empty an existing account; see the error's docs).
+/// execution cannot empty an existing account; see that error's docs).
 pub fn recompute_post_root(
     witness: &ExecutionWitness,
     proofs: &WitnessProofs,
@@ -348,13 +359,14 @@ pub fn recompute_post_root(
             Some(v) => *v,
             None => match pre_acct {
                 Some(ta) => (ta.nonce, ta.balance, ta.code_hash),
-                // Storage write to an account with no pre leaf and no
-                // account-field change: the fields are all empty.
+                // Storage write to an account with no pre leaf, and no
+                // account-field change. All the fields are empty.
                 None => (0, U256::ZERO, KECCAK_EMPTY),
             },
         };
-        // The delta stores "no code" as ZERO in some write paths; the trie
-        // leaf always uses KECCAK_EMPTY (mirrors the live writer's mapping).
+        // The delta stores "no code" as ZERO in some write paths. The
+        // trie leaf always uses KECCAK_EMPTY, mirroring the live
+        // writer's mapping.
         let code_hash = if code_hash == B256::ZERO {
             KECCAK_EMPTY
         } else {

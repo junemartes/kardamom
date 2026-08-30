@@ -1,29 +1,30 @@
-//! 31-byte-per-field-element packing into EIP-4844 blobs.
+//! Packs 31 bytes per field element into EIP-4844 blobs.
 //!
-//! Per the BLS12-381 field constraint, each 32-byte field element must encode
-//! a value `< BLS_MODULUS`. The canonical safe encoding keeps the high byte of
-//! every field element zero and packs 31 user bytes into the low 31 bytes. A
-//! single blob (`BYTES_PER_BLOB` = 131072 bytes, 4096 field elements) therefore
-//! carries `4096 * 31 = 126976` payload bytes (`USABLE_BYTES_PER_BLOB`).
+//! The BLS12-381 field constraint requires each 32-byte field element to
+//! encode a value less than `BLS_MODULUS`. The safe encoding keeps the high
+//! byte of every field element zero, and packs 31 payload bytes into the low
+//! 31 bytes. A single blob (`BYTES_PER_BLOB` = 131072 bytes, 4096 field
+//! elements) carries `4096 * 31 = 126976` payload bytes
+//! (`USABLE_BYTES_PER_BLOB`).
 //!
-//! We prepend a 4-byte little-endian length header to the payload before
-//! chunking, so `unpack_from_blobs` knows where the original payload ends and
-//! drops the trailing zero padding.
+//! A 4-byte little-endian length header goes before the payload, before
+//! chunking. This lets `unpack_from_blobs` find the end of the original
+//! payload and drop the trailing zero padding.
 
 use alloy_eips::eip4844::{BYTES_PER_BLOB, Blob, FIELD_ELEMENT_BYTES_USIZE};
 
 use crate::error::BatcherError;
 
-/// Bytes of payload we pack into the low end of every 32-byte field element.
-/// The high byte is kept zero so the resulting field element is unambiguously
-/// `< BLS_MODULUS`. alloy's `USABLE_BYTES_PER_BLOB` (130048) is the result of a
-/// tighter 254-bit packing scheme; we deliberately use the simpler 31-byte
-/// scheme because it composes cleanly with `zstd` and is robust against
-/// trusted-setup edge cases.
+/// The number of payload bytes packed into the low end of each 32-byte field
+/// element. The high byte stays zero, so the field element is always less
+/// than `BLS_MODULUS`. Alloy's `USABLE_BYTES_PER_BLOB` (130048) comes from a
+/// tighter 254-bit packing scheme. This crate uses the simpler 31-byte
+/// scheme instead. It composes cleanly with `zstd` and avoids trusted-setup
+/// edge cases.
 const USABLE_BYTES_PER_FIELD: usize = FIELD_ELEMENT_BYTES_USIZE - 1; // 31
 
-/// Total bytes a single blob carries under the 31-byte-per-field scheme:
-/// 4096 field elements × 31 bytes each = 126_976.
+/// Total bytes one blob carries under the 31-byte-per-field scheme: 4096
+/// field elements times 31 bytes each equals 126_976.
 pub const USABLE_BYTES_PER_BLOB: usize =
     (BYTES_PER_BLOB / FIELD_ELEMENT_BYTES_USIZE) * USABLE_BYTES_PER_FIELD;
 
@@ -41,8 +42,8 @@ pub fn pack_to_blobs(payload: &[u8]) -> Result<Vec<Blob>, BatcherError> {
     prefixed.extend_from_slice(payload);
 
     if prefixed.len() <= LENGTH_HEADER_BYTES && payload.is_empty() {
-        // Empty payload: encode as a single blob whose length prefix is 0 and
-        // the rest is padding. This keeps the round-trip well-defined.
+        // For an empty payload, encode one blob with a length prefix of 0.
+        // The rest is padding. This keeps the round trip well defined.
         let blob = encode_one_blob(&prefixed);
         return Ok(vec![blob]);
     }
@@ -92,7 +93,7 @@ fn encode_one_blob(chunk: &[u8]) -> Blob {
     while src < chunk.len() {
         let take = (chunk.len() - src).min(USABLE_BYTES_PER_FIELD);
         let dst = field_idx * FIELD_ELEMENT_BYTES_USIZE;
-        // dst[0] stays zero (high byte) — the loop writes into dst[1..1+take].
+        // dst[0] stays zero (the high byte). The loop writes into dst[1..1+take].
         blob_bytes[dst + 1..dst + 1 + take].copy_from_slice(&chunk[src..src + take]);
         src += take;
         field_idx += 1;
@@ -100,8 +101,8 @@ fn encode_one_blob(chunk: &[u8]) -> Blob {
     Blob::new(blob_bytes)
 }
 
-/// Decode one blob to its 126976-byte payload area (still includes any trailing
-/// zero padding — caller strips by length header).
+/// Decode one blob to its 126976-byte payload area. This still includes any
+/// trailing zero padding. The caller strips it using the length header.
 fn decode_one_blob(blob: &Blob) -> Vec<u8> {
     let raw: &[u8] = blob.as_slice();
     debug_assert_eq!(raw.len(), BYTES_PER_BLOB);

@@ -1,6 +1,6 @@
-//! The commit thread: drains the exec → commit channel into adaptive receipt
-//! batches and publishes them (then any boundary) on tx_receipts with
-//! must-deliver retry semantics.
+//! The commit thread drains the exec-to-commit channel into adaptive receipt
+//! batches. It publishes each batch, then any boundary, on tx_receipts.
+//! It uses must-deliver retry logic.
 
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -16,22 +16,30 @@ use crate::exec_types::CMessage;
 use super::ports::TxReceiptsPublication;
 use super::types::ExecToCommit;
 
-/// Max receipts per published batch. Bounds the wire frame (receipts with
-/// logs vary in size; 64 keeps worst-case frames well inside the term-buffer
-/// message limit) — NOT a latency knob: the batch is whatever accumulated in
-/// the exec→commit channel while the previous publish was in flight, so at
-/// low rates batches are size 1 and nothing waits.
+/// Maximum number of receipts in one published batch.
+///
+/// This limit bounds the wire frame. Receipt sizes vary because of logs.
+/// A value of 64 keeps the worst-case frame well inside the term-buffer
+/// message limit.
+///
+/// This is not a latency knob. The batch holds only what queued in the
+/// exec-to-commit channel during the previous publish. At low rates, each
+/// batch has one receipt, and nothing waits.
 const RECEIPT_BATCH_MAX: usize = 64;
 
-/// One step of the must-deliver retry loop, shared by the receipts-batch and
-/// boundary publishes: a PROVEN divergence from the sink (the validator's
-/// receipt cross-check) is fatal, not transient. Retrying would silently
-/// defeat the fail-stop: the first failing publish already consumed the
-/// buffered receipt, so a retry finds nothing, waits out the receipt window,
-/// lands in the "unverified" arm and the pipeline keeps committing past a
-/// proven mismatch. Propagate instead so `Executor::run` returns the error
-/// and the process halts. Any other error is transient: warn (at attempt 1,
-/// then every 20th), sleep 50ms, and let the caller retry.
+/// One step of the must-deliver retry loop. The receipt-batch and boundary
+/// publishes share this step.
+///
+/// A proven divergence from the sink (the validator's receipt cross-check)
+/// is fatal, not transient. Do not retry it. A retry would defeat the
+/// fail-stop: the failed publish already consumed the buffered receipt, so
+/// the retry finds nothing, waits out the receipt window, and lands in the
+/// "unverified" arm. The pipeline would then keep committing past a proven
+/// mismatch. Propagate the error instead, so `Executor::run` returns it and
+/// the process halts.
+///
+/// Any other error is transient. Warn on attempt 1 and then every 20th
+/// attempt. Sleep 50 ms and let the caller retry.
 fn retry_must_deliver(
     attempts: &mut u32,
     e: ExecutorError,
@@ -59,12 +67,12 @@ where
         .name("executor-commit".into())
         .spawn(move || -> Result<(), ExecutorError> {
             loop {
-                // Block for the next message, then opportunistically drain
-                // whatever else is already queued into ONE receipt batch
-                // (adaptive batching: batch size ≈ arrivals during the
-                // previous publish — 1 at low rate, larger under load, no
-                // added latency in either regime). A boundary flushes the
-                // receipts gathered so far first, preserving stream order.
+                // Block for the next message. Then drain any other queued
+                // messages into one receipt batch (adaptive batching). The
+                // batch size matches the arrivals during the previous
+                // publish: 1 at a low rate, larger under load, with no
+                // added latency in either case. A boundary flushes the
+                // receipts gathered so far, and this keeps the stream order.
                 let mut receipts: Vec<Receipt> = Vec::new();
                 let mut boundary = None;
                 match rx.recv() {
@@ -85,20 +93,24 @@ where
                     }
                 }
 
-                // tx_receipts is MUST-DELIVER: a transaction's receipt has to make
-                // it back to the ingress that is parking the client. A transient
-                // publish failure — NOT_CONNECTED while the ingress's subscription
-                // is still forming during multi-host bring-up — must NOT drop the
-                // receipt or kill this thread. Killing it would close the bounded
-                // exec→commit channel, back-pressure the exec thread, stop
-                // tx_ordering consumption, and freeze ALL state progress. So retry
-                // until it lands, resuming at the unpublished SUFFIX of the batch
-                // (re-publishing a delivered prefix is only harmless-duplicate on
-                // the wire, but the validator's verifying sink consumes its buffer
-                // per receipt — the suffix resume keeps its semantics identical to
-                // the old one-publish-per-receipt loop). (Deploy order brings the
-                // ingress up first, so this normally succeeds on the first
-                // attempt.)
+                // tx_receipts is must-deliver. A transaction's receipt must reach
+                // the ingress that is parking the client. A transient publish
+                // failure (for example NOT_CONNECTED, while the ingress
+                // subscription is still forming during multi-host startup) must
+                // not drop the receipt or stop this thread. Stopping the thread
+                // would close the bounded exec-to-commit channel. This would
+                // back-pressure the exec thread, stop tx_ordering consumption,
+                // and freeze all state progress.
+                //
+                // So retry until the receipt lands. Resume at the unpublished
+                // suffix of the batch. Re-publishing a delivered prefix is a
+                // harmless duplicate on the wire. But the validator's verifying
+                // sink consumes its buffer per receipt, so the suffix resume
+                // keeps the same semantics as the old one-publish-per-receipt
+                // loop.
+                //
+                // Deploy order brings the ingress up first, so this usually
+                // succeeds on the first attempt.
                 let mut attempts: u32 = 0;
                 let mut from = 0usize;
                 while from < receipts.len() {

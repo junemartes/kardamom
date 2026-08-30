@@ -2,11 +2,11 @@
 
 use thiserror::Error;
 
-/// Errors a state-database operation may surface.
+/// Errors from a state-database operation.
 ///
-/// `kardamom_types::StateError` is the marker trait the trait surface returns;
-/// we implement it for this type so a `StateDatabase` impl over `StateSnapshot`
-/// can advertise this as its associated `Error`.
+/// `kardamom_types::StateError` is the marker trait for the trait surface's
+/// return type. This type implements it, so a `StateDatabase` implementation
+/// over `StateSnapshot` can use it as its associated `Error` type.
 #[derive(Debug, Error)]
 pub enum StateError {
     #[error("mdbx error: {0}")]
@@ -27,9 +27,11 @@ pub enum StateError {
     RkyvDecode { table: &'static str, detail: String },
     #[error("recovery failed: {0}")]
     Recovery(String),
-    /// A checkpoint image whose bytes do not hash to what its source (the
-    /// MANIFEST, or the serving peer's headers) claims. The Display string is
-    /// pinned: tests and operators grep for the CORRUPT marker.
+    /// A checkpoint image whose bytes do not match the hash from its source
+    /// (the MANIFEST, or the serving peer's headers).
+    ///
+    /// Do not change the Display string. Tests and operators search for the
+    /// CORRUPT marker.
     #[error("checkpoint {image} is CORRUPT: image hashes to {got:#x}, {claimant} says {want:#x}")]
     CorruptCheckpointImage {
         image: String,
@@ -37,8 +39,10 @@ pub enum StateError {
         got: alloy_primitives::B256,
         want: alloy_primitives::B256,
     },
-    /// A checkpoint image bound to a different chain's genesis than this
-    /// node's. The Display string is pinned: tests and operators grep for the
+    /// A checkpoint image that is bound to a different chain's genesis than
+    /// this node's.
+    ///
+    /// Do not change the Display string. Tests and operators search for the
     /// DIFFERENT CHAIN marker.
     #[error(
         "checkpoint {image} belongs to a DIFFERENT CHAIN: its genesis digest is {image_genesis:#x}, this node's is {expected:#x}"
@@ -67,12 +71,11 @@ pub enum StateError {
 
 impl From<signet_libmdbx::ReadError> for StateError {
     fn from(value: signet_libmdbx::ReadError) -> Self {
-        // `ReadError` is the read-only variant that can additionally carry
-        // decode errors. We flatten to a string — the BadEncoding variant is
-        // already covered by the explicit decoders.
+        // `ReadError` is the read-only variant. It can also carry decode
+        // errors. We flatten it to a string. The explicit decoders already
+        // cover the BadEncoding variant.
         StateError::MdbxRead(value.to_string())
     }
 }
 
-// Implement the marker trait required by `kardamom_types::StateDatabase`.
 impl kardamom_types::StateError for StateError {}

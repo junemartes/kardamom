@@ -1,6 +1,7 @@
-//! State-access traits. The `StateDatabase` trait is `revm::Database`-compatible
-//! (in spirit; we do not depend on revm here). S4's executor consumes any
-//! implementor; S6 ships the libmdbx-backed one.
+//! State-access traits. The `StateDatabase` trait is compatible with
+//! `revm::Database` in spirit; this crate does not depend on revm. The
+//! sequential executor consumes any implementor. The state writer ships
+//! the libmdbx-backed one.
 
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
@@ -25,21 +26,24 @@ pub trait StateDatabase: Send + Sync {
     /// Receipt lookup by canonical position.
     fn get_receipt(&self, pos: BPosition) -> Result<Option<Receipt>, Self::Error>;
 
-    /// tx_hash → BPosition (the `tx_hash_index` table in S6).
+    /// tx_hash to BPosition lookup. This is the `tx_hash_index` table the
+    /// state writer maintains.
     fn get_tx_position(&self, tx_hash: B256) -> Result<Option<BPosition>, Self::Error>;
 
-    /// Open an INDEPENDENT read view anchored at the same state as `self`
-    /// (mdbx: a fresh RO txn at the same MVCC anchor), so sibling worker
-    /// threads read without contending on this view's backend cursor —
-    /// sharing one mdbx snapshot across W workers serializes their reads
-    /// (measured slower than sequential at w=4 in the Block-STM campaign).
+    /// Open an independent read view anchored at the same state as `self`.
+    /// In mdbx this is a fresh read-only transaction at the same MVCC
+    /// anchor. Sibling worker threads then read without contending on this
+    /// view's backend cursor. Sharing one mdbx snapshot across W workers
+    /// serializes their reads; the Block-STM benchmarks measured this as
+    /// slower than running sequentially at w=4.
     ///
-    /// `None` when the backend cannot mint one, or cannot PROVE the fresh
-    /// view anchors at the same state (the writer advanced mid-mint) —
-    /// callers then share `self`, which is always correct, merely
-    /// serialized. The blanket `&T` impl keeps this default (it cannot
-    /// return an owned `&T` from a mint); parallel strategies hold a
-    /// concrete `S`, so the default only ever means "share".
+    /// Returns `None` when the backend cannot mint a new view, or cannot
+    /// prove the fresh view anchors at the same state (for example, the
+    /// writer advanced mid-mint). Callers then share `self` instead, which
+    /// is always correct, only serialized. The blanket `&T` impl keeps this
+    /// default, because it cannot return an owned `&T` from a mint.
+    /// Parallel strategies hold a concrete `S`, so the default always means
+    /// "share".
     fn fork_view(&self) -> Option<Self>
     where
         Self: Sized,
@@ -47,9 +51,9 @@ pub trait StateDatabase: Send + Sync {
         None
     }
 }
-/// Borrowed databases are databases: lets [`ExecScope`]-style owners hold
-/// either an owned snapshot (executor per-block scope) or a borrow
-/// (compat wrapper, validator batches) behind one generic.
+/// A borrowed database is a database. This lets an [`ExecScope`]-style
+/// owner hold either an owned snapshot (the executor's per-block scope) or
+/// a borrow (a compat wrapper, or validator batches) behind one generic type.
 impl<T: StateDatabase> StateDatabase for &T {
     type Error = T::Error;
     fn basic(&self, address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error> {

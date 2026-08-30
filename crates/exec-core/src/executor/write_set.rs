@@ -13,27 +13,23 @@ use alloc::collections::BTreeMap;
 
 use crate::delta::WriteSet;
 
-/// Build a `WriteSet` from CacheDB's accumulated cache. Unlike
-/// [`write_set_from_evm_state`] (which iterates revm's per-tx
-/// `EvmState`), this iterates `CacheDB::cache.accounts` after the deposit's
-/// commit cycle is complete, so the resulting WriteSet covers BOTH the
-/// mint pre-credit and any inner-call writes. Accounts in state `None`
-/// (loaded but unchanged) and `NotExisting` (never observed) are skipped.
-/// Record a deposit's WriteSet into the block Bal as WRITES (constructed
-/// accounts — the commit-cache shape loses original values, so
-/// `original_value` is fabricated to differ from present, forcing write
-/// classification; only present values are ever serialized). Both executor
-/// and validator build deposit claims through this same path, keeping the
-/// claims symmetric. Reads are not attributed for deposits.
+/// Record a deposit's `WriteSet` into the block BAL as writes. The
+/// commit-cache shape used to build a deposit's `WriteSet` loses original
+/// values, so this fabricates `original_value` to differ from
+/// `present_value`, forcing write classification. Only present values are
+/// ever serialized. Both the executor and the validator build deposit
+/// claims through this same path, so the claims stay symmetric. Reads are
+/// not attributed for deposits.
 ///
-/// Classification in revm's Bal is per FIELD, each compared against the
-/// fabricated original — so every field a later batch may seed from must
-/// have its original forced to differ. Nonce and balance always (post-values
-/// only; the mint IS a balance claim), code only when this record deployed
-/// it (`ws.code` carries created-only bytecode, and the claim must include
-/// the BYTES — code is a seed, see `ClaimIndex::code`). The first version
-/// fabricated only the nonce, and per-field classification silently dropped
-/// the balance and code claims: the deposit mint never reached the BAL.
+/// Revm's BAL classifies changes per field, each compared against the
+/// fabricated original. So every field a later batch may seed from must
+/// have its original forced to differ. This always applies to nonce and
+/// balance (post-values only; the mint is itself a balance claim), and to
+/// code only when this record deployed it (`ws.code` carries only newly
+/// created bytecode, and the claim must include the bytes, since code is
+/// a seed; see `ClaimIndex::code`). An earlier version fabricated only
+/// the nonce, and per-field classification silently dropped the balance
+/// and code claims, so the deposit mint never reached the BAL.
 impl WriteSet {
     /// See the module docs above this impl for the fabrication rationale.
     pub fn record_into_bal(&self, bal: &mut revm::state::bal::Bal, bal_index: u64) {
@@ -47,7 +43,7 @@ impl WriteSet {
         write_set_from_evm_state_inner(state)
     }
 
-    /// [`Self::from_evm_state`] with DEPOSIT artifact fidelity: every
+    /// [`Self::from_evm_state`], with deposit artifact fidelity: every
     /// accessed slot of a touched account is emitted, read-only slots
     /// included, at the present value. The historic deposit path derived
     /// its WriteSet from a fresh `CacheDB` (which caches reads), so the
@@ -57,10 +53,10 @@ impl WriteSet {
     /// `deposit.rs` is the gate.
     pub fn from_evm_state_deposit(state: &revm::state::EvmState) -> Self {
         let mut ws = write_set_from_evm_state_inner(state);
-        // Re-walk for the artifact parts the per-tx filter drops:
-        // read-only slots, and the code bytes of CALLED contracts (the
-        // fresh cache carried both — reads land in the cache, and a
-        // called contract's bytecode lands in `cache.contracts`).
+        // Re-walk for the artifact parts the per-tx filter drops: read-only
+        // slots, and the code bytes of called contracts. The fresh cache
+        // carried both: reads land in the cache, and a called contract's
+        // bytecode lands in `cache.contracts`.
         for (addr, account) in state.iter() {
             if !account.is_touched() {
                 continue;
@@ -110,8 +106,8 @@ fn record_writeset_into_bal_inner(bal: &mut revm::state::bal::Bal, bal_index: u6
         original.nonce = original.nonce.wrapping_add(1);
         original.balance = original.balance.wrapping_add(U256::ONE);
         if deployed_here {
-            // `ws.code` never carries empty bytecode, so KECCAK256_EMPTY is
-            // guaranteed to differ from the deployed hash.
+            // `ws.code` never carries empty bytecode, so KECCAK256_EMPTY
+            // always differs from the deployed hash.
             original.code_hash = alloy_primitives::KECCAK256_EMPTY;
             original.code = None;
         }
@@ -143,7 +139,7 @@ fn record_writeset_into_bal_inner(bal: &mut revm::state::bal::Bal, bal_index: u6
         entry.storage.insert(
             slot_key,
             EvmStorageSlot {
-                original_value: !*value, // != present ⇒ classified as write
+                original_value: !*value, // differs from present_value, so this is a write
                 present_value: *value,
                 transaction_id: 0,
                 is_cold: false,
@@ -155,6 +151,13 @@ fn record_writeset_into_bal_inner(bal: &mut revm::state::bal::Bal, bal_index: u6
     }
 }
 
+/// Build a `WriteSet` from `CacheDB`'s accumulated cache. Unlike
+/// [`write_set_from_evm_state`] (which iterates revm's per-tx
+/// `EvmState`), this iterates `CacheDB::cache.accounts` after the
+/// deposit's commit cycle completes. So the resulting `WriteSet` covers
+/// both the mint pre-credit and any inner-call writes. This skips
+/// accounts in state `None` (loaded but unchanged) and `NotExisting`
+/// (never observed).
 pub(super) fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
     let mut ws = WriteSet::default();
     for (addr, account) in state.accounts.iter() {
@@ -169,9 +172,10 @@ pub(super) fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
         ws.accounts
             .push((*addr, (info.nonce, info.balance, info.code_hash)));
 
-        // CacheDB stores bytecode separately by code_hash; resolve via the
-        // `contracts` map. KECCAK_EMPTY (canonical empty-code) and empty
-        // bytecode are not worth shipping in the delta.
+        // CacheDB stores bytecode separately, by code_hash. Resolve it
+        // through the `contracts` map. Skip KECCAK_EMPTY (the canonical
+        // empty-code hash) and empty bytecode; neither is worth shipping
+        // in the delta.
         if info.code_hash != KECCAK_EMPTY
             && let Some(code) = state.contracts.get(&info.code_hash)
             && !code.is_empty()
@@ -191,14 +195,14 @@ pub(super) fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
     ws
 }
 
-/// Public: the Block-STM engine (`kardamom-stm`) builds per-tx write sets
-/// from its own revm outcomes with exactly these emission rules — touched
-/// accounts, changed slots, created code only.
+/// Public API: the Block-STM engine (`kardamom-stm`) builds per-tx write
+/// sets from its own revm outcomes, using exactly these emission rules:
+/// touched accounts, changed slots, and created code only.
 fn write_set_from_evm_state_inner(state: &revm::state::EvmState) -> WriteSet {
     let mut ws = WriteSet::default();
     for (addr, account) in state.iter() {
         // Only emit accounts revm marked as touched. Untouched entries are
-        // pure reads.
+        // only reads.
         if !account.is_touched() {
             continue;
         }
@@ -206,13 +210,14 @@ fn write_set_from_evm_state_inner(state: &revm::state::EvmState) -> WriteSet {
         ws.accounts
             .push((*addr, (info.nonce, info.balance, info.code_hash)));
 
-        // Code bytes: ONLY for accounts CREATED this tx. revm also loads
-        // the bytecode of every contract merely CALLED (`info.code` is
-        // populated on load), and the old unconditional capture copied the
-        // full runtime into the WriteSet per call — 1.6KB/tx on CLOB
-        // workloads, the second-largest allocation site post-ExecScope.
-        // A called contract's code is already durable (snapshot/parent);
-        // only a CREATE introduces new bytes the delta must carry.
+        // Code bytes: only for accounts created this tx. Revm also loads
+        // the bytecode of every contract that is merely called (`info.code`
+        // is populated on load). An earlier version copied the full
+        // runtime into the `WriteSet` on every call, unconditionally,
+        // costing about 1.6KB/tx on CLOB workloads, the second-largest
+        // allocation site after `Executor`. A called contract's code is
+        // already durable (in the snapshot or parent); only a CREATE
+        // introduces new bytes that the delta must carry.
         if account.is_created()
             && let Some(code) = info.code.as_ref()
             && info.code_hash != KECCAK_EMPTY
@@ -226,7 +231,7 @@ fn write_set_from_evm_state_inner(state: &revm::state::EvmState) -> WriteSet {
 
         for (key, slot) in account.storage.iter() {
             // Only record slots whose present_value differs from the
-            // original_value. revm tracks both on `EvmStorageSlot`.
+            // original_value. Revm tracks both on `EvmStorageSlot`.
             if slot.original_value != slot.present_value {
                 let b_key = B256::from(key.to_be_bytes::<32>());
                 ws.storage.push(((*addr, b_key), slot.present_value));

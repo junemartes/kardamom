@@ -20,9 +20,9 @@ sol! {
 
 const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
 
-/// Set up an anvil instance with ERC-7955 factory preloaded and DEV_OWNER impersonated
-/// (so transactions from DEV_OWNER don't need a private key). Returns None if anvil
-/// isn't available.
+/// Set up an anvil instance with the ERC-7955 factory preloaded. Impersonate
+/// DEV_OWNER, so transactions from it need no private key. Return `None` if
+/// anvil is not available.
 async fn setup_anvil_with_erc7955() -> Option<(
     alloy_node_bindings::AnvilInstance,
     impl alloy_provider::Provider + Clone,
@@ -38,7 +38,7 @@ async fn setup_anvil_with_erc7955() -> Option<(
         .await
         .ok()?;
 
-    // Fund and impersonate DEV_OWNER so transactions from it are accepted without a key.
+    // Fund DEV_OWNER and impersonate it, so its transactions need no key.
     let _: serde_json::Value = provider
         .raw_request(
             "anvil_setBalance".into(),
@@ -144,15 +144,14 @@ async fn multi_l2_deploy_and_atomic_upgrade() {
         "impl must be shared via dedup"
     );
 
-    // State independence: each proxy's l2Minter is its own.
+    // Each proxy keeps its own l2Minter value.
     let lock_a = ETHLockbox::new(e42.proxy, provider.clone());
     let lock_b = ETHLockbox::new(e43.proxy, provider.clone());
     assert_eq!(lock_a.l2Minter().call().await.unwrap(), l2_minter_a);
     assert_eq!(lock_b.l2Minter().call().await.unwrap(), l2_minter_b);
 
-    // Deposit on L2 A only — L2 B's nonce stays at 0.
-    // Use anvil's funded account (addresses()[0]) to pay for the deposit, not DEV_OWNER.
-    // DEV_OWNER can also send ETH since we funded it above.
+    // Deposit on L2 A only, so L2 B's nonce stays at 0. DEV_OWNER pays for
+    // the deposit; it can send ETH because it was funded above.
     let target = address!("0000000000000000000000000000000000000022");
     lock_a
         .depositETH(target, 100_000, Bytes::new())
@@ -199,7 +198,7 @@ async fn multi_l2_deploy_and_atomic_upgrade() {
         "upgraded impl must still be shared"
     );
 
-    // L2 A's deposit nonce survived the upgrade (state preserved).
+    // L2 A's deposit nonce stays the same after the upgrade. State is preserved.
     assert_eq!(lock_a.depositNonce().call().await.unwrap(), 1u64);
     assert_eq!(lock_b.depositNonce().call().await.unwrap(), 0u64);
 

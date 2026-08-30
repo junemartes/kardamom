@@ -1,9 +1,10 @@
-//! Pins the `L2ToL1MessagePasser` predeploy in `chains/dev-withdrawals.toml`:
+//! Checks the `L2ToL1MessagePasser` predeploy in `chains/dev-withdrawals.toml`.
+//! The predeploy:
 //!   * exists at the canonical message-passer address,
-//!   * carries runtime bytecode byte-equal to the forge-compiled artifact.
+//!   * has runtime bytecode that is byte-equal to the forge-compiled artifact.
 //!
-//! Regression target: editing the contract without regenerating the genesis
-//! `code` (or vice versa) breaks this test before it breaks a dev chain.
+//! This test fails before a dev chain breaks, if someone edits the contract
+//! without regenerating the genesis `code`, or the other way around.
 
 use std::path::PathBuf;
 
@@ -27,7 +28,7 @@ fn dev_withdrawals_genesis_predeploys_message_passer_with_artifact_bytecode() {
         .find(|e| e.address == MESSAGE_PASSER)
         .unwrap_or_else(|| panic!("no alloc for message passer {MESSAGE_PASSER}"));
 
-    // Artifact side: forge's deployedBytecode is the runtime code a predeploy seeds.
+    // Artifact side. The forge deployedBytecode field holds the runtime code for a predeploy.
     let artifact = workspace.join("contracts/out/L2ToL1MessagePasser.sol/L2ToL1MessagePasser.json");
     let Ok(raw_artifact) = std::fs::read_to_string(&artifact) else {
         eprintln!("SKIP: {} not built (run forge build)", artifact.display());

@@ -1,17 +1,18 @@
-//! M-archive (tx_ordering + per-sequencer tx_data) offline reader tests.
+//! M-archive (tx_ordering plus per-sequencer tx_data) offline reader tests.
 //!
 //! Covers:
-//!   * happy-path in-order resolution (refs come on B after the env was
-//!     written to A — the natural case the sequencer drives);
-//!   * out-of-order open: refs on B reference A-positions that haven't been
-//!     read yet (we pre-load the A index, so it works either way — the test
-//!     pins this invariant down);
-//!   * missing-A-archive surfaced as a `BatcherError::Config`;
-//!   * canonical-ordering invariant: the output `position` field is the
-//!     tx_ordering canonical position, not the A-archive position the envelope
-//!     was fetched from.
+//!   - The happy path, in-order resolution: refs come on B after the
+//!     envelope was written to A. This is the natural case, driven by the
+//!     sequencer.
+//!   - Out-of-order open: refs on B point at A-positions that have not
+//!     been read yet. The reader pre-loads the A index, so it works either
+//!     way. This test pins that invariant down.
+//!   - A missing A-archive, surfaced as a `BatcherError::Config`.
+//!   - The canonical-ordering invariant: the output `position` field is the
+//!     tx_ordering canonical position, not the A-archive position the
+//!     envelope was fetched from.
 //!
-//! Also exercises the CLI spec parser.
+//! It also exercises the CLI spec parser.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -123,8 +124,8 @@ fn happy_path_in_order_resolution() {
     let records: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(records.len(), 5);
 
-    // Canonical order matches the tx_ordering walk; payload bytes resolved
-    // from the correct A-archive.
+    // The canonical order matches the tx_ordering walk. Payload bytes are
+    // resolved from the correct A-archive.
     let expected_correlation = [10u64, 20, 11, 21];
     for (i, exp) in expected_correlation.iter().enumerate() {
         let ResolvedRecord::Tx {
@@ -152,12 +153,13 @@ fn happy_path_in_order_resolution() {
 
 #[test]
 fn out_of_order_b_refs_a_positions_still_resolve() {
-    // TxOrdering carries refs in the canonical order — which may point at
-    // A-positions on different sequencers and in non-monotone A-position
-    // order (a sequencer that wrote envelopes to its own A at positions 0,
-    // 128, 256 may have those positions appear on B in the order 256, 128,
-    // 0 if its earlier offers were back-pressured behind another
-    // sequencer's). The pre-loaded per-A index resolves them regardless.
+    // TxOrdering carries refs in the canonical order. These can point at
+    // A-positions on different sequencers, and not in increasing A-position
+    // order. For example, a sequencer that wrote envelopes to its own A at
+    // positions 0, 128, and 256 might see those positions appear on B in
+    // the order 256, 128, 0, if its earlier offers were queued behind
+    // another sequencer's. The pre-loaded per-A index resolves them
+    // regardless.
     let dir = TempDir::new().unwrap();
 
     let a0 = write_segment(

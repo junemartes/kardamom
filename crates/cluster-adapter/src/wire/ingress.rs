@@ -1,8 +1,8 @@
-//! Ingress-direction codec (Rust sequencer → cluster): guarded record frames,
-//! batches, the origin-advancing epoch record, the subscribe / replay-request
-//! control messages, and the guard-header splitters used by tests and the
-//! in-Rust service mock. Frame layouts are documented on the `KIND_*`
-//! constants in the parent module.
+//! Ingress-direction codec (Rust sequencer to cluster). It covers guarded
+//! record frames, batches, the origin-advancing epoch record, the
+//! subscribe and replay-request control messages, and the guard-header
+//! splitters used by tests and the in-Rust service mock. Frame layouts
+//! are documented on the `KIND_*` constants in the parent module.
 
 use alloy_primitives::Address;
 use kardamom_types::epoch::EpochRecord;
@@ -15,11 +15,11 @@ use super::{
     rd_u64,
 };
 
-// ── encode (ingress: Rust → cluster) ────────────────────────────────────────
+// ── encode (ingress: Rust to cluster) ───────────────────────────────────────
 
-/// Encode a `TxRef` as an ingress app message. `sender`/`nonce` feed the
-/// service's per-sender contiguity guard (#85 fix B) and are NOT part of the
-/// relayed payload — executors never see them.
+/// Encode a `TxRef` as an ingress app message. `sender` and `nonce` feed
+/// the service's per-sender contiguity guard. They are not part of the
+/// relayed payload; executors never see them.
 pub fn encode_ingress_txref(r: &TxRef, sender: Address, nonce: u64) -> Vec<u8> {
     let mut b = Vec::with_capacity(INGRESS_CANONICAL_ID_OFFSET + CANONICAL_ID_LEN + 1 + 1 + 8 + 4);
     b.push(KIND_INGRESS_RECORD);
@@ -30,13 +30,15 @@ pub fn encode_ingress_txref(r: &TxRef, sender: Address, nonce: u64) -> Vec<u8> {
     b.push(r.shard_id);
     b.extend_from_slice(&r.tx_data_position.term_id.to_le_bytes());
     b.extend_from_slice(&r.tx_data_position.term_offset.to_le_bytes());
-    // tx_data publisher session (active/active ingress join discriminator).
+    // tx_data publisher session. This is the active/active ingress join
+    // discriminator.
     b.extend_from_slice(&r.tx_data_session_id.to_le_bytes());
     b
 }
 
-/// Encode a `DepositRef` as an ingress app message. Deposits carry no sender
-/// nonce; the all-zero sender marks the record guard-exempt.
+/// Encode a `DepositRef` as an ingress app message. Deposits carry no
+/// sender nonce. The all-zero sender marks the record as exempt from the
+/// guard check.
 pub fn encode_ingress_depositref(r: &DepositRef) -> Vec<u8> {
     let mut b = Vec::with_capacity(INGRESS_CANONICAL_ID_OFFSET + CANONICAL_ID_LEN + 1 + 8);
     b.push(KIND_INGRESS_RECORD);
@@ -49,13 +51,13 @@ pub fn encode_ingress_depositref(r: &DepositRef) -> Vec<u8> {
     b
 }
 
-/// Encode an [`EpochRecord`] as an ORIGIN-ADVANCING ingress message:
+/// Encode an [`EpochRecord`] as an origin-advancing ingress message:
 /// `[kind=4][canonical_id:32][l1_origin:u64][slot_count:u32][RT_EPOCH][rkyv
 /// EpochRecord…]`.
 ///
-/// The service closes the current block before relaying this, so the epoch's
-/// deposits lead a block, and adopts `l1_origin` for later boundaries.
-/// `slot_count` is [`epoch_slots`].
+/// The service closes the current block before relaying this, so the
+/// epoch's deposits lead a new block. It also adopts `l1_origin` for
+/// later boundaries. `slot_count` is [`epoch_slots`].
 pub fn encode_ingress_epoch(epoch: &EpochRecord) -> Result<Vec<u8>, WireError> {
     let body = rkyv::to_bytes::<rkyv::rancor::Error>(epoch)
         .map_err(|e| WireError::BadEpoch(e.to_string()))?;
@@ -73,10 +75,11 @@ pub fn encode_ingress_epoch(epoch: &EpochRecord) -> Result<Vec<u8>, WireError> {
 }
 
 /// Encode an egress-subscribe announcement (ingress): `[kind:u8 = 2]`. A
-/// session that sends this is a canonical-stream consumer — the service
-/// includes it in the per-record/per-boundary egress fan-out. Publisher-only
-/// sessions (sequencers) never send it and stop receiving the canonical
-/// broadcast they were dropping client-side anyway.
+/// session that sends this is a canonical-stream consumer. The service
+/// includes it in the per-record and per-boundary egress fan-out.
+/// Publisher-only sessions (sequencers) never send it. They stop
+/// receiving the canonical broadcast, which they were already dropping
+/// on the client side.
 pub fn encode_subscribe() -> Vec<u8> {
     vec![KIND_SUBSCRIBE]
 }
@@ -94,8 +97,8 @@ pub fn encode_ingress_batch(entries: &[Vec<u8>]) -> Vec<u8> {
     b
 }
 
-/// Decode a batch frame — used by tests / a Rust service mock (the real
-/// service-side decode lives in the Java `SealerClusteredService`).
+/// Decode a batch frame. Used by tests and a Rust service mock. The real
+/// service-side decode lives in the Java `SealerClusteredService`.
 pub fn decode_ingress_batch(buf: &[u8]) -> Result<Vec<&[u8]>, WireError> {
     if buf.first() != Some(&KIND_BATCH) {
         return Err(WireError::BadEgressKind(*buf.first().unwrap_or(&255)));
@@ -132,8 +135,8 @@ pub fn encode_replay_request(from_index: u64, from_block: u64) -> Vec<u8> {
     encode_kind_2u64(KIND_REPLAY_REQUEST, from_index, from_block)
 }
 
-/// Decode a replay request — used by tests / a Rust service mock (the real
-/// service-side decode lives in the Java `SealerClusteredService`).
+/// Decode a replay request. Used by tests and a Rust service mock. The
+/// real service-side decode lives in the Java `SealerClusteredService`.
 pub fn decode_replay_request(buf: &[u8]) -> Result<(u64, u64), WireError> {
     if buf.first() != Some(&KIND_REPLAY_REQUEST) {
         return Err(WireError::BadEgressKind(*buf.first().unwrap_or(&255)));
@@ -143,11 +146,11 @@ pub fn decode_replay_request(buf: &[u8]) -> Result<(u64, u64), WireError> {
 
 // ── ingress-frame splitters (the service's view of a record) ────────────────
 
-/// The `(canonical_id, relayed_payload)` a cluster service extracts from an
-/// ingress message — `relayed_payload` is everything from `canonical_id`
-/// onward (what the Java service forwards to egress); the guard header
-/// (`sender`/`nonce`) before it is consumed by the service and never
-/// relayed. Used by the in-Rust service mock in tests.
+/// The `(canonical_id, relayed_payload)` pair that a cluster service
+/// extracts from an ingress message. `relayed_payload` is everything from
+/// `canonical_id` onward: what the Java service forwards to egress. The
+/// guard header (`sender` and `nonce`) before it is consumed by the
+/// service and never relayed. Used by the in-Rust service mock in tests.
 pub fn split_ingress(buf: &[u8]) -> Result<([u8; 32], &[u8]), WireError> {
     let payload = buf
         .get(INGRESS_CANONICAL_ID_OFFSET..)
@@ -168,9 +171,9 @@ pub fn split_ingress(buf: &[u8]) -> Result<([u8; 32], &[u8]), WireError> {
     Ok((cid, payload))
 }
 
-/// The `(sender, nonce)` guard header of an ingress record frame — what the
-/// Java service feeds the per-sender contiguity guard. Used by tests and the
-/// in-Rust service mock.
+/// The `(sender, nonce)` guard header of an ingress record frame. The
+/// Java service feeds this to the per-sender contiguity guard. Used by
+/// tests and the in-Rust service mock.
 pub fn ingress_sender_nonce(buf: &[u8]) -> Result<(Address, u64), WireError> {
     let sender = buf
         .get(INGRESS_SENDER_OFFSET..INGRESS_SENDER_OFFSET + SENDER_LEN)

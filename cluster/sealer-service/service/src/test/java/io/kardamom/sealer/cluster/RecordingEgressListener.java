@@ -9,8 +9,8 @@ import org.agrona.DirectBuffer;
 
 /**
  * Decoding {@link EgressListener} shared by the in-JVM TestCluster tests
- * ({@link SealerClusterFailoverTest}, {@link SealerReplayTest}). Records the
- * union of what those tests assert on:
+ * ({@link SealerClusterFailoverTest}, {@link SealerReplayTest}). It records
+ * everything those tests assert on:
  * <ul>
  *   <li>the ordered canonical {@code index} of every RELAYED frame;</li>
  *   <li>the count and min/max {@code blockNumber} of every BOUNDARY frame;</li>
@@ -19,15 +19,15 @@ import org.agrona.DirectBuffer;
  * </ul>
  * The frame layouts match {@link SealerEgress}'s framing (little-endian).
  *
- * <p>The listener runs inline on the test's {@code pollEgress()} thread
- * (single-threaded with the await loops), so plain fields are consistent.</p>
+ * <p>The listener runs inline on the test's {@code pollEgress()} thread. This
+ * thread also runs the await loops, so plain fields stay consistent.</p>
  */
 final class RecordingEgressListener implements EgressListener {
     final List<Long> relayedIndexes = new ArrayList<>();
     long maxBoundaryBlockNumber = Long.MIN_VALUE;
     long minBoundaryBlockNumber = Long.MAX_VALUE;
-    // Count of BOUNDARY frames seen — lets a yield-await loop poll for "at least
-    // one boundary has fired" without depending on a particular blockNumber.
+    // Count of BOUNDARY frames seen. A yield-await loop can poll for "at least
+    // one boundary fired" without checking a specific blockNumber.
     long boundaryCount = 0;
     long replayDoneCount = 0;
     long replayUnavailableCount = 0;

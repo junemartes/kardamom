@@ -1,24 +1,27 @@
 //! Time-budgeted retry for Aeron `offer`, shared by the publisher adapters
 //! ([`crate::publisher`] and [`crate::aeron_live`]).
 //!
-//! Aeron's `offer` returns a non-negative stream position on success, or a
-//! negative status code on failure: `NOT_CONNECTED (-1)` when no subscriber
-//! image has formed yet, `BACK_PRESSURED (-2)` when the term window is full,
-//! plus `ADMIN_ACTION (-3)` / `PUBLICATION_CLOSED (-4)` / `MAX_POSITION (-5)`.
+//! Aeron's `offer` returns a non-negative stream position on success. On
+//! failure it returns a negative status code: `NOT_CONNECTED (-1)` when no
+//! subscriber image has formed yet, `BACK_PRESSURED (-2)` when the term
+//! window is full, plus `ADMIN_ACTION (-3)`, `PUBLICATION_CLOSED (-4)`, and
+//! `MAX_POSITION (-5)`.
 //!
-//! The previous loop spun a fixed 1024 times (microseconds) and treated every
-//! negative code identically, so a publisher whose subscriber had not *yet*
-//! joined gave up almost instantly. Aeron does **not** replay pre-subscription
-//! history, so that first frame was silently lost. Over IPC the connection
-//! forms within the spin budget, which is why the single-host e2e worked (and
-//! why it still wraps its pipeline bring-up in a fixed `sleep`); over UDP
-//! multicast — where image establishment takes 100s of milliseconds — the
-//! publisher dropped the message and nothing flowed downstream.
+//! An earlier loop spun a fixed 1024 times (microseconds) and treated every
+//! negative code the same way. A publisher whose subscriber had not yet
+//! joined gave up almost at once. Aeron does not replay history from before
+//! a subscription starts, so that first frame was lost with no warning. Over
+//! IPC the connection forms within the spin budget, so the single-host e2e
+//! test worked (it still wraps its pipeline bring-up in a fixed `sleep`).
+//! Over UDP multicast, where image establishment can take hundreds of
+//! milliseconds, the publisher dropped the message and nothing moved
+//! downstream.
 //!
-//! [`offer_with_deadline`] fixes this: it spins briefly for transient
-//! back-pressure (the receiver drains within microseconds), then backs off to
-//! 1 ms sleeps, retrying until the offer succeeds or a deadline passes. So the
-//! first publish *waits* for the subscriber to connect and is delivered.
+//! [`offer_with_deadline`] fixes this. It spins briefly for transient
+//! back-pressure (the receiver drains within microseconds), then backs off
+//! to 1 ms sleeps, and retries until the offer succeeds or a deadline
+//! passes. The first publish now waits for the subscriber to connect, and
+//! is delivered.
 
 use std::time::{Duration, Instant};
 
@@ -26,17 +29,18 @@ use tracing::warn;
 
 use crate::error::LogError;
 
-/// How long to keep retrying a failing offer before giving up. Sized to cover
-/// UDP-multicast image establishment (the rusteron docs bound a connect wait at
-/// 5 s) plus margin; in steady state, once the subscriber is connected, an
-/// offer succeeds on the first attempt and this budget is never approached.
+/// How long to keep retrying a failing offer before giving up. This covers
+/// UDP-multicast image establishment (the rusteron docs bound a connect wait
+/// at 5 s) plus margin. Once the subscriber is connected, an offer succeeds
+/// on the first attempt, so this budget is rarely approached.
 pub(crate) const OFFER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Spin (busy-wait, no sleep) for this many initial attempts — the low-latency
-/// path for transient back-pressure, where the receiver frees the term window
-/// within microseconds. Past it we sleep, since a negative code that persists
-/// beyond a spin burst is almost always `NOT_CONNECTED` (a subscriber image that
-/// has not formed), and continuing to spin would just burn a core.
+/// Spin (busy-wait, no sleep) for this many initial attempts. This is the
+/// low-latency path for transient back-pressure, where the receiver frees
+/// the term window within microseconds. After this, the code sleeps: a
+/// negative code that outlasts a spin burst is almost always
+/// `NOT_CONNECTED` (no subscriber image yet), and more spinning would only
+/// burn a core.
 const SPIN_ATTEMPTS: u64 = 1024;
 
 /// Human-readable label for an Aeron offer status code (negative = failure).
@@ -52,11 +56,11 @@ pub(crate) fn offer_code_str(code: i64) -> &'static str {
 }
 
 /// Retry `try_offer` until it returns a non-negative position or `timeout`
-/// elapses, returning the raw success code (the caller decodes the position).
+/// elapses. Returns the raw success code; the caller decodes the position.
 ///
 /// `try_offer` is the bare Aeron `offer` call (returns `>= 0` position or a
-/// negative status). See the module docs for why this waits rather than failing
-/// fast after a fixed spin count.
+/// negative status). See the module docs for why this waits, instead of
+/// failing fast after a fixed spin count.
 pub(crate) fn offer_with_deadline(
     mut try_offer: impl FnMut() -> i64,
     timeout: Duration,
@@ -79,8 +83,8 @@ pub(crate) fn offer_with_deadline(
         if attempt <= SPIN_ATTEMPTS {
             std::hint::spin_loop();
         } else {
-            // Throttled so a long wait (e.g. a subscriber that is slow to join)
-            // is visible without flooding the log.
+            // Log throttling makes a long wait (e.g. a slow subscriber) visible
+            // without flooding the log.
             if attempt.is_multiple_of(1024) {
                 warn!(
                     code = offer_code_str(code),
@@ -100,8 +104,8 @@ mod tests {
 
     #[test]
     fn succeeds_immediately_when_offer_ok() {
-        // A connected publication returns a position on the first try — no spin,
-        // no sleep, no waiting.
+        // A connected publication returns a position on the first try.
+        // There is no spin, no sleep, and no wait.
         let calls = Cell::new(0u64);
         let r = offer_with_deadline(
             || {
@@ -117,11 +121,11 @@ mod tests {
 
     #[test]
     fn waits_out_not_connected_then_delivers() {
-        // THE regression: a subscriber that connects only after the publisher
-        // has been offering for a while. NOT_CONNECTED (-1) for the first 1100
+        // Regression test: a subscriber connects only after the publisher has
+        // been offering for a while. NOT_CONNECTED (-1) for the first 1100
         // attempts (past the spin budget, into the sleep phase), then a real
-        // position. The old fixed 1024-spin loop returned Err here; the fix must
-        // keep retrying and deliver.
+        // position. The old fixed 1024-spin loop returned Err here. The fix
+        // must keep retrying and deliver.
         let n = Cell::new(0u64);
         let r = offer_with_deadline(
             || {
@@ -138,8 +142,8 @@ mod tests {
 
     #[test]
     fn retries_transient_back_pressure() {
-        // BACK_PRESSURED (-2) a handful of times then success — handled in the
-        // fast spin path without sleeping.
+        // BACK_PRESSURED (-2) a few times, then success. The fast spin path
+        // handles this without sleeping.
         let n = Cell::new(0u64);
         let r = offer_with_deadline(
             || {
@@ -156,7 +160,7 @@ mod tests {
     #[test]
     fn times_out_when_never_connected() {
         // A publication whose subscriber never joins must error after the
-        // deadline (rather than spin forever or fail in microseconds).
+        // deadline. It must not spin forever or fail in microseconds.
         let start = Instant::now();
         let err = offer_with_deadline(|| -1, Duration::from_millis(60)).expect_err("must time out");
         assert!(

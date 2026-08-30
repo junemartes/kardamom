@@ -1,6 +1,6 @@
-//! `kardamom-stm-p0` — Block-STM P0 report: oracle critical-path analysis and
-//! footprint-classifier grading over real workloads, offline, through
-//! the real engine. (spec: docs/agents/block-stm-executor-spec.md)
+//! `kardamom-stm-p0` produces the offline Block-STM report: oracle
+//! critical-path analysis and footprint-classifier grading over real
+//! workloads, offline, through the real engine.
 
 use alloy_primitives::U256;
 use clap::Parser;
@@ -16,7 +16,7 @@ const ANVIL_MNEMONIC: &str = "test test test test test test test test test test 
 #[derive(Parser, Debug)]
 #[command(name = "kardamom-stm-p0")]
 struct Args {
-    /// uniswap | defi | transfers
+    /// One of: uniswap, defi, transfers.
     #[arg(long, default_value = "uniswap")]
     scenario: String,
     #[arg(long, default_value_t = 4)]
@@ -27,38 +27,40 @@ struct Args {
     blocks: usize,
     #[arg(long, default_value_t = 200)]
     block_size: usize,
-    /// % of flow ops that are swaps (uniswap scenario).
+    /// The percentage of flow operations that are swaps, for the
+    /// uniswap scenario.
     #[arg(long, default_value_t = 70)]
     swap_share: u64,
-    /// % of swaps hitting a non-home pair.
+    /// The percentage of swaps that hit a pair other than the home pair.
     #[arg(long, default_value_t = 10)]
     cross: u64,
     #[arg(long, default_value_t = 0.5)]
     train_frac: f64,
-    /// Apply the Accumulator treatment: exclude universal-write cells
-    /// (>95% of txs) from the conflict graphs.
+    /// Apply the accumulator treatment: exclude universal-write cells,
+    /// touched by more than 95% of transactions, from the conflict graphs.
     #[arg(long, default_value_t = false)]
     accumulator: bool,
-    /// P1 shadow replay: stream the capture through the LIVE shadow loop
-    /// (predict with prior-blocks-only stats -> grade -> train, per block,
-    /// cold start) and print the per-block curve the executor's
-    /// footprint-shadow thread would emit. This is the P1 measurement,
-    /// offline: same grade_block, same cap, same exclusion.
+    /// Run the shadow replay: stream the capture through the live
+    /// shadow loop, meaning predict with prior-blocks-only stats, grade,
+    /// then train, for each block, from a cold start, and print the
+    /// per-block curve the executor's footprint-shadow thread would
+    /// emit. This is the shadow measurement, offline, with the same
+    /// grade_block, cap, and exclusion the live thread uses.
     #[arg(long, default_value_t = false)]
     shadow: bool,
     #[arg(long, default_value = ".")]
     repo_root: String,
     #[arg(long, default_value_t = 412346)]
     chain_id: u64,
-    /// Optional JSON report path.
+    /// An optional JSON report path.
     #[arg(long)]
     json: Option<String>,
 }
 
-/// The P1 loop, replayed offline: per block in stream order, grade with the
-/// stats as they stood BEFORE the block, then train on it — the executor's
-/// footprint-shadow thread does exactly this per boundary (engine::shadow).
-/// GRADE_CAP mirrors the live constant.
+/// The shadow loop, replayed offline: for each block, in stream order,
+/// grade with the stats as they stood before the block, then train on
+/// it. The executor's footprint-shadow thread does exactly this at
+/// each boundary; see `engine::shadow`. `GRADE_CAP` mirrors the live constant.
 fn shadow_replay(obs: &[capture::TxObs], exclude: &HashSet<Cell>) {
     use kardamom_footprint::grade::grade_block;
     const GRADE_CAP: usize = 2_048;
@@ -152,7 +154,7 @@ fn main() -> anyhow::Result<()> {
                 (w.setup_blocks, w.flow_blocks)
             }
             "defi" => {
-                // BenchDefi single-instance: the max-contention scenario.
+                // BenchDefi single-instance: this is the max-contention scenario.
                 let (deploys, contracts) =
                     defi::deployment_txs(&signers, a.chain_id, 0, 1_000_000_000)?;
                 let per_sender = (a.blocks * a.block_size) / a.senders + 2;
@@ -177,7 +179,7 @@ fn main() -> anyhow::Result<()> {
                     .iter()
                     .map(|d| to_env(d, signers[0].signer.address()))
                     .collect();
-                // Round-robin interleave into blocks.
+                // Interleave into blocks in rotation.
                 let mut cursors = vec![0usize; queues.len()];
                 let mut flows = Vec::with_capacity(a.blocks);
                 for _ in 0..a.blocks {
@@ -251,7 +253,7 @@ fn main() -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     let obs_all = capture::run_capture(&snap, &all_blocks, a.chain_id);
     let exec_s = t0.elapsed().as_secs_f64();
-    // Flow-only observations, re-based so block numbers start at 1.
+    // These are flow-only observations, re-based so block numbers start at 1.
     let obs: Vec<capture::TxObs> = obs_all
         .into_iter()
         .filter(|o| o.block > n_setup as u64)
@@ -269,7 +271,7 @@ fn main() -> anyhow::Result<()> {
         gas as f64 / 1e6 / exec_s
     );
 
-    // Accumulator treatment: exclude universal write cells if asked.
+    // The accumulator treatment: exclude universal write cells, if asked.
     let exclude: HashSet<Cell> = if a.accumulator {
         oracle::universal_writes(&obs, 0.95)
             .into_iter()
@@ -293,7 +295,8 @@ fn main() -> anyhow::Result<()> {
     );
     print!("{}", report.summary());
 
-    // Classifier class shares (learned over ALL flow obs, reporting only).
+    // The classifier class shares, learned over all flow observations,
+    // for reporting only.
     let stats = classifier::Stats::learn(&obs);
     let (fixed, total) = stats.class_shares();
     println!(

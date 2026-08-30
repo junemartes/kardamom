@@ -1,21 +1,23 @@
-//! L1-governed upgrades — the constants and calldata layout shared by the
-//! derivation rule, the L1 contracts, and the execution engine.
+//! L1-governed upgrades. This module holds the constants and calldata
+//! layout shared by the derivation rule, the L1 contracts, and the
+//! execution engine.
 //!
-//! An **upgrade transaction** is an L1 transaction to
+//! An upgrade transaction is an L1 transaction to
 //! `ETHLockbox.initiateUpgrade`, authorized to the factory owner (a Safe in
-//! production). It emits `UpgradeInitiated`, which the DA watcher picks up
-//! alongside `DepositInitiated` and turns into a **system deposit**: a deposit
-//! with a domain-1 source hash, `is_system_transaction = true`, sender
-//! [`SYSTEM_UPGRADER`], and calldata calling
+//! production). It emits `UpgradeInitiated`. The DA watcher picks this up,
+//! alongside `DepositInitiated`, and turns it into a system deposit: a
+//! deposit with a domain-1 source hash, `is_system_transaction = true`,
+//! sender [`SYSTEM_UPGRADER`], and calldata that calls
 //! `KardamomChainState.setFeature` on [`CHAIN_STATE`].
 //!
-//! These definitions are the **single source of truth** for the byte layouts
-//! the L2 predeploy sees; they must stay identical to
+//! These definitions are the single source of truth for the byte layouts
+//! the L2 predeploy sees. They must stay identical to
 //! `contracts/src/L2/KardamomChainState.sol` and
-//! `contracts/src/L1/ETHLockbox.sol`. The tie is enforced by
-//! `crates/deployer/tests/chainstate_genesis_predeploy.rs` (address, bytecode,
-//! `SYSTEM_UPGRADER`, and the `setFeature` selector are all cross-checked
-//! against the compiled artifacts) and end-to-end by the S12 scenarios.
+//! `contracts/src/L1/ETHLockbox.sol`.
+//! `crates/deployer/tests/chainstate_genesis_predeploy.rs` enforces the
+//! tie: it cross-checks the address, bytecode, `SYSTEM_UPGRADER`, and the
+//! `setFeature` selector against the compiled artifacts. The end-to-end
+//! test scenarios enforce it too, through the live chain.
 //!
 //! See `docs/specs/2026-08-16-l1-upgrade-feature-flags-design.md`.
 
@@ -24,24 +26,25 @@ use alloc::vec::Vec;
 use alloy_primitives::{Address, U256, address};
 use bytes::Bytes;
 
-/// Canonical L2 address of the `KardamomChainState` predeploy — the feature-flag
-/// store. Seeded into genesis; see `chains/dev-withdrawals.toml`.
+/// Canonical L2 address of the `KardamomChainState` predeploy. This is the
+/// feature-flag store. It is seeded into genesis; see `chains/dev-withdrawals.toml`.
 pub const CHAIN_STATE: Address = address!("0x4200000000000000000000000000000000000017");
 
-/// Synthetic L2 sender for system upgrade deposits: the last 20 bytes of
-/// `keccak256("kardamom.upgrades.system-sender.v1")`.
+/// Synthetic L2 sender for system upgrade deposits. This is the last 20
+/// bytes of `keccak256("kardamom.upgrades.system-sender.v1")`.
 ///
-/// Only [`crate::epoch::derive_epoch`] mints deposits from this address, and
-/// no one else can forge one: user deposits carry an **aliased** L1 sender
-/// (`+0x1111...1111`), so producing this sender from L1 would mean inverting
-/// keccak to find the pre-alias L1 address, and no key signs for a hash-derived
-/// address on L2 either. `KardamomChainState.setFeature` re-checks it on the
-/// contract side as defence in depth.
+/// Only [`crate::epoch::derive_epoch`] mints deposits from this address. No
+/// one else can forge one. A user deposit carries an aliased L1 sender
+/// (`+0x1111...1111`), so producing this sender from L1 would need
+/// inverting keccak to find the pre-alias L1 address. No key signs for a
+/// hash-derived address on L2, either. `KardamomChainState.setFeature`
+/// re-checks the sender on the contract side, as defense in depth.
 pub const SYSTEM_UPGRADER: Address = address!("0x454156dAb0518B9244CC7Ff1b0FfFf6c7E031B6D");
 
-/// Gas limit stamped on every system upgrade deposit. `setFeature` is one
-/// `SSTORE` plus an event (~50k); the headroom costs nothing because deposits
-/// execute with `gas_price = 0` and are not metered against a block budget.
+/// Gas limit stamped on every system upgrade deposit. `setFeature` costs
+/// one `SSTORE` plus an event, about 50k gas. The extra headroom costs
+/// nothing: deposits execute with `gas_price = 0` and are not metered
+/// against a block budget.
 pub const UPGRADE_TX_GAS_LIMIT: u64 = 1_000_000;
 
 /// Selector of `KardamomChainState.setFeature(uint256,uint64)`.
@@ -49,12 +52,13 @@ pub const SET_FEATURE_SELECTOR: [u8; 4] = [0x8a, 0xfd, 0xb8, 0x54];
 
 /// ABI-encode `setFeature(featureId, activationTimestamp)`.
 ///
-/// Hand-rolled rather than using `sol!` so this crate stays `no_std` and free
-/// of `alloy-sol-types`. The layout is the whole of ABI encoding for two static
-/// words: `selector(4) || pad32(featureId) || pad32(activationTimestamp)`.
+/// This is hand-rolled, instead of using `sol!`, so this crate stays
+/// `no_std` and free of `alloy-sol-types`. The layout is all of the ABI
+/// encoding needed for two static words:
+/// `selector(4) || pad32(featureId) || pad32(activationTimestamp)`.
 ///
-/// `activation_timestamp` is in epoch-**milliseconds** (this chain's
-/// `block.timestamp` unit); `0` means "activate immediately".
+/// `activation_timestamp` is in epoch milliseconds, this chain's
+/// `block.timestamp` unit. `0` means "activate immediately".
 pub fn encode_set_feature(feature_id: U256, activation_timestamp: u64) -> Bytes {
     let mut out = Vec::with_capacity(68);
     out.extend_from_slice(&SET_FEATURE_SELECTOR);
@@ -70,9 +74,9 @@ mod tests {
 
     #[test]
     fn system_upgrader_is_the_documented_keccak_suffix() {
-        // The address is derived, not chosen — anyone can recompute it, and a
-        // typo in the constant cannot silently create an address someone might
-        // hold a key for.
+        // The address is derived, not chosen. Anyone can recompute it. A typo
+        // in the constant cannot silently create an address that someone
+        // might hold a key for.
         let h = keccak256("kardamom.upgrades.system-sender.v1");
         assert_eq!(SYSTEM_UPGRADER, Address::from_slice(&h[12..]));
     }
@@ -106,8 +110,8 @@ mod tests {
 
     #[test]
     fn chain_state_sits_next_to_the_message_passer() {
-        // The 0x42..00 predeploy namespace is allocated densely and by hand;
-        // a collision with the message passer would be catastrophic and silent.
+        // The 0x42..00 predeploy namespace is allocated densely, by hand. A
+        // collision with the message passer would be silent and severe.
         assert_ne!(CHAIN_STATE, crate::withdrawals::MESSAGE_PASSER);
         assert_eq!(CHAIN_STATE.as_slice()[19], 0x17);
     }

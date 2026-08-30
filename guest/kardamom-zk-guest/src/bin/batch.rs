@@ -1,12 +1,12 @@
-//! The kardamom BATCH guest (spec: no-std-exec-core, PR 4): one proof per
-//! posted batch. Reads a rkyv [`BatchProverInput`], runs the SAME anchored
+//! The kardamom batch guest: one proof per
+//! posted batch. Reads a rkyv [`BatchProverInput`], runs the same anchored
 //! per-block execution as the single-block guest over each frame, and
-//! chains the roots INTERNALLY — block i's claimed `pre_state_root` must
+//! chains the roots internally: block i's claimed `pre_state_root` must
 //! equal block i-1's recomputed post root, so the proof's outer roots
-//! attest the whole contiguous range. Folds the batch records commitment
-//! (L2 txs only — deposits are L1-originated and excluded from DA batches
-//! by design) and commits the 160-byte [`BatchPublicOutputs`] layout the
-//! `KardamomProofOracle` decodes.
+//! attest the whole contiguous range. It folds the batch records
+//! commitment (L2 txs only; deposits are L1-originated and excluded from
+//! DA batches by design) and commits the 160-byte [`BatchPublicOutputs`]
+//! layout the `KardamomProofOracle` decodes.
 //!
 //! [`BatchProverInput`]: kardamom_types::BatchProverInput
 //! [`BatchPublicOutputs`]: kardamom_types::BatchPublicOutputs

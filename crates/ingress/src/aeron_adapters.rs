@@ -1,12 +1,12 @@
 //! Live Aeron adapters behind the proxy's channel traits.
 //!
 //! [`LiveIngressPublication`] fans the proxy's validated `TxEnvelope`s out
-//! over M per-shard `tx_data` publisher handles; [`LiveIngressSubscription`]
+//! over M per-shard `tx_data` publisher handles. [`LiveIngressSubscription`]
 //! pumps each `kardamom_log::aeron_live` subscriber handle into a
-//! `tokio::sync::broadcast` sender so the proxy's `broadcast::Receiver`-based
-//! trait surface can fan out to multiple watchers. Both used to live inside
-//! the `kardamom-ingress` binary; they are a lib module so the pump plumbing
-//! is unit-testable without a media driver.
+//! `tokio::sync::broadcast` sender, so the proxy's `broadcast::Receiver`
+//! trait surface can fan out to multiple watchers. Both used to live
+//! inside the `kardamom-ingress` binary. They are a lib module now, so
+//! the pump plumbing can be unit-tested without a media driver.
 
 use std::future::Future;
 
@@ -64,8 +64,9 @@ impl IngressPublication for LiveIngressPublication {
             .get(shard)
             .ok_or_else(|| IngressError::Internal(format!("shard {shard} out of range")))?
             .clone();
-        // The Aeron publish blocks via the runtime's command channel; do
-        // it off the reactor thread so we don't stall the JSON-RPC server.
+        // The Aeron publish blocks through the runtime's command channel.
+        // This runs it off the reactor thread, so it does not stall the
+        // JSON-RPC server.
         tokio::task::spawn_blocking(move || pub_handle.publish(&envelope))
             .await
             .map_err(|e| IngressError::Internal(format!("publish_tx_data join: {e}")))?
@@ -80,18 +81,19 @@ impl IngressPublication for LiveIngressPublication {
 // trait surface can fan out to multiple watchers.
 // ---------------------------------------------------------------------------
 
-/// A pull source the generic broadcast pump can drain: one `(position, item)`
-/// stream with the position discarded at this layer. The four subscription
-/// streams (receipts, local-fsync watermark, block boundaries, tx_errors)
-/// only differ in how one item is pulled, so they share a single pump.
+/// A pull source that the generic broadcast pump can drain: one
+/// `(position, item)` stream, with the position dropped at this layer.
+/// The four subscription streams, receipts, local-fsync watermark, block
+/// boundaries, and tx_errors, differ only in how one item is pulled, so
+/// they share a single pump.
 trait PumpSource: Send + 'static {
     type Item: Clone + Send + 'static;
     fn next_item(&mut self) -> impl Future<Output = Option<Self::Item>> + Send;
 }
 
-/// Spawn one broadcast fan-out pump: drain `source` into `tx` until the
-/// source closes (AeronRuntime shutdown). Lagging/absent receivers are the
-/// broadcast channel's concern, so the send result is ignored.
+/// Spawns one broadcast fan-out pump. Drains `source` into `tx` until the
+/// source closes, on AeronRuntime shutdown. A lagging or absent receiver
+/// is the broadcast channel's concern, so this ignores the send result.
 fn spawn_pump<S: PumpSource>(mut source: S, tx: broadcast::Sender<S::Item>) {
     tokio::spawn(async move {
         while let Some(item) = source.next_item().await {
@@ -100,8 +102,8 @@ fn spawn_pump<S: PumpSource>(mut source: S, tx: broadcast::Sender<S::Item>) {
     });
 }
 
-/// Detached-receiver source (`into_receiver()` handles — see the tx_receipts
-/// comment in [`LiveIngressSubscription::open`]).
+/// Detached-receiver source, for `into_receiver()` handles. See the
+/// tx_receipts comment in [`LiveIngressSubscription::open`].
 impl<T: Clone + Send + 'static> PumpSource
     for tokio::sync::mpsc::UnboundedReceiver<(BPosition, T)>
 {
@@ -132,7 +134,8 @@ impl PumpSource for TxErrorsSubscriberHandle {
     }
 }
 
-/// Live [`IngressSubscription`]: broadcast buses fed by per-stream pump tasks.
+/// Live [`IngressSubscription`]. Per-stream pump tasks feed these
+/// broadcast buses.
 #[derive(Clone)]
 pub struct LiveIngressSubscription {
     receipts: broadcast::Sender<Receipt>,
@@ -164,45 +167,50 @@ impl LiveIngressSubscription {
             );
         }
 
-        // tx_receipts → Receipt fan-out.
+        // This is the tx_receipts to Receipt fan-out.
         //
-        // MDS (fan-in): open ONE control-mode=manual subscription on
-        // `tx_receipts_control_channel` and attach each executor replica's
-        // unicast endpoint (0..executor_count) as a destination. N executors
-        // replay the SAME canonical order and emit IDENTICAL receipts, so the
-        // proxy dedups by tx hash downstream (first-wins) — this layer just
-        // aggregates the streams. Legacy IPC: a plain subscription on the
-        // shared `tx_receipts_channel`.
+        // MDS, the fan-in mode: this opens one control-mode=manual
+        // subscription on `tx_receipts_control_channel`, and attaches
+        // each executor replica's unicast endpoint, `0..executor_count`,
+        // as a destination. N executors replay the same canonical order
+        // and emit identical receipts, so the proxy dedups by tx hash
+        // downstream, first-wins. This layer only aggregates the streams.
+        // Legacy IPC uses a plain subscription on the shared
+        // `tx_receipts_channel` instead.
         let receipts_sub = TxReceiptsSubscriberHandle::open_auto(rt, channels, executor_count)
             .map_err(|e| IngressError::Internal(format!("open tx_receipts: {e}")))?;
-        // `into_receiver()`: the handle's AeronRuntime clone must NOT travel
-        // into the pump task — that ownership cycle keeps the runtime alive
-        // forever (see `TxReceiptsSubscriberHandle::into_receiver`). Harmless
-        // here today only because `main` returns without joining on the
-        // streams; it made the validator unkillable by SIGTERM.
+        // `into_receiver()`: the handle's AeronRuntime clone must not
+        // travel into the pump task. That ownership cycle would keep the
+        // runtime alive forever; see
+        // `TxReceiptsSubscriberHandle::into_receiver`. This is harmless
+        // today only because `main` returns without joining on the
+        // streams. It once made the validator unkillable by SIGTERM.
         spawn_pump(receipts_sub.into_receiver(), receipts_tx.clone());
 
-        // Quorum/durable watermark: in the cluster-only topology this bus is fed
-        // by the Aeron Cluster egress observer spawned in `main` (cluster mode
-        // replaced the standalone sealer that used to publish it on Aeron), not
-        // by an Aeron `quorum_watermark` subscription here. The bus + its
-        // `subscribe_watermark()` surface are unchanged; only the producer moved.
+        // Quorum and durable watermark: in the cluster-only topology,
+        // this bus is fed by the Aeron Cluster egress observer that
+        // `main` spawns. Cluster mode replaced the standalone sealer that
+        // used to publish this on Aeron, so there is no Aeron
+        // `quorum_watermark` subscription here. The bus and its
+        // `subscribe_watermark()` surface are unchanged; only the
+        // producer moved.
 
-        // Per-recorder fsync watermark
+        // This is the per-recorder fsync watermark.
         let fsync_sub = FsyncWatermarkSubscriberHandle::open(rt, channels, recorder_id)
             .map_err(|e| IngressError::Internal(format!("open fsync watermark: {e}")))?;
         spawn_pump(fsync_sub, local_fsync_tx.clone());
 
-        // tx_receipts → BlockBoundary fan-out (the `tx_receipts_stream_id + 1`
-        // side-stream). Same MDS vs IPC branch as the receipt stream above:
-        // attach the same per-replica executor endpoints to the boundary MDS
+        // This is the tx_receipts to BlockBoundary fan-out, the
+        // `tx_receipts_stream_id + 1` side stream. It uses the same MDS
+        // vs. IPC branch as the receipt stream above: it attaches the
+        // same per-replica executor endpoints to the boundary MDS
         // subscription.
         let boundary_sub =
             TxReceiptsBoundarySubscriberHandle::open_auto(rt, channels, executor_count)
                 .map_err(|e| IngressError::Internal(format!("open tx_receipts boundaries: {e}")))?;
         spawn_pump(boundary_sub, block_boundaries_tx.clone());
 
-        // tx_errors → TxError fan-out
+        // This is the tx_errors to TxError fan-out.
         let errors_sub = TxErrorsSubscriberHandle::open(rt, channels)
             .map_err(|e| IngressError::Internal(format!("open tx_errors: {e}")))?;
         spawn_pump(errors_sub, tx_errors_tx.clone());
@@ -216,10 +224,11 @@ impl LiveIngressSubscription {
         })
     }
 
-    /// Producer side of the quorum/durable watermark bus. In the cluster-only
-    /// topology the bus is fed by the binary's Aeron Cluster egress observer
-    /// (there is no Aeron `quorum_watermark` subscription here — see the note
-    /// in [`Self::open`]); the observer thread sends into this handle.
+    /// Producer side of the quorum and durable watermark bus. In the
+    /// cluster-only topology, the binary's Aeron Cluster egress observer
+    /// feeds this bus, since there is no Aeron `quorum_watermark`
+    /// subscription here; see the note in [`Self::open`]. The observer
+    /// thread sends into this handle.
     pub fn watermark_sender(&self) -> broadcast::Sender<QuorumWatermark> {
         self.watermarks.clone()
     }
@@ -247,9 +256,9 @@ impl IngressSubscription for LiveIngressSubscription {
 mod tests {
     use super::*;
 
-    // The generic pump delivers items (position stripped) to every broadcast
-    // subscriber and ends when the source closes — the plumbing all four
-    // stream pumps share.
+    // The generic pump delivers items, with the position stripped, to
+    // every broadcast subscriber, and ends when the source closes. All
+    // four stream pumps share this plumbing.
     #[tokio::test]
     async fn pump_fans_out_and_ends_on_close() {
         let (src_tx, src_rx) = tokio::sync::mpsc::unbounded_channel::<(BPosition, u64)>();
@@ -269,8 +278,8 @@ mod tests {
         assert_eq!(sub_b.recv().await.unwrap(), 7);
         assert_eq!(sub_b.recv().await.unwrap(), 8);
 
-        // Closing the source ends the pump: the bus's only sender clone inside
-        // the pump task drops, so subscribers observe Closed.
+        // Closing the source ends the pump: the bus's only sender clone
+        // inside the pump task drops, so subscribers see Closed.
         drop(src_tx);
         drop(bus);
         assert!(matches!(
@@ -279,9 +288,9 @@ mod tests {
         ));
     }
 
-    // A shard index past the publication vector is an Internal error, not a
-    // panic (the proxy computes shards mod M, but the adapter must not trust
-    // that).
+    // A shard index past the publication vector must give an Internal
+    // error, not a panic. The proxy computes shards mod M, but the
+    // adapter must not rely on that.
     #[tokio::test]
     async fn publication_rejects_out_of_range_shard() {
         let publication = LiveIngressPublication {

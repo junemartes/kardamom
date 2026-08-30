@@ -1,6 +1,7 @@
-//! `StateDatabase::fork_view` on the mdbx snapshot: a fork is an
-//! INDEPENDENT RO txn at the SAME MVCC anchor, and the anchor check
-//! refuses a fork once the writer has advanced past the source snapshot.
+//! `StateDatabase::fork_view` on the mdbx snapshot. A fork is an
+//! independent read-only transaction at the same MVCC anchor. The
+//! anchor check refuses a fork once the writer has advanced past the
+//! source snapshot.
 
 mod common;
 
@@ -40,15 +41,16 @@ fn fork_reads_the_same_anchor_and_staleness_refuses() {
         .unwrap();
     let snap_at_2 = writer.snapshot_rx.recv().unwrap();
 
-    // The PRE-advance fork still reads block-1 state (it owns its txn).
+    // The fork from before the advance still reads block-1 state,
+    // because it owns its own transaction.
     assert_eq!(
         fork.storage(addr, common::slot_key(7)).unwrap(),
         U256::from(999u64),
         "a fork minted at block 1 must keep the block-1 view"
     );
 
-    // A fork from the STALE snapshot must refuse: a fresh txn would anchor
-    // at block 2, which is not the state snap_at_1 represents.
+    // A fork from the stale snapshot must refuse. A fresh transaction
+    // would anchor at block 2, which is not the state snap_at_1 represents.
     assert!(
         snap_at_1.fork_view().is_none(),
         "fork from a stale snapshot must return None"

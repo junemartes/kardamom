@@ -1,7 +1,6 @@
 //! libmdbx-backed L2 state DB.
 //!
-//! See `` and the system for
-//! the protocol and crate-level invariants.
+//! See the spec for the protocol and the crate-level invariants.
 
 pub mod checkpoint;
 pub mod checkpoint_transfer;
@@ -38,8 +37,8 @@ pub use recovery::{
 pub use snapshot::StateSnapshot;
 pub use swap::{SnapshotHandle, SnapshotReceiver, channel as snapshot_channel};
 pub use trie::{AccountTrieParts, empty_root, state_root, storage_root};
-// The 3b proof-generation API is generic over the libmdbx txn kind; callers
-// (the validator's witness anchoring) need to NAME those types without
-// growing their own libmdbx dependency line.
+// The proof-generation API works with any libmdbx transaction kind. Callers
+// (the validator's witness anchoring) need to name these types without
+// adding their own libmdbx dependency.
 pub use signet_libmdbx;
 pub use writer::{StateWriter, TrieMode, WriteBatch, WriterHandle};

@@ -15,13 +15,13 @@ use kardamom_state::StateSnapshot;
 use crate::args::Args;
 
 /// tx_receipts publication. With MDS (fan-in) enabled, this replica
-/// publishes both the receipt stream and the boundary side-stream to its
-/// OWN per-replica unicast endpoint (selected by --recorder-id); ingress
-/// aggregates every replica's endpoint onto one multi-destination
-/// subscription. Without MDS (the IPC default), fall back to the shared
-/// single-channel path so single-host/local behaviour is unchanged. Either
-/// way the commit thread's must-deliver retry drives the same
-/// publish_receipt/publish_boundary surface.
+/// publishes the receipt stream and the boundary side-stream to its own
+/// per-replica unicast endpoint (chosen by `--recorder-id`). Ingress
+/// combines every replica's endpoint into one multi-destination
+/// subscription. Without MDS (the IPC default), the code falls back to the
+/// shared single-channel path, so single-host and local behavior stays the
+/// same. Either way, the commit thread's must-deliver retry drives the same
+/// `publish_receipt` and `publish_boundary` surface.
 pub(crate) fn open_tx_receipts_pub(
     rt_pub: &AeronRuntime,
     channels: &ChannelsConfig,
@@ -42,15 +42,16 @@ pub(crate) fn open_tx_receipts_pub(
     Ok(LiveTxReceiptsPub { handle })
 }
 
-/// Block-STM execution strategy (opt-in): the pool server spins up at
-/// startup and lives for the process; blocks route through it at each
-/// boundary. `None` keeps the engine's streaming per-tx path untouched.
+/// Block-STM execution strategy (opt-in). The pool server starts at
+/// startup and lives for the whole process. Blocks route through it at
+/// each boundary. `None` leaves the engine's streaming per-tx path
+/// unchanged.
 pub(crate) fn build_block_exec(args: &Args) -> Option<BlockExec<StateSnapshot>> {
     if !args.parallel_execution {
         return None;
     }
-    // 0 = auto; hard cap 40 per the mdbx reader-slot budget
-    // (geometry::MAX_READERS = 64, shared with exec/RPC/compaction).
+    // 0 means auto. The hard cap is 40, from the mdbx reader-slot budget
+    // (geometry::MAX_READERS = 64, shared with exec, RPC, and compaction).
     let workers = match args.execution_workers {
         0 => std::thread::available_parallelism()
             .map(|n| n.get().min(8))
@@ -74,9 +75,9 @@ pub(crate) fn build_block_exec(args: &Args) -> Option<BlockExec<StateSnapshot>> 
 // Role-specific adapter: tx_receipts publication.
 // ---------------------------------------------------------------------------
 
-/// The executor role's port types: the concrete mdbx/Aeron implementations
-/// throughout — this binary makes no runtime impl choices, so nothing needs
-/// the boxed-wiring escape hatch.
+/// The executor role's port types: the concrete mdbx and Aeron
+/// implementations, used throughout. This binary makes no runtime
+/// implementation choices, so nothing needs the boxed-wiring escape hatch.
 pub(crate) struct ExecutorWiring;
 
 impl EngineWiring for ExecutorWiring {
@@ -95,12 +96,12 @@ pub(crate) struct LiveTxReceiptsPub {
 }
 
 impl TxReceiptsPublication for LiveTxReceiptsPub {
-    /// One `Vec<Receipt>` wire frame per batch: one encode + one blocking
-    /// ack round trip through the Aeron thread instead of one per receipt.
-    /// All-or-nothing per frame, so a transient failure reports 0 published
-    /// and the commit thread's must-deliver loop retries the whole batch
-    /// (harmless duplicates — tx_receipts is AT-LEAST-ONCE, consumers dedup
-    /// on `tx_idx`).
+    /// One `Vec<Receipt>` wire frame per batch: one encode and one blocking
+    /// ack round trip through the Aeron thread, instead of one per receipt.
+    /// Each frame is all-or-nothing. A transient failure reports 0
+    /// published, and the commit thread's must-deliver loop retries the
+    /// whole batch. The duplicates are harmless: tx_receipts delivers at
+    /// least once, and consumers dedupe on `tx_idx`.
     fn publish_receipts(
         &mut self,
         receipts: &[kardamom_types::Receipt],
@@ -121,11 +122,12 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
                 .publish_receipt(&r)
                 .map(|_| ())
                 .map_err(|e| ExecutorError::State(format!("publish_receipt: {e}"))),
-            // BEST-EFFORT: a block-boundary marker. Ingress acks on the receipt /
-            // durable watermark, not on this — and blocking the commit thread
-            // here (e.g. at startup before ingress's MDS destinations attach)
-            // would freeze ALL state progress. Fire-and-forget so empty blocks
-            // never stall the executor; a dropped boundary is harmless.
+            // Best-effort: a block-boundary marker. Ingress acks on the receipt
+            // or durable watermark, not on this marker. Blocking the commit
+            // thread here (for example, at startup before ingress's MDS
+            // destinations attach) would freeze all state progress. This call
+            // is fire-and-forget, so empty blocks never stall the executor.
+            // A dropped boundary is harmless.
             CMessage::BlockBoundary(b) => self
                 .handle
                 .publish_boundary_best_effort(&b)

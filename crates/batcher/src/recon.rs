@@ -1,9 +1,9 @@
-//! Reconstruction support for the §6 conformance test.
+//! Reconstruction support for the section 6 conformance test.
 //!
-//! Given the blobs that the batcher posted (the L1 calldata only contains the
-//! versioned hashes + block range; the blob bytes themselves come from the
-//! beacon-chain blob sidecar), rebuild the `Vec<BlockFrame>` the batcher fed
-//! in. Validates the entire batcher pipeline against a single round-trip.
+//! Takes the blobs the batcher posted. The L1 calldata holds only the
+//! versioned hashes and block range; the blob bytes themselves come from the
+//! beacon-chain blob sidecar. Rebuilds the `Vec<BlockFrame>` the batcher fed
+//! in. This validates the whole batcher pipeline with one round trip.
 
 use alloy_eips::eip4844::Blob;
 
@@ -14,9 +14,10 @@ use crate::frame::{BlockFrame, Kar1Payload, decode as frame_decode};
 
 /// Reconstruct the per-block tx stream from a sequence of blobs.
 ///
-/// `blobs` must be the in-order set of blobs for **one** posted batch. The
-/// function unpacks the 31-byte field encoding, detects whether the unpacked
-/// bytes are a zstd stream (decompress if so), then decodes the KAR1 framing.
+/// `blobs` must be the in-order set of blobs for one posted batch. This
+/// function unpacks the 31-byte field encoding. It checks whether the
+/// unpacked bytes are a zstd stream, and decompresses them if so. Then it
+/// decodes the KAR1 framing.
 pub fn reconstruct(blobs: &[Blob]) -> Result<Vec<BlockFrame>, BatcherError> {
     let raw = unpack_from_blobs(blobs)?;
     let framed = if is_zstd(&raw) {
@@ -38,8 +39,8 @@ mod tests {
     use super::*;
     use crate::frame::MAGIC;
 
-    /// KAR1 magic must not be mistaken for a zstd stream — its first byte
-    /// is 'K' (0x4B), whereas zstd streams start with 0x28.
+    /// The KAR1 magic must not look like a zstd stream. Its first byte is
+    /// 'K' (0x4B). zstd streams start with 0x28.
     #[test]
     fn kar1_magic_is_not_zstd() {
         assert!(!is_zstd(&MAGIC));

@@ -1,6 +1,6 @@
-//! The client-facing submit path: `submit_raw` (blocking, park-until-receipt)
-//! and `submit_raw_async` (ack-on-publish), plus their shared validate /
-//! cache-answer / publish stages.
+//! The client-facing submit path. `submit_raw` blocks and parks until a
+//! receipt arrives. `submit_raw_async` acks on publish. Both share the
+//! validate, cache-answer, and publish stages.
 
 use std::net::IpAddr;
 
@@ -37,10 +37,11 @@ where
             return answer.map(|receipt| ReceiptResponse { receipt });
         }
 
-        // Park *before* publishing — the receipt can arrive on the cache
-        // channel before we'd otherwise have registered, especially under load.
-        // The queue-depth gauge is maintained by the registry itself (every
-        // insert/remove path, including a cancelled handler's Drop).
+        // Park before publishing. Under load, the receipt can arrive on
+        // the cache channel before this code would otherwise register the
+        // wait. The registry itself maintains the queue-depth gauge, on
+        // every insert and remove path, including a cancelled handler's
+        // Drop.
         let wait = self.pending.register(v.sender, v.nonce);
 
         self.publish_validated(&v, raw_tx).await?;
@@ -49,8 +50,8 @@ where
             .await_with_timeout(self.cfg.pending_receipt_timeout)
             .await;
 
-        // Count accepted/rejected on the terminal outcome (not at publish
-        // time) so a single submission never increments both.
+        // Count accepted or rejected on the terminal outcome, not at
+        // publish time, so a single submission never increments both.
         match &result {
             Ok(_) => {
                 metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
@@ -60,13 +61,15 @@ where
             Err(_) => count_reject("internal"),
         }
 
-        // Identity check on the fulfilled receipt: the pending map is keyed
-        // (sender, nonce), so with racing replicas — or any upstream
-        // receipt mix-up — the receipt that releases this waiter can belong
-        // to a DIFFERENT tx. Echoing its hash as the submit response is how
-        // #156 surfaced (in-cluster nonce-unordered: "returned hash !=
-        // locally computed"). Fail loudly and NAME both hashes instead: the
-        // error attributes the mix-up to the component that produced it.
+        // Identity check on the fulfilled receipt. The pending map is
+        // keyed by (sender, nonce). So, with racing replicas, or any
+        // upstream receipt mix-up, the receipt that releases this waiter
+        // can belong to a different tx. Echoing its hash as the submit
+        // response is how issue #156 surfaced: an in-cluster
+        // nonce-unordered case where the returned hash did not match the
+        // locally computed hash. Instead, this code fails loudly and
+        // names both hashes, so the error attributes the mix-up to the
+        // component that produced it.
         if let Ok(resp) = &result
             && resp.receipt.tx_hash != v.tx_hash
         {
@@ -89,14 +92,14 @@ where
     }
 
     /// Fire-and-observe submission for subscription-mode clients
-    /// (`kardamom_sendRawTransactionAsync`): validates and publishes exactly
-    /// like [`Self::submit_raw`], but acks with the tx hash as soon as the
-    /// envelope is on tx_data instead of parking the caller until the receipt
-    /// arrives. Receipt delivery happens out-of-band — on
-    /// `kardamom_subscribeReceipts` or by polling
-    /// `eth_getTransactionReceipt`. On this path "accepted" in the metrics
-    /// means *published*, not *receipted*; the
-    /// `received == accepted + rejected` invariant is unchanged.
+    /// (`kardamom_sendRawTransactionAsync`). This method validates and
+    /// publishes exactly like [`Self::submit_raw`], but it acks with the tx
+    /// hash as soon as the envelope is on tx_data, instead of parking the
+    /// caller until the receipt arrives. Receipt delivery happens
+    /// separately, through `kardamom_subscribeReceipts` or by polling
+    /// `eth_getTransactionReceipt`. On this path, "accepted" in the
+    /// metrics means published, not receipted. The
+    /// `received == accepted + rejected` invariant still holds.
     pub async fn submit_raw_async(
         &self,
         client_ip: IpAddr,
@@ -111,20 +114,21 @@ where
         Ok(v.tx_hash)
     }
 
-    /// The single home of the cached-receipt identity rule (#156), shared by
-    /// both submit paths. `None` means no cache hit — continue to publish.
-    /// On a hit: a resubmission is only a resubmission if it is the SAME tx —
-    /// the cache is keyed (sender, nonce), so a DIFFERENT tx reusing a
-    /// receipted nonce would otherwise be answered with the previous tx's
-    /// receipt — and its hash — as if it had landed (#156: the submit
-    /// response must never carry another tx's identity).
+    /// The one place for the cached-receipt identity rule (issue #156),
+    /// shared by both submit paths. `None` means no cache hit, so the
+    /// caller should continue to publish. On a hit, a resubmission counts
+    /// as a resubmission only if it is the same tx. The cache is keyed by
+    /// (sender, nonce), so a different tx that reuses a receipted nonce
+    /// would otherwise get answered with the previous tx's receipt, and
+    /// hash, as if it had landed. The submit response must never carry
+    /// another tx's identity.
     fn answer_from_cache(&self, v: &ValidatedSubmission) -> Option<Result<Receipt, IngressError>> {
         let prev = v.cached.as_ref()?;
         if prev.tx_hash != v.tx_hash {
             count_reject("nonce-conflict");
             return Some(Err(IngressError::Duplicate((v.sender, v.nonce))));
         }
-        // Count it so received == accepted + rejected holds on every path.
+        // Count it, so received == accepted + rejected holds on every path.
         metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
         Some(Ok(prev.clone()))
     }
@@ -138,12 +142,13 @@ where
     ) -> Result<ValidatedSubmission, IngressError> {
         metrics::counter!(crate::metrics::TX_RECEIVED_TOTAL).increment(1);
 
-        // Overload valve: when the pending registry is this deep the pipeline
-        // is not draining — shed new submissions with an explicit retryable
-        // error instead of parking them into a wedge (the pre-#86 failure
-        // mode: parked submits pinned every connection slot and the ingress
-        // refused ALL clients). Applies to both submit paths; depth 0 sheds
-        // everything (used by tests).
+        // Overload valve. When the pending registry reaches this depth,
+        // the pipeline is not draining. This code sheds new submissions
+        // with an explicit retryable error, instead of parking them into
+        // a backlog. Before issue #86 fixed this, parked submits pinned
+        // every connection slot and the ingress refused every client.
+        // This applies to both submit paths. A depth of 0 sheds
+        // everything, and tests use this.
         let depth = self.pending.len();
         if depth >= self.cfg.pending_shed_depth {
             count_reject("overloaded");
@@ -151,7 +156,7 @@ where
         }
 
         if let Err(e) = self.rate_limiter.check(client_ip) {
-            let _ = e; // unit error
+            let _ = e; // This error carries no data.
             count_reject("rate-limited");
             return Err(IngressError::RateLimited(client_ip.to_string()));
         }
@@ -161,10 +166,11 @@ where
             IngressError::Decode(e.to_string())
         })?;
 
-        // Protocol-limit checks (W1b, docs/agents/l1-client-suite-port-spec.md)
-        // — before sig-verify, so a tx that can never execute is refused with
-        // a clear error instead of costing a signature recovery and then
-        // burning into a `status=false` skip receipt downstream.
+        // Protocol-limit checks (W1b,
+        // docs/agents/l1-client-suite-port-spec.md) run before sig-verify.
+        // This way, a tx that can never execute gets a clear error, and
+        // does not cost a signature recovery or turn into a
+        // `status=false` skip receipt downstream.
         if let ConsensusEnvelope::Eip4844(_) = env {
             count_reject("unsupported-type");
             return Err(IngressError::UnsupportedTxType(0x03));
@@ -176,10 +182,10 @@ where
 
         let nonce = env.nonce();
 
-        //: the proxy is the *only* place `sender` and
-        // `tx_hash` are computed. Both fields are stamped into the envelope
-        // before any downstream consumer observes the tx, and the sig-verify
-        // failure path returns *before* we publish to Aeron.
+        // Identity guarantee: the proxy is the only place that computes
+        // `sender` and `tx_hash`. This code stamps both fields into the
+        // envelope before any other consumer sees the tx. The sig-verify
+        // failure path returns before this code publishes to Aeron.
         let (sender, tx_hash) = self
             .verifier
             .recover(env, raw_tx.clone())
@@ -202,12 +208,12 @@ where
         })
     }
 
-    /// Publish a validated envelope onto tx_data[shard]. The shard is
-    /// selected by sender-address hash (`partition_for(sender, K)`) so every
-    /// tx from a given sender lands on the same shard's A stream, which lets
-    /// the P sequencers per shard nonce-order them consistently. The envelope
-    /// carries the canonical `tx_hash` so downstream consumers can dedup and
-    /// re-emit it without recomputing (S0).
+    /// Publishes a validated envelope onto tx_data[shard]. The shard comes
+    /// from the sender-address hash, `partition_for(sender, K)`, so every
+    /// tx from a given sender lands on the same shard's A stream. This
+    /// lets the P sequencers per shard nonce-order them consistently. The
+    /// envelope carries the canonical `tx_hash`, so downstream consumers
+    /// can dedup and re-emit it without recomputing it.
     async fn publish_validated(
         &self,
         v: &ValidatedSubmission,

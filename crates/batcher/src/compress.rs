@@ -2,7 +2,8 @@
 
 use crate::error::BatcherError;
 
-/// Default zstd compression level — balances throughput vs ratio for tx-stream-like data.
+/// The default zstd compression level. It balances throughput against ratio
+/// for tx-stream data.
 pub const DEFAULT_LEVEL: i32 = 9;
 
 pub fn encode_zstd(input: &[u8], level: i32) -> Result<Vec<u8>, BatcherError> {

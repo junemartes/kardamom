@@ -1,6 +1,6 @@
-//! Oracle dependency analysis: the TRUE conflict graph from actual
-//! read/write sets, its gas-weighted critical path, and grading of the
-//! classifier's predicted graph against it.
+//! Oracle dependency analysis: the true conflict graph from actual
+//! read and write sets, its gas-weighted critical path, and grading of
+//! the classifier's predicted graph against it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -15,7 +15,8 @@ pub struct BlockOracle {
     pub gas: u64,
     /// Gas of the longest true-dependency chain.
     pub critical_path_gas: u64,
-    /// Direct conflicting pairs (share >=1 cell with a write on either side).
+    /// Direct conflicting pairs (share at least one cell, with a write on
+    /// either side).
     pub conflict_pairs: usize,
 }
 
@@ -23,7 +24,7 @@ pub struct BlockOracle {
 #[derive(Debug, Default)]
 pub struct Report {
     pub blocks: Vec<BlockOracle>,
-    /// Cells written by >95% of txs (fee-sink candidates).
+    /// Cells written by more than 95% of txs (fee-sink candidates).
     pub universal_write_cells: Vec<(Cell, f64)>,
     /// Predicted-graph grading (holdout only).
     pub grading: Option<Grading>,
@@ -33,29 +34,30 @@ pub struct Report {
 pub struct Grading {
     pub holdout_txs: usize,
     pub cold_txs: usize,
-    /// True-conflicting DIRECT pairs missed by prediction (dangerous
-    /// direction: would have run concurrently and aborted).
+    /// True-conflicting direct pairs missed by prediction. This is the
+    /// dangerous direction: these would have run concurrently and aborted.
     pub missed_pairs: usize,
-    /// Predicted-conflicting pairs with no true conflict (over-merge:
-    /// forfeited parallelism).
+    /// Predicted-conflicting pairs with no true conflict. This is an
+    /// over-merge: forfeited parallelism.
     pub false_pairs: usize,
     pub true_pairs: usize,
     pub predicted_pairs: usize,
-    /// Critical-path gas of the PREDICTED graph (chains follow predicted
-    /// conflicts + Tail: cold txs serialize behind everything).
+    /// Critical-path gas of the predicted graph (chains follow predicted
+    /// conflicts plus Tail: cold txs serialize behind everything).
     pub predicted_cp_gas: u64,
     pub oracle_cp_gas: u64,
     pub gas: u64,
 }
 
-/// Build direct-conflict pair set per block via a cell -> touchers index.
-/// Conflict = two txs touch the same cell, at least one writing it.
+/// Build the direct-conflict pair set per block, through a cell-to-touchers
+/// index. Two txs conflict when they touch the same cell and at least one
+/// writes it.
 pub(crate) fn conflict_pairs(
     txs: &[&TxObs],
     cells_of: impl Fn(&TxObs) -> (BTreeSet<Cell>, BTreeSet<Cell>),
     exclude: &HashSet<Cell>,
 ) -> HashSet<(u64, u64)> {
-    // cell -> (readers, writers) as local tx positions
+    // Map each cell to its readers and writers, as local tx positions.
     let mut readers: HashMap<Cell, Vec<usize>> = HashMap::new();
     let mut writers: HashMap<Cell, Vec<usize>> = HashMap::new();
     for (i, o) in txs.iter().enumerate() {
@@ -100,7 +102,8 @@ pub(crate) fn conflict_pairs(
 }
 
 /// Gas-weighted critical path over a direct-conflict pair set (canonical
-/// order is the topological order: edges only run low index -> high).
+/// order is the topological order: edges only run from a low index to a
+/// high index).
 pub(crate) fn critical_path(txs: &[&TxObs], pairs: &HashSet<(u64, u64)>) -> u64 {
     let pos: HashMap<u64, usize> = txs.iter().enumerate().map(|(i, o)| (o.index, i)).collect();
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); txs.len()];
@@ -169,7 +172,7 @@ pub fn analyze(obs: &[TxObs], train_frac: f64, exclude: &HashSet<Cell>) -> Repor
         });
     }
 
-    // Train/holdout grading.
+    // Train and holdout grading.
     let split = ((max_block as f64) * train_frac).ceil() as u64;
     let train: Vec<TxObs> = obs.iter().filter(|o| o.block <= split).cloned().collect();
     let holdout: Vec<&TxObs> = obs.iter().filter(|o| o.block > split).collect();
@@ -182,7 +185,7 @@ pub fn analyze(obs: &[TxObs], train_frac: f64, exclude: &HashSet<Cell>) -> Repor
             holdout_txs: holdout.len(),
             ..Default::default()
         };
-        // Per holdout block: true pairs vs predicted pairs.
+        // Per holdout block: true pairs against predicted pairs.
         for b in (split + 1)..=max_block {
             let txs: Vec<&TxObs> = holdout.iter().filter(|o| o.block == b).copied().collect();
             if txs.is_empty() {
@@ -190,7 +193,8 @@ pub fn analyze(obs: &[TxObs], train_frac: f64, exclude: &HashSet<Cell>) -> Repor
             }
             let true_pairs = conflict_pairs(&txs, actual_cells, exclude);
 
-            // Predicted cells per tx; cold => wildcard (conflicts with all).
+            // Predicted cells per tx. A cold tx is a wildcard: it conflicts
+            // with all.
             let mut predicted: Vec<Option<BTreeSet<Cell>>> = Vec::with_capacity(txs.len());
             for o in &txs {
                 let p = stats.predict(o);
@@ -199,10 +203,10 @@ pub fn analyze(obs: &[TxObs], train_frac: f64, exclude: &HashSet<Cell>) -> Repor
                 }
                 predicted.push(p);
             }
-            // Predicted pair set: wildcard txs conflict with everything;
-            // otherwise cell-intersection with W-mode approximated as
-            // "any shared predicted cell conflicts" (predictions don't
-            // split R/W yet — conservative).
+            // Predicted pair set: a wildcard tx conflicts with everything.
+            // Otherwise, any shared predicted cell counts as a conflict
+            // (predictions do not yet split read and write, which is
+            // conservative).
             let mut pred_pairs: HashSet<(u64, u64)> = HashSet::new();
             for i in 0..txs.len() {
                 for j in i + 1..txs.len() {
@@ -225,10 +229,9 @@ pub fn analyze(obs: &[TxObs], train_frac: f64, exclude: &HashSet<Cell>) -> Repor
             g.false_pairs += pred_pairs.difference(&true_pairs).count();
             g.gas += txs.iter().map(|o| o.gas).sum::<u64>();
             g.oracle_cp_gas += critical_path(&txs, &true_pairs);
-            // Predicted graph must be SAFE for scheduling: edges = union
-            // of predicted and (missed pairs would abort at runtime — for
-            // the achievable-speedup bound we schedule by predictions
-            // alone).
+            // The predicted graph must be safe for scheduling. A missed
+            // pair would abort at runtime, but for the achievable-speedup
+            // bound we schedule by predictions alone.
             g.predicted_cp_gas += critical_path(&txs, &pred_pairs);
         }
         report.grading = Some(g);

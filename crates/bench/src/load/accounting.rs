@@ -1,11 +1,13 @@
-//! Completeness + drop accounting + pass/fail verdict.
+//! This module does completeness accounting, drop accounting, and the
+//! pass-fail verdict.
 //!
-//! The authoritative completeness gate is per-tx receipts (`missing` =
-//! accepted-but-never-receipted). The Prometheus counters are corroborating
-//! diagnostics — there is no native "dropped tx" counter, so ingress drops are
-//! *inferred* (received − accepted − rejected − queued) and treated as soft
-//! signals (noisy within the in-flight window), while the sequencer's
-//! dropped/evicted counters are unambiguous.
+//! The authoritative completeness gate is per-transaction receipts:
+//! `missing` means accepted but never receipted. The Prometheus counters
+//! are corroborating diagnostics. There is no native dropped-transaction
+//! counter, so the code infers ingress drops as
+//! `received - accepted - rejected - queued`, and treats this as a soft
+//! signal, since it is noisy within the in-flight window. The
+//! sequencer's dropped and evicted counters are unambiguous.
 
 use serde::Serialize;
 
@@ -13,92 +15,101 @@ use crate::load::config::LoadReport;
 use crate::load::engine::Counts;
 use crate::load::scrape::MetricsSnapshot;
 
-/// Per-executor keep-pace evaluation.
+/// The keep-pace evaluation for one executor.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct KeepPace {
-    /// Executor node-container name.
+    /// The executor node-container name.
     pub node: String,
-    /// Executor block number at the start of the window.
+    /// The executor block number at the start of the window.
     pub base: Option<u64>,
-    /// Executor block number at the end of the window.
+    /// The executor block number at the end of the window.
     pub final_block: Option<u64>,
-    /// Blocks advanced over the window (`final - base`).
+    /// The blocks advanced over the window: `final - base`.
     pub advanced: Option<i64>,
-    /// Sealer-minus-executor block gap at the end (clamped ≥ 0).
+    /// The sealer-minus-executor block gap at the end, clamped to be at
+    /// least 0.
     pub gap: Option<i64>,
-    /// `OK` | `FROZEN` | `RECOVERING` | `GAP>N` | `METRIC-MISSING`.
+    /// One of `OK`, `FROZEN`, `RECOVERING`, `GAP>N`, or `METRIC-MISSING`.
     pub verdict: String,
 }
 
-/// Inputs to [`evaluate`].
+/// The inputs to [`evaluate`].
 pub struct EvalInput<'a> {
-    /// Final delivery counts from the tracker.
+    /// The final delivery counts from the tracker.
     pub counts: Counts,
-    /// Accepted-but-never-receipted txs (hard durability failures).
+    /// The transactions accepted but never receipted. These are hard
+    /// durability failures.
     pub missing: u64,
-    /// Offered txs whose submit failed and never landed.
+    /// The offered transactions whose submit failed and never landed.
     pub unlanded: u64,
-    /// Metric snapshot at the start of the measured window.
+    /// The metric snapshot at the start of the measured window.
     pub base: &'a MetricsSnapshot,
-    /// Metric snapshot at the end (after a short settle).
+    /// The metric snapshot at the end, after a short settle time.
     pub fin: &'a MetricsSnapshot,
-    /// Optional recheck snapshot taken a few seconds after `fin` (chaos runs):
-    /// a restarted executor's block gauge resets to 0 so `final − base` reads
-    /// ≤ 0 mid-replay; movement between `fin` and this sample distinguishes
-    /// RECOVERING from FROZEN.
+    /// An optional recheck snapshot, taken a few seconds after `fin`,
+    /// for chaos runs. A restarted executor's block gauge resets to 0,
+    /// so `final - base` can read at or below 0 mid-replay. Movement
+    /// between `fin` and this sample tells RECOVERING apart from FROZEN.
     pub recheck: Option<&'a MetricsSnapshot>,
-    /// Max allowed sealer-minus-executor block gap.
+    /// The maximum allowed sealer-minus-executor block gap.
     pub max_gap: u64,
-    /// Fail if any accepted tx is missing a receipt.
+    /// Fail the run if any accepted transaction is missing a receipt.
     pub assert_all_delivered: bool,
-    /// Blocking mode: an accepted `eth_sendRawTransaction` PARKED until its
-    /// receipt was observed by the serving ingress, so acceptance itself
-    /// proves the receipt existed — an accepted-but-unresolved entry means
-    /// the receipt later became UNSERVABLE (evicted from the bounded
-    /// ingress cache; the durable copy lives in the executor state DB —
-    /// verified by direct mdbx inspection: 5/5 sampled "missing" hashes
-    /// present), not undelivered. With this set, `missing` downgrades to a
-    /// warning PROVIDED every product drop counter scraped as exactly zero
-    /// — any nonzero or unscraped counter keeps the hard failure. Async
-    /// (subscribe) mode must NOT set this: its ack proves only publication.
+    /// In blocking mode, an accepted `eth_sendRawTransaction` parked
+    /// until the serving ingress observed its receipt. So acceptance
+    /// itself proves the receipt existed. An accepted-but-unresolved
+    /// entry then means the receipt later became unservable, for
+    /// example evicted from the bounded ingress cache, with the durable
+    /// copy still in the executor state database, not that it was
+    /// undelivered. Direct mdbx inspection confirmed this for every
+    /// sampled "missing" hash. With this set, `missing` downgrades to
+    /// a warning, but only if every product drop counter scraped as
+    /// exactly zero; a nonzero or unscraped counter keeps the hard
+    /// failure. Async (subscribe) mode must not set this: its ack
+    /// proves only publication, not a receipt.
     pub ack_proves_receipt: bool,
-    /// Chaos framing: transient gap / service-down blips and sequencer
-    /// past-nonce drops (submit-retry noise across an ingress restart) are
-    /// informational (a killed component is expected to be briefly
-    /// unavailable); a never-advancing executor (FROZEN) and missing receipts
-    /// are still failures.
+    /// Under the chaos framing, a transient gap or service-down blip,
+    /// and a sequencer past-nonce drop from submit-retry noise across
+    /// an ingress restart, are informational: a killed component is
+    /// expected to be briefly unavailable. A never-advancing executor
+    /// (FROZEN) and a missing receipt are still failures.
     pub chaos_mode: bool,
 }
 
-/// The harness verdict + computed accounting, serialized into the report.
+/// The harness verdict, with the computed accounting, serialized into
+/// the report.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Verdict {
-    /// Overall pass/fail.
+    /// The overall pass or fail result.
     pub pass: bool,
-    /// Human-readable failure reasons (empty when `pass`).
+    /// The human-readable failure reasons. Empty when `pass` is true.
     pub failures: Vec<String>,
-    /// Submits attempted.
+    /// The submits attempted.
     pub offered: u64,
-    /// Submits ingress accepted.
+    /// The submits ingress accepted.
     pub accepted: u64,
-    /// Txs confirmed via a receipt.
+    /// The transactions confirmed by a receipt.
     pub receipted: u64,
-    /// Accepted txs with no receipt (must be 0 under `assert_all_delivered`).
+    /// The accepted transactions with no receipt. This must be 0 under
+    /// `assert_all_delivered`.
     pub missing: u64,
-    /// Offered txs that never landed (submit failed through all retries).
+    /// The offered transactions that never landed, because the submit
+    /// failed through all retries.
     pub unlanded: u64,
-    /// Receipts with a non-`0x1` status.
+    /// The receipts with a status other than `0x1`.
     pub bad_status: u64,
-    /// Inferred ingress drop: `Δreceived − Δaccepted − Δrejected − queue` (soft;
-    /// noisy within the in-flight window).
+    /// The inferred ingress drop:
+    /// `Δreceived - Δaccepted - Δrejected - queue`. This is a soft
+    /// signal, noisy within the in-flight window.
     pub inferred_ingress_drop: Option<i64>,
-    /// Sequencer txs dropped for a past nonce over the window (unambiguous).
+    /// The sequencer transactions dropped for a past nonce over the
+    /// window. This value is unambiguous.
     pub seq_dropped: Option<i64>,
-    /// Sequencer pending-buffer evictions over the window.
+    /// The sequencer pending-buffer evictions over the window.
     pub seq_evicted: Option<i64>,
-    /// Sequencer backpressure events over the window.
+    /// The sequencer backpressure events over the window.
     pub seq_backpressure: Option<i64>,
-    /// Per-executor keep-pace.
+    /// The keep-pace result for each executor.
     pub keep_pace: Vec<KeepPace>,
 }
 
@@ -111,7 +122,8 @@ fn delta(a: Option<u64>, b: Option<u64>) -> Option<i64> {
     }
 }
 
-/// `node`'s block gauge in `snap`, or `None` if it wasn't scraped.
+/// The block gauge for `node` in `snap`. Returns `None` if the code
+/// did not scrape it.
 fn executor_block(snap: &MetricsSnapshot, node: &str) -> Option<u64> {
     snap.executor_blocks
         .iter()
@@ -147,9 +159,9 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
                 failures.push(format!("executor {node}: block metric unreachable"));
             }
         } else if matches!(advanced, Some(a) if a <= 0) && sealer_adv > 0 {
-            // A restarted executor's gauge resets to 0, so `advanced` ≤ 0 can
-            // mean "replaying after a kill", not frozen. If the recheck sample
-            // shows the gauge moving past `fin`, it's recovering.
+            // A restarted executor's gauge resets to 0. So `advanced` at or
+            // below 0 can mean "replaying after a kill", not frozen. If the
+            // recheck sample shows the gauge moving past `fin`, it is recovering.
             let recheck_blk = input.recheck.and_then(|r| executor_block(r, node));
             if matches!((recheck_blk, *fin_blk), (Some(r), Some(f)) if r > f) {
                 verdict = "RECOVERING".to_string();
@@ -204,21 +216,21 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
         failures.push("ingress accepted ZERO txs (pipeline not reachable)".to_string());
     }
     if input.assert_all_delivered && input.missing > 0 {
-        // Blocking mode: acceptance proved the receipt existed (the submit
-        // parked on it), so if the product counters PROVE nothing was
-        // dropped anywhere, an unresolved entry is a serving-layer artifact
-        // (bounded ingress cache evicted it before the feed/sweeper could
-        // observe it; the durable copy is in the executor state DB).
-        // Downgrade to a warning ONLY under that full proof — any nonzero
-        // OR UNSCRAPED counter keeps the hard failure.
+        // In blocking mode, acceptance proved the receipt existed, because
+        // the submit parked on it. So if the product counters prove nothing
+        // was dropped anywhere, an unresolved entry is a serving-layer
+        // artifact: the bounded ingress cache evicted it before the feed or
+        // sweeper could observe it, and the durable copy is in the executor
+        // state database. Downgrade to a warning only under that full proof.
+        // A nonzero or unscraped counter keeps the hard failure.
         let drops_proven_zero = inferred_ingress_drop == Some(0)
             && seq_dropped == Some(0)
             && seq_evicted == Some(0)
             && seq_backpressure == Some(0);
-        // D-8 bound: the eviction explanation only covers a THIN tail. If a
-        // material fraction of accepted traffic is unresolved, "every counter
-        // reads zero" is evidence of a counter blind spot, not of cache
-        // eviction — that must stay a hard failure.
+        // The eviction explanation covers only a thin tail. If a material
+        // fraction of accepted traffic is unresolved, "every counter reads
+        // zero" points to a counter blind spot, not cache eviction. That
+        // case must stay a hard failure.
         let within_eviction_tail = input.missing <= (c.accepted / 100).max(50);
         if input.ack_proves_receipt && drops_proven_zero && within_eviction_tail {
             tracing::warn!(
@@ -237,10 +249,10 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
     if c.bad_status > 0 {
         failures.push(format!("{} receipt(s) had non-0x1 status", c.bad_status));
     }
-    // Unambiguous sequencer drops are a real failure (not just inference
-    // noise) — except under chaos, where a submit retried across an ingress
-    // restart (volatile dedup cache) can legitimately reach the sequencer
-    // twice; the delta stays reported in the verdict as a diagnostic.
+    // An unambiguous sequencer drop is a real failure, not just inference
+    // noise, except under chaos. There, a submit retried across an ingress
+    // restart can legitimately reach the sequencer twice, because the dedup
+    // cache is volatile. The delta still appears in the verdict as a diagnostic.
     if matches!(seq_dropped, Some(d) if d > 0) && !input.chaos_mode {
         failures.push(format!(
             "sequencer dropped {seq_dropped:?} past-nonce tx(s)"
@@ -264,10 +276,11 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
     }
 }
 
-/// Per-ramp-step version of [`evaluate`]'s keep-pace gate: a cheap boolean
-/// over two step-boundary snapshots (frozen / lagging executors), with no
-/// restart-recheck and lenient on missing metrics — the full-window verdict
-/// with failure reasons stays [`evaluate`]'s job.
+/// A per-ramp-step version of [`evaluate`]'s keep-pace gate. This is a
+/// cheap boolean check over two step-boundary snapshots, for a frozen or
+/// lagging executor. It does no restart recheck, and is lenient on a
+/// missing metric. The full-window verdict, with failure reasons, is
+/// still [`evaluate`]'s job.
 pub(crate) fn step_gap_ok(s0: &MetricsSnapshot, s1: &MetricsSnapshot, max_gap: u64) -> bool {
     let sealer_adv = match (s0.sealer_block, s1.sealer_block) {
         (Some(a), Some(b)) => b > a,
@@ -275,27 +288,27 @@ pub(crate) fn step_gap_ok(s0: &MetricsSnapshot, s1: &MetricsSnapshot, max_gap: u
     };
     for (node, b1) in &s1.executor_blocks {
         let b0 = executor_block(s0, node);
-        // Missing metric → can't assert, stay lenient.
+        // A missing metric means the check cannot run, so stay lenient.
         if let (Some(b0), Some(b1), Some(sealer)) = (b0, *b1, s1.sealer_block) {
             if sealer_adv && b1 <= b0 {
-                return false; // frozen
+                return false; // The executor is frozen.
             }
             if sealer.saturating_sub(b1) > max_gap {
-                return false; // lagging
+                return false; // The executor is lagging.
             }
         }
     }
     true
 }
 
-/// Per-ramp-step version of [`evaluate`]'s sequencer-drop gate: did the
-/// drop/eviction counters grow over the step?
+/// A per-ramp-step version of [`evaluate`]'s sequencer-drop gate. Checks
+/// whether the drop or eviction counters grew over the step.
 pub(crate) fn step_seq_clean(s0: &MetricsSnapshot, s1: &MetricsSnapshot) -> bool {
     let grew = |a: Option<u64>, b: Option<u64>| matches!((a, b), (Some(a), Some(b)) if b > a);
     !grew(s0.seq_dropped_past, s1.seq_dropped_past) && !grew(s0.seq_evictions, s1.seq_evictions)
 }
 
-/// Render the report + verdict to stdout.
+/// Render the report and verdict to stdout.
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn print_report(r: &LoadReport) {
     println!(
@@ -329,8 +342,8 @@ pub(crate) fn print_report(r: &LoadReport) {
     }
     let v = &r.verdict;
     if r.total_gas > 0 && r.duration_secs > 0.0 {
-        // total_gas spans ramp + soak; the soak window's own gas is the
-        // total minus what the ramp steps drained into their counters.
+        // total_gas spans the ramp and the soak. The soak window's own gas
+        // is the total minus what the ramp steps drained into their counters.
         let ramp_gas: u64 = r.ramp.iter().map(|s| s.gas_used).sum();
         let soak_gas = r.total_gas.saturating_sub(ramp_gas);
         println!(
@@ -441,7 +454,7 @@ mod tests {
     #[test]
     fn frozen_executor_fails_even_in_chaos() {
         let base = snap(&[("exec-0", 10), ("exec-1", 10)], 10);
-        // exec-1 never advanced while the sealer did.
+        // exec-1 never advances, while the sealer does.
         let fin = snap(&[("exec-0", 50), ("exec-1", 10)], 50);
         let v = evaluate(&EvalInput {
             counts: counts(300, 300, 300, 0),
@@ -462,7 +475,7 @@ mod tests {
     #[test]
     fn gap_is_soft_in_chaos_hard_in_soak() {
         let base = snap(&[("exec-0", 10)], 10);
-        // executor advanced but lags the sealer by 40 (> max_gap 5).
+        // The executor advances but lags the sealer by 40, above max_gap of 5.
         let fin = snap(&[("exec-0", 20)], 60);
         let soak = evaluate(&EvalInput {
             counts: counts(300, 300, 300, 0),
@@ -498,8 +511,9 @@ mod tests {
 
     #[test]
     fn restarted_executor_with_moving_recheck_is_recovering_not_frozen() {
-        // exec-1 was hard-killed: gauge reset (10 → 3, advanced < 0) but the
-        // recheck sample shows it replaying (3 → 8) → RECOVERING, not FROZEN.
+        // exec-1 was hard-killed: its gauge reset from 10 to 3, so advanced
+        // is negative. The recheck sample shows it replaying, from 3 to 8,
+        // so the verdict is RECOVERING, not FROZEN.
         let base = snap(&[("exec-0", 10), ("exec-1", 10)], 10);
         let fin = snap(&[("exec-0", 50), ("exec-1", 3)], 50);
         let recheck = snap(&[("exec-0", 51), ("exec-1", 8)], 51);
@@ -522,7 +536,7 @@ mod tests {
 
     #[test]
     fn restarted_executor_with_stalled_recheck_is_frozen() {
-        // Gauge reset and did NOT move by the recheck sample → still FROZEN.
+        // The gauge reset, and did not move by the recheck sample: still FROZEN.
         let base = snap(&[("exec-0", 10), ("exec-1", 10)], 10);
         let fin = snap(&[("exec-0", 50), ("exec-1", 3)], 50);
         let recheck = snap(&[("exec-0", 51), ("exec-1", 3)], 51);
@@ -566,8 +580,8 @@ mod tests {
 
     #[test]
     fn sequencer_drop_is_soft_in_chaos() {
-        // Retry noise across an ingress restart can double-submit; the drop
-        // delta is reported but must not fail a chaos run.
+        // Retry noise across an ingress restart can double-submit. The drop
+        // delta is reported, but must not fail a chaos run.
         let mut base = snap(&[("exec-0", 10)], 10);
         base.seq_dropped_past = Some(0);
         let mut fin = snap(&[("exec-0", 50)], 50);

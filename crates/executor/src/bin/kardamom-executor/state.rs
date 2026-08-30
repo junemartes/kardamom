@@ -12,17 +12,18 @@ use crate::args::Args;
 /// Everything `main` needs from the state side before streams open.
 pub(crate) struct PreparedState {
     pub(crate) env: StateEnv,
-    /// The persisted cursor (GENESIS-valued on a fresh DB): the cluster
-    /// client replays the canonical stream from it and the reader/exec
-    /// threads seed their absolute counters from it (see `ResumePoint`).
+    /// The persisted cursor. It has a genesis value on a fresh DB. The
+    /// cluster client replays the canonical stream from it, and the reader
+    /// and exec threads seed their absolute counters from it (see
+    /// `ResumePoint`).
     pub(crate) start: ResumePoint,
 }
 
 /// Fast cold-start recovery, env open, cursor read, checkpointer spawn.
 ///
-/// Restore runs BEFORE opening the env: if the state dir is empty (a
-/// fresh/wiped node) and a checkpoint is available locally or from peers,
-/// startup then sees a populated DB and replays only the tail instead of
+/// Restore runs before the env opens. If the state dir is empty (a fresh
+/// or wiped node) and a checkpoint is available locally or from a peer,
+/// startup then sees a populated DB. It replays only the tail, instead of
 /// re-syncing from genesis.
 pub(crate) fn prepare_state(
     args: &Args,
@@ -31,19 +32,17 @@ pub(crate) fn prepare_state(
 ) -> Result<PreparedState> {
     if let Some(ckpt_dir) = args.checkpoint_dir.as_ref() {
         // Serve this node's checkpoints to peers (the other side of the peer
-        // fetch below). Best-effort infrastructure, but a bad bind address is
-        // a deploy bug — fail startup loudly.
+        // fetch below). This is best-effort infrastructure. But a bad bind
+        // address is a deploy bug, so fail startup loudly.
         // Runs as a tokio task for the life of the process (called inside
         // the runtime; the handle is not needed).
         if let Some(addr) = args.checkpoint_serve_addr {
             kardamom_state::serve_checkpoints(addr, ckpt_dir.clone())
                 .context("bind checkpoint serve address")?;
         }
-        // Fresh iff the state dir has no mdbx data file — checked WITHOUT opening
-        // the env (opening would itself create the data file and defeat restore).
-        // (Observed motivation for the ladder's quarantine rung: a copy that
-        // raced the writer's prune had no MANIFEST; every restart refused it
-        // and the fleet sat at 2/3.)
+        // The state dir is fresh only if it has no mdbx data file. Check this
+        // without opening the env: opening would create the data file itself
+        // and defeat the restore.
         let fresh = !kardamom_state::checkpoint::has_state_db(&args.state_dir)
             .context("probe state dir")?;
         if fresh {
@@ -80,8 +79,8 @@ pub(crate) fn prepare_state(
 
     spawn_checkpointer(args, &env, shutdown);
 
-    // Crash-recovery cursor. A non-genesis cursor means we restarted
-    // mid-chain; a fresh start IS a resume from the genesis cursor.
+    // Crash-recovery cursor. A non-genesis cursor means the node restarted
+    // mid-chain. A fresh start is just a resume from the genesis cursor.
     let start = ResumePoint {
         block: recovery.last_committed_block,
         record_count: recovery.last_fsynced_b_position.as_index(),
@@ -98,12 +97,13 @@ pub(crate) fn prepare_state(
     Ok(PreparedState { env, start })
 }
 
-/// Periodic checkpointing (fast recovery for OTHER nodes, and for this node
-/// on a future wipe). `compact_to` runs against an online RO snapshot, so it
-/// never blocks the writer. A tokio interval task; each tick runs the mdbx
-/// compaction on `spawn_blocking` (the txn stays on one thread for the whole
-/// call). Prunes to `checkpoint_keep`. Stops when `shutdown` is cancelled.
-/// Must be called inside a tokio runtime.
+/// Periodic checkpointing. It gives fast recovery for other nodes, and
+/// for this node after a future wipe. `compact_to` runs against an
+/// online read-only snapshot, so it never blocks the writer. This runs
+/// as a tokio interval task. Each tick runs the mdbx compaction on
+/// `spawn_blocking`, so the transaction stays on one thread for the
+/// whole call. It prunes to `checkpoint_keep`, and stops when
+/// `shutdown` is cancelled. Call this inside a tokio runtime.
 fn spawn_checkpointer(args: &Args, env: &StateEnv, shutdown: CancellationToken) {
     let (Some(ckpt_dir), true) = (
         args.checkpoint_dir.clone(),

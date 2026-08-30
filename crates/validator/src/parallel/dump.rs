@@ -1,6 +1,7 @@
-//! Serialize a diverging block's inputs for offline replay. Best-effort:
-//! failures only log. Format: JSON envelope with hex payloads — small
-//! (one block), self-contained, versioned by field presence.
+//! Serialize a diverging block's inputs for offline replay. This is
+//! best-effort: failures only log. The format is a JSON envelope with hex
+//! payloads. It covers one block, is self-contained, and is versioned by
+//! field presence.
 
 use kardamom_engine::actor::BufferedRecord;
 use kardamom_engine::delta::PendingDelta;
@@ -8,10 +9,9 @@ use kardamom_engine::error::ExecutorError;
 
 use super::claims::ClaimIndex;
 
-/// Serializable projection of a block's canonical records — shared by the
-/// claim-path dump below and the receipt-path flight ring
-/// (`crate::flight`): both dumps must stay replayable by the same offline
-/// tooling.
+/// Serializable projection of a block's canonical records. The claim-path
+/// dump below and the receipt-path flight ring (`crate::flight`) share
+/// this: both dumps must stay replayable by the same offline tooling.
 pub(crate) fn records_json(records: &[BufferedRecord]) -> Vec<serde_json::Value> {
     records
         .iter()
@@ -49,8 +49,8 @@ pub(crate) fn records_json(records: &[BufferedRecord]) -> Vec<serde_json::Value>
         .collect()
 }
 
-/// Serializable projection of a claim index (same sharing rationale as
-/// [`records_json`]).
+/// Serializable projection of a claim index. Same sharing reason as
+/// [`records_json`].
 pub(crate) fn claims_json(claims: &ClaimIndex) -> serde_json::Value {
     serde_json::json!({
         "claims_storage": claims.storage.iter().map(|((a, k), w)| serde_json::json!({
@@ -80,9 +80,9 @@ pub(super) fn dump_divergence_inputs(
     granularity: u16,
     err: &ExecutorError,
 ) {
-    // Same dir as the flight recorder's receipt-divergence dumper;
-    // overridable so tests (and dev hosts) can assert the artifact without
-    // /opt existing.
+    // This uses the same directory as the flight recorder's
+    // receipt-divergence dumper. It can be overridden, so tests and dev
+    // hosts can check the file without /opt existing.
     let dir = std::env::var("KARDAMOM_FLIGHT_DIR").unwrap_or_else(|_| "/opt/kardamom/state".into());
     let path = std::path::Path::new(&dir).join(format!("divergence-{block}.json"));
     let mut payload = serde_json::json!({

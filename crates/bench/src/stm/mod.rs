@@ -1,19 +1,21 @@
-//! Block-STM P0: footprint statistics + oracle dependency analysis
-//! (spec: `docs/agents/block-stm-executor-spec.md`).
+//! This module does offline Block-STM analysis: footprint statistics and
+//! oracle dependency analysis.
 //!
-//! Everything here is OFFLINE analysis — no engine changes, no cluster.
-//! The capture runner executes workload blocks sequentially through the
-//! REAL engine with a fresh per-tx `Bal` (so `storage_reads` attribute per
-//! tx), the classifier recovers mapping base-slots by keccak inversion,
-//! and the oracle builds the TRUE dependency graph from actual read/write
-//! sets — yielding the go/no-go numbers of the spec: critical-path ratio,
-//! prediction hit-rates, over-merge cost, fee-sink identification.
+//! Everything here is offline analysis: no engine changes, no cluster.
+//! The capture runner executes workload blocks in order, through the
+//! real engine, with a fresh per-transaction `Bal`, so `storage_reads`
+//! is attributed per transaction. The classifier recovers mapping
+//! base-slots by keccak inversion. The oracle builds the true
+//! dependency graph from actual read and write sets. Together these
+//! yield the go/no-go numbers: critical-path ratio, prediction
+//! hit rates, over-merge cost, and fee-sink identification.
 
 pub mod capture;
 pub mod uniswap;
 
-// The classifier / oracle / cell model moved to `kardamom-footprint` so the
-// live executor's P1 shadow (`kardamom-engine::shadow`) grades on EXACTLY
-// the code the P0 GO verdict was measured with. Re-exported here so the
-// `kardamom-stm-p0` bin's import surface is unchanged.
+// The classifier, oracle, and cell model moved to `kardamom-footprint`,
+// so the live executor's shadow scheduler (`kardamom-engine::shadow`)
+// grades on exactly the code the offline go verdict was measured with.
+// This module re-exports them, so the `kardamom-stm-p0` binary's import
+// surface stays unchanged.
 pub use kardamom_footprint::{Cell, TxObs, classifier, oracle};

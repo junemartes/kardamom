@@ -3,20 +3,22 @@
 # chaos-cases-validator.sh — validator-centric cases (lapse, fresh join,
 # whole-stack CPU squeeze) + the shared warm-up gate and SIGSTOP freeze/thaw.
 # =============================================================================
-# SOURCED into chaos.sh's shell (never executed as a child). This file must
-# NOT install traps (chaos.sh owns the single EXIT trap).
+# This file is sourced into chaos.sh's shell, never run as a child
+# process. This file must not install traps; chaos.sh owns the single
+# EXIT trap.
 
 # --- shared warm-up gate -----------------------------------------------------
 
-# Wait until the validator is CAUGHT UP AND VERIFYING LIVE — its
-# blocks_verified counter is advancing and its lag to the executors is small.
-# (A validator re-executes from genesis; blocks that passed before it started
-# have no BAL and are committed unverified during a fast catch-up, so it
-# reaches the live head and only THEN verifies steadily. A lapse/squeeze must
-# hit a verifying validator, not one still catching up.) Replaces the warm-up
-# loop previously repeated 4×. Returns 0 once warmed, 1 on timeout; either way
-# the last observations land in WARM_VERIFIED/WARM_BLOCK/WARM_EXEC/WARM_T so
-# callers can log/fail with the real numbers.
+# Wait until the validator has caught up and is verifying live: its
+# blocks_verified counter is advancing, and its lag to the executors is
+# small. A validator re-executes from genesis. Blocks that passed
+# before it started have no BAL, and commit unverified during a fast
+# catch-up. So it reaches the live head, and only then verifies
+# steadily. A lapse or squeeze case must hit a verifying validator, not
+# one still catching up. This replaces a warm-up loop that used to
+# repeat in 4 places. Returns 0 once warmed, 1 on timeout. Either way,
+# the last observations land in WARM_VERIFIED/WARM_BLOCK/WARM_EXEC/
+# WARM_T, so callers can log or fail with the real numbers.
 WARM_VERIFIED=0; WARM_BLOCK=0; WARM_EXEC=0; WARM_T=0
 wait_validator_verifying_live() { # <timeout-s> [max-lag (default 15)]
   local timeout_s="$1" max_lag="${2:-15}" t=0 vprev=-1 verified=0 v_now=0 e_now=0
@@ -37,17 +39,18 @@ wait_validator_verifying_live() { # <timeout-s> [max-lag (default 15)]
 
 # --- shared SIGSTOP freeze / thaw --------------------------------------------
 
-# SIGSTOP + VERIFIED freeze (#108): `docker pause` silently no-ops in the
-# nested-DinD freezer, so a "paused" task can keep running and every assert
-# then passes against a victim that never lapsed (observed on both the
-# validator-lapse and sequencer-lapse cases; CI run 30178211248). Signals hit
-# the task's PID 1 regardless of freezer delegation, and the mid-freeze probe
-# makes a silent no-op IMPOSSIBLE: a frozen process cannot answer HTTP, so if
-# metrics still respond the case fails loudly instead of asserting against a
-# replica that never lapsed. Sleeps 3s before probing — callers subtract 3
-# from their freeze window. $5 (bridge ip) is optional: when set the probe is
-# bridge-first like fetch_metrics; empty means docker-exec-only (loopback
-# exporters).
+# Use SIGSTOP with a verified freeze. `docker pause` silently no-ops
+# in the nested-DinD freezer, so a "paused" task can keep running, and
+# every assert then passes against a victim that never lapsed. This
+# happened on both the validator-lapse and sequencer-lapse cases.
+# Signals hit the task's PID 1 regardless of freezer delegation, and
+# the mid-freeze probe rules out a silent no-op: a frozen process
+# cannot answer HTTP, so if metrics still respond, the case fails
+# loudly instead of asserting against a replica that never lapsed.
+# This function sleeps 3s before probing; callers subtract 3 from
+# their freeze window. $5 (bridge ip) is optional. When set, the probe
+# tries the bridge first, like fetch_metrics. When empty, it uses
+# docker-exec only, for loopback exporters.
 freeze_verified() { # <node> <inner-container> <metrics-port> <case-context> [bridge-ip]
   local node="$1" inner="$2" port="$3" ctx="$4" ip="${5:-}"
   docker exec "${node}" docker kill -s STOP "${inner}" >/dev/null \
@@ -60,35 +63,38 @@ freeze_verified() { # <node> <inner-container> <metrics-port> <case-context> [br
   log "${ctx}: freeze verified (metrics endpoint dark)"
 }
 
-# SIGCONT a frozen inner container (bounded; silent). Returns non-zero on
-# failure — a failed CONT is NOT automatically a case error: the frozen task
-# can be REPLACED under us mid-freeze (supervisor action), or the node exec
-# can be transiently wedged; each case owns that verdict.
+# Send SIGCONT to a frozen inner container, with a bound and no
+# output. Returns non-zero on failure. A failed CONT is not
+# automatically a case error: the frozen task can get replaced
+# mid-freeze by a supervisor action, or the node exec can be
+# transiently wedged. Each case decides what that means.
 thaw_container() { # <node> <inner-container>
   timeout 20 docker exec "$1" docker kill -s CONT "$2" >/dev/null 2>&1
 }
 
 # --- validator-lapse ---------------------------------------------------------
 
-# validator-lapse case: PAUSE the validator process for a window under
-# sustained load, then resume. The validator's live tx_bal multicast image
-# lapses during the pause; on resume the missed BALs are still sitting in the
-# live multicast TERM BUFFER, so the validator drains them and keeps
-# verifying, and the catch-up skip (#78) bounds the cost of anything that aged
-# out of the term buffer (those blocks commit unverified instead of blocking
-# 5s each). There is NO side-stream refetch mechanism — that prototype was
-# discarded (a co-located recorder + follow-live replay starves the live poll
-# path). Asserts: verification coverage held (bal_missing did not materially
-# grow), the validator kept verifying past the pre-pause count, caught back
-# up, and saw no divergence. The pipeline itself is untouched (the validator
-# is off the hot path), so the standard load + progress verdicts still apply.
+# validator-lapse case: pause the validator process for a window,
+# under sustained load, then resume. The validator's live tx_bal
+# multicast image lapses during the pause. On resume, the missed BALs
+# are still sitting in the live multicast term buffer, so the
+# validator drains them and keeps verifying. The catch-up skip bounds
+# the cost of anything that aged out of the term buffer; those blocks
+# commit unverified instead of blocking 5s each. There is no
+# side-stream refetch mechanism; that prototype was discarded, since a
+# co-located recorder plus follow-live replay starves the live poll
+# path. Asserts: verification coverage holds (bal_missing did not grow
+# much), the validator kept verifying past the pre-pause count, caught
+# back up, and saw no divergence. The pipeline itself is untouched, since
+# the validator is off the hot path, so the standard load and progress
+# verdicts still apply.
 LAPSE_S="${LAPSE_S:-30}"
 
-# Forensics for validator-lapse failures: the validator lives alone on the
-# aux tier and the generic failure dump does not cover it — capture the
-# nomad view, the node's container states, and the validator's own log tail
-# so a dark-endpoint verdict is attributable (process dead vs exec wedge vs
-# supervisor not restarting).
+# Print forensics for validator-lapse failures. The validator lives
+# alone on the aux tier, and the generic failure dump does not cover
+# it. Capture the nomad view, the node's container states, and the
+# validator's own log tail, so a dark-endpoint verdict can point to a
+# cause: process dead, exec wedged, or supervisor not restarting.
 val_debug() {
   log "validator-lapse DEBUG: nomad validator job status:"
   on_control 'nomad job status validator 2>/dev/null | tail -12' 2>/dev/null || true
@@ -104,9 +110,10 @@ run_validator_lapse() {
   inner="$(inner_container "${VALIDATOR_NODE}" validator)"
   [ -n "${inner}" ] || fail "validator-lapse: no inner validator container on ${VALIDATOR_NODE}"
 
-  # WARM UP: the lapse must hit a verifying validator, not one still catching
-  # up. Pausing a validator that never verified would fail LATER with a
-  # misleading "did not resume verifying" — fail here with the real reason.
+  # Warm up. The lapse must hit a verifying validator, not one still
+  # catching up. Pausing a validator that never verified would fail
+  # later with a misleading "did not resume verifying". Fail here with
+  # the real reason.
   wait_validator_verifying_live 150 \
     || fail "validator-lapse: never warmed up within ${WARM_T}s (verified=${WARM_VERIFIED} block=${WARM_BLOCK} exec=${WARM_EXEC}) — not verifying live BEFORE the pause"
   log "validator-lapse: warmed up (verified=${WARM_VERIFIED} block=${WARM_BLOCK} exec=${WARM_EXEC}) after ${WARM_T}s"
@@ -120,12 +127,12 @@ run_validator_lapse() {
   freeze_verified "${VALIDATOR_NODE}" "${inner}" "${VALIDATOR_PORT}" validator-lapse
   sleep $(( LAPSE_S - 3 ))
   if ! thaw_container "${VALIDATOR_NODE}" "${inner}"; then
-    # A failed CONT is NOT a case error by itself: the frozen task can be
-    # REPLACED under us mid-freeze (supervisor action) — which IS the
-    # newborn path — or the node exec can be transiently wedged. The
-    # sampling loop below owns the verdict (end state: verifying live,
-    # caught up, zero divergences); the thaw mechanics must never abort
-    # the case.
+    # A failed CONT is not a case error by itself. The frozen task can
+    # get replaced mid-freeze by a supervisor action, which is the
+    # newborn path, or the node exec can be transiently wedged. The
+    # sampling loop below decides the verdict, based on the end state:
+    # verifying live, caught up, zero divergences. The thaw mechanics
+    # must never abort the case.
     local cur0
     cur0="$(inner_container "${VALIDATOR_NODE}" validator)"
     if [ -n "${cur0}" ] && [ "${cur0}" != "${inner}" ]; then
@@ -137,14 +144,14 @@ run_validator_lapse() {
     fi
   fi
 
-  # VERIFIED THAW (mirror of the verified freeze): a CONT that silently
-  # misses leaves a FROZEN ORPHAN squatting the metrics port — every
-  # supervisor replacement then dies instantly on EADDRINUSE (fatal in
-  # kardamom_obs::init), burns the restart budget, and mode=fail strands
-  # the validator permanently (reproduced locally; the 240s dark-endpoint
-  # run). Within a grace window the endpoint must answer OR the container
-  # must have been replaced; otherwise KILL the frozen container so the
-  # port frees and the supervisor restarts into clean air.
+  # This is a verified thaw, mirroring the verified freeze. A CONT
+  # that silently misses leaves a frozen orphan squatting the metrics
+  # port. Every supervisor replacement then dies instantly on
+  # EADDRINUSE, fatal in kardamom_obs::init, which burns the restart
+  # budget, and mode=fail strands the validator permanently. Within a
+  # grace window, the endpoint must answer, or the container must have
+  # been replaced. Otherwise, kill the frozen container, so the port
+  # frees and the supervisor restarts into clean air.
   local thaw_ok=0 tw=0 curX
   while [ "${tw}" -lt 30 ]; do
     sleep 5; tw=$(( tw + 5 ))
@@ -161,20 +168,23 @@ run_validator_lapse() {
     timeout 20 docker exec "${VALIDATOR_NODE}" docker kill "${inner}" >/dev/null 2>&1 || true
   fi
 
-  # POST-THAW, identity decides the contract. A ${LAPSE_S}s freeze exceeds
-  # the media driver's client-liveness timeout: the validator's aeron client
-  # is EVICTED and the process fail-stops on thaw → Nomad restarts it → the
-  # DESIGNED recovery loop (persisted-cursor resume + archive replay-merge +
-  # catch-up mode) — the crash-only path production actually takes, never
-  # end-to-end asserted before this case. Either path must END the same way:
-  # verifying LIVE again, caught up, zero divergences.
-  #   - SURVIVOR (container StartedAt unchanged; sub-eviction freeze): the
-  #     original term-buffer contract — verified advances past the
-  #     pre-freeze count and bal_missing growth stays within tolerance.
-  #   - NEWBORN (StartedAt changed): counters RESET; catch-up commits the
-  #     freeze-window backlog unverified BY DESIGN (#78), so bal_missing is
-  #     not comparable across the restart — assert it verifies live from
-  #     the fresh counter, catches up, and reports zero divergences.
+  # After thaw, container identity decides the contract. A ${LAPSE_S}s
+  # freeze exceeds the media driver's client-liveness timeout. The
+  # validator's aeron client gets evicted, and the process fail-stops
+  # on thaw. Nomad restarts it, into the designed recovery loop:
+  # persisted-cursor resume, archive replay-merge, and catch-up mode.
+  # This is the crash-only path production actually takes, and this
+  # case is the first to assert it end to end. Either path must end
+  # the same way: verifying live again, caught up, zero divergences.
+  #   - Survivor (container StartedAt unchanged, a freeze shorter than
+  #     eviction): the original term-buffer contract holds. verified
+  #     advances past the pre-freeze count, and bal_missing growth
+  #     stays within tolerance.
+  #   - Newborn (StartedAt changed): counters reset. Catch-up commits
+  #     the freeze-window backlog unverified, by design, so bal_missing
+  #     is not comparable across the restart. Assert that it verifies
+  #     live from the fresh counter, catches up, and reports zero
+  #     divergences.
   local t=0 ok=0 path="" cur started1 vf1 v1 e_now d1
   while [ "${t}" -lt 240 ]; do
     sleep 10; t=$(( t + 10 ))
@@ -219,40 +229,42 @@ run_validator_lapse() {
 
 # --- validator-join ----------------------------------------------------------
 
-# validator-join (#143): a FRESH validator joining a chain already in
-# progress. Stop the running validator, wipe its state + checkpoint staging,
-# and let Nomad restart it with nothing: the newborn must ADOPT an executor
-# peer checkpoint (the cold-start half of the replay-unavailable fallback),
-# bootstrap the hashed mirror + trie from that trie-off image, catch up to
-# the live head, and RESUME VERIFIED execution with zero divergences —
-# proving both sync and state correctness (the divergence latch re-executes
-# and cross-checks every post-join block against the executors' BAL +
-# receipts, and the MPT root advancing proves the bootstrapped trie is
-# coherent). Executors checkpoint every 20s from bring-up, so a peer
-# checkpoint always exists; the adoption log grep keeps the case
-# non-vacuous — a genesis-replay join would NOT print it.
+# validator-join: a fresh validator joins a chain already in
+# progress. Stop the running validator, wipe its state and checkpoint
+# staging, and let Nomad restart it with nothing. The newborn must
+# adopt an executor peer checkpoint, the cold-start half of the
+# replay-unavailable fallback, bootstrap the hashed mirror and trie
+# from that trie-off image, catch up to the live head, and resume
+# verified execution with zero divergences. This proves both sync and
+# state correctness: the divergence latch re-executes and cross-checks
+# every post-join block against the executors' BAL and receipts, and
+# the MPT root advancing proves the bootstrapped trie is coherent.
+# Executors checkpoint every 20s from bring-up, so a peer checkpoint
+# always exists. The adoption log grep keeps the case non-vacuous; a
+# genesis-replay join would not print it.
 run_validator_join() {
   local inner
   inner="$(inner_container "${VALIDATOR_NODE}" validator)"
   [ -n "${inner}" ] || fail "validator-join: no inner validator container on ${VALIDATOR_NODE}"
 
-  # Warm up: the chain must be far enough along that adoption skips real work,
-  # and the pre-join validator must be verifying live so the case-end state
-  # ("verifying again") is meaningful.
+  # Warm up. The chain must be far enough along that adoption skips
+  # real work, and the pre-join validator must be verifying live, so
+  # the case-end state ("verifying again") is meaningful.
   wait_validator_verifying_live 150 \
     || fail "validator-join: cluster never warmed up within ${WARM_T}s (verified=${WARM_VERIFIED} block=${WARM_BLOCK} exec=${WARM_EXEC})"
   log "validator-join: warmed up (verified=${WARM_VERIFIED} block=${WARM_BLOCK} exec=${WARM_EXEC}); wiping the validator for a fresh join"
 
-  # Container NAMES survive a task restart (task-<alloc-id>), so newborn
-  # identity is the docker StartedAt timestamp — the validator-lapse case's
-  # lesson, relearned on this case's first CI run (sync succeeded, the
-  # name-based newborn detection never fired).
+  # Container names survive a task restart (task-<alloc-id>), so
+  # newborn identity is the docker StartedAt timestamp. This is the
+  # validator-lapse case's lesson, learned again here: sync succeeded,
+  # but name-based newborn detection never fired.
   local started0
   started0="$(container_started_at "${VALIDATOR_NODE}" "${inner}")"
 
-  # Kill, then wipe inside the restart delay (the job's restart stanza waits
-  # 15s before the replacement container starts — the wipe wins the race, and
-  # a wipe-first order would race the LIVE mdbx instead).
+  # Kill, then wipe inside the restart delay. The job's restart
+  # stanza waits 15s before the replacement container starts, so the
+  # wipe wins the race. A wipe-first order would instead race the
+  # live mdbx.
   docker exec "${VALIDATOR_NODE}" docker kill "${inner}" >/dev/null \
     || fail "validator-join: kill failed"
   timeout 15 docker exec "${VALIDATOR_NODE}" sh -c \
@@ -260,7 +272,8 @@ run_validator_join() {
     || fail "validator-join: state wipe failed"
   log "validator-join: validator killed, state + checkpoint staging wiped"
 
-  # The newborn must appear, ADOPT a peer checkpoint, catch up, and verify.
+  # The newborn must appear, adopt a peer checkpoint, catch up, and
+  # verify.
   local deadline=$(( $(date +%s) + 240 )) newborn="" joined=0 vf1=0 v1=0 e_now=0
   while [ "$(date +%s)" -lt "${deadline}" ]; do
     if [ -z "${newborn}" ]; then
@@ -289,9 +302,10 @@ run_validator_join() {
     fail "validator-join: fresh validator not verifying + caught up within 240s (newborn=${newborn:-none}, verified=${vf1}, block=${v1}, exec=${e_now})"
   fi
 
-  # Non-vacuity: the join must have gone through ADOPTION (the #143 path),
-  # incl. the trie bootstrap of the trie-off executor image — a genesis
-  # replay would satisfy the sync asserts without exercising either.
+  # Non-vacuity check: the join must have gone through adoption,
+  # including the trie bootstrap of the trie-off executor image. A
+  # genesis replay would satisfy the sync asserts without exercising
+  # either.
   local nlogs
   nlogs="$(timeout 20 docker exec "${VALIDATOR_NODE}" docker logs "${newborn}" 2>&1 | tail -400 || true)"
   has_line "${nlogs}" "adopted state from checkpoint" \
@@ -299,9 +313,10 @@ run_validator_join() {
   has_line "${nlogs}" "trie bootstrap complete" \
     || { val_debug; fail "validator-join: adopted state but no trie bootstrap ran (trie-off image not detected?)"; }
 
-  # State correctness: zero divergences across the whole join (the latch
-  # covers every post-join block the validator actually verified), and the
-  # MPT root observation must be advancing (the bootstrapped trie is live).
+  # State correctness: zero divergences across the whole join. The
+  # latch covers every post-join block the validator actually
+  # verified. The MPT root observation must be advancing, proving the
+  # bootstrapped trie is live.
   local div root_blk
   div="$(val_metric_req validator_divergence_total 'validator-join divergence==0 assert')"
   [ "${div}" -eq 0 ] || { val_debug; fail "validator-join: ${div} divergence(s) after join"; }
@@ -313,36 +328,41 @@ run_validator_join() {
 
 # --- cpu-squeeze: whole-stack CPU-starvation drill ---------------------------
 
-# Recreates the degraded-CI-runner storm ON PURPOSE: every kardamom node
-# container is cgroup-throttled AT ONCE (docker update --cpus), so executors,
-# sealers, ingress, sequencers and the validator all starve together — Aeron
-# sessions lapse, back-pressure engages everywhere, and the validator falls
-# into catch-up exactly like the 4-core GH runners at loadavg 17-32. That
-# window produced the 2026-08-03 load-shard divergence (halt -> restart ->
-# CLEAN re-validation of the same blocks: non-deterministic on replay, the
-# replay-overlap class). Ambient starvation found it by luck; this drill
-# hunts it deliberately. Invariant under squeeze: NO divergence, ever —
-# starvation may slow the validator, never fork its verdict.
+# This drill recreates the degraded-CI-runner storm on purpose. Every
+# kardamom node container is cgroup-throttled at once (docker update
+# --cpus), so executors, sealers, ingress, sequencers, and the
+# validator all starve together. Aeron sessions lapse, back-pressure
+# engages everywhere, and the validator falls into catch-up, just like
+# the 4-core GH runners under heavy load. That kind of window once
+# produced a load-shard divergence: halt, restart, then a clean
+# re-validation of the same blocks, a sign of non-determinism on
+# replay (the replay-overlap class). Ambient starvation found it by
+# luck; this drill hunts it on purpose. The invariant under squeeze:
+# no divergence, ever. Starvation may slow the validator, but must
+# never fork its verdict.
 SQUEEZE_S="${SQUEEZE_S:-120}"
 SQUEEZE_CPUS_PER_NODE="${SQUEEZE_CPUS_PER_NODE:-0.75}"
 SQUEEZE_RECOVER_S="${SQUEEZE_RECOVER_S:-180}"
-# Oscillation: N squeeze->release cycles instead of one long squeeze. The
-# replay-overlap class needs the TRANSITION (sessions lapse under squeeze,
-# then reconnect + replay-merge on release) — repeated cycles exercise that
-# machinery far harder than one sustained squeeze of the same total length.
+# Oscillation: run N squeeze-and-release cycles instead of one long
+# squeeze. The replay-overlap class needs the transition: sessions
+# lapse under squeeze, then reconnect and replay-merge on release.
+# Repeated cycles exercise that machinery far harder than one
+# sustained squeeze of the same total length.
 SQUEEZE_CYCLES="${SQUEEZE_CYCLES:-1}"
 SQUEEZE_RELEASE_S="${SQUEEZE_RELEASE_S:-30}"
 
 run_cpu_squeeze() {
-  # Warm-up gate (same as validator-lapse): the squeeze must hit a validator
-  # VERIFYING LIVE — squeezing one still in catch-up asserts nothing.
+  # Warm-up gate, the same as validator-lapse. The squeeze must hit a
+  # validator verifying live; squeezing one still in catch-up asserts
+  # nothing.
   wait_validator_verifying_live 150 \
     || fail "cpu-squeeze: validator never verifying live within ${WARM_T}s (verified=${WARM_VERIFIED} block=${WARM_BLOCK} exec=${WARM_EXEC})"
   log "cpu-squeeze: warmed up (verified=${WARM_VERIFIED} block=${WARM_BLOCK} exec=${WARM_EXEC}) after ${WARM_T}s"
 
-  # Node containers on the HOST engine (the DinD outer layer): the cgroup
-  # limit cascades to every inner task. Control/registry stay untouched —
-  # the drill starves the STACK, not the harness's own probes.
+  # Target node containers on the host engine, the DinD outer layer.
+  # The cgroup limit cascades to every inner task. Control and
+  # registry stay untouched, since the drill starves the stack, not
+  # the harness's own probes.
   local nodes
   nodes="$(docker ps --format '{{.Names}}' | grep -E '^kardamom-(executor|sequencer|ingress|sealer|aux)-[0-9]+$' || true)"
   [ -n "${nodes}" ] || fail "cpu-squeeze: no kardamom node containers found on the host engine"
@@ -354,16 +374,18 @@ run_cpu_squeeze() {
       docker update --cpus "${SQUEEZE_CPUS_PER_NODE}" "${n}" >/dev/null \
         || fail "cpu-squeeze: docker update --cpus failed for ${n}"
     done
-    # Verify the squeeze TOOK (a silently-ignored limit would assert nothing
-    # — the validator-lapse docker-pause lesson): NanoCpus must be non-zero.
+    # Verify the squeeze took effect. A silently ignored limit would
+    # assert nothing, the same lesson as the validator-lapse
+    # docker-pause case. NanoCpus must be non-zero.
     local nano
     nano="$(docker inspect -f '{{.HostConfig.NanoCpus}}' "$(head -1 <<<"${nodes}")")"
     [ "${nano:-0}" -gt 0 ] || fail "cpu-squeeze: throttle did not take (NanoCpus=${nano})"
     log "cpu-squeeze: cycle ${cyc}/${SQUEEZE_CYCLES} squeezing ${SQUEEZE_S}s"
     sleep "${SQUEEZE_S}"
 
-    # Restore — two passes, best-effort second: leaving a node throttled
-    # would poison every later case/assert on this cluster.
+    # Restore CPU, with a best-effort second pass. Leaving a node
+    # throttled would poison every later case and assert on this
+    # cluster.
     for n in ${nodes}; do
       docker update --cpus 0 "${n}" >/dev/null 2>&1 \
         || { sleep 2; docker update --cpus 0 "${n}" >/dev/null 2>&1; } \
@@ -379,11 +401,12 @@ run_cpu_squeeze() {
   wait_validator_verifying_live "${SQUEEZE_RECOVER_S}" \
     || fail "cpu-squeeze: validator not verifying live within ${SQUEEZE_RECOVER_S}s of restore (verified=${WARM_VERIFIED} block=${WARM_BLOCK} exec=${WARM_EXEC})"
 
-  # THE invariant: zero divergences — metric AND logs (the metric resets if
-  # the validator restarted mid-squeeze; a pre-restart divergence still shows
-  # in the old alloc's log, exactly the 2026-08-03 signature). The alloc-log
-  # scan is the SHARED implementation in validator-verdict.sh (ci-cluster.sh's
-  # §7c verdict runs the same one; SIGPIPE doctrine documented there).
+  # The invariant: zero divergences, checked in both the metric and
+  # the logs. The metric resets if the validator restarted
+  # mid-squeeze, but a pre-restart divergence still shows in the old
+  # alloc's log. The alloc-log scan is the shared implementation in
+  # validator-verdict.sh; ci-cluster.sh's §7c verdict runs the same
+  # one, and the SIGPIPE doctrine is documented there.
   local div
   div="$(val_metric validator_divergence_total)"; div="$(printf '%.0f' "${div:-0}")"
   [ "${div}" -eq 0 ] || fail "cpu-squeeze: validator counted ${div} divergence(s) under starvation"
@@ -397,26 +420,26 @@ run_cpu_squeeze() {
 # --- case entry points (dispatched from run_case) ----------------------------
 
 case_validator_lapse() {
-  # No component killed: pause the (off-hot-path) validator and assert it
-  # resumes verifying with coverage held — the live term buffer redelivers
-  # the paused window on resume, and the catch-up skip (#78) bounds
-  # anything that aged out. All validator-specific asserts live in the
-  # helper.
+  # No component is killed. Pause the validator, which is off the hot
+  # path, and check that it resumes verifying with coverage held. The
+  # live term buffer redelivers the paused window on resume, and the
+  # catch-up skip bounds anything that aged out. All validator-specific
+  # asserts live in the helper.
   run_validator_lapse
 }
 
 case_cpu_squeeze() {
-  # Whole-stack CPU starvation (no kills): throttle every node container
-  # at once and assert the invariant that starvation may slow the
-  # pipeline but never fork the validator's verdict. All squeeze
-  # mechanics + asserts live in the helper.
+  # Whole-stack CPU starvation, with no kills. Throttle every node
+  # container at once, and check the invariant: starvation may slow
+  # the pipeline, but must never fork the validator's verdict. All
+  # squeeze mechanics and asserts live in the helper.
   run_cpu_squeeze
 }
 
 case_validator_join() {
-  # Fresh validator joins the running chain mid-run: wipe + restart, must
-  # adopt an executor peer checkpoint (#143 cold-start half, incl. the
-  # trie bootstrap), catch up, and resume VERIFIED execution with zero
-  # divergences. All asserts in the helper.
+  # A fresh validator joins the running chain mid-run: wipe and
+  # restart. It must adopt an executor peer checkpoint, the cold-start
+  # half, including the trie bootstrap, catch up, and resume verified
+  # execution with zero divergences. All asserts live in the helper.
   run_validator_join
 }

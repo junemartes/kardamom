@@ -1,22 +1,22 @@
 //! Executor-side BAL publication.
 //!
-//! Publishes one EIP-7928 Block Access List frame per block on `tx_bal`
-//! (spec: `docs/agents/bal-attribution-parallel-validation-spec.md`).
+//! Publishes one EIP-7928 Block Access List frame per block on `tx_bal`.
+//! See docs/agents/bal-attribution-parallel-validation-spec.md.
 //!
-//! **Emission is not best-effort.** Once BALs drive the validator's parallel
-//! re-execution, their availability over the catch-up window is a LIVENESS
-//! property: a validator that lags and finds BALs missing must re-execute
-//! sequentially, and at high tps sequential re-execution can be slower than
-//! the chain — it would never catch up. So every block's state transition is
-//! emitted, with an ack'd publish and a bounded retry deadline, from a
-//! DEDICATED thread: the exec thread's only cost is moving the captured
-//! `Bal` onto a channel.
+//! Emission is not best-effort. Once BALs drive the validator's parallel
+//! re-execution, their availability over the catch-up window is a
+//! liveness property. A validator that lags and finds BALs missing must
+//! re-execute sequentially, and at high tps sequential re-execution can
+//! be slower than the chain, so it would never catch up. So the code
+//! emits every block's state transition, with an acked publish and a
+//! bounded retry deadline, from a dedicated thread. The exec thread's
+//! only cost is moving the captured `Bal` onto a channel.
 //!
 //! The frame is a [`BalFrame`]: the receipts-free merged `BlockDelta`
-//! (unchanged from v1 — receipts dominate byte size and fat frames once
-//! collapsed the validator's lapse window, #113) plus the canonical
-//! RLP-encoded `alloy_eip7928::BlockAccessList` carrying per-slot
-//! `(tx_index, value)` writes and per-account storage reads.
+//! (unchanged from v1; receipts dominate byte size, and fat frames once
+//! shrank the validator's lapse window) plus the canonical RLP-encoded
+//! `alloy_eip7928::BlockAccessList`, carrying per-slot `(tx_index, value)`
+//! writes and per-account storage reads.
 
 use std::time::{Duration, Instant};
 
@@ -27,29 +27,29 @@ use kardamom_log::aeron_live::PubHandle;
 use kardamom_types::{BalFrame, BlockDelta};
 
 /// Default attribution granularity written into the frame: K-tx chunks
-/// matching the validator's scheduling unit (`--validation-batch-size`,
-/// default 8 — at K > 1 the validator chunk-aligns its batches to the
+/// that match the validator's scheduling unit (`--validation-batch-size`,
+/// default 8; at K > 1 the validator chunk-aligns its batches to the
 /// frame's K anyway, see `parallel::execute_block_parallel`).
 ///
-/// The BAL is a SEEDING artifact: its claims exist so the validator's
-/// batches can re-execute in parallel, and the seeding induction only ever
-/// consumes chunk-final values — so chunk-boundary verification is all the
-/// artifact needs, and quantizing costs no parallelism. Per-tx execution
-/// integrity is carried by the per-tx receipts cross-check
-/// (`write_set_hash`), not by BAL attribution. Chunk-collapsing shrinks
-/// frames (within-chunk writes to one item collapse to the chunk-final
-/// value), which protects the validator's lapse window (#113).
+/// The BAL is a seeding artifact: its claims exist so the validator's
+/// batches can re-execute in parallel, and the seeding induction only
+/// ever consumes chunk-final values. So chunk-boundary verification is
+/// all the artifact needs, and quantizing costs no parallelism. Per-tx
+/// execution integrity comes from the per-tx receipts cross-check
+/// (`write_set_hash`), not from BAL attribution. Chunk-collapsing
+/// shrinks frames (within-chunk writes to one item collapse to the
+/// chunk-final value), which protects the validator's lapse window.
 ///
-/// `1` (per-tx, the standard EIP-7928 artifact) remains available via the
-/// override for external consumers or divergence forensics. If the
-/// chunk-collapsed path ever diverges live again (the unexplained K=20
-/// DeFi incident), the flight recorder dumps replay inputs at the point of
-/// failure — see `kardamom_validator::flight`.
+/// `1` (per-tx, the standard EIP-7928 artifact) stays available through
+/// the override, for external consumers or divergence forensics. If the
+/// chunk-collapsed path ever diverges live, the flight recorder dumps
+/// replay inputs at the point of failure; see `kardamom_validator::flight`.
 const DEFAULT_GRANULARITY: u16 = 8;
 
-/// Attribution granularity written into the frame, [`DEFAULT_GRANULARITY`]
-/// unless overridden via `KARDAMOM_BAL_GRANULARITY` (1 = per-tx; other K =
-/// K-tx chunks, the size ladder's rungs).
+/// Attribution granularity written into the frame. It is
+/// [`DEFAULT_GRANULARITY`] unless overridden by `KARDAMOM_BAL_GRANULARITY`
+/// (1 means per-tx; other K values mean K-tx chunks, the size ladder's
+/// rungs).
 fn configured_granularity() -> u16 {
     std::env::var("KARDAMOM_BAL_GRANULARITY")
         .ok()
@@ -58,23 +58,24 @@ fn configured_granularity() -> u16 {
         .unwrap_or(DEFAULT_GRANULARITY)
 }
 
-/// Per-frame publish deadline. A frame that cannot be delivered live within
-/// this window is still RETAINED (replay-serving is the durability path);
-/// the deadline only bounds how long one frame occupies the publisher. It
-/// must be WELL UNDER the block interval: at 2s (== the tick) a
-/// NOT_CONNECTED window drained exactly at the arrival rate, so the bounded
-/// handoff channel hovered at capacity and any jitter back-pressured the
-/// exec thread. 500ms keeps drain 4x arrival during subscriber outages.
+/// Per-frame publish deadline. A frame that cannot be delivered live
+/// within this window is still retained (replay-serving is the
+/// durability path). The deadline only bounds how long one frame
+/// occupies the publisher. It must be well under the block interval: at
+/// 2s (the tick length), a `NOT_CONNECTED` window drained at exactly the
+/// arrival rate, so the bounded handoff channel hovered at capacity and
+/// any jitter back-pressured the exec thread. 500ms keeps the drain rate
+/// 4x the arrival rate during subscriber outages.
 const PUBLISH_DEADLINE: Duration = Duration::from_millis(500);
 
-/// Retained encoded frames for validator catch-up. 256 blocks ≈ 8.5 min at
-/// the 2s tick.
+/// Retained encoded frames for validator catch-up. 256 blocks is about
+/// 8.5 min at the 2s tick.
 const RETENTION_BLOCKS: usize = 256;
 
-/// Quantize a Bal's tx indices into K-sized chunks: within a chunk, writes
-/// to the same item collapse to the chunk-final value. Applied to the
-/// exported alloy BAL so the wire artifact matches what the validator will
-/// verify against at that granularity.
+/// Quantize a Bal's tx indices into K-sized chunks. Within a chunk,
+/// writes to the same item collapse to the chunk-final value. This
+/// applies to the exported alloy BAL, so the wire artifact matches what
+/// the validator will verify at that granularity.
 use kardamom_engine::bal_ladder::quantize;
 
 /// Copy bytes into the aligned buffer the publish API expects.
@@ -123,8 +124,9 @@ pub fn run_bal_publisher(rx: Receiver<BalHandoff>, pubh: PubHandle) {
         let (boundary, delta, bal) = match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(v) => v,
             Err(RecvTimeoutError::Timeout) => {
-                // Idle tick: no block closed in the last 500ms. trace, not
-                // debug — this fires twice a second on a quiet chain.
+                // Idle tick: no block closed in the last 500ms. Use trace
+                // level, not debug: this fires twice a second on a quiet
+                // chain.
                 tracing::trace!("BAL publisher idle: no handoff in 500ms");
                 continue;
             }
@@ -171,19 +173,19 @@ pub fn run_bal_publisher(rx: Receiver<BalHandoff>, pubh: PubHandle) {
             "BAL frame encoded"
         );
 
-        // Ack'd delivery with a bounded deadline. Retained regardless of
-        // live-delivery outcome: retention IS the durability path (a
-        // validator that was down catches up from the ring).
+        // Acked delivery with a bounded deadline. The frame is retained
+        // regardless of the live-delivery outcome: retention is the
+        // durability path (a validator that was down catches up from the
+        // ring).
         //
-        // NOT_CONNECTED is TERMINAL, not retried: it means no subscriber
-        // exists right now (e.g. a validator-less stack), and spinning the
-        // full deadline on every frame capped this pump's drain rate at
-        // 2 frames/s — below the local 250ms block cadence — so the
-        // bounded exec→pump handoff filled and BLOCKED THE EXEC THREAD,
-        // delaying every receipt behind it (S4's -32000 park timeouts;
-        // chain-semantics red). The frame still lands in the retention
-        // ring either way; only BACK_PRESSURED-class transients are worth
-        // the bounded retry.
+        // A `NOT_CONNECTED` result is terminal, not retried. It means no
+        // subscriber exists right now (for example, a validator-less
+        // stack). Spinning the full deadline on every frame capped this
+        // pump's drain rate at 2 frames/s, below the local 250ms block
+        // cadence. That filled the bounded exec-to-pump handoff and
+        // blocked the exec thread, delaying every receipt behind it. The
+        // frame still lands in the retention ring either way. Only
+        // `BACK_PRESSURED`-class transients are worth the bounded retry.
         let deadline = Instant::now() + PUBLISH_DEADLINE;
         let mut outcome = "ok";
         loop {

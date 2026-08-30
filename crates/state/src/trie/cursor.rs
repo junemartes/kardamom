@@ -1,11 +1,15 @@
-//! mdbx read helpers for the incremental trie: fetch stored branch nodes by
-//! path, and collect hashed leaves under a nibble prefix in ascending key order.
+//! mdbx read helpers for the incremental trie. These fetch stored
+//! branch nodes by path, and collect hashed leaves under a nibble prefix
+//! in ascending key order.
 //!
-//! Generic over the transaction kind (`Tx<K>`) so the same code serves the
-//! writer's RW txn (reads must see the just-written hashed-mirror rows) and
-//! read-only callers. Keys for stored nodes are the **unpacked** nibble path
-//! (one nibble per byte) so lexicographic mdbx order == trie order and no two
-//! distinct paths collide; storage tries prepend the 32-byte `account_hash`.
+//! These helpers are generic over the transaction kind (`Tx<K>`), so the
+//! same code serves the writer's read-write transaction, where reads
+//! must see the just-written hashed-mirror rows, and read-only callers.
+//!
+//! Keys for stored nodes use the unpacked nibble path, one nibble per
+//! byte. This makes lexicographic mdbx order match trie order, and no
+//! two distinct paths collide. Storage tries prepend the 32-byte
+//! `account_hash`.
 
 use alloy_primitives::{B256, U256};
 use alloy_trie::{BranchNodeCompact, Nibbles};
@@ -15,9 +19,9 @@ use std::sync::Arc;
 use signet_libmdbx::tx::{PtrSync, SyncKind};
 use signet_libmdbx::{TransactionKind, TxSync};
 
-/// Any sync transaction kind (read-only or read-write) — the walker and
-/// cursors only READ, so both are welcome; proof generation runs them over
-/// a read txn against the committed snapshot.
+/// Any sync transaction kind, read-only or read-write. The walker and
+/// cursors only read, so both kinds work. Proof generation runs them
+/// over a read transaction against the committed snapshot.
 pub trait ReadKind: TransactionKind + SyncKind<Access = Arc<PtrSync>> {}
 impl<K: TransactionKind + SyncKind<Access = Arc<PtrSync>>> ReadKind for K {}
 
@@ -42,7 +46,7 @@ pub(crate) fn node_key(account_hash: Option<&B256>, path: &Nibbles) -> Vec<u8> {
     }
 }
 
-/// Fetch the stored branch node at `path` (exact), if present.
+/// Fetch the stored branch node at the exact `path`, if present.
 pub(crate) fn get_branch_node<K: ReadKind>(
     tx: &TxSync<K>,
     db: Database,
@@ -98,8 +102,9 @@ pub(crate) fn encode_account_leaf(p: &AccountTrieParts) -> [u8; 104] {
     out
 }
 
-/// The 32-byte key whose first `prefix.len()` nibbles equal `prefix`, rest zero —
-/// the cursor seek start for "leaves under prefix".
+/// The 32-byte key whose first `prefix.len()` nibbles equal `prefix`,
+/// with the rest zero. This is the cursor seek start for "leaves under
+/// this prefix".
 fn padded_key(prefix: &Nibbles) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (i, n) in prefix.to_vec().into_iter().enumerate() {
@@ -115,7 +120,8 @@ fn padded_key(prefix: &Nibbles) -> [u8; 32] {
     out
 }
 
-/// True iff the 32-byte hashed key's first `prefix.len()` nibbles equal `prefix`.
+/// Returns true if the 32-byte hashed key's first `prefix.len()`
+/// nibbles equal `prefix`.
 fn key_starts_with(key: &B256, prefix: &Nibbles) -> bool {
     Nibbles::unpack(key.as_slice()).starts_with(prefix)
 }
@@ -145,8 +151,9 @@ pub(crate) fn collect_hashed_accounts_under<K: ReadKind>(
     Ok(out)
 }
 
-/// Collect `(keccak(slot), value)` for one account's hashed storage under
-/// `prefix`, ascending. Keys in `hashed_storage` are `account_hash ++ keccak(slot)`.
+/// Collect `(keccak(slot), value)` for one account's hashed storage
+/// under `prefix`, in ascending order. Keys in `hashed_storage` are
+/// `account_hash ++ keccak(slot)`.
 pub(crate) fn collect_hashed_storage_under<K: ReadKind>(
     tx: &TxSync<K>,
     db: Database,

@@ -1,21 +1,25 @@
-//! `kardamom-archive-rereplicate` — restore or repair an Aeron Archive from a peer.
+//! `kardamom-archive-rereplicate`: restore or repair an Aeron Archive from
+//! a peer.
 //!
-//! `tx_data` is recorded on both ingress replicas (two node-independent mirror
-//! copies). If one node's archive volume is lost, the default mode restores it
-//! from the surviving peer's copy, returning the cluster to full 2-copy
-//! redundancy. `--heal` repairs *corruption* instead: copy only the named (or
-//! auto-detected diverging) segments, leaving the rest of the archive alone.
+//! `tx_data` is recorded on both ingress replicas, giving two
+//! node-independent mirror copies. If one node's archive volume is lost,
+//! the default mode restores it from the surviving peer's copy, and
+//! returns the cluster to full 2-copy redundancy. `--heal` repairs
+//! corruption instead: it copies only the named (or auto-detected
+//! diverging) segments, leaving the rest of the archive alone.
 //!
-//! It is a file-level segment mirror (rusteron-archive doesn't expose Aeron's
-//! network `replicate()`): copy `.rec` segments + `archive.catalog` — never
-//! `archive-mark.dat` (a live source heartbeats its mark; a transplanted copy
-//! makes the destination's Archive crash-loop on 'active Mark file detected').
-//! The **destination archive daemon must be stopped** during
-//! any copy. Cross-node transport (docker cp / tar / scp) is the operator's job;
-//! this operates on two locally-visible archive `dir/` paths and verifies the
-//! result. Mirror inequality proves one side is corrupt, not which: the arbiter
-//! is a CRC-armed `aeron-archive verify` (record-time CRC32 is enabled in the
-//! driver), run on the suspect node before its daemon rejoins.
+//! This is a file-level segment mirror, because rusteron-archive does not
+//! expose Aeron's network `replicate()`. It copies `.rec` segments and
+//! `archive.catalog`, but never `archive-mark.dat`. A live source
+//! heartbeats its mark, so a transplanted copy would make the
+//! destination's Archive crash-loop on 'active Mark file detected'. The
+//! destination archive daemon must be stopped during any copy.
+//! Cross-node transport (docker cp, tar, or scp) is the operator's job;
+//! this tool operates on two locally visible archive `dir/` paths and
+//! verifies the result. A mirror mismatch proves one side is corrupt, but
+//! not which one. The arbiter is a CRC-armed `aeron-archive verify`
+//! (record-time CRC32 is enabled in the driver), run on the suspect node
+//! before its daemon rejoins.
 
 use std::path::PathBuf;
 
@@ -27,12 +31,14 @@ use tracing::info;
 #[derive(Parser, Debug)]
 #[command(name = "kardamom-archive-rereplicate", version)]
 struct Cli {
-    /// Source archive `dir/` (a surviving peer's `.rec` segments + catalog).
+    /// The source archive `dir/`: a surviving peer's `.rec` segments and
+    /// catalog.
     #[arg(long)]
     source_dir: PathBuf,
 
-    /// Destination archive `dir/` (the wiped or corrupt node). Its archive
-    /// daemon must be stopped. Created if absent.
+    /// The destination archive `dir/`: the wiped or corrupt node. Its
+    /// archive daemon must be stopped. This creates the directory if it is
+    /// absent.
     #[arg(long)]
     dest_dir: PathBuf,
 
@@ -41,8 +47,8 @@ struct Cli {
     no_verify: bool,
 
     /// Heal mode: copy only diverging segments instead of the whole archive.
-    /// Segments come from `--segments`, or are auto-detected by a content
-    /// diff against the source mirror when the flag is omitted.
+    /// Segments come from `--segments`. If that flag is omitted, this tool
+    /// auto-detects them with a content diff against the source mirror.
     #[arg(long, default_value_t = false)]
     heal: bool,
 
@@ -50,8 +56,9 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     segments: Vec<String>,
 
-    /// Report diverging segments (one per line, exit 3 if any) and change
-    /// nothing. Composable: `--diff` then `--heal --segments <names>`.
+    /// Report diverging segments, one per line, and exit with code 3 if any
+    /// exist. Change nothing. Compose it as `--diff`, then
+    /// `--heal --segments <names>`.
     #[arg(long, default_value_t = false)]
     diff: bool,
 }
@@ -65,10 +72,11 @@ fn main() -> anyhow::Result<()> {
         for name in &diff.diverged {
             println!("{name}");
         }
-        // Dest-only segments (recording ids the mirror never opened — daemon
-        // restart / post-restore sessions, issue #126) are a divergence the
-        // mirror CANNOT vouch for, and --heal cannot repair them from this
-        // source; tagged so scripted callers can tell the two classes apart.
+        // Dest-only segments are recording ids the mirror never opened, from
+        // a daemon restart or a post-restore session. They are a divergence
+        // the mirror cannot vouch for, and --heal cannot repair them from
+        // this source. Tag them so scripted callers can tell the two
+        // classes apart.
         for name in &diff.dest_only {
             println!("{name} dest-only (no source counterpart; unhealable from this mirror)");
         }
@@ -85,9 +93,9 @@ fn main() -> anyhow::Result<()> {
 
     if cli.heal {
         let segments = if cli.segments.is_empty() {
-            // Auto-detect heals only what the mirror can vouch for; dest-only
-            // segments have no source bytes to copy and are reported by
-            // --diff instead.
+            // Auto-detect heals only what the mirror can vouch for.
+            // Dest-only segments have no source bytes to copy, and --diff
+            // reports them instead.
             let diff =
                 diff_mirror(&cli.source_dir, &cli.dest_dir).context("detect diverging segments")?;
             if !diff.dest_only.is_empty() {

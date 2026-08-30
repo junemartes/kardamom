@@ -7,10 +7,12 @@ interface IKardamomFactory {
         Upgrade
     }
 
-    /// One deployment / upgrade instruction. `targetImpl` lets multiple specs in one
-    /// batch share a single freshly-deployed impl: the first spec for an `(id, implSalt)`
-    /// pair sets `targetImpl = address(0)` (factory CREATE2's the impl); subsequent specs
-    /// set `targetImpl = <that address>` to skip the redundant CREATE2.
+    /// One deployment or upgrade instruction. `targetImpl` lets multiple
+    /// specs in one batch share a single, freshly deployed implementation.
+    /// The first spec for an `(id, implSalt)` pair sets
+    /// `targetImpl = address(0)`, so the factory runs CREATE2 for the
+    /// implementation. Later specs set `targetImpl` to that address, to
+    /// skip the redundant CREATE2 call.
     struct DeploymentSpec {
         uint256 l2ChainId;
         bytes32 id;

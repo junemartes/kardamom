@@ -1,15 +1,17 @@
-//! The prover input: everything one block's anchored stateless execution
-//! consumes, as a single rkyv frame (spec: no-std-exec-core, phase 3c).
+//! The prover input. This holds everything that one block's anchored
+//! stateless execution needs, as a single rkyv frame. See
+//! docs/agents/no-std-exec-core-spec.md.
 //!
-//! Host side: the validator's capture + anchoring assemble this from
-//! `capture_block_witness` / `anchor_block_witness` output. Guest side: the
-//! zkVM program deserializes it, rebuilds the exec-core record list, and
-//! runs `execute_block_anchored` — whose public outputs are the ONLY thing
-//! the proof reveals ([`PublicOutputs`]).
+//! On the host side, the validator's capture and anchoring assemble this
+//! from the output of `capture_block_witness` and `anchor_block_witness`.
+//! On the guest side, the zkVM program deserializes it, rebuilds the
+//! exec-core record list, and runs `execute_block_anchored`. The proof
+//! reveals only that function's public outputs ([`PublicOutputs`]).
 //!
-//! The BAL travels as its canonical RLP (`bal_rlp`) — the exact bytes the
-//! executor published in the frame — so `bal_commitment = keccak256(bal_rlp)`
-//! binds the proof to the posted artifact without re-encoding ambiguity.
+//! The BAL travels as its canonical RLP (`bal_rlp`). These are the exact
+//! bytes the executor published in the frame. So
+//! `bal_commitment = keccak256(bal_rlp)` binds the proof to the posted
+//! artifact, with no re-encoding ambiguity.
 
 use alloc::vec::Vec;
 
@@ -20,9 +22,9 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::witness::{ExecutionWitness, WitnessProofs};
 use crate::{BPosition, BlockBoundaryStart, Deposit, TxEnvelope, wire};
 
-/// One canonical record on the prover wire — mirrors the exec core's
-/// `BufferedRecord` (which is not itself a wire type; the guest rebuilds
-/// it from this).
+/// One canonical record on the prover wire. This mirrors the exec core's
+/// `BufferedRecord`. That type is not itself a wire type; the guest
+/// rebuilds it from this record.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 pub enum ProverRecord {
     Tx {
@@ -41,29 +43,29 @@ pub enum ProverRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 pub struct ProverInput {
     pub chain_id: u64,
-    /// The boundary that OPENED this block (block N's txs execute under
-    /// boundary N-1's timestamp — the guest rebuilds `ExecEnv` exactly as
-    /// the live exec thread does).
+    /// The boundary that opened this block. Block N's transactions execute
+    /// under boundary N-1's timestamp. The guest rebuilds `ExecEnv` exactly
+    /// as the live exec thread does.
     pub boundary: BlockBoundaryStart,
     pub witness: ExecutionWitness,
     pub proofs: WitnessProofs,
     pub records: Vec<ProverRecord>,
-    /// The published frame's canonical BAL RLP (the proof input; the guest
-    /// re-derives and compares).
+    /// The published frame's canonical BAL RLP. This is the proof input;
+    /// the guest re-derives it and compares.
     #[rkyv(with = wire::BytesVec)]
     pub bal_rlp: Bytes,
     pub granularity: u16,
 }
 
-/// The single-block proof's public outputs (v2, spec PR 5 slice 0): the
-/// DISPUTE-READY 160-byte abi shape a Solidity `abi.decode(publicValues,
-/// (bytes32, bytes32, uint256, bytes32, bytes32))` reads directly:
-/// `pre_state_root || post_state_root || block_number(u256) ||
-/// records_digest || bal_commitment`. `records_digest` is the block's
-/// [`BlockRecordsDigest`] (L2 txs only) — the field the optimistic
-/// oracle's `challengeBlock` compares against the claim's per-block
-/// digests. `bal_commitment` binds the L2-published BAL artifact for
-/// off-chain accountability; L1 does not store it.
+/// The single-block proof's public outputs (v2, spec PR 5 slice 0). This is
+/// a dispute-ready, 160-byte abi shape. A Solidity call to
+/// `abi.decode(publicValues, (bytes32, bytes32, uint256, bytes32, bytes32))`
+/// reads it directly: `pre_state_root || post_state_root ||
+/// block_number(u256) || records_digest || bal_commitment`. `records_digest`
+/// is the block's [`BlockRecordsDigest`], covering L2 transactions only.
+/// The optimistic oracle's `challengeBlock` compares this field against the
+/// claim's per-block digests. `bal_commitment` binds the L2-published BAL
+/// artifact for off-chain accountability. L1 does not store it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicOutputs {
     pub pre_state_root: B256,
@@ -104,14 +106,14 @@ impl PublicOutputs {
     }
 }
 
-/// Per-block digest of the batch-attested record identities (spec: PR 4).
+/// Per-block digest of the batch-attested record identities.
 ///
-/// Covers L2-ORIGINATED TXS ONLY — deposits are L1-originated (the batcher
-/// deliberately excludes them from DA batches; L1 already holds them), so
-/// the batch commitment binds exactly what the batch posts. Both the
-/// batcher (at batch close) and the batch guest (over its input records)
-/// compute this; the settlement contract stores the batch fold and the
-/// proof oracle requires equality.
+/// Covers L2-originated transactions only. Deposits are L1-originated. The
+/// batcher deliberately excludes them from DA batches, because L1 already
+/// holds them. So the batch commitment binds exactly what the batch posts.
+/// Both the batcher, at batch close, and the batch guest, over its input
+/// records, compute this digest. The settlement contract stores the batch
+/// fold, and the proof oracle requires the two to match.
 pub struct BlockRecordsDigest {
     h: Keccak256,
 }
@@ -145,19 +147,19 @@ pub fn batch_records_commitment(block_digests: impl IntoIterator<Item = B256>) -
     h.finalize()
 }
 
-/// A BATCH proof's input: contiguous per-block frames (spec: PR 4). The
-/// guest chains the roots internally — block i's `pre_state_root` must
-/// equal block i-1's recomputed post root — so one proof attests the whole
-/// posted range.
+/// A batch proof's input: contiguous per-block frames. The
+/// guest chains the roots internally: block i's `pre_state_root` must equal
+/// block i-1's recomputed post root. So one proof attests the whole posted
+/// range.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 pub struct BatchProverInput {
     pub blocks: Vec<ProverInput>,
 }
 
-/// The batch proof's public outputs: 160 bytes, 5x32, exactly Solidity's
-/// `abi.decode(publicValues, (bytes32, bytes32, uint256, uint256, bytes32))`:
-/// `pre_state_root || post_state_root || first_block || last_block ||
-/// records_commitment`.
+/// The batch proof's public outputs: 160 bytes, five 32-byte words. This
+/// matches Solidity's `abi.decode(publicValues, (bytes32, bytes32, uint256,
+/// uint256, bytes32))`: `pre_state_root || post_state_root || first_block ||
+/// last_block || records_commitment`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchPublicOutputs {
     pub pre_state_root: B256,

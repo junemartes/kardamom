@@ -2,20 +2,22 @@
 # =============================================================================
 # chaos-asserts.sh — injectors, evidence sources and assertions for chaos.sh.
 # =============================================================================
-# SOURCED into chaos.sh's shell (never executed as a child): the injectors
-# write the KILLED_* globals that assert_count consumes, and fail() must abort
-# the ONE suite process. This file must NOT install traps (chaos.sh owns the
-# single EXIT trap). Requires lib.sh (on_control, count_running, log, fail),
-# lib-topology.sh and chaos-probes.sh.
+# This file is sourced into chaos.sh's shell, never run as a child
+# process. The injectors write the KILLED_* globals that assert_count
+# reads, and fail() must abort the one suite process. This file must
+# not install traps; chaos.sh owns the single EXIT trap. It needs
+# lib.sh (on_control, count_running, log, fail), lib-topology.sh, and
+# chaos-probes.sh.
 
 # --- injectors --------------------------------------------------------------
 
-# The injectors record WHAT they killed (stopped alloc id, or killed inner
-# container id + where) so assert_count can require observed REPLACEMENT, not
-# just a running count: right after a kill the doomed alloc can still report
-# ClientStatus==running on the first poll, so a bare count>=N check could pass
-# instantly against the OLD alloc without ever observing the outage — a
-# vacuous "recovered within SLO". assert_count consumes + clears these.
+# The injectors record what they killed: the stopped alloc id, or the
+# killed inner container id and where. This lets assert_count require
+# observed replacement, not just a running count. Right after a kill,
+# the doomed alloc can still report ClientStatus==running on the first
+# poll. So a bare count>=N check could pass instantly against the old
+# alloc, without ever observing the outage, a vacuous "recovered within
+# SLO". assert_count reads and clears these.
 KILLED_ALLOC=""
 KILLED_NODE=""; KILLED_TASK=""; KILLED_CID=""
 
@@ -28,10 +30,11 @@ inject_graceful() { # <job>
 }
 
 inject_graceful_group() { # <job> <task-group>
-  # The `|| true` is load-bearing (same doctrine as val_metric): under
-  # `set -eo pipefail` a non-zero docker exec turns this assignment into a
-  # SILENT exit with no CHAOS FAIL line. awk reads to EOF on purpose — an
-  # early `exit` closes the pipe under the writer and fails it with EPIPE.
+  # The `|| true` here is load-bearing, the same doctrine as
+  # val_metric. Under `set -eo pipefail`, a non-zero docker exec would
+  # turn this assignment into a silent exit, with no CHAOS FAIL line.
+  # awk reads to EOF on purpose. An early `exit` would close the pipe
+  # under the writer and fail it with EPIPE.
   local alloc
   alloc="$(on_control 'nomad job allocs -t "{{range .}}{{.ID}} {{.TaskGroup}} {{.ClientStatus}}{{\"\n\"}}{{end}}" "$1"' "$1" 2>/dev/null \
     | awk -v g="$2" '$2==g && $3=="running" && !found {found=$1} END {if (found) print found}' || true)"
@@ -42,11 +45,12 @@ inject_graceful_group() { # <job> <task-group>
 }
 
 inject_hard() { # <node-container(s), space-separated candidates> <task-name>
-  # Multiple candidates cover tasks whose placement can move between cases
-  # (observed: after graceful-executor, the replacement alloc's container is
-  # not always back on executor-0 when hard-executor probes it). The first
-  # node actually running the task is killed; NO node running it is still a
-  # loud failure — never a vacuous pass.
+  # Multiple candidates cover tasks whose placement can move between
+  # cases. For example, after graceful-executor, the replacement
+  # alloc's container is not always back on executor-0 when
+  # hard-executor probes it. This kills the first node actually
+  # running the task. If no node is running it, that is still a loud
+  # failure, never a vacuous pass.
   local node cid=""
   for node in $1; do
     cid="$(docker exec "${node}" sh -c 'docker ps --filter name='"$2"' -q | head -1' 2>/dev/null)"
@@ -59,14 +63,15 @@ inject_hard() { # <node-container(s), space-separated candidates> <task-name>
   KILLED_NODE="${node}"; KILLED_TASK="$2"; KILLED_CID="${cid}"
 }
 
-kill_node() { # <node-container(s)> — docker kill that trusts container STATE over the exit event
+kill_node() { # <node-container(s)> — docker kill that trusts container state over the exit event
   docker kill "$@" >/dev/null 2>&1 && return 0
-  # On a thrashed host docker kill can report "did not receive an exit event"
-  # AFTER the SIGKILL landed: dockerd's wait for the containerd exit event
-  # times out while the victim still dies with exit 137. Observed live
-  # (2026-08-09, loadavg ~30): both victims' FinishedAt within a second of
-  # the kill, error anyway, case failed with the victims already dead. Judge
-  # the kill by container state, not by the event — only a victim genuinely
+  # On a thrashed host, docker kill can report "did not receive an
+  # exit event" after the SIGKILL already landed. dockerd's wait for
+  # the containerd exit event times out while the victim still dies
+  # with exit 137. This has happened for real: both victims' FinishedAt
+  # landed within a second of the kill, but docker still reported an
+  # error, and the case failed with the victims already dead. Judge the
+  # kill by container state, not by the event. Only a victim genuinely
   # still running after a grace window is a failure.
   local n t
   for n in "$@"; do
@@ -81,18 +86,19 @@ kill_node() { # <node-container(s)> — docker kill that trusts container STATE 
 
 # --- alloc-log evidence sources ---------------------------------------------
 
-# Concatenated logs of every alloc of a Nomad job (running or not). THE
-# evidence source for lines that straddle a task restart: Nomad's docker
-# driver GCs the dead container on an in-place restart, so `docker logs` on
-# the node silently loses everything the dying generation said (first
-# retention-overrun run: the sealer provably refused the replay and the
-# executor provably self-repaired, but the refusal/fetch/park lines lived in
-# the reaped container and the case read "never happened"). Nomad's own alloc
-# log files persist across restarts of the same alloc, so pre-kill and
-# post-rejoin lines land in the same stream; callers assert on counts
-# increasing, not mere presence.
-#   $2 = --stdout-only : skip the stderr stream (the cluster job's role/
-#        snapshot lines print to stdout; its stderr is JVM noise).
+# Get the concatenated logs of every alloc of a Nomad job, running or
+# not. This is the evidence source for lines that straddle a task
+# restart. Nomad's docker driver garbage-collects the dead container on
+# an in-place restart, so `docker logs` on the node silently loses
+# everything the dying generation said. On an early retention-overrun
+# run, the sealer provably refused the replay and the executor provably
+# self-repaired, but the refusal, fetch, and park lines lived in the
+# reaped container, and the case read "never happened". Nomad's own
+# alloc log files persist across restarts of the same alloc, so
+# pre-kill and post-rejoin lines land in the same stream. Callers
+# assert on counts increasing, not mere presence.
+#   $2 = --stdout-only: skip the stderr stream. The cluster job's role
+#        and snapshot lines print to stdout; its stderr is JVM noise.
 job_alloc_logs() { # <nomad-job> [--stdout-only]
   local job="$1" flag="${2:-}" allocs alloc
   allocs="$(on_control 'nomad job allocs -t "{{range .}}{{.ID}}{{\"\n\"}}{{end}}" "$1"' "${job}" 2>/dev/null || true)"
@@ -107,22 +113,25 @@ job_alloc_logs() { # <nomad-job> [--stdout-only]
   done <<<"${allocs}"
 }
 
-# Concatenated stdout of every cluster alloc — the uniform evidence source for
-# snapshot/restore/role lines (was a near-copy of job_alloc_logs; now a flag).
+# Get the concatenated stdout of every cluster alloc, the uniform
+# evidence source for snapshot, restore, and role lines. This used to
+# be a near-copy of job_alloc_logs; now it is a flag.
 cluster_alloc_logs() { job_alloc_logs "${CLUSTER_TASK}" --stdout-only; }
 
-# Count of alloc-log lines containing a fixed needle. `grep -c` reads ALL
-# input (no early exit, so no SIGPIPE under pipefail — unlike `grep -q`);
-# `|| true` keeps the zero-match exit status from killing the suite.
+# Count alloc-log lines containing a fixed needle. `grep -c` reads all
+# input, with no early exit, so no SIGPIPE under pipefail, unlike
+# `grep -q`. `|| true` keeps a zero-match exit status from killing the
+# suite.
 count_log_lines() { # <job> <needle> [--stdout-only] -> count
   job_alloc_logs "$1" "${3:-}" | grep -c -- "$2" || true
 }
 
-# Poll until the job's alloc-log count of <needle> EXCEEDS <baseline> (counts,
-# not presence: bring-up and earlier cases also log the same lines). Calls
-# fail() on timeout — invoke DIRECTLY, never inside $(...): a fail() in a
-# command substitution only exits the subshell, and the suite would sail on
-# past a dead assert.
+# Poll until the job's alloc-log count of <needle> exceeds <baseline>.
+# This checks counts, not presence, since bring-up and earlier cases
+# also log the same lines. Calls fail() on timeout. Call this function
+# directly, never inside $(...): a fail() in a command substitution
+# only exits the subshell, and the suite would sail on past a dead
+# assert.
 wait_log_count_gt() { # <job> <needle> <baseline> <timeout-s> <interval-s> <fail-msg> [--stdout-only]
   local job="$1" needle="$2" base="$3" timeout_s="$4" interval="$5" msg="$6" flag="${7:-}"
   local t=0 now=0
@@ -137,11 +146,12 @@ wait_log_count_gt() { # <job> <needle> <baseline> <timeout-s> <interval-s> <fail
   done
 }
 
-# Wait for a checkpoint to exist on a peer/donor node (the repeated
-# checkpoint-donor gate: recovery-D fetches from a peer at or above the
-# post-freeze floor, and donors checkpoint every 20s while live — but only
-# once the chain is moving. Waiting here, not failing later with a misleading
-# "resync did not complete", names the real precondition).
+# Wait for a checkpoint to exist on a peer or donor node. This is the
+# repeated checkpoint-donor gate. Recovery-D fetches from a peer at or
+# above the post-freeze floor. Donors checkpoint every 20s while live,
+# but only once the chain is moving. Waiting here, instead of failing
+# later with a misleading "resync did not complete", names the real
+# precondition.
 wait_peer_checkpoint() { # <node> <case-context>
   local node="$1" ctx="${2:-checkpoint-wait}" _i
   log "${ctx}: waiting for a checkpoint on ${node}"
@@ -157,24 +167,28 @@ wait_peer_checkpoint() { # <node> <case-context>
 
 # --- cluster leadership detection -------------------------------------------
 
-# Return the memberId (0/1/2) of the CURRENT Raft leader, by grepping the LAST
-# `cluster role=LEADER memberId=N` line across the 3 `cluster` allocs' stdout.
-# SealerClusteredService.onRoleChange() prints that line to stdout on every role
-# transition (deliberately stdout, not slf4j, for grep-ability), so the last such
-# line in an alloc's log is that member's most-recent role; the member whose last
-# role line is LEADER is the current leader. memberId N == kardamom-sealer-N.
+# Return the memberId (0, 1, or 2) of the current Raft leader. This
+# greps the last `cluster role=LEADER memberId=N` line across the 3
+# `cluster` allocs' stdout. SealerClusteredService.onRoleChange() prints
+# that line to stdout on every role transition, deliberately to stdout
+# and not slf4j, so it is easy to grep. So the last such line in an
+# alloc's log is that member's most recent role, and the member whose
+# last role line is LEADER is the current leader. memberId N equals
+# kardamom-sealer-N.
 #
-# Tolerates election windows with a bounded retry loop ($1 = max secs, default
-# CHAOS_LEADER_SLO_S): right after a kill there may briefly be no leader line yet.
-# Prints the leader memberId on stdout (and nothing else); fails if none found in
-# time. Reads logs via the control node's `nomad alloc logs` (same access pattern
-# the rest of the suite uses).
+# This tolerates election windows with a bounded retry loop ($1 = max
+# seconds, default CHAOS_LEADER_SLO_S). Right after a kill, there may
+# briefly be no leader line yet. Prints the leader memberId on stdout,
+# and nothing else. Fails if none is found in time. Reads logs through
+# the control node's `nomad alloc logs`, the same access pattern the
+# rest of the suite uses.
 cluster_leader() { # [max-secs]
   local max="${1:-${CHAOS_LEADER_SLO_S}}" t=0 allocs alloc lastrole leader
   while :; do
     leader=""
-    # All cluster allocs (running or not) — a just-killed member's log may still
-    # show its last role line, but we only trust a member whose LAST line is LEADER.
+    # All cluster allocs, running or not. A just-killed member's log
+    # may still show its last role line, but this only trusts a
+    # member whose last line is LEADER.
     allocs="$(on_control 'nomad job allocs -t "{{range .}}{{.ID}}{{\"\n\"}}{{end}}" "$1"' "${CLUSTER_TASK}" 2>/dev/null || true)"
     while read -r alloc; do
       [ -n "${alloc}" ] || continue
@@ -195,11 +209,12 @@ cluster_leader() { # [max-secs]
 # --- assertions -------------------------------------------------------------
 
 assert_count() { # <job> <min-running> <slo-secs>
-  # Besides count>=N, require evidence the recovery actually HAPPENED when we
-  # know what was killed: a gracefully-stopped alloc must be replaced by a
-  # DIFFERENT running alloc id; a hard-killed inner task container must be
-  # running again under a NEW container id (Nomad restarts the task in-place —
-  # the alloc id survives, but docker restarts always mint a new container id).
+  # Besides count>=N, require evidence the recovery actually happened,
+  # when the killed target is known. A gracefully stopped alloc must
+  # be replaced by a different running alloc id. A hard-killed inner
+  # task container must be running again under a new container id.
+  # Nomad restarts the task in place, so the alloc id survives, but a
+  # docker restart always creates a new container id.
   local killed_alloc="${KILLED_ALLOC}" killed_node="${KILLED_NODE}"
   local killed_task="${KILLED_TASK}" killed_cid="${KILLED_CID}"
   KILLED_ALLOC=""; KILLED_NODE=""; KILLED_TASK=""; KILLED_CID=""
@@ -207,7 +222,8 @@ assert_count() { # <job> <min-running> <slo-secs>
   while :; do
     if [ "$(count_running "$1")" -ge "$2" ]; then
       if [ -n "${killed_alloc}" ]; then
-        # Replacement leg: >=N running allocs NOT counting the stopped one.
+        # Replacement leg: >=N running allocs, not counting the stopped
+        # one.
         if [ "$(running_allocs "$1" | grep -cv "^${killed_alloc}\$")" -ge "$2" ]; then
           log "$1 has >= $2 running alloc(s) after ${t}s (stopped alloc ${killed_alloc} replaced)"
           return 0
@@ -231,12 +247,13 @@ assert_count() { # <job> <min-running> <slo-secs>
 }
 
 assert_progress() {
-  # Pipeline-progress probe for the component-chaos cases. Prefer the sealer's
-  # boundary counter (re-exported by the executors) when reachable — it ticks
-  # every boundary, ~4/s, even with no load. If no executor exporter answers,
-  # fall back to the executor's committed-block gauge (the same signal the
-  # cluster cases use). Kept as a name so the ported component-chaos cases
-  # need no edits.
+  # This is the pipeline-progress probe for the component-chaos
+  # cases. Prefer the sealer's boundary counter, re-exported by the
+  # executors, when reachable. It ticks on every boundary, about 4
+  # times a second, even with no load. If no executor exporter
+  # answers, fall back to the executor's committed-block gauge, the
+  # same signal the cluster cases use. This function keeps its name so
+  # the ported component-chaos cases need no edits.
   local b0 b1
   b0="$(sealer_boundaries || true)"
   if [ -n "${b0}" ]; then
@@ -251,12 +268,13 @@ assert_progress() {
   assert_executor_progress "$@"
 }
 
-# Cluster-mode analogue of assert_progress: the executor's committed-block gauge
-# must advance. POLLS until it advances or a timeout — recovery is not instant
-# after a leader kill (the cluster client must redirect to the newly-elected leader
-# and resume egress before the executor applies the next block), so a single fixed
-# window is flaky. Succeeds as soon as progress is observed. $1 = timeout secs
-# (default 60).
+# This is the cluster-mode analogue of assert_progress: the executor's
+# committed-block gauge must advance. It polls until progress shows or
+# a timeout hits. Recovery is not instant after a leader kill: the
+# cluster client must redirect to the newly elected leader and resume
+# egress before the executor applies the next block. So a single fixed
+# window is flaky. This succeeds as soon as progress is observed. $1 =
+# timeout in seconds (default 60).
 assert_executor_progress() {
   local timeout="${1:-60}" e0 e1 t=0
   e0="$(executor_progress || true)"; e0="${e0:-0}"
@@ -270,16 +288,17 @@ assert_executor_progress() {
   done
 }
 
-# Per-replica recovery verdict: EVERY executor must individually converge to
-# the fleet head before a case may pass. The MAX-across-replicas progress
-# probe above keeps transient scrape gaps from failing a healthy run — but it
-# also MASKS a replica that never recovered (wedged or crash-looping behind
-# the fleet): the suite stayed green through months of every restarted
-# executor being permanently broken, because ONE untouched replica carried
-# every probe. A resilience suite that cannot see 2/3 of the fleet dead
-# proves nothing, so every case now ends with this convergence check:
-# within EXEC_CONVERGE_SLO_S, every executor's OWN gauge must be scrapeable
-# and within EXEC_CONVERGE_LAG blocks of the fleet head.
+# This is the per-replica recovery verdict. Every executor must
+# individually converge to the fleet head before a case may pass. The
+# max-across-replicas progress probe above keeps transient scrape gaps
+# from failing a healthy run, but it also masks a replica that never
+# recovered, wedged or crash-looping behind the fleet. The suite once
+# stayed green for months while every restarted executor was
+# permanently broken, because one untouched replica carried every
+# probe. A resilience suite that cannot see two-thirds of the fleet
+# dead proves nothing. So every case now ends with this convergence
+# check: within EXEC_CONVERGE_SLO_S, every executor's own gauge must be
+# scrapeable and within EXEC_CONVERGE_LAG blocks of the fleet head.
 EXEC_CONVERGE_SLO_S="${EXEC_CONVERGE_SLO_S:-150}"
 EXEC_CONVERGE_LAG="${EXEC_CONVERGE_LAG:-50}"
 assert_executors_converged() { # <case>
@@ -288,10 +307,11 @@ assert_executors_converged() { # <case>
   while :; do
     max=""; bad=""; blk=()
     for i in "${!EXECUTOR_NODES[@]}"; do
-      # `|| true` is load-bearing (same class as val_metric's): under
-      # `set -euo pipefail` a failed scrape — e.g. the just-returned node's
-      # exporter not up yet — otherwise kills the whole script silently, with
-      # no fail() message (pipefail makes the assignment itself fail).
+      # `|| true` is load-bearing here, the same class as val_metric's.
+      # Under `set -euo pipefail`, a failed scrape, for example the
+      # just-returned node's exporter not up yet, would otherwise kill
+      # the whole script silently, with no fail() message, since
+      # pipefail makes the assignment itself fail.
       v="$(prom_value "$(exec_metrics "${i}" || true)" "${EXECUTOR_BLOCK_METRIC}" first \
         || true)"
       if [ -n "${v}" ]; then
@@ -319,9 +339,10 @@ assert_executors_converged() { # <case>
   done
 }
 
-# D-4: bare `assert_count ingress 2` after the killed-markers were consumed
-# passes even if nothing ever died. Require BOTH ingress replicas' exporters
-# to actually answer — real liveness, not a nomad row count.
+# A bare `assert_count ingress 2`, after the killed-markers are
+# consumed, passes even if nothing ever died. Require both ingress
+# replicas' exporters to actually answer, real liveness, not a nomad
+# row count.
 assert_ingress_pair_live() { # <case>
   local t=0 n v ok
   while :; do
@@ -336,15 +357,16 @@ assert_ingress_pair_live() { # <case>
   done
 }
 
-# Cluster-mode "must NOT progress": the executor's block gauge must stay FLAT
-# over a window (quorum lost → no new commits → no false progress). $1 = window.
+# This is the cluster-mode "must not progress" check. The executor's
+# block gauge must stay flat over a window: quorum lost means no new
+# commits, so there must be no false progress. $1 = window.
 assert_executor_stalled() {
-  # D-1: both samples must be REAL scrapes. Defaulting to 0 made this pass
-  # vacuously (0 <= 0) exactly when a two-node kill blacked the exporters
-  # out — the one situation the quorum-loss case exists to observe. The
-  # executors themselves survive a sealer-quorum loss, so an unreachable
-  # gauge here is a harness failure, not an expected outage; retry, then
-  # fail LOUDLY.
+  # Both samples must be real scrapes. Defaulting to 0 made this
+  # pass vacuously (0 <= 0), exactly when a two-node kill blacked out
+  # the exporters, the one situation the quorum-loss case exists to
+  # observe. The executors themselves survive a sealer-quorum loss, so
+  # an unreachable gauge here is a harness failure, not an expected
+  # outage. Retry, then fail loudly.
   local window="${1:-15}" e0="" e1="" i
   for i in 1 2 3 4 5; do
     e0="$(executor_progress || true)"; [ -n "${e0}" ] && break; sleep 3
@@ -376,12 +398,14 @@ assert_load_pass() { # <json> <case>
   fi
 }
 
-# Relaxed load verdict for the TOTAL-OUTAGE case (cluster-quorum-loss-recover). A
-# full quorum loss legitimately stops the sequencer from ACCEPTING some txs offered
-# during the outage — they surface as seq_dropped / past-nonce and were never
-# accepted, so they are not a delivery gap. The guarantee that must still hold is
-# GAPLESS delivery of every ACCEPTED tx (missing == 0) — which the cluster meets on
-# recovery. So assert missing==0 here instead of the strict all-delivered verdict.
+# This is a relaxed load verdict for the total-outage case
+# (cluster-quorum-loss-recover). A full quorum loss fairly stops the
+# sequencer from accepting some txs offered during the outage. They
+# surface as seq_dropped or past-nonce, and were never accepted, so
+# they are not a delivery gap. The guarantee that must still hold is
+# gapless delivery of every accepted tx (missing == 0), which the
+# cluster meets on recovery. So this asserts missing==0, instead of the
+# strict all-delivered verdict.
 assert_accepted_delivered() { # <json> <case>
   if grep -qE '"missing":[[:space:]]*0[[:space:]]*,' "$1" 2>/dev/null; then
     log "load OK for case $2: every ACCEPTED tx receipted (missing=0); seq_dropped tolerated during total outage"
@@ -392,24 +416,26 @@ assert_accepted_delivered() { # <json> <case>
   fi
 }
 
-# Restarted-replica health probe. KNOWN LIMITATION (re-opened F02.1): a
-# restarted replica hydrates nonce floors from an empty state DB, so for
-# ESTABLISHED senders it buffers refs as "future" and publishes nothing until
-# a global hydration signal exists — the shard runs at P=1 for those senders
-# (the racing twin covers them; fresh nonce-0 senders hydrate at floor 0 and
-# are covered immediately). The nonce-floor fast-forward that made a rejoiner
-# republish for established senders was REVERTED: under overload it forged
-# canonical nonce gaps (nonces dropped before tx_data are invisible to BOTH
-# replicas) and crashed every executor — see
-# docs/reviews/2026-07-17-30-commit-review/fixes-CI-replay-loop.md. So this
-# probe asserts what IS guaranteed: the restarted replica is alive and
-# scrapeable (exporter up, session established), NOT that it republishes for
-# the pinned established-sender load.
+# This is the restarted-replica health probe. Known limitation: a
+# restarted replica hydrates nonce floors from an
+# empty state database. So for established senders, it buffers refs as
+# "future" and publishes nothing until a global hydration signal
+# exists. The shard runs at P=1 for those senders; the racing twin
+# covers them. Fresh nonce-0 senders hydrate at floor 0 and are covered
+# right away. A nonce-floor fast-forward once made a rejoiner republish
+# for established senders, but it was reverted: under overload, it
+# forged canonical nonce gaps (nonces dropped before tx_data are
+# invisible to both replicas), and crashed every executor. See
+# docs/reviews/2026-07-17-30-commit-review/fixes-CI-replay-loop.md. So
+# this probe asserts what is guaranteed: the restarted replica is alive
+# and scrapeable, with its exporter up and session established, not
+# that it republishes for the pinned established-sender load.
 assert_replica_healthy() { # <node-container> <node-ip> <metrics-port> [slo-secs]
   local node="$1" ip="$2" port="$3" slo="${4:-90}" t=0 v
   while :; do
-    # Bridge-direct first (exporters bind 0.0.0.0 since the replica-metrics
-    # fix), docker exec fallback — same rationale as exec_metrics().
+    # Try the bridge IP directly first; exporters bind 0.0.0.0 since
+    # the replica-metrics fix. Fall back to docker exec, the same
+    # reasoning as exec_metrics().
     v="$(fetch_metrics "${ip}" "${node}" "${port}" 2>/dev/null \
         | awk '/^kardamom_sequencer_/{ n++ } END { printf "%d", n }' || true)"
     if [ -n "${v}" ] && [ "${v}" -gt 0 ]; then

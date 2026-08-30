@@ -5,15 +5,16 @@
 //! | `accounts`      | `Address` (20 B)                 | RLP `(u64 nonce, U256 balance, B256 code_hash, B256 storage_root)` |
 //! | `storage`       | `Address ++ B256 key` (52 B)     | `U256 value` (32 B, big-endian)                  |
 //! | `code`          | `B256 code_hash` (32 B)          | raw bytecode                                     |
-//! | `headers`       | `u64 block_number` (8 B BE)      | encoded `(BPosition end_tx_idx, u64 l2_timestamp)` — **no state root** |
+//! | `headers`       | `u64 block_number` (8 B BE)      | encoded `(BPosition end_tx_idx, u64 l2_timestamp)`, no state root |
 //! | `receipts`      | `BPosition tx_idx` (8 B)         | encoded `Receipt` (rkyv archive, owned at rest)  |
-//! | `tx_hash_index` | `B256 tx_hash` (32 B)            | `BPosition` (8 B, i32 BE term_id ++ i32 BE term_offset) — feeds S1 `eth_getTransactionReceipt(hash)` |
-//! | `meta`          | `&[u8]` (well-known keys, below) | varies — see `meta.rs`                           |
+//! | `tx_hash_index` | `B256 tx_hash` (32 B)            | `BPosition` (8 B, i32 BE term_id ++ i32 BE term_offset), for `eth_getTransactionReceipt(hash)` |
+//! | `meta`          | `&[u8]` (well-known keys, below) | varies, see `meta.rs`                            |
 //!
-//! BE encoding on the `headers` key keeps `block_number` ordered under mdbx's
-//! lexicographic cursor; we depend on that for the cold-start scan. `BPosition`
-//! encoding (term_id i32 BE ++ term_offset i32 BE, 8 bytes) is lexicographically
-//! ordered by `(term_id, term_offset)` — same property holds for `receipts`.
+//! Big-endian encoding on the `headers` key keeps `block_number` ordered
+//! under mdbx's lexicographic cursor. The cold-start scan depends on this
+//! order. `BPosition` encoding (term_id i32 BE, then term_offset i32 BE, 8
+//! bytes total) is lexicographically ordered by `(term_id, term_offset)`.
+//! The `receipts` table has the same property.
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
@@ -30,10 +31,13 @@ pub const TABLE_TX_HASH_INDEX: &str = "tx_hash_index";
 pub const TABLE_META: &str = "meta";
 
 // --- Incremental state-trie tables (schema v2; see crate::trie) ---
-// Stored intermediate branch nodes, keyed by trie PATH (raw *unpacked* nibbles,
-// one nibble per byte, so lexicographic mdbx order == trie order — see
-// trie/cursor.rs::node_key; storage-trie keys prepend the 32-byte account
-// hash); the hashed-state mirror holds the leaves keyed by keccak. See
+//
+// These tables store intermediate branch nodes, keyed by the trie path.
+// The path uses raw, unpacked nibbles, one nibble per byte, so lexicographic
+// mdbx order matches trie order. See `trie/cursor.rs::node_key`. Storage-trie
+// keys prepend the 32-byte account hash.
+//
+// The hashed-state mirror holds the leaves, keyed by keccak. See
 // docs/specs/2026-06-23-incremental-trie-design.md.
 pub const TABLE_ACCOUNT_TRIE: &str = "account_trie";
 pub const TABLE_STORAGE_TRIE: &str = "storage_trie";
@@ -115,21 +119,21 @@ pub fn encode_code_key(hash: B256) -> [u8; 32] {
 
 // ---------- headers ----------
 //
-// Per, headers do NOT carry a state-root commitment. The encoded value
-// is `(end_tx_idx: BPosition, l2_timestamp: u64, l1_origin: u64)`. We use a
-// hand-rolled fixed-width encoding (8 + 8 + 8 = 24 bytes) instead of RLP — the
-// row is fixed-size and BPosition is not an RLP-native type.
+// Headers do not carry a state-root commitment. The encoded value is
+// `(end_tx_idx: BPosition, l2_timestamp: u64, l1_origin: u64)`. This uses a
+// hand-rolled, fixed-width encoding (8 + 8 + 8 = 24 bytes) instead of RLP.
+// The row has a fixed size, and `BPosition` is not an RLP-native type.
 //
-// The origin took the 4 reserved bytes plus 4 more, so rows grew 20 → 24.
-// Decode still accepts the 20-byte form and reports `l1_origin: 0`, which is
-// exactly what a pre-origin chain meant, so an existing state DB keeps
-// reading without a migration pass.
+// The origin field added 4 bytes to the 4 reserved bytes, so rows grew
+// from 20 to 24 bytes. Decoding still accepts the 20-byte form and reports
+// `l1_origin: 0`. This is what a pre-origin chain meant, so an existing
+// state DB keeps reading without a migration.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderValue {
     pub end_tx_idx: BPosition,
     pub l2_timestamp: u64,
-    /// L1 block number whose epoch this block belongs to. See
+    /// The L1 block number for the epoch this block belongs to. See
     /// `docs/agents/l1-origin-deposit-derivation-spec.md`.
     pub l1_origin: u64,
 }
@@ -148,7 +152,7 @@ pub fn encode_header_value(v: &HeaderValue) -> [u8; 24] {
 }
 
 pub fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
-    // 20 bytes is the pre-origin row; anything else is corruption.
+    // A 20-byte value is the pre-origin row. Anything else is corruption.
     if bytes.len() != 24 && bytes.len() != 20 {
         return Err(StateError::BadEncoding {
             table: TABLE_HEADERS,
@@ -172,13 +176,16 @@ pub fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
 
 // ---------- receipts ----------
 //
-// Key: BPosition (8 bytes — i32 BE term_id ++ i32 BE term_offset). The codec
-// itself lives in [`crate::meta`] (`encode_b_position` / `decode_b_position`)
-// since it's used for both receipt keys and several meta-cursor values.
-// Value: rkyv-archived `Receipt` (kardamom-types).
+// Key: `BPosition` (8 bytes: i32 BE term_id, then i32 BE term_offset). The
+// codec lives in [`crate::meta`] (`encode_b_position` and
+// `decode_b_position`), because it is also used for several meta-cursor
+// values.
+//
+// Value: an rkyv-archived `Receipt` (from `kardamom_types`).
 
 pub fn encode_receipt_value(r: &Receipt) -> Vec<u8> {
-    // `Receipt` upstream derives `rkyv::Archive/Serialize/Deserialize`.
+    // The upstream `Receipt` type derives `rkyv::Archive`, `rkyv::Serialize`,
+    // and `rkyv::Deserialize`.
     rkyv::to_bytes::<rkyv::rancor::Error>(r)
         .expect("Receipt rkyv serialize is infallible for owned data")
         .to_vec()
@@ -193,11 +200,12 @@ pub fn decode_receipt_value(bytes: &[u8]) -> Result<Receipt, StateError> {
 
 // ---------- tx_hash_index ----------
 //
-// Key: `B256 tx_hash` (32 B). Value: `BPosition` (8 B, same layout as
-// the receipts-table key — see [`crate::meta::encode_b_position`]). Populated
-// during block commit (one entry per receipt). Read path: S1 proxy's
-// `eth_getTransactionReceipt(hash)` calls `StateDatabase::get_tx_position(hash)`
-// → `StateDatabase::get_receipt(pos)`.
+// Key: `B256 tx_hash` (32 bytes). Value: `BPosition` (8 bytes, the same
+// layout as the receipts-table key; see [`crate::meta::encode_b_position`]).
+//
+// Block commit populates one entry per receipt. On the read path,
+// `eth_getTransactionReceipt(hash)` calls
+// `StateDatabase::get_tx_position(hash)`, then `StateDatabase::get_receipt(pos)`.
 
 pub fn encode_tx_hash_key(hash: B256) -> [u8; 32] {
     hash.into()
@@ -220,13 +228,16 @@ pub fn decode_tx_hash_value(bytes: &[u8]) -> Result<BPosition, StateError> {
 
 // ---------- table iteration ----------
 
-/// Walk every row of `db` in key order, calling `f(key, value)` per row.
+/// Walk every row of `db` in key order, and call `f(key, value)` for each
+/// row.
 ///
-/// The shared full-table cursor walk (integrity checks, recovery scans, the
-/// trie rebuild oracle): position at `first`, step with `next`, stop at the
-/// end — or early when `f` returns [`ControlFlow::Break`]. Errors from the
-/// cursor or from `f` propagate unchanged. Generic over the txn kind so RO
-/// and RW callers share one implementation.
+/// Integrity checks, recovery scans, and the trie rebuild oracle share
+/// this full-table cursor walk. It starts at `first`, steps with `next`,
+/// and stops at the end, or earlier if `f` returns [`ControlFlow::Break`].
+/// Errors from the cursor or from `f` propagate unchanged.
+///
+/// This function is generic over the transaction kind, so read-only and
+/// read-write callers share one implementation.
 pub(crate) fn for_each_row<K: signet_libmdbx::TransactionKind>(
     txn: &signet_libmdbx::tx::Tx<K>,
     db: signet_libmdbx::Database,
@@ -290,8 +301,9 @@ mod tests {
 
     #[test]
     fn block_key_layout_is_pinned() {
-        // `headers` is an at-rest format: the key is the block number as 8
-        // big-endian bytes. Pin the exact byte layout (no decoder exists).
+        // `headers` is an at-rest format. The key is the block number as 8
+        // big-endian bytes. This test pins the exact byte layout; there is
+        // no decoder for the key.
         assert_eq!(
             encode_block_key(0x0102_0304_0506_0708),
             [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
@@ -301,8 +313,9 @@ mod tests {
 
     #[test]
     fn header_value_layout_is_pinned() {
-        // `headers` value is an at-rest format: term_id (i32 BE) ++ term_offset
-        // (i32 BE) ++ l2_timestamp (u64 BE) ++ l1_origin (u64 BE) = 24 bytes.
+        // `headers` value is an at-rest format: term_id (i32 BE), then
+        // term_offset (i32 BE), then l2_timestamp (u64 BE), then l1_origin
+        // (u64 BE). Total: 24 bytes.
         let v = HeaderValue {
             end_tx_idx: BPosition {
                 term_id: 0x0102_0304,
@@ -323,8 +336,9 @@ mod tests {
         assert_eq!(decode_header_value(&encode_header_value(&v)).unwrap(), v);
     }
 
-    /// A state DB written before the origin existed must keep reading: its
-    /// 20-byte rows mean origin 0, which is what that chain actually had.
+    /// A state DB written before the origin field existed must keep
+    /// working. Its 20-byte rows mean origin 0, which is what those chains
+    /// actually had.
     #[test]
     fn pre_origin_header_rows_still_decode() {
         let legacy = [
@@ -336,7 +350,7 @@ mod tests {
         let v = decode_header_value(&legacy).unwrap();
         assert_eq!(v.l2_timestamp, 0x1112_1314_1516_1718);
         assert_eq!(v.l1_origin, 0);
-        // Anything that is neither width is corruption, not a third version.
+        // A value that is neither width is corruption, not a third format version.
         assert!(decode_header_value(&legacy[..19]).is_err());
         assert!(decode_header_value(&[0u8; 32]).is_err());
     }
@@ -352,7 +366,6 @@ mod tests {
 
     #[test]
     fn tx_hash_index_roundtrip() {
-        //: tx_hash → BPosition lookup table.
         let hash = b256!("0x000000000000000000000000000000000000000000000000000000000000dead");
         let pos = BPosition {
             term_id: 7,
@@ -386,7 +399,7 @@ mod tests {
 
     #[test]
     fn receipt_value_roundtrip() {
-        // Sanity-check that the rkyv codec round-trips a non-trivial Receipt.
+        // Check that the rkyv codec round-trips a non-trivial Receipt.
         use kardamom_types::WireLog;
         let r = Receipt {
             tx_idx: BPosition {

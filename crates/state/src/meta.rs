@@ -1,8 +1,9 @@
-//! `meta` table: well-known keys for durable cursors.
+//! The `meta` table holds well-known keys for durable cursors.
 //!
-//! All writes go through the same RW txn as the block delta they correspond
-//! to. The atomic boundary is the mdbx commit; cold-start reads the cursors
-//! to find the post-recovery snapshot point.
+//! Every write goes through the same read-write transaction as the block
+//! delta it belongs to. The mdbx commit is the atomic boundary. On cold
+//! start, the node reads these cursors to find the post-recovery snapshot
+//! point.
 //!
 //! | Key                                  | Value                          |
 //! |--------------------------------------|--------------------------------|
@@ -22,35 +23,47 @@ pub const KEY_LAST_COMMITTED_BLOCK: &[u8] = b"last_committed_block";
 pub const KEY_LAST_COMMITTED_END_TX_POSITION: &[u8] = b"last_committed_end_tx_position";
 pub const KEY_LAST_FSYNCED_B_POSITION: &[u8] = b"last_fsynced_b_position";
 pub const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
-/// Presence-only flag written once when genesis allocations are seeded into a
-/// fresh env (see `crate::genesis::seed_genesis`). Makes genesis seeding
-/// idempotent across restarts independently of the block cursor (genesis is
-/// "block 0", so `last_committed_block` stays 0 until the first real block).
+/// A presence-only flag. It is written once, when genesis allocations are
+/// seeded into a fresh env (see `crate::genesis::seed_genesis`).
+///
+/// This flag makes genesis seeding idempotent across restarts, independent
+/// of the block cursor. Genesis is "block 0", so `last_committed_block`
+/// stays 0 until the first real block commits.
 pub const KEY_GENESIS_APPLIED: &[u8] = b"genesis_applied";
-/// Digest (32 B keccak) of the genesis allocations seeded into this env (see
-/// `crate::genesis`). Compared on every restart so a changed `--chain` file (or
-/// a node pointed at the wrong state dir) fails startup instead of silently
-/// running on divergent genesis state. May be absent on envs seeded before the
-/// digest existed; it is backfilled on the next start.
+/// The 32-byte keccak digest of the genesis allocations seeded into this
+/// env (see `crate::genesis`).
+///
+/// The node compares this digest on every restart. This makes startup fail
+/// on a changed `--chain` file, or a node pointed at the wrong state
+/// directory, instead of running silently on divergent genesis state.
+///
+/// This key may be absent on an env seeded before the digest existed. The
+/// node backfills it on the next start.
 pub const KEY_GENESIS_DIGEST: &[u8] = b"genesis_digest";
-/// Latest computed Ethereum MPT world-state root (32 B). Written by the
-/// trie-aware writer (`StateWriter::spawn_with_trie`) in the same RW txn as the
-/// block it commits; absent on databases written by the plain (non-trie)
-/// executor writer. See `crate::trie`.
+/// The latest computed Ethereum MPT world-state root (32 bytes).
+///
+/// The trie-aware writer (`StateWriter::spawn_with_trie`) writes this in
+/// the same read-write transaction as the block it commits. It is absent
+/// on databases written by the plain, non-trie executor writer. See
+/// `crate::trie`.
 pub const KEY_STATE_ROOT: &[u8] = b"state_root";
 
-// v2 adds the incremental state-trie tables (account_trie, storage_trie,
-// hashed_accounts, hashed_storage). A v1 DB is refused (fresh-from-genesis
-// only; see docs/specs/2026-06-23-incremental-trie-design.md §8).
+// v2 adds the incremental state-trie tables: account_trie, storage_trie,
+// hashed_accounts, and hashed_storage. The database refuses a v1 DB; only
+// fresh-from-genesis is supported. See
+// docs/specs/2026-06-23-incremental-trie-design.md, section 8.
 pub const SCHEMA_VERSION: u32 = 2;
 
 // ---------- typed meta readers ----------
 //
-// One `get` + decode per well-known key, shared by every startup/verify path
-// that reads a cursor out of the `meta` table. `Ok(None)` means the key is
-// absent; a present-but-undecodable value surfaces the decoder's
-// `BadEncoding`. Generic over the txn kind so RO (snapshot, recovery) and RW
-// (writer, genesis) callers share one implementation.
+// Each function does one `get` and decode for a well-known key. Every
+// startup and verify path that reads a cursor from the `meta` table shares
+// these functions. `Ok(None)` means the key is absent. A present but
+// undecodable value returns the decoder's `BadEncoding` error.
+//
+// These functions are generic over the transaction kind. This lets
+// read-only callers (snapshot, recovery) and read-write callers (writer,
+// genesis) share one implementation.
 
 pub fn read_meta_u64<K: TransactionKind>(
     txn: &Tx<K>,

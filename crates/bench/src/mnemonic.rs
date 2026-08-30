@@ -1,8 +1,8 @@
-//! BIP-39 mnemonic generation and BIP-32 signer derivation.
+//! This module does BIP-39 mnemonic generation and BIP-32 signer derivation.
 //!
-//! Uses the English wordlist via `alloy_signer_local`'s `mnemonic`
-//! feature, which itself wraps `coins-bip39`. Derivation path is the
-//! standard Ethereum/Anvil m/44'/60'/0'/0/N.
+//! It uses the English wordlist through `alloy_signer_local`'s `mnemonic`
+//! feature, which wraps `coins-bip39`. The derivation path is the
+//! standard Ethereum and Anvil path m/44'/60'/0'/0/N.
 
 use alloy_signer_local::{
     MnemonicBuilder,
@@ -11,14 +11,14 @@ use alloy_signer_local::{
 
 use crate::signers::DerivedSigner;
 
-/// Generate a fresh BIP-39 mnemonic phrase using the English wordlist.
+/// Generate a fresh BIP-39 mnemonic phrase with the English wordlist.
 ///
-/// `word_count` must be one of 12, 15, 18, 21, 24. Other values error.
+/// `word_count` must be one of 12, 15, 18, 21, or 24. Other values fail.
 ///
 /// # Errors
 ///
-/// Errors if `word_count` is not a valid BIP-39 word count or if the
-/// underlying RNG fails.
+/// Returns an error if `word_count` is not a valid BIP-39 word count,
+/// or if the RNG fails.
 pub fn generate(word_count: u32) -> anyhow::Result<String> {
     let mut rng = rand::thread_rng();
     let mnemonic = Mnemonic::<English>::new_with_count(&mut rng, word_count as usize)
@@ -26,13 +26,13 @@ pub fn generate(word_count: u32) -> anyhow::Result<String> {
     Ok(mnemonic.to_phrase())
 }
 
-/// Derive `count` signers from `phrase` along m/44'/60'/0'/0/N (the
-/// Anvil/MetaMask default Ethereum derivation path).
+/// Derive `count` signers from `phrase` along m/44'/60'/0'/0/N. This is
+/// the default Anvil and MetaMask Ethereum derivation path.
 ///
 /// # Errors
 ///
-/// Errors if `phrase` is not a valid BIP-39 mnemonic or if the BIP-32
-/// derivation chain fails for any of the requested indices.
+/// Returns an error if `phrase` is not a valid BIP-39 mnemonic, or if
+/// BIP-32 derivation fails for a requested index.
 pub fn derive_signers(phrase: &str, count: u32) -> anyhow::Result<Vec<DerivedSigner>> {
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {

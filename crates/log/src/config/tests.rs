@@ -12,7 +12,7 @@ fn write_tmp(contents: &str) -> tempfile::NamedTempFile {
 fn empty_file_yields_defaults() {
     let f = write_tmp("");
     let cfg = LogConfig::from_toml_path(f.path()).expect("load empty");
-    // Bit-for-bit the built-in defaults.
+    // Must match the built-in defaults exactly.
     let d = LogConfig::default();
     assert_eq!(cfg.recorder_id, d.recorder_id);
     assert_eq!(
@@ -25,7 +25,7 @@ fn empty_file_yields_defaults() {
 
 #[test]
 fn partial_channels_section_inherits_other_fields() {
-    // Only one channel field set; everything else must default.
+    // Only one channel field is set; everything else must default.
     let f = write_tmp(
         r#"
             [channels]
@@ -112,8 +112,9 @@ fn tx_bal_defaults_present() {
 
 #[test]
 fn round_trips_through_toml() {
-    // A fully-serialized config must parse back identically — guards the
-    // serde attrs against a field that serializes but won't deserialize.
+    // A fully serialized config must parse back identically. This guards
+    // the serde attributes against a field that serializes but will not
+    // deserialize.
     let original = LogConfig::default();
     let s = toml::to_string(&original).expect("serialize");
     let f = write_tmp(&s);
@@ -144,8 +145,9 @@ fn tx_receipts_endpoint_offsets_port_by_replica() {
         ..Default::default()
     };
     assert!(ch.tx_receipts_mds_enabled());
-    // Receipts at base + 2*r, boundaries at base + 2*r + 1 (distinct ports
-    // so ingress's two manual subs don't bind the same socket).
+    // Receipts use base + 2*r, boundaries use base + 2*r + 1. These are
+    // distinct ports, so ingress's two manual subscriptions do not bind
+    // the same socket.
     assert_eq!(
         ch.tx_receipts_endpoint(0).as_deref(),
         Some("aeron:udp?endpoint=192.168.56.31:40020")
@@ -164,7 +166,7 @@ fn tx_receipts_endpoint_offsets_port_by_replica() {
         Some("aeron:udp?endpoint=192.168.56.31:40025"),
         "replica i boundaries at base_port + 2*i + 1"
     );
-    // receipt and boundary endpoints for the same replica must differ.
+    // The receipt and boundary endpoints for the same replica must differ.
     assert_ne!(
         ch.tx_receipts_endpoint(1),
         ch.tx_receipts_boundary_endpoint(1)
@@ -174,8 +176,8 @@ fn tx_receipts_endpoint_offsets_port_by_replica() {
 #[test]
 fn mds_contract_parses_from_toml_and_aligns_both_sides() {
     // The deploy channels.toml MDS contract. The executor publishes to
-    // `tx_receipts_endpoint(replica)` and ingress attaches the SAME
-    // `tx_receipts_endpoint(i)` for i in 0..executor_count — this single
+    // `tx_receipts_endpoint(replica)`, and ingress attaches the same
+    // `tx_receipts_endpoint(i)` for i in 0..executor_count. This single
     // helper is the source of truth on both sides, so a round-trip parse
     // must yield identical endpoints for a given index.
     let f = write_tmp(
@@ -199,9 +201,9 @@ fn mds_contract_parses_from_toml_and_aligns_both_sides() {
         ch.tx_receipts_endpoint(1).as_deref(),
         Some("aeron:udp?endpoint=192.168.56.31:40022")
     );
-    // The boundary stream (`tx_receipts_stream_id + 1`) uses a DISTINCT
-    // endpoint, base + 2*1 + 1 = 40023, so ingress's two manual subs don't
-    // bind the same socket.
+    // The boundary stream (`tx_receipts_stream_id + 1`) uses a distinct
+    // endpoint, base + 2*1 + 1 = 40023, so ingress's two manual
+    // subscriptions do not bind the same socket.
     assert_eq!(
         ch.tx_receipts_boundary_endpoint(1).as_deref(),
         Some("aeron:udp?endpoint=192.168.56.31:40023")
@@ -211,8 +213,8 @@ fn mds_contract_parses_from_toml_and_aligns_both_sides() {
 
 #[test]
 fn mds_nonpositive_base_port_rejected() {
-    // A negative base used to wrap via `as u32` into a nonsense port;
-    // it must now fail at load time with a config error.
+    // A negative base used to wrap through `as u32` into a nonsense port.
+    // It must now fail at load time with a config error.
     for port in ["-40020", "0"] {
         let f = write_tmp(&format!(
             r#"
@@ -250,7 +252,7 @@ fn mds_base_port_overflowing_u16_rejected() {
 
 #[test]
 fn mds_valid_base_port_accepted_and_non_mds_port_unchecked() {
-    // The deploy-shaped MDS config still loads…
+    // The deploy-shaped MDS config still loads.
     let f = write_tmp(
         r#"
             [channels]
@@ -261,7 +263,7 @@ fn mds_valid_base_port_accepted_and_non_mds_port_unchecked() {
             "#,
     );
     LogConfig::from_toml_path(f.path()).expect("valid MDS config loads");
-    // …and the base port is only validated when MDS is actually enabled.
+    // The base port is only validated when MDS is actually enabled.
     let f = write_tmp("[channels]\ntx_receipts_endpoint_base_port = 0\n");
     LogConfig::from_toml_path(f.path()).expect("port unchecked without MDS");
 }

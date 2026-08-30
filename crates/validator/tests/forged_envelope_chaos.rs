@@ -1,28 +1,30 @@
-//! Forged-envelope chaos test (spec: no-std-exec-core, phase 3a.1).
+//! Forged-envelope chaos test.
 //!
-//! The S0 pipeline trusts `TxEnvelope.sender` / `tx_hash` from the proxy. A
-//! compromised proxy or sequencer can therefore attribute an attacker-signed
-//! tx to a victim — the theft shape: `envelope.sender = victim`, signature by
-//! the attacker, value flowing to the attacker's sink. 3a.1 closes this in
-//! the LIVE validator: `ExecutorConfig::verify_record_identity` re-derives
-//! every tx record's identity at arrival (the same
-//! `exec_core::stateless::verify_record_identity` the zk guest runs) and
-//! halts the pipeline with `ExecutorError::RecordIdentity`, which the
-//! validator binary classifies as an INTEGRITY failure (divergence latch →
-//! exit 2), not an availability restart.
+//! The pipeline trusts `TxEnvelope.sender` and `tx_hash` from the
+//! proxy. A compromised proxy or sequencer can therefore attribute an
+//! attacker-signed tx to a victim: the theft shape is
+//! `envelope.sender = victim`, signed by the attacker, with value
+//! flowing to the attacker's sink. The live validator closes this:
+//! `ExecutorConfig::verify_record_identity` re-derives every
+//! tx record's identity at arrival, the same check
+//! `exec_core::stateless::verify_record_identity` runs for the zk guest,
+//! and stops the pipeline with `ExecutorError::RecordIdentity`. The
+//! validator binary classifies this as an integrity failure (divergence
+//! latch, exit 2), not an availability restart.
 //!
-//! All three cases drive the REAL `Executor::run` pipeline — the same
-//! reader-join → exec → commit threads production runs, over channel-backed
-//! subscriptions (the determinism suite's harness shape):
+//! All three cases drive the real `Executor::run` pipeline, the same
+//! reader-join, exec, and commit threads production runs, over
+//! channel-backed subscriptions:
 //!
-//! - flag ON + honest traffic → executes and commits normally (the check
-//!   must not false-positive on well-formed envelopes);
-//! - flag ON + forged sender → `RecordIdentity` halt before the first EVM
-//!   step, integrity latch set, victim untouched;
-//! - flag OFF + the same forgery → the theft COMMITS. This is the
-//!   documented pre-3a.1 blind spot, pinned as a test so the executor-side
-//!   decision (defense-in-depth vs latency) is made against a red/green
-//!   fact, not a claim.
+//! - flag on, honest traffic: executes and commits normally (the check
+//!   must not false-positive on well-formed envelopes).
+//! - flag on, forged sender: `RecordIdentity` stops the pipeline before
+//!   the first EVM step, the integrity latch is set, and the victim is
+//!   untouched.
+//! - flag off, the same forgery: the theft commits. This is the
+//!   documented blind spot from before this check existed, pinned as a test so the
+//!   executor-side decision (defense-in-depth against latency) rests on
+//!   a red/green fact, not a claim.
 
 use std::thread;
 use std::time::Duration;
@@ -104,11 +106,11 @@ fn bpos(off: i32) -> BPosition {
     }
 }
 
-/// A value transfer to [`SINK`], signed by `signer` but CLAIMING `sender` as
-/// its origin. With `sender == signer.address()` this is an honest envelope;
-/// with a different `sender` it is the theft shape (the `tx_hash` stays
-/// honest — a forged hash would already fail the reader's reference join,
-/// and hash forgery is covered by the exec-core unit tests).
+/// A value transfer to [`SINK`], signed by `signer` but claiming `sender`
+/// as its origin. With `sender == signer.address()`, this is an honest
+/// envelope. With a different `sender`, it is the theft shape. The
+/// `tx_hash` stays honest: a forged hash would already fail the reader's
+/// reference join, and hash forgery is covered by the exec-core unit tests.
 fn envelope_claiming(signer: &PrivateKeySigner, sender: Address) -> KtTxEnvelope {
     let mut tx = TxLegacy {
         chain_id: Some(CHAIN_ID),
@@ -131,8 +133,8 @@ fn envelope_claiming(signer: &PrivateKeySigner, sender: Address) -> KtTxEnvelope
     }
 }
 
-/// Drive one single-tx block through the full pipeline. Returns the engine
-/// result, the C-stream output, and the (shared) post-run state DB.
+/// Drive one single-tx block through the full pipeline. Returns the
+/// engine result, the C-stream output, and the shared post-run state DB.
 fn run_pipeline(
     envelope: KtTxEnvelope,
     victim: Address,
@@ -227,8 +229,8 @@ fn forged_sender_halts_and_latches_with_verification_on() {
 
     let (res, out, snap) = run_pipeline(envelope_claiming(&attacker, victim), victim, true);
 
-    // The pipeline halts with the identity error before the first EVM step:
-    // nothing reaches the C stream, nothing reaches the writer.
+    // The pipeline halts with the identity error before the first EVM
+    // step: nothing reaches the C stream, and nothing reaches the writer.
     let err = res.expect_err("forged sender must halt the pipeline");
     assert!(
         matches!(err, ExecutorError::RecordIdentity(_)),
@@ -244,7 +246,7 @@ fn forged_sender_halts_and_latches_with_verification_on() {
     assert!(snap.basic(SINK).unwrap().is_none(), "no loot may land");
 
     // The validator binary's exit classification: RecordIdentity is an
-    // INTEGRITY failure — it must latch (exit 2, page the humans), not
+    // integrity failure. It must latch (exit 2, page the humans), not
     // restart as an availability blip.
     let divergence = Divergence::new();
     assert!(latch_integrity_failure(&divergence, &err));
@@ -255,7 +257,7 @@ fn forged_sender_halts_and_latches_with_verification_on() {
         "reason must carry the proof: {reason}"
     );
 
-    // Availability errors must NOT impersonate integrity.
+    // Availability errors must not look like integrity failures.
     let availability = Divergence::new();
     assert!(!latch_integrity_failure(
         &availability,
@@ -272,10 +274,12 @@ fn forged_sender_commits_theft_with_verification_off() {
 
     let (res, out, snap) = run_pipeline(envelope_claiming(&attacker, victim), victim, false);
 
-    // The documented pre-3a.1 blind spot: with the check off, the proxy's
-    // claimed sender is trusted and the attacker-signed tx spends the
-    // victim's funds. If closing the executor-side gap ever flips this test,
-    // that is the intended signal — delete it alongside the flag decision.
+    // This is the documented blind spot from before this check existed:
+    // with the check off, the
+    // proxy's claimed sender is trusted, and the attacker-signed tx
+    // spends the victim's funds. If closing the executor-side gap ever
+    // flips this test, that is the intended signal: delete it alongside
+    // the flag decision.
     res.expect("with verification off the forgery executes");
     assert!(
         out.iter()

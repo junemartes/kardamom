@@ -1,22 +1,25 @@
-//! EEST state-test conformance runner (W1 of
-//! `docs/agents/l1-client-suite-port-spec.md`) — the `consume direct` analog.
+//! EEST state-test conformance runner (see W1 in
+//! `docs/agents/l1-client-suite-port-spec.md`). This is the `consume
+//! direct` analog.
 //!
-//! Walks the `state_tests` tree of a pinned execution-spec-tests fixture
-//! release, and for every post entry of the pinned fork executes the
-//! fixture's transaction through the SAME path the live executor and
-//! validator share — `decode_alloy_envelope` → `tx_env_from_alloy` →
-//! [`Executor::execute_tx`] — under the *fixture's* block/cfg env (via
-//! [`Executor::new_with_envs`]), then checks the resulting state root and
-//! logs hash against the fixture's expectation.
+//! This walks the `state_tests` tree of a pinned execution-spec-tests
+//! fixture release. For every post entry of the pinned fork, it executes
+//! the fixture's transaction through the same path the live executor and
+//! validator share: `DecodedTx::decode`, then `tx_env_from_alloy`,
+//! then [`Executor::execute_tx`], under the fixture's block and cfg env
+//! (through [`Executor::new_with_envs`]). It then checks the resulting
+//! state root and logs hash against the fixture's expectation.
 //!
-//! Latest-fork-only policy: only `post.Osaka` entries run; every other fork
-//! key is ignored. A fork bump changes [`FORK`] here alongside
-//! `block_env::SPEC_ID` and the fixture tag in `scripts/fetch-eest-fixtures.sh`.
+//! Latest-fork-only policy: only `post.Osaka` entries run; every other
+//! fork key is ignored. A fork bump changes [`FORK`] here, alongside
+//! `block_env::SPEC_ID` and the fixture tag in
+//! `scripts/fetch-eest-fixtures.sh`.
 //!
-//! Expected failures live in `tests/eest_expected_failures.json` — the
-//! precise, versioned statement of where kardamom's execution deviates from
-//! mainnet EVM. The runner fails on unexpected failures AND on unexpected
-//! passes (stale entries must be removed, with their reason re-examined).
+//! Expected failures live in `tests/eest_expected_failures.json`. This
+//! is the precise, versioned statement of where kardamom's execution
+//! deviates from mainnet EVM. The runner fails on unexpected failures,
+//! and on unexpected passes (stale entries must be removed, with their
+//! reason re-examined).
 //!
 //! Run: `KARDAMOM_EEST_FIXTURES=<dir> cargo test -p kardamom-exec-core \
 //!       --release --test eest_state -- --ignored` (or `just eest`).
@@ -37,7 +40,7 @@ use revm::primitives::KECCAK_EMPTY;
 use revm::primitives::hardfork::SpecId;
 use revm::statetest_types::{SpecName, Test, TestSuite, TestUnit};
 
-/// The one fork this chain executes — see `block_env::SPEC_ID`.
+/// The one fork this chain executes. See `block_env::SPEC_ID`.
 const FORK: SpecName = SpecName::Osaka;
 const SPEC: SpecId = kardamom_exec_core::block_env::SPEC_ID;
 
@@ -61,10 +64,11 @@ fn load_xfails() -> Vec<Xfail> {
         .expect("xfail list must parse")
 }
 
-/// Exact-id entries are STRICT: a pass flags the entry as stale. Prefix
-/// (`…*`) entries are LAX: they mark a family where *failures* are expected,
-/// while cases in the family that pass keep counting as plain passes (many
-/// families fail only on the parametrizations that hit the deviation).
+/// Exact-id entries are strict: a pass flags the entry as stale.
+/// Prefix (`...*`) entries are lax: they mark a family where failures are
+/// expected, while cases in the family that pass still count as plain
+/// passes. Many families fail only on the parametrizations that hit the
+/// deviation.
 fn xfail_match<'a>(xfails: &'a [Xfail], id: &str) -> Option<&'a Xfail> {
     xfails.iter().find(|x| {
         x.id == id
@@ -75,13 +79,13 @@ fn xfail_match<'a>(xfails: &'a [Xfail], id: &str) -> Option<&'a Xfail> {
 }
 
 // ---------------------------------------------------------------------------
-// Post-state oracle: a full alloc model + pure MPT root
+// Post-state oracle: a full alloc model, plus a pure MPT root
 
 #[derive(Default)]
 struct Alloc {
-    /// addr → (nonce, balance, code_hash)
+    /// addr to (nonce, balance, code_hash)
     accounts: BTreeMap<Address, (u64, U256, B256)>,
-    /// (addr, slot) → value
+    /// (addr, slot) to value
     storage: BTreeMap<(Address, B256), U256>,
 }
 
@@ -104,9 +108,9 @@ impl Alloc {
             .accounts
             .iter()
             .filter_map(|(addr, (nonce, balance, code_hash))| {
-                // Kardamom's empty-code sentinel is `B256::ZERO` (normalized to
-                // `KECCAK_EMPTY` at the snapshot boundary, #161); the trie always
-                // encodes `KECCAK_EMPTY`.
+                // Kardamom's empty-code sentinel is `B256::ZERO`
+                // (normalized to `KECCAK_EMPTY` at the snapshot
+                // boundary). The trie always encodes `KECCAK_EMPTY`.
                 let code_hash = if *code_hash == B256::ZERO {
                     KECCAK_EMPTY
                 } else {
@@ -165,8 +169,8 @@ fn run_case(unit: &TestUnit, t: &Test) -> Outcome {
     let Some(txbytes) = &t.txbytes else {
         return Outcome::Skip("no txbytes");
     };
-    // Kardamom carries no blob transactions: type-3 is rejected at ingress
-    // and `max_blobs_per_tx = 0` in production cfg. Blob fixtures test
+    // Kardamom carries no blob transactions. Ingress rejects type-3, and
+    // `max_blobs_per_tx = 0` in production cfg. Blob fixtures test
     // semantics the chain deliberately does not have.
     if txbytes.first() == Some(&0x03) {
         return Outcome::Skip("blob tx (type-3 unsupported)");
@@ -175,9 +179,10 @@ fn run_case(unit: &TestUnit, t: &Test) -> Outcome {
         return Outcome::Skip("no sender");
     };
 
-    // Fixture-derived envs — NOT the production `ExecEnv` derivation. The
-    // cfg starts from the same constructor production uses (pinned spec,
-    // spec-derived gas table) and takes the fixture's chain id.
+    // These are fixture-derived envs, not the production `ExecEnv`
+    // derivation. The cfg starts from the same constructor production
+    // uses (pinned spec, spec-derived gas table), and takes the
+    // fixture's chain id.
     let mut cfg = CfgEnv::new_with_spec(SPEC);
     cfg.chain_id = unit
         .env
@@ -246,9 +251,10 @@ fn run_case(unit: &TestUnit, t: &Test) -> Outcome {
     ws.finish();
     alloc.apply(&ws);
 
-    // A fixture that expects a validation exception must land on our
-    // deterministic invalid-skip (total derivation, #92) — an executed
-    // receipt here means a validation gap even if the root happens to match.
+    // A fixture that expects a validation exception must land on this
+    // code's deterministic invalid-skip (total derivation). An executed
+    // receipt here means a validation gap, even if the root happens to
+    // match.
     if t.expect_exception.is_some() && !receipt.is_invalid_skip() {
         return Outcome::Fail(format!(
             "expected exception {:?} but tx executed (status={}, gas={})",
@@ -259,7 +265,7 @@ fn run_case(unit: &TestUnit, t: &Test) -> Outcome {
     let root = alloc.state_root();
     if root != t.hash {
         // When the fixture ships its full post_state, name the differing
-        // accounts — worth far more in triage than two root hashes.
+        // accounts. This is far more useful for triage than two root hashes.
         let mut diffs = Vec::new();
         for (addr, want) in &t.post_state {
             let got = alloc.accounts.get(addr);
@@ -330,7 +336,7 @@ fn eest_state_tests_conform() {
     let xfails = load_xfails();
 
     let (mut pass, mut skip) = (0usize, BTreeMap::<&str, usize>::new());
-    // Expected failures, keyed by the xfail entry's reason — the summary
+    // Expected failures, keyed by the xfail entry's reason. The summary
     // shows reviewers what each accepted deviation currently costs.
     let mut expected_by_reason = BTreeMap::<String, usize>::new();
     let mut unexpected_failures: Vec<(String, String)> = Vec::new();
@@ -365,7 +371,7 @@ fn eest_state_tests_conform() {
                 let id = format!("{name}[{i}]");
                 match run_case(&unit, t) {
                     Outcome::Pass => match xfail_match(&xfails, &id) {
-                        // Strict only for exact entries — see `xfail_match`.
+                        // Strict only for exact entries. See `xfail_match`.
                         Some(x) if !x.id.ends_with('*') => unexpected_passes.push(id),
                         _ => pass += 1,
                     },
@@ -381,7 +387,7 @@ fn eest_state_tests_conform() {
 
     let expected_fail: usize = expected_by_reason.values().sum();
 
-    // Full failure list as JSON for triage / CI artifacts.
+    // Full failure list as JSON, for triage and CI artifacts.
     if let Ok(report) = std::env::var("KARDAMOM_EEST_REPORT") {
         let body = serde_json::json!({
             "pass": pass,

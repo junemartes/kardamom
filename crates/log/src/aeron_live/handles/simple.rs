@@ -1,11 +1,11 @@
-//! The four structurally-identical single-stream handle pairs: TxErrors,
+//! The four structurally identical single-stream handle pairs: TxErrors,
 //! TxDeposits, FsyncWatermark, Quorum. Each is a publisher wrapping one
 //! [`PubHandle`] plus a subscriber wrapping one typed receiver, differing
 //! only in message type, channel/stream selection, and the publisher's
-//! publish surface — so the boilerplate (structs, `open`, `recv`/`try_recv`)
-//! is stamped out by [`declare_channel_handles!`]. The four public type-name
-//! pairs and their method signatures are exactly what the four hand-written
-//! copies exposed.
+//! publish surface. [`declare_channel_handles!`] stamps out the
+//! boilerplate (structs, `open`, `recv`/`try_recv`). The four public
+//! type-name pairs and their method signatures are exactly what the four
+//! hand-written copies exposed.
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -18,15 +18,15 @@ use kardamom_types::{BPosition, EpochRecord, FsyncWatermark, QuorumWatermark, Tx
 /// `(channel, stream_id)`:
 ///
 /// - a `Clone` publisher struct wrapping a [`PubHandle`], with an
-///   `open(rt, ch, ...)` constructor and the caller-supplied publish methods
-///   pasted verbatim into its `impl` (so `publish`'s exact signature — and
-///   whether `raw()` exists — stays per-type);
+///   `open(rt, ch, ...)` constructor and the caller-supplied publish
+///   methods pasted verbatim into its `impl` (so `publish`'s exact
+///   signature, and whether `raw()` exists, stays per type);
 /// - a subscriber struct wrapping an `UnboundedReceiver<(BPosition, $msg)>`
-///   with the same-shaped `open` plus the standard `recv` / `try_recv`.
+///   with the same-shaped `open` plus the standard `recv` and `try_recv`.
 ///
-/// `open(ch, ...)` binds the `ChannelsConfig` parameter name (and any extra
-/// parameters) used by the `$channel` / `$stream` selection expressions; both
-/// the publisher's and the subscriber's `open` share them.
+/// `open(ch, ...)` binds the `ChannelsConfig` parameter name (and any
+/// extra parameters) used by the `$channel`/`$stream` selection
+/// expressions. Both the publisher's and the subscriber's `open` share them.
 macro_rules! declare_channel_handles {
     (
         $(#[$pub_doc:meta])*

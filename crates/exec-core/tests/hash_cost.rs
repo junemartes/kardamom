@@ -1,10 +1,10 @@
 //! Cost of the consensus witness (`WriteSet::hash`) in isolation.
 //!
-//! The STM commit tail's hash+validate lanes measured 1.44 µs/tx on
-//! transfers, ~70% of it hashing — far above what 3 keccak permutations
-//! should cost. This separates the hash's OWN cost (hot data) from the
-//! cost of reaching cold write sets scattered across a 1.8MB result
-//! carcass, because the two have completely different fixes.
+//! The STM commit tail's hash-and-validate lanes measured 1.44 µs/tx on
+//! transfers, about 70% of it spent hashing. That is far above what 3
+//! keccak permutations should cost. This separates the hash's own cost
+//! (hot data) from the cost of reaching cold write sets scattered across
+//! a 1.8MB result set, because the two need completely different fixes.
 use alloy_primitives::{Address, B256, U256};
 use kardamom_exec_core::delta::WriteSet;
 
@@ -35,8 +35,8 @@ fn write_set_hash_cost() {
     }
     let hot = t.elapsed().as_nanos() as f64 / (REPS * sets.len()) as f64;
 
-    // Cold: stride through 64MB between hashes so every write set is a
-    // fresh miss, as it is in the tail.
+    // Cold: stride through 16MB between hashes, so every write set is a
+    // fresh cache miss, matching the tail's access pattern.
     let junk = vec![7u8; 16 << 20];
     let mut acc = 0u64;
     let t = std::time::Instant::now();
