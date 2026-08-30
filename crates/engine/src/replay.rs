@@ -212,9 +212,7 @@ fn drive_block(
         block.l2_timestamp,
         |addr, slot| {
             snapshot.storage(addr, slot).map_err(|e| {
-                crate::error::ExecutorError::State(format!(
-                    "block-close read {addr}/{slot}: {e:?}"
-                ))
+                crate::error::ExecutorError::State(format!("block-close read {addr}/{slot}: {e:?}"))
             })
         },
     )?;
