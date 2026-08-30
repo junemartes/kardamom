@@ -7,12 +7,13 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import org.junit.jupiter.api.Test;
 
 /**
- * Pure-function tests for the {@link ClusterNode} launcher helpers. No Aeron / no
- * cluster boot, so these are fast. They pin the two parsing helpers that turn the
- * {@code -Dkardamom.cluster.members} string into this member's endpoints / id.
+ * Pure-function tests for the {@link ClusterNode} launcher helpers. These
+ * tests use no Aeron and no cluster boot, so they run fast. They pin the two
+ * parsing helpers that turn the {@code -Dkardamom.cluster.members} string
+ * into this member's endpoints and id.
  */
 final class ClusterNodeTest {
-    /** Realistic 3-member topology (mirrors deploy/cluster/nomad/cluster.nomad.hcl). */
+    /** A realistic 3-member topology, matching deploy/cluster/nomad/cluster.nomad.hcl. */
     private static final String MEMBERS =
         "0,192.168.56.51:40200,192.168.56.51:40201,192.168.56.51:40202,192.168.56.51:40203,192.168.56.51:40204"
             + "|1,192.168.56.52:40200,192.168.56.52:40201,192.168.56.52:40202,192.168.56.52:40203,192.168.56.52:40204"

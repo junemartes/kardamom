@@ -11,11 +11,12 @@ import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
 /**
- * Contiguity-guard (#85 fix B) unit tests for {@link CanonicalSealerState}:
- * per-sender nonce tracking, gap rejection without state movement, dedup
- * absorbing republished copies before the nonce check, the zero-sender
- * exemption, LRU bounding of the sender map, and guard survival across
- * snapshot versions. Split out of {@link CanonicalSealerStateTest}.
+ * Contiguity-guard unit tests for {@link CanonicalSealerState}.
+ * The tests cover per-sender nonce tracking, gap rejection without state
+ * movement, dedup absorption of republished copies before the nonce check,
+ * the zero-sender exemption, LRU bounding of the sender map, and guard
+ * survival across snapshot versions.
+ * These tests were split out of {@link CanonicalSealerStateTest}.
  */
 class ContiguityGuardTest {
 
@@ -31,16 +32,16 @@ class ContiguityGuardTest {
     void guard_rejects_known_sender_gap_without_state_change() {
         CanonicalSealerState state = new CanonicalSealerState(8);
         state.onRecord(id(1), sender(1), 0, payload("a"));
-        // Nonce 2 while 1 is expected: reject, and NOTHING changes — no count,
-        // no dedup entry, no expected-nonce movement.
+        // The state expects nonce 1, but this record has nonce 2. The state
+        // rejects it. Nothing changes: no count, no dedup entry, no nonce update.
         CanonicalSealerState.RecordOutcome gap = state.onRecord(id(2), sender(1), 2, payload("b"));
         assertTrue(gap.rejected);
         assertEquals(1L, gap.expectedNonce);
         assertFalse(gap.relayed.isPresent());
         assertEquals(1L, state.canonicalCount(), "reject must not count");
         assertEquals(Optional.of(1L), state.expectedNonceOf(sender(1)), "reject must not advance");
-        // The gap fills, then the SAME rejected id republishes and is fresh
-        // (a reject leaves no dedup entry).
+        // The gap is filled. The same rejected id republishes and is fresh,
+        // because a reject leaves no dedup entry.
         assertTrue(state.onRecord(id(3), sender(1), 1, payload("gap")).relayed.isPresent());
         assertTrue(state.onRecord(id(2), sender(1), 2, payload("b")).relayed.isPresent());
         assertEquals(3L, state.canonicalCount());
@@ -48,9 +49,9 @@ class ContiguityGuardTest {
 
     @Test
     void guard_dedup_absorbs_republished_copies_before_the_nonce_check() {
-        // #114 interplay: the sequencer republishes unconfirmed refs; copies
-        // that DID commit re-arrive with a by-then stale nonce and MUST be
-        // absorbed as duplicates, never contiguity-rejected.
+        // The sequencer republishes unconfirmed refs.
+        // Copies that already committed re-arrive with a now-stale nonce.
+        // The guard must absorb these as duplicates, not reject them as gaps.
         CanonicalSealerState state = new CanonicalSealerState(8);
         state.onRecord(id(1), sender(1), 0, payload("a"));
         state.onRecord(id(2), sender(1), 1, payload("b"));
@@ -71,17 +72,18 @@ class ContiguityGuardTest {
 
     @Test
     void guard_map_is_lru_bounded_and_evicted_sender_reseeds() {
-        // Capacity 2 (shared with the dedup window): tracking a third sender
-        // evicts the LEAST RECENTLY USED one, which then re-seeds like a new
-        // sender — honest degradation, never a false reject.
+        // Capacity 2 is shared with the dedup window.
+        // Tracking a third sender evicts the least recently used sender.
+        // The evicted sender then re-seeds like a new sender. This is
+        // graceful degradation, not a false reject.
         CanonicalSealerState state = new CanonicalSealerState(2);
         state.onRecord(id(1), sender(1), 10, payload("a"));
         state.onRecord(id(2), sender(2), 20, payload("b"));
-        state.onRecord(id(3), sender(1), 11, payload("a2")); // touches sender1
-        state.onRecord(id(4), sender(3), 30, payload("c")); // evicts sender2 (LRU)
+        state.onRecord(id(3), sender(1), 11, payload("a2")); // touches sender 1
+        state.onRecord(id(4), sender(3), 30, payload("c")); // evicts sender 2, the least recently used sender
         assertEquals(2, state.trackedSenders());
         assertEquals(Optional.empty(), state.expectedNonceOf(sender(2)), "sender2 evicted");
-        // Evicted sender2 reappears at an arbitrary nonce: seeds, not rejected.
+        // The evicted sender 2 reappears at an arbitrary nonce. It seeds again, and is not rejected.
         CanonicalSealerState.RecordOutcome reseed = state.onRecord(id(5), sender(2), 99, payload("b2"));
         assertTrue(reseed.relayed.isPresent(), "evicted sender re-seeds");
     }
@@ -95,19 +97,20 @@ class ContiguityGuardTest {
         CanonicalSealerState restored = CanonicalSealerState.load(original.takeSnapshot(), 8);
         assertEquals(2, restored.trackedSenders());
         assertEquals(Optional.of(6L), restored.expectedNonceOf(sender(1)));
-        // The restored guard still rejects a gap…
+        // The restored guard still rejects a gap.
         CanonicalSealerState.RecordOutcome gap = restored.onRecord(id(3), sender(1), 9, payload("x"));
         assertTrue(gap.rejected, "restored guard must keep rejecting gaps");
         assertEquals(6L, gap.expectedNonce);
-        // …and still accepts the contiguous next nonce.
+        // The restored guard still accepts the next contiguous nonce.
         assertTrue(restored.onRecord(id(3), sender(1), 6, payload("x")).relayed.isPresent());
     }
 
     @Test
     void guard_v1_snapshot_loads_with_empty_map() {
-        // A pre-guard (v1) snapshot restores an EMPTY guard map: every sender
-        // re-seeds trust-on-first-sight. Synthesize a v1 snapshot by patching
-        // the version field and dropping the sender section.
+        // A pre-guard (v1) snapshot restores an empty guard map.
+        // Every sender re-seeds on trust at first sight.
+        // This test builds a v1 snapshot by patching the version field and
+        // removing the sender section.
         CanonicalSealerState original = new CanonicalSealerState(8, 1);
         original.onRecord(id(1), sender(1), 5, payload("a"));
         byte[] v2 = original.takeSnapshot();

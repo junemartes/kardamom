@@ -3,14 +3,13 @@ package io.kardamom.sealer;
 import java.util.Optional;
 
 /**
- * Outcome of an origin-advancing record
- * ({@link CanonicalSealerState#onOriginRecord}): the boundary that had to be
- * forced to close the outgoing epoch's block (absent when the open block was
- * still empty), plus the record to relay.
+ * Outcome of an origin-advancing record ({@link CanonicalSealerState#onOriginRecord}).
+ * It holds the boundary that closes the outgoing epoch's block (empty if the
+ * open block was still empty), plus the record to relay.
  *
- * <p>The order matters and is the whole point: the caller MUST offer
- * {@link #forcedBoundary} before {@link #relayed}, or the epoch's deposits
- * land at the tail of the previous block instead of leading the new one. See
+ * <p>Order matters: the caller must offer {@link #forcedBoundary} before
+ * {@link #relayed}. Otherwise the epoch's deposits land at the tail of the
+ * previous block, not at the head of the new one. See
  * {@code docs/agents/l1-origin-deposit-derivation-spec.md}.</p>
  */
 public final class OriginAdvance {
@@ -22,12 +21,12 @@ public final class OriginAdvance {
         this.relayed = relayed;
     }
 
-    /** Boundary closing the previous epoch's block; empty if it was empty. */
+    /** The boundary that closes the previous epoch's block. Empty if that block was empty. */
     public Optional<Boundary> forcedBoundary() {
         return Optional.ofNullable(forcedBoundary);
     }
 
-    /** The record to relay, leading the newly opened block. */
+    /** The record to relay. It leads the newly opened block. */
     public Relayed relayed() {
         return relayed;
     }

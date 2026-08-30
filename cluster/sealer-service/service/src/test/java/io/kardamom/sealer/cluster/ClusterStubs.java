@@ -16,9 +16,9 @@ import org.agrona.concurrent.YieldingIdleStrategy;
 /**
  * Minimal in-memory {@link Cluster}/{@link ClientSession} stubs shared by the
  * driverless service tests ({@link SealerFanoutTest}, {@link SnapshotRestoreTest}).
- * Only what {@code onStart}/session fan-out/replay touches is implemented; every
- * transport-level operation throws. {@link StubSession#offered} records every
- * egress frame verbatim so tests assert on raw frame bytes.
+ * These stubs implement only what {@code onStart}, session fan-out, and replay
+ * touch. Every transport-level operation throws. {@link StubSession#offered}
+ * records every egress frame verbatim, so tests can assert on raw frame bytes.
  */
 final class ClusterStubs {
 
