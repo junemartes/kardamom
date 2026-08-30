@@ -173,34 +173,37 @@ pub fn spawn_commit_poller(
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let mut last = 0u64;
+        // Park on the snapshot watch: one wake per commit. The 200 ms
+        // timer and the last != block dedup are gone — each publish IS a
+        // new committed block.
+        let mut watch = snap_rx.watch();
         loop {
-            if shutdown.is_cancelled() {
-                return;
-            }
-            if let Some(snap) = snap_rx.current() {
-                let block = snap.block_number();
-                if block != last {
-                    last = block;
-                    metrics::set_committed_block(block);
-                    match snap.state_root() {
-                        Ok(Some(root)) => {
-                            metrics::set_state_root_block(block);
-                            tracing::debug!(block, state_root = %root, "validator committed block");
-                            if let Some(h) = attester_handle.as_ref() {
-                                h.submit_root(block, root);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(block, error = %e, "state_root read failed")
-                        }
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                changed = watch.changed() => {
+                    if changed.is_err() {
+                        // Writer gone: shutdown path.
+                        return;
                     }
                 }
             }
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            let Some(snap) = watch.borrow_and_update().clone() else {
+                continue;
+            };
+            let block = snap.block_number();
+            metrics::set_committed_block(block);
+            match snap.state_root() {
+                Ok(Some(root)) => {
+                    metrics::set_state_root_block(block);
+                    tracing::debug!(block, state_root = %root, "validator committed block");
+                    if let Some(h) = attester_handle.as_ref() {
+                        h.submit_root(block, root);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(block, error = %e, "state_root read failed")
+                }
             }
         }
     });
