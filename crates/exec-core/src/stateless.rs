@@ -3,7 +3,7 @@
 //!
 //! [`execute_block`] is the single-scope sequential driver both live roles
 //! already used (hoisted verbatim from the validator so the zk guest links
-//! the exact production code path): one [`ExecScope`] per block, deposits
+//! the exact production code path): one [`Executor`] per block, deposits
 //! folded into the scope cache so later txs observe their writes.
 //!
 //! [`execute_block_stateless`] is the GUEST shape: the same driver over a
@@ -32,7 +32,7 @@ use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
-use crate::executor::{ExecScope, decode_alloy_envelope, execute_deposit_tx};
+use crate::executor::{DecodedTx, Executor, execute_deposit_tx};
 use crate::witness::WitnessDb;
 
 /// One canonical record of a block, in execution order. Clone is cheap:
@@ -124,7 +124,7 @@ fn execute_block_inner<S: StateDatabase>(
     let mut delta = PendingDelta::new();
     let mut receipts = Vec::with_capacity(records.len());
     let mut cumulative = 0u64;
-    let mut scope = ExecScope::new(snapshot, parent, env)?;
+    let mut scope = Executor::new(snapshot, parent, env)?;
     for (i, rec) in records.iter().enumerate() {
         let idx_in_block = i as u64;
         // revm's Bal convention: index 0 = pre-execution, 1..=n = txs in
@@ -168,7 +168,7 @@ fn execute_block_inner<S: StateDatabase>(
 #[allow(clippy::too_many_arguments)] // mirrors execute_tx/execute_deposit_tx;
 // a params struct would rename the same nine fields without removing any.
 pub fn execute_record_in_scope<'a, S: StateDatabase>(
-    scope: &mut ExecScope<&'a S>,
+    scope: &mut Executor<&'a S>,
     snapshot: &'a S,
     parent: Option<&PendingDelta>,
     delta: &PendingDelta,
@@ -230,7 +230,7 @@ pub fn verify_record_identity(envelope: &TxEnvelope) -> Result<(), ExecutorError
             envelope.tx_hash
         )));
     }
-    let decoded = decode_alloy_envelope(&envelope.raw_tx, TxIndex::ZERO)?;
+    let decoded = DecodedTx::decode(&envelope.raw_tx, TxIndex::ZERO)?;
     let recovered = decoded
         .recover_signer()
         .map_err(|e| ExecutorError::RecordIdentity(format!("sender recovery failed: {e}")))?;

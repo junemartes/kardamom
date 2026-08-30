@@ -1,12 +1,11 @@
 //! `WriteSet` extraction from revm's two state shapes (per-tx `EvmState`,
-//! post-commit `CacheDB` cache), BAL recording for deposits, and the
-//! `WireLog` conversion.
+//! post-commit `CacheDB` cache) and BAL recording for deposits. The
+//! `WireLog` conversion lives on the type itself (`WireLog::from`).
 
 use alloy_primitives::Bytes as AlloyBytes;
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
-use kardamom_types::WireLog;
-use revm::primitives::{KECCAK_EMPTY, Log};
+use revm::primitives::KECCAK_EMPTY;
 use revm::state::Bytecode;
 
 use alloc::boxed::Box;
@@ -35,7 +34,21 @@ use crate::delta::WriteSet;
 /// the BYTES — code is a seed, see `ClaimIndex::code`). The first version
 /// fabricated only the nonce, and per-field classification silently dropped
 /// the balance and code claims: the deposit mint never reached the BAL.
-pub fn record_writeset_into_bal(bal: &mut revm::state::bal::Bal, bal_index: u64, ws: &WriteSet) {
+impl WriteSet {
+    /// See the module docs above this impl for the fabrication rationale.
+    pub fn record_into_bal(&self, bal: &mut revm::state::bal::Bal, bal_index: u64) {
+        record_writeset_into_bal_inner(bal, bal_index, self)
+    }
+
+    /// Build a `WriteSet` from revm's per-tx `EvmState`. Only touched
+    /// accounts, changed slots, and created code are emitted, which keeps
+    /// the per-tx hash stable across replicas.
+    pub fn from_evm_state(state: &revm::state::EvmState) -> Self {
+        write_set_from_evm_state_inner(state)
+    }
+}
+
+fn record_writeset_into_bal_inner(bal: &mut revm::state::bal::Bal, bal_index: u64, ws: &WriteSet) {
     use revm::state::{Account, AccountInfo, AccountStatus, EvmStorageSlot};
     let mut by_addr: BTreeMap<Address, Account> = BTreeMap::new();
     for (addr, (nonce, balance, code_hash)) in &ws.accounts {
@@ -140,7 +153,7 @@ pub(super) fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
 /// Public: the Block-STM engine (`kardamom-stm`) builds per-tx write sets
 /// from its own revm outcomes with exactly these emission rules — touched
 /// accounts, changed slots, created code only.
-pub fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
+fn write_set_from_evm_state_inner(state: &revm::state::EvmState) -> WriteSet {
     let mut ws = WriteSet::default();
     for (addr, account) in state.iter() {
         // Only emit accounts revm marked as touched. Untouched entries are
@@ -181,13 +194,4 @@ pub fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
     }
     ws.finish();
     ws
-}
-
-/// Public: the Block-STM engine mirrors the receipt log encoding.
-pub fn wire_log(log: &Log) -> WireLog {
-    WireLog {
-        address: log.address,
-        topics: log.data.topics().to_vec(),
-        data: Bytes::copy_from_slice(log.data.data.as_ref()),
-    }
 }

@@ -37,6 +37,19 @@ pub struct WireLog {
     pub data: Bytes,
 }
 
+/// The one wire encoding of an EVM log. Every emitter (the streaming
+/// executor and the Block-STM engine) converts through this impl, so the
+/// receipt log encoding cannot drift between them.
+impl From<&alloy_primitives::Log> for WireLog {
+    fn from(log: &alloy_primitives::Log) -> Self {
+        Self {
+            address: log.address,
+            topics: log.data.topics().to_vec(),
+            data: Bytes::copy_from_slice(log.data.data.as_ref()),
+        }
+    }
+}
+
 /// Per-tx execution receipt. Published on tx_receipts by executor replicas.
 ///
 /// Carries every field the ingress needs to answer

@@ -19,7 +19,7 @@ use crate::exec_types::TxIndex;
 
 use super::db::{SnapshotRef, seed_cache_layer};
 use super::tx_env::tx_env_from_deposit;
-use super::write_set::{record_writeset_into_bal, wire_log, write_set_from_cache};
+use super::write_set::write_set_from_cache;
 
 /// Execute one [`kardamom_types::Deposit`] against a snapshot + the current
 /// `PendingDelta`. Returns the receipt plus a fresh per-tx `WriteSet`.
@@ -123,11 +123,11 @@ pub fn execute_deposit_tx<S: StateDatabase>(
     // pre-credit and any inner-call writes contribute touched accounts.
     let ws = write_set_from_cache(&cache.cache);
     if let Some((bal, bal_index)) = bal {
-        record_writeset_into_bal(bal, bal_index, &ws);
+        ws.record_into_bal(bal, bal_index);
     }
 
     let write_set_hash = ws.hash();
-    let wire_logs: Vec<WireLog> = logs.iter().map(wire_log).collect();
+    let wire_logs: Vec<WireLog> = logs.iter().map(kardamom_types::WireLog::from).collect();
     let cumulative_gas_used = cumulative_gas_used_before + gas_used;
 
     let receipt = Receipt {

@@ -98,7 +98,7 @@ pub(super) struct ExecState<S: SnapshotSource, Q, P, E> {
     /// at each boundary; rebuilt lazily at the block's first tx
     /// (seeded with parent + whatever the live delta already holds,
     /// e.g. deposits that landed before the first tx).
-    pub(super) scope: Option<crate::executor::ExecScope<S::Db>>,
+    pub(super) scope: Option<crate::executor::Executor<S::Db>>,
     /// Pipelined commit (depth K): at each boundary the finalized
     /// delta is SUBMITTED to the writer but not awaited — the next
     /// block executes against snapshot ∘ merged-unsettled ∘ delta,
@@ -379,7 +379,7 @@ where
         let sc = match self.scope.as_mut() {
             Some(sc) => sc,
             None => {
-                let mut sc = crate::executor::ExecScope::new(
+                let mut sc = crate::executor::Executor::new(
                     self.snapshots
                         .snapshot_after(self.current_block.saturating_sub(1)),
                     self.parent.as_ref(),

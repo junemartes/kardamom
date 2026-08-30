@@ -16,19 +16,42 @@ use alloc::format;
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
 
-/// Decode an `alloy_consensus::TxEnvelope` from the `raw_tx` bytes carried
-/// in a `kardamom_types::TxEnvelope`. The signature is already verified by
-/// the proxy (S1, S0); we just need the typed accessors to build a
-/// revm `TxEnv`.
-pub fn decode_alloy_envelope(
-    raw_tx: &Bytes,
-    tx_idx: TxIndex,
-) -> Result<alloy_consensus::TxEnvelope, ExecutorError> {
-    let mut slice: &[u8] = raw_tx.as_ref();
-    alloy_consensus::TxEnvelope::decode_2718(&mut slice).map_err(|e| ExecutorError::Execution {
-        idx: tx_idx,
-        detail: format!("decode raw_tx: {e}"),
-    })
+/// A decoded 2718 envelope, ready for `TxEnv` derivation.
+///
+/// The newtype owns both halves of the old free-function pair
+/// (`decode_alloy_envelope` + `tx_env_from_alloy`) and stays independent
+/// of [`super::Executor`]: the Block-STM engine decodes off-thread in
+/// `prepare` and hands the decoded value to a worker later.
+#[derive(Debug, Clone)]
+pub struct DecodedTx(pub alloy_consensus::TxEnvelope);
+
+impl DecodedTx {
+    /// Decode from the `raw_tx` bytes carried in a
+    /// `kardamom_types::TxEnvelope`. The signature is already verified by
+    /// the proxy (S1, S0); we only need the typed accessors.
+    pub fn decode(raw_tx: &Bytes, tx_idx: TxIndex) -> Result<Self, ExecutorError> {
+        let mut slice: &[u8] = raw_tx.as_ref();
+        alloy_consensus::TxEnvelope::decode_2718(&mut slice)
+            .map(Self)
+            .map_err(|e| ExecutorError::Execution {
+                idx: tx_idx,
+                detail: format!("decode raw_tx: {e}"),
+            })
+    }
+
+    /// Convert into a revm `TxEnv`. `signer` is the proxy-populated
+    /// sender — never recomputed here (S0).
+    pub fn tx_env(&self, signer: Address) -> TxEnv {
+        tx_env_from_alloy(&self.0, signer)
+    }
+}
+
+impl core::ops::Deref for DecodedTx {
+    type Target = alloy_consensus::TxEnvelope;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// Convert a recovered tx envelope into a `TxEnv`. `signer` is the proxy-
@@ -41,7 +64,7 @@ pub fn decode_alloy_envelope(
 /// split, set-code txs as plain calls), measured at 1,292 EEST cases. Every
 /// field is now populated from the envelope; a revm field addition is a
 /// compile error, i.e. a forced decision.
-pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Address) -> TxEnv {
+fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Address) -> TxEnv {
     use revm::context_interface::either::Either;
     TxEnv {
         // The EIP-2718 type byte drives revm's per-type validity rules

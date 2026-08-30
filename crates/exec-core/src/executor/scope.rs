@@ -1,4 +1,4 @@
-//! [`ExecScope`] — the per-block EVM + committed cache — plus the free
+//! [`Executor`] — the per-block EVM + committed cache — plus the free
 //! [`execute_tx`] compatibility wrapper and the deterministic invalid-skip
 //! path (#92).
 
@@ -18,8 +18,7 @@ use crate::error::ExecutorError;
 use crate::exec_types::{ReceiptStatus, TxIndex};
 
 use super::db::{SnapshotDb, seed_cache_layer};
-use super::tx_env::{decode_alloy_envelope, tx_env_from_alloy};
-use super::write_set::{wire_log, write_set_from_evm_state};
+use super::tx_env::DecodedTx;
 
 /// Per-tx READ-touch capture for the footprint shadow scheduler
 /// (spec: block-stm-executor §P1). The block-level EIP-7928 BAL cannot
@@ -57,7 +56,7 @@ pub struct TouchSet {
 /// The free [`execute_tx`] wrapper (one scope per call) keeps the old
 /// signature for replay and tests; hot paths hold a scope per block
 /// (executor) or per batch (validator).
-pub struct ExecScope<S: StateDatabase> {
+pub struct Executor<S: StateDatabase> {
     evm: revm::handler::MainnetEvm<
         revm::context::Context<
             revm::context::BlockEnv,
@@ -69,7 +68,7 @@ pub struct ExecScope<S: StateDatabase> {
     env: ExecEnv,
 }
 
-impl<S: StateDatabase> ExecScope<S> {
+impl<S: StateDatabase> Executor<S> {
     /// Build the block's scope: cache seeded with the PARENT layer only
     /// (fixed for the whole block), EVM constructed once.
     pub fn new(
@@ -81,12 +80,12 @@ impl<S: StateDatabase> ExecScope<S> {
         Self::new_with_envs(snapshot, parent, env, block, cfg)
     }
 
-    /// Like [`ExecScope::new`], but with caller-supplied revm envs instead of
+    /// Like [`Executor::new`], but with caller-supplied revm envs instead of
     /// the [`ExecEnv`]-derived production ones. This is the seam the EEST
     /// conformance runner uses to execute under a *fixture's* block env
     /// (coinbase, basefee, difficulty, blob params) — it tests the engine's
     /// revm integration, not kardamom's boundary derivation. Production
-    /// paths use [`ExecScope::new`]; `env` here only feeds the metadata on
+    /// paths use [`Executor::new`]; `env` here only feeds the metadata on
     /// skip receipts (block number).
     pub fn new_with_envs(
         snapshot: S,
@@ -116,8 +115,8 @@ impl<S: StateDatabase> ExecScope<S> {
         seed_cache_layer(cache, layer).map_err(ExecutorError::State)
     }
 
-    #[allow(clippy::too_many_arguments)] // matches the free execute_tx's shape;
-    // see the equivalent allow there for the rationale.
+    #[allow(clippy::too_many_arguments)] // the per-tx entry point's shape;
+    // see the equivalent allow on `execute_once`.
     pub fn execute_tx(
         &mut self,
         tx_idx: TxIndex,
@@ -147,10 +146,10 @@ impl<S: StateDatabase> ExecScope<S> {
         // Non-deterministic failures (Database errors) still fail-stop below.
         // A skip is LOUD: any occurrence means an upstream guard failed
         // (`kardamom_executor_invalid_tx_skipped_total` deserves an alert).
-        let alloy_env = match decode_alloy_envelope(&inbound_envelope.raw_tx, tx_idx) {
+        let alloy_env = match DecodedTx::decode(&inbound_envelope.raw_tx, tx_idx) {
             Ok(env_) => env_,
             Err(_) => {
-                return Ok(invalid_skip(
+                return Ok(Self::skip_receipt(
                     tx_position,
                     inbound_envelope,
                     0,
@@ -187,7 +186,7 @@ impl<S: StateDatabase> ExecScope<S> {
         tx_idx: TxIndex,
         tx_position: BPosition,
         inbound_envelope: &TxEnvelope,
-        alloy_env: &alloy_consensus::TxEnvelope,
+        alloy_env: &DecodedTx,
         tx_index_in_block: u64,
         cumulative_gas_used_before: u64,
         bal: Option<(&mut revm::state::bal::Bal, u64)>,
@@ -203,13 +202,13 @@ impl<S: StateDatabase> ExecScope<S> {
             .gas_price()
             .unwrap_or_else(|| alloy_env.max_fee_per_gas());
 
-        let tx_env = tx_env_from_alloy(alloy_env, signer);
+        let tx_env = alloy_env.tx_env(signer);
         let outcome = match self.evm.transact(tx_env) {
             Ok(o) => o,
             // Deterministic input-invalidity: every replica computes the same
             // rejection from the same (state, tx) — skip, never halt (#92).
             Err(revm::context::result::EVMError::Transaction(_)) => {
-                return Ok(invalid_skip(
+                return Ok(Self::skip_receipt(
                     tx_position,
                     inbound_envelope,
                     nonce,
@@ -220,7 +219,7 @@ impl<S: StateDatabase> ExecScope<S> {
                 ));
             }
             Err(revm::context::result::EVMError::Header(_)) => {
-                return Ok(invalid_skip(
+                return Ok(Self::skip_receipt(
                     tx_position,
                     inbound_envelope,
                     nonce,
@@ -253,7 +252,7 @@ impl<S: StateDatabase> ExecScope<S> {
         // accounts and slots are emitted, which keeps the per-tx hash stable
         // across replicas (revm's iteration is over an AddressMap; we re-sort
         // into BTreeMap inside WriteSet via insert).
-        let ws = write_set_from_evm_state(&outcome.state);
+        let ws = WriteSet::from_evm_state(&outcome.state);
         if let Some((bal, bal_index)) = bal {
             for (addr, account) in outcome.state.iter() {
                 bal.update_account(bal_index, *addr, account);
@@ -280,7 +279,7 @@ impl<S: StateDatabase> ExecScope<S> {
         );
 
         let write_set_hash = ws.hash();
-        let wire_logs = logs.iter().map(wire_log).collect();
+        let wire_logs = logs.iter().map(kardamom_types::WireLog::from).collect();
         let cumulative_gas_used = cumulative_gas_used_before + gas_used;
         // Contract address is meaningful only for successful CREATE txs.
         // Failed CREATEs and any CALL tx have `contract_address = None`.
@@ -332,78 +331,108 @@ impl<S: StateDatabase> ExecScope<S> {
 #[allow(clippy::too_many_arguments)] // 8 args is the natural shape of an
 // "execute one tx" entry point — packaging them into a struct would shuffle
 // the noise around without reducing it.
-pub fn execute_tx<S: StateDatabase>(
-    snapshot: &S,
-    parent: Option<&PendingDelta>,
-    delta: &PendingDelta,
-    env: ExecEnv,
-    tx_idx: TxIndex,
-    tx_position: BPosition,
-    inbound_envelope: &TxEnvelope,
-    tx_index_in_block: u64,
-    cumulative_gas_used_before: u64,
-    // EIP-7928 capture (spec: bal-attribution-parallel-validation): when
-    // set, every account/slot this tx touched is recorded into the block's
-    // Bal under `bal_index` (1-based tx position per revm's convention) —
-    // writes as (index, value), read-only accesses into storage_reads.
-    // revm classifies from original-vs-present in `outcome.state`.
-    bal: Option<(&mut revm::state::bal::Bal, u64)>,
-) -> Result<(Receipt, WriteSet), ExecutorError> {
-    // Compatibility wrapper: one throwaway scope per call (replay + tests).
-    // Hot paths hold an [`ExecScope`] per block/batch instead — that is
-    // where the allocation win lives.
-    let mut scope = ExecScope::new(snapshot, parent, env)?;
-    scope.seed_layer(delta)?;
-    scope.execute_tx(
-        tx_idx,
-        tx_position,
-        inbound_envelope,
-        tx_index_in_block,
-        cumulative_gas_used_before,
-        bal,
-        None,
-    )
+impl<S: StateDatabase> Executor<S> {
+    /// One-shot convenience: build a throwaway per-call executor, seed the
+    /// caller's live delta, execute one tx. For replay and tests — hot
+    /// paths hold an [`Executor`] per block/batch instead; that is where
+    /// the allocation win lives.
+    #[allow(clippy::too_many_arguments)] // the one-tx entry point's shape.
+    pub fn execute_once(
+        snapshot: &S,
+        parent: Option<&PendingDelta>,
+        delta: &PendingDelta,
+        env: ExecEnv,
+        tx_idx: TxIndex,
+        tx_position: BPosition,
+        inbound_envelope: &TxEnvelope,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+        // EIP-7928 capture (spec: bal-attribution-parallel-validation):
+        // when set, every account/slot this tx touched is recorded into
+        // the block's Bal under `bal_index` (1-based tx position per
+        // revm's convention) — writes as (index, value), read-only
+        // accesses into storage_reads. revm classifies from
+        // original-vs-present in `outcome.state`.
+        bal: Option<(&mut revm::state::bal::Bal, u64)>,
+    ) -> Result<(Receipt, WriteSet), ExecutorError> {
+        let mut scope = Executor::new(snapshot, parent, env)?;
+        scope.seed_layer(delta)?;
+        scope.execute_tx(
+            tx_idx,
+            tx_position,
+            inbound_envelope,
+            tx_index_in_block,
+            cumulative_gas_used_before,
+            bal,
+            None,
+        )
+    }
 }
 
-/// Build the deterministic SKIP receipt for a canonical record that is
-/// invalid at execution (#92): `status=false, gas_used=0` (the wire-visible
-/// marker — real execution always charges intrinsic gas), empty logs, EMPTY
-/// write set (`WriteSet::default().hash()` on both the live and re-exec
-/// sides), gas accounting unchanged. Loud by design: log + counter — a skip
-/// existing at all means an upstream guard (sequencer nonce fence, cluster
-/// dedup, resync floors) let an invalid record reach the canonical log.
-/// Public: the Block-STM engine (`kardamom-stm`) produces the identical
-/// skip artifact on its parallel path — one definition, one wire shape.
-#[allow(clippy::too_many_arguments)]
-pub fn invalid_skip(
-    tx_position: BPosition,
-    inbound_envelope: &TxEnvelope,
-    nonce: u64,
-    to: Option<Address>,
-    block_number: u64,
-    tx_index_in_block: u64,
-    cumulative_gas_used_before: u64,
-) -> (Receipt, WriteSet) {
-    let ws = WriteSet::default();
-    let write_set_hash = ws.hash();
-    let receipt = Receipt {
-        tx_idx: tx_position,
-        tx_hash: inbound_envelope.tx_hash,
-        tx_type: kardamom_types::tx_type_of(&inbound_envelope.raw_tx),
-        status: false,
-        gas_used: 0,
-        logs: Vec::new(),
-        write_set_hash,
-        nonce,
-        from: inbound_envelope.sender,
-        to,
-        contract_address: None,
-        effective_gas_price: 0,
-        block_number,
-        transaction_index: tx_index_in_block,
-        cumulative_gas_used: cumulative_gas_used_before,
-    };
-    (receipt, ws)
+/// The deterministic SKIP receipt, as an associated constructor (no state
+/// access): the Block-STM engine builds skip receipts inside its own
+/// worker EVM and must keep ONE definition of the skip artifact.
+impl<S: StateDatabase> Executor<S> {
+    /// Build the deterministic SKIP receipt for a canonical record that is
+    /// invalid at execution (#92): `status=false, gas_used=0` (the
+    /// wire-visible marker — real execution always charges intrinsic
+    /// gas), empty logs, EMPTY write set (`WriteSet::default().hash()` on
+    /// both the live and re-exec sides), gas accounting unchanged. Loud
+    /// by design: a skip existing at all means an upstream guard let an
+    /// invalid record reach the canonical log.
+    #[allow(clippy::too_many_arguments)]
+    pub fn skip_receipt(
+        tx_position: BPosition,
+        inbound_envelope: &TxEnvelope,
+        nonce: u64,
+        to: Option<Address>,
+        block_number: u64,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+    ) -> (Receipt, WriteSet) {
+        let ws = WriteSet::default();
+        let write_set_hash = ws.hash();
+        let receipt = Receipt {
+            tx_idx: tx_position,
+            tx_hash: inbound_envelope.tx_hash,
+            tx_type: kardamom_types::tx_type_of(&inbound_envelope.raw_tx),
+            status: false,
+            gas_used: 0,
+            logs: Vec::new(),
+            write_set_hash,
+            nonce,
+            from: inbound_envelope.sender,
+            to,
+            contract_address: None,
+            effective_gas_price: 0,
+            block_number,
+            transaction_index: tx_index_in_block,
+            cumulative_gas_used: cumulative_gas_used_before,
+        };
+        (receipt, ws)
+    }
+
+    /// [`Self::skip_receipt`] with this executor's block number.
+    #[allow(clippy::too_many_arguments)]
+    pub fn skip(
+        &self,
+        tx_position: BPosition,
+        inbound_envelope: &TxEnvelope,
+        nonce: u64,
+        to: Option<Address>,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+    ) -> (Receipt, WriteSet) {
+        Self::skip_receipt(
+            tx_position,
+            inbound_envelope,
+            nonce,
+            to,
+            self.env.block_number,
+            tx_index_in_block,
+            cumulative_gas_used_before,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -464,7 +493,7 @@ mod tests {
         let env = ExecEnv::new(1, &boundary(1));
 
         let stale = signed_transfer(&signer, to, 1_000, 3);
-        let (receipt, ws) = execute_tx(
+        let (receipt, ws) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -494,7 +523,7 @@ mod tests {
         // The chain continues: the sender's REAL next tx (nonce 5) executes.
         let env2 = ExecEnv::new(1, &boundary(1));
         let live = signed_transfer(&signer, to, 1_000, 5);
-        let (r2, _) = execute_tx(
+        let (r2, _) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -523,7 +552,7 @@ mod tests {
             sender: signer.address(),
             tx_hash: keccak256([0xde, 0xad, 0xbe, 0xef]),
         };
-        let (receipt, ws) = execute_tx(
+        let (receipt, ws) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -555,7 +584,7 @@ mod tests {
         let env = ExecEnv::new(1, &boundary(1));
 
         let env_tx = signed_transfer(&signer, to, 1_000, 0);
-        let (receipt, ws) = execute_tx(
+        let (receipt, ws) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -607,7 +636,7 @@ mod tests {
         let mut delta = PendingDelta::new();
         // First transfer.
         let tx1 = signed_transfer(&signer, to, 100, 0);
-        let (r1, ws1) = execute_tx(
+        let (r1, ws1) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -630,7 +659,7 @@ mod tests {
         // Second transfer from the same sender; nonce must be 1, sender
         // balance must already be debited 100.
         let tx2 = signed_transfer(&signer, to, 50, 1);
-        let (r2, ws2) = execute_tx(
+        let (r2, ws2) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -670,7 +699,7 @@ mod tests {
         let tx = signed_transfer(&signer, to, 1_000, 0);
 
         let mut bal = revm::state::bal::Bal::new();
-        let (_receipt, ws) = execute_tx(
+        let (_receipt, ws) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -719,7 +748,7 @@ mod tests {
         // tx1 populates the delta (as in a real block).
         let tx1 = signed_transfer(&signer, to, 1_000, 0);
         let mut bal = revm::state::bal::Bal::new();
-        let (_r1, ws1) = execute_tx(
+        let (_r1, ws1) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -737,7 +766,7 @@ mod tests {
 
         // tx2 runs with the seeded delta — the production path.
         let tx2 = signed_transfer(&signer, to, 500, 1);
-        let (_r2, ws2) = execute_tx(
+        let (_r2, ws2) = Executor::execute_once(
             &snap,
             None,
             &delta,

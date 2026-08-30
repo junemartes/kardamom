@@ -11,7 +11,7 @@ use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::error::ExecutorError;
 use kardamom_engine::exec_types::TxIndex;
-use kardamom_engine::executor::{execute_deposit_tx, execute_tx};
+use kardamom_engine::executor::{Executor, execute_deposit_tx};
 use kardamom_engine::state::MockStateDatabase;
 use kardamom_types::{BPosition, BlockBoundaryStart, Deposit, StateDatabase, TxEnvelope};
 
@@ -106,7 +106,7 @@ fn exec_record<S: StateDatabase>(
             tx_idx,
             envelope,
             position,
-        } => execute_tx(
+        } => Executor::execute_once(
             snap,
             parent,
             delta,

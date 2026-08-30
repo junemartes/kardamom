@@ -116,7 +116,7 @@ pub fn execute_batch<S: StateDatabase>(
     // ONE execution scope per batch (EVM + commit-into cache reused across
     // the batch's txs — the per-tx construction was ~90% of execution-path
     // allocation). The seed layer plays the parent role.
-    let mut scope = kardamom_engine::executor::ExecScope::new(snapshot, Some(seed), env)?;
+    let mut scope = kardamom_engine::executor::Executor::new(snapshot, Some(seed), env)?;
     for (i, rec) in records.iter().enumerate() {
         let bal_index = first_index + i as u64;
         let global_index_in_block = bal_index - 1;
