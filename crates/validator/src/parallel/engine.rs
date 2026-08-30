@@ -127,10 +127,6 @@ pub fn execute_batch<S: StateDatabase>(
         // construction is the only drift-proof comparison.
         let (receipt, ws) = execute_record_in_scope(
             &mut scope,
-            snapshot,
-            Some(seed),
-            &delta,
-            env,
             rec,
             global_index_in_block,
             cumulative,

@@ -273,4 +273,120 @@ mod tests {
             "got {err:?}"
         );
     }
+
+    /// THE EQUIVALENCE GATE for the on-scope deposit path (#234 part 2):
+    /// the historic fresh-cache path and `Executor::execute_deposit` must
+    /// produce byte-identical artifacts — receipt (write_set_hash
+    /// included), WriteSet, and BAL claims — across the shapes that can
+    /// diverge: a plain mint, a storage-WRITING call, a storage-READING
+    /// call (the fresh cache cached reads into the artifact), a
+    /// reverting call (mint survives), and a deposit AFTER a prior write
+    /// on the same scope.
+    #[test]
+    fn old_and_new_deposit_paths_agree() {
+        use crate::executor::Executor;
+
+        // Contract A: SSTORE(0x01, CALLVALUE) — a writing call.
+        let write_code = AlloyBytes::from(vec![0x34, 0x60, 0x01, 0x55, 0x00]);
+        // Contract B: SLOAD(0x01); POP; STOP — a reading call.
+        let read_code = AlloyBytes::from(vec![0x60, 0x01, 0x54, 0x50, 0x00]);
+        // Contract C: REVERT(0,0).
+        let revert_code = AlloyBytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]);
+
+        let mk = |code: &AlloyBytes| {
+            let bc = Bytecode::new_raw(code.clone());
+            (bc.hash_slow(), bc)
+        };
+        let (wh, wb) = mk(&write_code);
+        let (rh, rb) = mk(&read_code);
+        let (vh, vb) = mk(&revert_code);
+        let (a_write, a_read, a_rev) = (
+            Address::from([0xA1u8; 20]),
+            Address::from([0xA2u8; 20]),
+            Address::from([0xA3u8; 20]),
+        );
+        let from = Address::from([0x11u8; 20]);
+        let plain_to = Address::from([0x22u8; 20]);
+
+        let snap = MockStateDatabase::builder()
+            .account(a_write, U256::ZERO, 1, wh)
+            .code(wh, Bytes::copy_from_slice(wb.original_bytes().as_ref()))
+            .account(a_read, U256::ZERO, 1, rh)
+            .code(rh, Bytes::copy_from_slice(rb.original_bytes().as_ref()))
+            .account(a_rev, U256::ZERO, 1, vh)
+            .code(vh, Bytes::copy_from_slice(vb.original_bytes().as_ref()))
+            .storage(
+                a_read,
+                alloy_primitives::B256::with_last_byte(1),
+                U256::from(77u64),
+            )
+            .build();
+        let env = ExecEnv::new(1, &boundary(1));
+
+        let cases = [
+            (
+                "plain mint",
+                dep(from, Some(plain_to), 1_000, 400, Bytes::new()),
+            ),
+            (
+                "writing call",
+                dep(from, Some(a_write), 1_000, 5, Bytes::new()),
+            ),
+            (
+                "reading call",
+                dep(from, Some(a_read), 1_000, 0, Bytes::new()),
+            ),
+            (
+                "reverting call",
+                dep(from, Some(a_rev), 1_000, 200, Bytes::new()),
+            ),
+        ];
+
+        // A prior write on the delta/scope, so the on-scope path runs over
+        // a non-empty cache exactly like a mid-block deposit does.
+        let mut prior = PendingDelta::new();
+        {
+            let mut ws0 = crate::delta::WriteSet::default();
+            ws0.accounts.push((
+                Address::from([0x77u8; 20]),
+                (3, U256::from(9u64), KECCAK_EMPTY),
+            ));
+            ws0.finish();
+            prior.apply(ws0);
+        }
+
+        for (name, d) in cases {
+            // OLD: fresh cache over snapshot ∘ prior.
+            let mut old_bal = revm::state::bal::Bal::new();
+            let (old_r, old_ws) = execute_deposit_tx(
+                &snap,
+                None,
+                &prior,
+                env,
+                TxIndex(0),
+                pos(0),
+                &d,
+                0,
+                0,
+                Some((&mut old_bal, 1)),
+            )
+            .unwrap_or_else(|e| panic!("{name}: old path failed: {e:?}"));
+
+            // NEW: on a scope seeded with the same prior layer.
+            let mut scope = Executor::new(&snap, None, env).expect("scope");
+            scope.seed_layer(&prior).expect("seed");
+            let mut new_bal = revm::state::bal::Bal::new();
+            let (new_r, new_ws) = scope
+                .execute_deposit(TxIndex(0), pos(0), &d, 0, 0, Some((&mut new_bal, 1)))
+                .unwrap_or_else(|e| panic!("{name}: new path failed: {e:?}"));
+
+            assert_eq!(new_ws, old_ws, "{name}: WriteSet diverges");
+            assert_eq!(new_r, old_r, "{name}: Receipt diverges");
+            let (mut o, mut n) = (alloc::vec::Vec::new(), alloc::vec::Vec::new());
+            use alloy_rlp::Encodable;
+            old_bal.into_alloy_bal().encode(&mut o);
+            new_bal.into_alloy_bal().encode(&mut n);
+            assert_eq!(n, o, "{name}: BAL claims diverge");
+        }
+    }
 }

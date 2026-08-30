@@ -46,6 +46,47 @@ impl WriteSet {
     pub fn from_evm_state(state: &revm::state::EvmState) -> Self {
         write_set_from_evm_state_inner(state)
     }
+
+    /// [`Self::from_evm_state`] with DEPOSIT artifact fidelity: every
+    /// accessed slot of a touched account is emitted, read-only slots
+    /// included, at the present value. The historic deposit path derived
+    /// its WriteSet from a fresh `CacheDB` (which caches reads), so the
+    /// wire artifact — `write_set_hash`, and the BAL claims built from it
+    /// — includes read slots. The on-scope deposit path must keep that
+    /// artifact byte-identical; the old-vs-new equivalence test in
+    /// `deposit.rs` is the gate.
+    pub fn from_evm_state_deposit(state: &revm::state::EvmState) -> Self {
+        let mut ws = write_set_from_evm_state_inner(state);
+        // Re-walk for the artifact parts the per-tx filter drops:
+        // read-only slots, and the code bytes of CALLED contracts (the
+        // fresh cache carried both — reads land in the cache, and a
+        // called contract's bytecode lands in `cache.contracts`).
+        for (addr, account) in state.iter() {
+            if !account.is_touched() {
+                continue;
+            }
+            for (key, slot) in account.storage.iter() {
+                if slot.original_value == slot.present_value {
+                    let b_key = alloy_primitives::B256::from(key.to_be_bytes::<32>());
+                    ws.storage.push(((*addr, b_key), slot.present_value));
+                }
+            }
+            let info = &account.info;
+            if !account.is_created()
+                && info.code_hash != KECCAK_EMPTY
+                && let Some(code) = info.code.as_ref()
+                && !code.is_empty()
+                && !ws.code.iter().any(|(h, _)| *h == info.code_hash)
+            {
+                ws.code.push((
+                    info.code_hash,
+                    Bytes::copy_from_slice(code.original_bytes().as_ref()),
+                ));
+            }
+        }
+        ws.finish();
+        ws
+    }
 }
 
 fn record_writeset_into_bal_inner(bal: &mut revm::state::bal::Bal, bal_index: u64, ws: &WriteSet) {

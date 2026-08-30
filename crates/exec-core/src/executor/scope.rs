@@ -18,7 +18,7 @@ use crate::error::ExecutorError;
 use crate::exec_types::{ReceiptStatus, TxIndex};
 
 use super::db::{SnapshotDb, seed_cache_layer};
-use super::tx_env::DecodedTx;
+use super::tx_env::{DecodedTx, tx_env_from_deposit};
 
 /// Per-tx READ-touch capture for the footprint shadow scheduler
 /// (spec: block-stm-executor §P1). The block-level EIP-7928 BAL cannot
@@ -113,6 +113,128 @@ impl<S: StateDatabase> Executor<S> {
     pub fn seed_layer(&mut self, layer: &PendingDelta) -> Result<(), ExecutorError> {
         let cache = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
         seed_cache_layer(cache, layer).map_err(ExecutorError::State)
+    }
+
+    /// Execute a DEPOSIT on this block scope. The historic free function
+    /// (`execute_deposit_tx`, kept as the equivalence reference) rebuilt a
+    /// fresh `CacheDB` and re-seeded parent + delta for every deposit; on
+    /// the scope, the block cache is reused and only the nonce check is
+    /// toggled for the inner call (deposits carry no nonce).
+    ///
+    /// Artifact contract: receipt, `WriteSet` (read slots included — see
+    /// [`WriteSet::from_evm_state_deposit`]), `write_set_hash`, and the
+    /// BAL claims are BYTE-IDENTICAL to the historic path; the
+    /// `old_and_new_deposit_paths_agree` test in `deposit.rs` is the gate.
+    ///
+    /// Error paths fail-stop the pipeline (deposits have no skip
+    /// semantics), so a mint committed before a failed inner call cannot
+    /// leak into a later tx: nothing later runs.
+    pub fn execute_deposit(
+        &mut self,
+        tx_idx: TxIndex,
+        tx_position: BPosition,
+        deposit: &kardamom_types::Deposit,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+        bal: Option<(&mut revm::state::bal::Bal, u64)>,
+    ) -> Result<(Receipt, WriteSet), ExecutorError> {
+        use revm::context::result::ExecutionResult;
+
+        // (1) Mint pre-credit, committed unconditionally — the mint is
+        // durable regardless of inner-call outcome.
+        let cache = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
+        let mut info = revm::Database::basic(cache, deposit.from)
+            .map_err(|e| ExecutorError::Execution {
+                idx: tx_idx,
+                detail: format!("basic({:?}): {e:?}", deposit.from),
+            })?
+            .unwrap_or_default();
+        info.balance = info
+            .balance
+            .checked_add(alloy_primitives::U256::from(deposit.mint))
+            .ok_or_else(|| ExecutorError::Execution {
+                idx: tx_idx,
+                detail: format!(
+                    "mint overflow: account {:?} balance + mint {} would exceed U256::MAX",
+                    deposit.from, deposit.mint
+                ),
+            })?;
+        let mut acct = revm::state::Account::from(info);
+        acct.mark_touch();
+        revm::DatabaseCommit::commit(cache, core::iter::once((deposit.from, acct)).collect());
+
+        // (2) Inner call with the nonce check off. The toggle-restore pair
+        // has NO fallible call between toggle and restore: an early return
+        // with the toggle still set would run every later tx in the block
+        // without nonce validation.
+        let tx_env = tx_env_from_deposit(deposit);
+        (*self.evm).modify_cfg(|c| c.disable_nonce_check = true);
+        let result = self.evm.transact(tx_env);
+        (*self.evm).modify_cfg(|c| c.disable_nonce_check = false);
+        let outcome = result.map_err(|e| ExecutorError::Execution {
+            idx: tx_idx,
+            detail: format!("{e:?}"),
+        })?;
+
+        let gas_used = outcome.result.gas().tx_gas_used();
+        let (status_success, logs) = match &outcome.result {
+            ExecutionResult::Success { logs, .. } => (true, logs.clone()),
+            ExecutionResult::Revert { .. } => (false, alloc::vec::Vec::new()),
+            ExecutionResult::Halt { .. } => (false, alloc::vec::Vec::new()),
+        };
+
+        // (3) The deposit artifact keeps read slots (see the extractor
+        // doc). Capture before the commit consumes the state.
+        let mut ws = WriteSet::from_evm_state_deposit(&outcome.state);
+        revm::DatabaseCommit::commit(
+            revm::context_interface::ContextTr::db_mut(&mut *self.evm),
+            outcome.state,
+        );
+        // The sender always carries the mint in the artifact, even when
+        // the inner call never touched it.
+        if !ws.accounts.iter().any(|(a, _)| *a == deposit.from) {
+            let cache = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
+            let info = revm::Database::basic(cache, deposit.from)
+                .map_err(|e| ExecutorError::Execution {
+                    idx: tx_idx,
+                    detail: format!("basic({:?}): {e:?}", deposit.from),
+                })?
+                .unwrap_or_default();
+            ws.accounts
+                .push((deposit.from, (info.nonce, info.balance, info.code_hash)));
+            ws.finish();
+        }
+        if let Some((bal, bal_index)) = bal {
+            ws.record_into_bal(bal, bal_index);
+        }
+
+        let write_set_hash = ws.hash();
+        let wire_logs: alloc::vec::Vec<kardamom_types::WireLog> =
+            logs.iter().map(kardamom_types::WireLog::from).collect();
+        let cumulative_gas_used = cumulative_gas_used_before + gas_used;
+        let receipt = Receipt {
+            tx_idx: tx_position,
+            // Deposits' canonical id is the OP source_hash, NOT a 2718
+            // keccak.
+            tx_hash: deposit.source_hash,
+            // L1-originated: consumes no L2 nonce (the filler `nonce: 0`
+            // is NOT a real nonce — consumers branch on the type).
+            tx_type: kardamom_types::TX_TYPE_DEPOSIT,
+            status: status_success,
+            gas_used,
+            logs: wire_logs,
+            write_set_hash,
+            nonce: 0,
+            from: deposit.from,
+            to: deposit.to,
+            contract_address: None,
+            // Deposits pay no fee.
+            effective_gas_price: 0,
+            block_number: self.env.block_number,
+            transaction_index: tx_index_in_block,
+            cumulative_gas_used,
+        };
+        Ok((receipt, ws))
     }
 
     #[allow(clippy::too_many_arguments)] // the per-tx entry point's shape;

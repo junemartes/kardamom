@@ -266,10 +266,6 @@ fn run_one<S: StateDatabase + Clone + Sync + 'static>(
                 let mut frag = revm::state::bal::Bal::new();
                 let (receipt, ws) = execute_record_in_scope(
                     &mut scope,
-                    &req.snapshot,
-                    Some(&merged),
-                    &PendingDelta::new(),
-                    req.env,
                     &rec,
                     at,
                     cumulative,
