@@ -18,7 +18,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use alloy_primitives::keccak256;
 use kardamom_engine::actor::{BlockExec, BufferedRecord};
@@ -170,10 +169,12 @@ pub fn assemble_prover_input(
     }
 }
 
-/// Spawn the spool task. Polls the writer's snapshot channel; for each
-/// observed snapshot at block M, tries to prove block M+1 (records from
+/// Spawn the spool task. Parks on the writer's snapshot watch; for each
+/// published snapshot at block M, tries to prove block M+1 (records from
 /// the flight ring) against that PINNED snapshot. Blocks whose window was
-/// skipped are counted and dropped.
+/// skipped are counted and dropped — the watch slot is latest-wins, so a
+/// slow spool can still land past intermediate snapshots, but the wake is
+/// now per publish instead of a 100 ms timer.
 pub fn spawn_prover_spool(
     spool_dir: PathBuf,
     chain_id: u64,
@@ -181,13 +182,16 @@ pub fn spawn_prover_spool(
     flight: Arc<FlightRing>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        const TICK: Duration = Duration::from_millis(100);
+        let mut watch = snap_rx.watch();
         // The next block to prove; its pre-state snapshot is `pending - 1`.
         let mut pending: Option<u64> = None;
         let mut held: Option<StateSnapshot> = None;
         loop {
-            tokio::time::sleep(TICK).await;
-            let Some(snap) = snap_rx.current() else {
+            // Writer gone => the chain is shutting down; exit the task.
+            if watch.changed().await.is_err() {
+                return;
+            }
+            let Some(snap) = watch.borrow_and_update().clone() else {
                 continue;
             };
             let at = snap.block_number();

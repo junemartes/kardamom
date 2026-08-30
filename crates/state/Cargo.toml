@@ -36,7 +36,7 @@ signet-libmdbx = "0.8"
 rkyv.workspace = true
 thiserror.workspace = true
 # Checkpoint peer server (`checkpoint_transfer`): tokio listener + per-connection tasks.
-tokio = { workspace = true, features = ["net", "rt", "io-util", "macros", "time", "fs"] }
+tokio = { workspace = true, features = ["net", "rt", "io-util", "macros", "time", "fs", "sync"] }
 tracing.workspace = true
 
 [dev-dependencies]

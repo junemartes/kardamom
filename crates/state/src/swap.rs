@@ -5,12 +5,17 @@
 //! to the new one. Old snapshots are dropped, which releases their mdbx RO
 //! txn and lets the freelist reclaim the corresponding pages.
 //!
-//! Implementation: zero async, single-producer/single-consumer, both ends
-//! on plain threads. This is a "latest value wins" slot, which no crossbeam
-//! channel provides (they are FIFO queues): the newest snapshot lives in an
-//! `ArcSwapOption` (lock-free load, one atomic swap to publish) and a
-//! length-1 crossbeam channel wakes the consumer; a pending wake coalesces
-//! with the next.
+//! Implementation: the sync path has zero async, single-producer/
+//! single-consumer, both ends on plain threads. This is a "latest value
+//! wins" slot, which no crossbeam channel provides (they are FIFO
+//! queues): the newest snapshot lives in an `ArcSwapOption` (lock-free
+//! load, one atomic swap to publish) and a length-1 crossbeam channel
+//! wakes the sync consumer (the exec thread); a pending wake coalesces
+//! with the next. An async half mirrors every publish into a
+//! `tokio::sync::watch` slot: async consumers (prover spool, commit
+//! poller) park on `changed()` instead of polling `current()` on a
+//! timer. `watch::Sender` needs no runtime to send, so the writer
+//! thread stays runtime-free.
 
 use std::sync::Arc;
 
@@ -23,6 +28,7 @@ use crate::snapshot::StateSnapshot;
 pub struct SnapshotHandle {
     latest: Arc<ArcSwapOption<StateSnapshot>>,
     notify: crossbeam_channel::Sender<()>,
+    watch: tokio::sync::watch::Sender<Option<StateSnapshot>>,
 }
 
 /// Consumer side. The executor calls `recv()` to block on the next snapshot,
@@ -31,18 +37,25 @@ pub struct SnapshotHandle {
 pub struct SnapshotReceiver {
     latest: Arc<ArcSwapOption<StateSnapshot>>,
     notify: crossbeam_channel::Receiver<()>,
+    watch: tokio::sync::watch::Receiver<Option<StateSnapshot>>,
 }
 
 /// Create a fresh swap channel. Returns the producer + consumer ends.
 pub fn channel() -> (SnapshotHandle, SnapshotReceiver) {
     let latest = Arc::new(ArcSwapOption::empty());
     let (tx, rx) = crossbeam_channel::bounded(1);
+    let (wtx, wrx) = tokio::sync::watch::channel(None);
     (
         SnapshotHandle {
             latest: latest.clone(),
             notify: tx,
+            watch: wtx,
         },
-        SnapshotReceiver { latest, notify: rx },
+        SnapshotReceiver {
+            latest,
+            notify: rx,
+            watch: wrx,
+        },
     )
 }
 
@@ -51,6 +64,10 @@ impl SnapshotHandle {
     /// which releases its mdbx RO txn — exactly the desired behavior since
     /// the consumer only ever needs the freshest one.
     pub fn publish(&self, snapshot: StateSnapshot) {
+        // The watch slot gets a clone (clones share the inner Arc, so both
+        // slots pin ONE mdbx RO txn). send_replace drops the prior value
+        // even with zero receivers.
+        self.watch.send_replace(Some(snapshot.clone()));
         // `store` drops the previous value once no `load` guard holds it.
         self.latest.store(Some(Arc::new(snapshot)));
         // try_send: if the slot is full, the receiver has not consumed yet —
@@ -72,6 +89,14 @@ impl SnapshotReceiver {
     pub fn recv(&self) -> Option<StateSnapshot> {
         self.notify.recv().ok()?;
         self.current()
+    }
+
+    /// The async half: a `watch` receiver over the same publishes. Async
+    /// consumers park on `changed().await` and read with
+    /// `borrow_and_update()` — no timer, no missed-publish dedup. The
+    /// slot is latest-wins, exactly like `current()`.
+    pub fn watch(&self) -> tokio::sync::watch::Receiver<Option<StateSnapshot>> {
+        self.watch.clone()
     }
 }
 
