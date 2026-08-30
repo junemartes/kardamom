@@ -11,6 +11,7 @@ use kardamom_log::config::ChannelsConfig;
 use kardamom_state::SnapshotReceiver;
 use kardamom_validator::attester::AttesterHandle;
 use kardamom_validator::{BalBuffer, ClaimBuffer, ReceiptBuffer, metrics};
+use tokio_util::sync::CancellationToken;
 
 /// tx_bal: per-block BlockDelta (BAL). Simple (multicast/IPC) subscription,
 /// wrapped in a SILENCE WATCHDOG (#144): a multicast image that never
@@ -24,17 +25,17 @@ use kardamom_validator::{BalBuffer, ClaimBuffer, ReceiptBuffer, metrics};
 /// The pump holds an AeronRuntime clone (needed to reopen), which is the
 /// documented SIGTERM-deadlock trap (see the tx_receipts comment on
 /// [`spawn_receipts_pump`]): the runtime only shuts down when its last clone
-/// drops. Hence the 5s wake tick + the `stop` flag, set BEFORE the main path
-/// drops `rt`, so this task releases its clone within one tick and graceful
-/// shutdown completes.
+/// drops. Hence the `shutdown` token: the main path cancels it BEFORE it
+/// drops `rt`, the `select!` below wakes at once, and this task releases
+/// its clone so graceful shutdown completes. No wake tick is needed —
+/// cancellation interrupts the `recv` directly.
 pub fn spawn_bal_pump(
     rt: &AeronRuntime,
     channels: &ChannelsConfig,
     bals: Arc<BalBuffer>,
     claims: Arc<ClaimBuffer>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
-    const BAL_TICK: Duration = Duration::from_secs(5);
     const BAL_SILENCE_REOPEN: Duration = Duration::from_secs(60);
     // BalFrame (spec: bal-attribution-parallel-validation): the merged
     // delta plus the EIP-7928 access list; the write-set cross-check
@@ -50,37 +51,31 @@ pub fn spawn_bal_pump(
     let bal_channel = channels.tx_bal_channel.clone();
     let bal_stream_id = channels.tx_bal_stream_id;
     tokio::spawn(async move {
-        let mut silent_for = Duration::ZERO;
         loop {
-            if stop.load(std::sync::atomic::Ordering::SeqCst) {
-                return; // release the runtime clone promptly on shutdown
-            }
-            let frame = match tokio::time::timeout(BAL_TICK, bal_rx.recv()).await {
-                Ok(Some((_pos, frame))) => {
-                    silent_for = Duration::ZERO;
-                    frame
-                }
+            let recv = tokio::select! {
+                biased;
+                // Release the runtime clone promptly on shutdown.
+                _ = shutdown.cancelled() => return,
+                r = tokio::time::timeout(BAL_SILENCE_REOPEN, bal_rx.recv()) => r,
+            };
+            let frame = match recv {
+                Ok(Some((_pos, frame))) => frame,
                 Ok(None) => return, // runtime shutting down
                 Err(_) => {
-                    silent_for += BAL_TICK;
-                    if silent_for >= BAL_SILENCE_REOPEN {
-                        silent_for = Duration::ZERO;
-                        metrics::counter_bal_sub_reopen();
-                        tracing::warn!(
-                            silence_s = BAL_SILENCE_REOPEN.as_secs(),
-                            "tx_bal silent — reopening the subscription \
-                             (never-joined or dead multicast image, #144)"
-                        );
-                        match bal_rt.open_subscription::<kardamom_types::BalFrame>(
-                            &bal_channel,
-                            bal_stream_id,
-                        ) {
-                            Ok(rx) => bal_rx = rx,
-                            Err(e) => tracing::warn!(
-                                error = %e,
-                                "tx_bal reopen failed; retrying after the next window"
-                            ),
-                        }
+                    metrics::counter_bal_sub_reopen();
+                    tracing::warn!(
+                        silence_s = BAL_SILENCE_REOPEN.as_secs(),
+                        "tx_bal silent — reopening the subscription \
+                         (never-joined or dead multicast image, #144)"
+                    );
+                    match bal_rt
+                        .open_subscription::<kardamom_types::BalFrame>(&bal_channel, bal_stream_id)
+                    {
+                        Ok(rx) => bal_rx = rx,
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "tx_bal reopen failed; retrying after the next window"
+                        ),
                     }
                     continue;
                 }
@@ -139,19 +134,28 @@ pub fn spawn_bal_pump(
 /// the join below never returned) while the executor — which publishes
 /// receipts rather than subscribing — shut down fine. MDS destinations are
 /// attached inside `open_tx_receipts`, so nothing needs the clone after
-/// this point.
+/// this point. The `shutdown` token is a second, explicit exit so the pump
+/// stops at the same moment as the others instead of waiting for `recv` to
+/// observe the runtime teardown.
 pub fn spawn_receipts_pump(
     rt: &AeronRuntime,
     channels: &ChannelsConfig,
     executor_count_flag: Option<u32>,
     receipts: Arc<ReceiptBuffer>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     let executor_count = executor_count_flag.unwrap_or(channels.tx_receipts_executor_count);
     let mut rx = TxReceiptsSubscriberHandle::open_auto(rt, channels, executor_count)
         .context("open tx_receipts")?
         .into_receiver();
     tokio::spawn(async move {
-        while let Some((_pos, r)) = rx.recv().await {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                r = rx.recv() => r,
+            };
+            let Some((_pos, r)) = next else { return };
             receipts.insert(r);
         }
     });
@@ -163,10 +167,17 @@ pub fn spawn_receipts_pump(
 /// `validator_state_root_block` is set only when the committed snapshot
 /// actually yielded a root — an independent measurement, not a mirror of
 /// the committed-block gauge.
-pub fn spawn_commit_poller(snap_rx: SnapshotReceiver, attester_handle: Option<AttesterHandle>) {
+pub fn spawn_commit_poller(
+    snap_rx: SnapshotReceiver,
+    attester_handle: Option<AttesterHandle>,
+    shutdown: CancellationToken,
+) {
     tokio::spawn(async move {
         let mut last = 0u64;
         loop {
+            if shutdown.is_cancelled() {
+                return;
+            }
             if let Some(snap) = snap_rx.current() {
                 let block = snap.block_number();
                 if block != last {
@@ -187,7 +198,10 @@ pub fn spawn_commit_poller(snap_rx: SnapshotReceiver, attester_handle: Option<At
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
         }
     });
 }

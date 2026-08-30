@@ -11,12 +11,11 @@
 //! trie-aware vs plain writer) stays in each binary.
 
 use std::path::Path;
-use std::sync::mpsc as sync_mpsc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use kardamom_log::aeron_live::{AeronRuntime, TxDataSubscriberHandle};
+use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::{AeronConfig, ChannelsConfig};
 use kardamom_log::refetch::{ArchiveRefetcher, RefetchConfig};
 use kardamom_state::Durability;
@@ -148,15 +147,17 @@ pub fn bounded_join_timeout(resuming: bool) -> Duration {
 }
 
 // ---------------------------------------------------------------------------
-// Async log handles → sync engine traits, with the per-shard pump tasks.
+// Async log handles → sync engine traits.
 // ---------------------------------------------------------------------------
 
 /// The live tx_data subscription both role binaries run: one Aeron
-/// subscriber handle per shard, async→sync bridged through a pump task.
+/// subscriber channel per shard. The Aeron reader thread sends into a tokio
+/// channel; the engine's reader thread blocks on it with `blocking_recv`, so
+/// no pump task sits between them.
 /// Public so a binary's `EngineWiring` can name it as its `TxData` type.
 pub struct LiveTxDataSub {
     sequencer_id: u8,
-    rx: sync_mpsc::Receiver<(TxDataLoc, TxEnvelope)>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<(TxDataLoc, TxEnvelope)>,
 }
 
 impl TxDataSubscription for LiveTxDataSub {
@@ -165,16 +166,16 @@ impl TxDataSubscription for LiveTxDataSub {
     }
 
     fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError> {
-        self.rx.recv().map_err(|_| ExecutorError::TxDataClosed {
+        self.rx.blocking_recv().ok_or(ExecutorError::TxDataClosed {
             sequencer_id: self.sequencer_id,
         })
     }
 }
 
-/// Open the M per-shard tx_data subscriptions, bridging each handle's async
-/// `recv()` to the synchronous `next()` the engine's reader threads expect
-/// (dedicated tokio pump task per shard; must be called inside a tokio
-/// runtime).
+/// Open the M per-shard tx_data subscriptions. Each hands the engine's
+/// reader thread the subscription's tokio receiver directly; the reader
+/// blocks on it off-runtime. Dropping the [`AeronRuntime`] closes every
+/// subscription's sender, so `next()` then returns `TxDataClosed`.
 ///
 /// ALWAYS live multicast — including on a crash-recovery resume. The old
 /// resume path opened an archive replay-merge against the LOCAL node's
@@ -189,24 +190,20 @@ pub fn open_tx_data_subs(
     channels: &ChannelsConfig,
     shards: u8,
 ) -> Result<Vec<LiveTxDataSub>> {
-    let mut tx_data_subs: Vec<LiveTxDataSub> = Vec::with_capacity(shards as usize);
-    for shard_id in 0..shards {
-        let (tx, rx) = sync_mpsc::channel::<(TxDataLoc, TxEnvelope)>();
-        let mut handle = TxDataSubscriberHandle::open(rt, channels, shard_id)
-            .with_context(|| format!("open TxDataSubscriberHandle shard={shard_id}"))?;
-        tokio::spawn(async move {
-            while let Some(item) = handle.recv().await {
-                if tx.send(item).is_err() {
-                    break;
-                }
-            }
-        });
-        tx_data_subs.push(LiveTxDataSub {
-            sequencer_id: shard_id,
-            rx,
-        });
-    }
-    Ok(tx_data_subs)
+    (0..shards)
+        .map(|shard_id| {
+            let rx = rt
+                .open_tx_data_subscription(
+                    &channels.tx_data_channel(shard_id),
+                    channels.tx_data_stream_id(shard_id),
+                )
+                .with_context(|| format!("open tx_data subscription shard={shard_id}"))?;
+            Ok(LiveTxDataSub {
+                sequencer_id: shard_id,
+                rx,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

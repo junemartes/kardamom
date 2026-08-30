@@ -6,7 +6,9 @@ use std::net::{SocketAddr, TcpListener};
 #[tokio::test]
 async fn da_watcher_metrics_endpoint_serves_expected_counters() {
     let addr = free_port();
-    kardamom_obs::init("da-watcher", addr, "local", "test", "test").expect("init");
+    kardamom_obs::init("da-watcher", addr, "local", "test", "test")
+        .await
+        .expect("init");
 
     // Touch the counter so the describe call registers it.
     ::metrics::counter!(

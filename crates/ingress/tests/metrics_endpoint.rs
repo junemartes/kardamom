@@ -6,7 +6,9 @@ use std::net::{SocketAddr, TcpListener};
 #[tokio::test]
 async fn ingress_metrics_endpoint_serves_expected_counters() {
     let addr = free_port();
-    kardamom_obs::init("ingress", addr, "local", "test", "test").expect("init");
+    kardamom_obs::init("ingress", addr, "local", "test", "test")
+        .await
+        .expect("init");
 
     // Touch the counter the ingress crate is expected to publish so the
     // describe_counter call doesn't require driving the full binary.

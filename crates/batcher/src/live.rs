@@ -27,9 +27,9 @@ use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result, bail};
-use crossbeam_channel::{Receiver, RecvTimeoutError};
 use metrics::{counter, gauge};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::Receiver;
 use tracing::{info, warn};
 
 use kardamom_engine::bin_support;
@@ -209,7 +209,6 @@ pub fn reconcile(cursor: Option<BatchCursor>, l1: L1Truth) -> Result<(BatchCurso
 /// serialized by the contract CAS, persisting the cursor only after a
 /// confirmed post.
 pub struct LiveSender<P> {
-    handle: tokio::runtime::Handle,
     provider: P,
     settlement: Address,
     da_store: FsBlobStore,
@@ -219,9 +218,7 @@ pub struct LiveSender<P> {
 }
 
 impl<P: Provider> LiveSender<P> {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        handle: tokio::runtime::Handle,
         provider: P,
         settlement: Address,
         da_store: FsBlobStore,
@@ -230,7 +227,6 @@ impl<P: Provider> LiveSender<P> {
         cursor_path: PathBuf,
     ) -> Self {
         Self {
-            handle,
             provider,
             settlement,
             da_store,
@@ -246,17 +242,22 @@ impl<P: Provider> LiveSender<P> {
     /// timeout, CAS revert of the duplicate) counts as success. Any foreign
     /// advance of `lastBatchIndex` is fatal — the batcher is single-instance
     /// and the CAS exists to make that race loud.
-    pub fn post_confirmed(&mut self, batch: &PostedBatch, mut cursor: BatchCursor) -> Result<()> {
+    pub async fn post_confirmed(
+        &mut self,
+        batch: &PostedBatch,
+        mut cursor: BatchCursor,
+    ) -> Result<()> {
         cursor.last_batch_index = self.prev_index + 1;
         let mut attempt: u32 = 0;
         loop {
-            let res = self.handle.block_on(post_batch(
+            let res = post_batch(
                 &self.provider,
                 self.settlement,
                 self.prev_index,
                 batch,
                 &self.da_store,
-            ));
+            )
+            .await;
             match res {
                 Ok(next) => {
                     self.prev_index = next;
@@ -266,9 +267,7 @@ impl<P: Provider> LiveSender<P> {
                     // Before retrying, ask the chain whether our tx actually
                     // landed (receipt timeout / StaleBatchIndex revert of a
                     // duplicate send both look like errors locally).
-                    let truth = self
-                        .handle
-                        .block_on(read_l1_truth(&self.provider, self.settlement));
+                    let truth = read_l1_truth(&self.provider, self.settlement).await;
                     match truth {
                         Ok(t) if t.last_batch_index == self.prev_index + 1 => {
                             if t.covered_through_block == batch.l2_block_end {
@@ -314,7 +313,7 @@ impl<P: Provider> LiveSender<P> {
                         error = %format!("{e:#}"),
                         "L1 post failed; retrying"
                     );
-                    std::thread::sleep(backoff);
+                    tokio::time::sleep(backoff).await;
                 }
             }
         }
@@ -349,11 +348,12 @@ pub struct FeedConfig {
 }
 
 /// The live feed loop: `ReaderToExec` records → accumulator → close policy →
-/// [`LiveSender`]. Runs on a dedicated (blocking) thread until the reader
-/// channel closes or a post fail-stops. Crash-only: no graceful drain — the
-/// cursor is at-least-once and restart re-observes.
-pub fn run_feed<P: Provider>(
-    rx: Receiver<ReaderToExec>,
+/// [`LiveSender`]. An async task fed by the reader thread through a bounded
+/// tokio channel; runs until that channel closes or a post fail-stops.
+/// Crash-only: no graceful drain — the cursor is at-least-once and restart
+/// re-observes.
+pub async fn run_feed<P: Provider>(
+    mut rx: Receiver<ReaderToExec>,
     mut sender: LiveSender<P>,
     cfg: FeedConfig,
 ) -> Result<()> {
@@ -366,37 +366,18 @@ pub fn run_feed<P: Provider>(
     let mut pending: Vec<ClosedBlock> = Vec::new();
     let mut oldest_pending: Option<Instant> = None;
 
-    let post_group = |pending: &mut Vec<ClosedBlock>,
-                      oldest: &mut Option<Instant>,
-                      sender: &mut LiveSender<P>|
-     -> Result<()> {
-        let group = std::mem::take(pending);
-        *oldest = None;
-        gauge!(live_metric_names::PENDING_BLOCKS).set(0.0);
-        let last = group.last().expect("post_group called with pending blocks");
-        let cursor = BatchCursor {
-            next_index: last.end_tx_idx.as_index(),
-            next_block: last.block_number + 1,
-            // post_confirmed stamps last_batch_index.
-            last_batch_index: 0,
-        };
-        let batch = pack_blocks(&pack_cfg, &group)?;
-        sender.post_confirmed(&batch, cursor)
-    };
-
     loop {
-        match rx.recv_timeout(cfg.flush) {
-            Ok(ReaderToExec::Tx {
+        match tokio::time::timeout(cfg.flush, rx.recv()).await {
+            Ok(Some(ReaderToExec::Tx {
                 envelope, position, ..
-            }) => acc.observe_tx(envelope, position),
+            })) => acc.observe_tx(envelope, position),
             // Deposits are absent from DA by design: re-derivable from L1
             // (mirrors MultiArchiveReader skipping DepositRefs offline).
-            // Deposits are absent from DA by design: re-derivable from L1.
             // The epoch marker is skipped for the same reason — a
             // reconstructor reads the origin off the block boundary and
             // re-derives that L1 block's deposits itself.
-            Ok(ReaderToExec::Deposit { .. } | ReaderToExec::Epoch { .. }) => {}
-            Ok(ReaderToExec::Boundary(b)) => {
+            Ok(Some(ReaderToExec::Deposit { .. } | ReaderToExec::Epoch { .. })) => {}
+            Ok(Some(ReaderToExec::Boundary(b))) => {
                 let closed = acc.observe_boundary(b);
                 counter!(metric_names::BLOCKS_OBSERVED).increment(1);
                 if closed.block_number <= cfg.skip_through_block {
@@ -407,19 +388,39 @@ pub fn run_feed<P: Provider>(
                 oldest_pending.get_or_insert_with(Instant::now);
                 gauge!(live_metric_names::PENDING_BLOCKS).set(pending.len() as f64);
                 if pending.len() >= cfg.blocks_per_batch {
-                    post_group(&mut pending, &mut oldest_pending, &mut sender)?;
+                    post_group(&pack_cfg, &mut pending, &mut oldest_pending, &mut sender).await?;
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
+            // Flush timeout.
+            Err(_) => {
                 if !pending.is_empty() && oldest_pending.is_some_and(|t| t.elapsed() >= cfg.flush) {
-                    post_group(&mut pending, &mut oldest_pending, &mut sender)?;
+                    post_group(&pack_cfg, &mut pending, &mut oldest_pending, &mut sender).await?;
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                bail!("tx_ordering reader channel closed; see reader thread error")
-            }
+            Ok(None) => bail!("tx_ordering reader channel closed; see reader thread error"),
         }
     }
+}
+
+/// Pack and post the pending group; clears it.
+async fn post_group<P: Provider>(
+    pack_cfg: &BatcherConfig,
+    pending: &mut Vec<ClosedBlock>,
+    oldest: &mut Option<Instant>,
+    sender: &mut LiveSender<P>,
+) -> Result<()> {
+    let group = std::mem::take(pending);
+    *oldest = None;
+    gauge!(live_metric_names::PENDING_BLOCKS).set(0.0);
+    let last = group.last().expect("post_group called with pending blocks");
+    let cursor = BatchCursor {
+        next_index: last.end_tx_idx.as_index(),
+        next_block: last.block_number + 1,
+        // post_confirmed stamps last_batch_index.
+        last_batch_index: 0,
+    };
+    let batch = pack_blocks(pack_cfg, &group)?;
+    sender.post_confirmed(&batch, cursor).await
 }
 
 /// Everything [`run`] needs from the CLI, already validated: the binary
@@ -515,7 +516,8 @@ pub async fn run(args: LiveArgs) -> Result<()> {
     }
     // No tx_deposits reader: deposits ride inside the epoch record on the
     // canonical stream, so there is nothing to join against.
-    let (feed_tx, feed_rx) = crossbeam_channel::bounded(1 << 14);
+    // Bounded: the reader thread `blocking_send`s, the feed task `recv`s.
+    let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1 << 14);
     // The default 100 ms join timeout is an IPC-locality assumption; on the
     // cluster's UDP multicast a transient frame drop takes the archive
     // refetch (which only engages after `join_refetch_after` = 10 s) to
@@ -534,9 +536,8 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         join_recovery,
     );
 
-    // --- Feed loop on a blocking thread. -----------------------------------
+    // --- Feed loop task. ---------------------------------------------------
     let sender = LiveSender::new(
-        tokio::runtime::Handle::current(),
         provider,
         settlement,
         da_store,
@@ -550,9 +551,9 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         flush: Duration::from_millis(args.flush_ms),
         skip_through_block,
     };
-    let mut feed = tokio::task::spawn_blocking(move || run_feed(feed_rx, sender, feed_cfg));
+    let mut feed = tokio::spawn(run_feed(feed_rx, sender, feed_cfg));
     let feed_result = tokio::select! {
-        r = &mut feed => r.context("feed thread panicked")?,
+        r = &mut feed => r.context("feed task panicked")?,
         () = bin_support::wait_for_shutdown() => {
             // Exit cleanly: the cursor is reconciled against L1 truth on every
             // restart, so tearing down mid-batch loses nothing.

@@ -54,7 +54,7 @@ async fn aeron_cluster_starts_and_state_writer_applies_batch() {
         .durability(Durability::SafeNoSync)
         .open()
         .expect("env open");
-    let writer = StateWriter::spawn(env).expect("writer spawn");
+    let mut writer = StateWriter::spawn(env).expect("writer spawn");
     // Drop the genesis snapshot.
     let _ = writer.snapshot_rx.recv();
 

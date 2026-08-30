@@ -173,7 +173,7 @@ fn require_l1_flags<'a>(
 async fn main() -> anyhow::Result<()> {
     kardamom_engine::bin_support::init_tracing();
     let cli = Cli::parse();
-    kardamom_obs::init_service!("batcher", cli.metrics_addr, &cli.host_id)?;
+    kardamom_obs::init_service!("batcher", cli.metrics_addr, &cli.host_id).await?;
 
     if cli.live {
         return live_main(cli).await;

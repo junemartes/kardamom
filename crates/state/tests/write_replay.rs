@@ -9,7 +9,7 @@ use kardamom_types::StateDatabase;
 
 #[test]
 fn writer_applies_deltas_and_state_reflects_them() {
-    let (_dir, writer) = common::open_tmp_writer();
+    let (_dir, mut writer) = common::open_tmp_writer();
     let addr = address!("0x00000000000000000000000000000000000000aa");
 
     // Drain the spawn-time snapshot first so the per-block snapshots line up.

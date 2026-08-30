@@ -149,9 +149,8 @@ impl<S: StateDatabase> ExecScope<S> {
         // (`kardamom_executor_invalid_tx_skipped_total` deserves an alert).
         let alloy_env = match decode_alloy_envelope(&inbound_envelope.raw_tx, tx_idx) {
             Ok(env_) => env_,
-            Err(e) => {
+            Err(_) => {
                 return Ok(invalid_skip(
-                    &format!("undecodable raw_tx: {e}"),
                     tx_position,
                     inbound_envelope,
                     0,
@@ -209,9 +208,8 @@ impl<S: StateDatabase> ExecScope<S> {
             Ok(o) => o,
             // Deterministic input-invalidity: every replica computes the same
             // rejection from the same (state, tx) — skip, never halt (#92).
-            Err(revm::context::result::EVMError::Transaction(reason)) => {
+            Err(revm::context::result::EVMError::Transaction(_)) => {
                 return Ok(invalid_skip(
-                    &format!("{reason:?}"),
                     tx_position,
                     inbound_envelope,
                     nonce,
@@ -221,9 +219,8 @@ impl<S: StateDatabase> ExecScope<S> {
                     cumulative_gas_used_before,
                 ));
             }
-            Err(revm::context::result::EVMError::Header(reason)) => {
+            Err(revm::context::result::EVMError::Header(_)) => {
                 return Ok(invalid_skip(
-                    &format!("{reason:?}"),
                     tx_position,
                     inbound_envelope,
                     nonce,
@@ -378,9 +375,7 @@ pub fn execute_tx<S: StateDatabase>(
 /// Public: the Block-STM engine (`kardamom-stm`) produces the identical
 /// skip artifact on its parallel path — one definition, one wire shape.
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(feature = "std"), allow(unused_variables))]
 pub fn invalid_skip(
-    reason: &str,
     tx_position: BPosition,
     inbound_envelope: &TxEnvelope,
     nonce: u64,
@@ -389,20 +384,6 @@ pub fn invalid_skip(
     tx_index_in_block: u64,
     cumulative_gas_used_before: u64,
 ) -> (Receipt, WriteSet) {
-    // Loudness is a `std`-side concern; the skip receipt itself is the
-    // consensus artifact and is produced identically in guest builds.
-    #[cfg(feature = "std")]
-    {
-        tracing::error!(
-            tx_hash = ?inbound_envelope.tx_hash,
-            from = ?inbound_envelope.sender,
-            nonce,
-            block = block_number,
-            reason,
-            "INVALID canonical tx SKIPPED (deterministic; upstream guard failed — investigate)"
-        );
-        crate::metrics::record_invalid_tx_skipped();
-    }
     let ws = WriteSet::default();
     let write_set_hash = ws.hash();
     let receipt = Receipt {

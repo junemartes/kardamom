@@ -167,7 +167,7 @@ fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init_service!("sequencer", args.metrics_addr, &args.host_id)?;
+    kardamom_obs::init_service!("sequencer", args.metrics_addr, &args.host_id).await?;
     let raw = std::fs::read_to_string(&args.config).context("read config")?;
     let mut cfg: SequencerConfig = toml::from_str(&raw).context("parse config")?;
     apply_cli_overrides(&args, &mut cfg)?;
@@ -242,14 +242,14 @@ async fn main() -> anyhow::Result<()> {
     let (resync_controller, floor_tx, reject_tx, watermark) =
         kardamom_sequencer::resync::resync_channel(cfg.resync.clone(), cfg.partition_index);
 
-    let watermark_thread = feeds::spawn_egress_watermark_feed(
+    let watermark_task = feeds::spawn_egress_watermark_feed(
         cluster_egress,
         cfg.resync.boundary_silence_ms,
         cfg.partition_index,
         watermark,
         reject_tx,
-    )
-    .context("spawn egress-watermark thread")?;
+        shutdown.clone(),
+    );
 
     // DEDICATED receipts runtime: receipt decode runs at full line rate, and
     // the main `rt`'s polling thread must stay dedicated to the tx_data
@@ -269,14 +269,13 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(channels.tx_receipts_executor_count),
     )
     .context("open tx_receipts")?;
-    let receipts_thread = feeds::spawn_receipt_floor_feed(
+    let receipts_task = feeds::spawn_receipt_floor_feed(
         receipts_sub,
         shutdown.clone(),
         cfg.partition_count,
         cfg.partition_index,
         floor_tx,
-    )
-    .context("spawn receipts-floors thread")?;
+    );
 
     // Clone shares the single session thread; offers serialise through it. Both
     // loops use `cluster_pub` (impl `TxOrderingRefPublisher`) — the canonical
@@ -307,15 +306,15 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::error!(error = %e, "sequencer epoch task panicked"),
     }
     // Drop the cluster session only after both loops have stopped. This also
-    // closes the egress channel, unblocking the watermark thread; the
-    // receipts thread exits on the shutdown flag (or the closed floor
-    // channel once the main loop is gone).
+    // closes the egress channel, unblocking the watermark feed (which also
+    // checks the shutdown token every tick); the receipts task exits on the
+    // token (or the closed floor channel once the main loop is gone).
     drop(cluster_guard);
-    if let Err(e) = watermark_thread.join() {
-        tracing::warn!(?e, "egress-watermark thread panicked");
+    if let Err(e) = watermark_task.await {
+        tracing::warn!(?e, "egress-watermark task panicked");
     }
-    if let Err(e) = receipts_thread.join() {
-        tracing::warn!(?e, "receipts-floors thread panicked");
+    if let Err(e) = receipts_task.await {
+        tracing::warn!(?e, "receipts-floors task panicked");
     }
     drop(rt);
     Ok(())

@@ -233,7 +233,7 @@ pub fn check_sequence(previous: Option<u64>, got: u64) -> Result<(), EpochFault>
 pub struct EpochVerifier {
     previous_origin: Option<u64>,
     divergence: Arc<Divergence>,
-    tx: std::sync::mpsc::Sender<EpochRecord>,
+    tx: tokio::sync::mpsc::Sender<EpochRecord>,
 }
 
 impl EpochVerifier {
@@ -247,21 +247,16 @@ impl EpochVerifier {
         divergence: Arc<Divergence>,
         rt: &tokio::runtime::Handle,
     ) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<EpochRecord>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<EpochRecord>(EPOCH_QUEUE_CAP);
         let div = divergence.clone();
         rt.spawn(async move {
-            // Blocking recv on a std channel would block a runtime worker, so
-            // hop through spawn_blocking per item; epochs arrive at L1 block
-            // cadence (~1 per 12 s), so the hop is free.
-            let rx = std::sync::Mutex::new(rx);
             // The last epoch that VERIFIED, as the anchor the next one must
             // descend from. Only a verified epoch becomes an anchor: chaining
             // from an unchecked hash would let one accepted lie legitimise
             // every block after it.
             let mut anchor: Option<(u64, B256)> = None;
             loop {
-                let next = tokio::task::block_in_place(|| rx.lock().unwrap().recv());
-                let Ok(epoch) = next else {
+                let Some(epoch) = rx.recv().await else {
                     return; // engine gone
                 };
                 // Retry rather than one-shot. An unreachable L1 is not a
@@ -329,6 +324,14 @@ impl EpochVerifier {
         }
     }
 }
+
+/// Depth of the exec-thread -> verifier queue. Epochs arrive at L1 block
+/// cadence (~1 per 12 s) and one content check takes at most
+/// `VERIFY_ATTEMPTS * VERIFY_RETRY_DELAY` (16 s), so the queue drains faster
+/// than it fills unless L1 is down for a long time. 64 entries is ~13 min of
+/// epochs; past that, the exec thread drops the epoch (see
+/// [`EpochObserver::observe`]) rather than block on the L1 outage.
+const EPOCH_QUEUE_CAP: usize = 64;
 
 /// How many times a content check is retried before a verdict. Spans a few L1
 /// block times so an honest lag between this validator's L1 view and the
@@ -400,10 +403,22 @@ impl EpochObserver for EpochVerifier {
             return Err(ExecutorError::State(fault.to_string()));
         }
         self.previous_origin = Some(epoch.l1_number);
-        // Content check is queued; a full queue must not wedge the exec
-        // thread, and a dropped item only costs coverage of that epoch.
-        if self.tx.send(epoch.clone()).is_err() {
-            tracing::warn!("epoch verifier task is gone; content checks stopped");
+        // Content check is queued with `try_send`: a full queue must not
+        // wedge the exec thread, and a dropped item only costs coverage of
+        // that epoch.
+        use tokio::sync::mpsc::error::TrySendError;
+        match self.tx.try_send(epoch.clone()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                metrics::counter_epoch_unverified();
+                tracing::warn!(
+                    l1_number = epoch.l1_number,
+                    "epoch verifier queue full; epoch not content-checked"
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                tracing::warn!("epoch verifier task is gone; content checks stopped");
+            }
         }
         Ok(())
     }

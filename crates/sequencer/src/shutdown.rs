@@ -1,32 +1,46 @@
 //! Cooperative shutdown signal for the sequencer loop.
+//!
+//! Thin wrapper over [`CancellationToken`] so the sync core (publish loop,
+//! deposit pump) polls [`Shutdown::is_signaled`] while the tokio shell awaits
+//! [`Shutdown::cancelled`] in `select!`.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use tokio_util::sync::CancellationToken;
 
 /// Cooperative shutdown signal shared with the loop driver. Cloneable so the
-/// signal handler thread can keep one copy and the loop thread another.
-#[derive(Clone)]
+/// signal handler task can keep one copy and the loop thread another.
+#[derive(Clone, Debug)]
 pub struct Shutdown {
-    flag: Arc<AtomicBool>,
+    token: CancellationToken,
 }
 
 impl Shutdown {
-    pub fn from_atomic(flag: Arc<AtomicBool>) -> Self {
-        Self { flag }
-    }
     pub fn new() -> Self {
         Self {
-            flag: Arc::new(AtomicBool::new(false)),
+            token: CancellationToken::new(),
         }
     }
+
+    /// Wrap an existing token (share one cancellation tree with other tasks).
+    pub fn from_token(token: CancellationToken) -> Self {
+        Self { token }
+    }
+
     pub fn signal(&self) {
-        self.flag.store(true, Ordering::Release);
+        self.token.cancel();
     }
+
     pub fn is_signaled(&self) -> bool {
-        self.flag.load(Ordering::Acquire)
+        self.token.is_cancelled()
     }
-    pub fn atomic(&self) -> Arc<AtomicBool> {
-        self.flag.clone()
+
+    /// The underlying token, for tasks that want to `select!` on it directly.
+    pub fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    /// Resolves once [`Shutdown::signal`] has been called.
+    pub async fn cancelled(&self) {
+        self.token.cancelled().await
     }
 }
 
