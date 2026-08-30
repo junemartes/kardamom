@@ -45,7 +45,7 @@ pub fn spawn_egress_watermark_feed(
     silence_ms: u64,
     partition: u32,
     watermark: SharedWatermark,
-    reject_tx: std::sync::mpsc::Sender<(Address, u64, u64)>,
+    reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
     shutdown: Shutdown,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
@@ -61,7 +61,7 @@ fn run_egress_watermark_feed(
     silence_ms: u64,
     partition: u32,
     watermark: SharedWatermark,
-    reject_tx: std::sync::mpsc::Sender<(Address, u64, u64)>,
+    reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
     shutdown: Shutdown,
 ) {
     use kardamom_cluster_adapter::live::EgressPoll;
@@ -166,7 +166,7 @@ pub fn spawn_receipt_floor_feed(
     shutdown: Shutdown,
     partition_count: u32,
     partition_index: u32,
-    floor_tx: std::sync::mpsc::Sender<FloorUpdate>,
+    floor_tx: crossbeam_channel::Sender<FloorUpdate>,
 ) -> tokio::task::JoinHandle<()> {
     let rx = sub.into_receiver();
     tokio::spawn(run_receipt_floor_feed(
@@ -184,7 +184,7 @@ async fn run_receipt_floor_feed(
     shutdown: Shutdown,
     partition_count: u32,
     partition_index: u32,
-    floor_tx: std::sync::mpsc::Sender<FloorUpdate>,
+    floor_tx: crossbeam_channel::Sender<FloorUpdate>,
 ) {
     loop {
         let receipt = tokio::select! {

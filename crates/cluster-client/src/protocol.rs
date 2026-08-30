@@ -47,9 +47,7 @@ const BLOCK_NEW_LEADER_EVENT: u16 = 20;
 ///
 /// `num_enum` derives the two conversions. `catch_all` maps an unknown
 /// code into `Unknown(i32)` and keeps the value.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, num_enum::FromPrimitive, num_enum::IntoPrimitive,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::FromPrimitive, num_enum::IntoPrimitive)]
 #[repr(i32)]
 pub enum EventCode {
     Ok = 0,
