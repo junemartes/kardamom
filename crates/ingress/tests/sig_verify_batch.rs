@@ -72,7 +72,7 @@ async fn batched_callers_never_cross_answers() {
     let v = std::sync::Arc::new(BatchVerifier::with_parallelism(
         8,
         Duration::from_micros(50),
-        4,
+        1,
     ));
     let (good_env, good_raw, good_addr) = fixtures::signed(1);
     let (bad_env, bad_raw, bad_addr) = fixtures::signed(2);
@@ -97,6 +97,11 @@ async fn batched_callers_never_cross_answers() {
 /// which is exactly what the sequential in-task loop did. With recovery
 /// on the blocking pool a 1ms timer still fires on time. The threshold
 /// sits between those two worlds: this test FAILS on the old code.
+///
+/// Parallelism 1 on purpose: the assert measures where the work runs, not
+/// how fast. With 4 blocking threads on a 2-core CI host the OS deschedules
+/// the runtime thread and the timer fires 10-50ms late — a CPU-contention
+/// stall that reads as the bug this test guards against.
 #[tokio::test(flavor = "current_thread")]
 async fn recovery_does_not_block_the_reactor() {
     let v = std::sync::Arc::new(BatchVerifier::with_parallelism(
