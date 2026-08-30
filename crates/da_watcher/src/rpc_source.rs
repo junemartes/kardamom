@@ -2,9 +2,9 @@
 //!
 //! Two responsibilities only:
 //!   * map `finalized_block_number()` → `eth_getBlockByNumber("finalized")`,
-//!   * map `deposit_logs(...)` → `eth_getLogs(...)` filtered by the lockbox
-//!     address and the `DepositInitiated` event signature, then ABI-decode
-//!     each result into a [`DepositLog`].
+//!   * map `lockbox_logs(...)` → `eth_getLogs(...)` filtered by the lockbox
+//!     address and the `DepositInitiated` / `UpgradeInitiated` event
+//!     signatures, then ABI-decode each result into a [`LockboxLog`].
 //!
 //! Ported verbatim from PR #10's `crates/node/src/l1_source_rpc.rs`. The
 //! event signature is byte-pinned to the on-chain `ETHLockbox.sol` ABI by
@@ -16,7 +16,9 @@ use alloy_rpc_types_eth::{BlockNumberOrTag, Filter, Log as RpcLog};
 use alloy_sol_types::{SolEvent, sol};
 use async_trait::async_trait;
 
-use crate::source::{DepositLog, L1Source, L1SourceError};
+use kardamom_types::epoch::UpgradeLog;
+
+use crate::source::{DepositLog, L1Source, L1SourceError, LockboxLog};
 
 sol! {
     /// Mirror of `contracts/src/L1/ETHLockbox.sol::DepositInitiated`.
@@ -30,6 +32,13 @@ sol! {
         uint256 mint,
         uint64 gasLimit,
         bytes data
+    );
+
+    /// Mirror of `contracts/src/L1/ETHLockbox.sol::UpgradeInitiated` — the
+    /// upgrade transaction. `activationTimestamp` is epoch-MILLISECONDS.
+    #[derive(Debug)]
+    event UpgradeInitiated(
+        uint64 indexed upgradeNonce, uint256 indexed featureId, uint64 activationTimestamp
     );
 }
 
@@ -76,15 +85,21 @@ where
         Ok((block.header.hash, block.header.parent_hash))
     }
 
-    async fn deposit_logs(
+    async fn lockbox_logs(
         &self,
         lockbox: Address,
         from_block: u64,
         to_block: u64,
-    ) -> Result<Vec<DepositLog>, L1SourceError> {
+    ) -> Result<Vec<LockboxLog>, L1SourceError> {
+        // ONE query for both event kinds: a topic0 set, not two round trips.
+        // Two queries could succeed and fail independently, which would let an
+        // epoch derive with its deposits but without its upgrade.
         let filter = Filter::new()
             .address(lockbox)
-            .event_signature(DepositInitiated::SIGNATURE_HASH)
+            .event_signature(vec![
+                DepositInitiated::SIGNATURE_HASH,
+                UpgradeInitiated::SIGNATURE_HASH,
+            ])
             .from_block(from_block)
             .to_block(to_block);
 
@@ -94,8 +109,66 @@ where
             .await
             .map_err(|e| L1SourceError::Provider(e.to_string()))?;
 
-        logs.iter().map(decode_deposit_log).collect()
+        logs.iter().map(decode_lockbox_log).collect()
     }
+}
+
+/// Decode one lockbox log, dispatching on `topic[0]`.
+///
+/// An unrecognised topic0 is a hard `Decode` error rather than a skip: the
+/// filter asked for exactly two signatures, so anything else means the provider
+/// ignored the filter, and silently dropping it would derive an epoch that
+/// disagrees with L1.
+pub(crate) fn decode_lockbox_log(log: &RpcLog) -> Result<LockboxLog, L1SourceError> {
+    let topic0 = *log
+        .topic0()
+        .ok_or_else(|| L1SourceError::Decode("log has no topic[0]".to_string()))?;
+    if topic0 == DepositInitiated::SIGNATURE_HASH {
+        decode_deposit_log(log).map(LockboxLog::Deposit)
+    } else if topic0 == UpgradeInitiated::SIGNATURE_HASH {
+        decode_upgrade_log(log).map(LockboxLog::Upgrade)
+    } else {
+        Err(L1SourceError::Decode(format!(
+            "unexpected event signature: got {topic0:#x}, want {:#x} or {:#x}",
+            DepositInitiated::SIGNATURE_HASH,
+            UpgradeInitiated::SIGNATURE_HASH
+        )))
+    }
+}
+
+/// Decode a single `UpgradeInitiated` log into an [`UpgradeLog`].
+pub(crate) fn decode_upgrade_log(log: &RpcLog) -> Result<UpgradeLog, L1SourceError> {
+    let topic0 = log
+        .topic0()
+        .ok_or_else(|| L1SourceError::Decode("log has no topic[0]".to_string()))?;
+    if *topic0 != UpgradeInitiated::SIGNATURE_HASH {
+        return Err(L1SourceError::Decode(format!(
+            "unexpected event signature: got {topic0:#x}, want {:#x}",
+            UpgradeInitiated::SIGNATURE_HASH
+        )));
+    }
+
+    let decoded = UpgradeInitiated::decode_log(&log.inner)
+        .map_err(|e| L1SourceError::Decode(format!("UpgradeInitiated decode: {e}")))?;
+    let evt = decoded.data;
+
+    let block_hash = log
+        .block_hash
+        .ok_or_else(|| L1SourceError::Decode("log missing block_hash".to_string()))?;
+    let log_index = log
+        .log_index
+        .ok_or_else(|| L1SourceError::Decode("log missing log_index".to_string()))?;
+    let block_number = log
+        .block_number
+        .ok_or_else(|| L1SourceError::Decode("log missing block_number".to_string()))?;
+
+    Ok(UpgradeLog {
+        block_number,
+        block_hash,
+        log_index,
+        feature_id: evt.featureId,
+        activation_timestamp: evt.activationTimestamp,
+    })
 }
 
 /// Decode a single `DepositInitiated` log into a [`DepositLog`].
@@ -211,6 +284,78 @@ mod tests {
         assert_eq!(
             out.block_hash,
             b256!("1111111111111111111111111111111111111111111111111111111111111111")
+        );
+    }
+
+    fn synthetic_upgrade_log(feature: u64, activation: u64, log_index: u64) -> RpcLog {
+        // topics: [sig, upgradeNonce(uint64), featureId(uint256)]
+        let topics = vec![
+            UpgradeInitiated::SIGNATURE_HASH,
+            B256::from(U256::from(3u64)),
+            B256::from(U256::from(feature)),
+        ];
+        // Non-indexed: (uint64 activationTimestamp).
+        let body = (activation,).abi_encode_sequence();
+        let inner = alloy_primitives::Log {
+            address: address!("0000000000000000000000000000000000C0DE01"),
+            data: LogData::new(topics, Bytes::from(body)).expect("LogData"),
+        };
+        RpcLog {
+            inner,
+            block_hash: Some(b256!(
+                "2222222222222222222222222222222222222222222222222222222222222222"
+            )),
+            block_number: Some(456),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: Some(log_index),
+            removed: false,
+        }
+    }
+
+    #[test]
+    fn decodes_upgrade_initiated_log() {
+        let log = synthetic_upgrade_log(9, 1_700_000_000_250, 2);
+        let out = decode_upgrade_log(&log).expect("decode ok");
+        assert_eq!(out.feature_id, U256::from(9u64));
+        assert_eq!(out.activation_timestamp, 1_700_000_000_250);
+        assert_eq!(out.log_index, 2);
+        assert_eq!(out.block_number, 456);
+    }
+
+    /// One filtered query returns both kinds interleaved; the dispatcher must
+    /// route on topic0 rather than on position or count.
+    #[test]
+    fn dispatches_both_event_kinds_on_topic0() {
+        let dep = synthetic_log(U256::from(5u64), 21_000, Bytes::new());
+        let upg = synthetic_upgrade_log(1, 0, 7);
+
+        assert!(matches!(
+            decode_lockbox_log(&dep).expect("deposit"),
+            LockboxLog::Deposit(_)
+        ));
+        assert!(matches!(
+            decode_lockbox_log(&upg).expect("upgrade"),
+            LockboxLog::Upgrade(_)
+        ));
+    }
+
+    /// A provider that ignores the topic filter must be caught, not skipped:
+    /// silently dropping an unknown log would derive an epoch that disagrees
+    /// with L1 while looking perfectly healthy.
+    #[test]
+    fn dispatcher_rejects_an_unfiltered_third_event() {
+        let mut log = synthetic_log(U256::from(1u64), 21_000, Bytes::new());
+        let bad = b256!("beef000000000000000000000000000000000000000000000000000000000000");
+        let mut topics: Vec<B256> = log.inner.data.topics().to_vec();
+        topics[0] = bad;
+        log.inner.data = LogData::new(topics, log.inner.data.data.clone()).expect("rebuild");
+
+        let err = decode_lockbox_log(&log).expect_err("unknown topic0 must fail");
+        assert!(
+            matches!(err, L1SourceError::Decode(ref m) if m.contains("event signature")),
+            "got {err:?}"
         );
     }
 

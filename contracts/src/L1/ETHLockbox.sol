@@ -9,6 +9,13 @@ interface IWithdrawalOutputOracle {
     function isFinalizable(uint256 index) external view returns (bool);
 }
 
+/// @notice Minimal view of the factory's ownership, read to authorize upgrade
+///         transactions. The factory is `Ownable2StepUpgradeable`; its owner is
+///         the chain's L1 authority (a Safe in production).
+interface IOwnable {
+    function owner() external view returns (address);
+}
+
 /// @title ETHLockbox
 /// @notice The L1 ETH bridge. Holds ETH deposited via `depositETH` (the on-ramp)
 ///         and releases it via `finalizeWithdrawal` (the off-ramp) once a
@@ -43,6 +50,15 @@ contract ETHLockbox is KardamomUUPSBase {
     /// @notice Replay guard: withdrawal leaf hash => already paid out.
     mapping(bytes32 => bool) public finalizedWithdrawals;
 
+    /// @notice Monotonic upgrade counter. Observability/idempotence aid only —
+    ///         the L2 side dedups on the L1 log position, not on this.
+    /// @dev    MUST stay last: `depositNonce`/`l2Minter` share slot 0 and
+    ///         `outputOracle`/`finalizedWithdrawals` follow, so a new variable
+    ///         inserted anywhere above would shift them and corrupt a live
+    ///         proxy's state on upgrade. Appending is layout-safe and zero-init
+    ///         is the correct starting value, so no `reinitializer` is needed.
+    uint64 public upgradeNonce;
+
     event DepositInitiated(
         uint64 indexed depositNonce,
         address indexed from,
@@ -55,12 +71,25 @@ contract ETHLockbox is KardamomUUPSBase {
         bytes32 indexed withdrawalHash, address indexed target, uint256 value
     );
 
+    /// @notice The **upgrade transaction**: an L1-authorized instruction to
+    ///         schedule an L2 feature flag. The DA watcher derives a system
+    ///         deposit from this log exactly as it derives user deposits from
+    ///         `DepositInitiated`, so the instruction inherits L1's ordering
+    ///         and finality.
+    /// @param activationTimestamp L2 activation time in epoch-**MILLISECONDS**
+    ///        (L2 `block.timestamp` is ms on this chain). 0 = activate
+    ///        immediately.
+    event UpgradeInitiated(
+        uint64 indexed upgradeNonce, uint256 indexed featureId, uint64 activationTimestamp
+    );
+
     error ZeroDeposit();
     error AlreadyFinalized();
     error BadInclusionProof();
     error OutputRootMismatch();
     error NotFinalizable();
     error TransferFailed();
+    error NotUpgradeAuthority();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -97,6 +126,29 @@ contract ETHLockbox is KardamomUUPSBase {
             depositNonce += 1;
         }
         emit DepositInitiated(depositNonce, msg.sender, to, msg.value, gasLimit, data);
+    }
+
+    // -------------------------------------------------------------------------
+    // Upgrades (L1-governed feature flags)
+    // -------------------------------------------------------------------------
+
+    /// @notice Schedule an L2 feature flag from L1. Authorized to the factory
+    ///         owner — the chain's L1 authority, a Safe in production. Rotating
+    ///         factory ownership rotates this authority with it, so there is
+    ///         exactly one root of trust.
+    /// @dev    Emits only; the state change happens on L2. The DA watcher turns
+    ///         this log into a system deposit calling
+    ///         `KardamomChainState.setFeature`, which every node executes at the
+    ///         same canonical position.
+    /// @param featureId           The flag to schedule.
+    /// @param activationTimestamp Activation time in epoch-**MILLISECONDS**
+    ///                            (see the event docs); 0 activates immediately.
+    function initiateUpgrade(uint256 featureId, uint64 activationTimestamp) external {
+        if (msg.sender != IOwnable(FACTORY).owner()) revert NotUpgradeAuthority();
+        unchecked {
+            upgradeNonce += 1;
+        }
+        emit UpgradeInitiated(upgradeNonce, featureId, activationTimestamp);
     }
 
     // -------------------------------------------------------------------------

@@ -13,7 +13,7 @@
 //! ## Layering
 //!
 //! - [`source::L1Source`] — async trait abstracting the two L1 reads the
-//!   watcher needs (`finalized_block_number`, `deposit_logs`). The trait is
+//!   watcher needs (`finalized_block_number`, `lockbox_logs`). The trait is
 //!   the seam for tests (mock impl) and production
 //!   ([`rpc_source::RpcL1Source`] — alloy-provider-backed).
 //! - [`publisher::EpochPublisher`] — sink for the
@@ -44,7 +44,13 @@
 //!   separate follow-up.
 //! - Reorg handling. Finalized blocks do not reorg in normal Ethereum
 //!   operation; the watcher trusts finality.
-//! - L1-attributes / system txs (OP `is_system_transaction = true`).
+//! - L1-attributes deposits (the OP block-attributes system tx). The OTHER
+//!   kind of system tx — the **upgrade transaction** — IS in scope: the
+//!   watcher reads `UpgradeInitiated` alongside `DepositInitiated` from the
+//!   same lockbox address and the same query, and
+//!   `kardamom_types::epoch::derive_epoch` turns it into a system deposit
+//!   (`is_system_transaction = true`). See
+//!   `docs/specs/2026-08-16-l1-upgrade-feature-flags-design.md`.
 
 pub mod metrics;
 pub mod publisher;
@@ -56,7 +62,10 @@ pub mod watcher;
 // VERIFIER can share it — a second copy would verify nothing (see
 // docs/agents/l1-origin-deposit-derivation-spec.md). Re-exported here so
 // existing callers keep working.
-pub use kardamom_types::epoch::{DepositLog, alias_l1_address, deposit_from_log, source_hash};
+pub use kardamom_types::epoch::{
+    DepositLog, LockboxLog, UpgradeLog, alias_l1_address, deposit_from_log, source_hash,
+    source_hash_system, upgrade_from_log,
+};
 pub use publisher::{EpochPublisher, PublishError};
 pub use rpc_source::RpcL1Source;
 pub use source::{L1Source, L1SourceError};

@@ -40,12 +40,15 @@ use crate::metrics;
 pub trait L1EpochSource: Send + Sync + 'static {
     /// `(hash, parent_hash)` of L1 block `number`, from one round trip.
     async fn block_ids(&self, number: u64) -> anyhow::Result<(B256, B256)>;
-    async fn deposit_logs(
+    /// Both lockbox event kinds from one query — the same call the producer
+    /// makes. Reading fewer kinds than the watcher writes would report every
+    /// upgrade as a fabricated deposit.
+    async fn lockbox_logs(
         &self,
         lockbox: Address,
         from_block: u64,
         to_block: u64,
-    ) -> anyhow::Result<Vec<kardamom_types::DepositLog>>;
+    ) -> anyhow::Result<Vec<kardamom_types::epoch::LockboxLog>>;
 }
 
 /// Blanket adapter over the DA watcher's `L1Source`, so the validator reads L1
@@ -61,13 +64,13 @@ where
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    async fn deposit_logs(
+    async fn lockbox_logs(
         &self,
         lockbox: Address,
         from_block: u64,
         to_block: u64,
-    ) -> anyhow::Result<Vec<kardamom_types::DepositLog>> {
-        kardamom_da_watcher::L1Source::deposit_logs(self, lockbox, from_block, to_block)
+    ) -> anyhow::Result<Vec<kardamom_types::epoch::LockboxLog>> {
+        kardamom_da_watcher::L1Source::lockbox_logs(self, lockbox, from_block, to_block)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
@@ -163,7 +166,7 @@ impl std::fmt::Display for EpochFault {
 pub fn compare_against_l1(
     epoch: &EpochRecord,
     l1_hash: alloy_primitives::B256,
-    logs: &[kardamom_types::DepositLog],
+    logs: &[kardamom_types::epoch::LockboxLog],
 ) -> Result<(), EpochFault> {
     if epoch.l1_hash != l1_hash {
         return Err(EpochFault::HashMismatch {
@@ -374,7 +377,7 @@ async fn verify_one<S: L1EpochSource + ?Sized>(
         }));
     }
     let logs = source
-        .deposit_logs(lockbox, epoch.l1_number, epoch.l1_number)
+        .lockbox_logs(lockbox, epoch.l1_number, epoch.l1_number)
         .await
         .map_err(VerifyOutcome::Unavailable)?;
     compare_against_l1(epoch, hash, &logs).map_err(VerifyOutcome::Fault)
@@ -423,13 +426,14 @@ impl EpochObserver for EpochVerifier {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{B256, address};
+    use alloy_primitives::{B256, U256, address};
     use kardamom_types::DepositLog;
+    use kardamom_types::epoch::{LockboxLog, UpgradeLog};
 
     use super::*;
 
-    fn log(number: u64, hash: B256, index: u64, mint: u128) -> DepositLog {
-        DepositLog {
+    fn log(number: u64, hash: B256, index: u64, mint: u128) -> LockboxLog {
+        LockboxLog::Deposit(DepositLog {
             block_number: number,
             block_hash: hash,
             log_index: index,
@@ -438,7 +442,79 @@ mod tests {
             mint,
             gas_limit: 200_000,
             data: alloy_primitives::Bytes::new(),
-        }
+        })
+    }
+
+    fn upgrade(number: u64, hash: B256, index: u64, feature: u64) -> LockboxLog {
+        LockboxLog::Upgrade(UpgradeLog {
+            block_number: number,
+            block_hash: hash,
+            log_index: index,
+            feature_id: U256::from(feature),
+            activation_timestamp: 0,
+        })
+    }
+
+    /// The failure this guards against is subtle and total: if the verifier
+    /// read only `DepositInitiated` while the watcher wrote both kinds, every
+    /// upgrade would look like a deposit the producer invented, and EVERY
+    /// validator would fail-stop the moment the chain was first upgraded.
+    #[test]
+    fn an_epoch_carrying_an_upgrade_verifies() {
+        let hash = B256::repeat_byte(0x12);
+        let logs = vec![log(7, hash, 0, 100), upgrade(7, hash, 1, 1)];
+        let epoch = derive_epoch(7, hash, &logs).unwrap();
+        assert_eq!(epoch.deposits.len(), 2);
+        assert!(epoch.deposits[1].is_system_transaction);
+        assert_eq!(compare_against_l1(&epoch, hash, &logs), Ok(()));
+    }
+
+    #[test]
+    fn a_forged_upgrade_in_the_stream_is_caught() {
+        // The attack this closes: a sequencer inserting an upgrade L1 never
+        // authorized. L1 has only the deposit, so the derived truth differs.
+        let hash = B256::repeat_byte(0x13);
+        let truth_logs = vec![log(7, hash, 0, 100)];
+        let mut epoch = derive_epoch(7, hash, &truth_logs).unwrap();
+        let forged = derive_epoch(7, hash, &[upgrade(7, hash, 1, 1)]).unwrap();
+        epoch.deposits.push(forged.deposits[0].clone());
+
+        let err = compare_against_l1(&epoch, hash, &truth_logs).unwrap_err();
+        assert!(
+            matches!(err, EpochFault::DepositsMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_upgrade_is_caught() {
+        // The mirror attack: L1 authorized an upgrade, the stream omits it.
+        let hash = B256::repeat_byte(0x14);
+        let truth_logs = vec![upgrade(7, hash, 0, 1)];
+        let mut epoch = derive_epoch(7, hash, &truth_logs).unwrap();
+        epoch.deposits.clear();
+
+        let err = compare_against_l1(&epoch, hash, &truth_logs).unwrap_err();
+        assert!(
+            matches!(err, EpochFault::DepositsMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_upgrade_with_tampered_payload_is_caught() {
+        // Same position and count, different feature id — the case a count
+        // comparison alone would wave through.
+        let hash = B256::repeat_byte(0x15);
+        let truth_logs = vec![upgrade(7, hash, 0, 1)];
+        let epoch = derive_epoch(7, hash, &[upgrade(7, hash, 0, 999)]).unwrap();
+
+        let err = compare_against_l1(&epoch, hash, &truth_logs).unwrap_err();
+        assert!(
+            matches!(err, EpochFault::DepositsMismatch { ref detail, .. }
+                     if detail.contains("index 0")),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -630,12 +706,12 @@ mod tests {
                 .copied()
                 .ok_or_else(|| anyhow::anyhow!("finalized L1 block {number} not found"))
         }
-        async fn deposit_logs(
+        async fn lockbox_logs(
             &self,
             _lockbox: Address,
             _from: u64,
             _to: u64,
-        ) -> anyhow::Result<Vec<DepositLog>> {
+        ) -> anyhow::Result<Vec<LockboxLog>> {
             Ok(Vec::new())
         }
     }

@@ -21,10 +21,16 @@ rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytech
 alloy-rlp = { version = "0.3", default-features = false }
 alloy-eip7928 = { version = "0.3", default-features = false, features = ["rlp"] }
 
-# NOTE: SP1's precompile accelerator patches (sha3/k256/bls12-381 forks)
-# are deliberately NOT pinned in the scaffold — they are a performance
-# optimization, correctness is identical unpatched, and their tags must be
-# chosen against the prover SDK version when the harness lands.
+# SP1 v6 precompile accelerator patches (the rsp reth-block-prover set,
+# matched to this tree's crate versions). Keccak dominates our cycle count
+# — every witness trie node is hashed — so patching sha3 is the big win;
+# k256 accelerates per-tx ecrecover, sha2 the misc hashing. Correctness is
+# identical to unpatched (the precompiles are drop-in); the win is ~10x
+# fewer cycles, which is what makes CPU groth16 tractable.
+[patch.crates-io]
+sha3 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha3-0.11.0-sp1-6.0.0" }
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha2-0.10.9-sp1-6.0.0", package = "sha2" }
+k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-6.0.0" }
 
 [profile.release]
 opt-level = 3

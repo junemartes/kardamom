@@ -19,12 +19,13 @@ pub mod nonce_gap;
 pub mod nonce_unordered;
 pub mod rpc_liveness;
 pub mod rpc_vectors;
+pub mod upgrade;
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, U256};
 use anyhow::{Context, Result};
 
 use crate::harness::l2::L2Client;
@@ -181,6 +182,61 @@ pub fn read_validator_state_root(state_dir: &Path) -> Result<Option<B256>> {
     let env = open_state_ro(state_dir)?;
     let snap = kardamom_state::StateSnapshot::open(&env).context("snapshot validator state")?;
     snap.state_root().context("read validator state root")
+}
+
+/// A consistent read of the `KardamomChainState` predeploy, taken together
+/// with the block number it belongs to.
+///
+/// Every field comes from ONE `StateSnapshot` — a single long-lived read
+/// transaction — which is what makes the exact assertions in the S12 scenarios
+/// possible. Reading the head block and the beacon separately would race the
+/// chain: the beacon could advance between the two reads and an exact
+/// `beats == head - activation_block + 1` check would flap.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainStateView {
+    /// Highest block committed in the state DB this was read from.
+    pub block_number: u64,
+    /// Raw activation timestamp (ms) of the health-check feature; 0 = never
+    /// scheduled.
+    pub activation: U256,
+    /// Health beacon, unpacked: `(beats, block_number, timestamp_ms)`.
+    pub beacon: (u64, u64, u64),
+}
+
+impl ChainStateView {
+    /// Beats recorded so far.
+    pub fn beats(&self) -> u64 {
+        self.beacon.0
+    }
+}
+
+/// Read the chain-state predeploy out of a node's state DB.
+///
+/// Direct mdbx rather than RPC because the ingress serves neither `eth_call`
+/// nor `eth_getStorageAt`; the read is read-only and MVCC, so it never blocks
+/// the running node's writer.
+pub fn read_chain_state(state_dir: &Path) -> Result<ChainStateView> {
+    use kardamom_exec_core::features::{
+        FEATURE_HEALTH_CHECK, HEALTH_BEACON_SLOT, activation_slot, unpack_beacon,
+    };
+    use kardamom_types::StateDatabase;
+    use kardamom_types::upgrades::CHAIN_STATE;
+
+    let env = open_state_ro(state_dir)?;
+    let snap = kardamom_state::StateSnapshot::open(&env).context("snapshot state")?;
+    let block_number = snap.block_number();
+    let activation = snap
+        .storage(CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK))
+        .context("read activation slot")?;
+    let beacon = unpack_beacon(
+        snap.storage(CHAIN_STATE, HEALTH_BEACON_SLOT)
+            .context("read beacon slot")?,
+    );
+    Ok(ChainStateView {
+        block_number,
+        activation,
+        beacon,
+    })
 }
 
 /// Snapshot of the sequencer health counters a semantics scenario requires
