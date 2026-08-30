@@ -24,6 +24,18 @@
 #
 # Shares the node Aeron media driver via the bind-mounted tmpfs aeron.dir.
 
+# Digest-pinned image (attested-identity P0.1): scripts/deploy.sh passes the
+# repo:tag@sha256:... reference captured at push time (deploy/cluster/
+# images.digests) — both racing replica groups run the same pinned bytes. The
+# empty default falls back to the mutable :dev tag in the task configs — a dev
+# affordance for manual `nomad job run` during debugging, NOT a production
+# path.
+variable "image_ref" {
+  type        = string
+  description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
+  default     = ""
+}
+
 job "sequencer" {
   datacenters = ["dc1"]
   type        = "service"
@@ -76,12 +88,16 @@ job "sequencer" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.10:5000/kardamom-sequencer:dev"
-        # Always pull the freshly-built image: the mutable :dev tag would otherwise
-        # let Nomad reuse a stale node-cached layer across rebuilds (caused a
-        # crash-retry storm that stalled the deploy).
-        force_pull   = true
-        network_mode = "host"
+        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-sequencer:dev"
+        # force_pull kept for both paths (see the ingress job's comment):
+        # the :dev fallback needs it; on the pinned path the 1.9.5 driver
+        # pulls the tag but resolves the image by digest, so the pin holds.
+        force_pull = true
+        # Read-only rootfs (attested-identity P0.3): the sequencer writes only
+        # to the bind-mounted aeron dir + Nomad's alloc/local/secrets mounts.
+        # Validated by the cluster-e2e suite.
+        readonly_rootfs = true
+        network_mode    = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
         ]
@@ -168,9 +184,11 @@ job "sequencer" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.10:5000/kardamom-sequencer:dev"
-        force_pull   = true
-        network_mode = "host"
+        # Same digest-pin + fallback + readonly rationale as seq-a above.
+        image           = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-sequencer:dev"
+        force_pull      = true
+        readonly_rootfs = true
+        network_mode    = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
         ]
