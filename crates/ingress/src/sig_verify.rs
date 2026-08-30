@@ -16,14 +16,12 @@
 //!   amortizes wakeups + task hops, not vectorized math (secp256k1 doesn't
 //!   expose that).
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_consensus::TxEnvelope;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_primitives::{Address, B256, Bytes, keccak256};
-use tokio::sync::{Mutex, Notify, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::error::IngressError;
@@ -49,61 +47,57 @@ struct VerifyRequest {
     respond: oneshot::Sender<Result<(Address, B256), IngressError>>,
 }
 
-/// 64-deep recovery ring with a 50µs flush window.
+/// Batched recovery: `depth`-sized batches with a `flush_window` cap.
 ///
-/// Submitted requests park on a `oneshot` until the ring is flushed: either
-/// because depth was reached, or because the flush timer fires.
+/// One consumer task pulls requests from a bounded mpsc channel with
+/// `recv_many`. A batch flushes when it reaches `depth`, or when the
+/// window ends with a partial batch. The old shape was this channel built
+/// by hand: a `Mutex<Vec>` as the queue, a `Notify` as the wake, and a
+/// race where two `recover` callers both saw `len() >= depth` and the
+/// second drained an empty Vec.
 ///
-///: each `recover` call returns `(sender, tx_hash)`. The
-/// keccak256 over `raw_tx` is computed alongside ECDSA recovery in the same
-/// batch slot (essentially free vs. the ECDSA cost). Failure ⇒ caller rejects
-/// at the RPC boundary.
+/// Each `recover` call returns `(sender, tx_hash)`. The keccak256 over
+/// `raw_tx` is computed alongside ECDSA recovery in the same batch slot
+/// (essentially free vs. the ECDSA cost). Failure ⇒ caller rejects at the
+/// RPC boundary.
+///
+/// The queue is bounded at `depth * 4`: an overloaded verifier
+/// backpressures the RPC handlers instead of growing without limit. The
+/// consumer task exits when the verifier drops (all senders gone).
 pub struct BatchVerifier {
-    inner: Arc<Mutex<Vec<VerifyRequest>>>,
-    notify: Arc<Notify>,
-    depth: usize,
-    _flush_task: JoinHandle<()>,
+    tx: mpsc::Sender<VerifyRequest>,
 }
 
 impl BatchVerifier {
     pub fn new(depth: usize, flush_window: Duration) -> Self {
         assert!(depth > 0);
-        let inner: Arc<Mutex<Vec<VerifyRequest>>> = Arc::new(Mutex::new(Vec::with_capacity(depth)));
-        let notify = Arc::new(Notify::new());
-        let inner_for_task = inner.clone();
-        let notify_for_task = notify.clone();
-        let flush = tokio::spawn(async move {
-            let mut scratch: Vec<VerifyRequest> = Vec::new();
+        let (tx, mut rx) = mpsc::channel::<VerifyRequest>(depth * 4);
+        tokio::spawn(async move {
+            let mut batch: Vec<VerifyRequest> = Vec::with_capacity(depth);
             loop {
-                // Wait until at least one request is queued (or the verifier is
-                // dropped; in that case nothing notifies and the task just
-                // hangs harmlessly).
-                notify_for_task.notified().await;
-                // Bound the flush window. If `depth` requests showed up first
-                // the synchronous fast-path in `recover` already drained them,
-                // so this sleep just resolves remaining stragglers.
+                // Park until at least one request arrives. `recv_many`
+                // returns 0 only when every sender is gone — the verifier
+                // dropped, so the task exits.
+                if rx.recv_many(&mut batch, depth).await == 0 {
+                    return;
+                }
+                // Top the batch up inside the flush window. A full batch
+                // skips the wait entirely — `recv_many` already returned
+                // everything queued, and the loop condition is false.
                 let deadline = Instant::now() + flush_window;
-                tokio::time::sleep_until(deadline).await;
-                // Swap with a reusable scratch: the old drain().collect()
-                // allocated a fresh Vec per flush window (the ring grows
-                // once to steady-state capacity and is then reused).
-                scratch.clear();
-                {
-                    let mut g = inner_for_task.lock().await;
-                    std::mem::swap(&mut *g, &mut scratch);
+                while batch.len() < depth {
+                    let want = depth - batch.len();
+                    match tokio::time::timeout_at(deadline, rx.recv_many(&mut batch, want)).await {
+                        // Window over, or senders gone with a partial
+                        // batch: flush what we have.
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
                 }
-                if scratch.is_empty() {
-                    continue;
-                }
-                scratch = Self::process_batch_blocking(scratch).await;
+                batch = Self::process_batch_blocking(batch).await;
             }
         });
-        Self {
-            inner,
-            notify,
-            depth,
-            _flush_task: flush,
-        }
+        Self { tx }
     }
 
     /// Run the CPU-bound recovery for `batch` on the blocking pool
@@ -133,33 +127,22 @@ impl BatchVerifier {
     }
 
     /// Submit a tx envelope (plus its raw bytes) and await `(sender, tx_hash)`.
-    /// Flushes immediately if the ring fills.
+    /// A full batch flushes at once; a partial batch flushes at the window.
     pub async fn recover(
         &self,
         env: TxEnvelope,
         raw_tx: Bytes,
     ) -> Result<(Address, B256), IngressError> {
-        let (tx, rx) = oneshot::channel();
-        let should_flush_now = {
-            let mut g = self.inner.lock().await;
-            g.push(VerifyRequest {
+        let (otx, orx) = oneshot::channel();
+        self.tx
+            .send(VerifyRequest {
                 env,
                 raw_tx,
-                respond: tx,
-            });
-            g.len() >= self.depth
-        };
-        if should_flush_now {
-            // Drain and process now to avoid waiting for the timer.
-            let drained: Vec<VerifyRequest> = {
-                let mut g = self.inner.lock().await;
-                g.drain(..).collect()
-            };
-            let _ = Self::process_batch_blocking(drained).await;
-        } else {
-            self.notify.notify_one();
-        }
-        rx.await
+                respond: otx,
+            })
+            .await
+            .map_err(|_| IngressError::Internal("verifier task gone".into()))?;
+        orx.await
             .map_err(|_| IngressError::Internal("verifier dropped".into()))?
     }
 }
