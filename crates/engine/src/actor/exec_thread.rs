@@ -14,7 +14,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, Deposit, EpochRecord, SnapshotSource,
-    TxEnvelope,
+    StateDatabase, TxEnvelope,
 };
 
 use crate::block_env::ExecEnv;
@@ -510,6 +510,55 @@ where
         self.record_applied("execute_deposit_tx", position, result, apply_start)
     }
 
+    /// Run the block-close protocol actions for the block being sealed.
+    ///
+    /// Supplies the two state layers `exec-core` cannot see — the merged
+    /// unsettled-parent delta, then the mdbx snapshot — so the composed read is
+    /// `delta → parent → snapshot`, matching what the EVM sees through
+    /// `seed_cache_layer`. Reading the snapshot alone would miss both the
+    /// current block's writes and up to K unsettled blocks, which for a flag
+    /// read means activating late (or never) on a busy chain while a quieter
+    /// replica activated on time: a divergence.
+    fn apply_block_close_actions(
+        &mut self,
+        block_number: u64,
+        header_ts_ms: u64,
+    ) -> Result<(), ExecutorError> {
+        // Field-level destructuring: `delta` is borrowed mutably while
+        // `parent`/`snapshot` are read by the closure.
+        let Self {
+            delta,
+            parent,
+            snapshot,
+            ..
+        } = self;
+
+        let outcome = kardamom_exec_core::features::apply_block_close_actions(
+            delta,
+            block_number,
+            header_ts_ms,
+            |addr, slot| {
+                if let Some(v) = parent.as_ref().and_then(|p| p.storage.get(&(addr, slot))) {
+                    return Ok(*v);
+                }
+                snapshot.storage(addr, slot).map_err(|e| {
+                    ExecutorError::State(format!("block-close read {addr}/{slot}: {e:?}"))
+                })
+            },
+        )?;
+
+        if let Some(beat) = outcome.health_beat {
+            metrics::counter!(crate::metrics::HEALTH_BEACON_BEATS_TOTAL).increment(1);
+            tracing::info!(
+                block_number,
+                beat,
+                l2_timestamp_ms = header_ts_ms,
+                "health beacon"
+            );
+        }
+        Ok(())
+    }
+
     fn on_boundary(&mut self, start: BlockBoundaryStart) -> Result<Flow, ExecutorError> {
         let BlockBoundaryStart {
             block_number,
@@ -598,6 +647,23 @@ where
             metrics::histogram!(crate::metrics::BLOCK_APPLY_DURATION_SECONDS)
                 .record(elapsed.as_secs_f64());
         }
+
+        // Block-close protocol actions (L1-governed feature flags).
+        //
+        // Placed here deliberately: after EVERY record of the block has landed
+        // in `self.delta` (streaming arms above, or the whole-block strategy's
+        // fold just above) and before the delta is taken for the writer. That
+        // ordering is what lets an upgrade deposit activate a feature for the
+        // very block that carried it, and puts the actions' writes in the same
+        // delta the validator cross-checks.
+        //
+        // This runs on EVERY role, because it is engine code: the executor,
+        // the streaming validator and the parallel validator all reach it. A
+        // role that skipped it would diverge on the first active block.
+        //
+        // `l2_timestamp` is THIS boundary's stamp — the block's own header
+        // time, not the (previous boundary's) time its txs executed with.
+        self.apply_block_close_actions(block_number, l2_timestamp)?;
 
         // S0: NO state-root computation. The sealed
         // BlockBoundary on tx_receipts is slim — no

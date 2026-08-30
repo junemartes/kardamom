@@ -266,6 +266,44 @@ downstream by the first-seen dedup on `source_hash`. A dead watcher stalls
 deposits only, and it reads *finalized* L1 blocks, so reorgs are out of scope
 by construction.
 
+## L1-governed upgrades (feature flags)
+
+A feature flag is turned on by an **upgrade transaction**: an L1 call to
+`ETHLockbox.initiateUpgrade`, authorized to the factory owner (a Safe in
+production), which the DA-watcher derives into a system deposit that writes the
+`KardamomChainState` predeploy. Because it rides the deposit path, it inherits
+that path's failure modes wholesale — finalized-only reads, at-least-once
+delivery, first-seen dedup — and adds no new ones. Design:
+`docs/specs/2026-08-16-l1-upgrade-feature-flags-design.md`.
+
+What matters operationally is that **mixed-version fleets fail-stop rather than
+fork**, in two distinct places:
+
+- An **old validator** (a binary whose `derive_epoch` does not know about
+  `UpgradeInitiated`, running with L1 verification) halts at the epoch
+  containing the upgrade — it re-derives that L1 block, sees a deposit it
+  cannot account for, and reports `DepositsMismatch`. Loud and attributable,
+  not a silent divergence.
+- An **old executor** would apply the `setFeature` deposit fine (it is ordinary
+  deposit data on the wire) but lacks the block-close hook, so a *new*
+  validator's write-set comparison fails on the first active block.
+
+Hence the rollout rule: **ship the binaries first, flip the flag second.** The
+activation timestamp exists to give operators that window.
+
+The one liveness gap is inherited from the watcher's in-memory cursor: a
+watcher that restarts *after* the upgrade's L1 block finalized but before
+observing it re-seeds at the current tip and skips that epoch — the same
+seed-skip that affects user deposits. The runbook is therefore to confirm the
+L2 receipt (keyed by the domain-1 `source_hash` of the L1 log position) before
+treating an upgrade as applied; the L1 `upgradeNonce` makes a re-send
+unambiguous.
+
+Covered by the chain-semantics suite's S13a/b/c (immediate activation,
+scheduled activation, and both authority gates), which assert an EXACT beacon
+count per block on the executor *and* the validator — a "greater than zero"
+check would pass against a feature that activated once and stopped.
+
 ## Substrate (the shared failure domain)
 
 - **ArchivingMediaDriver** — one combined Media Driver + Archive JVM per node

@@ -21,6 +21,7 @@ alloy-rlp = { workspace = true, features = ["derive"] }
 alloy-trie = { version = "0.9", features = ["ethereum"] }
 bytes.workspace = true
 crossbeam-channel = "0.5"
+arc-swap = { workspace = true }
 kardamom-log.workspace = true
 kardamom-types.workspace = true
 # Shadow-check counters surface in the host process's Prometheus exporter.

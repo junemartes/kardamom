@@ -53,6 +53,15 @@ sol! {
             uint64 gasLimit,
             bytes data
         );
+        /// The upgrade transaction. Authorized to the factory owner;
+        /// `activationTimestamp` is epoch-MILLISECONDS, 0 = immediately.
+        function initiateUpgrade(uint256 featureId, uint64 activationTimestamp) external;
+        function upgradeNonce() external view returns (uint64);
+        event UpgradeInitiated(
+            uint64 indexed upgradeNonce,
+            uint256 indexed featureId,
+            uint64 activationTimestamp
+        );
     }
 
     #[sol(rpc)]
