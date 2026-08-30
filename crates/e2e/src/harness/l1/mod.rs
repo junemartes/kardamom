@@ -248,6 +248,81 @@ impl L1 {
         Ok((block_hash, log_index))
     }
 
+    /// Send an **upgrade transaction** as the chain's L1 authority.
+    ///
+    /// `DEV_OWNER` is the factory owner and is impersonated for the anvil's
+    /// lifetime (see `launch`), which is how the harness already drives
+    /// `applyDeployments` — so this is the same authority path production uses
+    /// with a Safe, not a test-only bypass.
+    ///
+    /// `activation_timestamp` is epoch-**milliseconds** (L2 `block.timestamp`
+    /// is ms on this chain); `0` activates immediately. Returns the L1 block
+    /// hash and log index the system deposit's `source_hash` derives from.
+    pub async fn initiate_upgrade(
+        &self,
+        feature_id: U256,
+        activation_timestamp: u64,
+    ) -> Result<(B256, u64)> {
+        let provider = self.provider();
+        let lockbox = ETHLockbox::new(self.lockbox, &provider);
+        let receipt = lockbox
+            .initiateUpgrade(feature_id, activation_timestamp)
+            .from(DEV_OWNER)
+            .send()
+            .await
+            .context("send initiateUpgrade")?
+            .get_receipt()
+            .await
+            .context("initiateUpgrade receipt")?;
+        anyhow::ensure!(receipt.status(), "initiateUpgrade reverted");
+        let log = receipt
+            .inner
+            .logs()
+            .iter()
+            .find(|l| l.address() == self.lockbox)
+            .context("no UpgradeInitiated log from the lockbox")?;
+        Ok((
+            log.block_hash.context("log carries no block hash")?,
+            log.log_index.context("log carries no index")?,
+        ))
+    }
+
+    /// Attempt an upgrade transaction from an account that is NOT the
+    /// authority. Returns the error the chain produced.
+    ///
+    /// Used as a negative control, so it deliberately returns `Ok(())` only
+    /// when the call actually SUCCEEDED — the caller asserts on the error.
+    pub async fn try_initiate_upgrade_unauthorized(
+        &self,
+        key: &str,
+        feature_id: U256,
+    ) -> Result<()> {
+        let provider = self.wallet(key)?;
+        let lockbox = ETHLockbox::new(self.lockbox, &provider);
+        // A revert can surface either at estimate/call time (`send` errors) or
+        // as a failed receipt, depending on the node; treat both as rejection
+        // and only a successful receipt as a breach.
+        match lockbox.initiateUpgrade(feature_id, 0).send().await {
+            Err(e) => Err(anyhow::anyhow!("rejected at send: {e}")),
+            Ok(pending) => match pending.get_receipt().await {
+                Err(e) => Err(anyhow::anyhow!("rejected before receipt: {e}")),
+                Ok(r) if !r.status() => Err(anyhow::anyhow!("reverted on chain")),
+                Ok(_) => Ok(()),
+            },
+        }
+    }
+
+    /// The lockbox's current upgrade nonce.
+    pub async fn upgrade_nonce(&self) -> Result<u64> {
+        let provider = self.provider();
+        let lockbox = ETHLockbox::new(self.lockbox, &provider);
+        lockbox
+            .upgradeNonce()
+            .call()
+            .await
+            .context("read upgradeNonce")
+    }
+
     /// Several `depositETH` calls landing in ONE L1 block — i.e. one epoch
     /// with several deposits.
     ///
@@ -329,21 +404,43 @@ impl L1 {
         Ok(block.header.number)
     }
 
-    /// Every `DepositInitiated` log the lockbox emitted in `[from, to]`,
+    /// Every lockbox log — deposits **and** upgrades — emitted in `[from, to]`,
     /// decoded through the SAME rule the producer uses.
     ///
     /// Tests compare the chain against this, so re-implementing the decode
     /// here would let a producer bug and a test bug cancel out.
+    pub async fn lockbox_logs(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<kardamom_types::epoch::LockboxLog>> {
+        // Via `provider_for` rather than `provider()`: the method returns an
+        // `impl Provider` capturing `&self`, and `L1Source` needs `'static`.
+        let source = kardamom_da_watcher::RpcL1Source::new(provider_for(self.anvil.endpoint()));
+        kardamom_da_watcher::L1Source::lockbox_logs(&source, self.lockbox, from_block, to_block)
+            .await
+            .context("read lockbox logs")
+    }
+
+    /// Just the `DepositInitiated` logs from [`Self::lockbox_logs`].
+    ///
+    /// Deliberately filtered rather than fetched separately: callers key on the
+    /// USER-domain `source_hash`, which an upgrade log does not have (system
+    /// deposits derive under domain 1), so handing them the union would compute
+    /// ids that match nothing.
     pub async fn deposit_logs(
         &self,
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<kardamom_types::DepositLog>> {
-        // Via `provider_for` rather than `provider()`: the method returns an
-        // `impl Provider` capturing `&self`, and `L1Source` needs `'static`.
-        let source = kardamom_da_watcher::RpcL1Source::new(provider_for(self.anvil.endpoint()));
-        kardamom_da_watcher::L1Source::deposit_logs(&source, self.lockbox, from_block, to_block)
-            .await
-            .context("read deposit logs")
+        Ok(self
+            .lockbox_logs(from_block, to_block)
+            .await?
+            .into_iter()
+            .filter_map(|l| match l {
+                kardamom_types::epoch::LockboxLog::Deposit(d) => Some(d),
+                kardamom_types::epoch::LockboxLog::Upgrade(_) => None,
+            })
+            .collect())
     }
 }

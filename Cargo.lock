@@ -2233,6 +2233,7 @@ dependencies = [
  "kardamom-bench",
  "kardamom-da-watcher",
  "kardamom-deployer",
+ "kardamom-exec-core",
  "kardamom-executor",
  "kardamom-ingress",
  "kardamom-log",
