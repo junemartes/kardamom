@@ -52,7 +52,7 @@ pub use prover::{
     BatchProverInput, BatchPublicOutputs, BlockRecordsDigest, ProverInput, ProverRecord,
     PublicOutputs, batch_records_commitment,
 };
-pub use receipt::{Receipt, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, WireLog, tx_type_of};
+pub use receipt::{Receipt, SkipReason, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, WireLog, tx_type_of};
 pub use state::{SnapshotSource, StateDatabase, StateError};
 pub use tx_error::{TxError, TxErrorReason};
 pub use tx_ordering::TxOrderingMessage;

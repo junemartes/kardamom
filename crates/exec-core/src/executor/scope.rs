@@ -4,7 +4,7 @@
 
 use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256};
-use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
+use kardamom_types::{BPosition, Receipt, SkipReason, StateDatabase, TxEnvelope};
 use revm::context::result::ExecutionResult;
 use revm::database::CacheDB;
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
@@ -233,6 +233,7 @@ impl<S: StateDatabase> Executor<S> {
             block_number: self.env.block_number,
             transaction_index: tx_index_in_block,
             cumulative_gas_used,
+            skip_reason: None,
         };
         Ok((receipt, ws))
     }
@@ -270,8 +271,10 @@ impl<S: StateDatabase> Executor<S> {
         // (`kardamom_executor_invalid_tx_skipped_total` deserves an alert).
         let alloy_env = match DecodedTx::decode(&inbound_envelope.raw_tx, tx_idx) {
             Ok(env_) => env_,
-            Err(_) => {
+            Err(e) => {
                 return Ok(Self::skip_receipt(
+                    SkipReason::Undecodable,
+                    &format!("undecodable raw_tx: {e}"),
                     tx_position,
                     inbound_envelope,
                     0,
@@ -329,8 +332,10 @@ impl<S: StateDatabase> Executor<S> {
             Ok(o) => o,
             // Deterministic input-invalidity: every replica computes the same
             // rejection from the same (state, tx) — skip, never halt (#92).
-            Err(revm::context::result::EVMError::Transaction(_)) => {
+            Err(revm::context::result::EVMError::Transaction(e)) => {
                 return Ok(Self::skip_receipt(
+                    skip_reason_of_tx(&e),
+                    &format!("{e:?}"),
                     tx_position,
                     inbound_envelope,
                     nonce,
@@ -340,8 +345,10 @@ impl<S: StateDatabase> Executor<S> {
                     cumulative_gas_used_before,
                 ));
             }
-            Err(revm::context::result::EVMError::Header(_)) => {
+            Err(revm::context::result::EVMError::Header(e)) => {
                 return Ok(Self::skip_receipt(
+                    SkipReason::Header,
+                    &format!("{e:?}"),
                     tx_position,
                     inbound_envelope,
                     nonce,
@@ -431,6 +438,7 @@ impl<S: StateDatabase> Executor<S> {
             block_number: self.env.block_number,
             transaction_index: tx_index_in_block,
             cumulative_gas_used,
+            skip_reason: None,
         };
         Ok((receipt, ws))
     }
@@ -491,6 +499,31 @@ impl<S: StateDatabase> Executor<S> {
     }
 }
 
+/// Coarse, deterministic classification of a revm tx-validation rejection
+/// into the wire [`SkipReason`]. Part of the state transition: every
+/// replica maps the same rejection to the same reason (an orphan-rule-free
+/// stand-in for `From<&InvalidTransaction>` — both types are foreign here).
+pub fn skip_reason_of_tx(err: &revm::context::result::InvalidTransaction) -> SkipReason {
+    use revm::context::result::InvalidTransaction as E;
+    match err {
+        E::NonceTooLow { .. } => SkipReason::NonceTooLow,
+        E::NonceTooHigh { .. } => SkipReason::NonceTooHigh,
+        E::LackOfFundForMaxFee { .. } | E::OverflowPaymentInTransaction => {
+            SkipReason::InsufficientFunds
+        }
+        E::CallerGasLimitMoreThanBlock
+        | E::CallGasCostMoreThanGasLimit { .. }
+        | E::GasFloorMoreThanGasLimit { .. }
+        | E::TxGasLimitGreaterThanCap { .. } => SkipReason::GasLimit,
+        E::PriorityFeeGreaterThanMaxFee
+        | E::GasPriceLessThanBasefee
+        | E::BlobGasPriceGreaterThanMax { .. } => SkipReason::Fee,
+        E::CreateInitCodeSizeLimit => SkipReason::InitCodeSize,
+        E::RejectCallerWithCode => SkipReason::SenderHasCode,
+        _ => SkipReason::OtherTransaction,
+    }
+}
+
 /// The deterministic SKIP receipt, as an associated constructor (no state
 /// access): the Block-STM engine builds skip receipts inside its own
 /// worker EVM and must keep ONE definition of the skip artifact.
@@ -503,7 +536,10 @@ impl<S: StateDatabase> Executor<S> {
     /// by design: a skip existing at all means an upstream guard let an
     /// invalid record reach the canonical log.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "std"), allow(unused_variables))]
     pub fn skip_receipt(
+        reason: SkipReason,
+        detail: &str,
         tx_position: BPosition,
         inbound_envelope: &TxEnvelope,
         nonce: u64,
@@ -512,6 +548,22 @@ impl<S: StateDatabase> Executor<S> {
         tx_index_in_block: u64,
         cumulative_gas_used_before: u64,
     ) -> (Receipt, WriteSet) {
+        // Loudness is a `std`-side concern; the skip receipt itself is the
+        // consensus artifact and is produced identically in guest builds.
+        // `detail` keeps the full revm rejection next to the coarse enum.
+        #[cfg(feature = "std")]
+        {
+            tracing::error!(
+                tx_hash = ?inbound_envelope.tx_hash,
+                from = ?inbound_envelope.sender,
+                nonce,
+                block = block_number,
+                reason = reason.as_str(),
+                detail,
+                "INVALID canonical tx SKIPPED (deterministic; upstream guard failed — investigate)"
+            );
+            crate::metrics::record_invalid_tx_skipped(reason);
+        }
         let ws = WriteSet::default();
         let write_set_hash = ws.hash();
         let receipt = Receipt {
@@ -530,6 +582,7 @@ impl<S: StateDatabase> Executor<S> {
             block_number,
             transaction_index: tx_index_in_block,
             cumulative_gas_used: cumulative_gas_used_before,
+            skip_reason: Some(reason),
         };
         (receipt, ws)
     }
@@ -538,6 +591,8 @@ impl<S: StateDatabase> Executor<S> {
     #[allow(clippy::too_many_arguments)]
     pub fn skip(
         &self,
+        reason: SkipReason,
+        detail: &str,
         tx_position: BPosition,
         inbound_envelope: &TxEnvelope,
         nonce: u64,
@@ -546,6 +601,8 @@ impl<S: StateDatabase> Executor<S> {
         cumulative_gas_used_before: u64,
     ) -> (Receipt, WriteSet) {
         Self::skip_receipt(
+            reason,
+            detail,
             tx_position,
             inbound_envelope,
             nonce,
@@ -629,6 +686,11 @@ mod tests {
         )
         .expect("invalid tx must SKIP, not error");
         assert!(receipt.is_invalid_skip(), "status=false, gas_used=0 marker");
+        assert_eq!(
+            receipt.skip_reason,
+            Some(SkipReason::NonceTooLow),
+            "typed cause on the wire (#241)"
+        );
         assert_eq!(receipt.tx_hash, stale.tx_hash);
         assert_eq!(receipt.nonce, 3);
         assert_eq!(
@@ -660,6 +722,7 @@ mod tests {
         .expect("valid tx after a skip");
         assert!(r2.status);
         assert!(!r2.is_invalid_skip());
+        assert_eq!(r2.skip_reason, None, "an executed tx carries no reason");
     }
 
     #[test]
@@ -688,6 +751,7 @@ mod tests {
         )
         .expect("undecodable bytes must SKIP, not error");
         assert!(receipt.is_invalid_skip());
+        assert_eq!(receipt.skip_reason, Some(SkipReason::Undecodable));
         assert_eq!(receipt.nonce, 0, "nonce unknowable from undecodable bytes");
         assert_eq!(receipt.write_set_hash, WriteSet::default().hash());
         assert!(ws.accounts.is_empty());

@@ -50,8 +50,10 @@ pub struct FloorUpdate {
     pub deposit: bool,
     /// #92 marker receipt: the tx was ORDERED (canonical-log commitment is
     /// proven — it confirms publishes) but consumed no nonce (it is NOT
-    /// floor evidence).
-    pub invalid_skip: bool,
+    /// floor evidence). `Some` carries the typed cause (#241) — the floor
+    /// logic only asks "is this a skip?" today; reason-specific handling
+    /// (drop on `NonceTooLow`, evict on `NonceTooHigh`) is the follow-up.
+    pub skip_reason: Option<kardamom_types::SkipReason>,
 }
 
 /// Shared state between the egress-watermark FEED thread and the publish
@@ -274,7 +276,7 @@ impl ResyncController {
                         continue;
                     }
                     confirmations.push((u.sender, u.executed_nonce));
-                    if u.invalid_skip {
+                    if u.skip_reason.is_some() {
                         continue;
                     }
                     let floor = u.executed_nonce.saturating_add(1);
