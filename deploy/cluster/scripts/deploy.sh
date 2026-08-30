@@ -13,7 +13,45 @@
 #   deploy/cluster/scripts/deploy.sh
 #   NOMAD_ADDR=http://192.168.56.10:4646 deploy/cluster/scripts/deploy.sh
 #   LOCKBOX_ADDRESS=0x... deploy/cluster/scripts/deploy.sh   # for da-watcher
+#   KARDAMOM_REQUIRE_SIGNED=1 deploy/cluster/scripts/deploy.sh   # prod posture
 set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: deploy.sh [-h|--help]
+
+Deploys the kardamom Nomad job pipeline (Aeron substrate -> anvil L1 ->
+cluster/sequencer/ingress/executor/validator/da-watcher -> batcher). All
+configuration is via environment variables; see the header comment for
+NOMAD_ADDR / LOCKBOX_ADDRESS / SETTLEMENT_ADDRESS / DIGEST_MANIFEST.
+
+Signature verification (attested-identity P0.5, cosign keyless + public
+Rekor):
+
+  KARDAMOM_REQUIRE_SIGNED=1
+      Before ANY job run: verify the digest manifest's signature bundle
+      (<manifest>.sigbundle, written by the CI push path) and every pinned
+      image's keyless signature, both against the pinned CI identity. Any
+      failure — missing manifest, missing bundle, bad signature, unverifiable
+      image — REFUSES the deploy (fail closed). This is the PRODUCTION
+      posture.
+
+  DEFAULT: OFF. Unsigned local deploys are a dev affordance for the local
+  cluster, loudly warned about at run time — a production deploy without
+  KARDAMOM_REQUIRE_SIGNED=1 has no supply-chain integrity gate.
+
+  Identity pinning (defaults for junemartes/kardamom's CI live in ONE place,
+  scripts/lib-signing.sh signing_defaults; override to re-pin):
+      KARDAMOM_CERT_IDENTITY_RE    certificate identity regexp
+                                   (org/repo/workflow ref of the signing run)
+      KARDAMOM_CERT_OIDC_ISSUER    OIDC issuer (GitHub Actions)
+EOF
+}
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  "") ;;
+  *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+esac
 
 # --- locate the nomad/ job dir relative to this script ----------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,6 +86,104 @@ if ! command -v nomad >/dev/null 2>&1; then
   echo "ERROR: 'nomad' CLI not found on PATH. Install Nomad or run this on r1." >&2
   exit 1
 fi
+
+# --- digest-pinned image refs (attested-identity P0.1) -----------------------
+# The image build/push step (ci-images.sh push_image, or `make images`) records
+# each pushed image's registry digest in the manifest below, one line per
+# image: "<svc> <repo>:<tag>@sha256:...". Every kardamom job exposes an
+# `image_ref` HCL variable; passing the digest ref through it makes the task
+# run the EXACT bytes this deploy pushed (a digest is immutable — nobody who
+# can push to the registry can change what a restart runs). The COMBINED
+# repo:tag@digest form matters: Nomad 1.9.5's docker driver mis-parses a bare
+# repo@digest on a port-carrying registry host ("invalid reference format" at
+# pull; see ci-images.sh push_image). The manifest + this deploy log are the
+# audit record of what this deploy pinned; operational tooling can audit the
+# running fleet against them later.
+#
+# Fallback: a missing manifest (or missing per-service line) leaves image_ref
+# empty and the job runs its mutable :dev tag default. That fallback exists so
+# a manual `nomad job run <job>.nomad.hcl` during debugging still works — it
+# is a DEV AFFORDANCE, not a production path, and it is loudly warned about.
+DIGEST_MANIFEST="${DIGEST_MANIFEST:-${CLUSTER_DIR}/images.digests}"
+if [[ -f "${DIGEST_MANIFEST}" ]]; then
+  echo "==> Image digests:  ${DIGEST_MANIFEST}"
+  sed 's/^/    /' "${DIGEST_MANIFEST}"
+else
+  echo "WARNING: digest manifest not found at ${DIGEST_MANIFEST}." >&2
+  echo "         Jobs will run mutable :dev tags (dev fallback, NOT a" >&2
+  echo "         production path). Run the image build/push step to pin." >&2
+fi
+
+# --- signed-manifest verification (attested-identity P0.5) -------------------
+# A deploy-time signature is a birth certificate, not a pulse: this gate
+# proves the manifest (and every image it pins) was produced by the pinned CI
+# identity BEFORE any job run; the continuous half lives in the private
+# repo's image-drift sweep, which verifies the same bundle before trusting
+# the manifest as its expected-state anchor. Fail closed on ANY failure —
+# missing manifest, missing bundle, bad signature — matching the
+# corrupt-manifest posture in image_ref_args below.
+if [[ "${KARDAMOM_REQUIRE_SIGNED:-0}" == "1" ]]; then
+  # shellcheck source=deploy/cluster/scripts/lib-signing.sh
+  source "${SCRIPT_DIR}/lib-signing.sh"
+  echo "==> KARDAMOM_REQUIRE_SIGNED=1: verifying manifest + image signatures (cosign, public Rekor)"
+  if [[ ! -f "${DIGEST_MANIFEST}" ]]; then
+    echo "ERROR: KARDAMOM_REQUIRE_SIGNED=1 but there is no digest manifest at" >&2
+    echo "       ${DIGEST_MANIFEST}. A signed deploy cannot fall back to mutable" >&2
+    echo "       tags; refusing to deploy." >&2
+    exit 1
+  fi
+  if ! verify_manifest_signature "${DIGEST_MANIFEST}"; then
+    echo "ERROR: digest manifest signature verification FAILED — refusing to deploy." >&2
+    exit 1
+  fi
+  SIGNED_REF_RE='^[a-z0-9./:-]+@sha256:[0-9a-f]{64}$'
+  VERIFIED_IMAGES=0
+  # fd 3, not stdin: cosign must not be able to swallow manifest lines.
+  while read -r -u 3 svc ref _; do
+    [[ -z "${svc}" || "${svc}" == \#* ]] && continue
+    if [[ ! "${ref}" =~ ${SIGNED_REF_RE} ]]; then
+      echo "ERROR: malformed digest ref for '${svc}' in the SIGNED manifest: '${ref}'" >&2
+      echo "       (signature verified but the content is not a pinned ref) — refusing to deploy." >&2
+      exit 1
+    fi
+    if ! verify_image_signature "${ref}"; then
+      echo "ERROR: image signature verification FAILED for '${svc}' (${ref}) — refusing to deploy." >&2
+      exit 1
+    fi
+    VERIFIED_IMAGES=$((VERIFIED_IMAGES + 1))
+  done 3<"${DIGEST_MANIFEST}"
+  echo "==> signatures OK: manifest bundle + ${VERIFIED_IMAGES} image ref(s) verified"
+else
+  echo "WARNING: KARDAMOM_REQUIRE_SIGNED is not set — deploying WITHOUT" >&2
+  echo "         signature verification. This is the local-dev posture only;" >&2
+  echo "         production deploys must set KARDAMOM_REQUIRE_SIGNED=1" >&2
+  echo "         (see --help)." >&2
+fi
+
+# Populate IMAGE_REF_ARGS=(-var image_ref=<repo>:<tag>@sha256:...) for a
+# service, or leave it empty (tag fallback) when the manifest has no line for
+# it. The last matching line wins, mirroring push order. A PRESENT-but-
+# malformed ref is a hard error, not a fallback: it means the manifest is
+# corrupt (hand-edited, or a capture bug) and deploying unpinned while a
+# manifest exists would silently break the audit record.
+IMAGE_REF_ARGS=()
+image_ref_args() {
+  local svc="$1" ref="" ref_re='^[a-z0-9./:-]+@sha256:[0-9a-f]{64}$'
+  IMAGE_REF_ARGS=()
+  if [[ -f "${DIGEST_MANIFEST}" ]]; then
+    ref="$(awk -v s="${svc}" '$1 == s { r = $2 } END { print r }' "${DIGEST_MANIFEST}" | tr -d '[:space:]\r')"
+  fi
+  if [[ -n "${ref}" ]]; then
+    if [[ ! "${ref}" =~ ${ref_re} ]]; then
+      echo "ERROR: malformed digest ref for '${svc}' in ${DIGEST_MANIFEST}: '${ref}'" >&2
+      echo "       expected <repo>:<tag>@sha256:<64 hex>; refusing to deploy from a corrupt manifest." >&2
+      exit 1
+    fi
+    IMAGE_REF_ARGS=(-var "image_ref=${ref}")
+  else
+    echo "WARNING: no pinned digest for '${svc}'; its job falls back to the mutable :dev tag." >&2
+  fi
+}
 
 # --- helpers ----------------------------------------------------------------
 
@@ -103,7 +239,8 @@ wait_running() {
 # --- 1. Aeron substrate (system job on all nodes) ---------------------------
 echo
 echo "### Phase 1: Aeron substrate"
-run_job "aeron.system.nomad.hcl"
+image_ref_args aeron
+run_job "aeron.system.nomad.hcl" ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
 # Generous timeout: every worker node force-pulls the aeron image from the single
 # in-cluster registry at once, slow under CI CPU contention (the dedicated cluster
 # nodes added more concurrent pullers). Comes up well under this cap on a healthy
@@ -190,18 +327,23 @@ if [[ -n "${KARDAMOM_CLUSTER_SNAPSHOT_S:-}" ]]; then
   echo "==> cluster: snapshot interval override: ${KARDAMOM_CLUSTER_SNAPSHOT_S}s"
   CLUSTER_ARGS+=(-var "cluster_snapshot_interval_s=${KARDAMOM_CLUSTER_SNAPSHOT_S}")
 fi
-run_job "cluster.nomad.hcl" "${CLUSTER_ARGS[@]}"
+image_ref_args cluster
+CLUSTER_ARGS+=(${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"})
+run_job "cluster.nomad.hcl" ${CLUSTER_ARGS[@]+"${CLUSTER_ARGS[@]}"}
 wait_running "cluster" 300
-run_job "sequencer.nomad.hcl"
+image_ref_args sequencer
+run_job "sequencer.nomad.hcl" ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
 # Bring the ingress up BEFORE the executor. The ingress is the tx_receipts
 # SUBSCRIBER and the executor is the must-deliver PUBLISHER; starting the
 # subscriber first means the executor's receipt publications connect immediately
 # instead of stalling against a not-yet-present subscriber during bring-up (which
 # would back-pressure the exec→commit channel and freeze state). The ingress also
 # subscribes the quorum watermark (from the already-running aggregator) here.
-run_job "ingress.nomad.hcl"
+image_ref_args ingress
+run_job "ingress.nomad.hcl" ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
 wait_running "ingress" 240
-run_job "executor.nomad.hcl"
+image_ref_args executor
+run_job "executor.nomad.hcl" ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
 # The validator is a passive follower (subscribes to the same multicast
 # channels + its own cluster egress session); it can come up alongside the
 # executors — it re-executes from genesis regardless of join order.
@@ -231,9 +373,12 @@ if [ -n "${L1_LIGHT_CLIENT_EXECUTION_RPC:-}" ] && [ -n "${L1_LIGHT_CLIENT_CONSEN
     -var "lockbox_address=${LOCKBOX_ADDRESS}"
   )
 fi
-run_job "validator.nomad.hcl" ${VALIDATOR_ARGS[@]+"${VALIDATOR_ARGS[@]}"}
+image_ref_args validator
+run_job "validator.nomad.hcl" ${VALIDATOR_ARGS[@]+"${VALIDATOR_ARGS[@]}"} ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
 # (The ${arr[@]+...} expansion keeps `set -u` happy on bash 3.2 — macOS'
 # /bin/bash — where expanding an empty array is an "unbound variable" error.)
+image_ref_args da-watcher
+DA_WATCHER_ARGS+=(${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"})
 run_job "da-watcher.nomad.hcl" ${DA_WATCHER_ARGS[@]+"${DA_WATCHER_ARGS[@]}"}
 
 # The cluster was already waited-on above (before the sequencer connected).
@@ -249,6 +394,8 @@ BATCHER_ARGS=()
 if [[ -n "${SETTLEMENT_ADDRESS}" ]]; then
   BATCHER_ARGS=(-var "settlement_address=${SETTLEMENT_ADDRESS}")
 fi
+image_ref_args batcher
+BATCHER_ARGS+=(${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"})
 run_job "batcher.nomad.hcl" ${BATCHER_ARGS[@]+"${BATCHER_ARGS[@]}"}
 if [[ -n "${SETTLEMENT_ADDRESS}" ]]; then
   wait_running "batcher" 240
