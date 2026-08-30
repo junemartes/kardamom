@@ -134,6 +134,8 @@ The Nomad job specs pull their config payloads from `config/` with HCL2
 `file()`, so submit them **from `deploy/cluster/`** (`scripts/deploy.sh` and
 `make validate` already do).
 
+Operational integrity tooling lives in the private infra repo.
+
 ## Aeron-in-Docker
 
 - **Shared `aeron.dir`:** Ansible mounts a host tmpfs at
