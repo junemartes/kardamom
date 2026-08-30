@@ -78,10 +78,12 @@
 #
 # Cases: graceful-executor hard-executor graceful-ingress hard-ingress
 #        graceful-sequencer hard-sequencer sequencer-replica-kill
-#        sequencer-lapse
-#        sealer-graceful sealer-hard
-#        node-failure-executor archive-driver-loss
-#        cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover
+#        sequencer-lapse validator-lapse validator-join
+#        node-failure-executor state-checkpoint-restore replay-window-resync
+#        retention-overrun retention-overrun-validator
+#        archive-driver-loss archive-tx-data-wipe archive-corruption
+#        cluster-leader-kill cluster-follower-kill cluster-member-rejoin
+#        cluster-quorum-loss-recover
 # =============================================================================
 set -euo pipefail
 
@@ -112,6 +114,9 @@ LOAD_BIN="${LOAD_BIN:-${ROOT}/target/release/kardamom-load}"
 # Archive repair tool (archive-corruption case); built with the service bins.
 REREP_BIN="${REREP_BIN:-${ROOT}/target/release/kardamom-archive-rereplicate}"
 CHAOS_TPS="${CHAOS_TPS:-50}"
+# D-11: rotate the ingress blast radius across runs (0 or 1). Deterministic
+# per CI run (GITHUB_RUN_ID parity), overridable locally.
+INGRESS_VICTIM="${INGRESS_VICTIM:-$(( ${GITHUB_RUN_ID:-0} % 2 ))}"
 CHAOS_CASE_S="${CHAOS_CASE_S:-45}"
 LOAD_MAX_GAP="${LOAD_MAX_GAP:-5}"
 # Service jobs use force_pull=true, so a restart re-pulls the image from the
@@ -191,7 +196,8 @@ run_case() { # <case-name>
 
   # One dedicated fresh funded account per case (single sender, nonces from 0)
   # so cases never collide / leave nonce gaps on the never-reset chain.
-  if [ "${name}" = "sequencer-replica-kill" ] || [ "${name}" = "sequencer-lapse" ]; then
+  if [ "${name}" = "sequencer-replica-kill" ] || [ "${name}" = "sequencer-lapse" ] \
+    || [ "${name}" = "graceful-sequencer" ] || [ "${name}" = "hard-sequencer" ]; then
     # PIN this case's load to SHARD 0 — the shard whose replica A is killed
     # (or paused). An arbitrary account lands on shard 0 or 1 by address
     # hash, so ~half of runs would otherwise drive an UNTOUCHED shard and the

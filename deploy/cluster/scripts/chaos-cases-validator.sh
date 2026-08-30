@@ -204,7 +204,7 @@ run_validator_lapse() {
     val_debug
     fail "validator-lapse: validator not verifying live + caught up within ${t}s of thaw (path=${path:-unknown}, verified=${vf1:-?}, block=${v1:-?}, exec=${e_now:-?})"
   fi
-  d1="$(val_metric validator_divergence_total)"; d1="${d1:-0}"
+  d1="$(val_metric_req validator_divergence_total 'validator-lapse divergence==0 assert')"
   [ "${d1}" -eq 0 ] || fail "validator-lapse: ${d1} divergence(s) after recovery"
   if [ "${path}" = "survivor" ]; then
     local m1
@@ -303,7 +303,7 @@ run_validator_join() {
   # covers every post-join block the validator actually verified), and the
   # MPT root observation must be advancing (the bootstrapped trie is live).
   local div root_blk
-  div="$(val_metric validator_divergence_total)"; div="${div:-0}"
+  div="$(val_metric_req validator_divergence_total 'validator-join divergence==0 assert')"
   [ "${div}" -eq 0 ] || { val_debug; fail "validator-join: ${div} divergence(s) after join"; }
   root_blk="$(val_metric validator_state_root_block)"; root_blk="${root_blk:-0}"
   [ "${root_blk}" -gt 0 ] \
