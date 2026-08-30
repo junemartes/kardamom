@@ -253,6 +253,17 @@ byte parity, or that the chain is rebuildable from L1.
    `kardamom-reconstruct` (rebuild-from-L1) into a cluster shard.
 
 **P3 — de-vacuify (cheap, high value)**
-10. D-1, D-2 (scrape-failure-as-zero), D-3–D-5 (killed-marker counts), D-6
+10. **DONE** — D-1 (stall assert requires real scrapes), D-2 (val_metric_req +
+    retried divergence scrape in ci-cluster), D-3 (ingress counts 2 with
+    killed-marker legs), D-4 (assert_ingress_pair_live after the archive
+    cases), D-5 (node-failure observes the victim's exporter going dark
+    first), D-6 (graceful/hard-sequencer pin load to shard 0; graceful stops
+    a seq-a alloc via inject_graceful_group), D-7 (semantics shard gets the
+    bounded-lag validator verdict), D-8 (must-deliver downgrade bounded to
+    the eviction tail: missing <= max(50, accepted/100)), D-9 (dead sealer-*
+    cases deleted), D-10 (header + chaos-iter lists refreshed), D-11
+    (hard-ingress victim rotates by run id; sequencer-side rotation deferred —
+    needs shard-aware load pinning). Original list: D-1, D-2
+    (scrape-failure-as-zero), D-3–D-5 (killed-marker counts), D-6
     (shard pinning), D-7 (semantics lag bound), D-9/D-10 (dead + stale), D-11
     (rotate blast radius).

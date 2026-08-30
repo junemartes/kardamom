@@ -18,8 +18,11 @@ HALF="${1:?usage: chaos-iter.sh <a|b>}"
 export NOMAD_ADDR="http://192.168.56.10:4646"
 
 case "${HALF}" in
-  a) CASES="graceful-executor hard-executor node-failure-executor graceful-ingress hard-ingress archive-driver-loss archive-tx-data-wipe" ;;
-  b) CASES="graceful-sequencer hard-sequencer sequencer-replica-kill validator-lapse cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover" ;;
+  # D-10: halves track the CI shards' case lists (cluster-e2e.yml is the
+  # source of truth); retention-overrun* need KARDAMOM_CLUSTER_RETENTION
+  # deployed small, so they are opt-in here rather than in a half.
+  a) CASES="graceful-executor hard-executor node-failure-executor state-checkpoint-restore replay-window-resync graceful-ingress hard-ingress archive-driver-loss archive-tx-data-wipe archive-corruption" ;;
+  b) CASES="graceful-sequencer hard-sequencer sequencer-replica-kill sequencer-lapse validator-lapse validator-join cluster-leader-kill cluster-follower-kill cluster-member-rejoin cluster-quorum-loss-recover" ;;
   *) echo "unknown half ${HALF}" >&2; exit 1 ;;
 esac
 

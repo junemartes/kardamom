@@ -27,6 +27,20 @@ inject_graceful() { # <job>
   KILLED_ALLOC="${alloc}"
 }
 
+inject_graceful_group() { # <job> <task-group>
+  # The `|| true` is load-bearing (same doctrine as val_metric): under
+  # `set -eo pipefail` a non-zero docker exec turns this assignment into a
+  # SILENT exit with no CHAOS FAIL line. awk reads to EOF on purpose — an
+  # early `exit` closes the pipe under the writer and fails it with EPIPE.
+  local alloc
+  alloc="$(on_control 'nomad job allocs -t "{{range .}}{{.ID}} {{.TaskGroup}} {{.ClientStatus}}{{\"\n\"}}{{end}}" "$1"' "$1" 2>/dev/null \
+    | awk -v g="$2" '$2==g && $3=="running" && !found {found=$1} END {if (found) print found}' || true)"
+  [ -n "${alloc}" ] || fail "no running $2 alloc to stop for job $1"
+  log "graceful: nomad alloc stop ${alloc} (job $1, group $2)"
+  on_control 'nomad alloc stop "$1"' "${alloc}" >/dev/null
+  KILLED_ALLOC="${alloc}"
+}
+
 inject_hard() { # <node-container(s), space-separated candidates> <task-name>
   # Multiple candidates cover tasks whose placement can move between cases
   # (observed: after graceful-executor, the replacement alloc's container is
@@ -305,13 +319,42 @@ assert_executors_converged() { # <case>
   done
 }
 
+# D-4: bare `assert_count ingress 2` after the killed-markers were consumed
+# passes even if nothing ever died. Require BOTH ingress replicas' exporters
+# to actually answer — real liveness, not a nomad row count.
+assert_ingress_pair_live() { # <case>
+  local t=0 n v ok
+  while :; do
+    ok=1
+    for n in "${INGRESS_NODES[@]}"; do
+      v="$(fetch_metrics '' "${n}" "${INGRESS_PORT}" 2>/dev/null | head -1 || true)"
+      [ -n "${v}" ] || { ok=0; break; }
+    done
+    [ "${ok}" -eq 1 ] && { log "$1: both ingress exporters live"; return 0; }
+    sleep 5; t=$(( t + 5 ))
+    [ "${t}" -ge 120 ] && fail "$1: ingress replica ${n} exporter dark after ${t}s (pair not fully recovered)"
+  done
+}
+
 # Cluster-mode "must NOT progress": the executor's block gauge must stay FLAT
 # over a window (quorum lost → no new commits → no false progress). $1 = window.
 assert_executor_stalled() {
-  local window="${1:-15}" e0 e1
-  e0="$(executor_progress || true)"; e0="${e0:-0}"
+  # D-1: both samples must be REAL scrapes. Defaulting to 0 made this pass
+  # vacuously (0 <= 0) exactly when a two-node kill blacked the exporters
+  # out — the one situation the quorum-loss case exists to observe. The
+  # executors themselves survive a sealer-quorum loss, so an unreachable
+  # gauge here is a harness failure, not an expected outage; retry, then
+  # fail LOUDLY.
+  local window="${1:-15}" e0="" e1="" i
+  for i in 1 2 3 4 5; do
+    e0="$(executor_progress || true)"; [ -n "${e0}" ] && break; sleep 3
+  done
+  [ -n "${e0}" ] || fail "stall assert: no executor gauge scrapeable BEFORE the window — cannot observe the stall (scrape-failure-as-zero would pass vacuously)"
   sleep "${window}"
-  e1="$(executor_progress || true)"; e1="${e1:-0}"
+  for i in 1 2 3 4 5; do
+    e1="$(executor_progress || true)"; [ -n "${e1}" ] && break; sleep 3
+  done
+  [ -n "${e1}" ] || fail "stall assert: no executor gauge scrapeable AFTER the window — cannot observe the stall"
   awk "BEGIN{exit !(${e1}<=${e0})}" \
     && log "pipeline correctly STALLED (executor block ${e0} -> ${e1} over ${window}s, no false progress)" \
     || fail "pipeline UNEXPECTEDLY progressed while quorum lost (executor block ${e0} -> ${e1})"

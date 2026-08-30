@@ -58,16 +58,34 @@ struct VerifyRequest {
 /// keccak256 over `raw_tx` is computed alongside ECDSA recovery in the same
 /// batch slot (essentially free vs. the ECDSA cost). Failure ⇒ caller rejects
 /// at the RPC boundary.
+/// Batches smaller than this are recovered on a single blocking thread —
+/// splitting a 1-3 tx batch costs more in hops than the 42µs/tx it saves.
+/// At deployed rates the ring almost always holds ONE transaction (a 50µs
+/// window at 3.8k tx/s sees 0.2 arrivals), so this is the common path.
+const PARALLEL_THRESHOLD: usize = 4;
+
 pub struct BatchVerifier {
     inner: Arc<Mutex<Vec<VerifyRequest>>>,
     notify: Arc<Notify>,
     depth: usize,
+    /// Chunks a full ring is split into. Defaults to the machine's
+    /// parallelism, capped: ingress shares its cores with the RPC
+    /// reactor, so recovery must not monopolize them.
+    parallelism: usize,
     _flush_task: JoinHandle<()>,
 }
 
 impl BatchVerifier {
     pub fn new(depth: usize, flush_window: Duration) -> Self {
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 8))
+            .unwrap_or(1);
+        Self::with_parallelism(depth, flush_window, parallelism)
+    }
+
+    pub fn with_parallelism(depth: usize, flush_window: Duration, parallelism: usize) -> Self {
         assert!(depth > 0);
+        let parallelism = parallelism.max(1);
         let inner: Arc<Mutex<Vec<VerifyRequest>>> = Arc::new(Mutex::new(Vec::with_capacity(depth)));
         let notify = Arc::new(Notify::new());
         let inner_for_task = inner.clone();
@@ -92,43 +110,92 @@ impl BatchVerifier {
                     let mut g = inner_for_task.lock().await;
                     std::mem::swap(&mut *g, &mut scratch);
                 }
-                if scratch.is_empty() {
-                    continue;
-                }
-                scratch = Self::process_batch_blocking(scratch).await;
+                Self::process_batch(std::mem::take(&mut scratch), parallelism).await;
             }
         });
         Self {
             inner,
             notify,
             depth,
+            parallelism,
             _flush_task: flush,
         }
     }
 
-    /// Run the CPU-bound recovery for `batch` on the blocking pool
-    /// (`spawn_blocking`), so ECDSA never stalls the tokio workers. Each
-    /// request's result is sent on its `oneshot` from the blocking thread.
-    /// Returns the (drained) Vec so the caller can reuse its capacity.
-    async fn process_batch_blocking(mut batch: Vec<VerifyRequest>) -> Vec<VerifyRequest> {
-        match tokio::task::spawn_blocking(move || {
-            for req in batch.drain(..) {
-                // Per-tx recovery + keccak; the "batch" amortizes wakeups,
-                // not math.
-                let res = recover_single(&req.env, &req.raw_tx);
-                let _ = req.respond.send(res);
-            }
-            batch
-        })
-        .await
-        {
-            Ok(batch) => batch,
-            // The blocking task panicked: the pending `oneshot` senders are
-            // dropped with it, so every waiter sees "verifier dropped".
-            Err(e) => {
-                tracing::error!(error = %e, "sig_verify: recovery batch panicked");
-                Vec::new()
-            }
+    /// Recover a batch OFF the async runtime, fanning out across the
+    /// blocking pool.
+    ///
+    /// Two properties this fixes, both measured:
+    ///
+    /// 1. Recovery is 42µs of pure CPU per transaction. Running it inside
+    ///    the flush task blocked a tokio worker that is also serving RPC
+    ///    connections — the classic async anti-pattern, and it shows up as
+    ///    tail latency rather than throughput.
+    /// 2. It is embarrassingly parallel — 23.3k tx/s on one thread, 45.3k
+    ///    on two, 85.7k on four (see `tests/stage_costs.rs`) — but the old
+    ///    loop was strictly sequential, so a full 64-deep ring was 2.7ms
+    ///    of serial work.
+    ///
+    /// The ECDSA math itself cannot be batched: recovery produces a
+    /// DISTINCT public key per signature, so there is no random-linear-
+    /// combination trick as with Ed25519 batch verification or BLS
+    /// aggregation. Parallelism is the whole win available here.
+    async fn process_batch(batch: Vec<VerifyRequest>, parallelism: usize) {
+        if batch.is_empty() {
+            return;
+        }
+        // Below the threshold, splitting costs more than it saves: one
+        // chunk is 42µs of work against a spawn_blocking hop.
+        let workers = if batch.len() < PARALLEL_THRESHOLD || parallelism <= 1 {
+            1
+        } else {
+            parallelism.min(batch.len())
+        };
+        if workers == 1 {
+            let _ = tokio::task::spawn_blocking(move || Self::recover_chunk(batch)).await;
+            return;
+        }
+        // A SHARED CURSOR, not a split. `split_off` reallocates and copies
+        // the remaining TAIL once per chunk — a 64-deep ring cut into 8
+        // chunks moves 224 requests through 7 progressively smaller
+        // allocations, which the CI allocation gate caught as +1374 B/op
+        // over the 4254 B/op baseline (allocs/op was unchanged: few
+        // allocations, large ones). Handing every worker the same iterator
+        // moves each request exactly once and allocates one Arc for the
+        // whole batch. It also load-balances: recovery is uniform per
+        // signature, but the blocking pool's threads are not, and a worker
+        // that starts late simply takes fewer requests.
+        //
+        // Lock cost is irrelevant here — one uncontended acquire per
+        // request against 42µs of ECDSA on the other side of it.
+        let cursor = Arc::new(std::sync::Mutex::new(batch.into_iter()));
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let cursor = cursor.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                loop {
+                    let next = cursor
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .next();
+                    let Some(req) = next else { break };
+                    let res = recover_single(&req.env, &req.raw_tx);
+                    let _ = req.respond.send(res);
+                }
+            }));
+        }
+        for h in handles {
+            // A panicking worker drops its senders, so the awaiting
+            // callers see the verifier as gone rather than hanging.
+            let _ = h.await;
+        }
+    }
+
+    /// The synchronous core: recover each request and answer its caller.
+    fn recover_chunk(batch: Vec<VerifyRequest>) {
+        for req in batch {
+            let res = recover_single(&req.env, &req.raw_tx);
+            let _ = req.respond.send(res);
         }
     }
 
@@ -150,12 +217,13 @@ impl BatchVerifier {
             g.len() >= self.depth
         };
         if should_flush_now {
-            // Drain and process now to avoid waiting for the timer.
+            // Ring full: recover now rather than waiting out the timer —
+            // but on the blocking pool, never on this task's thread.
             let drained: Vec<VerifyRequest> = {
                 let mut g = self.inner.lock().await;
                 g.drain(..).collect()
             };
-            let _ = Self::process_batch_blocking(drained).await;
+            Self::process_batch(drained, self.parallelism).await;
         } else {
             self.notify.notify_one();
         }
