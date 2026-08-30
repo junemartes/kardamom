@@ -3,36 +3,39 @@
 //!
 //! ## The bug this guards against
 //!
-//! [`AeronRuntime`] runs **one** thread that services every publication *and*
+//! [`AeronRuntime`] runs one thread that services every publication and
 //! subscription in a process. The old publish path offered in a blocking
-//! spin/sleep loop (up to `OFFER_TIMEOUT` ≈ 5 s) — so while one publication was
-//! back-pressured (e.g. its subscriber slow or not yet joined), that same thread
-//! **stopped polling all subscriptions**.
+//! spin/sleep loop (up to `OFFER_TIMEOUT`, about 5 s). While one
+//! publication was back-pressured (for example its subscriber was slow or
+//! had not joined yet), that same thread stopped polling all subscriptions.
 //!
-//! In the container cluster that was fatal: the executor publishes `tx_receipts`
-//! and subscribes `tx_ordering` on the same runtime. A momentarily back-pressured
-//! `tx_receipts` offer parked the thread long enough (> Aeron's MIN flow-control
-//! receiver timeout, ~2 s) that the sealer dropped the executor from flow
-//! control, advanced past it, and the executor's `tx_ordering` image developed an
-//! unfillable gap and went end-of-stream — a permanent freeze (the subscription
-//! uses `no_unavailable_image_handler` and never re-subscribes). Observed live as
-//! two executors pinned forever at block 48 while a freshly-restarted one tracked
-//! the sealer exactly.
+//! In the container cluster that was fatal: the executor publishes
+//! `tx_receipts` and subscribes to `tx_ordering` on the same runtime. A
+//! momentarily back-pressured `tx_receipts` offer parked the thread long
+//! enough (more than Aeron's minimum flow-control receiver timeout, about
+//! 2 s) that the sealer dropped the executor from flow control, advanced
+//! past it, and the executor's `tx_ordering` image developed an
+//! unfillable gap and went end-of-stream. That was a permanent freeze,
+//! since the subscription uses `no_unavailable_image_handler` and never
+//! re-subscribes. This once left two executors pinned forever at block 48
+//! while a freshly restarted one tracked the sealer exactly.
 //!
-//! The fix parks a back-pressured offer on a retry queue (`drain_pending`) and
-//! keeps polling subscriptions between attempts. This test proves it end-to-end:
-//! with a never-connecting publication mid-offer, a *live* subscription still
-//! receives its frame promptly (instead of being stalled for ~5 s).
+//! The fix parks a back-pressured offer on a retry queue (`drain_pending`)
+//! and keeps polling subscriptions between attempts. This test proves it
+//! end-to-end: with a never-connecting publication mid-offer, a live
+//! subscription still receives its frame promptly, instead of stalling
+//! for about 5 s.
 //!
-//! Gated on the `docker-e2e` feature AND on Docker availability (the real Aeron
-//! Media Driver runs in a container), same as `offer_connect_race.rs`.
+//! Gated on the `docker-e2e` feature and on Docker availability (the real
+//! Aeron Media Driver runs in a container), same as `offer_connect_race.rs`.
 //!
-//! NOTE: runs under **Linux CI only**. On macOS Docker Desktop the host Aeron
-//! client mmaps the bind-mounted `aeron.dir`, whose shared-memory semantics the
-//! virtualized filesystem does not honour (→ `SIGBUS` / `add_subscription`
-//! timeout) — the same reason the pipeline e2e runs the client and driver
-//! together inside Linux node containers. The platform-independent regression
-//! guard for this fix is `aeron_live::drain_pending_tests` (runs everywhere).
+//! Note: runs under Linux CI only. On macOS Docker Desktop the host Aeron
+//! client mmaps the bind-mounted `aeron.dir`, whose shared-memory
+//! semantics the virtualized filesystem does not honor (giving `SIGBUS`
+//! or an `add_subscription` timeout). This is the same reason the
+//! pipeline e2e runs the client and driver together inside Linux node
+//! containers. The platform-independent regression guard for this fix is
+//! `aeron_live::drain_pending_tests` (runs everywhere).
 
 #![cfg(feature = "docker-e2e")]
 
@@ -64,16 +67,17 @@ fn env(correlation_id: u64, fill: u8) -> TxEnvelope {
     }
 }
 
-/// How long a delivery may take before we call it "starved". The bug stalls the
-/// poll loop for `OFFER_TIMEOUT` (~5 s); a healthy runtime delivers in
-/// milliseconds. 1.5 s sits comfortably between the two.
+/// How long a delivery may take before this test calls it "starved". The
+/// bug stalls the poll loop for `OFFER_TIMEOUT` (about 5 s); a healthy
+/// runtime delivers in milliseconds. 1.5 s sits comfortably between the two.
 const MAX_DELIVERY: Duration = Duration::from_millis(1500);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker; run with `cargo test -p kardamom-log --features docker-e2e --test offer_starvation -- --ignored`"]
 async fn back_pressured_publish_does_not_starve_a_live_subscription() {
-    // Explicit opt-in test (`--features docker-e2e -- --ignored`): a missing
-    // Docker must fail loudly, not silently pass via an early return.
+    // Explicit opt-in test (`--features docker-e2e -- --ignored`). A
+    // missing Docker must fail loudly, not silently pass through an early
+    // return.
     assert!(
         docker_available().await,
         "docker not available — required for this --ignored docker-e2e test"
@@ -85,22 +89,22 @@ async fn back_pressured_publish_does_not_starve_a_live_subscription() {
     let aeron_dir = cluster.aeron_dir_host(0).to_string_lossy().to_string();
 
     let mut cfg = LogConfig::default();
-    // Plain IPC over the shared aeron.dir; a distinct stream base so this test
-    // can't collide with the other e2e tests' streams.
+    // Plain IPC over the shared aeron.dir. A distinct stream base keeps
+    // this test from colliding with the other e2e tests' streams.
     cfg.channels.tx_data_channel_template = "aeron:ipc?alias=a-{sid}".to_string();
     cfg.channels.tx_data_stream_id_base = 5201;
 
     let rt = AeronRuntime::spawn_with_dir(&aeron_dir).expect("aeron runtime");
 
-    // --- LIVE stream (sid 0): a connected publisher + subscriber. ---
+    // --- Live stream (sid 0): a connected publisher and subscriber. ---
     let live_sid = 0u8;
     let live_pub = TxDataPublisherHandle::open(&rt, &cfg.channels, live_sid).expect("live pub");
     let mut live_sub =
         TxDataSubscriberHandle::open(&rt, &cfg.channels, live_sid).expect("live sub");
 
-    // Warm up so the live image is fully formed BEFORE we induce back-pressure
-    // elsewhere — this isolates the variable under test (thread starvation), not
-    // connection setup.
+    // Warm up so the live image is fully formed before this test induces
+    // back-pressure elsewhere. This isolates the variable under test
+    // (thread starvation), not connection setup.
     {
         let live_pub = live_pub.clone();
         tokio::task::spawn_blocking(move || live_pub.publish(&env(1, 0x11)))
@@ -120,22 +124,24 @@ async fn back_pressured_publish_does_not_starve_a_live_subscription() {
         assert!(warmed, "live image never formed during warm-up");
     }
 
-    // --- DEAD stream (sid 1): a publisher with NO subscriber. Every offer to it
-    // returns NOT_CONNECTED and (old code) would block the shared thread. ---
+    // --- Dead stream (sid 1): a publisher with no subscriber. Every offer
+    // to it returns NOT_CONNECTED, and old code would block the shared
+    // thread. ---
     let dead_sid = 1u8;
     let dead_pub = TxDataPublisherHandle::open(&rt, &cfg.channels, dead_sid).expect("dead pub");
 
-    // Fire the never-connecting publish. With the old blocking offer this pins
-    // the Aeron thread for ~5 s; with the fix it is parked and retried. We detach
-    // it — it eventually errors at the offer deadline, which we don't wait for.
+    // Fire the never-connecting publish. With the old blocking offer this
+    // pins the Aeron thread for about 5 s; with the fix it is parked and
+    // retried. This test detaches it; it eventually errors at the offer
+    // deadline, which this test does not wait for.
     let dead_task = tokio::task::spawn_blocking(move || dead_pub.publish(&env(999, 0xDD)));
 
-    // Give the runtime a beat to pick up the dead publish (so, in the buggy
-    // version, the thread is *already* inside its blocking offer).
+    // Give the runtime a beat to pick up the dead publish, so in the buggy
+    // version the thread is already inside its blocking offer.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // --- The assertion: a fresh publish on the LIVE stream must be delivered
-    // promptly, even though the dead publish is mid-flight. ---
+    // --- The assertion: a fresh publish on the live stream must be
+    // delivered promptly, even though the dead publish is mid-flight. ---
     let t0 = Instant::now();
     {
         let live_pub = live_pub.clone();

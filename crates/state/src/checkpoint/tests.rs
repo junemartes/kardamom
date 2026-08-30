@@ -40,8 +40,8 @@ fn commit_blocks(env: &StateEnv, addr: Address, upto: u64) {
     handle.shutdown().unwrap();
 }
 
-/// Every real env is genesis-seeded at startup; checkpoints inherit that
-/// digest as their chain identity, so test envs must be seeded too.
+/// Every real env is genesis-seeded at startup. Checkpoints inherit
+/// that digest as their chain identity, so test envs must be seeded too.
 fn seed_test_genesis(env: &StateEnv) {
     let accounts = [kardamom_types::AccountChange {
         address: Address::from([0x01; 20]),
@@ -89,9 +89,9 @@ fn checkpoint_restore_roundtrips_state() {
     assert_eq!(balance, U256::from(500u64));
 }
 
-/// A checkpoint whose bytes changed under its manifest must be refused,
-/// not adopted. This is the at-rest half of the DA-blob lesson: an image
-/// is only as trustworthy as something that pins its content.
+/// A checkpoint whose bytes changed under its manifest must be
+/// refused, not adopted. An image is only as trustworthy as something
+/// that pins its content.
 #[test]
 fn restore_refuses_a_tampered_image() {
     let src = tempfile::tempdir().unwrap();
@@ -107,10 +107,10 @@ fn restore_refuses_a_tampered_image() {
     let c = create_checkpoint(&env, ckpt.path()).unwrap();
     drop(env);
 
-    // Verifies while honest.
+    // The checkpoint verifies while it is untouched.
     verify_checkpoint(&c.path, None).expect("untouched checkpoint must verify");
 
-    // Flip one byte deep inside the image, preserving length.
+    // Flip one byte deep inside the image, and keep the same length.
     let data = checkpoint_data_file(&c.path).unwrap();
     let mut bytes = std::fs::read(&data).unwrap();
     let mid = bytes.len() / 2;
@@ -126,10 +126,9 @@ fn restore_refuses_a_tampered_image() {
     assert!(!has_state_db(dst.path()).unwrap());
 }
 
-/// A checkpoint from ANOTHER CHAIN must be refused. This is the failure
-/// that actually happened: a stale checkpoint leaked across a chaos reset,
-/// a fresh node adopted it, and it then asked the cluster for a canonical
-/// index that chain had never produced — looping forever.
+/// A checkpoint from another chain must be refused. Without this
+/// check, a fresh node could adopt a foreign checkpoint, then request a
+/// canonical index that chain never produced, and loop forever.
 #[test]
 fn restore_refuses_a_foreign_chain() {
     let src = tempfile::tempdir().unwrap();
@@ -160,8 +159,8 @@ fn restore_refuses_a_foreign_chain() {
     restore_checkpoint(&c.path, dst.path(), Some(ours)).expect("same chain must restore");
 }
 
-/// An image with no manifest at all is unverifiable and must be refused —
-/// otherwise the check is trivially bypassed by deleting a file.
+/// An image with no manifest at all is unverifiable and must be
+/// refused. Otherwise, deleting a file would trivially bypass the check.
 #[test]
 fn restore_refuses_an_unmanifested_image() {
     let src = tempfile::tempdir().unwrap();
@@ -186,7 +185,8 @@ fn restore_refuses_an_unmanifested_image() {
 }
 
 /// A bad newest checkpoint must cost one rung of the ladder, not wedge
-/// the node: restore_best quarantines it and restores the next-newest.
+/// the node. `restore_best_checkpoint` quarantines it and restores the
+/// next-newest.
 #[test]
 fn restore_best_quarantines_bad_and_falls_back() {
     let src = tempfile::tempdir().unwrap();
@@ -204,8 +204,7 @@ fn restore_best_quarantines_bad_and_falls_back() {
     let torn = create_checkpoint(&env, ckpt.path()).unwrap();
     drop(env);
 
-    // Make the newest look like the observed CI failure: an image whose
-    // MANIFEST never arrived (tar raced the writer's prune).
+    // Make the newest look like an image whose MANIFEST never arrived.
     std::fs::remove_file(manifest_path(&torn.path)).unwrap();
 
     let (block, path) = restore_best_checkpoint(ckpt.path(), dst.path(), None)
@@ -227,7 +226,7 @@ fn restore_best_quarantines_bad_and_falls_back() {
         "expected one quarantined checkpoint: {rejected:?}"
     );
 
-    // Nothing restorable left -> Ok(None), never a crash loop.
+    // Nothing restorable is left, so this returns Ok(None), never a crash loop.
     let dst2 = tempfile::tempdir().unwrap();
     std::fs::remove_file(manifest_path(&good.path)).unwrap();
     assert!(
@@ -261,7 +260,7 @@ fn latest_picks_highest_block_and_prune_trims() {
         7
     );
 
-    // Prune everything before block 7 → removes the block-3 checkpoint.
+    // Prune everything before block 7. This removes the block-3 checkpoint.
     assert_eq!(prune_checkpoints(ckpt_dir.path(), 7).unwrap(), 1);
     assert_eq!(
         latest_checkpoint(ckpt_dir.path()).unwrap().unwrap().block,
@@ -281,7 +280,7 @@ fn create_sweeps_stale_tmp_and_leaves_no_residue() {
     seed_test_genesis(&env);
     commit_blocks(&env, addr, 2);
 
-    // Plant a stale tmp dir from a "crashed" earlier writer.
+    // Plant a stale temp directory, as if from a crashed earlier writer.
     let stale = ckpt_dir.path().join(".checkpoint-000000000000000001.tmp");
     std::fs::create_dir_all(&stale).unwrap();
 
@@ -314,7 +313,7 @@ fn restore_refuses_to_clobber_populated_dir() {
     commit_blocks(&env, addr, 2);
     let c = create_checkpoint(&env, ckpt_dir.path()).unwrap();
 
-    // Restoring over the live (populated) src dir must be refused.
+    // Restoring over the live, populated source directory must be refused.
     let err = restore_checkpoint(&c.path, src_dir.path(), None).unwrap_err();
     assert!(matches!(err, StateError::Recovery(_)));
 }

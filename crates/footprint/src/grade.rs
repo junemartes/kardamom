@@ -1,15 +1,15 @@
-//! Per-block shadow grading (spec §P1): predict with stats trained on PRIOR
-//! blocks, build the predicted conflict structure, grade it against the
-//! block's actual read/write cells — all pure computation, called by the
-//! executor's shadow thread once per boundary (and trainable afterwards,
-//! keeping the cold-start curve honest: a block never grades against stats
-//! that already saw it).
+//! Per-block shadow grading: predict with stats trained on prior
+//! blocks, build the predicted conflict structure, and grade it against the
+//! block's actual read and write cells. This is pure computation, called by
+//! the executor's shadow thread once per boundary (it can train afterwards,
+//! so a block never grades against stats that already saw it, which keeps
+//! the cold-start curve honest).
 //!
-//! Semantics are IDENTICAL to the P0 oracle's holdout grading
-//! ([`crate::oracle::analyze`]) — same conflict definition, same wildcard
-//! treatment of cold txs, same exclusion boundary (the fee-sink Accumulator
-//! cell) — so the live numbers land on the same yardstick as the measured
-//! GO verdict.
+//! Semantics match the offline oracle's holdout grading
+//! ([`crate::oracle::analyze`]) exactly: same conflict definition, same
+//! wildcard treatment of cold txs, same exclusion boundary (the fee-sink
+//! Accumulator cell). This keeps the live numbers on the same yardstick as
+//! the measured GO verdict.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -20,32 +20,33 @@ use crate::{Cell, TxObs};
 /// One block's shadow verdict.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BlockGrade {
-    /// Txs offered for grading (excludes serial-lane records the caller
-    /// never builds obs for).
+    /// Txs offered for grading. Excludes serial-lane records the caller
+    /// never builds an observation for.
     pub txs: usize,
     /// Txs actually graded (`min(txs, cap)`; the caller logs truncation).
     pub graded: usize,
     /// Graded txs whose selector had no stats (wildcard: conflicts with
-    /// everything — the Tail lane).
+    /// everything, the Tail lane).
     pub cold_txs: usize,
     pub gas: u64,
     /// True direct-conflict pairs among graded txs.
     pub true_edges: usize,
     /// Predicted direct-conflict pairs among graded txs.
     pub predicted_edges: usize,
-    /// True-conflicting pairs missed by prediction — the DANGEROUS class
-    /// (`footprint_false_independent_total`): these would have run
+    /// True-conflicting pairs missed by prediction: the dangerous class
+    /// (`footprint_false_independent_total`). These would have run
     /// concurrently and aborted.
     pub missed_pairs: usize,
-    /// Predicted-conflicting pairs with no true conflict (over-merge:
-    /// forfeited parallelism, the silent pessimism error).
+    /// Predicted-conflicting pairs with no true conflict. This is an
+    /// over-merge: forfeited parallelism, the silent pessimism error.
     pub false_pairs: usize,
-    /// Wave structure of the PREDICTED DAG: number of levels (a tx's level
-    /// is 1 + max of its predicted predecessors') and the widest level.
+    /// Wave structure of the predicted DAG: the number of levels (a tx's
+    /// level is one plus the max of its predicted predecessors') and the
+    /// widest level.
     pub predicted_waves: usize,
     pub predicted_width: usize,
     /// Gas-weighted critical paths: the predicted schedule's bound and the
-    /// oracle's (the number no predictor beats).
+    /// oracle's bound (the number no predictor beats).
     pub predicted_cp_gas: u64,
     pub oracle_cp_gas: u64,
     /// Cell-coverage hit rate inputs, over non-cold graded txs: how many of
@@ -77,12 +78,12 @@ impl BlockGrade {
     }
 }
 
-/// Grade one block. `stats` must NOT have been trained on this block yet.
-/// `exclude` is the Accumulator boundary (spec "The graph index" #4): cells
-/// serviced by deferred commutative folding never form edges — without
-/// excluding the fee sink every block grades 1.00x flat (P0, measured).
-/// `cap` bounds the O(n²) pair grading on burst blocks; graded txs are the
-/// first `cap` in canonical order and `graded < txs` reports the cut.
+/// Grade one block. `stats` must not have been trained on this block yet.
+/// `exclude` is the Accumulator boundary: cells
+/// serviced by deferred commutative folding never form edges. Without
+/// excluding the fee sink, every block grades a flat 1.00x (measured
+/// offline). `cap` bounds the O(n²) pair grading on burst blocks. Graded txs are
+/// the first `cap` in canonical order, and `graded < txs` reports the cut.
 pub fn grade_block(
     stats: &Stats,
     txs: &[TxObs],
@@ -102,7 +103,7 @@ pub fn grade_block(
 
     let true_pairs = conflict_pairs(&graded, actual_cells, exclude);
 
-    // Predicted cells per tx; cold => wildcard (conflicts with all).
+    // Predicted cells per tx. A cold tx is a wildcard: it conflicts with all.
     let mut predicted: Vec<Option<BTreeSet<Cell>>> = Vec::with_capacity(graded.len());
     for o in &graded {
         let p = stats.predict(o);
@@ -123,9 +124,10 @@ pub fn grade_block(
         predicted.push(p);
     }
 
-    // Predicted pair set: wildcard txs conflict with everything; otherwise
-    // any shared predicted cell conflicts (predictions don't split R/W —
-    // conservative, matching the P0 grading).
+    // Predicted pair set: a wildcard tx conflicts with everything.
+    // Otherwise, any shared predicted cell is a conflict (predictions do
+    // not split read and write, which is conservative and matches the
+    // offline grading).
     let mut pred_pairs: HashSet<(u64, u64)> = HashSet::new();
     for i in 0..graded.len() {
         for j in i + 1..graded.len() {
@@ -150,9 +152,10 @@ pub fn grade_block(
     g.predicted_cp_gas = critical_path(&graded, &pred_pairs);
 
     // Wave structure of the predicted DAG (canonical order is the
-    // topological order: edges only run low index -> high). One pass over
-    // edges sorted by source suffices: every edge INTO a node has a smaller
-    // source, so a node's level is settled before any edge leaves it.
+    // topological order: edges only run from a low index to a high index).
+    // One pass over edges sorted by source is enough: every edge into a
+    // node has a smaller source, so a node's level is settled before any
+    // edge leaves it.
     let pos: std::collections::HashMap<u64, usize> = graded
         .iter()
         .enumerate()
@@ -213,8 +216,9 @@ mod tests {
 
     #[test]
     fn cold_block_serializes_and_misses_nothing() {
-        // Everything cold => wildcard => all pairs predicted-conflicting:
-        // zero missed pairs (safe), waves == txs (fully serial).
+        // Every tx is cold, so every tx is a wildcard, so every pair is a
+        // predicted conflict: zero missed pairs (safe), and the wave count
+        // equals the tx count (fully serial).
         let stats = Stats::default();
         let fixed = Cell::Slot(POOL, B256::ZERO);
         let txs: Vec<TxObs> = (0..4)
@@ -225,19 +229,19 @@ mod tests {
         assert_eq!(g.missed_pairs, 0);
         assert_eq!(g.predicted_waves, 4);
         assert_eq!(g.predicted_width, 1);
-        assert_eq!(g.predicted_edges, 6); // complete graph on 4
-        assert_eq!(g.true_edges, 6); // all write the same fixed slot
-        // 4 chained 100k-gas txs: cp == total.
+        assert_eq!(g.predicted_edges, 6); // complete graph on 4 nodes
+        assert_eq!(g.true_edges, 6); // all txs write the same fixed slot
+        // 4 chained 100k-gas txs: the critical path equals the total gas.
         assert_eq!(g.predicted_cp_ratio(), 1.0);
     }
 
     #[test]
     fn trained_stats_split_independent_senders_into_one_wave() {
-        // Each tx writes a slot unique to its sender. Those slots are NOT
-        // modelled since inversion was removed (they appear once each, far
-        // below the fixed threshold), so cell COVERAGE is partial — but
-        // the SCHEDULE is unaffected, which is the distinction that
-        // matters: unmodelled cells that never collide cost nothing.
+        // Each tx writes a slot unique to its sender. Since inversion was
+        // removed, these slots are not modelled (each appears once, far
+        // below the fixed threshold), so cell coverage is partial. But the
+        // schedule is unaffected — this is the key distinction:
+        // unmodelled cells that never collide cost nothing.
         use alloy_primitives::keccak256;
         let slot_of = |a: Address| -> B256 {
             let mut buf = [0u8; 64];
@@ -257,7 +261,7 @@ mod tests {
         for i in 0..4 {
             stats.learn_obs(&mk(i, addr(i as u8 + 1)));
         }
-        // Grade a fresh block of 3 distinct-sender txs.
+        // Grade a fresh block of three distinct-sender txs.
         let txs: Vec<TxObs> = (10..13).map(|i| mk(i, addr(i as u8 + 20))).collect();
         let g = grade_block(&stats, &txs, &HashSet::new(), 2048);
         assert_eq!(g.cold_txs, 0);
@@ -267,18 +271,19 @@ mod tests {
         assert_eq!(g.false_pairs, 0);
         assert_eq!(g.predicted_waves, 1, "independent txs share one wave");
         assert_eq!(g.predicted_width, 3);
-        // Half the actual cells (the per-sender slots) are unmodelled...
+        // Half the actual cells (the per-sender slots) are unmodelled.
         assert_eq!(g.hit_rate(), 0.5);
-        // ...and it costs the schedule nothing, because they never
+        // This costs the schedule nothing, because those slots never
         // collide: no true edge exists for the predictor to miss.
         assert_eq!(g.missed_pairs, 0);
     }
 
     #[test]
     fn false_independence_is_counted() {
-        // Trained on sender-slot-only behavior, then the block ALSO shares
-        // a hot fixed slot the training never showed at 60%: prediction
-        // says independent, truth says conflict => missed pairs.
+        // Training saw only sender-slot behavior. The block also shares a
+        // hot fixed slot that training never showed at 60%, so the
+        // prediction says independent while the truth says conflict. This
+        // must count as a missed pair.
         use alloy_primitives::keccak256;
         let slot_of = |a: Address| -> B256 {
             let mut buf = [0u8; 64];
@@ -316,7 +321,7 @@ mod tests {
             .collect();
         let mut exclude = HashSet::new();
         exclude.insert(sink);
-        // Cold (wildcard) predictions still serialize, but TRUE edges must
+        // Cold (wildcard) predictions still serialize, but true edges must
         // vanish with the exclusion — the Accumulator boundary.
         let g = grade_block(&Stats::default(), &txs, &exclude, 2048);
         assert_eq!(g.true_edges, 0);

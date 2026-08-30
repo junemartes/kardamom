@@ -7,8 +7,8 @@ use crate::env::{Durability, StateEnvBuilder};
 use crate::schema::{TABLE_ACCOUNTS, TABLE_HEADERS, TABLE_RECEIPTS, decode_account_value};
 use crate::writer::{StateWriter, TrieMode, WriteBatch};
 
-/// Build a small 2-block chain (with receipts) through the trie-aware
-/// writer into `dir`, seeded with a genesis account.
+/// Build a small 2-block chain, with receipts, through the trie-aware
+/// writer into `dir`. Seed it with a genesis account.
 fn build_db(dir: &std::path::Path) {
     let env = StateEnvBuilder::new(dir)
         .durability(Durability::SafeNoSync)
@@ -80,8 +80,8 @@ fn sweep_is_clean_on_a_healthy_db() {
 fn sweep_detects_a_flipped_receipt_byte() {
     let dir = tempfile::tempdir().unwrap();
     build_db(dir.path());
-    // Corrupt one receipt value in place (what disk rot / a torn write
-    // would look like at the row level).
+    // Corrupt one receipt value in place. This is what disk rot or a
+    // torn write looks like at the row level.
     {
         let env = open(dir.path());
         let txn = env.raw().begin_rw_sync().unwrap();
@@ -92,7 +92,7 @@ fn sweep_detects_a_flipped_receipt_byte() {
         };
         let last = v.len() - 1;
         v[last] ^= 0xFF;
-        v.truncate(v.len() - 3); // also shear the tail so rkyv must reject
+        v.truncate(v.len() - 3); // Also cut the tail, so rkyv must reject this value.
         txn.put(db, &k, &v, WriteFlags::UPSERT).unwrap();
         txn.commit().unwrap();
     }
@@ -137,7 +137,7 @@ fn deep_compare_identical_dbs_is_empty_and_divergent_is_not() {
     let eb = open(b.path());
     assert!(deep_compare(&ea, &eb).unwrap().is_empty());
     drop(eb);
-    // Perturb one account balance in b.
+    // Change one account balance in b.
     {
         let eb = open(b.path());
         let txn = eb.raw().begin_rw_sync().unwrap();

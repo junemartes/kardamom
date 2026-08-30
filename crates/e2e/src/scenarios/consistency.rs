@@ -1,24 +1,25 @@
-//! S6 — `validator_matches_executor`.
+//! `validator_matches_executor`.
 //!
 //! The validator independently re-executes the canonical stream and
-//! cross-checks the executor's published BALs and receipts; this scenario
-//! observes that machinery end-to-end and then goes one level deeper than
-//! the streams can: an offline, byte-level comparison of the two libmdbx
+//! cross-checks the executor's published BALs and receipts. This scenario
+//! watches that machinery end to end, then goes one level deeper than the
+//! streams can: an offline, byte-level comparison of the two libmdbx
 //! databases.
 //!
-//! Live phase ([`run`], target-agnostic): mixed workload (transfers +
-//! contract creates), drain, then assert — as DELTAS over the workload, so a
-//! validator that replayed a backlog before catching up is judged on what it
-//! does now — that it verified new blocks, missed no more BALs than its
-//! budget allows (zero on IPC, a small budget on the cluster's lossy
-//! multicast), never diverged, ran the per-block trie shadow-check without a
-//! mismatch, and caught its committed cursor up to the executor's.
+//! Live phase ([`run`], target-agnostic): a mixed workload of transfers and
+//! contract creates, then drain, then check the result. The checks compare
+//! deltas over the workload, so a validator that replayed a backlog before
+//! catching up is judged on what it does now: that it verified new blocks,
+//! missed no more BALs than its budget allows (zero on IPC, a small budget
+//! on the cluster's lossy multicast), never diverged, ran the per-block
+//! trie shadow-check with no mismatch, and caught its committed cursor up
+//! to the executor's.
 //!
-//! Offline phase ([`verify_state_dirs`], runs after a graceful shutdown —
-//! Target C obtains the dirs via `docker cp`): `kardamom_state::sweep` on
-//! both DBs must be clean, the validator must hold a persisted (and
-//! reproducible) state root, and `deep_compare` must find the chain-state
-//! tables byte-identical. Stream checks catch execution divergence; the
+//! Offline phase ([`verify_state_dirs`], runs after a graceful shutdown;
+//! Target C gets the directories with `docker cp`): `kardamom_state::sweep`
+//! on both databases must be clean, the validator must hold a persisted and
+//! reproducible state root, and `deep_compare` must find the chain-state
+//! tables byte-identical. The stream checks catch execution divergence; the
 //! table diff catches persistence divergence.
 
 use std::path::Path;
@@ -31,28 +32,29 @@ use super::{SeqCounters, Target};
 use crate::harness::l2::{self, SignedTransfer};
 use crate::harness::metrics::poll_until;
 
-/// PUSH1 01 PUSH1 00 MSTORE8 PUSH1 01 PUSH1 00 RETURN — deploys a 1-byte
-/// runtime, the minimal real CREATE.
+/// PUSH1 01 PUSH1 00 MSTORE8 PUSH1 01 PUSH1 00 RETURN: deploys a 1-byte
+/// runtime. This is the smallest real CREATE.
 const TINY_INIT_CODE: &[u8] = &[0x60, 0x01, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 0x00, 0xf3];
 
-/// Sequential transactions submitted AFTER the validator has caught up, to
-/// ask "does verification work on fresh blocks?" — see the probe below.
+/// Sequential transactions submitted after the validator catches up, to
+/// ask "does verification work on fresh blocks?" See the probe below.
 const PROBE_TXS: u64 = 5;
 
 pub struct Params {
     pub senders: usize,
     pub transfers_per_sender: usize,
     pub sender_base: usize,
-    /// How many BALs the validator may miss FOR THIS SCENARIO'S OWN BLOCKS.
+    /// How many BALs the validator may miss for this scenario's own blocks.
     ///
-    /// Zero on Target L: one host, IPC transport, no lossy hop. On Target C
-    /// `tx_bal` is UDP multicast, which is lossy by design — a dropped BAL
-    /// leaves that block unverified and is explicitly not a divergence — so
-    /// the cluster runner allows a small budget. The check is a DELTA across
-    /// the workload rather than an absolute count, because a validator that
-    /// replayed a backlog before catching up legitimately commits those older
-    /// blocks unverified (`BalBuffer`'s catch-up mode), and that history says
-    /// nothing about whether it is verifying now.
+    /// Zero on Target L: one host, IPC transport, no lossy hop. On Target C,
+    /// `tx_bal` uses UDP multicast, which is lossy by design. A dropped BAL
+    /// leaves that block unverified, and the design does not treat this as
+    /// a divergence. So the cluster runner allows a small budget. The
+    /// check compares a delta over the workload, not an absolute count,
+    /// because a validator that replayed a backlog before catching up
+    /// commits those older blocks unverified on purpose (`BalBuffer`'s
+    /// catch-up mode). That history says nothing about whether the
+    /// validator is verifying now.
     pub max_bal_missing: f64,
 }
 
@@ -75,10 +77,10 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         .executor_metric(super::EXEC_TX_APPLIED)
         .await
         .unwrap_or(0.0);
-    // Baselines for the validator counters: everything below is asserted as a
-    // DELTA over this scenario's workload, so a validator that started behind
-    // a running chain is judged on what it does now, not on the backlog it
-    // committed unverified while catching up.
+    // Baselines for the validator counters. Every check below compares a
+    // delta over this scenario's workload, so a validator that started
+    // behind a running chain is judged on what it does now, not on the
+    // backlog it committed unverified while catching up.
     let verified_before = t
         .validator_metric(super::VALIDATOR_BLOCKS_VERIFIED)
         .await
@@ -88,8 +90,9 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         .await
         .unwrap_or(0.0);
 
-    // Mixed workload: dense transfers, with the last nonce of each sender a
-    // contract CREATE (exercises code + storage-trie paths in both DBs).
+    // A mixed workload: dense transfers, with the last nonce of each
+    // sender a contract CREATE. This exercises the code and storage-trie
+    // paths in both databases.
     let mut planned: Vec<SignedTransfer> = Vec::new();
     for signer in &signers[p.sender_base..] {
         for n in 0..p.transfers_per_sender {
@@ -121,9 +124,10 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         .await?;
     baseline.assert_flat(t, "consistency workload").await?;
 
-    // Validator verdict: caught up, verifying, never diverged, shadow-check
-    // active and clean. (Committed chases a moving head — poll until it
-    // reaches the executor block sampled in the same round.)
+    // Validator verdict: caught up, verifying, never diverged, and the
+    // shadow-check is active and clean. (The committed cursor chases a
+    // moving head, so poll until it reaches the executor block sampled in
+    // the same round.)
     poll_until(
         "validator committed == executor block",
         Duration::from_secs(30),
@@ -138,14 +142,15 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         },
     )
     .await?;
-    // VERIFICATION PROBE. The bulk workload above deliberately gets the
-    // validator behind, and a validator behind the head commits blocks
-    // UNVERIFIED on purpose — `BalBuffer`'s catch-up mode treats a BAL older
-    // than the backlog lookbehind as unrecoverable rather than crawling. So
-    // "did verification happen?" cannot be asked of burst blocks; it has to
-    // be asked of fresh ones, with the validator caught up (the poll above
-    // guarantees that). A handful of sequential transactions spans a few
-    // blocks, so a single lost multicast BAL cannot decide the outcome.
+    // Verification probe. The bulk workload above deliberately gets the
+    // validator behind. A validator behind the head commits blocks
+    // unverified on purpose: `BalBuffer`'s catch-up mode treats a BAL
+    // older than the backlog lookbehind as unrecoverable, instead of
+    // crawling through it. So this test cannot ask "did verification
+    // happen?" of burst blocks. It must ask fresh blocks instead, with the
+    // validator caught up (the poll above guarantees that). A handful of
+    // sequential transactions spans a few blocks, so one lost multicast
+    // BAL cannot decide the outcome.
     let verified_before = t
         .validator_metric(super::VALIDATOR_BLOCKS_VERIFIED)
         .await
@@ -216,9 +221,10 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
     Ok(())
 }
 
-/// Offline phase: both DBs internally coherent, byte-identical chain state,
-/// and the validator holds a reproducible root. Requires cleanly-closed DBs
-/// (graceful shutdown / copies of stopped services).
+/// Offline phase: both databases are internally coherent, the chain
+/// state is byte-identical, and the validator holds a reproducible root.
+/// This needs cleanly closed databases (graceful shutdown, or copies of
+/// stopped services).
 pub fn verify_state_dirs(executor_dir: &Path, validator_dir: &Path) -> Result<()> {
     let exec_env = kardamom_state::StateEnvBuilder::new(executor_dir)
         .open()
@@ -245,7 +251,7 @@ pub fn verify_state_dirs(executor_dir: &Path, validator_dir: &Path) -> Result<()
         "validator DB has no persisted state root"
     );
 
-    // Both DBs must have executed the same chain…
+    // Both databases must have executed the same chain.
     anyhow::ensure!(
         exec_report.last_committed_block == val_report.last_committed_block,
         "executor stopped at block {} but validator at {}",
@@ -256,12 +262,13 @@ pub fn verify_state_dirs(executor_dir: &Path, validator_dir: &Path) -> Result<()
         val_report.last_committed_block > 0,
         "the workload produced no blocks"
     );
-    // …and only the validator maintains a live trie. `seed_genesis` writes
-    // meta[state_root] on every DB, so the executor's plain (TrieMode::Off)
-    // writer leaves a GENESIS-era root frozen at block 0 while the chain
-    // advances — asserting the two roots differ pins that asymmetry (and
-    // would catch an executor that silently started maintaining a trie, or a
-    // validator whose root stopped advancing).
+    // Only the validator keeps a live trie. `seed_genesis` writes
+    // meta[state_root] on every database, so the executor's plain
+    // (TrieMode::Off) writer leaves a genesis-era root frozen at block 0
+    // while the chain advances. This check, that the two roots differ,
+    // pins down that asymmetry. It would also catch an executor that
+    // silently started keeping a trie, or a validator whose root stopped
+    // advancing.
     if let (Some(exec_root), Some(val_root)) = (exec_report.state_root, val_report.state_root) {
         anyhow::ensure!(
             exec_root != val_root,

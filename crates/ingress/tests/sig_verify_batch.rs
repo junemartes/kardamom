@@ -105,22 +105,22 @@ fn thread_cpu_ns() -> u64 {
 /// The recovery work must not run on the async runtime's thread.
 ///
 /// The test drives 256 recoveries through the verifier on a
-/// `current_thread` runtime — the test thread IS the runtime thread —
-/// and asserts the runtime thread's own CPU TIME stays well below what
-/// running them inline would cost. If any path (the ring-full fast path
-/// or the flush task) runs recovery inline, that CPU lands on this
-/// thread and the count jumps past the bound deterministically.
+/// `current_thread` runtime. The test thread IS the runtime thread. The
+/// assert bounds the runtime thread's own CPU TIME far below the inline
+/// cost of the batch. If any path (the ring-full fast path or the flush
+/// task) runs recovery inline, that CPU lands on this thread and the
+/// count jumps past the bound every time.
 ///
 /// Two calibrations, both learned from CI failures (issue #252):
-/// - CPU time, not wall clock: the old timer assert measured the OS
-///   scheduler — on a loaded 2-core host the runtime thread is
-///   descheduled for 1-16 ms with the work fully off-thread.
-///   Descheduling does not accrue thread CPU time.
-/// - The bound is HALF of this build's own measured inline cost, not a
-///   constant: recovery is ~10.7 ms in release and ~130 ms in debug,
-///   while the healthy bookkeeping is ~2 ms and ~5-8 ms. No constant
-///   serves both profiles; the ratio does (measured margins are >2.5x
-///   on both sides in both).
+/// - Use CPU time, not wall clock. The old timer assert measured the OS
+///   scheduler. On a loaded 2-core host, the OS deschedules the runtime
+///   thread for 1-16 ms with the work fully off-thread. Time spent
+///   descheduled does not add to thread CPU time.
+/// - Use HALF of this build's own measured inline cost as the bound,
+///   not a constant. Recovery costs ~10.7 ms in release and ~130 ms in
+///   debug. The healthy bookkeeping costs ~2 ms and ~5-8 ms. No
+///   constant fits both profiles; the ratio fits both with a margin
+///   above 2.5x on each side.
 #[tokio::test(flavor = "current_thread")]
 async fn recovery_does_not_block_the_reactor() {
     let cases: Vec<_> = (0..256u64).map(fixtures::signed).collect();

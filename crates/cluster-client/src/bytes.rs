@@ -4,12 +4,12 @@
 //! buffers: the SBE session codec here ([`crate::protocol`], error type
 //! `DecodeError`) and the app-envelope codec in `kardamom-cluster-adapter`'s
 //! `wire` module (error type `WireError`). Their `TooShort { at, need, have }`
-//! variants are structurally identical but deliberately distinct types — a
-//! session-protocol decode failure and an app-envelope decode failure are
-//! different faults with different handlers. So the shared primitives return
-//! `Option`: `None` means the read fell off the end of the buffer, and each
-//! codec maps that to its OWN error with its own `at`/`need`/`have` values.
-//! Keep this module error-type-free.
+//! variants are structurally identical, but they are deliberately distinct
+//! types. A session-protocol decode failure and an app-envelope decode
+//! failure are different faults with different handlers. So the shared
+//! primitives return `Option`: `None` means the read fell off the end of
+//! the buffer, and each codec maps that to its own error, with its own
+//! `at`/`need`/`have` values. Keep this module free of error types.
 
 /// The exact-width `[u8; N]` at `at..at + N`, or `None` if `buf` is too short.
 fn chunk<const N: usize>(buf: &[u8], at: usize) -> Option<[u8; N]> {

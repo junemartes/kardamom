@@ -1,6 +1,6 @@
-//! Parity and fail-stop tests for the seeded parallel engine
-//! (`engine.rs`): parallel batches vs sequential ground truth, forged
-//! claims, deposits, and the K > 1 quantized chunk views.
+//! Parity and stop tests for the seeded parallel engine (`engine.rs`):
+//! parallel batches against sequential ground truth, forged claims,
+//! deposits, and the K > 1 quantized chunk views.
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_network::TxSignerSync;
@@ -48,8 +48,8 @@ fn tx(signer: &PrivateKeySigner, to: Address, nonce: u64, value: u64, i: u64) ->
     }
 }
 
-/// A zero-value call: [`tx`] with `value = 0`, kept for call-shaped
-/// readability at use sites.
+/// A zero-value call: [`tx`] with `value = 0`. Kept so call sites read
+/// clearly as calls.
 fn call_tx(signer: &PrivateKeySigner, to: Address, nonce: u64, i: u64) -> BufferedRecord {
     tx(signer, to, nonce, 0, i)
 }
@@ -86,11 +86,11 @@ fn env() -> ExecEnv {
     )
 }
 
-/// One record through the FREE executor path (tx or deposit; a fresh
-/// scope per call) — deliberately NOT the exec core's
+/// One record through the free executor path, a tx or a deposit, with a
+/// fresh scope per call. This is deliberately not the exec core's
 /// `execute_record_in_scope`, so the parity tests compare the shared
-/// production dispatch against an independently-constructed reference
-/// instead of against itself.
+/// production dispatch against an independently built reference, instead
+/// of against itself.
 fn exec_record<S: StateDatabase>(
     snap: &S,
     parent: Option<&PendingDelta>,
@@ -139,11 +139,11 @@ fn exec_record<S: StateDatabase>(
     }
 }
 
-/// THE sequential-capture fixture (previously hand-rolled at four sites):
-/// execute `records` in order through the free executor path with Bal
-/// capture, folding writes as it goes. Returns the folded delta (the
-/// sequential ground truth) and the captured `Bal` (the claim source).
-/// `assert_status` additionally requires every record to execute.
+/// The sequential-capture fixture: run `records` in order through the
+/// free executor path with Bal capture, folding writes as it goes.
+/// Returns the folded delta, the sequential ground truth, and the
+/// captured `Bal`, the claim source. `assert_status` also requires every
+/// record to execute.
 fn seq_capture<S: StateDatabase>(
     snap: &S,
     parent: Option<&PendingDelta>,
@@ -172,13 +172,10 @@ fn seq_capture<S: StateDatabase>(
     (delta, bal)
 }
 
-/// Build a claim index by SEQUENTIALLY executing the block through the
-/// executor's REAL capture path (`execute_tx` / `execute_deposit_tx` →
-/// revm `Bal`), exactly as the live executor produces claims. The first
-/// version of this fixture hand-rolled claims from WriteSets — symmetric
-/// with a verification bug (per-field vs whole-triple attribution), so
-/// both passed while live traffic diverged on every transfer. The
-/// fixture and the producer must share code, not shape.
+/// Build a claim index by executing the block sequentially through the
+/// executor's real capture path (`execute_tx` and `execute_deposit_tx`,
+/// through revm `Bal`), exactly as the live executor produces claims.
+/// The fixture and the producer must share code, not only the same shape.
 fn honest_claims<S: StateDatabase>(snap: &S, records: &[BufferedRecord]) -> ClaimIndex {
     let (_, bal) = seq_capture(snap, None, records, false);
     ClaimIndex::from_alloy(&bal.into_alloy_bal())
@@ -188,12 +185,13 @@ fn seq_delta<S: StateDatabase>(snap: &S, records: &[BufferedRecord]) -> PendingD
     seq_capture(snap, None, records, false).0
 }
 
-/// THE parity property: parallel seeded batches must produce byte-identical
-/// state to sequential execution — including for a CONFLICTING workload
-/// (one sender, dependent nonces, shared recipient) where every tx depends
-/// on its predecessor. Seeding, not ordering, is what makes that safe.
-/// One small pool per test: the production strategy holds a persistent
-/// pool; tests mint a fresh one so each case is isolated.
+/// The parity property: parallel seeded batches must produce
+/// byte-identical state to sequential execution, including for a
+/// conflicting workload (one sender, dependent nonces, shared recipient)
+/// where every tx depends on its predecessor. Seeding, not ordering, is
+/// what makes that safe. Each test gets one small pool: the production
+/// strategy holds a persistent pool, but tests build a fresh one so each
+/// case is isolated.
 fn test_pool() -> kardamom_stm::pool::WorkerPool {
     kardamom_stm::pool::WorkerPool::new(4, Vec::new())
 }
@@ -210,8 +208,8 @@ fn parallel_batches_equal_sequential_on_a_fully_dependent_chain() {
             alloy_primitives::KECCAK256_EMPTY,
         )
         .build();
-    // 12 txs from ONE sender: maximal conflict (each reads the balance and
-    // nonce the previous tx wrote).
+    // 12 txs from one sender: maximal conflict, since each reads the
+    // balance and nonce the previous tx wrote.
     let txs: Vec<BufferedRecord> = (0..12).map(|i| tx(&signer, to, i, 1_000 + i, i)).collect();
 
     let claims = honest_claims(&snap, &txs);
@@ -244,8 +242,8 @@ fn parallel_batches_equal_sequential_on_a_fully_dependent_chain() {
     }
 }
 
-/// A FORGED claim must fail-stop at the batch that produces it — this is
-/// what makes seeding from unverified claims sound.
+/// A forged claim must stop the process at the batch that produces it.
+/// This is what makes seeding from unverified claims sound.
 #[test]
 fn a_forged_claim_fails_stop_at_its_producing_batch() {
     let signer = PrivateKeySigner::random();
@@ -261,8 +259,9 @@ fn a_forged_claim_fails_stop_at_its_producing_batch() {
     let txs: Vec<BufferedRecord> = (0..8).map(|i| tx(&signer, to, i, 500, i)).collect();
 
     let mut claims = honest_claims(&snap, &txs);
-    // Tamper: inflate the recipient's claimed balance at tx 6 (batch 2 of
-    // 5-tx batches) — the executor claiming a state it did not compute.
+    // Tamper with the claims: inflate the recipient's claimed balance at
+    // tx 6 (batch 2 of 5-tx batches), so the executor claims a state it
+    // did not compute.
     let bogus = claims.balance.get_mut(&to).expect("recipient claims");
     if let Some(entry) = bogus.iter_mut().find(|(i, _)| *i == 6) {
         entry.1 += U256::from(1_000_000u64);
@@ -282,10 +281,10 @@ fn a_forged_claim_fails_stop_at_its_producing_batch() {
     }
 }
 
-/// K = 20 end-to-end: quantized wire claims + chunk-aligned batches
-/// must be parity-identical to sequential, and a forged CHUNK claim
-/// must fail-stop naming the chunk. Exercises the same-view invariant:
-/// both sides pass through the shared quantize().
+/// K = 20 end-to-end: quantized wire claims and chunk-aligned batches
+/// must be parity-identical to sequential, and a forged chunk claim
+/// must stop the process, naming the chunk. This exercises the same-view
+/// invariant: both sides pass through the shared quantize().
 #[test]
 fn quantized_claims_verify_with_aligned_batches() {
     let signer = PrivateKeySigner::random();
@@ -300,7 +299,7 @@ fn quantized_claims_verify_with_aligned_batches() {
         .build();
     let txs: Vec<BufferedRecord> = (0..47).map(|i| tx(&signer, to, i, 100 + i, i)).collect();
 
-    // The executor's view: per-tx capture, then the SHARED quantize.
+    // The executor's view: per-tx capture, then the shared quantize.
     let (expected, bal) = seq_capture(&snap, None, &txs, false);
     let quantized = kardamom_engine::bal_ladder::quantize(bal.into_alloy_bal(), 20);
     let claims = ClaimIndex::from_alloy(&quantized);
@@ -310,7 +309,7 @@ fn quantized_claims_verify_with_aligned_batches() {
     assert_eq!(out.delta.accounts, expected.accounts);
     assert_eq!(out.batches, 3, "47 txs at K=20 -> 3 aligned chunks");
 
-    // Forge a chunk-2 claim: must fail-stop naming the chunk.
+    // Forge a chunk-2 claim: this must stop the process, naming the chunk.
     let mut forged = claims.clone();
     if let Some(w) = forged.balance.get_mut(&to)
         && let Some(e) = w.iter_mut().find(|(i, _)| *i == 2)
@@ -327,11 +326,9 @@ fn quantized_claims_verify_with_aligned_batches() {
     }
 }
 
-/// THE depth-K regression: under the pipelined commit the snapshot can
-/// be K blocks stale — block 2's txs must observe block 1's writes via
-/// the PARENT layer. The first DeFi gate diverged exactly here: the
-/// hook dropped the parent, the validator saw stale nonces, and skipped
-/// txs the executor had executed.
+/// The depth-K regression: under the pipelined commit, the snapshot can
+/// be K blocks stale. Block 2's txs must observe block 1's writes through
+/// the parent layer.
 #[test]
 fn parent_layer_bridges_the_uncommitted_gap() {
     let signer = PrivateKeySigner::random();
@@ -345,31 +342,31 @@ fn parent_layer_bridges_the_uncommitted_gap() {
         )
         .build();
 
-    // Block 1: nonces 0..3, executed and folded into a parent layer —
-    // but NEVER committed to the snapshot (StaticSnapshotSource
-    // semantics: the mock snapshot still says nonce 0).
+    // Block 1: nonces 0..3, executed and folded into a parent layer, but
+    // never committed to the snapshot. Under StaticSnapshotSource
+    // semantics, the mock snapshot still says nonce 0.
     let b1: Vec<BufferedRecord> = (0..4).map(|i| tx(&signer, to, i, 100, i)).collect();
     let claims1 = honest_claims(&snap, &b1);
     let out1 = execute_block_parallel(&test_pool(), &snap, None, &b1, &claims1, env(), 2, 1)
         .expect("block 1");
     let parent = out1.delta.clone();
 
-    // Block 2: nonces 4..7. Against the bare snapshot every tx is a
-    // nonce-mismatch skip; with the parent layer they execute.
+    // Block 2: nonces 4..7. Against the bare snapshot, every tx is a
+    // nonce-mismatch skip. With the parent layer, they execute.
     let b2: Vec<BufferedRecord> = (4..8).map(|i| tx(&signer, to, i, 100, i)).collect();
-    // Build block-2 claims through the same capture path, WITH parent
-    // (every record must execute given the parent).
+    // Build block-2 claims through the same capture path, with a parent,
+    // so every record must execute given the parent.
     let (delta, bal) = seq_capture(&snap, Some(&parent), &b2, true);
     let claims2 = ClaimIndex::from_alloy(&bal.into_alloy_bal());
 
-    // WITHOUT parent: the stale-state bug — every tx skips.
+    // Without the parent: the stale-state bug means every tx skips.
     let stale = execute_block_parallel(&test_pool(), &snap, None, &b2, &claims2, env(), 2, 1);
     assert!(
         stale.is_err(),
         "without the parent layer the block must diverge (skips vs claims)"
     );
 
-    // WITH parent: byte-identical to the sequential-with-parent run.
+    // With the parent: byte-identical to the sequential-with-parent run.
     let out2 = execute_block_parallel(
         &test_pool(),
         &snap,
@@ -402,18 +399,14 @@ fn empty_block_is_a_no_op() {
     assert!(out.receipts.is_empty() && out.batches == 0);
 }
 
-/// THE deposit-emission regression: a deposit's mint MUST be claimed in
-/// the BAL as a balance write, because later batches seed the recipient's
-/// balance from it. Before the fix, `record_writeset_into_bal` fabricated
-/// only a differing nonce and revm's per-FIELD classification silently
-/// dropped the balance claim — batch 2 seeded the pre-mint balance and
-/// every spend of minted funds diverged.
+/// A deposit's mint must be claimed in the BAL as a balance write,
+/// because later batches seed the recipient's balance from it.
 #[test]
 fn deposit_mint_seeds_later_batches() {
     let signer = PrivateKeySigner::random();
     let d = signer.address();
     let to = address!("00000000000000000000000000000000000000EE");
-    // D starts at ZERO balance: only the mint can fund its txs.
+    // d starts at zero balance, so only the mint can fund its txs.
     let snap = MockStateDatabase::builder()
         .account(d, U256::ZERO, 0, alloy_primitives::KECCAK256_EMPTY)
         .build();
@@ -433,7 +426,7 @@ fn deposit_mint_seeds_later_batches() {
     );
     let expected = seq_delta(&snap, &records);
 
-    // batch_size 1: the spends run in batches seeded ONLY from claims.
+    // batch_size 1: the spends run in batches seeded only from claims.
     let out = execute_block_parallel(&test_pool(), &snap, None, &records, &claims, env(), 1, 1)
         .expect("deposit-seeded parallel block");
     assert_eq!(out.delta.accounts, expected.accounts);
@@ -444,10 +437,9 @@ fn deposit_mint_seeds_later_batches() {
     assert!(out.receipts.iter().all(|r| r.status));
 }
 
-/// A CREATE deposit's bytecode is a CODE claim: a later batch calling
-/// the deposited contract must seed the BYTES, or the call no-ops
-/// against empty code (the cross-chunk CREATE-then-CALL class, deposit
-/// edition).
+/// A CREATE deposit's bytecode is a code claim. A later batch calling
+/// the deposited contract must seed the bytes, or the call runs against
+/// empty code and does nothing.
 #[test]
 fn create_deposit_code_seeds_later_calls() {
     let signer = PrivateKeySigner::random();
@@ -491,8 +483,8 @@ fn create_deposit_code_seeds_later_calls() {
 }
 
 /// Deposits inside a K > 1 chunk: chunk-aligned batches with a deposit
-/// mid-chunk verify and match sequential (the deposit's claims are
-/// quantized through the same shared ladder as tx claims).
+/// mid-chunk verify and match sequential execution. The deposit's claims
+/// are quantized through the same shared ladder as tx claims.
 #[test]
 fn quantized_chunk_containing_a_deposit_verifies() {
     let signer = PrivateKeySigner::random();
@@ -508,18 +500,17 @@ fn quantized_chunk_containing_a_deposit_verifies() {
             alloy_primitives::KECCAK256_EMPTY,
         )
         .build();
-    // Chunk 1 (K=4): 3 filler txs + the deposit at bal index 4, so the
-    // deposit is CHUNK-FINAL for d's balance — chunk 2's spends seed the
-    // mint from the deposit's claim alone, and no same-chunk tx re-claim
-    // can mask a missing deposit emission. (The CALL deposit bumps d's
-    // nonce to 1; spends run nonces 1..4.)
+    // Chunk 1 (K=4): 3 filler txs plus the deposit at bal index 4, so the
+    // deposit is chunk-final for d's balance. Chunk 2's spends seed the
+    // mint from the deposit's claim alone. The CALL deposit bumps d's
+    // nonce to 1, so spends run nonces 1..4.
     let mut records: Vec<BufferedRecord> = (0..3u64).map(|i| tx(&filler, to, i, 100, i)).collect();
     records.push(dep(d, Some(to), 10u128.pow(18), Vec::new(), 3));
     for i in 4..8u64 {
         records.push(tx(&signer, to, i - 3, 500, i));
     }
 
-    // Executor view: per-record capture, then the SHARED quantize at K=4.
+    // Executor view: per-record capture, then the shared quantize at K=4.
     let (expected, bal) = seq_capture(&snap, None, &records, true);
     let quantized = kardamom_engine::bal_ladder::quantize(bal.into_alloy_bal(), 4);
     let claims = ClaimIndex::from_alloy(&quantized);
@@ -531,8 +522,8 @@ fn quantized_chunk_containing_a_deposit_verifies() {
     assert_eq!(out.batches, 2, "8 records at K=4 -> 2 aligned chunks");
 }
 
-/// A forged claim about a DEPOSIT fails-stop like any other — deposits
-/// get no special trust.
+/// A forged claim about a deposit stops the process like any other:
+/// deposits get no special trust.
 #[test]
 fn a_forged_deposit_claim_fails_stop() {
     let signer = PrivateKeySigner::random();
@@ -562,9 +553,10 @@ fn a_forged_deposit_claim_fails_stop() {
     }
 }
 
-/// A/B: the pooled dispatch must be BYTE-IDENTICAL to the scope-spawn
-/// reference on the same compositions — receipts, delta, and (on a forged
-/// claim) the error text. The pool changes only WHERE batches run.
+/// A/B check: the pooled dispatch must be byte-identical to the
+/// scope-spawn reference on the same compositions, including receipts,
+/// delta, and, on a forged claim, the error text. The pool changes only
+/// where batches run.
 #[test]
 fn pooled_dispatch_matches_scoped_reference() {
     let signer = PrivateKeySigner::random();
@@ -579,8 +571,8 @@ fn pooled_dispatch_matches_scoped_reference() {
         )
         .build();
     let txs: Vec<BufferedRecord> = (0..23).map(|i| tx(&signer, to, i, 100 + i, i)).collect();
-    // Per-tx capture once; at K > 1 the wire claims are chunk-collapsed
-    // through the SHARED quantize, exactly as the executor publishes them.
+    // Capture per tx once; at K > 1 the wire claims are chunk-collapsed
+    // through the shared quantize, exactly as the executor publishes them.
     let (_, bal) = seq_capture(&snap, None, &txs, false);
     let raw = bal.into_alloy_bal();
 
@@ -629,11 +621,10 @@ fn pooled_dispatch_matches_scoped_reference() {
     }
 }
 
-/// Real-mdbx equivalence: the pooled path with PER-WORKER SNAPSHOT FORKS
+/// Real-mdbx equivalence: the pooled path with per-worker snapshot forks
 /// (`fork_view`) produces byte-identical output to sequential execution
-/// against the same mdbx snapshot. This is the state-backed proof for the
-/// shared-read-txn fix — mock tests cannot exercise the fork path's mdbx
-/// anchor semantics.
+/// against the same mdbx snapshot. Mock tests cannot exercise the fork
+/// path's mdbx anchor semantics, so this test uses a real state env.
 #[test]
 fn pooled_with_forks_matches_sequential_on_mdbx() {
     use kardamom_engine::stateless::execute_block;
@@ -661,7 +652,7 @@ fn pooled_with_forks_matches_sequential_on_mdbx() {
     .expect("seed genesis");
     let mut writer = kardamom_state::StateWriter::spawn(env_).expect("spawn writer");
     let snap = writer.snapshot_rx.recv().expect("genesis snapshot");
-    // Sanity: forks mint (writer quiescent at genesis).
+    // Sanity check: forks mint while the writer is quiet at genesis.
     assert!(
         snap.fork_view().is_some(),
         "fork must mint at a quiet anchor"

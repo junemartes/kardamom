@@ -1,16 +1,16 @@
 //! Withdrawal commitments shared by the attester (validator) and the on-chain
 //! L1 bridge.
 //!
-//! These functions are the **single source of truth** for the byte layouts the
+//! These functions are the single source of truth for the byte layouts the
 //! L1 contracts verify. They must stay identical to:
-//! - `L2ToL1MessagePasser.hashWithdrawal` / `ETHLockbox.hashWithdrawal`
+//! - `L2ToL1MessagePasser.hashWithdrawal` and `ETHLockbox.hashWithdrawal`
 //!   (the withdrawal leaf),
 //! - `ETHLockbox._merkleRoot` (the positional keccak Merkle tree), and
-//! - `WithdrawalOutputOracle.OUTPUT_VERSION` + the output-root packing in
+//! - `WithdrawalOutputOracle.OUTPUT_VERSION` and the output-root packing in
 //!   `ETHLockbox.finalizeWithdrawal`.
 //!
-//! The cross-language tie is enforced by the anvil integration test, where a
-//! proof built here is verified by the real deployed `ETHLockbox`.
+//! The anvil integration test enforces the cross-language tie: a proof
+//! built here is verified by the real deployed `ETHLockbox`.
 
 use alloc::vec::Vec;
 
@@ -21,15 +21,16 @@ pub const OUTPUT_VERSION: u8 = 0;
 
 /// Domain tag prefixed to a withdrawal hash before it enters the Merkle tree.
 /// Must equal `ETHLockbox.LEAF_DOMAIN`. Leaves and internal nodes hash under
-/// distinct domains so an internal-node preimage can never be replayed as a
-/// leaf (second-preimage hardening).
+/// distinct domains, so an internal-node preimage can never be replayed as
+/// a leaf. This is second-preimage hardening.
 pub const LEAF_DOMAIN: u8 = 0x00;
 /// Domain tag prefixed to each internal `(left, right)` pair. Must equal
 /// `ETHLockbox.NODE_DOMAIN`.
 pub const NODE_DOMAIN: u8 = 0x01;
 
-/// Canonical L2 address of the `L2ToL1MessagePasser` predeploy (the L2
-/// withdrawal entry point). Seeded into genesis; see `chains/dev-withdrawals.toml`.
+/// Canonical L2 address of the `L2ToL1MessagePasser` predeploy. This is the
+/// L2 withdrawal entry point. It is seeded into genesis; see
+/// `chains/dev-withdrawals.toml`.
 pub const MESSAGE_PASSER: Address = address!("0x4200000000000000000000000000000000000016");
 
 /// `keccak256` of the `MessagePassed` event signature (topic0).
@@ -37,18 +38,20 @@ pub fn message_passed_topic0() -> B256 {
     keccak256("MessagePassed(uint256,address,address,uint256,bytes32)")
 }
 
-/// Decode a `MessagePassed` log into `(nonce, leaf)`, where `leaf` is the
-/// withdrawal hash recomputed from the decoded fields via [`withdrawal_leaf`].
-/// Returns `None` if the log is not a well-formed `MessagePassed` event, or if
-/// the event-carried hash does not equal the recomputed one — the recompute
-/// catches predeploy/bytecode drift (the predeploy runtime bytecode is
-/// duplicated by hand in `chains/dev-withdrawals.toml`) instead of trusting
-/// event-carried data. The attester uses this to collect an output's
-/// withdrawals from re-executed block receipts.
+/// Decode a `MessagePassed` log into `(nonce, leaf)`. `leaf` is the
+/// withdrawal hash, recomputed from the decoded fields with
+/// [`withdrawal_leaf`]. Returns `None` if the log is not a well-formed
+/// `MessagePassed` event, or if the event-carried hash does not equal the
+/// recomputed one. The recompute catches predeploy or bytecode drift,
+/// because the predeploy runtime bytecode is duplicated by hand in
+/// `chains/dev-withdrawals.toml`, instead of trusting the event-carried
+/// data. The attester uses this to collect an output's withdrawals from
+/// re-executed block receipts.
 ///
 /// Event: `MessagePassed(uint256 indexed nonce, address indexed sender,
 /// address indexed target, uint256 value, bytes32 withdrawalHash)`.
-/// `topics = [topic0, nonce, sender, target]`; `data = value(32) ++ hash(32)`.
+/// `topics = [topic0, nonce, sender, target]`.
+/// `data = value(32) ++ hash(32)`.
 pub fn decode_message_passed(topics: &[B256], data: &[u8]) -> Option<(U256, B256)> {
     if topics.len() != 4 || topics[0] != message_passed_topic0() || data.len() != 64 {
         return None;
@@ -67,9 +70,9 @@ pub fn decode_message_passed(topics: &[B256], data: &[u8]) -> Option<(U256, B256
 
 /// Canonical withdrawal leaf: `keccak256(abi.encode(nonce, sender, target, value))`.
 ///
-/// `abi.encode` lays each static value out as one 32-byte word: `nonce` and
-/// `value` big-endian, `sender`/`target` right-aligned (12 zero bytes then the
-/// 20 address bytes).
+/// `abi.encode` lays out each static value as one 32-byte word: `nonce`
+/// and `value` big-endian, `sender` and `target` right-aligned (12 zero
+/// bytes, then the 20 address bytes).
 pub fn withdrawal_leaf(nonce: U256, sender: Address, target: Address, value: U256) -> B256 {
     let mut buf = [0u8; 128];
     buf[0..32].copy_from_slice(&nonce.to_be_bytes::<32>());
@@ -79,8 +82,8 @@ pub fn withdrawal_leaf(nonce: U256, sender: Address, target: Address, value: U25
     keccak256(buf)
 }
 
-/// `keccak256(NODE_DOMAIN ++ left ++ right)` — one internal node of the
-/// withdrawals tree.
+/// `keccak256(NODE_DOMAIN ++ left ++ right)`. This is one internal node of
+/// the withdrawals tree.
 fn hash_pair(left: B256, right: B256) -> B256 {
     let mut buf = [0u8; 65];
     buf[0] = NODE_DOMAIN;
@@ -89,8 +92,8 @@ fn hash_pair(left: B256, right: B256) -> B256 {
     keccak256(buf)
 }
 
-/// `keccak256(LEAF_DOMAIN ++ withdrawal_hash)` — a withdrawal hash lifted into
-/// the tree's leaf level.
+/// `keccak256(LEAF_DOMAIN ++ withdrawal_hash)`. This lifts a withdrawal
+/// hash into the tree's leaf level.
 fn hash_leaf(leaf: B256) -> B256 {
     let mut buf = [0u8; 33];
     buf[0] = LEAF_DOMAIN;
@@ -98,9 +101,9 @@ fn hash_leaf(leaf: B256) -> B256 {
     keccak256(buf)
 }
 
-/// Domain-hash the withdrawal hashes into the tree's leaf level, padded up to
-/// the next power-of-two size with the zero leaf — the fixed-shape convention
-/// the on-chain positional verifier reconstructs.
+/// Domain-hash the withdrawal hashes into the tree's leaf level. Pad up to
+/// the next power-of-two size with the zero leaf. This is the fixed-shape
+/// convention that the on-chain positional verifier reconstructs.
 fn leaf_level(leaves: &[B256]) -> Vec<B256> {
     let mut level = leaves.to_vec();
     let target = level.len().next_power_of_two().max(1);
@@ -108,9 +111,9 @@ fn leaf_level(leaves: &[B256]) -> Vec<B256> {
     level.into_iter().map(hash_leaf).collect()
 }
 
-/// Merkle root over `leaves` (withdrawal hashes, in withdrawal-nonce order
-/// within the output's block range). Empty input yields `B256::ZERO`; a single
-/// leaf yields `hash_leaf(leaf)`.
+/// Merkle root over `leaves`: withdrawal hashes, in withdrawal-nonce order
+/// within the output's block range. An empty input gives `B256::ZERO`. A
+/// single leaf gives `hash_leaf(leaf)`.
 pub fn withdrawals_root(leaves: &[B256]) -> B256 {
     if leaves.is_empty() {
         return B256::ZERO;
@@ -122,9 +125,9 @@ pub fn withdrawals_root(leaves: &[B256]) -> B256 {
     level[0]
 }
 
-/// Sibling path for the leaf at `index`, bottom-up. Length equals the tree
-/// depth (0 for a single-leaf tree). Pairs with [`withdrawals_root`] and is
-/// verified by `ETHLockbox._merkleRoot`.
+/// Sibling path for the leaf at `index`, from the bottom up. Its length
+/// equals the tree depth (`0` for a single-leaf tree). It pairs with
+/// [`withdrawals_root`], and `ETHLockbox._merkleRoot` verifies it.
 pub fn withdrawal_proof(leaves: &[B256], index: usize) -> Vec<B256> {
     let mut level = leaf_level(leaves);
     let mut idx = index;
@@ -142,9 +145,9 @@ pub fn withdrawal_proof(leaves: &[B256], index: usize) -> Vec<B256> {
     proof
 }
 
-/// Recompute a root from a leaf (withdrawal hash), its index, and its sibling
-/// proof. Mirrors the on-chain `ETHLockbox._merkleRoot`; used to self-check
-/// generated proofs.
+/// Recompute a root from a leaf (a withdrawal hash), its index, and its
+/// sibling proof. Mirrors the on-chain `ETHLockbox._merkleRoot`. Used to
+/// self-check generated proofs.
 pub fn recompute_root(leaf: B256, index: usize, proof: &[B256]) -> B256 {
     let mut node = hash_leaf(leaf);
     let mut idx = index;
@@ -202,9 +205,9 @@ mod tests {
 
     #[test]
     fn leaves_and_nodes_are_domain_separated() {
-        // A single-leaf root must NOT be the raw withdrawal hash, and an
-        // internal pair must NOT hash the same as an undomained concat — the
-        // second-preimage hardening the domains exist for.
+        // A single-leaf root must not be the raw withdrawal hash. An
+        // internal pair must not hash the same as an undomained concat.
+        // This is the second-preimage hardening the domains exist for.
         let l = leaf(0);
         assert_ne!(withdrawals_root(&[l]), l);
         let (a, b) = (leaf(1), leaf(2));
@@ -267,7 +270,7 @@ mod tests {
         let (topics, mut data) = message_passed(7, s, t, 1_000);
         data[63] ^= 0x01; // corrupt the event-carried withdrawal hash
         assert!(decode_message_passed(&topics, &data).is_none());
-        // ... and a tampered field (value) no longer matches the carried hash.
+        // A tampered field (value) also no longer matches the carried hash.
         let (topics, mut data) = message_passed(7, s, t, 1_000);
         data[31] ^= 0x01;
         assert!(decode_message_passed(&topics, &data).is_none());
@@ -278,7 +281,7 @@ mod tests {
         let s = address!("0x00000000000000000000000000000000000000aa");
         let t = address!("0x00000000000000000000000000000000000000bb");
         let (topics, mut data) = message_passed(7, s, t, 1_000);
-        data.push(0x00); // 65 bytes: malformed, must be rejected (`!= 64`)
+        data.push(0x00); // 65 bytes is malformed. It must be rejected (`!= 64`).
         assert!(decode_message_passed(&topics, &data).is_none());
     }
 

@@ -1,5 +1,6 @@
-//! Stateful deployer: wraps a provider + operator address and exposes
-//! high-level `ensure_factory`, `apply`, `addresses`, and `verify` methods.
+//! A stateful deployer. It wraps a provider and an operator address, and
+//! exposes the high-level methods `ensure_factory`, `apply`, `addresses`,
+//! and `verify`.
 
 use alloy_network::{Ethereum, ReceiptResponse, TransactionBuilder};
 use alloy_primitives::{Address, B256, Bytes, TxHash, U256};
@@ -104,13 +105,13 @@ pub struct VerifyMismatch {
 // Deployer
 // ---------------------------------------------------------------------------
 
-/// Stateful deployer: wraps a provider and the canonical factory `owner`.
+/// A stateful deployer. It wraps a provider and the canonical factory `owner`.
 ///
-/// `owner` is part of the factory's CREATE2 initcode, so it pins the factory
-/// address. Write methods take an `operator` (the tx `from`).
+/// The `owner` is part of the factory's CREATE2 initcode, so it fixes the
+/// factory address. Write methods take an `operator` address as the tx `from`.
 ///
-/// Generic over the provider so it works with any alloy provider (including
-/// anvil-backed providers in tests).
+/// This struct is generic over the provider, so it works with any alloy
+/// provider, including anvil-backed providers in tests.
 pub struct Deployer<P> {
     provider: P,
     owner: Address,
@@ -129,8 +130,8 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // factory_address — pure computation
     // -----------------------------------------------------------------------
 
-    /// Derive the factory proxy address from embedded creation bytecode + the
-    /// configured owner. Pure (no I/O).
+    /// Derive the factory proxy address from the embedded creation bytecode
+    /// and the configured owner. This function does no I/O.
     pub fn factory_address(&self) -> Address {
         let impl_initcode = embedded::factory_v1_creation();
         let proxy_creation_code = embedded::erc1967_proxy_creation();
@@ -138,11 +139,13 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         factory_proxy_address(&proxy_creation_code, impl_addr, self.owner)
     }
 
-    /// Predict the proxy address a fresh `Op::Deploy { l2_chain_id, id, .. }`
-    /// (version 1) will produce, given the exact `init_args` that deploy will
-    /// use. Pure (no I/O). Used to wire one contract's address into another's
-    /// init data within the same atomic `apply` batch (e.g. the output oracle
-    /// address into `ETHLockbox.initialize`).
+    /// Predict the proxy address for a fresh `Op::Deploy { l2_chain_id, id, .. }`
+    /// at version 1, given the exact `init_args` the deploy will use. This
+    /// function does no I/O.
+    ///
+    /// Use it to pass one contract's address into another contract's init
+    /// data, within the same atomic `apply` batch. For example, pass the
+    /// output oracle address into `ETHLockbox.initialize`.
     pub fn predict_proxy_address(
         &self,
         l2_chain_id: u64,
@@ -166,8 +169,9 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // ensure_factory — bootstrap workflow
     // -----------------------------------------------------------------------
 
-    /// Ensure the kardamom factory is deployed on the connected chain. Anyone
-    /// with gas can call this; the on-chain owner is set at initialize time.
+    /// Make sure the kardamom factory is deployed on the connected chain.
+    /// Anyone with gas can call this. The on-chain owner is set at initialize
+    /// time.
     pub async fn ensure_factory(&self, operator: Address) -> Result<FactoryStatus, DeployError> {
         // (a) ERC-7955 factory must be present.
         if !self.code_present(ERC7955_FACTORY).await? {
@@ -210,25 +214,26 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // apply — send applyDeployments to the factory
     // -----------------------------------------------------------------------
 
-    /// Send one `applyDeployments` tx for the given ops.
+    /// Send one `applyDeployments` transaction for the given ops.
     ///
-    /// Performs impl-dedup grouping: ops sharing the same `(id, version)` produce specs
-    /// where only the first triggers a CREATE2 of the impl; subsequent specs reference
-    /// the (offline-computed) impl address via `target_impl`. This makes "upgrade across
-    /// N L2s to the same new impl" a one-impl-deploy operation instead of N copies.
+    /// This method groups ops by impl for dedup. Ops that share the same
+    /// `(id, version)` produce specs where only the first spec triggers a
+    /// CREATE2 of the impl. The other specs reference the impl address,
+    /// computed offline, through `target_impl`. So an upgrade of the same
+    /// new impl across N L2s deploys the impl once, not N times.
     pub async fn apply(&self, ops: &[Op], operator: Address) -> Result<TxHash, DeployError> {
         let factory_proxy = self.factory_address();
 
-        // Verify factory is deployed.
+        // Check that the factory is deployed.
         if !self.code_present(factory_proxy).await? {
             return Err(DeployError::FactoryNotDeployed(factory_proxy));
         }
 
-        // Build raw specs (each has target_impl = zero), then run the dedup pass.
+        // Build raw specs, each with target_impl = zero. Then run the dedup pass.
         let mut specs: Vec<DeploymentSpec> = ops.iter().map(build_spec).collect();
         dedup_impl_specs(factory_proxy, &mut specs);
 
-        // Encode + send.
+        // Encode and send.
         let abi_specs: Vec<IKardamomFactory::DeploymentSpec> =
             specs.into_iter().map(spec_to_abi).collect();
         let call = IKardamomFactory::applyDeploymentsCall { specs: abi_specs };
@@ -247,8 +252,8 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // addresses — read the factory registry
     // -----------------------------------------------------------------------
 
-    /// Read the factory's on-chain registry. If `l2_chain_id` is `Some`, returns entries
-    /// only for that L2; otherwise returns entries across all registered L2s.
+    /// Read the factory's on-chain registry. If `l2_chain_id` is `Some`, return
+    /// entries for only that L2. Otherwise, return entries for all registered L2s.
     pub async fn addresses(
         &self,
         l2_chain_id: Option<u64>,
@@ -299,7 +304,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // verify — cross-check registry vs ERC1967 storage slot
     // -----------------------------------------------------------------------
 
-    /// Verify every registry entry's `currentImpl` matches the proxy's ERC1967 impl slot.
+    /// Check that each registry entry's `currentImpl` matches the proxy's ERC1967 impl slot.
     pub async fn verify(&self) -> Result<VerifyReport, DeployError> {
         let entries = self.addresses(None).await?;
         let mut mismatches = Vec::new();
@@ -327,13 +332,13 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    /// True iff `addr` has non-empty code on the connected chain.
+    /// Return true if `addr` has code on the connected chain.
     async fn code_present(&self, addr: Address) -> Result<bool, DeployError> {
         Ok(!self.provider.get_code_at(addr).await?.is_empty())
     }
 
-    /// Send `tx`, wait for its receipt, and fail with [`DeployError::Reverted`]
-    /// if the transaction did not succeed.
+    /// Send `tx` and wait for its receipt. Fail with [`DeployError::Reverted`]
+    /// if the transaction does not succeed.
     async fn send_and_confirm(
         &self,
         tx: TransactionRequest,
@@ -371,10 +376,11 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 // Free helpers
 // ---------------------------------------------------------------------------
 
-/// Impl-dedup pass used by [`Deployer::apply`]: within each `(id, impl_salt)`
-/// group, the first spec keeps `target_impl = zero` (the factory CREATE2's the
-/// impl); subsequent specs reference the impl via `target_impl`, computed
-/// offline from the factory address and the spec's `impl_salt` + `impl_initcode`.
+/// Impl-dedup pass used by [`Deployer::apply`]. Within each `(id, impl_salt)`
+/// group, the first spec keeps `target_impl = zero`, so the factory does a
+/// CREATE2 of the impl. The other specs reference the impl through
+/// `target_impl`, computed offline from the factory address and the spec's
+/// `impl_salt` and `impl_initcode`.
 fn dedup_impl_specs(factory: Address, specs: &mut [DeploymentSpec]) {
     let mut seen_impl: std::collections::HashMap<(B256, B256), Address> =
         std::collections::HashMap::new();
@@ -386,7 +392,8 @@ fn dedup_impl_specs(factory: Address, specs: &mut [DeploymentSpec]) {
             let computed =
                 crate::addresses::app_impl_address(factory, s.impl_salt, &s.impl_initcode);
             seen_impl.insert(key, computed);
-            // First spec in the group keeps target_impl = zero (factory CREATE2's the impl).
+            // The first spec in the group keeps target_impl = zero.
+            // The factory does a CREATE2 for the impl.
         }
     }
 }
@@ -433,13 +440,12 @@ mod apply_dedup_tests {
         }
     }
 
-    /// Sanity round-trip: build a `DeploymentSpec`, encode + decode through the
-    /// JSON-ABI-derived `IKardamomFactory::applyDeploymentsCall`, and assert every
-    /// field survives. Catches accidental field reshuffling in `spec_to_abi`
-    /// (and would catch a Rust-side struct mismatch, though the JSON ABI itself is
-    /// the source of truth for layout). The cargo↔Solidity layout pin is the
-    /// bytecode-hash CI gate plus the e2e deploy/upgrade integration tests
-    /// against anvil.
+    /// Round-trip test: build a `DeploymentSpec`, encode and decode it through
+    /// the JSON-ABI-derived `IKardamomFactory::applyDeploymentsCall`, and check
+    /// that every field survives. This catches an accidental field reshuffle
+    /// in `spec_to_abi`. The JSON ABI is the source of truth for layout; the
+    /// bytecode-hash CI gate and the e2e deploy/upgrade tests against anvil
+    /// pin the Rust-to-Solidity layout match.
     #[test]
     fn apply_deployments_calldata_roundtrip() {
         use super::IKardamomFactory;
@@ -469,20 +475,20 @@ mod apply_dedup_tests {
         assert_eq!(d.initData, spec.init_data);
         assert_eq!(d.implSalt, spec.impl_salt);
         assert_eq!(d.targetImpl, spec.target_impl);
-        // Sanity: the abi round-trips byte-for-byte too.
+        // Check that the abi also round-trips byte-for-byte.
         assert_eq!(d.abi_encode(), abi.abi_encode());
     }
 
-    /// Exercises the dedup pass `apply` runs (`dedup_impl_specs`) against a
+    /// Test the dedup pass that `apply` runs (`dedup_impl_specs`), using a
     /// fake factory address.
     #[test]
     fn dedup_picks_first_in_group_for_create2() {
         let factory = Address::from([0x11; 20]);
         let mut specs = vec![
             raw_spec(42, 1, 1),
-            raw_spec(43, 1, 1), // same (id, salt) as #0 — must reuse
-            raw_spec(42, 2, 2), // different id — own group
-            raw_spec(44, 1, 1), // same (id, salt) as #0 — must reuse
+            raw_spec(43, 1, 1), // same (id, salt) as #0; must reuse
+            raw_spec(42, 2, 2), // different id; starts a new group
+            raw_spec(44, 1, 1), // same (id, salt) as #0; must reuse
         ];
 
         super::dedup_impl_specs(factory, &mut specs);

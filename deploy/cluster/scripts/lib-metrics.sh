@@ -2,31 +2,36 @@
 # =============================================================================
 # lib-metrics.sh — shared Prometheus scrape + parse helpers.
 # =============================================================================
-# SOURCED (never executed) by chaos.sh (via chaos-probes.sh), ci-cluster.sh and
-# smoke-load.sh. Consolidates the 10+ per-script scrape/parse sites that had
-# drifted into three different awk metric-match regexes:
-#     chaos.sh       '"[{ ]"'        (val_metric/seqa_metric — misses nothing in
-#                                     practice, but cannot match a label-less
-#                                     bare-name sample line)
-#     ci-cluster.sh  '"([{ ])"'      (same limitation)
+# This file is sourced, never run directly, by chaos.sh (through
+# chaos-probes.sh), ci-cluster.sh, and smoke-load.sh. It replaces 10+
+# per-script scrape and parse sites. These sites had drifted into three
+# different awk metric-match patterns:
+#     chaos.sh       '"[{ ]"'        (val_metric/seqa_metric — matches most
+#                                     samples, but not a label-less bare-name
+#                                     sample line)
+#     ci-cluster.sh  '"([{ ])"'      (same limit)
 #     smoke-load.sh  '"([{ ]|$)"'    (also matches label-less samples)
-# Unified here on '"([{ ]|$)"' — the one that also matches label-less samples —
-# so every consumer parses the exposition format identically.
+# This file uses '"([{ ]|$)"' everywhere. This pattern also matches
+# label-less samples, so every consumer parses the exposition format the
+# same way.
 #
-# No dependency on lib.sh (no log/fail): smoke-load.sh sources this while
-# keeping its own "RESULT: FAIL" fail contract.
+# This file does not depend on lib.sh, and defines no log() or fail().
+# smoke-load.sh sources this file while keeping its own "RESULT: FAIL" fail
+# contract.
 
-# Fetch one /metrics body: bridge-DIRECT first, docker-exec fallback.
-#   $1 = bridge ip   ("" => skip the direct probe: loopback-only exporter)
-#   $2 = node container ("" => skip the docker-exec fallback: direct-only)
+# Fetch one /metrics body. Try the bridge IP directly first, then fall back
+# to docker exec.
+#   $1 = bridge ip   ("" skips the direct probe: exporter is loopback-only)
+#   $2 = node container ("" skips the docker-exec fallback: direct-only)
 #   $3 = metrics port
-# The direct probe matters where available: a hard `docker kill` of a
-# privileged sibling can stall the runner's dockerd for tens of seconds,
-# taking every `docker exec` probe down with it and reading as a pipeline
-# stall when nothing is wrong (issue #76). Prints the body; returns non-zero
-# if no probe answered. Callers under `set -euo pipefail` MUST guard the
-# capture (`$(fetch_metrics ... || true)`) — an unguarded failing assignment
-# kills the whole script with NO fail message (the val_metric lesson).
+# Use the direct probe when it is available. A hard `docker kill` of a
+# privileged sibling container can stall the runner's dockerd for tens of
+# seconds. This would take every `docker exec` probe down with it, and
+# look like a pipeline stall when nothing is wrong. The function prints
+# the body and returns non-zero if no probe answers. Under
+# `set -euo pipefail`, callers must guard the capture:
+# `$(fetch_metrics ... || true)`. An unguarded failing assignment kills
+# the whole script with no fail message.
 fetch_metrics() {
   local ip="$1" node="$2" port="$3"
   if [ -n "${ip}" ]; then
@@ -39,16 +44,17 @@ fetch_metrics() {
 
 # Extract one metric from a captured /metrics body.
 #   $1 = body   $2 = metric name   $3 = mode: first (default) | sum
-#   first : int value of the FIRST matching sample (gauges); empty if absent.
-#   sum   : int sum of $NF across ALL matching samples (per-label counters);
-#           empty if NO sample matched (scrape failure / metric not yet
-#           registered is NOT zero — the sequencer-lapse "scrape failure is
-#           not zero" contract).
-# awk int-truncates (%d) — gauges may render as floats / scientific notation.
-# awk always reads the ENTIRE body (no early exit): the producer is a bash
-# expansion so there is no pipe-buffer/SIGPIPE hazard either way, but keeping
-# the consumer full-read matches the suite's no-early-exit-consumer doctrine
-# (see the SIGPIPE header in chaos-probes.sh / PR #158).
+#   first : int value of the first matching sample (gauges). Empty if none
+#           match.
+#   sum   : int sum of $NF across all matching samples (per-label counters).
+#           Empty if no sample matched. A scrape failure, or a metric not
+#           yet registered, is not the same as zero.
+# awk truncates to an int (%d). Gauges may render as floats or in
+# scientific notation.
+# awk always reads the entire body, with no early exit. The producer is a
+# bash expansion, so there is no pipe-buffer or SIGPIPE risk either way.
+# Reading the full body here matches the suite's rule: consumers never
+# exit early. See the SIGPIPE note in the chaos-probes.sh file header.
 prom_value() {
   local body="$1" metric="$2" mode="${3:-first}"
   if [ "${mode}" = "sum" ]; then

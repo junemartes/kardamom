@@ -1,11 +1,11 @@
-//! The cluster-client seam the adapters depend on.
+//! The cluster-client seam that the adapters depend on.
 //!
 //! The real implementation (behind `kardamom-cluster-client`'s `aeron-live`
-//! feature) drives an [`crate`]-level Aeron ingress publication + egress
-//! subscription through the `SessionDriver`. The adapters only need two
-//! capabilities — offer an app message to ingress, and receive the next app
-//! message from egress — so they are written against these traits and tested
-//! with the in-memory fakes below.
+//! feature) drives an [`crate`]-level Aeron ingress publication and egress
+//! subscription through the `SessionDriver`. The adapters need only two
+//! capabilities: offer an app message to ingress, and receive the next app
+//! message from egress. So the adapters use these traits, and tests use the
+//! in-memory fakes below.
 
 /// Outcome of offering an app message to cluster ingress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -22,8 +22,8 @@ pub trait ClusterIngress: Send {
 }
 
 /// Receive app messages from cluster egress (used by the tx_ordering
-/// subscription). `recv` blocks until the next payload or returns `None` when
-/// the session/stream has closed.
+/// subscription). `recv` blocks until the next payload arrives. It returns
+/// `None` when the session or stream closes.
 pub trait ClusterEgress: Send {
     fn recv(&mut self) -> Option<Vec<u8>>;
 }
@@ -37,8 +37,8 @@ pub mod fakes {
 
     use super::{ClusterEgress, ClusterIngress, OfferOutcome};
 
-    /// In-memory ingress sink. Records every accepted payload; a togglable flag
-    /// simulates back-pressure / disconnection.
+    /// In-memory ingress sink. It records every accepted payload. A toggle
+    /// flag simulates back-pressure or disconnection.
     #[derive(Clone, Default)]
     pub struct FakeIngress {
         pub accepted: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -70,8 +70,9 @@ pub mod fakes {
         }
     }
 
-    /// In-memory egress source backed by a queue. `recv` pops the next payload;
-    /// returns `None` once the queue is empty and the source is marked closed.
+    /// In-memory egress source backed by a queue. `recv` pops the next
+    /// payload. It returns `None` once the queue is empty and the source is
+    /// closed.
     #[derive(Clone, Default)]
     pub struct FakeEgress {
         queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -88,7 +89,7 @@ pub mod fakes {
         pub fn push(&self, payload: Vec<u8>) {
             self.queue.lock().unwrap().push_back(payload);
         }
-        /// Mark the stream closed; once the queue drains, `recv` returns `None`.
+        /// Mark the stream closed. Once the queue drains, `recv` returns `None`.
         pub fn close(&self) {
             *self.closed.lock().unwrap() = true;
         }
@@ -103,8 +104,9 @@ pub mod fakes {
                 if *self.closed.lock().unwrap() {
                     return None;
                 }
-                // Deterministic tests always close before draining, so this is
-                // only reached in a misuse; yield to avoid a hot spin.
+                // Deterministic tests always close before the queue drains.
+                // This code path runs only on misuse. Yield to avoid a hot
+                // spin.
                 std::thread::yield_now();
             }
         }

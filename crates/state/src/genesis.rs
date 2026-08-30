@@ -1,14 +1,15 @@
 //! One-shot genesis seeding for a fresh env.
 //!
-//! The executor seeds the chain's genesis allocations (balances / nonces /
-//! code) into a brand-new env *before* spawning the [`crate::writer::StateWriter`],
-//! so the writer's initial published snapshot already reflects genesis and the
-//! first block's transactions have account state to debit.
+//! The executor seeds the chain's genesis allocations (balances, nonces,
+//! and code) into a brand-new env before it spawns the
+//! [`crate::writer::StateWriter`]. This way, the writer's first published
+//! snapshot already reflects genesis, and the first block's transactions
+//! have account state to debit.
 //!
-//! Seeding is gated on the [`KEY_GENESIS_APPLIED`] meta flag so a restart against
-//! an already-seeded env is a no-op — independent of the block cursor, since
-//! genesis is "block 0" and `last_committed_block` stays 0 until the first real
-//! block commits.
+//! Seeding is gated on the [`KEY_GENESIS_APPLIED`] meta flag, so a restart
+//! against an already-seeded env is a no-op. This check is independent of
+//! the block cursor, because genesis is "block 0". `last_committed_block`
+//! stays 0 until the first real block commits.
 
 use alloy_primitives::{B256, keccak256};
 use kardamom_types::{AccountChange, CodeEntry};
@@ -22,12 +23,15 @@ use crate::schema::{
     encode_code_key,
 };
 
-/// Order-insensitive digest of a genesis allocation: keccak over the sorted
-/// account entries (address, nonce, balance, code_hash) and sorted code hashes
-/// (bytecode is content-addressed, so the hash pins the bytes). Persisted at
-/// seed time under [`KEY_GENESIS_DIGEST`] and compared on every later
-/// [`seed_genesis`] call, so a changed `--chain` file — or a node pointed at
-/// the wrong state dir — fails startup instead of being silently ignored.
+/// An order-insensitive digest of a genesis allocation. This is a keccak
+/// hash over the sorted account entries (address, nonce, balance,
+/// code_hash) and the sorted code hashes. Bytecode is content-addressed,
+/// so the hash pins the bytes.
+///
+/// The digest is stored at seed time under [`KEY_GENESIS_DIGEST`], and
+/// compared on every later [`seed_genesis`] call. This makes startup fail
+/// on a changed `--chain` file, or a node pointed at the wrong state
+/// directory, instead of silently ignoring the change.
 pub fn genesis_digest(accounts: &[AccountChange], code: &[CodeEntry]) -> B256 {
     let mut accs: Vec<&AccountChange> = accounts.iter().collect();
     accs.sort_by_key(|a| a.address);
@@ -47,8 +51,8 @@ pub fn genesis_digest(accounts: &[AccountChange], code: &[CodeEntry]) -> B256 {
     keccak256(&buf)
 }
 
-/// True if genesis has already been seeded into this env (the
-/// [`KEY_GENESIS_APPLIED`] flag is present).
+/// Returns true if genesis has already been seeded into this env. This
+/// checks whether the [`KEY_GENESIS_APPLIED`] flag is present.
 pub fn genesis_applied(env: &StateEnv) -> Result<bool, StateError> {
     let txn = env.raw().begin_ro_sync()?;
     let meta = txn.open_db(Some(TABLE_META))?;
@@ -57,18 +61,23 @@ pub fn genesis_applied(env: &StateEnv) -> Result<bool, StateError> {
         .is_some())
 }
 
-/// Idempotently seed genesis allocations into a fresh env.
+/// Seed genesis allocations into a fresh env. This function is idempotent.
 ///
-/// Writes every account and code entry plus the [`KEY_GENESIS_APPLIED`] flag and
-/// the [`KEY_GENESIS_DIGEST`] in a single RW txn. Returns `Ok(true)` if it
-/// seeded, `Ok(false)` if genesis was already applied — after verifying the
-/// supplied allocations match the digest the env was seeded from; a mismatch
-/// (changed `--chain` file, wrong state dir) is
-/// [`StateError::GenesisMismatch`]. Envs seeded before the digest existed have
-/// it backfilled from the supplied allocations on the next start.
+/// It writes every account and code entry, plus the
+/// [`KEY_GENESIS_APPLIED`] flag and the [`KEY_GENESIS_DIGEST`], in a
+/// single read-write transaction.
 ///
-/// `storage_root` is persisted as `B256::ZERO` — v0 keeps no per-account MPT
-/// roots, matching [`crate::writer::StateWriter`].
+/// Returns `Ok(true)` if it seeded the env. Returns `Ok(false)` if genesis
+/// was already applied, after checking that the supplied allocations
+/// match the digest the env was seeded from. A mismatch, from a changed
+/// `--chain` file or the wrong state directory, returns
+/// [`StateError::GenesisMismatch`].
+///
+/// An env seeded before the digest existed gets the digest backfilled
+/// from the supplied allocations on the next start.
+///
+/// `storage_root` is stored as `B256::ZERO`. v0 keeps no per-account MPT
+/// roots, to match [`crate::writer::StateWriter`].
 pub fn seed_genesis(
     env: &StateEnv,
     accounts: &[AccountChange],
@@ -81,8 +90,8 @@ pub fn seed_genesis(
         .get::<Vec<u8>>(meta.dbi(), KEY_GENESIS_APPLIED)?
         .is_some()
     {
-        // Already seeded — verify the supplied alloc is the one this env was
-        // seeded from, then report no-op.
+        // Already seeded. Check that the supplied allocation matches the
+        // one this env was seeded from, then report a no-op.
         match crate::meta::read_meta_b256(&txn, meta, KEY_GENESIS_DIGEST)? {
             Some(stored) => {
                 drop(txn);
@@ -94,9 +103,9 @@ pub fn seed_genesis(
                 }
             }
             None => {
-                // Env seeded before the digest existed: we cannot verify the
-                // original alloc, so backfill from the supplied one — future
-                // restarts then detect drift.
+                // This env was seeded before the digest existed. We cannot
+                // verify the original allocation, so we backfill from the
+                // supplied one. Future restarts can then detect drift.
                 txn.put(
                     meta,
                     KEY_GENESIS_DIGEST,
@@ -130,8 +139,8 @@ pub fn seed_genesis(
 
     for entry in code {
         let key = encode_code_key(entry.code_hash);
-        // Code is content-addressed; NO_OVERWRITE skips a redundant write when
-        // two allocs share bytecode.
+        // Code is content-addressed. NO_OVERWRITE skips a redundant write
+        // when two allocations share the same bytecode.
         match txn.put(code_db, key, &entry.code, WriteFlags::NO_OVERWRITE) {
             Ok(()) => {}
             Err(signet_libmdbx::MdbxError::KeyExist) => {}
@@ -139,9 +148,10 @@ pub fn seed_genesis(
         }
     }
 
-    // Build the initial hashed-state mirror + account trie so a from-genesis
-    // validator starts at the correct world-state root before block 1. (Harmless
-    // for the executor, whose writer runs with TrieMode::Off and ignores them.)
+    // Build the initial hashed-state mirror and account trie. This lets a
+    // from-genesis validator start at the correct world-state root before
+    // block 1. This step is harmless for the executor: its writer runs
+    // with `TrieMode::Off` and ignores these tables.
     let trie_tables = crate::trie::TrieTables::open(&txn)?;
     let genesis_delta = kardamom_types::BlockDelta {
         block_number: 0,
@@ -158,9 +168,10 @@ pub fn seed_genesis(
         WriteFlags::UPSERT,
     )?;
 
-    // The flag and digest commit atomically with the allocations (one RW txn),
-    // so a crash mid-seed aborts everything and the next start re-seeds
-    // cleanly; put order within the txn is irrelevant.
+    // The flag and digest commit atomically with the allocations, in one
+    // read-write transaction. A crash mid-seed aborts everything, so the
+    // next start re-seeds cleanly. The put order within the transaction
+    // does not matter.
     txn.put(
         meta,
         KEY_GENESIS_DIGEST,
@@ -279,8 +290,8 @@ mod tests {
 
     #[test]
     fn seed_genesis_rejects_changed_alloc() {
-        // A restart with a different --chain file must fail loudly, not
-        // silently keep the old genesis state.
+        // A restart with a different --chain file must fail clearly. It
+        // must not silently keep the old genesis state.
         let (_dir, env) = temp_env();
         let accounts = vec![AccountChange {
             address: Address::repeat_byte(0x11),
@@ -295,7 +306,7 @@ mod tests {
         let err = seed_genesis(&env, &changed, &[]).unwrap_err();
         assert!(matches!(err, StateError::GenesisMismatch { .. }), "{err}");
 
-        // Same alloc in a different order is still the same genesis.
+        // The same allocation in a different order is still the same genesis.
         let mut two = vec![
             AccountChange {
                 address: Address::repeat_byte(0x22),
@@ -313,8 +324,8 @@ mod tests {
 
     #[test]
     fn seed_genesis_backfills_missing_digest() {
-        // Envs seeded before the digest existed get it backfilled on the next
-        // start, after which drift is detected.
+        // An env seeded before the digest existed gets it backfilled on
+        // the next start. After that, drift is detected.
         let (_dir, env) = temp_env();
         let accounts = vec![AccountChange {
             address: Address::repeat_byte(0x33),
@@ -324,7 +335,7 @@ mod tests {
         }];
         assert!(seed_genesis(&env, &accounts, &[]).unwrap());
 
-        // Simulate a legacy env: remove the stored digest.
+        // Simulate a legacy env by removing the stored digest.
         {
             let txn = env.raw().begin_rw_sync().unwrap();
             let meta = txn.open_db(Some(TABLE_META)).unwrap();
@@ -332,9 +343,10 @@ mod tests {
             txn.commit().unwrap();
         }
 
-        // First restart backfills (no verification possible)...
+        // The first restart backfills the digest. Verification is not
+        // possible yet.
         assert!(!seed_genesis(&env, &accounts, &[]).unwrap());
-        // ...after which a changed alloc is rejected.
+        // After that, a changed allocation is rejected.
         let mut changed = accounts.clone();
         changed[0].nonce = 9;
         assert!(matches!(

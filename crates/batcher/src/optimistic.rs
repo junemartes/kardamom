@@ -1,14 +1,14 @@
-//! Optimistic-mode L1 drivers (spec: no-std-exec-core, PR 5): the claim
-//! poster and the challenge driver, both fed by the validator's prover
-//! SPOOL — whose per-block `expected-outputs.bin` (the 160-byte
-//! `PublicOutputs`) already carries exactly the `(post_root,
-//! records_digest)` pair a claim attests and a watcher cross-checks.
+//! Optimistic-mode L1 drivers: the claim poster and the challenge driver.
+//! See the no-std-exec-core spec. Both drivers read from the validator's
+//! prover spool. Each block's `expected-outputs.bin` (the 160-byte
+//! `PublicOutputs`) already carries the `(post_root, records_digest)` pair
+//! that a claim attests to and a watcher cross-checks.
 //!
-//! Cadences stay decoupled, as everywhere in this series: the poster
-//! claims when the spool has covered a posted batch; the challenger
-//! compares pending claims against the spool and, at the FIRST divergent
-//! offset, submits the single-block proof the prover produced for that
-//! block (`zk-host --prove` on the spooled frame). Nothing stalls.
+//! The two cadences stay decoupled. The poster claims a batch once the spool
+//! covers it. The challenger compares pending claims against the spool and,
+//! at the first divergent offset, submits the single-block proof the prover
+//! made for that block (`zk-host --prove` on the spooled frame). Neither
+//! driver blocks on the other.
 
 use std::path::Path;
 
@@ -54,8 +54,8 @@ fn spool_sequences(spool: &Path, start: u64, end: u64) -> Result<(Vec<B256>, Vec
     Ok((roots, digests))
 }
 
-/// Claim the NEXT unclaimed posted batch from the spool's attestations.
-/// The bond is read from the oracle (`minBond`).
+/// Claim the next unclaimed posted batch, using the spool's attestations.
+/// Read the bond from the oracle (`minBond`).
 pub async fn claim_next_batch<P: Provider>(
     provider: P,
     oracle_addr: Address,
@@ -132,9 +132,9 @@ pub enum WatchOutcome {
     NothingPending,
 }
 
-/// Compare the next pending claim against the spool; at the FIRST
+/// Compare the next pending claim against the spool. At the first
 /// divergent offset, submit `challengeBlock` with the prover's files
-/// (`block-N/{public-values.bin, proof.bin}` — the single-block layout).
+/// (`block-N/{public-values.bin, proof.bin}`, the single-block layout).
 pub async fn watch_and_challenge<P: Provider>(
     provider: P,
     oracle_addr: Address,
@@ -172,8 +172,8 @@ pub async fn watch_and_challenge<P: Provider>(
         .await
         .map_err(|e| BatcherError::L1(format!("claims({batch_index}): {e}")))?;
 
-    // Rebuild the claimed sequences from the SPOOL and compare seqHash: if
-    // they match, the claim IS the spool's view — honest by our own data.
+    // Rebuild the claimed sequences from the spool and compare seqHash. If
+    // they match, the claim matches the spool's view. Treat it as honest.
     let (roots, digests) = match spool_sequences(spool, entry.l2BlockStart, entry.l2BlockEnd) {
         Ok(seqs) => seqs,
         Err(_) => return Ok(WatchOutcome::NothingPending),
@@ -186,9 +186,9 @@ pub async fn watch_and_challenge<P: Provider>(
         return Ok(WatchOutcome::ClaimHonest { batch_index });
     }
 
-    // Divergent claim. The claim event carries the claimed sequences; we
-    // find the first offset where OUR root differs by re-deriving the
-    // claimed arrays from the event log.
+    // The claim is divergent. The claim event carries the claimed sequences.
+    // Find the first offset where the local root differs, by re-deriving
+    // the claimed arrays from the event log.
     let filter = oracle
         .BatchClaimed_filter()
         .topic1(U256::from(batch_index))
@@ -200,11 +200,11 @@ pub async fn watch_and_challenge<P: Provider>(
     let (_, log) = logs
         .last()
         .ok_or_else(|| BatcherError::L1("claim exists but no BatchClaimed event".into()))?;
-    // The event stores seqHash, not the arrays; the CLAIM TX's calldata
-    // has them. v0: the divergence offset comes from comparing our spool
-    // roots against the claim's final root progression — the first block
-    // whose spool proof files exist AND whose claimed root (from the tx
-    // calldata) differs. Fetching calldata:
+    // The event stores seqHash, not the arrays. The claim transaction's
+    // calldata has them. In v0, the divergence offset comes from comparing
+    // the local spool roots against the claim's root sequence. It is the
+    // first block whose spool proof files exist and whose claimed root
+    // (from the tx calldata) differs. Fetch the calldata:
     let tx_hash = log
         .transaction_hash
         .ok_or_else(|| BatcherError::L1("claim event without tx hash".into()))?;
@@ -224,8 +224,9 @@ pub async fn watch_and_challenge<P: Provider>(
         }
     }
     let Some(block_offset) = offset else {
-        // Roots agree but digests differ — impossible past the fold check;
-        // treat as honest rather than invent a challenge we cannot win.
+        // The roots agree but the digests differ. This cannot happen past
+        // the fold check. Treat it as honest instead of raising a
+        // challenge that cannot win.
         return Ok(WatchOutcome::ClaimHonest { batch_index });
     };
     let divergent_block = entry.l2BlockStart + block_offset;

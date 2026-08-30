@@ -20,7 +20,7 @@ fn pos(offset: i32) -> BPosition {
     }
 }
 
-// --- OnQuorum (default, the original behavior) -----------------------
+// --- OnQuorum, the default and original behavior ----------------------
 
 #[tokio::test]
 async fn quorum_parks_until_receipt_and_watermark_both_arrive() {
@@ -74,10 +74,11 @@ async fn tx_error_releases_parked_client_with_duplicate() {
 
 #[tokio::test]
 async fn eviction_releases_the_parked_wait_with_an_evicted_error() {
-    // The wedge fix: a sequencer overload-shed (Evicted) must error the
-    // parked submit instead of leaving it waiting for a receipt that can
-    // never arrive (the pre-fix silent evict permanently gapped the
-    // sender and pinned the connection until timeout).
+    // This is the backlog fix. A sequencer overload-shed (Evicted) must
+    // error the parked submit, instead of leaving it waiting for a
+    // receipt that can never arrive. Before this fix, a silent evict
+    // permanently gapped the sender and pinned the connection until
+    // timeout.
     let p = Arc::new(PendingReceipts::new(AckPolicy::OnOffer));
     let sender = Address::repeat_byte(0x77);
     let nonce = 21u64;
@@ -101,9 +102,9 @@ async fn eviction_releases_the_parked_wait_with_an_evicted_error() {
 
 #[tokio::test]
 async fn success_arriving_within_the_grace_overrides_a_rejection() {
-    // F02.6: with racing sequencer replicas, replica A's DuplicatedTx can
-    // arrive BEFORE replica B's receipt for the same tx. The rejection is
-    // held for the grace window; the receipt must win.
+    // With racing sequencer replicas, replica A's DuplicatedTx can
+    // arrive before replica B's receipt for the same tx. The rejection
+    // is held for the grace window, and the receipt must win.
     let p = Arc::new(PendingReceipts::with_error_grace(
         AckPolicy::OnOffer,
         Duration::from_millis(200),
@@ -116,14 +117,14 @@ async fn success_arriving_within_the_grace_overrides_a_rejection() {
     let waiter = tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(5)).await });
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    // Rejection first (replica A, stale floor)...
+    // The rejection arrives first, from replica A with a stale floor.
     p.on_tx_error(
         sender,
         nonce,
         TxErrorReason::DuplicatedTx { expected_nonce: 6 },
     )
     .await;
-    // ...then the twin's success, well inside the grace window.
+    // Then the twin's success arrives, well inside the grace window.
     tokio::time::sleep(Duration::from_millis(20)).await;
     p.on_receipt(sender, nonce, dummy_receipt(position)).await;
 
@@ -137,8 +138,9 @@ async fn success_arriving_within_the_grace_overrides_a_rejection() {
 
 #[tokio::test]
 async fn rejection_releases_after_the_grace_when_no_success_arrives() {
-    // A genuine duplicate (both replicas reject, no receipt ever) still
-    // reaches the client — just delayed by the grace window.
+    // A genuine duplicate, where both replicas reject and no receipt
+    // ever arrives, still reaches the client, only delayed by the grace
+    // window.
     let p = Arc::new(PendingReceipts::with_error_grace(
         AckPolicy::OnOffer,
         Duration::from_millis(50),
@@ -169,11 +171,12 @@ async fn rejection_releases_after_the_grace_when_no_success_arrives() {
 
 #[tokio::test]
 async fn watermark_gated_receipt_suppresses_a_rejection() {
-    // A receipt that arrived but is still parked on the durability gate
-    // already proves the tx landed — a late rejection must not evict it.
+    // A receipt that arrived, but is still parked on the durability
+    // gate, already proves the tx landed. A late rejection must not
+    // evict it.
     let p = Arc::new(PendingReceipts::with_error_grace(
         AckPolicy::OnQuorum,
-        Duration::ZERO, // inline release path; the stored receipt must gate it
+        Duration::ZERO, // Inline release path; the stored receipt must gate it.
     ));
     let sender = Address::repeat_byte(0xAA);
     let nonce = 1u64;
@@ -183,9 +186,10 @@ async fn watermark_gated_receipt_suppresses_a_rejection() {
     let waiter = tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(5)).await });
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    // Receipt arrives but quorum hasn't caught up — stored, not released.
+    // The receipt arrives, but quorum has not caught up, so it is
+    // stored, not released.
     p.on_receipt(sender, nonce, dummy_receipt(position)).await;
-    // Twin's rejection must be suppressed by the stored receipt.
+    // The twin's rejection must be suppressed by the stored receipt.
     p.on_tx_error(
         sender,
         nonce,
@@ -195,7 +199,7 @@ async fn watermark_gated_receipt_suppresses_a_rejection() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(p.len(), 1, "entry must survive the rejection");
 
-    // Quorum catches up → the success is delivered.
+    // Quorum catches up, and the success is delivered.
     p.update_quorum_watermark(QuorumWatermark { position })
         .await;
     let res = waiter.await.expect("join").expect("receipt must win");
@@ -204,8 +208,8 @@ async fn watermark_gated_receipt_suppresses_a_rejection() {
 
 #[tokio::test]
 async fn tx_error_for_unparked_key_is_noop() {
-    // No client parked for this (sender, nonce) → on_tx_error returns
-    // silently without panicking.
+    // No client is parked for this (sender, nonce), so on_tx_error
+    // returns silently, without a panic.
     let p = Arc::new(PendingReceipts::new(AckPolicy::OnQuorum));
     p.on_tx_error(
         Address::repeat_byte(0x77),
@@ -254,12 +258,12 @@ async fn quorum_does_not_release_on_local_watermark_alone() {
     })
     .await;
 
-    // Local advanced but quorum didn't — must time out.
+    // Local advanced, but quorum did not, so this must time out.
     let err = waiter.await.unwrap().unwrap_err();
     assert!(matches!(err, IngressError::Timeout));
 }
 
-// --- OnOffer (no durability gate) ------------------------------------
+// --- OnOffer, no durability gate ---------------------------------------
 
 #[tokio::test]
 async fn on_offer_releases_as_soon_as_receipt_arrives() {
@@ -271,13 +275,14 @@ async fn on_offer_releases_as_soon_as_receipt_arrives() {
     let waiter = tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(5)).await });
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    // No watermark updates at all — must still release on receipt.
+    // With no watermark updates at all, this must still release on
+    // receipt.
     p.on_receipt(sender, 0, dummy_receipt(position)).await;
     let res = waiter.await.unwrap().unwrap();
     assert_eq!(res.receipt.tx_idx, position);
 }
 
-// --- OnLocalFsync (local-only, ignores quorum) -----------------------
+// --- OnLocalFsync, local only, ignores quorum ---------------------------
 
 #[tokio::test]
 async fn local_releases_on_local_watermark_only() {
@@ -290,13 +295,13 @@ async fn local_releases_on_local_watermark_only() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     p.on_receipt(sender, 0, dummy_receipt(position)).await;
-    // Quorum advances but policy ignores it — still parked.
+    // Quorum advances, but the policy ignores it, so this stays parked.
     p.update_quorum_watermark(QuorumWatermark { position })
         .await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(p.len(), 1);
 
-    // Local advances → releases.
+    // Local advances, and this releases.
     p.update_local_watermark(FsyncWatermark {
         recorder_id: 0,
         position,
@@ -306,7 +311,7 @@ async fn local_releases_on_local_watermark_only() {
     assert_eq!(res.receipt.tx_idx, position);
 }
 
-// --- OnLocalFsyncAndQuorum (both required) ---------------------------
+// --- OnLocalFsyncAndQuorum, both required -------------------------------
 
 #[tokio::test]
 async fn both_requires_local_and_quorum_to_advance() {
@@ -319,7 +324,7 @@ async fn both_requires_local_and_quorum_to_advance() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     p.on_receipt(sender, 0, dummy_receipt(position)).await;
-    // Only local — still parked.
+    // With only local advanced, this stays parked.
     p.update_local_watermark(FsyncWatermark {
         recorder_id: 0,
         position,
@@ -328,14 +333,14 @@ async fn both_requires_local_and_quorum_to_advance() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(p.len(), 1);
 
-    // Now quorum too → releases.
+    // Now quorum advances too, and this releases.
     p.update_quorum_watermark(QuorumWatermark { position })
         .await;
     let res = waiter.await.unwrap().unwrap();
     assert_eq!(res.receipt.tx_idx, position);
 }
 
-// --- Timeout still works regardless of policy ------------------------
+// --- Timeout still works regardless of policy ---------------------------
 
 #[tokio::test]
 async fn times_out_when_neither_event_arrives() {
@@ -349,12 +354,12 @@ async fn times_out_when_neither_event_arrives() {
     assert_eq!(p.len(), 0);
 }
 
-// --- Cancelled-future cleanup (the #81 follow-up) ---------------------
+// --- Cancelled-future cleanup, the #81 follow-up ------------------------
 
 #[tokio::test]
 async fn dropping_an_unresolved_wait_removes_its_entry() {
-    // The core leak: a client disconnect drops the RPC handler future,
-    // which drops the PendingWait without any of the release paths
+    // This is the core leak. A client disconnect drops the RPC handler
+    // future, which drops the PendingWait without any release path
     // running. The entry must leave the map right there.
     let p = PendingReceipts::new(AckPolicy::OnOffer);
     let wait = p.register(Address::repeat_byte(0xB1), 4);
@@ -365,9 +370,10 @@ async fn dropping_an_unresolved_wait_removes_its_entry() {
 
 #[tokio::test]
 async fn aborting_a_parked_await_cleans_up() {
-    // Same, through the real shape: the wait is parked inside
-    // await_with_timeout when the owning task is aborted (the future is
-    // dropped mid-await, exactly what jsonrpsee does on disconnect).
+    // This is the same case, through the real shape: the wait is parked
+    // inside await_with_timeout when the owning task is aborted. The
+    // future is dropped mid-await, exactly what jsonrpsee does on
+    // disconnect.
     let p = Arc::new(PendingReceipts::new(AckPolicy::OnOffer));
     let wait = p.register(Address::repeat_byte(0xB2), 7);
     let task = tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(60)).await });
@@ -380,13 +386,13 @@ async fn aborting_a_parked_await_cleans_up() {
 
 #[tokio::test]
 async fn stale_wait_drop_spares_a_replacement_registration() {
-    // (sender, nonce) re-registered while an old wait still exists: the
-    // old wait's Drop is identity-guarded and must NOT evict the new
-    // registration.
+    // (sender, nonce) is re-registered while an old wait still exists.
+    // The old wait's Drop is guarded by identity and must not evict the
+    // new registration.
     let p = PendingReceipts::new(AckPolicy::OnOffer);
     let sender = Address::repeat_byte(0xB3);
     let stale = p.register(sender, 1);
-    let fresh = p.register(sender, 1); // replaces the slot
+    let fresh = p.register(sender, 1); // This replaces the slot.
     assert_eq!(p.len(), 1);
     drop(stale);
     assert_eq!(p.len(), 1, "stale drop must spare the replacement");
@@ -396,10 +402,10 @@ async fn stale_wait_drop_spares_a_replacement_registration() {
 
 #[tokio::test]
 async fn a_dead_slot_reads_as_absent() {
-    // Structurally unreachable through the public API (Drop removes the
-    // slot BEFORE its entry dies) — simulated directly to pin the reader
-    // contract anyway: a dead Weak means "no client parked", never a
-    // panic or a release.
+    // This case is structurally unreachable through the public API,
+    // since Drop removes the slot before its entry dies. This test
+    // simulates it directly anyway, to pin the reader contract: a dead
+    // Weak means "no client parked," never a panic or a release.
     let p = PendingReceipts::new(AckPolicy::OnOffer);
     let sender = Address::repeat_byte(0xB5);
     p.map.insert((sender, 3), Weak::new());
@@ -411,8 +417,8 @@ async fn a_dead_slot_reads_as_absent() {
 #[tokio::test]
 async fn grace_task_does_not_keep_a_disconnected_entry_alive() {
     // The deferred rejection-release holds only a Weak across its grace
-    // sleep: a client that disconnects mid-grace must free its entry
-    // immediately, not after the grace fires.
+    // sleep. A client that disconnects mid-grace must free its entry
+    // right away, not after the grace fires.
     let p = Arc::new(PendingReceipts::with_error_grace(
         AckPolicy::OnOffer,
         Duration::from_millis(100),
@@ -422,22 +428,23 @@ async fn grace_task_does_not_keep_a_disconnected_entry_alive() {
     let weak = Arc::downgrade(&wait.entry);
     p.on_tx_error(sender, 6, TxErrorReason::DuplicatedTx { expected_nonce: 9 })
         .await;
-    drop(wait); // disconnect mid-grace
+    drop(wait); // Disconnect mid-grace.
     assert_eq!(
         weak.strong_count(),
         0,
         "the pending grace task must not keep the entry alive"
     );
     assert_eq!(p.len(), 0);
-    // Let the grace fire against the dead weak: must be a clean no-op.
+    // Let the grace fire against the dead weak. This must be a clean no-op.
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(p.len(), 0);
 }
 
 #[tokio::test]
 async fn replacement_registration_still_releases_on_receipt() {
-    // End-to-end on the replacement: after a stale wait is dropped, the
-    // fresh registration still parks and releases normally.
+    // This is an end-to-end check on the replacement: after a stale
+    // wait is dropped, the fresh registration still parks and releases
+    // normally.
     let p = Arc::new(PendingReceipts::new(AckPolicy::OnOffer));
     let sender = Address::repeat_byte(0xB4);
     let position = pos(12);

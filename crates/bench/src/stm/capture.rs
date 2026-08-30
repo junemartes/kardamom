@@ -1,6 +1,7 @@
-//! Sequential capture runner: execute blocks through the real engine,
-//! recording per-tx footprints with a FRESH `Bal` per tx so that
-//! `storage_reads` (block-scoped in EIP-7928) attribute to the single tx
+//! This is the sequential capture runner. It executes blocks through
+//! the real engine, and records per-transaction footprints with a
+//! fresh `Bal` for each transaction, so `storage_reads`, which is
+//! block-scoped in EIP-7928, attributes to the single transaction
 //! inside it.
 
 use alloy_primitives::B256;
@@ -9,14 +10,14 @@ use kardamom_engine::{ExecEnv, PendingDelta, TxIndex};
 use kardamom_types::{BPosition, BlockBoundaryStart, StateDatabase, TxEnvelope};
 
 use super::Cell;
-// Re-exported so `capture::TxObs` keeps resolving for the stm-p0 bin; the
-// scheduling-time view decoder is shared with the live shadow.
+// This re-export keeps `capture::TxObs` resolving for the stm-p0 binary.
+// The scheduling-time view decoder is shared with the live shadow.
 pub use super::TxObs;
 use kardamom_footprint::envelope_view;
 
-/// Execute `blocks` (each a list of signed envelopes) sequentially against
-/// `snap`, returning per-tx observations. Panics on execution errors —
-/// capture inputs are deterministic fixtures.
+/// Execute `blocks`, each a list of signed envelopes, in order against
+/// `snap`. Returns per-transaction observations. Panics on an
+/// execution error, since capture inputs are deterministic fixtures.
 pub fn run_capture<S: StateDatabase>(
     snap: &S,
     blocks: &[Vec<TxEnvelope>],
@@ -48,8 +49,8 @@ pub fn run_capture<S: StateDatabase>(
                 envelope,
                 i as u64,
                 cumulative,
-                // Per-tx Bal at index 1: this tx's touches are the whole
-                // list — reads attribute exactly.
+                // This is a per-transaction Bal at index 1: this transaction's
+                // touches are the whole list, so reads attribute exactly.
                 Some((&mut bal, 1)),
             )
             .expect("capture execute");
@@ -83,8 +84,9 @@ pub fn run_capture<S: StateDatabase>(
                     writes.push(Cell::Account(acct.address));
                 }
             }
-            // WriteSet accounts catch anything the Bal's change-classifier
-            // collapsed (belt and braces; dedup below).
+            // WriteSet accounts catch anything the Bal's change classifier
+            // collapsed. This is a second check; the dedup below removes
+            // any duplicate.
             for (addr, _) in ws.accounts.iter() {
                 writes.push(Cell::Account(*addr));
             }

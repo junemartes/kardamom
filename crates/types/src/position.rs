@@ -1,11 +1,12 @@
-//! Position in Aeron tx_ordering's recording — the canonical L2 tx identifier.
+//! Position in Aeron's `tx_ordering` recording. This is the canonical L2
+//! transaction identifier.
 
 use rkyv::{Archive, Deserialize, Serialize};
 
-/// Aeron's `term_id` is `i32`; `term_offset` is the byte offset within the term
-/// and is always non-negative but typed `i32` to match Aeron's wire format.
-/// Ordering is `(term_id, term_offset)` lexicographic so watermark comparisons
-/// are a single cmp.
+/// Aeron's `term_id` is `i32`. `term_offset` is the byte offset within the
+/// term. It is always non-negative, but uses `i32` to match Aeron's wire
+/// format. Ordering is lexicographic on `(term_id, term_offset)`, so a
+/// watermark comparison is a single `cmp` call.
 #[derive(
     Clone,
     Copy,
@@ -32,19 +33,19 @@ impl BPosition {
         term_offset: 0,
     };
 
-    /// Encode a logical monotone index into the two position words.
+    /// Encode a logical, always-increasing index into the two position words.
     ///
-    /// This is **not** an Aeron byte position — it is the
-    /// publisher-independent block-boundary alignment key carried by
-    /// `BlockBoundaryStart.end_tx_idx`: the cumulative count of canonical
-    /// tx_ordering records (TxRef + DepositRef) the sealer has republished
-    /// through the end of a block. The executor compares it against its own
-    /// processed-record count. Encoding it in `BPosition` (rather than adding
-    /// a wire field) keeps the tx_ordering / tx_receipts message formats
-    /// unchanged; `from_index(0) == ZERO`, so existing zero-initialisers map to
-    /// "no records yet". Aeron byte positions are fragile across a
-    /// multi-publisher merge (per-publication term spaces) and across the
-    /// offer-return vs frame-start frames, which is exactly why alignment uses
+    /// This is not an Aeron byte position. It is the publisher-independent
+    /// block-boundary alignment key carried by `BlockBoundaryStart.end_tx_idx`.
+    /// The key is the total count of canonical tx_ordering records (TxRef and
+    /// DepositRef) the sealer has republished through the end of a block. The
+    /// executor compares it against its own processed-record count. Encoding
+    /// it in `BPosition`, instead of adding a wire field, keeps the
+    /// tx_ordering and tx_receipts message formats unchanged. `from_index(0)`
+    /// equals `ZERO`, so existing zero-initializers still mean "no records
+    /// yet". Aeron byte positions are fragile across a multi-publisher merge,
+    /// because each publisher has its own term space, and across
+    /// offer-return versus frame-start frames. This is why alignment uses
     /// this logical count instead.
     pub const fn from_index(idx: u64) -> Self {
         Self {
@@ -59,16 +60,17 @@ impl BPosition {
     }
 }
 
-/// Location of a `TxEnvelope` fragment on a tx_data stream: the Aeron publisher
-/// `session_id` plus the fragment-start [`BPosition`].
+/// Location of a `TxEnvelope` fragment on a tx_data stream: the Aeron
+/// publisher `session_id` plus the fragment-start [`BPosition`].
 ///
-/// The session id discriminates **concurrent ingress publishers** on one shard.
-/// Aeron positions are per-session, so two active/active ingresses publishing to
-/// the same tx_data stream can produce the same `(term_id, term_offset)`; pairing
-/// it with `session_id` makes the executor's join key
-/// `(shard_id, session_id, position)` unique. This is an in-process locator (log →
-/// sequencer / executor); only `session_id` crosses the wire, carried by
-/// [`crate::TxRef::tx_data_session_id`]. `BPosition` itself is unchanged.
+/// The session id tells apart concurrent ingress publishers on one shard.
+/// Aeron positions are per session, so two active ingresses that publish to
+/// the same tx_data stream can produce the same `(term_id, term_offset)`.
+/// Pairing the position with `session_id` makes the executor's join key
+/// `(shard_id, session_id, position)` unique. This is an in-process locator,
+/// from the log to the sequencer or executor. Only `session_id` crosses the
+/// wire, carried by [`crate::TxRef::tx_data_session_id`]. `BPosition` itself
+/// stays unchanged.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct TxDataLoc {
     pub session_id: i32,
@@ -101,7 +103,7 @@ mod tests {
         ] {
             assert_eq!(BPosition::from_index(idx).as_index(), idx, "idx={idx}");
         }
-        // The zero index is the canonical zero position (existing initialisers).
+        // The zero index is the canonical zero position, used by existing initializers.
         assert_eq!(BPosition::from_index(0), BPosition::ZERO);
     }
 }

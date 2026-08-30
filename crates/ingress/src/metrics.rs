@@ -1,32 +1,33 @@
 //! Ingress metrics.
 //!
-//! The binary owns the exporter; this module just declares names + the
-//! `describe` function that registers human-readable descriptions.
-//! Default no-op recorder is fine for tests; production binaries wire
-//! `metrics-exporter-prometheus` via `kardamom_obs::init`.
+//! The binary owns the exporter. This module only declares names and the
+//! `describe` function, which registers human-readable descriptions.
+//! The default no-op recorder works for tests. Production binaries wire
+//! `metrics-exporter-prometheus` through `kardamom_obs::init`.
 
 pub const TX_RECEIVED_TOTAL: &str = "kardamom_ingress_tx_received_total";
 pub const TX_ACCEPTED_TOTAL: &str = "kardamom_ingress_tx_accepted_total";
 pub const TX_REJECTED_TOTAL: &str = "kardamom_ingress_tx_rejected_total";
 pub const QUEUE_DEPTH: &str = "kardamom_ingress_queue_depth";
-/// Duplicate receipts dropped by the tx_receipts MDS fan-in dedup (the same
-/// receipt replayed by multiple executor replicas). 0 on the single-executor
-/// IPC path.
+/// Duplicate receipts dropped by the tx_receipts MDS fan-in dedup. This
+/// counts the same receipt replayed by multiple executor replicas. The
+/// value is 0 on the single-executor IPC path.
 pub const RECEIPT_DUPLICATE_TOTAL: &str = "kardamom_ingress_receipt_duplicate_total";
-/// Duplicate tx_errors dropped by the consumer-side dedup (P racing sequencer
-/// replicas each emit the same per-tx rejection, so every error arrives up to
-/// P times; a rejection already overridden by a success is also dropped).
-/// 0 on a single-replica (P=1) deployment.
+/// Duplicate tx_errors dropped by the consumer-side dedup. P racing
+/// sequencer replicas each emit the same per-tx rejection, so each error
+/// can arrive up to P times. A rejection already overridden by a success
+/// is also dropped. The value is 0 on a single-replica (P=1) deployment.
 pub const TX_ERROR_DUPLICATE_TOTAL: &str = "kardamom_ingress_tx_error_duplicate_total";
 /// Malformed cluster egress frames dropped by the on-quorum watermark
-/// observer. The cluster stream is authoritative, so this should stay 0; a
-/// sustained non-zero means a Java/Rust envelope framing mismatch shipped and
-/// records are being silently lost (see `crate::cluster`).
+/// observer. The cluster stream is authoritative, so this value should stay
+/// 0. A sustained non-zero value means a Java/Rust envelope framing
+/// mismatch shipped, and records are being lost silently. See
+/// `crate::cluster`.
 pub const CLUSTER_FRAME_DROPPED_TOTAL: &str = "kardamom_ingress_cluster_frames_dropped_total";
 
-/// Increment [`TX_REJECTED_TOTAL`] with the given `reason` label. Single
-/// home for the submit-path rejection counter so every rejection is counted
-/// the same way (and call sites stay one line).
+/// Increments [`TX_REJECTED_TOTAL`] with the given `reason` label. This is
+/// the one place for the submit-path rejection counter, so every rejection
+/// counts the same way and call sites stay one line.
 #[inline]
 pub(crate) fn count_reject(reason: &'static str) {
     metrics::counter!(TX_REJECTED_TOTAL, "reason" => reason).increment(1);
@@ -63,7 +64,8 @@ mod tests {
 
     #[test]
     fn describe_smoke() {
-        // Default recorder is no-op; just verify this compiles and doesn't panic.
+        // The default recorder is no-op. This test only checks that the
+        // code compiles and does not panic.
         describe();
     }
 

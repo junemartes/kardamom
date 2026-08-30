@@ -15,12 +15,13 @@ import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
 /**
- * Deterministic unit tests for {@link CanonicalSealerState}: dedup, counting,
- * boundaries, determinism and snapshot round-trips. These depend ONLY on
- * JUnit 5 — no Aeron jars — so the canonical logic stays verifiable even when
- * the cluster transport cannot be built. The contiguity guard is covered in
- * {@link ContiguityGuardTest}; L1-origin/epoch handling in
- * {@link OriginRecordTest}.
+ * Deterministic unit tests for {@link CanonicalSealerState}.
+ * The tests check dedup, counting, boundaries, determinism, and snapshot
+ * round trips.
+ * The tests use only JUnit 5, not Aeron. This keeps the canonical logic
+ * testable even when the cluster transport does not build.
+ * {@link ContiguityGuardTest} covers the contiguity guard.
+ * {@link OriginRecordTest} covers L1-origin and epoch handling.
  */
 class CanonicalSealerStateTest {
 
@@ -40,26 +41,26 @@ class CanonicalSealerStateTest {
 
     @Test
     void dedup_window_evicts_fifo() {
-        // Capacity 2, mirrors Rust DedupWindow::first_seen semantics.
+        // Capacity is 2. This matches the Rust DedupWindow::first_seen behavior.
         CanonicalSealerState state = new CanonicalSealerState(2);
 
         assertTrue(state.firstSeen(id(1)));
         assertFalse(state.firstSeen(id(1)), "second sighting is a duplicate");
         assertTrue(state.firstSeen(id(2)));
-        // Window is [1, 2]; inserting 3 evicts 1 (oldest first).
+        // The window holds [1, 2]. Adding 3 evicts 1, the oldest id.
         assertTrue(state.firstSeen(id(3)));
         assertFalse(state.firstSeen(id(2)), "2 still inside the window");
         assertFalse(state.firstSeen(id(3)), "3 still inside the window");
-        // id1 was evicted, so it is fresh again.
+        // Id 1 was evicted. It is fresh again.
         assertTrue(state.firstSeen(id(1)), "evicted id is fresh again");
         assertEquals(2, state.dedupSize(), "window stays at capacity");
     }
 
     @Test
     void count_matches_deduped_records() {
-        // N=7 records, D=3 of which are duplicates of earlier ids ⇒ 4 unique.
+        // 7 records include 3 duplicates of earlier ids, so 4 records are unique.
         CanonicalSealerState state = new CanonicalSealerState(1024);
-        int[] ids = {1, 2, 1, 3, 2, 4, 3}; // duplicates: positions 2(id1), 4(id2), 6(id3)
+        int[] ids = {1, 2, 1, 3, 2, 4, 3}; // duplicates at position 2 (id 1), 4 (id 2), 6 (id 3)
         int n = ids.length;
         int duplicates = 3;
         for (int i : ids) {
@@ -75,7 +76,7 @@ class CanonicalSealerStateTest {
         state.onRecord(id(2), payload("y"));
         state.onRecord(id(2), payload("y-dup")); // dropped, not counted
         state.onRecord(id(3), payload("z"));
-        // 3 unique records counted at tick time.
+        // The tick counts 3 unique records.
         Boundary boundary = state.onTick(1000);
         assertEquals(state.canonicalCount(), boundary.endTxIdx);
         assertEquals(3L, boundary.endTxIdx);
@@ -92,16 +93,16 @@ class CanonicalSealerStateTest {
             }
             previous = b.blockNumber;
         }
-        // 5 ticks starting at genesis block 1 ⇒ stamped 1..5, next would be 6.
+        // 5 ticks starting at genesis block 1 stamp blocks 1 to 5. The next block is 6.
         assertEquals(6L, state.blockNumber());
     }
 
     @Test
     void l2_timestamp_floored_to_interval() {
         CanonicalSealerState state = new CanonicalSealerState(64);
-        // 1123 / 250 = 4 ⇒ 1000.
+        // 1123 / 250 = 4, so the floored value is 1000.
         assertEquals(1000L, state.onTick(1123).l2Timestamp);
-        // 1250 is exactly on an interval boundary ⇒ 1250.
+        // 1250 is exactly on an interval boundary, so the floored value is 1250.
         assertEquals(1250L, state.onTick(1250).l2Timestamp);
     }
 
@@ -111,7 +112,7 @@ class CanonicalSealerStateTest {
         byte[] input = new byte[] {0, 1, 2, (byte) 0xFF, 0x7F, (byte) 0x80, 42, -7};
         Relayed relayed = state.onRecord(id(9), input).orElseThrow();
         assertArrayEquals(input, relayed.payload, "payload must be byte-identical");
-        // The state never wraps/parses the payload: the same reference is relayed.
+        // The state does not wrap or parse the payload. It relays the same reference.
         assertSame(input, relayed.payload);
     }
 
@@ -120,7 +121,7 @@ class CanonicalSealerStateTest {
         CanonicalSealerState a = new CanonicalSealerState(16, 1);
         CanonicalSealerState b = new CanonicalSealerState(16, 1);
 
-        // A fixed interleaving of records (with duplicates) and ticks.
+        // This is a fixed sequence of records, including duplicates, and ticks.
         List<Object> aEgress = drive(a);
         List<Object> bEgress = drive(b);
 
@@ -141,7 +142,7 @@ class CanonicalSealerStateTest {
         CanonicalSealerState restored = CanonicalSealerState.load(snapshot, 4);
         assertNotSame(original, restored);
 
-        // Identical continuation inputs ⇒ identical outputs from both.
+        // Identical continuation inputs produce identical outputs from both states.
         List<Object> origCont = continuation(original);
         List<Object> restCont = continuation(restored);
         assertEquals(origCont, restCont, "restored state must continue identically");
@@ -154,9 +155,9 @@ class CanonicalSealerStateTest {
         CanonicalSealerState original = new CanonicalSealerState(8, 1);
         original.onRecord(id(1), payload("a"));
         original.onRecord(id(2), payload("b"));
-        original.onTick(750); // stamps block 1, endTxIdx 2; block ⇒ 2
+        original.onTick(750); // stamps block 1 with endTxIdx 2; block number becomes 2
         original.onRecord(id(3), payload("c"));
-        original.onTick(1000); // stamps block 2, endTxIdx 3; block ⇒ 3
+        original.onTick(1000); // stamps block 2 with endTxIdx 3; block number becomes 3
 
         long expectedCount = original.canonicalCount();
         long expectedBlock = original.blockNumber();
@@ -167,24 +168,24 @@ class CanonicalSealerStateTest {
         assertEquals(expectedBlock, next.blockNumber, "block number resumes exactly");
         assertEquals(expectedCount, next.endTxIdx, "endTxIdx resumes from snapshotted count");
 
-        // Dedup window also survived: a snapshotted id is still a duplicate.
+        // The dedup window also survives. A snapshotted id is still a duplicate.
         assertFalse(restored.firstSeen(id(3)), "snapshotted id must still dedup");
     }
 
     @Test
     void load_rejects_id_count_above_capacity() {
-        // Snapshot taken with a window of 8 ids…
+        // The snapshot was taken with a window of 8 ids.
         CanonicalSealerState original = new CanonicalSealerState(8, 1);
         for (int i = 1; i <= 8; i++) {
             original.onRecord(id(i), payload("p" + i));
         }
         byte[] snapshot = original.takeSnapshot();
-        // …must NOT silently load into a smaller configured window: dedup
-        // behaviour would diverge from a fresh state with the same config.
+        // The state must not silently load into a smaller configured window.
+        // Otherwise, dedup behavior would diverge from a fresh state with the same config.
         IllegalArgumentException e = org.junit.jupiter.api.Assertions.assertThrows(
                 IllegalArgumentException.class, () -> CanonicalSealerState.load(snapshot, 4));
         assertTrue(e.getMessage().contains("idCount"), "message names the field: " + e.getMessage());
-        // The same snapshot loads fine at (or above) the original capacity.
+        // The same snapshot loads correctly at or above the original capacity.
         assertEquals(8, CanonicalSealerState.load(snapshot, 8).dedupSize());
         assertEquals(8, CanonicalSealerState.load(snapshot, 16).dedupSize());
     }
@@ -196,8 +197,8 @@ class CanonicalSealerStateTest {
             original.onRecord(id(i), payload("p" + i));
         }
         byte[] snapshot = original.takeSnapshot();
-        // Chop off half of the id section (the F12.1 truncated-fragment shape):
-        // must fail with a DESCRIPTIVE error, not a raw BufferUnderflowException.
+        // Remove half of the id section to truncate the snapshot.
+        // The load must fail with a clear error message, not a raw BufferUnderflowException.
         byte[] truncated = java.util.Arrays.copyOf(snapshot, snapshot.length - 2 * CanonicalSealerState.CANONICAL_ID_LEN - 7);
         IllegalArgumentException e = org.junit.jupiter.api.Assertions.assertThrows(
                 IllegalArgumentException.class, () -> CanonicalSealerState.load(truncated, 8));
@@ -206,7 +207,7 @@ class CanonicalSealerStateTest {
 
     // --- helpers ------------------------------------------------------------
 
-    /** A fixed, reproducible script of records and ticks; returns the egress. */
+    /** Run a fixed, repeatable script of records and ticks. Return the egress. */
     private static List<Object> drive(CanonicalSealerState state) {
         List<Object> egress = new ArrayList<>();
         record(state, egress, 1, "a");
@@ -220,10 +221,10 @@ class CanonicalSealerStateTest {
         return egress;
     }
 
-    /** A reproducible continuation script used to compare post-snapshot states. */
+    /** Run a repeatable continuation script to compare states after a snapshot. */
     private static List<Object> continuation(CanonicalSealerState state) {
         List<Object> egress = new ArrayList<>();
-        record(state, egress, 3, "c-maybe-dup"); // dup if window still holds id3
+        record(state, egress, 3, "c-maybe-dup"); // duplicate only if window still holds id 3
         record(state, egress, 5, "e");
         egress.add(state.onTick(900));
         record(state, egress, 6, "f");

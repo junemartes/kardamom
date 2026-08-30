@@ -1,7 +1,8 @@
-//! Egress-direction codec (cluster → Rust executor): the decoded
-//! [`EgressItem`] stream, plus encoders that mirror the Java service's framing
-//! byte-for-byte (used by tests and the in-Rust service mock). Frame layouts
-//! are documented on the `EGRESS_KIND_*` constants in the parent module.
+//! Egress-direction codec (cluster to Rust executor). It has the decoded
+//! [`EgressItem`] stream, plus encoders that mirror the Java service's
+//! framing byte-for-byte (used by tests and the in-Rust service mock).
+//! Frame layouts are documented on the `EGRESS_KIND_*` constants in the
+//! parent module.
 
 use alloy_primitives::{Address, B256};
 use kardamom_types::epoch::EpochRecord;
@@ -13,7 +14,7 @@ use super::{
     SENDER_LEN, WireError, encode_kind_2u64, rd_i32, rd_u32, rd_u64,
 };
 
-// ── decode (egress: cluster → Rust) ─────────────────────────────────────────
+// ── decode (egress: cluster to Rust) ────────────────────────────────────────
 
 /// A decoded egress item from the cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,9 +30,9 @@ pub enum EgressItem {
     },
     /// Replay complete up to (exclusive) the given live cursor.
     ReplayDone { up_to_index: u64, up_to_block: u64 },
-    /// Contiguity reject (#85 fix B): the service refused to seal `sender`'s
-    /// ref at `nonce` because it expected `expected` — republish from
-    /// `expected` (the unconfirmed ledger holds the missing refs).
+    /// Contiguity reject. The service refused to seal `sender`'s ref at
+    /// `nonce`, because it expected `expected`. Republish from `expected`:
+    /// the unconfirmed ledger holds the missing refs.
     ContiguityReject {
         sender: Address,
         nonce: u64,
@@ -97,9 +98,10 @@ pub fn decode_egress(buf: &[u8]) -> Result<EgressItem, WireError> {
     }
 }
 
-/// Decode a relayed payload `[canonical_id:32][record_type:u8][fields…]` into a
-/// `TxOrderingMessage` (the original `tx_data`/`deposit` position is recovered;
-/// the canonical L2 position is assigned by the caller from `index`).
+/// Decode a relayed payload `[canonical_id:32][record_type:u8][fields…]`
+/// into a `TxOrderingMessage`. This recovers the original `tx_data` or
+/// `deposit` position. The caller assigns the canonical L2 position from
+/// `index`.
 fn decode_relayed_payload(p: &[u8]) -> Result<TxOrderingMessage, WireError> {
     let cid = p.get(0..CANONICAL_ID_LEN).ok_or(WireError::TooShort {
         at: 0,
@@ -145,20 +147,22 @@ fn decode_relayed_payload(p: &[u8]) -> Result<TxOrderingMessage, WireError> {
             )))
         }
         RT_EPOCH => {
-            // The rkyv body sits at offset 33 of the relayed payload (after the
-            // canonical id and the record type), so it is NEVER 8-aligned in
-            // place — rkyv refuses to read it without a copy into an aligned
-            // buffer. Every other record type decodes field-by-field and so
-            // never hits this. Epochs are ~one per L1 block, so the copy is
-            // immaterial; the alternative (padding the frame to realign) would
-            // have to survive the Java relay byte-for-byte.
+            // The rkyv body sits at offset 33 of the relayed payload (after
+            // the canonical id and the record type). This offset is never
+            // 8-aligned in place, so rkyv refuses to read it without a copy
+            // into an aligned buffer. Every other record type decodes
+            // field-by-field, so it never hits this. Epochs happen about
+            // once per L1 block, so the copy cost is small. The
+            // alternative, padding the frame to realign it, would have to
+            // survive the Java relay byte-for-byte.
             let mut aligned = rkyv::util::AlignedVec::<8>::with_capacity(fields.len());
             aligned.extend_from_slice(fields);
             let epoch: EpochRecord = rkyv::from_bytes::<EpochRecord, rkyv::rancor::Error>(&aligned)
                 .map_err(|e| WireError::BadEpoch(e.to_string()))?;
-            // The canonical id is derived from the epoch itself, so a relayed
-            // record whose id does not match its payload has been tampered
-            // with or mis-encoded — reject rather than trust the header.
+            // The canonical id comes from the epoch itself. So if a relayed
+            // record's id does not match its payload, the record was
+            // tampered with or mis-encoded. Reject it instead of trusting
+            // the header.
             if epoch.canonical_id() != id {
                 return Err(WireError::BadEpoch(format!(
                     "canonical id {id} does not match epoch for L1 block {}",
@@ -171,7 +175,7 @@ fn decode_relayed_payload(p: &[u8]) -> Result<TxOrderingMessage, WireError> {
     }
 }
 
-// ── encode (egress: mirrors the Java framing — for tests / a Rust service mock) ─
+// ── encode (egress: mirrors Java framing, for tests and a Rust service mock) ─
 
 /// Frame a relayed record exactly as the Java service does. `payload` is the
 /// relayed payload (`[canonical_id:32][record_type][fields…]`).

@@ -10,9 +10,9 @@ async fn sequencer_metrics_endpoint_serves_expected_counters() {
         .await
         .expect("init");
 
-    // Touch every counter the sequencer crate is expected to publish so
-    // describe_counter calls don't require us to also drive the binary.
-    // Uses the crate's constants so a rename in src/metrics.rs fails here.
+    // Touch every counter that the sequencer crate publishes. This lets
+    // describe_counter run without the binary. The test uses the crate's
+    // constants, so a rename in src/metrics.rs breaks this test.
     metrics::counter!(kardamom_sequencer::metrics::TX_INGESTED, "partition" => "0").increment(0);
 
     let body = scrape(&format!("http://{addr}/metrics")).await;

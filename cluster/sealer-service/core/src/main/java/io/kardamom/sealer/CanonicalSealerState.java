@@ -11,37 +11,37 @@ import java.util.Optional;
 /**
  * Deterministic canonical-ordering state machine for the Kardamom sealer.
  *
- * <p>Pure POJO with NO Aeron dependency, NO wall clock and NO threads — every
- * output is a deterministic function of the input sequence. This is a faithful
- * Java port of the Rust sealer's canonical republish logic
- * ({@code crates/sealer/src/bin/kardamom-sealer.rs}), the boundary emitter
- * ({@code crates/sealer/src/emitter.rs}) and the executor-side
+ * <p>This is a pure POJO. It has no Aeron dependency, no wall clock, and no
+ * threads. Every output is a deterministic function of the input sequence.
+ * This class is a faithful Java port of the Rust sealer's canonical republish
+ * logic ({@code crates/sealer/src/bin/kardamom-sealer.rs}), the boundary
+ * emitter ({@code crates/sealer/src/emitter.rs}), and the executor-side
  * {@code DedupWindow} ({@code crates/executor/src/reader.rs}).</p>
  *
  * <p>Responsibilities:</p>
  * <ul>
  *   <li><b>Dedup</b> — a bounded, FIFO-evicted first-seen window over 32-byte
- *       canonical ids ({@link #firstSeen(byte[])}), mirroring Rust
+ *       canonical ids ({@link #firstSeen(byte[])}). This mirrors the Rust
  *       {@code DedupWindow}/{@code CanonicalDedup}.</li>
  *   <li><b>Canonical count</b> — {@link #onRecord(byte[], byte[], long, byte[])}
- *       relays each first-seen record with its 0-based index and bumps
- *       {@code canonicalCount}; duplicates are dropped and never counted.</li>
- *   <li><b>Contiguity guard</b> (#85 fix B) — a bounded per-sender
- *       expected-nonce map. A known sender's first-seen record whose nonce is
- *       not the expected next one is REJECTED (never counted, never deduped)
- *       so a voided-offer gap surfaces as a recoverable signal instead of a
- *       silently sealed canonical nonce gap. Unknown senders seed at any
- *       nonce; the all-zero sender (deposits) is exempt.</li>
- *   <li><b>Boundaries</b> — {@link #onTick(long)} stamps a {@link Boundary} with
- *       the current count and a 250 ms-floored timestamp, then advances the
- *       block number.</li>
- *   <li><b>Snapshot</b> — {@link #takeSnapshot()} / {@link #load(byte[], int)}
+ *       relays each first-seen record with its 0-based index and increases
+ *       {@code canonicalCount}. Duplicates are dropped and never counted.</li>
+ *   <li><b>Contiguity guard</b> — a bounded per-sender expected-nonce map. If
+ *       a known sender's first-seen record has a nonce other than the
+ *       expected next one, the guard rejects the record (it is never counted
+ *       or deduped). This turns a voided-offer gap into a recoverable signal,
+ *       instead of a silently sealed canonical nonce gap. Unknown senders
+ *       seed at any nonce. The all-zero sender (deposits) is exempt.</li>
+ *   <li><b>Boundaries</b> — {@link #onTick(long)} stamps a {@link Boundary}
+ *       with the current count and a timestamp floored to 250 ms, then
+ *       advances the block number.</li>
+ *   <li><b>Snapshot</b> — {@link #takeSnapshot()} and {@link #load(byte[], int)}
  *       round-trip the full state for cluster snapshots.</li>
  * </ul>
  */
 public final class CanonicalSealerState {
 
-    /** L2 tick alignment in milliseconds. Mirrors the Rust sealer's 250 ms tick. */
+    /** L2 tick alignment in milliseconds. This matches the Rust sealer's 250 ms tick. */
     public static final long TICK_INTERVAL_MS = 250L;
 
     /** Length, in bytes, of a canonical id (a 32-byte hash). */
@@ -55,34 +55,40 @@ public final class CanonicalSealerState {
 
     private static final int SNAPSHOT_MAGIC = 0x4B53_4541; // "KSEA"
     /**
-     * v2 appended the contiguity-guard sender map; v3 appends the L1-origin
-     * trio ({@code l1Origin}, {@code lastL2Timestamp}, {@code lastBoundaryCount})
-     * AFTER it, so v1 and v2 parsing is untouched and older snapshots still
-     * load — the trio defaults to zero, which is exactly the pre-origin state.
-     * A cluster upgrades in place without a coordinated snapshot migration.
+     * Version 2 added the contiguity-guard sender map. Version 3 adds the
+     * L1-origin trio ({@code l1Origin}, {@code lastL2Timestamp},
+     * {@code lastBoundaryCount}) after it. This keeps v1 and v2 parsing
+     * unchanged, so older snapshots still load. The trio defaults to zero,
+     * which is exactly the pre-origin state. A cluster can upgrade in place
+     * without a coordinated snapshot migration.
      */
     private static final int SNAPSHOT_VERSION = 3;
 
     /**
-     * FIFO first-seen window. Insertion-ordered, so the oldest inserted id is
-     * the first element — exactly the {@code VecDeque} front the Rust
-     * {@code DedupWindow} pops on eviction. Keys are 32-byte ids wrapped in a
-     * read-only {@link ByteBuffer} for value-based equality.
+     * FIFO first-seen window. It is insertion-ordered, so the oldest inserted
+     * id is the first element. This is exactly the {@code VecDeque} front
+     * that the Rust {@code DedupWindow} pops on eviction. Keys are 32-byte
+     * ids, wrapped in a read-only {@link ByteBuffer} for value-based
+     * equality.
      */
     private final LinkedHashSet<ByteBuffer> dedup;
     private final int dedupCapacity;
 
     /**
-     * Per-sender expected next nonce (#85 fix B), LRU-bounded at the dedup
-     * capacity (one shared knob all members already must agree on; ~5MB at
-     * the 1&lt;&lt;17 default). DETERMINISM: access-ordered, mutated only by
-     * the replicated record sequence, and snapshotted in iteration order, so
-     * every member holds the identical map AND identical eviction order. The
-     * eviction floor is honest degradation: an evicted sender that reappears
-     * is treated as unknown and re-seeds at whatever nonce arrives (its gap
-     * protection restarts there) — the same trust-on-first-sight as a brand
-     * new sender, never a false reject. Keys are 20-byte senders wrapped in
-     * read-only {@link ByteBuffer}s for value-based equality.
+     * Per-sender expected next nonce. This map is LRU-bounded at the dedup
+     * capacity (one shared setting all members must already agree on; about
+     * 5MB at the default of 1&lt;&lt;17). The map is access-ordered and
+     * mutated only by the replicated record sequence, and is snapshotted in
+     * iteration order. So every member holds an identical map with an
+     * identical eviction order.
+     *
+     * <p>An evicted sender that reappears is treated as unknown. It re-seeds
+     * at whatever nonce arrives, and its gap protection restarts there. This
+     * is the same trust-on-first-sight rule as for a brand new sender, so
+     * eviction never causes a false reject.</p>
+     *
+     * <p>Keys are 20-byte senders, wrapped in read-only {@link ByteBuffer}s
+     * for value-based equality.</p>
      */
     private final LinkedHashMap<ByteBuffer, Long> expectedNonce;
 
@@ -94,29 +100,31 @@ public final class CanonicalSealerState {
 
     /**
      * L1 block number stamped into every boundary until the next
-     * origin-advancing record. Echoed from ordered input — this state machine
-     * NEVER reads L1, which is what keeps it deterministic across replicas.
+     * origin-advancing record. This value is echoed from ordered input. The
+     * state machine never reads L1 itself, which keeps it deterministic
+     * across replicas.
      */
     private long l1Origin;
 
     /**
-     * Timestamp of the last boundary stamped. Boundaries are forced strictly
-     * increasing: a tick-aligned timestamp alone stopped being unique once
-     * {@link #onOriginRecord} can force a second boundary inside the same
-     * 250 ms window, and two blocks sharing a timestamp is a trap for anything
-     * reasoning about block time.
+     * Timestamp of the last boundary stamped. Boundaries are forced to
+     * strictly increase. A tick-aligned timestamp alone is not always
+     * unique, because {@link #onOriginRecord} can force a second boundary
+     * inside the same 250 ms window. Two blocks that share a timestamp would
+     * confuse any code that reasons about block time.
      */
     private long lastL2Timestamp;
 
     /**
-     * {@code canonicalCount} at the last boundary — i.e. how many records the
-     * currently open block already holds. Lets {@link #onOriginRecord} skip
-     * forcing a boundary when the open block is still empty, so a burst of
-     * epochs (L1 catch-up) does not emit a run of empty blocks.
+     * The {@code canonicalCount} value at the last boundary. This is how
+     * many records the currently open block already holds. It lets
+     * {@link #onOriginRecord} skip forcing a boundary when the open block is
+     * still empty, so a burst of epochs (L1 catch-up) does not create a run
+     * of empty blocks.
      */
     private long lastBoundaryCount;
 
-    /** Construct at genesis (block number {@value #GENESIS_BLOCK_NUMBER}). */
+    /** Create a state at genesis (block number {@value #GENESIS_BLOCK_NUMBER}). */
     public CanonicalSealerState(int dedupCapacity) {
         this(dedupCapacity, GENESIS_BLOCK_NUMBER);
     }
@@ -141,21 +149,23 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * Record {@code id32} in the dedup window; returns {@code false} if it is
-     * already present (a duplicate), {@code true} if it is freshly inserted.
+     * Record {@code id32} in the dedup window. Returns {@code false} if the
+     * id is already present (a duplicate), or {@code true} if it is freshly
+     * inserted.
      *
-     * <p>On a fresh insert, if the window now exceeds its capacity the OLDEST
-     * inserted id is evicted. Mirrors Rust {@code DedupWindow::first_seen}
-     * exactly: an evicted id becomes "fresh" again on a later sighting.</p>
+     * <p>On a fresh insert, if the window then exceeds its capacity, the
+     * oldest inserted id is evicted. This matches the Rust
+     * {@code DedupWindow::first_seen} exactly: an evicted id becomes "fresh"
+     * again if it is seen later.</p>
      *
      * @param id32 a 32-byte canonical id (defensively copied)
      */
     public boolean firstSeen(byte[] id32) {
         checkId(id32);
-        // Defensive copy so the caller's array can't mutate a stored key.
+        // Copy the array so the caller cannot change a stored key later.
         ByteBuffer key = ByteBuffer.wrap(id32.clone()).asReadOnlyBuffer();
         if (dedup.contains(key)) {
-            return false; // already present
+            return false; // the id is already present
         }
         insertFresh(key);
         return true;
@@ -169,21 +179,27 @@ public final class CanonicalSealerState {
         }
     }
 
-    /** Insert a NOT-present key into the dedup window, FIFO-evicting. */
+    /** Insert a new key into the dedup window. Evict the oldest entry if the window is full. */
     private void insertFresh(ByteBuffer key) {
         dedup.add(key);
         if (dedup.size() > dedupCapacity) {
             Iterator<ByteBuffer> it = dedup.iterator();
-            it.next(); // oldest inserted (FIFO front)
+            it.next(); // the oldest inserted id (front of the FIFO)
             it.remove();
         }
     }
 
     /**
-     * Outcome of {@link #onRecord(byte[], byte[], long, byte[])}: exactly one
-     * of dropped-duplicate ({@code relayed} empty, not rejected), relayed
-     * ({@code relayed} present), or contiguity-rejected ({@code rejected}
-     * true, {@code expectedNonce} carries the nonce the guard wanted).
+     * Outcome of {@link #onRecord(byte[], byte[], long, byte[])}. It is
+     * exactly one of:
+     * <ul>
+     *   <li>dropped duplicate — {@code relayed} is empty, {@code rejected}
+     *       is false;</li>
+     *   <li>relayed — {@code relayed} holds the record;</li>
+     *   <li>contiguity-rejected — {@code rejected} is true, and
+     *       {@code expectedNonce} carries the nonce that the guard
+     *       wanted.</li>
+     * </ul>
      */
     public static final class RecordOutcome {
         public final Optional<Relayed> relayed;
@@ -212,17 +228,21 @@ public final class CanonicalSealerState {
     /**
      * Process one application record.
      *
-     * <p>Order matters (#85 fix B interplay with the #114 republish ledger):
-     * the dedup check runs FIRST, so a re-offered copy of a record that
-     * already committed is absorbed as a duplicate BEFORE the contiguity
-     * guard sees its (by then stale) nonce. Then, for a non-zero sender, the
-     * guard: a known sender whose nonce is not the expected next one is
-     * REJECTED — no dedup insert (the sequencer republishes the same
-     * canonical id after recovering the gap, and it must then be accepted as
-     * fresh), no count, no relay. Unknown senders (first sight, or evicted
-     * from the bounded map) seed at whatever nonce arrives.</p>
+     * <p>Order matters: the dedup check runs first, so a re-offered copy of
+     * a record that already committed is absorbed as a duplicate before the
+     * contiguity guard sees its now-stale nonce. Then, for a non-zero
+     * sender, the guard runs:</p>
+     * <ul>
+     *   <li>a known sender whose nonce is not the expected next one is
+     *       rejected — the record is not deduped, counted, or relayed,
+     *       because the sequencer must resend the same canonical id after
+     *       it recovers from the gap, and that resend must then be accepted
+     *       as fresh;</li>
+     *   <li>an unknown sender — new, or evicted from the bounded map —
+     *       seeds at whatever nonce arrives.</li>
+     * </ul>
      *
-     * <p>{@code payload} is relayed VERBATIM and is never parsed.</p>
+     * <p>{@code payload} is relayed as-is and is never parsed.</p>
      */
     public RecordOutcome onRecord(byte[] canonicalId32, byte[] sender20, long nonce, byte[] payload) {
         checkId(canonicalId32);
@@ -250,10 +270,11 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * Guard-exempt record processing (no sender identity — the pre-guard
-     * contract, kept for deposits-only callers and the existing tests).
-     * Equivalent to {@link #onRecord(byte[], byte[], long, byte[])} with the
-     * all-zero sender.
+     * Process a record without the contiguity guard (no sender identity).
+     * This is the pre-guard contract, kept for deposit-only callers and
+     * existing tests. It is equivalent to
+     * {@link #onRecord(byte[], byte[], long, byte[])} with the all-zero
+     * sender.
      */
     public Optional<Relayed> onRecord(byte[] canonicalId32, byte[] payload) {
         return onRecord(canonicalId32, new byte[SENDER_LEN], 0L, payload).relayed;
@@ -269,18 +290,24 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * Stamp a block boundary at this tick. The boundary's {@code endTxIdx} is the
-     * current {@code canonicalCount} (every record counted so far belongs to a
-     * block ≤ this boundary); {@code l2Timestamp} is {@code leaderClockMillis}
-     * floored to {@link #TICK_INTERVAL_MS}. The block number is advanced AFTER
-     * stamping, so successive ticks produce monotonically increasing,
-     * gap-free block numbers.
+     * Stamp a block boundary at this tick.
+     * <ul>
+     *   <li>{@code endTxIdx} is the current {@code canonicalCount} — every
+     *       record counted so far belongs to a block at or before this
+     *       boundary.</li>
+     *   <li>{@code l2Timestamp} is {@code leaderClockMillis} floored to
+     *       {@link #TICK_INTERVAL_MS}.</li>
+     * </ul>
+     * <p>The block number advances after the stamp, so successive ticks
+     * produce block numbers that increase by one each time, with no
+     * gaps.</p>
      */
     public Boundary onTick(long leaderClockMillis) {
         long floored = (leaderClockMillis / TICK_INTERVAL_MS) * TICK_INTERVAL_MS;
-        // Under pure tick cadence `floored` always clears the previous stamp by
-        // a full interval and this max() is a no-op; it only bites after
-        // onOriginRecord forced an extra boundary inside the same window.
+        // Under a normal tick cadence, `floored` always exceeds the previous
+        // stamp by a full interval, so this max() call has no effect. It
+        // matters only after onOriginRecord forces an extra boundary in the
+        // same window.
         long l2Timestamp = Math.max(floored, lastL2Timestamp + 1);
         Boundary boundary = new Boundary(blockNumber, canonicalCount, l2Timestamp, l1Origin);
         blockNumber++;
@@ -290,41 +317,42 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * Process one ORIGIN-ADVANCING record: a record whose carrying frame also
+     * Process one origin-advancing record: a record whose frame also
      * declares a new L1 origin (see {@code KIND_ORIGIN_RECORD} in
-     * {@code crates/cluster-adapter/src/wire.rs}). Semantics, in order:
+     * {@code crates/cluster-adapter/src/wire.rs}). The steps, in order:
      *
      * <ol>
-     *   <li>drop it if the canonical id is a duplicate — every sequencer
-     *       forwards every epoch, so most offers are re-offers of a record
-     *       already ordered, carrying the origin it already adopted;</li>
-     *   <li>close the currently open block (if it holds any records) so the
-     *       record LEADS a block rather than landing mid-block. The forced
-     *       boundary still carries the OLD origin: it closes a block that
-     *       belongs to the old epoch;</li>
-     *   <li>adopt {@code newL1Origin}, so every subsequent boundary carries
+     *   <li>drop the record if its canonical id is a duplicate. Every
+     *       sequencer forwards every epoch, so most offers are re-offers of
+     *       a record that is already ordered, carrying the origin it
+     *       already adopted;</li>
+     *   <li>close the currently open block, if it holds any records, so the
+     *       record leads a block instead of landing mid-block. The forced
+     *       boundary still carries the old origin, because it closes a
+     *       block that belongs to the old epoch;</li>
+     *   <li>adopt {@code newL1Origin}, so every later boundary carries
      *       it;</li>
-     *   <li>relay the payload verbatim, exactly like {@link #onRecord}.</li>
+     *   <li>relay the payload as-is, exactly like {@link #onRecord}.</li>
      * </ol>
      *
-     * <p>{@code slotCount} is how many canonical slots this record claims (see
-     * {@code epoch_slots} in {@code crates/cluster-adapter/src/wire.rs}): an
-     * epoch is the one record that expands to a contiguous RANGE — the marker
-     * plus one slot per deposit — because every slot must map to at most one
-     * transaction downstream. The sealer takes the count on trust since it
-     * never parses the payload; consumers that do parse it re-derive and
-     * fail-stop on a mismatch.</p>
+     * <p>{@code slotCount} is how many canonical slots this record claims
+     * (see {@code epoch_slots} in {@code crates/cluster-adapter/src/wire.rs}).
+     * An epoch record expands to a contiguous range of slots — the marker
+     * plus one slot per deposit — because each slot must map to at most one
+     * transaction downstream. The sealer trusts this count and never parses
+     * the payload. Consumers that do parse it re-derive the count and fail
+     * stop on a mismatch.</p>
      *
-     * <p>The origin is echoed, never validated against L1 — this state machine
-     * has no L1 access by design. Monotonicity is enforced because that check
-     * is purely local to replicated state.</p>
+     * <p>The origin is echoed, never validated against L1, because this
+     * state machine has no L1 access by design. Monotonicity is enforced
+     * locally, since that check needs only the replicated state.</p>
      *
-     * @param newL1Origin the L1 block number this record's epoch belongs to
-     * @param slotCount canonical slots claimed; must be >= 1
+     * @param newL1Origin the L1 block number for this record's epoch
+     * @param slotCount canonical slots claimed; must be at least 1
      * @return empty if the record was a duplicate; otherwise the forced
      *         boundary (if any) and the relayed record
-     * @throws IllegalArgumentException if {@code newL1Origin} does not advance
-     *         or {@code slotCount} is below 1
+     * @throws IllegalArgumentException if {@code newL1Origin} does not
+     *         advance, or {@code slotCount} is below 1
      */
     public Optional<OriginAdvance> onOriginRecord(
             byte[] canonicalId32,
@@ -333,19 +361,20 @@ public final class CanonicalSealerState {
             byte[] payload,
             long leaderClockMillis) {
         if (slotCount < 1) {
-            // A zero-width record would make the next record reuse this index,
-            // and the consumer's dense cursor keys records BY index.
+            // A zero-width record would make the next record reuse this
+            // index. The consumer's dense cursor keys records by index.
             throw new IllegalArgumentException("slotCount must be >= 1, got " + slotCount);
         }
-        // Dedup FIRST. Checking monotonicity before dedup would reject the M
-        // racing sequencers' normal re-offers as regressions.
+        // Check dedup first. Checking monotonicity before dedup would reject
+        // normal re-offers from racing sequencers as regressions.
         if (!firstSeen(canonicalId32)) {
             return Optional.empty();
         }
         if (newL1Origin <= l1Origin) {
-            // Not a duplicate, yet claiming an origin at or below the current
-            // one: two producers disagree about L1. Rejecting keeps l1Origin
-            // monotonic, which the derivation rules depend on.
+            // This is not a duplicate, but it claims an origin at or below
+            // the current one, so two producers disagree about L1. Reject
+            // it to keep l1Origin increasing, which the derivation rules
+            // depend on.
             throw new IllegalArgumentException(
                     "l1Origin must advance: have " + l1Origin + ", got " + newL1Origin);
         }
@@ -355,8 +384,9 @@ public final class CanonicalSealerState {
         }
         l1Origin = newL1Origin;
         long index = canonicalCount;
-        // The record is relayed at the FIRST slot of its range; the rest of the
-        // range is consumed here so the next record starts past the deposits.
+        // The record is relayed at the first slot of its range. The rest of
+        // the range is consumed here, so the next record starts past the
+        // deposits.
         canonicalCount += slotCount;
         return Optional.of(new OriginAdvance(forced, new Relayed(index, payload)));
     }
@@ -392,11 +422,11 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * The guard's expected next nonce for {@code sender20}, or empty if
-     * untracked. Iteration-based on purpose: a {@code get} on the
-     * access-ordered map would reorder the LRU — this accessor is for tests
-     * and member-local observability, which must NOT perturb the replicated
-     * eviction order.
+     * The guard's expected next nonce for {@code sender20}, or empty if the
+     * sender is not tracked. This method iterates on purpose: a {@code get}
+     * call on the access-ordered map would reorder the LRU. This accessor
+     * is for tests and local observability, and must not change the
+     * replicated eviction order.
      */
     public Optional<Long> expectedNonceOf(byte[] sender20) {
         ByteBuffer key = ByteBuffer.wrap(sender20).asReadOnlyBuffer();
@@ -409,20 +439,22 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * Serialise the full state: dedup ids (32 bytes each, in FIFO/insertion
-     * order), {@code canonicalCount}, {@code blockNumber} and (v2) the
-     * contiguity-guard sender map in LRU iteration order (eldest first, so a
-     * restore rebuilds the identical eviction order). The capacity is NOT
-     * encoded — it is supplied at {@link #load(byte[], int)} time (matching
-     * the cluster's configured window).
+     * Serialize the full state: dedup ids (32 bytes each, in FIFO/insertion
+     * order), {@code canonicalCount}, {@code blockNumber}, and (from
+     * version 2) the contiguity-guard sender map in LRU iteration order
+     * (eldest first, so a restore rebuilds the identical eviction order).
+     * The capacity is not encoded. It is supplied at
+     * {@link #load(byte[], int)} time, matching the cluster's configured
+     * window.
      *
      * <p>Layout (big-endian): magic(4) | version(4) | canonicalCount(8) |
      * blockNumber(8) | idCount(4) | idCount * 32 | senderCount(4) |
      * senderCount * (sender 20 + expectedNonce 8) | l1Origin(8) |
      * lastL2Timestamp(8) | lastBoundaryCount(8).</p>
      *
-     * <p>The v3 origin trio is APPENDED after the v2 sender map so v1/v2
-     * parsing is byte-identical and older snapshots keep loading.</p>
+     * <p>The version-3 origin trio is added after the version-2 sender map,
+     * so version-1 and version-2 parsing stays byte-identical and older
+     * snapshots keep loading.</p>
      */
     public byte[] takeSnapshot() {
         int idCount = dedup.size();
@@ -452,7 +484,7 @@ public final class CanonicalSealerState {
             buf.put(raw);
             buf.putLong(e.getValue());
         }
-        // v3 tail.
+        // Version-3 fields.
         buf.putLong(l1Origin);
         buf.putLong(lastL2Timestamp);
         buf.putLong(lastBoundaryCount);
@@ -460,10 +492,10 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * Restore a state previously produced by {@link #takeSnapshot()}. Subsequent
-     * behaviour is identical to the snapshotted instance: the dedup window is
-     * rebuilt in the same FIFO order and {@code canonicalCount}/{@code blockNumber}
-     * resume exactly.
+     * Restore a state that {@link #takeSnapshot()} produced earlier. Later
+     * behavior matches the snapshotted instance exactly: the dedup window
+     * rebuilds in the same FIFO order, and {@code canonicalCount} and
+     * {@code blockNumber} resume from the same values.
      */
     public static CanonicalSealerState load(byte[] snapshot, int dedupCapacity) {
         ByteBuffer buf = ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN);
@@ -480,13 +512,13 @@ public final class CanonicalSealerState {
         long blockNumber = buf.getLong();
         int idCount = buf.getInt();
         if (idCount < 0 || idCount > dedupCapacity) {
-            // A snapshot taken with a LARGER configured window than this
-            // member's would silently rebuild an oversized window that
-            // firstSeen shrinks by only one entry per insert — dedup behaviour
-            // would differ from a fresh state with the same config, a
-            // determinism hazard if members ever disagree on the capacity.
-            // Fail loudly instead; shrinking the window across a restart
-            // requires an explicit migration, not a silent truncation.
+            // A snapshot taken with a larger configured window than this
+            // member's would silently rebuild an oversized window. firstSeen
+            // only shrinks it by one entry per insert, so dedup behavior
+            // would differ from a fresh state with the same config — a
+            // determinism hazard if members disagree on the capacity. Fail
+            // loudly instead of truncating silently. Shrinking the window
+            // across a restart needs an explicit migration.
             throw new IllegalArgumentException(
                     "snapshot idCount " + idCount + " outside [0, dedupCapacity="
                             + dedupCapacity + "] — members must agree on the configured window");
@@ -502,8 +534,8 @@ public final class CanonicalSealerState {
         for (int i = 0; i < idCount; i++) {
             byte[] raw = new byte[CANONICAL_ID_LEN];
             buf.get(raw);
-            // Insert directly in FIFO order without eviction or counting; the
-            // snapshot already reflects a window within capacity.
+            // Insert directly in FIFO order, without eviction or counting.
+            // The snapshot already reflects a window within capacity.
             state.dedup.add(ByteBuffer.wrap(raw).asReadOnlyBuffer());
         }
         if (version >= 2) {
@@ -523,8 +555,9 @@ public final class CanonicalSealerState {
                 byte[] raw = new byte[SENDER_LEN];
                 buf.get(raw);
                 long expected = buf.getLong();
-                // put() into the fresh access-ordered map in snapshot order
-                // (eldest first) rebuilds the identical LRU order.
+                // Put entries into the fresh access-ordered map in snapshot
+                // order (eldest first). This rebuilds the identical LRU
+                // order.
                 state.expectedNonce.put(ByteBuffer.wrap(raw).asReadOnlyBuffer(), expected);
             }
         }
@@ -533,10 +566,11 @@ public final class CanonicalSealerState {
             state.lastL2Timestamp = buf.getLong();
             state.lastBoundaryCount = buf.getLong();
         }
-        // A v1 snapshot (pre-guard deploy) restores an EMPTY guard map: every
-        // sender re-seeds on its next record — trust-on-first-sight, honest
-        // degradation, no false rejects. A v1/v2 snapshot (pre-origin)
-        // restores origin 0, which is exactly the state that chain was in.
+        // A version-1 snapshot (before the guard existed) restores an empty
+        // guard map, so every sender re-seeds on its next record. This is
+        // trust-on-first-sight, and it causes no false rejects. A version-1
+        // or version-2 snapshot (before origin tracking) restores origin 0,
+        // which is exactly the state that chain was in.
         state.canonicalCount = canonicalCount;
         return state;
     }

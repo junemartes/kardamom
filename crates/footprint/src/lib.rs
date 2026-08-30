@@ -1,16 +1,15 @@
-//! Footprint prediction core for the Block-STM campaign
-//! (spec: `docs/agents/block-stm-executor-spec.md`).
+//! Footprint prediction core for the Block-STM campaign.
 //!
-//! Pure data + algorithms, shared by two consumers with opposite lifecycles:
-//! the OFFLINE P0 lab (`kardamom-bench`'s `stm` module: capture runner,
-//! oracle report) and the ONLINE P1 shadow scheduler in the live executor
-//! (`kardamom-engine::shadow`). Extracting the classifier here is what keeps
-//! the two from drifting — the P0 GO verdict was measured on exactly this
-//! inversion/prediction code, and P1's job is to validate those numbers in
-//! the live pipeline, not on a reimplementation.
+//! This is pure data and algorithms. Two consumers share it, with opposite
+//! lifecycles: the offline lab (`kardamom-bench`'s `stm` module: capture
+//! runner, oracle report) and the online shadow scheduler in the live
+//! executor (`kardamom-engine::shadow`). The classifier lives here so the
+//! two do not drift apart. The offline GO verdict was measured on this
+//! exact inversion and prediction code. The shadow scheduler's job is to
+//! check those numbers in the live pipeline, not to reimplement them.
 //!
-//! Nothing in this crate touches an engine, a database, or a metric
-//! registry: observations in, predictions/grades out.
+//! This crate does not touch an engine, a database, or a metric registry.
+//! It takes observations in and returns predictions and grades.
 
 pub mod classifier;
 pub mod grade;
@@ -18,17 +17,17 @@ pub mod oracle;
 
 use alloy_primitives::{Address, B256, U256};
 
-/// A state cell for conflict analysis. `Account` covers balance+nonce
-/// (their updates are read-modify-write, so same-address account writes
-/// always conflict); `Slot` is one storage slot.
+/// A state cell for conflict analysis. `Account` covers balance and nonce
+/// (their updates are read-modify-write, so writes to the same address
+/// always conflict). `Slot` is one storage slot.
 ///
-/// Known approximation: pure BALANCE-opcode reads of third-party accounts
-/// are not visible in the offline capture (EIP-7928 attributes storage
-/// reads, not account reads) — such cross-tx edges are missed there. They
-/// are second-order on our workloads (ERC20 flows read storage, not native
-/// balances). The live shadow path DOES see them (`TouchSet.account_reads`)
-/// but keeps them out of the conflict cells for parity with the P0 yardstick,
-/// counting them separately (the P2 Accumulator-guard signal).
+/// Known approximation: the offline capture does not see plain BALANCE-opcode
+/// reads of third-party accounts (EIP-7928 attributes storage reads, not
+/// account reads), so it misses those cross-tx edges. This is a minor gap
+/// for our workloads, since ERC20 flows read storage, not native balances.
+/// The live shadow path does see them (`TouchSet.account_reads`), but keeps
+/// them out of the conflict cells to match the offline yardstick. It counts
+/// them separately instead (the Accumulator-guard signal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Cell {
     Account(Address),
@@ -36,10 +35,10 @@ pub enum Cell {
 }
 
 /// One observed transaction: scheduling-time knowledge (sender, to,
-/// selector, args) + ground truth (reads, writes, gas).
+/// selector, args) and ground truth (reads, writes, gas).
 #[derive(Debug, Clone)]
 pub struct TxObs {
-    /// Global canonical index across the whole capture / stream.
+    /// Global canonical index across the whole capture or stream.
     pub index: u64,
     pub block: u64,
     pub sender: Address,
@@ -49,17 +48,17 @@ pub struct TxObs {
     /// candidates.
     pub args: Vec<U256>,
     pub gas: u64,
-    /// Native value attached (tier-1 recipient-account key when > 0).
+    /// Native value attached (tier-1 recipient-account key when above zero).
     pub has_value: bool,
     pub reads: Vec<Cell>,
     pub writes: Vec<Cell>,
 }
 
-/// Decode the scheduling-time fields off a raw 2718 envelope:
-/// `(to, selector, ABI-head words, has_value)`. Shared by the offline
-/// capture runner and the live shadow so both build identical
-/// derivation-candidate views. Undecodable bytes yield the empty view
-/// (selector-less ⇒ tier-1-only prediction).
+/// Decode the scheduling-time fields from a raw 2718 envelope:
+/// `(to, selector, ABI-head words, has_value)`. The offline capture runner
+/// and the live shadow share this function, so both build the same
+/// derivation-candidate views. Undecodable bytes give the empty view
+/// (no selector means tier-1-only prediction).
 pub fn envelope_view(raw: &[u8]) -> (Option<Address>, Option<[u8; 4]>, Vec<U256>, bool) {
     use alloy_eips::eip2718::Decodable2718;
     let Ok(env) = alloy_consensus::TxEnvelope::decode_2718(&mut &raw[..]) else {
@@ -68,9 +67,9 @@ pub fn envelope_view(raw: &[u8]) -> (Option<Address>, Option<[u8; 4]>, Vec<U256>
     decoded_view(&env)
 }
 
-/// [`envelope_view`] over an already-decoded envelope — callers that hold
-/// the decoded tx (the STM engine decodes once for schedule AND execution)
-/// skip the second RLP pass.
+/// [`envelope_view`] over an already-decoded envelope. Callers that hold
+/// the decoded tx (the STM engine decodes once, for both schedule and
+/// execution) skip the second RLP pass.
 pub fn decoded_view(
     env: &alloy_consensus::TxEnvelope,
 ) -> (Option<Address>, Option<[u8; 4]>, Vec<U256>, bool) {

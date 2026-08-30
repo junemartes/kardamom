@@ -1,11 +1,11 @@
 //! Phase 2 recovery: skip-count replay.
 //!
-//! On restart the exec thread is fed the canonical stream re-played from
-//! record 0 and must skip everything already committed (see [`ResumePoint`]).
-//! These tests drive the skip path deterministically with synthetic records
-//! — no Aeron, no archive — and assert the executor neither re-commits a
-//! replayed block nor re-emits a replayed receipt, while still executing
-//! everything past the persisted cursor.
+//! On restart, the exec thread receives the canonical stream replayed
+//! from record 0. It must skip everything already committed (see
+//! [`ResumePoint`]). These tests drive the skip path with synthetic
+//! records, with no Aeron and no archive. They confirm the executor does
+//! not re-commit a replayed block or re-emit a replayed receipt, and
+//! still executes everything past the persisted cursor.
 
 use std::sync::{Arc, Mutex};
 
@@ -25,15 +25,17 @@ use super::{ExecToCommit, ExecutorConfig, ResumePoint, spawn_exec};
 
 #[test]
 fn resume_executes_from_cursor_with_absolute_counts() {
-    // Pre-restart the executor committed block 1 (2 txs, record_count=2).
-    // The canonical source (cluster REPLAY_FROM) delivers from the cursor:
-    // only block 2's new tx + boundary arrive, with ABSOLUTE indices/counts
-    // (tx_idx 2, boundary end count 3). The exec thread must seed its
-    // counters from the ResumePoint — starting them at zero made exactly
-    // this stream die BoundaryMisaligned on every mid-chain restart.
+    // Before restart, the executor committed block 1 (2 transactions,
+    // record_count=2). The canonical source (cluster REPLAY_FROM) delivers
+    // from the cursor: only block 2's new transaction and boundary arrive,
+    // with absolute indices and counts (tx_idx 2, boundary end count 3).
+    // The exec thread must seed its counters from the ResumePoint.
+    // Starting them at zero made this exact stream fail with
+    // BoundaryMisaligned on every mid-chain restart.
     let signer = PrivateKeySigner::random();
     let to = address!("00000000000000000000000000000000000ABCDE");
-    // Snapshot represents post-block-1 state: signer nonce already at 2.
+    // The snapshot represents the post-block-1 state: the signer nonce is
+    // already at 2.
     let snap = MockStateDatabase::builder()
         .account(
             signer.address(),
@@ -47,7 +49,8 @@ fn resume_executes_from_cursor_with_absolute_counts() {
     let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(16);
     let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(16);
 
-    // Post-cursor work only: block 2's tx + boundary, absolute keys.
+    // Only post-cursor work: block 2's transaction and boundary, with
+    // absolute keys.
     tx_r2e
         .send(ReaderToExec::Tx {
             tx_idx: TxIndex(2),
@@ -85,8 +88,9 @@ fn resume_executes_from_cursor_with_absolute_counts() {
     h.join().expect("no panic").expect("exec ok");
 
     let (receipt_blocks, boundaries) = drain_commits(rx_e2c);
-    // Block 2's single tx produced a receipt, attributed to block 2 (the
-    // seeded current_block) — not block 1 (a zero-seeded counter's value).
+    // Block 2's single transaction produces a receipt attributed to block
+    // 2, the seeded current_block. It is not attributed to block 1, which
+    // would be a zero-seeded counter's value.
     assert_eq!(
         receipt_blocks,
         vec![2],
@@ -100,10 +104,11 @@ fn resume_executes_from_cursor_with_absolute_counts() {
 
 #[test]
 fn resume_after_empty_block_backlog() {
-    // The sealer kept emitting empty blocks (1,2,3) while the executor was
-    // down; record_count stayed 0. resume={block:3, count:0}: delivery
-    // resumes at block 4, whose first real tx (absolute index 0) executes
-    // and commits — attributed to block 4, not a restarted-from-1 counter.
+    // The sealer kept emitting empty blocks (1, 2, 3) while the executor
+    // was down, so record_count stayed 0. With resume={block:3, count:0},
+    // delivery resumes at block 4. Its first real transaction (absolute
+    // index 0) executes and commits, attributed to block 4, not to a
+    // counter restarted from 1.
     let signer = PrivateKeySigner::random();
     let to = address!("00000000000000000000000000000000000ABCDE");
     let snap = MockStateDatabase::builder()
@@ -119,7 +124,7 @@ fn resume_after_empty_block_backlog() {
     let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(16);
     let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(16);
 
-    // Block 4: first real tx (count 0 -> 1).
+    // Block 4: the first real transaction (count 0 to 1).
     tx_r2e
         .send(ReaderToExec::Tx {
             tx_idx: TxIndex(0),
@@ -170,10 +175,10 @@ fn resume_after_empty_block_backlog() {
 
 #[test]
 fn resume_boundary_alignment_still_checked() {
-    // Resume must not bypass the boundary-alignment invariant: a boundary
-    // whose ABSOLUTE record count disagrees with the seeded-and-advanced
-    // counter is still fatal (here: cursor 5, one tx seen ⇒ have 6, but
-    // the boundary claims 10).
+    // Resume must not bypass the boundary-alignment invariant. A boundary
+    // whose absolute record count disagrees with the seeded-and-advanced
+    // counter is still fatal. Here the cursor is 5, one transaction is
+    // seen, so the count is 6, but the boundary claims 10.
     let signer = PrivateKeySigner::random();
     let to = address!("00000000000000000000000000000000000ABCDE");
     let snap = MockStateDatabase::builder()

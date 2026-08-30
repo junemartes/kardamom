@@ -1,29 +1,21 @@
-//! TxReceipts executor-side demux wrapper + `TxIndex` newtype.
+//! `TxReceipts` executor-side demultiplex wrapper, and the `TxIndex` newtype.
 //!
 //! Shared wire types (`BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundary`,
 //! `BlockBoundaryStart`, `BlockDelta`, `AccountChange`, `TxOrderingMessage`,
-//! `TxRef`) are imported from `kardamom-types`; we never
-//! redefine them here.
+//! `TxRef`) come from `kardamom-types`. This module never redefines them.
 //!
-//! Pre-S4-arch-update this module also held a `BMessage` enum that was the
-//! executor's internal inbound demux (`Tx | BoundaryStart` with full
-//! envelopes). Post- the inbound type is `kardamom_types::
-//! TxOrderingMessage` (tiny refs + boundaries) plus the per-A `TxEnvelope`
-//! streams; the executor reads them through the `reader.rs` module rather
-//! than a single demux enum.
-//!
-//! The executor's `ReceiptStatus` enum is a local presentation of revm's
-//! execution outcome — `kardamom_types::Receipt.status` is a single `bool`
-//! (success/failure); the executor converts before publishing.
+//! The executor's `ReceiptStatus` enum is a local view of revm's execution
+//! outcome. `kardamom_types::Receipt.status` is a single `bool` (success or
+//! failure). The executor converts the outcome before it publishes.
 
 use kardamom_types::{BlockBoundary, Receipt};
 use revm::context::result::HaltReason;
 
-/// Monotonically increasing global index of a tx within the canonical
-/// tx_ordering stream. Derived by the executor's tx_ordering reader from the
-/// input order, starting at 0 for the first tx after genesis. The
-/// downstream `Receipt.tx_idx` is the `BPosition` (the canonical wire id);
-/// this `TxIndex` is an executor-local sanity counter only.
+/// A global index of a tx in the canonical tx_ordering stream. The value
+/// increases with each tx. The executor's tx_ordering reader derives it
+/// from the input order, starting at 0 for the first tx after genesis. The
+/// downstream `Receipt.tx_idx` uses `BPosition`, the canonical wire id. This
+/// `TxIndex` is only a local sanity counter for the executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TxIndex(pub u64);
 
@@ -34,16 +26,16 @@ impl TxIndex {
     }
 }
 
-/// One published record on tx_receipts — receipts and sealed boundaries.
+/// One published record on tx_receipts: a receipt or a sealed boundary.
 #[derive(Debug, Clone)]
 pub enum CMessage {
     Receipt(Receipt),
     BlockBoundary(BlockBoundary),
 }
 
-/// Executor-local presentation of revm's execution outcome. Folded into a
-/// `bool` when materializing `kardamom_types::Receipt.status` (success vs.
-/// failure); the richer Halt reason stays internal for diagnostics/logs only.
+/// A local view of revm's execution outcome. The executor folds this into
+/// a `bool` for `kardamom_types::Receipt.status` (success or failure). The
+/// richer halt reason stays internal, for diagnostics and logs only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptStatus {
     Success,
@@ -69,7 +61,7 @@ mod tests {
 
     #[test]
     fn bposition_orders_by_term_then_offset() {
-        // BPosition comes from kardamom-types; sanity-check the import works.
+        // BPosition comes from kardamom-types. This checks that the import works.
         let a = BPosition {
             term_id: 0,
             term_offset: 100,

@@ -1,10 +1,10 @@
 //! Watcher loop: cursor-tailed L1 polling that builds one [`EpochRecord`] per
 //! finalized L1 block and publishes it on the `tx_deposits` Aeron channel.
 //!
-//! The unit is the EPOCH, not the deposit. Every finalized L1 block yields
-//! exactly one record — including blocks with no deposits — because the
-//! no-skipping rule is only enforceable if every epoch appears on the stream.
-//! See `docs/agents/l1-origin-deposit-derivation-spec.md`.
+//! The unit is the epoch, not the deposit. Every finalized L1 block yields
+//! exactly one record, including a block with no deposits. The no-skipping
+//! rule only holds if every epoch appears on the stream. See
+//! `docs/agents/l1-origin-deposit-derivation-spec.md`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,52 +33,52 @@ pub struct DaWatcherConfig {
     pub poll_interval: Duration,
 }
 
-/// Handle to a running watcher task. Drop `shutdown` (or send `()`) to ask
-/// the loop to exit; `task` is the underlying tokio `JoinHandle`.
+/// Handle to a running watcher task. Drop `shutdown`, or send `()` on it, to
+/// ask the loop to exit. `task` is the underlying tokio `JoinHandle`.
 pub struct WatcherHandle {
-    /// Underlying tokio task. `.await` after sending `shutdown` to join.
+    /// Underlying tokio task. `.await` this after sending `shutdown`, to join.
     pub task: JoinHandle<()>,
-    /// Cooperative shutdown signal. `send(())` (or dropping it) asks the
+    /// Cooperative shutdown signal. Send `()`, or drop this, to ask the
     /// watcher loop to exit at the next tick boundary.
     pub shutdown: oneshot::Sender<()>,
 }
 
 /// Errors the watcher's tick loop reports up. A `Tip` or `Logs` error means
-/// the cursor was NOT advanced; the next tick will retry the same range.
+/// the cursor did not advance. The next tick retries the same range.
 #[derive(Debug, thiserror::Error)]
 pub enum MonitorError {
-    /// `L1Source::finalized_block_number` failed (transport/decode).
+    /// `L1Source::finalized_block_number` failed (transport or decode error).
     #[error("failed to read L1 finalized tip: {0}")]
     Tip(L1SourceError),
     /// `L1Source::lockbox_logs` failed.
     #[error("failed to read L1 deposit logs: {0}")]
     Logs(L1SourceError),
-    /// `L1Source::block_hash` failed. An epoch cannot be built without its
-    /// block's hash — the canonical id derives from it.
+    /// `L1Source::block_hash` failed. An epoch needs its block's hash to
+    /// build the canonical id, so it cannot be built without one.
     #[error("failed to read L1 block hash: {0}")]
     BlockHash(L1SourceError),
     /// The logs fetched for a block disagree with the hash fetched for that
-    /// same block — an L1 reorg between the two reads, or a provider serving
-    /// inconsistent views. Never advance the cursor past this.
+    /// same block. This can mean an L1 reorg happened between the two
+    /// reads, or the provider served inconsistent views. Never advance the
+    /// cursor past this.
     #[error("epoch derivation failed: {0}")]
     Derive(EpochError),
-    /// The L1 has not yet produced a finalized block. Classified as a tick-
-    /// level outcome (not an err) so dashboards don't light up before
-    /// finality kicks in on a freshly-started chain.
+    /// The L1 has not yet produced a finalized block. This is a tick-level
+    /// outcome, not an error, so dashboards do not alarm before finality
+    /// starts on a freshly started chain.
     #[error("L1 has no finalized block yet")]
     NotFinalized,
-    /// The publisher transport is permanently closed; the watcher must
-    /// exit.
+    /// The publisher transport is permanently closed. The watcher must exit.
     #[error("deposit publisher closed")]
     PublisherClosed,
 }
 
-/// One processing pass. Public so unit tests can exercise it directly
-/// without any timer or thread.
+/// One processing pass. This is public, so unit tests can call it directly,
+/// with no timer or thread.
 ///
-/// Returns `Ok(n)` on success (`n` = number of epochs successfully published
-/// this pass; zero on seed/idle ticks). The `cursor` advances per published
-/// block, so a partial pass resumes exactly where it stopped.
+/// On success, return `Ok(n)`, where `n` is the number of epochs published
+/// this pass. `n` is zero on a seed or idle tick. The `cursor` advances per
+/// published block, so a partial pass resumes exactly where it stopped.
 ///
 /// On `Err`, the cursor is unchanged.
 ///
@@ -89,8 +89,9 @@ pub enum MonitorError {
 /// - [`MonitorError::Derive`] if a block's logs disagree with its hash.
 /// - [`MonitorError::PublisherClosed`] if the publisher transport is shut.
 ///
-/// Publish backpressure is logged and the cursor is left at the last block
-/// that DID publish, so the next tick retries from the one that did not.
+/// A publish backpressure event is logged. The cursor stays at the last
+/// block that did publish, so the next tick retries from the one that did
+/// not.
 pub async fn process_once<S, P>(
     publisher: &P,
     source: &S,
@@ -112,7 +113,7 @@ where
 
     let from_block = match cursor {
         None => {
-            // Seed: skip historical deposits per spec Non-Goals.
+            // Seed the cursor. Skip historical deposits, per the spec's Non-Goals section.
             *cursor = Some(tip);
             return Ok(0);
         }
@@ -120,8 +121,8 @@ where
         Some(c) => *c + 1,
     };
 
-    // One range query for the logs, then split by block: the alternative
-    // (a query per block) multiplies RPC round-trips on catch-up for no gain.
+    // Fetch the logs with one range query, then split by block. A query per
+    // block would multiply RPC round-trips during catch-up, for no gain.
     let logs = source
         .lockbox_logs(lockbox, from_block, tip)
         .await
@@ -133,10 +134,10 @@ where
 
     let mut published = 0usize;
     for number in from_block..=tip {
-        // Blocks with no deposits have no log to carry their hash, so it is
-        // fetched per block. `derive_epoch` then cross-checks every log's
-        // block_hash against it, which is what catches a reorg landing
-        // between the log query and this read.
+        // A block with no deposits has no log to carry its hash, so the
+        // hash is fetched per block. `derive_epoch` then checks every log's
+        // block_hash against it. This is what catches a reorg between the
+        // log query and this read.
         let hash = source
             .block_hash(number)
             .await
@@ -148,10 +149,11 @@ where
         match publisher.publish(&epoch) {
             Ok(pos) => {
                 published += 1;
-                // Advance PER BLOCK, not once for the whole range: a failure
-                // halfway through must not re-publish the epochs already
-                // accepted (dedup would absorb it, but the cursor is also the
-                // origin-lag signal and should not go backwards).
+                // Advance the cursor per block, not once for the whole
+                // range. A failure halfway through must not re-publish
+                // already-accepted epochs. Dedup would absorb a repeat, but
+                // the cursor also drives the origin-lag signal, and it
+                // should not go backwards.
                 *cursor = Some(number);
                 ::metrics::counter!(metrics::EPOCHS_PUBLISHED_TOTAL).increment(1);
                 ::metrics::counter!(metrics::DEPOSITS_DETECTED_TOTAL).increment(deposits as u64);
@@ -165,8 +167,8 @@ where
                 );
             }
             Err(PublishError::Backpressure) => {
-                // Hold the cursor at the last SUCCESSFUL block: re-tick
-                // resumes at exactly this one.
+                // Hold the cursor at the last successful block. The next
+                // tick resumes at exactly this one.
                 warn!(
                     target: "da_watcher",
                     l1_number = number,
@@ -176,11 +178,11 @@ where
             }
             Err(PublishError::Closed) => return Err(MonitorError::PublisherClosed),
             Err(PublishError::Transport(detail)) => {
-                // Deliberately NOT the old per-deposit "log and carry on".
-                // Skipping an epoch puts a permanent hole in the origin
-                // sequence, which is precisely what the no-skipping rule
-                // forbids and what a verifier would later reject the chain
-                // for. Stop the range here and retry from this block.
+                // This does not use the old per-deposit "log and carry on"
+                // approach. Skipping an epoch puts a permanent hole in the
+                // origin sequence. The no-skipping rule forbids that, and a
+                // verifier would later reject the chain for it. Stop the
+                // range here and retry from this block.
                 warn!(
                     target: "da_watcher",
                     l1_number = number,
@@ -196,7 +198,7 @@ where
     Ok(published)
 }
 
-/// Spawn the watcher loop. Returns a [`WatcherHandle`] that owns the task
+/// Spawn the watcher loop. Return a [`WatcherHandle`] that owns the task
 /// and a cooperative shutdown channel.
 pub fn spawn<S, P>(publisher: P, source: S, config: DaWatcherConfig) -> WatcherHandle
 where
@@ -207,8 +209,8 @@ where
     let source = Arc::new(source);
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {
-        // `interval` fires immediately on the first `tick().await`, which
-        // is what we want: seed the cursor as soon as the task starts.
+        // `interval` fires immediately on the first `tick().await`. This is
+        // what we want: it seeds the cursor as soon as the task starts.
         let mut interval = tokio::time::interval(config.poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut cursor: Option<u64> = None;
@@ -257,8 +259,8 @@ where
     }
 }
 
-// Helper: `Arc<T>: EpochPublisher` so the spawned task can share the
-// publisher without forcing the trait to require `Clone`.
+// This lets `Arc<T>` implement `EpochPublisher`, so the spawned task can
+// share the publisher without the trait requiring `Clone`.
 impl<P: EpochPublisher + ?Sized> EpochPublisher for Arc<P> {
     fn publish(&self, epoch: &EpochRecord) -> Result<kardamom_types::BPosition, PublishError> {
         (**self).publish(epoch)
@@ -281,7 +283,7 @@ mod tests {
     }
 
     /// A log in L1 block `number`, whose hash is the mock's filler for that
-    /// number — i.e. what the watcher will independently fetch.
+    /// number. This is the hash the watcher will fetch on its own.
     fn dep_log(number: u64, log_index: u64, mint: u128) -> LockboxLog {
         LockboxLog::Deposit(DepositLog {
             block_number: number,
@@ -320,9 +322,9 @@ mod tests {
         assert!(pub_.published.lock().unwrap().is_empty());
     }
 
-    /// The upgrade transaction rides the deposit path end to end: same query,
-    /// same epoch, same publish. If this ever needed its own plumbing, the
-    /// sealer and slot accounting would have needed changes too.
+    /// The upgrade transaction rides the deposit path end to end: the same
+    /// query, the same epoch, the same publish. If it ever needed its own
+    /// plumbing, the sealer and slot accounting would need changes too.
     #[tokio::test]
     async fn an_upgrade_log_becomes_a_system_deposit_in_its_epoch() {
         let pub_ = InMemoryEpochPublisher::default();
@@ -349,15 +351,15 @@ mod tests {
         assert_eq!(d.mint, 0);
     }
 
-    /// Deposits and upgrades arrive on one topic-filtered query, so they must
-    /// stay in L1 log order within the epoch — an upgrade must not overtake a
-    /// deposit L1 sequenced first.
+    /// Deposits and upgrades arrive on one topic-filtered query, so they
+    /// must stay in L1 log order within the epoch. An upgrade must not
+    /// overtake a deposit that L1 sequenced first.
     #[tokio::test]
     async fn deposits_and_upgrades_share_one_epoch_in_log_order() {
         let pub_ = InMemoryEpochPublisher::default();
         let src = MockL1Source::new();
         src.push_tip(Ok(301));
-        // Pushed out of order on purpose; the rule sorts by log_index.
+        // Pushed out of order on purpose. The rule sorts by log_index.
         src.push_logs(Ok(vec![
             dep_log(301, 2, 500),
             upg_log(301, 1, 7, 1_700_000_000_250),
@@ -389,7 +391,7 @@ mod tests {
         let pub_ = InMemoryEpochPublisher::default();
         let src = MockL1Source::new();
         src.push_tip(Ok(153));
-        // A single range query spanning three blocks: two deposits in 151,
+        // A single range query spans three blocks: two deposits in 151,
         // none in 152, one in 153.
         src.push_logs(Ok(vec![
             dep_log(151, 0, 100),
@@ -414,8 +416,8 @@ mod tests {
         assert!(v[1].deposits.is_empty(), "block 152 had no deposits");
         assert_eq!(v[2].deposits.len(), 1);
 
-        // Deposit content is derived, not passed through: sender aliased,
-        // source_hash from the L1 (block_hash, log_index).
+        // Deposit content is derived, not passed through: the sender is
+        // aliased, and source_hash comes from the L1 (block_hash, log_index).
         assert_eq!(
             v[0].deposits[0].from,
             alias_l1_address(Address::repeat_byte(0x11))
@@ -429,9 +431,9 @@ mod tests {
         assert_eq!(v[0].deposits[0].value, U256::from(100u64));
     }
 
-    /// The no-skipping rule in miniature: a stretch of L1 with no deposits at
-    /// all must still produce one epoch per block, or the origin sequence
-    /// gets a hole a verifier would reject.
+    /// The no-skipping rule in miniature: a stretch of L1 with no deposits
+    /// at all must still produce one epoch per block. Otherwise, the origin
+    /// sequence gets a hole that a verifier would reject.
     #[tokio::test]
     async fn depositless_range_still_emits_every_epoch() {
         let pub_ = InMemoryEpochPublisher::default();
@@ -490,12 +492,13 @@ mod tests {
         let n = process_once(&pub_, &src, lockbox(), &mut cursor)
             .await
             .unwrap();
-        assert_eq!(n, 0); // first publish backpressured; loop returned early
-        assert_eq!(cursor, Some(150)); // cursor NOT advanced
+        assert_eq!(n, 0); // The first publish was backpressured, so the loop returned early.
+        assert_eq!(cursor, Some(150)); // The cursor did not advance.
     }
 
-    /// A partially-published range must resume at the first block that did
-    /// NOT publish — not re-emit the ones that did, and not skip past them.
+    /// A partially published range must resume at the first block that did
+    /// not publish. It must not re-emit the blocks that did publish, and
+    /// must not skip past them.
     #[tokio::test]
     async fn partial_range_resumes_at_the_first_unpublished_block() {
         let pub_ = InMemoryEpochPublisher::default();

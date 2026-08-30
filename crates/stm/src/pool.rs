@@ -1,43 +1,45 @@
 //! The shared persistent worker pool.
 //!
-//! Promoted from the commit tail's private lane pool: the same machinery now
-//! serves every fan-out in the workspace that wants "run f over N chunks on
-//! W persistent threads" — the STM commit tail's hash+validate lanes, the
-//! sharded-admission lanes, and the validator's BAL-seeded batch execution
-//! (which used to spawn one OS thread per batch per block).
+//! Promoted from the commit tail's private lane pool. The same machinery
+//! now serves every fan-out in the workspace that wants to run a function
+//! over N chunks on W persistent threads: the STM commit tail's
+//! hash-and-validate lanes, the sharded-admission lanes, and the
+//! validator's BAL-seeded batch execution (which used to spawn one OS
+//! thread per batch per block).
 //!
 //! History: these threads used to be `std::thread::scope` spawns, one set
-//! per block, and once the consensus witness got cheap the SPAWN/JOIN became
-//! 0.5ms of a 1.9ms tail — 36% of the overlap scope, pure overhead. Two
-//! cheaper theories were measured and rejected first (128KB stacks: no
-//! change; letting the tail thread take a chunk: worse, because the caller
-//! cores are shared with the harness and writer so that chunk straggles).
+//! per block. Once the consensus witness got cheap, the spawn and join
+//! cost became 0.5ms of a 1.9ms tail — 36% of the overlap scope, pure
+//! overhead. Two cheaper ideas were tested and rejected first: 128KB
+//! stacks made no difference, and letting the tail thread take a chunk was
+//! worse, because the caller cores are shared with the harness and writer,
+//! so that chunk lagged behind.
 //!
-//! So: create the threads ONCE per pool and hand them work. The workers are
-//! parked between jobs and optionally pinned to cores.
+//! The fix: create the threads once per pool and hand them work. Workers
+//! park between jobs and can be pinned to cores.
 //!
-//! SAFETY MODEL. `run` publishes a pointer to the caller's closure, wakes
-//! the workers, and does not return until every worker has finished with it
-//! — the same guarantee `thread::scope` gives, enforced here by a
-//! completion counter the caller waits on. The closure therefore outlives
-//! every use, which is what lets the lifetime be erased. Chunk indices are
-//! handed out by a single `fetch_add`, so each index is executed exactly
-//! once and workers never share a chunk.
+//! Safety model. `run` publishes a pointer to the caller's closure, wakes
+//! the workers, and does not return until every worker has finished with
+//! it. This is the same guarantee `thread::scope` gives, enforced here by
+//! a completion counter the caller waits on. The closure therefore
+//! outlives every use, which is what lets the lifetime be erased. Chunk
+//! indices are handed out by a single `fetch_add`, so each index runs
+//! exactly once and workers never share a chunk.
 //!
-//! PANIC CONTAINMENT. A panic inside the closure is caught at the worker,
-//! recorded, and surfaced as [`PoolPanic`] from `run` — the worker keeps
+//! Panic containment. A panic inside the closure is caught at the worker,
+//! recorded, and surfaced as [`PoolPanic`] from `run`. The worker keeps
 //! draining chunks and the pool survives for the next job. (The private
-//! predecessor let the unwind kill the lane thread, after which the
-//! completion counter never drained and `run` deadlocked; callers that
-//! treat a panic as fatal now get to fail loudly instead.)
+//! predecessor let the unwind kill the lane thread. After that, the
+//! completion counter never drained and `run` deadlocked. Callers that
+//! treat a panic as fatal now fail loudly instead.)
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// A chunk closure panicked. Carries the first panic observed (worker,
-/// chunk, panic payload rendered best-effort); every chunk still ran or was
-/// drained, and the pool remains usable.
+/// chunk, and the panic payload rendered best-effort). Every chunk still
+/// ran or was drained, and the pool remains usable.
 #[derive(Debug, Clone)]
 pub struct PoolPanic {
     pub worker: usize,
@@ -65,9 +67,9 @@ struct Job {
     call: unsafe fn(*const (), usize, usize),
 }
 
-// SAFETY: the pointer targets a closure the CALLER owns and keeps alive
-// across the whole `run` call (it blocks until every worker is done), and
-// the closure is `Sync` so concurrent calls are sound.
+// SAFETY: the pointer targets a closure the caller owns and keeps alive
+// across the whole `run` call (it blocks until every worker is done). The
+// closure is `Sync`, so concurrent calls are sound.
 unsafe impl Send for Job {}
 unsafe impl Sync for Job {}
 
@@ -75,12 +77,12 @@ struct Shared {
     /// Current job, generation-stamped so a worker never runs a stale one.
     job: Mutex<Option<Job>>,
     wake: Condvar,
-    /// Signalled by the last worker to finish, so the caller can BLOCK
+    /// Signalled by the last worker to finish, so the caller can block
     /// instead of spinning. Spinning here is fine when the workers have
-    /// their own cores and catastrophic when they do not: with three
+    /// their own cores, but harmful when they do not: with three
     /// admission lanes on two physical caller cores, a spin-only wait
-    /// turned a 4-minute benchmark into 11+ minutes, because the waiter
-    /// was competing with the lanes it was waiting for.
+    /// turned a 4-minute benchmark into more than 11 minutes, because the
+    /// waiter competed with the lanes it was waiting for.
     done: Condvar,
     done_lock: Mutex<()>,
     generation: AtomicU64,
@@ -124,7 +126,7 @@ impl WorkerPool {
             let pins = pin_cores.clone();
             threads.push(
                 std::thread::Builder::new()
-                    // Historic name kept: ops tooling greps for stm-lane-*.
+                    // Keep this name: ops tooling greps for stm-lane-*.
                     .name(format!("stm-lane-{li}"))
                     .spawn(move || {
                         if !pins.is_empty() {
@@ -156,8 +158,8 @@ impl WorkerPool {
                                     break;
                                 }
                                 // SAFETY: `run` keeps the closure alive until
-                                // `active` drains, and each index is handed
-                                // out once.
+                                // `active` drains, and each index is handed out
+                                // once.
                                 let r = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
                                     (job.call)(job.data, li, i)
                                 }));
@@ -199,12 +201,12 @@ impl WorkerPool {
 
     /// Run `f(worker_idx, chunk_idx)` for every chunk in `0..n_chunks` and
     /// return once every chunk has completed. Chunks are claimed by index,
-    /// so a slow worker simply takes fewer. `worker_idx` is stable for the
-    /// duration of one `run` — a caller can key per-worker resources
-    /// (snapshots, scratch buffers) on it.
+    /// so a slow worker simply takes fewer. `worker_idx` stays stable for
+    /// the duration of one `run` call, so a caller can key per-worker
+    /// resources (snapshots, scratch buffers) on it.
     ///
-    /// A contained closure panic surfaces as `Err(PoolPanic)` AFTER every
-    /// chunk has been drained; the pool stays usable.
+    /// A contained closure panic surfaces as `Err(PoolPanic)` after every
+    /// chunk has been drained. The pool stays usable.
     pub fn run<F>(&self, n_chunks: usize, f: &F) -> Result<(), PoolPanic>
     where
         F: Fn(usize, usize) + Sync,
@@ -213,7 +215,7 @@ impl WorkerPool {
             return Ok(());
         }
         unsafe fn trampoline<F: Fn(usize, usize)>(data: *const (), lane: usize, i: usize) {
-            // SAFETY: `data` came from `&F` in `run`, which outlives the call.
+            // SAFETY: `data` came from `&F` in `run`, which outlives this call.
             let f = unsafe { &*(data as *const F) };
             f(lane, i);
         }
@@ -236,8 +238,8 @@ impl WorkerPool {
         }
         self.shared.wake.notify_all();
         // Wait out the workers: a short spin catches the common case where
-        // the chunks are tens of microseconds, then BLOCK. Never spin
-        // indefinitely — the workers may be sharing this thread's core.
+        // the chunks take tens of microseconds, then block. Never spin
+        // forever, since the workers may share this thread's core.
         let mut spins = 0u32;
         while self.shared.active.load(Ordering::Acquire) != 0 {
             spins += 1;
@@ -352,7 +354,7 @@ mod tests {
             .expect_err("chunk 7 must surface");
         assert_eq!(err.chunk, 7);
         assert!(err.message.contains("chunk 7 exploded"));
-        // Every OTHER chunk still ran exactly once — the job drained.
+        // Every other chunk still ran exactly once — the job drained.
         for (i, c) in ran.iter().enumerate() {
             assert_eq!(c.load(Ordering::Relaxed), 1, "chunk {i}");
         }

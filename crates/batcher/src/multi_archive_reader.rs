@@ -1,29 +1,31 @@
 //! M-archive offline reader.
 //!
-//! After the canonical-ordering archive (tx_ordering) carries only
-//! [`TxOrderingMessage`] records — `TxRef` (pointer into tx_data[i]) and
-//! `BlockBoundaryStart` (sealer). Full [`TxEnvelope`] bytes live on the
-//! per-sequencer tx_data archives.
+//! The canonical-ordering archive (tx_ordering) carries only
+//! [`TxOrderingMessage`] records: `TxRef` (a pointer into tx_data[i]) and
+//! `BlockBoundaryStart` (from the sealer). The full [`TxEnvelope`] bytes
+//! live on the per-sequencer tx_data archives.
 //!
 //! This module ties the two together for the offline batcher pipeline:
 //!
 //! 1. Open one [`TxOrderingSegmentReader`] for the canonical orderer.
-//! 2. Open one [`TxDataSegmentReader`] per discovered sequencer; pre-load
-//!    each into a `(BPosition -> TxEnvelope)` map. (For v0 the offline path
-//!    materialises the per-A index in RAM — fine for batch sizes that fit a
-//!    few segment files. Streaming/page-cache modes are a future scale-up.)
-//! 3. Walk tx_ordering in order; for each [`TxOrderingMessage::TxRef`] resolve
-//!    `(sequencer_id, tx_data_position)` against the right per-A index; for each
-//!    [`TxOrderingMessage::BoundaryStart`] yield the boundary marker.
+//! 2. Open one [`TxDataSegmentReader`] per discovered sequencer. Pre-load
+//!    each into a `(BPosition -> TxEnvelope)` map. In v0, the offline path
+//!    keeps the per-A index in RAM. This works for batch sizes that fit a
+//!    few segment files. Streaming or page-cache modes are a future
+//!    scale-up.
+//! 3. Walk tx_ordering in order. For each [`TxOrderingMessage::TxRef`],
+//!    resolve `(sequencer_id, tx_data_position)` against the matching per-A
+//!    index. For each [`TxOrderingMessage::BoundaryStart`], yield the
+//!    boundary marker.
 //!
-//! The output is a stream of [`ResolvedRecord`]s — exactly the shape the
-//! existing [`crate::batch::BatchAccumulator`] consumed before. The
-//! BatchAccumulator therefore needs no behavioural change.
+//! The output is a stream of [`ResolvedRecord`]s, in the same shape the
+//! existing [`crate::batch::BatchAccumulator`] already consumed. So
+//! `BatchAccumulator` needs no behavior change.
 //!
-//! Out-of-order opens — refs on B for A-positions that haven't been read
-//! yet — are handled transparently: the per-A index is populated up front
-//! from the segment file, so any position the B-walker encounters is either
-//! present (we resolve it) or genuinely missing (we error). Tests exercise
+//! Out-of-order opens are handled without special cases. These are refs on
+//! B for A-positions that have not been read yet. The per-A index is built
+//! up front from the segment file. So any position the B-walker meets is
+//! either present (it resolves) or truly missing (it errors). Tests cover
 //! both the in-order and out-of-order cases.
 
 use std::collections::HashMap;
@@ -34,20 +36,20 @@ use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessag
 use crate::archive_reader::{TxDataSegmentReader, TxOrderingSegmentReader};
 use crate::error::BatcherError;
 
-/// A record resolved from the M+1 archive topology back into the legacy
-/// "stream of tx + boundary" shape that the [`crate::batch::BatchAccumulator`]
-/// already understands. The `position` field is the canonical B-position of
-/// the originating tx_ordering record (system invariant I1), not the tx_data
-/// position the envelope was fetched from. Canonical L2 ordering is by B.
+/// A record resolved from the M+1 archive topology, in the "stream of tx
+/// plus boundary" shape that [`crate::batch::BatchAccumulator`] already
+/// understands. The `position` field is the canonical B-position of the
+/// originating tx_ordering record (system invariant I1). It is not the
+/// tx_data position the envelope came from. Canonical L2 order follows B.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolvedRecord {
     Tx {
-        /// Canonical position of the `TxRef` on tx_ordering. This is the value
-        /// the batch accumulator stores in `RecordedTx::position`.
+        /// The canonical position of the `TxRef` on tx_ordering. This is the
+        /// value the batch accumulator stores in `RecordedTx::position`.
         position: BPosition,
-        /// The originating tx_data position. Useful for diagnostics and
-        /// for the per-A reader's own bookkeeping. Carried through so test
-        /// asserts can verify resolution went to the right A-archive.
+        /// The originating tx_data position. This is useful for diagnostics
+        /// and for the per-A reader's own bookkeeping. Tests use it to check
+        /// that resolution used the right A-archive.
         sequencer_id: u8,
         tx_data_position: BPosition,
         env: TxEnvelope,
@@ -59,13 +61,13 @@ pub enum ResolvedRecord {
 }
 
 /// Configuration for the M-archive reader. `b_segment` is the tx_ordering
-/// segment file path; `a_segments` maps `sequencer_id` to the corresponding
+/// segment file path. `a_segments` maps `sequencer_id` to the matching
 /// tx_data segment file path.
 ///
-/// For v0 each archive is one segment file; multi-segment iteration is the
-/// same algorithm applied to consecutive files and is left for a follow-up
-/// (the offline batcher consumes whole epochs at a time, so segment-roll
-/// handling happens at the orchestration layer, not in the reader itself).
+/// In v0, each archive is one segment file. Multi-segment iteration uses the
+/// same algorithm on consecutive files, and is left for later. The offline
+/// batcher reads whole epochs at a time, so segment-roll handling belongs in
+/// the orchestration layer, not in the reader itself.
 #[derive(Clone, Debug)]
 pub struct MultiArchiveConfig {
     pub b_segment: PathBuf,
@@ -73,9 +75,9 @@ pub struct MultiArchiveConfig {
 }
 
 impl MultiArchiveConfig {
-    /// Parse the `--tx_data-archive sid=path,sid=path,...` CLI form. Used
-    /// by the CLI driver; centralised here so tests can exercise the same
-    /// parser without depending on `clap`.
+    /// Parse the `--tx_data-archive sid=path,sid=path,...` CLI form. The CLI
+    /// driver uses this. It lives here so tests can use the same parser
+    /// without depending on `clap`.
     pub fn parse_a_spec(spec: &str) -> Result<HashMap<u8, PathBuf>, BatcherError> {
         let mut out = HashMap::new();
         for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -106,8 +108,8 @@ impl MultiArchiveConfig {
 /// Built once per A-archive during [`MultiArchiveReader::open`].
 type PerASegmentIndex = HashMap<BPosition, TxEnvelope>;
 
-/// M-archive offline reader. Walks tx_ordering in canonical order, resolving
-/// each `TxRef` against the per-sequencer A indexes.
+/// M-archive offline reader. It walks tx_ordering in canonical order and
+/// resolves each `TxRef` against the per-sequencer A indexes.
 pub struct MultiArchiveReader {
     b_reader: TxOrderingSegmentReader,
     /// `sequencer_id -> (BPosition -> TxEnvelope)` index.
@@ -115,8 +117,9 @@ pub struct MultiArchiveReader {
 }
 
 impl MultiArchiveReader {
-    /// Open all archives, eagerly load per-A indexes, and return a reader
-    /// that can be iterated to yield [`ResolvedRecord`]s in canonical order.
+    /// Open all archives, load the per-A indexes right away, and return a
+    /// reader. Iterate the reader to get [`ResolvedRecord`]s in canonical
+    /// order.
     pub fn open(cfg: &MultiArchiveConfig) -> Result<Self, BatcherError> {
         let b_reader = TxOrderingSegmentReader::open(&cfg.b_segment)?;
         let mut a_indexes = HashMap::with_capacity(cfg.a_segments.len());
@@ -160,9 +163,9 @@ impl Iterator for MultiArchiveReader {
     type Item = Result<ResolvedRecord, BatcherError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // The batcher only emits user-tx data + block boundaries to L1.
-        // DepositRefs are L1-originated; we skip them by recursing until we
-        // hit a record the batcher cares about.
+        // The batcher sends only user-tx data and block boundaries to L1.
+        // DepositRefs come from L1, so this loop skips them until it finds
+        // a record the batcher needs.
         loop {
             let next_b = self.b_reader.next()?;
             let rec = match next_b {
@@ -183,15 +186,14 @@ impl Iterator for MultiArchiveReader {
                     };
                 }
                 TxOrderingMessage::DepositRef(_) | TxOrderingMessage::Epoch(_) => {
-                    // L1 deposits originated on L1; they don't need to be
-                    // re-batched back. Skip.
+                    // L1 deposits come from L1, so they do not need to go
+                    // back into a batch. Skip them.
                     //
-                    // Epochs are skipped for the same reason and, under the
-                    // deposit-derivation design, deliberately so: a
+                    // Skip epochs for the same reason, and by design: a
                     // reconstructor re-derives an epoch's deposits from L1
-                    // itself, guided by the block's `l1_origin`, so putting
-                    // them in the blob would be both wasted space and an
-                    // unverifiable claim (deposits are unsigned). See
+                    // itself, using the block's `l1_origin`. Putting deposits
+                    // in the blob would waste space and add an unverifiable
+                    // claim, because deposits are unsigned. See
                     // docs/agents/l1-origin-deposit-derivation-spec.md.
                     continue;
                 }

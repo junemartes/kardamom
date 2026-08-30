@@ -1,10 +1,9 @@
-//! TxData / tx_ordering reader threads + join buffer (S4-arch-update,
-//!,).
+//! TxData / tx_ordering reader threads and join buffer.
 //!
-//! Before the executor had **one** tx_ordering reader thread that
-//! pulled full [`TxEnvelope`]s off tx_ordering and handed them downstream. After
-//! the split-architecture refactor tx_ordering carries only
-//! ~16-32 B [`TxOrderingMessage`] records (`TxRef | BoundaryStart`); the full
+//! The executor used to have one tx_ordering reader thread. It pulled full
+//! [`TxEnvelope`]s off tx_ordering and handed them downstream. After the
+//! split-architecture refactor, tx_ordering carries only ~16-32 B
+//! [`TxOrderingMessage`] records (`TxRef` or `BoundaryStart`). The full
 //! envelope bytes live on M per-sequencer **tx_data** archives.
 //!
 //! This module owns the M+1 reader thread topology:
@@ -25,24 +24,24 @@
 //!                                                    inline)
 //! ```
 //!
-//! Each tx_data reader thread is dedicated to one Aeron subscription
-//! (tx_data[i]). `rusteron_client::Aeron` is `!Send + !Sync`, so each
-//! subscription must own its own Aeron client on its own OS thread. The
-//! reader simply inserts every fragment into the shared [`JoinBuffer`].
+//! Each tx_data reader thread serves one Aeron subscription (tx_data[i]).
+//! `rusteron_client::Aeron` is `!Send + !Sync`, so each subscription must own
+//! its own Aeron client on its own OS thread. The reader only inserts each
+//! fragment into the shared [`JoinBuffer`].
 //!
-//! The single tx_ordering reader pulls [`TxOrderingMessage`] records in canonical
-//! order (system invariant I1). For each:
+//! The single tx_ordering reader pulls [`TxOrderingMessage`] records in
+//! canonical order (system invariant I1). For each:
 //!
-//! - `TxRef`: look up `(sequencer_id, tx_data_position)` in the join buffer; if
-//!   present, hand `(b_position, TxEnvelope)` to the exec thread. If absent
-//!   (A-publisher lag of a few µs), spin with a bounded backoff up to
-//!   [`ReaderConfig::join_timeout`]; beyond that, return [`ExecutorError::
-//!   JoinTimeout`] — something is wrong upstream.
-//! - `BoundaryStart`: forward verbatim.
+//! - `TxRef`: look up `(sequencer_id, tx_data_position)` in the join buffer.
+//!   If present, send `(b_position, TxEnvelope)` to the exec thread. If
+//!   absent (a few µs of A-publisher lag), spin with a bounded backoff up to
+//!   [`ReaderConfig::join_timeout`]. Beyond that, return
+//!   [`ExecutorError::JoinTimeout`]: something is wrong upstream.
+//! - `BoundaryStart`: forward as-is.
 //!
-//! `BPosition` handed to exec is the **tx_ordering** position (the canonical L2
-//! position), not the tx_data position. Downstream consumers continue to
-//! key on this.
+//! The `BPosition` handed to exec is the tx_ordering position, the canonical
+//! L2 position, not the tx_data position. Downstream consumers keep keying
+//! on this.
 
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -61,38 +60,39 @@ use crate::exec_types::TxIndex;
 
 pub mod cluster;
 
-/// Subscription to one **tx_data[i]**.
+/// Subscription to one tx_data[i].
 ///
-/// One impl per sequencer partition. Implementations:
-/// - in production: `kardamom_log::TxDataSubscriber` on a dedicated OS thread.
-/// - in tests: `kardamom_log::testing::FakeTxDataSubscription`.
+/// One implementation per sequencer partition:
+///   - in production: `kardamom_log::TxDataSubscriber`, on a dedicated OS
+///     thread.
+///   - in tests: `kardamom_log::testing::FakeTxDataSubscription`.
 ///
-/// The contract: `next` blocks until the next `(tx_data_position, envelope)` is
-/// available; returns `Err(ExecutorError::TxDataClosed { sequencer_id })`
-/// when the underlying subscription closes cleanly.
+/// Contract: `next` blocks until the next `(tx_data_position, envelope)` is
+/// available. It returns `Err(ExecutorError::TxDataClosed { sequencer_id })`
+/// when the subscription closes cleanly.
 pub trait TxDataSubscription: Send {
-    /// Sequencer id this subscription is bound to. Used to key the join
-    /// buffer and surface diagnostics.
+    /// Sequencer id this subscription is bound to. It keys the join buffer
+    /// and appears in diagnostics.
     fn sequencer_id(&self) -> u8;
 
     fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError>;
 }
 
-/// Subscription to **tx_ordering** (the canonical orderer).
+/// Subscription to tx_ordering, the canonical orderer.
 ///
-/// Yields tiny [`TxOrderingMessage`] records (`TxRef | DepositRef |
-/// BoundaryStart`) each tagged with its canonical `BPosition`. The
+/// Yields tiny [`TxOrderingMessage`] records (`TxRef`, `DepositRef`, or
+/// `BoundaryStart`), each tagged with its canonical `BPosition`. The
 /// `BPosition` is the system's canonical L2 tx ordering (invariant I1).
 ///
-/// In production: `kardamom_log::TxOrderingSubscriber` on a dedicated OS thread.
-/// In tests: see `kardamom_log::testing::FakeTxOrderingSubscription`.
+/// In production: `kardamom_log::TxOrderingSubscriber`, on a dedicated OS
+/// thread. In tests: see `kardamom_log::testing::FakeTxOrderingSubscription`.
 pub trait TxOrderingSubscription: Send {
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError>;
 }
 
-// Boxed trait objects are subscriptions too, so callers holding
-// `Box<dyn ...>` (the `bin_support` open_* helpers' return type) can hand
-// them straight to the spawn_* functions.
+// Boxed trait objects are subscriptions too. So callers holding
+// `Box<dyn ...>` (the return type of the `bin_support` open_* helpers) can
+// hand them straight to the spawn_* functions.
 impl TxDataSubscription for Box<dyn TxDataSubscription> {
     fn sequencer_id(&self) -> u8 {
         (**self).sequencer_id()
@@ -109,23 +109,24 @@ impl TxOrderingSubscription for Box<dyn TxOrderingSubscription> {
     }
 }
 
-/// Lookup-and-remove join buffer keyed by
+/// Lookup-and-remove join buffer, keyed by
 /// `(sequencer_id, session_id, tx_data_position)`.
 ///
-/// TxData reader threads insert via [`JoinBuffer::insert`]. The
-/// tx_ordering reader pulls via [`JoinBuffer::take`] (remove-on-hit). Bounded
-/// by the in-flight window — typically a few thousand entries (~100 MB at
-/// envelope-sized values).
+/// TxData reader threads insert with [`JoinBuffer::insert`]. The
+/// tx_ordering reader reads with [`JoinBuffer::take`], which removes on a
+/// hit. The in-flight window bounds its size, typically a few thousand
+/// entries (~100 MB at envelope-sized values).
 ///
-/// The `session_id` (Aeron publisher session) is part of the key because Aeron
-/// positions are per-session: under active/active ingress two publishers on one
-/// shard can emit fragments with the same `(term_id, term_offset)`, so
-/// `(sequencer_id, tx_data_position)` alone is ambiguous. The sequencer stamps
-/// the session into `TxRef.tx_data_session_id`; the lookup uses it.
+/// The key includes `session_id` (the Aeron publisher session), because
+/// Aeron positions are per-session. Under active/active ingress, two
+/// publishers on one shard can emit fragments with the same `(term_id,
+/// term_offset)`. So `(sequencer_id, tx_data_position)` alone is ambiguous.
+/// The sequencer stamps the session into `TxRef.tx_data_session_id`, and the
+/// lookup uses it.
 ///
-/// Shared across M+1 threads via `Arc`. `DashMap` over per-shard locks
-/// since the access pattern is M concurrent inserts + one concurrent reader;
-/// we never iterate.
+/// This is shared across M+1 threads with an `Arc`. It uses `DashMap`, with
+/// per-shard locks, because the access pattern is M concurrent inserts and
+/// one concurrent reader. It is never iterated.
 #[derive(Clone, Default)]
 pub struct JoinBuffer {
     inner: Arc<DashMap<(u8, i32, BPosition), TxEnvelope>>,
@@ -148,8 +149,8 @@ impl JoinBuffer {
     }
 
     /// Remove and return the envelope at
-    /// `(sequencer_id, session_id, tx_data_position)`, or `None` if it isn't
-    /// (yet) present.
+    /// `(sequencer_id, session_id, tx_data_position)`. Return `None` if it is
+    /// not present yet.
     pub fn take(
         &self,
         sequencer_id: u8,
@@ -161,8 +162,8 @@ impl JoinBuffer {
             .map(|kv| kv.1)
     }
 
-    /// Current entry count. Exposed for tests and the periodic
-    /// growth-monitor warning emitted by the tx_ordering reader.
+    /// Current entry count. Used by tests and by the periodic growth-monitor
+    /// warning the tx_ordering reader emits.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -174,28 +175,31 @@ impl JoinBuffer {
 
 /// Archive-backed envelope recovery for join misses.
 ///
-/// The tx_data / tx_deposits side streams are lossy multicast: a canonical ref
-/// whose envelope never arrived (image lapsed under load, publisher raced a
-/// subscriber restart, node-kill blackout) used to be terminal — the bounded
-/// join fired and the whole process died, betting that restart-recovery could
-/// replay the gap (it couldn't: the durability recordings live on OTHER nodes'
-/// archives). Implementations of this trait close that gap in-band: fetch the
-/// missing range from a remote durability archive and feed the join buffer,
-/// so a transient loss costs one bounded stall instead of a process death.
-/// The join timeout stays the final arbiter — if the archives can't produce
-/// the envelope either, the reader still fails loudly.
+/// The tx_data and tx_deposits side streams are lossy multicast. A
+/// canonical ref whose envelope never arrived, from an image lapse under
+/// load, a publisher racing a subscriber restart, or a node-kill blackout,
+/// used to be terminal: the bounded join fired and the whole process died.
+/// This bet that restart-recovery could replay the gap, but it could not:
+/// the durability recordings live on other nodes' archives.
+/// Implementations of this trait close that gap in-band. They fetch the
+/// missing range from a remote durability archive and feed the join
+/// buffer, so a transient loss costs one bounded stall instead of a
+/// process death. The join timeout stays the final arbiter: if the
+/// archives cannot produce the envelope either, the reader still fails
+/// loudly.
 ///
-/// Implementations own their transport (endpoints, failover, backoff) and are
-/// called from the tx_ordering reader thread, so one call must stay well
-/// under the join-timeout budget.
+/// Implementations own their transport (endpoints, failover, backoff). The
+/// tx_ordering reader thread calls them, so one call must stay well under
+/// the join-timeout budget.
 ///
-/// Not `Send`: the Aeron archive client types are thread-bound, so the
-/// recovery is constructed INSIDE the reader thread via a
-/// [`JoinRecoveryFactory`] and never crosses threads.
+/// This trait is not `Send`. The Aeron archive client types are
+/// thread-bound, so a [`JoinRecoveryFactory`] builds the recovery inside
+/// the reader thread, and it never crosses threads.
 pub trait JoinRecovery {
-    /// Fetch tx_data envelopes for `shard_id` recorded at/after `from` on the
-    /// publisher session `session_id`, feeding each into `sink` (which inserts
-    /// into the join buffer). Returns the number of envelopes recovered.
+    /// Fetch tx_data envelopes for `shard_id`, recorded at or after `from` on
+    /// the publisher session `session_id`. Feed each into `sink`, which
+    /// inserts it into the join buffer. Return the number of envelopes
+    /// recovered.
     fn recover_tx_data(
         &mut self,
         shard_id: u8,
@@ -204,8 +208,9 @@ pub trait JoinRecovery {
         sink: &mut dyn FnMut(TxDataLoc, TxEnvelope),
     ) -> Result<u64, String>;
 
-    /// Fetch tx_deposits recorded at/after `from` (any publisher session),
-    /// feeding each into `sink`. Returns the number of deposits recovered.
+    /// Fetch tx_deposits recorded at or after `from`, from any publisher
+    /// session. Feed each into `sink`. Return the number of deposits
+    /// recovered.
     fn recover_deposits(
         &mut self,
         from: BPosition,
@@ -213,37 +218,37 @@ pub trait JoinRecovery {
     ) -> Result<u64, String>;
 }
 
-/// Constructs the (thread-bound) [`JoinRecovery`] inside the reader thread.
-/// Returning `None` (e.g. config absent) leaves the plain bounded join.
+/// Builds the thread-bound [`JoinRecovery`] inside the reader thread.
+/// Return `None`, for example when config is absent, to keep the plain
+/// bounded join.
 pub type JoinRecoveryFactory = Box<dyn FnOnce() -> Option<Box<dyn JoinRecovery>> + Send>;
 
 /// Tunables for the reader / join layer.
 #[derive(Clone, Debug)]
 pub struct ReaderConfig {
-    /// Upper bound on how long the tx_ordering reader will wait for a
-    /// `TxRef`'s envelope to land on its tx_data. 100 ms matches the
-    /// "few µs of A-publisher lag is fine, anything more is upstream
-    /// failure" comment in the plan.
+    /// Upper bound on how long the tx_ordering reader waits for a `TxRef`'s
+    /// envelope to land on its tx_data. 100 ms matches the rule: a few µs of
+    /// A-publisher lag is fine, anything more is an upstream failure.
     pub join_timeout: Duration,
-    /// How long a join waits in-band before the first archive-refetch attempt
-    /// (when a [`JoinRecovery`] is wired). Long enough that ordinary publisher
-    /// lag never triggers a refetch; short enough that a real loss recovers
-    /// well inside the join budget. Further attempts repeat on the same
-    /// cadence until `join_timeout` expires.
+    /// How long a join waits in-band before the first archive-refetch attempt,
+    /// when a [`JoinRecovery`] is wired. Long enough that ordinary publisher lag
+    /// never triggers a refetch. Short enough that a real loss recovers well
+    /// inside the join budget. Further attempts repeat on the same cadence
+    /// until `join_timeout` expires.
     pub join_refetch_after: Duration,
-    /// Polling interval used during the join wait. Trade-off: smaller =
-    /// faster recovery from lag, more CPU; larger = vice versa. 50 µs is
-    /// well below the 100 ms ceiling.
+    /// Polling interval used during the join wait. A smaller value recovers
+    /// from lag faster, but uses more CPU. A larger value does the opposite.
+    /// 50 µs is well below the 100 ms ceiling.
     pub join_poll_interval: Duration,
-    /// Soft warn threshold on the join buffer's size; emits a `warn!` log
-    /// when crossed (no back-pressure — that's the publisher's job).
+    /// Soft warn threshold on the join buffer's size. Emits a `warn!` log when
+    /// crossed. This applies no back-pressure; that is the publisher's job.
     pub buffer_warn_threshold: usize,
     /// Capacity of the canonical-id dedup window on the tx_ordering reader.
-    /// Duplicates of one canonical id are the P racing sequencers'
-    /// republications, which land within the sequencers' publish spread of
-    /// each other — the window only has to outlive that spread, not the
-    /// whole stream. 2^20 ids (~32 MiB of hashes) gives ~10 s of headroom
-    /// even at 100k tx/s.
+    /// Duplicates of one canonical id come from the P racing sequencers'
+    /// republications, which land close together, within the sequencers'
+    /// publish spread. So the window only has to outlast that spread, not the
+    /// whole stream. 2^20 ids (~32 MiB of hashes) gives ~10 s of headroom, even
+    /// at 100k tx/s.
     pub dedup_window: usize,
 }
 
@@ -261,11 +266,11 @@ impl Default for ReaderConfig {
 
 /// Message routed from the tx_ordering reader to the executor's exec thread.
 ///
-/// `tx_idx` is the **executor-local** monotone counter assigned in
-/// canonical (B-position) arrival order; `position` is the tx_ordering
-/// `BPosition` (the wire-level canonical id). The exec thread uses both:
-/// `tx_idx` as a sanity-check newtype, `position` as the
-/// downstream-published `Receipt.tx_idx`.
+/// `tx_idx` is the executor-local monotone counter, assigned in canonical
+/// (B-position) arrival order. `position` is the tx_ordering `BPosition`,
+/// the wire-level canonical id. The exec thread uses both: `tx_idx` as a
+/// sanity-check newtype, and `position` as the downstream-published
+/// `Receipt.tx_idx`.
 #[derive(Debug)]
 pub enum ReaderToExec {
     Tx {
@@ -278,8 +283,8 @@ pub enum ReaderToExec {
         deposit: Deposit,
         position: BPosition,
     },
-    /// An L1 epoch marker: advances the block's L1 origin and consumes the
-    /// first slot of the epoch's range. Applies NO transaction — the epoch's
+    /// An L1 epoch marker. It advances the block's L1 origin and consumes the
+    /// first slot of the epoch's range. It applies no transaction; the epoch's
     /// deposits follow as their own [`ReaderToExec::Deposit`] messages.
     Epoch {
         tx_idx: TxIndex,
@@ -289,10 +294,10 @@ pub enum ReaderToExec {
     Boundary(BlockBoundaryStart),
 }
 
-/// Spawn one tx_data reader thread for `tx_data_sub`. Inserts every
-/// `(TxDataLoc, envelope)` into `buffer` keyed by
-/// `(tx_data_sub.sequencer_id(), loc.session_id, loc.position)`. Returns when the
-/// subscription closes cleanly (`Ok(())`) or propagates the first error.
+/// Spawn one tx_data reader thread for `tx_data_sub`. It inserts every
+/// `(TxDataLoc, envelope)` into `buffer`, keyed by
+/// `(tx_data_sub.sequencer_id(), loc.session_id, loc.position)`. It returns
+/// `Ok(())` when the subscription closes cleanly, or the first error.
 pub fn spawn_tx_data_reader<D>(
     mut tx_data_sub: D,
     buffer: JoinBuffer,
@@ -315,26 +320,26 @@ where
         .expect("spawn tx_data reader")
 }
 
-/// Role-specific hook called for every [`EpochRecord`] on the canonical
+/// Role-specific hook, called for every [`EpochRecord`] on the canonical
 /// stream, in canonical order, before its deposits are applied.
 ///
-/// The executor wires nothing here — it trusts the ordered stream. The
-/// VALIDATOR wires a verifier that re-derives the epoch from L1 and rejects a
-/// chain that disagrees (phase 1 of
-/// `docs/agents/l1-origin-deposit-derivation-spec.md`): deriving deposits is
-/// only half the guarantee, since without a checker a buggy sequencer silently
-/// produces a chain nobody can rebuild.
+/// The executor wires nothing here; it trusts the ordered stream. The
+/// validator wires a verifier that re-derives the epoch from L1 and rejects
+/// a chain that disagrees (phase 1 of
+/// `docs/agents/l1-origin-deposit-derivation-spec.md`). Deriving deposits
+/// is only half the guarantee: without a checker, a buggy sequencer could
+/// silently build a chain nobody can rebuild.
 ///
-/// Returning `Err` stops the engine — the same fail-stop a receipt or write-set
-/// divergence takes. Implementations must be CHEAP: this runs on the exec
-/// thread, so anything with network latency (an L1 read) belongs on a
-/// background task with a deferred verdict, not inline here.
+/// Returning `Err` stops the engine, the same fail-stop a receipt or
+/// write-set divergence takes. Implementations must be cheap: this runs on
+/// the exec thread. Anything with network latency, such as an L1 read,
+/// belongs on a background task with a deferred verdict, not inline here.
 pub trait EpochObserver: Send {
     fn observe(&mut self, epoch: &EpochRecord) -> Result<(), ExecutorError>;
 }
 
-/// The no-check [`EpochObserver`] for roles that trust the ordered stream
-/// (the executor role, and most tests): every epoch passes. Exists so an
+/// The no-check [`EpochObserver`], for roles that trust the ordered stream:
+/// the executor role, and most tests. Every epoch passes. This exists so an
 /// [`EngineWiring`](crate::actor::EngineWiring) that runs no epoch
 /// verification still has a concrete type to name.
 #[derive(Debug, Clone, Copy, Default)]
@@ -346,21 +351,21 @@ impl EpochObserver for NoEpochCheck {
     }
 }
 
-// Runtime-choice seam, same pattern as the subscription forwarding impls
-// above: a binary that must pick its observer at runtime names the boxed
-// type in its wiring.
+// Runtime-choice seam, the same pattern as the subscription forwarding
+// impls above. A binary that must pick its observer at runtime names the
+// boxed type in its wiring.
 impl EpochObserver for Box<dyn EpochObserver> {
     fn observe(&mut self, epoch: &EpochRecord) -> Result<(), ExecutorError> {
         (**self).observe(epoch)
     }
 }
 
-/// Bounded first-seen window for canonical-id dedup, FIFO-evicted.
+/// Bounded first-seen window for canonical-id dedup, evicted FIFO.
 ///
 /// `first_seen` returns `false` for an id already in the window. Once more
-/// than `capacity` ids are held, the oldest is evicted — safe because the
-/// duplicates of one canonical id (the racing sequencers' republications)
-/// arrive within the publish spread of each other, far inside the window.
+/// than `capacity` ids are held, the oldest is evicted. This is safe,
+/// because duplicates of one canonical id (the racing sequencers'
+/// republications) arrive close together, well inside the window.
 struct DedupWindow {
     seen: std::collections::HashSet<alloy_primitives::B256>,
     fifo: std::collections::VecDeque<alloy_primitives::B256>,
@@ -376,7 +381,7 @@ impl DedupWindow {
         }
     }
 
-    /// Records `id`; returns `false` if it is already in the window.
+    /// Record `id`. Return `false` if it is already in the window.
     fn first_seen(&mut self, id: alloy_primitives::B256) -> bool {
         if !self.seen.insert(id) {
             return false;
@@ -416,20 +421,20 @@ impl ExecSink for tokio::sync::mpsc::Sender<ReaderToExec> {
     }
 }
 
-/// Spawn the single tx_ordering reader thread. Pulls
-/// [`TxOrderingMessage`] records in canonical order; for each
-/// `TxRef`, joins against `buffer` (with a bounded wait) and forwards
-/// `(position, envelope)` to `exec_out`. For each `BoundaryStart`, forwards
-/// directly.
+/// Spawn the single tx_ordering reader thread. It pulls
+/// [`TxOrderingMessage`] records in canonical order. For each `TxRef`, it
+/// joins against `buffer` with a bounded wait, and forwards `(position,
+/// envelope)` to `exec_out`. For each `BoundaryStart`, it forwards directly.
 ///
 /// `start_tx_idx` seeds the executor-local record counter: 0 on a fresh
-/// start, the persisted cursor's record count on a resume — the canonical
-/// source delivers from the cursor onward, and the indices this reader
-/// assigns are checked downstream against ABSOLUTE boundary counts.
+/// start, or the persisted cursor's record count on a resume. The canonical
+/// source delivers from the cursor onward, and downstream checks the
+/// indices this reader assigns against absolute boundary counts.
 ///
-/// `recovery_factory`, when wired, turns a join miss into an archive refetch
-/// instead of an immediate death — see [`JoinRecovery`]. It runs once, inside
-/// this thread (the recovery's Aeron resources are thread-bound).
+/// `recovery_factory`, when wired, turns a join miss into an archive
+/// refetch instead of an immediate death; see [`JoinRecovery`]. It runs
+/// once, inside this thread, because the recovery's Aeron resources are
+/// thread-bound.
 pub fn spawn_tx_ordering_reader<O, S>(
     mut tx_ordering_sub: O,
     buffer: JoinBuffer,
@@ -449,14 +454,15 @@ where
                 recovery_factory.and_then(|f| f());
             let mut next_tx_idx = start_tx_idx;
             let mut last_warn_len: usize = 0;
-            // Canonical-id dedup. Under the MDS topology the P sequencers per
+            // Canonical-id dedup. Under the MDS topology, the P sequencers per
             // shard each republish the same `(tx_hash, shard, tx_data_position)`
-            // TxRef onto tx_ordering, so this reader sees P duplicates per
-            // logical tx. Same story for deposits: all M sequencers race to
-            // republish the same `DepositRef(source_hash, …)` onto tx_ordering.
-            // Only the first occurrence drives a join-buffer take + exec
-            // dispatch; the rest are silently dropped. tx_hash and source_hash
-            // share a flat namespace (both B256) so we use one window.
+            // TxRef onto tx_ordering. So this reader sees P duplicates per
+            // logical tx. The same happens for deposits: all M sequencers race
+            // to republish the same `DepositRef(source_hash, …)` onto
+            // tx_ordering. Only the first occurrence drives a join-buffer take
+            // and exec dispatch; the rest are silently dropped. `tx_hash` and
+            // `source_hash` share one flat namespace (both B256), so we use
+            // one window.
             let mut seen_canonical_ids = DedupWindow::new(cfg.dedup_window);
             loop {
                 let (position, msg) = match tx_ordering_sub.next() {
@@ -467,7 +473,7 @@ where
                 match msg {
                     TxOrderingMessage::TxRef(tx_ref) => {
                         if !seen_canonical_ids.first_seen(tx_ref.tx_hash) {
-                            // Duplicate from racing sequencers — drop.
+                            // Duplicate from racing sequencers. Drop it.
                             debug!(
                                 target: "kardamom_executor::reader",
                                 tx_hash = ?tx_ref.tx_hash,
@@ -495,9 +501,9 @@ where
                             }
                         };
 
-                        // Periodic warn — if the buffer grows unboundedly,
-                        // either an A-publisher is racing far ahead of B
-                        // (back-pressure issue) or a leak.
+                        // Periodic warning. If the buffer keeps growing, either
+                        // an A-publisher is racing far ahead of B, a
+                        // back-pressure issue, or there is a leak.
                         let cur = buffer.len();
                         if cur >= cfg.buffer_warn_threshold && cur > last_warn_len * 2 {
                             warn!(
@@ -526,8 +532,9 @@ where
                         // An epoch claims a contiguous slot range: the marker,
                         // then one slot per deposit (see `wire::epoch_slots`).
                         // Dispatching the marker first keeps the exec side's
-                        // per-record counter — the block-boundary alignment key
-                        // — in step without giving the marker a transaction.
+                        // per-record counter in step. This counter is the
+                        // block-boundary alignment key. The marker itself
+                        // gets no transaction.
                         if !seen_canonical_ids.first_seen(epoch.canonical_id()) {
                             debug!(
                                 target: "kardamom_executor::reader",
@@ -549,9 +556,9 @@ where
                         {
                             return Ok(()); // exec thread shutting down
                         }
-                        // The deposits travel INSIDE the epoch record, so
-                        // unlike a DepositRef there is no side-stream join to
-                        // wait on — nothing here can time out or go missing.
+                        // The deposits travel inside the epoch record. Unlike a
+                        // DepositRef, there is no side-stream join to wait on.
+                        // Nothing here can time out or go missing.
                         for deposit in deposits {
                             let tx_idx = next_tx_idx;
                             next_tx_idx = next_tx_idx.next();
@@ -568,12 +575,12 @@ where
                         }
                     }
                     TxOrderingMessage::DepositRef(dep_ref) => {
-                        // Retired by the epoch switch-over: deposits now
-                        // travel INSIDE an epoch record, so there is no
-                        // `tx_deposits` envelope left to join against. A ref
-                        // here means the stream predates the cutover (this is
-                        // a breaking chain change, not a rolling upgrade), so
-                        // fail loudly rather than silently drop a deposit.
+                        // Retired by the epoch switch-over. Deposits now travel
+                        // inside an epoch record, so there is no `tx_deposits`
+                        // envelope left to join against. A ref here means the
+                        // stream predates the cutover. This is a breaking
+                        // chain change, not a rolling upgrade. So fail loudly
+                        // instead of silently dropping a deposit.
                         tracing::error!(
                             target: "kardamom_executor::reader",
                             source_hash = ?dep_ref.source_hash,
@@ -603,16 +610,16 @@ where
 }
 
 /// Spin-wait for `(sequencer_id, session_id, tx_data_position)` to appear in
-/// `buffer`, returning `Some(env)` on success or `None` after `timeout`.
-/// Join a `TxRef` against the buffer with the full join budget, interleaving
+/// `buffer`. Return `Some(env)` on success, or `None` after `timeout`.
+/// Join a `TxRef` against the buffer with the full join budget, mixing in
 /// bounded archive-refetch attempts when a [`JoinRecovery`] is wired.
 ///
-/// Timeline: wait `join_refetch_after` in-band (covers ordinary publisher
-/// lag); on a miss, refetch the missing range from the durability archives
-/// and keep waiting, repeating until `join_timeout` is spent. Without a
-/// recovery this degenerates to today's single bounded wait. A refetch
-/// error is non-fatal here (endpoints rotate inside the impl; the final
-/// arbiter stays the join timeout).
+/// Timeline: wait `join_refetch_after` in-band, to cover ordinary publisher
+/// lag. On a miss, refetch the missing range from the durability archives
+/// and keep waiting, repeating until `join_timeout` runs out. Without a
+/// recovery, this becomes a single bounded wait. A refetch error is
+/// non-fatal here; endpoints rotate inside the implementation, and the
+/// join timeout stays the final arbiter.
 fn join_envelope(
     buffer: &JoinBuffer,
     recovery: &mut Option<Box<dyn JoinRecovery>>,
@@ -641,7 +648,7 @@ fn join_envelope(
     }
     loop {
         let Some(r) = recovery.as_mut() else {
-            return None; // no recovery wired: the single wait above was the budget
+            return None; // no recovery wired: the wait above was the whole budget
         };
         let now = Instant::now();
         if now >= deadline {
@@ -686,8 +693,8 @@ fn join_envelope(
     }
 }
 
-/// Spin until the tx_data envelope keyed by
-/// `(sequencer_id, session_id, tx_data_position)` lands on the
+/// Spin until the tx_data envelope, keyed by
+/// `(sequencer_id, session_id, tx_data_position)`, lands on the
 /// [`JoinBuffer`], or the timeout elapses.
 fn wait_for_envelope(
     buffer: &JoinBuffer,
@@ -773,8 +780,8 @@ mod tests {
         }
     }
 
-    /// Build a `TxDataLoc` with session `0` (the single-publisher default used
-    /// by tests that don't model concurrent ingress).
+    /// Build a `TxDataLoc` with session `0`. This is the single-publisher
+    /// default for tests that do not model concurrent ingress.
     fn loc(off: i32) -> TxDataLoc {
         TxDataLoc::new(0, pos(off))
     }
@@ -883,9 +890,9 @@ mod tests {
         }
     }
 
-    /// An epoch expands to the marker plus one dispatch per deposit, with
-    /// `tx_idx` running consecutively across the whole range — that contiguity
-    /// is what the exec side's boundary alignment counts on.
+    /// An epoch expands to the marker plus one dispatch per deposit. `tx_idx`
+    /// runs consecutively across the whole range. The exec side's boundary
+    /// alignment depends on that contiguity.
     #[test]
     fn channel_b_reader_expands_an_epoch_into_marker_plus_deposits() {
         let deposits: Vec<Deposit> = (0..3)
@@ -959,7 +966,7 @@ mod tests {
         }
     }
 
-    /// A duplicate epoch from a racing sequencer must dispatch NOTHING — a
+    /// A duplicate epoch from a racing sequencer must dispatch nothing. A
     /// second expansion would double-apply every deposit in it.
     #[test]
     fn channel_b_reader_drops_a_duplicate_epoch() {
@@ -996,7 +1003,7 @@ mod tests {
         assert_eq!(out.len(), 2, "one marker + one deposit, not two of each");
     }
 
-    /// Race test: `TxRef` arrives BEFORE its envelope. The B reader spins
+    /// Race test: `TxRef` arrives before its envelope. The B reader spins,
     /// and picks it up once the A reader inserts.
     #[test]
     fn channel_b_reader_tolerates_a_publisher_lag() {
@@ -1070,8 +1077,8 @@ mod tests {
         ));
     }
 
-    /// Duplicate `TxRef`s (the MDS racing-sequencer republications) collapse
-    /// to a single exec dispatch; the join-buffer entry is taken only once.
+    /// Duplicate `TxRef`s, from MDS racing-sequencer republications, collapse
+    /// to a single exec dispatch. The join-buffer entry is taken only once.
     #[test]
     fn channel_b_reader_dedups_racing_sequencer_txrefs() {
         let signer = PrivateKeySigner::random();
@@ -1121,12 +1128,13 @@ mod tests {
         assert_eq!(w.fifo.len(), 2);
     }
 
-    /// I-A core proof: under active/active ingress, two publishers on one shard
-    /// have independent Aeron term spaces, so they can emit fragments at the
-    /// SAME `(term_id, term_offset)`. The join key carries `session_id`, so each
-    /// `TxRef` still resolves to its own envelope — no overwrite, no cross-wire.
-    /// Pre-1a (key was `(shard, position)`) the second insert would clobber the
-    /// first and the executor would join the wrong bytes.
+    /// Core proof for the I-A invariant. Under active/active ingress, two
+    /// publishers on one shard have independent Aeron term spaces. So they can
+    /// emit fragments at the same `(term_id, term_offset)`. The join key
+    /// carries `session_id`, so each `TxRef` still resolves to its own
+    /// envelope: no overwrite, no cross-wire. Before this fix, the key was
+    /// `(shard, position)`, and the second insert would overwrite the first;
+    /// the executor would then join the wrong bytes.
     #[test]
     fn join_buffer_distinguishes_colliding_positions() {
         let signer = PrivateKeySigner::random();
@@ -1146,17 +1154,18 @@ mod tests {
         assert_eq!(got_b.tx_hash, env_b.tx_hash);
         assert_eq!(buf.len(), 0);
 
-        // A wrong-session lookup misses (it would have silently returned the
-        // wrong envelope under the old `(shard, position)` key).
+        // A wrong-session lookup misses. Under the old `(shard, position)` key,
+        // it would have silently returned the wrong envelope.
         buf.insert(3, 100, p, env_a.clone());
         assert!(buf.take(3, 999, p).is_none(), "wrong session must miss");
         assert!(buf.take(3, 100, p).is_some());
     }
 
-    /// I-A integration through the real reader threads: two tx_data fragments on
-    /// one shard at the SAME `BPosition` but different publisher sessions (the
-    /// active/active collision). Two `TxRef`s — each carrying its publisher's
-    /// session — must each join the correct envelope, in canonical order.
+    /// I-A integration test, through the real reader threads. Two tx_data
+    /// fragments on one shard share the same `BPosition`, but have different
+    /// publisher sessions: the active/active collision. Two `TxRef`s, each
+    /// carrying its publisher's session, must each join the correct envelope,
+    /// in canonical order.
     #[test]
     fn reader_joins_two_sessions_at_same_position() {
         let signer = PrivateKeySigner::random();
@@ -1165,7 +1174,8 @@ mod tests {
         let buf = JoinBuffer::new();
 
         // One tx_data reader for shard 5, fed two colliding-position fragments
-        // from two distinct sessions (what two active/active ingresses produce).
+        // from two distinct sessions. This is what two active/active
+        // ingresses produce.
         let a = VecTxDataSub {
             sequencer_id: 5,
             queue: VecDeque::from(vec![
@@ -1180,7 +1190,8 @@ mod tests {
         assert_eq!(buf.len(), 2, "distinct sessions must both be buffered");
 
         // Canonical order interleaves them: env_b's ref first, then env_a's.
-        // Each ref carries its session, so the join keys on session not position.
+        // Each ref carries its session, so the join keys on session, not
+        // position.
         let b = VecTxOrderingSub {
             queue: VecDeque::from(vec![
                 Ok((

@@ -1,6 +1,6 @@
-//! Checkpoint manifests: what a checkpoint's bytes ARE, and the shared
-//! verify/publish helpers every path that adopts or emits an image goes
-//! through (the recovery-C hardening; see [`CheckpointManifest`]).
+//! Checkpoint manifests: what a checkpoint's bytes are. Also the shared
+//! verify and publish helpers that every path adopting or emitting an
+//! image goes through. See [`CheckpointManifest`].
 
 use std::path::{Path, PathBuf};
 
@@ -11,29 +11,34 @@ use crate::error::StateError;
 
 use super::checkpoint_data_file;
 
-/// Sidecar written next to every checkpoint: what these bytes ARE.
+/// A sidecar file written next to every checkpoint: it says what these
+/// bytes are.
 ///
-/// A checkpoint is a bare mdbx image. Renaming it into place makes it atomic
-/// against torn writes, but the file itself is entirely self-UNdescribing:
-/// nothing binds it to a chain, and the peer transfer is plain HTTP with no
-/// checksum. Three failures were therefore silent — bytes corrupted at rest
-/// or in flight, a truncated fetch, and (observed in the recovery-C campaign)
-/// a checkpoint from a PREVIOUS chain adopted by a fresh node, which then
-/// requested a canonical index that chain never had and looped forever.
+/// A checkpoint is a bare mdbx image. Renaming it into place makes it
+/// atomic against torn writes, but the file itself does not describe
+/// itself. Nothing binds it to a chain, and the peer transfer is plain
+/// HTTP with no checksum. Without a manifest, three failures were
+/// silent: bytes corrupted at rest or in flight, a truncated fetch, and
+/// a checkpoint from a previous chain adopted by a fresh node. That last
+/// case made the node request a canonical index its chain never had, and
+/// loop forever.
 ///
-/// Since #143 the VALIDATOR adopts peer checkpoints and bootstraps its trie
-/// from them, so a bad adoption becomes its state — and its own shadow-check
-/// cannot object, because that rebuilds from the same adopted mirror.
+/// The validator adopts peer checkpoints and bootstraps its trie from
+/// them, so a bad adoption becomes its state. Its own shadow-check
+/// cannot catch this, because that check rebuilds from the same adopted
+/// mirror.
 ///
-/// Format is flat `key=value` lines: no serde dependency, trivially readable
-/// by an operator, and forward-compatible (unknown keys are ignored).
+/// The format is flat `key=value` lines. This needs no serde dependency,
+/// is easy for an operator to read, and is forward-compatible: unknown
+/// keys are ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointManifest {
-    /// Committed block the image was taken at (matches the file name).
+    /// The committed block the image was taken at. This matches the file name.
     pub block: u64,
     /// keccak256 of the mdbx image bytes.
     pub image_keccak: B256,
-    /// `KEY_GENESIS_DIGEST` from the image — the chain-identity binding.
+    /// `KEY_GENESIS_DIGEST` from the image. This binds the image to a
+    /// chain identity.
     pub genesis_digest: B256,
 }
 
@@ -74,17 +79,21 @@ impl CheckpointManifest {
     }
 }
 
-/// Manifest path for a checkpoint: `<checkpoint>/MANIFEST`, INSIDE the
-/// checkpoint directory. Living inside means the single directory rename
-/// publishes image and manifest atomically, and any copy of the checkpoint —
-/// peer fetch, chaos re-replication, an operator's rsync — carries its
-/// manifest by construction. A sibling file would be silently dropped by
-/// exactly the copy paths the manifest exists to protect.
+/// The manifest path for a checkpoint: `<checkpoint>/MANIFEST`, inside
+/// the checkpoint directory.
+///
+/// Because the manifest lives inside the directory, the single directory
+/// rename publishes the image and manifest atomically. Any copy of the
+/// checkpoint, such as a peer fetch, re-replication, or an operator's
+/// rsync, carries its manifest by construction. A sibling file would be
+/// silently dropped by exactly the copy paths the manifest exists to
+/// protect.
 pub fn manifest_path(checkpoint: &Path) -> PathBuf {
     checkpoint.join("MANIFEST")
 }
 
-/// keccak256 of a file's bytes, read in chunks (images are hundreds of MB).
+/// The keccak256 of a file's bytes, read in chunks. Images can be
+/// hundreds of MB.
 pub(crate) fn file_keccak(path: &Path) -> Result<B256, StateError> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
@@ -100,7 +109,8 @@ pub(crate) fn file_keccak(path: &Path) -> Result<B256, StateError> {
     Ok(hasher.finalize())
 }
 
-/// Read the genesis digest an env was seeded with (the chain-identity key).
+/// Read the genesis digest an env was seeded with. This is the
+/// chain-identity key.
 pub(crate) fn stored_genesis_digest(env: &StateEnv) -> Result<B256, StateError> {
     let txn = env.raw().begin_ro_sync()?;
     let meta = txn.open_db(Some(crate::schema::TABLE_META))?;
@@ -112,8 +122,8 @@ pub(crate) fn stored_genesis_digest(env: &StateEnv) -> Result<B256, StateError> 
     }
 }
 
-/// Read a checkpoint's manifest without hashing the image (the serve path
-/// only needs to describe what it is about to send).
+/// Read a checkpoint's manifest without hashing the image. The serve
+/// path only needs to describe what it is about to send.
 pub fn read_manifest(checkpoint: &Path) -> Result<CheckpointManifest, StateError> {
     let mpath = manifest_path(checkpoint);
     let text = std::fs::read_to_string(&mpath)
@@ -121,17 +131,19 @@ pub fn read_manifest(checkpoint: &Path) -> Result<CheckpointManifest, StateError
     CheckpointManifest::parse(&text)
 }
 
-/// The two refusal checks every checkpoint image must pass before it can
-/// become this node's state — integrity (the bytes hash to what the source
-/// claims) and chain identity (the image belongs to this node's chain).
-/// Shared by the disk-restore path ([`verify_checkpoint`], hash claimed by
-/// the MANIFEST) and the peer-fetch path (hash claimed by the peer's
-/// headers): this is the recovery-C hardening, and a one-sided change here
-/// silently weakens whichever path stops getting it.
+/// The two refusal checks every checkpoint image must pass before it
+/// can become this node's state: integrity, meaning the bytes hash to
+/// what the source claims, and chain identity, meaning the image
+/// belongs to this node's chain.
 ///
-/// `image` names the image and `claimant` the source of the expected hash,
-/// for the refusal messages (tests assert on the CORRUPT / DIFFERENT CHAIN
-/// markers).
+/// The disk-restore path ([`verify_checkpoint`], with the hash claimed
+/// by the MANIFEST) and the peer-fetch path (with the hash claimed by
+/// the peer's headers) share this function. A one-sided change here
+/// would silently weaken whichever path stops using it.
+///
+/// `image` names the image, and `claimant` names the source of the
+/// expected hash, for the refusal messages. Tests check these messages
+/// for the CORRUPT and DIFFERENT CHAIN markers.
 pub(crate) fn check_image_identity(
     image: &str,
     claimant: &str,
@@ -160,11 +172,13 @@ pub(crate) fn check_image_identity(
     Ok(())
 }
 
-/// Publish a staged checkpoint: manifest INSIDE the tmp entry, then one
-/// rename — image and manifest become visible atomically, so an observable
-/// checkpoint is always verifiable and self-contained under any copy
-/// mechanism. A crash before the rename leaves only the hidden tmp entry
-/// (swept by `sweep_stale_tmp` / re-fetched next time).
+/// Publish a staged checkpoint. Write the manifest inside the temp
+/// entry, then do one rename. The image and manifest become visible
+/// atomically, so an observable checkpoint is always verifiable and
+/// self-contained, under any copy mechanism.
+///
+/// A crash before the rename leaves only the hidden temp entry. This is
+/// cleaned up by `sweep_stale_tmp`, or re-fetched next time.
 pub(crate) fn publish_checkpoint(
     tmp: &Path,
     dest: &Path,
@@ -175,7 +189,7 @@ pub(crate) fn publish_checkpoint(
     Ok(())
 }
 
-/// Verify a checkpoint image against its manifest, and (when supplied)
+/// Verify a checkpoint image against its manifest, and, when supplied,
 /// against the chain the caller expects. Returns the manifest.
 pub fn verify_checkpoint(
     checkpoint: &Path,

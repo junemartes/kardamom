@@ -1,12 +1,12 @@
 //! mdbx Environment opener and table-handle cache.
 //!
-//! Every other module in this crate goes through `StateEnv` for the env
-//! handle. Geometry is set once at open time per `geometry.rs`.
+//! Every other module in this crate uses `StateEnv` for the env handle.
+//! Geometry is set once, at open time, as described in `geometry.rs`.
 //!
-//! We use the `signet-libmdbx` 0.8 binding (MIT/Apache). The
-//! environment runs in the synchronized transaction mode (`begin_ro_sync` /
-//! `begin_rw_sync`) so the writer thread + executor's RO snapshot thread can
-//! share handles safely.
+//! This crate uses the `signet-libmdbx` 0.8 binding (MIT/Apache). The
+//! environment runs in synchronized transaction mode (`begin_ro_sync` and
+//! `begin_rw_sync`). This lets the writer thread and the executor's
+//! read-only snapshot thread share handles safely.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,10 +23,11 @@ use crate::schema::ALL_TABLES;
 /// Durability mode passed through to libmdbx.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
-    /// `Durable` mode (fdatasync on commit). Use in production.
+    /// `Durable` mode. It calls fdatasync on each commit. Use it in production.
     Durable,
-    /// `SafeNoSync` — commit returns after page-table flush but skips fdatasync.
-    /// Use only in tests; combined with PLP NVMe this is unsafe on real hosts.
+    /// `SafeNoSync` mode. Commit returns after the page-table flush, but
+    /// skips fdatasync. Use it only in tests. This mode is unsafe on real
+    /// hosts, even with power-loss-protected (PLP) NVMe.
     SafeNoSync,
 }
 
@@ -64,25 +65,31 @@ impl StateEnvBuilder {
         self
     }
 
-    /// Open the environment READ-ONLY: no writes, no table creation, and no
-    /// directory creation. Safe to point at a state dir another process is
-    /// actively writing (mdbx is multi-process; a reader takes an MVCC
-    /// snapshot and never blocks the writer), which is how tooling inspects a
-    /// LIVE node — `kardamom-statecheck` and the e2e suite both rely on it.
+    /// mdbx WRITEMAP mode. Dirty pages mutate the map directly, and commit
+    /// skips the per-page pwrite pass. In one measurement, this cut commit
+    /// time from 30-45 ms to about 4 ms for a 16k-value block under
+    /// `SafeNoSync`.
     ///
-    /// The env must already exist and be initialised; `Durability` is
-    /// irrelevant in this mode (nothing syncs).
-    /// mdbx WRITEMAP: dirty pages mutate the map directly and commit
-    /// skips the per-page pwrite pass — measured 30-45ms -> ~4ms for a
-    /// 16k-value block commit under SafeNoSync. The trade: any wild
-    /// write in THIS process can corrupt the map (no copy-on-write
-    /// isolation), so this is opt-in — benchmarking and deployments
-    /// that accept the blast radius. OFF by default.
+    /// The trade-off: a stray write in this process can corrupt the map,
+    /// because there is no copy-on-write isolation. This mode is opt-in,
+    /// for benchmarking and for deployments that accept that risk. It is
+    /// off by default.
     pub fn write_map(mut self, yes: bool) -> Self {
         self.write_map = yes;
         self
     }
 
+    /// Open the environment as read-only. This mode has no writes, no table
+    /// creation, and no directory creation.
+    ///
+    /// This is safe even if another process is actively writing to the same
+    /// state directory. mdbx supports multiple processes: a reader takes an
+    /// MVCC snapshot and never blocks the writer. Tooling uses this to
+    /// inspect a live node. Both `kardamom-statecheck` and the end-to-end
+    /// test suite rely on it.
+    ///
+    /// The env must already exist and be initialized. `Durability` has no
+    /// effect in this mode, because nothing syncs.
     pub fn read_only(mut self, yes: bool) -> Self {
         self.read_only = yes;
         self
@@ -124,10 +131,11 @@ impl StateEnvBuilder {
 
         let env = builder.open(&self.path)?;
 
-        // Create every named DB once so handles are cached in the environment
-        // and a downstream RO txn does not have to call `create_db`. Skipped
-        // read-only: the tables already exist (the writing process made them)
-        // and an RW txn is impossible in that mode.
+        // Create every named DB once, so handles are cached in the
+        // environment. A downstream read-only transaction then does not
+        // need to call `create_db`. Skip this step in read-only mode: the
+        // tables already exist, and a read-write transaction is not
+        // possible in that mode.
         if !self.read_only {
             let txn = env.begin_rw_sync()?;
             for name in ALL_TABLES {
@@ -143,7 +151,7 @@ impl StateEnvBuilder {
     }
 }
 
-/// Shared handle to an open mdbx environment. Cheap to clone.
+/// A shared handle to an open mdbx environment. It is cheap to clone.
 #[derive(Debug, Clone)]
 pub struct StateEnv {
     pub(crate) env: Arc<Environment>,

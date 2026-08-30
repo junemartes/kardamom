@@ -91,7 +91,7 @@ fn receipt_roundtrip() {
 
 #[test]
 fn receipt_roundtrip_contract_creation() {
-    // CREATE tx variant: `to` is None, `contract_address` is Some.
+    // CREATE transaction variant: `to` is `None`, `contract_address` is `Some`.
     let v = Receipt {
         tx_type: kardamom_types::TX_TYPE_LEGACY,
         tx_idx: BPosition {
@@ -158,7 +158,7 @@ fn boundary_roundtrip() {
     };
     assert_eq!(roundtrip(&start), start);
 
-    // BlockBoundary has NO state_root_commitment field.
+    // BlockBoundary has no state_root_commitment field.
     let end = BlockBoundary {
         block_number: 7,
         end_tx_idx: BPosition {

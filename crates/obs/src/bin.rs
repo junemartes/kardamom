@@ -1,12 +1,12 @@
 //! Process scaffolding shared by every kardamom service binary: tracing
 //! init and shutdown-signal waiting.
 //!
-//! Every service links `kardamom-obs` already (for the Prometheus exporter),
-//! which makes this the one home light enough for all of them — the previous
-//! copies lived in `kardamom_engine::bin_support` (too heavy a dependency for
-//! ingress/sequencer/da-watcher) and as private per-bin duplicates that had
-//! started to drift (the batcher's copy hardcoded "info" and ignored
-//! `RUST_LOG`; two bins missed SIGTERM entirely).
+//! Every service already links `kardamom-obs` for the Prometheus exporter,
+//! so this is a light enough home for all of them. The previous copies lived
+//! in `kardamom_engine::bin_support` (too heavy a dependency for
+//! ingress, sequencer, and da-watcher) and as private per-bin duplicates
+//! that had started to drift: the batcher's copy hardcoded "info" and
+//! ignored `RUST_LOG`, and two bins missed SIGTERM entirely.
 
 /// Install the fmt tracing subscriber: `RUST_LOG` if set, "info" otherwise.
 pub fn init_tracing() {

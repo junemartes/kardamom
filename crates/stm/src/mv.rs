@@ -1,18 +1,19 @@
-//! Multi-version state cache (spec §P2): per (address) and (address, slot),
-//! a small version list `(tx_index, value)`. A read at index i sees the
-//! highest write BELOW i, else the block-input view — the same layering
-//! `ExecScope`'s commit cache encodes sequentially, made concurrent.
+//! Multi-version state cache: for each address, and each
+//! (address, slot) pair, a small version list `(tx_index, value)`. A read
+//! at index i sees the highest write below i, or else the block-input
+//! view. This is the same layering `ExecScope`'s commit cache uses
+//! sequentially, made concurrent.
 //!
-//! Under pessimistic scheduling, two txs touching the same cell are ordered
-//! by a DAG edge, so version lists are effectively written in index order
-//! and readers never race their own predecessors. The lists still
-//! sorted-insert and reads still record `(cell, version-seen)` — the
-//! validation pass replays those records against the final lists, which is
-//! what catches a prediction miss (false independence) and triggers the
-//! sequential-fallback invariant.
+//! Under pessimistic scheduling, a DAG edge orders any two transactions
+//! that touch the same cell, so version lists are effectively written in
+//! index order and readers never race their own predecessors. The lists
+//! still use a sorted insert, and reads still record `(cell,
+//! version-seen)`. The validation pass replays those records against the
+//! final lists. This catches a prediction miss (false independence) and
+//! triggers the sequential-fallback invariant.
 //!
-//! The fee sink is NOT published here (the `Accumulator` boundary): every
-//! worker reads its block-start value, and the commit pass materializes the
+//! The fee sink is not published here (the `Accumulator` boundary): every
+//! worker reads its block-start value, and the commit pass computes the
 //! exact prefix sums instead.
 
 use std::sync::RwLock;
@@ -32,8 +33,8 @@ pub struct AccountVersion {
     pub code_hash: B256,
 }
 
-/// What a read observed: the publishing tx's index, or `None` for the
-/// block-input view. Recorded per read, replayed at validation.
+/// What a read observed: the publishing transaction's index, or `None` for
+/// the block-input view. Recorded per read, replayed at validation.
 pub type SeenVersion = Option<u32>;
 
 /// A recorded read for validation.
@@ -41,23 +42,23 @@ pub type SeenVersion = Option<u32>;
 pub enum ReadRecord {
     Account(Address, SeenVersion),
     Slot(Address, B256, SeenVersion),
-    /// Bytecode lookup. Content-addressed, so there is no version — but a
-    /// MISS that a later CREATE fills is a real staleness: the reader
-    /// executed against absent code. `true` = served from the cache.
+    /// Bytecode lookup. Content-addressed, so there is no version. A miss
+    /// that a later CREATE fills is real staleness: the reader executed
+    /// against absent code. `true` means the cache served the read.
     Code(B256, bool),
 }
 
-/// Shard count. Widening this to 1024 was tried and REVERTED: the theory
-/// was that ~180 live cells over 64 shards made workers bounce each
-/// other's lock lines, but it measured neutral (78ms vs 76ms), so the
-/// contention is not shard collisions and the extra 64KB/block bought
-/// nothing.
+/// Shard count. Widening this to 1024 was tested: the theory was that
+/// about 180 live cells over 64 shards made workers bounce each other's
+/// lock lines. The result was neutral, so shard collisions are not the
+/// cause of the contention, and the extra memory per block buys nothing.
+/// Do not widen this without a new measurement.
 const SHARDS: usize = 64;
 
 fn shard_of(bytes: &[u8]) -> usize {
-    // Addresses and slot keys are high-entropy in their LOW bytes (they
-    // are hashes or counters), and folding only the first 8 was clustering
-    // structured addresses. Fold the tail instead.
+    // Addresses and slot keys are high-entropy in their low bytes (they
+    // are hashes or counters). Folding only the first 8 bytes clustered
+    // structured addresses, so fold the tail instead.
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in bytes.iter().rev().take(8) {
         h ^= *b as u64;
@@ -75,8 +76,8 @@ type Shard<K, V> = RwLock<FastMap<K, Versions<V>>>;
 pub struct MvCache {
     accounts: Vec<Shard<Address, AccountVersion>>,
     storage: Vec<Shard<(Address, B256), U256>>,
-    /// Content-addressed CREATE bytecode — no versioning (a hash IS its
-    /// content), append-only.
+    /// Content-addressed CREATE bytecode. No versioning is needed, since
+    /// a hash is its own content. Append-only.
     code: RwLock<FastMap<B256, Bytes>>,
 }
 
@@ -99,20 +100,20 @@ impl MvCache {
         }
     }
 
-    /// Publish one tx's writes in the ONLY safe order: code and storage
-    /// first, ACCOUNTS LAST.
+    /// Publish one transaction's writes in the only safe order: code and
+    /// storage first, accounts last.
     ///
-    /// A reader reaches a contract's code and storage only THROUGH its
-    /// account (revm loads `basic` → `code_by_hash` → `SLOAD`), so making
-    /// the account version the last thing published gives a
-    /// happens-before: whoever sees the new account finds its code and
-    /// storage already there. The reverse order (accounts first) let a
-    /// concurrent reader load a freshly-CREATEd account carrying
-    /// `code_hash = H`, miss `H` in the cache, fall back to the snapshot,
-    /// and execute against EMPTY code — a silent divergence that read
-    /// validation cannot see (its account read was legitimately current,
-    /// and code reads carry no version). `skip_account` is the fee sink
-    /// (Accumulator: never published).
+    /// A reader reaches a contract's code and storage only through its
+    /// account (revm loads `basic`, then `code_by_hash`, then `SLOAD`).
+    /// Publishing the account version last gives a happens-before order:
+    /// whoever sees the new account also finds its code and storage
+    /// already there. The reverse order let a concurrent reader load a
+    /// freshly created account with `code_hash = H`, miss `H` in the
+    /// cache, fall back to the snapshot, and execute against empty code.
+    /// This was a silent divergence that read validation could not see,
+    /// because the account read was legitimately current and code reads
+    /// carry no version. `skip_account` is the fee sink, which this
+    /// method never publishes (the `Accumulator` boundary).
     pub fn publish_write_set(&self, idx: u32, ws: &WriteSet, skip_account: Address) {
         for (hash, code) in ws.code.iter() {
             self.publish_code(*hash, Bytes::clone(code));
@@ -136,9 +137,9 @@ impl MvCache {
         }
     }
 
-    /// Publish one tx's account write. Sorted-insert keeps correctness
-    /// even if a prediction miss let writers race out of index order
-    /// (validation still convicts the miss).
+    /// Publish one transaction's account write. The sorted insert keeps
+    /// results correct even if a prediction miss let writers race out of
+    /// index order — validation still catches the miss.
     pub fn publish_account(&self, idx: u32, addr: Address, v: AccountVersion) {
         let mut g = self.accounts[shard_of(addr.as_slice())]
             .write()
@@ -189,20 +190,21 @@ impl MvCache {
         (p > 0).then(|| list[p - 1])
     }
 
-    /// Between-block scrub for POOLED REUSE: drop every entry but keep
-    /// every allocation — shard tables, version vecs' buffers are gone
-    /// (entries dropped) but the maps' capacity stays, so the next
-    /// block's publishes re-fill warm pages instead of mapping fresh
-    /// ones. Caller guarantees quiescence (the reaper scrubs only
-    /// unwrapped caches).
+    /// Between-block scrub for pooled reuse: drop every entry but keep
+    /// every allocation. Shard tables and version-vec buffers lose their
+    /// entries, but the maps keep their capacity, so the next block's
+    /// publishes re-fill warm pages instead of mapping fresh ones. The
+    /// caller must guarantee quiescence (the reaper scrubs only unwrapped
+    /// caches).
     pub fn scrub(&self) {
-        // Keep KEYS and their version-vec buffers: hot cells recur
-        // block after block, so an entry with a cleared vec means the
-        // next block's publish PUSHES into a warm buffer instead of
-        // allocating (a cell with no versions reads/validates exactly
-        // like an absent cell). A drifting keyset would grow the maps
-        // unboundedly — the size cap falls back to a full clear.
-        const KEEP_KEYS_CAP: usize = 1024; // per shard; ~64 shards
+        // Keep the keys and their version-vec buffers. Hot cells recur
+        // block after block, so an entry with a cleared vec lets the
+        // next block's publish push into a warm buffer instead of
+        // allocating a new one (a cell with no versions reads and
+        // validates exactly like an absent cell). A drifting key set
+        // would grow the maps without bound, so past the size cap this
+        // falls back to a full clear.
+        const KEEP_KEYS_CAP: usize = 1024; // per shard; about 64 shards
         for sh in &self.accounts {
             let mut g = sh.write().expect("mv poisoned");
             if g.len() > KEEP_KEYS_CAP {
@@ -226,11 +228,11 @@ impl MvCache {
         self.code.write().expect("mv poisoned").clear();
     }
 
-    /// Materialize the block's FINAL write view: per cell, the highest
-    /// version (== the last writer's value == exactly what the commit
-    /// fold computes), plus all CREATEd code. The repair path uses this
-    /// to turn a predecessor's mv layer into a mergeable delta; it is
-    /// fold-cost and only runs on the rare paths that need a
+    /// Compute the block's final write view: for each cell, the highest
+    /// version (the last writer's value, exactly what the commit fold
+    /// computes), plus all CREATEd code. The repair path uses this to
+    /// turn a predecessor's mv layer into a mergeable delta. It costs a
+    /// full fold and only runs on the rare paths that need a
     /// `PendingDelta` shape instead of probing the cache directly.
     pub fn final_delta(&self) -> kardamom_exec_core::delta::PendingDelta {
         let mut d = kardamom_exec_core::delta::PendingDelta::new();
@@ -265,8 +267,9 @@ impl MvCache {
     }
 
     /// Replay one read record against the final lists: does the version the
-    /// tx observed still equal the highest version below it? A mismatch
-    /// means a lower-index tx published AFTER the read — false independence.
+    /// transaction observed still equal the highest version below it? A
+    /// mismatch means a lower-index transaction published after the read
+    /// — false independence.
     pub fn validate(&self, idx: u32, r: &ReadRecord) -> bool {
         match r {
             ReadRecord::Account(addr, seen) => {
@@ -275,8 +278,8 @@ impl MvCache {
             ReadRecord::Slot(addr, key, seen) => {
                 self.read_slot(idx, addr, key).map(|(i, _)| i) == *seen
             }
-            // A miss that the cache can now serve means the reader ran
-            // against code a concurrent CREATE had not published yet.
+            // A miss the cache can now serve means the reader ran
+            // against code that a concurrent CREATE had not published yet.
             ReadRecord::Code(hash, hit) => *hit || !self.has_code(hash),
         }
     }
@@ -321,13 +324,14 @@ mod tests {
         assert_eq!(mv.read_slot(10, &a, &k).unwrap(), (9, U256::from(90u64)));
     }
 
-    /// REGRESSION (silent divergence): a reader that can see a
-    /// freshly-CREATEd account MUST be able to see its code. Publishing
-    /// accounts before code let a concurrent tx load the account, miss the
-    /// hash, fall back to the snapshot, and execute against EMPTY code —
-    /// and validation could not catch it (the account read was current;
-    /// code reads carry no version). The ordered publish is the fix; this
-    /// hammers the window a wrong order would open.
+    /// Regression test for a silent divergence: a reader that can see a
+    /// freshly created account must also be able to see its code.
+    /// Publishing accounts before code let a concurrent transaction load
+    /// the account, miss the hash, fall back to the snapshot, and execute
+    /// against empty code. Validation could not catch this, because the
+    /// account read was current and code reads carry no version. The
+    /// ordered publish is the fix; this test hammers the window a wrong
+    /// order would open.
     #[test]
     fn account_version_never_precedes_its_code() {
         use kardamom_exec_core::delta::WriteSet;
@@ -381,7 +385,7 @@ mod tests {
         // code and must be wounded.
         mv.publish_code(hash, Bytes::from_static(&[0x00]));
         assert!(!mv.validate(3, &rec));
-        // A read that HIT the cache is never stale.
+        // A read that hit the cache is never stale.
         assert!(mv.validate(3, &ReadRecord::Code(hash, true)));
     }
 
@@ -397,7 +401,7 @@ mod tests {
             !mv.validate(6, &r),
             "a lower-index write invalidates the read"
         );
-        // A read that DID see tx 4 validates.
+        // A read that did see tx 4 validates.
         assert!(mv.validate(6, &ReadRecord::Account(a, Some(4))));
     }
 }

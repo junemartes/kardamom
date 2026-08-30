@@ -1,6 +1,6 @@
-//! Property: full pipeline round-trip — encode → pack → reconstruct — for
-//! arbitrary block payloads. Catches subtle interactions between zstd, blob
-//! padding, and KAR1 framing.
+//! Property: a full pipeline round trip (encode, pack, reconstruct) for
+//! arbitrary block payloads. This catches subtle interactions between
+//! zstd, blob padding, and KAR1 framing.
 
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
@@ -60,7 +60,7 @@ fn to_block_frame(b: &ClosedBlock) -> BlockFrame {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
-    /// Compressed round-trip for variable block / tx / payload shapes.
+    /// A compressed round trip for variable block, tx, and payload shapes.
     #[test]
     fn full_pipeline_compressed_roundtrip(
         n_blocks in 1usize..6,

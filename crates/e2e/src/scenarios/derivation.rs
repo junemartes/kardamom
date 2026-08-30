@@ -1,18 +1,18 @@
-//! S10 — L1-origin deposit derivation.
+//! L1-origin deposit derivation.
 //!
 //! The rules under test come from
 //! `docs/agents/l1-origin-deposit-derivation-spec.md`:
 //!
-//!   1. the origin is monotonic,
-//!   2. it never skips an L1 block,
-//!   3. an epoch's deposits LEAD the block they open,
-//!   4. the origin stays at or below L1 finality,
+//!   1. the origin is monotonic.
+//!   2. it never skips an L1 block.
+//!   3. an epoch's deposits lead the block they open.
+//!   4. the origin stays at or below L1 finality.
 //!   5. bounded lag is a liveness alarm.
 //!
-//! These are properties of the CHAIN, not of any one component, so they are
-//! asserted against persisted block headers and executed receipts rather than
-//! against logs or metrics. A component could log the right thing and still
-//! build the wrong chain.
+//! These are properties of the chain, not of any one component. So this
+//! test checks them against persisted block headers and executed receipts,
+//! not against logs or metrics. A component could log the right thing and
+//! still build the wrong chain.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -34,19 +34,14 @@ pub struct BlockOrigin {
     pub l2_timestamp: u64,
 }
 
-/// Read every persisted block header, in block order.
+/// Like [`read_block_origins`], but wait until the header for
+/// `block_number` has actually been committed.
 ///
-/// Read-only mdbx open: an MVCC snapshot that never blocks the writer, the
-/// same seam `read_validator_state_root` uses. Nothing exposes headers over
-/// RPC (there is no `eth_getBlockByNumber`), so the state DB is the only
-/// place the origin is observable — which is itself worth knowing.
-/// [`read_block_origins`], but wait until the header for `block_number` has
-/// actually been committed.
-///
-/// A receipt is published at EXECUTION time; the header lands only when the
-/// block COMMITS at the next sealer boundary. Anything that learns a block
-/// number from a receipt and then reads the headers table is therefore racing
-/// that commit, and must wait rather than assume.
+/// A receipt is published when the transaction executes, but the header
+/// lands only when the block commits at the next sealer boundary.
+/// Anything that learns a block number from a receipt and then reads the
+/// headers table is racing that commit, and must wait instead of
+/// assuming.
 pub async fn await_block_origins_through(
     state_dir: &Path,
     block_number: u64,
@@ -66,6 +61,13 @@ pub async fn await_block_origins_through(
     .await
 }
 
+/// Read every persisted block header, in block order.
+///
+/// This is a read-only mdbx open: an MVCC snapshot that never blocks the
+/// writer, the same seam `read_validator_state_root` uses. Nothing exposes
+/// headers over RPC (there is no `eth_getBlockByNumber`), so the state
+/// database is the only place to observe the origin, which is worth
+/// knowing on its own.
 pub fn read_block_origins(state_dir: &Path) -> Result<Vec<BlockOrigin>> {
     let env = open_state_ro(state_dir)?;
     let headers = kardamom_state::read_all_headers(&env).context("read headers table")?;
@@ -80,33 +82,34 @@ pub fn read_block_origins(state_dir: &Path) -> Result<Vec<BlockOrigin>> {
         .collect())
 }
 
-/// Rules 1, 2 and 4 over the whole chain built so far.
+/// Checks rules 1, 2, and 4 over the whole chain built so far.
 ///
-/// `l1_finalized` is the L1 finalized tip observed AFTER the chain stopped
-/// growing, so "origin never exceeds finality" is checked against a bound
-/// that can only have moved forward.
+/// `l1_finalized` is the L1 finalized tip observed after the chain
+/// stopped growing. So this checks "the origin never exceeds finality"
+/// against a bound that can only have moved forward.
 pub fn assert_origin_sequence_is_sound(blocks: &[BlockOrigin], l1_finalized: u64) -> Result<()> {
     anyhow::ensure!(!blocks.is_empty(), "no blocks were produced");
 
     let mut prev: Option<BlockOrigin> = None;
     for b in blocks {
-        // `l1_origin == 0` means "no epoch adopted yet" — the blocks a chain
-        // produces between genesis and its first epoch. The step OUT of 0 is
-        // the watcher's seed, which deliberately skips historical L1 (see the
-        // spec's Non-Goals), so it is not a skip in the rule-2 sense.
+        // `l1_origin == 0` means "no epoch adopted yet". These are the
+        // blocks a chain produces between genesis and its first epoch. The
+        // step out of 0 is the watcher's seed, which deliberately skips
+        // historical L1 (see the spec's Non-Goals). So this step is not a
+        // skip in the rule-2 sense.
         //
-        // GAP: because the seed is where it is, deposits made in L1 blocks
-        // BEFORE it are unrecoverable — nothing derives them. Closing that is
-        // what the spec's `l1_origin_genesis` edge case is for; until it
-        // lands, a chain's verifiable history starts at its first epoch, not
-        // at L1 genesis.
+        // Known gap: because the seed starts where it does, deposits made
+        // in L1 blocks before it are unrecoverable, since nothing derives
+        // them. The spec's `l1_origin_genesis` edge case will close this
+        // gap. Until then, a chain's verifiable history starts at its
+        // first epoch, not at L1 genesis.
         let crossing_the_seed = prev.is_some_and(|p| p.l1_origin == 0) && b.l1_origin > 0;
         if let Some(p) = prev
             && !crossing_the_seed
         {
-            // Rule 1 — monotonic. A regression would make deposit derivation
-            // ambiguous: two blocks claiming different origins for the same
-            // stretch of L1.
+            // Rule 1: monotonic. A regression would make deposit derivation
+            // ambiguous: two blocks would claim different origins for the
+            // same stretch of L1.
             anyhow::ensure!(
                 b.l1_origin >= p.l1_origin,
                 "l1_origin regressed: block {} has origin {}, block {} had {}",
@@ -115,10 +118,11 @@ pub fn assert_origin_sequence_is_sound(blocks: &[BlockOrigin], l1_finalized: u64
                 p.block_number,
                 p.l1_origin
             );
-            // Rule 2 — no skipping. Every L1 block between two origins must
-            // have had its own epoch, so the origin may only step by one.
-            // A jump means an epoch was dropped, and with it any deposits it
-            // carried — exactly the censorship this design exists to prevent.
+            // Rule 2: no skipping. Every L1 block between two origins must
+            // have had its own epoch, so the origin may step by only one. A
+            // jump means an epoch was dropped, along with any deposits it
+            // carried. This is exactly the censorship this design exists
+            // to prevent.
             anyhow::ensure!(
                 b.l1_origin <= p.l1_origin + 1,
                 "l1_origin skipped from {} to {} between blocks {} and {}: \
@@ -129,7 +133,7 @@ pub fn assert_origin_sequence_is_sound(blocks: &[BlockOrigin], l1_finalized: u64
                 b.block_number
             );
         }
-        // Rule 4 — the origin is only ever an L1 block that is already final.
+        // Rule 4: the origin is always an L1 block that is already final.
         anyhow::ensure!(
             b.l1_origin <= l1_finalized,
             "block {} claims origin {} beyond the L1 finalized tip {}",
@@ -142,12 +146,12 @@ pub fn assert_origin_sequence_is_sound(blocks: &[BlockOrigin], l1_finalized: u64
     Ok(())
 }
 
-/// S10a — the origin advances across ordinary operation, and the sequence it
-/// traces obeys rules 1, 2 and 4.
+/// The origin advances during ordinary operation, and the
+/// sequence it traces obeys rules 1, 2, and 4.
 ///
-/// Deliberately runs with NO deposits: an idle L1 is the case where it is
-/// tempting to emit nothing at all, and rule 2 is exactly what that would
-/// break.
+/// This deliberately runs with no deposits. An idle L1 is the case where
+/// it is tempting to emit nothing at all, and rule 2 is exactly the rule
+/// that would break.
 pub async fn origin_advances_over_an_idle_l1(l1: &L1, state_dir: &Path) -> Result<()> {
     let start = read_block_origins(state_dir)?;
     let start_origin = start.last().map(|b| b.l1_origin).unwrap_or(0);
@@ -171,13 +175,14 @@ pub async fn origin_advances_over_an_idle_l1(l1: &L1, state_dir: &Path) -> Resul
     Ok(())
 }
 
-/// S10b — rule 3: an epoch's deposits LEAD the block they open, even when L2
-/// traffic is flowing at the same time.
+/// Rule 3: an epoch's deposits lead the block they open, even
+/// while L2 traffic flows at the same time.
 ///
-/// The interleaving is the point. Deposits and L2 txs race onto one canonical
-/// stream, so "deposits come first" can only hold because the epoch is atomic
-/// and forces a boundary — not because of timing luck. Under concurrent load
-/// a design that merely tends to put deposits early would fail here.
+/// The interleaving is the point. Deposits and L2 transactions race onto
+/// one canonical stream. So "deposits come first" can only hold because
+/// the epoch is atomic and forces a boundary, not because of timing luck.
+/// Under concurrent load, a design that only tends to put deposits early
+/// would fail this test.
 pub async fn deposits_lead_their_block_under_load(
     t: &Target,
     l1: &L1,
@@ -207,20 +212,20 @@ pub async fn deposits_lead_their_block_under_load(
     let (block_number, tx_index) =
         receipt_placement(&receipt).context("place the deposit receipt")?;
 
-    // Rule 3: index 0 of its block. Not "early", not "before the txs that
-    // happened to arrive later" — first.
+    // Rule 3: index 0 of its block. Not "early", and not "before the
+    // transactions that happened to arrive later" — it must be first.
     anyhow::ensure!(
         tx_index == 0,
         "deposit landed at index {tx_index} of block {block_number}, not at the front"
     );
 
-    // And the block it leads is the one whose origin is the epoch's.
+    // The block it leads must also be the one whose origin is the epoch's.
     //
-    // The receipt we just placed is published when the tx EXECUTES, but the
-    // block's header is persisted only when that block COMMITS at the next
-    // sealer boundary — so reading the state DB the instant a receipt lands
-    // races the commit, and lost that race intermittently ("no header for
-    // block N"). Wait for the header instead of assuming it is already there.
+    // The receipt above is published when the transaction executes, but
+    // the block's header is persisted only when that block commits at the
+    // next sealer boundary. Reading the state database right after the
+    // receipt lands races that commit. Wait for the header instead of
+    // assuming it is already there.
     let blocks = await_block_origins_through(state_dir, block_number).await?;
     let this = blocks
         .iter()
@@ -243,11 +248,11 @@ pub async fn deposits_lead_their_block_under_load(
     Ok(())
 }
 
-/// S10c — several deposits in ONE L1 block all land, in L1 log order, in one
-/// L2 block.
+/// Several deposits in one L1 block all land, in L1 log order, in
+/// one L2 block.
 ///
-/// This is what the atomic epoch record buys: the group cannot be split
-/// across blocks or reordered, because it travels as a single canonical
+/// This is what the atomic epoch record buys: no one can split the group
+/// across blocks or reorder it, because it travels as a single canonical
 /// record.
 pub async fn multi_deposit_epoch_lands_in_log_order(
     t: &Target,
@@ -289,8 +294,8 @@ pub async fn multi_deposit_epoch_lands_in_log_order(
         placements.iter().all(|(_, bn, _)| *bn == block),
         "one L1 block's deposits were split across L2 blocks: {placements:?}"
     );
-    // L1 log order == L2 transaction order, and they occupy the front of the
-    // block contiguously.
+    // L1 log order matches L2 transaction order, and the deposits occupy
+    // the front of the block with no gaps.
     let mut by_log = placements.clone();
     by_log.sort_by_key(|(log_index, _, _)| *log_index);
     for (expected_idx, (_, _, tx_index)) in by_log.iter().enumerate() {
@@ -307,14 +312,15 @@ pub async fn multi_deposit_epoch_lands_in_log_order(
     Ok(())
 }
 
-/// S10d — a stalled L1 must not stall L2.
+/// A stalled L1 must not stall L2.
 ///
-/// Rule 5 promises deposits are delayed, never lost, and that ordinary
-/// transaction flow keeps running while the origin is frozen. That is the
-/// difference between a liveness alarm and a liveness failure.
+/// Rule 5 promises that deposits are delayed, never lost, and that
+/// ordinary transaction flow keeps running while the origin is frozen.
+/// That is the difference between a liveness alarm and a liveness
+/// failure.
 pub async fn stalled_l1_does_not_stall_l2(t: &Target, l1: &L1, state_dir: &Path) -> Result<()> {
-    // Anvil runs with block_time(1), so L1 has to be told to stop; merely
-    // not mining would leave it producing a block a second.
+    // Anvil runs with block_time(1), so L1 must be told to stop. Simply
+    // not mining would still leave it producing a block every second.
     tokio::time::sleep(Duration::from_secs(2)).await;
     l1.pause_block_production().await?;
     // Let the watcher drain whatever was already finalized before freezing.
@@ -343,7 +349,7 @@ pub async fn stalled_l1_does_not_stall_l2(t: &Target, l1: &L1, state_dir: &Path)
         .await
         .context("L2 must keep executing while the L1 origin is frozen")?;
 
-    // The origin held steady rather than inventing blocks.
+    // The origin held steady, instead of inventing blocks.
     let after = read_block_origins(state_dir)?;
     let after_origin = after
         .last()
@@ -369,11 +375,11 @@ pub async fn stalled_l1_does_not_stall_l2(t: &Target, l1: &L1, state_dir: &Path)
     Ok(())
 }
 
-/// S10e — every deposit that L1 recorded is on L2 exactly once.
+/// Every deposit that L1 recorded is on L2 exactly once.
 ///
-/// Derives the expected set straight from L1 logs and compares it against
-/// what the chain executed. This is the property a verifier will enforce in
-/// phase D; asserting it here means the producer is already honest.
+/// This derives the expected set directly from L1 logs and compares it
+/// against what the chain executed. A later validator check will enforce
+/// this property. Checking it here shows the producer is already honest.
 pub async fn every_l1_deposit_appears_exactly_once(
     t: &Target,
     l1: &L1,
@@ -407,8 +413,8 @@ pub async fn every_l1_deposit_appears_exactly_once(
         *seen.entry(sh).or_default() += 1;
     }
 
-    // Duplicates would mean the M racing sequencers' re-offers were not
-    // deduped — the deposit would have minted twice.
+    // A duplicate would mean the racing sequencers' re-offers were not
+    // deduplicated, so the deposit would have minted twice.
     for (sh, count) in &seen {
         anyhow::ensure!(*count == 1, "deposit {sh} executed {count} times");
     }

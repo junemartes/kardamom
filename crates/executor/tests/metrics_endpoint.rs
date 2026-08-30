@@ -10,9 +10,10 @@ async fn executor_metrics_endpoint_serves_expected_counters() {
         .await
         .expect("init");
 
-    // Touch the counter the executor crate is expected to publish so
-    // describe_counter calls don't require us to also drive the binary.
-    // Uses the crate's constants so a rename in src/metrics.rs fails here.
+    // Touch the counter that the executor crate publishes. This means
+    // describe_counter calls do not also need us to run the binary.
+    // The test uses the crate's constants, so a rename in src/metrics.rs
+    // breaks this test.
     metrics::counter!(kardamom_engine::metrics::TX_APPLIED_TOTAL, "outcome" => "ok").increment(0);
 
     let body = scrape(&format!("http://{addr}/metrics")).await;

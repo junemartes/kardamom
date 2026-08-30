@@ -1,12 +1,12 @@
-// S6/S7/S9b + the Target-C runner pre-flight — executor/validator
-// consistency, the divergence tripwire, and crash recovery. Included from
-// main.rs (see the header there); shared helpers live in main.rs.
+// Executor and validator consistency, the divergence tripwire, crash
+// recovery, and the Target-C runner pre-flight. This file is included
+// from main.rs (see the header there). Shared helpers live in main.rs.
 
-/// S6: the validator independently re-executes everything the executor
-/// executes, verifies it against the executor's streams — and after a
-/// graceful shutdown, the two libmdbx databases hold byte-identical chain
-/// state (plus both pass the `kardamom_state::integrity` sweep, run both as
-/// a library and through the `kardamom-statecheck` binary).
+/// S6: the validator re-executes everything the executor executes, on
+/// its own, and verifies it against the executor's streams. After a
+/// graceful shutdown, the two libmdbx databases hold byte-identical
+/// chain state. Both also pass the `kardamom_state::integrity` sweep, run
+/// both as a library and through the `kardamom-statecheck` binary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s6_validator_matches_executor() {
@@ -36,9 +36,10 @@ async fn s6_validator_matches_executor() {
     );
 }
 
-/// S7: prove the divergence tripwire actually fires — a corrupt BAL on the
-/// real tx_bal channel must halt the validator with the documented exit 2.
-/// Closes the docs/failure-modes.md "divergence injection" gap.
+/// S7: prove the divergence tripwire actually fires. A corrupt BAL on
+/// the real tx_bal channel must halt the validator with the documented
+/// exit code 2. This closes the docs/failure-modes.md "divergence
+/// injection" gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s7_corrupt_bal_halts_validator() {
@@ -54,18 +55,19 @@ async fn s7_corrupt_bal_halts_validator() {
         .expect("S7");
 }
 
-/// S9b: an unclean executor death (SIGKILL) must not corrupt or lose state —
-/// the restarted process resumes from its persisted cursor instead of
-/// re-syncing from genesis, the chain keeps working, and its DB still matches
-/// the validator's (which never restarted) byte for byte.
+/// An unclean executor death (SIGKILL) must not corrupt or lose
+/// state. The restarted process resumes from its persisted cursor
+/// instead of re-syncing from genesis, the chain keeps working, and its
+/// database still matches the validator's (which never restarted) byte
+/// for byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s9_executor_crash_recovery_is_consistent() {
     let mut stack = LocalStack::launch(StackConfig {
         validator: true,
-        // Crash recovery REQUIRES the durability archive: the restarted
+        // Crash recovery requires the durability archive. The restarted
         // executor replays canonical records from its persisted cursor, and
-        // the envelopes for those records were published while it was down.
+        // those records were published as envelopes while it was down.
         archive_durability: true,
         ..StackConfig::default()
     })
@@ -85,7 +87,8 @@ async fn s9_executor_crash_recovery_is_consistent() {
         .await
         .expect("S9b post-restart phase");
 
-    // Resume, not genesis re-sync: the restarted process says so explicitly.
+    // The restarted process resumed, instead of re-syncing from genesis.
+    // It states this explicitly in its log.
     let log = stack.restarted_executor_log().unwrap_or_default();
     assert!(
         log.contains("resuming from persisted state cursor"),
@@ -100,15 +103,16 @@ async fn s9_executor_crash_recovery_is_consistent() {
     consistency::verify_state_dirs(&exec_dir, &val_dir).expect("post-crash state comparison");
 }
 
-/// The Target-C RUNNER, exercised at Target L: launch a local stack and drive
-/// it through the real `kardamom-semantics` binary — the same binary the
-/// cluster-e2e `semantics` shard invokes, with the same argument shape.
+/// The Target-C runner, exercised at Target L: launch a local stack and
+/// drive it through the real `kardamom-semantics` binary. This is the
+/// same binary the cluster-e2e `semantics` shard invokes, with the same
+/// arguments.
 ///
-/// This is the pre-flight for Target C. The cluster shard costs ~40 minutes
-/// per attempt and only reports a log dump, so proving the CLI's wiring
-/// (argument parsing → `Target` construction → case dispatch → exit code)
-/// here means a shard failure points at the cluster environment rather than
-/// at the runner.
+/// This is the pre-flight check for Target C. The cluster shard costs
+/// about 40 minutes per attempt and only reports a log dump. Proving the
+/// CLI's wiring here (argument parsing, `Target` construction, case
+/// dispatch, exit code) means a shard failure points at the cluster
+/// environment, not at the runner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn target_c_runner_drives_the_stack() {
@@ -148,7 +152,8 @@ async fn target_c_runner_drives_the_stack() {
                 &park.as_millis().to_string(),
             ])
             // A representative slice: one nonce case and the consistency case.
-            // The full set runs on the cluster shard; this proves the plumbing.
+            // The cluster shard runs the full set. This just proves the
+            // plumbing.
             .args(["--cases", "nonce-unordered,consistency"]),
     );
     assert!(

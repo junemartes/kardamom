@@ -1,28 +1,33 @@
-//! E2E test scaffold: real Aeron Media Driver + Aeron Archive in Docker via
-//! the [`kardamom_log::testing::AeronTestCluster`] harness from S3.
+//! An end-to-end test scaffold: a real Aeron Media Driver and Aeron
+//! Archive in Docker, using the
+//! [`kardamom_log::testing::AeronTestCluster`] harness.
 //!
-//!— mock-based unit and integration tests in this crate stay
-//! (write_replay, snapshot_mvcc, snapshot_swap, concurrent_readers,
-//! recovery_midblock, compaction_smoke); this is *additional* coverage that
-//! brings up the real Aeron container so we catch wire-format / IPC /
-//! back-pressure bugs the channel-less in-process writer cannot surface.
+//! The mock-based unit and integration tests in this crate stay in
+//! place (write_replay, snapshot_mvcc, snapshot_swap,
+//! concurrent_readers, recovery_midblock, compaction_smoke). This test
+//! is additional coverage: it brings up the real Aeron container, so it
+//! can catch wire-format, IPC, and back-pressure bugs that the
+//! channel-less in-process writer cannot surface.
 //!
-//! Gated behind `feature = "docker-e2e"` because it requires a Docker daemon
-//! and ~30s startup; default `cargo test` skips it.
+//! This test is gated behind `feature = "docker-e2e"`, because it
+//! needs a Docker daemon and about 30 seconds to start. A default
+//! `cargo test` skips it.
 //!
-//! **v0 scope:** brings up the Aeron container, opens a real libmdbx
-//! `StateWriter`, and asserts the harness resolves its host ports + the
-//! writer can apply at least one local batch. The full tx_receipts subscribe
-//! → BlockDelta-build → writer round-trip requires a `TxReceiptsSubscriber`
-//! adapter wrapping `log`'s `aeron-live` tx_receipts async wrapper.
-//! The high-level tx_receipts async wrapper is not yet shipped by `log`
-//! (only the low-level rusteron primitives plus the
-//! `testing::AeronTestCluster` harness are exposed). When that wrapper
-//! lands, this file gains the full publish → writer → tx_hash_index
-//! round-trip; the harness assertion
-//! below is the gating proof that this crate's test target can reach the
-//! Aeron container, which is the prerequisite the wrapper landing
-//! unblocks.
+//! v0 scope: this test brings up the Aeron container, opens a real
+//! libmdbx `StateWriter`, and asserts that the harness resolves its
+//! host ports, and that the writer can apply at least one local batch.
+//!
+//! The full round trip, from a tx_receipts subscription, through
+//! building a `BlockDelta`, to the writer, needs a
+//! `TxReceiptsSubscriber` adapter that wraps `log`'s `aeron-live`
+//! tx_receipts async wrapper. `log` does not yet ship that high-level
+//! wrapper; it exposes only the low-level rusteron primitives, plus the
+//! `testing::AeronTestCluster` harness.
+//!
+//! When that wrapper lands, this file will gain the full publish,
+//! writer, tx_hash_index round trip. The harness assertion below proves
+//! that this crate's test target can already reach the Aeron container,
+//! which is the prerequisite that landing the wrapper depends on.
 
 #![cfg(feature = "docker-e2e")]
 
@@ -58,9 +63,9 @@ async fn aeron_cluster_starts_and_state_writer_applies_batch() {
     // Drop the genesis snapshot.
     let _ = writer.snapshot_rx.recv();
 
-    // 3. Apply one block boundary + delta locally — exercising the writer
-    //    end-to-end. The full plumb-through-Aeron flow waits on the high-
-    //    level tx_receipts wrapper (see module docs above).
+    // 3. Apply one block boundary and delta locally, exercising the
+    //    writer end to end. The full flow through Aeron waits on the
+    //    high-level tx_receipts wrapper. See the module docs above.
     let addr = address!("0x00000000000000000000000000000000000000aa");
     writer
         .delta_tx

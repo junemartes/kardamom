@@ -1,11 +1,12 @@
-//! Determinism conformance: two executor instances driven by the same input
-//! must produce byte-identical tx_receipts output (every `tx_hash` and every
-//! `write_set_hash` matches). No state-root assertion: the executor does not
-//! emit a state-root commitment (S0).
+//! Determinism conformance. Two executor instances, driven by the same
+//! input, must produce byte-identical tx_receipts output (every
+//! `tx_hash` and every `write_set_hash` matches). No state-root
+//! assertion: the executor does not emit a state-root commitment yet.
 //!
-//! Post-S4-arch-update wiring: M=1 tx_data + 1 tx_ordering, refs join via
-//! the executor's `JoinBuffer`. Determinism doesn't depend on the demux
-//! shape — it depends on canonical ordering, which tx_ordering preserves.
+//! Wiring after the join-buffer architecture update: M=1 tx_data, plus one
+//! tx_ordering, with refs joined through the executor's `JoinBuffer`.
+//! Determinism does not depend on the demux shape. It depends on
+//! canonical ordering, which tx_ordering preserves.
 
 use std::thread;
 use std::time::Duration;
@@ -125,10 +126,10 @@ fn populate(
             a_pos += 200;
             nonce += 1;
         }
-        // end_tx_idx is the cumulative COUNT of canonical records through this
-        // block (alignment key). bpos_off has advanced once per TxRef, so it IS
-        // that count; encode it via bpos() (== BPosition::from_index for these
-        // small term-0 values).
+        // end_tx_idx is the cumulative count of canonical records through
+        // this block (the alignment key). bpos_off has advanced once per
+        // TxRef, so it equals that count. Encode it with `bpos()` (the
+        // same as `BPosition::from_index` for these small term-0 values).
         b_tx.send((
             bpos(bpos_off),
             TxOrderingMessage::BoundaryStart(BlockBoundaryStart {

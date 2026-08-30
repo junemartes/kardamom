@@ -10,12 +10,14 @@ import java.util.concurrent.TimeUnit;
 import org.agrona.DirectBuffer;
 
 /**
- * A {@link TestNode.TestService} whose every {@link io.aeron.cluster.service.ClusteredService}
- * callback delegates to a real {@link SealerClusteredService}. The 1.44.0
- * {@link io.aeron.test.cluster.TestCluster} can only construct services through a
- * {@code Supplier<TestNode.TestService[]>}, so an external {@code ClusteredService}
- * is injected by composition here — the harness drives THIS object, which forwards
- * verbatim to the production service. No behaviour is added or intercepted.
+ * A {@link TestNode.TestService} whose every
+ * {@link io.aeron.cluster.service.ClusteredService} callback delegates to a
+ * real {@link SealerClusteredService}. The 1.44.0
+ * {@link io.aeron.test.cluster.TestCluster} can only construct services
+ * through a {@code Supplier<TestNode.TestService[]>}. So this class injects
+ * an external {@code ClusteredService} by composition: the harness drives
+ * this object, which forwards every call verbatim to the production
+ * service. It adds or intercepts no behavior.
  *
  * <p>Shared by {@link SealerClusterFailoverTest} and {@link SealerReplayTest}.</p>
  */
@@ -28,16 +30,19 @@ final class SealerTestService extends TestNode.TestService {
 
     @Override
     public void onStart(final Cluster cluster, final Image snapshotImage) {
-        // WARNING — snapshot/recovery limitation: on a SNAPSHOT-recovery start both
-        // super.onStart(...) and delegate.onStart(...) are handed the SAME snapshot
-        // Image. An Image is a consumable cursor: whoever polls it first DRAINS it,
-        // so the second consumer sees an empty image and silently starts from genesis.
-        // This is harmless ONLY because these tests never take a snapshot (snapshotImage
-        // is always null here). DO NOT reuse this wrapper as-is for any snapshot/
-        // recovery test case: in that scenario the DELEGATE — not super — must be the
-        // one to consume the snapshot Image (super must be given a null/no-op image),
-        // otherwise the production service will lose its recovered state.
-        super.onStart(cluster, snapshotImage); // lets the harness latch its Cluster ref
+        // Snapshot-recovery limitation:
+        // - On a snapshot-recovery start, both super.onStart and delegate.onStart
+        //   get the same snapshot Image.
+        // - An Image is a consumable cursor: the first caller to poll it drains it.
+        //   The second caller then sees an empty image and starts from genesis
+        //   without warning.
+        // - This is harmless here only because these tests never take a snapshot;
+        //   snapshotImage is always null.
+        // - Do not reuse this wrapper for a snapshot or recovery test case as-is.
+        //   In that case, only the delegate may consume the snapshot Image; give
+        //   super a null or no-op image instead. Otherwise the production service
+        //   loses its recovered state.
+        super.onStart(cluster, snapshotImage); // Lets the harness latch its Cluster reference.
         delegate.onStart(cluster, snapshotImage);
     }
 
@@ -78,7 +83,7 @@ final class SealerTestService extends TestNode.TestService {
             final int logSessionId,
             final TimeUnit timeUnit,
             final int appVersion) {
-        // Drive the production service's deferred initial boundary-timer (re)arming.
+        // Drive the production service's deferred boundary-timer arming or rearming.
         delegate.onNewLeadershipTermEvent(
                 leadershipTermId, logPosition, timestamp, termBaseLogPosition,
                 leaderMemberId, logSessionId, timeUnit, appVersion);

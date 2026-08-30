@@ -1,12 +1,14 @@
-//! Read-only snapshot: long-lived mdbx RO txn that backs `StateDatabase`.
+//! A read-only snapshot: a long-lived mdbx read-only transaction that backs
+//! `StateDatabase`.
 //!
-//! The mdbx RO txn is the MVCC anchor. As long as one of these is alive, the
-//! mdbx freelist will not reuse the pages reachable from that snapshot — see
-//! `geometry::HORIZON_BLOCKS` for the bound the writer enforces.
+//! The mdbx read-only transaction is the MVCC anchor. While one stays alive,
+//! the mdbx freelist will not reuse the pages it can reach. See
+//! `geometry::HORIZON_BLOCKS` for the limit the writer enforces.
 //!
-//! The snapshot is `Clone` and cheap to share — the inner txn is held in an
-//! `Arc<SnapshotInner>` so multiple consumers (executor, RPC) can read against
-//! the exact same MVCC view without each opening a new txn slot.
+//! The snapshot is `Clone` and cheap to share. The inner transaction lives
+//! in an `Arc<SnapshotInner>`, so multiple consumers (the executor, the RPC
+//! server) can read the same MVCC view without each opening a new
+//! transaction slot.
 
 use std::sync::Arc;
 
@@ -27,11 +29,11 @@ use crate::schema::{
     encode_account_key, encode_code_key, encode_storage_key, encode_tx_hash_key,
 };
 
-/// MVCC snapshot of the state DB at exactly one block boundary.
+/// An MVCC snapshot of the state DB at exactly one block boundary.
 ///
-/// Holds the underlying RO txn for its full lifetime. Drop it to release the
-/// snapshot — which the writer's horizon check uses to know it can reclaim
-/// older pages.
+/// It holds the underlying read-only transaction for its full lifetime.
+/// Drop the snapshot to release it. The writer's horizon check then knows
+/// it can reclaim older pages.
 #[derive(Clone)]
 pub struct StateSnapshot {
     inner: Arc<SnapshotInner>,
@@ -40,14 +42,16 @@ pub struct StateSnapshot {
 struct SnapshotInner {
     txn: RoTxSync,
     block_number: u64,
-    // DBI handles cached at open time. `Database` is `Copy` (u32 + flags), so
-    // the per-call `txn.open_db(...)` round-trip is replaced by a struct read.
+    // DBI handles are cached at open time. `Database` is `Copy` (a u32 plus
+    // flags), so a struct read replaces the per-call `txn.open_db(...)`
+    // round trip.
     accounts_db: Database,
     storage_db: Database,
     code_db: Database,
     receipts_db: Database,
     tx_hash_db: Database,
-    // Keep the env Arc alive so the env doesn't outlive the snapshot's RO txn.
+    // Keep a strong reference to the env, so it stays alive for as long as
+    // the snapshot's read-only transaction does.
     _env: Arc<Environment>,
 }
 
@@ -58,9 +62,10 @@ impl StateSnapshot {
         Self::open_on(env.env.clone())
     }
 
-    /// [`Self::open`] from the raw environment handle — the shared body of
-    /// `open` and [`StateDatabase::fork_view`] (a fork mints its sibling
-    /// txn from the env the snapshot already keeps alive).
+    /// Runs [`Self::open`] from the raw environment handle. This is the
+    /// shared body of `open` and [`StateDatabase::fork_view`]. A fork
+    /// creates its sibling transaction from the env the snapshot already
+    /// keeps alive.
     fn open_on(env: Arc<Environment>) -> Result<Self, StateError> {
         let txn = env.begin_ro_sync()?;
         let meta = txn.open_db(Some(TABLE_META))?;
@@ -84,8 +89,9 @@ impl StateSnapshot {
         })
     }
 
-    /// The snapshot's pinned RO transaction — the read view for trie walks
-    /// (proof generation anchors against exactly this state; spec 3b/3c).
+    /// The snapshot's pinned read-only transaction. This is the read view
+    /// for trie walks. Proof generation anchors against exactly this state
+    /// (spec sections 3b and 3c).
     pub fn ro_txn(&self) -> &RoTxSync {
         &self.inner.txn
     }
@@ -95,10 +101,12 @@ impl StateSnapshot {
         self.inner.block_number
     }
 
-    /// The canonical Ethereum MPT world-state root committed at this snapshot's
-    /// block, or `None` on databases written by the plain (non-trie) executor
-    /// writer (which does not maintain a state root). Written by the trie-aware
-    /// writer (`StateWriter::spawn_with_trie`); see [`crate::trie`].
+    /// The canonical Ethereum MPT world-state root committed at this
+    /// snapshot's block.
+    ///
+    /// This is `None` on databases written by the plain, non-trie executor
+    /// writer, which does not maintain a state root. The trie-aware writer
+    /// (`StateWriter::spawn_with_trie`) writes it. See [`crate::trie`].
     pub fn state_root(&self) -> Result<Option<B256>, StateError> {
         let meta = self.inner.txn.open_db(Some(TABLE_META))?;
         read_meta_b256(&self.inner.txn, meta, KEY_STATE_ROOT)
@@ -108,16 +116,21 @@ impl StateSnapshot {
 impl StateDatabase for StateSnapshot {
     type Error = StateError;
 
-    /// Mint a sibling snapshot with its OWN RO txn. mdbx serializes reads
-    /// through a txn's cursors, so W workers sharing one snapshot read
-    /// serially — the Block-STM campaign measured that shape SLOWER than
-    /// sequential execution at w=4 (`PoolHandle::begin_block_per_worker`
-    /// exists for the same reason). The fresh txn anchors at the CURRENT
-    /// committed block, so the fork is returned only when that still
-    /// equals this snapshot's block; a writer that advanced mid-mint (the
-    /// depth-K commit pipeline makes this routine under load) yields
-    /// `None` and the caller shares `self` — correct, merely serialized.
-    /// Note `Clone` does NOT do this: cloning shares the inner txn.
+    /// Create a sibling snapshot with its own read-only transaction.
+    ///
+    /// mdbx serializes reads through a transaction's cursors. So, if W
+    /// workers share one snapshot, their reads run serially. The Block-STM
+    /// benchmarks measured this as slower than sequential execution at
+    /// w=4. `PoolHandle::begin_block_per_worker` exists for the same reason.
+    ///
+    /// The fresh transaction anchors at the current committed block. The
+    /// fork is returned only if that block still equals this snapshot's
+    /// block. If the writer advanced while the fork was being created,
+    /// which is common under load with the depth-K commit pipeline, this
+    /// method returns `None`. The caller then shares `self` instead. This
+    /// is correct, only serialized.
+    ///
+    /// `Clone` does not do this: cloning shares the inner transaction.
     fn fork_view(&self) -> Option<Self> {
         let fork = Self::open_on(self.inner._env.clone()).ok()?;
         (fork.inner.block_number == self.inner.block_number).then_some(fork)
@@ -162,7 +175,7 @@ impl StateDatabase for StateSnapshot {
         }
     }
 
-    ///: load a Receipt by its canonical BPosition. Returns None if no
+    /// Load a receipt by its canonical `BPosition`. Returns `None` if no
     /// receipt was committed at that position.
     fn get_receipt(&self, pos: BPosition) -> Result<Option<Receipt>, Self::Error> {
         let key = encode_b_position(pos);
@@ -176,7 +189,8 @@ impl StateDatabase for StateSnapshot {
         }
     }
 
-    ///: tx_hash → BPosition lookup. Feeds S1 `eth_getTransactionReceipt`.
+    /// Look up a `BPosition` by transaction hash. This supports
+    /// `eth_getTransactionReceipt`.
     fn get_tx_position(&self, tx_hash: B256) -> Result<Option<BPosition>, Self::Error> {
         let key = encode_tx_hash_key(tx_hash);
         match self

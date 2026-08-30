@@ -1,30 +1,31 @@
 //! `kardamom-validator`: monolithic validator node.
 //!
-//! Follows the sequencer by subscribing to the same canonical streams the
-//! executor reads (`tx_data` × M, `tx_ordering` from the Aeron Cluster (Raft)
-//! egress, `tx_deposits`), re-executes
-//! every block through the shared `kardamom-engine` pipeline, and commits to its
-//! own libmdbx state via the **trie-aware** writer — advancing a canonical
-//! Ethereum MPT state root per block. It additionally subscribes to the
-//! executor's `tx_receipts` and per-block `tx_bal` (BAL) streams and cross-checks
-//! its independent re-execution against them, fail-stopping on any proven
-//! divergence. No HA; off the hot path.
+//! It follows the sequencer by subscribing to the same canonical streams
+//! the executor reads (`tx_data` x M, `tx_ordering` from the Aeron
+//! Cluster (Raft) egress, `tx_deposits`). It re-executes every block
+//! through the shared `kardamom-engine` pipeline, and commits to its own
+//! libmdbx state through the trie-aware writer, advancing a canonical
+//! Ethereum MPT state root per block. It also subscribes to the
+//! executor's `tx_receipts` and per-block `tx_bal` (BAL) streams, checks
+//! its independent re-execution against them, and stops on any proven
+//! divergence. It has no HA and runs off the hot path.
 //!
-//! Milestone 1: re-execute from genesis (or resume via the same archive
-//! replay-merge the executor uses) + produce roots + cross-check. It publishes
-//! nothing on the L2 streams.
+//! Milestone 1: re-execute from genesis, or resume through the same
+//! archive replay-merge the executor uses, produce roots, and check
+//! them. It publishes nothing on the L2 streams.
 //!
-//! **L1 output attestation** (optional): when `--l1-rpc-url`,
-//! `--output-oracle` and `--attester-key` are ALL given, a background attester
-//! collects each committed block's `MessagePassed` withdrawal leaves, builds
-//! the per-output withdrawals root, and posts one output per
-//! `--attester-post-interval` blocks to the L1 `WithdrawalOutputOracle`. The
-//! key must be the oracle's permissioned `attester`. Without the three flags
-//! the validator performs no automatic attestation (previous behavior).
+//! L1 output attestation (optional): when `--l1-rpc-url`,
+//! `--output-oracle`, and `--attester-key` are all given, a background
+//! attester collects each committed block's `MessagePassed` withdrawal
+//! leaves, builds the per-output withdrawals root, and posts one output
+//! per `--attester-post-interval` blocks to the L1
+//! `WithdrawalOutputOracle`. The key must be the oracle's permissioned
+//! `attester`. Without all three flags, the validator does no automatic
+//! attestation.
 //!
-//! Structure: CLI/file config in [`args`]; the checkpoint-trust lifecycle
-//! (adoption marker / trie bootstrap / resync fallback) in [`adoption`]; the
-//! verification-stream pump tasks in [`pumps`].
+//! Structure: CLI and file config in [`args`]; the checkpoint-trust
+//! lifecycle (adoption marker, trie bootstrap, resync fallback) in
+//! [`adoption`]; the verification-stream pump tasks in [`pumps`].
 
 mod adoption;
 mod args;
@@ -48,9 +49,9 @@ use kardamom_validator::{
 
 use args::{Args, ValidatorFileConfig, resolve_attester_key};
 
-/// The validator role's port types. Only the receipts sink stays boxed —
-/// it is genuinely chosen at runtime (the optional attester tee wraps the
-/// plain sink); the epoch check is the L1-re-deriving
+/// The validator role's port types. Only the receipts sink stays boxed,
+/// since it is genuinely chosen at runtime (the optional attester tee
+/// wraps the plain sink). The epoch check is the L1-re-deriving
 /// [`epoch_verify::EpochVerifier`].
 struct ValidatorWiring;
 
@@ -71,16 +72,16 @@ async fn main() -> Result<()> {
     kardamom_obs::init_service!("validator", args.metrics_addr, &args.host_id).await?;
     kardamom_engine::metrics::describe();
     metrics::describe();
-    // The TOML supplies the `[cluster]` section (the canonical tx_ordering
-    // stream is ALWAYS the Aeron Cluster egress); all other runtime tuning
+    // The TOML supplies the `[cluster]` section. The canonical tx_ordering
+    // stream is always the Aeron Cluster egress; all other runtime tuning
     // still comes from the CLI flags above.
     let raw = std::fs::read_to_string(&args.config).context("read validator config")?;
     let mut file_cfg: ValidatorFileConfig =
         toml::from_str(&raw).context("parse validator config")?;
 
-    // Per-node cluster egress endpoint: the cluster client's egress_channel is
-    // this node's reachable address, so it's injected by the deploy rather than
-    // baked into the static config file.
+    // Per-node cluster egress endpoint. The cluster client's
+    // egress_channel is this node's reachable address, so the deploy
+    // injects it rather than baking it into the static config file.
     if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
         file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
     }
@@ -99,10 +100,10 @@ async fn main() -> Result<()> {
     }
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
 
-    // --- State backend + crash-recovery decision (mirrors the executor). ---
+    // --- State backend and crash-recovery decision (mirrors the executor). ---
     let (genesis, chain_id) = bin_support::resolve_genesis(args.chain.as_deref(), args.chain_id)?;
 
-    // Cold-start checkpoint adoption (#143) — see `adoption` for the trust
+    // Cold-start checkpoint adoption: see `adoption` for the trust
     // lifecycle (marker, trie bootstrap, resync fallback).
     let expected_genesis = bin_support::expected_genesis_digest(genesis.as_ref());
     adoption::adopt_checkpoint_if_fresh(
@@ -129,11 +130,10 @@ async fn main() -> Result<()> {
         );
     }
 
-    // M tx_data subscriptions + tx_deposits (async→sync bridged), identical to
-    // the executor: ALWAYS live, with the down-window/lapse gap recovered
-    // in-band by the reader's join-miss refetch against the remote durability
-    // archives (the resume-gated replay-merge this replaces pointed at the
-    // LOCAL archive, which records neither stream).
+    // M tx_data subscriptions plus tx_deposits (bridged async to sync),
+    // identical to the executor: always live, with the down-window or
+    // lapse gap recovered in-band by the reader's join-miss refetch
+    // against the remote durability archives.
     let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
@@ -143,30 +143,31 @@ async fn main() -> Result<()> {
         args.replay_destination_endpoint.as_deref(),
     );
 
-    // 1 tx_ordering subscription — ALWAYS the Aeron Cluster (Raft) egress,
-    // exactly as in the executor. The cluster has already deduped + totally
-    // ordered the stream and exposes a blocking `next()`, so no async→sync
-    // bridge is needed. Leader failover / reconnect — including crash-recovery
-    // replay of the canonical stream — is handled inside the cluster client.
-    // The cluster-session guard (`LiveCluster`) + its dedicated Aeron runtime
-    // must outlive the validator loop, so bind the guard in the outer scope;
-    // it is dropped only after the `join` await below.
+    // One tx_ordering subscription, always the Aeron Cluster (Raft)
+    // egress, exactly as in the executor. The cluster has already
+    // deduplicated and totally ordered the stream and exposes a
+    // blocking `next()`, so no async-to-sync bridge is needed. Leader
+    // failover and reconnect, including crash-recovery replay of the
+    // canonical stream, is handled inside the cluster client. The
+    // cluster-session guard (`LiveCluster`) and its dedicated Aeron
+    // runtime must outlive the validator loop, so bind the guard in the
+    // outer scope; it is dropped only after the `join` await below.
     // Fresh validators start at genesis and receive the full retained
     // canonical stream. The replay request is re-sent on every session
-    // establishment, so a validator whose session dies mid-chaos catches
-    // back up instead of fail-stopping on an unrecoverable gap.
+    // start, so a validator whose session dies mid-chaos catches back up
+    // instead of stopping on an unrecoverable gap.
     let (cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
         args.aeron_dir.as_deref(),
         file_cfg.cluster.to_live(),
         bin_support::cluster_replay_cursor(&start),
     )?;
     tracing::info!("kardamom-validator: tx_ordering via Aeron Cluster");
-    // The kardamom_sealer_* re-export is the EXECUTOR's job — a validator
-    // emitting a second (lagging) copy of the series would break sum()-style
-    // queries and contradict the documented observation point.
+    // The kardamom_sealer_* re-export is the executor's job. A validator
+    // emitting a second, lagging copy of the series would break
+    // sum()-style queries and contradict the documented observation point.
     let tx_ordering_sub = cluster_sub.suppress_sealer_metrics();
 
-    // --- Verification streams: tx_bal (BAL) + tx_receipts (see `pumps`). ---
+    // --- Verification streams: tx_bal (BAL) and tx_receipts (see `pumps`). ---
     let divergence = Divergence::new();
     let bals = BalBuffer::new();
     let claims = kardamom_validator::ClaimBuffer::new();
@@ -206,9 +207,9 @@ async fn main() -> Result<()> {
         Some(every_n) => TrieMode::ShadowCheck { every_n },
         None => TrieMode::Incremental,
     };
-    // Adoption half two: rebuild the mirror + trie when the adoption marker
-    // (or a truly trie-less image) says so — BEFORE the trie-aware writer
-    // spawns.
+    // Adoption, half two: rebuild the mirror and trie when the adoption
+    // marker, or a truly trie-less image, says to. This must run before
+    // the trie-aware writer spawns.
     adoption::bootstrap_trie_if_adopted(&args.state_dir, &env)?;
     let mut writer =
         StateWriter::spawn_with_trie(env, trie_mode).context("spawn trie-aware state writer")?;
@@ -220,14 +221,15 @@ async fn main() -> Result<()> {
         divergence.clone(),
     )
     // Blocks at or below the recovery resume point were verified before
-    // the restart; replay re-execution against already-applied state
-    // yields empty deltas that CANNOT match the BAL — comparing them
-    // produced false-divergence restart cascades.
+    // the restart. Replay re-execution against already-applied state
+    // gives empty deltas that cannot match the BAL. Comparing them
+    // caused false-divergence restart cascades.
     .with_verify_floor(recovery.last_committed_block);
 
-    // L1 output attester: enabled only when the three flags are all present.
-    // (Runs inside this tokio runtime; the task lives as long as a handle
-    // clone does — `attester_handle` is held below for the process lifetime.)
+    // L1 output attester: enabled only when all three flags are present.
+    // It runs inside this tokio runtime. The task lives as long as a
+    // handle clone does; `attester_handle` is held below for the process
+    // lifetime.
     let attester_handle = match (
         args.l1_rpc_url.clone(),
         args.output_oracle,
@@ -248,24 +250,24 @@ async fn main() -> Result<()> {
             );
             Some(handle)
         }
-        (None, None, None) => None, // milestone-1 default: no automatic attestation
+        (None, None, None) => None, // Milestone-1 default: no automatic attestation.
         _ => anyhow::bail!(
             "attestation needs --l1-rpc-url, --output-oracle and --attester-key together \
              (got a partial set)"
         ),
     };
 
-    // Tee each block's withdrawal leaves into the attester from the RECEIPT
-    // stream (a plain sink when attestation is disabled).
+    // Tee each block's withdrawal leaves into the attester from the
+    // receipt stream (a plain sink when attestation is disabled).
     //
-    // NOT from the BlockDelta: the engine finalizes every delta with an empty
-    // receipts vec (receipts travel on tx_receipts), so the previous
-    // `AttestingWriterQueue` wiring collected nothing — every posted output
-    // carried `leaves=0`, no withdrawal was ever attested, and none could be
-    // finalized on L1. Caught end-to-end by the chain-semantics suite's S2.
+    // This does not read from the BlockDelta. The engine finalizes every
+    // delta with an empty receipts vector, since receipts travel on
+    // tx_receipts, so reading from the delta would collect nothing: every
+    // posted output would carry `leaves=0`, no withdrawal would be
+    // attested, and none could be finalized on L1.
+    //
     // Flight ring: recent block inputs for the receipt-divergence dump.
-    // Always on — the receipt cross-check runs on the sequential path too,
-    // and the F3-era wsh mismatch is exactly the class it captures.
+    // Always on, since the receipt check runs on the sequential path too.
     let flight = kardamom_validator::flight::FlightRing::new();
     let tx_receipts_pub: Box<dyn TxReceiptsPublication> = {
         let sink = ValidatorReceiptSink::new(receipts.clone(), divergence.clone())
@@ -284,25 +286,26 @@ async fn main() -> Result<()> {
 
     let mut cfg = ExecutorConfig {
         chain_id,
-        // 3a.1: a validator ALWAYS re-derives record identity. The stream's
-        // sender/tx_hash are proxy claims, and verification that trusts them
-        // re-executes the very theft it exists to catch; the resulting
-        // RecordIdentity halt is classified as integrity (exit 2) below.
+        // A validator always re-derives record identity. The
+        // stream's sender and tx_hash are proxy claims, and verification
+        // that trusts them re-executes the very theft it exists to catch.
+        // The resulting RecordIdentity halt is classified as integrity
+        // (exit 2) below.
         verify_record_identity: true,
         ..ExecutorConfig::default()
     };
-    // ALWAYS bound the tx_data join wait — a verifier that loses an envelope
-    // must fail LOUDLY into the supervisor-restart + archive-replay recovery
-    // loop, not hang forever mid-join. (Divergence fail-stops stay
-    // distinguishable by their 'halted on divergence' log line.) See
-    // `bounded_join_timeout` for why fresh > resume.
+    // Always bound the tx_data join wait. A verifier that loses an
+    // envelope must fail loudly into the supervisor-restart and
+    // archive-replay recovery loop, not hang forever mid-join. Divergence
+    // stops stay distinguishable by their "halted on divergence" log
+    // line. See `bounded_join_timeout` for why fresh differs from resume.
     cfg.reader.join_timeout = bin_support::bounded_join_timeout(start.is_resume());
 
-    // Parallel validation strategy (opt-in): seeded batches driven by the
+    // Parallel validation strategy, opt-in: seeded batches driven by the
     // BAL. `None` keeps the engine's streaming per-tx path byte-for-byte.
     let block_exec = if args.parallel_validation {
-        // 0 = auto; hard cap 40 per the mdbx reader-slot budget
-        // (geometry::MAX_READERS = 64, shared with exec/RPC/compaction).
+        // 0 means auto; hard cap 40 per the mdbx reader-slot budget
+        // (geometry::MAX_READERS = 64, shared with exec, RPC, and compaction).
         let workers = match args.validation_workers {
             0 => std::thread::available_parallelism()
                 .map(|n| n.get().min(8))
@@ -321,9 +324,10 @@ async fn main() -> Result<()> {
             Some(flight.clone()),
         ))
     } else if args.prove_batches.is_some() {
-        // The spool feeds from the flight ring, which only the whole-block
-        // path fills: run the SEQUENTIAL whole-block strategy (identical
-        // semantics to streaming — it delegates to the shared driver).
+        // The spool feeds from the flight ring, which only the
+        // whole-block path fills. Run the sequential whole-block
+        // strategy, which has the same semantics as streaming, since it
+        // delegates to the shared driver.
         Some(kardamom_validator::prover::sequential_block_exec(
             flight.clone(),
         ))
@@ -340,9 +344,10 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Epoch verification (phase 1). Sequence rules 1-2 are local and always
-    // enforced once an epoch appears; the CONTENT check needs L1, so it is
-    // only wired when both the RPC URL and the lockbox address are given.
+    // Epoch verification (phase 1). Sequence rules 1-2 are local and
+    // always enforced once an epoch appears. The content check needs L1,
+    // so it is wired only when both the RPC URL and the lockbox address
+    // are given.
     let epoch_observer: Option<epoch_verify::EpochVerifier> =
         match (args.l1_rpc_url.as_deref(), args.lockbox) {
             (Some(url), Some(lockbox)) => {
@@ -387,11 +392,11 @@ async fn main() -> Result<()> {
             },
             start,
             RoleHooks {
-                // No BAL capture: the validator VERIFIES BALs, never
+                // No BAL capture: the validator verifies BALs, never
                 // publishes them.
                 bal_capture: None,
-                // No footprint shadow either: P1 measures on the EXECUTOR
-                // role.
+                // No footprint shadow either: measurement runs on the
+                // executor role.
                 footprint_shadow: None,
                 // Whole-block exec strategy (the parallel-validation path).
                 block_exec,
@@ -400,11 +405,11 @@ async fn main() -> Result<()> {
         )
     });
 
-    // Exit on WHICHEVER comes first: an operator shutdown signal, or the
-    // engine loop finishing on its own (a divergence fail-stop or a stream
+    // Exit on whichever comes first: an operator shutdown signal, or the
+    // engine loop finishing on its own (a divergence stop or a stream
     // error). Waiting only for SIGTERM would leave a halted validator
-    // lingering "alive" — metrics up, chain frozen — hiding the very
-    // fail-stop signal the divergence machinery exists to surface.
+    // looking "alive", with metrics up and the chain frozen, hiding the
+    // very stop signal the divergence machinery exists to surface.
     let engine_result = tokio::select! {
         _ = bin_support::wait_for_shutdown() => {
             tracing::info!("kardamom-validator: shutdown signal received; dropping runtime");
@@ -426,8 +431,8 @@ async fn main() -> Result<()> {
         Ok(Ok(())) => tracing::info!("validator main loop returned cleanly"),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "validator main loop returned an error");
-            // A forged record identity is proof, not an outage: latch it so
-            // the exit-2 path below fires instead of the restart loop.
+            // A forged record identity is proof, not an outage. Latch it,
+            // so the exit-2 path below fires instead of the restart loop.
             kardamom_validator::latch_integrity_failure(&divergence, &e);
             engine_error = Some(Some(e));
         }
@@ -439,15 +444,17 @@ async fn main() -> Result<()> {
     if let Err(e) = writer.shutdown() {
         tracing::error!(error = %e, "state writer shutdown returned an error");
     }
-    // Present in the log ⇒ the clean-shutdown path ran to the writer stop;
-    // absent before exit ⇒ the process died uncleanly (mdbx env left
-    // unsteady — read-only consumers will see WANNA_RECOVERY).
+    // If this line is present in the log, the clean-shutdown path ran to
+    // the writer stop. If it is absent before exit, the process died
+    // uncleanly, and the mdbx env is left unsteady: read-only consumers
+    // will see WANNA_RECOVERY.
     tracing::info!("validator shutdown: state writer stopped");
-    // Exit 2 is RESERVED for a proven divergence (the latch records before the
-    // engine surfaces `Divergence`) — the page-the-humans signal. Any other
-    // engine failure (a stream error, a replay-window overrun needing resync)
-    // is an availability problem, not an integrity one, and must not
-    // impersonate it: exit 1 and let the orchestrator restart.
+    // Exit 2 is reserved for a proven divergence (the latch records
+    // before the engine surfaces `Divergence`), the page-the-humans
+    // signal. Any other engine failure (a stream error, a replay-window
+    // overrun needing resync) is an availability problem, not an
+    // integrity one, and must not look like one: exit 1 and let the
+    // orchestrator restart.
     if divergence.is_halted() {
         if let Some(reason) = divergence.reason() {
             tracing::error!(reason = %reason, "validator halted on divergence");

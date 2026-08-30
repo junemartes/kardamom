@@ -1,10 +1,10 @@
-//! Account/storage-level anchor gate (spec: no-std-exec-core, phase 3b):
-//! `verify_witness_anchored` + `recompute_post_root` over a realistic
-//! two-trie state, cross-checked against alloy-trie's one-shot roots (the
-//! primitive `kardamom-state`'s oracle wraps).
+//! Account and storage-level anchor gate: `verify_witness_anchored` and
+//! `recompute_post_root` over a
+//! realistic two-trie state, cross-checked against alloy-trie's one-shot
+//! roots (the primitive `kardamom-state`'s oracle wraps).
 //!
-//! The raw sparse-trie mechanics are proven in `anchor_sparse.rs`; this
-//! file proves the STATE SEMANTICS layered on them: TrieAccount leaves,
+//! `anchor_sparse.rs` proves the raw sparse-trie mechanics. This file
+//! proves the state semantics layered on them: TrieAccount leaves,
 //! per-account storage roots, exclusion proofs for absent accounts and
 //! explicit-zero slots, EIP-161 empty-account handling, and refutation of
 //! every witness lie.
@@ -30,7 +30,7 @@ const S1: B256 = B256::with_last_byte(1);
 const S2: B256 = B256::with_last_byte(2);
 const S3: B256 = B256::with_last_byte(3); // explicit-zero read
 
-/// Full reference state: account → (TrieAccount, storage map).
+/// Full reference state: account to (TrieAccount, storage map).
 type RefState = BTreeMap<Address, (TrieAccount, BTreeMap<B256, U256>)>;
 
 fn base_state() -> RefState {
@@ -85,8 +85,8 @@ fn oracle_state_root(st: &RefState) -> B256 {
     alloy_trie::root::state_root_unhashed(st.iter().map(|(addr, (ta, _))| (*addr, *ta)))
 }
 
-/// EVERY node of the account trie and every touched storage trie, keyed by
-/// hash — the test's stand-in for the validator's live trie.
+/// Every node of the account trie, and every touched storage trie, keyed
+/// by hash. This is the test's stand-in for the validator's live trie.
 fn all_nodes(st: &RefState) -> (B256, HashMap<B256, Bytes>) {
     let mut nodes = HashMap::new();
     // Account trie with all keys as proof targets.
@@ -152,7 +152,7 @@ fn proofs_from(nodes: impl IntoIterator<Item = Bytes>) -> WitnessProofs {
     }
 }
 
-/// The honest witness for this test's read set: A (with s1, s2 and an
+/// The honest witness for this test's read set: A (with s1, s2, and an
 /// explicit-zero s3), B, and a proven-absent account.
 fn witness(st: &RefState, root: B256) -> ExecutionWitness {
     let (a, _) = &st[&A];
@@ -208,8 +208,9 @@ fn witness(st: &RefState, root: B256) -> ExecutionWitness {
     }
 }
 
-/// Fixed point over the complete node map (the validator's algorithm; the
-/// test's node source is the reference builder instead of the live trie).
+/// Fixed point over the complete node map (the validator's algorithm).
+/// The test's node source is the reference builder, instead of the live
+/// trie.
 fn anchored<T>(
     all: &HashMap<B256, Bytes>,
     op: impl Fn(&WitnessProofs) -> Result<T, AnchorError>,
@@ -239,8 +240,9 @@ fn honest_witness_verifies_and_recomputes_the_oracle_post_root() {
     assert_eq!(root, oracle_state_root(&st), "reference builders agree");
     let w = witness(&st, root);
 
-    // The block: A's balance and nonce change, s1 rewritten, s2 zeroed
-    // (storage deletion collapse), B untouched, FRESH account created.
+    // The block: A's balance and nonce change, s1 is rewritten, s2 is
+    // zeroed (a storage deletion collapse), B is untouched, and a FRESH
+    // account is created.
     let mut delta = PendingDelta::new();
     delta
         .accounts
@@ -251,7 +253,7 @@ fn honest_witness_verifies_and_recomputes_the_oracle_post_root() {
         .accounts
         .insert(FRESH, (0, U256::from(100_000), KECCAK_EMPTY));
 
-    // Witness for FRESH: the execution READ it (absent) before creating it.
+    // Witness for FRESH: the execution read it (absent) before creating it.
     let mut w = w;
     w.accounts.push(WitnessAccount {
         address: FRESH,
@@ -287,16 +289,16 @@ fn honest_witness_verifies_and_recomputes_the_oracle_post_root() {
     );
     let oracle_post = oracle_state_root(&post);
 
-    // Fixed point: verification + recompute under one growing node set —
-    // exactly the capture loop's shape.
+    // Fixed point: verification and recompute, under one growing node
+    // set. This is exactly the capture loop's shape.
     let (sparse_post, proofs) = anchored(&all, |proofs| {
         let pre = verify_witness_anchored(&w, proofs)?;
         recompute_post_root(&w, proofs, &pre, &delta)
     });
     assert_eq!(sparse_post, oracle_post, "post root equals the oracle");
 
-    // The final proof set also verifies standalone (guest shape: one shot,
-    // no retry).
+    // The final proof set also verifies standalone (the guest shape: one
+    // shot, no retry).
     let pre = verify_witness_anchored(&w, &proofs).expect("guest-shape verify");
     let again = recompute_post_root(&w, &proofs, &pre, &delta).expect("guest-shape recompute");
     assert_eq!(again, oracle_post);
@@ -331,10 +333,11 @@ fn every_witness_lie_is_refuted() {
     );
     assert!(
         refuted(&|w| {
-            // Claim the absent account exists WITH STATE. (Merely flipping
-            // `exists` on all-zero fields is EIP-161-empty — equivalent to
-            // absent by execution semantics, deliberately NOT a lie: the
-            // state table keeps touched-empty rows the trie excludes.)
+            // Claim the absent account exists, with state. Merely
+            // flipping `exists` on all-zero fields is EIP-161-empty,
+            // which execution semantics treat as equivalent to absent.
+            // That is deliberately not a lie: the state table keeps
+            // touched-empty rows that the trie excludes.
             let i = w.accounts.iter().position(|a| a.address == ABSENT).unwrap();
             w.accounts[i].exists = true;
             w.accounts[i].nonce = 1;
@@ -342,9 +345,10 @@ fn every_witness_lie_is_refuted() {
         "absence lie"
     );
     {
-        // The EIP-161 equivalence, positively: witnessed-present-but-empty
-        // against a trie exclusion VERIFIES (the touched-zero-fee-coinbase
-        // shape the live pipeline produces).
+        // The EIP-161 equivalence, shown positively: a
+        // witnessed-present-but-empty account against a trie exclusion
+        // verifies. This is the touched, zero-fee coinbase shape the
+        // live pipeline produces.
         let mut empty_present = w.clone();
         let i = empty_present
             .accounts
@@ -385,7 +389,8 @@ fn every_witness_lie_is_refuted() {
         "zeroed-slot lie"
     );
 
-    // And a lying ROOT is a MissingNode, not a refutation: nothing links.
+    // A lying root gives a MissingNode error, not a refutation. Nothing
+    // links to it.
     let mut lie = w.clone();
     lie.pre_state_root = Some(B256::repeat_byte(0x42));
     assert!(matches!(
@@ -400,8 +405,9 @@ fn emptying_a_preexisting_account_fails_closed() {
     let (root, all) = all_nodes(&st);
     let w = witness(&st, root);
 
-    // B (nonce 0, no code) drained to zero balance → EIP-161 empty →
-    // account-trie deletion, unreachable live and unsupported v0.
+    // B (nonce 0, no code) drained to zero balance becomes EIP-161
+    // empty, which needs an account-trie deletion. Live execution
+    // cannot reach this, and version 0 does not support it.
     let mut delta = PendingDelta::new();
     delta.accounts.insert(B, (0, U256::ZERO, KECCAK_EMPTY));
 
@@ -421,7 +427,8 @@ fn emptying_a_preexisting_account_fails_closed() {
         AnchorError::AccountDeleteUnsupported { address } if address == B
     ));
 
-    // Whereas a FRESH account touched-but-empty is EIP-161-skipped: no-op.
+    // A FRESH account that is touched but empty is EIP-161-skipped
+    // instead: a no-op.
     let mut w2 = w.clone();
     w2.accounts.push(WitnessAccount {
         address: FRESH,

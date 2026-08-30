@@ -1,24 +1,23 @@
-//! Stateless execution over a captured pre-state witness (spec:
-//! no-std-exec-core, phase 2).
+//! Stateless execution over a captured pre-state witness.
 //!
-//! Two halves of one contract:
+//! This is two halves of one contract:
 //!
-//! - [`WitnessRecorder`] (std, validator-side collector) wraps a real
-//!   `StateDatabase` snapshot and records every account/slot/code read with
-//!   the value the snapshot returned. Execution reads reach the snapshot
-//!   only on first touch (`CacheDB` memoizes), so the recording is exactly
-//!   the block's pre-state slice — including PROVEN ABSENCE (an account read
-//!   that returned `None`) and explicit zero slots.
+//! - [`WitnessRecorder`] (`std`, a validator-side collector) wraps a real
+//!   `StateDatabase` snapshot, and records every account, slot, and code
+//!   read with the value the snapshot returned. Execution reads reach the
+//!   snapshot only on first touch (`CacheDB` memoizes), so the recording is
+//!   exactly the block's pre-state slice. This includes proven absence (an
+//!   account read that returned `None`) and explicit zero slots.
 //! - [`WitnessDb`] (`no_std`, the zk-guest shape) replays a
-//!   [`kardamom_types::ExecutionWitness`] as a `StateDatabase`. It is
-//!   FAIL-CLOSED: a read of any key the witness does not carry is an error
-//!   ([`WitnessError`]), never an empty default — an incomplete witness must
-//!   abort a stateless re-execution (and, in phase 3, a proof), not warp it.
+//!   [`kardamom_types::ExecutionWitness`] as a `StateDatabase`. It fails
+//!   closed: a read of any key the witness does not carry is an error
+//!   ([`WitnessError`]), never an empty default. An incomplete witness must
+//!   abort a stateless re-execution (and, in phase 3, a proof), not distort
+//!   it.
 //!
-//! Round-trip guarantee (asserted by the validator's stateless re-execution
-//! test): executing the same records over `WitnessDb::from_witness(capture)`
-//! produces the identical receipts and `BlockDelta` the recorded execution
-//! produced.
+//! Round-trip guarantee, asserted by the validator's stateless re-execution
+//! test: executing the same records over `WitnessDb::from_witness(capture)`
+//! produces the same receipts and `BlockDelta` as the recorded execution.
 
 use alloc::collections::BTreeMap;
 
@@ -30,9 +29,9 @@ use kardamom_types::{
 };
 use revm::primitives::KECCAK_EMPTY;
 
-/// Error surfaced by [`WitnessDb`] when the execution reads a key the
-/// witness does not carry. Deterministic-fatal for a stateless re-execution:
-/// the witness is incomplete for these records.
+/// Error from [`WitnessDb`] when execution reads a key the witness does
+/// not carry. This is fatal for a stateless re-execution: the witness is
+/// incomplete for these records.
 #[derive(Debug, thiserror::Error)]
 pub enum WitnessError {
     #[error("witness missing account {0}")]
@@ -45,11 +44,11 @@ pub enum WitnessError {
 
 impl StateError for WitnessError {}
 
-/// `no_std` witness-backed [`StateDatabase`]. See the module docs for the
-/// fail-closed contract.
+/// A `no_std`, witness-backed [`StateDatabase`]. See the module docs for
+/// the fail-closed contract.
 #[derive(Debug, Default, Clone)]
 pub struct WitnessDb {
-    /// `None` = proven absent.
+    /// `None` means proven absent.
     accounts: BTreeMap<Address, Option<(u64, U256, B256)>>,
     storage: BTreeMap<(Address, B256), U256>,
     code: BTreeMap<B256, Bytes>,
@@ -83,9 +82,9 @@ impl StateDatabase for WitnessDb {
     }
 
     fn code_by_hash(&self, code_hash: B256) -> Result<Bytes, Self::Error> {
-        // Both spellings of "no code" resolve to empty without a witness
-        // entry — mirrors `SnapshotRef::code_by_hash_ref`'s handling plus
-        // the #161 zero-hash normalization.
+        // Both spellings of "no code" resolve to empty, with no witness
+        // entry needed. This mirrors `SnapshotRef::code_by_hash_ref`'s
+        // handling, plus zero-hash normalization.
         if code_hash == KECCAK_EMPTY || code_hash == B256::ZERO {
             return Ok(Bytes::new());
         }
@@ -102,7 +101,7 @@ impl StateDatabase for WitnessDb {
             .ok_or(WitnessError::MissingSlot(address, key))
     }
 
-    /// Receipts are not pre-state; a stateless re-execution never reads them.
+    /// Receipts are not pre-state. A stateless re-execution never reads them.
     fn get_receipt(&self, _pos: BPosition) -> Result<Option<Receipt>, Self::Error> {
         Ok(None)
     }
@@ -112,13 +111,14 @@ impl StateDatabase for WitnessDb {
     }
 }
 
-/// Validator-side witness collector: a recording decorator over the real
-/// snapshot. `std`-only (interior `Mutex` so it satisfies the `Sync` bound
-/// `execute_block_parallel` places on the shared snapshot).
+/// A validator-side witness collector: a recording decorator over the
+/// real snapshot. This needs `std`, because the interior `Mutex` satisfies
+/// the `Sync` bound that `execute_block_parallel` places on the shared
+/// snapshot.
 ///
-/// First-touch wins: the value recorded for a key is the one the FIRST read
-/// observed; later reads are answered from the recording, so the witness and
-/// the live execution can never disagree mid-block.
+/// First touch wins. The value recorded for a key is the one the first
+/// read observed. Later reads are answered from the recording, so the
+/// witness and the live execution can never disagree mid-block.
 #[cfg(feature = "std")]
 pub struct WitnessRecorder<S> {
     inner: S,
@@ -179,7 +179,7 @@ impl<S: StateDatabase> WitnessRecorder<S> {
             .into_iter()
             .map(|(code_hash, code)| CodeEntry { code_hash, code })
             .collect();
-        // BTreeMap iteration is already the canonical sorted order.
+        // BTreeMap iteration already gives the canonical sorted order.
         ExecutionWitness {
             block_number,
             accounts,
@@ -205,8 +205,8 @@ impl<S: StateDatabase> StateDatabase for WitnessRecorder<S> {
     }
 
     fn code_by_hash(&self, code_hash: B256) -> Result<Bytes, Self::Error> {
-        // Empty-code hashes never enter the witness (WitnessDb resolves them
-        // structurally), keeping witnesses minimal.
+        // Empty-code hashes never enter the witness. `WitnessDb` resolves
+        // them structurally, which keeps witnesses minimal.
         if code_hash == KECCAK_EMPTY || code_hash == B256::ZERO {
             return Ok(Bytes::new());
         }
@@ -229,7 +229,7 @@ impl<S: StateDatabase> StateDatabase for WitnessRecorder<S> {
         Ok(v)
     }
 
-    /// Pass-through, unrecorded: receipts are not pre-state.
+    /// Pass through, unrecorded. Receipts are not pre-state.
     fn get_receipt(&self, pos: BPosition) -> Result<Option<Receipt>, Self::Error> {
         self.inner.get_receipt(pos)
     }
@@ -260,7 +260,7 @@ mod tests {
             rec.basic(addr(1)).unwrap(),
             Some((3, U256::from(7u64), B256::ZERO))
         );
-        // Absent account: recorded as proven-absent.
+        // Absent account: recorded as proven absent.
         assert_eq!(rec.basic(addr(2)).unwrap(), None);
         // Explicit zero slot: recorded, not defaulted.
         assert_eq!(rec.storage(addr(1), B256::ZERO).unwrap(), U256::ZERO);
@@ -314,11 +314,11 @@ mod tests {
             .account(addr(1), U256::from(1u64), 0, B256::ZERO)
             .build();
         let rec = WitnessRecorder::new(snap.clone());
-        // Touch in one order…
+        // Touch in one order.
         rec.basic(addr(3)).unwrap();
         rec.basic(addr(1)).unwrap();
         let w1 = rec.into_witness(1);
-        // …and the reverse.
+        // Then touch in the reverse order.
         let rec = WitnessRecorder::new(snap);
         rec.basic(addr(1)).unwrap();
         rec.basic(addr(3)).unwrap();

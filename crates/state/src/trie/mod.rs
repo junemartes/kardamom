@@ -1,25 +1,34 @@
-//! Canonical Ethereum MPT state root over the libmdbx state — **node-incremental**.
+//! The canonical Ethereum MPT state root over the libmdbx state. This
+//! computation is node-incremental.
 //!
-//! Reth's state-root model on `alloy_trie` primitives: stored `BranchNodeCompact`
-//! intermediate nodes ([`node`] codec, kept in the `account_trie`/`storage_trie`
-//! tables) plus a hashed-state mirror (`hashed_accounts`/`hashed_storage`). Per
-//! block, [`update_for_block`] updates the mirror and walks only the changed
-//! key-prefixes ([`walker`], driven by a [`PrefixSet`] over [`cursor`]s),
-//! skipping unchanged subtries via their stored hash. On a large, dense trie
-//! this brings the per-block root cost down from O(all accounts) toward
-//! O(changed keys) — but not all the way: the skip only fires where a stored
-//! node sits at the exact child path with its hash bit set. Extension-shaped
-//! children (whose parent hash bit `HashBuilder` clears) and any subtrie whose
-//! node is stored deeper than the exact path get re-walked from leaves even
-//! when unchanged, so small/sparse tries — including any trie whose top-level
-//! node is an extension — repeatedly pay full-subtree rebuilds. `crate::writer`
-//! drives it inside the block-commit txn so the root advances atomically with
-//! state.
+//! This follows reth's state-root model, built on `alloy_trie`
+//! primitives. It stores `BranchNodeCompact` intermediate nodes (the
+//! [`node`] codec, kept in the `account_trie` and `storage_trie` tables),
+//! plus a hashed-state mirror (`hashed_accounts` and `hashed_storage`).
 //!
-//! The pure `state_root` / `storage_root` rebuild functions below are retained as
-//! the **shadow-check oracle** ([`rebuild_root`]) and the equivalence-test
-//! reference; the **root value** is identical to a full rebuild — proven by the
-//! 50-block `incremental_equals_full_rebuild` test.
+//! Per block, [`update_for_block`] updates the mirror and walks only the
+//! changed key-prefixes ([`walker`], driven by a [`PrefixSet`] over
+//! [`cursor`]s). It skips unchanged subtries using their stored hash.
+//! On a large, dense trie, this brings the per-block root cost down from
+//! O(all accounts) toward O(changed keys), but not all the way:
+//!
+//! - The skip only fires where a stored node sits at the exact child
+//!   path, with its hash bit set.
+//! - Extension-shaped children, whose parent hash bit `HashBuilder`
+//!   clears, get re-walked from leaves even when unchanged.
+//! - The same is true for any subtrie whose node is stored deeper than
+//!   the exact path.
+//!
+//! So small or sparse tries, including any trie whose top-level node is
+//! an extension, repeatedly pay full-subtree rebuilds. `crate::writer`
+//! runs this inside the block-commit transaction, so the root advances
+//! atomically with the state.
+//!
+//! The pure `state_root` and `storage_root` rebuild functions below
+//! remain in place as the shadow-check oracle ([`rebuild_root`]) and the
+//! equivalence-test reference. The resulting root value is identical to
+//! a full rebuild. The 50-block `incremental_equals_full_rebuild` test
+//! proves this.
 
 pub mod cursor;
 pub mod node;
@@ -42,14 +51,14 @@ use signet_libmdbx::tx::aliases::RwTxSync;
 
 use crate::error::StateError;
 
-/// Node-incremental state-root computation over the stored trie tables. The
-/// pure `state_root`/`storage_root` rebuild fns below remain the shadow-check
-/// oracle.
+/// Node-incremental state-root computation over the stored trie
+/// tables. The pure `state_root` and `storage_root` rebuild functions
+/// below remain the shadow-check oracle.
 pub struct StateRoot;
 
 impl StateRoot {
-    /// One account's storage-trie root, incrementally. `prefix_set` holds
-    /// `keccak(slot)` of the account's changed slots.
+    /// One account's storage-trie root, computed incrementally.
+    /// `prefix_set` holds `keccak(slot)` for the account's changed slots.
     pub fn storage_root_incremental(
         tx: &RwTxSync,
         storage_trie: Database,
@@ -60,8 +69,9 @@ impl StateRoot {
         walker::storage_root(tx, storage_trie, hashed_storage, &account_hash, prefix_set)
     }
 
-    /// The world-state account-trie root, incrementally. `prefix_set` holds
-    /// `keccak(addr)` of every changed account (incl. storage-root changes).
+    /// The world-state account-trie root, computed incrementally.
+    /// `prefix_set` holds `keccak(addr)` for every changed account,
+    /// including accounts with only a storage-root change.
     pub fn state_root_incremental(
         tx: &RwTxSync,
         account_trie: Database,
@@ -77,12 +87,20 @@ impl StateRoot {
     }
 }
 
-/// Persist a walk's [`TrieUpdates`] to a node table: range-delete each cleared
-/// subtrie prefix (stale nodes a leaf rebuild may have orphaned under
-/// extensions), then upsert each produced branch node, then delete each
-/// collapsed path. Clears run **before** upserts so freshly produced nodes
-/// inside a cleared region survive. `account_hash` namespaces storage-trie keys
-/// (`None` for the account trie). Used by the writer and the test harness.
+/// Persist a walk's [`TrieUpdates`] to a node table.
+///
+/// This does three things, in order:
+///
+/// 1. Range-delete each cleared subtrie prefix. These are stale nodes
+///    that a leaf rebuild may have orphaned under extensions.
+/// 2. Upsert each produced branch node.
+/// 3. Delete each collapsed path.
+///
+/// Clears must run before upserts, so freshly produced nodes inside a
+/// cleared region survive.
+///
+/// `account_hash` namespaces storage-trie keys; pass `None` for the
+/// account trie. The writer and the test harness both use this function.
 pub fn apply_trie_updates(
     txn: &RwTxSync,
     db: Database,
@@ -134,8 +152,8 @@ impl TrieTables {
     }
 }
 
-/// Delete every row in `db` whose key starts with `prefix` (used to drop a
-/// deleted account's whole hashed-storage / storage-trie subtree).
+/// Delete every row in `db` whose key starts with `prefix`. This drops
+/// a deleted account's whole hashed-storage or storage-trie subtree.
 fn del_prefix(txn: &RwTxSync, db: Database, prefix: &[u8]) -> Result<(), StateError> {
     let mut keys: Vec<Vec<u8>> = Vec::new();
     {
@@ -159,11 +177,13 @@ fn del_prefix(txn: &RwTxSync, db: Database, prefix: &[u8]) -> Result<(), StateEr
     Ok(())
 }
 
-/// Apply one block's `BlockDelta` to the hashed-state mirror and the stored
-/// tries, returning the new canonical world-state root. Runs inside the writer's
-/// block-commit txn (so the root advances atomically with the state). Mirrors
-/// the equivalence-tested harness: storage tries first (stamping each account's
-/// `storage_root` into the hashed account), then the account trie.
+/// Apply one block's `BlockDelta` to the hashed-state mirror and the
+/// stored tries. Returns the new canonical world-state root.
+///
+/// This runs inside the writer's block-commit transaction, so the root
+/// advances atomically with the state. It mirrors the equivalence-tested
+/// harness: storage tries first, stamping each account's `storage_root`
+/// into the hashed account, then the account trie.
 pub fn update_for_block(
     txn: &RwTxSync,
     t: &TrieTables,
@@ -190,7 +210,7 @@ pub fn update_for_block(
             let mut key = ah.as_slice().to_vec();
             key.extend_from_slice(sh.as_slice());
             if val.is_zero() {
-                // Absent-key deletes are fine; any other mdbx failure must
+                // An absent-key delete is fine. Any other mdbx failure must
                 // surface, or the mirror silently diverges from the reference.
                 match txn.del(t.hashed_storage, key, None) {
                     Ok(_) | Err(signet_libmdbx::MdbxError::NotFound) => {}
@@ -265,9 +285,11 @@ pub fn update_for_block(
     Ok(root)
 }
 
-/// Independent full-rebuild of the world-state root from the hashed mirror, used
-/// by the writer's shadow-check. Different code path than the incremental walker
-/// (alloy-trie's one-shot pre-hashed root builders), so a walker bug diverges.
+/// An independent full rebuild of the world-state root from the hashed
+/// mirror, used by the writer's shadow-check. This takes a different
+/// code path than the incremental walker, using alloy-trie's one-shot
+/// pre-hashed root builders, so a walker bug would show up as a
+/// divergence.
 pub fn rebuild_root(txn: &RwTxSync, t: &TrieTables) -> Result<B256, StateError> {
     // Per-account storage root recomputed from the hashed storage mirror.
     let storage_root_for = |ah: &B256| -> Result<B256, StateError> {
@@ -296,8 +318,9 @@ pub fn rebuild_root(txn: &RwTxSync, t: &TrieTables) -> Result<B256, StateError> 
     Ok(root::state_root_unsorted(accts))
 }
 
-/// The basic account fields needed to form an account-trie leaf. (`AccountValue`
-/// in [`crate::schema`] stores these plus the persisted `storage_root`.)
+/// The basic account fields needed to form an account-trie leaf.
+/// `AccountValue` in [`crate::schema`] stores these, plus the persisted
+/// `storage_root`.
 #[derive(Debug, Clone, Copy)]
 pub struct AccountTrieParts {
     pub nonce: u64,
@@ -307,9 +330,10 @@ pub struct AccountTrieParts {
 }
 
 impl AccountTrieParts {
-    /// Canonical code hash: kardamom seeds codeless accounts (and genesis allocs)
-    /// with `B256::ZERO`, but an Ethereum trie leaf uses `KECCAK_EMPTY` for empty
-    /// code. `ZERO` is never a valid code hash, so the mapping is unambiguous.
+    /// The canonical code hash. Kardamom seeds codeless accounts, and
+    /// genesis allocations, with `B256::ZERO`. But an Ethereum trie leaf
+    /// uses `KECCAK_EMPTY` for empty code. `ZERO` is never a valid code
+    /// hash, so this mapping is unambiguous.
     fn canonical_code_hash(&self) -> B256 {
         if self.code_hash.is_zero() {
             KECCAK_EMPTY
@@ -318,10 +342,10 @@ impl AccountTrieParts {
         }
     }
 
-    /// Canonical storage root: `B256::ZERO` is the "no storage trie computed yet"
-    /// sentinel (e.g. genesis-seeded accounts). An empty storage trie roots to
-    /// `EMPTY_ROOT_HASH`; `ZERO` is never a valid MPT root, so the mapping is
-    /// unambiguous.
+    /// The canonical storage root. `B256::ZERO` is the sentinel for "no
+    /// storage trie computed yet", for example on genesis-seeded accounts.
+    /// An empty storage trie roots to `EMPTY_ROOT_HASH`. `ZERO` is never a
+    /// valid MPT root, so this mapping is unambiguous.
     fn canonical_storage_root(&self) -> B256 {
         if self.storage_root.is_zero() {
             EMPTY_ROOT_HASH
@@ -330,9 +354,10 @@ impl AccountTrieParts {
         }
     }
 
-    /// EIP-161 emptiness: an account with zero nonce, zero balance, and no code
-    /// is not present in the world-state trie. (Storage-bearing accounts have
-    /// code in practice, so `storage_root` is not part of the emptiness test.)
+    /// EIP-161 emptiness. An account with zero nonce, zero balance, and no
+    /// code is not present in the world-state trie. Storage-bearing
+    /// accounts have code in practice, so `storage_root` is not part of
+    /// this test.
     pub(crate) fn is_empty(&self) -> bool {
         self.nonce == 0 && self.balance.is_zero() && self.canonical_code_hash() == KECCAK_EMPTY
     }
@@ -353,17 +378,18 @@ pub fn empty_root() -> B256 {
     EMPTY_ROOT_HASH
 }
 
-/// Storage-trie root for one account from its `(slot, value)` pairs. Zero-valued
-/// slots are omitted (they are absent from an Ethereum storage trie). Keys are
-/// raw slots; alloy-trie hashes them (secure trie). An account with no non-zero
-/// slots yields [`EMPTY_ROOT_HASH`].
+/// The storage-trie root for one account, from its `(slot, value)`
+/// pairs. Zero-valued slots are omitted, because they are absent from an
+/// Ethereum storage trie. Keys are raw slots; alloy-trie hashes them, as
+/// a secure trie. An account with no non-zero slots yields
+/// [`EMPTY_ROOT_HASH`].
 pub fn storage_root(slots: impl IntoIterator<Item = (B256, U256)>) -> B256 {
     root::storage_root_unhashed(slots.into_iter().filter(|(_, v)| !v.is_zero()))
 }
 
-/// World-state root over the full account set. Empty accounts (EIP-161) are
-/// omitted. Addresses are raw; alloy-trie hashes them (secure trie). An empty
-/// account set yields [`EMPTY_ROOT_HASH`].
+/// The world-state root over the full account set. Empty accounts
+/// (EIP-161) are omitted. Addresses are raw; alloy-trie hashes them, as
+/// a secure trie. An empty account set yields [`EMPTY_ROOT_HASH`].
 pub fn state_root(accounts: impl IntoIterator<Item = (Address, AccountTrieParts)>) -> B256 {
     root::state_root_unhashed(
         accounts
@@ -396,8 +422,9 @@ mod tests {
 
     #[test]
     fn empty_accounts_excluded_eip161() {
-        // An account that is empty (nonce 0, balance 0, no code) must not be in
-        // the trie — so a state of only-empty accounts roots to the empty trie.
+        // An account that is empty, with nonce 0, balance 0, and no code,
+        // must not be in the trie. So a state of only empty accounts
+        // roots to the empty trie.
         let empty = address!("0x00000000000000000000000000000000000000aa");
         assert_eq!(
             state_root([(empty, parts(0, 0, EMPTY_ROOT_HASH))]),
@@ -440,9 +467,9 @@ mod tests {
 
     #[test]
     fn zero_sentinels_normalize_to_canonical() {
-        // A funded account seeded with ZERO code_hash + ZERO storage_root (the
-        // kardamom/genesis sentinels) must root identically to one built with
-        // the canonical KECCAK_EMPTY + EMPTY_ROOT_HASH.
+        // A funded account seeded with ZERO code_hash and ZERO storage_root,
+        // the kardamom and genesis sentinels, must root identically to
+        // one built with the canonical KECCAK_EMPTY and EMPTY_ROOT_HASH.
         let a = address!("0x0000000000000000000000000000000000000001");
         let sentinel = AccountTrieParts {
             nonce: 1,
@@ -457,7 +484,7 @@ mod tests {
             storage_root: EMPTY_ROOT_HASH,
         };
         assert_eq!(state_root([(a, sentinel)]), state_root([(a, canonical)]));
-        // And a ZERO-everything empty account is still excluded.
+        // A ZERO-everything empty account is still excluded.
         let empty = AccountTrieParts {
             nonce: 0,
             balance: U256::ZERO,

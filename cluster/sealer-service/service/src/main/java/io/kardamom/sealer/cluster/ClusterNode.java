@@ -12,28 +12,32 @@ import java.io.File;
 import org.agrona.SemanticVersion;
 import org.agrona.concurrent.ShutdownSignalBarrier;
 
-/** Boots an all-in-one Aeron Cluster member (media driver + archive +
- *  consensus module) running {@link SealerClusteredService}. Config via -D sysprops. */
+/**
+ * Boots an all-in-one Aeron Cluster member: a media driver, an archive, and
+ * a consensus module, running {@link SealerClusteredService}.
+ * Configure it with -D system properties.
+ */
 public final class ClusterNode {
     // App version shared with the Rust cluster-client (kardamom-cluster-client's
     // SessionConnectRequest sends APP_SEMANTIC_VERSION = 0.3.0). Two Aeron checks
-    // constrain this, and BOTH require MAJOR 0:
-    //   1. session connect: the client's version major must equal the cluster's
-    //      appVersion major;
-    //   2. leadership term: a FRESH cluster's log version is 0.0.0, and Aeron
-    //      rejects a major mismatch ("incompatible version: X log=0.0.0") which
-    //      makes every member self-terminate.
-    // Pinned to 0.3.0 (Aeron 1.44's default appVersion) on BOTH the ConsensusModule
-    // and the ServiceContainer (they must agree).
+    // constrain this value, and both require major version 0:
+    //   1. Session connect: the client's version major must equal the
+    //      cluster's appVersion major.
+    //   2. Leadership term: a fresh cluster's log version is 0.0.0, and
+    //      Aeron rejects a major mismatch ("incompatible version:
+    //      X log=0.0.0"), which makes every member self-terminate.
+    // Pinned to 0.3.0 (Aeron 1.44's default appVersion) on both the
+    // ConsensusModule and the ServiceContainer. They must agree.
     static final int APP_VERSION = SemanticVersion.compose(0, 3, 0);
 
     public static void main(final String[] args) {
         // "0,ingressHost:port,consensusHost:port,logHost:port,catchupHost:port,archiveHost:port|1,...|2,..."
         final String clusterMembers = System.getProperty("kardamom.cluster.members");
         if (clusterMembers == null) throw new IllegalStateException("kardamom.cluster.members not set");
-        // memberId: use an explicit -Dkardamom.cluster.memberId when given (>=0, e.g.
-        // TestCluster), else derive it from this node's IP. The Nomad deploy passes the
-        // node IP (not an explicit id) because the alloc index != the node it lands on.
+        // memberId: use an explicit -Dkardamom.cluster.memberId when given
+        // (>=0, for example from TestCluster), else derive it from this
+        // node's IP. The Nomad deploy passes the node IP, not an explicit
+        // id, because the alloc index does not match the node it lands on.
         final int memberIdProp = Integer.getInteger("kardamom.cluster.memberId", -1);
         final String nodeIp = System.getProperty("kardamom.cluster.nodeIp");
         final int memberId = (memberIdProp >= 0) ? memberIdProp : memberIdForNodeIp(clusterMembers, nodeIp);
@@ -42,26 +46,28 @@ public final class ClusterNode {
         final String archiveDir = System.getProperty("kardamom.archive.dir", "/opt/kardamom/archive");
         final int ingressStreamId = Integer.getInteger("kardamom.cluster.ingressStreamId", 101);
         final long tickMs = Long.getLong("kardamom.cluster.tickMs", 2000L);
-        // Dedup window: must exceed worst-case racing-replica stall × peak
-        // unique-record throughput, and every member MUST use the same value —
-        // see SealerWire.DEFAULT_DEDUP_CAPACITY for the sizing math.
+        // Dedup window: this must exceed the worst-case racing-replica stall
+        // multiplied by the peak unique-record throughput, and every member
+        // must use the same value. See SealerWire.DEFAULT_DEDUP_CAPACITY for
+        // the sizing math.
         final int dedupCapacity = Integer.getInteger(
             "kardamom.cluster.dedupCapacity", SealerWire.DEFAULT_DEDUP_CAPACITY);
 
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
 
-        // Launch with a retry past the mark-file liveness window. A member that
-        // was HARD-KILLED (kill -9 / docker kill) cannot clear its archive and
-        // cluster mark files; agrona's guard then sees a fresh-enough activity
-        // timestamp and ClusteredMediaDriver.launch throws
-        // "IllegalStateException: active Mark file detected" until the stale
-        // heartbeat ages out (~10s) — the chaos suite's "poison window": a
-        // supervisor restarting the task within it burned restart attempts
-        // until the member was stranded below quorum. Retrying IN-PROCESS
-        // (fresh contexts each attempt — Aeron contexts are single-use) makes a
-        // supervised restart deterministic while PRESERVING the double-run
-        // guard: a genuinely live sibling on the same dirs keeps heartbeating,
-        // so every retry still fails and we exit with the original error.
+        // Launch with a retry past the mark-file liveness window. A member
+        // that was hard-killed (kill -9 or docker kill) cannot clear its
+        // archive and cluster mark files. Agrona's guard then sees a
+        // fresh-enough activity timestamp, and ClusteredMediaDriver.launch
+        // throws "IllegalStateException: active Mark file detected" until
+        // the stale heartbeat ages out, after about 10 seconds. In this
+        // window, a supervisor that restarts the task can burn all its
+        // restart attempts and strand the member below quorum. Retrying
+        // in-process, with fresh contexts each attempt since Aeron contexts
+        // are single-use, makes a supervised restart reliable. It also keeps
+        // the double-run guard: a genuinely live sibling on the same
+        // directories keeps sending heartbeats, so every retry still fails
+        // and this exits with the original error.
         final ShutdownSignalBarrier barrier = new ShutdownSignalBarrier();
         ClusteredMediaDriver driver = null;
         ClusteredServiceContainer container = null;
@@ -100,18 +106,17 @@ public final class ClusterNode {
     }
 
     /**
-     * Periodic cluster-wide snapshot trigger ({@code -Dkardamom.cluster.snapshotIntervalS},
-     * 0 disables). Before this existed NOTHING ever took a snapshot, so the Raft log
-     * grew without bound and a blank member rejoining had to replay the entire
-     * lifetime log — the snapshot/restore path shipped without ever running outside
-     * unit tests.
+     * Periodic cluster-wide snapshot trigger
+     * ({@code -Dkardamom.cluster.snapshotIntervalS}, 0 disables it).
      *
-     * Runs identically on EVERY member: only the leader's control toggle accepts
-     * SNAPSHOT (the action is appended to the replicated log, so all members then
-     * snapshot at the same log position), and on followers {@link ClusterTool#snapshot}
-     * is a no-op returning false — "the current leader snapshots on schedule" with no
-     * cross-member coordination and no deploy special-casing. Failures are logged and
-     * the next tick retries; a snapshot trigger must never take a member down.
+     * <p>This runs the same way on every member. Only the leader's control
+     * toggle accepts SNAPSHOT. The action is appended to the replicated log,
+     * so all members then snapshot at the same log position. On a follower,
+     * {@link ClusterTool#snapshot} is a no-op that returns false. So the
+     * current leader snapshots on schedule, with no cross-member
+     * coordination and no special deploy case. Failures are logged, and the
+     * next tick retries. A snapshot trigger must never take a member
+     * down.</p>
      */
     private static void startSnapshotScheduler(final String clusterDir, final int memberId) {
         final long intervalS = Long.getLong("kardamom.cluster.snapshotIntervalS", 300L);
@@ -143,7 +148,7 @@ public final class ClusterNode {
             + " intervalS=" + intervalS);
     }
 
-    /** Launch retries past the ~10s mark-file liveness window with margin. */
+    /** Launch retries past the ~10s mark-file liveness window, with margin. */
     static final int MAX_LAUNCH_ATTEMPTS = 6;
     static final long LAUNCH_RETRY_DELAY_MS = 5_000;
 
@@ -167,11 +172,13 @@ public final class ClusterNode {
             .dirDeleteOnShutdown(false);
     }
 
-        // Aeron 1.44 requires Archive.Context.replicationChannel to be set (no
-        // default). It's the channel this archive receives replication on during
-        // cluster catch-up (snapshot/log transfer between members). The standard
-        // ClusteredMediaDriver pattern uses this node's IP with an OS-assigned
-        // (ephemeral) port. me[*] all share this node's IP (host of the ingress ep).
+        // Aeron 1.44 requires Archive.Context.replicationChannel to be set;
+        // it has no default. This is the channel this archive uses to
+        // receive replication during cluster catch-up (snapshot and log
+        // transfer between members). The standard ClusteredMediaDriver
+        // pattern uses this node's IP with an OS-assigned (ephemeral) port.
+        // Every entry in me[*] shares this node's IP, the host of the
+        // ingress endpoint.
     private static Archive.Context archiveContext(
             final String aeronDir, final String archiveDir, final String[] me) {
         final String nodeHost = me[0].split(":")[0];
@@ -195,51 +202,51 @@ public final class ClusterNode {
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .ingressChannel("aeron:udp")
-            // The cluster LOG rides Aeron's 64MB default terms -> a 192MB log
-            // buffer for the log publication, PLUS 192MB per member image,
-            // PLUS 192MB per election LogReplay — on the aeron tmpfs. At this
-            // deployment's KB/s rates that's ~all of a 1GB tmpfs gone at
-            // election time: members then die with 'insufficient usable
-            // storage' (log replay / session response pubs) while Raft looks
-            // healthy from outside. 8MB terms (24MB logs) leave an order of
-            // magnitude of headroom without approaching flow-control limits.
+            // The cluster log uses Aeron's 64MB default term length. That
+            // gives a 192MB log buffer for the log publication, plus 192MB
+            // per member image, plus 192MB per election LogReplay, all on
+            // the Aeron tmpfs. At this deployment's KB/s rates, that uses
+            // almost all of a 1GB tmpfs at election time. Members then fail
+            // with "insufficient usable storage" for log replay or session
+            // response publications, while Raft looks healthy from outside.
+            // 8MB terms (24MB logs) leave an order of magnitude of headroom
+            // without approaching flow-control limits.
             .logChannel("aeron:udp?term-length=8m")
             .ingressStreamId(ingressStreamId)
             .appVersion(APP_VERSION)
-            // Client sessions must survive a full quorum outage END TO END
-            // (kill 2/3 -> 15s stall window -> node restart -> member recovery
-            // -> re-election: ~40-60s observed on CI) instead of expiring and
-            // forcing clients through a reconnect. Without canonical-stream
-            // replay on reconnect (a tracked follow-up), a session that dies
-            // while commits continue re-attaches with an unrecoverable GAP —
-            // the client then fail-stops (observed: the validator halting after
-            // the quorum case at 30s). No commits happen during the outage
-            // itself, so a SURVIVING session resumes gap-free. Clients
-            // keep-alive every 1s; a genuinely dead client holds a session
-            // slot for at most 90s, acceptable for this deployment's small,
-            // long-lived client set.
+            // Client sessions must survive a full quorum outage end to end
+            // (kill 2 of 3 members, stall, node restart, member recovery,
+            // re-election) instead of expiring and forcing a client
+            // reconnect. Without canonical-stream replay on reconnect (a
+            // tracked follow-up), a session that dies while commits continue
+            // re-attaches with an unrecoverable gap, and the client then
+            // fail-stops. No commits happen during the outage itself, so a
+            // surviving session resumes with no gap. Clients send a
+            // keep-alive every second. A genuinely dead client holds a
+            // session slot for at most 90 seconds, which is acceptable for
+            // this deployment's small, long-lived client set.
             .sessionTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(90))
-            // The Aeron default (10) sits AT this deployment's legitimate
-            // session count (3 executors + validator + 4 sequencer publishers
-            // + transient smoke/load clients), so ANY reconnect churn locks
-            // everyone out: a forced re-establishment leaks its predecessor
-            // session for up to the 90s timeout above, and a consumer-side
-            // egress-silence storm (observed live: ~400 sessions churned while
-            // the boundary clock was dead) exhausts the slots within seconds —
-            // rejected connects then hammer the module further. 256 gives the
-            // storm three orders of headroom while the 90s timeout still reaps
-            // zombies.
+            // The Aeron default (10) sits at this deployment's normal session
+            // count (3 executors, 1 validator, 4 sequencer publishers, plus
+            // transient smoke and load clients), so any reconnect churn locks
+            // everyone out. A forced re-establishment leaks its old session
+            // for up to the 90-second timeout above, and a consumer-side
+            // egress-silence storm can exhaust the slots within seconds,
+            // and rejected connects then add more load to the module. 256
+            // gives the storm three orders of magnitude of headroom, while
+            // the 90-second timeout still reaps zombie sessions.
             .maxConcurrentSessions(256)
-            // leaderHeartbeatTimeoutNs stays at Aeron's 10s default: raising it
-            // to 20s was tried and made real failovers ~20s slower (leader-kill
-            // recovery blew the 60s pipeline-progress SLO), while the "leader
-            // heartbeat timeout" warnings it was meant to silence were benign.
+            // leaderHeartbeatTimeoutNs stays at Aeron's 10-second default.
+            // Raising it to 20 seconds was tried and made real failovers
+            // about 20 seconds slower, missing the 60-second pipeline
+            // progress SLO on leader-kill recovery, while the "leader
+            // heartbeat timeout" warnings it aimed to silence were harmless.
             .replicationChannel("aeron:udp?endpoint=" + me[3]);
 
-        // Announce self-termination on stdout — Aeron's DEFAULT termination
-        // hook signals the shutdown barrier and the JVM exits 0 with NOTHING on
-        // stderr or in the error log; the line makes the WHEN and the WHICH
-        // grep-able next to the role lines the chaos suite already reads.
+        // Log self-termination to stdout. Aeron's default termination hook
+        // signals the shutdown barrier, and the JVM exits with code 0 and
+        // nothing in stderr or the error log. This line makes the when and
+        // the which grep-able next to the role lines the chaos suite reads.
         ctx.terminationHook(() -> {
             System.out.println("cluster TERMINATION memberId=" + memberId
                 + " component=CONSENSUS_MODULE (requested shutdown — e.g. election/state conflict on rejoin)");
@@ -256,9 +263,9 @@ public final class ClusterNode {
             .clusterDir(new File(clusterDir))
             .appVersion(APP_VERSION)
             .clusteredService(new SealerClusteredService(dedupCapacity, tickMs, memberId));
-        // The clustered-service CONTAINER has its OWN termination hook;
-        // instrumenting only the consensus module still exits silently when the
-        // container is the one that terminates.
+        // The clustered-service container has its own termination hook.
+        // Instrumenting only the consensus module would still exit silently
+        // when the container is the one that terminates.
         ctx.terminationHook(() -> {
             System.out.println("cluster TERMINATION memberId=" + memberId
                 + " component=SERVICE_CONTAINER (requested shutdown)");
@@ -268,12 +275,15 @@ public final class ClusterNode {
     }
 
     /**
-     * Extract this member's 5 endpoints from the pipe/comma clusterMembers string.
-     * Each member entry is {@code id,ingress,consensus,log,catchup,archive}; entries
-     * are pipe-separated. Endpoints are trimmed (stray whitespace in the rendered
-     * Nomad template would otherwise flow opaquely into an Aeron channel URI and fail
-     * deep inside the driver). Malformed entries fail with a descriptive message so a
-     * bad {@code -Dkardamom.cluster.members} is debuggable from the container log.
+     * Extract this member's 5 endpoints from the pipe- and comma-separated
+     * clusterMembers string.
+     * Each member entry is {@code id,ingress,consensus,log,catchup,archive},
+     * and entries are pipe-separated. This trims each endpoint, since stray
+     * whitespace from the rendered Nomad template would otherwise flow into
+     * an Aeron channel URI and fail deep inside the driver. A malformed
+     * entry fails with a clear message, so a bad
+     * {@code -Dkardamom.cluster.members} value is easy to debug from the
+     * container log.
      */
     static String[] memberEndpoints(final String clusterMembers, final int memberId) {
         for (final String member : clusterMembers.split("\\|")) {
@@ -296,9 +306,12 @@ public final class ClusterNode {
         throw new IllegalArgumentException("memberId " + memberId + " not in " + clusterMembers);
     }
 
-    /** Resolve this member's id by matching nodeIp against each member's ingress host
-     *  in the clusterMembers string. Used when memberId isn't given explicitly (the
-     *  Nomad deploy passes the node IP, since alloc index != node). */
+    /**
+     * Resolve this member's id by matching nodeIp against each member's
+     * ingress host in the clusterMembers string.
+     * Used when memberId is not given explicitly. The Nomad deploy passes
+     * the node IP, since the alloc index does not match the node.
+     */
     static int memberIdForNodeIp(final String clusterMembers, final String nodeIp) {
         if (nodeIp == null || nodeIp.isEmpty()) {
             throw new IllegalStateException(

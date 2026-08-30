@@ -1,18 +1,21 @@
-//! Single writer thread: drains the [`WriteBatch`] channel, commits one mdbx
-//! RW txn per block boundary, publishes new snapshots through the snapshot-
-//! swap channel.
+//! A single writer thread. It drains the [`WriteBatch`] channel, commits
+//! one mdbx read-write transaction per block boundary, and publishes new
+//! snapshots through the snapshot-swap channel.
 //!
-//! ## Coordination with S4 executor
+//! ## Coordination with the executor
 //!
-//! S4's executor `submit(boundary: BlockBoundary, delta: BlockDelta)` is the
-//! producer; this writer is the consumer. We accept the pair as
-//! [`WriteBatch`] so the cursor we persist in the `meta` table tracks both
+//! The executor's `submit(boundary: BlockBoundary, delta: BlockDelta)` is
+//! the producer. This writer is the consumer. This crate accepts the pair
+//! as a [`WriteBatch`], so the cursor persisted in the `meta` table
+//! tracks all three values:
+//!
 //! - `last_committed_block` = `boundary.block_number`
 //! - `last_committed_end_tx_position` = `boundary.end_tx_idx`
-//! - `last_fsynced_b_position` = `boundary.end_tx_idx` (same; the boundary
-//!   `end_tx_idx` IS the last B position the executor committed through).
+//! - `last_fsynced_b_position` = `boundary.end_tx_idx`. These are the
+//!   same value, because the boundary's `end_tx_idx` is the last B
+//!   position the executor committed through.
 //!
-//! `BlockDelta` lives in `kardamom-types` — we never redefine it.
+//! `BlockDelta` lives in `kardamom-types`. This crate never redefines it.
 
 use std::thread::{self, JoinHandle};
 
@@ -39,11 +42,14 @@ use crate::swap::{SnapshotHandle, SnapshotReceiver, channel as swap_channel};
 use crate::trie;
 use alloy_primitives::B256;
 
-/// One block's worth of state changes submitted to the writer.
+/// One block's worth of state changes, submitted to the writer.
 ///
-/// Pairs the boundary marker with its delta so the writer can persist all of
-/// (a) the block-level cursors, (b) the per-key state mutations, and
-/// (c) the per-tx receipts in a single atomic mdbx commit.
+/// This pairs the boundary marker with its delta. The writer then
+/// persists, in a single atomic mdbx commit:
+///
+/// - The block-level cursors.
+/// - The per-key state mutations.
+/// - The per-transaction receipts.
 #[derive(Debug, Clone)]
 pub struct WriteBatch {
     pub boundary: BlockBoundary,
@@ -55,8 +61,8 @@ impl WriteBatch {
         Self { boundary, delta }
     }
 
-    /// Worst-case encoded size used by the writer to budget the mdbx txn.
-    /// Heuristic only — not exact.
+    /// The worst-case encoded size, used by the writer to budget the mdbx
+    /// transaction. This is a heuristic, not an exact value.
     pub fn approx_size_bytes(&self) -> usize {
         let acct = self.delta.accounts.len() * (20 + 96);
         let stor = self.delta.storage.len() * (52 + 32);
@@ -68,8 +74,9 @@ impl WriteBatch {
     }
 }
 
-/// Handle returned by [`StateWriter::spawn`]. Drop to stop the writer thread
-/// (which closes the delta sender and joins on the next loop iteration).
+/// The handle returned by [`StateWriter::spawn`]. Drop it to stop the
+/// writer thread. This closes the delta sender, and the thread joins on
+/// its next loop iteration.
 pub struct WriterHandle {
     pub delta_tx: Sender<WriteBatch>,
     pub snapshot_rx: SnapshotReceiver,
@@ -104,23 +111,28 @@ impl Drop for WriterHandle {
 /// How the writer maintains the state-root trie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrieMode {
-    /// No trie (the sequencer-side executor; v0 emits no state-root commitment).
+    /// No trie. The sequencer-side executor uses this; v0 emits no
+    /// state-root commitment.
     Off,
-    /// Node-incremental trie, persisting the canonical MPT root per block.
+    /// A node-incremental trie. This persists the canonical MPT root per
+    /// block.
     Incremental,
-    /// Incremental, plus a full-rebuild shadow-check every `every_n` blocks that
-    /// fail-stops the writer on mismatch (a canary against walker bugs).
+    /// Incremental, plus a full-rebuild shadow-check every `every_n`
+    /// blocks. This check stops the writer on a mismatch, as a canary
+    /// against walker bugs.
     ShadowCheck { every_n: u64 },
 }
 
-/// Single-writer state thread. Owns the only RW mdbx txn at a time.
+/// The single-writer state thread. It owns the only read-write mdbx
+/// transaction at a time.
 pub struct StateWriter {
     env: StateEnv,
     delta_rx: Receiver<WriteBatch>,
     snapshot_handle: SnapshotHandle,
-    /// Trie maintenance mode. `Off` for the executor; `Incremental`/`ShadowCheck`
-    /// for the validator — each block commit advances the canonical Ethereum MPT
-    /// world-state root (see [`crate::trie`]) inside the same atomic txn.
+    /// The trie maintenance mode. `Off` for the executor. `Incremental` or
+    /// `ShadowCheck` for the validator: each block commit then advances
+    /// the canonical Ethereum MPT world-state root (see [`crate::trie`])
+    /// inside the same atomic transaction.
     trie_mode: TrieMode,
 }
 
@@ -131,18 +143,19 @@ impl StateWriter {
         Self::spawn_inner(env, TrieMode::Off)
     }
 
-    /// Spawn the trie-aware writer with the given [`TrieMode`]: each block commit
-    /// advances the Ethereum MPT state root inside the same atomic txn. Used by
-    /// the validator.
+    /// Spawn the trie-aware writer with the given [`TrieMode`]. Each block
+    /// commit then advances the Ethereum MPT state root inside the same
+    /// atomic transaction. The validator uses this.
     pub fn spawn_with_trie(env: StateEnv, mode: TrieMode) -> Result<WriterHandle, StateError> {
         Self::spawn_inner(env, mode)
     }
 
     fn spawn_inner(env: StateEnv, trie_mode: TrieMode) -> Result<WriterHandle, StateError> {
-        // Bounded channel: HORIZON_BLOCKS deep. If the writer falls behind by
-        // more than the version horizon, the executor will block here — at
-        // which point the snapshot it holds is about to be invalidated anyway,
-        // so blocking is the correct fail-fast.
+        // This channel is bounded, HORIZON_BLOCKS deep. If the writer falls
+        // behind by more than the version horizon, the executor blocks
+        // here. At that point, the snapshot the executor holds is about
+        // to become invalid anyway, so blocking is the correct fail-fast
+        // behavior.
         let (delta_tx, delta_rx) =
             crossbeam_channel::bounded(crate::geometry::HORIZON_BLOCKS as usize);
         let (snapshot_handle, snapshot_rx) = swap_channel();
@@ -179,9 +192,9 @@ impl StateWriter {
             env_kind = ?self.env.raw().env_kind(),
             "state writer started"
         );
-        // Confirm the env kind is what we expect — we use the no-write-map
-        // mode by default (the safest choice for arbitrary kernels and the
-        // signet-libmdbx default).
+        // Confirm the env kind is what we expect. This crate uses the
+        // no-write-map mode by default. That is the safest choice for
+        // arbitrary kernels, and it is signet-libmdbx's default.
         assert!(matches!(
             self.env.raw().env_kind(),
             EnvironmentKind::Default | EnvironmentKind::WriteMap
@@ -198,17 +211,17 @@ impl StateWriter {
             let size = batch.approx_size_bytes();
             debug!(block, size_bytes = size, "applying block delta");
             if let Err(e) = self.apply(&batch) {
-                // LOUD on both channels: tracing for production, stderr
-                // unconditionally — a halting state writer strands every
-                // consumer of the snapshot channel (they block, they do
-                // not error), and a silent version of this failure cost a
-                // debugging session to find.
+                // Report this clearly on both channels: tracing for
+                // production, and stderr unconditionally. A halted state
+                // writer strands every consumer of the snapshot channel.
+                // They block instead of erroring, so a silent failure
+                // here is hard to find.
                 eprintln!("kardamom-state-writer HALTING: block {block} apply failed: {e}");
                 error!(block, error = %e, "block apply failed; halting writer");
                 return Err(e);
             }
-            // Publish the post-N snapshot. Old snapshot is dropped inside
-            // SnapshotHandle::publish, which releases its RO txn.
+            // Publish the snapshot after this block. `SnapshotHandle::publish`
+            // drops the old snapshot, which releases its read-only transaction.
             match StateSnapshot::open(&self.env) {
                 Ok(snap) => self.snapshot_handle.publish(snap),
                 Err(e) => {
@@ -236,16 +249,22 @@ impl StateWriter {
         let meta = txn.open_db(Some(TABLE_META))?;
         let t_open = t0.elapsed();
 
-        // --- storage (written first so the trie-aware path can read an
-        // account's current slots when recomputing its storage_root) ---
-        // Upstream StorageChange.key is B256 (matches the StateDatabase trait
-        // signature). The executor writes every slot as an absolute value;
-        // there are no tombstones — writing U256::ZERO means "slot is now zero".
-        // CURSOR + SORTED INPUT: `BlockDelta` vectors come from BTreeMap
-        // iteration, so keys ascend, and a cursor upsert descends the
-        // tree from its previous position instead of from the root —
-        // measured as the difference between a writer that keeps pace
-        // with the execution pipeline and one 2x behind it.
+        // --- storage ---
+        // Write storage first, so the trie-aware path can read an
+        // account's current slots when it recomputes that account's
+        // storage_root.
+        //
+        // Upstream `StorageChange.key` is `B256`, matching the
+        // `StateDatabase` trait signature. The executor writes every slot
+        // as an absolute value. There are no tombstones: writing
+        // `U256::ZERO` means the slot is now zero.
+        //
+        // This uses a cursor with sorted input. `BlockDelta` vectors come
+        // from `BTreeMap` iteration, so keys ascend. A cursor upsert then
+        // walks down the tree from its previous position, instead of
+        // from the root. In one measurement, this was the difference
+        // between a writer that keeps pace with the execution pipeline
+        // and one running twice as slow.
         let t1 = std::time::Instant::now();
         {
             let mut cur = txn.cursor(storage)?;
@@ -261,10 +280,11 @@ impl StateWriter {
         let t_storage = t1.elapsed();
 
         // --- accounts ---
-        // The `accounts` table feeds revm reads (nonce/balance/code_hash) and
-        // does not carry a meaningful storage_root — the state trie keeps the
-        // canonical per-account storage_root in `hashed_accounts` (see
-        // crate::trie). Persist storage_root = ZERO here regardless of trie mode.
+        // The `accounts` table feeds revm reads: nonce, balance, and
+        // code_hash. It does not carry a meaningful `storage_root`. The
+        // state trie keeps the canonical per-account storage root in
+        // `hashed_accounts` (see `crate::trie`). This code always
+        // persists `storage_root` as ZERO here, regardless of trie mode.
         let t2 = std::time::Instant::now();
         {
             let mut cur = txn.cursor(accounts)?;
@@ -284,10 +304,10 @@ impl StateWriter {
         // --- code ---
         for entry in &batch.delta.code {
             let key = encode_code_key(entry.code_hash);
-            // code is content-addressed; NO_OVERWRITE saves a write.
+            // Code is content-addressed. NO_OVERWRITE skips a redundant write.
             match txn.put(code, key, &entry.code, WriteFlags::NO_OVERWRITE) {
                 Ok(()) => {}
-                Err(signet_libmdbx::MdbxError::KeyExist) => {} // duplicate code, fine
+                Err(signet_libmdbx::MdbxError::KeyExist) => {} // Duplicate code. Fine.
                 Err(e) => return Err(e.into()),
             }
         }
@@ -305,21 +325,22 @@ impl StateWriter {
             WriteFlags::UPSERT,
         )?;
 
-        // --- receipts + tx_hash_index ---
-        // For each receipt: write the receipt at its BPosition key, AND
-        // populate tx_hash_index[receipt.tx_hash] = receipt.tx_idx so the S1
-        // proxy can serve eth_getTransactionReceipt(hash) via two reads:
-        //   StateDatabase::get_tx_position(hash) → StateDatabase::get_receipt(pos)
+        // --- receipts and tx_hash_index ---
+        // For each receipt, write the receipt at its BPosition key, and
+        // set tx_hash_index[receipt.tx_hash] = receipt.tx_idx. This lets
+        // a caller serve eth_getTransactionReceipt(hash) with two reads:
+        // StateDatabase::get_tx_position(hash), then
+        // StateDatabase::get_receipt(pos).
         let t3 = std::time::Instant::now();
         {
-            // Receipts arrive in ascending BPosition order — cursor.
+            // Receipts arrive in ascending BPosition order, so use a cursor.
             let mut cur = txn.cursor(receipts)?;
             for r in &batch.delta.receipts {
                 let pos_key = encode_b_position(r.tx_idx);
                 cur.put(&pos_key, &encode_receipt_value(r), WriteFlags::UPSERT)?;
             }
-            // The hash index's keys are random; SORT them first so its
-            // cursor gets the same locality.
+            // The hash index's keys are random. Sort them first, so the
+            // cursor gets the same locality benefit.
             let mut hk: Vec<([u8; 32], [u8; 8])> = batch
                 .delta
                 .receipts
@@ -360,10 +381,11 @@ impl StateWriter {
         )?;
 
         // --- state root (trie-aware only) ---
-        // Node-incrementally advance the canonical Ethereum MPT world-state root
-        // and persist it in the same txn so the root advances atomically with
-        // state. ShadowCheck additionally rebuilds the root from scratch on a
-        // sampling interval and fail-stops on mismatch (canary for walker bugs).
+        // Advance the canonical Ethereum MPT world-state root
+        // incrementally, and persist it in the same transaction. This
+        // makes the root advance atomically with the state. `ShadowCheck`
+        // also rebuilds the root from scratch at a sampling interval, and
+        // stops the writer on a mismatch, as a canary for walker bugs.
         if self.trie_mode != TrieMode::Off {
             let tables = trie::TrieTables::open(&txn)?;
             let root = trie::update_for_block(&txn, &tables, &batch.delta)?;

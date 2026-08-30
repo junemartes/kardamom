@@ -1,8 +1,10 @@
-//! `kardamom-load` — open-loop sustained-load + chaos verification harness.
+//! `kardamom-load` is an open-loop sustained-load and chaos
+//! verification harness.
 //!
-//! Drives a paced, pre-generated tx stream through ingress, tracks every tx to
-//! a receipt (must-deliver), scrapes cluster metrics for drop/liveness
-//! signals, and exits non-zero on a failing verdict. See
+//! It drives a paced, pre-generated transaction stream through
+//! ingress, tracks every transaction to a receipt (must-deliver),
+//! reads cluster metrics for drop and liveness signals, and exits
+//! with a non-zero code on a failing verdict. See
 //! `kardamom_bench::load` for the algorithm.
 
 use std::path::PathBuf;
@@ -21,133 +23,139 @@ use kardamom_bench::load::{self, ANVIL_MNEMONIC, Completeness, LoadConfig};
     about = "Sustained-load + chaos verification harness."
 )]
 struct Args {
-    /// Ingress JSON-RPC URL.
+    /// The ingress JSON-RPC URL.
     #[arg(long)]
     rpc: String,
 
-    /// L2 chain id (probed via eth_chainId when omitted).
+    /// The L2 chain ID. When omitted, the code probes it with eth_chainId.
     #[arg(long)]
     chain_id: Option<u64>,
 
-    /// Soak duration.
+    /// The soak duration.
     #[arg(long, value_parser = humantime::parse_duration, default_value = "300s")]
     duration: Duration,
 
-    /// Ramp ceiling (soak mode) / fixed rate (chaos mode), tx/s.
+    /// The ramp ceiling in soak mode, or the fixed rate in chaos mode,
+    /// in tx/s.
     #[arg(long, default_value_t = 200)]
     target_tps: u32,
 
-    /// Number of sender accounts.
+    /// The number of sender accounts.
     #[arg(long, default_value_t = 16)]
     senders: u32,
 
-    /// First account index in the mnemonic table (reserve low accounts).
+    /// The first account index in the mnemonic table. This reserves
+    /// the low accounts.
     #[arg(long = "sender-offset", default_value_t = 0)]
     sender_offset: u32,
 
-    /// Per-sender starting nonce.
+    /// The starting nonce for each sender.
     #[arg(long = "nonce-start", default_value_t = 0)]
     nonce_start: u64,
 
-    /// BIP-39 mnemonic the senders derive from.
+    /// The BIP-39 mnemonic the senders derive from.
     #[arg(long, default_value = ANVIL_MNEMONIC)]
     mnemonic: String,
 
-    /// Transfer sink address.
+    /// The transfer sink address.
     #[arg(long, default_value = "0x000000000000000000000000000000000000dEaD")]
     to: String,
 
-    /// Wei per transfer.
+    /// The wei value of each transfer.
     #[arg(long, default_value_t = 1)]
     value: u64,
 
-    /// Legacy gas price (wei).
+    /// The legacy gas price, in wei.
     #[arg(long = "gas-price", default_value_t = 1_000_000_000)]
     gas_price: u128,
 
-    /// Max outstanding submits (open-loop back-pressure bound).
+    /// The limit on outstanding submits. This bounds open-loop back pressure.
     #[arg(long = "max-in-flight", default_value_t = 256)]
     max_in_flight: u32,
 
-    /// Max allowed sealer-minus-executor block gap.
+    /// The maximum allowed gap between the sealer and executor block.
     #[arg(long = "max-gap", default_value_t = 5)]
     max_gap: u64,
 
-    /// How long to keep draining receipts after the send window.
+    /// How long to keep draining receipts after the send window ends.
     #[arg(long = "drain-timeout", value_parser = humantime::parse_duration, default_value = "90s")]
     drain_timeout: Duration,
 
-    /// Per-submit retry attempts on transient failure.
-    /// Submit via kardamom_sendRawTransactionAsync + a WebSocket receipt
-    /// subscription instead of the parked eth_sendRawTransaction.
+    /// The number of per-submit retry attempts on a transient failure.
+    /// Submit through kardamom_sendRawTransactionAsync and a WebSocket
+    /// receipt subscription, instead of the parked eth_sendRawTransaction.
     #[arg(long, default_value_t = false)]
     subscribe: bool,
 
-    /// Blocking mode: confirm receipts via the WebSocket feed instead of a
-    /// per-tx eth_getTransactionReceipt re-fetch (halves HTTP request load).
+    /// In blocking mode, confirm receipts through the WebSocket feed
+    /// instead of a per-transaction eth_getTransactionReceipt re-fetch.
+    /// This halves the HTTP request load.
     #[arg(long, default_value_t = false)]
     feed_confirm: bool,
-    /// Workload family: plain transfers or the DeFi mix (CLOB + swap pool
-    /// + vault) with gas-centric reporting.
+    /// The workload family: plain transfers, or the DeFi mix of a
+    /// CLOB, a swap pool, and a vault, with gas-centric reporting.
     #[arg(long, default_value = "transfers", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<kardamom_bench::load::Workload>().map_err(|e| e.to_string())))]
     workload: kardamom_bench::load::Workload,
 
     #[arg(long = "retry-submit", default_value_t = 2)]
     retry_submit: u32,
 
-    /// Ramp increment per step (tx/s); 0 ⇒ target_tps/8.
+    /// The ramp increment for each step, in tx/s. 0 means target_tps / 8.
     #[arg(long = "ramp-step-tps", default_value_t = 0)]
     ramp_step_tps: u32,
 
-    /// Seconds held per ramp step.
+    /// The number of seconds held at each ramp step.
     #[arg(long = "ramp-step-secs", default_value_t = 15)]
     ramp_step_secs: u64,
 
-    /// Fraction of the discovered max to soak at.
+    /// The fraction of the discovered maximum rate to soak at.
     #[arg(long = "soak-fraction", default_value_t = 0.8)]
     soak_fraction: f64,
 
-    /// Completeness criterion: accepted | offered.
+    /// The completeness criterion: accepted or offered.
     #[arg(long, default_value = "accepted")]
     completeness: String,
 
-    /// Fail unless completeness is met.
+    /// Fail the run unless the completeness criterion is met.
     #[arg(long = "assert-all-delivered", default_value_t = false)]
     assert_all_delivered: bool,
 
-    /// Chaos framing: skip ramp; tolerate transient gaps/outages.
+    /// The chaos framing: skip the ramp, and tolerate transient gaps
+    /// or outages.
     #[arg(long = "chaos-mode", default_value_t = false)]
     chaos_mode: bool,
 
-    /// Fixed-rate framing: skip the ramp, soak at target-tps with the STRICT
-    /// verdict. For CI invariant gating on shared/weak hosts, where edge
-    /// discovery measures the hypervisor rather than the stack.
+    /// The fixed-rate framing: skip the ramp, and soak at target_tps
+    /// with the strict verdict. Use this for CI invariant gating on a
+    /// shared or weak host, where edge discovery measures the
+    /// hypervisor rather than the stack.
     #[arg(long = "fixed-rate", default_value_t = false)]
     fixed_rate: bool,
 
-    /// Comma-separated services to scrape: executor/ingress/sequencer. The
-    /// `kardamom_sealer_*` values ride the executor scrape — the clustered
-    /// sealer (Aeron Cluster, Raft) has no endpoint of its own; executors
-    /// re-export its boundary stream from cluster egress.
+    /// The services to scrape, comma-separated: executor, ingress, or
+    /// sequencer. The `kardamom_sealer_*` values ride the executor
+    /// scrape, because the clustered sealer, an Aeron Cluster Raft
+    /// group, has no endpoint of its own; the executors re-export its
+    /// boundary stream from cluster egress.
     #[arg(long, default_value = "executor,ingress")]
     scrape: String,
 
-    /// docker-exec scrape (true) vs direct curl (false).
+    /// Scrape through docker exec when true, or a direct curl when false.
     #[arg(long = "metrics-via-docker", default_value_t = true, action = clap::ArgAction::Set)]
     metrics_via_docker: bool,
 
-    /// Executor node-container names (comma-separated).
+    /// The executor node container names, comma-separated.
     #[arg(
         long = "executor-nodes",
         default_value = "kardamom-executor-0,kardamom-executor-1,kardamom-executor-2"
     )]
     executor_nodes: String,
 
-    /// Ingress node-container name.
+    /// The ingress node container name.
     #[arg(long = "ingress-node", default_value = "kardamom-ingress-0")]
     ingress_node: String,
 
-    /// Sequencer node-container names (comma-separated).
+    /// The sequencer node container names, comma-separated.
     #[arg(
         long = "sequencer-nodes",
         default_value = "kardamom-sequencer-0,kardamom-sequencer-1"

@@ -1,21 +1,23 @@
-//! Snapshot-swap protocol (§5).
+//! Snapshot-swap protocol (spec section 5).
 //!
-//! The writer publishes a fresh `StateSnapshot` after every successful RW
-//! commit. The executor watches the channel and swaps its underlying snapshot
-//! to the new one. Old snapshots are dropped, which releases their mdbx RO
-//! txn and lets the freelist reclaim the corresponding pages.
+//! The writer publishes a fresh `StateSnapshot` after every successful
+//! read-write commit. The executor watches the channel and swaps in the new
+//! snapshot. Dropping an old snapshot releases its mdbx read-only
+//! transaction and lets the freelist reclaim its pages.
 //!
-//! Implementation: the sync path has zero async, single-producer/
-//! single-consumer, both ends on plain threads. This is a "latest value
-//! wins" slot, which no crossbeam channel provides (they are FIFO
-//! queues): the newest snapshot lives in an `ArcSwapOption` (lock-free
-//! load, one atomic swap to publish) and a length-1 crossbeam channel
-//! wakes the sync consumer (the exec thread); a pending wake coalesces
-//! with the next. An async half mirrors every publish into a
-//! `tokio::sync::watch` slot: async consumers (prover spool, commit
-//! poller) park on `changed()` instead of polling `current()` on a
-//! timer. `watch::Sender` needs no runtime to send, so the writer
-//! thread stays runtime-free.
+//! Implementation: the sync path uses no async. It is a single-producer,
+//! single-consumer design, with both ends on plain threads. This is a
+//! "latest value wins" slot. No crossbeam channel gives this; they are
+//! FIFO queues. So the newest snapshot lives in an `ArcSwapOption`. This
+//! gives a lock-free load and one atomic swap to publish. A length-1
+//! crossbeam channel wakes the sync consumer, the exec thread. A pending
+//! wake coalesces with the next one.
+//!
+//! An async half mirrors every publish into a `tokio::sync::watch` slot.
+//! Async consumers, such as the prover spool and the commit poller, park
+//! on `changed()` instead of polling `current()` on a timer.
+//! `watch::Sender` needs no runtime to send. So the writer thread stays
+//! runtime-free.
 
 use std::sync::Arc;
 
@@ -40,7 +42,7 @@ pub struct SnapshotReceiver {
     watch: tokio::sync::watch::Receiver<Option<StateSnapshot>>,
 }
 
-/// Create a fresh swap channel. Returns the producer + consumer ends.
+/// Create a fresh swap channel. Returns the producer and consumer ends.
 pub fn channel() -> (SnapshotHandle, SnapshotReceiver) {
     let latest = Arc::new(ArcSwapOption::empty());
     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -60,18 +62,18 @@ pub fn channel() -> (SnapshotHandle, SnapshotReceiver) {
 }
 
 impl SnapshotHandle {
-    /// Replace the latest snapshot. Drops any prior unconsumed snapshot,
-    /// which releases its mdbx RO txn — exactly the desired behavior since
-    /// the consumer only ever needs the freshest one.
+    /// Replace the latest snapshot. This drops any unconsumed prior
+    /// snapshot and releases its mdbx read-only transaction. This is the
+    /// desired behavior: the consumer only needs the freshest snapshot.
     pub fn publish(&self, snapshot: StateSnapshot) {
-        // The watch slot gets a clone (clones share the inner Arc, so both
-        // slots pin ONE mdbx RO txn). send_replace drops the prior value
+        // The watch slot gets a clone. Clones share the inner Arc, so both
+        // slots pin one mdbx RO txn. `send_replace` drops the prior value,
         // even with zero receivers.
         self.watch.send_replace(Some(snapshot.clone()));
         // `store` drops the previous value once no `load` guard holds it.
         self.latest.store(Some(Arc::new(snapshot)));
-        // try_send: if the slot is full, the receiver has not consumed yet —
-        // the latest-pointer update above is sufficient.
+        // Use try_send. If the slot is full, the receiver has not consumed
+        // the last notification yet. The latest-pointer update above is enough.
         let _ = self.notify.try_send(());
     }
 }
@@ -102,8 +104,8 @@ impl SnapshotReceiver {
 
 #[cfg(test)]
 mod tests {
-    // Real swap behavior is tested in tests/snapshot_swap.rs (needs a live env).
-    // Here we only test that the channel mechanics don't deadlock.
+    // tests/snapshot_swap.rs tests the real swap behavior; it needs a live
+    // env. Here we only test that the channel mechanics do not deadlock.
     use super::*;
 
     #[test]

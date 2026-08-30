@@ -1,6 +1,6 @@
-//! Helper: prints the deterministic factory proxy address derived from the
-//! embedded `KardamomFactoryV1` and `ERC1967Proxy` creation bytecode and the
-//! supplied owner. Run after picking your canonical owner to bake the address
+//! Print the deterministic factory proxy address, derived from the embedded
+//! `KardamomFactoryV1` and `ERC1967Proxy` creation bytecode and the given
+//! owner. Run this after you pick a canonical owner, to bake the address
 //! into KardamomUUPSBase.sol.
 
 use alloy_primitives::Address;

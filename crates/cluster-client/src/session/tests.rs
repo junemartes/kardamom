@@ -26,7 +26,8 @@ fn event(code: EventCode, correlation_id: i64, session: i64, detail: &str) -> Ve
     })
 }
 
-/// Drive a fresh driver to Connected state; returns (driver, session_id).
+/// Drive a fresh driver to the Connected state, using the given session id.
+/// Return the driver.
 fn connected(session: i64) -> SessionDriver {
     let mut d = SessionDriver::new("ch", 1, 1_000);
     let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
@@ -37,23 +38,23 @@ fn connected(session: i64) -> SessionDriver {
     d
 }
 
-// ── #99 regression: foreign-session events must be ignored ──────────────
+// Regression tests: foreign-session events must be ignored.
 //
 // The egress endpoint is per-node static config, so the subscription also
-// receives events addressed to OTHER sessions — most damagingly a killed
-// predecessor process's session corpse timing out ~90s after the kill.
-// Acting on those tore down a healthy session and set up a perpetual
-// open→TIMEOUT→reconnect cycle (issue #99).
+// receives events addressed to other sessions. The worst case is a killed
+// predecessor process's session corpse timing out after the kill. Acting
+// on those events tore down a healthy session and caused a perpetual
+// open, timeout, reconnect cycle.
 
 #[test]
 fn foreign_closed_event_ignored_while_connected() {
     let mut d = connected(77);
-    // The predecessor's session (id 42) times out; its corpse event
+    // The predecessor's session (id 42) times out. Its corpse event
     // arrives on our shared egress channel.
     let evs = d.on_egress(&event(EventCode::Closed, 999, 42, "TIMEOUT"));
     assert!(evs.is_empty(), "foreign Closed must produce no events");
     assert!(d.is_connected(), "our session must survive");
-    // Keep-alives keep flowing for OUR session.
+    // Keep-alives keep flowing for our session.
     let frames = d.poll_outbound(2_000);
     assert!(!frames.is_empty(), "keep-alive cadence unaffected");
 }
@@ -93,7 +94,7 @@ fn stale_correlation_rejection_ignored_while_connecting() {
     let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
         .unwrap()
         .correlation_id;
-    // A rejection for some OTHER correlation (previous process's attempt).
+    // A rejection for some other correlation, from a previous process's attempt.
     let evs = d.on_egress(&event(EventCode::Error, corr + 555, 0, "nope"));
     assert!(evs.is_empty(), "stale rejection must not fail our connect");
     // Our own rejection still lands.
@@ -202,14 +203,14 @@ fn new_leader_event_updates_term_keeps_session() {
             ingress_endpoints: "0=h0:9,1=h1:9,2=h2:9".into()
         }]
     );
-    // Still connected (same session), and now offers under the new term.
+    // Still connected, with the same session, and now offers under the new term.
     assert!(d.is_connected());
     let framed = d.wrap_app(b"y", 0).unwrap();
     match decode_egress(&framed).unwrap() {
         Egress::SessionMessage(m) => assert_eq!(m.leadership_term_id, 10),
         other => panic!("expected SessionMessage, got {other:?}"),
     }
-    // No re-connect is queued (the session is preserved across the term).
+    // No reconnect is queued. The session is preserved across the term.
     assert!(d.poll_outbound(1).is_empty());
 }
 
@@ -258,7 +259,7 @@ fn failed_session_reconnects_after_backoff() {
         .unwrap()
         .correlation_id;
     d.on_egress(&ok_event(corr, 5, 9, 0));
-    // Cluster closes the session (e.g. timeout during a quorum outage).
+    // The cluster closes the session, for example on a timeout during a quorum outage.
     let closed = encode_session_event(&SessionEvent {
         cluster_session_id: 5,
         correlation_id: 0,
@@ -271,8 +272,8 @@ fn failed_session_reconnects_after_backoff() {
         d.on_egress(&closed),
         vec![DriverEvent::Failed("TIMEOUT".into())]
     );
-    // Before the backoff elapses (relative to the last connect at t=0…
-    // long past already at t=10_000): a fresh connect is queued.
+    // The backoff is relative to the last connect at t=0, and t=10_000 is
+    // long past it, so a fresh connect is queued.
     let out = d.poll_outbound(10_000);
     assert_eq!(out.len(), 1);
     assert_eq!(
@@ -320,16 +321,17 @@ fn redirect_connect_does_not_hint_rotation() {
     });
     d.on_egress(&redirect);
     // The redirect-driven connect must go to the member the cluster named,
-    // NOT be rotated away from it.
+    // not be rotated away from it.
     assert_eq!(d.poll_outbound(1).len(), 1);
     assert!(!d.take_rotate_hint());
 }
 
-// CI-replay-loop regression: a consumer whose session egress goes silent
-// must be able to FORCE a re-establishment — a close for the old session,
-// then the normal Failed→backoff→connect self-heal — because re-requesting
-// replay on a session with a dead egress image loops forever (the cluster
-// serves frames + REPLAY_DONE into an image that no longer delivers).
+// Regression test: a consumer whose session egress goes silent must be
+// able to force a re-establishment. This closes the old session, then runs
+// the normal Failed, backoff, connect self-heal. Without it, re-requesting
+// replay on a session with a dead egress image would loop forever, since
+// the cluster serves frames and REPLAY_DONE into an image that no longer
+// delivers.
 #[test]
 fn force_reconnect_closes_old_session_and_reestablishes() {
     let mut d = SessionDriver::new("ch", 1, 1_000);
@@ -353,8 +355,8 @@ fn force_reconnect_closes_old_session_and_reestablishes() {
     assert!(matches!(d.state(), SessionState::Failed(_)));
     assert!(d.wrap_app(b"x", 0).is_none());
 
-    // The self-heal path re-emits a connect (with a rotate hint) and the
-    // new session connects with a FRESH correlation + session id.
+    // The self-heal path re-emits a connect, with a rotate hint, and the
+    // new session connects with a fresh correlation id and session id.
     let out = d.poll_outbound(RECONNECT_BACKOFF_MS + 1);
     assert_eq!(out.len(), 1);
     assert!(d.take_rotate_hint(), "forced reconnect rotates the target");

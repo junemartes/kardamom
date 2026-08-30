@@ -9,21 +9,23 @@ import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.UnsafeBuffer;
 
 /**
- * Cluster snapshot stream I/O for {@link SealerClusteredService}: reads and
- * writes the {@link io.kardamom.sealer.CanonicalSealerState} snapshot byte
- * stream over an Aeron snapshot image/publication. Pure static helpers with
- * zero instance state, so the snapshot-fidelity tests drive them directly
- * against a real embedded media driver (see {@code SnapshotRestoreTest}).
+ * Cluster snapshot stream I/O for {@link SealerClusteredService}.
+ * Reads and writes the {@link io.kardamom.sealer.CanonicalSealerState}
+ * snapshot byte stream over an Aeron snapshot image or publication. These are
+ * pure static helpers with no instance state, so the snapshot-fidelity tests
+ * can call them directly against a real embedded media driver (see
+ * {@code SnapshotRestoreTest}).
  */
 final class SnapshotIo {
 
     /**
-     * Read the WHOLE snapshot byte stream off the snapshot image. Snapshots
-     * larger than the MTU arrive as MANY fragments (and, above
-     * {@code maxMessageLength}, as many messages — see {@link #writeSnapshot}),
-     * so fragments are reassembled with an {@link ImageFragmentAssembler} and
-     * messages concatenated until end-of-stream. A snapshot image that closes
-     * early or carries no bytes is FATAL — never fabricate genesis state.
+     * Read the whole snapshot byte stream off the snapshot image.
+     * A snapshot larger than the MTU arrives as many fragments, and, above
+     * {@code maxMessageLength}, as many messages (see {@link #writeSnapshot}).
+     * This method reassembles fragments with an {@link ImageFragmentAssembler}
+     * and concatenates messages until the end of the stream. A snapshot image
+     * that closes early or carries no bytes is fatal. Never invent genesis
+     * state in its place.
      */
     static byte[] readSnapshot(final Image snapshotImage, final IdleStrategy idleStrategy) {
         final ExpandableArrayBuffer assembled = new ExpandableArrayBuffer();
@@ -55,10 +57,10 @@ final class SnapshotIo {
 
     /**
      * Offer the full snapshot, chunked at the publication's
-     * {@code maxMessageLength} so ANY dedup-window size round-trips. A
-     * terminal offer result is FATAL: exiting silently would record an
-     * empty/truncated snapshot, and the member restoring from it would
-     * diverge (or refuse to start) with no recorded error.
+     * {@code maxMessageLength} so any dedup-window size round-trips.
+     * A terminal offer result is fatal. Exiting silently would record an
+     * empty or truncated snapshot, and the member restoring from it would
+     * diverge, or refuse to start, with no recorded error.
      */
     static void writeSnapshot(
             final ExclusivePublication snapshotPublication,

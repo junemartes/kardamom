@@ -1,12 +1,12 @@
-//! Drive `forge build` to populate `<workspace>/contracts/out/`, then emit a
-//! Rust module that exposes the creation bytecode of each needed artifact via
+//! Run `forge build` to fill `<workspace>/contracts/out/`. Then write a Rust
+//! module that exposes the creation bytecode of each artifact through
 //! `include_bytes!`. After this script runs:
 //!   * `<workspace>/contracts/out/<Name>.sol/<Name>.json` exists.
 //!   * `$OUT_DIR/embedded_artifacts.rs` defines `KARDAMOM_FACTORY_V1_CREATION`,
 //!     `ERC1967_PROXY_CREATION`, `ETH_LOCKBOX_CREATION`.
 //!
-//! Forge is the single source of truth for contract compilation; this script
-//! just orchestrates it and embeds the result. Requires `forge` on PATH.
+//! Forge is the source of truth for contract compilation. This script only
+//! runs forge and embeds the result. It needs `forge` on the PATH.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,11 +48,10 @@ fn main() -> Result<()> {
         .to_path_buf();
     let contracts_root = workspace_root.join("contracts");
 
-    // Emit a rerun trigger for every .sol file recursively so adding a new
-    // contract under contracts/src/<subdir>/ invalidates the cached build.
-    // Cargo's rerun-if-changed on a directory only tracks direct children,
-    // not subdirs — that's why adding contracts/src/L2/ silently didn't
-    // re-trigger build.rs in CI.
+    // Add a rerun trigger for each .sol file, found recursively. This makes a
+    // new contract under contracts/src/<subdir>/ invalidate the cached build.
+    // Cargo's rerun-if-changed on a directory tracks only direct children,
+    // not subdirectories.
     for entry in walk_sol_files(&contracts_root.join("src")) {
         println!("cargo:rerun-if-changed={}", entry.display());
     }
@@ -140,9 +139,10 @@ fn emit_embedded_module(contracts_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read `bytecode.object` (hex) from `artifact_path`, decode to raw bytes, write to
-/// `<out_dir>/<contract>.bin`. Returns that path for `include_bytes!`. Keeps the
-/// source-of-truth as the JSON artifact while letting the consts be raw bytes.
+/// Read `bytecode.object` (hex) from `artifact_path`. Decode it to raw bytes.
+/// Write the bytes to `<out_dir>/<contract>.bin` and return that path for
+/// `include_bytes!`. The JSON artifact stays the source of truth; the consts
+/// hold only raw bytes.
 fn write_creation_bin(
     artifact_path: &Path,
     out_dir: &Path,
@@ -185,9 +185,9 @@ fn hex_nibble(c: u8) -> Result<u8> {
     }
 }
 
-/// Yield every `*.sol` file under `dir` recursively. Used to populate
-/// `cargo:rerun-if-changed=...` so the build script invalidates when contracts
-/// are added or removed anywhere in the tree.
+/// Return every `*.sol` file under `dir`, found recursively. This fills the
+/// `cargo:rerun-if-changed=...` list, so the build reruns when a contract is
+/// added or removed anywhere in the tree.
 fn walk_sol_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     walk_sol_files_into(dir, &mut out);

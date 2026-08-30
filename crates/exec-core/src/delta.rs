@@ -1,18 +1,19 @@
 //! Per-tx write-set accumulation and deterministic hashing.
 //!
 //! `WriteSet` is the per-tx unit. `kardamom_types::BlockDelta` is the
-//! per-block accumulator the state writer eventually consumes. The crucial
-//! invariant is that `WriteSet::hash()` is identical across all executor
-//! replicas for any given tx — see (divergence panic).
+//! per-block accumulator that the state writer consumes. The key invariant
+//! is that `WriteSet::hash()` gives the same value on every executor
+//! replica, for any given tx.
 //!
-//! **No state-root computation here** (S0). The executor never emits
-//! a state-root commitment. Per-tx `write_set_hash` is the sole determinism
-//! witness; block-level attestation is a future validator concern.
+//! This module computes no state root. The executor never emits a
+//! state-root commitment. Per-tx `write_set_hash` is the only determinism
+//! witness here; block-level attestation is a future validator concern.
 //!
-//! Selfdestruct semantics are out of scope for v0 — the EVM hardforks the
-//! executor targets do not produce selfdestruct effects on existing chains
-//! (EIP-6780 reduced its observable effect to balance transfer within the
-//! same tx). Add a `destroyed` flag when the runtime starts requiring it.
+//! Selfdestruct semantics are out of scope for version 0. The EVM
+//! hardforks this executor targets do not produce selfdestruct effects on
+//! existing chains (EIP-6780 reduced its visible effect to a balance
+//! transfer within the same tx). Add a `destroyed` flag when the runtime
+//! needs it.
 
 use alloc::vec::Vec;
 
@@ -21,16 +22,16 @@ use bytes::Bytes;
 use kardamom_types::delta::CodeEntry;
 use kardamom_types::{AccountChange, BlockDelta, StorageChange};
 
-/// One transaction's write effects, as SORTED small-vectors.
+/// One transaction's write effects, as sorted small vectors.
 ///
-/// Was three `BTreeMap`s — but a B-tree allocates a 1KB-class leaf node
-/// per map even for a handful of entries, which DHAT measured at ~2.7KB
-/// of the ~5.4KB/tx execution-path total. A typical tx writes 2-4
-/// accounts, 0-10 slots and 0-1 code entries: inline `SmallVec`s make
-/// the common case ZERO-allocation. Canonical iteration (the hash
-/// contract) comes from sort-on-build instead of tree order: builders
-/// push then call [`WriteSet::finish`]; [`WriteSet::hash`] debug-asserts
-/// sortedness.
+/// This used to store three `BTreeMap`s. A B-tree allocates a 1KB-class
+/// leaf node per map, even for a few entries. DHAT measured this at about
+/// 2.7KB of the roughly 5.4KB/tx execution-path total. A typical tx writes
+/// 2 to 4 accounts, 0 to 10 slots, and 0 or 1 code entries, so inline
+/// `SmallVec`s make the common case allocation-free. Canonical iteration
+/// (the hash contract) comes from sorting on build, not from tree order.
+/// Builders push entries, then call [`WriteSet::finish`]. [`WriteSet::hash`]
+/// debug-asserts that the set is sorted.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[allow(clippy::type_complexity)]
 pub struct WriteSet {
@@ -43,10 +44,10 @@ pub struct WriteSet {
 }
 
 impl WriteSet {
-    /// Sort into canonical order. Builders push in revm's (nondeterministic
-    /// HashMap) iteration order and MUST call this before the set is
-    /// hashed, applied or compared. Keys are unique by construction (one
-    /// entry per account/slot per tx), so unstable sort is safe.
+    /// Sort into canonical order. Builders push entries in revm's
+    /// nondeterministic HashMap iteration order. Call this before the set
+    /// is hashed, applied, or compared. Keys are unique by construction
+    /// (one entry per account or slot per tx), so an unstable sort is safe.
     pub fn finish(&mut self) {
         self.accounts.sort_unstable_by_key(|(a, _)| *a);
         self.storage.sort_unstable_by_key(|(k, _)| *k);
@@ -55,7 +56,8 @@ impl WriteSet {
         debug_assert!(self.storage.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
-    /// Keyed account lookup (linear — the set is tiny; safe pre-finish).
+    /// Look up an account by key. This is a linear search, which is safe
+    /// because the set is tiny, and works before `finish` runs.
     pub fn account(&self, addr: &Address) -> Option<&(u64, U256, B256)> {
         self.accounts
             .iter()
@@ -65,23 +67,15 @@ impl WriteSet {
 
     /// Deterministic keccak256 hash of the write set.
     ///
-    /// Layout (concatenated, then hashed):
-    ///   "ACC" || count_be_u32
-    ///     || for each (addr asc): addr(20) || nonce(8 LE) || balance(32 BE) || code_hash(32)
-    ///   "STO" || count_be_u32
-    ///     || for each ((addr, key) asc): addr(20) || key(32 BE) || value(32 BE)
-    ///   "COD" || count_be_u32
-    ///     || for each (code_hash asc): code_hash(32) || bytes_len(8 LE) || bytes
-    ///
-    /// Stable ordering comes from `BTreeMap`. Numeric encodings are explicit
-    /// width + endianness so two replicas on different architectures produce
-    /// identical bytes.
+    /// See [`WriteSet::encode`] for the exact byte layout. Encoding uses an
+    /// explicit width and endianness for every field, so two replicas on
+    /// different architectures produce identical bytes.
     pub fn hash(&self) -> B256 {
-        // The byte SEQUENCE is the consensus contract; how it reaches the
-        // sponge is not. ONE encoder ([`WriteSet::encode`]) feeds two
-        // sinks — a stack buffer for the common case, the sponge itself
-        // for a write set too large for it (a CREATE carrying bytecode)
-        // — so the two paths cannot drift apart.
+        // The byte sequence is the consensus contract. How it reaches the
+        // hash sponge is not. One encoder ([`WriteSet::encode`]) feeds two
+        // sinks: a stack buffer for the common case, and the sponge itself
+        // for a write set too large for the buffer (for example, a CREATE
+        // that carries bytecode). So the two paths cannot drift apart.
         debug_assert!(
             self.accounts.windows(2).all(|w| w[0].0 < w[1].0)
                 && self.storage.windows(2).all(|w| w[0].0 < w[1].0),
@@ -89,7 +83,7 @@ impl WriteSet {
         );
         let mut h = alloy_primitives::Keccak256::new();
         const INLINE: usize = 1024;
-        // Worst case per entry (every field at full width).
+        // Worst case per entry, with every field at full width.
         let need = 1
             + 10
             + self.accounts.len() * (20 + 1 + 10 + 32 + 32)
@@ -109,11 +103,11 @@ impl WriteSet {
         h.finalize()
     }
 
-    /// THE CONSENSUS ENCODING (v2, compact). Canonical and injective:
-    /// every integer is minimal-width with its width carried, and the
-    /// entry order is the sorted order `finish()` establishes, so one
-    /// write set has exactly one encoding and one encoding describes
-    /// exactly one write set.
+    /// The consensus encoding (v2, compact). This encoding is canonical
+    /// and injective. Every integer is minimal-width, with its width
+    /// carried. The entry order is the sorted order that `finish()`
+    /// establishes. So one write set has exactly one encoding, and one
+    /// encoding describes exactly one write set.
     ///
     /// ```text
     /// u8   version (0x02)
@@ -136,15 +130,16 @@ impl WriteSet {
     ///   per entry, sorted by hash: [32] hash, var len, [len] bytes
     /// ```
     ///
-    /// WHY the compaction: this hash is the per-tx determinism witness
-    /// and BOTH engines pay it — measured at 1.1µs/tx, ~22% of a
-    /// sequential transfer block and ~70% of the STM commit tail's
-    /// work. The cost is Keccak-f permutations (~290ns each), so the
-    /// only real lever is BYTES: the previous fixed-width encoding put
-    /// a 3-account transfer at 297 bytes (3 permutations); minimal-width
-    /// balances, varint nonces and a code-hash tag put it near 100 (ONE
-    /// permutation). Nothing about the witness's meaning changes — same
-    /// inputs, same coverage, fewer bytes.
+    /// Why the compaction: both engines pay for this hash, since it is
+    /// the per-tx determinism witness. Measurements show 1.1µs/tx, about
+    /// 22% of a sequential transfer block, and about 70% of the STM
+    /// commit tail's work. The cost comes from Keccak-f permutations
+    /// (about 290ns each), so the only real lever is byte count. The
+    /// previous fixed-width encoding put a 3-account transfer at 297
+    /// bytes (3 permutations). Minimal-width balances, varint nonces,
+    /// and a code-hash tag put it near 100 bytes (one permutation). The
+    /// witness's meaning does not change: same inputs, same coverage,
+    /// fewer bytes.
     fn encode<S: WsSink>(&self, s: &mut S) {
         s.put(&[WS_ENCODING_V2]);
         put_varint(s, self.accounts.len() as u64);
@@ -188,8 +183,8 @@ impl WriteSet {
 }
 
 impl WriteSet {
-    /// Encoded length — test-only, so the "a transfer fits in one keccak
-    /// block" property can be asserted structurally.
+    /// Encoded length. This is test-only, so a test can check
+    /// structurally that a transfer fits in one keccak block.
     pub fn encoded_len_for_test(&self) -> usize {
         struct Counter(usize);
         impl WsSink for Counter {
@@ -203,17 +198,19 @@ impl WriteSet {
     }
 }
 
-/// Version byte of the write-set encoding (see [`WriteSet::encode`]).
+/// Version byte for the write-set encoding. See [`WriteSet::encode`].
 const WS_ENCODING_V2: u8 = 0x02;
 
-/// `keccak256([])` — revm's code hash for every account without code, so
-/// it is worth one tag value instead of 32 bytes on every EOA.
+/// `keccak256([])`. Revm uses this as the code hash for every account
+/// without code, so it is worth one tag value instead of 32 bytes on
+/// every externally owned account (EOA).
 const KECCAK_EMPTY_HASH: B256 = B256::new([
     0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
     0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
 ]);
 
-/// Where the canonical encoding goes: a stack buffer, or the sponge.
+/// A destination for the canonical encoding: a stack buffer or the hash
+/// sponge.
 trait WsSink {
     fn put(&mut self, bytes: &[u8]);
 }
@@ -238,7 +235,7 @@ impl WsSink for alloy_primitives::Keccak256 {
     }
 }
 
-/// LEB128, canonical (minimal length).
+/// LEB128 encoding, canonical (minimal length).
 #[inline]
 fn put_varint<S: WsSink>(s: &mut S, mut v: u64) {
     let mut buf = [0u8; 10];
@@ -257,8 +254,8 @@ fn put_varint<S: WsSink>(s: &mut S, mut v: u64) {
     s.put(&buf[..n]);
 }
 
-/// Big-endian bytes with leading zeros stripped, plus the length. Zero
-/// encodes as length 0.
+/// Big-endian bytes with leading zeros removed, plus the length. Zero
+/// has length 0.
 #[inline]
 fn minimal_be(v: &U256) -> ([u8; 32], usize) {
     let bytes = v.to_be_bytes::<32>();
@@ -266,27 +263,27 @@ fn minimal_be(v: &U256) -> ([u8; 32], usize) {
     (bytes, 32 - lead)
 }
 
-/// Mutable per-block accumulator the exec thread carries between txs. Holds
-/// the same canonical maps as `WriteSet` so we can both layer running writes
-/// over the snapshot for the next tx and serialize to `kardamom_types::
-/// BlockDelta` at block close.
+/// Mutable per-block accumulator that the exec thread carries between txs.
+/// It holds the same canonical data as `WriteSet`. This lets the exec
+/// thread layer running writes over the snapshot for the next tx, and
+/// serialize to `kardamom_types::BlockDelta` at block close.
 #[derive(Debug, Default, Clone)]
 pub struct PendingDelta {
-    // HASH maps, deliberately (were BTreeMaps): the accumulator's jobs
-    // are upserts, gets, and unordered iteration — nothing here needs
-    // order, and B-tree CONSTRUCTION was measured as the commit tail's
-    // single largest irreducible cost (~170ns/node; it survived input
-    // reduction, index-sort, and two chunk+merge parallelizations).
-    // The ONE ordered consumer — the state writer's cursor walk — gets
-    // its order from `finalize`, which sorts ONCE, deduped, off the
-    // execution-critical path. Iteration order here is nondeterministic;
-    // any serialization MUST go through `finalize` (it does).
+    // These are hash maps on purpose (they used to be `BTreeMap`s). The
+    // accumulator only does upserts, gets, and unordered iteration, so it
+    // does not need order. B-tree construction was the single largest
+    // fixed cost in the commit tail, about 170ns per node, and stayed
+    // that way after several optimization attempts. The one consumer
+    // that needs order, the state writer's cursor walk, gets it from
+    // `finalize`, which sorts once, after dedup, off the
+    // execution-critical path. Iteration order here is nondeterministic.
+    // Any serialization must go through `finalize`, and it does.
     pub accounts: DeltaMap<Address, (u64, U256, B256)>,
     pub storage: DeltaMap<(Address, B256), U256>,
     pub code: DeltaMap<B256, Bytes>,
 }
 
-/// The accumulator's map type — no_std-friendly hash map.
+/// The accumulator's map type: a hash map that works in `no_std`.
 pub type DeltaMap<K, V> = hashbrown::HashMap<K, V, hashbrown::DefaultHashBuilder>;
 
 impl PendingDelta {
@@ -294,9 +291,9 @@ impl PendingDelta {
         Self::default()
     }
 
-    /// Merge a per-tx WriteSet into the running delta. Later writes overwrite
-    /// earlier ones; this matches the sequential execution model — the last
-    /// tx to touch a slot wins for the block.
+    /// Merge a per-tx `WriteSet` into the running delta. Later writes
+    /// overwrite earlier ones. This matches the sequential execution
+    /// model: the last tx to touch a slot wins for the block.
     pub fn apply(&mut self, ws: WriteSet) {
         for (addr, v) in ws.accounts {
             self.accounts.insert(addr, v);
@@ -309,11 +306,11 @@ impl PendingDelta {
         }
     }
 
-    /// Merge ANOTHER block's delta over this one (the other's writes win) —
-    /// maintains the pipelined commit's single merged read layer over
-    /// multiple unsettled blocks, so per-tx cache seeding stays O(one
-    /// layer) at any pipeline depth. `code` entries are `Bytes` (ref-counted
-    /// — cheap clones).
+    /// Merge another block's delta over this one. The other delta's writes
+    /// win. This keeps the pipelined commit's single merged read layer
+    /// over multiple unsettled blocks, so per-tx cache seeding stays at
+    /// one layer of cost, no matter the pipeline depth. `code` entries
+    /// are `Bytes`, which are reference-counted, so clones are cheap.
     pub fn merge_from(&mut self, other: &PendingDelta) {
         for (addr, v) in &other.accounts {
             self.accounts.insert(*addr, *v);
@@ -326,18 +323,19 @@ impl PendingDelta {
         }
     }
 
-    /// Finalize: produce a wire-shape `BlockDelta` ready for the state
-    /// writer. `receipts` are the block's per-tx receipts in arrival order —
-    /// supplied by the caller (the actor / replayer holds them), persisted by
-    /// the writer into the `receipts` + `tx_hash_index` tables so
-    /// `eth_getTransactionReceipt` answers from durable state after a restart
-    /// (#109: this was hardcoded empty and the read path was dead).
+    /// Finalize: produce a wire-shape `BlockDelta`, ready for the state
+    /// writer. `receipts` are the block's per-tx receipts, in arrival
+    /// order. The caller supplies them (the actor or replayer holds
+    /// them). The writer persists them into the `receipts` and
+    /// `tx_hash_index` tables, so `eth_getTransactionReceipt` can answer
+    /// from durable state after a restart.
     pub fn finalize(self, block_number: u64, receipts: Vec<kardamom_types::Receipt>) -> BlockDelta {
-        // THE canonical ordering point: the accumulator maps are
-        // unordered; every serialized/persisted view of a block delta
-        // passes through here and leaves sorted. Cost: one sort of the
-        // DEDUPED entry set (~0.5ms for 8k entries) — paid once, off the
-        // execution-critical path, instead of B-tree construction on it.
+        // This is the one place that establishes canonical order. The
+        // accumulator maps are unordered. Every serialized or persisted
+        // view of a block delta passes through here and leaves sorted.
+        // Cost: one sort of the deduped entry set, about 0.5ms for 8,000
+        // entries, paid once and off the execution-critical path, instead
+        // of paying for B-tree construction on that path.
         let mut accounts: Vec<AccountChange> = self
             .accounts
             .into_iter()
@@ -375,10 +373,10 @@ impl PendingDelta {
     }
 }
 
-//NOTE: No `block_delta_root` / state-root function here. the
-// executor does not compute or publish any state-root commitment. The sealed
-// BlockBoundary on tx_receipts is slim; the state writer flushes the delta to
-// libmdbx, and that's the end of the executor's role in block closure.
+// NOTE: there is no `block_delta_root` or state-root function here. The
+// executor does not compute or publish a state-root commitment. The sealed
+// BlockBoundary on tx_receipts is slim. The state writer flushes the delta
+// to libmdbx, and that ends the executor's role in block closure.
 
 #[cfg(test)]
 mod tests {
@@ -398,8 +396,8 @@ mod tests {
 
     #[test]
     fn hash_is_independent_of_insertion_order() {
-        // BTreeMap canonicalizes order, so even if a buggy revm wrapper inserted
-        // in different orders, the hash is the same.
+        // finish() sorts the entries, so even if a revm wrapper inserts
+        // them in a different order, the hash is the same.
         let a1 = Address::from([0x11u8; 20]);
         let a2 = Address::from([0x22u8; 20]);
 
@@ -500,11 +498,11 @@ mod tests {
         let bd = delta.finalize(7, receipts);
         assert_eq!(bd.block_number, 7);
         assert_eq!(bd.accounts.len(), 2);
-        // BTreeMap iteration order = ascending; verify deterministic order.
+        // finalize() sorts by address; check that the order is deterministic.
         assert_eq!(bd.accounts[0].address, a1);
         assert_eq!(bd.accounts[1].address, a2);
-        // #109: the block's receipts ride INSIDE the delta so the writer
-        // persists them (receipts + tx_hash_index tables) — no longer empty.
+        // The block's receipts ride inside the delta, so the writer
+        // persists them into the receipts and tx_hash_index tables.
         assert_eq!(bd.receipts.len(), 1);
     }
 }

@@ -1,8 +1,8 @@
 //! RPC golden vectors — W2 of `docs/agents/l1-client-suite-port-spec.md`,
-//! the hive `rpc-compat` analog.
+//! the analog of hive's `rpc-compat`.
 //!
 //! Each `.io` file under `crates/e2e/vectors/rpc/` is a sequence of
-//! request/expectation exchanges frozen against the v0 RPC contract:
+//! request and expectation exchanges, frozen against the v0 RPC contract:
 //!
 //! ```text
 //! # comment
@@ -10,16 +10,18 @@
 //! << {"result": "${CHAIN_ID_HEX}"}
 //! ```
 //!
-//! Expectations are `{"result": …}` or `{"error": {"code": …, "message": …}}`.
-//! `${NAME}` tokens are substituted before sending/matching (chain id,
-//! signed raw txs, addresses); the matchers `${ANY}` (any value) and
-//! `${HEX}` (any `0x…` string) survive into comparison. Object comparison is
-//! SUBSET: keys listed in the expectation must match, extra actual keys are
-//! allowed — pin what the contract promises, tolerate additions. Hex-string
-//! comparison is case-insensitive (alloy checksums addresses).
+//! An expectation is `{"result": …}` or `{"error": {"code": …, "message":
+//! …}}`. `${NAME}` tokens are substituted before sending or matching (chain
+//! id, signed raw transactions, addresses). The matchers `${ANY}` (any
+//! value) and `${HEX}` (any `0x…` string) survive into the comparison.
+//! Object comparison checks a subset: the keys listed in the expectation
+//! must match, but extra keys in the actual value are allowed. This pins
+//! down what the contract promises, and tolerates later additions.
+//! Hex-string comparison ignores case (alloy checksums addresses).
 //!
-//! Vectors are `include_str!`-embedded so both targets ship them inside
-//! their binaries — no fixture paths on the Target-C runner.
+//! Vectors are embedded with `include_str!`, so both targets ship them
+//! inside their binaries, with no fixture paths needed on the Target-C
+//! runner.
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
@@ -53,8 +55,8 @@ const VECTORS: &[(&str, &str)] = &[
 
 pub struct Params {
     /// Funded dev-mnemonic index for the happy-path submit vector. The
-    /// account must be fresh (nonce 0) — the established per-case account
-    /// convention.
+    /// account must be fresh (nonce 0), following the usual per-case
+    /// account convention.
     pub sender: usize,
     /// Transfer recipient (any address; also mnemonic-derived).
     pub recipient: usize,
@@ -108,9 +110,9 @@ fn build_substitutions(t: &Target, p: &Params) -> Result<BTreeMap<String, Value>
 
     let valid = l2::sign_transfer(sender, t.chain_id, 0, recipient, 1)?;
 
-    // Deterministically unrecoverable: r = 0 is outside the scalar field, so
-    // decode succeeds and recovery fails — the exact path the sig-verify
-    // error covers.
+    // This is unrecoverable by design: r = 0 is outside the scalar field.
+    // So decoding succeeds but recovery fails, which is the exact path
+    // the signature-verify error covers.
     let badsig = {
         let tx = TxLegacy {
             chain_id: Some(t.chain_id),
@@ -125,7 +127,8 @@ fn build_substitutions(t: &Target, p: &Params) -> Result<BTreeMap<String, Value>
         encode_2718(tx.into_signed(sig))
     };
 
-    // A block's worth of gas — valid RLP + signature, over the per-tx cap.
+    // A block's worth of gas: valid RLP and signature, but over the
+    // per-transaction cap.
     let overcap = {
         let mut tx = TxLegacy {
             chain_id: Some(t.chain_id),
@@ -143,8 +146,9 @@ fn build_substitutions(t: &Target, p: &Params) -> Result<BTreeMap<String, Value>
         encode_2718(tx.into_signed(sig))
     };
 
-    // Minimal type-3 envelope; only needs to decode (rejection precedes
-    // sig-verify), but sign it properly anyway.
+    // A minimal type-3 envelope. It only needs to decode, since rejection
+    // happens before signature verification, but this signs it properly
+    // anyway.
     let type3 = {
         let mut tx = alloy_consensus::TxEip4844 {
             chain_id: t.chain_id,
@@ -185,8 +189,9 @@ fn encode_2718<T: Encodable2718>(signed: T) -> Vec<u8> {
     out
 }
 
-/// Parse `>> request` / `<< expectation` line pairs; `#` comments and blank
-/// lines are skipped. Every `>>` must be followed by a `<<`.
+/// Parse `>> request` and `<< expectation` line pairs. This skips `#`
+/// comments and blank lines. Every `>>` line must be followed by a `<<`
+/// line.
 fn parse(text: &str) -> Result<Vec<(Value, Value)>> {
     let mut out = Vec::new();
     let mut pending: Option<Value> = None;
@@ -218,8 +223,8 @@ fn parse(text: &str) -> Result<Vec<(Value, Value)>> {
     Ok(out)
 }
 
-/// Replace whole-string `${NAME}` tokens (matchers `${ANY}`/`${HEX}` are not
-/// in the map and survive into `matches`).
+/// Replace whole-string `${NAME}` tokens. The matchers `${ANY}` and
+/// `${HEX}` are not in the map, so they survive into [`matches`].
 fn substitute(v: Value, subs: &BTreeMap<String, Value>) -> Value {
     match v {
         Value::String(s) => {
@@ -244,9 +249,9 @@ fn substitute(v: Value, subs: &BTreeMap<String, Value>) -> Value {
     }
 }
 
-/// Recursive comparison: `${ANY}` matches anything, `${HEX}` any `0x…`
-/// string, objects match as SUBSET of actual, arrays elementwise, hex
-/// strings case-insensitively.
+/// Compare recursively. `${ANY}` matches anything, `${HEX}` matches any
+/// `0x…` string, objects match as a subset of the actual value, arrays
+/// match element by element, and hex strings compare with no case check.
 fn matches(expect: &Value, actual: &Value) -> Result<()> {
     match (expect, actual) {
         (Value::String(e), _) if e == "${ANY}" => Ok(()),

@@ -1,6 +1,7 @@
-// S3/S4/S5 — the transaction-pipeline scenarios: nonce ordering, nonce gaps,
-// and RPC liveness. Included from main.rs (see the header there); shared
-// helpers (`client_timeout`, `target`, …) live in main.rs.
+// The transaction-pipeline scenarios: nonce ordering, nonce gaps, and
+// RPC liveness. This file is included from main.rs (see the header
+// there). Shared helpers (`client_timeout`, `target`, …) live in
+// main.rs.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
@@ -72,11 +73,10 @@ async fn s5_connection_cap_refusal_is_prompt() {
         .expect("S5 cap");
 }
 
-/// Regression test for the #81 pending-registry leak (fixed in #91, the
-/// Weak-indexed registry): client-aborted parked submits must leave no
-/// registry entries behind — queue depth returns to baseline once the park
-/// bound passes. Shipped as an env-gated known-failure canary until the fix
-/// landed; runs unconditionally now.
+/// Regression test for a pending-registry leak, fixed by the
+/// Weak-indexed registry. Client-aborted parked submits must leave no
+/// registry entries behind: queue depth returns to baseline once the
+/// park bound passes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s5_queue_depth_recovers_after_client_aborts() {
@@ -96,9 +96,9 @@ async fn s5_queue_depth_recovers_after_client_aborts() {
         .expect("S5 canary");
 }
 
-/// W2 (docs/agents/l1-client-suite-port-spec.md): the RPC golden vectors —
-/// the whole v0 contract as data. Same vectors run as the Target-C
-/// `rpc-vectors` case.
+/// The RPC golden vectors (docs/agents/l1-client-suite-port-spec.md):
+/// the whole v0 contract as data. The Target-C `rpc-vectors` case runs
+/// the same vectors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn rpc_golden_vectors_hold() {

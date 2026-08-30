@@ -1,5 +1,5 @@
-//! Smoke test: open an env, verify each table is openable inside a read txn,
-//! then close it cleanly.
+//! A smoke test. Open an env, verify each table is openable inside a
+//! read transaction, then close it cleanly.
 
 use kardamom_state::env::{Durability, StateEnvBuilder};
 use kardamom_state::schema::ALL_TABLES;
@@ -28,9 +28,9 @@ fn env_reopens_existing_path() {
             .durability(Durability::SafeNoSync)
             .open()
             .unwrap();
-        // first open creates schema, then closes
+        // The first open creates the schema, then closes.
     }
-    // re-open should find the existing tables
+    // The reopen should find the existing tables.
     let env = StateEnvBuilder::new(tmp.path())
         .durability(Durability::SafeNoSync)
         .open()

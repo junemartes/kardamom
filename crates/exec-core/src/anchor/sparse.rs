@@ -1,22 +1,22 @@
-//! A sparse Merkle-Patricia trie over a content-addressed node set (spec:
-//! no-std-exec-core, phase 3b).
+//! A sparse Merkle-Patricia trie over a content-addressed node set.
 //!
-//! The trie starts as a single unresolved root hash and expands nodes ON
-//! DEMAND from the [`NodeStore`] as keys are read, inserted, or removed.
-//! Untouched subtrees stay unresolved — re-hashing reuses their `RlpNode`
-//! verbatim, which is what makes the post-root recompute O(touched paths)
-//! instead of O(state).
+//! The trie starts as a single unresolved root hash, and expands nodes on
+//! demand from the [`NodeStore`] as keys are read, inserted, or removed.
+//! Untouched subtrees stay unresolved. Re-hashing reuses their `RlpNode`
+//! verbatim, which makes the post-root recompute cost proportional to the
+//! touched paths, not the whole state.
 //!
-//! Every resolved node is verified BY CONSTRUCTION: resolution looks nodes
-//! up by the exact hash the parent carries (the store is keyed by
+//! Every resolved node is verified by construction. Resolution looks
+//! nodes up by the exact hash the parent carries (the store is keyed by
 //! `keccak256(node)`), so a malicious node set can only produce
-//! [`AnchorError::MissingNode`] or a root mismatch — never smuggle state.
+//! [`AnchorError::MissingNode`] or a root mismatch. It can never smuggle
+//! state.
 //!
-//! [`AnchorError::MissingNode`] deliberately names BOTH the hash and the
-//! nibble position: the capture-side fixed point resolves it by re-running
-//! the live-trie walk with that position as a retainer target (hashes are
-//! not addressable there), so its precision is part of the design, not
-//! diagnostics.
+//! [`AnchorError::MissingNode`] names both the hash and the nibble
+//! position on purpose. The capture-side fixed point resolves it by
+//! re-running the live-trie walk with that position as a retainer target
+//! (hashes are not addressable there), so this precision is part of the
+//! design, not just diagnostics.
 //!
 //! [`NodeStore`]: super::NodeStore
 
@@ -39,14 +39,15 @@ enum Node {
 }
 
 impl Node {
-    /// Expand an [`RlpNode`] reference into a structural node (children stay
-    /// unresolved). Inline references (< 32 bytes) decode in place; hash
-    /// references go through the store.
+    /// Expand an [`RlpNode`] reference into a structural node. Children
+    /// stay unresolved. An inline reference (under 32 bytes) decodes in
+    /// place; a hash reference goes through the store.
     fn resolve(r: &RlpNode, at: &Nibbles, store: &NodeStore<'_>) -> Result<Node, AnchorError> {
         let trie_node = store.resolve(r, at)?;
         Ok(match trie_node {
-            // A child reference never points at the empty root: MPT parents
-            // omit empty children entirely (branch mask bit unset).
+            // A child reference never points at the empty root. MPT
+            // parents omit empty children entirely (the branch mask bit
+            // stays unset).
             TrieNode::EmptyRoot => {
                 return Err(AnchorError::Malformed("empty-root node as a child"));
             }
@@ -79,19 +80,21 @@ impl Node {
     }
 }
 
-/// What a key lookup proved. `Absent` is a real (exclusion) proof: the walk
-/// reached the point where the key would live and found something else.
+/// What a key lookup proved. `Absent` is a real exclusion proof: the walk
+/// reached the point where the key would live, and found something else.
 pub enum Lookup {
     Found(Vec<u8>),
     Absent,
 }
 
-/// A sparse MPT rooted at a known hash, expanding through `store` on demand.
+/// A sparse MPT rooted at a known hash, expanding through `store` on
+/// demand.
 ///
-/// All keys are fixed-width 32-byte words (secure-trie: callers pass
-/// `keccak(address)` / `keccak(slot)`), so a path can never terminate AT a
-/// branch — branch value slots are structurally empty in state and storage
-/// tries, and hitting one is a malformed node set, not a state shape.
+/// All keys are fixed-width 32-byte words (a secure trie: callers pass
+/// `keccak(address)` or `keccak(slot)`), so a path can never terminate at
+/// a branch. Branch value slots are structurally empty in state and
+/// storage tries, so hitting one means a malformed node set, not a
+/// possible state shape.
 pub struct SparseTrie<'s, 'p> {
     root: Option<Node>,
     store: &'s NodeStore<'p>,
@@ -110,8 +113,8 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
         }
     }
 
-    /// Prove `key` present (returning its value) or absent. Resolves only
-    /// the nodes on the key's path.
+    /// Prove `key` present (and return its value) or absent. This
+    /// resolves only the nodes on the key's path.
     pub fn lookup(&mut self, key: B256) -> Result<Lookup, AnchorError> {
         let path = Nibbles::unpack(key);
         let Some(root) = self.root.as_mut() else {
@@ -188,8 +191,9 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
                     *existing = value;
                     return Ok(node);
                 }
-                // Split: shared prefix → (extension →) branch with the two
-                // diverging remainders.
+                // Split: a shared prefix becomes an extension (if
+                // non-empty) over a branch with the two diverging
+                // remainders.
                 let common = key.common_prefix_length(&rest);
                 let old_nibble = key.get_unchecked(common);
                 let new_nibble = rest.get_unchecked(common);
@@ -256,8 +260,8 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
         }
     }
 
-    /// Remove `key`. Removing an absent key is a no-op (a write-to-zero of a
-    /// slot that was already absent).
+    /// Remove `key`. Removing an absent key is a no-op, the same as
+    /// writing zero to a slot that was already absent.
     pub fn remove(&mut self, key: B256) -> Result<(), AnchorError> {
         let path = Nibbles::unpack(key);
         let Some(root) = self.root.take() else {
@@ -267,7 +271,7 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
         Ok(())
     }
 
-    /// Remove inside `node`; `None` = the subtree vanished entirely.
+    /// Remove inside `node`. `None` means the subtree vanished entirely.
     fn remove_in(
         node: Node,
         path: &Nibbles,
@@ -282,7 +286,7 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
                 if key == rest {
                     Ok(None)
                 } else {
-                    // Not this key — absent-key remove is a no-op.
+                    // Not this key. Removing an absent key is a no-op.
                     Ok(Some(Node::Leaf { key, value }))
                 }
             }
@@ -303,7 +307,7 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
                 let idx = nibble as usize;
                 match children[idx].take() {
                     None => {
-                        // Absent-key remove: keep the branch untouched.
+                        // Removing an absent key: keep the branch untouched.
                         return Ok(Some(Node::Branch { children }));
                     }
                     Some(child) => {
@@ -313,9 +317,10 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
                         }
                     }
                 }
-                // The child vanished. Two or more survivors keep the branch;
-                // exactly one COLLAPSES it — the deletion shape whose
-                // sibling the capture fixed point must have supplied.
+                // The child vanished. Two or more survivors keep the
+                // branch. Exactly one survivor collapses it. This is the
+                // deletion shape whose sibling the capture fixed point
+                // must have supplied.
                 let mut survivors = children
                     .iter()
                     .enumerate()
@@ -328,8 +333,9 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
                     (Some(_), Some(_)) => Ok(Some(Node::Branch { children })),
                     (Some(i), None) => {
                         // Splice the lone survivor up through nibble `i`.
-                        // Resolving it is what can demand an off-path node —
-                        // the MissingNode the fixed point exists to feed.
+                        // Resolving it can demand an off-path node. This
+                        // is the MissingNode the fixed point exists to
+                        // feed.
                         let survivor = children[i].take().expect("survivor indexed");
                         let mut nib = Nibbles::new();
                         nib.push(i as u8);
@@ -356,17 +362,19 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
         }
     }
 
-    /// Re-hash the trie bottom-up. Untouched (unresolved) subtrees reuse the
-    /// reference their parent carried — no store access, no recompute.
+    /// Re-hash the trie bottom-up. Untouched (unresolved) subtrees reuse
+    /// the reference their parent carried, with no store access and no
+    /// recompute.
     pub fn root(&self) -> B256 {
         match &self.root {
             None => EMPTY_ROOT_HASH,
-            // Nothing was touched at all: the root hash is the reference
-            // itself, NOT keccak of the 33-byte hash-string RLP.
+            // Nothing was touched at all. The root hash is the reference
+            // itself, not keccak of the 33-byte hash-string RLP.
             Some(Node::Unresolved(r)) => match r.as_hash() {
                 Some(h) => h,
-                // An inline reference IS the node encoding (< 32 bytes —
-                // unreachable for secure tries, but keccak of it is correct).
+                // An inline reference is the node encoding (under 32
+                // bytes, unreachable for secure tries, but keccak of it
+                // is still correct).
                 None => keccak256(r.as_slice()),
             },
             Some(node) => {
@@ -379,7 +387,7 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
 }
 
 /// The stand-in used while a child is temporarily moved out during an
-/// in-place edit; never observable after the edit completes.
+/// in-place edit. It is never observable after the edit completes.
 fn placeholder() -> Node {
     Node::Leaf {
         key: Nibbles::new(),
@@ -387,10 +395,10 @@ fn placeholder() -> Node {
     }
 }
 
-/// Encode `node` into `out` as its full RLP (used at the root, where the
-/// hash is always keccak of the encoding regardless of length). Unresolved
-/// roots are handled by [`SparseTrie::root`]; unresolved CHILDREN never
-/// reach here ([`rlp_ref`] short-circuits them).
+/// Encode `node` into `out` as its full RLP. This is used at the root,
+/// where the hash is always keccak of the encoding, no matter the
+/// length. [`SparseTrie::root`] handles unresolved roots. Unresolved
+/// children never reach here; [`rlp_ref`] short-circuits them.
 fn encode_node(node: &Node, out: &mut Vec<u8>) {
     use alloy_rlp::Encodable;
     match node {
@@ -415,9 +423,9 @@ fn encode_node(node: &Node, out: &mut Vec<u8>) {
     }
 }
 
-/// A node's reference form as seen from its parent: the untouched keep
-/// their original reference; the modified re-encode and re-hash (inline if
-/// < 32 bytes, per MPT).
+/// A node's reference form, as seen from its parent. Untouched nodes keep
+/// their original reference. Modified nodes re-encode and re-hash
+/// (inline if under 32 bytes, per MPT).
 fn rlp_ref(node: &Node) -> RlpNode {
     match node {
         Node::Unresolved(r) => r.clone(),
@@ -440,10 +448,11 @@ fn wrap_extension(prefix: Nibbles, node: Node) -> Node {
     }
 }
 
-/// After a removal below an extension: an extension may not point at a leaf
-/// or another extension — merge keys; pointing at a branch stays as-is. An
-/// unresolved child is untouched, hence necessarily still branch-shaped (an
-/// extension never pointed at anything else), so its reference is kept.
+/// After a removal below an extension. An extension may not point at a
+/// leaf or another extension, so this merges keys. Pointing at a branch
+/// stays as-is. An unresolved child is untouched, so it must still be
+/// branch-shaped (an extension never pointed at anything else), and its
+/// reference is kept.
 fn merge_extension(key: Nibbles, child: Node) -> Node {
     match child {
         Node::Leaf { key: ck, value } => Node::Leaf {

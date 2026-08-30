@@ -1,12 +1,12 @@
 //! Target-agnostic chain-semantics scenario drivers.
 //!
-//! Each scenario proves one slice of the spec
-//! (`docs/agents/chain-semantics-e2e-suite-spec.md`) through externally
-//! observable seams only: the ingress JSON-RPC and the per-service
-//! Prometheus endpoints. Nothing here knows how the pipeline was brought up,
-//! so the same drivers run against the Target-L local stack today and the
-//! Target-C `ci-cluster.sh` DinD cluster later (PR-4 swaps the metrics
-//! transport for docker-exec probes behind this same struct).
+//! Each scenario proves one part of the spec
+//! (`docs/agents/chain-semantics-e2e-suite-spec.md`) through external seams
+//! only: the ingress JSON-RPC and the per-service Prometheus endpoints.
+//! Nothing here knows how the pipeline started. So the same drivers run
+//! against the Target-L local stack today, and later against the Target-C
+//! `ci-cluster.sh` DinD cluster (PR-4 swaps the metrics transport for
+//! docker-exec probes behind this same struct).
 
 pub mod bridge;
 pub mod consistency;
@@ -56,12 +56,13 @@ pub const TRIE_SHADOW_MISMATCH: &str = "kardamom_state_trie_shadow_mismatch_tota
 pub struct Target {
     pub rpc: L2Client,
     pub chain_id: u64,
-    /// The ingress-side submit park bound; latency assertions derive from it.
+    /// The ingress-side submit park limit. Latency checks derive from this
+    /// value.
     pub pending_receipt_timeout: Duration,
     pub ingress_metrics: SocketAddr,
     pub executor_metrics: SocketAddr,
     pub sequencer_metrics: Vec<SocketAddr>,
-    /// Present when the stack runs a validator (S6/S7).
+    /// Present when the stack runs a validator.
     pub validator_metrics: Option<SocketAddr>,
 }
 
@@ -87,8 +88,8 @@ impl Target {
             .with_context(|| format!("ingress metric {name} absent"))
     }
 
-    /// Sum of `name` across every sequencer replica (absent ⇒ 0: counters
-    /// only materialise on first increment).
+    /// Sum of `name` across every sequencer replica. A missing value counts
+    /// as 0, because a counter appears only after its first increase.
     pub async fn sequencer_metric_sum(&self, name: &str) -> Result<f64> {
         let mut sum = 0.0;
         for addr in &self.sequencer_metrics {
@@ -114,8 +115,8 @@ impl Target {
 }
 
 // ---------------------------------------------------------------------------
-// Shared receipt helpers — every scenario that inspects an L2 receipt goes
-// through these rather than open-coding the JSON poking.
+// Shared receipt helpers. Every scenario that reads an L2 receipt uses
+// these helpers, instead of writing its own JSON code.
 // ---------------------------------------------------------------------------
 
 /// Wait for the L2 receipt of `hash`, which for a deposit is its
@@ -135,8 +136,8 @@ pub fn receipt_field<'a>(r: &'a serde_json::Value, key: &str) -> Option<&'a str>
     r.get(key).and_then(|v| v.as_str())
 }
 
-/// Where the chain placed the receipt's transaction:
-/// `(blockNumber, transactionIndex)`, hex-parsed.
+/// Where the chain placed the receipt's transaction, as
+/// `(blockNumber, transactionIndex)`. Both values are hex-parsed.
 pub fn receipt_placement(r: &serde_json::Value) -> Result<(u64, u64)> {
     let hex_u64 = |key: &str| -> Result<u64> {
         let s = receipt_field(r, key).with_context(|| format!("receipt has no {key}: {r}"))?;
@@ -156,9 +157,9 @@ pub fn assert_receipt_ok(r: &serde_json::Value, what: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Shared state-DB reads — READ-ONLY mdbx opens of a live service's state dir
-// (mdbx is multi-process: the reader takes an MVCC snapshot and never blocks
-// or disturbs the writer).
+// Shared state-DB reads. These open a live service's state directory as
+// read-only mdbx. mdbx supports many processes: the reader takes an MVCC
+// snapshot and never blocks or disturbs the writer.
 // ---------------------------------------------------------------------------
 
 /// Read-only mdbx open of a service's state dir.
@@ -169,35 +170,35 @@ pub(crate) fn open_state_ro(dir: &Path) -> Result<kardamom_state::StateEnv> {
         .context("open state dir read-only")
 }
 
-/// The validator's currently-committed MPT state root, read from its live
+/// The validator's current committed MPT state root, read from its live
 /// state DB.
 ///
-/// This is the seam a future `eth_getProof`-style API or a root-carrying
-/// metric would replace. Today nothing exposes roots, which is precisely the
-/// user-facing gap the withdrawal scenario documents: a real withdrawer
-/// cannot obtain the `stateRoot` argument `finalizeWithdrawal` demands. For
-/// S8 it is the parity target: an INDEPENDENT computation, not anything the
-/// DA path produced.
+/// A future `eth_getProof`-style API, or a root-carrying metric, could
+/// replace this seam. Today nothing exposes roots. This is the same gap a
+/// real withdrawer faces: it cannot get the `stateRoot` argument that
+/// `finalizeWithdrawal` needs. This is the parity target: an
+/// independent computation, not a value the DA path produced.
 pub fn read_validator_state_root(state_dir: &Path) -> Result<Option<B256>> {
     let env = open_state_ro(state_dir)?;
     let snap = kardamom_state::StateSnapshot::open(&env).context("snapshot validator state")?;
     snap.state_root().context("read validator state root")
 }
 
-/// A consistent read of the `KardamomChainState` predeploy, taken together
-/// with the block number it belongs to.
+/// A consistent read of the `KardamomChainState` predeploy, together with
+/// the block number it belongs to.
 ///
-/// Every field comes from ONE `StateSnapshot` — a single long-lived read
-/// transaction — which is what makes the exact assertions in the S12 scenarios
+/// Every field comes from one `StateSnapshot`: a single long-lived read
+/// transaction. This is what makes the exact checks in the verified-L1
+/// scenarios
 /// possible. Reading the head block and the beacon separately would race the
-/// chain: the beacon could advance between the two reads and an exact
-/// `beats == head - activation_block + 1` check would flap.
+/// chain: the beacon could advance between the two reads, and an exact
+/// `beats == head - activation_block + 1` check would then flap.
 #[derive(Debug, Clone, Copy)]
 pub struct ChainStateView {
     /// Highest block committed in the state DB this was read from.
     pub block_number: u64,
-    /// Raw activation timestamp (ms) of the health-check feature; 0 = never
-    /// scheduled.
+    /// Raw activation timestamp (ms) of the health-check feature. 0 means
+    /// the feature is never scheduled.
     pub activation: U256,
     /// Health beacon, unpacked: `(beats, block_number, timestamp_ms)`.
     pub beacon: (u64, u64, u64),
@@ -210,11 +211,11 @@ impl ChainStateView {
     }
 }
 
-/// Read the chain-state predeploy out of a node's state DB.
+/// Read the chain-state predeploy from a node's state DB.
 ///
-/// Direct mdbx rather than RPC because the ingress serves neither `eth_call`
-/// nor `eth_getStorageAt`; the read is read-only and MVCC, so it never blocks
-/// the running node's writer.
+/// This reads mdbx directly, not RPC, because the ingress serves neither
+/// `eth_call` nor `eth_getStorageAt`. The read is read-only and MVCC, so it
+/// never blocks the running node's writer.
 pub fn read_chain_state(state_dir: &Path) -> Result<ChainStateView> {
     use kardamom_exec_core::features::{
         FEATURE_HEALTH_CHECK, HEALTH_BEACON_SLOT, activation_slot, unpack_beacon,
@@ -239,8 +240,8 @@ pub fn read_chain_state(state_dir: &Path) -> Result<ChainStateView> {
     })
 }
 
-/// Snapshot of the sequencer health counters a semantics scenario requires
-/// to stay flat (no past-nonce drops, no reorder-buffer sheds).
+/// Snapshot of the sequencer health counters that a semantics scenario
+/// needs to stay flat: no past-nonce drops, and no reorder-buffer sheds.
 pub struct SeqCounters {
     pub dropped_past: f64,
     pub evictions: f64,

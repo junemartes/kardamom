@@ -12,10 +12,11 @@ import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
 /**
- * L1-origin / epoch-handling unit tests for {@link CanonicalSealerState}:
- * origin adoption, forced boundaries, slot-range claiming, duplicate-epoch
- * absorption, origin monotonicity, and snapshot compatibility across the
- * pre-origin versions. Split out of {@link CanonicalSealerStateTest}.
+ * L1-origin and epoch-handling unit tests for {@link CanonicalSealerState}.
+ * The tests cover origin adoption, forced boundaries, slot-range claims,
+ * duplicate-epoch absorption, origin monotonicity, and snapshot
+ * compatibility with pre-origin versions.
+ * These tests were split out of {@link CanonicalSealerStateTest}.
  */
 class OriginRecordTest {
 
@@ -29,15 +30,15 @@ class OriginRecordTest {
 
         assertTrue(advance.isPresent());
         Boundary forced = advance.get().forcedBoundary().orElseThrow();
-        // The forced boundary closes a block belonging to the PREVIOUS epoch,
-        // so it must NOT carry the incoming origin.
+        // The forced boundary closes a block from the previous epoch.
+        // So the boundary must not carry the new origin.
         assertEquals(0L, forced.l1Origin, "forced boundary keeps the old origin");
         assertEquals(1L, forced.endTxIdx, "closes the block holding the tx");
-        // The epoch record itself lands AFTER the boundary: it leads the new block.
+        // The epoch record lands after the boundary. It leads the new block.
         assertEquals(1L, advance.get().relayed().index);
         assertEquals(100L, state.l1Origin());
 
-        // Only from the next boundary on does the new origin appear.
+        // The new origin appears only from the next boundary on.
         assertEquals(100L, state.onTick(2_000L).l1Origin);
     }
 
@@ -60,14 +61,15 @@ class OriginRecordTest {
     void back_to_back_epochs_emit_one_block_each_and_no_empty_blocks() {
         CanonicalSealerState state = new CanonicalSealerState(8);
 
-        // A catch-up burst: three epochs with no L2 traffic in between.
+        // This is a catch-up burst: three epochs with no L2 traffic between them.
         Optional<OriginAdvance> a = state.onOriginRecord(id(1), 100L, 1L, payload("e100"), 1_000L);
         Optional<OriginAdvance> b = state.onOriginRecord(id(2), 101L, 1L, payload("e101"), 1_000L);
         Optional<OriginAdvance> c = state.onOriginRecord(id(3), 102L, 1L, payload("e102"), 1_000L);
 
         assertTrue(a.orElseThrow().forcedBoundary().isEmpty(), "nothing open yet");
-        // b and c each close the block their predecessor opened — which is
-        // non-empty (it holds that epoch's record), so each yields exactly one.
+        // b and c each close the block that its predecessor opened.
+        // Each block is non-empty because it holds that epoch's record.
+        // So each closure yields exactly one block.
         assertEquals(100L, b.orElseThrow().forcedBoundary().orElseThrow().l1Origin);
         assertEquals(101L, c.orElseThrow().forcedBoundary().orElseThrow().l1Origin);
         assertEquals(102L, state.l1Origin());
@@ -81,10 +83,11 @@ class OriginRecordTest {
         long blockAfterFirst = state.blockNumber();
         long countAfterFirst = state.canonicalCount();
 
-        // What M racing sequencers actually produce: the SAME epoch re-offered
-        // with the SAME origin the state already adopted. Dedup must absorb
-        // it — treating a non-advancing origin as a fault here would reject
-        // every sequencer but the first.
+        // M racing sequencers can re-offer the same epoch with the same origin
+        // the state already adopted.
+        // Dedup must absorb this case.
+        // If a non-advancing origin were treated as a fault, the state would
+        // reject every sequencer except the first.
         Optional<OriginAdvance> dup =
                 state.onOriginRecord(id(2), 100L, 1L, payload("epoch-100"), 2_000L);
 
@@ -113,7 +116,7 @@ class OriginRecordTest {
     @Test
     void forced_boundary_keeps_timestamps_strictly_increasing_within_a_tick() {
         CanonicalSealerState state = new CanonicalSealerState(8);
-        // Two boundaries inside ONE 250 ms window: the tick, then a forced one.
+        // Two boundaries occur inside one 250 ms window: the tick, then a forced boundary.
         Boundary tick = state.onTick(1_000L);
         state.onRecord(id(1), payload("tx"));
         Boundary forced =
@@ -126,7 +129,7 @@ class OriginRecordTest {
         assertTrue(
                 forced.l2Timestamp > tick.l2Timestamp,
                 "two blocks must never share a timestamp: " + forced.l2Timestamp);
-        // The next aligned tick is far enough ahead to resume plain flooring.
+        // The next aligned tick is far enough ahead to resume normal flooring.
         assertEquals(1_250L, state.onTick(1_250L).l2Timestamp);
     }
 
@@ -142,8 +145,9 @@ class OriginRecordTest {
         assertEquals(state.l1Origin(), restored.l1Origin());
         assertEquals(state.canonicalCount(), restored.canonicalCount());
         assertEquals(state.blockNumber(), restored.blockNumber());
-        // The two must stay indistinguishable: same next boundary, and the
-        // restored member must still refuse a stale origin.
+        // The original and restored states must stay indistinguishable.
+        // Both must produce the same next boundary.
+        // The restored state must still refuse a stale origin.
         assertEquals(state.onTick(2_000L), restored.onTick(2_000L));
         assertThrows(
                 IllegalArgumentException.class,
@@ -152,10 +156,12 @@ class OriginRecordTest {
 
     @Test
     void older_snapshots_load_as_pre_origin_state() {
-        // What an in-place upgrade finds on disk. v1 predates BOTH the
-        // contiguity-guard sender map and the origin trio; v2 has the sender
-        // map but no origin. Both mean origin 0 — exactly the state those
-        // chains were in — so neither needs a migration pass.
+        // This is what an in-place upgrade finds on disk.
+        // Version 1 predates both the contiguity-guard sender map and the
+        // origin trio.
+        // Version 2 has the sender map but no origin.
+        // Both versions mean origin 0, which matches the state of those chains.
+        // So neither version needs a migration pass.
         CanonicalSealerState pre = new CanonicalSealerState(8);
         pre.onRecord(id(1), sender(1), 0L, payload("tx"));
         pre.onTick(1_000L);
@@ -177,7 +183,7 @@ class OriginRecordTest {
         assertEquals(count, fromV1.canonicalCount());
         assertEquals(block, fromV1.blockNumber());
 
-        // v2: the same, plus an (empty) sender map and no origin trio.
+        // v2 format: the same fields, plus an empty sender map and no origin trio.
         java.nio.ByteBuffer v2 = java.nio.ByteBuffer
                 .allocate(4 + 4 + 8 + 8 + 4 + CanonicalSealerState.CANONICAL_ID_LEN + 4)
                 .order(java.nio.ByteOrder.BIG_ENDIAN);
@@ -193,7 +199,7 @@ class OriginRecordTest {
         assertEquals(count, fromV2.canonicalCount());
         assertEquals(block, fromV2.blockNumber());
 
-        // Both adopt an origin normally from there.
+        // Both states adopt an origin normally from there.
         assertTrue(fromV1.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_500L).isPresent());
         assertTrue(fromV2.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_500L).isPresent());
     }
@@ -203,16 +209,16 @@ class OriginRecordTest {
         CanonicalSealerState state = new CanonicalSealerState(8);
         state.onRecord(id(1), payload("tx"));
 
-        // Marker + 3 deposits = 4 slots, relayed at the FIRST of them.
+        // The marker plus 3 deposits use 4 slots. The relay uses the first slot.
         Optional<OriginAdvance> advance =
                 state.onOriginRecord(id(2), 100L, 4L, payload("e100"), 1_000L);
 
         assertEquals(1L, advance.orElseThrow().relayed().index);
         assertEquals(5L, state.canonicalCount(), "range is consumed, not just the marker");
-        // The next ordinary record starts past the deposits — no slot is shared.
+        // The next ordinary record starts after the deposits. No slot is shared.
         assertEquals(5L, state.onRecord(id(3), payload("tx2")).orElseThrow().index);
-        // ...and the boundary that closes the block agrees with the count, which
-        // is exactly what the executor's alignment check compares against.
+        // The boundary that closes the block agrees with the count.
+        // The executor's alignment check compares against this same count.
         assertEquals(6L, state.onTick(1_500L).endTxIdx);
     }
 
@@ -228,16 +234,17 @@ class OriginRecordTest {
         assertEquals(0L, state.canonicalCount());
     }
 
-    /// The M-sequencer fan-in: every sequencer forwards every epoch, so all
-    /// but the first offer of each is a duplicate carrying the origin already
-    /// adopted. That is normal traffic, not a regression.
+    /// In the M-sequencer fan-in, every sequencer forwards every epoch.
+    /// So all offers after the first are duplicates that carry the origin
+    /// already adopted.
+    /// This is normal traffic, not a regression.
     @Test
     void racing_sequencers_reoffering_the_same_epoch_is_not_a_regression() {
         CanonicalSealerState state = new CanonicalSealerState(64);
         for (int epoch = 1; epoch <= 3; epoch++) {
             long origin = 100L + epoch;
             for (int sequencer = 0; sequencer < 3; sequencer++) {
-                // Same epoch id from three sequencers, same declared origin.
+                // Three sequencers send the same epoch id with the same declared origin.
                 Optional<OriginAdvance> r =
                         state.onOriginRecord(id(epoch), origin, 1L, payload("e" + epoch), 1_000L);
                 assertEquals(

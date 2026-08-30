@@ -1,10 +1,10 @@
 //! Genesis chain config: chain id plus initial account allocation.
 //!
 //! On disk this is kardamom-native TOML (see `chains/dev.toml`). The struct
-//! derives `serde::Deserialize` directly; the only custom serde code lives
-//! on the `balance` and `code` string-parsed fields. Semantic validation
-//! (chain id != 0, duplicate alloc addresses) happens in `Genesis::validate`,
-//! which the TOML loader calls after parsing.
+//! derives `serde::Deserialize` directly. The only custom serde code is on
+//! the string-parsed `balance` and `code` fields. `Genesis::validate` checks
+//! chain id != 0 and duplicate alloc addresses. The TOML loader calls it
+//! after parsing.
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -34,13 +34,13 @@ impl Genesis {
     /// Build the `(accounts, code)` allocation set for
     /// [`crate::AccountChange`]-based genesis seeding (`kardamom_state::seed_genesis`).
     ///
-    /// Every [`AllocEntry`] becomes one [`crate::AccountChange`] with its
-    /// declared balance/nonce; an empty-code account uses `code_hash =
-    /// B256::ZERO` (the executor/validator convention — kardamom does not use
-    /// the Ethereum `KECCAK_EMPTY` sentinel), and code bytes become a
-    /// [`crate::delta::CodeEntry`]. Using this shared builder keeps the
-    /// rebuild-from-L1 reconstructor's genesis byte-identical to the live
-    /// executor's, so their state roots match.
+    /// Each [`AllocEntry`] becomes one [`crate::AccountChange`] with its
+    /// declared balance and nonce. An empty-code account uses `code_hash =
+    /// B256::ZERO`. This is the executor and validator convention; kardamom
+    /// does not use the Ethereum `KECCAK_EMPTY` sentinel. Code bytes become
+    /// a [`crate::delta::CodeEntry`]. This shared builder keeps the
+    /// rebuild-from-L1 reconstructor's genesis identical, byte for byte, to
+    /// the live executor's genesis, so their state roots match.
     pub fn to_alloc(&self) -> (Vec<crate::AccountChange>, Vec<crate::delta::CodeEntry>) {
         use alloy_primitives::{B256, keccak256};
         let mut accounts = Vec::with_capacity(self.alloc.len());
@@ -68,7 +68,7 @@ impl Genesis {
         (accounts, code)
     }
 
-    /// Semantic validation that can't be expressed in the type or derive.
+    /// Checks rules that the type and derive cannot express.
     pub fn validate(&self) -> Result<(), GenesisError> {
         if self.chain_id == 0 {
             return Err(GenesisError::ZeroChainId);

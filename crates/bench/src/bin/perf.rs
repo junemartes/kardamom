@@ -1,21 +1,23 @@
-//! `kardamom-perf` — cluster performance pipeline CLI.
+//! `kardamom-perf` is the cluster performance pipeline CLI.
 //!
-//! Automates the saturation campaign: bring the deploy/cluster DinD stack up
-//! fresh, ramp offered load to the sustainable edge, hold a steady soak while
-//! async-profiler samples the sealer Raft leader, and fold everything into a
-//! report directory (`load-report.json`, `flame.html`/`flame.svg`,
-//! `stacks.collapsed`, `summary.md`).
+//! It automates the saturation campaign: bring the deploy and cluster
+//! DinD stack up fresh, ramp offered load to the sustainable edge,
+//! hold a steady soak while async-profiler samples the sealer Raft
+//! leader, and fold everything into a report directory
+//! (`load-report.json`, `flame.html`, `flame.svg`, `stacks.collapsed`,
+//! `summary.md`).
 //!
-//!   kardamom-perf up                # fresh stack (build + purge + deploy)
-//!   kardamom-perf run --fresh       # up, then ramp → profile → report
-//!   kardamom-perf run               # reuse the running stack (fresh chain!)
-//!   kardamom-perf report --dir OUT  # re-render summary.md from artifacts
+//!   kardamom-perf up                # Bring up a fresh stack: build, purge, deploy.
+//!   kardamom-perf run --fresh       # up, then ramp, profile, and report.
+//!   kardamom-perf run               # Reuse the running stack. This uses a fresh chain.
+//!   kardamom-perf report --dir OUT  # Re-render summary.md from artifacts.
 //!
-//! Account budget: the pipeline assumes the fresh chain `up` deploys —
-//! genesis accounts #1..#6 drive the discovery ramp and #7..#15 the profiled
-//! soak (#0/#16 belong to the deploy's smoke gates). Rerunning against a
-//! used chain needs a fresh `up` first (nonces are managed locally; ingress
-//! has no eth_getTransactionCount).
+//! Account budget: the pipeline assumes the fresh chain `up` deploys.
+//! Genesis accounts 1 through 6 drive the discovery ramp, and 7
+//! through 15 drive the profiled soak. Accounts 0 and 16 belong to the
+//! deploy's smoke gates. Rerunning against a used chain needs a fresh
+//! `up` first, since nonces are managed locally and ingress has no
+//! eth_getTransactionCount.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -40,22 +42,24 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Bring the cluster up fresh: build images/binaries, purge the previous
-    /// deployment, wipe state, run ci-cluster.sh (KEEP=1, no load/chaos).
+    /// Bring the cluster up fresh: build images and binaries, purge the
+    /// previous deployment, wipe state, and run ci-cluster.sh with
+    /// KEEP=1 and no load or chaos stages.
     Up {
-        /// Skip the builder-image/binary build (reuse staged target/release).
+        /// Skip the builder-image and binary build. Reuse the staged
+        /// target/release.
         #[arg(long)]
         skip_build: bool,
-        /// Repo root (defaults to the current directory).
+        /// The repo root. Defaults to the current directory.
         #[arg(long, default_value = ".")]
         repo_root: PathBuf,
     },
-    /// Ramp to the sustainable edge, then soak while profiling the sealer
-    /// leader; write the report directory.
+    /// Ramp to the sustainable edge, then soak while profiling the
+    /// sealer leader. Writes the report directory.
     Run(RunArgs),
     /// Re-render summary.md from an existing run directory.
     Report {
-        /// A directory previously produced by `kardamom-perf run`.
+        /// A directory that `kardamom-perf run` previously produced.
         #[arg(long)]
         dir: PathBuf,
     },
@@ -63,49 +67,51 @@ enum Cmd {
 
 #[derive(Parser, Debug)]
 struct RunArgs {
-    /// Run `up` first (fresh chain — required unless the stack was just
-    /// deployed and its ramp/profile accounts are unused).
+    /// Run `up` first, for a fresh chain. This is required unless the
+    /// stack was just deployed and its ramp and profile accounts are
+    /// unused.
     #[arg(long)]
     fresh: bool,
-    /// With --fresh: skip the build step.
+    /// With --fresh, skip the build step.
     #[arg(long)]
     skip_build: bool,
-    /// Repo root (defaults to the current directory).
+    /// The repo root. Defaults to the current directory.
     #[arg(long, default_value = ".")]
     repo_root: PathBuf,
-    /// Ingress JSON-RPC URL.
+    /// The ingress JSON-RPC URL.
     #[arg(long, default_value = "http://192.168.56.31:8545")]
     rpc: String,
-    /// Workload for the ramp+soak phases: transfers or defi.
+    /// The workload for the ramp and soak phases: transfers or defi.
     #[arg(long, default_value = "transfers", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<kardamom_bench::load::Workload>().map_err(|e| e.to_string())))]
     workload: kardamom_bench::load::Workload,
-    /// L2 chain id (deploy/cluster genesis).
+    /// The L2 chain ID for the deploy and cluster genesis.
     #[arg(long, default_value_t = 412346)]
     chain_id: u64,
-    /// Ramp ceiling (tx/s) for edge discovery.
+    /// The ramp ceiling, in tx/s, for edge discovery.
     #[arg(long, default_value_t = 4000)]
     ceiling: u32,
-    /// Ramp increment per step (tx/s).
+    /// The ramp increment for each step, in tx/s.
     #[arg(long, default_value_t = 250)]
     ramp_step: u32,
-    /// Seconds held per ramp step.
+    /// The number of seconds held at each ramp step.
     #[arg(long, default_value_t = 12)]
     ramp_step_secs: u64,
-    /// Profiled soak rate as a fraction of the discovered max.
+    /// The profiled soak rate, as a fraction of the discovered maximum.
     #[arg(long, default_value_t = 0.8)]
     soak_fraction: f64,
-    /// Profiled soak length (must cover warmup + both profiler passes).
+    /// The profiled soak length. This must cover warmup and both
+    /// profiler passes.
     #[arg(long, default_value_t = 240)]
     soak_secs: u64,
-    /// Collapsed-capture length within the soak.
+    /// The collapsed-capture length within the soak.
     #[arg(long, default_value_t = 60)]
     profile_secs: u64,
-    /// Drive load via kardamom_sendRawTransactionAsync + a WebSocket
-    /// receipt subscription (in-flight txs hold no connections) instead of
-    /// the parked eth_sendRawTransaction.
+    /// Drive load through kardamom_sendRawTransactionAsync and a
+    /// WebSocket receipt subscription, so an in-flight transaction
+    /// holds no connection, instead of the parked eth_sendRawTransaction.
     #[arg(long, default_value_t = false)]
     subscribe: bool,
-    /// Output base directory (a timestamped subdir is created).
+    /// The output base directory. The code creates a timestamped subdirectory.
     #[arg(long, default_value = "target/perf")]
     out: PathBuf,
 }
@@ -125,7 +131,8 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Shared knobs for both load phases. Senders/offset/rate/shape vary.
+/// The settings shared by both load phases. Senders, offset, rate, and
+/// shape vary between phases.
 #[allow(clippy::too_many_arguments)]
 fn load_cfg(a: &RunArgs, out: PathBuf) -> LoadConfig {
     LoadConfig {
@@ -153,15 +160,16 @@ fn load_cfg(a: &RunArgs, out: PathBuf) -> LoadConfig {
         completeness: Completeness::Accepted,
         assert_all_delivered: true,
         chaos_mode: false,
-        // The perf suite's whole point is edge discovery on dedicated
-        // hardware — always ramp.
+        // The perf suite exists for edge discovery on dedicated hardware.
+        // Always ramp.
         fixed_rate: false,
         scrape: vec!["executor".into(), "ingress".into(), "sequencer".into()],
         metrics_via_docker: true,
         subscribe: a.subscribe,
-        // Blocking runs confirm via the WebSocket feed: one HTTP call per tx
-        // instead of two (the per-tx receipt re-fetch alone was another
-        // full-rate request stream through the proxy + ingress).
+        // Blocking runs confirm through the WebSocket feed: one HTTP call
+        // per transaction instead of two. The per-transaction receipt
+        // re-fetch alone would be another full-rate request stream
+        // through the proxy and ingress.
         feed_confirm: true,
         executor_nodes: vec![
             "kardamom-executor-0".into(),
@@ -181,24 +189,25 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     let out = OutDir::create(&a.out)?;
     println!("==> output dir: {}", out.0.display());
 
-    // Phase 1 — edge discovery: ramp with a token soak (the profiled soak is
-    // phase 2, on its own accounts). Accounts #1..#15: per-sender in-flight
-    // depth ≈ (rate / senders) × latency must stay inside the sequencer's
-    // max_pending_per_sender=16 reorder window, or the harness's own nonce
-    // reordering trips evictions that read as the pipeline's edge. 15
-    // senders keep a 10k tx/s ramp step at ~7 in flight per sender; the old
-    // 6 crossed the window at ~2.4k/step. (#16/#17 are the deploy gates'
-    // re-smoke accounts — never touch them here.)
+    // Phase 1 is edge discovery: ramp with a token soak. The profiled soak
+    // is phase 2, on its own accounts. This phase uses accounts 1 through
+    // 15. The per-sender in-flight depth, approximately
+    // (rate / senders) * latency, must stay inside the sequencer's
+    // max_pending_per_sender window of 16. Otherwise the harness's own
+    // nonce reordering trips evictions that look like the pipeline's edge.
+    // 15 senders keep a 10k tx/s ramp step at about 7 in flight per sender.
+    // Accounts 16 and 17 are the deploy gates' re-smoke accounts; never
+    // touch them here.
     println!("==> phase 1: ramp to the edge (ceiling {} tx/s)", a.ceiling);
     let mut cfg = load_cfg(&a, out.path("discovery-report.json"));
     cfg.target_tps = a.ceiling;
     cfg.senders = 15;
     cfg.sender_offset = 1;
     cfg.duration = Duration::from_secs(1);
-    // Discovery probes past the edge on purpose — retried submits whose first
-    // attempt landed show up as past-nonce drops there. Strict delivery
-    // gating belongs to the profiled soak; here only the per-step
-    // sustainability signals matter.
+    // Discovery probes past the edge on purpose. A retried submit whose
+    // first attempt landed shows up there as a past-nonce drop. Strict
+    // delivery gating belongs to the profiled soak; here, only the
+    // per-step sustainability signals matter.
     cfg.assert_all_delivered = false;
     load::run(cfg).await.context("discovery ramp")?;
     let discovery = report::read_load_report(&out.path("discovery-report.json"))?;
@@ -210,10 +219,11 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
         discovery.discovered_max_tps, soak_rate
     );
 
-    // Phase 2 — steady soak (chaos-mode = fixed rate, no ramp) on the
-    // dedicated genesis block #18..#33 (16 fresh senders — same per-sender
-    // in-flight arithmetic as the ramp, sized for an 8k tx/s soak), with the
-    // profiler attached once the rate is established.
+    // Phase 2 is a steady soak: chaos mode means a fixed rate, with no
+    // ramp, on the dedicated genesis accounts 18 through 33 (16 fresh
+    // senders, with the same per-sender in-flight arithmetic as the
+    // ramp, sized for an 8k tx/s soak). The profiler attaches once the
+    // rate is established.
     let mut cfg = load_cfg(&a, out.path("load-report.json"));
     cfg.target_tps = soak_rate;
     cfg.senders = 16;
@@ -222,7 +232,7 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     cfg.duration = Duration::from_secs(a.soak_secs);
     let load_task = tokio::spawn(load::run(cfg));
 
-    // Warmup so leader detection sees steady-state CPU, not ramp transients.
+    // Warm up, so leader detection sees steady-state CPU, not ramp transients.
     tokio::time::sleep(Duration::from_secs(20)).await;
     let (leader, collapsed, cpu_snapshot) = {
         let profile_secs = a.profile_secs;
@@ -279,8 +289,9 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
 fn rerender(dir: PathBuf) -> anyhow::Result<()> {
     let out = OutDir(dir);
     let soak_report = report::read_load_report(&out.path("load-report.json"))?;
-    // An older or partial run directory may lack the discovery report; fall
-    // back to the soak report so the summary still renders (with no ramp).
+    // An older or partial run directory can lack the discovery report.
+    // Fall back to the soak report, so the summary still renders, with
+    // no ramp.
     let discovery = report::read_load_report(&out.path("discovery-report.json"))
         .unwrap_or_else(|_| soak_report.clone());
     let collapsed = std::fs::read_to_string(out.path("stacks.collapsed"))?;

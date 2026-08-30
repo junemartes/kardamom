@@ -1,25 +1,31 @@
-//! State checkpoints: consistent point-in-time snapshots of the libMDBX state
-//! DB for **fast cold-start recovery**.
+//! State checkpoints: consistent point-in-time snapshots of the libmdbx
+//! state DB, for fast cold-start recovery.
 //!
-//! A cold-started executor/validator with an empty state DB otherwise re-syncs
-//! from genesis — replaying the *entire* canonical stream — which grows without
-//! bound as the chain ages. A checkpoint lets a wiped node restore a recent
-//! consistent state and replay only the short tail from the checkpoint's block
-//! to the head. Because the executor replicas are deterministic state machines
-//! at the same block, one replica's checkpoint is a valid restore source for
-//! another (peer-to-peer restore, mirroring the archive re-replication path).
+//! A cold-started executor or validator with an empty state DB must
+//! otherwise re-sync from genesis, replaying the entire canonical
+//! stream. This replay grows without bound as the chain ages. A
+//! checkpoint lets a wiped node restore a recent consistent state and
+//! replay only the short tail from the checkpoint's block to the head.
 //!
-//! Creation reuses [`compact_to`] (`mdbx_env_copy` + `MDBX_CP_COMPACT`) against
-//! an online RO snapshot, so the live env keeps serving reads/writes throughout.
-//! The copy lands under a hidden tmp name and is renamed into place when
-//! complete, so anything visible as `checkpoint-*` is a full, consistent image
-//! that will never change again — copying one concurrently is always safe.
-//! Restore is a plain file copy of the checkpoint env into a fresh state dir;
-//! the normal startup path then sees a non-empty DB and resumes from its
-//! `last_committed_block` cursor.
+//! Executor replicas are deterministic state machines at the same block,
+//! so one replica's checkpoint is a valid restore source for another.
+//! This supports peer-to-peer restore, which mirrors the archive
+//! re-replication path.
 //!
-//! The manifest type and the shared verify/publish helpers (also consumed by
-//! the peer-fetch path in [`crate::checkpoint_transfer`]) live in [`manifest`].
+//! Creation reuses [`compact_to`] (`mdbx_env_copy` with
+//! `MDBX_CP_COMPACT`) against an online read-only snapshot, so the live
+//! env keeps serving reads and writes throughout. The copy lands under a
+//! hidden temp name and is renamed into place when complete. So anything
+//! visible as `checkpoint-*` is a full, consistent image that will never
+//! change again, and copying one concurrently is always safe.
+//!
+//! Restore is a plain file copy of the checkpoint env into a fresh state
+//! directory. The normal startup path then sees a non-empty DB and
+//! resumes from its `last_committed_block` cursor.
+//!
+//! The manifest type and the shared verify and publish helpers live in
+//! [`manifest`]. The peer-fetch path in [`crate::checkpoint_transfer`]
+//! also uses these helpers.
 
 mod manifest;
 
@@ -51,8 +57,9 @@ pub struct CheckpointInfo {
     pub path: PathBuf,
 }
 
-/// Checkpoint directory name for `block`, zero-padded so lexical order matches
-/// numeric order (`latest_checkpoint` relies on it).
+/// The checkpoint directory name for `block`. It is zero-padded, so
+/// lexical order matches numeric order. [`latest_checkpoint`] depends on
+/// this.
 pub(crate) fn checkpoint_name(block: u64) -> String {
     format!("checkpoint-{block:018}")
 }
@@ -62,14 +69,15 @@ pub(crate) fn parse_checkpoint_block(name: &str) -> Option<u64> {
         .and_then(|s| s.parse().ok())
 }
 
-/// True if `name` names an mdbx data file, in either convention the mdbx
-/// build may use (subdir-mode `mdbx.dat` / `data.mdbx`, or any `.dat`).
+/// Returns true if `name` names an mdbx data file, using either naming
+/// convention the mdbx build may use: subdir-mode `mdbx.dat` or
+/// `data.mdbx`, or any name ending in `.dat`.
 fn is_mdbx_data_name(name: &str) -> bool {
     name.ends_with(".dat") || name == "mdbx.dat" || name == "data.mdbx"
 }
 
-/// Delete `path` whether it is a directory or a single file (checkpoints are
-/// either, depending on the mdbx build).
+/// Delete `path`, whether it is a directory or a single file. A
+/// checkpoint can be either, depending on the mdbx build.
 fn remove_dir_or_file(path: &Path) -> Result<(), StateError> {
     if path.is_dir() {
         std::fs::remove_dir_all(path)?;
@@ -79,8 +87,8 @@ fn remove_dir_or_file(path: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
-/// `read_dir` that treats a missing directory as empty (`Ok(None)`) — the
-/// scanners must not fail before the first checkpoint is ever created.
+/// Like `read_dir`, but treats a missing directory as empty (`Ok(None)`).
+/// The scanners must not fail before the first checkpoint is ever created.
 fn read_dir_or_absent(dir: &Path) -> Result<Option<std::fs::ReadDir>, StateError> {
     match std::fs::read_dir(dir) {
         Ok(rd) => Ok(Some(rd)),
@@ -89,10 +97,12 @@ fn read_dir_or_absent(dir: &Path) -> Result<Option<std::fs::ReadDir>, StateError
     }
 }
 
-/// Create a checkpoint of `env` under `checkpoints_dir`, named by its committed
-/// block. Returns the checkpoint's block + path. If a checkpoint for the same
-/// block already exists it is treated as a no-op success (idempotent). The live
-/// env stays online throughout.
+/// Create a checkpoint of `env` under `checkpoints_dir`, named by its
+/// committed block. Returns the checkpoint's block and path.
+///
+/// If a checkpoint for the same block already exists, this function
+/// treats it as a no-op success. It is idempotent. The live env stays
+/// online throughout.
 pub fn create_checkpoint(
     env: &StateEnv,
     checkpoints_dir: &Path,
@@ -104,11 +114,12 @@ pub fn create_checkpoint(
         info!(block, path = %dest.display(), "checkpoint for block already present; skipping");
         return Ok(CheckpointInfo { block, path: dest });
     }
-    // Compact under a hidden tmp name and rename into place only when the copy
-    // is complete: peers copy checkpoints while we write (chaos re-replication,
-    // peer restore), and a half-written env under its final name would hand
-    // them a torn mdbx image. Hidden names don't parse as `checkpoint-*`, so
-    // `latest_checkpoint`/`prune_checkpoints` never see in-progress copies.
+    // Compact under a hidden temp name, and rename into place only when
+    // the copy is complete. Peers may copy checkpoints while we write, for
+    // re-replication or peer restore. A half-written env under its final
+    // name would hand them a torn mdbx image. Hidden names do not parse as
+    // `checkpoint-*`, so `latest_checkpoint` and `prune_checkpoints` never
+    // see an in-progress copy.
     sweep_stale_tmp(checkpoints_dir)?;
     let tmp = checkpoints_dir.join(format!(".{}.tmp", checkpoint_name(block)));
     let tmp_data = tmp.join("mdbx.dat");
@@ -123,9 +134,9 @@ pub fn create_checkpoint(
     Ok(CheckpointInfo { block, path: dest })
 }
 
-/// Remove leftover `.checkpoint-*.tmp` entries (a writer crashed mid-compact).
-/// Safe to run before compacting because there is a single checkpoint writer
-/// per directory.
+/// Remove leftover `.checkpoint-*.tmp` entries, left when a writer
+/// crashed mid-compact. This is safe to run before compacting, because
+/// each directory has a single checkpoint writer.
 fn sweep_stale_tmp(checkpoints_dir: &Path) -> Result<(), StateError> {
     for entry in std::fs::read_dir(checkpoints_dir)? {
         let entry = entry?;
@@ -138,9 +149,10 @@ fn sweep_stale_tmp(checkpoints_dir: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
-/// Return the highest-block checkpoint under `checkpoints_dir`, or `None` if
-/// there are none (or the directory does not exist). A checkpoint is either a
-/// directory (`mdbx.dat` inside) or a single file, depending on the mdbx build.
+/// Return the highest-block checkpoint under `checkpoints_dir`. Returns
+/// `None` if there are none, or the directory does not exist. A
+/// checkpoint is either a directory holding `mdbx.dat`, or a single
+/// file, depending on the mdbx build.
 pub fn latest_checkpoint(checkpoints_dir: &Path) -> Result<Option<CheckpointInfo>, StateError> {
     let Some(rd) = read_dir_or_absent(checkpoints_dir)? else {
         return Ok(None);
@@ -161,8 +173,9 @@ pub fn latest_checkpoint(checkpoints_dir: &Path) -> Result<Option<CheckpointInfo
     Ok(best)
 }
 
-/// Delete every checkpoint older than `keep_from` block, keeping newer ones.
-/// Returns how many were removed. Used to bound checkpoint disk use.
+/// Delete every checkpoint older than the `keep_from` block, and keep
+/// newer ones. Returns how many were removed. This bounds checkpoint
+/// disk use.
 pub fn prune_checkpoints(checkpoints_dir: &Path, keep_from: u64) -> Result<usize, StateError> {
     let Some(rd) = read_dir_or_absent(checkpoints_dir)? else {
         return Ok(0);
@@ -180,21 +193,21 @@ pub fn prune_checkpoints(checkpoints_dir: &Path, keep_from: u64) -> Result<usize
     Ok(removed)
 }
 
-/// Restore `checkpoint` into `state_dir` (which must be empty or absent):
-/// copies the compacted mdbx env files across. Returns the restored
-/// `last_committed_block`. The caller then opens `state_dir` normally and the
-/// standard resume path replays the tail.
+/// Restore `checkpoint` into `state_dir`. `state_dir` must be empty or
+/// absent. This copies the compacted mdbx env files across, and returns
+/// the restored `last_committed_block`. The caller then opens
+/// `state_dir` normally, and the standard resume path replays the tail.
 pub fn restore_checkpoint(
     checkpoint: &Path,
     state_dir: &Path,
     expected_genesis: Option<B256>,
 ) -> Result<u64, StateError> {
-    // Verify BEFORE copying: an unverifiable or foreign image must never
+    // Verify before copying. An unverifiable or foreign image must never
     // become this node's state.
     let manifest = verify_checkpoint(checkpoint, expected_genesis)?;
     std::fs::create_dir_all(state_dir)?;
-    // Refuse to clobber an existing populated state DB — restore is for a fresh
-    // (wiped) node only.
+    // Refuse to overwrite an existing, populated state DB. Restore is
+    // only for a fresh, wiped node.
     if has_state_db(state_dir)? {
         return Err(StateError::Recovery(format!(
             "state dir {} already holds a DB; restore is for a fresh dir only",
@@ -216,16 +229,18 @@ pub fn restore_checkpoint(
     Ok(block)
 }
 
-/// Restore the newest VERIFIABLE checkpoint under `checkpoints_dir` into
-/// `state_dir`, returning `(restored_block, checkpoint_path)`. A checkpoint
-/// that fails verification is QUARANTINED — renamed to a hidden
-/// `.rejected-<name>` the scanners never pick up — and the next-newest is
-/// tried. A bad image must cost the node one rung of its fallback ladder
-/// (older checkpoint -> peer fetch -> genesis), never wedge it: observed in
-/// CI, a copy that raced the source's prune delivered an image without its
-/// MANIFEST, and the restart refused it, exited, restarted into the same
-/// refusal — a crash loop that held the fleet at 2/3 until the case timed
-/// out. `Ok(None)` when no restorable checkpoint remains.
+/// Restore the newest verifiable checkpoint under `checkpoints_dir`
+/// into `state_dir`. Returns `(restored_block, checkpoint_path)`.
+///
+/// A checkpoint that fails verification is quarantined: renamed to a
+/// hidden `.rejected-<name>` that the scanners never pick up. The
+/// function then tries the next-newest checkpoint.
+///
+/// A bad image must cost the node only one rung of its fallback ladder
+/// (older checkpoint, then peer fetch, then genesis). It must never
+/// wedge the node in a restart loop.
+///
+/// Returns `Ok(None)` when no restorable checkpoint remains.
 pub fn restore_best_checkpoint(
     checkpoints_dir: &Path,
     state_dir: &Path,
@@ -238,9 +253,10 @@ pub fn restore_best_checkpoint(
         match restore_checkpoint(&ckpt.path, state_dir, expected_genesis) {
             Ok(block) => return Ok(Some((block, ckpt.path))),
             Err(e) => {
-                // A failure after verification (I/O mid-copy) may have staged
-                // a partial data file; a leftover would make the next attempt
-                // refuse "state dir already holds a DB".
+                // A failure after verification, such as I/O failing
+                // mid-copy, may have staged a partial data file. A
+                // leftover file would make the next attempt refuse with
+                // "state dir already holds a DB".
                 let _ = std::fs::remove_file(state_dir.join("mdbx.dat"));
                 let name = ckpt
                     .path
@@ -254,8 +270,8 @@ pub fn restore_best_checkpoint(
                     quarantined_as = %rejected.display(),
                     "checkpoint failed verification; quarantining and trying the next-newest"
                 );
-                // If even the rename fails the loop cannot make progress —
-                // surface the original refusal rather than spinning.
+                // If even the rename fails, the loop cannot make progress.
+                // Report the original refusal instead of spinning.
                 std::fs::rename(&ckpt.path, &rejected).map_err(|re| {
                     StateError::Recovery(format!(
                         "checkpoint {} failed verification ({e}) and could not be                          quarantined: {re}",
@@ -267,10 +283,11 @@ pub fn restore_best_checkpoint(
     }
 }
 
-/// Resolve a checkpoint's mdbx data file: either `<checkpoint>/mdbx.dat` (the
-/// env was copied in subdir mode) or the `<checkpoint>` file itself
-/// (single-file mode). Either way it is a complete mdbx image; dir-mode open
-/// reads it as `<state_dir>/mdbx.dat`.
+/// Resolve a checkpoint's mdbx data file. This is either
+/// `<checkpoint>/mdbx.dat`, when the env was copied in subdir mode, or
+/// the `<checkpoint>` file itself, in single-file mode. Either way, it
+/// is a complete mdbx image. Dir-mode open reads it as
+/// `<state_dir>/mdbx.dat`.
 pub(crate) fn checkpoint_data_file(checkpoint: &Path) -> Result<PathBuf, StateError> {
     if checkpoint.is_dir() {
         find_mdbx_data(checkpoint)?.ok_or_else(|| {
@@ -302,14 +319,15 @@ fn find_mdbx_data(dir: &Path) -> Result<Option<PathBuf>, StateError> {
     Ok(None)
 }
 
-/// Move a stale state DB aside into `<state_dir>/stale/`, so the next startup
-/// sees a fresh dir (and restores from a checkpoint) while an operator keeps
-/// one generation of the old DB for inspection. A previous parked copy is
-/// dropped. Returns the parked path, or `None` if there was nothing to park.
+/// Move a stale state DB aside into `<state_dir>/stale/`. The next
+/// startup then sees a fresh directory and restores from a checkpoint,
+/// while an operator keeps one generation of the old DB for inspection.
+/// This drops any previous parked copy. Returns the parked path, or
+/// `None` if there was nothing to park.
 ///
-/// Used by the resync fallback: a cursor below the cluster's retention floor
-/// can never catch up, so the DB it lives in is unusable as-is — but deleting
-/// state outright on an automated path is not acceptable.
+/// The resync fallback uses this. A cursor below the cluster's
+/// retention floor can never catch up, so its DB is unusable as-is. But
+/// an automated path must not delete state outright.
 pub fn park_state_db(state_dir: &Path) -> Result<Option<PathBuf>, StateError> {
     if !has_state_db(state_dir)? {
         return Ok(None);
@@ -330,10 +348,13 @@ pub fn park_state_db(state_dir: &Path) -> Result<Option<PathBuf>, StateError> {
     Ok(Some(parked))
 }
 
-/// True if `dir` already contains an mdbx data file (a populated state DB).
-/// A caller can use this to decide whether a cold-start should restore a
-/// checkpoint (dir empty) or resume the existing DB — without opening the env
-/// (which would itself create the data file).
+/// Returns true if `dir` already contains an mdbx data file, meaning a
+/// populated state DB.
+///
+/// A caller can use this to decide whether a cold start should restore
+/// a checkpoint, when the directory is empty, or resume the existing
+/// DB. This check does not open the env, which would itself create the
+/// data file.
 pub fn has_state_db(dir: &Path) -> Result<bool, StateError> {
     let Some(rd) = read_dir_or_absent(dir)? else {
         return Ok(false);

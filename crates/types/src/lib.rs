@@ -1,20 +1,21 @@
 //! Pure data types and traits shared across the kardamom subsystems.
 //!
-//! No I/O. No Aeron. No libmdbx. Everything in this crate is `#[no_std]`-
-//! friendly in spirit (we still use `alloc` for `Vec`/`Bytes`).
+//! No I/O. No Aeron. No libmdbx. This crate is `#[no_std]`-friendly in
+//! spirit. It still uses `alloc` for `Vec` and `Bytes`.
 //!
 //! Wire types (`TxEnvelope`, `Receipt`, `BlockBoundary*`,
 //! `FsyncWatermark`, `QuorumWatermark`, `BlockDelta`) derive
-//! `#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]`. Consumers
-//! that need zero-copy access use `rkyv::access::<Archived<T>>(bytes)`;
-//! consumers that need an owned value call `rkyv::deserialize`.
+//! `#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]`. A consumer
+//! that needs zero-copy access uses `rkyv::access::<Archived<T>>(bytes)`. A
+//! consumer that needs an owned value calls `rkyv::deserialize`.
 //!
 //! ## rkyv + alloy-primitives
 //!
-//! alloy's `Address`, `B256`, and `U256` do not derive `rkyv::Archive`
-//! upstream. We bridge them via the [`wire`] module's `with` adapters and use
-//! `#[rkyv(with = wire::AddressBytes)]` style attributes on fields. This keeps
-//! the public type ergonomic (`pub sender: Address`) while making rkyv happy.
+//! alloy's `Address`, `B256`, and `U256` types do not derive `rkyv::Archive`
+//! upstream. This crate bridges them with the [`wire`] module's `with`
+//! adapters, using attributes like `#[rkyv(with = wire::AddressBytes)]` on
+//! fields. This keeps the public type easy to use (`pub sender: Address`)
+//! and keeps rkyv working.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 

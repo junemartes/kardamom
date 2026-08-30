@@ -1,37 +1,36 @@
 //! Archive re-replication: restore a wiped Aeron Archive from a peer's mirror.
 //!
-//! `tx_data` is recorded on **both** ingress replicas (each joins the shard's
-//! UDP multicast group and records it), so there are two node-independent mirror
-//! copies of every shard's archive. That survives a single node loss — but only
-//! once: after one copy is gone there is no path back to two, so the *next* loss
-//! is fatal, and on a volume wipe the executor's `resolve_recording` simply
-//! hangs. This tool closes that gap by restoring a lost archive from the
-//! surviving peer, returning the cluster to full 2-copy redundancy.
+//! `tx_data` is recorded on both ingress replicas. Each one joins the shard's
+//! UDP multicast group and records it. So there are two node-independent
+//! mirror copies of every shard's archive. That survives one node loss, but
+//! only once: once one copy is gone, there is no path back to two, so the
+//! next loss is fatal. On a volume wipe, the executor's `resolve_recording`
+//! simply hangs. This tool closes that gap. It restores a lost archive from
+//! the surviving peer, and returns the cluster to full 2-copy redundancy.
 //!
-//! rusteron-archive does not expose Aeron's network `replicate()`, so
-//! re-replication is a **file-level segment mirror**: copy every `.rec` segment
-//! plus the `archive.catalog` (both ingress archives share identical recording
-//! ids, so the catalog transplants cleanly). The copy is format-agnostic — it
-//! does not parse the raw Aeron segment framing; a deeper integrity pass is
-//! `aeron-archive verify` on the restored node.
+//! rusteron-archive does not expose Aeron's network `replicate()`. So
+//! re-replication is a file-level segment mirror: it copies every `.rec`
+//! segment plus the `archive.catalog`. Both ingress archives share identical
+//! recording ids, so the catalog transplants cleanly. The copy is
+//! format-agnostic: it does not parse the raw Aeron segment framing. A
+//! deeper integrity pass is `aeron-archive verify` on the restored node.
 //!
-//! `archive-mark.dat` is **never** copied: a live source daemon heartbeats its
-//! mark file, so a transplanted copy looks "active" to the destination's
-//! restarting Archive, which then crash-loops on `active Mark file detected`
-//! until the copied heartbeat ages out (observed blowing the chaos restart SLO).
-//! The destination daemon recreates its own mark on start; the mark carries no
-//! recording data.
+//! `archive-mark.dat` is never copied. A live source daemon heartbeats its
+//! mark file. A transplanted copy would look "active" to the destination's
+//! restarting Archive, which then crash-loops on `active Mark file
+//! detected` until the copied heartbeat ages out. The destination daemon
+//! recreates its own mark on start; the mark carries no recording data.
 //!
-//! Operational note: the destination archive daemon **must be stopped** during
-//! the copy (it holds the catalog open). The chaos case / runbook stops the
-//! `aeron` job, runs this, then restarts it.
+//! Operational note: the destination archive daemon must be stopped during
+//! the copy, because it holds the catalog open. The chaos case, or the
+//! runbook, stops the `aeron` job, runs this tool, then restarts it.
 
 use std::path::Path;
 
 use crate::error::BatcherError;
 
 /// The one non-`.rec` file the mirror transplants. The mark file
-/// (`archive-mark.dat`) is deliberately NOT copied — see the module doc.
+/// (`archive-mark.dat`) is deliberately not copied. See the module doc.
 const CATALOG_FILE: &str = "archive.catalog";
 
 /// What a [`mirror_archive`] run copied.
@@ -42,25 +41,26 @@ pub struct MirrorReport {
     pub catalog_copied: bool,
 }
 
-/// Mirror the Aeron archive directory `source_dir` into `dest_dir`: the
-/// `archive.catalog` first (via a stable read), then every `*.rec` segment
-/// (never the mark file). Existing files in `dest_dir` are overwritten.
-/// `source_dir` / `dest_dir` are the archive's `dir/` directory (where the
-/// `.rec` files live).
+/// Mirror the Aeron archive directory `source_dir` into `dest_dir`. Copy
+/// the `archive.catalog` first (using a stable read), then every `*.rec`
+/// segment (never the mark file). This overwrites existing files in
+/// `dest_dir`. `source_dir` and `dest_dir` are the archive's `dir/`
+/// directory, where the `.rec` files live.
 ///
-/// The catalog is the tear-prone file: a LIVE source daemon rewrites catalog
-/// entries on recording lifecycle events (start/stop/extend), and the very
-/// incident that motivates a restore — a peer's publishers dying — makes the
-/// mirror stop those recordings and rewrite exactly those entries seconds
-/// later. A plain copy racing such a write captures a torn entry whose stored
-/// checksum no longer matches its descriptor (fails a CRC-armed
-/// `ArchiveTool verify`, issue #98). The stable read (two consecutive
-/// identical snapshots) guarantees a consistent catalog image, and copying it
-/// BEFORE the segments guarantees segment data covers every position the
-/// catalog references.
+/// The catalog is the file most prone to tearing. A live source daemon
+/// rewrites catalog entries on recording lifecycle events (start, stop,
+/// extend). The very incident that motivates a restore, a peer's
+/// publishers dying, makes the mirror stop those recordings and rewrite
+/// exactly those entries seconds later. A plain copy that races such a
+/// write captures a torn entry whose stored checksum no longer matches its
+/// descriptor, which fails a CRC-armed `ArchiveTool verify`. The stable
+/// read (two consecutive identical snapshots) guarantees a consistent
+/// catalog image. Copying it before the segments guarantees the segment
+/// data covers every position the catalog references.
 ///
-/// The destination archive daemon MUST be stopped first. Errors if the source
-/// holds no `.rec` segments (nothing to replicate — likely a wrong path).
+/// The destination archive daemon must be stopped first. This returns an
+/// error if the source holds no `.rec` segments. That likely means the path
+/// is wrong.
 pub fn mirror_archive(source_dir: &Path, dest_dir: &Path) -> Result<MirrorReport, BatcherError> {
     std::fs::create_dir_all(dest_dir)?;
     let mut report = MirrorReport::default();
@@ -92,14 +92,16 @@ pub fn mirror_archive(source_dir: &Path, dest_dir: &Path) -> Result<MirrorReport
     Ok(report)
 }
 
-/// Attempts before giving up on a stable catalog snapshot. Catalog writes are
-/// event-driven bursts (recording start/stop), not a steady stream — two
-/// identical consecutive reads normally happen on the first try.
+/// The number of attempts before giving up on a stable catalog snapshot.
+/// Catalog writes come in event-driven bursts (recording start or stop),
+/// not a steady stream. Two identical consecutive reads normally happen on
+/// the first try.
 const STABLE_READ_ATTEMPTS: usize = 10;
 
-/// Read `path` until two consecutive snapshots are byte-identical, returning
-/// the stable bytes. Errors with `Corruption` if the file never stabilizes —
-/// the caller is copying from something busier than a catalog should ever be.
+/// Read `path` until two consecutive snapshots are byte-identical. Returns
+/// the stable bytes. Returns a `Corruption` error if the file never
+/// stabilizes: the caller is copying from something busier than a catalog
+/// should ever be.
 fn read_stable(path: &Path, attempts: usize) -> Result<Vec<u8>, BatcherError> {
     read_stable_with(attempts, || std::fs::read(path).map_err(BatcherError::from)).map_err(|e| {
         match e {
@@ -129,13 +131,13 @@ where
     Err(BatcherError::Corruption("unstable read".into()))
 }
 
-/// Verify `dest_dir` mirrors `source_dir`: every source `.rec` exists in dest
-/// with **identical content** (chunked byte compare — a length-preserving
-/// corruption is exactly the case a size check cannot see). Returns the number
-/// of segments verified; a divergence is `BatcherError::Corruption` naming
-/// every differing segment. `aeron-archive verify` (CRC-armed) remains the
-/// arbiter of WHICH side is corrupt — mirror inequality alone only proves that
-/// one of them is.
+/// Verify that `dest_dir` mirrors `source_dir`: every source `.rec` must
+/// exist in `dest_dir` with identical content. This uses a chunked byte
+/// compare, because a length-preserving corruption is exactly the case a
+/// size check cannot see. Returns the number of segments verified. A
+/// divergence returns `BatcherError::Corruption`, naming every differing
+/// segment. `aeron-archive verify` (CRC-armed) still decides which side is
+/// corrupt; a mirror mismatch only proves that one side is.
 pub fn verify_mirror(source_dir: &Path, dest_dir: &Path) -> Result<usize, BatcherError> {
     let diff = diff_mirror(source_dir, dest_dir)?;
     if !diff.is_clean() {
@@ -158,16 +160,18 @@ pub fn verify_mirror(source_dir: &Path, dest_dir: &Path) -> Result<usize, Batche
     Ok(verified)
 }
 
-/// Compare every source `.rec` against its mirror copy in `dest_dir` and
-/// return the names of segments that are missing or whose bytes differ. The
-/// heal path copies exactly this set (instead of the whole archive).
+/// [`diff_mirror`] compares every source `.rec` against its mirror copy in
+/// `dest_dir`. It returns the names of segments that are missing or whose
+/// bytes differ. The heal path copies exactly this set, instead of the
+/// whole archive.
+///
 /// What [`diff_mirror`] found. `diverged` are segments the mirror can vouch
-/// for and [`heal_from_mirror`] can repair; `dest_only` are segments present
-/// ONLY on the destination — recording ids are per-archive counters, so a
-/// daemon restart / post-restore session opens ids the mirror never has
-/// (issue #126). Those are UNHEALABLE from this mirror and must be surfaced,
-/// not silently skipped: an iterate-source-only diff claims "no divergence"
-/// for bytes the mirror cannot vouch for.
+/// for, and [`heal_from_mirror`] can repair them. `dest_only` are segments
+/// present only on the destination. Recording ids are per-archive counters,
+/// so a daemon restart, or a post-restore session, opens ids the mirror
+/// never has. Those segments cannot be healed from this mirror, and must be
+/// surfaced, not silently skipped. A diff that iterates only the source
+/// would claim "no divergence" for bytes the mirror cannot vouch for.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MirrorDiff {
     pub diverged: Vec<String>,
@@ -211,7 +215,8 @@ pub fn diff_mirror(source_dir: &Path, dest_dir: &Path) -> Result<MirrorDiff, Bat
     Ok(diff)
 }
 
-/// Chunked byte compare — segments can be large, so never slurp whole files.
+/// A chunked byte compare. Segments can be large, so this never reads a
+/// whole file into memory.
 fn files_differ(a: &Path, b: &Path) -> Result<bool, BatcherError> {
     use std::io::Read;
     if std::fs::metadata(a)?.len() != std::fs::metadata(b)?.len() {
@@ -240,13 +245,14 @@ pub struct HealReport {
     pub bytes_copied: u64,
 }
 
-/// Targeted repair: copy ONLY the named `.rec` segments from the surviving
-/// mirror into `dest_dir`, leaving everything else untouched (a whole-archive
-/// re-copy is `mirror_archive`). Names must be bare segment file names — the
-/// output of [`diff_mirror`] or of a CRC-armed `ArchiveTool verify`.
+/// A targeted repair. Copy only the named `.rec` segments from the
+/// surviving mirror into `dest_dir`, leaving everything else untouched. For
+/// a whole-archive re-copy, use `mirror_archive`. Names must be bare
+/// segment file names, such as the output of [`diff_mirror`] or of a
+/// CRC-armed `ArchiveTool verify`.
 ///
-/// Same operational constraint as the full mirror: the destination archive
-/// daemon must be stopped during the copy.
+/// This has the same operational constraint as the full mirror: the
+/// destination archive daemon must be stopped during the copy.
 pub fn heal_from_mirror(
     source_dir: &Path,
     dest_dir: &Path,
@@ -259,7 +265,7 @@ pub fn heal_from_mirror(
     }
     let mut report = HealReport::default();
     for name in segments {
-        // Bare `.rec` file names only — reject anything path-like.
+        // Accept only bare `.rec` file names. Reject anything path-like.
         if name.contains('/') || name.contains('\\') || !name.ends_with(".rec") {
             return Err(BatcherError::Reconstruct(format!(
                 "invalid segment name {name:?} — expected a bare *.rec file name"
@@ -293,9 +299,9 @@ mod tests {
         write(src.path(), "0-0.rec", &[1u8; 4096]);
         write(src.path(), "1-0.rec", &[2u8; 8192]);
         write(src.path(), CATALOG_FILE, &[9u8; 1024]);
-        // A live source's mark file must NOT be transplanted (the destination
-        // daemon would see it as active and crash-loop) — and non-archive
-        // files must be ignored.
+        // A live source's mark file must not be transplanted. The
+        // destination daemon would see it as active and crash-loop. Also,
+        // non-archive files must be ignored.
         write(src.path(), "archive-mark.dat", &[7u8; 512]);
         write(src.path(), "notes.txt", b"ignore me");
 
@@ -364,8 +370,9 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         write(src.path(), "0-0.rec", &[1u8; 4096]);
         mirror_archive(src.path(), dst.path()).unwrap();
-        // Flip one byte mid-file, length unchanged — invisible to a size
-        // check, which is exactly the corruption this verify must catch.
+        // Flip one byte in the middle of the file. The length stays the
+        // same, so a size check cannot see it. This is the corruption this
+        // verify must catch.
         let mut corrupt = vec![1u8; 4096];
         corrupt[2048] ^= 0xFF;
         write(dst.path(), "0-0.rec", &corrupt);
@@ -394,10 +401,11 @@ mod tests {
         assert!(diff.dest_only.is_empty());
     }
 
-    /// Issue #126: recording ids are per-archive counters, so a restarted /
-    /// post-restore destination owns segment names the mirror never has. An
-    /// iterate-source-only diff silently skips them — they must surface as
-    /// dest-only (unhealable from this mirror, but absolutely a divergence).
+    /// Recording ids are per-archive counters, so a restarted or
+    /// post-restore destination owns segment names the mirror never has. A
+    /// diff that iterates only the source would silently skip them. They
+    /// must surface as dest-only: this cannot be healed from this mirror,
+    /// but it is still a divergence.
     #[test]
     fn diff_reports_dest_only_segments() {
         let src = tempfile::tempdir().unwrap();
@@ -427,7 +435,7 @@ mod tests {
         let mut corrupt = vec![2u8; 1024];
         corrupt[100] ^= 0xFF;
         write(dst.path(), "1-0.rec", &corrupt);
-        // Also locally modify the healthy one to prove heal doesn't touch it.
+        // Also locally modify the healthy one, to prove heal does not touch it.
         write(dst.path(), "0-0.rec", &[9u8; 1024]);
 
         let report = heal_from_mirror(src.path(), dst.path(), &["1-0.rec".to_string()]).unwrap();

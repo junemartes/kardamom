@@ -1,20 +1,25 @@
-//! DeFi bench workload: CLOB updates, Uniswap-style swaps, vault flows.
+//! This is the DeFi bench workload: CLOB updates, Uniswap-style swaps,
+//! and vault flows.
 //!
-//! Contracts live in `bench-contracts/src/BenchDefi.sol` (own foundry
-//! project, isolated from the pinned CREATE2-sensitive one); creation
-//! bytecode is embedded via `bench-contracts/embed.sh` into
-//! `defi_bytecode.rs`. The mix is chosen for its BAL/write-set profile as
+//! The contracts live in `bench-contracts/src/BenchDefi.sol`, its own
+//! foundry project, kept apart from the pinned CREATE2-sensitive one.
+//! `bench-contracts/embed.sh` embeds the creation bytecode into
+//! `defi_bytecode.rs`. The mix is chosen for its write-set profile as
 //! much as its gas profile:
 //!
-//! - swaps hammer two HOT reserve slots (chunk-collapsible attribution),
-//! - vault ops mix two hot aggregate slots with a unique per-user slot,
-//! - CLOB places allocate fresh order structs (UNIQUE slots chunking cannot
-//!   compress) behind a hot id counter and best-price slots.
+//! - A swap writes to two hot reserve slots, whose attribution can
+//!   collapse into a chunk.
+//! - A vault operation writes to two hot aggregate slots and one
+//!   unique per-user slot.
+//! - A CLOB place allocates a fresh order struct, in a unique slot that
+//!   chunking cannot compress, behind a hot ID counter and best-price
+//!   slots.
 //!
-//! Deployment is deterministic: the FIRST load sender deploys all three
-//! contracts at `nonce_start..nonce_start+2`, so every other sender can
-//! compute the addresses without an RPC round-trip, and sender 0's op queue
-//! simply starts three nonces later.
+//! Deployment is deterministic: the first load sender deploys all
+//! three contracts, at nonces `nonce_start` through `nonce_start + 2`.
+//! This lets every other sender compute the addresses without an RPC
+//! round trip, and sender 0's operation queue simply starts three
+//! nonces later.
 
 use std::time::{Duration, Instant};
 
@@ -32,9 +37,9 @@ use crate::signers::DerivedSigner;
 
 include!("defi_bytecode.rs");
 
-/// Gas limit for every workload call: covers the CLOB worst case (cold
-/// order slots + a crossing fill) with headroom. Unused gas is refunded;
-/// only `gasUsed` counts toward the gas/s metrics.
+/// The gas limit for every workload call. This covers the CLOB worst
+/// case, cold order slots plus a crossing fill, with headroom. Unused
+/// gas is refunded; only `gasUsed` counts toward the gas/s metrics.
 const CALL_GAS_LIMIT: u64 = 400_000;
 const CREATE_GAS_LIMIT: u64 = 1_500_000;
 
@@ -46,8 +51,8 @@ pub struct DefiContracts {
 }
 
 impl DefiContracts {
-    /// Addresses when `deployer` creates pool, vault, clob at
-    /// `nonce_start`, `nonce_start+1`, `nonce_start+2`.
+    /// The addresses when `deployer` creates the pool, vault, and CLOB
+    /// at `nonce_start`, `nonce_start + 1`, and `nonce_start + 2`.
     pub fn at(deployer: Address, nonce_start: u64) -> Self {
         Self {
             pool: deployer.create(nonce_start),
@@ -70,12 +75,14 @@ fn call(selector_sig: &str, args: &[U256]) -> Bytes {
     Bytes::from(data)
 }
 
-/// The deterministic op for `(sender, seq)`: target contract + calldata.
-/// Mix: ~50% swaps, ~25% vault (deposit/withdraw alternating), ~25% CLOB
-/// (7 places : 1 cancel).
+/// The deterministic operation for `(sender, seq)`: the target contract
+/// and calldata. The mix is about 50% swaps, 25% vault operations
+/// (deposit and withdraw alternating), and 25% CLOB operations (7
+/// places for every 1 cancel).
 fn op(contracts: &DefiContracts, sender: usize, seq: u64) -> (Address, Bytes) {
-    // Cheap deterministic mixer — NOT a hash, just decorrelates the mix
-    // from the sequence so every sender exercises all ops in all phases.
+    // This is a cheap deterministic mixer, not a hash. It only decorrelates
+    // the mix from the sequence, so every sender exercises all operations
+    // in all phases.
     let h = (sender as u64)
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9));
@@ -99,8 +106,9 @@ fn op(contracts: &DefiContracts, sender: usize, seq: u64) -> (Address, Bytes) {
         }
         _ => {
             if h % 8 == 7 {
-                // Cancel a recent-ish id. Cancels of other users' orders (or
-                // filled ones) no-op cheaply — realistic book churn.
+                // Cancel a recent-ish ID. A cancel of another user's order,
+                // or of a filled order, is a cheap no-op. This is realistic
+                // book churn.
                 let id = U256::from((seq.saturating_sub(1)).max(1));
                 (contracts.clob, call("cancel(uint256)", &[id]))
             } else {
@@ -157,9 +165,10 @@ fn creation_bytes(hex: &str) -> Bytes {
     Bytes::from(alloy_primitives::hex::decode(hex).expect("embedded bytecode hex"))
 }
 
-/// The three deployment txs, signed by `signers[0]` at
-/// `nonce_start..nonce_start+2`. Submit and CONFIRM these before starting
-/// load — every workload call targets their computed addresses.
+/// The three deployment transactions, signed by `signers[0]` at nonces
+/// `nonce_start` through `nonce_start + 2`. Submit and confirm these
+/// before starting load: every workload call targets their computed
+/// addresses.
 pub fn deployment_txs(
     signers: &[DerivedSigner],
     chain_id: u64,
@@ -189,15 +198,15 @@ pub fn deployment_txs(
     Ok((txs, contracts))
 }
 
-/// Submit the deployment txs and wait until each is mined successfully.
-/// Land these before any load — every workload call targets their computed
-/// addresses, so a call arriving before its contract exists would revert and
-/// poison the verdict.
+/// Submit the deployment transactions and wait until each is mined
+/// successfully. Land these before any load starts: every workload
+/// call targets their computed addresses, so a call that arrives
+/// before its contract exists would revert and spoil the verdict.
 ///
 /// # Errors
-/// Errors if a submit is rejected, a deployment reverts, the chain stops
-/// advancing while a deploy is unmined, or an accepted deploy is never
-/// included within the hard cap.
+/// Returns an error if a submit is rejected, a deployment reverts, the
+/// chain stops advancing while a deployment is unmined, or an accepted
+/// deployment is never included within the hard cap.
 pub async fn deploy_and_confirm(client: &HttpClient, deploys: &[PlannedTx]) -> anyhow::Result<()> {
     for d in deploys {
         let _: alloy_primitives::B256 = client
@@ -205,18 +214,17 @@ pub async fn deploy_and_confirm(client: &HttpClient, deploys: &[PlannedTx]) -> a
             .await
             .map_err(|e| anyhow::anyhow!("defi deploy submit (nonce {}): {e}", d.nonce))?;
     }
-    // A LIVENESS bound, expressed as one. This stage starts the moment
-    // the transfer soak's verdict lands, so the chain is still draining
-    // that backlog and the deploy queues behind it; how long that takes
-    // is a property of the runner, not of the code under test. A fixed
-    // wall-clock deadline therefore races the drain — it was 30s, then
-    // 180s, and CI still burned the whole 180s with the chain making
-    // steady progress the entire time.
+    // This is a liveness bound, expressed as one. This stage starts the
+    // moment the transfer soak's verdict lands, so the chain is still
+    // draining that backlog, with the deploy queued behind it. How long
+    // that takes is a property of the runner, not of the code under test.
+    // A fixed wall-clock deadline would race the drain instead.
     //
-    // So: wait as long as the CHAIN IS ADVANCING, and fail only when it
-    // stops. A stalled pipeline is caught in seconds; a merely slow one
-    // is waited out. The overall cap stays as a backstop against waiting
-    // forever on a chain that advances but never includes this tx.
+    // So this code waits as long as the chain is advancing, and fails
+    // only when it stops. A stalled pipeline is caught in seconds; a
+    // merely slow one is waited out. The overall cap stays as a backstop
+    // against waiting forever on a chain that advances but never
+    // includes this transaction.
     const STALL_LIMIT: Duration = Duration::from_secs(60);
     const HARD_CAP: Duration = Duration::from_secs(600);
     async fn head_block(client: &HttpClient) -> Option<u64> {
@@ -271,9 +279,9 @@ pub async fn deploy_and_confirm(client: &HttpClient, deploys: &[PlannedTx]) -> a
     Ok(())
 }
 
-/// Pre-sign per-sender queues of DeFi calls. Sender 0's nonces start after
-/// the three deployments; every sender's FIRST op is `pool.seed()` so swaps
-/// have balances to move.
+/// Pre-sign per-sender queues of DeFi calls. Sender 0's nonces start
+/// after the three deployments. Every sender's first operation is
+/// `pool.seed()`, so swaps have balances to move.
 pub fn pregenerate_defi(
     signers: &[DerivedSigner],
     chain_id: u64,
@@ -288,7 +296,7 @@ pub fn pregenerate_defi(
     let mut out = Vec::with_capacity(signers.len());
     for (sender, s) in signers.iter().enumerate() {
         let base = if sender == 0 {
-            nonce_start + 3 // after the deployments
+            nonce_start + 3 // This is after the deployments.
         } else {
             nonce_start
         };
@@ -316,10 +324,12 @@ pub fn pregenerate_defi(
     Ok(out)
 }
 
-/// Pre-sign per-sender queues of a SINGLE op family (allocation profiling:
-/// per-family numbers separate contract-execution cost from engine fixed
-/// cost). Families needing state (withdraw needs shares, cancel needs
-/// orders) interleave a setup op every 4th tx so the measured op dominates.
+/// Pre-sign per-sender queues of a single operation family, for
+/// allocation profiling: per-family numbers separate contract-execution
+/// cost from engine fixed cost. A family that needs state, such as
+/// withdraw needing shares or cancel needing orders, interleaves a
+/// setup operation every 4th transaction, so the measured operation
+/// dominates.
 pub fn pregenerate_family(
     signers: &[DerivedSigner],
     chain_id: u64,
@@ -454,7 +464,8 @@ mod tests {
         let q = pregenerate_defi(&signers, 412_346, &c, 4, 0, 1_000_000_000).unwrap();
         assert_eq!(q[0][0].nonce, 3, "sender 0 shifted past deployments");
         assert_eq!(q[1][0].nonce, 0, "other senders start at nonce_start");
-        // Every sender's first op is the pool seed (funds swap balances).
+        // Every sender's first operation is the pool seed, which funds
+        // swap balances.
         for queue in &q {
             assert!(!queue.is_empty());
         }

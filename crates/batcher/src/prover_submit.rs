@@ -1,14 +1,14 @@
-//! The proof submitter (spec: no-std-exec-core, PR 4): posts batch validity
-//! proofs to the `KardamomProofOracle`, aligned with the settlement's
-//! L1-as-truth batch cursor.
+//! The proof submitter. See the no-std-exec-core spec. It posts batch
+//! validity proofs to the `KardamomProofOracle`, aligned with the
+//! settlement's L1-as-truth batch cursor.
 //!
-//! Fully decoupled cadence: the oracle names the next unproven batch, the
-//! settlement's stored entry names its range, and the submitter posts the
-//! prover's output files for that range when they exist — otherwise it
-//! reports "not yet" and the caller retries later. Submission is
-//! PERMISSIONLESS on the contract; the proof is the authorization.
+//! The cadence is fully decoupled. The oracle names the next unproven
+//! batch. The settlement's stored entry names its range. The submitter
+//! posts the prover's output files for that range when they exist.
+//! Otherwise it reports "not yet", and the caller retries later. Submission
+//! is permissionless on the contract; the proof is the authorization.
 
-// The sol! macro generates initialize(7 args) for oracle v2.
+// The sol! macro generates an initialize function with 7 arguments for oracle v2.
 #![allow(clippy::too_many_arguments)]
 
 use std::path::Path;
@@ -42,8 +42,8 @@ pub enum SubmitOutcome {
     ProofNotReady { batch_index: u64 },
 }
 
-/// Submit the NEXT unproven batch's proof, if both the batch and its proof
-/// files exist. `proofs_dir` holds the zk-host layout:
+/// Submit the next unproven batch's proof, if the batch and its proof
+/// files both exist. `proofs_dir` holds the zk-host layout:
 /// `batch-<first>-<last>/{public-values.bin, proof.bin}`.
 pub async fn submit_next_proof<P: Provider>(
     provider: P,
@@ -80,8 +80,9 @@ pub async fn submit_next_proof<P: Provider>(
     };
     let proof = std::fs::read(dir.join("proof.bin")).unwrap_or_default();
 
-    // Fail fast client-side on anything the contract would reject: cheaper
-    // than a revert, and a precise error beats a raw one.
+    // Fail fast on the client side for anything the contract would reject.
+    // This is cheaper than a revert, and gives a precise error instead of a
+    // raw one.
     let decoded = BatchPublicOutputs::decode(&pv)
         .ok_or_else(|| BatcherError::L1("malformed public-values.bin".into()))?;
     if decoded.first_block != entry.l2BlockStart

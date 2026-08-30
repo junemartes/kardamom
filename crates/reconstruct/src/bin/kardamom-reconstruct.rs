@@ -1,15 +1,17 @@
 //! `kardamom-reconstruct` — rebuild L2 state from L1 data alone.
 //!
-//! The bottom-of-stack data-availability recovery tool. Given an L1 endpoint, a
-//! `KardamomL2Settlement` address, and a DA blob store, it walks the
-//! `BatchPosted` event log, fetches each batch's blobs by the versioned hashes
-//! L1 committed to, decodes them back into ordered blocks, and re-executes them
-//! through the shared engine into a fresh trie-aware state DB — producing the
-//! reconstructed head + canonical state root.
+//! The bottom-of-stack data-availability recovery tool. Given an L1
+//! endpoint, a `KardamomL2Settlement` address, and a DA blob store, it
+//! walks the `BatchPosted` event log, fetches each batch's blobs by the
+//! versioned hashes L1 committed to, decodes them back into ordered
+//! blocks, and re-executes them through the shared engine into a fresh
+//! trie-aware state DB. This produces the reconstructed head and
+//! canonical state root.
 //!
-//! Scope: L2 transactions (deposits are re-derivable from L1 events, a
-//! documented follow-up — see `kardamom_engine::replay`). With `--expect-root`
-//! it exits non-zero on any mismatch, so it doubles as a chaos-suite assertion.
+//! Scope: L2 transactions. Deposits are re-derivable from L1 events, a
+//! documented follow-up (see `kardamom_engine::replay`). With
+//! `--expect-root` it exits non-zero on any mismatch, so it also works as
+//! a chaos-suite assertion.
 
 use std::path::PathBuf;
 
@@ -33,12 +35,13 @@ struct Cli {
     #[arg(long)]
     settlement: Address,
 
-    /// DA blob store directory (the *bytes* behind the on-chain commitments).
+    /// DA blob store directory: the bytes behind the on-chain commitments.
     #[arg(long)]
     da_store: PathBuf,
 
-    /// Kardamom genesis TOML (schema: `kardamom_types::Genesis`). Supplies the
-    /// chain id and the initial allocation the reconstruction must start from.
+    /// Kardamom genesis TOML (schema: `kardamom_types::Genesis`). Supplies
+    /// the chain id and the initial allocation the reconstruction starts
+    /// from.
     #[arg(long)]
     chain: PathBuf,
 
@@ -50,8 +53,9 @@ struct Cli {
     #[arg(long)]
     state_dir: PathBuf,
 
-    /// Optional expected state root; if set, the tool asserts the reconstructed
-    /// root matches and exits non-zero otherwise (chaos-suite gate).
+    /// Optional expected state root. If set, the tool checks that the
+    /// reconstructed root matches, and exits non-zero otherwise
+    /// (chaos-suite gate).
     #[arg(long)]
     expect_root: Option<B256>,
 }
@@ -104,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
         state_root = %outcome.state_root,
         "reconstruction complete"
     );
-    // Machine-readable line for scripts/chaos assertions.
+    // Machine-readable line for scripts and chaos assertions.
     println!(
         "reconstructed head={} blocks={} txs={} state_root={:#x}",
         outcome.head_block, outcome.blocks_applied, outcome.txs_applied, outcome.state_root

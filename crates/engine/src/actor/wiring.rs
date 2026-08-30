@@ -3,32 +3,32 @@
 //! [`Executor::run`] used to take 13 positional arguments, three of them
 //! boxed trait objects. This module replaces that shape with two ideas:
 //!
-//! - **One [`EngineWiring`] impl per role** names every port type the run is
-//!   generic over (7 associated types), so `run` carries a single type
-//!   parameter instead of seven and the whole pipeline is statically
-//!   dispatched — no `Box<dyn …>` anywhere in the hot path.
-//! - **Category structs** group the run's inputs by what they do:
+//! - One [`EngineWiring`] impl per role names every port type the run is
+//!   generic over (seven associated types). So `run` carries a single type
+//!   parameter instead of seven, and the whole pipeline uses static
+//!   dispatch, with no `Box<dyn ...>` in the hot path.
+//! - Category structs group the run's inputs by what they do:
 //!   [`Inbound`] (what the reader threads consume), [`Outbound`] (the
-//!   receipts publication + state-writer seams), [`ResumePoint`] (the
-//!   cursor execution starts from — [`GENESIS`] on a fresh chain),
+//!   receipts publication and the state-writer seams), [`ResumePoint`]
+//!   (the cursor execution starts from, [`GENESIS`] on a fresh chain), and
 //!   [`RoleHooks`] (the optional role-specific behavior).
 //!
 //! [`ResumePoint`]: super::ResumePoint
 //! [`GENESIS`]: super::ResumePoint::GENESIS
 //!
-//! A caller that genuinely needs to pick an implementation at RUNTIME (e.g.
+//! A caller that needs to pick an implementation at runtime (for example,
 //! the validator's optional attester tee around its receipts sink) still
-//! can: every port trait has a forwarding impl for its boxed form, so the
-//! wiring just names `Box<dyn …>` as that one associated type. The choice
-//! of dynamic dispatch then lives with the caller that needs it instead of
-//! being forced on every caller by the API.
+//! can. Every port trait has a forwarding impl for its boxed form, so the
+//! wiring can name `Box<dyn ...>` as that one associated type. This way,
+//! the choice of dynamic dispatch stays with the caller that needs it,
+//! instead of being forced on every caller by the API.
 //!
-//! Two closure-shaped inputs intentionally stay boxed rather than becoming
-//! associated types: [`BlockExec`] and
+//! Two closure-shaped inputs stay boxed instead of becoming associated
+//! types: [`BlockExec`] and
 //! [`JoinRecoveryFactory`](crate::reader::JoinRecoveryFactory). Closure
-//! types are unnameable, so a wiring impl could not write them out anyway —
-//! callers would be forced to box exactly as they do today — and both run
-//! far off the hot path (once per block / only on a join miss).
+//! types have no name, so a wiring impl could not write them out anyway,
+//! and callers would still need to box them. Both also run far off the hot
+//! path: once per block, or only on a join miss.
 //!
 //! [`Executor::run`]: super::Executor::run
 
@@ -43,8 +43,8 @@ use crate::reader::{
 use super::ports::{StateWriterQueue, StateWriterSignal, TxReceiptsPublication};
 use super::types::{BalHandoff, BlockExec};
 
-/// The full set of port types one role plugs into [`Executor::run`] — the
-/// "parent trait" that bundles what would otherwise be seven independent
+/// The full set of port types one role plugs into [`Executor::run`]. This
+/// is the parent trait that bundles what would otherwise be seven separate
 /// type parameters.
 ///
 /// Implementors are zero-sized marker types, one per call site:
@@ -64,21 +64,23 @@ use super::types::{BalHandoff, BlockExec};
 ///
 /// [`Executor::run`]: super::Executor::run
 pub trait EngineWiring {
-    /// Per-partition tx_data subscription (M of them, see [`Inbound`]).
+    /// Per-partition tx_data subscription. There are M of them (see
+    /// [`Inbound`]).
     type TxData: TxDataSubscription + 'static;
     /// The canonical tx_ordering subscription.
     type TxOrdering: TxOrderingSubscription + 'static;
     /// The tx_receipts publication the commit thread drains into.
     type TxReceipts: TxReceiptsPublication + 'static;
-    /// Post-block state snapshot source (the state writer's read side).
+    /// Post-block state snapshot source: the state writer's read side.
     type Snapshots: SnapshotSource + 'static;
-    /// Durability signal from the state writer ("block N is fsynced").
+    /// Durability signal from the state writer: block N is fsynced.
     type WriterSignal: StateWriterSignal + 'static;
     /// Delta hand-off queue into the state writer.
     type WriterQueue: StateWriterQueue + 'static;
-    /// Role-specific epoch check ([`NoEpochCheck`](crate::reader::NoEpochCheck)
-    /// for roles that trust the ordered stream; the validator's verifier
-    /// re-derives each epoch from L1).
+    /// Role-specific epoch check. Use
+    /// [`NoEpochCheck`](crate::reader::NoEpochCheck) for roles that trust
+    /// the ordered stream. The validator's verifier re-derives each epoch
+    /// from L1.
     type Epoch: EpochObserver + 'static;
 }
 
@@ -90,13 +92,14 @@ pub type SnapshotDb<W> = <<W as EngineWiring>::Snapshots as SnapshotSource>::Db;
 /// canonical tx_ordering subscription, and the optional archive-backed
 /// join-miss recovery.
 pub struct Inbound<W: EngineWiring> {
-    /// One subscription per sequencer partition (M total). May be supplied
-    /// in any order — each subscription declares its own `sequencer_id`.
+    /// One subscription per sequencer partition (M total). Callers may
+    /// supply them in any order, since each subscription declares its own
+    /// `sequencer_id`.
     pub tx_data: Vec<W::TxData>,
-    /// The canonical orderer. Its clean close is what ends the run.
+    /// The canonical orderer. Its clean close ends the run.
     pub tx_ordering: W::TxOrdering,
     /// Archive-backed join-miss refetch factory (see
-    /// [`crate::reader::JoinRecovery`]); `None` keeps the plain bounded
+    /// [`crate::reader::JoinRecovery`]). `None` keeps the plain bounded
     /// join.
     pub join_recovery: Option<JoinRecoveryFactory>,
 }
@@ -110,29 +113,29 @@ pub struct Outbound<W: EngineWiring> {
     pub writer_queue: W::WriterQueue,
 }
 
-/// Role-specific optional behavior. Everything here defaults to "off"
-/// ([`RoleHooks::none`]); the executor wires BAL capture, the validator
+/// Role-specific optional behavior. Everything here defaults to off (see
+/// [`RoleHooks::none`]). The executor wires BAL capture. The validator
 /// wires the whole-block strategy and the epoch verifier.
 pub struct RoleHooks<W: EngineWiring> {
     /// EIP-7928 capture hand-off to the BAL publisher thread (executor
-    /// role); `None` skips capture entirely.
+    /// role). `None` skips capture.
     pub bal_capture: Option<Sender<BalHandoff>>,
-    /// P1 footprint shadow (`crate::shadow`): per-block capture handoff to
-    /// the grader thread (executor role, `KARDAMOM_FOOTPRINT_SHADOW=1`);
-    /// `None` skips capture entirely. Ignored on the whole-block
-    /// (validator) path — captures ride the streaming arm.
+    /// Footprint shadow (`crate::shadow`): per-block capture hand-off to
+    /// the grader thread (executor role, `KARDAMOM_FOOTPRINT_SHADOW=1`).
+    /// `None` skips capture. Ignored on the whole-block (validator) path,
+    /// since captures ride the streaming arm.
     pub footprint_shadow: Option<Sender<crate::shadow::ShadowBlock>>,
-    /// Whole-block execution strategy (validator parallel path); `None`
-    /// keeps the per-tx streaming path untouched.
+    /// Whole-block execution strategy (validator parallel path). `None`
+    /// keeps the per-transaction streaming path unchanged.
     pub block_exec: Option<BlockExec<SnapshotDb<W>>>,
-    /// Epoch check, run before an epoch's deposits apply; `None` trusts
-    /// the ordered stream.
+    /// Epoch check, run before an epoch's deposits apply. `None` trusts the
+    /// ordered stream.
     pub epoch_observer: Option<W::Epoch>,
 }
 
 impl<W: EngineWiring> RoleHooks<W> {
-    /// No role-specific behavior: streaming execution, no BAL capture, no
-    /// epoch check (the executor's and most tests' shape).
+    /// No role-specific behavior: streaming execution, no BAL capture, and
+    /// no epoch check. This is the shape the executor and most tests use.
     pub fn none() -> Self {
         Self {
             bal_capture: None,

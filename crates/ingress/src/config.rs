@@ -9,21 +9,23 @@ use kardamom_types::AckPolicy;
 
 /// Static configuration for an `IngressProxy` instance.
 ///
-/// All fields are required; pick a `IngressConfig::default()` for tests.
+/// All fields are required. Use `IngressConfig::default()` for tests.
 #[derive(Debug, Clone)]
 pub struct IngressConfig {
-    /// HTTP+WS jsonrpsee server bind address.
+    /// HTTP and WS jsonrpsee server bind address.
     pub jsonrpc_bind: SocketAddr,
     /// Optional TCP bind for the binary line protocol.
     pub binary_tcp_bind: Option<SocketAddr>,
     /// Optional UDS path for the binary line protocol.
     pub binary_uds_path: Option<PathBuf>,
-    /// Number of sequencer partitions (M); routes `keccak(sender) % M`.
+    /// Number of sequencer partitions (M). Routes on `keccak(sender) % M`.
     pub partition_count_m: u32,
-    /// Stable identity of this ingress replica (active/active deployments run N
-    /// of them). Namespaces `correlation_id` so the `(replica, sequence)` pair
-    /// is globally unique: `correlation_id = (ingress_id << 48) | (seq & 2^48-1)`.
-    /// Logged at startup. Single-instance deployments use `0`.
+    /// The stable identity of this ingress replica. An active/active
+    /// deployment runs N replicas. This id namespaces `correlation_id`, so
+    /// the `(replica, sequence)` pair stays unique:
+    /// `correlation_id = (ingress_id << 48) | (seq & 2^48-1)`.
+    /// The proxy logs this id at startup. A single-instance deployment
+    /// uses `0`.
     pub ingress_id: u16,
     /// Per-IP token-bucket replenishment rate (tokens/sec).
     pub rate_limit_per_ip_per_sec: NonZeroU32,
@@ -33,29 +35,32 @@ pub struct IngressConfig {
     pub sig_verify_batch_depth: usize,
     /// Batched sig-verify flush window (spec calls for 50µs).
     pub sig_verify_flush_window: Duration,
-    /// Max time the proxy waits for receipt + watermark before timing out the
-    /// client.
+    /// Max time the proxy waits for a receipt and a watermark before it
+    /// times out the client.
     pub pending_receipt_timeout: Duration,
     /// L2 chain id (returned by `eth_chainId`).
     pub chain_id: u64,
-    /// Receipt-cache capacity (FIFO-evicted).
+    /// Receipt-cache capacity. Eviction order is arbitrary; see
+    /// [`crate::receipt_cache::ReceiptCache`].
     pub receipt_cache_capacity: usize,
     /// Which durability gate the proxy waits on before acking a tx. See
     /// [`kardamom_types::AckPolicy`] for the four modes.
     pub ack_policy: AckPolicy,
     /// Max concurrent JSON-RPC connections. `submit_raw` parks each
-    /// submission's request until its receipt arrives, so steady-state
-    /// concurrent connections ≈ offered rate × receipt latency — which grows
-    /// exactly when the pipeline is slowest. jsonrpsee's default (100) capped
-    /// end-to-end throughput at 100/latency and turned overload into
-    /// connection refusals for every client of the replica. Sized so the
-    /// connection table is never the binding limit.
+    /// submission's request until its receipt arrives. So, at steady
+    /// state, concurrent connections are about the offered rate times the
+    /// receipt latency, and this count grows most when the pipeline is
+    /// slowest. jsonrpsee's default of 100 capped end-to-end throughput at
+    /// 100 divided by latency, and turned overload into connection
+    /// refusals for every client of the replica. This value is sized so
+    /// the connection table is never the limit.
     pub rpc_max_connections: u32,
-    /// Pending-registry depth beyond which new submissions are shed with an
-    /// explicit retryable `Overloaded` error instead of parked. A registry
-    /// this deep means the pipeline is not draining; parking more submits
-    /// only builds the wedge (parked submits pin connections and their
-    /// senders' later nonces). Depth 0 sheds everything (test hook).
+    /// Pending-registry depth. Past this depth, new submissions get an
+    /// explicit retryable `Overloaded` error instead of being parked. A
+    /// registry this deep means the pipeline is not draining. Parking more
+    /// submits would only make the backlog worse, since a parked submit
+    /// pins its connection and its sender's later nonces. A depth of 0
+    /// sheds everything, as a test hook.
     pub pending_shed_depth: usize,
 }
 
@@ -74,15 +79,15 @@ impl Default for IngressConfig {
             sig_verify_flush_window: Duration::from_micros(50),
             pending_receipt_timeout: Duration::from_secs(30),
             chain_id: 1,
-            // 128k ≈ a 27s query horizon at 4,800 tx/s (~77MB across both
-            // indexes at bench-receipt sizes). 64k gave 13.7s — SHORTER than
-            // any refetch fallback's reaction time at that rate, so the
-            // ~0.1% of confirmations the WS feed misses became permanently
-            // unqueryable and read as phantom must-deliver violations
-            // (observed: 584-1,963 "missing" on soaks whose drop counters
-            // were all zero). Eviction is arbitrary (DashMap), so the
-            // horizon is a lower bound only for a fraction of entries —
-            // fallbacks must poll well inside it.
+            // 128k gives about a 27s query horizon at 4,800 tx/s (about
+            // 77MB across both indexes at bench-receipt sizes). 64k gave
+            // only 13.7s, shorter than any refetch fallback's reaction time
+            // at that rate. So the small share of confirmations the WS feed
+            // misses became permanently unqueryable, and looked like
+            // phantom must-deliver violations.
+            // Eviction order is arbitrary (DashMap), so the horizon is a
+            // lower bound for only part of the entries. Fallbacks must
+            // poll well inside it.
             receipt_cache_capacity: 128 * 1024,
             ack_policy: AckPolicy::default(),
             rpc_max_connections: 8192,
@@ -91,9 +96,10 @@ impl Default for IngressConfig {
     }
 }
 
-/// TOML file the `kardamom-ingress` binary parses from `--config` for the
-/// Aeron Cluster (Raft) client connection. The rest of the ingress runtime
-/// tuning still comes from CLI flags + [`IngressConfig::default`].
+/// TOML file that the `kardamom-ingress` binary parses from `--config`, for
+/// the Aeron Cluster (Raft) client connection. The rest of the ingress
+/// runtime tuning still comes from CLI flags and
+/// [`IngressConfig::default`].
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 #[serde(default)]
 pub struct IngressFileConfig {
@@ -102,9 +108,9 @@ pub struct IngressFileConfig {
     pub cluster: ClusterConfig,
 }
 
-// The `[cluster]` TOML section has ONE definition (mirroring the
-// executor/sequencer shape by construction), shared by every cluster client
-// and re-exported from `kardamom-cluster-adapter`.
+// The `[cluster]` TOML section has one definition. It mirrors the
+// executor/sequencer shape by design, and every cluster client shares it.
+// `kardamom-cluster-adapter` re-exports it here.
 pub use kardamom_cluster_adapter::ClusterConfig;
 
 #[cfg(test)]

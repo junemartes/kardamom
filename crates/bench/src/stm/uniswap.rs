@@ -1,13 +1,15 @@
-//! Real-Uniswap workload, router-less: REAL v2-core bytecode (factory +
-//! pairs) driven at the pair level — `token.transfer(pair, in)` then
-//! `pair.swap(out0, out1, to, "")` — with swap outputs computed offline
-//! against deterministically-tracked reserves (the same x*y=k + 0.3%-fee
-//! integer math the contract runs, so every signed tx succeeds and every
-//! pair's on-chain reserves match the generator's model exactly).
+//! This is a real Uniswap workload, without a router. It uses the real
+//! v2-core bytecode, factory and pairs, driven at the pair level:
+//! `token.transfer(pair, in)`, then `pair.swap(out0, out1, to, "")`.
+//! Swap outputs are computed offline against deterministically tracked
+//! reserves, with the same x*y=k plus 0.3% fee integer math the
+//! contract runs. So every signed transaction succeeds, and every
+//! pair's on-chain reserves match the generator's model exactly.
 //!
-//! Pair addresses are CREATE2-deterministic (salt = keccak(token0++token1),
-//! init-code hash from the vendored artifact), so the whole stream signs
-//! offline before anything executes.
+//! Pair addresses are CREATE2-deterministic. The salt is
+//! `keccak(token0 ++ token1)`, and the init-code hash comes from the
+//! vendored artifact. So the whole stream signs offline before
+//! anything executes.
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
@@ -50,9 +52,10 @@ fn creation_code(path: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 pub struct UniswapWorkload {
-    /// Setup blocks (deploys, pair creation, liquidity, sender funding).
+    /// The setup blocks: deploys, pair creation, liquidity, and
+    /// sender funding.
     pub setup_blocks: Vec<Vec<TxEnvelope>>,
-    /// Flow blocks (swaps + ERC20 transfers).
+    /// The flow blocks: swaps and ERC20 transfers.
     pub flow_blocks: Vec<Vec<TxEnvelope>>,
 }
 
@@ -101,11 +104,13 @@ impl Signer<'_> {
 
 /// Generate the workload.
 ///
-/// - `pairs`: number of isolated pools (2 tokens each) — the contention
-///   knob: senders' home pairs spread round-robin.
-/// - `swap_share_pct`: % of flow ops that are swaps (rest are plain ERC20
-///   transfers between senders — the parallel-friendly class).
-/// - `cross_pct`: % of swaps that hit a NON-home pair (cross-domain joins).
+/// - `pairs`: the number of isolated pools, 2 tokens each. This is the
+///   contention setting: senders' home pairs spread out in rotation.
+/// - `swap_share_pct`: the percentage of flow operations that are
+///   swaps. The rest are plain ERC20 transfers between senders, the
+///   parallel-friendly class.
+/// - `cross_pct`: the percentage of swaps that hit a pair other than
+///   the sender's home pair, a cross-domain join.
 #[allow(clippy::too_many_arguments)]
 pub fn generate(
     repo_root: &str,
@@ -137,7 +142,7 @@ pub fn generate(
     };
     let mut setup: Vec<TxEnvelope> = Vec::new();
 
-    // Tokens: 2 per pair. Addresses = CREATE(deployer, nonce).
+    // Tokens: 2 per pair. Each address is CREATE(deployer, nonce).
     let mut tokens: Vec<Address> = Vec::new();
     for _ in 0..pairs * 2 {
         let addr = dep_addr.create(dep.nonce);
@@ -149,13 +154,13 @@ pub fn generate(
         ));
         tokens.push(addr);
     }
-    // Factory: constructor(address feeToSetter).
+    // Factory: the constructor takes `address feeToSetter`.
     let factory = dep_addr.create(dep.nonce);
     let mut fac_init = factory_code.clone();
     fac_init.extend_from_slice(&addr_word(dep_addr).to_be_bytes::<32>());
     setup.push(dep.sign(chain_id, TxKind::Create, CREATE_GAS, fac_init.into()));
 
-    // Pairs via createPair — address is CREATE2-deterministic.
+    // Pairs are created through createPair. The address is CREATE2-deterministic.
     let mut pair_states: Vec<PairState> = Vec::new();
     for p in 0..pairs {
         let (a, b) = (tokens[p * 2], tokens[p * 2 + 1]);
@@ -188,7 +193,8 @@ pub fn generate(
         });
     }
 
-    // Liquidity: deployer mints to itself, transfers to each pair, mints LP.
+    // Liquidity: the deployer mints to itself, transfers to each pair,
+    // then mints LP tokens.
     let liq = U256::from(10u128.pow(24));
     for ps in &mut pair_states {
         for t in [ps.token0, ps.token1] {
@@ -215,7 +221,7 @@ pub fn generate(
         ps.reserve1 = liq;
     }
 
-    // Sender funding: every sender self-mints every token it may use.
+    // Sender funding: every sender mints for itself every token it may use.
     let fund = U256::from(10u128.pow(23));
     let mut senders: Vec<Signer> = signers[1..]
         .iter()
@@ -233,7 +239,7 @@ pub fn generate(
         }
     }
 
-    // Setup slices into blocks of txs_per_block for realistic shapes.
+    // Slice setup into blocks of txs_per_block, for realistic shapes.
     let setup_blocks: Vec<Vec<TxEnvelope>> = setup
         .chunks(txs_per_block.max(1))
         .map(|c| c.to_vec())
@@ -241,7 +247,7 @@ pub fn generate(
 
     // Flows.
     let mut flows: Vec<Vec<TxEnvelope>> = Vec::with_capacity(flow_blocks);
-    let mut h: u64 = 0x243F_6A88_85A3_08D3; // deterministic mixer state
+    let mut h: u64 = 0x243F_6A88_85A3_08D3; // This is the deterministic mixer state.
     let mut mix = |x: u64| {
         h ^= x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         h ^= h >> 29;
@@ -259,7 +265,7 @@ pub fn generate(
             let me = senders[si].s.signer.address();
             let room_for_swap = txs_per_block - block.len() >= 2;
             if r % 100 < swap_share_pct && room_for_swap {
-                // Swap on home pair (or a cross pair) — 2 txs.
+                // Swap on the home pair, or a cross pair: 2 transactions.
                 let home = si % pair_states.len();
                 let pi = if r / 100 % 100 < cross_pct {
                     (home + 1 + (r as usize / 10_000) % pair_states.len().max(1))
@@ -301,7 +307,7 @@ pub fn generate(
                     ),
                 ));
             } else {
-                // Plain ERC20 transfer to another sender — parallel class.
+                // A plain ERC20 transfer to another sender: the parallel class.
                 let tj = (si + 1 + (r as usize >> 8) % (n_send - 1)) % n_send;
                 let dst = senders[tj].s.signer.address();
                 let t = tokens[(r as usize >> 16) % tokens.len()];

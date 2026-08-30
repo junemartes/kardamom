@@ -1,8 +1,9 @@
-//! Prometheus text-format scraping + bounded polling.
+//! Prometheus text-format scraping, plus bounded polling.
 //!
-//! The scenario drivers observe the pipeline exclusively through each
-//! service's `/metrics` endpoint (and the ingress JSON-RPC). Polls are always
-//! deadline-bounded — never fixed sleeps — per the repo's test conventions.
+//! The scenario drivers observe the pipeline only through each service's
+//! `/metrics` endpoint (and the ingress JSON-RPC). Polls always have a
+//! deadline. This code never uses a fixed sleep, following the repo's
+//! test conventions.
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -14,8 +15,8 @@ use anyhow::{Context, Result};
 pub struct Scrape(pub String);
 
 impl Scrape {
-    /// Sum of every sample of `name` across label sets. `None` when the
-    /// metric is absent (distinct from a genuine 0 sample).
+    /// Sum every sample of `name` across label sets. Returns `None` when
+    /// the metric is absent, which differs from a genuine 0 sample.
     pub fn value(&self, name: &str) -> Option<f64> {
         let mut found = false;
         let mut sum = 0.0;
@@ -23,9 +24,9 @@ impl Scrape {
             if line.starts_with('#') || !line.starts_with(name) {
                 continue;
             }
-            // Exact-name match: the next char must terminate the metric name
-            // (label block or sample separator), so `foo` never matches
-            // `foo_total`.
+            // This is an exact-name match. The next character must end the
+            // metric name (a label block or a sample separator), so `foo`
+            // never matches `foo_total`.
             let rest = &line[name.len()..];
             if !(rest.starts_with('{') || rest.starts_with(' ')) {
                 continue;
@@ -39,8 +40,9 @@ impl Scrape {
     }
 }
 
-/// Scrape `http://addr/metrics` with a plain HTTP/1.0 GET (no client deps;
-/// the exporter answers 1.0 with a non-chunked body and closes).
+/// Scrape `http://addr/metrics` with a plain HTTP/1.0 GET. This needs no
+/// client library: the exporter answers with a non-chunked HTTP/1.0 body
+/// and closes the connection.
 pub fn scrape_blocking(addr: SocketAddr, timeout: Duration) -> Result<Scrape> {
     let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)
         .with_context(|| format!("connect {addr}"))?;
@@ -67,9 +69,9 @@ pub async fn scrape(addr: SocketAddr) -> Result<Scrape> {
         .context("scrape task join")?
 }
 
-/// Poll `f` every `interval` until it returns `Some(v)` or `timeout` passes.
-/// On timeout, fails with `what` plus the last observation `f` reported via
-/// its `None` (callers embed context in `what`).
+/// Poll `f` every `interval` until it returns `Some(v)`, or until
+/// `timeout` passes. On timeout, this fails with `what` as the message.
+/// Callers should put context in `what`.
 pub async fn poll_until<T, F, Fut>(
     what: &str,
     timeout: Duration,

@@ -1,30 +1,31 @@
-//! TOML configuration deserialized by the `kardamom-executor` binary.
+//! TOML configuration that the `kardamom-executor` binary deserializes.
 //!
-//! Historically the executor took all runtime tuning via CLI flags and only
-//! presence-checked `--config`. This module adds the top-level config the
-//! binary deserializes from that TOML; every field has a default so an empty
-//! config file (the existing deployment shape) still parses. The first real
-//! field is the `[cluster]` section — cluster mode is the only mode, so the
-//! section must be populated for the binary to connect (an empty section
-//! fails at cluster connect time with a config error).
+//! In the past, the executor took all runtime tuning through CLI flags. It
+//! only checked that `--config` was present. This module adds the top-level
+//! config that the binary reads from that TOML file. Every field has a
+//! default, so an empty config file (the current deployment shape) still
+//! parses. The first real field is the `[cluster]` section. Cluster mode is
+//! the only mode, so this section must be filled in before the binary can
+//! connect. An empty section fails at cluster connect time with a config
+//! error.
 //!
-//! Note: this is distinct from [`crate::ExecutorConfig`] (in `actor.rs`), which
+//! Note: this differs from [`crate::ExecutorConfig`] (in `actor.rs`), which
 //! is the in-process runtime tuning passed to [`crate::Executor::run`]. This
-//! struct is the deserialization target for the operator-supplied TOML file.
+//! struct is the target for deserializing the operator-supplied TOML file.
 
 use serde::Deserialize;
 
-// The `[cluster]` section type lives beside the cluster reader in the engine
-// (the validator parses the same section); re-exported here so existing
-// `kardamom_executor::config::ClusterConfig` paths keep resolving.
+// The `[cluster]` section type lives next to the cluster reader in the
+// engine (the validator parses the same section). It is re-exported here so
+// existing `kardamom_executor::config::ClusterConfig` paths still resolve.
 pub use kardamom_engine::reader::cluster::ClusterConfig;
 
 /// Top-level config the `kardamom-executor` binary deserializes from `--config`.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ExecutorFileConfig {
-    /// Aeron Cluster (Raft) sealer client config. tx_ordering ALWAYS comes from
-    /// the cluster egress — there is no longer a non-cluster path.
+    /// Aeron Cluster (Raft) sealer client config. tx_ordering always comes
+    /// from the cluster egress. There is no other path.
     pub cluster: ClusterConfig,
 }
 
@@ -40,14 +41,15 @@ mod tests {
 
     #[test]
     fn comment_only_toml_parses() {
-        // Matches the deployed executor.toml shape (comment-only file).
+        // This matches the deployed executor.toml shape: a comment-only file.
         let cfg: ExecutorFileConfig = toml::from_str("# just a comment\n").unwrap();
         assert!(cfg.cluster.ingress_endpoints.is_empty());
     }
 
     #[test]
     fn cluster_section_parses() {
-        // `enabled` is a legacy key (removed knob) — must still be tolerated.
+        // `enabled` is an old key. The setting is removed, but the parser
+        // must still accept it.
         let toml = r#"
             [cluster]
             enabled = true
@@ -57,7 +59,7 @@ mod tests {
         "#;
         let cfg: ExecutorFileConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.cluster.ingress_endpoints, "0=h0:9000,1=h1:9001");
-        // Stream-id / keepalive defaults fill in when omitted.
+        // Stream ID and keep-alive defaults fill in when they are omitted.
         let c = cfg.cluster.defaults_applied();
         assert_eq!(c.ingress_stream_id, 101);
         assert_eq!(c.egress_stream_id, 102);

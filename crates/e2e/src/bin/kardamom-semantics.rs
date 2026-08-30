@@ -1,18 +1,20 @@
 //! `kardamom-semantics` — the Target-C runner for the chain-semantics suite.
 //!
-//! The scenario drivers in `e2e::scenarios` talk only to externally
-//! observable seams (ingress JSON-RPC + per-service `/metrics`), so the same
-//! code that runs against the single-host Target-L stack in
-//! `tests/chain_semantics.rs` runs unchanged against the real 12-node DinD
-//! cluster — this binary just points them at cluster addresses instead of
-//! per-test temp ports. Divergence between the two targets is itself signal.
+//! The scenario drivers in `e2e::scenarios` talk only to external seams: the
+//! ingress JSON-RPC and the per-service `/metrics`. So the same code that
+//! runs against the single-host Target-L stack in `tests/chain_semantics.rs`
+//! also runs against the real 12-node DinD cluster. This binary points the
+//! drivers at cluster addresses instead of per-test temp ports. A difference
+//! between the two targets is itself a signal.
 //!
-//! Invoked by `deploy/cluster/scripts/ci-cluster.sh` (the `semantics` shard of
-//! `cluster-e2e.yml`) from the runner, which can reach the cluster bridge
-//! directly: executor/validator/sequencer metrics all bind `0.0.0.0` in their
-//! Nomad jobs and `chaos.sh` already scrapes them over plain HTTP.
+//! `deploy/cluster/scripts/ci-cluster.sh` starts this binary (the
+//! `semantics` shard of `cluster-e2e.yml`) from the runner. The runner can
+//! reach the cluster bridge directly: the executor, validator, and
+//! sequencer metrics all bind `0.0.0.0` in their Nomad jobs, and `chaos.sh`
+//! already scrapes them over plain HTTP.
 //!
-//! Exits non-zero on the first failing case, like every other CI gate here.
+//! Exits with a non-zero code on the first failing case, like every other
+//! CI gate here.
 //!
 //! ```text
 //! kardamom-semantics \
@@ -46,23 +48,25 @@ struct Args {
     /// L2 chain id (must match the cluster's genesis).
     #[arg(long, default_value_t = 412_346)]
     chain_id: u64,
-    /// Executor `/metrics` addresses. Any replica answers; the first that
-    /// responds is used.
+    /// Executor `/metrics` addresses. Any replica can answer. This binary
+    /// uses the first one that answers.
     #[arg(long, value_delimiter = ',')]
     executor_metrics: Vec<SocketAddr>,
-    /// Sequencer `/metrics` addresses (all replicas; counters are summed).
+    /// Sequencer `/metrics` addresses (all replicas). The binary sums the
+    /// counters.
     #[arg(long, value_delimiter = ',')]
     sequencer_metrics: Vec<SocketAddr>,
     /// Validator `/metrics` address. Required for the `consistency` case.
     #[arg(long)]
     validator_metrics: Option<SocketAddr>,
-    /// Ingress `/metrics` address. The deployed ingress binds loopback-only,
-    /// so this is usually absent and the cases that need it are skipped.
+    /// Ingress `/metrics` address. The deployed ingress binds to loopback
+    /// only. So this is usually absent, and the cases that need it are
+    /// skipped.
     #[arg(long)]
     ingress_metrics: Option<SocketAddr>,
-    /// The ingress's `--pending-receipt-timeout-ms`. The nonce-gap case
-    /// derives its latency bounds from this, so it must match the deployment
-    /// (30 s unless the job overrides it).
+    /// The ingress's `--pending-receipt-timeout-ms` value. The nonce-gap
+    /// case derives its latency limits from this value. It must match the
+    /// deployment (30 s unless the job sets another value).
     #[arg(long, default_value_t = 30_000)]
     pending_receipt_timeout_ms: u64,
     /// Comma-separated case list.
@@ -73,13 +77,14 @@ struct Args {
     )]
     cases: Vec<String>,
     /// First dev-mnemonic account index this run may use. The cluster's
-    /// funded-account ledger (see ci-cluster.sh) assigns disjoint ranges to
-    /// each check; the semantics shard owns its own block.
+    /// funded-account ledger (see ci-cluster.sh) gives each check its own
+    /// range of accounts. The semantics shard owns its own block of
+    /// accounts.
     #[arg(long, default_value_t = 1)]
     account_base: usize,
 
     /// In-cluster anvil L1 JSON-RPC endpoint. Required for the `l1-batch`
-    /// case (the live batcher's L2 → L1 round trip, #39).
+    /// case: the live batcher's L2 to L1 round trip.
     #[arg(long)]
     l1_rpc: Option<String>,
 
@@ -98,13 +103,13 @@ async fn main() -> Result<()> {
     );
 
     let park = Duration::from_millis(args.pending_receipt_timeout_ms);
-    // Client bound above the server-side park so a gap case observes the
-    // ingress's own -32000 rather than a client abort.
+    // Set the client timeout above the server park time. This way, a gap
+    // case sees the ingress's own -32000 error, not a client abort.
     let rpc = L2Client::new(&args.rpc, park * 3 + Duration::from_secs(5))
         .context("build ingress JSON-RPC client")?;
 
-    // Executor replicas: pick one that answers. A cluster always has three;
-    // any of them serves the same counters.
+    // Pick one executor replica that answers. A cluster always has three
+    // replicas, and each one serves the same counters.
     let executor = pick_live(&args.executor_metrics)
         .await
         .context("no executor /metrics endpoint answered")?;
@@ -113,9 +118,10 @@ async fn main() -> Result<()> {
         rpc,
         chain_id: args.chain_id,
         pending_receipt_timeout: park,
-        // The deployed ingress binds metrics on loopback; when it is not
-        // reachable this points at the executor so the struct stays valid,
-        // and the cases that actually read ingress metrics are skipped below.
+        // The deployed ingress binds metrics on loopback. When it is not
+        // reachable, this field points at the executor instead, so the
+        // struct stays valid. The cases that read ingress metrics are
+        // skipped below.
         ingress_metrics: args.ingress_metrics.unwrap_or(executor),
         executor_metrics: executor,
         sequencer_metrics: args.sequencer_metrics.clone(),
@@ -156,10 +162,10 @@ async fn run_case(
                 t,
                 nonce_unordered::Params {
                     senders: 4,
-                    // Smaller than Target L: the cluster's boundary tick is
-                    // 2 s (vs 250 ms locally), so a wide run would spend the
-                    // whole case waiting for blocks rather than proving
-                    // anything extra.
+                    // Use a smaller count than Target L. The cluster's
+                    // boundary tick is 2 s (250 ms locally). A larger run
+                    // would spend the whole case waiting for blocks, without
+                    // proving more.
                     txs_per_sender: 16,
                     sender_base: base,
                     ..nonce_unordered::Params::default()
@@ -180,8 +186,8 @@ async fn run_case(
         }
         "rpc-liveness" => {
             if !have_ingress_metrics {
-                // The queue-depth probe is the only part needing ingress
-                // metrics, and it is covered at Target L.
+                // Only the queue-depth probe needs ingress metrics, and
+                // Target L already covers it.
                 println!("    (ingress /metrics not reachable — queue-depth probe skipped)");
             }
             rpc_liveness::run(
@@ -204,11 +210,11 @@ async fn run_case(
                     senders: 3,
                     transfers_per_sender: 12,
                     sender_base: base + 10,
-                    // tx_bal is UDP multicast here, not IPC: a dropped BAL
-                    // leaves a block unverified, which the design explicitly
-                    // tolerates (it is never a divergence). Budget a few for
-                    // the workload's own blocks; a validator receiving NO
-                    // BALs still blows through this.
+                    // Here tx_bal uses UDP multicast, not IPC. A dropped BAL
+                    // leaves a block unverified, and the design allows this
+                    // (it is never a divergence). This budget covers a few
+                    // drops from the workload's own blocks. A validator that
+                    // receives no BALs still goes over this budget.
                     max_bal_missing: 3.0,
                 },
             )

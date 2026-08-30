@@ -144,8 +144,8 @@ fn channel_b_carries_tx_refs_and_boundaries_in_publish_order() {
     assert_eq!(got[2], TxOrderingMessage::BoundaryStart(b));
 }
 
-/// Mini end-to-end of the executor's B-to-A join: A-readers
-/// buffer envelopes keyed by `(sequencer_id, tx_data_position)`; the B-reader
+/// Mini end-to-end of the executor's B-to-A join: A-readers buffer
+/// envelopes keyed by `(sequencer_id, tx_data_position)`. The B-reader
 /// walks the canonical order, looking up the envelope on each `TxRef`.
 #[test]
 fn b_reader_joins_against_a_buffer_in_canonical_order() {
@@ -161,8 +161,8 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
     let p_0b = a0_pub.publish(&env(102, 0x03)).unwrap();
     let p_1b = a1_pub.publish(&env(103, 0x04)).unwrap();
 
-    // Canonical-orderer interleaving: 0a, 1a, 1b, 0b (sequencer order is not
-    // canonical — the B-stream is).
+    // Canonical-orderer interleaving: 0a, 1a, 1b, 0b. Sequencer order is
+    // not canonical; the B-stream is.
     let _ = b_pub
         .publish_ref(&TxRef {
             tx_hash: alloy_primitives::B256::ZERO,
@@ -213,8 +213,8 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
         16,
     );
 
-    // Walk B in canonical order; assert we recover the canonical sequence of
-    // (sender, correlation_id).
+    // Walk B in canonical order, and check that this recovers the
+    // canonical sequence of (sender, correlation_id).
     let mut tx_ordering_sub = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
     let mut canonical: Vec<u64> = Vec::new();
     tx_ordering_sub.poll(

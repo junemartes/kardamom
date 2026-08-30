@@ -1,6 +1,6 @@
-//! Plain data types of the executor actor: restart/resume cursor, run
-//! configuration, the BAL and whole-block-execution hand-off shapes, and the
-//! internal exec → commit envelope.
+//! Plain data types of the executor actor: the restart and resume cursor,
+//! the run configuration, the BAL and whole-block-execution hand-off shapes,
+//! and the internal exec-to-commit envelope.
 
 use kardamom_types::BlockBoundary;
 
@@ -11,27 +11,31 @@ use crate::reader::ReaderConfig;
 
 /// Where a run starts: the persisted state cursor
 /// (`kardamom_state::RecoveryPoint`), or [`ResumePoint::GENESIS`] on a fresh
-/// chain — a fresh start IS a resume from the genesis cursor (all three
-/// fields zero), so there is no separate fresh-start mode to wire. The
-/// canonical stream source (the cluster's `REPLAY_FROM` on connect) delivers
-/// **from this cursor onward** — records below it are deduped inside
-/// [`crate::reader::cluster`] — so the reader and exec threads seed their
-/// counters here instead of replaying from record 0 and skip-counting:
+/// chain. A fresh start is a resume from the genesis cursor (all three
+/// fields zero), so there is no separate fresh-start mode to wire.
 ///
-/// - `block` — the last durably-committed block (`last_committed_block`). The
-///   first boundary delivered after resume is `block + 1`; the post-`block`
-///   state snapshot is what execution resumes against.
-/// - `record_count` — the cumulative count of canonical records (TxRef +
-///   DepositRef) applied through `block` (`last_fsynced_b_position.as_index()`).
-///   The reader assigns the first delivered record this index, so the boundary
-///   alignment check (absolute counts) holds across the restart. Because
-///   `record_count` is exactly the end count of `block`, the resume boundary
-///   falls cleanly between blocks — no partial block is ever half-replayed.
-/// - `l2_timestamp` — boundary `block`'s timestamp (from the committed header
-///   row). Block N+1's txs execute with boundary N's timestamp, and a resumed
-///   replica never sees boundary `block` again — without this seed its first
-///   post-resume block would execute with ts=0 and silently diverge from the
-///   replicas that never restarted.
+/// The canonical stream source (the cluster's `REPLAY_FROM` on connect)
+/// delivers records from this cursor onward. Records below the cursor are
+/// deduped inside [`crate::reader::cluster`]. So the reader and exec threads
+/// seed their counters from this cursor, instead of replaying from record 0
+/// and counting the records to skip.
+///
+/// Fields:
+/// - `block`: the last durably-committed block (`last_committed_block`).
+///   The first boundary delivered after resume is `block + 1`. Execution
+///   resumes against the state snapshot taken after `block`.
+/// - `record_count`: the cumulative count of canonical records (TxRef and
+///   DepositRef) applied through `block`
+///   (`last_fsynced_b_position.as_index()`). The reader assigns this index
+///   to the first delivered record, so the boundary alignment check
+///   (absolute counts) still holds across the restart. `record_count` is
+///   exactly the end count of `block`, so the resume boundary falls cleanly
+///   between blocks. No partial block is ever half-replayed.
+/// - `l2_timestamp`: the timestamp of boundary `block` (from the committed
+///   header row). Block N+1's transactions execute with boundary N's
+///   timestamp, and a resumed replica never sees boundary `block` again.
+///   Without this seed, the first post-resume block would execute with
+///   ts=0 and silently diverge from replicas that never restarted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResumePoint {
     pub block: u64,
@@ -40,9 +44,9 @@ pub struct ResumePoint {
 }
 
 impl ResumePoint {
-    /// The fresh-chain cursor: nothing committed, no records applied, no
-    /// boundary timestamp yet. Execution opens block 1 against the genesis
-    /// snapshot, exactly as a resume from block 0 would.
+    /// The fresh-chain cursor: nothing committed, no records applied, and
+    /// no boundary timestamp yet. Execution opens block 1 against the
+    /// genesis snapshot, the same as a resume from block 0.
     pub const GENESIS: Self = Self {
         block: 0,
         record_count: 0,
@@ -65,26 +69,32 @@ impl Default for ResumePoint {
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
     pub chain_id: u64,
-    /// Bound on the receipt queue between exec and commit threads. Larger =
-    /// more amortization, more memory.
+    /// Bound on the receipt queue between the exec and commit threads. A
+    /// larger bound gives more amortization, at the cost of more memory.
     pub receipt_queue_depth: usize,
     /// Reader-layer tunables (join buffer timeout, growth warning
     /// threshold). See [`ReaderConfig`].
     pub reader: ReaderConfig,
-    /// Re-derive every tx record's identity at arrival — `tx_hash ==
-    /// keccak256(raw_tx)`, `sender` == the signature's recovered signer (the
-    /// same [`crate::stateless::verify_record_identity`] the zk guest runs)
-    /// — and abort the pipeline with [`ExecutorError::RecordIdentity`] on
-    /// mismatch. The S0 stream carries both fields as PROXY CLAIMS; a role
-    /// that leaves this off executes whatever identity the proxy asserted
-    /// (spec: no-std-exec-core, 3a.1). The validator enables it
-    /// unconditionally and classifies the error as an integrity halt; the
-    /// executor keeps it off — with the validator checking, a forged
-    /// envelope cannot commit unnoticed, so sequencer-side rejection is
-    /// defense-in-depth priced at one ecrecover per tx on the hot path, a
-    /// separate decision. Deposit records are out of scope: their identity
-    /// (`source_hash`) stays a trusted input until the witness is
-    /// L1-anchored.
+    /// Re-derive every tx record's identity on arrival: check that
+    /// `tx_hash == keccak256(raw_tx)`, and that `sender` matches the
+    /// signature's recovered signer. This is the same check as
+    /// [`crate::stateless::verify_record_identity`], which the zk guest
+    /// runs. On a mismatch, abort the pipeline with
+    /// [`ExecutorError::RecordIdentity`].
+    ///
+    /// The stream carries both fields as proxy claims. A role that
+    /// leaves this off executes
+    /// whatever identity the proxy asserted.
+    ///
+    /// The validator enables this check unconditionally and treats a
+    /// mismatch as an integrity halt. The executor keeps it off: with the
+    /// validator checking, a forged envelope cannot commit unnoticed. So
+    /// sequencer-side rejection is defense-in-depth, priced at one ecrecover
+    /// per transaction on the hot path. That trade-off is a separate
+    /// decision.
+    ///
+    /// Deposit records are out of scope. Their identity (`source_hash`)
+    /// stays a trusted input until the witness is anchored on L1.
     pub verify_record_identity: bool,
 }
 
@@ -99,32 +109,33 @@ impl Default for ExecutorConfig {
     }
 }
 
-/// Per-block EIP-7928 handoff to the executor's BAL publisher thread:
-/// (boundary, receipts-free merged delta for the frame's V1 section, the
-/// captured Bal). Sent at each boundary when capture is enabled.
+/// Per-block EIP-7928 hand-off to the executor's BAL publisher thread: the
+/// boundary, the receipts-free merged delta for the frame's V1 section, and
+/// the captured Bal. Sent at each boundary when capture is enabled.
 pub type BalHandoff = (
     BlockBoundary,
     kardamom_types::BlockDelta,
     revm::state::bal::Bal,
 );
 
-// Buffered-record + block-output types moved to the `no_std` exec core with
-// the phase-3 stateless driver (they ARE its input/output shapes); re-exported
-// here so every pre-move path keeps resolving. They still mirror
-// [`crate::reader::ReaderToExec`]'s payload arms.
+// The buffered-record and block-output types moved to the `no_std` exec
+// core with the phase-3 stateless driver, since they are its input and
+// output shapes. Re-exported here so every pre-move path still resolves.
+// They still mirror the payload arms of `crate::reader::ReaderToExec`.
 pub use kardamom_exec_core::stateless::{BlockExecOutput, BufferedRecord};
 
 /// Optional whole-block execution strategy. `None` (the executor) keeps the
-/// per-tx streaming path untouched. `Some` (the validator's parallel
-/// verifier) makes the exec thread BUFFER a block's records and execute
-/// them together at the boundary — which is what allows batches to run
+/// per-transaction streaming path unchanged. `Some` (the validator's
+/// parallel verifier) makes the exec thread buffer a block's records and
+/// execute them together at the boundary. This is what lets batches run
 /// concurrently, seeded from BAL claims.
-/// (snapshot, PARENT LAYER, records, env, block_number). The parent layer
-/// is the actor's merged not-yet-durable writes — the depth-K commit
-/// pipeline lets execution run up to K blocks ahead of fsync, so the
-/// snapshot alone can be K blocks STALE. Ignoring it executes against old
-/// state: under load the validator skipped txs (nonce mismatch) the
-/// executor had executed, a proven divergence in the first DeFi gate.
+/// Parameters: snapshot, parent layer, records, env, block_number. The
+/// parent layer is the actor's merged, not-yet-durable writes. The depth-K
+/// commit pipeline lets execution run up to K blocks ahead of fsync, so the
+/// snapshot alone can be K blocks stale. Ignoring the parent layer executes
+/// against old state. Under load, this caused the validator to skip
+/// transactions (nonce mismatch) that the executor had already executed.
+/// This was a proven divergence, found in the first DeFi gate.
 pub type BlockExec<D> = Box<
     dyn Fn(
             &D,
@@ -136,7 +147,7 @@ pub type BlockExec<D> = Box<
         + Send,
 >;
 
-/// Internal envelope routed from exec → commit thread.
+/// Internal envelope routed from the exec thread to the commit thread.
 pub(crate) enum ExecToCommit {
     Receipt(kardamom_types::Receipt),
     Boundary(BlockBoundary),

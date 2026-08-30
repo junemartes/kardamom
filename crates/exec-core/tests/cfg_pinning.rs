@@ -1,12 +1,13 @@
-//! Pin every effective execution parameter (W1b of
+//! Pin every effective execution parameter (see W1b in
 //! `docs/agents/l1-client-suite-port-spec.md`).
 //!
-//! `CfgEnv` is `#[non_exhaustive]`, so unlike `BlockEnv` we cannot force a
-//! compile error when revm grows a field — instead these tests assert the
-//! effective value of every parameter, including the spec-derived ones we
-//! deliberately leave unset. A failure here after a revm bump is the alarm
-//! working: some execution parameter changed underneath us and needs a
-//! recorded decision, not a silent adoption.
+//! `CfgEnv` is `#[non_exhaustive]`, so unlike `BlockEnv` this cannot force
+//! a compile error when revm grows a field. Instead, these tests assert
+//! the effective value of every parameter, including the spec-derived
+//! ones this code deliberately leaves unset. A failure here after a revm
+//! bump is the alarm working: some execution parameter changed
+//! underneath this code and needs a recorded decision, not a silent
+//! adoption.
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use kardamom_exec_core::block_env::{BLOCK_GAS_LIMIT, ExecEnv, SPEC_ID};
@@ -37,10 +38,10 @@ fn spec_is_pinned_to_osaka() {
     assert_eq!(env().cfg_env().spec, SPEC_ID);
 }
 
-/// Failure here means upstream revm moved its default spec past our pin:
-/// behavior is UNCHANGED (that is what the pin is for), but a newer fork now
-/// exists upstream. Follow the fork-bump procedure in the spec's hardfork
-/// policy section, then update this assertion.
+/// A failure here means upstream revm moved its default spec past this
+/// pin. Behavior is unchanged (that is what the pin is for), but a newer
+/// fork now exists upstream. Follow the fork-bump procedure in the
+/// spec's hardfork policy section, then update this assertion.
 #[test]
 fn upstream_default_spec_still_matches_pin() {
     assert_eq!(SpecId::default(), SPEC_ID);
@@ -61,7 +62,7 @@ fn tx_gas_limit_cap_is_the_eip7825_cap() {
 #[test]
 fn blob_parameters_are_explicit_and_blobs_are_impossible() {
     let cfg = env().cfg_env();
-    // `None` would SKIP the max-blob check entirely; `Some(0)` makes any
+    // `None` would skip the max-blob check entirely. `Some(0)` makes any
     // type-3 tx that slips past ingress deterministically invalid.
     assert_eq!(cfg.max_blobs_per_tx, Some(0));
     assert_eq!(
@@ -73,10 +74,10 @@ fn blob_parameters_are_explicit_and_blobs_are_impossible() {
 #[test]
 fn code_size_limits_are_spec_derived() {
     let cfg = env().cfg_env();
-    // Deliberately unset: the effective limits come from the pinned spec.
+    // Deliberately unset. The effective limits come from the pinned spec.
     assert_eq!(cfg.limit_contract_code_size, None);
     assert_eq!(cfg.limit_contract_initcode_size, None);
-    // Pin what "spec-derived" currently resolves to (EIP-170 / EIP-3860).
+    // Pin what "spec-derived" currently resolves to (EIP-170 and EIP-3860).
     assert_eq!(eip170::MAX_CODE_SIZE, 24_576);
     assert_eq!(eip3860::MAX_INITCODE_SIZE, 49_152);
 }
@@ -89,12 +90,15 @@ fn misc_cfg_values_pinned() {
     assert!(!cfg.disable_nonce_check);
 }
 
-/// The per-opcode gas cost table. Two assertions:
-/// 1. the table in our CfgEnv is the one derived from `SPEC_ID` (guards the
-///    construction-order hazard: the table is built when the CfgEnv is
-///    constructed and is NOT rebuilt on later `spec` assignment);
-/// 2. a golden keccak of the table itself, so an upstream opcode repricing
-///    (EIP-7904-class, or a quiet revm patch) surfaces as a reviewable diff.
+/// The per-opcode gas cost table. This makes two assertions:
+///
+/// 1. The table in this `CfgEnv` is the one derived from `SPEC_ID`. This
+///    guards the construction-order hazard: the table is built when the
+///    `CfgEnv` is constructed, and is not rebuilt on a later `spec`
+///    assignment.
+/// 2. A golden keccak of the table itself, so an upstream opcode
+///    repricing (an EIP-7904-class change, or a quiet revm patch)
+///    surfaces as a reviewable diff.
 #[test]
 fn gas_table_matches_pinned_spec_and_golden_hash() {
     let cfg = env().cfg_env();
@@ -117,8 +121,9 @@ fn gas_table_matches_pinned_spec_and_golden_hash() {
     );
 }
 
-/// `BlockEnv` is a plain struct, so full-literal equality pins every field at
-/// once; adding a field upstream breaks `block_env()` at compile time first.
+/// `BlockEnv` is a plain struct, so full-literal equality pins every
+/// field at once. Adding a field upstream breaks `block_env()` at
+/// compile time first.
 #[test]
 fn block_env_fully_pinned() {
     let be = env().block_env();
@@ -139,8 +144,9 @@ fn block_env_fully_pinned() {
             slot_num: 0,
         }
     );
-    // Excess 0 ⇒ blob gasprice 1 for any update fraction — the documented
-    // reason the Prague constant is inert.
+    // An excess of 0 gives a blob gas price of 1 for any update
+    // fraction. This is the documented reason the Prague constant has
+    // no effect.
     assert_eq!(
         be.blob_excess_gas_and_price.unwrap().blob_gasprice,
         1,

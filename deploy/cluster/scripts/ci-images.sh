@@ -2,31 +2,33 @@
 # =============================================================================
 # ci-images.sh — image build + registry push for ci-cluster.sh.
 # =============================================================================
-# SOURCED into ci-cluster.sh's shell (never executed as a child): a fatal
-# build error must abort the ONE ci-cluster process (set -e / explicit exit).
-# Reads the entry script's ROOT/REGISTRY/TAG/SERVICES/DIGEST_MANIFEST
-# constants at call time.
-# This file must NOT install traps (ci-cluster.sh owns the single EXIT trap).
-# Requires lib.sh (log) and lib-signing.sh (sign_pushed_image; ci-cluster.sh
-# signs the completed manifest itself via sign_digest_manifest — after the
-# LAST push, because a bundle over a half-written manifest would verify and
-# still lie).
+# This file is sourced into ci-cluster.sh's shell, never run as a child
+# process. A fatal build error must abort the one ci-cluster process,
+# through set -e or an explicit exit. It reads the entry script's
+# ROOT/REGISTRY/TAG/SERVICES/DIGEST_MANIFEST constants at call time.
+# This file must not install traps; ci-cluster.sh owns the single EXIT
+# trap. It needs lib.sh (for log) and lib-signing.sh (for
+# sign_pushed_image). ci-cluster.sh signs the completed manifest itself,
+# with sign_digest_manifest, after the last push. A signature over a
+# half-written manifest would still verify, but it would lie.
 
 # Push a locally-built image to the in-cluster registry.
 #
-# On a CI runner the host docker daemon reaches 192.168.56.10:5000 directly, so
-# this is a plain `docker push` (REGISTRY_PUSH_NODE unset → unchanged behavior).
+# On a CI runner, the host docker daemon reaches 192.168.56.10:5000
+# directly. So this is a plain `docker push`, and REGISTRY_PUSH_NODE stays
+# unset with no change in behavior.
 #
-# On the local Docker-Desktop harness (local-cluster.sh) the VM daemon's registry
-# traffic is hijacked by Docker Desktop's transparent HTTP proxy
-# (http.docker.internal:3128), whose bypass list does NOT include the VM-internal
-# 192.168.56.0/24 bridge — so a direct push routes through that proxy, which can't
-# reach the bridge IP, and hangs until "context deadline exceeded" (the registry
-# never receives the request). Side-step the proxy entirely by moving the image
-# engine-to-engine over the docker socket (`docker save | docker exec … docker
-# load`) into REGISTRY_PUSH_NODE's inner docker, then pushing from THERE: that node
-# is co-located with the registry (cp1), so its push is node-local and never touches
-# the proxy. The other nodes still pull from the registry over the bridge as usual.
+# On the local Docker Desktop harness (local-cluster.sh), Docker Desktop's
+# transparent HTTP proxy (http.docker.internal:3128) hijacks the VM
+# daemon's registry traffic. Its bypass list does not include the
+# VM-internal 192.168.56.0/24 bridge. So a direct push routes through
+# that proxy, which cannot reach the bridge IP, and hangs until "context
+# deadline exceeded" — the registry never gets the request. To avoid the
+# proxy, move the image engine-to-engine over the docker socket
+# (`docker save | docker exec … docker load`) into REGISTRY_PUSH_NODE's
+# inner docker, then push from there. That node (cp1) sits next to the
+# registry, so its push is node-local and never touches the proxy. Other
+# nodes still pull from the registry over the bridge as usual.
 push_image() {
   local img="$1"
   local out
@@ -37,42 +39,45 @@ push_image() {
   else
     out="$(docker push "${img}" | tee /dev/stderr)"
   fi
-  # Digest capture (attested-identity P0.1): record the digest of exactly this
-  # push so deploy.sh can pin the jobs. The digest comes from the push
-  # output's final "digest: sha256:..." line, NOT from
+  # Digest capture: record the digest of this exact push, so deploy.sh
+  # can pin the jobs. The digest comes from the
+  # push output's last "digest: sha256:..." line, not from
   # `docker inspect --format='{{index .RepoDigests 0}}'`, for two reasons:
-  #   1. it works identically for both push paths above — in the
-  #      REGISTRY_PUSH_NODE path the push happens inside the node's INNER
-  #      docker, where a host-side inspect would find no RepoDigests at all;
-  #   2. RepoDigests is an unordered LIST that can carry digests for other
-  #      repos/registries the same image ID is tagged under, so index 0 is not
-  #      guaranteed to be this registry's digest — the push output line is by
-  #      definition the digest of exactly this push to exactly this repo.
-  # Defensive strip + shape validation: an invisible \r/space here would print
-  # clean in every log yet fail docker's reference parser at pull time. Fail
-  # loudly rather than fall back: a deploy that silently lost its digest
-  # would run the mutable :dev tag while claiming an audit record.
+  #   1. It works the same for both push paths above. In the
+  #      REGISTRY_PUSH_NODE path, the push happens inside the node's
+  #      inner docker, where a host-side inspect would find no
+  #      RepoDigests at all.
+  #   2. RepoDigests is an unordered list. It can hold digests for other
+  #      repos or registries that share the same image ID, so index 0 is
+  #      not guaranteed to be this registry's digest. The push output
+  #      line always names the digest of this exact push, to this exact
+  #      repo.
+  # Strip stray characters and validate the shape. An invisible \r or
+  # space would print clean in every log, but fail docker's reference
+  # parser at pull time. Fail loudly instead of falling back. A deploy
+  # that silently lost its digest would run the mutable :dev tag while
+  # claiming an audit record.
   local digest
   digest="$(awk '/digest: sha256:/ {d=$3} END {print d}' <<<"${out}" | tr -d '[:space:]\r')"
   if [[ -z "${digest}" ]]; then
     echo "ERROR: could not capture the pushed digest for ${img} from the push output" >&2
     exit 1
   fi
-  # Manifest line: "<svc> <repo>:<tag>@sha256:..." where <svc> is the image
-  # basename minus the kardamom- prefix (aeron, cluster, ingress, ...).
-  # deploy.sh maps each job to its <svc> line and passes the ref via
+  # Manifest line: "<svc> <repo>:<tag>@sha256:...". <svc> is the image
+  # basename without its kardamom- prefix (aeron, cluster, ingress, ...).
+  # deploy.sh maps each job to its <svc> line, and passes the ref through
   # -var image_ref=... .
   #
-  # The COMBINED repo:tag@digest form (not bare repo@digest) is deliberate:
-  # Nomad 1.9.5's docker driver (drivers/docker/utils.go parseDockerImage)
-  # mis-parses a bare digest ref on a PORT-carrying registry host — the
-  # registry-port colon makes it take the "tag contains /" branch, append
-  # :latest, and the pull dies with "invalid reference format" (exactly what
-  # took down every aeron alloc on PR #212's first e2e run). With repo:tag@
-  # digest the driver pulls the advisory tag and then resolves the container
-  # image by the DIGEST ref (ImageInspectWithRaw on the full pinned string),
-  # so the digest still pins what runs: a moved tag fails the task instead
-  # of ever running unpinned bytes.
+  # The combined repo:tag@digest form is deliberate; a bare repo@digest is
+  # not enough. Nomad 1.9.5's docker driver
+  # (drivers/docker/utils.go parseDockerImage) cannot parse a bare digest
+  # ref on a registry host with a port. The registry-port colon makes it
+  # take the "tag contains /" branch, append :latest, and the pull fails
+  # with "invalid reference format". With repo:tag@digest, the driver
+  # pulls the advisory tag, then resolves the container image by the
+  # digest ref (ImageInspectWithRaw on the full pinned string). So the
+  # digest still pins what runs: a moved tag fails the task, instead of
+  # running unpinned bytes.
   local ref name ref_re='^[a-z0-9./:-]+@sha256:[0-9a-f]{64}$'
   ref="${img}@${digest}"
   if [[ ! "${ref}" =~ ${ref_re} ]]; then
@@ -83,32 +88,36 @@ push_image() {
   name="${name%%:*}"
   echo "${name#kardamom-} ${ref}" >>"${DIGEST_MANIFEST}"
   log "pinned ${name#kardamom-} -> ${ref}"
-  # Attested-identity P0.5: keyless-sign the digest we just pinned (public
-  # Rekor). No-op with a log line outside CI-with-OIDC — the local harness
-  # (and the REGISTRY_PUSH_NODE proxy-safe path, which is local-dev by
-  # definition) deploys unsigned, exactly like deploy.sh's :dev-tag fallback.
+  # Sign the digest just pinned, with keyless signing to the public
+  # Rekor log. Outside CI with OIDC, this is a
+  # logged no-op. The local harness, and the REGISTRY_PUSH_NODE
+  # proxy-safe path (local dev by definition), deploy unsigned, the same
+  # as deploy.sh's :dev-tag fallback.
   sign_pushed_image "${ref}"
 }
 
-# Thin service images from prebuilt binaries (§5): the workflow ran
-# `cargo build --release` for each BIN; wrap each into a thin image and push
-# to the in-cluster registry (reachable on the bridge IP).
+# Build thin service images from prebuilt binaries (§5). The workflow ran
+# `cargo build --release` for each BIN. This function wraps each binary
+# into a thin image, and pushes it to the in-cluster registry, reachable
+# on the bridge IP.
 build_service_images() {
   local staging found so svc bin
   log "building + pushing service images to ${REGISTRY}"
-  # Fresh digest manifest for THIS deploy (push_image appends one line per
-  # image; deploy.sh reads it to pin every job to repo@sha256:...).
+  # Start a fresh digest manifest for this deploy. push_image appends one
+  # line per image. deploy.sh reads the file to pin every job to
+  # repo@sha256:....
   : >"${DIGEST_MANIFEST}"
   # Aeron image (same canonical Dockerfile as make images).
   docker build -f "${ROOT}/crates/log/docker/aeron/Dockerfile" \
     -t "${REGISTRY}/kardamom-aeron:${TAG}" "${ROOT}/crates/log/docker/aeron"
   push_image "${REGISTRY}/kardamom-aeron:${TAG}"
 
-  # The binaries link Aeron DYNAMICALLY (rusteron's static feature is broken on
-  # Linux), so the thin runtime image must carry libaeron.so /
-  # libaeron_archive_c_client.so. rusteron builds them under the cargo build dir;
-  # stage them into the image build context (target/release) so the Dockerfile
-  # can COPY them in. ldconfig in the image then makes them resolvable.
+  # The binaries link Aeron dynamically, since rusteron's static feature
+  # is broken on Linux. So the thin runtime image must carry libaeron.so
+  # and libaeron_archive_c_client.so. rusteron builds these under the
+  # cargo build directory. Stage them into the image build context
+  # (target/release), so the Dockerfile can copy them in. ldconfig in the
+  # image then makes them resolvable.
   staging="${ROOT}/target/release/_aeronlibs"
   rm -rf "${staging}"; mkdir -p "${staging}"
   found=0
@@ -126,13 +135,16 @@ build_service_images() {
   done
 }
 
-# Cluster image — the Java Aeron-Cluster node (§5b). The clustered sealer
-# (cluster.nomad.hcl, Phase 3) runs a PURE-JVM Aeron Cluster member, NOT a Rust
-# SERVICE — so it's built separately from the SERVICES loop above: the workflow
-# runs `./gradlew :service:shadowJar` (before ci-cluster.sh) to produce
-# kardamom-cluster-node.jar; here we stage that jar into the Dockerfile's
-# build context and build/push the image deploy.sh's cluster.nomad.hcl pulls
-# (192.168.56.10:5000/kardamom-cluster:dev). cluster.Dockerfile COPYs the jar.
+# Build the cluster image, the Java Aeron Cluster node (§5b). The
+# clustered sealer (cluster.nomad.hcl, Phase 3) runs a pure-JVM Aeron
+# Cluster member, not a Rust service. So this function builds it
+# separately from the SERVICES loop above. The workflow runs
+# `./gradlew :service:shadowJar` before ci-cluster.sh, to produce
+# kardamom-cluster-node.jar. This function stages that jar into the
+# Dockerfile's build context, then builds and pushes the image
+# deploy.sh's cluster.nomad.hcl pulls
+# (192.168.56.10:5000/kardamom-cluster:dev). cluster.Dockerfile copies the
+# jar in.
 build_cluster_image() {
   local CLUSTER_JAR="${ROOT}/cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar"
   if [[ -f "${CLUSTER_JAR}" ]]; then
@@ -142,8 +154,9 @@ build_cluster_image() {
       -t "${REGISTRY}/kardamom-cluster:${TAG}" "${ROOT}/deploy/cluster/docker"
     push_image "${REGISTRY}/kardamom-cluster:${TAG}"
   else
-    # The deploy uses the CLUSTERED sealer (cluster.nomad.hcl), so a missing jar is
-    # fatal: deploy.sh would fail pulling kardamom-cluster:${TAG}. Fail loudly here.
+    # The deploy uses the clustered sealer (cluster.nomad.hcl), so a
+    # missing jar is fatal. deploy.sh would fail to pull
+    # kardamom-cluster:${TAG}. Fail loudly here.
     echo "ERROR: cluster jar not found at ${CLUSTER_JAR}" >&2
     echo "       Build it first: (cd cluster/sealer-service && ./gradlew :service:shadowJar)" >&2
     exit 1

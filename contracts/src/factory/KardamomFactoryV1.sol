@@ -10,23 +10,24 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 
 import {IKardamomFactory} from "./IKardamomFactory.sol";
 
-/// @notice UUPS-upgradeable contract registry and CREATE2 deployer.
-/// Bootstrap pattern: deployed through ERC-7955's permissionless CREATE2 factory so the
-/// proxy address is the same across L1s for a given (compiled bytecode, owner) pair.
-/// The proxy's initcode embeds `initialize(address owner)`, so the canonical address
-/// depends on the owner — different envs (mainnet/testnet/dev) use different owners
-/// and naturally land at different L1 addresses.
+/// @notice A UUPS-upgradeable contract registry and CREATE2 deployer.
+/// This uses a bootstrap pattern: ERC-7955's permissionless CREATE2 factory
+/// deploys it, so the proxy address stays the same across L1 chains for a
+/// given pair of compiled bytecode and owner. The proxy's initcode embeds
+/// `initialize(address owner)`, so the canonical address depends on the
+/// owner. Different environments (mainnet, testnet, dev) use different
+/// owners, so each one lands at a different L1 address.
 contract KardamomFactoryV1 is
     IKardamomFactory,
     Initializable,
     UUPSUpgradeable,
     Ownable2StepUpgradeable
 {
-    // Per-(l2ChainId) discovery.
+    // Discovery data, keyed by l2ChainId.
     uint256[] public l2ChainIds;
     mapping(uint256 => bool) private _l2ChainIdSeen;
 
-    // Per-(l2ChainId, contractId) registry.
+    // Registry data, keyed by l2ChainId and contractId.
     mapping(uint256 => bytes32[]) private _idsByChainId;
     mapping(uint256 => mapping(bytes32 => Entry)) private _registry;
 
@@ -35,8 +36,9 @@ contract KardamomFactoryV1 is
         _disableInitializers();
     }
 
-    /// @notice Bootstrap initializer. Owner is passed in; the bootstrap caller (whoever
-    /// runs ERC-7955.deploy with this initcode) does not need to be the owner.
+    /// @notice The bootstrap initializer. The caller passes in the owner.
+    /// The bootstrap caller (whoever runs ERC-7955.deploy with this
+    /// initcode) does not need to be the owner.
     function initialize(address owner) external initializer {
         __Ownable_init(owner);
         __Ownable2Step_init();
@@ -46,8 +48,9 @@ contract KardamomFactoryV1 is
 
     // ---------- IKardamomFactory ----------
 
-    /// @notice Process specs sequentially. Any single failure reverts the entire batch
-    /// (standard Solidity transaction semantics — there is no partial-success state).
+    /// @notice Process specs in order. If any one spec fails, the whole
+    /// batch reverts, following normal Solidity transaction rules. There
+    /// is no partial-success state.
     function applyDeployments(DeploymentSpec[] calldata specs) external onlyOwner {
         uint256 n = specs.length;
         for (uint256 i = 0; i < n; i++) {
@@ -142,8 +145,9 @@ contract KardamomFactoryV1 is
         emit Upgraded(s.l2ChainId, s.id, oldImpl, newImpl, e.version);
     }
 
-    /// Resolve the impl: reuse `s.targetImpl` if non-zero (verified to have code),
-    /// otherwise CREATE2 from `s.implInitcode` + `s.implSalt`.
+    /// Resolve the implementation address. Reuse `s.targetImpl` if it is
+    /// non-zero, after checking it has code. Otherwise, run CREATE2 with
+    /// `s.implInitcode` and `s.implSalt`.
     function _resolveImpl(DeploymentSpec calldata s) internal returns (address impl) {
         if (s.targetImpl != address(0)) {
             if (s.targetImpl.code.length == 0) revert ImplNotDeployed(s.targetImpl);
@@ -151,9 +155,10 @@ contract KardamomFactoryV1 is
             return impl;
         }
         impl = _create2(s.implInitcode, s.implSalt);
-        // Defense-in-depth: _create2 already reverts on addr==0, but a constructor
-        // that returns no runtime code (e.g. SELFDESTRUCT in constructor) would still
-        // produce a non-zero address with empty code.
+        // This is a defense-in-depth check. `_create2` already reverts when
+        // the address is zero. But a constructor that returns no runtime
+        // code (for example, one that self-destructs) can still produce a
+        // non-zero address with empty code.
         if (impl.code.length == 0) revert Create2Failed();
     }
 

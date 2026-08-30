@@ -1,24 +1,24 @@
-//! S5 — `rpc_endpoints_never_hang`.
+//! `rpc_endpoints_never_hang`.
 //!
 //! Every endpoint answers within its contract bound, with the documented
-//! code, under adversarial inputs and while submits are parked:
+//! error code, under bad input and while submits are parked:
 //!
-//! - malformed RLP / invalid signature → `-32602`, immediate;
-//! - a *different* tx reusing a landed (sender, nonce) slot → immediate
-//!   success returning the slot's canonical (original) hash — the designed
-//!   (sender, nonce)-keyed idempotency, NOT a new execution;
-//! - idempotent raw resubmit → immediate success, same hash;
-//! - unknown-hash receipt lookup → `null`, fast;
-//! - `eth_chainId` (correct value!) / `eth_blockNumber` stay fast while a
-//!   nonce-gap submit is parked on the same server;
+//! - malformed RLP or an invalid signature: `-32602`, immediate.
+//! - a different transaction that reuses a landed (sender, nonce) slot: an
+//!   immediate `-32602` nonce-conflict rejection, not a silent alias of
+//!   another transaction's hash.
+//! - an idempotent raw resubmit: immediate success, same hash.
+//! - an unknown-hash receipt lookup: `null`, fast.
+//! - `eth_chainId` (with the correct value) and `eth_blockNumber` stay
+//!   fast while a nonce-gap submit is parked on the same server.
 //! - the deferred read endpoints (`eth_getBalance`,
-//!   `eth_getTransactionCount`) fail cleanly with `-32603`, never hang.
+//!   `eth_getTransactionCount`) fail cleanly with `-32603`, and never hang.
 //!
-//! Two probes need dedicated stacks and live as separate drivers below:
-//! [`connection_cap_refusal`] (a tiny `--rpc-max-connections`) and
-//! [`queue_depth_canary`] (regression guard for the #81 pending-registry
-//! leak on cancelled RPC futures, fixed in #91 by the Weak-indexed
-//! registry).
+//! Two probes need dedicated stacks, so they live as separate drivers
+//! below: [`connection_cap_refusal`] (a small `--rpc-max-connections`
+//! value) and [`queue_depth_canary`] (a regression guard for a
+//! pending-registry leak on cancelled RPC futures, fixed by the
+//! Weak-indexed registry).
 
 use std::time::Duration;
 
@@ -52,9 +52,9 @@ fn expect_call_error<T: std::fmt::Debug>(out: &RpcOutcome<T>, code: i32, what: &
     }
 }
 
-/// A structurally valid legacy tx whose signature cannot recover (s far
-/// beyond the curve order), so it exercises the sig-verify rejection path
-/// rather than the RLP decoder.
+/// A structurally valid legacy transaction whose signature cannot recover
+/// (s is far beyond the curve order). This exercises the signature-verify
+/// rejection path, not the RLP decoder.
 fn unrecoverable_tx(chain_id: u64, to: Address) -> Bytes {
     let tx = TxLegacy {
         chain_id: Some(chain_id),
@@ -74,8 +74,8 @@ fn unrecoverable_tx(chain_id: u64, to: Address) -> Bytes {
 
 pub struct Params {
     pub sender: usize,
-    /// A second account whose nonce-gap submit provides the parked-load
-    /// backdrop for the read-endpoint probes.
+    /// A second account. Its nonce-gap submit gives the read-endpoint
+    /// probes a background of parked load.
     pub parked_sender: usize,
 }
 
@@ -109,7 +109,7 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         tokio::spawn(async move { rpc.send_raw(&raw).await })
     };
 
-    // --- Adversarial matrix, all bounded. -------------------------------------
+    // --- Bad-input matrix, all bounded. -------------------------------------
     // Malformed RLP.
     let out = t
         .rpc
@@ -123,14 +123,14 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
     assert_fast(&out, fast, "unrecoverable-sig submit")?;
     expect_call_error(&out, CODE_INVALID, "unrecoverable-sig submit")?;
 
-    // A DIFFERENT tx at the landed (sender, nonce 0) slot: identity-honest
-    // semantics (#156). The old contract answered with the slot's canonical
-    // hash — i.e., a submit response carrying ANOTHER tx's identity, which
-    // is exactly the shape that let an upstream receipt mix-up silently
-    // poison a client's view of what landed. The contract is now a PROMPT
-    // named nonce-conflict rejection (the "nonce too low" analogue); the
-    // liveness property under test — bounded, non-hanging answers — holds
-    // through the error path.
+    // A different transaction at the landed (sender, nonce 0) slot. This
+    // checks identity-honest semantics. The old contract answered with the
+    // slot's canonical hash: a submit response that carried another
+    // transaction's identity. That let an upstream receipt mix-up silently
+    // poison a client's view of what landed. The contract now gives a
+    // prompt, named nonce-conflict rejection (like "nonce too low"). The
+    // liveness property under test, a bounded and non-hanging answer,
+    // still holds through this error path.
     let tx0_alt = l2::sign_transfer(sender, t.chain_id, 0, to, 2)?;
     anyhow::ensure!(tx0_alt.hash != tx0.hash, "alt tx must differ");
     let out = t.rpc.send_raw(&tx0_alt.raw).await;
@@ -158,7 +158,7 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         out.result
     );
 
-    // Reads stay fast (and correct) while the gap submit is parked.
+    // Reads stay fast and correct while the gap submit is parked.
     let expected_chain_id = format!("0x{:x}", t.chain_id);
     for i in 0..20 {
         let out = t.rpc.chain_id().await;
@@ -188,7 +188,7 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
     assert_fast(&out, fast, "eth_getTransactionCount (deferred)")?;
     expect_call_error(&out, CODE_INTERNAL, "eth_getTransactionCount (deferred)")?;
 
-    // The parked submit resolves with the server-side timeout (bounded).
+    // The parked submit resolves with the server timeout, which is bounded.
     let out = parked.await.context("parked submit join")?;
     match out.result {
         Err(RpcError::Call { code, .. }) if code == super::CODE_TIMEOUT => {}
@@ -197,10 +197,10 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
     Ok(())
 }
 
-/// The connection cap refuses the (cap+1)-th concurrent connection promptly —
-/// a transport-level refusal, never an indefinite park. Run on a stack with a
-/// small `--rpc-max-connections` (= `cap`) and a short pending-receipt
-/// timeout.
+/// The connection cap refuses the (cap+1)-th concurrent connection
+/// promptly, with a transport-level refusal, never an indefinite park.
+/// Run this on a stack with a small `--rpc-max-connections` value (`cap`)
+/// and a short pending-receipt timeout.
 pub async fn connection_cap_refusal(
     rpc_url: &str,
     chain_id: u64,
@@ -211,17 +211,17 @@ pub async fn connection_cap_refusal(
     let signers = l2::dev_signers((sender_base + cap) as u32 + 1)?;
     let to = Address::from([0x56u8; 20]);
 
-    // Occupy exactly `cap` connections with parked nonce-gap submits, one
-    // client (= one HTTP connection) each.
+    // Occupy exactly `cap` connections with parked nonce-gap submits. Each
+    // client opens one HTTP connection.
     let mut parked = tokio::task::JoinSet::new();
     for i in 0..cap {
         let client = L2Client::new(rpc_url, park * 3)?;
         let tx = l2::sign_transfer(&signers[sender_base + i], chain_id, 5, to, 1)?;
         parked.spawn(async move { client.send_raw(&tx.raw).await });
     }
-    // Give the parked submits a moment to occupy their connections (bounded
-    // poll: the ingress received counter is not exposed per-connection, so
-    // poll until all `cap` submits are in flight via a short settle loop).
+    // Give the parked submits a moment to occupy their connections. There
+    // is no per-connection counter to poll, so this just waits a short,
+    // fixed time instead.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // The next connection must be refused promptly.
@@ -238,8 +238,8 @@ pub async fn connection_cap_refusal(
         out.result
     );
 
-    // Once the parked submits time out server-side, capacity frees and the
-    // same endpoint serves again.
+    // Once the parked submits time out on the server, capacity frees up,
+    // and the same endpoint serves requests again.
     while let Some(j) = parked.join_next().await {
         let out = j.context("parked join")?;
         anyhow::ensure!(
@@ -261,12 +261,12 @@ pub async fn connection_cap_refusal(
     Ok(())
 }
 
-/// Regression guard for the #81 pending-registry leak (fixed in #91): cancel
-/// in-flight gap submits at the CLIENT (dropping the connection mid-park)
-/// and require `kardamom_ingress_queue_depth` to return to baseline once the
-/// server-side park bound has passed. With the Weak-indexed registry the
-/// dropped handler future kills its entry and its `Drop` reaps the slot —
-/// this pins that property end-to-end.
+/// Regression guard for a pending-registry leak. This cancels in-flight
+/// gap submits at the client, by dropping the connection mid-park, and
+/// requires `kardamom_ingress_queue_depth` to return to baseline once the
+/// server park bound passes. With the Weak-indexed registry, the dropped
+/// handler future kills its entry, and its `Drop` implementation reaps
+/// the slot. This test checks that property end to end.
 pub async fn queue_depth_canary(t: &Target, sender_base: usize, n: usize) -> Result<()> {
     let signers = l2::dev_signers((sender_base + n) as u32)?;
     let to = Address::from([0x57u8; 20]);
@@ -275,8 +275,8 @@ pub async fn queue_depth_canary(t: &Target, sender_base: usize, n: usize) -> Res
         .await
         .unwrap_or(0.0);
 
-    // Clients that give up long before the server's park bound: each drop
-    // abandons its parked submit_raw future server-side.
+    // These clients give up long before the server's park bound. Each drop
+    // abandons its parked submit_raw future on the server.
     let mut aborted = tokio::task::JoinSet::new();
     for i in 0..n {
         let client = L2Client::new(&t.rpc.url, Duration::from_millis(500))?;
@@ -292,8 +292,8 @@ pub async fn queue_depth_canary(t: &Target, sender_base: usize, n: usize) -> Res
         );
     }
 
-    // After the server-side bound (+ margin), every abandoned entry should
-    // have been cleaned up.
+    // After the server bound, plus a margin, every abandoned entry should
+    // be cleaned up.
     poll_until(
         "ingress queue depth back to baseline after client aborts",
         t.pending_receipt_timeout + Duration::from_secs(10),

@@ -1,12 +1,14 @@
-//! Smoke test: run `Harness<TransfersWorkflow>` for ~800ms against the
-//! in-process **ingress** stand-in and assert it completes end-to-end.
+//! This is a smoke test. It runs `Harness<TransfersWorkflow>` for about
+//! 800ms against the in-process ingress stand-in, and checks that it
+//! completes end-to-end.
 //!
-//! The harness drives a real `IngressProxy` (over `MockChannels` + a fake
-//! executor) and scopes flame/pprof recording to the dispatch window. Ingress
-//! emits no `tracing` spans, so the tracing-flame SVG is intentionally skipped
-//! when empty (see `harness::write_flame_output`); this test just confirms the
-//! wiring runs without error. The full in-process Aeron pipeline harness
-//! (real execution → span-based flames) is tracked as a follow-up.
+//! The harness drives a real `IngressProxy`, over `MockChannels` with
+//! a fake executor, and scopes flame and pprof recording to the
+//! dispatch window. Ingress emits no `tracing` spans, so the code
+//! skips the tracing-flame SVG on purpose when it would be empty; see
+//! `harness::write_flame_output`. This test only confirms the wiring
+//! runs without error. A full in-process Aeron pipeline harness, with
+//! real execution and span-based flame graphs, is a follow-up item.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -22,9 +24,10 @@ async fn harness_runs_against_inprocess_ingress() {
 
     let bench = Benchmark {
         workflow: TransfersWorkflow::default(),
-        // Sized larger than the timeout can consume so the deadline (not work
-        // exhaustion) ends the dispatch and the full measurement window runs.
-        // Kept small enough that debug-build ECDSA presigning is tolerable.
+        // This is sized larger than the timeout can consume, so the deadline,
+        // not running out of work, ends the dispatch, and the full
+        // measurement window runs. It stays small enough that debug-build
+        // ECDSA presigning is tolerable.
         txs_per_task: 2_000,
         max_in_flight: 8,
         timeout: Duration::from_millis(800),
@@ -42,10 +45,11 @@ async fn harness_runs_against_inprocess_ingress() {
     .await
     .expect("harness ran");
 
-    // The tracing-flame SVG is skipped when no spans were recorded (ingress
-    // emits none), so we don't assert on its contents — the assertion is that
-    // the full harness wiring (in-process ingress + dispatch + report) ran to
-    // completion. Clean up the SVG + folded sidecar if either was left behind.
+    // The tracing-flame SVG is skipped when no spans were recorded, since
+    // ingress emits none. So this test does not check its contents; the
+    // check is that the full harness wiring, in-process ingress, dispatch,
+    // and report, ran to completion. Clean up the SVG and folded sidecar
+    // if either was left behind.
     let _ = std::fs::remove_file(&flame_out);
     let mut sidecar = flame_out.clone().into_os_string();
     sidecar.push(".folded.tmp");

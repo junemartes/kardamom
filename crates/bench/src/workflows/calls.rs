@@ -1,4 +1,4 @@
-//! `CallsWorkflow` — saturate the node's read path with a single
+//! `CallsWorkflow` saturates the node's read path with a single
 //! deterministic `eth_call`.
 
 use alloy_primitives::{Address, Bytes, TxKind, U256};
@@ -17,19 +17,20 @@ use crate::workflows::{
 
 const METHOD: &str = "eth_call";
 
-/// Built-in workflow: read-only `eth_call` load against a deterministic
-/// contract. Stresses the node's read path.
+/// A built-in workflow with read-only `eth_call` load against a
+/// deterministic contract. It stresses the node's read path.
 #[derive(Debug, Clone)]
 pub struct CallsWorkflow {
-    /// BIP-39 phrase the signers are derived from. EOAs aren't strictly
-    /// needed for `eth_call`, but the harness expects every workflow to
-    /// declare them so the same Genesis works across runs.
+    /// The BIP-39 phrase the signers are derived from. `eth_call` does
+    /// not strictly need EOAs, but the harness expects every workflow to
+    /// declare them, so the same genesis works across runs.
     pub mnemonic: String,
-    /// Balance each prefunded signer EOA gets in genesis.
+    /// The balance each prefunded signer EOA gets in genesis.
     pub signer_balance: U256,
-    /// Address of the contract that will be the `to` of every `eth_call`.
+    /// The address of the contract that is the `to` value of every
+    /// `eth_call`.
     pub contract: Address,
-    /// Bytecode deployed at `contract` in the in-process genesis.
+    /// The bytecode deployed at `contract` in the in-process genesis.
     pub contract_code: Bytes,
 }
 
@@ -73,7 +74,7 @@ impl BenchWorkflow for CallsWorkflow {
         txs_per_task: u32,
     ) -> anyhow::Result<Prepared<Self::Item>> {
         let _chain_id = preflight_chain_id(client).await?;
-        // Verify the contract is actually deployed at the expected address.
+        // Check that the contract is deployed at the expected address.
         let req = TransactionRequest {
             to: Some(TxKind::Call(self.contract)),
             ..Default::default()
@@ -93,9 +94,9 @@ impl BenchWorkflow for CallsWorkflow {
             )
         }
 
-        // No per-item state for `eth_call` — both warmup and main are just
-        // unit markers; the actual request is built per-iteration in
-        // `dispatch` from `self`.
+        // `eth_call` has no per-item state. Warmup and main are only unit
+        // markers. `dispatch` builds the actual request from `self` on
+        // each iteration.
         let warmup = vec![(); WARMUP_PER_TASK * n_tasks as usize];
         let main = (0..n_tasks)
             .map(|_| vec![(); txs_per_task as usize])

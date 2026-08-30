@@ -1,41 +1,44 @@
-//! Block-STM engine, P2 (spec: `docs/agents/block-stm-executor-spec.md`).
+//! Block-STM engine.
 //!
-//! Pessimistic-by-prediction parallel execution over a multi-version cache:
-//! the footprint predictor (P0-measured, P1-shadow-validated) turns each
-//! block into a dependency DAG BEFORE anything executes — predicted overlap
-//! is authoritative ORDER, so conflicting txs never run concurrently and
-//! there are no abort storms to absorb. Parallelism comes from the
-//! workload's true structure (distinct pools / books / senders); cold or
-//! unpredictable txs take the serial `Tail` lane at the block's end.
+//! This engine predicts contention before it executes. The footprint
+//! predictor (measured offline, shadow-validated online) builds a dependency
+//! DAG for the whole block before any transaction runs. Predicted overlap
+//! becomes the execution order, so conflicting transactions never run at
+//! the same time, and no abort storms happen. Parallelism comes from the
+//! real structure of the workload (distinct pools, books, or senders).
+//! Cold or unpredictable transactions run in the serial `Tail` lane at the
+//! end of the block.
 //!
-//! This crate is the OFFLINE milestone (P2a): the engine + its A/B
-//! validation harness seam. It is deliberately not wired into the live
-//! executor — that is P3 (`--parallel-execution`), which rides the
-//! determinism suite and the in-stack validator.
+//! This crate is an offline milestone: the engine and its A/B
+//! validation harness. It is not wired into the live executor yet. That
+//! wiring uses the `--parallel-execution` flag, the determinism suite,
+//! and the in-stack validator.
 //!
-//! Correctness stance (spec invariants):
-//! 1. Byte-identical receipts + delta vs sequential execution, enforced in
-//!    tests and by the A/B harness on every run.
-//! 2. Heuristics affect scheduling only: every recorded read is VALIDATED
-//!    against the multi-version cache after execution; any violation
-//!    discards the block and re-executes it sequentially
+//! Correctness rules (spec invariants):
+//! 1. Receipts and the delta must be byte-identical to sequential
+//!    execution. Tests and the A/B harness check this on every run.
+//! 2. Heuristics affect scheduling only. The engine validates every
+//!    recorded read against the multi-version cache after execution. A
+//!    violation discards the block and re-executes it sequentially
 //!    (`fallback` in [`execute::StmOutcome`] — invariant #3).
-//! 3. The `Accumulator` fee sink (P0: written by 100% of txs — a universal
-//!    serializer without this) is served DEFERRED: workers read the
-//!    block-start value, per-tx credits are folded as exact deltas, and the
-//!    canonical-order commit materializes absolute balances and fixes up
-//!    each write-set hash — receipts and delta land byte-identical to
-//!    sequential. (The BALANCE-opcode runtime guard is a P3 concern; the
-//!    P1 shadow already measures its trigger rate as ~zero, and the A/B
-//!    equivalence check catches any workload that violates the assumption.)
+//! 3. The `Accumulator` fee sink is written by almost every transaction,
+//!    so it would force full serialization without one exception: each
+//!    worker reads its block-start value, and every transaction's credit
+//!    is folded as an exact delta. The canonical-order commit then
+//!    computes absolute balances and fixes up each write-set hash, so
+//!    receipts and the delta still match sequential execution byte for
+//!    byte. (A runtime guard for the BALANCE opcode is a live-executor
+//!    concern. The footprint shadow scheduler shows its trigger rate is
+//!    near zero, and the A/B
+//!    equivalence check catches any workload that breaks this assumption.)
 
-/// FNV-1a `BuildHasher` for the engine's internal maps.
+/// Fast `BuildHasher` for the engine's internal maps.
 ///
-/// Their keys — addresses, slot hashes, domain tuples — are already
-/// high-entropy, so SipHash's collision resistance against adversarial
-/// input buys nothing here and costs real time: the state caches are
-/// probed ~7 times per transaction on the hottest path in the engine.
-/// A collision would cost lookup time, never correctness.
+/// The keys (addresses, slot hashes, domain tuples) are already
+/// high-entropy. SipHash's defense against adversarial input costs real
+/// time and buys nothing here: the hottest path in the engine probes
+/// these caches about 7 times per transaction. A hash collision costs
+/// lookup time only. It never affects correctness.
 #[derive(Default, Clone, Copy)]
 pub struct FnvBuild;
 
@@ -50,20 +53,21 @@ impl std::hash::BuildHasher for FnvBuild {
 
 impl std::hash::Hasher for Fnv {
     fn finish(&self) -> u64 {
-        // Final avalanche so a 64-bit key that only differs in high
-        // bits still spreads across the table's low bits.
+        // A final avalanche step. It spreads a 64-bit key that differs
+        // only in its high bits across the table's low bits.
         let mut h = self.0;
         h ^= h >> 32;
         h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         h ^= h >> 29;
         h
     }
-    /// WORD-AT-A-TIME. The keys this map family sees (addresses, slot
-    /// hashes, (address, slot) pairs) are already high-entropy, so a
-    /// per-8-byte multiply-xorshift mixes them fully; the byte-at-a-time
-    /// FNV loop it replaces was ~50 dependent-latency cycles per 20-byte
-    /// key and hashed twice per upsert — measured as the serial feed's
-    /// last-toucher stage (0.40µs/tx). Tail bytes fold in as one word.
+    /// Hashes 8 bytes at a time.
+    ///
+    /// The keys this map family sees (addresses, slot hashes, and
+    /// (address, slot) pairs) are already high-entropy, so a per-8-byte
+    /// multiply-xorshift mixes them well. This replaces a byte-at-a-time
+    /// FNV loop that cost about 50 cycles per 20-byte key and ran twice
+    /// per upsert. The remaining tail bytes fold in as one word.
     fn write(&mut self, bytes: &[u8]) {
         const K: u64 = 0x9E37_79B9_7F4A_7C15;
         let (chunks, rem) = bytes.as_chunks::<8>();
@@ -95,12 +99,13 @@ pub type FastMap<K, V> = std::collections::HashMap<K, V, FnvBuild>;
 pub mod execute;
 pub mod pool;
 
-/// Re-exported so harnesses can pre-decode for BOTH engines (see
+/// Re-exported so harnesses can pre-decode for both engines (see
 /// `execute::execute_block_sequential_decoded`).
 pub use kardamom_exec_core::executor::DecodedTx;
 pub mod mv;
 pub mod schedule;
 
-/// The accumulator-marked fee sink (mirrors `kardamom_exec_core::block_env`:
-/// beneficiary = address(0), basefee = 0 — the V0 documented burn).
+/// The fee sink the accumulator marks (mirrors
+/// `kardamom_exec_core::block_env`: beneficiary = address(0), basefee = 0 —
+/// the documented V0 burn).
 pub const FEE_SINK: alloy_primitives::Address = alloy_primitives::Address::ZERO;

@@ -1,4 +1,4 @@
-//! Measure end-to-end pack throughput: build → encode → compress → pack
+//! Measure end-to-end pack throughput: build, encode, compress, and pack,
 //! across blob counts.
 
 use std::hint::black_box;
@@ -42,8 +42,8 @@ fn bench_pack(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
     group.sample_size(20);
 
-    // ~500 KiB of raw txs — fits in ≤6 blobs uncompressed (6 × 126_976 ≈
-    // 745 KiB ceiling, minus framing overhead).
+    // About 500 KiB of raw txs. This fits in 6 blobs uncompressed (6 times
+    // 126_976 bytes is about a 745 KiB ceiling, minus framing overhead).
     let block_600k = vec![make_block(2_400, 200)];
     group.bench_function("pack_600k_compressed", |b| {
         let cfg = BatcherConfig {

@@ -1,14 +1,16 @@
-//! Per-shard tx_data archive-recorder threads + the F13.2 ready barrier.
+//! Per-shard tx_data archive-recorder threads, and the ready barrier.
 //!
-//! The recorder-thread body itself (connect a thread-confined archive
-//! session, start recording, report the startup outcome, hold until stop) is
-//! `kardamom_log::recorder::record_stream_until_stopped`, shared with the
-//! da-watcher's tx_deposits recorder; this module owns the per-shard fan-out
-//! and the barrier `main` blocks on before serving RPC.
+//! `kardamom_log::recorder::record_stream_until_stopped` runs the
+//! recorder-thread body: connect a thread-confined archive session, start
+//! recording, report the startup outcome, and hold until stop. The
+//! da-watcher's tx_deposits recorder shares this function. This module owns
+//! the per-shard fan-out and the barrier that `main` blocks on before it
+//! serves RPC.
 //!
-//! The threads stay std threads: they hold Aeron archive sessions (`!Send`).
-//! The seam to the async shell is tokio: a [`CancellationToken`] for stop and
-//! one `oneshot` per recorder for readiness.
+//! The threads stay std threads: they hold Aeron archive sessions
+//! (`!Send`). The seam to the async shell is tokio: a
+//! [`CancellationToken`] for stop, and one `oneshot` per recorder for
+//! readiness.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -23,12 +25,13 @@ use tokio_util::sync::CancellationToken;
 /// the startup failure reason).
 pub type RecorderReady = oneshot::Receiver<(u8, Result<i64, String>)>;
 
-/// Spawn one archive recorder thread per tx_data shard. Each connects its own
-/// (thread-confined) archive session, starts recording its shard's tx_data
-/// publication, reports its startup outcome on its `oneshot`, and holds the
-/// recording alive until `stop` is cancelled. The recording itself runs in
-/// the ArchivingMediaDriver; the thread only keeps the session connected and
-/// re-adopts an existing recording on restart.
+/// Spawns one archive recorder thread for each tx_data shard. Each thread
+/// connects its own thread-confined archive session, starts recording its
+/// shard's tx_data publication, reports its startup outcome on its
+/// `oneshot`, and holds the recording alive until `stop` is cancelled.
+/// The ArchivingMediaDriver runs the recording itself. The thread only
+/// keeps the session connected and re-adopts an existing recording after
+/// a restart.
 ///
 /// Returns the join handles (for teardown) and one readiness receiver per
 /// shard, in shard order.
@@ -76,13 +79,14 @@ pub fn spawn_tx_data_recorders(
         .unzip()
 }
 
-/// Wait until every recorder thread has reported readiness, failing on the
-/// first reported error (or on timeout). This is the F13.2 barrier:
-/// publish/RPC must not start before the recordings are active.
+/// Waits until every recorder thread reports readiness. Fails on the
+/// first reported error, or on timeout. This is the barrier: publish
+/// and RPC must not start before the recordings are active.
 pub async fn wait_for_recorders(ready: Vec<RecorderReady>) -> Result<()> {
-    // Generous total budget: the publications are already open, so the
-    // recording normally materialises within one catalog-poll tick (~500ms);
-    // the timeout only bounds a wedged/unreachable archive.
+    // This budget is generous in total. The publications are already
+    // open, so the recording normally starts within one catalog-poll
+    // tick (about 500ms). The timeout only bounds a stuck or
+    // unreachable archive.
     const RECORDER_READY_TIMEOUT: Duration = Duration::from_secs(60);
     let all = async {
         for rx in ready {

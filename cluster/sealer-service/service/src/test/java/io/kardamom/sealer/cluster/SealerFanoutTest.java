@@ -14,12 +14,13 @@ import org.junit.jupiter.api.Test;
 
 /**
  * Egress fan-out targeting: relayed records and boundaries reach the sessions
- * that announced themselves as canonical-stream consumers ({@code SUBSCRIBE}
- * frame or a replay request) — NOT publisher-only sessions — with a
- * broadcast-to-all fallback while no consumer has announced itself (fresh
- * restart, mixed-version deploy). The per-session unicast offer is the
- * dominant leader cost at saturation, so the consumer set directly bounds the
- * sealer's throughput ceiling.
+ * that announced themselves as canonical-stream consumers, through a
+ * {@code SUBSCRIBE} frame or a replay request. Publisher-only sessions do not
+ * receive them. While no consumer has announced itself, such as at a fresh
+ * restart or a mixed-version deploy, the service falls back to broadcasting
+ * to all sessions. The per-session unicast offer is the leader's main cost at
+ * saturation, so the consumer set directly bounds the sealer's throughput
+ * ceiling.
  */
 class SealerFanoutTest {
 
@@ -45,7 +46,7 @@ class SealerFanoutTest {
                 .count();
     }
 
-    /** Non-zero test sender for the contiguity guard (0 = guard-exempt). */
+    /** A non-zero test sender for the contiguity guard. Sender 0 is guard-exempt. */
     private static byte[] sender(final int tag) {
         final byte[] s = new byte[CanonicalSealerState.SENDER_LEN];
         java.util.Arrays.fill(s, (byte) 0xAA);
@@ -61,8 +62,8 @@ class SealerFanoutTest {
     }
 
     /**
-     * One record from the shared test sender with nonce == {@code n}: tests
-     * that emit records 0, 1, … stay guard-contiguous.
+     * One record from the shared test sender with nonce equal to {@code n}.
+     * Tests that emit records 0, 1, and so on stay guard-contiguous.
      */
     private void record(final StubSession from, final int n) {
         deliver(from, IngressFrames.recordFrame(n, sender(1), n));
@@ -84,8 +85,8 @@ class SealerFanoutTest {
     @Test
     void batchEntriesProcessLikeIndividualRecords() {
         subscribe(consumerA);
-        // Batch of 3: two fresh records + a duplicate of the first — the
-        // consumer must receive exactly 2 relays (intra-batch dedup holds).
+        // Batch of 3: two fresh records and a duplicate of the first. The
+        // consumer must receive exactly 2 relays, so intra-batch dedup holds.
         final byte[][] entries = new byte[3][];
         entries[0] = recordFrame(10);
         entries[1] = recordFrame(11);
@@ -111,7 +112,7 @@ class SealerFanoutTest {
                 "publisher-only session stays out of the fan-out");
     }
 
-    /** Batch-test entries keep the shared sender, nonce == idTag - 10. */
+    /** Batch-test entries keep the shared sender; nonce equals idTag minus 10. */
     private static byte[] recordFrame(final int n) {
         return IngressFrames.recordFrame(n, sender(1), n - 10);
     }
@@ -123,8 +124,9 @@ class SealerFanoutTest {
         rawRecord(publisher, 20, s, 0); // seeds, accepted
         assertEquals(1, relayedCount(consumerA));
 
-        // Nonce 2 while 1 is expected: the refs for nonce 1 vanished — the
-        // service must NOT seal the gap. Reject goes to the OFFERING session.
+        // Nonce 2 arrives while 1 is expected: the reference for nonce 1 is
+        // missing. The service must not fill the gap. The reject goes to the
+        // offering session.
         rawRecord(publisher, 21, s, 2);
         assertEquals(1, relayedCount(consumerA), "gap record must not relay");
         final List<byte[]> rejects = publisher.offered.stream()
@@ -144,9 +146,9 @@ class SealerFanoutTest {
         assertEquals(1, reject.getLong(1 + CanonicalSealerState.SENDER_LEN + Long.BYTES,
                 ByteOrder.LITTLE_ENDIAN));
 
-        // Recovery: the gap ref (nonce 1) arrives, then the SAME previously
-        // rejected id republishes at nonce 2 — it must be accepted as fresh
-        // (a reject leaves no dedup entry behind).
+        // Recovery: the gap reference (nonce 1) arrives. Then the same
+        // previously rejected id republishes at nonce 2. The service must
+        // accept it as fresh, because a reject leaves no dedup entry behind.
         rawRecord(publisher, 22, s, 1);
         rawRecord(publisher, 21, s, 2);
         assertEquals(3, relayedCount(consumerA), "gap fill + republished reject both relay");
@@ -156,8 +158,8 @@ class SealerFanoutTest {
     void zeroSenderIsGuardExempt() {
         subscribe(consumerA);
         final byte[] zero = new byte[CanonicalSealerState.SENDER_LEN];
-        // Deposits carry the zero sender and a filler nonce — any order, any
-        // repetition of nonce values must pass (only the id dedups).
+        // Deposits carry the zero sender and a filler nonce. Any order and
+        // any repeated nonce value must pass; only the id dedups.
         rawRecord(publisher, 30, zero, 0);
         rawRecord(publisher, 31, zero, 0);
         rawRecord(publisher, 32, zero, 5);
@@ -175,7 +177,7 @@ class SealerFanoutTest {
     @Test
     void relaysOnlyToAnnouncedConsumers() {
         subscribe(consumerA);
-        replayRequest(consumerB, 0, 1); // a replay request announces a consumer too
+        replayRequest(consumerB, 0, 1); // A replay request also announces a consumer.
 
         record(publisher, 0);
         assertEquals(0, relayedCount(publisher),
@@ -187,8 +189,8 @@ class SealerFanoutTest {
     @Test
     void boundariesStayBroadcastToEverySession() {
         // Unlike relayed records, boundaries reach every session even after
-        // consumers announce: the sequencer's boundary-only lag feed (#93)
-        // consumes them without a SUBSCRIBE announcement.
+        // consumers announce. The sequencer's boundary-only lag feed consumes
+        // them without a SUBSCRIBE announcement.
         subscribe(consumerA);
         service.onTimerEvent(SealerClusteredService.BOUNDARY_TIMER_CORRELATION_ID, 250);
         final long pubBoundaries = publisher.offered.stream()
@@ -208,8 +210,8 @@ class SealerFanoutTest {
         assertEquals(1, relayedCount(consumerA));
         assertEquals(0, relayedCount(publisher));
 
-        // Close the only consumer: the set empties and the fallback broadcast
-        // returns, so a restart's pre-subscribe window can never starve.
+        // Close the only consumer: the set empties, and the fallback broadcast
+        // returns. This means a restart's pre-subscribe window never starves.
         service.onSessionClose(consumerA, 0, null);
         record(publisher, 1);
         assertEquals(1, relayedCount(publisher), "empty set falls back to broadcast");
@@ -217,12 +219,12 @@ class SealerFanoutTest {
     }
 
     /**
-     * The relayed payload of an origin record must be EXACTLY
-     * {@code [canonical_id:32][record_type][fields…]} — the same shape a plain
-     * record relays in — with no trailing slack. Consumers deserialise the
-     * fields with rkyv, which locates its root at the END of the buffer, so
-     * even a few extra bytes make every epoch undecodable. Nothing on the Rust
-     * side can catch this: it is purely a property of this relay.
+     * The relayed payload of an origin record must be exactly
+     * {@code [canonical_id:32][record_type][fields…]}, the same shape a plain
+     * record relays in, with no trailing slack. Consumers deserialize the
+     * fields with rkyv, which locates its root at the end of the buffer. Even
+     * a few extra bytes make the whole epoch undecodable. Nothing on the Rust
+     * side can catch this bug; it is purely a property of this relay.
      */
     @Test
     void origin_record_relays_id_and_fields_with_no_trailing_slack() {

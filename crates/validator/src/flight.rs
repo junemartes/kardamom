@@ -1,13 +1,13 @@
 //! Receipt-divergence flight recorder.
 //!
 //! The claim-check path dumps its inputs at the point of failure
-//! (`parallel::dump_divergence_inputs`) — but a receipt-wsh mismatch fires
-//! LATER, on the commit thread, after the block's records and claims have
-//! been dropped: the F3-era K=20 incident (same status/gas, different
-//! `write_set_hash`) left one log line and nothing to replay. The ring keeps
-//! the last few blocks' canonical records + claim indexes (cheap: record
-//! payloads are refcounted `Bytes`), and the receipt sink dumps the whole
-//! ring plus BOTH receipts, field by field, the moment a mismatch is proven.
+//! (`parallel::dump_divergence_inputs`). But a receipt write-set-hash
+//! mismatch fires later, on the commit thread, after the block's records
+//! and claims are dropped. Without this ring, such a mismatch leaves one
+//! log line and nothing to replay. The ring keeps the last few blocks'
+//! canonical records and claim indexes; this is cheap, since record
+//! payloads are refcounted `Bytes`. The receipt sink dumps the whole ring
+//! plus both receipts, field by field, the moment a mismatch is proven.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -19,24 +19,25 @@ use kardamom_types::Receipt;
 use crate::parallel::ClaimIndex;
 
 /// How many recent blocks the ring retains. The mismatching tx is almost
-/// always in the newest block (receipts stream right behind execution), but
-/// pipelined commits mean the receipt cross-check can trail by a few blocks.
+/// always in the newest block, since receipts stream right behind
+/// execution, but pipelined commits mean the receipt check can trail by a
+/// few blocks.
 const RING_CAP: usize = 6;
 
 struct BlockCapture {
     block: u64,
     granularity: u16,
-    /// The exec env the block ran under (boundary timestamp etc.) — the
-    /// prover spool re-executes with capture under the SAME env.
+    /// The exec env the block ran under, such as the boundary timestamp.
+    /// The prover spool re-executes with capture under the same env.
     env: ExecEnv,
     records: Vec<BufferedRecord>,
-    /// `None` when the block validated on the sequential path (claims never
-    /// arrived) — the records alone still let the block replay offline.
+    /// `None` when the block validated on the sequential path, so claims
+    /// never arrived. The records alone still let the block replay offline.
     claims: Option<Arc<ClaimIndex>>,
 }
 
-/// Shared ring of recent block inputs. Pushed by the block-exec strategy,
-/// dumped by [`crate::ValidatorReceiptSink`] on a receipt mismatch.
+/// Shared ring of recent block inputs. The block-exec strategy pushes to
+/// it; [`crate::ValidatorReceiptSink`] dumps it on a receipt mismatch.
 #[derive(Default)]
 pub struct FlightRing {
     ring: Mutex<VecDeque<BlockCapture>>,
@@ -48,7 +49,7 @@ impl FlightRing {
         Arc::new(Self::default())
     }
 
-    /// Record a block's inputs (call once per block, before execution).
+    /// Record a block's inputs. Call once per block, before execution.
     pub fn push(
         &self,
         block: u64,
@@ -70,8 +71,8 @@ impl FlightRing {
         });
     }
 
-    /// One block's inputs back out of the ring (the prover spool's feed).
-    /// Cheap: record payloads are refcounted `Bytes`.
+    /// Get one block's inputs back out of the ring; this is the prover
+    /// spool's feed. Cheap, since record payloads are refcounted `Bytes`.
     pub fn records_for(&self, block: u64) -> Option<(u16, ExecEnv, Vec<BufferedRecord>)> {
         let g = self.ring.lock().expect("flight ring poisoned");
         g.iter()
@@ -79,12 +80,12 @@ impl FlightRing {
             .map(|c| (c.granularity, c.env, c.records.clone()))
     }
 
-    /// Serialize the ring + both receipts for offline replay. Best-effort:
-    /// failures only log — the divergence fail-stop must never be masked by
-    /// recorder trouble.
+    /// Serialize the ring and both receipts for offline replay. This is
+    /// best-effort: failures only log. Recorder trouble must never mask
+    /// the divergence stop.
     pub fn dump_receipt_divergence(&self, local: &Receipt, published: &Receipt) {
-        // Same dir as the claim-path dumper; overridable so tests can
-        // assert the artifact without /opt existing.
+        // This uses the same directory as the claim-path dumper. It can
+        // be overridden, so tests can check the file without /opt existing.
         let dir =
             std::env::var("KARDAMOM_FLIGHT_DIR").unwrap_or_else(|_| "/opt/kardamom/state".into());
         let dir = std::path::Path::new(&dir);

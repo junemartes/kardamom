@@ -1,6 +1,6 @@
-//! Property test: published nonces per sender form a strictly-ascending,
-//! dense run starting at 0, no matter what shuffle of `(sender, nonce)` pairs
-//! we feed into PartitionState::process.
+//! Property test for PartitionState::process.
+//! Published nonces for each sender form a strictly ascending, dense run
+//! that starts at 0. This is true for any shuffle of `(sender, nonce)` pairs.
 
 use std::collections::HashMap;
 

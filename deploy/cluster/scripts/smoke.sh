@@ -1,32 +1,36 @@
 #!/usr/bin/env bash
-# Pipeline smoke test: submit a transfer through the kardamom ingress JSON-RPC
-# proxy and assert a receipt with status 0x1 comes back.
+# This is a pipeline smoke test. It submits a transfer through the
+# kardamom ingress JSON-RPC proxy. It checks that the receipt status
+# comes back as 0x1.
 #
-# Ingress endpoint: http://192.168.56.31:8545 (ingress_ip:ingress_rpc from
-# ansible/group_vars/all.yml). Signer: Anvil account #0 (prefunded with 1000
-# ETH in config/genesis/dev.toml).
+# Ingress endpoint: http://192.168.56.31:8545 (ingress_ip:ingress_rpc in
+# ansible/group_vars/all.yml). Signer: Anvil account #0, prefunded with
+# 1000 ETH in config/genesis/dev.toml.
 #
-# Prefers foundry `cast` (cast send + cast receipt). Falls back to a documented
-# curl flow with a pre-signed raw tx if cast is absent.
+# The script prefers foundry `cast` (cast send plus cast receipt). It
+# falls back to a documented curl flow with a pre-signed raw tx when cast
+# is missing.
 #
-# Prints PASS/FAIL; exits nonzero on failure.
+# The script prints PASS or FAIL, and exits nonzero on failure.
 set -euo pipefail
 
 RPC_URL="${RPC_URL:-http://192.168.56.31:8545}"
 CHAIN_ID="${CHAIN_ID:-412346}"
-# Anvil account #0 private key (public, dev only).
+# Anvil account #0's private key. This key is public; use it for dev only.
 PK="${PK:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
-# Burn / sink address for the transfer.
+# Burn (sink) address for the transfer.
 TO="${TO:-0x000000000000000000000000000000000000dEaD}"
 VALUE="${VALUE:-1}"   # wei
-# Nonce is ALWAYS 0. Every caller submits from its OWN dedicated funded account
-# (the gate, each load/chaos case, and the churn re-smokes — see the
-# account-budget note in ci-cluster.sh), so each account's first and only tx is
-# nonce 0. The ingress JSON-RPC deliberately does NOT implement
-# eth_getTransactionCount ("deferred to S6 state writer"; crates/ingress/src/
-# json_rpc.rs), so cast can't auto-fill the nonce — but with a fresh account per
-# check we never need a non-zero one, which is why there is no NONCE knob and no
-# cross-call nonce coordination. Pick the account via PK, not the nonce.
+# The nonce is always 0. Every caller submits from its own dedicated
+# funded account: the gate, each load/chaos case, and the churn
+# re-smokes. See the account-budget note in ci-cluster.sh. So each
+# account's first and only tx has nonce 0. The ingress JSON-RPC does not
+# implement eth_getTransactionCount on purpose (deferred to the state
+# writer; see crates/ingress/src/json_rpc.rs). So cast cannot auto-fill
+# the nonce. Since each check uses a fresh account, no check ever needs a
+# non-zero nonce. This is why there is no NONCE setting and no
+# cross-call nonce coordination. Pick the account through PK, not the
+# nonce.
 
 echo "==> Smoke test against ingress: ${RPC_URL} (chain-id ${CHAIN_ID}, nonce 0)"
 
@@ -41,16 +45,19 @@ if command -v cast >/dev/null 2>&1; then
   CAST_ERR="$(mktemp)"
   trap 'rm -f "${CAST_ERR}"' EXIT
 
-  # cast send signs + submits and (without --async) waits for the receipt,
-  # printing it as JSON with --json. status is "0x1" on success.
+  # cast send signs and submits the tx. Without --async, it waits for the
+  # receipt and prints it as JSON, using --json. status is "0x1" on
+  # success.
   #
-  # nonce/gas-price/gas-limit/chain are ALL passed EXPLICITLY so cast does not
-  # issue its usual fill calls (eth_getTransactionCount / eth_gasPrice /
-  # eth_estimateGas) — the ingress implements only eth_chainId / eth_blockNumber
-  # / eth_sendRawTransaction / eth_getTransactionReceipt and returns an error
-  # for eth_getTransactionCount + eth_getBalance ("deferred to S6 state writer",
-  # crates/ingress/src/json_rpc.rs). With every field provided, cast's only RPC
-  # calls are eth_sendRawTransaction + eth_getTransactionReceipt.
+  # This command passes nonce, gas price, gas limit, and chain id
+  # explicitly. This stops cast from making its usual fill calls
+  # (eth_getTransactionCount, eth_gasPrice, eth_estimateGas). The ingress
+  # implements only eth_chainId, eth_blockNumber, eth_sendRawTransaction,
+  # and eth_getTransactionReceipt. It returns an error for
+  # eth_getTransactionCount and eth_getBalance (deferred to the state
+  # writer; see crates/ingress/src/json_rpc.rs). With every field
+  # provided, cast's only RPC calls are eth_sendRawTransaction and
+  # eth_getTransactionReceipt.
   set +e
   RECEIPT_JSON="$(cast send "${TO}" \
       --value "${VALUE}" \
@@ -80,7 +87,7 @@ if command -v cast >/dev/null 2>&1; then
   fi
 
   echo "==> tx hash: ${TXH:-<unknown>}  receipt status: ${STATUS:-<none>}"
-  # Accept "0x1" or "1" (cast may render decoded status).
+  # Accept "0x1" or "1". cast may render a decoded status.
   if [[ "${STATUS}" == "0x1" || "${STATUS}" == "1" || "${STATUS}" == "true" ]]; then
     echo "RESULT: PASS"
     exit 0
@@ -101,9 +108,10 @@ if ! command -v curl >/dev/null 2>&1; then
   fail "neither 'cast' nor 'curl' is available"
 fi
 
-# PLACEHOLDER pre-signed legacy tx: account #0 -> 0x...dEaD, value 1 wei,
-# nonce 0, gasPrice 1, gas 21000, chain-id 412346. Replace RAW_TX with a tx
-# signed for the current signer nonce if this is rejected.
+# This is a placeholder pre-signed legacy tx: account #0 to 0x...dEaD,
+# value 1 wei, nonce 0, gas price 1, gas 21000, chain id 412346. Replace
+# RAW_TX with a tx signed for the current signer nonce if this is
+# rejected.
 RAW_TX="${RAW_TX:-0xPLACEHOLDER_REPLACE_WITH_PRESIGNED_RAW_TX}"
 
 if [[ "${RAW_TX}" == 0xPLACEHOLDER* ]]; then

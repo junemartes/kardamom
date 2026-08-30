@@ -1,4 +1,5 @@
-//! Smoke test: settlement sol! binding loads + selector matches contract.
+//! Smoke test: the settlement sol! binding loads, and its selector matches
+//! the contract.
 
 use alloy_primitives::{Address, B256, keccak256};
 use alloy_sol_types::SolCall;

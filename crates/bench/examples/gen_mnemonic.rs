@@ -1,6 +1,7 @@
-//! Print a fresh BIP-39 mnemonic phrase. Useful for seeding a custom
-//! `BenchWorkflow` impl that doesn't want to share signers with the
-//! built-in Anvil-mnemonic workflows.
+//! Print a fresh BIP-39 mnemonic phrase.
+//!
+//! Use this to seed a custom `BenchWorkflow` that must not share signers with
+//! the built-in Anvil-mnemonic workflows.
 //!
 //! Usage:
 //!   `cargo run --example gen_mnemonic -p kardamom-bench`

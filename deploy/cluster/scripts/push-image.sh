@@ -1,31 +1,34 @@
 #!/usr/bin/env bash
 # =============================================================================
-# push-image.sh — docker push + digest capture (attested-identity P0.1).
+# push-image.sh — pushes a docker image and captures its digest.
 # =============================================================================
-# Used by the Makefile `images` target (the VM/vagrant path, where the HOST
-# daemon pushes directly to the in-cluster registry). The container-cluster
-# path has its own capture in ci-images.sh push_image (it must also handle the
-# REGISTRY_PUSH_NODE engine-to-engine push, which this helper does not).
+# The Makefile `images` target uses this script, on the VM/vagrant path. On
+# that path, the host daemon pushes directly to the in-cluster registry. The
+# container-cluster path has its own capture, in ci-images.sh push_image.
+# That path must also handle the REGISTRY_PUSH_NODE engine-to-engine push,
+# which this script does not.
 #
-# The digest is parsed from the push output's final "digest: sha256:..." line
-# rather than `docker inspect --format='{{index .RepoDigests 0}}'`:
-# RepoDigests is an unordered list that can carry digests for other repos or
-# registries the same image ID is tagged under, while the push output line is
-# by definition the digest of exactly this push to exactly this repo.
+# This script reads the digest from the push output's last
+# "digest: sha256:..." line. It does not use
+# `docker inspect --format='{{index .RepoDigests 0}}'`. RepoDigests is an
+# unordered list. It can hold digests for other repos or registries that
+# share the same image ID. The push output line always names the digest of
+# this exact push, to this exact repo.
 #
-# The manifest carries the COMBINED repo:tag@sha256:... form — Nomad 1.9.5's
-# docker driver mis-parses a bare repo@digest ref on a port-carrying registry
-# host (appends :latest -> "invalid reference format"); with the combined
-# form the driver pulls the advisory tag and resolves the container image by
-# the digest, which still pins what runs. See ci-images.sh push_image for the
-# full rationale (same capture, same form).
+# The manifest stores the combined repo:tag@sha256:... form. Nomad 1.9.5's
+# docker driver cannot parse a bare repo@digest ref on a registry host with a
+# port. It appends :latest and fails with "invalid reference format". With
+# the combined form, the driver pulls the advisory tag, but still resolves
+# the container image by digest. This still pins what runs. See
+# ci-images.sh push_image for the full reasoning; it uses the same capture
+# and form.
 #
 # Usage: push-image.sh <svc> <image:tag> <manifest>
 #   <svc>       manifest key (aeron, cluster, ingress, ...)
 #   <image:tag> fully-qualified image ref to push
-#   <manifest>  digest manifest file; one "<svc> <repo>:<tag>@sha256:..."
-#               line is APPENDED per call (the Makefile truncates it per
-#               build)
+#   <manifest>  digest manifest file. Each call appends one
+#               "<svc> <repo>:<tag>@sha256:..." line. The Makefile truncates
+#               the file once per build.
 set -euo pipefail
 
 if [[ $# -ne 3 || "$1" == "-h" || "$1" == "--help" ]]; then
@@ -33,10 +36,11 @@ if [[ $# -ne 3 || "$1" == "-h" || "$1" == "--help" ]]; then
   exit 2
 fi
 
-# Signing (attested-identity P0.5): keyless cosign of the pushed digest when
-# running in CI with OIDC; a clear skip line otherwise (this Makefile/VM path
-# is normally local dev). The Makefile signs the completed manifest after the
-# LAST image via scripts/sign-manifest.sh.
+# Signing: the script does keyless cosign signing of the pushed digest
+# when it runs in CI with OIDC. Otherwise, it logs a
+# clear skip line, since this Makefile/VM path is normally local dev. The
+# Makefile signs the completed manifest after the last image, using
+# scripts/sign-manifest.sh.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=deploy/cluster/scripts/lib-signing.sh
 source "${SCRIPT_DIR}/lib-signing.sh"
@@ -46,8 +50,8 @@ img="$2"
 manifest="$3"
 
 out="$(docker push "${img}" | tee /dev/stderr)"
-# Defensive strip + shape validation: a stray \r/space prints clean in logs
-# but fails docker's reference parser at pull time.
+# Strip stray characters and validate the shape. A stray \r or space prints
+# clean in logs, but fails docker's reference parser at pull time.
 digest="$(awk '/digest: sha256:/ {d=$3} END {print d}' <<<"${out}" | tr -d '[:space:]\r')"
 if [[ -z "${digest}" ]]; then
   echo "ERROR: could not capture the pushed digest for ${img} from the push output" >&2

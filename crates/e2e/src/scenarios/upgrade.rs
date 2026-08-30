@@ -247,10 +247,9 @@ pub async fn activates_at_timestamp(
     // schedule is anchored to the chain's own notion of now — reading it off
     // the head block rather than from wall-clock keeps the two in the same
     // frame even if the host clock and the sealer's disagree.
-    // Wait rather than read once: the stack's launch barrier guarantees
-    // block 1 exists, but a restarted or slow executor can still race this
-    // read (issue #250 — the one-shot read failed with "chain has produced
-    // no blocks" three times in one CI day).
+    // Wait, do not read once. The launch barrier guarantees block 1
+    // exists. A restarted or slow executor can still race this read
+    // (issue #250: the one-shot read failed three times in one CI day).
     let head_ts = crate::harness::metrics::poll_until(
         "a committed head block to anchor the schedule",
         std::time::Duration::from_secs(30),

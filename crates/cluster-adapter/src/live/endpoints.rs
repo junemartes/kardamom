@@ -1,6 +1,7 @@
-//! Ingress endpoint helpers for the session thread: parse the
+//! Ingress endpoint helpers for the session thread. They parse the
 //! `memberId=host:port,…` member list, open (and round-robin) ingress
-//! publications, plus the small byte/clock utilities the loop shares.
+//! publications, and provide the small byte and clock utilities the loop
+//! shares.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,9 +10,9 @@ use rkyv::util::AlignedVec;
 
 use super::with_control_term_length;
 
-/// Parse a `memberId=host:port,…` list and open an ingress publication to the
-/// given member. Small terms via [`with_control_term_length`] (see its doc for
-/// the tmpfs-exhaustion incident behind it).
+/// Parse a `memberId=host:port,…` list and open an ingress publication to
+/// the given member. Use small terms through [`with_control_term_length`]
+/// (see its doc for the reason).
 pub(super) fn open_leader_pub(
     rt: &AeronRuntime,
     endpoints: &str,
@@ -42,9 +43,10 @@ pub(super) fn member_ids(endpoints: &str) -> Vec<i32> {
     ids
 }
 
-/// Open a publication to the member AFTER `current` in the list (wrapping) —
-/// the round-robin step for self-heal reconnects. Falls through dead ids by
-/// returning the first member whose publication opens.
+/// Open a publication to the member after `current` in the list, and wrap
+/// around at the end. This is the round-robin step for self-heal
+/// reconnects. It skips dead IDs and returns the first member whose
+/// publication opens.
 pub(super) fn open_next_member_pub(
     rt: &AeronRuntime,
     endpoints: &str,

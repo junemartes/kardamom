@@ -1,13 +1,15 @@
-//! Full DA round-trip against a real L1 (anvil): deploy `KardamomL2Settlement`,
-//! post batches as real EIP-4844 blob transactions (blobs recorded in a DA
-//! store), then — with the original blocks thrown away — read the `BatchPosted`
-//! event log back, fetch the blobs from the DA store by the versioned hashes L1
-//! committed to, decode + re-execute them, and assert the reconstructed state
-//! root equals the canonical (directly-executed) root.
+//! Full DA round trip against a real L1 (anvil): deploy
+//! `KardamomL2Settlement`, post batches as real EIP-4844 blob transactions
+//! (blobs recorded in a DA store), then discard the original blocks, read
+//! the `BatchPosted` event log back, fetch the blobs from the DA store by
+//! the versioned hashes L1 committed to, decode and re-execute them, and
+//! check that the reconstructed state root equals the canonical
+//! (directly-executed) root.
 //!
-//! This is the "rebuild-from-L1" data-loss recovery path proven end-to-end
-//! through actual L1. Skips gracefully if anvil is unavailable (same convention
-//! as `anvil_e2e.rs` / the deployer's `deploy_e2e.rs`).
+//! This is the "rebuild-from-L1" data-loss recovery path, proven end to
+//! end through actual L1. It skips gracefully if anvil is unavailable
+//! (the same convention as `anvil_e2e.rs` and the deployer's
+//! `deploy_e2e.rs`).
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
@@ -77,8 +79,8 @@ async fn rebuild_from_l1_reconstructs_canonical_state_root() {
     let batcher_signer: PrivateKeySigner = anvil.keys()[1].clone().into();
     let batcher_addr = batcher_signer.address();
 
-    // Deploy provider: impersonated DEV_OWNER drives the factory (no fillers,
-    // matching the deployer's e2e convention).
+    // Deploy provider: an impersonated DEV_OWNER drives the factory (no
+    // fillers, matching the deployer's e2e convention).
     let deploy_provider = ProviderBuilder::new()
         .disable_recommended_fillers()
         .connect_http(anvil.endpoint_url());
@@ -122,7 +124,8 @@ async fn rebuild_from_l1_reconstructs_canonical_state_root() {
         .expect("deploy KardamomL2Settlement");
     let settlement = deployer.addresses(Some(DEPLOY_CHAIN_ID)).await.unwrap()[0].proxy;
 
-    // Posting provider: wallet-filled with the batcher key (fills nonce/gas/blob).
+    // Posting provider: wallet-filled with the batcher key (fills nonce,
+    // gas, and blob fields).
     let post_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(batcher_signer))
         .connect_http(anvil.endpoint_url());

@@ -1,5 +1,5 @@
-//! mdbx codec for `alloy_trie::BranchNodeCompact` — the stored intermediate
-//! trie node. Fixed little-tooling layout (all big-endian):
+//! The mdbx codec for `alloy_trie::BranchNodeCompact`, the stored
+//! intermediate trie node. This is a fixed layout, all big-endian:
 //!
 //! ```text
 //! state_mask(u16) ++ tree_mask(u16) ++ hash_mask(u16)
@@ -7,8 +7,9 @@
 //!   ++ hashes_len(u16) ++ hashes(32B each)
 //! ```
 //!
-//! `hashes_len` always equals the number of set bits in `hash_mask` (alloy-trie
-//! enforces this), but we store it explicitly so decode is self-describing.
+//! `hashes_len` always equals the number of set bits in `hash_mask`.
+//! alloy-trie enforces this, but this codec stores the length explicitly,
+//! so decoding is self-describing.
 
 use alloy_primitives::B256;
 use alloy_trie::{BranchNodeCompact, TrieMask};

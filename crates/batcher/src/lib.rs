@@ -1,27 +1,30 @@
 //! Kardamom L1 batcher.
 //!
-//! Offline, archive-driven (S0): reads the canonical L2 stream from
-//! the on-disk Aeron archives, groups it into per-block batches, packs them
-//! into EIP-4844 blobs (KAR1 + zstd framing, no state-root field /!), and posts them to the `KardamomL2Settlement` data-availability
-//! sink contract on L1.
+//! This is the offline, archive-driven design. It reads the canonical L2
+//! stream from the on-disk Aeron archives. It groups the stream into
+//! per-block batches. It packs the batches into EIP-4844 blobs (KAR1 format
+//! with zstd framing, no state-root field). It posts the blobs to the
+//! `KardamomL2Settlement` data-availability sink contract on L1.
 //!
-//! ## split data/ordering topology
+//! ## Split data/ordering topology
 //!
-//! After the batcher reads from `M + 1` archives, not one:
+//! The batcher reads from `M + 1` archives, not one:
 //!
-//! - **TxOrdering archive** carries the canonical orderer payload — only
-//!   `TxOrderingMessage` records (`TxRef + BoundaryStart`). Tiny per-record.
-//! - **Per-sequencer tx_data archives** carry the bulk `TxEnvelope` bytes.
-//!   One per sequencer; opened on demand by [`multi_archive_reader`].
+//! - The **TxOrdering archive** carries the canonical orderer payload. It
+//!   holds only `TxOrderingMessage` records (`TxRef + BoundaryStart`). Each
+//!   record is small.
+//! - The **per-sequencer tx_data archives** carry the bulk `TxEnvelope`
+//!   bytes. There is one archive per sequencer. [`multi_archive_reader`]
+//!   opens each archive on demand.
 //!
-//! [`multi_archive_reader::MultiArchiveReader`] is the glue: it walks B in
-//! canonical order, resolving each `TxRef` against the appropriate tx_data
-//! position index, and yields [`multi_archive_reader::ResolvedRecord`]s the
-//! existing [`batch::BatchAccumulator`] can consume as-is.
+//! [`multi_archive_reader::MultiArchiveReader`] connects the two archives. It
+//! walks the ordering archive in canonical order. For each `TxRef`, it looks
+//! up the position in the matching tx_data index. It yields
+//! [`multi_archive_reader::ResolvedRecord`]s. The existing
+//! [`batch::BatchAccumulator`] can consume these records as-is.
 //!
-//! See `` for the full task plan and
-//! `` / / for
-//! the cross-cutting decisions that shape this crate.
+//! See the project task plan and design docs for the cross-cutting decisions
+//! that shape this crate.
 
 pub mod archive_reader;
 pub mod batch;

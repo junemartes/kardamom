@@ -1,12 +1,14 @@
-//! JSON-RPC client + transaction signing for the scenario drivers.
+//! JSON-RPC client and transaction signing for the scenario drivers.
 //!
-//! Thin wrapper over jsonrpsee's HTTP client that (a) surfaces JSON-RPC error
-//! codes as data (the scenarios assert on them) and (b) measures per-call
-//! latency (the "RPC never hangs" assertions are latency bounds).
+//! This is a thin wrapper over jsonrpsee's HTTP client. It does two
+//! things: it surfaces JSON-RPC error codes as data, so the scenarios can
+//! check them, and it measures the latency of each call, since the
+//! "RPC never hangs" checks are latency limits.
 //!
 //! Signing reuses `kardamom_bench`'s mnemonic derivation (the anvil dev
-//! mnemonic funded by `deploy/cluster/config/genesis/dev.toml`) and the exact
-//! `TxLegacy → sign → encode_2718` pattern of `kardamom-load`.
+//! mnemonic, funded by `deploy/cluster/config/genesis/dev.toml`) and the
+//! same `TxLegacy` to sign to `encode_2718` pattern that `kardamom-load`
+//! uses.
 
 use std::time::{Duration, Instant};
 
@@ -21,8 +23,8 @@ use jsonrpsee::rpc_params;
 use kardamom_bench::mnemonic;
 pub use kardamom_bench::signers::DerivedSigner;
 
-/// The anvil/hardhat dev mnemonic; accounts #0..#17 are prefunded by
-/// `deploy/cluster/config/genesis/dev.toml`.
+/// The anvil/hardhat dev mnemonic. Accounts #0 through #17 are prefunded
+/// by `deploy/cluster/config/genesis/dev.toml`.
 pub const DEV_MNEMONIC: &str = "test test test test test test test test test test test junk";
 
 /// Outcome of a JSON-RPC call, with the wall-clock latency of the round trip.
@@ -32,8 +34,9 @@ pub struct RpcOutcome<T> {
     pub elapsed: Duration,
 }
 
-/// A JSON-RPC layer error: either a server-side error object (code +
-/// message) or a transport-level failure (timeout, refused connection, …).
+/// A JSON-RPC layer error. This is either a server-side error object
+/// (code and message) or a transport-level failure (timeout, refused
+/// connection, and so on).
 #[derive(Debug, Clone)]
 pub enum RpcError {
     /// The server answered with a JSON-RPC error object.
@@ -70,9 +73,9 @@ pub struct L2Client {
 }
 
 impl L2Client {
-    /// `request_timeout` bounds every call at the client; scenarios set it
-    /// ABOVE the ingress-side pending-receipt timeout so a server-side
-    /// timeout error is distinguishable from a client-side abort.
+    /// `request_timeout` limits every call at the client. Scenarios set it
+    /// above the ingress-side pending-receipt timeout, so a server timeout
+    /// error can be told apart from a client-side abort.
     pub fn new(url: &str, request_timeout: Duration) -> Result<Self> {
         let http = HttpClientBuilder::default()
             .request_timeout(request_timeout)
@@ -102,8 +105,8 @@ impl L2Client {
         }
     }
 
-    /// `eth_sendRawTransaction`. Blocks (server-side) until the receipt lands
-    /// or the ingress pending-receipt timeout fires.
+    /// `eth_sendRawTransaction`. The server blocks until the receipt lands,
+    /// or until the ingress pending-receipt timeout fires.
     pub async fn send_raw(&self, raw: &Bytes) -> RpcOutcome<B256> {
         self.call(
             "eth_sendRawTransaction",
@@ -112,7 +115,7 @@ impl L2Client {
         .await
     }
 
-    /// `eth_getTransactionReceipt` — `None` on cache miss.
+    /// `eth_getTransactionReceipt`. Returns `None` on a cache miss.
     pub async fn receipt(&self, hash: B256) -> RpcOutcome<Option<serde_json::Value>> {
         self.call("eth_getTransactionReceipt", rpc_params![format!("{hash}")])
             .await
@@ -126,14 +129,14 @@ impl L2Client {
         self.call("eth_blockNumber", rpc_params![]).await
     }
 
-    /// `eth_getBalance` — expected to answer with a clean error (deferred
-    /// endpoint), never to hang; kept for the S5 liveness matrix.
+    /// `eth_getBalance`. This is a deferred endpoint: it must answer with
+    /// a clean error, and never hang. Kept for the RPC liveness matrix.
     pub async fn get_balance(&self, addr: Address) -> RpcOutcome<String> {
         self.call("eth_getBalance", rpc_params![format!("{addr}"), "latest"])
             .await
     }
 
-    /// `eth_getTransactionCount` — same deferred-endpoint contract.
+    /// `eth_getTransactionCount`. Has the same deferred-endpoint contract.
     pub async fn get_transaction_count(&self, addr: Address) -> RpcOutcome<String> {
         self.call(
             "eth_getTransactionCount",
@@ -142,9 +145,10 @@ impl L2Client {
         .await
     }
 
-    /// Raw JSON-RPC call with untyped params/result — the rpc-vectors
-    /// driver's transport. Errors surface as `RpcError::Call{code,message}`
-    /// so vectors can match the full error contract.
+    /// A raw JSON-RPC call, with untyped params and result. This is the
+    /// transport the rpc-vectors driver uses. Errors surface as
+    /// `RpcError::Call{code,message}`, so vectors can match the full
+    /// error contract.
     pub async fn raw_call(
         &self,
         method: &str,
@@ -173,9 +177,9 @@ pub struct SignedTransfer {
 }
 
 /// Sign a 21k-gas legacy value transfer (the `kardamom-load` shape).
-/// `value_wei` perturbs the payload so two txs at the same nonce can be
-/// distinguished (the S5 past-nonce probe needs a *different* tx, not an
-/// idempotent resubmit).
+/// `value_wei` changes the payload, so two transactions at the same nonce
+/// can be told apart. The RPC liveness past-nonce probe needs a
+/// different transaction, not an idempotent resubmit.
 pub fn sign_transfer(
     signer: &DerivedSigner,
     chain_id: u64,
@@ -209,8 +213,9 @@ pub fn sign_transfer(
     })
 }
 
-/// Sign a legacy contract-creation tx. `init_code` is the deployment
-/// bytecode; 100k gas covers the trivial creates the scenarios deploy.
+/// Sign a legacy contract-creation transaction. `init_code` is the
+/// deployment bytecode. 100k gas covers the trivial creates the
+/// scenarios deploy.
 pub fn sign_create(
     signer: &DerivedSigner,
     chain_id: u64,
@@ -243,8 +248,9 @@ pub fn sign_create(
     })
 }
 
-/// Sign a legacy call to `to` carrying `value` and `input` (contract calls
-/// such as the withdrawal predeploy's `initiateWithdrawal`).
+/// Sign a legacy call to `to`, carrying `value` and `input`. This covers
+/// contract calls such as the withdrawal predeploy's
+/// `initiateWithdrawal`.
 pub fn sign_call(
     signer: &DerivedSigner,
     chain_id: u64,
@@ -279,8 +285,9 @@ pub fn sign_call(
     })
 }
 
-/// Deterministic in-place Fisher–Yates shuffle (xorshift64*), so scenario
-/// orderings are reproducible from a seed without pulling in `rand`.
+/// A deterministic, in-place Fisher-Yates shuffle (xorshift64*). This
+/// makes scenario orderings reproducible from a seed, with no need for
+/// `rand`.
 pub fn seeded_shuffle<T>(items: &mut [T], mut seed: u64) {
     debug_assert!(seed != 0, "xorshift seed must be non-zero");
     let mut next = move || {

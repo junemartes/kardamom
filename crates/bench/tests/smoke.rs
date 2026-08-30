@@ -1,12 +1,13 @@
-//! Smoke test: run `Benchmark<TransfersWorkflow>` against an in-process
-//! kardamom **ingress** (real `IngressProxy` over `MockChannels` + a
-//! fake-executor receipt loop) for a short window, and assert the write-path
-//! histogram is non-empty.
+//! This is a smoke test. It runs `Benchmark<TransfersWorkflow>` against
+//! an in-process kardamom ingress, a real `IngressProxy` over
+//! `MockChannels` with a fake-executor receipt loop, for a short
+//! window, and checks that the write-path histogram is not empty.
 //!
-//! This replaces the former in-process-`Node` smoke test: `kardamom-node` was
-//! removed and the bench now targets the cluster ingress. `transfers` is the
-//! write-path workflow (`eth_sendRawTransaction` + parked-receipt release),
-//! which ingress serves; `eth_call`-based workflows are deferred until ingress
+//! This replaces the former in-process-`Node` smoke test, from before
+//! the removal of `kardamom-node`; the bench now targets the cluster
+//! ingress. `transfers` is the write-path workflow, using
+//! `eth_sendRawTransaction` with parked-receipt release, which ingress
+//! serves. An `eth_call`-based workflow is deferred until ingress
 //! grows read-path RPCs.
 
 use std::time::Duration;
@@ -50,8 +51,8 @@ async fn bench_records_samples_against_inprocess_ingress() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_genesis_alloc_propagates_bad_mnemonic() {
-    // C2 regression test: a workflow constructed with a bogus mnemonic
-    // must surface an `Err` from `genesis_alloc`, not panic.
+    // Regression test: a workflow built with a bad mnemonic must return
+    // an `Err` from `genesis_alloc`, not panic.
     let workflow = MixedWorkflow {
         mnemonic: "this is not a valid bip39 phrase at all".to_string(),
         ..MixedWorkflow::default()

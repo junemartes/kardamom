@@ -1,7 +1,11 @@
-//! Library half of `kardamom-bench`. Exposes the `BenchWorkflow` trait, the
-//! generic `Benchmark<W>` dispatcher, the in-process `Harness<W>`, three
-//! built-in workflows (transfers/calls/mixed), and a few primitives
-//! (mnemonic derivation, transfer presigning) that workflows reuse.
+//! This is the library half of `kardamom-bench`.
+//!
+//! It exposes:
+//! - the `BenchWorkflow` trait
+//! - the generic `Benchmark<W>` dispatcher
+//! - the in-process `Harness<W>`
+//! - three built-in workflows: transfers, calls, and mixed
+//! - primitives that workflows reuse, such as mnemonic derivation and transfer presigning
 
 pub mod benchmark;
 pub mod config;

@@ -1,14 +1,14 @@
-//! PR 5's closing contract on anvil: the optimistic path end to end.
+//! The optimistic path end to end, on anvil.
 //!
-//! Scenario A (the equilibrium): a REAL batch posted, claimed from the
-//! spool's attestations, watched (honest), window elapsed, finalized —
-//! the root advances with ZERO proofs generated.
+//! Scenario A (the equilibrium): a real batch is posted, claimed from the
+//! spool's attestations, watched (honest), and finalized once the window
+//! elapses. The root advances with zero proofs generated.
 //!
-//! Scenario B (the defense): a lying claim (correct digests — the fold
-//! check passes; wrong root at offset 1), detected by the watcher against
-//! the spool, challenged with the single-block proof files at the FIRST
-//! divergent offset, slashed, rewound — then honestly re-claimed and
-//! finalized.
+//! Scenario B (the defense): a lying claim (correct digests, so the fold
+//! check passes, but a wrong root at offset 1) is detected by the watcher
+//! against the spool. It is challenged with the single-block proof files
+//! at the first divergent offset, slashed, and rewound. Then it is
+//! honestly re-claimed and finalized.
 
 use alloy_node_bindings::Anvil;
 use alloy_primitives::{Address, B256, U256, address};
@@ -59,8 +59,8 @@ fn honest_root(block: u64) -> B256 {
     B256::repeat_byte(0xA0u8.wrapping_add(block as u8))
 }
 
-/// Write a spool entry as the validator's spool would (the 160-byte
-/// expected-outputs layout is the claim poster's + watcher's feed).
+/// Write a spool entry the way the validator's spool would. The 160-byte
+/// expected-outputs layout feeds both the claim poster and the watcher.
 fn write_spool_block(spool: &std::path::Path, block: u64, pre: B256, digest: B256) {
     let out = PublicOutputs {
         pre_state_root: pre,
@@ -175,8 +175,9 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
     )
     .unwrap();
 
-    // The spool the "validator" produced: digests MUST be the batcher's
-    // per-block digests (shared primitives), roots are the honest chain.
+    // The spool the "validator" produced. The digests must be the
+    // batcher's per-block digests (shared primitives). The roots are the
+    // honest chain.
     let d7 = {
         let mut d = BlockRecordsDigest::new(7);
         d.add_tx(&env_tx(0).raw_tx);
@@ -262,15 +263,15 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
         .get_receipt()
         .await
         .unwrap();
-    // NOTE: batch 2 re-uses the 7..8 range shape; the spool's honest roots
-    // chain from the CURRENT state root, so re-write the spool for the new
-    // pre-root context (honest chain now starts at honest_root(8)).
-    // For simplicity the lie keeps offset 0 honest and lies at offset 1.
+    // Batch 2 reuses the 7..8 range shape. The spool's honest roots chain
+    // from the current state root, so rewrite the spool for the new
+    // pre-root context (the honest chain now starts at honest_root(8)).
+    // For simplicity, the lie keeps offset 0 honest and lies at offset 1.
     write_spool_block(&spool, 7, honest_root(8), d7);
     write_spool_block(&spool, 8, honest_root(7), d8);
 
-    // The LIAR claims directly: digests correct (fold passes), root wrong
-    // at offset 1.
+    // The liar claims directly. The digests are correct (the fold passes),
+    // but the root is wrong at offset 1.
     let lie = B256::repeat_byte(0x66);
     oracle
         .claimBatch(2, vec![honest_root(7), lie], vec![d7, d8])
@@ -295,8 +296,9 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
         }
     );
 
-    // The prover produces the single-block files (zk-host --prove shape):
-    // public values = the honest block 8, proof = mock (accepting verifier).
+    // The prover produces the single-block files (the zk-host --prove
+    // shape). The public values are the honest block 8; the proof is a
+    // mock (accepting verifier).
     let dir = spool.join("block-8");
     let honest_pv = PublicOutputs {
         pre_state_root: honest_root(7),
@@ -319,8 +321,9 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
         }
     );
 
-    // Rewind: root unchanged, batch reopen, slash credited to challenger
-    // (the provider's default account submitted the challenge).
+    // Rewind: the root is unchanged, the batch reopens, and the slash is
+    // credited to the challenger (the provider's default account submitted
+    // the challenge).
     assert_eq!(oracle.stateRoot().call().await.unwrap(), honest_root(8));
     assert_eq!(oracle.highestClaimedBatch().call().await.unwrap(), 1);
 

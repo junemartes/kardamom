@@ -1,12 +1,11 @@
-//! Sender-to-partition routing. `partition = keccak256(sender)[..8] % M`.
+//! This module routes a sender to a partition. `partition = keccak256(sender)[..8] % M`.
 
 use alloy_primitives::{Address, keccak256};
 
-/// Returns the partition index for `sender` given `m` partitions.
+/// Returns the partition index for `sender`, out of `m` partitions.
 ///
-/// Implementation: take the first 8 bytes of `keccak256(sender)` as a
-/// big-endian `u64`, then `% m`. This matches the algorithm described in
-///
+/// Take the first 8 bytes of `keccak256(sender)` as a big-endian `u64`.
+/// Then compute `% m`.
 #[inline]
 pub fn partition_for(sender: Address, m: u32) -> u32 {
     debug_assert!(m > 0, "partition count must be positive");
@@ -31,8 +30,9 @@ mod tests {
 
     #[test]
     fn distribution_is_reasonable_over_1024_addresses() {
-        // For 1024 random addresses into 8 partitions each bucket should hold
-        // at least 1024/8 / 2 = 64. (Smoke test; not a chi-square.)
+        // With 1024 addresses in 8 partitions, each bucket should get at
+        // least 1024 / 8 / 2 = 64 addresses. This is a smoke test, not a
+        // chi-square test.
         let mut counts = [0u32; 8];
         for i in 0u64..1024 {
             let mut bytes = [0u8; 20];

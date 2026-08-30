@@ -1,18 +1,19 @@
 //! Anvil as the L1, with the bridge contracts deployed.
 //!
-//! Reuses the pattern `crates/validator/tests/withdrawal_e2e.rs` established:
-//! predeploy the ERC-7955 factory with `anvil_setCode`, fund + impersonate
-//! `DEV_OWNER`, bootstrap the kardamom factory, then deploy the
-//! `WithdrawalOutputOracle` and `ETHLockbox` **atomically** with the oracle's
-//! address predicted and wired into the lockbox's initializer.
+//! This reuses the pattern that `crates/validator/tests/withdrawal_e2e.rs`
+//! established: predeploy the ERC-7955 factory with `anvil_setCode`, fund
+//! and impersonate `DEV_OWNER`, bootstrap the kardamom factory, then
+//! deploy the `WithdrawalOutputOracle` and `ETHLockbox` atomically, with
+//! the oracle's address predicted and wired into the lockbox's
+//! initializer.
 //!
-//! Two anvil flags are load-bearing here:
-//! - `--slots-in-an-epoch 1` so the `finalized` tag advances. The da-watcher
-//!   polls `eth_getBlockByNumber("finalized")`, which by default lags
-//!   `latest` by ~64 blocks — without this the watcher never sees a deposit
-//!   and the scenario stalls forever. (This cost the deleted #67 e2e real
-//!   debugging time; it is the single most important line in this file.)
-//! - `block_time(1)` so blocks are produced without explicit mining.
+//! Two anvil flags matter here:
+//! - `--slots-in-an-epoch 1`, so the `finalized` tag advances. The
+//!   da-watcher polls `eth_getBlockByNumber("finalized")`, which by
+//!   default lags `latest` by about 64 blocks. Without this flag, the
+//!   watcher never sees a deposit, and the scenario stalls forever. This
+//!   is the single most important line in this file.
+//! - `block_time(1)`, so blocks are produced with no explicit mining.
 
 mod contracts;
 
@@ -28,17 +29,17 @@ use kardamom_deployer::{ContractId, Deployer, Op, encode_address_pair, encode_or
 
 pub use contracts::*;
 
-/// Short finalization window so a scenario can warp past it quickly (the
-/// production default is 86_400).
+/// A short finalization window, so a scenario can warp past it quickly
+/// (the production default is 86_400).
 pub const FINALIZATION_WINDOW: u64 = 60;
 
 /// The receipt type the wallet providers hand back.
 type L1TxReceipt = <alloy_network::Ethereum as alloy_network::Network>::ReceiptResponse;
 
-/// Provider without a wallet (reads + `anvil_*` cheatcodes), tuned for tests
-/// (50 ms poll). Takes the URL by value and captures no lifetime, so the
-/// result is usable where `'static` is required (`deposit_logs` hands it to
-/// `L1Source`).
+/// A provider with no wallet (reads and `anvil_*` cheatcodes), tuned for
+/// tests (50 ms poll). It takes the URL by value and captures no
+/// lifetime, so the result works where `'static` is required
+/// (`deposit_logs` hands it to `L1Source`).
 fn provider_for(url: String) -> impl Provider + Clone {
     let p = ProviderBuilder::new()
         .disable_recommended_fillers()
@@ -52,14 +53,15 @@ pub struct L1 {
     anvil: alloy_node_bindings::AnvilInstance,
     pub lockbox: Address,
     pub oracle: Address,
-    /// `KardamomL2Settlement` — the DA batch inbox (S8).
+    /// `KardamomL2Settlement`: the DA batch inbox.
     pub settlement: Address,
 }
 
 impl L1 {
-    /// Spawn anvil and deploy the bridge. `Ok(None)` when the `anvil` binary
-    /// is absent, so bridge scenarios skip rather than fail on a machine
-    /// without Foundry (the convention every other anvil test here uses).
+    /// Spawn anvil and deploy the bridge. Returns `Ok(None)` when the
+    /// `anvil` binary is absent, so bridge scenarios skip instead of
+    /// failing on a machine with no Foundry. This is the same convention
+    /// every other anvil test here uses.
     pub async fn launch(l2_chain_id: u64) -> Result<Option<Self>> {
         let Ok(anvil) = alloy_node_bindings::Anvil::new()
             .block_time(1)
@@ -90,7 +92,8 @@ impl L1 {
             .raw_request("anvil_impersonateAccount".into(), (DEV_OWNER,))
             .await
             .context("impersonate DEV_OWNER")?;
-        // The batcher signs real blob txs, so it needs a real balance.
+        // The batcher signs real blob transactions, so it needs a real
+        // balance.
         let _: serde_json::Value = deploy_provider
             .raw_request(
                 "anvil_setBalance".into(),
@@ -105,9 +108,9 @@ impl L1 {
             .await
             .context("ensure kardamom factory")?;
 
-        // The lockbox's initializer needs the oracle's address, so predict it
-        // from the EXACT init args the deploy will use and deploy both in one
-        // transaction.
+        // The lockbox's initializer needs the oracle's address. Predict
+        // that address from the exact init args the deploy will use, then
+        // deploy both contracts in one transaction.
         let oracle_init =
             encode_oracle_init_args(ATTESTER_ADDR, DEPOSITOR_ADDR, FINALIZATION_WINDOW);
         let predicted_oracle = deployer.predict_proxy_address(
@@ -130,7 +133,8 @@ impl L1 {
                         init_args: lockbox_init,
                     },
                     // The DA batch inbox. `l1Batcher` is the only address
-                    // allowed to post, so it is the key S8 signs blob txs with.
+                    // allowed to post, so it is the key the DA-parity test
+                    // uses to sign blob transactions.
                     Op::Deploy {
                         l2_chain_id,
                         id: ContractId::KardamomL2Settlement,
@@ -173,7 +177,7 @@ impl L1 {
         self.anvil.endpoint()
     }
 
-    /// Provider without a wallet (reads + anvil_* cheatcodes).
+    /// A provider with no wallet (reads and anvil_* cheatcodes).
     pub fn provider(&self) -> impl Provider + Clone {
         provider_for(self.anvil.endpoint())
     }
@@ -188,8 +192,8 @@ impl L1 {
         Ok(p)
     }
 
-    /// Mine `n` empty blocks (also advances `finalized`, given
-    /// `--slots-in-an-epoch 1`).
+    /// Mine `n` empty blocks. This also advances `finalized`, because of
+    /// `--slots-in-an-epoch 1`.
     pub async fn mine(&self, n: u64) -> Result<()> {
         let p = self.provider();
         for _ in 0..n {
@@ -213,7 +217,7 @@ impl L1 {
     }
 
     /// The `(block_hash, block_number, log_index)` of the `DepositInitiated`
-    /// log carried by a `depositETH` receipt (which must be successful).
+    /// log in a `depositETH` receipt. The receipt must be successful.
     fn deposit_log(&self, receipt: &L1TxReceipt) -> Result<(B256, u64, u64)> {
         anyhow::ensure!(receipt.status(), "depositETH reverted");
         let log = receipt
@@ -229,9 +233,9 @@ impl L1 {
         ))
     }
 
-    /// `depositETH(to, gas_limit, "")` with `value` wei, from `DEPOSITOR_ADDR`.
-    /// Returns the L1 block hash and log index the OP-style `source_hash` is
-    /// derived from.
+    /// Call `depositETH(to, gas_limit, "")` with `value` wei, from
+    /// `DEPOSITOR_ADDR`. Returns the L1 block hash and log index the
+    /// OP-style `source_hash` derives from.
     pub async fn deposit_eth(&self, to: Address, value: U256) -> Result<(B256, u64)> {
         let provider = self.wallet(DEPOSITOR_KEY)?;
         let lockbox = ETHLockbox::new(self.lockbox, &provider);
@@ -248,16 +252,17 @@ impl L1 {
         Ok((block_hash, log_index))
     }
 
-    /// Send an **upgrade transaction** as the chain's L1 authority.
+    /// Send an upgrade transaction as the chain's L1 authority.
     ///
-    /// `DEV_OWNER` is the factory owner and is impersonated for the anvil's
-    /// lifetime (see `launch`), which is how the harness already drives
-    /// `applyDeployments` — so this is the same authority path production uses
-    /// with a Safe, not a test-only bypass.
+    /// `DEV_OWNER` is the factory owner, and the anvil impersonates it for
+    /// its whole lifetime (see `launch`). This is how the harness already
+    /// drives `applyDeployments`, so this is the same authority path
+    /// production uses with a Safe, not a test-only bypass.
     ///
-    /// `activation_timestamp` is epoch-**milliseconds** (L2 `block.timestamp`
-    /// is ms on this chain); `0` activates immediately. Returns the L1 block
-    /// hash and log index the system deposit's `source_hash` derives from.
+    /// `activation_timestamp` is in epoch milliseconds (L2
+    /// `block.timestamp` is in milliseconds on this chain). `0` activates
+    /// immediately. Returns the L1 block hash and log index the system
+    /// deposit's `source_hash` derives from.
     pub async fn initiate_upgrade(
         &self,
         feature_id: U256,
@@ -287,11 +292,12 @@ impl L1 {
         ))
     }
 
-    /// Attempt an upgrade transaction from an account that is NOT the
+    /// Attempt an upgrade transaction from an account that is not the
     /// authority. Returns the error the chain produced.
     ///
-    /// Used as a negative control, so it deliberately returns `Ok(())` only
-    /// when the call actually SUCCEEDED — the caller asserts on the error.
+    /// This is a negative control, so it deliberately returns `Ok(())`
+    /// only when the call actually succeeded. The caller checks for the
+    /// error.
     pub async fn try_initiate_upgrade_unauthorized(
         &self,
         key: &str,
@@ -299,9 +305,9 @@ impl L1 {
     ) -> Result<()> {
         let provider = self.wallet(key)?;
         let lockbox = ETHLockbox::new(self.lockbox, &provider);
-        // A revert can surface either at estimate/call time (`send` errors) or
-        // as a failed receipt, depending on the node; treat both as rejection
-        // and only a successful receipt as a breach.
+        // A revert can surface at estimate or call time (a `send` error),
+        // or as a failed receipt, depending on the node. Treat both as a
+        // rejection, and treat only a successful receipt as a breach.
         match lockbox.initiateUpgrade(feature_id, 0).send().await {
             Err(e) => Err(anyhow::anyhow!("rejected at send: {e}")),
             Ok(pending) => match pending.get_receipt().await {
@@ -323,14 +329,15 @@ impl L1 {
             .context("read upgradeNonce")
     }
 
-    /// Several `depositETH` calls landing in ONE L1 block — i.e. one epoch
-    /// with several deposits.
+    /// Several `depositETH` calls landing in one L1 block. This forms one
+    /// epoch with several deposits.
     ///
-    /// Auto-mining is disabled for the duration so the sends queue up, then a
-    /// single `evm_mine` seals them together. Sending them under auto-mine
-    /// would put each in its own block and test nothing about grouping.
+    /// This disables auto-mining while the sends queue up, then seals
+    /// them together with a single `evm_mine`. Sending them under
+    /// auto-mine would put each one in its own block, and test nothing
+    /// about grouping.
     ///
-    /// Returns `(block_hash, block_number, log_index)` per deposit.
+    /// Returns `(block_hash, block_number, log_index)` for each deposit.
     pub async fn deposit_eth_batch(
         &self,
         recipients: &[Address],
@@ -369,8 +376,8 @@ impl L1 {
         Ok(out)
     }
 
-    /// `evm_setAutomine` — the single switch behind
-    /// [`pause_block_production`](Self::pause_block_production) /
+    /// `evm_setAutomine`, the single switch behind
+    /// [`pause_block_production`](Self::pause_block_production) and
     /// [`resume_block_production`](Self::resume_block_production).
     async fn set_automine(&self, on: bool) -> Result<()> {
         let _: serde_json::Value = self
@@ -381,9 +388,10 @@ impl L1 {
         Ok(())
     }
 
-    /// Stop L1 block production entirely (anvil runs with `block_time(1)`, so
-    /// simply not calling [`mine`](Self::mine) does NOT make L1 idle).
-    /// Pairs with [`resume_block_production`](Self::resume_block_production).
+    /// Stop L1 block production completely. Anvil runs with
+    /// `block_time(1)`, so simply not calling [`mine`](Self::mine) does
+    /// not make L1 idle. Pair this with
+    /// [`resume_block_production`](Self::resume_block_production).
     pub async fn pause_block_production(&self) -> Result<()> {
         self.set_automine(false).await
     }
@@ -393,7 +401,8 @@ impl L1 {
         self.set_automine(true).await
     }
 
-    /// Latest finalized L1 block number — the same view the da-watcher tails.
+    /// The latest finalized L1 block number, the same view the da-watcher
+    /// follows.
     pub async fn finalized_block_number(&self) -> Result<u64> {
         let block = self
             .provider()
@@ -404,18 +413,20 @@ impl L1 {
         Ok(block.header.number)
     }
 
-    /// Every lockbox log — deposits **and** upgrades — emitted in `[from, to]`,
-    /// decoded through the SAME rule the producer uses.
+    /// Every lockbox log (deposits and upgrades) emitted in `[from, to]`,
+    /// decoded through the same rule the producer uses.
     ///
-    /// Tests compare the chain against this, so re-implementing the decode
-    /// here would let a producer bug and a test bug cancel out.
+    /// Tests compare the chain against this value. Rewriting the decode
+    /// logic here would let a producer bug and a test bug cancel each
+    /// other out.
     pub async fn lockbox_logs(
         &self,
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<kardamom_types::epoch::LockboxLog>> {
-        // Via `provider_for` rather than `provider()`: the method returns an
-        // `impl Provider` capturing `&self`, and `L1Source` needs `'static`.
+        // Use `provider_for`, not `provider()`. `provider()` returns an
+        // `impl Provider` that captures `&self`, but `L1Source` needs
+        // `'static`.
         let source = kardamom_da_watcher::RpcL1Source::new(provider_for(self.anvil.endpoint()));
         kardamom_da_watcher::L1Source::lockbox_logs(&source, self.lockbox, from_block, to_block)
             .await
@@ -424,10 +435,10 @@ impl L1 {
 
     /// Just the `DepositInitiated` logs from [`Self::lockbox_logs`].
     ///
-    /// Deliberately filtered rather than fetched separately: callers key on the
-    /// USER-domain `source_hash`, which an upgrade log does not have (system
-    /// deposits derive under domain 1), so handing them the union would compute
-    /// ids that match nothing.
+    /// This filters the logs instead of fetching them separately. Callers
+    /// key on the user-domain `source_hash`, which an upgrade log does
+    /// not have (system deposits derive under domain 1). Handing callers
+    /// the full union would compute ids that match nothing.
     pub async fn deposit_logs(
         &self,
         from_block: u64,

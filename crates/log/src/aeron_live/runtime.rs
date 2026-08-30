@@ -1,7 +1,7 @@
 //! [`AeronRuntime`]: the single Aeron thread's command bus and the
 //! `Send + Sync` handles it hands out ([`PubHandle`], typed subscription
 //! receivers). All Aeron work happens on the dedicated thread spawned here
-//! (see `super::thread`); this module only ships commands to it.
+//! (see `super::thread`). This module only ships commands to it.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -22,8 +22,8 @@ use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 // AeronRuntime: the single Aeron thread + command bus.
 // ---------------------------------------------------------------------------
 
-/// Top-level handle. Spawn once per process / test; share via clone (cheap —
-/// it's an `Arc` over the command channel).
+/// Top-level handle. Spawn once per process or test; share by cloning
+/// (cheap, since it is an `Arc` over the command channel).
 ///
 /// Drop the last clone to tear down the Aeron thread cleanly.
 #[derive(Clone)]
@@ -69,17 +69,18 @@ pub(super) enum RuntimeCmd {
     },
     /// Register a new subscription. The Aeron thread executes
     /// `aeron.add_subscription()`, stores it in the sub table, and arranges
-    /// for the supplied `deliver` closure to be invoked on each fragment.
-    /// Replies with the assigned `sub_id` (needed to attach MDS destinations).
+    /// for the supplied `deliver` closure to run on each fragment. Replies
+    /// with the assigned `sub_id` (needed to attach MDS destinations).
     OpenSubscription {
         uri: String,
         stream_id: i32,
         deliver: DeliverFn,
         ack: CbSender<Result<u32, LogError>>,
     },
-    /// Attach a source endpoint to a multi-destination (`control-mode=manual`)
-    /// subscription. Used to aggregate per-publisher streams (e.g. one ingress
-    /// MDS subscription pulling receipts from every executor replica).
+    /// Attach a source endpoint to a multi-destination
+    /// (`control-mode=manual`) subscription. Used to aggregate
+    /// per-publisher streams, for example one ingress MDS subscription
+    /// pulling receipts from every executor replica.
     SubAddDestination {
         sub_id: u32,
         uri: String,
@@ -96,11 +97,11 @@ pub(super) enum RuntimeCmd {
 }
 
 /// One command round trip to the Aeron thread: build the command around a
-/// fresh ack channel, send it, and wait [`ACK_TIMEOUT`] for the reply. Every
-/// control-plane call on [`AeronRuntime`] and [`PubHandle::publish_bytes`]
-/// share this shape, so the two failure modes (the Aeron thread died / the
-/// ack never came) have exactly one wording each; `op` names the caller in
-/// the timeout error.
+/// fresh ack channel, send it, and wait [`ACK_TIMEOUT`] for the reply.
+/// Every control-plane call on [`AeronRuntime`] and
+/// [`PubHandle::publish_bytes`] shares this shape, so the two failure
+/// modes (the Aeron thread died, or the ack never came) each have exactly
+/// one wording. `op` names the caller in the timeout error.
 fn request<R>(
     cmd_tx: &CbSender<RuntimeCmd>,
     mk: impl FnOnce(CbSender<Result<R, LogError>>) -> RuntimeCmd,
@@ -116,9 +117,9 @@ fn request<R>(
 }
 
 impl AeronRuntime {
-    /// [`spawn_with_dir`](Self::spawn_with_dir) when a directory is given,
-    /// [`spawn_default`](Self::spawn_default) otherwise — the shape every
-    /// service binary's optional `--aeron-dir` flag needs.
+    /// Calls [`spawn_with_dir`](Self::spawn_with_dir) when a directory is
+    /// given, or [`spawn_default`](Self::spawn_default) otherwise. This is
+    /// the shape every service binary's optional `--aeron-dir` flag needs.
     pub fn spawn(aeron_dir: Option<&std::path::Path>) -> Result<Self, LogError> {
         match aeron_dir {
             Some(dir) => Self::spawn_with_dir(dir),
@@ -135,9 +136,9 @@ impl AeronRuntime {
         })
     }
 
-    /// Spawn pointing at a specific `aeron.dir` (the Media Driver's shared-
-    /// memory directory). Used by e2e tests that bind-mount the container's
-    /// aeron.dir into the host.
+    /// Spawn pointing at a specific `aeron.dir` (the Media Driver's
+    /// shared-memory directory). Used by e2e tests that bind-mount the
+    /// container's aeron.dir into the host.
     pub fn spawn_with_dir(aeron_dir: impl Into<std::path::PathBuf>) -> Result<Self, LogError> {
         let aeron_dir = aeron_dir.into();
         let aeron_dir_str = aeron_dir
@@ -156,10 +157,11 @@ impl AeronRuntime {
         })
     }
 
-    /// Spawn the Aeron thread, building the `AeronContext` inside the thread
-    /// via the caller-supplied closure. The closure runs on the Aeron thread
-    /// — this is the only way to feed it custom configuration without
-    /// crossing the `!Send + !Sync` boundary that AeronContext sits on.
+    /// Spawn the Aeron thread, building the `AeronContext` inside the
+    /// thread with the caller-supplied closure. The closure runs on the
+    /// Aeron thread. This is the only way to feed it custom configuration
+    /// without crossing the `!Send + !Sync` boundary that AeronContext
+    /// sits on.
     pub fn spawn_with<F>(make_ctx: F) -> Result<Self, LogError>
     where
         F: FnOnce() -> Result<rusteron_client::AeronContext, LogError> + Send + 'static,
@@ -223,10 +225,10 @@ impl AeronRuntime {
         })
     }
 
-    /// Open a raw subscription with a caller-supplied delivery closure.
-    /// Used by adapters that need to demultiplex fragments themselves.
-    /// Open a subscription with a raw deliver closure, returning the assigned
-    /// `sub_id` (used to attach MDS destinations; most callers ignore it).
+    /// Open a subscription with a raw deliver closure, returning the
+    /// assigned `sub_id` (used to attach MDS destinations; most callers
+    /// ignore it). Used by adapters that must demultiplex fragments
+    /// themselves.
     pub fn open_subscription_with_deliver(
         &self,
         uri: &str,
@@ -246,9 +248,9 @@ impl AeronRuntime {
         )
     }
 
-    /// Attach a source endpoint to a multi-destination subscription (one opened
-    /// `control-mode=manual`). Blocks until the driver confirms the attach.
-    /// Idempotent — re-adding an already-attached `uri` is a no-op.
+    /// Attach a source endpoint to a multi-destination subscription (one
+    /// opened `control-mode=manual`). Blocks until the driver confirms the
+    /// attach. Idempotent: re-adding an already-attached `uri` is a no-op.
     pub fn add_destination(&self, sub_id: u32, uri: &str) -> Result<(), LogError> {
         let uri = uri.to_string();
         request(
@@ -285,18 +287,18 @@ impl AeronRuntime {
         self.open_subscription_merged(std::slice::from_ref(&uri), stream_id)
     }
 
-    /// Open one or more subscriptions on the **same** `stream_id`, all feeding
+    /// Open one or more subscriptions on the same `stream_id`, all feeding
     /// a single mpsc receiver. Each URI becomes its own Aeron subscription
-    /// (its own `SubEntry`); fragments from every one are decoded and merged
-    /// into the returned channel in the Aeron thread's poll order — the same
-    /// merge the shared-multicast path produced from multiple images of one
-    /// subscription.
+    /// (its own `SubEntry`). Fragments from every one are decoded and
+    /// merged into the returned channel in the Aeron thread's poll order,
+    /// the same merge the shared-multicast path produced from multiple
+    /// images of one subscription.
     ///
-    /// This is the tx_ordering MDC subscriber primitive: the executor passes
-    /// one MDC control URI per publisher (sealer + each sequencer), and the
-    /// downstream reader sees a single ordered `(BPosition, T)` stream exactly
-    /// as before. With a single URI it is identical to
-    /// [`Self::open_subscription`].
+    /// This is the tx_ordering MDC subscriber primitive: the executor
+    /// passes one MDC control URI per publisher (the sealer and each
+    /// sequencer), and the downstream reader sees a single ordered
+    /// `(BPosition, T)` stream, exactly as before. With a single URI it is
+    /// identical to [`Self::open_subscription`].
     pub fn open_subscription_merged<T>(
         &self,
         uris: &[&str],
@@ -321,10 +323,11 @@ impl AeronRuntime {
         Ok(msg_rx)
     }
 
-    /// Like [`open_subscription`](Self::open_subscription) but also returns the
-    /// `sub_id`, so the caller can attach MDS source endpoints via
-    /// [`add_destination`](Self::add_destination). Open the subscription on a
-    /// `control-mode=manual` channel to make it multi-destination.
+    /// Like [`open_subscription`](Self::open_subscription), but also
+    /// returns the `sub_id`, so the caller can attach MDS source endpoints
+    /// with [`add_destination`](Self::add_destination). Open the
+    /// subscription on a `control-mode=manual` channel to make it
+    /// multi-destination.
     pub fn open_subscription_with_id<T>(
         &self,
         uri: &str,
@@ -342,12 +345,13 @@ impl AeronRuntime {
         Ok((sub_id, msg_rx))
     }
 
-    /// Open a **tx_data** subscription yielding `(TxDataLoc, TxEnvelope)`,
-    /// pairing each envelope with its Aeron publisher `session_id`. The session
-    /// id disambiguates concurrent (active/active) ingress publishers on one
-    /// shard: it is what the sequencer stamps into `TxRef.tx_data_session_id`
-    /// and the executor keys its join buffer on. With a single publisher every
-    /// fragment carries the same session id, so behavior is unchanged.
+    /// Open a tx_data subscription yielding `(TxDataLoc, TxEnvelope)`,
+    /// pairing each envelope with its Aeron publisher `session_id`. The
+    /// session id keeps concurrent (active/active) ingress publishers on
+    /// one shard distinct. It is what the sequencer stamps into
+    /// `TxRef.tx_data_session_id`, and what the executor keys its join
+    /// buffer on. With a single publisher, every fragment carries the same
+    /// session id, so behavior is unchanged.
     pub fn open_tx_data_subscription(
         &self,
         uri: &str,
@@ -369,12 +373,12 @@ impl AeronRuntime {
     }
 }
 
-/// Build the standard typed deliver closure: decode each fragment as `T` and
-/// forward `(BPosition, T)` into `msg_tx` (a send error means the subscriber
-/// dropped its receiver — silently ignored; the sub keeps draining). Shared by
-/// [`AeronRuntime::open_subscription_merged`] and
-/// [`AeronRuntime::open_subscription_with_id`] so the decode/forward behaviour
-/// cannot drift between them.
+/// Build the standard typed deliver closure: decode each fragment as `T`
+/// and forward `(BPosition, T)` into `msg_tx`. A send error means the
+/// subscriber dropped its receiver; this is ignored, and the subscription
+/// keeps draining. Shared by [`AeronRuntime::open_subscription_merged`]
+/// and [`AeronRuntime::open_subscription_with_id`], so the decode/forward
+/// behavior cannot drift between them.
 fn typed_deliver<T>(msg_tx: tokio::sync::mpsc::UnboundedSender<(BPosition, T)>) -> DeliverFn
 where
     T: rkyv::Archive + Send + 'static,
@@ -394,10 +398,11 @@ where
 }
 
 /// Routes Aeron C-client errors through `tracing` instead of the client's
-/// default raw-stderr print. The client can follow a fatal error (e.g. code
-/// 1000, driver keepalive timeout) by terminating the process, so this line
-/// is often the service's last — it must carry our timestamp and land in the
-/// service's own log to sequence the death against the other services'.
+/// default raw-stderr print. The client may follow a fatal error (for
+/// example code 1000, a driver keepalive timeout) by ending the process,
+/// so this line is often the service's last. It must carry this service's
+/// timestamp and land in its own log, to sequence the death against the
+/// other services'.
 struct TracingErrorHandler;
 
 impl rusteron_client::AeronErrorHandlerCallback for TracingErrorHandler {
@@ -407,11 +412,11 @@ impl rusteron_client::AeronErrorHandlerCallback for TracingErrorHandler {
             msg, "aeron client error; exiting (fail-fast, as aeron's default handler does)"
         );
         // The C default handler this replaces exits the process after its
-        // stderr print — and that contract must survive the swap: a client
-        // that lost its driver and lingers keeps its /metrics port up while
-        // every publication is closed, which reads as a live-but-stuck
-        // service to supervisors and probes (observed: wedged validator,
-        // frozen committed-block gauge). Die so the supervisor restarts us.
+        // stderr print, and that contract must survive the swap. A client
+        // that loses its driver and lingers keeps its /metrics port up
+        // while every publication is closed, which reads as a
+        // live-but-stuck service to supervisors and probes. Exit here so
+        // the supervisor restarts the process.
         std::process::exit(1);
     }
 }
@@ -420,8 +425,8 @@ fn build_aeron(ctx: rusteron_client::AeronContext) -> Result<Rc<AeronClient>, Lo
     let handler = rusteron_client::Handler::leak(TracingErrorHandler);
     ctx.set_error_handler(Some(&handler))
         .map_err(|e| LogError::Aeron(format!("set_error_handler: {e}")))?;
-    // The C side holds the leaked pointer for the client's (= process')
-    // lifetime; forgetting the wrapper suppresses its drop-time
+    // The C side holds the leaked pointer for the client's (the process')
+    // lifetime. Forgetting the wrapper suppresses its drop-time
     // release()-was-never-called complaint.
     std::mem::forget(handler);
     let aeron = AeronClient::new(&ctx).map_err(|e| LogError::Aeron(format!("Aeron::new: {e}")))?;
@@ -445,7 +450,7 @@ pub struct PubHandle {
 
 impl PubHandle {
     /// Blocking publish with `BPosition` ack. Waits [`ACK_TIMEOUT`] for the
-    /// Aeron thread's reply — see that constant for why the ack always
+    /// Aeron thread's reply. See that constant for why the ack always
     /// resolves first.
     pub fn publish_bytes(&self, bytes: AlignedVec) -> Result<BPosition, LogError> {
         let pub_id = self.pub_id;

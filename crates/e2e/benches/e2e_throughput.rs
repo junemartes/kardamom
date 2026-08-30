@@ -1,17 +1,16 @@
-//! Phase-4 sustained-load throughput / latency benchmark for the full
-//! pipeline.
+//! Sustained-load throughput and latency benchmark for the full pipeline.
 //!
-//! Brings up real Aeron in Docker, opens the new Send-friendly
+//! This brings up real Aeron in Docker, opens the Send-friendly
 //! [`kardamom_log::aeron_live`] adapters, and measures:
 //!
-//!   - **throughput** — sustained tx/s over the publish→subscribe round
-//!     trip on tx_data,
-//!   - **latency p50/p99/p999** — eth_sendRawTransaction (compressed to
-//!     "publish onto tx_data") → receipt-on-tx_receipts, captured via
-//!     `hdrhistogram` so percentiles are exact rather than sampled.
+//!   - throughput: sustained transactions per second, over the
+//!     publish-to-subscribe round trip on tx_data.
+//!   - latency (p50, p99, p999): from `eth_sendRawTransaction` (modeled as
+//!     "publish onto tx_data") to a receipt on tx_receipts, captured with
+//!     `hdrhistogram` so the percentiles are exact, not sampled.
 //!
-//! Gated behind `feature = "full-pipeline-e2e"` (same flag as the test).
-//! Run with:
+//! This is gated behind `feature = "full-pipeline-e2e"` (the same flag as
+//! the test). Run it with:
 //!
 //! ```bash
 //! cargo bench -p e2e --features full-pipeline-e2e \
@@ -60,9 +59,9 @@ fn run_e2e_throughput(c: &mut Criterion) {
     let mut subscriber = TxDataSubscriberHandle::open(&aeron_rt, &cfg.channels, sequencer_id)
         .expect("tx_data subscriber for drain");
 
-    // Background draining task. Without it, every batch fills the term
-    // buffer and the publisher hits back-pressure. Drains as fast as the
-    // subscriber can deliver — we don't care about values here.
+    // A background draining task. Without it, every batch fills the term
+    // buffer, and the publisher hits back-pressure. It drains as fast as
+    // the subscriber can deliver; the values do not matter here.
     let drain_stop = Arc::new(AtomicBool::new(false));
     let drain_stop_for_task = drain_stop.clone();
     let drain_handle = std::thread::spawn(move || {
@@ -133,9 +132,10 @@ fn run_e2e_throughput(c: &mut Criterion) {
     });
     group.finish();
 
-    // Order-of-drop: AeronRuntime holds an Arc<JoinHandle> we want to flush
-    // before testcontainers' async drop reaches for the tokio runtime. Force
-    // testcontainers cleanup INSIDE rt.block_on so Handle::current() resolves.
+    // Drop order matters here. `AeronRuntime` holds an `Arc<JoinHandle>`
+    // that must flush before testcontainers' async drop reaches for the
+    // tokio runtime. Run testcontainers cleanup inside `rt.block_on`, so
+    // `Handle::current()` resolves.
     drop(aeron_rt);
     rt.block_on(async move { drop(cluster) });
     drop(rt);
@@ -143,11 +143,12 @@ fn run_e2e_throughput(c: &mut Criterion) {
 
 #[cfg(not(feature = "full-pipeline-e2e"))]
 fn run_e2e_throughput(c: &mut Criterion) {
-    // Without the feature, register a single no-op so `cargo bench` still has
-    // something to measure (and so the bench compiles in default-feature CI).
+    // Without the feature, register a single no-op. This gives `cargo
+    // bench` something to measure, and lets the bench compile in
+    // default-feature CI.
     c.bench_function("e2e_throughput_disabled", |b| {
         b.iter(|| {
-            // No-op: the real benchmark requires `--features full-pipeline-e2e`.
+            // No-op. The real benchmark needs `--features full-pipeline-e2e`.
         });
     });
 }

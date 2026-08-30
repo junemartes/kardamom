@@ -15,16 +15,17 @@ pub struct DerivedSigner {
     pub address: Address,
 }
 
-/// Pre-sign `count` EIP-2718-encoded legacy value transfers,
-/// round-robining across `signers`.
+/// Pre-sign `count` EIP-2718-encoded legacy value transfers.
+/// This function rotates the transfers across `signers`.
 ///
-/// Each signer's nonces start at `nonce_base` and increase monotonically.
-/// Returns the raw bytes for each tx, ordered for round-robin dispatch.
+/// Each signer's nonces start at `nonce_base` and increase in order.
+/// The function returns the raw bytes for each transaction, in
+/// round-robin dispatch order.
 ///
 /// # Errors
 ///
-/// Errors if `signers` is empty, or if signing any individual transaction
-/// fails (k256 signer error).
+/// Returns an error if `signers` is empty, or if signing a
+/// transaction fails with a k256 signer error.
 pub fn presign_transfers(
     signers: &[DerivedSigner],
     chain_id: u64,

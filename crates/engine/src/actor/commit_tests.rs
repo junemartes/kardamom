@@ -1,5 +1,5 @@
-//! Commit-thread tests: stream-order preservation, must-deliver retry,
-//! adaptive batching, suffix resume, and the divergence fail-stop.
+//! Tests for the commit thread: stream order, must-deliver retry, adaptive
+//! batching, suffix resume, and the divergence fail-stop.
 
 use std::sync::{Arc, Mutex};
 
@@ -57,8 +57,9 @@ fn commit_thread_preserves_order() {
     assert!(matches!(&l[1], CMessage::BlockBoundary(b) if b.block_number == 1));
 }
 
-/// Rejects the first `fails_left` publish attempts (a transient
-/// NOT_CONNECTED while the ingress subscription is forming), then records.
+/// Rejects the first `fails_left` publish attempts, then records each one.
+/// This simulates a transient NOT_CONNECTED error while the ingress
+/// subscription is forming.
 struct FlakyPub {
     fails_left: u32,
     log: Arc<Mutex<Vec<CMessage>>>,
@@ -74,9 +75,10 @@ impl TxReceiptsPublication for FlakyPub {
     }
 }
 
-// tx_receipts is must-deliver: a transient publish failure (subscriber not
-// yet connected during multi-host bring-up) must neither drop the receipt
-// nor kill the commit thread — it must retry until the receipt lands.
+// tx_receipts is must-deliver. A transient publish failure (the subscriber
+// is not yet connected during multi-host startup) must not drop the
+// receipt or stop the commit thread. The thread must retry until the
+// receipt lands.
 #[test]
 fn commit_thread_retries_until_delivered() {
     let (tx, rx) = bounded::<ExecToCommit>(8);
@@ -105,7 +107,7 @@ fn commit_thread_retries_until_delivered() {
         },
         rx,
     );
-    // Must return Ok — the thread survived the transient failures.
+    // This must return Ok. The thread survived the transient failures.
     h.join()
         .expect("no panic")
         .expect("commit thread must not die on a transient publish failure");
@@ -130,8 +132,9 @@ fn receipt(tag: u8, offset: i32) -> Receipt {
     }
 }
 
-/// Records each `publish_receipts` call's batch (the live transport's
-/// one-frame-per-batch shape) plus boundaries via `publish`.
+/// Records the batch from each `publish_receipts` call. This matches the
+/// live transport's one-frame-per-batch shape. It also records boundaries
+/// through `publish`.
 struct BatchRecordPub {
     batches: Arc<Mutex<Vec<Vec<Receipt>>>>,
     boundaries: Arc<Mutex<Vec<BlockBoundary>>>,
@@ -150,8 +153,8 @@ impl TxReceiptsPublication for BatchRecordPub {
     }
 }
 
-// Queued receipts drain into ONE batch publish (adaptive batching), and a
-// boundary flushes the receipts gathered before it — order preserved.
+// Queued receipts drain into one batch publish (adaptive batching). A
+// boundary flushes the receipts gathered before it, and order is preserved.
 #[test]
 fn commit_thread_batches_queued_receipts_and_flushes_on_boundary() {
     let (tx, rx) = bounded::<ExecToCommit>(16);
@@ -194,8 +197,9 @@ fn commit_thread_batches_queued_receipts_and_flushes_on_boundary() {
     );
 }
 
-/// Publishes `accept` receipts of each batch then fails transiently once,
-/// recording everything accepted — exercises the suffix resume.
+/// Publishes `accept` receipts from each batch, then fails once with a
+/// transient error. Records everything it accepts. This tests the suffix
+/// resume.
 struct PartialPub {
     accept: usize,
     fail_once: bool,
@@ -220,7 +224,7 @@ impl TxReceiptsPublication for PartialPub {
     }
 }
 
-// A partial batch failure resumes at the unpublished SUFFIX: every receipt
+// A partial batch failure resumes at the unpublished suffix. Every receipt
 // is delivered exactly once, in order.
 #[test]
 fn commit_thread_resumes_batch_at_failed_suffix() {
@@ -251,8 +255,8 @@ fn commit_thread_resumes_batch_at_failed_suffix() {
     );
 }
 
-/// A sink that reports a PROVEN divergence (the validator's receipt
-/// cross-check) on every publish.
+/// A sink that reports a proven divergence on every publish. This
+/// simulates the validator's receipt cross-check.
 struct DivergingPub;
 impl TxReceiptsPublication for DivergingPub {
     fn publish(&mut self, _msg: CMessage) -> Result<(), ExecutorError> {
@@ -260,10 +264,11 @@ impl TxReceiptsPublication for DivergingPub {
     }
 }
 
-// F10.1 regression: the must-deliver retry must NOT spin on a proven
-// divergence — that would consume the fail-stop (retry → empty buffer →
-// "unverified" → pipeline keeps committing). A Divergence error has to
-// propagate out of the commit thread immediately.
+// Regression test: the must-deliver retry must not spin on a proven
+// divergence. Spinning would defeat the fail-stop, because the retry finds
+// an empty buffer, lands in the "unverified" arm, and the pipeline keeps
+// committing. A Divergence error must propagate out of the commit thread
+// immediately.
 #[test]
 fn commit_thread_fail_stops_on_divergence() {
     let (tx, rx) = bounded::<ExecToCommit>(8);

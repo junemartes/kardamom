@@ -1,6 +1,6 @@
-//! Validator metric names + helpers. Mirrors the lightweight style of the other
-//! services: thin wrappers over the `metrics` facade so the call sites stay
-//! readable and the names live in one place.
+//! Validator metric names and helpers. This mirrors the lightweight style
+//! of the other services: thin wrappers over the `metrics` facade, so the
+//! call sites stay readable and the names live in one place.
 
 pub const DIVERGENCE_TOTAL: &str = "validator_divergence_total";
 pub const BLOCKS_VERIFIED_TOTAL: &str = "validator_blocks_verified_total";
@@ -10,15 +10,15 @@ pub const COMMITTED_BLOCK: &str = "validator_committed_block";
 pub const STATE_ROOT_BLOCK: &str = "validator_state_root_block";
 /// Epochs whose deposits were re-derived from L1 and matched.
 pub const EPOCHS_VERIFIED_TOTAL: &str = "validator_epochs_verified_total";
-/// Epochs that FAILED verification — a chain fault, always paired with a
-/// divergence.
+/// Epochs that failed verification. This is a chain fault, always paired
+/// with a divergence.
 pub const EPOCH_FAULTS_TOTAL: &str = "validator_epoch_faults_total";
-/// Epochs skipped because L1 was unreachable. NOT a fault: an RPC outage must
-/// not read as a divergence. Sustained non-zero means verification coverage
-/// has holes.
+/// Epochs skipped because L1 was unreachable. Not a fault: an RPC outage
+/// must not read as a divergence. A sustained non-zero rate means
+/// verification coverage has holes.
 pub const EPOCHS_UNVERIFIED_TOTAL: &str = "validator_epochs_unverified_total";
 
-/// Register metric descriptions. Call once at startup (after `kardamom_obs::init`).
+/// Register metric descriptions. Call once at startup, after `kardamom_obs::init`.
 pub fn describe() {
     metrics::describe_counter!(
         DIVERGENCE_TOTAL,
@@ -48,18 +48,18 @@ pub fn describe() {
 pub const RESYNC_TOTAL: &str = "validator_resync_total";
 pub const BAL_SUB_REOPEN_TOTAL: &str = "validator_bal_sub_reopen_total";
 
-/// Replay-window-overrun resync outcomes (#143), labeled
-/// `outcome=peer-checkpoint|unrecoverable` — the validator twin of
+/// Replay-window-overrun resync outcomes, labeled
+/// `outcome=peer-checkpoint|unrecoverable`. This is the validator twin of
 /// `kardamom_executor_resync_total`. Any `peer-checkpoint` increment also
-/// means blocks through the adopted checkpoint are UNVERIFIED by this
-/// validator (same trust class as #78 catch-up).
+/// means blocks through the adopted checkpoint are unverified by this
+/// validator.
 pub fn resync_counter(outcome: &'static str) -> metrics::Counter {
     metrics::counter!(RESYNC_TOTAL, "outcome" => outcome)
 }
 
-/// tx_bal subscription reopened after prolonged silence (#144) — a never-
-/// joined or silently-dead multicast image self-healing. Sustained growth
-/// means BAL delivery to this node is genuinely broken.
+/// The tx_bal subscription reopened after prolonged silence. This is a
+/// never-joined or silently-dead multicast image healing itself.
+/// Sustained growth means BAL delivery to this node is genuinely broken.
 pub fn counter_bal_sub_reopen() {
     metrics::counter!(BAL_SUB_REOPEN_TOTAL).increment(1);
 }
@@ -80,21 +80,22 @@ pub fn counter_epoch_unverified() {
     metrics::counter!(EPOCHS_UNVERIFIED_TOTAL).increment(1);
 }
 
-/// Blocks re-executed as seeded parallel batches (label: batch count).
+/// Blocks re-executed as seeded parallel batches. The label is the batch count.
 pub fn counter_parallel_block(batches: usize) {
     metrics::counter!("kardamom_validator_parallel_blocks_total").increment(1);
     metrics::histogram!("kardamom_validator_parallel_batches").record(batches as f64);
 }
 
-/// Blocks that fell back to sequential re-execution (claims absent/deposits).
+/// Blocks that fell back to sequential re-execution: claims absent, or deposits.
 pub fn counter_parallel_fallback() {
     metrics::counter!("kardamom_validator_parallel_fallback_total").increment(1);
 }
 
 /// Pool workers that could not mint an independent snapshot fork
-/// (`StateDatabase::fork_view` refused — writer advanced mid-mint) and fell
-/// back to sharing the strategy's snapshot. Correct but serialized; a
-/// sustained non-zero rate means the mdbx read-parallelism fix is off.
+/// (`StateDatabase::fork_view` refused because the writer advanced
+/// mid-mint) and fell back to sharing the strategy's snapshot. This is
+/// correct but serialized. A sustained non-zero rate means the mdbx
+/// read-parallelism fix is off.
 pub fn counter_fork_fallback(workers: u64) {
     metrics::counter!("kardamom_validator_snapshot_fork_fallback_total").increment(workers);
 }
@@ -116,16 +117,16 @@ pub fn set_committed_block(block: u64) {
     metrics::gauge!(COMMITTED_BLOCK).set(block as f64);
 }
 
-/// Record that `block`'s MPT state root was actually observed on the committed
-/// snapshot. Kept separate from [`set_committed_block`] so the "state root
-/// advancing" signal is a real measurement rather than a mirror of the
-/// committed-block gauge.
+/// Record that `block`'s MPT state root was actually observed on the
+/// committed snapshot. This is kept separate from [`set_committed_block`],
+/// so the "state root advancing" signal is a real measurement, not a
+/// mirror of the committed-block gauge.
 pub fn set_state_root_block(block: u64) {
     metrics::gauge!(STATE_ROOT_BLOCK).set(block as f64);
 }
 
-/// Prover-spool outcomes (spec 3c): frames written, blocks dropped
-/// (pre-state window missed / records aged out), assembly failures.
+/// Prover-spool outcomes (spec 3c): frames written, blocks dropped (the
+/// pre-state window was missed, or records aged out), assembly failures.
 pub fn counter_prover_spooled() {
     metrics::counter!("validator_prover_frames_spooled_total").increment(1);
 }

@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# sign-manifest.sh — keyless-sign the COMPLETED digest manifest (P0.5).
+# sign-manifest.sh — signs the completed digest manifest with keyless signing.
 # =============================================================================
-# Thin executable wrapper over lib-signing.sh's sign_digest_manifest for
-# callers that cannot source bash libs (the Makefile `images` target). Run it
-# ONCE, after the last push-image.sh of a build: the manifest blob signature
-# covers the whole manifest, and a bundle over a half-written one would
-# verify and still lie.
+# This is a thin wrapper over lib-signing.sh's sign_digest_manifest function.
+# Use it when a caller cannot source bash libraries, such as the Makefile
+# `images` target. Run it once, after the last push-image.sh of a build. The
+# manifest signature covers the whole manifest. A signature over a
+# half-written manifest would still verify, but it would lie about the
+# content.
 #
-# In CI with OIDC (ACTIONS_ID_TOKEN_REQUEST_URL set): cosign sign-blob --yes,
-# keyless, logged to the PUBLIC Rekor; the offline-verifiable bundle lands at
-# <manifest>.sigbundle. Outside CI: skipped with a log line (local deploys
-# are a documented dev affordance).
+# In CI with OIDC (the ACTIONS_ID_TOKEN_REQUEST_URL variable set), the script
+# runs `cosign sign-blob --yes`. This does keyless signing and logs to the
+# public Rekor log. The offline-verifiable bundle lands at
+# <manifest>.sigbundle. Outside CI, the script skips signing and logs a
+# message. Local deploys without signing are a supported case for developers.
 #
 # Usage: sign-manifest.sh <manifest>
 set -euo pipefail
