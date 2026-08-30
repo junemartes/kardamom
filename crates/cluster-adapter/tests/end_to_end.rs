@@ -14,8 +14,8 @@ use std::collections::{HashSet, VecDeque};
 use alloy_primitives::{Address, B256};
 use kardamom_cluster_adapter::gateway::fakes::{FakeEgress, FakeIngress};
 use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record, split_ingress};
-use kardamom_executor::reader::TxOrderingSubscription;
-use kardamom_executor::reader::cluster::ClusterTxOrderingSubscription;
+use kardamom_engine::reader::TxOrderingSubscription;
+use kardamom_engine::reader::cluster::ClusterTxOrderingSubscription;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::outbound::cluster::ClusterRefPublisher;
 use kardamom_types::{BPosition, TxOrderingMessage, TxRef};
@@ -146,6 +146,6 @@ fn closed_stream_surfaces_as_clean_eof() {
     let mut sub = ClusterTxOrderingSubscription::new(egress);
     assert!(matches!(
         sub.next(),
-        Err(kardamom_executor::ExecutorError::TxOrderingClosed)
+        Err(kardamom_engine::ExecutorError::TxOrderingClosed)
     ));
 }

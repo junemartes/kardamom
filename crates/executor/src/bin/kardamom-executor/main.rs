@@ -28,10 +28,11 @@ mod wiring;
 use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_engine::bin_support;
-use kardamom_executor::{
-    Executor, ExecutorConfig, ExecutorError, ExecutorFileConfig, Inbound, MdbxSnapshotSource,
-    MdbxWriterQueue, MdbxWriterSignal, Outbound, RoleHooks,
+use kardamom_engine::{
+    Executor, ExecutorConfig, ExecutorError, Inbound, MdbxSnapshotSource, MdbxWriterQueue,
+    MdbxWriterSignal, Outbound, RoleHooks,
 };
+use kardamom_executor::ExecutorFileConfig;
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::LogConfig;
 use kardamom_state::{StateWriter, seed_genesis};
@@ -44,7 +45,7 @@ async fn main() -> Result<()> {
     bin_support::init_tracing();
     let args = Args::parse();
     kardamom_obs::init_service!("executor", args.metrics_addr, &args.host_id).await?;
-    kardamom_executor::metrics::describe();
+    kardamom_engine::metrics::describe();
     // The TOML supplies the optional `[cluster]` section (default disabled);
     // all other runtime tuning still comes from the CLI flags above. An empty
     // / comment-only file (the existing deployment shape) deserializes to a
@@ -292,7 +293,7 @@ async fn main() -> Result<()> {
         expected_genesis,
         false,
     )? {
-        metrics::counter!(kardamom_executor::metrics::RESYNC_TOTAL, "outcome" => outcome)
+        metrics::counter!(kardamom_engine::metrics::RESYNC_TOTAL, "outcome" => outcome)
             .increment(1);
     }
     // Non-zero exits so the orchestrator can tell a failed recovery / dead
