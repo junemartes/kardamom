@@ -29,17 +29,21 @@ async fn each_tx_lands_on_keccak_partition() {
 
         // Fake executor — one task per partition, satisfies receipt +
         // watermark immediately.
+        // One shared monotone position space across partitions — receipts
+        // carry positions from the sealer's single tx_ordering stream. See
+        // the same note in end_to_end_test.rs: per-partition `term_id`s let
+        // the quorum watermark regress and strand parked receipts.
+        let next_pos = Arc::new(std::sync::atomic::AtomicI32::new(0));
         let mut spawns = Vec::new();
-        for (i, mut rx) in rx_vec.drain(..).enumerate() {
+        for mut rx in rx_vec.drain(..) {
             let receipt_bus = mock.receipt_bus.clone();
             let watermark_bus = mock.watermark_bus.clone();
+            let next_pos = next_pos.clone();
             spawns.push(tokio::spawn(async move {
-                let mut local_idx: i32 = 0;
                 while let Some(envelope) = rx.recv().await {
-                    local_idx += 1;
                     let pos = BPosition {
-                        term_id: i as i32,
-                        term_offset: local_idx,
+                        term_id: 0,
+                        term_offset: next_pos.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
                     };
                     let nonce = extract_nonce(&envelope.raw_tx);
                     let receipt = Receipt {

@@ -35,17 +35,24 @@ async fn one_hundred_txs_route_and_receive_receipts() {
 
     // Fake executor — drains each partition, immediately satisfies
     // receipt + watermark.
+    // Every receipt's `tx_idx` is a position in the sealer's SINGLE
+    // tx_ordering stream (see crates/log/src/watermark.rs: one archive
+    // recording, one durable watermark), so all partitions share one
+    // monotone position space. Giving each partition its own `term_id`
+    // instead lets the quorum watermark move BACKWARDS — `BPosition` is
+    // ordered `(term_id, term_offset)` — and any receipt parked above
+    // where the last watermark happens to land is never released.
+    let next_pos = Arc::new(std::sync::atomic::AtomicI32::new(0));
     let mut handles = Vec::new();
-    for (i, mut rx) in partition_rx.drain(..).enumerate() {
+    for mut rx in partition_rx.drain(..) {
         let receipt_bus = mock.receipt_bus.clone();
         let watermark_bus = mock.watermark_bus.clone();
+        let next_pos = next_pos.clone();
         handles.push(tokio::spawn(async move {
-            let mut local_idx: i32 = 0;
             while let Some(envelope) = rx.recv().await {
-                local_idx += 1;
                 let pos = BPosition {
-                    term_id: i as i32,
-                    term_offset: local_idx,
+                    term_id: 0,
+                    term_offset: next_pos.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
                 };
                 let nonce = nonce_of(&envelope.raw_tx);
                 let receipt = Receipt {

@@ -36,6 +36,17 @@ variable "cluster_snapshot_interval_s" {
   default = "300"
 }
 
+# Digest-pinned image (attested-identity P0.1): scripts/deploy.sh passes the
+# repo:tag@sha256:... reference captured at push time (deploy/cluster/
+# images.digests). The empty default falls back to the mutable :dev tag in
+# the task config — a dev affordance for manual `nomad job run` during
+# debugging, NOT a production path.
+variable "image_ref" {
+  type        = string
+  description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
+  default     = ""
+}
+
 # Pure JVM image (cluster.Dockerfile launches io.kardamom.sealer.cluster.ClusterNode).
 
 job "cluster" {
@@ -96,11 +107,17 @@ job "cluster" {
       }
 
       config {
-        image = "192.168.56.10:5000/kardamom-cluster:dev"
-        # Always pull the freshly-built image: the mutable :dev tag would otherwise
-        # let Nomad reuse a stale node-cached layer across rebuilds (caused a
-        # crash-retry storm that stalled the deploy).
-        force_pull   = true
+        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-cluster:dev"
+        # force_pull kept for both paths (see the ingress job's comment):
+        # the :dev fallback needs it; on the pinned path the 1.9.5 driver
+        # pulls the tag but resolves the image by digest, so the pin holds.
+        force_pull = true
+        # NO readonly_rootfs here (attested-identity P0.3, deliberately
+        # skipped): this is a JVM task, and the JVM writes into the rootfs
+        # outside the bind mounts — /tmp (hsperfdata, JVM temp files) at
+        # minimum. Turning it on needs a tmpfs mount for /tmp validated by a
+        # full cluster-e2e pass first; a wrong guess here wedges the Raft
+        # sealer, which is the whole pipeline.
         network_mode = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",

@@ -28,9 +28,17 @@ job "anvil" {
       driver = "docker"
 
       config {
-        # Pinned release tag; the foundry image also publishes :latest/:nightly
-        # but an unpinned tag is a "works on my laptop" bug waiting to happen.
-        image        = "ghcr.io/foundry-rs/foundry:v1.5.0"
+        # Pinned release tag AND content digest (attested-identity P0.1): the
+        # tag alone is mutable upstream — ghcr.io lets the publisher re-point
+        # it — while the digest names immutable bytes. The digest is the
+        # multi-arch index digest of foundry-rs/foundry:v1.5.0, resolved from
+        # ghcr.io at pin time; the tag stays in the ref for readability only
+        # (docker pulls by the digest when both are present).
+        image = "ghcr.io/foundry-rs/foundry:v1.5.0@sha256:2a4c7c28807504292da7f76a069dae6d027e7993e9b274f6bf01eb41b0f4bdc6"
+        # NO readonly_rootfs (attested-identity P0.3, deliberately skipped):
+        # upstream image, not a kardamom build; anvil keeps its chain state in
+        # the container filesystem (no bind mounts here), so a read-only root
+        # would break it outright.
         network_mode = "host"
         # The foundry image's ENTRYPOINT is ["/bin/sh", "-c"], which would eat
         # a command+args list (sh -c "anvil" "--host" ... runs anvil with NO

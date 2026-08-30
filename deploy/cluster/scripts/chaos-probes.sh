@@ -122,6 +122,28 @@ val_metric() { # <metric-name> -> integer (empty on scrape failure)
   prom_value "${body}" "$1" first
 }
 
+# D-2 companion to val_metric: REQUIRED scrape. val_metric's empty-on-failure
+# contract is right for progress polling, but "divergence == 0" style asserts
+# were reading a failed scrape as 0 — the assert passed exactly when the
+# validator was too wedged to answer. Retries, then fails the case loudly.
+val_metric_req() { # <metric-name> <why>
+  local v i
+  for i in 1 2 3 4 5; do
+    v="$(val_metric "$1")"
+    [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+    # Absent metric vs dead exporter: metrics-rs counters are not exported
+    # until first incremented, so a healthy zero-divergence validator has NO
+    # divergence_total line at all. If the always-present canary scrapes,
+    # the exporter is alive and the absent counter genuinely IS 0.
+    if [ -n "$(val_metric validator_committed_block)" ]; then
+      printf '0'
+      return 0
+    fi
+    sleep 3
+  done
+  fail "validator exporter unscrapeable after 5 tries — refusing to treat a dead exporter as 0 ($2)"
+}
+
 # --- sequencer shard-0 replica probes ----------------------------------------
 
 seqa_metric() { # <metric-name> -> integer sum across label lines (empty on scrape failure)
