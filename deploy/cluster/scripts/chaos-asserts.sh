@@ -28,9 +28,13 @@ inject_graceful() { # <job>
 }
 
 inject_graceful_group() { # <job> <task-group>
+  # The `|| true` is load-bearing (same doctrine as val_metric): under
+  # `set -eo pipefail` a non-zero docker exec turns this assignment into a
+  # SILENT exit with no CHAOS FAIL line. awk reads to EOF on purpose — an
+  # early `exit` closes the pipe under the writer and fails it with EPIPE.
   local alloc
   alloc="$(on_control 'nomad job allocs -t "{{range .}}{{.ID}} {{.TaskGroup}} {{.ClientStatus}}{{\"\n\"}}{{end}}" "$1"' "$1" 2>/dev/null \
-    | awk -v g="$2" '$2==g && $3=="running"{print $1; exit}')"
+    | awk -v g="$2" '$2==g && $3=="running" && !found {found=$1} END {if (found) print found}' || true)"
   [ -n "${alloc}" ] || fail "no running $2 alloc to stop for job $1"
   log "graceful: nomad alloc stop ${alloc} (job $1, group $2)"
   on_control 'nomad alloc stop "$1"' "${alloc}" >/dev/null
