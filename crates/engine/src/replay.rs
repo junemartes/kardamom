@@ -22,7 +22,7 @@
 use alloy_primitives::B256;
 use kardamom_state::{StateEnv, StateWriter, TrieMode, seed_genesis};
 use kardamom_types::{
-    AccountChange, BPosition, BlockBoundary, CodeEntry, SnapshotSource, TxEnvelope,
+    AccountChange, BPosition, BlockBoundary, CodeEntry, SnapshotSource, StateDatabase, TxEnvelope,
 };
 
 use crate::actor::{StateWriterQueue, StateWriterSignal};
@@ -210,6 +210,25 @@ where
             counters.global_pos += 1;
             counters.txs_applied += 1;
         }
+
+        // Same block-close protocol actions the live engine runs, through the
+        // same shared implementation — a reconstructor that skipped them would
+        // rebuild a chain whose state diverges from the canonical one the
+        // moment any feature is active. Replay commits one block at a time
+        // against its own committed snapshot, so there is no parent layer to
+        // consult: `delta` then snapshot.
+        kardamom_exec_core::features::apply_block_close_actions(
+            &mut delta,
+            block.block_number,
+            block.l2_timestamp,
+            |addr, slot| {
+                snapshot.storage(addr, slot).map_err(|e| {
+                    crate::error::ExecutorError::State(format!(
+                        "block-close read {addr}/{slot}: {e:?}"
+                    ))
+                })
+            },
+        )?;
 
         let block_delta = delta.finalize(block.block_number, block_receipts);
         let boundary = BlockBoundary {
