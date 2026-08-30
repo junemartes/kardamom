@@ -27,6 +27,7 @@ pub mod delta;
 pub mod error;
 pub mod exec_types;
 pub mod executor;
+pub mod features;
 #[cfg(feature = "std")]
 pub mod metrics;
 #[cfg(feature = "std")]

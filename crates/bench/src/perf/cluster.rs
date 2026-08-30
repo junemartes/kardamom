@@ -86,6 +86,16 @@ done"#
     Ok(())
 }
 
+/// True when the cluster's control node container exists (running or not) —
+/// the discriminator between "redeploy over an existing cluster" (purge
+/// first) and "the cluster is gone" (a torn-down host, e.g. after another
+/// session's teardown): purging a missing cluster used to fail the whole
+/// `up` with "No such container: kardamom-control-0" even though
+/// ci-cluster.sh handles from-scratch creation fine.
+fn cluster_exists() -> bool {
+    sh("docker", &["inspect", "kardamom-control-0"]).is_ok()
+}
+
 /// Bring the stack up fresh: `local-cluster.sh build` (reproducible builder +
 /// orchestrator image), then `ci-cluster.sh` from a fresh orchestrator with
 /// KEEP=1 and the load/chaos stages skipped. Blocks until the deploy's smoke
@@ -114,7 +124,13 @@ pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
             ],
         )?;
     }
-    purge()?;
+    if cluster_exists() {
+        purge()?;
+    } else {
+        println!(
+            "==> no existing cluster (control-0 absent); skipping purge, ci-cluster.sh creates from scratch"
+        );
+    }
 
     println!("==> deploying fresh cluster (ci-cluster.sh, KEEP=1, no load/chaos stages)");
     let _ = sh("docker", &["rm", "-f", "kardamom-orch"]);

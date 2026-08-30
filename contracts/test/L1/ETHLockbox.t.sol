@@ -279,7 +279,7 @@ contract ETHLockboxTest is Test {
     // ---------------------------------------------------------------------
 
     /// Must match KardamomUUPSBase.FACTORY.
-    address constant FACTORY = 0xED26EF4bE626a43Ea01074435D80fC48Dc5040cD;
+    address constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
 
     function test_initializeV2_sets_oracle_factory_only() public {
         // A lockbox deployed deposit-only (zero oracle) — the pre-V2 fleet.
@@ -307,6 +307,86 @@ contract ETHLockboxTest is Test {
         vm.prank(FACTORY);
         vm.expectRevert();
         depositOnly.initializeV2(address(0xDEAD));
+    }
+
+    // ---------------------------------------------------------------------
+    // Upgrade transactions (L1-governed L2 feature flags)
+    // ---------------------------------------------------------------------
+
+    address constant UPGRADE_OWNER = address(0xA11CE);
+
+    event UpgradeInitiated(
+        uint64 indexed upgradeNonce, uint256 indexed featureId, uint64 activationTimestamp
+    );
+
+    /// Point `FACTORY.owner()` at `UPGRADE_OWNER`. The real factory is
+    /// `Ownable2StepUpgradeable`; the lockbox only ever reads `owner()`.
+    function _mockFactoryOwner() internal {
+        vm.mockCall(FACTORY, abi.encodeWithSignature("owner()"), abi.encode(UPGRADE_OWNER));
+    }
+
+    function test_initiateUpgrade_emits_for_the_factory_owner() public {
+        _mockFactoryOwner();
+
+        vm.expectEmit(true, true, true, true, address(lockbox));
+        emit UpgradeInitiated(1, 7, 1_700_000_000_250);
+
+        vm.prank(UPGRADE_OWNER);
+        lockbox.initiateUpgrade(7, 1_700_000_000_250);
+
+        assertEq(lockbox.upgradeNonce(), 1);
+    }
+
+    function test_initiateUpgrade_rejects_a_stranger() public {
+        _mockFactoryOwner();
+
+        vm.expectRevert(ETHLockbox.NotUpgradeAuthority.selector);
+        vm.prank(address(0xBAD));
+        lockbox.initiateUpgrade(1, 0);
+
+        // A rejected attempt must not consume a nonce — the nonce indexes the
+        // authorized instruction series operators reason about.
+        assertEq(lockbox.upgradeNonce(), 0);
+    }
+
+    /// The authority is the factory owner *at call time*, so rotating factory
+    /// ownership rotates who may upgrade the chain. One root of trust.
+    function test_initiateUpgrade_follows_factory_ownership() public {
+        _mockFactoryOwner();
+        vm.prank(UPGRADE_OWNER);
+        lockbox.initiateUpgrade(1, 0);
+
+        address rotated = address(0xB0B);
+        vm.mockCall(FACTORY, abi.encodeWithSignature("owner()"), abi.encode(rotated));
+
+        vm.expectRevert(ETHLockbox.NotUpgradeAuthority.selector);
+        vm.prank(UPGRADE_OWNER);
+        lockbox.initiateUpgrade(2, 0);
+
+        vm.prank(rotated);
+        lockbox.initiateUpgrade(2, 0);
+        assertEq(lockbox.upgradeNonce(), 2);
+    }
+
+    function test_initiateUpgrade_nonce_is_monotonic() public {
+        _mockFactoryOwner();
+        vm.startPrank(UPGRADE_OWNER);
+        for (uint64 i = 1; i <= 3; i++) {
+            lockbox.initiateUpgrade(i, 0);
+            assertEq(lockbox.upgradeNonce(), i);
+        }
+        vm.stopPrank();
+    }
+
+    /// An immediate upgrade (activation 0) must be expressible: unlike
+    /// `depositETH`, an upgrade carries no value and must not be forced to.
+    function test_initiateUpgrade_takes_no_value_and_allows_zero_activation() public {
+        _mockFactoryOwner();
+        vm.expectEmit(true, true, true, true, address(lockbox));
+        emit UpgradeInitiated(1, 1, 0);
+        vm.prank(UPGRADE_OWNER);
+        lockbox.initiateUpgrade(1, 0);
+        assertEq(address(lockbox).balance, 0);
     }
 
     function test_unauthorized_upgrade_reverts() public {

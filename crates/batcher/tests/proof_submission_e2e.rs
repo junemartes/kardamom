@@ -113,7 +113,10 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
                     settlement_addr,
                     *verifier.address(),
                     VKEY,
+                    VKEY, // block vkey (mock verifier ignores both)
                     GENESIS_ROOT,
+                    0, // window 0: validity-mode e2e finalizes by proof
+                    U256::ZERO,
                 ),
             }],
             DEV_OWNER,
@@ -223,7 +226,7 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
     assert_eq!(out, SubmitOutcome::Submitted { batch_index: 1 });
     let oracle = IKardamomProofOracle::new(oracle_addr, provider.clone());
     assert_eq!(oracle.stateRoot().call().await.unwrap(), POST_ROOT);
-    assert_eq!(oracle.lastProvenBatch().call().await.unwrap(), 1);
+    assert_eq!(oracle.lastFinalizedBatch().call().await.unwrap(), 1);
 
     // Idempotence at the cursor: batch 2 not posted → NoBatchPosted.
     let out = submit_next_proof(provider.clone(), oracle_addr, proofs_dir.path())

@@ -11,15 +11,20 @@
 //!
 //! Contents:
 //!
-//!   * [`source_hash`] — keccak over `(domain || keccak(rlp[l1_block_hash,
-//!     l1_log_index]))`. Domain 0 = user deposit. The canonical id used by
-//!     downstream consumers to dedup deposits.
+//!   * [`source_hash`] / [`source_hash_system`] — keccak over `(domain ||
+//!     keccak(rlp[l1_block_hash, l1_log_index]))`. Domain 0 = user deposit,
+//!     domain 1 = system tx. The canonical id used by downstream consumers to
+//!     dedup deposits.
 //!   * [`alias_l1_address`] — `L1 + 0x1111...1111` mod 2^160. Avoids
 //!     collisions between L1 contracts and L2 contracts at the same address.
 //!     EOAs round-trip harmlessly (their L2 alias is just a different EOA
 //!     address).
 //!   * [`DepositLog`] — the decoded shape of one `DepositInitiated` L1 log.
-//!   * [`deposit_from_log`] / [`derive_epoch`] — log(s) → [`Deposit`](crate::Deposit)s.
+//!   * [`UpgradeLog`] — the decoded shape of one `UpgradeInitiated` L1 log (an
+//!     **upgrade transaction**), and [`LockboxLog`], the union the watcher
+//!     reads off the single lockbox address.
+//!   * [`deposit_from_log`] / [`upgrade_from_log`] / [`derive_epoch`] —
+//!     log(s) → [`Deposit`](crate::Deposit)s.
 //!   * [`EpochRecord`] — an epoch as it travels on the canonical stream.
 //!
 //! Ported verbatim from PR #10's `crates/node/src/deposit.rs`; the
@@ -36,21 +41,41 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::deposit::Deposit;
 use crate::wire;
 
+/// Source-hash domain for an ordinary user deposit (`ETHLockbox.depositETH`).
+pub const DOMAIN_USER_DEPOSIT: u64 = 0;
+
+/// Source-hash domain for a **system transaction** — today, the upgrade
+/// transaction (`ETHLockbox.initiateUpgrade`).
+///
+/// Domain separation is what keeps a system deposit's id disjoint from a user
+/// deposit's even when both are derived from the same `(block_hash, log_index)`
+/// position, which is exactly what the downstream first-seen dedup keys on.
+pub const DOMAIN_SYSTEM_TX: u64 = 1;
+
 /// Compute the OP-style source hash for a user deposit:
 ///
 /// ```text
 ///   deposit_id_hash = keccak256(rlp([l1_block_hash, l1_log_index]))
 ///   source_hash     = keccak256(rlp([domain = 0u64, deposit_id_hash]))
 /// ```
-///
-/// Domain 0 = user deposit; domain 1 (reserved) = L1-attributes / system tx.
 pub fn source_hash(l1_block_hash: B256, l1_log_index: u64) -> B256 {
+    source_hash_in_domain(DOMAIN_USER_DEPOSIT, l1_block_hash, l1_log_index)
+}
+
+/// Source hash for a system transaction — same construction as [`source_hash`]
+/// under [`DOMAIN_SYSTEM_TX`].
+pub fn source_hash_system(l1_block_hash: B256, l1_log_index: u64) -> B256 {
+    source_hash_in_domain(DOMAIN_SYSTEM_TX, l1_block_hash, l1_log_index)
+}
+
+/// The shared construction behind both domains. One body so a change to the
+/// hashing scheme cannot apply to user deposits and system txs unevenly.
+fn source_hash_in_domain(domain: u64, l1_block_hash: B256, l1_log_index: u64) -> B256 {
     let inner = encode_list_two(&l1_block_hash, &l1_log_index);
     let deposit_id_hash = keccak256(&inner);
 
     // domain = 0u64 encodes as RLP 0x80 (canonical empty-string form for
-    // integer zero).
-    let domain: u64 = 0;
+    // integer zero); domain = 1u64 encodes as the single byte 0x01.
     let outer = encode_list_two(&domain, &deposit_id_hash);
     keccak256(&outer)
 }
@@ -122,6 +147,82 @@ pub struct DepositLog {
     pub data: AlloyBytes,
 }
 
+/// One decoded `UpgradeInitiated` L1 log — the **upgrade transaction**.
+///
+/// Emitted by `ETHLockbox.initiateUpgrade`, which is gated to the L1 factory
+/// owner, so merely being in this list means the instruction was authorized on
+/// L1. Derivation reproduces it verbatim; it never re-checks the authority,
+/// because L1 already did and every node sees the same finalized logs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeLog {
+    /// Number of the L1 block this log was emitted in.
+    pub block_number: u64,
+    /// Hash of the L1 block this log was emitted in. Feeds `source_hash`.
+    pub block_hash: B256,
+    /// Position of this log within the L1 block. Feeds `source_hash`, and is
+    /// the ORDERING key within an epoch — shared with deposits, since both
+    /// kinds come from the same contract and interleave in one log stream.
+    pub log_index: u64,
+    /// The feature flag to schedule.
+    pub feature_id: U256,
+    /// Activation time in epoch-**milliseconds** (this chain's block-timestamp
+    /// unit); `0` means "activate immediately", resolved on L2 to the
+    /// activating block's timestamp.
+    pub activation_timestamp: u64,
+}
+
+/// A decoded log from the lockbox — the one L1 contract the watcher reads.
+///
+/// Both variants derive into a [`Deposit`]; they differ in the source-hash
+/// domain, the sender, and whether `is_system_transaction` is set. Keeping them
+/// in one ordered list is what makes deposits and upgrades interleave by L1 log
+/// index, so an upgrade cannot jump ahead of a deposit that L1 ordered first.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LockboxLog {
+    /// `DepositInitiated` — a user bridging ETH.
+    Deposit(DepositLog),
+    /// `UpgradeInitiated` — an authorized upgrade transaction.
+    Upgrade(UpgradeLog),
+}
+
+impl LockboxLog {
+    /// Number of the L1 block this log was emitted in.
+    pub fn block_number(&self) -> u64 {
+        match self {
+            Self::Deposit(l) => l.block_number,
+            Self::Upgrade(l) => l.block_number,
+        }
+    }
+
+    /// Hash of the L1 block this log was emitted in.
+    pub fn block_hash(&self) -> B256 {
+        match self {
+            Self::Deposit(l) => l.block_hash,
+            Self::Upgrade(l) => l.block_hash,
+        }
+    }
+
+    /// Position of this log within its L1 block — the epoch ordering key.
+    pub fn log_index(&self) -> u64 {
+        match self {
+            Self::Deposit(l) => l.log_index,
+            Self::Upgrade(l) => l.log_index,
+        }
+    }
+}
+
+impl From<DepositLog> for LockboxLog {
+    fn from(l: DepositLog) -> Self {
+        Self::Deposit(l)
+    }
+}
+
+impl From<UpgradeLog> for LockboxLog {
+    fn from(l: UpgradeLog) -> Self {
+        Self::Upgrade(l)
+    }
+}
+
 /// One L1 epoch's contribution to the L2 chain, as it travels on the
 /// canonical stream.
 ///
@@ -176,42 +277,84 @@ pub fn deposit_from_log(log: &DepositLog) -> Deposit {
     }
 }
 
-/// THE derivation rule: L1 block `(l1_number, l1_hash)` plus its
-/// `DepositInitiated` logs → the epoch the L2 chain must contain.
+/// Build the L2 system deposit for one L1 upgrade log.
 ///
-/// Deposits are ordered by **log index**, which is also what `source_hash`
+/// Deliberately unlike [`deposit_from_log`] in three ways, each load-bearing:
+///
+///  * the sender is the fixed [`SYSTEM_UPGRADER`](crate::upgrades::SYSTEM_UPGRADER)
+///    and is **not** aliased — aliasing exists to keep L1 senders from colliding
+///    with L2 addresses, whereas this sender is *defined* on L2 and is the thing
+///    the predeploy authorizes against;
+///  * `mint`/`value` are zero: an upgrade moves no ETH (and the lockbox's
+///    `initiateUpgrade` is not payable, so there is none to move);
+///  * `is_system_transaction` is set — the first real use of the field, which
+///    the wire type has carried as `false` since v0.
+pub fn upgrade_from_log(log: &UpgradeLog) -> Deposit {
+    Deposit {
+        source_hash: source_hash_system(log.block_hash, log.log_index),
+        from: crate::upgrades::SYSTEM_UPGRADER,
+        to: Some(crate::upgrades::CHAIN_STATE),
+        mint: 0,
+        value: U256::ZERO,
+        gas_limit: crate::upgrades::UPGRADE_TX_GAS_LIMIT,
+        is_system_transaction: true,
+        input: Bytes::copy_from_slice(
+            crate::upgrades::encode_set_feature(log.feature_id, log.activation_timestamp).as_ref(),
+        ),
+    }
+}
+
+/// Build the L2 deposit for one lockbox log, whichever kind it is.
+pub fn deposit_from_lockbox_log(log: &LockboxLog) -> Deposit {
+    match log {
+        LockboxLog::Deposit(l) => deposit_from_log(l),
+        LockboxLog::Upgrade(l) => upgrade_from_log(l),
+    }
+}
+
+/// THE derivation rule: L1 block `(l1_number, l1_hash)` plus its lockbox logs
+/// (`DepositInitiated` **and** `UpgradeInitiated`) → the epoch the L2 chain
+/// must contain.
+///
+/// Entries are ordered by **log index**, which is also what `source_hash`
 /// commits to, so the order is a property of L1 rather than of whoever
 /// happened to read it. `logs` may arrive in any order; callers need not
 /// pre-sort. Logs from a different block than `l1_hash` are a programming
 /// error and are rejected rather than silently mixed in.
+///
+/// Both log kinds share one index space because they are emitted by one
+/// contract: an upgrade and a deposit in the same L1 block land in the L2 block
+/// in the order L1 put them in, and `DuplicateLogIndex` catches a caller that
+/// merged two log sets incorrectly — including one that fetched deposits and
+/// upgrades in separate queries and double-counted a position.
 pub fn derive_epoch(
     l1_number: u64,
     l1_hash: B256,
-    logs: &[DepositLog],
+    logs: &[LockboxLog],
 ) -> Result<EpochRecord, EpochError> {
-    let mut ordered: Vec<&DepositLog> = Vec::with_capacity(logs.len());
+    let mut ordered: Vec<&LockboxLog> = Vec::with_capacity(logs.len());
     for log in logs {
-        if log.block_hash != l1_hash {
+        if log.block_hash() != l1_hash {
             return Err(EpochError::ForeignLog {
                 expected: l1_hash,
-                found: log.block_hash,
+                found: log.block_hash(),
             });
         }
         ordered.push(log);
     }
-    ordered.sort_by_key(|l| l.log_index);
+    ordered.sort_by_key(|l| l.log_index());
     if let Some(dup) = ordered
         .windows(2)
-        .find(|w| w[0].log_index == w[1].log_index)
+        .find(|w| w[0].log_index() == w[1].log_index())
     {
         return Err(EpochError::DuplicateLogIndex {
-            log_index: dup[0].log_index,
+            log_index: dup[0].log_index(),
         });
     }
     Ok(EpochRecord {
         l1_number,
         l1_hash,
-        deposits: ordered.into_iter().map(deposit_from_log).collect(),
+        deposits: ordered.into_iter().map(deposit_from_lockbox_log).collect(),
     })
 }
 
@@ -262,7 +405,7 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    fn log(block: B256, index: u64, to_byte: u8, mint: u128) -> DepositLog {
+    fn deposit_log(block: B256, index: u64, to_byte: u8, mint: u128) -> DepositLog {
         DepositLog {
             block_number: 0,
             block_hash: block,
@@ -273,6 +416,20 @@ mod tests {
             gas_limit: 200_000,
             data: AlloyBytes::new(),
         }
+    }
+
+    fn log(block: B256, index: u64, to_byte: u8, mint: u128) -> LockboxLog {
+        LockboxLog::Deposit(deposit_log(block, index, to_byte, mint))
+    }
+
+    fn upgrade_log(block: B256, index: u64, feature: u64, activation: u64) -> LockboxLog {
+        LockboxLog::Upgrade(UpgradeLog {
+            block_number: 0,
+            block_hash: block,
+            log_index: index,
+            feature_id: U256::from(feature),
+            activation_timestamp: activation,
+        })
     }
 
     #[test]
@@ -346,8 +503,8 @@ mod tests {
     #[test]
     fn deposits_carry_aliased_sender_and_derived_source_hash() {
         let block = B256::repeat_byte(0x66);
-        let l = log(block, 4, 7, 100);
-        let d = &derive_epoch(3, block, std::slice::from_ref(&l))
+        let l = deposit_log(block, 4, 7, 100);
+        let d = &derive_epoch(3, block, &[l.clone().into()])
             .unwrap()
             .deposits[0];
         assert_eq!(d.source_hash, source_hash(block, 4));
@@ -355,6 +512,154 @@ mod tests {
         assert_eq!(d.to, Some(l.to));
         assert_eq!(d.value, U256::from(100u64));
         assert!(!d.is_system_transaction);
+    }
+
+    // ---------------------------------------------------------------------
+    // Upgrade transactions (system deposits)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn system_domain_separates_from_the_user_domain_at_the_same_position() {
+        // The whole point of the domain byte: a deposit and an upgrade at the
+        // same (block, log_index) — impossible today, but the dedup key must
+        // not rely on that — get different ids.
+        let block = B256::repeat_byte(0x91);
+        assert_ne!(source_hash(block, 3), source_hash_system(block, 3));
+    }
+
+    #[test]
+    fn upgrade_derives_a_system_deposit_targeting_the_chain_state() {
+        let block = B256::repeat_byte(0x21);
+        let e = derive_epoch(4, block, &[upgrade_log(block, 2, 1, 0)]).unwrap();
+        let d = &e.deposits[0];
+
+        assert_eq!(d.source_hash, source_hash_system(block, 2));
+        assert_eq!(d.from, crate::upgrades::SYSTEM_UPGRADER);
+        assert_eq!(d.to, Some(crate::upgrades::CHAIN_STATE));
+        assert!(d.is_system_transaction);
+        // An upgrade moves no ETH.
+        assert_eq!(d.mint, 0);
+        assert_eq!(d.value, U256::ZERO);
+        // Calldata is exactly setFeature(1, 0).
+        assert_eq!(
+            d.input.as_ref(),
+            crate::upgrades::encode_set_feature(U256::from(1u64), 0).as_ref()
+        );
+    }
+
+    #[test]
+    fn upgrade_sender_is_not_aliased() {
+        // Aliasing exists to separate L1 senders from L2 addresses; the system
+        // sender is defined ON L2 and is what the predeploy authorizes against,
+        // so aliasing it would break every upgrade.
+        let block = B256::repeat_byte(0x22);
+        let e = derive_epoch(1, block, &[upgrade_log(block, 0, 1, 0)]).unwrap();
+        assert_eq!(e.deposits[0].from, crate::upgrades::SYSTEM_UPGRADER);
+        assert_ne!(
+            e.deposits[0].from,
+            alias_l1_address(crate::upgrades::SYSTEM_UPGRADER)
+        );
+    }
+
+    #[test]
+    fn upgrade_carries_its_activation_timestamp_into_the_calldata() {
+        let block = B256::repeat_byte(0x23);
+        let ts = 1_700_000_004_000u64;
+        let e = derive_epoch(1, block, &[upgrade_log(block, 0, 9, ts)]).unwrap();
+        assert_eq!(
+            e.deposits[0].input.as_ref(),
+            crate::upgrades::encode_set_feature(U256::from(9u64), ts).as_ref()
+        );
+    }
+
+    #[test]
+    fn deposits_and_upgrades_interleave_in_l1_log_order() {
+        // One contract, one log stream: an upgrade must not jump ahead of a
+        // deposit L1 ordered first, in either input order.
+        let block = B256::repeat_byte(0x24);
+        let forward = derive_epoch(
+            6,
+            block,
+            &[
+                log(block, 0, 1, 10),
+                upgrade_log(block, 1, 1, 0),
+                log(block, 2, 2, 20),
+            ],
+        )
+        .unwrap();
+        let shuffled = derive_epoch(
+            6,
+            block,
+            &[
+                log(block, 2, 2, 20),
+                log(block, 0, 1, 10),
+                upgrade_log(block, 1, 1, 0),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(forward, shuffled);
+        assert_eq!(forward.deposits.len(), 3);
+        assert!(!forward.deposits[0].is_system_transaction);
+        assert!(forward.deposits[1].is_system_transaction);
+        assert!(!forward.deposits[2].is_system_transaction);
+    }
+
+    #[test]
+    fn an_upgrade_colliding_with_a_deposit_log_index_is_rejected() {
+        let block = B256::repeat_byte(0x25);
+        let err = derive_epoch(
+            1,
+            block,
+            &[log(block, 3, 1, 5), upgrade_log(block, 3, 1, 0)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, EpochError::DuplicateLogIndex { log_index: 3 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn foreign_upgrade_log_is_rejected() {
+        let block = B256::repeat_byte(0x26);
+        let other = B256::repeat_byte(0x27);
+        let err = derive_epoch(1, block, &[upgrade_log(other, 0, 1, 0)]).unwrap_err();
+        assert!(matches!(err, EpochError::ForeignLog { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn upgrade_derivation_is_deterministic_across_callers() {
+        // Same producer/verifier equality the user-deposit path relies on: the
+        // validator re-derives upgrades from L1 and fail-stops on any diff.
+        let block = B256::repeat_byte(0x28);
+        let logs = [upgrade_log(block, 1, 3, 999), log(block, 0, 4, 1)];
+        assert_eq!(
+            derive_epoch(2, block, &logs).unwrap(),
+            derive_epoch(2, block, &logs).unwrap()
+        );
+    }
+
+    #[test]
+    fn system_source_hash_known_vector() {
+        // Anchored like the user-deposit vector above: the id a system deposit
+        // dedups on is consensus-visible, so a change must be deliberate.
+        //
+        // Cross-checked against a hand-built RLP encoding rather than captured
+        // from this implementation, so the vector is independent evidence:
+        //   inner = e2 a0 <32-byte block hash> 2a          (list, payload 34)
+        //   outer = e2 01 a0 keccak(inner)                 (domain 1 is a bare
+        //                                                   0x01 byte, not 0x81 0x01)
+        // The same procedure with domain 0 (encoded 0x80) reproduces the
+        // user-domain vector below, which confirms the method.
+        let h = source_hash_system(
+            b256!("0000000000000000000000000000000000000000000000000000000000000001"),
+            42,
+        );
+        assert_eq!(
+            h,
+            b256!("60a7cd0721ff0987010cb857c9439ed4078bec21893625b554f27c03787047cc")
+        );
     }
 
     #[test]
