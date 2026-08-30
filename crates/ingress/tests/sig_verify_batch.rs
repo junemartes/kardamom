@@ -104,22 +104,37 @@ fn thread_cpu_ns() -> u64 {
 
 /// The recovery work must not run on the async runtime's thread.
 ///
-/// 256 recoveries are ~10.7ms of pure CPU. The test drives them through
-/// the verifier on a `current_thread` runtime — the test thread IS the
-/// runtime thread — and asserts the runtime thread's own CPU TIME stays
-/// far below the ECDSA cost. If any path (the ring-full fast path or the
-/// flush task) runs recovery inline, that CPU lands on this thread and
-/// the count jumps past the bound deterministically.
+/// The test drives 256 recoveries through the verifier on a
+/// `current_thread` runtime — the test thread IS the runtime thread —
+/// and asserts the runtime thread's own CPU TIME stays well below what
+/// running them inline would cost. If any path (the ring-full fast path
+/// or the flush task) runs recovery inline, that CPU lands on this
+/// thread and the count jumps past the bound deterministically.
 ///
-/// CPU time, not wall clock, on purpose (issue #252): the old wall-clock
-/// timer assert measured the OS scheduler — on a loaded 2-core host the
-/// runtime thread is descheduled for 1-16ms with the work fully
-/// off-thread, and one flake per CI wave was the result. Descheduling
-/// does not accrue thread CPU time, so this bound is immune to host
-/// load in BOTH directions.
+/// Two calibrations, both learned from CI failures (issue #252):
+/// - CPU time, not wall clock: the old timer assert measured the OS
+///   scheduler — on a loaded 2-core host the runtime thread is
+///   descheduled for 1-16 ms with the work fully off-thread.
+///   Descheduling does not accrue thread CPU time.
+/// - The bound is HALF of this build's own measured inline cost, not a
+///   constant: recovery is ~10.7 ms in release and ~130 ms in debug,
+///   while the healthy bookkeeping is ~2 ms and ~5-8 ms. No constant
+///   serves both profiles; the ratio does (measured margins are >2.5x
+///   on both sides in both).
 #[tokio::test(flavor = "current_thread")]
 async fn recovery_does_not_block_the_reactor() {
     let cases: Vec<_> = (0..256u64).map(fixtures::signed).collect();
+
+    // Calibrate: what would running the batch inline cost on THIS build
+    // and silicon? Measured by thread CPU time over a 16-tx sample,
+    // before the workload's own measurement window opens.
+    let cal0 = thread_cpu_ns();
+    for (env, raw, _) in cases.iter().take(16) {
+        let _ = kardamom_ingress::sig_verify::recover_single(env, raw);
+    }
+    let inline_cost_ns = (thread_cpu_ns() - cal0) * (256 / 16);
+    let bound_ns = inline_cost_ns / 2;
+
     let v = std::sync::Arc::new(BatchVerifier::with_parallelism(
         64,
         Duration::from_micros(50),
@@ -134,13 +149,19 @@ async fn recovery_does_not_block_the_reactor() {
     for h in handles {
         h.await.unwrap().unwrap();
     }
-    let runtime_cpu_ms = (thread_cpu_ns() - cpu0) as f64 / 1e6;
-    eprintln!("runtime-thread CPU during 256 recoveries: {runtime_cpu_ms:.2}ms");
+    let runtime_cpu_ns = thread_cpu_ns() - cpu0;
+    eprintln!(
+        "runtime-thread CPU during 256 recoveries: {:.2}ms (inline would be ~{:.2}ms)",
+        runtime_cpu_ns as f64 / 1e6,
+        inline_cost_ns as f64 / 1e6
+    );
     assert!(
-        runtime_cpu_ms < 5.0,
-        "runtime thread burned {runtime_cpu_ms:.2}ms of CPU during batch recovery \
-         (task bookkeeping is ~1ms; 256 recoveries are ~10.7ms) — \
-         CPU work is running on a runtime thread"
+        runtime_cpu_ns < bound_ns,
+        "runtime thread burned {:.2}ms of CPU during batch recovery (inline cost \
+         is ~{:.2}ms; bookkeeping should be far below half of it) — \
+         CPU work is running on a runtime thread",
+        runtime_cpu_ns as f64 / 1e6,
+        inline_cost_ns as f64 / 1e6
     );
 }
 
