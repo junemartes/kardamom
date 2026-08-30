@@ -17,6 +17,7 @@ testing = []
 docker-e2e = ["testing", "kardamom-log/docker-e2e"]
 
 [dependencies]
+crossbeam-channel.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-rlp.workspace = true
@@ -34,6 +35,7 @@ metrics.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util = { workspace = true }
 toml.workspace = true
 tracing.workspace = true
 

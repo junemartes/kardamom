@@ -35,4 +35,4 @@ tracing.workspace = true
 kardamom-cluster-adapter = { path = ".", features = ["testing"] }
 toml.workspace = true
 kardamom-sequencer = { path = "../sequencer" }
-kardamom-executor = { path = "../executor" }
+kardamom-engine = { path = "../engine" }

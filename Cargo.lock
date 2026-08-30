@@ -774,6 +774,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "ark-bls12-381"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2234,7 +2243,6 @@ dependencies = [
  "kardamom-da-watcher",
  "kardamom-deployer",
  "kardamom-exec-core",
- "kardamom-executor",
  "kardamom-ingress",
  "kardamom-log",
  "kardamom-sequencer",
@@ -3699,7 +3707,6 @@ dependencies = [
  "bytes",
  "clap",
  "criterion 0.7.0",
- "crossbeam-channel",
  "kardamom-deployer",
  "kardamom-engine",
  "kardamom-log",
@@ -3765,7 +3772,7 @@ dependencies = [
  "crossbeam-channel",
  "kardamom-cluster-adapter",
  "kardamom-cluster-client",
- "kardamom-executor",
+ "kardamom-engine",
  "kardamom-log",
  "kardamom-sequencer",
  "kardamom-types",
@@ -3780,6 +3787,7 @@ dependencies = [
 name = "kardamom-cluster-client"
 version = "0.1.0"
 dependencies = [
+ "num_enum",
  "thiserror 2.0.18",
 ]
 
@@ -3803,6 +3811,7 @@ dependencies = [
  "reqwest 0.13.4",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -3924,6 +3933,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber 0.3.23",
@@ -3971,6 +3981,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tower",
  "tracing",
@@ -3993,6 +4004,7 @@ dependencies = [
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
 ]
@@ -4054,6 +4066,7 @@ dependencies = [
  "clap",
  "core_affinity",
  "criterion 0.5.1",
+ "crossbeam-channel",
  "dhat",
  "kardamom-cluster-adapter",
  "kardamom-log",
@@ -4067,6 +4080,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
 ]
@@ -4078,6 +4092,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
+ "arc-swap",
  "bytes",
  "criterion 0.7.0",
  "crossbeam-channel",
@@ -4161,6 +4176,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber 0.3.23",

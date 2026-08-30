@@ -16,6 +16,7 @@ fn free_port() -> SocketAddr {
 async fn init_exposes_build_info_and_service_up() {
     let addr = free_port();
     kardamom_obs::init("test-service", addr, "test-host", "0.0.0", "deadbeef")
+        .await
         .expect("init succeeds on a free port");
 
     // The exporter binds asynchronously, so give it a short retry budget.

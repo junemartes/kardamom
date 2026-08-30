@@ -561,14 +561,21 @@ impl Sequencer {
                 tracing::warn!(core, "failed to pin sequencer thread to core");
             }
         }
-        let mut backoff_us = 1u64;
+        // Same escalation as the deposit pump: 1µs base, x2 per idle
+        // iteration, 100µs cap, snap back on work. IdleBackoff with
+        // grace 1 gives the exact old sleep sequence (1, 2, 4, ... 100).
+        let mut backoff = kardamom_log::aeron_live::IdleBackoff::new(
+            Duration::from_micros(1),
+            Duration::from_micros(100),
+            1,
+        );
         loop {
             if shutdown.is_signaled() {
                 return Ok(());
             }
             match self.run_once(channel_a, b, rc) {
                 Ok(true) => {
-                    backoff_us = 1;
+                    backoff.reset();
                     if let Some(r) = self.resync.as_mut() {
                         r.note_publish_ok();
                     }
@@ -577,8 +584,7 @@ impl Sequencer {
                     if let Some(r) = self.resync.as_mut() {
                         r.note_publish_ok();
                     }
-                    std::thread::sleep(Duration::from_micros(backoff_us));
-                    backoff_us = backoff_us.saturating_mul(2).min(100);
+                    std::thread::sleep(backoff.idle_wait());
                 }
                 Err(SequencerError::Backpressure) => {
                     // Sustained backpressure (including a not-yet-reconnected

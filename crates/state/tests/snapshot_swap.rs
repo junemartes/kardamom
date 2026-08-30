@@ -8,7 +8,7 @@ use kardamom_types::StateDatabase;
 
 #[test]
 fn each_commit_publishes_a_post_commit_snapshot() {
-    let (_dir, writer) = common::open_tmp_writer();
+    let (_dir, mut writer) = common::open_tmp_writer();
     let addr = address!("0x00000000000000000000000000000000000000aa");
 
     // Initial snapshot at block 0 published on spawn.
@@ -40,7 +40,7 @@ fn each_commit_publishes_a_post_commit_snapshot() {
 fn tx_hash_lookup_round_trips_through_writer() {
     // The writer populates tx_hash_index on every commit. Snapshots can
     // resolve a tx_hash to a BPosition, then to a Receipt.
-    let (_dir, writer) = common::open_tmp_writer();
+    let (_dir, mut writer) = common::open_tmp_writer();
     let addr = address!("0x00000000000000000000000000000000000000bb");
     let _ = writer.snapshot_rx.recv();
 

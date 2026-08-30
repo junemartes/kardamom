@@ -3,7 +3,7 @@
 //! multi-version view, and publish versions. A canonical-order commit
 //! pass then computes the exact sequential artifacts: receipts
 //! (cumulative gas, accumulator-fixed write-set hashes) and the block
-//! `PendingDelta`. These are byte-identical to `ExecScope` output by
+//! `PendingDelta`. These are byte-identical to `Executor` output by
 //! construction, and validation re-checks this.
 //!
 //! Wound-wait runtime detection (ESTIMATE marks, child self-abort) is not
@@ -23,10 +23,7 @@ use kardamom_exec_core::block_env::ExecEnv;
 use kardamom_exec_core::delta::{PendingDelta, WriteSet};
 use kardamom_exec_core::error::ExecutorError;
 use kardamom_exec_core::exec_types::{ReceiptStatus, TxIndex};
-use kardamom_exec_core::executor::{
-    ExecScope, SnapshotRef, decode_alloy_envelope, invalid_skip, tx_env_from_alloy, wire_log,
-    write_set_from_evm_state,
-};
+use kardamom_exec_core::executor::{DecodedTx, Executor, SnapshotRef};
 use kardamom_footprint::classifier::{DomainKey, Stats};
 use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
 use revm::context::result::ExecutionResult;
@@ -638,7 +635,7 @@ const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 #[derive(Clone)]
 pub struct Prepared {
     /// `None` when the envelope does not decode: the #92 skip path.
-    pub decoded: Option<alloy_consensus::TxEnvelope>,
+    pub decoded: Option<DecodedTx>,
     /// Predicted contention domains, with the fee sink already excluded.
     pub domains: Vec<DomainKey>,
     /// A 64-bit hash per domain, computed here, off the feed thread, in
@@ -681,7 +678,7 @@ pub fn domain_hash64(d: &DomainKey) -> u64 {
 /// one transaction at its canonical position. That is what makes it safe
 /// to compute here, concurrently, ahead of canonical order.
 pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepared {
-    let decoded = decode_alloy_envelope(&envelope.raw_tx, tx_idx).ok();
+    let decoded = DecodedTx::decode(&envelope.raw_tx, tx_idx).ok();
     // The local index is irrelevant to prediction (it only labels the
     // observation), so preparation needs no position in the block.
     let view = schedule::scheduling_view_decoded(0, envelope, decoded.as_ref());
@@ -788,7 +785,7 @@ struct TxSlot {
     tx_idx: TxIndex,
     position: BPosition,
     envelope: TxEnvelope,
-    decoded: Option<alloy_consensus::TxEnvelope>,
+    decoded: Option<DecodedTx>,
     /// Predicted cell hashes (from `prepare`, off-thread). Sharded
     /// admission reads them from here; the serial feed uses the
     /// `Prepared` copy directly and leaves this empty.
@@ -3748,7 +3745,7 @@ fn block_tail<S: StateDatabase + Sync>(
                 // there is no second copy in a parallel vec.
                 let slot = ctx.slots[i].get().expect("slot set for every admitted tx");
                 let (tx_idx, position, envelope) = (slot.tx_idx, slot.position, &slot.envelope);
-                let mut scope = ExecScope::new(&ctx.snapshots[0], Some(&layered), ctx.env)?;
+                let mut scope = Executor::new(&ctx.snapshots[0], Some(&layered), ctx.env)?;
                 // Repair capture replaces the wounded fragment: this
                 // execution runs against the computed prefix, so its
                 // capture (fee sink included) is canonical directly.
@@ -4294,7 +4291,7 @@ pub fn execute_block_stm<S: StateDatabase + Sync + Clone + 'static>(
     )
 }
 
-/// The sequential reference path (also the fallback): `ExecScope` per
+/// The sequential reference path (also the fallback): `Executor` per
 /// block, in canonical order, the executor's streaming semantics.
 /// [`execute_block_sequential`] with the RLP already decoded: the fair
 /// baseline for A/B against the parallel engine.
@@ -4310,10 +4307,10 @@ pub fn execute_block_sequential_decoded<S: StateDatabase + Sync>(
     base: Option<&PendingDelta>,
     env: ExecEnv,
     txs: &[(TxIndex, BPosition, TxEnvelope)],
-    decoded: &[Option<alloy_consensus::TxEnvelope>],
+    decoded: &[Option<DecodedTx>],
 ) -> Result<(Vec<Receipt>, PendingDelta), ExecutorError> {
     debug_assert_eq!(txs.len(), decoded.len(), "one decode slot per tx");
-    let mut scope = ExecScope::new(snapshot, base, env)?;
+    let mut scope = Executor::new(snapshot, base, env)?;
     let mut receipts = Vec::with_capacity(txs.len());
     let mut delta = PendingDelta::new();
     let mut cumulative = 0u64;
@@ -4354,7 +4351,7 @@ pub fn execute_block_sequential<S: StateDatabase + Sync>(
     env: ExecEnv,
     txs: &[(TxIndex, BPosition, TxEnvelope)],
 ) -> Result<(Vec<Receipt>, PendingDelta), ExecutorError> {
-    let mut scope = ExecScope::new(snapshot, base, env)?;
+    let mut scope = Executor::new(snapshot, base, env)?;
     let mut receipts = Vec::with_capacity(txs.len());
     let mut delta = PendingDelta::new();
     let mut cumulative = 0u64;
@@ -4387,7 +4384,7 @@ pub fn execute_block_sequential<S: StateDatabase + Sync>(
     Ok((receipts, delta))
 }
 
-/// One worker's EVM over its multi-version view: ExecScope's shape with
+/// One worker's EVM over its multi-version view: Executor's shape with
 /// the concurrent DB swapped in.
 type WorkerEvm<'a, S> = revm::handler::MainnetEvm<
     revm::context::Context<
@@ -4399,7 +4396,7 @@ type WorkerEvm<'a, S> = revm::handler::MainnetEvm<
 >;
 
 /// Execute one transaction against its multi-version view. Mirrors
-/// `ExecScope::execute_tx` exactly (#92 skip semantics, write-set
+/// `Executor::execute_tx` exactly (#92 skip semantics, write-set
 /// emission, receipt shape), with MvCache publish in place of the
 /// sequential commit. The worker's EVM is reused across transactions;
 /// only the view's index and read log are re-aimed.
@@ -4430,14 +4427,18 @@ fn execute_one<S: StateDatabase>(
     tx_idx: TxIndex,
     position: BPosition,
     envelope: &TxEnvelope,
-    decoded: Option<&alloy_consensus::TxEnvelope>,
+    decoded: Option<&DecodedTx>,
     sink_start_balance: U256,
     bal_base: Option<u64>,
     fresh_reads: &mut dyn FnMut() -> Vec<ReadRecord>,
 ) -> Result<TxResult, ExecutorError> {
-    let skip = |reason: &str, nonce: u64, to: Option<alloy_primitives::Address>| {
-        let (receipt, ws) = invalid_skip(
+    let skip = |reason: kardamom_types::SkipReason,
+                detail: &str,
+                nonce: u64,
+                to: Option<alloy_primitives::Address>| {
+        let (receipt, ws) = Executor::<S>::skip_receipt(
             reason,
+            detail,
             position,
             envelope,
             nonce,
@@ -4458,7 +4459,12 @@ fn execute_one<S: StateDatabase>(
 
     let _ = tx_idx;
     let Some(alloy_env) = decoded else {
-        return Ok(skip("undecodable raw_tx", 0, None));
+        return Ok(skip(
+            kardamom_types::SkipReason::Undecodable,
+            "undecodable raw_tx",
+            0,
+            None,
+        ));
     };
     use alloy_consensus::Transaction;
     let signer = envelope.sender;
@@ -4474,15 +4480,25 @@ fn execute_one<S: StateDatabase>(
         db.idx = local_idx;
         db.reads.clear();
     }
-    let tx_env = tx_env_from_alloy(alloy_env, signer);
+    let tx_env = alloy_env.tx_env(signer);
     let t_evm = std::time::Instant::now();
     let mut outcome = match evm.transact(tx_env) {
         Ok(o) => o,
-        Err(revm::context::result::EVMError::Transaction(reason)) => {
-            return Ok(skip(&format!("{reason:?}"), nonce, to));
+        Err(revm::context::result::EVMError::Transaction(e)) => {
+            return Ok(skip(
+                kardamom_exec_core::executor::skip_reason_of_tx(&e),
+                &format!("{e:?}"),
+                nonce,
+                to,
+            ));
         }
-        Err(revm::context::result::EVMError::Header(reason)) => {
-            return Ok(skip(&format!("{reason:?}"), nonce, to));
+        Err(revm::context::result::EVMError::Header(e)) => {
+            return Ok(skip(
+                kardamom_types::SkipReason::Header,
+                &format!("{e:?}"),
+                nonce,
+                to,
+            ));
         }
         Err(e) => {
             return Err(ExecutorError::Execution {
@@ -4500,14 +4516,15 @@ fn execute_one<S: StateDatabase>(
     // `logs.clone()` (topic Vecs and data Bytes per log, on every
     // success) was allocation for its own sake.
     let (status, wire_logs) = match &outcome.result {
-        ExecutionResult::Success { logs, .. } => {
-            (ReceiptStatus::Success, logs.iter().map(wire_log).collect())
-        }
+        ExecutionResult::Success { logs, .. } => (
+            ReceiptStatus::Success,
+            logs.iter().map(kardamom_types::WireLog::from).collect(),
+        ),
         ExecutionResult::Revert { .. } => (ReceiptStatus::Revert, Vec::new()),
         ExecutionResult::Halt { reason, .. } => (ReceiptStatus::Halt(reason.clone()), Vec::new()),
     };
 
-    let ws = write_set_from_evm_state(&outcome.state);
+    let ws = WriteSet::from_evm_state(&outcome.state);
     // EIP-7928 capture: this transaction's fragment at its block-global
     // index, through the same update_account the streaming path uses on
     // the same `outcome.state`. Everything the mv cache tracks reads
@@ -4590,6 +4607,7 @@ fn execute_one<S: StateDatabase>(
         transaction_index: local_idx as u64,
         // Canonical prefix sums land in the commit pass.
         cumulative_gas_used: 0,
+        skip_reason: None,
     };
     Ok(TxResult {
         receipt,

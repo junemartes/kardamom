@@ -37,6 +37,68 @@ pub struct WireLog {
     pub data: Bytes,
 }
 
+/// The one wire encoding of an EVM log. Every emitter (the streaming
+/// executor and the Block-STM engine) converts through this impl, so the
+/// receipt log encoding cannot drift between them.
+impl From<&alloy_primitives::Log> for WireLog {
+    fn from(log: &alloy_primitives::Log) -> Self {
+        Self {
+            address: log.address,
+            topics: log.data.topics().to_vec(),
+            data: Bytes::copy_from_slice(log.data.data.as_ref()),
+        }
+    }
+}
+
+/// Why a deterministically-invalid canonical tx was SKIPPED (see
+/// [`Receipt::is_invalid_skip`]). Every replica derives the same reason
+/// from the same input, so the reason is part of the deterministic
+/// transition and consumers may act on it:
+/// - `NonceTooLow`: a duplicate that made it past every dedup layer.
+/// - `NonceTooHigh`: a sealed gap — the sender's later refs are dead.
+///
+/// APPEND-ONLY: the discriminants are on the wire (rkyv).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
+pub enum SkipReason {
+    /// `raw_tx` did not decode as an EIP-2718 envelope.
+    Undecodable = 1,
+    NonceTooLow = 2,
+    NonceTooHigh = 3,
+    InsufficientFunds = 4,
+    /// A gas-limit class rejection (block cap, floor, intrinsic cost).
+    GasLimit = 5,
+    /// A fee class rejection (priority > max, price < basefee, blob fee).
+    Fee = 6,
+    InitCodeSize = 7,
+    /// EIP-3607: the sender has code.
+    SenderHasCode = 8,
+    /// Any other `InvalidTransaction` rejection.
+    OtherTransaction = 9,
+    /// An `InvalidHeader` rejection.
+    Header = 10,
+}
+
+impl SkipReason {
+    /// Stable snake_case name — the metrics label and (later) the RPC
+    /// string for this reason.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SkipReason::Undecodable => "undecodable",
+            SkipReason::NonceTooLow => "nonce_too_low",
+            SkipReason::NonceTooHigh => "nonce_too_high",
+            SkipReason::InsufficientFunds => "insufficient_funds",
+            SkipReason::GasLimit => "gas_limit",
+            SkipReason::Fee => "fee",
+            SkipReason::InitCodeSize => "init_code_size",
+            SkipReason::SenderHasCode => "sender_has_code",
+            SkipReason::OtherTransaction => "other_transaction",
+            SkipReason::Header => "header",
+        }
+    }
+}
+
 /// Per-transaction execution receipt. Executor replicas publish this on
 /// tx_receipts.
 ///
@@ -100,6 +162,12 @@ pub struct Receipt {
     /// Running sum of `gas_used` for all transactions in the block, up to
     /// and including this one.
     pub cumulative_gas_used: u64,
+    /// `Some` iff this receipt is an invalid-skip marker (see
+    /// [`Receipt::is_invalid_skip`]): the typed cause. The bool+gas marker
+    /// stays the invariant; this field carries the WHY. Part of the
+    /// deterministic transition — the validator's receipt cross-check
+    /// compares it like every other field.
+    pub skip_reason: Option<SkipReason>,
 }
 
 impl Receipt {

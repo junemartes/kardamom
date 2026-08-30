@@ -84,6 +84,7 @@ fn receipt_roundtrip() {
         block_number: 42,
         transaction_index: 3,
         cumulative_gas_used: 84_000,
+        skip_reason: None,
     };
     assert_eq!(roundtrip(&v), v);
 }
@@ -110,7 +111,37 @@ fn receipt_roundtrip_contract_creation() {
         block_number: 1,
         transaction_index: 0,
         cumulative_gas_used: 100_000,
+        skip_reason: None,
     };
+    assert_eq!(roundtrip(&v), v);
+}
+
+#[test]
+fn receipt_roundtrip_invalid_skip() {
+    // #92 skip marker + the typed cause (#241): the reason must survive
+    // the wire, and the discriminant is append-only.
+    let v = Receipt {
+        tx_type: kardamom_types::TX_TYPE_LEGACY,
+        tx_idx: BPosition {
+            term_id: 1,
+            term_offset: 128,
+        },
+        tx_hash: B256::repeat_byte(0x99),
+        status: false,
+        gas_used: 0,
+        logs: vec![],
+        write_set_hash: B256::ZERO,
+        nonce: 9,
+        from: Address::repeat_byte(0xAA),
+        to: None,
+        contract_address: None,
+        effective_gas_price: 0,
+        block_number: 7,
+        transaction_index: 2,
+        cumulative_gas_used: 42_000,
+        skip_reason: Some(kardamom_types::SkipReason::NonceTooHigh),
+    };
+    assert!(v.is_invalid_skip());
     assert_eq!(roundtrip(&v), v);
 }
 

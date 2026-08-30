@@ -17,7 +17,7 @@ use kardamom_bench::mnemonic;
 use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::exec_types::TxIndex;
-use kardamom_engine::executor::execute_tx;
+use kardamom_engine::executor::Executor;
 use kardamom_engine::state::MockStateDatabase;
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope};
 
@@ -118,7 +118,7 @@ fn defi_execution_allocation_profile() {
             sender,
             tx_hash: raw.hash,
         };
-        let (r, ws) = execute_tx(
+        let (r, ws) = Executor::execute_once(
             snap,
             None,
             delta,
@@ -163,7 +163,7 @@ fn defi_execution_allocation_profile() {
     }
 
     // This is the measured window under DHAT, through the production
-    // path: one ExecScope for each simulated block, re-scoped every
+    // path: one Executor for each simulated block, re-scoped every
     // BLOCK_TXS to model block boundaries.
     const BLOCK_TXS: usize = 1000;
     let profiler = dhat::Profiler::builder().build();
@@ -171,11 +171,10 @@ fn defi_execution_allocation_profile() {
     let t0 = std::time::Instant::now();
     let mut gas = 0u64;
     let measured: Vec<_> = txs.iter().skip(SENDERS * 4).collect();
-    let mut scope: Option<kardamom_engine::executor::ExecScope<&MockStateDatabase>> = None;
+    let mut scope: Option<kardamom_engine::executor::Executor<&MockStateDatabase>> = None;
     for (n, (si, t)) in measured.iter().enumerate() {
         if n % BLOCK_TXS == 0 {
-            let mut sc =
-                kardamom_engine::executor::ExecScope::new(&snap, None, env).expect("scope");
+            let mut sc = kardamom_engine::executor::Executor::new(&snap, None, env).expect("scope");
             sc.seed_layer(&delta).expect("seed");
             scope = Some(sc);
         }

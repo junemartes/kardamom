@@ -6,7 +6,9 @@ use std::net::{SocketAddr, TcpListener};
 #[tokio::test]
 async fn sequencer_metrics_endpoint_serves_expected_counters() {
     let addr = free_port();
-    kardamom_obs::init("sequencer", addr, "local", "test", "test").expect("init");
+    kardamom_obs::init("sequencer", addr, "local", "test", "test")
+        .await
+        .expect("init");
 
     // Touch every counter that the sequencer crate publishes. This lets
     // describe_counter run without the binary. The test uses the crate's

@@ -6,7 +6,7 @@ use alloy_primitives::{Address, B256, U256};
 use kardamom_types::{AccountChange, BPosition, BlockBoundary, BlockDelta, StateDatabase};
 
 fn commit_blocks(env: &StateEnv, addr: Address, upto: u64) {
-    let handle = StateWriter::spawn(env.clone()).unwrap();
+    let mut handle = StateWriter::spawn(env.clone()).unwrap();
     for b in 1..=upto {
         let boundary = BlockBoundary {
             block_number: b,

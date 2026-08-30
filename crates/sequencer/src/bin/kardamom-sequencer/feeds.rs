@@ -1,10 +1,16 @@
-//! The sequencer's background feed threads, and the publish-loop spawner.
+//! The sequencer's background feeds, and the publish-loop spawner.
 //!
 //! Three loops feed, or drain, the publish path. The cluster-egress
-//! watermark thread and the tx_receipts floor thread supply the
+//! watermark task and the tx_receipts floor task supply the
 //! `ResyncController` (see the sequencer-lag-resync spec).
 //! `spawn_publish_loops` runs the canonical `TxRef` loop and the
 //! `DepositRef` epoch pump on blocking tasks.
+//!
+//! Seam rule: the async shell is tokio. Anything that blocks, such as
+//! Aeron polls, the crossbeam egress receiver, or the microsecond-backoff
+//! publish loop, runs on `spawn_blocking`. It polls `Shutdown::is_signaled`.
+//! Async-capable work, such as the receipts fan-in on an existing tokio
+//! channel, is a plain task. It uses `select!` on `Shutdown::cancelled`.
 
 use std::time::Duration;
 
@@ -17,40 +23,49 @@ use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::resync::{FloorUpdate, ResyncController, SharedWatermark};
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
+use kardamom_types::{BPosition, Receipt};
 
 use crate::adapters::{LiveEpochSub, LiveTxDataSub, LiveTxErrorPub};
 
-/// Spawn the egress-watermark FEED thread. This is the silence authority:
-/// it measures boundary-arrival gaps. Idle traffic still emits a boundary
+/// Spawn the egress-watermark feed. This is the silence authority: it
+/// measures boundary-arrival gaps. Idle traffic still emits a boundary
 /// every cluster tick, so arrivals, not count changes, are the liveness
 /// signal. It raises the sticky lag flag and a starvation-proof metric.
 ///
-/// This thread must never block without a bound (it uses `recv_timeout`).
+/// This feed must never block without a bound (it uses `recv_timeout`).
 /// The publish loop can block: a session offer waits on the session
 /// thread, which may be mid-reconnect after a process freeze. A detector
 /// that only runs when the publish loop runs would miss the freeze
 /// entirely.
+///
+/// `LiveEgress` holds nothing `!Send`. But its only wait primitive is a
+/// blocking crossbeam `recv_timeout`. So the body runs on `spawn_blocking`
+/// and checks `shutdown` once per 500 ms tick. `reject_tx` stays a std
+/// channel, because its consumer is the sync `ResyncController` in the
+/// publish loop.
 pub fn spawn_egress_watermark_feed(
     egress: LiveEgress,
     silence_ms: u64,
     partition: u32,
     watermark: SharedWatermark,
-    reject_tx: std::sync::mpsc::Sender<(Address, u64, u64)>,
-) -> std::io::Result<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("cluster-egress-watermark".into())
-        .spawn(move || {
-            run_egress_watermark_feed(egress, silence_ms, partition, watermark, reject_tx)
-        })
+    reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
+    shutdown: Shutdown,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        run_egress_watermark_feed(
+            egress, silence_ms, partition, watermark, reject_tx, shutdown,
+        )
+    })
 }
 
-/// Body of the egress-watermark thread (see [`spawn_egress_watermark_feed`]).
+/// Body of the egress-watermark feed (see [`spawn_egress_watermark_feed`]).
 fn run_egress_watermark_feed(
     mut egress: LiveEgress,
     silence_ms: u64,
     partition: u32,
     watermark: SharedWatermark,
-    reject_tx: std::sync::mpsc::Sender<(Address, u64, u64)>,
+    reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
+    shutdown: Shutdown,
 ) {
     use kardamom_cluster_adapter::live::EgressPoll;
     use kardamom_cluster_adapter::wire::{self, EgressItem, decode_egress};
@@ -80,7 +95,7 @@ fn run_egress_watermark_feed(
             }
         }
     };
-    loop {
+    while !shutdown.is_signaled() {
         match egress.recv_timeout(Duration::from_millis(500)) {
             EgressPoll::Frame(frame) => {
                 // The sealer rejected one of this sequencer's refs
@@ -140,73 +155,87 @@ fn run_egress_watermark_feed(
 
 /// Spawn the tx_receipts-to-per-sender executed-truth floor feed. Only
 /// this shard's senders reach the floor channel.
+///
+/// The receipts handle already fans in over a tokio unbounded channel. The
+/// Aeron poll thread is the producer. So this is a plain async task. It
+/// awaits `recv()` and `Shutdown::cancelled`, with no idle-sleep polling.
+/// The handle reduces to its receiver (`into_receiver`), so the task holds
+/// no `AeronRuntime` clone. `floor_tx` stays a std channel, because its
+/// consumer is the sync `ResyncController` in the publish loop.
 pub fn spawn_receipt_floor_feed(
     sub: TxReceiptsSubscriberHandle,
     shutdown: Shutdown,
     partition_count: u32,
     partition_index: u32,
-    floor_tx: std::sync::mpsc::Sender<FloorUpdate>,
-) -> std::io::Result<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("tx-receipts-floors".into())
-        .spawn(move || {
-            run_receipt_floor_feed(sub, shutdown, partition_count, partition_index, floor_tx)
-        })
+    floor_tx: crossbeam_channel::Sender<FloorUpdate>,
+) -> tokio::task::JoinHandle<()> {
+    let rx = sub.into_receiver();
+    tokio::spawn(run_receipt_floor_feed(
+        rx,
+        shutdown,
+        partition_count,
+        partition_index,
+        floor_tx,
+    ))
 }
 
-/// Body of the receipts-floors thread (see [`spawn_receipt_floor_feed`]).
-fn run_receipt_floor_feed(
-    mut sub: TxReceiptsSubscriberHandle,
+/// Body of the receipts-floors task (see [`spawn_receipt_floor_feed`]).
+async fn run_receipt_floor_feed(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(BPosition, Receipt)>,
     shutdown: Shutdown,
     partition_count: u32,
     partition_index: u32,
-    floor_tx: std::sync::mpsc::Sender<FloorUpdate>,
+    floor_tx: crossbeam_channel::Sender<FloorUpdate>,
 ) {
-    let mut idle = IdleBackoff::new(Duration::from_micros(1), Duration::from_micros(500), 1);
-    while !shutdown.is_signaled() {
-        match sub.try_recv() {
-            Some((_pos, receipt)) => {
-                idle.reset();
-                // Nonce-0 receipts are excluded from floor
-                // evidence. A deposit receipt stamps a filler
-                // `nonce: 0` (deposits run with the nonce check
-                // disabled; see executor.rs `tx_env_from_deposit`).
-                // This makes it indistinguishable, on the wire,
-                // from a genuine nonce-0 transaction receipt.
-                // Treating one as proof that L2 tx-nonce 0 executed
-                // could wrongly Past-reject a sender's first
-                // transaction. The cost: floors only ever prove
-                // from nonce 1 upward. This degrades toward
-                // publish, the safer side.
-                //
-                // Only this shard's senders can appear in this
-                // replica's publish stream, so the floor map stays
-                // bounded to them.
-                //
-                // Forward every partition-matched receipt. The
-                // controller splits floor evidence (skip and
-                // deposit receipts excluded, since they consume no
-                // L2 nonce) from publish confirmations (skip
-                // receipts count as confirmations: ordering is the
-                // claim).
-                if kardamom_sequencer::partition::partition_for(receipt.from, partition_count)
-                    == partition_index
-                {
-                    // A send failure means the publish loop is gone. Exit.
-                    if floor_tx
-                        .send(FloorUpdate {
-                            sender: receipt.from,
-                            executed_nonce: receipt.nonce,
-                            invalid_skip: receipt.is_invalid_skip(),
-                            deposit: receipt.is_deposit(),
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-            None => std::thread::sleep(idle.idle_wait()),
+    loop {
+        let receipt = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            msg = rx.recv() => match msg {
+                Some((_pos, receipt)) => receipt,
+                // The subscription closed. The runtime shut down.
+                // Nothing more to feed.
+                None => return,
+            },
+        };
+        // Nonce-0 receipts are excluded from floor
+        // evidence. A deposit receipt stamps a filler
+        // `nonce: 0` (deposits run with the nonce check
+        // disabled; see executor.rs `tx_env_from_deposit`).
+        // This makes it indistinguishable, on the wire,
+        // from a genuine nonce-0 transaction receipt.
+        // Treating one as proof that L2 tx-nonce 0 executed
+        // could wrongly Past-reject a sender's first
+        // transaction. The cost: floors only ever prove
+        // from nonce 1 upward. This degrades toward
+        // publish, the safer side.
+        //
+        // Only this shard's senders can appear in this
+        // replica's publish stream, so the floor map stays
+        // bounded to them.
+        //
+        // Forward every partition-matched receipt. The
+        // controller splits floor evidence (skip and
+        // deposit receipts excluded, since they consume no
+        // L2 nonce) from publish confirmations (skip
+        // receipts count as confirmations: ordering is the
+        // claim).
+        if kardamom_sequencer::partition::partition_for(receipt.from, partition_count)
+            != partition_index
+        {
+            continue;
+        }
+        // A send failure means the publish loop is gone. Exit.
+        if floor_tx
+            .send(FloorUpdate {
+                sender: receipt.from,
+                executed_nonce: receipt.nonce,
+                skip_reason: receipt.skip_reason,
+                deposit: receipt.is_deposit(),
+            })
+            .is_err()
+        {
+            return;
         }
     }
 }
@@ -252,7 +281,10 @@ where
 
     // Independent pump for tx_deposits to epoch on tx_ordering. The epoch
     // path is not nonce-gated. It is a simple poll-and-publish loop that
-    // runs alongside the canonical TxData-to-TxRef path.
+    // runs alongside the canonical TxData-to-TxRef path. It stays on
+    // spawn_blocking. `process_epoch` does a sync Aeron poll and a sync
+    // cluster offer. So the loop polls `is_signaled` between backoff
+    // sleeps.
     let mut epoch_pub = deposit_pub;
     let join_deposits = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
         let mut idle = IdleBackoff::new(Duration::from_micros(1), Duration::from_micros(100), 1);

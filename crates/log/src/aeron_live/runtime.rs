@@ -29,7 +29,25 @@ use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 #[derive(Clone)]
 pub struct AeronRuntime {
     cmd_tx: CbSender<RuntimeCmd>,
-    join: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// Shared owner of the Aeron thread: the last clone to drop tears it
+    /// down (see [`AeronThread`]). Held only for its `Drop`.
+    _thread: Arc<AeronThread>,
+}
+
+/// RAII owner of the Aeron thread. Dropping it sends `Shutdown` and joins,
+/// so teardown runs exactly once — when the last [`AeronRuntime`] clone goes.
+struct AeronThread {
+    cmd_tx: CbSender<RuntimeCmd>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for AeronThread {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(RuntimeCmd::Shutdown);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
 }
 
 /// Subset of commands the Aeron-thread loop processes.
@@ -178,9 +196,13 @@ impl AeronRuntime {
             }
         }
 
+        let thread = Arc::new(AeronThread {
+            cmd_tx: cmd_tx.clone(),
+            join: Some(join),
+        });
         Ok(Self {
             cmd_tx,
-            join: Arc::new(std::sync::Mutex::new(Some(join))),
+            _thread: thread,
         })
     }
 
@@ -373,17 +395,6 @@ where
             }
         }
     })
-}
-
-impl Drop for AeronRuntime {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.join) == 1 {
-            let _ = self.cmd_tx.send(RuntimeCmd::Shutdown);
-            if let Some(j) = self.join.lock().unwrap().take() {
-                let _ = j.join();
-            }
-        }
-    }
 }
 
 /// Routes Aeron C-client errors through `tracing` instead of the client's

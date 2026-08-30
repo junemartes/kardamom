@@ -22,7 +22,6 @@ use crate::block_env::ExecEnv;
 use crate::delta::{PendingDelta, WriteSet};
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
-use crate::executor::execute_deposit_tx;
 use crate::reader::{EpochObserver, ReaderToExec};
 
 use super::ports::{StateWriterQueue, StateWriterSignal};
@@ -102,7 +101,7 @@ pub(super) struct ExecState<S: SnapshotSource, Q, P, E> {
     /// lazily, at the block's first tx. The rebuild seeds it with the
     /// parent and anything already in the live delta, for example deposits
     /// that landed before the first tx.
-    pub(super) scope: Option<crate::executor::ExecScope<S::Db>>,
+    pub(super) scope: Option<crate::executor::Executor<S::Db>>,
     /// Pipelined commit, at depth K. At each boundary, the code submits the
     /// finalized delta to the writer, but does not wait for it. The next
     /// block executes against the snapshot, then the merged unsettled layer,
@@ -396,7 +395,7 @@ where
         let sc = match self.scope.as_mut() {
             Some(sc) => sc,
             None => {
-                let mut sc = crate::executor::ExecScope::new(
+                let mut sc = crate::executor::Executor::new(
                     self.snapshots
                         .snapshot_after(self.current_block.saturating_sub(1)),
                     self.parent.as_ref(),
@@ -493,11 +492,23 @@ where
         }
         let env = self.exec_env(self.current_block);
         let apply_start = Instant::now();
-        let result = execute_deposit_tx(
-            &self.snapshot,
-            self.parent.as_ref(),
-            &self.delta,
-            env,
+        // Deposits now run ON the block scope (same lazy init as `on_tx`):
+        // the mint and the inner call commit into the block cache, so
+        // later txs observe them with no fold-back layer.
+        let sc = match self.scope.as_mut() {
+            Some(sc) => sc,
+            None => {
+                let mut sc = crate::executor::Executor::new(
+                    self.snapshots
+                        .snapshot_after(self.current_block.saturating_sub(1)),
+                    self.parent.as_ref(),
+                    env,
+                )?;
+                sc.seed_layer(&self.delta)?;
+                self.scope.insert(sc)
+            }
+        };
+        let result = sc.execute_deposit(
             tx_idx,
             position,
             &deposit,
@@ -507,14 +518,6 @@ where
                 .as_ref()
                 .map(|_| (&mut self.block_bal, self.tx_index_in_block + 1)),
         );
-        // Deposits run outside the scope; they are rare and have their own
-        // commit semantics. Fold their writes into the block cache, so
-        // later txs in this block can see them.
-        if let (Some(sc), Ok((_, ws))) = (self.scope.as_mut(), &result) {
-            let mut layer = PendingDelta::new();
-            layer.apply(ws.clone());
-            sc.seed_layer(&layer)?;
-        }
         // Shadow: deposits take the serial barrier lane (spec strategy 1).
         // The code counts them; it does not model them.
         if self.shadow_tx.is_some() && result.is_ok() {

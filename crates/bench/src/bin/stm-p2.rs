@@ -1,5 +1,5 @@
 //! `kardamom-stm-p2` runs a Block-STM offline A/B test. It runs the
-//! same generated blocks through the sequential engine (`ExecScope`)
+//! same generated blocks through the sequential engine (`Executor`)
 //! and the STM engine (`kardamom-stm`), checks that receipts and the
 //! delta are byte-identical on every block, and reports wall-clock
 //! time for each worker count.
@@ -26,7 +26,7 @@ use kardamom_bench::stm::uniswap;
 use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::exec_types::TxIndex;
-use kardamom_engine::executor::{ExecScope, TouchSet};
+use kardamom_engine::executor::{Executor, TouchSet};
 use kardamom_engine::state::MockStateDatabase;
 use kardamom_footprint::classifier::Stats;
 use kardamom_footprint::{Cell, TxObs, envelope_view};
@@ -285,7 +285,7 @@ fn train<S: kardamom_types::StateDatabase>(
     base: Option<&PendingDelta>,
     stats: &mut Stats,
 ) -> anyhow::Result<()> {
-    let mut scope = ExecScope::new(snapshot, base, e)?;
+    let mut scope = Executor::new(snapshot, base, e)?;
     let mut cumulative = 0u64;
     for (i, (tx_idx, position, envelope)) in recs.iter().enumerate() {
         let mut touches = TouchSet::default();
@@ -955,9 +955,9 @@ fn run_mdbx_ab(
                     // timers, and hand it to the sequential engine the way
                     // `prepare` hands it to the parallel one. Charging
                     // decode to only one side inflated every ratio.
-                    let seq_decoded: Vec<Option<alloy_consensus::TxEnvelope>> = recs
+                    let seq_decoded: Vec<Option<kardamom_stm::DecodedTx>> = recs
                         .iter()
-                        .map(|(t, _, en)| kardamom_stm::decode_alloy_envelope(&en.raw_tx, *t).ok())
+                        .map(|(t, _, en)| kardamom_stm::DecodedTx::decode(&en.raw_tx, *t).ok())
                         .collect();
                     let a0 = alloc_snap();
                     let b0 = bucket_snap();

@@ -87,7 +87,7 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
         .durability(Durability::SafeNoSync)
         .open()
         .unwrap();
-    let writer = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
+    let mut writer = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
 
     // --- Block 1: the seed, through the production writer (accounts,
     // code, storage, trie, and meta all land as live commits do).

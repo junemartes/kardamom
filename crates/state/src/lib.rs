@@ -23,7 +23,9 @@ pub use checkpoint::{
     manifest_path, park_state_db, prune_checkpoints, read_manifest, restore_best_checkpoint,
     restore_checkpoint, verify_checkpoint,
 };
-pub use checkpoint_transfer::{fetch_best_checkpoint, fetch_latest_checkpoint, serve_checkpoints};
+pub use checkpoint_transfer::{
+    CheckpointServer, fetch_best_checkpoint, fetch_latest_checkpoint, serve_checkpoints,
+};
 pub use compaction::compact_to;
 pub use env::{Durability, StateEnv, StateEnvBuilder};
 pub use error::StateError;

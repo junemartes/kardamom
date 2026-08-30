@@ -6,7 +6,9 @@ use std::net::{SocketAddr, TcpListener};
 #[tokio::test]
 async fn batcher_metrics_endpoint_serves_expected_counters() {
     let addr = free_port();
-    kardamom_obs::init("batcher", addr, "local", "test", "test").expect("init");
+    kardamom_obs::init("batcher", addr, "local", "test", "test")
+        .await
+        .expect("init");
 
     // Touch every counter the batcher crate is expected to publish. This
     // way, describe_counter calls do not require running the binary too.

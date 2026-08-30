@@ -79,7 +79,7 @@ fn bench_apply(c: &mut Criterion) {
                 writer.snapshot_rx.recv().unwrap();
                 (dir, writer)
             },
-            |(_dir, writer)| {
+            |(_dir, mut writer)| {
                 writer.delta_tx.send(big_batch(1)).unwrap();
                 writer.snapshot_rx.recv().unwrap();
                 writer.shutdown().unwrap();

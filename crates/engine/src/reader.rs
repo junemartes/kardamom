@@ -396,6 +396,31 @@ impl DedupWindow {
     }
 }
 
+/// The consumer is gone; the reader thread exits cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SinkClosed;
+
+/// Where the tx_ordering reader thread hands its records. The reader is a
+/// std thread, so the send is blocking on every implementation: a crossbeam
+/// channel between std threads (executor/validator exec thread), or a tokio
+/// bounded channel whose consumer is an async task (batcher feed loop) via
+/// `blocking_send`.
+pub trait ExecSink: Send + 'static {
+    fn send(&self, msg: ReaderToExec) -> Result<(), SinkClosed>;
+}
+
+impl ExecSink for Sender<ReaderToExec> {
+    fn send(&self, msg: ReaderToExec) -> Result<(), SinkClosed> {
+        Sender::send(self, msg).map_err(|_| SinkClosed)
+    }
+}
+
+impl ExecSink for tokio::sync::mpsc::Sender<ReaderToExec> {
+    fn send(&self, msg: ReaderToExec) -> Result<(), SinkClosed> {
+        self.blocking_send(msg).map_err(|_| SinkClosed)
+    }
+}
+
 /// Spawn the single tx_ordering reader thread. It pulls
 /// [`TxOrderingMessage`] records in canonical order. For each `TxRef`, it
 /// joins against `buffer` with a bounded wait, and forwards `(position,
@@ -410,16 +435,17 @@ impl DedupWindow {
 /// refetch instead of an immediate death; see [`JoinRecovery`]. It runs
 /// once, inside this thread, because the recovery's Aeron resources are
 /// thread-bound.
-pub fn spawn_tx_ordering_reader<O>(
+pub fn spawn_tx_ordering_reader<O, S>(
     mut tx_ordering_sub: O,
     buffer: JoinBuffer,
     cfg: ReaderConfig,
-    exec_out: Sender<ReaderToExec>,
+    exec_out: S,
     start_tx_idx: TxIndex,
     recovery_factory: Option<JoinRecoveryFactory>,
 ) -> JoinHandle<Result<(), ExecutorError>>
 where
     O: TxOrderingSubscription + 'static,
+    S: ExecSink,
 {
     thread::Builder::new()
         .name("executor-reader-b".into())

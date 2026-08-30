@@ -191,12 +191,11 @@ mod tests {
         // before the binary calls `writer.shutdown()`. This gives the same
         // order.
         drop(queue);
-        handle.shutdown().unwrap();
     }
 
     #[test]
     fn wait_committed_returns_ge_requested() {
-        let (_dir, handle) = spawn_writer();
+        let (_dir, mut handle) = spawn_writer();
         let mut queue = MdbxWriterQueue::new(handle.delta_tx.clone());
         let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
 
@@ -218,7 +217,7 @@ mod tests {
         // `StateWriter::spawn` publishes an initial snapshot right away. So
         // the source gives a usable, empty, block-0 view before the exec
         // thread submits anything.
-        let (_dir, handle) = spawn_writer();
+        let (_dir, mut handle) = spawn_writer();
         let source = MdbxSnapshotSource::new(handle.snapshot_rx.clone());
 
         let snap = source.snapshot_after(0);
@@ -243,7 +242,7 @@ mod tests {
                 .durability(Durability::SafeNoSync)
                 .open()
                 .unwrap();
-            let handle = StateWriter::spawn(env).unwrap();
+            let mut handle = StateWriter::spawn(env).unwrap();
             let mut queue = MdbxWriterQueue::new(handle.delta_tx.clone());
             let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
             for b in 1..=3 {

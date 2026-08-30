@@ -31,7 +31,7 @@ use crate::actor::{StateWriterQueue, StateWriterSignal};
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::exec_types::TxIndex;
-use crate::executor::execute_tx;
+use crate::executor::Executor;
 use crate::persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 
 /// One block to re-execute: its boundary metadata and ordered transactions.
@@ -121,37 +121,30 @@ where
     // sender drops at the end of the scope. This lets the writer thread exit.
     // `handle.shutdown()` below joins the thread. It would deadlock if any
     // sender were still alive.
-    let (drive, root) = {
+    let state_root = {
         let mut queue = MdbxWriterQueue::new(handle.delta_tx.clone());
         let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
         let source = MdbxSnapshotSource::new(handle.snapshot_rx.clone());
 
-        let drive = drive_blocks(
-            &mut queue,
-            &mut signal,
-            &source,
-            chain_id,
-            blocks,
-            &mut counters,
-        );
+        blocks.into_iter().try_for_each(|block| {
+            drive_block(
+                &mut queue,
+                &mut signal,
+                &source,
+                chain_id,
+                block,
+                &mut counters,
+            )
+        })?;
 
         // Read the final root only if the drive succeeded, and before
         // tearing down.
-        let root = match &drive {
-            Ok(()) => source
-                .snapshot_after(counters.head)
-                .state_root()
-                .map_err(ReplayError::from)
-                .and_then(|o| o.ok_or(ReplayError::NoStateRoot)),
-            Err(_) => Ok(B256::ZERO), // unused: `drive?` below returns the error first
-        };
-        (drive, root)
+        source
+            .snapshot_after(counters.head)
+            .state_root()
+            .map_err(ReplayError::from)
+            .and_then(|o| o.ok_or(ReplayError::NoStateRoot))?
     };
-    let shutdown = handle.shutdown();
-
-    drive?;
-    shutdown?;
-    let state_root = root?;
 
     Ok(ReplayOutcome {
         head_block: counters.head,
@@ -164,91 +157,84 @@ where
 /// Inner loop. It executes each block's txs, submits the block delta, and
 /// waits for the durable commit. It borrows the adapters, so the caller can
 /// always tear down the writer afterward, no matter the outcome.
-fn drive_blocks<I>(
+fn drive_block(
     queue: &mut MdbxWriterQueue,
     signal: &mut MdbxWriterSignal,
     source: &MdbxSnapshotSource,
     chain_id: u64,
-    blocks: I,
+    block: ReplayBlock,
     counters: &mut Counters,
-) -> Result<(), ReplayError>
-where
-    I: IntoIterator<Item = ReplayBlock>,
-{
-    for block in blocks {
-        // Take the snapshot after the previously committed block, or genesis
-        // for the first block. `wait_committed` below keeps the published
-        // snapshot anchored at `counters.head`. So this is exactly the
-        // pre-block state view.
-        let snapshot = source.snapshot_after(counters.head);
-        let exec_env = ExecEnv {
-            chain_id,
-            block_number: block.block_number,
-            l2_timestamp: block.l2_timestamp,
-        };
+) -> Result<(), ReplayError> {
+    // Take the snapshot after the previously committed block, or genesis
+    // for the first block. `wait_committed` below keeps the published
+    // snapshot anchored at `counters.head`. So this is exactly the
+    // pre-block state view.
+    let snapshot = source.snapshot_after(counters.head);
+    let exec_env = ExecEnv {
+        chain_id,
+        block_number: block.block_number,
+        l2_timestamp: block.l2_timestamp,
+    };
 
-        let mut delta = PendingDelta::new();
-        let mut block_receipts = Vec::with_capacity(block.txs.len());
-        let mut cumulative_gas = 0u64;
-        for (i, tx) in block.txs.iter().enumerate() {
-            let tx_position = BPosition::from_index(counters.global_pos);
-            // Replay executes one durably committed block at a time against
-            // its own committed snapshot. There is no pipelined parent layer.
-            let (receipt, ws) = execute_tx(
-                &snapshot,
-                None,
-                &delta,
-                exec_env,
-                TxIndex(counters.tx_idx),
-                tx_position,
-                tx,
-                i as u64,
-                cumulative_gas,
-                None,
-            )?;
-            delta.apply(ws);
-            cumulative_gas += receipt.gas_used;
-            block_receipts.push(receipt);
-            counters.tx_idx += 1;
-            counters.global_pos += 1;
-            counters.txs_applied += 1;
-        }
-
-        // This runs the same block-close protocol actions as the live
-        // engine, through the same shared implementation. A reconstructor
-        // that skipped them would build a chain whose state diverges from
-        // the canonical one as soon as any feature is active. Replay commits
-        // one block at a time against its own committed snapshot, so there
-        // is no parent layer to check: use `delta`, then the snapshot.
-        kardamom_exec_core::features::apply_block_close_actions(
-            &mut delta,
-            block.block_number,
-            block.l2_timestamp,
-            |addr, slot| {
-                snapshot.storage(addr, slot).map_err(|e| {
-                    crate::error::ExecutorError::State(format!(
-                        "block-close read {addr}/{slot}: {e:?}"
-                    ))
-                })
-            },
+    let mut delta = PendingDelta::new();
+    let mut block_receipts = Vec::with_capacity(block.txs.len());
+    let mut cumulative_gas = 0u64;
+    for (i, tx) in block.txs.iter().enumerate() {
+        let tx_position = BPosition::from_index(counters.global_pos);
+        // Replay executes one durably committed block at a time against
+        // its own committed snapshot. There is no pipelined parent layer.
+        let (receipt, ws) = Executor::execute_once(
+            &snapshot,
+            None,
+            &delta,
+            exec_env,
+            TxIndex(counters.tx_idx),
+            tx_position,
+            tx,
+            i as u64,
+            cumulative_gas,
+            None,
         )?;
-
-        let block_delta = delta.finalize(block.block_number, block_receipts);
-        let boundary = BlockBoundary {
-            block_number: block.block_number,
-            end_tx_idx: BPosition::from_index(counters.global_pos),
-            l2_timestamp: block.l2_timestamp,
-            // Offline replay reconstructs from the DA payload, which does not
-            // carry the origin yet (KAR2 adds it; see the deposit-derivation
-            // spec). Zero here is correct: reconstruction derives no deposits
-            // yet, so no block it builds has an epoch to point at.
-            l1_origin: 0,
-        };
-        queue.submit(boundary, block_delta)?;
-        signal.wait_committed(block.block_number)?;
-        counters.head = block.block_number;
-        counters.blocks_applied += 1;
+        delta.apply(ws);
+        cumulative_gas += receipt.gas_used;
+        block_receipts.push(receipt);
+        counters.tx_idx += 1;
+        counters.global_pos += 1;
+        counters.txs_applied += 1;
     }
+
+    // Same block-close protocol actions the live engine runs, through the
+    // same shared implementation — a reconstructor that skipped them would
+    // rebuild a chain whose state diverges from the canonical one the
+    // moment any feature is active. Replay commits one block at a time
+    // against its own committed snapshot, so there is no parent layer to
+    // consult: `delta` then snapshot.
+    kardamom_exec_core::features::apply_block_close_actions(
+        &mut delta,
+        block.block_number,
+        block.l2_timestamp,
+        |addr, slot| {
+            snapshot.storage(addr, slot).map_err(|e| {
+                crate::error::ExecutorError::State(format!("block-close read {addr}/{slot}: {e:?}"))
+            })
+        },
+    )?;
+
+    let block_delta = delta.finalize(block.block_number, block_receipts);
+    let boundary = BlockBoundary {
+        block_number: block.block_number,
+        end_tx_idx: BPosition::from_index(counters.global_pos),
+        l2_timestamp: block.l2_timestamp,
+        // Offline replay reconstructs from the DA payload, which does not
+        // carry the origin yet (KAR2 adds it — see the deposit-derivation
+        // spec). Zero here is honest: reconstruction currently derives no
+        // deposits, so no block it builds has an epoch to point at.
+        l1_origin: 0,
+    };
+    queue.submit(boundary, block_delta)?;
+    signal.wait_committed(block.block_number)?;
+    counters.head = block.block_number;
+    counters.blocks_applied += 1;
     Ok(())
 }
 

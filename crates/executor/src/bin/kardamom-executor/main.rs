@@ -31,10 +31,11 @@ mod wiring;
 use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_engine::bin_support;
-use kardamom_executor::{
-    Executor, ExecutorConfig, ExecutorError, ExecutorFileConfig, Inbound, MdbxSnapshotSource,
-    MdbxWriterQueue, MdbxWriterSignal, Outbound, RoleHooks,
+use kardamom_engine::{
+    Executor, ExecutorConfig, ExecutorError, Inbound, MdbxSnapshotSource, MdbxWriterQueue,
+    MdbxWriterSignal, Outbound, RoleHooks,
 };
+use kardamom_executor::ExecutorFileConfig;
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::LogConfig;
 use kardamom_state::{StateWriter, seed_genesis};
@@ -46,8 +47,8 @@ use wiring::ExecutorWiring;
 async fn main() -> Result<()> {
     bin_support::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init_service!("executor", args.metrics_addr, &args.host_id)?;
-    kardamom_executor::metrics::describe();
+    kardamom_obs::init_service!("executor", args.metrics_addr, &args.host_id).await?;
+    kardamom_engine::metrics::describe();
     // The TOML supplies the optional `[cluster]` section (disabled by
     // default). All other runtime tuning still comes from the CLI flags
     // above. An empty or comment-only file (the current deployment shape)
@@ -100,7 +101,10 @@ async fn main() -> Result<()> {
     // Load genesis (its chain_id is adopted when present).
     let (genesis, chain_id) = bin_support::resolve_genesis(args.chain.as_deref(), args.chain_id)?;
     let expected_genesis = bin_support::expected_genesis_digest(genesis.as_ref());
-    let state::PreparedState { env, start } = state::prepare_state(&args, expected_genesis)?;
+    // Cancelled on the way out; stops the periodic checkpointer task.
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let state::PreparedState { env, start } =
+        state::prepare_state(&args, expected_genesis, shutdown.clone())?;
 
     // M tx_data subscriptions, plus tx_deposits, bridged from async to
     // sync (shared with the validator binary; see `bin_support`). These
@@ -161,7 +165,7 @@ async fn main() -> Result<()> {
     // Spawn the writer, and build the three executor adapters from its
     // handle. The snapshot-swap channel feeds reads (the snapshot source
     // and commit signal). The delta channel feeds writes.
-    let writer = StateWriter::spawn(env).context("spawn state writer")?;
+    let mut writer = StateWriter::spawn(env).context("spawn state writer")?;
     let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
     let writer_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
     // BAL publication: tee each block's `BlockDelta` onto tx_bal, so
@@ -264,11 +268,11 @@ async fn main() -> Result<()> {
         }
         res = &mut join => Some(res),
     };
-    // Dropping the AeronRuntime closes every subscription. That makes the
-    // tokio pump tasks return `None`, which closes the sync mpsc channels,
-    // which surfaces `TxDataClosed` or `TxOrderingClosed` to the executor:
-    // a clean shutdown.
+    // Dropping the AeronRuntime closes every subscription's sender. Then
+    // the reader threads' `blocking_recv` returns `None`. This surfaces
+    // `TxDataClosed` to the executor, for a clean shutdown.
     drop(rt);
+    shutdown.cancel();
     // In cluster mode, the tx_ordering reader blocks on cluster egress
     // `recv()`, which returns `None` only once the session thread drops
     // its sender: when the `LiveCluster` guard is dropped. Drop it here,
@@ -306,7 +310,7 @@ async fn main() -> Result<()> {
         expected_genesis,
         false,
     )? {
-        metrics::counter!(kardamom_executor::metrics::RESYNC_TOTAL, "outcome" => outcome)
+        metrics::counter!(kardamom_engine::metrics::RESYNC_TOTAL, "outcome" => outcome)
             .increment(1);
     }
     // A non-zero exit lets the orchestrator tell a failed recovery or

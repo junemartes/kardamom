@@ -5,6 +5,22 @@
 //! The binary's Aeron subscriber tasks fill the buffers. The sync exec and
 //! commit threads drain them, and wait briefly for the matching data to
 //! arrive.
+//!
+//! # Why a `Condvar`, not a tokio channel
+//!
+//! The async/sync seam elsewhere in the validator uses tokio primitives
+//! (`tokio::sync::mpsc`, `CancellationToken`). This buffer keeps a
+//! `Mutex` + `Condvar` on purpose:
+//!
+//! - The consumer waits on a KEY with a DEADLINE, not on the next item.
+//!   A channel is FIFO; the keyed map would still have to exist beside it,
+//!   and `tokio::sync::mpsc` has no `recv_timeout` for the sync side.
+//! - The wait lives entirely on the std thread. The async producer only
+//!   takes the mutex for a short, await-free critical section and calls
+//!   `notify_all`, which never blocks. So no tokio task ever parks on a
+//!   std primitive, and the exec thread needs no runtime handle.
+//! - `Condvar::wait_timeout` gives the deadline semantics `take` depends on
+//!   (see the comment in [`KeyedBuffer::take`]) with one primitive.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};

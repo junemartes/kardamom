@@ -86,12 +86,25 @@ pub struct WriterHandle {
 impl WriterHandle {
     /// Stop the writer and wait for its thread to exit. Returns the writer's
     /// final result.
-    pub fn shutdown(mut self) -> Result<(), StateError> {
-        drop(self.delta_tx);
+    ///
+    /// The writer thread exits when the delta channel closes, so this handle's
+    /// sender is replaced with a disconnected one before the join. Any OTHER
+    /// live clone of `delta_tx` keeps the thread alive and makes this call
+    /// block until that clone drops — callers must drop their adapters first.
+    pub fn shutdown(&mut self) -> Result<(), StateError> {
+        let (closed_tx, _) = crossbeam_channel::bounded(0);
+        drop(std::mem::replace(&mut self.delta_tx, closed_tx));
         match self.join.take() {
             Some(j) => j.join().expect("writer thread panicked"),
             None => Ok(()),
         }
+    }
+}
+
+impl Drop for WriterHandle {
+    fn drop(&mut self) {
+        self.shutdown()
+            .unwrap_or_else(|e| error!(message = "Writer didn't shut down properly", err = ?e))
     }
 }
 

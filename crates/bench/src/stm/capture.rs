@@ -5,7 +5,7 @@
 //! inside it.
 
 use alloy_primitives::B256;
-use kardamom_engine::executor::execute_tx;
+use kardamom_engine::executor::Executor;
 use kardamom_engine::{ExecEnv, PendingDelta, TxIndex};
 use kardamom_types::{BPosition, BlockBoundaryStart, StateDatabase, TxEnvelope};
 
@@ -39,7 +39,7 @@ pub fn run_capture<S: StateDatabase>(
         let mut cumulative = 0u64;
         for (i, envelope) in block.iter().enumerate() {
             let mut bal = revm::state::bal::Bal::new();
-            let (receipt, ws) = execute_tx(
+            let (receipt, ws) = Executor::execute_once(
                 snap,
                 None,
                 &delta,

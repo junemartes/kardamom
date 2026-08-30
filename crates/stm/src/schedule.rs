@@ -56,10 +56,10 @@ pub fn scheduling_view(local_idx: u32, envelope: &TxEnvelope) -> TxObs {
 pub fn scheduling_view_decoded(
     local_idx: u32,
     envelope: &TxEnvelope,
-    decoded: Option<&alloy_consensus::TxEnvelope>,
+    decoded: Option<&kardamom_exec_core::executor::DecodedTx>,
 ) -> TxObs {
     let (to, selector, args, has_value) = match decoded {
-        Some(d) => decoded_view(d),
+        Some(d) => decoded_view(&d.0),
         None => (None, None, Vec::new(), false),
     };
     view_from_parts(local_idx, envelope, to, selector, args, has_value)
@@ -167,7 +167,7 @@ impl DagBuilder {
 pub fn build(
     stats: &Stats,
     envelopes: &[TxEnvelope],
-    decoded: &[Option<alloy_consensus::TxEnvelope>],
+    decoded: &[Option<kardamom_exec_core::executor::DecodedTx>],
     exclude: &HashSet<Cell>,
 ) -> BlockSchedule {
     let n = envelopes.len();
@@ -213,10 +213,14 @@ mod tests {
         Address::with_last_byte(i)
     }
 
-    fn decode_all(envs: &[TxEnvelope]) -> Vec<Option<alloy_consensus::TxEnvelope>> {
+    fn decode_all(envs: &[TxEnvelope]) -> Vec<Option<kardamom_exec_core::executor::DecodedTx>> {
         use alloy_eips::eip2718::Decodable2718;
         envs.iter()
-            .map(|e| alloy_consensus::TxEnvelope::decode_2718(&mut &e.raw_tx[..]).ok())
+            .map(|e| {
+                alloy_consensus::TxEnvelope::decode_2718(&mut &e.raw_tx[..])
+                    .ok()
+                    .map(kardamom_exec_core::executor::DecodedTx)
+            })
             .collect()
     }
 

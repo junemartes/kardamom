@@ -14,7 +14,7 @@ pub mod bin;
 /// function would bake in kardamom-obs's version instead.
 ///
 /// ```ignore
-/// kardamom_obs::init_service!("ingress", args.metrics_addr, &args.host_id)?;
+/// kardamom_obs::init_service!("ingress", args.metrics_addr, &args.host_id).await?;
 /// ```
 #[macro_export]
 macro_rules! init_service {
@@ -56,7 +56,12 @@ pub const BUILD_INFO: &str = "kardamom_build_info";
 pub const SERVICE_UP: &str = "kardamom_service_up";
 
 /// Install the Prometheus exporter for this service.
-pub fn init(
+///
+/// Must run inside a Tokio runtime: the exporter future is spawned onto the
+/// ambient runtime (`tokio::spawn`). Every service binary is a
+/// `#[tokio::main]`, so the call site is `init(...).await?` (or the
+/// [`init_service!`] macro followed by `.await?`).
+pub async fn init(
     service: &'static str,
     metrics_addr: SocketAddr,
     host_id: &str,
@@ -66,33 +71,24 @@ pub fn init(
     if host_id.is_empty() {
         return Err(anyhow!("host_id must be non-empty"));
     }
+    // Fail with a clear error (not the exporter's "no reactor running"
+    // panic) when a caller forgets the runtime.
+    tokio::runtime::Handle::try_current()
+        .context("kardamom_obs::init requires an ambient tokio runtime")?;
 
-    // Build and run the exporter on a dedicated thread with its own
-    // single-threaded runtime, never on the service's tokio runtime.
-    // `PrometheusBuilder::install()` spawns onto the ambient runtime when one
-    // exists. That would couple scrape liveness to service-runtime health: a
-    // wedged or starved service runtime would silently take /metrics down
-    // with it, so every probe would read "service gone" when the truth is
-    // "service wedged". A dedicated thread keeps /metrics answering
-    // regardless, so a wedged-but-alive service shows as
-    // `kardamom_service_up == 1` with stale gauges.
-    //
-    // The whole build runs inside the dedicated runtime's context, because
-    // `PrometheusBuilder::build()` needs an ambient Tokio reactor (it fails
-    // with "there is no reactor running" otherwise), and some callers
-    // (da-watcher) call `init` from a plain non-async main. The channel
-    // hand-off makes init fail fast and guarantees the recorder is globally
-    // installed before init returns, so `describe_*!` and `gauge!` below
-    // always reach it.
+    // The exporter runs as a task on the service's runtime. This is the
+    // one tokio runtime in the process. An earlier design used a dedicated
+    // thread and a private runtime, to keep /metrics answering when the
+    // service runtime wedged. The team removed that design to keep one
+    // runtime for the async shell.
     //
     // Fail-fast includes the HTTP bind: metrics-exporter-prometheus (0.18)
     // binds the TCP listener synchronously inside `build()`, so a port
-    // collision surfaces through `ready_tx` as an init error, rather than as
-    // a healthy-looking service with no /metrics. The init_port_in_use
-    // integration test pins this: if a dependency upgrade moves the bind
-    // into the exporter future's first poll, that test fails, and the bind
-    // must be made eager here again (for example, by pre-binding a std
-    // TcpListener).
+    // collision surfaces as an init error, rather than as a healthy-looking
+    // service with no /metrics. The init_port_in_use integration test pins
+    // this: if a dependency upgrade moves the bind into the exporter
+    // future's first poll, that test fails, and the bind must be made
+    // eager here again (for example, by pre-binding a std TcpListener).
     //
     // An `AddrInUse` error gets a bounded retry; every other bind or build
     // error stays fail-fast. A port squatter is usually a wedged or frozen
@@ -112,70 +108,38 @@ pub fn init(
             .and_then(|v| v.parse().ok())
             .unwrap_or(5_000),
     );
-    let host_id_owned = host_id.to_string();
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
-    std::thread::Builder::new()
-        .name("obs-exporter".into())
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("obs-exporter: build runtime")
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                    return;
-                }
-            };
-            let _guard = rt.enter();
-            let build_once = || {
-                PrometheusBuilder::new()
-                    .with_http_listener(metrics_addr)
-                    .set_buckets(DURATION_BUCKETS)
-                    .context("set_buckets")
-                    .and_then(|b| {
-                        b.add_global_label("service", service)
-                            .add_global_label("host_id", &host_id_owned)
-                            .build()
-                            .context("PrometheusBuilder::build")
-                    })
-            };
-            let mut built = build_once();
-            let mut attempt: u32 = 0;
-            while attempt < bind_retries && built.as_ref().err().is_some_and(is_addr_in_use) {
-                attempt += 1;
-                tracing::warn!(
-                    %metrics_addr,
-                    attempt,
-                    max = bind_retries,
-                    "metrics port in use (squatter not yet reaped?); retrying bind (#122)"
-                );
-                std::thread::sleep(bind_retry_delay);
-                built = build_once();
-            }
-            let exporter = match built {
-                Ok((recorder, exporter)) => {
-                    if let Err(e) = metrics::set_global_recorder(recorder) {
-                        let _ = ready_tx.send(Err(anyhow!("set_global_recorder: {e}")));
-                        return;
-                    }
-                    let _ = ready_tx.send(Ok(()));
-                    exporter
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                    return;
-                }
-            };
-            if let Err(e) = rt.block_on(exporter) {
-                tracing::error!(error = ?e, "obs-exporter: exporter terminated");
-            }
-        })
-        .context("spawn obs-exporter thread")?;
-    ready_rx
-        .recv()
-        .context("obs-exporter thread exited before signalling readiness")??;
+    let build_once = || {
+        PrometheusBuilder::new()
+            .with_http_listener(metrics_addr)
+            .set_buckets(DURATION_BUCKETS)
+            .context("set_buckets")
+            .and_then(|b| {
+                b.add_global_label("service", service)
+                    .add_global_label("host_id", host_id)
+                    .build()
+                    .context("PrometheusBuilder::build")
+            })
+    };
+    let mut built = build_once();
+    let mut attempt: u32 = 0;
+    while attempt < bind_retries && built.as_ref().err().is_some_and(is_addr_in_use) {
+        attempt += 1;
+        tracing::warn!(
+            %metrics_addr,
+            attempt,
+            max = bind_retries,
+            "metrics port in use (squatter not yet reaped?); retrying bind (#122)"
+        );
+        tokio::time::sleep(bind_retry_delay).await;
+        built = build_once();
+    }
+    let (recorder, exporter) = built?;
+    metrics::set_global_recorder(recorder).map_err(|e| anyhow!("set_global_recorder: {e}"))?;
+    tokio::spawn(async move {
+        if let Err(e) = exporter.await {
+            tracing::error!(error = ?e, "obs-exporter: exporter terminated");
+        }
+    });
 
     metrics::describe_gauge!(BUILD_INFO, "Build info; value is always 1.");
     metrics::gauge!(

@@ -27,10 +27,10 @@
 //!   triggers. False positives only cost floor lookups, which is what
 //!   lets the triggers stay twitchy and local.
 
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
 use alloy_primitives::Address;
@@ -53,8 +53,11 @@ pub struct FloorUpdate {
     pub deposit: bool,
     /// A marker receipt: the transaction was ordered (canonical-log
     /// commitment is proven, so it confirms publishes), but it consumed
-    /// no nonce, so it is not floor evidence.
-    pub invalid_skip: bool,
+    /// no nonce, so it is not floor evidence. `Some` carries the typed
+    /// cause. The floor logic only asks "is this a skip?" today. Reason
+    /// specific handling (drop on `NonceTooLow`, evict on `NonceTooHigh`)
+    /// is a future step.
+    pub skip_reason: Option<kardamom_types::SkipReason>,
 }
 
 /// Shared state between the egress-watermark FEED thread and the publish
@@ -174,6 +177,9 @@ pub struct ResyncController {
     active: bool,
     floors: HashMap<Address, u64>,
     floor_rx: Receiver<FloorUpdate>,
+    /// The drain sets this when it sees `Disconnected`. It logs the event
+    /// once. It does not treat the channel as "empty forever".
+    floor_rx_dead: bool,
     /// `(sender, nonce, expected)` contiguity rejects, forwarded by the
     /// egress-watermark thread. The sealer refused a ref whose nonce was
     /// not the sender's expected next one. `nonce >= expected` means a
@@ -182,6 +188,7 @@ pub struct ResyncController {
     /// expected nonce advanced past it), and its dedup entry aged out.
     /// This confirms by reject, dropping the ledger entry.
     reject_rx: Receiver<(Address, u64, u64)>,
+    reject_rx_dead: bool,
     watermark: SharedWatermark,
     last_watermark: u64,
     /// Set once the first boundary has been seen. A jump before the
@@ -219,7 +226,9 @@ impl ResyncController {
             active: false,
             floors: HashMap::new(),
             floor_rx,
+            floor_rx_dead: false,
             reject_rx,
+            reject_rx_dead: false,
             watermark,
             last_watermark: 0,
             watermark_seen: false,
@@ -274,7 +283,7 @@ impl ResyncController {
                         continue;
                     }
                     confirmations.push((u.sender, u.executed_nonce));
-                    if u.invalid_skip {
+                    if u.skip_reason.is_some() {
                         continue;
                     }
                     let floor = u.executed_nonce.saturating_add(1);
@@ -284,7 +293,17 @@ impl ResyncController {
                         raised.push((u.sender, floor));
                     }
                 }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.floor_rx_dead {
+                        self.floor_rx_dead = true;
+                        tracing::warn!(
+                            partition = self.partition,
+                            "floor-update producer disconnected; resync floors are frozen"
+                        );
+                    }
+                    break;
+                }
             }
         }
         if !raised.is_empty() {
@@ -332,7 +351,17 @@ impl ResyncController {
                             .or_insert(expected);
                     }
                 }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.reject_rx_dead {
+                        self.reject_rx_dead = true;
+                        tracing::warn!(
+                            partition = self.partition,
+                            "contiguity-reject producer disconnected"
+                        );
+                    }
+                    break;
+                }
             }
         }
         (drops, lowest.into_iter().collect())
@@ -446,8 +475,8 @@ pub type ResyncChannel = (
 /// channel (handed to the egress-watermark thread, alongside the shared
 /// watermark).
 pub fn resync_channel(cfg: ResyncConfig, partition: u32) -> ResyncChannel {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let (reject_tx, reject_rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let (reject_tx, reject_rx) = crossbeam_channel::unbounded();
     let watermark = SharedWatermark::new();
     let controller = ResyncController::new(cfg, partition, rx, reject_rx, watermark.clone());
     (controller, tx, reject_tx, watermark)

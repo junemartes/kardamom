@@ -28,8 +28,8 @@ use revm::primitives::{KECCAK_EMPTY, TxKind};
 use revm::state::Bytecode;
 use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 
-use kardamom_executor::executor::SnapshotRef;
-use kardamom_executor::{
+use kardamom_engine::executor::SnapshotRef;
+use kardamom_engine::{
     BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
     Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ResumePoint,
     RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,

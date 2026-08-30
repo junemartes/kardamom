@@ -8,7 +8,7 @@ use kardamom_types::StateDatabase;
 
 #[test]
 fn pre_n_snapshot_keeps_pre_n_view() {
-    let (_dir, writer) = common::open_tmp_writer();
+    let (_dir, mut writer) = common::open_tmp_writer();
     let addr = address!("0x00000000000000000000000000000000000000aa");
 
     // Drop the genesis snapshot.

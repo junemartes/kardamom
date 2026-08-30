@@ -98,7 +98,7 @@ fn trie_writer_root_matches_model_and_persists() {
             .durability(Durability::SafeNoSync)
             .open()
             .unwrap();
-        let handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
+        let mut handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
         for delta in &blocks {
             for s in &delta.storage {
                 model_stor
@@ -141,7 +141,8 @@ fn shadow_check_agrees_every_block() {
         .durability(Durability::SafeNoSync)
         .open()
         .unwrap();
-    let handle = StateWriter::spawn_with_trie(env, TrieMode::ShadowCheck { every_n: 1 }).unwrap();
+    let mut handle =
+        StateWriter::spawn_with_trie(env, TrieMode::ShadowCheck { every_n: 1 }).unwrap();
     let blocks = vec![
         BlockDelta {
             block_number: 1,

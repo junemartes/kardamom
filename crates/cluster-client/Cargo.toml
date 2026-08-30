@@ -11,6 +11,7 @@ edition.workspace = true
 # is layered on top behind the `aeron-live` feature in later Phase-0 work.
 
 [dependencies]
+num_enum = { workspace = true }
 thiserror.workspace = true
 
 [dev-dependencies]

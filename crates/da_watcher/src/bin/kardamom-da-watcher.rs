@@ -26,6 +26,8 @@ use kardamom_log::config::LogConfig;
 use kardamom_log::recorder::{RecorderKind, record_stream_until_stopped};
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_types::{BPosition, EpochRecord};
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -69,7 +71,8 @@ struct Args {
     host_id: String,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
 
     let args = Args::parse();
@@ -87,12 +90,9 @@ fn main() -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION"),
         option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
     )
+    .await
     .context("init prometheus exporter")?;
     kardamom_da_watcher::metrics::describe();
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
 
     let resolved = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
     let channels = resolved.channels;
@@ -102,22 +102,25 @@ fn main() -> anyhow::Result<()> {
         .context("open TxDepositsPublisherHandle")?;
 
     // Archive recorder for tx_deposits, placed here with the publisher, so
-    // the executor can replay deposit envelopes on crash recovery.
+    // the executor can replay deposit envelopes on crash recovery. The
+    // thread stays a std thread. It holds an Aeron archive session, which
+    // is `!Send`. The seam to the async shell uses a `CancellationToken`
+    // for stop and a `oneshot` channel for readiness.
     //
     // The watcher loop must not publish a single deposit before the
     // recording is confirmed active. Recovery replays from record 0 and
     // needs every envelope, so a gap at the start of the stream would
     // permanently break executor crash recovery. The recorder reports its
-    // startup outcome on `ready`. The code below blocks on it (the
+    // startup outcome on `ready`. The code below waits on it (the
     // tx_deposits publication is already open, so the recording starts
     // quickly) and treats failure as fatal. The operator asked for
     // --archive-durability, so running without it would be a silent lie.
-    let recorder_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = CancellationToken::new();
     let recorder_handle = if args.archive_durability {
         let aeron_dir = args.aeron_dir.clone();
         let channels = channels.clone();
-        let stop = recorder_stop.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<i64, String>>();
+        let stop = stop.clone();
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<i64, String>>();
         let handle = std::thread::Builder::new()
             .name("da-watcher-tx-deposits-recorder".into())
             .spawn(move || {
@@ -148,16 +151,20 @@ fn main() -> anyhow::Result<()> {
             .expect("spawn tx_deposits recorder thread");
         // This budget is generous: normally one catalog-poll tick is about
         // 500ms. The timeout only bounds a stuck or unreachable archive.
-        match ready_rx.recv_timeout(Duration::from_secs(60)) {
-            Ok(Ok(recording_id)) => {
+        match tokio::time::timeout(Duration::from_secs(60), ready_rx).await {
+            Ok(Ok(Ok(recording_id))) => {
                 tracing::info!(recording_id, "tx_deposits recording confirmed active");
             }
-            Ok(Err(e)) => anyhow::bail!(
+            Ok(Ok(Err(e))) => anyhow::bail!(
                 "archive durability requested but the tx_deposits recorder failed to start: {e}"
             ),
-            Err(e) => anyhow::bail!(
+            Ok(Err(_)) => anyhow::bail!(
+                "archive durability requested but the tx_deposits recorder thread exited before \
+                 reporting readiness"
+            ),
+            Err(_) => anyhow::bail!(
                 "archive durability requested but the tx_deposits recording did not become \
-                 active within 60s: {e}"
+                 active within 60s"
             ),
         }
         Some(handle)
@@ -165,37 +172,37 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    rt.block_on(async move {
-        let provider = ProviderBuilder::new()
-            .connect(&args.l1_rpc)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to connect to L1 RPC {}: {e}", args.l1_rpc))?;
-        let source = RpcL1Source::new(provider);
-        let publisher = LiveTxDepositsPublisher::new(tx_deposits_pub);
+    let provider = ProviderBuilder::new()
+        .connect(&args.l1_rpc)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect to L1 RPC {}: {e}", args.l1_rpc))?;
+    let source = RpcL1Source::new(provider);
+    let publisher = LiveTxDepositsPublisher::new(tx_deposits_pub);
 
-        tracing::info!(
-            l1_rpc = %args.l1_rpc,
-            ?lockbox,
-            poll_interval = ?cfg.poll_interval,
-            "kardamom-da-watcher starting; publishing epochs onto tx_deposits"
-        );
+    tracing::info!(
+        l1_rpc = %args.l1_rpc,
+        ?lockbox,
+        poll_interval = ?cfg.poll_interval,
+        "kardamom-da-watcher starting; publishing epochs onto tx_deposits"
+    );
 
-        let handle = spawn_watcher(publisher, source, cfg);
-        // Wait for SIGTERM (an orchestrator stop) or Ctrl-C, then ask the
-        // watcher to exit at the next tick boundary. Dropping the shutdown
-        // channel would also signal this, but an explicit send() gives a
-        // clearer log line.
-        wait_for_shutdown().await;
-        let _ = handle.shutdown.send(());
-        handle
-            .task
-            .await
-            .map_err(|e| anyhow::anyhow!("watcher task panicked: {e}"))?;
-        Ok::<(), anyhow::Error>(())
-    })?;
-    recorder_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let handle = spawn_watcher(publisher, source, cfg);
+    // Wait for SIGTERM (an orchestrator stop) or Ctrl-C, then ask the
+    // watcher to exit at the next tick boundary. Dropping the shutdown
+    // channel would also signal this, but an explicit send() gives a
+    // clearer log line.
+    wait_for_shutdown().await;
+    let _ = handle.shutdown.send(());
+    handle
+        .task
+        .await
+        .map_err(|e| anyhow::anyhow!("watcher task panicked: {e}"))?;
+
+    stop.cancel();
     if let Some(h) = recorder_handle {
-        let _ = h.join();
+        // The recorder thread polls the stop flag; joining it blocks, so
+        // move the join off the runtime workers.
+        let _ = tokio::task::spawn_blocking(move || h.join()).await;
     }
     drop(aeron_rt);
     Ok(())

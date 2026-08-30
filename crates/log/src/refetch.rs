@@ -488,20 +488,68 @@ fn start_bounded_replay(
 
 /// Drain a replay subscription: deliver until [`DRAIN_IDLE`] of silence after
 /// the last fragment (bounded replay exhausted) or the [`DRAIN_CAP`].
+///
+/// The refetcher runs on the tx_ordering reader thread — a plain std thread
+/// with no tokio runtime entered — so each wait is a blocking receive with an
+/// idle timeout via [`recv_timeout`]: the thread parks on the channel and
+/// wakes on the next fragment. No `try_recv` + sleep busy loop, and no
+/// runtime of its own.
 fn drain<T>(rx: &mut UnboundedReceiver<T>, mut deliver: impl FnMut(T)) {
-    let start = Instant::now();
-    let mut last = Instant::now();
-    while start.elapsed() < DRAIN_CAP {
-        match rx.try_recv() {
-            Ok(item) => {
-                deliver(item);
-                last = Instant::now();
-            }
-            Err(_) => {
-                if last.elapsed() >= DRAIN_IDLE {
-                    return;
+    let deadline = Instant::now() + DRAIN_CAP;
+    loop {
+        let budget = DRAIN_IDLE.min(deadline.saturating_duration_since(Instant::now()));
+        if budget.is_zero() {
+            return;
+        }
+        match recv_timeout(rx, budget) {
+            Ok(Some(item)) => deliver(item),
+            // Idle timeout (replay exhausted) or channel closed (runtime gone).
+            Err(RecvTimeout) | Ok(None) => return,
+        }
+    }
+}
+
+/// The wait in [`recv_timeout`] elapsed with nothing received.
+struct RecvTimeout;
+
+/// Blocking receive with a timeout on a tokio `UnboundedReceiver` from a
+/// thread that is NOT inside a tokio runtime. tokio's receiver only offers
+/// `blocking_recv` (no timeout) and async `recv` (needs a timer for
+/// `timeout`), so this drives `poll_recv` by hand with a waker that unparks
+/// the calling thread: park until woken or the deadline, re-poll, repeat.
+/// Spurious unparks just cause an extra poll.
+///
+/// `Ok(None)` means the channel closed; `Err(RecvTimeout)` means the deadline
+/// passed.
+fn recv_timeout<T>(
+    rx: &mut UnboundedReceiver<T>,
+    timeout: Duration,
+) -> Result<Option<T>, RecvTimeout> {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match rx.poll_recv(&mut cx) {
+            Poll::Ready(item) => return Ok(item),
+            Poll::Pending => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(RecvTimeout);
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::park_timeout(deadline - now);
             }
         }
     }

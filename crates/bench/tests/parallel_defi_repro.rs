@@ -18,7 +18,7 @@ use kardamom_engine::actor::BufferedRecord;
 use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::exec_types::TxIndex;
-use kardamom_engine::executor::execute_tx;
+use kardamom_engine::executor::Executor;
 use kardamom_engine::state::MockStateDatabase;
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope};
 use kardamom_validator::parallel::{ClaimIndex, execute_block_parallel};
@@ -91,7 +91,7 @@ fn k20_defi_parallel_matches_sequential_across_compositions() {
     {
         let env = env_for(1);
         for d in &deploys {
-            let (r, ws) = execute_tx(
+            let (r, ws) = Executor::execute_once(
                 &snap,
                 None,
                 &parent,
@@ -111,7 +111,7 @@ fn k20_defi_parallel_matches_sequential_across_compositions() {
         }
         for (si, q) in queues.iter().enumerate() {
             let t = &q[0]; // This is the seed() operation.
-            let (r, ws) = execute_tx(
+            let (r, ws) = Executor::execute_once(
                 &snap,
                 None,
                 &parent,
@@ -161,7 +161,7 @@ fn k20_defi_parallel_matches_sequential_across_compositions() {
         let mut cum = 0u64;
         let mut statuses = Vec::new();
         for (i, (si, t)) in txs.iter().enumerate() {
-            let (r, ws) = execute_tx(
+            let (r, ws) = Executor::execute_once(
                 &snap,
                 Some(&parent),
                 &seq_delta,
@@ -267,7 +267,7 @@ fn create_then_call_across_chunks_in_one_block() {
     let mut bal = revm::state::bal::Bal::new();
     let mut cum = 0u64;
     for (i, (si, t)) in txs.iter().enumerate() {
-        let (r, ws) = execute_tx(
+        let (r, ws) = Executor::execute_once(
             &snap,
             None,
             &seq_delta,

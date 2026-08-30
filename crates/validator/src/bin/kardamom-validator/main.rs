@@ -69,7 +69,7 @@ impl EngineWiring for ValidatorWiring {
 async fn main() -> Result<()> {
     bin_support::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init_service!("validator", args.metrics_addr, &args.host_id)?;
+    kardamom_obs::init_service!("validator", args.metrics_addr, &args.host_id).await?;
     kardamom_engine::metrics::describe();
     metrics::describe();
     // The TOML supplies the `[cluster]` section. The canonical tx_ordering
@@ -173,15 +173,23 @@ async fn main() -> Result<()> {
     let claims = kardamom_validator::ClaimBuffer::new();
     let receipts = ReceiptBuffer::new();
 
-    let bal_pump_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // One token stops every pump. It is cancelled BEFORE `rt` drops (see
+    // `pumps::spawn_bal_pump` for the runtime-clone deadlock it prevents).
+    let pump_shutdown = tokio_util::sync::CancellationToken::new();
     pumps::spawn_bal_pump(
         &rt,
         &channels,
         bals.clone(),
         claims.clone(),
-        bal_pump_stop.clone(),
+        pump_shutdown.clone(),
     )?;
-    pumps::spawn_receipts_pump(&rt, &channels, args.executor_count, receipts.clone())?;
+    pumps::spawn_receipts_pump(
+        &rt,
+        &channels,
+        args.executor_count,
+        receipts.clone(),
+        pump_shutdown.clone(),
+    )?;
 
     // Seed genesis once into a fresh env.
     let (genesis_accounts, genesis_code) = bin_support::build_genesis_alloc(genesis.as_ref());
@@ -203,7 +211,7 @@ async fn main() -> Result<()> {
     // marker, or a truly trie-less image, says to. This must run before
     // the trie-aware writer spawns.
     adoption::bootstrap_trie_if_adopted(&args.state_dir, &env)?;
-    let writer =
+    let mut writer =
         StateWriter::spawn_with_trie(env, trie_mode).context("spawn trie-aware state writer")?;
     let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
     let writer_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
@@ -270,7 +278,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    pumps::spawn_commit_poller(writer.snapshot_rx.clone(), attester_handle.clone());
+    pumps::spawn_commit_poller(
+        writer.snapshot_rx.clone(),
+        attester_handle.clone(),
+        pump_shutdown.clone(),
+    );
 
     let mut cfg = ExecutorConfig {
         chain_id,
@@ -405,7 +417,9 @@ async fn main() -> Result<()> {
         }
         res = &mut join => Some(res),
     };
-    bal_pump_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Order matters: cancel the pumps first so the tx_bal pump releases its
+    // AeronRuntime clone, then drop `rt` so the runtime can shut down.
+    pump_shutdown.cancel();
     drop(rt);
     drop(cluster_guard);
     let joined = match engine_result {

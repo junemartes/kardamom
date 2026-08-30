@@ -23,7 +23,7 @@ use alloy_signer_local::PrivateKeySigner;
 use kardamom_exec_core::block_env::ExecEnv;
 use kardamom_exec_core::delta::{PendingDelta, WriteSet};
 use kardamom_exec_core::exec_types::TxIndex;
-use kardamom_exec_core::executor::{ExecScope, execute_tx};
+use kardamom_exec_core::executor::Executor;
 use kardamom_exec_core::state::MockStateDatabase;
 use kardamom_types::{AccountChange, BPosition, BlockDelta, StorageChange, TxEnvelope};
 
@@ -123,7 +123,7 @@ fn second_tx_write_set_is_scope_invariant() {
 
     // Executor shape: both txs in one scope (per-block CacheDB).
     let db_a = genesis_db();
-    let mut scope = ExecScope::new(&db_a, None, env()).unwrap();
+    let mut scope = Executor::new(&db_a, None, env()).unwrap();
     let (r0_same, _ws0_same) = scope
         .execute_tx(TxIndex(0), pos(0), &tx0, 0, 0, None, None)
         .unwrap();
@@ -136,7 +136,7 @@ fn second_tx_write_set_is_scope_invariant() {
     // the DB, then tx1 runs in a fresh scope that reads the committed
     // state (a batch straddle).
     let db_b = genesis_db();
-    let (r0_split, ws0_split) = execute_tx(
+    let (r0_split, ws0_split) = Executor::execute_once(
         &db_b,
         None,
         &PendingDelta::new(),
@@ -151,7 +151,7 @@ fn second_tx_write_set_is_scope_invariant() {
     .unwrap();
     assert!(r0_split.status);
     db_b.apply_block_delta(&delta_from(&ws0_split, 1));
-    let (r1_split, _ws1_split) = execute_tx(
+    let (r1_split, _ws1_split) = Executor::execute_once(
         &db_b,
         None,
         &PendingDelta::new(),

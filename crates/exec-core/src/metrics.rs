@@ -12,6 +12,6 @@
 /// the canonical log. Treat this as a standing alert.
 pub const INVALID_TX_SKIPPED_TOTAL: &str = "kardamom_executor_invalid_tx_skipped_total";
 
-pub fn record_invalid_tx_skipped() {
-    metrics::counter!(INVALID_TX_SKIPPED_TOTAL).increment(1);
+pub fn record_invalid_tx_skipped(reason: kardamom_types::SkipReason) {
+    metrics::counter!(INVALID_TX_SKIPPED_TOTAL, "reason" => reason.as_str()).increment(1);
 }

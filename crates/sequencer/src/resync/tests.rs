@@ -105,7 +105,7 @@ fn floor_updates_raise_and_report() {
         deposit: false,
         sender: s(1),
         executed_nonce: 4,
-        invalid_skip: false,
+        skip_reason: None,
     })
     .unwrap();
     let (raised, confirmations) = c.drain_floor_updates();
@@ -128,7 +128,7 @@ fn skip_receipts_confirm_but_never_raise_floors() {
         deposit: false,
         sender: s(1),
         executed_nonce: 7,
-        invalid_skip: true,
+        skip_reason: Some(kardamom_types::SkipReason::NonceTooLow),
     })
     .unwrap();
     let (raised, confirmations) = c.drain_floor_updates();
@@ -148,7 +148,7 @@ fn deposit_receipts_neither_confirm_nor_raise() {
         deposit: true,
         sender: s(1),
         executed_nonce: 0,
-        invalid_skip: false,
+        skip_reason: None,
     })
     .unwrap();
     let (raised, confirmations) = c.drain_floor_updates();
@@ -167,7 +167,7 @@ fn genuine_nonce_zero_tx_confirms_and_raises() {
         deposit: false,
         sender: s(1),
         executed_nonce: 0,
-        invalid_skip: false,
+        skip_reason: None,
     })
     .unwrap();
     let (raised, confirmations) = c.drain_floor_updates();
@@ -188,7 +188,7 @@ fn nonce_zero_skip_confirms_without_raising() {
         deposit: false,
         sender: s(1),
         executed_nonce: 0,
-        invalid_skip: true,
+        skip_reason: Some(kardamom_types::SkipReason::NonceTooLow),
     })
     .unwrap();
     let (raised, confirmations) = c.drain_floor_updates();
@@ -225,7 +225,7 @@ fn floors_are_monotonic() {
         deposit: false,
         sender: s(1),
         executed_nonce: 9,
-        invalid_skip: false,
+        skip_reason: None,
     })
     .unwrap();
     // A lower receipt arriving later (a late multicast frame) must not
@@ -234,7 +234,7 @@ fn floors_are_monotonic() {
         deposit: false,
         sender: s(1),
         executed_nonce: 3,
-        invalid_skip: false,
+        skip_reason: None,
     })
     .unwrap();
     let (raised, _) = c.drain_floor_updates();

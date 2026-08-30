@@ -70,8 +70,8 @@ fn pos(offset: i32) -> BPosition {
 /// exactly the state these tests exercise.
 type ResyncTestRig = (
     Sequencer,
-    std::sync::mpsc::Sender<FloorUpdate>,
-    std::sync::mpsc::Sender<(alloy_primitives::Address, u64, u64)>,
+    crossbeam_channel::Sender<FloorUpdate>,
+    crossbeam_channel::Sender<(alloy_primitives::Address, u64, u64)>,
 );
 
 fn resync_sequencer_with_rejects() -> ResyncTestRig {
@@ -81,7 +81,7 @@ fn resync_sequencer_with_rejects() -> ResyncTestRig {
     (seq, floor_tx, reject_tx)
 }
 
-fn resync_sequencer() -> (Sequencer, std::sync::mpsc::Sender<FloorUpdate>) {
+fn resync_sequencer() -> (Sequencer, crossbeam_channel::Sender<FloorUpdate>) {
     let (seq, floor_tx, _reject_tx) = resync_sequencer_with_rejects();
     (seq, floor_tx)
 }
@@ -113,7 +113,7 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
             deposit: false,
             sender: s.address(),
             executed_nonce: 1,
-            invalid_skip: false,
+            skip_reason: None,
         })
         .unwrap();
 
@@ -181,7 +181,7 @@ fn receipt_floor_unsticks_cold_rejoin_buffer() {
             deposit: false,
             sender: s.address(),
             executed_nonce: 4,
-            invalid_skip: false,
+            skip_reason: None,
         })
         .unwrap();
 
@@ -223,7 +223,7 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
             deposit: false,
             sender: s.address(),
             executed_nonce: 1,
-            invalid_skip: false,
+            skip_reason: None,
         })
         .unwrap();
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
@@ -254,7 +254,7 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
             deposit: false,
             sender: s.address(),
             executed_nonce: 2,
-            invalid_skip: false,
+            skip_reason: None,
         })
         .unwrap();
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();

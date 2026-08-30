@@ -39,14 +39,14 @@
 //! wrap `Rc` and raw pointers; the C client is thread-confined). The whole
 //! replay-and-live poll loop runs on one dedicated OS thread that the
 //! [`ReplayMergeSubscriber`] owns. Decoded records cross to the consumer
-//! through a `tokio::sync::mpsc` channel.
+//! through a `tokio::sync::mpsc` channel. The stop request crosses the
+//! other way, as a [`CancellationToken`]. A fatal error comes back as the
+//! thread's `JoinHandle<Result<(), LogError>>` return value.
 
 use std::cell::Cell;
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -55,6 +55,7 @@ use rusteron_archive::{
     AeronArchiveReplayMerge, Handler, Handlers,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::codec;
@@ -74,12 +75,12 @@ const POLL_FRAGMENT_LIMIT: i32 = 100;
 /// [`shutdown`](Self::shutdown), to stop the thread.
 pub struct ReplayMergeSubscriber<T, L = BPosition> {
     rx: UnboundedReceiver<(L, T)>,
-    stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
-    /// Set by the poll thread when it dies with a fatal error (archive
-    /// error, coverage gap, decode failure, or stuck merge). `None` after a
-    /// clean stop. See [`take_failure`](Self::take_failure).
-    failure: Arc<std::sync::Mutex<Option<LogError>>>,
+    stop: CancellationToken,
+    /// The poll thread. Its return value carries the fatal error it died
+    /// with: archive error, coverage gap, decode failure, or a stuck merge.
+    /// It returns `Ok(())` after a clean stop. See
+    /// [`take_failure`](Self::take_failure).
+    join: Option<JoinHandle<Result<(), LogError>>>,
 }
 
 /// Parameters for opening a replay-merge subscriber. The channels mirror
@@ -139,28 +140,26 @@ where
         F: Fn(BPosition, i32) -> L + Send + 'static,
     {
         let (msg_tx, msg_rx) = unbounded_channel::<(L, T)>();
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = CancellationToken::new();
         let stop_thread = stop.clone();
-        let failure = Arc::new(std::sync::Mutex::new(None));
-        let failure_thread = failure.clone();
 
         let join = thread::Builder::new()
             .name("kardamom-replay-merge".into())
             .spawn(move || {
-                if let Err(e) =
+                let res =
                     run_replay_merge::<T, L, F>(&params, &cfg, &stop_thread, loc, move |rec| {
                         // Returns Err only when the consumer has dropped its
                         // receiver. Treat this as a stop request.
                         msg_tx.send(rec).map_err(|_| ())
-                    })
-                {
+                    });
+                if let Err(e) = &res {
                     // A dead replay thread is a failed crash recovery, not a
-                    // clean end of stream. Log at error level and record the
+                    // clean end of stream. Log at error level and return the
                     // failure, so the consumer can tell a closed channel
                     // apart from a clean stop, and exit non-zero.
                     error!(error = %e, "replay-merge subscriber stopped with error");
-                    *failure_thread.lock().expect("replay failure lock") = Some(e);
                 }
+                res
             })
             .map_err(|e| LogError::Aeron(format!("spawn replay-merge thread: {e}")))?;
 
@@ -168,7 +167,6 @@ where
             rx: msg_rx,
             stop,
             join: Some(join),
-            failure,
         })
     }
 
@@ -180,11 +178,23 @@ where
 
     /// Take the fatal error the poll thread died with, if any. After
     /// [`recv`](Self::recv) returns `None`, `Some(_)` here means the replay
-    /// ended abnormally (a failed crash recovery), and the consumer must
-    /// treat it as an error. `None` means a clean stop or end of stream.
-    /// This moves the error out; later calls return `None`.
-    pub fn take_failure(&self) -> Option<LogError> {
-        self.failure.lock().expect("replay failure lock").take()
+    /// terminated abnormally (a failed crash recovery), and the consumer
+    /// must treat it as an error. `None` means a clean stop or end of
+    /// stream. This moves the error out; later calls return `None`.
+    ///
+    /// This joins the poll thread, to read its return value. Call this
+    /// only after `recv` returns `None`. At that point the thread has
+    /// already dropped its sender and is exiting. Calling it earlier
+    /// cancels the thread first, so the join cannot hang. A thread that
+    /// panicked reports as an `Aeron` error.
+    pub fn take_failure(&mut self) -> Option<LogError> {
+        let j = self.join.take()?;
+        self.stop.cancel();
+        match j.join() {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(_) => Some(LogError::Aeron("replay-merge thread panicked".into())),
+        }
     }
 
     /// Borrow the receiver (for example, to bridge into a sync channel).
@@ -194,7 +204,7 @@ where
 
     /// Signal the poll thread to stop and join it.
     pub fn shutdown(mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.cancel();
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -217,7 +227,7 @@ where
 
 impl<T, L> Drop for ReplayMergeSubscriber<T, L> {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.cancel();
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -231,7 +241,7 @@ impl<T, L> Drop for ReplayMergeSubscriber<T, L> {
 fn run_replay_merge<T, L, F>(
     params: &ReplayMergeParams,
     cfg: &AeronConfig,
-    stop: &AtomicBool,
+    stop: &CancellationToken,
     loc: F,
     mut deliver: impl FnMut((L, T)) -> Result<(), ()>,
 ) -> Result<(), LogError>
@@ -345,7 +355,7 @@ where
     // a Result.
     let handler_err: Cell<Option<LogError>> = Cell::new(None);
     let consumer_gone = Cell::new(false);
-    while !stop.load(Ordering::Acquire) {
+    while !stop.is_cancelled() {
         if merge.has_failed() {
             return Err(LogError::Aeron("replay-merge failed".into()));
         }
@@ -394,6 +404,9 @@ where
                 )));
             }
             let _ = archive.poll_for_recording_signals();
+            // Bounded back-off on this std thread: it waits on archive-side
+            // state (fragments arriving), not on the stop signal, so a short
+            // sleep is the right tool; the token is re-checked each lap.
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -428,7 +441,7 @@ const CATALOG_PAGE: i32 = 100;
 fn resolve_recording(
     archive: &rusteron_archive::AeronArchive,
     stream_id: i32,
-    stop: &AtomicBool,
+    stop: &CancellationToken,
 ) -> Result<Option<ResolvedRecording>, LogError> {
     struct Found {
         latest: Cell<Option<(i64, i32, i64)>>,
@@ -457,7 +470,7 @@ fn resolve_recording(
     }
 
     let mut logged = false;
-    while !stop.load(Ordering::Acquire) {
+    while !stop.is_cancelled() {
         let found = Rc::new(Found {
             latest: Cell::new(None),
             matches: Cell::new(0),
@@ -509,6 +522,9 @@ fn resolve_recording(
             );
             logged = true;
         }
+        // Catalog poll cadence (std thread, waiting on archive state); the
+        // stop token is re-checked every lap so cancellation lands within
+        // one tick.
         thread::sleep(Duration::from_millis(500));
     }
     Ok(None)

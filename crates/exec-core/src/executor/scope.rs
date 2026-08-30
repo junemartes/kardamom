@@ -1,10 +1,10 @@
-//! [`ExecScope`]: the per-block EVM and committed cache, plus the free
+//! [`Executor`]: the per-block EVM and committed cache, plus the free
 //! [`execute_tx`] compatibility wrapper and the deterministic invalid-skip
 //! path.
 
 use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256};
-use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
+use kardamom_types::{BPosition, Receipt, SkipReason, StateDatabase, TxEnvelope};
 use revm::context::result::ExecutionResult;
 use revm::database::CacheDB;
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
@@ -18,8 +18,7 @@ use crate::error::ExecutorError;
 use crate::exec_types::{ReceiptStatus, TxIndex};
 
 use super::db::{SnapshotDb, seed_cache_layer};
-use super::tx_env::{decode_alloy_envelope, tx_env_from_alloy};
-use super::write_set::{wire_log, write_set_from_evm_state};
+use super::tx_env::{DecodedTx, tx_env_from_deposit};
 
 /// Per-tx read-touch capture for the footprint shadow scheduler. The
 /// block-level EIP-7928 BAL cannot
@@ -58,7 +57,7 @@ pub struct TouchSet {
 /// The free [`execute_tx`] wrapper (one scope per call) keeps the old
 /// signature, for replay and tests. Hot paths hold one scope per block
 /// (the executor) or per batch (the validator).
-pub struct ExecScope<S: StateDatabase> {
+pub struct Executor<S: StateDatabase> {
     evm: revm::handler::MainnetEvm<
         revm::context::Context<
             revm::context::BlockEnv,
@@ -70,7 +69,7 @@ pub struct ExecScope<S: StateDatabase> {
     env: ExecEnv,
 }
 
-impl<S: StateDatabase> ExecScope<S> {
+impl<S: StateDatabase> Executor<S> {
     /// Build the block's scope. The cache is seeded with the parent layer
     /// only (fixed for the whole block), and the EVM is constructed once.
     pub fn new(
@@ -82,12 +81,12 @@ impl<S: StateDatabase> ExecScope<S> {
         Self::new_with_envs(snapshot, parent, env, block, cfg)
     }
 
-    /// Like [`ExecScope::new`], but with caller-supplied revm envs, instead
+    /// Like [`Executor::new`], but with caller-supplied revm envs, instead
     /// of the ones derived from [`ExecEnv`]. This is the seam the EEST
     /// conformance runner uses to execute under a fixture's block env
     /// (coinbase, basefee, difficulty, blob params). It tests the
     /// engine's revm integration, not kardamom's boundary derivation.
-    /// Production paths use [`ExecScope::new`]. Here, `env` only feeds
+    /// Production paths use [`Executor::new`]. Here, `env` only feeds
     /// the metadata on skip receipts (block number).
     pub fn new_with_envs(
         snapshot: S,
@@ -118,8 +117,131 @@ impl<S: StateDatabase> ExecScope<S> {
         seed_cache_layer(cache, layer).map_err(ExecutorError::State)
     }
 
-    #[allow(clippy::too_many_arguments)] // matches the free execute_tx's shape;
-    // see the matching allow there for the reason.
+    /// Execute a DEPOSIT on this block scope. The historic free function
+    /// (`execute_deposit_tx`, kept as the equivalence reference) rebuilt a
+    /// fresh `CacheDB` and re-seeded parent + delta for every deposit; on
+    /// the scope, the block cache is reused and only the nonce check is
+    /// toggled for the inner call (deposits carry no nonce).
+    ///
+    /// Artifact contract: receipt, `WriteSet` (read slots included — see
+    /// [`WriteSet::from_evm_state_deposit`]), `write_set_hash`, and the
+    /// BAL claims are BYTE-IDENTICAL to the historic path; the
+    /// `old_and_new_deposit_paths_agree` test in `deposit.rs` is the gate.
+    ///
+    /// Error paths fail-stop the pipeline (deposits have no skip
+    /// semantics), so a mint committed before a failed inner call cannot
+    /// leak into a later tx: nothing later runs.
+    pub fn execute_deposit(
+        &mut self,
+        tx_idx: TxIndex,
+        tx_position: BPosition,
+        deposit: &kardamom_types::Deposit,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+        bal: Option<(&mut revm::state::bal::Bal, u64)>,
+    ) -> Result<(Receipt, WriteSet), ExecutorError> {
+        use revm::context::result::ExecutionResult;
+
+        // (1) Mint pre-credit, committed unconditionally — the mint is
+        // durable regardless of inner-call outcome.
+        let cache = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
+        let mut info = revm::Database::basic(cache, deposit.from)
+            .map_err(|e| ExecutorError::Execution {
+                idx: tx_idx,
+                detail: format!("basic({:?}): {e:?}", deposit.from),
+            })?
+            .unwrap_or_default();
+        info.balance = info
+            .balance
+            .checked_add(alloy_primitives::U256::from(deposit.mint))
+            .ok_or_else(|| ExecutorError::Execution {
+                idx: tx_idx,
+                detail: format!(
+                    "mint overflow: account {:?} balance + mint {} would exceed U256::MAX",
+                    deposit.from, deposit.mint
+                ),
+            })?;
+        let mut acct = revm::state::Account::from(info);
+        acct.mark_touch();
+        revm::DatabaseCommit::commit(cache, core::iter::once((deposit.from, acct)).collect());
+
+        // (2) Inner call with the nonce check off. The toggle-restore pair
+        // has NO fallible call between toggle and restore: an early return
+        // with the toggle still set would run every later tx in the block
+        // without nonce validation.
+        let tx_env = tx_env_from_deposit(deposit);
+        (*self.evm).modify_cfg(|c| c.disable_nonce_check = true);
+        let result = self.evm.transact(tx_env);
+        (*self.evm).modify_cfg(|c| c.disable_nonce_check = false);
+        let outcome = result.map_err(|e| ExecutorError::Execution {
+            idx: tx_idx,
+            detail: format!("{e:?}"),
+        })?;
+
+        let gas_used = outcome.result.gas().tx_gas_used();
+        let (status_success, logs) = match &outcome.result {
+            ExecutionResult::Success { logs, .. } => (true, logs.clone()),
+            ExecutionResult::Revert { .. } => (false, alloc::vec::Vec::new()),
+            ExecutionResult::Halt { .. } => (false, alloc::vec::Vec::new()),
+        };
+
+        // (3) The deposit artifact keeps read slots (see the extractor
+        // doc). Capture before the commit consumes the state.
+        let mut ws = WriteSet::from_evm_state_deposit(&outcome.state);
+        revm::DatabaseCommit::commit(
+            revm::context_interface::ContextTr::db_mut(&mut *self.evm),
+            outcome.state,
+        );
+        // The sender always carries the mint in the artifact, even when
+        // the inner call never touched it.
+        if !ws.accounts.iter().any(|(a, _)| *a == deposit.from) {
+            let cache = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
+            let info = revm::Database::basic(cache, deposit.from)
+                .map_err(|e| ExecutorError::Execution {
+                    idx: tx_idx,
+                    detail: format!("basic({:?}): {e:?}", deposit.from),
+                })?
+                .unwrap_or_default();
+            ws.accounts
+                .push((deposit.from, (info.nonce, info.balance, info.code_hash)));
+            ws.finish();
+        }
+        if let Some((bal, bal_index)) = bal {
+            ws.record_into_bal(bal, bal_index);
+        }
+
+        let write_set_hash = ws.hash();
+        let wire_logs: alloc::vec::Vec<kardamom_types::WireLog> =
+            logs.iter().map(kardamom_types::WireLog::from).collect();
+        let cumulative_gas_used = cumulative_gas_used_before + gas_used;
+        let receipt = Receipt {
+            tx_idx: tx_position,
+            // Deposits' canonical id is the OP source_hash, NOT a 2718
+            // keccak.
+            tx_hash: deposit.source_hash,
+            // L1-originated: consumes no L2 nonce (the filler `nonce: 0`
+            // is NOT a real nonce — consumers branch on the type).
+            tx_type: kardamom_types::TX_TYPE_DEPOSIT,
+            status: status_success,
+            gas_used,
+            logs: wire_logs,
+            write_set_hash,
+            nonce: 0,
+            from: deposit.from,
+            to: deposit.to,
+            contract_address: None,
+            // Deposits pay no fee.
+            effective_gas_price: 0,
+            block_number: self.env.block_number,
+            transaction_index: tx_index_in_block,
+            cumulative_gas_used,
+            skip_reason: None,
+        };
+        Ok((receipt, ws))
+    }
+
+    #[allow(clippy::too_many_arguments)] // the per-tx entry point's shape;
+    // see the equivalent allow on `execute_once`.
     pub fn execute_tx(
         &mut self,
         tx_idx: TxIndex,
@@ -154,10 +276,11 @@ impl<S: StateDatabase> ExecScope<S> {
         // failures (database errors) still fail-stop below. A skip is
         // loud by design: any occurrence means an upstream guard failed,
         // and `kardamom_executor_invalid_tx_skipped_total` should alert.
-        let alloy_env = match decode_alloy_envelope(&inbound_envelope.raw_tx, tx_idx) {
+        let alloy_env = match DecodedTx::decode(&inbound_envelope.raw_tx, tx_idx) {
             Ok(env_) => env_,
             Err(e) => {
-                return Ok(invalid_skip(
+                return Ok(Self::skip_receipt(
+                    SkipReason::Undecodable,
                     &format!("undecodable raw_tx: {e}"),
                     tx_position,
                     inbound_envelope,
@@ -195,7 +318,7 @@ impl<S: StateDatabase> ExecScope<S> {
         tx_idx: TxIndex,
         tx_position: BPosition,
         inbound_envelope: &TxEnvelope,
-        alloy_env: &alloy_consensus::TxEnvelope,
+        alloy_env: &DecodedTx,
         tx_index_in_block: u64,
         cumulative_gas_used_before: u64,
         bal: Option<(&mut revm::state::bal::Bal, u64)>,
@@ -212,14 +335,15 @@ impl<S: StateDatabase> ExecScope<S> {
             .gas_price()
             .unwrap_or_else(|| alloy_env.max_fee_per_gas());
 
-        let tx_env = tx_env_from_alloy(alloy_env, signer);
+        let tx_env = alloy_env.tx_env(signer);
         let outcome = match self.evm.transact(tx_env) {
             Ok(o) => o,
             // Deterministic input invalidity: every replica computes the
             // same rejection from the same state and tx. Skip, never halt.
-            Err(revm::context::result::EVMError::Transaction(reason)) => {
-                return Ok(invalid_skip(
-                    &format!("{reason:?}"),
+            Err(revm::context::result::EVMError::Transaction(e)) => {
+                return Ok(Self::skip_receipt(
+                    skip_reason_of_tx(&e),
+                    &format!("{e:?}"),
                     tx_position,
                     inbound_envelope,
                     nonce,
@@ -229,9 +353,10 @@ impl<S: StateDatabase> ExecScope<S> {
                     cumulative_gas_used_before,
                 ));
             }
-            Err(revm::context::result::EVMError::Header(reason)) => {
-                return Ok(invalid_skip(
-                    &format!("{reason:?}"),
+            Err(revm::context::result::EVMError::Header(e)) => {
+                return Ok(Self::skip_receipt(
+                    SkipReason::Header,
+                    &format!("{e:?}"),
                     tx_position,
                     inbound_envelope,
                     nonce,
@@ -265,7 +390,7 @@ impl<S: StateDatabase> ExecScope<S> {
         // and changed accounts and slots are emitted, which keeps the
         // per-tx hash stable across replicas. Revm iterates over an
         // AddressMap; `WriteSet::finish` sorts the entries afterward.
-        let ws = write_set_from_evm_state(&outcome.state);
+        let ws = WriteSet::from_evm_state(&outcome.state);
         if let Some((bal, bal_index)) = bal {
             for (addr, account) in outcome.state.iter() {
                 bal.update_account(bal_index, *addr, account);
@@ -293,7 +418,7 @@ impl<S: StateDatabase> ExecScope<S> {
         );
 
         let write_set_hash = ws.hash();
-        let wire_logs = logs.iter().map(wire_log).collect();
+        let wire_logs = logs.iter().map(kardamom_types::WireLog::from).collect();
         let cumulative_gas_used = cumulative_gas_used_before + gas_used;
         // Contract address is meaningful only for a successful CREATE tx.
         // A failed CREATE and any CALL tx have `contract_address = None`.
@@ -323,6 +448,7 @@ impl<S: StateDatabase> ExecScope<S> {
             block_number: self.env.block_number,
             transaction_index: tx_index_in_block,
             cumulative_gas_used,
+            skip_reason: None,
         };
         Ok((receipt, ws))
     }
@@ -347,98 +473,161 @@ impl<S: StateDatabase> ExecScope<S> {
 #[allow(clippy::too_many_arguments)] // 8 args is the natural shape of an
 // "execute one tx" entry point. Packaging them into a struct would just
 // move the noise around, not reduce it.
-pub fn execute_tx<S: StateDatabase>(
-    snapshot: &S,
-    parent: Option<&PendingDelta>,
-    delta: &PendingDelta,
-    env: ExecEnv,
-    tx_idx: TxIndex,
-    tx_position: BPosition,
-    inbound_envelope: &TxEnvelope,
-    tx_index_in_block: u64,
-    cumulative_gas_used_before: u64,
-    // EIP-7928 capture. When set, this records every account and slot
-    // the tx touched into the
-    // block's Bal, under `bal_index` (a 1-based tx position, by revm's
-    // convention). Writes go in as (index, value); read-only accesses go
-    // into storage_reads. Revm classifies each by comparing original and
-    // present values in `outcome.state`.
-    bal: Option<(&mut revm::state::bal::Bal, u64)>,
-) -> Result<(Receipt, WriteSet), ExecutorError> {
-    // A compatibility wrapper: one throwaway scope per call, for replay
-    // and tests. Hot paths hold an [`ExecScope`] per block or batch
-    // instead. That is where the allocation savings come from.
-    let mut scope = ExecScope::new(snapshot, parent, env)?;
-    scope.seed_layer(delta)?;
-    scope.execute_tx(
-        tx_idx,
-        tx_position,
-        inbound_envelope,
-        tx_index_in_block,
-        cumulative_gas_used_before,
-        bal,
-        None,
-    )
+impl<S: StateDatabase> Executor<S> {
+    /// One-shot convenience method. It builds a throwaway executor for
+    /// one call. It seeds the caller's live delta, then executes one tx.
+    /// Use this for replay and tests. A hot path holds one [`Executor`]
+    /// per block or batch instead, for the allocation win.
+    #[allow(clippy::too_many_arguments)] // the one-tx entry point's shape.
+    pub fn execute_once(
+        snapshot: &S,
+        parent: Option<&PendingDelta>,
+        delta: &PendingDelta,
+        env: ExecEnv,
+        tx_idx: TxIndex,
+        tx_position: BPosition,
+        inbound_envelope: &TxEnvelope,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+        // EIP-7928 capture. When set, this records every account and
+        // slot the tx touched into the block's Bal, under `bal_index`
+        // (a 1-based tx position, by revm's convention). Writes go in
+        // as (index, value); read-only accesses go into storage_reads.
+        // Revm classifies each by comparing original and present
+        // values in `outcome.state`.
+        bal: Option<(&mut revm::state::bal::Bal, u64)>,
+    ) -> Result<(Receipt, WriteSet), ExecutorError> {
+        let mut scope = Executor::new(snapshot, parent, env)?;
+        scope.seed_layer(delta)?;
+        scope.execute_tx(
+            tx_idx,
+            tx_position,
+            inbound_envelope,
+            tx_index_in_block,
+            cumulative_gas_used_before,
+            bal,
+            None,
+        )
+    }
 }
 
-/// Build the deterministic skip receipt for a canonical record that is
-/// invalid at execution: `status=false, gas_used=0` (the wire-visible
-/// marker, since real execution always charges intrinsic gas), empty
-/// logs, an empty write set (`WriteSet::default().hash()` on both the
-/// live and re-exec sides), and unchanged gas accounting. This is loud by
-/// design: a log plus a counter. A skip existing at all means an upstream
-/// guard (sequencer nonce fence, cluster dedup, or resync floor) let an
-/// invalid record reach the canonical log.
-///
-/// Public API: the Block-STM engine (`kardamom-stm`) produces the
-/// identical skip artifact on its parallel path. One definition, one
-/// wire shape.
-#[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(feature = "std"), allow(unused_variables))]
-pub fn invalid_skip(
-    reason: &str,
-    tx_position: BPosition,
-    inbound_envelope: &TxEnvelope,
-    nonce: u64,
-    to: Option<Address>,
-    block_number: u64,
-    tx_index_in_block: u64,
-    cumulative_gas_used_before: u64,
-) -> (Receipt, WriteSet) {
-    // Loudness is a `std`-side concern. The skip receipt itself is the
-    // consensus artifact, and guest builds produce it identically.
-    #[cfg(feature = "std")]
-    {
-        tracing::error!(
-            tx_hash = ?inbound_envelope.tx_hash,
-            from = ?inbound_envelope.sender,
-            nonce,
-            block = block_number,
-            reason,
-            "INVALID canonical tx SKIPPED (deterministic; upstream guard failed — investigate)"
-        );
-        crate::metrics::record_invalid_tx_skipped();
+/// Classify a revm tx-validation rejection into the wire [`SkipReason`].
+/// This is part of the state transition: every replica maps the same
+/// rejection to the same reason. This function stands in for
+/// `From<&InvalidTransaction>`, which the orphan rule blocks here (both
+/// types are foreign to this crate).
+pub fn skip_reason_of_tx(err: &revm::context::result::InvalidTransaction) -> SkipReason {
+    use revm::context::result::InvalidTransaction as E;
+    match err {
+        E::NonceTooLow { .. } => SkipReason::NonceTooLow,
+        E::NonceTooHigh { .. } => SkipReason::NonceTooHigh,
+        E::LackOfFundForMaxFee { .. } | E::OverflowPaymentInTransaction => {
+            SkipReason::InsufficientFunds
+        }
+        E::CallerGasLimitMoreThanBlock
+        | E::CallGasCostMoreThanGasLimit { .. }
+        | E::GasFloorMoreThanGasLimit { .. }
+        | E::TxGasLimitGreaterThanCap { .. } => SkipReason::GasLimit,
+        E::PriorityFeeGreaterThanMaxFee
+        | E::GasPriceLessThanBasefee
+        | E::BlobGasPriceGreaterThanMax { .. } => SkipReason::Fee,
+        E::CreateInitCodeSizeLimit => SkipReason::InitCodeSize,
+        E::RejectCallerWithCode => SkipReason::SenderHasCode,
+        _ => SkipReason::OtherTransaction,
     }
-    let ws = WriteSet::default();
-    let write_set_hash = ws.hash();
-    let receipt = Receipt {
-        tx_idx: tx_position,
-        tx_hash: inbound_envelope.tx_hash,
-        tx_type: kardamom_types::tx_type_of(&inbound_envelope.raw_tx),
-        status: false,
-        gas_used: 0,
-        logs: Vec::new(),
-        write_set_hash,
-        nonce,
-        from: inbound_envelope.sender,
-        to,
-        contract_address: None,
-        effective_gas_price: 0,
-        block_number,
-        transaction_index: tx_index_in_block,
-        cumulative_gas_used: cumulative_gas_used_before,
-    };
-    (receipt, ws)
+}
+
+/// The deterministic skip receipt, as an associated constructor. It
+/// needs no state access. The Block-STM engine builds skip receipts
+/// inside its own worker EVM, and both paths must keep one definition
+/// of the skip artifact.
+impl<S: StateDatabase> Executor<S> {
+    /// Build the deterministic skip receipt for a canonical record that is
+    /// invalid at execution: `status=false, gas_used=0` (the wire-visible
+    /// marker, since real execution always charges intrinsic gas), empty
+    /// logs, an empty write set (`WriteSet::default().hash()` on both the
+    /// live and re-exec sides), and unchanged gas accounting. This is loud
+    /// by design: a log plus a counter. A skip existing at all means an
+    /// upstream guard (sequencer nonce fence, cluster dedup, or resync
+    /// floor) let an invalid record reach the canonical log.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "std"), allow(unused_variables))]
+    pub fn skip_receipt(
+        reason: SkipReason,
+        detail: &str,
+        tx_position: BPosition,
+        inbound_envelope: &TxEnvelope,
+        nonce: u64,
+        to: Option<Address>,
+        block_number: u64,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+    ) -> (Receipt, WriteSet) {
+        // Loudness is a `std`-side concern. The skip receipt itself is
+        // the consensus artifact, and guest builds produce it
+        // identically. `detail` keeps the full revm rejection next to
+        // the coarse enum.
+        #[cfg(feature = "std")]
+        {
+            tracing::error!(
+                tx_hash = ?inbound_envelope.tx_hash,
+                from = ?inbound_envelope.sender,
+                nonce,
+                block = block_number,
+                reason = reason.as_str(),
+                detail,
+                "INVALID canonical tx SKIPPED (deterministic; upstream guard failed — investigate)"
+            );
+            crate::metrics::record_invalid_tx_skipped(reason);
+        }
+        let ws = WriteSet::default();
+        let write_set_hash = ws.hash();
+        let receipt = Receipt {
+            tx_idx: tx_position,
+            tx_hash: inbound_envelope.tx_hash,
+            tx_type: kardamom_types::tx_type_of(&inbound_envelope.raw_tx),
+            status: false,
+            gas_used: 0,
+            logs: Vec::new(),
+            write_set_hash,
+            nonce,
+            from: inbound_envelope.sender,
+            to,
+            contract_address: None,
+            effective_gas_price: 0,
+            block_number,
+            transaction_index: tx_index_in_block,
+            cumulative_gas_used: cumulative_gas_used_before,
+            skip_reason: Some(reason),
+        };
+        (receipt, ws)
+    }
+
+    /// [`Self::skip_receipt`] with this executor's block number.
+    #[allow(clippy::too_many_arguments)]
+    pub fn skip(
+        &self,
+        reason: SkipReason,
+        detail: &str,
+        tx_position: BPosition,
+        inbound_envelope: &TxEnvelope,
+        nonce: u64,
+        to: Option<Address>,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+    ) -> (Receipt, WriteSet) {
+        Self::skip_receipt(
+            reason,
+            detail,
+            tx_position,
+            inbound_envelope,
+            nonce,
+            to,
+            self.env.block_number,
+            tx_index_in_block,
+            cumulative_gas_used_before,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -499,7 +688,7 @@ mod tests {
         let env = ExecEnv::new(1, &boundary(1));
 
         let stale = signed_transfer(&signer, to, 1_000, 3);
-        let (receipt, ws) = execute_tx(
+        let (receipt, ws) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -513,6 +702,11 @@ mod tests {
         )
         .expect("invalid tx must SKIP, not error");
         assert!(receipt.is_invalid_skip(), "status=false, gas_used=0 marker");
+        assert_eq!(
+            receipt.skip_reason,
+            Some(SkipReason::NonceTooLow),
+            "typed cause on the wire (#241)"
+        );
         assert_eq!(receipt.tx_hash, stale.tx_hash);
         assert_eq!(receipt.nonce, 3);
         assert_eq!(
@@ -529,7 +723,7 @@ mod tests {
         // The chain continues. The sender's real next tx, nonce 5, executes.
         let env2 = ExecEnv::new(1, &boundary(1));
         let live = signed_transfer(&signer, to, 1_000, 5);
-        let (r2, _) = execute_tx(
+        let (r2, _) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -544,6 +738,7 @@ mod tests {
         .expect("valid tx after a skip");
         assert!(r2.status);
         assert!(!r2.is_invalid_skip());
+        assert_eq!(r2.skip_reason, None, "an executed tx carries no reason");
     }
 
     #[test]
@@ -558,7 +753,7 @@ mod tests {
             sender: signer.address(),
             tx_hash: keccak256([0xde, 0xad, 0xbe, 0xef]),
         };
-        let (receipt, ws) = execute_tx(
+        let (receipt, ws) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -572,6 +767,7 @@ mod tests {
         )
         .expect("undecodable bytes must SKIP, not error");
         assert!(receipt.is_invalid_skip());
+        assert_eq!(receipt.skip_reason, Some(SkipReason::Undecodable));
         assert_eq!(receipt.nonce, 0, "nonce unknowable from undecodable bytes");
         assert_eq!(receipt.write_set_hash, WriteSet::default().hash());
         assert!(ws.accounts.is_empty());
@@ -590,7 +786,7 @@ mod tests {
         let env = ExecEnv::new(1, &boundary(1));
 
         let env_tx = signed_transfer(&signer, to, 1_000, 0);
-        let (receipt, ws) = execute_tx(
+        let (receipt, ws) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -643,7 +839,7 @@ mod tests {
         let mut delta = PendingDelta::new();
         // First transfer.
         let tx1 = signed_transfer(&signer, to, 100, 0);
-        let (r1, ws1) = execute_tx(
+        let (r1, ws1) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -666,7 +862,7 @@ mod tests {
         // Second transfer from the same sender. The nonce must be 1, and
         // the sender balance must already show a debit of 100.
         let tx2 = signed_transfer(&signer, to, 50, 1);
-        let (r2, ws2) = execute_tx(
+        let (r2, ws2) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -706,7 +902,7 @@ mod tests {
         let tx = signed_transfer(&signer, to, 1_000, 0);
 
         let mut bal = revm::state::bal::Bal::new();
-        let (_receipt, ws) = execute_tx(
+        let (_receipt, ws) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -756,7 +952,7 @@ mod tests {
         // tx1 populates the delta (as in a real block).
         let tx1 = signed_transfer(&signer, to, 1_000, 0);
         let mut bal = revm::state::bal::Bal::new();
-        let (_r1, ws1) = execute_tx(
+        let (_r1, ws1) = Executor::execute_once(
             &snap,
             None,
             &delta,
@@ -774,7 +970,7 @@ mod tests {
 
         // tx2 runs with the seeded delta. This is the production path.
         let tx2 = signed_transfer(&signer, to, 500, 1);
-        let (_r2, ws2) = execute_tx(
+        let (_r2, ws2) = Executor::execute_once(
             &snap,
             None,
             &delta,

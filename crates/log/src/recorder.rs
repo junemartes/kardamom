@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::{AeronConfig, ChannelsConfig, RecorderId};
@@ -201,7 +202,7 @@ impl RecorderKind {
 /// records tx_deposits). It connects a thread-confined archive session,
 /// starts recording `(channel, stream_id)`, reports the startup outcome
 /// exactly once through `ready`, and holds the recording (and its archive
-/// session) alive until `stop` is set. The recording itself runs in the
+/// session) alive until `stop` is cancelled. The recording itself runs in the
 /// ArchivingMediaDriver. This thread only keeps the session connected and
 /// re-adopts an existing recording on restart.
 ///
@@ -211,17 +212,29 @@ impl RecorderKind {
 /// barrier before they publish anything. Crash recovery replays from record
 /// 0 and needs every envelope, so a gap at the birth of the stream would
 /// permanently break executor crash recovery.
+///
+/// ## Stop signal
+///
+/// `stop` is a [`CancellationToken`]. It is the one seam primitive between
+/// the tokio shell and this std thread. The archive session is `!Send`. So
+/// the function stays a blocking thread body, not an async fn. Once the
+/// recording is active, the thread only waits. It parks on
+/// `stop.cancelled()` through `futures::executor::block_on`. The token's
+/// future needs no tokio timer or reactor. So this works with or without a
+/// runtime handle on the thread. It wakes the instant the token is
+/// cancelled; it does not sleep-poll. During startup, the catalog wait
+/// still polls the archive on a bounded 500 ms cadence, because it waits
+/// on archive state, not on the stop signal. It checks
+/// `stop.is_cancelled()` on each tick.
 pub fn record_stream_until_stopped(
     aeron_dir: Option<&Path>,
     aeron_cfg: &AeronConfig,
     channel: &str,
     stream_id: i32,
     kind: RecorderKind,
-    stop: &std::sync::atomic::AtomicBool,
+    stop: &CancellationToken,
     ready: impl FnOnce(Result<i64, String>),
 ) -> Result<(), LogError> {
-    use std::sync::atomic::Ordering;
-
     let session = match connect_archive(aeron_dir, aeron_cfg) {
         Ok(s) => s,
         Err(e) => {
@@ -229,7 +242,7 @@ pub fn record_stream_until_stopped(
             return Err(e);
         }
     };
-    let mut should_stop = || stop.load(Ordering::SeqCst);
+    let mut should_stop = || stop.is_cancelled();
     let recorder =
         match Recorder::start_stream(session.archive, channel, stream_id, kind, &mut should_stop) {
             Ok(Some(r)) => r,
@@ -246,9 +259,7 @@ pub fn record_stream_until_stopped(
         };
     ready(Ok(recorder.recording_id()));
     // Hold the recording (and its archive session) alive until shutdown.
-    while !stop.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    futures::executor::block_on(stop.cancelled());
     Ok(())
 }
 

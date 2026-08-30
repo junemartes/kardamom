@@ -25,9 +25,11 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
 use revm::state::Bytecode;
 
-use kardamom_executor::block_env::ExecEnv;
-use kardamom_executor::executor::execute_tx;
-use kardamom_executor::{
+use kardamom_engine::block_env::ExecEnv;
+// The exec-core Executor (the per-block EVM scope) is a different type
+// from the actor `kardamom_engine::Executor` imported below.
+use kardamom_engine::executor::Executor as ExecCore;
+use kardamom_engine::{
     BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
     Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, PendingDelta,
     ResumePoint, RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
@@ -113,7 +115,7 @@ fn bench_transfer_step(c: &mut Criterion) {
         b.iter(|| {
             let delta = PendingDelta::new();
             let env_tx = signed_transfer(&signer, to, 0);
-            let _ = execute_tx(
+            let _ = ExecCore::execute_once(
                 &snap,
                 None,
                 &delta,
@@ -154,7 +156,7 @@ fn bench_sstore_step(c: &mut Criterion) {
         b.iter(|| {
             let delta = PendingDelta::new();
             let env_tx = signed_sstore_call(&signer, contract, 0);
-            let (_r, _ws) = execute_tx(
+            let (_r, _ws) = ExecCore::execute_once(
                 &snap,
                 None,
                 &delta,

@@ -36,7 +36,7 @@ use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use revm::primitives::KECCAK_EMPTY;
 
-use kardamom_executor::{
+use kardamom_engine::{
     BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
     Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ReaderConfig,
     ResumePoint, RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,

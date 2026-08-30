@@ -26,7 +26,7 @@ fn recovery_point_matches_last_committed_block() {
             .durability(Durability::SafeNoSync)
             .open()
             .unwrap();
-        let writer = StateWriter::spawn(env).unwrap();
+        let mut writer = StateWriter::spawn(env).unwrap();
         // Drain the genesis snapshot.
         let _ = writer.snapshot_rx.recv();
         for block in 1..=3u64 {

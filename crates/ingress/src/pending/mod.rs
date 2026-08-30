@@ -111,9 +111,13 @@ pub const DEFAULT_TX_ERROR_GRACE: Duration = Duration::from_millis(500);
 pub struct PendingReceipts {
     policy: AckPolicy,
     map: PendingMap,
-    /// Latest watermarks observed. Cached to avoid a one-receiver-per-await
-    /// fanout.
-    latest: Arc<Mutex<Watermarks>>,
+    /// Latest watermarks observed: one `watch` slot per kind. A `watch`
+    /// channel already gives the cache-latest-value behavior, with no
+    /// one-receiver-per-await fanout, that the old `Arc<Mutex<Watermarks>>`
+    /// hand-built. Writers call `send_replace`. Readers call `borrow`,
+    /// with no lock and no await.
+    quorum: tokio::sync::watch::Sender<Option<BPosition>>,
+    local: tokio::sync::watch::Sender<Option<BPosition>>,
     /// See [`DEFAULT_TX_ERROR_GRACE`]. Tests can override this.
     error_grace: Duration,
     /// Watermark-ordered index of parked entries: `(tx_idx, seq)` to
@@ -149,7 +153,8 @@ impl PendingReceipts {
         Self {
             policy,
             map: Arc::new(DashMap::new()),
-            latest: Arc::new(Mutex::new(Watermarks::default())),
+            quorum: tokio::sync::watch::Sender::new(None),
+            local: tokio::sync::watch::Sender::new(None),
             error_grace,
             parked: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             park_seq: std::sync::atomic::AtomicU64::new(0),
@@ -196,7 +201,7 @@ impl PendingReceipts {
         };
         let mut e = entry.lock().await;
         e.receipt = Some(receipt.clone());
-        let latest = *self.latest.lock().await;
+        let latest = self.watermarks();
         if self.gate_satisfied(&latest, receipt.tx_idx) {
             if let Some(resp) = e.responder.take() {
                 // This only releases the waiter. The woken waiter's Drop
@@ -221,8 +226,9 @@ impl PendingReceipts {
             // burst's final tick, the waiter would hang until client
             // timeout, holding its connection open, which amplifies file
             // descriptor use at the tail of a burst. Re-draining after
-            // the park is idempotent, and it closes this window.
-            let latest2 = *self.latest.lock().await;
+            // the park is idempotent, and it closes this window. The
+            // re-read is a lock-free `borrow` now.
+            let latest2 = self.watermarks();
             if self.gate_satisfied(&latest2, tx_idx) {
                 self.release_satisfied().await;
             }
@@ -284,17 +290,27 @@ impl PendingReceipts {
         }
     }
 
-    /// Called when a new quorum-watermark snapshot arrives.
+    /// Called when a new quorum-watermark snapshot arrives. The drain
+    /// runs inline, so the release happens on the same tick, with no
+    /// scheduler hop.
     pub async fn update_quorum_watermark(&self, wm: QuorumWatermark) {
-        self.latest.lock().await.quorum = Some(wm.position);
+        self.quorum.send_replace(Some(wm.position));
         self.release_satisfied().await;
     }
 
     /// Called when a new local-fsync watermark snapshot arrives, from
     /// the per-recorder stream for the local host.
     pub async fn update_local_watermark(&self, wm: FsyncWatermark) {
-        self.latest.lock().await.local = Some(wm.position);
+        self.local.send_replace(Some(wm.position));
         self.release_satisfied().await;
+    }
+
+    /// The latest watermark pair, read lock-free from the watch slots.
+    fn watermarks(&self) -> Watermarks {
+        Watermarks {
+            quorum: *self.quorum.borrow(),
+            local: *self.local.borrow(),
+        }
     }
 
     /// Walks every parked entry and releases the ones whose stored
@@ -303,7 +319,7 @@ impl PendingReceipts {
     /// through the oneshot, and leaves slot removal to the woken
     /// waiter's Drop.
     async fn release_satisfied(&self) {
-        let latest = *self.latest.lock().await;
+        let latest = self.watermarks();
         // The effective release watermark is the minimum over the
         // watermark kinds the policy requires. If a required watermark
         // is absent, nothing releases.

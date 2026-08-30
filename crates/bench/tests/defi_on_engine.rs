@@ -15,7 +15,7 @@ use kardamom_bench::mnemonic;
 use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::exec_types::TxIndex;
-use kardamom_engine::executor::execute_tx;
+use kardamom_engine::executor::Executor;
 use kardamom_engine::state::MockStateDatabase;
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope};
 
@@ -63,7 +63,7 @@ fn defi_workload_executes_on_the_engine() {
     let mut cumulative = 0u64;
     let mut i = 0u64;
     let mut run = |tx: &PlannedTx, sender: Address, delta: &mut PendingDelta, cum: &mut u64| {
-        let (receipt, ws) = execute_tx(
+        let (receipt, ws) = Executor::execute_once(
             &snap,
             None,
             delta,

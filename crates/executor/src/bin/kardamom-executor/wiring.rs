@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use kardamom_engine::actor::BlockExec;
 use kardamom_engine::bin_support;
-use kardamom_executor::{
+use kardamom_engine::{
     CMessage, EngineWiring, ExecutorError, MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal,
     NoEpochCheck, TxReceiptsPublication,
 };
