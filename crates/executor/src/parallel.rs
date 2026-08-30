@@ -47,7 +47,7 @@ use kardamom_engine::bal_ladder::merge_bal_fragments;
 use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::error::ExecutorError;
-use kardamom_engine::executor::ExecScope;
+use kardamom_engine::executor::Executor as ExecCore;
 use kardamom_engine::stateless::{execute_block_capture, execute_record_in_scope};
 use kardamom_footprint::classifier::Stats;
 use kardamom_stm::execute::{PoolConfig, PoolHandle, with_pool};
@@ -266,14 +266,10 @@ fn run_one<S: StateDatabase + Clone + Sync + 'static>(
                     },
                 );
 
-                let mut scope = ExecScope::new(&req.snapshot, Some(&merged), req.env)?;
+                let mut scope = ExecCore::new(&req.snapshot, Some(&merged), req.env)?;
                 let mut frag = revm::state::bal::Bal::new();
                 let (receipt, ws) = execute_record_in_scope(
                     &mut scope,
-                    &req.snapshot,
-                    Some(&merged),
-                    &PendingDelta::new(),
-                    req.env,
                     &rec,
                     at,
                     cumulative,

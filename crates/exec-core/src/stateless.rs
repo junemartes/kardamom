@@ -3,7 +3,7 @@
 //!
 //! [`execute_block`] is the single-scope sequential driver both live roles
 //! already used (hoisted verbatim from the validator so the zk guest links
-//! the exact production code path): one [`ExecScope`] per block, deposits
+//! the exact production code path): one [`Executor`] per block, deposits
 //! folded into the scope cache so later txs observe their writes.
 //!
 //! [`execute_block_stateless`] is the GUEST shape: the same driver over a
@@ -32,7 +32,7 @@ use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
-use crate::executor::{ExecScope, decode_alloy_envelope, execute_deposit_tx};
+use crate::executor::{DecodedTx, Executor};
 use crate::witness::WitnessDb;
 
 /// One canonical record of a block, in execution order. Clone is cheap:
@@ -124,23 +124,14 @@ fn execute_block_inner<S: StateDatabase>(
     let mut delta = PendingDelta::new();
     let mut receipts = Vec::with_capacity(records.len());
     let mut cumulative = 0u64;
-    let mut scope = ExecScope::new(snapshot, parent, env)?;
+    let mut scope = Executor::new(snapshot, parent, env)?;
     for (i, rec) in records.iter().enumerate() {
         let idx_in_block = i as u64;
         // revm's Bal convention: index 0 = pre-execution, 1..=n = txs in
         // block order (same as the actor's `tx_index_in_block + 1`).
         let bal_arg = bal.as_deref_mut().map(|b| (b, idx_in_block + 1));
-        let (receipt, ws) = execute_record_in_scope(
-            &mut scope,
-            snapshot,
-            parent,
-            &delta,
-            env,
-            rec,
-            idx_in_block,
-            cumulative,
-            bal_arg,
-        )?;
+        let (receipt, ws) =
+            execute_record_in_scope(&mut scope, rec, idx_in_block, cumulative, bal_arg)?;
         cumulative = receipt.cumulative_gas_used;
         delta.apply(ws);
         receipts.push(receipt);
@@ -156,23 +147,16 @@ fn execute_block_inner<S: StateDatabase>(
 }
 
 /// Execute ONE canonical record inside an existing block scope — the
-/// Tx-vs-Deposit dispatch every whole-block strategy shares. A Tx runs in
-/// the scope; a Deposit runs outside it (rare, own commit semantics) against
-/// `snapshot ∘ parent ∘ delta`, and its writes are folded into the scope
-/// cache so later records observe them. `delta` is the caller's accumulated
-/// block/batch delta; `parent` its seed layer.
+/// Tx-vs-Deposit dispatch every whole-block strategy shares. Both kinds
+/// now run ON the scope: a deposit reuses the block cache and toggles
+/// the nonce check for its inner call (see [`Executor::execute_deposit`]),
+/// so the old snapshot/parent/delta re-seed per deposit is gone.
 ///
 /// This is the single home of consensus-critical record dispatch: the
 /// sequential driver above, the validator's parallel batches, and (through
 /// the driver) the zk guest all execute records through here.
-#[allow(clippy::too_many_arguments)] // mirrors execute_tx/execute_deposit_tx;
-// a params struct would rename the same nine fields without removing any.
-pub fn execute_record_in_scope<'a, S: StateDatabase>(
-    scope: &mut ExecScope<&'a S>,
-    snapshot: &'a S,
-    parent: Option<&PendingDelta>,
-    delta: &PendingDelta,
-    env: ExecEnv,
+pub fn execute_record_in_scope<S: StateDatabase>(
+    scope: &mut Executor<&S>,
     rec: &BufferedRecord,
     idx_in_block: u64,
     cumulative: u64,
@@ -196,26 +180,7 @@ pub fn execute_record_in_scope<'a, S: StateDatabase>(
             tx_idx,
             deposit,
             position,
-        } => {
-            let out = execute_deposit_tx(
-                snapshot,
-                parent,
-                delta,
-                env,
-                *tx_idx,
-                *position,
-                deposit,
-                idx_in_block,
-                cumulative,
-                bal,
-            )?;
-            // Fold deposit writes into the scope cache (mirrors the
-            // actor's streaming path) so later txs observe them.
-            let mut layer = PendingDelta::new();
-            layer.apply(out.1.clone());
-            scope.seed_layer(&layer)?;
-            Ok(out)
-        }
+        } => scope.execute_deposit(*tx_idx, *position, deposit, idx_in_block, cumulative, bal),
     }
 }
 
@@ -230,7 +195,7 @@ pub fn verify_record_identity(envelope: &TxEnvelope) -> Result<(), ExecutorError
             envelope.tx_hash
         )));
     }
-    let decoded = decode_alloy_envelope(&envelope.raw_tx, TxIndex::ZERO)?;
+    let decoded = DecodedTx::decode(&envelope.raw_tx, TxIndex::ZERO)?;
     let recovered = decoded
         .recover_signer()
         .map_err(|e| ExecutorError::RecordIdentity(format!("sender recovery failed: {e}")))?;

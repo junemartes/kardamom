@@ -5,8 +5,8 @@
 //! release, and for every post entry of the pinned fork executes the
 //! fixture's transaction through the SAME path the live executor and
 //! validator share — `decode_alloy_envelope` → `tx_env_from_alloy` →
-//! [`ExecScope::execute_tx`] — under the *fixture's* block/cfg env (via
-//! [`ExecScope::new_with_envs`]), then checks the resulting state root and
+//! [`Executor::execute_tx`] — under the *fixture's* block/cfg env (via
+//! [`Executor::new_with_envs`]), then checks the resulting state root and
 //! logs hash against the fixture's expectation.
 //!
 //! Latest-fork-only policy: only `post.Osaka` entries run; every other fork
@@ -28,7 +28,7 @@ use std::path::Path;
 use alloy_primitives::{Address, B256, Bytes as AlloyBytes, U256, keccak256};
 use alloy_rlp::Encodable;
 use kardamom_exec_core::block_env::ExecEnv;
-use kardamom_exec_core::executor::ExecScope;
+use kardamom_exec_core::executor::Executor;
 use kardamom_exec_core::state::MockStateDatabase;
 use kardamom_exec_core::{TxIndex, WriteSet};
 use kardamom_types::{BPosition, Receipt, TxEnvelope};
@@ -217,7 +217,7 @@ fn run_case(unit: &TestUnit, t: &Test) -> Outcome {
         }
     }
 
-    let mut scope = match ExecScope::new_with_envs(db.build(), None, exec_env, block, cfg) {
+    let mut scope = match Executor::new_with_envs(db.build(), None, exec_env, block, cfg) {
         Ok(s) => s,
         Err(e) => return Outcome::Fail(format!("scope construction: {e}")),
     };

@@ -29,7 +29,7 @@ use crate::actor::{StateWriterQueue, StateWriterSignal};
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::exec_types::TxIndex;
-use crate::executor::execute_tx;
+use crate::executor::Executor;
 use crate::persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 
 /// One block to re-execute: boundary metadata + its ordered transactions.
@@ -180,7 +180,7 @@ fn drive_block(
         let tx_position = BPosition::from_index(counters.global_pos);
         // Replay executes one durably-committed block at a time against
         // its own committed snapshot — no pipelined parent layer.
-        let (receipt, ws) = execute_tx(
+        let (receipt, ws) = Executor::execute_once(
             &snapshot,
             None,
             &delta,

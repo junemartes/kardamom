@@ -97,7 +97,7 @@ pub mod pool;
 
 /// Re-exported so harnesses can pre-decode for BOTH engines (see
 /// `execute::execute_block_sequential_decoded`).
-pub use kardamom_exec_core::executor::decode_alloy_envelope;
+pub use kardamom_exec_core::executor::DecodedTx;
 pub mod mv;
 pub mod schedule;
 

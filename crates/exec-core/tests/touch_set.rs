@@ -2,7 +2,7 @@
 //! per-tx READ attribution from `outcome.state` — accounts loaded but never
 //! touched, and slots accessed without a value change. The block-scoped BAL
 //! cannot see either per tx, which is why the capture lives in
-//! `ExecScope::execute_tx` itself.
+//! `Executor::execute_tx` itself.
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
@@ -11,7 +11,7 @@ use alloy_primitives::{Address, B256, TxKind, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_exec_core::block_env::ExecEnv;
 use kardamom_exec_core::exec_types::TxIndex;
-use kardamom_exec_core::executor::{ExecScope, TouchSet};
+use kardamom_exec_core::executor::{Executor, TouchSet};
 use kardamom_exec_core::state::MockStateDatabase;
 use kardamom_types::{BPosition, TxEnvelope};
 
@@ -97,7 +97,7 @@ fn env() -> ExecEnv {
 #[test]
 fn sload_only_call_lands_in_reads() {
     let db = db();
-    let mut scope = ExecScope::new(&db, None, env()).unwrap();
+    let mut scope = Executor::new(&db, None, env()).unwrap();
     let mut touches = TouchSet::default();
     let (receipt, _ws) = scope
         .execute_tx(
@@ -125,7 +125,7 @@ fn sload_only_call_lands_in_reads() {
 #[test]
 fn balance_subject_lands_in_account_reads() {
     let db = db();
-    let mut scope = ExecScope::new(&db, None, env()).unwrap();
+    let mut scope = Executor::new(&db, None, env()).unwrap();
     let mut touches = TouchSet::default();
     let (receipt, _ws) = scope
         .execute_tx(
@@ -148,7 +148,7 @@ fn balance_subject_lands_in_account_reads() {
 #[test]
 fn sstore_call_is_a_write_not_a_read() {
     let db = db();
-    let mut scope = ExecScope::new(&db, None, env()).unwrap();
+    let mut scope = Executor::new(&db, None, env()).unwrap();
     let mut touches = TouchSet::default();
     let (receipt, ws) = scope
         .execute_tx(
@@ -183,7 +183,7 @@ fn touches_none_is_a_no_op() {
     // The default path (every caller except the shadow-enabled executor)
     // passes `None` and must behave identically.
     let db = db();
-    let mut scope = ExecScope::new(&db, None, env()).unwrap();
+    let mut scope = Executor::new(&db, None, env()).unwrap();
     let (receipt, _) = scope
         .execute_tx(
             TxIndex(0),

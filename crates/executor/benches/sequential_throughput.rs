@@ -26,7 +26,9 @@ use revm::primitives::KECCAK_EMPTY;
 use revm::state::Bytecode;
 
 use kardamom_executor::block_env::ExecEnv;
-use kardamom_executor::executor::execute_tx;
+// The exec-core Executor (the per-block EVM scope) is a different type
+// from the actor `kardamom_executor::Executor` imported below.
+use kardamom_executor::executor::Executor as ExecCore;
 use kardamom_executor::{
     BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
     Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, PendingDelta,
@@ -113,7 +115,7 @@ fn bench_transfer_step(c: &mut Criterion) {
         b.iter(|| {
             let delta = PendingDelta::new();
             let env_tx = signed_transfer(&signer, to, 0);
-            let _ = execute_tx(
+            let _ = ExecCore::execute_once(
                 &snap,
                 None,
                 &delta,
@@ -154,7 +156,7 @@ fn bench_sstore_step(c: &mut Criterion) {
         b.iter(|| {
             let delta = PendingDelta::new();
             let env_tx = signed_sstore_call(&signer, contract, 0);
-            let (_r, _ws) = execute_tx(
+            let (_r, _ws) = ExecCore::execute_once(
                 &snap,
                 None,
                 &delta,
