@@ -28,6 +28,7 @@ tracing-flame = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 toml = "1"
+num_enum = "0.7"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 hdrhistogram = "7"

@@ -3778,6 +3778,7 @@ dependencies = [
 name = "kardamom-cluster-client"
 version = "0.1.0"
 dependencies = [
+ "num_enum",
  "thiserror 2.0.18",
 ]
 
