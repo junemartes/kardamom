@@ -128,6 +128,10 @@ struct SessionLoop {
     egress_kind_filter: Option<Vec<u8>>,
     frame_rx: Receiver<Vec<u8>>,
     req_rx: Receiver<OfferReq>,
+    /// Set when a drain sees `Disconnected` on the receiver. A dead
+    /// receiver stays out of the idle Select (see `idle_wait`).
+    frame_rx_dead: bool,
+    req_rx_dead: bool,
     out_tx: Sender<Vec<u8>>,
     stop: Arc<AtomicBool>,
     // Last time an egress frame arrived OR a session was (re)established —
@@ -222,6 +226,8 @@ impl SessionLoop {
             egress_kind_filter,
             frame_rx: seams.frame_rx,
             req_rx: seams.req_rx,
+            frame_rx_dead: false,
+            req_rx_dead: false,
             out_tx: seams.out_tx,
             stop: seams.stop,
             egress_alive_at_ms: now_ms(),
@@ -268,7 +274,10 @@ impl SessionLoop {
                 Err(TryRecvError::Empty) => break,
                 // A dropped LiveIngress/LiveEgress must NOT kill the session
                 // (the other half may still be in use); only `stop` terminates.
-                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.frame_rx_dead = true;
+                    break;
+                }
             }
         }
         worked
@@ -476,7 +485,10 @@ impl SessionLoop {
                 Err(TryRecvError::Empty) => break,
                 // A dropped LiveIngress/LiveEgress must NOT kill the session
                 // (the other half may still be in use); only `stop` terminates.
-                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.req_rx_dead = true;
+                    break;
+                }
             }
         }
         worked
@@ -500,22 +512,33 @@ impl SessionLoop {
         } else {
             self.backoff.idle_wait()
         };
-        let mut sel = crossbeam_channel::Select::new();
-        sel.recv(&self.frame_rx);
-        sel.recv(&self.req_rx);
         // A DISCONNECTED channel counts as "ready" to crossbeam's Select —
         // and consumers legitimately drop their unused LiveIngress seam
         // (`let (cluster, _ingress, egress) = connect_with_replay(...)`),
-        // which disconnects req_rx forever. Readiness with NOTHING actually
-        // queued is that artifact, and looping on it busy-spins the session
-        // thread at 100% of a core (observed: idle executors/validator at
-        // ~157% container CPU; the compact CI stack starved outright —
-        // chain-semantics S8 timeout). Fall back to the plain duty-cycle
-        // sleep in that case; a frame racing in behind the emptiness checks
-        // waits at most `wait`.
-        if sel.ready_timeout(wait).is_ok() && self.frame_rx.is_empty() && self.req_rx.is_empty() {
-            thread::sleep(wait);
+        // which disconnects req_rx forever. The old shape kept req_rx in
+        // the Select and slept `wait` on the empty-ready artifact — so
+        // EVERY idle iteration paid the full sleep once req_rx died (the
+        // exact latency the Select was added to remove). Build the Select
+        // from LIVE receivers only: readiness then means "something is
+        // queued" and `ready_timeout` alone parks correctly. A dead+empty
+        // channel stays dead — nothing can arrive on it again.
+        let mut sel = crossbeam_channel::Select::new();
+        let mut live = 0;
+        if !self.frame_rx_dead {
+            sel.recv(&self.frame_rx);
+            live += 1;
         }
+        if !self.req_rx_dead {
+            sel.recv(&self.req_rx);
+            live += 1;
+        }
+        if live == 0 {
+            // Every producer is gone: nothing can arrive; plain duty-cycle
+            // sleep keeps the keep-alive/replay cadence.
+            thread::sleep(wait);
+            return;
+        }
+        let _ = sel.ready_timeout(wait);
     }
 
     /// Graceful shutdown: tell the cluster to close our session instead of

@@ -44,39 +44,20 @@ const BLOCK_SESSION_KEEP_ALIVE: u16 = 16;
 const BLOCK_NEW_LEADER_EVENT: u16 = 20;
 
 /// `EventCode` enum from the schema (a `SessionEvent.code`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `num_enum` derives the two conversions. `catch_all` maps an unknown
+/// code into `Unknown(i32)` and keeps the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::FromPrimitive, num_enum::IntoPrimitive)]
+#[repr(i32)]
 pub enum EventCode {
-    Ok,
-    Error,
-    Redirect,
-    AuthenticationRejected,
-    Closed,
+    Ok = 0,
+    Error = 1,
+    Redirect = 2,
+    AuthenticationRejected = 3,
+    Closed = 4,
     /// Unknown / future code, preserved verbatim.
+    #[num_enum(catch_all)]
     Unknown(i32),
-}
-
-impl EventCode {
-    pub fn from_i32(v: i32) -> Self {
-        match v {
-            0 => Self::Ok,
-            1 => Self::Error,
-            2 => Self::Redirect,
-            3 => Self::AuthenticationRejected,
-            4 => Self::Closed,
-            other => Self::Unknown(other),
-        }
-    }
-
-    pub fn to_i32(self) -> i32 {
-        match self {
-            Self::Ok => 0,
-            Self::Error => 1,
-            Self::Redirect => 2,
-            Self::AuthenticationRejected => 3,
-            Self::Closed => 4,
-            Self::Unknown(v) => v,
-        }
-    }
 }
 
 /// Errors decoding a cluster-protocol frame.
@@ -317,7 +298,7 @@ pub fn encode_session_event(ev: &SessionEvent) -> Vec<u8> {
     b.extend_from_slice(&ev.correlation_id.to_le_bytes());
     b.extend_from_slice(&ev.leadership_term_id.to_le_bytes());
     b.extend_from_slice(&ev.leader_member_id.to_le_bytes());
-    b.extend_from_slice(&ev.code.to_i32().to_le_bytes());
+    b.extend_from_slice(&i32::from(ev.code).to_le_bytes());
     put_var(&mut b, ev.detail.as_bytes());
     b
 }
@@ -327,7 +308,7 @@ fn decode_session_event(h: &MessageHeader, body: &[u8]) -> Result<SessionEvent, 
     let correlation_id = rd_i64(body, 8)?;
     let leadership_term_id = rd_i64(body, 16)?;
     let leader_member_id = rd_i32(body, 24)?;
-    let code = EventCode::from_i32(rd_i32(body, 28)?);
+    let code = EventCode::from(rd_i32(body, 28)?);
     // Optional trailing fixed fields (version, leaderHeartbeatTimeoutNs) are
     // skipped via the sender's blockLength.
     let (detail, _) = rd_var(body, h.block_length as usize)?;
@@ -530,7 +511,7 @@ mod tests {
         b.extend_from_slice(&42i64.to_le_bytes()); // correlationId
         b.extend_from_slice(&3i64.to_le_bytes()); // leadershipTermId
         b.extend_from_slice(&2i32.to_le_bytes()); // leaderMemberId
-        b.extend_from_slice(&EventCode::Redirect.to_i32().to_le_bytes()); // code
+        b.extend_from_slice(&i32::from(EventCode::Redirect).to_le_bytes()); // code
         b.extend_from_slice(&0i32.to_le_bytes()); // version (optional)
         b.extend_from_slice(&0i64.to_le_bytes()); // leaderHeartbeatTimeoutNs (optional)
         put_var(&mut b, b"0=host0:9000,1=host1:9000");

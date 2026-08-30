@@ -3788,6 +3788,7 @@ dependencies = [
 name = "kardamom-cluster-client"
 version = "0.1.0"
 dependencies = [
+ "num_enum",
  "thiserror 2.0.18",
 ]
 
@@ -4066,6 +4067,7 @@ dependencies = [
  "clap",
  "core_affinity",
  "criterion 0.5.1",
+ "crossbeam-channel",
  "dhat",
  "kardamom-cluster-adapter",
  "kardamom-log",

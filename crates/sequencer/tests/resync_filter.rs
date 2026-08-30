@@ -70,8 +70,8 @@ fn pos(offset: i32) -> BPosition {
 /// state these tests exercise.
 type ResyncTestRig = (
     Sequencer,
-    std::sync::mpsc::Sender<FloorUpdate>,
-    std::sync::mpsc::Sender<(alloy_primitives::Address, u64, u64)>,
+    crossbeam_channel::Sender<FloorUpdate>,
+    crossbeam_channel::Sender<(alloy_primitives::Address, u64, u64)>,
 );
 
 fn resync_sequencer_with_rejects() -> ResyncTestRig {
@@ -81,7 +81,7 @@ fn resync_sequencer_with_rejects() -> ResyncTestRig {
     (seq, floor_tx, reject_tx)
 }
 
-fn resync_sequencer() -> (Sequencer, std::sync::mpsc::Sender<FloorUpdate>) {
+fn resync_sequencer() -> (Sequencer, crossbeam_channel::Sender<FloorUpdate>) {
     let (seq, floor_tx, _reject_tx) = resync_sequencer_with_rejects();
     (seq, floor_tx)
 }
