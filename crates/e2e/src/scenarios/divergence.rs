@@ -38,7 +38,9 @@ pub async fn corrupt_bal_halts_validator(stack: &mut LocalStack, t: &Target) -> 
     }
     poll_until(
         "validator verifying (warmup)",
-        Duration::from_secs(20),
+        // An upper bound, not a pace: a warm run pays actual time. 20-30s
+        // was not enough for a cold validator on a contended runner (#250).
+        Duration::from_secs(60),
         Duration::from_millis(250),
         || async {
             let v = t
@@ -121,7 +123,9 @@ pub async fn forged_epoch_halts_validator(
     // happily, not on one that never started.
     poll_until(
         "validator verifying (warmup)",
-        Duration::from_secs(30),
+        // An upper bound, not a pace: a warm run pays actual time. 20-30s
+        // was not enough for a cold validator on a contended runner (#250).
+        Duration::from_secs(60),
         Duration::from_millis(250),
         || async {
             let v = t
@@ -204,7 +208,9 @@ pub async fn verified_l1_endpoint(
     // Warm up: the verdict must land on a validator that was verifying happily.
     poll_until(
         "validator verifying (warmup)",
-        Duration::from_secs(30),
+        // An upper bound, not a pace: a warm run pays actual time. 20-30s
+        // was not enough for a cold validator on a contended runner (#250).
+        Duration::from_secs(60),
         Duration::from_millis(250),
         || async {
             let v = t

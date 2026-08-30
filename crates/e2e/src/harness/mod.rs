@@ -342,6 +342,29 @@ impl LocalStack {
             },
         )
         .await?;
+        // The chain is LIVE only once the executor commits its first block.
+        // Without this barrier every scenario pays the sealer/executor cold
+        // start out of its own (much tighter) budget — under runner
+        // contention that cost alone blew four different scenarios'
+        // timeouts (issue #250). The bound is generous on purpose: a warm
+        // host passes in ~1s, and only a genuinely wedged stack waits it
+        // out. Idle chains still seal boundary ticks, so no traffic is
+        // needed.
+        let exec_addr = stack.executor.metrics_addr;
+        metrics::poll_until(
+            "the executor's first committed block",
+            Duration::from_secs(90),
+            Duration::from_millis(250),
+            || async move {
+                let v = metrics::scrape(exec_addr)
+                    .await
+                    .ok()
+                    .and_then(|s| s.value(crate::scenarios::EXEC_BLOCK_NUMBER))
+                    .unwrap_or(0.0);
+                Ok((v >= 1.0).then_some(()))
+            },
+        )
+        .await?;
         Ok(stack)
     }
 

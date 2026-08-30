@@ -247,10 +247,21 @@ pub async fn activates_at_timestamp(
     // schedule is anchored to the chain's own notion of now — reading it off
     // the head block rather than from wall-clock keeps the two in the same
     // frame even if the host clock and the sealer's disagree.
-    let head_ts = super::derivation::read_block_origins(executor_state_dir)?
-        .last()
-        .map(|b| b.l2_timestamp)
-        .context("chain has produced no blocks")?;
+    // Wait rather than read once: the stack's launch barrier guarantees
+    // block 1 exists, but a restarted or slow executor can still race this
+    // read (issue #250 — the one-shot read failed with "chain has produced
+    // no blocks" three times in one CI day).
+    let head_ts = crate::harness::metrics::poll_until(
+        "a committed head block to anchor the schedule",
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(200),
+        || async {
+            Ok(super::derivation::read_block_origins(executor_state_dir)?
+                .last()
+                .map(|b| b.l2_timestamp))
+        },
+    )
+    .await?;
     let activation_ts = head_ts + SCHEDULE_AHEAD_MS;
 
     let scheduled_block = upgrade_and_await(t, l1, FEATURE_HEALTH_CHECK, activation_ts).await?;
