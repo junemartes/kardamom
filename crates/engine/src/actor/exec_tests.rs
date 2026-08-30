@@ -12,9 +12,9 @@ use revm::primitives::KECCAK_EMPTY;
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
 use crate::reader::{NoEpochCheck, ReaderToExec};
-use crate::state::{MockStateDatabase, StaticSnapshotSource};
+use crate::state::{MockStateDatabase, MutatingSnapshotSource, StaticSnapshotSource};
 
-use super::test_support::{ImmediateCommit, RecordingQueue, legacy, pos};
+use super::test_support::{ApplyingRecordingQueue, ImmediateCommit, RecordingQueue, legacy, pos};
 use super::{BalHandoff, ExecToCommit, ExecutorConfig, ResumePoint, spawn_exec};
 
 #[test]
@@ -391,4 +391,199 @@ fn exec_hands_off_shadow_captures_at_boundary() {
     let mut exclude = std::collections::HashSet::new();
     exclude.insert(kardamom_footprint::Cell::Account(crate::shadow::FEE_SINK));
     crate::shadow::process_block(blk, &mut stats, &exclude);
+}
+
+// ---------------------------------------------------------------------------
+// Block-close protocol actions (L1-governed feature flags)
+// ---------------------------------------------------------------------------
+
+use kardamom_exec_core::features::{
+    FEATURE_HEALTH_CHECK, HEALTH_BEACON_SLOT, activation_slot, unpack_beacon,
+};
+use kardamom_types::upgrades::CHAIN_STATE;
+
+/// Read the beacon out of a submitted block delta.
+fn beacon_in(delta: &kardamom_types::BlockDelta) -> Option<(u64, u64, u64)> {
+    delta
+        .storage
+        .iter()
+        .find(|s| s.address == CHAIN_STATE && s.key == HEALTH_BEACON_SLOT)
+        .map(|s| unpack_beacon(s.value))
+}
+
+/// Two empty blocks, flag never scheduled: the chain must be byte-identical to
+/// one built without the feature existing. This is the property that lets the
+/// code ship dormant on a live chain.
+#[test]
+fn a_dormant_feature_writes_nothing_at_block_close() {
+    let writer_log = Arc::new(Mutex::new(Vec::new()));
+    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(8);
+
+    for block_number in 1..=2u64 {
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number,
+                end_tx_idx: pos(0),
+                l2_timestamp: 1_700_000_000_000 + block_number * 250,
+                l1_origin: 0,
+            }))
+            .unwrap();
+    }
+    drop(tx_r2e);
+
+    spawn_exec(
+        ExecutorConfig::default(),
+        rx_r2e,
+        tx_e2c,
+        StaticSnapshotSource(MockStateDatabase::builder().build()),
+        ImmediateCommit,
+        RecordingQueue(writer_log.clone()),
+        ResumePoint::GENESIS,
+        None,
+        None,
+        None,
+        None::<NoEpochCheck>,
+    )
+    .join()
+    .expect("no panic")
+    .expect("exec ok");
+    drop(rx_e2c);
+
+    let log = writer_log.lock().unwrap();
+    assert_eq!(log.len(), 2);
+    for (_, delta) in log.iter() {
+        assert!(
+            delta.storage.is_empty(),
+            "a dormant flag must not touch state"
+        );
+    }
+}
+
+/// With the flag active, EVERY block records a beacon — the beat counter
+/// increments across blocks and each beacon carries that block's own number
+/// and header timestamp.
+#[test]
+fn an_active_feature_beats_once_per_block() {
+    let writer_log = Arc::new(Mutex::new(Vec::new()));
+    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(8);
+
+    // Activated at a time already in the past.
+    let db = MockStateDatabase::builder()
+        .storage(
+            CHAIN_STATE,
+            activation_slot(FEATURE_HEALTH_CHECK),
+            U256::from(1_000u64),
+        )
+        .build();
+
+    for block_number in 1..=3u64 {
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number,
+                end_tx_idx: pos(0),
+                l2_timestamp: 2_000 + block_number,
+                l1_origin: 0,
+            }))
+            .unwrap();
+    }
+    drop(tx_r2e);
+
+    spawn_exec(
+        ExecutorConfig::default(),
+        rx_r2e,
+        tx_e2c,
+        MutatingSnapshotSource(db.clone()),
+        ImmediateCommit,
+        ApplyingRecordingQueue {
+            db,
+            log: writer_log.clone(),
+        },
+        ResumePoint::GENESIS,
+        None,
+        None,
+        None,
+        None::<NoEpochCheck>,
+    )
+    .join()
+    .expect("no panic")
+    .expect("exec ok");
+    drop(rx_e2c);
+
+    let log = writer_log.lock().unwrap();
+    assert_eq!(log.len(), 3);
+    for (i, (boundary, delta)) in log.iter().enumerate() {
+        let beat = i as u64 + 1;
+        assert_eq!(
+            beacon_in(delta),
+            Some((beat, boundary.block_number, boundary.l2_timestamp)),
+            "block {} must carry beat {beat} with its own header fields",
+            boundary.block_number
+        );
+    }
+}
+
+/// The beacon must be timed off the block's OWN header stamp, not the
+/// (previous boundary's) stamp its transactions executed with. A feature
+/// scheduled between two boundaries must therefore fire in the first block
+/// whose header reaches it.
+#[test]
+fn activation_is_judged_against_the_blocks_own_header_timestamp() {
+    let writer_log = Arc::new(Mutex::new(Vec::new()));
+    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(8);
+
+    let activation = 5_000u64;
+    let snap = MockStateDatabase::builder()
+        .storage(
+            CHAIN_STATE,
+            activation_slot(FEATURE_HEALTH_CHECK),
+            U256::from(activation),
+        )
+        .build();
+
+    // Headers straddle the activation time: 4_999 (before), 5_000 (exactly at
+    // it — inclusive, so it fires), 5_001 (after).
+    for (block_number, ts) in [(1u64, 4_999u64), (2, 5_000), (3, 5_001)] {
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number,
+                end_tx_idx: pos(0),
+                l2_timestamp: ts,
+                l1_origin: 0,
+            }))
+            .unwrap();
+    }
+    drop(tx_r2e);
+
+    spawn_exec(
+        ExecutorConfig::default(),
+        rx_r2e,
+        tx_e2c,
+        MutatingSnapshotSource(snap.clone()),
+        ImmediateCommit,
+        ApplyingRecordingQueue {
+            db: snap,
+            log: writer_log.clone(),
+        },
+        ResumePoint::GENESIS,
+        None,
+        None,
+        None,
+        None::<NoEpochCheck>,
+    )
+    .join()
+    .expect("no panic")
+    .expect("exec ok");
+    drop(rx_e2c);
+
+    let log = writer_log.lock().unwrap();
+    assert_eq!(beacon_in(&log[0].1), None, "block 1 is before activation");
+    assert_eq!(
+        beacon_in(&log[1].1),
+        Some((1, 2, 5_000)),
+        "activation is inclusive: the block AT T beats"
+    );
+    assert_eq!(beacon_in(&log[2].1), Some((2, 3, 5_001)));
 }

@@ -11,6 +11,7 @@
 #      update KardamomUUPSBase.FACTORY with the new computed address.
 
 [profile.default]
+via_ir = true
 src = "src"
 test = "test"
 out = "out"

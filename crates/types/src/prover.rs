@@ -55,26 +55,34 @@ pub struct ProverInput {
     pub granularity: u16,
 }
 
-/// The proof's public outputs, in their committed byte layout:
-/// `pre_state_root(32) || post_state_root(32) || bal_commitment(32) ||
-/// block_number(8 LE)` — 104 bytes, the tuple an L1 verifier reads.
+/// The single-block proof's public outputs (v2, spec PR 5 slice 0): the
+/// DISPUTE-READY 160-byte abi shape a Solidity `abi.decode(publicValues,
+/// (bytes32, bytes32, uint256, bytes32, bytes32))` reads directly:
+/// `pre_state_root || post_state_root || block_number(u256) ||
+/// records_digest || bal_commitment`. `records_digest` is the block's
+/// [`BlockRecordsDigest`] (L2 txs only) — the field the optimistic
+/// oracle's `challengeBlock` compares against the claim's per-block
+/// digests. `bal_commitment` binds the L2-published BAL artifact for
+/// off-chain accountability; L1 does not store it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicOutputs {
     pub pre_state_root: B256,
     pub post_state_root: B256,
-    pub bal_commitment: B256,
     pub block_number: u64,
+    pub records_digest: B256,
+    pub bal_commitment: B256,
 }
 
 impl PublicOutputs {
-    pub const ENCODED_LEN: usize = 104;
+    pub const ENCODED_LEN: usize = 160;
 
     pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
         out[0..32].copy_from_slice(self.pre_state_root.as_slice());
         out[32..64].copy_from_slice(self.post_state_root.as_slice());
-        out[64..96].copy_from_slice(self.bal_commitment.as_slice());
-        out[96..104].copy_from_slice(&self.block_number.to_le_bytes());
+        out[64..96].copy_from_slice(&U256::from(self.block_number).to_be_bytes::<32>());
+        out[96..128].copy_from_slice(self.records_digest.as_slice());
+        out[128..160].copy_from_slice(self.bal_commitment.as_slice());
         out
     }
 
@@ -82,11 +90,16 @@ impl PublicOutputs {
         if bytes.len() != Self::ENCODED_LEN {
             return None;
         }
+        let n = U256::from_be_slice(&bytes[64..96]);
+        if n > U256::from(u64::MAX) {
+            return None;
+        }
         Some(Self {
             pre_state_root: B256::from_slice(&bytes[0..32]),
             post_state_root: B256::from_slice(&bytes[32..64]),
-            bal_commitment: B256::from_slice(&bytes[64..96]),
-            block_number: u64::from_le_bytes(bytes[96..104].try_into().ok()?),
+            block_number: n.to::<u64>(),
+            records_digest: B256::from_slice(&bytes[96..128]),
+            bal_commitment: B256::from_slice(&bytes[128..160]),
         })
     }
 }

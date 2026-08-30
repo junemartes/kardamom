@@ -20,13 +20,14 @@ use alloy_rlp::Decodable;
 use kardamom_exec_core::block_env::ExecEnv;
 use kardamom_exec_core::exec_types::TxIndex;
 use kardamom_exec_core::stateless::{BufferedRecord, execute_block_anchored};
-use kardamom_types::{ProverInput, ProverRecord, PublicOutputs};
+use kardamom_types::{BlockRecordsDigest, ProverInput, ProverRecord, PublicOutputs};
 
 pub fn main() {
     let input_bytes = sp1_zkvm::io::read_vec();
     let input: ProverInput = rkyv::from_bytes::<ProverInput, rkyv::rancor::Error>(&input_bytes)
         .expect("prover input frame");
 
+    let mut digest = BlockRecordsDigest::new(input.boundary.block_number);
     let records: Vec<BufferedRecord> = input
         .records
         .into_iter()
@@ -35,11 +36,14 @@ pub fn main() {
                 tx_idx,
                 envelope,
                 position,
-            } => BufferedRecord::Tx {
-                tx_idx: TxIndex(tx_idx),
-                envelope,
-                position,
-            },
+            } => {
+                digest.add_tx(&envelope.raw_tx);
+                BufferedRecord::Tx {
+                    tx_idx: TxIndex(tx_idx),
+                    envelope,
+                    position,
+                }
+            }
             ProverRecord::Deposit {
                 tx_idx,
                 deposit,
@@ -71,8 +75,9 @@ pub fn main() {
     let outputs = PublicOutputs {
         pre_state_root: anchored.pre_state_root,
         post_state_root: anchored.post_state_root,
-        bal_commitment: anchored.bal_commitment,
         block_number: anchored.block_number,
+        records_digest: digest.finish(),
+        bal_commitment: anchored.bal_commitment,
     };
     sp1_zkvm::io::commit_slice(&outputs.encode());
 }

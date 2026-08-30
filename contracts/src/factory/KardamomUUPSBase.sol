@@ -13,7 +13,7 @@ abstract contract KardamomUUPSBase is Initializable, UUPSUpgradeable {
     /// Kardamom factory proxy address. Must match the address computed by
     /// `kardamom_deployer::addresses::factory_proxy_address(...)`. A cross-check
     /// test asserts this; if either drifts, the test fails.
-    address internal constant FACTORY = 0xED26EF4bE626a43Ea01074435D80fC48Dc5040cD;
+    address internal constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
 
     error NotFactory();
 

@@ -12,7 +12,7 @@ contract WithdrawalOutputOracleTest is Test {
     address constant CHALLENGER = address(0xC4A1);
     uint64 constant WINDOW = 1 days;
     /// Must match KardamomUUPSBase.FACTORY (the rotation/upgrade authority).
-    address constant FACTORY = 0xED26EF4bE626a43Ea01074435D80fC48Dc5040cD;
+    address constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
 
     event OutputProposed(
         uint256 indexed index,

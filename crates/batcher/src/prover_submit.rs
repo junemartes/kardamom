@@ -8,6 +8,9 @@
 //! reports "not yet" and the caller retries later. Submission is
 //! PERMISSIONLESS on the contract; the proof is the authorization.
 
+// The sol! macro generates initialize(7 args) for oracle v2.
+#![allow(clippy::too_many_arguments)]
+
 use std::path::Path;
 
 use alloy_primitives::Address;
@@ -48,12 +51,12 @@ pub async fn submit_next_proof<P: Provider>(
     proofs_dir: &Path,
 ) -> Result<SubmitOutcome, BatcherError> {
     let oracle = IKardamomProofOracle::new(oracle_addr, &provider);
-    let last_proven = oracle
-        .lastProvenBatch()
+    let last_finalized = oracle
+        .lastFinalizedBatch()
         .call()
         .await
-        .map_err(|e| BatcherError::L1(format!("lastProvenBatch: {e}")))?;
-    let next = last_proven + 1;
+        .map_err(|e| BatcherError::L1(format!("lastFinalizedBatch: {e}")))?;
+    let next = last_finalized + 1;
 
     let settlement_addr = oracle
         .settlement()

@@ -55,8 +55,11 @@ impl ContractId {
             ContractId::KardamomL2Settlement => "initialize(address)",
             // WithdrawalOutputOracle.initialize(address attester, address challenger, uint64 window)
             ContractId::WithdrawalOutputOracle => "initialize(address,address,uint64)",
-            // KardamomProofOracle.initialize(settlement, verifier, programVKey, genesisRoot)
-            ContractId::KardamomProofOracle => "initialize(address,address,bytes32,bytes32)",
+            // KardamomProofOracle.initialize(settlement, verifier, batchVKey,
+            // blockVKey, genesisRoot, challengeWindow, minBond) — v2 (PR 5).
+            ContractId::KardamomProofOracle => {
+                "initialize(address,address,bytes32,bytes32,bytes32,uint64,uint96)"
+            }
         }
     }
 

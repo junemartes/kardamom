@@ -264,11 +264,18 @@ fn capture_anchor_guest_and_live_trie_agree() {
             granularity: 1,
         };
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&input).expect("serialize input");
+        let mut digest = kardamom_types::BlockRecordsDigest::new(1);
+        for r in &records {
+            if let BufferedRecord::Tx { envelope, .. } = r {
+                digest.add_tx(&envelope.raw_tx);
+            }
+        }
         let expected = PublicOutputs {
             pre_state_root: anchored.pre_state_root,
             post_state_root: anchored.post_state_root,
-            bal_commitment: anchored.bal_commitment,
             block_number: anchored.block_number,
+            records_digest: digest.finish(),
+            bal_commitment: anchored.bal_commitment,
         };
         std::fs::write(format!("{dir}/prover-input.rkyv"), &bytes).unwrap();
         std::fs::write(format!("{dir}/expected-outputs.bin"), expected.encode()).unwrap();
