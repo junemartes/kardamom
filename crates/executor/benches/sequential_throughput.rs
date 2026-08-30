@@ -25,11 +25,11 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
 use revm::state::Bytecode;
 
-use kardamom_executor::block_env::ExecEnv;
+use kardamom_engine::block_env::ExecEnv;
 // The exec-core Executor (the per-block EVM scope) is a different type
-// from the actor `kardamom_executor::Executor` imported below.
-use kardamom_executor::executor::Executor as ExecCore;
-use kardamom_executor::{
+// from the actor `kardamom_engine::Executor` imported below.
+use kardamom_engine::executor::Executor as ExecCore;
+use kardamom_engine::{
     BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
     Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, PendingDelta,
     ResumePoint, RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,

@@ -2,7 +2,7 @@
 //! cursor, the periodic checkpointer task, and the resume decision.
 
 use anyhow::{Context, Result};
-use kardamom_executor::ResumePoint;
+use kardamom_engine::ResumePoint;
 use kardamom_state::checkpoint::{create_checkpoint, prune_checkpoints};
 use kardamom_state::{StateEnv, StateEnvBuilder, read_recovery_point};
 use tokio_util::sync::CancellationToken;

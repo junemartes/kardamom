@@ -13,11 +13,11 @@ use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
 use revm::primitives::KECCAK_EMPTY;
 
-use kardamom_executor::parallel::{StmExecConfig, stm_block_exec};
-use kardamom_executor::{
+use kardamom_engine::{
     BPosition, MockStateDatabase, TxEnvelope as KtTxEnvelope, TxIndex, actor::BufferedRecord,
     block_env::ExecEnv,
 };
+use kardamom_executor::parallel::{StmExecConfig, stm_block_exec};
 
 fn tx_record(
     signer: &PrivateKeySigner,
@@ -129,7 +129,7 @@ fn stm_strategy_matches_sequential_capture_byte_for_byte() {
     };
 
     // A: the sequential capture driver — the streaming path's semantics.
-    let seq = kardamom_executor::stateless::execute_block_capture(&snap, None, &records, env)
+    let seq = kardamom_engine::stateless::execute_block_capture(&snap, None, &records, env)
         .expect("sequential");
 
     for workers in [1usize, 4, 8] {
