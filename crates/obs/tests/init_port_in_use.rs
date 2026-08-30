@@ -12,8 +12,8 @@
 //! process-global, so both halves live in ONE test body (cargo runs tests
 //! in threads).
 
-#[test]
-fn init_retries_addr_in_use_then_fails_or_recovers() {
+#[tokio::test(flavor = "multi_thread")]
+async fn init_retries_addr_in_use_then_fails_or_recovers() {
     // SAFETY: no other test in this binary reads these vars concurrently.
     unsafe {
         std::env::set_var("KARDAMOM_OBS_BIND_RETRIES", "4");
@@ -25,6 +25,7 @@ fn init_retries_addr_in_use_then_fails_or_recovers() {
     let addr = blocker.local_addr().unwrap();
     let t0 = std::time::Instant::now();
     let err = kardamom_obs::init("obs-collision", addr, "host", "0.0.0", "deadbeef")
+        .await
         .expect_err("held squatter must still surface a bind failure");
     let msg = format!("{err:#}");
     assert!(
@@ -41,14 +42,15 @@ fn init_retries_addr_in_use_then_fails_or_recovers() {
     // installed once per process, so this half must be the SUCCESSFUL one.)
     let blocker2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr2 = blocker2.local_addr().unwrap();
-    let releaser = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(250));
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         drop(blocker2);
     });
     kardamom_obs::init("obs-recovers", addr2, "host", "0.0.0", "deadbeef")
+        .await
         .expect("init must recover once the squatter releases the port");
-    releaser.join().unwrap();
-    let body = std::thread::spawn(move || {
+    releaser.await.unwrap();
+    let body = tokio::task::spawn_blocking(move || {
         std::io::Read::read_to_string(
             &mut std::net::TcpStream::connect(addr2)
                 .map(|mut s| {
@@ -61,5 +63,5 @@ fn init_retries_addr_in_use_then_fails_or_recovers() {
     });
     // Connectivity is enough — the recorder installed and the listener owns
     // the port the squatter vacated.
-    let _ = body.join();
+    let _ = body.await;
 }

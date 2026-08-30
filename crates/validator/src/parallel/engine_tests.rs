@@ -659,7 +659,7 @@ fn pooled_with_forks_matches_sequential_on_mdbx() {
         &[],
     )
     .expect("seed genesis");
-    let writer = kardamom_state::StateWriter::spawn(env_).expect("spawn writer");
+    let mut writer = kardamom_state::StateWriter::spawn(env_).expect("spawn writer");
     let snap = writer.snapshot_rx.recv().expect("genesis snapshot");
     // Sanity: forks mint (writer quiescent at genesis).
     assert!(

@@ -14,7 +14,6 @@ mod recorders;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -27,6 +26,7 @@ use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::LogConfig;
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_types::QuorumWatermark;
+use tokio_util::sync::CancellationToken;
 
 use recorders::{spawn_tx_data_recorders, wait_for_recorders};
 
@@ -158,7 +158,7 @@ impl From<AckPolicyArg> for kardamom_types::AckPolicy {
 async fn main() -> Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init_service!("ingress", args.metrics_addr, &args.host_id)?;
+    kardamom_obs::init_service!("ingress", args.metrics_addr, &args.host_id).await?;
     kardamom_ingress::metrics::describe();
     // v0 config loading: runtime tunables come from defaults + CLI flags; the
     // TOML supplies the optional `[cluster]` section (the Aeron Cluster client
@@ -208,20 +208,17 @@ async fn main() -> Result<()> {
     // envelope, so a birth-of-stream gap would permanently break executor
     // crash recovery. A recorder startup failure is fatal: the operator asked
     // for --archive-durability, so serving without it would be a silent lie.
-    let recorder_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (recorder_ready_tx, recorder_ready_rx) =
-        std::sync::mpsc::channel::<(u8, Result<i64, String>)>();
-    let recorder_handles = if args.archive_durability {
+    let stop = CancellationToken::new();
+    let (recorder_handles, recorder_ready) = if args.archive_durability {
         spawn_tx_data_recorders(
             args.aeron_dir.clone(),
             channels.clone(),
             aeron_cfg.clone(),
             args.shards as u8,
-            recorder_stop.clone(),
-            recorder_ready_tx,
+            &stop,
         )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     // tx_receipts MDS membership: prefer the CLI/env `--executor-count`, else
@@ -238,7 +235,8 @@ async fn main() -> Result<()> {
     // Wait for all of them to be confirmed active (or fail startup) BEFORE the
     // JSON-RPC server accepts its first transaction.
     if args.archive_durability {
-        wait_for_recorders(&recorder_ready_rx, args.shards as u8)
+        wait_for_recorders(recorder_ready)
+            .await
             .context("archive durability requested but tx_data recorders failed to start")?;
     }
     let subscription =
@@ -263,12 +261,20 @@ async fn main() -> Result<()> {
             AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
         let (guard, mut observer) =
             cluster_watermark_observer(cluster_rt, live).context("connect cluster watermark")?;
-        // Blocking egress poll on a dedicated thread → durable count → bus.
+        // Blocking egress poll on a dedicated std thread (the observer holds
+        // the `!Send` cluster client) → durable count → bus. The thread
+        // stops on the shutdown token or when the observer ends; the bus is
+        // a tokio `broadcast` channel, so the send never blocks (a send with
+        // no live receiver is not an error here).
         let wm_tx = subscription.watermark_sender();
+        let wm_stop = stop.clone();
         std::thread::Builder::new()
             .name("cluster-watermark".into())
             .spawn(move || {
-                while let Some(position) = observer.next_position() {
+                while !wm_stop.is_cancelled() {
+                    let Some(position) = observer.next_position() else {
+                        break;
+                    };
                     let _ = wm_tx.send(QuorumWatermark { position });
                 }
             })
@@ -287,7 +293,7 @@ async fn main() -> Result<()> {
     tracing::info!("kardamom-ingress: shutdown signal received");
     handle.jsonrpc_handle.stop().ok();
     handle.jsonrpc_handle.stopped().await;
-    recorder_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    stop.cancel();
     for h in recorder_handles {
         let _ = h.join();
     }

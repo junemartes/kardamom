@@ -43,7 +43,7 @@ use wiring::ExecutorWiring;
 async fn main() -> Result<()> {
     bin_support::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init_service!("executor", args.metrics_addr, &args.host_id)?;
+    kardamom_obs::init_service!("executor", args.metrics_addr, &args.host_id).await?;
     kardamom_executor::metrics::describe();
     // The TOML supplies the optional `[cluster]` section (default disabled);
     // all other runtime tuning still comes from the CLI flags above. An empty
@@ -92,7 +92,10 @@ async fn main() -> Result<()> {
     // Load genesis (its chain_id is adopted when present).
     let (genesis, chain_id) = bin_support::resolve_genesis(args.chain.as_deref(), args.chain_id)?;
     let expected_genesis = bin_support::expected_genesis_digest(genesis.as_ref());
-    let state::PreparedState { env, start } = state::prepare_state(&args, expected_genesis)?;
+    // Cancelled on the way out; stops the periodic checkpointer task.
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let state::PreparedState { env, start } =
+        state::prepare_state(&args, expected_genesis, shutdown.clone())?;
 
     // M tx_data subscriptions + tx_deposits, async→sync bridged (shared with
     // the validator binary — see `bin_support`). ALWAYS live: the down-window
@@ -149,7 +152,7 @@ async fn main() -> Result<()> {
     // Spawn the writer; build the three executor adapters from its handle. The
     // snapshot-swap channel feeds reads (snapshot source + commit signal); the
     // delta channel feeds writes.
-    let writer = StateWriter::spawn(env).context("spawn state writer")?;
+    let mut writer = StateWriter::spawn(env).context("spawn state writer")?;
     let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
     let writer_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
     // BAL publication: tee each block's BlockDelta onto tx_bal so validators can
@@ -249,11 +252,11 @@ async fn main() -> Result<()> {
         }
         res = &mut join => Some(res),
     };
-    // Dropping the AeronRuntime closes every subscription, which causes
-    // the tokio pump tasks to return None, which closes the sync mpsc
-    // channels, which surfaces TxDataClosed / TxOrderingClosed to the
-    // executor — clean shutdown.
+    // Dropping the AeronRuntime closes every subscription's sender, so the
+    // reader threads' `blocking_recv` returns None, which surfaces
+    // TxDataClosed to the executor — clean shutdown.
     drop(rt);
+    shutdown.cancel();
     // In cluster mode, the tx_ordering reader blocks on cluster egress
     // `recv()`, which only returns `None` once the session thread drops its
     // sender — i.e. when the `LiveCluster` guard is dropped. Drop it here so the

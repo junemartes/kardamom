@@ -92,7 +92,10 @@ impl BatchVerifier {
                     let mut g = inner_for_task.lock().await;
                     std::mem::swap(&mut *g, &mut scratch);
                 }
-                Self::process_batch(&mut scratch);
+                if scratch.is_empty() {
+                    continue;
+                }
+                scratch = Self::process_batch_blocking(scratch).await;
             }
         });
         Self {
@@ -103,12 +106,29 @@ impl BatchVerifier {
         }
     }
 
-    fn process_batch(batch: &mut Vec<VerifyRequest>) {
-        for req in batch.drain(..) {
-            // Per-tx recovery + keccak; the "batch" amortizes wakeups, not
-            // math.
-            let res = recover_single(&req.env, &req.raw_tx);
-            let _ = req.respond.send(res);
+    /// Run the CPU-bound recovery for `batch` on the blocking pool
+    /// (`spawn_blocking`), so ECDSA never stalls the tokio workers. Each
+    /// request's result is sent on its `oneshot` from the blocking thread.
+    /// Returns the (drained) Vec so the caller can reuse its capacity.
+    async fn process_batch_blocking(mut batch: Vec<VerifyRequest>) -> Vec<VerifyRequest> {
+        match tokio::task::spawn_blocking(move || {
+            for req in batch.drain(..) {
+                // Per-tx recovery + keccak; the "batch" amortizes wakeups,
+                // not math.
+                let res = recover_single(&req.env, &req.raw_tx);
+                let _ = req.respond.send(res);
+            }
+            batch
+        })
+        .await
+        {
+            Ok(batch) => batch,
+            // The blocking task panicked: the pending `oneshot` senders are
+            // dropped with it, so every waiter sees "verifier dropped".
+            Err(e) => {
+                tracing::error!(error = %e, "sig_verify: recovery batch panicked");
+                Vec::new()
+            }
         }
     }
 
@@ -130,12 +150,12 @@ impl BatchVerifier {
             g.len() >= self.depth
         };
         if should_flush_now {
-            // Drain and process synchronously to avoid waiting for the timer.
-            let mut drained: Vec<VerifyRequest> = {
+            // Drain and process now to avoid waiting for the timer.
+            let drained: Vec<VerifyRequest> = {
                 let mut g = self.inner.lock().await;
                 g.drain(..).collect()
             };
-            Self::process_batch(&mut drained);
+            let _ = Self::process_batch_blocking(drained).await;
         } else {
             self.notify.notify_one();
         }

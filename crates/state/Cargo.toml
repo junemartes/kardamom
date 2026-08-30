@@ -34,6 +34,8 @@ signet-libmdbx = "0.8"
 # `Receipt` upstream already derives Archive/Serialize/Deserialize.
 rkyv.workspace = true
 thiserror.workspace = true
+# Checkpoint peer server (`checkpoint_transfer`): tokio listener + per-connection tasks.
+tokio = { workspace = true, features = ["net", "rt", "io-util", "macros", "time", "fs"] }
 tracing.workspace = true
 
 [dev-dependencies]

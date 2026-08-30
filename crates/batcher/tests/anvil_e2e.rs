@@ -228,7 +228,6 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
     let batch1 = pack_blocks(&BatcherConfig::default(), &[block1]).unwrap();
 
     let mut sender = LiveSender::new(
-        tokio::runtime::Handle::current(),
         provider.clone(),
         settlement_addr,
         da_store,
@@ -236,20 +235,15 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
         2,
         cursor_path.clone(),
     );
-    // post_confirmed blocks on the runtime handle — run it off-runtime, as
-    // the production feed thread does.
     let cursor1 = BatchCursor {
         next_index: 0,
         next_block: 2,
         last_batch_index: 0,
     };
-    let (mut sender, first) = tokio::task::spawn_blocking(move || {
-        let r = sender.post_confirmed(&batch1, cursor1);
-        (sender, r)
-    })
-    .await
-    .unwrap();
-    first.expect("first post must confirm");
+    sender
+        .post_confirmed(&batch1, cursor1)
+        .await
+        .expect("first post must confirm");
 
     let settlement = IKardamomL2Settlement::new(settlement_addr, provider.clone());
     assert_eq!(settlement.lastBatchIndex().call().await.unwrap(), 1);
@@ -296,9 +290,9 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
         next_block: 3,
         last_batch_index: 0,
     };
-    let err = tokio::task::spawn_blocking(move || sender.post_confirmed(&batch2, cursor2))
+    let err = sender
+        .post_confirmed(&batch2, cursor2)
         .await
-        .unwrap()
         .expect_err("foreign CAS advance must fail-stop");
     let msg = format!("{err:#}");
     assert!(

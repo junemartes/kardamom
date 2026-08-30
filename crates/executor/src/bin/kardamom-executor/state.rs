@@ -1,10 +1,11 @@
 //! State backend startup: checkpoint serve/restore, env open, the durable
-//! cursor, the periodic checkpointer thread, and the resume decision.
+//! cursor, the periodic checkpointer task, and the resume decision.
 
 use anyhow::{Context, Result};
 use kardamom_executor::ResumePoint;
 use kardamom_state::checkpoint::{create_checkpoint, prune_checkpoints};
 use kardamom_state::{StateEnv, StateEnvBuilder, read_recovery_point};
+use tokio_util::sync::CancellationToken;
 
 use crate::args::Args;
 
@@ -26,11 +27,14 @@ pub(crate) struct PreparedState {
 pub(crate) fn prepare_state(
     args: &Args,
     expected_genesis: Option<alloy_primitives::B256>,
+    shutdown: CancellationToken,
 ) -> Result<PreparedState> {
     if let Some(ckpt_dir) = args.checkpoint_dir.as_ref() {
         // Serve this node's checkpoints to peers (the other side of the peer
         // fetch below). Best-effort infrastructure, but a bad bind address is
         // a deploy bug — fail startup loudly.
+        // Runs as a tokio task for the life of the process (called inside
+        // the runtime; the handle is not needed).
         if let Some(addr) = args.checkpoint_serve_addr {
             kardamom_state::serve_checkpoints(addr, ckpt_dir.clone())
                 .context("bind checkpoint serve address")?;
@@ -74,7 +78,7 @@ pub(crate) fn prepare_state(
         .with_context(|| format!("open state env at {}", args.state_dir.display()))?;
     let recovery = read_recovery_point(&env).context("read state recovery point")?;
 
-    spawn_checkpointer(args, &env)?;
+    spawn_checkpointer(args, &env, shutdown);
 
     // Crash-recovery cursor. A non-genesis cursor means we restarted
     // mid-chain; a fresh start IS a resume from the genesis cursor.
@@ -96,35 +100,49 @@ pub(crate) fn prepare_state(
 
 /// Periodic checkpointing (fast recovery for OTHER nodes, and for this node
 /// on a future wipe). `compact_to` runs against an online RO snapshot, so it
-/// never blocks the writer. Guarded by an interval; prunes to
-/// `checkpoint_keep`.
-fn spawn_checkpointer(args: &Args, env: &StateEnv) -> Result<()> {
+/// never blocks the writer. A tokio interval task; each tick runs the mdbx
+/// compaction on `spawn_blocking` (the txn stays on one thread for the whole
+/// call). Prunes to `checkpoint_keep`. Stops when `shutdown` is cancelled.
+/// Must be called inside a tokio runtime.
+fn spawn_checkpointer(args: &Args, env: &StateEnv, shutdown: CancellationToken) {
     let (Some(ckpt_dir), true) = (
         args.checkpoint_dir.clone(),
         args.checkpoint_interval_secs > 0,
     ) else {
-        return Ok(());
+        return;
     };
     let ckpt_env = env.clone();
     let interval = std::time::Duration::from_secs(args.checkpoint_interval_secs);
     let keep = args.checkpoint_keep;
-    std::thread::Builder::new()
-        .name("kardamom-checkpointer".into())
-        .spawn(move || {
-            loop {
-                std::thread::sleep(interval);
-                match create_checkpoint(&ckpt_env, &ckpt_dir) {
-                    Ok(info) => {
-                        if info.block > keep
-                            && let Err(e) = prune_checkpoints(&ckpt_dir, info.block - keep + 1)
-                        {
-                            tracing::warn!(error = %e, "checkpoint prune failed");
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
-                }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // The first tick fires immediately; the old thread slept first.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = ticker.tick() => {}
             }
-        })
-        .context("spawn checkpointer thread")?;
-    Ok(())
+            let env = ckpt_env.clone();
+            let dir = ckpt_dir.clone();
+            let ran = tokio::task::spawn_blocking(move || checkpoint_once(&env, &dir, keep)).await;
+            if let Err(e) = ran {
+                tracing::warn!(error = %e, "checkpointer task panicked");
+            }
+        }
+    });
+}
+
+/// One checkpoint + prune round; failures are logged, never fatal.
+fn checkpoint_once(env: &StateEnv, ckpt_dir: &std::path::Path, keep: u64) {
+    match create_checkpoint(env, ckpt_dir) {
+        Ok(info) => {
+            if info.block > keep
+                && let Err(e) = prune_checkpoints(ckpt_dir, info.block - keep + 1)
+            {
+                tracing::warn!(error = %e, "checkpoint prune failed");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
+    }
 }

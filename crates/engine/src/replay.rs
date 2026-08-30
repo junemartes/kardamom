@@ -119,37 +119,30 @@ where
     // delta sender drops at its end, which is what lets the writer thread
     // exit — `handle.shutdown()` below joins it and would deadlock while any
     // sender were still alive.
-    let (drive, root) = {
+    let state_root = {
         let mut queue = MdbxWriterQueue::new(handle.delta_tx.clone());
         let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
         let source = MdbxSnapshotSource::new(handle.snapshot_rx.clone());
 
-        let drive = drive_blocks(
-            &mut queue,
-            &mut signal,
-            &source,
-            chain_id,
-            blocks,
-            &mut counters,
-        );
+        blocks.into_iter().try_for_each(|block| {
+            drive_block(
+                &mut queue,
+                &mut signal,
+                &source,
+                chain_id,
+                block,
+                &mut counters,
+            )
+        })?;
 
         // Read the final root while the drive succeeded and before tearing
         // down.
-        let root = match &drive {
-            Ok(()) => source
-                .snapshot_after(counters.head)
-                .state_root()
-                .map_err(ReplayError::from)
-                .and_then(|o| o.ok_or(ReplayError::NoStateRoot)),
-            Err(_) => Ok(B256::ZERO), // unused; `drive?` below returns first
-        };
-        (drive, root)
+        source
+            .snapshot_after(counters.head)
+            .state_root()
+            .map_err(ReplayError::from)
+            .and_then(|o| o.ok_or(ReplayError::NoStateRoot))?
     };
-    let shutdown = handle.shutdown();
-
-    drive?;
-    shutdown?;
-    let state_root = root?;
 
     Ok(ReplayOutcome {
         head_block: counters.head,
@@ -162,71 +155,66 @@ where
 /// Inner loop: execute each block's txs, submit the block delta, wait for the
 /// durable commit. Borrows the adapters so the caller can always tear the
 /// writer down afterwards regardless of outcome.
-fn drive_blocks<I>(
+fn drive_block(
     queue: &mut MdbxWriterQueue,
     signal: &mut MdbxWriterSignal,
     source: &MdbxSnapshotSource,
     chain_id: u64,
-    blocks: I,
+    block: ReplayBlock,
     counters: &mut Counters,
-) -> Result<(), ReplayError>
-where
-    I: IntoIterator<Item = ReplayBlock>,
-{
-    for block in blocks {
-        // Snapshot after the previously-committed block (genesis before the
-        // first). `wait_committed` below keeps the published snapshot anchored
-        // at `counters.head`, so this is exactly the pre-block state view.
-        let snapshot = source.snapshot_after(counters.head);
-        let exec_env = ExecEnv {
-            chain_id,
-            block_number: block.block_number,
-            l2_timestamp: block.l2_timestamp,
-        };
+) -> Result<(), ReplayError> {
+    // Snapshot after the previously-committed block (genesis before the
+    // first). `wait_committed` below keeps the published snapshot anchored
+    // at `counters.head`, so this is exactly the pre-block state view.
+    let snapshot = source.snapshot_after(counters.head);
+    let exec_env = ExecEnv {
+        chain_id,
+        block_number: block.block_number,
+        l2_timestamp: block.l2_timestamp,
+    };
 
-        let mut delta = PendingDelta::new();
-        let mut block_receipts = Vec::with_capacity(block.txs.len());
-        let mut cumulative_gas = 0u64;
-        for (i, tx) in block.txs.iter().enumerate() {
-            let tx_position = BPosition::from_index(counters.global_pos);
-            // Replay executes one durably-committed block at a time against
-            // its own committed snapshot — no pipelined parent layer.
-            let (receipt, ws) = execute_tx(
-                &snapshot,
-                None,
-                &delta,
-                exec_env,
-                TxIndex(counters.tx_idx),
-                tx_position,
-                tx,
-                i as u64,
-                cumulative_gas,
-                None,
-            )?;
-            delta.apply(ws);
-            cumulative_gas += receipt.gas_used;
-            block_receipts.push(receipt);
-            counters.tx_idx += 1;
-            counters.global_pos += 1;
-            counters.txs_applied += 1;
-        }
-
-        let block_delta = delta.finalize(block.block_number, block_receipts);
-        let boundary = BlockBoundary {
-            block_number: block.block_number,
-            end_tx_idx: BPosition::from_index(counters.global_pos),
-            l2_timestamp: block.l2_timestamp,
-            // Offline replay reconstructs from the DA payload, which does not
-            // carry the origin yet (KAR2 adds it — see the deposit-derivation
-            // spec). Zero here is honest: reconstruction currently derives no
-            // deposits, so no block it builds has an epoch to point at.
-            l1_origin: 0,
-        };
-        queue.submit(boundary, block_delta)?;
-        signal.wait_committed(block.block_number)?;
-        counters.head = block.block_number;
-        counters.blocks_applied += 1;
+    let mut delta = PendingDelta::new();
+    let mut block_receipts = Vec::with_capacity(block.txs.len());
+    let mut cumulative_gas = 0u64;
+    for (i, tx) in block.txs.iter().enumerate() {
+        let tx_position = BPosition::from_index(counters.global_pos);
+        // Replay executes one durably-committed block at a time against
+        // its own committed snapshot — no pipelined parent layer.
+        let (receipt, ws) = execute_tx(
+            &snapshot,
+            None,
+            &delta,
+            exec_env,
+            TxIndex(counters.tx_idx),
+            tx_position,
+            tx,
+            i as u64,
+            cumulative_gas,
+            None,
+        )?;
+        delta.apply(ws);
+        cumulative_gas += receipt.gas_used;
+        block_receipts.push(receipt);
+        counters.tx_idx += 1;
+        counters.global_pos += 1;
+        counters.txs_applied += 1;
     }
+
+    let block_delta = delta.finalize(block.block_number, block_receipts);
+    let boundary = BlockBoundary {
+        block_number: block.block_number,
+        end_tx_idx: BPosition::from_index(counters.global_pos),
+        l2_timestamp: block.l2_timestamp,
+        // Offline replay reconstructs from the DA payload, which does not
+        // carry the origin yet (KAR2 adds it — see the deposit-derivation
+        // spec). Zero here is honest: reconstruction currently derives no
+        // deposits, so no block it builds has an epoch to point at.
+        l1_origin: 0,
+    };
+    queue.submit(boundary, block_delta)?;
+    signal.wait_committed(block.block_number)?;
+    counters.head = block.block_number;
+    counters.blocks_applied += 1;
     Ok(())
 }
 

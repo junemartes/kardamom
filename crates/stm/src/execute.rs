@@ -4368,9 +4368,8 @@ fn execute_one<S: StateDatabase>(
     bal_base: Option<u64>,
     fresh_reads: &mut dyn FnMut() -> Vec<ReadRecord>,
 ) -> Result<TxResult, ExecutorError> {
-    let skip = |reason: &str, nonce: u64, to: Option<alloy_primitives::Address>| {
+    let skip = |nonce: u64, to: Option<alloy_primitives::Address>| {
         let (receipt, ws) = invalid_skip(
-            reason,
             position,
             envelope,
             nonce,
@@ -4391,7 +4390,7 @@ fn execute_one<S: StateDatabase>(
 
     let _ = tx_idx;
     let Some(alloy_env) = decoded else {
-        return Ok(skip("undecodable raw_tx", 0, None));
+        return Ok(skip(0, None));
     };
     use alloy_consensus::Transaction;
     let signer = envelope.sender;
@@ -4411,11 +4410,9 @@ fn execute_one<S: StateDatabase>(
     let t_evm = std::time::Instant::now();
     let mut outcome = match evm.transact(tx_env) {
         Ok(o) => o,
-        Err(revm::context::result::EVMError::Transaction(reason)) => {
-            return Ok(skip(&format!("{reason:?}"), nonce, to));
-        }
-        Err(revm::context::result::EVMError::Header(reason)) => {
-            return Ok(skip(&format!("{reason:?}"), nonce, to));
+        Err(revm::context::result::EVMError::Transaction(_))
+        | Err(revm::context::result::EVMError::Header(_)) => {
+            return Ok(skip(nonce, to));
         }
         Err(e) => {
             return Err(ExecutorError::Execution {

@@ -3698,7 +3698,6 @@ dependencies = [
  "bytes",
  "clap",
  "criterion 0.7.0",
- "crossbeam-channel",
  "kardamom-deployer",
  "kardamom-engine",
  "kardamom-log",
@@ -3802,6 +3801,7 @@ dependencies = [
  "reqwest 0.13.4",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -3923,6 +3923,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber 0.3.23",
@@ -3970,6 +3971,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tower",
  "tracing",
@@ -3992,6 +3994,7 @@ dependencies = [
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
 ]
@@ -4066,6 +4069,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
 ]
@@ -4160,6 +4164,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber 0.3.23",

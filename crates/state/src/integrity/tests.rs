@@ -21,7 +21,7 @@ fn build_db(dir: &std::path::Path) {
         code_hash: B256::ZERO,
     }];
     crate::genesis::seed_genesis(&env, &genesis_accounts, &[]).unwrap();
-    let handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
+    let mut handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
     for block in 1..=2u64 {
         let receipt = Receipt {
             tx_idx: BPosition::from_index(block),

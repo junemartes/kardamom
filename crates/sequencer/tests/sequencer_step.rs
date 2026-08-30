@@ -1,8 +1,5 @@
 //! Driver-level tests for `Sequencer::run_once` + `run`.
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-
 use alloy_consensus::{SignableTransaction, TxEnvelope as ConsensusEnvelope, TxLegacy};
 use alloy_network::TxSignerSync;
 use alloy_primitives::{Address, U256};
@@ -217,7 +214,8 @@ fn run_loops_until_shutdown_signaled() {
     let mut channel_a = ScriptedTxData::default();
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
-    let shutdown = Shutdown::from_atomic(Arc::new(AtomicBool::new(true)));
+    let shutdown = Shutdown::new();
+    shutdown.signal();
     let result = seq.run(&mut channel_a, &mut b, &mut rc, shutdown);
     assert!(result.is_ok(), "{result:?}");
 }

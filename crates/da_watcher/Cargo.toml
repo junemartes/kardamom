@@ -30,6 +30,7 @@ tracing.workspace = true
 kardamom-log = { workspace = true }
 anyhow.workspace = true
 clap.workspace = true
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }
