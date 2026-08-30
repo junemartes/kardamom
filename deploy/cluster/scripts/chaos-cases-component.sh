@@ -20,21 +20,30 @@ case_hard_executor() {
   assert_count executor 3 "${CHAOS_RESTART_SLO_S}"
 }
 
+# D-3: count 2, not 1 — with a killed-marker set, assert_count's replacement
+# leg then requires the KILLED replica back, instead of the untouched peer
+# satisfying ">=1" on the first poll.
 case_graceful_ingress() {
   inject_graceful ingress
-  assert_count ingress 1 "${CHAOS_RESTART_SLO_S}"
+  assert_count ingress 2 "${CHAOS_RESTART_SLO_S}"
 }
 
+# D-11: the hard-kill victim rotates by run id (INGRESS_VICTIM, chaos.sh) —
+# ingress is active/active symmetric, and a blast radius pinned forever to
+# ingress-0 never proves the twin can die.
 case_hard_ingress() {
-  inject_hard kardamom-ingress-0 ingress
-  assert_count ingress 1 "${CHAOS_RESTART_SLO_S}"
+  inject_hard "kardamom-ingress-${INGRESS_VICTIM}" ingress
+  assert_count ingress 2 "${CHAOS_RESTART_SLO_S}"
 }
 
 # Sequencers run P=2 racing replicas per shard (job groups seq-a/seq-b,
 # 4 allocs total): a kill no longer stalls its shard — the twin on the
 # other node keeps ordering, so these also assert live pipeline progress.
+# D-6: the load is PINNED to shard 0 (account selection in run_case) and the
+# stop targets a seq-a alloc specifically — an arbitrary alloc meant ~half of
+# runs killed a replica the pinned load never used.
 case_graceful_sequencer() {
-  inject_graceful sequencer
+  inject_graceful_group sequencer seq-a
   assert_progress
   assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
 }
@@ -63,22 +72,12 @@ case_sequencer_replica_kill() {
   assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
 }
 
-case_sealer_graceful() {
-  inject_graceful sealer
-  assert_count sealer 1 "${CHAOS_RESTART_SLO_S}"
-}
-
-# KNOWN GAP (single-sealer topology): after a HARD sealer crash the executors
-# freeze and don't re-attach to the restarted sealer's canonical tx_ordering
-# (sealer was a singleton SPOF; HA was future work). SUPERSEDED by the
-# clustered sealer (Phase 3): the cluster-leader-kill case now covers the
-# hard-kill-of-the-ordering-authority scenario with a 3-member Raft quorum that
-# re-elects. Excluded from the always-on CI suite (see cluster-e2e.yml); kept
-# here to reproduce against a legacy single-sealer deploy; tracked in issue #58.
-case_sealer_hard() {
-  inject_hard kardamom-sealer-0 sealer
-  assert_count sealer 1 "${CHAOS_RESTART_SLO_S}"
-}
+# D-9: sealer-graceful / sealer-hard DELETED — they targeted the legacy
+# single-sealer job that no longer deploys (superseded by the 3-member Raft
+# cluster: cluster-leader-kill / cluster-follower-kill /
+# cluster-quorum-loss-recover in chaos-cases-cluster.sh). They would fail on
+# the first `running_alloc sealer` if ever invoked; keeping dead cases invites
+# a future vacuous resurrection.
 
 case_node_failure_executor() {
   # Kill the whole node container. With 3 executor-role nodes + distinct_hosts
@@ -86,6 +85,16 @@ case_node_failure_executor() {
   # degrades to 2 and must keep progressing; bringing the node back recovers 3.
   log "node-failure: docker kill kardamom-executor-2 (whole node)"
   kill_node kardamom-executor-2
+  # D-5: the survivors satisfy a bare ">= 2" instantly — first OBSERVE the
+  # outage (the victim's gauge goes dark), else the case never proves a
+  # node was actually lost.
+  local nf_t=0
+  while exec_metrics 2 >/dev/null 2>&1; do
+    sleep 3; nf_t=$(( nf_t + 3 ))
+    [ "${nf_t}" -ge 60 ] \
+      && fail "node-failure: executor-2's exporter still answering ${nf_t}s after the node kill — outage not observed"
+  done
+  log "node-failure: outage observed (executor-2 exporter dark after ${nf_t}s)"
   assert_count executor 2 "${CHAOS_RESTART_SLO_S}"
   # Wide window here too: killing a whole NODE thrashes the runner (docker
   # teardown + nomad node-down churn) enough that on 4-core CI hosts even

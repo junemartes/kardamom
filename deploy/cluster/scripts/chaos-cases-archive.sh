@@ -44,6 +44,7 @@ case_archive_driver_loss() {
   assert_progress
   assert_count aeron "${aeron_base}" "${CHAOS_RESTART_SLO_S}"
   assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
+  assert_ingress_pair_live "${name}"
 }
 
 case_archive_tx_data_wipe() {
@@ -158,6 +159,7 @@ case_archive_tx_data_wipe() {
   fi
   log "archive-tx-data-wipe: restored archive verified OK on ingress-0 (2-copy redundancy recovered)"
   assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
+  assert_ingress_pair_live "${name}"
 }
 
 case_archive_corruption() {
@@ -319,4 +321,5 @@ print(best + 40 if best >= 0 else -1)
     || fail "archive-corruption: drain disable failed"
   assert_count aeron "${aeron_base}" "${CHAOS_RESTART_SLO_S}"
   assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
+  assert_ingress_pair_live "${name}"
 }

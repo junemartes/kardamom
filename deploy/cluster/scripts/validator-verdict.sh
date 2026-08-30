@@ -144,7 +144,12 @@ run_validator_verdict() {
   # side-stream refetch (tracked follow-up), not test tuning.
   v_start="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_committed_block)"; v_start="${v_start:-0}"
   v_start="$(printf '%.0f' "${v_start}")"
-  if [[ "${RUN_LOAD:-1}" == "1" ]]; then
+  # D-7: the semantics shard runs REAL (light) traffic through the scenario
+  # drivers, so the validator can and must be held to the bounded-lag verdict —
+  # it only got the weak forward-progress one because RUN_LOAD=0. The weak
+  # verdict stays for CHAOS shards, where side-stream image lapse under a kill
+  # barrage makes bounded lag a tracked follow-up, not an assertion.
+  if [[ "${RUN_LOAD:-1}" == "1" || "${RUN_SEMANTICS:-0}" == "1" ]]; then
     deadline=$(( $(date +%s) + VALIDATOR_SYNC_TIMEOUT_S ))
     ok=0
     while (( $(date +%s) < deadline )); do
@@ -192,8 +197,24 @@ run_validator_verdict() {
   verified="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_blocks_verified_total)"
   verified="$(printf '%.0f' "${verified:-0}")"
   (( verified > 0 )) || { echo "FAIL: validator verified 0 blocks against the BAL (tx_bal not flowing?)" >&2; exit 1; }
-  diverged="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_divergence_total)"
-  diverged="$(printf '%.0f' "${diverged:-0}")"
+  # D-2: a failed scrape must not read as "0 divergences" — retry, then fail
+  # loudly rather than pass vacuously on a dead exporter.
+  diverged=""
+  for _ in 1 2 3 4 5; do
+    diverged="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_divergence_total)"
+    [[ -n "${diverged}" ]] && break
+    # Absent metric vs dead exporter: divergence_total is not exported until
+    # first incremented, so a healthy validator has no such line. The canary
+    # (committed_block, always present once live) proves the exporter answers;
+    # the absent counter then genuinely IS 0.
+    if [[ -n "$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_committed_block)" ]]; then
+      diverged=0
+      break
+    fi
+    sleep 3
+  done
+  [[ -n "${diverged}" ]] || { echo "FAIL: validator exporter unscrapeable after 5 tries — cannot assert 0 divergences" >&2; exit 1; }
+  diverged="$(printf '%.0f' "${diverged}")"
   (( diverged == 0 )) || { echo "FAIL: validator counted ${diverged} divergence(s)" >&2; exit 1; }
   # Metric AND logs: the metric resets if the alloc restarted (recovery loop);
   # a pre-restart divergence still shows in the alloc log — the shared
