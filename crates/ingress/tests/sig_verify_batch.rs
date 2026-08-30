@@ -90,41 +90,57 @@ async fn batched_callers_never_cross_answers() {
     assert_eq!(bs, bad_addr);
 }
 
-/// The reactor must stay responsive while recovery runs.
+/// CPU nanoseconds consumed by THIS thread (`CLOCK_THREAD_CPUTIME_ID`).
+/// Time spent descheduled does not accrue, so host load cannot inflate it.
+fn thread_cpu_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: writes one timespec the C way; no aliasing beyond the call.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// The recovery work must not run on the async runtime's thread.
 ///
-/// 256 recoveries are ~10.7ms of CPU. On a single-threaded runtime that
-/// is 10.7ms of stall if the work runs on the runtime's own thread —
-/// which is exactly what the sequential in-task loop did. With recovery
-/// on the blocking pool a 1ms timer still fires on time. The threshold
-/// sits between those two worlds: this test FAILS on the old code.
+/// 256 recoveries are ~10.7ms of pure CPU. The test drives them through
+/// the verifier on a `current_thread` runtime — the test thread IS the
+/// runtime thread — and asserts the runtime thread's own CPU TIME stays
+/// far below the ECDSA cost. If any path (the ring-full fast path or the
+/// flush task) runs recovery inline, that CPU lands on this thread and
+/// the count jumps past the bound deterministically.
 ///
-/// Parallelism 1 on purpose: the assert measures where the work runs, not
-/// how fast. With 4 blocking threads on a 2-core CI host the OS deschedules
-/// the runtime thread and the timer fires 10-50ms late — a CPU-contention
-/// stall that reads as the bug this test guards against.
+/// CPU time, not wall clock, on purpose (issue #252): the old wall-clock
+/// timer assert measured the OS scheduler — on a loaded 2-core host the
+/// runtime thread is descheduled for 1-16ms with the work fully
+/// off-thread, and one flake per CI wave was the result. Descheduling
+/// does not accrue thread CPU time, so this bound is immune to host
+/// load in BOTH directions.
 #[tokio::test(flavor = "current_thread")]
 async fn recovery_does_not_block_the_reactor() {
+    let cases: Vec<_> = (0..256u64).map(fixtures::signed).collect();
     let v = std::sync::Arc::new(BatchVerifier::with_parallelism(
         64,
         Duration::from_micros(50),
         4,
     ));
-    let cases: Vec<_> = (0..256u64).map(fixtures::signed).collect();
+    let cpu0 = thread_cpu_ns();
     let mut handles = Vec::new();
     for (env, raw, _) in cases {
         let v = v.clone();
         handles.push(tokio::spawn(async move { v.recover(env, raw).await }));
     }
-    tokio::task::yield_now().await;
-    let t = std::time::Instant::now();
-    tokio::time::sleep(Duration::from_millis(1)).await;
-    let slept = t.elapsed();
     for h in handles {
         h.await.unwrap().unwrap();
     }
+    let runtime_cpu_ms = (thread_cpu_ns() - cpu0) as f64 / 1e6;
+    eprintln!("runtime-thread CPU during 256 recoveries: {runtime_cpu_ms:.2}ms");
     assert!(
-        slept < Duration::from_millis(6),
-        "reactor stalled {slept:?} during batch recovery — CPU work is running on a runtime thread"
+        runtime_cpu_ms < 5.0,
+        "runtime thread burned {runtime_cpu_ms:.2}ms of CPU during batch recovery \
+         (task bookkeeping is ~1ms; 256 recoveries are ~10.7ms) — \
+         CPU work is running on a runtime thread"
     );
 }
 
