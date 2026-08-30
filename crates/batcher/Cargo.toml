@@ -72,7 +72,6 @@ criterion = { version = "0.7", features = ["html_reports"] }
 alloy-node-bindings.workspace = true
 alloy-consensus.workspace = true
 alloy-network.workspace = true
-alloy-signer-local.workspace = true
 serde_json.workspace = true
 reqwest = { workspace = true }
 
@@ -91,3 +90,11 @@ harness = false
 [[bin]]
 name = "kardamom-proof-submitter"
 path = "src/bin/kardamom-proof-submitter.rs"
+
+[[bin]]
+name = "kardamom-batch-claimer"
+path = "src/bin/kardamom-batch-claimer.rs"
+
+[[bin]]
+name = "kardamom-batch-watcher"
+path = "src/bin/kardamom-batch-watcher.rs"

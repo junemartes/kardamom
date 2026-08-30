@@ -580,7 +580,7 @@ Single-block proving (the 104-byte layout) remains for dev/round-trip.
   the submitter posts — three decoupled cadences, gaps tolerated
   end-to-end.
 
-## PR 5 design — optimistic validation, proofs on dispute (2026-08-16)
+## PR 5 design — optimistic validation, proofs on dispute (2026-08-16; DELIVERED same day)
 
 Validity mode (PR 4) proves every batch: ~8M cycles/block spent proving
 things nobody disputes. This phase inverts the default: batches advance the
@@ -737,6 +737,16 @@ challenger is "the stand-in for a trustless ZK fault proof" — this is that
 replacement arriving. Follow-up (deferred): point withdrawal finalization
 at the proof oracle's FINALIZED roots and retire the permissioned
 attester/challenger pair; one root chain serves batches and withdrawals.
+
+Delivery evidence: 18-test forge suite on oracle v2 (the full
+claim/finalize/challenge matrix incl. the fold check, first-divergence
+anchoring, agreeing-proof revert, cascade + rewind); both guest round
+trips on the 160-byte outputs; and `optimistic_e2e` on anvil — the honest
+path finalizing with ZERO proofs and a lying claim (correct digests,
+wrong root at offset 1) detected by the spool-fed watcher, challenged at
+the exact offset, slashed, rewound, and honestly re-claimed. The spool is
+the bridge: its per-block expected-outputs feed BOTH the claim poster and
+the watcher, so optimistic mode added no new validator surface.
 
 ### Delivery slices
 

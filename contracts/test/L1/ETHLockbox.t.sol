@@ -279,7 +279,7 @@ contract ETHLockboxTest is Test {
     // ---------------------------------------------------------------------
 
     /// Must match KardamomUUPSBase.FACTORY.
-    address constant FACTORY = 0xED26EF4bE626a43Ea01074435D80fC48Dc5040cD;
+    address constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
 
     function test_initializeV2_sets_oracle_factory_only() public {
         // A lockbox deployed deposit-only (zero oracle) — the pre-V2 fleet.
