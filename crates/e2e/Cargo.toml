@@ -29,6 +29,7 @@ full-pipeline-e2e = [
     "dep:kardamom-batcher",
     "dep:kardamom-bench",
     "dep:kardamom-da-watcher",
+    "dep:kardamom-exec-core",
     "dep:kardamom-deployer",
     "dep:kardamom-state",
     "dep:libc",
@@ -67,6 +68,7 @@ alloy-provider = { workspace = true, optional = true }
 alloy-signer-local = { workspace = true, optional = true }
 alloy-sol-types = { workspace = true, optional = true }
 kardamom-da-watcher = { path = "../da_watcher", optional = true }
+kardamom-exec-core = { path = "../exec-core", optional = true }
 kardamom-deployer = { path = "../deployer", optional = true }
 anyhow = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }

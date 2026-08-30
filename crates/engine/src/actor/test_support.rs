@@ -102,3 +102,27 @@ pub(super) fn drain_commits(rx: Receiver<ExecToCommit>) -> (Vec<u64>, Vec<u64>) 
     }
     (receipts, boundaries)
 }
+
+/// Records every submitted block AND applies it to a shared
+/// `MockStateDatabase`, so a later block's snapshot observes an earlier
+/// block's writes.
+///
+/// Pair with `MutatingSnapshotSource` over the same handle for any test that
+/// spans more than one block. Plain `RecordingQueue` + `StaticSnapshotSource`
+/// silently loses committed state: the settle sweep drops a settled block from
+/// the parent read layer on the assumption that the refreshed snapshot now
+/// contains it, which a static snapshot never does — so multi-block state
+/// carry-over reads as zero and a test can "pass" against behaviour production
+/// would never produce.
+pub(super) struct ApplyingRecordingQueue {
+    pub(super) db: kardamom_exec_core::state::MockStateDatabase,
+    pub(super) log: Arc<Mutex<Vec<(BlockBoundary, BlockDelta)>>>,
+}
+
+impl StateWriterQueue for ApplyingRecordingQueue {
+    fn submit(&mut self, b: BlockBoundary, d: BlockDelta) -> Result<(), ExecutorError> {
+        self.db.apply_block_delta(&d);
+        self.log.lock().unwrap().push((b, d));
+        Ok(())
+    }
+}

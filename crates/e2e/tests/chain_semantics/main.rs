@@ -27,7 +27,7 @@ use e2e::harness::services::IngressOptions;
 use e2e::harness::{LocalStack, StackConfig};
 use e2e::scenarios::{
     bridge, consistency, crash_recovery, da_parity, derivation, divergence, nonce_gap,
-    nonce_unordered, rpc_liveness, rpc_vectors,
+    nonce_unordered, rpc_liveness, rpc_vectors, upgrade,
 };
 
 /// Client request bound, kept above every server-side park bound used here.
@@ -74,3 +74,4 @@ include!("pipeline.rs");
 include!("consistency.rs");
 include!("bridge_da.rs");
 include!("derivation.rs");
+include!("upgrades.rs");

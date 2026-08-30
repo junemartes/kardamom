@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use alloy_primitives::Address;
 
-use crate::source::DepositLog;
+use crate::source::LockboxLog;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -50,7 +50,7 @@ pub enum MonitorError {
     /// `L1Source::finalized_block_number` failed (transport/decode).
     #[error("failed to read L1 finalized tip: {0}")]
     Tip(L1SourceError),
-    /// `L1Source::deposit_logs` failed.
+    /// `L1Source::lockbox_logs` failed.
     #[error("failed to read L1 deposit logs: {0}")]
     Logs(L1SourceError),
     /// `L1Source::block_hash` failed. An epoch cannot be built without its
@@ -123,12 +123,12 @@ where
     // One range query for the logs, then split by block: the alternative
     // (a query per block) multiplies RPC round-trips on catch-up for no gain.
     let logs = source
-        .deposit_logs(lockbox, from_block, tip)
+        .lockbox_logs(lockbox, from_block, tip)
         .await
         .map_err(MonitorError::Logs)?;
-    let mut by_block: BTreeMap<u64, Vec<DepositLog>> = BTreeMap::new();
+    let mut by_block: BTreeMap<u64, Vec<LockboxLog>> = BTreeMap::new();
     for log in logs {
-        by_block.entry(log.block_number).or_default().push(log);
+        by_block.entry(log.block_number()).or_default().push(log);
     }
 
     let mut published = 0usize;
@@ -272,7 +272,9 @@ mod tests {
     use crate::source::fakes::MockL1Source;
     use alloy_primitives::U256;
     use alloy_primitives::{Address, B256, address};
-    use kardamom_types::epoch::{DepositLog, alias_l1_address, source_hash};
+    use kardamom_types::epoch::{
+        DepositLog, UpgradeLog, alias_l1_address, source_hash, source_hash_system,
+    };
 
     fn lockbox() -> Address {
         address!("0000000000000000000000000000000000C0DE01")
@@ -280,8 +282,8 @@ mod tests {
 
     /// A log in L1 block `number`, whose hash is the mock's filler for that
     /// number — i.e. what the watcher will independently fetch.
-    fn dep_log(number: u64, log_index: u64, mint: u128) -> DepositLog {
-        DepositLog {
+    fn dep_log(number: u64, log_index: u64, mint: u128) -> LockboxLog {
+        LockboxLog::Deposit(DepositLog {
             block_number: number,
             block_hash: MockL1Source::filler_hash(number),
             log_index,
@@ -290,7 +292,18 @@ mod tests {
             mint,
             gas_limit: 200_000,
             data: alloy_primitives::Bytes::new(),
-        }
+        })
+    }
+
+    /// An upgrade-transaction log in L1 block `number`.
+    fn upg_log(number: u64, log_index: u64, feature: u64, activation: u64) -> LockboxLog {
+        LockboxLog::Upgrade(UpgradeLog {
+            block_number: number,
+            block_hash: MockL1Source::filler_hash(number),
+            log_index,
+            feature_id: alloy_primitives::U256::from(feature),
+            activation_timestamp: activation,
+        })
     }
 
     #[tokio::test]
@@ -305,6 +318,70 @@ mod tests {
         assert_eq!(n, 0);
         assert_eq!(cursor, Some(100));
         assert!(pub_.published.lock().unwrap().is_empty());
+    }
+
+    /// The upgrade transaction rides the deposit path end to end: same query,
+    /// same epoch, same publish. If this ever needed its own plumbing, the
+    /// sealer and slot accounting would have needed changes too.
+    #[tokio::test]
+    async fn an_upgrade_log_becomes_a_system_deposit_in_its_epoch() {
+        let pub_ = InMemoryEpochPublisher::default();
+        let src = MockL1Source::new();
+        src.push_tip(Ok(201));
+        src.push_logs(Ok(vec![upg_log(201, 0, 1, 0)]));
+        let mut cursor = Some(200);
+
+        let n = process_once(&pub_, &src, lockbox(), &mut cursor)
+            .await
+            .unwrap();
+
+        assert_eq!(n, 1);
+        let v = pub_.published.lock().unwrap();
+        assert_eq!(v[0].deposits.len(), 1);
+        let d = &v[0].deposits[0];
+        assert!(d.is_system_transaction);
+        assert_eq!(d.from, kardamom_types::upgrades::SYSTEM_UPGRADER);
+        assert_eq!(d.to, Some(kardamom_types::upgrades::CHAIN_STATE));
+        assert_eq!(
+            d.source_hash,
+            source_hash_system(MockL1Source::filler_hash(201), 0)
+        );
+        assert_eq!(d.mint, 0);
+    }
+
+    /// Deposits and upgrades arrive on one topic-filtered query, so they must
+    /// stay in L1 log order within the epoch — an upgrade must not overtake a
+    /// deposit L1 sequenced first.
+    #[tokio::test]
+    async fn deposits_and_upgrades_share_one_epoch_in_log_order() {
+        let pub_ = InMemoryEpochPublisher::default();
+        let src = MockL1Source::new();
+        src.push_tip(Ok(301));
+        // Pushed out of order on purpose; the rule sorts by log_index.
+        src.push_logs(Ok(vec![
+            dep_log(301, 2, 500),
+            upg_log(301, 1, 7, 1_700_000_000_250),
+            dep_log(301, 0, 100),
+        ]));
+        let mut cursor = Some(300);
+
+        process_once(&pub_, &src, lockbox(), &mut cursor)
+            .await
+            .unwrap();
+
+        let v = pub_.published.lock().unwrap();
+        let kinds: Vec<bool> = v[0]
+            .deposits
+            .iter()
+            .map(|d| d.is_system_transaction)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![false, true, false],
+            "epoch must follow L1 log order, not arrival order"
+        );
+        assert_eq!(v[0].deposits[0].mint, 100);
+        assert_eq!(v[0].deposits[2].mint, 500);
     }
 
     #[tokio::test]
@@ -456,7 +533,7 @@ mod tests {
         let pub_ = InMemoryEpochPublisher::default();
         let src = MockL1Source::new();
         src.push_tip(Ok(151));
-        src.push_logs(Ok(vec![DepositLog {
+        src.push_logs(Ok(vec![LockboxLog::Deposit(DepositLog {
             block_number: 151,
             block_hash: B256::repeat_byte(0xFF), // not the filler for 151
             log_index: 0,
@@ -465,7 +542,7 @@ mod tests {
             mint: 1,
             gas_limit: 100,
             data: alloy_primitives::Bytes::new(),
-        }]));
+        })]));
         let mut cursor = Some(150);
 
         let err = process_once(&pub_, &src, lockbox(), &mut cursor)
