@@ -49,6 +49,10 @@ source "${SCRIPT_DIR}/lib-topology.sh"
 # Prometheus scrape/parse helpers (fetch_metrics, prom_value).
 # shellcheck source=deploy/cluster/scripts/lib-metrics.sh
 source "${SCRIPT_DIR}/lib-metrics.sh"
+# cosign signing/verification for the digest manifest + images (P0.5):
+# sign_pushed_image (used by ci-images.sh push_image) + sign_digest_manifest.
+# shellcheck source=deploy/cluster/scripts/lib-signing.sh
+source "${SCRIPT_DIR}/lib-signing.sh"
 # ci-cluster's own sourced libs (see the SPLIT LAYOUT note above).
 # shellcheck source=deploy/cluster/scripts/ci-diagnostics.sh
 source "${SCRIPT_DIR}/ci-diagnostics.sh"
@@ -63,6 +67,12 @@ NET=kardamom-net
 SUBNET=192.168.56.0/24
 REGISTRY=192.168.56.10:5000
 TAG=dev
+# Per-deploy image digest manifest (attested-identity P0.1): push_image
+# (ci-images.sh) records "<svc> <repo>@sha256:..." per pushed image, and
+# deploy.sh reads the SAME default path to pin every job's image_ref var.
+# Gitignored — it is an audit record of one deploy, not source.
+DIGEST_MANIFEST="${DIGEST_MANIFEST:-${CLUSTER_DIR}/images.digests}"
+export DIGEST_MANIFEST
 NODE_IMAGE=kardamom-node:ci
 # NOTE: kardamom-recorder was removed (durability is now archive-at-the-sealer);
 # the sealer image carries the durability sidecar.
@@ -247,6 +257,12 @@ ANSIBLE_HOST_KEY_CHECKING=False \
 build_service_images
 # --- 5b. Cluster image (Java Aeron-Cluster node) -----------------------------
 build_cluster_image
+# --- 5c. Sign the COMPLETED digest manifest (attested-identity P0.5) ---------
+# Every image above was signed by digest at push time (push_image); the
+# manifest blob is signed once, HERE, after the last push — it is the
+# document deploy-time verification and the private-repo image-drift sweep
+# anchor on. Keyless, public Rekor, in CI only; a clear skip line otherwise.
+sign_digest_manifest "${DIGEST_MANIFEST}"
 
 # --- 6. Deploy the Nomad jobs + smoke ---------------------------------------
 export NOMAD_ADDR="http://192.168.56.10:4646"

@@ -17,6 +17,17 @@
 # NOTE: this job uses file() for its templates, so submit it from the
 # deploy/cluster/ directory (scripts/deploy.sh does this).
 
+# Digest-pinned image (attested-identity P0.1): scripts/deploy.sh passes the
+# repo:tag@sha256:... reference captured at push time (deploy/cluster/
+# images.digests). The empty default falls back to the mutable :dev tag in
+# the task config — a dev affordance for manual `nomad job run` during
+# debugging, NOT a production path.
+variable "image_ref" {
+  type        = string
+  description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
+  default     = ""
+}
+
 # Epoch verification (phase D). BOTH must be set to enable it: the validator
 # then re-derives every epoch from L1 and fail-stops on disagreement. Left
 # empty, it still enforces the origin SEQUENCE (rules 1-2, which need no L1)
@@ -95,10 +106,17 @@ job "validator" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.10:5000/kardamom-validator:dev"
-        # Always pull the freshly-built image (mutable :dev tag; see executor job).
-        force_pull   = true
-        network_mode = "host"
+        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-validator:dev"
+        # force_pull kept for both paths (see the ingress job's comment):
+        # the :dev fallback needs it; on the pinned path the 1.9.5 driver
+        # pulls the tag but resolves the image by digest, so the pin holds.
+        force_pull = true
+        # Read-only rootfs (attested-identity P0.3): the validator's writable
+        # surfaces — its state dir under the shared mount, the checkpoint
+        # staging dir, the aeron dir — are all explicit bind mounts below,
+        # plus Nomad's alloc/local/secrets mounts. Validated by cluster-e2e.
+        readonly_rootfs = true
+        network_mode    = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
           "/opt/kardamom/state:/opt/kardamom/state",
@@ -151,15 +169,15 @@ job "validator" {
           # randomized blocks; cadence 8 still shadow-checks hundreds of blocks
           # per e2e run under real load).
           "--trie-shadow-check", "8",
-        ],
-        # Epoch verification against L1 (phase D). Appended ONLY when both
-        # are configured — the validator requires --lockbox to parse as an
-        # address, so passing it empty would break every deploy that has not
-        # opted in. Unset, the validator still enforces the origin SEQUENCE;
-        # only the content check is off.
-        var.l1_rpc_url == "" || var.lockbox_address == "" ? [] : [
-          "--l1-rpc-url", var.l1_rpc_url,
-          "--lockbox", var.lockbox_address,
+          ],
+          # Epoch verification against L1 (phase D). Appended ONLY when both
+          # are configured — the validator requires --lockbox to parse as an
+          # address, so passing it empty would break every deploy that has not
+          # opted in. Unset, the validator still enforces the origin SEQUENCE;
+          # only the content check is off.
+          var.l1_rpc_url == "" || var.lockbox_address == "" ? [] : [
+            "--l1-rpc-url", var.l1_rpc_url,
+            "--lockbox", var.lockbox_address,
         ])
       }
 

@@ -6,6 +6,10 @@ SHELL := /bin/bash
 REGISTRY := 192.168.56.10:5000
 NOMAD_ADDR := http://192.168.56.10:4646
 TAG := dev
+# Per-deploy image digest manifest (attested-identity P0.1): written at push
+# time by scripts/push-image.sh, read by scripts/deploy.sh to pin every job's
+# image_ref variable to repo@sha256:... . Gitignored (audit record, not source).
+DIGEST_MANIFEST := images.digests
 # Workspace root (this file lives in deploy/cluster/).
 ROOT := $(abspath ../..)
 # The Rust service binaries that get their own image. There is NO kardamom-
@@ -36,15 +40,16 @@ provision:
 ## NOTE: pushing needs $(REGISTRY) in the HOST Docker daemon's
 ## insecure-registries (see README "Host prerequisites").
 images:
+	@rm -f $(DIGEST_MANIFEST)
 	docker build -f $(ROOT)/crates/log/docker/aeron/Dockerfile \
 		-t $(REGISTRY)/kardamom-aeron:$(TAG) $(ROOT)/crates/log/docker/aeron
-	docker push $(REGISTRY)/kardamom-aeron:$(TAG)
+	./scripts/push-image.sh aeron $(REGISTRY)/kardamom-aeron:$(TAG) $(DIGEST_MANIFEST)
 	@for svc in $(SERVICES); do \
 		echo "==> building kardamom-$$svc"; \
 		docker build -f docker/service.Dockerfile \
 			--build-arg BIN=kardamom-$$svc \
 			-t $(REGISTRY)/kardamom-$$svc:$(TAG) $(ROOT) || exit 1; \
-		docker push $(REGISTRY)/kardamom-$$svc:$(TAG) || exit 1; \
+		./scripts/push-image.sh $$svc $(REGISTRY)/kardamom-$$svc:$(TAG) $(DIGEST_MANIFEST) || exit 1; \
 	done
 	@# Java Aeron Cluster node (cluster.nomad.hcl pulls kardamom-cluster:$(TAG)).
 	@# The jar must be built first — fail loudly, or deploy.sh fails pulling.
@@ -56,7 +61,10 @@ images:
 	cp $(CLUSTER_JAR) docker/kardamom-cluster-node.jar
 	docker build -f docker/cluster.Dockerfile \
 		-t $(REGISTRY)/kardamom-cluster:$(TAG) docker
-	docker push $(REGISTRY)/kardamom-cluster:$(TAG)
+	./scripts/push-image.sh cluster $(REGISTRY)/kardamom-cluster:$(TAG) $(DIGEST_MANIFEST)
+	@# P0.5: sign the COMPLETED manifest (keyless, CI-with-OIDC only; a clear
+	@# skip line locally). Must stay the LAST step of this target.
+	./scripts/sign-manifest.sh $(DIGEST_MANIFEST)
 
 ## deploy: run the Aeron system job, then the service jobs (sealer first — it
 deploy:
