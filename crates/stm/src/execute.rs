@@ -4365,8 +4365,13 @@ fn execute_one<S: StateDatabase>(
     bal_base: Option<u64>,
     fresh_reads: &mut dyn FnMut() -> Vec<ReadRecord>,
 ) -> Result<TxResult, ExecutorError> {
-    let skip = |nonce: u64, to: Option<alloy_primitives::Address>| {
+    let skip = |reason: kardamom_types::SkipReason,
+                detail: &str,
+                nonce: u64,
+                to: Option<alloy_primitives::Address>| {
         let (receipt, ws) = Executor::<S>::skip_receipt(
+            reason,
+            detail,
             position,
             envelope,
             nonce,
@@ -4387,7 +4392,12 @@ fn execute_one<S: StateDatabase>(
 
     let _ = tx_idx;
     let Some(alloy_env) = decoded else {
-        return Ok(skip(0, None));
+        return Ok(skip(
+            kardamom_types::SkipReason::Undecodable,
+            "undecodable raw_tx",
+            0,
+            None,
+        ));
     };
     use alloy_consensus::Transaction;
     let signer = envelope.sender;
@@ -4407,9 +4417,21 @@ fn execute_one<S: StateDatabase>(
     let t_evm = std::time::Instant::now();
     let mut outcome = match evm.transact(tx_env) {
         Ok(o) => o,
-        Err(revm::context::result::EVMError::Transaction(_))
-        | Err(revm::context::result::EVMError::Header(_)) => {
-            return Ok(skip(nonce, to));
+        Err(revm::context::result::EVMError::Transaction(e)) => {
+            return Ok(skip(
+                kardamom_exec_core::executor::skip_reason_of_tx(&e),
+                &format!("{e:?}"),
+                nonce,
+                to,
+            ));
+        }
+        Err(revm::context::result::EVMError::Header(e)) => {
+            return Ok(skip(
+                kardamom_types::SkipReason::Header,
+                &format!("{e:?}"),
+                nonce,
+                to,
+            ));
         }
         Err(e) => {
             return Err(ExecutorError::Execution {
@@ -4515,6 +4537,7 @@ fn execute_one<S: StateDatabase>(
         transaction_index: local_idx as u64,
         // Canonical prefix sums land in the commit pass.
         cumulative_gas_used: 0,
+        skip_reason: None,
     };
     Ok(TxResult {
         receipt,

@@ -29,7 +29,7 @@ mod write_set;
 
 pub use db::{SnapshotDb, SnapshotRef, StateRefError};
 pub use deposit::execute_deposit_tx;
-pub use scope::{Executor, TouchSet};
+pub use scope::{Executor, TouchSet, skip_reason_of_tx};
 pub use tx_env::DecodedTx;
 
 #[cfg(test)]

@@ -224,7 +224,7 @@ async fn run_receipt_floor_feed(
             .send(FloorUpdate {
                 sender: receipt.from,
                 executed_nonce: receipt.nonce,
-                invalid_skip: receipt.is_invalid_skip(),
+                skip_reason: receipt.skip_reason,
                 deposit: receipt.is_deposit(),
             })
             .is_err()

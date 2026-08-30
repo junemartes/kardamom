@@ -113,7 +113,7 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
             deposit: false,
             sender: s.address(),
             executed_nonce: 1,
-            invalid_skip: false,
+            skip_reason: None,
         })
         .unwrap();
 
@@ -180,7 +180,7 @@ fn receipt_floor_unsticks_cold_rejoin_buffer() {
             deposit: false,
             sender: s.address(),
             executed_nonce: 4,
-            invalid_skip: false,
+            skip_reason: None,
         })
         .unwrap();
 
@@ -221,7 +221,7 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
             deposit: false,
             sender: s.address(),
             executed_nonce: 1,
-            invalid_skip: false,
+            skip_reason: None,
         })
         .unwrap();
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
@@ -251,7 +251,7 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
             deposit: false,
             sender: s.address(),
             executed_nonce: 2,
-            invalid_skip: false,
+            skip_reason: None,
         })
         .unwrap();
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();

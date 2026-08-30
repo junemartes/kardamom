@@ -67,6 +67,9 @@ pub fn receipt_consistent(local: &Receipt, published: &Receipt) -> bool {
         && local.gas_used == published.gas_used
         && local.write_set_hash == published.write_set_hash
         && local.logs == published.logs
+        // The typed skip cause (#241) is part of the deterministic
+        // transition: same input, same reason on every replica.
+        && local.skip_reason == published.skip_reason
 }
 
 // ---------------------------------------------------------------------------

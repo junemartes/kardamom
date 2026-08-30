@@ -150,6 +150,7 @@ pub fn execute_deposit_tx<S: StateDatabase>(
         block_number: env.block_number,
         transaction_index: tx_index_in_block,
         cumulative_gas_used,
+        skip_reason: None,
     };
     Ok((receipt, ws))
 }
