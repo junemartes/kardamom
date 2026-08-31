@@ -41,8 +41,6 @@ use tracing::{info, warn};
 
 use crate::config::{AeronConfig, ChannelsConfig, RecorderId};
 use crate::error::LogError;
-use crate::publisher::QuorumPublisher;
-use kardamom_types::QuorumWatermark;
 
 type Archive = rusteron_archive::AeronArchive;
 type AeronClient = rusteron_client::Aeron;
@@ -268,9 +266,11 @@ pub struct Recorder {
     /// this field is deliberately not `Arc<Archive>`. The recording-position
     /// poll and the durable-watermark publish in
     /// [`run_durable_watermark_loop`] both run on this thread.
-    archive: Archive,
+    // RAII: dropping this closes the archive session and stops the
+    // recording — held, never read (its last reader left with the
+    // durable-watermark decoder).
+    _archive: Archive,
     recording_id: i64,
-    term_buffer_length: i32,
 }
 
 impl Recorder {
@@ -287,6 +287,9 @@ impl Recorder {
     /// compatibility (there is exactly one archive, conventionally recorder
     /// 0). The durable-watermark path no longer needs either.
     pub fn start_b_mdc(
+        // RAII: dropping this closes the archive session and stops the
+        // recording — held, never read (its last reader left with the
+        // durable-watermark decoder).
         archive: Archive,
         control_uri: &str,
         ch: &ChannelsConfig,
@@ -314,6 +317,9 @@ impl Recorder {
     /// automatically. Returns `Ok(None)` if `should_stop` fires before the
     /// recording appears.
     pub fn start_stream(
+        // RAII: dropping this closes the archive session and stops the
+        // recording — held, never read (its last reader left with the
+        // durable-watermark decoder).
         archive: Archive,
         channel: &str,
         stream_id: i32,
@@ -327,6 +333,9 @@ impl Recorder {
     /// appeared (clean shutdown during startup). Returns
     /// `Ok(Some(recorder))` once recording.
     fn start_inner(
+        // RAII: dropping this closes the archive session and stops the
+        // recording — held, never read (its last reader left with the
+        // durable-watermark decoder).
         archive: Archive,
         channel: &str,
         stream_id: i32,
@@ -367,15 +376,16 @@ impl Recorder {
             None => return Ok(None), // shutdown before a recording appeared
         };
 
-        // Fetch the descriptor once at startup, so the term buffer length is
-        // ready to decode positions without a control-channel round trip on
-        // every watermark tick.
-        let term_buffer_length = fetch_descriptor(&archive, recording_id)?;
+        // Pull the descriptor once at startup so the term buffer length is
+        // available to decode positions without a control-channel round-trip
+        // on every watermark tick.
+        // Descriptor fetch retained as a recording-liveness validation
+        // (its term length fed the deleted durable-watermark decoder).
+        let _ = fetch_descriptor(&archive, recording_id)?;
 
         Ok(Some(Self {
-            archive,
+            _archive: archive,
             recording_id,
-            term_buffer_length,
         }))
     }
 
@@ -452,65 +462,6 @@ impl Recorder {
     pub fn recording_id(&self) -> i64 {
         self.recording_id
     }
-
-    /// Current, committed-to-archive-buffer position for this recording.
-    /// Maps to `aeron_archive_get_recording_position` in the C client.
-    ///
-    /// With `fileSyncLevel=1` set on the archive daemon, the returned
-    /// position is byte-durable on local storage. Every byte up to it has
-    /// gone through `fdatasync` before the position was published.
-    pub fn current_position(&self) -> Result<i64, LogError> {
-        self.archive
-            .get_recording_position(self.recording_id)
-            .map_err(|e| LogError::Aeron(format!("get_recording_position: {e}")))
-    }
-
-    /// Decompose an absolute Aeron stream position into the
-    /// `(term_id, term_offset)` pair `BPosition` carries, using this
-    /// recording's term buffer length.
-    fn to_bposition(&self, pos: i64) -> kardamom_types::BPosition {
-        let term_len = self.term_buffer_length as i64;
-        kardamom_types::BPosition {
-            term_id: (pos / term_len) as i32,
-            term_offset: (pos % term_len) as i32,
-        }
-    }
-}
-
-/// Poll the sealer's tx_ordering archive recording position and republish
-/// it as the single durable watermark whenever it advances.
-/// `QuorumWatermark` now carries the one archive-at-the-sealer durable
-/// position, not a Q-of-N aggregate. Ingress's `on-quorum` ack gate
-/// consumes this, after the custom recorders and quorum aggregator were
-/// removed.
-///
-/// Runs on the calling thread, because `AeronArchive` and the publisher
-/// are thread-confined.
-pub fn run_durable_watermark_loop(
-    recorder: &Recorder,
-    publisher: &QuorumPublisher,
-    poll_interval: Duration,
-    mut should_stop: impl FnMut() -> bool,
-) -> Result<(), LogError> {
-    let mut last_pos: i64 = -1;
-    while !should_stop() {
-        match recorder.current_position() {
-            Ok(pos) if pos > last_pos => {
-                let wm = QuorumWatermark {
-                    position: recorder.to_bposition(pos),
-                };
-                if let Err(e) = publisher.publish(&wm) {
-                    warn!(error = %e, "durable watermark publish failed");
-                } else {
-                    last_pos = pos;
-                }
-            }
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "get_recording_position failed"),
-        }
-        std::thread::sleep(poll_interval);
-    }
-    Ok(())
 }
 
 /// One-shot descriptor fetch through `list_recording`, returning the
