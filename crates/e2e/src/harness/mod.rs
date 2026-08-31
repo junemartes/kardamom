@@ -336,7 +336,10 @@ impl LocalStack {
         for (name, addr) in stack.metric_addrs() {
             metrics::poll_until(
                 &format!("{name} /metrics"),
-                Duration::from_secs(30),
+                // An upper bound, not a pace. 30s was not enough for
+                // process startup on a contended runner with two stacks
+                // launching at once (#250).
+                Duration::from_secs(90),
                 Duration::from_millis(200),
                 || async move { Ok(metrics::scrape(addr).await.ok().map(|_| ())) },
             )
@@ -345,11 +348,34 @@ impl LocalStack {
         let probe = l2::L2Client::new(&stack.ingress.rpc_url, Duration::from_secs(2))?;
         metrics::poll_until(
             "ingress eth_chainId",
-            Duration::from_secs(30),
+            Duration::from_secs(90),
             Duration::from_millis(200),
             || {
                 let probe = probe.clone();
                 async move { Ok(probe.chain_id().await.result.ok().map(|_| ())) }
+            },
+        )
+        .await?;
+        // The chain is LIVE only once the executor commits its first block.
+        // Without this barrier every scenario pays the sealer/executor cold
+        // start out of its own (much tighter) budget — under runner
+        // contention that cost alone blew four different scenarios'
+        // timeouts (issue #250). The bound is generous on purpose: a warm
+        // host passes in ~1s, and only a genuinely wedged stack waits it
+        // out. Idle chains still seal boundary ticks, so no traffic is
+        // needed.
+        let exec_addr = stack.executor.metrics_addr;
+        metrics::poll_until(
+            "the executor's first committed block",
+            Duration::from_secs(90),
+            Duration::from_millis(250),
+            || async move {
+                let v = metrics::scrape(exec_addr)
+                    .await
+                    .ok()
+                    .and_then(|s| s.value(crate::scenarios::EXEC_BLOCK_NUMBER))
+                    .unwrap_or(0.0);
+                Ok((v >= 1.0).then_some(()))
             },
         )
         .await?;

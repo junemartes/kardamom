@@ -1,6 +1,6 @@
-//! The batch verifier's contract. Every submitted transaction gets its own
-//! correct answer, no matter how the ring is chunked. The recovery work
-//! does not run on the async runtime's threads.
+//! The batch verifier's contract: every submitted transaction gets its own
+//! correct answer regardless of how the ring is chunked, and the recovery
+//! work does not run on the async runtime's threads.
 
 use std::time::Duration;
 
@@ -39,9 +39,9 @@ mod fixtures {
     }
 }
 
-/// Every caller gets the sender that signed its own transaction. Chunking
-/// must never cross responses. This test runs at several batch sizes, to
-/// cover both the single-chunk path and the fanned-out path.
+/// Every caller gets the sender that signed ITS transaction — chunking must
+/// never cross responses. Run at several batch sizes so both the
+/// single-chunk path and the fanned-out path are covered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_caller_gets_its_own_sender() {
     for n in [1usize, 3, 8, 64, 100, 200] {
@@ -83,65 +83,99 @@ async fn batched_callers_never_cross_answers() {
     let b = tokio::spawn(async move { vb.recover(bad_env, bad_raw).await });
     let (gs, _) = g.await.unwrap().expect("valid tx must recover");
     assert_eq!(gs, good_addr);
-    // The other transaction in the same batch must resolve to its own
-    // signer. Chunking must never cross responses.
+    // The other transaction in the same batch must resolve to ITS OWN
+    // signer — chunking must never cross responses.
     let (bs, _) = b.await.unwrap().expect("second tx must recover");
     assert_ne!(bs, good_addr, "batch crossed two callers' answers");
     assert_eq!(bs, bad_addr);
 }
 
-/// The reactor must stay responsive while recovery runs.
+/// CPU nanoseconds consumed by THIS thread (`CLOCK_THREAD_CPUTIME_ID`).
+/// Time spent descheduled does not accrue, so host load cannot inflate it.
+fn thread_cpu_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: writes one timespec the C way; no aliasing beyond the call.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// The recovery work must not run on the async runtime's thread.
 ///
-/// 256 recoveries take about 10.7ms of CPU time. On a single-threaded
-/// runtime, that is 10.7ms of stall if the work runs on the runtime's own
-/// thread. That is exactly what the old sequential in-task loop did. With
-/// recovery on the blocking pool, a 1ms timer still fires on time. The
-/// threshold sits between these two cases, so this test fails on the old
-/// code.
+/// The test drives 256 recoveries through the verifier on a
+/// `current_thread` runtime. The test thread IS the runtime thread. The
+/// assert bounds the runtime thread's own CPU TIME far below the inline
+/// cost of the batch. If any path (the ring-full fast path or the flush
+/// task) runs recovery inline, that CPU lands on this thread and the
+/// count jumps past the bound every time.
 ///
-/// This test uses parallelism 1 on purpose. The assert checks where the
-/// work runs, not how fast. With 4 blocking threads on a 2-core CI host,
-/// the OS can deschedule the runtime thread, and the timer then fires
-/// 10-50ms late. That CPU-contention stall would look like the bug this
-/// test guards against.
+/// Two calibrations, both learned from CI failures (issue #252):
+/// - Use CPU time, not wall clock. The old timer assert measured the OS
+///   scheduler. On a loaded 2-core host, the OS deschedules the runtime
+///   thread for 1-16 ms with the work fully off-thread. Time spent
+///   descheduled does not add to thread CPU time.
+/// - Use HALF of this build's own measured inline cost as the bound,
+///   not a constant. Recovery costs ~10.7 ms in release and ~130 ms in
+///   debug. The healthy bookkeeping costs ~2 ms and ~5-8 ms. No
+///   constant fits both profiles; the ratio fits both with a margin
+///   above 2.5x on each side.
 #[tokio::test(flavor = "current_thread")]
 async fn recovery_does_not_block_the_reactor() {
+    let cases: Vec<_> = (0..256u64).map(fixtures::signed).collect();
+
+    // Calibrate: what would running the batch inline cost on THIS build
+    // and silicon? Measured by thread CPU time over a 16-tx sample,
+    // before the workload's own measurement window opens.
+    let cal0 = thread_cpu_ns();
+    for (env, raw, _) in cases.iter().take(16) {
+        let _ = kardamom_ingress::sig_verify::recover_single(env, raw);
+    }
+    let inline_cost_ns = (thread_cpu_ns() - cal0) * (256 / 16);
+    let bound_ns = inline_cost_ns / 2;
+
     let v = std::sync::Arc::new(BatchVerifier::with_parallelism(
         64,
         Duration::from_micros(50),
         4,
     ));
-    let cases: Vec<_> = (0..256u64).map(fixtures::signed).collect();
+    let cpu0 = thread_cpu_ns();
     let mut handles = Vec::new();
     for (env, raw, _) in cases {
         let v = v.clone();
         handles.push(tokio::spawn(async move { v.recover(env, raw).await }));
     }
-    tokio::task::yield_now().await;
-    let t = std::time::Instant::now();
-    tokio::time::sleep(Duration::from_millis(1)).await;
-    let slept = t.elapsed();
     for h in handles {
         h.await.unwrap().unwrap();
     }
+    let runtime_cpu_ns = thread_cpu_ns() - cpu0;
+    eprintln!(
+        "runtime-thread CPU during 256 recoveries: {:.2}ms (inline would be ~{:.2}ms)",
+        runtime_cpu_ns as f64 / 1e6,
+        inline_cost_ns as f64 / 1e6
+    );
     assert!(
-        slept < Duration::from_millis(6),
-        "reactor stalled {slept:?} during batch recovery — CPU work is running on a runtime thread"
+        runtime_cpu_ns < bound_ns,
+        "runtime thread burned {:.2}ms of CPU during batch recovery (inline cost \
+         is ~{:.2}ms; bookkeeping should be far below half of it) — \
+         CPU work is running on a runtime thread",
+        runtime_cpu_ns as f64 / 1e6,
+        inline_cost_ns as f64 / 1e6
     );
 }
 
-/// What the fan-out actually buys. ECDSA recovery costs about 42µs of pure
-/// CPU per transaction. It cannot be batched mathematically, because every
-/// signature recovers a distinct public key. There is no shared-scalar
-/// trick here, unlike with Ed25519 batch verification. So the only
-/// available gain is running the recoveries at the same time. This test
-/// measures a full ring through the verifier, at parallelism 1 against the
-/// machine's width.
+/// What the fan-out actually buys. ECDSA recovery is ~42µs of pure CPU per
+/// transaction and cannot be batched mathematically (every signature
+/// recovers a DISTINCT public key — there is no shared-scalar trick as with
+/// Ed25519 batch verification), so the only win available is running the
+/// recoveries at the same time. This measures a full ring through the
+/// verifier at parallelism 1 vs the machine's width.
 ///
-/// This test reports numbers instead of asserting a speedup. On a loaded
-/// or single-core CI runner, there is nothing to gain, and a timing
-/// threshold would be flaky. The correctness check, that every caller
-/// gets its own sender, holds either way.
+/// Reports numbers rather than asserting a speedup: on a loaded or
+/// single-core CI runner there is nothing to win, and a timing threshold
+/// would be a flake. The correctness assertion — every caller gets its own
+/// sender — holds either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fanning_out_a_full_ring_scales_with_cores() {
     const RING: usize = 256;

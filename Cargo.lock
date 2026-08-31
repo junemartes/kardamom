@@ -3972,6 +3972,7 @@ dependencies = [
  "kardamom-log",
  "kardamom-obs",
  "kardamom-types",
+ "libc",
  "metrics",
  "nonzero_ext",
  "rand 0.9.4",

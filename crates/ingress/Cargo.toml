@@ -48,6 +48,7 @@ name = "kardamom-ingress"
 path = "src/bin/kardamom-ingress/main.rs"
 
 [dev-dependencies]
+libc.workspace = true
 alloy-signer-local.workspace = true
 criterion = { version = "0.7", features = ["async_tokio"] }
 futures.workspace = true
