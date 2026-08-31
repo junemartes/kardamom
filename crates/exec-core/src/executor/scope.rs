@@ -4,6 +4,7 @@
 
 use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256};
+use kardamom_types::xchain::{self, XChainMessage};
 use kardamom_types::{BPosition, Receipt, SkipReason, StateDatabase, TxEnvelope};
 use revm::context::result::ExecutionResult;
 use revm::database::CacheDB;
@@ -18,7 +19,7 @@ use crate::error::ExecutorError;
 use crate::exec_types::{ReceiptStatus, TxIndex};
 
 use super::db::{SnapshotDb, seed_cache_layer};
-use super::tx_env::{DecodedTx, tx_env_from_deposit};
+use super::tx_env::{DecodedTx, tx_env_from_deposit, tx_env_from_xchain};
 
 /// Per-tx read-touch capture for the footprint shadow scheduler. The
 /// block-level EIP-7928 BAL cannot
@@ -123,9 +124,10 @@ impl<S: StateDatabase> Executor<S> {
     /// the scope, the block cache is reused and only the nonce check is
     /// toggled for the inner call (deposits carry no nonce).
     ///
-    /// Artifact contract: receipt, `WriteSet` (read slots included — see
+    /// Artifact contract: receipt, `WriteSet` (called-contract code
+    /// included, unchanged entries filtered out — see
     /// [`WriteSet::from_evm_state_deposit`]), `write_set_hash`, and the
-    /// BAL claims are BYTE-IDENTICAL to the historic path; the
+    /// BAL claims match the historic path's true changes. The
     /// `old_and_new_deposit_paths_agree` test in `deposit.rs` is the gate.
     ///
     /// Error paths fail-stop the pipeline (deposits have no skip
@@ -231,6 +233,107 @@ impl<S: StateDatabase> Executor<S> {
             to: deposit.to,
             contract_address: None,
             // Deposits pay no fee.
+            effective_gas_price: 0,
+            block_number: self.env.block_number,
+            transaction_index: tx_index_in_block,
+            cumulative_gas_used,
+            skip_reason: None,
+        };
+        Ok((receipt, ws))
+    }
+
+    /// Execute one cross-chain delivery (a 0x7D message) on this block
+    /// scope. Mirrors [`Self::execute_deposit`]: the block cache is
+    /// reused, the call is fee-free with the nonce check off, and the
+    /// receipt's canonical id is the message's `source_hash`, not a 2718
+    /// keccak.
+    ///
+    /// Artifact contract: receipt, `WriteSet` (called-contract code
+    /// included, unchanged entries filtered out — see
+    /// [`WriteSet::from_evm_state_deposit`]), `write_set_hash`, and the
+    /// BAL claims match the historic free function (`execute_xchain_tx`).
+    /// A gate test like `old_and_new_deposit_paths_agree` applies here
+    /// too.
+    ///
+    /// v1 carries no value. A nonzero `message.value` is a chain fault,
+    /// not a droppable message, so this fails the engine before it
+    /// touches the cache.
+    #[allow(clippy::too_many_arguments)] // matches execute_deposit's shape;
+    // see the equivalent allow there for the reason.
+    pub fn execute_xchain(
+        &mut self,
+        tx_idx: TxIndex,
+        tx_position: BPosition,
+        origin_chain_id: u64,
+        message: &XChainMessage,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+        bal: Option<(&mut revm::state::bal::Bal, u64)>,
+    ) -> Result<(Receipt, WriteSet), ExecutorError> {
+        if message.value != 0 {
+            return Err(ExecutorError::Execution {
+                idx: tx_idx,
+                detail: format!(
+                    "xchain message (origin {origin_chain_id}, seq {}) carries value {} but v1 \
+                     delivery is value-free — chain fault, not droppable",
+                    message.seq, message.value
+                ),
+            });
+        }
+
+        // Inner call with the nonce check off. No fallible call sits
+        // between the toggle and its restore — deposits and cross-chain
+        // deliveries share this rule; see the note on `execute_deposit`.
+        let tx_env = tx_env_from_xchain(origin_chain_id, message);
+        (*self.evm).modify_cfg(|c| c.disable_nonce_check = true);
+        let result = self.evm.transact(tx_env);
+        (*self.evm).modify_cfg(|c| c.disable_nonce_check = false);
+        let outcome = result.map_err(|e| ExecutorError::Execution {
+            idx: tx_idx,
+            detail: format!("{e:?}"),
+        })?;
+
+        let gas_used = outcome.result.gas().tx_gas_used();
+        // A revert inside deliver (or a bubbled-up inner-call revert)
+        // marks the receipt failed, but it is not an engine error. This
+        // is the deposit posture.
+        let (status_success, logs) = match &outcome.result {
+            ExecutionResult::Success { logs, .. } => (true, logs.clone()),
+            ExecutionResult::Revert { .. } => (false, Vec::new()),
+            ExecutionResult::Halt { .. } => (false, Vec::new()),
+        };
+
+        let ws = WriteSet::from_evm_state_deposit(&outcome.state);
+        revm::DatabaseCommit::commit(
+            revm::context_interface::ContextTr::db_mut(&mut *self.evm),
+            outcome.state,
+        );
+        if let Some((bal, bal_index)) = bal {
+            ws.record_into_bal(bal, bal_index);
+        }
+
+        let write_set_hash = ws.hash();
+        let wire_logs: Vec<kardamom_types::WireLog> =
+            logs.iter().map(kardamom_types::WireLog::from).collect();
+        let cumulative_gas_used = cumulative_gas_used_before + gas_used;
+        let receipt = Receipt {
+            tx_idx: tx_position,
+            // The canonical id stamped at derivation (source_hash), not a
+            // 2718 keccak. Same posture as deposits.
+            tx_hash: message.source_hash,
+            tx_type: kardamom_types::TX_TYPE_XCHAIN,
+            status: status_success,
+            gas_used,
+            logs: wire_logs,
+            write_set_hash,
+            // Origin-derived: consumes no local nonce. The filler
+            // `nonce: 0` is never a real nonce; consumers branch on
+            // `tx_type`, not on it.
+            nonce: 0,
+            from: xchain::xchain_tx_sender(origin_chain_id),
+            to: Some(xchain::INBOX),
+            contract_address: None,
+            // Destination-side delivery pays no fee (quota-gated instead).
             effective_gas_price: 0,
             block_number: self.env.block_number,
             transaction_index: tx_index_in_block,

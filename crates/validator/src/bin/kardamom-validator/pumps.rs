@@ -34,6 +34,11 @@ pub fn spawn_bal_pump(
     channels: &ChannelsConfig,
     bals: Arc<BalBuffer>,
     claims: Arc<ClaimBuffer>,
+    // The interop outbox extractor's own claim buffer. The engine's
+    // `claims` buffer is consumed by the whole-block strategy (and never
+    // drained in streaming mode), so this pump feeds both, sharing the
+    // one decoded index instead of cloning it per consumer.
+    extract_claims: Option<Arc<ClaimBuffer>>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     const BAL_SILENCE_REOPEN: Duration = Duration::from_secs(60);
@@ -100,11 +105,12 @@ pub fn spawn_bal_pump(
                     // batches aligned to it. The validator's ladder view
                     // always follows the wire.
                     Ok(bal) if !bal.is_empty() => {
-                        claims.insert(
-                            delta.block_number,
-                            *granularity,
-                            kardamom_validator::parallel::ClaimIndex::from_alloy(&bal),
-                        );
+                        let idx =
+                            Arc::new(kardamom_validator::parallel::ClaimIndex::from_alloy(&bal));
+                        claims.insert_arc(delta.block_number, *granularity, idx.clone());
+                        if let Some(ec) = extract_claims.as_ref() {
+                            ec.insert_arc(delta.block_number, *granularity, idx);
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => tracing::warn!(
@@ -168,6 +174,9 @@ pub fn spawn_receipts_pump(
 pub fn spawn_commit_poller(
     snap_rx: SnapshotReceiver,
     attester_handle: Option<AttesterHandle>,
+    // Interop attestation stream (unsigned): the same observed roots,
+    // retained and served over `kardamom_subscribeAttestations`.
+    attestation_store: Option<Arc<kardamom_validator::interop::AttestationStore>>,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -196,6 +205,9 @@ pub fn spawn_commit_poller(
                     tracing::debug!(block, state_root = %root, "validator committed block");
                     if let Some(h) = attester_handle.as_ref() {
                         h.submit_root(block, root);
+                    }
+                    if let Some(s) = attestation_store.as_ref() {
+                        s.push(block, root);
                     }
                 }
                 Ok(None) => {}

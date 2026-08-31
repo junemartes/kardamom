@@ -45,6 +45,24 @@ pub(crate) fn records_json(records: &[BufferedRecord]) -> Vec<serde_json::Value>
                 "idx": tx_idx.0,
                 "pos": position.as_index(),
             }),
+            BufferedRecord::XChain {
+                tx_idx,
+                origin_chain_id,
+                message,
+                position,
+            } => serde_json::json!({
+                "kind": "xchain",
+                "origin_chain_id": origin_chain_id,
+                "source_hash": format!("{:?}", message.source_hash),
+                "seq": message.seq,
+                "origin_sender": format!("{:?}", message.origin_sender),
+                "target": format!("{:?}", message.target),
+                "value": message.value.to_string(),
+                "gas_limit": message.gas_limit,
+                "input": alloy_primitives::hex::encode(&message.input),
+                "idx": tx_idx.0,
+                "pos": position.as_index(),
+            }),
         })
         .collect()
 }

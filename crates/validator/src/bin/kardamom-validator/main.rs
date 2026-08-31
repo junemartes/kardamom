@@ -173,6 +173,28 @@ async fn main() -> Result<()> {
     let claims = kardamom_validator::ClaimBuffer::new();
     let receipts = ReceiptBuffer::new();
 
+    // Interop serving surfaces (the outbox and attestation feeds), off by default. The
+    // extractor gets its own claim buffer: the engine's is consumed by the
+    // whole-block strategy (and never drained in streaming mode), so the
+    // BAL pump feeds both, sharing the decoded index.
+    struct InteropServe {
+        addr: std::net::SocketAddr,
+        store: std::sync::Arc<kardamom_validator::interop::FeedStore>,
+        attestations: std::sync::Arc<kardamom_validator::interop::AttestationStore>,
+        claims: std::sync::Arc<kardamom_validator::ClaimBuffer>,
+    }
+    let interop_serve = args.serve_feed.map(|addr| InteropServe {
+        addr,
+        store: std::sync::Arc::new(kardamom_validator::interop::FeedStore::new(
+            chain_id,
+            args.feed_retention_blocks,
+        )),
+        attestations: std::sync::Arc::new(kardamom_validator::interop::AttestationStore::new(
+            args.feed_retention_blocks,
+        )),
+        claims: kardamom_validator::ClaimBuffer::new(),
+    });
+
     // One token stops every pump. It is cancelled BEFORE `rt` drops (see
     // `pumps::spawn_bal_pump` for the runtime-clone deadlock it prevents).
     let pump_shutdown = tokio_util::sync::CancellationToken::new();
@@ -181,6 +203,7 @@ async fn main() -> Result<()> {
         &channels,
         bals.clone(),
         claims.clone(),
+        interop_serve.as_ref().map(|s| s.claims.clone()),
         pump_shutdown.clone(),
     )?;
     pumps::spawn_receipts_pump(
@@ -272,17 +295,63 @@ async fn main() -> Result<()> {
     let tx_receipts_pub: Box<dyn TxReceiptsPublication> = {
         let sink = ValidatorReceiptSink::new(receipts.clone(), divergence.clone())
             .with_flight(flight.clone());
-        match &attester_handle {
+        let mut chain: Box<dyn TxReceiptsPublication> = match &attester_handle {
             Some(h) => Box::new(attester::AttestingReceiptSink::new(sink, h.clone())),
             None => Box::new(sink),
+        };
+        // Outbox extraction sits outermost: it buffers before forwarding but
+        // flushes to the feed store only after the inner chain (the receipt
+        // cross-check) accepted the boundary — a diverging block is never
+        // served.
+        if let Some(s) = interop_serve.as_ref() {
+            chain = Box::new(kardamom_validator::interop::ExtractingReceiptSink::new(
+                chain,
+                chain_id,
+                s.claims.clone(),
+                s.store.clone(),
+                divergence.clone(),
+            ));
         }
+        chain
     };
 
     pumps::spawn_commit_poller(
         writer.snapshot_rx.clone(),
         attester_handle.clone(),
+        interop_serve.as_ref().map(|s| s.attestations.clone()),
         pump_shutdown.clone(),
     );
+
+    // Start the feed server (the interop serving surfaces). Dropping the
+    // handle stops the server, so it is held for the process lifetime; a
+    // divergence halt exits the process and the sockets die with it — a
+    // validator whose verification halts must stop serving.
+    let _feed_server = match interop_serve.as_ref() {
+        Some(s) => {
+            let (local, handle) = kardamom_validator::interop::start_feed_server(
+                s.addr,
+                kardamom_validator::interop::FeedServerState {
+                    chain_id,
+                    validator_id: args.host_id.clone(),
+                    store: s.store.clone(),
+                    attestations: s.attestations.clone(),
+                },
+            )
+            .await
+            .context("start interop feed server")?;
+            if let Some(path) = args.serve_feed_addr_file.as_ref() {
+                std::fs::write(path, format!("{local}\n")).context("write feed addr file")?;
+            }
+            tracing::info!(
+                addr = %local,
+                retention_blocks = args.feed_retention_blocks,
+                "interop feed server enabled (kardamom_subscribeOutbox, \
+                 kardamom_subscribeAttestations)"
+            );
+            Some(handle)
+        }
+        None => None,
+    };
 
     let mut cfg = ExecutorConfig {
         chain_id,
@@ -375,6 +444,15 @@ async fn main() -> Result<()> {
             }
         };
 
+    // Remote-epoch verification (interop): inline pair-sequence checks on
+    // every RemoteEpochRecord, always on — they need no transport, exactly
+    // like the L1 origin sequence rules. Content-vs-origin verification (§10
+    // postures) is a later phase; see `interop::verify`'s module docs.
+    let remote_epoch_observer: Option<Box<dyn kardamom_engine::RemoteEpochObserver>> =
+        Some(Box::new(
+            kardamom_validator::interop::RemoteEpochVerifier::new(divergence.clone()),
+        ));
+
     let mut join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
         Executor::run::<ValidatorWiring>(
             cfg,
@@ -401,6 +479,7 @@ async fn main() -> Result<()> {
                 // Whole-block exec strategy (the parallel-validation path).
                 block_exec,
                 epoch_observer,
+                remote_epoch_observer,
             },
         )
     });

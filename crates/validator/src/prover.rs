@@ -56,8 +56,16 @@ pub fn sequential_block_exec<D: StateDatabase + Sync + 'static>(
     )
 }
 
-/// Convert exec-core records to the prover wire form; the guest rebuilds them.
-fn wire_records(records: &[BufferedRecord]) -> Vec<ProverRecord> {
+/// Convert exec-core records to the prover wire form; the guest rebuilds
+/// them.
+///
+/// Cross-chain (0x7D) deliveries have no `ProverRecord` shape yet — the
+/// guest cannot rebuild an `XChainMessage`'s Inbox call, and its identity
+/// is a trusted input in the same way a deposit's is (see the module docs
+/// on `kardamom_exec_core::stateless`). A block that carries one is not
+/// provable yet, so this fails closed instead of silently dropping the
+/// record from the digest.
+fn wire_records(records: &[BufferedRecord]) -> Result<Vec<ProverRecord>, ExecutorError> {
     records
         .iter()
         .map(|r| match r {
@@ -65,20 +73,23 @@ fn wire_records(records: &[BufferedRecord]) -> Vec<ProverRecord> {
                 tx_idx,
                 envelope,
                 position,
-            } => ProverRecord::Tx {
+            } => Ok(ProverRecord::Tx {
                 tx_idx: tx_idx.0,
                 envelope: envelope.clone(),
                 position: *position,
-            },
+            }),
             BufferedRecord::Deposit {
                 tx_idx,
                 deposit,
                 position,
-            } => ProverRecord::Deposit {
+            } => Ok(ProverRecord::Deposit {
                 tx_idx: tx_idx.0,
                 deposit: deposit.clone(),
                 position: *position,
-            },
+            }),
+            BufferedRecord::XChain { .. } => Err(ExecutorError::State(
+                "prover spool: cross-chain (0x7D) deliveries have no prover-wire shape yet".into(),
+            )),
         })
         .collect()
 }
@@ -131,7 +142,7 @@ pub fn spool_block(
         records_digest: digest.finish(),
         bal_commitment: keccak256(&bal_rlp),
     };
-    let input = assemble_prover_input(chain_id, env, witness, proofs, records, bal_rlp, 1);
+    let input = assemble_prover_input(chain_id, env, witness, proofs, records, bal_rlp, 1)?;
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&input)
         .map_err(|e| ExecutorError::State(format!("serialize prover input: {e}")))?;
 
@@ -153,8 +164,8 @@ pub fn assemble_prover_input(
     records: &[BufferedRecord],
     bal_rlp: Vec<u8>,
     granularity: u16,
-) -> ProverInput {
-    ProverInput {
+) -> Result<ProverInput, ExecutorError> {
+    Ok(ProverInput {
         chain_id,
         boundary: BlockBoundaryStart {
             block_number: env.block_number,
@@ -164,10 +175,10 @@ pub fn assemble_prover_input(
         },
         witness,
         proofs,
-        records: wire_records(records),
+        records: wire_records(records)?,
         bal_rlp: bal_rlp.into(),
         granularity,
-    }
+    })
 }
 
 /// Spawn the spool task. It waits on the writer's snapshot watch. For each
