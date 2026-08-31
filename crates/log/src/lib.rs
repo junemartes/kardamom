@@ -6,8 +6,8 @@
 //! to the sealer records the sealer's tx_ordering MDC publication. Its
 //! `get_recording_position()` returns a position that is byte-durable on
 //! local storage. The sealer publishes that position as the durable
-//! watermark that ingress gates its must-deliver ack on (see
-//! [`recorder::run_durable_watermark_loop`]). The previous N-way Q-of-N
+//! watermark that ingress gates its must-deliver ack on, through the
+//! ingress cluster-egress observer. The previous N-way Q-of-N
 //! quorum aggregator and custom recorders no longer exist.
 //!
 //! This crate owns the transport implementation only. Wire data types live
