@@ -187,6 +187,21 @@ async fn s13_xchain_da_parity() {
         .await
         .expect("S13 canonical blocks");
 
+    // The fence's receipt streams at execute time, but its block commits
+    // only at the next sealer tick. Quiescing suspends the sealer, so a
+    // shutdown that wins that 250 ms race leaves the last canonical block
+    // uncommitted, and the DA set can then never match the executor's
+    // state. Wait for the last collected block's header before quiesce.
+    let last_block = canonical
+        .blocks
+        .iter()
+        .map(|b| b.block_number)
+        .max()
+        .expect("canonical set is never empty");
+    e2e::scenarios::derivation::await_block_origins_through(&exec_dir, last_block)
+        .await
+        .expect("S13 last canonical block committed");
+
     // 3. Quiesce: stop the interop watcher, then the stack — the executor
     //    closes its DB cleanly with every executed block durable.
     watcher.proc.kill();
