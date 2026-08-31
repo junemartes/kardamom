@@ -479,7 +479,6 @@ fn tx_ref_arriving_before_envelope_still_joins() {
         receipt_queue_depth: 8,
         reader: ReaderConfig {
             join_timeout: Duration::from_millis(500),
-            join_poll_interval: Duration::from_micros(100),
             ..ReaderConfig::default()
         },
         ..ExecutorConfig::default()
