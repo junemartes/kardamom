@@ -36,6 +36,7 @@ fn arb_block(number: u64, n_txs: usize, raw_len: usize) -> ClosedBlock {
         block_number: number,
         l2_timestamp: 1_700_000_000 + number,
         end_tx_idx: pos(0),
+        remote_epochs: Vec::new(),
         txs,
     }
 }
@@ -44,6 +45,7 @@ fn to_block_frame(b: &ClosedBlock) -> BlockFrame {
     BlockFrame {
         block_number: b.block_number,
         l2_timestamp: b.l2_timestamp,
+        remote_epochs: b.remote_epochs.clone(),
         txs: b
             .txs
             .iter()

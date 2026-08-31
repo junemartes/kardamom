@@ -85,6 +85,27 @@ public final class SealerWire {
      */
     public static final byte KIND_ORIGIN_RECORD = 4;
 
+    /**
+     * Remote-origin record — a batch of cross-chain messages a PEER chain
+     * produced:
+     * {@code [kind:5][canonical_id:32][origin_chain_id:u64 LE][anchor_number:u64 LE][slot_count:u32 LE][payload…]}.
+     *
+     * <p>A distinct kind byte, not a record type inside a
+     * {@link #KIND_ORIGIN_RECORD} payload: the service branches to its own
+     * handler on the tag alone and stays schema-agnostic — peeking into the
+     * payload to tell an epoch from a remote batch is exactly the parsing this
+     * layer must never do. It also lets the header differ, which it must: TWO
+     * u64 fields (WHICH peer, and WHERE in that peer's chain) where an epoch
+     * needs one, because there is exactly one L1 but any number of peers.</p>
+     *
+     * <p>Like {@link #KIND_ORIGIN_RECORD} it carries no guard header —
+     * cross-chain messages are not nonce-gated by an L2 sender — and its
+     * {@code slot_count} is {@code 1 + message count} (marker plus one slot per
+     * message), taken on trust and re-derived by consumers that do parse the
+     * payload. See {@code docs/specs/interop-outbox-messaging-spec.md} §7.</p>
+     */
+    public static final byte KIND_REMOTE_ORIGIN_RECORD = 5;
+
     /** Offset of the 32-byte canonical id in a {@link #KIND_ORIGIN_RECORD} frame. */
     static final int ORIGIN_ID_OFFSET = KIND_OFFSET + Byte.BYTES;
     /** Offset of the u64 L1 origin within a {@link #KIND_ORIGIN_RECORD} frame. */
@@ -94,6 +115,22 @@ public final class SealerWire {
     static final int SLOT_COUNT_OFFSET = ORIGIN_OFFSET + Long.BYTES;
     /** Minimum valid origin-record length: kind + canonical id + origin + slots. */
     static final int MIN_ORIGIN_RECORD_LEN = SLOT_COUNT_OFFSET + Integer.BYTES;
+
+    /** Offset of the 32-byte canonical id in a {@link #KIND_REMOTE_ORIGIN_RECORD} frame. */
+    static final int REMOTE_ID_OFFSET = KIND_OFFSET + Byte.BYTES;
+    /** Offset of the u64 LE origin chain id within a {@link #KIND_REMOTE_ORIGIN_RECORD} frame. */
+    static final int REMOTE_CHAIN_ID_OFFSET =
+            REMOTE_ID_OFFSET + CanonicalSealerState.CANONICAL_ID_LEN;
+    /** Offset of the u64 LE anchor number within a {@link #KIND_REMOTE_ORIGIN_RECORD} frame. */
+    static final int REMOTE_ANCHOR_OFFSET = REMOTE_CHAIN_ID_OFFSET + Long.BYTES;
+    /** Offset of the u32 LE slot count within a {@link #KIND_REMOTE_ORIGIN_RECORD} frame. */
+    static final int REMOTE_SLOT_COUNT_OFFSET = REMOTE_ANCHOR_OFFSET + Long.BYTES;
+    /**
+     * Minimum valid remote-origin length: kind + canonical id + chain id +
+     * anchor + slots. Eight bytes longer than {@link #MIN_ORIGIN_RECORD_LEN} —
+     * the second u64 is the whole header difference.
+     */
+    static final int MIN_REMOTE_ORIGIN_RECORD_LEN = REMOTE_SLOT_COUNT_OFFSET + Integer.BYTES;
 
     /** Minimum valid replay-request length: kind + from_index + from_block. */
     static final int MIN_REPLAY_REQUEST_LEN = Byte.BYTES + Long.BYTES + Long.BYTES;

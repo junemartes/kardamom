@@ -145,6 +145,7 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
             // This value is synthetic. See the module docs.
             l2_timestamp: 1_700_000_000 + block_number,
             end_tx_idx: BPosition::from_index(end),
+            remote_epochs: vec![],
             txs: recorded,
         });
     }

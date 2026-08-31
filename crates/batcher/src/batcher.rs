@@ -176,6 +176,7 @@ fn build_payload(blocks: &[ClosedBlock]) -> Kar1Payload {
         .map(|b| BlockFrame {
             block_number: b.block_number,
             l2_timestamp: b.l2_timestamp,
+            remote_epochs: b.remote_epochs.clone(),
             txs: b
                 .txs
                 .iter()

@@ -12,17 +12,23 @@
 //!
 //! ## Scope
 //!
-//! This handles L2 transactions only. The DA payload does not carry
-//! deposits (L1-originated txs); the batcher's `MultiArchiveReader` skips
-//! `DepositRef`s. So a block range with deposits cannot reconstruct a
-//! byte-identical root from blobs alone. That needs re-deriving deposits
-//! from L1 events (the `da_watcher` path) and merging them back in
-//! canonical order. This is a documented follow-up. For deposit-free ranges
-//! (the common case, and everything the load harness produces), the
-//! reconstructed root is exact.
+//! This handles L2 transactions plus cross-chain (interop) deliveries.
+//! Remote-epoch records travel in the DA payload by value. They are not
+//! re-derivable from this chain's L1, so replay re-executes their messages
+//! as 0x7D txs at the head of the block each record leads. This is exactly
+//! where the live exec thread applied them.
+//!
+//! Deposits (L1-originated txs) are not carried in the DA payload; the
+//! batcher's `MultiArchiveReader` skips `DepositRef`s. So a block range with
+//! deposits cannot reconstruct a byte-identical root from blobs alone. That
+//! needs re-deriving deposits from L1 events (the `da_watcher` path) and
+//! merging them back in canonical order. This is a documented follow-up.
+//! For deposit-free ranges (the common case, and everything the load
+//! harness produces), the reconstructed root is exact.
 
 use alloy_primitives::B256;
 use kardamom_state::{StateEnv, StateWriter, TrieMode, seed_genesis};
+use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{
     AccountChange, BPosition, BlockBoundary, CodeEntry, SnapshotSource, StateDatabase, TxEnvelope,
 };
@@ -31,7 +37,7 @@ use crate::actor::{StateWriterQueue, StateWriterSignal};
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::exec_types::TxIndex;
-use crate::executor::Executor;
+use crate::executor::{Executor, execute_xchain_tx};
 use crate::persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 
 /// One block to re-execute: its boundary metadata and ordered transactions.
@@ -39,11 +45,19 @@ use crate::persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 /// The transaction list is the block's canonical order, as recovered from
 /// the DA payload. Each [`TxEnvelope`]'s `sender` and `tx_hash` are trusted
 /// as-is, the same as on the hot path. The proxy stamped them at the system
-/// boundary, and the DA round-trip preserved them.
+/// boundary, and the DA round-trip preserved them. The same trust applies to
+/// `remote_epochs`: each message's `source_hash` and `seq` carry over
+/// verbatim. Replay reproduces the bytes; verification is the validator's
+/// job.
 #[derive(Clone, Debug)]
 pub struct ReplayBlock {
     pub block_number: u64,
     pub l2_timestamp: u64,
+    /// Remote-epoch records leading this block. Their messages execute (as
+    /// 0x7D txs, in record order then seq order) BEFORE `txs` — mirroring the
+    /// live pipeline, where the sealer closes the open block on a remote
+    /// origin advance so a record's messages open the next one.
+    pub remote_epochs: Vec<RemoteEpochRecord>,
     pub txs: Vec<TxEnvelope>,
 }
 
@@ -179,7 +193,45 @@ fn drive_block(
     let mut delta = PendingDelta::new();
     let mut block_receipts = Vec::with_capacity(block.txs.len());
     let mut cumulative_gas = 0u64;
-    for (i, tx) in block.txs.iter().enumerate() {
+    let mut tx_index_in_block = 0u64;
+
+    // Remote-epoch messages lead the block: the sealer closed the previous
+    // block on the origin advance. They execute first, as 0x7D txs in
+    // record order then seq order, the same order the live exec thread
+    // uses.
+    for record in &block.remote_epochs {
+        // The record's marker consumed one canonical slot on the live
+        // stream, with no tx applied. Mirror that here, so the synthetic
+        // counters keep the live shape (neither feeds the state trie; see
+        // `Counters`).
+        counters.tx_idx += 1;
+        counters.global_pos += 1;
+        for message in &record.messages {
+            let tx_position = BPosition::from_index(counters.global_pos);
+            let (receipt, ws) = execute_xchain_tx(
+                &snapshot,
+                None,
+                &delta,
+                exec_env,
+                TxIndex(counters.tx_idx),
+                tx_position,
+                record.origin_chain_id,
+                message,
+                tx_index_in_block,
+                cumulative_gas,
+                None,
+            )?;
+            delta.apply(ws);
+            cumulative_gas += receipt.gas_used;
+            block_receipts.push(receipt);
+            tx_index_in_block += 1;
+            counters.tx_idx += 1;
+            counters.global_pos += 1;
+            counters.txs_applied += 1;
+        }
+    }
+
+    for tx in block.txs.iter() {
         let tx_position = BPosition::from_index(counters.global_pos);
         // Replay executes one durably committed block at a time against
         // its own committed snapshot. There is no pipelined parent layer.
@@ -191,13 +243,14 @@ fn drive_block(
             TxIndex(counters.tx_idx),
             tx_position,
             tx,
-            i as u64,
+            tx_index_in_block,
             cumulative_gas,
             None,
         )?;
         delta.apply(ws);
         cumulative_gas += receipt.gas_used;
         block_receipts.push(receipt);
+        tx_index_in_block += 1;
         counters.tx_idx += 1;
         counters.global_pos += 1;
         counters.txs_applied += 1;
@@ -305,11 +358,13 @@ mod tests {
             ReplayBlock {
                 block_number: 1,
                 l2_timestamp: 1_700_000_000,
+                remote_epochs: Vec::new(),
                 txs: vec![transfer(signer, to1, 0, 100), transfer(signer, to2, 1, 50)],
             },
             ReplayBlock {
                 block_number: 2,
                 l2_timestamp: 1_700_000_001,
+                remote_epochs: Vec::new(),
                 txs: vec![transfer(signer, to1, 2, 25)],
             },
         ]

@@ -85,6 +85,10 @@ pub enum Genesis {
     /// `chains/dev-withdrawals.toml`: the `L2ToL1MessagePasser` predeploy
     /// at `0x42…16`, but only account #0 is prefunded.
     DevWithdrawals,
+    /// `chains/dev-interop.toml` — the cross-chain `Outbox`/`Inbox`
+    /// predeploys at `0x42…E0`/`0x42…E1`, only account #0 prefunded. The
+    /// xchain scenario needs it.
+    DevInterop,
 }
 
 impl Genesis {
@@ -92,6 +96,7 @@ impl Genesis {
         match self {
             Genesis::ClusterDev => repo.join("deploy/cluster/config/genesis/dev.toml"),
             Genesis::DevWithdrawals => repo.join("chains/dev-withdrawals.toml"),
+            Genesis::DevInterop => repo.join("chains/dev-interop.toml"),
         }
     }
 }
@@ -464,6 +469,25 @@ impl LocalStack {
     /// no final flush. What survives is exactly what mdbx committed.
     pub fn crash_executor(&mut self) {
         self.executor.proc.kill();
+    }
+
+    /// Spawn the interop watcher (`kardamom-da-watcher` in interop mode)
+    /// against `feed_url`, publishing remote epochs into this stack's Aeron
+    /// dir. The caller owns the returned process — the xchain scenario
+    /// observes its exit (the pair-scoped fail-stop) directly — and it still
+    /// dies with the test via `PR_SET_PDEATHSIG`, so nothing leaks.
+    pub fn spawn_interop_watcher(
+        &self,
+        origin_chain_id: u64,
+        feed_url: &str,
+        cursor_file: &Path,
+    ) -> Result<services::Spawned> {
+        services::spawn_interop_watcher(
+            &self.service_spec(),
+            origin_chain_id,
+            feed_url,
+            cursor_file,
+        )
     }
 
     /// The [`ServiceSpec`] this stack launched its services from, rebuilt

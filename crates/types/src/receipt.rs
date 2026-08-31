@@ -13,6 +13,10 @@ use crate::wire;
 pub const TX_TYPE_LEGACY: u8 = 0x00;
 /// EIP-2718 type byte for an L1-originated deposit. This is the OP-stack value.
 pub const TX_TYPE_DEPOSIT: u8 = 0x7E;
+/// EIP-2718 type byte for a cross-chain message from another Kardamom chain
+/// (`docs/specs/interop-outbox-messaging-spec.md`). One below the deposit
+/// type; shares its fee-free, nonce-less execution shape.
+pub const TX_TYPE_XCHAIN: u8 = 0x7D;
 
 /// The EIP-2718 type byte of a raw encoded transaction. For a typed
 /// envelope, the leading byte is the type (`0x00..=0x7f`). Any byte above
@@ -193,6 +197,12 @@ impl Receipt {
     /// deposit consumes no L2 nonce; see [`Receipt::tx_type`].
     pub fn is_deposit(&self) -> bool {
         self.tx_type == TX_TYPE_DEPOSIT
+    }
+
+    /// Whether this receipt is for a cross-chain message from another
+    /// Kardamom chain (fee-free and nonce-less, like a deposit).
+    pub fn is_xchain(&self) -> bool {
+        self.tx_type == TX_TYPE_XCHAIN
     }
 }
 

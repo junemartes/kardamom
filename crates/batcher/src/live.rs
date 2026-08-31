@@ -387,6 +387,17 @@ pub async fn run_feed<P: Provider>(
             // same reason: a reconstructor reads the origin from the block
             // boundary and re-derives that L1 block's deposits itself.
             Ok(Some(ReaderToExec::Deposit { .. } | ReaderToExec::Epoch { .. })) => {}
+            // Remote-epoch records travel in DA. Unlike deposits, they are
+            // not derivable again from this chain's L1 origin. So the
+            // record, with its messages and calldata by value, is buffered
+            // into the block it leads. It travels in the KAR1 v2 payload
+            // for the reconstruction replay to run again.
+            Ok(Some(ReaderToExec::RemoteEpoch { record, .. })) => acc.observe_remote_epoch(*record),
+            // The per-message expansion of the record above. The messages
+            // already travel by value inside the buffered record, so these
+            // expanded dispatches add nothing new. Skip them here, the same
+            // way the exec side expands them again from the record.
+            Ok(Some(ReaderToExec::XChain { .. })) => {}
             Ok(Some(ReaderToExec::Boundary(b))) => {
                 let closed = acc.observe_boundary(b);
                 counter!(metric_names::BLOCKS_OBSERVED).increment(1);

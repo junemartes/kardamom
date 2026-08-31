@@ -32,6 +32,7 @@ use crate::boundary::BlockBoundaryStart;
 use crate::deposit::DepositRef;
 use crate::epoch::EpochRecord;
 use crate::txref::TxRef;
+use crate::xchain::RemoteEpochRecord;
 
 /// One tx_ordering wire record. Variants stay narrow. This keeps the "tiny
 /// payload" property that makes tx_ordering's concurrent publication
@@ -53,6 +54,13 @@ pub enum TxOrderingMessage {
     /// epoch's `l1_number` into every following boundary. See
     /// `docs/agents/l1-origin-deposit-derivation-spec.md`.
     Epoch(EpochRecord),
+    /// A remote epoch: one peer Kardamom chain's contiguous outbox-message
+    /// batch, in seq order. Origin-advancing like [`Self::Epoch`] (the sealer
+    /// closes the open block first, per-peer), but its origin marker is NOT
+    /// stamped into boundaries — remote origin positions are recoverable from
+    /// these records themselves, which keeps boundary size independent of the
+    /// peer count. See `docs/specs/interop-outbox-messaging-spec.md`.
+    RemoteEpoch(RemoteEpochRecord),
 }
 
 impl TxOrderingMessage {
@@ -76,11 +84,19 @@ impl TxOrderingMessage {
         matches!(self, Self::Epoch(_))
     }
 
+    /// Whether this record is a remote (peer-chain) epoch.
+    pub const fn is_remote_epoch(&self) -> bool {
+        matches!(self, Self::RemoteEpoch(_))
+    }
+
     /// Returns the contained `TxRef` if this record is a transaction reference.
     pub const fn as_tx_ref(&self) -> Option<&TxRef> {
         match self {
             Self::TxRef(r) => Some(r),
-            Self::DepositRef(_) | Self::BoundaryStart(_) | Self::Epoch(_) => None,
+            Self::DepositRef(_)
+            | Self::BoundaryStart(_)
+            | Self::Epoch(_)
+            | Self::RemoteEpoch(_) => None,
         }
     }
 
@@ -88,7 +104,7 @@ impl TxOrderingMessage {
     pub const fn as_deposit_ref(&self) -> Option<&DepositRef> {
         match self {
             Self::DepositRef(d) => Some(d),
-            Self::TxRef(_) | Self::BoundaryStart(_) | Self::Epoch(_) => None,
+            Self::TxRef(_) | Self::BoundaryStart(_) | Self::Epoch(_) | Self::RemoteEpoch(_) => None,
         }
     }
 
@@ -96,7 +112,18 @@ impl TxOrderingMessage {
     pub const fn as_epoch(&self) -> Option<&EpochRecord> {
         match self {
             Self::Epoch(e) => Some(e),
-            Self::TxRef(_) | Self::DepositRef(_) | Self::BoundaryStart(_) => None,
+            Self::TxRef(_)
+            | Self::DepositRef(_)
+            | Self::BoundaryStart(_)
+            | Self::RemoteEpoch(_) => None,
+        }
+    }
+
+    /// If this record is a remote epoch, return it.
+    pub const fn as_remote_epoch(&self) -> Option<&RemoteEpochRecord> {
+        match self {
+            Self::RemoteEpoch(r) => Some(r),
+            Self::TxRef(_) | Self::DepositRef(_) | Self::BoundaryStart(_) | Self::Epoch(_) => None,
         }
     }
 
@@ -104,8 +131,14 @@ impl TxOrderingMessage {
     pub const fn as_boundary(&self) -> Option<&BlockBoundaryStart> {
         match self {
             Self::BoundaryStart(b) => Some(b),
-            Self::TxRef(_) | Self::DepositRef(_) | Self::Epoch(_) => None,
+            Self::TxRef(_) | Self::DepositRef(_) | Self::Epoch(_) | Self::RemoteEpoch(_) => None,
         }
+    }
+}
+
+impl From<RemoteEpochRecord> for TxOrderingMessage {
+    fn from(r: RemoteEpochRecord) -> Self {
+        Self::RemoteEpoch(r)
     }
 }
 

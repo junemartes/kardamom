@@ -224,6 +224,7 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
         block_number: 1,
         l2_timestamp: 7,
         end_tx_idx: BPosition::from_index(0),
+        remote_epochs: vec![],
         txs: vec![],
     };
     let batch1 = pack_blocks(&BatcherConfig::default(), &[block1]).unwrap();
@@ -284,6 +285,7 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
         block_number: 2,
         l2_timestamp: 8,
         end_tx_idx: BPosition::from_index(0),
+        remote_epochs: vec![],
         txs: vec![],
     };
     let batch2 = pack_blocks(&BatcherConfig::default(), &[block2]).unwrap();

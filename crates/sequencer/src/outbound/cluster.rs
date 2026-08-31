@@ -7,6 +7,7 @@
 //! offer surfaces as `SequencerError::Backpressure`, so the existing
 //! rewind-and-retry path applies.
 
+use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{EpochRecord, TxRef};
 
 use crate::SequencerError;
@@ -90,6 +91,16 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
         // nothing to amortize.
         let bytes = wire::encode_ingress_epoch(e)
             .map_err(|err| SequencerError::EncodeFailed(format!("epoch: {err}")))?;
+        self.offer(&bytes)
+    }
+
+    fn try_publish_remote_epoch(&mut self, r: &RemoteEpochRecord) -> Result<(), SequencerError> {
+        // KIND_REMOTE_ORIGIN_RECORD, not KIND_ORIGIN_RECORD: the sealer must
+        // advance the marker for THIS origin chain and must not stamp a peer
+        // chain's anchor into an L2 block boundary. Never batched — one per
+        // origin block that carried messages, each forcing a boundary.
+        let bytes = wire::encode_ingress_remote_epoch(r)
+            .map_err(|err| SequencerError::EncodeFailed(format!("remote epoch: {err}")))?;
         self.offer(&bytes)
     }
 }
@@ -206,6 +217,47 @@ mod tests {
         );
         // Marker plus 1 deposit.
         assert_eq!(u32::from_le_bytes(sent[0][41..45].try_into().unwrap()), 2);
+    }
+
+    /// A remote epoch must go out as KIND_REMOTE_ORIGIN_RECORD, carrying the
+    /// origin chain id alongside the anchor: the sealer keys its marker on the
+    /// pair, so relaying this as a plain KIND_ORIGIN_RECORD would merge every
+    /// peer's progress into the L1 origin and stamp a peer's anchor into an L2
+    /// block boundary.
+    #[test]
+    fn publishes_remote_epoch_as_a_remote_origin_record_envelope() {
+        let ingress = FakeIngress::new();
+        let mut pubr = ClusterRefPublisher::new(ingress.clone());
+        let r = RemoteEpochRecord {
+            origin_chain_id: 412_346,
+            anchor_number: 8_888,
+            anchor_hash: B256::repeat_byte(0x33),
+            first_seq: 4,
+            messages: vec![kardamom_types::xchain::XChainMessage {
+                source_hash: B256::repeat_byte(0xE7),
+                seq: 4,
+                gas_limit: 100_000,
+                ..Default::default()
+            }],
+        };
+        pubr.try_publish_remote_epoch(&r).unwrap();
+
+        let sent = ingress.accepted();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0][0], wire::KIND_REMOTE_ORIGIN_RECORD);
+        assert_eq!(&sent[0][1..33], r.canonical_id().as_slice());
+        assert_eq!(
+            u64::from_le_bytes(sent[0][33..41].try_into().unwrap()),
+            412_346,
+            "the sealer reads the origin chain id from this fixed offset"
+        );
+        assert_eq!(
+            u64::from_le_bytes(sent[0][41..49].try_into().unwrap()),
+            8_888,
+            "…and the anchor position from this one"
+        );
+        // Marker + 1 message.
+        assert_eq!(u32::from_le_bytes(sent[0][49..53].try_into().unwrap()), 2);
     }
 
     #[test]

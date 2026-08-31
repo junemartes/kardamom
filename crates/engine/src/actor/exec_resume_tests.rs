@@ -84,6 +84,7 @@ fn resume_executes_from_cursor_with_absolute_counts() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -158,6 +159,7 @@ fn resume_after_empty_block_backlog() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -225,6 +227,7 @@ fn resume_boundary_alignment_still_checked() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     );
     let res = h.join().expect("no panic");
     assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));
@@ -276,6 +279,7 @@ fn no_resume_executes_and_commits_block_one() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     );
     h.join().expect("no panic").expect("exec ok");
 

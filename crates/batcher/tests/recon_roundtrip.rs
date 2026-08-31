@@ -33,6 +33,7 @@ fn closed(block_number: u64, n: usize) -> ClosedBlock {
         block_number,
         l2_timestamp: 1_700_000_000 + block_number,
         end_tx_idx: pos((n as i32) * 64),
+        remote_epochs: Vec::new(),
         txs,
     }
 }
@@ -43,6 +44,7 @@ fn expected_frames(blocks: &[ClosedBlock]) -> Vec<BlockFrame> {
         .map(|b| BlockFrame {
             block_number: b.block_number,
             l2_timestamp: b.l2_timestamp,
+            remote_epochs: b.remote_epochs.clone(),
             txs: b
                 .txs
                 .iter()
@@ -89,6 +91,139 @@ fn roundtrip_five_blocks_grouped() {
     assert_eq!(batch.l2_block_end, 14);
     let reconstructed = reconstruct(&batch.blobs).unwrap();
     assert_eq!(reconstructed, expected_frames(&blocks));
+}
+
+// ---------------------------------------------------------------------------
+// Remote-epoch (interop) DA representation — spec §16 Q8.
+// ---------------------------------------------------------------------------
+
+/// Per-message calldata cap enforced by the origin Outbox
+/// (`contracts/src/L2/Outbox.sol` MAX_DATA_BYTES).
+const MAX_DATA_BYTES: usize = 65_536;
+
+fn remote_epoch(
+    origin: u64,
+    first_seq: u64,
+    inputs: &[&[u8]],
+    with_callback: bool,
+) -> kardamom_types::xchain::RemoteEpochRecord {
+    use kardamom_types::xchain::{Callback, RemoteEpochRecord, XChainMessage, remote_source_hash};
+    let messages = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            let seq = first_seq + i as u64;
+            XChainMessage {
+                source_hash: remote_source_hash(origin, seq),
+                seq,
+                origin_sender: Address::repeat_byte(0xA1),
+                target: Address::repeat_byte(0xB2),
+                value: 0,
+                gas_limit: 150_000,
+                input: Bytes::copy_from_slice(input),
+                callback: with_callback.then(|| Callback {
+                    target: Address::repeat_byte(0xCB),
+                    gas_limit: 90_000,
+                    context: B256::repeat_byte(0x42),
+                }),
+            }
+        })
+        .collect();
+    RemoteEpochRecord {
+        origin_chain_id: origin,
+        anchor_number: 100 + first_seq,
+        anchor_hash: B256::repeat_byte(0x0B),
+        first_seq,
+        messages,
+    }
+}
+
+/// Round-trip a batch whose middle block is led by TWO remote-epoch records
+/// (a multi-message record with callbacks and a single-message one) — the
+/// records must come back byte-identical, attributed to exactly the block
+/// they lead, with the surrounding tx-only blocks untouched.
+#[test]
+fn roundtrip_remote_epochs_multi_message_record() {
+    let mut blocks = vec![closed(7, 2), closed(8, 3), closed(9, 1)];
+    blocks[1].remote_epochs = vec![
+        remote_epoch(412_399, 5, &[&[0xCA, 0xFE], &[], &[0xBE; 33]], true),
+        remote_epoch(412_400, 0, &[&[0x01]], false),
+    ];
+
+    let batch = pack_blocks(&BatcherConfig::default(), &blocks).unwrap();
+    let reconstructed = reconstruct(&batch.blobs).unwrap();
+    assert_eq!(reconstructed, expected_frames(&blocks));
+    assert_eq!(reconstructed[1].remote_epochs, blocks[1].remote_epochs);
+    assert!(reconstructed[0].remote_epochs.is_empty());
+    assert!(reconstructed[2].remote_epochs.is_empty());
+}
+
+/// A record whose messages carry the Outbox's MAX_DATA_BYTES calldata cap:
+/// two such messages exceed one blob's 126 976 usable bytes, so the payload
+/// must span blobs — the SAME multi-blob mechanism an oversized tx batch uses
+/// (`pack_to_blobs` slicing, `pack_blocks`' 6-blob ceiling as the guard) —
+/// and still round-trip byte-identically.
+#[test]
+fn roundtrip_max_size_messages_span_blobs() {
+    let big_a = vec![0x5A; MAX_DATA_BYTES];
+    let big_b = vec![0xA5; MAX_DATA_BYTES];
+    let mut block = closed(3, 1);
+    block.remote_epochs = vec![remote_epoch(412_399, 0, &[&big_a, &big_b], false)];
+    let blocks = vec![block];
+
+    // Uncompressed, so the payload size is the framed size and the blob
+    // spanning is deterministic (zstd would collapse the repeated bytes).
+    let cfg = BatcherConfig {
+        compress: false,
+        ..Default::default()
+    };
+    let batch = pack_blocks(&cfg, &blocks).unwrap();
+    assert!(
+        batch.blobs.len() >= 2,
+        "two max-size messages must overflow a single blob (got {} blob(s))",
+        batch.blobs.len()
+    );
+    let reconstructed = reconstruct(&batch.blobs).unwrap();
+    assert_eq!(reconstructed, expected_frames(&blocks));
+    assert_eq!(
+        reconstructed[0].remote_epochs[0].messages[0].input.len(),
+        MAX_DATA_BYTES
+    );
+}
+
+/// The accumulator attributes a remote-epoch record to the block it LEADS
+/// (the record arrives after a boundary, before the next block's txs), and
+/// the buffer drains — the next boundary carries none.
+#[test]
+fn accumulator_attributes_remote_epochs_to_the_block_they_lead() {
+    use kardamom_batcher::batch::BatchAccumulator;
+    use kardamom_types::BlockBoundaryStart;
+
+    let mut acc = BatchAccumulator::new();
+    let boundary = |n: u64| BlockBoundaryStart {
+        block_number: n,
+        l2_timestamp: 1_700_000_000 + n,
+        end_tx_idx: pos(0),
+        l1_origin: 0,
+    };
+
+    // Block 1 closes with no interop traffic.
+    let b1 = acc.observe_boundary(boundary(1));
+    assert!(b1.remote_epochs.is_empty());
+
+    // A record leads block 2: observed right after boundary 1, before the
+    // block's txs.
+    let rec = remote_epoch(412_399, 0, &[&[0xCA]], false);
+    acc.observe_remote_epoch(rec.clone());
+    let tx = closed(0, 1).txs.remove(0);
+    acc.observe_tx(tx.envelope, tx.position);
+    let b2 = acc.observe_boundary(boundary(2));
+    assert_eq!(b2.remote_epochs, vec![rec]);
+    assert_eq!(b2.txs.len(), 1);
+
+    // Drained: block 3 carries none.
+    let b3 = acc.observe_boundary(boundary(3));
+    assert!(b3.remote_epochs.is_empty());
 }
 
 /// A DA store that returns wrong bytes of the right length must be caught

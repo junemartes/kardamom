@@ -209,11 +209,16 @@ async fn main() -> anyhow::Result<()> {
     );
     let mut tx_count: u64 = 0;
     let mut block_count: u64 = 0;
+    let mut remote_epoch_count: u64 = 0;
     for rec in reader {
         match rec? {
             ResolvedRecord::Tx { position, env, .. } => {
                 tx_count += 1;
                 batcher.accumulator().observe_tx(env, position);
+            }
+            ResolvedRecord::RemoteEpoch { record, .. } => {
+                remote_epoch_count += 1;
+                batcher.accumulator().observe_remote_epoch(record);
             }
             ResolvedRecord::Boundary { marker, .. } => {
                 block_count += 1;
@@ -226,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
     info!(
         tx_count,
         block_count,
+        remote_epoch_count,
         batches = batches.len(),
         "archive scan complete"
     );
