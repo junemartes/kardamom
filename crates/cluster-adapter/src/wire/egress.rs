@@ -6,12 +6,13 @@
 
 use alloy_primitives::{Address, B256};
 use kardamom_types::epoch::EpochRecord;
+use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, BlockBoundaryStart, DepositRef, TxOrderingMessage, TxRef};
 
 use super::{
     CANONICAL_ID_LEN, EGRESS_KIND_BOUNDARY, EGRESS_KIND_CONTIGUITY_REJECT, EGRESS_KIND_RELAYED,
-    EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE, RT_DEPOSITREF, RT_EPOCH, RT_TXREF,
-    SENDER_LEN, WireError, encode_kind_2u64, rd_i32, rd_u32, rd_u64,
+    EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE, RT_DEPOSITREF, RT_EPOCH,
+    RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError, encode_kind_2u64, rd_i32, rd_u32, rd_u64,
 };
 
 // ── decode (egress: cluster to Rust) ────────────────────────────────────────
@@ -170,6 +171,27 @@ fn decode_relayed_payload(p: &[u8]) -> Result<TxOrderingMessage, WireError> {
                 )));
             }
             Ok(TxOrderingMessage::Epoch(epoch))
+        }
+        RT_REMOTE_EPOCH => {
+            // Same unaligned-body copy as RT_EPOCH, for the same reason.
+            let mut aligned = rkyv::util::AlignedVec::<8>::with_capacity(fields.len());
+            aligned.extend_from_slice(fields);
+            let rec: RemoteEpochRecord =
+                rkyv::from_bytes::<RemoteEpochRecord, rkyv::rancor::Error>(&aligned)
+                    .map_err(|e| WireError::BadRemoteEpoch(e.to_string()))?;
+            // The id commits to the pair's (origin, anchor, seq range), so a
+            // mismatch means the header and the batch disagree about WHICH
+            // slice of the pair's sequence this is — the one thing dedup
+            // cannot be allowed to get wrong.
+            if rec.canonical_id() != id {
+                return Err(WireError::BadRemoteEpoch(format!(
+                    "canonical id {id} does not match remote epoch from chain {} seqs {}..={}",
+                    rec.origin_chain_id,
+                    rec.first_seq,
+                    rec.last_seq()
+                )));
+            }
+            Ok(TxOrderingMessage::RemoteEpoch(rec))
         }
         other => Err(WireError::BadRecordType(other)),
     }

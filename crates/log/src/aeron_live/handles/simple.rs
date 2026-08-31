@@ -1,17 +1,18 @@
-//! The four structurally identical single-stream handle pairs: TxErrors,
-//! TxDeposits, FsyncWatermark, Quorum. Each is a publisher wrapping one
-//! [`PubHandle`] plus a subscriber wrapping one typed receiver, differing
+//! The five structurally identical single-stream handle pairs: TxErrors,
+//! TxDeposits, TxRemoteEpochs, FsyncWatermark, Quorum. Each is a publisher
+//! wrapping one [`PubHandle`] plus a subscriber wrapping one typed receiver, differing
 //! only in message type, channel/stream selection, and the publisher's
 //! publish surface. [`declare_channel_handles!`] stamps out the
-//! boilerplate (structs, `open`, `recv`/`try_recv`). The four public
-//! type-name pairs and their method signatures are exactly what the four
-//! hand-written copies exposed.
+//! boilerplate (structs, `open`, `recv`/`try_recv`). The public type-name
+//! pairs and their method signatures are exactly what the hand-written
+//! copies exposed.
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::super::{AeronRuntime, PubHandle};
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
+use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, EpochRecord, FsyncWatermark, QuorumWatermark, TxError};
 
 /// Declare a publisher/subscriber handle pair over one config-selected
@@ -112,6 +113,22 @@ declare_channel_handles! {
     /// TxDeposits subscriber (DA watcher → sequencer).
     subscriber TxDepositsSubscriberHandle(EpochRecord);
     open(ch) = (ch.tx_deposits_channel, ch.tx_deposits_stream_id);
+}
+
+declare_channel_handles! {
+    /// TxRemoteEpochs publisher (interop watcher → sequencer).
+    publisher TxRemoteEpochsPublisherHandle {
+        pub fn publish(&self, r: &RemoteEpochRecord) -> Result<BPosition, LogError> {
+            self.inner.publish(r)
+        }
+
+        pub fn raw(&self) -> &PubHandle {
+            &self.inner
+        }
+    }
+    /// TxRemoteEpochs subscriber (interop watcher → sequencer).
+    subscriber TxRemoteEpochsSubscriberHandle(RemoteEpochRecord);
+    open(ch) = (ch.tx_remote_epochs_channel, ch.tx_remote_epochs_stream_id);
 }
 
 declare_channel_handles! {

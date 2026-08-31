@@ -43,15 +43,22 @@
 //!   `Deposit` from `tx_deposits`, and runs the deposit. Wiring this up is a
 //!   separate follow-up.
 //! - Reorg handling. Finalized blocks do not reorg in normal Ethereum
-//!   operation, so the watcher trusts finality.
-//! - L1-attributes deposits (the OP block-attributes system transaction).
-//!   The upgrade transaction, the other kind of system transaction, is in
-//!   scope: the watcher reads `UpgradeInitiated` alongside
-//!   `DepositInitiated` from the same lockbox address and the same query.
-//!   `kardamom_types::epoch::derive_epoch` turns it into a system deposit
-//!   (`is_system_transaction = true`). See
-//!   `docs/specs/2026-08-16-l1-upgrade-feature-flags-design.md`.
+//!   operation; the watcher trusts finality.
+//! - L1-attributes / system txs (OP `is_system_transaction = true`).
+//!
+//! ## Interop
+//!
+//! [`interop`] is the second source adapter that the spec's §6 asks this
+//! crate to grow. It uses the same watch-derive-publish shape, with a peer
+//! Kardamom chain as the origin instead of L1. It mirrors the layering
+//! above, seam for seam: `RemoteChainSource` matches [`source::L1Source`],
+//! `RemoteEpochPublisher` matches [`publisher::EpochPublisher`], and
+//! `interop::watcher::process_once` matches [`watcher::process_once`]. It
+//! shares nothing else. The derivation rule lives in
+//! `kardamom_types::xchain`, for the same reason the deposit rule lives in
+//! `kardamom_types::epoch`.
 
+pub mod interop;
 pub mod metrics;
 pub mod publisher;
 pub mod rpc_source;

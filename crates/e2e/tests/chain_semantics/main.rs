@@ -78,3 +78,4 @@ include!("consistency.rs");
 include!("bridge_da.rs");
 include!("derivation.rs");
 include!("upgrades.rs");
+include!("xchain.rs");

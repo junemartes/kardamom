@@ -17,14 +17,14 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
-    TxReceiptsSubscriberHandle,
+    TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::sequencer::Shutdown;
 
-use adapters::{LiveEpochSub, LiveTxDataSub, LiveTxErrorPub};
+use adapters::{LiveEpochSub, LiveRemoteEpochSub, LiveTxDataSub, LiveTxErrorPub};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -203,12 +203,15 @@ async fn main() -> anyhow::Result<()> {
         .context("open TxDataSubscriberHandle")?;
     let tx_deposits_sub = TxDepositsSubscriberHandle::open(&rt, &channels)
         .context("open TxDepositsSubscriberHandle")?;
+    let tx_remote_epochs_sub = TxRemoteEpochsSubscriberHandle::open(&rt, &channels)
+        .context("open TxRemoteEpochsSubscriberHandle")?;
     let tx_errors_pub =
         TxErrorsPublisherHandle::open(&rt, &channels).context("open TxErrorsPublisherHandle")?;
 
     let shutdown = Shutdown::new();
     let shutdown_for_main = shutdown.clone();
     let shutdown_for_deposits = shutdown.clone();
+    let shutdown_for_remote_epochs = shutdown.clone();
 
     tracing::info!(
         "nonce floors: sequencer holds no state-DB reader; cold senders seed at \
@@ -287,19 +290,22 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Cloning shares the single session thread, and offers serialize
-    // through it. Both loops use `cluster_pub` (it implements
-    // `TxOrderingRefPublisher`): the canonical `TxRef` loop and the
-    // `DepositRef` pump.
-    let (join_main, join_deposits) = feeds::spawn_publish_loops(
+    // through it. All three loops use `cluster_pub` (it implements
+    // `TxOrderingRefPublisher`): the canonical `TxRef` loop and the two
+    // origin pumps.
+    let (join_main, join_deposits, join_remote_epochs) = feeds::spawn_publish_loops(
         cfg_clone,
         LiveTxDataSub::new(tx_data_sub),
+        cluster_pub.clone(),
         cluster_pub.clone(),
         cluster_pub,
         LiveTxErrorPub::new(tx_errors_pub),
         LiveEpochSub::new(tx_deposits_sub),
+        LiveRemoteEpochSub::new(tx_remote_epochs_sub),
         Some(resync_controller),
         shutdown_for_main,
         shutdown_for_deposits,
+        shutdown_for_remote_epochs,
     );
 
     wait_for_shutdown().await;
@@ -315,7 +321,14 @@ async fn main() -> anyhow::Result<()> {
         Ok(Err(e)) => tracing::error!(error = %e, "sequencer epoch pump returned an error"),
         Err(e) => tracing::error!(error = %e, "sequencer epoch task panicked"),
     }
-    // Drop the cluster session only after both loops have stopped. This
+    match join_remote_epochs.await {
+        Ok(Ok(())) => tracing::info!("sequencer remote-epoch pump returned cleanly"),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "sequencer remote-epoch pump returned an error")
+        }
+        Err(e) => tracing::error!(error = %e, "sequencer remote-epoch task panicked"),
+    }
+    // Drop the cluster session only after every loop has stopped. This
     // also closes the egress channel, which unblocks the watermark feed.
     // The feed also checks the shutdown token on each tick. The receipts
     // task exits on the token, or on the closed floor channel after the

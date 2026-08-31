@@ -90,6 +90,7 @@ fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -166,6 +167,7 @@ fn exec_pipelines_k_deep_and_blocks_only_at_capacity() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -237,6 +239,7 @@ fn exec_settles_inflight_commits_while_idle() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     );
 
     // The writer catches up on its own. The exec thread must notice

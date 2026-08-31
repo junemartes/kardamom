@@ -10,6 +10,7 @@ fn sample_payload() -> Kar1Payload {
             BlockFrame {
                 block_number: 42,
                 l2_timestamp: 1_700_000_000,
+                remote_epochs: vec![],
                 txs: vec![
                     TxFrame {
                         correlation_id: 1,
@@ -28,6 +29,7 @@ fn sample_payload() -> Kar1Payload {
             BlockFrame {
                 block_number: 43,
                 l2_timestamp: 1_700_000_250,
+                remote_epochs: vec![],
                 txs: vec![],
             },
         ],
@@ -47,7 +49,7 @@ fn roundtrip_preserves_payload() {
 fn header_starts_with_magic_and_version() {
     let bytes = encode(&sample_payload()).expect("encode");
     assert_eq!(&bytes[..4], &MAGIC);
-    assert_eq!(bytes[4], 1, "version byte");
+    assert_eq!(bytes[4], 2, "version byte");
     assert_eq!(bytes[5], 0, "uncompressed flag");
 }
 

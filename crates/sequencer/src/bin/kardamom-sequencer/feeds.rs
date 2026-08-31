@@ -21,11 +21,12 @@ use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::epoch::process_epoch;
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
+use kardamom_sequencer::remote_epoch::process_remote_epoch;
 use kardamom_sequencer::resync::{FloorUpdate, ResyncController, SharedWatermark};
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
 use kardamom_types::{BPosition, Receipt};
 
-use crate::adapters::{LiveEpochSub, LiveTxDataSub, LiveTxErrorPub};
+use crate::adapters::{LiveEpochSub, LiveRemoteEpochSub, LiveTxDataSub, LiveTxErrorPub};
 
 /// Spawn the egress-watermark feed. This is the silence authority: it
 /// measures boundary-arrival gaps. Idle traffic still emits a boundary
@@ -242,23 +243,32 @@ async fn run_receipt_floor_feed(
 
 pub type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
 
-/// Spawn the main sequencer loop and the deposit pump, over a pair of
+/// Spawn the main sequencer loop and the two origin pumps, over three
 /// `TxOrderingRefPublisher`s (`main_pub` for the canonical `TxRef` loop,
-/// `deposit_pub` for the epoch pump). This is generic over the publisher
-/// type, so the Aeron and cluster branches share one implementation. Both
-/// branches supply concrete publishers that implement the trait.
+/// `deposit_pub` for the L1 epoch pump, `remote_epoch_pub` for the interop
+/// one). This is generic over the publisher type, so the Aeron and cluster
+/// branches share one implementation. Both branches supply concrete
+/// publishers that implement the trait.
+///
+/// The two origin pumps run as separate loops, not one merged poll, because
+/// the origins are independent: a peer whose feed has stalled must not
+/// delay L1 deposits, and an L1 RPC outage must not stall cross-chain
+/// delivery.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_publish_loops<P>(
     cfg: SequencerConfig,
     mut tx_data: LiveTxDataSub,
     main_pub: P,
     deposit_pub: P,
+    remote_epoch_pub: P,
     mut tx_errors: LiveTxErrorPub,
     mut epoch_sub: LiveEpochSub,
+    mut remote_epoch_sub: LiveRemoteEpochSub,
     resync: Option<ResyncController>,
     shutdown_for_main: Shutdown,
     shutdown_for_deposits: Shutdown,
-) -> (LoopHandle, LoopHandle)
+    shutdown_for_remote_epochs: Shutdown,
+) -> (LoopHandle, LoopHandle, LoopHandle)
 where
     P: TxOrderingRefPublisher + Send + 'static,
 {
@@ -304,5 +314,26 @@ where
         }
     });
 
-    (join_main, join_deposits)
+    // Independent pump for tx_remote_epochs to a remote-origin record on
+    // tx_ordering, on the same terms as the deposit pump above.
+    let mut remote_epoch_pub = remote_epoch_pub;
+    let join_remote_epochs = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
+        let mut idle = IdleBackoff::new(Duration::from_micros(1), Duration::from_micros(100), 1);
+        loop {
+            if shutdown_for_remote_epochs.is_signaled() {
+                return Ok(());
+            }
+            match process_remote_epoch(&mut remote_epoch_sub, &mut remote_epoch_pub) {
+                Ok(true) => idle.reset(),
+                Ok(false) => std::thread::sleep(idle.idle_wait()),
+                Err(SequencerError::Backpressure) => {
+                    std::thread::sleep(Duration::from_micros(10));
+                }
+                Err(SequencerError::IngressDisconnected) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    });
+
+    (join_main, join_deposits, join_remote_epochs)
 }

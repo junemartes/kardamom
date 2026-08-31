@@ -31,6 +31,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
 
 use crate::archive_reader::{TxDataSegmentReader, TxOrderingSegmentReader};
@@ -57,6 +58,14 @@ pub enum ResolvedRecord {
     Boundary {
         position: BPosition,
         marker: BlockBoundaryStart,
+    },
+    /// A remote-epoch record (interop): one peer chain's contiguous
+    /// outbox-message batch, messages by value. Fed to
+    /// [`crate::batch::BatchAccumulator::observe_remote_epoch`] so the record
+    /// travels in the DA payload of the block it leads (spec §16 Q8).
+    RemoteEpoch {
+        position: BPosition,
+        record: RemoteEpochRecord,
     },
 }
 
@@ -196,6 +205,17 @@ impl Iterator for MultiArchiveReader {
                     // claim, because deposits are unsigned. See
                     // docs/agents/l1-origin-deposit-derivation-spec.md.
                     continue;
+                }
+                TxOrderingMessage::RemoteEpoch(rec) => {
+                    // Unlike epoch deposits, remote messages are NOT
+                    // re-derivable from this chain's L1 origin, so they DO
+                    // travel in DA (spec §16 Q8): yield the record — messages
+                    // by value — for the accumulator to buffer into the block
+                    // it leads (mirrors `live.rs`).
+                    return Some(Ok(ResolvedRecord::RemoteEpoch {
+                        position,
+                        record: rec,
+                    }));
                 }
                 TxOrderingMessage::BoundaryStart(b) => {
                     return Some(Ok(ResolvedRecord::Boundary {

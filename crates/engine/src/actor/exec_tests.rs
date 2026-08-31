@@ -70,6 +70,7 @@ fn exec_runs_two_txs_and_emits_slim_boundary() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     );
     h.join().expect("no panic").expect("exec ok");
     drop(rx_e2c);
@@ -171,6 +172,7 @@ fn deposit_credit_is_visible_to_later_txs_in_the_block() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -240,6 +242,7 @@ fn exec_handoff_carries_a_populated_bal() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -306,6 +309,7 @@ fn exec_rejects_misaligned_boundary() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     );
     let res = h.join().expect("no panic");
     assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));
@@ -362,6 +366,7 @@ fn exec_hands_off_shadow_captures_at_boundary() {
         Some(stx),
         None,
         None::<NoEpochCheck>,
+        None,
     );
     h.join().expect("no panic").expect("exec ok");
     drop(rx_e2c);
@@ -446,6 +451,7 @@ fn a_dormant_feature_writes_nothing_at_block_close() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     )
     .join()
     .expect("no panic")
@@ -507,6 +513,7 @@ fn an_active_feature_beats_once_per_block() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     )
     .join()
     .expect("no panic")
@@ -574,6 +581,7 @@ fn activation_is_judged_against_the_blocks_own_header_timestamp() {
         None,
         None,
         None::<NoEpochCheck>,
+        None,
     )
     .join()
     .expect("no panic")
@@ -588,4 +596,186 @@ fn activation_is_judged_against_the_blocks_own_header_timestamp() {
         "activation is inclusive: the block AT T beats"
     );
     assert_eq!(beacon_in(&log[2].1), Some((2, 3, 5_001)));
+}
+
+// ── Interop P1: remote epochs execute as 0x7D deliveries ────────────────────
+
+fn remote_epoch_fixture(origin: u64, n: u64) -> kardamom_types::xchain::RemoteEpochRecord {
+    use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage, remote_source_hash};
+    RemoteEpochRecord {
+        origin_chain_id: origin,
+        anchor_number: 900,
+        anchor_hash: alloy_primitives::B256::repeat_byte(0x0A),
+        first_seq: 0,
+        messages: (0..n)
+            .map(|seq| XChainMessage {
+                source_hash: remote_source_hash(origin, seq),
+                seq,
+                origin_sender: Address::repeat_byte(0xA5),
+                target: Address::repeat_byte(0xB6),
+                value: 0,
+                gas_limit: 100_000,
+                input: Default::default(),
+                callback: None,
+            })
+            .collect(),
+    }
+}
+
+/// Feed a marker + its messages + the closing boundary into the channel,
+/// mirroring what the tx_ordering reader dispatches for one record.
+fn send_remote_epoch(
+    tx_r2e: &crossbeam_channel::Sender<ReaderToExec>,
+    record: kardamom_types::xchain::RemoteEpochRecord,
+) {
+    let origin = record.origin_chain_id;
+    let messages = record.messages.clone();
+    tx_r2e
+        .send(ReaderToExec::RemoteEpoch {
+            tx_idx: TxIndex(0),
+            record: Box::new(record),
+            position: pos(0),
+        })
+        .unwrap();
+    for (i, message) in messages.into_iter().enumerate() {
+        tx_r2e
+            .send(ReaderToExec::XChain {
+                tx_idx: TxIndex(1 + i as u64),
+                origin_chain_id: origin,
+                message: Box::new(message),
+                position: pos(1 + i as i32),
+            })
+            .unwrap();
+    }
+}
+
+struct RecordingRemoteObserver(Arc<Mutex<Vec<u64>>>);
+impl crate::reader::RemoteEpochObserver for RecordingRemoteObserver {
+    fn observe(
+        &mut self,
+        rec: &kardamom_types::xchain::RemoteEpochRecord,
+    ) -> Result<(), ExecutorError> {
+        self.0.lock().unwrap().push(rec.origin_chain_id);
+        Ok(())
+    }
+}
+
+/// The marker consumes a slot but applies no tx; each message executes as a
+/// 0x7D receipt keyed by its remote source hash, from the aliased origin
+/// Outbox — and the observer seam fires on the marker, before the messages.
+#[test]
+fn remote_epoch_messages_execute_as_0x7d_receipts() {
+    use kardamom_types::xchain;
+
+    let origin: u64 = 424_242;
+    let record = remote_epoch_fixture(origin, 2);
+
+    let snap = MockStateDatabase::builder().build();
+    let writer_log = Arc::new(Mutex::new(Vec::new()));
+    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(64);
+
+    send_remote_epoch(&tx_r2e, record);
+    tx_r2e
+        .send(ReaderToExec::Boundary(BlockBoundaryStart {
+            block_number: 1,
+            // Marker + 2 messages = 3 slots consumed.
+            end_tx_idx: pos(3),
+            l2_timestamp: 1_700_000_000,
+            l1_origin: 0,
+        }))
+        .unwrap();
+    drop(tx_r2e);
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let h = spawn_exec(
+        ExecutorConfig::default(),
+        rx_r2e,
+        tx_e2c,
+        StaticSnapshotSource(snap),
+        ImmediateCommit,
+        RecordingQueue(writer_log.clone()),
+        ResumePoint::GENESIS,
+        None,
+        None,
+        None,
+        None::<NoEpochCheck>,
+        Some(Box::new(RecordingRemoteObserver(observed.clone()))),
+    );
+    h.join().expect("no panic").expect("exec ok");
+
+    let mut receipts = Vec::new();
+    while let Ok(m) = rx_e2c.try_recv() {
+        if let ExecToCommit::Receipt(r) = m {
+            receipts.push(r);
+        }
+    }
+    assert_eq!(
+        receipts.len(),
+        2,
+        "marker applies no tx; each message applies one"
+    );
+    for (seq, r) in receipts.iter().enumerate() {
+        assert_eq!(r.tx_type, kardamom_types::TX_TYPE_XCHAIN);
+        assert_eq!(r.tx_hash, xchain::remote_source_hash(origin, seq as u64));
+        assert!(r.status);
+        assert_eq!(r.from, xchain::xchain_tx_sender(origin));
+        assert_eq!(r.to, Some(xchain::INBOX));
+    }
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![origin],
+        "observer fired once, on the marker"
+    );
+    // The block's receipts also persist through the writer, like any tx's.
+    let log = writer_log.lock().unwrap();
+    assert_eq!(log[0].1.receipts.len(), 2);
+}
+
+struct RejectingRemoteObserver;
+impl crate::reader::RemoteEpochObserver for RejectingRemoteObserver {
+    fn observe(
+        &mut self,
+        rec: &kardamom_types::xchain::RemoteEpochRecord,
+    ) -> Result<(), ExecutorError> {
+        Err(ExecutorError::State(format!(
+            "remote epoch rejected (origin {})",
+            rec.origin_chain_id
+        )))
+    }
+}
+
+/// A rejected record fail-stops on the MARKER — before any of its messages
+/// execute — the same posture as a rejected L1 epoch.
+#[test]
+fn rejected_remote_epoch_halts_before_messages_execute() {
+    let record = remote_epoch_fixture(424_242, 2);
+    let snap = MockStateDatabase::builder().build();
+    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(64);
+    send_remote_epoch(&tx_r2e, record);
+    drop(tx_r2e);
+
+    let h = spawn_exec(
+        ExecutorConfig::default(),
+        rx_r2e,
+        tx_e2c,
+        StaticSnapshotSource(snap),
+        ImmediateCommit,
+        RecordingQueue(Arc::new(Mutex::new(Vec::new()))),
+        ResumePoint::GENESIS,
+        None,
+        None,
+        None,
+        None::<NoEpochCheck>,
+        Some(Box::new(RejectingRemoteObserver)),
+    );
+    let res = h.join().expect("no panic");
+    assert!(matches!(res, Err(ExecutorError::State(_))), "got {res:?}");
+    assert!(
+        !rx_e2c
+            .try_iter()
+            .any(|m| matches!(m, ExecToCommit::Receipt(_))),
+        "no message may execute after its record is rejected"
+    );
 }

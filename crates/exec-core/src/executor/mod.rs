@@ -21,6 +21,7 @@
 //! - `scope`: [`ExecScope`] (per-block EVM and cache), and the per-call
 //!   [`execute_tx`] wrapper, including the deterministic invalid-skip path.
 //! - `deposit`: OP-aligned deposit execution.
+//! - `xchain`: cross-chain message delivery execution.
 //! - `write_set`: `WriteSet` extraction from revm state, and BAL recording.
 
 mod db;
@@ -28,11 +29,13 @@ mod deposit;
 mod scope;
 mod tx_env;
 mod write_set;
+mod xchain;
 
 pub use db::{SnapshotDb, SnapshotRef, StateRefError};
 pub use deposit::execute_deposit_tx;
 pub use scope::{Executor, TouchSet, skip_reason_of_tx};
 pub use tx_env::DecodedTx;
+pub use xchain::{XCHAIN_DELIVERY_OVERHEAD, execute_xchain_tx};
 
 #[cfg(test)]
 pub(crate) mod test_support {

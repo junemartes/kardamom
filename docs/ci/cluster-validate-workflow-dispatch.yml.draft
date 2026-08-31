@@ -1,0 +1,24 @@
+# DRAFT — operator action required (the CI bot cannot push
+# .github/workflows/*.yml; see the repo memory note).
+#
+# cluster-validate.yml is the ONLY workflow without `workflow_dispatch`.
+# When GitHub stops delivering `pull_request` events for a branch (the
+# documented failure mode ci.yml's own comment records, hit again on
+# feat/interop-xchain-p1 / PR #219 on 2026-08-16: zero runs registered,
+# close/reopen did not re-deliver, manual dispatch of the other four
+# workflows was the working fallback), cluster-validate has no way to run
+# for that branch at all.
+#
+# Requested change to .github/workflows/cluster-validate.yml — add the
+# dispatch trigger alongside the existing ones:
+#
+#   on:
+#     push:
+#       branches: [main]
+#       paths: [...unchanged...]
+#     pull_request:
+#       paths: [...unchanged...]
+#     workflow_dispatch:        # <-- add this line
+#
+# Nothing else changes; the path filters stay as they are (dispatch is
+# manual and unconditional by design, matching the other four workflows).

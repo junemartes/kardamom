@@ -2,11 +2,14 @@
 
 use kardamom_log::aeron_live::{
     TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
+    TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_sequencer::epoch::EpochSubscriber;
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::TxDataSubscriber;
 use kardamom_sequencer::outbound::TxErrorPublisher;
+use kardamom_sequencer::remote_epoch::RemoteEpochSubscriber;
+use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, EpochRecord, TxDataLoc, TxEnvelope, TxError};
 
 pub struct LiveTxDataSub {
@@ -39,6 +42,22 @@ impl LiveEpochSub {
 
 impl EpochSubscriber for LiveEpochSub {
     fn poll(&mut self) -> Result<Option<(BPosition, EpochRecord)>, SequencerError> {
+        Ok(self.handle.try_recv())
+    }
+}
+
+pub struct LiveRemoteEpochSub {
+    handle: TxRemoteEpochsSubscriberHandle,
+}
+
+impl LiveRemoteEpochSub {
+    pub fn new(handle: TxRemoteEpochsSubscriberHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl RemoteEpochSubscriber for LiveRemoteEpochSub {
+    fn poll(&mut self) -> Result<Option<(BPosition, RemoteEpochRecord)>, SequencerError> {
         Ok(self.handle.try_recv())
     }
 }

@@ -213,6 +213,9 @@ async fn aeron_cluster_starts_and_batcher_round_trips_the_m_plus_one_topology() 
             ResolvedRecord::Tx { position, env, .. } => {
                 batcher.accumulator().observe_tx(env, position);
             }
+            ResolvedRecord::RemoteEpoch { record, .. } => {
+                batcher.accumulator().observe_remote_epoch(record);
+            }
             ResolvedRecord::Boundary { marker, .. } => {
                 let closed = batcher.accumulator().observe_boundary(marker);
                 let pack = pack_blocks(&cfg, std::slice::from_ref(&closed)).expect("pack");
