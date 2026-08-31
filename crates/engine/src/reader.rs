@@ -130,6 +130,11 @@ impl TxOrderingSubscription for Box<dyn TxOrderingSubscription> {
 #[derive(Clone, Default)]
 pub struct JoinBuffer {
     inner: Arc<DashMap<(u8, i32, BPosition), TxEnvelope>>,
+    /// Wakes `take_wait`ers on every insert (push-model-spec, Push-1b).
+    /// One consumer waits for one key at a time; producers notify_all under
+    /// the lock so a waiter that re-checks under the same lock can never
+    /// miss an insert.
+    gate: Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
 }
 
 impl JoinBuffer {
@@ -146,6 +151,42 @@ impl JoinBuffer {
     ) {
         self.inner
             .insert((sequencer_id, session_id, tx_data_position), env);
+        let (lock, cv) = &*self.gate;
+        let _guard = lock.lock().expect("join gate poisoned");
+        cv.notify_all();
+    }
+
+    /// Blocking [`JoinBuffer::take`]: parks on the insert notify until the
+    /// key lands or `timeout` elapses — replaces the former 50µs-per-tx
+    /// spin loop (push-model-spec, Push-1b).
+    pub fn take_wait(
+        &self,
+        sequencer_id: u8,
+        session_id: i32,
+        tx_data_position: BPosition,
+        timeout: Duration,
+    ) -> Option<TxEnvelope> {
+        if let Some(env) = self.take(sequencer_id, session_id, tx_data_position) {
+            return Some(env);
+        }
+        let deadline = Instant::now() + timeout;
+        let (lock, cv) = &*self.gate;
+        let mut guard = lock.lock().expect("join gate poisoned");
+        loop {
+            // Re-check UNDER the lock: an insert+notify that raced the miss
+            // above is observed here, before parking.
+            if let Some(env) = self.take(sequencer_id, session_id, tx_data_position) {
+                return Some(env);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (g, _timeout_result) = cv
+                .wait_timeout(guard, deadline - now)
+                .expect("join gate poisoned");
+            guard = g;
+        }
     }
 
     /// Remove and return the envelope at
@@ -236,10 +277,6 @@ pub struct ReaderConfig {
     /// inside the join budget. Further attempts repeat on the same cadence
     /// until `join_timeout` expires.
     pub join_refetch_after: Duration,
-    /// Polling interval used during the join wait. A smaller value recovers
-    /// from lag faster, but uses more CPU. A larger value does the opposite.
-    /// 50 µs is well below the 100 ms ceiling.
-    pub join_poll_interval: Duration,
     /// Soft warn threshold on the join buffer's size. Emits a `warn!` log when
     /// crossed. This applies no back-pressure; that is the publisher's job.
     pub buffer_warn_threshold: usize,
@@ -257,7 +294,6 @@ impl Default for ReaderConfig {
         Self {
             join_timeout: Duration::from_millis(100),
             join_refetch_after: Duration::from_secs(10),
-            join_poll_interval: Duration::from_micros(50),
             buffer_warn_threshold: 10_000,
             dedup_window: 1 << 20,
         }
@@ -636,14 +672,7 @@ fn join_envelope(
         Some(_) => cfg.join_refetch_after.min(cfg.join_timeout),
         None => cfg.join_timeout,
     };
-    if let Some(env) = wait_for_envelope(
-        buffer,
-        shard,
-        session,
-        pos,
-        first_slice,
-        cfg.join_poll_interval,
-    ) {
+    if let Some(env) = wait_for_envelope(buffer, shard, session, pos, first_slice) {
         return Some(env);
     }
     loop {
@@ -685,38 +714,24 @@ fn join_envelope(
         if slice.is_zero() {
             return buffer.take(shard, session, pos);
         }
-        if let Some(env) =
-            wait_for_envelope(buffer, shard, session, pos, slice, cfg.join_poll_interval)
-        {
+        if let Some(env) = wait_for_envelope(buffer, shard, session, pos, slice) {
             return Some(env);
         }
     }
 }
 
-/// Spin until the tx_data envelope, keyed by
+/// Park until the tx_data envelope, keyed by
 /// `(sequencer_id, session_id, tx_data_position)`, lands on the
-/// [`JoinBuffer`], or the timeout elapses.
+/// [`JoinBuffer`], or the timeout elapses. The buffer's insert notify wakes
+/// the wait; there is no poll interval.
 fn wait_for_envelope(
     buffer: &JoinBuffer,
     sequencer_id: u8,
     session_id: i32,
     tx_data_position: BPosition,
     timeout: Duration,
-    poll_interval: Duration,
 ) -> Option<TxEnvelope> {
-    if let Some(env) = buffer.take(sequencer_id, session_id, tx_data_position) {
-        return Some(env);
-    }
-    let deadline = Instant::now() + timeout;
-    loop {
-        thread::sleep(poll_interval);
-        if let Some(env) = buffer.take(sequencer_id, session_id, tx_data_position) {
-            return Some(env);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-    }
+    buffer.take_wait(sequencer_id, session_id, tx_data_position, timeout)
 }
 
 #[cfg(test)]
@@ -1014,7 +1029,6 @@ mod tests {
         // Configure a generous timeout so the test passes even on slow CI.
         let cfg = ReaderConfig {
             join_timeout: Duration::from_millis(500),
-            join_poll_interval: Duration::from_micros(100),
             ..ReaderConfig::default()
         };
 
@@ -1056,7 +1070,6 @@ mod tests {
         let buf = JoinBuffer::new();
         let cfg = ReaderConfig {
             join_timeout: Duration::from_millis(50),
-            join_poll_interval: Duration::from_millis(5),
             ..ReaderConfig::default()
         };
         let b = VecTxOrderingSub {
