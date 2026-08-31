@@ -22,6 +22,7 @@ pub mod rpc_vectors;
 pub mod upgrade;
 pub mod xchain;
 pub mod xchain_da_parity;
+pub mod xchain_two_stacks;
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -101,6 +102,44 @@ impl Target {
             sum += s.value(name).unwrap_or(0.0);
         }
         Ok(sum)
+    }
+
+    /// The validator's verdict on the run so far — the interop scenarios'
+    /// LOAD-BEARING assertion (S12/S14): the validator must have COMMITTED
+    /// past the executor's current durable head (so the whole-block path
+    /// actually executed the interop blocks instead of fail-stopping — a
+    /// dead validator times out here with its metrics port refusing), it
+    /// must have VERIFIED blocks (non-vacuity), and it must have proven no
+    /// divergence.
+    pub async fn assert_validator_verdict(&self, what: &str) -> Result<()> {
+        let addr = self
+            .validator_metrics
+            .context("target has no validator (StackConfig::validator)")?;
+        let target_block = self.executor_metric(EXEC_BLOCK_NUMBER).await?;
+        metrics::poll_until(
+            &format!("{what}: validator committed >= {target_block}"),
+            Duration::from_secs(90),
+            Duration::from_millis(250),
+            || async {
+                let s = metrics::scrape(addr).await?;
+                let committed = s.value(VALIDATOR_COMMITTED_BLOCK).unwrap_or(0.0);
+                Ok((committed >= target_block).then_some(committed))
+            },
+        )
+        .await?;
+        let s = metrics::scrape(addr).await?;
+        // Counters only materialise on first increment: absent == 0.
+        let divergence = s.value(VALIDATOR_DIVERGENCE).unwrap_or(0.0);
+        anyhow::ensure!(
+            divergence == 0.0,
+            "{what}: validator recorded {divergence} divergence(s)"
+        );
+        let verified = s.value(VALIDATOR_BLOCKS_VERIFIED).unwrap_or(0.0);
+        anyhow::ensure!(
+            verified > 0.0,
+            "{what}: validator verified no blocks — its verdict is vacuous"
+        );
+        Ok(())
     }
 
     /// Wait until the executor's applied-tx counter reaches `at_least`.

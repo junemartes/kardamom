@@ -132,6 +132,7 @@ impl Executor {
             footprint_shadow,
             block_exec,
             epoch_observer,
+            remote_epoch_observer,
         } = hooks;
         // No role supplies a remote epoch check yet. The seam stays on
         // `spawn_exec` until the destination-validator verifier lands.

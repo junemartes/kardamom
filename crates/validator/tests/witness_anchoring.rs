@@ -261,6 +261,12 @@ fn capture_anchor_guest_and_live_trie_agree() {
                         deposit: deposit.clone(),
                         position: *position,
                     },
+                    // Cross-chain (0x7D) deliveries have no prover-wire
+                    // shape yet (see `wire_records` in `prover.rs`). This
+                    // fixture's block never carries one.
+                    BufferedRecord::XChain { .. } => {
+                        panic!("prover fixture export does not support xchain records yet")
+                    }
                 })
                 .collect(),
             bal_rlp: bal_rlp.into(),
