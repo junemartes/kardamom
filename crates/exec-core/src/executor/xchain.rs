@@ -21,7 +21,7 @@ use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
 
 use super::db::{SnapshotRef, seed_cache_layer};
-use super::write_set::write_set_from_cache;
+use super::write_set::{retain_changed, write_set_from_cache};
 
 /// Extra gas for a cross-chain delivery, on top of the inner-call budget.
 ///
@@ -128,6 +128,10 @@ pub fn execute_xchain_tx<S: StateDatabase>(
     };
 
     let ws = write_set_from_cache(&cache.cache);
+    // Same discipline as deposits: only true changes survive, so this
+    // capture is a pure function of execution, not of what the pipelined
+    // commit happened to leave in the seeded layers.
+    let ws = retain_changed(ws, snapshot, parent, delta, tx_idx)?;
     if let Some((bal, bal_index)) = bal {
         ws.record_into_bal(bal, bal_index);
     }

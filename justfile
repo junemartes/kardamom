@@ -290,7 +290,13 @@ test-e2e-local: aeron-jar cluster-jar
         -p kardamom-validator -p kardamom-state -p kardamom-da-watcher \
         -p kardamom-reconstruct
     cargo test -p e2e --features full-pipeline-e2e --test chain_semantics \
-        --locked -- --ignored --nocapture --test-threads=2
+        --locked -- --ignored --nocapture --test-threads=2 --skip s14_
+    # S14 runs TWO full stacks (4 JVMs + 10 service processes) — the
+    # heaviest scenario by far. Serialized after the rest so its load never
+    # shares the host with another stack's timing-sensitive assertions
+    # (S10d's origin-freeze drain in particular).
+    cargo test -p e2e --features full-pipeline-e2e --test chain_semantics \
+        --locked s14_ -- --ignored --nocapture --test-threads=1
 
 # ---------------------------------------------------------------------------
 # Multi-node cluster (deploy/cluster) — HOST dependencies.

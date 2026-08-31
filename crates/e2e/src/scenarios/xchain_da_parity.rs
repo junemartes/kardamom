@@ -230,6 +230,20 @@ pub fn executor_state_root(state_dir: &Path) -> Result<B256> {
     kardamom_state::bootstrap_trie_from_state(&env).context("root the executor's flat state")
 }
 
+/// Table-by-table first-diffs between two stopped state DBs
+/// ([`kardamom_state::deep_compare`]) — the forensic dump the root-parity
+/// failure path prints, so a mismatch in CI names rows instead of two
+/// opaque hashes.
+pub fn state_diff(a_dir: &Path, b_dir: &Path) -> Result<Vec<String>> {
+    let a = kardamom_state::StateEnvBuilder::new(a_dir)
+        .open()
+        .context("open state dir a")?;
+    let b = kardamom_state::StateEnvBuilder::new(b_dir)
+        .open()
+        .context("open state dir b")?;
+    kardamom_state::deep_compare(&a, &b).context("deep_compare")
+}
+
 /// Beyond the root gate: the rebuilt DB must reproduce the interop SUBSTANCE
 /// byte-for-byte against the live executor's DB — Inbox lane state, the
 /// receiver's stored calldata word, and the 0x7D receipts (keyed by

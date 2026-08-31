@@ -10,8 +10,13 @@ use revm::state::Bytecode;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::format;
 
-use crate::delta::WriteSet;
+use kardamom_types::StateDatabase;
+
+use crate::delta::{PendingDelta, WriteSet};
+use crate::error::ExecutorError;
+use crate::exec_types::TxIndex;
 
 /// Record a deposit's `WriteSet` into the block BAL as writes. The
 /// commit-cache shape used to build a deposit's `WriteSet` loses original
@@ -43,29 +48,51 @@ impl WriteSet {
         write_set_from_evm_state_inner(state)
     }
 
-    /// [`Self::from_evm_state`], with deposit artifact fidelity: every
-    /// accessed slot of a touched account is emitted, read-only slots
-    /// included, at the present value. The historic deposit path derived
-    /// its WriteSet from a fresh `CacheDB` (which caches reads), so the
-    /// wire artifact — `write_set_hash`, and the BAL claims built from it
-    /// — includes read slots. The on-scope deposit path must keep that
-    /// artifact byte-identical; the old-vs-new equivalence test in
-    /// `deposit.rs` is the gate.
+    /// [`Self::from_evm_state`], for a deposit or a cross-chain delivery
+    /// (a 0x7D message). These are commit-cache style records: fee-free,
+    /// with the nonce check off, and their artifact must stay
+    /// byte-identical to the historic free-function path
+    /// (`execute_deposit_tx`, `execute_xchain_tx`) — the equivalence test
+    /// in `deposit.rs` is the gate.
+    ///
+    /// Two extra rules on top of [`Self::from_evm_state`]:
+    ///
+    /// - An account entry survives only when it truly changed: compare
+    ///   `info` against `original_info`, revm's per-transaction pre-load
+    ///   snapshot (normalized so kardamom's `B256::ZERO` empty-code
+    ///   sentinel compares equal to revm's `KECCAK_EMPTY`). This drops
+    ///   noise from an account merely touched into existence with
+    ///   nothing in it (the fee recipient at zero reward, and similar
+    ///   cases) — a value pipelined-commit timing could otherwise leak
+    ///   into the artifact.
+    /// - A called (not created) contract's bytecode is re-added: the
+    ///   historic fresh-cache path always carried it, since a called
+    ///   contract's code lands in the cache on load.
     pub fn from_evm_state_deposit(state: &revm::state::EvmState) -> Self {
+        // Kardamom's empty-code sentinel is `B256::ZERO`; revm's is
+        // `KECCAK_EMPTY`. Normalize so "empty" compares equal on both
+        // sides — `seed_cache_layer` can put kardamom's convention into
+        // the scope's cache.
+        let norm = |h: B256| if h == KECCAK_EMPTY { B256::ZERO } else { h };
+
         let mut ws = write_set_from_evm_state_inner(state);
-        // Re-walk for the artifact parts the per-tx filter drops: read-only
-        // slots, and the code bytes of called contracts. The fresh cache
-        // carried both: reads land in the cache, and a called contract's
-        // bytecode lands in `cache.contracts`.
-        for (addr, account) in state.iter() {
+        ws.accounts.retain(|(addr, (nonce, balance, code_hash))| {
+            let Some(account) = state.get(addr) else {
+                return true;
+            };
+            let original = &account.original_info;
+            *nonce != original.nonce
+                || *balance != original.balance
+                || norm(*code_hash) != norm(original.code_hash)
+        });
+
+        // Re-walk for the artifact part the per-tx filter drops: the code
+        // bytes of a called (not created) contract. The historic
+        // fresh-cache path carried it, since a called contract's
+        // bytecode lands in `cache.contracts` on load.
+        for account in state.values() {
             if !account.is_touched() {
                 continue;
-            }
-            for (key, slot) in account.storage.iter() {
-                if slot.original_value == slot.present_value {
-                    let b_key = alloy_primitives::B256::from(key.to_be_bytes::<32>());
-                    ws.storage.push(((*addr, b_key), slot.present_value));
-                }
             }
             let info = &account.info;
             if !account.is_created()
@@ -193,6 +220,82 @@ pub(super) fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
     }
     ws.finish();
     ws
+}
+
+/// Filter a write set down to values that changed.
+///
+/// [`write_set_from_cache`] copies every touched slot in an account's
+/// cache entry. Some touched slots come from layer seeding
+/// (`seed_cache_layer`), not from this record. The seeded slots differ by
+/// commit timing: an executor with an unsettled previous block seeds
+/// (and so "captures") that block's slots, while a validator that
+/// already settled the block does not. So a deposit or 0x7D claim, and
+/// its `write_set_hash`, can differ between the executor and the
+/// validator for a reason that is not the execution itself.
+///
+/// This compares each entry against the pre-execution view (`snapshot`
+/// composed with `parent` and `delta`) and keeps only real changes. The
+/// result does not depend on which layer held a value. It also drops
+/// touched-but-unchanged noise, such as a fee recipient at zero reward,
+/// on both sides for the same reason.
+pub(super) fn retain_changed<S: StateDatabase>(
+    ws: WriteSet,
+    snapshot: &S,
+    parent: Option<&PendingDelta>,
+    delta: &PendingDelta,
+    idx: TxIndex,
+) -> Result<WriteSet, ExecutorError> {
+    // Kardamom's empty-code sentinel is `B256::ZERO`; revm's is
+    // `KECCAK_EMPTY`. Normalize so "empty" compares equal on both sides.
+    let norm = |h: B256| if h == KECCAK_EMPTY { B256::ZERO } else { h };
+    let state_err = |detail: alloc::string::String| ExecutorError::Execution { idx, detail };
+
+    let mut out = WriteSet::default();
+    for (addr, triple) in ws.accounts.iter() {
+        let pre = match delta
+            .accounts
+            .get(addr)
+            .or_else(|| parent.and_then(|p| p.accounts.get(addr)))
+        {
+            Some(v) => Some(*v),
+            None => snapshot
+                .basic(*addr)
+                .map_err(|e| state_err(format!("retain basic({addr:?}): {e}")))?,
+        };
+        let changed = match pre {
+            Some((n, b, c)) => triple.0 != n || triple.1 != b || norm(triple.2) != norm(c),
+            // No prior account: keep a real creation, but drop an
+            // account touched into existence with nothing in it (a
+            // beneficiary at zero reward, and similar cases).
+            None => !(triple.0 == 0 && triple.1 == U256::ZERO && norm(triple.2) == B256::ZERO),
+        };
+        if changed {
+            out.accounts.push((*addr, *triple));
+        }
+    }
+    for ((addr, key), value) in ws.storage.iter() {
+        let pre = match delta
+            .storage
+            .get(&(*addr, *key))
+            .or_else(|| parent.and_then(|p| p.storage.get(&(*addr, *key))))
+        {
+            Some(v) => *v,
+            None => snapshot
+                .storage(*addr, *key)
+                .map_err(|e| state_err(format!("retain storage({addr:?}, {key:?}): {e}")))?,
+        };
+        if *value != pre {
+            out.storage.push(((*addr, *key), *value));
+        }
+    }
+    // Code entries carry only bytecode this record created. That is
+    // always a real change, so code passes through unfiltered.
+    out.code = ws.code;
+    // The input is already sorted (`write_set_from_cache` calls
+    // `finish()`). Filtering keeps that order, so no re-sort is needed.
+    // `finish()` still re-checks the order invariant in debug builds.
+    out.finish();
+    Ok(out)
 }
 
 /// Public API: the Block-STM engine (`kardamom-stm`) builds per-tx write

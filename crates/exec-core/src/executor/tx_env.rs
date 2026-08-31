@@ -8,6 +8,7 @@ use alloy_primitives::Bytes as AlloyBytes;
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use kardamom_types::Deposit;
+use kardamom_types::xchain::{self, XChainMessage};
 use revm::context::TxEnv;
 use revm::primitives::TxKind;
 
@@ -117,6 +118,27 @@ pub(super) fn tx_env_from_deposit(dep: &Deposit) -> TxEnv {
         value: dep.value,
         data: AlloyBytes::copy_from_slice(dep.input.as_ref()),
         gas_limit: dep.gas_limit,
+        gas_price: 0,
+        nonce: 0,
+        chain_id: None,
+        ..Default::default()
+    }
+}
+
+/// Build a `TxEnv` for one cross-chain delivery. The call is fee-free
+/// (`gas_price = 0`), carries no nonce, and its caller is the aliased
+/// origin Outbox — the only address `Inbox.deliver` accepts. `gas_limit`
+/// adds [`super::xchain::XCHAIN_DELIVERY_OVERHEAD`] on top of the
+/// message's own budget, to also pay for the Inbox's own bookkeeping.
+pub(super) fn tx_env_from_xchain(origin_chain_id: u64, message: &XChainMessage) -> TxEnv {
+    TxEnv {
+        caller: xchain::xchain_tx_sender(origin_chain_id),
+        kind: TxKind::Call(xchain::INBOX),
+        value: alloy_primitives::U256::ZERO,
+        data: AlloyBytes::from(xchain::deliver_calldata(origin_chain_id, message)),
+        gas_limit: message
+            .gas_limit
+            .saturating_add(super::xchain::XCHAIN_DELIVERY_OVERHEAD),
         gas_price: 0,
         nonce: 0,
         chain_id: None,

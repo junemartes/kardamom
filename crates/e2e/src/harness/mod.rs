@@ -50,15 +50,27 @@ pub struct StackConfig {
     /// divergence-detection tests). Off by default: the nonce and RPC
     /// scenarios do not need it, and stacks stay lighter without it.
     pub validator: bool,
+    /// Run the validator with `--parallel-validation` (the DEPLOYED cluster's
+    /// mode: seeded BAL batches on the whole-block path). S12/S14 set it so
+    /// the validator's verdict covers the whole-block 0x7D arm, not just the
+    /// streaming one.
+    pub validator_parallel: bool,
+    /// Run the validator with `--serve-feed` (the egress-E1 public-validator
+    /// role): outbox extraction + the WS feed surfaces. The bound address
+    /// lands in `<root>/validator-feed.addr`; see
+    /// [`LocalStack::validator_feed_url`].
+    pub validator_serve_feed: bool,
     /// Trie shadow-check cadence for the validator. `Some(1)` checks every
     /// block, the semantics-suite default. The cluster runs with 8.
     pub trie_shadow_check: Option<u64>,
-    /// Route the validator's L1 reads through the mock verified endpoint
-    /// (`l1_verified`), the way production routes them through a light
-    /// client. The da-watcher keeps talking to anvil directly. Only the
-    /// verifier's view is interposed, so a fault isolates to verification
-    /// and does not also corrupt the epochs being produced.
-    pub verified_l1: bool,
+    /// The L2 chain id. Defaults to [`DEV_CHAIN_ID`] (what every genesis TOML
+    /// in the repo declares). A DIFFERENT id makes launch materialise a
+    /// patched copy of the genesis into the stack root (same alloc + predeploy
+    /// blobs, overridden `chain_id` line) — the two-stack interop scenario
+    /// needs a distinct chain B without duplicating predeploy bytecode in a
+    /// sibling TOML (the deployer's genesis drift guard stays pointed at the
+    /// canonical files).
+    pub chain_id: u64,
     /// Which L2 genesis to run. Bridge scenarios need
     /// [`Genesis::DevWithdrawals`] for the `L2ToL1MessagePasser` predeploy.
     pub genesis: Genesis,
@@ -73,6 +85,12 @@ pub struct StackConfig {
     /// archive still has them. This costs a recorder-startup barrier at
     /// bring-up, so it is opt-in.
     pub archive_durability: bool,
+    /// Route the validator's L1 reads through the mock verified endpoint
+    /// (`l1_verified`), the way production routes them through a light
+    /// client. The da-watcher keeps talking to anvil directly. Only the
+    /// verifier's view is interposed, so a fault isolates to verification
+    /// and does not also corrupt the epochs being produced.
+    pub verified_l1: bool,
 }
 
 /// The L2 genesis a stack boots from.
@@ -109,7 +127,10 @@ impl Default for StackConfig {
             cluster_tick_ms: 250,
             ingress: IngressOptions::default(),
             validator: false,
+            validator_parallel: false,
+            validator_serve_feed: false,
             trie_shadow_check: Some(1),
+            chain_id: DEV_CHAIN_ID,
             genesis: Genesis::ClusterDev,
             l1: false,
             archive_durability: false,
@@ -168,6 +189,7 @@ fn assemble_spec<'a>(
     driver: &'a MediaDriver,
     sealer: &'a SealerCluster,
     shards: u32,
+    chain_id: u64,
     genesis: &'a Path,
     log_config: Option<&'a Path>,
 ) -> ServiceSpec<'a> {
@@ -176,10 +198,42 @@ fn assemble_spec<'a>(
         aeron_dir: &driver.aeron_dir,
         cluster_ingress_endpoints: &sealer.ingress_endpoints,
         shards,
-        chain_id: DEV_CHAIN_ID,
+        chain_id,
         genesis,
         log_config,
     }
+}
+
+/// Materialise the genesis for `chain_id`: the canonical TOML as-is at the
+/// default id, or a patched copy in the stack root (only the `chain_id` line
+/// rewritten — alloc + predeploy bytecode ride along byte-identical, so the
+/// deployer's drift guard keeps watching the ONE canonical copy).
+fn materialise_genesis(canonical: &Path, chain_id: u64, root: &Path) -> Result<PathBuf> {
+    if chain_id == DEV_CHAIN_ID {
+        return Ok(canonical.to_path_buf());
+    }
+    let src = std::fs::read_to_string(canonical)
+        .with_context(|| format!("read genesis {}", canonical.display()))?;
+    let mut replaced = false;
+    let patched: String = src
+        .lines()
+        .map(|line| {
+            if !replaced && line.trim_start().starts_with("chain_id") {
+                replaced = true;
+                format!("chain_id = {chain_id}\n")
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    anyhow::ensure!(
+        replaced,
+        "genesis {} has no chain_id line to override",
+        canonical.display()
+    );
+    let path = root.join(format!("genesis-chain-{chain_id}.toml"));
+    std::fs::write(&path, patched).context("write patched genesis")?;
+    Ok(path)
 }
 
 impl LocalStack {
@@ -189,7 +243,7 @@ impl LocalStack {
     /// the crate-level anvil tests.
     pub async fn launch_opt(cfg: StackConfig) -> Result<Option<Self>> {
         let l1 = if cfg.l1 {
-            match l1::L1::launch(DEV_CHAIN_ID).await? {
+            match l1::L1::launch(cfg.chain_id).await? {
                 Some(l1) => Some(l1),
                 None => return Ok(None),
             }
@@ -221,6 +275,7 @@ impl LocalStack {
             .tempdir()
             .context("create stack temp root")?;
         eprintln!("stack root: {}", root.path().display());
+        let genesis = materialise_genesis(&genesis, cfg.chain_id, root.path())?;
 
         // Bring-up follows a dependency order, and each step waits for
         // readiness: driver, then sealer (leader), then sequencers and
@@ -267,6 +322,7 @@ impl LocalStack {
             &driver,
             &sealer,
             cfg.shards,
+            cfg.chain_id,
             &genesis,
             log_config.as_deref(),
         );
@@ -299,11 +355,18 @@ impl LocalStack {
             }),
             _ => wiring.clone(),
         };
+        let feed_addr_file = root.path().join("validator-feed.addr");
         let validator = if cfg.validator {
             Some(services::spawn_validator(
                 &spec,
-                cfg.trie_shadow_check,
-                validator_wiring.as_ref(),
+                &services::ValidatorOptions {
+                    trie_shadow_check: cfg.trie_shadow_check,
+                    attester: validator_wiring.as_ref(),
+                    parallel: cfg.validator_parallel,
+                    serve_feed_addr_file: cfg
+                        .validator_serve_feed
+                        .then_some(feed_addr_file.as_path()),
+                },
             )?)
         } else {
             None
@@ -410,7 +473,7 @@ impl LocalStack {
     pub fn target(&self, rpc_timeout: Duration) -> Result<Target> {
         Ok(Target {
             rpc: l2::L2Client::new(&self.ingress.rpc_url, rpc_timeout)?,
-            chain_id: DEV_CHAIN_ID,
+            chain_id: self.cfg.chain_id,
             pending_receipt_timeout: self.cfg.ingress.pending_receipt_timeout,
             ingress_metrics: self.ingress.metrics_addr,
             executor_metrics: self.executor.metrics_addr,
@@ -498,9 +561,34 @@ impl LocalStack {
             &self.driver,
             &self.sealer,
             self.cfg.shards,
+            self.cfg.chain_id,
             &self.genesis,
             self.log_config.as_deref(),
         )
+    }
+
+    /// The WS URL of this stack's validator feed
+    /// (`StackConfig::validator_serve_feed`), polled from the addr file the
+    /// binary writes once its server is bound (port 0 at spawn, so the real
+    /// port is only known to the process).
+    pub async fn validator_feed_url(&self) -> Result<String> {
+        let path = self.root.path().join("validator-feed.addr");
+        metrics::poll_until(
+            "validator feed addr file",
+            Duration::from_secs(30),
+            Duration::from_millis(200),
+            || {
+                let path = path.clone();
+                async move {
+                    Ok(std::fs::read_to_string(&path)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()))
+                }
+            },
+        )
+        .await
+        .map(|addr| format!("ws://{addr}"))
     }
 
     /// Restart the executor against the same state directory and metrics

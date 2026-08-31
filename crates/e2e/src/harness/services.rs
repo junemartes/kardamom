@@ -326,14 +326,22 @@ pub fn spawn_executor_at(
     })
 }
 
-/// Spawn `kardamom-validator` with its own state directory, and the trie
-/// shadow-check at the given cadence (`Some(1)` checks every block, the
-/// semantics-suite default; the production cluster runs 8).
-pub fn spawn_validator(
-    spec: &ServiceSpec<'_>,
-    trie_shadow_check: Option<u64>,
-    attester: Option<&L1Wiring>,
-) -> Result<Spawned> {
+/// Validator spawn knobs beyond the shared [`ServiceSpec`].
+pub struct ValidatorOptions<'a> {
+    /// Trie shadow-check cadence. `Some(1)` checks every block, the
+    /// semantics-suite default. The production cluster runs 8.
+    pub trie_shadow_check: Option<u64>,
+    /// L1 output attestation + epoch verification wiring.
+    pub attester: Option<&'a L1Wiring>,
+    /// `--parallel-validation` (the deployed cluster's mode).
+    pub parallel: bool,
+    /// `Some(path)` enables the egress-E1 serving role: `--serve-feed
+    /// 127.0.0.1:0` with the bound address written to `path`.
+    pub serve_feed_addr_file: Option<&'a Path>,
+}
+
+/// Spawn `kardamom-validator` with its own state directory.
+pub fn spawn_validator(spec: &ServiceSpec<'_>, opts: &ValidatorOptions<'_>) -> Result<Spawned> {
     let cfg_path = spec.root.join("validator.toml");
     std::fs::write(&cfg_path, cluster_toml(spec.cluster_ingress_endpoints))?;
     let state_dir = spec.root.join("validator-state");
@@ -359,14 +367,24 @@ pub fn spawn_validator(
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", "e2e-validator"]);
     with_log_config(&mut cmd, spec);
-    if let Some(n) = trie_shadow_check {
+    if let Some(n) = opts.trie_shadow_check {
         cmd.args(["--trie-shadow-check", &n.to_string()]);
+    }
+    if opts.parallel {
+        cmd.arg("--parallel-validation");
+    }
+    // The egress-E1 serving role: port 0 (OS-assigned, so concurrent stacks
+    // never collide), real address discovered through the addr file.
+    if let Some(addr_file) = opts.serve_feed_addr_file {
+        cmd.args(["--serve-feed", "127.0.0.1:0"])
+            .arg("--serve-feed-addr-file")
+            .arg(addr_file);
     }
     // L1 output attestation needs all three flags together, or none of
     // them (the binary rejects a partial set). `--attester-post-interval
     // 1` posts an output per block, so a withdrawal becomes finalizable
     // promptly.
-    if let Some(l1) = attester {
+    if let Some(l1) = opts.attester {
         cmd.args(["--l1-rpc-url", &l1.rpc_url])
             .args(["--output-oracle", &l1.oracle])
             .args(["--attester-key", &l1.attester_key])

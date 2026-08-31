@@ -155,6 +155,24 @@ pub struct Args {
 
     #[arg(long, env = "KARDAMOM_ATTESTER_POST_INTERVAL", default_value_t = 1)]
     pub attester_post_interval: u64,
+
+    // --- Interop serving surfaces (the outbox and attestation feeds) -----
+    /// Enable the interop feed server on this address (`host:port`; port 0
+    /// picks one). Off by default. When set, the validator extracts outbox
+    /// messages from its re-executed receipts (cross-checked against BAL
+    /// claims) and serves `kardamom_subscribeOutbox` +
+    /// `kardamom_subscribeAttestations` over WS — the public-validator role.
+    #[arg(long, env = "KARDAMOM_SERVE_FEED")]
+    pub serve_feed: Option<std::net::SocketAddr>,
+    /// How many blocks of outbox messages / attestations the feed retains.
+    /// A subscriber whose cursor falls below the window is told `Lagged`;
+    /// deeper backfill is a v2 concern (the data is in DA).
+    #[arg(long, env = "KARDAMOM_FEED_RETENTION_BLOCKS", default_value_t = 1024)]
+    pub feed_retention_blocks: u64,
+    /// File the feed server's actually-bound address is written to
+    /// (`host:port` + newline), for harnesses that pass port 0.
+    #[arg(long, env = "KARDAMOM_SERVE_FEED_ADDR_FILE")]
+    pub serve_feed_addr_file: Option<PathBuf>,
 }
 
 /// Resolve the attester key flag: raw hex, or `env:VAR`, the deployer's

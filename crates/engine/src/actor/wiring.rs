@@ -131,6 +131,10 @@ pub struct RoleHooks<W: EngineWiring> {
     /// Epoch check, run before an epoch's deposits apply. `None` trusts the
     /// ordered stream.
     pub epoch_observer: Option<W::Epoch>,
+    /// Remote-epoch check (interop), run before a `RemoteEpochRecord`'s
+    /// messages apply. `None` trusts the pair's origin sequence as sent.
+    /// Wired by the destination validator only.
+    pub remote_epoch_observer: Option<Box<dyn crate::reader::RemoteEpochObserver>>,
 }
 
 impl<W: EngineWiring> RoleHooks<W> {
@@ -142,6 +146,7 @@ impl<W: EngineWiring> RoleHooks<W> {
             footprint_shadow: None,
             block_exec: None,
             epoch_observer: None,
+            remote_epoch_observer: None,
         }
     }
 }

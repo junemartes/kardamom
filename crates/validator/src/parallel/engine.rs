@@ -86,11 +86,55 @@ pub fn build_seed<S: StateDatabase>(
     Ok(seed)
 }
 
-// Record dispatch (tx vs. deposit, plus the deposit fold) lives in the
+// Record dispatch (tx vs. deposit vs. cross-chain delivery) lives in the
 // exec core (`stateless::execute_record_in_scope`). The batch path below
 // runs the same dispatch as the sequential driver and the zk guest, so the
 // actor's streaming arms are the only other dispatch left in the tree.
 use kardamom_engine::stateless::execute_record_in_scope;
+
+/// Remove from `computed` the entries `claimed` lacks whose value equals
+/// the latest claimed value strictly before `unit` — that is, entries that
+/// restate the already-established value.
+///
+/// A deposit or cross-chain delivery is a commit-cache style record: its
+/// `WriteSet` runs through `record_writeset_into_bal`, which fabricates an
+/// "original" value to force write classification, so the batch's fresh
+/// `Bal` claims it unconditionally, even when the value did not change
+/// (the fee recipient at its unchanged balance, for example). The
+/// executor's whole-block `Bal` only claims a write when the value
+/// changed versus the last recorded write, so it dedups this same case
+/// away. Comparing the two Bal shapes directly then reports a false
+/// divergence: the batch claims a write the block-level Bal never made.
+///
+/// Equality with the prior claim is exactly the dedup condition the block
+/// capture applied, so dropping these entries here is lossless: a
+/// genuinely different value still diverges, and the reverse direction
+/// (claimed but not recomputed) stays strict, since both sides dedup
+/// against the same last-recorded value.
+fn drop_wire_deduped(
+    computed: &mut super::claims::ClaimSlice,
+    claimed: &super::claims::ClaimSlice,
+    claims: &ClaimIndex,
+    unit: u64,
+) {
+    computed.storage.retain(|(addr, slot), v| {
+        claimed.storage.contains_key(&(*addr, *slot))
+            || claims.storage_seed(*addr, *slot, unit) != Some(*v)
+    });
+    computed.balance.retain(|addr, v| {
+        claimed.balance.contains_key(addr) || claims.balance_seed(*addr, unit) != Some(*v)
+    });
+    computed.nonce.retain(|addr, v| {
+        claimed.nonce.contains_key(addr) || claims.nonce_seed(*addr, unit) != Some(*v)
+    });
+    computed.code.retain(|addr, h| {
+        claimed.code.contains_key(addr)
+            || claims
+                .code_seed(*addr, unit)
+                .map(alloy_primitives::keccak256)
+                != Some(*h)
+    });
+}
 
 /// Execute one batch sequentially over `snapshot` and `seed`. `first_index`
 /// is the batch's first bal index (1-based). Receipts carry local
@@ -152,7 +196,8 @@ pub fn execute_batch<S: StateDatabase>(
     if granularity <= 1 {
         for unit in first_index..=last_index {
             let claimed = claims.claims_in_range(unit, unit);
-            let computed = computed_idx.claims_in_range(unit, unit);
+            let mut computed = computed_idx.claims_in_range(unit, unit);
+            drop_wire_deduped(&mut computed, &claimed, claims, unit);
             if claimed != computed {
                 return Err(ExecutorError::Divergence(format!(
                     "tx {unit}: {}",
@@ -163,7 +208,8 @@ pub fn execute_batch<S: StateDatabase>(
     } else {
         let chunk = kardamom_engine::bal_ladder::chunk_of(first_index, k);
         let claimed = claims.claims_in_range(chunk, chunk);
-        let computed = computed_idx.claims_in_range(chunk, chunk);
+        let mut computed = computed_idx.claims_in_range(chunk, chunk);
+        drop_wire_deduped(&mut computed, &claimed, claims, chunk);
         if claimed != computed {
             return Err(ExecutorError::Divergence(format!(
                 "chunk {chunk} (txs {first_index}..={last_index}): {}",

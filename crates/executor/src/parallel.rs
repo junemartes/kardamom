@@ -139,7 +139,7 @@ fn pool_server<S: StateDatabase + Clone + Sync + 'static>(
     tracing::info!("stm pool server stopped");
 }
 
-/// A block's records split at deposit positions.
+/// A block's records split at deposit and cross-chain-delivery positions.
 enum Segment {
     /// Consecutive transactions, starting at block-global record index
     /// `start` (0-based).
@@ -151,8 +151,10 @@ enum Segment {
             kardamom_types::TxEnvelope,
         )>,
     },
-    /// One deposit at block-global record index `at`.
-    Deposit { at: u64, rec: BufferedRecord },
+    /// One deposit or cross-chain delivery at block-global record index
+    /// `at`. Both are non-Tx records the STM engine does not execute;
+    /// they run serially through the same shared scope arm.
+    Singleton { at: u64, rec: BufferedRecord },
 }
 
 fn segment(records: &[BufferedRecord]) -> Vec<Segment> {
@@ -170,10 +172,12 @@ fn segment(records: &[BufferedRecord]) -> Vec<Segment> {
                     txs: vec![(*tx_idx, *position, envelope.clone())],
                 }),
             },
-            BufferedRecord::Deposit { .. } => segs.push(Segment::Deposit {
-                at: i as u64,
-                rec: rec.clone(),
-            }),
+            BufferedRecord::Deposit { .. } | BufferedRecord::XChain { .. } => {
+                segs.push(Segment::Singleton {
+                    at: i as u64,
+                    rec: rec.clone(),
+                })
+            }
         }
     }
     segs
@@ -255,11 +259,11 @@ fn run_one<S: StateDatabase + Clone + Sync + 'static>(
                 frags.push(out.bal.expect("capture session returns a BAL"));
                 seg_layers.push(std::sync::Arc::new(out.delta));
             }
-            Segment::Deposit { at, rec } => {
-                // The streaming deposit path, unchanged: execute outside
-                // the scope against the snapshot layered with the parent
-                // and prior segments, and capture at the block-global
-                // index.
+            Segment::Singleton { at, rec } => {
+                // The streaming deposit/cross-chain path, unchanged:
+                // execute outside the scope against the snapshot layered
+                // with the parent and prior segments, and capture at the
+                // block-global index.
                 let merged = seg_layers.iter().fold(
                     req.parent.clone().unwrap_or_default(),
                     |mut merged, l| {

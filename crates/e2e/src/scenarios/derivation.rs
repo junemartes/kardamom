@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use super::{Target, assert_receipt_ok, await_l2_receipt, open_state_ro, receipt_placement};
 use crate::harness::l1::L1;
 use crate::harness::l2;
+use crate::harness::metrics::poll_until;
 
 /// One block's header as the chain recorded it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,12 +386,22 @@ pub async fn every_l1_deposit_appears_exactly_once(
     l1: &L1,
     state_dir: &Path,
 ) -> Result<()> {
-    let blocks = read_block_origins(state_dir)?;
-    let highest_origin = blocks
-        .last()
-        .map(|b| b.l1_origin)
-        .context("no blocks produced")?;
-    anyhow::ensure!(highest_origin > 0, "the chain never adopted an L1 origin");
+    // POLLED, not one-shot: on a fresh stack the first epoch has to travel
+    // watcher → sealer → executor → durable header before an origin is
+    // observable at all; a single read raced that bring-up on cold CI
+    // runners ("the chain never adopted an L1 origin").
+    let highest_origin = poll_until(
+        "the chain to adopt an L1 origin (first epoch durable)",
+        Duration::from_secs(60),
+        Duration::from_millis(250),
+        || async {
+            Ok(read_block_origins(state_dir)?
+                .last()
+                .map(|b| b.l1_origin)
+                .filter(|o| *o > 0))
+        },
+    )
+    .await?;
 
     // Everything L1 recorded up to the origin the chain has actually reached.
     let logs = l1
