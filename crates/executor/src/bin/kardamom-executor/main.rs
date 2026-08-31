@@ -252,6 +252,9 @@ async fn main() -> Result<()> {
                 // (phase 2 would give it its own L1 dependency).
                 block_exec,
                 epoch_observer: None,
+                // No remote-epoch check either: that seam is wired by the
+                // destination validator only.
+                remote_epoch_observer: None,
             },
         )
     });

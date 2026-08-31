@@ -22,6 +22,7 @@
 //! - The witness itself is unanchored until phase 3b (MPT proofs against
 //!   `pre_state_root`).
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
 
@@ -50,6 +51,18 @@ pub enum BufferedRecord {
     Deposit {
         tx_idx: TxIndex,
         deposit: kardamom_types::Deposit,
+        position: BPosition,
+    },
+    /// One derived cross-chain message (a 0x7D delivery). `origin_chain_id`
+    /// travels with the message: execution aliases the sender and
+    /// authenticates the Inbox call per origin, and the message itself
+    /// does not repeat the pair identity. Boxed like the reader's own
+    /// XChain arm, so this rare interop variant does not grow the enum on
+    /// every Tx clone.
+    XChain {
+        tx_idx: TxIndex,
+        origin_chain_id: u64,
+        message: Box<kardamom_types::xchain::XChainMessage>,
         position: BPosition,
     },
 }
@@ -186,6 +199,20 @@ pub fn execute_record_in_scope<S: StateDatabase>(
             deposit,
             position,
         } => scope.execute_deposit(*tx_idx, *position, deposit, idx_in_block, cumulative, bal),
+        BufferedRecord::XChain {
+            tx_idx,
+            origin_chain_id,
+            message,
+            position,
+        } => scope.execute_xchain(
+            *tx_idx,
+            *position,
+            *origin_chain_id,
+            message,
+            idx_in_block,
+            cumulative,
+            bal,
+        ),
     }
 }
 
@@ -240,8 +267,8 @@ pub fn execute_block_stateless(
         if let BufferedRecord::Tx { envelope, .. } = rec {
             verify_record_identity(envelope)?;
         }
-        // Deposits: identity stays a trusted input until the witness is
-        // L1-anchored. See the module docs.
+        // Deposits and cross-chain messages: identity stays a trusted
+        // input until the witness is L1-anchored. See the module docs.
     }
     let db = WitnessDb::from_witness(witness);
     let (out, raw_bal) = execute_block_with_bal(&db, parent, records, env)?;

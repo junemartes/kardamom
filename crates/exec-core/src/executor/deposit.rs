@@ -20,7 +20,7 @@ use crate::exec_types::TxIndex;
 
 use super::db::{SnapshotRef, seed_cache_layer};
 use super::tx_env::tx_env_from_deposit;
-use super::write_set::write_set_from_cache;
+use super::write_set::{retain_changed, write_set_from_cache};
 
 /// Execute one [`kardamom_types::Deposit`] against a snapshot and the
 /// current `PendingDelta`. Returns the receipt, plus a fresh per-tx
@@ -125,8 +125,11 @@ pub fn execute_deposit_tx<S: StateDatabase>(
     };
 
     // Build the write set from revm's final-state cache. Both the mint
-    // pre-credit and any inner-call writes add touched accounts.
+    // pre-credit and any inner-call writes add touched accounts. Layer-
+    // seeded entries this deposit did not change are then filtered out
+    // (see `retain_changed`); capture must not depend on commit timing.
     let ws = write_set_from_cache(&cache.cache);
+    let ws = retain_changed(ws, snapshot, parent, delta, tx_idx)?;
     if let Some((bal, bal_index)) = bal {
         ws.record_into_bal(bal, bal_index);
     }

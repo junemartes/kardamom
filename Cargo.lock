@@ -3805,6 +3805,7 @@ dependencies = [
  "bytes",
  "clap",
  "jsonrpsee",
+ "kardamom-interop-feed",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-types",
@@ -3993,6 +3994,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-interop-feed"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "jsonrpsee",
+ "kardamom-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kardamom-log"
 version = "0.1.0"
 dependencies = [
@@ -4166,9 +4179,11 @@ dependencies = [
  "bytes",
  "clap",
  "crossbeam-channel",
+ "jsonrpsee",
  "kardamom-da-watcher",
  "kardamom-deployer",
  "kardamom-engine",
+ "kardamom-interop-feed",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-state",

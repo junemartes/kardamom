@@ -9,6 +9,14 @@
 /// watcher process (nonzero exit, nothing skipped) while the chain keeps
 /// sealing. No anvil needed: the origin chain is the mock feed, and the
 /// stack's L1 path is simply absent.
+///
+/// The stack ALSO runs a validator in the DEPLOYED configuration
+/// (`--parallel-validation`), and its verdict is load-bearing: before this
+/// slice, the whole-block path had no `BufferedRecord::XChain` arm and a
+/// validator here would have fail-stopped on the first delivery — which S12
+/// never noticed, because its stack ran no validator at all. Now every
+/// interop block must clear the seeded-parallel claim checks and the
+/// write-set/receipt cross-checks, divergence-free.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s12_xchain_delivery() {
@@ -17,6 +25,8 @@ async fn s12_xchain_delivery() {
 
     let stack = LocalStack::launch(StackConfig {
         genesis: e2e::harness::Genesis::DevInterop,
+        validator: true,
+        validator_parallel: true,
         ..StackConfig::default()
     })
     .await
@@ -38,9 +48,104 @@ async fn s12_xchain_delivery() {
         .await
         .expect("S12 delivery");
 
+    // The validator's verdict on the interop blocks — MUST come before the
+    // gap arm so a whole-block fail-stop is attributed to the deliveries.
+    t.assert_validator_verdict("S12 after delivery")
+        .await
+        .expect("S12 validator verdict");
+
     xchain::gap_halts_pair_not_chain(&t, &feed, &mut watcher, outcome)
         .await
         .expect("S12 gap arm");
+
+    t.assert_validator_verdict("S12 after the gap arm")
+        .await
+        .expect("S12 final validator verdict");
+}
+
+/// S14: TWO real LocalStacks, cross-chain both ways, no mock anywhere — the
+/// egress-E1 acceptance. Chain A (412346) and chain B (412347, patched
+/// genesis) each run the full stack plus a `--parallel-validation
+/// --serve-feed` validator; B's interop watcher subscribes to A's VALIDATOR
+/// feed over real WS (and vice versa for the callback), so the serving
+/// surfaces, the outbox extraction with its BAL cross-check, and the
+/// two-chain round trip A→B→A are all on the line at once.
+///
+/// The harness already namespaces everything two stacks could collide on
+/// (per-test temp roots, OS-assigned ports everywhere, per-stack aeron
+/// dirs); the one genuinely new knob is chain B's id, which materialises a
+/// patched-genesis copy so the predeploy blobs stay single-sourced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "TWO full local stacks; the heaviest scenario — run via `just test-e2e-local` or with --ignored"]
+async fn s14_xchain_two_stacks() {
+    use e2e::scenarios::xchain_two_stacks::{self, CHAIN_B_ID};
+
+    let started = std::time::Instant::now();
+    let interop_stack = |chain_id: u64| StackConfig {
+        genesis: e2e::harness::Genesis::DevInterop,
+        chain_id,
+        validator: true,
+        validator_parallel: true,
+        validator_serve_feed: true,
+        ..StackConfig::default()
+    };
+    // Brought up one after the other: two stacks are 4 JVMs + 10 service
+    // processes, and racing both bring-ups doubles the peak load for no
+    // scenario value.
+    let stack_a = LocalStack::launch(interop_stack(e2e::harness::DEV_CHAIN_ID))
+        .await
+        .expect("stack A");
+    let stack_b = LocalStack::launch(interop_stack(CHAIN_B_ID))
+        .await
+        .expect("stack B");
+    eprintln!("S14: both stacks up in {:?}", started.elapsed());
+
+    let a = target(&stack_a);
+    let b = target(&stack_b);
+    let a_exec_dir = stack_a.executor_state_dir().expect("A executor state dir");
+    let b_exec_dir = stack_b.executor_state_dir().expect("B executor state dir");
+
+    // B's watcher consumes A's VALIDATOR feed — the real serving surface.
+    let a_feed_url = stack_a.validator_feed_url().await.expect("A feed url");
+    let b_cursor = stack_b.root().join("lane-from-a.cursor");
+    let _watcher_on_b = stack_b
+        .spawn_interop_watcher(e2e::harness::DEV_CHAIN_ID, &a_feed_url, &b_cursor)
+        .expect("spawn B's watcher of A");
+
+    // Leg 1: user tx on A -> Outbox -> A validator extract/serve -> B
+    // watcher -> 0x7D delivery on B (receiver storage, Inbox slots, cursor).
+    let outcome = xchain_two_stacks::forward_leg(
+        &a,
+        &b,
+        e2e::harness::DEV_CHAIN_ID,
+        &b_exec_dir,
+        &b_cursor,
+    )
+    .await
+    .expect("S14 forward leg");
+    eprintln!("S14: forward leg done at {:?}", started.elapsed());
+
+    // Leg 2: the callback comes home through B's validator feed.
+    let b_feed_url = stack_b.validator_feed_url().await.expect("B feed url");
+    let a_cursor = stack_a.root().join("lane-from-b.cursor");
+    let _watcher_on_a = stack_a
+        .spawn_interop_watcher(CHAIN_B_ID, &b_feed_url, &a_cursor)
+        .expect("spawn A's watcher of B");
+    xchain_two_stacks::callback_leg(&a, &b, e2e::harness::DEV_CHAIN_ID, &a_exec_dir, &a_cursor, outcome)
+        .await
+        .expect("S14 callback leg");
+    eprintln!("S14: round trip done at {:?}", started.elapsed());
+
+    // Both validators' verdicts: every interop block cleared the whole-block
+    // claim checks and the cross-checks, and the extraction served only
+    // BAL-tied messages — divergence-free on both chains.
+    a.assert_validator_verdict("S14 chain A")
+        .await
+        .expect("S14 A validator verdict");
+    b.assert_validator_verdict("S14 chain B")
+        .await
+        .expect("S14 B validator verdict");
+    eprintln!("S14: total {:?}", started.elapsed());
 }
 
 /// S13: the interop chain rebuilt from its OWN DA (spec §16 Q8). The S12
@@ -82,6 +187,21 @@ async fn s13_xchain_da_parity() {
         .await
         .expect("S13 canonical blocks");
 
+    // The fence's receipt streams at execute time, but its block commits
+    // only at the next sealer tick. Quiescing suspends the sealer, so a
+    // shutdown that wins that 250 ms race leaves the last canonical block
+    // uncommitted, and the DA set can then never match the executor's
+    // state. Wait for the last collected block's header before quiesce.
+    let last_block = canonical
+        .blocks
+        .iter()
+        .map(|b| b.block_number)
+        .max()
+        .expect("canonical set is never empty");
+    e2e::scenarios::derivation::await_block_origins_through(&exec_dir, last_block)
+        .await
+        .expect("S13 last canonical block committed");
+
     // 3. Quiesce: stop the interop watcher, then the stack — the executor
     //    closes its DB cleanly with every executed block durable.
     watcher.proc.kill();
@@ -108,15 +228,45 @@ async fn s13_xchain_da_parity() {
         .expect("S13 L1 batch log");
     let recon_dir = tempfile::tempdir().expect("recon dir");
     let genesis = e2e::harness::services::repo_root().join("chains/dev-interop.toml");
-    da_parity::reconstruct_and_compare(
+    if let Err(e) = da_parity::reconstruct_and_compare(
         &l1.rpc_url(),
         l1.settlement,
         da_dir.path(),
         &genesis,
         recon_dir.path(),
         expected_root,
-    )
-    .expect("S13 DA parity");
+    ) {
+        // FORENSICS before the panic: a root mismatch from two opaque hashes
+        // is undiagnosable once CI drops the temp dirs (this fired ONCE on a
+        // CI runner and never reproduced locally across contention, repeated
+        // runs, and the same block composition). Name the collected set and
+        // the first differing rows table-by-table so the next occurrence is
+        // attributable from the log alone. (headers/receipts rows differ
+        // benignly: replay synthesizes timestamps and carries l1_origin 0 —
+        // the accounts/storage lines are the signal.)
+        eprintln!("S13 collected canonical set:");
+        for b in &canonical.blocks {
+            eprintln!(
+                "  block {}: {} record(s), {} tx(s)",
+                b.block_number,
+                b.remote_epochs.len(),
+                b.txs.len()
+            );
+        }
+        match xchain_da_parity::state_diff(recon_dir.path(), &exec_dir) {
+            Ok(diffs) if diffs.is_empty() => {
+                eprintln!("S13 deep_compare: no table diffs (?)")
+            }
+            Ok(diffs) => {
+                eprintln!("S13 deep_compare (reconstructed vs live executor):");
+                for d in diffs {
+                    eprintln!("  {d}");
+                }
+            }
+            Err(de) => eprintln!("S13 deep_compare failed: {de:#}"),
+        }
+        panic!("S13 DA parity: {e:#}");
+    }
 
     // 6. The rebuilt DB reproduces the interop substance: lane state equal to
     //    the live executor's, receiver calldata intact, 0x7D receipts

@@ -732,6 +732,118 @@ fn remote_epoch_messages_execute_as_0x7d_receipts() {
     assert_eq!(log[0].1.receipts.len(), 2);
 }
 
+/// Whole-block execution (the validator's parallel path) BUFFERS cross-chain
+/// messages like deposits and hands them to the strategy at the boundary —
+/// the slice-2 gap where this arm used to fail-stop the engine. The strategy
+/// here dispatches through `execute_xchain_tx` exactly as the streaming path
+/// does, and the receipts land on the commit channel unchanged.
+#[test]
+fn whole_block_strategy_receives_buffered_xchain_records() {
+    use super::types::{BlockExec, BlockExecOutput, BufferedRecord};
+    use crate::delta::PendingDelta;
+    use crate::executor::execute_xchain_tx;
+    use kardamom_types::xchain;
+
+    let origin: u64 = 424_242;
+    let record = remote_epoch_fixture(origin, 2);
+
+    let snap = MockStateDatabase::builder().build();
+    let writer_log = Arc::new(Mutex::new(Vec::new()));
+    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(64);
+
+    send_remote_epoch(&tx_r2e, record);
+    tx_r2e
+        .send(ReaderToExec::Boundary(BlockBoundaryStart {
+            block_number: 1,
+            end_tx_idx: pos(3), // marker + 2 messages
+            l2_timestamp: 1_700_000_000,
+            l1_origin: 0,
+        }))
+        .unwrap();
+    drop(tx_r2e);
+
+    // A minimal whole-block strategy: record what arrived, execute the
+    // XChain arms sequentially through the shared executor entry point.
+    let seen_kinds = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let seen = seen_kinds.clone();
+    let strategy: BlockExec<MockStateDatabase> =
+        Box::new(move |snapshot, _parent, records, env, _block| {
+            let mut receipts = Vec::new();
+            let mut delta = PendingDelta::new();
+            let mut cumulative = 0u64;
+            for (i, rec) in records.iter().enumerate() {
+                match rec {
+                    BufferedRecord::Tx { .. } => seen.lock().unwrap().push("tx"),
+                    BufferedRecord::Deposit { .. } => seen.lock().unwrap().push("deposit"),
+                    BufferedRecord::XChain {
+                        tx_idx,
+                        origin_chain_id,
+                        message,
+                        position,
+                    } => {
+                        seen.lock().unwrap().push("xchain");
+                        let (r, ws) = execute_xchain_tx(
+                            snapshot,
+                            None,
+                            &delta,
+                            env,
+                            *tx_idx,
+                            *position,
+                            *origin_chain_id,
+                            message,
+                            i as u64,
+                            cumulative,
+                            None,
+                        )?;
+                        cumulative = r.cumulative_gas_used;
+                        delta.apply(ws);
+                        receipts.push(r);
+                    }
+                }
+            }
+            Ok(BlockExecOutput {
+                receipts,
+                delta,
+                bal: None,
+            })
+        });
+
+    let h = spawn_exec(
+        ExecutorConfig::default(),
+        rx_r2e,
+        tx_e2c,
+        StaticSnapshotSource(snap),
+        ImmediateCommit,
+        RecordingQueue(writer_log),
+        ResumePoint::GENESIS,
+        None,
+        None,
+        Some(strategy),
+        None::<NoEpochCheck>,
+        None,
+    );
+    h.join().expect("no panic").expect("exec ok");
+
+    assert_eq!(
+        *seen_kinds.lock().unwrap(),
+        vec!["xchain", "xchain"],
+        "the strategy must receive the buffered 0x7D records (marker excluded)"
+    );
+    let receipts: Vec<_> = rx_e2c
+        .try_iter()
+        .filter_map(|m| match m {
+            ExecToCommit::Receipt(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(receipts.len(), 2);
+    for (seq, r) in receipts.iter().enumerate() {
+        assert_eq!(r.tx_type, kardamom_types::TX_TYPE_XCHAIN);
+        assert_eq!(r.tx_hash, xchain::remote_source_hash(origin, seq as u64));
+    }
+}
+
 struct RejectingRemoteObserver;
 impl crate::reader::RemoteEpochObserver for RejectingRemoteObserver {
     fn observe(
