@@ -72,8 +72,10 @@ pub mod cluster;
 /// available. It returns `Err(ExecutorError::TxDataClosed { sequencer_id })`
 /// when the subscription closes cleanly.
 pub trait TxDataSubscription: Send {
-    /// Sequencer id this subscription is bound to. It keys the join buffer
-    /// and appears in diagnostics.
+    /// The tx_data lane this subscription reads. The value is the lane
+    /// index, `TxRef::shard_id`. It names the archive that holds the
+    /// envelope, not the process that published the ref. It keys the join
+    /// buffer and appears in diagnostics.
     fn sequencer_id(&self) -> u8;
 
     fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError>;
@@ -111,7 +113,8 @@ impl TxOrderingSubscription for Box<dyn TxOrderingSubscription> {
 }
 
 /// Lookup-and-remove join buffer, keyed by
-/// `(sequencer_id, session_id, tx_data_position)`.
+/// `(sequencer_id, session_id, tx_data_position)`. Here `sequencer_id` is
+/// the tx_data lane index (`TxRef::shard_id`), not a publisher identity.
 ///
 /// TxData reader threads insert with [`JoinBuffer::insert`]. The
 /// tx_ordering reader reads with [`JoinBuffer::take`], which removes on a

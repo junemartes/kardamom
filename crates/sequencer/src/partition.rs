@@ -1,22 +1,21 @@
 //! Sender-to-partition routing.
 //!
-//! This algorithm must match `kardamom_ingress::routing::partition_for`
-//! exactly. Take the first 8 bytes of `keccak256(sender.as_slice())` as a
-//! big-endian `u64`, then compute `% m`. The proxy routes by this rule. The
-//! sequencer must agree byte-for-byte, or messages go to the wrong
-//! partition.
+//! The rule lives in `kardamom_types::shard_map`. The ingress uses the
+//! same module (`kardamom_ingress::routing::partition_for`). So the two
+//! sides agree byte for byte by construction. The rule has two levels. The
+//! fixed level is `vslot = keccak256(sender)[..8] % 256`. The dynamic
+//! level is a map from vslot to lane. Today the map is the identity
+//! `lane = vslot % M`, which equals the legacy rule
+//! `keccak256(sender)[..8] % M`. See `docs/specs/dynamic-sequencer-sizing.md`.
 
-use alloy_primitives::{Address, keccak256};
+use alloy_primitives::Address;
 
 /// Compute the partition index for a sender address.
 ///
 /// `m` is the total number of sequencer partitions (must be `>= 1`).
 #[inline]
 pub fn partition_for(sender: Address, m: u32) -> u32 {
-    debug_assert!(m >= 1, "partition count must be >= 1");
-    let h = keccak256(sender.as_slice());
-    let leading = u64::from_be_bytes(h[..8].try_into().expect("8 bytes"));
-    (leading % m as u64) as u32
+    kardamom_types::shard_map::partition_for(sender, m)
 }
 
 #[derive(Debug, thiserror::Error)]

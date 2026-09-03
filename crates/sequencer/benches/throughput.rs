@@ -28,6 +28,10 @@ impl TxDataSubscriber for DequeTxData {
     fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError> {
         Ok(self.0.pop_front())
     }
+
+    fn lane(&self) -> u8 {
+        0
+    }
 }
 
 fn signer(seed: u64) -> PrivateKeySigner {
