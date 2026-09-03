@@ -241,7 +241,18 @@ public final class ClusterNode {
             // about 20 seconds slower, missing the 60-second pipeline
             // progress SLO on leader-kill recovery, while the "leader
             // heartbeat timeout" warnings it aimed to silence were harmless.
-            .replicationChannel("aeron:udp?endpoint=" + me[3]);
+            //
+            // The replication channel must not share a port with the
+            // catch-up endpoint (me[3]). During an election, log
+            // replication opens a plain receive socket on this channel.
+            // Catch-up then adds the catch-up endpoint as a multi-destination
+            // subscription, which binds its own socket. Two sockets on one
+            // port fail with "Address already in use" when the replication
+            // socket has not closed yet. The election then waits forever in
+            // Election.init for local sockets to close, and the member stays
+            // INACTIVE while it reports healthy. Use an OS-assigned port,
+            // the same as the archive's replication channel.
+            .replicationChannel("aeron:udp?endpoint=" + me[0].split(":")[0] + ":0");
 
         // Log self-termination to stdout. Aeron's default termination hook
         // signals the shutdown barrier, and the JVM exits with code 0 and
