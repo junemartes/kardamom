@@ -123,6 +123,33 @@ fn run_egress_watermark_feed(
                     }
                     continue;
                 }
+                // The sealer rejected a remote-origin record this
+                // sequencer relayed (audit H2/H9). The record is the
+                // watcher's, and the watcher reconciles its cursor
+                // with the destination at startup, so this is
+                // informational here: log loudly and count it.
+                if frame.first() == Some(&wire::EGRESS_KIND_REMOTE_ORIGIN_REJECT) {
+                    if let Ok(EgressItem::RemoteOriginReject {
+                        origin_chain_id,
+                        first_seq,
+                        expected_next_seq,
+                        reason,
+                    }) = decode_egress(&frame)
+                    {
+                        let reason = wire::remote_origin_reject_reason(reason);
+                        tracing::error!(
+                            partition,
+                            origin = origin_chain_id,
+                            first_seq,
+                            expected_next_seq,
+                            reason,
+                            "sealer REMOTE-ORIGIN-REJECT: the record was not sealed; \
+                             the lane cursor on the sealer is expected_next_seq"
+                        );
+                        seq_metrics::record_remote_origin_reject(origin_chain_id, reason);
+                    }
+                    continue;
+                }
                 // Check the cheap kind byte first. Relayed records
                 // arrive at full line rate on every replica, and
                 // fully decoding them here, just to discard them,
@@ -295,14 +322,18 @@ where
     // spawn_blocking. `process_epoch` does a sync Aeron poll and a sync
     // cluster offer. So the loop polls `is_signaled` between backoff
     // sleeps.
+    // The one-slot `pending` holds a popped epoch across a backpressured
+    // offer. The next tick retries it before it polls again, so a
+    // backpressured epoch is never dropped (audit H2).
     let mut epoch_pub = deposit_pub;
     let join_deposits = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
         let mut idle = IdleBackoff::new(Duration::from_micros(1), Duration::from_micros(100), 1);
+        let mut pending = None;
         loop {
             if shutdown_for_deposits.is_signaled() {
                 return Ok(());
             }
-            match process_epoch(&mut epoch_sub, &mut epoch_pub) {
+            match process_epoch(&mut epoch_sub, &mut epoch_pub, &mut pending) {
                 Ok(true) => idle.reset(),
                 Ok(false) => std::thread::sleep(idle.idle_wait()),
                 Err(SequencerError::Backpressure) => {
@@ -315,15 +346,17 @@ where
     });
 
     // Independent pump for tx_remote_epochs to a remote-origin record on
-    // tx_ordering, on the same terms as the deposit pump above.
+    // tx_ordering, on the same terms as the deposit pump above, with the
+    // same one-slot retry.
     let mut remote_epoch_pub = remote_epoch_pub;
     let join_remote_epochs = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
         let mut idle = IdleBackoff::new(Duration::from_micros(1), Duration::from_micros(100), 1);
+        let mut pending = None;
         loop {
             if shutdown_for_remote_epochs.is_signaled() {
                 return Ok(());
             }
-            match process_remote_epoch(&mut remote_epoch_sub, &mut remote_epoch_pub) {
+            match process_remote_epoch(&mut remote_epoch_sub, &mut remote_epoch_pub, &mut pending) {
                 Ok(true) => idle.reset(),
                 Ok(false) => std::thread::sleep(idle.idle_wait()),
                 Err(SequencerError::Backpressure) => {

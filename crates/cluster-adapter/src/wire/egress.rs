@@ -11,8 +11,9 @@ use kardamom_types::{BPosition, BlockBoundaryStart, DepositRef, TxOrderingMessag
 
 use super::{
     CANONICAL_ID_LEN, EGRESS_KIND_BOUNDARY, EGRESS_KIND_CONTIGUITY_REJECT, EGRESS_KIND_RELAYED,
-    EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE, RT_DEPOSITREF, RT_EPOCH,
-    RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError, encode_kind_2u64, rd_i32, rd_u32, rd_u64,
+    EGRESS_KIND_REMOTE_ORIGIN_REJECT, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
+    RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError, encode_kind_2u64,
+    rd_i32, rd_u32, rd_u64,
 };
 
 // ── decode (egress: cluster to Rust) ────────────────────────────────────────
@@ -38,6 +39,17 @@ pub enum EgressItem {
         sender: Address,
         nonce: u64,
         expected: u64,
+    },
+    /// Remote-origin reject. The sealer refused a kind-5 record from
+    /// `origin_chain_id` at `first_seq`. `expected_next_seq` is the
+    /// sealer's lane cursor for that origin (0 when the reason is not a
+    /// seq mismatch). `reason` is a `REMOTE_ORIGIN_REJECT_*` code; see
+    /// [`super::remote_origin_reject_reason`].
+    RemoteOriginReject {
+        origin_chain_id: u64,
+        first_seq: u64,
+        expected_next_seq: u64,
+        reason: u8,
     },
 }
 
@@ -95,6 +107,16 @@ pub fn decode_egress(buf: &[u8]) -> Result<EgressItem, WireError> {
                 expected: rd_u64(buf, 1 + SENDER_LEN + 8)?,
             })
         }
+        EGRESS_KIND_REMOTE_ORIGIN_REJECT => Ok(EgressItem::RemoteOriginReject {
+            origin_chain_id: rd_u64(buf, 1)?,
+            first_seq: rd_u64(buf, 9)?,
+            expected_next_seq: rd_u64(buf, 17)?,
+            reason: *buf.get(25).ok_or(WireError::TooShort {
+                at: 25,
+                need: 1,
+                have: buf.len().saturating_sub(25),
+            })?,
+        }),
         other => Err(WireError::BadEgressKind(other)),
     }
 }
@@ -183,10 +205,12 @@ fn decode_relayed_payload(p: &[u8]) -> Result<TxOrderingMessage, WireError> {
             let rec: RemoteEpochRecord =
                 rkyv::from_bytes::<RemoteEpochRecord, rkyv::rancor::Error>(&aligned)
                     .map_err(|e| WireError::BadRemoteEpoch(e.to_string()))?;
-            // The id commits to the pair's (origin, anchor, seq range), so a
-            // mismatch means the header and the batch disagree about WHICH
-            // slice of the pair's sequence this is — the one thing dedup
-            // cannot be allowed to get wrong.
+            // The id commits to the pair's (origin, anchor number, anchor
+            // hash, seq range), so a mismatch means the header and the batch
+            // disagree about WHICH slice of the pair's sequence this is —
+            // the one thing dedup cannot be allowed to get wrong. The sealer
+            // reads the anchor and the seq range from the header only, so
+            // this check is what binds those header fields to the body.
             if rec.canonical_id() != id {
                 return Err(WireError::BadRemoteEpoch(format!(
                     "canonical id {id} does not match remote epoch from chain {} seqs {}..={}",
@@ -247,5 +271,21 @@ pub fn encode_contiguity_reject(sender: Address, nonce: u64, expected: u64) -> V
     b.extend_from_slice(sender.as_slice());
     b.extend_from_slice(&nonce.to_le_bytes());
     b.extend_from_slice(&expected.to_le_bytes());
+    b
+}
+
+/// Frame a remote-origin reject exactly as the Java service does.
+pub fn encode_remote_origin_reject(
+    origin_chain_id: u64,
+    first_seq: u64,
+    expected_next_seq: u64,
+    reason: u8,
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(1 + 8 + 8 + 8 + 1);
+    b.push(EGRESS_KIND_REMOTE_ORIGIN_REJECT);
+    b.extend_from_slice(&origin_chain_id.to_le_bytes());
+    b.extend_from_slice(&first_seq.to_le_bytes());
+    b.extend_from_slice(&expected_next_seq.to_le_bytes());
+    b.push(reason);
     b
 }

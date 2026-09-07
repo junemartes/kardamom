@@ -126,19 +126,21 @@ pub fn cluster_ref_publisher_with_egress(
     rt: kardamom_log::aeron_live::AeronRuntime,
     cfg: LiveClusterConfig,
 ) -> Result<(LiveCluster, ClusterRefPublisher<LiveIngress>, LiveEgress), LiveError> {
-    // Only boundaries and contiguity rejects pass through. Line-rate record
+    // Only boundaries and reject frames pass through. Line-rate record
     // frames are dropped at the session thread, instead of being allocated
     // and channelled to a receiver that discards them (the session thread
-    // also services the publish offers). A reject frame is the sealer
+    // also services the publish offers). A contiguity reject is the sealer
     // telling this publisher that a known sender's ref would seal a nonce
-    // gap. The watermark thread forwards reject frames into the rewind
-    // path.
+    // gap; the watermark thread forwards it into the rewind path. A
+    // remote-origin reject is the sealer refusing a relayed kind-5 record;
+    // the watermark thread logs and counts it.
     let (cluster, ingress, egress) = live::connect_with_egress_kind_filter(
         rt,
         cfg,
         &[
             wire::EGRESS_KIND_BOUNDARY,
             wire::EGRESS_KIND_CONTIGUITY_REJECT,
+            wire::EGRESS_KIND_REMOTE_ORIGIN_REJECT,
         ],
     )?;
     Ok((cluster, ClusterRefPublisher::new(ingress), egress))

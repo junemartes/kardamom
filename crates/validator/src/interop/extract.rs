@@ -56,24 +56,10 @@ sol! {
 // same function. The forge-vector test below pins it at this call site too.
 pub use kardamom_types::xchain::{SENT_MESSAGES_SLOT_INDEX, sent_messages_slot};
 
-/// Deterministic anchor for one origin block, served as the feed's
-/// `originBlockHash`.
-///
-/// Kardamom blocks carry NO canonical hash in v0 — the sealed
-/// `BlockBoundary` is slim (no state commitment) and the RPC returns
-/// `blockHash: null` — so this is a position commitment, not a content one.
-/// What matters is DETERMINISM: every validator of the same chain serves the
-/// identical anchor for a block, so racing relayers derive byte-identical
-/// `RemoteEpochRecord`s and `canonical_id` dedup collapses them. Content
-/// authenticity is §10's job (re-derivation / attestation quorum), never
-/// this field's; the destination treats it as opaque.
-pub fn xchain_anchor_hash(origin_chain_id: u64, block_number: u64) -> B256 {
-    let mut buf = Vec::with_capacity(25 + 16);
-    buf.extend_from_slice(b"KARDAMOM_XCHAIN_ANCHOR_V0");
-    buf.extend_from_slice(&origin_chain_id.to_be_bytes());
-    buf.extend_from_slice(&block_number.to_be_bytes());
-    keccak256(&buf)
-}
+/// The deterministic anchor for one origin block, served as the feed's
+/// `originBlockHash`. Defined in `kardamom-types` so the watcher recomputes
+/// the same value and rejects a feed that chooses its own (audit M4).
+pub use kardamom_types::xchain::xchain_anchor_hash;
 
 /// Why extraction failed. Every variant is a chain-level fault: the receipts
 /// are this validator's OWN re-execution (already cross-checked against the

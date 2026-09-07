@@ -27,6 +27,10 @@ async fn s12_xchain_delivery() {
         genesis: e2e::harness::Genesis::DevInterop,
         validator: true,
         validator_parallel: true,
+        // The validator serves eth_getStorageAt for the watcher's startup
+        // cursor reconcile.
+        validator_serve_feed: true,
+        remote_origins: vec![xchain::ORIGIN_CHAIN_ID],
         ..StackConfig::default()
     })
     .await
@@ -38,10 +42,17 @@ async fn s12_xchain_delivery() {
     // real outbox-feed protocol, scripted by the test.
     let feed = MockInteropFeed::new(xchain::ORIGIN_CHAIN_ID).await;
 
-    // The real watcher binary, first boot: no cursor file yet, seeded at 0.
+    // The real watcher binary, first boot: no cursor file yet, seeded at 0,
+    // reconciled against the validator's Inbox.nextSeq (also 0).
+    let dest_rpc = stack.validator_feed_url().await.expect("validator rpc url");
     let cursor_file = stack.root().join("interop-pair.cursor");
     let mut watcher = stack
-        .spawn_interop_watcher(xchain::ORIGIN_CHAIN_ID, &feed.url(), &cursor_file)
+        .spawn_interop_watcher(
+            xchain::ORIGIN_CHAIN_ID,
+            &feed.url(),
+            &cursor_file,
+            Some(&dest_rpc),
+        )
         .expect("spawn interop watcher");
 
     let outcome = xchain::delivery(&t, &feed, &exec_dir, &cursor_file, watcher.metrics_addr)
@@ -53,6 +64,19 @@ async fn s12_xchain_delivery() {
     t.assert_validator_verdict("S12 after delivery")
         .await
         .expect("S12 validator verdict");
+
+    // The sealer's lane guard: a skipping kind-5 record is rejected with a
+    // reject frame, and nothing executes. The gap arm then delivers seq 3
+    // through the same sealer, which proves the lane stayed intact.
+    xchain::sealer_rejects_a_skipped_seq(
+        &t,
+        &stack.aeron_dir(),
+        &stack.sealer_logs(),
+        &exec_dir,
+        &outcome,
+    )
+    .await
+    .expect("S12 sealer reject arm");
 
     xchain::gap_halts_pair_not_chain(&t, &feed, &mut watcher, outcome)
         .await
@@ -87,6 +111,12 @@ async fn s14_xchain_two_stacks() {
         validator: true,
         validator_parallel: true,
         validator_serve_feed: true,
+        // Each sealer allowlists the OTHER chain as its remote origin.
+        remote_origins: vec![if chain_id == e2e::harness::DEV_CHAIN_ID {
+            CHAIN_B_ID
+        } else {
+            e2e::harness::DEV_CHAIN_ID
+        }],
         ..StackConfig::default()
     };
     // Brought up one after the other: two stacks are 4 JVMs + 10 service
@@ -105,11 +135,18 @@ async fn s14_xchain_two_stacks() {
     let a_exec_dir = stack_a.executor_state_dir().expect("A executor state dir");
     let b_exec_dir = stack_b.executor_state_dir().expect("B executor state dir");
 
-    // B's watcher consumes A's VALIDATOR feed — the real serving surface.
+    // B's watcher consumes A's VALIDATOR feed — the real serving surface —
+    // and reconciles its cursor against B's own validator.
     let a_feed_url = stack_a.validator_feed_url().await.expect("A feed url");
+    let b_feed_url = stack_b.validator_feed_url().await.expect("B feed url");
     let b_cursor = stack_b.root().join("lane-from-a.cursor");
     let _watcher_on_b = stack_b
-        .spawn_interop_watcher(e2e::harness::DEV_CHAIN_ID, &a_feed_url, &b_cursor)
+        .spawn_interop_watcher(
+            e2e::harness::DEV_CHAIN_ID,
+            &a_feed_url,
+            &b_cursor,
+            Some(&b_feed_url),
+        )
         .expect("spawn B's watcher of A");
 
     // Leg 1: user tx on A -> Outbox -> A validator extract/serve -> B
@@ -126,10 +163,9 @@ async fn s14_xchain_two_stacks() {
     eprintln!("S14: forward leg done at {:?}", started.elapsed());
 
     // Leg 2: the callback comes home through B's validator feed.
-    let b_feed_url = stack_b.validator_feed_url().await.expect("B feed url");
     let a_cursor = stack_a.root().join("lane-from-b.cursor");
     let _watcher_on_a = stack_a
-        .spawn_interop_watcher(CHAIN_B_ID, &b_feed_url, &a_cursor)
+        .spawn_interop_watcher(CHAIN_B_ID, &b_feed_url, &a_cursor, Some(&a_feed_url))
         .expect("spawn A's watcher of B");
     xchain_two_stacks::callback_leg(&a, &b, &a_exec_dir, &a_cursor, outcome)
         .await
@@ -165,6 +201,7 @@ async fn s13_xchain_da_parity() {
     let mut stack = launch_l1_or_skip!(StackConfig {
         l1: true,
         genesis: e2e::harness::Genesis::DevInterop,
+        remote_origins: vec![xchain::ORIGIN_CHAIN_ID],
         ..StackConfig::default()
     });
     let t = target(&stack);
@@ -172,8 +209,10 @@ async fn s13_xchain_da_parity() {
 
     let feed = MockInteropFeed::new(xchain::ORIGIN_CHAIN_ID).await;
     let cursor_file = stack.root().join("interop-pair.cursor");
+    // No validator in this stack, so nothing serves eth_getStorageAt: the
+    // startup cursor reconcile is skipped (first boot at seq 0 either way).
     let mut watcher = stack
-        .spawn_interop_watcher(xchain::ORIGIN_CHAIN_ID, &feed.url(), &cursor_file)
+        .spawn_interop_watcher(xchain::ORIGIN_CHAIN_ID, &feed.url(), &cursor_file, None)
         .expect("spawn interop watcher");
 
     // 1. The S12 delivery flow, unchanged — every layer's evidence asserted.

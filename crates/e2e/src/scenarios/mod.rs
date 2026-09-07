@@ -47,6 +47,7 @@ pub const SEQ_DROPPED_PAST: &str = "kardamom_sequencer_tx_dropped_past_total";
 pub const SEQ_EVICTIONS: &str = "kardamom_sequencer_pending_evictions_total";
 pub const SEQ_REMOTE_EPOCHS_RELAYED: &str = "kardamom_sequencer_remote_epochs_relayed_total";
 pub const SEQ_REMOTE_MESSAGES_RELAYED: &str = "kardamom_sequencer_remote_messages_relayed_total";
+pub const SEQ_REMOTE_ORIGIN_REJECT: &str = "kardamom_sequencer_remote_origin_reject_total";
 pub const INGRESS_QUEUE_DEPTH: &str = "kardamom_ingress_queue_depth";
 pub const VALIDATOR_COMMITTED_BLOCK: &str = "validator_committed_block";
 pub const VALIDATOR_BLOCKS_VERIFIED: &str = "validator_blocks_verified_total";

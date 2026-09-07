@@ -24,6 +24,7 @@
 //! ```text
 //!   relayed record:  [kind:u8 = 1][index:u64][payload_len:u32][relayed payload…]
 //!   block boundary:  [kind:u8 = 2][block_number:u64][end_tx_idx:u64][l2_timestamp:u64]
+//!   remote reject:   [kind:u8 = 6][origin_chain_id:u64][first_seq:u64][expected_next_seq:u64][reason:u8]
 //! ```
 //! `index` is the 0-based canonical record index that the leader's
 //! replicated state machine assigns. The executor maps it to
@@ -46,7 +47,8 @@ mod tests;
 
 pub use egress::{
     EgressItem, decode_egress, encode_contiguity_reject, encode_egress_boundary,
-    encode_egress_record, encode_replay_done, encode_replay_unavailable,
+    encode_egress_record, encode_remote_origin_reject, encode_replay_done,
+    encode_replay_unavailable,
 };
 pub use ingress::{
     decode_ingress_batch, decode_replay_request, encode_ingress_batch, encode_ingress_depositref,
@@ -89,7 +91,7 @@ pub const KIND_BATCH: u8 = 3;
 /// `docs/agents/l1-origin-deposit-derivation-spec.md`.
 pub const KIND_ORIGIN_RECORD: u8 = 4;
 /// Ingress kind: a REMOTE-ORIGIN-ADVANCING record
-/// `[kind:u8 = 5][canonical_id:32][origin_chain_id:u64][anchor_number:u64][slot_count:u32][record_type:u8][fields…]`.
+/// `[kind:u8 = 5][canonical_id:32][origin_chain_id:u64][anchor_number:u64][slot_count:u32][first_seq:u64][last_seq:u64][record_type:u8][fields…]`.
 ///
 /// [`KIND_ORIGIN_RECORD`] for a peer Kardamom chain instead of L1. Same
 /// posture — deduped on `canonical_id`, block closed before the record is
@@ -103,6 +105,15 @@ pub const KIND_ORIGIN_RECORD: u8 = 4;
 /// * the adopted position is NOT stamped into block boundaries. `l1_origin` is
 ///   part of the L2 block's identity; a peer chain's anchor is not, so a
 ///   remote origin advances per-pair bookkeeping only.
+///
+/// `first_seq` and `last_seq` are the record's seq range. The sealer keeps
+/// a `next_seq` per origin and accepts a record only if `first_seq` equals
+/// it (the lane contiguity guard, audit H2/H9). It also checks
+/// `slot_count == 2 + last_seq - first_seq`, so a frame cannot claim more
+/// slots than its body fills (audit H3). Every header field is bound by
+/// `canonical_id`, which commits to the origin, the anchor, and the seq
+/// range. A rejected frame answers the offering session with
+/// [`EGRESS_KIND_REMOTE_ORIGIN_REJECT`].
 ///
 /// A distinct KIND rather than a `record_type` under [`KIND_ORIGIN_RECORD`]
 /// for the same reason kind 4 exists at all: the sealer branches on the frame
@@ -142,6 +153,40 @@ pub const EGRESS_KIND_REPLAY_DONE: u8 = 4;
 /// unconfirmed ledger to `expected` and republishes, turning a silent gap
 /// into a recoverable signal. Matches Java `EGRESS_KIND_CONTIGUITY_REJECT`.
 pub const EGRESS_KIND_CONTIGUITY_REJECT: u8 = 5;
+/// Egress kind: remote-origin reject. The sealer refused a
+/// [`KIND_REMOTE_ORIGIN_RECORD`] frame:
+/// `[kind:u8 = 6][origin_chain_id:u64][first_seq:u64][expected_next_seq:u64][reason:u8]`.
+/// The service sends this only to the offering session, like the
+/// contiguity reject. The sequencer logs it and counts it. It does not
+/// republish: the record is the watcher's, and the watcher reconciles its
+/// cursor with the destination's `Inbox.nextSeq` at startup. `reason` is
+/// one of the `REMOTE_ORIGIN_REJECT_*` codes. Matches Java
+/// `EGRESS_KIND_REMOTE_ORIGIN_REJECT`.
+pub const EGRESS_KIND_REMOTE_ORIGIN_REJECT: u8 = 6;
+
+/// `first_seq` is not the sealer's `next_seq` for the origin.
+pub const REMOTE_ORIGIN_REJECT_SEQ_MISMATCH: u8 = 1;
+/// `anchor_number` does not advance the origin's adopted anchor.
+pub const REMOTE_ORIGIN_REJECT_ANCHOR_REGRESSED: u8 = 2;
+/// `slot_count != 2 + last_seq - first_seq`.
+pub const REMOTE_ORIGIN_REJECT_SLOT_COUNT_MISMATCH: u8 = 3;
+/// `origin_chain_id` is not in the sealer's remote-origin allowlist.
+pub const REMOTE_ORIGIN_REJECT_UNKNOWN_ORIGIN: u8 = 4;
+/// `last_seq < first_seq`, or the range overflows.
+pub const REMOTE_ORIGIN_REJECT_BAD_RANGE: u8 = 5;
+
+/// Human-readable label for a remote-origin reject reason. Used as a
+/// metric label and in log lines. Unknown codes map to `"unknown"`.
+pub fn remote_origin_reject_reason(code: u8) -> &'static str {
+    match code {
+        REMOTE_ORIGIN_REJECT_SEQ_MISMATCH => "seq_mismatch",
+        REMOTE_ORIGIN_REJECT_ANCHOR_REGRESSED => "anchor_regressed",
+        REMOTE_ORIGIN_REJECT_SLOT_COUNT_MISMATCH => "slot_count_mismatch",
+        REMOTE_ORIGIN_REJECT_UNKNOWN_ORIGIN => "unknown_origin",
+        REMOTE_ORIGIN_REJECT_BAD_RANGE => "bad_range",
+        _ => "unknown",
+    }
+}
 
 /// Record discriminant inside the relayed payload.
 pub const RT_TXREF: u8 = 0;

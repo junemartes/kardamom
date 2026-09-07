@@ -30,7 +30,7 @@ kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
 kardamom-state = { path = "../state" }
 kardamom-obs = { path = "../obs" }
-alloy-primitives.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-provider.workspace = true
 alloy-network.workspace = true
 alloy-contract.workspace = true

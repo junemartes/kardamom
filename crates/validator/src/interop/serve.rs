@@ -73,6 +73,9 @@ pub struct FeedServerState {
     pub store: Arc<FeedStore>,
     pub attestations: Arc<AttestationStore>,
     pub limits: FeedServerLimits,
+    /// The validator's committed state, for `eth_getStorageAt` (see
+    /// [`crate::interop::state_rpc`]). `None` leaves that method off.
+    pub state_env: Option<kardamom_state::StateEnv>,
 }
 
 /// Live-subscription counters, shared by both handlers.
@@ -329,7 +332,16 @@ pub async fn start_feed_server(
         state: state.clone(),
         slots: slots.clone(),
     });
-    module.merge(AttestationFeedApiServer::into_rpc(Handler { state, slots }))?;
+    module.merge(AttestationFeedApiServer::into_rpc(Handler {
+        state: state.clone(),
+        slots,
+    }))?;
+    if let Some(env) = &state.state_env {
+        use crate::interop::state_rpc::{StateReadApiServer, StateReadHandler};
+        module.merge(StateReadApiServer::into_rpc(StateReadHandler::new(
+            env.clone(),
+        )))?;
+    }
     Ok((local, server.start(module)))
 }
 
@@ -384,6 +396,7 @@ mod tests {
                 store,
                 attestations,
                 limits,
+                state_env: None,
             },
         )
         .await

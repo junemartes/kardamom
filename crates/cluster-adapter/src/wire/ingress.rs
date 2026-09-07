@@ -77,25 +77,34 @@ pub fn encode_ingress_epoch(epoch: &EpochRecord) -> Result<Vec<u8>, WireError> {
 
 /// Encode a [`RemoteEpochRecord`] as a REMOTE-ORIGIN-ADVANCING ingress
 /// message: `[kind=5][canonical_id:32][origin_chain_id:u64][anchor_number:u64]
-/// [slot_count:u32][RT_REMOTE_EPOCH][rkyv RemoteEpochRecord…]`.
+/// [slot_count:u32][first_seq:u64][last_seq:u64][RT_REMOTE_EPOCH][rkyv
+/// RemoteEpochRecord…]`.
 ///
 /// The two u64s are a pair, not a number: `anchor_number` positions the record
 /// only within `origin_chain_id`, so the sealer keys its marker on both.
-/// `slot_count` is [`remote_epoch_slots`]. See [`KIND_REMOTE_ORIGIN_RECORD`]
+/// `slot_count` is [`remote_epoch_slots`]. `first_seq` and `last_seq` feed
+/// the sealer's lane contiguity guard. See [`KIND_REMOTE_ORIGIN_RECORD`]
 /// for why this is a distinct kind rather than a record type under
 /// [`KIND_ORIGIN_RECORD`].
 pub fn encode_ingress_remote_epoch(rec: &RemoteEpochRecord) -> Result<Vec<u8>, WireError> {
+    if rec.messages.is_empty() {
+        return Err(WireError::BadRemoteEpoch(
+            "empty remote epoch has no seq range".into(),
+        ));
+    }
     let body = rkyv::to_bytes::<rkyv::rancor::Error>(rec)
         .map_err(|e| WireError::BadRemoteEpoch(e.to_string()))?;
     let slots = u32::try_from(remote_epoch_slots(rec)).map_err(|_| {
         WireError::BadRemoteEpoch(format!("{} messages overflows u32", rec.messages.len()))
     })?;
-    let mut b = Vec::with_capacity(1 + CANONICAL_ID_LEN + 8 + 8 + 4 + 1 + body.len());
+    let mut b = Vec::with_capacity(1 + CANONICAL_ID_LEN + 8 + 8 + 4 + 8 + 8 + 1 + body.len());
     b.push(KIND_REMOTE_ORIGIN_RECORD);
     b.extend_from_slice(rec.canonical_id().as_slice());
     b.extend_from_slice(&rec.origin_chain_id.to_le_bytes());
     b.extend_from_slice(&rec.anchor_number.to_le_bytes());
     b.extend_from_slice(&slots.to_le_bytes());
+    b.extend_from_slice(&rec.first_seq.to_le_bytes());
+    b.extend_from_slice(&rec.last_seq().to_le_bytes());
     b.push(RT_REMOTE_EPOCH);
     b.extend_from_slice(&body);
     Ok(b)

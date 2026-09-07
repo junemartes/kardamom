@@ -118,3 +118,37 @@ pub async fn publish_forged_epoch(aeron_dir: &Path, l1_number: u64) -> Result<()
     .await
     .context("injection task join")?
 }
+
+/// Publish one [`kardamom_types::xchain::RemoteEpochRecord`] onto
+/// `tx_remote_epochs`, as the interop watcher would. The real sequencers
+/// relay it onto the cluster as a kind-5 record, so the sealer's lane
+/// guards see exactly the frame a misbehaving or mis-seeded watcher would
+/// send. The record must be well formed (a valid body and a matching
+/// canonical id), or the sealer drops it as malformed and the drill only
+/// tests the codec.
+pub async fn publish_remote_epoch(
+    aeron_dir: &Path,
+    record: kardamom_types::xchain::RemoteEpochRecord,
+) -> Result<()> {
+    let aeron_dir = aeron_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let channels = LogConfig::resolve(None)
+            .context("resolve log config")?
+            .channels;
+        let rt = AeronRuntime::spawn_with_dir(&aeron_dir).context("attach injection runtime")?;
+        let publication = rt
+            .open_publication(
+                &channels.tx_remote_epochs_channel,
+                channels.tx_remote_epochs_stream_id,
+            )
+            .context("open tx_remote_epochs publication")?;
+        for _round in 0..10 {
+            let bytes = kardamom_log::codec::encode(&record).context("encode remote epoch")?;
+            publication.publish_best_effort(bytes);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        Ok(())
+    })
+    .await
+    .context("injection task join")?
+}

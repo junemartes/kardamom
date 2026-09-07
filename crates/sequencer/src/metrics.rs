@@ -41,6 +41,11 @@ pub const REF_REPUBLISHED: &str = "kardamom_sequencer_ref_republished_total";
 /// Cluster dedup collapses the M copies downstream.
 pub const REMOTE_EPOCHS_RELAYED: &str = "kardamom_sequencer_remote_epochs_relayed_total";
 pub const REMOTE_MESSAGES_RELAYED: &str = "kardamom_sequencer_remote_messages_relayed_total";
+/// Remote-origin records the sealer rejected, by origin and reason
+/// (`seq_mismatch`, `anchor_regressed`, `slot_count_mismatch`,
+/// `unknown_origin`, `bad_range`). A nonzero `seq_mismatch` rate means a
+/// watcher's cursor disagrees with the sealer's lane cursor.
+pub const REMOTE_ORIGIN_REJECT_TOTAL: &str = "kardamom_sequencer_remote_origin_reject_total";
 
 /// Pre-registered per-partition metric handles for the hot loop.
 ///
@@ -160,6 +165,15 @@ pub fn record_remote_epoch_relayed(origin_chain_id: u64, messages: usize) {
     let origin = origin_chain_id.to_string();
     counter!(REMOTE_EPOCHS_RELAYED, "origin" => origin.clone()).increment(1);
     counter!(REMOTE_MESSAGES_RELAYED, "origin" => origin).increment(messages as u64);
+}
+
+pub fn record_remote_origin_reject(origin_chain_id: u64, reason: &'static str) {
+    counter!(
+        REMOTE_ORIGIN_REJECT_TOTAL,
+        "origin" => origin_chain_id.to_string(),
+        "reason" => reason
+    )
+    .increment(1);
 }
 
 #[cfg(test)]

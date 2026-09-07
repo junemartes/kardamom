@@ -206,10 +206,10 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
             EgressItem::ReplayDone { .. } => {
                 self.catching_up = false;
             }
-            // Contiguity rejects are offered only to the offering sequencer
-            // session. An executor session cannot receive one. Ignore it
-            // defensively.
-            EgressItem::ContiguityReject { .. } => {}
+            // Contiguity and remote-origin rejects are offered only to the
+            // offering sequencer session. An executor session cannot
+            // receive one. Ignore them defensively.
+            EgressItem::ContiguityReject { .. } | EgressItem::RemoteOriginReject { .. } => {}
             EgressItem::ReplayUnavailable {
                 oldest_index,
                 oldest_block,

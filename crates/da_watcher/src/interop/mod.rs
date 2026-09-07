@@ -28,6 +28,7 @@
 pub mod cursor;
 pub mod feed;
 pub mod publisher;
+pub mod reconcile;
 pub mod source;
 pub mod watcher;
 
@@ -44,5 +45,8 @@ pub use feed::{
     UNSUBSCRIBE_OUTBOX_METHOD,
 };
 pub use publisher::RemoteEpochPublisher;
+pub use reconcile::{
+    DestinationStateReader, ReconcileError, ReconcileRetry, RpcDestinationReader, reconcile_cursor,
+};
 pub use source::{RemoteChainSource, RemoteSourceError, WsRemoteChainSource};
 pub use watcher::{InteropError, InteropWatcherConfig, process_once, spawn};

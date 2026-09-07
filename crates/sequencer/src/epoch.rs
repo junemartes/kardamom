@@ -37,23 +37,44 @@ pub trait EpochSubscriber: Send {
     fn poll(&mut self) -> Result<Option<(BPosition, EpochRecord)>, SequencerError>;
 }
 
-/// Single-step epoch pump. Pulls one epoch off the subscription and
-/// forwards it on `tx_ordering`. Returns `Ok(true)` if it processed an
-/// epoch (the caller should keep going), or `Ok(false)` if the
-/// subscription is idle.
+/// One epoch popped from the subscription but not yet accepted by the
+/// cluster. The pump holds it here across a `Backpressure` result and
+/// retries it before it polls again.
+pub type PendingEpoch = Option<(BPosition, EpochRecord)>;
+
+/// Single-step epoch pump. Takes the pending epoch if there is one, else
+/// pulls one epoch off the subscription, and forwards it on `tx_ordering`.
+/// Returns `Ok(true)` if it processed an epoch (the caller should keep
+/// going), or `Ok(false)` if the subscription is idle.
 ///
-/// On `SequencerError::Backpressure`, the caller retries the same epoch on
-/// the next tick. The epoch is durable on the deposits stream, so there is
-/// no rewind state to manage.
-pub fn process_epoch<S, P>(sub: &mut S, b: &mut P) -> Result<bool, SequencerError>
+/// On `SequencerError::Backpressure` the epoch goes into `pending`, and
+/// the next call retries the SAME epoch before it polls for a new one. The
+/// poll is destructive (`try_recv`), so without this slot a backpressured
+/// epoch would be lost, and the L1 origin sequence would have a permanent
+/// hole (audit H2). `Backpressure` includes "not connected", so a leader
+/// election would otherwise drain every sequencer's backlog at once.
+pub fn process_epoch<S, P>(
+    sub: &mut S,
+    b: &mut P,
+    pending: &mut PendingEpoch,
+) -> Result<bool, SequencerError>
 where
     S: EpochSubscriber,
     P: TxOrderingRefPublisher,
 {
-    let Some((_pos, epoch)) = sub.poll()? else {
-        return Ok(false);
+    let (pos, epoch) = match pending.take() {
+        Some(held) => held,
+        None => match sub.poll()? {
+            Some(next) => next,
+            None => return Ok(false),
+        },
     };
-    b.try_publish_epoch(&epoch)?;
+    if let Err(e) = b.try_publish_epoch(&epoch) {
+        if matches!(e, SequencerError::Backpressure) {
+            *pending = Some((pos, epoch));
+        }
+        return Err(e);
+    }
     Ok(true)
 }
 
@@ -128,7 +149,7 @@ mod tests {
         let e = epoch(100, 3);
         sub.push(BPosition::default(), e.clone());
 
-        assert!(process_epoch(&mut sub, &mut pubr).unwrap());
+        assert!(process_epoch(&mut sub, &mut pubr, &mut None).unwrap());
 
         let got = pubr.epochs.lock().unwrap();
         assert_eq!(got.len(), 1);
@@ -143,7 +164,7 @@ mod tests {
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
         sub.push(BPosition::default(), epoch(101, 0));
 
-        assert!(process_epoch(&mut sub, &mut pubr).unwrap());
+        assert!(process_epoch(&mut sub, &mut pubr, &mut None).unwrap());
         assert_eq!(pubr.epochs.lock().unwrap().len(), 1);
     }
 
@@ -151,7 +172,7 @@ mod tests {
     fn idle_subscription_reports_no_work() {
         let mut sub = ScriptedEpochs::default();
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
-        assert!(!process_epoch(&mut sub, &mut pubr).unwrap());
+        assert!(!process_epoch(&mut sub, &mut pubr, &mut None).unwrap());
     }
 
     #[test]
@@ -160,7 +181,7 @@ mod tests {
         sub.close();
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
         assert!(matches!(
-            process_epoch(&mut sub, &mut pubr),
+            process_epoch(&mut sub, &mut pubr, &mut None),
             Err(SequencerError::IngressDisconnected)
         ));
     }
@@ -171,11 +192,52 @@ mod tests {
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
         *pubr.fail_with_backpressure.lock().unwrap() = true;
         sub.push(BPosition::default(), epoch(102, 1));
+        let mut pending = None;
 
         assert!(matches!(
-            process_epoch(&mut sub, &mut pubr),
+            process_epoch(&mut sub, &mut pubr, &mut pending),
             Err(SequencerError::Backpressure)
         ));
         assert!(pubr.epochs.lock().unwrap().is_empty());
+        assert!(pending.is_some(), "the popped epoch is held, not dropped");
+    }
+
+    /// Audit H2: a backpressured publish followed by a successful one relays
+    /// the same epoch exactly once, and the epoch behind it is not skipped.
+    #[test]
+    fn a_backpressured_epoch_is_retried_and_relayed_exactly_once() {
+        let mut sub = ScriptedEpochs::default();
+        let mut pubr = InMemoryTxOrderingRefPublisher::default();
+        sub.push(BPosition::default(), epoch(102, 1));
+        sub.push(BPosition::default(), epoch(103, 0));
+        let mut pending = None;
+
+        *pubr.fail_with_backpressure.lock().unwrap() = true;
+        assert!(matches!(
+            process_epoch(&mut sub, &mut pubr, &mut pending),
+            Err(SequencerError::Backpressure)
+        ));
+        assert!(matches!(
+            process_epoch(&mut sub, &mut pubr, &mut pending),
+            Err(SequencerError::Backpressure)
+        ));
+        assert_eq!(
+            sub.queue.lock().unwrap().len(),
+            1,
+            "the retry does not poll past the held epoch"
+        );
+
+        *pubr.fail_with_backpressure.lock().unwrap() = false;
+        assert!(process_epoch(&mut sub, &mut pubr, &mut pending).unwrap());
+        assert!(pending.is_none(), "the slot empties on success");
+        assert!(process_epoch(&mut sub, &mut pubr, &mut pending).unwrap());
+        assert!(!process_epoch(&mut sub, &mut pubr, &mut pending).unwrap());
+
+        let got = pubr.epochs.lock().unwrap();
+        assert_eq!(
+            got.iter().map(|e| e.l1_number).collect::<Vec<_>>(),
+            vec![102, 103],
+            "each epoch once, in order"
+        );
     }
 }

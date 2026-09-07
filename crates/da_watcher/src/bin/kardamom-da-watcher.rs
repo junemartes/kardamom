@@ -10,7 +10,9 @@
 //!   `--self-chain-id`): a WebSocket outbox feed from one peer Kardamom
 //!   chain. Each origin block that carried messages becomes one
 //!   `RemoteEpochRecord` on `tx_remote_epochs`, through
-//!   [`LiveRemoteEpochsPublisher`].
+//!   [`LiveRemoteEpochsPublisher`]. At startup the cursor file is
+//!   reconciled with the destination's `Inbox.nextSeq` through
+//!   `--interop-dest-rpc` (see `interop::reconcile`).
 //!
 //! Either path can run alone, or both together. They share nothing but the
 //! Aeron runtime: a stalled peer pairing must not hold up L1 deposits, and
@@ -27,8 +29,8 @@ use anyhow::Context;
 use clap::Parser;
 
 use kardamom_da_watcher::interop::{
-    CursorFile, InteropWatcherConfig, RemoteEpochPublisher, WsRemoteChainSource,
-    spawn as spawn_interop_watcher,
+    CursorFile, InteropWatcherConfig, ReconcileRetry, RemoteEpochPublisher, RpcDestinationReader,
+    WsRemoteChainSource, reconcile_cursor, spawn as spawn_interop_watcher,
 };
 use kardamom_da_watcher::{
     DaWatcherConfig, EpochPublisher, PublishError, RpcL1Source, WatcherHandle,
@@ -106,6 +108,19 @@ struct Args {
         default_missing_value = "true"
     )]
     interop_fault_exits: bool,
+    /// JSON-RPC endpoint of OUR chain (the destination), for example the
+    /// validator's `--serve-feed` address as `ws://host:port`. At startup
+    /// the watcher reads `Inbox.nextSeq[origin]` there with
+    /// `eth_getStorageAt` and reconciles the cursor file with it: a stale
+    /// cursor advances, an equal cursor is fine, and a cursor AHEAD of the
+    /// chain refuses to start. Required with the interop triple unless
+    /// `--interop-skip-cursor-reconcile` is set.
+    #[arg(long)]
+    interop_dest_rpc: Option<String>,
+    /// Skip the startup cursor reconcile. For tests only: a cursor that is
+    /// ahead of the destination is a permanent lane hole.
+    #[arg(long, default_value_t = false)]
+    interop_skip_cursor_reconcile: bool,
     /// Optional `LogConfig` TOML that supplies the Aeron `[channels]`
     /// config. If unset, this uses built-in single-host IPC defaults,
     /// which keep local and e2e behavior unchanged. A multi-host
@@ -147,6 +162,9 @@ struct InteropPath {
     feed_url: String,
     cursor_file: CursorFile,
     cfg: InteropWatcherConfig,
+    /// The destination JSON-RPC for the startup cursor reconcile. `None`
+    /// only with `--interop-skip-cursor-reconcile`.
+    dest_rpc: Option<String>,
 }
 
 /// Split the flags into the two independent origin paths.
@@ -214,6 +232,21 @@ fn resolve_paths(args: &Args) -> anyhow::Result<(Option<L1Path>, Option<InteropP
                 }
                 None => args.interop_start_seq,
             };
+            let dest_rpc = match (&args.interop_dest_rpc, args.interop_skip_cursor_reconcile) {
+                (Some(url), _) => Some(url.clone()),
+                (None, true) => {
+                    tracing::warn!(
+                        "--interop-skip-cursor-reconcile: the cursor file is trusted as is; \
+                         a cursor ahead of the destination is a permanent lane hole"
+                    );
+                    None
+                }
+                (None, false) => anyhow::bail!(
+                    "the interop path requires --interop-dest-rpc (the destination JSON-RPC \
+                     that serves eth_getStorageAt, for the startup cursor reconcile); pass \
+                     --interop-skip-cursor-reconcile to skip it in tests"
+                ),
+            };
             Some(InteropPath {
                 peer_chain_id,
                 feed_url: feed_url.clone(),
@@ -223,6 +256,7 @@ fn resolve_paths(args: &Args) -> anyhow::Result<(Option<L1Path>, Option<InteropP
                     start_seq,
                     retry_interval: Duration::from_secs(args.interop_retry_interval_secs),
                 },
+                dest_rpc,
             })
         }
         (None, None, _) => None,
@@ -374,13 +408,39 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    if let (Some(interop), Some(tx_remote_epochs_pub)) = (interop, tx_remote_epochs_pub) {
+    if let (Some(mut interop), Some(tx_remote_epochs_pub)) = (interop, tx_remote_epochs_pub) {
+        // Reconcile the resume position with the destination BEFORE
+        // anything is derived (audit H9). A cursor ahead of the chain is
+        // fatal here, so the process exits before it can publish a hole.
+        if let Some(url) = &interop.dest_rpc {
+            let reader = RpcDestinationReader::connect(url)
+                .await
+                .with_context(|| format!("connect --interop-dest-rpc {url}"))?;
+            let reconciled = reconcile_cursor(
+                &reader,
+                interop.peer_chain_id,
+                interop.cfg.start_seq,
+                ReconcileRetry::default(),
+            )
+            .await
+            .context("reconcile the interop cursor with the destination")?;
+            if reconciled != interop.cfg.start_seq {
+                // The file is behind the chain. Persisting the chain's
+                // cursor is safe: every seq below it was delivered.
+                interop
+                    .cursor_file
+                    .persist(reconciled)
+                    .context("persist the reconciled cursor")?;
+                interop.cfg.start_seq = reconciled;
+            }
+        }
         tracing::info!(
             feed_url = %interop.feed_url,
             origin = interop.peer_chain_id,
             self_chain_id = interop.cfg.self_chain_id,
             start_seq = interop.cfg.start_seq,
             cursor_file = %interop.cursor_file.path().display(),
+            dest_rpc = interop.dest_rpc.as_deref().unwrap_or("<skipped>"),
             "kardamom-da-watcher: publishing remote epochs onto tx_remote_epochs"
         );
         let source = WsRemoteChainSource::new(

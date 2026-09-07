@@ -16,6 +16,7 @@
 pub mod extract;
 pub mod serve;
 pub mod sink;
+pub mod state_rpc;
 pub mod store;
 pub mod verify;
 
