@@ -150,13 +150,17 @@ fn decode_relayed_payload(p: &[u8]) -> Result<TxOrderingMessage, WireError> {
         RT_EPOCH => {
             // The rkyv body sits at offset 33 of the relayed payload (after
             // the canonical id and the record type). This offset is never
-            // 8-aligned in place, so rkyv refuses to read it without a copy
-            // into an aligned buffer. Every other record type decodes
+            // aligned in place, so rkyv refuses to read it without a copy
+            // into an aligned buffer. The buffer alignment is 16: the
+            // archived `Deposit` and `XChainMessage` carry a `u128`, so
+            // their archived forms need 16, and rkyv's default is 16. An
+            // 8-aligned buffer only worked when the allocator happened to
+            // hand out a 16-aligned block. Every other record type decodes
             // field-by-field, so it never hits this. Epochs happen about
             // once per L1 block, so the copy cost is small. The
             // alternative, padding the frame to realign it, would have to
             // survive the Java relay byte-for-byte.
-            let mut aligned = rkyv::util::AlignedVec::<8>::with_capacity(fields.len());
+            let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(fields.len());
             aligned.extend_from_slice(fields);
             let epoch: EpochRecord = rkyv::from_bytes::<EpochRecord, rkyv::rancor::Error>(&aligned)
                 .map_err(|e| WireError::BadEpoch(e.to_string()))?;
@@ -174,7 +178,7 @@ fn decode_relayed_payload(p: &[u8]) -> Result<TxOrderingMessage, WireError> {
         }
         RT_REMOTE_EPOCH => {
             // Same unaligned-body copy as RT_EPOCH, for the same reason.
-            let mut aligned = rkyv::util::AlignedVec::<8>::with_capacity(fields.len());
+            let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(fields.len());
             aligned.extend_from_slice(fields);
             let rec: RemoteEpochRecord =
                 rkyv::from_bytes::<RemoteEpochRecord, rkyv::rancor::Error>(&aligned)
