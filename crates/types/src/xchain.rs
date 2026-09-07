@@ -61,6 +61,13 @@ pub const OUTBOX: Address = address!("0x42000000000000000000000000000000000000E0
 /// what makes delivery injection unforgeable by user txs.
 pub const INBOX: Address = address!("0x42000000000000000000000000000000000000E1");
 
+/// Canonical predeploy address of the `CheckpointMarker`. It emits the
+/// checkpoint markers for coordinated recovery lines and is the only valid
+/// origin sender of a marker message. The receiving predeploy accepts a
+/// marker only when the Inbox reports this address as the origin sender.
+/// Seeded into genesis like [`INBOX`].
+pub const CHECKPOINT_MARKER: Address = address!("0x42000000000000000000000000000000000000E2");
+
 /// The EVM sender of a derived cross-chain tx from `origin_chain_id`: the
 /// origin's Outbox predeploy, aliased into the destination's address space.
 /// `Inbox.deliver` authenticates against exactly this address (the OP
