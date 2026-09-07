@@ -185,4 +185,18 @@ python3 "${SCRIPT_DIR}/render-sequencer-job.py" --map "${MAP}" > "${JOB}"
 run_job nomad/sequencer.nomad.hcl "steady: final vslot sets"
 wait_running sequencer 300
 rm -f "${NEXT_MAP}"
-log "done: ${TARGET} active lanes. Commit config/shard-map.toml and nomad/sequencer.nomad.hcl."
+log "done: ${TARGET} active lanes."
+# check-contract.py requires partition_count and the ingress --shards to
+# equal the active lane count of the committed map, and accepts a steady
+# count of 1, 2, 4, or 8 only. A committed resize that leaves them
+# behind fails the contract check. Say so here, so the operator commits
+# all four files together.
+case "${TARGET}" in
+  1|2|4|8)
+    log "commit together: config/shard-map.toml, nomad/sequencer.nomad.hcl,"
+    log "  ansible/group_vars/all.yml (partition_count: ${TARGET}),"
+    log "  nomad/ingress.nomad.hcl (\"--shards\", \"${TARGET}\")." ;;
+  *)
+    log "${TARGET} lanes is a transient count: the contract accepts a steady count of 1, 2, 4, or 8."
+    log "  Resize again toward one of those before you commit the map and the job." ;;
+esac
