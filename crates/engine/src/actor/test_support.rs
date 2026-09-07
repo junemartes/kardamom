@@ -1,8 +1,9 @@
 //! Shared fixtures for the actor's test modules: canonical-position and
-//! signed-legacy-transaction builders, writer-signal and writer-queue test
-//! doubles, and the commit-channel drain helper.
+//! signed-legacy-transaction builders, remote-epoch fixtures, writer-signal
+//! and writer-queue test doubles, and the commit-channel drain helper.
 
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
@@ -10,12 +11,23 @@ use alloy_network::TxSignerSync;
 use alloy_primitives::{Address, Bytes as AlloyBytes, TxKind as APTxKind, U256, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
-use crossbeam_channel::Receiver;
-use kardamom_types::{BPosition, BlockBoundary, BlockDelta, TxEnvelope as KtTxEnvelope};
+use crossbeam_channel::{Receiver, Sender};
+use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage, remote_source_hash};
+use kardamom_types::{
+    BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource,
+    TxEnvelope as KtTxEnvelope,
+};
+use revm::primitives::KECCAK_EMPTY;
 
 use crate::error::ExecutorError;
+use crate::exec_types::TxIndex;
+use crate::reader::{NoEpochCheck, ReaderToExec, RemoteEpochObserver};
+use crate::state::MockStateDatabase;
 
-use super::{ExecToCommit, StateWriterQueue, StateWriterSignal};
+use super::{
+    BalHandoff, BlockExec, ExecHooks, ExecInputs, ExecToCommit, ExecutorConfig, ResumePoint,
+    StateWriterQueue, StateWriterSignal, spawn_exec,
+};
 
 pub(super) fn pos(off: i32) -> BPosition {
     BPosition {
@@ -24,7 +36,55 @@ pub(super) fn pos(off: i32) -> BPosition {
     }
 }
 
-pub(super) fn legacy(
+/// A `MockStateDatabase` funding `signer`'s address with 1 ETH at `nonce`.
+/// The common pre-block snapshot most streaming exec tests start from.
+pub(super) fn funded(signer: &PrivateKeySigner, nonce: u64) -> MockStateDatabase {
+    MockStateDatabase::builder()
+        .account(
+            signer.address(),
+            U256::from(10u128.pow(18)),
+            nonce,
+            KECCAK_EMPTY,
+        )
+        .build()
+}
+
+/// Build a `ReaderToExec::Boundary` message: `block_number` closes at
+/// `end_count` canonical records (encoded as a `BPosition`), stamped
+/// `l2_timestamp`. `l1_origin` is always 0 in this crate's fixtures; no
+/// test here exercises a non-zero epoch.
+pub(super) fn boundary_msg(block_number: u64, end_count: i32, l2_timestamp: u64) -> ReaderToExec {
+    ReaderToExec::Boundary(BlockBoundaryStart {
+        block_number,
+        end_tx_idx: pos(end_count),
+        l2_timestamp,
+        l1_origin: 0,
+    })
+}
+
+/// Build a `ReaderToExec::Tx` message: canonical index `idx` (used for
+/// both `tx_idx` and `position` — the common case where a tx's wire
+/// position matches its canonical count), a `legacy` transfer of `value`
+/// to `to` at nonce `nonce`.
+pub(super) fn tx_msg(
+    signer: &PrivateKeySigner,
+    to: Address,
+    idx: u64,
+    nonce: u64,
+    value: u64,
+) -> ReaderToExec {
+    ReaderToExec::Tx {
+        tx_idx: TxIndex(idx),
+        envelope: legacy(signer, to, nonce, value),
+        position: pos(i32::try_from(idx).expect("test fixture: idx fits in i32")),
+    }
+}
+
+/// Build a signed legacy transfer, wrapped as a `kardamom_types::TxEnvelope`.
+/// This matches what the proxy hands downstream, with `sender` and
+/// `tx_hash` stamped. `pub(crate)`: `reader::tests` and `replay::tests`
+/// also build this fixture, and import this one copy instead of their own.
+pub(crate) fn legacy(
     signer: &PrivateKeySigner,
     to: Address,
     nonce: u64,
@@ -81,7 +141,11 @@ impl StateWriterSignal for StagedCommit {
     }
 }
 
-pub(super) struct RecordingQueue(pub(super) Arc<Mutex<Vec<(BlockBoundary, BlockDelta)>>>);
+/// Every `(BlockBoundary, BlockDelta)` a `RecordingQueue` or
+/// `ApplyingRecordingQueue` has submitted, in submit order.
+pub(super) type WriterLog = Arc<Mutex<Vec<(BlockBoundary, BlockDelta)>>>;
+
+pub(super) struct RecordingQueue(pub(super) WriterLog);
 impl StateWriterQueue for RecordingQueue {
     fn submit(&mut self, b: BlockBoundary, d: BlockDelta) -> Result<(), ExecutorError> {
         self.0.lock().unwrap().push((b, d));
@@ -91,7 +155,7 @@ impl StateWriterQueue for RecordingQueue {
 
 /// Drain a closed `ExecToCommit` receiver. Return the block numbers of the
 /// emitted receipts and boundaries, each in order.
-pub(super) fn drain_commits(rx: Receiver<ExecToCommit>) -> (Vec<u64>, Vec<u64>) {
+pub(super) fn drain_commits(rx: &Receiver<ExecToCommit>) -> (Vec<u64>, Vec<u64>) {
     let mut receipts = Vec::new();
     let mut boundaries = Vec::new();
     while let Ok(m) = rx.recv() {
@@ -116,7 +180,7 @@ pub(super) fn drain_commits(rx: Receiver<ExecToCommit>) -> (Vec<u64>, Vec<u64>) 
 /// behavior production would never show.
 pub(super) struct ApplyingRecordingQueue {
     pub(super) db: kardamom_exec_core::state::MockStateDatabase,
-    pub(super) log: Arc<Mutex<Vec<(BlockBoundary, BlockDelta)>>>,
+    pub(super) log: WriterLog,
 }
 
 impl StateWriterQueue for ApplyingRecordingQueue {
@@ -124,5 +188,202 @@ impl StateWriterQueue for ApplyingRecordingQueue {
         self.db.apply_block_delta(&d);
         self.log.lock().unwrap().push((b, d));
         Ok(())
+    }
+}
+
+/// Build a remote-epoch record with `n` messages, for the interop tests.
+pub(super) fn remote_epoch_fixture(origin: u64, n: u64) -> RemoteEpochRecord {
+    RemoteEpochRecord {
+        origin_chain_id: origin,
+        anchor_number: 900,
+        anchor_hash: alloy_primitives::B256::repeat_byte(0x0A),
+        first_seq: 0,
+        messages: (0..n)
+            .map(|seq| XChainMessage {
+                source_hash: remote_source_hash(origin, seq),
+                seq,
+                origin_sender: Address::repeat_byte(0xA5),
+                target: Address::repeat_byte(0xB6),
+                value: 0,
+                gas_limit: 100_000,
+                input: bytes::Bytes::default(),
+                callback: None,
+            })
+            .collect(),
+    }
+}
+
+/// Build the marker + its messages, mirroring what the `tx_ordering` reader
+/// dispatches for one record. The caller appends the closing boundary.
+pub(super) fn remote_epoch_records(record: RemoteEpochRecord) -> Vec<ReaderToExec> {
+    let origin = record.origin_chain_id;
+    let messages = record.messages.clone();
+    let mut out = vec![ReaderToExec::RemoteEpoch {
+        tx_idx: TxIndex(0),
+        record: Box::new(record),
+        position: pos(0),
+    }];
+    out.extend(
+        messages
+            .into_iter()
+            .enumerate()
+            .map(|(i, message)| ReaderToExec::XChain {
+                tx_idx: TxIndex(1 + i as u64),
+                origin_chain_id: origin,
+                message: Box::new(message),
+                position: pos(1 + i32::try_from(i).expect("small test fixture")),
+            }),
+    );
+    out
+}
+
+/// Feed `records` into a fresh unbounded channel, then close the sender.
+/// This is the reader-to-exec handoff shape every exec test drives: every
+/// record is queued before `spawn_exec` starts, and the closed sender
+/// signals end-of-stream once the exec thread drains them.
+pub(super) fn feed(records: Vec<ReaderToExec>) -> Receiver<ReaderToExec> {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    for record in records {
+        tx.send(record).unwrap();
+    }
+    rx
+}
+
+/// Same as [`feed`], for the exec-to-commit channel: queue every message,
+/// then close the sender, so `spawn_commit` sees a clean end of stream
+/// after draining them.
+pub(super) fn feed_commits(messages: Vec<ExecToCommit>) -> Receiver<ExecToCommit> {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    for message in messages {
+        tx.send(message).unwrap();
+    }
+    rx
+}
+
+/// Builder for `spawn_exec`'s test fixtures. Every exec test wires the same
+/// twelve-argument call, with nine of the twelve almost always `None`. This
+/// collects them: `cfg` is always `ExecutorConfig::default()` and `start`
+/// is always `ResumePoint::GENESIS` in every current test, so both start
+/// there; the hook builders opt in only where a test needs one.
+///
+/// `E` is fixed to [`NoEpochCheck`], since no test in this crate supplies a
+/// non-trivial epoch observer.
+/// Depth for the `ExecRig`-owned exec-to-commit channel. Nothing drains it
+/// until after `.join()` (or, for the idle-probe test, until the test
+/// reads it directly), so this only needs to comfortably exceed the
+/// largest receipt+boundary count any current test produces (at most a
+/// few dozen).
+const RIG_COMMIT_CAPACITY: usize = 128;
+
+pub(super) struct ExecRig<S: SnapshotSource, Q, P> {
+    snapshots: S,
+    sw_signal: Q,
+    sw_queue: P,
+    start: ResumePoint,
+    bal_tx: Option<Sender<BalHandoff>>,
+    shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
+    block_exec: Option<BlockExec<<S as SnapshotSource>::Db>>,
+    remote_epoch_observer: Option<Box<dyn RemoteEpochObserver>>,
+    tx_e2c: Sender<ExecToCommit>,
+    rx_e2c: Receiver<ExecToCommit>,
+}
+
+impl<S, Q, P> ExecRig<S, Q, P>
+where
+    S: SnapshotSource + 'static,
+    Q: StateWriterSignal + 'static,
+    P: StateWriterQueue + 'static,
+{
+    pub(super) fn new(snapshots: S, sw_signal: Q, sw_queue: P) -> Self {
+        let (tx_e2c, rx_e2c) = crossbeam_channel::bounded(RIG_COMMIT_CAPACITY);
+        Self {
+            snapshots,
+            sw_signal,
+            sw_queue,
+            start: ResumePoint::GENESIS,
+            bal_tx: None,
+            shadow_tx: None,
+            block_exec: None,
+            remote_epoch_observer: None,
+            tx_e2c,
+            rx_e2c,
+        }
+    }
+
+    pub(super) fn start(mut self, start: ResumePoint) -> Self {
+        self.start = start;
+        self
+    }
+
+    pub(super) fn bal(mut self, tx: Sender<BalHandoff>) -> Self {
+        self.bal_tx = Some(tx);
+        self
+    }
+
+    pub(super) fn shadow(mut self, tx: Sender<crate::shadow::ShadowBlock>) -> Self {
+        self.shadow_tx = Some(tx);
+        self
+    }
+
+    pub(super) fn block_exec(mut self, strategy: BlockExec<S::Db>) -> Self {
+        self.block_exec = Some(strategy);
+        self
+    }
+
+    pub(super) fn remote(mut self, observer: Box<dyn RemoteEpochObserver>) -> Self {
+        self.remote_epoch_observer = Some(observer);
+        self
+    }
+
+    /// Spawns the exec thread. Returns its handle, and the exec-to-commit
+    /// receiver.
+    ///
+    /// The receiver must come back to the caller, not stay a field this
+    /// method drops: `self.rx_e2c` is the channel's only receiver, and a
+    /// bounded `Sender::send` inside the exec thread turns into an
+    /// immediate `Flow::Stop` the moment its last receiver disappears.
+    /// Returning it here, for the caller to bind (even to a name the test
+    /// never reads), keeps it alive until the test's own scope ends —
+    /// normally past the `.join()` call this handle is for.
+    pub(super) fn spawn(
+        self,
+        rx: Receiver<ReaderToExec>,
+    ) -> (
+        JoinHandle<Result<(), ExecutorError>>,
+        Receiver<ExecToCommit>,
+    ) {
+        let rx_e2c = self.rx_e2c;
+        let h = spawn_exec::<S, Q, P, NoEpochCheck>(ExecInputs {
+            cfg: ExecutorConfig::default(),
+            rx,
+            tx: self.tx_e2c,
+            snapshots: self.snapshots,
+            sw_signal: self.sw_signal,
+            sw_queue: self.sw_queue,
+            start: self.start,
+            hooks: ExecHooks {
+                bal_tx: self.bal_tx,
+                shadow_tx: self.shadow_tx,
+                block_exec: self.block_exec,
+                epoch_observer: None,
+                remote_epoch_observer: self.remote_epoch_observer,
+            },
+        });
+        (h, rx_e2c)
+    }
+}
+
+impl<S, Q> ExecRig<S, Q, RecordingQueue>
+where
+    S: SnapshotSource + 'static,
+    Q: StateWriterSignal + 'static,
+{
+    /// Convenience constructor for the common case: a `RecordingQueue`
+    /// writer over a fresh writer log. Returns the rig and a clone of the
+    /// log handle, since `RecordingQueue` owns the other clone.
+    pub(super) fn recording(snapshots: S, sw_signal: Q) -> (Self, WriterLog) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let rig = Self::new(snapshots, sw_signal, RecordingQueue(log.clone()));
+        (rig, log)
     }
 }

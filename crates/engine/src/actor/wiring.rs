@@ -1,7 +1,7 @@
 //! Type-level wiring of the executor actor.
 //!
-//! [`Executor::run`] used to take 13 positional arguments, three of them
-//! boxed trait objects. This module replaces that shape with two ideas:
+//! This module gives [`Executor::run`] two ideas in place of a long
+//! positional argument list:
 //!
 //! - One [`EngineWiring`] impl per role names every port type the run is
 //!   generic over (seven associated types). So `run` carries a single type
@@ -18,10 +18,11 @@
 //!
 //! A caller that needs to pick an implementation at runtime (for example,
 //! the validator's optional attester tee around its receipts sink) still
-//! can. Every port trait has a forwarding impl for its boxed form, so the
-//! wiring can name `Box<dyn ...>` as that one associated type. This way,
-//! the choice of dynamic dispatch stays with the caller that needs it,
-//! instead of being forced on every caller by the API.
+//! can. [`TxReceiptsPublication`] has a forwarding impl for its boxed
+//! form, so the wiring can name `Box<dyn TxReceiptsPublication>` as that
+//! one associated type. This way, the choice of dynamic dispatch stays
+//! with the caller that needs it, instead of being forced on every caller
+//! by the API.
 //!
 //! Two closure-shaped inputs stay boxed instead of becoming associated
 //! types: [`BlockExec`] and
@@ -52,8 +53,8 @@ use super::types::{BalHandoff, BlockExec};
 /// ```ignore
 /// struct ValidatorWiring;
 /// impl EngineWiring for ValidatorWiring {
-///     type TxData = Box<dyn TxDataSubscription>; // runtime transport choice
-///     type TxOrdering = Box<dyn TxOrderingSubscription>;
+///     type TxData = ClusterTxDataSubscription;
+///     type TxOrdering = ClusterTxOrderingSubscription;
 ///     type TxReceipts = Box<dyn TxReceiptsPublication>; // attester tee
 ///     type Snapshots = MdbxSnapshotSource;
 ///     type WriterSignal = MdbxWriterSignal;
@@ -64,12 +65,12 @@ use super::types::{BalHandoff, BlockExec};
 ///
 /// [`Executor::run`]: super::Executor::run
 pub trait EngineWiring {
-    /// Per-partition tx_data subscription. There are M of them (see
+    /// Per-partition `tx_data` subscription. There are M of them (see
     /// [`Inbound`]).
     type TxData: TxDataSubscription + 'static;
-    /// The canonical tx_ordering subscription.
+    /// The canonical `tx_ordering` subscription.
     type TxOrdering: TxOrderingSubscription + 'static;
-    /// The tx_receipts publication the commit thread drains into.
+    /// The `tx_receipts` publication the commit thread drains into.
     type TxReceipts: TxReceiptsPublication + 'static;
     /// Post-block state snapshot source: the state writer's read side.
     type Snapshots: SnapshotSource + 'static;
@@ -88,8 +89,8 @@ pub trait EngineWiring {
 /// the double projection through [`SnapshotSource::Db`].
 pub type SnapshotDb<W> = <<W as EngineWiring>::Snapshots as SnapshotSource>::Db;
 
-/// What the reader threads consume: the M tx_data subscriptions, the
-/// canonical tx_ordering subscription, and the optional archive-backed
+/// What the reader threads consume: the M `tx_data` subscriptions, the
+/// canonical `tx_ordering` subscription, and the optional archive-backed
 /// join-miss recovery.
 pub struct Inbound<W: EngineWiring> {
     /// One subscription per sequencer partition (M total). Callers may
@@ -104,7 +105,7 @@ pub struct Inbound<W: EngineWiring> {
     pub join_recovery: Option<JoinRecoveryFactory>,
 }
 
-/// The actor's outbound ports: the tx_receipts publication and the three
+/// The actor's outbound ports: the `tx_receipts` publication and the three
 /// state-writer seams (snapshot source, durability signal, delta queue).
 pub struct Outbound<W: EngineWiring> {
     pub tx_receipts: W::TxReceipts,
@@ -140,6 +141,7 @@ pub struct RoleHooks<W: EngineWiring> {
 impl<W: EngineWiring> RoleHooks<W> {
     /// No role-specific behavior: streaming execution, no BAL capture, and
     /// no epoch check. This is the shape the executor and most tests use.
+    #[must_use]
     pub fn none() -> Self {
         Self {
             bal_capture: None,

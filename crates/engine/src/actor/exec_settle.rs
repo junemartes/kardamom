@@ -7,11 +7,11 @@
 //! end-of-stream close-out.
 //!
 //! The sweep is one method, [`ExecState::settle_ready`]. The boundary entry
-//! point only adds its blocking full-depth `wait_committed` step first.
-//! Before this split, the sweep existed twice, in the idle-probe arm and
-//! the boundary arm. An edit to only one copy would have caused a real
-//! divergence bug.
+//! point only adds its blocking full-depth `wait_committed` step first. One
+//! sweep method serves both entry points, so an edit to the settle logic
+//! cannot apply to only one of them.
 
+use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use kardamom_types::SnapshotSource;
@@ -26,7 +26,12 @@ use super::types::ExecToCommit;
 /// Matches `kardamom_state::geometry::HORIZON_BLOCKS`, the writer's own
 /// bounded queue depth. A deeper exec pipeline would only block in
 /// `submit` instead.
-pub(super) const COMMIT_PIPELINE_DEPTH: usize = 4;
+///
+/// Typed `NonZeroUsize` even though the literal is safe today: at 0, the
+/// depth-cap guard below (`inflight.len() >= COMMIT_PIPELINE_DEPTH`) always
+/// holds, so the exec thread would block in `wait_committed` at every
+/// boundary and the pipeline would silently collapse to depth 1.
+pub(super) const COMMIT_PIPELINE_DEPTH: NonZeroUsize = NonZeroUsize::new(4).expect("4 is nonzero");
 
 impl<S, Q, P, E> ExecState<S, Q, P, E>
 where
@@ -43,22 +48,20 @@ where
     /// survivors, because a merged map cannot be subtracted from. The
     /// `msg` argument keeps the log shape of the two call sites
     /// distinguishable.
-    pub(super) fn settle_ready(
-        &mut self,
-        durable: u64,
-        msg: &'static str,
-    ) -> Result<Flow, ExecutorError> {
+    pub(super) fn settle_ready(&mut self, durable: u64, msg: &'static str) -> Flow {
         let mut newest_settled = None;
-        while self
+        while let Some((b, _)) = self
             .inflight
-            .front()
-            .is_some_and(|(b, _)| b.block_number <= durable)
+            .pop_front_if(|(b, _)| b.block_number <= durable)
         {
-            let (b, _) = self.inflight.pop_front().expect("front checked");
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "block numbers stay far below 2^52"
+            )]
             metrics::gauge!(crate::metrics::BLOCK_NUMBER).set(b.block_number as f64);
             newest_settled = Some(b.block_number);
             if self.tx.send(ExecToCommit::Boundary(b)).is_err() {
-                return Ok(Flow::Stop);
+                return Flow::Stop;
             }
         }
         if let Some(n) = newest_settled {
@@ -78,7 +81,7 @@ where
                 }
             });
         }
-        Ok(Flow::Continue)
+        Flow::Continue
     }
 
     /// Boundary-arm settling. This runs the non-blocking
@@ -90,23 +93,19 @@ where
     /// back-pressure is correct.
     pub(super) fn settle_at_boundary(&mut self) -> Result<Flow, ExecutorError> {
         let mut durable = self.sw_signal.committed()?;
-        if self.inflight.len() >= COMMIT_PIPELINE_DEPTH
+        if self.inflight.len() >= COMMIT_PIPELINE_DEPTH.get()
             && self
                 .inflight
                 .front()
                 .is_some_and(|(b, _)| b.block_number > durable)
         {
-            let oldest = self
-                .inflight
-                .front()
-                .map(|(b, _)| b.block_number)
-                .unwrap_or(0);
+            let oldest = self.inflight.front().map_or(0, |(b, _)| b.block_number);
             let commit_wait = Instant::now();
             durable = self.sw_signal.wait_committed(oldest)?;
             metrics::histogram!(crate::metrics::STATE_COMMIT_DURATION_SECONDS)
                 .record(commit_wait.elapsed().as_secs_f64());
         }
-        self.settle_ready(durable, "pipelined commits settled; snapshot swapped")
+        Ok(self.settle_ready(durable, "pipelined commits settled; snapshot swapped"))
     }
 
     /// Idle-probe settling. This runs the same non-blocking settle sweep
@@ -121,20 +120,20 @@ where
         //
         // Between blocks, both are empty. This is the idle-tail case this
         // probe exists for. A mid-block gap simply defers to the next
-        // boundary's sweep, the same as before this probe existed.
+        // boundary's sweep.
         if self.scope.is_some() || !self.buffered.is_empty() {
             return Ok(Flow::Continue);
         }
         let durable = self.sw_signal.committed()?;
-        self.settle_ready(
+        Ok(self.settle_ready(
             durable,
             "pipelined commits settled on idle probe; snapshot swapped",
-        )
+        ))
     }
 
     /// Clean end of stream. Settle every in-flight commit so the pipeline
     /// does not silently drop the final boundaries.
-    pub(super) fn on_closed(&mut self) -> Result<(), ExecutorError> {
+    pub(super) fn on_closed(&mut self) {
         if let Some((last, _)) = self.inflight.back() {
             let last_n = last.block_number;
             if self.sw_signal.wait_committed(last_n).is_ok() {
@@ -143,6 +142,5 @@ where
                 }
             }
         }
-        Ok(())
     }
 }

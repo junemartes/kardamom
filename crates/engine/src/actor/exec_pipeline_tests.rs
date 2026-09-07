@@ -2,111 +2,64 @@
 //! unsettled blocks, depth-K blocking behavior, and idle-tail settling
 //! through the probe.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::reader::ReaderToExec;
+use crate::state::{MockStateDatabase, StaticSnapshotSource};
 use alloy_primitives::{U256, address};
 use alloy_signer_local::PrivateKeySigner;
 use crossbeam_channel::bounded;
-use kardamom_types::BlockBoundaryStart;
-use revm::primitives::KECCAK_EMPTY;
 
-use crate::exec_types::TxIndex;
-use crate::reader::{NoEpochCheck, ReaderToExec};
-use crate::state::{MockStateDatabase, StaticSnapshotSource};
-
-use super::test_support::{ImmediateCommit, RecordingQueue, StagedCommit, legacy, pos};
-use super::{ExecToCommit, ExecutorConfig, ResumePoint, spawn_exec};
+use super::ExecToCommit;
+use super::test_support::{
+    ExecRig, ImmediateCommit, StagedCommit, boundary_msg, feed, funded, tx_msg,
+};
 
 /// This test checks pipelined commit. Block N+1 executes against
 /// snapshot plus parent(N) while block N's commit is still unsettled.
 /// Boundaries still forward in order once their block is durable. The
-/// StaticSnapshotSource never advances, so cross-block visibility can
+/// `StaticSnapshotSource` never advances, so cross-block visibility can
 /// only come from the parent layer. A broken layer makes the block-2
 /// spend fail (status 0) and turns this test red.
 #[test]
 fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
     let signer_a = PrivateKeySigner::random();
     let signer_b = PrivateKeySigner::random();
-    let a = signer_a.address();
     let b = signer_b.address();
     let c = address!("00000000000000000000000000000000000ABCDE");
 
     // Only A is funded at genesis. B's balance exists only in block 1's
     // delta until that block's commit lands. The static source never
     // exposes that commit.
-    let snap = MockStateDatabase::builder()
-        .account(a, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
-        .build();
-    let writer_log = Arc::new(Mutex::new(Vec::new()));
-
-    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
-    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(8);
+    let snap = funded(&signer_a, 0);
+    let (rig, writer_log) = ExecRig::recording(StaticSnapshotSource(snap), ImmediateCommit);
 
     // Block 1: A sends to B, a large transfer so B can pay gas in block 2.
-    tx_r2e
-        .send(ReaderToExec::Tx {
-            tx_idx: TxIndex(0),
-            envelope: legacy(&signer_a, b, 0, 100_000_000_000_000_000),
-            position: pos(0),
-        })
-        .unwrap();
-    tx_r2e
-        .send(ReaderToExec::Boundary(BlockBoundaryStart {
-            block_number: 1,
-            end_tx_idx: pos(1),
-            l2_timestamp: 1_700_000_000,
-            l1_origin: 0,
-        }))
-        .unwrap();
     // Block 2: B sends to C, spending funds B has only from block 1's writes.
-    tx_r2e
-        .send(ReaderToExec::Tx {
-            tx_idx: TxIndex(1),
-            envelope: legacy(&signer_b, c, 0, 60),
-            position: pos(1),
-        })
-        .unwrap();
-    tx_r2e
-        .send(ReaderToExec::Boundary(BlockBoundaryStart {
-            block_number: 2,
-            end_tx_idx: pos(2),
-            l2_timestamp: 1_700_000_002,
-            l1_origin: 0,
-        }))
-        .unwrap();
-    drop(tx_r2e);
+    let rx_r2e = feed(vec![
+        tx_msg(&signer_a, b, 0, 0, 100_000_000_000_000_000),
+        boundary_msg(1, 1, 1_700_000_000),
+        tx_msg(&signer_b, c, 1, 0, 60),
+        boundary_msg(2, 2, 1_700_000_002),
+    ]);
 
-    let cfg = ExecutorConfig::default();
-    let h = spawn_exec(
-        cfg,
-        rx_r2e,
-        tx_e2c,
-        StaticSnapshotSource(snap),
-        ImmediateCommit,
-        RecordingQueue(writer_log.clone()),
-        ResumePoint::GENESIS,
-        None,
-        None,
-        None,
-        None::<NoEpochCheck>,
-        None,
-    );
+    let (h, rx_e2c) = rig.spawn(rx_r2e);
     h.join().expect("no panic").expect("exec ok");
 
     // The e2c ordering proves the pipeline shape. Block 2's receipt streams
     // before boundary 1 forwards. Boundary 1 settles when boundary 2
     // enters; boundary 2 settles at the end of the stream.
-    let mut kinds = Vec::new();
-    while let Ok(m) = rx_e2c.try_recv() {
-        kinds.push(match m {
+    let kinds: Vec<String> = rx_e2c
+        .try_iter()
+        .map(|m| match m {
             ExecToCommit::Receipt(r) => {
                 assert!(r.status, "every tx must succeed (parent layer visible)");
                 format!("R{}", r.block_number)
             }
             ExecToCommit::Boundary(bd) => format!("B{}", bd.block_number),
-        });
-    }
+        })
+        .collect();
     assert_eq!(
         kinds,
         vec!["R1", "R2", "B1", "B2"],
@@ -133,42 +86,23 @@ fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
 #[test]
 fn exec_pipelines_k_deep_and_blocks_only_at_capacity() {
     let snap = MockStateDatabase::builder().build();
-    let writer_log = Arc::new(Mutex::new(Vec::new()));
     let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let blocking_waits = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(16);
-    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(16);
-
-    for n in 1..=6u64 {
-        tx_r2e
-            .send(ReaderToExec::Boundary(BlockBoundaryStart {
-                block_number: n,
-                end_tx_idx: pos(0),
-                l2_timestamp: 1_700_000_000 + n,
-                l1_origin: 0,
-            }))
-            .unwrap();
-    }
-    drop(tx_r2e);
-
-    let h = spawn_exec(
-        ExecutorConfig::default(),
-        rx_r2e,
-        tx_e2c,
+    let (rig, writer_log) = ExecRig::recording(
         StaticSnapshotSource(snap),
         StagedCommit {
             durable: durable.clone(),
             blocking_waits: blocking_waits.clone(),
         },
-        RecordingQueue(writer_log.clone()),
-        ResumePoint::GENESIS,
-        None,
-        None,
-        None,
-        None::<NoEpochCheck>,
-        None,
     );
+    let rx_r2e = feed(
+        (1..=6u64)
+            .map(|n| boundary_msg(n, 0, 1_700_000_000 + n))
+            .collect(),
+    );
+
+    let (h, rx_e2c) = rig.spawn(rx_r2e);
     h.join().expect("no panic").expect("exec ok");
 
     // Boundaries 1-4 pipeline without any blocking wait. Boundaries 5 and
@@ -203,44 +137,26 @@ fn exec_pipelines_k_deep_and_blocks_only_at_capacity() {
 #[test]
 fn exec_settles_inflight_commits_while_idle() {
     let snap = MockStateDatabase::builder().build();
-    let writer_log = Arc::new(Mutex::new(Vec::new()));
     let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let blocking_waits = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(16);
-    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(16);
 
     // Three boundaries, below depth K, so nothing blocks. With the writer
     // stuck at 0, nothing settles either. The channel stays open, so no
     // end-of-stream drain can rescue them.
     for n in 1..=3u64 {
-        tx_r2e
-            .send(ReaderToExec::Boundary(BlockBoundaryStart {
-                block_number: n,
-                end_tx_idx: pos(0),
-                l2_timestamp: 1_700_000_000 + n,
-                l1_origin: 0,
-            }))
-            .unwrap();
+        tx_r2e.send(boundary_msg(n, 0, 1_700_000_000 + n)).unwrap();
     }
 
-    let h = spawn_exec(
-        ExecutorConfig::default(),
-        rx_r2e,
-        tx_e2c,
+    let (rig, _writer_log) = ExecRig::recording(
         StaticSnapshotSource(snap),
         StagedCommit {
             durable: durable.clone(),
             blocking_waits: blocking_waits.clone(),
         },
-        RecordingQueue(writer_log.clone()),
-        ResumePoint::GENESIS,
-        None,
-        None,
-        None,
-        None::<NoEpochCheck>,
-        None,
     );
+    let (h, rx_e2c) = rig.spawn(rx_r2e);
 
     // The writer catches up on its own. The exec thread must notice
     // through the idle probe and forward all three boundaries, with no

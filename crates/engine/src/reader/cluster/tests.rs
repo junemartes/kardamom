@@ -6,9 +6,20 @@ use kardamom_cluster_adapter::wire::{
 };
 use kardamom_types::TxRef;
 
+/// Format one delivered record as a short tag, for order assertions.
+fn label((pos, msg): (BPosition, TxOrderingMessage)) -> String {
+    match msg {
+        TxOrderingMessage::TxRef(_) => format!("r{}", pos.as_index()),
+        TxOrderingMessage::BoundaryStart(b) => format!("b{}", b.block_number),
+        other => format!("?{other:?}"),
+    }
+}
+
 fn relayed_txref(shard: u8, off: i32) -> Vec<u8> {
     let r = TxRef::new(
-        B256::repeat_byte(off as u8),
+        B256::repeat_byte(
+            u8::try_from(off).expect("test fixture: off is a small non-negative offset"),
+        ),
         shard,
         BPosition {
             term_id: 0,
@@ -33,7 +44,10 @@ fn replay_gap_is_reordered_and_deduped() {
     // Replayed frames, in emission order. This includes a duplicate of
     // record 5's predecessor range, and both boundaries.
     for i in 0..5 {
-        egress.push(encode_egress_record(i, &relayed_txref(1, i as i32)));
+        egress.push(encode_egress_record(
+            i,
+            &relayed_txref(1, i32::try_from(i).expect("small test fixture")),
+        ));
     }
     egress.push(encode_egress_boundary(1, 2, 1_000, 0));
     egress.push(encode_egress_boundary(2, 4, 2_000, 0)); // duplicate boundary
@@ -41,15 +55,7 @@ fn replay_gap_is_reordered_and_deduped() {
     egress.close();
 
     let mut sub = ClusterTxOrderingSubscription::new(egress);
-    let mut got = Vec::new();
-    while let Ok((pos, msg)) = sub.next() {
-        let tag = match msg {
-            TxOrderingMessage::TxRef(_) => format!("r{}", pos.as_index()),
-            TxOrderingMessage::BoundaryStart(b) => format!("b{}", b.block_number),
-            other => format!("?{other:?}"),
-        };
-        got.push(tag);
-    }
+    let got: Vec<String> = std::iter::from_fn(|| sub.next().ok()).map(label).collect();
     assert_eq!(got, vec!["r0", "r1", "b1", "r2", "r3", "b2", "r4", "r5"]);
 }
 
@@ -103,21 +109,17 @@ fn resume_cursor_skips_already_applied_range() {
     // the cursor are dropped. Delivery starts exactly at the cursor.
     let egress = FakeEgress::new();
     for i in 0..5 {
-        egress.push(encode_egress_record(i, &relayed_txref(1, i as i32)));
+        egress.push(encode_egress_record(
+            i,
+            &relayed_txref(1, i32::try_from(i).expect("small test fixture")),
+        ));
     }
     egress.push(encode_egress_boundary(1, 2, 1_000, 0)); // below cursor: dup
     egress.push(encode_egress_boundary(2, 5, 2_000, 0));
     egress.push(wire::encode_replay_done(5, 3));
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(3, 2));
-    let mut got = Vec::new();
-    while let Ok((pos, msg)) = sub.next() {
-        got.push(match msg {
-            TxOrderingMessage::TxRef(_) => format!("r{}", pos.as_index()),
-            TxOrderingMessage::BoundaryStart(b) => format!("b{}", b.block_number),
-            other => format!("?{other:?}"),
-        });
-    }
+    let got: Vec<String> = std::iter::from_fn(|| sub.next().ok()).map(label).collect();
     assert_eq!(got, vec!["r3", "r4", "b2"]);
 }
 

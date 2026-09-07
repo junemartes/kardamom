@@ -32,6 +32,7 @@ pub struct MdbxSnapshotSource {
 }
 
 impl MdbxSnapshotSource {
+    #[must_use]
     pub fn new(rx: SnapshotReceiver) -> Self {
         Self { rx }
     }
@@ -62,6 +63,7 @@ pub struct MdbxWriterQueue {
 }
 
 impl MdbxWriterQueue {
+    #[must_use]
     pub fn new(delta_tx: Sender<WriteBatch>) -> Self {
         Self { delta_tx }
     }
@@ -86,6 +88,7 @@ pub struct MdbxWriterSignal {
 }
 
 impl MdbxWriterSignal {
+    #[must_use]
     pub fn new(rx: SnapshotReceiver) -> Self {
         Self { rx }
     }
@@ -93,7 +96,7 @@ impl MdbxWriterSignal {
 
 impl StateWriterSignal for MdbxWriterSignal {
     fn committed(&mut self) -> Result<u64, ExecutorError> {
-        Ok(self.rx.current().map(|s| s.block_number()).unwrap_or(0))
+        Ok(self.rx.current().map_or(0, |s| s.block_number()))
     }
 
     fn wait_committed(&mut self, await_at_least: u64) -> Result<u64, ExecutorError> {
@@ -108,7 +111,7 @@ impl StateWriterSignal for MdbxWriterSignal {
             }
             match self.rx.recv() {
                 Some(s) if s.block_number() >= await_at_least => return Ok(s.block_number()),
-                Some(_) => continue,
+                Some(_) => {}
                 None => {
                     return Err(ExecutorError::State(
                         "state writer stopped before committing block".into(),
@@ -128,7 +131,20 @@ mod tests {
     };
     use kardamom_types::{AccountChange, BPosition, StateDatabase};
 
-    /// Open a fresh SafeNoSync env and spawn its writer. Return the handle and
+    /// Run `f` with a fresh `MdbxWriterQueue` over `delta_tx`, then drop the
+    /// queue at the end of this call. Every `delta_tx` clone must drop
+    /// before `handle.shutdown()` can join the writer thread. Scoping the
+    /// queue to one call, instead of a bare `drop(queue)` at each call
+    /// site, keeps that ordering rule in one place.
+    fn with_queue<T>(
+        delta_tx: &Sender<WriteBatch>,
+        f: impl FnOnce(&mut MdbxWriterQueue) -> T,
+    ) -> T {
+        let mut queue = MdbxWriterQueue::new(delta_tx.clone());
+        f(&mut queue)
+    }
+
+    /// Open a fresh `SafeNoSync` env and spawn its writer. Return the handle and
     /// the temp dir; the caller must keep the dir alive. Tests sync on the
     /// snapshot channel with `wait_committed`, never on wall-clock time.
     fn spawn_writer() -> (tempfile::TempDir, WriterHandle) {
@@ -168,14 +184,19 @@ mod tests {
     #[test]
     fn submit_then_wait_then_snapshot_roundtrips() {
         let (_dir, handle) = spawn_writer();
-        let mut queue = MdbxWriterQueue::new(handle.delta_tx.clone());
         let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
         let source = MdbxSnapshotSource::new(handle.snapshot_rx.clone());
 
         let addr = Address::from([0x42; 20]);
-        queue
-            .submit(boundary(1), block_delta(1, addr, 999))
-            .unwrap();
+        // `shutdown()` (not called here) joins the writer, which exits only
+        // after every delta sender drops. `with_queue` ends the queue's
+        // clone at this call, so the ordering the production binary keeps
+        // (drop the adapters, then call `writer.shutdown()`) holds here too.
+        with_queue(&handle.delta_tx, |queue| {
+            queue
+                .submit(boundary(1), block_delta(1, addr, 999))
+                .unwrap();
+        });
 
         assert_eq!(signal.wait_committed(1).unwrap(), 1);
 
@@ -184,31 +205,24 @@ mod tests {
         assert_eq!(nonce, 1);
         assert_eq!(balance, U256::from(999u64));
         assert_eq!(snap.block_number(), 1);
-
-        // `shutdown()` joins the writer. The writer exits only after every
-        // delta sender drops. So release the queue's clone first. In
-        // production, the executor task owns the adapters and drops them
-        // before the binary calls `writer.shutdown()`. This gives the same
-        // order.
-        drop(queue);
     }
 
     #[test]
     fn wait_committed_returns_ge_requested() {
         let (_dir, mut handle) = spawn_writer();
-        let mut queue = MdbxWriterQueue::new(handle.delta_tx.clone());
         let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
 
         let addr = Address::from([0x07; 20]);
-        queue.submit(boundary(1), block_delta(1, addr, 1)).unwrap();
-        queue.submit(boundary(2), block_delta(2, addr, 2)).unwrap();
+        with_queue(&handle.delta_tx, |queue| {
+            queue.submit(boundary(1), block_delta(1, addr, 1)).unwrap();
+            queue.submit(boundary(2), block_delta(2, addr, 2)).unwrap();
+        });
 
         // Waiting for an already-passed block must not block forever. It must
         // report the actual committed block, which is >= the request.
         assert!(signal.wait_committed(2).unwrap() >= 2);
         assert!(signal.wait_committed(1).unwrap() >= 1);
 
-        drop(queue); // release the delta sender to let the writer exit (see above)
         handle.shutdown().unwrap();
     }
 
@@ -243,15 +257,15 @@ mod tests {
                 .open()
                 .unwrap();
             let mut handle = StateWriter::spawn(env).unwrap();
-            let mut queue = MdbxWriterQueue::new(handle.delta_tx.clone());
             let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
-            for b in 1..=3 {
-                queue
-                    .submit(boundary(b), block_delta(b, addr, b * 10))
-                    .unwrap();
-            }
+            with_queue(&handle.delta_tx, |queue| {
+                for b in 1..=3 {
+                    queue
+                        .submit(boundary(b), block_delta(b, addr, b * 10))
+                        .unwrap();
+                }
+            });
             assert_eq!(signal.wait_committed(3).unwrap(), 3);
-            drop(queue); // release the delta sender to let the writer exit (see above)
             handle.shutdown().unwrap();
         }
 
@@ -273,15 +287,16 @@ mod tests {
 
     #[test]
     fn wait_committed_errors_when_writer_dropped() {
-        let (_dir, handle) = spawn_writer();
-        let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
-
-        // Drop the writer without committing block 1. Closing `delta_tx` ends
-        // the writer thread. This drops the snapshot producer and closes the
-        // notify channel. `wait_committed` then sees the initial block-0
-        // snapshot, which is < 1. It blocks on `recv`, gets `None`, and
-        // returns an error instead of hanging.
-        drop(handle);
+        // Drop the writer without committing block 1, inside this scope.
+        // Closing `delta_tx` ends the writer thread. This drops the
+        // snapshot producer and closes the notify channel. `wait_committed`
+        // then sees the initial block-0 snapshot, which is < 1. It blocks
+        // on `recv`, gets `None`, and returns an error instead of hanging.
+        let (_dir, snapshot_rx) = {
+            let (dir, handle) = spawn_writer();
+            (dir, handle.snapshot_rx.clone())
+        };
+        let mut signal = MdbxWriterSignal::new(snapshot_rx);
 
         let err = signal.wait_committed(1).unwrap_err();
         assert!(matches!(err, ExecutorError::State(_)));
