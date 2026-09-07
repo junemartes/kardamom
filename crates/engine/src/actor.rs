@@ -132,9 +132,7 @@ impl Executor {
             footprint_shadow,
             block_exec,
             epoch_observer,
-            // The hook is not wired yet. The destination-validator
-            // verifier PR removes this discard and the `None` below.
-            remote_epoch_observer: _,
+            remote_epoch_observer,
         } = hooks;
 
         let buffer = JoinBuffer::new();
