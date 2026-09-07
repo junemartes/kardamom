@@ -27,6 +27,7 @@ use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::remote_epoch::process_remote_epoch;
 use kardamom_sequencer::resync::{FloorUpdate, ResyncController, SharedWatermark};
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
+use kardamom_types::shard_map::{VslotSet, vslot_for};
 use kardamom_types::{BPosition, Receipt};
 
 use crate::adapters::{LiveEpochSub, LiveRemoteEpochSub, LiveTxDataSub, LiveTxErrorPub};
@@ -169,26 +170,20 @@ fn run_egress_watermark_feed(
 pub fn spawn_receipt_floor_feed(
     sub: TxReceiptsSubscriberHandle,
     shutdown: Shutdown,
-    partition_count: u32,
-    partition_index: u32,
+    vslots: VslotSet,
     floor_tx: crossbeam_channel::Sender<FloorUpdate>,
 ) -> tokio::task::JoinHandle<()> {
     let rx = sub.into_receiver();
-    tokio::spawn(run_receipt_floor_feed(
-        rx,
-        shutdown,
-        partition_count,
-        partition_index,
-        floor_tx,
-    ))
+    tokio::spawn(run_receipt_floor_feed(rx, shutdown, vslots, floor_tx))
 }
 
 /// Body of the receipts-floors task (see [`spawn_receipt_floor_feed`]).
+/// `vslots` is the replica's whole set, shadow slots included: floors
+/// must advance for the incoming senders during the warm-up too.
 async fn run_receipt_floor_feed(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<(BPosition, Receipt)>,
     shutdown: Shutdown,
-    partition_count: u32,
-    partition_index: u32,
+    vslots: VslotSet,
     floor_tx: crossbeam_channel::Sender<FloorUpdate>,
 ) {
     loop {
@@ -224,9 +219,7 @@ async fn run_receipt_floor_feed(
         // L2 nonce) from publish confirmations (skip
         // receipts count as confirmations: ordering is the
         // claim).
-        if kardamom_sequencer::partition::partition_for(receipt.from, partition_count)
-            != partition_index
-        {
+        if !vslots.contains(vslot_for(receipt.from)) {
             continue;
         }
         // A send failure means the publish loop is gone. Exit.

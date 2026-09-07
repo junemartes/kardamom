@@ -15,7 +15,6 @@ use crate::channels::{IngressPublication, IngressSubscription};
 use crate::error::IngressError;
 use crate::metrics::count_reject;
 use crate::pending::ReceiptResponse;
-use crate::routing::partition_for;
 
 use super::{IngressProxy, ValidatedSubmission};
 
@@ -219,7 +218,7 @@ where
         v: &ValidatedSubmission,
         raw_tx: AlloyBytes,
     ) -> Result<(), IngressError> {
-        let shard = partition_for(v.sender, self.cfg.partition_count_m) as usize;
+        let shard = self.cfg.lane_for(v.sender) as usize;
         let correlation_id = self.next_correlation_id();
         self.publication
             .publish_tx_data(

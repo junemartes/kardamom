@@ -73,9 +73,16 @@ struct Args {
     executor_count: Option<u32>,
     /// The active shard count (M). The ingress opens every lane of the
     /// lane plane, and the identity map routes senders to the first M.
-    /// So M must be 1, 2, 4, or 8. Defaults to 8.
+    /// So M must be 1, 2, 4, or 8. Defaults to 8. `--shard-map` replaces
+    /// the identity map.
     #[arg(long, default_value_t = 8)]
     shards: u32,
+    /// A TOML file with the versioned vslot-to-lane map: `version = N`
+    /// and `table = [256 lanes]`. It replaces the identity map. A resize
+    /// re-renders this file and restarts the ingress. See
+    /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.2.
+    #[arg(long, env = "KARDAMOM_SHARD_MAP")]
+    shard_map: Option<PathBuf>,
     /// Records each per-shard tx_data publication to the Aeron Archive, so
     /// the executor can replay full transaction envelopes on crash
     /// recovery, through `kardamom_log::replay`. Off by default, since
@@ -179,10 +186,21 @@ async fn main() -> Result<()> {
     let raw = std::fs::read_to_string(&args.config).context("read ingress config")?;
     let file_cfg: IngressFileConfig = toml::from_str(&raw).context("parse ingress config")?;
     kardamom_types::shard_map::validate_shard_count(args.shards).context("--shards")?;
+    let shard_map = match args.shard_map.as_deref() {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("read shard map {}", path.display()))?;
+            let map: kardamom_types::shard_map::ShardMap = toml::from_str(&text)
+                .with_context(|| format!("parse shard map {}", path.display()))?;
+            Some(map)
+        }
+        None => None,
+    };
 
     let mut cfg = IngressConfig {
         jsonrpc_bind: args.jsonrpc_bind,
         partition_count_m: args.shards,
+        shard_map,
         ingress_id: args.ingress_id,
         ack_policy: args.ack_policy.into(),
         rpc_max_connections: args.rpc_max_connections,
@@ -196,10 +214,15 @@ async fn main() -> Result<()> {
     cfg.binary_tcp_bind = None;
     cfg.binary_uds_path = None;
 
+    let map_version = cfg.shard_map.as_ref().map(|m| m.version());
+    metrics::gauge!(kardamom_ingress::metrics::SHARD_MAP_VERSION)
+        .set(map_version.unwrap_or(0) as f64);
     tracing::info!(
         jsonrpc_bind = %cfg.jsonrpc_bind,
         shards = cfg.partition_count_m,
         lanes = LANE_COUNT,
+        shard_map_version = ?map_version,
+        active_lanes = cfg.shard_map.as_ref().map(|m| m.active_lanes()),
         ingress_id = cfg.ingress_id,
         ack_policy = ?cfg.ack_policy,
         "kardamom-ingress starting"

@@ -1,5 +1,6 @@
 //! Runtime configuration for a single sequencer process.
 
+use kardamom_types::shard_map::{LANE_COUNT, ShardMap, VslotSet};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -57,6 +58,31 @@ pub struct SequencerConfig {
     /// empty. See `crate::lookup`.
     #[serde(default)]
     pub lookup: crate::lookup::LookupConfig,
+    /// The own tx_data lane. `None` means `sequencer_id`. A ref for an
+    /// envelope on this lane carries this lane. See
+    /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.2.
+    #[serde(default)]
+    pub lane: Option<u8>,
+    /// The virtual slots this replica serves, in the text form
+    /// `"0-7,16,32-47"`. `None` means the identity map: the slots of
+    /// `partition_index` under `lane = vslot % partition_count`. The
+    /// wrong-shard guard drops an envelope whose slot is not in the set.
+    #[serde(default)]
+    pub vslots: Option<VslotSet>,
+    /// The old lanes to read during a resize, in addition to `lane`. An
+    /// envelope on an old lane keeps that lane in its ref.
+    #[serde(default)]
+    pub extra_lanes: Vec<u8>,
+    /// The incoming slots that start in shadow mode: the state machine
+    /// runs, but the ref publisher and the tx_errors publisher stay
+    /// suppressed until the warm-up passes. Must be a subset of `vslots`.
+    #[serde(default)]
+    pub shadow_vslots: VslotSet,
+    /// The warm-up, in ms. Shadow mode ends this long after the
+    /// subscriptions open. `None` means `tx_ttl_ms + 5000`. Must be at
+    /// least `tx_ttl_ms`.
+    #[serde(default)]
+    pub shadow_warm_ms: Option<u64>,
 }
 
 fn default_nonce_floor_lag_ms() -> u64 {
@@ -92,24 +118,89 @@ impl Default for SequencerConfig {
             cluster: ClusterConfig::default(),
             resync: crate::resync::ResyncConfig::default(),
             lookup: crate::lookup::LookupConfig::default(),
+            lane: None,
+            vslots: None,
+            extra_lanes: Vec::new(),
+            shadow_vslots: VslotSet::EMPTY,
+            shadow_warm_ms: None,
         }
     }
 }
 
 impl SequencerConfig {
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.partition_count == 0 {
-            return Err(ConfigError::ZeroPartitions);
+    /// The own tx_data lane.
+    pub fn lane(&self) -> u8 {
+        self.lane.unwrap_or(self.sequencer_id)
+    }
+
+    /// Every lane this replica reads: the own lane first, then the old
+    /// lanes of a resize.
+    pub fn lanes(&self) -> Vec<u8> {
+        std::iter::once(self.lane())
+            .chain(self.extra_lanes.iter().copied())
+            .collect()
+    }
+
+    /// The virtual slots this replica serves. An explicit set wins. The
+    /// default is the identity map over `partition_count`.
+    pub fn vslot_set(&self) -> Result<VslotSet, ConfigError> {
+        match self.vslots {
+            Some(set) => Ok(set),
+            None => {
+                let map =
+                    ShardMap::identity(self.partition_count).map_err(ConfigError::LanePlane)?;
+                Ok(map.vslot_set(self.partition_index as u8))
+            }
         }
-        crate::partition::validate_partition_count(self.partition_count)
-            .map_err(ConfigError::LanePlane)?;
+    }
+
+    /// The shadow warm-up.
+    pub fn shadow_warm(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.shadow_warm_ms.unwrap_or(self.tx_ttl_ms + 5_000))
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.tx_ttl_ms == 0 {
             return Err(ConfigError::ZeroTtl);
         }
-        if self.partition_index >= self.partition_count {
-            return Err(ConfigError::IndexOutOfRange {
-                index: self.partition_index,
-                count: self.partition_count,
+        if self.vslots.is_none() {
+            // The identity map needs a count that fits the lane plane and
+            // an index inside it.
+            if self.partition_count == 0 {
+                return Err(ConfigError::ZeroPartitions);
+            }
+            crate::partition::validate_partition_count(self.partition_count)
+                .map_err(ConfigError::LanePlane)?;
+            if self.partition_index >= self.partition_count {
+                return Err(ConfigError::IndexOutOfRange {
+                    index: self.partition_index,
+                    count: self.partition_count,
+                });
+            }
+        }
+        let lane = self.lane();
+        if lane >= LANE_COUNT {
+            return Err(ConfigError::LaneOutOfPlane(lane));
+        }
+        if let Some(bad) = self.extra_lanes.iter().find(|l| **l >= LANE_COUNT) {
+            return Err(ConfigError::LaneOutOfPlane(*bad));
+        }
+        if self.extra_lanes.contains(&lane) {
+            return Err(ConfigError::ExtraLaneIsOwn(lane));
+        }
+        let vslots = self.vslot_set()?;
+        if !self.shadow_vslots.is_subset_of(&vslots) {
+            return Err(ConfigError::ShadowNotSubset);
+        }
+        if !self.shadow_vslots.is_empty() && self.extra_lanes.is_empty() {
+            return Err(ConfigError::ShadowWithoutOldLane);
+        }
+        if let Some(warm) = self.shadow_warm_ms
+            && warm < self.tx_ttl_ms
+        {
+            return Err(ConfigError::ShadowWarmBelowTtl {
+                warm_ms: warm,
+                ttl_ms: self.tx_ttl_ms,
             });
         }
         Ok(())
@@ -144,6 +235,16 @@ pub enum ConfigError {
     ZeroPartitions,
     #[error("tx_ttl_ms must be >= 1")]
     ZeroTtl,
+    #[error("lane {0} is outside the lane plane of {LANE_COUNT} lanes")]
+    LaneOutOfPlane(u8),
+    #[error("extra_lanes contains the own lane {0}")]
+    ExtraLaneIsOwn(u8),
+    #[error("shadow_vslots is not a subset of vslots")]
+    ShadowNotSubset,
+    #[error("shadow_vslots needs at least one old lane in extra_lanes")]
+    ShadowWithoutOldLane,
+    #[error("shadow_warm_ms {warm_ms} is below tx_ttl_ms {ttl_ms}")]
+    ShadowWarmBelowTtl { warm_ms: u64, ttl_ms: u64 },
     #[error("partition_count does not fit the lane plane: {0}")]
     LanePlane(#[from] crate::partition::PartitionConfigError),
     #[error("partition_index {index} >= partition_count {count}")]
@@ -180,6 +281,98 @@ mod tests {
             };
             assert!(matches!(cfg.validate(), Err(ConfigError::LanePlane(_))));
         }
+    }
+
+    #[test]
+    fn explicit_vslots_skip_the_identity_checks() {
+        // A new shard on lane 2 under a 3-lane map. No identity map fits.
+        let cfg = SequencerConfig {
+            partition_count: 3,
+            partition_index: 2,
+            sequencer_id: 2,
+            lane: Some(2),
+            vslots: Some(VslotSet::parse("2,5,8").unwrap()),
+            extra_lanes: vec![0, 1],
+            shadow_vslots: VslotSet::parse("2,5,8").unwrap(),
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
+        assert_eq!(cfg.lane(), 2);
+        assert_eq!(cfg.lanes(), vec![2, 0, 1]);
+        assert_eq!(cfg.vslot_set().unwrap().len(), 3);
+        assert_eq!(cfg.shadow_warm(), std::time::Duration::from_millis(35_000));
+    }
+
+    #[test]
+    fn default_vslots_follow_the_identity_map() {
+        let cfg = SequencerConfig {
+            partition_count: 2,
+            partition_index: 1,
+            sequencer_id: 1,
+            ..Default::default()
+        };
+        let set = cfg.vslot_set().unwrap();
+        assert_eq!(set.len(), 128);
+        assert!(set.contains(1) && !set.contains(0));
+        assert_eq!(cfg.lane(), 1);
+    }
+
+    #[test]
+    fn resize_config_is_checked() {
+        let base = SequencerConfig {
+            lane: Some(2),
+            vslots: Some(VslotSet::parse("2,5").unwrap()),
+            ..Default::default()
+        };
+        let shadow_not_subset = SequencerConfig {
+            shadow_vslots: VslotSet::parse("9").unwrap(),
+            extra_lanes: vec![0],
+            ..base.clone()
+        };
+        assert!(matches!(
+            shadow_not_subset.validate(),
+            Err(ConfigError::ShadowNotSubset)
+        ));
+        let shadow_without_lane = SequencerConfig {
+            shadow_vslots: VslotSet::parse("2").unwrap(),
+            ..base.clone()
+        };
+        assert!(matches!(
+            shadow_without_lane.validate(),
+            Err(ConfigError::ShadowWithoutOldLane)
+        ));
+        let own_in_extra = SequencerConfig {
+            extra_lanes: vec![2],
+            ..base.clone()
+        };
+        assert!(matches!(
+            own_in_extra.validate(),
+            Err(ConfigError::ExtraLaneIsOwn(2))
+        ));
+        let lane_out = SequencerConfig {
+            lane: Some(8),
+            ..base.clone()
+        };
+        assert!(matches!(
+            lane_out.validate(),
+            Err(ConfigError::LaneOutOfPlane(8))
+        ));
+        let warm_short = SequencerConfig {
+            shadow_warm_ms: Some(1_000),
+            ..base.clone()
+        };
+        assert!(matches!(
+            warm_short.validate(),
+            Err(ConfigError::ShadowWarmBelowTtl { .. })
+        ));
+        let toml_form: SequencerConfig = toml::from_str(
+            "partition_count = 2\npartition_index = 0\nsequencer_id = 0\n\
+             max_pending_per_sender = 16\nbackpressure_policy = \"return_immediately\"\n\
+             lane = 2\nvslots = \"2,5,8\"\nextra_lanes = [0, 1]\nshadow_vslots = \"5\"\n",
+        )
+        .unwrap();
+        assert_eq!(toml_form.vslots.unwrap().to_string(), "2,5,8");
+        assert_eq!(toml_form.shadow_vslots.to_string(), "5");
     }
 
     #[test]

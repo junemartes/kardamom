@@ -6,6 +6,8 @@
 //! `metrics-exporter-prometheus` through `kardamom_obs::init`.
 
 pub const TX_RECEIVED_TOTAL: &str = "kardamom_ingress_tx_received_total";
+/// The installed shard map version. 0 is the identity map.
+pub const SHARD_MAP_VERSION: &str = "kardamom_ingress_shard_map_version";
 pub const TX_ACCEPTED_TOTAL: &str = "kardamom_ingress_tx_accepted_total";
 pub const TX_REJECTED_TOTAL: &str = "kardamom_ingress_tx_rejected_total";
 pub const QUEUE_DEPTH: &str = "kardamom_ingress_queue_depth";

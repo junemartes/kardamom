@@ -21,6 +21,19 @@ pub const PENDING_BUFFER_EXPIRED: &str = "kardamom_sequencer_pending_expired_tot
 pub const NONCE_LOOKUP_REQUESTS: &str = "kardamom_sequencer_nonce_lookup_requests_total";
 pub const NONCE_LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
 pub const NONCE_LOOKUPS_IN_FLIGHT: &str = "kardamom_sequencer_nonce_lookups_in_flight";
+/// Envelopes dropped by the wrong-shard guard: their vslot is not in this
+/// replica's set. During a resize, a new shard reads the old lanes whole,
+/// so this counts the other shards' traffic. It is not an error.
+pub const WRONG_SHARD_DROPPED: &str = "kardamom_sequencer_wrong_shard_dropped_total";
+/// Refs the state machine advanced past in shadow mode without an offer.
+pub const SHADOW_SUPPRESSED: &str = "kardamom_sequencer_shadow_suppressed_total";
+/// The number of vslots in shadow mode. 0 means the replica publishes for
+/// its whole set.
+pub const SHADOW_VSLOTS: &str = "kardamom_sequencer_shadow_vslots";
+/// The parked entries per vslot, refreshed once per second. The resize
+/// runbook reads it for the moved vslots before it restarts the old
+/// shard.
+pub const PENDING_DEPTH: &str = "kardamom_sequencer_pending_depth";
 pub const BACKPRESSURE_EVENTS: &str = "kardamom_sequencer_backpressure_total";
 pub const NONCE_CHECK_DURATION_SECONDS: &str = "kardamom_sequencer_nonce_check_duration_seconds";
 
@@ -67,6 +80,8 @@ pub struct HotMetrics {
     pub evictions: metrics::Counter,
     pub expired: metrics::Counter,
     pub lookup_requests: metrics::Counter,
+    pub wrong_shard: metrics::Counter,
+    pub shadow_suppressed: metrics::Counter,
     pub backpressure: metrics::Counter,
     pub nonce_check_seconds: metrics::Histogram,
 }
@@ -83,10 +98,21 @@ impl HotMetrics {
             evictions: counter!(PENDING_BUFFER_EVICTIONS, "partition" => p.clone()),
             expired: counter!(PENDING_BUFFER_EXPIRED, "partition" => p.clone()),
             lookup_requests: counter!(NONCE_LOOKUP_REQUESTS, "partition" => p.clone()),
+            wrong_shard: counter!(WRONG_SHARD_DROPPED, "partition" => p.clone()),
+            shadow_suppressed: counter!(SHADOW_SUPPRESSED, "partition" => p.clone()),
             backpressure: counter!(BACKPRESSURE_EVENTS, "partition" => p.clone()),
             nonce_check_seconds: histogram!(NONCE_CHECK_DURATION_SECONDS, "partition" => p),
         }
     }
+}
+
+pub fn record_shadow_vslots(partition: u32, n: usize) {
+    gauge!(SHADOW_VSLOTS, "partition" => partition.to_string()).set(n as f64);
+}
+
+pub fn record_pending_depth(partition: u32, vslot: u8, depth: u32) {
+    gauge!(PENDING_DEPTH, "partition" => partition.to_string(), "vslot" => vslot.to_string())
+        .set(depth as f64);
 }
 
 pub fn record_nonce_lookup(partition: u32, outcome: &'static str) {

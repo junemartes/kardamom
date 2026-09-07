@@ -13,10 +13,21 @@
 use crate::error::SequencerError;
 use kardamom_types::{TxDataLoc, TxEnvelope};
 
-/// Subscription to one tx_data stream.
-/// Yields `(TxDataLoc, envelope)` for each Aeron fragment: the envelope
-/// paired with its publisher `session_id` and `BPosition`. Production code
-/// wraps a `log` tx_data subscriber. Tests use [`fakes::ScriptedTxData`].
+/// One envelope off tx_data, with the lane it lives on. The sequencer
+/// stamps the lane into `TxRef::shard_id`, so the executor joins the ref
+/// against the archive that holds the envelope.
+#[derive(Debug)]
+pub struct Inbound {
+    pub lane: u8,
+    pub loc: TxDataLoc,
+    pub envelope: TxEnvelope,
+}
+
+/// Subscription to one or more tx_data lanes.
+/// Yields an [`Inbound`] for each Aeron fragment: the envelope paired
+/// with its lane, its publisher `session_id`, and its `BPosition`.
+/// Production code wraps one `log` tx_data subscriber per lane. Tests use
+/// [`fakes::ScriptedTxData`].
 ///
 /// This has the same shape as the executor's `TxDataSubscription` trait.
 /// The difference: the sequencer is one of P concurrent subscribers per
@@ -26,17 +37,11 @@ use kardamom_types::{TxDataLoc, TxEnvelope};
 /// `TxRef.tx_data_session_id` give the executor a unique join key.
 pub trait TxDataSubscriber: Send {
     /// Poll for at most one message. Returns:
-    ///  - `Ok(Some((loc, env)))` on the next available fragment.
+    ///  - `Ok(Some(inbound))` on the next available fragment.
     ///  - `Ok(None)` when no message is ready (caller backs off).
     ///  - `Err(IngressDisconnected)` when the subscription is permanently
     ///    closed.
-    fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError>;
-
-    /// The tx_data lane this subscription reads. Every envelope from
-    /// `poll` lives on this lane. The sequencer stamps it into
-    /// `TxRef::shard_id`, so the executor joins the ref against the
-    /// archive that holds the envelope.
-    fn lane(&self) -> u8;
+    fn poll(&mut self) -> Result<Option<Inbound>, SequencerError>;
 }
 
 // ===========================================================================
@@ -62,15 +67,15 @@ pub mod fakes {
     }
 
     impl TxDataSubscriber for ScriptedTxData {
-        fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError> {
+        fn poll(&mut self) -> Result<Option<Inbound>, SequencerError> {
             if self.disconnected {
                 return Err(SequencerError::IngressDisconnected);
             }
-            Ok(self.queue.pop_front())
-        }
-
-        fn lane(&self) -> u8 {
-            self.lane
+            Ok(self.queue.pop_front().map(|(loc, envelope)| Inbound {
+                lane: self.lane,
+                loc,
+                envelope,
+            }))
         }
     }
 }

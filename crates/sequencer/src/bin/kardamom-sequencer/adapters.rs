@@ -6,33 +6,46 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_sequencer::epoch::EpochSubscriber;
 use kardamom_sequencer::error::SequencerError;
-use kardamom_sequencer::inbound::TxDataSubscriber;
+use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
 use kardamom_sequencer::outbound::TxErrorPublisher;
 use kardamom_sequencer::remote_epoch::RemoteEpochSubscriber;
 use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{BPosition, EpochRecord, TxDataLoc, TxEnvelope, TxError};
+use kardamom_types::{BPosition, EpochRecord, TxError};
 
+/// The live tx_data subscription set: one handle per lane the sequencer
+/// reads. The own lane comes first. A resize adds the old lanes. The poll
+/// walks the lanes in rotation, so a busy old lane cannot starve the own
+/// lane.
 pub struct LiveTxDataSub {
-    handle: TxDataSubscriberHandle,
-    /// The lane the handle was opened on.
-    lane: u8,
+    lanes: Vec<(u8, TxDataSubscriberHandle)>,
+    next: usize,
 }
 
 impl LiveTxDataSub {
-    pub fn new(handle: TxDataSubscriberHandle, lane: u8) -> Self {
-        Self { handle, lane }
+    pub fn new(lanes: Vec<(u8, TxDataSubscriberHandle)>) -> Self {
+        assert!(!lanes.is_empty(), "a sequencer reads at least one lane");
+        Self { lanes, next: 0 }
     }
 }
 
 impl TxDataSubscriber for LiveTxDataSub {
-    fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError> {
+    fn poll(&mut self) -> Result<Option<Inbound>, SequencerError> {
         // try_recv is non-blocking. The Sequencer's run loop handles
         // backoff when poll returns None.
-        Ok(self.handle.try_recv())
-    }
-
-    fn lane(&self) -> u8 {
-        self.lane
+        let n = self.lanes.len();
+        for i in 0..n {
+            let idx = (self.next + i) % n;
+            let (lane, handle) = &mut self.lanes[idx];
+            if let Some((loc, envelope)) = handle.try_recv() {
+                self.next = (idx + 1) % n;
+                return Ok(Some(Inbound {
+                    lane: *lane,
+                    loc,
+                    envelope,
+                }));
+            }
+        }
+        Ok(None)
     }
 }
 

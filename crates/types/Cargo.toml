@@ -34,6 +34,7 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 thiserror = { version = "2", default-features = false }
 
 [dev-dependencies]
+serde_json = "1"
 # rkyv roundtrip tests only — nothing I/O
 # `sol!`-generated encoder: the compiler-grade oracle the hand-rolled
 # `xchain::deliver_calldata` is pinned byte-identical against.
