@@ -197,28 +197,18 @@ async fn run_receipt_floor_feed(
                 None => return,
             },
         };
-        // Nonce-0 receipts are excluded from floor
-        // evidence. A deposit receipt stamps a filler
-        // `nonce: 0` (deposits run with the nonce check
-        // disabled; see executor.rs `tx_env_from_deposit`).
-        // This makes it indistinguishable, on the wire,
-        // from a genuine nonce-0 transaction receipt.
-        // Treating one as proof that L2 tx-nonce 0 executed
-        // could wrongly Past-reject a sender's first
-        // transaction. The cost: floors only ever prove
-        // from nonce 1 upward. This degrades toward
-        // publish, the safer side.
+        // Forward every receipt of this replica's vslots, nonce 0
+        // included. A deposit receipt carries `Receipt::tx_type ==
+        // TX_TYPE_DEPOSIT`, so the controller tells it apart from a
+        // genuine nonce-0 transaction receipt. It excludes deposits and
+        // skip receipts from floor evidence (they consume no L2 nonce),
+        // and counts skip receipts as publish confirmations (ordering is
+        // the claim).
         //
-        // Only this shard's senders can appear in this
-        // replica's publish stream, so the floor map stays
-        // bounded to them.
-        //
-        // Forward every partition-matched receipt. The
-        // controller splits floor evidence (skip and
-        // deposit receipts excluded, since they consume no
-        // L2 nonce) from publish confirmations (skip
-        // receipts count as confirmations: ordering is the
-        // claim).
+        // Only this replica's senders can appear in its publish stream,
+        // so the floor map stays bounded to them. The set includes the
+        // shadow vslots of a resize: floors must advance for the
+        // incoming senders during the warm-up too.
         if !vslots.contains(vslot_for(receipt.from)) {
             continue;
         }
