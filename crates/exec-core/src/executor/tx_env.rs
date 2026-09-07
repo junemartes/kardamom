@@ -128,17 +128,22 @@ pub(super) fn tx_env_from_deposit(dep: &Deposit) -> TxEnv {
 /// Build a `TxEnv` for one cross-chain delivery. The call is fee-free
 /// (`gas_price = 0`), carries no nonce, and its caller is the aliased
 /// origin Outbox — the only address `Inbox.deliver` accepts. `gas_limit`
-/// adds [`super::xchain::XCHAIN_DELIVERY_OVERHEAD`] on top of the
-/// message's own budget, to also pay for the Inbox's own bookkeeping.
+/// is [`super::xchain::xchain_gas_budget`]: the message's own budget, plus
+/// [`super::xchain::XCHAIN_DELIVERY_OVERHEAD`] for the Inbox's bookkeeping,
+/// plus the intrinsic gas of the delivery calldata.
+///
+/// Both delivery paths (the free `execute_xchain_tx` and
+/// `Executor::execute_xchain`) build their `TxEnv` here, so the budget
+/// cannot drift between them.
 pub(super) fn tx_env_from_xchain(origin_chain_id: u64, message: &XChainMessage) -> TxEnv {
+    let calldata = xchain::deliver_calldata(origin_chain_id, message);
+    let gas_limit = super::xchain::xchain_gas_budget(message.gas_limit, &calldata);
     TxEnv {
         caller: xchain::xchain_tx_sender(origin_chain_id),
         kind: TxKind::Call(xchain::INBOX),
         value: alloy_primitives::U256::ZERO,
-        data: AlloyBytes::from(xchain::deliver_calldata(origin_chain_id, message)),
-        gas_limit: message
-            .gas_limit
-            .saturating_add(super::xchain::XCHAIN_DELIVERY_OVERHEAD),
+        data: AlloyBytes::from(calldata),
+        gas_limit,
         gas_price: 0,
         nonce: 0,
         chain_id: None,

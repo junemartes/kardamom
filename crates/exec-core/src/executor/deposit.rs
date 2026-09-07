@@ -3,11 +3,11 @@
 //! canonical id.
 
 use alloy_primitives::U256;
-use kardamom_types::{BPosition, Deposit, Receipt, StateDatabase, WireLog};
-use revm::context::result::ExecutionResult;
+use kardamom_types::{BPosition, Deposit, Receipt, SkipReason, StateDatabase, WireLog};
+use revm::context::result::{EVMError, ExecutionResult};
 use revm::database::CacheDB;
 use revm::primitives::Log;
-use revm::state::Account;
+use revm::state::{Account, AccountInfo};
 use revm::{Context, DatabaseCommit, ExecuteCommitEvm, MainBuilder, MainContext};
 
 use alloc::format;
@@ -19,8 +19,87 @@ use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
 
 use super::db::{SnapshotRef, seed_cache_layer};
+use super::scope::{derived_tx_rejection, skip_reason_of_tx};
 use super::tx_env::tx_env_from_deposit;
 use super::write_set::{retain_changed, write_set_from_cache};
+
+/// The write set of a deposit whose inner call never ran: the mint
+/// pre-credit alone. `info` is `deposit.from` as read back from the cache
+/// after the mint commit. A zero mint changes nothing, so the set is
+/// empty; this matches what `retain_changed` keeps on the executed path.
+/// Both deposit paths build this artifact here, so it is identical by
+/// construction.
+pub(super) fn mint_only_write_set(deposit: &Deposit, info: &AccountInfo) -> WriteSet {
+    let mut ws = WriteSet::default();
+    if deposit.mint != 0 {
+        ws.accounts
+            .push((deposit.from, (info.nonce, info.balance, info.code_hash)));
+        ws.finish();
+    }
+    ws
+}
+
+/// The deterministic failed receipt for a deposit that revm rejects at
+/// validation (an L1 `gasLimit` below the intrinsic cost, for example).
+/// Both deposit paths build it here, so the artifact is identical by
+/// construction.
+///
+/// The state it leaves: the mint pre-credit stays (it is committed before
+/// the inner call, and it is durable no matter the outcome), the sender's
+/// nonce does not move, `status = false`, `gas_used = 0`, no logs, and
+/// `skip_reason = Some(reason)`. The pair `status = false, gas_used = 0`
+/// is the wire-visible skip marker ([`Receipt::is_invalid_skip`]). The
+/// mint is the one state change a skip marker can carry.
+#[allow(clippy::too_many_arguments)] // the receipt's own field list.
+#[cfg_attr(not(feature = "std"), allow(unused_variables))]
+pub(super) fn failed_deposit_receipt(
+    reason: SkipReason,
+    detail: &str,
+    tx_position: BPosition,
+    deposit: &Deposit,
+    ws: WriteSet,
+    bal: Option<(&mut revm::state::bal::Bal, u64)>,
+    block_number: u64,
+    tx_index_in_block: u64,
+    cumulative_gas_used_before: u64,
+) -> (Receipt, WriteSet) {
+    #[cfg(feature = "std")]
+    {
+        tracing::error!(
+            source_hash = ?deposit.source_hash,
+            from = ?deposit.from,
+            gas_limit = deposit.gas_limit,
+            block = block_number,
+            reason = reason.as_str(),
+            detail,
+            "INVALID deposit FAILED (deterministic; the mint stays, the inner call never ran)"
+        );
+        crate::metrics::record_invalid_tx_skipped(reason);
+    }
+    if let Some((bal, bal_index)) = bal {
+        ws.record_into_bal(bal, bal_index);
+    }
+    let write_set_hash = ws.hash();
+    let receipt = Receipt {
+        tx_idx: tx_position,
+        tx_hash: deposit.source_hash,
+        tx_type: kardamom_types::TX_TYPE_DEPOSIT,
+        status: false,
+        gas_used: 0,
+        logs: Vec::new(),
+        write_set_hash,
+        nonce: 0,
+        from: deposit.from,
+        to: deposit.to,
+        contract_address: None,
+        effective_gas_price: 0,
+        block_number,
+        transaction_index: tx_index_in_block,
+        cumulative_gas_used: cumulative_gas_used_before,
+        skip_reason: Some(reason),
+    };
+    (receipt, ws)
+}
 
 /// Execute one [`kardamom_types::Deposit`] against a snapshot and the
 /// current `PendingDelta`. Returns the receipt, plus a fresh per-tx
@@ -38,6 +117,10 @@ use super::write_set::{retain_changed, write_set_from_cache};
 /// 3. The receipt's `tx_hash` is the deposit's `source_hash`. Deposits
 ///    have no 2718-canonical hash on the inbound side, so `source_hash`
 ///    is the canonical id that ingress queries by.
+///
+/// A deposit that revm rejects at validation becomes a deterministic
+/// failed receipt (`failed_deposit_receipt`); the mint from step 1
+/// stays. Only local failures (database errors) are engine errors.
 #[allow(clippy::too_many_arguments)] // matches execute_tx's shape; see the
 // matching allow on execute_tx for the reason.
 pub fn execute_deposit_tx<S: StateDatabase>(
@@ -110,12 +193,33 @@ pub fn execute_deposit_tx<S: StateDatabase>(
         .with_block(env.block_env())
         .with_cfg(cfg)
         .build_mainnet();
-    let result = evm
-        .transact_commit(tx_env)
-        .map_err(|e| ExecutorError::Execution {
-            idx: tx_idx,
-            detail: format!("{e:?}"),
-        })?;
+    let result = match evm.transact_commit(tx_env) {
+        Ok(r) => r,
+        // Deterministic input invalidity: the mint stays, the inner call
+        // never ran. Same artifact as the scope path.
+        Err(EVMError::Transaction(e)) => {
+            drop(evm);
+            let info = revm::Database::basic(&mut cache, deposit.from)
+                .map_err(|e| ExecutorError::Execution {
+                    idx: tx_idx,
+                    detail: format!("basic({:?}): {e:?}", deposit.from),
+                })?
+                .unwrap_or_default();
+            let ws = mint_only_write_set(deposit, &info);
+            return Ok(failed_deposit_receipt(
+                skip_reason_of_tx(&e),
+                &format!("{e:?}"),
+                tx_position,
+                deposit,
+                ws,
+                bal,
+                env.block_number,
+                tx_index_in_block,
+                cumulative_gas_used_before,
+            ));
+        }
+        Err(e) => return Err(derived_tx_rejection(e, tx_idx)),
+    };
 
     let gas_used = result.gas().tx_gas_used();
     let (status_success, logs) = match &result {
@@ -285,6 +389,70 @@ mod tests {
         );
     }
 
+    /// An L1 `gasLimit` below the intrinsic cost fails revm validation.
+    /// That is a deterministic failed receipt, never an engine error: the
+    /// mint stays, the nonce does not move, and the pair `status = false,
+    /// gas_used = 0` marks the skip on the wire.
+    #[test]
+    fn deposit_below_intrinsic_gas_is_a_failed_receipt_not_an_error() {
+        let from = Address::from([0x11u8; 20]);
+        let to = Address::from([0x22u8; 20]);
+        let snap = MockStateDatabase::builder()
+            .account(from, U256::from(5u64), 7, KECCAK_EMPTY)
+            .build();
+        let delta = PendingDelta::new();
+        let env = ExecEnv::new(1, &boundary(1));
+
+        for gas_limit in [0u64, 100] {
+            let mut d = dep(from, Some(to), 1_000, 400, Bytes::new());
+            d.gas_limit = gas_limit;
+            let mut bal = revm::state::bal::Bal::new();
+            let (receipt, ws) = execute_deposit_tx(
+                &snap,
+                None,
+                &delta,
+                env,
+                TxIndex(0),
+                pos(0),
+                &d,
+                0,
+                90,
+                Some((&mut bal, 1)),
+            )
+            .unwrap_or_else(|e| panic!("gas_limit {gas_limit}: {e:?}"));
+
+            assert!(receipt.is_invalid_skip(), "gas_limit {gas_limit}");
+            assert!(!receipt.status);
+            assert_eq!(receipt.gas_used, 0);
+            assert_eq!(receipt.cumulative_gas_used, 90);
+            assert!(receipt.logs.is_empty());
+            assert_eq!(
+                receipt.skip_reason,
+                Some(kardamom_types::SkipReason::GasLimit)
+            );
+            assert_eq!(receipt.tx_hash, d.source_hash);
+            assert_eq!(receipt.tx_type, kardamom_types::TX_TYPE_DEPOSIT);
+            // The mint stays. The nonce does not move. The recipient saw
+            // nothing.
+            assert_eq!(
+                *ws.account(&from).expect("mint in the write set"),
+                (7, U256::from(1_005u64), KECCAK_EMPTY)
+            );
+            assert!(ws.account(&to).is_none());
+            assert!(ws.storage.is_empty());
+            assert!(ws.code.is_empty());
+            assert_eq!(receipt.write_set_hash, ws.hash());
+            // The mint is a BAL claim, like on the executed path.
+            let alloy = bal.into_alloy_bal();
+            assert!(
+                alloy
+                    .iter()
+                    .any(|a| a.address == from && !a.balance_changes.is_empty()),
+                "mint claim missing from BAL: {alloy:?}"
+            );
+        }
+    }
+
     /// THE EQUIVALENCE GATE for the on-scope deposit path (#234 part 2):
     /// the historic fresh-cache path and `Executor::execute_deposit` must
     /// produce byte-identical artifacts — receipt (write_set_hash
@@ -334,11 +502,18 @@ mod tests {
             .build();
         let env = ExecEnv::new(1, &boundary(1));
 
+        let mut below_intrinsic = dep(from, Some(plain_to), 1_000, 0, Bytes::new());
+        below_intrinsic.gas_limit = 0;
+        let mut below_intrinsic_no_mint = dep(from, Some(plain_to), 0, 0, Bytes::new());
+        below_intrinsic_no_mint.gas_limit = 100;
+
         let cases = [
             (
                 "plain mint",
                 dep(from, Some(plain_to), 1_000, 400, Bytes::new()),
             ),
+            ("validation failure, mint kept", below_intrinsic),
+            ("validation failure, no mint", below_intrinsic_no_mint),
             (
                 "writing call",
                 dep(from, Some(a_write), 1_000, 5, Bytes::new()),

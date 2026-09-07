@@ -61,6 +61,16 @@ pub const OUTBOX: Address = address!("0x42000000000000000000000000000000000000E0
 /// what makes delivery injection unforgeable by user txs.
 pub const INBOX: Address = address!("0x42000000000000000000000000000000000000E1");
 
+/// Largest `gasLimit` the origin `Outbox` accepts for one message. This
+/// mirrors `Outbox.MAX_MESSAGE_GAS` (`contracts/src/L2/Outbox.sol`).
+/// [`derive_remote_epoch`] rejects a larger value, so an honest origin can
+/// never produce a message that the destination cannot budget.
+pub const MAX_MESSAGE_GAS: u64 = 10_000_000;
+
+/// Largest `data` length the origin `Outbox` accepts for one message. This
+/// mirrors `Outbox.MAX_DATA_BYTES` (`contracts/src/L2/Outbox.sol`).
+pub const MAX_DATA_BYTES: usize = 65_536;
+
 /// The EVM sender of a derived cross-chain tx from `origin_chain_id`: the
 /// origin's Outbox predeploy, aliased into the destination's address space.
 /// `Inbox.deliver` authenticates against exactly this address (the OP
@@ -386,7 +396,13 @@ pub struct RemoteEpochRecord {
 impl RemoteEpochRecord {
     /// Sequence number of the last message in the batch.
     pub fn last_seq(&self) -> u64 {
-        self.first_seq + self.messages.len() as u64 - 1
+        // Saturating on purpose. A wire-decoded record reaches this method
+        // (through `canonical_id`) before any check runs, so a hostile
+        // `first_seq` must not panic a debug build. [`derive_remote_epoch`]
+        // and the validator reject a record whose seq range overflows.
+        self.first_seq
+            .saturating_add(self.messages.len() as u64)
+            .saturating_sub(1)
     }
 
     /// Canonical id for cluster dedup: racing relayers that observe the same
@@ -440,17 +456,53 @@ pub fn derive_remote_epoch(
             }
         });
     }
-    if let Some(gap) = ordered.windows(2).find(|w| w[1].seq != w[0].seq + 1) {
-        return Err(XChainError::SeqSkipped {
-            expected: gap[0].seq + 1,
-            found: gap[1].seq,
-        });
+    for w in ordered.windows(2) {
+        let Some(want) = w[0].seq.checked_add(1) else {
+            return Err(XChainError::SeqOverflow { seq: w[0].seq });
+        };
+        if w[1].seq != want {
+            return Err(XChainError::SeqSkipped {
+                expected: want,
+                found: w[1].seq,
+            });
+        }
+    }
+    // The record's seq range must fit in u64. The validator computes
+    // `last_seq + 1` as its next cursor, so the last seq must leave room
+    // for one more.
+    if first.checked_add(ordered.len() as u64).is_none() {
+        return Err(XChainError::SeqOverflow { seq: first });
     }
     for m in &ordered {
         if m.dest_chain_id != self_chain_id {
             return Err(XChainError::ForeignDestination {
                 expected: self_chain_id,
                 found: m.dest_chain_id,
+            });
+        }
+        // Producer-side mirror of the `Outbox.sendMessage` checks. An
+        // honest origin can never trip these. A feed that does is
+        // malicious or corrupt, and the record must not reach the
+        // canonical stream: the destination budgets delivery from these
+        // bounds.
+        if m.value != 0 {
+            return Err(XChainError::ValueNotAllowed {
+                seq: m.seq,
+                value: m.value,
+            });
+        }
+        if m.gas_limit > MAX_MESSAGE_GAS {
+            return Err(XChainError::GasLimitAboveCap {
+                seq: m.seq,
+                gas_limit: m.gas_limit,
+                cap: MAX_MESSAGE_GAS,
+            });
+        }
+        if m.data.len() > MAX_DATA_BYTES {
+            return Err(XChainError::DataAboveCap {
+                seq: m.seq,
+                len: m.data.len(),
+                cap: MAX_DATA_BYTES,
             });
         }
     }
@@ -491,6 +543,20 @@ pub enum XChainError {
     SeqRegressed { expected: u64, found: u64 },
     #[error("message for chain {found} in a batch derived by chain {expected}")]
     ForeignDestination { expected: u64, found: u64 },
+    /// A seq at or near `u64::MAX`. The dense-lane arithmetic (`seq + 1`)
+    /// would overflow.
+    #[error("outbox seq {seq} overflows the dense-lane arithmetic")]
+    SeqOverflow { seq: u64 },
+    /// v1 messaging carries no value. The `Outbox` rejects a nonzero value,
+    /// so this can only come from a malicious or corrupt feed.
+    #[error("outbox message seq {seq} carries value {value}; v1 delivery is value-free")]
+    ValueNotAllowed { seq: u64, value: u128 },
+    /// `gas_limit` above [`MAX_MESSAGE_GAS`], which the `Outbox` rejects.
+    #[error("outbox message seq {seq} gas limit {gas_limit} is above the cap {cap}")]
+    GasLimitAboveCap { seq: u64, gas_limit: u64, cap: u64 },
+    /// `data` longer than [`MAX_DATA_BYTES`], which the `Outbox` rejects.
+    #[error("outbox message seq {seq} data length {len} is above the cap {cap}")]
+    DataAboveCap { seq: u64, len: usize, cap: usize },
 }
 
 #[cfg(test)]
@@ -500,7 +566,7 @@ mod tests {
 
     fn msg(seq: u64, dest: u64) -> OutboxMessage {
         OutboxMessage {
-            origin_block_number: 100 + seq,
+            origin_block_number: seq.saturating_add(100),
             origin_block_hash: B256::repeat_byte(0x0B),
             dest_chain_id: dest,
             seq,
@@ -612,6 +678,90 @@ mod tests {
             matches!(e, XChainError::DuplicateSeq { seq: 5 }),
             "got {e:?}"
         );
+    }
+
+    #[test]
+    fn seq_overflow_is_a_fault_not_a_panic() {
+        // Two messages at the top of the u64 range: the gap check would
+        // compute `u64::MAX + 1`.
+        let e = derive_remote_epoch(
+            SELF,
+            ORIGIN,
+            u64::MAX - 1,
+            &[msg(u64::MAX - 1, SELF), msg(u64::MAX, SELF)],
+        )
+        .unwrap_err();
+        assert!(matches!(e, XChainError::SeqOverflow { .. }), "got {e:?}");
+        // One message at u64::MAX: the next cursor would overflow.
+        let e = derive_remote_epoch(SELF, ORIGIN, u64::MAX, &[msg(u64::MAX, SELF)]).unwrap_err();
+        assert!(
+            matches!(e, XChainError::SeqOverflow { seq: u64::MAX }),
+            "got {e:?}"
+        );
+        // A hostile record does not panic `last_seq`.
+        let r = RemoteEpochRecord {
+            first_seq: u64::MAX,
+            messages: alloc::vec![XChainMessage::default(), XChainMessage::default()],
+            ..Default::default()
+        };
+        // The value is meaningless for an invalid record. Only the
+        // absence of a panic matters.
+        let _ = r.last_seq();
+        let r = RemoteEpochRecord::default();
+        assert_eq!(r.last_seq(), 0);
+    }
+
+    #[test]
+    fn outbox_bounds_are_mirrored_on_the_producer() {
+        // Value.
+        let mut m = msg(0, SELF);
+        m.value = 1;
+        let e = derive_remote_epoch(SELF, ORIGIN, 0, &[m]).unwrap_err();
+        assert!(
+            matches!(e, XChainError::ValueNotAllowed { seq: 0, value: 1 }),
+            "got {e:?}"
+        );
+        // Gas limit.
+        let mut m = msg(0, SELF);
+        m.gas_limit = MAX_MESSAGE_GAS + 1;
+        let e = derive_remote_epoch(SELF, ORIGIN, 0, &[m]).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                XChainError::GasLimitAboveCap {
+                    seq: 0,
+                    gas_limit: 10_000_001,
+                    cap: MAX_MESSAGE_GAS
+                }
+            ),
+            "got {e:?}"
+        );
+        // Data length.
+        let mut m = msg(0, SELF);
+        m.data = AlloyBytes::from(alloc::vec![0xFFu8; MAX_DATA_BYTES + 1]);
+        let e = derive_remote_epoch(SELF, ORIGIN, 0, &[m]).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                XChainError::DataAboveCap {
+                    seq: 0,
+                    len: 65_537,
+                    cap: MAX_DATA_BYTES
+                }
+            ),
+            "got {e:?}"
+        );
+    }
+
+    #[test]
+    fn honest_maxima_pass_the_producer_checks() {
+        let mut m = msg(0, SELF);
+        m.value = 0;
+        m.gas_limit = MAX_MESSAGE_GAS;
+        m.data = AlloyBytes::from(alloc::vec![0xFFu8; MAX_DATA_BYTES]);
+        let r = derive_remote_epoch(SELF, ORIGIN, 0, &[m]).unwrap();
+        assert_eq!(r.messages[0].gas_limit, MAX_MESSAGE_GAS);
+        assert_eq!(r.messages[0].input.len(), MAX_DATA_BYTES);
     }
 
     #[test]
