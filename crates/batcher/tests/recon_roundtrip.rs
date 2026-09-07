@@ -191,6 +191,66 @@ fn roundtrip_max_size_messages_span_blobs() {
     );
 }
 
+/// H7: the records commitment binds the remote epochs the batch posts. The
+/// same batch with and without a record has a different commitment, and a
+/// reader that recomputes the digest from the reconstructed frames gets
+/// the posted commitment back.
+#[test]
+fn records_commitment_binds_remote_epochs() {
+    const CHAIN_ID: u64 = 412_347;
+    let cfg = BatcherConfig {
+        chain_id: CHAIN_ID,
+        ..Default::default()
+    };
+    let plain = vec![closed(7, 2), closed(8, 3)];
+    let mut led = plain.clone();
+    led[1].remote_epochs = vec![remote_epoch(412_346, 5, &[&[0xCA, 0xFE], &[]], true)];
+
+    let plain_batch = pack_blocks(&cfg, &plain).unwrap();
+    let led_batch = pack_blocks(&cfg, &led).unwrap();
+    assert_ne!(
+        plain_batch.records_commitment, led_batch.records_commitment,
+        "a remote epoch must change the records commitment"
+    );
+
+    // The commitment binds the message content and the pair.
+    let mut other_msg = led.clone();
+    other_msg[1].remote_epochs[0].messages[0].input = Bytes::from_static(&[0xCA, 0xFF]);
+    assert_ne!(
+        pack_blocks(&cfg, &other_msg).unwrap().records_commitment,
+        led_batch.records_commitment
+    );
+    let other_chain = BatcherConfig {
+        chain_id: CHAIN_ID + 1,
+        ..Default::default()
+    };
+    assert_ne!(
+        pack_blocks(&other_chain, &led).unwrap().records_commitment,
+        led_batch.records_commitment
+    );
+
+    // Recompute from the reconstructed frames: remote epochs first, then txs.
+    let frames = reconstruct(&led_batch.blobs).unwrap();
+    let recomputed = kardamom_types::batch_records_commitment(frames.iter().map(|f| {
+        let mut d = kardamom_types::BlockRecordsDigest::new(f.block_number);
+        for rec in &f.remote_epochs {
+            d.add_remote_epoch(CHAIN_ID, rec);
+        }
+        for tx in &f.txs {
+            d.add_tx(&tx.raw_tx);
+        }
+        d.finish()
+    }));
+    assert_eq!(recomputed, led_batch.records_commitment);
+    assert_eq!(
+        recomputed,
+        kardamom_types::batch_records_commitment(
+            led.iter()
+                .map(|b| kardamom_batcher::batcher::block_records_digest(CHAIN_ID, b))
+        )
+    );
+}
+
 /// The accumulator attributes a remote-epoch record to the block it LEADS
 /// (the record arrives after a boundary, before the next block's txs), and
 /// the buffer drains — the next boundary carries none.

@@ -63,6 +63,12 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_compress: bool,
 
+    /// The L2 chain id of the chain this batcher posts for. The records
+    /// commitment digests each remote-epoch message leaf, and the leaf
+    /// commits to this id. Same default as the sibling services.
+    #[arg(long, env = "KARDAMOM_CHAIN_ID", default_value_t = 1)]
+    chain_id: u64,
+
     /// Skip L1 broadcast; only inspect the archive. Live posting requires
     /// `--dry-run=false` plus `--l1-rpc`, `--l1-key`, `--settlement`, and
     /// `--da-store`.
@@ -203,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
         BatcherConfig {
             blocks_per_batch: cli.blocks_per_batch,
             compress: !cli.no_compress,
+            chain_id: cli.chain_id,
             ..Default::default()
         },
         MockSender::default(),
@@ -305,6 +312,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         compress: !cli.no_compress,
         flush_ms: cli.flush_ms,
         l1_retries: cli.l1_retries,
+        chain_id: cli.chain_id,
     })
     .await
 }
