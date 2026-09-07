@@ -122,11 +122,12 @@ impl Sequencer {
     pub fn new(cfg: SequencerConfig) -> Self {
         cfg.validate().expect("validated config");
         let cap = cfg.max_pending_per_sender;
+        let ttl = std::time::Duration::from_millis(cfg.tx_ttl_ms);
         let hot = metrics::HotMetrics::new(cfg.partition_index);
         Self {
             cfg,
             hot,
-            state: PartitionState::new(cap),
+            state: PartitionState::new(cap, ttl),
             resync: None,
             unconfirmed: UnconfirmedLedger::new(),
         }
@@ -355,6 +356,35 @@ impl Sequencer {
             .is_some_and(|r| r.floor(sender).is_some_and(|f| f > nonce))
     }
 
+    /// Expire the parked entries whose lifetime (`tx_ttl`) has passed, and
+    /// tell their parked submit calls and receipt subscribers. An entry
+    /// waits on a nonce gap for at most `tx_ttl`. After that, the client
+    /// gets an explicit error and can resubmit once the gap fills. This
+    /// runs on every iteration, so an idle sequencer expires on time. The
+    /// sweep is bounded per iteration. See
+    /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.3.
+    fn expiry_tick<R>(&mut self, rc: &mut R)
+    where
+        R: TxErrorPublisher,
+    {
+        let now = std::time::Instant::now();
+        for (sender, nonce) in self.state.sweep_expired(now, 256) {
+            self.hot.expired.increment(1);
+            trace!(
+                sender = ?sender,
+                nonce,
+                "pending entry expired after tx_ttl; reporting Expired"
+            );
+            rc.publish_error(TxError {
+                sender,
+                nonce,
+                reason: TxErrorReason::Expired {
+                    expected_nonce: self.state.next_nonce(sender),
+                },
+            });
+        }
+    }
+
     /// Tell an evicted transaction's parked submit call, and any receipt
     /// subscribers, that it will never be sequenced. A silent eviction
     /// would leave the client waiting forever, with its later nonces
@@ -395,6 +425,7 @@ impl Sequencer {
     {
         // Resync bookkeeping runs first, every iteration. See `resync_tick`.
         self.resync_tick();
+        self.expiry_tick(rc);
 
         let pending = self.state.drain_pending();
         if !pending.is_empty() {

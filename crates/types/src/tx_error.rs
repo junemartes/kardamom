@@ -44,4 +44,10 @@ pub enum TxErrorReason {
     /// could never arrive. That was the cause of the permanent-nonce-gap
     /// wedge.
     Evicted { expected_nonce: u64 },
+    /// The transaction waited on a nonce gap for longer than the
+    /// sequencer's `tx_ttl`. The sequencer dropped it from its pending
+    /// buffer. This is the explicit end of a transaction's lifetime. The
+    /// client must resubmit it after the gap fills. See
+    /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.3.
+    Expired { expected_nonce: u64 },
 }

@@ -73,6 +73,11 @@ struct Args {
     /// `partition_index as u8`.
     #[arg(long)]
     sequencer_id: Option<u8>,
+    /// The lifetime of a transaction that waits on a nonce gap, in ms
+    /// (`tx_ttl_ms`). The deploy passes the same value to the ingress as
+    /// `--pending-receipt-timeout-ms`.
+    #[arg(long, env = "KARDAMOM_TX_TTL_MS")]
+    tx_ttl_ms: Option<u64>,
     /// Override the CPU core to pin to.
     #[arg(long)]
     core_id: Option<usize>,
@@ -118,6 +123,9 @@ fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
     }
     if let Some(m) = args.partition_count {
         cfg.partition_count = m;
+    }
+    if let Some(ttl) = args.tx_ttl_ms {
+        cfg.tx_ttl_ms = ttl;
     }
     if args.partition_offset != 0 {
         // An explicit --sequencer-id combined with rotation would
@@ -190,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         partition_index = cfg.partition_index,
         sequencer_id = cfg.sequencer_id,
+        tx_ttl_ms = cfg.tx_ttl_ms,
         "kardamom-sequencer starting"
     );
 

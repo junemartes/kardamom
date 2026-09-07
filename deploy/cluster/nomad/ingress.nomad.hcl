@@ -149,6 +149,9 @@ job "ingress" {
           # to the first M. check-contract.py checks this mirror.
           "--shards", "2",
           "--jsonrpc-bind", "0.0.0.0:8545",
+          # The submit park bound. It equals the sequencer transaction
+          # lifetime (tx_ttl_ms in group_vars/all.yml).
+          "--pending-receipt-timeout-ms", "30000",
           # Use a stable per-replica id (alloc index 0 or 1). This
           # namespaces correlation_id, so the two active/active
           # replicas never collide. See

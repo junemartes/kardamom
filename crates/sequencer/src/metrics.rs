@@ -11,6 +11,9 @@ pub const TX_PUBLISHED_TO_B: &str = "kardamom_sequencer_tx_published_to_b_total"
 pub const TX_BUFFERED_FUTURE: &str = "kardamom_sequencer_tx_buffered_future_total";
 pub const TX_DROPPED_PAST: &str = "kardamom_sequencer_tx_dropped_past_total";
 pub const PENDING_BUFFER_EVICTIONS: &str = "kardamom_sequencer_pending_evictions_total";
+/// Parked entries that waited on a nonce gap past `tx_ttl`. Each one got
+/// an explicit `Expired` error on tx_errors.
+pub const PENDING_BUFFER_EXPIRED: &str = "kardamom_sequencer_pending_expired_total";
 pub const BACKPRESSURE_EVENTS: &str = "kardamom_sequencer_backpressure_total";
 pub const NONCE_CHECK_DURATION_SECONDS: &str = "kardamom_sequencer_nonce_check_duration_seconds";
 
@@ -55,6 +58,7 @@ pub struct HotMetrics {
     pub buffered_future: metrics::Counter,
     pub dropped_past: metrics::Counter,
     pub evictions: metrics::Counter,
+    pub expired: metrics::Counter,
     pub backpressure: metrics::Counter,
     pub nonce_check_seconds: metrics::Histogram,
 }
@@ -69,6 +73,7 @@ impl HotMetrics {
             buffered_future: counter!(TX_BUFFERED_FUTURE, "partition" => p.clone()),
             dropped_past: counter!(TX_DROPPED_PAST, "partition" => p.clone()),
             evictions: counter!(PENDING_BUFFER_EVICTIONS, "partition" => p.clone()),
+            expired: counter!(PENDING_BUFFER_EXPIRED, "partition" => p.clone()),
             backpressure: counter!(BACKPRESSURE_EVENTS, "partition" => p.clone()),
             nonce_check_seconds: histogram!(NONCE_CHECK_DURATION_SECONDS, "partition" => p),
         }

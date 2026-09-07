@@ -116,6 +116,8 @@ job "sequencer" {
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--partition-count", "2",
           "--partition-index", "${meta.node_index}",
+          # The transaction lifetime (tx_ttl_ms in group_vars/all.yml).
+          "--tx-ttl-ms", "30000",
           # Cluster mode only: this node's cluster-egress (response)
           # endpoint. The cluster client's egress_channel is per node,
           # since the node IP differs, so it is injected here instead
@@ -212,6 +214,8 @@ job "sequencer" {
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--partition-count", "2",
           "--partition-index", "${meta.node_index}",
+          # The transaction lifetime (tx_ttl_ms in group_vars/all.yml).
+          "--tx-ttl-ms", "30000",
           # Rotate onto the other shard; see the header. Replicas of a
           # shard never share a node.
           "--partition-offset", "1",

@@ -110,6 +110,10 @@ pub struct ServiceSpec<'a> {
     /// The active shard count (M). The sequencers and the ingress take it.
     /// The consumers open the fixed lane plane and take no count.
     pub shards: u32,
+    /// The transaction lifetime. The sequencers take it as `--tx-ttl-ms`.
+    /// The ingress takes the same value as `--pending-receipt-timeout-ms`
+    /// (see [`IngressOptions`]). One value drives both, as in the deploy.
+    pub tx_ttl: Duration,
     pub chain_id: u64,
     pub genesis: &'a Path,
     /// `--log-config` for every service. `None` uses the built-in
@@ -231,6 +235,7 @@ pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
         .args(["--partition-index", &index.to_string()])
         .args(["--partition-count", &spec.shards.to_string()])
         .args(["--sequencer-id", &index.to_string()])
+        .args(["--tx-ttl-ms", &spec.tx_ttl.as_millis().to_string()])
         .args([
             "--cluster-egress-endpoint",
             &format!("127.0.0.1:{egress_port}"),
