@@ -132,7 +132,7 @@ impl Executor {
             footprint_shadow,
             block_exec,
             epoch_observer,
-            remote_epoch_observer: _,
+            remote_epoch_observer,
         } = hooks;
 
         let buffer = JoinBuffer::new();
