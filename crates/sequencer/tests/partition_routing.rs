@@ -29,5 +29,5 @@ fn validate_partition_count_rejects_zero() {
 fn validate_partition_count_accepts_power_of_two_and_other() {
     assert!(validate_partition_count(1).is_ok());
     assert!(validate_partition_count(8).is_ok());
-    assert!(validate_partition_count(64).is_ok());
+    assert!(validate_partition_count(64).is_err());
 }

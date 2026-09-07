@@ -1,7 +1,7 @@
 //! `kardamom-validator`: monolithic validator node.
 //!
 //! It follows the sequencer by subscribing to the same canonical streams
-//! the executor reads (`tx_data` x M, `tx_ordering` from the Aeron
+//! the executor reads (`tx_data` x 8 lanes, `tx_ordering` from the Aeron
 //! Cluster (Raft) egress, `tx_deposits`). It re-executes every block
 //! through the shared `kardamom-engine` pipeline, and commits to its own
 //! libmdbx state through the trie-aware writer, advancing a canonical
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!(
-        shards = args.shards,
+        lanes = kardamom_types::shard_map::LANE_COUNT,
         chain_id = args.chain_id,
         "kardamom-validator starting"
     );
@@ -130,11 +130,11 @@ async fn main() -> Result<()> {
         );
     }
 
-    // M tx_data subscriptions plus tx_deposits (bridged async to sync),
+    // One tx_data subscription per lane plus tx_deposits (bridged async to sync),
     // identical to the executor: always live, with the down-window or
     // lapse gap recovered in-band by the reader's join-miss refetch
     // against the remote durability archives.
-    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
+    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,

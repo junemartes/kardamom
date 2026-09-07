@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 /// the startup failure reason).
 pub type RecorderReady = oneshot::Receiver<(u8, Result<i64, String>)>;
 
-/// Spawns one archive recorder thread for each tx_data shard. Each thread
+/// Spawns one archive recorder thread for each tx_data lane. Each thread
 /// connects its own thread-confined archive session, starts recording its
 /// shard's tx_data publication, reports its startup outcome on its
 /// `oneshot`, and holds the recording alive until `stop` is cancelled.
@@ -34,15 +34,15 @@ pub type RecorderReady = oneshot::Receiver<(u8, Result<i64, String>)>;
 /// a restart.
 ///
 /// Returns the join handles (for teardown) and one readiness receiver per
-/// shard, in shard order.
+/// lane, in lane order.
 pub fn spawn_tx_data_recorders(
     aeron_dir: Option<PathBuf>,
     channels: ChannelsConfig,
     aeron_cfg: AeronConfig,
-    shards: u8,
+    lanes: u8,
     stop: &CancellationToken,
 ) -> (Vec<std::thread::JoinHandle<()>>, Vec<RecorderReady>) {
-    (0..shards)
+    (0..lanes)
         .map(|sid| {
             let aeron_dir = aeron_dir.clone();
             let channels = channels.clone();

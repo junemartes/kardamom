@@ -458,7 +458,6 @@ pub struct LiveArgs {
     pub cursor_file: PathBuf,
     pub log_config: Option<PathBuf>,
     pub aeron_dir: Option<PathBuf>,
-    pub shards: u8,
     pub cluster_egress_endpoint: Option<String>,
     pub replay_destination_endpoint: Option<String>,
     pub archive_control_response_endpoint: Option<String>,
@@ -509,7 +508,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         aeron_cfg.aeron_dir = dir.clone();
     }
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
+    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,

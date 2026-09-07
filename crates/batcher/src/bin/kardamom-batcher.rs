@@ -106,10 +106,6 @@ struct Cli {
     #[arg(long, env = "KARDAMOM_AERON_DIR")]
     aeron_dir: Option<PathBuf>,
 
-    /// Number of sender shards (tx_data channels to subscribe).
-    #[arg(long, default_value_t = 1)]
-    shards: u8,
-
     /// This node's cluster-egress endpoint `ip:port`. It overrides the
     /// config's egress_channel, and the Nomad job injects it per node.
     #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
@@ -297,7 +293,6 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         cursor_file,
         log_config: cli.log_config.clone(),
         aeron_dir: cli.aeron_dir.clone(),
-        shards: cli.shards,
         cluster_egress_endpoint: cli.cluster_egress_endpoint.clone(),
         replay_destination_endpoint: cli.replay_destination_endpoint.clone(),
         archive_control_response_endpoint: cli.archive_control_response_endpoint.clone(),

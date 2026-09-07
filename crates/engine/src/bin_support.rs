@@ -175,11 +175,13 @@ impl TxDataSubscription for LiveTxDataSub {
     }
 }
 
-/// Open the M per-shard tx_data subscriptions. Each subscription hands
-/// the engine's reader thread its tokio receiver directly. The reader
-/// thread blocks on it, off the tokio runtime. When the [`AeronRuntime`]
-/// drops, every subscription's sender closes. Then `next()` returns
-/// `TxDataClosed`.
+/// Open one tx_data subscription per lane of the lane plane
+/// (`LANE_COUNT`, today 8). A consumer does not know the active shard
+/// count. It reads every lane, and an idle lane costs one handle and one
+/// blocked reader thread. Each subscription hands the engine's reader
+/// thread its tokio receiver directly. The reader thread blocks on it,
+/// off the tokio runtime. When the [`AeronRuntime`] drops, every
+/// subscription's sender closes. Then `next()` returns `TxDataClosed`.
 ///
 /// This always uses live multicast, even on a crash-recovery resume. The
 /// old resume path opened an archive replay-merge against the local node's
@@ -193,16 +195,15 @@ impl TxDataSubscription for LiveTxDataSub {
 pub fn open_tx_data_subs(
     rt: &AeronRuntime,
     channels: &ChannelsConfig,
-    shards: u8,
 ) -> Result<Vec<LiveTxDataSub>> {
-    (0..shards)
+    (0..kardamom_types::shard_map::LANE_COUNT)
         .map(|shard_id| {
             let rx = rt
                 .open_tx_data_subscription(
                     &channels.tx_data_channel(shard_id),
                     channels.tx_data_stream_id(shard_id),
                 )
-                .with_context(|| format!("open tx_data subscription shard={shard_id}"))?;
+                .with_context(|| format!("open tx_data subscription lane={shard_id}"))?;
             Ok(LiveTxDataSub {
                 sequencer_id: shard_id,
                 rx,

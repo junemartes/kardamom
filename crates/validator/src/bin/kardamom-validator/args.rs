@@ -33,9 +33,6 @@ pub struct Args {
     /// Aeron Media Driver directory (`aeron.dir`).
     #[arg(long)]
     pub aeron_dir: Option<PathBuf>,
-    /// Number of tx_data shards to subscribe to.
-    #[arg(long, default_value_t = 8)]
-    pub shards: u8,
     /// Number of executor replicas whose tx_receipts endpoints to attach,
     /// when tx_receipts MDS is enabled. Falls back to
     /// `channels.tx_receipts_executor_count`.

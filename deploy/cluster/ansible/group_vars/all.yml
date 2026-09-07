@@ -18,7 +18,13 @@ image_prefix: "{{ registry_host }}:{{ registry_port }}/kardamom"
 
 # --- L2 chain -------------------------------------------------------------
 chain_id: 412346                 # matches chains/dev.toml
-partition_count: 2               # M sequencers
+partition_count: 2               # M active sequencer shards: 1, 2, 4, or 8
+# The lane plane is fixed at 8 tx_data lanes in code
+# (kardamom_types::shard_map::LANE_COUNT). Every process opens all 8.
+# The ingress and the sequencers take partition_count; the executor, the
+# validator, and the batcher take no count. Mirrors, checked by
+# scripts/check-contract.py: ingress.nomad.hcl --shards,
+# sequencer.nomad.hcl --partition-count, config/sequencer.toml.tpl.
 
 # --- ports ----------------------------------------------------------------
 ports:

@@ -1,6 +1,6 @@
 //! `kardamom-executor`: standalone executor service process.
 //!
-//! Opens M tx_data subscribers, one tx_ordering subscriber, and one
+//! Opens one tx_data subscriber per lane, one tx_ordering subscriber, and one
 //! tx_receipts publisher through the log layer's Aeron runtime. It wires
 //! them into the executor's reader, exec, and commit thread topology, and
 //! runs until SIGTERM or Ctrl-C. The state backend is the libmdbx-backed
@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!(
-        shards = args.shards,
+        lanes = kardamom_types::shard_map::LANE_COUNT,
         chain_id = args.chain_id,
         "kardamom-executor starting"
     );
@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
     // archives. The resume-gated replay-merge this replaces pointed at
     // the consumer's local archive, which recorded neither stream, so a
     // resuming process had no tx_data source at all.
-    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
+    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,

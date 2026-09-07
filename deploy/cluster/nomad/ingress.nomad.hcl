@@ -144,6 +144,9 @@ job "ingress" {
           "--config", "/local/ingress.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
+          # The active shard count (M). Mirrors partition_count in
+          # group_vars/all.yml. The ingress opens all 8 lanes and routes
+          # to the first M. check-contract.py checks this mirror.
           "--shards", "2",
           "--jsonrpc-bind", "0.0.0.0:8545",
           # Use a stable per-replica id (alloc index 0 or 1). This

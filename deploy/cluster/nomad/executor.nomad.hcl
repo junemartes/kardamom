@@ -4,12 +4,13 @@
 # ingress.
 #
 # Invocation (from crates/e2e/tests/multiprocess_e2e.rs):
-#   kardamom-executor --config <executor.toml> --aeron-dir <dir> --shards 2 \
+#   kardamom-executor --config <executor.toml> --aeron-dir <dir> \
 #       --chain-id 412346 --chain <genesis.toml>
 #
 # executor.toml is presence-checked only. The genesis renders from
 # config/genesis/dev.toml, and passes through --chain. chain-id 412346
-# comes from group_vars/all.yml. shards 2 equals partition_count.
+# comes from group_vars/all.yml. The executor opens all 8 tx_data lanes.
+# It takes no shard count. See docs/specs/dynamic-sequencer-sizing.md.
 #
 # This mounts both the shared Aeron tmpfs aeron.dir and the persistent
 # state_dir (/opt/kardamom/state), for the libmdbx StateWriter, so
@@ -149,7 +150,6 @@ job "executor" {
           # (cluster_egress_port), stays uniform; uniqueness comes
           # from node_ip.
           "--cluster-egress-endpoint", "${meta.node_ip}:40210",
-          "--shards", "2",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",
           # Join-miss archive refetch (tx_data and tx_deposits). When

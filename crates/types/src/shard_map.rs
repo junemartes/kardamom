@@ -20,6 +20,28 @@ pub const VSLOT_COUNT: usize = 256;
 /// The maximum number of lanes. A lane index is a `u8`.
 pub const LANE_CAP: u32 = 256;
 
+/// The number of physical lanes in the lane plane. Every process opens
+/// all of them at startup. The active map uses the first `M` lanes,
+/// where `M` is the shard count. An idle lane costs one handle and one
+/// idle stream. See `docs/specs/dynamic-sequencer-sizing.md`, section 3.1.
+pub const LANE_COUNT: u8 = 8;
+
+/// Validate a shard count `m` against the lane plane and the identity map.
+/// `m` must be between 1 and [`LANE_COUNT`], and must divide 256. So the
+/// valid values are 1, 2, 4, and 8. Returns `m` as a lane count.
+pub fn validate_shard_count(m: u32) -> Result<u8, ShardMapError> {
+    if m == 0 {
+        return Err(ShardMapError::LaneCount(m));
+    }
+    if m > LANE_COUNT as u32 {
+        return Err(ShardMapError::AboveLanePlane(m));
+    }
+    if !(VSLOT_COUNT as u32).is_multiple_of(m) {
+        return Err(ShardMapError::NotADivisor(m));
+    }
+    Ok(m as u8)
+}
+
 /// The first 8 bytes of `keccak256(sender)` as a big-endian `u64`.
 #[inline]
 fn sender_hash_prefix(sender: Address) -> u64 {
@@ -55,6 +77,8 @@ pub enum ShardMapError {
     LaneCount(u32),
     #[error("the identity map needs a lane count that divides 256, got {0}")]
     NotADivisor(u32),
+    #[error("shard count {0} is above the lane plane of {LANE_COUNT} lanes")]
+    AboveLanePlane(u32),
 }
 
 /// A versioned table from virtual slot to lane.
@@ -180,6 +204,20 @@ mod tests {
         assert_eq!(ShardMap::identity(0), Err(ShardMapError::LaneCount(0)));
         assert_eq!(ShardMap::identity(257), Err(ShardMapError::LaneCount(257)));
         assert_eq!(ShardMap::identity(3), Err(ShardMapError::NotADivisor(3)));
+    }
+
+    #[test]
+    fn shard_count_must_fit_the_lane_plane() {
+        for m in [1u32, 2, 4, 8] {
+            assert_eq!(validate_shard_count(m), Ok(m as u8));
+        }
+        assert_eq!(validate_shard_count(0), Err(ShardMapError::LaneCount(0)));
+        assert_eq!(validate_shard_count(3), Err(ShardMapError::NotADivisor(3)));
+        assert_eq!(validate_shard_count(6), Err(ShardMapError::NotADivisor(6)));
+        assert_eq!(
+            validate_shard_count(16),
+            Err(ShardMapError::AboveLanePlane(16))
+        );
     }
 
     #[test]
