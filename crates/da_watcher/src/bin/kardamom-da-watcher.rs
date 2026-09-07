@@ -92,6 +92,20 @@ struct Args {
     /// poll interval: the feed is stream-driven.
     #[arg(long, default_value_t = 2)]
     interop_retry_interval_secs: u64,
+    /// Exit the process nonzero when the interop pair fail-stops (a
+    /// derivation fault or a feed lag), even while the L1 path still runs.
+    /// Default true. With `--interop-fault-exits=false` the L1 path keeps
+    /// the process up and the halt shows only in the log and the
+    /// `kardamom_da_watcher_remote_tick_total{outcome="fault"}` metric.
+    #[arg(
+        long,
+        env = "KARDAMOM_INTEROP_FAULT_EXITS",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    interop_fault_exits: bool,
     /// Optional `LogConfig` TOML that supplies the Aeron `[channels]`
     /// config. If unset, this uses built-in single-host IPC defaults,
     /// which keep local and e2e behavior unchanged. A multi-host
@@ -388,25 +402,36 @@ async fn main() -> anyhow::Result<()> {
     // clearer log line.
     //
     // Also wait on the watcher tasks themselves. A watcher that finishes
-    // without being asked has fail-stopped: an interop derivation fault, or
-    // a closed publisher. While at least one other watcher still runs, the
-    // process stays up. The fault domain is the pair, and killing the L1
-    // deposit path because a peer feed served a gap would widen it. But
-    // once the last watcher has fail-stopped, nothing is left to watch.
-    // Staying up as a healthy-looking husk would hide the halt from the
-    // orchestrator, so the process exits nonzero. This lets the supervisor,
-    // or an e2e harness, see the fail-stop as a process outcome, not just a
-    // log line.
-    let all_fail_stopped = tokio::select! {
-        _ = wait_for_shutdown() => false,
-        () = async {
+    // without being asked has fail-stopped: an interop derivation fault, a
+    // feed lag, or a closed publisher. Once the last watcher has
+    // fail-stopped, nothing is left to watch. Staying up as a
+    // healthy-looking husk would hide the halt from the orchestrator, so
+    // the process exits nonzero. This lets the supervisor, or an e2e
+    // harness, see the fail-stop as a process outcome, not just a log line.
+    //
+    // With `--interop-fault-exits` (the default) an interop fail-stop exits
+    // the process even while the L1 path still runs. The fault domain is
+    // still the pair on the chain: the L1 path restarts with the process.
+    // Without the flag, the L1 path keeps the process up and the halt
+    // shows only in the log and the metric.
+    let interop_fault_exits = args.interop_fault_exits;
+    let fail_stopped: Option<&'static str> = tokio::select! {
+        _ = wait_for_shutdown() => None,
+        halt = async {
             loop {
                 if watchers.iter().all(|(_, h)| h.task.is_finished()) {
-                    break;
+                    break "every configured watcher";
+                }
+                if interop_fault_exits
+                    && watchers
+                        .iter()
+                        .any(|(name, h)| *name == "interop" && h.task.is_finished())
+                {
+                    break "the interop watcher";
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-        } => true,
+        } => Some(halt),
     };
     for (name, handle) in watchers {
         if handle.task.is_finished() {
@@ -418,10 +443,14 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("{name} watcher task panicked: {e}"))?;
     }
-    if all_fail_stopped {
+    if let Some(who) = fail_stopped {
+        tracing::error!(
+            "{who} fail-stopped (no shutdown was requested); exiting nonzero so the halt is a \
+             process outcome"
+        );
         anyhow::bail!(
-            "every configured watcher fail-stopped (no shutdown was requested); \
-             exiting nonzero so the halt is a process outcome"
+            "{who} fail-stopped (no shutdown was requested); exiting nonzero so the halt is a \
+             process outcome"
         );
     }
 

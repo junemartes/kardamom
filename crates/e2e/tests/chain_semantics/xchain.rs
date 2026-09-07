@@ -131,7 +131,7 @@ async fn s14_xchain_two_stacks() {
     let _watcher_on_a = stack_a
         .spawn_interop_watcher(CHAIN_B_ID, &b_feed_url, &a_cursor)
         .expect("spawn A's watcher of B");
-    xchain_two_stacks::callback_leg(&a, &b, e2e::harness::DEV_CHAIN_ID, &a_exec_dir, &a_cursor, outcome)
+    xchain_two_stacks::callback_leg(&a, &b, &a_exec_dir, &a_cursor, outcome)
         .await
         .expect("S14 callback leg");
     eprintln!("S14: round trip done at {:?}", started.elapsed());

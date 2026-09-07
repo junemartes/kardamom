@@ -66,6 +66,11 @@ pub enum InteropError {
     /// see the module docs.
     #[error("remote epoch derivation failed: {0}")]
     Derive(XChainError),
+    /// The feed cannot serve our cursor: its floor is above it. TERMINAL for
+    /// this pair. Reading on would skip; re-subscribing gets the same
+    /// answer. An operator resets the cursor, or backfills from DA.
+    #[error("remote feed lagged: cursor {cursor} is below the feed floor {floor}")]
+    Lagged { cursor: u64, floor: u64 },
     /// The publisher transport is permanently closed; the watcher must exit.
     #[error("remote epoch publisher closed")]
     PublisherClosed,
@@ -85,6 +90,8 @@ pub enum InteropError {
 /// - [`InteropError::Source`] if the feed failed. Cursor unchanged; retry.
 /// - [`InteropError::Derive`] if the batch broke the sequence rules. Cursor
 ///   unchanged; the caller must STOP (never skip).
+/// - [`InteropError::Lagged`] if the feed floor is above the cursor. Cursor
+///   unchanged; the caller must STOP.
 /// - [`InteropError::PublisherClosed`] if the sink is shut.
 pub async fn process_once<S, P>(
     publisher: &P,
@@ -97,10 +104,10 @@ where
     P: RemoteEpochPublisher,
 {
     let origin = source.origin_chain_id();
-    let batch = source
-        .next_batch(*cursor)
-        .await
-        .map_err(InteropError::Source)?;
+    let batch = source.next_batch(*cursor).await.map_err(|e| match e {
+        RemoteSourceError::Lagged { cursor, floor, .. } => InteropError::Lagged { cursor, floor },
+        e => InteropError::Source(e),
+    })?;
 
     // The batch goes in verbatim: ordering, gap, duplicate and
     // foreign-destination verdicts all belong to the shared rule, which the
@@ -172,9 +179,9 @@ where
 /// it over the CLI seed) is the binary's job, so the loop has exactly one
 /// notion of "where am I".
 ///
-/// The task ends on shutdown, on a closed publisher, or on a derivation fault.
-/// The last of those is the fail-stop: the handle's `task` completing without
-/// a shutdown signal is the pair's halt signal.
+/// The task ends on shutdown, on a closed publisher, on a derivation fault,
+/// or on a feed lag. The last two are the fail-stop: the handle's `task`
+/// completing without a shutdown signal is the pair's halt signal.
 pub fn spawn<S, P>(
     publisher: P,
     mut source: S,
@@ -280,6 +287,24 @@ where
                         error = %e,
                         "remote epoch derivation fault; STOPPING this pair (a feed gap is \
                          never skipped — operator intervention required)"
+                    );
+                    break;
+                }
+                Err(InteropError::Lagged { cursor: at, floor }) => {
+                    ::metrics::counter!(
+                        metrics::REMOTE_WATCHER_TICK_TOTAL,
+                        "origin" => origin_label.clone(),
+                        "outcome" => "fault"
+                    )
+                    .increment(1);
+                    error!(
+                        target: "da_watcher::interop",
+                        origin,
+                        cursor = at,
+                        floor,
+                        "remote feed lagged; STOPPING this pair (the feed cannot serve the \
+                         cursor; reset the cursor or backfill from DA — operator \
+                         intervention required)"
                     );
                     break;
                 }
@@ -689,36 +714,117 @@ mod tests {
         assert_eq!(cursor_file.load().unwrap(), Some(3));
     }
 
-    /// `Lagged` says the feed's retention overtook us; reading on would skip.
-    /// Resuming from the cursor must lose nothing and repeat nothing.
+    /// `Lagged` says the feed cannot serve our cursor. Reading on would
+    /// skip, and a re-subscribe gets the same answer: the pair halts, and
+    /// nothing past the floor is published.
     #[tokio::test]
-    async fn a_lagged_marker_resumes_from_the_cursor() {
+    async fn a_lagged_marker_halts_the_pair() {
+        let feed = MockInteropFeed::new(ORIGIN).await;
+        feed.push_message(msg(0, 100));
+        feed.push_message(msg(1, 100));
+        feed.push_message(msg(2, 101));
+        feed.push_message(msg(3, 102));
+        // Seqs 0-1 aged out of the feed before the watcher started.
+        feed.set_floor(2);
+        let (publisher, handle) = spawn_against(&feed).await;
+
+        assert_halted(handle).await;
+        assert!(
+            publisher.records().is_empty(),
+            "nothing past the floor may be published"
+        );
+        assert_eq!(
+            feed.subscription_count(),
+            1,
+            "a lag marker must not trigger a re-subscribe loop"
+        );
+    }
+
+    /// The bound itself: `next_batch` returns the terminal error in bounded
+    /// time, from one subscription, instead of looping on re-subscribe.
+    #[tokio::test]
+    async fn a_lagged_marker_terminates_next_batch() {
+        use crate::interop::source::RemoteSourceError;
+
+        let feed = MockInteropFeed::new(ORIGIN).await;
+        feed.push_message(msg(3, 102));
+        feed.set_floor(3);
+        let mut source = WsRemoteChainSource::new(ORIGIN, SELF, feed.url())
+            .with_reconnect(Duration::from_millis(20), 50);
+
+        let err = tokio::time::timeout(Duration::from_secs(5), source.next_batch(0))
+            .await
+            .expect("next_batch must return, not loop")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RemoteSourceError::Lagged {
+                    cursor: 0,
+                    floor: 3,
+                    floor_block: Some(102)
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(feed.subscription_count(), 1);
+
+        // Through `process_once`: the terminal variant, cursor unchanged.
+        let publisher = InMemoryRemoteEpochPublisher::default();
+        let mut cursor = 0u64;
+        let err = process_once(&publisher, &mut source, SELF, &mut cursor)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InteropError::Lagged {
+                    cursor: 0,
+                    floor: 3
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(cursor, 0);
+        // A cursor at the floor is served; the head closes the block.
+        feed.push_head(103);
+        let batch = tokio::time::timeout(Duration::from_secs(5), source.next_batch(3))
+            .await
+            .expect("the batch must close on the head")
+            .unwrap();
+        assert_eq!(batch.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![3]);
+    }
+
+    /// A lane with one message delivers: the origin's `head` event closes
+    /// the block, no later message on the lane is needed.
+    #[tokio::test]
+    async fn a_head_event_closes_a_single_message_block() {
         let feed = MockInteropFeed::new(ORIGIN).await;
         let (publisher, handle) = spawn_against(&feed).await;
 
         feed.push_message(msg(0, 100));
-        feed.push_lagged(3);
-        feed.push_message(msg(1, 100));
-        feed.push_message(msg(2, 101));
-        feed.push_message(msg(3, 102));
+        feed.push_head(100); // at the open block: not a close
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(publisher.records().is_empty(), "block 100 is still open");
+        feed.push_head(101);
+        wait_until(|| !publisher.records().is_empty(), "one record").await;
 
+        // The next message starts a new block; a later head closes it too.
+        feed.push_message(msg(1, 105));
+        feed.push_head(106);
         wait_until(|| publisher.records().len() >= 2, "two records").await;
         let _ = handle.shutdown.send(());
 
-        assert!(
-            feed.subscription_count() >= 2,
-            "a lag marker must trigger a re-subscription, not a read-on"
-        );
         let records = publisher.records();
-        assert_eq!(records.len(), 2);
-        let seqs: Vec<u64> = records
-            .iter()
-            .flat_map(|r| r.messages.iter().map(|m| m.seq))
-            .collect();
+        assert_eq!(records[0].anchor_number, 100);
+        assert_eq!(records[0].first_seq, 0);
+        assert_eq!(records[0].last_seq(), 0);
+        assert_eq!(records[1].anchor_number, 105);
+        assert_eq!(records[1].first_seq, 1);
         assert_eq!(
-            seqs,
-            vec![0, 1, 2],
-            "no loss and no duplicates across the lag"
+            publisher.deduped_count(),
+            0,
+            "a head close must not replay the batch"
         );
     }
 }

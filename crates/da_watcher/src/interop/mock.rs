@@ -22,18 +22,18 @@
 //!
 //! ## Retention model
 //!
-//! Everything pushed is retained forever and served from `cursor.seq` onward,
-//! which is the contract a real feed offers within its retention window. Lag
-//! markers are the exception: they are per-subscription runtime events rather
-//! than log entries, so each is delivered at most once across the mock's
-//! lifetime — otherwise a subscriber that recovered from a lag by
-//! re-subscribing would be handed the same lag again, forever.
+//! Everything pushed is retained and served from `cursor.seq` onward, which
+//! is the contract a real feed offers within its retention window.
+//! [`MockInteropFeed::set_floor`] models the window's edge the way the
+//! validator's store does: messages below the floor are gone, and EVERY
+//! subscribe with a cursor below the floor gets a `Lagged` frame naming the
+//! floor, then the retained suffix. A subscriber that re-subscribes from
+//! the same cursor gets the same answer, exactly like the real server.
+//! [`MockInteropFeed::push_head`] scripts the origin's `head` event.
 
-use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::server::{PendingSubscriptionSink, Server, ServerHandle};
@@ -46,21 +46,17 @@ use crate::interop::feed::{OutboxCursor, OutboxEventDto, OutboxFeedApiServer, Ou
 #[derive(Clone, Debug)]
 enum FeedItem {
     Message(Box<OutboxMessage>),
-    /// Identified so it can be delivered at most once — see the module docs.
-    Lagged {
-        skipped: u64,
-        id: u64,
-    },
+    /// The origin closed every block through this one.
+    Head(u64),
 }
 
 struct FeedState {
     origin_chain_id: u64,
     script: Mutex<Vec<FeedItem>>,
-    /// Lag markers already delivered, by id.
-    emitted_lagged: Mutex<BTreeSet<u64>>,
+    /// First seq the feed serves. A subscribe below it gets `Lagged`.
+    floor: Mutex<u64>,
     /// Messages the feed will swallow before retaining any more.
     swallow: Mutex<u64>,
-    next_lagged_id: AtomicU64,
     /// `dest_chain_id` of every subscription received, in order. Its length is
     /// the re-subscription count the reconnect/lag tests assert on.
     subscribed_dests: Mutex<Vec<u64>>,
@@ -87,9 +83,8 @@ impl MockInteropFeed {
         let state = Arc::new(FeedState {
             origin_chain_id,
             script: Mutex::new(Vec::new()),
-            emitted_lagged: Mutex::new(BTreeSet::new()),
+            floor: Mutex::new(0),
             swallow: Mutex::new(0),
-            next_lagged_id: AtomicU64::new(0),
             subscribed_dests: Mutex::new(Vec::new()),
             items: watch::channel(0usize).0,
             close_epoch: watch::channel(0u64).0,
@@ -138,13 +133,30 @@ impl MockInteropFeed {
         self.state.items.send_replace(len);
     }
 
-    /// Script a lag marker at the current stream position: the next subscriber
-    /// to reach it is told `skipped` items were lost. Delivered at most once.
-    pub fn push_lagged(&self, skipped: u64) {
-        let id = self.state.next_lagged_id.fetch_add(1, Ordering::SeqCst);
+    /// Raise the feed floor: messages below `seq` are gone, and every
+    /// subscribe with a cursor below `seq` gets a `Lagged` frame first —
+    /// the real server's retention edge.
+    pub fn set_floor(&self, seq: u64) {
+        let len = {
+            let mut floor = self.state.floor.lock().unwrap();
+            *floor = (*floor).max(seq);
+            let mut script = self.state.script.lock().unwrap();
+            script.retain(|item| match item {
+                FeedItem::Message(m) => m.seq >= *floor,
+                FeedItem::Head(_) => true,
+            });
+            script.len()
+        };
+        self.state.items.send_replace(len);
+    }
+
+    /// Script a `head` event: the origin closed every block through
+    /// `block`. A subscriber with an open batch from an earlier block
+    /// closes it.
+    pub fn push_head(&self, block: u64) {
         let len = {
             let mut script = self.state.script.lock().unwrap();
-            script.push(FeedItem::Lagged { skipped, id });
+            script.push(FeedItem::Head(block));
             script.len()
         };
         self.state.items.send_replace(len);
@@ -201,6 +213,35 @@ impl OutboxFeedApiServer for FeedHandler {
             .unwrap()
             .push(dest_chain_id);
 
+        // The retention edge, judged on EVERY subscribe like the real
+        // server: a cursor below the floor is told so, then served from
+        // the floor.
+        let floor = *self.state.floor.lock().unwrap();
+        let mut from = cursor.seq;
+        if from < floor {
+            let floor_block = self
+                .state
+                .script
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|i| match i {
+                    FeedItem::Message(m) => Some(m.origin_block_number),
+                    FeedItem::Head(_) => None,
+                });
+            let event = OutboxEventDto::Lagged {
+                skipped: floor - from,
+                floor_seq: Some(floor),
+                floor_block,
+            };
+            let msg = serde_json::value::to_raw_value(&event)
+                .map_err(|e| format!("serialize feed event: {e}"))?;
+            if sink.send(msg).await.is_err() {
+                return Ok(());
+            }
+            from = floor;
+        }
+
         let mut next = 0usize;
         loop {
             loop {
@@ -212,16 +253,13 @@ impl OutboxFeedApiServer for FeedHandler {
                     // Honouring the cursor is the whole contract: a resumed
                     // subscriber must see exactly the same suffix a fresh one
                     // at that cursor would.
-                    FeedItem::Message(m) if m.seq < cursor.seq => continue,
+                    FeedItem::Message(m) if m.seq < from => continue,
                     FeedItem::Message(m) => OutboxEventDto::Message(Box::new(
                         OutboxMessageDto::from_outbox_message(self.state.origin_chain_id, &m),
                     )),
-                    FeedItem::Lagged { skipped, id } => {
-                        if !self.state.emitted_lagged.lock().unwrap().insert(id) {
-                            continue;
-                        }
-                        OutboxEventDto::Lagged { skipped }
-                    }
+                    FeedItem::Head(block) => OutboxEventDto::Head {
+                        block_number: block,
+                    },
                 };
                 let msg = serde_json::value::to_raw_value(&event)
                     .map_err(|e| format!("serialize feed event: {e}"))?;
