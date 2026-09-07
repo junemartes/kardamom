@@ -1,4 +1,4 @@
-//! M-archive (tx_ordering plus per-sequencer tx_data) offline reader tests.
+//! M-archive (`tx_ordering` plus per-sequencer `tx_data`) offline reader tests.
 //!
 //! Covers:
 //!   - The happy path, in-order resolution: refs come on B after the
@@ -9,31 +9,23 @@
 //!     way. This test pins that invariant down.
 //!   - A missing A-archive, surfaced as a `BatcherError::Config`.
 //!   - The canonical-ordering invariant: the output `position` field is the
-//!     tx_ordering canonical position, not the A-archive position the
+//!     `tx_ordering` canonical position, not the A-archive position the
 //!     envelope was fetched from.
 //!
 //! It also exercises the CLI spec parser.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
 
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
-use kardamom_batcher::archive_reader::append_frame;
 use kardamom_batcher::error::BatcherError;
 use kardamom_batcher::multi_archive_reader::{
     MultiArchiveConfig, MultiArchiveReader, ResolvedRecord,
 };
+use kardamom_batcher::testkit::write_segment;
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
 use tempfile::TempDir;
-
-fn pos(o: i32) -> BPosition {
-    BPosition {
-        term_id: 0,
-        term_offset: o,
-    }
-}
 
 fn tx(correlation: u64) -> TxEnvelope {
     TxEnvelope {
@@ -44,25 +36,41 @@ fn tx(correlation: u64) -> TxEnvelope {
     }
 }
 
-/// Build a temporary `.rec` file with `frames` written via `append_frame`.
-fn write_segment<T>(dir: &TempDir, name: &str, frames: &[(BPosition, T)]) -> PathBuf
-where
-    T: for<'a> rkyv::Serialize<
-            rkyv::api::high::HighSerializer<
-                rkyv::util::AlignedVec,
-                rkyv::ser::allocator::ArenaHandle<'a>,
-                rkyv::rancor::Error,
-            >,
-        >,
-{
-    let mut buf = Vec::new();
-    for (p, v) in frames {
-        append_frame(&mut buf, *p, v);
-    }
-    let path = dir.path().join(name);
-    let mut f = std::fs::File::create(&path).unwrap();
-    f.write_all(&buf).unwrap();
-    path
+/// A `TxRef` frame at B-position `term_offset`, from sequencer
+/// `sequencer_id` at A-position `a_pos`.
+fn tx_ref_at(
+    term_offset: u64,
+    sequencer_id: u8,
+    a_pos: BPosition,
+) -> (BPosition, TxOrderingMessage) {
+    (
+        BPosition::from_index(term_offset),
+        TxOrderingMessage::TxRef(TxRef::new(
+            alloy_primitives::B256::ZERO,
+            sequencer_id,
+            a_pos,
+            0,
+        )),
+    )
+}
+
+/// A `BoundaryStart` frame at B-position `term_offset`, closing
+/// `block_number`.
+fn boundary_at(
+    term_offset: u64,
+    block_number: u64,
+    l2_timestamp: u64,
+) -> (BPosition, TxOrderingMessage) {
+    let pos = BPosition::from_index(term_offset);
+    (
+        pos,
+        TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
+            block_number,
+            end_tx_idx: pos,
+            l2_timestamp,
+            l1_origin: 0,
+        }),
+    )
 }
 
 #[test]
@@ -70,40 +78,34 @@ fn happy_path_in_order_resolution() {
     let dir = TempDir::new().unwrap();
 
     // Two sequencers each write two envelopes to their own A archive.
-    let a0 = write_segment(&dir, "a0.rec", &[(pos(0), tx(10)), (pos(128), tx(11))]);
-    let a1 = write_segment(&dir, "a1.rec", &[(pos(0), tx(20)), (pos(128), tx(21))]);
+    let a0 = write_segment(
+        dir.path(),
+        "a0.rec",
+        &[
+            (BPosition::from_index(0), tx(10)),
+            (BPosition::from_index(128), tx(11)),
+        ],
+    );
+    let a1 = write_segment(
+        dir.path(),
+        "a1.rec",
+        &[
+            (BPosition::from_index(0), tx(20)),
+            (BPosition::from_index(128), tx(21)),
+        ],
+    );
 
     // TxOrdering records the canonical order: interleaved refs from both
     // sequencers, then a boundary.
     let b = write_segment(
-        &dir,
+        dir.path(),
         "b.rec",
         &[
-            (
-                pos(0),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(0), 0)),
-            ),
-            (
-                pos(16),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 1, pos(0), 0)),
-            ),
-            (
-                pos(32),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(128), 0)),
-            ),
-            (
-                pos(48),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 1, pos(128), 0)),
-            ),
-            (
-                pos(64),
-                TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
-                    block_number: 1,
-                    end_tx_idx: pos(64),
-                    l2_timestamp: 1_700_000_000,
-                    l1_origin: 0,
-                }),
-            ),
+            tx_ref_at(0, 0, BPosition::from_index(0)),
+            tx_ref_at(16, 1, BPosition::from_index(0)),
+            tx_ref_at(32, 0, BPosition::from_index(128)),
+            tx_ref_at(48, 1, BPosition::from_index(128)),
+            boundary_at(64, 1, 1_700_000_000),
         ],
     );
 
@@ -139,15 +141,18 @@ fn happy_path_in_order_resolution() {
         };
         assert_eq!(env.correlation_id, *exp);
         // The B-canonical position is what the accumulator records.
-        assert_eq!(*position, pos((i as i32) * 16));
+        assert_eq!(
+            *position,
+            BPosition::from_index(u64::try_from(i).unwrap() * 16)
+        );
         // sequencer_id matches the TxRef the batcher resolved against.
-        assert_eq!(*sequencer_id, (i % 2) as u8);
+        assert_eq!(*sequencer_id, u8::try_from(i % 2).unwrap());
     }
 
     let ResolvedRecord::Boundary { position, marker } = &records[4] else {
         panic!("expected boundary at end");
     };
-    assert_eq!(*position, pos(64));
+    assert_eq!(*position, BPosition::from_index(64));
     assert_eq!(marker.block_number, 1);
 }
 
@@ -163,37 +168,24 @@ fn out_of_order_b_refs_a_positions_still_resolve() {
     let dir = TempDir::new().unwrap();
 
     let a0 = write_segment(
-        &dir,
+        dir.path(),
         "a0.rec",
-        &[(pos(0), tx(100)), (pos(128), tx(101)), (pos(256), tx(102))],
+        &[
+            (BPosition::from_index(0), tx(100)),
+            (BPosition::from_index(128), tx(101)),
+            (BPosition::from_index(256), tx(102)),
+        ],
     );
 
     // B references a0 in reverse A-order.
     let b = write_segment(
-        &dir,
+        dir.path(),
         "b.rec",
         &[
-            (
-                pos(0),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(256), 0)),
-            ),
-            (
-                pos(16),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(128), 0)),
-            ),
-            (
-                pos(32),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(0), 0)),
-            ),
-            (
-                pos(48),
-                TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
-                    block_number: 7,
-                    end_tx_idx: pos(48),
-                    l2_timestamp: 1_700_000_007,
-                    l1_origin: 0,
-                }),
-            ),
+            tx_ref_at(0, 0, BPosition::from_index(256)),
+            tx_ref_at(16, 0, BPosition::from_index(128)),
+            tx_ref_at(32, 0, BPosition::from_index(0)),
+            boundary_at(48, 7, 1_700_000_007),
         ],
     );
 
@@ -229,11 +221,16 @@ fn out_of_order_b_refs_a_positions_still_resolve() {
 fn missing_a_archive_surfaces_as_config_error() {
     let dir = TempDir::new().unwrap();
     let b = write_segment(
-        &dir,
+        dir.path(),
         "b.rec",
         &[(
-            pos(0),
-            TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 99, pos(0), 0)),
+            BPosition::from_index(0),
+            TxOrderingMessage::TxRef(TxRef::new(
+                alloy_primitives::B256::ZERO,
+                99,
+                BPosition::from_index(0),
+                0,
+            )),
         )],
     );
 
@@ -256,13 +253,18 @@ fn missing_a_archive_surfaces_as_config_error() {
 fn missing_a_position_surfaces_as_frame_error() {
     let dir = TempDir::new().unwrap();
     // A-archive has only position 0; B references position 9999.
-    let a0 = write_segment(&dir, "a0.rec", &[(pos(0), tx(1))]);
+    let a0 = write_segment(dir.path(), "a0.rec", &[(BPosition::from_index(0), tx(1))]);
     let b = write_segment(
-        &dir,
+        dir.path(),
         "b.rec",
         &[(
-            pos(0),
-            TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(9999), 0)),
+            BPosition::from_index(0),
+            TxOrderingMessage::TxRef(TxRef::new(
+                alloy_primitives::B256::ZERO,
+                0,
+                BPosition::from_index(9999),
+                0,
+            )),
         )],
     );
 

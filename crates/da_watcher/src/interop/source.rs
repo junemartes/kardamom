@@ -33,6 +33,7 @@
 //!     quietly fixed a gap would hide exactly the fault the no-skip rule
 //!     exists to catch.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -42,9 +43,10 @@ use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
 use kardamom_types::xchain::OutboxMessage;
 use tracing::{debug, warn};
 
-use crate::interop::feed::{
+use kardamom_interop_feed::{
     OutboxCursor, OutboxEventDto, SUBSCRIBE_OUTBOX_METHOD, UNSUBSCRIBE_OUTBOX_METHOD,
 };
+
 use crate::metrics;
 
 /// Errors a [`RemoteChainSource`] can surface.
@@ -59,7 +61,7 @@ pub enum RemoteSourceError {
     #[error("remote feed transport error: {0}")]
     Transport(String),
     /// A feed item this build cannot interpret (see
-    /// [`crate::interop::feed::FeedDecodeError`]).
+    /// [`kardamom_interop_feed::FeedDecodeError`]).
     #[error("remote feed decode error: {0}")]
     Decode(String),
 }
@@ -91,6 +93,9 @@ pub trait RemoteChainSource: Send + 'static {
     ) -> Result<Vec<OutboxMessage>, RemoteSourceError>;
 }
 
+/// [`WsRemoteChainSource::new`]'s default reconnect budget.
+const DEFAULT_MAX_RECONNECT_ATTEMPTS: NonZeroU32 = NonZeroU32::new(8).unwrap();
+
 /// Production [`RemoteChainSource`]: a jsonrpsee WebSocket subscription to a
 /// peer validator's `kardamom_subscribeOutbox`.
 ///
@@ -105,7 +110,7 @@ pub struct WsRemoteChainSource {
     dest_chain_id: u64,
     url: String,
     reconnect_backoff: Duration,
-    max_reconnect_attempts: u32,
+    max_reconnect_attempts: NonZeroU32,
     // Held for its lifetime, not its API: dropping the client closes the
     // WebSocket out from under the subscription.
     client: Option<WsClient>,
@@ -126,7 +131,7 @@ impl WsRemoteChainSource {
             dest_chain_id,
             url: url.into(),
             reconnect_backoff: Duration::from_millis(250),
-            max_reconnect_attempts: 8,
+            max_reconnect_attempts: DEFAULT_MAX_RECONNECT_ATTEMPTS,
             client: None,
             subscription: None,
             cursor: None,
@@ -138,9 +143,10 @@ impl WsRemoteChainSource {
     /// the failure back to the watcher. Bounded rather than infinite so a dead
     /// peer surfaces on the watcher's tick metric instead of inside a silent
     /// retry loop.
-    pub fn with_reconnect(mut self, backoff: Duration, max_attempts: u32) -> Self {
+    #[must_use]
+    pub fn with_reconnect(mut self, backoff: Duration, max_attempts: NonZeroU32) -> Self {
         self.reconnect_backoff = backoff;
-        self.max_reconnect_attempts = max_attempts.max(1);
+        self.max_reconnect_attempts = max_attempts;
         self
     }
 
@@ -175,7 +181,7 @@ impl WsRemoteChainSource {
             return Ok(());
         }
         let mut last = None;
-        for attempt in 0..self.max_reconnect_attempts {
+        for attempt in 0..self.max_reconnect_attempts.get() {
             match self.connect(from).await {
                 Ok(()) => {
                     debug!(
@@ -219,8 +225,16 @@ impl WsRemoteChainSource {
         }
         let batch = std::mem::replace(&mut self.pending, vec![msg]);
         // Track the caller's expected next cursor so an un-advanced caller
-        // (backpressure) is detected as a rewind and replayed.
-        self.cursor = batch.iter().map(|m| m.seq).max().map(|s| s + 1);
+        // (backpressure) is detected as a rewind and replayed. `checked_add`
+        // guards a `seq == u64::MAX` message (unreachable in practice) from
+        // wrapping to 0; falling back to `None` instead just forces the
+        // next call onto the same resubscribe path an actually-rewound
+        // caller already takes.
+        self.cursor = batch
+            .iter()
+            .map(|m| m.seq)
+            .max()
+            .and_then(|s| s.checked_add(1));
         Some(batch)
     }
 }
@@ -317,7 +331,7 @@ impl RemoteChainSource for WsRemoteChainSource {
 pub mod fakes {
     use std::collections::VecDeque;
 
-    use super::*;
+    use super::{OutboxMessage, RemoteChainSource, RemoteSourceError, async_trait};
 
     /// In-memory [`RemoteChainSource`] driven by a scripted queue of batches —
     /// the interop counterpart of [`crate::source::fakes::MockL1Source`], for
@@ -334,6 +348,7 @@ pub mod fakes {
     }
 
     impl ScriptedRemoteSource {
+        #[must_use]
         pub fn new(origin_chain_id: u64) -> Self {
             Self {
                 origin_chain_id,

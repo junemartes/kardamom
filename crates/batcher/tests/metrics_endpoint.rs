@@ -5,15 +5,16 @@ use std::net::{SocketAddr, TcpListener};
 
 #[tokio::test]
 async fn batcher_metrics_endpoint_serves_expected_counters() {
+    // Touch every counter the batcher crate is expected to publish. This
+    // way, describe_counter calls do not require running the binary too.
+    // Use the crate's constants, so a rename in metric_names fails here.
+    use kardamom_batcher::batcher::metric_names;
+
     let addr = free_port();
     kardamom_obs::init("batcher", addr, "local", "test", "test")
         .await
         .expect("init");
 
-    // Touch every counter the batcher crate is expected to publish. This
-    // way, describe_counter calls do not require running the binary too.
-    // Use the crate's constants, so a rename in metric_names fails here.
-    use kardamom_batcher::batcher::metric_names;
     metrics::counter!(metric_names::BLOCKS_OBSERVED).increment(0);
     metrics::counter!(metric_names::BATCHES_POSTED).increment(0);
     metrics::counter!(metric_names::BLOBS_POSTED).increment(0);
@@ -38,10 +39,10 @@ async fn batcher_metrics_endpoint_serves_expected_counters() {
 }
 
 fn free_port() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = l.local_addr().unwrap();
-    drop(l);
-    a
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
 }
 
 async fn scrape(url: &str) -> String {

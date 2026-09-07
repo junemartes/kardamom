@@ -14,7 +14,7 @@
 //! `BatchPosted` event log in index order. It fetches each batch's blobs
 //! from a [`BlobSource`], using the versioned hashes L1 committed to. It
 //! decodes the blobs back into the ordered [`BlockFrame`] stream, the input
-//! to [`crate::reexec::reconstruct_state`].
+//! the `kardamom-reconstruct` crate re-executes to rebuild L2 state.
 
 use alloy_consensus::BlobTransactionSidecarVariant;
 use alloy_eips::eip4844::BlobTransactionSidecar;
@@ -49,6 +49,9 @@ pub struct BatchDescriptor {
 
 /// Build a real 4844 sidecar (KZG commitments and proofs from the env
 /// trusted setup) from already-packed blobs.
+///
+/// # Errors
+/// Returns an error when the sidecar cannot be built from `blobs`.
 pub fn build_sidecar(
     blobs: Vec<alloy_eips::eip4844::Blob>,
 ) -> Result<BlobTransactionSidecar, BatcherError> {
@@ -67,6 +70,10 @@ pub fn build_sidecar(
 /// `prev_batch_index` is the contract's current `lastBatchIndex` (a
 /// compare-and-swap guard against replay). Returns the new batch index on
 /// success.
+///
+/// # Errors
+/// Returns an error when sidecar construction, sending the transaction, or
+/// awaiting its receipt fails, or when the transaction reverts.
 pub async fn post_batch<P: Provider>(
     provider: &P,
     settlement: Address,
@@ -115,11 +122,16 @@ pub async fn post_batch<P: Provider>(
     if !receipt.status() {
         return Err(BatcherError::L1("postBatch reverted".into()));
     }
-    Ok(prev_batch_index + 1)
+    prev_batch_index
+        .checked_add(1)
+        .ok_or_else(|| BatcherError::L1("prev_batch_index overflowed u64".into()))
 }
 
 /// Read all `BatchPosted` events from `settlement`, at or after
 /// `from_block`. Returns them in ascending batch-index order.
+///
+/// # Errors
+/// Returns an error when the log query or an event's decode fails.
 pub async fn read_posted_batches<P: Provider>(
     provider: &P,
     settlement: Address,
@@ -134,17 +146,19 @@ pub async fn read_posted_batches<P: Provider>(
         .await
         .map_err(|e| BatcherError::L1(format!("get_logs BatchPosted: {e}")))?;
 
-    let mut out = Vec::with_capacity(logs.len());
-    for log in logs {
-        let ev = IKardamomL2Settlement::BatchPosted::decode_log(&log.inner)
-            .map_err(|e| BatcherError::L1(format!("decode BatchPosted: {e}")))?;
-        out.push(BatchDescriptor {
-            index: ev.data.batchIndex,
-            versioned_hashes: ev.data.blobHashes.clone(),
-            l2_block_start: ev.data.l2BlockStart,
-            l2_block_end: ev.data.l2BlockEnd,
-        });
-    }
+    let mut out = logs
+        .iter()
+        .map(|log| {
+            let ev = IKardamomL2Settlement::BatchPosted::decode_log(&log.inner)
+                .map_err(|e| BatcherError::L1(format!("decode BatchPosted: {e}")))?;
+            Ok(BatchDescriptor {
+                index: ev.data.batchIndex,
+                versioned_hashes: ev.data.blobHashes.clone(),
+                l2_block_start: ev.data.l2BlockStart,
+                l2_block_end: ev.data.l2BlockEnd,
+            })
+        })
+        .collect::<Result<Vec<_>, BatcherError>>()?;
     out.sort_by_key(|d| d.index);
     Ok(out)
 }
@@ -153,10 +167,17 @@ pub async fn read_posted_batches<P: Provider>(
 /// batch's blobs from `source`, using the versioned hashes L1 committed to,
 /// and decode them. `descriptors` must be in ascending index order, as
 /// [`read_posted_batches`] returns them.
+///
+/// # Errors
+/// Returns an error when fetching or verifying a blob fails, or when
+/// reconstruction of the decoded blobs fails.
 pub fn recover_blocks<S: BlobSource>(
     descriptors: &[BatchDescriptor],
     source: &S,
 ) -> Result<Vec<BlockFrame>, BatcherError> {
+    // Keep this as a loop. `verify_blob_against_hash`'s KZG check already
+    // uses most of the default test-thread stack; the extra frames an
+    // iterator/closure chain adds here are enough to overflow it.
     let mut blocks = Vec::new();
     for d in descriptors {
         let mut blobs = Vec::with_capacity(d.versioned_hashes.len());
@@ -184,6 +205,10 @@ pub fn recover_blocks<S: BlobSource>(
 /// in-cluster durable copy is gone. The hash is already in the
 /// `BatchPosted` event, so the check costs one commitment per blob, on a
 /// recovery path that runs at most once per incident.
+///
+/// # Errors
+/// Returns an error when the recomputed versioned hash does not match
+/// `versioned_hash`.
 pub fn verify_blob_against_hash(
     versioned_hash: B256,
     blob: &alloy_eips::eip4844::Blob,

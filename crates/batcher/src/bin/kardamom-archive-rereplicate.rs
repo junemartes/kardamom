@@ -68,15 +68,26 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if cli.diff {
-        let diff = diff_mirror(&cli.source_dir, &cli.dest_dir).context("diff mirror")?;
+        return cli.run_diff();
+    }
+    if cli.heal {
+        return cli.run_heal();
+    }
+    cli.run_mirror()
+}
+
+impl Cli {
+    /// `--diff`: report diverging segments and exit nonzero if any exist.
+    /// Changes nothing.
+    fn run_diff(&self) -> anyhow::Result<()> {
+        let diff = diff_mirror(&self.source_dir, &self.dest_dir).context("diff mirror")?;
         for name in &diff.diverged {
             println!("{name}");
         }
-        // Dest-only segments are recording ids the mirror never opened, from
-        // a daemon restart or a post-restore session. They are a divergence
-        // the mirror cannot vouch for, and --heal cannot repair them from
-        // this source. Tag them so scripted callers can tell the two
-        // classes apart.
+        // Dest-only segments are recording ids the mirror never opened, from a
+        // daemon restart or a post-restore session. They are a divergence the
+        // mirror cannot vouch for, and --heal cannot repair them from this
+        // source. Tag them so scripted callers can tell the two classes apart.
         for name in &diff.dest_only {
             println!("{name} dest-only (no source counterpart; unhealable from this mirror)");
         }
@@ -88,16 +99,18 @@ fn main() -> anyhow::Result<()> {
         if !diff.is_clean() {
             std::process::exit(3);
         }
-        return Ok(());
+        Ok(())
     }
 
-    if cli.heal {
-        let segments = if cli.segments.is_empty() {
-            // Auto-detect heals only what the mirror can vouch for.
-            // Dest-only segments have no source bytes to copy, and --diff
-            // reports them instead.
-            let diff =
-                diff_mirror(&cli.source_dir, &cli.dest_dir).context("detect diverging segments")?;
+    /// `--heal`: copy only diverging segments (`--segments`, or
+    /// auto-detected) instead of the whole archive.
+    fn run_heal(&self) -> anyhow::Result<()> {
+        let segments = if self.segments.is_empty() {
+            // Auto-detect heals only what the mirror can vouch for. Dest-only
+            // segments have no source bytes to copy, and --diff reports them
+            // instead.
+            let diff = diff_mirror(&self.source_dir, &self.dest_dir)
+                .context("detect diverging segments")?;
             if !diff.dest_only.is_empty() {
                 tracing::warn!(
                     dest_only = diff.dest_only.len(),
@@ -106,18 +119,18 @@ fn main() -> anyhow::Result<()> {
             }
             diff.diverged
         } else {
-            cli.segments.clone()
+            self.segments.clone()
         };
-        let report = heal_from_mirror(&cli.source_dir, &cli.dest_dir, &segments)
+        let report = heal_from_mirror(&self.source_dir, &self.dest_dir, &segments)
             .with_context(|| format!("heal {} segment(s)", segments.len()))?;
         info!(
             segments = report.segments_healed,
             bytes = report.bytes_copied,
             "healed diverging archive segments from mirror"
         );
-        if !cli.no_verify {
+        if !self.no_verify {
             let verified =
-                verify_mirror(&cli.source_dir, &cli.dest_dir).context("verify mirror")?;
+                verify_mirror(&self.source_dir, &self.dest_dir).context("verify mirror")?;
             info!(verified, "segment contents verified against source");
         }
         // Machine-readable line for chaos/runbook assertions.
@@ -125,32 +138,37 @@ fn main() -> anyhow::Result<()> {
             "healed segments={} bytes={}",
             report.segments_healed, report.bytes_copied
         );
-        return Ok(());
+        Ok(())
     }
 
-    let report = mirror_archive(&cli.source_dir, &cli.dest_dir).with_context(|| {
-        format!(
-            "mirror {} -> {}",
-            cli.source_dir.display(),
-            cli.dest_dir.display()
-        )
-    })?;
-    info!(
-        segments = report.segments_copied,
-        bytes = report.bytes_copied,
-        catalog = report.catalog_copied,
-        "re-replicated archive segments"
-    );
+    /// The default mode: restore the whole destination archive from the
+    /// source mirror.
+    fn run_mirror(&self) -> anyhow::Result<()> {
+        let report = mirror_archive(&self.source_dir, &self.dest_dir).with_context(|| {
+            format!(
+                "mirror {} -> {}",
+                self.source_dir.display(),
+                self.dest_dir.display()
+            )
+        })?;
+        info!(
+            segments = report.segments_copied,
+            bytes = report.bytes_copied,
+            catalog = report.catalog_copied,
+            "re-replicated archive segments"
+        );
 
-    if !cli.no_verify {
-        let verified = verify_mirror(&cli.source_dir, &cli.dest_dir).context("verify mirror")?;
-        info!(verified, "segment contents verified against source");
+        if !self.no_verify {
+            let verified =
+                verify_mirror(&self.source_dir, &self.dest_dir).context("verify mirror")?;
+            info!(verified, "segment contents verified against source");
+        }
+
+        // Machine-readable line for chaos/runbook assertions.
+        println!(
+            "rereplicated segments={} bytes={} catalog={}",
+            report.segments_copied, report.bytes_copied, report.catalog_copied
+        );
+        Ok(())
     }
-
-    // Machine-readable line for chaos/runbook assertions.
-    println!(
-        "rereplicated segments={} bytes={} catalog={}",
-        report.segments_copied, report.bytes_copied, report.catalog_copied
-    );
-    Ok(())
 }

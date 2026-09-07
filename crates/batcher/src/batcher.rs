@@ -7,9 +7,11 @@
 //!   encodes KAR1, compresses with zstd if enabled, packs the result into
 //!   blobs, and hands the batch to a [`Sender`] for L1 broadcast.
 //!
-//! This is a single-instance design for v1. There is no election or standby.
-//! If the batcher process dies, the L2 stops settling blocks until an
-//! operator restarts it.
+//! This is a single-instance design: no election or standby. If the batcher
+//! process dies, the L2 stops settling blocks until an operator restarts
+//! it.
+
+use std::num::NonZeroUsize;
 
 use alloy_eips::eip4844::Blob;
 use metrics::counter;
@@ -31,8 +33,10 @@ pub mod metric_names {
 /// Configuration for the batching loop.
 #[derive(Clone, Debug)]
 pub struct BatcherConfig {
-    /// Number of closed blocks to group into a single L1 post. Defaults to 1.
-    pub blocks_per_batch: usize,
+    /// Number of closed blocks to group into a single L1 post. Defaults to
+    /// one. Nonzero at the type level: zero would make every "group is
+    /// full" comparison at the post site vacuously true.
+    pub blocks_per_batch: NonZeroUsize,
     /// Whether to zstd-compress the framed payload before blob packing.
     pub compress: bool,
     /// zstd compression level when `compress` is true.
@@ -42,7 +46,7 @@ pub struct BatcherConfig {
 impl Default for BatcherConfig {
     fn default() -> Self {
         Self {
-            blocks_per_batch: 1,
+            blocks_per_batch: NonZeroUsize::MIN,
             compress: true,
             compression_level: DEFAULT_LEVEL,
         }
@@ -66,6 +70,9 @@ pub struct PostedBatch {
 /// provider and builds a 4844 transaction (see [`crate::settlement`]). The
 /// test version only captures the batch.
 pub trait Sender {
+    /// # Errors
+    /// Returns an error when the batch cannot be sent (for example, an L1
+    /// transaction failure in the production sink).
     fn post(&mut self, batch: PostedBatch) -> Result<(), BatcherError>;
 }
 
@@ -112,10 +119,14 @@ impl<S: Sender> Batcher<S> {
     /// The reader thread calls this method when a `ClosedBlock` becomes
     /// available. If enough blocks are ready to form a batch, this method
     /// builds the blobs and sends them to the sender.
+    ///
+    /// # Errors
+    /// Returns an error when packing the group into blobs fails, or when
+    /// [`Sender::post`] fails.
     pub fn on_closed_block(&mut self, block: ClosedBlock) -> Result<(), BatcherError> {
         counter!(metric_names::BLOCKS_OBSERVED).increment(1);
         self.pending_blocks.push(block);
-        if self.pending_blocks.len() < self.cfg.blocks_per_batch {
+        if self.pending_blocks.len() < self.cfg.blocks_per_batch.get() {
             return Ok(());
         }
         let group = std::mem::take(&mut self.pending_blocks);
@@ -132,6 +143,10 @@ impl<S: Sender> Batcher<S> {
 ///
 /// Steps: encode KAR1, compress with zstd if enabled, then pack into at
 /// most 6 blobs.
+///
+/// # Errors
+/// Returns an error when `blocks` is empty, or when frame encoding or blob
+/// packing fails.
 pub fn pack_blocks(
     cfg: &BatcherConfig,
     blocks: &[ClosedBlock],
@@ -153,8 +168,8 @@ pub fn pack_blocks(
             blobs.len()
         )));
     }
-    let l2_block_start = blocks.first().map(|b| b.block_number).unwrap_or(0);
-    let l2_block_end = blocks.last().map(|b| b.block_number).unwrap_or(0);
+    let l2_block_start = blocks.first().map_or(0, |b| b.block_number);
+    let l2_block_end = blocks.last().map_or(0, |b| b.block_number);
     let records_commitment = kardamom_types::batch_records_commitment(blocks.iter().map(|b| {
         let mut d = kardamom_types::BlockRecordsDigest::new(b.block_number);
         for t in &b.txs {

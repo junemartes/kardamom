@@ -1,12 +1,10 @@
 //! End-to-end deployer flow against anvil with the ERC-7955 factory predeployed.
 //! Skips gracefully if forge artifacts or anvil are missing.
 
-use alloy_node_bindings::Anvil;
 use alloy_primitives::{Address, Bytes, U256, address};
-use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::sol;
 
-use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
+use kardamom_deployer::testkit::AnvilRig;
 use kardamom_deployer::{ContractId, Deployer, FactoryStatus, Op, encode_address_pair};
 
 sol! {
@@ -20,60 +18,19 @@ sol! {
 
 const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
 
-/// Set up an anvil instance with the ERC-7955 factory preloaded. Impersonate
-/// DEV_OWNER, so transactions from it need no private key. Return `None` if
-/// anvil is not available.
-async fn setup_anvil_with_erc7955() -> Option<(
-    alloy_node_bindings::AnvilInstance,
-    impl alloy_provider::Provider + Clone,
-)> {
-    let anvil = Anvil::new().try_spawn().ok()?;
-    let provider = ProviderBuilder::new()
-        .disable_recommended_fillers()
-        .connect_http(anvil.endpoint_url());
-
-    let bytes_hex = format!("0x{ERC7955_RUNTIME_HEX}");
-    let _: serde_json::Value = provider
-        .raw_request("anvil_setCode".into(), (ERC7955_FACTORY, bytes_hex))
-        .await
-        .ok()?;
-
-    // Fund DEV_OWNER and impersonate it, so its transactions need no key.
-    let _: serde_json::Value = provider
-        .raw_request(
-            "anvil_setBalance".into(),
-            (DEV_OWNER, U256::from(1_000_000_000_000_000_000_000u128)),
-        )
-        .await
-        .ok()?;
-    let _: serde_json::Value = provider
-        .raw_request("anvil_impersonateAccount".into(), (DEV_OWNER,))
-        .await
-        .ok()?;
-
-    Some((anvil, provider))
-}
-
 #[tokio::test]
 async fn cross_chain_address_parity() {
-    let (anvil_a, provider_a) = match setup_anvil_with_erc7955().await {
-        Some(p) => p,
-        None => {
-            eprintln!("SKIP: anvil unavailable");
-            return;
-        }
+    let Some(rig_a) = AnvilRig::spawn(&[DEV_OWNER]).await else {
+        eprintln!("SKIP: anvil unavailable");
+        return;
     };
-    let (_anvil_b, provider_b) = match setup_anvil_with_erc7955().await {
-        Some(p) => p,
-        None => {
-            eprintln!("SKIP: anvil unavailable");
-            return;
-        }
+    let Some(rig_b) = AnvilRig::spawn(&[DEV_OWNER]).await else {
+        eprintln!("SKIP: anvil unavailable");
+        return;
     };
-    let _ = anvil_a; // keep alive
 
-    let deployer_a = Deployer::new(provider_a, DEV_OWNER);
-    let deployer_b = Deployer::new(provider_b, DEV_OWNER);
+    let deployer_a = Deployer::new(rig_a.provider, DEV_OWNER);
+    let deployer_b = Deployer::new(rig_b.provider, DEV_OWNER);
 
     assert!(matches!(
         deployer_a.ensure_factory(DEV_OWNER).await.unwrap(),
@@ -95,14 +52,11 @@ async fn cross_chain_address_parity() {
 #[tokio::test]
 #[ignore = "anvil flake: reverts intermittently with 'atomic multi-L2 upgrade: Reverted'; tracked separately"]
 async fn multi_l2_deploy_and_atomic_upgrade() {
-    let (anvil, provider) = match setup_anvil_with_erc7955().await {
-        Some(p) => p,
-        None => {
-            eprintln!("SKIP: anvil unavailable");
-            return;
-        }
+    let Some(rig) = AnvilRig::spawn(&[DEV_OWNER]).await else {
+        eprintln!("SKIP: anvil unavailable");
+        return;
     };
-    let _ = anvil; // keep alive
+    let provider = rig.provider.clone();
     let deployer = Deployer::new(provider.clone(), DEV_OWNER);
 
     deployer.ensure_factory(DEV_OWNER).await.unwrap();

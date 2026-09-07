@@ -66,7 +66,7 @@ pub trait L1Source: Send + Sync + 'static {
 
     /// Lockbox logs (`DepositInitiated` and `UpgradeInitiated`) that
     /// `lockbox` emits in the inclusive block range `[from_block, to_block]`.
-    /// The response order is the canonical (block, log_index) order.
+    /// The response order is the canonical (block, `log_index`) order.
     ///
     /// Both event kinds must come back from one query. Fetching them
     /// separately and merging the results could let a partial failure drop
@@ -86,7 +86,7 @@ pub mod fakes {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use super::*;
+    use super::{Address, B256, DepositLog, L1Source, L1SourceError, LockboxLog, async_trait};
 
     /// In-memory `L1Source` driven by a scripted queue. Tests push expected
     /// `(tip, logs)` pairs in order. Each `process_once` call consumes one
@@ -108,12 +108,18 @@ pub mod fakes {
     impl MockL1Source {
         /// Deterministic filler hash for a block number, used when `hashes`
         /// has no entry. Tests building expected epochs use it too.
+        #[must_use]
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "deliberate: repeats number mod 256"
+        )]
         pub fn filler_hash(number: u64) -> B256 {
             B256::repeat_byte(number as u8)
         }
     }
 
     impl MockL1Source {
+        #[must_use]
         pub fn new() -> Self {
             Self {
                 tips: Mutex::new(VecDeque::new()),
@@ -123,10 +129,18 @@ pub mod fakes {
             }
         }
 
+        /// # Panics
+        /// Panics if the internal lock is poisoned (a prior panic while
+        /// holding it), which only happens after the test has already
+        /// failed.
         pub fn push_tip(&self, r: Result<u64, L1SourceError>) {
             self.tips.lock().unwrap().push_back(r);
         }
 
+        /// # Panics
+        /// Panics if the internal lock is poisoned (a prior panic while
+        /// holding it), which only happens after the test has already
+        /// failed.
         pub fn push_logs(&self, r: Result<Vec<LockboxLog>, L1SourceError>) {
             self.logs.lock().unwrap().push_back(r);
         }

@@ -32,6 +32,10 @@ pub use crate::publisher::PublishError;
 pub trait RemoteEpochPublisher: Send + Sync + 'static {
     /// Publish one record. Returns the assigned wire position so callers can
     /// correlate.
+    ///
+    /// # Errors
+    /// Returns [`PublishError`] when the transport is backpressured, closed,
+    /// or fails.
     fn publish(&self, record: &RemoteEpochRecord) -> Result<BPosition, PublishError>;
 }
 
@@ -42,7 +46,7 @@ pub mod fakes {
 
     use alloy_primitives::B256;
 
-    use super::*;
+    use super::{BPosition, PublishError, RemoteEpochPublisher, RemoteEpochRecord};
 
     /// In-memory [`RemoteEpochPublisher`] recording every published record in
     /// order, mirroring [`crate::publisher::fakes::InMemoryEpochPublisher`] —
@@ -63,11 +67,23 @@ pub mod fakes {
 
     impl InMemoryRemoteEpochPublisher {
         /// Records ACCEPTED so far (first-seen, in order), cloned.
+        ///
+        /// # Panics
+        /// Panics if the internal lock is poisoned (a prior panic while
+        /// holding it), which only happens after the test has already
+        /// failed.
+        #[must_use]
         pub fn records(&self) -> Vec<RemoteEpochRecord> {
             self.published.lock().unwrap().clone()
         }
 
         /// How many publishes were absorbed as `canonical_id` duplicates.
+        ///
+        /// # Panics
+        /// Panics if the internal lock is poisoned (a prior panic while
+        /// holding it), which only happens after the test has already
+        /// failed.
+        #[must_use]
         pub fn deduped_count(&self) -> u64 {
             *self.deduped.lock().unwrap()
         }
@@ -87,14 +103,16 @@ pub mod fakes {
                 let len = self.published.lock().unwrap().len();
                 return Ok(BPosition {
                     term_id: 0,
-                    term_offset: (len as i32) * 64,
+                    // A fake position; test record counts never approach i32::MAX.
+                    term_offset: i32::try_from(len).expect("record count fits in i32") * 64,
                 });
             }
             let mut v = self.published.lock().unwrap();
             v.push(record.clone());
             Ok(BPosition {
                 term_id: 0,
-                term_offset: (v.len() as i32) * 64,
+                // A fake position; test record counts never approach i32::MAX.
+                term_offset: i32::try_from(v.len()).expect("record count fits in i32") * 64,
             })
         }
     }

@@ -16,7 +16,9 @@ fn make_block(n_txs: usize, raw_len: usize) -> ClosedBlock {
         .map(|i| RecordedTx {
             position: BPosition {
                 term_id: 0,
-                term_offset: (i * 64) as i32,
+                // Benchmark setup, not the measured path: n_txs is small
+                // enough that i * 64 always fits in i32.
+                term_offset: i32::try_from(i * 64).expect("benchmark position fits in i32"),
             },
             envelope: TxEnvelope {
                 correlation_id: i,

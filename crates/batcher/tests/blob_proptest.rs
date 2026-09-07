@@ -20,11 +20,8 @@ proptest! {
     #[test]
     fn high_byte_always_zero(payload in proptest::collection::vec(any::<u8>(), 0..(USABLE_BYTES_PER_BLOB / 2))) {
         let blobs = pack_to_blobs(&payload).unwrap();
-        for blob in &blobs {
-            let raw: &[u8] = blob.as_slice();
-            for chunk in raw.as_chunks::<32>().0 {
-                prop_assert_eq!(chunk[0], 0);
-            }
+        for chunk in blobs.iter().flat_map(|blob| blob.as_slice().as_chunks::<32>().0) {
+            prop_assert_eq!(chunk[0], 0);
         }
     }
 }

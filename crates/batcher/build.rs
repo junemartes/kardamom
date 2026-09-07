@@ -37,9 +37,8 @@ fn walk_sol_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn walk_sol_files_into(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
     for entry in entries.flatten() {
         let path = entry.path();

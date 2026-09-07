@@ -65,6 +65,7 @@ impl CursorFile {
         Self { path: path.into() }
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -72,6 +73,10 @@ impl CursorFile {
     /// Read the persisted cursor. `Ok(None)` when the file does not exist —
     /// the first-boot case, where the CLI seed applies. A file that exists
     /// but does not parse is [`CursorError::Corrupt`], never a silent 0.
+    ///
+    /// # Errors
+    /// Returns an error when the file exists but cannot be read, or its
+    /// contents do not parse as a `u64`.
     pub fn load(&self) -> Result<Option<u64>, CursorError> {
         let raw = match std::fs::read_to_string(&self.path) {
             Ok(raw) => raw,
@@ -96,6 +101,10 @@ impl CursorFile {
     /// rename over the target. A crash at any point leaves either the old
     /// complete value or the new complete value — never a torn write, which
     /// `load` would otherwise reject as corruption.
+    ///
+    /// # Errors
+    /// Returns an error when the temp file cannot be written, synced, or
+    /// renamed into place.
     pub fn persist(&self, next_seq: u64) -> Result<(), CursorError> {
         let io = |source| CursorError::Io {
             path: self.path.clone(),

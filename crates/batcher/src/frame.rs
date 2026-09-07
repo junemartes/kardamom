@@ -1,18 +1,17 @@
 //! KAR1 framing: the on-blob payload format.
 //!
-//! This format has no `state_root` field (by design, at this stage). After framing,
-//! zstd can compress the whole payload (flag bit 0 set). The result is then
-//! sliced into 31-byte field-element chunks for blob packing.
+//! The format carries no `state_root` field. After framing, zstd can
+//! compress the whole payload (flag bit 0 set). The result is then sliced
+//! into 31-byte field-element chunks for blob packing.
 //!
 //! Version 2 adds the per-block **remote-epoch** section (interop:
-//! `docs/specs/interop-outbox-messaging-spec.md` §16 Q8 — RemoteEpoch records
-//! are posted into the destination's own DA batches, so every chain is
-//! self-reconstructible with no dependency on a peer being alive). The records
-//! that LEAD a block — the sealer closes the open block on a remote-epoch
-//! origin advance, so a record's messages always execute at the head of the
-//! next block — are carried before that block's transactions, messages by
-//! VALUE including calldata, exactly as they travel the canonical stream.
-//! No chain is in production; version 1 payloads are not accepted.
+//! `RemoteEpoch` records are posted into the destination's own DA batches,
+//! so every chain is self-reconstructible with no dependency on a peer
+//! being alive). The records that LEAD a block — the sealer closes the open
+//! block on a remote-epoch origin advance, so a record's messages always
+//! execute at the head of the next block — are carried before that block's
+//! transactions, messages by VALUE including calldata, exactly as they
+//! travel the canonical stream. Only version 2 is accepted.
 //!
 //! ```text
 //! Header:
@@ -62,6 +61,8 @@
 //! uses today), and [`crate::batcher::pack_blocks`] keeps the loud 6-blob
 //! ceiling as the batch-size guard.
 
+use std::num::NonZeroUsize;
+
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use kardamom_types::xchain::{Callback, RemoteEpochRecord, XChainMessage};
@@ -103,6 +104,9 @@ pub struct Kar1Payload {
 }
 
 /// Encode a [`Kar1Payload`] to its KAR1 byte form.
+///
+/// # Errors
+/// Returns an error when the block count overflows `u32`.
 pub fn encode(payload: &Kar1Payload) -> Result<Vec<u8>, BatcherError> {
     let block_count: u32 = payload
         .blocks
@@ -194,13 +198,18 @@ fn encode_remote_epoch(buf: &mut Vec<u8>, rec: &RemoteEpochRecord) -> Result<(),
     Ok(())
 }
 
+/// Min `XChainMessage` size: `source_hash`(32) + `seq`(8) +
+/// `origin_sender`(20) + `target`(20) + `value`(16) + `gas_limit`(8) +
+/// `input_len`(4) + callback flag(1).
+const MIN_XCHAIN_MSG_BYTES: NonZeroUsize = NonZeroUsize::new(109).unwrap();
+
 fn decode_remote_epoch(r: &mut Reader<'_>) -> Result<RemoteEpochRecord, BatcherError> {
     let origin_chain_id = r.read_u64_le()?;
     let anchor_number = r.read_u64_le()?;
     let anchor_hash = B256::from_slice(r.read_bytes(32)?);
     let first_seq = r.read_u64_le()?;
     let msg_count = r.read_u32_le()?;
-    let mut messages = Vec::with_capacity(msg_count as usize);
+    let mut messages = Vec::with_capacity(r.capacity_hint(msg_count, MIN_XCHAIN_MSG_BYTES));
     for _ in 0..msg_count {
         let source_hash = B256::from_slice(r.read_bytes(32)?);
         let seq = r.read_u64_le()?;
@@ -243,7 +252,21 @@ fn decode_remote_epoch(r: &mut Reader<'_>) -> Result<RemoteEpochRecord, BatcherE
     })
 }
 
+/// Min `BlockFrame` size: `block_number`(8) + `l2_timestamp`(8) +
+/// `remote_epoch_count`(4) + `tx_count`(4).
+const MIN_BLOCK_FRAME_BYTES: NonZeroUsize = NonZeroUsize::new(24).unwrap();
+/// Min `RemoteEpochRecord` size: `origin_chain_id`(8) + `anchor_number`(8)
+/// + `anchor_hash`(32) + `first_seq`(8) + `msg_count`(4).
+const MIN_REMOTE_EPOCH_RECORD_BYTES: NonZeroUsize = NonZeroUsize::new(60).unwrap();
+/// Min `TxFrame` size: `correlation_id`(8) + `sender`(20) + `tx_hash`(32)
+/// + `raw_tx_len`(4).
+const MIN_TX_FRAME_BYTES: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+
 /// Decode a KAR1 byte form back into a [`Kar1Payload`].
+///
+/// # Errors
+/// Returns an error when the magic, version, or a field is malformed, or
+/// when `bytes` ends before a declared field.
 pub fn decode(bytes: &[u8]) -> Result<Kar1Payload, BatcherError> {
     let mut r = Reader::new(bytes);
     let magic = r.read_bytes(4)?;
@@ -261,60 +284,89 @@ pub fn decode(bytes: &[u8]) -> Result<Kar1Payload, BatcherError> {
     let block_count = r.read_u32_le()?;
     let _reserved = r.read_u16_le()?;
 
-    let mut blocks = Vec::with_capacity(block_count as usize);
-    for _ in 0..block_count {
-        let block_number = r.read_u64_le()?;
-        let l2_timestamp = r.read_u64_le()?;
-        let remote_epoch_count = r.read_u32_le()?;
-        let mut remote_epochs = Vec::with_capacity(remote_epoch_count as usize);
-        for _ in 0..remote_epoch_count {
-            remote_epochs.push(decode_remote_epoch(&mut r)?);
-        }
-        let tx_count = r.read_u32_le()?;
-        let mut txs = Vec::with_capacity(tx_count as usize);
-        for _ in 0..tx_count {
-            let correlation_id = r.read_u64_le()?;
-            let sender_bytes = r.read_bytes(20)?;
-            let sender = Address::from_slice(sender_bytes);
-            let hash_bytes = r.read_bytes(32)?;
-            let tx_hash = B256::from_slice(hash_bytes);
-            let raw_tx_len = r.read_u32_le()?;
-            let raw_tx_bytes = r.read_bytes(raw_tx_len as usize)?;
-            txs.push(TxFrame {
-                correlation_id,
-                sender,
-                tx_hash,
-                raw_tx: Bytes::copy_from_slice(raw_tx_bytes),
-            });
-        }
-        blocks.push(BlockFrame {
-            block_number,
-            l2_timestamp,
-            remote_epochs,
-            txs,
-        });
-    }
+    let blocks = (0..block_count).try_fold(
+        Vec::with_capacity(r.capacity_hint(block_count, MIN_BLOCK_FRAME_BYTES)),
+        |mut acc, _| -> Result<_, BatcherError> {
+            acc.push(decode_block_frame(&mut r)?);
+            Ok(acc)
+        },
+    )?;
     Ok(Kar1Payload { blocks, compressed })
 }
 
+/// Decode one [`BlockFrame`]: its header, then its remote-epoch and tx
+/// sections. Its own function so [`decode`]'s block loop does not nest a
+/// loop inside a loop.
+fn decode_block_frame(r: &mut Reader<'_>) -> Result<BlockFrame, BatcherError> {
+    let block_number = r.read_u64_le()?;
+    let l2_timestamp = r.read_u64_le()?;
+    let remote_epoch_count = r.read_u32_le()?;
+    let remote_epochs = (0..remote_epoch_count).try_fold(
+        Vec::with_capacity(r.capacity_hint(remote_epoch_count, MIN_REMOTE_EPOCH_RECORD_BYTES)),
+        |mut acc, _| -> Result<_, BatcherError> {
+            acc.push(decode_remote_epoch(r)?);
+            Ok(acc)
+        },
+    )?;
+    let tx_count = r.read_u32_le()?;
+    let txs = (0..tx_count).try_fold(
+        Vec::with_capacity(r.capacity_hint(tx_count, MIN_TX_FRAME_BYTES)),
+        |mut acc, _| -> Result<_, BatcherError> {
+            acc.push(decode_tx_frame(r)?);
+            Ok(acc)
+        },
+    )?;
+    Ok(BlockFrame {
+        block_number,
+        l2_timestamp,
+        remote_epochs,
+        txs,
+    })
+}
+
+/// Decode one [`TxFrame`]. Its own function so [`decode_block_frame`]'s tx
+/// loop does not nest a loop inside a loop.
+fn decode_tx_frame(r: &mut Reader<'_>) -> Result<TxFrame, BatcherError> {
+    let correlation_id = r.read_u64_le()?;
+    let sender_bytes = r.read_bytes(20)?;
+    let sender = Address::from_slice(sender_bytes);
+    let hash_bytes = r.read_bytes(32)?;
+    let tx_hash = B256::from_slice(hash_bytes);
+    let raw_tx_len = r.read_u32_le()?;
+    let raw_tx_bytes = r.read_bytes(raw_tx_len as usize)?;
+    Ok(TxFrame {
+        correlation_id,
+        sender,
+        tx_hash,
+        raw_tx: Bytes::copy_from_slice(raw_tx_bytes),
+    })
+}
+
+/// Holds only the unread remainder of the buffer, so no position field
+/// tracks an index into a longer-lived slice — no arithmetic on positions
+/// is possible.
 struct Reader<'a> {
     buf: &'a [u8],
-    pos: usize,
 }
 
 impl<'a> Reader<'a> {
     fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self { buf }
+    }
+    /// A safe `Vec::with_capacity` hint for a wire count `n`, whose
+    /// decoded elements are at least `min_elem_bytes` each. A corrupt or
+    /// adversarial wire count (up to `u32::MAX`) must not turn straight
+    /// into an allocation request: capping it against the bytes actually
+    /// left to read bounds the hint by what could possibly still decode,
+    /// while `read_bytes` below still catches the real short-read case.
+    fn capacity_hint(&self, n: u32, min_elem_bytes: NonZeroUsize) -> usize {
+        (n as usize).min(self.buf.len() / min_elem_bytes.get())
     }
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], BatcherError> {
-        if self.pos + n > self.buf.len() {
-            return Err(BatcherError::Frame(format!(
-                "short read: want {n}, have {}",
-                self.buf.len() - self.pos
-            )));
-        }
-        let s = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
+        let (s, rest) = self.buf.split_at_checked(n).ok_or_else(|| {
+            BatcherError::Frame(format!("short read: want {n}, have {}", self.buf.len()))
+        })?;
+        self.buf = rest;
         Ok(s)
     }
     fn read_u8(&mut self) -> Result<u8, BatcherError> {

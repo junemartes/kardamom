@@ -17,6 +17,7 @@
 //! the reverse must also hold. At least one path must be set.
 
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -37,7 +38,7 @@ use kardamom_da_watcher::{
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDepositsPublisherHandle, TxRemoteEpochsPublisherHandle,
 };
-use kardamom_log::config::LogConfig;
+use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
 use kardamom_log::recorder::{RecorderKind, record_stream_until_stopped};
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_types::xchain::RemoteEpochRecord;
@@ -59,13 +60,15 @@ struct Args {
     /// L1 address of the `ETHLockbox` proxy this L2 chain id maps to.
     #[arg(long)]
     lockbox: Option<String>,
-    /// Polling cadence in seconds (default 12).
-    #[arg(long, default_value_t = 12)]
-    poll_interval_secs: u64,
+    /// Polling cadence in seconds (default 12). Must be nonzero: 0 reaches
+    /// `tokio::time::interval`, which panics on a zero period.
+    #[arg(long, default_value = "12")]
+    poll_interval_secs: NonZeroU64,
     /// Peer Kardamom chain to source cross-chain messages from. Enables the
     /// interop path. It requires `--interop-feed-url` and `--self-chain-id`.
+    /// Chain id 0 is not valid.
     #[arg(long)]
-    interop_peer_chain_id: Option<u64>,
+    interop_peer_chain_id: Option<NonZeroU64>,
     /// The peer validator's outbox-feed WebSocket endpoint, for example
     /// `ws://127.0.0.1:9944`.
     #[arg(long)]
@@ -73,8 +76,9 @@ struct Args {
     /// Our chain id. The feed filters on it. `derive_remote_epoch` rejects,
     /// and never drops, a message addressed elsewhere. A wrong value here
     /// fail-stops the pair instead of executing another chain's traffic.
+    /// Chain id 0 is not valid.
     #[arg(long)]
-    self_chain_id: Option<u64>,
+    self_chain_id: Option<NonZeroU64>,
     /// Durable per-pair cursor file, required with the interop triple. The
     /// watcher saves its resume position here, atomically, after each
     /// successful publish. On restart the file overrides
@@ -89,9 +93,10 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     interop_start_seq: u64,
     /// Pause before a retry after a feed transport or decode failure. Not a
-    /// poll interval: the feed is stream-driven.
-    #[arg(long, default_value_t = 2)]
-    interop_retry_interval_secs: u64,
+    /// poll interval: the feed is stream-driven. Must be nonzero, or the
+    /// retry path becomes a tight reconnect loop.
+    #[arg(long, default_value = "2")]
+    interop_retry_interval_secs: NonZeroU64,
     /// Optional `LogConfig` TOML that supplies the Aeron `[channels]`
     /// config. If unset, this uses built-in single-host IPC defaults,
     /// which keep local and e2e behavior unchanged. A multi-host
@@ -104,7 +109,7 @@ struct Args {
     /// recipe always passes this explicitly.
     #[arg(long)]
     aeron_dir: Option<PathBuf>,
-    /// Record the tx_deposits publication to the Aeron Archive, so the
+    /// Record the `tx_deposits` publication to the Aeron Archive, so the
     /// executor can replay deposit envelopes on crash recovery
     /// (`kardamom_log::replay`). This is off by default. The cluster
     /// enables it where the archive runs.
@@ -150,7 +155,7 @@ fn resolve_paths(args: &Args) -> anyhow::Result<(Option<L1Path>, Option<InteropP
                 rpc: rpc.clone(),
                 cfg: DaWatcherConfig {
                     lockbox,
-                    poll_interval: Duration::from_secs(args.poll_interval_secs),
+                    poll_interval: Duration::from_secs(args.poll_interval_secs.get()),
                 },
             })
         }
@@ -170,6 +175,8 @@ fn resolve_paths(args: &Args) -> anyhow::Result<(Option<L1Path>, Option<InteropP
                      cannot be its own remote origin"
                 );
             }
+            let peer_chain_id = peer_chain_id.get();
+            let self_chain_id = self_chain_id.get();
             // The cursor file is REQUIRED, not optional-with-a-default: a
             // watcher whose resume position lives only in a CLI flag replays
             // (or worse, skips) on every restart, and the skip direction is a
@@ -204,7 +211,7 @@ fn resolve_paths(args: &Args) -> anyhow::Result<(Option<L1Path>, Option<InteropP
                 cfg: InteropWatcherConfig {
                     self_chain_id,
                     start_seq,
-                    retry_interval: Duration::from_secs(args.interop_retry_interval_secs),
+                    retry_interval: Duration::from_secs(args.interop_retry_interval_secs.get()),
                 },
             })
         }
@@ -242,19 +249,28 @@ async fn main() -> anyhow::Result<()> {
     kardamom_da_watcher::metrics::describe();
 
     let resolved = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
-    let channels = resolved.channels;
-    let aeron_cfg = resolved.aeron;
+    serve(args, l1, interop, resolved.channels, resolved.aeron).await
+}
+
+/// Run both origin watchers to completion. The Aeron runtime is scoped to
+/// this function, so it drops as soon as the watchers and the recorder
+/// thread have stopped, with no explicit `drop` needed.
+async fn serve(
+    args: Args,
+    l1: Option<L1Path>,
+    interop: Option<InteropPath>,
+    channels: ChannelsConfig,
+    aeron_cfg: AeronConfig,
+) -> anyhow::Result<()> {
     let aeron_rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-    let tx_deposits_pub = l1
-        .is_some()
-        .then(|| TxDepositsPublisherHandle::open(&aeron_rt, &channels))
-        .transpose()
-        .context("open TxDepositsPublisherHandle")?;
-    let tx_remote_epochs_pub = interop
-        .is_some()
-        .then(|| TxRemoteEpochsPublisherHandle::open(&aeron_rt, &channels))
-        .transpose()
-        .context("open TxRemoteEpochsPublisherHandle")?;
+    let service = DaWatcherService {
+        aeron_rt,
+        channels,
+        aeron_cfg,
+        aeron_dir: args.aeron_dir.clone(),
+    };
+    let (tx_deposits_pub, tx_remote_epochs_pub) =
+        service.open_publishers(l1.is_some(), interop.is_some())?;
 
     // --archive-durability records tx_deposits specifically; with no L1 path
     // there is no such publication, and starting a recording on a stream this
@@ -263,24 +279,86 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--archive-durability records tx_deposits and requires the L1 path");
     }
 
-    // Archive recorder for tx_deposits, placed here with the publisher, so
-    // the executor can replay deposit envelopes on crash recovery. The
-    // thread stays a std thread. It holds an Aeron archive session, which
-    // is `!Send`. The seam to the async shell uses a `CancellationToken`
-    // for stop and a `oneshot` channel for readiness.
-    //
-    // The watcher loop must not publish a single deposit before the
-    // recording is confirmed active. Recovery replays from record 0 and
-    // needs every envelope, so a gap at the start of the stream would
-    // permanently break executor crash recovery. The recorder reports its
-    // startup outcome on `ready`. The code below waits on it (the
-    // tx_deposits publication is already open, so the recording starts
-    // quickly) and treats failure as fatal. The operator asked for
-    // --archive-durability, so running without it would be a silent lie.
     let stop = CancellationToken::new();
     let recorder_handle = if args.archive_durability {
-        let aeron_dir = args.aeron_dir.clone();
-        let channels = channels.clone();
+        Some(service.start_deposits_recorder(&stop).await?)
+    } else {
+        None
+    };
+
+    let watchers = spawn_watchers(l1, interop, tx_deposits_pub, tx_remote_epochs_pub).await?;
+    // A panicked watcher task or an all-fail-stopped exit both return `Err`
+    // here and skip the cleanup below, exactly as a bare early return would:
+    // the recorder thread is left running, detached, for the process exit
+    // to reap.
+    await_shutdown_or_fail_stop(watchers).await?;
+
+    stop.cancel();
+    if let Some(h) = recorder_handle {
+        // The recorder thread polls the stop flag; joining it blocks, so
+        // move the join off the runtime workers.
+        let _ = tokio::task::spawn_blocking(move || h.join()).await;
+    }
+    Ok(())
+}
+
+/// The setup state `serve` builds once and both `open_publishers` and
+/// `start_deposits_recorder` read from: the Aeron runtime and directory,
+/// and the resolved channels/Aeron config. `spawn_watchers` and
+/// `await_shutdown_or_fail_stop` need none of this — they operate purely
+/// on the watcher handles and paths passed to them — so they stay free
+/// functions rather than methods here.
+struct DaWatcherService {
+    aeron_rt: AeronRuntime,
+    channels: ChannelsConfig,
+    aeron_cfg: AeronConfig,
+    aeron_dir: Option<PathBuf>,
+}
+
+impl DaWatcherService {
+    /// Open the publications each configured path needs. `tx_deposits`
+    /// opens only when the L1 path is set, `tx_remote_epochs` only when
+    /// interop is; opening either unconditionally would advertise a
+    /// publication this process may never write to.
+    fn open_publishers(
+        &self,
+        want_l1: bool,
+        want_interop: bool,
+    ) -> anyhow::Result<(
+        Option<TxDepositsPublisherHandle>,
+        Option<TxRemoteEpochsPublisherHandle>,
+    )> {
+        let tx_deposits_pub = want_l1
+            .then(|| TxDepositsPublisherHandle::open(&self.aeron_rt, &self.channels))
+            .transpose()
+            .context("open TxDepositsPublisherHandle")?;
+        let tx_remote_epochs_pub = want_interop
+            .then(|| TxRemoteEpochsPublisherHandle::open(&self.aeron_rt, &self.channels))
+            .transpose()
+            .context("open TxRemoteEpochsPublisherHandle")?;
+        Ok((tx_deposits_pub, tx_remote_epochs_pub))
+    }
+
+    /// Start the `tx_deposits` archive recorder and wait for it to confirm
+    /// an active recording before returning.
+    ///
+    /// The thread stays a std thread: it holds an Aeron archive session,
+    /// which is `!Send`. The seam to the async shell uses `stop` for
+    /// shutdown and a `oneshot` channel for readiness.
+    ///
+    /// The watcher loop must not publish a single deposit before the
+    /// recording is confirmed active. Recovery replays from record 0 and
+    /// needs every envelope, so a gap at the start of the stream would
+    /// permanently break executor crash recovery. The operator asked for
+    /// `--archive-durability`, so returning before the recording is live
+    /// would run without it while claiming otherwise.
+    async fn start_deposits_recorder(
+        &self,
+        stop: &CancellationToken,
+    ) -> anyhow::Result<std::thread::JoinHandle<()>> {
+        let aeron_dir = self.aeron_dir.clone();
+        let aeron_cfg = self.aeron_cfg.clone();
+        let channels = self.channels.clone();
         let stop = stop.clone();
         let (ready_tx, ready_rx) = oneshot::channel::<Result<i64, String>>();
         let handle = std::thread::Builder::new()
@@ -329,11 +407,17 @@ async fn main() -> anyhow::Result<()> {
                  active within 60s"
             ),
         }
-        Some(handle)
-    } else {
-        None
-    };
+        Ok(handle)
+    }
+}
 
+/// Spawn one watcher per fully-configured path.
+async fn spawn_watchers(
+    l1: Option<L1Path>,
+    interop: Option<InteropPath>,
+    tx_deposits_pub: Option<TxDepositsPublisherHandle>,
+    tx_remote_epochs_pub: Option<TxRemoteEpochsPublisherHandle>,
+) -> anyhow::Result<Vec<(&'static str, WatcherHandle)>> {
     let mut watchers: Vec<(&'static str, WatcherHandle)> = Vec::new();
 
     if let (Some(l1), Some(tx_deposits_pub)) = (l1, tx_deposits_pub) {
@@ -382,23 +466,26 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    // Wait for SIGTERM (an orchestrator stop) or Ctrl-C, then ask each
-    // watcher to exit at the next tick boundary. Dropping the shutdown
-    // channel would also signal this, but an explicit send() gives a
-    // clearer log line.
-    //
-    // Also wait on the watcher tasks themselves. A watcher that finishes
-    // without being asked has fail-stopped: an interop derivation fault, or
-    // a closed publisher. While at least one other watcher still runs, the
-    // process stays up. The fault domain is the pair, and killing the L1
-    // deposit path because a peer feed served a gap would widen it. But
-    // once the last watcher has fail-stopped, nothing is left to watch.
-    // Staying up as a healthy-looking husk would hide the halt from the
-    // orchestrator, so the process exits nonzero. This lets the supervisor,
-    // or an e2e harness, see the fail-stop as a process outcome, not just a
-    // log line.
+    Ok(watchers)
+}
+
+/// Wait for SIGTERM (an orchestrator stop), Ctrl-C, or every watcher to
+/// fail-stop on its own, then ask each remaining watcher to exit.
+///
+/// A watcher that finishes without being asked has fail-stopped: an interop
+/// derivation fault, or a closed publisher. While at least one other watcher
+/// still runs, the process stays up — the fault domain is the pair, and
+/// killing the L1 deposit path because a peer feed served a gap would widen
+/// it. But once the last watcher has fail-stopped, nothing is left to
+/// watch. Staying up as a healthy-looking husk would hide the halt from the
+/// orchestrator, so the process exits nonzero. This lets the supervisor, or
+/// an e2e harness, see the fail-stop as a process outcome, not just a log
+/// line.
+async fn await_shutdown_or_fail_stop(
+    watchers: Vec<(&'static str, WatcherHandle)>,
+) -> anyhow::Result<()> {
     let all_fail_stopped = tokio::select! {
-        _ = wait_for_shutdown() => false,
+        () = wait_for_shutdown() => false,
         () = async {
             loop {
                 if watchers.iter().all(|(_, h)| h.task.is_finished()) {
@@ -424,14 +511,6 @@ async fn main() -> anyhow::Result<()> {
              exiting nonzero so the halt is a process outcome"
         );
     }
-
-    stop.cancel();
-    if let Some(h) = recorder_handle {
-        // The recorder thread polls the stop flag; joining it blocks, so
-        // move the join off the runtime workers.
-        let _ = tokio::task::spawn_blocking(move || h.join()).await;
-    }
-    drop(aeron_rt);
     Ok(())
 }
 
@@ -455,9 +534,8 @@ impl EpochPublisher for LiveTxDepositsPublisher {
             Ok(pos) => Ok(pos),
             Err(e) => {
                 let msg = e.to_string();
-                // Aeron's own token, via `offer_code_str` — matching on
-                // prose ("back-pressure") never fires, so every stall used to
-                // report as Transport.
+                // Match Aeron's own `BACK_PRESSURED` token from
+                // `offer_code_str`, not the prose "back-pressure".
                 if msg.contains("BACK_PRESSURED") {
                     Err(PublishError::Backpressure)
                 } else {
@@ -496,9 +574,8 @@ impl RemoteEpochPublisher for LiveRemoteEpochsPublisher {
             Ok(pos) => Ok(pos),
             Err(e) => {
                 let msg = e.to_string();
-                // Aeron's own token, via `offer_code_str` — matching on
-                // prose ("back-pressure") never fires, so every stall used to
-                // report as Transport.
+                // Match Aeron's own `BACK_PRESSURED` token from
+                // `offer_code_str`, not the prose "back-pressure".
                 if msg.contains("BACK_PRESSURED") {
                     Err(PublishError::Backpressure)
                 } else {

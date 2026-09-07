@@ -44,7 +44,18 @@ fn spool_outputs(spool: &Path, block: u64) -> Option<PublicOutputs> {
 
 /// Assemble `(roots, digests)` for a posted range from the spool.
 fn spool_sequences(spool: &Path, start: u64, end: u64) -> Result<(Vec<B256>, Vec<B256>), u64> {
-    let mut roots = Vec::with_capacity((end - start + 1) as usize);
+    // A capacity hint only; a bad estimate costs a realloc, not
+    // correctness — EXCEPT for a plain `end - start`, which underflows to
+    // a near-u64::MAX span when `end < start` (a malformed settlement
+    // entry) and turns a hint into a huge allocation request. `end < start`
+    // makes the loop below a no-op (`start..=end` is empty), so a missing
+    // checked step falls back to 0, matching what the loop actually does.
+    let cap = end
+        .checked_sub(start)
+        .and_then(|span| span.checked_add(1))
+        .and_then(|span| usize::try_from(span).ok())
+        .unwrap_or(0);
+    let mut roots = Vec::with_capacity(cap);
     let mut digests = Vec::with_capacity(roots.capacity());
     for n in start..=end {
         let out = spool_outputs(spool, n).ok_or(n)?;
@@ -56,18 +67,23 @@ fn spool_sequences(spool: &Path, start: u64, end: u64) -> Result<(Vec<B256>, Vec
 
 /// Claim the next unclaimed posted batch, using the spool's attestations.
 /// Read the bond from the oracle (`minBond`).
+///
+/// # Errors
+/// Returns an error when an L1 call fails, or when `claimBatch` reverts.
 pub async fn claim_next_batch<P: Provider>(
     provider: P,
     oracle_addr: Address,
     spool: &Path,
 ) -> Result<ClaimOutcome, BatcherError> {
     let oracle = IKardamomProofOracle::new(oracle_addr, &provider);
-    let next = oracle
+    let highest_claimed = oracle
         .highestClaimedBatch()
         .call()
         .await
-        .map_err(|e| BatcherError::L1(format!("highestClaimedBatch: {e}")))?
-        + 1;
+        .map_err(|e| BatcherError::L1(format!("highestClaimedBatch: {e}")))?;
+    let next = highest_claimed
+        .checked_add(1)
+        .ok_or_else(|| BatcherError::L1("highestClaimedBatch overflowed u64".into()))?;
     let settlement_addr = oracle
         .settlement()
         .call()
@@ -132,9 +148,77 @@ pub enum WatchOutcome {
     NothingPending,
 }
 
+/// The first block offset, within the claim's range, where a claimed root
+/// differs from the spool's local root. Takes no state (just two slices),
+/// so it stays a free function rather than a method on [`ClaimWatch`].
+fn first_divergent_offset(claimed_roots: &[B256], local_roots: &[B256]) -> Option<u64> {
+    claimed_roots
+        .iter()
+        .enumerate()
+        .find(|(i, claimed_root)| local_roots.get(*i) != Some(*claimed_root))
+        .map(|(i, _)| i as u64)
+}
+
+/// The read-only state `watch_and_challenge` needs to re-derive a claim's
+/// committed arrays and read the prover's per-block proof files: the L1
+/// provider, the proof oracle's address, and the local prover spool.
+struct ClaimWatch<'a, P> {
+    provider: &'a P,
+    oracle_addr: Address,
+    spool: &'a Path,
+}
+
+impl<P: Provider> ClaimWatch<'_, P> {
+    /// The claim's attested arrays, decoded from the `claimBatch` call's
+    /// own calldata. The `BatchClaimed` event stores only `seqHash`, so
+    /// the arrays it attested to must be re-read from the claim
+    /// transaction.
+    async fn claimed_arrays_from_log(
+        &self,
+        batch_index: u64,
+    ) -> Result<IKardamomProofOracle::claimBatchCall, BatcherError> {
+        let oracle = IKardamomProofOracle::new(self.oracle_addr, self.provider);
+        let filter = oracle
+            .BatchClaimed_filter()
+            .topic1(U256::from(batch_index))
+            .from_block(0);
+        let logs = filter
+            .query()
+            .await
+            .map_err(|e| BatcherError::L1(format!("BatchClaimed logs: {e}")))?;
+        let (_, log) = logs
+            .last()
+            .ok_or_else(|| BatcherError::L1("claim exists but no BatchClaimed event".into()))?;
+        let tx_hash = log
+            .transaction_hash
+            .ok_or_else(|| BatcherError::L1("claim event without tx hash".into()))?;
+        let tx = self
+            .provider
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .map_err(|e| BatcherError::L1(format!("claim tx fetch: {e}")))?
+            .ok_or_else(|| BatcherError::L1("claim tx not found".into()))?;
+        IKardamomProofOracle::claimBatchCall::abi_decode(tx.input())
+            .map_err(|e| BatcherError::L1(format!("claim calldata decode: {e}")))
+    }
+
+    /// Read the prover's single-block proof files for `block`, if the
+    /// prover has produced both of them yet.
+    fn read_block_proof(&self, block: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+        let dir = self.spool.join(format!("block-{block}"));
+        let pv = std::fs::read(dir.join("public-values.bin")).ok()?;
+        let proof = std::fs::read(dir.join("proof.bin")).ok()?;
+        Some((pv, proof))
+    }
+}
+
 /// Compare the next pending claim against the spool. At the first
 /// divergent offset, submit `challengeBlock` with the prover's files
 /// (`block-N/{public-values.bin, proof.bin}`, the single-block layout).
+///
+/// # Errors
+/// Returns an error when an L1 call, log query, or transaction fetch
+/// fails, or when `challengeBlock` reverts.
 pub async fn watch_and_challenge<P: Provider>(
     provider: P,
     oracle_addr: Address,
@@ -154,7 +238,9 @@ pub async fn watch_and_challenge<P: Provider>(
     if highest == last_finalized {
         return Ok(WatchOutcome::NothingPending);
     }
-    let batch_index = last_finalized + 1;
+    let batch_index = last_finalized
+        .checked_add(1)
+        .ok_or_else(|| BatcherError::L1("lastFinalizedBatch overflowed u64".into()))?;
     let settlement_addr = oracle
         .settlement()
         .call()
@@ -174,9 +260,8 @@ pub async fn watch_and_challenge<P: Provider>(
 
     // Rebuild the claimed sequences from the spool and compare seqHash. If
     // they match, the claim matches the spool's view. Treat it as honest.
-    let (roots, digests) = match spool_sequences(spool, entry.l2BlockStart, entry.l2BlockEnd) {
-        Ok(seqs) => seqs,
-        Err(_) => return Ok(WatchOutcome::NothingPending),
+    let Ok((roots, digests)) = spool_sequences(spool, entry.l2BlockStart, entry.l2BlockEnd) else {
+        return Ok(WatchOutcome::NothingPending);
     };
     let local_seq_hash = alloy_primitives::keccak256(alloy_sol_types::SolValue::abi_encode(&(
         roots.clone(),
@@ -186,62 +271,30 @@ pub async fn watch_and_challenge<P: Provider>(
         return Ok(WatchOutcome::ClaimHonest { batch_index });
     }
 
-    // The claim is divergent. The claim event carries the claimed sequences.
-    // Find the first offset where the local root differs, by re-deriving
-    // the claimed arrays from the event log.
-    let filter = oracle
-        .BatchClaimed_filter()
-        .topic1(U256::from(batch_index))
-        .from_block(0);
-    let logs = filter
-        .query()
-        .await
-        .map_err(|e| BatcherError::L1(format!("BatchClaimed logs: {e}")))?;
-    let (_, log) = logs
-        .last()
-        .ok_or_else(|| BatcherError::L1("claim exists but no BatchClaimed event".into()))?;
-    // The event stores seqHash, not the arrays. The claim transaction's
-    // calldata has them. In v0, the divergence offset comes from comparing
-    // the local spool roots against the claim's root sequence. It is the
-    // first block whose spool proof files exist and whose claimed root
-    // (from the tx calldata) differs. Fetch the calldata:
-    let tx_hash = log
-        .transaction_hash
-        .ok_or_else(|| BatcherError::L1("claim event without tx hash".into()))?;
-    let tx = provider
-        .get_transaction_by_hash(tx_hash)
-        .await
-        .map_err(|e| BatcherError::L1(format!("claim tx fetch: {e}")))?
-        .ok_or_else(|| BatcherError::L1("claim tx not found".into()))?;
-    let call = IKardamomProofOracle::claimBatchCall::abi_decode(tx.input())
-        .map_err(|e| BatcherError::L1(format!("claim calldata decode: {e}")))?;
-
-    let mut offset = None;
-    for (i, claimed_root) in call.blockRoots.iter().enumerate() {
-        if roots.get(i) != Some(claimed_root) {
-            offset = Some(i as u64);
-            break;
-        }
-    }
-    let Some(block_offset) = offset else {
+    // The claim is divergent. Re-derive the claimed arrays from the claim
+    // transaction's own calldata, then find the first offset where the
+    // local spool root differs from it.
+    let watch = ClaimWatch {
+        provider: &provider,
+        oracle_addr,
+        spool,
+    };
+    let call = watch.claimed_arrays_from_log(batch_index).await?;
+    let Some(block_offset) = first_divergent_offset(&call.blockRoots, &roots) else {
         // The roots agree but the digests differ. This cannot happen past
         // the fold check. Treat it as honest instead of raising a
         // challenge that cannot win.
         return Ok(WatchOutcome::ClaimHonest { batch_index });
     };
-    let divergent_block = entry.l2BlockStart + block_offset;
-    let dir = spool.join(format!("block-{divergent_block}"));
-    let (pv, proof) = match (
-        std::fs::read(dir.join("public-values.bin")),
-        std::fs::read(dir.join("proof.bin")),
-    ) {
-        (Ok(pv), Ok(proof)) => (pv, proof),
-        _ => {
-            return Ok(WatchOutcome::ProofNotReady {
-                batch_index,
-                divergent_block,
-            });
-        }
+    let divergent_block = entry
+        .l2BlockStart
+        .checked_add(block_offset)
+        .ok_or_else(|| BatcherError::L1("l2BlockStart + block_offset overflowed u64".into()))?;
+    let Some((pv, proof)) = watch.read_block_proof(divergent_block) else {
+        return Ok(WatchOutcome::ProofNotReady {
+            batch_index,
+            divergent_block,
+        });
     };
     let receipt = oracle
         .challengeBlock(

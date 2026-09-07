@@ -172,6 +172,11 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     /// Make sure the kardamom factory is deployed on the connected chain.
     /// Anyone with gas can call this. The on-chain owner is set at initialize
     /// time.
+    ///
+    /// # Errors
+    /// Returns an error when the ERC-7955 factory is absent, an L1 call
+    /// fails, or the bootstrap transaction does not leave the factory
+    /// deployed.
     pub async fn ensure_factory(&self, operator: Address) -> Result<FactoryStatus, DeployError> {
         // (a) ERC-7955 factory must be present.
         if !self.code_present(ERC7955_FACTORY).await? {
@@ -221,6 +226,10 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     /// CREATE2 of the impl. The other specs reference the impl address,
     /// computed offline, through `target_impl`. So an upgrade of the same
     /// new impl across N L2s deploys the impl once, not N times.
+    ///
+    /// # Errors
+    /// Returns an error when the factory is not deployed, or the
+    /// `applyDeployments` transaction fails.
     pub async fn apply(&self, ops: &[Op], operator: Address) -> Result<TxHash, DeployError> {
         let factory_proxy = self.factory_address();
 
@@ -254,6 +263,9 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 
     /// Read the factory's on-chain registry. If `l2_chain_id` is `Some`, return
     /// entries for only that L2. Otherwise, return entries for all registered L2s.
+    ///
+    /// # Errors
+    /// Returns an error when an L1 call fails.
     pub async fn addresses(
         &self,
         l2_chain_id: Option<u64>,
@@ -269,9 +281,9 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         let l2s: Vec<u64> = if let Some(id) = l2_chain_id {
             vec![id]
         } else {
-            let count: U256 = factory.l2ChainIdCount().call().await?;
-            let count: u64 = count.to();
-            let mut out = Vec::with_capacity(count as usize);
+            let count =
+                Self::factory_count_u64(factory.l2ChainIdCount().call().await?, "l2ChainIdCount")?;
+            let mut out = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
             for i in 0..count {
                 let v: U256 = factory.l2ChainIdAt(U256::from(i)).call().await?;
                 out.push(v.to());
@@ -281,23 +293,33 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 
         let mut entries = Vec::new();
         for l2 in l2s {
-            let count: U256 = factory.idCount(U256::from(l2)).call().await?;
-            let count: u64 = count.to();
-            for i in 0..count {
-                let id: B256 = factory.idAt(U256::from(l2), U256::from(i)).call().await?;
-                let e: IKardamomFactory::Entry = factory.entry(U256::from(l2), id).call().await?;
-                entries.push(RegistryEntry {
-                    l2_chain_id: l2,
-                    id,
-                    proxy: e.proxy,
-                    current_impl: e.currentImpl,
-                    version: e.version,
-                    deployed_at: e.deployedAt,
-                    upgraded_at: e.upgradedAt,
-                });
-            }
+            entries.extend(self.entries_for_l2(l2).await?);
         }
         Ok(entries)
+    }
+
+    /// Read all registry entries for one L2: enumerate `idAt(l2, i)` for
+    /// `i` in `0..idCount(l2)`, then fetch each entry. Its own method so
+    /// `addresses` iterates only its outer `l2s` loop.
+    async fn entries_for_l2(&self, l2: u64) -> Result<Vec<RegistryEntry>, DeployError> {
+        let factory = IKardamomFactory::new(self.factory_address(), &self.provider);
+        let count =
+            Self::factory_count_u64(factory.idCount(U256::from(l2)).call().await?, "idCount")?;
+        let mut out = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        for i in 0..count {
+            let id: B256 = factory.idAt(U256::from(l2), U256::from(i)).call().await?;
+            let e: IKardamomFactory::Entry = factory.entry(U256::from(l2), id).call().await?;
+            out.push(RegistryEntry {
+                l2_chain_id: l2,
+                id,
+                proxy: e.proxy,
+                current_impl: e.currentImpl,
+                version: e.version,
+                deployed_at: e.deployedAt,
+                upgraded_at: e.upgradedAt,
+            });
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -305,6 +327,9 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // -----------------------------------------------------------------------
 
     /// Check that each registry entry's `currentImpl` matches the proxy's ERC1967 impl slot.
+    ///
+    /// # Errors
+    /// Returns an error when [`Self::addresses`] or an L1 storage read fails.
     pub async fn verify(&self) -> Result<VerifyReport, DeployError> {
         let entries = self.addresses(None).await?;
         let mut mismatches = Vec::new();
@@ -369,6 +394,14 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 
         let receipt = self.send_and_confirm(tx).await?;
         Ok(receipt.transaction_hash())
+    }
+
+    /// `count.try_into::<u64>()`, with a typed error instead of `U256::to`'s
+    /// panic on overflow. `field` names the factory getter this count came
+    /// from, for the error message.
+    fn factory_count_u64(count: U256, field: &str) -> Result<u64, DeployError> {
+        u64::try_from(count)
+            .map_err(|_| DeployError::Provider(format!("{field} does not fit in u64: {count}")))
     }
 }
 
