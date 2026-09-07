@@ -189,6 +189,11 @@ impl Receipt {
     /// "this transaction did not happen". A skip consumes no nonce (the
     /// sequencer's receipt floors must ignore it), and it writes no state
     /// (its `write_set_hash` is the empty-set hash).
+    ///
+    /// One exception: a deposit ([`Receipt::is_deposit`]) that fails
+    /// validation keeps its mint pre-credit. The mint is committed before
+    /// the inner call and is durable no matter the outcome. Such a
+    /// receipt carries the mint in its write set, and nothing else.
     pub fn is_invalid_skip(&self) -> bool {
         !self.status && self.gas_used == 0
     }

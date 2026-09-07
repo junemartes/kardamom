@@ -61,6 +61,16 @@ pub const OUTBOX: Address = address!("0x42000000000000000000000000000000000000E0
 /// what makes delivery injection unforgeable by user txs.
 pub const INBOX: Address = address!("0x42000000000000000000000000000000000000E1");
 
+/// Largest `gasLimit` the origin `Outbox` accepts for one message. This
+/// mirrors `Outbox.MAX_MESSAGE_GAS` (`contracts/src/L2/Outbox.sol`).
+/// [`derive_remote_epoch`] rejects a larger value, so an honest origin can
+/// never produce a message that the destination cannot budget.
+pub const MAX_MESSAGE_GAS: u64 = 10_000_000;
+
+/// Largest `data` length the origin `Outbox` accepts for one message. This
+/// mirrors `Outbox.MAX_DATA_BYTES` (`contracts/src/L2/Outbox.sol`).
+pub const MAX_DATA_BYTES: usize = 65_536;
+
 /// The EVM sender of a derived cross-chain tx from `origin_chain_id`: the
 /// origin's Outbox predeploy, aliased into the destination's address space.
 /// `Inbox.deliver` authenticates against exactly this address (the OP
@@ -354,6 +364,95 @@ fn push_word_address(out: &mut Vec<u8>, a: Address) {
     out.extend_from_slice(&w);
 }
 
+// ── Storage layout and ABI pins of the Outbox / Inbox predeploys ─────────────
+//
+// The validator's outbox extraction, the e2e scenarios, and the contracts
+// share these values. This is the one Rust copy. The tests below pin each
+// value against `forge inspect` and `cast index` output. The Solidity
+// fields are append-only: a field inserted before `sentMessages` shifts the
+// slot index, and every validator halts with `ClaimMismatch` on the first
+// send.
+
+/// Storage slot index of `mapping(uint64 => uint64) nonces` in the Outbox
+/// predeploy — the FIRST declared field.
+pub const OUTBOX_NONCES_SLOT_INDEX: u64 = 0;
+
+/// Storage slot index of `mapping(bytes32 => bool) sentMessages` in the
+/// Outbox predeploy — the SECOND declared field.
+pub const SENT_MESSAGES_SLOT_INDEX: u64 = 1;
+
+/// Storage slot index of `mapping(uint64 => mapping(uint64 => uint8))
+/// delivered` in the Inbox predeploy — the FIRST declared field.
+pub const INBOX_DELIVERED_SLOT_INDEX: u64 = 0;
+
+/// Storage slot index of `mapping(uint64 => uint64) nextSeq` in the Inbox
+/// predeploy — the SECOND declared field.
+pub const INBOX_NEXT_SEQ_SLOT_INDEX: u64 = 1;
+
+/// Solidity signature of `Outbox.sendMessage`. The callback struct flattens
+/// to its tuple type, as in [`INBOX_DELIVER_SIGNATURE`].
+pub const OUTBOX_SEND_MESSAGE_SIGNATURE: &str =
+    "sendMessage(uint64,address,uint64,bytes,(address,uint64,bytes32))";
+
+/// Solidity signature of the `Outbox.MessageSent` event.
+pub const MESSAGE_SENT_SIGNATURE: &str = "MessageSent(uint64,uint64,address,address,uint256,\
+                                          uint64,bytes,bytes32,(address,uint64,bytes32))";
+
+/// 4-byte function selector of [`OUTBOX_SEND_MESSAGE_SIGNATURE`].
+pub fn outbox_send_message_selector() -> [u8; 4] {
+    let h = keccak256(OUTBOX_SEND_MESSAGE_SIGNATURE.as_bytes());
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// `topic0` of the `Outbox.MessageSent` event.
+pub fn message_sent_topic0() -> B256 {
+    keccak256(MESSAGE_SENT_SIGNATURE.as_bytes())
+}
+
+/// A `u64` as one left-padded 32-byte word: the `abi.encode` of a `uint64`,
+/// and the key form of a `uint64` mapping key.
+pub fn u64_word(v: u64) -> B256 {
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&v.to_be_bytes());
+    B256::from(w)
+}
+
+/// The Solidity mapping rule: the slot of `m[key]` for a mapping declared at
+/// `slot_index` is `keccak256(key ‖ uint256(slot_index))`.
+pub fn mapping_slot(key: B256, slot_index: u64) -> B256 {
+    let mut buf = [0u8; 64];
+    buf[0..32].copy_from_slice(key.as_slice());
+    buf[32..64].copy_from_slice(u64_word(slot_index).as_slice());
+    keccak256(buf)
+}
+
+/// The storage slot of `Outbox.nonces[dest_chain_id]`.
+pub fn outbox_nonces_slot(dest_chain_id: u64) -> B256 {
+    mapping_slot(u64_word(dest_chain_id), OUTBOX_NONCES_SLOT_INDEX)
+}
+
+/// The storage slot of `Outbox.sentMessages[msg_hash]`. The executor must
+/// claim this slot `true` for every honest send; the validator's outbox
+/// extraction checks the claim.
+pub fn sent_messages_slot(msg_hash: B256) -> B256 {
+    mapping_slot(msg_hash, SENT_MESSAGES_SLOT_INDEX)
+}
+
+/// The storage slot of `Inbox.nextSeq[origin_chain_id]`.
+pub fn inbox_next_seq_slot(origin_chain_id: u64) -> B256 {
+    mapping_slot(u64_word(origin_chain_id), INBOX_NEXT_SEQ_SLOT_INDEX)
+}
+
+/// The storage slot of `Inbox.delivered[origin_chain_id][seq]`. The outer
+/// mapping's value slot is the inner mapping's slot index.
+pub fn inbox_delivered_slot(origin_chain_id: u64, seq: u64) -> B256 {
+    let inner = mapping_slot(u64_word(origin_chain_id), INBOX_DELIVERED_SLOT_INDEX);
+    let mut buf = [0u8; 64];
+    buf[0..32].copy_from_slice(u64_word(seq).as_slice());
+    buf[32..64].copy_from_slice(inner.as_slice());
+    keccak256(buf)
+}
+
 /// One origin chain's contiguous batch of messages, as it travels on the
 /// canonical stream.
 ///
@@ -386,7 +485,13 @@ pub struct RemoteEpochRecord {
 impl RemoteEpochRecord {
     /// Sequence number of the last message in the batch.
     pub fn last_seq(&self) -> u64 {
-        self.first_seq + self.messages.len() as u64 - 1
+        // Saturating on purpose. A wire-decoded record reaches this method
+        // (through `canonical_id`) before any check runs, so a hostile
+        // `first_seq` must not panic a debug build. [`derive_remote_epoch`]
+        // and the validator reject a record whose seq range overflows.
+        self.first_seq
+            .saturating_add(self.messages.len() as u64)
+            .saturating_sub(1)
     }
 
     /// Canonical id for cluster dedup: racing relayers that observe the same
@@ -440,17 +545,53 @@ pub fn derive_remote_epoch(
             }
         });
     }
-    if let Some(gap) = ordered.windows(2).find(|w| w[1].seq != w[0].seq + 1) {
-        return Err(XChainError::SeqSkipped {
-            expected: gap[0].seq + 1,
-            found: gap[1].seq,
-        });
+    for w in ordered.windows(2) {
+        let Some(want) = w[0].seq.checked_add(1) else {
+            return Err(XChainError::SeqOverflow { seq: w[0].seq });
+        };
+        if w[1].seq != want {
+            return Err(XChainError::SeqSkipped {
+                expected: want,
+                found: w[1].seq,
+            });
+        }
+    }
+    // The record's seq range must fit in u64. The validator computes
+    // `last_seq + 1` as its next cursor, so the last seq must leave room
+    // for one more.
+    if first.checked_add(ordered.len() as u64).is_none() {
+        return Err(XChainError::SeqOverflow { seq: first });
     }
     for m in &ordered {
         if m.dest_chain_id != self_chain_id {
             return Err(XChainError::ForeignDestination {
                 expected: self_chain_id,
                 found: m.dest_chain_id,
+            });
+        }
+        // Producer-side mirror of the `Outbox.sendMessage` checks. An
+        // honest origin can never trip these. A feed that does is
+        // malicious or corrupt, and the record must not reach the
+        // canonical stream: the destination budgets delivery from these
+        // bounds.
+        if m.value != 0 {
+            return Err(XChainError::ValueNotAllowed {
+                seq: m.seq,
+                value: m.value,
+            });
+        }
+        if m.gas_limit > MAX_MESSAGE_GAS {
+            return Err(XChainError::GasLimitAboveCap {
+                seq: m.seq,
+                gas_limit: m.gas_limit,
+                cap: MAX_MESSAGE_GAS,
+            });
+        }
+        if m.data.len() > MAX_DATA_BYTES {
+            return Err(XChainError::DataAboveCap {
+                seq: m.seq,
+                len: m.data.len(),
+                cap: MAX_DATA_BYTES,
             });
         }
     }
@@ -491,16 +632,30 @@ pub enum XChainError {
     SeqRegressed { expected: u64, found: u64 },
     #[error("message for chain {found} in a batch derived by chain {expected}")]
     ForeignDestination { expected: u64, found: u64 },
+    /// A seq at or near `u64::MAX`. The dense-lane arithmetic (`seq + 1`)
+    /// would overflow.
+    #[error("outbox seq {seq} overflows the dense-lane arithmetic")]
+    SeqOverflow { seq: u64 },
+    /// v1 messaging carries no value. The `Outbox` rejects a nonzero value,
+    /// so this can only come from a malicious or corrupt feed.
+    #[error("outbox message seq {seq} carries value {value}; v1 delivery is value-free")]
+    ValueNotAllowed { seq: u64, value: u128 },
+    /// `gas_limit` above [`MAX_MESSAGE_GAS`], which the `Outbox` rejects.
+    #[error("outbox message seq {seq} gas limit {gas_limit} is above the cap {cap}")]
+    GasLimitAboveCap { seq: u64, gas_limit: u64, cap: u64 },
+    /// `data` longer than [`MAX_DATA_BYTES`], which the `Outbox` rejects.
+    #[error("outbox message seq {seq} data length {len} is above the cap {cap}")]
+    DataAboveCap { seq: u64, len: usize, cap: usize },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, b256};
+    use alloy_primitives::{Address, address, b256};
 
     fn msg(seq: u64, dest: u64) -> OutboxMessage {
         OutboxMessage {
-            origin_block_number: 100 + seq,
+            origin_block_number: seq.saturating_add(100),
             origin_block_hash: B256::repeat_byte(0x0B),
             dest_chain_id: dest,
             seq,
@@ -615,6 +770,90 @@ mod tests {
     }
 
     #[test]
+    fn seq_overflow_is_a_fault_not_a_panic() {
+        // Two messages at the top of the u64 range: the gap check would
+        // compute `u64::MAX + 1`.
+        let e = derive_remote_epoch(
+            SELF,
+            ORIGIN,
+            u64::MAX - 1,
+            &[msg(u64::MAX - 1, SELF), msg(u64::MAX, SELF)],
+        )
+        .unwrap_err();
+        assert!(matches!(e, XChainError::SeqOverflow { .. }), "got {e:?}");
+        // One message at u64::MAX: the next cursor would overflow.
+        let e = derive_remote_epoch(SELF, ORIGIN, u64::MAX, &[msg(u64::MAX, SELF)]).unwrap_err();
+        assert!(
+            matches!(e, XChainError::SeqOverflow { seq: u64::MAX }),
+            "got {e:?}"
+        );
+        // A hostile record does not panic `last_seq`.
+        let r = RemoteEpochRecord {
+            first_seq: u64::MAX,
+            messages: alloc::vec![XChainMessage::default(), XChainMessage::default()],
+            ..Default::default()
+        };
+        // The value is meaningless for an invalid record. Only the
+        // absence of a panic matters.
+        let _ = r.last_seq();
+        let r = RemoteEpochRecord::default();
+        assert_eq!(r.last_seq(), 0);
+    }
+
+    #[test]
+    fn outbox_bounds_are_mirrored_on_the_producer() {
+        // Value.
+        let mut m = msg(0, SELF);
+        m.value = 1;
+        let e = derive_remote_epoch(SELF, ORIGIN, 0, &[m]).unwrap_err();
+        assert!(
+            matches!(e, XChainError::ValueNotAllowed { seq: 0, value: 1 }),
+            "got {e:?}"
+        );
+        // Gas limit.
+        let mut m = msg(0, SELF);
+        m.gas_limit = MAX_MESSAGE_GAS + 1;
+        let e = derive_remote_epoch(SELF, ORIGIN, 0, &[m]).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                XChainError::GasLimitAboveCap {
+                    seq: 0,
+                    gas_limit: 10_000_001,
+                    cap: MAX_MESSAGE_GAS
+                }
+            ),
+            "got {e:?}"
+        );
+        // Data length.
+        let mut m = msg(0, SELF);
+        m.data = AlloyBytes::from(alloc::vec![0xFFu8; MAX_DATA_BYTES + 1]);
+        let e = derive_remote_epoch(SELF, ORIGIN, 0, &[m]).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                XChainError::DataAboveCap {
+                    seq: 0,
+                    len: 65_537,
+                    cap: MAX_DATA_BYTES
+                }
+            ),
+            "got {e:?}"
+        );
+    }
+
+    #[test]
+    fn honest_maxima_pass_the_producer_checks() {
+        let mut m = msg(0, SELF);
+        m.value = 0;
+        m.gas_limit = MAX_MESSAGE_GAS;
+        m.data = AlloyBytes::from(alloc::vec![0xFFu8; MAX_DATA_BYTES]);
+        let r = derive_remote_epoch(SELF, ORIGIN, 0, &[m]).unwrap();
+        assert_eq!(r.messages[0].gas_limit, MAX_MESSAGE_GAS);
+        assert_eq!(r.messages[0].input.len(), MAX_DATA_BYTES);
+    }
+
+    #[test]
     fn foreign_destination_is_rejected_not_dropped() {
         let e =
             derive_remote_epoch(SELF, ORIGIN, 0, &[msg(0, SELF), msg(1, SELF + 9)]).unwrap_err();
@@ -697,6 +936,104 @@ mod tests {
         assert_eq!(
             leaf,
             b256!("0df14340efd8c8b32f4c333c3dca8470b0bae319a3dfe32adb213df2b8834d3c")
+        );
+    }
+
+    // ── Value pins (audit 2026-09-03, L3). The Solidity side asserts the same
+    // values in `contracts/test/L2/Outbox.t.sol`. A change to any of these is
+    // a chain-splitting change.
+
+    #[test]
+    fn callback_commitment_known_vector_is_pinned() {
+        // The `test_hashCallback_matchesRust` inputs of Outbox.t.sol.
+        let cb = Callback {
+            target: Address::repeat_byte(0x01),
+            gas_limit: 100_000,
+            context: B256::repeat_byte(0x02),
+        };
+        assert_eq!(
+            cb.commitment(),
+            b256!("3cc4851e518423fb0983f20dc6198ffd6ef901107d7b7911ffc4e8f942442b05")
+        );
+    }
+
+    #[test]
+    fn alias_known_vectors_are_pinned() {
+        // The `test_aliasVectors_matchRust` values of Outbox.t.sol.
+        assert_eq!(
+            alias_remote_address(ORIGIN, Address::repeat_byte(0xaa)),
+            address!("aa1fbdc71f2e2531f6704edff74f45bff135db61")
+        );
+        assert_eq!(
+            xchain_tx_sender(ORIGIN),
+            address!("32122ab04da66c349463091cfda2773e379f678b")
+        );
+    }
+
+    #[test]
+    fn remote_source_hash_known_vector_is_pinned() {
+        // rlp([412346, 7]) = 0xc583064aba07; inner = cast keccak of that;
+        // rlp([2, inner]) = 0xe202a0‖inner; the value is cast keccak of that.
+        assert_eq!(
+            remote_source_hash(ORIGIN, 7),
+            b256!("4f9bc7dd342a5ae3eae82c238c74109eb4322fd0c8898b7e21487d7e0750e1e4")
+        );
+    }
+
+    // ── Layout pins (audit L4): `forge inspect Outbox storage-layout`,
+    // `forge inspect Inbox storage-layout`, `forge inspect Outbox
+    // methodIdentifiers`, `forge inspect Outbox events`, and `cast index`.
+
+    #[test]
+    fn slot_indices_match_forge_inspect_storage_layout() {
+        // Outbox: nonces at slot 0, sentMessages at slot 1.
+        assert_eq!(OUTBOX_NONCES_SLOT_INDEX, 0);
+        assert_eq!(SENT_MESSAGES_SLOT_INDEX, 1);
+        // Inbox: delivered at slot 0, nextSeq at slot 1.
+        assert_eq!(INBOX_DELIVERED_SLOT_INDEX, 0);
+        assert_eq!(INBOX_NEXT_SEQ_SLOT_INDEX, 1);
+    }
+
+    #[test]
+    fn mapping_slots_match_cast_index() {
+        // cast index uint64 412399 1
+        assert_eq!(
+            inbox_next_seq_slot(412_399),
+            b256!("5ac03b415b91ae90f3b79893af8b4cdd0ad13a6ca17919c466ef18c217a044fd")
+        );
+        // inner = cast index uint64 412399 0; cast index uint64 3 <inner>
+        assert_eq!(
+            inbox_delivered_slot(412_399, 3),
+            b256!("879e07c4bf04e0eabddfb4406f66267e8b610479d5da37e69d2025f905df870f")
+        );
+        // cast index uint64 412347 0
+        assert_eq!(
+            outbox_nonces_slot(412_347),
+            b256!("8b93788024e4921562298d6c9986e253bebd7e9e30a69000736530e7c7ccb02c")
+        );
+        // cast index bytes32 0x11..11 1
+        assert_eq!(
+            sent_messages_slot(B256::repeat_byte(0x11)),
+            b256!("7deb3b60ec0f1bf56dbdd0ffedbadafddeaa08947884ff0f215ce93ee1826102")
+        );
+        // The cross-language msg_leaf vector as the key:
+        // cast index bytes32 0x0df14340..4d3c 1
+        assert_eq!(
+            sent_messages_slot(b256!(
+                "0df14340efd8c8b32f4c333c3dca8470b0bae319a3dfe32adb213df2b8834d3c"
+            )),
+            b256!("d4b78be0c1de834d6a6db01a7ae3f433776afbc98b26f4e51412b94effd6d438")
+        );
+    }
+
+    #[test]
+    fn send_message_selector_and_topic_match_forge_inspect() {
+        // forge inspect Outbox methodIdentifiers
+        assert_eq!(outbox_send_message_selector(), [0xbd, 0x1b, 0x0f, 0xd9]);
+        // forge inspect Outbox events
+        assert_eq!(
+            message_sent_topic0(),
+            b256!("a00ff5f6f9bf2c30c7cd578b6a82c98b08f2d33a5677222b9d8b925c62a48082")
         );
     }
 }

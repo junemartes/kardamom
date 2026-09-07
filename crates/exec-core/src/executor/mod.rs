@@ -35,7 +35,7 @@ pub use db::{SnapshotDb, SnapshotRef, StateRefError};
 pub use deposit::execute_deposit_tx;
 pub use scope::{Executor, TouchSet, skip_reason_of_tx};
 pub use tx_env::DecodedTx;
-pub use xchain::{XCHAIN_DELIVERY_OVERHEAD, execute_xchain_tx};
+pub use xchain::{XCHAIN_DELIVERY_OVERHEAD, execute_xchain_tx, xchain_gas_budget};
 
 #[cfg(test)]
 pub(crate) mod test_support {

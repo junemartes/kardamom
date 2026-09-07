@@ -27,7 +27,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kardamom_engine::{ExecutorError, RemoteEpochObserver};
-use kardamom_types::xchain::{RemoteEpochRecord, remote_source_hash};
+use kardamom_types::xchain::{
+    MAX_DATA_BYTES, MAX_MESSAGE_GAS, RemoteEpochRecord, remote_source_hash,
+};
 
 use crate::Divergence;
 use crate::metrics;
@@ -65,6 +67,23 @@ pub enum RemoteEpochFault {
     /// the canonical id is position-derived, so a mismatch means the record
     /// was not produced by the shared derivation rule.
     SourceHashMismatch { origin: u64, seq: u64 },
+    /// The record's seq range does not fit in u64. The lane cursor
+    /// (`last_seq + 1`) would overflow.
+    SeqOverflow { origin: u64, first_seq: u64 },
+    /// A message carries a nonzero value. v1 delivery is value-free, and
+    /// the origin `Outbox` rejects such a send, so the record did not come
+    /// from the shared derivation rule.
+    ValueNotAllowed { origin: u64, seq: u64, value: u128 },
+    /// A message's `gas_limit` is above `MAX_MESSAGE_GAS`, which the origin
+    /// `Outbox` rejects.
+    GasLimitAboveCap {
+        origin: u64,
+        seq: u64,
+        gas_limit: u64,
+    },
+    /// A message's `input` is longer than `MAX_DATA_BYTES`, which the origin
+    /// `Outbox` rejects.
+    DataAboveCap { origin: u64, seq: u64, len: usize },
 }
 
 impl std::fmt::Display for RemoteEpochFault {
@@ -108,6 +127,30 @@ impl std::fmt::Display for RemoteEpochFault {
                 "message (origin {origin}, seq {seq}) carries a source_hash that is not \
                  remote_source_hash(origin, seq)"
             ),
+            Self::SeqOverflow { origin, first_seq } => write!(
+                f,
+                "remote-epoch record for origin {origin} starts at seq {first_seq}; its seq \
+                 range overflows u64"
+            ),
+            Self::ValueNotAllowed { origin, seq, value } => write!(
+                f,
+                "message (origin {origin}, seq {seq}) carries value {value}; v1 delivery is \
+                 value-free"
+            ),
+            Self::GasLimitAboveCap {
+                origin,
+                seq,
+                gas_limit,
+            } => write!(
+                f,
+                "message (origin {origin}, seq {seq}) gas limit {gas_limit} is above the cap \
+                 {MAX_MESSAGE_GAS}"
+            ),
+            Self::DataAboveCap { origin, seq, len } => write!(
+                f,
+                "message (origin {origin}, seq {seq}) data length {len} is above the cap \
+                 {MAX_DATA_BYTES}"
+            ),
         }
     }
 }
@@ -141,8 +184,28 @@ pub fn check_remote_epoch(
             });
         }
     }
+    // The seq range must fit in u64 with room for the next cursor
+    // (`last_seq + 1`). This check runs before any per-message arithmetic
+    // and before `observe` calls `last_seq()`.
+    if rec
+        .first_seq
+        .checked_add(rec.messages.len() as u64)
+        .is_none()
+    {
+        return Err(RemoteEpochFault::SeqOverflow {
+            origin,
+            first_seq: rec.first_seq,
+        });
+    }
     for (i, msg) in rec.messages.iter().enumerate() {
-        let want_seq = rec.first_seq + i as u64;
+        // Cannot overflow: the range check above covers `first_seq + len`.
+        let want_seq =
+            rec.first_seq
+                .checked_add(i as u64)
+                .ok_or(RemoteEpochFault::SeqOverflow {
+                    origin,
+                    first_seq: rec.first_seq,
+                })?;
         if msg.seq != want_seq {
             return Err(RemoteEpochFault::NonDense {
                 origin,
@@ -155,6 +218,30 @@ pub fn check_remote_epoch(
             return Err(RemoteEpochFault::SourceHashMismatch {
                 origin,
                 seq: msg.seq,
+            });
+        }
+        // The same bounds `derive_remote_epoch` applies on the producer.
+        // The origin `Outbox` rejects each of these at send time, so a
+        // record that carries one did not come from an honest origin.
+        if msg.value != 0 {
+            return Err(RemoteEpochFault::ValueNotAllowed {
+                origin,
+                seq: msg.seq,
+                value: msg.value,
+            });
+        }
+        if msg.gas_limit > MAX_MESSAGE_GAS {
+            return Err(RemoteEpochFault::GasLimitAboveCap {
+                origin,
+                seq: msg.seq,
+                gas_limit: msg.gas_limit,
+            });
+        }
+        if msg.input.len() > MAX_DATA_BYTES {
+            return Err(RemoteEpochFault::DataAboveCap {
+                origin,
+                seq: msg.seq,
+                len: msg.input.len(),
             });
         }
     }
@@ -200,8 +287,14 @@ impl RemoteEpochObserver for RemoteEpochVerifier {
                 .record(format!("remote-epoch verification failed: {fault}"));
             return Err(ExecutorError::State(fault.to_string()));
         }
-        self.next_seq
-            .insert(rec.origin_chain_id, rec.last_seq() + 1);
+        // `check_remote_epoch` proved `first_seq + len` fits, so this
+        // `checked_add` cannot fail. It stays checked so a future change to
+        // the checks cannot reintroduce a silent wrap.
+        let next = rec
+            .last_seq()
+            .checked_add(1)
+            .ok_or_else(|| ExecutorError::State("remote-epoch lane cursor overflow".to_string()))?;
+        self.next_seq.insert(rec.origin_chain_id, next);
         metrics::counter_remote_epoch_verified();
         Ok(())
     }
@@ -300,6 +393,69 @@ mod tests {
             check_remote_epoch(None, &r),
             Err(RemoteEpochFault::SourceHashMismatch { origin: 7, seq: 0 })
         ));
+    }
+
+    #[test]
+    fn outbox_bounds_are_mirrored_on_the_validator() {
+        // Value.
+        let mut r = record(7, 0, 1);
+        r.messages[0].value = 1;
+        assert_eq!(
+            check_remote_epoch(None, &r),
+            Err(RemoteEpochFault::ValueNotAllowed {
+                origin: 7,
+                seq: 0,
+                value: 1
+            })
+        );
+        // Gas limit.
+        let mut r = record(7, 0, 1);
+        r.messages[0].gas_limit = MAX_MESSAGE_GAS + 1;
+        assert_eq!(
+            check_remote_epoch(None, &r),
+            Err(RemoteEpochFault::GasLimitAboveCap {
+                origin: 7,
+                seq: 0,
+                gas_limit: MAX_MESSAGE_GAS + 1
+            })
+        );
+        // Data length.
+        let mut r = record(7, 0, 1);
+        r.messages[0].input = bytes::Bytes::from(vec![0xFFu8; MAX_DATA_BYTES + 1]);
+        assert_eq!(
+            check_remote_epoch(None, &r),
+            Err(RemoteEpochFault::DataAboveCap {
+                origin: 7,
+                seq: 0,
+                len: MAX_DATA_BYTES + 1
+            })
+        );
+        // The honest maxima pass.
+        let mut r = record(7, 0, 1);
+        r.messages[0].gas_limit = MAX_MESSAGE_GAS;
+        r.messages[0].input = bytes::Bytes::from(vec![0xFFu8; MAX_DATA_BYTES]);
+        assert_eq!(check_remote_epoch(None, &r), Ok(()));
+    }
+
+    #[test]
+    fn seq_overflow_is_a_fault_not_a_panic() {
+        // One message at u64::MAX: the next cursor would overflow.
+        let mut r = record(7, 0, 1);
+        r.first_seq = u64::MAX;
+        r.messages[0].seq = u64::MAX;
+        r.messages[0].source_hash = remote_source_hash(7, u64::MAX);
+        assert_eq!(
+            check_remote_epoch(None, &r),
+            Err(RemoteEpochFault::SeqOverflow {
+                origin: 7,
+                first_seq: u64::MAX
+            })
+        );
+        // Through the verifier: a fault, no panic, and the latch holds.
+        let div = Divergence::new();
+        let mut v = RemoteEpochVerifier::new(div.clone());
+        assert!(v.observe(&r).is_err());
+        assert!(div.reason().unwrap().contains("overflows"));
     }
 
     #[test]

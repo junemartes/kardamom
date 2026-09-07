@@ -51,19 +51,10 @@ sol! {
     );
 }
 
-/// Storage slot index of `mapping(bytes32 => bool) sentMessages` in the
-/// Outbox predeploy — the SECOND declared field (`nonces` is slot 0).
-pub const SENT_MESSAGES_SLOT_INDEX: u64 = 1;
-
-/// The storage slot holding `sentMessages[msg_hash]`:
-/// `keccak256(msgHash ‖ uint256(SENT_MESSAGES_SLOT_INDEX))` — the Solidity
-/// mapping rule. Pinned against forge-computed vectors (`cast index`) below.
-pub fn sent_messages_slot(msg_hash: B256) -> B256 {
-    let mut buf = [0u8; 64];
-    buf[0..32].copy_from_slice(msg_hash.as_slice());
-    buf[32..64].copy_from_slice(&U256::from(SENT_MESSAGES_SLOT_INDEX).to_be_bytes::<32>());
-    keccak256(buf)
-}
+// The slot of `sentMessages[msg_hash]` has one definition, in
+// `kardamom_types::xchain`. The e2e scenarios read the same slot with the
+// same function. The forge-vector test below pins it at this call site too.
+pub use kardamom_types::xchain::{SENT_MESSAGES_SLOT_INDEX, sent_messages_slot};
 
 /// Deterministic anchor for one origin block, served as the feed's
 /// `originBlockHash`.

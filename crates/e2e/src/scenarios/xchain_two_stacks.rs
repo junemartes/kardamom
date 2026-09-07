@@ -27,18 +27,19 @@
 //!
 //! ## Origin-block closing
 //!
-//! A batch is one origin block, and an origin block is only known complete
-//! when a LATER message appears on the same lane (the watcher's grouping
-//! rule). Each leg therefore sends a CLOSER — a second `sendMessage` on the
-//! same lane, forced into a later origin block — whose own delivery is never
-//! awaited (its block stays open, exactly like S12's seq-3 sentinel).
+//! A batch is one origin block. The origin validator sends a `head` event
+//! after the last message once a later block closes, and the sealer stamps
+//! blocks on a timer, so a lane with one message delivers by itself. No
+//! synthetic closer message is needed on either leg.
 
 use std::path::Path;
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
-use kardamom_types::xchain::{Callback, INBOX, OUTBOX, remote_source_hash, xchain_tx_sender};
+use kardamom_types::xchain::{
+    Callback, INBOX, OUTBOX, outbox_send_message_selector, remote_source_hash, xchain_tx_sender,
+};
 
 use super::xchain::{
     RECEIVER_INIT_CODE, inbox_delivered_slot, inbox_next_seq_slot, log_address, log_topic,
@@ -63,11 +64,10 @@ pub fn send_message_calldata(
     data: &[u8],
     cb: Option<Callback>,
 ) -> Vec<u8> {
-    let selector =
-        &keccak256("sendMessage(uint64,address,uint64,bytes,(address,uint64,bytes32))")[..4];
+    let selector = outbox_send_message_selector();
     let cb = cb.unwrap_or_default();
     let mut out = Vec::with_capacity(4 + 8 * 32 + data.len().div_ceil(32) * 32);
-    out.extend_from_slice(selector);
+    out.extend_from_slice(&selector);
     out.extend_from_slice(u64_word(dest_chain_id).as_slice());
     out.extend_from_slice(super::xchain::address_word(target).as_slice());
     out.extend_from_slice(u64_word(gas_limit).as_slice());
@@ -149,32 +149,6 @@ async fn send_message(
     Ok((block, seq))
 }
 
-/// Send a CLOSER on the same lane, retrying until it lands in a block
-/// STRICTLY AFTER `after_block` — what lets the watcher's grouping rule
-/// close the previous origin block. Its own delivery is never awaited.
-async fn send_closer(
-    t: &Target,
-    s: &mut ChainSender,
-    dest_chain_id: u64,
-    after_block: u64,
-    what: &str,
-) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let payee = s.payee;
-        let (block, _seq) =
-            send_message(t, s, dest_chain_id, payee, &[0xC1, 0x05, 0xE2], None, what).await?;
-        if block > after_block {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "{what}: closer never landed after block {after_block}"
-        );
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-}
-
 /// What the A→B leg proved; the callback leg builds on it.
 pub struct ForwardOutcome {
     /// The receiver contract deployed on B.
@@ -183,12 +157,10 @@ pub struct ForwardOutcome {
     pub payload_word: B256,
     /// The callback requested from B back to A.
     pub callback: Callback,
-    /// A-side sender (its nonce continues into the callback leg's closers).
+    /// A-side sender (its nonce continues into the callback leg's nudges).
     pub sender_a: ChainSender,
     /// B-side sender.
     pub sender_b: ChainSender,
-    /// L2 block on B that delivered seq 0 (the callback's origin block).
-    pub delivery_block_on_b: u64,
 }
 
 /// Leg 1 — A → B: a user tx on A sends through A's REAL Outbox; A's
@@ -230,7 +202,7 @@ pub async fn forward_leg(
         gas_limit: 90_000,
         context: B256::repeat_byte(0x42),
     };
-    let (send_block, seq) = send_message(
+    let (_send_block, seq) = send_message(
         a,
         &mut sender_a,
         b.chain_id,
@@ -244,9 +216,8 @@ pub async fn forward_leg(
         seq == 0,
         "first message on the A->B lane must be seq 0, got {seq}"
     );
-
-    // Close its origin block so the batch derives.
-    send_closer(a, &mut sender_a, b.chain_id, send_block, "A->B closer").await?;
+    // No closer: A's validator sends a `head` event once the next block
+    // closes, and B's watcher derives the batch from it.
 
     // The delivery on B: a 0x7D receipt keyed by the position-derived id.
     let source_hash = remote_source_hash(a_chain_id, 0);
@@ -287,12 +258,8 @@ pub async fn forward_leg(
         }),
         "the callback response must be enqueued through B's Outbox toward A: {r}"
     );
-    let (delivery_block_on_b, _) = receipt_placement(&r)?;
-
     // Contract + Inbox state on B, from B's executor DB. Commits are
     // pipelined, so nudge B with transfers until the delivery is durable.
-    // `>= 1`, not `== 1`: a retried closer can legitimately close its
-    // predecessor's block and deliver an extra lane seq.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let next_seq = read_slot(b_exec_dir, INBOX, inbox_next_seq_slot(a_chain_id))?;
@@ -327,8 +294,7 @@ pub async fn forward_leg(
         "B's Outbox.nonces[A] = {lane_nonce}, expected >= 1 (the callback response)"
     );
 
-    // B's durable lane cursor advanced past the delivered seq (>= 1: a
-    // retried closer can push it further).
+    // B's durable lane cursor advanced past the delivered seq.
     let cursor = std::fs::read_to_string(b_cursor_file)
         .with_context(|| format!("read B cursor {}", b_cursor_file.display()))?;
     let cursor_seq: u64 = cursor
@@ -346,7 +312,6 @@ pub async fn forward_leg(
         callback,
         sender_a,
         sender_b,
-        delivery_block_on_b,
     })
 }
 
@@ -357,21 +322,12 @@ pub async fn forward_leg(
 pub async fn callback_leg(
     a: &Target,
     b: &Target,
-    a_chain_id: u64,
     a_exec_dir: &Path,
     a_cursor_file: &Path,
     mut outcome: ForwardOutcome,
 ) -> Result<()> {
-    // Close the response's origin block on B: a user send on the SAME B→A
-    // lane, in a later B block than the delivery that enqueued the response.
-    send_closer(
-        b,
-        &mut outcome.sender_b,
-        a_chain_id,
-        outcome.delivery_block_on_b,
-        "B->A closer",
-    )
-    .await?;
+    // No closer on B either: B's validator sends a `head` event once the
+    // block after the delivery closes, and A's watcher derives the response.
 
     // The response delivery on A: seq 0 of B's lane to A.
     let source_hash = remote_source_hash(b.chain_id, 0);
@@ -437,4 +393,65 @@ pub async fn callback_leg(
         "A's B-lane cursor must be >= 1, got {cursor_seq}"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+    use alloy_sol_types::{SolCall, sol};
+
+    sol! {
+        struct SolCb {
+            address target;
+            uint64 gasLimit;
+            bytes32 context;
+        }
+
+        function sendMessage(
+            uint64 destChainId,
+            address target,
+            uint64 gasLimit,
+            bytes data,
+            SolCb cb
+        );
+    }
+
+    /// The hand-rolled `sendMessage` calldata must match `alloy-sol-types`
+    /// byte for byte (audit 2026-09-03, L4). Empty, sub-word, and word+1
+    /// payloads exercise the zero-length tail, the right padding, and a
+    /// two-word tail.
+    #[test]
+    fn send_message_calldata_is_byte_identical_to_sol_types() {
+        assert_eq!(sendMessageCall::SELECTOR, outbox_send_message_selector());
+        let cb = Callback {
+            target: Address::repeat_byte(0x0C),
+            gas_limit: 90_000,
+            context: B256::repeat_byte(0x1D),
+        };
+        let target = Address::repeat_byte(0xB9);
+        for data in [&b""[..], &[0x01][..], &[0xEE; 33][..]] {
+            for callback in [None, Some(cb)] {
+                let c = callback.unwrap_or_default();
+                let expect = sendMessageCall {
+                    destChainId: CHAIN_B_ID,
+                    target,
+                    gasLimit: 250_000,
+                    data: alloy_primitives::Bytes::copy_from_slice(data),
+                    cb: SolCb {
+                        target: c.target,
+                        gasLimit: c.gas_limit,
+                        context: c.context,
+                    },
+                }
+                .abi_encode();
+                assert_eq!(
+                    send_message_calldata(CHAIN_B_ID, target, 250_000, data, callback),
+                    expect,
+                    "data len {}, callback {}",
+                    data.len(),
+                    callback.is_some()
+                );
+            }
+        }
+    }
 }

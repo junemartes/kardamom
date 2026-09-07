@@ -194,7 +194,7 @@ mod tests {
         sink.publish(boundary(5)).unwrap();
 
         assert!(!div.is_halted());
-        let (msgs, _) = store.from_seq(412_347, 0);
+        let msgs = store.from_seq(412_347, 0).msgs;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].seq, 0);
     }
@@ -222,7 +222,7 @@ mod tests {
         assert!(matches!(err, ExecutorError::Divergence(_)));
         assert!(div.is_halted());
         assert!(div.reason().unwrap().contains("outbox extraction failed"));
-        let (msgs, _) = store.from_seq(412_347, 0);
+        let msgs = store.from_seq(412_347, 0).msgs;
         assert!(msgs.is_empty(), "a diverging block must never be served");
     }
 
@@ -243,7 +243,7 @@ mod tests {
             !div.is_halted(),
             "bal_missing posture: unchecked, not halted"
         );
-        let (msgs, _) = store.from_seq(412_347, 0);
+        let msgs = store.from_seq(412_347, 0).msgs;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].seq, 3);
     }
@@ -264,8 +264,8 @@ mod tests {
             sink.publish(boundary(b)).unwrap();
         }
         // Retention 2, head 8: the block-1 message aged out.
-        let (msgs, floor) = store.from_seq(412_347, 0);
-        assert!(msgs.is_empty());
-        assert_eq!(floor, 1);
+        let scan = store.from_seq(412_347, 0);
+        assert!(scan.msgs.is_empty());
+        assert_eq!(scan.floor_seq, Some(1));
     }
 }

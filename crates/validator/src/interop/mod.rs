@@ -20,7 +20,7 @@ pub mod store;
 pub mod verify;
 
 pub use extract::{OutboxExtractError, collect_outbox_messages, sent_messages_slot};
-pub use serve::{FeedServerState, start_feed_server};
+pub use serve::{FeedServerLimits, FeedServerState, start_feed_server};
 pub use sink::ExtractingReceiptSink;
-pub use store::{AttestationStore, FeedStore};
+pub use store::{AttestationStore, FeedStore, LaneScan};
 pub use verify::{RemoteEpochFault, RemoteEpochVerifier, check_remote_epoch};

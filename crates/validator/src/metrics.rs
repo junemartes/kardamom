@@ -28,6 +28,9 @@ pub const OUTBOX_EXTRACTED_TOTAL: &str = "validator_outbox_extracted_total";
 /// Blocks whose extracted outbox messages could not be cross-checked against
 /// BAL claims (claims never arrived). NOT a fault — the bal_missing posture.
 pub const OUTBOX_UNCHECKED_TOTAL: &str = "validator_outbox_unchecked_total";
+/// Feed subscriptions rejected because a cap was hit (per destination or
+/// total; see `interop::serve::FeedServerLimits`).
+pub const FEED_SUBSCRIPTION_REJECTED_TOTAL: &str = "validator_feed_subscription_rejected_total";
 
 /// Register metric descriptions. Call once at startup, after `kardamom_obs::init`.
 pub fn describe() {
@@ -46,6 +49,10 @@ pub fn describe() {
     metrics::describe_counter!(
         RECEIPT_MISSING_TOTAL,
         "Receipts for which no published receipt arrived within the wait window"
+    );
+    metrics::describe_counter!(
+        FEED_SUBSCRIPTION_REJECTED_TOTAL,
+        "Feed subscriptions rejected because a subscription cap was hit"
     );
     metrics::describe_gauge!(COMMITTED_BLOCK, "Highest block the validator has committed");
     metrics::describe_gauge!(
@@ -105,6 +112,10 @@ pub fn counter_outbox_extracted(n: usize) {
 
 pub fn counter_outbox_unchecked() {
     metrics::counter!(OUTBOX_UNCHECKED_TOTAL).increment(1);
+}
+
+pub fn counter_feed_subscription_rejected() {
+    metrics::counter!(FEED_SUBSCRIPTION_REJECTED_TOTAL).increment(1);
 }
 
 /// Blocks re-executed as seeded parallel batches. The label is the batch count.

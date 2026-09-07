@@ -168,9 +168,8 @@ case_cluster_member_rejoin() {
   # CLUSTER_REJOIN_SLO_S covers the log this suite builds. A member that
   # never converges now fails here, where the cause is clear, instead of
   # as a mystery stall in a later case. A member that never converges
-  # can get stuck in a join wedge: it fails to bind its catch-up
-  # endpoint, never receives the rest of the log, and stays inactive
-  # after a fast partial replay.
+  # is stuck in a join wedge: it stays inactive after a fast partial
+  # replay and never receives the rest of the log (issue #195).
   t=0
   while :; do
     f1="$(count_log_lines "${CLUSTER_TASK}" "sealer state FRESH at genesis memberId=${follower}" --stdout-only)"
@@ -200,7 +199,7 @@ case_cluster_member_rejoin() {
       [ "${f1}" -gt "${f0}" ] \
         || fail "cluster-member-rejoin: restarted member did not start blank (fresh-at-genesis count ${f0} -> ${f1}) — the wipe did not take, this run proved nothing about empty-state rejoin"
       if [ "${moved:-0}" -eq 0 ]; then
-        fail "cluster-member-rejoin: blank member FROZE at block ${catchup_block} (head at wipe ${head_at_wipe}) — its replay position never advanced once in ${t}s, so this is the JOIN WEDGE of issue #195, not slow replay: the member fails to bind its catchup endpoint (Receiver.onAddDestination -> BindException), never receives the rest of the log, and parks in Election.init/awaitLocalSocketsClosed while reporting healthy to Nomad. Check the member's driver error log for 'Address already in use' on its 402x3 endpoint"
+        fail "cluster-member-rejoin: blank member FROZE at block ${catchup_block} (head at wipe ${head_at_wipe}) — its replay position never advanced once in ${t}s, so this is a JOIN WEDGE (issue #195), not slow replay: the member stays INACTIVE after a partial replay while reporting healthy to Nomad. Check the member's driver error log and a thread dump of its consensus-module thread"
       fi
       fail "cluster-member-rejoin: blank member replayed to block ${catchup_block} of head-at-wipe ${head_at_wipe} in ${t}s — the position DID keep advancing, so this is genuinely slow catch-up rather than the #195 wedge: blank-member replay is O(lifetime log) and the log is never purged, see the log-purge follow-up in docs/reviews/2026-08-03-chaos-coverage-audit.md"
     fi

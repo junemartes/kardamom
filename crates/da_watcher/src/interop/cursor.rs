@@ -21,6 +21,15 @@
 //!   which is why no code path here writes the file before the publish it
 //!   records.
 //!
+//! ## One watcher per cursor file
+//!
+//! [`CursorFile::open`] takes an advisory lock on a sibling `<path>.lock`
+//! file and holds it for the life of the process. Two watchers on one cursor
+//! file would race the temp-file rename: each could publish the lane from a
+//! different position, and the file would hold whichever rename landed
+//! last. The second watcher fails at startup instead. The lock is an OS
+//! file lock, so a crash releases it; nothing stale is left behind.
+//!
 //! ## Corruption is a hard error
 //!
 //! A cursor file that exists but does not parse is never treated as 0 or as
@@ -31,8 +40,10 @@
 //! (restore the file, or deliberately delete it to re-seed via
 //! `--interop-start-seq`).
 
+use std::fs::{File, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Why the cursor file could not be read or written.
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +61,14 @@ pub enum CursorError {
          position — restore the file, or delete it to re-seed from --interop-start-seq"
     )]
     Corrupt { path: PathBuf, contents: String },
+    /// Another process holds the lock on this cursor file. See the module
+    /// docs: two watchers on one file is a misconfiguration, never a race
+    /// to tolerate.
+    #[error(
+        "cursor file {path} is locked by another watcher (lock file {lock}); run one watcher \
+         per cursor file — stop the other process, or use a different --interop-cursor-file"
+    )]
+    Locked { path: PathBuf, lock: PathBuf },
 }
 
 /// One pair's persisted cursor. The value stored is the FIRST SEQ NOT YET
@@ -58,11 +77,44 @@ pub enum CursorError {
 #[derive(Debug, Clone)]
 pub struct CursorFile {
     path: PathBuf,
+    /// The advisory lock on `<path>.lock`. Every clone shares the handle, so
+    /// the lock lives as long as the last clone. The OS releases it when the
+    /// process exits, cleanly or not.
+    _lock: Arc<File>,
 }
 
 impl CursorFile {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+    /// Open the cursor at `path` and take its lock. Fails with
+    /// [`CursorError::Locked`] when another watcher holds the lock. The
+    /// cursor file itself is not created here; `load` reports it absent
+    /// until the first `persist`.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, CursorError> {
+        let path = path.into();
+        let lock_path = lock_path_of(&path);
+        let io = |source| CursorError::Io {
+            path: lock_path.clone(),
+            source,
+        };
+        let lock = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(io)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(CursorError::Locked {
+                    path,
+                    lock: lock_path,
+                });
+            }
+            Err(TryLockError::Error(e)) => return Err(io(e)),
+        }
+        Ok(Self {
+            path,
+            _lock: Arc::new(lock),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -127,6 +179,14 @@ impl CursorFile {
     }
 }
 
+/// `<path>.lock`, appended to the full file name so `pair.cursor` and
+/// `pair` never share a lock file.
+fn lock_path_of(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,14 +202,14 @@ mod tests {
 
     #[test]
     fn missing_file_is_first_boot_not_zero() {
-        let c = CursorFile::new(temp_path("missing"));
+        let c = CursorFile::open(temp_path("missing")).unwrap();
         let _ = std::fs::remove_file(c.path());
         assert!(matches!(c.load(), Ok(None)));
     }
 
     #[test]
     fn roundtrip_and_overwrite() {
-        let c = CursorFile::new(temp_path("roundtrip"));
+        let c = CursorFile::open(temp_path("roundtrip")).unwrap();
         c.persist(7).unwrap();
         assert_eq!(c.load().unwrap(), Some(7));
         c.persist(12_345).unwrap();
@@ -163,7 +223,7 @@ mod tests {
 
     #[test]
     fn corrupt_file_is_a_hard_error_never_silent_zero() {
-        let c = CursorFile::new(temp_path("corrupt"));
+        let c = CursorFile::open(temp_path("corrupt")).unwrap();
         std::fs::write(c.path(), "not-a-seq\n").unwrap();
         let err = c.load().unwrap_err();
         assert!(matches!(err, CursorError::Corrupt { .. }), "got {err:?}");
@@ -177,8 +237,40 @@ mod tests {
     fn surrounding_whitespace_is_tolerated() {
         // The file is written with a trailing newline; hand-edits with an
         // editor may add one more. Both are the same value, not corruption.
-        let c = CursorFile::new(temp_path("whitespace"));
+        let c = CursorFile::open(temp_path("whitespace")).unwrap();
         std::fs::write(c.path(), " 42\n\n").unwrap();
         assert_eq!(c.load().unwrap(), Some(42));
+    }
+
+    #[test]
+    fn a_second_watcher_on_one_cursor_file_is_refused() {
+        let path = temp_path("locked");
+        let first = CursorFile::open(&path).unwrap();
+        let err = CursorFile::open(&path).unwrap_err();
+        assert!(matches!(err, CursorError::Locked { .. }), "got {err:?}");
+        assert!(
+            lock_path_of(&path).exists(),
+            "lock file is a sibling of the cursor"
+        );
+
+        // A clone shares the lock: dropping the original keeps it held.
+        let clone = first.clone();
+        drop(first);
+        assert!(matches!(
+            CursorFile::open(&path),
+            Err(CursorError::Locked { .. })
+        ));
+
+        // The last handle releases it, so a restart can take it again.
+        drop(clone);
+        CursorFile::open(&path).unwrap();
+    }
+
+    #[test]
+    fn lock_file_name_keeps_the_full_cursor_name() {
+        assert_eq!(
+            lock_path_of(Path::new("/var/lib/kardamom/pair.cursor")),
+            PathBuf::from("/var/lib/kardamom/pair.cursor.lock")
+        );
     }
 }
