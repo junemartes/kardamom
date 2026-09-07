@@ -53,6 +53,10 @@ pub struct SequencerConfig {
     /// must equal the cluster's `-Dkardamom.cluster.dedupCapacity`.
     #[serde(default)]
     pub resync: crate::resync::ResyncConfig,
+    /// The nonce lookup from an executor. Off when the endpoint list is
+    /// empty. See `crate::lookup`.
+    #[serde(default)]
+    pub lookup: crate::lookup::LookupConfig,
 }
 
 fn default_nonce_floor_lag_ms() -> u64 {
@@ -87,6 +91,7 @@ impl Default for SequencerConfig {
             backpressure_policy: BackpressurePolicy::ReturnImmediately,
             cluster: ClusterConfig::default(),
             resync: crate::resync::ResyncConfig::default(),
+            lookup: crate::lookup::LookupConfig::default(),
         }
     }
 }

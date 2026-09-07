@@ -130,6 +130,12 @@ pub(crate) struct Args {
     /// (`REPLAY_UNAVAILABLE`). Requires `--checkpoint-dir`.
     #[arg(long, env = "KARDAMOM_CHECKPOINT_PEERS", value_delimiter = ',')]
     pub(crate) checkpoint_peers: Vec<String>,
+    /// Serve read-only account nonce queries (`eth_getTransactionCount`)
+    /// on this address. The sequencers ask it for the committed nonce of a
+    /// cold sender. Off when unset. See
+    /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.4.
+    #[arg(long, env = "KARDAMOM_NONCE_QUERY_ADDR")]
+    pub(crate) nonce_query_addr: Option<std::net::SocketAddr>,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9004")]
     pub(crate) metrics_addr: std::net::SocketAddr,

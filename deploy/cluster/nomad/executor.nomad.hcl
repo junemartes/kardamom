@@ -180,6 +180,9 @@ job "executor" {
           # peer list is harmless; its own checkpoint never satisfies
           # the floor.
           "--checkpoint-serve-addr", "${meta.node_ip}:9014",
+          # The account nonce query for the sequencers
+          # (ports.executor_nonce_query in group_vars/all.yml).
+          "--nonce-query-addr", "${meta.node_ip}:9024",
           "--checkpoint-peers", "192.168.56.41:9014,192.168.56.42:9014,192.168.56.43:9014",
           # Bind the Prometheus exporter on all interfaces; the
           # default is loopback. The chaos suite probes it directly

@@ -195,6 +195,35 @@ must_contain(
     "chain-semantics park default equals tx_ttl_ms",
 )
 
+# --- executor nonce query -----------------------------------------------------------
+# Every executor serves the query on ports.executor_nonce_query. Both sequencer
+# groups carry the full executor list, derived from node_classes.executor.
+nonce_query_port = ports.get("executor_nonce_query", "")
+if not nonce_query_port:
+    err("group_vars/all.yml: missing ports.executor_nonce_query")
+must_contain(
+    jobs / "executor.nomad.hcl",
+    f'"--nonce-query-addr", "${{meta.node_ip}}:{nonce_query_port}"',
+    "executor nonce query address",
+)
+m_exec_start = re.search(r"^\s{2}executor:\s*\{[^}]*?\bip_start:\s*(\d+)", gv, re.M)
+m_exec_count = re.search(r"^\s{2}executor:\s*\{[^}]*?\bcount:\s*(\d+)", gv, re.M)
+ip_prefix_for_exec = scalar(gv, "ip_prefix")
+if m_exec_start and m_exec_count and ip_prefix_for_exec and nonce_query_port:
+    urls = ",".join(
+        f"http://{ip_prefix_for_exec}.{int(m_exec_start.group(1)) + i}:{nonce_query_port}"
+        for i in range(int(m_exec_count.group(1)))
+    )
+    flag = f'"--executor-query-endpoints", "{urls}"'
+    found = seq_job.count(flag)
+    if found != 2:
+        err(
+            "nomad/sequencer.nomad.hcl: expected both replica groups to pass "
+            f"{flag} (found {found})"
+        )
+else:
+    err("group_vars/all.yml: missing node_classes.executor ip_start/count")
+
 # --- config templates -----------------------------------------------------------
 # Cluster-only: tx_ordering is carried by the Aeron Cluster (Raft), not the
 # legacy MDC pub/sub, so the old sealer channel_b_mdc_control ⊆ tx_ordering_mdc_

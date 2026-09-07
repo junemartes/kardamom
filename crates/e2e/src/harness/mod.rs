@@ -175,6 +175,9 @@ pub struct LocalStack {
     /// archive-durability `channels.toml`, written once at launch). Also
     /// reused by [`Self::service_spec`] for a restarted service.
     log_config: Option<PathBuf>,
+    /// The executor's nonce query port. Picked before the sequencers
+    /// spawn, and reused by a restarted executor.
+    executor_query_port: u16,
     root: tempfile::TempDir,
     keep: bool,
     shutdown_report: ShutdownReport,
@@ -189,6 +192,7 @@ fn assemble_spec<'a>(
     driver: &'a MediaDriver,
     sealer: &'a SealerCluster,
     cfg: &StackConfig,
+    executor_query_port: u16,
     genesis: &'a Path,
     log_config: Option<&'a Path>,
 ) -> ServiceSpec<'a> {
@@ -198,6 +202,7 @@ fn assemble_spec<'a>(
         cluster_ingress_endpoints: &sealer.ingress_endpoints,
         shards: cfg.shards,
         tx_ttl: cfg.ingress.pending_receipt_timeout,
+        executor_query: std::net::SocketAddr::from(([127, 0, 0, 1], executor_query_port)),
         chain_id: cfg.chain_id,
         genesis,
         log_config,
@@ -317,11 +322,13 @@ impl LocalStack {
             None
         };
 
+        let executor_query_port = proc::free_tcp_port()?;
         let spec = assemble_spec(
             root.path(),
             &driver,
             &sealer,
             &cfg,
+            executor_query_port,
             &genesis,
             log_config.as_deref(),
         );
@@ -390,6 +397,7 @@ impl LocalStack {
             l1,
             genesis,
             log_config,
+            executor_query_port,
             root,
             keep,
             shutdown_report: ShutdownReport::default(),
@@ -560,6 +568,7 @@ impl LocalStack {
             &self.driver,
             &self.sealer,
             &self.cfg,
+            self.executor_query_port,
             &self.genesis,
             self.log_config.as_deref(),
         )
@@ -587,6 +596,28 @@ impl LocalStack {
         )
         .await
         .map(|addr| format!("ws://{addr}"))
+    }
+
+    /// The index of the sequencer (and the lane) that serves `sender`.
+    pub fn sequencer_for(&self, sender: alloy_primitives::Address) -> u32 {
+        kardamom_types::shard_map::partition_for(sender, self.cfg.shards)
+    }
+
+    /// Kill sequencer `index` and start a fresh process in its place. The
+    /// new process is cold: it holds no nonce state. The call returns once
+    /// the process has connected its cluster session. Scenarios that hold a
+    /// [`scenarios::Target`] rebuild it: the metrics port changed.
+    pub fn restart_sequencer(&mut self, index: u32) -> Result<()> {
+        let i = index as usize;
+        self.sequencers[i].proc.kill();
+        let mut respawned = services::spawn_sequencer(&self.service_spec(), index)?;
+        crate::harness::proc::wait_for_log_line(
+            &mut respawned.proc,
+            "tx_ordering via Aeron Cluster",
+            Duration::from_secs(60),
+        )?;
+        self.sequencers[i] = respawned;
+        Ok(())
     }
 
     /// Restart the executor against the same state directory and metrics

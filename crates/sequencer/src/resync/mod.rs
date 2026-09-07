@@ -38,9 +38,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::metrics;
 
-/// One executed-truth observation from the tx_receipts stream.
-/// `sender`'s transaction at `executed_nonce` produced a receipt, so the
-/// sender's floor is at least `executed_nonce + 1`.
+/// One executed-truth observation. Two sources produce it:
+///
+/// - The tx_receipts stream: `sender`'s transaction at `executed_nonce`
+///   produced a receipt, so the sender's floor is at least
+///   `executed_nonce + 1`.
+/// - The nonce lookup (`crate::lookup`): an executor reports the committed
+///   account nonce `c`, so every nonce below `c` executed. The task sends
+///   `executed_nonce = c - 1`, and nothing for `c == 0`. The controller
+///   treats both sources the same: the floor rises to `c`, and published
+///   refs at or below `c - 1` count as confirmed, because the committed
+///   state proves them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FloorUpdate {
     pub sender: Address,

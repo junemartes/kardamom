@@ -116,6 +116,9 @@ pub struct Sequencer {
     /// [`crate::unconfirmed`] for the ledger semantics and the
     /// expiry-queue mechanics.
     unconfirmed: UnconfirmedLedger<RefMetadata>,
+    /// The nonce lookup seam. `None` when the binary has no executor
+    /// endpoints (tests, IPC dev runs). See [`crate::lookup`].
+    lookup: Option<Box<dyn crate::lookup::NonceLookup>>,
 }
 
 impl Sequencer {
@@ -130,7 +133,14 @@ impl Sequencer {
             state: PartitionState::new(cap, ttl),
             resync: None,
             unconfirmed: UnconfirmedLedger::new(),
+            lookup: None,
         }
+    }
+
+    /// Enable the nonce lookup. A park of a sender with no known floor
+    /// then asks the lookup task for the sender's committed nonce.
+    pub fn enable_nonce_lookup(&mut self, lookup: Box<dyn crate::lookup::NonceLookup>) {
+        self.lookup = Some(lookup);
     }
 
     /// Enable lag detection and receipt-floor resync. The controller
@@ -356,6 +366,27 @@ impl Sequencer {
             .is_some_and(|r| r.floor(sender).is_some_and(|f| f > nonce))
     }
 
+    /// Ask for the committed nonce of `sender` after a park, when no
+    /// receipt has proven a floor for it yet. A cold replica heals through
+    /// this. A sender with a known floor parks for an ordinary reason (a
+    /// gap the client has not filled), and a lookup would say nothing
+    /// new. The lookup task dedups senders and bounds the rate, so a
+    /// request per park is cheap. See [`crate::lookup`].
+    fn request_lookup(&mut self, sender: alloy_primitives::Address) {
+        let Some(lookup) = self.lookup.as_mut() else {
+            return;
+        };
+        let floor_known = self
+            .resync
+            .as_ref()
+            .is_some_and(|r| r.floor(sender).is_some());
+        if floor_known {
+            return;
+        }
+        self.hot.lookup_requests.increment(1);
+        lookup.request(sender);
+    }
+
     /// Expire the parked entries whose lifetime (`tx_ttl`) has passed, and
     /// tell their parked submit calls and receipt subscribers. An entry
     /// waits on a nonce gap for at most `tx_ttl`. After that, the client
@@ -516,10 +547,12 @@ impl Sequencer {
             NonceOutcome::Matched => {}
             NonceOutcome::Buffered | NonceOutcome::BufferedReplaced => {
                 self.hot.buffered_future.increment(1);
+                self.request_lookup(sender);
             }
             NonceOutcome::BufferedEvicting { evicted_nonce } => {
                 self.hot.buffered_future.increment(1);
                 self.hot.evictions.increment(1);
+                self.request_lookup(sender);
                 self.report_evicted(rc, sender, evicted_nonce);
             }
             NonceOutcome::RejectedTooFar { nonce: rejected } => {

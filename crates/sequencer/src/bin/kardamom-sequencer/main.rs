@@ -106,6 +106,11 @@ struct Args {
     /// Boundary-silence resync trigger, ms (`[resync] boundary_silence_ms`).
     #[arg(long, env = "KARDAMOM_RESYNC_BOUNDARY_SILENCE_MS")]
     resync_boundary_silence_ms: Option<u64>,
+    /// The executor nonce query endpoints, as a comma-separated list of
+    /// `http://host:port` (`[lookup] executor_endpoints`). Empty means no
+    /// lookup. See `docs/specs/dynamic-sequencer-sizing.md`, section 3.4.
+    #[arg(long, env = "KARDAMOM_EXECUTOR_QUERY_ENDPOINTS", value_delimiter = ',')]
+    executor_query_endpoints: Vec<String>,
     /// Executor replica count for the tx_receipts MDS fan-in (parity with
     /// the validator). Falls back to `channels.tx_receipts_executor_count`.
     /// Not relevant when receipts ride multicast (the cluster deploy).
@@ -126,6 +131,9 @@ fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
     }
     if let Some(ttl) = args.tx_ttl_ms {
         cfg.tx_ttl_ms = ttl;
+    }
+    if !args.executor_query_endpoints.is_empty() {
+        cfg.lookup.executor_endpoints = args.executor_query_endpoints.clone();
     }
     if args.partition_offset != 0 {
         // An explicit --sequencer-id combined with rotation would
@@ -222,13 +230,23 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_for_deposits = shutdown.clone();
     let shutdown_for_remote_epochs = shutdown.clone();
 
-    tracing::info!(
-        "nonce floors: sequencer holds no state-DB reader; cold senders seed at \
-         0 and committed floors are recovered from the tx_receipts stream via \
-         the receipt-floor resync. NOTE: a restarted replica does NOT regain \
-         coverage of established senders until resync floors catch up (F02.1 \
-         re-opened)"
-    );
+    if cfg.lookup.enabled() {
+        tracing::info!(
+            endpoints = ?cfg.lookup.executor_endpoints,
+            timeout_ms = cfg.lookup.timeout_ms,
+            max_in_flight = cfg.lookup.max_in_flight,
+            "nonce floors: cold senders seed at 0; committed floors come from the \
+             tx_receipts stream and from the executor nonce lookup, so a restarted \
+             replica regains an established sender on its first park (F02.1 closed)"
+        );
+    } else {
+        tracing::warn!(
+            "nonce floors: no executor query endpoints; cold senders seed at 0 and \
+             committed floors come from the tx_receipts stream only. A restarted \
+             replica does NOT regain coverage of an established sender until a \
+             receipt arrives (F02.1). Set --executor-query-endpoints."
+        );
+    }
     let cfg_clone = cfg.clone();
 
     // tx_ordering always publishes to the Aeron Cluster (Raft) ingress. The
@@ -295,8 +313,26 @@ async fn main() -> anyhow::Result<()> {
         shutdown.clone(),
         cfg.partition_count,
         cfg.partition_index,
-        floor_tx,
+        floor_tx.clone(),
     );
+
+    // The nonce lookup task. It shares the floor channel with the receipts
+    // feed: an executor's committed nonce is floor evidence of the same
+    // kind as a receipt.
+    let (lookup_requester, lookup_task) = if cfg.lookup.enabled() {
+        let (requester, rx) = kardamom_sequencer::lookup::LookupRequester::channel();
+        let task = feeds::spawn_nonce_lookup_feed(
+            rx,
+            cfg.lookup.clone(),
+            cfg.partition_index,
+            floor_tx,
+            shutdown.clone(),
+        );
+        (Some(requester), Some(task))
+    } else {
+        drop(floor_tx);
+        (None, None)
+    };
 
     // Cloning shares the single session thread, and offers serialize
     // through it. All three loops use `cluster_pub` (it implements
@@ -312,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
         LiveEpochSub::new(tx_deposits_sub),
         LiveRemoteEpochSub::new(tx_remote_epochs_sub),
         Some(resync_controller),
+        lookup_requester,
         shutdown_for_main,
         shutdown_for_deposits,
         shutdown_for_remote_epochs,
@@ -348,6 +385,13 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Err(e) = receipts_task.await {
         tracing::warn!(?e, "receipts-floors task panicked");
+    }
+    // The lookup task exits on the token, or on the closed request
+    // channel after the main loop ends.
+    if let Some(task) = lookup_task
+        && let Err(e) = task.await
+    {
+        tracing::warn!(?e, "nonce-lookup task panicked");
     }
     drop(rt);
     Ok(())

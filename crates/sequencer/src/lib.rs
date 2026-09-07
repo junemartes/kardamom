@@ -29,6 +29,7 @@ pub mod config;
 pub mod epoch;
 pub mod error;
 pub mod inbound;
+pub mod lookup;
 pub mod metrics;
 mod nonce_decode;
 pub mod outbound;

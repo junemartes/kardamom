@@ -14,6 +14,13 @@ pub const PENDING_BUFFER_EVICTIONS: &str = "kardamom_sequencer_pending_evictions
 /// Parked entries that waited on a nonce gap past `tx_ttl`. Each one got
 /// an explicit `Expired` error on tx_errors.
 pub const PENDING_BUFFER_EXPIRED: &str = "kardamom_sequencer_pending_expired_total";
+/// Nonce lookups. `NONCE_LOOKUP_REQUESTS` counts the parks that asked for
+/// one. `NONCE_LOOKUPS` counts the queries the task ran, by `outcome`
+/// (`ok`, `error`, `timeout`, `shed`). `NONCE_LOOKUPS_IN_FLIGHT` is the
+/// concurrent query gauge.
+pub const NONCE_LOOKUP_REQUESTS: &str = "kardamom_sequencer_nonce_lookup_requests_total";
+pub const NONCE_LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
+pub const NONCE_LOOKUPS_IN_FLIGHT: &str = "kardamom_sequencer_nonce_lookups_in_flight";
 pub const BACKPRESSURE_EVENTS: &str = "kardamom_sequencer_backpressure_total";
 pub const NONCE_CHECK_DURATION_SECONDS: &str = "kardamom_sequencer_nonce_check_duration_seconds";
 
@@ -59,6 +66,7 @@ pub struct HotMetrics {
     pub dropped_past: metrics::Counter,
     pub evictions: metrics::Counter,
     pub expired: metrics::Counter,
+    pub lookup_requests: metrics::Counter,
     pub backpressure: metrics::Counter,
     pub nonce_check_seconds: metrics::Histogram,
 }
@@ -74,10 +82,20 @@ impl HotMetrics {
             dropped_past: counter!(TX_DROPPED_PAST, "partition" => p.clone()),
             evictions: counter!(PENDING_BUFFER_EVICTIONS, "partition" => p.clone()),
             expired: counter!(PENDING_BUFFER_EXPIRED, "partition" => p.clone()),
+            lookup_requests: counter!(NONCE_LOOKUP_REQUESTS, "partition" => p.clone()),
             backpressure: counter!(BACKPRESSURE_EVENTS, "partition" => p.clone()),
             nonce_check_seconds: histogram!(NONCE_CHECK_DURATION_SECONDS, "partition" => p),
         }
     }
+}
+
+pub fn record_nonce_lookup(partition: u32, outcome: &'static str) {
+    counter!(NONCE_LOOKUPS, "partition" => partition.to_string(), "outcome" => outcome)
+        .increment(1);
+}
+
+pub fn record_nonce_lookups_in_flight(partition: u32, n: usize) {
+    gauge!(NONCE_LOOKUPS_IN_FLIGHT, "partition" => partition.to_string()).set(n as f64);
 }
 
 pub fn record_ingest(partition: u32) {

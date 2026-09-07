@@ -162,6 +162,13 @@ async fn main() -> Result<()> {
         "state env opened"
     );
 
+    // The nonce query endpoint reads the committed state through its own
+    // short-lived snapshots. It must exist before the writer takes `env`.
+    if let Some(addr) = args.nonce_query_addr {
+        kardamom_state::serve_nonce_queries(addr, env.clone())
+            .context("bind nonce query address")?;
+    }
+
     // Spawn the writer, and build the three executor adapters from its
     // handle. The snapshot-swap channel feeds reads (the snapshot source
     // and commit signal). The delta channel feeds writes.

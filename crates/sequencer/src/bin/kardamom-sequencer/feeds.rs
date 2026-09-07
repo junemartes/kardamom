@@ -12,7 +12,8 @@
 //! Async-capable work, such as the receipts fan-in on an existing tokio
 //! channel, is a plain task. It uses `select!` on `Shutdown::cancelled`.
 
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 use kardamom_cluster_adapter::LiveEgress;
@@ -20,6 +21,8 @@ use kardamom_log::aeron_live::{IdleBackoff, TxReceiptsSubscriberHandle};
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::epoch::process_epoch;
 use kardamom_sequencer::error::SequencerError;
+use kardamom_sequencer::lookup::{self, LookupConfig, LookupRequester};
+use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::remote_epoch::process_remote_epoch;
 use kardamom_sequencer::resync::{FloorUpdate, ResyncController, SharedWatermark};
@@ -241,6 +244,158 @@ async fn run_receipt_floor_feed(
     }
 }
 
+/// Spawn the nonce lookup task. It drains the core's requests, dedups the
+/// senders in flight, bounds the concurrency and the per-sender retry
+/// rate, queries the executors, and delivers each answer as a
+/// `FloorUpdate`. See `kardamom_sequencer::lookup`.
+///
+/// One query runs on its own task, so a slow executor never blocks the
+/// drain. The endpoints rotate per query, and a query walks the list until
+/// one endpoint answers within the timeout.
+pub fn spawn_nonce_lookup_feed(
+    rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
+    cfg: LookupConfig,
+    partition: u32,
+    floor_tx: crossbeam_channel::Sender<FloorUpdate>,
+    shutdown: Shutdown,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_nonce_lookup_feed(
+        rx, cfg, partition, floor_tx, shutdown,
+    ))
+}
+
+/// One lookup result, from a query task back to the drain.
+type LookupDone = (Address, Result<u64, String>);
+
+async fn run_nonce_lookup_feed(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
+    cfg: LookupConfig,
+    partition: u32,
+    floor_tx: crossbeam_channel::Sender<FloorUpdate>,
+    shutdown: Shutdown,
+) {
+    let timeout = Duration::from_millis(cfg.timeout_ms.max(1));
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "nonce lookup: http client build failed; lookups off");
+            return;
+        }
+    };
+    let endpoints: std::sync::Arc<[String]> = cfg.executor_endpoints.into();
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<LookupDone>();
+    let mut in_flight: HashSet<Address> = HashSet::new();
+    // The last request time per sender. It bounds the retry rate to one
+    // lookup per timeout per sender.
+    let mut recent: HashMap<Address, Instant> = HashMap::new();
+    let mut next_endpoint = 0usize;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            done = done_rx.recv() => {
+                let Some((sender, result)) = done else { return };
+                in_flight.remove(&sender);
+                seq_metrics::record_nonce_lookups_in_flight(partition, in_flight.len());
+                match result {
+                    Ok(nonce) => {
+                        seq_metrics::record_nonce_lookup(partition, "ok");
+                        tracing::debug!(sender = ?sender, nonce, "nonce lookup answered");
+                        // A committed nonce `c` proves every nonce below it
+                        // executed. Nonce 0 proves nothing.
+                        if nonce > 0
+                            && floor_tx
+                                .send(FloorUpdate {
+                                    sender,
+                                    executed_nonce: nonce - 1,
+                                    skip_reason: None,
+                                    deposit: false,
+                                })
+                                .is_err()
+                        {
+                            // The publish loop is gone.
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let outcome = if e.contains("timed out") { "timeout" } else { "error" };
+                        seq_metrics::record_nonce_lookup(partition, outcome);
+                        tracing::warn!(sender = ?sender, error = %e, "nonce lookup failed");
+                    }
+                }
+            }
+            req = rx.recv() => {
+                let Some(sender) = req else { return };
+                let now = Instant::now();
+                if in_flight.contains(&sender)
+                    || recent.get(&sender).is_some_and(|t| now.duration_since(*t) < timeout)
+                {
+                    continue;
+                }
+                if in_flight.len() >= cfg.max_in_flight {
+                    seq_metrics::record_nonce_lookup(partition, "shed");
+                    continue;
+                }
+                if recent.len() >= 4096 {
+                    recent.retain(|_, t| now.duration_since(*t) < timeout);
+                }
+                recent.insert(sender, now);
+                in_flight.insert(sender);
+                seq_metrics::record_nonce_lookups_in_flight(partition, in_flight.len());
+                let first = next_endpoint % endpoints.len();
+                next_endpoint = next_endpoint.wrapping_add(1);
+                let client = client.clone();
+                let endpoints = endpoints.clone();
+                let done_tx = done_tx.clone();
+                tokio::spawn(async move {
+                    let result = query_executors(&client, &endpoints, first, sender).await;
+                    let _ = done_tx.send((sender, result));
+                });
+            }
+        }
+    }
+}
+
+/// Query the endpoints from `first` in rotation. The first answer wins.
+async fn query_executors(
+    client: &reqwest::Client,
+    endpoints: &[String],
+    first: usize,
+    sender: Address,
+) -> Result<u64, String> {
+    let mut last_err = String::from("no executor endpoints");
+    for i in 0..endpoints.len() {
+        let endpoint = &endpoints[(first + i) % endpoints.len()];
+        match query_one(client, endpoint, sender).await {
+            Ok(n) => return Ok(n),
+            Err(e) => last_err = format!("{endpoint}: {e}"),
+        }
+    }
+    Err(last_err)
+}
+
+async fn query_one(
+    client: &reqwest::Client,
+    endpoint: &str,
+    sender: Address,
+) -> Result<u64, String> {
+    let resp = client
+        .post(endpoint)
+        .header("content-type", "application/json")
+        .body(lookup::request_body(sender))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                "timed out".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    lookup::parse_answer(&body)
+}
+
 pub type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
 
 /// Spawn the main sequencer loop and the two origin pumps, over three
@@ -265,6 +420,7 @@ pub fn spawn_publish_loops<P>(
     mut epoch_sub: LiveEpochSub,
     mut remote_epoch_sub: LiveRemoteEpochSub,
     resync: Option<ResyncController>,
+    lookup: Option<LookupRequester>,
     shutdown_for_main: Shutdown,
     shutdown_for_deposits: Shutdown,
     shutdown_for_remote_epochs: Shutdown,
@@ -280,6 +436,9 @@ where
         let mut sequencer = Sequencer::new(cfg);
         if let Some(controller) = resync {
             sequencer.enable_resync(controller);
+        }
+        if let Some(requester) = lookup {
+            sequencer.enable_nonce_lookup(Box::new(requester));
         }
         sequencer.run(
             &mut tx_data,
