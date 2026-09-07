@@ -129,6 +129,11 @@ impl Drop for SlotGuard {
             && let Some(n) = g.per_dest.get_mut(&d)
         {
             *n = n.saturating_sub(1);
+            // Drop the entry at zero, so a client that churns destination
+            // ids cannot grow the map without bound.
+            if *n == 0 {
+                g.per_dest.remove(&d);
+            }
         }
     }
 }
