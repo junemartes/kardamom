@@ -1,4 +1,4 @@
-//! Origin-side outbox extraction (spec §5): decode `MessageSent` logs from
+//! Origin-side outbox extraction: decode `MessageSent` logs from
 //! the Outbox predeploy out of this validator's RE-EXECUTED receipts,
 //! recompute-and-reject the event-carried commitment, and cross-check each
 //! send against the executor's BAL claim for the `sentMessages` slot.
@@ -19,6 +19,8 @@
 //! exactly this tx's access index. A send the executor did not claim — or a
 //! claim without a matching event — means the two views of the block
 //! diverged: halt, the `write_set_eq` posture.
+
+use std::num::NonZeroU16;
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_sol_types::{SolEvent, sol};
@@ -53,12 +55,12 @@ sol! {
 
 /// Storage slot index of `mapping(bytes32 => bool) sentMessages` in the
 /// Outbox predeploy — the SECOND declared field (`nonces` is slot 0).
-pub const SENT_MESSAGES_SLOT_INDEX: u64 = 1;
+const SENT_MESSAGES_SLOT_INDEX: u64 = 1;
 
 /// The storage slot holding `sentMessages[msg_hash]`:
 /// `keccak256(msgHash ‖ uint256(SENT_MESSAGES_SLOT_INDEX))` — the Solidity
 /// mapping rule. Pinned against forge-computed vectors (`cast index`) below.
-pub fn sent_messages_slot(msg_hash: B256) -> B256 {
+pub(crate) fn sent_messages_slot(msg_hash: B256) -> B256 {
     let mut buf = [0u8; 64];
     buf[0..32].copy_from_slice(msg_hash.as_slice());
     buf[32..64].copy_from_slice(&U256::from(SENT_MESSAGES_SLOT_INDEX).to_be_bytes::<32>());
@@ -76,12 +78,23 @@ pub fn sent_messages_slot(msg_hash: B256) -> B256 {
 /// `RemoteEpochRecord`s and `canonical_id` dedup collapses them. Content
 /// authenticity is §10's job (re-derivation / attestation quorum), never
 /// this field's; the destination treats it as opaque.
-pub fn xchain_anchor_hash(origin_chain_id: u64, block_number: u64) -> B256 {
-    let mut buf = Vec::with_capacity(25 + 16);
-    buf.extend_from_slice(b"KARDAMOM_XCHAIN_ANCHOR_V0");
-    buf.extend_from_slice(&origin_chain_id.to_be_bytes());
-    buf.extend_from_slice(&block_number.to_be_bytes());
-    keccak256(&buf)
+fn xchain_anchor_hash(origin_chain_id: u64, block_number: u64) -> B256 {
+    let mut buf = [0u8; 25 + 8 + 8];
+    buf[0..25].copy_from_slice(b"KARDAMOM_XCHAIN_ANCHOR_V0");
+    buf[25..33].copy_from_slice(&origin_chain_id.to_be_bytes());
+    buf[33..41].copy_from_slice(&block_number.to_be_bytes());
+    keccak256(buf)
+}
+
+/// One log's site: which chain observed it, and where. Shared by
+/// [`decode_message_sent`] and [`check_leaf`], and by the errors they
+/// raise, so the three fields travel together instead of three parallel
+/// arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogSite {
+    pub origin_chain_id: u64,
+    pub block: u64,
+    pub tx_index: u64,
 }
 
 /// Why extraction failed. Every variant is a chain-level fault: the receipts
@@ -90,24 +103,20 @@ pub fn xchain_anchor_hash(origin_chain_id: u64, block_number: u64) -> B256 {
 /// or the executor's claims diverged from them — halt, never skip.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OutboxExtractError {
-    /// A log from the Outbox address carries the MessageSent topic but does
+    /// A log from the Outbox address carries the `MessageSent` topic but does
     /// not ABI-decode.
-    #[error("block {block} tx {tx_index}: MessageSent log does not decode: {detail}")]
-    Undecodable {
-        block: u64,
-        tx_index: u64,
-        detail: String,
-    },
+    #[error("block {} tx {}: MessageSent log does not decode: {detail}", site.block, site.tx_index)]
+    Undecodable { site: LogSite, detail: String },
     /// The recomputed message leaf differs from the event-carried `msgHash` —
     /// predeploy/bytecode drift, or a contract at the predeploy address that
     /// is not the Outbox.
     #[error(
-        "block {block} tx {tx_index} (dest {dest}, seq {seq}): recomputed msg leaf {computed} \
-         != event-carried {carried} — event data drifted from the shared hashing rule"
+        "block {} tx {} (dest {dest}, seq {seq}): recomputed msg leaf {computed} \
+         != event-carried {carried} — event data drifted from the shared hashing rule",
+        site.block, site.tx_index
     )]
     LeafMismatch {
-        block: u64,
-        tx_index: u64,
+        site: LogSite,
         dest: u64,
         seq: u64,
         computed: B256,
@@ -146,21 +155,28 @@ pub enum OutboxExtractError {
 /// Returns the messages in block order (== per-destination seq order, since
 /// the Outbox's per-destination counter is dense and monotone within a
 /// block).
+///
+/// # Errors
+///
+/// Returns an error if a `MessageSent`-shaped log is malformed or
+/// drifted from the shared hashing rule, or if `claims` is given and a
+/// send has no matching, or a wrong, `sentMessages` claim.
 pub fn collect_outbox_messages(
     origin_chain_id: u64,
     block_number: u64,
     receipts: &[Receipt],
-    claims: Option<(u16, &ClaimIndex)>,
+    claims: Option<(NonZeroU16, &ClaimIndex)>,
 ) -> Result<Vec<OutboxMessage>, OutboxExtractError> {
-    let mut out = Vec::new();
-    for receipt in receipts {
-        for log in &receipt.logs {
-            if let Some(msg) = decode_message_sent(
+    receipts
+        .iter()
+        .flat_map(|receipt| receipt.logs.iter().map(move |log| (receipt, log)))
+        .try_fold(Vec::new(), |mut out, (receipt, log)| {
+            let site = LogSite {
                 origin_chain_id,
-                block_number,
-                receipt.transaction_index,
-                log,
-            )? {
+                block: block_number,
+                tx_index: receipt.transaction_index,
+            };
+            if let Some(msg) = decode_message_sent(site, log)? {
                 if let Some((granularity, idx)) = claims {
                     cross_check_claim(
                         block_number,
@@ -172,9 +188,8 @@ pub fn collect_outbox_messages(
                 }
                 out.push(msg.message);
             }
-        }
-    }
-    Ok(out)
+            Ok(out)
+        })
 }
 
 /// One decoded send plus the fields the claim cross-check needs.
@@ -187,9 +202,7 @@ struct DecodedSend {
 /// `Ok(None)` = not ours (foreign address or topic — skip); `Err` = it IS a
 /// MessageSent-shaped Outbox log but malformed or drifted (fault).
 fn decode_message_sent(
-    origin_chain_id: u64,
-    block: u64,
-    tx_index: u64,
+    site: LogSite,
     log: &WireLog,
 ) -> Result<Option<DecodedSend>, OutboxExtractError> {
     if log.address != OUTBOX {
@@ -200,61 +213,21 @@ fn decode_message_sent(
     }
     let decoded = MessageSent::decode_raw_log(log.topics.iter().copied(), log.data.as_ref())
         .map_err(|e| OutboxExtractError::Undecodable {
-            block,
-            tx_index,
+            site,
             detail: e.to_string(),
         })?;
 
     let value = u128::try_from(decoded.value).map_err(|_| OutboxExtractError::Undecodable {
-        block,
-        tx_index,
+        site,
         detail: format!("value {} exceeds the protocol's u128", decoded.value),
     })?;
-    let callback = {
-        let cb = &decoded.callback;
-        if cb.target == Address::ZERO && cb.gasLimit == 0 && cb.context == B256::ZERO {
-            None
-        } else {
-            Some(Callback {
-                target: cb.target,
-                gas_limit: cb.gasLimit,
-                context: cb.context,
-            })
-        }
-    };
-
-    // Recompute-and-reject: the commitment is rebuilt from the decoded
-    // fields through the shared rule; the event-carried hash is only ever
-    // COMPARED, never propagated.
-    let computed = msg_leaf(
-        origin_chain_id,
-        decoded.destChainId,
-        decoded.seq,
-        decoded.sender,
-        decoded.target,
-        value,
-        decoded.gasLimit,
-        keccak256(&decoded.data),
-        callback
-            .as_ref()
-            .map(Callback::commitment)
-            .unwrap_or_else(kardamom_types::xchain::no_callback_hash),
-    );
-    if computed != decoded.msgHash {
-        return Err(OutboxExtractError::LeafMismatch {
-            block,
-            tx_index,
-            dest: decoded.destChainId,
-            seq: decoded.seq,
-            computed,
-            carried: decoded.msgHash,
-        });
-    }
+    let callback = decode_callback(&decoded.callback);
+    let computed = check_leaf(site, &decoded, value, callback.as_ref())?;
 
     Ok(Some(DecodedSend {
         message: OutboxMessage {
-            origin_block_number: block,
-            origin_block_hash: xchain_anchor_hash(origin_chain_id, block),
+            origin_block_number: site.block,
+            origin_block_hash: xchain_anchor_hash(site.origin_chain_id, site.block),
             dest_chain_id: decoded.destChainId,
             seq: decoded.seq,
             sender: decoded.sender,
@@ -268,6 +241,56 @@ fn decode_message_sent(
     }))
 }
 
+/// Decode the callback sub-struct. The zero-callback sentinel (all-zero
+/// target, gas limit, and context) means "no callback".
+fn decode_callback(cb: &SolCallback) -> Option<Callback> {
+    if cb.target == Address::ZERO && cb.gasLimit == 0 && cb.context == B256::ZERO {
+        None
+    } else {
+        Some(Callback {
+            target: cb.target,
+            gas_limit: cb.gasLimit,
+            context: cb.context,
+        })
+    }
+}
+
+/// Recompute-and-reject: rebuild the commitment from the decoded fields
+/// through the shared rule, and compare it against the event-carried
+/// hash, which is never propagated on its own. Returns the recomputed
+/// leaf.
+fn check_leaf(
+    site: LogSite,
+    decoded: &MessageSent,
+    value: u128,
+    callback: Option<&Callback>,
+) -> Result<B256, OutboxExtractError> {
+    let computed = msg_leaf(
+        site.origin_chain_id,
+        decoded.destChainId,
+        decoded.seq,
+        decoded.sender,
+        decoded.target,
+        value,
+        decoded.gasLimit,
+        keccak256(&decoded.data),
+        callback.map_or_else(
+            kardamom_types::xchain::no_callback_hash,
+            Callback::commitment,
+        ),
+    );
+    if computed != decoded.msgHash {
+        return Err(OutboxExtractError::LeafMismatch {
+            site,
+            dest: decoded.destChainId,
+            seq: decoded.seq,
+            computed,
+            carried: decoded.msgHash,
+        });
+    }
+    Ok(computed)
+}
+
 /// The state tie: `sentMessages[msgHash]` must be claimed `true` by the
 /// executor at exactly this tx's access index (chunk ordinal at wire
 /// granularity K > 1 — the validator's ladder view always follows the wire).
@@ -275,13 +298,13 @@ fn cross_check_claim(
     block: u64,
     tx_index: u64,
     send: &DecodedSend,
-    granularity: u16,
+    granularity: NonZeroU16,
     claims: &ClaimIndex,
 ) -> Result<(), OutboxExtractError> {
     let slot = sent_messages_slot(send.msg_hash);
     let bal_index = tx_index + 1;
-    let claim_index = if granularity > 1 {
-        kardamom_engine::bal_ladder::chunk_of(bal_index, u64::from(granularity))
+    let claim_index = if granularity.get() > 1 {
+        kardamom_engine::bal_ladder::chunk_of(bal_index, u64::from(granularity.get()))
     } else {
         bal_index
     };
@@ -318,7 +341,7 @@ pub(crate) mod tests_support {
     use super::*;
     use alloy_primitives::Bytes as AlloyBytes;
 
-    /// Build a MessageSent WireLog exactly as the predeploy emits it: the
+    /// Build a `MessageSent` `WireLog` exactly as the predeploy emits it: the
     /// carried msgHash computed through the SAME shared rule (an honest
     /// contract).
     pub(crate) fn honest_sent_log_full(
@@ -330,10 +353,7 @@ pub(crate) mod tests_support {
     ) -> WireLog {
         let sender = Address::repeat_byte(0xA1);
         let target = Address::repeat_byte(0xB2);
-        let cb_hash = callback
-            .as_ref()
-            .map(Callback::commitment)
-            .unwrap_or(B256::ZERO);
+        let cb_hash = callback.as_ref().map_or(B256::ZERO, Callback::commitment);
         let msg_hash = msg_leaf(
             origin,
             dest,
@@ -407,6 +427,11 @@ mod tests {
         }
     }
 
+    /// A fixture wire granularity. Every caller passes a literal `> 0`.
+    fn nz(n: u16) -> NonZeroU16 {
+        NonZeroU16::new(n).expect("fixture granularity")
+    }
+
     /// The sol! event signature must equal the Solidity contract's — the
     /// pinned string is `Outbox.sol`'s event with the callback struct
     /// flattened to its tuple type.
@@ -462,7 +487,7 @@ mod tests {
                     WireLog {
                         address: Address::repeat_byte(0x99),
                         topics: vec![B256::repeat_byte(0x77)],
-                        data: Default::default(),
+                        data: bytes::Bytes::default(),
                     },
                     sent_log(1, &[], Some(cb)),
                 ],
@@ -547,13 +572,14 @@ mod tests {
 
         // Honest claims: tx 0 -> bal index 1, tx 1 -> bal index 2.
         let claims = claims_for(&[(1, h0), (2, h1)]);
-        let msgs = collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((1, &claims))).unwrap();
+        let msgs =
+            collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((nz(1), &claims))).unwrap();
         assert_eq!(msgs.len(), 2);
 
         // Missing claim for the second send.
         let claims = claims_for(&[(1, h0)]);
         let err =
-            collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((1, &claims))).unwrap_err();
+            collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((nz(1), &claims))).unwrap_err();
         assert!(
             matches!(err, OutboxExtractError::ClaimMismatch { seq: 1, .. }),
             "{err:?}"
@@ -561,7 +587,7 @@ mod tests {
 
         // Claim at the WRONG access index (attribution drift).
         let claims = claims_for(&[(1, h0), (3, h1)]);
-        assert!(collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((1, &claims))).is_err());
+        assert!(collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((nz(1), &claims))).is_err());
 
         // Claimed false (post-value 0).
         let mut claims = claims_for(&[(1, h0), (2, h1)]);
@@ -570,7 +596,7 @@ mod tests {
             .get_mut(&(OUTBOX, sent_messages_slot(h1)))
             .unwrap()[0]
             .1 = U256::ZERO;
-        assert!(collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((1, &claims))).is_err());
+        assert!(collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((nz(1), &claims))).is_err());
     }
 
     /// At wire granularity K > 1 the claims are chunk-collapsed: the send's
@@ -582,9 +608,11 @@ mod tests {
         // tx index 25 -> bal index 26 -> chunk 2 at K=20.
         let receipts = vec![receipt_with(25, vec![log])];
         let claims = claims_for(&[(2, h)]);
-        assert!(collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((20, &claims))).is_ok());
+        assert!(collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((nz(20), &claims))).is_ok());
         // The per-tx index must NOT be accepted at K=20.
         let claims = claims_for(&[(26, h)]);
-        assert!(collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((20, &claims))).is_err());
+        assert!(
+            collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((nz(20), &claims))).is_err()
+        );
     }
 }

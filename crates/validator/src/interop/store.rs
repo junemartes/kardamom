@@ -9,11 +9,47 @@
 //! for a bump).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroU64;
 use std::sync::Mutex;
 
 use alloy_primitives::B256;
 use kardamom_types::xchain::OutboxMessage;
 use tokio::sync::watch;
+
+/// State plus its wake-up version, bumped on every mutation. Shared by
+/// [`FeedStore`] and [`AttestationStore`]: lock, mutate, drop the lock,
+/// bump the version is the one write path both use, and the version is
+/// the one a subscriber's `subscribe()` waits on.
+struct Versioned<T> {
+    inner: Mutex<T>,
+    version: watch::Sender<u64>,
+}
+
+impl<T> Versioned<T> {
+    fn new(value: T) -> Self {
+        Self {
+            inner: Mutex::new(value),
+            version: watch::channel(0).0,
+        }
+    }
+
+    /// Read the state under the lock, and release it when this returns.
+    fn read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        f(&crate::lock_recover(&self.inner))
+    }
+
+    /// Mutate the state under the lock, release it, then bump the
+    /// wake-up version. A version, not a count: wrapping is the meaning
+    /// here, and a subscriber only ever compares it for change.
+    fn mutate(&self, f: impl FnOnce(&mut T)) {
+        f(&mut crate::lock_recover(&self.inner));
+        self.version.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.version.subscribe()
+    }
+}
 
 /// One destination's retained messages, in seq order (appends arrive in
 /// block order and the Outbox's per-destination counter is dense, so pushes
@@ -26,6 +62,24 @@ struct Lane {
     floor: u64,
 }
 
+impl Lane {
+    /// Drop every message below `cutoff` (an origin block number), raising
+    /// `floor` past each one dropped.
+    fn prune_below(&mut self, cutoff: u64) {
+        while let Some(front) = self.msgs.front() {
+            if front.origin_block_number >= cutoff {
+                break;
+            }
+            // `seq` is wire-derived (from the extractor's own
+            // re-execution, but ultimately from send counts a contract
+            // can run arbitrarily high). A wrap would set the retention
+            // floor to 0 and hide the loss.
+            self.floor = front.seq.saturating_add(1);
+            self.msgs.pop_front();
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct FeedInner {
     lanes: BTreeMap<u64, Lane>,
@@ -36,19 +90,17 @@ struct FeedInner {
 /// Per-destination outbox feed store with block-based retention.
 pub struct FeedStore {
     origin_chain_id: u64,
-    retention_blocks: u64,
-    inner: Mutex<FeedInner>,
-    /// Version bump per append; subscription handlers wait on it.
-    items: watch::Sender<u64>,
+    retention_blocks: NonZeroU64,
+    state: Versioned<FeedInner>,
 }
 
 impl FeedStore {
-    pub fn new(origin_chain_id: u64, retention_blocks: u64) -> Self {
+    #[must_use]
+    pub fn new(origin_chain_id: u64, retention_blocks: NonZeroU64) -> Self {
         Self {
             origin_chain_id,
-            retention_blocks: retention_blocks.max(1),
-            inner: Mutex::new(FeedInner::default()),
-            items: watch::channel(0).0,
+            retention_blocks,
+            state: Versioned::new(FeedInner::default()),
         }
     }
 
@@ -60,32 +112,25 @@ impl FeedStore {
     /// Record one block's extracted messages (possibly none — every block
     /// advances the retention head) and prune lanes that aged out.
     pub fn append_block(&self, block: u64, msgs: Vec<OutboxMessage>) {
-        let mut g = self.inner.lock().unwrap();
-        g.head_block = g.head_block.max(block);
-        for m in msgs {
-            let lane = g.lanes.entry(m.dest_chain_id).or_default();
-            lane.msgs.push_back(m);
-        }
-        let cutoff = g.head_block.saturating_sub(self.retention_blocks);
-        for lane in g.lanes.values_mut() {
-            while let Some(front) = lane.msgs.front() {
-                if front.origin_block_number >= cutoff {
-                    break;
-                }
-                lane.floor = front.seq + 1;
-                lane.msgs.pop_front();
+        let retention_blocks = self.retention_blocks.get();
+        self.state.mutate(|g| {
+            g.head_block = g.head_block.max(block);
+            for m in msgs {
+                let lane = g.lanes.entry(m.dest_chain_id).or_default();
+                lane.msgs.push_back(m);
             }
-        }
-        drop(g);
-        self.items.send_modify(|v| *v += 1);
+            let cutoff = g.head_block.saturating_sub(retention_blocks);
+            for lane in g.lanes.values_mut() {
+                lane.prune_below(cutoff);
+            }
+        });
     }
 
     /// Everything retained for `dest` from `from_seq` onward, plus the
     /// lane's retention floor. `floor > from_seq` ⇒ the subscriber lagged
     /// out of retention and `floor - from_seq` items are gone.
     pub fn from_seq(&self, dest: u64, from_seq: u64) -> (Vec<OutboxMessage>, u64) {
-        let g = self.inner.lock().unwrap();
-        match g.lanes.get(&dest) {
+        self.state.read(|g| match g.lanes.get(&dest) {
             Some(lane) => (
                 lane.msgs
                     .iter()
@@ -95,86 +140,76 @@ impl FeedStore {
                 lane.floor,
             ),
             None => (Vec::new(), 0),
-        }
+        })
     }
 
     /// Wake-up channel for subscription handlers (tap BEFORE the first scan).
     pub fn subscribe(&self) -> watch::Receiver<u64> {
-        self.items.subscribe()
+        self.state.subscribe()
     }
 }
 
 /// Ring of this validator's per-block `(block_number, state_root)`
 /// attestations, block-retained like the feed store.
 pub struct AttestationStore {
-    retention_blocks: u64,
-    inner: Mutex<VecDeque<(u64, B256)>>,
-    items: watch::Sender<u64>,
+    retention_blocks: NonZeroU64,
+    state: Versioned<VecDeque<(u64, B256)>>,
 }
 
 impl AttestationStore {
-    pub fn new(retention_blocks: u64) -> Self {
+    #[must_use]
+    pub fn new(retention_blocks: NonZeroU64) -> Self {
         Self {
-            retention_blocks: retention_blocks.max(1),
-            inner: Mutex::new(VecDeque::new()),
-            items: watch::channel(0).0,
+            retention_blocks,
+            state: Versioned::new(VecDeque::new()),
         }
     }
 
     /// Record `block`'s committed state root (call once per block, in order).
     pub fn push(&self, block: u64, state_root: B256) {
-        let mut g = self.inner.lock().unwrap();
-        g.push_back((block, state_root));
-        let cutoff = block.saturating_sub(self.retention_blocks);
-        while g.front().is_some_and(|(b, _)| *b < cutoff) {
-            g.pop_front();
-        }
-        drop(g);
-        self.items.send_modify(|v| *v += 1);
+        let retention_blocks = self.retention_blocks.get();
+        self.state.mutate(|g| {
+            g.push_back((block, state_root));
+            let cutoff = block.saturating_sub(retention_blocks);
+            while g.front().is_some_and(|(b, _)| *b < cutoff) {
+                g.pop_front();
+            }
+        });
     }
 
     /// Retained attestations from `from_block` onward, plus the first
     /// retained block (the retention floor; 0 when nothing is retained yet).
     pub fn from_block(&self, from_block: u64) -> (Vec<(u64, B256)>, u64) {
-        let g = self.inner.lock().unwrap();
-        let floor = g.front().map(|(b, _)| *b).unwrap_or(0);
-        (
-            g.iter()
-                .filter(|(b, _)| *b >= from_block)
-                .copied()
-                .collect(),
-            floor,
-        )
+        self.state.read(|g| {
+            let floor = g.front().map_or(0, |(b, _)| *b);
+            (
+                g.iter()
+                    .filter(|(b, _)| *b >= from_block)
+                    .copied()
+                    .collect(),
+                floor,
+            )
+        })
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
-        self.items.subscribe()
+        self.state.subscribe()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::Address;
 
-    fn msg(dest: u64, seq: u64, block: u64) -> OutboxMessage {
-        OutboxMessage {
-            origin_block_number: block,
-            origin_block_hash: B256::repeat_byte(block as u8),
-            dest_chain_id: dest,
-            seq,
-            sender: Address::repeat_byte(0xA1),
-            target: Address::repeat_byte(0xB2),
-            value: 0,
-            gas_limit: 100_000,
-            data: Default::default(),
-            callback: None,
-        }
+    fn nz(n: u64) -> NonZeroU64 {
+        NonZeroU64::new(n).expect("fixture retention")
     }
+
+    use crate::interop::outbox_msg as msg;
 
     #[test]
     fn lanes_are_per_destination_and_cursor_scans_by_seq() {
-        let store = FeedStore::new(1, 100);
+        let store = FeedStore::new(1, nz(100));
         store.append_block(10, vec![msg(7, 0, 10), msg(9, 0, 10)]);
         store.append_block(11, vec![msg(7, 1, 11)]);
 
@@ -191,7 +226,7 @@ mod tests {
 
     #[test]
     fn retention_prunes_by_block_and_raises_the_floor() {
-        let store = FeedStore::new(1, 5);
+        let store = FeedStore::new(1, nz(5));
         store.append_block(10, vec![msg(7, 0, 10), msg(7, 1, 10)]);
         store.append_block(12, vec![msg(7, 2, 12)]);
         // Head advances well past block 10: seqs 0-1 age out.
@@ -206,7 +241,7 @@ mod tests {
 
     #[test]
     fn empty_blocks_advance_retention_without_messages() {
-        let store = FeedStore::new(1, 2);
+        let store = FeedStore::new(1, nz(2));
         store.append_block(1, vec![msg(7, 0, 1)]);
         for b in 2..=10 {
             store.append_block(b, vec![]);
@@ -218,7 +253,7 @@ mod tests {
 
     #[test]
     fn append_wakes_subscribers() {
-        let store = FeedStore::new(1, 100);
+        let store = FeedStore::new(1, nz(100));
         let mut rx = store.subscribe();
         let before = *rx.borrow_and_update();
         store.append_block(1, vec![]);
@@ -228,9 +263,10 @@ mod tests {
 
     #[test]
     fn attestation_ring_retains_and_floors() {
-        let ring = AttestationStore::new(3);
+        let ring = AttestationStore::new(nz(3));
         for b in 1..=10u64 {
-            ring.push(b, B256::repeat_byte(b as u8));
+            let byte = u8::try_from(b).expect("fixture block < 256");
+            ring.push(b, B256::repeat_byte(byte));
         }
         let (all, floor) = ring.from_block(0);
         assert_eq!(floor, 7, "cutoff = 10 - 3");

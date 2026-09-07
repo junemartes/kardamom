@@ -29,9 +29,18 @@
 //! import path.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use kardamom_engine::ExecutorError;
+
+/// Lock `m`, recovering the data if an earlier panic poisoned it. Every
+/// caller in this crate protects plain data with no invariant a panic
+/// mid-update could break, so recovery is always safe: a panicking
+/// writer never leaves the guarded value in a state a later reader or
+/// writer cannot use.
+pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// L1 output attester. It collects `MessagePassed` leaves from re-executed
 /// blocks, builds the per-output withdrawals root, and posts it to the L1
@@ -46,6 +55,7 @@ pub mod metrics;
 pub mod prover;
 pub mod witness;
 
+mod block_accum;
 mod buffers;
 mod seams;
 
@@ -58,10 +68,11 @@ pub use seams::*;
 #[derive(Debug, Default)]
 pub struct Divergence {
     halted: AtomicBool,
-    reason: Mutex<Option<String>>,
+    reason: OnceLock<String>,
 }
 
 impl Divergence {
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -72,17 +83,39 @@ impl Divergence {
         if !self.halted.swap(true, Ordering::SeqCst) {
             let reason = reason.into();
             tracing::error!(reason = %reason, "validator divergence detected — halting");
-            *self.reason.lock().unwrap() = Some(reason);
+            let _ = self.reason.set(reason);
             metrics::counter_divergence();
         }
     }
 
+    #[must_use]
     pub fn is_halted(&self) -> bool {
         self.halted.load(Ordering::SeqCst)
     }
 
+    #[must_use]
     pub fn reason(&self) -> Option<String> {
-        self.reason.lock().unwrap().clone()
+        self.reason.get().cloned()
+    }
+
+    /// If halted, the recorded reason, or `default` if [`record`](Self::record)
+    /// has been called but has not yet finished storing it (a race this
+    /// crate's usage never actually hits, since every caller stores
+    /// before returning; kept as a safe fallback rather than a panic).
+    /// `None` when not halted. Callers wrap the string in their own
+    /// `ExecutorError` variant, so this returns the reason only.
+    #[must_use]
+    pub fn halt_reason(&self, default: &str) -> Option<String> {
+        self.is_halted()
+            .then(|| self.reason().unwrap_or_else(|| default.to_string()))
+    }
+
+    /// Record `reason` as the divergence (idempotent — see
+    /// [`record`](Self::record)) and hand it back, so a call site can
+    /// record-and-return the same string in one expression.
+    pub fn halt(&self, reason: String) -> String {
+        self.record(reason.clone());
+        reason
     }
 }
 

@@ -1,6 +1,4 @@
-//! The validator's interop role (`docs/specs/egress-node-spec.md` v2,
-//! `docs/specs/interop-outbox-messaging-spec.md` §5/§10): one binary, roles
-//! by config.
+//! The validator's interop role: one binary, roles by config.
 //!
 //! - [`verify`] — destination side: the [`RemoteEpochVerifier`] wired on the
 //!   engine's `RemoteEpochObserver` seam (inline pair-sequence checks;
@@ -19,8 +17,27 @@ pub mod sink;
 pub mod store;
 pub mod verify;
 
-pub use extract::{OutboxExtractError, collect_outbox_messages, sent_messages_slot};
+pub use extract::{OutboxExtractError, collect_outbox_messages};
 pub use serve::{FeedServerState, start_feed_server};
 pub use sink::ExtractingReceiptSink;
 pub use store::{AttestationStore, FeedStore};
-pub use verify::{RemoteEpochFault, RemoteEpochVerifier, check_remote_epoch};
+pub use verify::RemoteEpochVerifier;
+
+/// A fixture `OutboxMessage`, shared by [`serve`] and [`store`]'s test
+/// modules.
+#[cfg(test)]
+pub(crate) fn outbox_msg(dest: u64, seq: u64, block: u64) -> kardamom_types::xchain::OutboxMessage {
+    let block_byte = u8::try_from(block).expect("fixture block < 256");
+    kardamom_types::xchain::OutboxMessage {
+        origin_block_number: block,
+        origin_block_hash: alloy_primitives::B256::repeat_byte(block_byte),
+        dest_chain_id: dest,
+        seq,
+        sender: alloy_primitives::Address::repeat_byte(0xA1),
+        target: alloy_primitives::Address::repeat_byte(0xB2),
+        value: 0,
+        gas_limit: 100_000,
+        data: alloy_primitives::Bytes::default(),
+        callback: None,
+    }
+}

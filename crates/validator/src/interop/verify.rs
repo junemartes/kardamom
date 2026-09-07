@@ -1,10 +1,9 @@
-//! Remote-epoch verification — the interop mirror of [`crate::epoch_verify`]
-//! (`docs/specs/interop-outbox-messaging-spec.md` §10).
+//! Remote-epoch verification — the interop mirror of [`crate::epoch_verify`].
 //!
 //! Deriving remote epochs is only half the guarantee, exactly as for L1
 //! epochs: without a checker, a buggy or malicious watcher/sealer produces a
 //! canonical stream whose interop lane nobody can re-derive and nothing
-//! notices. This module is the checker's PHASE-1 SKELETON:
+//! notices. This module checks two things:
 //!
 //! - **Pair-sequence rules, synchronous.** Per-origin `seq` monotonicity —
 //!   dense, no regress, no skip — plus record well-formedness (non-empty,
@@ -12,16 +11,11 @@
 //!   state, so they run inline on the exec thread and reject BEFORE the
 //!   record's messages execute. A violation is a chain fault: divergence
 //!   halt, the same posture as [`EpochFault`](crate::epoch_verify::EpochFault).
-//! - **Content-vs-origin, NOT YET.** Whether the batch matches what origin
-//!   chain A actually sent (re-derivation from A's feed under a §10 posture —
-//!   own-validator over DA / signed stream, or a validator attestation
-//!   quorum) needs a transport to A and per-pair trust config. That is a
-//!   later phase (E2, interop P2: attestation keys + quorum wiring); when it
-//!   lands it takes the [`crate::epoch_verify::EpochVerifier`] shape — a
-//!   background task with a deferred verdict, observed here on the next
-//!   record. Until then a fabricated-but-well-sequenced batch is NOT caught
-//!   by this validator alone; it IS caught by any peer running its own
-//!   validator of the origin (§10 posture A).
+//! - **Content-vs-origin, not checked here.** Whether the batch matches what
+//!   the origin chain actually sent needs a transport to the origin and
+//!   per-pair trust config. A fabricated-but-well-sequenced batch is not
+//!   caught by this validator alone; it is caught by any peer running its
+//!   own validator of the origin.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -37,7 +31,7 @@ use crate::metrics;
 /// disagreeing about it is a consensus fault, not a pair problem (§10's
 /// failure-semantics asymmetry).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RemoteEpochFault {
+pub(crate) enum RemoteEpochFault {
     /// The pair's seq went backwards (or repeated): `got < expected`.
     SeqRegressed {
         origin: u64,
@@ -65,6 +59,16 @@ pub enum RemoteEpochFault {
     /// the canonical id is position-derived, so a mismatch means the record
     /// was not produced by the shared derivation rule.
     SourceHashMismatch { origin: u64, seq: u64 },
+    /// `first_seq + index` overflows `u64` — a crafted or corrupt record.
+    /// `index` is either a message position (`< messages.len()`, the
+    /// density check) or `messages.len()` itself (the one-past cursor
+    /// [`RemoteEpochVerifier::observe`] forms after this record verifies).
+    /// Checked once, up front, so neither site re-derives the bound.
+    SeqOverflow {
+        origin: u64,
+        first_seq: u64,
+        index: usize,
+    },
 }
 
 impl std::fmt::Display for RemoteEpochFault {
@@ -108,6 +112,15 @@ impl std::fmt::Display for RemoteEpochFault {
                 "message (origin {origin}, seq {seq}) carries a source_hash that is not \
                  remote_source_hash(origin, seq)"
             ),
+            Self::SeqOverflow {
+                origin,
+                first_seq,
+                index,
+            } => write!(
+                f,
+                "remote-epoch record for origin {origin}: first_seq {first_seq} + index \
+                 {index} overflows u64 — a crafted or corrupt record"
+            ),
         }
     }
 }
@@ -117,13 +130,31 @@ impl std::fmt::Display for RemoteEpochFault {
 /// record for this origin — a resumed/late-joining validator legitimately
 /// starts mid-pair, mirroring [`crate::epoch_verify::check_sequence`]'s
 /// first-epoch exemption) plus record well-formedness.
-pub fn check_remote_epoch(
+pub(crate) fn check_remote_epoch(
     expected: Option<u64>,
     rec: &RemoteEpochRecord,
 ) -> Result<(), RemoteEpochFault> {
     let origin = rec.origin_chain_id;
     if rec.messages.is_empty() {
         return Err(RemoteEpochFault::Empty { origin });
+    }
+    // `first_seq` is wire data (the canonical-stream record), so its
+    // whole declared range must fit in `u64` before anything below reads
+    // an individual message's seq against it. This one check covers two
+    // sites: every `first_seq + i` the density loop computes for
+    // `i < len` (checked here at `index = len`, the largest offset that
+    // matters, since a smaller offset cannot overflow if the largest one
+    // does not), and the one-past cursor
+    // ([`RemoteEpochVerifier::observe`]'s `last_seq() + 1`, which is
+    // `first_seq + len`) — the same value. Checking it once here lets
+    // both use plain seq arithmetic afterward.
+    let len = rec.messages.len() as u64;
+    if rec.first_seq.checked_add(len).is_none() {
+        return Err(RemoteEpochFault::SeqOverflow {
+            origin,
+            first_seq: rec.first_seq,
+            index: rec.messages.len(),
+        });
     }
     if let Some(expected) = expected {
         if rec.first_seq < expected {
@@ -142,6 +173,8 @@ pub fn check_remote_epoch(
         }
     }
     for (i, msg) in rec.messages.iter().enumerate() {
+        // Bounded: `first_seq + len` fits (checked above) and `i < len`,
+        // so `first_seq + i` cannot overflow either.
         let want_seq = rec.first_seq + i as u64;
         if msg.seq != want_seq {
             return Err(RemoteEpochFault::NonDense {
@@ -186,12 +219,8 @@ impl RemoteEpochObserver for RemoteEpochVerifier {
         // A verdict recorded elsewhere (write-set/receipt divergence, or —
         // later phase — a deferred content check) lands here on the next
         // record, exactly like EpochVerifier.
-        if self.divergence.is_halted() {
-            return Err(ExecutorError::State(
-                self.divergence
-                    .reason()
-                    .unwrap_or_else(|| "validator halted".to_string()),
-            ));
+        if let Some(reason) = self.divergence.halt_reason("validator halted") {
+            return Err(ExecutorError::State(reason));
         }
         let expected = self.next_seq.get(&rec.origin_chain_id).copied();
         if let Err(fault) = check_remote_epoch(expected, rec) {
@@ -200,6 +229,9 @@ impl RemoteEpochObserver for RemoteEpochVerifier {
                 .record(format!("remote-epoch verification failed: {fault}"));
             return Err(ExecutorError::State(fault.to_string()));
         }
+        // Bounded: `check_remote_epoch` already proved `first_seq +
+        // messages.len()` fits in `u64` (the `SeqOverflow` check), and
+        // `last_seq() + 1` is exactly that value, so this cannot overflow.
         self.next_seq
             .insert(rec.origin_chain_id, rec.last_seq() + 1);
         metrics::counter_remote_epoch_verified();
@@ -228,7 +260,7 @@ mod tests {
                     target: Address::repeat_byte(0xB2),
                     value: 0,
                     gas_limit: 100_000,
-                    input: Default::default(),
+                    input: bytes::Bytes::default(),
                     callback: None,
                 })
                 .collect(),
@@ -300,6 +332,34 @@ mod tests {
             check_remote_epoch(None, &r),
             Err(RemoteEpochFault::SourceHashMismatch { origin: 7, seq: 0 })
         ));
+        // `first_seq` at the very top of `u64`: even one message makes
+        // `first_seq + len` overflow. Built directly (not through
+        // `record`'s `first_seq..first_seq + n` range, which would
+        // overflow constructing the fixture itself).
+        let overflowing = RemoteEpochRecord {
+            origin_chain_id: 7,
+            anchor_number: 40,
+            anchor_hash: B256::repeat_byte(0x0B),
+            first_seq: u64::MAX,
+            messages: vec![XChainMessage {
+                source_hash: remote_source_hash(7, u64::MAX),
+                seq: u64::MAX,
+                origin_sender: Address::repeat_byte(0xA1),
+                target: Address::repeat_byte(0xB2),
+                value: 0,
+                gas_limit: 100_000,
+                input: bytes::Bytes::default(),
+                callback: None,
+            }],
+        };
+        assert_eq!(
+            check_remote_epoch(None, &overflowing),
+            Err(RemoteEpochFault::SeqOverflow {
+                origin: 7,
+                first_seq: u64::MAX,
+                index: 1,
+            })
+        );
     }
 
     #[test]

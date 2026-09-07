@@ -22,12 +22,12 @@ const ADOPTION_MARKER: &str = ".adopted-needs-trie-bootstrap";
 
 /// Checkpoint adoption, cold-start half: a fresh validator joining a
 /// chain that outgrew the cluster retention window cannot re-execute
-/// from genesis, since REPLAY_FROM(genesis) is refused. So it adopts the
+/// from genesis, since `REPLAY_FROM(genesis)` is refused. So it adopts the
 /// newest staged or peer checkpoint before opening the env. Startup then
 /// resumes from its cursor, and only the tail replays. Blocks through
 /// the adopted checkpoint are unverified by this validator. The
 /// trustless alternative is a rebuild from L1.
-pub fn adopt_checkpoint_if_fresh(
+pub(crate) fn adopt_checkpoint_if_fresh(
     checkpoint_dir: Option<&Path>,
     state_dir: &Path,
     checkpoint_peers: &[String],
@@ -80,7 +80,7 @@ pub fn adopt_checkpoint_if_fresh(
 /// the marker is removed only after commit. `has_trie` stays as a
 /// backup check for a truly mirror-less image, such as an
 /// operator-copied directory.
-pub fn bootstrap_trie_if_adopted(state_dir: &Path, env: &StateEnv) -> Result<()> {
+pub(crate) fn bootstrap_trie_if_adopted(state_dir: &Path, env: &StateEnv) -> Result<()> {
     let adoption_marker = state_dir.join(ADOPTION_MARKER);
     if adoption_marker.exists() || !kardamom_state::has_trie(env).context("probe state trie")? {
         tracing::info!("adopted state image — bootstrapping hashed mirror + trie");
@@ -89,7 +89,7 @@ pub fn bootstrap_trie_if_adopted(state_dir: &Path, env: &StateEnv) -> Result<()>
             .context("bootstrap trie from adopted state")?;
         tracing::info!(
             state_root = %root,
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            elapsed_secs = started.elapsed().as_secs_f64(),
             "trie bootstrap complete"
         );
         if adoption_marker.exists() {
@@ -99,18 +99,17 @@ pub fn bootstrap_trie_if_adopted(state_dir: &Path, env: &StateEnv) -> Result<()>
     Ok(())
 }
 
-/// Replay-window overrun: repair before exiting, the same way as the
-/// executor's recovery-D path. Fetch a peer checkpoint at or above the
-/// retention floor, and park the stale DB, so the next restart takes the
-/// ordinary fresh-start restore path instead of a deterministic crash
-/// loop re-requesting the same refused REPLAY_FROM.
+/// Replay-window overrun: repair before exiting. Fetch a peer checkpoint
+/// at or above the retention floor, and park the stale DB, so the next
+/// restart takes the ordinary fresh-start restore path instead of a
+/// deterministic crash loop re-requesting the same refused `REPLAY_FROM`.
 ///
 /// The adopted state is unverified by this validator through the
 /// checkpoint block. This is an accepted tradeoff: the divergence latch
 /// only ever covers blocks this validator actually verified. The
 /// trustless alternative remains kardamom-reconstruct, a rebuild from L1,
 /// into --state-dir.
-pub fn resync_after_engine_error(
+pub(crate) fn resync_after_engine_error(
     cause: Option<&ExecutorError>,
     checkpoint_dir: Option<&Path>,
     checkpoint_peers: &[String],

@@ -19,7 +19,6 @@
 //! re-execution, and the missing frame already surfaced on the write-set
 //! path. A claim MISMATCH is a divergence halt.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +26,7 @@ use kardamom_engine::{CMessage, ExecutorError, TxReceiptsPublication};
 use kardamom_types::Receipt;
 use kardamom_types::xchain::OUTBOX;
 
+use crate::block_accum::BlockAccumulator;
 use crate::buffers::ClaimBuffer;
 use crate::interop::extract::collect_outbox_messages;
 use crate::interop::store::FeedStore;
@@ -36,7 +36,7 @@ use crate::{Divergence, metrics};
 /// unchecked. The BAL frame lands around the boundary (the write-set
 /// cross-check on the exec thread already waited for the same frame), so
 /// this is a margin, not an expected wait.
-pub const CLAIM_WAIT: Duration = Duration::from_secs(2);
+const CLAIM_WAIT: Duration = Duration::from_secs(2);
 
 pub struct ExtractingReceiptSink<P: TxReceiptsPublication> {
     inner: P,
@@ -45,7 +45,7 @@ pub struct ExtractingReceiptSink<P: TxReceiptsPublication> {
     store: Arc<FeedStore>,
     divergence: Arc<Divergence>,
     /// Blocks' outbox-relevant receipts accumulated since the last boundary.
-    pending: BTreeMap<u64, Vec<Receipt>>,
+    pending: BlockAccumulator<Receipt>,
     claim_wait: Duration,
 }
 
@@ -63,7 +63,7 @@ impl<P: TxReceiptsPublication> ExtractingReceiptSink<P> {
             claims,
             store,
             divergence,
-            pending: BTreeMap::new(),
+            pending: BlockAccumulator::new(),
             claim_wait: CLAIM_WAIT,
         }
     }
@@ -75,10 +75,14 @@ impl<P: TxReceiptsPublication> ExtractingReceiptSink<P> {
     }
 
     /// Extract every pending block up to and including `block`; every block
-    /// advances the store's retention head even when it sent nothing.
+    /// advances the store's retention head even when it sent nothing. A
+    /// block with no accumulated receipts is absent from `drain_through`'s
+    /// result, so it skips the per-block claims wait below entirely — the
+    /// trailing `append_block` call after the loop is what still advances
+    /// its retention head, without paying that wait for a block with
+    /// nothing to extract.
     fn flush_through(&mut self, block: u64) -> Result<(), ExecutorError> {
-        let tail = self.pending.split_off(&(block + 1));
-        let flushed = std::mem::replace(&mut self.pending, tail);
+        let flushed = self.pending.drain_through(block);
         for (b, receipts) in flushed {
             let claims = self.claims.take(b, self.claim_wait);
             if claims.is_none() {
@@ -98,8 +102,7 @@ impl<P: TxReceiptsPublication> ExtractingReceiptSink<P> {
                 Ok(msgs) => msgs,
                 Err(fault) => {
                     let reason = format!("outbox extraction failed: {fault}");
-                    self.divergence.record(reason.clone());
-                    return Err(ExecutorError::Divergence(reason));
+                    return Err(ExecutorError::Divergence(self.divergence.halt(reason)));
                 }
             };
             metrics::counter_outbox_extracted(msgs.len());
@@ -121,10 +124,7 @@ impl<P: TxReceiptsPublication> TxReceiptsPublication for ExtractingReceiptSink<P
         match &msg {
             CMessage::Receipt(r) => {
                 if r.logs.iter().any(|l| l.address == OUTBOX) {
-                    self.pending
-                        .entry(r.block_number)
-                        .or_default()
-                        .push(r.clone());
+                    self.pending.push(r.block_number, r.clone());
                 }
             }
             CMessage::BlockBoundary(b) => boundary = Some(b.block_number),
@@ -146,6 +146,10 @@ mod tests {
     use crate::interop::extract::sent_messages_slot;
     use crate::interop::extract::tests_support::{honest_sent_log, log_msg_hash};
     use crate::parallel::ClaimIndex;
+
+    fn nz(n: u64) -> std::num::NonZeroU64 {
+        std::num::NonZeroU64::new(n).expect("fixture retention")
+    }
 
     struct OkSink;
     impl TxReceiptsPublication for OkSink {
@@ -177,7 +181,7 @@ mod tests {
     #[test]
     fn extracts_at_the_boundary_with_matching_claims() {
         let claims = ClaimBuffer::new();
-        let store = Arc::new(FeedStore::new(CHAIN, 100));
+        let store = Arc::new(FeedStore::new(CHAIN, nz(100)));
         let div = Divergence::new();
         let mut sink =
             ExtractingReceiptSink::new(OkSink, CHAIN, claims.clone(), store.clone(), div.clone());
@@ -188,7 +192,7 @@ mod tests {
             .entry((OUTBOX, sent_messages_slot(log_msg_hash(&log))))
             .or_default()
             .push((1, U256::ONE));
-        claims.insert(5, 1, idx);
+        claims.insert(5, std::num::NonZeroU16::MIN, idx);
 
         sink.publish(receipt(5, 0, vec![log])).unwrap();
         sink.publish(boundary(5)).unwrap();
@@ -202,7 +206,7 @@ mod tests {
     #[test]
     fn a_claim_mismatch_halts_and_never_serves() {
         let claims = ClaimBuffer::new();
-        let store = Arc::new(FeedStore::new(CHAIN, 100));
+        let store = Arc::new(FeedStore::new(CHAIN, nz(100)));
         let div = Divergence::new();
         let mut sink =
             ExtractingReceiptSink::new(OkSink, CHAIN, claims.clone(), store.clone(), div.clone())
@@ -215,7 +219,7 @@ mod tests {
             .entry((OUTBOX, B256::repeat_byte(0x77)))
             .or_default()
             .push((1, U256::ONE));
-        claims.insert(5, 1, idx);
+        claims.insert(5, std::num::NonZeroU16::MIN, idx);
 
         sink.publish(receipt(5, 0, vec![log])).unwrap();
         let err = sink.publish(boundary(5)).unwrap_err();
@@ -229,7 +233,7 @@ mod tests {
     #[test]
     fn missing_claims_serve_unchecked_not_halt() {
         let claims = ClaimBuffer::new();
-        let store = Arc::new(FeedStore::new(CHAIN, 100));
+        let store = Arc::new(FeedStore::new(CHAIN, nz(100)));
         let div = Divergence::new();
         let mut sink =
             ExtractingReceiptSink::new(OkSink, CHAIN, claims, store.clone(), div.clone())
@@ -251,7 +255,7 @@ mod tests {
     #[test]
     fn boundaries_advance_retention_for_empty_blocks() {
         let claims = ClaimBuffer::new();
-        let store = Arc::new(FeedStore::new(CHAIN, 2));
+        let store = Arc::new(FeedStore::new(CHAIN, nz(2)));
         let div = Divergence::new();
         let mut sink =
             ExtractingReceiptSink::new(OkSink, CHAIN, claims.clone(), store.clone(), div)

@@ -1,7 +1,6 @@
-//! The validator's serving surfaces (spec §5, egress spec E1): a jsonrpsee
-//! WS server — the validator's first; until now it exposed only Prometheus
-//! metrics — implementing the shared wire contract
-//! (`kardamom-interop-feed`): `kardamom_subscribeOutbox` from the
+//! The validator's serving surfaces: a jsonrpsee WS server implementing
+//! the shared wire contract (`kardamom-interop-feed`):
+//! `kardamom_subscribeOutbox` from the
 //! [`FeedStore`] and `kardamom_subscribeAttestations` from the
 //! [`AttestationStore`]. OFF by default; enabled by `--serve-feed`.
 //!
@@ -21,6 +20,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use alloy_primitives::B256;
 use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::server::{PendingSubscriptionSink, Server, ServerHandle, SubscriptionSink};
 use kardamom_interop_feed::{
@@ -47,6 +47,56 @@ async fn send_event<T: serde::Serialize>(sink: &SubscriptionSink, event: &T) -> 
     sink.send(msg).await.map_err(|_| ())
 }
 
+/// The subscription loop shared by both feeds: cursor-honoring backfill
+/// first, then live items as the store appends, until the sink closes or
+/// the store shuts down. `scan(next)` returns the items retained from
+/// `next` and the lane's retention floor. `lagged(skipped)` builds the
+/// wire frame for a cursor that aged out of retention. `item(&I)` builds
+/// one item's wire frame plus the cursor value to advance to after
+/// sending it. Sync callbacks only: the store reads are lock-and-return,
+/// no I/O, so only this function's own send/wait steps are async — the one
+/// place either feed's per-item loop needs to nest inside the outer
+/// scan-and-wait loop.
+async fn serve_cursor_feed<I, E: serde::Serialize>(
+    sink: &SubscriptionSink,
+    mut wake: tokio::sync::watch::Receiver<u64>,
+    start: u64,
+    scan: impl Fn(u64) -> (Vec<I>, u64),
+    lagged: impl Fn(u64) -> E,
+    item: impl Fn(&I) -> (E, u64),
+) -> SubscriptionResult {
+    let mut next = start;
+    loop {
+        let (items, floor) = scan(next);
+        if next < floor {
+            // The cursor aged out of retention: name the loss, then serve
+            // what is retained (the subscriber re-subscribes from its own
+            // cursor regardless — Lagged is not a read-on). Bounded: the
+            // guarding `if` proves `floor > next`.
+            if send_event(sink, &lagged(floor - next)).await.is_err() {
+                return Ok(());
+            }
+            next = floor;
+            continue;
+        }
+        for it in &items {
+            let (ev, advance_to) = item(it);
+            if send_event(sink, &ev).await.is_err() {
+                return Ok(());
+            }
+            next = advance_to;
+        }
+        tokio::select! {
+            () = sink.closed() => return Ok(()),
+            r = wake.changed() => {
+                if r.is_err() {
+                    return Ok(()); // store gone — shutdown
+                }
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl OutboxFeedApiServer for Handler {
     async fn subscribe_outbox(
@@ -56,43 +106,25 @@ impl OutboxFeedApiServer for Handler {
         cursor: OutboxCursor,
     ) -> SubscriptionResult {
         // Tap before accept: nothing appended in between may be missed.
-        let mut wake = self.state.store.subscribe();
+        let wake = self.state.store.subscribe();
         let sink = pending.accept().await?;
         let origin = self.state.store.origin_chain_id();
-        let mut next = cursor.seq;
-        loop {
-            let (msgs, floor) = self.state.store.from_seq(dest_chain_id, next);
-            if next < floor {
-                // The cursor aged out of retention: name the loss, then
-                // serve what is retained (the subscriber re-subscribes from
-                // its own cursor regardless — Lagged is not a read-on).
-                let ev = OutboxEventDto::Lagged {
-                    skipped: floor - next,
-                };
-                if send_event(&sink, &ev).await.is_err() {
-                    return Ok(());
-                }
-                next = floor;
-                continue;
-            }
-            for m in &msgs {
+        serve_cursor_feed(
+            &sink,
+            wake,
+            cursor.seq,
+            |next| self.state.store.from_seq(dest_chain_id, next),
+            |skipped| OutboxEventDto::Lagged { skipped },
+            |m: &kardamom_types::xchain::OutboxMessage| {
                 let ev = OutboxEventDto::Message(Box::new(OutboxMessageDto::from_outbox_message(
                     origin, m,
                 )));
-                if send_event(&sink, &ev).await.is_err() {
-                    return Ok(());
-                }
-                next = m.seq + 1;
-            }
-            tokio::select! {
-                () = sink.closed() => return Ok(()),
-                r = wake.changed() => {
-                    if r.is_err() {
-                        return Ok(()); // store gone — shutdown
-                    }
-                }
-            }
-        }
+                // A wrap here (`m.seq == u64::MAX`) would stall the
+                // subscriber's cursor instead of advancing it.
+                (ev, m.seq.saturating_add(1))
+            },
+        )
+        .await
     }
 }
 
@@ -103,50 +135,39 @@ impl AttestationFeedApiServer for Handler {
         pending: PendingSubscriptionSink,
         cursor: AttestationCursor,
     ) -> SubscriptionResult {
-        let mut wake = self.state.attestations.subscribe();
+        let wake = self.state.attestations.subscribe();
         let sink = pending.accept().await?;
-        let mut next = cursor.block_number;
-        loop {
-            let (atts, floor) = self.state.attestations.from_block(next);
-            if next < floor {
-                let ev = AttestationEventDto::Lagged {
-                    skipped: floor - next,
-                };
-                if send_event(&sink, &ev).await.is_err() {
-                    return Ok(());
-                }
-                next = floor;
-                continue;
-            }
-            for (block, root) in &atts {
+        serve_cursor_feed(
+            &sink,
+            wake,
+            cursor.block_number,
+            |next| self.state.attestations.from_block(next),
+            |skipped| AttestationEventDto::Lagged { skipped },
+            |(block, root): &(u64, B256)| {
                 let ev = AttestationEventDto::Attestation(Box::new(AttestationDto {
                     chain_id: self.state.chain_id,
                     block_number: *block,
                     state_root: *root,
                     validator_id: self.state.validator_id.clone(),
-                    // UNSIGNED in E1 — E2 adds the per-validator key; the
-                    // wire field is already optional (see the DTO docs).
+                    // Attestations are unsigned; the wire field is
+                    // already optional (see the DTO docs).
                     signature: None,
                 }));
-                if send_event(&sink, &ev).await.is_err() {
-                    return Ok(());
-                }
-                next = block + 1;
-            }
-            tokio::select! {
-                () = sink.closed() => return Ok(()),
-                r = wake.changed() => {
-                    if r.is_err() {
-                        return Ok(());
-                    }
-                }
-            }
-        }
+                // A wrap here (`block == u64::MAX`) would stall the
+                // subscriber's cursor instead of advancing it.
+                (ev, block.saturating_add(1))
+            },
+        )
+        .await
     }
 }
 
 /// Start the feed server. Returns the bound address and the handle whose
 /// drop shuts the server down (hold it for the process lifetime).
+///
+/// # Errors
+///
+/// Returns an error if the server cannot bind `addr`.
 pub async fn start_feed_server(
     addr: SocketAddr,
     state: FeedServerState,
@@ -169,7 +190,7 @@ pub async fn start_feed_server(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, B256};
+    use alloy_primitives::B256;
     use jsonrpsee::core::client::{Subscription, SubscriptionClientT};
     use jsonrpsee::rpc_params;
     use jsonrpsee::ws_client::WsClientBuilder;
@@ -179,22 +200,15 @@ mod tests {
     };
     use kardamom_types::xchain::OutboxMessage;
 
+    fn nz(n: u64) -> std::num::NonZeroU64 {
+        std::num::NonZeroU64::new(n).expect("fixture retention")
+    }
+
     const CHAIN: u64 = 412_346;
     const DEST: u64 = 412_347;
 
     fn msg(seq: u64, block: u64) -> OutboxMessage {
-        OutboxMessage {
-            origin_block_number: block,
-            origin_block_hash: B256::repeat_byte(block as u8),
-            dest_chain_id: DEST,
-            seq,
-            sender: Address::repeat_byte(0xA1),
-            target: Address::repeat_byte(0xB2),
-            value: 0,
-            gas_limit: 100_000,
-            data: Default::default(),
-            callback: None,
-        }
+        crate::interop::outbox_msg(DEST, seq, block)
     }
 
     async fn spawn(
@@ -218,8 +232,8 @@ mod tests {
     /// speaking exactly the watcher's wire protocol.
     #[tokio::test]
     async fn outbox_subscription_backfills_then_streams() {
-        let store = Arc::new(FeedStore::new(CHAIN, 100));
-        let atts = Arc::new(AttestationStore::new(100));
+        let store = Arc::new(FeedStore::new(CHAIN, nz(100)));
+        let atts = Arc::new(AttestationStore::new(nz(100)));
         store.append_block(1, vec![msg(0, 1), msg(1, 1)]);
         let (addr, _handle) = spawn(store.clone(), atts).await;
 
@@ -255,8 +269,8 @@ mod tests {
     /// loss, then the retained suffix.
     #[tokio::test]
     async fn outbox_cursor_below_retention_is_lagged() {
-        let store = Arc::new(FeedStore::new(CHAIN, 2));
-        let atts = Arc::new(AttestationStore::new(100));
+        let store = Arc::new(FeedStore::new(CHAIN, nz(2)));
+        let atts = Arc::new(AttestationStore::new(nz(100)));
         store.append_block(1, vec![msg(0, 1), msg(1, 1)]);
         store.append_block(5, vec![msg(2, 5)]);
         // head 5, retention 2 -> block-1 messages pruned, floor = 2.
@@ -287,8 +301,8 @@ mod tests {
 
     #[tokio::test]
     async fn attestations_stream_unsigned_with_cursor() {
-        let store = Arc::new(FeedStore::new(CHAIN, 100));
-        let atts = Arc::new(AttestationStore::new(100));
+        let store = Arc::new(FeedStore::new(CHAIN, nz(100)));
+        let atts = Arc::new(AttestationStore::new(nz(100)));
         atts.push(1, B256::repeat_byte(0x01));
         atts.push(2, B256::repeat_byte(0x02));
         let (addr, _handle) = spawn(store, atts.clone()).await;
