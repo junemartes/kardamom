@@ -34,6 +34,7 @@ pub const NODE_DOMAIN: u8 = 0x01;
 pub const MESSAGE_PASSER: Address = address!("0x4200000000000000000000000000000000000016");
 
 /// `keccak256` of the `MessagePassed` event signature (topic0).
+#[must_use]
 pub fn message_passed_topic0() -> B256 {
     keccak256("MessagePassed(uint256,address,address,uint256,bytes32)")
 }
@@ -52,6 +53,7 @@ pub fn message_passed_topic0() -> B256 {
 /// address indexed target, uint256 value, bytes32 withdrawalHash)`.
 /// `topics = [topic0, nonce, sender, target]`.
 /// `data = value(32) ++ hash(32)`.
+#[must_use]
 pub fn decode_message_passed(topics: &[B256], data: &[u8]) -> Option<(U256, B256)> {
     if topics.len() != 4 || topics[0] != message_passed_topic0() || data.len() != 64 {
         return None;
@@ -73,23 +75,31 @@ pub fn decode_message_passed(topics: &[B256], data: &[u8]) -> Option<(U256, B256
 /// `abi.encode` lays out each static value as one 32-byte word: `nonce`
 /// and `value` big-endian, `sender` and `target` right-aligned (12 zero
 /// bytes, then the 20 address bytes).
+#[must_use]
 pub fn withdrawal_leaf(nonce: U256, sender: Address, target: Address, value: U256) -> B256 {
     let mut buf = [0u8; 128];
-    buf[0..32].copy_from_slice(&nonce.to_be_bytes::<32>());
-    buf[44..64].copy_from_slice(sender.as_slice());
-    buf[76..96].copy_from_slice(target.as_slice());
-    buf[96..128].copy_from_slice(&value.to_be_bytes::<32>());
+    buf[0..32].copy_from_slice(&crate::abi::word_u256(nonce));
+    buf[32..64].copy_from_slice(&crate::abi::word_address(sender));
+    buf[64..96].copy_from_slice(&crate::abi::word_address(target));
+    buf[96..128].copy_from_slice(&crate::abi::word_u256(value));
+    keccak256(buf)
+}
+
+/// `keccak256(tag ++ a ++ b)`: one domain-tag byte, then two 32-byte
+/// words. [`hash_pair`] and [`output_root`] both mirror this exact
+/// on-chain shape, under different tags.
+fn tagged_hash2(tag: u8, a: B256, b: B256) -> B256 {
+    let mut buf = [0u8; 65];
+    buf[0] = tag;
+    buf[1..33].copy_from_slice(a.as_slice());
+    buf[33..65].copy_from_slice(b.as_slice());
     keccak256(buf)
 }
 
 /// `keccak256(NODE_DOMAIN ++ left ++ right)`. This is one internal node of
 /// the withdrawals tree.
 fn hash_pair(left: B256, right: B256) -> B256 {
-    let mut buf = [0u8; 65];
-    buf[0] = NODE_DOMAIN;
-    buf[1..33].copy_from_slice(left.as_slice());
-    buf[33..65].copy_from_slice(right.as_slice());
-    keccak256(buf)
+    tagged_hash2(NODE_DOMAIN, left, right)
 }
 
 /// `keccak256(LEAF_DOMAIN ++ withdrawal_hash)`. This lifts a withdrawal
@@ -106,7 +116,9 @@ fn hash_leaf(leaf: B256) -> B256 {
 /// convention that the on-chain positional verifier reconstructs.
 fn leaf_level(leaves: &[B256]) -> Vec<B256> {
     let mut level = leaves.to_vec();
-    let target = level.len().next_power_of_two().max(1);
+    // `0usize.next_power_of_two()` is already 1, so the empty case needs
+    // no extra floor.
+    let target = level.len().next_power_of_two();
     level.resize(target, B256::ZERO);
     level.into_iter().map(hash_leaf).collect()
 }
@@ -114,6 +126,7 @@ fn leaf_level(leaves: &[B256]) -> Vec<B256> {
 /// Merkle root over `leaves`: withdrawal hashes, in withdrawal-nonce order
 /// within the output's block range. An empty input gives `B256::ZERO`. A
 /// single leaf gives `hash_leaf(leaf)`.
+#[must_use]
 pub fn withdrawals_root(leaves: &[B256]) -> B256 {
     if leaves.is_empty() {
         return B256::ZERO;
@@ -128,7 +141,20 @@ pub fn withdrawals_root(leaves: &[B256]) -> B256 {
 /// Sibling path for the leaf at `index`, from the bottom up. Its length
 /// equals the tree depth (`0` for a single-leaf tree). It pairs with
 /// [`withdrawals_root`], and `ETHLockbox._merkleRoot` verifies it.
+///
+/// # Panics
+///
+/// Panics if `leaves` is empty or `index >= leaves.len()`. Without this
+/// check, `index = usize::MAX` wraps `idx + 1` back to a small in-range
+/// value and returns a wrong sibling with no panic at all — this bound
+/// turns that into a loud, immediate failure instead.
+#[must_use]
 pub fn withdrawal_proof(leaves: &[B256], index: usize) -> Vec<B256> {
+    assert!(
+        index < leaves.len(),
+        "withdrawal_proof: index {index} out of range for {} leaves",
+        leaves.len()
+    );
     let mut level = leaf_level(leaves);
     let mut idx = index;
     let mut proof = Vec::new();
@@ -146,8 +172,10 @@ pub fn withdrawal_proof(leaves: &[B256], index: usize) -> Vec<B256> {
 }
 
 /// Recompute a root from a leaf (a withdrawal hash), its index, and its
-/// sibling proof. Mirrors the on-chain `ETHLockbox._merkleRoot`. Used to
-/// self-check generated proofs.
+/// sibling proof. Mirrors the on-chain `ETHLockbox._merkleRoot`. The
+/// reference verifier: a proof consumer runs this same rule against the
+/// proof `crate::withdrawals` generated.
+#[must_use]
 pub fn recompute_root(leaf: B256, index: usize, proof: &[B256]) -> B256 {
     let mut node = hash_leaf(leaf);
     let mut idx = index;
@@ -163,12 +191,9 @@ pub fn recompute_root(leaf: B256, index: usize, proof: &[B256]) -> B256 {
 }
 
 /// Output root: `keccak256(abi.encodePacked(OUTPUT_VERSION, state_root, withdrawals_root))`.
+#[must_use]
 pub fn output_root(state_root: B256, withdrawals_root: B256) -> B256 {
-    let mut buf = [0u8; 65];
-    buf[0] = OUTPUT_VERSION;
-    buf[1..33].copy_from_slice(state_root.as_slice());
-    buf[33..65].copy_from_slice(withdrawals_root.as_slice());
-    keccak256(buf)
+    tagged_hash2(OUTPUT_VERSION, state_root, withdrawals_root)
 }
 
 #[cfg(test)]
@@ -218,15 +243,20 @@ mod tests {
         assert_ne!(hash_leaf(a), hash_pair(a, b));
     }
 
+    /// Every leaf's proof recomputes `root`, for one tree of size `n`.
+    fn assert_proofs_recompute_root(leaves: &[B256], root: B256, n: usize) {
+        for (i, &l) in leaves.iter().enumerate() {
+            let proof = withdrawal_proof(leaves, i);
+            assert_eq!(recompute_root(l, i, &proof), root, "n={n} i={i}");
+        }
+    }
+
     #[test]
     fn proofs_recompute_root_all_sizes() {
         for n in 1..=9usize {
             let leaves: Vec<B256> = (0..n as u64).map(leaf).collect();
             let root = withdrawals_root(&leaves);
-            for (i, &l) in leaves.iter().enumerate() {
-                let proof = withdrawal_proof(&leaves, i);
-                assert_eq!(recompute_root(l, i, &proof), root, "n={n} i={i}");
-            }
+            assert_proofs_recompute_root(&leaves, root, n);
         }
     }
 
@@ -270,7 +300,7 @@ mod tests {
         let (topics, mut data) = message_passed(7, s, t, 1_000);
         data[63] ^= 0x01; // corrupt the event-carried withdrawal hash
         assert!(decode_message_passed(&topics, &data).is_none());
-        // A tampered field (value) also no longer matches the carried hash.
+        // A tampered value does not match the carried hash either.
         let (topics, mut data) = message_passed(7, s, t, 1_000);
         data[31] ^= 0x01;
         assert!(decode_message_passed(&topics, &data).is_none());
@@ -292,5 +322,14 @@ mod tests {
         let a = output_root(sr, wr);
         assert_eq!(a, output_root(sr, wr));
         assert_ne!(a, output_root(wr, sr));
+    }
+
+    #[test]
+    #[should_panic(expected = "index 3 out of range for 3 leaves")]
+    fn withdrawal_proof_rejects_an_out_of_range_index() {
+        // Defect: an unchecked `index` let `idx + 1` wrap past `usize::MAX`
+        // back into range and return a wrong sibling with no panic at all.
+        let leaves: Vec<B256> = (0..3u64).map(leaf).collect();
+        let _ = withdrawal_proof(&leaves, 3);
     }
 }

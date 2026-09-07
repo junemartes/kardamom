@@ -41,6 +41,7 @@ impl Genesis {
     /// a [`crate::delta::CodeEntry`]. This shared builder keeps the
     /// rebuild-from-L1 reconstructor's genesis identical, byte for byte, to
     /// the live executor's genesis, so their state roots match.
+    #[must_use]
     pub fn to_alloc(&self) -> (Vec<crate::AccountChange>, Vec<crate::delta::CodeEntry>) {
         use alloy_primitives::{B256, keccak256};
         let mut accounts = Vec::with_capacity(self.alloc.len());
@@ -50,8 +51,7 @@ impl Genesis {
             let code_hash = entry
                 .code
                 .as_ref()
-                .map(|c| keccak256(c.as_ref()))
-                .unwrap_or(B256::ZERO);
+                .map_or(B256::ZERO, |c| keccak256(c.as_ref()));
             accounts.push(crate::AccountChange {
                 address: entry.address,
                 nonce,
@@ -69,17 +69,24 @@ impl Genesis {
     }
 
     /// Checks rules that the type and derive cannot express.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenesisError::ZeroChainId`] if `chain_id` is 0, or
+    /// [`GenesisError::DuplicateAlloc`] if two allocation entries share an
+    /// address.
     pub fn validate(&self) -> Result<(), GenesisError> {
         if self.chain_id == 0 {
             return Err(GenesisError::ZeroChainId);
         }
         let mut seen = alloc::collections::BTreeSet::new();
-        for entry in &self.alloc {
-            if !seen.insert(entry.address) {
-                return Err(GenesisError::DuplicateAlloc(entry.address));
+        self.alloc.iter().try_for_each(|entry| {
+            if seen.insert(entry.address) {
+                Ok(())
+            } else {
+                Err(GenesisError::DuplicateAlloc(entry.address))
             }
-        }
-        Ok(())
+        })
     }
 }
 

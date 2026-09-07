@@ -1,6 +1,8 @@
 //! Deep table-level comparison between two state DBs: [`deep_compare`]
 //! and its receipt field-diff helper.
 
+use signet_libmdbx::tx::aliases::RwTxSync;
+
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::{
@@ -12,6 +14,15 @@ use crate::schema::{
     TABLE_TX_HASH_INDEX, decode_receipt_value,
 };
 
+const SHARED_TABLES: &[&str] = &[
+    TABLE_ACCOUNTS,
+    TABLE_STORAGE,
+    TABLE_CODE,
+    TABLE_HEADERS,
+    TABLE_RECEIPTS,
+    TABLE_TX_HASH_INDEX,
+];
+
 /// A byte-level comparison of the chain-state tables of two DBs.
 /// Canonically, one is an executor's DB and the other is a validator's.
 ///
@@ -21,40 +32,66 @@ use crate::schema::{
 /// This comparison excludes trie tables and per-node meta, such as the
 /// fsync watermark and `state_root`. Only the validator maintains a
 /// trie, and [`super::sweep`] verifies it.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if either DB's transaction, table open, or
+/// cursor read fails.
 pub fn deep_compare(a: &StateEnv, b: &StateEnv) -> Result<Vec<String>, StateError> {
-    const SHARED_TABLES: &[&str] = &[
-        TABLE_ACCOUNTS,
-        TABLE_STORAGE,
-        TABLE_CODE,
-        TABLE_HEADERS,
-        TABLE_RECEIPTS,
-        TABLE_TX_HASH_INDEX,
-    ];
-    const MAX_DIFFS_PER_TABLE: usize = 8;
-
     let ta = a.raw().begin_rw_sync()?;
     let tb = b.raw().begin_rw_sync()?;
     let mut diffs = Vec::new();
-
     for table in SHARED_TABLES {
-        let da = ta.open_db(Some(table))?;
-        let db = tb.open_db(Some(table))?;
-        let mut ca = ta.cursor(da)?;
-        let mut cb = tb.cursor(db)?;
+        diffs.extend(TableCompare::new(&ta, &tb, table).run()?);
+    }
+    diffs.extend(TableCompare::meta_keys(&ta, &tb)?);
+    Ok(diffs)
+}
+
+/// A dual-cursor merge of one shared table between two DBs' transactions.
+/// Advances the smaller side on a key mismatch to resynchronize, and stops
+/// early once the table has reported `MAX_DIFFS_PER_TABLE` differences.
+struct TableCompare<'a> {
+    ta: &'a RwTxSync,
+    tb: &'a RwTxSync,
+    table: &'a str,
+    diffs: Vec<String>,
+}
+
+impl<'a> TableCompare<'a> {
+    fn new(ta: &'a RwTxSync, tb: &'a RwTxSync, table: &'a str) -> Self {
+        Self {
+            ta,
+            tb,
+            table,
+            diffs: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, message: String) {
+        self.diffs.push(message);
+    }
+
+    fn run(mut self) -> Result<Vec<String>, StateError> {
+        const MAX_DIFFS_PER_TABLE: usize = 8;
+
+        let da = self.ta.open_db(Some(self.table))?;
+        let db = self.tb.open_db(Some(self.table))?;
+        let mut ca = self.ta.cursor(da)?;
+        let mut cb = self.tb.cursor(db)?;
         let mut ia = ca.first::<Vec<u8>, Vec<u8>>()?;
         let mut ib = cb.first::<Vec<u8>, Vec<u8>>()?;
-        let mut table_diffs = 0usize;
-        while table_diffs < MAX_DIFFS_PER_TABLE {
+        while self.diffs.len() < MAX_DIFFS_PER_TABLE {
             match (&ia, &ib) {
                 (None, None) => break,
                 (Some((ka, va)), Some((kb, vb))) => {
                     if ka != kb {
-                        diffs.push(format!(
-                            "{table}: key mismatch a={:02x?} b={:02x?}",
-                            &ka[..ka.len().min(8)],
-                            &kb[..kb.len().min(8)]
+                        self.push(format!(
+                            "{}: key mismatch a={:02x?} b={:02x?}",
+                            self.table,
+                            super::head(ka),
+                            super::head(kb)
                         ));
-                        table_diffs += 1;
                         // Advance the smaller side to resynchronize.
                         if ka < kb {
                             ia = ca.next::<Vec<u8>, Vec<u8>>()?;
@@ -64,77 +101,83 @@ pub fn deep_compare(a: &StateEnv, b: &StateEnv) -> Result<Vec<String>, StateErro
                         continue;
                     }
                     if va != vb {
-                        // Byte lengths alone do not say what diverged.
-                        // "224 vs 224 bytes" is the shape a fixed-width field
-                        // mismatch takes, and chasing it from CI logs is
-                        // guesswork. Receipts decode, so name the fields instead.
-                        let detail = if *table == TABLE_RECEIPTS {
-                            receipt_field_diff(va, vb)
-                        } else {
-                            None
-                        };
-                        match detail {
-                            Some(d) => {
-                                diffs.push(format!("{table}[{:02x?}]: {d}", &ka[..ka.len().min(8)]))
-                            }
-                            None => diffs.push(format!(
-                                "{table}[{:02x?}]: values differ ({} vs {} bytes)",
-                                &ka[..ka.len().min(8)],
-                                va.len(),
-                                vb.len()
-                            )),
-                        }
-                        table_diffs += 1;
+                        let message = self.value_diff_message(ka, va, vb);
+                        self.push(message);
                     }
                     ia = ca.next::<Vec<u8>, Vec<u8>>()?;
                     ib = cb.next::<Vec<u8>, Vec<u8>>()?;
                 }
                 (Some((ka, _)), None) => {
-                    diffs.push(format!(
-                        "{table}: extra key in a: {:02x?}",
-                        &ka[..ka.len().min(8)]
+                    self.push(format!(
+                        "{}: extra key in a: {:02x?}",
+                        self.table,
+                        super::head(ka)
                     ));
-                    table_diffs += 1;
                     ia = ca.next::<Vec<u8>, Vec<u8>>()?;
                 }
                 (None, Some((kb, _))) => {
-                    diffs.push(format!(
-                        "{table}: extra key in b: {:02x?}",
-                        &kb[..kb.len().min(8)]
+                    self.push(format!(
+                        "{}: extra key in b: {:02x?}",
+                        self.table,
+                        super::head(kb)
                     ));
-                    table_diffs += 1;
                     ib = cb.next::<Vec<u8>, Vec<u8>>()?;
                 }
             }
         }
-        if table_diffs >= MAX_DIFFS_PER_TABLE {
-            diffs.push(format!("{table}: further diffs truncated"));
+        if self.diffs.len() >= MAX_DIFFS_PER_TABLE {
+            self.push(format!("{}: further diffs truncated", self.table));
+        }
+        Ok(self.diffs)
+    }
+
+    /// One value-mismatch message for `key` in this table. Byte lengths
+    /// alone do not say what diverged. "224 vs 224 bytes" is the shape a
+    /// fixed-width field mismatch takes, and chasing it from CI logs is
+    /// guesswork. Receipts decode, so this names the fields instead.
+    fn value_diff_message(&self, key: &[u8], va: &[u8], vb: &[u8]) -> String {
+        let detail = if self.table == TABLE_RECEIPTS {
+            receipt_field_diff(va, vb)
+        } else {
+            None
+        };
+        match detail {
+            Some(d) => format!("{}[{:02x?}]: {d}", self.table, super::head(key)),
+            None => format!(
+                "{}[{:02x?}]: values differ ({} vs {} bytes)",
+                self.table,
+                super::head(key),
+                va.len(),
+                vb.len()
+            ),
         }
     }
 
-    // Shared meta cursors must agree. Per-node keys, such as the fsync
-    // watermark and `state_root`, are excluded by design.
-    let ma = ta.open_db(Some(TABLE_META))?;
-    let mb = tb.open_db(Some(TABLE_META))?;
-    for key in [
-        KEY_LAST_COMMITTED_BLOCK,
-        KEY_LAST_COMMITTED_END_TX_POSITION,
-        KEY_GENESIS_DIGEST,
-        KEY_SCHEMA_VERSION,
-    ] {
-        let va = ta.get::<Vec<u8>>(ma.dbi(), key)?;
-        let vb = tb.get::<Vec<u8>>(mb.dbi(), key)?;
-        if va != vb {
-            diffs.push(format!(
-                "meta[{}]: {:02x?} vs {:02x?}",
-                String::from_utf8_lossy(key),
-                va.as_deref().map(|v| &v[..v.len().min(8)]),
-                vb.as_deref().map(|v| &v[..v.len().min(8)])
-            ));
+    /// Compare the shared meta cursors. Per-node keys, such as the fsync
+    /// watermark and `state_root`, are excluded by design.
+    fn meta_keys(ta: &'a RwTxSync, tb: &'a RwTxSync) -> Result<Vec<String>, StateError> {
+        let mut diffs = Vec::new();
+        let ma = ta.open_db(Some(TABLE_META))?;
+        let mb = tb.open_db(Some(TABLE_META))?;
+        for key in [
+            KEY_LAST_COMMITTED_BLOCK,
+            KEY_LAST_COMMITTED_END_TX_POSITION,
+            KEY_GENESIS_DIGEST,
+            KEY_SCHEMA_VERSION,
+        ] {
+            let va = ta.get::<Vec<u8>>(ma.dbi(), key)?;
+            let vb = tb.get::<Vec<u8>>(mb.dbi(), key)?;
+            if va != vb {
+                diffs.push(format!(
+                    "meta[{}]: {:02x?} vs {:02x?}",
+                    String::from_utf8_lossy(key),
+                    va.as_deref().map(super::head),
+                    vb.as_deref().map(super::head)
+                ));
+            }
         }
+        Ok(diffs)
     }
-
-    Ok(diffs)
 }
 
 /// A field-level diff of two encoded receipts, for the deep-compare

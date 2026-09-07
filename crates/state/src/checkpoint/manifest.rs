@@ -16,12 +16,11 @@ use super::checkpoint_data_file;
 ///
 /// A checkpoint is a bare mdbx image. Renaming it into place makes it
 /// atomic against torn writes, but the file itself does not describe
-/// itself. Nothing binds it to a chain, and the peer transfer is plain
-/// HTTP with no checksum. Without a manifest, three failures were
-/// silent: bytes corrupted at rest or in flight, a truncated fetch, and
-/// a checkpoint from a previous chain adopted by a fresh node. That last
-/// case made the node request a canonical index its chain never had, and
-/// loop forever.
+/// itself. The manifest binds the image to a chain and to its bytes: it
+/// catches corruption at rest or in flight, a truncated fetch, and a
+/// checkpoint from a previous chain that a fresh node would otherwise
+/// adopt and then loop forever requesting a canonical index its chain
+/// never had.
 ///
 /// The validator adopts peer checkpoints and bootstraps its trie from
 /// them, so a bad adoption becomes its state. Its own shadow-check
@@ -32,7 +31,7 @@ use super::checkpoint_data_file;
 /// is easy for an operator to read, and is forward-compatible: unknown
 /// keys are ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckpointManifest {
+pub(crate) struct CheckpointManifest {
     /// The committed block the image was taken at. This matches the file name.
     pub block: u64,
     /// keccak256 of the mdbx image bytes.
@@ -43,6 +42,7 @@ pub struct CheckpointManifest {
 }
 
 impl CheckpointManifest {
+    #[must_use]
     pub fn encode(&self) -> String {
         format!(
             "version=1\nblock={}\nimage_keccak={:#x}\ngenesis_digest={:#x}\n",
@@ -50,6 +50,10 @@ impl CheckpointManifest {
         )
     }
 
+    /// # Errors
+    ///
+    /// Returns [`StateError::Recovery`] if `text` is missing `block`,
+    /// `image_keccak`, or `genesis_digest`, or any of them fails to parse.
     pub fn parse(text: &str) -> Result<Self, StateError> {
         let mut block = None;
         let mut image_keccak = None;
@@ -88,7 +92,8 @@ impl CheckpointManifest {
 /// rsync, carries its manifest by construction. A sibling file would be
 /// silently dropped by exactly the copy paths the manifest exists to
 /// protect.
-pub fn manifest_path(checkpoint: &Path) -> PathBuf {
+#[must_use]
+pub(crate) fn manifest_path(checkpoint: &Path) -> PathBuf {
     checkpoint.join("MANIFEST")
 }
 
@@ -122,13 +127,36 @@ pub(crate) fn stored_genesis_digest(env: &StateEnv) -> Result<B256, StateError> 
     }
 }
 
-/// Read a checkpoint's manifest without hashing the image. The serve
-/// path only needs to describe what it is about to send.
-pub fn read_manifest(checkpoint: &Path) -> Result<CheckpointManifest, StateError> {
+/// Build the manifest path, read it, and parse it. `unreadable_msg`
+/// builds the error for a missing or unreadable file from the manifest
+/// path and the underlying I/O error; [`read_manifest`] and
+/// [`verify_checkpoint`] differ only in that message's wording.
+///
+/// # Errors
+///
+/// Returns [`StateError::Recovery`] if the manifest file is missing or
+/// unreadable, or if [`CheckpointManifest::parse`] rejects its contents.
+fn load_manifest(
+    checkpoint: &Path,
+    unreadable_msg: impl FnOnce(&Path, &std::io::Error) -> String,
+) -> Result<CheckpointManifest, StateError> {
     let mpath = manifest_path(checkpoint);
     let text = std::fs::read_to_string(&mpath)
-        .map_err(|e| StateError::Recovery(format!("no manifest at {}: {e}", mpath.display())))?;
+        .map_err(|e| StateError::Recovery(unreadable_msg(&mpath, &e)))?;
     CheckpointManifest::parse(&text)
+}
+
+/// Read a checkpoint's manifest without hashing the image. The serve
+/// path only needs to describe what it is about to send.
+///
+/// # Errors
+///
+/// Returns [`StateError::Recovery`] if the manifest file is missing or
+/// unreadable, or if [`CheckpointManifest::parse`] rejects its contents.
+pub(crate) fn read_manifest(checkpoint: &Path) -> Result<CheckpointManifest, StateError> {
+    load_manifest(checkpoint, |mpath, e| {
+        format!("no manifest at {}: {e}", mpath.display())
+    })
 }
 
 /// The two refusal checks every checkpoint image must pass before it
@@ -191,20 +219,26 @@ pub(crate) fn publish_checkpoint(
 
 /// Verify a checkpoint image against its manifest, and, when supplied,
 /// against the chain the caller expects. Returns the manifest.
-pub fn verify_checkpoint(
+///
+/// # Errors
+///
+/// Returns [`StateError::Recovery`] if the manifest is missing, unreadable,
+/// or malformed; [`StateError::CorruptCheckpointImage`] if the image bytes
+/// do not hash to the manifest's `image_keccak`; and
+/// [`StateError::ForeignChainCheckpoint`] if `expected_genesis` is set and
+/// disagrees with the manifest's `genesis_digest`.
+pub(crate) fn verify_checkpoint(
     checkpoint: &Path,
     expected_genesis: Option<B256>,
 ) -> Result<CheckpointManifest, StateError> {
-    let mpath = manifest_path(checkpoint);
-    let text = std::fs::read_to_string(&mpath).map_err(|e| {
-        StateError::Recovery(format!(
+    let manifest = load_manifest(checkpoint, |mpath, e| {
+        format!(
             "checkpoint {} has no readable manifest at {}: {e} — refusing to \
              adopt an unverifiable image",
             checkpoint.display(),
             mpath.display()
-        ))
+        )
     })?;
-    let manifest = CheckpointManifest::parse(&text)?;
     let data = checkpoint_data_file(checkpoint)?;
     let got = file_keccak(&data)?;
     check_image_identity(

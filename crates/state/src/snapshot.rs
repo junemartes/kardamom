@@ -21,7 +21,8 @@ use signet_libmdbx::{Database, Environment};
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::{
-    KEY_LAST_COMMITTED_BLOCK, KEY_STATE_ROOT, encode_b_position, read_meta_b256, read_meta_u64,
+    KEY_LAST_COMMITTED_BLOCK, KEY_STATE_ROOT, encode_b_position, get_decoded, read_meta_b256,
+    read_meta_u64,
 };
 use crate::schema::{
     TABLE_ACCOUNTS, TABLE_CODE, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX,
@@ -52,12 +53,17 @@ struct SnapshotInner {
     tx_hash_db: Database,
     // Keep a strong reference to the env, so it stays alive for as long as
     // the snapshot's read-only transaction does.
-    _env: Arc<Environment>,
+    env: Arc<Environment>,
 }
 
 impl StateSnapshot {
     /// Open a fresh snapshot anchored at the writer's current
     /// `last_committed_block` cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if the read-only transaction or a table open
+    /// fails.
     pub fn open(env: &StateEnv) -> Result<Self, StateError> {
         Self::open_on(env.env.clone())
     }
@@ -84,7 +90,7 @@ impl StateSnapshot {
                 code_db,
                 receipts_db,
                 tx_hash_db,
-                _env: env,
+                env,
             }),
         })
     }
@@ -92,11 +98,13 @@ impl StateSnapshot {
     /// The snapshot's pinned read-only transaction. This is the read view
     /// for trie walks. Proof generation anchors against exactly this state
     /// (spec sections 3b and 3c).
+    #[must_use]
     pub fn ro_txn(&self) -> &RoTxSync {
         &self.inner.txn
     }
 
     /// Returns the block number this snapshot is anchored at.
+    #[must_use]
     pub fn block_number(&self) -> u64 {
         self.inner.block_number
     }
@@ -107,6 +115,10 @@ impl StateSnapshot {
     /// This is `None` on databases written by the plain, non-trie executor
     /// writer, which does not maintain a state root. The trie-aware writer
     /// (`StateWriter::spawn_with_trie`) writes it. See [`crate::trie`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if the `meta` table open or read fails.
     pub fn state_root(&self) -> Result<Option<B256>, StateError> {
         let meta = self.inner.txn.open_db(Some(TABLE_META))?;
         read_meta_b256(&self.inner.txn, meta, KEY_STATE_ROOT)
@@ -132,35 +144,30 @@ impl StateDatabase for StateSnapshot {
     ///
     /// `Clone` does not do this: cloning shares the inner transaction.
     fn fork_view(&self) -> Option<Self> {
-        let fork = Self::open_on(self.inner._env.clone()).ok()?;
+        let fork = Self::open_on(self.inner.env.clone()).ok()?;
         (fork.inner.block_number == self.inner.block_number).then_some(fork)
     }
 
     fn basic(&self, address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error> {
         let key = encode_account_key(address);
-        match self
-            .inner
-            .txn
-            .get::<Vec<u8>>(self.inner.accounts_db.dbi(), &key)?
-        {
-            None => Ok(None),
-            Some(bytes) => {
-                let v = decode_account_value(&bytes)?;
-                Ok(Some((v.nonce, v.balance, v.code_hash)))
-            }
-        }
+        let v = get_decoded(
+            &self.inner.txn,
+            self.inner.accounts_db,
+            &key,
+            decode_account_value,
+        )?;
+        Ok(v.map(|v| (v.nonce, v.balance, v.code_hash)))
     }
 
     fn storage(&self, address: Address, key: B256) -> Result<U256, Self::Error> {
         let composite = encode_storage_key(address, key);
-        match self
-            .inner
-            .txn
-            .get::<Vec<u8>>(self.inner.storage_db.dbi(), &composite)?
-        {
-            None => Ok(U256::ZERO),
-            Some(bytes) => decode_storage_value(&bytes),
-        }
+        let v = get_decoded(
+            &self.inner.txn,
+            self.inner.storage_db,
+            &composite,
+            decode_storage_value,
+        )?;
+        Ok(v.unwrap_or(U256::ZERO))
     }
 
     fn code_by_hash(&self, code_hash: B256) -> Result<Bytes, Self::Error> {
@@ -179,27 +186,23 @@ impl StateDatabase for StateSnapshot {
     /// receipt was committed at that position.
     fn get_receipt(&self, pos: BPosition) -> Result<Option<Receipt>, Self::Error> {
         let key = encode_b_position(pos);
-        match self
-            .inner
-            .txn
-            .get::<Vec<u8>>(self.inner.receipts_db.dbi(), &key)?
-        {
-            None => Ok(None),
-            Some(bytes) => decode_receipt_value(&bytes).map(Some),
-        }
+        get_decoded(
+            &self.inner.txn,
+            self.inner.receipts_db,
+            &key,
+            decode_receipt_value,
+        )
     }
 
     /// Look up a `BPosition` by transaction hash. This supports
     /// `eth_getTransactionReceipt`.
     fn get_tx_position(&self, tx_hash: B256) -> Result<Option<BPosition>, Self::Error> {
         let key = encode_tx_hash_key(tx_hash);
-        match self
-            .inner
-            .txn
-            .get::<Vec<u8>>(self.inner.tx_hash_db.dbi(), &key)?
-        {
-            None => Ok(None),
-            Some(bytes) => decode_tx_hash_value(&bytes).map(Some),
-        }
+        get_decoded(
+            &self.inner.txn,
+            self.inner.tx_hash_db,
+            &key,
+            decode_tx_hash_value,
+        )
     }
 }

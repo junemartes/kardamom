@@ -1,34 +1,39 @@
-//! libmdbx schema. Seven named tables, each with a fixed key/value encoding.
+//! libmdbx schema: the tables listed in [`ALL_TABLES`], each with a fixed
+//! key/value encoding.
 //!
-//! | Table           | Key                              | Value                                            |
-//! |-----------------|----------------------------------|--------------------------------------------------|
-//! | `accounts`      | `Address` (20 B)                 | RLP `(u64 nonce, U256 balance, B256 code_hash, B256 storage_root)` |
-//! | `storage`       | `Address ++ B256 key` (52 B)     | `U256 value` (32 B, big-endian)                  |
-//! | `code`          | `B256 code_hash` (32 B)          | raw bytecode                                     |
-//! | `headers`       | `u64 block_number` (8 B BE)      | encoded `(BPosition end_tx_idx, u64 l2_timestamp)`, no state root |
-//! | `receipts`      | `BPosition tx_idx` (8 B)         | encoded `Receipt` (rkyv archive, owned at rest)  |
-//! | `tx_hash_index` | `B256 tx_hash` (32 B)            | `BPosition` (8 B, i32 BE term_id ++ i32 BE term_offset), for `eth_getTransactionReceipt(hash)` |
-//! | `meta`          | `&[u8]` (well-known keys, below) | varies, see `meta.rs`                            |
+//! | Table            | Key                              | Value                                            |
+//! |------------------|-----------------------------------|--------------------------------------------------|
+//! | `accounts`       | `Address` (20 B)                 | RLP `(u64 nonce, U256 balance, B256 code_hash, B256 storage_root)` |
+//! | `storage`        | `Address ++ B256 key` (52 B)     | `U256 value` (32 B, big-endian)                  |
+//! | `code`           | `B256 code_hash` (32 B)          | raw bytecode                                     |
+//! | `headers`        | `u64 block_number` (8 B BE)      | encoded `(BPosition end_tx_idx, u64 l2_timestamp, u64 l1_origin)`, no state root |
+//! | `receipts`       | `BPosition tx_idx` (8 B)         | encoded `Receipt` (rkyv archive, owned at rest)  |
+//! | `tx_hash_index`  | `B256 tx_hash` (32 B)            | `BPosition` (8 B, i32 BE `term_id` ++ i32 BE `term_offset`), for `eth_getTransactionReceipt(hash)` |
+//! | `meta`           | `&[u8]` (well-known keys, below) | varies, see `meta.rs`                            |
+//! | `account_trie`   | trie path (raw nibbles)          | branch node, see `trie/node.rs`                  |
+//! | `storage_trie`   | account hash ++ trie path        | branch node, see `trie/node.rs`                  |
+//! | `hashed_accounts`| `keccak256(Address)` (32 B)      | hashed-state mirror leaf                         |
+//! | `hashed_storage` | account hash ++ `keccak256(key)` | hashed-state mirror leaf                         |
 //!
 //! Big-endian encoding on the `headers` key keeps `block_number` ordered
 //! under mdbx's lexicographic cursor. The cold-start scan depends on this
-//! order. `BPosition` encoding (term_id i32 BE, then term_offset i32 BE, 8
+//! order. `BPosition` encoding (`term_id` i32 BE, then `term_offset` i32 BE, 8
 //! bytes total) is lexicographically ordered by `(term_id, term_offset)`.
 //! The `receipts` table has the same property.
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
-use kardamom_types::{BPosition, Receipt};
+use kardamom_types::{AccountChange, BPosition, CodeEntry, Receipt};
 
 use crate::error::StateError;
 
-pub const TABLE_ACCOUNTS: &str = "accounts";
-pub const TABLE_STORAGE: &str = "storage";
-pub const TABLE_CODE: &str = "code";
-pub const TABLE_HEADERS: &str = "headers";
-pub const TABLE_RECEIPTS: &str = "receipts";
-pub const TABLE_TX_HASH_INDEX: &str = "tx_hash_index";
-pub const TABLE_META: &str = "meta";
+pub(crate) const TABLE_ACCOUNTS: &str = "accounts";
+pub(crate) const TABLE_STORAGE: &str = "storage";
+pub(crate) const TABLE_CODE: &str = "code";
+pub(crate) const TABLE_HEADERS: &str = "headers";
+pub(crate) const TABLE_RECEIPTS: &str = "receipts";
+pub(crate) const TABLE_TX_HASH_INDEX: &str = "tx_hash_index";
+pub(crate) const TABLE_META: &str = "meta";
 
 // --- Incremental state-trie tables (schema v2; see crate::trie) ---
 //
@@ -37,12 +42,11 @@ pub const TABLE_META: &str = "meta";
 // mdbx order matches trie order. See `trie/cursor.rs::node_key`. Storage-trie
 // keys prepend the 32-byte account hash.
 //
-// The hashed-state mirror holds the leaves, keyed by keccak. See
-// docs/specs/2026-06-23-incremental-trie-design.md.
-pub const TABLE_ACCOUNT_TRIE: &str = "account_trie";
-pub const TABLE_STORAGE_TRIE: &str = "storage_trie";
-pub const TABLE_HASHED_ACCOUNTS: &str = "hashed_accounts";
-pub const TABLE_HASHED_STORAGE: &str = "hashed_storage";
+// The hashed-state mirror holds the leaves, keyed by keccak.
+pub(crate) const TABLE_ACCOUNT_TRIE: &str = "account_trie";
+pub(crate) const TABLE_STORAGE_TRIE: &str = "storage_trie";
+pub(crate) const TABLE_HASHED_ACCOUNTS: &str = "hashed_accounts";
+pub(crate) const TABLE_HASHED_STORAGE: &str = "hashed_storage";
 
 pub const ALL_TABLES: &[&str] = &[
     TABLE_ACCOUNTS,
@@ -61,61 +65,65 @@ pub const ALL_TABLES: &[&str] = &[
 // ---------- accounts ----------
 
 #[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable)]
-pub struct AccountValue {
+pub(crate) struct AccountValue {
     pub nonce: u64,
     pub balance: U256,
     pub code_hash: B256,
     pub storage_root: B256,
 }
 
-pub fn encode_account_key(addr: Address) -> [u8; 20] {
+#[must_use]
+pub(crate) fn encode_account_key(addr: Address) -> [u8; 20] {
     addr.into_array()
 }
 
-pub fn encode_account_value(v: &AccountValue) -> Vec<u8> {
+#[must_use]
+pub(crate) fn encode_account_value(v: &AccountValue) -> Vec<u8> {
     let mut buf = Vec::with_capacity(96);
     v.encode(&mut buf);
     buf
 }
 
-pub fn decode_account_value(bytes: &[u8]) -> Result<AccountValue, StateError> {
+/// # Errors
+///
+/// Returns [`StateError`] if `bytes` does not RLP-decode as an
+/// [`AccountValue`].
+pub(crate) fn decode_account_value(bytes: &[u8]) -> Result<AccountValue, StateError> {
     AccountValue::decode(&mut &bytes[..]).map_err(StateError::from)
 }
 
 // ---------- storage ----------
 
 /// Storage key is `Address (20 B) ++ B256 slot (32 B) = 52 B`.
-pub fn encode_storage_key(addr: Address, slot: B256) -> [u8; 52] {
+#[must_use]
+pub(crate) fn encode_storage_key(addr: Address, slot: B256) -> [u8; 52] {
     let mut out = [0u8; 52];
     out[..20].copy_from_slice(addr.as_slice());
     out[20..].copy_from_slice(slot.as_slice());
     out
 }
 
-pub fn encode_storage_value(v: U256) -> [u8; 32] {
+#[must_use]
+pub(crate) fn encode_storage_value(v: U256) -> [u8; 32] {
     v.to_be_bytes::<32>()
 }
 
-pub fn decode_storage_value(bytes: &[u8]) -> Result<U256, StateError> {
-    if bytes.len() != 32 {
-        return Err(StateError::BadEncoding {
-            table: TABLE_STORAGE,
-            expected: 32,
-            got: bytes.len(),
-        });
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(bytes);
-    Ok(U256::from_be_bytes(arr))
+/// # Errors
+///
+/// Returns [`StateError::BadEncoding`] if `bytes` is not 32 bytes.
+pub(crate) fn decode_storage_value(bytes: &[u8]) -> Result<U256, StateError> {
+    Ok(U256::from_be_bytes(*crate::meta::fixed::<32>(
+        TABLE_STORAGE,
+        bytes,
+    )?))
 }
 
 // ---------- code ----------
 
-pub fn encode_code_key(hash: B256) -> [u8; 32] {
+#[must_use]
+pub(crate) fn encode_code_key(hash: B256) -> [u8; 32] {
     hash.into()
 }
-
-// code value = raw bytes; no codec needed
 
 // ---------- headers ----------
 //
@@ -124,25 +132,25 @@ pub fn encode_code_key(hash: B256) -> [u8; 32] {
 // hand-rolled, fixed-width encoding (8 + 8 + 8 = 24 bytes) instead of RLP.
 // The row has a fixed size, and `BPosition` is not an RLP-native type.
 //
-// The origin field added 4 bytes to the 4 reserved bytes, so rows grew
-// from 20 to 24 bytes. Decoding still accepts the 20-byte form and reports
-// `l1_origin: 0`. This is what a pre-origin chain meant, so an existing
-// state DB keeps reading without a migration.
+// A 24-byte row carries `l1_origin`; a 20-byte row decodes as
+// `l1_origin = 0`, so an existing state DB keeps reading without a
+// migration.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderValue {
     pub end_tx_idx: BPosition,
     pub l2_timestamp: u64,
-    /// The L1 block number for the epoch this block belongs to. See
-    /// `docs/agents/l1-origin-deposit-derivation-spec.md`.
+    /// The L1 block number for the epoch this block belongs to.
     pub l1_origin: u64,
 }
 
-pub fn encode_block_key(block_number: u64) -> [u8; 8] {
+#[must_use]
+pub(crate) fn encode_block_key(block_number: u64) -> [u8; 8] {
     block_number.to_be_bytes()
 }
 
-pub fn encode_header_value(v: &HeaderValue) -> [u8; 24] {
+#[must_use]
+pub(crate) fn encode_header_value(v: &HeaderValue) -> [u8; 24] {
     let mut out = [0u8; 24];
     out[..4].copy_from_slice(&v.end_tx_idx.term_id.to_be_bytes());
     out[4..8].copy_from_slice(&v.end_tx_idx.term_offset.to_be_bytes());
@@ -151,26 +159,87 @@ pub fn encode_header_value(v: &HeaderValue) -> [u8; 24] {
     out
 }
 
-pub fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
+/// # Errors
+///
+/// Returns [`StateError::BadEncoding`] if `bytes` is neither the
+/// current 24-byte row nor the pre-origin 20-byte row.
+pub(crate) fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
     // A 20-byte value is the pre-origin row. Anything else is corruption.
-    if bytes.len() != 24 && bytes.len() != 20 {
-        return Err(StateError::BadEncoding {
-            table: TABLE_HEADERS,
-            expected: 24,
-            got: bytes.len(),
+    // Matching each fixed-size array by value, rather than slicing and
+    // `try_into`-ing sub-ranges, makes every field width a compile-time
+    // fact instead of a runtime check.
+    if let Ok(row) = <&[u8; 24]>::try_from(bytes) {
+        let &[
+            t0,
+            t1,
+            t2,
+            t3,
+            o0,
+            o1,
+            o2,
+            o3,
+            l0,
+            l1,
+            l2,
+            l3,
+            l4,
+            l5,
+            l6,
+            l7,
+            r0,
+            r1,
+            r2,
+            r3,
+            r4,
+            r5,
+            r6,
+            r7,
+        ] = row;
+        return Ok(HeaderValue {
+            end_tx_idx: BPosition {
+                term_id: i32::from_be_bytes([t0, t1, t2, t3]),
+                term_offset: i32::from_be_bytes([o0, o1, o2, o3]),
+            },
+            l2_timestamp: u64::from_be_bytes([l0, l1, l2, l3, l4, l5, l6, l7]),
+            l1_origin: u64::from_be_bytes([r0, r1, r2, r3, r4, r5, r6, r7]),
         });
     }
-    Ok(HeaderValue {
-        end_tx_idx: BPosition {
-            term_id: i32::from_be_bytes(bytes[..4].try_into().expect("4 bytes")),
-            term_offset: i32::from_be_bytes(bytes[4..8].try_into().expect("4 bytes")),
-        },
-        l2_timestamp: u64::from_be_bytes(bytes[8..16].try_into().expect("8 bytes")),
-        l1_origin: if bytes.len() == 24 {
-            u64::from_be_bytes(bytes[16..24].try_into().expect("8 bytes"))
-        } else {
-            0
-        },
+    if let Ok(row) = <&[u8; 20]>::try_from(bytes) {
+        // The last 4 bytes of the pre-origin row are a reserved field
+        // the old format never used; ignore them, same as the original
+        // decoder did.
+        let &[
+            t0,
+            t1,
+            t2,
+            t3,
+            o0,
+            o1,
+            o2,
+            o3,
+            l0,
+            l1,
+            l2,
+            l3,
+            l4,
+            l5,
+            l6,
+            l7,
+            _reserved @ ..,
+        ] = row;
+        return Ok(HeaderValue {
+            end_tx_idx: BPosition {
+                term_id: i32::from_be_bytes([t0, t1, t2, t3]),
+                term_offset: i32::from_be_bytes([o0, o1, o2, o3]),
+            },
+            l2_timestamp: u64::from_be_bytes([l0, l1, l2, l3, l4, l5, l6, l7]),
+            l1_origin: 0,
+        });
+    }
+    Err(StateError::BadEncoding {
+        table: TABLE_HEADERS,
+        expected: 24,
+        got: bytes.len(),
     })
 }
 
@@ -183,7 +252,12 @@ pub fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
 //
 // Value: an rkyv-archived `Receipt` (from `kardamom_types`).
 
-pub fn encode_receipt_value(r: &Receipt) -> Vec<u8> {
+/// # Panics
+///
+/// Never in practice: rkyv serialization of an owned, non-shared `Receipt`
+/// has no failure path.
+#[must_use]
+pub(crate) fn encode_receipt_value(r: &Receipt) -> Vec<u8> {
     // The upstream `Receipt` type derives `rkyv::Archive`, `rkyv::Serialize`,
     // and `rkyv::Deserialize`.
     rkyv::to_bytes::<rkyv::rancor::Error>(r)
@@ -191,7 +265,11 @@ pub fn encode_receipt_value(r: &Receipt) -> Vec<u8> {
         .to_vec()
 }
 
-pub fn decode_receipt_value(bytes: &[u8]) -> Result<Receipt, StateError> {
+/// # Errors
+///
+/// Returns [`StateError::RkyvDecode`] if `bytes` does not decode as an
+/// archived [`Receipt`].
+pub(crate) fn decode_receipt_value(bytes: &[u8]) -> Result<Receipt, StateError> {
     rkyv::from_bytes::<Receipt, rkyv::rancor::Error>(bytes).map_err(|e| StateError::RkyvDecode {
         table: TABLE_RECEIPTS,
         detail: e.to_string(),
@@ -207,15 +285,20 @@ pub fn decode_receipt_value(bytes: &[u8]) -> Result<Receipt, StateError> {
 // `eth_getTransactionReceipt(hash)` calls
 // `StateDatabase::get_tx_position(hash)`, then `StateDatabase::get_receipt(pos)`.
 
-pub fn encode_tx_hash_key(hash: B256) -> [u8; 32] {
+#[must_use]
+pub(crate) fn encode_tx_hash_key(hash: B256) -> [u8; 32] {
     hash.into()
 }
 
-pub fn encode_tx_hash_value(pos: BPosition) -> [u8; 8] {
+#[must_use]
+pub(crate) fn encode_tx_hash_value(pos: BPosition) -> [u8; 8] {
     crate::meta::encode_b_position(pos)
 }
 
-pub fn decode_tx_hash_value(bytes: &[u8]) -> Result<BPosition, StateError> {
+/// # Errors
+///
+/// Returns [`StateError::BadEncoding`] if `bytes` is not 8 bytes.
+pub(crate) fn decode_tx_hash_value(bytes: &[u8]) -> Result<BPosition, StateError> {
     crate::meta::decode_b_position(bytes).map_err(|e| match e {
         StateError::BadEncoding { expected, got, .. } => StateError::BadEncoding {
             table: TABLE_TX_HASH_INDEX,
@@ -250,6 +333,136 @@ pub(crate) fn for_each_row<K: signet_libmdbx::TransactionKind>(
             return Ok(());
         }
         item = cur.next::<Vec<u8>, Vec<u8>>()?;
+    }
+    Ok(())
+}
+
+/// Delete `key` from `db`. An absent key is fine — every trie-table and
+/// hashed-mirror delete in this crate is idempotent by construction — so
+/// this folds `MdbxError::NotFound` into success. Any other mdbx failure
+/// still surfaces.
+pub(crate) fn del_if_present(
+    txn: &signet_libmdbx::tx::aliases::RwTxSync,
+    db: signet_libmdbx::Database,
+    key: impl AsRef<[u8]>,
+) -> Result<(), StateError> {
+    match txn.del(db, key, None) {
+        Ok(_) | Err(signet_libmdbx::MdbxError::NotFound) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Put `key` into `db`, unless it already holds a value. `value`'s bytes
+/// are the same regardless of which caller's write lost the race, so a
+/// redundant write of content-addressed data (code, by hash) is expected,
+/// not an error.
+pub(crate) fn put_if_absent(
+    txn: &signet_libmdbx::tx::aliases::RwTxSync,
+    db: signet_libmdbx::Database,
+    key: impl AsRef<[u8]>,
+    value: impl AsRef<[u8]>,
+) -> Result<(), StateError> {
+    match txn.put(db, key, value, signet_libmdbx::WriteFlags::NO_OVERWRITE) {
+        Ok(()) | Err(signet_libmdbx::MdbxError::KeyExist) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write every account change. The block-commit writer and genesis
+/// seeding both build this same [`AccountValue`], always with
+/// `storage_root: B256::ZERO` — the accounts table never carries the
+/// trie's per-account root, only `hashed_accounts` does (see
+/// `crate::trie`) — so both share this one write.
+///
+/// This uses a cursor with sorted input: `BlockDelta`'s accounts vector
+/// comes from `BTreeMap` iteration, so keys ascend, and a cursor upsert
+/// walks down from its previous position instead of from the root. This
+/// is the writer's per-block hot path, so the cursor here is
+/// load-bearing, not incidental.
+pub(crate) fn write_accounts(
+    txn: &signet_libmdbx::tx::aliases::RwTxSync,
+    db: signet_libmdbx::Database,
+    changes: &[AccountChange],
+) -> Result<(), StateError> {
+    let mut cur = txn.cursor(db)?;
+    for change in changes {
+        let key = encode_account_key(change.address);
+        let v = AccountValue {
+            nonce: change.nonce,
+            balance: change.balance,
+            code_hash: change.code_hash,
+            storage_root: B256::ZERO,
+        };
+        cur.put(
+            &key,
+            &encode_account_value(&v),
+            signet_libmdbx::WriteFlags::UPSERT,
+        )?;
+    }
+    Ok(())
+}
+
+/// Write every new code entry. Code is content-addressed, so a key that
+/// already exists carries the same bytes; [`put_if_absent`] skips the
+/// redundant write.
+pub(crate) fn write_code(
+    txn: &signet_libmdbx::tx::aliases::RwTxSync,
+    db: signet_libmdbx::Database,
+    entries: &[CodeEntry],
+) -> Result<(), StateError> {
+    for entry in entries {
+        let key = encode_code_key(entry.code_hash);
+        put_if_absent(txn, db, key, &entry.code)?;
+    }
+    Ok(())
+}
+
+/// Walk every row of `db` whose key starts with `prefix`, ascending, and
+/// stops at the first key outside the prefix, or earlier if `f` returns
+/// [`ControlFlow::Break`]. Errors from the cursor or from `f` propagate
+/// unchanged.
+///
+/// This is [`for_each_row`]'s prefix-scoped counterpart: a `set_range` to
+/// the prefix, then `next` while the key still starts with it. Every
+/// cursor prefix scan in this crate — trie node deletion, trie leaf
+/// collection — shares this loop.
+pub(crate) fn for_each_prefix<K: signet_libmdbx::TransactionKind>(
+    txn: &signet_libmdbx::tx::Tx<K>,
+    db: signet_libmdbx::Database,
+    prefix: &[u8],
+    mut f: impl FnMut(Vec<u8>, Vec<u8>) -> Result<std::ops::ControlFlow<()>, StateError>,
+) -> Result<(), StateError> {
+    let mut cur = txn.cursor(db)?;
+    let mut item = cur.set_range::<Vec<u8>, Vec<u8>>(prefix)?;
+    while let Some((k, v)) = item {
+        if !k.starts_with(prefix) {
+            break;
+        }
+        if f(k, v)?.is_break() {
+            return Ok(());
+        }
+        item = cur.next::<Vec<u8>, Vec<u8>>()?;
+    }
+    Ok(())
+}
+
+/// Delete every row in `db` whose key starts with `prefix`. Used to drop
+/// a deleted account's whole hashed-storage or storage-trie subtree, and
+/// to clear a rebuilt subtrie's stale nodes before its upserts land.
+pub(crate) fn del_prefix(
+    txn: &signet_libmdbx::tx::aliases::RwTxSync,
+    db: signet_libmdbx::Database,
+    prefix: &[u8],
+) -> Result<(), StateError> {
+    // Collect first, then delete: a cursor cannot mutate the table it is
+    // walking.
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for_each_prefix(txn, db, prefix, |k, _v| {
+        keys.push(k);
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
+    for k in keys {
+        del_if_present(txn, db, k)?;
     }
     Ok(())
 }

@@ -16,9 +16,10 @@ use std::collections::BTreeMap;
 use alloy_primitives::{Address, B256, U256, keccak256};
 use kardamom_types::{AccountChange, BlockDelta, StorageChange};
 
-use super::{AccountTrieParts, TrieTables, empty_root, update_for_block};
-use crate::env::{Durability, StateEnv, StateEnvBuilder};
+use super::{TrieTables, empty_root};
+use crate::env::StateEnv;
 use crate::schema::{TABLE_ACCOUNT_TRIE, TABLE_STORAGE_TRIE};
+use crate::testing::temp_env;
 
 /// Basic (non-storage_root) account fields tracked by the model.
 #[derive(Clone, Copy)]
@@ -83,6 +84,19 @@ fn splitmix(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Pick a pseudo-random element of `items`. The modulo bounds the index
+/// below `items.len()`, so the round trip through `u64` never truncates
+/// in practice; `try_from` makes that a checked fact instead of an
+/// asserted one.
+fn pick<T>(rng: &mut u64, items: &[T]) -> T
+where
+    T: Copy,
+{
+    let len = u64::try_from(items.len()).expect("test fixture pools are far under u64::MAX");
+    let idx = usize::try_from(splitmix(rng) % len).unwrap();
+    items[idx]
+}
+
 /// Apply a block through the production incremental path and return the new
 /// world-state root.
 fn apply_block(env: &StateEnv, b: &Block) -> B256 {
@@ -92,7 +106,7 @@ fn apply_block(env: &StateEnv, b: &Block) -> B256 {
 fn apply_delta(env: &StateEnv, delta: &BlockDelta) -> B256 {
     let txn = env.raw().begin_rw_sync().unwrap();
     let tables = TrieTables::open(&txn).unwrap();
-    let root = update_for_block(&txn, &tables, delta).unwrap();
+    let root = tables.update_for_block(&txn, delta).unwrap();
     txn.commit().unwrap();
     root
 }
@@ -102,44 +116,24 @@ fn oracle_root(
     accts: &BTreeMap<Address, Basic>,
     stor: &BTreeMap<Address, BTreeMap<B256, U256>>,
 ) -> B256 {
-    super::state_root(accts.iter().map(|(addr, basic)| {
-        let sroot = stor
-            .get(addr)
-            .map(|m| super::storage_root(m.iter().map(|(k, v)| (*k, *v))))
-            .unwrap_or_else(empty_root);
-        (
-            *addr,
-            AccountTrieParts {
-                nonce: basic.nonce,
-                balance: basic.balance,
-                code_hash: basic.code_hash,
-                storage_root: sroot,
-            },
-        )
-    }))
+    let accounts: BTreeMap<Address, (u64, U256, B256)> = accts
+        .iter()
+        .map(|(addr, b)| (*addr, (b.nonce, b.balance, b.code_hash)))
+        .collect();
+    crate::testing::model_state_root(&accounts, stor)
 }
 
 /// Dump every `(key, value)` row of a table, ascending.
 fn dump_table(env: &StateEnv, name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     let txn = env.raw().begin_rw_sync().unwrap();
     let db = txn.open_db(Some(name)).unwrap();
-    let mut cur = txn.cursor(db).unwrap();
     let mut out = Vec::new();
-    let mut item = cur.first::<Vec<u8>, Vec<u8>>().unwrap();
-    while let Some((k, v)) = item {
+    crate::schema::for_each_row(&txn, db, |k, v| {
         out.push((k, v));
-        item = cur.next::<Vec<u8>, Vec<u8>>().unwrap();
-    }
+        Ok(std::ops::ControlFlow::Continue(()))
+    })
+    .unwrap();
     out
-}
-
-fn temp_env() -> (tempfile::TempDir, StateEnv) {
-    let dir = tempfile::tempdir().unwrap();
-    let env = StateEnvBuilder::new(dir.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
-    (dir, env)
 }
 
 /// The orphan detector. Replay the model's cumulative state into a
@@ -159,11 +153,10 @@ fn assert_node_tables_match_fresh_build(
     for (addr, basic) in accts {
         b.acct_upserts.push((*addr, *basic));
     }
-    for (addr, slots) in stor {
-        for (k, v) in slots {
-            b.storage.push((*addr, *k, *v));
-        }
-    }
+    b.storage.extend(
+        stor.iter()
+            .flat_map(|(addr, slots)| slots.iter().map(move |(k, v)| (*addr, *k, *v))),
+    );
     apply_block(&fresh, &b);
     assert_eq!(
         dump_table(env, TABLE_ACCOUNT_TRIE),
@@ -199,96 +192,7 @@ fn incremental_equals_full_rebuild_over_random_blocks() {
     let mut m_stor: BTreeMap<Address, BTreeMap<B256, U256>> = BTreeMap::new();
 
     for block in 0..80u64 {
-        let mut rng = block.wrapping_mul(0x1234_5678_9abc_def1) ^ 0xdead_beef;
-
-        // Use one op per account per block. A real, aggregated BlockDelta
-        // never repeats an account. None means delete; Some means a
-        // non-empty upsert. Deletes happen often, 1 in 4, so subtries
-        // keep collapsing and regrowing.
-        let mut ops: BTreeMap<Address, Option<Basic>> = BTreeMap::new();
-        let n_acct = 1 + (splitmix(&mut rng) % 6);
-        for _ in 0..n_acct {
-            let addr = addrs[(splitmix(&mut rng) % addrs.len() as u64) as usize];
-            if splitmix(&mut rng) % 4 == 3 {
-                ops.insert(addr, None);
-            } else {
-                let nonce = 1 + splitmix(&mut rng) % 9;
-                let balance = U256::from(1 + splitmix(&mut rng) % 1000);
-                ops.insert(
-                    addr,
-                    Some(Basic {
-                        nonce,
-                        balance,
-                        code_hash: B256::ZERO,
-                    }),
-                );
-            }
-        }
-        // Storage ops, deduplicated per (addr, slot), with the last write
-        // winning. These only apply to accounts that exist, or are
-        // upserted this block.
-        let mut stor_ops: BTreeMap<(Address, B256), U256> = BTreeMap::new();
-        let n_stor = splitmix(&mut rng) % 5;
-        for _ in 0..n_stor {
-            let addr = addrs[(splitmix(&mut rng) % addrs.len() as u64) as usize];
-            if !m_accts.contains_key(&addr) && !matches!(ops.get(&addr), Some(Some(_))) {
-                ops.insert(
-                    addr,
-                    Some(Basic {
-                        nonce: 1,
-                        balance: U256::from(1u64),
-                        code_hash: B256::ZERO,
-                    }),
-                );
-            }
-            let slot = slots[(splitmix(&mut rng) % slots.len() as u64) as usize];
-            let val = U256::from(splitmix(&mut rng) % 100);
-            stor_ops.insert((addr, slot), val);
-        }
-
-        let mut b = Block::default();
-        for (addr, op) in &ops {
-            match op {
-                Some(basic) => b.acct_upserts.push((*addr, *basic)),
-                None => b.acct_deletes.push(*addr),
-            }
-        }
-        for ((addr, slot), val) in &stor_ops {
-            // Skip storage on accounts being deleted this block.
-            if matches!(ops.get(addr), Some(None)) {
-                continue;
-            }
-            b.storage.push((*addr, *slot, *val));
-        }
-
-        // --- advance the model ---
-        for addr in &b.acct_deletes {
-            m_accts.remove(addr);
-            m_stor.remove(addr);
-        }
-        for (addr, basic) in &b.acct_upserts {
-            if b.acct_deletes.contains(addr) {
-                continue;
-            }
-            // Upserts are always non-empty. See the block-generation code above.
-            m_accts.insert(*addr, *basic);
-        }
-        for (addr, slot, val) in &b.storage {
-            if !m_accts.contains_key(addr) {
-                continue;
-            }
-            let s = m_stor.entry(*addr).or_default();
-            if val.is_zero() {
-                s.remove(slot);
-            } else {
-                s.insert(*slot, *val);
-            }
-        }
-
-        let got = apply_delta(&env, &b.to_delta(block));
-        let want = oracle_root(&m_accts, &m_stor);
-        assert_eq!(got, want, "root mismatch at block {block}");
-
+        run_random_block(&env, &addrs, &slots, block, &mut m_accts, &mut m_stor);
         if block % 10 == 9 {
             assert_node_tables_match_fresh_build(
                 &env,
@@ -299,6 +203,108 @@ fn incremental_equals_full_rebuild_over_random_blocks() {
         }
     }
     assert_node_tables_match_fresh_build(&env, &m_accts, &m_stor, "final");
+}
+
+/// One random block of [`incremental_equals_full_rebuild_over_random_blocks`]:
+/// generate its account and storage ops, apply it through the production
+/// path, fold it into the oracle model, and assert the two roots agree.
+fn run_random_block(
+    env: &StateEnv,
+    addrs: &[Address],
+    slots: &[B256],
+    block: u64,
+    m_accts: &mut BTreeMap<Address, Basic>,
+    m_stor: &mut BTreeMap<Address, BTreeMap<B256, U256>>,
+) {
+    let mut rng = block.wrapping_mul(0x1234_5678_9abc_def1) ^ 0xdead_beef;
+
+    // Use one op per account per block. A real, aggregated BlockDelta
+    // never repeats an account. None means delete; Some means a
+    // non-empty upsert. Deletes happen often, 1 in 4, so subtries
+    // keep collapsing and regrowing.
+    let mut ops: BTreeMap<Address, Option<Basic>> = BTreeMap::new();
+    let n_acct = 1 + (splitmix(&mut rng) % 6);
+    for _ in 0..n_acct {
+        let addr = pick(&mut rng, addrs);
+        if splitmix(&mut rng) % 4 == 3 {
+            ops.insert(addr, None);
+        } else {
+            let nonce = 1 + splitmix(&mut rng) % 9;
+            let balance = U256::from(1 + splitmix(&mut rng) % 1000);
+            ops.insert(
+                addr,
+                Some(Basic {
+                    nonce,
+                    balance,
+                    code_hash: B256::ZERO,
+                }),
+            );
+        }
+    }
+    // Storage ops, deduplicated per (addr, slot), with the last write
+    // winning. These only apply to accounts that exist, or are
+    // upserted this block.
+    let mut stor_ops: BTreeMap<(Address, B256), U256> = BTreeMap::new();
+    let n_stor = splitmix(&mut rng) % 5;
+    for _ in 0..n_stor {
+        let addr = pick(&mut rng, addrs);
+        if !m_accts.contains_key(&addr) && !matches!(ops.get(&addr), Some(Some(_))) {
+            ops.insert(
+                addr,
+                Some(Basic {
+                    nonce: 1,
+                    balance: U256::from(1u64),
+                    code_hash: B256::ZERO,
+                }),
+            );
+        }
+        let slot = pick(&mut rng, slots);
+        let val = U256::from(splitmix(&mut rng) % 100);
+        stor_ops.insert((addr, slot), val);
+    }
+
+    let mut b = Block::default();
+    for (addr, op) in &ops {
+        match op {
+            Some(basic) => b.acct_upserts.push((*addr, *basic)),
+            None => b.acct_deletes.push(*addr),
+        }
+    }
+    for ((addr, slot), val) in &stor_ops {
+        // Skip storage on accounts being deleted this block.
+        if matches!(ops.get(addr), Some(None)) {
+            continue;
+        }
+        b.storage.push((*addr, *slot, *val));
+    }
+
+    // --- advance the model ---
+    for addr in &b.acct_deletes {
+        m_accts.remove(addr);
+        m_stor.remove(addr);
+    }
+    for (addr, basic) in &b.acct_upserts {
+        if b.acct_deletes.contains(addr) {
+            continue;
+        }
+        // Upserts are always non-empty. See the block-generation code above.
+        m_accts.insert(*addr, *basic);
+    }
+    for (addr, slot, val) in &b.storage {
+        if !m_accts.contains_key(addr) {
+            continue;
+        }
+        let s = m_stor.entry(*addr).or_default();
+        if val.is_zero() {
+            s.remove(slot);
+        } else {
+            s.insert(*slot, *val);
+        }
+    }
+
+    let got = apply_delta(env, &b.to_delta(block));
+    let want = oracle_root(m_accts, m_stor);
+    assert_eq!(got, want, "root mismatch at block {block}");
 }
 
 /// This test constructs, deterministically, the exact geometry that an
@@ -318,18 +324,23 @@ fn incremental_equals_full_rebuild_over_random_blocks() {
 ///    stale orphan, and skips its "unchanged" child with `add_branch`,
 ///    using the stale hash. The result is a silently wrong root.
 #[test]
+#[allow(
+    clippy::many_single_char_names,
+    reason = "the single-letter names (a, b, c, d, e, anchor) match the geometry the doc \
+              comment above names; renaming them would make the two disagree"
+)]
 fn extension_collapse_regrow_no_stale_orphans() {
-    let nibs5 = |a: &Address| -> [u8; 5] {
+    fn nibs5(a: &Address) -> [u8; 5] {
         let h = keccak256(a);
         std::array::from_fn(|i| {
             let b = h[i / 2];
             if i % 2 == 0 { b >> 4 } else { b & 0x0f }
         })
-    };
+    }
     // Mine an address whose first five hashed-key nibbles satisfy `pred`.
     // A salted address never collides with `a` below, because its tail
     // bytes are non-zero.
-    let mine = |pred: &dyn Fn(&[u8; 5]) -> bool| -> Address {
+    fn mine<P: Fn(&[u8; 5]) -> bool>(pred: P) -> Address {
         for salt in 0u64..3_000_000 {
             let mut bytes = [0u8; 20];
             bytes[..8].copy_from_slice(&salt.to_le_bytes());
@@ -339,7 +350,7 @@ fn extension_collapse_regrow_no_stale_orphans() {
             }
         }
         panic!("address mining exhausted — hashed-key prefix never found");
-    };
+    }
 
     // `a` defines the target prefix [n0,n1,n2,n3]. The rest are mined
     // relative to it. Keys are keccak-hashed, so this searches for them
@@ -348,18 +359,18 @@ fn extension_collapse_regrow_no_stale_orphans() {
     let an = nibs5(&a);
     // b shares 4 nibbles with a, and diverges at nibble 4. This makes
     // branch(a,b) at [n0,n1,n2,n3], and [n0,n1,n2] a stored node.
-    let b = mine(&|m| m[..4] == an[..4] && m[4] != an[4]);
+    let b = mine(|m| m[..4] == an[..4] && m[4] != an[4]);
     // e shares 3 nibbles, and diverges at nibble 3. This makes
     // [n0,n1,n2] a branch.
-    let e = mine(&|m| m[..3] == an[..3] && m[3] != an[3]);
+    let e = mine(|m| m[..3] == an[..3] && m[3] != an[3]);
     // c shares 2 nibbles, and diverges at nibble 2. This makes [n0,n1] a
     // branch, stored under the extension from the root's n0 child.
-    let c = mine(&|m| m[..2] == an[..2] && m[2] != an[2]);
+    let c = mine(|m| m[..2] == an[..2] && m[2] != an[2]);
     // d shares 1 nibble, and diverges at nibble 1. It later regrows a
     // stored branch at exactly [n0].
-    let d = mine(&|m| m[0] == an[0] && m[1] != an[1]);
+    let d = mine(|m| m[0] == an[0] && m[1] != an[1]);
     // anchor has a different first nibble, so the root is always a branch.
-    let anchor = mine(&|m| m[0] != an[0]);
+    let anchor = mine(|m| m[0] != an[0]);
 
     let (_dir, env) = temp_env();
     let mut model: BTreeMap<Address, Basic> = BTreeMap::new();
@@ -419,11 +430,11 @@ fn extension_collapse_regrow_no_stale_orphans() {
     step(&mut model, &[(a, 21)], &[c], "block2");
     assert!(
         !stored_node_at(&an[..2]),
-        "stale orphan left at [n0,n1] after the subtree collapsed (F09.1)"
+        "stale orphan left at [n0,n1] after the subtree collapsed"
     );
 
     // 3. Regrow a stored node at exactly [n0]. Its tree_mask points into
-    //    the formerly orphaned region.
+    //    the region cleared in step 2.
     step(&mut model, &[(d, 15)], &[], "block3");
     assert!(stored_node_at(&an[..1]));
 

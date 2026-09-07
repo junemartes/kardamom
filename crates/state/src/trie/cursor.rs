@@ -61,17 +61,12 @@ pub(crate) fn get_branch_node<K: ReadKind>(
 
 /// Decode a `hashed_accounts` value (`nonce ++ balance ++ code_hash ++ storage_root`).
 pub(crate) fn decode_account_leaf(b: &[u8]) -> Result<AccountTrieParts, StateError> {
-    if b.len() != 104 {
-        return Err(StateError::BadEncoding {
-            table: HASHED_ACCT,
-            expected: 104,
-            got: b.len(),
-        });
-    }
-    let nonce = u64::from_be_bytes(b[0..8].try_into().unwrap());
-    let balance = U256::from_be_slice(&b[8..40]);
-    let code_hash = B256::from_slice(&b[40..72]);
-    let storage_root = B256::from_slice(&b[72..104]);
+    let row = crate::meta::fixed::<104>(HASHED_ACCT, b)?;
+    let [n0, n1, n2, n3, n4, n5, n6, n7, rest @ ..] = *row;
+    let nonce = u64::from_be_bytes([n0, n1, n2, n3, n4, n5, n6, n7]);
+    let balance = U256::from_be_slice(&rest[0..32]);
+    let code_hash = B256::from_slice(&rest[32..64]);
+    let storage_root = B256::from_slice(&rest[64..96]);
     Ok(AccountTrieParts {
         nonce,
         balance,

@@ -46,6 +46,11 @@ pub struct RecoveryPoint {
     pub last_committed_l2_timestamp: u64,
 }
 
+/// # Errors
+///
+/// Returns [`StateError::Recovery`] if the meta cursors say a block is
+/// committed but its header row is missing, and [`StateError`] if the
+/// read transaction or a table read fails.
 pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> {
     let txn = env.raw().begin_ro_sync()?;
     let meta = txn.open_db(Some(TABLE_META))?;
@@ -92,6 +97,10 @@ pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> 
 /// This checks whether `hashed_accounts` is non-empty, or the `accounts`
 /// table is empty. An empty env legitimately has no trie yet; genesis
 /// seeding builds it.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the read transaction or a table read fails.
 pub fn has_trie(env: &StateEnv) -> Result<bool, StateError> {
     let txn = env.raw().begin_ro_sync()?;
     let accounts_db = txn.open_db(Some(crate::schema::TABLE_ACCOUNTS))?;
@@ -122,61 +131,18 @@ pub fn has_trie(env: &StateEnv) -> Result<bool, StateError> {
 /// This runs in one read-write transaction. It is crash-safe: a torn
 /// bootstrap aborts entirely and reruns on the next start. It is
 /// idempotent: rerunning it on a populated mirror upserts the same rows.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the transaction, a table read, or the trie
+/// update fails.
 pub fn bootstrap_trie_from_state(env: &StateEnv) -> Result<alloy_primitives::B256, StateError> {
-    use crate::schema::{
-        TABLE_ACCOUNTS, TABLE_CODE, TABLE_STORAGE, decode_account_value, decode_storage_value,
-    };
-    use alloy_primitives::{Address, B256, U256};
-    use signet_libmdbx::WriteFlags;
-
     let txn = env.raw().begin_rw_sync()?;
 
-    let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS))?;
-    let mut accounts = Vec::new();
-    for_each_row(&txn, accounts_db, |k, v| {
-        if k.len() != 20 {
-            return Err(StateError::Recovery(format!(
-                "accounts key of length {} during trie bootstrap",
-                k.len()
-            )));
-        }
-        let a = decode_account_value(&v)?;
-        accounts.push(kardamom_types::AccountChange {
-            address: Address::from_slice(&k),
-            nonce: a.nonce,
-            balance: a.balance,
-            code_hash: a.code_hash,
-        });
-        Ok(ControlFlow::Continue(()))
-    })?;
-
-    let storage_db = txn.open_db(Some(TABLE_STORAGE))?;
-    let mut storage = Vec::new();
-    for_each_row(&txn, storage_db, |k, v| {
-        if k.len() != 52 {
-            return Err(StateError::Recovery(format!(
-                "storage key of length {} during trie bootstrap",
-                k.len()
-            )));
-        }
-        let value: U256 = decode_storage_value(&v)?;
-        storage.push(kardamom_types::StorageChange {
-            address: Address::from_slice(&k[..20]),
-            key: B256::from_slice(&k[20..]),
-            value,
-        });
-        Ok(ControlFlow::Continue(()))
-    })?;
-
-    let code_db = txn.open_db(Some(TABLE_CODE))?;
-    let mut code = Vec::new();
-    for_each_row(&txn, code_db, |k, v| {
-        code.push(kardamom_types::CodeEntry {
-            code_hash: B256::from_slice(&k),
-            code: v.into(),
-        });
-        Ok(ControlFlow::Continue(()))
-    })?;
+    let bootstrap = TrieBootstrap::open(&txn)?;
+    let accounts = bootstrap.read_all_accounts()?;
+    let storage = bootstrap.read_all_storage()?;
+    let code = bootstrap.read_all_code()?;
 
     let delta = kardamom_types::BlockDelta {
         block_number: 0,
@@ -185,17 +151,104 @@ pub fn bootstrap_trie_from_state(env: &StateEnv) -> Result<alloy_primitives::B25
         code,
         receipts: Vec::new(),
     };
-    let trie_tables = crate::trie::TrieTables::open(&txn)?;
-    let root = crate::trie::update_for_block(&txn, &trie_tables, &delta)?;
-    let meta = txn.open_db(Some(TABLE_META))?;
-    txn.put(
-        meta,
-        crate::meta::KEY_STATE_ROOT,
-        crate::meta::encode_b256(root),
-        WriteFlags::UPSERT,
-    )?;
+    let root = crate::trie::commit_trie_root(&txn, &delta)?;
     txn.commit()?;
     Ok(root)
+}
+
+/// The plain-state tables [`bootstrap_trie_from_state`] reads from, opened
+/// once on one read-write transaction.
+struct TrieBootstrap<'a> {
+    txn: &'a signet_libmdbx::tx::aliases::RwTxSync,
+    accounts_db: signet_libmdbx::Database,
+    storage_db: signet_libmdbx::Database,
+    code_db: signet_libmdbx::Database,
+}
+
+impl<'a> TrieBootstrap<'a> {
+    fn open(txn: &'a signet_libmdbx::tx::aliases::RwTxSync) -> Result<Self, StateError> {
+        use crate::schema::{TABLE_ACCOUNTS, TABLE_CODE, TABLE_STORAGE};
+        Ok(Self {
+            accounts_db: txn.open_db(Some(TABLE_ACCOUNTS))?,
+            storage_db: txn.open_db(Some(TABLE_STORAGE))?,
+            code_db: txn.open_db(Some(TABLE_CODE))?,
+            txn,
+        })
+    }
+
+    /// Walk `db`, decoding each row with `decode`. This is the one shared
+    /// "walk a table, decode each row, push" body behind
+    /// `read_all_accounts`/`read_all_storage`/`read_all_code`.
+    fn collect_rows<T>(
+        &self,
+        db: signet_libmdbx::Database,
+        mut decode: impl FnMut(&[u8], &[u8]) -> Result<T, StateError>,
+    ) -> Result<Vec<T>, StateError> {
+        let mut out = Vec::new();
+        for_each_row(self.txn, db, |k, v| {
+            out.push(decode(&k, &v)?);
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(out)
+    }
+
+    /// Read every row of `accounts` into the `AccountChange` shape
+    /// [`kardamom_types::BlockDelta`] carries.
+    fn read_all_accounts(&self) -> Result<Vec<kardamom_types::AccountChange>, StateError> {
+        use crate::schema::decode_account_value;
+        use alloy_primitives::Address;
+
+        self.collect_rows(self.accounts_db, |k, v| {
+            if k.len() != 20 {
+                return Err(StateError::Recovery(format!(
+                    "accounts key of length {} during trie bootstrap",
+                    k.len()
+                )));
+            }
+            let a = decode_account_value(v)?;
+            Ok(kardamom_types::AccountChange {
+                address: Address::from_slice(k),
+                nonce: a.nonce,
+                balance: a.balance,
+                code_hash: a.code_hash,
+            })
+        })
+    }
+
+    /// Read every row of `storage` into the `StorageChange` shape
+    /// [`kardamom_types::BlockDelta`] carries.
+    fn read_all_storage(&self) -> Result<Vec<kardamom_types::StorageChange>, StateError> {
+        use crate::schema::decode_storage_value;
+        use alloy_primitives::{Address, B256, U256};
+
+        self.collect_rows(self.storage_db, |k, v| {
+            if k.len() != 52 {
+                return Err(StateError::Recovery(format!(
+                    "storage key of length {} during trie bootstrap",
+                    k.len()
+                )));
+            }
+            let value: U256 = decode_storage_value(v)?;
+            Ok(kardamom_types::StorageChange {
+                address: Address::from_slice(&k[..20]),
+                key: B256::from_slice(&k[20..]),
+                value,
+            })
+        })
+    }
+
+    /// Read every row of `code` into the `CodeEntry` shape
+    /// [`kardamom_types::BlockDelta`] carries.
+    fn read_all_code(&self) -> Result<Vec<kardamom_types::CodeEntry>, StateError> {
+        use alloy_primitives::B256;
+
+        self.collect_rows(self.code_db, |k, v| {
+            Ok(kardamom_types::CodeEntry {
+                code_hash: B256::from_slice(k),
+                code: bytes::Bytes::copy_from_slice(v),
+            })
+        })
+    }
 }
 
 /// Every persisted block header, in block order.
@@ -205,6 +258,12 @@ pub fn bootstrap_trie_from_state(env: &StateEnv) -> Result<alloy_primitives::B25
 /// chain, such as the L1-origin sequence or boundary alignment, rather
 /// than a single block. Nothing serves headers over RPC, so this is the
 /// only way to observe them.
+///
+/// # Errors
+///
+/// Returns [`StateError::BadEncoding`] if a stored key or value is not
+/// the header table's fixed width, and [`StateError`] if the read
+/// transaction fails.
 pub fn read_all_headers(env: &StateEnv) -> Result<Vec<(u64, HeaderValue)>, StateError> {
     let txn = env.raw().begin_ro_sync()?;
     let headers = txn.open_db(Some(TABLE_HEADERS))?;
@@ -212,14 +271,7 @@ pub fn read_all_headers(env: &StateEnv) -> Result<Vec<(u64, HeaderValue)>, State
     // Keys are block numbers in big-endian order, so mdbx's byte order is
     // block order.
     for_each_row(&txn, headers, |k, v| {
-        if k.len() != 8 {
-            return Err(StateError::BadEncoding {
-                table: TABLE_HEADERS,
-                expected: 8,
-                got: k.len(),
-            });
-        }
-        let block_number = u64::from_be_bytes(k[..8].try_into().expect("8 bytes"));
+        let block_number = u64::from_be_bytes(*crate::meta::fixed::<8>(TABLE_HEADERS, &k)?);
         out.push((block_number, decode_header_value(&v)?));
         Ok(ControlFlow::Continue(()))
     })?;

@@ -7,14 +7,12 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use kardamom_state::StateSnapshot;
-use kardamom_state::env::{Durability, StateEnvBuilder};
+
+#[path = "../tests/common/mod.rs"]
+mod common;
 
 fn bench_snapshot_open(c: &mut Criterion) {
-    let dir = tempfile::tempdir().unwrap();
-    let env = StateEnvBuilder::new(dir.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
+    let (_dir, env) = common::temp_env();
 
     let mut group = c.benchmark_group("state_snapshot");
     group.measurement_time(Duration::from_secs(5));

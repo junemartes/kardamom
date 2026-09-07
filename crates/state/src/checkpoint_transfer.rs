@@ -56,6 +56,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// comes close to this limit.
 const MAX_HEAD: usize = 4096;
 
+/// The `x-checkpoint-*` header names, shared between `prepare_response`
+/// (which writes them) and `PeerResponse::parse_headers` (which reads
+/// them). A rename on one side, without this, turns into a silent "peer
+/// sent no x-checkpoint-keccak" instead of a compile error.
+mod framing {
+    pub(super) const HDR_BLOCK: &str = "x-checkpoint-block";
+    pub(super) const HDR_KECCAK: &str = "x-checkpoint-keccak";
+    pub(super) const HDR_GENESIS: &str = "x-checkpoint-genesis";
+}
+
 /// Removes the wrapped temp directory on drop. Set the field to `None`
 /// to defuse the guard once the directory has been published.
 ///
@@ -84,6 +94,10 @@ pub struct CheckpointServer {
 /// before the task spawns. So a bad address fails startup with a clear
 /// error, instead of only logging from a background task. Call this inside
 /// a tokio runtime.
+///
+/// # Errors
+///
+/// Returns an [`std::io::Error`] if `addr` cannot be bound.
 pub fn serve_checkpoints(
     addr: SocketAddr,
     checkpoints_dir: PathBuf,
@@ -157,9 +171,13 @@ fn prepare_response(
         }
     };
     let head = format!(
-        "HTTP/1.0 200 OK\r\nx-checkpoint-block: {}\r\nx-checkpoint-keccak: {:#x}\r\n\
-         x-checkpoint-genesis: {:#x}\r\ncontent-length: {len}\r\n\r\n",
-        ckpt.block, manifest.image_keccak, manifest.genesis_digest
+        "HTTP/1.0 200 OK\r\n{}: {}\r\n{}: {:#x}\r\n{}: {:#x}\r\ncontent-length: {len}\r\n\r\n",
+        framing::HDR_BLOCK,
+        ckpt.block,
+        framing::HDR_KECCAK,
+        manifest.image_keccak,
+        framing::HDR_GENESIS,
+        manifest.genesis_digest
     );
     Ok((head, file, len, ckpt.block))
 }
@@ -185,8 +203,8 @@ async fn serve_one(stream: tokio::net::TcpStream, checkpoints_dir: &Path) -> std
         }
     };
     timeout(IO_TIMEOUT, wr.write_all(head.as_bytes())).await??;
-    // Chunked copy with a per-syscall stall cap (the std version used socket
-    // timeouts): a dead peer fails within IO_TIMEOUT, a slow one streams on.
+    // Chunked copy with a per-syscall stall cap: a dead peer fails within
+    // IO_TIMEOUT, a slow one streams on.
     let mut file = tokio::fs::File::from_std(file);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -214,69 +232,44 @@ async fn serve_one(stream: tokio::net::TcpStream, checkpoints_dir: &Path) -> std
 /// It is renamed into place only after the full advertised length
 /// arrives. This preserves the invariant that a visible checkpoint is
 /// always complete, for any concurrent reader.
-pub fn fetch_latest_checkpoint(
+pub(crate) fn fetch_latest_checkpoint(
     peer: &str,
     checkpoints_dir: &Path,
     min_block: u64,
     expected_genesis: Option<B256>,
 ) -> Result<Option<CheckpointInfo>, StateError> {
-    let addr: SocketAddr = peer
-        .parse()
-        .map_err(|_| StateError::Recovery(format!("bad checkpoint peer address: {peer}")))?;
-    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    let mut stream = stream;
-    stream.write_all(b"GET /checkpoint/latest HTTP/1.0\r\n\r\n")?;
-
-    let mut reader = BufReader::new(stream);
-    let ResponseHead {
-        status,
-        block,
-        content_length,
-        keccak,
-        genesis,
-    } = read_response_head(&mut reader)?;
-    if status == 404 {
-        return Ok(None);
-    }
-    if status != 200 {
-        return Err(StateError::Recovery(format!(
-            "checkpoint peer {peer} returned status {status}"
-        )));
-    }
-    let block = block.ok_or_else(|| {
-        StateError::Recovery(format!(
-            "checkpoint peer {peer}: missing x-checkpoint-block"
-        ))
-    })?;
-    let len = content_length.ok_or_else(|| {
-        StateError::Recovery(format!("checkpoint peer {peer}: missing content-length"))
-    })?;
-    if block < min_block {
+    let mut fetch = CheckpointFetch::connect(peer, expected_genesis)?;
+    let head = match fetch.response()? {
+        PeerResponse::NotFound => return Ok(None),
+        PeerResponse::Image(head) => head,
+    };
+    if head.block < min_block {
         // Too old to be useful, for example below the cluster's retention
         // floor. Do not download the body.
         return Ok(None);
     }
 
     std::fs::create_dir_all(checkpoints_dir)?;
-    let dest = checkpoints_dir.join(checkpoint_name(block));
+    let dest = checkpoints_dir.join(checkpoint_name(head.block));
     if dest.exists() {
         // Already have this exact checkpoint locally, so there is nothing
         // to transfer. This is a recovery decision point, so we log it: a
         // silent skip here can look like the repair path never ran, even
         // though the node is fine.
         info!(
-            block,
+            block = head.block,
             peer, "peer's newest checkpoint already present locally; skipping transfer"
         );
-        return Ok(Some(CheckpointInfo { block, path: dest }));
+        return Ok(Some(CheckpointInfo {
+            block: head.block,
+            path: dest,
+        }));
     }
     // Build the same shape that `create_checkpoint` produces: a directory
     // holding `mdbx.dat` and `MANIFEST`, under a hidden temp name. This
     // makes the published checkpoint self-contained and re-verifiable
     // from disk.
-    let tmp = checkpoints_dir.join(format!(".{}.fetch.tmp", checkpoint_name(block)));
+    let tmp = checkpoints_dir.join(format!(".{}.fetch.tmp", checkpoint_name(head.block)));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
     // Every refusal below must leave no half-fetched temp entry behind.
@@ -284,60 +277,25 @@ pub fn fetch_latest_checkpoint(
     // publish step defuses it.
     let mut tmp_guard = TmpDirGuard(Some(&tmp));
     let tmp_data = tmp.join("mdbx.dat");
-    let mut out = std::fs::File::create(&tmp_data)?;
-    let copied = std::io::copy(&mut reader.by_ref().take(len), &mut out)?;
-    if copied != len {
-        return Err(StateError::Recovery(format!(
-            "checkpoint transfer from {peer} truncated: got {copied} of {len} bytes"
-        )));
-    }
-    out.sync_all()?;
-    drop(out);
+    fetch.download_image(head.len, &tmp_data)?;
 
-    // Check integrity and chain identity before the image becomes visible,
-    // using the shared refusal checks (`checkpoint::check_image_identity`).
-    // Without this check, this transfer was plain HTTP with only a length
-    // check. Silent bit rot, a lying peer, or a checkpoint from a
-    // different chain could all become this node's state.
-    let got = crate::checkpoint::file_keccak(&tmp_data)?;
-    let Some(want) = keccak else {
-        return Err(StateError::Recovery(format!(
-            "checkpoint peer {peer} sent no x-checkpoint-keccak — refusing an \
-             unverifiable image"
-        )));
-    };
-    let Some(genesis_digest) = genesis else {
-        return Err(StateError::Recovery(format!(
-            "checkpoint peer {peer} sent no x-checkpoint-genesis — refusing an \
-             unidentifiable image"
-        )));
-    };
-    crate::checkpoint::check_image_identity(
-        &format!("from peer {peer}"),
-        "peer",
-        got,
-        want,
-        genesis_digest,
-        expected_genesis,
-    )?;
+    let manifest = fetch.verify_image(&tmp_data, &head)?;
 
     // Store the manifest inside the checkpoint directory. This lets a
     // later restore re-verify from disk, instead of trusting that this
     // fetch happened correctly.
-    let manifest = crate::checkpoint::CheckpointManifest {
-        block,
-        image_keccak: got,
-        genesis_digest,
-    };
     crate::checkpoint::publish_checkpoint(&tmp, &dest, &manifest)?;
     tmp_guard.0 = None;
     info!(
-        block,
-        bytes = len,
+        block = head.block,
+        bytes = head.len,
         peer,
         "fetched checkpoint from peer (verified)"
     );
-    Ok(Some(CheckpointInfo { block, path: dest }))
+    Ok(Some(CheckpointInfo {
+        block: head.block,
+        path: dest,
+    }))
 }
 
 /// Fetch from each peer in turn, and keep the newest checkpoint at or
@@ -354,7 +312,11 @@ pub fn fetch_best_checkpoint(
 ) -> Option<CheckpointInfo> {
     let mut best: Option<CheckpointInfo> = None;
     for peer in peers {
-        let floor = best.as_ref().map_or(min_block, |b| b.block + 1);
+        // A peer advertising `u64::MAX` must not wrap the floor back to 0
+        // and disable the "newer only" filter for every later peer.
+        let floor = best
+            .as_ref()
+            .map_or(min_block, |b| b.block.saturating_add(1));
         match fetch_latest_checkpoint(peer, checkpoints_dir, floor, expected_genesis) {
             Ok(Some(c)) => best = Some(c),
             Ok(None) => {}
@@ -364,67 +326,208 @@ pub fn fetch_best_checkpoint(
     best
 }
 
-/// Parsed response head from a checkpoint peer.
-struct ResponseHead {
-    status: u16,
+/// One peer checkpoint fetch: the connection, and the context every step
+/// after parsing the response head needs.
+struct CheckpointFetch<'a> {
+    peer: &'a str,
+    reader: BufReader<TcpStream>,
+    expected_genesis: Option<B256>,
+}
+
+impl<'a> CheckpointFetch<'a> {
+    /// Connect to `peer` (`host:port`) and send the checkpoint-fetch
+    /// request.
+    fn connect(peer: &'a str, expected_genesis: Option<B256>) -> Result<Self, StateError> {
+        let addr: SocketAddr = peer
+            .parse()
+            .map_err(|_| StateError::Recovery(format!("bad checkpoint peer address: {peer}")))?;
+        let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+        stream.set_read_timeout(Some(IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(IO_TIMEOUT))?;
+        stream.write_all(b"GET /checkpoint/latest HTTP/1.0\r\n\r\n")?;
+        Ok(Self {
+            peer,
+            reader: BufReader::new(stream),
+            expected_genesis,
+        })
+    }
+
+    /// Read and parse the response head.
+    fn response(&mut self) -> Result<PeerResponse, StateError> {
+        let head = self.read_head_text()?;
+        PeerResponse::parse(&head, self.peer)
+    }
+
+    /// Read the raw head, line by line, up to the blank line that ends it.
+    fn read_head_text(&mut self) -> Result<String, StateError> {
+        let mut head = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.reader.read_line(&mut line)?;
+            if n == 0 || line == "\r\n" || line == "\n" {
+                break;
+            }
+            head.push_str(&line);
+            if head.len() > MAX_HEAD {
+                return Err(StateError::Recovery(
+                    "checkpoint peer response head too large".into(),
+                ));
+            }
+        }
+        Ok(head)
+    }
+
+    /// Copy exactly `len` bytes from the response body into a fresh file
+    /// at `path`, then sync it. The file closes when this returns,
+    /// before the caller reopens `path` to hash it.
+    fn download_image(&mut self, len: u64, path: &Path) -> Result<(), StateError> {
+        let mut out = std::fs::File::create(path)?;
+        let copied = std::io::copy(&mut self.reader.by_ref().take(len), &mut out)?;
+        if copied != len {
+            return Err(StateError::Recovery(format!(
+                "checkpoint transfer from {} truncated: got {copied} of {len} bytes",
+                self.peer
+            )));
+        }
+        out.sync_all()?;
+        Ok(())
+    }
+
+    /// Check integrity and chain identity before the image becomes
+    /// visible, using the shared refusal checks
+    /// (`checkpoint::check_image_identity`). Without this check, a
+    /// transfer is plain HTTP with only a length check: silent bit rot,
+    /// a lying peer, or a checkpoint from a different chain could all
+    /// become this node's state. Returns the manifest to publish.
+    fn verify_image(
+        &self,
+        tmp_data: &Path,
+        head: &CheckpointHead,
+    ) -> Result<crate::checkpoint::CheckpointManifest, StateError> {
+        let got = crate::checkpoint::file_keccak(tmp_data)?;
+        crate::checkpoint::check_image_identity(
+            &format!("from peer {}", self.peer),
+            "peer",
+            got,
+            head.keccak,
+            head.genesis,
+            self.expected_genesis,
+        )?;
+        Ok(crate::checkpoint::CheckpointManifest {
+            block: head.block,
+            image_keccak: got,
+            genesis_digest: head.genesis,
+        })
+    }
+}
+
+/// A peer's response to the checkpoint-fetch request, parsed once.
+enum PeerResponse {
+    /// The peer has no checkpoint (`404`).
+    NotFound,
+    /// The peer's newest checkpoint image, with everything needed to
+    /// fetch and verify it.
+    Image(CheckpointHead),
+}
+
+/// Everything `x-checkpoint-*` and `content-length` say about a peer's
+/// image, all required and already checked present.
+struct CheckpointHead {
+    block: u64,
+    len: u64,
+    keccak: B256,
+    genesis: B256,
+}
+
+impl PeerResponse {
+    /// Parse a full response head: the status line, then the headers
+    /// this client understands. `peer` names the source, for error
+    /// messages only.
+    fn parse(head: &str, peer: &str) -> Result<Self, StateError> {
+        let mut lines = head.lines();
+        let status_line = lines
+            .next()
+            .ok_or_else(|| StateError::Recovery("empty response from checkpoint peer".into()))?;
+        let status = Self::parse_status_line(status_line)?;
+        if status == 404 {
+            return Ok(Self::NotFound);
+        }
+        if status != 200 {
+            return Err(StateError::Recovery(format!(
+                "checkpoint peer {peer} returned status {status}"
+            )));
+        }
+        let headers = Self::parse_headers(lines);
+        let block = headers.block.ok_or_else(|| {
+            StateError::Recovery(format!(
+                "checkpoint peer {peer}: missing x-checkpoint-block"
+            ))
+        })?;
+        let len = headers.content_length.ok_or_else(|| {
+            StateError::Recovery(format!("checkpoint peer {peer}: missing content-length"))
+        })?;
+        let keccak = headers.keccak.ok_or_else(|| {
+            StateError::Recovery(format!(
+                "checkpoint peer {peer} sent no x-checkpoint-keccak — refusing an \
+                 unverifiable image"
+            ))
+        })?;
+        let genesis = headers.genesis.ok_or_else(|| {
+            StateError::Recovery(format!(
+                "checkpoint peer {peer} sent no x-checkpoint-genesis — refusing an \
+                 unidentifiable image"
+            ))
+        })?;
+        Ok(Self::Image(CheckpointHead {
+            block,
+            len,
+            keccak,
+            genesis,
+        }))
+    }
+
+    /// Parse the HTTP status code out of the response's first line.
+    fn parse_status_line(status_line: &str) -> Result<u16, StateError> {
+        status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| {
+                StateError::Recovery(format!(
+                    "bad status line from checkpoint peer: {status_line}"
+                ))
+            })
+    }
+
+    /// Parse the checkpoint-specific headers this client understands. Any
+    /// other header, or one it fails to parse, is ignored.
+    fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> ParsedHeaders {
+        let mut headers = ParsedHeaders::default();
+        for l in lines {
+            let Some((k, v)) = l.split_once(':') else {
+                continue;
+            };
+            match k.trim().to_ascii_lowercase().as_str() {
+                framing::HDR_BLOCK => headers.block = v.trim().parse().ok(),
+                "content-length" => headers.content_length = v.trim().parse().ok(),
+                framing::HDR_KECCAK => headers.keccak = v.trim().parse().ok(),
+                framing::HDR_GENESIS => headers.genesis = v.trim().parse().ok(),
+                _ => {}
+            }
+        }
+        headers
+    }
+}
+
+/// The subset of headers [`PeerResponse::parse_headers`] extracts, still
+/// optional: presence is checked once, by [`PeerResponse::parse`].
+#[derive(Default)]
+struct ParsedHeaders {
     block: Option<u64>,
     content_length: Option<u64>,
     keccak: Option<B256>,
     genesis: Option<B256>,
-}
-
-fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ResponseHead, StateError> {
-    let mut head = String::new();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 || line == "\r\n" || line == "\n" {
-            break;
-        }
-        head.push_str(&line);
-        if head.len() > MAX_HEAD {
-            return Err(StateError::Recovery(
-                "checkpoint peer response head too large".into(),
-            ));
-        }
-    }
-    let mut lines = head.lines();
-    let status_line = lines
-        .next()
-        .ok_or_else(|| StateError::Recovery("empty response from checkpoint peer".into()))?;
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| {
-            StateError::Recovery(format!(
-                "bad status line from checkpoint peer: {status_line}"
-            ))
-        })?;
-    let mut block = None;
-    let mut content_length = None;
-    let mut keccak = None;
-    let mut genesis = None;
-    for l in lines {
-        let Some((k, v)) = l.split_once(':') else {
-            continue;
-        };
-        match k.trim().to_ascii_lowercase().as_str() {
-            "x-checkpoint-block" => block = v.trim().parse().ok(),
-            "content-length" => content_length = v.trim().parse().ok(),
-            "x-checkpoint-keccak" => keccak = v.trim().parse().ok(),
-            "x-checkpoint-genesis" => genesis = v.trim().parse().ok(),
-            _ => {}
-        }
-    }
-    Ok(ResponseHead {
-        status,
-        block,
-        content_length,
-        keccak,
-        genesis,
-    })
 }
 
 #[cfg(test)]

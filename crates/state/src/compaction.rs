@@ -27,6 +27,11 @@ use crate::error::StateError;
 ///
 /// The live env stays online for reads and writes throughout compaction.
 /// Compaction runs against a read-only snapshot of the env.
+///
+/// # Errors
+///
+/// Returns [`StateError::Recovery`] if `dest` already exists, and
+/// [`StateError`] if the underlying `mdbx_env_copy` call fails.
 pub fn compact_to(env: &StateEnv, dest: &Path) -> Result<(), StateError> {
     info!(src = %env.path().display(), dst = %dest.display(), "starting compaction");
     if dest.exists() {

@@ -20,29 +20,29 @@
 /// before the writer must stop.
 ///
 /// The writer pauses, or alerts and halts, if the snapshot exceeds this limit.
-pub const HORIZON_BLOCKS: u32 = 4;
+pub(crate) const HORIZON_BLOCKS: u32 = 4;
 
 /// The mdbx page size. It must be a power of two between 256 B and 64 KB.
 ///
 /// 16 KB matches the OS page size on aarch64 and keeps freelist entries
 /// compact.
-pub const PAGE_SIZE: usize = 16 * 1024;
+pub(crate) const PAGE_SIZE: usize = 16 * 1024;
 
 /// The address-space ceiling. libmdbx supports up to 128 TB, but we use
 /// 256 GB so the process never needs a runtime grow or remap.
 ///
 /// The actual on-disk size still grows on demand.
-pub const SIZE_UPPER: usize = 256 * 1024 * 1024 * 1024;
+pub(crate) const SIZE_UPPER: usize = 256 * 1024 * 1024 * 1024;
 
 /// The starting on-disk size, 64 MB. It grows by `growth_step` on demand.
-pub const SIZE_LOWER: usize = 64 * 1024 * 1024;
+pub(crate) const SIZE_LOWER: usize = 64 * 1024 * 1024;
 
 /// Grow the file 256 MB at a time so frequent commits do not fragment it.
-pub const GROWTH_STEP: isize = 256 * 1024 * 1024;
+pub(crate) const GROWTH_STEP: isize = 256 * 1024 * 1024;
 
 /// The shrink threshold. Only release space back to the OS after 1 GB or
 /// more of slack accumulates.
-pub const SHRINK_STEP: isize = 1024 * 1024 * 1024;
+pub(crate) const SHRINK_STEP: isize = 1024 * 1024 * 1024;
 
 /// The maximum number of concurrent readers. The budget covers:
 ///
@@ -54,13 +54,13 @@ pub const SHRINK_STEP: isize = 1024 * 1024 * 1024;
 ///
 /// This value is conservative. Each reader slot costs about 128 B of shared
 /// memory.
-pub const MAX_READERS: u64 = 64;
+pub(crate) const MAX_READERS: u64 = 64;
 
 /// The number of named DBs the env opens at init time.
 ///
 /// Keep this value in sync with [`crate::schema::ALL_TABLES`]. The env
 /// builder uses it to size the internal slot table.
-pub const MAX_DBS: usize = 16;
+pub(crate) const MAX_DBS: usize = 16;
 
 #[cfg(test)]
 mod tests {

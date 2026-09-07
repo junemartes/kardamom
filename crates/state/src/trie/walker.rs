@@ -11,6 +11,13 @@
 //! correct full rebuild, and incrementality emerges as `HashBuilder`
 //! produces stored branch nodes for next time.
 //!
+//! The account trie and each account's storage trie run this exact
+//! algorithm over two different leaf sources. [`LeafSource`] captures
+//! what differs — which table, which key namespace, and how to emit a
+//! subtree's current leaves — and its default [`LeafSource::walk`] method
+//! is the one shared implementation. [`AccountWalk`] and [`StorageCtx`]
+//! are its two leaf sources.
+//!
 //! ## Deletion tracking
 //!
 //! Every stored node the walker descends into is recorded. After the
@@ -35,13 +42,15 @@ use alloy_trie::{BranchNodeCompact, HashBuilder, Nibbles};
 use signet_libmdbx::Database;
 use signet_libmdbx::TxSync;
 
-use super::cursor::{collect_hashed_accounts_under, collect_hashed_storage_under, get_branch_node};
+use super::cursor::{
+    ReadKind, collect_hashed_accounts_under, collect_hashed_storage_under, get_branch_node,
+};
 use super::prefix_set::PrefixSet;
 use crate::error::StateError;
 
 /// Branch-node mutations produced by one walk.
 #[derive(Debug, Default)]
-pub struct TrieUpdates {
+pub(crate) struct TrieUpdates {
     pub upserts: Vec<(Nibbles, BranchNodeCompact)>,
     pub removals: Vec<Nibbles>,
     /// Nibble-path prefixes whose subtries were rebuilt from leaves,
@@ -61,211 +70,223 @@ struct WalkLog {
     cleared: Vec<Nibbles>,
 }
 
+/// One trie's node table and leaf source: the account trie over the
+/// hashed-account mirror ([`AccountWalk`]), or one account's storage trie
+/// over its hashed-storage mirror ([`StorageCtx`]). [`LeafSource::walk`]
+/// is the one shared recursive-rebuild algorithm; each implementor only
+/// says which table it walks and how to emit a subtree's current leaves.
+trait LeafSource {
+    /// The branch-node table: `account_trie` or `storage_trie`.
+    fn trie_db(&self) -> Database;
+
+    /// `None` for the account trie. `Some(account_hash)` namespaces a
+    /// storage trie's keys to one account.
+    fn namespace(&self) -> Option<&B256>;
+
+    /// Emit every current leaf under `path` into `hb`, for the exact-miss
+    /// (full rebuild) and leaf-or-empty-child cases of [`Self::walk`].
+    fn emit_under<K: ReadKind>(
+        &self,
+        tx: &TxSync<K>,
+        path: &Nibbles,
+        hb: &mut HashBuilder,
+    ) -> Result<(), StateError>;
+
+    /// Recursively rebuild the changed regions of this trie into `hb`,
+    /// from `path` down. See the module doc for the skip rule and the
+    /// deletion-tracking contract `log` records.
+    fn walk<K: ReadKind>(
+        &self,
+        tx: &TxSync<K>,
+        path: &Nibbles,
+        prefix_set: &PrefixSet,
+        hb: &mut HashBuilder,
+        log: &mut WalkLog,
+    ) -> Result<(), StateError> {
+        match get_branch_node(tx, self.trie_db(), self.namespace(), path)? {
+            None => {
+                // This is a full leaf rebuild of this subtrie. Stored nodes may
+                // still exist under this path, behind extensions, where the
+                // exact-path get cannot see them. Mark the prefix for range
+                // deletion, so none of them survives as a stale orphan.
+                log.cleared.push(*path);
+                self.emit_under(tx, path, hb)?;
+            }
+            Some(node) => {
+                log.visited.push(*path);
+                let (tm, hm) = (node.tree_mask.get(), node.hash_mask.get());
+                // Iterate all 16 nibbles, not just the stored node's
+                // state_mask, which may be stale. A new leaf under a
+                // nibble absent from the old mask must still be surfaced
+                // from the hashed state.
+                for i in 0..16u8 {
+                    let mut child = *path;
+                    child.push(i);
+                    let changed = prefix_set.contains_prefix(&child);
+                    if (tm & (1 << i)) != 0 {
+                        // A stored branch child. Skip it if unchanged and
+                        // hashed; otherwise recurse.
+                        if !changed && (hm & (1 << i)) != 0 {
+                            hb.add_branch(child, node.hash_for_nibble(i), true);
+                        } else {
+                            self.walk(tx, &child, prefix_set, hb, log)?;
+                        }
+                    } else {
+                        // A leaf-or-empty child. Emit any current leaves
+                        // under it, to surface newly created entries.
+                        self.emit_under(tx, &child, hb)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The two table handles the account walk needs on every recursive call.
+#[derive(Clone, Copy)]
+struct AccountWalk {
+    account_trie: Database,
+    hashed_accounts: Database,
+}
+
+impl LeafSource for AccountWalk {
+    fn trie_db(&self) -> Database {
+        self.account_trie
+    }
+
+    fn namespace(&self) -> Option<&B256> {
+        None
+    }
+
+    fn emit_under<K: ReadKind>(
+        &self,
+        tx: &TxSync<K>,
+        path: &Nibbles,
+        hb: &mut HashBuilder,
+    ) -> Result<(), StateError> {
+        for (k, parts) in collect_hashed_accounts_under(tx, self.hashed_accounts, path)? {
+            if parts.is_empty() {
+                continue;
+            }
+            hb.add_leaf(
+                Nibbles::unpack(k.as_slice()),
+                &super::account_leaf_rlp(&parts),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The three table handles the storage walk needs on every recursive
+/// call. Grouping them keeps the walker under the argument-count limit.
+#[derive(Clone, Copy)]
+struct StorageCtx<'a> {
+    storage_trie: Database,
+    hashed_storage: Database,
+    account_hash: &'a B256,
+}
+
+impl LeafSource for StorageCtx<'_> {
+    fn trie_db(&self) -> Database {
+        self.storage_trie
+    }
+
+    fn namespace(&self) -> Option<&B256> {
+        Some(self.account_hash)
+    }
+
+    fn emit_under<K: ReadKind>(
+        &self,
+        tx: &TxSync<K>,
+        path: &Nibbles,
+        hb: &mut HashBuilder,
+    ) -> Result<(), StateError> {
+        for (k, v) in
+            collect_hashed_storage_under(tx, self.hashed_storage, self.account_hash, path)?
+        {
+            hb.add_leaf(Nibbles::unpack(k.as_slice()), &storage_leaf(v));
+        }
+        Ok(())
+    }
+}
+
+/// Run one [`LeafSource`]'s walk from the trie root, and fold the result
+/// into `(root, TrieUpdates)`. [`account_root`] and [`storage_root`] are
+/// this over the two leaf sources.
+fn root_with<K: ReadKind, L: LeafSource>(
+    tx: &TxSync<K>,
+    source: &L,
+    prefix_set: &PrefixSet,
+) -> Result<(B256, TrieUpdates), StateError> {
+    let mut hb = HashBuilder::default().with_updates(true);
+    let mut log = WalkLog::default();
+    source.walk(tx, &Nibbles::new(), prefix_set, &mut hb, &mut log)?;
+    let root = hb.root();
+    let (_, updated) = hb.split();
+    Ok(finalize(root, &updated, log))
+}
+
 /// Compute the account-trie root incrementally. `account_trie` and
 /// `hashed_accounts` are the table handles. `prefix_set` holds
 /// `keccak(addr)` for every changed account. Returns `(root, updates)`.
-pub(crate) fn account_root<K: crate::trie::cursor::ReadKind>(
+pub(crate) fn account_root<K: ReadKind>(
     tx: &TxSync<K>,
     account_trie: Database,
     hashed_accounts: Database,
     prefix_set: &PrefixSet,
-    account_leaf: &dyn Fn(&super::AccountTrieParts) -> Vec<u8>,
 ) -> Result<(B256, TrieUpdates), StateError> {
-    let mut hb = HashBuilder::default().with_updates(true);
-    let mut log = WalkLog::default();
-    walk_account(
+    root_with(
         tx,
-        account_trie,
-        hashed_accounts,
-        &Nibbles::new(),
+        &AccountWalk {
+            account_trie,
+            hashed_accounts,
+        },
         prefix_set,
-        &mut hb,
-        &mut log,
-        account_leaf,
-    )?;
-    let root = hb.root();
-    let (_, updated) = hb.split();
-    finalize(root, updated, log)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn walk_account<K: crate::trie::cursor::ReadKind>(
-    tx: &TxSync<K>,
-    account_trie: Database,
-    hashed_accounts: Database,
-    path: &Nibbles,
-    prefix_set: &PrefixSet,
-    hb: &mut HashBuilder,
-    log: &mut WalkLog,
-    account_leaf: &dyn Fn(&super::AccountTrieParts) -> Vec<u8>,
-) -> Result<(), StateError> {
-    match get_branch_node(tx, account_trie, None, path)? {
-        None => {
-            // This is a full leaf rebuild of this subtrie. Stored nodes may
-            // still exist under this path, behind extensions, where the
-            // exact-path get cannot see them. Mark the prefix for range
-            // deletion, so none of them survives as a stale orphan.
-            log.cleared.push(*path);
-            for (k, parts) in collect_hashed_accounts_under(tx, hashed_accounts, path)? {
-                if parts.is_empty() {
-                    continue;
-                }
-                hb.add_leaf(Nibbles::unpack(k.as_slice()), &account_leaf(&parts));
-            }
-        }
-        Some(node) => {
-            log.visited.push(*path);
-            let (tm, hm) = (node.tree_mask.get(), node.hash_mask.get());
-            // Iterate all 16 nibbles, not just the stored node's
-            // state_mask, which may be stale. A new account under a
-            // nibble absent from the old mask must still be surfaced
-            // from the hashed state.
-            for i in 0..16u8 {
-                let mut child = *path;
-                child.push(i);
-                let changed = prefix_set.contains_prefix(&child);
-                if (tm & (1 << i)) != 0 {
-                    // A stored branch child. Skip it if unchanged and
-                    // hashed; otherwise recurse.
-                    if !changed && (hm & (1 << i)) != 0 {
-                        hb.add_branch(child, node.hash_for_nibble(i), true);
-                    } else {
-                        walk_account(
-                            tx,
-                            account_trie,
-                            hashed_accounts,
-                            &child,
-                            prefix_set,
-                            hb,
-                            log,
-                            account_leaf,
-                        )?;
-                    }
-                } else {
-                    // A leaf-or-empty child. Emit any current leaves
-                    // under it, to surface newly created accounts.
-                    for (k, parts) in collect_hashed_accounts_under(tx, hashed_accounts, &child)? {
-                        if parts.is_empty() {
-                            continue;
-                        }
-                        hb.add_leaf(Nibbles::unpack(k.as_slice()), &account_leaf(&parts));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+    )
 }
 
 /// Compute one account's storage-trie root incrementally.
-pub(crate) fn storage_root<K: crate::trie::cursor::ReadKind>(
+pub(crate) fn storage_root<K: ReadKind>(
     tx: &TxSync<K>,
     storage_trie: Database,
     hashed_storage: Database,
     account_hash: &B256,
     prefix_set: &PrefixSet,
 ) -> Result<(B256, TrieUpdates), StateError> {
-    let mut hb = HashBuilder::default().with_updates(true);
-    let mut log = WalkLog::default();
-    walk_storage(
+    root_with(
         tx,
-        storage_trie,
-        hashed_storage,
-        account_hash,
-        &Nibbles::new(),
+        &StorageCtx {
+            storage_trie,
+            hashed_storage,
+            account_hash,
+        },
         prefix_set,
-        &mut hb,
-        &mut log,
-    )?;
-    let root = hb.root();
-    let (_, updated) = hb.split();
-    finalize(root, updated, log)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn walk_storage<K: crate::trie::cursor::ReadKind>(
-    tx: &TxSync<K>,
-    storage_trie: Database,
-    hashed_storage: Database,
-    account_hash: &B256,
-    path: &Nibbles,
-    prefix_set: &PrefixSet,
-    hb: &mut HashBuilder,
-    log: &mut WalkLog,
-) -> Result<(), StateError> {
-    match get_branch_node(tx, storage_trie, Some(account_hash), path)? {
-        None => {
-            // See walk_account. Clear the prefix, so stored nodes hiding
-            // under extensions cannot outlive this leaf rebuild as stale
-            // orphans.
-            log.cleared.push(*path);
-            for (k, v) in collect_hashed_storage_under(tx, hashed_storage, account_hash, path)? {
-                hb.add_leaf(Nibbles::unpack(k.as_slice()), &storage_leaf(v));
-            }
-        }
-        Some(node) => {
-            log.visited.push(*path);
-            let (tm, hm) = (node.tree_mask.get(), node.hash_mask.get());
-            for i in 0..16u8 {
-                let mut child = *path;
-                child.push(i);
-                let changed = prefix_set.contains_prefix(&child);
-                if (tm & (1 << i)) != 0 {
-                    if !changed && (hm & (1 << i)) != 0 {
-                        hb.add_branch(child, node.hash_for_nibble(i), true);
-                    } else {
-                        walk_storage(
-                            tx,
-                            storage_trie,
-                            hashed_storage,
-                            account_hash,
-                            &child,
-                            prefix_set,
-                            hb,
-                            log,
-                        )?;
-                    }
-                } else {
-                    for (k, v) in
-                        collect_hashed_storage_under(tx, hashed_storage, account_hash, &child)?
-                    {
-                        hb.add_leaf(Nibbles::unpack(k.as_slice()), &storage_leaf(v));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+    )
 }
 
 /// The proof-generation entry point (`trie::proofs`): the account
 /// walk from the root, with a caller-owned `HashBuilder` that has a
 /// proof retainer attached, and a discarded log. A proof walk mutates
 /// nothing and applies nothing.
-pub(crate) fn walk_account_for_proofs<K: crate::trie::cursor::ReadKind>(
+pub(crate) fn walk_account_for_proofs<K: ReadKind>(
     tx: &TxSync<K>,
     account_trie: Database,
     hashed_accounts: Database,
     prefix_set: &PrefixSet,
     hb: &mut HashBuilder,
-    account_leaf: &dyn Fn(&super::AccountTrieParts) -> Vec<u8>,
 ) -> Result<(), StateError> {
     let mut log = WalkLog::default();
-    walk_account(
-        tx,
+    AccountWalk {
         account_trie,
         hashed_accounts,
-        &Nibbles::new(),
-        prefix_set,
-        hb,
-        &mut log,
-        account_leaf,
-    )
+    }
+    .walk(tx, &Nibbles::new(), prefix_set, hb, &mut log)
 }
 
 /// The proof-generation entry for one storage trie's walk. Same
 /// contract as [`walk_account_for_proofs`].
-pub(crate) fn walk_storage_for_proofs<K: crate::trie::cursor::ReadKind>(
+pub(crate) fn walk_storage_for_proofs<K: ReadKind>(
     tx: &TxSync<K>,
     storage_trie: Database,
     hashed_storage: Database,
@@ -274,16 +295,12 @@ pub(crate) fn walk_storage_for_proofs<K: crate::trie::cursor::ReadKind>(
     hb: &mut HashBuilder,
 ) -> Result<(), StateError> {
     let mut log = WalkLog::default();
-    walk_storage(
-        tx,
+    StorageCtx {
         storage_trie,
         hashed_storage,
         account_hash,
-        &Nibbles::new(),
-        prefix_set,
-        hb,
-        &mut log,
-    )
+    }
+    .walk(tx, &Nibbles::new(), prefix_set, hb, &mut log)
 }
 
 /// Storage leaf value = RLP of the slot's U256 (matches `alloy_trie::root`).
@@ -302,9 +319,9 @@ fn storage_leaf(v: U256) -> Vec<u8> {
 ///   land.
 fn finalize(
     root: B256,
-    updated: alloy_trie::HashMap<Nibbles, BranchNodeCompact>,
+    updated: &alloy_trie::HashMap<Nibbles, BranchNodeCompact>,
     log: WalkLog,
-) -> Result<(B256, TrieUpdates), StateError> {
+) -> (B256, TrieUpdates) {
     let upserts: Vec<(Nibbles, BranchNodeCompact)> =
         updated.iter().map(|(k, v)| (*k, v.clone())).collect();
     let removals: Vec<Nibbles> = log
@@ -312,12 +329,12 @@ fn finalize(
         .into_iter()
         .filter(|p| !updated.contains_key(p))
         .collect();
-    Ok((
+    (
         root,
         TrieUpdates {
             upserts,
             removals,
             cleared: log.cleared,
         },
-    ))
+    )
 }

@@ -35,9 +35,8 @@ pub struct StorageChange {
     pub value: U256,
 }
 
-/// A single code-hash-to-bytecode mapping in a block delta. This is its own
-/// struct, not a `(B256, Bytes)` tuple as in the original plan. This lets the
-/// rkyv `with` adapters apply cleanly.
+/// A single code-hash-to-bytecode mapping in a block delta. A struct, not a
+/// `(B256, Bytes)` tuple, lets the rkyv `with` adapters apply cleanly.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct CodeEntry {
@@ -47,20 +46,13 @@ pub struct CodeEntry {
     pub code: Bytes,
 }
 
-/// `tx_bal` wire frame. See
-/// `docs/agents/bal-attribution-parallel-validation-spec.md`. It carries the
-/// merged final-value write set, plus the EIP-7928 Block Access List
-/// (canonical alloy RLP). The list carries per-slot `(tx_index, value)`
-/// write lists and per-account storage reads.
+/// `tx_bal` wire frame. It carries the merged final-value write set, plus
+/// the EIP-7928 Block Access List (canonical alloy RLP). The list carries
+/// per-slot `(tx_index, value)` write lists and per-account storage reads.
 ///
-/// This type has no version, by choice. It was once a V1/V2 enum. V1 (the
-/// delta alone, without receipts) had only one producer: a legacy
-/// writer-queue tee. The publisher thread replaced that producer, and
-/// nothing else used V1. So the version tag added only a permanent match arm
-/// for every consumer, and a risk for injection paths: the corrupt-BAL
-/// drill silently stopped working when its hand-built frames kept the old
-/// shape. The wire format can still change while the chain is at v0. Add
-/// versioning back when there is a second live shape to carry.
+/// This type has no version, by choice: the wire format may still change
+/// while the chain is at v0. Add versioning back when there is a second
+/// live shape to carry.
 #[derive(Clone, Debug, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct BalFrame {
@@ -78,6 +70,7 @@ pub struct BalFrame {
 
 impl BalFrame {
     /// The merged final-value section.
+    #[must_use]
     pub fn delta(&self) -> &BlockDelta {
         &self.delta
     }
