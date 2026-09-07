@@ -30,5 +30,5 @@
 //! without a media driver.
 
 pub mod bytes;
-pub mod protocol;
+pub(crate) mod protocol;
 pub mod session;

@@ -17,26 +17,31 @@ fn chunk<const N: usize>(buf: &[u8], at: usize) -> Option<[u8; N]> {
 }
 
 /// Read a little-endian `u16` at byte offset `at`.
+#[must_use]
 pub fn u16_le(buf: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(chunk(buf, at)?))
 }
 
 /// Read a little-endian `i32` at byte offset `at`.
+#[must_use]
 pub fn i32_le(buf: &[u8], at: usize) -> Option<i32> {
     Some(i32::from_le_bytes(chunk(buf, at)?))
 }
 
 /// Read a little-endian `u32` at byte offset `at`.
+#[must_use]
 pub fn u32_le(buf: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(chunk(buf, at)?))
 }
 
 /// Read a little-endian `i64` at byte offset `at`.
+#[must_use]
 pub fn i64_le(buf: &[u8], at: usize) -> Option<i64> {
     Some(i64::from_le_bytes(chunk(buf, at)?))
 }
 
 /// Read a little-endian `u64` at byte offset `at`.
+#[must_use]
 pub fn u64_le(buf: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(chunk(buf, at)?))
 }

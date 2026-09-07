@@ -16,7 +16,7 @@
 
 use kardamom_cluster_adapter::gateway::ClusterEgress;
 use kardamom_cluster_adapter::watermark::ClusterWatermark;
-use kardamom_cluster_adapter::wire::{self, EgressItem};
+use kardamom_cluster_adapter::wire::EgressItem;
 use kardamom_cluster_adapter::{LiveCluster, LiveClusterConfig, LiveEgress, LiveError, live};
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_types::BPosition;
@@ -47,7 +47,7 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
     pub fn next_position(&mut self) -> Option<BPosition> {
         loop {
             let bytes = self.egress.recv()?;
-            let count = match wire::decode_egress(&bytes) {
+            let count = match EgressItem::decode(&bytes) {
                 Ok(EgressItem::Record { index, .. }) => self.watermark.observe_record(index),
                 Ok(EgressItem::Boundary(b)) => {
                     self.watermark.observe_boundary(b.end_tx_idx.as_index())
@@ -92,7 +92,14 @@ pub fn cluster_watermark_observer(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
 ) -> Result<(LiveCluster, ClusterWatermarkObserver<LiveEgress>), LiveError> {
-    let (cluster, _ingress, egress) = live::connect_subscribed(rt, cfg)?;
+    let (cluster, _ingress, egress) = live::connect_with(
+        rt,
+        cfg,
+        live::ConnectOptions {
+            subscribe: true,
+            ..Default::default()
+        },
+    )?;
     Ok((cluster, ClusterWatermarkObserver::new(egress)))
 }
 
@@ -107,7 +114,7 @@ mod tests {
     use kardamom_types::{BPosition, TxRef};
 
     /// A valid relayed-record egress frame at canonical `index`. The
-    /// payload is a real `TxRef`, so `decode_egress` can parse it.
+    /// payload is a real `TxRef`, so `EgressItem::decode` can parse it.
     fn record(index: u64, off: i32) -> Vec<u8> {
         let r = TxRef::new(
             B256::repeat_byte(off as u8),
@@ -120,7 +127,7 @@ mod tests {
         );
         let ingress = encode_ingress_txref(&r, alloy_primitives::Address::ZERO, 0);
         let (_cid, relayed) = split_ingress(&ingress).unwrap();
-        encode_egress_record(index, relayed)
+        encode_egress_record(index, relayed).unwrap()
     }
 
     #[test]

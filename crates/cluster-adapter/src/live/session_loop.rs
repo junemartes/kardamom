@@ -1,8 +1,5 @@
 //! The session thread's duty cycle. [`run_session`] builds a
-//! [`SessionLoop`] and runs its numbered duty methods until `stop`. The
-//! struct's fields are the loop-carried state that used to be
-//! `run_session` locals. The methods are the numbered duty sections of
-//! the old loop body, with their comments kept.
+//! [`SessionLoop`] and runs its numbered duty methods until `stop`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,32 +67,36 @@ const SUBSCRIBE_RESEND_MS: u64 = 3_000;
 /// (session establishment), and every `interval_ms` after that. It
 /// records the send time when it fires.
 struct Resend {
-    last_ms: u64,
+    /// `None` means "never sent" (or just [`Resend::rearm`]ed), distinct
+    /// from a real send timestamp of 0 ms since epoch.
+    last_ms: Option<u64>,
     interval_ms: u64,
 }
 
 impl Resend {
     fn new(interval_ms: u64) -> Self {
         Self {
-            last_ms: 0,
+            last_ms: None,
             interval_ms,
         }
     }
 
     /// Force the next [`Resend::due`] to fire immediately.
     fn rearm(&mut self) {
-        self.last_ms = 0;
+        self.last_ms = None;
     }
 
     /// True when a (re)send is due: either it was never sent (or was
     /// re-armed), or the interval has passed since the last send.
     fn due(&mut self, now: u64) -> bool {
-        if self.last_ms == 0 || now.saturating_sub(self.last_ms) >= self.interval_ms {
-            self.last_ms = now;
-            true
-        } else {
-            false
+        let due = match self.last_ms {
+            None => true,
+            Some(last) => now.saturating_sub(last) >= self.interval_ms,
+        };
+        if due {
+            self.last_ms = Some(now);
         }
+        due
     }
 }
 
@@ -112,9 +113,31 @@ pub(super) struct SessionSeams {
     pub(super) stop: Arc<AtomicBool>,
 }
 
+/// Pop one item off `rx`, or `None` on `Empty`. On `Disconnected`, latches
+/// `*dead` and also returns `None`. Allocation-free: unlike a `drain`-style
+/// helper that collects into a `Vec` first, this borrows `rx`/`dead` only
+/// for the call itself, so the caller's `while let` loop body is free to
+/// borrow `self` again (for example, `self.on_driver_event(ev)`) on every
+/// iteration — required on this thread's offer path, which the module doc
+/// calls latency-critical.
+fn next_item<T>(rx: &Receiver<T>, dead: &mut bool) -> Option<T> {
+    match rx.try_recv() {
+        Ok(item) => Some(item),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => {
+            *dead = true;
+            None
+        }
+    }
+}
+
 /// The session thread's state. It holds the sans-IO [`SessionDriver`],
 /// the live ingress publication, the owner seams, and the loop-carried
 /// duty state.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent flags on unrelated axes (an egress consumer detached, a receiver died, a subscribe was confirmed), not a state machine to collapse into one enum"
+)]
 struct SessionLoop {
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
@@ -252,41 +275,24 @@ impl SessionLoop {
     /// any frame arrived (feeds `worked`).
     fn drain_egress(&mut self) -> bool {
         let mut worked = false;
-        loop {
-            match self.frame_rx.try_recv() {
-                Ok(frame) => {
-                    worked = true;
-                    let events = self.driver.on_egress(&frame);
-                    // Liveness means frames that survive the session filter.
-                    // A frame for a foreign session (the pre-restart
-                    // zombie's boundary broadcasts land on this same static
-                    // endpoint until the cluster reaps it at the 90s
-                    // session timeout) returns no events, and must not feed
-                    // the watchdog. Counting raw channel bytes instead kept
-                    // the only escape hatch (`force_reconnect` below)
-                    // disarmed for as long as a zombie was being served.
-                    // That wedged a restarted validator in a 3s
-                    // replay-request loop with a session the cluster may
-                    // have silently closed.
-                    if !events.is_empty() {
-                        self.egress_alive_at_ms = now_ms();
-                        // Real egress means the path works again. Reset the
-                        // watchdog backoff so a future outage gets the fast
-                        // first retry.
-                        self.egress_silence_reset_ms = EGRESS_SILENCE_RESET_MS;
-                    }
-                    for ev in events {
-                        self.on_driver_event(ev);
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                // A dropped LiveIngress or LiveEgress must not kill the
-                // session (the other half may still be in use). Only `stop`
-                // ends it.
-                Err(TryRecvError::Disconnected) => {
-                    self.frame_rx_dead = true;
-                    break;
-                }
+        while let Some(frame) = next_item(&self.frame_rx, &mut self.frame_rx_dead) {
+            worked = true;
+            let events = self.driver.on_egress(&frame);
+            // Liveness means frames that survive the session filter. A
+            // frame for a foreign session (the pre-restart zombie's
+            // boundary broadcasts land on this same static endpoint
+            // until the cluster reaps it at the 90s session timeout)
+            // returns no events, and must not feed the watchdog: only
+            // session-filtered events do.
+            if !events.is_empty() {
+                self.egress_alive_at_ms = now_ms();
+                // Real egress means the path works again. Reset the
+                // watchdog backoff so a future outage gets the fast
+                // first retry.
+                self.egress_silence_reset_ms = EGRESS_SILENCE_RESET_MS;
+            }
+            for ev in events {
+                self.on_driver_event(ev);
             }
         }
         worked
@@ -301,7 +307,7 @@ impl SessionLoop {
                     .as_ref()
                     .is_none_or(|ks| payload.first().is_some_and(|k| ks.contains(k)));
                 if wanted && self.egress_alive && self.out_tx.send(payload).is_err() {
-                    self.egress_alive = false; // consumer dropped
+                    self.egress_alive = false;
                 }
             }
             DriverEvent::Reconnect {
@@ -381,7 +387,10 @@ impl SessionLoop {
             return;
         }
         let req = crate::wire::encode_subscribe();
-        if let Some(framed) = self.driver.wrap_app(&req, now as i64) {
+        if let Some(framed) = self
+            .driver
+            .wrap_app(&req, i64::try_from(now).unwrap_or(i64::MAX))
+        {
             if let Err(e) = self.ingress.publish_bytes(to_aligned(&framed)) {
                 tracing::warn!(
                     error = %e,
@@ -409,14 +418,17 @@ impl SessionLoop {
         );
         let now = now_ms();
         let progressed = cursor != self.replay_cursor_at_send;
-        if progressed && self.replay_resend.last_ms != 0 {
+        if progressed && self.replay_resend.last_ms.is_some() {
             // Frames are flowing. Move the checkpoint so a future stall is
             // measured from the most recent progress, not the last send.
             self.replay_cursor_at_send = cursor;
-            self.replay_resend.last_ms = now;
+            self.replay_resend.last_ms = Some(now);
         } else if self.replay_resend.due(now) {
             let req = crate::wire::encode_replay_request(cursor.0, cursor.1);
-            if let Some(framed) = self.driver.wrap_app(&req, now as i64) {
+            if let Some(framed) = self
+                .driver
+                .wrap_app(&req, i64::try_from(now).unwrap_or(i64::MAX))
+            {
                 // This is a retrying publish, not best-effort. This rare,
                 // critical message is sent exactly when the ingress
                 // publication is at its busiest (mass reconnects under
@@ -477,28 +489,20 @@ impl SessionLoop {
     /// any offer was serviced (feeds `worked`).
     fn handle_offers(&mut self, now: u64) -> bool {
         let mut worked = false;
-        loop {
-            match self.req_rx.try_recv() {
-                Ok(OfferReq { payload, reply }) => {
-                    worked = true;
-                    let outcome = match self.driver.wrap_app(&payload, now as i64) {
-                        Some(framed) => match self.ingress.publish_bytes(to_aligned(&framed)) {
-                            Ok(_) => OfferOutcome::Accepted,
-                            Err(_) => OfferOutcome::BackPressured,
-                        },
-                        None => OfferOutcome::NotConnected,
-                    };
-                    let _ = reply.send(outcome);
-                }
-                Err(TryRecvError::Empty) => break,
-                // A dropped LiveIngress or LiveEgress must not kill the
-                // session (the other half may still be in use). Only `stop`
-                // ends it.
-                Err(TryRecvError::Disconnected) => {
-                    self.req_rx_dead = true;
-                    break;
-                }
-            }
+        while let Some(OfferReq { payload, reply }) = next_item(&self.req_rx, &mut self.req_rx_dead)
+        {
+            worked = true;
+            let outcome = match self
+                .driver
+                .wrap_app(&payload, i64::try_from(now).unwrap_or(i64::MAX))
+            {
+                Some(framed) => match self.ingress.publish_bytes(to_aligned(&framed)) {
+                    Ok(_) => OfferOutcome::Accepted,
+                    Err(_) => OfferOutcome::BackPressured,
+                },
+                None => OfferOutcome::NotConnected,
+            };
+            let _ = reply.send(outcome);
         }
         worked
     }
@@ -507,12 +511,8 @@ impl SessionLoop {
     /// egress frame or an offer request is ready (not consumed; the
     /// drain loops at the top of the iteration consume it), capped so
     /// the keep-alive, replay, and subscribe duties keep their cadence.
-    /// An unconditional 1ms sleep here added up to 1ms of latency to
-    /// every sequencer offer (two of these hand-offs per tx), a hard cap
-    /// of about 1-2k tx/s per shard on the offer path. The cap climbs
-    /// from 1ms to 5ms while consecutive iterations find nothing
-    /// (`IdleBackoff`; the fixed 1ms wake cost about 8% of sequencer
-    /// CPU). Any activity snaps it back.
+    /// The cap climbs from 1ms to 5ms while consecutive iterations find
+    /// nothing (`IdleBackoff`). Any activity snaps it back.
     fn idle_wait(&mut self, worked: bool) {
         if worked {
             self.backoff.reset();
@@ -526,13 +526,10 @@ impl SessionLoop {
         // Consumers legitimately drop their unused `LiveIngress` seam (for
         // example, `let (cluster, _ingress, egress) =
         // connect_with_replay(...)`), which disconnects `req_rx` forever.
-        // The old shape kept `req_rx` in the Select. It slept `wait` on
-        // the empty-ready artifact. Every idle iteration then paid the
-        // full sleep once `req_rx` died. This was the exact latency the
-        // Select was added to remove. Build the Select from live
-        // receivers only. Readiness then means something is queued, and
-        // `ready_timeout` alone parks correctly. A dead and empty channel
-        // stays dead. Nothing can arrive on it again.
+        // Build the Select from live receivers only, so readiness means
+        // something is queued, and `ready_timeout` alone parks correctly.
+        // A dead and empty channel stays dead: nothing can arrive on it
+        // again.
         let mut sel = crossbeam_channel::Select::new();
         let mut live = 0;
         if !self.frame_rx_dead {
@@ -555,11 +552,11 @@ impl SessionLoop {
     /// Graceful shutdown: tell the cluster to close our session, instead
     /// of leaking it until the 90s session timeout. The zombie is not
     /// just hygiene. The sealer keeps unicasting boundary broadcasts to a
-    /// dead session's egress endpoint, and for a restarting consumer on
-    /// the same static endpoint, those foreign frames used to disarm the
-    /// egress-liveness watchdog for the whole zombie lifetime. This call
-    /// is best-effort: a crash also skips the close, which is exactly
-    /// what the watchdog and session-filtered liveness now cover.
+    /// dead session's egress endpoint, and a restarting consumer on the
+    /// same static endpoint would otherwise receive those foreign frames.
+    /// Session-filtered liveness (`drain_egress`) ignores them, and the
+    /// egress-silence watchdog covers the case where this close is
+    /// skipped (for example, a crash).
     fn close_on_shutdown(mut self) {
         if let Some(close_frame) = self.driver.force_reconnect("shutdown") {
             self.ingress.publish_best_effort(to_aligned(&close_frame));

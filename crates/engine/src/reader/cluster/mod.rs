@@ -239,7 +239,7 @@ impl<E: ClusterEgress> TxOrderingSubscription for ClusterTxOrderingSubscription<
             let Some(bytes) = self.egress.recv() else {
                 return Err(ExecutorError::TxOrderingClosed);
             };
-            match wire::decode_egress(&bytes) {
+            match EgressItem::decode(&bytes) {
                 Ok(item) => self.ingest(item)?,
                 Err(e) => {
                     // A malformed frame is dropped, and logged. The cluster
@@ -275,12 +275,16 @@ pub fn cluster_tx_ordering_subscription(
     cfg: LiveClusterConfig,
     cursor: ReplayCursor,
 ) -> Result<(LiveCluster, ClusterTxOrderingSubscription<LiveEgress>), LiveError> {
-    let (cluster, _ingress, egress) = live::connect_with_replay(
+    let (cluster, _ingress, egress) = live::connect_with(
         rt,
         cfg,
-        live::ReplayOnConnect {
-            next_index: cursor.next_index.clone(),
-            next_block: cursor.next_block.clone(),
+        live::ConnectOptions {
+            replay: Some(live::ReplayOnConnect {
+                next_index: cursor.next_index.clone(),
+                next_block: cursor.next_block.clone(),
+            }),
+            subscribe: true,
+            ..Default::default()
         },
     )?;
     Ok((

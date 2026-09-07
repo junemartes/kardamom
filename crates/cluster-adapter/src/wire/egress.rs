@@ -8,11 +8,15 @@ use alloy_primitives::{Address, B256};
 use kardamom_types::epoch::EpochRecord;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, BlockBoundaryStart, DepositRef, TxOrderingMessage, TxRef};
+use rkyv::Archive;
+use rkyv::api::high::{HighDeserializer, HighValidator};
+use rkyv::rancor;
 
 use super::{
     CANONICAL_ID_LEN, EGRESS_KIND_BOUNDARY, EGRESS_KIND_CONTIGUITY_REJECT, EGRESS_KIND_RELAYED,
     EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE, RT_DEPOSITREF, RT_EPOCH,
-    RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError, encode_kind_2u64, rd_i32, rd_u32, rd_u64,
+    RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError, encode_kind_2u64, rd_i32, rd_len, rd_slice,
+    rd_u64, too_short,
 };
 
 // ── decode (egress: cluster to Rust) ────────────────────────────────────────
@@ -41,176 +45,210 @@ pub enum EgressItem {
     },
 }
 
-pub fn decode_egress(buf: &[u8]) -> Result<EgressItem, WireError> {
-    let kind = *buf.first().ok_or(WireError::TooShort {
-        at: 0,
-        need: 1,
-        have: 0,
-    })?;
-    match kind {
-        EGRESS_KIND_RELAYED => {
-            let index = rd_u64(buf, 1)?;
-            let payload_len = rd_u32(buf, 9)? as usize;
-            let start = 13;
-            let payload = buf
-                .get(start..start + payload_len)
-                .ok_or(WireError::BadPayloadLen {
-                    declared: payload_len,
-                    remaining: buf.len().saturating_sub(start),
-                })?;
-            Ok(EgressItem::Record {
-                index,
-                msg: decode_relayed_payload(payload)?,
-            })
+impl EgressItem {
+    /// # Errors
+    ///
+    /// Returns an error if `buf` is too short for its kind byte, or its
+    /// kind byte is not one of the `EGRESS_KIND_*` constants.
+    pub fn decode(buf: &[u8]) -> Result<Self, WireError> {
+        let kind = *buf.first().ok_or_else(|| too_short(buf, 0, 1))?;
+        match kind {
+            EGRESS_KIND_RELAYED => Self::decode_relayed(buf),
+            EGRESS_KIND_BOUNDARY => Self::decode_boundary(buf),
+            EGRESS_KIND_REPLAY_UNAVAILABLE => Ok(Self::ReplayUnavailable {
+                oldest_index: rd_u64(buf, 1)?,
+                oldest_block: rd_u64(buf, 9)?,
+            }),
+            EGRESS_KIND_REPLAY_DONE => Ok(Self::ReplayDone {
+                up_to_index: rd_u64(buf, 1)?,
+                up_to_block: rd_u64(buf, 9)?,
+            }),
+            EGRESS_KIND_CONTIGUITY_REJECT => Self::decode_contiguity_reject(buf),
+            other => Err(WireError::BadEgressKind(other)),
         }
-        EGRESS_KIND_BOUNDARY => {
-            let block_number = rd_u64(buf, 1)?;
-            let end_tx_idx = rd_u64(buf, 9)?;
-            let l2_timestamp = rd_u64(buf, 17)?;
-            let l1_origin = rd_u64(buf, 25)?;
-            Ok(EgressItem::Boundary(BlockBoundaryStart {
-                block_number,
-                end_tx_idx: BPosition::from_index(end_tx_idx),
-                l2_timestamp,
-                l1_origin,
-            }))
-        }
-        EGRESS_KIND_REPLAY_UNAVAILABLE => Ok(EgressItem::ReplayUnavailable {
-            oldest_index: rd_u64(buf, 1)?,
-            oldest_block: rd_u64(buf, 9)?,
-        }),
-        EGRESS_KIND_REPLAY_DONE => Ok(EgressItem::ReplayDone {
-            up_to_index: rd_u64(buf, 1)?,
-            up_to_block: rd_u64(buf, 9)?,
-        }),
-        EGRESS_KIND_CONTIGUITY_REJECT => {
-            let sender = buf.get(1..1 + SENDER_LEN).ok_or(WireError::TooShort {
-                at: 1,
-                need: SENDER_LEN,
-                have: buf.len().saturating_sub(1),
-            })?;
-            Ok(EgressItem::ContiguityReject {
-                sender: Address::from_slice(sender),
-                nonce: rd_u64(buf, 1 + SENDER_LEN)?,
-                expected: rd_u64(buf, 1 + SENDER_LEN + 8)?,
-            })
-        }
-        other => Err(WireError::BadEgressKind(other)),
+    }
+
+    fn decode_relayed(buf: &[u8]) -> Result<Self, WireError> {
+        let index = rd_u64(buf, 1)?;
+        let payload_len = rd_len(buf, 9)?;
+        let start = 13;
+        let payload = rd_slice(buf, start, payload_len).map_err(|_| WireError::BadPayloadLen {
+            declared: payload_len,
+            remaining: buf.len().saturating_sub(start),
+        })?;
+        Ok(Self::Record {
+            index,
+            msg: RelayedPayload::parse(payload)?.decode()?,
+        })
+    }
+
+    fn decode_boundary(buf: &[u8]) -> Result<Self, WireError> {
+        let block_number = rd_u64(buf, 1)?;
+        let end_tx_idx = rd_u64(buf, 9)?;
+        let l2_timestamp = rd_u64(buf, 17)?;
+        let l1_origin = rd_u64(buf, 25)?;
+        Ok(Self::Boundary(BlockBoundaryStart {
+            block_number,
+            end_tx_idx: BPosition::from_index(end_tx_idx),
+            l2_timestamp,
+            l1_origin,
+        }))
+    }
+
+    fn decode_contiguity_reject(buf: &[u8]) -> Result<Self, WireError> {
+        let sender = rd_slice(buf, 1, SENDER_LEN)?;
+        Ok(Self::ContiguityReject {
+            sender: Address::from_slice(sender),
+            nonce: rd_u64(buf, 1 + SENDER_LEN)?,
+            expected: rd_u64(buf, 1 + SENDER_LEN + 8)?,
+        })
     }
 }
 
-/// Decode a relayed payload `[canonical_id:32][record_type:u8][fields…]`
-/// into a `TxOrderingMessage`. This recovers the original `tx_data` or
-/// `deposit` position. The caller assigns the canonical L2 position from
-/// `index`.
-fn decode_relayed_payload(p: &[u8]) -> Result<TxOrderingMessage, WireError> {
-    let cid = p.get(0..CANONICAL_ID_LEN).ok_or(WireError::TooShort {
-        at: 0,
-        need: CANONICAL_ID_LEN,
-        have: p.len(),
-    })?;
-    let id = B256::from_slice(cid);
-    let rt = *p.get(CANONICAL_ID_LEN).ok_or(WireError::TooShort {
-        at: CANONICAL_ID_LEN,
-        need: 1,
-        have: p.len().saturating_sub(CANONICAL_ID_LEN),
-    })?;
-    let fields = &p[CANONICAL_ID_LEN + 1..];
-    match rt {
-        RT_TXREF => {
-            let shard_id = *fields.first().ok_or(WireError::TooShort {
-                at: 0,
-                need: 1,
-                have: 0,
-            })?;
-            let term_id = rd_i32(fields, 1)?;
-            let term_offset = rd_i32(fields, 5)?;
-            let tx_data_session_id = rd_i32(fields, 9)?;
-            Ok(TxOrderingMessage::TxRef(TxRef::new(
-                id,
-                shard_id,
-                BPosition {
-                    term_id,
-                    term_offset,
-                },
-                tx_data_session_id,
-            )))
-        }
-        RT_DEPOSITREF => {
-            let term_id = rd_i32(fields, 0)?;
-            let term_offset = rd_i32(fields, 4)?;
-            Ok(TxOrderingMessage::DepositRef(DepositRef::new(
-                id,
-                BPosition {
-                    term_id,
-                    term_offset,
-                },
-            )))
-        }
-        RT_EPOCH => {
-            // The rkyv body sits at offset 33 of the relayed payload (after
-            // the canonical id and the record type). This offset is never
-            // 8-aligned in place, so rkyv refuses to read it without a copy
-            // into an aligned buffer. Every other record type decodes
-            // field-by-field, so it never hits this. Epochs happen about
-            // once per L1 block, so the copy cost is small. The
-            // alternative, padding the frame to realign it, would have to
-            // survive the Java relay byte-for-byte.
-            let mut aligned = rkyv::util::AlignedVec::<8>::with_capacity(fields.len());
-            aligned.extend_from_slice(fields);
-            let epoch: EpochRecord = rkyv::from_bytes::<EpochRecord, rkyv::rancor::Error>(&aligned)
-                .map_err(|e| WireError::BadEpoch(e.to_string()))?;
-            // The canonical id comes from the epoch itself. So if a relayed
-            // record's id does not match its payload, the record was
-            // tampered with or mis-encoded. Reject it instead of trusting
-            // the header.
-            if epoch.canonical_id() != id {
-                return Err(WireError::BadEpoch(format!(
-                    "canonical id {id} does not match epoch for L1 block {}",
-                    epoch.l1_number
-                )));
-            }
-            Ok(TxOrderingMessage::Epoch(epoch))
-        }
-        RT_REMOTE_EPOCH => {
-            // Same unaligned-body copy as RT_EPOCH, for the same reason.
-            let mut aligned = rkyv::util::AlignedVec::<8>::with_capacity(fields.len());
-            aligned.extend_from_slice(fields);
-            let rec: RemoteEpochRecord =
-                rkyv::from_bytes::<RemoteEpochRecord, rkyv::rancor::Error>(&aligned)
-                    .map_err(|e| WireError::BadRemoteEpoch(e.to_string()))?;
-            // The id commits to the pair's (origin, anchor, seq range), so a
-            // mismatch means the header and the batch disagree about WHICH
-            // slice of the pair's sequence this is — the one thing dedup
-            // cannot be allowed to get wrong.
-            if rec.canonical_id() != id {
-                return Err(WireError::BadRemoteEpoch(format!(
-                    "canonical id {id} does not match remote epoch from chain {} seqs {}..={}",
-                    rec.origin_chain_id,
-                    rec.first_seq,
-                    rec.last_seq()
-                )));
-            }
-            Ok(TxOrderingMessage::RemoteEpoch(rec))
-        }
-        other => Err(WireError::BadRecordType(other)),
+/// A relayed payload slice, `[canonical_id:32][record_type:u8][fields…]`,
+/// parsed once in [`RelayedPayload::parse`] so every record-type decoder
+/// below is a method reading `self.id`/`self.fields`, rather than a free
+/// function each re-deriving them from a raw `&[u8]`.
+struct RelayedPayload<'a> {
+    id: B256,
+    record_type: u8,
+    fields: &'a [u8],
+}
+
+impl<'a> RelayedPayload<'a> {
+    fn parse(p: &'a [u8]) -> Result<Self, WireError> {
+        let cid = rd_slice(p, 0, CANONICAL_ID_LEN)?;
+        let record_type = *p
+            .get(CANONICAL_ID_LEN)
+            .ok_or_else(|| too_short(p, CANONICAL_ID_LEN, 1))?;
+        Ok(Self {
+            id: B256::from_slice(cid),
+            record_type,
+            fields: &p[CANONICAL_ID_LEN + 1..],
+        })
     }
+
+    /// Decode `self.fields` into a [`TxOrderingMessage`]. This recovers
+    /// the original `tx_data` or `deposit` position. The caller assigns
+    /// the canonical L2 position from the relayed record's `index`.
+    fn decode(&self) -> Result<TxOrderingMessage, WireError> {
+        match self.record_type {
+            RT_TXREF => self.decode_txref(),
+            RT_DEPOSITREF => self.decode_depositref(),
+            RT_EPOCH => self.decode_epoch(),
+            RT_REMOTE_EPOCH => self.decode_remote_epoch(),
+            other => Err(WireError::BadRecordType(other)),
+        }
+    }
+
+    fn decode_txref(&self) -> Result<TxOrderingMessage, WireError> {
+        let shard_id = *self
+            .fields
+            .first()
+            .ok_or_else(|| too_short(self.fields, 0, 1))?;
+        let term_id = rd_i32(self.fields, 1)?;
+        let term_offset = rd_i32(self.fields, 5)?;
+        let tx_data_session_id = rd_i32(self.fields, 9)?;
+        Ok(TxOrderingMessage::TxRef(TxRef::new(
+            self.id,
+            shard_id,
+            BPosition {
+                term_id,
+                term_offset,
+            },
+            tx_data_session_id,
+        )))
+    }
+
+    fn decode_depositref(&self) -> Result<TxOrderingMessage, WireError> {
+        let term_id = rd_i32(self.fields, 0)?;
+        let term_offset = rd_i32(self.fields, 4)?;
+        Ok(TxOrderingMessage::DepositRef(DepositRef::new(
+            self.id,
+            BPosition {
+                term_id,
+                term_offset,
+            },
+        )))
+    }
+
+    fn decode_epoch(&self) -> Result<TxOrderingMessage, WireError> {
+        let epoch: EpochRecord =
+            decode_rkyv_body(self.fields).map_err(|e| WireError::BadEpoch(e.to_string()))?;
+        // The canonical id comes from the epoch itself. So if a relayed
+        // record's id does not match its payload, the record was
+        // tampered with or mis-encoded. Reject it instead of trusting
+        // the header.
+        if epoch.canonical_id() != self.id {
+            return Err(WireError::BadEpoch(format!(
+                "canonical id {} does not match epoch for L1 block {}",
+                self.id, epoch.l1_number
+            )));
+        }
+        Ok(TxOrderingMessage::Epoch(epoch))
+    }
+
+    fn decode_remote_epoch(&self) -> Result<TxOrderingMessage, WireError> {
+        let rec: RemoteEpochRecord =
+            decode_rkyv_body(self.fields).map_err(|e| WireError::BadRemoteEpoch(e.to_string()))?;
+        // The id commits to the pair's (origin, anchor, seq range), so a
+        // mismatch means the header and the batch disagree about WHICH
+        // slice of the pair's sequence this is — the one thing dedup
+        // cannot be allowed to get wrong.
+        if rec.canonical_id() != self.id {
+            return Err(WireError::BadRemoteEpoch(format!(
+                "canonical id {} does not match remote epoch from chain {} seqs {}..={}",
+                self.id,
+                rec.origin_chain_id,
+                rec.first_seq,
+                rec.last_seq()
+            )));
+        }
+        Ok(TxOrderingMessage::RemoteEpoch(rec))
+    }
+}
+
+/// Decode an rkyv body that sits at a byte offset that is never 8-aligned
+/// in place, so rkyv refuses to read it without a copy into an aligned
+/// buffer first. Shared by the epoch and remote-epoch relayed record
+/// types; every other record type decodes field-by-field and never hits
+/// this. These records happen at most once per L1 (or origin) block, so
+/// the copy cost is small. The alternative, padding the frame to realign
+/// it, would have to survive the Java relay byte-for-byte.
+fn decode_rkyv_body<T>(fields: &[u8]) -> Result<T, rancor::Error>
+where
+    T: Archive,
+    T::Archived: rkyv::Deserialize<T, HighDeserializer<rancor::Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
+{
+    let mut aligned = rkyv::util::AlignedVec::<8>::with_capacity(fields.len());
+    aligned.extend_from_slice(fields);
+    rkyv::from_bytes::<T, rancor::Error>(&aligned)
 }
 
 // ── encode (egress: mirrors Java framing, for tests and a Rust service mock) ─
 
 /// Frame a relayed record exactly as the Java service does. `payload` is the
 /// relayed payload (`[canonical_id:32][record_type][fields…]`).
-pub fn encode_egress_record(index: u64, payload: &[u8]) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`WireError::EntryTooLarge`] if `payload.len()` does not fit
+/// in a `u32`. Every relayed payload rides one Aeron frame (MTU about
+/// 1408 bytes), far under that bound.
+pub fn encode_egress_record(index: u64, payload: &[u8]) -> Result<Vec<u8>, WireError> {
+    let len = u32::try_from(payload.len())
+        .map_err(|_| WireError::EntryTooLarge { len: payload.len() })?;
     let mut b = Vec::with_capacity(1 + 8 + 4 + payload.len());
     b.push(EGRESS_KIND_RELAYED);
     b.extend_from_slice(&index.to_le_bytes());
-    b.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    b.extend_from_slice(&len.to_le_bytes());
     b.extend_from_slice(payload);
-    b
+    Ok(b)
 }
 
 /// Frame a block boundary exactly as the Java service does.
+#[must_use]
 pub fn encode_egress_boundary(
     block_number: u64,
     end_tx_idx: u64,
@@ -227,16 +265,21 @@ pub fn encode_egress_boundary(
 }
 
 /// Frame a replay-unavailable notice exactly as the Java service does.
+#[must_use]
 pub fn encode_replay_unavailable(oldest_index: u64, oldest_block: u64) -> Vec<u8> {
     encode_kind_2u64(EGRESS_KIND_REPLAY_UNAVAILABLE, oldest_index, oldest_block)
 }
 
 /// Frame a replay-done marker exactly as the Java service does.
+#[must_use]
 pub fn encode_replay_done(up_to_index: u64, up_to_block: u64) -> Vec<u8> {
     encode_kind_2u64(EGRESS_KIND_REPLAY_DONE, up_to_index, up_to_block)
 }
 
-/// Frame a contiguity reject exactly as the Java service does.
+/// Frame a contiguity reject exactly as the Java service does. The real
+/// encoder is the Java service; this is a test and mock-server helper.
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
 pub fn encode_contiguity_reject(sender: Address, nonce: u64, expected: u64) -> Vec<u8> {
     let mut b = Vec::with_capacity(1 + SENDER_LEN + 8 + 8);
     b.push(EGRESS_KIND_CONTIGUITY_REJECT);

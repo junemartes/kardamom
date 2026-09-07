@@ -35,6 +35,17 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
         Self { ingress }
     }
 
+    /// Offer an already-encoded record. `what` labels the record kind in
+    /// [`SequencerError::EncodeFailed`], for the encode-error branch.
+    fn offer_encoded(
+        &mut self,
+        r: Result<Vec<u8>, wire::WireError>,
+        what: &str,
+    ) -> Result<(), SequencerError> {
+        let bytes = r.map_err(|err| SequencerError::EncodeFailed(format!("{what}: {err}")))?;
+        self.offer(&bytes)
+    }
+
     fn offer(&mut self, bytes: &[u8]) -> Result<(), SequencerError> {
         match self.ingress.offer(bytes) {
             OfferOutcome::Accepted => Ok(()),
@@ -74,10 +85,15 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
                     .iter()
                     .map(|(r, sender, nonce)| wire::encode_ingress_txref(r, *sender, *nonce))
                     .collect();
-                let frame = wire::encode_ingress_batch(&entries);
-                match self.offer(&frame) {
-                    Ok(()) => (many.len(), None),
-                    Err(e) => (0, Some(e)),
+                match wire::encode_ingress_batch(&entries) {
+                    Ok(frame) => match self.offer(&frame) {
+                        Ok(()) => (many.len(), None),
+                        Err(e) => (0, Some(e)),
+                    },
+                    Err(err) => (
+                        0,
+                        Some(SequencerError::EncodeFailed(format!("batch: {err}"))),
+                    ),
                 }
             }
         }
@@ -89,9 +105,7 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
         // before it relays the record. Epochs are never batched: there is
         // one per L1 block, and each one forces a boundary, so there is
         // nothing to amortize.
-        let bytes = wire::encode_ingress_epoch(e)
-            .map_err(|err| SequencerError::EncodeFailed(format!("epoch: {err}")))?;
-        self.offer(&bytes)
+        self.offer_encoded(wire::encode_ingress_epoch(e), "epoch")
     }
 
     fn try_publish_remote_epoch(&mut self, r: &RemoteEpochRecord) -> Result<(), SequencerError> {
@@ -99,29 +113,22 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
         // advance the marker for THIS origin chain and must not stamp a peer
         // chain's anchor into an L2 block boundary. Never batched — one per
         // origin block that carried messages, each forcing a boundary.
-        let bytes = wire::encode_ingress_remote_epoch(r)
-            .map_err(|err| SequencerError::EncodeFailed(format!("remote epoch: {err}")))?;
-        self.offer(&bytes)
+        self.offer_encoded(wire::encode_ingress_remote_epoch(r), "remote epoch")
     }
 }
 
-/// Connect to the cluster and wrap ingress as a `TxOrderingRefPublisher`.
-/// Keep the returned `LiveCluster` guard alive while the publisher is in use.
-pub fn cluster_ref_publisher(
-    rt: kardamom_log::aeron_live::AeronRuntime,
-    cfg: LiveClusterConfig,
-) -> Result<(LiveCluster, ClusterRefPublisher<LiveIngress>), LiveError> {
-    let (cluster, ingress, _egress) = live::connect(rt, cfg)?;
-    Ok((cluster, ClusterRefPublisher::new(ingress)))
-}
-
-/// Like [`cluster_ref_publisher`], but keeps the egress receiver. The
-/// cluster also broadcasts every relayed record and boundary to publisher
-/// sessions. This broadcast is load-bearing for the executors; this
-/// function used to discard it. The boundary frames carry `end_tx_idx`,
-/// the global canonical count that the lag-resync watermark trigger runs
-/// on (see docs/agents/sequencer-lag-resync-spec.md). Drop the returned
-/// `LiveEgress` to restore the old discard behavior.
+/// Connect to the cluster, wrap ingress as a `TxOrderingRefPublisher`, and
+/// keep the egress receiver. The cluster also broadcasts every relayed
+/// record and boundary to publisher sessions; the caller uses this to
+/// drive the lag-resync watermark trigger from the boundary frames'
+/// `end_tx_idx` (the global canonical count).
+///
+/// Keep the returned `LiveCluster` guard alive while the publisher is in
+/// use.
+///
+/// # Errors
+///
+/// Returns an error if the cluster session fails to connect.
 pub fn cluster_ref_publisher_with_egress(
     rt: kardamom_log::aeron_live::AeronRuntime,
     cfg: LiveClusterConfig,
@@ -133,13 +140,22 @@ pub fn cluster_ref_publisher_with_egress(
     // telling this publisher that a known sender's ref would seal a nonce
     // gap. The watermark thread forwards reject frames into the rewind
     // path.
-    let (cluster, ingress, egress) = live::connect_with_egress_kind_filter(
+    let (cluster, ingress, egress) = live::connect_with(
         rt,
         cfg,
-        &[
-            wire::EGRESS_KIND_BOUNDARY,
-            wire::EGRESS_KIND_CONTIGUITY_REJECT,
-        ],
+        live::ConnectOptions {
+            egress_kind_filter: Some(vec![
+                wire::EGRESS_KIND_BOUNDARY,
+                wire::EGRESS_KIND_CONTIGUITY_REJECT,
+            ]),
+            // `subscribe` stays at its default (false): no SUBSCRIBE
+            // announcement. Boundaries broadcast to every session (see
+            // SealerClusteredService.offerBoundary), and contiguity
+            // rejects go directly to the offering session. So this feed
+            // needs no consumer registration, and stays out of the
+            // per-record fan-out.
+            ..Default::default()
+        },
     )?;
     Ok((cluster, ClusterRefPublisher::new(ingress), egress))
 }
@@ -149,28 +165,14 @@ mod tests {
     use super::*;
     use alloy_primitives::B256;
     use kardamom_cluster_adapter::gateway::fakes::FakeIngress;
-    use kardamom_cluster_adapter::wire::{
-        EgressItem, decode_egress, encode_egress_record, split_ingress,
-    };
-    use kardamom_types::{BPosition, TxOrderingMessage};
-
-    fn txref() -> TxRef {
-        TxRef::new(
-            B256::repeat_byte(0x11),
-            2,
-            BPosition {
-                term_id: 0,
-                term_offset: 100,
-            },
-            0,
-        )
-    }
+    use kardamom_cluster_adapter::wire::{EgressItem, encode_egress_record, split_ingress, txref};
+    use kardamom_types::TxOrderingMessage;
 
     #[test]
     fn publishes_txref_as_ingress_envelope() {
         let ingress = FakeIngress::new();
         let mut pubr = ClusterRefPublisher::new(ingress.clone());
-        let r = txref();
+        let r = txref(0x11);
         let sender = alloy_primitives::Address::repeat_byte(0x55);
         pubr.try_publish_ref(&r, sender, 9).unwrap();
         let sent = ingress.accepted();
@@ -183,13 +185,13 @@ mod tests {
         // The Java service relays from the canonical id. That round-trips
         // back to the same TxRef.
         let (_cid, relayed) = split_ingress(&sent[0]).unwrap();
-        match decode_egress(&encode_egress_record(0, relayed)).unwrap() {
+        match EgressItem::decode(&encode_egress_record(0, relayed).unwrap()).unwrap() {
             EgressItem::Record { msg, .. } => assert_eq!(msg, TxOrderingMessage::TxRef(r)),
             other => panic!("expected Record, got {other:?}"),
         }
     }
 
-    /// An epoch must go out as KIND_ORIGIN_RECORD, not a plain record.
+    /// An epoch must go out as `KIND_ORIGIN_RECORD`, not a plain record.
     /// The kind byte makes the sealer close the block and adopt the origin.
     /// Getting it wrong would silently strand deposits mid-block.
     #[test]
@@ -219,9 +221,9 @@ mod tests {
         assert_eq!(u32::from_le_bytes(sent[0][41..45].try_into().unwrap()), 2);
     }
 
-    /// A remote epoch must go out as KIND_REMOTE_ORIGIN_RECORD, carrying the
+    /// A remote epoch must go out as `KIND_REMOTE_ORIGIN_RECORD`, carrying the
     /// origin chain id alongside the anchor: the sealer keys its marker on the
-    /// pair, so relaying this as a plain KIND_ORIGIN_RECORD would merge every
+    /// pair, so relaying this as a plain `KIND_ORIGIN_RECORD` would merge every
     /// peer's progress into the L1 origin and stamp a peer's anchor into an L2
     /// block boundary.
     #[test]
@@ -266,7 +268,7 @@ mod tests {
         ingress.set_outcome(OfferOutcome::BackPressured);
         let mut pubr = ClusterRefPublisher::new(ingress.clone());
         assert!(matches!(
-            pubr.try_publish_ref(&txref(), alloy_primitives::Address::ZERO, 0),
+            pubr.try_publish_ref(&txref(0x11), alloy_primitives::Address::ZERO, 0),
             Err(SequencerError::Backpressure)
         ));
         // Nothing was accepted by the gateway.
@@ -279,7 +281,7 @@ mod tests {
         ingress.set_outcome(OfferOutcome::NotConnected);
         let mut pubr = ClusterRefPublisher::new(ingress);
         assert!(matches!(
-            pubr.try_publish_ref(&txref(), alloy_primitives::Address::ZERO, 0),
+            pubr.try_publish_ref(&txref(0x11), alloy_primitives::Address::ZERO, 0),
             Err(SequencerError::Backpressure)
         ));
     }

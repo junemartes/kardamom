@@ -1,67 +1,32 @@
-//! End-to-end sequencer test against a scripted tx_data subscription and
-//! in-memory tx_ordering and receipt-cache publishers (MDS topology).
+//! End-to-end sequencer test against a scripted `tx_data` subscription and
+//! in-memory `tx_ordering` and receipt-cache publishers (MDS topology).
 //! This test checks:
-//!  * Canonical order on tx_ordering (the `TxRef` sequence) matches a
+//!  * Canonical order on `tx_ordering` (the `TxRef` sequence) matches a
 //!    per-sender, nonce-ascending sequence.
 //!  * Each ref's `tx_data_position` matches the position the proxy supplied
-//!    on the scripted tx_data subscription.
+//!    on the scripted `tx_data` subscription.
 //!  * Duplicates are dropped and reported on the receipt-cache channel.
 //!  * Future-nonce transactions are buffered, and drain when the prior
 //!    nonce arrives.
 
 use std::collections::HashMap;
 
-use alloy_consensus::{SignableTransaction, TxEnvelope as ConsensusEnvelope, TxLegacy};
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, U256};
-use alloy_rlp::Encodable;
-use alloy_signer_local::PrivateKeySigner;
-use bytes::Bytes;
+use alloy_primitives::Address;
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::inbound::fakes::ScriptedTxData;
-use kardamom_sequencer::outbound::fakes::{
-    InMemoryTxErrorPublisher, InMemoryTxOrderingRefPublisher,
-};
-use kardamom_sequencer::sequencer::Sequencer;
-
-fn signer(seed: u64) -> PrivateKeySigner {
-    let mut k = [0u8; 32];
-    k[24..].copy_from_slice(&seed.to_be_bytes());
-    PrivateKeySigner::from_bytes(&k.into()).unwrap()
-}
-
-fn signed_envelope(signer: &PrivateKeySigner, nonce: u64, correlation_id: u64) -> TxEnvelope {
-    let mut tx = TxLegacy {
-        chain_id: Some(1),
-        nonce,
-        gas_price: 1_000_000_000,
-        gas_limit: 21_000,
-        to: Address::ZERO.into(),
-        value: U256::ZERO,
-        input: Default::default(),
-    };
-    let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-    let alloy_env: ConsensusEnvelope = tx.into_signed(sig).into();
-    let mut buf = Vec::with_capacity(256);
-    alloy_env.encode(&mut buf);
-    TxEnvelope {
-        correlation_id,
-        raw_tx: Bytes::from(buf),
-        sender: signer.address(),
-        tx_hash: Default::default(),
-    }
-}
+use kardamom_sequencer::testkit::{drive_to_idle, one_partition_cfg, signed_envelope, signer};
 
 /// Build an A-position for each scripted envelope. This gives refs a
-/// unique pointer back to the simulated tx_data.
+/// unique pointer back to the simulated `tx_data`. Spaced by 64
+/// (unlike `testkit::pos`'s per-1 spacing) to also exercise a
+/// non-contiguous term offset.
 fn pos_n(n: u64) -> BPosition {
     BPosition {
         term_id: 0,
-        term_offset: (n * 64) as i32,
+        term_offset: i32::try_from(n * 64).unwrap(),
     }
 }
 
@@ -69,53 +34,44 @@ fn pos_n(n: u64) -> BPosition {
 fn integration_1000_txs_100_senders_with_chaos() {
     // Single shard so every sender lands here.
     let cfg = SequencerConfig {
-        partition_count: 1,
-        partition_index: 0,
-        sequencer_id: 0,
         max_pending_per_sender: 16,
-        ..Default::default()
+        ..one_partition_cfg()
     };
-    let mut seq = Sequencer::new(cfg.clone());
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(0xDEAD_BEEF);
     let signers: Vec<_> = (1..=100u64).map(signer).collect();
 
     // Each sender contributes 10 in-order nonces. Shuffle the arrival order
     // to exercise the future buffer.
-    let mut stream: Vec<(usize, u64)> = Vec::new();
-    for i in 0..signers.len() {
-        for n in 0..10u64 {
-            stream.push((i, n));
-        }
-    }
+    let mut stream: Vec<(usize, u64)> = (0..signers.len())
+        .flat_map(|i| (0..10u64).map(move |n| (i, n)))
+        .collect();
     stream.shuffle(&mut rng);
 
-    let mut channel_a = ScriptedTxData::default();
-    // sender_at_pos maps tx_data_position to (sender, nonce). It checks that
-    // each published TxRef's tx_data_position points back to the right envelope.
-    let mut sender_at_pos: HashMap<BPosition, (Address, u64)> = HashMap::new();
-    for (correlation, (i, n)) in stream.iter().enumerate() {
-        let position = pos_n(correlation as u64);
-        sender_at_pos.insert(position, (signers[*i].address(), *n));
-        let env = signed_envelope(&signers[*i], *n, correlation as u64);
-        channel_a
-            .queue
-            .push_back((TxDataLoc::new(0, position), env));
-    }
-    let total_input = channel_a.queue.len();
+    let tx_stream: Vec<(TxDataLoc, TxEnvelope)> = stream
+        .iter()
+        .enumerate()
+        .map(|(correlation, (i, n))| {
+            let position = pos_n(correlation as u64);
+            let env = signed_envelope(&signers[*i], *n, correlation as u64);
+            (TxDataLoc::new(0, position), env)
+        })
+        .collect();
+    let total_input = tx_stream.len();
 
-    let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryTxErrorPublisher::default();
-    loop {
-        match seq.run_once(&mut channel_a, &mut b, &mut rc) {
-            Ok(true) => continue,
-            Ok(false) => break,
-            Err(e) => panic!("unexpected error: {e:?}"),
-        }
-    }
+    // sender_at_pos maps tx_data_position to (sender, nonce). It checks that
+    // each published TxRef's tx_data_position points back to the right
+    // envelope. Derived from tx_stream (which carries the position) zipped
+    // with stream (which carries the sender index and nonce).
+    let sender_at_pos: HashMap<BPosition, (Address, u64)> = tx_stream
+        .iter()
+        .zip(stream.iter())
+        .map(|((loc, _env), (i, n))| (loc.position, (signers[*i].address(), *n)))
+        .collect();
+
+    let (refs, _errs) = drive_to_idle(cfg.clone(), &tx_stream);
 
     // Every in-order input must produce a B ref.
-    let refs = b.refs.lock().unwrap().clone();
     assert_eq!(
         refs.len(),
         total_input,
@@ -136,15 +92,11 @@ fn integration_1000_txs_100_senders_with_chaos() {
     }
     assert_eq!(per_sender.len(), signers.len());
     for (s, nonces) in &per_sender {
-        let mut last = None;
-        for n in nonces {
-            if let Some(p) = last {
-                assert!(*n > p, "sender {s}: nonces not ascending: {nonces:?}");
-            } else {
-                assert_eq!(*n, 0, "sender {s}: must start at nonce 0");
-            }
-            last = Some(*n);
-        }
+        assert_eq!(nonces[0], 0, "sender {s}: must start at nonce 0");
+        assert!(
+            nonces.windows(2).all(|w| w[1] > w[0]),
+            "sender {s}: nonces not ascending: {nonces:?}"
+        );
         assert_eq!(
             nonces.len(),
             10,
@@ -156,43 +108,27 @@ fn integration_1000_txs_100_senders_with_chaos() {
 #[test]
 fn integration_duplicates_are_reported() {
     let cfg = SequencerConfig {
-        partition_count: 1,
-        partition_index: 0,
-        sequencer_id: 0,
         max_pending_per_sender: 4,
-        ..Default::default()
+        ..one_partition_cfg()
     };
-    let mut seq = Sequencer::new(cfg);
     let s = signer(7);
-    let mut channel_a = ScriptedTxData::default();
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos_n(0)), signed_envelope(&s, 0, 100)));
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos_n(1)), signed_envelope(&s, 1, 101)));
-    // Three duplicates of nonce 0 arrive after nonce 1 is processed.
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos_n(2)), signed_envelope(&s, 0, 200)));
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos_n(3)), signed_envelope(&s, 0, 201)));
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos_n(4)), signed_envelope(&s, 0, 202)));
+    let stream = vec![
+        (TxDataLoc::new(0, pos_n(0)), signed_envelope(&s, 0, 100)),
+        (TxDataLoc::new(0, pos_n(1)), signed_envelope(&s, 1, 101)),
+        // Three duplicates of nonce 0 arrive after nonce 1 is processed.
+        (TxDataLoc::new(0, pos_n(2)), signed_envelope(&s, 0, 200)),
+        (TxDataLoc::new(0, pos_n(3)), signed_envelope(&s, 0, 201)),
+        (TxDataLoc::new(0, pos_n(4)), signed_envelope(&s, 0, 202)),
+    ];
 
-    let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryTxErrorPublisher::default();
-    while let Ok(true) = seq.run_once(&mut channel_a, &mut b, &mut rc) {}
+    let (refs, errs) = drive_to_idle(cfg, &stream);
 
-    assert_eq!(b.refs.lock().unwrap().len(), 2);
-    let errs = rc.errors.lock().unwrap();
+    assert_eq!(refs.len(), 2);
     assert_eq!(errs.len(), 3, "all 3 past-nonce submissions emit a TxError");
     // All 3 errors are for the same (sender, nonce=0). They are distinct
     // submissions, but the TxError layer cannot tell them apart:
     // correlation_id was dropped when the receipt-cache channel was retired.
-    for err in errs.iter() {
+    for err in &errs {
         assert_eq!(err.sender, s.address());
         assert_eq!(err.nonce, 0);
         assert!(matches!(
@@ -210,25 +146,16 @@ fn integration_bounded_buffer_evicts_oldest() {
     // only refs for 0 and the surviving futures would appear. This test
     // checks that no publishes happen in the all-future phase.
     let cfg = SequencerConfig {
-        partition_count: 1,
-        partition_index: 0,
-        sequencer_id: 0,
         max_pending_per_sender: 4,
-        ..Default::default()
+        ..one_partition_cfg()
     };
-    let mut seq = Sequencer::new(cfg);
     let s = signer(42);
-    let mut channel_a = ScriptedTxData::default();
-    for n in 100..110u64 {
-        channel_a
-            .queue
-            .push_back((TxDataLoc::new(0, pos_n(n)), signed_envelope(&s, n, n)));
-    }
-    let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryTxErrorPublisher::default();
-    while let Ok(true) = seq.run_once(&mut channel_a, &mut b, &mut rc) {}
+    let stream: Vec<_> = (100..110u64)
+        .map(|n| (TxDataLoc::new(0, pos_n(n)), signed_envelope(&s, n, n)))
+        .collect();
+    let (refs, _errs) = drive_to_idle(cfg, &stream);
     assert_eq!(
-        b.refs.lock().unwrap().len(),
+        refs.len(),
         0,
         "all 10 are futures, no canonical refs emitted"
     );

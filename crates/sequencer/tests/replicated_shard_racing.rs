@@ -1,9 +1,9 @@
 //! P=2 racing sequencer replicas on one shard (the replicated-sequencer-shards
-//! deploy: two Nomad groups, same partition, same tx_data stream).
+//! deploy: two Nomad groups, same partition, same `tx_data` stream).
 //!
 //! This test checks the invariants that make replica racing safe by
 //! construction:
-//!  * Determinism: two replicas fed the identical tx_data stream emit
+//!  * Determinism: two replicas fed the identical `tx_data` stream emit
 //!    byte-identical ref sequences (`wire::encode_ingress_txref`). So the
 //!    cluster's first-seen dedup relays the same canonical payload, no
 //!    matter which replica wins any given record.
@@ -13,86 +13,49 @@
 //!    nonce order is kept (each replica emits nonce-ordered, and session
 //!    order is kept per publisher, so the first-seen merge cannot invert
 //!    nonces).
-//!  * Cold rejoin: a replica that restarts mid-stream, and hydrates its
-//!    nonce floor from committed state (the stateless-sequencer cache-miss
-//!    path), emits a suffix of its twin's sequence. Merging it changes
-//!    nothing.
-//!  * Cold rejoin, misaligned floor: hydration is only a lower bound (the
-//!    deployed binary wires an empty state DB, and even a real one can
-//!    trail refs that the twin ordered but that are not committed yet).
-//!    The stream-adaptive floor fast-forward (`nonce_floor_lag_ms`) adopts
-//!    the live join point after the lag bound. So the rejoiner still
-//!    emits exactly its twin's suffix, instead of zombie-buffering forever.
+//!  * Cold rejoin: a replica that restarts mid-stream holds no
+//!    committed-state reader, so it seeds established senders at 0 and
+//!    buffers their traffic. It stalls (degraded P=1 coverage) until the
+//!    receipt-floor resync advances their floors, and never corrupts the
+//!    canonical stream in the meantime.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 
-use alloy_consensus::{SignableTransaction, TxEnvelope as ConsensusEnvelope, TxLegacy};
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, U256, keccak256};
-use alloy_rlp::Encodable;
-use bytes::Bytes;
+use alloy_consensus::transaction::Transaction as _;
+use alloy_primitives::Address;
+use alloy_rlp::Decodable as _;
+use alloy_signer_local::PrivateKeySigner;
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope, TxRef};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
 use kardamom_cluster_adapter::wire;
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::inbound::fakes::ScriptedTxData;
-use kardamom_sequencer::outbound::fakes::{
-    InMemoryTxErrorPublisher, InMemoryTxOrderingRefPublisher,
+use kardamom_sequencer::partition::PartitionCount;
+use kardamom_sequencer::testkit::{
+    EnvelopeSpec, drive_to_idle, envelope_with, one_partition_cfg, signer,
 };
-use kardamom_sequencer::partition::partition_for;
-use kardamom_sequencer::sequencer::Sequencer;
 
 const SENDERS: usize = 3;
 const TX_PER_SENDER: u64 = 20;
 
-fn signer(seed: u64) -> alloy_signer_local::PrivateKeySigner {
-    let mut k = [0u8; 32];
-    k[24..].copy_from_slice(&seed.to_be_bytes());
-    alloy_signer_local::PrivateKeySigner::from_bytes(&k.into()).unwrap()
-}
-
-/// Build a signed legacy transaction with the real keccak256 tx_hash.
+/// Build a signed legacy transaction with the real keccak256 `tx_hash`.
 /// This is the racing-replica dedup key. Unlike the single-replica tests,
 /// it is not left defaulted.
-fn signed_envelope(
-    s: &alloy_signer_local::PrivateKeySigner,
-    nonce: u64,
-    correlation_id: u64,
-) -> TxEnvelope {
-    let mut tx = TxLegacy {
-        chain_id: Some(1),
+fn signed_envelope(s: &PrivateKeySigner, nonce: u64, correlation_id: u64) -> TxEnvelope {
+    envelope_with(
+        s,
         nonce,
-        gas_price: 1_000_000_000,
-        gas_limit: 21_000,
-        to: Address::ZERO.into(),
-        value: U256::ZERO,
-        input: Default::default(),
-    };
-    let sig = s.sign_transaction_sync(&mut tx).unwrap();
-    let alloy_env: ConsensusEnvelope = tx.into_signed(sig).into();
-    let mut buf = Vec::with_capacity(256);
-    alloy_env.encode(&mut buf);
-    let tx_hash = keccak256(&buf);
-    TxEnvelope {
         correlation_id,
-        raw_tx: Bytes::from(buf),
-        sender: s.address(),
-        tx_hash,
-    }
+        EnvelopeSpec {
+            real_hash: true,
+            ..Default::default()
+        },
+    )
 }
 
-fn shard0_cfg() -> SequencerConfig {
-    SequencerConfig {
-        partition_count: 1,
-        partition_index: 0,
-        sequencer_id: 0,
-        ..Default::default()
-    }
-}
-
-/// The shared per-shard tx_data stream. SENDERS senders' transactions are
+/// The shared per-shard `tx_data` stream. SENDERS senders' transactions are
 /// interleaved round-robin, nonce-ordered per sender, with distinct
 /// A-positions. This is the way Aeron fragment offsets work in production.
 fn shard_stream() -> Vec<(TxDataLoc, TxEnvelope)> {
@@ -100,39 +63,38 @@ fn shard_stream() -> Vec<(TxDataLoc, TxEnvelope)> {
     // Sanity check: sharding is a property of the ingress router, not
     // the sequencer. With partition_count=1, every sender is ours.
     for s in &signers {
-        assert_eq!(partition_for(s.address(), 1), 0);
+        assert_eq!(
+            PartitionCount::new(NonZeroU32::new(1).unwrap()).index_of(s.address()),
+            0
+        );
     }
-    let mut stream = Vec::new();
-    let mut offset = 0i32;
-    for nonce in 0..TX_PER_SENDER {
-        for (i, s) in signers.iter().enumerate() {
+    // The cartesian product of (nonce, sender-index), in the same
+    // row-major order the original nested loop walked: `offset` there
+    // was just `64 * corr`, since it incremented once per (nonce, i)
+    // pair starting at 0.
+    (0..TX_PER_SENDER)
+        .flat_map(|nonce| (0..signers.len()).map(move |i| (nonce, i)))
+        .map(|(nonce, i)| {
             let corr = nonce * SENDERS as u64 + i as u64;
             let pos = BPosition {
                 term_id: 0,
-                term_offset: offset,
+                term_offset: i32::try_from(corr * 64).unwrap(),
             };
-            stream.push((TxDataLoc::new(0, pos), signed_envelope(s, nonce, corr)));
-            offset += 64;
-        }
-    }
-    stream
+            (
+                TxDataLoc::new(0, pos),
+                signed_envelope(&signers[i], nonce, corr),
+            )
+        })
+        .collect()
 }
 
 /// Run one replica over `stream`, returning its published refs.
 fn run_replica(stream: &[(TxDataLoc, TxEnvelope)]) -> Vec<TxRef> {
-    run_replica_with(shard0_cfg(), stream)
+    run_replica_with(one_partition_cfg(), stream)
 }
 
 fn run_replica_with(cfg: SequencerConfig, stream: &[(TxDataLoc, TxEnvelope)]) -> Vec<TxRef> {
-    let mut inbound = ScriptedTxData::default();
-    for (loc, env) in stream {
-        inbound.queue.push_back((*loc, env.clone()));
-    }
-    let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryTxErrorPublisher::default();
-    let mut seq = Sequencer::new(cfg);
-    while seq.run_once(&mut inbound, &mut b, &mut rc).unwrap() {}
-    b.refs.lock().unwrap().clone()
+    drive_to_idle(cfg, stream).0
 }
 
 /// The cluster's first-seen dedup (Java `CanonicalSealerState.firstSeen`),
@@ -142,7 +104,7 @@ fn first_seen_merge(interleaved: &[TxRef]) -> Vec<TxRef> {
     interleaved
         .iter()
         .filter(|r| seen.insert(r.tx_hash))
-        .cloned()
+        .copied()
         .collect()
 }
 
@@ -204,7 +166,8 @@ fn first_seen_dedup_of_any_interleaving_is_the_single_replica_stream() {
         // Per-sender nonce order in the canonical stream is dense and
         // ascending. (The stream is built round-robin, so stream[i]'s
         // nonce is i / SENDERS. No need to RLP-decode.)
-        let mut next: std::collections::HashMap<Address, u64> = Default::default();
+        let mut next: std::collections::HashMap<Address, u64> =
+            std::collections::HashMap::default();
         for r in &canonical {
             let (idx, env) = stream
                 .iter()
@@ -223,14 +186,14 @@ fn first_seen_dedup_of_any_interleaving_is_the_single_replica_stream() {
 /// A deliberately re-opened status pin: the floor fast-forward was removed
 /// after it published canonical nonce gaps. A sequencer cannot locally
 /// tell a twin-ordered gap apart from a client-abandoned one, and every
-/// executor fatally hit NonceTooHigh when it adopted a client-abandoned
+/// executor fatally hit `NonceTooHigh` when it adopted a client-abandoned
 /// gap.
 ///
 /// The sequencer holds no committed-state reader. So a replica that
 /// rejoins mid-stream seeds established senders at 0, buffers their
 /// traffic, and emits nothing for them until the receipt-floor resync
 /// (`crate::resync`, not wired in this harness) advances their floors from
-/// the tx_receipts stream. This is degraded P=1 coverage, but never
+/// the `tx_receipts` stream. This is degraded P=1 coverage, but never
 /// canonical corruption. This test pins the never-corrupts invariant.
 #[test]
 fn rejoining_replica_with_empty_db_stalls_but_never_corrupts() {
@@ -258,11 +221,9 @@ fn rejoining_replica_with_empty_db_stalls_but_never_corrupts() {
 
 /// A client-abandoned nonce hole must never be adopted into the canonical
 /// stream. This is a transaction dropped at ingress under overload, or
-/// during a chaos outage, so it never reaches tx_data. The sender stalls
-/// at the hole, and every published nonce run stays dense. The removed
-/// fast-forward used to adopt the post-hole run after 5 seconds,
-/// publishing a gapped stream that fatally hit NonceTooHigh on every
-/// executor.
+/// during a chaos outage, so it never reaches `tx_data`. The sender stalls
+/// at the hole, and every published nonce run stays dense: nothing past
+/// the hole is ever published.
 #[test]
 fn client_abandoned_nonce_hole_is_never_published_past() {
     let full = shard_stream();
@@ -275,9 +236,7 @@ fn client_abandoned_nonce_hole_is_never_published_past() {
             if env.sender != victim {
                 return true;
             }
-            use alloy_rlp::Decodable as _;
             let e = alloy_consensus::TxEnvelope::decode(&mut env.raw_tx.as_ref()).unwrap();
-            use alloy_consensus::transaction::Transaction as _;
             !(e.nonce() == 3 || e.nonce() == 4)
         })
         .collect();
@@ -287,14 +246,11 @@ fn client_abandoned_nonce_hole_is_never_published_past() {
     // The victim's published nonces are exactly the dense prefix 0..=2.
     // Nothing at or past the hole appears, and every sender's run is
     // gapless.
-    use std::collections::HashMap;
     let mut per_sender: HashMap<_, Vec<u64>> = HashMap::new();
     for (loc, env) in &stream {
         // Reconstruct (sender, nonce) for each published ref via its position.
         if let Some(r) = refs.iter().find(|r| r.tx_data_position == loc.position) {
-            use alloy_rlp::Decodable as _;
             let e = alloy_consensus::TxEnvelope::decode(&mut env.raw_tx.as_ref()).unwrap();
-            use alloy_consensus::transaction::Transaction as _;
             assert_eq!(r.tx_hash, env.tx_hash);
             per_sender.entry(env.sender).or_default().push(e.nonce());
         }
@@ -304,7 +260,7 @@ fn client_abandoned_nonce_hole_is_never_published_past() {
         let expect_len = if sender == victim {
             3 // 0,1,2, stalled at the hole
         } else {
-            TX_PER_SENDER as usize
+            usize::try_from(TX_PER_SENDER).unwrap()
         };
         assert_eq!(
             nonces,

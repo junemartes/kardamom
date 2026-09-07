@@ -24,8 +24,8 @@ use crate::protocol::{
 };
 
 /// App semantic version sent in `SessionConnectRequest.version`. This is the
-/// Aeron Cluster appVersion that the ConsensusModule validates. It is not
-/// the SBE schema version (an earlier value of 5.4.0 conflated the two).
+/// Aeron Cluster appVersion that the `ConsensusModule` validates. It is not
+/// the SBE schema version.
 ///
 /// The major version must be 0. Aeron checks this two ways, and both need
 /// major 0 here: at session connect, the client's major must equal the
@@ -33,10 +33,11 @@ use crate::protocol::{
 /// version starts at 0.0.0 internally. A nonzero major triggers an
 /// "incompatible version" error, and the members self-terminate.
 ///
-/// Pinned to 0.3.0, to match the Java cluster (ClusterNode.APP_VERSION).
-// The major lane (`0 << 16`) stays explicit, to mirror the major.minor.patch
-// packing, even though major is 0. Allow clippy's identity_op for clarity.
-#[allow(clippy::identity_op)]
+/// Pinned to 0.3.0, to match the Java cluster (`ClusterNode.APP_VERSION`).
+#[allow(
+    clippy::identity_op,
+    reason = "the major lane (0 << 16) stays explicit, to mirror the major.minor.patch packing, even though major is 0"
+)]
 pub const APP_SEMANTIC_VERSION: i32 = (0 << 16) | (3 << 8);
 
 /// Session state exposed to the transport.
@@ -140,7 +141,9 @@ impl SessionDriver {
     }
 
     /// Total connect requests emitted so far.
-    pub fn connect_attempts(&self) -> u64 {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn connect_attempts(&self) -> u64 {
         self.connect_attempts
     }
 
@@ -151,12 +154,29 @@ impl SessionDriver {
         std::mem::take(&mut self.rotate_hint)
     }
 
-    pub fn state(&self) -> &SessionState {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn state(&self) -> &SessionState {
         &self.state
     }
 
+    #[must_use]
     pub fn is_connected(&self) -> bool {
         matches!(self.state, SessionState::Connected { .. })
+    }
+
+    /// The foreign-session filter, shared by every `on_session_event` arm:
+    /// prove `ev` is ours by `cluster_session_id` when we hold a session,
+    /// or by connect correlation id when we are establishing one. See
+    /// `on_session_event`'s doc comment for why this matters (a
+    /// hard-killed predecessor's session corpse sends events here too).
+    fn event_is_ours(&self, ev: &crate::protocol::SessionEvent) -> bool {
+        match self.state {
+            SessionState::Connected {
+                cluster_session_id, ..
+            } => ev.cluster_session_id == cluster_session_id,
+            _ => ev.correlation_id == self.in_flight_correlation_id,
+        }
     }
 
     /// Frames the transport should offer on the ingress publication now.
@@ -185,22 +205,40 @@ impl SessionDriver {
             _ => {}
         }
         let mut out = Vec::new();
-        if self.pending_connect {
-            self.in_flight_correlation_id = self.next_correlation_id;
-            self.next_correlation_id += 1;
-            out.push(encode_session_connect_request(
-                self.in_flight_correlation_id,
-                self.response_stream_id,
-                APP_SEMANTIC_VERSION,
-                &self.response_channel,
-                &[],
-                "",
-            ));
-            self.pending_connect = false;
-            self.last_emit_ms = now_ms;
-            self.last_connect_ms = now_ms;
-            self.connect_attempts += 1;
+        self.emit_connect(now_ms, &mut out);
+        self.emit_keep_alive(now_ms, &mut out);
+        out
+    }
+
+    /// Emit a connect request if one is pending, and advance the retry
+    /// bookkeeping.
+    fn emit_connect(&mut self, now_ms: u64, out: &mut Vec<Vec<u8>>) {
+        if !self.pending_connect {
+            return;
         }
+        self.in_flight_correlation_id = self.next_correlation_id;
+        // A process-lifetime counter: wrap rather than panic (in a
+        // debug build). Reuse after i64::MAX connect attempts is not
+        // a real-world concern.
+        self.next_correlation_id = self.next_correlation_id.wrapping_add(1);
+        out.push(encode_session_connect_request(
+            self.in_flight_correlation_id,
+            self.response_stream_id,
+            APP_SEMANTIC_VERSION,
+            &self.response_channel,
+            &[],
+            "",
+        ));
+        self.pending_connect = false;
+        self.last_emit_ms = now_ms;
+        self.last_connect_ms = now_ms;
+        // Only ever compared against 0; saturate rather than wrap.
+        self.connect_attempts = self.connect_attempts.saturating_add(1);
+    }
+
+    /// Emit a keep-alive if connected and the interval has elapsed since
+    /// the last emit (a connect request also counts as an emit).
+    fn emit_keep_alive(&mut self, now_ms: u64, out: &mut Vec<Vec<u8>>) {
         if let SessionState::Connected {
             cluster_session_id,
             leadership_term_id,
@@ -214,7 +252,6 @@ impl SessionDriver {
             ));
             self.last_emit_ms = now_ms;
         }
-        out
     }
 
     /// Feed one egress frame. Return the resulting session events.
@@ -278,73 +315,62 @@ impl SessionDriver {
         // correlation id when we are establishing one, and ignore
         // everything else.
         match ev.code {
-            EventCode::Ok => {
-                match self.state {
-                    SessionState::Connected {
-                        cluster_session_id, ..
-                    } => {
-                        // Already connected: accept only an idempotent re-OK
-                        // for our own session, which refreshes the term and
-                        // leader. A foreign OK must not overwrite our
-                        // session state.
-                        if ev.cluster_session_id != cluster_session_id {
-                            return Vec::new();
-                        }
-                    }
-                    _ => {
-                        // Establishing: the OK must answer our in-flight
-                        // connect attempt.
-                        if ev.correlation_id != self.in_flight_correlation_id {
-                            return Vec::new();
-                        }
-                    }
-                }
-                self.state = SessionState::Connected {
-                    cluster_session_id: ev.cluster_session_id,
-                    leadership_term_id: ev.leadership_term_id,
-                    leader_member_id: ev.leader_member_id,
-                };
-                vec![DriverEvent::Connected {
-                    cluster_session_id: ev.cluster_session_id,
-                }]
-            }
-            EventCode::Redirect => {
-                // A follower answering our connect attempt with the
-                // leader's endpoints. A redirect is a connect-time
-                // response. While connected, or for a stale correlation
-                // id, a redirect is not ours to act on. Acting on a
-                // foreign one would force a spurious reconnect and drop
-                // our healthy session.
-                if self.is_connected() || ev.correlation_id != self.in_flight_correlation_id {
-                    return Vec::new();
-                }
-                self.pending_connect = true;
-                vec![DriverEvent::Reconnect {
-                    leader_member_id: ev.leader_member_id,
-                    ingress_endpoints: ev.detail,
-                }]
-            }
+            EventCode::Ok => self.on_ok(&ev),
+            EventCode::Redirect => self.on_redirect(ev),
             EventCode::Error | EventCode::AuthenticationRejected | EventCode::Closed => {
-                let ours = match self.state {
-                    SessionState::Connected {
-                        cluster_session_id, ..
-                    } => ev.cluster_session_id == cluster_session_id,
-                    // Establishing: connect rejections answer our correlation.
-                    _ => ev.correlation_id == self.in_flight_correlation_id,
-                };
-                if !ours {
-                    return Vec::new();
-                }
-                let reason = if ev.detail.is_empty() {
-                    format!("{:?}", ev.code)
-                } else {
-                    ev.detail.clone()
-                };
-                self.state = SessionState::Failed(reason.clone());
-                vec![DriverEvent::Failed(reason)]
+                self.on_rejection(&ev)
             }
             EventCode::Unknown(_) => Vec::new(),
         }
+    }
+
+    /// Already connected: accept only an idempotent re-OK for our own
+    /// session, which refreshes the term and leader. A foreign OK must
+    /// not overwrite our session state. Establishing: the OK must answer
+    /// our in-flight connect attempt. `event_is_ours` covers both cases.
+    fn on_ok(&mut self, ev: &crate::protocol::SessionEvent) -> Vec<DriverEvent> {
+        if !self.event_is_ours(ev) {
+            return Vec::new();
+        }
+        self.state = SessionState::Connected {
+            cluster_session_id: ev.cluster_session_id,
+            leadership_term_id: ev.leadership_term_id,
+            leader_member_id: ev.leader_member_id,
+        };
+        vec![DriverEvent::Connected {
+            cluster_session_id: ev.cluster_session_id,
+        }]
+    }
+
+    /// A follower answering our connect attempt with the leader's
+    /// endpoints. A redirect is a connect-time response. While connected,
+    /// or for a stale correlation id, a redirect is not ours to act on.
+    /// Acting on a foreign one would force a spurious reconnect and drop
+    /// our healthy session.
+    fn on_redirect(&mut self, ev: crate::protocol::SessionEvent) -> Vec<DriverEvent> {
+        if self.is_connected() || !self.event_is_ours(&ev) {
+            return Vec::new();
+        }
+        self.pending_connect = true;
+        vec![DriverEvent::Reconnect {
+            leader_member_id: ev.leader_member_id,
+            ingress_endpoints: ev.detail,
+        }]
+    }
+
+    /// `Error`, `AuthenticationRejected`, or `Closed`: fail the session if
+    /// the event is ours.
+    fn on_rejection(&mut self, ev: &crate::protocol::SessionEvent) -> Vec<DriverEvent> {
+        if !self.event_is_ours(ev) {
+            return Vec::new();
+        }
+        let reason = if ev.detail.is_empty() {
+            format!("{:?}", ev.code)
+        } else {
+            ev.detail.clone()
+        };
+        self.state = SessionState::Failed(reason.clone());
+        vec![DriverEvent::Failed(reason)]
     }
 
     /// Force the current session to be abandoned, and a fresh one
@@ -382,6 +408,7 @@ impl SessionDriver {
 
     /// Frame an application `payload` for ingress, as a `SessionMessageHeader`
     /// that wraps `payload`. Return `None` until the session is open.
+    #[must_use]
     pub fn wrap_app(&self, payload: &[u8], timestamp: i64) -> Option<Vec<u8>> {
         match self.state {
             SessionState::Connected {

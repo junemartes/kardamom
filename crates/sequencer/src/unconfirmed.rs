@@ -25,7 +25,7 @@ pub(crate) type UnconfirmedKey = (Address, u64);
 /// methods are single-threaded map and queue bookkeeping.
 pub(crate) struct UnconfirmedLedger<T> {
     /// Maps (sender, nonce) to (ref metadata, published-at). This is a
-    /// BTreeMap, so per-sender ranges trim cheaply on confirmation, and
+    /// `BTreeMap`, so per-sender ranges trim cheaply on confirmation, and
     /// rewinds see ascending nonce order.
     entries: BTreeMap<UnconfirmedKey, (T, Instant)>,
     /// Publish-order expiry queue over `entries`, with lazy deletion. A
@@ -35,9 +35,9 @@ pub(crate) struct UnconfirmedLedger<T> {
     /// while its old queue entry is still buffered, so timestamp equality
     /// tells the two apart.) Front-peek makes the confirm-timeout sweep
     /// O(1) when nothing has expired, the steady state, and amortized O(1)
-    /// per entry overall. The old full-map scan was O(rate times
-    /// receipt-latency) per iteration on the publish hot path, and it was
-    /// worst exactly when the system was already in failover recovery.
+    /// per entry overall. A full-map scan would cost O(rate times
+    /// receipt-latency) per iteration on the publish hot path, worst
+    /// exactly when the system is already in failover recovery.
     expiry: VecDeque<(Instant, UnconfirmedKey)>,
 }
 
@@ -54,6 +54,17 @@ impl<T> UnconfirmedLedger<T> {
         self.entries.len()
     }
 
+    /// Keys for `sender` with a nonce in `lo..=hi`, in ascending order.
+    /// Shared by every per-sender nonce-range scan below: none of them
+    /// can remove-while-iterating a `BTreeMap` range, so each collects
+    /// the keys first.
+    fn keys_in(&self, sender: Address, lo: u64, hi: u64) -> Vec<UnconfirmedKey> {
+        self.entries
+            .range((sender, lo)..=(sender, hi))
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
     /// Retain a just-published ref until a receipt proves canonical
     /// commitment, and queue it for the confirm-timeout sweep.
     pub(crate) fn record_published(&mut self, sender: Address, nonce: u64, meta: T) {
@@ -68,12 +79,7 @@ impl<T> UnconfirmedLedger<T> {
     /// preserved end to end). Drop them from the ledger. `sweep_expired`
     /// lazily deletes their expiry-queue slots.
     pub(crate) fn confirm_through(&mut self, sender: Address, confirmed: u64) {
-        let keys: Vec<_> = self
-            .entries
-            .range((sender, 0)..=(sender, confirmed))
-            .map(|(k, _)| *k)
-            .collect();
-        for k in keys {
+        for k in self.keys_in(sender, 0, confirmed) {
             self.entries.remove(&k);
         }
     }
@@ -102,11 +108,7 @@ impl<T> UnconfirmedLedger<T> {
         sender: Address,
         expected: u64,
     ) -> Vec<(UnconfirmedKey, T)> {
-        let keys: Vec<_> = self
-            .entries
-            .range((sender, expected)..=(sender, u64::MAX))
-            .map(|(k, _)| *k)
-            .collect();
+        let keys = self.keys_in(sender, expected, u64::MAX);
         self.take_descending(keys)
     }
 

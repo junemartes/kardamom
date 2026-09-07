@@ -1,22 +1,24 @@
-//! Inbound tx_data subscription.
+//! Inbound `tx_data` subscription.
 //!
-//! Under the MDS topology, the sequencer subscribes to one tx_data stream
+//! Under the MDS topology, the sequencer subscribes to one `tx_data` stream
 //! (the one for its address shard). It sees every `TxEnvelope` that any
 //! proxy published there, paired with the Aeron `BPosition` of that
 //! fragment. The sequencer reorders envelopes by per-sender nonce, then
 //! republishes a `TxRef { tx_hash, shard_id, tx_data_position }` onto
-//! tx_ordering.
+//! `tx_ordering`.
 //!
 //! The inbound `TxEnvelope` already has `sender` and `tx_hash` set by
 //! the proxy. No recovery or hashing happens here.
 
-use crate::error::SequencerError;
+use kardamom_log::aeron_live::TxDataSubscriberHandle;
 use kardamom_types::{TxDataLoc, TxEnvelope};
 
-/// Subscription to one tx_data stream.
+use crate::error::SequencerError;
+
+/// Subscription to one `tx_data` stream.
 /// Yields `(TxDataLoc, envelope)` for each Aeron fragment: the envelope
 /// paired with its publisher `session_id` and `BPosition`. Production code
-/// wraps a `log` tx_data subscriber. Tests use [`fakes::ScriptedTxData`].
+/// wraps a `log` `tx_data` subscriber. Tests use [`fakes::ScriptedTxData`].
 ///
 /// This has the same shape as the executor's `TxDataSubscription` trait.
 /// The difference: the sequencer is one of P concurrent subscribers per
@@ -30,7 +32,20 @@ pub trait TxDataSubscriber: Send {
     ///  - `Ok(None)` when no message is ready (caller backs off).
     ///  - `Err(IngressDisconnected)` when the subscription is permanently
     ///    closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SequencerError::IngressDisconnected`] when the
+    /// subscription is permanently closed.
     fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError>;
+}
+
+/// The live adapter: the sequencer's run loop handles backoff when `poll`
+/// returns `None`, so a miss is not an error here.
+impl TxDataSubscriber for TxDataSubscriberHandle {
+    fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError> {
+        Ok(self.try_recv())
+    }
 }
 
 // ===========================================================================
@@ -41,9 +56,9 @@ pub trait TxDataSubscriber: Send {
 pub mod fakes {
     use std::collections::VecDeque;
 
-    use super::*;
+    use super::{SequencerError, TxDataLoc, TxDataSubscriber, TxEnvelope};
 
-    /// In-memory tx_data subscription. It is scripted with `(loc, envelope)`
+    /// In-memory `tx_data` subscription. It is scripted with `(loc, envelope)`
     /// pairs in arrival order. Tests usually build a vector of envelopes and
     /// make increasing [`TxDataLoc`] values (session and position) before
     /// they run `Sequencer::run_once`.

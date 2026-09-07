@@ -1,11 +1,11 @@
 //! Sequencer event step and loop.
 //!
-//! [`Sequencer::run_once`] polls the shard's tx_data subscription for at
+//! [`Sequencer::run_once`] polls the shard's `tx_data` subscription for at
 //! most one fragment, and republishes a canonical-order `TxRef` onto
-//! tx_ordering.
+//! `tx_ordering`.
 //!
 //! Under the MDS topology, the proxy has already published the envelope
-//! onto tx_data. So the sequencer's input is `(tx_data_position,
+//! onto `tx_data`. So the sequencer's input is `(tx_data_position,
 //! envelope)`. The proxy's Aeron-offer position is the lookup key that
 //! downstream consumers (executor, batcher) use to resolve the envelope.
 //!
@@ -23,12 +23,12 @@
 //!     - past: emit a `TxError { reason: DuplicatedTx { expected_nonce } }`.
 //!  4. For each `Publish` action, build
 //!     `TxRef { tx_hash, shard_id, tx_data_position }` and publish it to
-//!     tx_ordering. If B applies backpressure,
+//!     `tx_ordering`. If B applies backpressure,
 //!     [`PartitionState::reinsert_for_retry`] rewinds the state, so the
 //!     next loop iteration retries the same `(sender, nonce)`.
 //!
 //! Warm cache: because every observed envelope advances `next_nonce` on a
-//! match, the in-memory map fills naturally from the tx_data read stream
+//! match, the in-memory map fills naturally from the `tx_data` read stream
 //! itself. No separate prefetch thread is needed. A cold sender (no
 //! activity since startup) seeds at nonce 0.
 //!
@@ -38,11 +38,11 @@
 //! nonces that will never reappear, and does not regain coverage of that
 //! sender (P=1 coverage until its twin also restarts). The committed
 //! floor is recovered out of band by the receipt-floor resync
-//! (`crate::resync`), not by a state-DB read. An earlier stream-adaptive
-//! floor fast-forward was removed, because it could not tell a
-//! twin-ordered gap apart from a client-abandoned one. Adopting the
-//! latter published canonical nonce gaps that fatally hit NonceTooHigh on
-//! every executor (see PartitionState's note).
+//! (`crate::resync`), not by a state-DB read. A sequencer cannot tell a
+//! twin-ordered gap apart from a client-abandoned one, so it must never
+//! locally infer and fast-forward past a nonce gap: adopting a
+//! client-abandoned gap publishes a canonical nonce gap that fatally hits
+//! `NonceTooHigh` on every executor (see `PartitionState`'s note).
 //!
 //! See also [`crate::outbound`] for the trait surface and the in-memory
 //! fakes used by tests.
@@ -52,19 +52,17 @@ use std::time::Duration;
 use kardamom_types::{BPosition, TxError, TxErrorReason};
 use tracing::{trace, warn};
 
-use crate::config::SequencerConfig;
+use crate::config::{ConfigError, SequencerConfig};
 use crate::error::SequencerError;
 use crate::inbound::TxDataSubscriber;
 use crate::metrics;
 use crate::nonce_decode::decode_nonce;
 use crate::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
-use crate::partition::partition_for;
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
 use crate::unconfirmed::{UnconfirmedKey, UnconfirmedLedger};
 
-// Re-export: the shutdown signal lived here before it moved to
-// `crate::shutdown`; the bin (and external callers) import
+// Re-export: the bin (and external callers) import
 // `kardamom_sequencer::sequencer::Shutdown`.
 pub use crate::shutdown::Shutdown;
 
@@ -74,35 +72,72 @@ pub use crate::shutdown::Shutdown;
 /// [`PartitionState::reinsert_for_retry`] puts a complete, ready-to-resend
 /// record back in the pending buffer on a B-backpressure rewind.
 ///
-/// This struct no longer carries the envelope bytes. The proxy already
-/// wrote them onto tx_data; the sequencer only republishes the ref.
+/// This struct holds a reference back to the envelope, not the envelope
+/// bytes themselves. The proxy already wrote them onto `tx_data`; the
+/// sequencer only republishes the ref.
 #[derive(Debug, Clone)]
 struct RefMetadata {
     correlation_id: u64,
     /// Carries through to `TxRef.tx_hash`.
     tx_hash: alloy_primitives::B256,
     /// The Aeron-offer position the proxy got back when it published this
-    /// envelope onto tx_data. Downstream consumers use this to look up
+    /// envelope onto `tx_data`. Downstream consumers use this to look up
     /// the envelope on the A archive.
     tx_data_position: BPosition,
-    /// The Aeron publisher `session_id` of that tx_data fragment. Carries
+    /// The Aeron publisher `session_id` of that `tx_data` fragment. Carries
     /// through to `TxRef.tx_data_session_id`, so the executor join key
     /// `(shard, session, position)` stays unique under concurrent,
     /// active-active ingress publishers.
     tx_data_session_id: i32,
 }
 
+/// One `Sequencer::run_once` iteration's port set: the `tx_data`
+/// subscription, the `tx_ordering` publisher, and the `tx_errors` publisher.
+/// Groups the three bounds behind one type parameter, instead of three
+/// separate ones on `run_once` and `run`.
+pub trait SequencerPorts: Send {
+    type In: TxDataSubscriber;
+    type Refs: TxOrderingRefPublisher;
+    type Errors: TxErrorPublisher;
+
+    /// Borrow the three ports for one iteration.
+    fn split(&mut self) -> (&mut Self::In, &mut Self::Refs, &mut Self::Errors);
+}
+
+/// Borrows the three [`SequencerPorts`] for one `run_once`/`run` call: a
+/// named struct instead of a positional `(&mut I, &mut B, &mut R)` tuple,
+/// so each borrow states what it is.
+pub struct Ports<'a, I, B, R> {
+    pub tx_data: &'a mut I,
+    pub refs: &'a mut B,
+    pub errors: &'a mut R,
+}
+
+impl<I, B, R> SequencerPorts for Ports<'_, I, B, R>
+where
+    I: TxDataSubscriber,
+    B: TxOrderingRefPublisher,
+    R: TxErrorPublisher,
+{
+    type In = I;
+    type Refs = B;
+    type Errors = R;
+
+    fn split(&mut self) -> (&mut I, &mut B, &mut R) {
+        (self.tx_data, self.refs, self.errors)
+    }
+}
+
 pub struct Sequencer {
     cfg: SequencerConfig,
     state: PartitionState<RefMetadata>,
-    /// Lag detection and receipt-floor resync (see
-    /// docs/agents/sequencer-lag-resync-spec.md). `None` when the binary
-    /// did not wire the receipts and egress-watermark feeds (tests, IPC
-    /// dev runs). Behavior is then identical to before resync existed.
+    /// Lag detection and receipt-floor resync (see [`crate::resync`]).
+    /// `None` when the binary did not wire the receipts and
+    /// egress-watermark feeds (tests, IPC dev runs). Resync then does
+    /// nothing.
     resync: Option<crate::resync::ResyncController>,
-    /// Pre-registered metric handles. Recording through them does not
-    /// allocate (the per-call `counter!` boxing used to be 6 of 10
-    /// allocations per transaction).
+    /// Pre-registered metric handles. Recording through these handles
+    /// does not allocate.
     hot: metrics::HotMetrics,
     /// Published-but-unconfirmed refs. Every published ref is retained
     /// until a receipt proves canonical commitment. See
@@ -112,17 +147,23 @@ pub struct Sequencer {
 }
 
 impl Sequencer {
-    pub fn new(cfg: SequencerConfig) -> Self {
-        cfg.validate().expect("validated config");
+    /// The constructor is the parse-once boundary: it validates `cfg`, so
+    /// every other method can assume `partition_index < partition_count`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `cfg` fails [`SequencerConfig::validate`].
+    pub fn new(cfg: SequencerConfig) -> Result<Self, ConfigError> {
+        cfg.validate()?;
         let cap = cfg.max_pending_per_sender;
         let hot = metrics::HotMetrics::new(cfg.partition_index);
-        Self {
+        Ok(Self {
             cfg,
             hot,
             state: PartitionState::new(cap),
             resync: None,
             unconfirmed: UnconfirmedLedger::new(),
-        }
+        })
     }
 
     /// Enable lag detection and receipt-floor resync. The controller
@@ -140,6 +181,7 @@ impl Sequencer {
         self.cfg.resync.confirm_timeout_ms = ms;
     }
 
+    #[must_use]
     pub fn config(&self) -> &SequencerConfig {
         &self.cfg
     }
@@ -189,35 +231,12 @@ impl Sequencer {
                 .map(|(s, n, m)| (self.make_txref(m), *s, *n))
                 .collect();
             let (published, err) = b.try_publish_ref_batch(&refs);
-            for (sender, n, meta) in rest.drain(..published) {
-                self.hot.publish.increment(1);
-                trace!(
-                    nonce = n,
-                    correlation_id = meta.correlation_id,
-                    ctx,
-                    "published ref"
-                );
-                // Retain until a receipt proves canonical commitment. A
-                // batch acceptance is still only an offer, one KIND_BATCH
-                // app message on the publication buffer, not a Raft
-                // commit. The whole batch can vanish in a dead-leader
-                // window exactly like a single offer, so every ref in
-                // the accepted prefix enters the unconfirmed ledger
-                // individually.
-                if self.resync.is_some() {
-                    self.unconfirmed.record_published(sender, n, meta);
-                }
-            }
+            self.record_published_prefix(&mut rest, published, ctx);
             match err {
                 None => {}
                 Some(SequencerError::Backpressure) => {
                     self.hot.backpressure.increment(1);
-                    // Rebuffer the failed chunk and everything after it,
-                    // in reverse, so each sender's floor ends rewound to
-                    // its lowest unpublished nonce.
-                    while let Some((s, n2, m)) = rest.pop_back() {
-                        self.state.reinsert_for_retry(s, n2, m);
-                    }
+                    self.rebuffer_rest(&mut rest);
                     return Err(SequencerError::Backpressure);
                 }
                 Some(e) => return Err(e),
@@ -226,104 +245,158 @@ impl Sequencer {
         Ok(())
     }
 
+    /// Drain the `published` prefix off `rest`: bump the publish metric,
+    /// trace each ref, and (if resync is active) record it in the
+    /// unconfirmed ledger. Retain until a receipt proves canonical
+    /// commitment. A batch acceptance is still only an offer, one
+    /// `KIND_BATCH` app message on the publication buffer, not a Raft
+    /// commit. The whole batch can vanish in a dead-leader window exactly
+    /// like a single offer, so every ref in the accepted prefix enters
+    /// the unconfirmed ledger individually.
+    fn record_published_prefix(
+        &mut self,
+        rest: &mut std::collections::VecDeque<(alloy_primitives::Address, u64, RefMetadata)>,
+        published: usize,
+        ctx: &'static str,
+    ) {
+        for (sender, n, meta) in rest.drain(..published) {
+            self.hot.publish.increment(1);
+            trace!(
+                nonce = n,
+                correlation_id = meta.correlation_id,
+                ctx,
+                "published ref"
+            );
+            if self.resync.is_some() {
+                self.unconfirmed.record_published(sender, n, meta);
+            }
+        }
+    }
+
+    /// Rebuffer everything left in `rest`, in reverse, so each sender's
+    /// floor ends rewound to its lowest unpublished nonce.
+    fn rebuffer_rest(
+        &mut self,
+        rest: &mut std::collections::VecDeque<(alloy_primitives::Address, u64, RefMetadata)>,
+    ) {
+        while let Some((s, n2, m)) = rest.pop_back() {
+            self.state.reinsert_for_retry(s, n2, m);
+        }
+    }
+
     /// Resync and unconfirmed-ledger bookkeeping. Runs first, on every
     /// `run_once` iteration, including idle ones, so boundary-silence
-    /// detection keeps ticking. It drains receipt floors, advances the
-    /// nonce state machine to any raised executed-truth floor (dropping
-    /// proven-duplicate buffered entries; newly contiguous runs surface
-    /// through `drain_pending` in `run_once`), then checks the watermark
-    /// triggers.
+    /// detection keeps ticking.
     fn resync_tick(&mut self) {
-        if let Some(r) = self.resync.as_mut() {
-            let (raised, confirmations) = r.drain_floor_updates();
-            // A receipt proves that every one of this sequencer's published
-            // refs for that sender, at or below its nonce, committed. Drop
-            // them from the unconfirmed ledger.
-            for (sender, confirmed) in confirmations {
-                self.unconfirmed.confirm_through(sender, confirmed);
-            }
-            for (sender, floor) in raised {
-                if let Some((from, dropped)) = self.state.advance_floor(sender, floor) {
-                    metrics::record_floor_advance(self.cfg.partition_index);
-                    // Every dropped buffered entry is a receipt-proven
-                    // duplicate, skipped without relying on any dedup
-                    // window. This is the spec's
-                    // `resync_skipped_executed_total`. There is no
-                    // separate flush-time filter: floors drain before any
-                    // publish action is computed, so the state machine's
-                    // floor is always current when `process` runs. A
-                    // proven-stale incoming envelope takes the ordinary
-                    // `Past`/DuplicatedTx path below, and is counted
-                    // there.
-                    for _ in 0..dropped {
-                        metrics::record_resync_skip(self.cfg.partition_index);
-                    }
-                    trace!(
-                        sender = ?sender,
-                        from,
-                        floor,
-                        dropped,
-                        "resync: receipt floor advanced nonce state"
-                    );
-                }
-            }
-            r.observe(std::time::Instant::now());
+        // Take `r` out of `self` for the duration of the two `&mut self`
+        // calls below: `self.resync` and `self` (for `self.unconfirmed`,
+        // `self.state`) cannot both be borrowed mutably at once through a
+        // shared `&mut self` receiver.
+        let Some(mut r) = self.resync.take() else {
+            return;
+        };
+        self.apply_receipt_drain(&mut r);
+        self.apply_contiguity_rejects(&mut r);
+        self.resync = Some(r);
+        self.sweep_confirm_timeouts();
+    }
 
-            // The sealer rejected this sequencer's ref because its nonce
-            // was not the sender's expected next one. Two cases, split in
-            // the drain:
-            //
-            // - Committed-proof (nonce < expected): drop the ledger entry
-            //   exactly like a receipt confirmation. See
-            //   `UnconfirmedLedger::drop_committed` for the full story.
-            let (drops, rewinds) = r.drain_contiguity_rejects();
-            for (sender, n) in drops {
-                if self.unconfirmed.drop_committed(sender, n) {
-                    trace!(
-                        sender = ?sender,
-                        nonce = n,
-                        "contiguity reject proves commitment; dropping unconfirmed entry (#85)"
-                    );
-                }
-            }
-            // - Gap (nonce >= expected): refs for expected..nonce-1
-            //   vanished (voided offers). They are all in the unconfirmed
-            //   ledger. Rewind them now instead of waiting out the confirm
-            //   timeout. The ledger hands them back in rewind-safe
-            //   descending order.
-            for (sender, expected) in rewinds {
-                let taken = self.unconfirmed.take_gap_rewinds(sender, expected);
-                if taken.is_empty() {
-                    continue;
-                }
-                metrics::record_ref_republished(self.cfg.partition_index, taken.len());
-                warn!(
+    /// Drain receipt floors, and advance the nonce state machine to any
+    /// raised executed-truth floor. Dropping proven-duplicate buffered
+    /// entries; newly contiguous runs surface through `drain_pending` in
+    /// `run_once`.
+    fn apply_receipt_drain(&mut self, r: &mut crate::resync::ResyncController) {
+        let (raised, confirmations) = r.drain_floor_updates();
+        // A receipt proves that every one of this sequencer's published
+        // refs for that sender, at or below its nonce, committed. Drop
+        // them from the unconfirmed ledger.
+        for (sender, confirmed) in confirmations {
+            self.unconfirmed.confirm_through(sender, confirmed);
+        }
+        for (sender, floor) in raised {
+            if let Some((from, dropped)) = self.state.advance_floor(sender, floor) {
+                metrics::record_floor_advance(self.cfg.partition_index);
+                // Every dropped buffered entry is a receipt-proven
+                // duplicate, skipped without relying on any dedup
+                // window. This is the spec's
+                // `resync_skipped_executed_total`. There is no
+                // separate flush-time filter: floors drain before any
+                // publish action is computed, so the state machine's
+                // floor is always current when `process` runs. A
+                // proven-stale incoming envelope takes the ordinary
+                // `Past`/DuplicatedTx path below, and is counted
+                // there.
+                metrics::record_resync_skip(
+                    self.cfg.partition_index,
+                    u64::try_from(dropped).unwrap_or(u64::MAX),
+                );
+                trace!(
                     sender = ?sender,
-                    expected,
-                    count = taken.len(),
-                    "sealer contiguity reject; rewinding unconfirmed refs for republish (#85)"
+                    from,
+                    floor,
+                    dropped,
+                    "resync: receipt floor advanced nonce state"
                 );
-                self.rewind_for_republish(taken);
             }
+        }
+        r.observe(std::time::Instant::now());
+    }
 
-            // Rewind refs past the confirm timeout for republish. See
-            // `UnconfirmedLedger::sweep_expired` for why re-offering is
-            // safe (no gap, no loss). Bounded per iteration.
-            let timeout = std::time::Duration::from_millis(self.cfg.resync.confirm_timeout_ms);
-            let now = std::time::Instant::now();
-            let expired = self.unconfirmed.sweep_expired(timeout, now, 256);
-            if !expired.is_empty() {
-                metrics::record_ref_republished(self.cfg.partition_index, expired.len());
-                warn!(
-                    count = expired.len(),
-                    // Rewind-safe descending order: the oldest (lowest)
-                    // nonce is the last entry.
-                    oldest_nonce = expired.last().map(|((_, n), _)| *n),
-                    "unconfirmed refs past confirm timeout; rewinding for republish (#85)"
+    /// The sealer rejected this sequencer's ref because its nonce was not
+    /// the sender's expected next one. Two cases, split in the drain:
+    ///
+    /// - Committed-proof (nonce < expected): drop the ledger entry
+    ///   exactly like a receipt confirmation. See
+    ///   `UnconfirmedLedger::drop_committed` for the full story.
+    /// - Gap (nonce >= expected): refs for expected..nonce-1 vanished
+    ///   (voided offers). They are all in the unconfirmed ledger. Rewind
+    ///   them now instead of waiting out the confirm timeout. The ledger
+    ///   hands them back in rewind-safe descending order.
+    fn apply_contiguity_rejects(&mut self, r: &mut crate::resync::ResyncController) {
+        let (drops, rewinds) = r.drain_contiguity_rejects();
+        for (sender, n) in drops {
+            if self.unconfirmed.drop_committed(sender, n) {
+                trace!(
+                    sender = ?sender,
+                    nonce = n,
+                    "contiguity reject proves commitment; dropping unconfirmed entry (#85)"
                 );
-                self.rewind_for_republish(expired);
-                metrics::record_unconfirmed_refs(self.cfg.partition_index, self.unconfirmed.len());
             }
+        }
+        for (sender, expected) in rewinds {
+            let taken = self.unconfirmed.take_gap_rewinds(sender, expected);
+            if taken.is_empty() {
+                continue;
+            }
+            metrics::record_ref_republished(self.cfg.partition_index, taken.len());
+            warn!(
+                sender = ?sender,
+                expected,
+                count = taken.len(),
+                "sealer contiguity reject; rewinding unconfirmed refs for republish (#85)"
+            );
+            self.rewind_for_republish(taken);
+        }
+    }
+
+    /// Rewind refs past the confirm timeout for republish. See
+    /// `UnconfirmedLedger::sweep_expired` for why re-offering is safe (no
+    /// gap, no loss). Bounded per iteration.
+    fn sweep_confirm_timeouts(&mut self) {
+        let timeout = std::time::Duration::from_millis(self.cfg.resync.confirm_timeout_ms);
+        let now = std::time::Instant::now();
+        let expired = self.unconfirmed.sweep_expired(timeout, now, 256);
+        if !expired.is_empty() {
+            metrics::record_ref_republished(self.cfg.partition_index, expired.len());
+            warn!(
+                count = expired.len(),
+                // Rewind-safe descending order: the oldest (lowest)
+                // nonce is the last entry.
+                oldest_nonce = expired.last().map(|((_, n), _)| *n),
+                "unconfirmed refs past confirm timeout; rewinding for republish (#85)"
+            );
+            self.rewind_for_republish(expired);
+            metrics::record_unconfirmed_refs(self.cfg.partition_index, self.unconfirmed.len());
         }
     }
 
@@ -367,27 +440,24 @@ impl Sequencer {
 
     /// Drive one ingress message through the state machine. Returns
     /// `Ok(true)` if it did work, or `Ok(false)` if the retry-drain and
-    /// the tx_data poll were both empty.
+    /// the `tx_data` poll were both empty.
     ///
     /// Order of operations:
     ///  1. First flush any metadata sitting at `pending[next_nonce]` (these
     ///     are the entries rebuffered after backpressure). If the B
     ///     publish blocks again, rewind again and return `Backpressure`
-    ///     without touching tx_data.
-    ///  2. Then poll tx_data for the next observed envelope and process it.
-    pub fn run_once<I, B, R>(
-        &mut self,
-        channel_a: &mut I,
-        b: &mut B,
-        rc: &mut R,
-    ) -> Result<bool, SequencerError>
-    where
-        I: TxDataSubscriber,
-        B: TxOrderingRefPublisher,
-        R: TxErrorPublisher,
-    {
+    ///     without touching `tx_data`.
+    ///  2. Then poll `tx_data` for the next observed envelope and process it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(SequencerError::Backpressure)` if the ref publisher
+    /// blocks, or `Err(SequencerError::IngressDisconnected)` if the
+    /// `tx_data` subscription closes.
+    pub fn run_once<P: SequencerPorts>(&mut self, ports: &mut P) -> Result<bool, SequencerError> {
         // Resync bookkeeping runs first, every iteration. See `resync_tick`.
         self.resync_tick();
+        let (channel_a, b, rc) = ports.split();
 
         let pending = self.state.drain_pending();
         if !pending.is_empty() {
@@ -395,12 +465,10 @@ impl Sequencer {
             return Ok(true);
         }
 
-        // The nonce-floor fast-forward sweep that used to run here was
-        // removed. It adopted client-abandoned nonce holes into the
-        // canonical stream, and fatally hit NonceTooHigh on every executor
-        // under ingress overload or chaos outages. A sender with an
-        // unfillable gap now stalls here, recoverably. See
-        // PartitionState's note.
+        // A sender with an unfillable nonce gap stalls here, recoverably.
+        // A local fast-forward past the gap would adopt it into the
+        // canonical stream and fatally hit NonceTooHigh on every executor.
+        // See PartitionState's note.
 
         let Some((tx_data_loc, envelope)) = channel_a.poll()? else {
             return Ok(false);
@@ -412,7 +480,7 @@ impl Sequencer {
         // Defensive: drop messages routed to the wrong shard. Otherwise, a
         // routing disagreement between proxy and sequencer would silently
         // corrupt nonce state.
-        let part = partition_for(sender, self.cfg.partition_count);
+        let part = self.cfg.partition_count.index_of(sender);
         if part != self.cfg.partition_index {
             warn!(
                 expected = self.cfg.partition_index,
@@ -461,8 +529,7 @@ impl Sequencer {
 
     /// Process-outcome bookkeeping for one observed envelope. Records
     /// metrics, notifies clients of evictions and duplicates, and collects
-    /// the publish actions for `flush_drained`. This is split out of
-    /// `run_once`; the sequence of operations is unchanged.
+    /// the publish actions for `flush_drained`.
     fn handle_outcome<R>(
         &mut self,
         rc: &mut R,
@@ -475,7 +542,9 @@ impl Sequencer {
     {
         match result.outcome {
             NonceOutcome::Matched => {}
-            NonceOutcome::Buffered | NonceOutcome::BufferedReplaced => {
+            NonceOutcome::Buffered
+            | NonceOutcome::BufferedReplaced
+            | NonceOutcome::BufferedDisabled => {
                 self.hot.buffered_future.increment(1);
             }
             NonceOutcome::BufferedEvicting { evicted_nonce } => {
@@ -491,12 +560,9 @@ impl Sequencer {
                 self.hot.evictions.increment(1);
                 self.report_evicted(rc, sender, rejected);
             }
-            NonceOutcome::BufferedDisabled => {
-                self.hot.buffered_future.increment(1);
-            }
             NonceOutcome::Past => {
-                // Two different things surface as `Past`. Conflating them
-                // broke the load harness's seq_clean verdict.
+                // Two different things surface as `Past`, and must stay
+                // distinct:
                 //
                 // - A receipt-proven skip (`proven_executed`): the resync
                 //   mechanism absorbing a duplicate. This is routine for a
@@ -506,17 +572,34 @@ impl Sequencer {
                 //   transaction succeeded; a DuplicatedTx notice would be
                 //   spurious and could race the receipt at ingress).
                 // - An ordinary client double-submit or stale nonce: no
-                //   floor proof. Count and report it exactly as before.
+                //   floor proof. Count it, and report it.
                 if self.proven_executed(sender, nonce) {
-                    metrics::record_resync_skip(self.cfg.partition_index);
+                    metrics::record_resync_skip(self.cfg.partition_index, 1);
                 } else {
                     self.hot.dropped_past.increment(1);
                 }
             }
         }
 
+        self.collect_publishes(rc, sender, result.actions)
+    }
+
+    /// Turn one process result's actions into the `(sender, nonce,
+    /// payload)` publish list, reporting each non-proven duplicate on
+    /// `rc` along the way. Split out of [`Self::handle_outcome`], whose
+    /// `match` over [`NonceOutcome`] above is a separate concern from
+    /// this loop over [`ProcessAction`]s.
+    fn collect_publishes<R>(
+        &self,
+        rc: &mut R,
+        sender: alloy_primitives::Address,
+        actions: Vec<ProcessAction<RefMetadata>>,
+    ) -> Vec<(alloy_primitives::Address, u64, RefMetadata)>
+    where
+        R: TxErrorPublisher,
+    {
         let mut publishes = Vec::new();
-        for action in result.actions {
+        for action in actions {
             match action {
                 ProcessAction::Publish { nonce: n, payload } => {
                     publishes.push((sender, n, payload));
@@ -543,18 +626,17 @@ impl Sequencer {
 
     /// Pin this thread to the configured core (if any) and loop until
     /// shutdown.
-    pub fn run<I, B, R>(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a `run_once` iteration fails with anything
+    /// other than backpressure or a disconnected `tx_data` subscription
+    /// (both handled internally).
+    pub fn run<P: SequencerPorts>(
         &mut self,
-        channel_a: &mut I,
-        b: &mut B,
-        rc: &mut R,
-        shutdown: Shutdown,
-    ) -> Result<(), SequencerError>
-    where
-        I: TxDataSubscriber,
-        B: TxOrderingRefPublisher,
-        R: TxErrorPublisher,
-    {
+        ports: &mut P,
+        shutdown: &Shutdown,
+    ) -> Result<(), SequencerError> {
         if let Some(core) = self.cfg.core_id {
             let id = core_affinity::CoreId { id: core };
             if !core_affinity::set_for_current(id) {
@@ -573,7 +655,7 @@ impl Sequencer {
             if shutdown.is_signaled() {
                 return Ok(());
             }
-            match self.run_once(channel_a, b, rc) {
+            match self.run_once(ports) {
                 Ok(true) => {
                     backoff.reset();
                     if let Some(r) = self.resync.as_mut() {

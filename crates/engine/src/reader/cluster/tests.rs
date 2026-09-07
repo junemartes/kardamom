@@ -28,12 +28,12 @@ fn replay_gap_is_reordered_and_deduped() {
     // r0 r1 b1(end2) r2 r3 b2(end4) r4 r5.
     let egress = FakeEgress::new();
     // Live-ahead: record 5 and boundary 2 arrive before the replay.
-    egress.push(encode_egress_record(5, &relayed_txref(1, 5)));
+    egress.push(encode_egress_record(5, &relayed_txref(1, 5)).unwrap());
     egress.push(encode_egress_boundary(2, 4, 2_000, 0));
     // Replayed frames, in emission order. This includes a duplicate of
     // record 5's predecessor range, and both boundaries.
     for i in 0..5 {
-        egress.push(encode_egress_record(i, &relayed_txref(1, i as i32)));
+        egress.push(encode_egress_record(i, &relayed_txref(1, i as i32)).unwrap());
     }
     egress.push(encode_egress_boundary(1, 2, 1_000, 0));
     egress.push(encode_egress_boundary(2, 4, 2_000, 0)); // duplicate boundary
@@ -71,9 +71,9 @@ fn boundary_first_stream_delivers_in_emission_order() {
 #[test]
 fn duplicates_below_cursor_are_skipped() {
     let egress = FakeEgress::new();
-    egress.push(encode_egress_record(0, &relayed_txref(1, 10)));
-    egress.push(encode_egress_record(0, &relayed_txref(1, 10))); // dup
-    egress.push(encode_egress_record(1, &relayed_txref(1, 11)));
+    egress.push(encode_egress_record(0, &relayed_txref(1, 10)).unwrap());
+    egress.push(encode_egress_record(0, &relayed_txref(1, 10)).unwrap()); // dup
+    egress.push(encode_egress_record(1, &relayed_txref(1, 11)).unwrap());
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::new(egress);
     assert_eq!(sub.next().unwrap().0, BPosition::from_index(0));
@@ -103,7 +103,7 @@ fn resume_cursor_skips_already_applied_range() {
     // the cursor are dropped. Delivery starts exactly at the cursor.
     let egress = FakeEgress::new();
     for i in 0..5 {
-        egress.push(encode_egress_record(i, &relayed_txref(1, i as i32)));
+        egress.push(encode_egress_record(i, &relayed_txref(1, i as i32)).unwrap());
     }
     egress.push(encode_egress_boundary(1, 2, 1_000, 0)); // below cursor: dup
     egress.push(encode_egress_boundary(2, 5, 2_000, 0));
@@ -124,8 +124,8 @@ fn resume_cursor_skips_already_applied_range() {
 #[test]
 fn yields_records_with_monotonic_bposition() {
     let egress = FakeEgress::new();
-    egress.push(encode_egress_record(0, &relayed_txref(1, 10)));
-    egress.push(encode_egress_record(1, &relayed_txref(2, 20)));
+    egress.push(encode_egress_record(0, &relayed_txref(1, 10)).unwrap());
+    egress.push(encode_egress_record(1, &relayed_txref(2, 20)).unwrap());
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::new(egress);
 
@@ -172,7 +172,7 @@ fn yields_boundary_with_fields_intact() {
 #[test]
 fn late_boundary_sealing_below_cursor_is_fatal() {
     let egress = FakeEgress::new();
-    egress.push(encode_egress_record(2, &relayed_txref(1, 2)));
+    egress.push(encode_egress_record(2, &relayed_txref(1, 2)).unwrap());
     egress.push(encode_egress_boundary(1, 2, 1_000, 0));
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(2, 1));

@@ -4,8 +4,9 @@
 //! property that must hold.
 
 use alloy_primitives::{Address, B256};
-use kardamom_types::{BPosition, DepositRef, TxOrderingMessage, TxRef};
+use kardamom_types::{BPosition, BlockBoundaryStart, DepositRef, TxOrderingMessage, TxRef};
 
+use super::ingress::decode_replay_request;
 use super::*;
 
 fn txref() -> TxRef {
@@ -30,7 +31,7 @@ fn depositref() -> DepositRef {
 }
 
 /// Ingress, then the service relays from the canonical ID, then egress,
-/// then decode: this reproduces the TxRef. The guard header is consumed,
+/// then decode: this reproduces the `TxRef`. The guard header is consumed,
 /// not relayed.
 #[test]
 fn txref_ingress_relay_egress_roundtrip() {
@@ -41,14 +42,14 @@ fn txref_ingress_relay_egress_roundtrip() {
     // Mirror the Java service: parse the id, relay from the canonical id.
     let (cid, relayed) = split_ingress(&ingress).unwrap();
     assert_eq!(cid, r.tx_hash.0);
-    let egress = encode_egress_record(5, relayed);
-    match decode_egress(&egress).unwrap() {
-        EgressItem::Record { index, msg } => {
-            assert_eq!(index, 5);
-            assert_eq!(msg, TxOrderingMessage::TxRef(r));
+    let egress = encode_egress_record(5, relayed).unwrap();
+    assert_eq!(
+        EgressItem::decode(&egress).unwrap(),
+        EgressItem::Record {
+            index: 5,
+            msg: TxOrderingMessage::TxRef(r)
         }
-        other => panic!("expected Record, got {other:?}"),
-    }
+    );
 }
 
 #[test]
@@ -59,27 +60,28 @@ fn depositref_ingress_relay_egress_roundtrip() {
     assert_eq!(ingress_sender_nonce(&ingress).unwrap(), (Address::ZERO, 0));
     let (cid, relayed) = split_ingress(&ingress).unwrap();
     assert_eq!(cid, r.source_hash.0);
-    let egress = encode_egress_record(8, relayed);
-    match decode_egress(&egress).unwrap() {
-        EgressItem::Record { index, msg } => {
-            assert_eq!(index, 8);
-            assert_eq!(msg, TxOrderingMessage::DepositRef(r));
+    let egress = encode_egress_record(8, relayed).unwrap();
+    assert_eq!(
+        EgressItem::decode(&egress).unwrap(),
+        EgressItem::Record {
+            index: 8,
+            msg: TxOrderingMessage::DepositRef(r)
         }
-        other => panic!("expected Record, got {other:?}"),
-    }
+    );
 }
 
 #[test]
 fn boundary_roundtrip() {
     let egress = encode_egress_boundary(12, 100, 1_700_000_000_250, 0);
-    match decode_egress(&egress).unwrap() {
-        EgressItem::Boundary(b) => {
-            assert_eq!(b.block_number, 12);
-            assert_eq!(b.end_tx_idx.as_index(), 100);
-            assert_eq!(b.l2_timestamp, 1_700_000_000_250);
-        }
-        other => panic!("expected Boundary, got {other:?}"),
-    }
+    assert_eq!(
+        EgressItem::decode(&egress).unwrap(),
+        EgressItem::Boundary(BlockBoundaryStart {
+            block_number: 12,
+            end_tx_idx: BPosition::from_index(100),
+            l2_timestamp: 1_700_000_000_250,
+            l1_origin: 0,
+        })
+    );
 }
 
 #[test]
@@ -128,7 +130,7 @@ fn remote_epoch() -> kardamom_types::xchain::RemoteEpochRecord {
                 target: Address::repeat_byte(0xB3),
                 value: 5,
                 gas_limit: 100_000,
-                input: Default::default(),
+                input: (&[][..]).into(),
                 callback: None,
             },
         ],
@@ -195,15 +197,15 @@ fn remote_epoch_ingress_relay_egress_roundtrip() {
     relayed.extend_from_slice(&cid);
     relayed.extend_from_slice(&ingress[53..]);
 
-    match decode_egress(&encode_egress_record(11, &relayed)).unwrap() {
-        EgressItem::Record { index, msg } => {
-            assert_eq!(index, 11);
-            assert_eq!(msg, TxOrderingMessage::RemoteEpoch(rec.clone()));
-        }
-        other => panic!("expected Record, got {other:?}"),
-    }
     assert_eq!(
-        u32::from_le_bytes(ingress[49..53].try_into().unwrap()) as u64,
+        EgressItem::decode(&encode_egress_record(11, &relayed).unwrap()).unwrap(),
+        EgressItem::Record {
+            index: 11,
+            msg: TxOrderingMessage::RemoteEpoch(rec.clone())
+        }
+    );
+    assert_eq!(
+        u64::from(u32::from_le_bytes(ingress[49..53].try_into().unwrap())),
         remote_epoch_slots(&rec),
     );
 }
@@ -212,18 +214,14 @@ fn remote_epoch_ingress_relay_egress_roundtrip() {
 fn contiguity_reject_roundtrip() {
     let sender = Address::repeat_byte(0x99);
     let b = encode_contiguity_reject(sender, 12, 8);
-    match decode_egress(&b).unwrap() {
+    assert_eq!(
+        EgressItem::decode(&b).unwrap(),
         EgressItem::ContiguityReject {
-            sender: s,
-            nonce,
-            expected,
-        } => {
-            assert_eq!(s, sender);
-            assert_eq!(nonce, 12);
-            assert_eq!(expected, 8);
+            sender,
+            nonce: 12,
+            expected: 8,
         }
-        other => panic!("expected ContiguityReject, got {other:?}"),
-    }
+    );
 }
 
 #[test]
@@ -238,33 +236,36 @@ fn replay_request_roundtrip() {
 #[test]
 fn replay_unavailable_roundtrip() {
     let b = encode_replay_unavailable(100, 7);
-    match decode_egress(&b).unwrap() {
+    assert_eq!(
+        EgressItem::decode(&b).unwrap(),
         EgressItem::ReplayUnavailable {
-            oldest_index,
-            oldest_block,
-        } => {
-            assert_eq!(oldest_index, 100);
-            assert_eq!(oldest_block, 7);
+            oldest_index: 100,
+            oldest_block: 7,
         }
-        other => panic!("expected ReplayUnavailable, got {other:?}"),
-    }
+    );
 }
 
 #[test]
 fn bad_kind_and_record_type_error() {
-    assert_eq!(decode_egress(&[9, 0, 0]), Err(WireError::BadEgressKind(9)));
+    assert_eq!(
+        EgressItem::decode(&[9, 0, 0]),
+        Err(WireError::BadEgressKind(9))
+    );
     // A relayed payload with an unknown record type.
     let mut payload = vec![0u8; 32];
     payload.push(7); // record_type 7
-    let egress = encode_egress_record(0, &payload);
-    assert_eq!(decode_egress(&egress), Err(WireError::BadRecordType(7)));
+    let egress = encode_egress_record(0, &payload).unwrap();
+    assert_eq!(
+        EgressItem::decode(&egress),
+        Err(WireError::BadRecordType(7))
+    );
 }
 
 #[test]
 fn truncated_egress_errors_cleanly() {
     assert!(matches!(
-        decode_egress(&[EGRESS_KIND_RELAYED, 0, 0]),
+        EgressItem::decode(&[EGRESS_KIND_RELAYED, 0, 0]),
         Err(WireError::TooShort { .. })
     ));
-    assert!(decode_egress(&[]).is_err());
+    assert!(EgressItem::decode(&[]).is_err());
 }

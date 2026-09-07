@@ -23,8 +23,9 @@
 //!
 //! Remote epochs are not nonce-gated and have no state-machine interaction, so
 //! this is the same poll → publish pump the epoch path is, running independent
-//! of both it and the tx_data → TxRef path.
+//! of both it and the `tx_data` → `TxRef` path.
 
+use kardamom_log::aeron_live::TxRemoteEpochsSubscriberHandle;
 use kardamom_types::BPosition;
 use kardamom_types::xchain::RemoteEpochRecord;
 
@@ -39,7 +40,19 @@ pub trait RemoteEpochSubscriber: Send {
     /// * `Ok(Some((pos, record)))` — a record was available and is yielded.
     /// * `Ok(None)` — no fragment available right now (caller should back off).
     /// * `Err(SequencerError::IngressDisconnected)` — subscription closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SequencerError::IngressDisconnected`] when the
+    /// subscription is closed.
     fn poll(&mut self) -> Result<Option<(BPosition, RemoteEpochRecord)>, SequencerError>;
+}
+
+/// The live adapter: a miss is not an error, the pump backs off.
+impl RemoteEpochSubscriber for TxRemoteEpochsSubscriberHandle {
+    fn poll(&mut self) -> Result<Option<(BPosition, RemoteEpochRecord)>, SequencerError> {
+        Ok(self.try_recv())
+    }
 }
 
 /// Single-step remote-epoch pump: pull one record off the subscription and
@@ -49,6 +62,11 @@ pub trait RemoteEpochSubscriber: Send {
 /// On `SequencerError::Backpressure` the caller retries the same record next
 /// tick — the record is durable on `tx_remote_epochs`, so there is no rewind
 /// state to manage.
+///
+/// # Errors
+///
+/// Returns an error if the subscription disconnects, or the publish
+/// backs off or fails.
 pub fn process_remote_epoch<S, P>(sub: &mut S, b: &mut P) -> Result<bool, SequencerError>
 where
     S: RemoteEpochSubscriber,
@@ -64,39 +82,17 @@ where
 
 #[cfg(any(test, feature = "testing"))]
 pub mod fakes {
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-
-    use super::*;
+    use super::{BPosition, RemoteEpochRecord, RemoteEpochSubscriber, SequencerError};
+    use crate::fakes::ScriptedQueue;
 
     /// In-memory [`RemoteEpochSubscriber`] driven by a scripted queue. Push
-    /// test inputs via [`ScriptedRemoteEpochs::push`]; the sequencer drains
+    /// test inputs via `ScriptedRemoteEpochs::push`; the sequencer drains
     /// them FIFO.
-    #[derive(Default, Clone)]
-    pub struct ScriptedRemoteEpochs {
-        pub queue: Arc<Mutex<VecDeque<(BPosition, RemoteEpochRecord)>>>,
-        pub closed: Arc<Mutex<bool>>,
-    }
-
-    impl ScriptedRemoteEpochs {
-        pub fn push(&self, pos: BPosition, record: RemoteEpochRecord) {
-            self.queue.lock().unwrap().push_back((pos, record));
-        }
-
-        pub fn close(&self) {
-            *self.closed.lock().unwrap() = true;
-        }
-    }
+    pub type ScriptedRemoteEpochs = ScriptedQueue<RemoteEpochRecord>;
 
     impl RemoteEpochSubscriber for ScriptedRemoteEpochs {
         fn poll(&mut self) -> Result<Option<(BPosition, RemoteEpochRecord)>, SequencerError> {
-            if let Some(item) = self.queue.lock().unwrap().pop_front() {
-                return Ok(Some(item));
-            }
-            if *self.closed.lock().unwrap() {
-                return Err(SequencerError::IngressDisconnected);
-            }
-            Ok(None)
+            self.poll_next()
         }
     }
 }
@@ -114,14 +110,17 @@ mod tests {
         RemoteEpochRecord {
             origin_chain_id: origin,
             anchor_number: 100 + first_seq,
-            anchor_hash: B256::repeat_byte(first_seq as u8),
+            anchor_hash: B256::repeat_byte(u8::try_from(first_seq).unwrap()),
             first_seq,
             messages: (0..messages)
-                .map(|i| XChainMessage {
-                    source_hash: B256::repeat_byte(0xE0 + i as u8),
-                    seq: first_seq + i as u64,
-                    gas_limit: 100_000,
-                    ..Default::default()
+                .map(|i| {
+                    let i = u64::try_from(i).unwrap();
+                    XChainMessage {
+                        source_hash: B256::repeat_byte(u8::try_from(0xE0 + i).unwrap()),
+                        seq: first_seq + i,
+                        gas_limit: 100_000,
+                        ..Default::default()
+                    }
                 })
                 .collect(),
         }
@@ -166,34 +165,11 @@ mod tests {
     }
 
     #[test]
-    fn idle_subscription_reports_no_work() {
-        let mut sub = ScriptedRemoteEpochs::default();
-        let mut pubr = InMemoryTxOrderingRefPublisher::default();
-        assert!(!process_remote_epoch(&mut sub, &mut pubr).unwrap());
-    }
-
-    #[test]
-    fn closed_subscription_surfaces_disconnect() {
-        let mut sub = ScriptedRemoteEpochs::default();
-        sub.close();
-        let mut pubr = InMemoryTxOrderingRefPublisher::default();
-        assert!(matches!(
-            process_remote_epoch(&mut sub, &mut pubr),
-            Err(SequencerError::IngressDisconnected)
-        ));
-    }
-
-    #[test]
-    fn backpressure_propagates_so_the_caller_retries() {
-        let mut sub = ScriptedRemoteEpochs::default();
-        let mut pubr = InMemoryTxOrderingRefPublisher::default();
-        *pubr.fail_with_backpressure.lock().unwrap() = true;
-        sub.push(BPosition::default(), record(412_346, 2, 1));
-
-        assert!(matches!(
-            process_remote_epoch(&mut sub, &mut pubr),
-            Err(SequencerError::Backpressure)
-        ));
-        assert!(pubr.remote_epochs.lock().unwrap().is_empty());
+    fn shares_the_idle_closed_backpressure_pump_contract() {
+        // Idle-report, closed-disconnect and backpressure-propagation are
+        // not remote-epoch-specific: crate::fakes::pump_contract::run
+        // exercises them once, generically, for every ScriptedQueue-backed
+        // pump.
+        crate::fakes::pump_contract::run(&record(412_346, 2, 1), process_remote_epoch);
     }
 }

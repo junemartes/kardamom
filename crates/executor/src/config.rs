@@ -61,8 +61,8 @@ mod tests {
         assert_eq!(cfg.cluster.ingress_endpoints, "0=h0:9000,1=h1:9001");
         // Stream ID and keep-alive defaults fill in when they are omitted.
         let c = cfg.cluster.defaults_applied();
-        assert_eq!(c.ingress_stream_id, 101);
-        assert_eq!(c.egress_stream_id, 102);
-        assert_eq!(c.keep_alive_interval_ms, 1000);
+        assert_eq!(c.ingress_stream_id, Some(101));
+        assert_eq!(c.egress_stream_id, Some(102));
+        assert_eq!(c.keep_alive_interval_ms.unwrap().get(), 1000);
     }
 }
