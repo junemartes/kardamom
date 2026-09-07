@@ -10,7 +10,8 @@ flame.folded
 flame.svg
 results/
 
-.claude
+.claude/*
+!.claude/settings.json
 
 # solc compiler blob (fetched, not source)
 soljson-latest.js

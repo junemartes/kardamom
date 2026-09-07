@@ -10,7 +10,12 @@ finding with a `file:line` reference.
 | file | content |
 |---|---|
 | `README.md` | this summary |
-| `crate-<group>.md` | one appendix per reviewer group, all findings in tables |
+| `crate-<group>.md` | one appendix per reviewer group, all findings in tables (R1 to R11) |
+| `arith-<group>.md` | one appendix per reviewer group for R12 and R13, one verdict per site |
+| `dry-<group>.md`, `dry-cross.md` | one appendix per reviewer group for R14, plus one across crates |
+| `duplicate-scan.md` | the exact near-duplicate scan output |
+| `inputs-<group>.md` | per-group implementation inputs: pedantic sites and mechanical rows |
+| `status-<group>.md` | written by the implementation agents: done, deferred, judged wrong |
 | `mechanical-lists.md` | every long function, large file, unreachable `pub` item, and hidden `too_many_arguments` site |
 | `clippy-pedantic-sites.md` | every clippy pedantic warning (2,526 rows) |
 
@@ -29,6 +34,11 @@ finding with a `file:line` reference.
 | R9 | No defensive input checks in the body. Parse once into a typed value at the boundary. |
 | R10 | Prefer functional style over imperative loops and mutable accumulators. |
 | R11 | `clippy::pedantic` passes. Group method arguments into structs where needed. |
+| R12 | Safe arithmetic everywhere it costs no performance: `checked_*`, `saturating_*`, `wrapping_*` by meaning, `try_from` for casts. |
+| R13 | A value that must not be zero is a `NonZero*` type, parsed once at the boundary. No `debug_assert!` guards. |
+| R14 | Less code. Similar patterns become one helper. |
+| R15 | Methods, not standalone functions. Builders that return `Self` are fine. Inputs live as struct state. |
+| R16 | No nested loops. Prefer iterators. An inner loop that must stay becomes a helper method. |
 
 ## Scope and method
 
@@ -518,6 +528,209 @@ point instead of four loose scalars.
 The other hidden lints: `mut_from_ref` at `stm/src/execute.rs:1646`, `type_complexity` at
 `exec-core/src/delta.rs:39`, three `identity_op` in `cluster-client`, one
 `needless_range_loop` in `stm-p2.rs`, and seven `dead_code` in test helpers.
+
+## R12 — safe arithmetic
+
+The release profile in the root `Cargo.toml` sets no `overflow-checks`, so every plain
+`+ - * <<` on an integer wraps silently in a production build. `alloy_primitives::U256`
+wraps in every profile. Against that, the workspace uses `checked_*` at 6 sites,
+`saturating_*` at 45, and `wrapping_*` at 30.
+
+| measure (production code, all features) | count |
+|---|---|
+| unchecked integer arithmetic sites (`clippy::arithmetic_side_effects`) | 729 |
+| integer divisions | 63 |
+| `as` casts | 549, of which 177 narrow or change sign |
+| slice index sites (`clippy::indexing_slicing`) | 597 |
+
+The reviewers gave one verdict per site that acts on input-derived, wire-derived,
+config-derived, clock-derived, or growing-counter values. 471 rows: 167 FIX, 29
+HOT_PATH_KEEP with the bound named, 266 PROVEN by a type or an adjacent check. The
+per-site tables are in `arith-<group>.md`.
+
+Defects found under this rule, each confirmed on the source:
+
+1. **A silent `U256` underflow into a receipt.** `crates/stm/src/execute.rs:4573`
+   computes `*b - sink_start_balance`; `U256::sub` wraps, so a balance below the start
+   writes a garbage `fee_delta`.
+2. **An attacker-controlled add in the nonce peek.** `skip_rlp_item` in
+   `crates/sequencer/src/nonce_decode.rs:80-92` adds an RLP length from the wire to an
+   offset with no check. The reviewer ran it with overflow checks off and got a wrong
+   nonce for garbage input, where the fallback to the full decode should have run.
+3. **The Aeron position decode assumes a 4 GiB term.** `decode_position` at
+   `crates/log/src/publisher.rs:241` and `crates/log/src/aeron_live/thread.rs:311` splits
+   the `offer` return with a fixed 32-bit shift. Aeron packs `term_id` with
+   `log2(term_length)` bits. The in-memory fake in `testing.rs` uses a real 16 MiB term,
+   so the unit tests do not see it. Confirm against a live media driver before fixing.
+4. **Block-range underflow into an allocation.** `crates/batcher/src/optimistic.rs:47`
+   computes `(end - start + 1) as usize` for `Vec::with_capacity` from two on-chain fields.
+5. **Wire counts straight into `with_capacity`.** The KAR1 decoder in
+   `crates/batcher/src/frame.rs` turns four `u32` counts from the wire into allocations
+   with no check against the bytes left.
+6. **A wrapping contiguity proof in the guest.** `guest/kardamom-zk-guest/src/bin/batch.rs:49`
+   checks `first_block + i as u64` on two untrusted fields; the guest release profile also
+   sets no `overflow-checks`.
+7. **A wrong Merkle sibling.** `crates/types/src/withdrawals.rs:137` indexes `idx + 1` on
+   an unvalidated `index`.
+8. **Batch-index steps on L1 values.** Six `+ 1` sites on a `u64` from an L1 contract call
+   (`batcher/src/l1.rs:118`, `live.rs:259, 287`, `optimistic.rs:70, 157`,
+   `prover_submit.rs:59`); the same shape on the attester cadence
+   (`validator/src/attester.rs:306`), the remote-epoch density check
+   (`validator/src/interop/verify.rs:145`), and a peer's HTTP header
+   (`state/src/checkpoint_transfer.rs:357`).
+9. **The opposite mistake.** 14 `.unwrap_or(0.0)` on a metrics scrape in `e2e`, and
+   `saturating` clamps in `bench` and `sequencer` that hide a bug where a `checked_*` with
+   an error is right.
+
+Two facts outside the rule that the reviewers found: `state/src/integrity/checks.rs:259`
+slices `&k[..4]` on a key with no length check, so a corrupt short key panics the
+integrity tool itself; and `state/src/checkpoint_transfer.rs:288` streams a peer's whole
+`content-length` to disk with no cap.
+
+The first fix is one line: `overflow-checks = true` in `[profile.release]`. It turns the
+silent wraps into panics until each site has its explicit form. Measure the hot paths
+in `stm` and `exec-core` before and after; the reviewers named the bounds for the 29
+sites that may keep plain arithmetic.
+
+## R13 — non-zero types
+
+The workspace uses a `NonZero*` type at 8 sites, all in `ingress` for the rate limiter.
+Against that there are 54 `.max(1)` fixups, 122 zero comparisons, and 16
+`debug_assert!` guards in production code. A `debug_assert!` is not a guard: it is
+compiled out of the release build, and the operation it fronts runs unchecked. The rule
+is that every such value is parsed once at its boundary (clap argument, config file, wire
+decode, constructor) into a `NonZero*` type or a newtype around one, and the assert is
+deleted.
+
+171 rows in `arith-<group>.md`, of which 22 are defects today:
+
+- **Division by zero behind a `debug_assert!`.** `partition_for` exists twice, in
+  `crates/ingress/src/routing.rs:11` and `crates/sequencer/src/partition.rs:16`, and both
+  compute `% m` with only a debug assert. `--shards 0` divides by zero in a release build,
+  and `--shards 256` truncates to 0 in the `as u8` cast that opens the publisher handles.
+- **A wire granularity used as a divisor.** `chunk_of` at
+  `crates/exec-core/src/bal_ladder.rs:87` divides by `k` with no guard; `k` reaches it from
+  the prover input as a `u16`. Three call sites in `validator` clamp the same value with
+  `.max(1)`.
+- **A zero worker pool that reports success.** `WorkerPool::new(0, ..)` at
+  `crates/stm/src/pool.rs:110` makes `run` return `Ok(())` while running no chunk; two
+  divisions by `workers` at `execute.rs:616, 2864` rely on `with_pool` to normalize it, and
+  `execute.rs:2146` can build a `TouchTable` of capacity 1 whose probe loop never ends.
+- **Zero periods.** A zero `--poll-interval-secs` panics the da-watcher inside
+  `tokio::time::interval`; a zero `challenge_window_secs` deploys a proof oracle with no
+  dispute period.
+- **Zero sizes from the CLI.** The engine's `dedup_window`, `--shards`, and `--chain-id`
+  with no genesis file; `bench` has 11 divisions by a CLI value with no lower bound;
+  `e2e`'s `seeded_shuffle` guards its seed with a `debug_assert!`.
+
+Types to add, in `kardamom-types` unless noted: `ShardCount(NonZeroU32)`,
+`ChainId(NonZeroU64)`, `Granularity(NonZeroU16)` for the BAL ladder, `WorkerCount(NonZeroUsize)`
+in `stm`, `PollInterval` and `ChallengeWindow` as `NonZeroU64` seconds in the batcher
+group, `Depth(NonZeroU16)` for the commit pipeline in `engine`, `every_n: NonZeroU64` in
+`state`. The 16 `debug_assert!` sites and the 54 `.max(1)` sites are listed per group in
+the appendices; each maps to one of these types.
+
+## R14 — less code through shared helpers
+
+An exact near-duplicate scan (8-line windows, whitespace-normalized) finds 135 clusters
+and about 7,000 duplicated lines across `crates/` and `guest/`. Two thirds of it is test
+fixture code. The largest clusters:
+
+| duplicated lines | files |
+|---|---|
+| 325 | `stm/tests/equivalence.rs`, 14 repeated fixture blocks in one file |
+| 267 | `bench/src/bin/stm-p2.rs` and `stm-p0.rs`, the scenario builders |
+| 206 | `engine/src/actor/exec_tests.rs`, 18 repeated spawn-feed-join blocks |
+| 183 | `stm/src/execute.rs`, 12 blocks including the `KECCAK_EMPTY` mapping at six sites |
+| 181 | the three engine actor test files, one fixture in three copies |
+| 162 | `batcher/tests/optimistic_e2e.rs` and `proof_submission_e2e.rs` |
+| 103 | `exec-core/src/executor/deposit.rs` and `xchain.rs`, the derived-transaction path |
+| 102 | `executor/tests/{determinism,diff_reference,replay_integration}.rs`, the `TestWiring` fixture |
+| 94 | `validator/src/parallel/engine.rs`, the parallel path and its `_scoped` copy |
+| 87 | the executor and validator `main.rs`, service wiring |
+
+Two consensus rules exist in two copies each: `partition_for` (ingress and sequencer)
+and `decode_position` (two files in `log`). The prior audit of 2026-08-07 named the
+service-binary boilerplate across six binaries as the highest-leverage item; part of it
+moved into `engine/src/bin_support.rs` since, and the rest is still open.
+
+The judgment pass covered structural duplication too: the same steps on different types,
+hand-rolled standard functions, forwarding wrappers, and repeated fixtures. Twelve reviewers
+(one per group and one across crates) propose about 240 production helpers and 140 test
+helpers. Their estimates sum to about 4,900 production lines and 5,500 test lines removed,
+with some overlap between the cross-crate rows and the per-group rows. The tables are in
+`dry-<group>.md` and `dry-cross.md`; the full scan output is in `duplicate-scan.md`.
+
+| group | production rows | test rows | lines saved, production | lines saved, tests |
+|---|---|---|---|---|
+| exec-core, footprint, reconstruct, guest | 25 | 11 | 757 | 462 |
+| log, obs | 13 | 12 | 626 | 259 |
+| bench, executor | 31 | 10 | 613 | 830 |
+| state, types | 24 | 9 | 551 | 313 |
+| e2e | 22 | 9 | 517 | 118 |
+| stm | 22 | 12 | 419 | 272 |
+| batcher, da_watcher, deployer | 20 | 14 | 338 | 591 |
+| validator | 19 | 12 | 296 | 499 |
+| sequencer, cluster-adapter, cluster-client | 20 | 12 | 282 | 330 |
+| cross-crate | 16 | 11 | 274 | 897 |
+| engine | 11 | 10 | 111 | 569 |
+| ingress, interop-feed | 17 | 15 | 107 | 384 |
+
+**Consensus rules with more than one body.** These are the rows to do first, because two
+copies of a rule drift into a divergence bug.
+
+- The derived-transaction path exists four times in `exec-core`: the free
+  `execute_deposit_tx` and `execute_xchain_tx`, and `Executor::execute_deposit` and
+  `Executor::execute_xchain`. Two are live at once: the streaming exec thread calls the free
+  `execute_xchain_tx`, the stateless driver, the validator, and the zk guest call
+  `Executor::execute_xchain`. Collapsing them removes about 380 lines.
+- The `Receipt` literal is built field by field at four sites in `exec-core/src/executor/scope.rs`
+  and once in `stm/src/execute.rs:4593`; `execute_one` in `stm` re-implements
+  `Executor::execute_tx_decoded`, including the error triage and the BAL fragment loop.
+- The ZERO-versus-`KECCAK_EMPTY` code-hash mapping at seven sites across `stm` and
+  `exec-core`; the EIP-161 empty-account test at three; BAL quantization written twice in
+  `exec-core/src/bal_ladder.rs` with two different algorithms; the wire-granularity
+  claim-index rule at three sites in `validator`.
+- `partition_for` in `ingress` and `sequencer`; `decode_position` twice in `log`; the
+  `ClosedBlock` to `BlockFrame` mapping at three sites in the batcher group (one is the DA
+  wire rule).
+
+**Whole second implementations.** `log/src/publisher.rs` and `subscriber.rs` rebuild the
+open, offer, decode and poll sequences that `aeron_live` owns, with no user (R8 lists them
+as dead). `validator/src/parallel/engine.rs` keeps a `_scoped` copy of the parallel
+driver. The epoch pump in `sequencer` is duplicated as the remote-epoch pump: trait, pump,
+scripted fake, and five parallel tests, for two record types. `stm-p0.rs` and `stm-p2.rs`
+share their scenario builders verbatim.
+
+**Repeated shapes with one helper each.** The `rkyv` `with` adapter trio in
+`types/src/wire.rs` (five copies, a macro saves about 130 lines); `walk_account` and
+`walk_storage` in `state/src/trie/walker.rs` (one generic walk); the archive catalog page
+loop in `log` (three copies, each with a hand-rolled `Handler::leak` and `release` pair
+that already caused one leak); the three `open_subscription*` methods in
+`aeron_live/runtime.rs`; the `WireError::TooShort` literal written 11 times in
+`cluster-client` although a `too_short` helper exists; the `for_each_row` walk hand-rolled
+once more in the trie tests; the six batch-index steps in the batcher group; the three
+poll-loop binaries there.
+
+**Test fixtures, the largest mass.** One `EngineWiring` test double set is copied in six
+files across `executor`, `validator`, and the bench (about 280 lines); the signed-legacy-
+transaction builder has about 14 copies; `bpos` and `pos` re-implement the existing
+`BPosition::from_index` about 12 times; the five `metrics_endpoint.rs` tests are
+near-identical; six batcher e2e files build the same anvil fixture; the engine actor tests
+call `spawn_exec` with the same 12-argument list 18 times; the temp-env open appears at 26
+sites in `state`. The reviewers agree on the fix: a `testing` feature on `kardamom-engine`
+that exports its `test_support` module, a `test-support` feature on `ingress`, and a shared
+signer, envelope, and fixture module in `kardamom-log::testing` or a new
+`kardamom-test-support` crate.
+
+**Still open from the audit of 2026-08-07.** `resume_point` copied between the executor and
+validator binaries; the `env:VAR` key parser in the validator and deployer; the
+`LogConfig::resolve` plus `AeronRuntime::spawn` open block and the `--log-config` and
+`--aeron-dir` clap pair in all six binaries; the recorder spawn-and-barrier wrapper in
+ingress and da-watcher; the anvil bridge bootstrap and `sol!` bindings in three test
+crates. The cross-crate reviewer recommends KEEP for the flattened `ObsArgs`, because the
+default metrics port differs per service. The rest of that audit's cross-cutting list is
+done.
 
 ## Java sealer (light pass)
 

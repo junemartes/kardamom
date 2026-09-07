@@ -1,0 +1,77 @@
+# state
+
+## Summary
+
+The largest production shape is `crates/types/src/wire.rs`. Five rkyv `with` adapters repeat one
+34-line impl trio; a macro removes about 130 lines. The next largest is
+`crates/state/src/trie/walker.rs`: `walk_account` and `walk_storage` run the same skip rule on two
+leaf sources, and one generic walk removes about 85 lines. After that come many small get-decode,
+put-ignore, and length-check blocks in `meta.rs`, `snapshot.rs`, `trie/mod.rs`, and `checks.rs`.
+Estimated production reduction is about 550 lines; estimated test reduction is about 310 lines, for
+about 860 total. Tests carry one dominant shape: the temp-env open appears at 26 sites across unit
+tests, integration tests, and benches. One prior-audit item touches this group (checkpoint image
+verification); it is done. `for_each_row` in `schema.rs` is already the shared table walk and serves
+10 call sites; only `dump_table` in the trie tests still hand-rolls it.
+
+## R14 production code
+
+| sites | shape | helper (name, signature, home) | lines saved |
+|---|---|---|---|
+| `crates/types/src/wire.rs:27-62`, `69-103`, `111-146`, `158-193`, `200-234` | Five rkyv `with` adapters. Each repeats `ArchiveWith` + `SerializeWith` + `DeserializeWith` over one convert-to-POD, convert-back pair. | `macro_rules! wire_adapter { ($name:ident, $ty:ty, $pod:ty, $to:expr, $from:expr) }` — `crates/types/src/wire.rs` | 130 |
+| `crates/state/src/trie/walker.rs:67-89` vs `161-183`; `92-158` vs `186-239`; `245-264` vs `268-287` | Account walk and storage walk share the same match, the same 16-nibble loop, and the same `tree_mask`/`hash_mask` skip rule. They differ only in the namespace and the leaf source. | `trait LeafSource { fn namespace(&self) -> Option<&B256>; fn emit_under<K: ReadKind>(&self, tx, db, path, hb) -> Result<(), StateError>; }` plus one generic `walk<K, L>` and one `root_with<K, L>` — `crates/state/src/trie/walker.rs` | 85 |
+| `crates/types/src/tx_ordering.rs:66-137` | Five `is_*` predicates and five `as_*` accessors. Each `as_*` spells every other variant in a `None` arm. | `macro_rules! variant_accessors { ... }` listing the variants once — `crates/types/src/tx_ordering.rs`. Keep the variant list explicit, so a new variant still forces an edit. | 45 |
+| `crates/types/src/xchain.rs:149-154`, `279-291`, `339-355`; `crates/types/src/withdrawals.rs:76-83`; `crates/types/src/epoch.rs:109-119`; `crates/types/src/upgrades.rs:62-68`; `crates/types/src/prover.rs:81-89`, `175-183` | Hand-written 32-byte ABI words. Each writes a value right-aligned into a fixed offset of a byte buffer. | `pub mod abi` with `word_u64`, `word_u128`, `word_u256`, `word_address`, `word_b256` (each returns `[u8; 32]`) and `push_word_*` on `Vec<u8>` — new `crates/types/src/abi.rs` | 35 |
+| `crates/state/src/snapshot.rs:139-152`, `154-164`, `166-176`, `180-190`, `194-204` | Five reads: encode a key, `txn.get`, then decode or return a default. | `fn get_decoded<K: TransactionKind, T>(txn: &Tx<K>, db: Database, key: &[u8], decode: fn(&[u8]) -> Result<T, StateError>) -> Result<Option<T>, StateError>` — `crates/state/src/meta.rs` | 25 |
+| `crates/state/src/meta.rs:116-127`, `133-144`, `153-169`, `175-184`; `crates/state/src/schema.rs:99-110` | Five fixed-width decoders. Each checks the length, builds `BadEncoding`, copies into an array. | `fn fixed<const N: usize>(table: &'static str, bytes: &[u8]) -> Result<[u8; N], StateError>` — `crates/state/src/meta.rs` | 25 |
+| `crates/state/src/meta.rs:68-77`, `79-88`, `90-99`, `101-110` | Four `read_meta_*` functions. Each is `match txn.get(..)? { Some(b) => Ok(Some(decode(&b)?)), None => Ok(None) }`. | Same `get_decoded` helper as above; the four named functions become one-line wrappers — `crates/state/src/meta.rs` | 22 |
+| `crates/types/src/prover.rs:81-106` and `175-202` | `PublicOutputs` and `BatchPublicOutputs` encode and decode the same 160-byte, five-word ABI frame. | `struct Words160([u8; 160])` with `put_b256(i, B256)`, `put_u64(i, u64)`, `b256(i)`, `u64_checked(i)` — `crates/types/src/prover.rs`. Removes an ABI-layout drift between the block oracle and the batch oracle. | 20 |
+| `crates/state/src/trie/mod.rs:157-178`, `293-307`; `crates/state/src/trie/cursor.rs:131-152`, `157-187` | Cursor prefix scan: `set_range`, then `next` while the key keeps the prefix. | `pub(crate) fn for_each_prefix<K: TransactionKind>(txn, db, prefix: &[u8], f: impl FnMut(Vec<u8>, Vec<u8>) -> Result<ControlFlow<()>, StateError>) -> Result<(), StateError>` — `crates/state/src/schema.rs`, next to `for_each_row` | 20 |
+| `crates/state/src/integrity/checks.rs:50-60`, `67-74`, `75-87`, `291-300` | Read a meta key, decode it, and push a problem string on failure. | `fn decoded_meta<T>(txn, meta, key, name: &str, decode: fn(&[u8]) -> Result<T, StateError>, r: &mut IntegrityReport) -> Option<T>` — `crates/state/src/integrity/checks.rs` | 20 |
+| `crates/state/src/checkpoint/mod.rs:140-150`, `156-174`, `179-194`, `310-320`, `358-369` | Five `read_dir` loops. Each unwraps the entry, takes `file_name().to_string_lossy()`, and tests the name. | `fn entry_names(dir: &Path) -> Result<Vec<(String, PathBuf)>, StateError>` (a missing directory gives an empty list) — `crates/state/src/checkpoint/mod.rs` | 20 |
+| `crates/state/src/trie/mod.rs:124-128`, `171-175`, `215-218`, `264-267` (delete); `crates/state/src/writer/mod.rs:308-312`, `crates/state/src/genesis.rs:144-148` (put) | Delete while ignoring `NotFound`, and put while ignoring `KeyExist`. | `fn del_if_present(txn, db, key) -> Result<(), StateError>` and `fn put_if_absent(txn, db, key, val) -> Result<(), StateError>` — `crates/state/src/schema.rs` | 18 |
+| `crates/state/src/writer/mod.rs:289-301` vs `crates/state/src/genesis.rs:124-138`; `crates/state/src/writer/mod.rs:305-313` vs `crates/state/src/genesis.rs:140-149` | The account write loop and the code write loop. Both build the same `AccountValue` with `storage_root: B256::ZERO` and use the same write flags. | `fn write_accounts(txn, db, changes: &[AccountChange]) -> Result<(), StateError>` and `fn write_code(txn, db, entries: &[CodeEntry]) -> Result<(), StateError>` — `crates/state/src/schema.rs`. Removes drift on the ZERO storage-root convention. | 18 |
+| `crates/state/src/genesis.rs:155-169`; `crates/state/src/recovery/mod.rs:181-196`; `crates/state/src/writer/mod.rs:389-411` | Open `TrieTables`, run `update_for_block`, then put the root under `KEY_STATE_ROOT`. | `pub(crate) fn commit_trie_root(txn: &RwTxSync, delta: &BlockDelta) -> Result<B256, StateError>` — `crates/state/src/trie/mod.rs` | 16 |
+| `crates/types/src/epoch.rs:85-96`, `crates/types/src/xchain.rs:97-108` | `encode_list_two` is byte-identical in both files. Both feed a consensus source hash. | `pub(crate) fn encode_list_two<A: Encodable, B: Encodable>(a: &A, b: &B) -> Vec<u8>` — new `crates/types/src/rlp.rs` | 11 |
+| `crates/state/src/integrity/compare.rs:53-55`, `78`, `81-84`, `94`, `102-104`; `crates/state/src/integrity/checks.rs:194`, `213`, `251`, `259`, `277` | Key truncation for a report line: `&k[..k.len().min(8)]` or `&k[..4]`. | `fn head(b: &[u8]) -> &[u8]` — `crates/state/src/integrity/mod.rs` | 8 |
+| `crates/state/src/checkpoint/manifest.rs:127-132` and `194-207` | Build the manifest path, read the file, parse it. The two copies differ only in the error text. | `fn load_manifest(checkpoint: &Path, context: &str) -> Result<CheckpointManifest, StateError>` — `crates/state/src/checkpoint/manifest.rs` | 8 |
+| `crates/state/src/bin/kardamom-statecheck.rs:80-88` and `112-121` | Run `sweep`, print the error and exit on failure, report, then fold into `failed`. | `fn sweep_or_exit(dir: &str, env: &StateEnv) -> IntegrityReport` — `crates/state/src/bin/kardamom-statecheck.rs` | 8 |
+| `crates/state/src/trie/mod.rs:81-85` and `crates/state/src/trie/proofs.rs:42-46` | The account-leaf RLP closure, copied verbatim into the root walk and the proof walk. | `pub(crate) fn account_leaf_rlp(p: &AccountTrieParts) -> Vec<u8>` — `crates/state/src/trie/mod.rs`. Removes a state-root against proof leaf-encoding drift. | 7 |
+| `crates/types/src/withdrawals.rs:87-93` and `166-172` | Two `[u8; 65]` buffers: one tag byte, then two 32-byte words. Both mirror on-chain code. | `fn tagged_hash2(tag: u8, a: B256, b: B256) -> B256` — `crates/types/src/withdrawals.rs` | 6 |
+| `crates/state/src/checkpoint_transfer.rs:159-163` (write) and `413-418` (read) | The serve half writes the `x-checkpoint-*` headers, and the fetch half parses them. The header names live as literals in both halves. | `mod framing` with `HDR_BLOCK`, `HDR_KECCAK`, `HDR_GENESIS` plus `encode_head` and `parse_head` — `crates/state/src/checkpoint_transfer.rs`. Small line win, real drift win: a rename on one side turns into a silent "peer sent no x-checkpoint-keccak". | 4 |
+| `crates/types/src/withdrawals.rs:117-126` and `131-146` | Both build the leaf level, then fold with `chunks(2).map(hash_pair)`. | KEEP, differs in what each level needs: `withdrawal_proof` must read the sibling at each level before it folds. Only the one-line fold is shared. | 0 |
+| `crates/state/src/recovery/mod.rs:134-187` and `crates/state/src/genesis.rs:156-162` | Both build one synthetic `BlockDelta` and pass it to `update_for_block`. | KEEP, differs in the source: bootstrap scans the tables, genesis takes caller data. Only the tail is shared (see `commit_trie_root` above). | 0 |
+| `crates/state/src/checkpoint/manifest.rs:57-67` and `crates/state/src/checkpoint_transfer.rs:409-419` | Both split lines on a separator and match four field names. | KEEP, differs in the separator and the case rule (`=` and exact keys, against `:` and lowercased header names). A shared iterator saves about 4 lines only. | 0 |
+
+## R14 tests
+
+| sites | shape | helper (name, signature, home) | lines saved |
+|---|---|---|---|
+| 26 sites: `crates/state/tests/common/mod.rs:17-21`; `tests/compaction_smoke.rs:10-14`, `44-48`; `tests/env_smoke.rs:9-13`, `26-30`, `34-37`; `tests/recovery_midblock.rs:25-28`, `58-61`; `tests/docker_e2e.rs:57-61`; `src/genesis.rs:195-202`; `src/checkpoint/tests.rs:64-67`, `101-104`, `138-141`, `170-173`, `196-199`, `245-248`, `276-279`, `308-311`; `src/integrity/tests.rs:13-16`, `60-65`; `src/writer/tests.rs:97-100`, `122-125`, `139-143`; `src/trie/incremental_tests.rs:136-143`; `benches/write_throughput.rs:72-76`; `benches/snapshot_open.rs:14-18` | Open a tempdir env: `StateEnvBuilder::new(dir).durability(SafeNoSync).open().unwrap()`. | `pub fn temp_env() -> (tempfile::TempDir, StateEnv)` and `pub fn open_env(dir: &Path) -> StateEnv` — new `crates/state/src/testing.rs`, behind `#[cfg(any(test, feature = "test-util"))]`, so unit tests, integration tests, and benches share one copy. | 70 |
+| `tests/concurrent_readers.rs:26-38`, `58-70`; `tests/write_replay.rs:18-35`; `tests/recovery_midblock.rs:32-47`; `tests/fork_view.rs:20-24`, `38-42`; `tests/snapshot_mvcc.rs:18-22`, `31-35`; `tests/snapshot_swap.rs:20-24`, `29-33`, `47-51`; `tests/docker_e2e.rs:70-77` | Send a `simple_delta` on `delta_tx`, then drain `snapshot_rx`. | `pub fn commit_block(w: &WriterHandle, block: u64, addr: Address, bal: u64, slot: u64, val: u64) -> StateSnapshot` and `pub fn commit_range(w: &WriterHandle, blocks: RangeInclusive<u64>, addr: Address) -> StateSnapshot` — `crates/state/tests/common/mod.rs` | 45 |
+| `crates/state/src/recovery/tests.rs:67-75`, `76-84`, `146-154`, `155-163`, `231-239`, `240-248`; `crates/state/src/trie/mod.rs:407-414` | The `AccountTrieParts { nonce, balance, code_hash: ZERO, storage_root: ZERO }` literal. | `pub fn parts(nonce: u64, balance: u64) -> AccountTrieParts` — `crates/state/src/testing.rs` | 40 |
+| `crates/state/src/checkpoint/tests.rs:56-70`, `96-107`, `133-145`, `165-177`, `191-202`, `240-251`, `272-282`, `304-314` | Eight tests repeat tempdir, open env, `seed_test_genesis`, `commit_blocks`. | `fn seeded_env_with_blocks(dir: &Path, addr: Address, upto: u64) -> StateEnv` — `crates/state/src/checkpoint/tests.rs` | 40 |
+| `crates/state/src/recovery/tests.rs:26-53`, `120-139`, `184-201` | Open a write txn, open `accounts`, build `AccountValue`, put each row, commit. | `fn put_plain_accounts(env: &StateEnv, rows: &[(Address, u64, u64)])` — `crates/state/src/testing.rs` | 35 |
+| `crates/types/tests/rkyv_roundtrip.rs:24-44`, `66-69`, `97-100`, `125-128`, `152-155`, `165-169`, `178-181`, `186-190`, `238-241`, `266-269`, `280-283`, `293-296`, `308-311` | The `BPosition { term_id, term_offset }` literal, 16 sites. | `fn pos(term_id: i32, term_offset: i32) -> BPosition` — `crates/types/tests/rkyv_roundtrip.rs` | 30 |
+| `crates/types/tests/rkyv_roundtrip.rs:64-88`, `95-115`, `123-143`; `crates/state/src/schema.rs:404-421`; `crates/state/src/integrity/tests.rs:26-33` | Full `Receipt` literals that spell every field, including the default ones. | `fn receipt(idx: u64) -> Receipt` using `..Receipt::default()` — `crates/types/tests/rkyv_roundtrip.rs`; the state sites already use `..Default::default()` and need no change. | 30 |
+| `crates/state/src/writer/tests.rs:37-56` and `crates/state/src/trie/incremental_tests.rs:101-120` | Two copies of the full-rebuild oracle root over an in-memory model. This is the reference that checks the incremental trie. | `pub fn model_state_root(accounts: &BTreeMap<Address, (u64, U256, B256)>, storage: &BTreeMap<Address, BTreeMap<B256, U256>>) -> B256` — `crates/state/src/testing.rs` | 18 |
+| `crates/state/src/trie/incremental_tests.rs:123-134` | `dump_table` hand-rolls the cursor walk that `schema::for_each_row` already owns. | Call `crate::schema::for_each_row` — no new helper. | 5 |
+
+## Prior audit items
+
+| item | status (open / done / partly) | note |
+|---|---|---|
+| Checkpoint image verification duplicated in state: `checkpoint.rs:178-196` against `checkpoint_transfer.rs:225-255`; shared `check_image` plus a shared tmp to MANIFEST to rename publisher | done | `check_image_identity` lives at `crates/state/src/checkpoint/manifest.rs:147-173`, and `publish_checkpoint` at `182-190`. Both the disk path (`verify_checkpoint`, `manifest.rs:210-217`) and the peer path (`fetch_latest_checkpoint`, `checkpoint_transfer.rs:315-332`) call them. |
+| Service-binary boilerplate, `AeronRuntime::spawn`, `open_tx_receipts`, bin_support additions, recorder-thread helper, `env:VAR` parser | not in this group | These touch the bins, `kardamom-engine`, `kardamom-log`, and `obs`. |
+| Tx/Deposit dispatch in validator; CacheDB seeding in exec-core; settle sweep in engine; offer loop in sealer | not in this group | No site in `crates/state` or `crates/types`. |
+| Archive catalog paging; shell metrics scrape; topology model; LE byte readers; Java sealer harness; e2e helpers | not in this group | No site in `crates/state` or `crates/types`. |
+
+## Notes
+
+- `crates/state/src/schema.rs:241-255` (`for_each_row`) is already the shared table walk. It serves
+  10 call sites in `integrity/checks.rs`, `recovery/mod.rs`, and `trie/mod.rs`. No action.
+- `crates/state/src/trie/mod.rs:141-153` (`TrieTables::open`) is the model for a table-handle
+  bundle. `crates/state/src/writer/mod.rs:243-249` opens seven core tables one by one and could use
+  the same shape, but the other seven `open_db` sites each open one or two tables only, so a
+  `StateTables` bundle would add more lines than it removes. Not proposed.
+- `crates/state/src/checkpoint_transfer.rs` uses `TmpDirGuard` (lines 64-72) as a scope guard. The
+  fetch path is the only user. No second site to share with.
