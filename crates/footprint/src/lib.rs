@@ -54,15 +54,32 @@ pub struct TxObs {
     pub writes: Vec<Cell>,
 }
 
-/// Decode the scheduling-time fields from a raw 2718 envelope:
-/// `(to, selector, ABI-head words, has_value)`. The offline capture runner
-/// and the live shadow share this function, so both build the same
-/// derivation-candidate views. Undecodable bytes give the empty view
-/// (no selector means tier-1-only prediction).
-pub fn envelope_view(raw: &[u8]) -> (Option<Address>, Option<[u8; 4]>, Vec<U256>, bool) {
+/// Scheduling-time knowledge decoded from a raw or already-decoded
+/// envelope: recipient, ABI selector, the first calldata words after
+/// it, and whether value moved. No selector means tier-1-only
+/// prediction (a native transfer, a create, or undecodable bytes).
+#[derive(Debug, Clone)]
+pub struct EnvelopeView {
+    pub to: Option<Address>,
+    pub selector: Option<[u8; 4]>,
+    pub args: Vec<U256>,
+    pub has_value: bool,
+}
+
+/// Decode the scheduling-time fields from a raw 2718 envelope. The
+/// offline capture runner and the live shadow share this function, so
+/// both build the same derivation-candidate views. Undecodable bytes
+/// give the empty view.
+#[must_use]
+pub fn envelope_view(raw: &[u8]) -> EnvelopeView {
     use alloy_eips::eip2718::Decodable2718;
     let Ok(env) = alloy_consensus::TxEnvelope::decode_2718(&mut &raw[..]) else {
-        return (None, None, Vec::new(), false);
+        return EnvelopeView {
+            to: None,
+            selector: None,
+            args: Vec::new(),
+            has_value: false,
+        };
     };
     decoded_view(&env)
 }
@@ -70,21 +87,73 @@ pub fn envelope_view(raw: &[u8]) -> (Option<Address>, Option<[u8; 4]>, Vec<U256>
 /// [`envelope_view`] over an already-decoded envelope. Callers that hold
 /// the decoded tx (the STM engine decodes once, for both schedule and
 /// execution) skip the second RLP pass.
-pub fn decoded_view(
-    env: &alloy_consensus::TxEnvelope,
-) -> (Option<Address>, Option<[u8; 4]>, Vec<U256>, bool) {
+///
+/// # Panics
+///
+/// Never panics: the selector conversion only runs on a slice
+/// `get(..4)` already proved is exactly 4 bytes long.
+#[must_use]
+pub fn decoded_view(env: &alloy_consensus::TxEnvelope) -> EnvelopeView {
     use alloy_consensus::Transaction;
     let has_value = env.value() > U256::ZERO;
     let to = env.to();
     let input = env.input();
     let selector: Option<[u8; 4]> = input.get(..4).map(|s| s.try_into().unwrap());
-    let mut args = Vec::new();
-    if input.len() > 4 {
-        for chunk in input[4..].chunks(32).take(6) {
-            let mut w = [0u8; 32];
-            w[..chunk.len()].copy_from_slice(chunk);
-            args.push(U256::from_be_bytes(w));
+    let args: Vec<U256> = if input.len() > 4 {
+        input[4..]
+            .chunks(32)
+            .take(6)
+            .map(|chunk| {
+                let mut w = [0u8; 32];
+                w[..chunk.len()].copy_from_slice(chunk);
+                U256::from_be_bytes(w)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    EnvelopeView {
+        to,
+        selector,
+        args,
+        has_value,
+    }
+}
+
+/// Shared test fixtures: `grade.rs` and `classifier.rs` both build
+/// [`TxObs`]s and small distinct addresses for their unit tests.
+#[cfg(test)]
+pub(crate) mod testkit {
+    use super::{Cell, TxObs};
+    use alloy_primitives::{Address, U256};
+
+    /// A small distinct address (`0x00..0i`), for a set of unrelated
+    /// senders in a test.
+    pub(crate) fn addr(i: u8) -> Address {
+        Address::with_last_byte(i)
+    }
+
+    /// A minimal observation: one sender, a fixed `to`/`selector`, one
+    /// arg word, given writes and reads.
+    pub(crate) fn obs(
+        index: u64,
+        sender: Address,
+        to: Address,
+        sel: [u8; 4],
+        writes: Vec<Cell>,
+        reads: Vec<Cell>,
+    ) -> TxObs {
+        TxObs {
+            index,
+            block: 1,
+            sender,
+            to: Some(to),
+            selector: Some(sel),
+            args: vec![U256::from(1u64)],
+            gas: 100_000,
+            has_value: false,
+            reads,
+            writes,
         }
     }
-    (to, selector, args, has_value)
 }

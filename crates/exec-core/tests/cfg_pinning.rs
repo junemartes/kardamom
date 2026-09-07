@@ -1,5 +1,4 @@
-//! Pin every effective execution parameter (see W1b in
-//! `docs/agents/l1-client-suite-port-spec.md`).
+//! Pin every effective execution parameter.
 //!
 //! `CfgEnv` is `#[non_exhaustive]`, so unlike `BlockEnv` this cannot force
 //! a compile error when revm grows a field. Instead, these tests assert

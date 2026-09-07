@@ -17,31 +17,23 @@
 use std::collections::{BTreeMap, HashMap};
 
 use alloy_primitives::{B256, Bytes, U256, keccak256};
-use alloy_trie::proof::ProofRetainer;
-use alloy_trie::{HashBuilder, Nibbles};
 use bytes::Bytes as WireBytes;
 use kardamom_exec_core::anchor::{AnchorError, Lookup, NodeStore, SparseTrie};
 use kardamom_types::WitnessProofs;
 
+mod common;
+use common::retained_nodes;
+
 /// Reference root, plus a complete node map, for a key-value set. This
-/// uses the oracle builder with every key as a proof target, so every
-/// path is retained, which means every node is retained.
+/// retains every key as a proof target, so every path is retained, which
+/// means every node is retained.
 fn reference(entries: &BTreeMap<B256, Vec<u8>>) -> (B256, HashMap<B256, Bytes>) {
-    let targets: Vec<Nibbles> = entries.keys().map(|k| Nibbles::unpack(k)).collect();
-    let mut hb = HashBuilder::default().with_proof_retainer(ProofRetainer::new(targets));
-    for (k, v) in entries {
-        hb.add_leaf(Nibbles::unpack(k), v);
-    }
-    let root = hb.root();
-    let mut nodes = HashMap::new();
-    for (_, node) in hb.take_proof_nodes().into_inner() {
-        // Only nodes of 32 bytes or more are addressable by hash. Smaller
-        // ones are inline in their parents and never fetched.
-        if node.len() >= 32 {
-            nodes.insert(keccak256(&node), node);
-        }
-    }
-    (root, nodes)
+    let targets: Vec<B256> = entries.keys().copied().collect();
+    let (root, nodes) = retained_nodes(entries, &targets);
+    (
+        root,
+        nodes.into_iter().map(|n| (keccak256(&n), n)).collect(),
+    )
 }
 
 /// Canonical wire form from a set of raw nodes.
@@ -89,17 +81,7 @@ fn fixed_point<T>(
 /// Proof nodes for a set of target keys, out of the complete map. This
 /// is the capture side's initial (read-path) seed.
 fn paths_for(entries: &BTreeMap<B256, Vec<u8>>, targets: &[B256]) -> Vec<Bytes> {
-    let target_nibbles: Vec<Nibbles> = targets.iter().map(|k| Nibbles::unpack(k)).collect();
-    let mut hb = HashBuilder::default().with_proof_retainer(ProofRetainer::new(target_nibbles));
-    for (k, v) in entries {
-        hb.add_leaf(Nibbles::unpack(k), v);
-    }
-    let _ = hb.root();
-    hb.take_proof_nodes()
-        .into_inner()
-        .into_values()
-        .filter(|n| n.len() >= 32)
-        .collect()
+    retained_nodes(entries, targets).1
 }
 
 fn key(i: u64) -> B256 {

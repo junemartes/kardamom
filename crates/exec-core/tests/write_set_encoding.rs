@@ -37,7 +37,11 @@ fn buffered_and_streaming_paths_agree() {
         .map(|i| {
             (
                 addr(i),
-                (i as u64, U256::from(10u64).pow(U256::from(18)), B256::ZERO),
+                (
+                    u64::from(i),
+                    U256::from(10u64).pow(U256::from(18)),
+                    B256::ZERO,
+                ),
             )
         })
         .collect();

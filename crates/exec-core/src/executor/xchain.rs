@@ -2,25 +2,18 @@
 //! EVM call into the Inbox predeploy, with the message's `source_hash` as
 //! the receipt's canonical id.
 
-use alloy_primitives::Bytes as AlloyBytes;
-use alloy_primitives::U256;
 use kardamom_types::xchain::{self, XChainMessage};
-use kardamom_types::{BPosition, Receipt, StateDatabase, WireLog};
-use revm::context::TxEnv;
-use revm::context::result::ExecutionResult;
-use revm::database::CacheDB;
-use revm::primitives::{Log, TxKind};
-use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
+use kardamom_types::{Receipt, StateDatabase};
 
 use alloc::format;
-use alloc::vec::Vec;
 
 use crate::block_env::ExecEnv;
 use crate::delta::{PendingDelta, WriteSet};
 use crate::error::ExecutorError;
-use crate::exec_types::TxIndex;
+use crate::exec_types::{TxIndex, TxSlot};
 
-use super::db::{SnapshotRef, seed_cache_layer};
+use super::db::seed_composed_cache;
+use super::derived::{DerivedCall, DerivedIdentity};
 use super::write_set::{retain_changed, write_set_from_cache};
 
 /// Extra gas for a cross-chain delivery, on top of the inner-call budget.
@@ -30,7 +23,18 @@ use super::write_set::{retain_changed, write_set_from_cache};
 /// work (a delivery-status write, an event, and a callback enqueue through
 /// the local Outbox), needs gas too. Without this headroom, that work
 /// would use up the app's budget.
-pub const XCHAIN_DELIVERY_OVERHEAD: u64 = 150_000;
+pub(super) const XCHAIN_DELIVERY_OVERHEAD: u64 = 150_000;
+
+/// One cross-chain message's origin and payload. `execute_xchain_tx`
+/// also carries `snapshot`/`parent`/`delta` (the deposit path's fresh-
+/// cache shape), so bundling `origin_chain_id` with `message` here keeps
+/// it within the argument-count bound `TxSlot` alone does not clear for
+/// this one entry point.
+#[derive(Clone, Copy)]
+pub struct XChainDelivery<'a> {
+    pub origin_chain_id: u64,
+    pub message: &'a XChainMessage,
+}
 
 /// Execute one derived cross-chain message. It runs against a snapshot
 /// and the current `PendingDelta`. It returns the receipt, plus a fresh
@@ -48,122 +52,110 @@ pub const XCHAIN_DELIVERY_OVERHEAD: u64 = 150_000;
 /// dropped message: the wire format keeps the field so it stays stable
 /// once value transfer ships, but minting before the anchored-tier value
 /// rules exist would inflate supply. So this case fails the engine.
-#[allow(clippy::too_many_arguments)] // matches execute_tx's shape; see the
-// equivalent allow on execute_tx for the rationale.
+///
+/// # Errors
+///
+/// Returns [`ExecutorError::Execution`] when `message.value` is nonzero,
+/// the inner call fails non-deterministically, or a database read fails.
 pub fn execute_xchain_tx<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
     delta: &PendingDelta,
     env: ExecEnv,
-    tx_idx: TxIndex,
-    tx_position: BPosition,
-    origin_chain_id: u64,
-    message: &XChainMessage,
-    tx_index_in_block: u64,
-    cumulative_gas_used_before: u64,
+    slot: TxSlot,
+    delivery: XChainDelivery<'_>,
     // See `execute_deposit_tx`. Cross-chain claims are writes only,
     // through the same constructed-account path. This keeps executor and
     // validator claims symmetric.
     bal: Option<(&mut revm::state::bal::Bal, u64)>,
 ) -> Result<(Receipt, WriteSet), ExecutorError> {
-    if message.value != 0 {
-        return Err(ExecutorError::Execution {
-            idx: tx_idx,
-            detail: format!(
-                "xchain message (origin {origin_chain_id}, seq {}) carries value {} but v1 \
-                 delivery is value-free — chain fault, not droppable",
-                message.seq, message.value
-            ),
-        });
-    }
+    let origin_chain_id = delivery.origin_chain_id;
+    let message = ValuelessMessage::new(slot.tx_idx, origin_chain_id, delivery.message)?;
 
     // Layer the running delta on top of the snapshot through CacheDB, so
     // revm sees writes from earlier txs in the same block. This mirrors
     // execute_tx.
-    let snap_ref = SnapshotRef { inner: snapshot };
-    let mut cache: CacheDB<SnapshotRef<'_, S>> = CacheDB::new(snap_ref);
-    for layer in parent.into_iter().chain(core::iter::once(delta)) {
-        seed_cache_layer(&mut cache, layer).map_err(|detail| ExecutorError::Execution {
-            idx: tx_idx,
-            detail,
-        })?;
-    }
-
-    // Like deposits, the derived tx carries no nonce.
-    let mut cfg = env.cfg_env();
-    cfg.disable_nonce_check = true;
-
+    let mut cache = seed_composed_cache(snapshot, parent, delta, slot.tx_idx)?;
     let sender = xchain::xchain_tx_sender(origin_chain_id);
-    let tx_env = TxEnv {
-        caller: sender,
-        kind: TxKind::Call(xchain::INBOX),
-        value: U256::ZERO,
-        data: AlloyBytes::from(xchain::deliver_calldata(origin_chain_id, message)),
-        gas_limit: message.gas_limit.saturating_add(XCHAIN_DELIVERY_OVERHEAD),
-        gas_price: 0,
-        nonce: 0,
-        chain_id: None,
-        ..Default::default()
-    };
-    let mut evm = Context::mainnet()
-        .with_db(&mut cache)
-        .with_block(env.block_env())
-        .with_cfg(cfg)
-        .build_mainnet();
-    let result = evm
-        .transact_commit(tx_env)
-        .map_err(|e| ExecutorError::Execution {
-            idx: tx_idx,
-            detail: format!("{e:?}"),
-        })?;
-
-    let gas_used = result.gas().tx_gas_used();
-    // A revert inside deliver (or the inner call bubbling one up) marks
-    // the receipt failed, but it is not an engine error. This is the
-    // deposit posture.
-    let (status_success, logs) = match &result {
-        ExecutionResult::Success { logs, .. } => (true, logs.clone()),
-        ExecutionResult::Revert { .. } => (false, Vec::<Log>::new()),
-        ExecutionResult::Halt { .. } => (false, Vec::<Log>::new()),
-    };
+    let mut call = DerivedCall::new(&mut cache, &env, slot);
+    let tx_env = super::tx_env::tx_env_from_xchain(origin_chain_id, &message);
+    let outcome = call.transact_commit(tx_env)?;
 
     let ws = write_set_from_cache(&cache.cache);
     // Same discipline as deposits: only true changes survive, so this
     // capture is a pure function of execution, not of what the pipelined
     // commit happened to leave in the seeded layers.
-    let ws = retain_changed(ws, snapshot, parent, delta, tx_idx)?;
+    let ws = retain_changed(ws, snapshot, parent, delta, slot.tx_idx)?;
     if let Some((bal, bal_index)) = bal {
         ws.record_into_bal(bal, bal_index);
     }
 
-    let write_set_hash = ws.hash();
-    let wire_logs: Vec<WireLog> = logs.iter().map(WireLog::from).collect();
-    let cumulative_gas_used = cumulative_gas_used_before + gas_used;
-
-    let receipt = Receipt {
-        tx_idx: tx_position,
-        // The canonical id stamped at derivation (source_hash), not a
-        // 2718 keccak. Same posture as deposits.
-        tx_hash: message.source_hash,
-        tx_type: kardamom_types::TX_TYPE_XCHAIN,
-        status: status_success,
-        gas_used,
-        logs: wire_logs,
-        write_set_hash,
-        // Origin-derived: consumes no local nonce. The filler `nonce: 0`
-        // is never a real nonce; consumers branch on tx_type, not on it.
-        nonce: 0,
-        from: sender,
-        to: Some(xchain::INBOX),
-        contract_address: None,
-        // Destination-side delivery pays no fee (quota-gated instead).
-        effective_gas_price: 0,
-        block_number: env.block_number,
-        transaction_index: tx_index_in_block,
-        cumulative_gas_used,
-        skip_reason: None,
-    };
+    let receipt = DerivedCall::new(&mut cache, &env, slot).derived_receipt(
+        DerivedIdentity {
+            tx_hash: message.source_hash,
+            tx_type: kardamom_types::TX_TYPE_XCHAIN,
+            from: sender,
+            to: Some(xchain::INBOX),
+        },
+        &outcome,
+        ws.hash(),
+    )?;
     Ok((receipt, ws))
+}
+
+/// A cross-chain message proven value-free and gas-bounded, at the point
+/// where it enters execution. v1 carries no value: a nonzero
+/// `message.value` is a chain fault, not a droppable message. The wire
+/// format keeps the field so it stays stable once value transfer ships,
+/// but minting before the anchored-tier value rules exist would inflate
+/// supply. `gas_limit` is bounded to the block gas limit here too, so
+/// [`tx_env_from_xchain`](super::tx_env::tx_env_from_xchain)'s
+/// `+ XCHAIN_DELIVERY_OVERHEAD` can be a plain add: an untrusted wire
+/// value near `u64::MAX` never reaches it. Every entry point
+/// ([`execute_xchain_tx`] and [`super::scope::Executor::execute_xchain`])
+/// derives one of these before touching the cache, so downstream code
+/// ([`DerivedCall::transact_commit`], [`DerivedCall::derived_receipt`])
+/// never re-checks either bound.
+pub(super) struct ValuelessMessage<'a>(&'a XChainMessage);
+
+impl<'a> ValuelessMessage<'a> {
+    pub(super) fn new(
+        tx_idx: TxIndex,
+        origin_chain_id: u64,
+        message: &'a XChainMessage,
+    ) -> Result<Self, ExecutorError> {
+        if message.value != 0 {
+            return Err(ExecutorError::Execution {
+                idx: tx_idx,
+                detail: format!(
+                    "xchain message (origin {origin_chain_id}, seq {}) carries value {} but v1 \
+                     delivery is value-free — chain fault, not droppable",
+                    message.seq, message.value
+                ),
+            });
+        }
+        if message.gas_limit > crate::block_env::BLOCK_GAS_LIMIT {
+            return Err(ExecutorError::Execution {
+                idx: tx_idx,
+                detail: format!(
+                    "xchain message (origin {origin_chain_id}, seq {}) claims gas_limit {} \
+                     above the block gas limit {} — chain fault, not droppable",
+                    message.seq,
+                    message.gas_limit,
+                    crate::block_env::BLOCK_GAS_LIMIT
+                ),
+            });
+        }
+        Ok(Self(message))
+    }
+}
+
+impl core::ops::Deref for ValuelessMessage<'_> {
+    type Target = XChainMessage;
+
+    fn deref(&self) -> &XChainMessage {
+        self.0
+    }
 }
 
 // -----------------------------------------------------------------
@@ -173,9 +165,9 @@ pub fn execute_xchain_tx<S: StateDatabase>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::test_support::{boundary, pos};
+    use crate::executor::test_support::{boundary, slot};
     use crate::state::MockStateDatabase;
-    use alloy_primitives::Address;
+    use alloy_primitives::{Address, Bytes as AlloyBytes, U256};
     use bytes::Bytes;
     use revm::state::Bytecode;
 
@@ -207,12 +199,11 @@ mod tests {
             None,
             &delta,
             env,
-            TxIndex(0),
-            pos(0),
-            ORIGIN_CHAIN,
-            &m,
-            0,
-            33,
+            slot(0, 0, 0, 33),
+            XChainDelivery {
+                origin_chain_id: ORIGIN_CHAIN,
+                message: &m,
+            },
             Some((&mut bal, 1)),
         )
         .expect("execute");
@@ -262,12 +253,11 @@ mod tests {
             None,
             &delta,
             env,
-            TxIndex(0),
-            pos(0),
-            ORIGIN_CHAIN,
-            &m,
-            0,
-            0,
+            slot(0, 0, 0, 0),
+            XChainDelivery {
+                origin_chain_id: ORIGIN_CHAIN,
+                message: &m,
+            },
             None,
         )
         .unwrap_err();
@@ -302,12 +292,11 @@ mod tests {
             None,
             &delta,
             env,
-            TxIndex(0),
-            pos(0),
-            ORIGIN_CHAIN,
-            &m,
-            0,
-            0,
+            slot(0, 0, 0, 0),
+            XChainDelivery {
+                origin_chain_id: ORIGIN_CHAIN,
+                message: &m,
+            },
             None,
         )
         .expect("revert is OK at the executor layer");

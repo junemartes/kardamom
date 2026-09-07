@@ -32,28 +32,64 @@ use crate::exec_types::TxIndex;
 /// balance (post-values only; the mint is itself a balance claim), and to
 /// code only when this record deployed it (`ws.code` carries only newly
 /// created bytecode, and the claim must include the bytes, since code is
-/// a seed; see `ClaimIndex::code`). An earlier version fabricated only
-/// the nonce, and per-field classification silently dropped the balance
-/// and code claims, so the deposit mint never reached the BAL.
+/// a seed; see `ClaimIndex::code`).
 impl WriteSet {
     /// See the module docs above this impl for the fabrication rationale.
     pub fn record_into_bal(&self, bal: &mut revm::state::bal::Bal, bal_index: u64) {
-        record_writeset_into_bal_inner(bal, bal_index, self)
+        let mut entries = BalEntries::default();
+        for (addr, (nonce, balance, code_hash)) in &self.accounts {
+            entries.account(self, *addr, *nonce, *balance, *code_hash);
+        }
+        for ((addr, key), value) in &self.storage {
+            entries.slot(*addr, *key, *value);
+        }
+        entries.record_into(bal, bal_index);
+    }
+
+    /// Push one account's cache-shape storage entries: the inner loop of
+    /// [`write_set_from_cache`]'s per-account walk. `CacheDB` carries no
+    /// original/present distinction, so every touched slot survives.
+    fn push_cache_storage<'a>(
+        &mut self,
+        addr: Address,
+        storage: impl IntoIterator<Item = (&'a U256, &'a U256)>,
+    ) {
+        for (key, value) in storage {
+            let b_key = B256::from(key.to_be_bytes::<32>());
+            self.storage.push(((addr, b_key), *value));
+        }
+    }
+
+    /// Push one account's evm-state-shape storage entries: the inner
+    /// loop of [`write_set_from_evm_state_inner`]'s per-account walk.
+    /// Only a slot whose `present_value` differs from `original_value`
+    /// is a real write; revm tracks both on `EvmStorageSlot`.
+    fn push_evm_state_storage<'a>(
+        &mut self,
+        addr: Address,
+        storage: impl IntoIterator<Item = (&'a U256, &'a revm::state::EvmStorageSlot)>,
+    ) {
+        for (key, slot) in storage {
+            if slot.original_value != slot.present_value {
+                let b_key = B256::from(key.to_be_bytes::<32>());
+                self.storage.push(((addr, b_key), slot.present_value));
+            }
+        }
     }
 
     /// Build a `WriteSet` from revm's per-tx `EvmState`. Only touched
     /// accounts, changed slots, and created code are emitted, which keeps
     /// the per-tx hash stable across replicas.
+    #[must_use]
     pub fn from_evm_state(state: &revm::state::EvmState) -> Self {
         write_set_from_evm_state_inner(state)
     }
 
     /// [`Self::from_evm_state`], for a deposit or a cross-chain delivery
     /// (a 0x7D message). These are commit-cache style records: fee-free,
-    /// with the nonce check off, and their artifact must stay
-    /// byte-identical to the historic free-function path
-    /// (`execute_deposit_tx`, `execute_xchain_tx`) — the equivalence test
-    /// in `deposit.rs` is the gate.
+    /// with the nonce check off. The artifact must stay byte-identical to
+    /// `execute_deposit_tx` and `execute_xchain_tx`; `deposit.rs`'s
+    /// `old_and_new_deposit_paths_agree` test is the gate.
     ///
     /// Two extra rules on top of [`Self::from_evm_state`]:
     ///
@@ -65,16 +101,14 @@ impl WriteSet {
     ///   nothing in it (the fee recipient at zero reward, and similar
     ///   cases) — a value pipelined-commit timing could otherwise leak
     ///   into the artifact.
-    /// - A called (not created) contract's bytecode is re-added: the
-    ///   historic fresh-cache path always carried it, since a called
-    ///   contract's code lands in the cache on load.
+    /// - A called (not created) contract's bytecode is re-added, since a
+    ///   called contract's code lands in the cache on load.
+    #[must_use]
     pub fn from_evm_state_deposit(state: &revm::state::EvmState) -> Self {
         // Kardamom's empty-code sentinel is `B256::ZERO`; revm's is
         // `KECCAK_EMPTY`. Normalize so "empty" compares equal on both
         // sides — `seed_cache_layer` can put kardamom's convention into
         // the scope's cache.
-        let norm = |h: B256| if h == KECCAK_EMPTY { B256::ZERO } else { h };
-
         let mut ws = write_set_from_evm_state_inner(state);
         ws.accounts.retain(|(addr, (nonce, balance, code_hash))| {
             let Some(account) = state.get(addr) else {
@@ -83,13 +117,14 @@ impl WriteSet {
             let original = &account.original_info;
             *nonce != original.nonce
                 || *balance != original.balance
-                || norm(*code_hash) != norm(original.code_hash)
+                || crate::code_hash::to_wire_code_hash(*code_hash)
+                    != crate::code_hash::to_wire_code_hash(original.code_hash)
         });
 
         // Re-walk for the artifact part the per-tx filter drops: the code
-        // bytes of a called (not created) contract. The historic
-        // fresh-cache path carried it, since a called contract's
-        // bytecode lands in `cache.contracts` on load.
+        // bytes of a called (not created) contract. A called contract's
+        // bytecode lands in `cache.contracts` on load, so it must be
+        // re-added here.
         for account in state.values() {
             if !account.is_touched() {
                 continue;
@@ -112,20 +147,37 @@ impl WriteSet {
     }
 }
 
-fn record_writeset_into_bal_inner(bal: &mut revm::state::bal::Bal, bal_index: u64, ws: &WriteSet) {
-    use revm::state::{Account, AccountInfo, AccountStatus, EvmStorageSlot};
-    let mut by_addr: BTreeMap<Address, Account> = BTreeMap::new();
-    for (addr, (nonce, balance, code_hash)) in &ws.accounts {
+/// A batch of BAL entries, built up from a `WriteSet`'s accounts and
+/// storage writes with fabricated `original_info`/`original_value`
+/// fields (see the module docs above [`WriteSet::record_into_bal`] for
+/// why fabrication is needed at all). [`WriteSet::record_into_bal`]
+/// fills one of these, then records it.
+#[derive(Default)]
+struct BalEntries(BTreeMap<Address, revm::state::Account>);
+
+impl BalEntries {
+    /// Add one account's BAL entry, with `original_info` fabricated to
+    /// differ from `info` in every field a later batch may seed from
+    /// (nonce, balance, and code when this record deployed it).
+    fn account(
+        &mut self,
+        ws: &WriteSet,
+        addr: Address,
+        nonce: u64,
+        balance: U256,
+        code_hash: B256,
+    ) {
+        use revm::state::{Account, AccountInfo, AccountStatus};
         let code = ws
             .code
             .iter()
-            .find(|(h, _)| h == code_hash)
+            .find(|(h, _)| *h == code_hash)
             .map(|(_, b)| Bytecode::new_raw(AlloyBytes::from(b.clone())));
         let deployed_here = code.is_some();
         let info = AccountInfo {
-            nonce: *nonce,
-            balance: *balance,
-            code_hash: *code_hash,
+            nonce,
+            balance,
+            code_hash,
             code,
             account_id: None,
         };
@@ -138,19 +190,28 @@ fn record_writeset_into_bal_inner(bal: &mut revm::state::bal::Bal, bal_index: u6
             original.code_hash = alloy_primitives::KECCAK256_EMPTY;
             original.code = None;
         }
-        by_addr.insert(
-            *addr,
+        self.0.insert(
+            addr,
             Account {
                 info,
                 original_info: Box::new(original),
                 transaction_id: 0,
-                storage: Default::default(),
+                storage: revm::state::EvmStorage::default(),
                 status: AccountStatus::Touched,
             },
         );
     }
-    for ((addr, key), value) in &ws.storage {
-        let entry = by_addr.entry(*addr).or_insert_with(|| {
+
+    /// Add one storage write, fabricating an empty account entry first
+    /// when `addr` was seen only through this write, with no
+    /// account-field change. That fabricated `original_info` differs
+    /// only in nonce, since balance and code are absent from `ws.accounts`
+    /// for this address. `original_value` is fabricated to differ from
+    /// `present_value`, so revm's per-field classification marks the
+    /// slot a write.
+    fn slot(&mut self, addr: Address, key: B256, value: U256) {
+        use revm::state::{Account, AccountInfo, AccountStatus, EvmStorageSlot};
+        let account = self.0.entry(addr).or_insert_with(|| {
             let info = AccountInfo::default();
             let mut original = info.clone();
             original.nonce = original.nonce.wrapping_add(1);
@@ -158,28 +219,32 @@ fn record_writeset_into_bal_inner(bal: &mut revm::state::bal::Bal, bal_index: u6
                 info,
                 original_info: Box::new(original),
                 transaction_id: 0,
-                storage: Default::default(),
+                storage: revm::state::EvmStorage::default(),
                 status: AccountStatus::Touched,
             }
         });
         let slot_key = U256::from_be_bytes::<32>(key.0);
-        entry.storage.insert(
+        account.storage.insert(
             slot_key,
             EvmStorageSlot {
-                original_value: !*value, // differs from present_value, so this is a write
-                present_value: *value,
+                original_value: !value, // differs from present_value, so this is a write
+                present_value: value,
                 transaction_id: 0,
                 is_cold: false,
             },
         );
     }
-    for (addr, account) in &by_addr {
-        bal.update_account(bal_index, *addr, account);
+
+    /// Record every entry into `bal` at `bal_index`.
+    fn record_into(&self, bal: &mut revm::state::bal::Bal, bal_index: u64) {
+        for (addr, account) in &self.0 {
+            bal.update_account(bal_index, *addr, account);
+        }
     }
 }
 
 /// Build a `WriteSet` from `CacheDB`'s accumulated cache. Unlike
-/// [`write_set_from_evm_state`] (which iterates revm's per-tx
+/// [`WriteSet::from_evm_state`] (which iterates revm's per-tx
 /// `EvmState`), this iterates `CacheDB::cache.accounts` after the
 /// deposit's commit cycle completes. So the resulting `WriteSet` covers
 /// both the mint pre-credit and any inner-call writes. This skips
@@ -187,7 +252,7 @@ fn record_writeset_into_bal_inner(bal: &mut revm::state::bal::Bal, bal_index: u6
 /// (never observed).
 pub(super) fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
     let mut ws = WriteSet::default();
-    for (addr, account) in state.accounts.iter() {
+    for (addr, account) in &state.accounts {
         match account.account_state {
             revm::database::AccountState::None | revm::database::AccountState::NotExisting => {
                 continue;
@@ -213,10 +278,7 @@ pub(super) fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
             ));
         }
 
-        for (key, value) in &account.storage {
-            let b_key = B256::from(key.to_be_bytes::<32>());
-            ws.storage.push(((*addr, b_key), *value));
-        }
+        ws.push_cache_storage(*addr, &account.storage);
     }
     ws.finish();
     ws
@@ -245,13 +307,10 @@ pub(super) fn retain_changed<S: StateDatabase>(
     delta: &PendingDelta,
     idx: TxIndex,
 ) -> Result<WriteSet, ExecutorError> {
-    // Kardamom's empty-code sentinel is `B256::ZERO`; revm's is
-    // `KECCAK_EMPTY`. Normalize so "empty" compares equal on both sides.
-    let norm = |h: B256| if h == KECCAK_EMPTY { B256::ZERO } else { h };
     let state_err = |detail: alloc::string::String| ExecutorError::Execution { idx, detail };
 
     let mut out = WriteSet::default();
-    for (addr, triple) in ws.accounts.iter() {
+    for (addr, triple) in &ws.accounts {
         let pre = match delta
             .accounts
             .get(addr)
@@ -263,17 +322,22 @@ pub(super) fn retain_changed<S: StateDatabase>(
                 .map_err(|e| state_err(format!("retain basic({addr:?}): {e}")))?,
         };
         let changed = match pre {
-            Some((n, b, c)) => triple.0 != n || triple.1 != b || norm(triple.2) != norm(c),
+            Some((n, b, c)) => {
+                triple.0 != n
+                    || triple.1 != b
+                    || crate::code_hash::to_wire_code_hash(triple.2)
+                        != crate::code_hash::to_wire_code_hash(c)
+            }
             // No prior account: keep a real creation, but drop an
             // account touched into existence with nothing in it (a
             // beneficiary at zero reward, and similar cases).
-            None => !(triple.0 == 0 && triple.1 == U256::ZERO && norm(triple.2) == B256::ZERO),
+            None => !crate::code_hash::is_empty_account(triple.0, triple.1, triple.2),
         };
         if changed {
             out.accounts.push((*addr, *triple));
         }
     }
-    for ((addr, key), value) in ws.storage.iter() {
+    for ((addr, key), value) in &ws.storage {
         let pre = match delta
             .storage
             .get(&(*addr, *key))
@@ -298,12 +362,12 @@ pub(super) fn retain_changed<S: StateDatabase>(
     Ok(out)
 }
 
-/// Public API: the Block-STM engine (`kardamom-stm`) builds per-tx write
-/// sets from its own revm outcomes, using exactly these emission rules:
-/// touched accounts, changed slots, and created code only.
+/// The emission rules the Block-STM engine (`kardamom-stm`) must match
+/// when it builds per-tx write sets from its own revm outcomes: touched
+/// accounts, changed slots, and created code only.
 fn write_set_from_evm_state_inner(state: &revm::state::EvmState) -> WriteSet {
     let mut ws = WriteSet::default();
-    for (addr, account) in state.iter() {
+    for (addr, account) in state {
         // Only emit accounts revm marked as touched. Untouched entries are
         // only reads.
         if !account.is_touched() {
@@ -315,12 +379,9 @@ fn write_set_from_evm_state_inner(state: &revm::state::EvmState) -> WriteSet {
 
         // Code bytes: only for accounts created this tx. Revm also loads
         // the bytecode of every contract that is merely called (`info.code`
-        // is populated on load). An earlier version copied the full
-        // runtime into the `WriteSet` on every call, unconditionally,
-        // costing about 1.6KB/tx on CLOB workloads, the second-largest
-        // allocation site after `Executor`. A called contract's code is
-        // already durable (in the snapshot or parent); only a CREATE
-        // introduces new bytes that the delta must carry.
+        // is populated on load), but a called contract's code is already
+        // durable (in the snapshot or parent); only a CREATE introduces
+        // new bytes that the delta must carry.
         if account.is_created()
             && let Some(code) = info.code.as_ref()
             && info.code_hash != KECCAK_EMPTY
@@ -332,14 +393,7 @@ fn write_set_from_evm_state_inner(state: &revm::state::EvmState) -> WriteSet {
             ));
         }
 
-        for (key, slot) in account.storage.iter() {
-            // Only record slots whose present_value differs from the
-            // original_value. Revm tracks both on `EvmStorageSlot`.
-            if slot.original_value != slot.present_value {
-                let b_key = B256::from(key.to_be_bytes::<32>());
-                ws.storage.push(((*addr, b_key), slot.present_value));
-            }
-        }
+        ws.push_evm_state_storage(*addr, &account.storage);
     }
     ws.finish();
     ws

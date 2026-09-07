@@ -8,13 +8,19 @@
 use alloy_primitives::{Address, B256, U256};
 use kardamom_exec_core::delta::WriteSet;
 
+mod common;
+use common::ns_per_op;
+
 fn transfer_ws(i: u64) -> WriteSet {
     let mut ws = WriteSet::default();
     for k in 0..3u64 {
-        ws.accounts.push((
-            Address::with_last_byte((i + k) as u8),
-            (i, U256::from(1_000_000u64 + i + k), B256::ZERO),
-        ));
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the address suffix wraps mod 256 on purpose: this only needs 3000 distinct-enough addresses, not a faithful account identity"
+        )]
+        let addr = Address::with_last_byte((i + k) as u8);
+        ws.accounts
+            .push((addr, (i, U256::from(1_000_000u64 + i + k), B256::ZERO)));
     }
     ws.finish();
     ws
@@ -22,18 +28,16 @@ fn transfer_ws(i: u64) -> WriteSet {
 
 #[test]
 fn write_set_hash_cost() {
+    const REPS: usize = 50;
     let sets: Vec<WriteSet> = (0..1000).map(transfer_ws).collect();
     for w in &sets {
         std::hint::black_box(w.hash());
     }
-    const REPS: usize = 50;
-    let t = std::time::Instant::now();
-    for _ in 0..REPS {
+    let hot = ns_per_op(REPS, sets.len(), || {
         for w in &sets {
             std::hint::black_box(w.hash());
         }
-    }
-    let hot = t.elapsed().as_nanos() as f64 / (REPS * sets.len()) as f64;
+    });
 
     // Cold: stride through 16MB between hashes, so every write set is a
     // fresh cache miss, matching the tail's access pattern.
@@ -41,9 +45,13 @@ fn write_set_hash_cost() {
     let mut acc = 0u64;
     let t = std::time::Instant::now();
     for (n, w) in sets.iter().enumerate() {
-        acc += junk[(n * 4093) % junk.len()] as u64;
+        acc += u64::from(junk[(n * 4093) % junk.len()]);
         std::hint::black_box(w.hash());
     }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a nanosecond-scale timing report; precision loss here is irrelevant"
+    )]
     let cold = t.elapsed().as_nanos() as f64 / sets.len() as f64;
     eprintln!(
         "WriteSet::hash 3-account: hot {hot:.0} ns/tx | cold-ish {cold:.0} ns/tx (junk {acc})"
