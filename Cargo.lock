@@ -4034,7 +4034,6 @@ dependencies = [
  "anyhow",
  "metrics",
  "metrics-exporter-prometheus",
- "reqwest 0.13.4",
  "serde_json",
  "tokio",
  "tracing",

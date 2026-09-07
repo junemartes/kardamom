@@ -1,4 +1,4 @@
-//! Real-Aeron e2e against the new Send-friendly `aeron_live` adapters.
+//! Real-Aeron e2e against the Send-friendly `aeron_live` adapters.
 //!
 //! Exercises the publish and subscribe path through `AeronRuntime`,
 //! showing that:
@@ -16,24 +16,13 @@
 
 #![cfg(feature = "docker-e2e")]
 
+mod common;
+
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256};
-use bytes::Bytes;
-use kardamom_log::aeron_live::{AeronRuntime, TxDataPublisherHandle, TxDataSubscriberHandle};
-use kardamom_log::config::LogConfig;
-use kardamom_log::testing::AeronTestCluster;
+use kardamom_log::aeron_live::{TxDataPublisherHandle, TxDataSubscriberHandle};
+use kardamom_log::testing::{AeronTestCluster, SingleNodeRig};
 use kardamom_types::TxEnvelope;
-
-async fn docker_available() -> bool {
-    use tokio::process::Command;
-    Command::new("docker")
-        .arg("info")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker; run with `cargo test -p log --features docker-e2e --test aeron_live_e2e -- --ignored`"]
@@ -42,32 +31,14 @@ async fn aeron_live_send_friendly_round_trip() {
     // docker-e2e -- --ignored`), an environment where Docker is required.
     // Its absence is an error, not a skip condition; a silent return
     // would count as a green pass.
-    assert!(
-        docker_available().await,
-        "docker not available — required for this --ignored docker-e2e test"
-    );
+    kardamom_log::testing::require_docker().await;
 
-    let cluster = AeronTestCluster::single_node()
-        .await
-        .expect("aeron container started");
-    let endpoint = cluster.archive_control_endpoint(0).await;
-    let aeron_dir = cluster.aeron_dir_host(0).to_string_lossy().to_string();
-    eprintln!("aeron archive control: {endpoint}");
-    eprintln!("aeron.dir (host): {aeron_dir}");
-
-    let mut cfg = LogConfig::default();
     // Use IPC over the shared `aeron.dir` (bind-mounted between host and
     // container). Both processes are clients of the same Media Driver
     // running inside the container, so no UDP is needed for this
-    // single-host smoke test. This overrides the per-shard tx_data
-    // template to a plain IPC URI for the single-shard test
-    // (sequencer_id=0).
-    cfg.channels.tx_data_channel_template = "aeron:ipc?alias=a-{sid}".to_string();
-    cfg.channels.tx_data_stream_id_base = 4001;
-
-    // Spawn the runtime, pointing AeronContext at the bind-mounted
-    // aeron.dir, so the host client joins the container's Media Driver.
-    let rt = AeronRuntime::spawn_with_dir(&aeron_dir).expect("aeron runtime");
+    // single-host smoke test. Stream base 4001 keeps this test's stream
+    // distinct from the other e2e tests'.
+    let SingleNodeRig { cluster, rt, cfg } = AeronTestCluster::single_node_runtime(4001).await;
 
     let sequencer_id = 0u8;
     let publisher =
@@ -81,13 +52,9 @@ async fn aeron_live_send_friendly_round_trip() {
         let publisher = publisher.clone();
         move || {
             for i in 0..50u64 {
+                let fill = u8::try_from(i).expect("loop bound is below u8::MAX");
                 publisher
-                    .publish(&TxEnvelope {
-                        correlation_id: i,
-                        raw_tx: Bytes::from(vec![0xEEu8; 64]),
-                        sender: Address::repeat_byte(i as u8),
-                        tx_hash: B256::repeat_byte(i as u8),
-                    })
+                    .publish(&common::tx_envelope(i, fill, 64))
                     .expect("publish");
             }
         }

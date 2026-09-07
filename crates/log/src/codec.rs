@@ -5,8 +5,8 @@
 //! only when the caller asks for it (`materialize`), for example when the
 //! value must outlive the fragment buffer.
 //!
-//! This crate uses rkyv v0.8, not the earlier bincode choice. Wire types
-//! live in `kardamom-types`; this crate is transport only.
+//! This crate uses rkyv v0.8. Wire types live in `kardamom-types`; this
+//! crate is transport only.
 
 use rkyv::api::high::{HighDeserializer, HighSerializer, HighValidator};
 use rkyv::rancor;
@@ -16,8 +16,37 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::error::LogError;
 
+/// A value this crate can decode off an Aeron fragment: rkyv-archived,
+/// `Send`, and `'static` so it can cross the Aeron-thread-to-tokio-task
+/// channel boundary. One supertrait replaces the repeated
+/// `T: Archive, T::Archived: Deserialize<T, ..> + CheckBytes<..>` bound set
+/// that every typed subscription and replay function names. A blanket impl
+/// covers every type that already satisfies the bounds, so no wire type
+/// implements this by hand.
+pub trait WireMessage:
+    Archive<
+        Archived: Deserialize<Self, HighDeserializer<rancor::Error>>
+                      + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
+    > + Send
+    + Sized
+    + 'static
+{
+}
+
+impl<T> WireMessage for T
+where
+    T: Archive + Send + 'static,
+    T::Archived: Deserialize<T, HighDeserializer<rancor::Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
+{
+}
+
 /// Encode a wire value to a fresh `AlignedVec` suitable for handing to
 /// `rusteron`'s `offer()`.
+///
+/// # Errors
+///
+/// Returns an error if rkyv serialization fails.
 pub fn encode<T>(value: &T) -> Result<AlignedVec, LogError>
 where
     T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
@@ -28,6 +57,10 @@ where
 /// Zero-copy access: borrow an `&Archived<T>` view of `bytes` without
 /// allocating. Returns an error if the bytes are not a valid rkyv archive
 /// for `T`.
+///
+/// # Errors
+///
+/// Returns an error if `bytes` is not a valid rkyv archive for `T`.
 pub fn access<T>(bytes: &[u8]) -> Result<&T::Archived, LogError>
 where
     T: Archive,
@@ -39,6 +72,11 @@ where
 /// Owning decode: copy an `Archived<T>` into an owned `T`. Use when the value
 /// must outlive the fragment buffer or when downstream code needs `T`
 /// directly. Hot-path consumers prefer [`access`] instead.
+///
+/// # Errors
+///
+/// Returns an error if `bytes` is not a valid rkyv archive for `T`,
+/// or if deserializing the archived value fails.
 pub fn materialize<T>(bytes: &[u8]) -> Result<T, LogError>
 where
     T: Archive,
@@ -55,7 +93,7 @@ mod tests {
     use kardamom_types::{AccountChange, BlockDelta, CodeEntry, StorageChange};
 
     /// The BAL payload (`BlockDelta`) must survive an encode-materialize
-    /// round trip unchanged. The executor publishes this on tx_bal, and the
+    /// round trip unchanged. The executor publishes this on `tx_bal`, and the
     /// validator decodes it to cross-check its re-execution.
     #[test]
     fn block_delta_bal_roundtrips() {

@@ -8,10 +8,31 @@ fn write_tmp(contents: &str) -> tempfile::NamedTempFile {
     f
 }
 
+/// Write `toml` to a temp file and load it. The `write_tmp` plus
+/// `from_toml_path` pair repeats across most tests in this module; this
+/// is the one place that owns the temp file's lifetime past the call.
+fn load(toml: &str) -> Result<LogConfig, LogError> {
+    LogConfig::from_toml_path(write_tmp(toml).path())
+}
+
+/// A minimal MDS `[channels]` block: fixed control channel and host,
+/// caller-chosen base port and executor count. Several tests differ from
+/// each other only in these two values.
+fn mds_toml(base_port: &str, count: u32) -> String {
+    format!(
+        r#"
+            [channels]
+            tx_receipts_control_channel = "aeron:udp?control-mode=manual"
+            tx_receipts_endpoint_host = "192.168.56.31"
+            tx_receipts_endpoint_base_port = {base_port}
+            tx_receipts_executor_count = {count}
+            "#
+    )
+}
+
 #[test]
 fn empty_file_yields_defaults() {
-    let f = write_tmp("");
-    let cfg = LogConfig::from_toml_path(f.path()).expect("load empty");
+    let cfg = load("").expect("load empty");
     // Must match the built-in defaults exactly.
     let d = LogConfig::default();
     assert_eq!(cfg.recorder_id, d.recorder_id);
@@ -19,7 +40,6 @@ fn empty_file_yields_defaults() {
         cfg.channels.tx_ordering_channel,
         d.channels.tx_ordering_channel
     );
-    assert_eq!(cfg.quorum.n, d.quorum.n);
     assert_eq!(cfg.aeron.file_sync_level, d.aeron.file_sync_level);
 }
 
@@ -46,23 +66,20 @@ fn partial_channels_section_inherits_other_fields() {
     assert_eq!(cfg.channels.tx_data_stream_id_base, 2000);
     // Untouched sections fall back wholesale.
     assert_eq!(cfg.recorder_id, 0);
-    assert_eq!(cfg.quorum, QuorumConfig::default());
 }
 
 #[test]
-fn recorder_id_and_quorum_override() {
-    let f = write_tmp(
-        r#"
-            recorder_id = 2
-            [quorum]
-            n = 5
-            q = 3
-            "#,
-    );
-    let cfg = LogConfig::from_toml_path(f.path()).expect("load");
+fn recorder_id_override() {
+    let cfg = load("recorder_id = 2\n").expect("load");
     assert_eq!(cfg.recorder_id, 2);
-    assert_eq!(cfg.quorum.n, 5);
-    assert_eq!(cfg.quorum.q, 3);
+}
+
+#[test]
+fn quorum_section_is_rejected() {
+    // `[quorum]` is not a config section. An unknown section must fail
+    // loudly, not load with the section ignored.
+    let err = load("[quorum]\nn = 5\nq = 3\n").expect_err("quorum section must be rejected");
+    assert!(matches!(err, LogError::Config(_)), "got {err:?}");
 }
 
 #[test]
@@ -163,7 +180,7 @@ fn tx_receipts_endpoint_offsets_port_by_replica() {
     let ch = ChannelsConfig {
         tx_receipts_control_channel: "aeron:udp?control-mode=manual".into(),
         tx_receipts_endpoint_host: "192.168.56.31".into(),
-        tx_receipts_endpoint_base_port: 40020,
+        tx_receipts_endpoint_base_port: Some(BasePort::try_from(40020).unwrap()),
         ..Default::default()
     };
     assert!(ch.tx_receipts_mds_enabled());
@@ -235,20 +252,11 @@ fn mds_contract_parses_from_toml_and_aligns_both_sides() {
 
 #[test]
 fn mds_nonpositive_base_port_rejected() {
-    // A negative base used to wrap through `as u32` into a nonsense port.
-    // It must now fail at load time with a config error.
+    // A non-positive base must fail at load time with a config error, not
+    // wrap into a nonsense port through the unsigned endpoint arithmetic.
     for port in ["-40020", "0"] {
-        let f = write_tmp(&format!(
-            r#"
-                [channels]
-                tx_receipts_control_channel = "aeron:udp?control-mode=manual"
-                tx_receipts_endpoint_host = "192.168.56.31"
-                tx_receipts_endpoint_base_port = {port}
-                tx_receipts_executor_count = 3
-                "#
-        ));
-        let err = LogConfig::from_toml_path(f.path())
-            .expect_err("non-positive MDS base port must be rejected");
+        let err =
+            load(&mds_toml(port, 3)).expect_err("non-positive MDS base port must be rejected");
         assert!(matches!(err, LogError::Config(_)), "got {err:?}");
         assert!(
             err.to_string().contains("tx_receipts_endpoint_base_port"),
@@ -260,38 +268,82 @@ fn mds_nonpositive_base_port_rejected() {
 #[test]
 fn mds_base_port_overflowing_u16_rejected() {
     // Highest replica endpoint (base + 2*count + 1) must stay a valid port.
-    let f = write_tmp(
-        r#"
-            [channels]
-            tx_receipts_control_channel = "aeron:udp?control-mode=manual"
-            tx_receipts_endpoint_host = "192.168.56.31"
-            tx_receipts_endpoint_base_port = 65530
-            tx_receipts_executor_count = 3
-            "#,
-    );
-    LogConfig::from_toml_path(f.path()).expect_err("overflowing MDS base port rejected");
+    load(&mds_toml("65530", 3)).expect_err("overflowing MDS base port rejected");
 }
 
 #[test]
-fn mds_valid_base_port_accepted_and_non_mds_port_unchecked() {
+fn mds_valid_base_port_accepted() {
     // The deploy-shaped MDS config still loads.
-    let f = write_tmp(
-        r#"
-            [channels]
-            tx_receipts_control_channel = "aeron:udp?control-mode=manual"
-            tx_receipts_endpoint_host = "192.168.56.31"
-            tx_receipts_endpoint_base_port = 40020
-            tx_receipts_executor_count = 3
-            "#,
-    );
-    LogConfig::from_toml_path(f.path()).expect("valid MDS config loads");
-    // The base port is only validated when MDS is actually enabled.
-    let f = write_tmp("[channels]\ntx_receipts_endpoint_base_port = 0\n");
-    LogConfig::from_toml_path(f.path()).expect("port unchecked without MDS");
+    load(&mds_toml("40020", 3)).expect("valid MDS config loads");
+}
+
+#[test]
+fn non_mds_base_port_zero_is_rejected() {
+    // `BasePort` rejects 0 at parse time, MDS on or off. A garbage port
+    // value in a config file is an error, not dead data this loader
+    // ignores because MDS happens to be off.
+    let err = load("[channels]\ntx_receipts_endpoint_base_port = 0\n")
+        .expect_err("a zero base port must be rejected");
+    assert!(matches!(err, LogError::Config(_)), "got {err:?}");
+}
+
+#[test]
+fn non_mds_base_port_absent_loads() {
+    // Omitting the field entirely (the common case: single-host IPC
+    // deployments never set it) still loads, defaulting to `None`.
+    let f = write_tmp("[channels]\n");
+    let ch = LogConfig::from_toml_path(f.path())
+        .expect("config without a base port loads")
+        .channels;
+    assert_eq!(ch.tx_receipts_endpoint_base_port, None);
 }
 
 #[test]
 fn executor_count_defaults_to_zero() {
     // Default (IPC) config never attaches MDS destinations.
     assert_eq!(ChannelsConfig::default().tx_receipts_executor_count, 0);
+}
+
+#[test]
+fn tx_data_stream_id_base_too_close_to_max_is_rejected() {
+    let ch = ChannelsConfig {
+        tx_data_stream_id_base: i32::MAX - 10,
+        ..Default::default()
+    };
+    assert!(
+        ch.validate().is_err(),
+        "a base within 255 of i32::MAX must fail validate, since \
+         tx_data_stream_id(255) would overflow"
+    );
+}
+
+#[test]
+fn fsync_watermark_tx_data_stream_id_base_too_close_to_max_is_rejected() {
+    let ch = ChannelsConfig {
+        fsync_watermark_tx_data_stream_id_base: i32::MAX - 10,
+        ..Default::default()
+    };
+    assert!(ch.validate().is_err());
+}
+
+#[test]
+fn tx_receipts_stream_id_at_max_is_rejected() {
+    let ch = ChannelsConfig {
+        tx_receipts_stream_id: i32::MAX,
+        ..Default::default()
+    };
+    assert!(
+        ch.validate().is_err(),
+        "tx_receipts_stream_id == i32::MAX must fail validate, since \
+         tx_receipts_boundary_stream_id() would overflow"
+    );
+}
+
+#[test]
+fn tx_receipts_boundary_stream_id_is_one_past_the_receipt_stream() {
+    let ch = ChannelsConfig::default();
+    assert_eq!(
+        ch.tx_receipts_boundary_stream_id(),
+        ch.tx_receipts_stream_id + 1
+    );
 }

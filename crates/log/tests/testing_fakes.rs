@@ -1,16 +1,16 @@
 #![cfg(feature = "testing")]
 
+mod common;
+
 use std::collections::HashMap;
 
-use alloy_primitives::{Address, B256};
-use bytes::Bytes;
 use kardamom_log::testing::{
     FakeBus, FakeFsyncWatermarkStream, FakePublication, FakeTxDataPublication,
     FakeTxDataSubscription, FakeTxOrderingPublication, FakeTxOrderingSubscription,
     FakeTypedSubscription,
 };
 use kardamom_types::{
-    BPosition, BlockBoundaryStart, FsyncWatermark, TxEnvelope, TxOrderingMessage, TxRef,
+    BPosition, BlockBoundaryStart, FsyncWatermark, TxEnvelope, TxOrderingMessage,
 };
 
 #[test]
@@ -19,12 +19,7 @@ fn fake_pub_sub_roundtrip() {
     let pubr = FakePublication::open(&bus, "test", 1);
     let mut sub = FakeTypedSubscription::<TxEnvelope>::open(&bus, "test", 1);
 
-    let env = TxEnvelope {
-        correlation_id: 42,
-        raw_tx: Bytes::from_static(b"abc"),
-        sender: Address::repeat_byte(0x11),
-        tx_hash: B256::repeat_byte(0x22),
-    };
+    let env = common::tx_envelope(42, 0x11, 32);
     pubr.publish(&env).unwrap();
 
     let mut received: Vec<TxEnvelope> = Vec::new();
@@ -66,24 +61,15 @@ fn fake_fsync_watermark_stream_per_recorder() {
 // TxData / TxOrdering fakes.
 // ---------------------------------------------------------------------------
 
-fn env(corr: u64, byte: u8) -> TxEnvelope {
-    TxEnvelope {
-        correlation_id: corr,
-        raw_tx: Bytes::from(vec![byte; 32]),
-        sender: Address::repeat_byte(byte),
-        tx_hash: B256::repeat_byte(byte),
-    }
-}
-
 #[test]
 fn channel_a_publish_returns_tx_data_positionnd_subscription_yields_same_position() {
     let bus = FakeBus::new();
     let pubr = FakeTxDataPublication::open(&bus, /*seq=*/ 2, "aeron:ipc?alias=a-2", 2001);
     let mut sub = FakeTxDataSubscription::open(&bus, "aeron:ipc?alias=a-2", 2001);
 
-    let p0 = pubr.publish(&env(1, 0x10)).unwrap();
-    let p1 = pubr.publish(&env(2, 0x11)).unwrap();
-    let p2 = pubr.publish(&env(3, 0x12)).unwrap();
+    let p0 = pubr.publish(&common::tx_envelope(1, 0x10, 32)).unwrap();
+    let p1 = pubr.publish(&common::tx_envelope(2, 0x11, 32)).unwrap();
+    let p2 = pubr.publish(&common::tx_envelope(3, 0x12, 32)).unwrap();
     assert!(p0 < p1, "positions monotone p0={p0:?} p1={p1:?}");
     assert!(p1 < p2);
 
@@ -102,24 +88,20 @@ fn channel_b_carries_tx_refs_and_boundaries_in_publish_order() {
     let pubr = FakeTxOrderingPublication::open(&bus, "aeron:ipc?alias=b", 1001);
     let mut sub = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
 
-    let r1 = TxRef {
-        tx_hash: alloy_primitives::B256::ZERO,
-        shard_id: 0,
-        tx_data_position: BPosition {
+    let r1 = common::tx_ref(
+        0,
+        BPosition {
             term_id: 0,
             term_offset: 0,
         },
-        tx_data_session_id: 0,
-    };
-    let r2 = TxRef {
-        tx_hash: alloy_primitives::B256::ZERO,
-        shard_id: 1,
-        tx_data_position: BPosition {
+    );
+    let r2 = common::tx_ref(
+        1,
+        BPosition {
             term_id: 0,
             term_offset: 64,
         },
-        tx_data_session_id: 0,
-    };
+    );
     let b = BlockBoundaryStart {
         block_number: 1,
         end_tx_idx: BPosition {
@@ -148,6 +130,9 @@ fn channel_b_carries_tx_refs_and_boundaries_in_publish_order() {
 /// envelopes keyed by `(sequencer_id, tx_data_position)`. The B-reader
 /// walks the canonical order, looking up the envelope on each `TxRef`.
 #[test]
+// `a0_pub`/`a1_pub` and `a0_sub`/`a1_sub` name per-shard A-stream handles;
+// the shard-index suffix is the point of the name, so it stays.
+#[allow(clippy::similar_names)]
 fn b_reader_joins_against_a_buffer_in_canonical_order() {
     let bus = FakeBus::new();
 
@@ -156,45 +141,17 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
     let b_pub = FakeTxOrderingPublication::open(&bus, "aeron:ipc?alias=b", 1001);
 
     // Two sequencers each publish two txs.
-    let p_0a = a0_pub.publish(&env(100, 0x01)).unwrap();
-    let p_1a = a1_pub.publish(&env(101, 0x02)).unwrap();
-    let p_0b = a0_pub.publish(&env(102, 0x03)).unwrap();
-    let p_1b = a1_pub.publish(&env(103, 0x04)).unwrap();
+    let p_0a = a0_pub.publish(&common::tx_envelope(100, 0x01, 32)).unwrap();
+    let p_1a = a1_pub.publish(&common::tx_envelope(101, 0x02, 32)).unwrap();
+    let p_0b = a0_pub.publish(&common::tx_envelope(102, 0x03, 32)).unwrap();
+    let p_1b = a1_pub.publish(&common::tx_envelope(103, 0x04, 32)).unwrap();
 
     // Canonical-orderer interleaving: 0a, 1a, 1b, 0b. Sequencer order is
     // not canonical; the B-stream is.
-    let _ = b_pub
-        .publish_ref(&TxRef {
-            tx_hash: alloy_primitives::B256::ZERO,
-            shard_id: 0,
-            tx_data_position: p_0a,
-            tx_data_session_id: 0,
-        })
-        .unwrap();
-    let _ = b_pub
-        .publish_ref(&TxRef {
-            tx_hash: alloy_primitives::B256::ZERO,
-            shard_id: 1,
-            tx_data_position: p_1a,
-            tx_data_session_id: 0,
-        })
-        .unwrap();
-    let _ = b_pub
-        .publish_ref(&TxRef {
-            tx_hash: alloy_primitives::B256::ZERO,
-            shard_id: 1,
-            tx_data_position: p_1b,
-            tx_data_session_id: 0,
-        })
-        .unwrap();
-    let _ = b_pub
-        .publish_ref(&TxRef {
-            tx_hash: alloy_primitives::B256::ZERO,
-            shard_id: 0,
-            tx_data_position: p_0b,
-            tx_data_session_id: 0,
-        })
-        .unwrap();
+    let _ = b_pub.publish_ref(&common::tx_ref(0, p_0a)).unwrap();
+    let _ = b_pub.publish_ref(&common::tx_ref(1, p_1a)).unwrap();
+    let _ = b_pub.publish_ref(&common::tx_ref(1, p_1b)).unwrap();
+    let _ = b_pub.publish_ref(&common::tx_ref(0, p_0b)).unwrap();
 
     // Drain both A-streams into the executor's per-A buffer.
     let mut a_buffer: HashMap<(u8, BPosition), TxEnvelope> = HashMap::new();

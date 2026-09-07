@@ -1,27 +1,20 @@
 //! End-to-end smoke test for `kardamom_obs::init`: start the exporter on an
 //! ephemeral port, scrape `/metrics`, and check that the heartbeat and
-//! build_info show up with the correct global labels.
+//! `build_info` show up with the correct global labels.
 
-use std::net::{SocketAddr, TcpListener};
+mod common;
 
-fn free_port() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = l.local_addr().expect("local_addr");
-    // Drop the listener to release the port before the exporter binds it.
-    drop(l);
-    addr
-}
+use std::time::Duration;
 
 #[tokio::test]
 async fn init_exposes_build_info_and_service_up() {
-    let addr = free_port();
+    let addr = common::free_port();
     kardamom_obs::init("test-service", addr, "test-host", "0.0.0", "deadbeef")
         .await
         .expect("init succeeds on a free port");
 
     // The exporter binds asynchronously, so give it a short retry budget.
-    let url = format!("http://{}/metrics", addr);
-    let body = scrape_with_retry(&url).await;
+    let body = common::scrape(addr, Duration::from_secs(2)).await;
 
     assert!(
         body.contains("kardamom_service_up{"),
@@ -43,14 +36,4 @@ async fn init_exposes_build_info_and_service_up() {
         body.contains("version=\"0.0.0\""),
         "expected version label in:\n{body}"
     );
-}
-
-async fn scrape_with_retry(url: &str) -> String {
-    for _ in 0..40 {
-        match reqwest::get(url).await {
-            Ok(r) if r.status().is_success() => return r.text().await.expect("text"),
-            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-        }
-    }
-    panic!("exporter did not become ready at {url}");
 }

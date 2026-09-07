@@ -9,13 +9,14 @@
 //!   running" panic. A plain `#[test]` cannot await an async fn. So the
 //!   runtime-less case uses the `Handle` contract inside `init` instead.
 //!
-//! The scrape below uses a raw std TcpStream on purpose, on a blocking
-//! task. It does not use an HTTP client. So the test depends only on the
-//! exporter listener.
+//! The scrape (`common::scrape`) uses a raw std `TcpStream` on purpose, on
+//! a blocking task. It does not use an HTTP client. So the test depends
+//! only on the exporter listener.
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::time::{Duration, Instant};
+mod common;
+
+use std::net::SocketAddr;
+use std::time::Duration;
 
 #[test]
 fn init_and_scrape_on_current_thread_runtime() {
@@ -54,26 +55,7 @@ fn init_and_scrape_on_current_thread_runtime() {
         // The listener is bound once init returns; poll briefly for the
         // accept loop to start serving. The scrape blocks, so it runs on a
         // blocking task while this runtime keeps driving the exporter.
-        let body = tokio::task::spawn_blocking(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                match TcpStream::connect(free) {
-                    Ok(mut s) => {
-                        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                        write!(s, "GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
-                        let mut out = String::new();
-                        s.read_to_string(&mut out).unwrap();
-                        break out;
-                    }
-                    Err(_) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(e) => panic!("exporter never came up on {free}: {e}"),
-                }
-            }
-        })
-        .await
-        .unwrap();
+        let body = common::scrape(free, Duration::from_secs(10)).await;
 
         assert!(
             body.contains("kardamom_obs_test_gauge"),
