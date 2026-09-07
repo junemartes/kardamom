@@ -59,8 +59,16 @@
 //! single blob's remaining space. That needs no special handling here: the
 //! framed payload is one buffer that [`crate::blob::pack_to_blobs`] slices
 //! across as many blobs as needed (the same mechanism an oversized tx batch
-//! uses today), and [`crate::batcher::pack_blocks`] keeps the loud 6-blob
-//! ceiling as the batch-size guard.
+//! uses today). Two guards bound the batch size. The derivation rule caps
+//! one record's wire size at
+//! `kardamom_types::xchain::MAX_REMOTE_EPOCH_WIRE_BYTES`, so a record fits
+//! in 5 blobs on its own. And [`crate::batcher::pack_block_groups`] splits a
+//! block group that overflows the 6-blob ceiling; a block that overflows on
+//! its own is a loud `BlockTooLarge` error.
+//!
+//! The DA payload is bound by the L1 records commitment: every record in
+//! a block (remote epochs first, then txs) has an arm in
+//! `kardamom_types::BlockRecordsDigest`.
 
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;

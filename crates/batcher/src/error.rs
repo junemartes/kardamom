@@ -27,4 +27,11 @@ pub enum BatcherError {
     /// treating it as an operational error.
     #[error("archive corruption: {0}")]
     Corruption(String),
+    /// One block on its own packs to more than the 6-blob ceiling. The
+    /// batcher cannot split a block, so it cannot post this one.
+    #[error(
+        "block {block_number} alone packs to {blobs} blobs; the ceiling is 6 blobs; \
+         the batcher cannot post this block"
+    )]
+    BlockTooLarge { block_number: u64, blobs: usize },
 }

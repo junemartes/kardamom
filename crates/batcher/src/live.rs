@@ -38,8 +38,9 @@ use kardamom_engine::bin_support;
 use kardamom_engine::reader::ReaderToExec;
 
 use crate::batch::{BatchAccumulator, ClosedBlock};
-use crate::batcher::{BatcherConfig, PostedBatch, metric_names, pack_blocks};
+use crate::batcher::{BatcherConfig, PostedBatch, metric_names, pack_block_groups};
 use crate::da_store::FsBlobStore;
+use crate::error::BatcherError;
 use crate::l1::{post_batch, read_posted_batches};
 use crate::settlement::IKardamomL2Settlement;
 
@@ -349,6 +350,8 @@ impl<P: Provider> LiveSender<P> {
 pub struct FeedConfig {
     pub blocks_per_batch: usize,
     pub compress: bool,
+    /// The L2 chain id. See [`BatcherConfig::chain_id`].
+    pub chain_id: u64,
     /// Post a partial group if the oldest pending block has waited this long.
     pub flush: Duration,
     /// Drop closed blocks at or below this number without posting. L1
@@ -370,6 +373,7 @@ pub async fn run_feed<P: Provider>(
     let pack_cfg = BatcherConfig {
         blocks_per_batch: cfg.blocks_per_batch,
         compress: cfg.compress,
+        chain_id: cfg.chain_id,
         ..Default::default()
     };
     let mut acc = BatchAccumulator::new();
@@ -424,6 +428,10 @@ pub async fn run_feed<P: Provider>(
 }
 
 /// Pack and post the pending group. This clears it.
+///
+/// A group that overflows the blob ceiling splits into several posts, one
+/// cursor each. A single block that overflows on its own is fatal: the
+/// loop stops with a log line that names the block.
 async fn post_group<P: Provider>(
     pack_cfg: &BatcherConfig,
     pending: &mut Vec<ClosedBlock>,
@@ -433,15 +441,45 @@ async fn post_group<P: Provider>(
     let group = std::mem::take(pending);
     *oldest = None;
     gauge!(live_metric_names::PENDING_BLOCKS).set(0.0);
-    let last = group.last().expect("post_group called with pending blocks");
-    let cursor = BatchCursor {
-        next_index: last.end_tx_idx.as_index(),
-        next_block: last.block_number + 1,
-        // post_confirmed stamps last_batch_index.
-        last_batch_index: 0,
+    let batches = match pack_block_groups(pack_cfg, &group) {
+        Ok(b) => b,
+        Err(
+            e @ BatcherError::BlockTooLarge {
+                block_number,
+                blobs,
+            },
+        ) => {
+            tracing::error!(
+                block = block_number,
+                blobs,
+                ceiling = crate::batcher::MAX_BLOBS_PER_BATCH,
+                "FATAL: one block alone exceeds the blob ceiling; the batcher cannot post it"
+            );
+            return Err(e.into());
+        }
+        Err(e) => return Err(e.into()),
     };
-    let batch = pack_blocks(pack_cfg, &group)?;
-    sender.post_confirmed(&batch, cursor).await
+    if batches.len() > 1 {
+        tracing::warn!(
+            blocks = group.len(),
+            batches = batches.len(),
+            "group split to stay under the blob ceiling"
+        );
+    }
+    for batch in &batches {
+        let last = group
+            .iter()
+            .find(|b| b.block_number == batch.l2_block_end)
+            .expect("batch end block is in the group");
+        let cursor = BatchCursor {
+            next_index: last.end_tx_idx.as_index(),
+            next_block: last.block_number + 1,
+            // post_confirmed stamps last_batch_index.
+            last_batch_index: 0,
+        };
+        sender.post_confirmed(batch, cursor).await?;
+    }
+    Ok(())
 }
 
 /// Everything [`run`] needs from the CLI, already validated. The binary
@@ -466,6 +504,8 @@ pub struct LiveArgs {
     pub compress: bool,
     pub flush_ms: u64,
     pub l1_retries: u32,
+    /// The L2 chain id. See [`BatcherConfig::chain_id`].
+    pub chain_id: u64,
 }
 
 /// Live service mode: the batcher as a third cluster-egress consumer.
@@ -493,6 +533,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         replay_from_index = cursor.next_index,
         replay_from_block = cursor.next_block,
         skip_through_block,
+        chain_id = args.chain_id,
         "live batcher starting"
     );
 
@@ -570,6 +611,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
     let feed_cfg = FeedConfig {
         blocks_per_batch: args.blocks_per_batch,
         compress: args.compress,
+        chain_id: args.chain_id,
         flush: Duration::from_millis(args.flush_ms),
         skip_through_block,
     };
