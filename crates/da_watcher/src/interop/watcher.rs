@@ -574,7 +574,7 @@ mod tests {
     #[tokio::test]
     async fn a_restart_resumes_exactly_from_the_persisted_cursor() {
         let dir = tempfile::tempdir().unwrap();
-        let cursor_file = CursorFile::new(dir.path().join("pair.cursor"));
+        let cursor_file = CursorFile::open(dir.path().join("pair.cursor")).unwrap();
 
         let feed = MockInteropFeed::new(ORIGIN).await;
         let publisher = InMemoryRemoteEpochPublisher::default();
@@ -633,7 +633,7 @@ mod tests {
         use crate::interop::source::fakes::ScriptedRemoteSource;
 
         let dir = tempfile::tempdir().unwrap();
-        let cursor_file = CursorFile::new(dir.path().join("pair.cursor"));
+        let cursor_file = CursorFile::open(dir.path().join("pair.cursor")).unwrap();
         let publisher = InMemoryRemoteEpochPublisher::default();
 
         // First life: publish succeeds, then the process dies before the

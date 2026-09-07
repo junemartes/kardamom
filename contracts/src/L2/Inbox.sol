@@ -106,6 +106,13 @@ contract Inbox {
 
     /// @notice Origin identity of the delivery currently in progress.
     ///         Reverts outside a delivery.
+    /// @dev    A receiver must check BOTH `msg.sender == XChain.INBOX` and
+    ///         the pair this returns. The pair alone is not enough. It stays
+    ///         set for the whole inner call, so every contract the delivery
+    ///         target calls during a delivery sees the same value. A
+    ///         contract that checks only `xDomainSender()` trusts a call the
+    ///         target made on its own behalf (a confused deputy). See the
+    ///         interop spec, section 8.
     function xDomainSender() external view returns (uint64 originChainId, address sender) {
         require(_xdSender != address(0), "Inbox: no delivery in progress");
         return (_xdOrigin, _xdSender);

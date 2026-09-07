@@ -354,6 +354,95 @@ fn push_word_address(out: &mut Vec<u8>, a: Address) {
     out.extend_from_slice(&w);
 }
 
+// ── Storage layout and ABI pins of the Outbox / Inbox predeploys ─────────────
+//
+// The validator's outbox extraction, the e2e scenarios, and the contracts
+// share these values. This is the one Rust copy. The tests below pin each
+// value against `forge inspect` and `cast index` output. The Solidity
+// fields are append-only: a field inserted before `sentMessages` shifts the
+// slot index, and every validator halts with `ClaimMismatch` on the first
+// send.
+
+/// Storage slot index of `mapping(uint64 => uint64) nonces` in the Outbox
+/// predeploy — the FIRST declared field.
+pub const OUTBOX_NONCES_SLOT_INDEX: u64 = 0;
+
+/// Storage slot index of `mapping(bytes32 => bool) sentMessages` in the
+/// Outbox predeploy — the SECOND declared field.
+pub const SENT_MESSAGES_SLOT_INDEX: u64 = 1;
+
+/// Storage slot index of `mapping(uint64 => mapping(uint64 => uint8))
+/// delivered` in the Inbox predeploy — the FIRST declared field.
+pub const INBOX_DELIVERED_SLOT_INDEX: u64 = 0;
+
+/// Storage slot index of `mapping(uint64 => uint64) nextSeq` in the Inbox
+/// predeploy — the SECOND declared field.
+pub const INBOX_NEXT_SEQ_SLOT_INDEX: u64 = 1;
+
+/// Solidity signature of `Outbox.sendMessage`. The callback struct flattens
+/// to its tuple type, as in [`INBOX_DELIVER_SIGNATURE`].
+pub const OUTBOX_SEND_MESSAGE_SIGNATURE: &str =
+    "sendMessage(uint64,address,uint64,bytes,(address,uint64,bytes32))";
+
+/// Solidity signature of the `Outbox.MessageSent` event.
+pub const MESSAGE_SENT_SIGNATURE: &str = "MessageSent(uint64,uint64,address,address,uint256,\
+                                          uint64,bytes,bytes32,(address,uint64,bytes32))";
+
+/// 4-byte function selector of [`OUTBOX_SEND_MESSAGE_SIGNATURE`].
+pub fn outbox_send_message_selector() -> [u8; 4] {
+    let h = keccak256(OUTBOX_SEND_MESSAGE_SIGNATURE.as_bytes());
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// `topic0` of the `Outbox.MessageSent` event.
+pub fn message_sent_topic0() -> B256 {
+    keccak256(MESSAGE_SENT_SIGNATURE.as_bytes())
+}
+
+/// A `u64` as one left-padded 32-byte word: the `abi.encode` of a `uint64`,
+/// and the key form of a `uint64` mapping key.
+pub fn u64_word(v: u64) -> B256 {
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&v.to_be_bytes());
+    B256::from(w)
+}
+
+/// The Solidity mapping rule: the slot of `m[key]` for a mapping declared at
+/// `slot_index` is `keccak256(key ‖ uint256(slot_index))`.
+pub fn mapping_slot(key: B256, slot_index: u64) -> B256 {
+    let mut buf = [0u8; 64];
+    buf[0..32].copy_from_slice(key.as_slice());
+    buf[32..64].copy_from_slice(u64_word(slot_index).as_slice());
+    keccak256(buf)
+}
+
+/// The storage slot of `Outbox.nonces[dest_chain_id]`.
+pub fn outbox_nonces_slot(dest_chain_id: u64) -> B256 {
+    mapping_slot(u64_word(dest_chain_id), OUTBOX_NONCES_SLOT_INDEX)
+}
+
+/// The storage slot of `Outbox.sentMessages[msg_hash]`. The executor must
+/// claim this slot `true` for every honest send; the validator's outbox
+/// extraction checks the claim.
+pub fn sent_messages_slot(msg_hash: B256) -> B256 {
+    mapping_slot(msg_hash, SENT_MESSAGES_SLOT_INDEX)
+}
+
+/// The storage slot of `Inbox.nextSeq[origin_chain_id]`.
+pub fn inbox_next_seq_slot(origin_chain_id: u64) -> B256 {
+    mapping_slot(u64_word(origin_chain_id), INBOX_NEXT_SEQ_SLOT_INDEX)
+}
+
+/// The storage slot of `Inbox.delivered[origin_chain_id][seq]`. The outer
+/// mapping's value slot is the inner mapping's slot index.
+pub fn inbox_delivered_slot(origin_chain_id: u64, seq: u64) -> B256 {
+    let inner = mapping_slot(u64_word(origin_chain_id), INBOX_DELIVERED_SLOT_INDEX);
+    let mut buf = [0u8; 64];
+    buf[0..32].copy_from_slice(u64_word(seq).as_slice());
+    buf[32..64].copy_from_slice(inner.as_slice());
+    keccak256(buf)
+}
+
 /// One origin chain's contiguous batch of messages, as it travels on the
 /// canonical stream.
 ///
@@ -496,7 +585,7 @@ pub enum XChainError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, b256};
+    use alloy_primitives::{Address, address, b256};
 
     fn msg(seq: u64, dest: u64) -> OutboxMessage {
         OutboxMessage {
@@ -697,6 +786,104 @@ mod tests {
         assert_eq!(
             leaf,
             b256!("0df14340efd8c8b32f4c333c3dca8470b0bae319a3dfe32adb213df2b8834d3c")
+        );
+    }
+
+    // ── Value pins (audit 2026-09-03, L3). The Solidity side asserts the same
+    // values in `contracts/test/L2/Outbox.t.sol`. A change to any of these is
+    // a chain-splitting change.
+
+    #[test]
+    fn callback_commitment_known_vector_is_pinned() {
+        // The `test_hashCallback_matchesRust` inputs of Outbox.t.sol.
+        let cb = Callback {
+            target: Address::repeat_byte(0x01),
+            gas_limit: 100_000,
+            context: B256::repeat_byte(0x02),
+        };
+        assert_eq!(
+            cb.commitment(),
+            b256!("3cc4851e518423fb0983f20dc6198ffd6ef901107d7b7911ffc4e8f942442b05")
+        );
+    }
+
+    #[test]
+    fn alias_known_vectors_are_pinned() {
+        // The `test_aliasVectors_matchRust` values of Outbox.t.sol.
+        assert_eq!(
+            alias_remote_address(ORIGIN, Address::repeat_byte(0xaa)),
+            address!("aa1fbdc71f2e2531f6704edff74f45bff135db61")
+        );
+        assert_eq!(
+            xchain_tx_sender(ORIGIN),
+            address!("32122ab04da66c349463091cfda2773e379f678b")
+        );
+    }
+
+    #[test]
+    fn remote_source_hash_known_vector_is_pinned() {
+        // rlp([412346, 7]) = 0xc583064aba07; inner = cast keccak of that;
+        // rlp([2, inner]) = 0xe202a0‖inner; the value is cast keccak of that.
+        assert_eq!(
+            remote_source_hash(ORIGIN, 7),
+            b256!("4f9bc7dd342a5ae3eae82c238c74109eb4322fd0c8898b7e21487d7e0750e1e4")
+        );
+    }
+
+    // ── Layout pins (audit L4): `forge inspect Outbox storage-layout`,
+    // `forge inspect Inbox storage-layout`, `forge inspect Outbox
+    // methodIdentifiers`, `forge inspect Outbox events`, and `cast index`.
+
+    #[test]
+    fn slot_indices_match_forge_inspect_storage_layout() {
+        // Outbox: nonces at slot 0, sentMessages at slot 1.
+        assert_eq!(OUTBOX_NONCES_SLOT_INDEX, 0);
+        assert_eq!(SENT_MESSAGES_SLOT_INDEX, 1);
+        // Inbox: delivered at slot 0, nextSeq at slot 1.
+        assert_eq!(INBOX_DELIVERED_SLOT_INDEX, 0);
+        assert_eq!(INBOX_NEXT_SEQ_SLOT_INDEX, 1);
+    }
+
+    #[test]
+    fn mapping_slots_match_cast_index() {
+        // cast index uint64 412399 1
+        assert_eq!(
+            inbox_next_seq_slot(412_399),
+            b256!("5ac03b415b91ae90f3b79893af8b4cdd0ad13a6ca17919c466ef18c217a044fd")
+        );
+        // inner = cast index uint64 412399 0; cast index uint64 3 <inner>
+        assert_eq!(
+            inbox_delivered_slot(412_399, 3),
+            b256!("879e07c4bf04e0eabddfb4406f66267e8b610479d5da37e69d2025f905df870f")
+        );
+        // cast index uint64 412347 0
+        assert_eq!(
+            outbox_nonces_slot(412_347),
+            b256!("8b93788024e4921562298d6c9986e253bebd7e9e30a69000736530e7c7ccb02c")
+        );
+        // cast index bytes32 0x11..11 1
+        assert_eq!(
+            sent_messages_slot(B256::repeat_byte(0x11)),
+            b256!("7deb3b60ec0f1bf56dbdd0ffedbadafddeaa08947884ff0f215ce93ee1826102")
+        );
+        // The cross-language msg_leaf vector as the key:
+        // cast index bytes32 0x0df14340..4d3c 1
+        assert_eq!(
+            sent_messages_slot(b256!(
+                "0df14340efd8c8b32f4c333c3dca8470b0bae319a3dfe32adb213df2b8834d3c"
+            )),
+            b256!("d4b78be0c1de834d6a6db01a7ae3f433776afbc98b26f4e51412b94effd6d438")
+        );
+    }
+
+    #[test]
+    fn send_message_selector_and_topic_match_forge_inspect() {
+        // forge inspect Outbox methodIdentifiers
+        assert_eq!(outbox_send_message_selector(), [0xbd, 0x1b, 0x0f, 0xd9]);
+        // forge inspect Outbox events
+        assert_eq!(
+            message_sent_topic0(),
+            b256!("a00ff5f6f9bf2c30c7cd578b6a82c98b08f2d33a5677222b9d8b925c62a48082")
         );
     }
 }

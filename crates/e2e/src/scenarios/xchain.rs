@@ -53,13 +53,13 @@ pub(crate) fn message_delivered_topic0() -> B256 {
     keccak256("MessageDelivered(uint64,uint64,bool)")
 }
 
-/// `keccak256` of the MessageSent signature (the callback struct flattens to
-/// its tuple type) — pinned by `forge inspect Outbox events`.
-pub(crate) fn message_sent_topic0() -> B256 {
-    keccak256(
-        "MessageSent(uint64,uint64,address,address,uint256,uint64,bytes,bytes32,(address,uint64,bytes32))",
-    )
-}
+// The Outbox / Inbox storage slots, the `MessageSent` topic, and the
+// `u64` word form have one definition, in `kardamom_types::xchain`. The
+// tests there pin each value against `forge inspect` and `cast index`.
+pub(crate) use kardamom_types::xchain::{
+    inbox_delivered_slot, inbox_next_seq_slot, message_sent_topic0, outbox_nonces_slot,
+    sent_messages_slot as outbox_sent_messages_slot, u64_word,
+};
 
 /// Minimal "Receiver-style" runtime, deployed via an ordinary CREATE tx
 /// through the ingress: copies the first 32 bytes of calldata into storage
@@ -73,44 +73,12 @@ pub(crate) const RECEIVER_INIT_CODE: [u8; 26] = [
     0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x37, 0x60, 0x00, 0x51, 0x60, 0x00, 0x55, 0x00,
 ];
 
-/// Storage slot of `mapping(uint64 => uint64) Inbox.nextSeq` (slot 1; slot 0
-/// is `delivered`). Shared with the DA-parity scenario.
-pub(crate) fn inbox_next_seq_slot(origin: u64) -> B256 {
-    map_slot(u64_word(origin), 1)
-}
-
-/// Storage slot of `Inbox.delivered[origin][seq]` (double mapping at slot 0).
-pub(crate) fn inbox_delivered_slot(origin: u64, seq: u64) -> B256 {
-    let inner = map_slot(u64_word(origin), 0);
-    keccak256([u64_word(seq).as_slice(), inner.as_slice()].concat())
-}
-
-/// Storage slot of `mapping(uint64 => uint64) Outbox.nonces` (slot 0).
-pub(crate) fn outbox_nonces_slot(dest: u64) -> B256 {
-    map_slot(u64_word(dest), 0)
-}
-
-/// Storage slot of `mapping(bytes32 => bool) Outbox.sentMessages` (slot 1).
-fn outbox_sent_messages_slot(msg_hash: B256) -> B256 {
-    map_slot(msg_hash, 1)
-}
-
-pub(crate) fn u64_word(v: u64) -> B256 {
-    let mut w = [0u8; 32];
-    w[24..].copy_from_slice(&v.to_be_bytes());
-    B256::from(w)
-}
-
 /// An address as a 32-byte topic word (left-padded), the indexed-address
 /// encoding.
 pub(crate) fn address_word(a: Address) -> B256 {
     let mut w = [0u8; 32];
     w[12..].copy_from_slice(a.as_slice());
     B256::from(w)
-}
-
-pub(crate) fn map_slot(key: B256, base_slot: u64) -> B256 {
-    keccak256([key.as_slice(), u64_word(base_slot).as_slice()].concat())
 }
 
 /// One storage slot of `address`, read from the executor's live state DB

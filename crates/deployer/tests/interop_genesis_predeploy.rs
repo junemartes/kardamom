@@ -15,11 +15,19 @@ use kardamom_types::Genesis;
 use kardamom_types::xchain::{INBOX, OUTBOX};
 
 /// Runtime bytecode from a forge artifact (`deployedBytecode.object`), or
-/// `None` when the artifact has not been built (the suite then skips, like
-/// the withdrawals drift-guard).
+/// `None` when the artifact has not been built. A local run then skips with
+/// a printed `SKIP:` line, like the withdrawals drift-guard. On CI (the `CI`
+/// env var is set) a missing artifact is a failure: the deployer build
+/// script runs `forge build`, so an absent artifact there means the guard
+/// checks nothing, and a silent pass would hide bytecode drift.
 fn artifact_runtime(workspace: &Path, contract: &str) -> Option<Bytes> {
     let artifact = workspace.join(format!("contracts/out/{contract}.sol/{contract}.json"));
     let Ok(raw) = std::fs::read_to_string(&artifact) else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{} not built on CI; the drift guard must not pass without the artifact",
+            artifact.display()
+        );
         eprintln!("SKIP: {} not built (run forge build)", artifact.display());
         return None;
     };
