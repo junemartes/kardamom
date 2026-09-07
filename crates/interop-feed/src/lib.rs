@@ -132,22 +132,37 @@ pub struct OutboxMessageDto {
 
 /// One item on the feed.
 ///
-/// Internally tagged (`{"type":"message", ...}` / `{"type":"lagged", ...}`),
-/// matching the `kardamom_subscribeReceipts` frame shape so one client idiom
-/// covers both subscriptions.
+/// Internally tagged (`{"type":"message", ...}` / `{"type":"lagged", ...}` /
+/// `{"type":"head", ...}`), matching the `kardamom_subscribeReceipts` frame
+/// shape so one client idiom covers both subscriptions.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum OutboxEventDto {
     /// An extracted outbox message. Boxed so the frame is not sized by its
-    /// largest variant — the lag marker is two words.
+    /// largest variant — the lag marker is a few words.
     Message(Box<OutboxMessageDto>),
-    /// The subscriber fell behind the server's retention and `skipped` items
-    /// were dropped. NOT recoverable by reading on: the subscriber must
-    /// re-subscribe from its own cursor, which is the same recovery
-    /// `kardamom_subscribeReceipts` prescribes. Carrying the count makes the
-    /// loss measurable rather than merely survivable.
+    /// The subscriber's cursor is below the first seq this server can
+    /// serve: `skipped` items are gone. NOT recoverable by reading on. The
+    /// subscriber must stop and let an operator reset its cursor, or
+    /// backfill from DA. `floor_seq` names the first seq the server serves.
+    /// `floor_block` names the first origin block the server serves (its
+    /// retention cutoff, or the block it resumed at after a restart). Both
+    /// are additive: an older server omits them.
     #[serde(rename_all = "camelCase")]
-    Lagged { skipped: u64 },
+    Lagged {
+        skipped: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        floor_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        floor_block: Option<u64>,
+    },
+    /// The origin has closed every block up to and including `block_number`.
+    /// A subscriber that holds an open batch from an earlier block can close
+    /// it now: no more messages for that block will arrive. The server sends
+    /// one after a block boundary that produced no message for the lane, so
+    /// a lane with one message still delivers.
+    #[serde(rename_all = "camelCase")]
+    Head { block_number: u64 },
 }
 
 /// Why a feed item could not be turned into an [`OutboxMessage`].
@@ -372,9 +387,45 @@ mod tests {
         );
         assert_eq!(v["callback"]["gasLimit"], 90_000);
 
-        let lagged = serde_json::to_value(OutboxEventDto::Lagged { skipped: 12 }).unwrap();
+        let lagged = serde_json::to_value(OutboxEventDto::Lagged {
+            skipped: 12,
+            floor_seq: None,
+            floor_block: None,
+        })
+        .unwrap();
         assert_eq!(lagged["type"], "lagged");
         assert_eq!(lagged["skipped"], 12);
+        assert!(
+            lagged.as_object().unwrap().get("floorSeq").is_none(),
+            "an unknown floor is omitted, not null"
+        );
+        let lagged = serde_json::to_value(OutboxEventDto::Lagged {
+            skipped: 12,
+            floor_seq: Some(12),
+            floor_block: Some(40),
+        })
+        .unwrap();
+        assert_eq!(lagged["floorSeq"], 12);
+        assert_eq!(lagged["floorBlock"], 40);
+        // An older server's frame (no floor fields) still decodes.
+        let back: OutboxEventDto =
+            serde_json::from_str(r#"{"type":"lagged","skipped":3}"#).unwrap();
+        assert_eq!(
+            back,
+            OutboxEventDto::Lagged {
+                skipped: 3,
+                floor_seq: None,
+                floor_block: None
+            }
+        );
+
+        let head = serde_json::to_value(OutboxEventDto::Head { block_number: 77 }).unwrap();
+        assert_eq!(
+            head,
+            serde_json::json!({ "type": "head", "blockNumber": 77 })
+        );
+        let back: OutboxEventDto = serde_json::from_value(head).unwrap();
+        assert_eq!(back, OutboxEventDto::Head { block_number: 77 });
     }
 
     #[test]

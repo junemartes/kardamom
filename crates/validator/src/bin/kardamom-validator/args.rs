@@ -169,6 +169,19 @@ pub struct Args {
     /// deeper backfill is a v2 concern (the data is in DA).
     #[arg(long, env = "KARDAMOM_FEED_RETENTION_BLOCKS", default_value_t = 1024)]
     pub feed_retention_blocks: u64,
+    /// Cap on live feed subscriptions of both kinds (outbox and
+    /// attestations) across all clients. A subscribe over the cap gets an
+    /// RPC error. Default 256.
+    #[arg(long, env = "KARDAMOM_FEED_MAX_SUBSCRIPTIONS", default_value_t = 256)]
+    pub feed_max_subscriptions: usize,
+    /// Cap on live outbox subscriptions for one destination chain. A
+    /// subscribe over the cap gets an RPC error. Default 8.
+    #[arg(
+        long,
+        env = "KARDAMOM_FEED_MAX_SUBSCRIPTIONS_PER_DEST",
+        default_value_t = 8
+    )]
+    pub feed_max_subscriptions_per_dest: usize,
     /// File the feed server's actually-bound address is written to
     /// (`host:port` + newline), for harnesses that pass port 0.
     #[arg(long, env = "KARDAMOM_SERVE_FEED_ADDR_FILE")]

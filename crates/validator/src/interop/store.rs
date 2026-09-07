@@ -21,9 +21,11 @@ use tokio::sync::watch;
 #[derive(Debug, Default)]
 struct Lane {
     msgs: VecDeque<OutboxMessage>,
-    /// Seq of the first retained message — everything below aged out of
-    /// retention. A subscriber whose cursor is below this floor is LAGGED.
-    floor: u64,
+    /// Seq of the first message this store can serve. Everything below it
+    /// is gone: it aged out of retention, or the validator resumed after
+    /// it. `None` after a resume until the lane's first message names it;
+    /// a subscriber below a `Some` floor is LAGGED.
+    floor: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -33,10 +35,32 @@ struct FeedInner {
     head_block: u64,
 }
 
+/// One cursor scan of a lane: what [`FeedStore::from_seq`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneScan {
+    /// Retained messages at or after the cursor, in seq order.
+    pub msgs: Vec<OutboxMessage>,
+    /// First seq the store can serve for this lane, when known.
+    /// `Some(floor)` with `floor > cursor` means the subscriber lagged out
+    /// and `floor - cursor` items are gone. `None` means the lane has no
+    /// message since the resume, so its floor is not yet known.
+    pub floor_seq: Option<u64>,
+    /// First origin block the store can serve: the retention cutoff, or
+    /// the resume block after a restart, whichever is later.
+    pub floor_block: u64,
+    /// Highest block the store has seen. Every message from a lower block
+    /// is already in the store.
+    pub head_block: u64,
+}
+
 /// Per-destination outbox feed store with block-based retention.
 pub struct FeedStore {
     origin_chain_id: u64,
     retention_blocks: u64,
+    /// First block the extractor sees after a restart. Messages from
+    /// earlier blocks never reach this store, so no lane floor is known
+    /// until the lane's first message arrives. `None` for a genesis start.
+    resume_block: Option<u64>,
     inner: Mutex<FeedInner>,
     /// Version bump per append; subscription handlers wait on it.
     items: watch::Sender<u64>,
@@ -47,9 +71,18 @@ impl FeedStore {
         Self {
             origin_chain_id,
             retention_blocks: retention_blocks.max(1),
+            resume_block: None,
             inner: Mutex::new(FeedInner::default()),
             items: watch::channel(0).0,
         }
+    }
+
+    /// Mark the store as resumed: `block` is the first block the extractor
+    /// will see. A subscriber whose cursor is below a lane's first
+    /// post-resume seq gets `Lagged` with this block as the floor.
+    pub fn with_resume_block(mut self, block: Option<u64>) -> Self {
+        self.resume_block = block;
+        self
     }
 
     /// The chain this store serves for (stamped on every wire item).
@@ -62,8 +95,17 @@ impl FeedStore {
     pub fn append_block(&self, block: u64, msgs: Vec<OutboxMessage>) {
         let mut g = self.inner.lock().unwrap();
         g.head_block = g.head_block.max(block);
+        let resumed = self.resume_block.is_some();
         for m in msgs {
-            let lane = g.lanes.entry(m.dest_chain_id).or_default();
+            let lane = g.lanes.entry(m.dest_chain_id).or_insert_with(|| Lane {
+                msgs: VecDeque::new(),
+                // A genesis start saw every block: the floor is seq 0. A
+                // resumed store learns the floor from the first message.
+                floor: (!resumed).then_some(0),
+            });
+            if lane.floor.is_none() {
+                lane.floor = Some(m.seq);
+            }
             lane.msgs.push_back(m);
         }
         let cutoff = g.head_block.saturating_sub(self.retention_blocks);
@@ -72,7 +114,7 @@ impl FeedStore {
                 if front.origin_block_number >= cutoff {
                     break;
                 }
-                lane.floor = front.seq + 1;
+                lane.floor = Some(front.seq + 1);
                 lane.msgs.pop_front();
             }
         }
@@ -81,20 +123,30 @@ impl FeedStore {
     }
 
     /// Everything retained for `dest` from `from_seq` onward, plus the
-    /// lane's retention floor. `floor > from_seq` ⇒ the subscriber lagged
-    /// out of retention and `floor - from_seq` items are gone.
-    pub fn from_seq(&self, dest: u64, from_seq: u64) -> (Vec<OutboxMessage>, u64) {
+    /// lane's floors and the store head. The scan starts at the cursor's
+    /// index (a binary search on the dense seq), not at the lane's front.
+    pub fn from_seq(&self, dest: u64, from_seq: u64) -> LaneScan {
         let g = self.inner.lock().unwrap();
+        let cutoff = g.head_block.saturating_sub(self.retention_blocks);
+        let floor_block = cutoff.max(self.resume_block.unwrap_or(0));
         match g.lanes.get(&dest) {
-            Some(lane) => (
-                lane.msgs
-                    .iter()
-                    .filter(|m| m.seq >= from_seq)
-                    .cloned()
-                    .collect(),
-                lane.floor,
-            ),
-            None => (Vec::new(), 0),
+            Some(lane) => {
+                let idx = lane.msgs.partition_point(|m| m.seq < from_seq);
+                LaneScan {
+                    msgs: lane.msgs.range(idx..).cloned().collect(),
+                    floor_seq: lane.floor,
+                    floor_block,
+                    head_block: g.head_block,
+                }
+            }
+            None => LaneScan {
+                msgs: Vec::new(),
+                // No message for this lane since the start: a genesis start
+                // knows the floor is 0, a resumed store does not know it.
+                floor_seq: self.resume_block.is_none().then_some(0),
+                floor_block,
+                head_block: g.head_block,
+            },
         }
     }
 
@@ -178,15 +230,23 @@ mod tests {
         store.append_block(10, vec![msg(7, 0, 10), msg(9, 0, 10)]);
         store.append_block(11, vec![msg(7, 1, 11)]);
 
-        let (m7, floor) = store.from_seq(7, 0);
-        assert_eq!(m7.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![0, 1]);
-        assert_eq!(floor, 0);
-        let (m7, _) = store.from_seq(7, 1);
-        assert_eq!(m7.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1]);
-        let (m9, _) = store.from_seq(9, 0);
-        assert_eq!(m9.len(), 1);
-        // Unknown destination: empty, floor 0 (nothing was ever pruned).
-        assert_eq!(store.from_seq(999, 0), (Vec::new(), 0));
+        let scan = store.from_seq(7, 0);
+        assert_eq!(
+            scan.msgs.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(scan.floor_seq, Some(0));
+        assert_eq!(scan.head_block, 11);
+        let scan = store.from_seq(7, 1);
+        assert_eq!(scan.msgs.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1]);
+        // A cursor past the tail scans nothing.
+        assert!(store.from_seq(7, 5).msgs.is_empty());
+        let scan = store.from_seq(9, 0);
+        assert_eq!(scan.msgs.len(), 1);
+        // Unknown destination on a genesis-start store: empty, floor 0.
+        let scan = store.from_seq(999, 0);
+        assert!(scan.msgs.is_empty());
+        assert_eq!(scan.floor_seq, Some(0));
     }
 
     #[test]
@@ -196,12 +256,17 @@ mod tests {
         store.append_block(12, vec![msg(7, 2, 12)]);
         // Head advances well past block 10: seqs 0-1 age out.
         store.append_block(16, vec![]);
-        let (m, floor) = store.from_seq(7, 0);
-        assert_eq!(m.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![2]);
-        assert_eq!(floor, 2, "floor names the first retained seq");
+        let scan = store.from_seq(7, 0);
+        assert_eq!(scan.msgs.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(
+            scan.floor_seq,
+            Some(2),
+            "floor names the first retained seq"
+        );
+        assert_eq!(scan.floor_block, 11, "cutoff = 16 - 5");
         // A cursor below the floor is the Lagged case; the caller computes
         // skipped = floor - cursor.
-        assert!(floor > 0);
+        assert!(scan.floor_seq.unwrap() > 0);
     }
 
     #[test]
@@ -211,9 +276,45 @@ mod tests {
         for b in 2..=10 {
             store.append_block(b, vec![]);
         }
-        let (m, floor) = store.from_seq(7, 0);
-        assert!(m.is_empty());
-        assert_eq!(floor, 1);
+        let scan = store.from_seq(7, 0);
+        assert!(scan.msgs.is_empty());
+        assert_eq!(scan.floor_seq, Some(1));
+        assert_eq!(scan.head_block, 10);
+    }
+
+    /// H8: after a restart the store did not see the earlier blocks. The
+    /// first message names the lane floor; a cursor below it is lagged,
+    /// with the resume block as the block floor.
+    #[test]
+    fn a_resumed_store_learns_the_floor_from_the_first_message() {
+        let store = FeedStore::new(1, 100).with_resume_block(Some(50));
+        // Before any message the floor is unknown.
+        let scan = store.from_seq(7, 0);
+        assert_eq!(scan.floor_seq, None);
+        assert_eq!(scan.floor_block, 50);
+        store.append_block(50, vec![]);
+        assert_eq!(store.from_seq(7, 0).floor_seq, None);
+
+        store.append_block(51, vec![msg(7, 5, 51)]);
+        let scan = store.from_seq(7, 0);
+        assert_eq!(scan.floor_seq, Some(5), "the first seq served is the floor");
+        assert_eq!(scan.floor_block, 50);
+        assert_eq!(scan.msgs.len(), 1);
+        // A cursor at the floor is not lagged.
+        assert_eq!(store.from_seq(7, 5).msgs.len(), 1);
+    }
+
+    /// The contrast to the resume case: a genesis start saw every block, so
+    /// a first message at seq 5 is an origin fault. The floor stays 0 and
+    /// the client's derivation rule reports the skip.
+    #[test]
+    fn a_genesis_store_keeps_floor_zero_for_a_skipping_lane() {
+        let store = FeedStore::new(1, 100);
+        store.append_block(1, vec![msg(7, 5, 1)]);
+        let scan = store.from_seq(7, 0);
+        assert_eq!(scan.floor_seq, Some(0));
+        assert_eq!(scan.floor_block, 0);
+        assert_eq!(scan.msgs[0].seq, 5);
     }
 
     #[test]
