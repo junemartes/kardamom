@@ -6,7 +6,7 @@ use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256};
 use kardamom_types::xchain::{self, XChainMessage};
 use kardamom_types::{BPosition, Receipt, SkipReason, StateDatabase, TxEnvelope};
-use revm::context::result::ExecutionResult;
+use revm::context::result::{EVMError, ExecutionResult};
 use revm::database::CacheDB;
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
 
@@ -19,7 +19,9 @@ use crate::error::ExecutorError;
 use crate::exec_types::{ReceiptStatus, TxIndex};
 
 use super::db::{SnapshotDb, seed_cache_layer};
+use super::deposit::{failed_deposit_receipt, mint_only_write_set};
 use super::tx_env::{DecodedTx, tx_env_from_deposit, tx_env_from_xchain};
+use super::xchain::{failed_xchain_receipt, xchain_value_rejection};
 
 /// Per-tx read-touch capture for the footprint shadow scheduler. The
 /// block-level EIP-7928 BAL cannot
@@ -130,9 +132,12 @@ impl<S: StateDatabase> Executor<S> {
     /// BAL claims match the historic path's true changes. The
     /// `old_and_new_deposit_paths_agree` test in `deposit.rs` is the gate.
     ///
-    /// Error paths fail-stop the pipeline (deposits have no skip
-    /// semantics), so a mint committed before a failed inner call cannot
-    /// leak into a later tx: nothing later runs.
+    /// A deposit that revm rejects at validation (for example an L1
+    /// `gasLimit` below the intrinsic cost) becomes a deterministic failed
+    /// receipt (`failed_deposit_receipt`): the mint stays, the inner call
+    /// never runs. Local failures (database errors) fail-stop the pipeline,
+    /// so a mint committed before such a failure cannot leak into a later
+    /// tx: nothing later runs.
     pub fn execute_deposit(
         &mut self,
         tx_idx: TxIndex,
@@ -175,10 +180,33 @@ impl<S: StateDatabase> Executor<S> {
         (*self.evm).modify_cfg(|c| c.disable_nonce_check = true);
         let result = self.evm.transact(tx_env);
         (*self.evm).modify_cfg(|c| c.disable_nonce_check = false);
-        let outcome = result.map_err(|e| ExecutorError::Execution {
-            idx: tx_idx,
-            detail: format!("{e:?}"),
-        })?;
+        let outcome = match result {
+            Ok(o) => o,
+            // Deterministic input invalidity: the mint stays, the inner
+            // call never ran. Same artifact as the free function.
+            Err(EVMError::Transaction(e)) => {
+                let cache = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
+                let info = revm::Database::basic(cache, deposit.from)
+                    .map_err(|e| ExecutorError::Execution {
+                        idx: tx_idx,
+                        detail: format!("basic({:?}): {e:?}", deposit.from),
+                    })?
+                    .unwrap_or_default();
+                let ws = mint_only_write_set(deposit, &info);
+                return Ok(failed_deposit_receipt(
+                    skip_reason_of_tx(&e),
+                    &format!("{e:?}"),
+                    tx_position,
+                    deposit,
+                    ws,
+                    bal,
+                    self.env.block_number,
+                    tx_index_in_block,
+                    cumulative_gas_used_before,
+                ));
+            }
+            Err(e) => return Err(derived_tx_rejection(e, tx_idx)),
+        };
 
         let gas_used = outcome.result.gas().tx_gas_used();
         let (status_success, logs) = match &outcome.result {
@@ -255,9 +283,10 @@ impl<S: StateDatabase> Executor<S> {
     /// A gate test like `old_and_new_deposit_paths_agree` applies here
     /// too.
     ///
-    /// v1 carries no value. A nonzero `message.value` is a chain fault,
-    /// not a droppable message, so this fails the engine before it
-    /// touches the cache.
+    /// v1 carries no value. A nonzero `message.value`, or a message revm
+    /// rejects at validation, becomes a deterministic failed receipt
+    /// (`failed_xchain_receipt`) before it touches the cache. Only local
+    /// failures (database errors) are engine errors.
     #[allow(clippy::too_many_arguments)] // matches execute_deposit's shape;
     // see the equivalent allow there for the reason.
     pub fn execute_xchain(
@@ -270,15 +299,17 @@ impl<S: StateDatabase> Executor<S> {
         cumulative_gas_used_before: u64,
         bal: Option<(&mut revm::state::bal::Bal, u64)>,
     ) -> Result<(Receipt, WriteSet), ExecutorError> {
-        if message.value != 0 {
-            return Err(ExecutorError::Execution {
-                idx: tx_idx,
-                detail: format!(
-                    "xchain message (origin {origin_chain_id}, seq {}) carries value {} but v1 \
-                     delivery is value-free — chain fault, not droppable",
-                    message.seq, message.value
-                ),
-            });
+        if let Some((reason, detail)) = xchain_value_rejection(origin_chain_id, message) {
+            return Ok(failed_xchain_receipt(
+                reason,
+                &detail,
+                tx_position,
+                origin_chain_id,
+                message,
+                self.env.block_number,
+                tx_index_in_block,
+                cumulative_gas_used_before,
+            ));
         }
 
         // Inner call with the nonce check off. No fallible call sits
@@ -288,10 +319,22 @@ impl<S: StateDatabase> Executor<S> {
         (*self.evm).modify_cfg(|c| c.disable_nonce_check = true);
         let result = self.evm.transact(tx_env);
         (*self.evm).modify_cfg(|c| c.disable_nonce_check = false);
-        let outcome = result.map_err(|e| ExecutorError::Execution {
-            idx: tx_idx,
-            detail: format!("{e:?}"),
-        })?;
+        let outcome = match result {
+            Ok(o) => o,
+            Err(EVMError::Transaction(e)) => {
+                return Ok(failed_xchain_receipt(
+                    skip_reason_of_tx(&e),
+                    &format!("{e:?}"),
+                    tx_position,
+                    origin_chain_id,
+                    message,
+                    self.env.block_number,
+                    tx_index_in_block,
+                    cumulative_gas_used_before,
+                ));
+            }
+            Err(e) => return Err(derived_tx_rejection(e, tx_idx)),
+        };
 
         let gas_used = outcome.result.gas().tx_gas_used();
         // A revert inside deliver (or a bubbled-up inner-call revert)
@@ -637,6 +680,22 @@ pub fn skip_reason_of_tx(err: &revm::context::result::InvalidTransaction) -> Ski
         E::CreateInitCodeSizeLimit => SkipReason::InitCodeSize,
         E::RejectCallerWithCode => SkipReason::SenderHasCode,
         _ => SkipReason::OtherTransaction,
+    }
+}
+
+/// Map a non-validation revm error on a derived tx (a deposit or a 0x7D
+/// delivery) to the engine error. The `EVMError::Transaction` arm is
+/// handled by the caller as a deterministic failed receipt. Everything
+/// else (database, header, custom) is local or is a block-env fault, not
+/// derivable from the record. It stays fatal, so crash recovery replays
+/// cleanly.
+pub(super) fn derived_tx_rejection<DbErr: core::fmt::Debug>(
+    err: EVMError<DbErr>,
+    idx: TxIndex,
+) -> ExecutorError {
+    ExecutorError::Execution {
+        idx,
+        detail: format!("{err:?}"),
     }
 }
 
