@@ -763,6 +763,7 @@ pub fn check_anchor(origin_chain_id: u64, msg: &OutboxMessage) -> Result<(), XCh
         });
     }
     Ok(())
+}
 
 /// The KAR1 v2 wire size of one record whose messages carry calldata of
 /// the given lengths: [`REMOTE_EPOCH_FIXED_WIRE_BYTES`] plus

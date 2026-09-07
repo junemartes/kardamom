@@ -280,6 +280,8 @@ mod tests {
 
     /// Pinned vector for the remote-epoch arm. A change here changes every
     /// L1 records commitment; the batcher and the guest must move together.
+    /// The arm digests `canonical_id`, which commits to `anchor_number`
+    /// since #263, so this vector moved with that change.
     #[test]
     fn remote_epoch_arm_vector() {
         let mut d = BlockRecordsDigest::new(7);
@@ -287,7 +289,7 @@ mod tests {
         d.add_tx(&[0xAB; 4]);
         assert_eq!(
             d.finish(),
-            b256!("0x8bf47e7f808a22ef0e164d29d6f3804ff19b1a8a721f2cf70bfb58cc255c7063")
+            b256!("0xe411b390e302b8cfced6cd32018bd219695bcbd9d91850c9d072f657f1294cf5")
         );
     }
 
