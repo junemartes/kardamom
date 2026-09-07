@@ -290,6 +290,12 @@ pub struct AttestationDto {
     pub validator_id: String,
     /// Signature over `(chain_id, block_number, state_root)` — absent until
     /// E2 adds attestation keys.
+    ///
+    /// An attestation with `signature: None` carries NO authority. It is a
+    /// plain statement from a socket, and anyone who can reach that socket
+    /// can produce one. A consumer must treat an unsigned attestation as
+    /// unusable for quorum, cross-check, or any other trust decision until
+    /// E2 lands. See `docs/specs/egress-node-spec.md`, section 5.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Bytes>,
 }

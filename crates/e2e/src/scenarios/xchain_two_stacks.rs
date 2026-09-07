@@ -36,9 +36,11 @@
 use std::path::Path;
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
-use kardamom_types::xchain::{Callback, INBOX, OUTBOX, remote_source_hash, xchain_tx_sender};
+use kardamom_types::xchain::{
+    Callback, INBOX, OUTBOX, outbox_send_message_selector, remote_source_hash, xchain_tx_sender,
+};
 
 use super::xchain::{
     RECEIVER_INIT_CODE, inbox_delivered_slot, inbox_next_seq_slot, log_address, log_topic,
@@ -63,11 +65,10 @@ pub fn send_message_calldata(
     data: &[u8],
     cb: Option<Callback>,
 ) -> Vec<u8> {
-    let selector =
-        &keccak256("sendMessage(uint64,address,uint64,bytes,(address,uint64,bytes32))")[..4];
+    let selector = outbox_send_message_selector();
     let cb = cb.unwrap_or_default();
     let mut out = Vec::with_capacity(4 + 8 * 32 + data.len().div_ceil(32) * 32);
-    out.extend_from_slice(selector);
+    out.extend_from_slice(&selector);
     out.extend_from_slice(u64_word(dest_chain_id).as_slice());
     out.extend_from_slice(super::xchain::address_word(target).as_slice());
     out.extend_from_slice(u64_word(gas_limit).as_slice());
@@ -437,4 +438,65 @@ pub async fn callback_leg(
         "A's B-lane cursor must be >= 1, got {cursor_seq}"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+    use alloy_sol_types::{SolCall, sol};
+
+    sol! {
+        struct SolCb {
+            address target;
+            uint64 gasLimit;
+            bytes32 context;
+        }
+
+        function sendMessage(
+            uint64 destChainId,
+            address target,
+            uint64 gasLimit,
+            bytes data,
+            SolCb cb
+        );
+    }
+
+    /// The hand-rolled `sendMessage` calldata must match `alloy-sol-types`
+    /// byte for byte (audit 2026-09-03, L4). Empty, sub-word, and word+1
+    /// payloads exercise the zero-length tail, the right padding, and a
+    /// two-word tail.
+    #[test]
+    fn send_message_calldata_is_byte_identical_to_sol_types() {
+        assert_eq!(sendMessageCall::SELECTOR, outbox_send_message_selector());
+        let cb = Callback {
+            target: Address::repeat_byte(0x0C),
+            gas_limit: 90_000,
+            context: B256::repeat_byte(0x1D),
+        };
+        let target = Address::repeat_byte(0xB9);
+        for data in [&b""[..], &[0x01][..], &[0xEE; 33][..]] {
+            for callback in [None, Some(cb)] {
+                let c = callback.unwrap_or_default();
+                let expect = sendMessageCall {
+                    destChainId: CHAIN_B_ID,
+                    target,
+                    gasLimit: 250_000,
+                    data: alloy_primitives::Bytes::copy_from_slice(data),
+                    cb: SolCb {
+                        target: c.target,
+                        gasLimit: c.gas_limit,
+                        context: c.context,
+                    },
+                }
+                .abi_encode();
+                assert_eq!(
+                    send_message_calldata(CHAIN_B_ID, target, 250_000, data, callback),
+                    expect,
+                    "data len {}, callback {}",
+                    data.len(),
+                    callback.is_some()
+                );
+            }
+        }
+    }
 }

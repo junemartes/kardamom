@@ -3,8 +3,10 @@
 //! (ingress, then service relay, then egress). That is exactly the
 //! property that must hold.
 
-use alloy_primitives::{Address, B256};
-use kardamom_types::{BPosition, DepositRef, TxOrderingMessage, TxRef};
+use alloy_primitives::{Address, B256, U256};
+use kardamom_types::epoch::EpochRecord;
+use kardamom_types::xchain::{Callback, RemoteEpochRecord};
+use kardamom_types::{BPosition, Deposit, DepositRef, TxOrderingMessage, TxRef};
 
 use super::*;
 
@@ -267,4 +269,101 @@ fn truncated_egress_errors_cleanly() {
         Err(WireError::TooShort { .. })
     ));
     assert!(decode_egress(&[]).is_err());
+}
+
+/// A remote epoch whose first message carries a callback: the `Some` arm of
+/// the archived `Option<Callback>`, which no other wire test covers.
+fn remote_epoch_with_callback() -> RemoteEpochRecord {
+    let mut rec = remote_epoch();
+    rec.messages[0].callback = Some(Callback {
+        target: Address::repeat_byte(0xC1),
+        gas_limit: 90_000,
+        context: B256::repeat_byte(0xC2),
+    });
+    rec
+}
+
+/// An L1 epoch with one deposit: the archived `Deposit` carries a `u128`
+/// and a `U256`, so it needs the 16-byte alignment too.
+fn epoch_with_deposit() -> EpochRecord {
+    EpochRecord {
+        l1_number: 77,
+        l1_hash: B256::repeat_byte(0x7A),
+        deposits: vec![Deposit {
+            source_hash: B256::repeat_byte(0xAA),
+            from: Address::repeat_byte(0x11),
+            to: Some(Address::repeat_byte(0x22)),
+            mint: 1_000_000_000_000u128,
+            value: U256::from(500u64),
+            gas_limit: 200_000,
+            is_system_transaction: false,
+            input: (&[0xDEu8, 0xAD, 0xBE, 0xEF][..]).into(),
+        }],
+    }
+}
+
+/// Relay an origin-record ingress frame the way the Java service does: keep
+/// the canonical id, drop the `header_len` bytes of sealer-only header,
+/// forward the record type and the rkyv body.
+fn relay_origin_record(ingress: &[u8], header_len: usize) -> Vec<u8> {
+    let mut relayed = ingress[1..33].to_vec();
+    relayed.extend_from_slice(&ingress[33 + header_len..]);
+    relayed
+}
+
+fn decode_record(buf: &[u8]) -> TxOrderingMessage {
+    match decode_egress(buf).unwrap() {
+        EgressItem::Record { msg, .. } => msg,
+        other => panic!("expected Record, got {other:?}"),
+    }
+}
+
+/// The decoder copies each rkyv body into a 16-aligned buffer before it
+/// reads it (audit 2026-09-03, L2). This test walks the input through every
+/// offset mod 16, so the decode never depends on where the allocator placed
+/// the frame. Both epoch kinds carry a `u128`-bearing archived type.
+#[test]
+fn epoch_bodies_decode_from_every_input_offset() {
+    let remote = remote_epoch_with_callback();
+    let remote_frame = encode_egress_record(
+        1,
+        &relay_origin_record(&encode_ingress_remote_epoch(&remote).unwrap(), 20),
+    );
+    let epoch = epoch_with_deposit();
+    let epoch_frame = encode_egress_record(
+        2,
+        &relay_origin_record(&encode_ingress_epoch(&epoch).unwrap(), 12),
+    );
+
+    for shift in 0..16usize {
+        let mut buf = vec![0u8; shift];
+        buf.extend_from_slice(&remote_frame);
+        assert_eq!(
+            decode_record(&buf[shift..]),
+            TxOrderingMessage::RemoteEpoch(remote.clone()),
+            "remote epoch at input offset {shift}"
+        );
+
+        let mut buf = vec![0u8; shift];
+        buf.extend_from_slice(&epoch_frame);
+        assert_eq!(
+            decode_record(&buf[shift..]),
+            TxOrderingMessage::Epoch(epoch.clone()),
+            "epoch at input offset {shift}"
+        );
+    }
+}
+
+/// Why the copy target is 16-aligned and not 8: rkyv refuses to read the
+/// archived record from an address that is 8 mod 16.
+#[test]
+fn archived_remote_epoch_needs_sixteen_byte_alignment() {
+    let body = rkyv::to_bytes::<rkyv::rancor::Error>(&remote_epoch_with_callback()).unwrap();
+    let mut shifted = rkyv::util::AlignedVec::<16>::with_capacity(8 + body.len());
+    shifted.extend_from_slice(&[0u8; 8]);
+    shifted.extend_from_slice(&body);
+    assert!(
+        rkyv::from_bytes::<RemoteEpochRecord, rkyv::rancor::Error>(&shifted[8..]).is_err(),
+        "an 8 mod 16 address must be rejected"
+    );
 }

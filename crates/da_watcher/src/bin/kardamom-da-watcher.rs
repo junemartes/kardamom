@@ -180,7 +180,10 @@ fn resolve_paths(args: &Args) -> anyhow::Result<(Option<L1Path>, Option<InteropP
                      position; --interop-start-seq only seeds the very first boot)"
                 );
             };
-            let cursor_file = CursorFile::new(path.clone());
+            // `open` takes the cursor's file lock. A second watcher on the
+            // same file stops here with `CursorError::Locked`.
+            let cursor_file =
+                CursorFile::open(path.clone()).context("open --interop-cursor-file")?;
             // A corrupt file must stop the process HERE, before anything is
             // derived — see `CursorFile::load` for why it is never treated
             // as 0.

@@ -347,3 +347,99 @@ fn block_delta_roundtrip() {
     };
     assert_eq!(roundtrip(&d), d);
 }
+
+// ── Golden bytes of the cross-chain wire types (audit 2026-09-03, L2) ──────
+//
+// The rkyv layout of `XChainMessage` and `RemoteEpochRecord` crosses the
+// Java relay byte-for-byte. A layout change here changes these bytes and
+// forces a review conversation. Pinned once from a run of `rkyv::to_bytes`.
+
+const XCHAIN_MESSAGE_GOLDEN: &str = "cafe0000000000000000000000000000e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\
+e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e10900000000000000a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1b2b2b2b2\
+b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b205000000000000000000000000000000400d03000000000088ffffff02000000\
+0100000000000000c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c100000000905f010000000000c2c2c2c2c2c2c2c2\
+c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c20000000000000000";
+
+const REMOTE_EPOCH_RECORD_GOLDEN: &str = "cafecafe000000000000000000000000e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\
+0900000000000000a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\
+05000000000000000000000000000000400d03000000000088ffffff020000000100000000000000c1c1c1c1c1c1c1c1\
+c1c1c1c1c1c1c1c1c1c1c1c100000000905f010000000000c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2\
+c2c2c2c2c2c2c2c20000000000000000e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\
+0a00000000000000a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\
+05000000000000000000000000000000400d030000000000cafeffff0200000000000000000000000000000000000000\
+000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\
+00000000000000000000000000000000ba4a06000000000077665544332211005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\
+5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a090000000000000048feffff02000000";
+
+fn golden_xchain_message() -> kardamom_types::xchain::XChainMessage {
+    use kardamom_types::xchain::{Callback, XChainMessage};
+    XChainMessage {
+        source_hash: B256::repeat_byte(0xE1),
+        seq: 9,
+        origin_sender: Address::repeat_byte(0xA1),
+        target: Address::repeat_byte(0xB2),
+        value: 5,
+        gas_limit: 200_000,
+        input: Bytes::from_static(b"\xca\xfe"),
+        callback: Some(Callback {
+            target: Address::repeat_byte(0xC1),
+            gas_limit: 90_000,
+            context: B256::repeat_byte(0xC2),
+        }),
+    }
+}
+
+fn golden_remote_epoch_record() -> kardamom_types::xchain::RemoteEpochRecord {
+    use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
+    let first = golden_xchain_message();
+    let second = XChainMessage {
+        seq: 10,
+        callback: None,
+        ..first.clone()
+    };
+    RemoteEpochRecord {
+        origin_chain_id: 412_346,
+        anchor_number: 0x0011_2233_4455_6677,
+        anchor_hash: B256::repeat_byte(0x5A),
+        first_seq: 9,
+        messages: vec![first, second],
+    }
+}
+
+#[test]
+fn xchain_message_golden_bytes_are_pinned() {
+    let v = golden_xchain_message();
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&v).unwrap();
+    assert_eq!(
+        alloy_primitives::hex::encode(&bytes[..]),
+        XCHAIN_MESSAGE_GOLDEN,
+        "XChainMessage rkyv layout changed"
+    );
+    assert_eq!(roundtrip(&v), v);
+    // The pinned bytes decode to the pinned value: the pin is not only a
+    // hash of the encoder, it is the decoder's contract too.
+    let raw = alloy_primitives::hex::decode(XCHAIN_MESSAGE_GOLDEN).unwrap();
+    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(raw.len());
+    aligned.extend_from_slice(&raw);
+    let back: kardamom_types::xchain::XChainMessage =
+        rkyv::from_bytes::<_, rkyv::rancor::Error>(&aligned).unwrap();
+    assert_eq!(back, v);
+}
+
+#[test]
+fn remote_epoch_record_golden_bytes_are_pinned() {
+    let v = golden_remote_epoch_record();
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&v).unwrap();
+    assert_eq!(
+        alloy_primitives::hex::encode(&bytes[..]),
+        REMOTE_EPOCH_RECORD_GOLDEN,
+        "RemoteEpochRecord rkyv layout changed"
+    );
+    assert_eq!(roundtrip(&v), v);
+    let raw = alloy_primitives::hex::decode(REMOTE_EPOCH_RECORD_GOLDEN).unwrap();
+    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(raw.len());
+    aligned.extend_from_slice(&raw);
+    let back: kardamom_types::xchain::RemoteEpochRecord =
+        rkyv::from_bytes::<_, rkyv::rancor::Error>(&aligned).unwrap();
+    assert_eq!(back, v);
+}
