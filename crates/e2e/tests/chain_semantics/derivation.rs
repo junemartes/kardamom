@@ -1,10 +1,12 @@
 // Tests for L1-origin deposit derivation. This file is included from
 // main.rs (see the header there). Shared helpers live in main.rs.
 //
-// The rules these tests check live in
-// docs/agents/l1-origin-deposit-derivation-spec.md. The checks run against
-// persisted headers and executed receipts, not logs. A component could
-// log the right thing and still build the wrong chain.
+// These tests check that the L1 origin advances monotonically, never
+// skips an L1 block, that an epoch's deposits lead the block they open,
+// that the origin never exceeds L1 finality, and that a stalled L1 does
+// not stall L2. The checks run against persisted headers and executed
+// receipts, not logs. A component could log the right thing and still
+// build the wrong chain.
 
 /// The tests that call this helper differ only in the derivation
 /// scenario they drive. They share the same L1-backed stack and the
@@ -88,7 +90,7 @@ async fn s10e_every_l1_deposit_appears_exactly_once() {
     let state_dir = stack.executor_state_dir().expect("executor state dir");
 
     // Give the chain something to find: two deposits in separate L1 blocks.
-    let signers = e2e::harness::l2::dev_signers(4).expect("signers");
+    let signers = e2e::harness::l2::dev_signers_total(4).expect("signers");
     for signer in &signers[2..4] {
         l1.deposit_eth(
             signer.address,
@@ -175,17 +177,12 @@ async fn s12d_verified_l1_swallowed_logs_halt_validator() {
 }
 
 async fn run_verified_l1_case(fault: e2e::harness::l1_verified::Fault) {
-    let Some(mut stack) = LocalStack::launch_opt(StackConfig {
+    let mut stack = launch_l1_or_skip!(StackConfig {
         l1: true,
         validator: true,
         verified_l1: true,
         ..StackConfig::default()
-    })
-    .await
-    .expect("stack") else {
-        eprintln!("SKIP: anvil not available");
-        return;
-    };
+    });
     let t = stack
         .target(client_timeout(Duration::from_secs(30)))
         .expect("target");

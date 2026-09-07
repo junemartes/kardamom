@@ -1,9 +1,8 @@
 //! Anvil as the L1, with the bridge contracts deployed.
 //!
-//! This reuses the pattern that `crates/validator/tests/withdrawal_e2e.rs`
-//! established: predeploy the ERC-7955 factory with `anvil_setCode`, fund
-//! and impersonate `DEV_OWNER`, bootstrap the kardamom factory, then
-//! deploy the `WithdrawalOutputOracle` and `ETHLockbox` atomically, with
+//! Bring-up predeploys the ERC-7955 factory with `anvil_setCode`, funds
+//! and impersonates `DEV_OWNER`, bootstraps the kardamom factory, then
+//! deploys the `WithdrawalOutputOracle` and `ETHLockbox` atomically, with
 //! the oracle's address predicted and wired into the lockbox's
 //! initializer.
 //!
@@ -30,16 +29,42 @@ use kardamom_deployer::{ContractId, Deployer, Op, encode_address_pair, encode_or
 pub use contracts::*;
 
 /// A short finalization window, so a scenario can warp past it quickly
-/// (the production default is 86_400).
-pub const FINALIZATION_WINDOW: u64 = 60;
+/// (the production default is `86_400`).
+pub(crate) const FINALIZATION_WINDOW: u64 = 60;
 
 /// The receipt type the wallet providers hand back.
-type L1TxReceipt = <alloy_network::Ethereum as alloy_network::Network>::ReceiptResponse;
+pub(crate) type L1TxReceipt = <alloy_network::Ethereum as alloy_network::Network>::ReceiptResponse;
+
+/// Poll for `hash`'s receipt by hand, instead of using alloy's watcher
+/// (which flakes after an anvil time warp — see the callers). `what`
+/// names the transaction, for the poll's log line.
+///
+/// # Errors
+/// Returns an error when no receipt lands within 30s.
+pub(crate) async fn await_l1_receipt(
+    p: &(impl Provider + Clone),
+    hash: B256,
+    what: &str,
+) -> Result<L1TxReceipt> {
+    crate::harness::metrics::poll_until(
+        &format!("{what} receipt"),
+        Duration::from_secs(30),
+        Duration::from_millis(250),
+        || async { Ok(p.get_transaction_receipt(hash).await.ok().flatten()) },
+    )
+    .await
+}
 
 /// A provider with no wallet (reads and `anvil_*` cheatcodes), tuned for
 /// tests (50 ms poll). It takes the URL by value and captures no
 /// lifetime, so the result works where `'static` is required
 /// (`deposit_logs` hands it to `L1Source`).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "a &str parameter would tie the returned impl Provider's captured lifetime to \
+               the borrow (edition 2024 RPIT auto-capture), breaking the 'static callers \
+               need; the value is read, not stored, so this is a deliberate exception"
+)]
 fn provider_for(url: String) -> impl Provider + Clone {
     let p = ProviderBuilder::new()
         .disable_recommended_fillers()
@@ -48,87 +73,95 @@ fn provider_for(url: String) -> impl Provider + Clone {
     p
 }
 
-/// A running anvil L1 with the bridge contracts deployed.
-pub struct L1 {
-    anvil: alloy_node_bindings::AnvilInstance,
-    pub lockbox: Address,
-    pub oracle: Address,
-    /// `KardamomL2Settlement`: the DA batch inbox.
-    pub settlement: Address,
+/// Bring-up state for deploying the bridge contracts onto a fresh anvil
+/// instance. Holds the raw provider (for `anvil_*` cheatcodes), the
+/// wrapped [`Deployer`] (for factory and contract calls), and the L2
+/// chain id every step needs, so each bring-up step reads them as state
+/// instead of taking them as loose parameters.
+struct L1BringUp<P: Provider<alloy_network::Ethereum> + Clone> {
+    provider: P,
+    deployer: Deployer<P>,
+    l2_chain_id: u64,
 }
 
-impl L1 {
-    /// Spawn anvil and deploy the bridge. Returns `Ok(None)` when the
-    /// `anvil` binary is absent, so bridge scenarios skip instead of
-    /// failing on a machine with no Foundry. This is the same convention
-    /// every other anvil test here uses.
-    pub async fn launch(l2_chain_id: u64) -> Result<Option<Self>> {
-        let Ok(anvil) = alloy_node_bindings::Anvil::new()
-            .block_time(1)
-            .arg("--slots-in-an-epoch")
-            .arg("1")
-            .try_spawn()
-        else {
-            return Ok(None);
-        };
+impl<P: Provider<alloy_network::Ethereum> + Clone> L1BringUp<P> {
+    fn new(provider: P, l2_chain_id: u64) -> Self {
+        let deployer = Deployer::new(provider.clone(), DEV_OWNER);
+        Self {
+            provider,
+            deployer,
+            l2_chain_id,
+        }
+    }
 
-        let deploy_provider = provider_for(anvil.endpoint());
-
-        let _: serde_json::Value = deploy_provider
+    /// Fund and impersonate the accounts the deploy needs, and predeploy
+    /// the ERC-7955 factory bytecode anvil does not ship with.
+    async fn prime_anvil(&self) -> Result<()> {
+        let _: serde_json::Value = self
+            .provider
             .raw_request(
                 "anvil_setCode".into(),
                 (ERC7955_FACTORY, format!("0x{ERC7955_RUNTIME_HEX}")),
             )
             .await
             .context("predeploy ERC-7955 factory")?;
-        let _: serde_json::Value = deploy_provider
+        let _: serde_json::Value = self
+            .provider
             .raw_request(
                 "anvil_setBalance".into(),
                 (DEV_OWNER, U256::from(1_000_000_000_000_000_000_000u128)),
             )
             .await
             .context("fund DEV_OWNER")?;
-        let _: serde_json::Value = deploy_provider
+        let _: serde_json::Value = self
+            .provider
             .raw_request("anvil_impersonateAccount".into(), (DEV_OWNER,))
             .await
             .context("impersonate DEV_OWNER")?;
         // The batcher signs real blob transactions, so it needs a real
         // balance.
-        let _: serde_json::Value = deploy_provider
+        let _: serde_json::Value = self
+            .provider
             .raw_request(
                 "anvil_setBalance".into(),
                 (BATCHER_ADDR, U256::from(1_000_000_000_000_000_000_000u128)),
             )
             .await
             .context("fund the batcher EOA")?;
+        Ok(())
+    }
 
-        let deployer = Deployer::new(deploy_provider.clone(), DEV_OWNER);
-        deployer
+    async fn ensure_factory(&self) -> Result<()> {
+        self.deployer
             .ensure_factory(DEV_OWNER)
             .await
             .context("ensure kardamom factory")?;
+        Ok(())
+    }
 
-        // The lockbox's initializer needs the oracle's address. Predict
-        // that address from the exact init args the deploy will use, then
-        // deploy both contracts in one transaction.
+    /// Deploy the oracle and lockbox atomically, with the oracle's address
+    /// predicted ahead of time so the lockbox's initializer can name it.
+    /// Returns the predicted oracle address, checked against the deployed
+    /// registry in [`Self::resolve_deployed_addresses`].
+    async fn deploy_bridge_contracts(&self) -> Result<Address> {
         let oracle_init =
             encode_oracle_init_args(ATTESTER_ADDR, DEPOSITOR_ADDR, FINALIZATION_WINDOW);
-        let predicted_oracle = deployer.predict_proxy_address(
-            l2_chain_id,
+        let predicted_oracle = self.deployer.predict_proxy_address(
+            self.l2_chain_id,
             ContractId::WithdrawalOutputOracle,
             &oracle_init,
         );
         let lockbox_init = encode_address_pair(L2_MINTER, predicted_oracle);
-        deployer
+        self.deployer
             .apply(
                 &[
                     Op::Deploy {
-                        l2_chain_id,
+                        l2_chain_id: self.l2_chain_id,
                         id: ContractId::WithdrawalOutputOracle,
                         init_args: oracle_init,
                     },
                     Op::Deploy {
-                        l2_chain_id,
+                        l2_chain_id: self.l2_chain_id,
                         id: ContractId::EthLockbox,
                         init_args: lockbox_init,
                     },
@@ -136,7 +169,7 @@ impl L1 {
                     // allowed to post, so it is the key the DA-parity test
                     // uses to sign blob transactions.
                     Op::Deploy {
-                        l2_chain_id,
+                        l2_chain_id: self.l2_chain_id,
                         id: ContractId::KardamomL2Settlement,
                         init_args: kardamom_deployer::encode_address_arg(BATCHER_ADDR),
                     },
@@ -145,9 +178,20 @@ impl L1 {
             )
             .await
             .context("deploy oracle + lockbox")?;
+        Ok(predicted_oracle)
+    }
 
-        let entries = deployer
-            .addresses(Some(l2_chain_id))
+    /// Read the deployed contract registry and confirm the oracle landed
+    /// at the predicted address (the lockbox's initializer was built from
+    /// that prediction, so a mismatch means the two point at different
+    /// contracts).
+    async fn resolve_deployed_addresses(
+        &self,
+        predicted_oracle: Address,
+    ) -> Result<BridgeAddresses> {
+        let entries = self
+            .deployer
+            .addresses(Some(self.l2_chain_id))
             .await
             .context("read deployed addresses")?;
         let find = |id: ContractId| -> Result<Address> {
@@ -164,25 +208,85 @@ impl L1 {
             oracle == predicted_oracle,
             "predicted oracle {predicted_oracle} != deployed {oracle}"
         );
+        Ok(BridgeAddresses {
+            oracle,
+            lockbox,
+            settlement,
+        })
+    }
+}
+
+/// The three proxy addresses [`L1BringUp::resolve_deployed_addresses`]
+/// reads back from the deployment registry.
+struct BridgeAddresses {
+    oracle: Address,
+    lockbox: Address,
+    settlement: Address,
+}
+
+/// A running anvil L1 with the bridge contracts deployed.
+pub struct L1 {
+    anvil: alloy_node_bindings::AnvilInstance,
+    pub lockbox: Address,
+    pub oracle: Address,
+    /// `KardamomL2Settlement`: the DA batch inbox.
+    pub settlement: Address,
+}
+
+impl L1 {
+    /// Spawn anvil and deploy the bridge. Returns `Ok(None)` when the
+    /// `anvil` binary is absent, so bridge scenarios skip instead of
+    /// failing on a machine with no Foundry. This is the same convention
+    /// every other anvil test here uses.
+    ///
+    /// # Errors
+    /// Returns an error when funding or impersonating the deploy accounts
+    /// fails, when the factory or the bridge contracts fail to deploy, or
+    /// when the deployed oracle address does not match the address
+    /// predicted before the deploy.
+    pub async fn launch(l2_chain_id: u64) -> Result<Option<Self>> {
+        let Ok(anvil) = alloy_node_bindings::Anvil::new()
+            .block_time(1)
+            .arg("--slots-in-an-epoch")
+            .arg("1")
+            .try_spawn()
+        else {
+            return Ok(None);
+        };
+
+        let deploy_provider = provider_for(anvil.endpoint());
+        let bring_up = L1BringUp::new(deploy_provider, l2_chain_id);
+        bring_up.prime_anvil().await?;
+        bring_up.ensure_factory().await?;
+
+        let predicted_oracle = bring_up.deploy_bridge_contracts().await?;
+        let addrs = bring_up
+            .resolve_deployed_addresses(predicted_oracle)
+            .await?;
 
         Ok(Some(Self {
             anvil,
-            lockbox,
-            oracle,
-            settlement,
+            lockbox: addrs.lockbox,
+            oracle: addrs.oracle,
+            settlement: addrs.settlement,
         }))
     }
 
+    #[must_use]
     pub fn rpc_url(&self) -> String {
         self.anvil.endpoint()
     }
 
     /// A provider with no wallet (reads and anvil_* cheatcodes).
+    #[must_use]
     pub fn provider(&self) -> impl Provider + Clone {
         provider_for(self.anvil.endpoint())
     }
 
     /// Provider that signs with `key`.
+    ///
+    /// # Errors
+    /// Returns an error when `key` does not parse as a private key.
     pub fn wallet(&self, key: &str) -> Result<impl Provider + Clone> {
         let signer: PrivateKeySigner = key.parse().context("parse dev key")?;
         let p = ProviderBuilder::new()
@@ -194,6 +298,9 @@ impl L1 {
 
     /// Mine `n` empty blocks. This also advances `finalized`, because of
     /// `--slots-in-an-epoch 1`.
+    ///
+    /// # Errors
+    /// Returns an error when the `evm_mine` RPC call fails.
     pub async fn mine(&self, n: u64) -> Result<()> {
         let p = self.provider();
         for _ in 0..n {
@@ -207,6 +314,10 @@ impl L1 {
 
     /// Jump past the oracle's finalization window, then mine so the new
     /// timestamp is observable.
+    ///
+    /// # Errors
+    /// Returns an error when the `evm_increaseTime` RPC call fails, or
+    /// when the follow-up mine ([`Self::mine`]) fails.
     pub async fn warp_past_window(&self) -> Result<()> {
         let p = self.provider();
         let _: serde_json::Value = p
@@ -218,14 +329,22 @@ impl L1 {
 
     /// The `(block_hash, block_number, log_index)` of the `DepositInitiated`
     /// log in a `depositETH` receipt. The receipt must be successful.
-    fn deposit_log(&self, receipt: &L1TxReceipt) -> Result<(B256, u64, u64)> {
-        anyhow::ensure!(receipt.status(), "depositETH reverted");
+    /// Require a successful receipt, find `event`'s log from the lockbox,
+    /// and pull its block hash, block number, and log index. `call` names
+    /// the transaction, for the revert message.
+    fn lockbox_event(
+        &self,
+        receipt: &L1TxReceipt,
+        call: &str,
+        event: &str,
+    ) -> Result<(B256, u64, u64)> {
+        anyhow::ensure!(receipt.status(), "{call} reverted");
         let log = receipt
             .inner
             .logs()
             .iter()
             .find(|l| l.address() == self.lockbox)
-            .context("no DepositInitiated log from the lockbox")?;
+            .with_context(|| format!("no {event} log from the lockbox"))?;
         Ok((
             log.block_hash.context("log carries no block hash")?,
             log.block_number.context("log carries no block number")?,
@@ -236,6 +355,10 @@ impl L1 {
     /// Call `depositETH(to, gas_limit, "")` with `value` wei, from
     /// `DEPOSITOR_ADDR`. Returns the L1 block hash and log index the
     /// OP-style `source_hash` derives from.
+    ///
+    /// # Errors
+    /// Returns an error when the transaction fails to send or confirm, or
+    /// when the receipt reverted or carries no `DepositInitiated` log.
     pub async fn deposit_eth(&self, to: Address, value: U256) -> Result<(B256, u64)> {
         let provider = self.wallet(DEPOSITOR_KEY)?;
         let lockbox = ETHLockbox::new(self.lockbox, &provider);
@@ -248,7 +371,8 @@ impl L1 {
             .get_receipt()
             .await
             .context("depositETH receipt")?;
-        let (block_hash, _block_number, log_index) = self.deposit_log(&receipt)?;
+        let (block_hash, _block_number, log_index) =
+            self.lockbox_event(&receipt, "depositETH", "DepositInitiated")?;
         Ok((block_hash, log_index))
     }
 
@@ -263,6 +387,10 @@ impl L1 {
     /// `block.timestamp` is in milliseconds on this chain). `0` activates
     /// immediately. Returns the L1 block hash and log index the system
     /// deposit's `source_hash` derives from.
+    ///
+    /// # Errors
+    /// Returns an error when the transaction fails to send or confirm, or
+    /// when the receipt reverted or carries no `UpgradeInitiated` log.
     pub async fn initiate_upgrade(
         &self,
         feature_id: U256,
@@ -279,17 +407,9 @@ impl L1 {
             .get_receipt()
             .await
             .context("initiateUpgrade receipt")?;
-        anyhow::ensure!(receipt.status(), "initiateUpgrade reverted");
-        let log = receipt
-            .inner
-            .logs()
-            .iter()
-            .find(|l| l.address() == self.lockbox)
-            .context("no UpgradeInitiated log from the lockbox")?;
-        Ok((
-            log.block_hash.context("log carries no block hash")?,
-            log.log_index.context("log carries no index")?,
-        ))
+        let (block_hash, _block_number, log_index) =
+            self.lockbox_event(&receipt, "initiateUpgrade", "UpgradeInitiated")?;
+        Ok((block_hash, log_index))
     }
 
     /// Attempt an upgrade transaction from an account that is not the
@@ -298,6 +418,10 @@ impl L1 {
     /// This is a negative control, so it deliberately returns `Ok(())`
     /// only when the call actually succeeded. The caller checks for the
     /// error.
+    ///
+    /// # Errors
+    /// Returns an error (the rejection this function proves) when the
+    /// chain refuses the call at send, at receipt, or by revert.
     pub async fn try_initiate_upgrade_unauthorized(
         &self,
         key: &str,
@@ -319,6 +443,9 @@ impl L1 {
     }
 
     /// The lockbox's current upgrade nonce.
+    ///
+    /// # Errors
+    /// Returns an error when the `upgradeNonce` call fails.
     pub async fn upgrade_nonce(&self) -> Result<u64> {
         let provider = self.provider();
         let lockbox = ETHLockbox::new(self.lockbox, &provider);
@@ -338,6 +465,11 @@ impl L1 {
     /// about grouping.
     ///
     /// Returns `(block_hash, block_number, log_index)` for each deposit.
+    ///
+    /// # Errors
+    /// Returns an error when pausing or resuming automine fails, when a
+    /// deposit fails to send or confirm, or when a receipt reverted or
+    /// carries no `DepositInitiated` log.
     pub async fn deposit_eth_batch(
         &self,
         recipients: &[Address],
@@ -371,7 +503,7 @@ impl L1 {
                 .get_receipt()
                 .await
                 .context("batched depositETH receipt")?;
-            out.push(self.deposit_log(&receipt)?);
+            out.push(self.lockbox_event(&receipt, "depositETH", "DepositInitiated")?);
         }
         Ok(out)
     }
@@ -392,17 +524,27 @@ impl L1 {
     /// `block_time(1)`, so simply not calling [`mine`](Self::mine) does
     /// not make L1 idle. Pair this with
     /// [`resume_block_production`](Self::resume_block_production).
+    ///
+    /// # Errors
+    /// Returns an error when the `evm_setAutomine` RPC call fails.
     pub async fn pause_block_production(&self) -> Result<()> {
         self.set_automine(false).await
     }
 
     /// Resume automatic L1 block production.
+    ///
+    /// # Errors
+    /// Returns an error when the `evm_setAutomine` RPC call fails.
     pub async fn resume_block_production(&self) -> Result<()> {
         self.set_automine(true).await
     }
 
     /// The latest finalized L1 block number, the same view the da-watcher
     /// follows.
+    ///
+    /// # Errors
+    /// Returns an error when the RPC call fails, or when L1 has not
+    /// finalized a block yet.
     pub async fn finalized_block_number(&self) -> Result<u64> {
         let block = self
             .provider()
@@ -419,6 +561,9 @@ impl L1 {
     /// Tests compare the chain against this value. Rewriting the decode
     /// logic here would let a producer bug and a test bug cancel each
     /// other out.
+    ///
+    /// # Errors
+    /// Returns an error when reading or decoding the L1 logs fails.
     pub async fn lockbox_logs(
         &self,
         from_block: u64,
@@ -439,6 +584,10 @@ impl L1 {
     /// key on the user-domain `source_hash`, which an upgrade log does
     /// not have (system deposits derive under domain 1). Handing callers
     /// the full union would compute ids that match nothing.
+    ///
+    /// # Errors
+    /// Returns an error under the same conditions as
+    /// [`Self::lockbox_logs`].
     pub async fn deposit_logs(
         &self,
         from_block: u64,

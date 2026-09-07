@@ -23,10 +23,10 @@
 //! inside their binaries, with no fixture paths needed on the Target-C
 //! runner.
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
+use alloy_consensus::SignableTransaction;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSignerSync;
-use alloy_primitives::{Bytes, Signature, TxKind, U256};
+use alloy_primitives::{Bytes, Signature, U256};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -71,40 +71,53 @@ impl Default for Params {
     }
 }
 
+/// # Errors
+/// Returns an error when a vector file fails to parse, when a request
+/// carries no method, or when a response does not match its expectation.
 pub async fn run(t: &Target, p: Params) -> Result<()> {
     let subs = build_substitutions(t, &p)?;
     for (file, text) in VECTORS {
-        for (i, (req, expect)) in parse(text)
-            .with_context(|| format!("parse vectors/rpc/{file}.io"))?
-            .into_iter()
-            .enumerate()
-        {
-            let req = substitute(req, &subs);
-            let expect = substitute(expect, &subs);
-            let method = req["method"]
-                .as_str()
-                .with_context(|| format!("{file}[{i}]: request has no method"))?;
-            let params: Vec<Value> = req["params"].as_array().cloned().unwrap_or_default();
+        run_vector_file(t, &subs, file, text).await?;
+    }
+    Ok(())
+}
 
-            let outcome = t.rpc.raw_call(method, &params).await;
-            let actual = match outcome.result {
-                Ok(v) => json!({ "result": v }),
-                Err(RpcError::Call { code, message }) => {
-                    json!({ "error": { "code": code, "message": message } })
-                }
-                Err(RpcError::Transport(e)) => {
-                    bail!("{file}[{i}] {method}: transport error (the contract forbids these): {e}")
-                }
-            };
-            matches(&expect, &actual)
-                .with_context(|| format!("{file}[{i}] {method}: got {actual}"))?;
-        }
+/// Run every request/expectation pair in one vector file.
+async fn run_vector_file(
+    t: &Target,
+    subs: &BTreeMap<String, Value>,
+    file: &str,
+    text: &str,
+) -> Result<()> {
+    for (i, (req, expect)) in parse(text)
+        .with_context(|| format!("parse vectors/rpc/{file}.io"))?
+        .into_iter()
+        .enumerate()
+    {
+        let req = substitute(req, subs);
+        let expect = substitute(expect, subs);
+        let method = req["method"]
+            .as_str()
+            .with_context(|| format!("{file}[{i}]: request has no method"))?;
+        let params: Vec<Value> = req["params"].as_array().cloned().unwrap_or_default();
+
+        let outcome = t.rpc.raw_call(method, &params).await;
+        let actual = match outcome.result {
+            Ok(v) => json!({ "result": v }),
+            Err(RpcError::Call { code, message }) => {
+                json!({ "error": { "code": code, "message": message } })
+            }
+            Err(RpcError::Transport(e)) => {
+                bail!("{file}[{i}] {method}: transport error (the contract forbids these): {e}")
+            }
+        };
+        matches(&expect, &actual).with_context(|| format!("{file}[{i}] {method}: got {actual}"))?;
     }
     Ok(())
 }
 
 fn build_substitutions(t: &Target, p: &Params) -> Result<BTreeMap<String, Value>> {
-    let signers = l2::dev_signers(p.sender.max(p.recipient) as u32 + 1)?;
+    let signers = l2::dev_signers_through(p.sender.max(p.recipient))?;
     let sender = &signers[p.sender];
     let recipient = signers[p.recipient].address;
 
@@ -114,15 +127,7 @@ fn build_substitutions(t: &Target, p: &Params) -> Result<BTreeMap<String, Value>
     // So decoding succeeds but recovery fails, which is the exact path
     // the signature-verify error covers.
     let badsig = {
-        let tx = TxLegacy {
-            chain_id: Some(t.chain_id),
-            nonce: 0,
-            gas_price: 1_000_000_000,
-            gas_limit: 21_000,
-            to: TxKind::Call(recipient),
-            value: U256::ONE,
-            input: Bytes::new(),
-        };
+        let tx = l2::legacy_tx(t.chain_id, 0, 21_000, recipient, U256::ONE);
         let sig = Signature::new(U256::ZERO, U256::ONE, false);
         encode_2718(tx.into_signed(sig))
     };
@@ -130,15 +135,7 @@ fn build_substitutions(t: &Target, p: &Params) -> Result<BTreeMap<String, Value>
     // A block's worth of gas: valid RLP and signature, but over the
     // per-transaction cap.
     let overcap = {
-        let mut tx = TxLegacy {
-            chain_id: Some(t.chain_id),
-            nonce: 0,
-            gas_price: 1_000_000_000,
-            gas_limit: 30_000_000,
-            to: TxKind::Call(recipient),
-            value: U256::ONE,
-            input: Bytes::new(),
-        };
+        let mut tx = l2::legacy_tx(t.chain_id, 0, 30_000_000, recipient, U256::ONE);
         let sig = sender
             .signer
             .sign_transaction_sync(&mut tx)
@@ -158,7 +155,7 @@ fn build_substitutions(t: &Target, p: &Params) -> Result<BTreeMap<String, Value>
             max_priority_fee_per_gas: 0,
             to: recipient,
             value: U256::ONE,
-            access_list: Default::default(),
+            access_list: alloy_eips::eip2930::AccessList::default(),
             blob_versioned_hashes: vec![alloy_primitives::B256::repeat_byte(0x01)],
             max_fee_per_blob_gas: 1,
             input: Bytes::new(),

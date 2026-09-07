@@ -18,17 +18,8 @@ async fn s3_nonces_unordered_all_land() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s4_nonce_gap_is_never_processed() {
-    let park = Duration::from_secs(4);
-    let stack = LocalStack::launch(StackConfig {
-        ingress: IngressOptions {
-            pending_receipt_timeout: park,
-            ..IngressOptions::default()
-        },
-        ..StackConfig::default()
-    })
-    .await
-    .expect("stack");
-    let t = stack.target(client_timeout(park)).expect("target");
+    let park = PARK_4S;
+    let (_stack, t) = launch_with_park(park, StackConfig::default()).await;
     nonce_gap::run(&t, nonce_gap::Params::default())
         .await
         .expect("S4");
@@ -37,17 +28,8 @@ async fn s4_nonce_gap_is_never_processed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s5_rpc_endpoints_never_hang() {
-    let park = Duration::from_secs(5);
-    let stack = LocalStack::launch(StackConfig {
-        ingress: IngressOptions {
-            pending_receipt_timeout: park,
-            ..IngressOptions::default()
-        },
-        ..StackConfig::default()
-    })
-    .await
-    .expect("stack");
-    let t = stack.target(client_timeout(park)).expect("target");
+    let park = PARK_5S;
+    let (_stack, t) = launch_with_park(park, StackConfig::default()).await;
     rpc_liveness::run(&t, rpc_liveness::Params::default())
         .await
         .expect("S5");
@@ -56,19 +38,30 @@ async fn s5_rpc_endpoints_never_hang() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s5_connection_cap_refusal_is_prompt() {
-    let park = Duration::from_secs(5);
-    let cap = 4usize;
-    let stack = LocalStack::launch(StackConfig {
-        ingress: IngressOptions {
-            pending_receipt_timeout: park,
-            rpc_max_connections: cap as u32,
+    let park = PARK_5S;
+    let cap = std::num::NonZeroUsize::new(4).unwrap();
+    let (_stack, t) = launch_with_park(
+        park,
+        StackConfig {
+            ingress: IngressOptions {
+                rpc_max_connections: std::num::NonZeroU32::try_from(
+                    u32::try_from(cap.get()).expect("cap fits in u32"),
+                )
+                .expect("cap is nonzero"),
+                ..IngressOptions::default()
+            },
+            ..StackConfig::default()
         },
-        ..StackConfig::default()
-    })
-    .await
-    .expect("stack");
-    let url = stack.target(client_timeout(park)).expect("target").rpc.url;
-    rpc_liveness::connection_cap_refusal(&url, e2e::harness::DEV_CHAIN_ID, cap, park, 1)
+    )
+    .await;
+    let url = t.rpc.url;
+    rpc_liveness::connection_cap_refusal(
+        &url,
+        e2e::harness::DEV_CHAIN_ID.get(),
+        cap,
+        park.as_duration(),
+        1,
+    )
         .await
         .expect("S5 cap");
 }
@@ -80,25 +73,15 @@ async fn s5_connection_cap_refusal_is_prompt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s5_queue_depth_recovers_after_client_aborts() {
-    let park = Duration::from_secs(4);
-    let stack = LocalStack::launch(StackConfig {
-        ingress: IngressOptions {
-            pending_receipt_timeout: park,
-            ..IngressOptions::default()
-        },
-        ..StackConfig::default()
-    })
-    .await
-    .expect("stack");
-    let t = stack.target(client_timeout(park)).expect("target");
-    rpc_liveness::queue_depth_canary(&t, 1, 3)
+    let park = PARK_4S;
+    let (_stack, t) = launch_with_park(park, StackConfig::default()).await;
+    rpc_liveness::queue_depth_canary(&t, 1, std::num::NonZeroUsize::new(3).unwrap())
         .await
         .expect("S5 canary");
 }
 
-/// The RPC golden vectors (docs/agents/l1-client-suite-port-spec.md):
-/// the whole v0 contract as data. The Target-C `rpc-vectors` case runs
-/// the same vectors.
+/// The RPC golden vectors: the whole v0 RPC contract as data. The
+/// Target-C `rpc-vectors` case runs the same vectors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn rpc_golden_vectors_hold() {

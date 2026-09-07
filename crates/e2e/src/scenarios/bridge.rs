@@ -49,13 +49,16 @@ impl Default for DepositParams {
     }
 }
 
+/// # Errors
+/// Returns an error when the deposit, its L2 receipt, or the beneficiary's
+/// follow-up spend fails.
 pub async fn deposit_round_trip(t: &Target, l1: &L1, p: DepositParams) -> Result<()> {
-    let signers: Vec<DerivedSigner> = l2::dev_signers(p.beneficiary.max(p.payee) as u32 + 1)?;
+    let signers: Vec<DerivedSigner> = l2::dev_signers_through(p.beneficiary.max(p.payee))?;
     let beneficiary = &signers[p.beneficiary];
     let payee = signers[p.payee].address;
     let applied_before = t
-        .executor_metric(super::EXEC_TX_APPLIED)
-        .await
+        .executor_metric_opt(super::EXEC_TX_APPLIED)
+        .await?
         .unwrap_or(0.0);
 
     // --- L1: deposit to the beneficiary. ---------------------------------
@@ -132,6 +135,11 @@ pub struct WithdrawalParams {
 /// after posting, and `withdrawal_proof` has no caller outside tests. So a
 /// real withdrawer must reconstruct exactly this. The scenario pins down
 /// that gap.
+///
+/// # Errors
+/// Returns an error when the backing deposit, the `initiateWithdrawal`
+/// call, or its receipt fails, or when the receipt carries no
+/// `MessagePassed` log.
 pub async fn initiate_withdrawal(
     t: &Target,
     l1: &L1,
@@ -139,7 +147,7 @@ pub async fn initiate_withdrawal(
 ) -> Result<WithdrawalTicket> {
     use alloy_sol_types::SolEvent;
 
-    let signers = l2::dev_signers(p.withdrawer as u32 + 1)?;
+    let signers = l2::dev_signers_through(p.withdrawer)?;
     let withdrawer = &signers[p.withdrawer];
     // Fresh L1 recipient so the payout is unambiguous.
     let recipient = Address::from([0x5Au8; 20]);
@@ -221,6 +229,11 @@ pub async fn initiate_withdrawal(
 /// its block commits only at the next sealer boundary. Freezing on receipt
 /// strands the transaction in an uncommitted block, so it never reaches a
 /// state root, and the attester never covers it.
+///
+/// # Errors
+/// Returns an error when no attested output ever commits to the
+/// withdrawal, when `finalizeWithdrawal` fails to send or reverts, when
+/// the payout does not match, or when a replay unexpectedly succeeds.
 pub async fn finalize_withdrawal(
     l1: &L1,
     ticket: WithdrawalTicket,
@@ -236,205 +249,291 @@ pub async fn finalize_withdrawal(
     } = ticket;
 
     let oracle = WithdrawalOutputOracle::new(l1.oracle, l1.provider());
-
-    // The attester carries this withdrawal's leaf in exactly one posted
-    // output. A post pairs the arriving state root with `leaves_through`,
-    // then `mark_attested` drops those leaves (and `on_leaves` refuses to
-    // re-add them for an already-attested block). So exactly one
-    // (state_root, withdrawals_root) pair on chain can ever match. Its
-    // root is whichever root the feeder happened to deliver alongside it,
-    // which is not necessarily the root that is still head by the time
-    // this code looks.
-    //
-    // Sampling only the current head root would race: once a later block
-    // commits, the head moves off the attested root, and no future post
-    // can match. The remaining poll time would then be wasted. Instead,
-    // this code remembers every root the validator was observed at (a
-    // cheap 100 ms sample, off the poll's own cadence, so a fast block
-    // cannot slip between two samples) and tests them all. Proving
-    // against a historical root is exactly what `finalizeWithdrawal`
-    // expects: it takes `state_root` as an explicit argument.
-    let observed: std::sync::Arc<std::sync::Mutex<Vec<B256>>> = Default::default();
-    // Keep the most recent read error. A validator that died leaves its
-    // mdbx environment in an unsteady state. The resulting
-    // `MDBX_WANNA_RECOVERY` error, on the read-only open, is the signal
-    // that tells "the stack fell over" apart from "the withdrawal was
-    // never attested". The sampler owns this read, so it must carry the
-    // error out to the failure message.
-    let last_err: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
-    let sampler_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sampler = {
-        let observed = observed.clone();
-        let last_err = last_err.clone();
-        let stop = sampler_stop.clone();
-        let dir = validator_state_dir.to_path_buf();
-        std::thread::Builder::new()
-            .name("s2-root-sampler".into())
-            .spawn(move || {
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    match read_validator_state_root(&dir) {
-                        Ok(Some(r)) => {
-                            let mut seen = observed.lock().expect("observed roots poisoned");
-                            if seen.last() != Some(&r) {
-                                seen.push(r);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            *last_err.lock().expect("sampler error poisoned") =
-                                Some(format!("{e:?}"));
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            })
-            .context("spawn S2 root sampler")?
+    let finder = OutputFinder {
+        oracle: &oracle,
+        validator_state_dir,
+        withdrawals_root,
     };
-
-    let found = poll_until(
-        "an attested output committing to this withdrawal",
-        Duration::from_secs(90),
-        Duration::from_millis(500),
-        || async {
-            let count = oracle
-                .outputCount()
-                .call()
-                .await
-                .unwrap_or(U256::ZERO)
-                .to::<u64>();
-            // Newest first: the withdrawal's block is near the head.
-            for i in (0..count).rev() {
-                let idx = U256::from(i);
-                let Ok(posted) = oracle.outputRootAt(idx).call().await else {
-                    continue;
-                };
-                let roots = observed.lock().expect("observed roots poisoned").clone();
-                for root in roots.iter().rev() {
-                    let expected =
-                        kardamom_types::withdrawals::output_root(*root, withdrawals_root);
-                    if posted == expected {
-                        return Ok(Some((idx, *root)));
-                    }
-                }
-            }
-            Ok(None)
-        },
-    )
-    .await;
-    sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = sampler.join();
-    let (output_index, state_root) = found.with_context(|| {
-        let roots = observed.lock().expect("observed roots poisoned").len();
-        match last_err.lock().expect("sampler error poisoned").as_deref() {
-            // A read error means the stack fell over. It does not mean
-            // attestation is broken, so say so instead of blaming the
-            // attester.
-            Some(e) => format!(
-                "could not track the validator's state roots ({roots} sampled before the last \
-                 failure) — the validator's state DB became unreadable, which is what an unclean \
-                 validator exit looks like: {e}"
-            ),
-            None => format!(
-                "no posted output commits to (any observed validator state root, withdrawals \
-                 root) — the attester never covered the withdrawal's block ({roots} distinct \
-                 roots sampled)"
-            ),
-        }
-    })?;
+    let (output_index, state_root) = finder.find_attested_output().await?;
 
     // --- L1: finalize after the window. -----------------------------------
     l1.warp_past_window().await?;
     let wallet = l1.wallet(l1::DEPOSITOR_KEY)?;
     let lockbox = ETHLockbox::new(l1.lockbox, &wallet);
-    let wtx = ETHLockbox::WithdrawalTransaction {
-        nonce,
-        sender,
-        target: recipient,
-        value,
+    let call = FinalizeCall {
+        wtx: ETHLockbox::WithdrawalTransaction {
+            nonce,
+            sender,
+            target: recipient,
+            value,
+        },
+        output_index,
+        state_root,
+        withdrawals_root,
+        proof,
     };
-    let before = wallet
-        .get_balance(recipient)
-        .await
-        .context("recipient balance before")?;
-    let pending = lockbox
-        .finalizeWithdrawal(
-            wtx.clone(),
-            output_index,
-            state_root,
-            withdrawals_root,
-            U256::ZERO,
-            proof.clone(),
-        )
-        // Use explicit gas to skip estimation. Gas estimation is where the
-        // alloy/anvil post-warp flake in `withdrawal_e2e.rs` bites.
-        .gas(2_000_000)
-        .send()
-        .await
-        .context("send finalizeWithdrawal")?;
-    let tx_hash = *pending.tx_hash();
-    // Poll the receipt by hand instead of using alloy's watcher (same
-    // flake).
-    let receipt = poll_until(
-        "finalizeWithdrawal receipt",
-        Duration::from_secs(30),
-        Duration::from_millis(250),
-        || async { Ok(wallet.get_transaction_receipt(tx_hash).await.ok().flatten()) },
-    )
-    .await?;
-    anyhow::ensure!(
-        receipt.status(),
-        "finalizeWithdrawal reverted (tx {tx_hash}) — the lockbox escrows only DEPOSITED ETH, \
-         so a withdrawal must be backed by a prior deposit"
-    );
-    let after = wallet
-        .get_balance(recipient)
-        .await
-        .context("recipient balance after")?;
-    anyhow::ensure!(
-        after == before + value,
-        "recipient balance {before} -> {after}, expected +{value}"
-    );
+    let finalizer = WithdrawalFinalizer {
+        wallet: &wallet,
+        lockbox: &lockbox,
+        call,
+        recipient,
+    };
+    let after = finalizer.finalize_payout(value).await?;
+    finalizer.assert_replay_rejected(after).await
+}
 
-    // Replaying the same withdrawal must fail. The lockbox flags the leaf
-    // on finalize (`AlreadyFinalized`). With explicit gas there is no
-    // pre-flight estimation, so the revert appears in the receipt, not at
-    // send time. The recipient must not be paid twice.
-    let replay = lockbox
-        .finalizeWithdrawal(
-            wtx,
-            output_index,
-            state_root,
-            withdrawals_root,
-            U256::ZERO,
-            proof,
+/// The fields both [`finalize_payout`] and [`assert_replay_rejected`] send
+/// to `finalizeWithdrawal`, built once in [`finalize_withdrawal`] so the
+/// two calls cannot drift apart.
+struct FinalizeCall {
+    wtx: ETHLockbox::WithdrawalTransaction,
+    output_index: U256,
+    state_root: B256,
+    withdrawals_root: B256,
+    proof: Vec<B256>,
+}
+
+/// The most recently observed root (checked newest-first) that, paired
+/// with `withdrawals_root`, produces the output root `posted` on chain.
+fn matching_observed_root(roots: &[B256], posted: B256, withdrawals_root: B256) -> Option<B256> {
+    roots
+        .iter()
+        .rev()
+        .copied()
+        .find(|root| kardamom_types::withdrawals::output_root(*root, withdrawals_root) == posted)
+}
+
+/// State for finding the one posted output that commits to a withdrawal's
+/// leaf. Built once by [`finalize_withdrawal`], so
+/// [`Self::find_attested_output`] reads its inputs as state instead of
+/// loose parameters.
+struct OutputFinder<'a, P: Provider + Clone> {
+    oracle: &'a WithdrawalOutputOracle::WithdrawalOutputOracleInstance<P>,
+    validator_state_dir: &'a std::path::Path,
+    withdrawals_root: B256,
+}
+
+impl<P: Provider + Clone> OutputFinder<'_, P> {
+    /// Find the one posted output that commits to `withdrawals_root`, and
+    /// the validator state root it was attested against.
+    ///
+    /// The attester carries this withdrawal's leaf in exactly one posted
+    /// output. A post pairs the arriving state root with `leaves_through`,
+    /// then `mark_attested` drops those leaves (and `on_leaves` refuses to
+    /// re-add them for an already-attested block). So exactly one
+    /// (`state_root`, `withdrawals_root`) pair on chain can ever match. Its
+    /// root is whichever root the feeder happened to deliver alongside it,
+    /// which is not necessarily the root that is still head by the time
+    /// this code looks.
+    ///
+    /// Sampling only the current head root would race: once a later block
+    /// commits, the head moves off the attested root, and no future post
+    /// can match. The remaining poll time would then be wasted. Instead,
+    /// this spawns a sampler thread that remembers every root the
+    /// validator was observed at (a cheap 100 ms sample, off the poll's
+    /// own cadence, so a fast block cannot slip between two samples) and
+    /// tests them all against every posted output. Proving against a
+    /// historical root is exactly what `finalizeWithdrawal` expects: it
+    /// takes `state_root` as an explicit argument.
+    ///
+    /// # Errors
+    /// Returns an error when no posted output commits to
+    /// `withdrawals_root` within 90s. The error names how many distinct
+    /// roots were sampled, and, when the validator's state DB became
+    /// unreadable, the last read error (the signal that the stack fell
+    /// over, as opposed to attestation never covering the withdrawal).
+    async fn find_attested_output(&self) -> Result<(U256, B256)> {
+        let observed: std::sync::Arc<std::sync::Mutex<Vec<B256>>> = std::sync::Arc::default();
+        // Keep the most recent read error. A validator that died leaves its
+        // mdbx environment in an unsteady state. The resulting
+        // `MDBX_WANNA_RECOVERY` error, on the read-only open, is the signal
+        // that tells "the stack fell over" apart from "the withdrawal was
+        // never attested". The sampler owns this read, so it must carry the
+        // error out to the failure message.
+        let last_err: std::sync::Arc<std::sync::Mutex<Option<String>>> = std::sync::Arc::default();
+        let sampler_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = {
+            let observed = observed.clone();
+            let last_err = last_err.clone();
+            let stop = sampler_stop.clone();
+            let dir = self.validator_state_dir.to_path_buf();
+            std::thread::Builder::new()
+                .name("s2-root-sampler".into())
+                .spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        match read_validator_state_root(&dir) {
+                            Ok(Some(r)) => {
+                                let mut seen = observed.lock().expect("observed roots poisoned");
+                                if seen.last() != Some(&r) {
+                                    seen.push(r);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                *last_err.lock().expect("sampler error poisoned") =
+                                    Some(format!("{e:?}"));
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                })
+                .context("spawn S2 root sampler")?
+        };
+
+        let found = poll_until(
+            "an attested output committing to this withdrawal",
+            Duration::from_secs(90),
+            Duration::from_millis(500),
+            || async {
+                let count = self
+                    .oracle
+                    .outputCount()
+                    .call()
+                    .await
+                    .unwrap_or(U256::ZERO)
+                    .to::<u64>();
+                // Newest first: the withdrawal's block is near the head.
+                for i in (0..count).rev() {
+                    let idx = U256::from(i);
+                    let Ok(posted) = self.oracle.outputRootAt(idx).call().await else {
+                        continue;
+                    };
+                    let roots = observed.lock().expect("observed roots poisoned").clone();
+                    if let Some(root) =
+                        matching_observed_root(&roots, posted, self.withdrawals_root)
+                    {
+                        return Ok(Some((idx, root)));
+                    }
+                }
+                Ok(None)
+            },
         )
-        .gas(2_000_000)
-        .send()
         .await;
-    match replay {
-        Err(_) => {} // an outright rejection is also acceptable
-        Ok(pending) => {
-            let hash = *pending.tx_hash();
-            let receipt = poll_until(
-                "replay receipt",
-                Duration::from_secs(30),
-                Duration::from_millis(250),
-                || async { Ok(wallet.get_transaction_receipt(hash).await.ok().flatten()) },
-            )
-            .await?;
-            anyhow::ensure!(
-                !receipt.status(),
-                "replaying a finalized withdrawal SUCCEEDED — double-spend of the bridge escrow"
-            );
-        }
+        sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = sampler.join();
+        found.with_context(|| {
+            let roots = observed.lock().expect("observed roots poisoned").len();
+            match last_err.lock().expect("sampler error poisoned").as_deref() {
+                // A read error means the stack fell over. It does not mean
+                // attestation is broken, so say so instead of blaming the
+                // attester.
+                Some(e) => format!(
+                    "could not track the validator's state roots ({roots} sampled before the \
+                     last failure) — the validator's state DB became unreadable, which is what \
+                     an unclean validator exit looks like: {e}"
+                ),
+                None => format!(
+                    "no posted output commits to (any observed validator state root, \
+                     withdrawals root) — the attester never covered the withdrawal's block \
+                     ({roots} distinct roots sampled)"
+                ),
+            }
+        })
     }
-    let final_balance = wallet
-        .get_balance(recipient)
-        .await
-        .context("recipient balance after replay")?;
-    anyhow::ensure!(
-        final_balance == after,
-        "replay changed the recipient's balance {after} -> {final_balance}"
-    );
-    Ok(())
+}
+
+/// State for finalizing one withdrawal: the wallet and lockbox it pays
+/// out through, the call built once by [`finalize_withdrawal`], and the
+/// recipient. [`Self::finalize_payout`] and [`Self::assert_replay_rejected`]
+/// read these as state instead of loose parameters, so the two calls
+/// cannot drift apart.
+struct WithdrawalFinalizer<'a, PW: Provider + Clone, PL: Provider + Clone> {
+    wallet: &'a PW,
+    lockbox: &'a ETHLockbox::ETHLockboxInstance<PL>,
+    call: FinalizeCall,
+    recipient: Address,
+}
+
+impl<PW: Provider + Clone, PL: Provider + Clone> WithdrawalFinalizer<'_, PW, PL> {
+    /// Send `finalizeWithdrawal` and check the payout landed. Returns the
+    /// recipient's post-payout balance, for [`Self::assert_replay_rejected`]
+    /// to compare against.
+    async fn finalize_payout(&self, value: U256) -> Result<U256> {
+        let before = self
+            .wallet
+            .get_balance(self.recipient)
+            .await
+            .context("recipient balance before")?;
+        let pending = self
+            .lockbox
+            .finalizeWithdrawal(
+                self.call.wtx.clone(),
+                self.call.output_index,
+                self.call.state_root,
+                self.call.withdrawals_root,
+                U256::ZERO,
+                self.call.proof.clone(),
+            )
+            // Use explicit gas to skip estimation. Gas estimation is where
+            // the alloy/anvil post-warp flake in `withdrawal_e2e.rs`
+            // bites.
+            .gas(2_000_000)
+            .send()
+            .await
+            .context("send finalizeWithdrawal")?;
+        let tx_hash = *pending.tx_hash();
+        let receipt = l1::await_l1_receipt(self.wallet, tx_hash, "finalizeWithdrawal").await?;
+        anyhow::ensure!(
+            receipt.status(),
+            "finalizeWithdrawal reverted (tx {tx_hash}) — the lockbox escrows only DEPOSITED \
+             ETH, so a withdrawal must be backed by a prior deposit"
+        );
+        let after = self
+            .wallet
+            .get_balance(self.recipient)
+            .await
+            .context("recipient balance after")?;
+        // `before` and `value` are wallet-balance and withdrawal wire values;
+        // an overflowing expectation must fail the check, not panic or wrap.
+        let expected = before
+            .checked_add(value)
+            .context("recipient balance before + withdrawal value overflows U256")?;
+        anyhow::ensure!(
+            after == expected,
+            "recipient balance {before} -> {after}, expected +{value}"
+        );
+        Ok(after)
+    }
+
+    /// Replaying the same withdrawal must fail. The lockbox flags the leaf
+    /// on finalize (`AlreadyFinalized`). With explicit gas there is no
+    /// pre-flight estimation, so the revert appears in the receipt, not
+    /// at send time. The recipient must not be paid twice.
+    async fn assert_replay_rejected(&self, after: U256) -> Result<()> {
+        let replay = self
+            .lockbox
+            .finalizeWithdrawal(
+                self.call.wtx.clone(),
+                self.call.output_index,
+                self.call.state_root,
+                self.call.withdrawals_root,
+                U256::ZERO,
+                self.call.proof.clone(),
+            )
+            .gas(2_000_000)
+            .send()
+            .await;
+        match replay {
+            Err(_) => {} // an outright rejection is also acceptable
+            Ok(pending) => {
+                let hash = *pending.tx_hash();
+                let receipt = l1::await_l1_receipt(self.wallet, hash, "replay").await?;
+                anyhow::ensure!(
+                    !receipt.status(),
+                    "replaying a finalized withdrawal SUCCEEDED — double-spend of the bridge \
+                     escrow"
+                );
+            }
+        }
+        let final_balance = self
+            .wallet
+            .get_balance(self.recipient)
+            .await
+            .context("recipient balance after replay")?;
+        anyhow::ensure!(
+            final_balance == after,
+            "replay changed the recipient's balance {after} -> {final_balance}"
+        );
+        Ok(())
+    }
 }

@@ -11,7 +11,7 @@ pub const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD000
 /// The L2 minter authorized on the lockbox. These scenarios do not use
 /// this account, since they exercise the deposit and withdraw paths, not
 /// minter-gated calls.
-pub const L2_MINTER: Address = address!("00000000000000000000000000000000000000BE");
+pub(super) const L2_MINTER: Address = address!("00000000000000000000000000000000000000BE");
 
 /// Anvil dev account #0: the oracle's attester (and the account
 /// prefunded by `chains/dev-withdrawals.toml` on L2).

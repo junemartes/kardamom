@@ -65,6 +65,14 @@ pub struct VerifiedL1 {
 
 impl VerifiedL1 {
     /// Bind on an ephemeral port and proxy to `upstream` (anvil).
+    ///
+    /// # Errors
+    /// Returns an error when the ephemeral port fails to bind or the
+    /// client cannot connect to `upstream`.
+    ///
+    /// # Panics
+    /// The spawned connection task panics if the fault mutex is poisoned
+    /// (a prior handler panicked while holding the lock).
     pub async fn spawn(upstream: &str) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -120,15 +128,21 @@ impl VerifiedL1 {
         })
     }
 
+    #[must_use]
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
     }
 
     /// Start lying (or stop). Takes effect on the next request.
+    ///
+    /// # Panics
+    /// Panics when the fault mutex is poisoned (a prior handler panicked
+    /// while holding the lock).
     pub fn set_fault(&self, f: Fault) {
         *self.fault.lock().unwrap() = f;
     }
 
+    #[must_use]
     pub fn served(&self) -> u64 {
         self.served.load(Ordering::Relaxed)
     }
@@ -156,7 +170,12 @@ async fn read_http_request(sock: &mut tokio::net::TcpStream) -> Result<Option<Ve
         .and_then(|s| s.split("\r\n").next())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    while buf.len() < header_end + len {
+    // `len` comes from the wire Content-Length header; a bad or hostile
+    // value must fail the request, not overflow the bound below.
+    let target_len = header_end
+        .checked_add(len)
+        .context("Content-Length header overflows the buffer size")?;
+    while buf.len() < target_len {
         let n = sock.read(&mut chunk).await?;
         if n == 0 {
             break;
@@ -174,7 +193,7 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 async fn handle(client: &HttpClient, body: &[u8], fault: Fault) -> serde_json::Value {
     let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return rpc_error(serde_json::Value::Null, &format!("bad request: {e}")),
+        Err(e) => return rpc_error(&serde_json::Value::Null, &format!("bad request: {e}")),
     };
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -197,7 +216,7 @@ async fn handle(client: &HttpClient, body: &[u8], fault: Fault) -> serde_json::V
     let upstream: Result<serde_json::Value, _> = client.request(method, rpc_args).await;
     let mut result = match upstream {
         Ok(v) => v,
-        Err(e) => return rpc_error(id, &format!("upstream: {e}")),
+        Err(e) => return rpc_error(&id, &format!("upstream: {e}")),
     };
 
     apply_fault(method, &params, &mut result, fault);
@@ -212,7 +231,6 @@ fn apply_fault(
     fault: Fault,
 ) {
     match fault {
-        Fault::None => {}
         Fault::SwallowLogs if method == "eth_getLogs" => {
             *result = serde_json::Value::Array(vec![]);
         }
@@ -247,7 +265,7 @@ fn block_at_or_after(
         .is_some_and(|n| n >= from_block)
 }
 
-fn rpc_error(id: serde_json::Value, msg: &str) -> serde_json::Value {
+fn rpc_error(id: &serde_json::Value, msg: &str) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -258,6 +276,10 @@ fn rpc_error(id: serde_json::Value, msg: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One `faults_actually_mutate_the_proxied_reply` case: a fault paired
+    /// with the check that proves it corrupted the reply.
+    type Check = fn(&serde_json::Value, &serde_json::Value);
 
     /// The mock must actually corrupt what it proxies. Without this check,
     /// a green fault-injection scenario would only prove that nothing
@@ -271,48 +293,39 @@ mod tests {
             "parentHash": format!("0x{}", "22".repeat(32)),
         });
 
-        let mut r = block.clone();
-        apply_fault("eth_getBlockByNumber", &[], &mut r, Fault::None);
-        assert_eq!(r, block, "None must pass through untouched");
-
-        let mut r = block.clone();
-        apply_fault(
-            "eth_getBlockByNumber",
-            &[],
-            &mut r,
-            Fault::WrongBlockHash { from_block: 0x10 },
-        );
-        assert_ne!(
-            r["hash"], block["hash"],
-            "hash must be corrupted at the threshold"
-        );
-
-        // Below the threshold, nothing changes. This lets a test arm a
-        // fault without invalidating epochs already verified.
-        let mut r = block.clone();
-        apply_fault(
-            "eth_getBlockByNumber",
-            &[],
-            &mut r,
-            Fault::WrongBlockHash { from_block: 0x11 },
-        );
-        assert_eq!(r, block, "below the threshold must pass through");
-
-        let mut r = block.clone();
-        apply_fault(
-            "eth_getBlockByNumber",
-            &[],
-            &mut r,
-            Fault::BrokenParentChain { from_block: 0x10 },
-        );
-        assert_eq!(
-            r["hash"], block["hash"],
-            "the block's OWN hash stays correct"
-        );
-        assert_ne!(
-            r["parentHash"], block["parentHash"],
-            "only ancestry is a lie"
-        );
+        // (fault, check) rows: one `apply_fault` call each, against the
+        // same block, checked by its own function.
+        let cases: [(Fault, Check); 4] = [
+            (Fault::None, |r, block| {
+                assert_eq!(r, block, "None must pass through untouched");
+            }),
+            (Fault::WrongBlockHash { from_block: 0x10 }, |r, block| {
+                assert_ne!(
+                    r["hash"], block["hash"],
+                    "hash must be corrupted at the threshold"
+                );
+            }),
+            // Below the threshold, nothing changes. This lets a test arm a
+            // fault without invalidating epochs already verified.
+            (Fault::WrongBlockHash { from_block: 0x11 }, |r, block| {
+                assert_eq!(r, block, "below the threshold must pass through");
+            }),
+            (Fault::BrokenParentChain { from_block: 0x10 }, |r, block| {
+                assert_eq!(
+                    r["hash"], block["hash"],
+                    "the block's OWN hash stays correct"
+                );
+                assert_ne!(
+                    r["parentHash"], block["parentHash"],
+                    "only ancestry is a lie"
+                );
+            }),
+        ];
+        for (fault, check) in cases {
+            let mut r = block.clone();
+            apply_fault("eth_getBlockByNumber", &[], &mut r, fault);
+            check(&r, &block);
+        }
 
         let mut logs = serde_json::json!([{ "address": "0xabc" }]);
         apply_fault("eth_getLogs", &[], &mut logs, Fault::SwallowLogs);

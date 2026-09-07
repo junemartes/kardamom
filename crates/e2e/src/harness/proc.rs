@@ -30,6 +30,10 @@ impl Proc {
     /// interruption would strand a media driver, a sealer JVM, and four
     /// services. They would then compete for CPU and Aeron resources, and
     /// the next run would fail at bring-up looking like a flake.
+    ///
+    /// # Errors
+    /// Returns an error when the log file cannot be created, or when
+    /// spawning the child process fails.
     pub fn spawn(name: &str, mut cmd: Command, log_path: PathBuf) -> Result<Self> {
         let log = std::fs::File::create(&log_path)
             .with_context(|| format!("create log file {}", log_path.display()))?;
@@ -71,11 +75,6 @@ impl Proc {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// The process id (for diagnostics).
-    pub fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
     /// Send SIGKILL, then reap the process. Safe to call more than once.
     pub fn kill(&mut self) {
         let _ = self.child.kill();
@@ -91,6 +90,11 @@ impl Proc {
         }
         #[cfg(unix)]
         unsafe {
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "Linux bounds pid_t well under i32::MAX (the default \
+                           /proc/sys/kernel/pid_max is 4_194_304), so this never wraps"
+            )]
             libc::kill(self.child.id() as i32, libc::SIGTERM);
         }
         let deadline = Instant::now() + grace;
@@ -110,14 +114,22 @@ impl Proc {
     pub fn suspend(&self) {
         #[cfg(unix)]
         unsafe {
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "see the pid_t bound noted in terminate"
+            )]
             libc::kill(self.child.id() as i32, libc::SIGSTOP);
         }
     }
 
     /// Send SIGCONT to resume a suspended process.
-    pub fn resume(&self) {
+    pub(crate) fn resume(&self) {
         #[cfg(unix)]
         unsafe {
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "see the pid_t bound noted in terminate"
+            )]
             libc::kill(self.child.id() as i32, libc::SIGCONT);
         }
     }
@@ -142,6 +154,7 @@ impl Proc {
     }
 
     /// Last `n` lines of the process log (best-effort, for failure dumps).
+    #[must_use]
     pub fn log_tail(&self, n: usize) -> String {
         match std::fs::read_to_string(&self.log_path) {
             Ok(s) => {
@@ -164,7 +177,11 @@ impl Drop for Proc {
 /// Also fails fast if `proc` exits first. A component that dies during
 /// startup should fail the bring-up right away, with its log tail, not
 /// after a timeout.
-pub fn wait_for_log_line(proc: &mut Proc, needle: &str, timeout: Duration) -> Result<()> {
+///
+/// # Errors
+/// Returns an error when `proc` exits before logging `needle`, or when
+/// `timeout` passes first.
+pub(crate) fn wait_for_log_line(proc: &mut Proc, needle: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(s) = std::fs::read_to_string(&proc.log_path)
@@ -191,7 +208,11 @@ pub fn wait_for_log_line(proc: &mut Proc, needle: &str, timeout: Duration) -> Re
 }
 
 /// Poll until `path` exists (media-driver readiness files).
-pub fn wait_for_file(proc: &mut Proc, path: &Path, timeout: Duration) -> Result<()> {
+///
+/// # Errors
+/// Returns an error when `proc` exits before `path` appears, or when
+/// `timeout` passes first.
+pub(crate) fn wait_for_file(proc: &mut Proc, path: &Path, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         if path.exists() {
@@ -216,17 +237,73 @@ pub fn wait_for_file(proc: &mut Proc, path: &Path, timeout: Duration) -> Result<
     }
 }
 
+/// A path checked, once, to exist and be a regular file.
+///
+/// Several lookups across the harness (jar files, the genesis TOML) ran
+/// the same `ensure!(path.is_file(), ...)` check right before use. This
+/// type moves that check to one constructor, so a caller that holds an
+/// `ExistingFile` never has to check again.
+pub struct ExistingFile(PathBuf);
+
+impl ExistingFile {
+    /// Check that `path` exists and is a regular file. `hint` names what
+    /// to do when it is missing (a command to run, or an env var to set).
+    ///
+    /// # Errors
+    /// Returns an error naming `path` and `hint` when `path` is not a file.
+    pub(crate) fn new(path: PathBuf, hint: &str) -> Result<Self> {
+        anyhow::ensure!(path.is_file(), "{} not found — {hint}", path.display());
+        Ok(Self(path))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// Find a build artifact: use the path in the environment variable `var`
+/// if it is set, else fall back to `fallback`. Either way, the result
+/// must be an existing file. `hint` names what to do when the fallback
+/// path is missing (a command to run).
+///
+/// # Errors
+/// Returns an error when neither location holds a file.
+pub(crate) fn resolve_artifact(var: &str, fallback: PathBuf, hint: &str) -> Result<ExistingFile> {
+    if let Ok(p) = std::env::var(var) {
+        return ExistingFile::new(PathBuf::from(p), &format!("set via {var}"));
+    }
+    ExistingFile::new(fallback, hint)
+}
+
+impl AsRef<Path> for ExistingFile {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for ExistingFile {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_ref()
+    }
+}
+
+impl std::fmt::Display for ExistingFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
+}
+
 /// Reserve a free TCP port on loopback. The listener drops before this
 /// function returns, so there is a small reuse race. This is fine for
 /// tests, since the OS cycles ephemeral ports instead of reissuing the
 /// same one right away.
-pub fn free_tcp_port() -> Result<u16> {
+pub(crate) fn free_tcp_port() -> Result<u16> {
     let l = std::net::TcpListener::bind("127.0.0.1:0").context("reserve tcp port")?;
     Ok(l.local_addr()?.port())
 }
 
 /// Reserve a free UDP port on loopback (same caveat as [`free_tcp_port`]).
-pub fn free_udp_port() -> Result<u16> {
+pub(crate) fn free_udp_port() -> Result<u16> {
     let s = std::net::UdpSocket::bind("127.0.0.1:0").context("reserve udp port")?;
     Ok(s.local_addr()?.port())
 }

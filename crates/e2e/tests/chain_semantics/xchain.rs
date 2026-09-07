@@ -2,6 +2,38 @@
 // MockInteropFeed as the simulated origin chain. Included from main.rs (see
 // the header there); shared helpers live in main.rs.
 
+/// Everything a `DevInterop`-based test needs to run `xchain::delivery`:
+/// the target, the executor's state dir, a scripted origin feed, the
+/// watcher's cursor file, and the spawned interop watcher (first boot: no
+/// cursor file yet, seeded at 0).
+struct InteropRig {
+    t: e2e::scenarios::Target,
+    exec_dir: std::path::PathBuf,
+    feed: kardamom_da_watcher::interop::mock::MockInteropFeed,
+    cursor_file: std::path::PathBuf,
+    watcher: e2e::harness::services::Spawned,
+}
+
+async fn interop_rig(stack: &LocalStack) -> InteropRig {
+    use e2e::scenarios::xchain;
+    use kardamom_da_watcher::interop::mock::MockInteropFeed;
+
+    let t = target(stack);
+    let exec_dir = stack.executor_state_dir().expect("executor state dir");
+    let feed = MockInteropFeed::new(xchain::ORIGIN_CHAIN_ID).await;
+    let cursor_file = stack.root().join("interop-pair.cursor");
+    let watcher = stack
+        .spawn_interop_watcher(xchain::ORIGIN_CHAIN_ID, &feed.url(), &cursor_file)
+        .expect("spawn interop watcher");
+    InteropRig {
+        t,
+        exec_dir,
+        feed,
+        cursor_file,
+        watcher,
+    }
+}
+
 /// S12: the full destination pipeline — the kardamom-da-watcher BINARY in
 /// interop mode against a scripted origin feed, sequencer relay, sealer
 /// per-peer origin advance, 0x7D execution through the genesis-seeded Inbox —
@@ -11,17 +43,13 @@
 /// stack's L1 path is simply absent.
 ///
 /// The stack ALSO runs a validator in the DEPLOYED configuration
-/// (`--parallel-validation`), and its verdict is load-bearing: before this
-/// slice, the whole-block path had no `BufferedRecord::XChain` arm and a
-/// validator here would have fail-stopped on the first delivery — which S12
-/// never noticed, because its stack ran no validator at all. Now every
+/// (`--parallel-validation`), and its verdict is load-bearing: every
 /// interop block must clear the seeded-parallel claim checks and the
 /// write-set/receipt cross-checks, divergence-free.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s12_xchain_delivery() {
     use e2e::scenarios::xchain;
-    use kardamom_da_watcher::interop::mock::MockInteropFeed;
 
     let stack = LocalStack::launch(StackConfig {
         genesis: e2e::harness::Genesis::DevInterop,
@@ -31,18 +59,7 @@ async fn s12_xchain_delivery() {
     })
     .await
     .expect("stack");
-    let t = target(&stack);
-    let exec_dir = stack.executor_state_dir().expect("executor state dir");
-
-    // The simulated origin chain: a real jsonrpsee WS server speaking the
-    // real outbox-feed protocol, scripted by the test.
-    let feed = MockInteropFeed::new(xchain::ORIGIN_CHAIN_ID).await;
-
-    // The real watcher binary, first boot: no cursor file yet, seeded at 0.
-    let cursor_file = stack.root().join("interop-pair.cursor");
-    let mut watcher = stack
-        .spawn_interop_watcher(xchain::ORIGIN_CHAIN_ID, &feed.url(), &cursor_file)
-        .expect("spawn interop watcher");
+    let InteropRig { t, exec_dir, feed, cursor_file, mut watcher } = interop_rig(&stack).await;
 
     let outcome = xchain::delivery(&t, &feed, &exec_dir, &cursor_file, watcher.metrics_addr)
         .await
@@ -63,7 +80,7 @@ async fn s12_xchain_delivery() {
         .expect("S12 final validator verdict");
 }
 
-/// S14: TWO real LocalStacks, cross-chain both ways, no mock anywhere — the
+/// S14: TWO real `LocalStack`s, cross-chain both ways, no mock anywhere — the
 /// egress-E1 acceptance. Chain A (412346) and chain B (412347, patched
 /// genesis) each run the full stack plus a `--parallel-validation
 /// --serve-feed` validator; B's interop watcher subscribes to A's VALIDATOR
@@ -83,7 +100,7 @@ async fn s14_xchain_two_stacks() {
     let started = std::time::Instant::now();
     let interop_stack = |chain_id: u64| StackConfig {
         genesis: e2e::harness::Genesis::DevInterop,
-        chain_id,
+        chain_id: std::num::NonZeroU64::new(chain_id).expect("chain id must be nonzero"),
         validator: true,
         validator_parallel: true,
         validator_serve_feed: true,
@@ -92,7 +109,7 @@ async fn s14_xchain_two_stacks() {
     // Brought up one after the other: two stacks are 4 JVMs + 10 service
     // processes, and racing both bring-ups doubles the peak load for no
     // scenario value.
-    let stack_a = LocalStack::launch(interop_stack(e2e::harness::DEV_CHAIN_ID))
+    let stack_a = LocalStack::launch(interop_stack(e2e::harness::DEV_CHAIN_ID.get()))
         .await
         .expect("stack A");
     let stack_b = LocalStack::launch(interop_stack(CHAIN_B_ID))
@@ -109,7 +126,7 @@ async fn s14_xchain_two_stacks() {
     let a_feed_url = stack_a.validator_feed_url().await.expect("A feed url");
     let b_cursor = stack_b.root().join("lane-from-a.cursor");
     let _watcher_on_b = stack_b
-        .spawn_interop_watcher(e2e::harness::DEV_CHAIN_ID, &a_feed_url, &b_cursor)
+        .spawn_interop_watcher(e2e::harness::DEV_CHAIN_ID.get(), &a_feed_url, &b_cursor)
         .expect("spawn B's watcher of A");
 
     // Leg 1: user tx on A -> Outbox -> A validator extract/serve -> B
@@ -117,7 +134,7 @@ async fn s14_xchain_two_stacks() {
     let outcome = xchain_two_stacks::forward_leg(
         &a,
         &b,
-        e2e::harness::DEV_CHAIN_ID,
+        e2e::harness::DEV_CHAIN_ID.get(),
         &b_exec_dir,
         &b_cursor,
     )
@@ -131,7 +148,7 @@ async fn s14_xchain_two_stacks() {
     let _watcher_on_a = stack_a
         .spawn_interop_watcher(CHAIN_B_ID, &b_feed_url, &a_cursor)
         .expect("spawn A's watcher of B");
-    xchain_two_stacks::callback_leg(&a, &b, e2e::harness::DEV_CHAIN_ID, &a_exec_dir, &a_cursor, outcome)
+    xchain_two_stacks::callback_leg(&a, &b, e2e::harness::DEV_CHAIN_ID.get(), &a_exec_dir, &a_cursor, outcome)
         .await
         .expect("S14 callback leg");
     eprintln!("S14: round trip done at {:?}", started.elapsed());
@@ -149,7 +166,7 @@ async fn s14_xchain_two_stacks() {
 }
 
 /// S13: the interop chain rebuilt from its OWN DA (spec §16 Q8). The S12
-/// delivery flow runs unchanged on a DevInterop stack that also carries the
+/// delivery flow runs unchanged on a `DevInterop` stack that also carries the
 /// anvil L1 (the S8 DA-posting idiom); the canonical blocks — remote-epoch
 /// records attached to the block each one led — are recovered from the
 /// pipeline's own receipts, posted to L1 as real EIP-4844 blobs, and
@@ -160,21 +177,13 @@ async fn s14_xchain_two_stacks() {
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13_xchain_da_parity() {
     use e2e::scenarios::{da_parity, xchain, xchain_da_parity};
-    use kardamom_da_watcher::interop::mock::MockInteropFeed;
 
     let mut stack = launch_l1_or_skip!(StackConfig {
         l1: true,
         genesis: e2e::harness::Genesis::DevInterop,
         ..StackConfig::default()
     });
-    let t = target(&stack);
-    let exec_dir = stack.executor_state_dir().expect("executor state dir");
-
-    let feed = MockInteropFeed::new(xchain::ORIGIN_CHAIN_ID).await;
-    let cursor_file = stack.root().join("interop-pair.cursor");
-    let mut watcher = stack
-        .spawn_interop_watcher(xchain::ORIGIN_CHAIN_ID, &feed.url(), &cursor_file)
-        .expect("spawn interop watcher");
+    let InteropRig { t, exec_dir, feed, cursor_file, mut watcher } = interop_rig(&stack).await;
 
     // 1. The S12 delivery flow, unchanged — every layer's evidence asserted.
     let outcome = xchain::delivery(&t, &feed, &exec_dir, &cursor_file, watcher.metrics_addr)
@@ -218,14 +227,7 @@ async fn s13_xchain_da_parity() {
     //    `--expect-root` gate plus its non-vacuity control (S8's machinery,
     //    reused verbatim).
     let l1 = stack.l1().expect("l1");
-    let da_dir = tempfile::tempdir().expect("da dir");
-    let da_store = kardamom_batcher::da_store::FsBlobStore::open(da_dir.path()).expect("da store");
-    da_parity::post_to_l1(l1, l1.settlement, &canonical.blocks, &da_store)
-        .await
-        .expect("S13 post to L1");
-    da_parity::assert_batches_on_l1(l1, l1.settlement, canonical.blocks.len(), &da_store)
-        .await
-        .expect("S13 L1 batch log");
+    let da_dir = post_and_verify_da(l1, &canonical.blocks, "S13").await;
     let recon_dir = tempfile::tempdir().expect("recon dir");
     let genesis = e2e::harness::services::repo_root().join("chains/dev-interop.toml");
     if let Err(e) = da_parity::reconstruct_and_compare(
@@ -255,7 +257,7 @@ async fn s13_xchain_da_parity() {
         }
         match xchain_da_parity::state_diff(recon_dir.path(), &exec_dir) {
             Ok(diffs) if diffs.is_empty() => {
-                eprintln!("S13 deep_compare: no table diffs (?)")
+                eprintln!("S13 deep_compare: no table diffs (?)");
             }
             Ok(diffs) => {
                 eprintln!("S13 deep_compare (reconstructed vs live executor):");
