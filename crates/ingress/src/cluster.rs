@@ -88,6 +88,10 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
 /// Connects to the cluster and wraps its egress as a
 /// [`ClusterWatermarkObserver`]. Keep the returned [`LiveCluster`] guard
 /// alive for as long as the observer is polled.
+///
+/// # Errors
+///
+/// Returns `LiveError` if the cluster connection fails.
 pub fn cluster_watermark_observer(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
@@ -109,8 +113,9 @@ mod tests {
     /// A valid relayed-record egress frame at canonical `index`. The
     /// payload is a real `TxRef`, so `decode_egress` can parse it.
     fn record(index: u64, off: i32) -> Vec<u8> {
+        let byte = u8::try_from(off).expect("test offsets fit in a u8");
         let r = TxRef::new(
-            B256::repeat_byte(off as u8),
+            B256::repeat_byte(byte),
             0,
             BPosition {
                 term_id: 0,

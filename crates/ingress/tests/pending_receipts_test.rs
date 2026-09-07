@@ -2,14 +2,13 @@
 //! channel, the proxy must time out the client after
 //! `pending_receipt_timeout`.
 
-mod common;
-
 use std::time::Duration;
 
 use alloy_signer_local::PrivateKeySigner;
 
 use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::error::IngressError;
+use kardamom_ingress::test_support::sign_legacy;
 use kardamom_ingress::{IngressProxy, MockChannels};
 
 #[tokio::test]
@@ -23,7 +22,7 @@ async fn submit_times_out_when_no_executor_responds() {
     let proxy = IngressProxy::new(cfg, mock.clone(), mock);
 
     let signer = PrivateKeySigner::random();
-    let raw = common::sign_legacy(&signer, 0);
+    let raw = sign_legacy(&signer, 0);
     let res = proxy.submit_raw("127.0.0.1".parse().unwrap(), raw).await;
     assert!(matches!(res.unwrap_err(), IngressError::Timeout));
 }

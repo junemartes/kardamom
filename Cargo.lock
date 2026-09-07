@@ -3974,6 +3974,7 @@ dependencies = [
  "jsonrpsee",
  "k256",
  "kardamom-cluster-adapter",
+ "kardamom-ingress",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-types",

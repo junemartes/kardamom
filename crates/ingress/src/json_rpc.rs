@@ -2,7 +2,7 @@
 //!
 //! The method set is the minimal v0 Ethereum subset:
 //! - `eth_chainId`.
-//! - `eth_blockNumber`, served from the tx_receipts `BlockBoundary`
+//! - `eth_blockNumber`, served from the `tx_receipts` `BlockBoundary`
 //!   watcher in the proxy.
 //! - `eth_sendRawTransaction`.
 //! - `eth_getTransactionReceipt`, a state-DB `tx_hash_index` lookup.
@@ -15,17 +15,30 @@ use alloy_primitives::{Address, B256, Bytes, Log, LogData, U256};
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionReceipt};
 use jsonrpsee::core::{RpcResult, SubscriptionResult};
 use jsonrpsee::proc_macros::rpc;
-use jsonrpsee::server::{PendingSubscriptionSink, Server, ServerHandle};
+use jsonrpsee::server::{PendingSubscriptionSink, Server, ServerHandle, SubscriptionSink};
 use jsonrpsee::types::ErrorObjectOwned;
 use tokio::sync::broadcast;
 
-use crate::channels::{IngressPublication, IngressSubscription};
+use crate::channels::{IngressPublication, IngressSubscription, ProxyBackend};
 use crate::error::IngressError;
 use crate::proxy::IngressProxy;
+use kardamom_types::{Receipt, TxError};
 
 tokio::task_local! {
     /// Set by the HTTP middleware for the lifetime of each request.
     pub(crate) static PEER_ADDR: std::cell::Cell<Option<IpAddr>>;
+}
+
+/// Reads the request's peer IP from the [`PEER_ADDR`] task-local, set by
+/// [`peer_addr_layer`], falling back to loopback if unset — for example
+/// in unit tests that use a custom transport with no peer-addr
+/// middleware.
+fn client_ip() -> IpAddr {
+    PEER_ADDR
+        .try_with(std::cell::Cell::get)
+        .ok()
+        .flatten()
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
 #[rpc(server, namespace = "eth")]
@@ -58,7 +71,7 @@ pub trait IngressEthApi {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ReceiptEvent {
-    /// A tx executed, and its enriched receipt was observed on tx_receipts.
+    /// A tx executed, and its enriched receipt was observed on `tx_receipts`.
     #[serde(rename_all = "camelCase")]
     Receipt { receipt: Box<TransactionReceipt> },
     /// The sequencer rejected the tx.
@@ -81,7 +94,7 @@ pub enum ReceiptEvent {
 /// can be in flight over a single connection.
 #[rpc(server, namespace = "kardamom")]
 pub trait IngressKardamomApi {
-    /// Fast-ack submission. Validates, publishes to tx_data, and returns
+    /// Fast-ack submission. Validates, publishes to `tx_data`, and returns
     /// the canonical tx hash right away. The client observes delivery
     /// through `kardamom_subscribeReceipts` or
     /// `eth_getTransactionReceipt`.
@@ -95,37 +108,24 @@ pub trait IngressKardamomApi {
     async fn subscribe_receipts(&self, senders: Option<Vec<Address>>) -> SubscriptionResult;
 }
 
-pub struct IngressHandlers<P, S>
-where
-    P: IngressPublication + Clone + 'static,
-    S: IngressSubscription + Clone + 'static,
-{
-    proxy: IngressProxy<P, S>,
+pub(crate) struct IngressHandlers<Backend: ProxyBackend> {
+    proxy: IngressProxy<Backend::Pub, Backend::Sub>,
 }
 
-impl<P, S> IngressHandlers<P, S>
-where
-    P: IngressPublication + Clone + 'static,
-    S: IngressSubscription + Clone + 'static,
-{
-    pub fn new(proxy: IngressProxy<P, S>) -> Self {
+impl<Backend: ProxyBackend> IngressHandlers<Backend> {
+    #[must_use]
+    pub(crate) fn new(proxy: IngressProxy<Backend::Pub, Backend::Sub>) -> Self {
         Self { proxy }
     }
 }
 
 #[async_trait::async_trait]
-impl<P, S> IngressEthApiServer for IngressHandlers<P, S>
-where
-    P: IngressPublication + Clone + 'static,
-    S: IngressSubscription + Clone + 'static,
-{
+impl<Backend: ProxyBackend> IngressEthApiServer for IngressHandlers<Backend> {
     async fn chain_id(&self) -> RpcResult<U256> {
         Ok(U256::from(self.proxy.config().chain_id))
     }
 
     async fn block_number(&self) -> RpcResult<U256> {
-        // The proxy's tx_receipts watcher, spawned in `IngressProxy::new`,
-        // maintains `latest_block_number: AtomicU64`.
         Ok(U256::from(self.proxy.latest_block_number()))
     }
 
@@ -142,14 +142,9 @@ where
     }
 
     async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256> {
-        let client_ip = PEER_ADDR
-            .try_with(|c| c.get())
-            .ok()
-            .flatten()
-            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let res = self
             .proxy
-            .submit_raw(client_ip, bytes)
+            .submit_raw(client_ip(), bytes)
             .await
             .map_err(ErrorObjectOwned::from)?;
         Ok(res.receipt.tx_hash)
@@ -160,24 +155,18 @@ where
         // off the tx_receipts stream, since the ingress holds no state
         // DB. Returns `null`, by JSON-RPC convention, if not yet
         // committed.
-        Ok(self.proxy.lookup_receipt_by_hash(hash).map(receipt_to_rpc))
+        Ok(self
+            .proxy
+            .lookup_receipt_by_hash(hash)
+            .map(|r| RpcReceipt::from(&r).0))
     }
 }
 
 #[async_trait::async_trait]
-impl<P, S> IngressKardamomApiServer for IngressHandlers<P, S>
-where
-    P: IngressPublication + Clone + 'static,
-    S: IngressSubscription + Clone + 'static,
-{
+impl<Backend: ProxyBackend> IngressKardamomApiServer for IngressHandlers<Backend> {
     async fn send_raw_transaction_async(&self, bytes: Bytes) -> RpcResult<B256> {
-        let client_ip = PEER_ADDR
-            .try_with(|c| c.get())
-            .ok()
-            .flatten()
-            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         self.proxy
-            .submit_raw_async(client_ip, bytes)
+            .submit_raw_async(client_ip(), bytes)
             .await
             .map_err(ErrorObjectOwned::from)
     }
@@ -189,33 +178,82 @@ where
     ) -> SubscriptionResult {
         // This taps the feeds before accepting, so nothing published in
         // between is missed.
-        let mut receipts = self.proxy.subscribe_receipt_feed();
-        let mut errors = self.proxy.subscribe_tx_error_feed();
+        let receipts = self.proxy.subscribe_receipt_feed();
+        let errors = self.proxy.subscribe_tx_error_feed();
         let sink = pending.accept().await?;
-        let filter: Option<std::collections::HashSet<Address>> = senders
-            .filter(|s| !s.is_empty())
-            .map(|s| s.into_iter().collect());
+        let filter = SenderFilter(
+            senders
+                .filter(|s| !s.is_empty())
+                .map(|s| s.into_iter().collect()),
+        );
+        ReceiptSubscription {
+            receipts,
+            errors,
+            filter,
+            sink,
+        }
+        .run()
+        .await?;
+        Ok(())
+    }
+}
 
+/// A sender allow-list for `kardamom_subscribeReceipts`. `None` streams
+/// every sender.
+struct SenderFilter(Option<std::collections::HashSet<Address>>);
+
+impl SenderFilter {
+    fn allows(&self, addr: Address) -> bool {
+        self.0.as_ref().is_none_or(|f| f.contains(&addr))
+    }
+}
+
+/// Owns one `kardamom_subscribeReceipts` session end to end: the two
+/// upstream feeds, the sender filter, and the sink the events go out on.
+struct ReceiptSubscription {
+    receipts: broadcast::Receiver<Receipt>,
+    errors: broadcast::Receiver<TxError>,
+    filter: SenderFilter,
+    sink: SubscriptionSink,
+}
+
+impl ReceiptSubscription {
+    /// Forwards events to the sink until the sink closes, a feed
+    /// disconnects, or the subscriber goes away.
+    async fn run(mut self) -> Result<(), String> {
+        while let Some(event) = self.next_event().await {
+            if !self.send_event(&event).await? {
+                break; // The subscriber went away.
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits for the next receipt or tx-error frame, applying the
+    /// filter, or a lag marker if either feed fell behind. Returns
+    /// `None` once the sink closes or a feed disconnects, which ends the
+    /// subscription.
+    async fn next_event(&mut self) -> Option<ReceiptEvent> {
         loop {
             let event = tokio::select! {
-                () = sink.closed() => break,
-                r = receipts.recv() => match r {
+                () = self.sink.closed() => return None,
+                r = self.receipts.recv() => match r {
                     Ok(rcpt) => {
-                        if filter.as_ref().is_some_and(|f| !f.contains(&rcpt.from)) {
+                        if !self.filter.allows(rcpt.from) {
                             continue;
                         }
                         ReceiptEvent::Receipt {
-                            receipt: Box::new(receipt_to_rpc(rcpt)),
+                            receipt: Box::new(RpcReceipt::from(&rcpt).0),
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         ReceiptEvent::Lagged { skipped: n }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 },
-                e = errors.recv() => match e {
+                e = self.errors.recv() => match e {
                     Ok(err) => {
-                        if filter.as_ref().is_some_and(|f| !f.contains(&err.sender)) {
+                        if !self.filter.allows(err.sender) {
                             continue;
                         }
                         let (reason, expected_nonce) = describe_tx_error(&err.reason);
@@ -229,16 +267,20 @@ where
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         ReceiptEvent::Lagged { skipped: n }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 },
             };
-            let msg = serde_json::value::to_raw_value(&event)
-                .map_err(|e| format!("serialize subscription event: {e}"))?;
-            if sink.send(msg).await.is_err() {
-                break; // The subscriber went away.
-            }
+            return Some(event);
         }
-        Ok(())
+    }
+
+    /// Serializes and sends one event to the subscriber. Returns
+    /// `Ok(false)` if the subscriber went away, so the caller ends the
+    /// loop instead of treating a closed sink as an error.
+    async fn send_event(&self, event: &ReceiptEvent) -> Result<bool, String> {
+        let msg = serde_json::value::to_raw_value(event)
+            .map_err(|e| format!("serialize subscription event: {e}"))?;
+        Ok(self.sink.send(msg).await.is_ok())
     }
 }
 
@@ -259,71 +301,81 @@ fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<
 /// Adapts the internal `kardamom_types::Receipt` to alloy's
 /// `TransactionReceipt`. The internal type carries the canonical
 /// B-position and `write_set_hash`, which the public Eth API does not
-/// need. The executor now populates everything else at execution time,
-/// and ingress only reshapes the fields.
+/// need. The executor populates the fields; ingress only reshapes them.
 ///
 /// `block_hash` stays `None` in v0. The slim `BlockBoundary` has no
 /// state commitment, so there is no meaningful hash to return. JSON-RPC
 /// allows `null` here.
-fn receipt_to_rpc(r: kardamom_types::Receipt) -> TransactionReceipt {
-    let block_number = r.block_number;
-    let logs: Vec<alloy_rpc_types_eth::Log> = r
-        .logs
-        .into_iter()
-        .enumerate()
-        .map(|(log_index, wl)| alloy_rpc_types_eth::Log {
-            inner: Log {
-                address: wl.address,
-                data: LogData::new_unchecked(
-                    wl.topics,
-                    alloy_primitives::Bytes::copy_from_slice(wl.data.as_ref()),
-                ),
+///
+/// A thin newtype, rather than a bare `TransactionReceipt`, because
+/// `kardamom_types::Receipt` and `alloy_rpc_types_eth::TransactionReceipt`
+/// are both foreign to this crate: the orphan rule blocks `impl
+/// From<&Receipt> for TransactionReceipt` directly, but allows it for a
+/// local wrapper type.
+struct RpcReceipt(TransactionReceipt);
+
+impl From<&kardamom_types::Receipt> for RpcReceipt {
+    fn from(r: &kardamom_types::Receipt) -> Self {
+        let logs: Vec<alloy_rpc_types_eth::Log> = r
+            .logs
+            .iter()
+            .enumerate()
+            .map(|(log_index, wl)| alloy_rpc_types_eth::Log {
+                inner: Log {
+                    address: wl.address,
+                    data: LogData::new_unchecked(
+                        wl.topics.clone(),
+                        alloy_primitives::Bytes::copy_from_slice(wl.data.as_ref()),
+                    ),
+                },
+                block_hash: None,
+                block_number: Some(r.block_number),
+                block_timestamp: None,
+                transaction_hash: Some(r.tx_hash),
+                transaction_index: Some(r.transaction_index),
+                // `usize` to `u64` is widening on every supported target.
+                log_index: Some(log_index as u64),
+                removed: false,
+            })
+            .collect();
+        let logs_bloom = alloy_primitives::logs_bloom(logs.iter().map(|l| &l.inner));
+        let with_bloom = alloy_consensus::ReceiptWithBloom {
+            receipt: alloy_consensus::Receipt {
+                status: alloy_consensus::Eip658Value::Eip658(r.status),
+                cumulative_gas_used: r.cumulative_gas_used,
+                logs,
             },
-            block_hash: None,
-            block_number: Some(block_number),
-            block_timestamp: None,
-            transaction_hash: Some(r.tx_hash),
+            logs_bloom,
+        };
+        // Maps the tx's real EIP-2718 type to alloy's `ReceiptEnvelope`.
+        // Bridge tooling identifies deposits by the 0x7E byte.
+        let inner = match r.tx_type {
+            kardamom_types::TX_TYPE_LEGACY => {
+                alloy_rpc_types_eth::ReceiptEnvelope::Legacy(with_bloom)
+            }
+            0x01 => alloy_rpc_types_eth::ReceiptEnvelope::Eip2930(with_bloom),
+            0x02 => alloy_rpc_types_eth::ReceiptEnvelope::Eip1559(with_bloom),
+            0x03 => alloy_rpc_types_eth::ReceiptEnvelope::Eip4844(with_bloom),
+            // Deposits (0x7E) have no alloy-eth envelope variant; the OP
+            // type lives in op-alloy. Legacy is the closest structural
+            // carrier. The authoritative deposit marker for kardamom
+            // consumers is `Receipt::is_deposit()` on the native stream.
+            _ => alloy_rpc_types_eth::ReceiptEnvelope::Legacy(with_bloom),
+        };
+        Self(TransactionReceipt {
+            inner,
+            transaction_hash: r.tx_hash,
             transaction_index: Some(r.transaction_index),
-            log_index: Some(log_index as u64),
-            removed: false,
+            block_hash: None,
+            block_number: Some(r.block_number),
+            gas_used: r.gas_used,
+            effective_gas_price: r.effective_gas_price,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: r.from,
+            to: r.to,
+            contract_address: r.contract_address,
         })
-        .collect();
-    let logs_bloom = alloy_primitives::logs_bloom(logs.iter().map(|l| &l.inner));
-    let with_bloom = alloy_consensus::ReceiptWithBloom {
-        receipt: alloy_consensus::Receipt {
-            status: alloy_consensus::Eip658Value::Eip658(r.status),
-            cumulative_gas_used: r.cumulative_gas_used,
-            logs,
-        },
-        logs_bloom,
-    };
-    // This reports the tx's real EIP-2718 type. It was hardcoded to
-    // Legacy before, so every deposit surfaced to clients as a type-0x00
-    // transaction. Bridge tooling identifies deposits by the 0x7E byte.
-    let inner = match r.tx_type {
-        kardamom_types::TX_TYPE_LEGACY => alloy_rpc_types_eth::ReceiptEnvelope::Legacy(with_bloom),
-        0x01 => alloy_rpc_types_eth::ReceiptEnvelope::Eip2930(with_bloom),
-        0x02 => alloy_rpc_types_eth::ReceiptEnvelope::Eip1559(with_bloom),
-        0x03 => alloy_rpc_types_eth::ReceiptEnvelope::Eip4844(with_bloom),
-        // Deposits (0x7E) have no alloy-eth envelope variant; the OP type
-        // lives in op-alloy. Legacy is the closest structural carrier.
-        // The authoritative deposit marker for kardamom consumers is
-        // `Receipt::is_deposit()` on the native stream.
-        _ => alloy_rpc_types_eth::ReceiptEnvelope::Legacy(with_bloom),
-    };
-    TransactionReceipt {
-        inner,
-        transaction_hash: r.tx_hash,
-        transaction_index: Some(r.transaction_index),
-        block_hash: None,
-        block_number: Some(r.block_number),
-        gas_used: r.gas_used,
-        effective_gas_price: r.effective_gas_price,
-        blob_gas_used: None,
-        blob_gas_price: None,
-        from: r.from,
-        to: r.to,
-        contract_address: r.contract_address,
     }
 }
 
@@ -331,6 +383,11 @@ fn receipt_to_rpc(r: kardamom_types::Receipt) -> TransactionReceipt {
 /// `ServerHandle`; dropping the handle shuts the server down. An HTTP
 /// middleware extracts the peer IP and stores it in the `PEER_ADDR`
 /// task-local for the duration of each request.
+///
+/// # Errors
+///
+/// Returns `IngressError::Internal` if the server fails to bind, or if
+/// the two RPC modules fail to merge.
 pub async fn start_jsonrpc_server<P, S>(
     proxy: IngressProxy<P, S>,
     addr: SocketAddr,
@@ -353,16 +410,16 @@ where
         .set_http_middleware(tower::ServiceBuilder::new().layer(peer_addr_layer::PeerAddrLayer))
         .build(addr)
         .await
-        .map_err(|e| IngressError::Internal(format!("jsonrpsee bind: {e}")))?;
+        .map_err(|e| IngressError::internal("jsonrpsee bind", e))?;
     let local = server
         .local_addr()
-        .map_err(|e| IngressError::Internal(format!("local_addr: {e}")))?;
-    let mut module = IngressEthApiServer::into_rpc(IngressHandlers::new(proxy.clone()));
+        .map_err(|e| IngressError::internal("local_addr", e))?;
+    let mut module = IngressEthApiServer::into_rpc(IngressHandlers::<(P, S)>::new(proxy.clone()));
     module
-        .merge(IngressKardamomApiServer::into_rpc(IngressHandlers::new(
-            proxy,
-        )))
-        .map_err(|e| IngressError::Internal(format!("rpc module merge: {e}")))?;
+        .merge(IngressKardamomApiServer::into_rpc(
+            IngressHandlers::<(P, S)>::new(proxy),
+        ))
+        .map_err(|e| IngressError::internal("rpc module merge", e))?;
     Ok((local, server.start(module)))
 }
 
@@ -372,9 +429,7 @@ where
 /// the extension is missing, for example in unit tests with custom
 /// transports, the handler falls back to loopback.
 mod peer_addr_layer {
-    use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::pin::Pin;
     use std::task::{Context, Poll};
 
     use tower::{Layer, Service};
@@ -382,7 +437,7 @@ mod peer_addr_layer {
     use super::PEER_ADDR;
 
     #[derive(Clone, Default)]
-    pub struct PeerAddrLayer;
+    pub(super) struct PeerAddrLayer;
 
     impl<S> Layer<S> for PeerAddrLayer {
         type Service = PeerAddrService<S>;
@@ -392,19 +447,38 @@ mod peer_addr_layer {
     }
 
     #[derive(Clone)]
-    pub struct PeerAddrService<S> {
+    pub(super) struct PeerAddrService<S> {
         inner: S,
     }
 
-    impl<S, Body> Service<hyper::Request<Body>> for PeerAddrService<S>
+    /// Every `tower::Service` this layer wraps, collapsed to one bound.
+    trait HttpService<Body>: Service<hyper::Request<Body>> + Clone + Send + 'static
+    where
+        Self::Future: Send + 'static,
+    {
+    }
+
+    impl<S, Body> HttpService<Body> for S
     where
         S: Service<hyper::Request<Body>> + Clone + Send + 'static,
         S::Future: Send + 'static,
         Body: Send + 'static,
     {
+    }
+
+    impl<S, Body> Service<hyper::Request<Body>> for PeerAddrService<S>
+    where
+        S: HttpService<Body>,
+        // `HttpService`'s own `where Self::Future: Send` bound applies to
+        // its implementors, but is not implied back at every use site, so
+        // this restates it.
+        S::Future: Send + 'static,
+        Body: Send + 'static,
+    {
         type Response = S::Response;
         type Error = S::Error;
-        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+        type Future =
+            tokio::task::futures::TaskLocalFuture<std::cell::Cell<Option<IpAddr>>, S::Future>;
 
         fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             self.inner.poll_ready(cx)
@@ -414,17 +488,12 @@ mod peer_addr_layer {
             let ip: IpAddr = req
                 .extensions()
                 .get::<std::net::SocketAddr>()
-                .map(|s| s.ip())
-                .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+                .map_or(IpAddr::V4(Ipv4Addr::LOCALHOST), std::net::SocketAddr::ip);
             // `Service::call` traditionally requires the cloned inner
             // ready service. This is the standard tower idiom.
             let clone = self.inner.clone();
             let mut inner = std::mem::replace(&mut self.inner, clone);
-            Box::pin(async move {
-                PEER_ADDR
-                    .scope(std::cell::Cell::new(Some(ip)), inner.call(req))
-                    .await
-            })
+            PEER_ADDR.scope(std::cell::Cell::new(Some(ip)), inner.call(req))
         }
     }
 }
@@ -432,11 +501,9 @@ mod peer_addr_layer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::MockChannels;
     use crate::config::IngressConfig;
-    use crate::proxy::IngressProxy;
+    use crate::test_support::{TestServer, http_client, start_test_server};
     use jsonrpsee::core::client::ClientT;
-    use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::rpc_params;
 
     #[tokio::test]
@@ -445,13 +512,8 @@ mod tests {
             chain_id: 31337,
             ..IngressConfig::default()
         };
-        let (mock, _rx) = MockChannels::new(8);
-        let proxy = IngressProxy::new(cfg, mock.clone(), mock);
-        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let (local, handle) = start_jsonrpc_server(proxy, bind).await.unwrap();
-        let client = HttpClientBuilder::default()
-            .build(format!("http://{local}"))
-            .unwrap();
+        let TestServer { addr, handle, .. } = start_test_server(cfg).await;
+        let client = http_client(addr);
         let id: U256 = client.request("eth_chainId", rpc_params![]).await.unwrap();
         assert_eq!(id, U256::from(31337u64));
         handle.stop().unwrap();
