@@ -146,6 +146,10 @@ job "batcher" {
           # traffic to about 1 tx every 5 seconds.
           "--blocks-per-batch", "5",
           "--flush-ms", "3000",
+          # The L2 chain id. The records commitment digests each
+          # remote-epoch message leaf, which commits to this id. Same
+          # value as the executor and validator jobs.
+          "--chain-id", "412346",
         ]
       }
 

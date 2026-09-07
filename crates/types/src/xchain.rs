@@ -61,6 +61,33 @@ pub const OUTBOX: Address = address!("0x42000000000000000000000000000000000000E0
 /// what makes delivery injection unforgeable by user txs.
 pub const INBOX: Address = address!("0x42000000000000000000000000000000000000E1");
 
+/// Fixed bytes one [`RemoteEpochRecord`] adds to the KAR1 v2 DA frame,
+/// before its messages: `origin_chain_id` (8) + `anchor_number` (8) +
+/// `anchor_hash` (32) + `first_seq` (8) + `msg_count` (4).
+pub const REMOTE_EPOCH_FIXED_WIRE_BYTES: usize = 8 + 8 + 32 + 8 + 4;
+
+/// Fixed bytes one [`XChainMessage`] adds to the KAR1 v2 DA frame, on top
+/// of its calldata: `source_hash` (32) + `seq` (8) + `origin_sender` (20) +
+/// `target` (20) + `value` (16) + `gas_limit` (8) + `input_len` (4) +
+/// callback flag (1) + callback body (20 + 8 + 32). The callback body is
+/// always charged, so the bound holds with or without a callback.
+pub const XCHAIN_MSG_FIXED_WIRE_BYTES: usize = 32 + 8 + 20 + 20 + 16 + 8 + 4 + 1 + 20 + 8 + 32;
+
+/// Cap on the KAR1 v2 wire size of one [`RemoteEpochRecord`]. See
+/// [`remote_epoch_wire_bytes`]. [`derive_remote_epoch`] rejects a larger
+/// record.
+///
+/// Arithmetic: one EIP-4844 blob carries 4096 field elements of 31 payload
+/// bytes each, 126_976 bytes. The batcher posts at most 6 blobs per batch,
+/// and it must post a block that holds one record on its own. Five blobs
+/// hold 634_880 bytes. The batcher also adds a 4-byte length prefix, a
+/// 12-byte KAR1 header, a 24-byte block header, and zero or more L2 txs.
+/// A 4_096-byte headroom covers the headers. So one record at the cap,
+/// alone in a block, fits in 5 blobs, fewer than the 6-blob ceiling.
+/// A record that carries 65_536-byte calldata in every message holds at
+/// most 9 messages under this cap.
+pub const MAX_REMOTE_EPOCH_WIRE_BYTES: usize = 5 * 126_976 - 4_096;
+
 /// The EVM sender of a derived cross-chain tx from `origin_chain_id`: the
 /// origin's Outbox predeploy, aliased into the destination's address space.
 /// `Inbox.deliver` authenticates against exactly this address (the OP
@@ -411,6 +438,9 @@ impl RemoteEpochRecord {
 /// callers need not pre-sort. Every violation is an error rather than a
 /// repair: for a VERIFIER these are chain faults, for a PRODUCER bugs or a
 /// malicious feed — either way, fail stop, never skip or reorder.
+///
+/// The record's wire size is capped at [`MAX_REMOTE_EPOCH_WIRE_BYTES`], so
+/// one record always fits in a DA batch on its own.
 pub fn derive_remote_epoch(
     self_chain_id: u64,
     origin_chain_id: u64,
@@ -455,6 +485,14 @@ pub fn derive_remote_epoch(
         }
     }
 
+    let wire_bytes = remote_epoch_wire_bytes(ordered.iter().map(|m| m.data.len()));
+    if wire_bytes > MAX_REMOTE_EPOCH_WIRE_BYTES {
+        return Err(XChainError::RecordTooLarge {
+            bytes: wire_bytes,
+            cap: MAX_REMOTE_EPOCH_WIRE_BYTES,
+        });
+    }
+
     let last = ordered.last().expect("non-empty");
     Ok(RemoteEpochRecord {
         origin_chain_id,
@@ -491,6 +529,19 @@ pub enum XChainError {
     SeqRegressed { expected: u64, found: u64 },
     #[error("message for chain {found} in a batch derived by chain {expected}")]
     ForeignDestination { expected: u64, found: u64 },
+    #[error("remote epoch record is {bytes} wire bytes; the cap is {cap}")]
+    RecordTooLarge { bytes: usize, cap: usize },
+}
+
+/// The KAR1 v2 wire size of one record whose messages carry calldata of
+/// the given lengths: [`REMOTE_EPOCH_FIXED_WIRE_BYTES`] plus
+/// [`XCHAIN_MSG_FIXED_WIRE_BYTES`] and the calldata length per message.
+pub fn remote_epoch_wire_bytes(data_lens: impl IntoIterator<Item = usize>) -> usize {
+    data_lens
+        .into_iter()
+        .fold(REMOTE_EPOCH_FIXED_WIRE_BYTES, |acc, n| {
+            acc + XCHAIN_MSG_FIXED_WIRE_BYTES + n
+        })
 }
 
 #[cfg(test)]
@@ -631,6 +682,53 @@ mod tests {
             derive_remote_epoch(SELF, ORIGIN, 0, &batch).unwrap(),
             derive_remote_epoch(SELF, ORIGIN, 0, &batch).unwrap()
         );
+    }
+
+    /// A record at the wire cap derives. One more calldata byte trips
+    /// `RecordTooLarge`.
+    #[test]
+    fn record_wire_cap_is_exact() {
+        let budget = MAX_REMOTE_EPOCH_WIRE_BYTES
+            - REMOTE_EPOCH_FIXED_WIRE_BYTES
+            - 2 * XCHAIN_MSG_FIXED_WIRE_BYTES;
+        let mut a = msg(0, SELF);
+        a.data = AlloyBytes::from(alloc::vec![0xAA; budget / 2]);
+        let mut b = msg(1, SELF);
+        b.data = AlloyBytes::from(alloc::vec![0xBB; budget - budget / 2]);
+        let at_cap = [a.clone(), b.clone()];
+        assert_eq!(
+            remote_epoch_wire_bytes(at_cap.iter().map(|m| m.data.len())),
+            MAX_REMOTE_EPOCH_WIRE_BYTES
+        );
+        assert!(derive_remote_epoch(SELF, ORIGIN, 0, &at_cap).is_ok());
+
+        b.data = AlloyBytes::from(alloc::vec![0xBB; budget - budget / 2 + 1]);
+        let e = derive_remote_epoch(SELF, ORIGIN, 0, &[a, b]).unwrap_err();
+        assert_eq!(
+            e,
+            XChainError::RecordTooLarge {
+                bytes: MAX_REMOTE_EPOCH_WIRE_BYTES + 1,
+                cap: MAX_REMOTE_EPOCH_WIRE_BYTES,
+            }
+        );
+    }
+
+    /// The cap counts fixed bytes per message. So many empty messages trip
+    /// it too, not only large calldata.
+    #[test]
+    fn record_wire_cap_counts_empty_messages() {
+        let n = MAX_REMOTE_EPOCH_WIRE_BYTES / XCHAIN_MSG_FIXED_WIRE_BYTES + 1;
+        let batch: Vec<OutboxMessage> = (0..n as u64)
+            .map(|seq| {
+                let mut m = msg(seq, SELF);
+                m.data = AlloyBytes::new();
+                m
+            })
+            .collect();
+        assert!(matches!(
+            derive_remote_epoch(SELF, ORIGIN, 0, &batch).unwrap_err(),
+            XChainError::RecordTooLarge { .. }
+        ));
     }
 
     #[test]
