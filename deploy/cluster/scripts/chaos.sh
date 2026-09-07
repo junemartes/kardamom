@@ -165,6 +165,11 @@ CHAOS_ACCT="${CHAOS_ACCT_BASE}"
 # Derivation: cast keccak <address> | cut -c3-18, then mod 2. This map
 # pins a case's load onto a specific shard (sequencer-replica-kill).
 ACCT_SHARD=(0 1 1 0 0 0 0 0 0 0 1 0 1 1 0 1)
+# The vslot of each funded account: keccak256(address)[7]. The shard map
+# (config/shard-map.toml) turns a vslot into a lane; ACCT_SHARD above is
+# that map applied at version 0. The resize case picks a sender whose
+# vslot moves under the next map. check-contract.py recomputes both.
+ACCT_VSLOT=(40 203 173 4 226 250 74 160 16 4 123 108 103 63 240 103)
 
 LOAD_PID=""
 cleanup() {
@@ -193,6 +198,8 @@ source "${SCRIPT_DIR}/chaos-cases-cluster.sh"
 source "${SCRIPT_DIR}/chaos-cases-validator.sh"
 # shellcheck source=deploy/cluster/scripts/chaos-cases-seq-retention.sh
 source "${SCRIPT_DIR}/chaos-cases-seq-retention.sh"
+# shellcheck source=deploy/cluster/scripts/chaos-cases-resize.sh
+source "${SCRIPT_DIR}/chaos-cases-resize.sh"
 
 # --- the per-case driver ----------------------------------------------------
 
@@ -213,7 +220,8 @@ run_case() { # <case-name>
   # nonces from 0, so cases never collide or leave nonce gaps on the
   # never-reset chain.
   if [ "${name}" = "sequencer-replica-kill" ] || [ "${name}" = "sequencer-lapse" ] \
-    || [ "${name}" = "graceful-sequencer" ] || [ "${name}" = "hard-sequencer" ]; then
+    || [ "${name}" = "graceful-sequencer" ] || [ "${name}" = "hard-sequencer" ] \
+    || [ "${name}" = "lookup-blackout" ]; then
     # Pin this case's load to shard 0, the shard whose replica A gets
     # killed or paused. An arbitrary account lands on shard 0 or 1 by
     # address hash, so about half of runs would otherwise drive an
@@ -222,6 +230,15 @@ run_case() { # <case-name>
     # their nonce chains stay at 0.
     while [ "${CHAOS_ACCT}" -le 15 ] && [ "${ACCT_SHARD[${CHAOS_ACCT}]}" -ne 0 ]; do
       log "${name}: skipping funded account #${CHAOS_ACCT} (shard ${ACCT_SHARD[${CHAOS_ACCT}]}; case needs shard 0)"
+      CHAOS_ACCT=$(( CHAOS_ACCT + 1 ))
+    done
+  fi
+  if [ "${name}" = "resize-scale-out-in" ]; then
+    # Pin this case's load to a sender that MOVES to the new lane under
+    # the next map. A sender that stays put would prove nothing about
+    # the move. See chaos-cases-resize.sh.
+    while [ "${CHAOS_ACCT}" -le 15 ] && ! acct_moves_on_scale_out "${CHAOS_ACCT}" 3; do
+      log "${name}: skipping funded account #${CHAOS_ACCT} (vslot ${ACCT_VSLOT[${CHAOS_ACCT}]} does not move)"
       CHAOS_ACCT=$(( CHAOS_ACCT + 1 ))
     done
   fi
@@ -256,6 +273,22 @@ run_case() { # <case-name>
     local min_s=$(( INJECT_DELAY + RETENTION_FREEZE_CAP_S + 120 ))
     [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
   fi
+  # resize-scale-out-in: two full resizes (each: overlap job, warm-up,
+  # ingress roll, drain, steady job) plus a replica kill. The load must
+  # flow through all of it. lookup-blackout: two replica restarts plus
+  # two lookup waits.
+  local retry="${LOAD_RETRY:-2}"
+  if [ "${name}" = "resize-scale-out-in" ]; then
+    local min_s=$(( INJECT_DELAY + 780 ))
+    [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
+    # The ingress roll restarts the load's ingress. A wide retry, with
+    # the receipt check between attempts, rides through it.
+    retry=60
+  fi
+  if [ "${name}" = "lookup-blackout" ]; then
+    local min_s=$(( INJECT_DELAY + 2 * CHAOS_RESTART_SLO_S + 300 ))
+    [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
+  fi
   # cpu-squeeze: load must keep flowing through the whole starvation
   # window and the recovery assert. A squeeze against an idle pipeline
   # exercises nothing; the divergence this case hunts needs live
@@ -278,6 +311,7 @@ run_case() { # <case-name>
   "${LOAD_BIN}" --rpc "${RPC_URL}" --chain-id "${CHAIN_ID}" --chaos-mode --duration "${case_s}s" \
     --target-tps "${CHAOS_TPS}" --senders 1 --sender-offset "${acct}" \
     --nonce-start 0 --assert-all-delivered --completeness accepted \
+    --retry-submit "${retry}" \
     --max-gap "${LOAD_MAX_GAP}" --scrape executor,ingress,sequencer \
     --drain-timeout "${drain}s" --output "${out}" >"${logf}" 2>&1 &
   LOAD_PID=$!

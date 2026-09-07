@@ -305,12 +305,20 @@ ANVIL_ACCOUNTS = [
     "dF3e18d64BC6A983f673Ab319CCaE4f1a57C7097", "cd3B766CCDd6AE721141F452C550Ca635964ce71",
 ]
 if SHARD_MAP.exists() and len(table) == 256:
-    expected_shards = " ".join(str(table[keccak256(bytes.fromhex(a))[7]]) for a in ANVIL_ACCOUNTS)
-    m_acct = re.search(r"^ACCT_SHARD=\(([^)]*)\)", (CLUSTER / "scripts" / "chaos.sh").read_text(), re.M)
+    chaos_text = (CLUSTER / "scripts" / "chaos.sh").read_text()
+    vslots = [keccak256(bytes.fromhex(a))[7] for a in ANVIL_ACCOUNTS]
+    expected_shards = " ".join(str(table[v]) for v in vslots)
+    m_acct = re.search(r"^ACCT_SHARD=\(([^)]*)\)", chaos_text, re.M)
     if not m_acct:
         err("scripts/chaos.sh: missing ACCT_SHARD table")
     elif " ".join(m_acct.group(1).split()) != expected_shards:
         err(f"scripts/chaos.sh: ACCT_SHARD=({m_acct.group(1)}) but the shard map gives ({expected_shards})")
+    expected_vslots = " ".join(str(v) for v in vslots)
+    m_vslot = re.search(r"^ACCT_VSLOT=\(([^)]*)\)", chaos_text, re.M)
+    if not m_vslot:
+        err("scripts/chaos.sh: missing ACCT_VSLOT table")
+    elif " ".join(m_vslot.group(1).split()) != expected_vslots:
+        err(f"scripts/chaos.sh: ACCT_VSLOT=({m_vslot.group(1)}) but keccak gives ({expected_vslots})")
 
 # --- executor nonce query -----------------------------------------------------------
 # Every executor serves the query on ports.executor_nonce_query. Both sequencer
