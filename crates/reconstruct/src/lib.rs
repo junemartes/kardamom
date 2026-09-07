@@ -262,6 +262,7 @@ mod tests {
             target: payee,
             value: 0,
             gas_limit: 150_000,
+            hops: 0,
             data: alloy_primitives::Bytes::copy_from_slice(&[0xDE, 0xAD]),
             callback,
         };

@@ -123,9 +123,14 @@ pub struct OutboxMessageDto {
     pub value: U256,
     /// Gas budget for the inner call on the destination.
     pub gas_limit: u64,
+    /// Remaining hop budget of the message (audit H6). Required: a peer that
+    /// omits it runs a protocol version this build does not understand.
+    pub hops: u8,
     /// Inner-call calldata, `0x`-prefixed hex.
     pub data: Bytes,
-    /// Requested response, if any.
+    /// Requested response, if any. An all-zero callback decodes as none
+    /// (audit M5): the Outbox event carries the zero struct for "no
+    /// callback", and both hash to the zero commitment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callback: Option<CallbackDto>,
 }
@@ -197,6 +202,7 @@ impl OutboxMessageDto {
             target: m.target,
             value: U256::from(m.value),
             gas_limit: m.gas_limit,
+            hops: m.hops,
             data: m.data.clone(),
             callback: m.callback.map(|cb| CallbackDto {
                 target: cb.target,
@@ -232,12 +238,16 @@ impl OutboxMessageDto {
             target: self.target,
             value,
             gas_limit: self.gas_limit,
+            hops: self.hops,
             data: self.data,
-            callback: self.callback.map(|cb| Callback {
-                target: cb.target,
-                gas_limit: cb.gas_limit,
-                context: cb.context,
-            }),
+            callback: self
+                .callback
+                .map(|cb| Callback {
+                    target: cb.target,
+                    gas_limit: cb.gas_limit,
+                    context: cb.context,
+                })
+                .filter(|cb| !cb.is_zero()),
         })
     }
 }
@@ -353,6 +363,7 @@ mod tests {
             target: Address::repeat_byte(0xB2),
             value: 0,
             gas_limit: 200_000,
+            hops: 2,
             data: Bytes::from_static(&[0xCA, 0xFE]),
             callback: Some(Callback {
                 target: Address::repeat_byte(0x0C),
@@ -392,6 +403,7 @@ mod tests {
             "wei is a hex quantity, not a JSON number"
         );
         assert_eq!(v["callback"]["gasLimit"], 90_000);
+        assert_eq!(v["hops"], 2, "the hop budget rides as a JSON number");
 
         let lagged = serde_json::to_value(OutboxEventDto::Lagged {
             skipped: 12,
@@ -432,6 +444,28 @@ mod tests {
         );
         let back: OutboxEventDto = serde_json::from_value(head).unwrap();
         assert_eq!(back, OutboxEventDto::Head { block_number: 77 });
+    }
+
+    /// An all-zero callback on the wire is "none" (audit M5): both commit to
+    /// the zero hash, and the protocol type must not carry `Some(zero)`.
+    #[test]
+    fn zero_callback_decodes_as_none() {
+        let mut dto = OutboxMessageDto::from_outbox_message(5, &sample());
+        dto.callback = Some(CallbackDto {
+            target: Address::ZERO,
+            gas_limit: 0,
+            context: B256::ZERO,
+        });
+        assert_eq!(dto.into_outbox_message(5).unwrap().callback, None);
+    }
+
+    /// `hops` is required: an item without it is a protocol mismatch.
+    #[test]
+    fn a_message_without_hops_is_rejected() {
+        let dto = OutboxMessageDto::from_outbox_message(5, &sample());
+        let mut v = serde_json::to_value(&dto).unwrap();
+        v.as_object_mut().unwrap().remove("hops");
+        assert!(serde_json::from_value::<OutboxMessageDto>(v).is_err());
     }
 
     #[test]

@@ -49,7 +49,7 @@ fn roundtrip_preserves_payload() {
 fn header_starts_with_magic_and_version() {
     let bytes = encode(&sample_payload()).expect("encode");
     assert_eq!(&bytes[..4], &MAGIC);
-    assert_eq!(bytes[4], 2, "version byte");
+    assert_eq!(bytes[4], 3, "version byte");
     assert_eq!(bytes[5], 0, "uncompressed flag");
 }
 

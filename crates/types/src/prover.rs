@@ -260,6 +260,8 @@ mod tests {
                     target: Address::repeat_byte(0xB2),
                     value: 0,
                     gas_limit: 150_000,
+                    // Nonzero, so the pinned vector covers the hop word.
+                    hops: 3,
                     input: Bytes::copy_from_slice(input),
                     callback: (i == 0).then(|| Callback {
                         target: Address::repeat_byte(0xCB),
@@ -281,7 +283,9 @@ mod tests {
     /// Pinned vector for the remote-epoch arm. A change here changes every
     /// L1 records commitment; the batcher and the guest must move together.
     /// The arm digests `canonical_id`, which commits to `anchor_number`
-    /// since #263, so this vector moved with that change.
+    /// since #263, so this vector moved with that change. It moved again
+    /// with #264: each leaf is a V1 `msg_leaf` with the `hops` word, and
+    /// the fixture sets `hops = 3`.
     #[test]
     fn remote_epoch_arm_vector() {
         let mut d = BlockRecordsDigest::new(7);
@@ -289,7 +293,7 @@ mod tests {
         d.add_tx(&[0xAB; 4]);
         assert_eq!(
             d.finish(),
-            b256!("0xe411b390e302b8cfced6cd32018bd219695bcbd9d91850c9d072f657f1294cf5")
+            b256!("0x4f5c1b78387235396041639dfd307e9f76e07c12af399ee9310ce1a64756f1c0")
         );
     }
 

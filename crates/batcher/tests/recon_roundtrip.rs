@@ -120,6 +120,7 @@ fn remote_epoch(
                 target: Address::repeat_byte(0xB2),
                 value: 0,
                 gas_limit: 150_000,
+                hops: 0,
                 input: Bytes::copy_from_slice(input),
                 callback: with_callback.then(|| Callback {
                     target: Address::repeat_byte(0xCB),

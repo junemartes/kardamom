@@ -371,6 +371,7 @@ mod tests {
             target: Address::repeat_byte(0xB2),
             value: 0,
             gas_limit: 100_000,
+            hops: 0,
             data: Default::default(),
             callback: None,
         }

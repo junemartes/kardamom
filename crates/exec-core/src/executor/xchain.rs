@@ -26,17 +26,25 @@ use super::write_set::{retain_changed, write_set_from_cache};
 /// Extra gas for a cross-chain delivery, on top of the inner-call budget
 /// and the calldata intrinsic gas.
 ///
-/// `message.gas_limit` pays only for the inner `target` call. The Inbox's
-/// own work (a delivery-status write, an event, and a callback enqueue
-/// through the local Outbox) needs gas too. Without this headroom, that
-/// work would use up the app's budget.
+/// `message.gas_limit` pays only for the inner `target` call. The Inbox
+/// hands the call exactly that amount when the delivery tx carries enough
+/// gas, and records the message as failed (status 2, callback sent) when it
+/// does not. This headroom is what makes "enough" true for every honest
+/// message. It covers, at the worst case `Inbox.t.sol` pins:
 ///
-/// The Inbox forwards `min(gasLimit, 63/64 of the gas it has left)` to
-/// the inner call (EIP-150). With this overhead, the inner call gets the
-/// full `gasLimit` only up to about 4.9M gas. Above that, the 63/64 rule
-/// withholds part of it. The delivery still executes; only the inner
-/// call's budget is smaller than requested.
-pub const XCHAIN_DELIVERY_OVERHEAD: u64 = 150_000;
+/// - the EIP-150 63/64 share the Inbox must hold back to forward the full
+///   `MAX_MESSAGE_GAS` (158_730 gas),
+/// - `Inbox.RESERVE` (200_000 gas): the bounded return copy, the status
+///   and cursor writes, the events, and the callback send through a cold
+///   Outbox lane,
+/// - the work before the inner call, with 64 KiB of calldata (about
+///   25_800 gas).
+///
+/// Measured need: 384_484 gas. Pinned at 1.2 times that, rounded up. Must
+/// equal `Outbox.DELIVERY_OVERHEAD` (`contracts/src/L2/Outbox.sol`); the
+/// origin charges its per-block destination budget with the same number.
+/// The calldata intrinsic gas is NOT part of this constant.
+pub const XCHAIN_DELIVERY_OVERHEAD: u64 = 462_000;
 
 /// The tx gas limit of one delivery: the message's inner-call budget, the
 /// Inbox overhead, and the intrinsic gas of `calldata` under the pinned
@@ -301,6 +309,7 @@ mod tests {
             target: Address::from([0x88u8; 20]),
             value: 0,
             gas_limit: 200_000,
+            hops: 0,
             input: data,
             callback: None,
         }
@@ -343,6 +352,13 @@ mod tests {
         let start = rest.find("\"0x").expect("code hex") + 3;
         let end = start + rest[start..].find('"').expect("closing quote");
         alloy_primitives::hex::decode(&rest[start..end]).expect("valid hex")
+    }
+
+    /// The origin charges its per-block destination budget with the same
+    /// overhead (`Outbox.DELIVERY_OVERHEAD`, pinned in `Outbox.t.sol`).
+    #[test]
+    fn delivery_overhead_matches_the_outbox_constant() {
+        assert_eq!(XCHAIN_DELIVERY_OVERHEAD, 462_000);
     }
 
     #[test]

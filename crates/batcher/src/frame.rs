@@ -77,7 +77,8 @@ use kardamom_types::xchain::{Callback, RemoteEpochRecord, XChainMessage};
 use crate::error::BatcherError;
 
 pub const MAGIC: [u8; 4] = *b"KAR1";
-pub const VERSION: u8 = 2;
+/// v3 added the `hops` byte to every cross-chain message (audit H6).
+pub const VERSION: u8 = 3;
 pub const FLAG_ZSTD: u8 = 0x01;
 
 const HEADER_LEN: usize = 4 + 1 + 1 + 4 + 2;
@@ -187,6 +188,7 @@ fn encode_remote_epoch(buf: &mut Vec<u8>, rec: &RemoteEpochRecord) -> Result<(),
         buf.extend_from_slice(msg.target.as_slice());
         buf.extend_from_slice(&msg.value.to_le_bytes());
         buf.extend_from_slice(&msg.gas_limit.to_le_bytes());
+        buf.push(msg.hops);
         buf.extend_from_slice(&input_len.to_le_bytes());
         buf.extend_from_slice(msg.input.as_ref());
         match &msg.callback {
@@ -216,6 +218,7 @@ fn decode_remote_epoch(r: &mut Reader<'_>) -> Result<RemoteEpochRecord, BatcherE
         let target = Address::from_slice(r.read_bytes(20)?);
         let value = r.read_u128_le()?;
         let gas_limit = r.read_u64_le()?;
+        let hops = r.read_u8()?;
         let input_len = r.read_u32_le()?;
         let input = Bytes::copy_from_slice(r.read_bytes(input_len as usize)?);
         let callback = match r.read_u8()? {
@@ -238,6 +241,7 @@ fn decode_remote_epoch(r: &mut Reader<'_>) -> Result<RemoteEpochRecord, BatcherE
             target,
             value,
             gas_limit,
+            hops,
             input,
             callback,
         });

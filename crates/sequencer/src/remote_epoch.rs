@@ -145,6 +145,7 @@ mod tests {
                     source_hash: B256::repeat_byte(0xE0 + i as u8),
                     seq: first_seq + i as u64,
                     gas_limit: 100_000,
+                    hops: 0,
                     ..Default::default()
                 })
                 .collect(),

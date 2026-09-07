@@ -45,6 +45,7 @@ sol! {
         address target,
         uint256 value,
         uint64 gasLimit,
+        uint8 hops,
         bytes data,
         bytes32 msgHash,
         SolCallback callback
@@ -211,6 +212,7 @@ fn decode_message_sent(
         decoded.target,
         value,
         decoded.gasLimit,
+        decoded.hops,
         keccak256(&decoded.data),
         callback
             .as_ref()
@@ -238,6 +240,7 @@ fn decode_message_sent(
             target: decoded.target,
             value,
             gas_limit: decoded.gasLimit,
+            hops: decoded.hops,
             data: decoded.data.clone(),
             callback,
         },
@@ -295,6 +298,9 @@ pub(crate) mod tests_support {
     use super::*;
     use alloy_primitives::Bytes as AlloyBytes;
 
+    /// Hop budget every fixture message carries.
+    pub(crate) const FIXTURE_HOPS: u8 = 3;
+
     /// Build a MessageSent WireLog exactly as the predeploy emits it: the
     /// carried msgHash computed through the SAME shared rule (an honest
     /// contract).
@@ -319,6 +325,7 @@ pub(crate) mod tests_support {
             target,
             0,
             200_000,
+            FIXTURE_HOPS,
             keccak256(data),
             cb_hash,
         );
@@ -329,6 +336,7 @@ pub(crate) mod tests_support {
             target,
             value: U256::ZERO,
             gasLimit: 200_000,
+            hops: FIXTURE_HOPS,
             data: AlloyBytes::copy_from_slice(data),
             msgHash: msg_hash,
             callback: match callback {
@@ -366,7 +374,7 @@ pub(crate) mod tests_support {
 
 #[cfg(test)]
 mod tests {
-    use super::tests_support::{honest_sent_log_full, log_msg_hash};
+    use super::tests_support::{FIXTURE_HOPS, honest_sent_log_full, log_msg_hash};
     use super::*;
 
     const SELF_CHAIN: u64 = 412_346;
@@ -392,7 +400,7 @@ mod tests {
         assert_eq!(
             MessageSent::SIGNATURE_HASH,
             keccak256(
-                "MessageSent(uint64,uint64,address,address,uint256,uint64,bytes,bytes32,\
+                "MessageSent(uint64,uint64,address,address,uint256,uint64,uint8,bytes,bytes32,\
                  (address,uint64,bytes32))"
             )
         );
@@ -451,6 +459,7 @@ mod tests {
         assert_eq!(msgs[0].dest_chain_id, DEST_CHAIN);
         assert_eq!(msgs[0].data.as_ref(), &[0xCA, 0xFE]);
         assert_eq!(msgs[0].origin_block_number, 42);
+        assert_eq!(msgs[0].hops, FIXTURE_HOPS, "the hop budget is decoded");
         assert_eq!(
             msgs[0].origin_block_hash,
             xchain_anchor_hash(SELF_CHAIN, 42),
@@ -465,14 +474,14 @@ mod tests {
     /// send would hole the pair's dense seq.
     #[test]
     fn event_carried_drift_is_a_fault() {
-        // Head layout: target, value, gasLimit, data-offset, msgHash,
+        // Head layout: target, value, gasLimit, hops, data-offset, msgHash,
         // callback tuple (3 words), then the dynamic data tail.
         // Both tamper directions must be caught (the decode_message_passed
         // discipline): a corrupted CARRIED hash, and a corrupted FIELD.
         let log = sent_log(0, &[0xCA, 0xFE], None);
         let mut carried = log.clone();
         let mut data = carried.data.to_vec();
-        data[4 * 32] ^= 0x01; // first byte of the msgHash word
+        data[5 * 32] ^= 0x01; // first byte of the msgHash word
         carried.data = data.into();
         let err = collect_outbox_messages(SELF_CHAIN, 42, &[receipt_with(0, vec![carried])], None)
             .unwrap_err();

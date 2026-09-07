@@ -239,6 +239,7 @@ mod tests {
                 source_hash: B256::repeat_byte(0xE7),
                 seq: 4,
                 gas_limit: 100_000,
+                hops: 0,
                 ..Default::default()
             }],
         };
