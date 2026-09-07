@@ -1006,26 +1006,47 @@ mod tests {
         );
     }
 
+    /// Messages that fill the wire budget exactly. Each message stays at or
+    /// under `MAX_DATA_BYTES`, so only the record cap can trip.
+    fn messages_at_wire_cap() -> alloc::vec::Vec<OutboxMessage> {
+        let mut budget = MAX_REMOTE_EPOCH_WIRE_BYTES - REMOTE_EPOCH_FIXED_WIRE_BYTES;
+        let mut out = alloc::vec::Vec::new();
+        let mut seq = 0u64;
+        while budget > 0 {
+            let len = core::cmp::min(MAX_DATA_BYTES, budget - XCHAIN_MSG_FIXED_WIRE_BYTES);
+            let mut m = msg(seq, SELF);
+            // One origin block for the whole record.
+            m.origin_block_number = 100;
+            m.data = AlloyBytes::from(alloc::vec![0xAA; len]);
+            budget -= XCHAIN_MSG_FIXED_WIRE_BYTES + len;
+            out.push(m);
+            seq += 1;
+        }
+        out
+    }
+
     /// A record at the wire cap derives. One more calldata byte trips
     /// `RecordTooLarge`.
     #[test]
     fn record_wire_cap_is_exact() {
-        let budget = MAX_REMOTE_EPOCH_WIRE_BYTES
-            - REMOTE_EPOCH_FIXED_WIRE_BYTES
-            - 2 * XCHAIN_MSG_FIXED_WIRE_BYTES;
-        let mut a = msg(0, SELF);
-        a.data = AlloyBytes::from(alloc::vec![0xAA; budget / 2]);
-        let mut b = msg(1, SELF);
-        b.data = AlloyBytes::from(alloc::vec![0xBB; budget - budget / 2]);
-        let at_cap = [a.clone(), b.clone()];
+        let at_cap = messages_at_wire_cap();
+        assert!(at_cap.iter().all(|m| m.data.len() <= MAX_DATA_BYTES));
         assert_eq!(
             remote_epoch_wire_bytes(at_cap.iter().map(|m| m.data.len())),
             MAX_REMOTE_EPOCH_WIRE_BYTES
         );
         assert!(derive_remote_epoch(SELF, ORIGIN, 0, &at_cap).is_ok());
 
-        b.data = AlloyBytes::from(alloc::vec![0xBB; budget - budget / 2 + 1]);
-        let e = derive_remote_epoch(SELF, ORIGIN, 0, &[a, b]).unwrap_err();
+        // Grow a message that has room under `MAX_DATA_BYTES` by one byte.
+        let mut over = at_cap.clone();
+        let idx = over
+            .iter()
+            .position(|m| m.data.len() < MAX_DATA_BYTES)
+            .expect("the last message has room");
+        let mut data = over[idx].data.to_vec();
+        data.push(0xBB);
+        over[idx].data = AlloyBytes::from(data);
+        let e = derive_remote_epoch(SELF, ORIGIN, 0, &over).unwrap_err();
         assert_eq!(
             e,
             XChainError::RecordTooLarge {
