@@ -134,9 +134,6 @@ impl Executor {
             epoch_observer,
             remote_epoch_observer,
         } = hooks;
-        // No role supplies a remote epoch check yet. The seam stays on
-        // `spawn_exec` until the destination-validator verifier lands.
-        let remote_epoch_observer: Option<Box<dyn crate::reader::RemoteEpochObserver>> = None;
 
         let buffer = JoinBuffer::new();
         let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(cfg.receipt_queue_depth);
