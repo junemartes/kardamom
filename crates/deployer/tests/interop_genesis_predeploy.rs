@@ -1,6 +1,7 @@
 //! Pins the interop predeploys in `chains/dev-interop.toml`:
 //!   * `Outbox` exists at `kardamom_types::xchain::OUTBOX`,
 //!   * `Inbox` exists at `kardamom_types::xchain::INBOX`,
+//!   * `CheckpointMarker` exists at `kardamom_types::xchain::CHECKPOINT_MARKER`,
 //!   * each carries runtime bytecode byte-equal to its forge-compiled
 //!     artifact.
 //!
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use alloy_primitives::{Address, Bytes, hex};
 use kardamom_types::Genesis;
-use kardamom_types::xchain::{INBOX, OUTBOX};
+use kardamom_types::xchain::{CHECKPOINT_MARKER, INBOX, OUTBOX};
 
 /// Runtime bytecode from a forge artifact (`deployedBytecode.object`), or
 /// `None` when the artifact has not been built (the suite then skips, like
@@ -55,7 +56,7 @@ fn assert_predeploy(genesis: &Genesis, workspace: &Path, contract: &str, address
 }
 
 #[test]
-fn dev_interop_genesis_predeploys_outbox_and_inbox_with_artifact_bytecode() {
+fn dev_interop_genesis_predeploys_interop_contracts_with_artifact_bytecode() {
     let workspace = PathBuf::from(env!("CARGO_WORKSPACE_DIR"));
 
     let toml = workspace.join("chains/dev-interop.toml");
@@ -66,4 +67,5 @@ fn dev_interop_genesis_predeploys_outbox_and_inbox_with_artifact_bytecode() {
 
     assert_predeploy(&genesis, &workspace, "Outbox", OUTBOX);
     assert_predeploy(&genesis, &workspace, "Inbox", INBOX);
+    assert_predeploy(&genesis, &workspace, "CheckpointMarker", CHECKPOINT_MARKER);
 }

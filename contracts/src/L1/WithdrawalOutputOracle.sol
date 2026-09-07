@@ -9,7 +9,9 @@ import {KardamomUUPSBase} from "../factory/KardamomUUPSBase.sol";
 ///         per L2 block range. A permissioned `challenger` can delete an
 ///         output while it is still inside its finalization window. The
 ///         withdrawal bridge reads finalized, non-deleted outputs to
-///         authorize payouts.
+///         authorize payouts. A permissioned `recovery` account can pause
+///         finalization and roll back the unsettled suffix of outputs
+///         after a coordinated chain revert.
 /// @dev    This milestone is optimistic with a permissioned challenge. The
 ///         `challenger` stands in for a trustless ZK fault proof
 ///         (`challenge(zkProof)` that recomputes the output root and finds
@@ -37,6 +39,16 @@ contract WithdrawalOutputOracle is KardamomUUPSBase {
 
     Output[] internal _outputs;
 
+    /// @notice The recovery account. It can pause finalization and roll
+    ///         back unsettled outputs. Zero disables both paths.
+    /// @dev    Appended after `_outputs`. The slots above must not move on
+    ///         a live proxy.
+    address public recovery;
+    /// @notice True while finalization is paused.
+    bool public paused;
+    /// @notice The L1 time of the current pause. Only valid while `paused`.
+    uint64 public pausedAt;
+
     event OutputProposed(
         uint256 indexed index,
         bytes32 indexed outputRoot,
@@ -47,6 +59,10 @@ contract WithdrawalOutputOracle is KardamomUUPSBase {
     event AttesterUpdated(address indexed previous, address indexed current);
     event ChallengerUpdated(address indexed previous, address indexed current);
     event FinalizationWindowUpdated(uint64 previous, uint64 current);
+    event RecoveryUpdated(address indexed previous, address indexed current);
+    event OutputsRolledBack(uint256 indexed fromIndex, uint256 count);
+    event FinalizationPaused(uint64 timestamp);
+    event FinalizationResumed(uint64 timestamp, uint256 restarted);
 
     error NotAttester();
     error NotChallenger();
@@ -56,6 +72,10 @@ contract WithdrawalOutputOracle is KardamomUUPSBase {
     error WindowElapsed();
     error ZeroAddress();
     error ZeroWindow();
+    error NotRecovery();
+    error BelowSettlementFloor(uint256 index);
+    error AlreadyPaused();
+    error NotPaused();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -108,6 +128,16 @@ contract WithdrawalOutputOracle is KardamomUUPSBase {
         if (_finalizationWindow == 0) revert ZeroWindow();
         emit FinalizationWindowUpdated(finalizationWindow, _finalizationWindow);
         finalizationWindow = _finalizationWindow;
+    }
+
+    /// @notice Set the recovery account. Only the Kardamom factory can call
+    ///         this. A zero address disables the pause and rollback paths.
+    ///         The recovery account belongs to the chain's dedicated recovery
+    ///         principal, not to the attester or challenger key holders.
+    function setRecovery(address _recovery) external {
+        if (msg.sender != FACTORY) revert NotFactory();
+        emit RecoveryUpdated(recovery, _recovery);
+        recovery = _recovery;
     }
 
     /// @notice The number of outputs ever proposed. Deleted outputs still
@@ -178,17 +208,102 @@ contract WithdrawalOutputOracle is KardamomUUPSBase {
         if (index >= _outputs.length) revert UnknownOutput();
         Output storage o = _outputs[index];
         if (o.deleted) revert AlreadyDeleted();
-        if (block.timestamp >= uint256(o.timestamp) + finalizationWindow) {
-            revert WindowElapsed();
-        }
+        if (_settled(o)) revert WindowElapsed();
         o.deleted = true;
         emit OutputDeleted(index, o.outputRoot);
     }
 
-    /// @notice True once `index` exists, is not deleted, and its window has ended.
+    // -------------------------------------------------------------------------
+    // Recovery. A coordinated chain revert discards a suffix of L2 blocks.
+    // The outputs posted for that suffix must not finalize a withdrawal,
+    // because the restored chain has no record of them. The recovery
+    // account rolls those outputs back. It can only roll back outputs that
+    // are still inside their window. An output whose window has ended is
+    // the settlement floor: withdrawals under it may already be paid on
+    // L1, and no revert may go below it. That rule is enforced here, not
+    // only in the operator's ceremony.
+    //
+    // The finalization window must be at least the revert window of the
+    // trust set (`W`). Otherwise a withdrawal can finalize before the
+    // operator can declare the incident that reverts it. This is an
+    // operator invariant on `finalizationWindow`.
+    // -------------------------------------------------------------------------
+
+    /// @notice Pause finalization. Only the recovery account can call this.
+    ///         While paused, no output is finalizable and the finalization
+    ///         clock stops. `unpause` restarts the clock of every output
+    ///         that was still inside its window.
+    function pause() external {
+        if (msg.sender != recovery) revert NotRecovery();
+        if (paused) revert AlreadyPaused();
+        paused = true;
+        pausedAt = uint64(block.timestamp);
+        emit FinalizationPaused(uint64(block.timestamp));
+    }
+
+    /// @notice Resume finalization. Only the recovery account can call
+    ///         this. Every output that was not yet settled when the pause
+    ///         began gets a fresh timestamp, so it waits a full window
+    ///         again. A boundary effect never completes across an incident.
+    /// @dev    The scan runs backward from the newest output and stops at
+    ///         the first settled one. Outputs are proposed in time order,
+    ///         so every older output is settled too. The unsettled suffix
+    ///         is bounded by the window and the proposal cadence.
+    function unpause() external {
+        if (msg.sender != recovery) revert NotRecovery();
+        if (!paused) revert NotPaused();
+        uint256 restarted = 0;
+        for (uint256 i = _outputs.length; i > 0; i--) {
+            Output storage o = _outputs[i - 1];
+            if (_settled(o)) break;
+            if (o.deleted) continue;
+            o.timestamp = uint64(block.timestamp);
+            restarted++;
+        }
+        paused = false;
+        pausedAt = 0;
+        emit FinalizationResumed(uint64(block.timestamp), restarted);
+    }
+
+    /// @notice Roll back every output from `fromIndex` to the newest one.
+    ///         Only the recovery account can call this. Each output in the
+    ///         range is marked deleted, the same as a successful challenge.
+    ///         The call reverts if any output in the range is already
+    ///         settled: that output is the settlement floor, and a rollback
+    ///         below it is never valid. Already deleted outputs are skipped.
+    ///         The attester then re-proposes outputs for the restored chain.
+    ///         Deleted outputs do not count toward the monotonicity floor,
+    ///         so the restored outputs can cover lower L2 blocks.
+    function rollbackOutputs(uint256 fromIndex) external {
+        if (msg.sender != recovery) revert NotRecovery();
+        uint256 n = _outputs.length;
+        if (fromIndex >= n) revert UnknownOutput();
+        uint256 count = 0;
+        for (uint256 i = fromIndex; i < n; i++) {
+            Output storage o = _outputs[i];
+            if (o.deleted) continue;
+            if (_settled(o)) revert BelowSettlementFloor(i);
+            o.deleted = true;
+            emit OutputDeleted(i, o.outputRoot);
+            count++;
+        }
+        emit OutputsRolledBack(fromIndex, count);
+    }
+
+    /// @notice True once `index` exists, is not deleted, its window has
+    ///         ended, and finalization is not paused.
     function isFinalizable(uint256 index) external view returns (bool) {
+        if (paused) return false;
         if (index >= _outputs.length) return false;
         Output storage o = _outputs[index];
-        return !o.deleted && block.timestamp >= uint256(o.timestamp) + finalizationWindow;
+        return !o.deleted && _settled(o);
+    }
+
+    /// @dev True when the output's window has ended on the settlement
+    ///      clock. The clock is the block time, or the pause time while
+    ///      paused. A window that ends during a pause does not settle.
+    function _settled(Output storage o) internal view returns (bool) {
+        uint256 clock = paused ? uint256(pausedAt) : block.timestamp;
+        return clock >= uint256(o.timestamp) + finalizationWindow;
     }
 }
