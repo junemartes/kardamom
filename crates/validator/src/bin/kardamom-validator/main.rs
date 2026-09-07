@@ -183,12 +183,16 @@ async fn main() -> Result<()> {
         attestations: std::sync::Arc<kardamom_validator::interop::AttestationStore>,
         claims: std::sync::Arc<kardamom_validator::ClaimBuffer>,
     }
+    // After a restart the extractor first sees block `start.block + 1`.
+    // The store learns each lane's floor from that point, so a stale
+    // subscriber gets `Lagged` instead of a silent seq hole.
+    let feed_resume_block = start.is_resume().then(|| start.block + 1);
     let interop_serve = args.serve_feed.map(|addr| InteropServe {
         addr,
-        store: std::sync::Arc::new(kardamom_validator::interop::FeedStore::new(
-            chain_id,
-            args.feed_retention_blocks,
-        )),
+        store: std::sync::Arc::new(
+            kardamom_validator::interop::FeedStore::new(chain_id, args.feed_retention_blocks)
+                .with_resume_block(feed_resume_block),
+        ),
         attestations: std::sync::Arc::new(kardamom_validator::interop::AttestationStore::new(
             args.feed_retention_blocks,
         )),
@@ -335,6 +339,10 @@ async fn main() -> Result<()> {
                     validator_id: args.host_id.clone(),
                     store: s.store.clone(),
                     attestations: s.attestations.clone(),
+                    limits: kardamom_validator::interop::FeedServerLimits {
+                        max_subscriptions: args.feed_max_subscriptions,
+                        max_subscriptions_per_dest: args.feed_max_subscriptions_per_dest,
+                    },
                 },
             )
             .await
@@ -345,6 +353,9 @@ async fn main() -> Result<()> {
             tracing::info!(
                 addr = %local,
                 retention_blocks = args.feed_retention_blocks,
+                resume_block = ?feed_resume_block,
+                max_subscriptions = args.feed_max_subscriptions,
+                max_subscriptions_per_dest = args.feed_max_subscriptions_per_dest,
                 "interop feed server enabled (kardamom_subscribeOutbox, \
                  kardamom_subscribeAttestations)"
             );
