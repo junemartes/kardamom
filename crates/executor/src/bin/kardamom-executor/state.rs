@@ -52,20 +52,19 @@ pub(crate) fn prepare_state(
                 &args.checkpoint_peers,
                 expected_genesis,
             )?;
-            match restored {
-                Some((block, path)) => {
-                    tracing::info!(
-                        restored_block = block,
-                        checkpoint = %path.display(),
-                        "restored state from checkpoint; will replay tail from here"
-                    );
-                }
-                None => tracing::info!(
+            if let Some((block, path)) = restored {
+                tracing::info!(
+                    restored_block = block,
+                    checkpoint = %path.display(),
+                    "restored state from checkpoint; will replay tail from here"
+                );
+            } else {
+                tracing::info!(
                     checkpoint_dir = %ckpt_dir.display(),
                     "no checkpoint available locally or from peers; fresh start will \
                      replay from genesis (refused if the chain outgrew the cluster \
                      retention window — then a peer checkpoint or rebuild-from-L1 is required)"
-                ),
+                );
             }
         }
     }
@@ -105,22 +104,21 @@ pub(crate) fn prepare_state(
 /// whole call. It prunes to `checkpoint_keep`, and stops when
 /// `shutdown` is cancelled. Call this inside a tokio runtime.
 fn spawn_checkpointer(args: &Args, env: &StateEnv, shutdown: CancellationToken) {
-    let (Some(ckpt_dir), true) = (
-        args.checkpoint_dir.clone(),
-        args.checkpoint_interval_secs > 0,
-    ) else {
+    let (Some(ckpt_dir), Some(interval_secs)) =
+        (args.checkpoint_dir.clone(), args.checkpoint_interval_secs.0)
+    else {
         return;
     };
     let ckpt_env = env.clone();
-    let interval = std::time::Duration::from_secs(args.checkpoint_interval_secs);
-    let keep = args.checkpoint_keep;
+    let interval = std::time::Duration::from_secs(interval_secs.get());
+    let keep = args.checkpoint_keep.get();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
-        // The first tick fires immediately; the old thread slept first.
+        // The first tick fires immediately.
         ticker.tick().await;
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => return,
+                () = shutdown.cancelled() => return,
                 _ = ticker.tick() => {}
             }
             let env = ckpt_env.clone();

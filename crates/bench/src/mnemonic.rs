@@ -27,28 +27,28 @@ pub fn generate(word_count: u32) -> anyhow::Result<String> {
 }
 
 /// Derive `count` signers from `phrase` along m/44'/60'/0'/0/N. This is
-/// the default Anvil and MetaMask Ethereum derivation path.
+/// the default Anvil and `MetaMask` Ethereum derivation path.
 ///
 /// # Errors
 ///
 /// Returns an error if `phrase` is not a valid BIP-39 mnemonic, or if
 /// BIP-32 derivation fails for a requested index.
 pub fn derive_signers(phrase: &str, count: u32) -> anyhow::Result<Vec<DerivedSigner>> {
-    let mut out = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        let path = format!("m/44'/60'/0'/0/{i}");
-        let signer = MnemonicBuilder::<English>::default()
-            .phrase(phrase)
-            .derivation_path(&path)
-            .map_err(|e| anyhow::anyhow!("derivation path {path}: {e}"))?
-            .build()
-            .map_err(|e| anyhow::anyhow!("deriving signer {i} from mnemonic: {e}"))?;
-        out.push(DerivedSigner {
-            address: signer.address(),
-            signer,
-        });
-    }
-    Ok(out)
+    (0..count)
+        .map(|i| {
+            let path = format!("m/44'/60'/0'/0/{i}");
+            let signer = MnemonicBuilder::<English>::default()
+                .phrase(phrase)
+                .derivation_path(&path)
+                .map_err(|e| anyhow::anyhow!("derivation path {path}: {e}"))?
+                .build()
+                .map_err(|e| anyhow::anyhow!("deriving signer {i} from mnemonic: {e}"))?;
+            Ok(DerivedSigner {
+                address: signer.address(),
+                signer,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -56,7 +56,7 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, address};
 
-    const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
+    use crate::ANVIL_MNEMONIC as ANVIL_PHRASE;
 
     #[test]
     fn generate_12_words_round_trips() {

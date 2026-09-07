@@ -6,17 +6,11 @@
 //! binary and builds a `Benchmark<MyWorkflow>` directly.
 
 use std::path::Path;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use jsonrpsee::http_client::HttpClientBuilder;
-use tracing_subscriber::EnvFilter;
 
-use kardamom_bench::config::{
-    DEFAULT_CONCURRENCY, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TIMEOUT_STR, DEFAULT_TXS_PER_TASK,
-    MAX_IN_FLIGHT_SLACK, REQUEST_TIMEOUT,
-};
-use kardamom_bench::report::{self, ReportInputs};
+use kardamom_bench::config::{BenchArgs, rpc_client};
+use kardamom_bench::report;
 use kardamom_bench::{
     BenchWorkflow, Benchmark, CallsWorkflow, MixedWorkflow, Outputs, TransfersWorkflow,
 };
@@ -28,25 +22,8 @@ struct Args {
     #[arg(long)]
     rpc: String,
 
-    /// A safety timeout for each phase. Warmup and dispatch each get
-    /// their own timeout. A sender also stops when its work vector is
-    /// drained, whichever comes first.
-    #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_TIMEOUT_STR)]
-    timeout: Duration,
-
-    /// The number of sender tasks. This equals the number of derived
-    /// signers, one per task.
-    #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
-    concurrency: u32,
-
-    /// The number of pre-signed transactions in the queue of each
-    /// sender task.
-    #[arg(long = "txs-per-task", default_value_t = DEFAULT_TXS_PER_TASK)]
-    txs_per_task: u32,
-
-    /// The limit on outstanding requests for each sender task.
-    #[arg(long = "max-in-flight", default_value_t = DEFAULT_MAX_IN_FLIGHT)]
-    max_in_flight: u32,
+    #[command(flatten)]
+    bench: BenchArgs,
 
     /// Write the report as JSON to this path in addition to printing it.
     #[arg(long)]
@@ -69,18 +46,11 @@ enum WorkloadCmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    kardamom_obs::bin::init_tracing();
 
     let args = Args::parse();
 
-    let client = HttpClientBuilder::default()
-        .request_timeout(REQUEST_TIMEOUT)
-        .max_concurrent_requests(args.max_in_flight as usize + MAX_IN_FLIGHT_SLACK)
-        .build(&args.rpc)?;
+    let client = rpc_client(&args.rpc, args.bench.max_in_flight)?;
 
     let report = match &args.workload {
         WorkloadCmd::Transfers => {
@@ -106,15 +76,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn bench_with<W: BenchWorkflow>(workflow: W, args: &Args) -> Benchmark<W> {
-    // This is a plain field copy. It stays a regular function, not a
-    // `const` function, because `Benchmark::workflow` is generic and can
-    // carry non-const data.
     Benchmark {
         workflow,
-        timeout: args.timeout,
-        concurrency: args.concurrency,
-        txs_per_task: args.txs_per_task,
-        max_in_flight: args.max_in_flight,
+        timeout: args.bench.timeout,
+        concurrency: args.bench.concurrency,
+        txs_per_task: args.bench.txs_per_task,
+        max_in_flight: args.bench.max_in_flight,
     }
 }
 
@@ -126,23 +93,63 @@ async fn run_one<W: BenchWorkflow>(
     tracing::info!(
         rpc = %args.rpc,
         workload = bench.workflow.name(),
-        txs_per_task = bench.txs_per_task,
+        txs_per_task = bench.txs_per_task.get(),
         max_in_flight = bench.max_in_flight,
         timeout = ?bench.timeout,
-        concurrency = bench.concurrency,
+        concurrency = bench.concurrency.get(),
         "starting bench"
     );
     let outputs: Outputs = bench.run(client).await?;
-    Ok(report::build_report(
-        ReportInputs {
-            workload_name: bench.workflow.name(),
-            txs_per_task: bench.txs_per_task,
-            max_in_flight: bench.max_in_flight,
-            concurrency: bench.concurrency,
-            configured_timeout: bench.timeout,
-        },
-        &outputs.counters,
-        outputs.histograms,
-        outputs.measurement_duration,
-    ))
+    Ok(bench.report(outputs))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use kardamom_bench::config::{
+        DEFAULT_CONCURRENCY, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TXS_PER_TASK,
+    };
+
+    use super::*;
+
+    #[test]
+    fn args_parse_with_only_the_required_flag() {
+        let args = Args::parse_from([
+            "kardamom-bench",
+            "--rpc",
+            "http://localhost:8545",
+            "transfers",
+        ]);
+        assert_eq!(args.rpc, "http://localhost:8545");
+        assert_eq!(args.bench.timeout, Duration::from_secs(10));
+        assert_eq!(args.bench.concurrency.get(), DEFAULT_CONCURRENCY);
+        assert_eq!(args.bench.txs_per_task.get(), DEFAULT_TXS_PER_TASK);
+        assert_eq!(args.bench.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
+        assert!(args.output.is_none());
+        assert!(matches!(args.workload, WorkloadCmd::Transfers));
+    }
+
+    #[test]
+    fn args_parse_overrides_every_bench_flag() {
+        let args = Args::parse_from([
+            "kardamom-bench",
+            "--rpc",
+            "http://localhost:8545",
+            "--timeout",
+            "5s",
+            "--concurrency",
+            "4",
+            "--txs-per-task",
+            "9",
+            "--max-in-flight",
+            "3",
+            "calls",
+        ]);
+        assert_eq!(args.bench.timeout, Duration::from_secs(5));
+        assert_eq!(args.bench.concurrency.get(), 4);
+        assert_eq!(args.bench.txs_per_task.get(), 9);
+        assert_eq!(args.bench.max_in_flight, 3);
+        assert!(matches!(args.workload, WorkloadCmd::Calls));
+    }
 }

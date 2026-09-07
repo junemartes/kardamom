@@ -1,5 +1,7 @@
 //! Role-specific adapters and construction: the executor's `EngineWiring`,
-//! the live tx_receipts publication, and the opt-in Block-STM strategy.
+//! the live `tx_receipts` publication, and the opt-in Block-STM strategy.
+
+use std::num::NonZeroUsize;
 
 use anyhow::{Context, Result};
 use kardamom_engine::actor::BlockExec;
@@ -14,7 +16,7 @@ use kardamom_state::StateSnapshot;
 
 use crate::args::Args;
 
-/// tx_receipts publication. With MDS (fan-in) enabled, this replica
+/// `tx_receipts` publication. With MDS (fan-in) enabled, this replica
 /// publishes the receipt stream and the boundary side-stream to its own
 /// per-replica unicast endpoint (chosen by `--recorder-id`). Ingress
 /// combines every replica's endpoint into one multi-destination
@@ -52,14 +54,17 @@ pub(crate) fn build_block_exec(args: &Args) -> Option<BlockExec<StateSnapshot>> 
     }
     // 0 means auto. The hard cap is 40, from the mdbx reader-slot budget
     // (geometry::MAX_READERS = 64, shared with exec, RPC, and compaction).
+    // Both arms yield at least 1, so `workers` is a `NonZeroUsize` from
+    // this boundary on.
     let workers = match args.execution_workers {
         0 => std::thread::available_parallelism()
-            .map(|n| n.get().min(8))
-            .unwrap_or(4),
-        n => n.min(40),
+            .map_or(NonZeroUsize::new(4).expect("4 != 0"), |n| {
+                NonZeroUsize::new(n.get().min(8)).expect("n.get() >= 1, so min(8) >= 1")
+            }),
+        n => NonZeroUsize::new(n.min(40)).expect("n >= 1 in this match arm, so min(40) >= 1"),
     };
     tracing::info!(
-        workers,
+        workers = workers.get(),
         "parallel execution ENABLED (Block-STM, block-at-a-time)"
     );
     Some(kardamom_executor::parallel::stm_block_exec(
@@ -100,7 +105,7 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
     /// ack round trip through the Aeron thread, instead of one per receipt.
     /// Each frame is all-or-nothing. A transient failure reports 0
     /// published, and the commit thread's must-deliver loop retries the
-    /// whole batch. The duplicates are harmless: tx_receipts delivers at
+    /// whole batch. The duplicates are harmless: `tx_receipts` delivers at
     /// least once, and consumers dedupe on `tx_idx`.
     fn publish_receipts(
         &mut self,

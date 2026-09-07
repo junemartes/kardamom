@@ -49,34 +49,43 @@ pub(crate) async fn receipt_feed_task(
             }
         };
         tracing::info!("receipt feed: subscribed");
-        while let Some(item) = sub.next().await {
-            let Ok(v) = item else { continue };
-            match v["type"].as_str() {
-                Some("receipt") => {
-                    let r = &v["receipt"];
-                    let Some(hash) = r["transactionHash"]
-                        .as_str()
-                        .and_then(|s| s.parse::<alloy_primitives::B256>().ok())
-                    else {
-                        continue;
-                    };
-                    let status = json_hex_u64(&r["status"]).unwrap_or(0);
-                    let gas = json_hex_u64(&r["gasUsed"]).unwrap_or(0);
-                    tracker.confirm_from_feed(hash, status, gas);
-                }
-                Some("txError") => {
-                    tracing::warn!(payload = %v, "receipt feed: sequencer rejection");
-                }
-                Some("lagged") => {
-                    tracing::warn!(
-                        payload = %v,
-                        "receipt feed: lagged — drain will settle the gap"
-                    );
-                }
-                _ => {}
-            }
-        }
+        drain_receipts(&mut sub, &tracker).await;
         tracing::warn!("receipt feed: stream ended; reconnecting");
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// Drain the subscription until the stream ends, confirming each
+/// receipt item into `tracker`.
+async fn drain_receipts(
+    sub: &mut jsonrpsee::core::client::Subscription<serde_json::Value>,
+    tracker: &Tracker,
+) {
+    while let Some(item) = sub.next().await {
+        let Ok(v) = item else { continue };
+        match v["type"].as_str() {
+            Some("receipt") => {
+                let r = &v["receipt"];
+                let Some(hash) = r["transactionHash"]
+                    .as_str()
+                    .and_then(|s| s.parse::<alloy_primitives::B256>().ok())
+                else {
+                    continue;
+                };
+                let status = json_hex_u64(&r["status"]).unwrap_or(0);
+                let gas = json_hex_u64(&r["gasUsed"]).unwrap_or(0);
+                tracker.confirm_from_feed(hash, status, gas);
+            }
+            Some("txError") => {
+                tracing::warn!(payload = %v, "receipt feed: sequencer rejection");
+            }
+            Some("lagged") => {
+                tracing::warn!(
+                    payload = %v,
+                    "receipt feed: lagged — drain will settle the gap"
+                );
+            }
+            _ => {}
+        }
     }
 }

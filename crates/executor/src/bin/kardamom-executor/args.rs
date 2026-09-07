@@ -2,10 +2,30 @@
 //! lives in `main.rs`; state recovery in `state.rs`; role adapters in
 //! `wiring.rs`.
 
+use std::num::{NonZeroU8, NonZeroU64, ParseIntError};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::Parser;
 use kardamom_engine::bin_support::StateDurabilityArg;
+
+/// `checkpoint_interval_secs`'s parsed value: `None` (from `"0"`) means
+/// checkpointing is disabled. A newtype, not `Option<NonZeroU64>`
+/// directly, because clap-derive's special-cased handling of an
+/// `Option<T>` field expects `T` to come back from its value parser,
+/// not `Option<T>`; wrapping it in a struct with its own `FromStr`
+/// keeps clap's "one required arg" machinery off this field, and lets
+/// the parser return the `None`-means-disabled value clap otherwise
+/// reserves for "argument absent".
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CheckpointInterval(pub(crate) Option<NonZeroU64>);
+
+impl FromStr for CheckpointInterval {
+    type Err = ParseIntError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse::<u64>().map(|n| Self(NonZeroU64::new(n)))
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -26,25 +46,24 @@ pub(crate) struct Args {
     /// Aeron Media Driver directory (`aeron.dir`).
     #[arg(long)]
     pub(crate) aeron_dir: Option<PathBuf>,
-    /// This replica's index. It selects the per-replica tx_receipts MDS
+    /// This replica's index. It selects the per-replica `tx_receipts` MDS
     /// endpoint (`channels.tx_receipts_endpoint(recorder_id)`). In the
     /// cluster, this comes from `${NOMAD_ALLOC_INDEX}` (the executor job is
     /// count-based, with `distinct_hosts`), and matches the co-located
     /// recorder's ID. The code uses it only when
-    /// `tx_receipts_mds_enabled()` is true. The old shared single-channel
-    /// path ignores it.
+    /// `tx_receipts_mds_enabled()` is true.
     #[arg(long, env = "KARDAMOM_RECORDER_ID", default_value_t = 0)]
     pub(crate) recorder_id: u32,
-    /// Number of tx_data shards to subscribe to. The default is 8, to match
-    /// the default `partition_count` in the sequencer.
-    #[arg(long, default_value_t = 8)]
-    pub(crate) shards: u8,
-    /// Execute blocks through the Block-STM engine (block-at-a-time; a
-    /// streaming pipeline is a planned follow-up). When off, the binary
-    /// uses the streaming per-tx path, byte-for-byte as before. Output is
-    /// byte-identical either way: receipts, deltas, and published BALs are
-    /// the same artifacts. The validator cross-check stops the process on
-    /// any drift.
+    /// Number of `tx_data` shards to subscribe to. The default is 8, to match
+    /// the default `partition_count` in the sequencer. Non-zero:
+    /// `MockChannels::new(0)` makes an empty shard set.
+    #[arg(long, default_value_t = NonZeroU8::new(8).expect("8 != 0"))]
+    pub(crate) shards: NonZeroU8,
+    /// Execute blocks through the Block-STM engine (block-at-a-time). When
+    /// off, the binary uses the streaming per-tx path, with byte-for-byte
+    /// identical output. Output is byte-identical either way: receipts,
+    /// deltas, and published BALs are the same artifacts. The validator
+    /// cross-check stops the process on any drift.
     #[arg(long, env = "KARDAMOM_PARALLEL_EXECUTION", default_value_t = false)]
     pub(crate) parallel_execution: bool,
     /// Worker threads for `--parallel-execution`. 0 means auto
@@ -61,10 +80,9 @@ pub(crate) struct Args {
     /// L2 chain id (used for revm).
     #[arg(long, default_value_t = 1)]
     pub(crate) chain_id: u64,
-    /// Deprecated and ignored. The executor now reads its startup block from
-    /// the persisted state cursor (`last_committed_block`, 0 for a fresh
-    /// genesis DB). This field stays so old invocations don't error; the
-    /// value itself is unused.
+    /// Deprecated. Accepted and ignored: the executor reads its startup
+    /// block from the persisted state cursor (`last_committed_block`, 0
+    /// for a fresh genesis DB).
     #[arg(long, default_value_t = 1)]
     pub(crate) initial_block: u64,
     /// Path to a genesis TOML (schema: `kardamom_types::Genesis`). The chain
@@ -87,15 +105,15 @@ pub(crate) struct Args {
     /// it only for tests or short-lived runs. It is unsafe on real hosts.
     #[arg(long, value_enum, default_value_t = StateDurabilityArg::Durable)]
     pub(crate) state_durability: StateDurabilityArg,
-    /// UDP endpoint (`host:port`) on this node for refetched tx_data and
-    /// tx_deposits fragments. A canonical reference whose envelope never
+    /// UDP endpoint (`host:port`) on this node for refetched `tx_data` and
+    /// `tx_deposits` fragments. A canonical reference whose envelope never
     /// arrived on the live multicast (image lapse, blackout, or a restart
     /// down-window) is recovered in-band: the reader replays the missing
     /// range from the remote durability archives
     /// (`tx_data_archive_endpoints` and `tx_deposits_archive_endpoints` in
     /// channels.toml) onto this endpoint. If unset, refetch is disabled
     /// (single-host and IPC runs), and a lost envelope is fatal after the
-    /// join timeout. tx_ordering crash recovery uses the Aeron Cluster
+    /// join timeout. `tx_ordering` crash recovery uses the Aeron Cluster
     /// client's `REPLAY_FROM` instead of this path.
     #[arg(long, env = "KARDAMOM_REPLAY_DESTINATION")]
     pub(crate) replay_destination_endpoint: Option<String>,
@@ -116,11 +134,12 @@ pub(crate) struct Args {
     pub(crate) checkpoint_dir: Option<PathBuf>,
     /// Interval, in seconds, between periodic state checkpoints. 0 disables
     /// checkpoint creation (restore-only). Ignored unless `checkpoint_dir` is set.
-    #[arg(long, default_value_t = 0)]
-    pub(crate) checkpoint_interval_secs: u64,
+    #[arg(long, default_value = "0")]
+    pub(crate) checkpoint_interval_secs: CheckpointInterval,
     /// Number of recent checkpoints to retain (older ones are pruned).
-    #[arg(long, default_value_t = 3)]
-    pub(crate) checkpoint_keep: u64,
+    /// Non-zero: keeping 0 checkpoints defeats the feature.
+    #[arg(long, default_value_t = NonZeroU64::new(3).expect("3 != 0"))]
+    pub(crate) checkpoint_keep: NonZeroU64,
     /// TCP address that serves this node's newest checkpoint to peer
     /// executors (`GET /checkpoint/latest`). Replicas are deterministic
     /// state machines, so any replica's checkpoint is a valid restore
@@ -140,4 +159,46 @@ pub(crate) struct Args {
     /// Host identifier. It is stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
     pub(crate) host_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Args;
+
+    /// `CheckpointInterval` gives clap one concrete type for this
+    /// field. This test parses a real command line, so a clap
+    /// definition-versus-access mismatch fails here.
+    #[test]
+    fn args_parse_with_only_the_required_flag() {
+        Args::try_parse_from(["kardamom-executor", "--config", "executor.toml"])
+            .expect("Args parses with just --config");
+    }
+
+    #[test]
+    fn checkpoint_interval_secs_parses_zero_and_nonzero() {
+        let a = Args::try_parse_from([
+            "kardamom-executor",
+            "--config",
+            "executor.toml",
+            "--checkpoint-interval-secs",
+            "0",
+        ])
+        .expect("parses");
+        assert!(a.checkpoint_interval_secs.0.is_none(), "0 means disabled");
+
+        let a = Args::try_parse_from([
+            "kardamom-executor",
+            "--config",
+            "executor.toml",
+            "--checkpoint-interval-secs",
+            "30",
+        ])
+        .expect("parses");
+        assert_eq!(
+            a.checkpoint_interval_secs.0.map(std::num::NonZeroU64::get),
+            Some(30)
+        );
+    }
 }

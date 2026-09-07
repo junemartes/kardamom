@@ -1,9 +1,8 @@
 //! `Benchmark<W>` is the dispatcher. It is generic over a `BenchWorkflow`.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
@@ -11,13 +10,10 @@ use jsonrpsee::http_client::HttpClient;
 
 use crate::config::{
     DEFAULT_CONCURRENCY, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TIMEOUT, DEFAULT_TXS_PER_TASK,
+    HIST_HIGH_US, HIST_LOW_US,
 };
 use crate::report::Counters;
-use crate::workflow::BenchWorkflow;
-
-const HIST_LOWEST_US: u64 = 1;
-const HIST_HIGHEST_US: u64 = 60_000_000; // 60 seconds
-const HIST_SIGFIGS: u8 = 3;
+use crate::workflow::{BenchWorkflow, DispatchOutcome};
 
 /// The settings and the workflow for a run.
 /// Construct this directly. `Default` fills in the standard
@@ -35,12 +31,12 @@ pub struct Benchmark<W: BenchWorkflow> {
     pub timeout: Duration,
     /// The number of sender tasks. This equals the number of derived
     /// signers, one per task. Built-in workflows use this value to size
-    /// their allocation set.
-    pub concurrency: u32,
+    /// their allocation set. Non-zero: a 0-task run produces no samples.
+    pub concurrency: NonZeroU32,
     /// The number of pre-signed transactions in the queue of each sender
     /// task. The run attempts a total of `txs_per_task * concurrency`
-    /// items of work.
-    pub txs_per_task: u32,
+    /// items of work. Non-zero: a 0-item queue produces no samples.
+    pub txs_per_task: NonZeroU32,
     /// The limit on outstanding requests across all senders. The HTTP
     /// client layer enforces this limit, through `max_concurrent_requests`,
     /// not a per-task semaphore. See the doc comment on
@@ -53,8 +49,8 @@ impl<W: BenchWorkflow + Default> Default for Benchmark<W> {
         Self {
             workflow: W::default(),
             timeout: DEFAULT_TIMEOUT,
-            concurrency: DEFAULT_CONCURRENCY,
-            txs_per_task: DEFAULT_TXS_PER_TASK,
+            concurrency: NonZeroU32::new(DEFAULT_CONCURRENCY).expect("DEFAULT_CONCURRENCY != 0"),
+            txs_per_task: NonZeroU32::new(DEFAULT_TXS_PER_TASK).expect("DEFAULT_TXS_PER_TASK != 0"),
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
         }
     }
@@ -113,18 +109,12 @@ impl<W: BenchWorkflow> Benchmark<W> {
     ///
     /// Forwards errors from `BenchWorkflow::prepare`, such as
     /// workflow-specific chain-state checks, signer derivation, or
-    /// presigning. Also fails early if `concurrency == 0` or
-    /// `txs_per_task == 0`. Both are user settings that would otherwise
-    /// silently produce a run with zero samples.
+    /// presigning. `concurrency` and `txs_per_task` are `NonZeroU32`,
+    /// so a 0-task or 0-item run, which would otherwise silently
+    /// produce zero samples, is a construction-time type error instead.
     pub async fn prepare(&self, client: &HttpClient) -> anyhow::Result<Prepared<W::Item>> {
-        if self.concurrency == 0 {
-            anyhow::bail!("Benchmark.concurrency must be > 0");
-        }
-        if self.txs_per_task == 0 {
-            anyhow::bail!("Benchmark.txs_per_task must be > 0");
-        }
         self.workflow
-            .prepare(client, self.concurrency, self.txs_per_task)
+            .prepare(client, self.concurrency.get(), self.txs_per_task.get())
             .await
     }
 
@@ -174,8 +164,11 @@ impl<W: BenchWorkflow> Benchmark<W> {
     /// runtime-wide `max_in_flight` budget, as
     /// `max_concurrent_requests = max_in_flight + MAX_IN_FLIGHT_SLACK`,
     /// not this method.
-    /// A per-task `Arc<TaskAccum>` keeps samples even when a timeout
-    /// cancels the task.
+    /// Each sender task owns its counts and histograms locally, and
+    /// returns them from its `JoinHandle` when it finishes. A timeout
+    /// drops only the in-flight `send_all` future; the task's owned
+    /// state, already updated for every completed request, survives
+    /// and is still returned.
     ///
     /// # Errors
     ///
@@ -183,12 +176,6 @@ impl<W: BenchWorkflow> Benchmark<W> {
     /// panics (the join handle forwards the panic), or if histogram
     /// merging finds a unit mismatch. A unit mismatch cannot happen with
     /// the bounds set here, but the method reports it for completeness.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a sender task panicked while it held the per-task
-    /// accumulator mutex. That poisons the mutex. This method reports
-    /// the poisoning as a hard error, instead of silently dropping samples.
     pub async fn dispatch(
         &self,
         client: HttpClient,
@@ -200,22 +187,28 @@ impl<W: BenchWorkflow> Benchmark<W> {
 
         let start = Instant::now();
 
-        let mut accums: Vec<Arc<TaskAccum>> = Vec::with_capacity(main.len());
         let mut handles = Vec::with_capacity(main.len());
         for work in main {
-            let accum = Arc::new(TaskAccum::new(methods)?);
-            accums.push(Arc::clone(&accum));
             let client = Arc::clone(&client);
             let workflow = Arc::clone(&workflow);
             let timeout = self.timeout;
+            let mut counts = TaskCounts {
+                ok: 0,
+                err: 0,
+                histograms: empty_histograms(methods)?,
+            };
             handles.push(tokio::spawn(async move {
-                let _ =
-                    tokio::time::timeout(timeout, send_loop(workflow, accum, client, work)).await;
+                tokio::select! {
+                    () = counts.send_all(&*workflow, &client, work) => {}
+                    () = tokio::time::sleep(timeout) => {}
+                }
+                counts
             }));
         }
 
+        let mut task_counts = Vec::with_capacity(handles.len());
         for h in handles {
-            h.await.map_err(|e| anyhow::anyhow!("task join: {e}"))?;
+            task_counts.push(h.await.map_err(|e| anyhow::anyhow!("task join: {e}"))?);
         }
 
         let measurement_duration = start.elapsed();
@@ -225,35 +218,18 @@ impl<W: BenchWorkflow> Benchmark<W> {
             ok: 0,
             err: 0,
         };
-        let mut per_task: Vec<BTreeMap<String, Histogram<u64>>> = Vec::with_capacity(accums.len());
-        for accum in accums {
-            counters.ok += accum.ok.load(Ordering::Relaxed);
-            counters.err += accum.err.load(Ordering::Relaxed);
-            // The per-task `TaskAccum` mutex is locked only here and inside
-            // `send_loop`. A poisoned mutex means a sender task panicked
-            // mid-iteration. This is a real bug: report it, do not drop samples.
-            let h = accum
-                .histograms
-                .lock()
-                .expect("task accumulator mutex poisoned (sender task panicked)")
-                .clone();
-            per_task.push(h);
+        let mut per_task: Vec<BTreeMap<String, Histogram<u64>>> =
+            Vec::with_capacity(task_counts.len());
+        for counts in task_counts {
+            counters.ok += counts.ok;
+            counters.err += counts.err;
+            per_task.push(counts.histograms);
         }
         counters.sent = counters.ok + counters.err;
 
-        let mut merged: BTreeMap<String, Histogram<u64>> = BTreeMap::new();
-        for m in methods {
-            merged.insert(
-                (*m).to_string(),
-                Histogram::<u64>::new_with_bounds(HIST_LOWEST_US, HIST_HIGHEST_US, HIST_SIGFIGS)?,
-            );
-        }
+        let mut merged = empty_histograms(methods)?;
         for task_hist in &per_task {
-            for (k, h) in task_hist {
-                if let Some(m) = merged.get_mut(k) {
-                    m.add(h).map_err(|e| anyhow::anyhow!("hist merge: {e:?}"))?;
-                }
-            }
+            merge_task_histograms(&mut merged, task_hist)?;
         }
 
         Ok(Outputs {
@@ -278,102 +254,179 @@ impl<W: BenchWorkflow> Benchmark<W> {
         self.warmup(&client, prepared.warmup).await?;
         self.dispatch(client, prepared.main).await
     }
-}
 
-struct TaskAccum {
-    ok: AtomicU64,
-    err: AtomicU64,
-    histograms: Mutex<BTreeMap<String, Histogram<u64>>>,
-}
-
-impl TaskAccum {
-    fn new(methods: &[&'static str]) -> anyhow::Result<Self> {
-        let mut histograms = BTreeMap::new();
-        for m in methods {
-            histograms.insert(
-                (*m).to_string(),
-                Histogram::<u64>::new_with_bounds(HIST_LOWEST_US, HIST_HIGHEST_US, HIST_SIGFIGS)?,
-            );
-        }
-        Ok(Self {
-            ok: AtomicU64::new(0),
-            err: AtomicU64::new(0),
-            histograms: Mutex::new(histograms),
-        })
+    /// Build a [`crate::report::BenchReport`] from this run's settings
+    /// and `outputs`. Both callers of `run`, the closed-loop binary and
+    /// the in-process harness, report the same five settings fields
+    /// this way.
+    pub fn report(&self, outputs: Outputs) -> crate::report::BenchReport {
+        crate::report::build_report(
+            crate::report::ReportInputs {
+                workload_name: self.workflow.name(),
+                txs_per_task: self.txs_per_task.get(),
+                max_in_flight: self.max_in_flight,
+                concurrency: self.concurrency.get(),
+                configured_timeout: self.timeout,
+            },
+            &outputs.counters,
+            outputs.histograms,
+            outputs.measurement_duration,
+        )
     }
 }
 
-async fn send_loop<W: BenchWorkflow>(
-    workflow: Arc<W>,
-    accum: Arc<TaskAccum>,
-    client: Arc<HttpClient>,
-    work: Vec<W::Item>,
-) {
-    // This function uses no per-task semaphore. Each sender task waits for
-    // one in-flight request before it sends the next, so per-task in-flight
-    // count is always 1. The `max_in_flight` setting lives on the HTTP
-    // client instead. The harness sets
-    // `max_concurrent_requests(max_in_flight + MAX_IN_FLIGHT_SLACK)`
-    // as the runtime-wide budget across all sender tasks.
-    for item in work {
-        let t0 = Instant::now();
-        let (method, ok) = workflow.dispatch(&client, item).await;
-        // `as_micros` returns a `u128`. Saturate to `u64`: this only
-        // matters for a dispatch that takes over 584,500 years.
-        let elapsed_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+/// One sender task's owned result: counts and per-method latency
+/// histograms. Returned from the task's `JoinHandle`, instead of
+/// shared through a mutex.
+struct TaskCounts {
+    ok: u64,
+    err: u64,
+    histograms: BTreeMap<String, Histogram<u64>>,
+}
 
-        if ok {
-            accum.ok.fetch_add(1, Ordering::Relaxed);
+impl TaskCounts {
+    /// Send every item in `work`, in order, one request in flight at a
+    /// time, and fold each result into `self`.
+    ///
+    /// This method uses no per-task semaphore. Each sender task waits
+    /// for one in-flight request before it sends the next, so per-task
+    /// in-flight count is always 1. The `max_in_flight` setting lives
+    /// on the HTTP client instead. The harness sets
+    /// `max_concurrent_requests(max_in_flight + MAX_IN_FLIGHT_SLACK)`
+    /// as the runtime-wide budget across all sender tasks.
+    ///
+    /// The caller races this against a timeout. A cancelled call drops
+    /// this future mid-request, but `self` holds every result already
+    /// folded in, so the caller keeps those samples regardless of
+    /// which side of the race wins.
+    async fn send_all<W: BenchWorkflow>(
+        &mut self,
+        workflow: &W,
+        client: &HttpClient,
+        work: Vec<W::Item>,
+    ) {
+        for item in work {
+            let t0 = Instant::now();
+            let outcome = workflow.dispatch(client, item).await;
+            // `as_micros` returns a `u128`. Saturate to `u64`: this only
+            // matters for a dispatch that takes over 584,500 years.
+            let elapsed_us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+            self.record(outcome, elapsed_us);
+        }
+    }
+
+    /// Fold one dispatch outcome into this task's counts and its
+    /// method's latency histogram.
+    fn record(&mut self, outcome: DispatchOutcome, elapsed_us: u64) {
+        if outcome.success {
+            self.ok += 1;
         } else {
-            accum.err.fetch_add(1, Ordering::Relaxed);
+            self.err += 1;
         }
-        if let Ok(mut h) = accum.histograms.lock()
-            && let Some(hist) = h.get_mut(method)
-        {
-            let _ = hist.record(elapsed_us.clamp(HIST_LOWEST_US, HIST_HIGHEST_US));
+        if let Some(hist) = self.histograms.get_mut(outcome.method) {
+            let _ = hist.record(elapsed_us.clamp(HIST_LOW_US, HIST_HIGH_US));
         }
     }
+}
+
+/// An empty histogram for each method, at the run's fixed bounds.
+fn empty_histograms(methods: &[&'static str]) -> anyhow::Result<BTreeMap<String, Histogram<u64>>> {
+    methods
+        .iter()
+        .map(|m| {
+            crate::config::new_latency_hist()
+                .map(|h| ((*m).to_string(), h))
+                .map_err(|e| anyhow::anyhow!("hist init: {e}"))
+        })
+        .collect()
+}
+
+/// Merge one task's per-method histograms into `merged`.
+fn merge_task_histograms(
+    merged: &mut BTreeMap<String, Histogram<u64>>,
+    task_hist: &BTreeMap<String, Histogram<u64>>,
+) -> anyhow::Result<()> {
+    for (k, h) in task_hist {
+        if let Some(m) = merged.get_mut(k) {
+            m.add(h).map_err(|e| anyhow::anyhow!("hist merge: {e:?}"))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::workflows::TransfersWorkflow;
-    use jsonrpsee::http_client::HttpClientBuilder;
+    use kardamom_types::AllocEntry;
 
-    fn dummy_bench(concurrency: u32, txs_per_task: u32) -> Benchmark<TransfersWorkflow> {
-        Benchmark {
-            workflow: TransfersWorkflow::default(),
-            timeout: Duration::from_secs(1),
-            concurrency,
-            txs_per_task,
-            max_in_flight: 1,
+    use super::*;
+
+    /// A workflow with no genesis state and no network calls, so a test
+    /// can exercise `Benchmark::prepare`'s NonZero-to-`u32` handoff
+    /// without a live client.
+    #[derive(Debug, Clone)]
+    struct NoopWorkflow;
+
+    impl BenchWorkflow for NoopWorkflow {
+        type Item = ();
+
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+
+        fn methods(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn genesis_alloc(&self, _n_tasks: u32) -> anyhow::Result<Vec<AllocEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn prepare(
+            &self,
+            _client: &HttpClient,
+            n_tasks: u32,
+            txs_per_task: u32,
+        ) -> impl std::future::Future<Output = anyhow::Result<Prepared<Self::Item>>> + Send
+        {
+            std::future::ready(Ok(Prepared {
+                warmup: Vec::new(),
+                main: (0..n_tasks)
+                    .map(|_| vec![(); txs_per_task as usize])
+                    .collect(),
+            }))
+        }
+
+        fn dispatch(
+            &self,
+            _client: &HttpClient,
+            (): (),
+        ) -> impl std::future::Future<Output = DispatchOutcome> + Send {
+            std::future::ready(DispatchOutcome {
+                method: "noop",
+                success: true,
+            })
         }
     }
 
-    fn dummy_client() -> HttpClient {
-        // This client is never used. The `prepare` zero-value guards fail
-        // before the code touches the client.
-        HttpClientBuilder::default()
+    /// `Benchmark::prepare` passes `concurrency.get()` and
+    /// `txs_per_task.get()` straight through to the workflow: one task
+    /// per sender, `txs_per_task` items in each.
+    #[tokio::test]
+    async fn prepare_passes_nonzero_concurrency_and_txs_per_task_through() {
+        let bench = Benchmark {
+            workflow: NoopWorkflow,
+            timeout: Duration::from_secs(1),
+            concurrency: NonZeroU32::new(3).expect("3 != 0"),
+            txs_per_task: NonZeroU32::new(5).expect("5 != 0"),
+            max_in_flight: 8,
+        };
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
             .build("http://127.0.0.1:1")
-            .expect("dummy client build")
-    }
-
-    #[tokio::test]
-    async fn prepare_bails_on_zero_concurrency() {
-        let err = dummy_bench(0, 10)
-            .prepare(&dummy_client())
-            .await
-            .expect_err("concurrency=0 should bail");
-        assert!(format!("{err:#}").contains("concurrency"));
-    }
-
-    #[tokio::test]
-    async fn prepare_bails_on_zero_txs_per_task() {
-        let err = dummy_bench(4, 0)
-            .prepare(&dummy_client())
-            .await
-            .expect_err("txs_per_task=0 should bail");
-        assert!(format!("{err:#}").contains("txs_per_task"));
+            .expect("client builds without connecting");
+        let prepared = bench.prepare(&client).await.expect("prepare");
+        assert_eq!(prepared.main.len(), 3, "one work vector per task");
+        for task in &prepared.main {
+            assert_eq!(task.len(), 5, "txs_per_task items in each task");
+        }
     }
 }

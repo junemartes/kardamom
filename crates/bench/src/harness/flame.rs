@@ -31,20 +31,24 @@ pub(crate) struct FilteredReport {
 /// function drops a sample that lands entirely in bench-side,
 /// jsonrpsee-client, tokio, or hyper code.
 pub(crate) fn filter_to_ingress(report: &pprof::Report) -> FilteredReport {
-    let mut kept = std::collections::HashMap::new();
-    let mut kept_count: isize = 0;
-    let mut dropped_count: isize = 0;
-    for (frames, count) in &report.data {
-        if frames_contains_ingress(frames) {
-            kept.insert(frames.clone(), *count);
-            kept_count += *count;
-        } else {
-            dropped_count += *count;
-        }
-    }
+    let (kept, dropped): (
+        std::collections::HashMap<_, _>,
+        std::collections::HashMap<_, _>,
+    ) = report
+        .data
+        .iter()
+        .partition(|(frames, _)| frames_contains_ingress(frames));
+    let kept_count: isize = kept
+        .values()
+        .copied()
+        .fold(0isize, |acc, x| acc.saturating_add(*x));
+    let dropped_count: isize = dropped
+        .values()
+        .copied()
+        .fold(0isize, |acc, x| acc.saturating_add(*x));
     FilteredReport {
         report: pprof::Report {
-            data: kept,
+            data: kept.into_iter().map(|(f, c)| (f.clone(), *c)).collect(),
             timing: report.timing.clone(),
         },
         kept_count,
@@ -66,19 +70,28 @@ fn frames_contains_ingress(frames: &pprof::Frames) -> bool {
 /// drop the thread prefix.
 pub(crate) fn pprof_report_to_folded_text(report: &pprof::Report) -> String {
     use std::fmt::Write;
-    let mut out = String::new();
-    for (key, value) in &report.data {
-        let mut line = key.thread_name_or_id();
-        for frame in key.frames.iter().rev() {
-            for symbol in frame.iter().rev() {
-                write!(&mut line, ";{symbol}").unwrap();
+    report
+        .data
+        .iter()
+        .map(|(key, value)| {
+            let mut line = key.thread_name_or_id();
+            for frame in key.frames.iter().rev() {
+                append_frame_symbols(&mut line, frame);
             }
-        }
-        write!(&mut line, " {value}").unwrap();
-        out.push_str(&line);
-        out.push('\n');
+            writeln!(&mut line, " {value}").unwrap();
+            line
+        })
+        .collect()
+}
+
+/// Append one frame's symbols (innermost first, matching the
+/// inlining-aware `pprof::Frames::frames` layout) to `line`, each
+/// `;`-prefixed, matching the folded-text stack format.
+fn append_frame_symbols(line: &mut String, frame: &[pprof::Symbol]) {
+    use std::fmt::Write;
+    for symbol in frame.iter().rev() {
+        write!(line, ";{symbol}").unwrap();
     }
-    out
 }
 
 /// The inferno-flamegraph folded format is
@@ -89,8 +102,16 @@ pub(crate) fn pprof_report_to_folded_text(report: &pprof::Report) -> String {
 /// so the same merge step works for both.
 ///
 /// This function drops a line with no `;` after the thread label, such
-/// as a bare-root sample like `ThreadId(N)-tokio-rt-worker 1234`. This
-/// matches the old `grep ';'` recipe from the docs.
+/// as a bare-root sample like `ThreadId(N)-tokio-rt-worker 1234`: a
+/// stack with no frames below the thread root carries no useful
+/// attribution.
+///
+/// The output builds one `"{stack} {count}\n"` line per entry from an
+/// iterator.
+#[allow(
+    clippy::format_collect,
+    reason = "one format! per entry reads more directly here than a write! fold into a growing String"
+)]
 pub(crate) fn merge_folded_text(input: &str) -> String {
     use std::collections::BTreeMap;
     let mut merged: BTreeMap<String, u64> = BTreeMap::new();
@@ -110,16 +131,13 @@ pub(crate) fn merge_folded_text(input: &str) -> String {
         if rest.is_empty() {
             continue;
         }
-        *merged.entry(rest.to_string()).or_insert(0) += count;
+        let entry = merged.entry(rest.to_string()).or_insert(0);
+        *entry = entry.saturating_add(count);
     }
-    let mut out = String::with_capacity(input.len());
-    for (stack, count) in &merged {
-        out.push_str(stack);
-        out.push(' ');
-        out.push_str(&count.to_string());
-        out.push('\n');
-    }
-    out
+    merged
+        .iter()
+        .map(|(stack, count)| format!("{stack} {count}\n"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -147,7 +165,7 @@ ThreadId(2)-tokio-worker 5555
 ";
         let out = merge_folded_text(input);
         // Neither line has a `;`. Both are bare-root samples, so both
-        // are dropped, matching the old `grep ';'` recipe.
+        // are dropped.
         assert_eq!(out.trim(), "");
     }
 

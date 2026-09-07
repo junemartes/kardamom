@@ -1,14 +1,14 @@
 //! This is an allocation profile of the ingress transaction-submission
 //! path. It is ignored by default; run it explicitly:
 //!
-//!   cargo test -p kardamom-bench --test alloc_profile_ingress --release -- \
+//!   cargo test -p kardamom-bench --test `alloc_profile_ingress` --release -- \
 //!     --ignored --nocapture
 //!
 //! It drives `IngressProxy::submit_raw`, the hot path shared by both
 //! the JSON-RPC and binary listeners: the overload valve, per-IP rate
 //! limit, RLP decode, batched secp256k1 recovery and keccak256
-//! tx_hash, receipt-cache lookup, pending-registry park, and the
-//! publish onto the tx_data shard seam. All this runs in-process
+//! `tx_hash`, receipt-cache lookup, pending-registry park, and the
+//! publish onto the `tx_data` shard seam. All this runs in-process
 //! against `MockChannels`, with no Aeron, no network, and no
 //! jsonrpsee, under the DHAT heap profiler. A harness pump synthesizes
 //! a `Receipt` for each published envelope, and a periodic
@@ -28,7 +28,14 @@
 //!   with the nonce read from a prebuilt hash map instead of decoded.
 //!
 //! Writes dhat-heap-ingress.json next to this crate's Cargo.toml,
-//! with per-callsite attribution viewable with dh_view.html.
+//! with per-callsite attribution viewable with `dh_view.html`.
+//!
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "indices and counters here are bounded by small, fixed test parameters (shard and sender counts), never near a truncation or precision boundary"
+)]
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -38,8 +45,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use alloy_primitives::{B256, Bytes, U256, keccak256};
-use kardamom_bench::mnemonic;
-use kardamom_bench::signers::presign_transfers;
+use kardamom_bench::signers::{SignerSet, presign_transfers};
 use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::{IngressProxy, MockChannels};
 use kardamom_types::{BPosition, QuorumWatermark, Receipt};
@@ -47,7 +53,7 @@ use kardamom_types::{BPosition, QuorumWatermark, Receipt};
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
+use kardamom_bench::ANVIL_MNEMONIC as ANVIL_PHRASE;
 const CHAIN_ID: u64 = 1;
 const SENDERS: u32 = 64;
 /// The submissions kept in flight for each driver batch. This is
@@ -59,11 +65,18 @@ const MEASURED: usize = 10 * INFLIGHT; // Inside the measured window.
 
 type Proxy = IngressProxy<MockChannels, MockChannels>;
 
-/// A fake downstream. It drains each tx_data shard, stamps a monotone
-/// tx_ordering position, and echoes a synthetic `Receipt`. The nonce
+/// A fake downstream. It drains each `tx_data` shard, stamps a monotone
+/// `tx_ordering` position, and echoes a synthetic `Receipt`. The nonce
 /// comes from the prebuilt `tx_hash -> nonce` map, so the pump does no
 /// per-transaction decoding. This keeps the harness's own allocation
 /// footprint near zero.
+///
+/// `nonce_by_hash` and `position` are `Arc`s the caller also keeps;
+/// taking them by value here just clones the handle, which is cheap.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "nonce_by_hash and position are Arcs the caller also keeps; taking them by value here just clones the handle"
+)]
 fn spawn_receipt_pump(
     mock: &MockChannels,
     rx_vec: Vec<tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>>,
@@ -143,7 +156,7 @@ fn ingress_submission_allocation_profile() {
     // Pre-generate valid signed raw transactions: 64 mnemonic-derived
     // senders, with sequential nonces, interleaved in rotation, using
     // the kardamom_bench helpers.
-    let signers = mnemonic::derive_signers(ANVIL_PHRASE, SENDERS).unwrap();
+    let signers = SignerSet::derive(ANVIL_PHRASE, SENDERS).unwrap();
     let raws = presign_transfers(
         &signers,
         CHAIN_ID,
@@ -158,7 +171,7 @@ fn ingress_submission_allocation_profile() {
     let nonce_by_hash: Arc<HashMap<B256, u64>> = Arc::new(
         raws.iter()
             .enumerate()
-            .map(|(i, raw)| (keccak256(raw), i as u64 / SENDERS as u64))
+            .map(|(i, raw)| (keccak256(raw), i as u64 / u64::from(SENDERS)))
             .collect(),
     );
 

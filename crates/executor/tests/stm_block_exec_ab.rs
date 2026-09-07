@@ -1,9 +1,16 @@
-//! Merge gate for `--parallel-execution` (scheduler unification B2). The
-//! Block-STM block-at-a-time strategy must be byte-identical to the
+//! Merge gate for `--parallel-execution`. The Block-STM
+//! block-at-a-time strategy must be byte-identical to the
 //! sequential capture driver: receipts, delta, and the published BAL's
 //! RLP, on blocks with real fees, deposits interleaved between tx runs,
 //! and an invalid skip. The validator's live cross-check fail-stops on
 //! any drift. This test is the offline form of that gate.
+//!
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "indices and gas values here are bounded by the small fixed test blocks, never near a truncation boundary"
+)]
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_network::TxSignerSync;
@@ -69,7 +76,7 @@ fn deposit_record(mint: u128, to: Address, i: u64) -> BufferedRecord {
             value: U256::ZERO,
             gas_limit: 100_000,
             is_system_transaction: false,
-            input: Default::default(),
+            input: bytes::Bytes::default(),
         },
         position: BPosition {
             term_id: 0,
@@ -135,7 +142,7 @@ fn stm_strategy_matches_sequential_capture_byte_for_byte() {
     for workers in [1usize, 4, 8] {
         // B: the Block-STM strategy (fresh pool per worker count).
         let strategy = stm_block_exec::<MockStateDatabase>(StmExecConfig {
-            workers,
+            workers: std::num::NonZeroUsize::new(workers).expect("workers in [1, 4, 8]"),
             pin_cores: Vec::new(),
             keep_hot: false,
         });

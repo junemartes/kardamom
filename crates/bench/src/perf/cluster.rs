@@ -25,7 +25,7 @@ pub const NODES: &[&str] = &[
     "kardamom-aux-0",
 ];
 
-pub const SEALER_NODES: &[&str] = &[
+const SEALER_NODES: &[&str] = &[
     "kardamom-sealer-0",
     "kardamom-sealer-1",
     "kardamom-sealer-2",
@@ -35,7 +35,7 @@ const NOMAD_ADDR: &str = "http://192.168.56.10:4646";
 
 /// Run a command, and capture stdout. Errors with context on a
 /// non-zero exit code.
-pub fn sh(program: &str, args: &[&str]) -> anyhow::Result<String> {
+pub(crate) fn sh(program: &str, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new(program)
         .args(args)
         .output()
@@ -51,7 +51,7 @@ pub fn sh(program: &str, args: &[&str]) -> anyhow::Result<String> {
 }
 
 /// `docker exec <container> bash -c <script>`.
-pub fn docker_exec(container: &str, script: &str) -> anyhow::Result<String> {
+pub(crate) fn docker_exec(container: &str, script: &str) -> anyhow::Result<String> {
     sh("docker", &["exec", container, "bash", "-c", script])
 }
 
@@ -61,7 +61,7 @@ pub fn docker_exec(container: &str, script: &str) -> anyhow::Result<String> {
 /// because the `-t` template flag silently emits nothing for the list
 /// form. A periodic-batch child, such as `batcher/periodic-*`, is
 /// purged along with its parent.
-pub fn purge() -> anyhow::Result<()> {
+pub(crate) fn purge() -> anyhow::Result<()> {
     println!("==> purging nomad jobs");
     docker_exec(
         "kardamom-control-0",
@@ -92,10 +92,9 @@ done"#
 /// Returns true when the cluster's control node container exists,
 /// whether running or not. This tells apart "redeploy over an existing
 /// cluster", which needs a purge first, from "the cluster is gone",
-/// for example a torn-down host after another session's teardown.
-/// Purging a missing cluster failed the whole `up` with "No such
-/// container: kardamom-control-0", even though ci-cluster.sh handles
-/// from-scratch creation fine.
+/// for example a torn-down host after another session's teardown. A
+/// purge runs only when the cluster exists: `ci-cluster.sh` handles
+/// from-scratch creation on its own.
 fn cluster_exists() -> bool {
     sh("docker", &["inspect", "kardamom-control-0"]).is_ok()
 }
@@ -105,29 +104,15 @@ fn cluster_exists() -> bool {
 /// `ci-cluster.sh` from a fresh orchestrator with `KEEP=1` and the
 /// load and chaos stages skipped. This function blocks until the
 /// deploy's smoke gates pass, and leaves the cluster running.
+///
+/// # Errors
+///
+/// Returns an error if building the images, starting the orchestrator,
+/// running `ci-cluster.sh`, or checking the smoke gates fails.
 pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
     let root = repo_root.to_str().context("repo root not utf-8")?;
     if !skip_build {
-        println!("==> building sealer jar");
-        let jar_dir = repo_root.join("cluster/sealer-service");
-        sh(
-            "bash",
-            &[
-                "-c",
-                &format!(
-                    "cd {} && ./gradlew :service:shadowJar -q",
-                    jar_dir.display()
-                ),
-            ],
-        )?;
-        println!("==> building service binaries + orchestrator image");
-        sh(
-            "bash",
-            &[
-                &format!("{root}/deploy/cluster/scripts/local-cluster.sh"),
-                "build",
-            ],
-        )?;
+        build_images(repo_root, root)?;
     }
     if cluster_exists() {
         purge()?;
@@ -136,7 +121,40 @@ pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
             "==> no existing cluster (control-0 absent); skipping purge, ci-cluster.sh creates from scratch"
         );
     }
+    start_orchestrator(root)?;
+    let out = run_ci_cluster()?;
+    check_smoke_gates(&out)?;
+    println!("==> cluster up; smoke + ingress-churn gates passed");
+    Ok(())
+}
 
+/// Build the sealer jar, the service binaries, and the orchestrator image.
+fn build_images(repo_root: &std::path::Path, root: &str) -> anyhow::Result<()> {
+    println!("==> building sealer jar");
+    let jar_dir = repo_root.join("cluster/sealer-service");
+    sh(
+        "bash",
+        &[
+            "-c",
+            &format!(
+                "cd {} && ./gradlew :service:shadowJar -q",
+                jar_dir.display()
+            ),
+        ],
+    )?;
+    println!("==> building service binaries + orchestrator image");
+    sh(
+        "bash",
+        &[
+            &format!("{root}/deploy/cluster/scripts/local-cluster.sh"),
+            "build",
+        ],
+    )?;
+    Ok(())
+}
+
+/// Start a fresh orchestrator container, replacing any leftover one.
+fn start_orchestrator(root: &str) -> anyhow::Result<()> {
     println!("==> deploying fresh cluster (ci-cluster.sh, KEEP=1, no load/chaos stages)");
     let _ = sh("docker", &["rm", "-f", "kardamom-orch"]);
     sh(
@@ -156,7 +174,13 @@ pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
             "kardamom-orchestrator:latest",
         ],
     )?;
-    let out = sh(
+    Ok(())
+}
+
+/// Run `ci-cluster.sh` inside the orchestrator, with `KEEP=1` and the
+/// load and chaos stages skipped. Returns its combined output.
+fn run_ci_cluster() -> anyhow::Result<String> {
+    sh(
         "docker",
         &[
             "exec",
@@ -173,17 +197,25 @@ pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
             "-lc",
             "cd /work && deploy/cluster/scripts/ci-cluster.sh",
         ],
-    )?;
+    )
+}
+
+/// Check that `ci-cluster.sh`'s output reports both smoke gates passing.
+fn check_smoke_gates(out: &str) -> anyhow::Result<()> {
     let passes = out.matches("RESULT: PASS").count();
     if passes < 2 {
         bail!("ci-cluster.sh finished but smoke gates did not both pass (saw {passes})");
     }
-    println!("==> cluster up; smoke + ingress-churn gates passed");
     Ok(())
 }
 
 /// Take one `docker stats` sample of a set of containers. Returns
 /// `(name, cpu%)` for each.
+///
+/// # Errors
+///
+/// Returns an error if the `docker stats` command fails, or if its
+/// output cannot be parsed.
 pub fn cpu_sample(containers: &[&str]) -> anyhow::Result<Vec<(String, f64)>> {
     let mut args = vec!["stats", "--no-stream", "--format", "{{.Name}} {{.CPUPerc}}"];
     args.extend_from_slice(containers);
@@ -197,15 +229,29 @@ pub fn cpu_sample(containers: &[&str]) -> anyhow::Result<Vec<(String, f64)>> {
         .collect())
 }
 
+/// Sample sealer CPU once, folding each container's percentage into
+/// `totals`.
+fn accumulate_cpu_sample(
+    totals: &mut std::collections::HashMap<String, f64>,
+) -> anyhow::Result<()> {
+    for (name, pct) in cpu_sample(SEALER_NODES)? {
+        *totals.entry(name).or_default() += pct;
+    }
+    Ok(())
+}
+
 /// The sealer node currently doing leader work: the busiest sealer
 /// container, sampled twice to avoid a transient spike. This result is
 /// meaningful only while load is flowing.
+///
+/// # Errors
+///
+/// Returns an error if the `docker stats` sampling fails, or if no
+/// sealer container is running.
 pub fn detect_sealer_leader() -> anyhow::Result<String> {
     let mut totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     for _ in 0..2 {
-        for (name, pct) in cpu_sample(SEALER_NODES)? {
-            *totals.entry(name).or_default() += pct;
-        }
+        accumulate_cpu_sample(&mut totals)?;
     }
     totals
         .into_iter()

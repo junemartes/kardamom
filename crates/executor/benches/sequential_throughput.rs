@@ -6,8 +6,15 @@
 //!   - `sstore_step`      : `execute_tx` against an SSTORE-heavy contract.
 //!
 //! This bench does not assert throughput floors, because CI variance is
-//! real. Run `cargo bench` locally to compare hardware-relative numbers.
-//! The spec target is over 50k tx/s on plain transfers, on one core.
+//! real. It prints numbers for a human to compare; run `cargo bench`
+//! locally to compare hardware-relative numbers.
+//!
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "indices and counters here are bounded by small, fixed bench parameters, never near a truncation boundary"
+)]
 
 use std::thread;
 use std::time::Duration;
@@ -45,6 +52,10 @@ const SSTORE_42_AT_VAR_KEY: [u8; 8] = [
     0x00, // STOP
 ];
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "every caller constructs alloy_env fresh and has no further use for it, so taking it by value avoids a needless clone at each call site"
+)]
 fn wrap_envelope(
     signer: &PrivateKeySigner,
     alloy_env: alloy_consensus::TxEnvelope,
@@ -94,6 +105,44 @@ fn pos(off: i32) -> BPosition {
     }
 }
 
+/// One repeated single-transaction bench: build a fresh
+/// [`PendingDelta`] and a fresh transaction each iteration, so no state
+/// accumulates across iterations, and run it through
+/// [`ExecCore::execute_once`] at nonce 0. `snap` and `env` stay fixed
+/// for the whole group; `mk` builds the transaction.
+struct TxBench<'a, F: Fn() -> KtTxEnvelope> {
+    snap: &'a MockStateDatabase,
+    env: ExecEnv,
+    mk: F,
+}
+
+impl<F: Fn() -> KtTxEnvelope> TxBench<'_, F> {
+    fn run(&self, c: &mut Criterion, group: &str, name: &str) {
+        let mut group = c.benchmark_group(group);
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let delta = PendingDelta::new();
+                let env_tx = (self.mk)();
+                let _ = ExecCore::execute_once(
+                    self.snap,
+                    None,
+                    &delta,
+                    self.env,
+                    TxIndex(0),
+                    pos(0),
+                    &env_tx,
+                    0,
+                    0,
+                    None,
+                )
+                .unwrap();
+            });
+        });
+        group.finish();
+    }
+}
+
 fn bench_transfer_step(c: &mut Criterion) {
     let signer = PrivateKeySigner::random();
     let from = signer.address();
@@ -107,30 +156,12 @@ fn bench_transfer_step(c: &mut Criterion) {
         l2_timestamp: 0,
     };
 
-    let mut group = c.benchmark_group("transfer_step");
-    group.throughput(Throughput::Elements(1));
-    // Bench the per-tx CPU cost of a single transfer at nonce 0. The
-    // snapshot rebuilds each iteration, so state does not accumulate.
-    group.bench_function("plain_transfer", |b| {
-        b.iter(|| {
-            let delta = PendingDelta::new();
-            let env_tx = signed_transfer(&signer, to, 0);
-            let _ = ExecCore::execute_once(
-                &snap,
-                None,
-                &delta,
-                env,
-                TxIndex(0),
-                pos(0),
-                &env_tx,
-                0,
-                0,
-                None,
-            )
-            .unwrap();
-        })
-    });
-    group.finish();
+    TxBench {
+        snap: &snap,
+        env,
+        mk: || signed_transfer(&signer, to, 0),
+    }
+    .run(c, "transfer_step", "plain_transfer");
 }
 
 fn bench_sstore_step(c: &mut Criterion) {
@@ -150,28 +181,12 @@ fn bench_sstore_step(c: &mut Criterion) {
         l2_timestamp: 0,
     };
 
-    let mut group = c.benchmark_group("sstore_step");
-    group.throughput(Throughput::Elements(1));
-    group.bench_function("sstore_one_slot", |b| {
-        b.iter(|| {
-            let delta = PendingDelta::new();
-            let env_tx = signed_sstore_call(&signer, contract, 0);
-            let (_r, _ws) = ExecCore::execute_once(
-                &snap,
-                None,
-                &delta,
-                env,
-                TxIndex(0),
-                pos(0),
-                &env_tx,
-                0,
-                0,
-                None,
-            )
-            .unwrap();
-        })
-    });
-    group.finish();
+    TxBench {
+        snap: &snap,
+        env,
+        mk: || signed_sstore_call(&signer, contract, 0),
+    }
+    .run(c, "sstore_step", "sstore_one_slot");
 }
 
 // Actor end-to-end: `BATCH` txs per iteration; reports throughput in tx/s.
@@ -252,34 +267,39 @@ fn bench_actor_throughput(c: &mut Criterion) {
             let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>((BATCH as usize) + 8);
             let (c_tx, c_rx) = bounded::<CMessage>((BATCH as usize) + 8);
 
-            for i in 0..BATCH {
-                let tx_data_position = pos((i as i32) * 200);
-                let env = signed_transfer(&signer, to, i);
-                let tx_hash = env.tx_hash;
-                a_tx.send((tx_data_position, env)).unwrap();
+            // `a_tx`/`b_tx` move into this block and drop at its end,
+            // closing both channels so the executor thread sees EOF once
+            // it drains everything sent here.
+            {
+                let a_tx = a_tx;
+                let b_tx = b_tx;
+                for i in 0..BATCH {
+                    let tx_data_position = pos((i as i32) * 200);
+                    let env = signed_transfer(&signer, to, i);
+                    let tx_hash = env.tx_hash;
+                    a_tx.send((tx_data_position, env)).unwrap();
+                    b_tx.send((
+                        pos(i as i32),
+                        TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position, 0)),
+                    ))
+                    .unwrap();
+                }
                 b_tx.send((
-                    pos(i as i32),
-                    TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position, 0)),
+                    pos(BATCH as i32),
+                    TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
+                        block_number: 1,
+                        // end_tx_idx is the cumulative count of canonical
+                        // records through this block (encoded through
+                        // `BPosition::from_index`). The executor compares this
+                        // against its applied-record count: here, all `BATCH`
+                        // txs. It is not the last tx's index.
+                        end_tx_idx: BPosition::from_index(BATCH),
+                        l2_timestamp: 0,
+                        l1_origin: 0,
+                    }),
                 ))
                 .unwrap();
             }
-            b_tx.send((
-                pos(BATCH as i32),
-                TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
-                    block_number: 1,
-                    // end_tx_idx is the cumulative count of canonical
-                    // records through this block (encoded through
-                    // `BPosition::from_index`). The executor compares this
-                    // against its applied-record count: here, all `BATCH`
-                    // txs. It is not the last tx's index.
-                    end_tx_idx: BPosition::from_index(BATCH),
-                    l2_timestamp: 0,
-                    l1_origin: 0,
-                }),
-            ))
-            .unwrap();
-            drop(a_tx);
-            drop(b_tx);
 
             let tx_data_subs = vec![ChanTxDataSub {
                 sequencer_id: 0,

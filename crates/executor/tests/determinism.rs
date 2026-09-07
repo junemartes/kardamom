@@ -1,12 +1,12 @@
 //! Determinism conformance. Two executor instances, driven by the same
-//! input, must produce byte-identical tx_receipts output (every
+//! input, must produce byte-identical `tx_receipts` output (every
 //! `tx_hash` and every `write_set_hash` matches). No state-root
 //! assertion: the executor does not emit a state-root commitment yet.
 //!
-//! Wiring after the join-buffer architecture update: M=1 tx_data, plus one
-//! tx_ordering, with refs joined through the executor's `JoinBuffer`.
-//! Determinism does not depend on the demux shape. It depends on
-//! canonical ordering, which tx_ordering preserves.
+//! The topology is M=1 `tx_data`, plus one `tx_ordering`, with refs
+//! joined through the executor's `JoinBuffer`. Determinism does not
+//! depend on the demux shape. It depends on canonical ordering, which
+//! `tx_ordering` preserves.
 
 use std::thread;
 use std::time::Duration;
@@ -143,6 +143,10 @@ fn populate(
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "each call constructs a fresh signer and has no further use for it"
+)]
 fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
     let from = signer.address();
     let snap = MockStateDatabase::builder()
@@ -187,10 +191,8 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
         )
     });
 
-    let mut out = Vec::new();
-    while let Ok(m) = c_rx.recv_timeout(Duration::from_secs(5)) {
-        out.push(m);
-    }
+    let out: Vec<_> =
+        std::iter::from_fn(|| c_rx.recv_timeout(Duration::from_secs(5)).ok()).collect();
     h.join().expect("no panic").expect("ok");
     out
 }

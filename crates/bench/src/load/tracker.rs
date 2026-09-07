@@ -14,9 +14,7 @@ use std::time::{Duration, Instant};
 use alloy_primitives::B256;
 use hdrhistogram::Histogram;
 
-const HIST_LOW_US: u64 = 1;
-const HIST_HIGH_US: u64 = 60_000_000;
-const HIST_SIGFIGS: u8 = 3;
+use crate::config::{HIST_HIGH_US, HIST_LOW_US};
 
 /// A poison-tolerant lock. A panicked submit task must not block the
 /// whole run's accounting, so this reads the data through the poison.
@@ -24,9 +22,46 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The p50/p95/p99 triple, in microseconds, from a latency histogram.
+fn quantiles(h: &Histogram<u64>) -> StepLatency {
+    StepLatency {
+        p50: h.value_at_quantile(0.50),
+        p95: h.value_at_quantile(0.95),
+        p99: h.value_at_quantile(0.99),
+    }
+}
+
+/// The leftover pending transactions after a drain, from
+/// [`Tracker::remaining_pending`]. `missing` is accepted-but-never
+/// receipted, a durability failure. `unlanded` is an offered
+/// transaction whose submit failed and never landed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PendingCounts {
+    pub(crate) missing: u64,
+    pub(crate) unlanded: u64,
+}
+
+/// The latency percentiles, in microseconds, from [`Tracker::latency_us`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Latency {
+    pub(crate) p50: u64,
+    pub(crate) p95: u64,
+    pub(crate) p99: u64,
+    pub(crate) max: u64,
+}
+
+/// The latency percentiles, in microseconds, from
+/// [`Tracker::take_step_latency_us`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StepLatency {
+    pub(crate) p50: u64,
+    pub(crate) p95: u64,
+    pub(crate) p99: u64,
+}
+
 /// The cumulative delivery counters. Take a snapshot with [`Tracker::counts`].
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Counts {
+pub(crate) struct Counts {
     /// The submits attempted.
     pub offered: u64,
     /// The submits that returned a hash. Ingress accepted these; under
@@ -44,7 +79,7 @@ struct Pending {
 }
 
 /// A shared, thread-safe delivery tracker.
-pub struct Tracker {
+pub(crate) struct Tracker {
     offered: AtomicU64,
     accepted: AtomicU64,
     receipted: AtomicU64,
@@ -74,7 +109,7 @@ impl Tracker {
     ///
     /// # Errors
     /// Returns an error if the code cannot allocate the latency histogram.
-    pub fn new() -> anyhow::Result<Self> {
+    pub(crate) fn new() -> anyhow::Result<Self> {
         Ok(Self {
             offered: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
@@ -82,16 +117,8 @@ impl Tracker {
             bad_status: AtomicU64::new(0),
             gas_used: AtomicU64::new(0),
             step_gas: AtomicU64::new(0),
-            lat_us: Mutex::new(Histogram::new_with_bounds(
-                HIST_LOW_US,
-                HIST_HIGH_US,
-                HIST_SIGFIGS,
-            )?),
-            step_lat_us: Mutex::new(Histogram::new_with_bounds(
-                HIST_LOW_US,
-                HIST_HIGH_US,
-                HIST_SIGFIGS,
-            )?),
+            lat_us: Mutex::new(crate::config::new_latency_hist()?),
+            step_lat_us: Mutex::new(crate::config::new_latency_hist()?),
             pending: Mutex::new(HashMap::new()),
             early: Mutex::new(HashMap::new()),
         })
@@ -146,7 +173,7 @@ impl Tracker {
     /// The feed-side confirmation, for subscribe mode. Settles the
     /// pending entry for `hash`, or stores the status if the submit
     /// task has not registered yet.
-    pub fn confirm_from_feed(&self, hash: B256, status: u64, gas: u64) {
+    pub(crate) fn confirm_from_feed(&self, hash: B256, status: u64, gas: u64) {
         self.gas_used.fetch_add(gas, Ordering::Relaxed);
         self.step_gas.fetch_add(gas, Ordering::Relaxed);
         let settled = lock(&self.pending).remove(&hash);
@@ -172,7 +199,7 @@ impl Tracker {
 
     /// Snapshot the cumulative counters.
     #[must_use]
-    pub fn counts(&self) -> Counts {
+    pub(crate) fn counts(&self) -> Counts {
         Counts {
             offered: self.offered.load(Ordering::Relaxed),
             accepted: self.accepted.load(Ordering::Relaxed),
@@ -187,7 +214,7 @@ impl Tracker {
     /// replica directly, to tell apart per-replica stream loss, cache
     /// eviction, and harness accounting bugs.
     #[must_use]
-    pub fn sample_pending(&self, n: usize) -> Vec<(B256, bool, Duration)> {
+    pub(crate) fn sample_pending(&self, n: usize) -> Vec<(B256, bool, Duration)> {
         lock(&self.pending)
             .iter()
             .take(n)
@@ -195,61 +222,58 @@ impl Tracker {
             .collect()
     }
 
-    /// Returns `(missing_accepted, unlanded)`: the leftover pending
-    /// transactions after the drain. `missing_accepted` is
-    /// accepted-but-never-receipted, a durability failure. `unlanded`
-    /// is an offered transaction whose submit failed and never landed.
+    /// The leftover pending transactions after the drain.
     #[must_use]
-    pub fn remaining_pending(&self) -> (u64, u64) {
-        let p = lock(&self.pending);
-        let mut missing = 0u64;
-        let mut unlanded = 0u64;
-        for v in p.values() {
-            if v.accepted {
-                missing += 1;
-            } else {
-                unlanded += 1;
-            }
-        }
-        (missing, unlanded)
+    pub(crate) fn remaining_pending(&self) -> PendingCounts {
+        lock(&self.pending)
+            .values()
+            .fold(PendingCounts::default(), |acc, v| {
+                if v.accepted {
+                    PendingCounts {
+                        missing: acc.missing + 1,
+                        ..acc
+                    }
+                } else {
+                    PendingCounts {
+                        unlanded: acc.unlanded + 1,
+                        ..acc
+                    }
+                }
+            })
     }
 
     /// Drain the per-step gas counter, for per-step Mgas/s.
     #[must_use]
-    pub fn take_step_gas(&self) -> u64 {
+    pub(crate) fn take_step_gas(&self) -> u64 {
         self.step_gas.swap(0, Ordering::Relaxed)
     }
 
     /// The total gas used by receipted transactions.
-    pub fn total_gas(&self) -> u64 {
+    pub(crate) fn total_gas(&self) -> u64 {
         self.gas_used.load(Ordering::Relaxed)
     }
 
-    /// The latency percentiles `(p50, p95, p99, max)`, in microseconds,
-    /// over the confirmed set.
-    pub fn latency_us(&self) -> (u64, u64, u64, u64) {
+    /// The latency percentiles, in microseconds, over the confirmed set.
+    pub(crate) fn latency_us(&self) -> Latency {
         let h = lock(&self.lat_us);
-        (
-            h.value_at_quantile(0.50),
-            h.value_at_quantile(0.95),
-            h.value_at_quantile(0.99),
-            h.max(),
-        )
+        let q = quantiles(&h);
+        Latency {
+            p50: q.p50,
+            p95: q.p95,
+            p99: q.p99,
+            max: h.max(),
+        }
     }
 
-    /// Drain the per-step latency histogram. Returns `(p50, p95, p99)`
-    /// in microseconds for everything confirmed since the previous call,
-    /// then resets the histogram.
+    /// Drain the per-step latency histogram: the percentiles, in
+    /// microseconds, for everything confirmed since the previous call.
+    /// Resets the histogram.
     #[must_use]
-    pub fn take_step_latency_us(&self) -> (u64, u64, u64) {
+    pub(crate) fn take_step_latency_us(&self) -> StepLatency {
         let mut h = lock(&self.step_lat_us);
-        let out = (
-            h.value_at_quantile(0.50),
-            h.value_at_quantile(0.95),
-            h.value_at_quantile(0.99),
-        );
+        let q = quantiles(&h);
         h.reset();
-        out
+        q
     }
 
     pub(crate) fn confirm(&self, status: u64, latency: Duration) {
@@ -266,11 +290,31 @@ impl Tracker {
             self.bad_status.fetch_add(1, Ordering::Relaxed);
         }
         let us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
-        if let Ok(mut h) = self.lat_us.lock() {
-            let _ = h.record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
-        }
-        if let Ok(mut h) = self.step_lat_us.lock() {
-            let _ = h.record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
-        }
+        let _ = lock(&self.lat_us).record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
+        let _ = lock(&self.step_lat_us).record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every accessor reads through the poison-tolerant `lock()` helper,
+    /// so a poisoned mutex still records the sample.
+    #[test]
+    fn confirm_with_gas_records_through_a_poisoned_mutex() {
+        let tracker = Tracker::new().expect("tracker");
+        // Poison the latency mutex, the way a panicking submit task would.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = tracker.lat_us.lock().unwrap();
+            panic!("simulated submit-task panic while holding the lock");
+        }));
+        assert!(tracker.lat_us.is_poisoned());
+
+        tracker.confirm_with_gas(1, Duration::from_micros(500), 21_000);
+
+        let lat = tracker.latency_us();
+        assert!(lat.p50 > 0, "sample was dropped: p50 is 0");
+        assert!(lat.max > 0, "sample was dropped: max is 0");
     }
 }

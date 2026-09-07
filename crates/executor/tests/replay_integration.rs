@@ -1,12 +1,10 @@
 //! Integration test: feed a synthetic stream of txs and boundaries into
-//! an `Executor`, and check the tx_receipts output against expectation.
+//! an `Executor`, and check the `tx_receipts` output against expectation.
 //!
-//! Wiring after the join-buffer architecture update: single-sequencer (M=1)
-//! topology. Envelopes push onto a fake tx_data. Tiny `TxRef` records
-//! and a `BlockBoundaryStart` push onto fake channel B, in the same
-//! canonical order. The executor's M+1 readers join the two streams
-//! through the in-process `JoinBuffer`. The expected receipts and slim
-//! boundaries on tx_receipts are unchanged from before the split.
+//! The topology is single-sequencer (M=1). Envelopes push onto a fake
+//! `tx_data`. Tiny `TxRef` records and a `BlockBoundaryStart` push onto
+//! fake channel B, in the same canonical order. The executor's M+1
+//! readers join the two streams through the in-process `JoinBuffer`.
 
 use std::thread;
 use std::time::Duration;
@@ -30,7 +28,7 @@ use kardamom_engine::{
 };
 
 /// Bridge a crossbeam receiver of `(BPosition, TxEnvelope)` into a
-/// `TxDataSubscription`. The `BPosition` this emits is the tx_data
+/// `TxDataSubscription`. The `BPosition` this emits is the `tx_data`
 /// position (the value sequencers publish in `TxRef`). The test sets it
 /// equal to a synthetic offset.
 struct ChanTxDataSub {
@@ -89,8 +87,8 @@ impl EngineWiring for TestWiring {
     type Epoch = NoEpochCheck;
 }
 
-/// Proxy-style envelope builder: sign, encode raw_tx, and fill in sender
-/// and tx_hash.
+/// Proxy-style envelope builder: sign, encode `raw_tx`, and fill in sender
+/// and `tx_hash`.
 fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address, val: u64) -> KtTxEnvelope {
     let mut tx = TxLegacy {
         chain_id: Some(1),

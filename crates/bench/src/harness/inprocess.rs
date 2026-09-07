@@ -16,16 +16,20 @@ use crate::config::{MAX_IN_FLIGHT_SLACK, REQUEST_TIMEOUT};
 /// stops everything on [`InProcessIngress::shutdown`].
 ///
 /// This is the stand-in behind the profiling
-/// [`Harness`](crate::harness::Harness) and the crate's smoke tests,
-/// used since the removal of `kardamom-node`. It exercises the real
-/// ingress hot path (signature recovery, routing, RPC framing, receipt
-/// release) with no live Aeron media driver and no real sequencer,
-/// executor, or sealer. A full in-process Aeron pipeline harness is a
-/// follow-up item.
+/// [`Harness`](crate::harness::Harness) and the crate's smoke tests.
+/// It exercises the real ingress hot path (signature recovery, routing,
+/// RPC framing, receipt release) with no live Aeron media driver and no
+/// real sequencer, executor, or sealer.
 ///
 /// `ack_policy` is forced to [`AckPolicy::OnOffer`], so a submission is
 /// released as soon as its receipt arrives. There is no recorder or
 /// quorum watermark here.
+///
+/// # Errors
+///
+/// Returns an error if the in-process RPC server cannot bind its
+/// ephemeral loopback port, or if the jsonrpsee client cannot connect
+/// to it.
 pub async fn spawn_inprocess_ingress(
     chain_id: u64,
     shards: u32,
@@ -39,32 +43,12 @@ pub async fn spawn_inprocess_ingress(
     // the parked submission. `from` and `nonce` match what the proxy parked
     // on, because it keys pending submissions by `(sender, nonce)`.
     let mut fake_exec = Vec::with_capacity(shard_rxs.len());
-    for (shard, mut rx) in shard_rxs.into_iter().enumerate() {
-        let receipt_tx = receipt_tx.clone();
-        fake_exec.push(tokio::spawn(async move {
-            let mut idx: i32 = 0;
-            while let Some(env) = rx.recv().await {
-                idx = idx.wrapping_add(1);
-                let nonce = decode_nonce(env.raw_tx.as_ref()).unwrap_or(0);
-                let receipt = Receipt {
-                    tx_idx: BPosition {
-                        term_id: shard as i32,
-                        term_offset: idx,
-                    },
-                    tx_hash: env.tx_hash,
-                    status: true,
-                    gas_used: 21_000,
-                    nonce,
-                    from: env.sender,
-                    ..Default::default()
-                };
-                // A send error means the broadcast bus has no receivers.
-                // The proxy is gone, so there is nothing left to release.
-                if receipt_tx.send(receipt).is_err() {
-                    break;
-                }
-            }
-        }));
+    for (shard, rx) in shard_rxs.into_iter().enumerate() {
+        fake_exec.push(tokio::spawn(run_fake_executor(
+            shard,
+            rx,
+            receipt_tx.clone(),
+        )));
     }
 
     let cfg = IngressConfig {
@@ -82,6 +66,44 @@ pub async fn spawn_inprocess_ingress(
         .max_concurrent_requests(max_in_flight + MAX_IN_FLIGHT_SLACK)
         .build(&url)?;
     Ok((client, InProcessIngress { handle, fake_exec }))
+}
+
+/// One shard's fake-executor task: drain published envelopes and send
+/// a success receipt back on the receipt bus, so the proxy releases
+/// the parked submission. `from` and `nonce` match what the proxy
+/// parked on, because it keys pending submissions by `(sender, nonce)`.
+///
+/// # Panics
+///
+/// Panics if `shard` exceeds `i32::MAX`. `shard` is a small config
+/// value (`shards`) in every real caller.
+async fn run_fake_executor(
+    shard: usize,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>,
+    receipt_tx: tokio::sync::broadcast::Sender<Receipt>,
+) {
+    let mut idx: i32 = 0;
+    while let Some(env) = rx.recv().await {
+        idx = idx.wrapping_add(1);
+        let nonce = decode_nonce(env.raw_tx.as_ref()).unwrap_or(0);
+        let receipt = Receipt {
+            tx_idx: BPosition {
+                term_id: i32::try_from(shard).expect("shard count fits in i32"),
+                term_offset: idx,
+            },
+            tx_hash: env.tx_hash,
+            status: true,
+            gas_used: 21_000,
+            nonce,
+            from: env.sender,
+            ..Default::default()
+        };
+        // A send error means the broadcast bus has no receivers. The
+        // proxy is gone, so there is nothing left to release.
+        if receipt_tx.send(receipt).is_err() {
+            break;
+        }
+    }
 }
 
 /// Owns the in-process ingress server and the fake-executor reflector

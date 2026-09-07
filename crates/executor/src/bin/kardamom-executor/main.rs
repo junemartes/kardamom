@@ -1,7 +1,7 @@
 //! `kardamom-executor`: standalone executor service process.
 //!
-//! Opens M tx_data subscribers, one tx_ordering subscriber, and one
-//! tx_receipts publisher through the log layer's Aeron runtime. It wires
+//! Opens M `tx_data` subscribers, one `tx_ordering` subscriber, and one
+//! `tx_receipts` publisher through the log layer's Aeron runtime. It wires
 //! them into the executor's reader, exec, and commit thread topology, and
 //! runs until SIGTERM or Ctrl-C. The state backend is the libmdbx-backed
 //! `kardamom-state` writer, opened at `--state-dir`: chain state commits
@@ -43,30 +43,120 @@ use kardamom_state::{StateWriter, seed_genesis};
 use args::Args;
 use wiring::ExecutorWiring;
 
+/// The state writer and the adapters built from its handle, plus the
+/// BAL and footprint-shadow capture handoffs.
+struct WriterAdapters {
+    writer: kardamom_state::WriterHandle,
+    snapshots: MdbxSnapshotSource,
+    writer_signal: MdbxWriterSignal,
+    writer_queue: MdbxWriterQueue,
+    bal_tx: crossbeam_channel::Sender<kardamom_engine::actor::BalHandoff>,
+    footprint_shadow: Option<crossbeam_channel::Sender<kardamom_engine::shadow::ShadowBlock>>,
+    /// Kept alive so the BAL publisher thread keeps running; not read.
+    _bal_publisher: std::thread::JoinHandle<()>,
+}
+
+/// Seed genesis into `env` if not already seeded, spawn the state
+/// writer and its adapters, open the `tx_bal` publication, and start the
+/// BAL publisher thread.
+fn spawn_writer_and_bal(
+    args: &Args,
+    env: kardamom_state::StateEnv,
+    genesis: Option<&kardamom_types::Genesis>,
+    rt_pub: &AeronRuntime,
+    channels: &kardamom_log::config::ChannelsConfig,
+) -> Result<WriterAdapters> {
+    // Seed genesis once into a fresh env (a no-op if already seeded, for
+    // example on recovery). This must run before `StateWriter::spawn`, so
+    // the writer's initial published snapshot already reflects genesis.
+    let (genesis_accounts, genesis_code) = bin_support::build_genesis_alloc(genesis);
+    let seeded = seed_genesis(&env, &genesis_accounts, &genesis_code)
+        .context("seed genesis into state env")?;
+    tracing::info!(
+        state_dir = %args.state_dir.display(),
+        durability = ?args.state_durability,
+        genesis_accounts = genesis_accounts.len(),
+        seeded,
+        "state env opened"
+    );
+
+    // Spawn the writer, and build the three executor adapters from its
+    // handle. The snapshot-swap channel feeds reads (the snapshot source
+    // and commit signal). The delta channel feeds writes.
+    let writer = StateWriter::spawn(env).context("spawn state writer")?;
+    let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
+    let writer_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
+    let writer_queue = MdbxWriterQueue::new(writer.delta_tx.clone());
+
+    // BAL publication: tee each block's `BlockDelta` onto tx_bal, so
+    // validators can cross-check their re-execution. This publishes on
+    // the isolated publication runtime (`rt_pub`), like receipts, so it
+    // never stalls the subscription poll.
+    let bal_pub = rt_pub
+        .open_publication(&channels.tx_bal_channel, channels.tx_bal_stream_id)
+        .context("open tx_bal publication")?;
+    // EIP-7928 BAL publisher. The exec thread hands off each block's
+    // captured Bal and receipts-free delta. This thread encodes and
+    // delivers it with an ack and bounded retry, retaining recent
+    // frames for validator catch-up. Emission is not best-effort:
+    // parallel validation makes BAL availability a validator liveness
+    // property. The channel has a bounded depth, so a wedged publisher
+    // back-pressures exec instead of dropping state transitions.
+    let (bal_tx, bal_rx) = crossbeam_channel::bounded(8);
+    let bal_publisher = std::thread::Builder::new()
+        .name("bal-publisher".into())
+        .spawn(move || kardamom_executor::bal::run_bal_publisher(bal_rx, bal_pub))
+        .context("spawn BAL publisher")?;
+
+    // Footprint shadow. Behind `KARDAMOM_FOOTPRINT_SHADOW=1`, the exec
+    // thread hands each block's tx captures to a grading thread
+    // (measurement only; execution stays sequential). It is `None`
+    // when the env flag is unset, for zero cost.
+    let footprint_shadow = kardamom_engine::shadow::spawn_from_env();
+
+    Ok(WriterAdapters {
+        writer,
+        snapshots,
+        writer_signal,
+        writer_queue,
+        bal_tx,
+        footprint_shadow,
+        _bal_publisher: bal_publisher,
+    })
+}
+
+/// Load the executor's TOML config, and apply the per-node cluster
+/// egress endpoint override.
+///
+/// The TOML supplies the optional `[cluster]` section (disabled by
+/// default). All other runtime tuning still comes from the CLI flags.
+/// An empty or comment-only file (the current deployment shape)
+/// deserializes to a disabled cluster, so behavior stays the same
+/// unless `[cluster]` is set.
+///
+/// The cluster client's `egress_channel` is this node's reachable
+/// address (the node IP differs per replica), so the Nomad job injects
+/// it as `--cluster-egress-endpoint`, instead of baking it into the
+/// static config file.
+fn load_file_config(args: &Args) -> Result<ExecutorFileConfig> {
+    let raw = std::fs::read_to_string(&args.config).context("read executor config")?;
+    let mut file_cfg: ExecutorFileConfig = toml::from_str(&raw).context("parse executor config")?;
+    if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
+        file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
+    }
+    Ok(file_cfg)
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     bin_support::init_tracing();
     let args = Args::parse();
     kardamom_obs::init_service!("executor", args.metrics_addr, &args.host_id).await?;
     kardamom_engine::metrics::describe();
-    // The TOML supplies the optional `[cluster]` section (disabled by
-    // default). All other runtime tuning still comes from the CLI flags
-    // above. An empty or comment-only file (the current deployment shape)
-    // deserializes to a disabled cluster, so behavior stays the same
-    // unless `[cluster]` is set.
-    let raw = std::fs::read_to_string(&args.config).context("read executor config")?;
-    let mut file_cfg: ExecutorFileConfig = toml::from_str(&raw).context("parse executor config")?;
-
-    // Per-node cluster egress endpoint. The cluster client's
-    // `egress_channel` is this node's reachable address (the node IP
-    // differs per replica), so the Nomad job injects it, instead of
-    // baking it into the static config file.
-    if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
-        file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
-    }
+    let file_cfg = load_file_config(&args)?;
 
     tracing::info!(
-        shards = args.shards,
+        shards = args.shards.get(),
         chain_id = args.chain_id,
         "kardamom-executor starting"
     );
@@ -110,10 +200,8 @@ async fn main() -> Result<()> {
     // sync (shared with the validator binary; see `bin_support`). These
     // stay live always: the reader's join-miss refetch recovers any
     // down-window or lapse gap in-band, against the remote durability
-    // archives. The resume-gated replay-merge this replaces pointed at
-    // the consumer's local archive, which recorded neither stream, so a
-    // resuming process had no tx_data source at all.
-    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
+    // archives.
+    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards.get())?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,
@@ -148,55 +236,15 @@ async fn main() -> Result<()> {
 
     let tx_receipts_pub = wiring::open_tx_receipts_pub(&rt_pub, &channels, &args)?;
 
-    // Seed genesis once into a fresh env (a no-op if already seeded, for
-    // example on recovery). This must run before `StateWriter::spawn`, so
-    // the writer's initial published snapshot already reflects genesis.
-    let (genesis_accounts, genesis_code) = bin_support::build_genesis_alloc(genesis.as_ref());
-    let seeded = seed_genesis(&env, &genesis_accounts, &genesis_code)
-        .context("seed genesis into state env")?;
-    tracing::info!(
-        state_dir = %args.state_dir.display(),
-        durability = ?args.state_durability,
-        genesis_accounts = genesis_accounts.len(),
-        seeded,
-        "state env opened"
-    );
-
-    // Spawn the writer, and build the three executor adapters from its
-    // handle. The snapshot-swap channel feeds reads (the snapshot source
-    // and commit signal). The delta channel feeds writes.
-    let mut writer = StateWriter::spawn(env).context("spawn state writer")?;
-    let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
-    let writer_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
-    // BAL publication: tee each block's `BlockDelta` onto tx_bal, so
-    // validators can cross-check their re-execution. This publishes on
-    // the isolated publication runtime (`rt_pub`), like receipts, so it
-    // never stalls the subscription poll.
-    let bal_pub = rt_pub
-        .open_publication(&channels.tx_bal_channel, channels.tx_bal_stream_id)
-        .context("open tx_bal publication")?;
-    // EIP-7928 BAL publisher. See
-    // docs/agents/bal-attribution-parallel-validation-spec.md. The exec
-    // thread hands off each block's captured Bal and receipts-free delta.
-    // This thread encodes and delivers it with an ack and bounded retry,
-    // retaining recent frames for validator catch-up. Emission is not
-    // best-effort: parallel validation makes BAL availability a
-    // validator liveness property. The channel has a bounded depth, so a
-    // wedged publisher back-pressures exec instead of dropping state
-    // transitions.
-    let (bal_tx, bal_rx) = crossbeam_channel::bounded(8);
-    let _bal_publisher = std::thread::Builder::new()
-        .name("bal-publisher".into())
-        .spawn(move || kardamom_executor::bal::run_bal_publisher(bal_rx, bal_pub))
-        .context("spawn BAL publisher")?;
-    // The legacy writer-queue tee is superseded by the publisher thread.
-    let writer_queue = MdbxWriterQueue::new(writer.delta_tx.clone());
-    // Footprint shadow. Behind
-    // `KARDAMOM_FOOTPRINT_SHADOW=1`, the exec thread hands each block's
-    // tx captures to a grading thread (measurement only; execution stays
-    // sequential). It is `None` when the env flag is unset, for zero
-    // cost.
-    let footprint_shadow = kardamom_engine::shadow::spawn_from_env();
+    let WriterAdapters {
+        mut writer,
+        snapshots,
+        writer_signal,
+        writer_queue,
+        bal_tx,
+        footprint_shadow,
+        _bal_publisher,
+    } = spawn_writer_and_bal(&args, env, genesis.as_ref(), &rt_pub, &channels)?;
 
     // `verify_record_identity` stays off here by decision, not omission.
     // With the validator checking every record, a forged envelope
@@ -222,7 +270,7 @@ async fn main() -> Result<()> {
     // The executor's main loop is sync (std::thread spawns underneath).
     // Run it inside spawn_blocking so the runtime stays responsive for
     // shutdown handling.
-    let mut join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
+    let join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
         Executor::run::<ExecutorWiring>(
             cfg,
             Inbound {
@@ -248,8 +296,7 @@ async fn main() -> Result<()> {
                 footprint_shadow,
                 // Whole-block Block-STM strategy under `--parallel-execution`.
                 // `None` keeps the streaming per-tx path. Either way, there
-                // is no epoch check: the executor trusts the ordered stream
-                // (phase 2 would give it its own L1 dependency).
+                // is no epoch check: the executor trusts the ordered stream.
                 block_exec,
                 epoch_observer: None,
                 // No remote-epoch check either: that seam is wired by the
@@ -259,42 +306,7 @@ async fn main() -> Result<()> {
         )
     });
 
-    // Exit on whichever comes first: an operator shutdown signal, or the
-    // engine loop finishing on its own (a fatal stream or join error).
-    // Waiting only for SIGTERM left an errored executor lingering
-    // "alive": metrics up, pipeline dead, instead of exiting so the
-    // orchestrator restarts it into the crash-recovery path.
-    let engine_result = tokio::select! {
-        _ = bin_support::wait_for_shutdown() => {
-            tracing::info!("kardamom-executor: shutdown signal received; dropping runtime");
-            None
-        }
-        res = &mut join => Some(res),
-    };
-    // Dropping the AeronRuntime closes every subscription's sender. Then
-    // the reader threads' `blocking_recv` returns `None`. This surfaces
-    // `TxDataClosed` to the executor, for a clean shutdown.
-    drop(rt);
-    shutdown.cancel();
-    // In cluster mode, the tx_ordering reader blocks on cluster egress
-    // `recv()`, which returns `None` only once the session thread drops
-    // its sender: when the `LiveCluster` guard is dropped. Drop it here,
-    // so the reader sees `TxOrderingClosed` and the executor loop can
-    // exit cleanly.
-    drop(cluster_guard);
-    let joined = match engine_result {
-        Some(r) => r,
-        None => join.await,
-    };
-    let mut engine_error: Option<ExecutorError> = None;
-    match joined {
-        Ok(Ok(())) => tracing::info!("executor main loop returned cleanly"),
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "executor main loop returned an error");
-            engine_error = Some(e);
-        }
-        Err(e) => tracing::error!(error = %e, "executor task panicked"),
-    }
+    let engine_error = run_engine(rt, cluster_guard, shutdown, join).await;
     // Stop the state writer thread (this closes the delta channel, joins
     // it, and surfaces its final result). The executor task has finished,
     // so its adapter clones of the delta sender are already dropped.
@@ -324,4 +336,79 @@ async fn main() -> Result<()> {
         anyhow::bail!("executor pipeline failed: {e}");
     }
     Ok(())
+}
+
+/// Cancels the shutdown token when this drops, so a struct that holds
+/// one can end it as a normal field drop, with no `drop()` call.
+struct CancelOnDrop(tokio_util::sync::CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// The runtime and cluster guards `run_engine` holds. Rust drops
+/// struct fields in declaration order, so dropping this struct ends
+/// `rt` first, then cancels `shutdown`, then drops `cluster_guard`,
+/// the fixed order this module's own doc describes.
+#[allow(
+    dead_code,
+    reason = "each field is held only for its RAII drop order and never read"
+)]
+struct EngineHandles {
+    rt: AeronRuntime,
+    shutdown: CancelOnDrop,
+    cluster_guard: kardamom_cluster_adapter::LiveCluster,
+}
+
+/// Wait for whichever comes first: an operator shutdown signal, or the
+/// engine loop finishing on its own (a fatal stream or join error).
+/// Exiting on the first of the two, instead of only on SIGTERM, avoids
+/// an errored executor lingering "alive": metrics up, pipeline dead,
+/// instead of exiting so the orchestrator restarts it into the
+/// crash-recovery path.
+///
+/// This function owns `rt` and `cluster_guard` and drops them in a
+/// fixed order once the wait ends. Dropping the `AeronRuntime` closes
+/// every subscription's sender, so the reader threads' `blocking_recv`
+/// returns `None` and the executor sees `TxDataClosed`. In cluster
+/// mode, the `tx_ordering` reader blocks on cluster egress `recv()`,
+/// which returns `None` only once the `LiveCluster` guard drops, so the
+/// reader sees `TxOrderingClosed` next.
+async fn run_engine(
+    rt: AeronRuntime,
+    cluster_guard: kardamom_cluster_adapter::LiveCluster,
+    shutdown: tokio_util::sync::CancellationToken,
+    mut join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
+) -> Option<ExecutorError> {
+    let handles = EngineHandles {
+        rt,
+        shutdown: CancelOnDrop(shutdown),
+        cluster_guard,
+    };
+    let engine_result = tokio::select! {
+        () = bin_support::wait_for_shutdown() => {
+            tracing::info!("kardamom-executor: shutdown signal received; dropping runtime");
+            None
+        }
+        res = &mut join => Some(res),
+    };
+    {
+        let _released = handles;
+    }
+    let joined = match engine_result {
+        Some(r) => r,
+        None => join.await,
+    };
+    let mut engine_error: Option<ExecutorError> = None;
+    match joined {
+        Ok(Ok(())) => tracing::info!("executor main loop returned cleanly"),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "executor main loop returned an error");
+            engine_error = Some(e);
+        }
+        Err(e) => tracing::error!(error = %e, "executor task panicked"),
+    }
+    engine_error
 }

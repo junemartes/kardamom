@@ -9,12 +9,13 @@
 //! `MvCache`.
 //!
 //! The benchmark must mirror a real block, or it measures its own
-//! artifacts. Two problems affected the first version of this benchmark:
+//! artifacts. Two rules follow from that:
 //!
 //! - `publish_account` does a sorted insert into a per-account version
 //!   list. A real block publishes at most `MAX_BLOCK_TXS` versions and
-//!   then discards the cache. A long-running loop against one cache is
-//!   quadratic, and reported a collapse that did not exist in production.
+//!   then discards the cache, so this benchmark must do the same: a
+//!   long-running loop against one cache is quadratic and measures the
+//!   harness, not the engine.
 //! - The engine skips the fee sink on publish; it folds the fee as a
 //!   delta instead. Publishing it makes every transaction in the block
 //!   write one hot key, which is a property of the benchmark, not the
@@ -23,6 +24,8 @@
 //! So this benchmark uses a fresh cache per block, a realistic block
 //! size, and skips the fee sink. The `--with-sink` mode restores it, to
 //! price the accumulator deferral, not to be mistaken for cache behavior.
+
+use std::num::NonZeroUsize;
 
 use alloy_primitives::{Address, B256, U256};
 use kardamom_stm::mv::{AccountVersion, MvCache};
@@ -54,10 +57,10 @@ fn version(i: u64) -> AccountVersion {
 fn tx_pattern(mv: &MvCache, idx: u32, sender: usize, recipient: usize, with_sink: bool) {
     std::hint::black_box(mv.read_account(idx, &addr(sender)));
     std::hint::black_box(mv.read_account(idx, &addr(recipient)));
-    mv.publish_account(idx, addr(sender), version(idx as u64));
-    mv.publish_account(idx, addr(recipient), version(idx as u64));
+    mv.publish_account(idx, addr(sender), version(u64::from(idx)));
+    mv.publish_account(idx, addr(recipient), version(u64::from(idx)));
     if with_sink {
-        mv.publish_account(idx, addr(0), version(idx as u64));
+        mv.publish_account(idx, addr(0), version(u64::from(idx)));
     }
 }
 
@@ -74,7 +77,13 @@ enum Access {
     Partitioned,
 }
 
-fn run(threads: usize, with_sink: bool, access: Access) -> f64 {
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "idx stays under BLOCK_TXS (a small fixed constant); nanosecond and tx-count display values stay far under 2^52"
+)]
+fn run(threads: NonZeroUsize, with_sink: bool, access: Access) -> f64 {
+    let threads = threads.get();
     let per_thread = BLOCK_TXS / threads;
     let started = std::time::Instant::now();
     for _ in 0..BLOCKS {
@@ -108,21 +117,56 @@ fn run(threads: usize, with_sink: bool, access: Access) -> f64 {
     started.elapsed().as_nanos() as f64 / total_txs
 }
 
-fn main() {
-    let mut args = std::env::args().skip(1);
-    let mut spec = "1,2,4,6,8".to_string();
-    let mut with_sink = false;
-    let mut access = Access::Shared;
-    for a in args.by_ref() {
-        match a.as_str() {
-            "--with-sink" => with_sink = true,
-            "--partitioned" => access = Access::Partitioned,
-            other => spec = other.to_string(),
+/// The parsed CLI options.
+struct Opts {
+    spec: String,
+    with_sink: bool,
+    access: Access,
+}
+
+impl Opts {
+    fn apply(mut self, a: &str) -> Self {
+        match a {
+            "--with-sink" => self.with_sink = true,
+            "--partitioned" => self.access = Access::Partitioned,
+            other => self.spec = other.to_string(),
+        }
+        self
+    }
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Self {
+            spec: "1,2,4,6,8".to_string(),
+            with_sink: false,
+            access: Access::Shared,
         }
     }
-    let threads: Vec<usize> = spec
+}
+
+fn main() {
+    let Opts {
+        spec,
+        with_sink,
+        access,
+    } = std::env::args()
+        .skip(1)
+        .fold(Opts::default(), |o, a| o.apply(&a));
+    let threads: Vec<NonZeroUsize> = spec
         .split(',')
-        .map(|s| s.trim().parse().expect("thread counts csv"))
+        .map(|s| {
+            let t: NonZeroUsize = s.trim().parse().expect("thread counts csv: 0 is not valid");
+            // Only Access::Partitioned divides ACCOUNTS by the thread
+            // count (`own`'s `ACCOUNTS / threads`); Access::Shared has
+            // no such divisor, so a thread count over ACCOUNTS is fine
+            // there, as it always was.
+            assert!(
+                access != Access::Partitioned || t.get() <= ACCOUNTS,
+                "thread count {t} exceeds ACCOUNTS ({ACCOUNTS}); --partitioned divides ACCOUNTS by the thread count"
+            );
+            t
+        })
         .collect();
 
     println!(
