@@ -332,11 +332,20 @@ async fn main() -> Result<()> {
     };
 
     let proxy = IngressProxy::new(cfg, publication, subscription);
+    let drainer = proxy.clone();
     let handle = proxy.start().await.context("IngressProxy::start")?;
     tracing::info!(jsonrpc_addr = %handle.jsonrpc_addr, "JSON-RPC listening");
 
     wait_for_shutdown().await;
     tracing::info!("kardamom-ingress: shutdown signal received");
+    // The graceful drain: refuse new submits, let the parked ones finish
+    // within the park bound, then stop the server. The Nomad job's
+    // kill_timeout covers this wait.
+    drainer.begin_drain();
+    let still_parked = drainer
+        .drain(Duration::from_millis(args.pending_receipt_timeout_ms))
+        .await;
+    tracing::info!(still_parked, "kardamom-ingress: drain finished");
     handle.jsonrpc_handle.stop().ok();
     handle.jsonrpc_handle.stopped().await;
     stop.cancel();

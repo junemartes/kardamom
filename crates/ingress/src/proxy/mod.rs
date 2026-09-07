@@ -11,6 +11,7 @@ mod watchers;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
 use tokio::sync::broadcast;
@@ -118,6 +119,10 @@ where
     /// Post-dedup tx-error re-broadcast, the same pattern as
     /// `receipt_feed`.
     pub(crate) tx_error_feed: broadcast::Sender<TxError>,
+    /// The graceful drain flag. Once set, new submits get `Draining`,
+    /// and the parked ones keep waiting for their receipts. See
+    /// [`Self::begin_drain`].
+    pub(crate) draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Capacity of the deduped receipt and error re-broadcast feeds. A
@@ -149,6 +154,7 @@ where
             latest_block_number: self.latest_block_number.clone(),
             receipt_feed: self.receipt_feed.clone(),
             tx_error_feed: self.tx_error_feed.clone(),
+            draining: self.draining.clone(),
         }
     }
 }
@@ -185,6 +191,7 @@ where
             latest_block_number: Arc::new(AtomicU64::new(0)),
             receipt_feed: broadcast::channel(FEED_CAPACITY).0,
             tx_error_feed: broadcast::channel(FEED_CAPACITY).0,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         me.spawn_tx_receipts_watcher();
         me.spawn_tx_errors_watcher();
@@ -260,6 +267,44 @@ where
 
     /// Starts every configured listener: jsonrpsee HTTP and WS, an
     /// optional TCP listener, and an optional UDS listener.
+    /// Start the graceful drain. New submits get `Draining` (a retryable
+    /// error: the client goes to the other replica). Parked submits keep
+    /// waiting for their receipts. Reads keep working. The deploy's
+    /// `kill_timeout` covers `tx_ttl`, so a parked submit resolves before
+    /// the process exits. See `docs/specs/dynamic-sequencer-sizing.md`,
+    /// section 3.6.
+    pub fn begin_drain(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(
+            pending = self.pending.len(),
+            "ingress: draining; new submits refused"
+        );
+    }
+
+    /// The number of parked submits.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// True once [`Self::begin_drain`] ran.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until no submit is parked, or `timeout` passes. Returns the
+    /// number of submits still parked.
+    pub async fn drain(&self, timeout: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let pending = self.pending.len();
+            if pending == 0 || tokio::time::Instant::now() >= deadline {
+                return pending;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     pub async fn start(self) -> Result<IngressHandle, IngressError>
     where
         P: 'static,

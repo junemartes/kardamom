@@ -116,6 +116,45 @@ async fn one_hundred_txs_route_and_receive_receipts() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn draining_refuses_new_submits_and_reports_parked_count() {
+    // The graceful drain of a restart: a parked submit keeps waiting, a
+    // new one gets a retryable error, and `drain` reports what is still
+    // parked when the bound passes.
+    let cfg = IngressConfig {
+        partition_count_m: 2,
+        pending_receipt_timeout: Duration::from_secs(10),
+        ..IngressConfig::default()
+    };
+    let (mock, mut partition_rx) = MockChannels::new(2);
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
+    // Swallow the envelopes: no receipt ever comes, so the submit parks.
+    for mut rx in partition_rx.drain(..) {
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    }
+    let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let signer = PrivateKeySigner::random();
+    let raw0 = common::sign_legacy(&signer, 0);
+    let parked = {
+        let proxy = proxy.clone();
+        tokio::spawn(async move { proxy.submit_raw(ip, raw0).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(proxy.pending_len(), 1, "the first submit parked");
+
+    proxy.begin_drain();
+    assert!(proxy.is_draining());
+    let raw1 = common::sign_legacy(&signer, 1);
+    match proxy.submit_raw(ip, raw1).await {
+        Err(kardamom_ingress::error::IngressError::Draining) => {}
+        other => panic!("expected Draining, got {other:?}"),
+    }
+    // The bound passes with the first submit still parked.
+    let still = proxy.drain(Duration::from_millis(200)).await;
+    assert_eq!(still, 1);
+    parked.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn proxy_parks_until_watermark_advances() {
     let cfg = IngressConfig {
         partition_count_m: 2,

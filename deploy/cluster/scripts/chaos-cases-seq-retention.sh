@@ -11,9 +11,9 @@
 
 # --- sequencer-lapse ---------------------------------------------------------
 
-# sequencer-lapse case: pause one racing replica of shard 0 (seq-a on
+# sequencer-lapse case: pause one racing replica of lane 0 (sequencer-0 on
 # kardamom-sequencer-0) for a window, under pinned shard-0 load, then
-# resume. The twin (seq-b, on the other node) keeps ordering; the
+# resume. The twin (lane 0's replica on the other node) keeps ordering; the
 # pipeline must never stall. On resume, the paused replica must detect
 # the lapse (a boundary-silence or watermark-jump on the cluster egress
 # it now consumes), and enter receipt-floor resync
@@ -29,7 +29,7 @@ SEQ_LAPSE_S="${SEQ_LAPSE_S:-30}"
 
 # Print forensics for sequencer-lapse failures: container identity (was
 # the task replaced? is the same container still running?), the full
-# resync metric block, and the current sequencer-a container's recent
+# resync metric block, and the current sequencer-0 container's recent
 # log lines. Early runs of this case failed with signatures only
 # explainable by process identity confusion. This makes the next
 # failure self-diagnosing.
@@ -39,18 +39,18 @@ seqa_debug() {
   log "sequencer-lapse DEBUG: resync metrics at .21:9001:"
   { fetch_metrics 192.168.56.21 kardamom-sequencer-0 9001 || true; } \
     | grep -E "resync|watermark|floor" | head -12 || true
-  log "sequencer-lapse DEBUG: current sequencer-a log tail:"
+  log "sequencer-lapse DEBUG: current sequencer-0 log tail:"
   docker exec kardamom-sequencer-0 sh -c \
-    'docker logs --tail 20 "$(docker ps --format "{{.Names}}" | grep -m1 "^sequencer-a")" 2>&1 | grep -E "RESYNC|LAG|resync|panic" | tail -10' 2>/dev/null || true
+    'docker logs --tail 20 "$(docker ps --format "{{.Names}}" | grep -m1 "^sequencer-0")" 2>&1 | grep -E "RESYNC|LAG|resync|panic" | tail -10' 2>/dev/null || true
 }
 
 run_sequencer_lapse() {
   local inner
-  inner="$(inner_container kardamom-sequencer-0 sequencer-a)"
-  [ -n "${inner}" ] || fail "sequencer-lapse: no inner sequencer-a container on kardamom-sequencer-0"
+  inner="$(inner_container kardamom-sequencer-0 sequencer-0)"
+  [ -n "${inner}" ] || fail "sequencer-lapse: no inner sequencer-0 container on kardamom-sequencer-0"
 
   # Detection used to be asserted on the twin (shard 0's replica B,
-  # node-1 seq-b). Freezing replica A wedged its egress session, which
+  # node-1, lane 0). Freezing replica A wedged its egress session, which
   # stalled the sealer's single service thread on the offer deadline, a
   # cluster-wide boundary-arrival gap every running replica's feed had
   # to flag. With the consumer-filtered egress fan-out, publisher-only
@@ -127,7 +127,7 @@ run_sequencer_lapse() {
       # fail-stopped on thaw). So entered >= 1 on the fresh process is
       # its startup resync engaging, and the lapse contract holds.
       local cur started1
-      cur="$(inner_container kardamom-sequencer-0 sequencer-a)"
+      cur="$(inner_container kardamom-sequencer-0 sequencer-0)"
       started1=""
       [ -n "${cur}" ] && started1="$(container_started_at kardamom-sequencer-0 "${cur}")"
       if [ -n "${started0}" ] && [ -n "${started1}" ] && [ "${started1}" != "${started0}" ] \
