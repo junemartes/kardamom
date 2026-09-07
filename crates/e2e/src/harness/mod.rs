@@ -60,6 +60,11 @@ pub struct StackConfig {
     /// lands in `<root>/validator-feed.addr`; see
     /// [`LocalStack::validator_feed_url`].
     pub validator_serve_feed: bool,
+    /// The sealer's remote-origin allowlist
+    /// (`-Dkardamom.cluster.remoteOrigins`): the peer chain ids whose
+    /// kind-5 records the cluster seals. Empty disables interop, and every
+    /// remote-origin record is rejected. The xchain scenarios set it.
+    pub remote_origins: Vec<u64>,
     /// Trie shadow-check cadence for the validator. `Some(1)` checks every
     /// block, the semantics-suite default. The cluster runs with 8.
     pub trie_shadow_check: Option<u64>,
@@ -129,6 +134,7 @@ impl Default for StackConfig {
             validator: false,
             validator_parallel: false,
             validator_serve_feed: false,
+            remote_origins: Vec::new(),
             trie_shadow_check: Some(1),
             chain_id: DEV_CHAIN_ID,
             genesis: Genesis::ClusterDev,
@@ -285,9 +291,10 @@ impl LocalStack {
             let repo = repo.clone();
             let tick = cfg.cluster_tick_ms;
             let members = cfg.sealer_members;
+            let remote_origins = cfg.remote_origins.clone();
             tokio::task::spawn_blocking(move || -> Result<(MediaDriver, SealerCluster)> {
                 let driver = MediaDriver::launch(&rootp)?;
-                let sealer = SealerCluster::launch(&rootp, &repo, members, tick)?;
+                let sealer = SealerCluster::launch(&rootp, &repo, members, tick, &remote_origins)?;
                 Ok((driver, sealer))
             })
             .await
@@ -536,21 +543,36 @@ impl LocalStack {
 
     /// Spawn the interop watcher (`kardamom-da-watcher` in interop mode)
     /// against `feed_url`, publishing remote epochs into this stack's Aeron
-    /// dir. The caller owns the returned process — the xchain scenario
-    /// observes its exit (the pair-scoped fail-stop) directly — and it still
-    /// dies with the test via `PR_SET_PDEATHSIG`, so nothing leaks.
+    /// dir. `dest_rpc` is this stack's own JSON-RPC that serves
+    /// `eth_getStorageAt` (the validator feed URL) for the startup cursor
+    /// reconcile; `None` skips the reconcile. The caller owns the returned
+    /// process — the xchain scenario observes its exit (the pair-scoped
+    /// fail-stop) directly — and it still dies with the test via
+    /// `PR_SET_PDEATHSIG`, so nothing leaks.
     pub fn spawn_interop_watcher(
         &self,
         origin_chain_id: u64,
         feed_url: &str,
         cursor_file: &Path,
+        dest_rpc: Option<&str>,
     ) -> Result<services::Spawned> {
         services::spawn_interop_watcher(
             &self.service_spec(),
             origin_chain_id,
             feed_url,
             cursor_file,
+            dest_rpc,
         )
+    }
+
+    /// Log files of the sealer cluster members, for scenarios that grep
+    /// the sealer's stdout signals (`cluster REMOTE-ORIGIN-REJECT …`).
+    pub fn sealer_logs(&self) -> Vec<PathBuf> {
+        self.sealer
+            .procs
+            .iter()
+            .map(|p| p.log_path.clone())
+            .collect()
     }
 
     /// The [`ServiceSpec`] this stack launched its services from, rebuilt

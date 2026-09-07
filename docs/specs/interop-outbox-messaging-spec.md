@@ -230,8 +230,9 @@ production posture.
   `derive_remote_epoch(self_chain_id, origin_chain_id, expected_first_seq,
   messages) -> Result<RemoteEpochRecord, XChainError>` — orders by `seq`,
   rejects gaps, regressions, duplicates, foreign destinations, and empty
-  batches. `canonical_id = keccak(origin_chain_id ‖ anchor_hash ‖ first_seq ‖
-  last_seq)` for cluster dedup, exactly like `EpochRecord`.
+  batches, and batches that span more than one origin block. `canonical_id =
+  keccak(origin_chain_id ‖ anchor_number ‖ anchor_hash ‖ first_seq ‖ last_seq)`
+  for cluster dedup, exactly like `EpochRecord`.
 - **Batches are one per origin block** — all messages to us from exactly one
   origin block, never a partial or spanning range. Deterministic boundaries are
   what make racing relayers and restarts derive byte-identical records so
@@ -259,7 +260,9 @@ The watcher only publishes messages that have cleared the trust gate (§10).
 - Wire: a **distinct ingress kind**, `KIND_REMOTE_ORIGIN_RECORD = 5`, carrying
   `RT_REMOTE_EPOCH = 3` and `remote_epoch_slots()` (marker + one slot per
   message), parallel to `epoch_slots`. Frame:
-  `[kind=5][canonical_id:32][origin_chain_id:u64][anchor_number:u64][slot_count:u32][RT_REMOTE_EPOCH][rkyv…]`.
+  `[kind=5][canonical_id:32][origin_chain_id:u64][anchor_number:u64][slot_count:u32][first_seq:u64][last_seq:u64][RT_REMOTE_EPOCH][rkyv…]`
+  (69-byte header; see "Known gaps" for the lane rules the sealer applies to
+  it).
   A distinct kind rather than a new record type under kind 4 for the reason
   kind 4 exists at all: the sealer branches on the frame tag and never opens
   the payload, so it cannot see a record-type discriminator that lives inside
@@ -928,21 +931,51 @@ An audit of the interop protocol on 2026-09-03 found the items below open on
 - C3 — pending
 - C4 — pending
 - H1 — #255
-- H2 — pending
-- H3 — pending
+- H2 — #263
+- H3 — #263 (partial: ingress session authentication stays open)
 - H4 — pending
 - H5 — pending
 - H6 — pending
 - H7 — #259
 - H8 — #258
-- H9 — pending
+- H9 — #263
 - M1 — #258
 - M2 — #260
 - M3 — #260
-- M4 — pending
+- M4 — #263
 - M5 — pending
-- M6 — pending
+- M6 — #263
 - M7 — #258
 - M8 — #259
 - M9 — #258
 - M10 — #258
+
+#263 (H2, H3 in part, H9, M4, M6) changes the sealer lane rules. The kind-5
+header carries `first_seq` and `last_seq`. The header is 69 bytes. The sealer
+keeps a `next_seq` cursor for each origin. It runs these checks, in this order,
+before the dedup insert:
+
+- The origin is in the configured allowlist.
+- `last_seq >= first_seq`.
+- `slot_count == 2 + last_seq - first_seq`.
+- `first_seq == next_seq[origin]` when the cursor is known.
+- `anchor_number` advances.
+
+A failed check sends an egress kind-6 reject frame to the offering session only:
+
+`[kind=6][origin_chain_id:u64][first_seq:u64][expected_next_seq:u64][reason:u8]`
+
+A rejected id never enters the dedup window. The sequencer pumps hold a
+backpressured record and retry it. No record is dropped.
+
+At startup the watcher reads `Inbox.nextSeq[origin]` on the destination through
+`--interop-dest-rpc`. The rules are:
+
+- A cursor below `nextSeq` advances to `nextSeq`.
+- An equal cursor is correct.
+- A cursor above `nextSeq` stops the watcher with an error after a short retry.
+
+The destination validator seeds its lane verifier from the same slot. It checks
+the first record too. `canonical_id` now commits to `anchor_number`. The
+watcher recomputes `xchain_anchor_hash` and rejects a feed message with a
+different anchor.

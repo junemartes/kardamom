@@ -654,7 +654,16 @@ impl crate::reader::RemoteEpochObserver for RecordingRemoteObserver {
     fn observe(
         &mut self,
         rec: &kardamom_types::xchain::RemoteEpochRecord,
+        parent_storage: &crate::reader::ParentStorageReader<'_>,
     ) -> Result<(), ExecutorError> {
+        // The seam gives the observer a parent-state read. A fresh chain
+        // reads zero for the Inbox lane cursor.
+        let next_seq = parent_storage(
+            kardamom_types::xchain::INBOX,
+            kardamom_types::xchain::inbox_next_seq_slot(rec.origin_chain_id),
+        )
+        .map_err(ExecutorError::State)?;
+        assert_eq!(next_seq, U256::ZERO);
         self.0.lock().unwrap().push(rec.origin_chain_id);
         Ok(())
     }
@@ -849,6 +858,7 @@ impl crate::reader::RemoteEpochObserver for RejectingRemoteObserver {
     fn observe(
         &mut self,
         rec: &kardamom_types::xchain::RemoteEpochRecord,
+        _parent_storage: &crate::reader::ParentStorageReader<'_>,
     ) -> Result<(), ExecutorError> {
         Err(ExecutorError::State(format!(
             "remote epoch rejected (origin {})",

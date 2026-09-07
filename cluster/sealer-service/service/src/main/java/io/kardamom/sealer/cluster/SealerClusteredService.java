@@ -13,6 +13,7 @@ import io.kardamom.sealer.OriginAdvance;
 import io.kardamom.sealer.RemoteOriginAdvance;
 import java.nio.ByteOrder;
 import java.util.Optional;
+import java.util.Set;
 import org.agrona.DirectBuffer;
 
 /**
@@ -38,6 +39,12 @@ public final class SealerClusteredService implements ClusteredService {
     private final int dedupCapacity;
     /** This cluster member's id, logged on role changes for the chaos suite. */
     private final int memberId;
+    /**
+     * Peer chain ids accepted as remote origins. Empty disables interop.
+     * Every member must run the same list: it decides accept-or-reject in
+     * the replicated state machine, like the dedup capacity.
+     */
+    private final Set<Long> remoteOrigins;
 
     private Cluster cluster;
     private CanonicalSealerState state;
@@ -63,15 +70,25 @@ public final class SealerClusteredService implements ClusteredService {
     /** Contiguity rejects emitted (logged at power-of-two counts). */
     private long rejectedFrameCount = 0;
 
+    /** Remote-origin rejects emitted (logged at power-of-two counts). */
+    private long remoteRejectedFrameCount = 0;
+
     // Scratch buffers for ingress id and sender extraction. Reuse them to
     // avoid a per-message allocation on the single cluster service thread.
     private final byte[] canonicalIdScratch = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
     private final byte[] senderScratch = new byte[CanonicalSealerState.SENDER_LEN];
 
-    public SealerClusteredService(int dedupCapacity, long tickIntervalMs, int memberId) {
+    public SealerClusteredService(
+            int dedupCapacity, long tickIntervalMs, int memberId, Set<Long> remoteOrigins) {
         this.dedupCapacity = dedupCapacity;
         this.tickIntervalMs = tickIntervalMs;
         this.memberId = memberId;
+        this.remoteOrigins = Set.copyOf(remoteOrigins);
+    }
+
+    /** A service with interop disabled (an empty remote-origin allowlist). */
+    public SealerClusteredService(int dedupCapacity, long tickIntervalMs, int memberId) {
+        this(dedupCapacity, tickIntervalMs, memberId, Set.of());
     }
 
     public SealerClusteredService(int dedupCapacity, long tickIntervalMs) {
@@ -91,7 +108,7 @@ public final class SealerClusteredService implements ClusteredService {
             // would diverge from the rest of the cluster, which assumes the
             // snapshotted state (and the log replayed after it) is correct.
             final byte[] snapshot = SnapshotIo.readSnapshot(snapshotImage, cluster.idleStrategy());
-            this.state = CanonicalSealerState.load(snapshot, dedupCapacity);
+            this.state = CanonicalSealerState.load(snapshot, dedupCapacity, remoteOrigins);
             // The retained deque is not snapshotted (v1). Nothing before the
             // restore point can ever be served, so the retention floors start
             // at the first frame this member can retain: record index
@@ -107,7 +124,8 @@ public final class SealerClusteredService implements ClusteredService {
             System.out.println("sealer snapshot RESTORED memberId=" + memberId
                 + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount());
         } else {
-            this.state = new CanonicalSealerState(dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
+            this.state = new CanonicalSealerState(
+                dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins);
             this.egress = new SealerEgress(
                 cluster, memberId, 0L, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
             System.out.println("sealer state FRESH at genesis memberId=" + memberId);
@@ -201,7 +219,7 @@ public final class SealerClusteredService implements ClusteredService {
                 // Its OWN kind, so the branch is taken on the tag alone: the
                 // service never peeks into the payload to tell a peer's message
                 // batch from an L1 epoch.
-                onRemoteOriginRecord(buffer, offset, length);
+                onRemoteOriginRecord(session, buffer, offset, length);
                 maybeReviveBoundaryClock();
                 return;
             case SealerWire.KIND_BATCH:
@@ -314,16 +332,19 @@ public final class SealerClusteredService implements ClusteredService {
     /**
      * Handle a {@link SealerWire#KIND_REMOTE_ORIGIN_RECORD} frame.
      * Strip the peer identity ({@code origin_chain_id}), that peer's anchor
-     * position, and the slot count. Relay the remaining payload as is, and
-     * offer the forced boundary first, so the batch leads the block it opens
-     * instead of trailing the block it closes.
+     * position, the slot count, and the seq range. Relay the remaining
+     * payload as is, and offer the forced boundary first, so the batch leads
+     * the block it opens instead of trailing the block it closes.
      *
-     * <p>This has the same shape as {@link #onOriginRecord}, with one extra
-     * u64 in the header. The state machine uses the peer position only for
-     * dedup's companion checks. It never stamps the position into a
-     * boundary (see {@link CanonicalSealerState#onRemoteOriginRecord}).</p>
+     * <p>A record the state machine rejects (unknown origin, bad range, slot
+     * count mismatch, lane cursor mismatch, or anchor regression) is
+     * answered with an {@link SealerWire#EGRESS_KIND_REMOTE_ORIGIN_REJECT}
+     * frame to the offering session, and is never relayed. Every member
+     * rejects it the same way, because the checks read only replicated
+     * state and shared configuration.</p>
      */
-    private void onRemoteOriginRecord(final DirectBuffer buffer, final int offset, final int length) {
+    private void onRemoteOriginRecord(
+            final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
         if (length < SealerWire.MIN_REMOTE_ORIGIN_RECORD_LEN) {
             onMalformedFrame("remote-origin-record", length);
             return;
@@ -336,38 +357,65 @@ public final class SealerClusteredService implements ClusteredService {
         final long slotCount =
                 buffer.getInt(offset + SealerWire.REMOTE_SLOT_COUNT_OFFSET, ByteOrder.LITTLE_ENDIAN)
                         & 0xFFFF_FFFFL;
+        final long firstSeq =
+                buffer.getLong(offset + SealerWire.REMOTE_FIRST_SEQ_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        final long lastSeq =
+                buffer.getLong(offset + SealerWire.REMOTE_LAST_SEQ_OFFSET, ByteOrder.LITTLE_ENDIAN);
 
         // Same relay shape as an epoch: [canonical_id:32][record_type][fields…],
         // measured from the END of the header so no slack lands where rkyv
         // looks for its root.
-        final int tailLength = length - (SealerWire.REMOTE_SLOT_COUNT_OFFSET + Integer.BYTES);
+        final int tailLength = length - SealerWire.MIN_REMOTE_ORIGIN_RECORD_LEN;
         final byte[] payload = new byte[CanonicalSealerState.CANONICAL_ID_LEN + tailLength];
         buffer.getBytes(
                 offset + SealerWire.REMOTE_ID_OFFSET, payload, 0, CanonicalSealerState.CANONICAL_ID_LEN);
         if (tailLength > 0) {
             buffer.getBytes(
-                    offset + SealerWire.REMOTE_SLOT_COUNT_OFFSET + Integer.BYTES,
+                    offset + SealerWire.MIN_REMOTE_ORIGIN_RECORD_LEN,
                     payload,
                     CanonicalSealerState.CANONICAL_ID_LEN,
                     tailLength);
         }
 
-        final Optional<RemoteOriginAdvance> advance;
-        try {
-            advance = state.onRemoteOriginRecord(
-                canonicalIdScratch, originChainId, anchorNumber, slotCount, payload, cluster.time());
-        } catch (final IllegalArgumentException ex) {
-            // A non-advancing peer position is a producer bug, exactly like a
-            // non-advancing L1 origin. Every member rejects it identically (the
-            // check reads only replicated state), so dropping is deterministic.
-            onMalformedFrame("remote-origin-record-regression", length);
+        final CanonicalSealerState.RemoteOriginOutcome outcome = state.onRemoteOriginRecord(
+            canonicalIdScratch, originChainId, anchorNumber, slotCount, firstSeq, lastSeq,
+            payload, cluster.time());
+        if (outcome.rejected) {
+            onRemoteOriginReject(session, originChainId, firstSeq, outcome.expectedNextSeq, outcome.reason);
             return;
         }
-        if (advance.isEmpty()) {
+        if (outcome.advance.isEmpty()) {
             return; // duplicate batch from a racing watcher
         }
-        advance.get().forcedBoundary().ifPresent(egress::offerBoundary);
-        egress.offerRelayed(advance.get().relayed());
+        outcome.advance.get().forcedBoundary().ifPresent(egress::offerBoundary);
+        egress.offerRelayed(outcome.advance.get().relayed());
+    }
+
+    /**
+     * Answer a remote-origin reject to the offering session. Member-local
+     * egress IO, exactly like {@link #onContiguityReject}: the rejection
+     * itself moved no replicated state, and every member computed it the
+     * same way.
+     */
+    private void onRemoteOriginReject(
+            final ClientSession session,
+            final long originChainId,
+            final long firstSeq,
+            final long expectedNextSeq,
+            final byte reason) {
+        remoteRejectedFrameCount++;
+        if (Long.bitCount(remoteRejectedFrameCount) == 1) {
+            // Log to stdout like the other operational signals, so the e2e
+            // and chaos suites can grep it. Count at powers of two so a
+            // storm cannot flood the log.
+            System.out.println("cluster REMOTE-ORIGIN-REJECT memberId=" + memberId
+                + " origin=" + Long.toUnsignedString(originChainId)
+                + " firstSeq=" + Long.toUnsignedString(firstSeq)
+                + " expectedNextSeq=" + Long.toUnsignedString(expectedNextSeq)
+                + " reason=" + reason
+                + " totalRejected=" + remoteRejectedFrameCount);
+        }
+        egress.offerRemoteOriginReject(session, originChainId, firstSeq, expectedNextSeq, reason);
     }
 
     /**

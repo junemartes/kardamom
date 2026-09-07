@@ -52,6 +52,14 @@ public final class ClusterNode {
         // the sizing math.
         final int dedupCapacity = Integer.getInteger(
             "kardamom.cluster.dedupCapacity", SealerWire.DEFAULT_DEDUP_CAPACITY);
+        // Remote-origin allowlist: the peer chain ids this sealer accepts
+        // kind-5 records from. -Dkardamom.cluster.remoteOrigins wins over
+        // the KARDAMOM_REMOTE_ORIGINS env var. Unset or empty disables
+        // interop. Every member must run the same list.
+        final java.util.Set<Long> remoteOrigins = parseRemoteOrigins(
+            System.getProperty("kardamom.cluster.remoteOrigins", System.getenv("KARDAMOM_REMOTE_ORIGINS")));
+        System.out.println("cluster remote-origin allowlist memberId=" + memberId
+            + " origins=" + (remoteOrigins.isEmpty() ? "<none: interop disabled>" : remoteOrigins));
 
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
 
@@ -78,7 +86,8 @@ public final class ClusterNode {
                     archiveContext(aeronDir, archiveDir, me),
                     consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, barrier));
                 container = ClusteredServiceContainer.launch(
-                    serviceContext(aeronDir, clusterDir, dedupCapacity, tickMs, memberId, barrier));
+                    serviceContext(
+                        aeronDir, clusterDir, dedupCapacity, tickMs, memberId, remoteOrigins, barrier));
                 break;
             } catch (final RuntimeException e) {
                 org.agrona.CloseHelper.quietClose(driver);
@@ -266,14 +275,40 @@ public final class ClusterNode {
         return ctx;
     }
 
+    /**
+     * Parse a comma-separated list of u64 chain ids. Blank entries are
+     * ignored. A malformed entry is fatal: a typo must not silently disable
+     * a peer.
+     */
+    static java.util.Set<Long> parseRemoteOrigins(final String raw) {
+        final java.util.Set<Long> out = new java.util.TreeSet<>();
+        if (raw == null) {
+            return out;
+        }
+        for (final String part : raw.split(",")) {
+            final String t = part.trim();
+            if (t.isEmpty()) {
+                continue;
+            }
+            try {
+                out.add(Long.parseUnsignedLong(t));
+            } catch (final NumberFormatException e) {
+                throw new IllegalStateException(
+                    "kardamom.cluster.remoteOrigins: '" + t + "' is not a u64 chain id", e);
+            }
+        }
+        return out;
+    }
+
     private static ClusteredServiceContainer.Context serviceContext(
             final String aeronDir, final String clusterDir, final int dedupCapacity,
-            final long tickMs, final int memberId, final ShutdownSignalBarrier barrier) {
+            final long tickMs, final int memberId, final java.util.Set<Long> remoteOrigins,
+            final ShutdownSignalBarrier barrier) {
         final ClusteredServiceContainer.Context ctx = new ClusteredServiceContainer.Context()
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .appVersion(APP_VERSION)
-            .clusteredService(new SealerClusteredService(dedupCapacity, tickMs, memberId));
+            .clusteredService(new SealerClusteredService(dedupCapacity, tickMs, memberId, remoteOrigins));
         // The clustered-service container has its own termination hook.
         // Instrumenting only the consensus module would still exit silently
         // when the container is the one that terminates.

@@ -238,6 +238,9 @@ async fn main() -> Result<()> {
     // marker, or a truly trie-less image, says to. This must run before
     // the trie-aware writer spawns.
     adoption::bootstrap_trie_if_adopted(&args.state_dir, &env)?;
+    // A read handle for the serving surface's `eth_getStorageAt`. The
+    // env is an Arc inside, so this shares the one mdbx environment.
+    let state_env_for_rpc = env.clone();
     let mut writer =
         StateWriter::spawn_with_trie(env, trie_mode).context("spawn trie-aware state writer")?;
     let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
@@ -343,6 +346,7 @@ async fn main() -> Result<()> {
                         max_subscriptions: args.feed_max_subscriptions,
                         max_subscriptions_per_dest: args.feed_max_subscriptions_per_dest,
                     },
+                    state_env: Some(state_env_for_rpc.clone()),
                 },
             )
             .await
@@ -357,7 +361,7 @@ async fn main() -> Result<()> {
                 max_subscriptions = args.feed_max_subscriptions,
                 max_subscriptions_per_dest = args.feed_max_subscriptions_per_dest,
                 "interop feed server enabled (kardamom_subscribeOutbox, \
-                 kardamom_subscribeAttestations)"
+                 kardamom_subscribeAttestations, eth_getStorageAt)"
             );
             Some(handle)
         }

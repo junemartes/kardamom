@@ -35,7 +35,8 @@ use anyhow::{Context, Result};
 use kardamom_da_watcher::interop::mock::MockInteropFeed;
 use kardamom_types::StateDatabase;
 use kardamom_types::xchain::{
-    Callback, INBOX, OUTBOX, OutboxMessage, msg_leaf, remote_source_hash, xchain_tx_sender,
+    Callback, INBOX, OUTBOX, OutboxMessage, derive_remote_epoch, msg_leaf, remote_source_hash,
+    xchain_anchor_hash, xchain_tx_sender,
 };
 
 use super::{
@@ -98,7 +99,9 @@ pub(crate) fn feed_msg(
 ) -> OutboxMessage {
     OutboxMessage {
         origin_block_number: origin_block,
-        origin_block_hash: B256::repeat_byte(origin_block as u8),
+        // The watcher recomputes the anchor and rejects a feed that chooses
+        // its own (audit M4), so the scripted feed must serve the real one.
+        origin_block_hash: xchain_anchor_hash(ORIGIN_CHAIN_ID, origin_block),
         dest_chain_id: crate::harness::DEV_CHAIN_ID,
         seq,
         sender: Address::repeat_byte(0xA1),
@@ -391,6 +394,110 @@ pub async fn delivery(
         receiver,
         payload_word,
     })
+}
+
+/// The sealer-guard arm (audit H2/H9/M6): a kind-5 record that SKIPS the
+/// lane cursor reaches the cluster through the real sequencers, and the
+/// sealer answers with a reject frame instead of sealing a hole.
+///
+/// Runs after [`delivery`]: seqs 0..2 are delivered, seq 3 is pending, and
+/// the sealer's lane cursor for the origin is 3. The injected record starts
+/// at seq 5. Evidence:
+///
+/// * the sequencers count `kardamom_sequencer_remote_origin_reject_total`
+///   with reason `seq_mismatch` (the reject frame reached the offering
+///   session and was decoded);
+/// * the sealer logged `cluster REMOTE-ORIGIN-REJECT … expectedNextSeq=3`;
+/// * nothing executed: `Inbox.nextSeq` is still 3, and seq 5 has no receipt.
+///
+/// The lane stays intact: [`gap_halts_pair_not_chain`] runs next and
+/// delivers seq 3 through the same sealer, which proves the reject did not
+/// move the lane cursor and did not poison the dedup window.
+pub async fn sealer_rejects_a_skipped_seq(
+    t: &Target,
+    aeron_dir: &Path,
+    sealer_logs: &[std::path::PathBuf],
+    executor_state_dir: &Path,
+    outcome: &DeliveryOutcome,
+) -> Result<()> {
+    let rejects_before = t
+        .sequencer_metric_sum(super::SEQ_REMOTE_ORIGIN_REJECT)
+        .await
+        .unwrap_or(0.0);
+
+    // A well-formed record at seq 5 (skipping 3 and 4) in a later origin
+    // block, derived by the SAME rule the watcher runs: the sealer must
+    // reject it on the lane cursor alone, not on its shape.
+    let payee = outcome.receiver;
+    let skipped = derive_remote_epoch(
+        t.chain_id,
+        ORIGIN_CHAIN_ID,
+        5,
+        &[feed_msg(5, 110, payee, &[0x55], None)],
+    )
+    .context("derive the skipping record")?;
+    anyhow::ensure!(skipped.first_seq == 5 && skipped.anchor_number == 110);
+    crate::harness::inject::publish_remote_epoch(aeron_dir, skipped).await?;
+
+    // The sequencers relayed it, and each one got the reject frame back.
+    poll_until(
+        "a sealer REMOTE-ORIGIN-REJECT counted by the sequencers",
+        Duration::from_secs(30),
+        Duration::from_millis(250),
+        || async {
+            let now = t
+                .sequencer_metric_sum(super::SEQ_REMOTE_ORIGIN_REJECT)
+                .await
+                .unwrap_or(0.0);
+            Ok((now >= rejects_before + 1.0).then_some(now))
+        },
+    )
+    .await?;
+
+    // The sealer named the reason in its log: the lane cursor was 3. The
+    // sealer prints before it offers, so the line is there by now; the
+    // poll only covers a slow log flush.
+    let needle = "REMOTE-ORIGIN-REJECT memberId=";
+    let detail = format!("origin={ORIGIN_CHAIN_ID} firstSeq=5 expectedNextSeq=3 reason=1");
+    poll_until(
+        "the sealer REMOTE-ORIGIN-REJECT log line",
+        Duration::from_secs(10),
+        Duration::from_millis(250),
+        || async {
+            let logs: String = sealer_logs
+                .iter()
+                .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+                .collect();
+            Ok(logs
+                .lines()
+                .any(|l| l.contains(needle) && l.contains(&detail))
+                .then_some(()))
+        },
+    )
+    .await?;
+
+    // Nothing executed. The lane cursor is untouched, and the skipping
+    // record's message has no receipt.
+    let next_seq = read_slot(
+        executor_state_dir,
+        INBOX,
+        inbox_next_seq_slot(ORIGIN_CHAIN_ID),
+    )?;
+    anyhow::ensure!(
+        next_seq == U256::from(3),
+        "Inbox.nextSeq must stay 3 after the reject, got {next_seq}"
+    );
+    let gone = t
+        .rpc
+        .receipt(remote_source_hash(ORIGIN_CHAIN_ID, 5))
+        .await
+        .result
+        .map_err(|e| anyhow::anyhow!("receipt probe for the skipping seq: {e}"))?;
+    anyhow::ensure!(
+        gone.is_none(),
+        "seq 5 skipped the lane and must never execute: {gone:?}"
+    );
+    Ok(())
 }
 
 /// The adversarial arm: the feed swallows one seq. The watcher must

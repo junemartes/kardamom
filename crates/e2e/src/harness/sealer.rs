@@ -50,7 +50,16 @@ impl SealerCluster {
     /// runs, 3 for a real quorum). This blocks until every member logs
     /// "cluster node up" and member 0 reports a role (LEADER, for a
     /// single member).
-    pub fn launch(root: &Path, repo_root: &Path, members: usize, tick_ms: u64) -> Result<Self> {
+    ///
+    /// `remote_origins` is the sealer's remote-origin allowlist. Empty
+    /// disables interop on the cluster.
+    pub fn launch(
+        root: &Path,
+        repo_root: &Path,
+        members: usize,
+        tick_ms: u64,
+        remote_origins: &[u64],
+    ) -> Result<Self> {
         anyhow::ensure!(members >= 1, "cluster needs at least one member");
         let jar = cluster_jar(repo_root)?;
 
@@ -110,6 +119,14 @@ impl SealerCluster {
             ))
             .arg("-Dkardamom.cluster.ingressStreamId=101")
             .arg(format!("-Dkardamom.cluster.tickMs={tick_ms}"))
+            .arg(format!(
+                "-Dkardamom.cluster.remoteOrigins={}",
+                remote_origins
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))
             // The cluster node is also an Aeron client, so it hits the same
             // 10 s limit when the driver conductor starves. See
             // `services::driver_timeout_ms` for the same value, spelled

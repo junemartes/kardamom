@@ -134,6 +134,29 @@ pub fn alias_remote_address(origin_chain_id: u64, sender: Address) -> Address {
     Address::from_slice(&h.as_slice()[12..])
 }
 
+/// Tag string hashed into [`xchain_anchor_hash`]. Versioned like
+/// [`XCHAIN_ALIAS_TAG`]: a change here changes every record id.
+pub const XCHAIN_ANCHOR_TAG: &str = "KARDAMOM_XCHAIN_ANCHOR_V0";
+
+/// Deterministic anchor for one origin block. The origin validator serves it
+/// as the feed's `originBlockHash`, and the watcher recomputes it.
+///
+/// Kardamom blocks carry no canonical hash in v0. The sealed boundary is
+/// slim, and the RPC returns `blockHash: null`. So this is a position
+/// commitment, not a content commitment. Every validator of one chain
+/// serves the same anchor for a block, so racing relayers derive
+/// byte-identical records, and `canonical_id` dedup collapses them. The
+/// watcher rejects a feed message whose anchor differs from this function,
+/// because the feed must not choose the anchor. Content authenticity is the
+/// job of spec §10, never of this field.
+pub fn xchain_anchor_hash(origin_chain_id: u64, block_number: u64) -> B256 {
+    let mut buf = Vec::with_capacity(XCHAIN_ANCHOR_TAG.len() + 16);
+    buf.extend_from_slice(XCHAIN_ANCHOR_TAG.as_bytes());
+    buf.extend_from_slice(&origin_chain_id.to_be_bytes());
+    buf.extend_from_slice(&block_number.to_be_bytes());
+    keccak256(&buf)
+}
+
 /// Response requested by a message's sender: enqueued through the
 /// destination's own Outbox when delivery completes (success or failure),
 /// addressed back to `target` on the origin. Fixed-size by design — the
@@ -498,9 +521,16 @@ impl RemoteEpochRecord {
     /// feed prefix derive byte-identical records, and first-seen dedup
     /// collapses them — the `EpochRecord::canonical_id` property, keyed by
     /// pair position rather than L1 hash.
+    ///
+    /// The preimage commits to `anchor_number` as well as to the anchor
+    /// hash and the seq range. The sealer reads the anchor from the frame
+    /// header, and the egress decoder recomputes this id from the body. So
+    /// a header whose anchor differs from the body fails the cross-check
+    /// instead of moving the sealer's per-peer position.
     pub fn canonical_id(&self) -> B256 {
-        let mut buf = Vec::with_capacity(8 + 32 + 16);
+        let mut buf = Vec::with_capacity(8 + 8 + 32 + 16);
         buf.extend_from_slice(&self.origin_chain_id.to_be_bytes());
+        buf.extend_from_slice(&self.anchor_number.to_be_bytes());
         buf.extend_from_slice(self.anchor_hash.as_slice());
         buf.extend_from_slice(&self.first_seq.to_be_bytes());
         buf.extend_from_slice(&self.last_seq().to_be_bytes());
@@ -595,6 +625,20 @@ pub fn derive_remote_epoch(
             });
         }
     }
+    // One record is one origin block. The record's anchor is the block of
+    // its LAST message, so a batch that spans two blocks would anchor its
+    // earlier messages at a later block. The watcher cuts batches at block
+    // edges, so a spanning batch is a producer bug or a malicious feed.
+    let first_block = ordered[0].origin_block_number;
+    if let Some(m) = ordered
+        .iter()
+        .find(|m| m.origin_block_number != first_block)
+    {
+        return Err(XChainError::MultiBlockBatch {
+            first_block,
+            found_block: m.origin_block_number,
+        });
+    }
 
     let last = ordered.last().expect("non-empty");
     Ok(RemoteEpochRecord {
@@ -646,6 +690,39 @@ pub enum XChainError {
     /// `data` longer than [`MAX_DATA_BYTES`], which the `Outbox` rejects.
     #[error("outbox message seq {seq} data length {len} is above the cap {cap}")]
     DataAboveCap { seq: u64, len: usize, cap: usize },
+    /// A batch spans more than one origin block. One record anchors at one
+    /// block, so the watcher must cut the batch at the block edge.
+    #[error("batch spans origin blocks {first_block} and {found_block}; one record is one block")]
+    MultiBlockBatch { first_block: u64, found_block: u64 },
+    /// A feed message carries an `origin_block_hash` that is not
+    /// [`xchain_anchor_hash`] of its `(origin, block)`. The anchor is a pure
+    /// function of the position, so the feed must not choose it.
+    #[error(
+        "message seq {seq} at origin block {block} carries anchor {carried}, expected {expected}"
+    )]
+    AnchorMismatch {
+        seq: u64,
+        block: u64,
+        carried: B256,
+        expected: B256,
+    },
+}
+
+/// Reject a feed message whose `origin_block_hash` is not the anchor that
+/// [`xchain_anchor_hash`] computes for its position. The watcher runs this
+/// on every message BEFORE derivation (audit M4: the anchor was trusted
+/// from the feed).
+pub fn check_anchor(origin_chain_id: u64, msg: &OutboxMessage) -> Result<(), XChainError> {
+    let expected = xchain_anchor_hash(origin_chain_id, msg.origin_block_number);
+    if msg.origin_block_hash != expected {
+        return Err(XChainError::AnchorMismatch {
+            seq: msg.seq,
+            block: msg.origin_block_number,
+            carried: msg.origin_block_hash,
+            expected,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -653,10 +730,17 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, address, b256};
 
+    /// One message in origin block 100. Every batch in these tests sits in
+    /// ONE origin block, because a record is one block (see
+    /// [`XChainError::MultiBlockBatch`]).
     fn msg(seq: u64, dest: u64) -> OutboxMessage {
+        msg_in_block(seq, dest, 100)
+    }
+
+    fn msg_in_block(seq: u64, dest: u64, block: u64) -> OutboxMessage {
         OutboxMessage {
-            origin_block_number: seq.saturating_add(100),
-            origin_block_hash: B256::repeat_byte(0x0B),
+            origin_block_number: block,
+            origin_block_hash: xchain_anchor_hash(ORIGIN, block),
             dest_chain_id: dest,
             seq,
             sender: Address::repeat_byte(0xA1),
@@ -879,6 +963,116 @@ mod tests {
         let c = derive_remote_epoch(SELF, ORIGIN, 1, &[msg(1, SELF)]).unwrap();
         assert_eq!(a.canonical_id(), b.canonical_id());
         assert_ne!(a.canonical_id(), c.canonical_id());
+        // The same seq range at a different anchor is a different record.
+        // The sealer trusts the header's anchor only because the id binds
+        // it (audit H3).
+        let mut d = a.clone();
+        d.anchor_number += 1;
+        assert_ne!(a.canonical_id(), d.canonical_id());
+    }
+
+    /// The id preimage is
+    /// `origin_be8 ‖ anchor_number_be8 ‖ anchor_hash ‖ first_seq_be8 ‖ last_seq_be8`.
+    /// A change here changes every record id on the canonical stream.
+    #[test]
+    fn canonical_id_known_vector_is_pinned() {
+        let rec = RemoteEpochRecord {
+            origin_chain_id: 412_346,
+            anchor_number: 0x0011_2233_4455_6677,
+            anchor_hash: B256::repeat_byte(0x5A),
+            first_seq: 9,
+            messages: alloc::vec![
+                XChainMessage {
+                    seq: 9,
+                    ..Default::default()
+                },
+                XChainMessage {
+                    seq: 10,
+                    ..Default::default()
+                },
+            ],
+        };
+        let mut preimage = alloc::vec::Vec::new();
+        preimage.extend_from_slice(&412_346u64.to_be_bytes());
+        preimage.extend_from_slice(&0x0011_2233_4455_6677u64.to_be_bytes());
+        preimage.extend_from_slice(&[0x5A; 32]);
+        preimage.extend_from_slice(&9u64.to_be_bytes());
+        preimage.extend_from_slice(&10u64.to_be_bytes());
+        assert_eq!(rec.canonical_id(), keccak256(&preimage));
+        assert_eq!(
+            rec.canonical_id(),
+            b256!("0xd75d04f838d45e94580c13899702239d95e68dc3380e932f23f73113c0a7895a"),
+            "pinned vector: regenerate on purpose only"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_spans_two_origin_blocks_is_rejected() {
+        let e = derive_remote_epoch(
+            SELF,
+            ORIGIN,
+            0,
+            &[msg_in_block(0, SELF, 100), msg_in_block(1, SELF, 101)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            XChainError::MultiBlockBatch {
+                first_block: 100,
+                found_block: 101
+            }
+        );
+        // Two messages in one block derive.
+        let ok = derive_remote_epoch(
+            SELF,
+            ORIGIN,
+            0,
+            &[msg_in_block(0, SELF, 100), msg_in_block(1, SELF, 100)],
+        )
+        .unwrap();
+        assert_eq!(ok.anchor_number, 100);
+    }
+
+    #[test]
+    fn anchor_check_rejects_a_feed_chosen_hash() {
+        let good = msg(3, SELF);
+        assert_eq!(check_anchor(ORIGIN, &good), Ok(()));
+        let mut bad = msg(3, SELF);
+        bad.origin_block_hash = B256::repeat_byte(0xEE);
+        let e = check_anchor(ORIGIN, &bad).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                XChainError::AnchorMismatch {
+                    seq: 3,
+                    block: 100,
+                    ..
+                }
+            ),
+            "got {e:?}"
+        );
+        // The anchor from another origin is also wrong.
+        let mut other = msg(3, SELF);
+        other.origin_block_hash = xchain_anchor_hash(ORIGIN + 1, 100);
+        assert!(check_anchor(ORIGIN, &other).is_err());
+    }
+
+    /// `keccak256("KARDAMOM_XCHAIN_ANCHOR_V0" ‖ origin_be8 ‖ block_be8)`.
+    #[test]
+    fn anchor_hash_known_vector_is_pinned() {
+        let mut preimage = alloc::vec::Vec::new();
+        preimage.extend_from_slice(b"KARDAMOM_XCHAIN_ANCHOR_V0");
+        preimage.extend_from_slice(&412_346u64.to_be_bytes());
+        preimage.extend_from_slice(&42u64.to_be_bytes());
+        assert_eq!(xchain_anchor_hash(412_346, 42), keccak256(&preimage));
+        assert_ne!(
+            xchain_anchor_hash(412_346, 42),
+            xchain_anchor_hash(412_346, 43)
+        );
+        assert_ne!(
+            xchain_anchor_hash(412_346, 42),
+            xchain_anchor_hash(412_347, 42)
+        );
     }
 
     #[test]

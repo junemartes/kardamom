@@ -164,10 +164,22 @@ fn remote_origin_record_layout_is_pinned_byte_for_byte() {
         3,
         "slot_count = marker + 2 messages"
     );
-    assert_eq!(b[53], RT_REMOTE_EPOCH);
-    assert_eq!(b[53], 3);
-    // Everything from offset 54 on is the opaque rkyv payload.
-    assert!(b.len() > 54, "the record body must be present");
+    assert_eq!(
+        u64::from_le_bytes(b[53..61].try_into().unwrap()),
+        9,
+        "first_seq is little-endian at offset 53"
+    );
+    assert_eq!(
+        u64::from_le_bytes(b[61..69].try_into().unwrap()),
+        10,
+        "last_seq is little-endian at offset 61"
+    );
+    // The sealer's slot_count rule: 2 + last_seq - first_seq.
+    assert_eq!(3, 2 + 10 - 9);
+    assert_eq!(b[69], RT_REMOTE_EPOCH);
+    assert_eq!(b[69], 3);
+    // Everything from offset 70 on is the opaque rkyv payload.
+    assert!(b.len() > 70, "the record body must be present");
 
     // The kind byte alone separates the two origin-advancing frames; the
     // sealer branches on it without opening either payload.
@@ -193,9 +205,9 @@ fn remote_epoch_ingress_relay_egress_roundtrip() {
     // the slot count are consumed by the sealer, not forwarded.
     let cid: [u8; 32] = ingress[1..33].try_into().unwrap();
     assert_eq!(cid, rec.canonical_id().0);
-    let mut relayed = Vec::with_capacity(32 + ingress.len() - 53);
+    let mut relayed = Vec::with_capacity(32 + ingress.len() - 69);
     relayed.extend_from_slice(&cid);
-    relayed.extend_from_slice(&ingress[53..]);
+    relayed.extend_from_slice(&ingress[69..]);
 
     match decode_egress(&encode_egress_record(11, &relayed)).unwrap() {
         EgressItem::Record { index, msg } => {
@@ -226,6 +238,61 @@ fn contiguity_reject_roundtrip() {
         }
         other => panic!("expected ContiguityReject, got {other:?}"),
     }
+}
+
+/// The header anchor is bound by the canonical id. A relayed body whose
+/// anchor differs from the id the sealer deduped on is rejected by the
+/// consumer, so a forged header cannot poison a peer's lane (audit H3).
+#[test]
+fn remote_epoch_body_anchor_is_bound_by_the_canonical_id() {
+    let rec = remote_epoch();
+    let mut forged = rec.clone();
+    forged.anchor_number = u64::MAX;
+    let body = rkyv::to_bytes::<rkyv::rancor::Error>(&forged).unwrap();
+    // Relay the FORGED body under the honest record's id.
+    let mut relayed = Vec::new();
+    relayed.extend_from_slice(rec.canonical_id().as_slice());
+    relayed.push(RT_REMOTE_EPOCH);
+    relayed.extend_from_slice(&body);
+    assert!(matches!(
+        decode_egress(&encode_egress_record(0, &relayed)),
+        Err(WireError::BadRemoteEpoch(_))
+    ));
+}
+
+#[test]
+fn remote_origin_reject_roundtrip() {
+    let b = encode_remote_origin_reject(412_346, 7, 5, REMOTE_ORIGIN_REJECT_SEQ_MISMATCH);
+    assert_eq!(b[0], EGRESS_KIND_REMOTE_ORIGIN_REJECT);
+    assert_eq!(
+        b[0], 6,
+        "kind 6 is the Java EGRESS_KIND_REMOTE_ORIGIN_REJECT"
+    );
+    assert_eq!(b.len(), 26, "kind + three u64 + reason");
+    assert_eq!(u64::from_le_bytes(b[1..9].try_into().unwrap()), 412_346);
+    assert_eq!(u64::from_le_bytes(b[9..17].try_into().unwrap()), 7);
+    assert_eq!(u64::from_le_bytes(b[17..25].try_into().unwrap()), 5);
+    assert_eq!(b[25], 1);
+    match decode_egress(&b).unwrap() {
+        EgressItem::RemoteOriginReject {
+            origin_chain_id,
+            first_seq,
+            expected_next_seq,
+            reason,
+        } => {
+            assert_eq!(origin_chain_id, 412_346);
+            assert_eq!(first_seq, 7);
+            assert_eq!(expected_next_seq, 5);
+            assert_eq!(reason, REMOTE_ORIGIN_REJECT_SEQ_MISMATCH);
+            assert_eq!(remote_origin_reject_reason(reason), "seq_mismatch");
+        }
+        other => panic!("expected RemoteOriginReject, got {other:?}"),
+    }
+    assert!(matches!(
+        decode_egress(&b[..25]),
+        Err(WireError::TooShort { at: 25, .. })
+    ));
+    assert_eq!(remote_origin_reject_reason(0xFF), "unknown");
 }
 
 #[test]
@@ -327,7 +394,7 @@ fn epoch_bodies_decode_from_every_input_offset() {
     let remote = remote_epoch_with_callback();
     let remote_frame = encode_egress_record(
         1,
-        &relay_origin_record(&encode_ingress_remote_epoch(&remote).unwrap(), 20),
+        &relay_origin_record(&encode_ingress_remote_epoch(&remote).unwrap(), 36),
     );
     let epoch = epoch_with_deposit();
     let epoch_frame = encode_egress_record(

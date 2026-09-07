@@ -31,7 +31,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
-use kardamom_types::xchain::{XChainError, derive_remote_epoch};
+use kardamom_types::xchain::{XChainError, check_anchor, derive_remote_epoch};
 
 use crate::interop::cursor::CursorFile;
 use crate::interop::publisher::{PublishError, RemoteEpochPublisher};
@@ -109,7 +109,14 @@ where
         e => InteropError::Source(e),
     })?;
 
-    // The batch goes in verbatim: ordering, gap, duplicate and
+    // The anchor is a pure function of (origin, block). The feed must not
+    // choose it, so recompute it here and reject a message that differs
+    // (audit M4). Terminal for the pair, like every derivation fault.
+    for m in &batch {
+        check_anchor(origin, m).map_err(InteropError::Derive)?;
+    }
+
+    // The batch goes in verbatim: ordering, gap, duplicate, multi-block and
     // foreign-destination verdicts all belong to the shared rule, which the
     // destination's verifier re-runs against the resulting record.
     let record = derive_remote_epoch(self_chain_id, origin, *cursor, &batch)
@@ -322,7 +329,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use alloy_primitives::{Address, B256, Bytes};
-    use kardamom_types::xchain::{OutboxMessage, RemoteEpochRecord, remote_source_hash};
+    use kardamom_types::xchain::{
+        OutboxMessage, RemoteEpochRecord, remote_source_hash, xchain_anchor_hash,
+    };
 
     use super::*;
     use crate::interop::mock::MockInteropFeed;
@@ -335,7 +344,7 @@ mod tests {
     fn msg(seq: u64, block: u64) -> OutboxMessage {
         OutboxMessage {
             origin_block_number: block,
-            origin_block_hash: B256::repeat_byte(block as u8),
+            origin_block_hash: xchain_anchor_hash(ORIGIN, block),
             dest_chain_id: SELF,
             seq,
             sender: Address::repeat_byte(0xA1),
@@ -516,6 +525,53 @@ mod tests {
         feed.push_message(msg(4, 103));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(publisher.records().len(), 1);
+    }
+
+    /// Audit M4: a feed that serves its own anchor is a fault of the feed.
+    /// The watcher recomputes the anchor and stops the pair.
+    #[tokio::test]
+    async fn a_feed_chosen_anchor_halts_the_pair() {
+        let feed = MockInteropFeed::new(ORIGIN).await;
+        let (publisher, handle) = spawn_against(&feed).await;
+
+        let mut forged = msg(0, 100);
+        forged.origin_block_hash = B256::repeat_byte(0xEE);
+        feed.push_message(forged);
+        feed.push_message(msg(1, 101));
+
+        assert_halted(handle).await;
+        assert!(
+            publisher.records().is_empty(),
+            "a batch with a forged anchor must not be published"
+        );
+    }
+
+    /// Audit M4: a batch that spans two origin blocks is rejected by the
+    /// shared rule. The scripted source hands over such a batch directly.
+    #[tokio::test]
+    async fn a_multi_block_batch_is_a_fault() {
+        use crate::interop::source::fakes::ScriptedRemoteSource;
+
+        let publisher = InMemoryRemoteEpochPublisher::default();
+        let mut source = ScriptedRemoteSource::new(ORIGIN);
+        source.push_batch(Ok(vec![msg(0, 100), msg(1, 101)]));
+        let mut cursor = 0u64;
+
+        let err = process_once(&publisher, &mut source, SELF, &mut cursor)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InteropError::Derive(XChainError::MultiBlockBatch {
+                    first_block: 100,
+                    found_block: 101
+                })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(cursor, 0);
+        assert!(publisher.records().is_empty());
     }
 
     /// Two messages at one seq: an equivocating origin, not a retry.

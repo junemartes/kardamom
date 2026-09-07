@@ -172,6 +172,7 @@ pub fn spawn_interop_watcher(
     origin_chain_id: u64,
     feed_url: &str,
     cursor_file: &Path,
+    dest_rpc: Option<&str>,
 ) -> Result<Spawned> {
     let metrics_port = free_tcp_port()?;
     let mut cmd = Command::new(bin("kardamom-da-watcher")?);
@@ -179,7 +180,19 @@ pub fn spawn_interop_watcher(
         .args(["--interop-feed-url", feed_url])
         .args(["--self-chain-id", &spec.chain_id.to_string()])
         .arg("--interop-cursor-file")
-        .arg(cursor_file)
+        .arg(cursor_file);
+    // The startup cursor reconcile needs a destination JSON-RPC that
+    // serves eth_getStorageAt (the validator's --serve-feed endpoint). A
+    // stack without one skips the reconcile, which is the test-only path.
+    match dest_rpc {
+        Some(url) => {
+            cmd.args(["--interop-dest-rpc", url]);
+        }
+        None => {
+            cmd.arg("--interop-skip-cursor-reconcile");
+        }
+    }
+    cmd
         // 1 s (vs the 2 s default) keeps feed-retry latency inside a test's
         // patience, mirroring the L1 watcher's tightened poll interval.
         .args(["--interop-retry-interval-secs", "1"])

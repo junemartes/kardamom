@@ -398,9 +398,24 @@ impl EpochObserver for Box<dyn EpochObserver> {
 /// engine. Keep implementations cheap. This code runs on the exec
 /// thread. Put slow work, such as a network call, on a background task
 /// with a deferred verdict.
+///
+/// `parent_storage` reads one storage slot from the state the record's
+/// block builds on: the live delta, then the unsettled parent blocks, then
+/// the committed snapshot. The destination validator seeds its per-origin
+/// lane cursor from `Inbox.nextSeq[origin]` through it, so a restart never
+/// exempts the first record from the contiguity check (audit H9).
 pub trait RemoteEpochObserver: Send {
-    fn observe(&mut self, rec: &RemoteEpochRecord) -> Result<(), ExecutorError>;
+    fn observe(
+        &mut self,
+        rec: &RemoteEpochRecord,
+        parent_storage: &ParentStorageReader<'_>,
+    ) -> Result<(), ExecutorError>;
 }
+
+/// A storage read against the parent state of the record under
+/// observation. See [`RemoteEpochObserver`].
+pub type ParentStorageReader<'a> = dyn Fn(alloy_primitives::Address, alloy_primitives::B256) -> Result<alloy_primitives::U256, String>
+    + 'a;
 
 /// Bounded first-seen window for canonical-id dedup, FIFO-evicted.
 ///

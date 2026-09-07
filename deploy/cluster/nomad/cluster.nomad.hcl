@@ -40,6 +40,20 @@ variable "cluster_snapshot_interval_s" {
   default = "300"
 }
 
+# Remote-origin allowlist (-Dkardamom.cluster.remoteOrigins): the peer
+# chain ids whose cross-chain records (kind 5) this sealer seals. An
+# empty list disables interop, and the sealer rejects every kind-5
+# record. Every member must run the same list: it decides
+# accept-or-reject in the replicated state machine, like the dedup
+# window. The default names the dev-interop peers the e2e suite uses
+# against the deployed 412346 chain: chain B (412347, S14) and the
+# simulated origin (412399, S12/S13). deploy.sh passes -var from
+# KARDAMOM_REMOTE_ORIGINS when set.
+variable "cluster_remote_origins" {
+  type    = string
+  default = "412347,412399"
+}
+
 # Digest-pinned image. scripts/deploy.sh
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests). The empty default falls back to the
@@ -114,7 +128,7 @@ job "cluster" {
       # same mechanism as the aeron job's _JAVA_OPTIONS. ${meta.node_ip}
       # interpolates in env exactly as it would in args.
       env {
-        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.members=0,192.168.56.51:40200,192.168.56.51:40201,192.168.56.51:40202,192.168.56.51:40203,192.168.56.51:40204|1,192.168.56.52:40200,192.168.56.52:40201,192.168.56.52:40202,192.168.56.52:40203,192.168.56.52:40204|2,192.168.56.53:40200,192.168.56.53:40201,192.168.56.53:40202,192.168.56.53:40203,192.168.56.53:40204 -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s}"
+        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.members=0,192.168.56.51:40200,192.168.56.51:40201,192.168.56.51:40202,192.168.56.51:40203,192.168.56.51:40204|1,192.168.56.52:40200,192.168.56.52:40201,192.168.56.52:40202,192.168.56.52:40203,192.168.56.52:40204|2,192.168.56.53:40200,192.168.56.53:40201,192.168.56.53:40202,192.168.56.53:40203,192.168.56.53:40204 -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins}"
       }
 
       config {
