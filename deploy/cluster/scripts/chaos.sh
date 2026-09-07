@@ -241,9 +241,30 @@ run_case() { # <case-name>
       log "${name}: skipping funded account #${CHAOS_ACCT} (vslot ${ACCT_VSLOT[${CHAOS_ACCT}]} does not move)"
       CHAOS_ACCT=$(( CHAOS_ACCT + 1 ))
     done
+    # The sequencer shard burns most of #7 through #15 on the shard-0
+    # pins above, and the fewest-moves render moves only a third of the
+    # vslots. So the walk can run out before a moved sender appears. On
+    # a chaos-only shard (RUN_LOAD=0) the load harness never ran, and
+    # the load reserve #1 through #6 still sits at nonce 0. Take the
+    # first moved sender from the reserve. This case runs last, so no
+    # later case takes the next reserve entry: CHAOS_ACCT goes past the
+    # end, and a later case fails loudly. check-contract.py walks this
+    # allocation for the sequencer shard, so a table change that breaks
+    # it fails there, not two hours into the shard.
+    if [ "${CHAOS_ACCT}" -gt 15 ] && [ "${RUN_LOAD:-1}" = "0" ]; then
+      local spare
+      for spare in 1 2 3 4 5 6; do
+        acct_moves_on_scale_out "${spare}" 3 || continue
+        log "${name}: no moved sender left in #7..#15; taking load-reserve account #${spare} (vslot ${ACCT_VSLOT[${spare}]}; RUN_LOAD=0, the load harness never used it)"
+        CHAOS_ACCT="${spare}"
+        break
+      done
+    fi
   fi
   local acct="${CHAOS_ACCT}"
   CHAOS_ACCT=$(( CHAOS_ACCT + 1 ))
+  # A reserve entry (#1..#6) serves the resize case only; see above.
+  [ "${acct}" -ge "${CHAOS_ACCT_BASE}" ] || CHAOS_ACCT=16
   [ "${acct}" -le 15 ] || fail "ran out of funded chaos accounts (#${acct} > 15); reduce CHAOS_CASES"
 
   # Set the per-case load window. sequencer-replica-kill needs load
