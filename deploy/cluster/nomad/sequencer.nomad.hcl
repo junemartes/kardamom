@@ -118,6 +118,9 @@ job "sequencer" {
           "--partition-index", "${meta.node_index}",
           # The transaction lifetime (tx_ttl_ms in group_vars/all.yml).
           "--tx-ttl-ms", "30000",
+          # The executor nonce query endpoints (node_classes.executor and
+          # ports.executor_nonce_query in group_vars/all.yml).
+          "--executor-query-endpoints", "http://192.168.56.41:9024,http://192.168.56.42:9024,http://192.168.56.43:9024",
           # Cluster mode only: this node's cluster-egress (response)
           # endpoint. The cluster client's egress_channel is per node,
           # since the node IP differs, so it is injected here instead
@@ -216,6 +219,9 @@ job "sequencer" {
           "--partition-index", "${meta.node_index}",
           # The transaction lifetime (tx_ttl_ms in group_vars/all.yml).
           "--tx-ttl-ms", "30000",
+          # The executor nonce query endpoints (node_classes.executor and
+          # ports.executor_nonce_query in group_vars/all.yml).
+          "--executor-query-endpoints", "http://192.168.56.41:9024,http://192.168.56.42:9024,http://192.168.56.43:9024",
           # Rotate onto the other shard; see the header. Replicas of a
           # shard never share a node.
           "--partition-offset", "1",

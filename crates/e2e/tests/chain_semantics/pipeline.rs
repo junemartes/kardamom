@@ -15,6 +15,29 @@ async fn s3_nonces_unordered_all_land() {
         .expect("S3");
 }
 
+/// F02.1: a restarted sequencer regains an established sender through the
+/// executor nonce lookup, with no twin to publish a receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
+async fn s15_restarted_sequencer_regains_an_established_sender() {
+    let mut stack = LocalStack::launch(StackConfig::default())
+        .await
+        .expect("stack");
+    let params = sequencer_restart::Params::default();
+    let applied = sequencer_restart::phase_before_restart(&target(&stack), &params)
+        .await
+        .expect("S15 before restart");
+
+    let sender = sequencer_restart::sender_address(&params).expect("sender");
+    let index = stack.sequencer_for(sender);
+    stack.restart_sequencer(index).expect("restart sequencer");
+
+    // The restarted replica has a new metrics port. Rebuild the target.
+    sequencer_restart::phase_after_restart(&target(&stack), &params, applied)
+        .await
+        .expect("S15 after restart");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s4_nonce_gap_is_never_processed() {

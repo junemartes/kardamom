@@ -34,6 +34,9 @@ signet-libmdbx = "0.8"
 # rkyv 0.8: receipts and `BlockDelta` are stored as rkyv archives at rest.
 # `Receipt` upstream already derives Archive/Serialize/Deserialize.
 rkyv.workspace = true
+# The nonce query endpoint (`nonce_query`): JSON-RPC bodies.
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 # Checkpoint peer server (`checkpoint_transfer`): tokio listener + per-connection tasks.
 tokio = { workspace = true, features = ["net", "rt", "io-util", "macros", "time", "fs", "sync"] }

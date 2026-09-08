@@ -114,6 +114,10 @@ pub struct ServiceSpec<'a> {
     /// The ingress takes the same value as `--pending-receipt-timeout-ms`
     /// (see [`IngressOptions`]). One value drives both, as in the deploy.
     pub tx_ttl: Duration,
+    /// The executor's nonce query address. The executor serves it, and
+    /// every sequencer queries it. The stack picks the port before the
+    /// sequencers spawn, so a restarted executor keeps it.
+    pub executor_query: SocketAddr,
     pub chain_id: u64,
     pub genesis: &'a Path,
     /// `--log-config` for every service. `None` uses the built-in
@@ -250,6 +254,10 @@ pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
         .args(["--sequencer-id", &index.to_string()])
         .args(["--tx-ttl-ms", &spec.tx_ttl.as_millis().to_string()])
         .args([
+            "--executor-query-endpoints",
+            &format!("http://{}", spec.executor_query),
+        ])
+        .args([
             "--cluster-egress-endpoint",
             &format!("127.0.0.1:{egress_port}"),
         ])
@@ -308,6 +316,7 @@ pub fn spawn_executor_at(
             &format!("127.0.0.1:{egress_port}"),
         ])
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
+        .args(["--nonce-query-addr", &spec.executor_query.to_string()])
         .args(["--host-id", "e2e-exec"]);
     // The footprint shadow is on for every e2e executor. It only
     // measures: execution stays sequential, and the handoff never blocks.

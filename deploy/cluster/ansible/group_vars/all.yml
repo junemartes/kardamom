@@ -45,6 +45,12 @@ ports:
   consul_serf_wan: 8302
   registry: 5000
   ingress_rpc: 8545            # eth JSON-RPC on the ingress node
+  # The executor's read-only account nonce query (eth_getTransactionCount).
+  # The sequencers ask it for the committed nonce of a cold sender. See
+  # docs/specs/dynamic-sequencer-sizing.md, section 3.4. Mirrors, checked
+  # by scripts/check-contract.py: executor.nomad.hcl --nonce-query-addr,
+  # sequencer.nomad.hcl --executor-query-endpoints (both groups).
+  executor_nonce_query: 9024
   anvil_l1: 8546              # in-cluster L1 (anvil) for the smoke test
   # Aeron archive control/response/replication (see aeron image EXPOSE).
   aeron_archive_control: 8010
