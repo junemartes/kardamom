@@ -8,6 +8,9 @@
 //! tx_ordering. The demux does not affect determinism, but the public
 //! `Executor::run` signature changed.
 
+const QUEUE_DEPTH_8: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::thread;
 use std::time::Duration;
 
@@ -30,10 +33,11 @@ use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 
 use kardamom_engine::executor::SnapshotRef;
 use kardamom_engine::{
-    BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
-    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ResumePoint,
-    RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
-    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, EngineWiring, ExecPorts, Executor, ExecutorConfig,
+    ExecutorError, Inbound, MockStateDatabase, MutatingSnapshotSource, NoBlockExec, NoEpochCheck,
+    NoRemoteEpochCheck, Outbound, ResumePoint, RoleHooks, StateWriterSignal, TxDataSubscription,
+    TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication,
+    TxRef, WriterApplyingQueue,
 };
 
 // Minimal: PUSH1 0x42; PUSH1 0x00; SSTORE; STOP
@@ -82,14 +86,19 @@ impl StateWriterSignal for Imm {
 
 /// Port types for this test's channel-backed fakes.
 struct TestWiring;
-impl EngineWiring for TestWiring {
-    type TxData = ChanTxDataSub;
-    type TxOrdering = ChanTxOrderingSub;
-    type TxReceipts = ChanReceiptsPub;
+impl ExecPorts for TestWiring {
     type Snapshots = MutatingSnapshotSource;
     type WriterSignal = Imm;
     type WriterQueue = WriterApplyingQueue;
     type Epoch = NoEpochCheck;
+    type RemoteEpoch = NoRemoteEpochCheck;
+    type BlockExec = NoBlockExec;
+}
+
+impl EngineWiring for TestWiring {
+    type TxData = ChanTxDataSub;
+    type TxOrdering = ChanTxOrderingSub;
+    type TxReceipts = ChanReceiptsPub;
 }
 
 fn bpos(off: i32) -> BPosition {
@@ -280,8 +289,8 @@ fn actor_receipts_match_naive_reference() {
     let h = thread::spawn(move || {
         Executor::run::<TestWiring>(
             ExecutorConfig {
-                chain_id: 1,
-                receipt_queue_depth: 8,
+                chain_id: NonZeroU64::MIN,
+                receipt_queue_depth: QUEUE_DEPTH_8,
                 ..Default::default()
             },
             Inbound {

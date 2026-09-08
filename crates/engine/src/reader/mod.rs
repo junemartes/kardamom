@@ -48,8 +48,9 @@ mod threads;
 
 pub use join::{JoinBuffer, ReaderConfig};
 pub use ports::{
-    EpochObserver, ExecSink, JoinRecovery, JoinRecoveryFactory, NoEpochCheck, ParentStorageReader,
-    RemoteEpochObserver, SinkClosed, TxDataSubscription, TxOrderingSubscription,
+    EpochObserver, ExecSink, JoinRecovery, JoinRecoveryError, JoinRecoveryFactory, NoEpochCheck,
+    NoRemoteEpochCheck, RemoteEpochObserver, SinkClosed, TxDataSubscription,
+    TxOrderingSubscription,
 };
 pub use threads::{ReaderToExec, spawn_tx_data_reader, spawn_tx_ordering_reader};
 

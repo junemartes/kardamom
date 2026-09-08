@@ -30,6 +30,19 @@ pub struct AllocEntry {
     pub nonce: Option<u64>,
 }
 
+impl AllocEntry {
+    /// This entry's code hash: `B256::ZERO` for an empty-code account, the
+    /// executor and validator convention. Kardamom does not use the
+    /// Ethereum `KECCAK_EMPTY` sentinel.
+    fn code_hash(&self) -> alloy_primitives::B256 {
+        self.code
+            .as_ref()
+            .map_or(alloy_primitives::B256::ZERO, |c| {
+                alloy_primitives::keccak256(c.as_ref())
+            })
+    }
+}
+
 impl Genesis {
     /// Build the `(accounts, code)` allocation set for
     /// [`crate::AccountChange`]-based genesis seeding (`kardamom_state::seed_genesis`).
@@ -43,29 +56,28 @@ impl Genesis {
     /// the live executor's genesis, so their state roots match.
     #[must_use]
     pub fn to_alloc(&self) -> (Vec<crate::AccountChange>, Vec<crate::delta::CodeEntry>) {
-        use alloy_primitives::{B256, keccak256};
-        let mut accounts = Vec::with_capacity(self.alloc.len());
-        let mut code = Vec::new();
-        for entry in &self.alloc {
-            let nonce = entry.nonce.unwrap_or(0);
-            let code_hash = entry
-                .code
-                .as_ref()
-                .map_or(B256::ZERO, |c| keccak256(c.as_ref()));
-            accounts.push(crate::AccountChange {
-                address: entry.address,
-                nonce,
-                balance: entry.balance,
-                code_hash,
-            });
-            if let Some(c) = entry.code.as_ref() {
-                code.push(crate::delta::CodeEntry {
+        // One pass, one `code_hash()` per entry: the account and its code
+        // entry (if any) both need the hash, so computing it here instead
+        // of once per collection avoids hashing the same code twice.
+        let (accounts, code): (Vec<_>, Vec<Option<_>>) = self
+            .alloc
+            .iter()
+            .map(|entry| {
+                let code_hash = entry.code_hash();
+                let account = crate::AccountChange {
+                    address: entry.address,
+                    nonce: entry.nonce.unwrap_or(0),
+                    balance: entry.balance,
+                    code_hash,
+                };
+                let code_entry = entry.code.as_ref().map(|c| crate::delta::CodeEntry {
                     code_hash,
                     code: c.0.clone(),
                 });
-            }
-        }
-        (accounts, code)
+                (account, code_entry)
+            })
+            .unzip();
+        (accounts, code.into_iter().flatten().collect())
     }
 
     /// Checks rules that the type and derive cannot express.

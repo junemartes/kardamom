@@ -2,12 +2,11 @@
 //! through the crate's public API with the `test-support`-feature fakes.
 
 use std::num::NonZeroU32;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use alloy_primitives::{Address, B256, Bytes};
 use kardamom_types::xchain::{
-    OutboxMessage, RemoteEpochRecord, XChainError, derive_remote_epoch, remote_source_hash,
-    xchain_anchor_hash,
+    Anchor, OutboxMessage, RemoteEpochRecord, XChainError, derive_remote_epoch, remote_source_hash,
 };
 
 use kardamom_da_watcher::interop::mock::MockInteropFeed;
@@ -24,7 +23,11 @@ const ORIGIN: u64 = 412_346;
 fn msg(seq: u64, block: u64) -> OutboxMessage {
     OutboxMessage {
         origin_block_number: block,
-        origin_block_hash: xchain_anchor_hash(ORIGIN, block),
+        origin_block_hash: Anchor {
+            origin_chain_id: ORIGIN,
+            block_number: block,
+        }
+        .hash(),
         dest_chain_id: SELF,
         seq,
         sender: Address::repeat_byte(0xA1),
@@ -67,11 +70,14 @@ fn spawn_resuming(
 }
 
 async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !cond() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    kardamom_obs::testkit::poll_until(
+        what,
+        Duration::from_secs(10),
+        Duration::from_millis(5),
+        async || Ok(cond().then_some(())),
+    )
+    .await
+    .unwrap();
 }
 
 /// The watcher halted of its own accord (fail-stop) rather than being
@@ -173,7 +179,7 @@ async fn one_record_per_origin_block() {
     assert_eq!(records[1].first_seq, 2);
     assert_eq!(records[1].last_seq(), 2);
     assert_eq!(
-        records[1].messages[0].source_hash,
+        records[1].messages.first().source_hash,
         remote_source_hash(ORIGIN, 2)
     );
 
@@ -240,8 +246,8 @@ async fn a_foreign_destination_halts_the_pair() {
     assert!(publisher.records().is_empty());
 }
 
-/// Audit M4: a feed that serves its own anchor is a fault of the feed.
-/// The watcher recomputes the anchor and stops the pair.
+/// A feed that serves its own anchor is a fault of the feed. The watcher
+/// recomputes the anchor and stops the pair.
 #[tokio::test]
 async fn a_feed_chosen_anchor_halts_the_pair() {
     let feed = MockInteropFeed::new(ORIGIN).await;
@@ -259,8 +265,8 @@ async fn a_feed_chosen_anchor_halts_the_pair() {
     );
 }
 
-/// Audit M4: a batch that spans two origin blocks is rejected by the
-/// shared rule. The scripted source hands over such a batch directly.
+/// A batch that spans two origin blocks is rejected by the shared rule.
+/// The scripted source hands over such a batch directly.
 #[tokio::test]
 async fn a_multi_block_batch_is_a_fault() {
     use kardamom_da_watcher::interop::source::fakes::ScriptedRemoteSource;
@@ -336,11 +342,16 @@ async fn a_reconnect_reproduces_byte_identical_records() {
 #[tokio::test]
 async fn a_restart_resumes_exactly_from_the_persisted_cursor() {
     let dir = tempfile::tempdir().unwrap();
-    let cursor_file = CursorFile::open(dir.path().join("pair.cursor")).unwrap();
+    let cursor_path = dir.path().join("pair.cursor");
 
     let feed = MockInteropFeed::new(ORIGIN).await;
     let publisher = InMemoryRemoteEpochPublisher::default();
-    let handle = spawn_resuming(&feed, publisher.clone(), 0, Some(cursor_file.clone()));
+    let handle = spawn_resuming(
+        &feed,
+        publisher.clone(),
+        0,
+        Some(CursorFile::open(&cursor_path).unwrap()),
+    );
 
     feed.push_message(msg(0, 100));
     feed.push_message(msg(1, 100));
@@ -349,17 +360,29 @@ async fn a_restart_resumes_exactly_from_the_persisted_cursor() {
     wait_until(|| publisher.records().len() >= 2, "two records").await;
     let _ = handle.shutdown.send(());
     handle.task.await.unwrap();
-    assert_eq!(
-        cursor_file.load().unwrap(),
-        Some(3),
-        "the persisted cursor must be one past the last PUBLISHED seq \
-         (seq 3's block is still open, so it is not published yet)"
-    );
+    // The watcher's task has exited, so its `CursorFile` (and the lock it
+    // holds) has dropped; reopening now is safe. The block scope ends
+    // this reopened handle before the next spawn reopens the file.
+    let resumed = {
+        let cursor_file = CursorFile::open(&cursor_path).unwrap();
+        let loaded = cursor_file.load().unwrap();
+        assert_eq!(
+            loaded,
+            Some(3),
+            "the persisted cursor must be one past the last PUBLISHED seq \
+             (seq 3's block is still open, so it is not published yet)"
+        );
+        loaded.expect("cursor persisted")
+    };
 
     // "Restart": a fresh watcher over the same publisher, seeded with a
     // deliberately wrong CLI value — the file must win.
-    let resumed = cursor_file.load().unwrap().expect("cursor persisted");
-    let handle = spawn_resuming(&feed, publisher.clone(), resumed, Some(cursor_file.clone()));
+    let handle = spawn_resuming(
+        &feed,
+        publisher.clone(),
+        resumed,
+        Some(CursorFile::open(&cursor_path).unwrap()),
+    );
     feed.push_message(msg(4, 103)); // closes 102
     feed.push_message(msg(5, 104)); // closes 103
     wait_until(|| publisher.records().len() >= 4, "four records").await;
@@ -381,7 +404,10 @@ async fn a_restart_resumes_exactly_from_the_persisted_cursor() {
         0,
         "a clean restart re-publishes nothing"
     );
-    assert_eq!(cursor_file.load().unwrap(), Some(5));
+    assert_eq!(
+        CursorFile::open(&cursor_path).unwrap().load().unwrap(),
+        Some(5)
+    );
 }
 
 /// The crash window the write ordering exists for: die AFTER the publish,

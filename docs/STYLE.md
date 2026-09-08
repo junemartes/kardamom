@@ -24,7 +24,7 @@ have no linter: read the diff against this list.
 | R13 | A value that must not be zero is a `NonZero*` type, or a newtype around one, parsed once at its boundary. No `.max(1)` fixups. No `assert!(x > 0)`. |
 | R14 | Less code. Two places with the same shape become one helper: exact copies, the same steps on different types, hand-rolled standard functions, forwarding wrappers, repeated test fixtures. |
 | R15 | Methods, not standalone functions. Attach behavior to a struct with `impl`. Builder methods that return `Self` are fine. Pass a method's inputs as struct state, not as loose parameters. |
-| R16 | No nested loops. Prefer iterators. If a loop must nest, the inner loop becomes a helper method. |
+| R16 | No nested control flow around a loop, in either direction. A loop inside another loop, an `if`, an `else`, or a `match` arm counts as nested, and so does an `if`, `else`, or `match` inside a loop body. Prefer iterators: the loop becomes an iterator chain (`filter`, `map`, `filter_map`, `try_for_each`, and so on). If a loop must stay, its body is one step: one call to a named helper, and the dispatch on its result (`return`, `break`, or `continue`). Everything else moves into the helper. |
 
 ## Writing
 

@@ -8,14 +8,13 @@
 //! so the pump plumbing is unit-testable without a media driver.
 
 use std::future::Future;
-use std::num::NonZeroU8;
+use std::num::{NonZeroU8, NonZeroU32};
 
-use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use kardamom_log::aeron_live::{
     AeronRuntime, FsyncWatermarkSubscriberHandle, TxDataPublisherHandle, TxErrorsSubscriberHandle,
-    TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle,
+    TxReceiptsBoundarySubscriberHandle, TxReceiptsReceiver, TxReceiptsSubscriberHandle,
 };
 use kardamom_log::config::ChannelsConfig;
 use kardamom_types::{
@@ -56,7 +55,6 @@ impl LiveIngressPublication {
     }
 }
 
-#[async_trait]
 impl IngressPublication for LiveIngressPublication {
     async fn publish_tx_data(
         &self,
@@ -106,8 +104,9 @@ fn spawn_pump<S: PumpSource>(mut source: S, tx: broadcast::Sender<S::Item>) {
     });
 }
 
-/// Detached-receiver source, for `into_receiver()` handles. See the
-/// `tx_receipts` comment in [`LiveIngressSubscription::open`].
+/// Generic `PumpSource` over a raw tokio `UnboundedReceiver<(BPosition,
+/// T)>`, dropping the position. This crate's own test (below) builds one
+/// directly, to test the pump plumbing without a media driver.
 impl<T: Clone + Send + 'static> PumpSource
     for tokio::sync::mpsc::UnboundedReceiver<(BPosition, T)>
 {
@@ -119,8 +118,9 @@ impl<T: Clone + Send + 'static> PumpSource
 
 /// Implements [`PumpSource`] for a subscriber handle whose `recv` returns
 /// `(BPosition, Item)`, dropping the position. The three concrete
-/// subscriber handles below share exactly this shape; the generic
-/// `UnboundedReceiver` impl above covers the `into_receiver()` case.
+/// subscriber handles below, plus [`TxReceiptsReceiver`] (`into_receiver()`
+/// handles; see the `tx_receipts` comment in
+/// [`LiveIngressSubscription::open`]), share exactly this shape.
 macro_rules! impl_pump_source {
     ($handle:ty, $item:ty) => {
         impl PumpSource for $handle {
@@ -135,6 +135,7 @@ macro_rules! impl_pump_source {
 impl_pump_source!(FsyncWatermarkSubscriberHandle, FsyncWatermark);
 impl_pump_source!(TxReceiptsBoundarySubscriberHandle, BlockBoundary);
 impl_pump_source!(TxErrorsSubscriberHandle, TxError);
+impl_pump_source!(TxReceiptsReceiver, Receipt);
 
 /// Live [`IngressSubscription`]. Per-stream pump tasks feed these
 /// broadcast buses.
@@ -156,7 +157,7 @@ impl LiveIngressSubscription {
         rt: &AeronRuntime,
         channels: &ChannelsConfig,
         recorder_id: u8,
-        executor_count: u32,
+        executor_count: Option<NonZeroU32>,
     ) -> Result<Self, IngressError> {
         let (receipts_tx, _) = broadcast::channel::<Receipt>(BUS_CAPACITY);
         let (watermarks_tx, _) = broadcast::channel::<QuorumWatermark>(BUS_CAPACITY);
@@ -167,7 +168,7 @@ impl LiveIngressSubscription {
         let mds = channels.tx_receipts_mds_enabled();
         if mds {
             tracing::info!(
-                executor_count,
+                ?executor_count,
                 control_channel = %channels.tx_receipts_control_channel,
                 "tx_receipts MDS fan-in: aggregating per-replica executor endpoints"
             );
@@ -262,27 +263,30 @@ mod tests {
     // four stream pumps share this plumbing.
     #[tokio::test]
     async fn pump_fans_out_and_ends_on_close() {
-        let (src_tx, src_rx) = tokio::sync::mpsc::unbounded_channel::<(BPosition, u64)>();
-        let (bus, _) = broadcast::channel::<u64>(16);
-        let mut sub_a = bus.subscribe();
-        let mut sub_b = bus.subscribe();
-        spawn_pump(src_rx, bus.clone());
+        // `src_tx` and `bus` (the outer sender handle) live only in this
+        // scope. Both go out of scope, and drop, at its end. The pump's own
+        // clone of `bus` drops in turn once it drains the two queued items
+        // and sees the source close, which is what ends the pump and lets
+        // `sub_a`/`sub_b` observe `Closed` below.
+        let (mut sub_a, mut sub_b) = {
+            let (src_tx, src_rx) = tokio::sync::mpsc::unbounded_channel::<(BPosition, u64)>();
+            let (bus, _) = broadcast::channel::<u64>(16);
+            let sub_a = bus.subscribe();
+            let sub_b = bus.subscribe();
+            spawn_pump(src_rx, bus.clone());
 
-        let pos = BPosition {
-            term_id: 0,
-            term_offset: 0,
+            let pos = BPosition {
+                term_id: 0,
+                term_offset: 0,
+            };
+            src_tx.send((pos, 7)).unwrap();
+            src_tx.send((pos, 8)).unwrap();
+            (sub_a, sub_b)
         };
-        src_tx.send((pos, 7)).unwrap();
-        src_tx.send((pos, 8)).unwrap();
         assert_eq!(sub_a.recv().await.unwrap(), 7);
         assert_eq!(sub_a.recv().await.unwrap(), 8);
         assert_eq!(sub_b.recv().await.unwrap(), 7);
         assert_eq!(sub_b.recv().await.unwrap(), 8);
-
-        // Closing the source ends the pump: the bus's only sender clone
-        // inside the pump task drops, so subscribers see Closed.
-        drop(src_tx);
-        drop(bus);
         assert!(matches!(
             sub_a.recv().await,
             Err(broadcast::error::RecvError::Closed)

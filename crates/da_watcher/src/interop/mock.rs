@@ -33,6 +33,7 @@
 //! [`MockInteropFeed::push_head`] scripts the origin's `head` event.
 
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -138,6 +139,11 @@ impl MockInteropFeed {
     /// Raise the feed floor: messages below `seq` are gone, and every
     /// subscribe with a cursor below `seq` gets a `Lagged` frame first —
     /// the real server's retention edge.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal lock is poisoned (a prior panic while holding
+    /// it), which only happens after the test has already failed.
     pub fn set_floor(&self, seq: u64) {
         let len = {
             let mut floor = self.state.floor.lock().unwrap();
@@ -155,6 +161,11 @@ impl MockInteropFeed {
     /// Script a `head` event: the origin closed every block through
     /// `block`. A subscriber with an open batch from an earlier block
     /// closes it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal lock is poisoned (a prior panic while holding
+    /// it), which only happens after the test has already failed.
     pub fn push_head(&self, block: u64) {
         let len = {
             let mut script = self.state.script.lock().unwrap();
@@ -236,7 +247,10 @@ impl OutboxFeedApiServer for FeedHandler {
                     FeedItem::Head(_) => None,
                 });
             let event = OutboxEventDto::Lagged {
-                skipped: floor - from,
+                // The enclosing `if from < floor` already rules out
+                // underflow. `saturating_sub` makes that visible at the
+                // arithmetic, not only at the branch.
+                skipped: floor.saturating_sub(from),
                 floor_seq: Some(floor),
                 floor_block,
             };
@@ -250,28 +264,9 @@ impl OutboxFeedApiServer for FeedHandler {
 
         let mut next = 0usize;
         loop {
-            loop {
-                let Some(item) = self.state.script.lock().unwrap().get(next).cloned() else {
-                    break;
-                };
-                next += 1;
-                let event = match item {
-                    // Honouring the cursor is the whole contract: a resumed
-                    // subscriber must see exactly the same suffix a fresh one
-                    // at that cursor would.
-                    FeedItem::Message(m) if m.seq < from => continue,
-                    FeedItem::Message(m) => OutboxEventDto::Message(Box::new(
-                        OutboxMessageDto::from_outbox_message(self.state.origin_chain_id, &m),
-                    )),
-                    FeedItem::Head(block) => OutboxEventDto::Head {
-                        block_number: block,
-                    },
-                };
-                let msg = serde_json::value::to_raw_value(&event)
-                    .map_err(|e| format!("serialize feed event: {e}"))?;
-                if sink.send(msg).await.is_err() {
-                    return Ok(());
-                }
+            match self.drain_script(&sink, from, next).await? {
+                ControlFlow::Break(()) => return Ok(()),
+                ControlFlow::Continue(n) => next = n,
             }
             tokio::select! {
                 () = sink.closed() => return Ok(()),
@@ -288,4 +283,66 @@ impl OutboxFeedApiServer for FeedHandler {
             }
         }
     }
+}
+
+impl FeedHandler {
+    /// Send every scripted item from `next` onward, at or after `from`.
+    /// Returns [`ControlFlow::Continue`] with the next unsent index once the
+    /// script is exhausted for now (the caller waits for more items), or
+    /// [`ControlFlow::Break`] once the sink closes (the caller should stop).
+    async fn drain_script(
+        &self,
+        sink: &jsonrpsee::core::server::SubscriptionSink,
+        from: u64,
+        mut next: usize,
+    ) -> Result<ControlFlow<(), usize>, String> {
+        loop {
+            match self.dispatch_one(sink, from, next).await? {
+                DispatchStep::Idle => return Ok(ControlFlow::Continue(next)),
+                DispatchStep::Sent => next += 1,
+                DispatchStep::ConsumerGone => return Ok(ControlFlow::Break(())),
+            }
+        }
+    }
+
+    /// Handle the one script item at `next`, if there is one: skip a
+    /// message that predates `from` (honouring the cursor is the whole
+    /// contract — a resumed subscriber must see exactly the same suffix a
+    /// fresh one at that cursor would), or send it. [`drain_script`]'s
+    /// loop is just this call plus the dispatch on its result.
+    async fn dispatch_one(
+        &self,
+        sink: &jsonrpsee::core::server::SubscriptionSink,
+        from: u64,
+        next: usize,
+    ) -> Result<DispatchStep, String> {
+        let Some(item) = self.state.script.lock().unwrap().get(next).cloned() else {
+            return Ok(DispatchStep::Idle);
+        };
+        let event = match item {
+            FeedItem::Message(m) if m.seq < from => return Ok(DispatchStep::Sent),
+            FeedItem::Message(m) => OutboxEventDto::Message(Box::new(
+                OutboxMessageDto::from_outbox_message(self.state.origin_chain_id, &m),
+            )),
+            FeedItem::Head(block) => OutboxEventDto::Head {
+                block_number: block,
+            },
+        };
+        let msg = serde_json::value::to_raw_value(&event)
+            .map_err(|e| format!("serialize feed event: {e}"))?;
+        if sink.send(msg).await.is_err() {
+            return Ok(DispatchStep::ConsumerGone);
+        }
+        Ok(DispatchStep::Sent)
+    }
+}
+
+/// [`FeedHandler::dispatch_one`]'s outcome: whether the script is
+/// exhausted for now, the item at that index was handled (sent, or
+/// skipped because it predates the cursor — either way the next call
+/// should try the following index), or the subscriber's sink is gone.
+enum DispatchStep {
+    Idle,
+    Sent,
+    ConsumerGone,
 }

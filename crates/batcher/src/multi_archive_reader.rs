@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
 
-use crate::archive_reader::{TxDataSegmentReader, TxOrderingSegmentReader};
+use crate::archive_reader::{TxDataSegmentReader, TxOrderingSegmentReader, TypedRecord};
 use crate::error::BatcherError;
 
 /// A record resolved from the M+1 archive topology, in the "stream of tx
@@ -91,25 +91,36 @@ impl MultiArchiveConfig {
     /// sequencer id does not parse as `u8`, or a sequencer id repeats.
     pub fn parse_a_spec(spec: &str) -> Result<HashMap<u8, PathBuf>, BatcherError> {
         let mut out = HashMap::new();
-        for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let (sid_str, path_str) = entry.split_once('=').ok_or_else(|| {
-                BatcherError::Config(format!(
-                    "tx_data-archive entry '{entry}' missing '=' separator"
-                ))
-            })?;
-            let sid: u8 = sid_str.trim().parse().map_err(|e| {
-                BatcherError::Config(format!(
-                    "tx_data-archive sequencer id '{sid_str}' is not a u8: {e}"
-                ))
-            })?;
-            let path = PathBuf::from(path_str.trim());
-            if out.insert(sid, path).is_some() {
-                return Err(BatcherError::Config(format!(
-                    "tx_data-archive sequencer id {sid} listed twice"
-                )));
-            }
-        }
+        spec.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .try_for_each(|entry| Self::insert_a_spec_entry(&mut out, entry))?;
         Ok(out)
+    }
+
+    /// Parse one `sid=path` entry of a `--channel-a-archive` spec, and
+    /// insert it into `out`.
+    fn insert_a_spec_entry(
+        out: &mut HashMap<u8, PathBuf>,
+        entry: &str,
+    ) -> Result<(), BatcherError> {
+        let (sid_str, path_str) = entry.split_once('=').ok_or_else(|| {
+            BatcherError::Config(format!(
+                "tx_data-archive entry '{entry}' missing '=' separator"
+            ))
+        })?;
+        let sid: u8 = sid_str.trim().parse().map_err(|e| {
+            BatcherError::Config(format!(
+                "tx_data-archive sequencer id '{sid_str}' is not a u8: {e}"
+            ))
+        })?;
+        let path = PathBuf::from(path_str.trim());
+        if out.insert(sid, path).is_some() {
+            return Err(BatcherError::Config(format!(
+                "tx_data-archive sequencer id {sid} listed twice"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -162,8 +173,11 @@ impl MultiArchiveReader {
             .map_or(0, std::collections::HashMap::len)
     }
 
-    fn resolve(&self, r: &TxRef) -> Result<TxEnvelope, BatcherError> {
-        let idx = self.a_indexes.get(&r.shard_id).ok_or_else(|| {
+    fn resolve(
+        a_indexes: &HashMap<u8, PerASegmentIndex>,
+        r: &TxRef,
+    ) -> Result<TxEnvelope, BatcherError> {
+        let idx = a_indexes.get(&r.shard_id).ok_or_else(|| {
             BatcherError::Config(format!(
                 "tx_data archive for sequencer_id={} not configured",
                 r.shard_id
@@ -176,63 +190,61 @@ impl MultiArchiveReader {
             ))
         })
     }
+
+    /// Turn one raw `tx_ordering` record into a `next()` result. `None`
+    /// skips it: the batcher sends only user-tx data and block boundaries
+    /// to L1. L1 deposits do not need to go back into a batch, and epochs
+    /// are skipped by design — a reconstructor re-derives an epoch's
+    /// deposits from L1 itself, using the block's `l1_origin`; putting
+    /// deposits in the blob would waste space and add an unverifiable
+    /// claim, because deposits are unsigned. `Some` yields the resolved
+    /// record: a [`TxRef`] resolved against the A indexes, or a remote
+    /// epoch or boundary marker carried as-is — remote messages are NOT
+    /// re-derivable from this chain's L1 origin, so they DO travel in DA
+    /// (spec §16 Q8), messages by value, for the accumulator to buffer
+    /// into the block it leads (mirrors `live.rs`).
+    fn classify(
+        a_indexes: &HashMap<u8, PerASegmentIndex>,
+        raw: Result<TypedRecord<TxOrderingMessage>, BatcherError>,
+    ) -> Option<Result<ResolvedRecord, BatcherError>> {
+        let rec = match raw {
+            Err(e) => return Some(Err(e)),
+            Ok(r) => r,
+        };
+        let position = rec.position;
+        match rec.value {
+            TxOrderingMessage::TxRef(r) => {
+                Some(Self::resolve(a_indexes, &r).map(|env| ResolvedRecord::Tx {
+                    position,
+                    sequencer_id: r.shard_id,
+                    tx_data_position: r.tx_data_position,
+                    env,
+                }))
+            }
+            TxOrderingMessage::DepositRef(_) | TxOrderingMessage::Epoch(_) => None,
+            TxOrderingMessage::RemoteEpoch(rec) => Some(Ok(ResolvedRecord::RemoteEpoch {
+                position,
+                record: rec,
+            })),
+            TxOrderingMessage::BoundaryStart(b) => Some(Ok(ResolvedRecord::Boundary {
+                position,
+                marker: b,
+            })),
+        }
+    }
 }
 
 impl Iterator for MultiArchiveReader {
     type Item = Result<ResolvedRecord, BatcherError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // The batcher sends only user-tx data and block boundaries to L1.
-        // DepositRefs come from L1, so this loop skips them until it finds
-        // a record the batcher needs.
-        loop {
-            let next_b = self.b_reader.next()?;
-            let rec = match next_b {
-                Err(e) => return Some(Err(e)),
-                Ok(r) => r,
-            };
-            let position = rec.position;
-            match rec.value {
-                TxOrderingMessage::TxRef(r) => {
-                    return match self.resolve(&r) {
-                        Ok(env) => Some(Ok(ResolvedRecord::Tx {
-                            position,
-                            sequencer_id: r.shard_id,
-                            tx_data_position: r.tx_data_position,
-                            env,
-                        })),
-                        Err(e) => Some(Err(e)),
-                    };
-                }
-                TxOrderingMessage::DepositRef(_) | TxOrderingMessage::Epoch(_) => {
-                    // L1 deposits come from L1, so they do not need to go
-                    // back into a batch. Skip them.
-                    //
-                    // Skip epochs for the same reason, and by design: a
-                    // reconstructor re-derives an epoch's deposits from L1
-                    // itself, using the block's `l1_origin`. Putting deposits
-                    // in the blob would waste space and add an unverifiable
-                    // claim, because deposits are unsigned.
-                }
-                TxOrderingMessage::RemoteEpoch(rec) => {
-                    // Unlike epoch deposits, remote messages are NOT
-                    // re-derivable from this chain's L1 origin, so they DO
-                    // travel in DA (spec §16 Q8): yield the record — messages
-                    // by value — for the accumulator to buffer into the block
-                    // it leads (mirrors `live.rs`).
-                    return Some(Ok(ResolvedRecord::RemoteEpoch {
-                        position,
-                        record: rec,
-                    }));
-                }
-                TxOrderingMessage::BoundaryStart(b) => {
-                    return Some(Ok(ResolvedRecord::Boundary {
-                        position,
-                        marker: b,
-                    }));
-                }
-            }
-        }
+        let Self {
+            b_reader,
+            a_indexes,
+        } = self;
+        b_reader
+            .by_ref()
+            .find_map(|raw| Self::classify(a_indexes, raw))
     }
 }
 
@@ -243,9 +255,9 @@ impl Iterator for MultiArchiveReader {
 /// Returns an error when the segment cannot be opened or a frame in it is
 /// corrupt, or when two records share a `BPosition`.
 pub fn load_a_index(path: &Path) -> Result<PerASegmentIndex, BatcherError> {
-    let reader = TxDataSegmentReader::open(path)?;
+    let mut reader = TxDataSegmentReader::open(path)?;
     let mut idx = HashMap::new();
-    for rec in reader {
+    reader.try_for_each(|rec| -> Result<(), BatcherError> {
         let rec = rec?;
         if idx.insert(rec.position, rec.value).is_some() {
             return Err(BatcherError::Frame(format!(
@@ -254,6 +266,7 @@ pub fn load_a_index(path: &Path) -> Result<PerASegmentIndex, BatcherError> {
                 path.display()
             )));
         }
-    }
+        Ok(())
+    })?;
     Ok(idx)
 }

@@ -50,6 +50,52 @@ pub(super) const ADMIT_BATCH: usize = 512;
 /// lock-free while the feed is still admitting.
 pub(super) const MAX_BLOCK_TXS: usize = 4_096;
 
+/// A transaction's position within a block, checked once against
+/// `MAX_BLOCK_TXS` where admission computes it. The type then carries
+/// the bound, so every later `u32` use is infallible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BlockTxIndex(u32);
+
+impl BlockTxIndex {
+    /// # Errors
+    /// Returns an error if `i >= MAX_BLOCK_TXS`.
+    pub(super) fn new(i: usize) -> Result<Self, kardamom_exec_core::error::ExecutorError> {
+        if i >= MAX_BLOCK_TXS {
+            return Err(kardamom_exec_core::error::ExecutorError::State(format!(
+                "stm pool: block exceeds MAX_BLOCK_TXS={MAX_BLOCK_TXS} (gas-limit math says impossible)"
+            )));
+        }
+        // MAX_BLOCK_TXS fits comfortably in u32, so this cannot fail
+        // once the bound above holds.
+        Ok(Self(u32::try_from(i).expect("MAX_BLOCK_TXS fits u32")))
+    }
+
+    pub(super) fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// A count bounded by `MAX_BLOCK_TXS`, parsed once where it is
+/// computed, so a caller never repeats the bound as a claim in an
+/// `.expect(..)` message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BlockTxCount(u32);
+
+impl BlockTxCount {
+    /// # Panics
+    /// Panics if `n` exceeds `MAX_BLOCK_TXS`. Both callers count
+    /// entries admission already capped at that bound, so this is a
+    /// scheduler-invariant check, not a caller contract.
+    pub(super) fn new(n: usize) -> Self {
+        assert!(n <= MAX_BLOCK_TXS, "count exceeds MAX_BLOCK_TXS: {n}");
+        Self(u32::try_from(n).expect("MAX_BLOCK_TXS fits u32"))
+    }
+
+    pub(super) fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// FIFO-scheduler-only knobs. Meaningless under [`Scheduler::Bag`] (the
 /// bag has no per-worker queues to dispatch on, assign to, or steal
 /// between), so they live inside [`Scheduler::Fifo`] instead of beside
@@ -193,10 +239,16 @@ pub struct PoolConfig {
 pub(crate) const DEFAULT_PRUNE_BATCH: std::num::NonZeroUsize =
     std::num::NonZeroUsize::new(8).expect("8 != 0");
 
+/// The default worker count: one, sequential. A caller that wants
+/// parallelism sets `workers` explicitly. `const` proves the bound at
+/// compile time, instead of unwrapping a literal every time a default
+/// config builds.
+const DEFAULT_WORKERS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(1).expect("1 != 0");
+
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            workers: std::num::NonZeroUsize::new(1).expect("1 != 0"),
+            workers: DEFAULT_WORKERS,
             prune_batch: DEFAULT_PRUNE_BATCH,
             parallel_worth_ns: PARALLEL_WORTH_NS,
             scheduler: Scheduler::default(),
@@ -208,42 +260,13 @@ impl Default for PoolConfig {
     }
 }
 
-/// A code hash normalized against revm's empty-code marker: the delta
-/// stores an all-zero hash for an account with no code, but revm
-/// expects `KECCAK_EMPTY` there.
-pub(super) struct CodeHash(alloy_primitives::B256);
-
-impl CodeHash {
-    pub(super) fn normalize(raw: alloy_primitives::B256) -> Self {
-        if raw == alloy_primitives::B256::ZERO {
-            Self(revm::primitives::KECCAK_EMPTY)
-        } else {
-            Self(raw)
-        }
-    }
-
-    pub(super) fn get(self) -> alloy_primitives::B256 {
-        self.0
-    }
-}
-
-/// Build an `AccountInfo` from the three fields every read stack layer
-/// stores, normalizing the code hash (see [`CodeHash`]) once. Every
-/// read source (mv layers, delta layers, the base cache, and the
-/// backend read stack) builds this same 5-field record.
-pub(super) fn account_info(
-    nonce: u64,
-    balance: alloy_primitives::U256,
-    code_hash: alloy_primitives::B256,
-) -> revm::state::AccountInfo {
-    revm::state::AccountInfo {
-        nonce,
-        balance,
-        code_hash: CodeHash::normalize(code_hash).get(),
-        account_id: None,
-        code: None,
-    }
-}
+/// Build an `AccountInfo` from the fields every read stack layer stores.
+/// Every read source (mv layers, delta layers, the base cache, and the
+/// backend read stack) builds this same record, on both this crate's
+/// Block-STM path and `kardamom-exec-core`'s streaming path, so the
+/// code-hash normalization lives once, in
+/// [`kardamom_exec_core::executor::account_info`].
+pub(super) use kardamom_exec_core::executor::account_info;
 
 /// A duration's nanoseconds as `u64`, for the pool's timing counters.
 /// Saturates instead of wrapping: a duration over `u64::MAX` nanoseconds

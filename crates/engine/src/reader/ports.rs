@@ -4,8 +4,11 @@
 use crossbeam_channel::Sender;
 
 use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{BPosition, Deposit, EpochRecord, TxDataLoc, TxEnvelope, TxOrderingMessage};
+use kardamom_types::{
+    BPosition, Deposit, EpochRecord, StateDatabase, TxDataLoc, TxEnvelope, TxOrderingMessage,
+};
 
+use crate::delta::ParentState;
 use crate::error::ExecutorError;
 
 use super::threads::ReaderToExec;
@@ -53,21 +56,39 @@ pub trait TxOrderingSubscription: Send {
 /// The `tx_data` and `tx_deposits` side streams are lossy multicast. A
 /// canonical ref whose envelope never arrives, from an image lapse under
 /// load, a publisher racing a subscriber restart, or a node-kill blackout,
-/// stalls the join. Implementations of this trait close that gap in-band.
-/// They fetch the missing range from a remote durability archive and feed
-/// the join buffer, so a transient loss costs one bounded stall instead of
-/// a process death. The join timeout stays the final arbiter: if the
-/// archives cannot produce the envelope either, the reader still fails
-/// loudly.
+/// stalls the join. This closes that gap in-band: it fetches the missing
+/// range from a remote durability archive and feeds the join buffer, so a
+/// transient loss costs one bounded stall instead of a process death. The
+/// join timeout stays the final arbiter: if the archives cannot produce
+/// the envelope either, the reader still fails loudly.
 ///
-/// Implementations own their transport (endpoints, failover, backoff). The
-/// `tx_ordering` reader thread calls them, so one call must stay well under
-/// the join-timeout budget.
+/// A struct, not a trait: every role (the executor, the validator, the
+/// batcher) recovers through the same durability archives, so there is
+/// one implementation to name. The `tx_ordering` reader thread calls its
+/// methods, so one call must stay well under the join-timeout budget.
 ///
-/// This trait is not `Send`. The Aeron archive client types are
-/// thread-bound, so a [`JoinRecoveryFactory`] builds the recovery inside
-/// the reader thread, and it never crosses threads.
-pub trait JoinRecovery {
+/// This type is not `Send`. The Aeron archive client is thread-bound, so
+/// a [`JoinRecoveryFactory`] builds it inside the reader thread, and it
+/// never crosses threads.
+pub struct JoinRecovery {
+    refetcher: kardamom_log::refetch::ArchiveRefetcher,
+    tx_data_stream_base: i32,
+    tx_deposits_stream_id: i32,
+}
+
+/// A join-miss archive recovery attempt failed.
+#[derive(Debug, thiserror::Error)]
+pub enum JoinRecoveryError {
+    /// `tx_data_stream_base + shard_id` overflowed `i32`.
+    #[error("tx_data stream id overflow: base {base} + shard {shard}")]
+    StreamIdOverflow { base: i32, shard: u8 },
+    /// The archive fetch itself failed (transport, or no matching
+    /// recording).
+    #[error(transparent)]
+    Archive(#[from] kardamom_log::error::LogError),
+}
+
+impl JoinRecovery {
     /// Fetch `tx_data` envelopes for `shard_id`, recorded at or after `from` on
     /// the publisher session `session_id`. Feed each into `sink`, which
     /// inserts it into the join buffer. Return the number of envelopes
@@ -75,14 +96,26 @@ pub trait JoinRecovery {
     ///
     /// # Errors
     ///
-    /// Returns `Err` with a transport or archive-query failure description.
-    fn recover_tx_data(
+    /// Returns `Err` on a transport or archive-query failure, or a shard id
+    /// whose stream id overflows `i32`.
+    pub fn recover_tx_data(
         &mut self,
         shard_id: u8,
         session_id: i32,
         from: BPosition,
-        sink: &mut dyn FnMut(TxDataLoc, TxEnvelope),
-    ) -> Result<u64, String>;
+        sink: impl FnMut(TxDataLoc, TxEnvelope),
+    ) -> Result<u64, JoinRecoveryError> {
+        let stream_id = self
+            .tx_data_stream_base
+            .checked_add(i32::from(shard_id))
+            .ok_or(JoinRecoveryError::StreamIdOverflow {
+                base: self.tx_data_stream_base,
+                shard: shard_id,
+            })?;
+        Ok(self
+            .refetcher
+            .fetch_tx_data(stream_id, session_id, from, sink)?)
+    }
 
     /// Fetch `tx_deposits` recorded at or after `from`, from any publisher
     /// session. Feed each into `sink`. Return the number of deposits
@@ -90,18 +123,38 @@ pub trait JoinRecovery {
     ///
     /// # Errors
     ///
-    /// Returns `Err` with a transport or archive-query failure description.
-    fn recover_deposits(
+    /// Returns `Err` on a transport or archive-query failure.
+    pub fn recover_deposits(
         &mut self,
         from: BPosition,
-        sink: &mut dyn FnMut(BPosition, Deposit),
-    ) -> Result<u64, String>;
+        sink: impl FnMut(BPosition, Deposit),
+    ) -> Result<u64, JoinRecoveryError> {
+        Ok(self
+            .refetcher
+            .fetch_deposits(self.tx_deposits_stream_id, from, sink)?)
+    }
 }
 
-/// Builds the thread-bound [`JoinRecovery`] inside the reader thread.
-/// Return `None`, for example when config is absent, to keep the plain
-/// bounded join.
-pub type JoinRecoveryFactory = Box<dyn FnOnce() -> Option<Box<dyn JoinRecovery>> + Send>;
+/// Builds the thread-bound [`JoinRecovery`] inside the reader thread. A
+/// value, not a closure: a wiring seam needs to name a concrete type, and
+/// a closure has none. Fields are `pub(crate)`: `bin_support::archive_join_recovery`
+/// is the only constructor.
+pub struct JoinRecoveryFactory {
+    pub(crate) cfg: kardamom_log::refetch::RefetchConfig,
+    pub(crate) tx_data_stream_base: i32,
+    pub(crate) tx_deposits_stream_id: i32,
+}
+
+impl JoinRecoveryFactory {
+    #[must_use]
+    pub fn build(self) -> JoinRecovery {
+        JoinRecovery {
+            refetcher: kardamom_log::refetch::ArchiveRefetcher::new(self.cfg),
+            tx_data_stream_base: self.tx_data_stream_base,
+            tx_deposits_stream_id: self.tx_deposits_stream_id,
+        }
+    }
+}
 
 /// Role-specific hook, called for every [`EpochRecord`] on the canonical
 /// stream, in canonical order, before its deposits are applied.
@@ -153,12 +206,12 @@ impl EpochObserver for NoEpochCheck {
 /// thread. Put slow work, such as a network call, on a background task
 /// with a deferred verdict.
 ///
-/// `parent_storage` reads one storage slot from the state the record's
-/// block builds on: the live delta, then the unsettled parent blocks, then
-/// the committed snapshot. The destination validator seeds its per-origin
+/// `parent` reads one storage slot from the state the record's block
+/// builds on: the live delta, then the unsettled parent blocks, then the
+/// committed snapshot. The destination validator seeds its per-origin
 /// lane cursor from `Inbox.nextSeq[origin]` through it, so a restart never
-/// exempts the first record from the contiguity check (audit H9).
-pub trait RemoteEpochObserver: Send {
+/// exempts the first record from the contiguity check.
+pub trait RemoteEpochObserver<S: StateDatabase>: Send {
     /// # Errors
     ///
     /// Returns `Err` when the implementation rejects `rec`. This is
@@ -166,14 +219,27 @@ pub trait RemoteEpochObserver: Send {
     fn observe(
         &mut self,
         rec: &RemoteEpochRecord,
-        parent_storage: &ParentStorageReader<'_>,
+        parent: &ParentState<'_, S>,
     ) -> Result<(), ExecutorError>;
 }
 
-/// A storage read against the parent state of the record under
-/// observation. See [`RemoteEpochObserver`].
-pub type ParentStorageReader<'a> = dyn Fn(alloy_primitives::Address, alloy_primitives::B256) -> Result<alloy_primitives::U256, String>
-    + 'a;
+/// The no-check [`RemoteEpochObserver`], for roles that trust the pair's
+/// origin sequence as sent: the executor role, and most tests. Every
+/// record passes. This exists so an
+/// [`EngineWiring`](crate::actor::EngineWiring) that runs no remote-epoch
+/// verification still has a concrete type to name.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoRemoteEpochCheck;
+
+impl<S: StateDatabase> RemoteEpochObserver<S> for NoRemoteEpochCheck {
+    fn observe(
+        &mut self,
+        _rec: &RemoteEpochRecord,
+        _parent: &ParentState<'_, S>,
+    ) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+}
 
 /// The consumer is gone; the reader thread exits cleanly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

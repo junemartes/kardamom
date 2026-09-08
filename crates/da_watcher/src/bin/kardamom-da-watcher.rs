@@ -3,15 +3,16 @@
 //! It runs up to two independent origin watchers in one process:
 //!
 //! * L1 deposits (`--l1-rpc` and `--lockbox`, plus an optional
-//!   `--poll-interval`): an [`da_watcher::RpcL1Source`] over an alloy HTTP
+//!   `--poll-interval`): an `da_watcher::RpcL1Source` over an alloy HTTP
 //!   provider. Each finalized L1 block becomes one `EpochRecord` on the
-//!   `tx_deposits` Aeron channel, through [`LiveTxDepositsPublisher`].
+//!   `tx_deposits` Aeron channel, through
+//!   [`publishers::LiveTxDepositsPublisher`].
 //! * Interop (`--interop-feed-url`, `--interop-peer-chain-id`, and
 //!   `--self-chain-id`): a WebSocket outbox feed from one peer Kardamom
 //!   chain. Each origin block that carried messages becomes one
 //!   `RemoteEpochRecord` on `tx_remote_epochs`, through
-//!   [`LiveRemoteEpochsPublisher`]. At startup the cursor file is
-//!   reconciled with the destination's `Inbox.nextSeq` through
+//!   [`publishers::LiveRemoteEpochsPublisher`]. At startup the cursor file
+//!   is reconciled with the destination's `Inbox.nextSeq` through
 //!   `--interop-dest-rpc` (see `interop::reconcile`).
 //!
 //! Either path can run alone, or both together. They share nothing but the
@@ -25,28 +26,27 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use alloy_primitives::Address;
-use alloy_provider::ProviderBuilder;
 use anyhow::Context;
 use clap::Parser;
 
+use kardamom_da_watcher::DaWatcherConfig;
 use kardamom_da_watcher::interop::{
-    CursorFile, InteropWatcherConfig, ReconcileRetry, RemoteEpochPublisher, RpcDestinationReader,
-    WsRemoteChainSource, reconcile_cursor, spawn as spawn_interop_watcher,
-};
-use kardamom_da_watcher::{
-    DaWatcherConfig, EpochPublisher, PublishError, RpcL1Source, WatcherHandle,
-    spawn as spawn_watcher,
+    CursorFile, CursorReconcile, InteropWatcherConfig, ReconcileRetry, RpcDestinationReader,
 };
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDepositsPublisherHandle, TxRemoteEpochsPublisherHandle,
 };
 use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
 use kardamom_log::recorder::{RecorderKind, record_stream_until_stopped};
-use kardamom_obs::bin::wait_for_shutdown;
-use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{BPosition, EpochRecord};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+
+#[path = "kardamom-da-watcher/publishers.rs"]
+mod publishers;
+#[path = "kardamom-da-watcher/watchers.rs"]
+mod watchers;
+
+use watchers::Watchers;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -149,7 +149,7 @@ struct Args {
     metrics_addr: SocketAddr,
     /// Host identifier. It is stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
-    host_id: String,
+    host_id: kardamom_obs::HostId,
 }
 
 /// The L1 deposit path, resolved. Present only when both `--l1-rpc` and
@@ -167,9 +167,36 @@ struct InteropPath {
     feed_url: String,
     cursor_file: CursorFile,
     cfg: InteropWatcherConfig,
-    /// The destination JSON-RPC for the startup cursor reconcile. `None`
-    /// only with `--interop-skip-cursor-reconcile`.
-    dest_rpc: Option<String>,
+    /// How the startup cursor reconcile reaches the destination.
+    cursor_reconcile: CursorReconcile,
+}
+
+impl InteropPath {
+    /// Reconcile the resume position with the destination BEFORE anything
+    /// is derived. A cursor ahead of the chain is fatal here, so the
+    /// process exits before it can publish a hole. [`CursorReconcile::Skip`]
+    /// is a no-op: the cursor file is trusted as is.
+    async fn reconcile(&mut self) -> anyhow::Result<()> {
+        let CursorReconcile::Rpc(url) = &self.cursor_reconcile else {
+            return Ok(());
+        };
+        let reader = RpcDestinationReader::connect(url)
+            .await
+            .with_context(|| format!("connect --interop-dest-rpc {url}"))?;
+        let reconciled = ReconcileRetry::default()
+            .reconcile(&reader, self.peer_chain_id, self.cfg.start_seq)
+            .await
+            .context("reconcile the interop cursor with the destination")?;
+        if reconciled != self.cfg.start_seq {
+            // The file is behind the chain. Persisting the chain's cursor
+            // is safe: every seq below it was delivered.
+            self.cursor_file
+                .persist(reconciled)
+                .context("persist the reconciled cursor")?;
+            self.cfg.start_seq = reconciled;
+        }
+        Ok(())
+    }
 }
 
 /// Split the flags into the two independent origin paths.
@@ -179,99 +206,8 @@ struct InteropPath {
 /// advanced, and the resulting seq hole is exactly what a destination verifier
 /// halts on much later.
 fn resolve_paths(args: &Args) -> anyhow::Result<(Option<L1Path>, Option<InteropPath>)> {
-    let l1 = match (&args.l1_rpc, &args.lockbox) {
-        (Some(rpc), Some(lockbox)) => {
-            let lockbox = Address::from_str(lockbox)
-                .map_err(|e| anyhow::anyhow!("--lockbox is not a valid address: {e}"))?;
-            Some(L1Path {
-                rpc: rpc.clone(),
-                cfg: DaWatcherConfig {
-                    lockbox,
-                    poll_interval: Duration::from_secs(args.poll_interval_secs.get()),
-                },
-            })
-        }
-        (None, None) => None,
-        _ => anyhow::bail!("--l1-rpc and --lockbox must be given together"),
-    };
-
-    let interop = match (
-        args.interop_peer_chain_id,
-        &args.interop_feed_url,
-        args.self_chain_id,
-    ) {
-        (Some(peer_chain_id), Some(feed_url), Some(self_chain_id)) => {
-            if peer_chain_id == self_chain_id {
-                anyhow::bail!(
-                    "--interop-peer-chain-id equals --self-chain-id ({self_chain_id}): a chain \
-                     cannot be its own remote origin"
-                );
-            }
-            let peer_chain_id = peer_chain_id.get();
-            let self_chain_id = self_chain_id.get();
-            // The cursor file is REQUIRED, not optional-with-a-default: a
-            // watcher whose resume position lives only in a CLI flag replays
-            // (or worse, skips) on every restart, and the skip direction is a
-            // permanent lane hole.
-            let Some(path) = &args.interop_cursor_file else {
-                anyhow::bail!(
-                    "the interop path requires --interop-cursor-file (the durable resume \
-                     position; --interop-start-seq only seeds the very first boot)"
-                );
-            };
-            // `open` takes the cursor's file lock. A second watcher on the
-            // same file stops here with `CursorError::Locked`.
-            let cursor_file =
-                CursorFile::open(path.clone()).context("open --interop-cursor-file")?;
-            // A corrupt file must stop the process HERE, before anything is
-            // derived — see `CursorFile::load` for why it is never treated
-            // as 0.
-            let start_seq = match cursor_file.load().context("load --interop-cursor-file")? {
-                Some(persisted) => {
-                    if args.interop_start_seq != 0 && args.interop_start_seq != persisted {
-                        tracing::info!(
-                            persisted,
-                            flag = args.interop_start_seq,
-                            "cursor file exists; ignoring --interop-start-seq"
-                        );
-                    }
-                    persisted
-                }
-                None => args.interop_start_seq,
-            };
-            let dest_rpc = match (&args.interop_dest_rpc, args.interop_skip_cursor_reconcile) {
-                (Some(url), _) => Some(url.clone()),
-                (None, true) => {
-                    tracing::warn!(
-                        "--interop-skip-cursor-reconcile: the cursor file is trusted as is; \
-                         a cursor ahead of the destination is a permanent lane hole"
-                    );
-                    None
-                }
-                (None, false) => anyhow::bail!(
-                    "the interop path requires --interop-dest-rpc (the destination JSON-RPC \
-                     that serves eth_getStorageAt, for the startup cursor reconcile); pass \
-                     --interop-skip-cursor-reconcile to skip it in tests"
-                ),
-            };
-            Some(InteropPath {
-                peer_chain_id,
-                feed_url: feed_url.clone(),
-                cursor_file,
-                cfg: InteropWatcherConfig {
-                    self_chain_id,
-                    start_seq,
-                    retry_interval: Duration::from_secs(args.interop_retry_interval_secs.get()),
-                },
-                dest_rpc,
-            })
-        }
-        (None, None, _) => None,
-        _ => anyhow::bail!(
-            "--interop-peer-chain-id, --interop-feed-url and --self-chain-id must be given together"
-        ),
-    };
-
+    let l1 = args.l1_path()?;
+    let interop = args.interop_path()?;
     if l1.is_none() && interop.is_none() {
         anyhow::bail!(
             "nothing to watch: give --l1-rpc + --lockbox, or the interop triple \
@@ -279,6 +215,110 @@ fn resolve_paths(args: &Args) -> anyhow::Result<(Option<L1Path>, Option<InteropP
         );
     }
     Ok((l1, interop))
+}
+
+impl Args {
+    /// Resolve the L1 deposit path: `Some` only when both `--l1-rpc` and
+    /// `--lockbox` were given.
+    fn l1_path(&self) -> anyhow::Result<Option<L1Path>> {
+        match (&self.l1_rpc, &self.lockbox) {
+            (Some(rpc), Some(lockbox)) => {
+                let lockbox = Address::from_str(lockbox)
+                    .map_err(|e| anyhow::anyhow!("--lockbox is not a valid address: {e}"))?;
+                Ok(Some(L1Path {
+                    rpc: rpc.clone(),
+                    cfg: DaWatcherConfig {
+                        lockbox,
+                        poll_interval: Duration::from_secs(self.poll_interval_secs.get()),
+                    },
+                }))
+            }
+            (None, None) => Ok(None),
+            _ => anyhow::bail!("--l1-rpc and --lockbox must be given together"),
+        }
+    }
+
+    /// Resolve the interop path: `Some` only when the full peer triple
+    /// (`--interop-peer-chain-id`, `--interop-feed-url`,
+    /// `--self-chain-id`) was given.
+    fn interop_path(&self) -> anyhow::Result<Option<InteropPath>> {
+        let (peer_chain_id, feed_url, self_chain_id) = match (
+            self.interop_peer_chain_id,
+            &self.interop_feed_url,
+            self.self_chain_id,
+        ) {
+            (Some(peer_chain_id), Some(feed_url), Some(self_chain_id)) => {
+                (peer_chain_id, feed_url, self_chain_id)
+            }
+            (None, None, _) => return Ok(None),
+            _ => anyhow::bail!(
+                "--interop-peer-chain-id, --interop-feed-url and --self-chain-id must be given \
+                 together"
+            ),
+        };
+        if peer_chain_id == self_chain_id {
+            anyhow::bail!(
+                "--interop-peer-chain-id equals --self-chain-id ({self_chain_id}): a chain \
+                 cannot be its own remote origin"
+            );
+        }
+        // The cursor file is REQUIRED, not optional-with-a-default: a
+        // watcher whose resume position lives only in a CLI flag replays
+        // (or worse, skips) on every restart, and the skip direction is a
+        // permanent lane hole.
+        let Some(path) = &self.interop_cursor_file else {
+            anyhow::bail!(
+                "the interop path requires --interop-cursor-file (the durable resume position; \
+                 --interop-start-seq only seeds the very first boot)"
+            );
+        };
+        // `open` takes the cursor's file lock. A second watcher on the
+        // same file stops here with `CursorError::Locked`.
+        let cursor_file = CursorFile::open(path.clone()).context("open --interop-cursor-file")?;
+        let start_seq = self.interop_start_seq(&cursor_file)?;
+        let cursor_reconcile = CursorReconcile::parse(
+            self.interop_dest_rpc.clone(),
+            self.interop_skip_cursor_reconcile,
+        )
+        .context("--interop-dest-rpc / --interop-skip-cursor-reconcile")?;
+        if matches!(cursor_reconcile, CursorReconcile::Skip) {
+            tracing::warn!(
+                "--interop-skip-cursor-reconcile: the cursor file is trusted as is; a cursor \
+                 ahead of the destination is a permanent lane hole"
+            );
+        }
+        Ok(Some(InteropPath {
+            peer_chain_id: peer_chain_id.get(),
+            feed_url: feed_url.clone(),
+            cursor_file,
+            cfg: InteropWatcherConfig {
+                self_chain_id: self_chain_id.get(),
+                start_seq,
+                retry_interval: Duration::from_secs(self.interop_retry_interval_secs.get()),
+            },
+            cursor_reconcile,
+        }))
+    }
+
+    /// The resume position to start from: the persisted cursor if the
+    /// file already has one (a corrupt file stops the process here,
+    /// before anything is derived — see [`CursorFile::load`] for why it
+    /// is never treated as 0), or `--interop-start-seq` on first boot.
+    fn interop_start_seq(&self, cursor_file: &CursorFile) -> anyhow::Result<u64> {
+        match cursor_file.load().context("load --interop-cursor-file")? {
+            Some(persisted) => {
+                if self.interop_start_seq != 0 && self.interop_start_seq != persisted {
+                    tracing::info!(
+                        persisted,
+                        flag = self.interop_start_seq,
+                        "cursor file exists; ignoring --interop-start-seq"
+                    );
+                }
+                Ok(persisted)
+            }
+            None => Ok(self.interop_start_seq),
+        }
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -291,7 +331,7 @@ async fn main() -> anyhow::Result<()> {
     kardamom_obs::init(
         "da-watcher",
         args.metrics_addr,
-        &args.host_id,
+        args.host_id.as_ref(),
         env!("CARGO_PKG_VERSION"),
         option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
     )
@@ -337,12 +377,19 @@ async fn serve(
         None
     };
 
-    let watchers = spawn_watchers(l1, interop, tx_deposits_pub, tx_remote_epochs_pub).await?;
+    let watchers = Watchers::spawn(
+        l1,
+        interop,
+        tx_deposits_pub,
+        tx_remote_epochs_pub,
+        args.interop_fault_exits,
+    )
+    .await?;
     // A panicked watcher task or an all-fail-stopped exit both return `Err`
     // here and skip the cleanup below, exactly as a bare early return would:
     // the recorder thread is left running, detached, for the process exit
     // to reap.
-    await_shutdown_or_fail_stop(watchers, args.interop_fault_exits).await?;
+    watchers.await_shutdown_or_fail_stop().await?;
 
     stop.cancel();
     if let Some(h) = recorder_handle {
@@ -439,7 +486,7 @@ impl DaWatcherService {
                     tracing::error!(error = %e, "tx_deposits recorder exited with error");
                 }
             })
-            .expect("spawn tx_deposits recorder thread");
+            .context("spawn tx_deposits recorder thread")?;
         // This budget is generous: normally one catalog-poll tick is about
         // 500ms. The timeout only bounds a stuck or unreachable archive.
         match tokio::time::timeout(Duration::from_secs(60), ready_rx).await {
@@ -459,221 +506,5 @@ impl DaWatcherService {
             ),
         }
         Ok(handle)
-    }
-}
-
-/// Spawn one watcher per fully-configured path.
-async fn spawn_watchers(
-    l1: Option<L1Path>,
-    interop: Option<InteropPath>,
-    tx_deposits_pub: Option<TxDepositsPublisherHandle>,
-    tx_remote_epochs_pub: Option<TxRemoteEpochsPublisherHandle>,
-) -> anyhow::Result<Vec<(&'static str, WatcherHandle)>> {
-    let mut watchers: Vec<(&'static str, WatcherHandle)> = Vec::new();
-
-    if let (Some(l1), Some(tx_deposits_pub)) = (l1, tx_deposits_pub) {
-        let provider = ProviderBuilder::new()
-            .connect(&l1.rpc)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to connect to L1 RPC {}: {e}", l1.rpc))?;
-        tracing::info!(
-            l1_rpc = %l1.rpc,
-            lockbox = ?l1.cfg.lockbox,
-            poll_interval = ?l1.cfg.poll_interval,
-            "kardamom-da-watcher: publishing L1 epochs onto tx_deposits"
-        );
-        watchers.push((
-            "l1",
-            spawn_watcher(
-                LiveTxDepositsPublisher::new(tx_deposits_pub),
-                RpcL1Source::new(provider),
-                l1.cfg,
-            ),
-        ));
-    }
-
-    if let (Some(mut interop), Some(tx_remote_epochs_pub)) = (interop, tx_remote_epochs_pub) {
-        // Reconcile the resume position with the destination BEFORE
-        // anything is derived (audit H9). A cursor ahead of the chain is
-        // fatal here, so the process exits before it can publish a hole.
-        if let Some(url) = &interop.dest_rpc {
-            let reader = RpcDestinationReader::connect(url)
-                .await
-                .with_context(|| format!("connect --interop-dest-rpc {url}"))?;
-            let reconciled = reconcile_cursor(
-                &reader,
-                interop.peer_chain_id,
-                interop.cfg.start_seq,
-                ReconcileRetry::default(),
-            )
-            .await
-            .context("reconcile the interop cursor with the destination")?;
-            if reconciled != interop.cfg.start_seq {
-                // The file is behind the chain. Persisting the chain's
-                // cursor is safe: every seq below it was delivered.
-                interop
-                    .cursor_file
-                    .persist(reconciled)
-                    .context("persist the reconciled cursor")?;
-                interop.cfg.start_seq = reconciled;
-            }
-        }
-        tracing::info!(
-            feed_url = %interop.feed_url,
-            origin = interop.peer_chain_id,
-            self_chain_id = interop.cfg.self_chain_id,
-            start_seq = interop.cfg.start_seq,
-            cursor_file = %interop.cursor_file.path().display(),
-            dest_rpc = interop.dest_rpc.as_deref().unwrap_or("<skipped>"),
-            "kardamom-da-watcher: publishing remote epochs onto tx_remote_epochs"
-        );
-        let source = WsRemoteChainSource::new(
-            interop.peer_chain_id,
-            interop.cfg.self_chain_id,
-            interop.feed_url,
-        );
-        watchers.push((
-            "interop",
-            spawn_interop_watcher(
-                LiveRemoteEpochsPublisher::new(tx_remote_epochs_pub),
-                source,
-                interop.cfg,
-                Some(interop.cursor_file),
-            ),
-        ));
-    }
-
-    Ok(watchers)
-}
-
-/// Wait for SIGTERM (an orchestrator stop), Ctrl-C, or every watcher to
-/// fail-stop on its own, then ask each remaining watcher to exit.
-///
-/// A watcher that finishes without being asked has fail-stopped: an interop
-/// derivation fault, a feed lag, or a closed publisher. Once the last
-/// watcher has fail-stopped, nothing is left to watch. Staying up as a
-/// healthy-looking husk would hide the halt from the orchestrator, so the
-/// process exits nonzero. This lets the supervisor, or an e2e harness, see
-/// the fail-stop as a process outcome, not just a log line.
-///
-/// With `interop_fault_exits` set (the default) an interop fail-stop exits
-/// the process even while the L1 path still runs. The fault domain is
-/// still the pair on the chain: the L1 path restarts with the process.
-/// Without the flag, the L1 path keeps the process up and the halt shows
-/// only in the log and the metric.
-async fn await_shutdown_or_fail_stop(
-    watchers: Vec<(&'static str, WatcherHandle)>,
-    interop_fault_exits: bool,
-) -> anyhow::Result<()> {
-    let fail_stopped: Option<&'static str> = tokio::select! {
-        _ = wait_for_shutdown() => None,
-        halt = async {
-            loop {
-                if watchers.iter().all(|(_, h)| h.task.is_finished()) {
-                    break "every configured watcher";
-                }
-                if interop_fault_exits
-                    && watchers
-                        .iter()
-                        .any(|(name, h)| *name == "interop" && h.task.is_finished())
-                {
-                    break "the interop watcher";
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        } => Some(halt),
-    };
-    for (name, handle) in watchers {
-        if handle.task.is_finished() {
-            tracing::error!(watcher = name, "watcher exited without a shutdown request");
-        }
-        let _ = handle.shutdown.send(());
-        handle
-            .task
-            .await
-            .map_err(|e| anyhow::anyhow!("{name} watcher task panicked: {e}"))?;
-    }
-    if let Some(who) = fail_stopped {
-        tracing::error!(
-            "{who} fail-stopped (no shutdown was requested); exiting nonzero so the halt is a \
-             process outcome"
-        );
-        anyhow::bail!(
-            "{who} fail-stopped (no shutdown was requested); exiting nonzero so the halt is a \
-             process outcome"
-        );
-    }
-    Ok(())
-}
-
-/// Live [`EpochPublisher`] backed by an Aeron `tx_deposits` publication.
-/// It publishes one epoch per finalized L1 block on `tx_deposits`. The
-/// downstream sequencer forwards each one, unchanged, onto `tx_ordering` as
-/// an origin-advancing record.
-struct LiveTxDepositsPublisher {
-    handle: TxDepositsPublisherHandle,
-}
-
-impl LiveTxDepositsPublisher {
-    fn new(handle: TxDepositsPublisherHandle) -> Self {
-        Self { handle }
-    }
-}
-
-impl EpochPublisher for LiveTxDepositsPublisher {
-    fn publish(&self, epoch: &EpochRecord) -> Result<BPosition, PublishError> {
-        match self.handle.publish(epoch) {
-            Ok(pos) => Ok(pos),
-            Err(e) => {
-                let msg = e.to_string();
-                // Match Aeron's own `BACK_PRESSURED` token from
-                // `offer_code_str`, not the prose "back-pressure".
-                if msg.contains("BACK_PRESSURED") {
-                    Err(PublishError::Backpressure)
-                } else {
-                    Err(PublishError::Transport(msg))
-                }
-            }
-        }
-    }
-}
-
-/// Live [`RemoteEpochPublisher`] backed by an Aeron `tx_remote_epochs`
-/// publication — [`LiveTxDepositsPublisher`] for the interop path. One record
-/// per peer-origin block that carried messages; the sequencer relays each
-/// verbatim onto `tx_ordering` as a remote-origin-advancing record.
-struct LiveRemoteEpochsPublisher {
-    handle: TxRemoteEpochsPublisherHandle,
-}
-
-impl LiveRemoteEpochsPublisher {
-    fn new(handle: TxRemoteEpochsPublisherHandle) -> Self {
-        Self { handle }
-    }
-}
-
-impl RemoteEpochPublisher for LiveRemoteEpochsPublisher {
-    /// A failed offer MUST be reported as failed. Both non-`Closed` variants
-    /// are non-fatal — the watcher holds its cursor and re-derives the same
-    /// batch, which is safe only because re-derivation is byte-identical, so
-    /// cluster dedup on `canonical_id` absorbs a record that actually landed.
-    /// The reverse error is unrecoverable: a publisher that reported a failed
-    /// publish as complete would advance the cursor past a record that never
-    /// existed, leaving a permanent hole in the pair's dense seq that the
-    /// destination halts on and no retry can fill.
-    fn publish(&self, record: &RemoteEpochRecord) -> Result<BPosition, PublishError> {
-        match self.handle.publish(record) {
-            Ok(pos) => Ok(pos),
-            Err(e) => {
-                let msg = e.to_string();
-                // Match Aeron's own `BACK_PRESSURED` token from
-                // `offer_code_str`, not the prose "back-pressure".
-                if msg.contains("BACK_PRESSURED") {
-                    Err(PublishError::Backpressure)
-                } else {
-                    Err(PublishError::Transport(msg))
-                }
-            }
-        }
     }
 }

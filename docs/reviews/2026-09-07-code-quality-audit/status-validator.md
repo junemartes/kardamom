@@ -1209,3 +1209,905 @@ coordinator's message (`keyed_buffer!`, `check_dense_step`, the
 cross-crate rows, several free-function calls, `Divergence::halt_reason`'s
 fallback default, the PROVEN arithmetic rows) needed no further
 action.
+
+## Round B (re-audit of the main delta)
+
+Scope: `reaudit-main.md`'s `validator` section, plus the round B brief's
+cross-crate items and `status-validator.md`'s own deferred/cross-crate rows
+whose files this group owns. Files owned this round: `crates/validator/src/interop/**`,
+`crates/validator/src/bin/kardamom-validator/**`, `crates/validator/src/metrics.rs`,
+`crates/validator/src/lib.rs`, `crates/validator/Cargo.toml`. The brief also
+names `crates/validator/src/pumps.rs`; that file does not exist — the pump
+tasks live at `crates/validator/src/bin/kardamom-validator/pumps.rs`, which
+is covered.
+
+Note: `crates/engine`, `crates/exec-core`, `crates/da_watcher`, and
+`crates/log` were all under concurrent edit by other groups during this
+round (per the brief's warning). Several `EngineWiring`/`RemoteEpochObserver`
+and `ChannelsConfig` findings below exist only because that concurrent work
+landed mid-session; each is called out as such.
+
+### Done
+
+- R2/R16, `crates/validator/src/interop/verify.rs` `check_remote_epoch`:
+  split into `check_lane_position` (empty/regressed/skipped/range-fit) and
+  `check_messages` (dense/source-hash/bounds, via `try_for_each`).
+  `check_remote_epoch` is now a two-line dispatcher.
+- Item 3 (cross-crate `check_bounds`), same file: `check_messages` calls
+  `kardamom_types::xchain::XChainMessage::check_bounds` and maps the
+  `BoundsFault` into one `RemoteEpochFault::Bounds { origin, fault }`
+  variant, replacing the three duplicated `ValueNotAllowed`/`GasLimitAboveCap`/`DataAboveCap`
+  variants that mirrored `types`'s (now-also-consolidated) error shape.
+- R8, `crates/validator/src/interop/verify.rs`: `check_remote_epoch` and
+  `RemoteEpochFault` are now `pub(crate)` — grepped both names workspace-wide;
+  only `crates/validator/src/interop/mod.rs`'s re-export used them, which
+  is now removed.
+- R12, `crates/validator/src/interop/verify.rs`: `rec.messages.len() as u64`
+  and the per-message `i as u64` are `u64::try_from(..)` now (in
+  `check_lane_position` and `check_messages`).
+- R1, `crates/validator/src/interop/verify.rs`: deleted both "audit H9"
+  references (the module-level doc on `check_remote_epoch`'s old home, and
+  a test doc), and `state_rpc.rs`'s "audit H9". `extract.rs`'s "audit M4"
+  deleted.
+- R6 (engine wiring generic), `crates/validator/src/interop/verify.rs`:
+  `RemoteEpochVerifier` is now `impl<S: StateDatabase> RemoteEpochObserver<S>`,
+  reading through `kardamom_engine::delta::ParentState<'_, S>` instead of
+  the old `ParentStorageReader<'_>` closure type. This tracks a same-round
+  change on the engine side (`RemoteEpochObserver` gained an `S:
+  StateDatabase` parameter and `EngineWiring` gained `type RemoteEpoch`), not
+  a change this group chose; `crates/validator/src/bin/kardamom-validator/wiring/run.rs`'s
+  `ValidatorWiring` now sets `type RemoteEpoch = RemoteEpochVerifier` and no
+  longer boxes it (`Option<RemoteEpochVerifier>`, not
+  `Option<Box<dyn RemoteEpochObserver>>`) — two of the five `Box<dyn` grep
+  hits from before this round are gone. The test harness in
+  `verify/tests.rs` replaced its closure-based mock parent with a small
+  `TestDb: StateDatabase` fixture (storage-only, with a `fails` flag for
+  the "read fails" case) plus a `#[cfg(test)] impl RemoteEpochVerifier {
+  fn observe_db }` convenience that builds the `ParentState` from it —
+  this is why every `.observe(` call site now reads `.observe_db(`.
+- R3, `crates/validator/src/interop/verify.rs`: was 508 code lines (over
+  the bound) once the R6 adaptation above added the `StateDatabase` test
+  fixture. Split into `verify/mod.rs` (235 lines) and `verify/tests.rs`
+  (272 lines).
+- R3, `crates/validator/src/interop/serve.rs` (567 code lines): split into
+  `serve/mod.rs` (250), `serve/slots.rs` (105), `serve/tests.rs` (285).
+- R11/R15, `serve/slots.rs`: `take_slot_or_reject(handler, pending, dest)`
+  is now `Handler::take_slot(&self, pending, dest) -> Result<Accepted,
+  Rejected>`, where `Accepted { pending, _guard }` names the still-pending
+  sink and the slot guard, and `Rejected` is a marker the caller matches on
+  to return `Ok(())`.
+- R9, `serve/slots.rs`: `Slots::take` returns `Result<SlotGuard,
+  SubscriptionCap>` (`enum SubscriptionCap { Total, PerDest }` with
+  `as_str()`), not a bare `&'static str`, so the RPC message and the log
+  field come from the one method.
+- R13, `serve/mod.rs` / `bin/kardamom-validator/args.rs`:
+  `FeedServerLimits`'s two fields are `NonZeroUsize`, parsed at the CLI
+  boundary (`--feed-max-subscriptions`, `--feed-max-subscriptions-per-dest`,
+  both still default 256/8). `Slots::take` now checks each cap before it
+  changes any count (was: `entry(d).or_insert_with` before the per-dest
+  check), which was the audit's stray-zero-entry concern; with `NonZeroUsize`
+  a cap can no longer be 0, so the entry-then-reject sequence that caused
+  the leak cannot occur regardless, and the reorder makes the invariant
+  hold structurally rather than by the type ruling out the triggering case.
+- R2/R16, `serve/mod.rs` `subscribe_outbox`: was 65 lines interleaving the
+  lag frame, the per-message loop, and the head frame around two ad hoc
+  variables (`last_msg_block: Option<u64>`, `head_sent: bool`). Replaced
+  with `LaneSession { next, awaiting_head: Option<u64> }` and three
+  methods, `lag_frame`/`message_frame`/`head_frame`, one per frame kind;
+  `awaiting_head` is the one `Option` the two old variables collapse into.
+  The per-message `for m in &scan.msgs` loop, which sat directly inside the
+  subscription's outer polling `loop`, is now `send_messages(&sink,
+  &mut session, origin, &scan.msgs)`, a helper function whose own `for`
+  loop is no longer textually nested in the caller (R16's literal fix for
+  a loop that must stay: move it to a helper method).
+  `serve_cursor_feed` (attestations only, untouched by this round's
+  findings) keeps its own `for it in &items` inside its polling loop; not
+  changed, since the reaudit did not flag it and it is not part of this
+  round's diff.
+  **Caught by the test suite, not by reading**: the first draft of this
+  refactor destructured `let Accepted { pending, .. } = ..;` in
+  `subscribe_outbox`/`subscribe_attestations`. The `..` drops `_guard`
+  (the `SlotGuard`) the instant the pattern match completes, instead of
+  holding it for the subscription's lifetime, so the per-destination cap
+  silently stopped working (a closed subscription's slot count was already
+  wrong by the time the second subscribe ran). `interop::serve::tests::subscription_caps_reject_the_excess`
+  failed on this; fixed by binding `_guard` by name (`let Accepted {
+  pending, _guard } = ..;`), which required widening the field from
+  private to `pub(super)` so the parent module can name it. Flagging this
+  because it is exactly the kind of defect the brief's "documented defect
+  fixes, each with a test" rule exists for, and the existing test is what
+  caught it, not a fix made ahead of a known bug.
+- R9, `crates/validator/src/interop/store.rs`: `Lane::floor: Option<u64>`
+  and `LaneScan::floor_seq` are now `enum LaneFloor { Known(u64),
+  UnknownAfterResume }` (`.known() -> Option<u64>` for the wire DTO,
+  `.is_above(cursor) -> bool` for the lag check), replacing the
+  three-state-in-one-`Option` encoding (genesis-known-0, resumed-unknown,
+  resumed-known).
+- R14, `crates/validator/src/interop/store.rs` `AttestationStore::from_block`:
+  returns `AttestationScan { items, floor }` instead of a bare
+  `(Vec<(u64, B256)>, u64)` tuple, the same treatment `FeedStore::from_seq`'s
+  `LaneScan` already had.
+- R15, `crates/validator/src/interop/state_rpc.rs`: `is_latest(block:
+  Option<&str>) -> bool` is now a `BlockTag` unit struct with a `FromStr`
+  that rejects any non-latest-like tag at parse time; `BlockTag::parse`
+  folds the `None`-reads-as-latest case in with `map_or`, so the handler's
+  body has no `if`.
+- R9, same file: the `spawn_blocking` closure returned `Result<U256,
+  String>` and was mapped into `ErrorObjectOwned` twice (once for the
+  `JoinError`, once for the inner result). Now returns `Result<U256,
+  StateRpcError>` (`UnsupportedBlock`/`Read`), with one `impl
+  From<StateRpcError> for ErrorObjectOwned` doing the `ErrorObjectOwned::owned`
+  construction exactly once.
+- R12, `crates/validator/src/bin/kardamom-validator/wiring/{startup,run}.rs`:
+  the two `self.state.start.block + 1` sites (computing the interop feed's
+  post-resume floor) are `self.state.start.block.checked_add(1).context(..)?`.
+  `ResumePoint::block` cannot realistically reach `u64::MAX`, so this is a
+  latent-overflow hardening, not an observed defect; no test added, since
+  there is no way to construct the failing input without an invalid
+  `ResumePoint`.
+- R3, `crates/validator/src/bin/kardamom-validator/wiring.rs` (706 code
+  lines): split into a `wiring/` directory — `mod.rs` (just the module doc
+  and the three `mod` declarations plus `pub(crate) use startup::Startup`),
+  `startup.rs` (`Startup`/`Opened`/`Streamed` and the subscription-opening
+  chain, 197 lines), `pipeline.rs` (the trie-aware writer and the optional
+  attester, `Written`/`Attested`, 121 lines), `run.rs` (the receipts sink,
+  the engine loop, and shutdown, 427 lines). Every phase struct's fields
+  are `pub(super)` (were bare-private, fine in one file; needed for the
+  sibling modules to reach through the chain) — the types themselves stay
+  `pub(crate)`, unchanged from before the split.
+- Already resolved, confirmed by reading, no change needed (report per the
+  brief's instruction to say so):
+  - `crates/validator/src/interop/store.rs` `.max(1)`: already `NonZeroU64`,
+    parsed at `FeedStore::new`/`AttestationStore::new`'s boundary.
+  - `crates/validator/src/interop/store.rs` `append_block`'s nested loops:
+    already `Lane::prune_below(&mut self, cutoff)`, called from a second,
+    sibling (not nested) loop.
+  - `crates/types` (not validator, but validator's caller)
+    `derive_remote_epoch`'s `expect("non-empty")`: already `split_first`.
+  - `crates/validator/src/interop/extract.rs`: `collect_outbox_messages`'s
+    `claims: Option<(NonZeroU16, &ClaimIndex)>` and
+    `cross_check_claim(..., granularity: NonZeroU16, ...)` already take the
+    parsed type; nothing to change here for item 4.
+  - `crates/validator/src/bin/kardamom-validator/pumps.rs::index_claims`:
+    already the one place the validator read `granularity` off the wire
+    (this round's `crates/types` change removes the last defensive check
+    that remained there — see `status-state.md`'s Round B section).
+  - `crates/validator/src/bin/kardamom-validator/wiring.rs`'s
+    `state_env_for_rpc` clone: already one clone (`.clone()` at the call
+    site, moved — not re-cloned — into `start_interop_serving`). The
+    reaudit's "one clone" fix was already applied before this round.
+
+### Cross-crate item 4 (`BalFrame.granularity`)
+
+Done in `crates/types` (see `status-state.md`). This group's own callers
+(`extract.rs`, `pumps.rs`) already took `NonZeroU16` from an earlier round
+and needed no further change. Callers outside this group needing the wire
+type: `crates/executor/src/bal.rs`, `crates/e2e/src/harness/inject.rs` (see
+`status-state.md`'s Round B section for exact lines).
+
+### Blocked / not done
+
+- R6, `crates/validator/src/bin/kardamom-validator/wiring/run.rs:45,84,96`
+  `Box<dyn TxReceiptsPublication>` (as `ValidatorWiring::TxReceipts`, the
+  `build_sink` local, and the `Ready` field): still needed. The receipts
+  sink chosen at runtime is one of up to four concrete types (plain sink ×
+  attester-tee, each × interop-extraction-tee), and collapsing that into a
+  closed enum or a generic `ExtractingReceiptSink<S>`/`AttestingReceiptSink<S>`
+  chain is the "Phase B" item `status-validator.md`'s Phase C section
+  already named as depending on `ExtractingReceiptSink<S>` becoming
+  generic — unrelated to the `RemoteEpoch` associated type the engine group
+  added this round, and out of scope for this pass's budget. Left with the
+  existing `Box<dyn>` and no new `#[allow]`.
+- `crates/validator/tests/forged_envelope_chaos.rs:92` `impl EngineWiring
+  for TestWiring` is missing `type RemoteEpoch = ..;`, a direct
+  consequence of the engine group's `RemoteEpochObserver<S>`/`type
+  RemoteEpoch` change landing mid-round. `crates/validator/tests/**` is
+  owned by a different group in this round; not edited. This is the only
+  reason `cargo test -p kardamom-validator` (full, with integration tests)
+  does not pass; `cargo test -p kardamom-validator --lib --bins` (90
+  tests) and `cargo check -p kardamom-validator --lib --bins` both pass
+  clean.
+- Coordinator follow-up: replacing `bin/kardamom-validator/args.rs`'s
+  `resolve_attester_key`'s hand-rolled `env:VAR` parsing with
+  `kardamom_deployer::KeyFlag::resolve` (now that `KeyFlag` moved to
+  `crates/deployer/src/lib.rs`, unconditionally `pub`, not behind
+  `test-support`). Checked `crates/deployer/Cargo.toml`: `kardamom-deployer`
+  has `build = "build.rs"`, and that script shells out to `forge build`
+  (requires the Foundry toolchain on `PATH` and network access to fetch
+  `contracts/lib/{forge-std,openzeppelin-contracts,openzeppelin-contracts-upgradeable}`)
+  to embed contract creation bytecode. Depending on it from
+  `kardamom-validator` — a runtime node binary with no other reason to
+  need a Solidity toolchain — would impose that build requirement on every
+  validator build. Left `resolve_attester_key`'s existing copy unchanged.
+
+### Item 5 (status-validator.md's own deferred/cross-crate rows)
+
+Re-read the "Deferred to Phase B" and "(c) Cross-crate" sections. Every row
+whose files this group owns is covered above (`RemoteEpochFault`/`check_remote_epoch`
+narrowing was folded into the R2/R8 work above rather than being a separate
+row). The remaining rows (`WorkerCount`/`AttesterKey`/`BatchSize` CLI
+newtypes, the `parallel/engine.rs` `Box<dyn>` sites, `epoch_verify.rs`'s
+`BlockNotFound` typed error) touch `parallel/**`, `attester/**`, or
+`epoch_verify.rs`, none of which this round's file list includes; not
+touched.
+
+### Gates
+
+- `cargo check -p kardamom-validator --lib --bins --all-features`: clean.
+  `cargo check -p kardamom-validator --all-targets --all-features` fails
+  only on `tests/forged_envelope_chaos.rs` (see Blocked above).
+- `cargo test -p kardamom-validator --lib --bins --all-features`: 90
+  passed, 0 failed (includes the `subscription_caps_reject_the_excess`
+  regression the refactor introduced and the test suite caught, and the
+  new `TestDb`-based `interop::verify` tests).
+- `cargo fmt -p kardamom-validator -- --check`: clean.
+- `cargo clippy -p kardamom-validator --lib --bins --all-features
+  --no-deps -- -D warnings -W clippy::pedantic -D unreachable_pub`: zero
+  warnings in every file this group owns. (Without `--no-deps` the same
+  command also reports pre-existing `unreachable_pub`/`missing_errors_doc`/
+  `unnecessary_wraps` findings in `crates/state` and `crates/da_watcher`,
+  which are dependency crates, not `-p kardamom-validator`'s own code, and
+  pre-existing findings inside `crates/validator/src/{attester/state.rs,
+  parallel/claims.rs}`, which are not this group's files.)
+- Forbidden-pattern grep over this group's directories: no hits except the
+  three still-blocked `Box<dyn TxReceiptsPublication>` sites listed above.
+- No file this group owns exceeds 500 code lines (`run.rs`, the largest
+  new file, is 427).
+
+## Round B, follow-up
+
+Three items from mid-round coordinator messages, addressed after the
+original Round B section above was written and gated.
+
+### 1. `crates/validator/src/interop/extract.rs` — R14 dedup with exec-core
+
+`cross_check_claim`'s inline `if granularity.get() > 1 { chunk_of(...) }
+else { bal_index }` duplicated `kardamom_engine::bal_ladder::claim_index`,
+a helper the exec-core group added concurrently (already used by
+`crates/validator/src/parallel/engine.rs:379`). Replaced the inline
+computation with a call to the shared helper. `interop::extract` tests
+(6) still pass.
+
+### 2. `Box<dyn TxReceiptsPublication>` de-dyn (R6, no size exemption)
+
+The sink side (`ExtractingReceiptSink<P>`, `AttestingReceiptSink<P>`) was
+already made generic over `P: TxReceiptsPublication` by the engine group
+concurrently with this round, along with a new `kardamom_engine::Either<A,
+B>` forwarder built for exactly this "runtime-chosen decorator, no
+allocation" shape. That left one remaining piece, owned here:
+`crates/validator/src/bin/kardamom-validator/wiring/run.rs`'s
+`Attested::build_sink` still boxed the result. Fixed by naming the whole
+chain as a value type:
+
+```
+type ReceiptsTee = Either<AttestingReceiptSink<ValidatorReceiptSink>, ValidatorReceiptSink>;
+type TxReceiptsChain = Either<ExtractingReceiptSink<ReceiptsTee>, ReceiptsTee>;
+```
+
+`build_sink` now returns `Either::Left`/`Either::Right` at each of the
+two independent startup choices (attester tee, outbox extraction)
+instead of `Box::new`; `Ready.tx_receipts_pub` and
+`ValidatorWiring::TxReceipts` are both `TxReceiptsChain`. Zero
+`Box<dyn TxReceiptsPublication>` sites remain in this group's files (the
+forbidden-pattern grep is clean for `Box<dyn` outside test paths).
+
+### 3. `crates/validator/src/attester/state.rs` — 8 `unreachable_pub` findings
+
+The coordinator extended this group's file ownership to include this one
+file (outside the original list, which named only `witness.rs` and
+`parallel/**` as excluded). All 8 `pub fn` on `AttestState`
+(`new`, `on_root`, `next_attestable`, `on_leaves`, `due`,
+`leaves_through`, `mark_attested`, `last_attested`) narrowed to
+`pub(crate)`: the struct itself is already `pub(crate)` and every caller
+is `attester/mod.rs`, a sibling module. `-D unreachable_pub` on
+`--lib --bins --no-deps` now finds zero findings in this file (it found
+zero in this group's own files even before this fix; these 8 were the
+only findings anywhere in the crate).
+
+### 4. R16, broadened form, across every owned production file
+
+Same broadened rule as the types-side follow-up (no loop with an
+`if`/`else`/`match`/`let-else` in its body, no loop inside a branch, in
+either direction — confirmed genuine, `docs/STYLE.md` R16 text checked
+directly). Every site found by grepping every `for`/`while`/`loop` in
+this group's files and reading each:
+
+- `crates/validator/src/interop/store.rs::Lane::prune_below`: `while let
+  Some(front) = self.msgs.front() { if ... { break; } ...; pop_front();
+  }` had an `if { break; }` in the body. Rewritten with
+  `VecDeque::pop_front_if`: `while let Some(front) =
+  self.msgs.pop_front_if(|f| f.origin_block_number < cutoff) { ...
+  }` — the condition moved into the loop's own condition (a `while let`
+  pattern match in the condition position does not count as nested,
+  per the rule's own "in either direction" framing being about the
+  loop's *body*), leaving a branch-free body.
+- `crates/validator/src/interop/serve/mod.rs::serve_cursor_feed`: the
+  `loop { if next < floor { ...; continue; } for it in &items { if ...
+  { return; } ... } select! { ... if r.is_err() { return; } ... } }`
+  had three separate branches in its body. Split into
+  `cursor_feed_step(...) -> Option<u64>` (a plain, non-loop async fn —
+  its internal `if`/`match`/`select!` are unrestricted, since R16 only
+  restricts loops) and a `while let Some(after) = cursor_feed_step(...).await
+  { next = after; }` outer loop whose body is one assignment.
+- `crates/validator/src/interop/serve/mod.rs::subscribe_outbox`: same
+  pattern (`lag_frame`/`send_messages`/`head_frame`/`select!` branches
+  inline in a `loop`). Split into `outbox_feed_step(...) -> Option<()>`
+  plus `while outbox_feed_step(...).await.is_some() {}`.
+  `subscribe_attestations` already called `serve_cursor_feed`, so it
+  was fixed for free.
+- `crates/validator/src/bin/kardamom-validator/pumps.rs`, all three
+  pump loops (`spawn_bal_pump`, `spawn_receipts_pump`,
+  `spawn_commit_poller`), each had a `loop { select! { ... }; match ...
+  { ... } }` or `let-else` in the body. Each split into a `*_step(...)
+  -> Option<...>` helper (the select!/match/let-else moved inside,
+  where they are unrestricted) plus a `while ... .is_some() {}` /
+  `while let Some(x) = ... { ... }` outer loop with a branch-free body.
+  The `tx_bal` pump's step also needed its 6 parameters grouped into a
+  new `BalPumpPorts` struct to stay under the pedantic
+  `too_many_arguments` limit (7) once the step function existed
+  standalone — R15's own "inputs as struct state" rule, applied to make
+  the split legal. This is the same shutdown-sequencing code the
+  original Round B section documented as sensitive (the "SIGTERM
+  deadlock trap" comment on the runtime clone); the split preserves the
+  same `biased;` select ordering, the same clone lifetimes (still owned
+  by the one `async move` block for the task's whole life), and the
+  same drop timing — verified by re-running the crate's full test suite
+  after each step, not just at the end.
+- `crates/validator/src/interop/sink.rs::ExtractingReceiptSink::flush_through`:
+  `for (b, receipts) in flushed { if claims.is_none() { ... } let msgs =
+  match collect_outbox_messages(...) { ... }; ...; }` had an `if` and a
+  `match` in the loop body. Extracted the whole per-block body into
+  `extract_and_serve_block(&self, block, receipts) -> Result<(),
+  ExecutorError>`; the loop's body is now one call
+  (`self.extract_and_serve_block(b, &receipts)?;`).
+- `crates/validator/src/interop/serve/tests.rs`: one test-file site,
+  `loop { if subscribe_outbox(...).await.is_ok() { break; } assert!(...);
+  sleep(...).await; }` (a poll-until-ready retry). Inverted into
+  `while subscribe_outbox(...).await.is_err() { assert!(...); sleep(...).await; }`
+  — same technique as `prune_below`, condition moved into the loop
+  header.
+- Everything else in this group's files already had branch-free loop
+  bodies (checked by grep + read, not just grep): `metrics.rs`,
+  `lib.rs`, `interop/extract.rs` (production and its `claims_for` test
+  helper), `interop/store.rs`'s other two loops (`append_block`'s two
+  `for` loops call only plain methods, no branch), `interop/serve/mod.rs`'s
+  `send_messages`, `xchain/abi_tests.rs`-equivalent-in-validator (none),
+  and every remaining `#[test]` loop in `interop/store.rs`,
+  `interop/sink.rs` (simple `for b in a..=b { ... }` ranges with no
+  branch in the body).
+
+All four items gated together with the rest of this follow-up (below).
+
+### `NonEmptyVec<XChainMessage>` fallout in this group's files
+
+The types-side change (`docs/reviews/.../status-state.md`'s Round B
+follow-up) changed `RemoteEpochRecord.messages` to `NonEmptyVec<XChainMessage>`,
+which is consumed by this group's `crates/validator/src/interop/verify/mod.rs`:
+
+- `check_lane_position`'s `if rec.messages.is_empty() { return
+  Err(RemoteEpochFault::Empty { origin }); }` deleted outright — the
+  type makes this state unreachable for anything that got this far
+  (either built in-process, where it cannot be constructed empty, or
+  decoded from the wire, where a zero-length archive now fails to
+  decode before reaching this function). `RemoteEpochFault::Empty` and
+  its `Display` arm removed as dead code (its only two call sites were
+  this check and its own dedicated test).
+- `u64::try_from(rec.messages.len())` → `u64::try_from(rec.messages.len().get())`.
+- `crates/validator/src/interop/verify/tests.rs`: `record()`'s helper
+  rewritten to build via `NonEmptyVec::new(first, rest)`; every
+  `r.messages[i]` mutation rewritten to `r.messages.as_mut_slice()[i]`
+  (added `NonEmptyVec::as_mut_slice` in the types crate for this, and
+  for any other in-place-edit test elsewhere); the "empty record" test
+  case (`r.messages.clear(); assert_eq!(..., Err(RemoteEpochFault::Empty
+  { .. }))`) deleted — the state it exercised is now unrepresentable,
+  same reasoning as the deleted types-side underflow test; the
+  `overflowing` record's direct struct literal switched to
+  `NonEmptyVec::new(msg, vec![])`.
+
+This group's usage was silently broken by the types-side change until
+found and fixed here — it does not show up as a build error until
+`kardamom-validator` itself is checked, which is why it is called out
+explicitly rather than left to the cross-crate list below.
+
+### Cross-crate callers of `NonEmptyVec`, not owned by this group
+
+Checked against the tree at the time of this report. Most were already
+fixed by their owning groups (engine, sequencer, cluster-adapter,
+da_watcher, batcher) between when the coordinator's message arrived and
+this report being written; one remains:
+
+- `crates/cluster-adapter/src/wire/tests.rs:119` (struct literal,
+  `messages: vec![...]`) and `:357` (`rec.messages[0].callback = ...`) —
+  still fails to compile as of this report. Fix: `messages:
+  NonEmptyVec::new(first_message, rest_vec)` at the construction site;
+  `rec.messages.as_mut_slice()[0].callback = ...` at the mutation site
+  (the production code in the same crate, `wire/ingress.rs` and
+  `wire/mod.rs`, was already fixed by the owning group).
+- Already fixed (verified compiling): `crates/da_watcher/src/interop/watcher.rs`,
+  `crates/cluster-adapter/src/wire/ingress.rs`, `crates/cluster-adapter/src/wire/mod.rs`,
+  `crates/engine/src/reader/tests.rs`, `crates/engine/src/actor/test_support.rs`,
+  `crates/engine/src/reader/threads.rs`, `crates/sequencer/src/remote_epoch.rs`,
+  `crates/sequencer/src/outbound/cluster.rs`, `crates/batcher/src/frame.rs`
+  (the batcher's own wire decoder, the second "wire boundary" a
+  coordinator message named).
+
+### Unrelated transient breakage observed and waited out, not caused by
+this round
+
+- `kardamom-log`: a brief `UnboundedReceiver` type-not-found error in
+  `refetch.rs`, self-healed within 15 seconds of polling.
+- `kardamom-engine::bin_support.rs`: a `TxDataSubscription` vs
+  `UnboundedReceiver` mismatch from a concurrent `kardamom-log` API
+  change (the same change below), unrelated to anything in this round;
+  resolved on its own within a few minutes of polling.
+- `kardamom-log`'s `AeronRuntime::open_subscription` return type changed
+  from `UnboundedReceiver<T>` to `TypedSubscription<T>`, and
+  `TxReceiptsSubscriberHandle::into_receiver()` now returns
+  `TxReceiptsReceiver` instead of `UnboundedReceiver<...>` — a genuine,
+  legitimate concurrent API change (not transient) that broke this
+  group's own `pumps.rs` (written earlier this round against the old
+  types). Fixed by updating `open_bal_sub`'s return type and
+  `bal_pump_step`/`receipts_pump_step`'s receiver parameter types to
+  the new `TypedSubscription<BalFrame>` / `TxReceiptsReceiver` types;
+  both still expose the same `async fn recv(&mut self) -> Option<(BPosition,
+  T)>` shape, so no other logic changed.
+
+### Gates (this follow-up, final state)
+
+- `cargo check -p kardamom-validator --all-targets`: clean, including
+  `tests/forged_envelope_chaos.rs` (the `type RemoteEpoch` blocker
+  documented in the original Round B section above was fixed by its
+  owning group since then — `--all-targets` now used, no longer
+  `--lib --bins`).
+- `cargo test -p kardamom-validator --all-targets`: 90 lib + 0 bin + 3 +
+  1 + 3 + 1 (1 ignored) + 1 integration-test-binary results, all pass,
+  zero failures.
+- `cargo fmt -p kardamom-validator -- --check`: the crate-wide check
+  shows unrelated diffs in `parallel/engine.rs` and `witness.rs` (not
+  owned by this group — left untouched); every file this group owns or
+  edited this round passes `rustfmt --check` individually.
+- `cargo clippy -p kardamom-validator --lib --bins --no-deps -- -D
+  warnings -W clippy::pedantic -D unreachable_pub`: clean, zero
+  findings anywhere in the crate (the 8 `attester/state.rs` findings
+  from the original Round B section are gone, per item 3 above).
+- Forbidden-pattern grep over this group's directories: clean, zero
+  hits (the three `Box<dyn TxReceiptsPublication>` sites from the
+  original Round B section are gone, per item 2 above).
+
+## Round B, follow-up 2
+
+Reversed two rulings from follow-up 1 (`followup-roundb-A-2.md`, informed by
+`review-roundb-A.md`), then worked the ~40 remaining findings.
+
+### Ruling reversals
+
+1. **`NonEmptyVec` stays on `Vec<T>` storage.** The archived bytes of a
+   `NonEmptyVec<T>` must stay byte-identical to a plain `Vec<T>`'s — the
+   golden `RemoteEpochRecord` vector in `crates/types/src/xchain/tests.rs`
+   (`canonical_id_known_vector_is_pinned`) pins those bytes. A `(first,
+   rest)` field split would change the archive shape. Instead, the three
+   `.expect("non-empty by construction")` sites (`len`, `first`, `last`)
+   collapsed into one private `fn split(&self) -> (&T, &[T])`
+   (`crates/types/src/xchain/message.rs`); `len`, `first`, and `last` all
+   derive from it, and only `split` carries the panic (documented: never
+   fires in practice, `new` and the wire decoder both guarantee one
+   element).
+2. **`RemoteEpochRecord::last_seq()` is `u64` again**, restored to its
+   original `saturating_add`/`saturating_sub` form (never panics, even on
+   a record built outside `derive_remote_epoch`/the wire decoder, matching
+   its pre-`NonEmptyVec` contract). The overflow guard moved to the wire
+   boundary instead: `#[rkyv(bytecheck(verify))]` added directly to
+   `RemoteEpochRecord`'s derive, with a hand-written `Verify` impl
+   (`mod remote_epoch_verify` in `message.rs`, mirroring `NonEmptyVec`'s
+   own `non_empty_verify`) that rejects an archive whose `first_seq +
+   (messages.len() - 1)` does not fit `u64`. `canonical_id()` no longer
+   needs `.unwrap_or(u64::MAX)`. The three non-owned call sites this
+   group fixed under follow-up 1's `Option<u64>` ruling were reverted to
+   their exact original form: `crates/cluster-adapter/src/wire/egress.rs`
+   (`decode_remote_epoch`'s format string, back to a bare
+   `rec.last_seq()`), `crates/cluster-adapter/src/wire/ingress.rs`
+   (`encode_ingress_remote_epoch`, back to
+   `&rec.last_seq().to_le_bytes()`), and
+   `crates/da_watcher/src/interop/watcher.rs` (back to `let last_seq =
+   record.last_seq();`, no `Option` handling). `crates/da_watcher/tests/
+   interop_watcher.rs` (not owned) needed no change either way — it never
+   used the `Option` form.
+
+### Findings worked (review-roundb-A.md)
+
+- **R9 `SeqRange`** (`crates/validator/src/interop/verify/mod.rs`): the
+  index-based seq arithmetic under "cannot fail" comments in
+  `check_lane_position`/`check_messages` is gone. `SeqRange { first, last,
+  next }` is built once (`SeqRange::new`, proven at construction) and
+  threaded through: `check_messages` walks `range.iter().zip(rec.messages
+  .iter())` instead of recomputing `first_seq + index`, and `observe` uses
+  `range.next_cursor()` instead of `last_seq().checked_add(1)`.
+  `check_lane_position`/`check_messages` also became methods on a local
+  `LaneCheck { expected, rec }` struct (R15); `check_remote_epoch` is now
+  `LaneCheck { expected, rec }.run()`.
+- **R9/R12/R13 `withdrawals.rs`**: `sibling_of`'s unchecked `level[idx +
+  1]` / `level[idx - 1]` became `Level::sibling`'s `self.0[idx ^ 1]` (no
+  arithmetic that can go out of range). `withdrawal_proof`'s opening
+  `assert!(index < leaves.len(), ...)` became a `LeafIndex::new(index,
+  leaf_count) -> Option<Self>` parsed once at the boundary; the function's
+  panic contract (documented in `# Panics`) is unchanged, so the two
+  non-owned callers (`crates/e2e/src/scenarios/bridge.rs`,
+  `crates/validator/tests/withdrawal_e2e.rs`) needed no change. A new
+  `Level(Vec<B256>)` newtype owns the padding, sibling lookup, and
+  `chunks(2)` reduction (`Level::leaves`, `Level::sibling`, `Level::up`),
+  shared by `withdrawals_root` and `withdrawal_proof`. `combine_with_sibling`
+  (the R15 half of this item) stays a standalone function: it combines one
+  running per-step hash with one proof sibling, not an indexable `Level`,
+  so it has no natural receiver the way `sibling_of` had `level`; folding
+  its `idx & 1` branch directly into `recompute_root`'s loop body would
+  re-violate R16 (a branch directly in a loop body), which is why it was
+  extracted in the first place.
+- **R15 method conversions**: `CursorFeed<'a, S, L, F>` (generic over
+  three closures, R7/R11 violation) replaced by two concrete structs with
+  exactly one caller each — `OutboxFeed` (`subscribe_outbox`) and
+  `AttestationFeed` (`subscribe_attestations`) — in
+  `crates/validator/src/interop/serve/mod.rs`. The standalone
+  `outbox_feed_step` and `send_messages` functions became
+  `OutboxFeed::step` and `LaneSession::send_messages`. `pumps.rs`'s three
+  `*_step` functions became `BalPump::step`, `ReceiptsPump::step`, and
+  `CommitPoller::step` (each struct now owns its live receiver/watch plus
+  its fixed ports, so `step` takes `&mut self` instead of one argument per
+  port). `open_interop_serve` became `Opened::open_interop_serve(&self,
+  resume_block)` in `wiring/startup.rs`, reading `self.base.args` and
+  `self.state.chain_id` instead of taking them as parameters.
+  `resolve_attester_key` was **not** converted to an `AttesterKey`
+  newtype: it is one of six coordinated newtypes already deferred to
+  Phase B as one unit (see "Deferred to Phase B" above,
+  `resolve_attester_key` row) — converting it alone would split that
+  documented unit without reducing scope.
+- **R14/R8/R11**: `RemoteEpochFault`'s hand-written 65-line `impl
+  std::fmt::Display` is now a derived `thiserror::Error` (one `#[error]`
+  per variant, wording byte-identical — the
+  `a_skipped_seq_halts`/`the_first_record_is_checked_against_the_seeded_
+  cursor` tests, which assert on the rendered message, still pass
+  unchanged). `AttestationStore`'s `Vec<(u64, B256)>` became
+  `Vec<Attestation>` (`struct Attestation { block_number, state_root }`,
+  `crates/validator/src/interop/store.rs`), mirroring `LaneScan.msgs:
+  Vec<OutboxMessage>`. Deleted `LaneFloor::known()` (zero callers anywhere
+  in the workspace) and `LaneFloor::is_above()` (used only by its own
+  test, which already asserted the same fact via `assert_eq!(scan
+  .floor_seq, LaneFloor::Known(2))` one line above — the redundant
+  assertion was dropped, not replaced). `NonEmptyVec::as_mut_slice` is
+  gone; `verify/tests.rs`'s fixtures that used it now build through a new
+  `record_with(origin, first_seq, n, edit)` helper that edits the plain
+  `Vec<XChainMessage>` before `NonEmptyVec::new` wraps it. Narrowed
+  `interop/mod.rs`'s `pub use` surface: dropped `OutboxExtractError`,
+  `collect_outbox_messages`, `AttestationScan`, `LaneScan`, `LaneFloor`
+  (grep-confirmed zero external users, inside or outside the crate,
+  through that re-export path — every real consumer already imports
+  through the `store`/`extract` module path directly).
+  `SUBSCRIPTION_CAP_ERROR_CODE` (`serve/mod.rs`) dropped its `pub`
+  entirely — its only reader is `slots`, a child module, which sees
+  module-private items without one.
+- **R1 comments**: fixed every phase/spec-section reference this round's
+  files still carried — `interop/mod.rs`'s module doc ("a later phase" →
+  "not checked here"), `store.rs`'s module doc (dropped "(spec §5)"),
+  `verify/mod.rs` (three sites: "later phase" in `RemoteEpochVerifier`'s
+  doc and in `observe`'s comment, both rewritten to state the invariant
+  directly; "§10's one-node-not-one-process-per-peer shape" rewritten
+  without the section reference), `verify/tests.rs` ("§11:" prefix
+  dropped, rest of the sentence was already self-contained). Deduped the
+  `u8::try_from(block).expect("fixture block < 256")` fixture pattern
+  (`interop/mod.rs:31`, `store.rs`'s attestation-ring test) into one
+  `fixture_block_byte(block: u64) -> u8` helper.
+- **R12/R10**: `NonEmptyVec::new`'s `Vec::with_capacity(rest.len() + 1)`
+  became `rest.len().saturating_add(1)`. `slots.rs`'s `per_dest + 1` /
+  `total += 1` became `saturating_add(1)`. `xchain/mod.rs`'s
+  `keccak_concat` lost its manual `for p in parts { buf.extend_from_slice
+  (p) }` loop in favor of `keccak256(parts.concat())`. `Ready::execute`
+  (`wiring/run.rs`, 83 code lines) was reviewed against R2's 51-100
+  judgment clause and left as one function: it is a single destructure
+  into the pieces `Executor::run`/`Shutdown` need, plus one spawn and one
+  await — splitting it would mean threading `cluster_guard`/`writer`/`rt`
+  (whose drop ORDER is a documented correctness requirement, see
+  `Shutdown::wait`) across a function boundary as a tuple or new struct,
+  for no reduction in real complexity. Considered and declined.
+- **Behavior changes**: `derive_remote_epoch`'s bounds-check order was
+  restored — `batch.ordered.iter().try_for_each(|m| m.check_bounds())?`
+  now runs on the borrowed `OutboxMessage`s BEFORE `check_one_block()` and
+  before `to_xchain_message`'s copy into `Bytes` (this round's earlier
+  refactor had moved it after both, so a batch that spans two blocks AND
+  carries an over-cap message wasted a copy before failing on the wrong
+  reason — `MultiBlockBatch` instead of `Bounds`). A new `OutboxMessage::
+  check_bounds` (mirroring `XChainMessage::check_bounds`, same
+  `BoundsFault` variants) runs on the pre-copy borrowed message; the
+  post-copy `messages.iter().try_for_each(XChainMessage::check_bounds)`
+  call is gone. Added
+  `a_multi_block_batch_with_an_over_cap_message_faults_on_bounds_first` to
+  `crates/types/src/xchain/tests.rs`, asserting `Bounds`, not
+  `MultiBlockBatch`. `genesis.rs`'s `Genesis::to_alloc` walked
+  `self.alloc` twice, calling `AllocEntry::code_hash()` (one `keccak256`
+  per code-carrying entry) from both passes; now one `.map(...).unzip()`
+  pass computes `code_hash` once per entry and reuses it for both the
+  `AccountChange` and the optional `CodeEntry`. `AllocEntry::code_entry()`
+  (the now-dead second-pass helper) is deleted.
+- **`.expect`/`.unwrap`**: `serve/slots.rs`'s two `self.inner.lock()
+  .unwrap()` sites (`Slots::take`, `SlotGuard::drop`) became `.lock()
+  .unwrap_or_else(std::sync::PoisonError::into_inner)`, each with a
+  comment explaining why: `SlotCounts`'s two fields are independent
+  counters with no cross-field invariant a partial write under panic
+  could break, and `Drop` cannot return an error regardless.
+
+### Workspace build (this follow-up)
+
+`cargo check --workspace --all-features --all-targets` is not clean; every
+failure is in a crate this group does not own:
+
+- `crates/bench/src/bin/kardamom-stm-p2.rs` (35 errors) and
+  `crates/bench/tests/{alloc_profile,defi_on_engine}.rs` — `PoolConfig`
+  field-shape drift (`dispatch_by_sender`/`eager_chain`/`bag_scheduler`/
+  `sticky_assign` no longer exist; `workers`/`prune_batch`/`admit_shards`
+  are now `NonZero*`), `execute_tx`/`execute_once`'s signature drift
+  (`TxSlot` vs `TxIndex`, dropped `BPosition`/`u64` args),
+  `run_block_prepared`/`execute_block_sequential_decoded` argument-shape
+  drift, `kardamom_stm::execute::prepare` now private, `LayerBinder::
+  bind_with` missing. All `kardamom-bench`/`kardamom-stm` — not this
+  group's crates.
+- `crates/e2e/src/harness/mod.rs:151` — `spawn_interop_watcher`'s
+  `cursor_reconcile: CursorReconcile` parameter fed an `Option<&str>`.
+  `crates/e2e` — not this group's crate.
+
+`kardamom-types` and `kardamom-validator` (`--all-features --all-targets`,
+minus the non-owned `crates/validator/tests/witness_anchoring.rs`, whose
+`needless_for_each` clippy-pedantic finding belongs to the group that owns
+`tests/`) both check, build, and test clean in isolation.
+
+### Gates (follow-up 2, final state)
+
+- `cargo check -p kardamom-types --all-features --all-targets`: clean.
+- `cargo check -p kardamom-validator --lib --bins`: clean.
+- `cargo test -p kardamom-types --lib`: all tests pass (71 total, `xchain`
+  module: 31).
+- `cargo test -p kardamom-validator --lib`: 90 passed, 0 failed.
+- `cargo fmt -p kardamom-types -- --check`: clean.
+- `cargo fmt -p kardamom-validator -- --check`: clean.
+- `cargo clippy -p kardamom-types --all-features --all-targets -- -D
+  warnings -D clippy::pedantic -D unreachable_pub`: clean.
+- `cargo clippy -p kardamom-validator --lib --bins --all-features -- -D
+  warnings -D clippy::pedantic`: clean. The same command with `-D
+  unreachable_pub` added fails, but only on 4 pre-existing, non-owned
+  items in `crates/state/src/checkpoint/manifest.rs:46,57` and
+  `crates/state/src/trie/mod.rs:67,84` (that crate is a dependency of
+  `kardamom-validator`, so `-D unreachable_pub` on the `-p
+  kardamom-validator` invocation still compiles and lints it) — not this
+  group's crate.
+- Forbidden-pattern grep (`debug_assert!`, `.max(1)`, `Box<dyn`,
+  `allow(clippy::too_many_arguments)`) over every file this group owns:
+  clean, zero hits.
+- Addendum item (coordinator, mid-round): `crates/validator/src/bin/
+  kardamom-validator/wiring/run.rs`'s `TxReceiptsChain`/`ReceiptsTee`
+  already used `kardamom_engine::Either`, not `Box<dyn
+  TxReceiptsPublication>`, by the time this round reached it — confirmed
+  via grep (zero `Box::new`/`Box<dyn`/`TxReceiptsPublication` hits in the
+  file). No change needed.
+
+Working-copy change id: `pryrnqkovrrqmplqpyowwtukmusxkmwn` (`jj log -r @
+-T change_id`). `jj commit`/`describe`/`new` are forbidden by the brief,
+so this is reported in place of a commit id — it is the id of the shared
+working-copy revision every group's edits land on.
+
+### Self-review pass (before reporting done)
+
+A second reviewer pass caught one real defect in the `Verify` impl above:
+it computed `first_seq + (len - 1)` (proving `last_seq` fits) instead of
+`first_seq + len` (proving room for `next_cursor`, the bound the ruling
+actually specifies and the producer/validator's two other guards check).
+Concretely, a record with `first_seq: u64::MAX` and one message would have
+decoded despite being unproduceable by `derive_remote_epoch` and rejected
+by `LaneCheck`. Fixed to `first_seq.checked_add(len).is_none()`, matching
+the ruling exactly; added
+`an_archive_whose_seq_range_overflows_u64_fails_to_decode` to
+`xchain/tests.rs` (a positive and negative control at the exact boundary)
+— it passed against the fix and would have caught the original off-by-one.
+Also fixed: `NonEmptyVec::len`'s `unwrap_or(NonZeroUsize::MIN)` fallback
+(a `.max(1)`-shaped sentinel in disguise) simplified to
+`NonZeroUsize::MIN.saturating_add(rest.len())`, no `Option` involved;
+three stale intra-doc links in `verify/mod.rs` (`[check_lane_position]`/
+`[check_messages]`, from before the `LaneCheck` conversion) repointed to
+`LaneCheck::lane_position`/`LaneCheck::messages`; the "Findings worked"
+`combine_with_sibling` bullet above got the one-sentence "stays standalone
+because" note it was missing. The three reverted call sites
+(`egress.rs`/`ingress.rs`/`watcher.rs`) were checked against `jj file show
+-r @- <path>` rather than just asserted — all match, modulo the
+already-existing `NonEmptyVec`-era `.get()` and dead-empty-check removals
+from an earlier, unrelated round.
+
+One more concurrent-edit fix, caught by the final gate re-run:
+`ChannelsConfig::tx_bal_channel` changed type from `String` to `ChannelUri`
+(a `kardamom-log`-owned change, mid-round). Updated `BalPump::bal_channel`
+to `ChannelUri` and the two `open_bal_sub` call sites to `.as_str()`; no
+other logic changed.
+
+## Round B, follow-up 2 — coordinator rejection and fixes
+
+The coordinator rejected two declines from the report above (the
+`AttesterKey` Phase-B-unit deferral, and the `Ready::execute` split) and
+named a third item (narrow `crates/state`'s 4 pre-existing
+`unreachable_pub` sites, since nobody else owns that crate this round).
+All three addressed; two coordinator addenda for other groups' concurrent
+renames (`ChannelUri`, `Either`) folded in along the way.
+
+### (1) The Phase B newtype unit
+
+Did every one of the six newtypes named in the "Deferred to Phase B" list
+above where the file is owned by this group; the two that are not are
+named, not silently skipped.
+
+- **`AttesterKey`** (`args.rs`): wraps `PrivateKeySigner`, parsed once at
+  the CLI boundary via `value_parser = AttesterKey::parse` (the old
+  `resolve_attester_key` body, now private and called from there). Clap
+  resolves `env:VAR` and validates the hex at `Args::parse()` time
+  instead of lazily inside `Written::spawn_attester`. `#[derive(Debug,
+  Clone)]`: safe because `PrivateKeySigner`'s own `Debug` impl prints
+  only the address and chain id, never the key material (checked against
+  `alloy-signer-local`'s source before deriving). `pipeline.rs`'s
+  `spawn_attester` now takes `key.into_signer()` instead of calling
+  `resolve_attester_key(key)?`.
+- **L1 RPC `Url`** (`args.rs`): `l1_rpc_url: Option<String>` became
+  `Option<reqwest::Url>`, parsed once via `value_parser = parse_l1_rpc_url`.
+  This removed the re-parse at BOTH of its two call sites, not one:
+  `pipeline.rs`'s `spawn_attester` (`url.parse().context(...)?` → the
+  already-typed value) and `run.rs`'s `build_epoch_observer` (same
+  pattern, not previously flagged by the review but caught while making
+  this change) — the second site's fix made `build_epoch_observer`
+  (and its caller, `run_ports`) provably infallible, so both lost their
+  `Result` return type per `clippy::unnecessary_wraps` (pedantic), not a
+  judgment call.
+- **`PostInterval`** (`args.rs`): wraps the already-`NonZeroU64`
+  `attester_post_interval`. The CLI boundary was already
+  `NonZero`-typed (R13's substance was already satisfied), so this adds
+  a semantic name distinguishing "blocks between L1 posts" from other
+  `NonZeroU64` CLI values this crate threads (for example
+  `RetentionBlocks`), rather than fixing a live defect.
+- **`RetentionBlocks`** (`interop/store.rs`, then threaded through
+  `args.rs`): wraps `NonZeroU64` for `FeedStore::new`/
+  `AttestationStore::new`'s `retention_blocks` parameter and the CLI's
+  `feed_retention_blocks` field. Re-exported from `interop::mod`
+  alongside `FeedStore`/`AttestationStore`. Every internal call site
+  (`interop/serve/tests.rs`, `interop/sink.rs`, `interop/store.rs`'s own
+  tests) updated — each had a local `nz(u64) -> NonZeroU64` fixture
+  helper; all three now return `RetentionBlocks` instead, so no call
+  site needed its own wrap.
+- **`WorkerCount`** (`args.rs`, resolved in `run.rs`'s
+  `build_block_exec`): the CLI's `--validation-workers 0`-means-auto
+  sentinel — previously a bare `usize` re-interpreted via
+  `NonZeroUsize::new(..).is_none()` at the one call site — is now parsed
+  once into `WorkerCount::Auto | WorkerCount::Fixed(NonZeroUsize)`.
+  `build_block_exec`'s resolution logic (the `AUTO_WORKER_CAP`/
+  `MAX_WORKERS`/`FALLBACK_WORKERS` constants and their `.min()` calls) is
+  unchanged — only the sentinel-vs-typed-value shape at the boundary
+  changed. `main.rs` (the doc's other named file for this item) has no
+  `WorkerCount`-relevant code any more; the doc's `main.rs:378` reference
+  was stale (files have moved substantially over this session's rounds).
+- **Not done — not owned**: `parallel/claims.rs`'s `BatchSize` and
+  `parallel/engine.rs`'s worker-count consumption. Checked both: every
+  internal call site in `parallel/claims.rs`/`parallel/engine.rs`
+  already takes `NonZeroUsize` (not a bare `usize`) for both batch size
+  and worker count — the R9/R13 boundary-safety property these two rows
+  named is already satisfied end to end; what remains is a purely
+  cosmetic rename (`NonZeroUsize` → a named `BatchSize`/`WorkerCount`
+  type) entirely inside files `crates/validator/src/parallel/**` this
+  group does not own.
+
+### (2) `Ready::execute` split
+
+Split into `Ready::run_engine` (spawns the engine loop on a blocking
+task, gathers everything shutdown needs into a new `Running` struct) and
+`Running::shutdown_in_order` (builds `Shutdown`, awaits `.wait()`, calls
+`finish`). `execute` is now `self.run_engine(ports)
+.shutdown_in_order().await` — two sequential calls, so the shutdown
+order `Shutdown::wait` enforces is unchanged (nothing interleaves the
+two steps; `run_engine` is not `async`, so there is no await point
+between spawning the engine task and building `Running`). No field, no
+drop-order change: `Running` carries exactly the values `Shutdown` and
+`finish` already needed, just gathered under one name instead of a
+36-line nested destructure staying live across both halves.
+
+### (3) `crates/state`'s `unreachable_pub` items
+
+Narrowed all 4 (nobody else owns `crates/state` this round, confirmed
+with the coordinator's own message): `CheckpointManifest::encode`/
+`::parse` (`crates/state/src/checkpoint/manifest.rs`) and
+`StateRoot::storage_root_incremental`/`::state_root_incremental`
+(`crates/state/src/trie/mod.rs`) all went from `pub` to `pub(crate)`.
+Checked each for cross-crate external use first (grep, workspace-wide):
+zero hits for all 4 — `CheckpointManifest`'s containing module
+(`checkpoint::manifest`) is private, and only re-exported at
+`pub(crate)` from `checkpoint::mod`, so `encode`/`parse` were never
+externally reachable regardless of their own `pub`; `StateRoot` itself
+is already `pub(crate)`, same story. `cargo check -p kardamom-state
+--lib --all-features`: clean.
+
+### Two coordinator addenda for other groups' renames
+
+- `kardamom_log::config::ChannelsConfig::tx_bal_channel` changed type to
+  `ChannelUri` (from `String`) — already fixed earlier this round (see
+  the "One more concurrent-edit fix" note above); re-confirmed clean
+  after this round's further edits, no `.to_string()` anywhere.
+- `kardamom_engine`'s `Either`-based `TxReceiptsChain`/`ReceiptsTee` in
+  `wiring/run.rs` — already confirmed clean earlier this round (zero
+  `Box::new`/`Box<dyn`/`TxReceiptsPublication` hits).
+
+### Gates (follow-up 2, after the coordinator's rejection)
+
+- `cargo check -p kardamom-validator --lib --bins`: clean.
+- `cargo test -p kardamom-validator --lib`: 90 passed, 0 failed
+  (unchanged — none of this round's items touch tested behavior; the
+  `AttesterKey`/`Url`/`WorkerCount`/`PostInterval`/`RetentionBlocks`
+  newtypes and the `execute` split have no dedicated unit tests of their
+  own, since they are CLI-parsing and wiring-glue types exercised by the
+  binary's `--help`/startup path, not the library's test suite).
+- `cargo clippy -p kardamom-validator --lib --bins --all-features -- -D
+  warnings -D clippy::pedantic -D unreachable_pub`: clean — the 4
+  `crates/state` blockers from the report above are gone (fixed in
+  (3)); no new pedantic findings from this round's own changes except
+  two caught and fixed along the way (`unnecessary_wraps` on
+  `build_epoch_observer` and `run_ports`, both now infallible — see (1)
+  above).
+- Forbidden-pattern grep: unchanged, clean.
+- `cargo check -p kardamom-validator --all-features --all-targets`
+  (the full gate, `--all-targets` this time): still blocked, but only by
+  the pre-existing, non-owned `crates/validator/tests/{witness_anchoring,
+  stateless_reexec,prover_spool}.rs` (a `Granularity: NonZeroU16` wire
+  change from another group landed mid-round; `witness.rs`'s
+  `reexecute_stateless` and `exec-core`'s `execute_block_anchored` both
+  now take `NonZeroU16`, and the non-owned integration tests under
+  `crates/validator/tests/` still pass bare integers). Not this group's
+  files to fix (`witness.rs` and `tests/` are both explicitly excluded
+  from this group's ownership).
+
+### Final gate re-run, after `kardamom-stm` unblocked
+
+`kardamom-stm` (a hard dependency of `kardamom-validator`) was mid an
+unrelated `AccountFields` tuple-to-struct migration for a stretch of this
+round, which blocked even a plain `cargo check -p kardamom-validator`
+(not just clippy). Once it cleared (and, immediately after, a second,
+related blocker in the non-owned `crates/validator/src/parallel/engine.rs`
+— `kardamom_exec_core::delta::AccountFields` referenced from a
+`[dev-dependencies]`-only crate — also cleared), the full gate ran clean:
+
+- `cargo check -p kardamom-validator --lib --bins --all-features`: clean.
+- `cargo check -p kardamom-validator --all-features --all-targets`:
+  blocked only by the same non-owned `crates/validator/tests/{prover_spool,
+  witness_anchoring,stateless_reexec}.rs` `NonZero<u16>`/`AccountFields`
+  drift named above — confirmed still the ONLY remaining blocker
+  workspace-wide for this crate (grep-checked every error's file path).
+- `cargo clippy -p kardamom-validator --lib --bins --all-features -- -D
+  warnings -D clippy::pedantic -D unreachable_pub`: **clean** — this is
+  the first time this exact command (the one the coordinator asked for)
+  has passed this round; the 4 `crates/state` blockers are gone.
+- `cargo test -p kardamom-validator --lib`: 90 passed, 0 failed.
+- `cargo fmt -p kardamom-validator -- --check`: clean.
+- Forbidden-pattern grep over every file this group owns: clean, zero
+  hits.
+
+### Two more coordinator addenda, folded in
+
+- Added `kardamom-obs = { path = "../obs", features = ["test-support"] }`
+  to `crates/validator/Cargo.toml`'s `[dev-dependencies]`, for group D's
+  planned `crates/validator/tests/prover_spool.rs` switch to
+  `kardamom_obs::testkit::poll_sync`. Confirmed it does not itself break
+  anything (`cargo check -p kardamom-validator --lib --bins
+  --all-features`: clean, both before and after).
+- `BatchSize` (`crates/validator/src/parallel/claims.rs`, the sixth
+  newtype of the Phase B unit named in the coordinator's first message
+  this round) is a caller-request note for group B, which owns
+  `parallel/`: every internal call site in `parallel/claims.rs` and
+  `parallel/engine.rs` already takes `NonZeroUsize` for both batch size
+  and worker count (grep-confirmed) — the R9/R13 boundary-safety
+  property is already satisfied end to end. What remains is a purely
+  cosmetic rename (`NonZeroUsize` → a named `BatchSize` type) entirely
+  inside files this group does not own; group B can pick it up as a
+  same-shape follow-up to `RetentionBlocks`/`PostInterval`/`WorkerCount`
+  above if desired.
+
+### Working-copy change id (this message)
+
+`pryrnqkovrrqmplqpyowwtukmusxkmwn` — unchanged from the report above;
+`jj commit`/`describe`/`new` remain forbidden by the brief. Gate log:
+`/tmp/claude-1001/-home-dev-kardamom-8/82f05a13-355f-46c2-a8c7-87b2c1c5036b/scratchpad/gate-roundb-A-2.log`.

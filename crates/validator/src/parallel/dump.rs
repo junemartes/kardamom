@@ -131,8 +131,8 @@ pub(super) fn dump_divergence_inputs(
         "granularity": granularity.get(),
         "error": format!("{err:?}"),
         "records": records_json(records),
-        "parent_accounts": parent.map(|p| p.accounts.iter().map(|(a, (n, b, c))| serde_json::json!({
-            "addr": format!("{a:?}"), "nonce": n, "balance": b.to_string(), "code_hash": format!("{c:?}"),
+        "parent_accounts": parent.map(|p| p.accounts.iter().map(|(a, f)| serde_json::json!({
+            "addr": format!("{a:?}"), "nonce": f.nonce, "balance": f.balance.to_string(), "code_hash": format!("{:?}", f.code_hash),
         })).collect::<Vec<_>>()),
         "parent_storage": parent.map(|p| p.storage.iter().map(|((a, k), v)| serde_json::json!({
             "addr": format!("{a:?}"), "slot": format!("{k:?}"), "value": v.to_string(),

@@ -60,6 +60,98 @@ impl std::fmt::Display for BasePort {
     }
 }
 
+/// A non-empty Aeron channel URI (`aeron:ipc?...`, `aeron:udp?...`).
+/// Parsed once at the config boundary (TOML deserialization), so a blank
+/// channel string fails config load, not a runtime `add_publication`/
+/// `add_subscription` call deep in a service's startup path.
+///
+/// `Deref<Target = str>` lets every existing `&cfg.some_channel` call
+/// site keep working unchanged through deref coercion; callers that need
+/// an owned `String` (for example a runtime command struct field) use
+/// [`Self::as_str`] or `.to_string()`.
+///
+/// `tx_receipts_control_channel` is the one channel field that stays a
+/// plain `String`: an empty string there is the "MDS off" sentinel (see
+/// `ChannelsConfig::tx_receipts_mds_enabled`), not a URI. The two
+/// `*_channel_template` fields also stay `String`: a template like
+/// `"aeron:ipc?alias=a-{sid}"` is not a valid URI until `{sid}` is
+/// substituted.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ChannelUri(String);
+
+impl ChannelUri {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Build a `ChannelUri` from a runtime-constructed, already-known
+    /// non-empty string (for example one assembled with `format!` from a
+    /// resolved endpoint), skipping the empty-string check
+    /// [`TryFrom<String>`] applies to config-file input. Named, rather
+    /// than a plain `From<String>`, so trusting the caller is visible at
+    /// the call site.
+    #[must_use]
+    pub fn new_trusted(uri: String) -> Self {
+        Self(uri)
+    }
+}
+
+impl TryFrom<String> for ChannelUri {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.is_empty() {
+            return Err("a channel URI must not be empty".to_string());
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<ChannelUri> for String {
+    fn from(value: ChannelUri) -> Self {
+        value.0
+    }
+}
+
+/// Trusts the literal: every call site is a compile-time default in this
+/// module, already reviewed as a valid, non-empty URI. TOML-sourced
+/// values go through the fallible [`TryFrom<String>`] above instead.
+impl From<&str> for ChannelUri {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl std::ops::Deref for ChannelUri {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ChannelUri {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Lets a test (or any other caller) compare a `ChannelUri` field against
+/// a string literal directly, without `.as_str()`.
+impl PartialEq<str> for ChannelUri {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for ChannelUri {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 // `Default` is derived. It composes the per-struct `Default` impls below.
 // Each section defaults independently, which is what lets a TOML file
 // specify only `[channels]` and inherit the rest.
@@ -147,11 +239,11 @@ pub struct AeronConfig {
     /// simpler and avoids the UDP control handshake, whose response cannot
     /// reliably route back to a co-located client. Only the recorder
     /// connects an `AeronArchive`, so the pipeline services do not use this.
-    pub archive_control_request_channel: String,
+    pub archive_control_request_channel: ChannelUri,
 
     /// Archive control response channel. Also `aeron:ipc`; responses ride
     /// the shared media driver back to the recorder.
-    pub archive_control_response_channel: String,
+    pub archive_control_response_channel: ChannelUri,
 
     /// Remote durability-archive control endpoints (`host:port`) whose
     /// archives record the `tx_data` streams (the ingress nodes). `tx_data` is
@@ -188,7 +280,7 @@ pub struct ChannelsConfig {
     /// publication still names this stream id, and the archive recorder
     /// (`RecorderKind::TxOrdering`) records frames from it for the
     /// durable-watermark path.
-    pub tx_ordering_channel: String,
+    pub tx_ordering_channel: ChannelUri,
     pub tx_ordering_stream_id: i32,
 
     /// `TxReceipts`: receipts and block boundaries. Not recorded.
@@ -196,7 +288,7 @@ pub struct ChannelsConfig {
     /// Single-host/IPC default: one shared channel (`tx_receipts_channel`)
     /// that the lone executor publishes to, and that ingress subscribes to
     /// directly.
-    pub tx_receipts_channel: String,
+    pub tx_receipts_channel: ChannelUri,
     pub tx_receipts_stream_id: i32,
 
     /// `TxReceipts` MDS (multi-host fan-in). When
@@ -238,22 +330,27 @@ pub struct ChannelsConfig {
     /// executor job runs a fixed `count` with `distinct_hosts`, so replica
     /// indices stay stable at `0..N`. A replica that restarts keeps its
     /// index and its endpoint, so the static attach stays correct across
-    /// restarts. This value must match the executor job `count`. 0 (the
-    /// default) is fine when MDS is disabled.
+    /// restarts. This value must match the executor job `count`. `None`
+    /// (the default) is fine when MDS is disabled.
+    ///
+    /// Migration: a config written when this field was a plain `u32`
+    /// may spell "no known count" as `tx_receipts_executor_count = 0`.
+    /// That now fails to load (`0` is not a `NonZeroU32`); omit the key
+    /// instead, which defaults to `None` and means the same thing.
     #[serde(default)]
-    pub tx_receipts_executor_count: u32,
+    pub tx_receipts_executor_count: Option<std::num::NonZeroU32>,
 
     /// `TxErrors`: sequencer-emitted rejection signals (duplicate or
     /// past-nonce today; more variants may follow). RAM only, not
     /// recorded: an operational signal, not canonical state.
-    pub tx_errors_channel: String,
+    pub tx_errors_channel: ChannelUri,
     pub tx_errors_stream_id: i32,
 
     /// `TxDeposits`: the DA watcher publishes full `Deposit` envelopes here.
     /// The M sequencers subscribe and republish a `DepositRef` onto
     /// `tx_ordering`, so the canonical order interleaves L1 deposits with
     /// regular L2 transactions. RAM only.
-    pub tx_deposits_channel: String,
+    pub tx_deposits_channel: ChannelUri,
     pub tx_deposits_stream_id: i32,
 
     /// `TxRemoteEpochs`: the interop watcher publishes one `RemoteEpochRecord`
@@ -263,7 +360,7 @@ pub struct ChannelsConfig {
     /// `tx_deposits`, but for a peer Kardamom chain instead of L1. It uses a
     /// separate stream because the two origins advance independently, and a
     /// stalled peer must not hold up L1 deposits. RAM only.
-    pub tx_remote_epochs_channel: String,
+    pub tx_remote_epochs_channel: ChannelUri,
     pub tx_remote_epochs_stream_id: i32,
 
     /// `TxBal`: the per-block BAL (Block Access List; the executor's
@@ -273,7 +370,7 @@ pub struct ChannelsConfig {
     /// see one copy per replica, which is harmless, because inserts are
     /// idempotent overwrites keyed by block number. Validators subscribe
     /// and cross-check their independent re-execution against it. RAM only.
-    pub tx_bal_channel: String,
+    pub tx_bal_channel: ChannelUri,
     pub tx_bal_stream_id: i32,
 
     /// `TxOrdering` per-recorder fsync watermark publication, parameterized
@@ -290,7 +387,7 @@ pub struct ChannelsConfig {
     pub fsync_watermark_tx_data_stream_id_base: i32,
 
     /// Aggregated quorum watermark (`tx_ordering`).
-    pub quorum_watermark_channel: String,
+    pub quorum_watermark_channel: ChannelUri,
     pub quorum_watermark_stream_id: i32,
 }
 
@@ -335,8 +432,10 @@ impl ChannelsConfig {
                      tx_receipts_control_channel enables MDS"
                     .to_string());
             };
-            let highest =
-                i64::from(base.get()) + 2 * i64::from(self.tx_receipts_executor_count) + 1;
+            let executor_count = self
+                .tx_receipts_executor_count
+                .map_or(0, std::num::NonZeroU32::get);
+            let highest = i64::from(base.get()) + 2 * i64::from(executor_count) + 1;
             if highest > i64::from(u16::MAX) {
                 return Err(format!(
                     "tx_receipts_endpoint_base_port ({base}) invalid with MDS enabled \
@@ -535,7 +634,7 @@ impl Default for ChannelsConfig {
             tx_receipts_endpoint_host: String::new(),
             tx_receipts_endpoint_base_port: None,
             tx_receipts_endpoint_interface: String::new(),
-            tx_receipts_executor_count: 0,
+            tx_receipts_executor_count: None,
             tx_errors_channel: "aeron:ipc?alias=tx-errors".into(),
             // 1003 collides with `tx_receipts_stream_id + 1` (the
             // BlockBoundary side-stream). Aeron IPC routes by stream_id

@@ -16,8 +16,10 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use kardamom_da_watcher::interop::CursorReconcile;
 
-use super::proc::{ExistingFile, Proc, free_tcp_port, free_udp_port};
+use super::proc::{ExistingFile, Proc};
+use kardamom_obs::testkit::{free_port, free_udp_port};
 
 /// How long an Aeron client waits for a media driver to update its
 /// keepalive before it decides the driver is dead and shuts down.
@@ -202,7 +204,7 @@ pub struct L1Wiring {
 /// Returns an error when the binary is not built or the process fails to
 /// spawn.
 pub fn spawn_da_watcher(spec: &ServiceSpec<'_>, l1: &L1Wiring) -> Result<Spawned> {
-    let metrics_port = free_tcp_port()?;
+    let metrics_port = free_port().port();
     let mut cmd = Command::new(bin("kardamom-da-watcher")?);
     cmd.args(["--l1-rpc", &l1.rpc_url])
         .args(["--lockbox", &l1.lockbox])
@@ -241,9 +243,9 @@ pub fn spawn_interop_watcher(
     origin_chain_id: u64,
     feed_url: &str,
     cursor_file: &Path,
-    dest_rpc: Option<&str>,
+    cursor_reconcile: &CursorReconcile,
 ) -> Result<Spawned> {
-    let metrics_port = free_tcp_port()?;
+    let metrics_port = free_port().port();
     let mut cmd = Command::new(bin("kardamom-da-watcher")?);
     cmd.args(["--interop-peer-chain-id", &origin_chain_id.to_string()])
         .args(["--interop-feed-url", feed_url])
@@ -253,14 +255,13 @@ pub fn spawn_interop_watcher(
     // The startup cursor reconcile needs a destination JSON-RPC that
     // serves eth_getStorageAt (the validator's --serve-feed endpoint). A
     // stack without one skips the reconcile, which is the test-only path.
-    match dest_rpc {
-        Some(url) => {
-            cmd.args(["--interop-dest-rpc", url]);
-        }
-        None => {
-            cmd.arg("--interop-skip-cursor-reconcile");
-        }
-    }
+    // `CursorReconcile::cli_args` is the same flag-building code the
+    // binary itself parses back, so the harness and the binary name one
+    // thing one way. Taking `CursorReconcile` here, instead of
+    // `Option<&str>`, means the caller builds the pair, and the invalid
+    // "a URL that is somehow also skip" state cannot exist at this
+    // boundary.
+    cmd.args(cursor_reconcile.cli_args());
     cmd
         // 1 s (vs the 2 s default) keeps feed-retry latency inside a test's
         // patience, mirroring the L1 watcher's tightened poll interval.
@@ -326,8 +327,8 @@ pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
         spec.shards
     );
     let cfg_path = spec.write_cluster_config(&format!("sequencer-{index}"), &prefix)?;
-    let metrics_port = free_tcp_port()?;
-    let egress_port = free_udp_port()?;
+    let metrics_port = free_port().port();
+    let egress_port = free_udp_port().port();
     let mut cmd = Command::new(bin("kardamom-sequencer")?);
     cmd.arg("--config")
         .arg(&cfg_path)
@@ -364,18 +365,17 @@ pub fn spawn_executor(spec: &ServiceSpec<'_>) -> Result<Spawned> {
 /// durability-archive endpoints (the archive-durability variant). Without
 /// it, a restarted executor cannot get envelopes for canonical records
 /// replayed from before the crash, and aborts by design.
-fn add_archive_endpoints(cmd: &mut Command, spec: &ServiceSpec<'_>) -> Result<()> {
+fn add_archive_endpoints(cmd: &mut Command, spec: &ServiceSpec<'_>) {
     if spec.log_config.is_some() {
         cmd.args([
             "--replay-destination-endpoint",
-            &format!("127.0.0.1:{}", free_udp_port()?),
+            &format!("127.0.0.1:{}", free_udp_port().port()),
         ])
         .args([
             "--archive-control-response-endpoint",
-            &format!("127.0.0.1:{}", free_udp_port()?),
+            &format!("127.0.0.1:{}", free_udp_port().port()),
         ]);
     }
-    Ok(())
 }
 
 /// Spawn the executor, or respawn it. `fixed_metrics_port` reuses a
@@ -396,9 +396,9 @@ pub fn spawn_executor_at(
     std::fs::create_dir_all(&state_dir)?;
     let metrics_port = match fixed_metrics_port {
         Some(p) => p,
-        None => free_tcp_port()?,
+        None => free_port().port(),
     };
-    let egress_port = free_udp_port()?;
+    let egress_port = free_udp_port().port();
     let mut cmd = spec.state_service_cmd(&StateService {
         bin_name: "executor",
         state_dir: &state_dir,
@@ -412,7 +412,7 @@ pub fn spawn_executor_at(
     // coverage in CI. Its per-block summary lines land in executor.log.
     cmd.env("KARDAMOM_FOOTPRINT_SHADOW", "1");
     with_log_config(&mut cmd, spec);
-    add_archive_endpoints(&mut cmd, spec)?;
+    add_archive_endpoints(&mut cmd, spec);
     common_service_env(&mut cmd);
     // A respawn logs to its own file, so the pre-crash log survives for
     // later inspection (`Proc::spawn` truncates its log file).
@@ -483,8 +483,8 @@ fn add_attester_args(cmd: &mut Command, opts: &ValidatorOptions<'_>) {
 pub fn spawn_validator(spec: &ServiceSpec<'_>, opts: &ValidatorOptions<'_>) -> Result<Spawned> {
     let state_dir = spec.root.join("validator-state");
     std::fs::create_dir_all(&state_dir)?;
-    let metrics_port = free_tcp_port()?;
-    let egress_port = free_udp_port()?;
+    let metrics_port = free_port().port();
+    let egress_port = free_udp_port().port();
     let mut cmd = spec.state_service_cmd(&StateService {
         bin_name: "validator",
         state_dir: &state_dir,
@@ -551,9 +551,11 @@ pub struct IngressOptions {
 impl Default for IngressOptions {
     fn default() -> Self {
         const THIRTY_SECS: std::num::NonZeroU64 = std::num::NonZeroU64::new(30).unwrap();
+        const DEFAULT_RPC_MAX_CONNECTIONS: std::num::NonZeroU32 =
+            std::num::NonZeroU32::new(8192).unwrap();
         Self {
             pending_receipt_timeout: ParkTimeout::from_secs(THIRTY_SECS),
-            rpc_max_connections: std::num::NonZeroU32::new(8192).unwrap(),
+            rpc_max_connections: DEFAULT_RPC_MAX_CONNECTIONS,
         }
     }
 }
@@ -569,8 +571,8 @@ pub struct SpawnedIngress {
 /// cannot be written, or when the process fails to spawn.
 pub fn spawn_ingress(spec: &ServiceSpec<'_>, opts: &IngressOptions) -> Result<SpawnedIngress> {
     let cfg_path = spec.write_cluster_config("ingress", "")?;
-    let metrics_port = free_tcp_port()?;
-    let rpc_port = free_tcp_port()?;
+    let metrics_port = free_port().port();
+    let rpc_port = free_port().port();
     let mut cmd = Command::new(bin("kardamom-ingress")?);
     cmd.arg("--config")
         .arg(&cfg_path)

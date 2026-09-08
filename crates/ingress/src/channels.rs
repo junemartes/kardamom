@@ -11,7 +11,8 @@
 //! Wire types come only from [`types`]. This module defines no new wire
 //! types.
 
-use async_trait::async_trait;
+use std::future::Future;
+
 use tokio::sync::{broadcast, mpsc};
 
 use kardamom_types::{
@@ -23,14 +24,16 @@ use crate::error::IngressError;
 /// Publisher surface. The proxy writes validated `TxEnvelope`s onto the
 /// sender-sharded `tx_data` streams. `partition_for(envelope.sender, K)`
 /// gives the shard index.
-#[async_trait]
 pub trait IngressPublication: Send + Sync + 'static {
     /// Publishes `envelope` onto `channel_A[shard]`. Multiple proxies can
     /// publish to the same shard's A stream at the same time. Aeron's
     /// shared publication semantics put them into one canonical byte
     /// order.
-    async fn publish_tx_data(&self, shard: usize, envelope: TxEnvelope)
-    -> Result<(), IngressError>;
+    fn publish_tx_data(
+        &self,
+        shard: usize,
+        envelope: TxEnvelope,
+    ) -> impl Future<Output = Result<(), IngressError>> + Send;
 }
 
 /// Subscriber surface. The proxy subscribes to the `tx_receipts` `Receipt`
@@ -103,9 +106,9 @@ impl MockChannels {
     /// a `Vec` of receivers, one per shard. The test's fake sequencer
     /// drains these.
     #[must_use]
-    pub fn new(shards: usize) -> (Self, Vec<mpsc::UnboundedReceiver<TxEnvelope>>) {
+    pub fn new(shards: std::num::NonZeroUsize) -> (Self, Vec<mpsc::UnboundedReceiver<TxEnvelope>>) {
         let (tx_vec, rx_vec): (Vec<_>, Vec<_>) =
-            (0..shards).map(|_| mpsc::unbounded_channel()).unzip();
+            (0..shards.get()).map(|_| mpsc::unbounded_channel()).unzip();
         let (receipt_bus, _) = broadcast::channel(BUS_CAPACITY);
         let (watermark_bus, _) = broadcast::channel(BUS_CAPACITY);
         let (local_fsync_bus, _) = broadcast::channel(BUS_CAPACITY);
@@ -125,20 +128,27 @@ impl MockChannels {
     }
 }
 
-#[async_trait]
 impl IngressPublication for MockChannels {
-    async fn publish_tx_data(
+    /// No `.await` in this mock: `tokio::sync::mpsc::UnboundedSender::send`
+    /// is synchronous. `std::future::ready` still satisfies the trait's
+    /// `impl Future` return without an `async fn` clippy would flag as
+    /// pointless.
+    fn publish_tx_data(
         &self,
         shard: usize,
         envelope: TxEnvelope,
-    ) -> Result<(), IngressError> {
-        self.tx_data_tx
-            .get(shard)
-            .ok_or_else(|| {
-                IngressError::PartitionUnavailable(format!("shard {shard} out of range"))
-            })?
-            .send(envelope)
-            .map_err(|e| IngressError::PartitionUnavailable(e.to_string()))
+    ) -> impl Future<Output = Result<(), IngressError>> + Send {
+        std::future::ready(
+            self.tx_data_tx
+                .get(shard)
+                .ok_or_else(|| {
+                    IngressError::PartitionUnavailable(format!("shard {shard} out of range"))
+                })
+                .and_then(|tx| {
+                    tx.send(envelope)
+                        .map_err(|e| IngressError::PartitionUnavailable(e.to_string()))
+                }),
+        )
     }
 }
 
@@ -168,7 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_routes_to_shard() {
-        let (mock, mut rx) = MockChannels::new(4);
+        let (mock, mut rx) = MockChannels::new(std::num::NonZeroUsize::new(4).unwrap());
         let env = TxEnvelope {
             correlation_id: 1,
             raw_tx: Bytes::new(),

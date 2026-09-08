@@ -4,24 +4,40 @@
 
 use kardamom_types::xchain;
 use kardamom_types::{Receipt, StateDatabase};
-use revm::ExecuteEvm;
 
 use alloc::format;
+
+use revm::database::CacheDB;
 
 use crate::delta::WriteSet;
 use crate::error::ExecutorError;
 use crate::exec_types::TxSlot;
 
-use super::derived::{CallOutcome, DerivedCall, DerivedIdentity};
+use super::db::SnapshotDb;
+use super::deposit::DepositFailure;
+use super::derived::{CallOutcome, DerivedCall, DerivedOutcome};
 use super::scope::Executor;
+use super::skip::{DerivedTxIdentity, Rejection, SkipContext};
 use super::tx_env::{tx_env_from_deposit, tx_env_from_xchain};
 
 impl<S: StateDatabase> Executor<S> {
+    /// Build a [`DerivedCall`] over this scope's block cache, for one
+    /// derived tx. Every entry point on this `impl` needs one, and none
+    /// can hold it across another `&mut self` call, so this stays a
+    /// per-call builder instead of a cached field.
+    fn derived_call(&mut self, slot: TxSlot) -> DerivedCall<'_, CacheDB<SnapshotDb<S>>> {
+        DerivedCall::new(
+            revm::context_interface::ContextTr::db_mut(&mut *self.evm),
+            &self.env,
+            slot,
+        )
+    }
+
     /// Execute a DEPOSIT on this block scope. Unlike `execute_deposit_tx`
     /// (kept as the equivalence reference, which rebuilds a fresh
     /// `CacheDB` and re-seeds parent + delta for every deposit), the
-    /// scope reuses the block cache and only toggles the nonce check for
-    /// the inner call (deposits carry no nonce).
+    /// scope reuses the block cache and only builds a throwaway EVM,
+    /// through [`DerivedCall::transact`], for the inner call.
     ///
     /// Artifact contract: receipt, `WriteSet` (called-contract code
     /// included, unchanged entries filtered out — see
@@ -29,9 +45,12 @@ impl<S: StateDatabase> Executor<S> {
     /// match `execute_deposit_tx`'s output exactly. The
     /// `old_and_new_deposit_paths_agree` test in `deposit.rs` is the gate.
     ///
-    /// Error paths fail-stop the pipeline (deposits have no skip
-    /// semantics), so a mint committed before a failed inner call cannot
-    /// leak into a later tx: nothing later runs.
+    /// A deposit that revm rejects at validation (for example an L1
+    /// `gasLimit` below the intrinsic cost) becomes a deterministic failed
+    /// receipt (`failed_deposit_receipt`): the mint stays, the inner call
+    /// never runs. Local failures (database errors) fail-stop the pipeline,
+    /// so a mint committed before such a failure cannot leak into a later
+    /// tx: nothing later runs.
     ///
     /// # Errors
     ///
@@ -45,19 +64,27 @@ impl<S: StateDatabase> Executor<S> {
     ) -> Result<(Receipt, WriteSet), ExecutorError> {
         // (1) Mint pre-credit, committed unconditionally — the mint is
         // durable regardless of inner-call outcome.
-        DerivedCall::new(
-            revm::context_interface::ContextTr::db_mut(&mut *self.evm),
-            &self.env,
-            slot,
-        )
-        .credit_mint(deposit)?;
+        self.derived_call(slot).credit_mint(deposit)?;
 
-        // (2) Inner call with the nonce check off. The toggle-restore pair
-        // has NO fallible call between toggle and restore: an early return
-        // with the toggle still set would run every later tx in the block
-        // without nonce validation.
+        // (2) Inner call with the nonce check off.
         let tx_env = tx_env_from_deposit(deposit);
-        let outcome = self.transact_without_nonce_check(slot.tx_idx, tx_env)?;
+        let outcome = match self.derived_call(slot).transact_or_skip(tx_env)? {
+            DerivedOutcome::Ran(o) => o,
+            // Deterministic input invalidity: the mint stays, the inner
+            // call never ran. Same artifact as the free function.
+            DerivedOutcome::Rejected(Rejection { reason, detail }) => {
+                let cache = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
+                return DepositFailure::from_validation::<S, _>(
+                    cache,
+                    deposit,
+                    slot,
+                    self.env.block_number,
+                    reason,
+                    &detail,
+                    bal,
+                );
+            }
+        };
         let call_outcome = CallOutcome::from(&outcome.result);
 
         // (3) The deposit artifact keeps read slots (see the extractor
@@ -72,47 +99,18 @@ impl<S: StateDatabase> Executor<S> {
             ws.record_into_bal(bal, bal_index);
         }
 
-        let receipt = DerivedCall::new(
-            revm::context_interface::ContextTr::db_mut(&mut *self.evm),
-            &self.env,
-            slot,
-        )
-        .derived_receipt(
-            DerivedIdentity {
+        let receipt = self.derived_call(slot).derived_receipt(
+            DerivedTxIdentity {
                 tx_hash: deposit.source_hash,
                 tx_type: kardamom_types::TX_TYPE_DEPOSIT,
                 from: deposit.from,
                 to: deposit.to,
+                nonce: 0,
             },
             &call_outcome,
             ws.hash(),
         )?;
         Ok((receipt, ws))
-    }
-
-    /// Toggle the nonce check off, run the inner call, and restore the
-    /// check. No fallible call sits between the toggle and its restore:
-    /// an early return with the toggle still set would run every later
-    /// tx in the block without nonce validation. Deposits and
-    /// cross-chain deliveries share this rule.
-    fn transact_without_nonce_check(
-        &mut self,
-        tx_idx: crate::exec_types::TxIndex,
-        tx_env: revm::context::TxEnv,
-    ) -> Result<
-        revm::context::result::ExecResultAndState<
-            revm::context::result::ExecutionResult,
-            revm::state::EvmState,
-        >,
-        ExecutorError,
-    > {
-        (*self.evm).modify_cfg(|c| c.disable_nonce_check = true);
-        let result = self.evm.transact(tx_env);
-        (*self.evm).modify_cfg(|c| c.disable_nonce_check = false);
-        result.map_err(|e| ExecutorError::Execution {
-            idx: tx_idx,
-            detail: format!("{e:?}"),
-        })
     }
 
     /// The sender always carries the mint in the artifact, even when the
@@ -131,8 +129,14 @@ impl<S: StateDatabase> Executor<S> {
                     detail: format!("basic({sender:?}): {e:?}"),
                 })?
                 .unwrap_or_default();
-            ws.accounts
-                .push((sender, (info.nonce, info.balance, info.code_hash)));
+            ws.accounts.push((
+                sender,
+                crate::delta::AccountFields {
+                    nonce: info.nonce,
+                    balance: info.balance,
+                    code_hash: info.code_hash,
+                },
+            ));
             ws.finish();
         }
         Ok(())
@@ -150,15 +154,16 @@ impl<S: StateDatabase> Executor<S> {
     /// match `execute_xchain_tx`'s output exactly. A gate test like
     /// `old_and_new_deposit_paths_agree` applies here too.
     ///
-    /// v1 carries no value. A nonzero `message.value` is a chain fault,
-    /// not a droppable message, so this fails the engine before it
-    /// touches the cache.
+    /// v1 carries no value. A nonzero `message.value`, or a message revm
+    /// rejects at validation (for example a `gas_limit` above the
+    /// EIP-7825 cap), becomes a deterministic failed receipt
+    /// (`failed_xchain_receipt`) before it touches the cache. Only local
+    /// failures (database errors) are engine errors.
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorError::Execution`] when `message.value` is
-    /// nonzero, the inner call fails non-deterministically, or a
-    /// database read fails.
+    /// Returns [`ExecutorError::Execution`] when the inner call fails
+    /// non-deterministically or a database read fails.
     pub fn execute_xchain(
         &mut self,
         slot: TxSlot,
@@ -166,14 +171,33 @@ impl<S: StateDatabase> Executor<S> {
         bal: Option<(&mut revm::state::bal::Bal, u64)>,
     ) -> Result<(Receipt, WriteSet), ExecutorError> {
         let origin_chain_id = delivery.origin_chain_id;
-        let message =
-            super::xchain::ValuelessMessage::new(slot.tx_idx, origin_chain_id, delivery.message)?;
+        if let Err(Rejection { reason, detail }) =
+            Executor::<S>::xchain_value_rejection(origin_chain_id, delivery.message)
+        {
+            return Ok(Executor::<S>::failed_xchain_receipt(
+                reason,
+                &detail,
+                SkipContext::new(slot, self.env.block_number),
+                origin_chain_id,
+                delivery.message,
+            ));
+        }
+        let message = super::xchain::ValuelessMessage::new(delivery.message);
 
-        // Inner call with the nonce check off. No fallible call sits
-        // between the toggle and its restore — deposits and cross-chain
-        // deliveries share this rule; see the note on `execute_deposit`.
+        // Inner call with the nonce check off.
         let tx_env = tx_env_from_xchain(origin_chain_id, &message);
-        let outcome = self.transact_without_nonce_check(slot.tx_idx, tx_env)?;
+        let outcome = match self.derived_call(slot).transact_or_skip(tx_env)? {
+            DerivedOutcome::Ran(o) => o,
+            DerivedOutcome::Rejected(Rejection { reason, detail }) => {
+                return Ok(Executor::<S>::failed_xchain_receipt(
+                    reason,
+                    &detail,
+                    SkipContext::new(slot, self.env.block_number),
+                    origin_chain_id,
+                    &message,
+                ));
+            }
+        };
         // A revert inside deliver (or a bubbled-up inner-call revert)
         // marks the receipt failed, but it is not an engine error. This
         // is the deposit posture.
@@ -189,17 +213,13 @@ impl<S: StateDatabase> Executor<S> {
         }
 
         let sender = xchain::xchain_tx_sender(origin_chain_id);
-        let receipt = DerivedCall::new(
-            revm::context_interface::ContextTr::db_mut(&mut *self.evm),
-            &self.env,
-            slot,
-        )
-        .derived_receipt(
-            DerivedIdentity {
+        let receipt = self.derived_call(slot).derived_receipt(
+            DerivedTxIdentity {
                 tx_hash: message.source_hash,
                 tx_type: kardamom_types::TX_TYPE_XCHAIN,
                 from: sender,
                 to: Some(xchain::INBOX),
+                nonce: 0,
             },
             &call_outcome,
             ws.hash(),

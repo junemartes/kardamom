@@ -21,16 +21,20 @@ use kardamom_types::{BPosition, QuorumWatermark, Receipt};
 /// The shard count every test below except `one_hundred_txs_route_and_receive_receipts`
 /// runs with.
 const TWO_SHARDS: NonZeroU32 = NonZeroU32::new(2).unwrap();
+/// [`TWO_SHARDS`], as the `MockChannels` shard count.
+const TWO_MOCK_SHARDS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(2).unwrap();
+
+const ONE_HUNDRED_TXS_SHARDS: NonZeroU32 = NonZeroU32::new(8).unwrap();
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_hundred_txs_route_and_receive_receipts() {
-    let m = 8u32;
+    let m = ONE_HUNDRED_TXS_SHARDS;
     let cfg = IngressConfig {
         partition_count_m: m,
         pending_receipt_timeout: Duration::from_secs(10),
         ..IngressConfig::default()
     };
-    let (mock, partition_rx) = MockChannels::new(m as usize);
+    let (mock, partition_rx) = MockChannels::new(std::num::NonZeroUsize::try_from(m).unwrap());
     let proxy = Arc::new(IngressProxy::new(cfg.clone(), mock.clone(), mock.clone()));
 
     // This is a fake executor. It drains each partition, and sends the
@@ -61,7 +65,7 @@ async fn one_hundred_txs_route_and_receive_receipts() {
         let (sender, resp) = res.expect("submit");
         assert_eq!(sender, signers[i].address());
         // This only checks the partition function on the recovered sender.
-        let _expected_partition = partition_for(sender, NonZeroU32::new(m).expect("m is non-zero"));
+        let _expected_partition = partition_for(sender, m);
         assert!(resp.receipt.status);
     }
 
@@ -83,11 +87,11 @@ async fn one_hundred_txs_route_and_receive_receipts() {
 #[tokio::test(flavor = "multi_thread")]
 async fn proxy_parks_until_watermark_advances() {
     let cfg = IngressConfig {
-        partition_count_m: 2,
+        partition_count_m: TWO_SHARDS,
         pending_receipt_timeout: Duration::from_secs(5),
         ..IngressConfig::default()
     };
-    let (mock, mut partition_rx) = MockChannels::new(2);
+    let (mock, mut partition_rx) = MockChannels::new(TWO_MOCK_SHARDS);
     let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
     // This is a fake executor for partition 0. It publishes the
@@ -156,7 +160,7 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
     const REPLICAS: usize = 3;
 
     let cfg = IngressConfig {
-        partition_count_m: 2,
+        partition_count_m: TWO_SHARDS,
         // OnOffer releases as soon as the deduped receipt arrives. This
         // way, the test exercises the receipt path with no watermark
         // dependency.
@@ -164,7 +168,7 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
         pending_receipt_timeout: Duration::from_secs(5),
         ..IngressConfig::default()
     };
-    let (mock, mut partition_rx) = MockChannels::new(2);
+    let (mock, mut partition_rx) = MockChannels::new(TWO_MOCK_SHARDS);
     let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
     let receipt_bus = mock.receipt_bus.clone();
@@ -191,9 +195,9 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
             };
             // This is the fan-in: the same receipt arrives once per
             // replica.
-            for _ in 0..REPLICAS {
+            (0..REPLICAS).for_each(|_| {
                 let _ = receipt_bus.send(receipt.clone());
-            }
+            });
         }
     });
 
@@ -240,12 +244,12 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn racing_replica_rejection_is_overridden_by_twin_success() {
     let cfg = IngressConfig {
-        partition_count_m: 2,
+        partition_count_m: TWO_SHARDS,
         ack_policy: kardamom_types::AckPolicy::OnOffer,
         pending_receipt_timeout: Duration::from_secs(5),
         ..IngressConfig::default()
     };
-    let (mock, mut partition_rx) = MockChannels::new(2);
+    let (mock, mut partition_rx) = MockChannels::new(TWO_MOCK_SHARDS);
     let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
     let receipt_bus = mock.receipt_bus.clone();
@@ -262,7 +266,7 @@ async fn racing_replica_rejection_is_overridden_by_twin_success() {
             let nonce = nonce_of(&envelope.raw_tx);
             // Replica A wrongly rejects. The rejection arrives from both
             // replicas, a 2x fan-out, and before the twin's receipt.
-            for _ in 0..2 {
+            (0..2).for_each(|_| {
                 let _ = error_bus.send(kardamom_types::TxError {
                     sender: envelope.sender,
                     nonce,
@@ -270,7 +274,7 @@ async fn racing_replica_rejection_is_overridden_by_twin_success() {
                         expected_nonce: nonce + 1,
                     },
                 });
-            }
+            });
             // The twin ordered it. The receipt lands shortly after, well
             // inside the rejection-release grace.
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -307,12 +311,12 @@ async fn racing_replica_rejection_is_overridden_by_twin_success() {
 #[tokio::test(flavor = "multi_thread")]
 async fn genuine_rejection_from_both_replicas_reaches_the_client_once() {
     let cfg = IngressConfig {
-        partition_count_m: 2,
+        partition_count_m: TWO_SHARDS,
         ack_policy: kardamom_types::AckPolicy::OnOffer,
         pending_receipt_timeout: Duration::from_secs(5),
         ..IngressConfig::default()
     };
-    let (mock, mut partition_rx) = MockChannels::new(2);
+    let (mock, mut partition_rx) = MockChannels::new(TWO_MOCK_SHARDS);
     let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
     let error_bus = mock.tx_error_bus.clone();

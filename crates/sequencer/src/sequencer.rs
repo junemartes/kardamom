@@ -651,35 +651,46 @@ impl Sequencer {
             Duration::from_micros(100),
             1,
         );
-        loop {
-            if shutdown.is_signaled() {
-                return Ok(());
+        while !shutdown.is_signaled() && self.run_tick(ports, &mut backoff)? {}
+        Ok(())
+    }
+
+    /// One [`Self::run`] iteration: dispatch on `run_once`'s outcome,
+    /// updating the resync controller and idle backoff. Returns whether
+    /// the loop should keep going; `false` only on a clean
+    /// `IngressDisconnected` exit.
+    fn run_tick<P: SequencerPorts>(
+        &mut self,
+        ports: &mut P,
+        backoff: &mut kardamom_log::aeron_live::IdleBackoff,
+    ) -> Result<bool, SequencerError> {
+        match self.run_once(ports) {
+            Ok(true) => {
+                backoff.reset();
+                if let Some(r) = self.resync.as_mut() {
+                    r.note_publish_ok();
+                }
+                Ok(true)
             }
-            match self.run_once(ports) {
-                Ok(true) => {
-                    backoff.reset();
-                    if let Some(r) = self.resync.as_mut() {
-                        r.note_publish_ok();
-                    }
+            Ok(false) => {
+                if let Some(r) = self.resync.as_mut() {
+                    r.note_publish_ok();
                 }
-                Ok(false) => {
-                    if let Some(r) = self.resync.as_mut() {
-                        r.note_publish_ok();
-                    }
-                    std::thread::sleep(backoff.idle_wait());
-                }
-                Err(SequencerError::Backpressure) => {
-                    // Sustained backpressure (including a not-yet-reconnected
-                    // cluster session, which maps here) is the publish-stall
-                    // resync trigger.
-                    if let Some(r) = self.resync.as_mut() {
-                        r.note_publish_stall(std::time::Instant::now());
-                    }
-                    std::thread::sleep(Duration::from_micros(10));
-                }
-                Err(SequencerError::IngressDisconnected) => return Ok(()),
-                Err(e) => return Err(e),
+                std::thread::sleep(backoff.idle_wait());
+                Ok(true)
             }
+            Err(SequencerError::Backpressure) => {
+                // Sustained backpressure (including a not-yet-reconnected
+                // cluster session, which maps here) is the publish-stall
+                // resync trigger.
+                if let Some(r) = self.resync.as_mut() {
+                    r.note_publish_stall(std::time::Instant::now());
+                }
+                std::thread::sleep(Duration::from_micros(10));
+                Ok(true)
+            }
+            Err(SequencerError::IngressDisconnected) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 }

@@ -17,6 +17,10 @@ use kardamom_log::config::LogConfig;
 use kardamom_types::{AccountChange, BlockDelta};
 use rkyv::util::AlignedVec;
 
+/// The corrupt BAL frame's granularity: 1 block per BAL entry, the
+/// finest grain, and the only one the injection needs.
+const ONE_BLOCK_GRANULARITY: std::num::NonZeroU16 = std::num::NonZeroU16::new(1).unwrap();
+
 /// Publish every one of `frames` on `publication`, once each.
 fn publish_all(publication: &PubHandle, frames: &[AlignedVec]) {
     for frame in frames {
@@ -97,7 +101,7 @@ pub async fn publish_corrupt_bal(aeron_dir: &Path, blocks: Vec<u64>) -> Result<(
             let frame = kardamom_types::BalFrame {
                 delta,
                 bal_rlp: Vec::new(),
-                granularity: 1,
+                granularity: ONE_BLOCK_GRANULARITY,
             };
             kardamom_log::codec::encode(&frame).context("encode corrupt BAL")
         })
@@ -158,29 +162,23 @@ pub async fn publish_forged_epoch(aeron_dir: &Path, l1_number: u64) -> Result<()
 /// send. The record must be well formed (a valid body and a matching
 /// canonical id), or the sealer drops it as malformed and the drill only
 /// tests the codec.
+///
+/// # Errors
+/// Returns an error when the log config cannot be resolved, the record
+/// fails to encode, or the publish itself fails.
 pub async fn publish_remote_epoch(
     aeron_dir: &Path,
     record: kardamom_types::xchain::RemoteEpochRecord,
 ) -> Result<()> {
-    let aeron_dir = aeron_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let channels = LogConfig::resolve(None)
-            .context("resolve log config")?
-            .channels;
-        let rt = AeronRuntime::spawn_with_dir(&aeron_dir).context("attach injection runtime")?;
-        let publication = rt
-            .open_publication(
-                &channels.tx_remote_epochs_channel,
-                channels.tx_remote_epochs_stream_id,
-            )
-            .context("open tx_remote_epochs publication")?;
-        for _round in 0..10 {
-            let bytes = kardamom_log::codec::encode(&record).context("encode remote epoch")?;
-            publication.publish_best_effort(bytes);
-            std::thread::sleep(std::time::Duration::from_millis(300));
-        }
-        Ok(())
-    })
+    let channels = LogConfig::resolve(None)
+        .context("resolve log config")?
+        .channels;
+    let bytes = kardamom_log::codec::encode(&record).context("encode remote epoch")?;
+    inject_frames(
+        aeron_dir,
+        &channels.tx_remote_epochs_channel,
+        channels.tx_remote_epochs_stream_id,
+        vec![bytes],
+    )
     .await
-    .context("injection task join")?
 }

@@ -182,6 +182,36 @@ pub enum OutboxEventDto {
     Head { block_number: u64 },
 }
 
+/// A resolved lane floor, from one `OutboxEventDto::Lagged` frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lag {
+    /// First seq the server serves.
+    pub floor: u64,
+    /// First origin block the server serves, when the server sent it.
+    pub floor_block: Option<u64>,
+}
+
+impl Lag {
+    /// Resolve the floor from a `Lagged` frame's raw fields, so every
+    /// consumer of [`OutboxEventDto::Lagged`] shares one fallback.
+    ///
+    /// Prefers `floor_seq`. An older server omits it; `from + skipped` is
+    /// the only floor consistent with that server's own `skipped` count,
+    /// since `from` is the cursor the subscriber asked to resume from.
+    #[must_use]
+    pub fn resolve(
+        from: u64,
+        skipped: u64,
+        floor_seq: Option<u64>,
+        floor_block: Option<u64>,
+    ) -> Self {
+        Self {
+            floor: floor_seq.unwrap_or(from.saturating_add(skipped)),
+            floor_block,
+        }
+    }
+}
+
 /// Why a feed item could not be turned into an [`OutboxMessage`].
 ///
 /// Every variant means the peer is running something this build does not
@@ -259,7 +289,7 @@ impl OutboxMessageDto {
 
 /// The origin-side feed surface (spec §5). Defined here, next to the DTOs,
 /// because it IS the contract: `kardamom-validator` implements this trait
-/// (the E1 serving surface), and `kardamom-da-watcher`'s mock implements it
+/// (the live serving implementation), and `kardamom-da-watcher`'s mock implements it
 /// so the destination side stays testable against a real server without a
 /// full origin stack.
 #[rpc(server, namespace = "kardamom")]
@@ -315,14 +345,13 @@ pub struct AttestationDto {
     pub state_root: B256,
     /// The serving validator's identity.
     pub validator_id: String,
-    /// Signature over `(chain_id, block_number, state_root)` — absent until
-    /// E2 adds attestation keys.
+    /// Signature over `(chain_id, block_number, state_root)` — absent
+    /// until attestation signing keys exist.
     ///
     /// An attestation with `signature: None` carries NO authority. It is a
     /// plain statement from a socket, and anyone who can reach that socket
-    /// can produce one. A consumer must treat an unsigned attestation as
-    /// unusable for quorum, cross-check, or any other trust decision until
-    /// E2 lands. See `docs/specs/egress-node-spec.md`, section 5.
+    /// can produce one. A consumer treats an unsigned attestation as
+    /// unusable for quorum, cross-check, or any other trust decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Bytes>,
 }
@@ -372,6 +401,28 @@ mod tests {
                 context: B256::repeat_byte(0x1D),
             }),
         }
+    }
+
+    #[test]
+    fn lag_prefers_floor_seq_when_present() {
+        assert_eq!(
+            Lag::resolve(10, 5, Some(12), Some(40)),
+            Lag {
+                floor: 12,
+                floor_block: Some(40)
+            }
+        );
+    }
+
+    #[test]
+    fn lag_falls_back_to_from_plus_skipped_for_an_older_server() {
+        assert_eq!(
+            Lag::resolve(10, 5, None, None),
+            Lag {
+                floor: 15,
+                floor_block: None
+            }
+        );
     }
 
     #[test]
@@ -484,9 +535,9 @@ mod tests {
         assert_eq!(dto.into_outbox_message(5).unwrap().dest_chain_id, 999);
     }
 
-    /// The attestation wire shape, pinned like the outbox frames. UNSIGNED in
-    /// E1: `signature` must be OMITTED when `None`, not serialized as null —
-    /// E2 adds it as a plain additive field.
+    /// The attestation wire shape, pinned like the outbox frames. Unsigned
+    /// today: `signature` must be OMITTED when `None`, not serialized as null,
+    /// so adding it later stays a plain additive field.
     #[test]
     fn attestation_wire_shape_is_pinned() {
         let dto = AttestationEventDto::Attestation(Box::new(AttestationDto {
@@ -503,7 +554,7 @@ mod tests {
         assert_eq!(v["validatorId"], "egress-1");
         assert!(
             v.as_object().unwrap().get("signature").is_none(),
-            "unsigned E1 attestations omit the field entirely"
+            "an unsigned attestation omits the field entirely"
         );
         let back: AttestationEventDto = serde_json::from_value(v).unwrap();
         assert_eq!(dto, back);

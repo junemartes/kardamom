@@ -2,15 +2,16 @@
 //! the live tx_receipts publication, and the opt-in Block-STM strategy.
 
 use anyhow::{Context, Result};
-use kardamom_engine::actor::BlockExec;
 use kardamom_engine::bin_support;
 use kardamom_engine::{
-    CMessage, EngineWiring, ExecutorError, MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal,
-    NoEpochCheck, TxReceiptsPublication,
+    CMessage, EngineWiring, ExecPorts, ExecutorError, MdbxSnapshotSource, MdbxWriterQueue,
+    MdbxWriterSignal, NoEpochCheck, NoRemoteEpochCheck, TxReceiptsPublication,
 };
+use kardamom_executor::parallel::StmBlockExec;
 use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsPublisherHandle};
 use kardamom_log::config::ChannelsConfig;
 use kardamom_state::StateSnapshot;
+use std::num::NonZeroUsize;
 
 use crate::args::Args;
 
@@ -46,23 +47,30 @@ pub(crate) fn open_tx_receipts_pub(
 /// startup and lives for the whole process. Blocks route through it at
 /// each boundary. `None` leaves the engine's streaming per-tx path
 /// unchanged.
-pub(crate) fn build_block_exec(args: &Args) -> Option<BlockExec<StateSnapshot>> {
+pub(crate) fn build_block_exec(args: &Args) -> Option<StmBlockExec<StateSnapshot>> {
+    /// Upper bound for the auto worker count (`--execution-workers 0`).
+    const AUTO_WORKER_CAP: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+    /// Worker count when the host does not report its parallelism.
+    const AUTO_WORKER_FALLBACK: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+    /// Hard cap: the mdbx reader-slot budget (`MAX_READERS = 64`) reserves
+    /// the rest for RPC and compaction.
+    const WORKER_CAP: NonZeroUsize = NonZeroUsize::new(40).unwrap();
     if !args.parallel_execution {
         return None;
     }
     // 0 means auto. The hard cap is 40, from the mdbx reader-slot budget
     // (geometry::MAX_READERS = 64, shared with exec, RPC, and compaction).
-    let workers = match args.execution_workers {
-        0 => std::thread::available_parallelism()
-            .map(|n| n.get().min(8))
-            .unwrap_or(4),
-        n => n.min(40),
+    let workers = match NonZeroUsize::new(args.execution_workers) {
+        None => std::thread::available_parallelism()
+            .map(|n| n.min(AUTO_WORKER_CAP))
+            .unwrap_or(AUTO_WORKER_FALLBACK),
+        Some(n) => n.min(WORKER_CAP),
     };
     tracing::info!(
         workers,
         "parallel execution ENABLED (Block-STM, block-at-a-time)"
     );
-    Some(kardamom_executor::parallel::stm_block_exec(
+    Some(StmBlockExec::spawn(
         kardamom_executor::parallel::StmExecConfig {
             workers,
             pin_cores: Vec::new(),
@@ -80,15 +88,20 @@ pub(crate) fn build_block_exec(args: &Args) -> Option<BlockExec<StateSnapshot>> 
 /// implementation choices, so nothing needs the boxed-wiring escape hatch.
 pub(crate) struct ExecutorWiring;
 
-impl EngineWiring for ExecutorWiring {
-    type TxData = bin_support::LiveTxDataSub;
-    type TxOrdering = bin_support::LiveTxOrderingSub;
-    type TxReceipts = LiveTxReceiptsPub;
+impl ExecPorts for ExecutorWiring {
     type Snapshots = MdbxSnapshotSource;
     type WriterSignal = MdbxWriterSignal;
     type WriterQueue = MdbxWriterQueue;
     // No epoch verification: the executor trusts the ordered stream.
     type Epoch = NoEpochCheck;
+    type RemoteEpoch = NoRemoteEpochCheck;
+    type BlockExec = StmBlockExec<StateSnapshot>;
+}
+
+impl EngineWiring for ExecutorWiring {
+    type TxData = bin_support::LiveTxDataSub;
+    type TxOrdering = bin_support::LiveTxOrderingSub;
+    type TxReceipts = LiveTxReceiptsPub;
 }
 
 pub(crate) struct LiveTxReceiptsPub {

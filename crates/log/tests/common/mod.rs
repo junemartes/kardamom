@@ -18,7 +18,7 @@ use kardamom_types::{BPosition, TxEnvelope, TxRef};
 /// bookkeeping (not the exact payload size) pass 32; the docker-e2e
 /// tests each pin their own historical length (48 or 64), since an MTU-
 /// or timing-sensitive test's payload size is part of what it pins.
-pub fn tx_envelope(correlation_id: u64, fill: u8, raw_len: usize) -> TxEnvelope {
+pub(crate) fn tx_envelope(correlation_id: u64, fill: u8, raw_len: usize) -> TxEnvelope {
     TxEnvelope {
         correlation_id,
         raw_tx: Bytes::from(vec![fill; raw_len]),
@@ -29,7 +29,7 @@ pub fn tx_envelope(correlation_id: u64, fill: u8, raw_len: usize) -> TxEnvelope 
 
 /// A `TxRef` for `shard_id`'s `tx_data` entry at `pos`, with `tx_hash`
 /// zeroed and `tx_data_session_id` 0 (single-publisher fixtures).
-pub fn tx_ref(shard_id: u8, pos: BPosition) -> TxRef {
+pub(crate) fn tx_ref(shard_id: u8, pos: BPosition) -> TxRef {
     TxRef {
         tx_hash: B256::ZERO,
         shard_id,

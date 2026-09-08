@@ -164,7 +164,7 @@ impl RunConfig {
         cursor: BatchCursor,
     ) -> Result<ReaderStack<impl Send + use<>>> {
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-        let tx_data_subs = bin_support::open_tx_data_subs(&rt, &self.channels, args.shards.get())?;
+        let tx_data_subs = bin_support::open_tx_data_subs(&rt, &self.channels, args.shards)?;
         let join_recovery = bin_support::archive_join_recovery(
             &self.channels,
             &self.aeron_cfg,
@@ -263,14 +263,25 @@ impl<G> ReaderHandles<G> {
         {
             return anyhow::anyhow!("tx_ordering reader failed: {re:#} (feed loop: {feed_err:#})");
         }
-        for h in self.join_handles {
-            if h.is_finished()
-                && let Ok(Err(re)) = h.join()
-            {
-                return anyhow::anyhow!("stream reader failed: {re:#} (feed loop: {feed_err:#})");
-            }
+        self.join_handles
+            .into_iter()
+            .find_map(|h| Self::stream_reader_failure(h, &feed_err))
+            .unwrap_or(feed_err)
+    }
+
+    /// `h`'s error, if it already finished and failed.
+    fn stream_reader_failure(
+        h: JoinHandle<Result<(), ExecutorError>>,
+        feed_err: &anyhow::Error,
+    ) -> Option<anyhow::Error> {
+        if h.is_finished()
+            && let Ok(Err(re)) = h.join()
+        {
+            return Some(anyhow::anyhow!(
+                "stream reader failed: {re:#} (feed loop: {feed_err:#})"
+            ));
         }
-        feed_err
+        None
     }
 }
 

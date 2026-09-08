@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use kardamom_cluster_client::session::{DriverEvent, SessionDriver};
-use kardamom_log::aeron_live::{AeronRuntime, IdleBackoff, PubHandle};
+use kardamom_log::aeron_live::{AeronRuntime, IdleBackoff, PubHandle, RawFrame};
 
 use super::endpoints::{now_ms, open_leader_pub, open_next_member_pub, to_aligned};
 use super::{LiveClusterConfig, OfferReq, ReplayOnConnect};
@@ -107,7 +107,7 @@ impl Resend {
 /// the stop flag set when the owning [`LiveCluster`](super::LiveCluster)
 /// is dropped.
 pub(super) struct SessionSeams {
-    pub(super) frame_rx: Receiver<Vec<u8>>,
+    pub(super) frame_rx: Receiver<RawFrame>,
     pub(super) req_rx: Receiver<OfferReq>,
     pub(super) out_tx: Sender<Vec<u8>>,
     pub(super) stop: Arc<AtomicBool>,
@@ -154,7 +154,7 @@ struct SessionLoop {
     replay: Option<ReplayOnConnect>,
     subscribe: bool,
     egress_kind_filter: Option<Vec<u8>>,
-    frame_rx: Receiver<Vec<u8>>,
+    frame_rx: Receiver<RawFrame>,
     req_rx: Receiver<OfferReq>,
     /// Set when a drain sees `Disconnected` on the receiver. A dead
     /// receiver stays out of the idle Select (see `idle_wait`).
@@ -277,25 +277,30 @@ impl SessionLoop {
         let mut worked = false;
         while let Some(frame) = next_item(&self.frame_rx, &mut self.frame_rx_dead) {
             worked = true;
-            let events = self.driver.on_egress(&frame);
-            // Liveness means frames that survive the session filter. A
-            // frame for a foreign session (the pre-restart zombie's
-            // boundary broadcasts land on this same static endpoint
-            // until the cluster reaps it at the 90s session timeout)
-            // returns no events, and must not feed the watchdog: only
-            // session-filtered events do.
-            if !events.is_empty() {
-                self.egress_alive_at_ms = now_ms();
-                // Real egress means the path works again. Reset the
-                // watchdog backoff so a future outage gets the fast
-                // first retry.
-                self.egress_silence_reset_ms = EGRESS_SILENCE_RESET_MS;
-            }
-            for ev in events {
-                self.on_driver_event(ev);
-            }
+            self.on_egress_frame(&frame);
         }
         worked
+    }
+
+    /// Handle one egress fragment: feed the watchdog when at least one
+    /// event survives the session filter, then fan every event out to
+    /// [`Self::on_driver_event`].
+    fn on_egress_frame(&mut self, frame: &RawFrame) {
+        let events = self.driver.on_egress(&frame.bytes);
+        // Liveness means frames that survive the session filter. A frame
+        // for a foreign session (the pre-restart zombie's boundary
+        // broadcasts land on this same static endpoint until the cluster
+        // reaps it at the 90s session timeout) returns no events, and
+        // must not feed the watchdog: only session-filtered events do.
+        if !events.is_empty() {
+            self.egress_alive_at_ms = now_ms();
+            // Real egress means the path works again. Reset the watchdog
+            // backoff so a future outage gets the fast first retry.
+            self.egress_silence_reset_ms = EGRESS_SILENCE_RESET_MS;
+        }
+        for ev in events {
+            self.on_driver_event(ev);
+        }
     }
 
     fn on_driver_event(&mut self, ev: DriverEvent) {

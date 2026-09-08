@@ -13,14 +13,14 @@ use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TryRecvError
 
 use super::pending::{IdleBackoff, PendingPublish, PubEntry, drain_pending};
 use super::runtime::RuntimeCmd;
-use super::{ADD_PUB_TIMEOUT, ADD_SUB_TIMEOUT, AeronClient, DeliverFn, Header, Sub};
+use super::{ADD_PUB_TIMEOUT, ADD_SUB_TIMEOUT, AeronClient, FrameSink, Header, RawFrame, Sub};
 use crate::error::LogError;
 use crate::offer_retry::OFFER_TIMEOUT;
 use crate::term_layout::TermLayout;
 use kardamom_types::BPosition;
 
 /// Adapter between rusteron's fragment-handler callback and a
-/// [`DeliverFn`], sitting behind an
+/// [`FrameSink`], sitting behind an
 /// [`rusteron_client::AeronFragmentAssembler`]. It runs once per complete
 /// message, with multi-fragment messages (any frame larger than one Aeron
 /// MTU, about 1.4 KB) already reassembled. Without the assembler,
@@ -31,15 +31,29 @@ use kardamom_types::BPosition;
 /// join) go through this same path, so position derivation stays
 /// consistent.
 struct AssembledDeliver {
-    deliver: DeliverFn,
+    sink: FrameSink,
 }
 
 impl rusteron_client::AeronFragmentHandlerCallback for AssembledDeliver {
     fn handle_aeron_fragment_handler(&mut self, buffer: &[u8], header: Header) {
         if let Some((pos, session)) = header_loc(&header) {
-            (self.deliver)(buffer, pos, session);
+            self.sink.send(RawFrame {
+                bytes: buffer.to_vec(),
+                pos,
+                session,
+            });
         }
     }
+}
+
+/// [`AeronThread::try_next_cmd`]'s outcome, for [`AeronThread::drain_commands`]'s loop.
+enum CmdStep {
+    /// A command was handled; keep draining.
+    Handled,
+    /// The channel has nothing queued right now.
+    Empty,
+    /// `Shutdown`, or the channel disconnected: the thread must stop.
+    Stop,
 }
 
 /// One row in the Aeron thread's subscription table.
@@ -122,65 +136,76 @@ impl AeronThread {
     /// disconnects.
     fn run(mut self) -> Result<(), LogError> {
         loop {
-            // Whether this iteration did anything: handled a command, or
-            // polled at least one fragment. Drives the idle backoff. An
-            // empty streak escalates the wait; any work snaps it back to
-            // base.
-            let mut worked = match self.drain_commands() {
+            match self.step() {
                 ControlFlow::Break(()) => return Ok(()),
-                ControlFlow::Continue(handled_any) => handled_any,
+                ControlFlow::Continue(()) => {}
+            }
+        }
+    }
+
+    /// One pass of the poll/command loop: drain commands, retry pending
+    /// publishes, poll every subscription, then idle-wait for the next
+    /// command at a cadence that escalates while nothing has work.
+    /// `Break(())` means the thread must stop (`Shutdown`, or the command
+    /// channel disconnected).
+    fn step(&mut self) -> ControlFlow<()> {
+        // Whether this pass did anything: handled a command, or polled at
+        // least one fragment. Drives the idle backoff. An empty streak
+        // escalates the wait; any work snaps it back to base.
+        let mut worked = match self.drain_commands() {
+            ControlFlow::Break(()) => return ControlFlow::Break(()),
+            ControlFlow::Continue(handled_any) => handled_any,
+        };
+
+        // 2. Attempt one offer per pending publish, preserving
+        //    per-publication FIFO order. Successful or expired entries
+        //    are removed.
+        drain_pending(&self.pubs, &mut self.pending);
+
+        // 3. Poll every subscription. This runs on every pass, even while
+        //    a publish is back-pressured in `pending`, so a slow or
+        //    stalled publish can never starve a subscription's image.
+        worked |= self.poll_subscriptions();
+
+        // 4. Idle. Block only when there is genuinely nothing to do:
+        //    nothing to poll and nothing pending. Otherwise wait at the
+        //    poll/retry cadence without busy-spinning a core.
+        if self.subs.is_empty() && self.pending.is_empty() {
+            return match self.wait_for_cmd(Duration::from_millis(1)) {
+                ControlFlow::Break(()) => ControlFlow::Break(()),
+                ControlFlow::Continue(_) => ControlFlow::Continue(()),
             };
+        }
 
-            // 2. Attempt one offer per pending publish, preserving
-            //    per-publication FIFO order. Successful or expired entries
-            //    are removed.
-            drain_pending(&self.pubs, &mut self.pending);
-
-            // 3. Poll every subscription. This runs on every iteration,
-            //    even while a publish is back-pressured in `pending`, so a
-            //    slow or stalled publish can never starve a subscription's
-            //    image.
-            worked |= self.poll_subscriptions();
-
-            // 4. Idle. Block only when there is genuinely nothing to do:
-            //    nothing to poll and nothing pending. Otherwise wait at
-            //    the poll/retry cadence without busy-spinning a core.
-            if self.subs.is_empty() && self.pending.is_empty() {
-                if let ControlFlow::Break(()) = self.wait_for_cmd(Duration::from_millis(1)) {
-                    return Ok(());
-                }
-            } else {
-                // Keep the 100 microsecond sub-poll/retry cadence while
-                // traffic flows, but wake immediately on a new command
-                // instead of blocking on `recv_timeout` for the full
-                // interval. With any subscription open (always, in the
-                // services) this branch is the steady state. Blocking the
-                // full 100 microseconds under every ack-waited publish
-                // caps a serialized publisher's rate (the sequencer's
-                // offer path first among them), so the wait uses
-                // `recv_timeout` to wake early on a command. When quiet,
-                // the wait escalates toward 1 ms (`IdleBackoff`), since a
-                // fixed 100 microsecond wake dominates a quiet loop's CPU
-                // with crossbeam's pre-park spin, not work. A non-empty
-                // `pending` pins the base cadence, because the retry
-                // timing of a back-pressured offer must not degrade.
-                let pending_or_worked = worked || !self.pending.is_empty();
-                if pending_or_worked {
+        // Keep the 100 microsecond sub-poll/retry cadence while traffic
+        // flows, but wake immediately on a new command instead of
+        // blocking on `recv_timeout` for the full interval. With any
+        // subscription open (always, in the services) this branch is the
+        // steady state. Blocking the full 100 microseconds under every
+        // ack-waited publish caps a serialized publisher's rate (the
+        // sequencer's offer path first among them), so the wait uses
+        // `recv_timeout` to wake early on a command. When quiet, the wait
+        // escalates toward 1 ms (`IdleBackoff`), since a fixed 100
+        // microsecond wake dominates a quiet loop's CPU with crossbeam's
+        // pre-park spin, not work. A non-empty `pending` pins the base
+        // cadence, because the retry timing of a back-pressured offer
+        // must not degrade.
+        let pending_or_worked = worked || !self.pending.is_empty();
+        if pending_or_worked {
+            self.backoff.reset();
+        }
+        let wait = if pending_or_worked {
+            Duration::from_micros(100)
+        } else {
+            self.backoff.idle_wait()
+        };
+        match self.wait_for_cmd(wait) {
+            ControlFlow::Break(()) => ControlFlow::Break(()),
+            ControlFlow::Continue(handled) => {
+                if handled {
                     self.backoff.reset();
                 }
-                let wait = if pending_or_worked {
-                    Duration::from_micros(100)
-                } else {
-                    self.backoff.idle_wait()
-                };
-                match self.wait_for_cmd(wait) {
-                    ControlFlow::Break(()) => return Ok(()),
-                    ControlFlow::Continue(handled) => {
-                        if handled {
-                            self.backoff.reset();
-                        }
-                    }
-                }
+                ControlFlow::Continue(())
             }
         }
     }
@@ -190,24 +215,29 @@ impl AeronThread {
     /// never block this loop (see [`PendingPublish`]).
     ///
     /// `Break(())` means the thread must stop (`Shutdown`, or the command
-    /// channel disconnected); the caller returns at that exact point, the
-    /// same point the old inline loop returned from. `Continue(true)`
-    /// means at least one command was handled.
+    /// channel disconnected); the caller returns at that exact point.
+    /// `Continue(true)` means at least one command was handled.
     fn drain_commands(&mut self) -> ControlFlow<(), bool> {
         let mut worked = false;
         loop {
-            match self.cmd_rx.try_recv() {
-                Ok(RuntimeCmd::Shutdown) | Err(TryRecvError::Disconnected) => {
-                    return ControlFlow::Break(());
-                }
-                Ok(cmd) => {
-                    worked = true;
-                    self.handle_cmd(cmd);
-                }
-                Err(TryRecvError::Empty) => break,
+            match self.try_next_cmd() {
+                CmdStep::Handled => worked = true,
+                CmdStep::Empty => return ControlFlow::Continue(worked),
+                CmdStep::Stop => return ControlFlow::Break(()),
             }
         }
-        ControlFlow::Continue(worked)
+    }
+
+    /// One non-blocking command-channel poll, for [`drain_commands`]'s loop.
+    fn try_next_cmd(&mut self) -> CmdStep {
+        match self.cmd_rx.try_recv() {
+            Ok(RuntimeCmd::Shutdown) | Err(TryRecvError::Disconnected) => CmdStep::Stop,
+            Ok(cmd) => {
+                self.handle_cmd(cmd);
+                CmdStep::Handled
+            }
+            Err(TryRecvError::Empty) => CmdStep::Empty,
+        }
     }
 
     /// Poll every subscription for fragments. Returns whether any
@@ -224,11 +254,10 @@ impl AeronThread {
     }
 
     /// Block waiting for the next command, up to `wait`. `Break(())` means
-    /// the thread must stop, at the same point the old inline
-    /// `recv_timeout` match returned from. `Continue(true)` means a
-    /// command arrived and was handled; `Continue(false)` means the wait
-    /// timed out with nothing to do. The caller uses that distinction to
-    /// decide whether to reset the idle backoff.
+    /// the thread must stop. `Continue(true)` means a command arrived and
+    /// was handled; `Continue(false)` means the wait timed out with
+    /// nothing to do. The caller uses that distinction to decide whether
+    /// to reset the idle backoff.
     fn wait_for_cmd(&mut self, wait: Duration) -> ControlFlow<(), bool> {
         match self.cmd_rx.recv_timeout(wait) {
             Ok(RuntimeCmd::Shutdown) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -282,11 +311,11 @@ impl AeronThread {
         &mut self,
         uri: &str,
         stream_id: i32,
-        deliver: DeliverFn,
+        sink: FrameSink,
     ) -> Result<u32, LogError> {
         let sub = self.open_sub(uri, stream_id)?;
         let (assembler, inner) =
-            rusteron_client::Handler::leak_with_fragment_assembler(AssembledDeliver { deliver })
+            rusteron_client::Handler::leak_with_fragment_assembler(AssembledDeliver { sink })
                 .map_err(|e| LogError::Aeron(format!("fragment assembler: {e:?}")))?;
         let id = u32::try_from(self.subs.len())
             .map_err(|_| LogError::Aeron("subscription table exceeds u32::MAX entries".into()))?;
@@ -332,10 +361,10 @@ impl AeronThread {
             RuntimeCmd::OpenSubscription {
                 uri,
                 stream_id,
-                deliver,
+                sink,
                 ack,
             } => {
-                let _ = ack.send(self.cmd_open_subscription(&uri, stream_id, deliver));
+                let _ = ack.send(self.cmd_open_subscription(&uri, stream_id, sink));
             }
             RuntimeCmd::SubAddDestination { sub_id, uri, ack } => {
                 let _ = ack.send(self.add_sub_destination(sub_id, &uri));
@@ -394,18 +423,7 @@ impl AeronThread {
                 c.as_c_str(),
             )
             .map_err(|e| LogError::Aeron(format!("add destination {uri}: {e}")))?;
-        let start = Instant::now();
-        loop {
-            match dest.aeron_subscription_async_destination_poll() {
-                Ok(1) => break,
-                Ok(_) => {}
-                Err(e) => return Err(LogError::Aeron(format!("destination poll {uri}: {e}"))),
-            }
-            if start.elapsed() > ADD_SUB_TIMEOUT {
-                return Err(LogError::Aeron(format!("add destination {uri} timed out")));
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        poll_until_attached(&dest, Instant::now(), uri)?;
         self.dests.push(Destination {
             sub_id,
             uri: uri.to_string(),
@@ -413,6 +431,46 @@ impl AeronThread {
         });
         Ok(())
     }
+}
+
+/// Block until `dest`'s attach completes or `uri`'s add-destination call
+/// times out (measured from `start`). Polls at a fixed 2 ms cadence.
+fn poll_until_attached(
+    dest: &rusteron_client::AeronAsyncDestination,
+    start: Instant,
+    uri: &str,
+) -> Result<(), LogError> {
+    loop {
+        match poll_attach_step(dest, start, uri) {
+            ControlFlow::Break(result) => return result,
+            ControlFlow::Continue(()) => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+}
+
+/// One attach-poll for [`poll_until_attached`]'s loop. `Break` carries the
+/// answer: ready, a poll error, or a timeout past `ADD_SUB_TIMEOUT`.
+/// `Continue` means poll again after the caller's wait.
+fn poll_attach_step(
+    dest: &rusteron_client::AeronAsyncDestination,
+    start: Instant,
+    uri: &str,
+) -> ControlFlow<Result<(), LogError>> {
+    match dest.aeron_subscription_async_destination_poll() {
+        Ok(1) => return ControlFlow::Break(Ok(())),
+        Ok(_) => {}
+        Err(e) => {
+            return ControlFlow::Break(Err(LogError::Aeron(format!(
+                "destination poll {uri}: {e}"
+            ))));
+        }
+    }
+    if start.elapsed() > ADD_SUB_TIMEOUT {
+        return ControlFlow::Break(Err(LogError::Aeron(format!(
+            "add destination {uri} timed out"
+        ))));
+    }
+    ControlFlow::Continue(())
 }
 
 /// Read the fragment-start [`BPosition`] and the Aeron publisher

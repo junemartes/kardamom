@@ -10,8 +10,11 @@ use kardamom_ingress::test_support::{sign_eip4844, sign_legacy_with_gas};
 use kardamom_ingress::{IngressProxy, MockChannels};
 use kardamom_types::limits::TX_GAS_LIMIT_CAP;
 
+/// The shard count `proxy()` starts `MockChannels` with.
+const SHARDS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(8).unwrap();
+
 fn proxy() -> IngressProxy<MockChannels, MockChannels> {
-    let (mock, _rx) = MockChannels::new(8);
+    let (mock, _rx) = MockChannels::new(SHARDS);
     IngressProxy::new(IngressConfig::default(), mock.clone(), mock)
 }
 

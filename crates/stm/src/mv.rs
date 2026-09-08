@@ -117,13 +117,27 @@ impl<K: Eq + std::hash::Hash + Copy, V: Copy> Shards<K, V> {
     /// a cell with an empty version list.
     fn fold_last_version(&self, mut sink: impl FnMut(K, &V)) {
         for sh in &self.0 {
-            let g = sh.read().expect("mv poisoned");
-            for (k, list) in g.iter() {
-                if let Some((_, v)) = list.last() {
-                    sink(*k, v);
-                }
-            }
+            Self::fold_shard_last_version(sh, &mut sink);
         }
+    }
+
+    /// Visit one shard's cells. The `for` loop in
+    /// [`Self::fold_last_version`] stays free of a branch.
+    fn fold_shard_last_version(sh: &Shard<K, V>, sink: &mut impl FnMut(K, &V)) {
+        let g = sh.read().expect("mv poisoned");
+        for (k, list) in g.iter() {
+            Self::sink_last_version(*k, list, sink);
+        }
+    }
+
+    /// Visit one cell's latest version, or nothing for an empty version
+    /// list. The `for` loop in [`Self::fold_shard_last_version`] stays
+    /// free of a branch.
+    fn sink_last_version(k: K, list: &Versions<V>, sink: &mut impl FnMut(K, &V)) {
+        let Some((_, v)) = list.last() else {
+            return;
+        };
+        sink(k, v);
     }
 
     /// Scrub every shard in place: past `keep_keys_cap` entries, drop
@@ -132,14 +146,21 @@ impl<K: Eq + std::hash::Hash + Copy, V: Copy> Shards<K, V> {
     /// buffer.
     fn scrub(&self, keep_keys_cap: usize) {
         for sh in &self.0 {
-            let mut g = sh.write().expect("mv poisoned");
-            if g.len() > keep_keys_cap {
-                g.clear();
-            } else {
-                for v in g.values_mut() {
-                    v.clear();
-                }
-            }
+            Self::scrub_shard(sh, keep_keys_cap);
+        }
+    }
+
+    /// Scrub one shard in place: past `keep_keys_cap` entries, drop the
+    /// whole map; otherwise keep the keys and clear each entry's version
+    /// vec. The `for` loop in [`Self::scrub`] stays free of a branch.
+    fn scrub_shard(sh: &Shard<K, V>, keep_keys_cap: usize) {
+        let mut g = sh.write().expect("mv poisoned");
+        if g.len() > keep_keys_cap {
+            g.clear();
+            return;
+        }
+        for v in g.values_mut() {
+            v.clear();
         }
     }
 }
@@ -191,20 +212,34 @@ impl MvCache {
         for ((addr, key), value) in &ws.storage {
             self.publish_slot(idx, *addr, *key, *value);
         }
-        for (addr, (nonce, balance, code_hash)) in &ws.accounts {
-            if *addr == skip_account {
-                continue;
-            }
-            self.publish_account(
+        for (addr, fields) in &ws.accounts {
+            self.publish_account_unless_skipped(
                 idx,
                 *addr,
                 AccountVersion {
-                    nonce: *nonce,
-                    balance: *balance,
-                    code_hash: *code_hash,
+                    nonce: fields.nonce,
+                    balance: fields.balance,
+                    code_hash: fields.code_hash,
                 },
+                skip_account,
             );
         }
+    }
+
+    /// Publish one account version, unless it is the skipped fee sink.
+    /// The `for` loop in [`Self::publish_write_set`] stays free of a
+    /// branch.
+    fn publish_account_unless_skipped(
+        &self,
+        idx: u32,
+        addr: Address,
+        v: AccountVersion,
+        skip_account: Address,
+    ) {
+        if addr == skip_account {
+            return;
+        }
+        self.publish_account(idx, addr, v);
     }
 
     /// Publish one transaction's account write. The sorted insert keeps
@@ -290,7 +325,14 @@ impl MvCache {
     pub(crate) fn final_delta(&self) -> kardamom_exec_core::delta::PendingDelta {
         let mut d = kardamom_exec_core::delta::PendingDelta::new();
         self.accounts.fold_last_version(|addr, v: &AccountVersion| {
-            d.accounts.insert(addr, (v.nonce, v.balance, v.code_hash));
+            d.accounts.insert(
+                addr,
+                kardamom_exec_core::delta::AccountFields {
+                    nonce: v.nonce,
+                    balance: v.balance,
+                    code_hash: v.code_hash,
+                },
+            );
         });
         self.storage.fold_last_version(|key, v: &U256| {
             d.storage.insert(key, *v);
@@ -390,14 +432,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut observed = 0u64;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some((_, a)) = mv.read_account(1, &created) {
-                        assert!(
-                            mv.read_code(&a.code_hash).is_some(),
-                            "account visible with code_hash {:?} but its code is not",
-                            a.code_hash
-                        );
-                        observed += 1;
-                    }
+                    observed += poll_created_account_visible(&mv, created);
                 }
                 observed
             })
@@ -407,13 +442,36 @@ mod tests {
         // so the reader keeps racing the window.
         for _ in 0..2_000 {
             let mut ws = WriteSet::default();
-            ws.accounts.push((created, (1, U256::ZERO, hash)));
+            ws.accounts.push((
+                created,
+                kardamom_exec_core::delta::AccountFields {
+                    nonce: 1,
+                    balance: U256::ZERO,
+                    code_hash: hash,
+                },
+            ));
             ws.code.push((hash, code.clone()));
             ws.finish();
             mv.publish_write_set(0, &ws, Address::repeat_byte(0xEE));
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         reader.join().expect("reader must not panic");
+    }
+
+    /// Poll once for the created account. Returns 1 if observed, after
+    /// asserting its code is visible too; else 0. The `while` loop in
+    /// [`account_version_never_precedes_its_code`] stays free of a
+    /// branch.
+    fn poll_created_account_visible(mv: &MvCache, created: Address) -> u64 {
+        let Some((_, a)) = mv.read_account(1, &created) else {
+            return 0;
+        };
+        assert!(
+            mv.read_code(&a.code_hash).is_some(),
+            "account visible with code_hash {:?} but its code is not",
+            a.code_hash
+        );
+        1
     }
 
     #[test]

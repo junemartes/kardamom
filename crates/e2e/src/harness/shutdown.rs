@@ -1,9 +1,10 @@
 //! Graceful teardown: stop the pipeline at a common final block, then
 //! shut the executor and validator down cleanly for offline inspection.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::LocalStack;
 
@@ -112,42 +113,61 @@ impl LocalStack {
     async fn drain_until_settled(&self) -> Result<()> {
         let exec_addr = self.executor.metrics_addr;
         let val_addr = self.validator.as_ref().map(|v| v.metrics_addr);
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut last_exec = -1.0f64;
         let mut last_val = -1.0f64;
-        loop {
-            let exec_block = super::metrics::scrape(exec_addr)
-                .await?
-                .value(crate::scenarios::EXEC_BLOCK_NUMBER)
-                .unwrap_or(0.0);
-            let val_block = match val_addr {
-                // No validator: treat its half as already settled.
-                None => exec_block,
-                Some(addr) => super::metrics::scrape(addr)
-                    .await?
-                    .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK)
-                    .unwrap_or(0.0),
-            };
-            #[allow(
-                clippy::float_cmp,
-                reason = "exact equality is the intended check here: both gauges come from \
-                           the same metric source, so an unchanged value scrapes back \
-                           bit-identical"
-            )]
-            let stable = exec_block == last_exec && val_block == last_val;
-            if stable && val_block >= exec_block {
-                // Both stable across one interval, validator not behind.
-                return Ok(());
-            }
-            last_exec = exec_block;
-            last_val = val_block;
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
+        super::metrics::poll_until(
+            "executor/validator to settle",
+            Duration::from_secs(60),
+            Duration::from_millis(500),
+            async || {
+                let settled = self
+                    .drain_settled_once(exec_addr, val_addr, &mut last_exec, &mut last_val)
+                    .await?;
+                Ok(settled.then_some(()))
+            },
+        )
+        .await
+        .with_context(|| {
+            format!(
                 "drain: executor/validator did not settle in 60s \
-                 (executor durable {exec_block}, validator committed {val_block})"
-            );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+                 (executor durable {last_exec}, validator committed {last_val})"
+            )
+        })
+    }
+
+    /// One [`Self::drain_until_settled`] tick: scrape both metrics, and
+    /// report whether both are stable across this interval with the
+    /// validator not behind. `last_exec`/`last_val` carry the previous
+    /// tick's sample, so two consecutive identical reads mean settled.
+    async fn drain_settled_once(
+        &self,
+        exec_addr: SocketAddr,
+        val_addr: Option<SocketAddr>,
+        last_exec: &mut f64,
+        last_val: &mut f64,
+    ) -> Result<bool> {
+        let exec_block = super::metrics::scrape(exec_addr)
+            .await?
+            .value(crate::scenarios::EXEC_BLOCK_NUMBER)
+            .unwrap_or(0.0);
+        let val_block = match val_addr {
+            // No validator: treat its half as already settled.
+            None => exec_block,
+            Some(addr) => super::metrics::scrape(addr)
+                .await?
+                .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK)
+                .unwrap_or(0.0),
+        };
+        #[allow(
+            clippy::float_cmp,
+            reason = "exact equality is the intended check here: both gauges come from \
+                       the same metric source, so an unchanged value scrapes back \
+                       bit-identical"
+        )]
+        let stable = exec_block == *last_exec && val_block == *last_val;
+        *last_exec = exec_block;
+        *last_val = val_block;
+        Ok(stable && val_block >= exec_block)
     }
 
     pub(super) fn dump_tails(&self) {

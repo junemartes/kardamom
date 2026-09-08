@@ -17,6 +17,10 @@
 //!   simulates about 30 ms of A-publisher lag. The tx_ordering reader
 //!   must spin and pick up the envelope once it lands.
 
+const QUEUE_DEPTH_8: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+const QUEUE_DEPTH_512: NonZeroUsize = NonZeroUsize::new(512).unwrap();
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -37,10 +41,11 @@ use rand_chacha::ChaCha8Rng;
 use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_engine::{
-    BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
-    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ReaderConfig,
-    ResumePoint, RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
-    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, EngineWiring, ExecPorts, Executor, ExecutorConfig,
+    ExecutorError, Inbound, MockStateDatabase, MutatingSnapshotSource, NoBlockExec, NoEpochCheck,
+    NoRemoteEpochCheck, Outbound, ReaderConfig, ResumePoint, RoleHooks, StateWriterSignal,
+    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription,
+    TxReceiptsPublication, TxRef, WriterApplyingQueue,
 };
 use kardamom_log::testing::{
     FakeBus, FakeTxDataPublication, FakeTxDataSubscription, FakeTxOrderingPublication,
@@ -137,14 +142,19 @@ impl StateWriterSignal for Imm {
 
 /// Port types for these tests' fake-bus adapters.
 struct TestWiring;
-impl EngineWiring for TestWiring {
-    type TxData = FakeTxDataSubAdapter;
-    type TxOrdering = FakeTxOrderingSubAdapter;
-    type TxReceipts = ChanReceiptsPub;
+impl ExecPorts for TestWiring {
     type Snapshots = MutatingSnapshotSource;
     type WriterSignal = Imm;
     type WriterQueue = WriterApplyingQueue;
     type Epoch = NoEpochCheck;
+    type RemoteEpoch = NoRemoteEpochCheck;
+    type BlockExec = NoBlockExec;
+}
+
+impl EngineWiring for TestWiring {
+    type TxData = FakeTxDataSubAdapter;
+    type TxOrdering = FakeTxOrderingSubAdapter;
+    type TxReceipts = ChanReceiptsPub;
 }
 
 fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address) -> KtTxEnvelope {
@@ -300,8 +310,8 @@ fn m4_canonical_b_order_drives_receipts() {
 
     let (c_tx, c_rx) = bounded::<CMessage>(512);
     let cfg = ExecutorConfig {
-        chain_id: 1,
-        receipt_queue_depth: 512,
+        chain_id: NonZeroU64::MIN,
+        receipt_queue_depth: QUEUE_DEPTH_512,
         ..Default::default()
     };
 
@@ -475,8 +485,8 @@ fn tx_ref_arriving_before_envelope_still_joins() {
 
     // Give the tx_ordering reader's join wait enough headroom even on slow CI.
     let cfg = ExecutorConfig {
-        chain_id: 1,
-        receipt_queue_depth: 8,
+        chain_id: NonZeroU64::MIN,
+        receipt_queue_depth: QUEUE_DEPTH_8,
         reader: ReaderConfig {
             join_timeout: Duration::from_millis(500),
             join_poll_interval: Duration::from_micros(100),

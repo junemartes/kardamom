@@ -14,9 +14,13 @@ testing = []
 # `cargo test` works in environments without a Docker daemon. Pulls
 # `testcontainers` in as a real (non-dep) dep because the e2e harness in
 # `testing::AeronTestCluster` is reused by other crates' integration tests.
-docker-e2e = ["testing", "dep:testcontainers"]
+docker-e2e = ["testing", "dep:testcontainers", "dep:anyhow"]
 
 [dependencies]
+# Only for `testing::AeronTestCluster`'s docker setup/teardown, behind
+# `docker-e2e`: those calls mix `std::io::Error`, testcontainers errors,
+# and ad hoc failures with no single concrete type to name.
+anyhow = { workspace = true, optional = true }
 crossbeam-channel.workspace = true
 futures.workspace = true
 kardamom-types.workspace = true

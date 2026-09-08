@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, U256};
-use kardamom_engine::actor::{BlockExec, BlockExecOutput, BufferedRecord};
+use kardamom_engine::actor::{BlockExecOutput, BlockExecStrategy, BufferedRecord};
 use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::error::ExecutorError;
@@ -57,43 +57,66 @@ pub(crate) fn build_seed<S: StateDatabase>(
         .copied()
         .collect();
     for addr in addrs {
-        let claimed_bal = claims.balance_seed(addr, before);
-        let claimed_nonce = claims.nonce_seed(addr, before);
-        let claimed_code = claims.code_seed(addr, before);
-        if claimed_bal.is_none() && claimed_nonce.is_none() && claimed_code.is_none() {
-            continue; // Nothing is claimed before this batch, so the snapshot stands.
-        }
-        let base = match seed.accounts.get(&addr) {
-            Some(v) => *v, // The parent layer already has the freshest base.
-            None => snapshot
-                .basic(addr)
-                .map_err(|e| ExecutorError::State(format!("seed basic({addr:?}): {e}")))?
-                .unwrap_or((0, U256::ZERO, alloy_primitives::KECCAK256_EMPTY)),
-        };
-        let code_hash = match claimed_code {
-            Some(code) => {
-                let h = alloy_primitives::keccak256(code);
-                seed.code.insert(h, code.clone());
-                h
-            }
-            None => base.2,
-        };
-        seed.accounts.insert(
-            addr,
-            (
-                claimed_nonce.unwrap_or(base.0),
-                claimed_bal.unwrap_or(base.1),
-                code_hash,
-            ),
-        );
+        seed_one_account(&mut seed, snapshot, claims, before, addr)?;
     }
 
-    for (addr, slot) in claims.storage.keys() {
-        if let Some(v) = claims.storage_seed(*addr, *slot, before) {
-            seed.storage.insert((*addr, *slot), v);
-        }
-    }
+    seed.storage
+        .extend(claims.storage.keys().filter_map(|(addr, slot)| {
+            claims
+                .storage_seed(*addr, *slot, before)
+                .map(|v| ((*addr, *slot), v))
+        }));
     Ok(seed)
+}
+
+/// Seed one account's fields from the latest claim strictly before the
+/// batch, falling back to the parent layer or the snapshot per field. A
+/// no-op when nothing is claimed before this batch: the snapshot stands.
+/// The loop in [`build_seed`] stays free of a branch.
+fn seed_one_account<S: StateDatabase>(
+    seed: &mut PendingDelta,
+    snapshot: &S,
+    claims: &ClaimIndex,
+    before: u64,
+    addr: Address,
+) -> Result<(), ExecutorError> {
+    let claimed_bal = claims.balance_seed(addr, before);
+    let claimed_nonce = claims.nonce_seed(addr, before);
+    let claimed_code = claims.code_seed(addr, before);
+    if claimed_bal.is_none() && claimed_nonce.is_none() && claimed_code.is_none() {
+        return Ok(());
+    }
+    let base = match seed.accounts.get(&addr) {
+        Some(v) => *v, // The parent layer already has the freshest base.
+        None => snapshot
+            .basic(addr)
+            .map_err(|e| ExecutorError::State(format!("seed basic({addr:?}): {e}")))?
+            .map_or(
+                kardamom_engine::delta::AccountFields {
+                    nonce: 0,
+                    balance: U256::ZERO,
+                    code_hash: alloy_primitives::KECCAK256_EMPTY,
+                },
+                kardamom_engine::delta::AccountFields::from,
+            ),
+    };
+    let code_hash = match claimed_code {
+        Some(code) => {
+            let h = alloy_primitives::keccak256(code);
+            seed.code.insert(h, code.clone());
+            h
+        }
+        None => base.code_hash,
+    };
+    seed.accounts.insert(
+        addr,
+        kardamom_engine::delta::AccountFields {
+            nonce: claimed_nonce.unwrap_or(base.nonce),
+            balance: claimed_bal.unwrap_or(base.balance),
+            code_hash,
+        },
+    );
+    Ok(())
 }
 
 // Record dispatch (tx vs. deposit vs. cross-chain delivery) lives in the
@@ -248,7 +271,7 @@ fn verify_units(
             Ok(())
         });
     }
-    let k = u64::from(granularity.get());
+    let k = std::num::NonZeroU64::from(granularity);
     let chunk = kardamom_engine::bal_ladder::chunk_of(first_index, k);
     let claimed = claims.claims_in_range(chunk, chunk);
     let mut computed = computed_idx.claims_in_range(chunk, chunk);
@@ -343,7 +366,9 @@ pub struct BlockInputs<'a, S> {
 /// caller's own snapshot instead, correct but serialized. The fallback is
 /// counted, so a silent loss of the fix shows up on the dashboard.
 fn fork_snapshots<S: StateDatabase + Sync>(pool: &WorkerPool, snapshot: &S) -> Vec<Option<S>> {
-    let forks: Vec<Option<S>> = (0..pool.workers()).map(|_| snapshot.fork_view()).collect();
+    let forks: Vec<Option<S>> = (0..pool.workers().get())
+        .map(|_| snapshot.fork_view())
+        .collect();
     let refused = forks.iter().filter(|f| f.is_none()).count();
     if refused > 0 {
         crate::metrics::counter_fork_fallback(refused as u64);
@@ -362,7 +387,6 @@ fn run_batches<S: StateDatabase + Sync>(
     forks: &[Option<S>],
     inputs: &BlockInputs<'_, S>,
 ) -> Result<Vec<BatchOutcome>, ExecutorError> {
-    let k = u64::from(inputs.granularity.get());
     let slots: Vec<std::sync::OnceLock<Result<BatchOutcome, ExecutorError>>> =
         ranges.iter().map(|_| std::sync::OnceLock::new()).collect();
     let body = |lane: usize, ci: usize| {
@@ -375,11 +399,7 @@ fn run_batches<S: StateDatabase + Sync>(
         let snap: &S = forks[lane].as_ref().unwrap_or(inputs.snapshot);
         // Seeds look up "latest claim strictly before this batch" in the
         // claim index space: tx indices at K = 1, chunk numbers at K > 1.
-        let before = if k > 1 {
-            kardamom_engine::bal_ladder::chunk_of(from, k)
-        } else {
-            from
-        };
+        let before = kardamom_engine::bal_ladder::claim_index(from, inputs.granularity);
         let out = build_seed(snap, inputs.parent, inputs.claims, before).and_then(|seed| {
             execute_batch(
                 snap,
@@ -469,70 +489,98 @@ pub(crate) fn execute_block_sequential<S: StateDatabase>(
     kardamom_engine::stateless::execute_block(snapshot, parent, records, env)
 }
 
-/// Build the validator's whole-block execution strategy: seeded parallel
-/// batches when this block's BAL claims arrive in time, sequential
-/// otherwise. Deposits take part like transactions. The executor captures
-/// their writes into the BAL at their block index (mint as a balance
-/// claim, CREATE bytecode as a code claim), so deposit-containing blocks
-/// validate in parallel too.
-pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
+/// The validator's whole-block execution strategy: seeded parallel
+/// batches when a block's BAL claims arrive in time, sequential
+/// otherwise. Deposits take part like transactions. The executor
+/// captures their writes into the BAL at their block index (mint as a
+/// balance claim, CREATE bytecode as a code claim), so deposit-containing
+/// blocks validate in parallel too. Build one with [`parallel_block_exec`].
+pub struct ParallelBlockExec {
+    claims: Arc<crate::ClaimBuffer>,
+    batch_size: NonZeroUsize,
+    // Built once and held here, so workers persist across blocks, instead
+    // of spawning one OS thread per batch per block.
+    pool: Arc<WorkerPool>,
+    flight: Option<Arc<crate::flight::FlightRing>>,
+}
+
+/// Build the validator's whole-block execution strategy. See
+/// [`ParallelBlockExec`].
+pub fn parallel_block_exec(
     claims: Arc<crate::ClaimBuffer>,
     batch_size: NonZeroUsize,
     workers: NonZeroUsize,
     flight: Option<Arc<crate::flight::FlightRing>>,
-) -> BlockExec<D> {
-    // The pool is built once and captured, so workers persist across
-    // blocks, instead of spawning one OS thread per batch per block.
-    let pool = Arc::new(WorkerPool::new(workers.get(), Vec::new()));
-    Box::new(
-        move |snapshot: &D,
-              parent: Option<&PendingDelta>,
-              records: &[BufferedRecord],
-              env: ExecEnv,
-              block: u64| {
-            if records.is_empty() {
-                // Empty blocks still enter the flight ring. The prover
-                // spool proves every block, and a gap here would stall it.
-                if let Some(f) = flight.as_ref() {
-                    f.push(block, NonZeroU16::MIN, env, records, None);
-                }
-                return execute_block_sequential(snapshot, parent, records, env);
+) -> ParallelBlockExec {
+    let pool = Arc::new(WorkerPool::new(workers, &[]));
+    ParallelBlockExec {
+        claims,
+        batch_size,
+        pool,
+        flight,
+    }
+}
+
+impl<D: StateDatabase + Sync + 'static> BlockExecStrategy<D> for ParallelBlockExec {
+    fn execute_block(
+        &self,
+        snapshot: &D,
+        parent: Option<&PendingDelta>,
+        records: &[BufferedRecord],
+        env: ExecEnv,
+        block_number: u64,
+    ) -> Result<BlockExecOutput, ExecutorError> {
+        if records.is_empty() {
+            // Empty blocks still enter the flight ring. The prover spool
+            // proves every block, and a gap here would stall it.
+            if let Some(f) = self.flight.as_ref() {
+                f.push(block_number, NonZeroU16::MIN, env, records, None);
             }
-            let Some((granularity, idx)) = claims.take(block, CLAIM_WAIT) else {
-                crate::metrics::counter_parallel_fallback();
-                tracing::debug!(block, "no BAL claims in time; sequential re-execution");
-                if let Some(f) = flight.as_ref() {
-                    f.push(block, NonZeroU16::MIN, env, records, None);
-                }
-                return execute_block_sequential(snapshot, parent, records, env);
-            };
-            if let Some(f) = flight.as_ref() {
-                f.push(block, granularity, env, records, Some(Arc::clone(&idx)));
+            return execute_block_sequential(snapshot, parent, records, env);
+        }
+        let Some((granularity, idx)) = self.claims.take(block_number, CLAIM_WAIT) else {
+            crate::metrics::counter_parallel_fallback();
+            tracing::debug!(
+                block_number,
+                "no BAL claims in time; sequential re-execution"
+            );
+            if let Some(f) = self.flight.as_ref() {
+                f.push(block_number, NonZeroU16::MIN, env, records, None);
             }
-            let inputs = BlockInputs {
-                snapshot,
-                parent,
-                txs: records,
-                claims: &idx,
-                env,
+            return execute_block_sequential(snapshot, parent, records, env);
+        };
+        if let Some(f) = self.flight.as_ref() {
+            f.push(
+                block_number,
                 granularity,
-            };
-            let out = match execute_block_parallel(&pool, &inputs, batch_size) {
-                Ok(out) => out,
-                Err(e) => {
-                    // Dump the exact inputs, so the failing block can
-                    // replay as a unit test.
-                    dump_divergence_inputs(block, records, &idx, parent, granularity, &e);
-                    return Err(e);
-                }
-            };
-            crate::metrics::counter_parallel_block(out.batches);
-            Ok(BlockExecOutput {
-                receipts: out.receipts,
-                delta: out.delta,
-                // The validator verifies BALs; it never publishes one.
-                bal: None,
-            })
-        },
-    )
+                env,
+                records,
+                Some(Arc::clone(&idx)),
+            );
+        }
+        let inputs = BlockInputs {
+            snapshot,
+            parent,
+            txs: records,
+            claims: &idx,
+            env,
+            granularity,
+        };
+        let out = match execute_block_parallel(&self.pool, &inputs, self.batch_size) {
+            Ok(out) => out,
+            Err(e) => {
+                // Dump the exact inputs, so the failing block can replay
+                // as a unit test.
+                dump_divergence_inputs(block_number, records, &idx, parent, granularity, &e);
+                return Err(e);
+            }
+        };
+        crate::metrics::counter_parallel_block(out.batches);
+        Ok(BlockExecOutput {
+            receipts: out.receipts,
+            delta: out.delta,
+            // The validator verifies BALs; it never publishes one.
+            bal: None,
+        })
+    }
 }

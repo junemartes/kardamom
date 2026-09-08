@@ -4,6 +4,7 @@
 //! sealed block. The state writer commits them atomically.
 
 use alloc::vec::Vec;
+use core::num::NonZeroU16;
 
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
@@ -64,8 +65,11 @@ pub struct BalFrame {
     /// `granularity`. This is empty when capture is disabled.
     pub bal_rlp: Vec<u8>,
     /// Attribution granularity. `1` means per-transaction. `K > 1` collapses
-    /// chunks of `K` transactions.
-    pub granularity: u16,
+    /// chunks of `K` transactions. Never zero: the archived form rejects a
+    /// zero byte pattern at decode time, so a corrupt or malicious producer
+    /// loses the whole frame (the `bal_missing` posture) instead of handing
+    /// every reader a value they must re-check.
+    pub granularity: NonZeroU16,
 }
 
 impl BalFrame {
@@ -84,4 +88,48 @@ pub struct BlockDelta {
     pub storage: Vec<StorageChange>,
     pub code: Vec<CodeEntry>,
     pub receipts: Vec<Receipt>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BalFrame, BlockDelta, NonZeroU16, Vec};
+
+    fn frame(granularity: u16) -> BalFrame {
+        BalFrame {
+            delta: BlockDelta::default(),
+            bal_rlp: Vec::new(),
+            granularity: NonZeroU16::new(granularity).expect("fixture granularity"),
+        }
+    }
+
+    /// Defect: a `BalFrame` with `granularity` zeroed on the wire must fail
+    /// to decode, not silently hand every reader an invalid value. The
+    /// archived form has the same layout as `u16`, so this locates the
+    /// granularity bytes by diffing two otherwise-identical encodings, then
+    /// zeroes exactly those bytes in a third and checks decode rejects it.
+    #[test]
+    fn a_zeroed_granularity_byte_pattern_fails_to_decode() {
+        let one = rkyv::to_bytes::<rkyv::rancor::Error>(&frame(1)).unwrap();
+        let two = rkyv::to_bytes::<rkyv::rancor::Error>(&frame(2)).unwrap();
+        assert_eq!(one.len(), two.len(), "only the granularity value differs");
+        let diff_positions: Vec<usize> = one
+            .iter()
+            .zip(two.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !diff_positions.is_empty(),
+            "granularity must appear somewhere in the archive"
+        );
+        let mut corrupted = one.to_vec();
+        for i in diff_positions {
+            corrupted[i] = 0;
+        }
+        assert!(
+            rkyv::from_bytes::<BalFrame, rkyv::rancor::Error>(&corrupted).is_err(),
+            "a zero granularity must not decode"
+        );
+    }
 }

@@ -6,7 +6,7 @@
 //! (hot data) from the cost of reaching cold write sets scattered across
 //! a 1.8MB result set, because the two need completely different fixes.
 use alloy_primitives::{Address, B256, U256};
-use kardamom_exec_core::delta::WriteSet;
+use kardamom_exec_core::delta::{AccountFields, WriteSet};
 
 mod common;
 use common::ns_per_op;
@@ -19,8 +19,14 @@ fn transfer_ws(i: u64) -> WriteSet {
             reason = "the address suffix wraps mod 256 on purpose: this only needs 3000 distinct-enough addresses, not a faithful account identity"
         )]
         let addr = Address::with_last_byte((i + k) as u8);
-        ws.accounts
-            .push((addr, (i, U256::from(1_000_000u64 + i + k), B256::ZERO)));
+        ws.accounts.push((
+            addr,
+            AccountFields {
+                nonce: i,
+                balance: U256::from(1_000_000u64 + i + k),
+                code_hash: B256::ZERO,
+            },
+        ));
     }
     ws.finish();
     ws

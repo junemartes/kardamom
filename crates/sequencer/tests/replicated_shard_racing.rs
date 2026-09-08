@@ -139,48 +139,66 @@ fn first_seen_dedup_of_any_interleaving_is_the_single_replica_stream() {
     // adversarial interleavings (seeded, reproducible): random alternation
     // that keeps each replica's own order.
     for seed in 0..8u64 {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let mut ia = a.iter();
-        let mut ib = b.iter();
-        let mut order: Vec<bool> = std::iter::repeat_n(true, a.len())
-            .chain(std::iter::repeat_n(false, b.len()))
-            .collect();
-        order.shuffle(&mut rng);
-        let interleaved: Vec<TxRef> = order
-            .into_iter()
-            .map(|from_a| {
-                if from_a {
-                    *ia.next().unwrap()
-                } else {
-                    *ib.next().unwrap()
-                }
-            })
-            .collect();
-
-        let canonical = first_seen_merge(&interleaved);
-        assert_eq!(
-            encoded(&canonical),
-            encoded(&a),
-            "seed {seed}: dedup must converge on the single-replica stream"
-        );
-        // Per-sender nonce order in the canonical stream is dense and
-        // ascending. (The stream is built round-robin, so stream[i]'s
-        // nonce is i / SENDERS. No need to RLP-decode.)
-        let mut next: std::collections::HashMap<Address, u64> =
-            std::collections::HashMap::default();
-        for r in &canonical {
-            let (idx, env) = stream
-                .iter()
-                .enumerate()
-                .find(|(_, (_, e))| e.tx_hash == r.tx_hash)
-                .map(|(i, (_, e))| (i, e))
-                .unwrap();
-            let nonce = idx as u64 / SENDERS as u64;
-            let want = next.entry(env.sender).or_insert(0);
-            assert_eq!(nonce, *want, "sender nonce order inverted");
-            *want += 1;
-        }
+        check_interleaving(seed, &a, &b, &stream);
     }
+}
+
+/// One [`first_seen_dedup_of_any_interleaving_is_the_single_replica_stream`]
+/// seed: shuffle `a` and `b` (keeping each replica's own session order),
+/// merge by first-seen `canonical_id`, and check the result converges on
+/// the single-replica stream with dense, ascending per-sender nonces.
+fn check_interleaving(seed: u64, a: &[TxRef], b: &[TxRef], stream: &[(TxDataLoc, TxEnvelope)]) {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut ia = a.iter();
+    let mut ib = b.iter();
+    let mut order: Vec<bool> = std::iter::repeat_n(true, a.len())
+        .chain(std::iter::repeat_n(false, b.len()))
+        .collect();
+    order.shuffle(&mut rng);
+    let interleaved: Vec<TxRef> = order
+        .into_iter()
+        .map(|from_a| {
+            if from_a {
+                *ia.next().unwrap()
+            } else {
+                *ib.next().unwrap()
+            }
+        })
+        .collect();
+
+    let canonical = first_seen_merge(&interleaved);
+    assert_eq!(
+        encoded(&canonical),
+        encoded(a),
+        "seed {seed}: dedup must converge on the single-replica stream"
+    );
+    // Per-sender nonce order in the canonical stream is dense and
+    // ascending. (The stream is built round-robin, so stream[i]'s
+    // nonce is i / SENDERS. No need to RLP-decode.)
+    let mut next: std::collections::HashMap<Address, u64> = std::collections::HashMap::default();
+    for r in &canonical {
+        assert_dense_ascending_nonce(stream, &mut next, r);
+    }
+}
+
+/// One canonical ref's nonce must be the next dense, ascending nonce for
+/// its sender. (The stream is built round-robin, so `stream[i]`'s nonce
+/// is `i / SENDERS`. No need to RLP-decode.)
+fn assert_dense_ascending_nonce(
+    stream: &[(TxDataLoc, TxEnvelope)],
+    next: &mut std::collections::HashMap<Address, u64>,
+    r: &TxRef,
+) {
+    let (idx, env) = stream
+        .iter()
+        .enumerate()
+        .find(|(_, (_, e))| e.tx_hash == r.tx_hash)
+        .map(|(i, (_, e))| (i, e))
+        .unwrap();
+    let nonce = idx as u64 / SENDERS as u64;
+    let want = next.entry(env.sender).or_insert(0);
+    assert_eq!(nonce, *want, "sender nonce order inverted");
+    *want += 1;
 }
 
 /// A deliberately re-opened status pin: the floor fast-forward was removed
@@ -247,7 +265,7 @@ fn client_abandoned_nonce_hole_is_never_published_past() {
     // Nothing at or past the hole appears, and every sender's run is
     // gapless.
     let mut per_sender: HashMap<_, Vec<u64>> = HashMap::new();
-    for (loc, env) in &stream {
+    for (loc, env) in stream.iter() {
         // Reconstruct (sender, nonce) for each published ref via its position.
         if let Some(r) = refs.iter().find(|r| r.tx_data_position == loc.position) {
             let e = alloy_consensus::TxEnvelope::decode(&mut env.raw_tx.as_ref()).unwrap();

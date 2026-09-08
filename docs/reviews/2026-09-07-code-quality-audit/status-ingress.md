@@ -630,3 +630,67 @@ Coordinator review of the first follow-up round: accepted. Six small R11/R12/R13
 6. **`tests/stage_costs.rs`'s file-level `#![allow(clippy::cast_precision_loss)]`** now carries its explanation as `reason = "..."` on the attribute itself (R11, the `lint_reasons` attribute form), instead of as a preceding module-doc paragraph; the old paragraph is deleted.
 
 **Gates, rerun after this round:** `cargo clippy -- -D warnings`: clean. `cargo clippy -- -W clippy::pedantic`, this group's own files: zero warnings. `cargo fmt --check`: clean. `cargo test -p kardamom-ingress -p kardamom-interop-feed --features binary-protocol`: 17 binaries, 91 tests, 0 failed — unchanged, confirming the struct/NonZero/shared-builder changes preserved behavior exactly.
+
+## Round B (group C: da_watcher, interop-feed, cluster-adapter, cluster-client, sequencer, log, ingress, obs)
+
+Item 5 of this round's brief: `IngressConfig.partition_count_m`/`chain_id` parsed once at the
+config boundary as `NonZeroU32`/`NonZeroU64`.
+
+- `crates/ingress/src/config.rs`: `IngressConfig.partition_count_m: u32` →
+  `NonZeroU32`; `.chain_id: u64` → `NonZeroU64` (doc notes EIP-155 forbids 0). `Default` uses
+  `nonzero_ext::nonzero!(8u32)` / `nonzero!(1u64)`, matching the file's existing style for its
+  other `NonZero*` fields.
+- `crates/ingress/src/proxy/mod.rs`: `IngressProxy::new`'s `NonZeroU32::new(cfg
+  .partition_count_m).expect("must be non-zero")` (an R9 defensive check on a value the type
+  now rules out) is gone; `partition_count_m: cfg.partition_count_m` directly. The doc
+  comments that justified the old plain-`u32` field (for `crates/bench`'s literals) are
+  deleted, since the field itself no longer needs that justification.
+- `crates/ingress/src/json_rpc.rs`: `chain_id()` RPC handler reads `.chain_id.get()`; its own
+  test's `IngressConfig { chain_id: 31337, .. }` literal is `NonZeroU64::new(31337).unwrap()`.
+- `crates/ingress/src/test_support.rs`: `start_test_server`'s `usize::try_from(cfg
+  .partition_count_m)` is `usize::try_from(cfg.partition_count_m.get())`.
+- `crates/ingress/src/bin/kardamom-ingress/main.rs`: `build_config` passes
+  `NonZeroU32::from(args.shards)` (widening `NonZeroU8` → `NonZeroU32`, no `.get()`
+  round-trip) and `args.chain_id` directly, instead of `u32::from(args.shards.get())` /
+  `args.chain_id.get()`; the `shards = cfg.partition_count_m` log field is `cfg
+  .partition_count_m.get()` (`tracing`'s `Value` impls do not cover `NonZero*`).
+
+Item 4's `DeliverFn` removal (see `status-log.md`) rippled into this crate:
+`crates/ingress/src/aeron_adapters.rs`'s `TxReceiptsSubscriberHandle::into_receiver()` now
+returns a new `kardamom_log::aeron_live::TxReceiptsReceiver`, not a raw tokio
+`UnboundedReceiver`. Added one `impl_pump_source!(TxReceiptsReceiver, Receipt)` line next to
+the other three; no other change, since the macro already targets exactly this shape
+(`recv().await -> Option<(BPosition, Item)>`), and `TxReceiptsReceiver` has it. The generic
+blanket `impl<T> PumpSource for UnboundedReceiver<(BPosition, T)>` stays — this crate's own
+`pump_fans_out_and_ends_on_close` test builds one directly.
+
+### Cross-file items this agent could not do (owned elsewhere)
+
+- `crates/ingress/tests/*.rs` (owned by the tests-directory agent, not this group):
+  `replicated_cluster_test.rs:151`, `end_to_end_test.rs:29,86,159,243,310`,
+  `receipt_subscription_test.rs:30`, `routing_test.rs:22`, `pending_receipts_test.rs:17` all
+  build `IngressConfig { partition_count_m: <u32 literal or var>, .. }` /
+  `{ chain_id: 1, .. }`; each needs the literal wrapped in `NonZeroU32::new(..).unwrap()` /
+  `NonZeroU64::new(..).unwrap()`, or (for a variable) `.try_into().unwrap()`.
+- `crates/ingress/benches/latency.rs:24` and `throughput.rs:26`: same
+  `partition_count_m: 8` literal, not owned by this group.
+- `crates/bench/src/harness/inprocess.rs:71-72` and
+  `crates/bench/tests/alloc_profile_ingress.rs:182` (a separate crate, `crates/bench`, not
+  owned by this group): `inprocess.rs` builds `IngressConfig { chain_id, partition_count_m:
+  shards, .. }` from its own `u64`/`u32` locals; `alloc_profile_ingress.rs` does `MockChannels
+  ::new(cfg.partition_count_m as usize)`, which needs `.get() as usize` (or `usize::try_from`).
+
+### Gates
+
+- `cargo clippy -p kardamom-ingress --lib --bins --all-features -- -D warnings -W
+  clippy::pedantic -D unreachable_pub`: clean, after also narrowing 10 pre-existing
+  `unreachable_pub` items in `pending/mod.rs` (`PendingReceipts` and its methods,
+  `PendingWait::await_with_timeout`) to `pub(crate)` — the `pending` module is already
+  `pub(crate)`, so nothing outside the crate could reach them; found while running this
+  round's gate, not part of the `reaudit-main.md` list.
+- `cargo clippy -p kardamom-ingress --all-targets ...`: the remaining failures are all in
+  `benches/*.rs` and `tests/*.rs` (both listed above, neither owned by this group).
+- `cargo test -p kardamom-ingress --lib --all-features`: 57 pass.
+- `cargo fmt -p kardamom-ingress -- --check`: clean.
+- Forbidden-pattern grep: prints nothing for `crates/ingress/src/**` outside `tests?/`/
+  `test_support`.

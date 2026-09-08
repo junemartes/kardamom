@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use tracing::warn;
 
-use kardamom_types::{BPosition, TxEnvelope};
+use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
 use super::ports::JoinRecovery;
 
@@ -22,9 +22,8 @@ use super::ports::JoinRecovery;
 /// The sequencer stamps the session into `TxRef.tx_data_session_id`, and the
 /// lookup uses it.
 ///
-/// Crate-local for now: `shard` and `session` are plain `u8`/`i32`. Phase B
-/// swaps them for `kardamom-types` newtypes (`ShardId`, `SessionId`) once
-/// those exist; this struct's shape does not change.
+/// `shard` and `session` are plain `u8`/`i32`, matching the wire fields on
+/// `kardamom_types::TxRef` that key this lookup.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(super) struct TxDataKey {
     pub(super) shard: u8,
@@ -123,6 +122,9 @@ pub struct ReaderConfig {
     pub dedup_window: NonZeroUsize,
 }
 
+/// Default [`ReaderConfig::dedup_window`] capacity: 2^20 ids.
+const DEFAULT_DEDUP_WINDOW: NonZeroUsize = NonZeroUsize::new(1 << 20).expect("1 << 20 is nonzero");
+
 impl Default for ReaderConfig {
     fn default() -> Self {
         Self {
@@ -130,7 +132,7 @@ impl Default for ReaderConfig {
             join_refetch_after: Duration::from_secs(10),
             join_poll_interval: Duration::from_micros(50),
             buffer_warn_threshold: 10_000,
-            dedup_window: NonZeroUsize::new(1 << 20).expect("1 << 20 is nonzero"),
+            dedup_window: DEFAULT_DEDUP_WINDOW,
         }
     }
 }
@@ -185,7 +187,7 @@ pub(super) struct JoinWait<'a> {
     cfg: &'a ReaderConfig,
     key: TxDataKey,
     deadline: Instant,
-    recovery: &'a mut Option<Box<dyn JoinRecovery>>,
+    recovery: &'a mut Option<JoinRecovery>,
 }
 
 impl<'a> JoinWait<'a> {
@@ -196,7 +198,7 @@ impl<'a> JoinWait<'a> {
     /// `tx_ordering` reader thread instead of failing this one join.
     pub(super) fn new(
         buffer: &'a JoinBuffer,
-        recovery: &'a mut Option<Box<dyn JoinRecovery>>,
+        recovery: &'a mut Option<JoinRecovery>,
         tx_ref: &kardamom_types::TxRef,
         cfg: &'a ReaderConfig,
     ) -> Result<Self, crate::error::ExecutorError> {
@@ -226,20 +228,36 @@ impl<'a> JoinWait<'a> {
             return Some(env);
         }
         loop {
-            if self.recovery.is_none() {
-                return None; // no recovery wired: the wait above was the whole budget
+            match self.poll_once() {
+                JoinStep::GiveUp => return None,
+                JoinStep::Take(env) => return Some(env),
+                JoinStep::Retry => {}
             }
-            if Instant::now() >= self.deadline {
-                return None;
-            }
-            self.refetch_once();
-            let slice = self.next_slice();
-            if slice.is_zero() {
-                return self.buffer.take(self.key);
-            }
-            if let Some(env) = self.wait_for(slice) {
-                return Some(env);
-            }
+        }
+    }
+
+    /// One refetch-then-wait attempt, after the initial wait in
+    /// [`Self::run`] misses. [`Self::run`]'s loop stays a plain dispatch on
+    /// the result.
+    fn poll_once(&mut self) -> JoinStep {
+        if self.recovery.is_none() {
+            // No recovery wired: the wait in `run` was the whole budget.
+            return JoinStep::GiveUp;
+        }
+        if Instant::now() >= self.deadline {
+            return JoinStep::GiveUp;
+        }
+        self.refetch_once();
+        let slice = self.next_slice();
+        if slice.is_zero() {
+            return match self.buffer.take(self.key) {
+                Some(env) => JoinStep::Take(env),
+                None => JoinStep::GiveUp,
+            };
+        }
+        match self.wait_for(slice) {
+            Some(env) => JoinStep::Take(env),
+            None => JoinStep::Retry,
         }
     }
 
@@ -260,12 +278,17 @@ impl<'a> JoinWait<'a> {
             "join miss on tx_data — refetching from durability archive"
         );
         let mut recovered = 0u64;
-        match r.recover_tx_data(key.shard, key.session, key.position, &mut |loc, env| {
-            buffer.insert(TxDataKey::new(key.shard, loc.session_id, loc.position), env);
-            // A cold diagnostic counter: saturate rather than let a
-            // pathological refetch wrap it back toward zero.
-            recovered = recovered.saturating_add(1);
-        }) {
+        match r.recover_tx_data(
+            key.shard,
+            key.session,
+            key.position,
+            &mut |loc: TxDataLoc, env: TxEnvelope| {
+                buffer.insert(TxDataKey::new(key.shard, loc.session_id, loc.position), env);
+                // A cold diagnostic counter: saturate rather than let a
+                // pathological refetch wrap it back toward zero.
+                recovered = recovered.saturating_add(1);
+            },
+        ) {
             Ok(_) => tracing::info!(
                 target: "kardamom_executor::reader",
                 sequencer_id = key.shard,
@@ -303,13 +326,31 @@ impl<'a> JoinWait<'a> {
             .checked_add(timeout)
             .map_or(self.deadline, |t| t.min(self.deadline));
         loop {
-            thread::sleep(self.cfg.join_poll_interval);
-            if let Some(env) = self.buffer.take(self.key) {
-                return Some(env);
-            }
-            if Instant::now() >= deadline {
-                return None;
+            match self.wait_step(deadline) {
+                JoinStep::Take(env) => return Some(env),
+                JoinStep::GiveUp => return None,
+                JoinStep::Retry => {}
             }
         }
     }
+
+    /// One poll of the join buffer, after sleeping one poll interval. The
+    /// loop in [`Self::wait_for`] stays a plain dispatch on the result.
+    fn wait_step(&self, deadline: Instant) -> JoinStep {
+        thread::sleep(self.cfg.join_poll_interval);
+        match self.buffer.take(self.key) {
+            Some(env) => JoinStep::Take(env),
+            None if Instant::now() >= deadline => JoinStep::GiveUp,
+            None => JoinStep::Retry,
+        }
+    }
+}
+
+/// One join-wait step: give up, take the recovered envelope, or retry.
+/// Shared by [`JoinWait::run`]'s refetch loop and [`JoinWait::wait_for`]'s
+/// poll loop.
+enum JoinStep {
+    GiveUp,
+    Take(TxEnvelope),
+    Retry,
 }

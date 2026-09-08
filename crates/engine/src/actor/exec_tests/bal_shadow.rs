@@ -33,7 +33,7 @@ fn exec_handoff_carries_a_populated_bal() {
     let (h, _rx_e2c) = rig.bal(bal_tx).spawn(rx_r2e);
     h.join().expect("no panic").expect("exec ok");
 
-    let (_boundary, delta, bal) = bal_rx.try_recv().expect("a BAL handoff");
+    let BalHandoff { delta, bal, .. } = bal_rx.try_recv().expect("a BAL handoff");
     assert!(
         !delta.accounts.is_empty(),
         "delta carries the block's writes"

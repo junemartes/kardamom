@@ -237,12 +237,15 @@ mod tests {
             anchor_number: 8_888,
             anchor_hash: B256::repeat_byte(0x33),
             first_seq: 4,
-            messages: vec![kardamom_types::xchain::XChainMessage {
-                source_hash: B256::repeat_byte(0xE7),
-                seq: 4,
-                gas_limit: 100_000,
-                ..Default::default()
-            }],
+            messages: kardamom_types::xchain::NonEmptyVec::new(
+                kardamom_types::xchain::XChainMessage {
+                    source_hash: B256::repeat_byte(0xE7),
+                    seq: 4,
+                    gas_limit: 100_000,
+                    ..Default::default()
+                },
+                Vec::new(),
+            ),
         };
         pubr.try_publish_remote_epoch(&r).unwrap();
 

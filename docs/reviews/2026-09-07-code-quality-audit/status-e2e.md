@@ -924,3 +924,444 @@ accepted. One item: **R12, `xchain.rs`'s receipt contiguity check** (`b0 == b1 &
 1`, the same bare-add shape fixed in `xchain_da_parity.rs` in round 3) is now `b0 == b1 &&
 i1.checked_sub(i0) == Some(1)`. Re-ran clippy `-D warnings` and `cargo fmt -p e2e -- --check`
 (both clean; the other three gates cannot change from one expression swap).
+
+# Round B — re-audit of the main delta (`reaudit-main.md`, e2e section)
+
+Files owned this round: `crates/e2e/**` except `crates/e2e/src/harness/services.rs`. Notes
+for the merged layout: `StackConfig` is `harness/config.rs`, the launch code is
+`harness/launch.rs`, `SealerLaunch` is `harness/sealer.rs`, and `sealer_rejects_a_skipped_seq`
+is `scenarios/xchain.rs`.
+
+## Done
+
+- R3, `harness/mod.rs` 569 → 581 lines — **already resolved by the merge**: the file is 208
+  code lines today. `LocalStack`'s service spawns already live in `harness/launch.rs` and
+  `harness/services.rs`, from the Phase A/C split. No change needed.
+- R11/R15, `harness/sealer.rs` `SealerCluster::launch(root, repo_root, members, tick_ms,
+  remote_origins)` — **already resolved by the merge**: a private `SealerLaunch<'a>` struct
+  (same file) holds those five values as state, and `launch` is now construct-then-drive
+  (`SealerLaunch::new(..)?; launch.spawn_all()?; launch.await_ready()?; launch.finish()`).
+  Every later step (`spawn_all`, `spawn_member`, `await_ready`, `await_leader`,
+  `reserve_endpoint_sets`, `format_member_strings`) takes `&self`/`&mut self`, not loose
+  parameters. No change needed.
+- R14, `harness/inject.rs` `publish_remote_epoch` — rewritten to call the file's own
+  `inject_frames` helper (the same one `publish_corrupt_bal` and `publish_forged_epoch`
+  already use), instead of hand-rolling its own spawn/attach/publish/sleep loop. Removes the
+  duplicate injection shape entirely; the record now encodes once, outside the retry loop.
+- R2 (case by case) + R9 + R12, `scenarios/xchain.rs` `sealer_rejects_a_skipped_seq` — split
+  into a `SkippedSeqCheck<'a>` struct (`t`, `aeron_dir`, `sealer_logs`, `executor_state_dir`,
+  `outcome` as state) with three methods: `inject`, `await_reject_evidence`,
+  `assert_lane_untouched`. The public function is now construct-then-call-three-steps. The
+  two `sequencer_metric_sum(..).await.unwrap_or(0.0)` calls now propagate the scrape error
+  with `?` instead of silently substituting a zero. The `rejects_before + 1.0` float compare
+  keeps a one-line comment stating why it is exact (a counter that only grows by whole
+  units), instead of a bare magic constant.
+- R3, `scenarios/xchain_two_stacks.rs` inline `mod abi_tests` — moved to the sibling file
+  `scenarios/xchain_two_stacks_tests.rs` (`#[path = "xchain_two_stacks_tests.rs"] mod
+  abi_tests;`, following the `scope_tests.rs`-style sibling-file convention used elsewhere in
+  the workspace). `xchain_two_stacks.rs` drops from 515 to 458 lines. While moving it, also
+  fixed a genuine nested loop the audit did not flag: `for data in [..] { for callback in
+  [..] { .. } }` is now one `.flat_map(..).for_each(..)` chain over the cartesian product.
+- R1, audit ids — deleted from `scenarios/xchain.rs` ("audit M4" at the `feed_msg` doc,
+  "audit H2/H9/M6" at `sealer_rejects_a_skipped_seq`'s doc) and
+  `scenarios/xchain_two_stacks.rs` ("audit 2026-09-03, L4" at the abi test's doc, now moved
+  with the file). The invariant text stays; only the reference is gone.
+- Cross-crate (from `status-batcher.md`/`status-e2e.md`'s Phase B deferred rows and
+  `status-validator.md`'s R14 cross-crate rows): `harness/l1/mod.rs` `L1BringUp::prime_anvil`
+  is gone. `L1::launch` now spawns anvil through `kardamom_deployer::testkit::AnvilRig::spawn`
+  (extended this round to take the caller's `Anvil` builder, so `--slots-in-an-epoch 1` and
+  `block_time(1)` still apply), which predeploys the ERC-7955 factory and funds/impersonates
+  `DEV_OWNER` and the batcher EOA. `harness/l1/contracts.rs` now re-exports the
+  `ETHLockbox`/`WithdrawalOutputOracle` `sol!` bindings and the anvil dev-account constants
+  from the new `kardamom_deployer::abi`/`kardamom_deployer::dev_keys` modules (see
+  `status-batcher.md`'s Round B section for those), instead of declaring its own copies; it
+  keeps only `L2ToL1MessagePasser`, which has no home elsewhere. Added
+  `features = ["test-support"]` to the `kardamom-deployer` dependency (both the optional
+  `[dependencies]` entry, gated by `full-pipeline-e2e`, and the `[dev-dependencies]` entry) in
+  `crates/e2e/Cargo.toml`.
+- `crates/e2e/src/scenarios/mod.rs` and `crates/e2e/src/scenarios/upgrade.rs`: an unrelated
+  compile break surfaced while gating this round — `kardamom_exec_core::features::Beacon`
+  changed from a packed `(u64, u64, u64)` tuple to a named struct.
+  `ChainStateView::beacon` is now `kardamom_exec_core::features::Beacon`, `beats()` reads
+  `.count`, and `upgrade.rs`'s `assert_beat_every_block` destructures the named fields instead
+  of a tuple.
+- R16 (STYLE.md's expanded "no nested loops" rule, applied to every function touched or newly
+  found by a grep sweep of this group's files): `scenarios/rpc_vectors.rs`'s `matches` had a
+  `for` loop inside each of its `Object`/`Array` match arms; both are now `try_for_each`
+  chains. `tests/chain_semantics/xchain.rs`'s `Ok(diffs) => { for d in diffs { .. } }` is now
+  `diffs.iter().for_each(..)`. (See the "R16 sweep" note below for what this pass did and did
+  not attempt.)
+
+## Not done — cross-file, not this group's file
+
+- R11/R15, `services::spawn_interop_watcher` / `LocalStack::spawn_interop_watcher` →
+  `InteropWatcherSpec` struct — the function itself lives in `harness/services.rs`, owned by
+  the group C agent this round (along with the R9 `CursorReconcile` item on the same
+  function). `LocalStack::spawn_interop_watcher` (`harness/mod.rs`, mine) is a thin forwarder
+  matching that function's signature; left unchanged until the services.rs signature lands, to
+  avoid guessing its final shape.
+- R14, `harness/proc.rs`'s `free_tcp_port` vs. `kardamom_obs::testkit::free_port` — still not
+  done: `free_tcp_port` returns `Result<u16>` with `.context(..)`, while `testkit::free_port`
+  returns a `SocketAddr` and panics on bind failure. Migrating it would turn a
+  `Result`-returning helper into one that can panic at every caller; out of scope for this
+  round's `free_udp_port` item.
+
+## Done, second pass (`free_udp_port` → `kardamom_obs::testkit`, and R16 continued)
+
+- `free_udp_port` moved to `crates/obs/src/testkit.rs` (mine for this one item), matching
+  `free_port`'s shape: `pub fn free_udp_port() -> SocketAddr`, panics on bind failure. Deleted
+  `harness/proc.rs`'s copy. Updated all its callers: `harness/sealer.rs`'s
+  `reserve_endpoint_sets` (now `Vec<[u16; 5]>`, no longer `Result`, since the port pick cannot
+  fail; simplified to `std::array::from_fn`), `harness/aeron.rs`'s three-port tuple, and
+  `harness/services.rs`'s six call sites (that file is group C's; this was the one authorized
+  edit in it, `s/free_udp_port()?/kardamom_obs::testkit::free_udp_port().port()/`, plus the
+  import line — nothing else in it touched). Added `kardamom-obs` (optional,
+  `feature = "test-support"`) to `crates/e2e/Cargo.toml`'s `[dependencies]` (gated by
+  `full-pipeline-e2e`, since these are library files, not just `dev-dependencies`).
+- R16, continued: fixed the remaining concrete sites the earlier sweep listed by name —
+  `nudge_until_settled`/`nudge_once_if_unsettled` split (`xchain.rs`), `nudge_until`'s
+  `send_nudge` extraction (`xchain_two_stacks.rs`), `bridge.rs`'s `sample_root_once` (the
+  sampler thread's tick) and `find_matching_posted_output` (the whole poll-tick body, moved out
+  of the `poll_until` closure), `derivation.rs`'s `assert_origin_sequence_is_sound` rewritten as
+  `windows(2).try_for_each(check_origin_step)` + `iter().try_for_each(check_origin_finalized)`,
+  and a new `send_filler_transfers` helper replacing two near-identical spam loops,
+  `nonce_gap.rs`'s `assert_one_parked_timed_out` extraction, `rpc_vectors.rs`'s `parse_line`
+  extraction, a new `poll_sync` (blocking analog of `poll_until`, in `harness/metrics.rs`) used
+  by `harness/sealer.rs`'s `await_leader`/`any_member_is_leader` and four functions in
+  `harness/proc.rs` (`terminate`, `wait_exit`, `wait_for_log_line`, `wait_for_file`), and
+  `harness/l1_verified.rs`'s `read_until_headers_end`/`read_until_length` split. Also fixed
+  `xchain_da_parity.rs`'s `assert_reconstructed_interop_state` (a `for seq in 0..3 { ensure!
+  (..) }` loop, hit while doing the `Inbox`/`Outbox` rename below) as `try_for_each`.
+- **Accepted as terminal / base-case, not rewritten further**: `harness/metrics.rs`'s
+  `poll_until`/`poll_sync` themselves (the shared primitives every other poll loop above now
+  calls — a timed poll fundamentally needs one loop with one readiness check; there is no
+  further reduction that does not just hide the same branch in recursion), `bin/
+  kardamom-semantics.rs`'s `pick_live` (a 3-element sequential async probe with early return;
+  a `futures::stream` rewrite would add a new dependency for one call site, and concurrent
+  probing would change behavior by probing every address instead of stopping at the first
+  live one), and `harness/l1_verified.rs`'s two read loops' own `if n == 0 { .. }` EOF checks
+  (the natural terminal condition of a physical byte-stream read, same shape as the shared
+  poll primitives).
+
+## R16 sweep
+
+The coordinator extended R16 twice mid-round: first to cover a loop inside an `if`/`else`/
+`match` arm, then to cover any nesting of a loop and a branch in either direction (loop in
+loop, loop in branch, branch in loop), with a helper-method or iterator-chain fix required in
+every case. A grep sweep of this group's files under the second, broadest form turns up
+roughly 30 sites, the large majority of which are a single `if`-guarded `continue`/`break`/log
+line inside an otherwise ordinary `for`/`while`/`loop` (poll loops in `harness/proc.rs`,
+`harness/sealer.rs`, `harness/metrics.rs`, `harness/l1_verified.rs`, scenario nudge loops in
+`bridge.rs`/`derivation.rs`/`nonce_gap.rs`/`xchain.rs`/`xchain_two_stacks.rs`, and
+`bin/kardamom-semantics.rs`).
+
+Rewriting all of those into iterator chains or named helpers, on a mechanical "any branch
+touches any loop" reading, would restructure most of this crate's control flow. The coordinator
+confirmed this reading is intended; the follow-up "Done, second pass" section above lists every
+site fixed and the small set kept as an accepted terminal/base case, with the reasoning for
+each. After that pass, a repeat grep of every file this group owns turns up no further
+loop/branch nesting outside the accepted base cases.
+
+## Cross-crate rename (types group): `Outbox`/`Inbox`/`Anchor`
+
+The types group replaced the standalone layout functions with `Outbox`/`Inbox` associated
+functions and `xchain_anchor_hash(origin, block)` with `Anchor { origin_chain_id, block_number
+}.hash()`. Updated every caller in this group's files: `scenarios/xchain.rs` (imports
+`Anchor`/`Inbox`/`Outbox`, drops the local forwarding `pub(crate) use` re-exports of the old
+free-function names — `u64_word` alone stays, now defined once in `scenarios/mod.rs` since
+`kardamom_types::xchain::u64_word` is private in the new layout), `scenarios/
+xchain_two_stacks.rs` and `xchain_two_stacks_tests.rs` (same), `scenarios/xchain_da_parity.rs`
+(also converted its `for seq in 0..3 { ensure!(..) }` loop to `try_for_each` while touching it).
+`harness/inject.rs:100` had no reference to the renamed items by the time this report was
+written (already resolved by the earlier `publish_remote_epoch` DRY pass); no change needed
+there.
+
+## Gates (this round)
+
+- `cargo fmt -p e2e -- --check`: clean on every file this round touched (checked file by file
+  with `rustfmt --edition 2024 --check`, since `cargo check -p e2e --features
+  full-pipeline-e2e` stayed blocked all session — see below).
+- `cargo check -p e2e --all-targets --features full-pipeline-e2e`: **blocked** at the time of
+  this report, not by this group's files. `crates/bench/src/harness/inprocess.rs` (not owned by
+  this group; `e2e` depends on it under `full-pipeline-e2e`) fails to compile against
+  `kardamom-ingress`'s `IngressConfig::{chain_id, partition_count_m}`, now
+  `NonZero<u64>`/`NonZero<u32>` — two plain-integer struct-literal fields need the same
+  `NonZero::new(..).unwrap()` treatment this round applied to `crates/ingress/tests/**` and
+  `crates/ingress/benches/**`. Retried repeatedly across the whole session (the error persisted
+  unchanged each time); still failing when this report was written. `cargo clippy`/`cargo test`
+  for `e2e` are blocked by the same error. A separate, unrelated blocker appeared late in the
+  session and was still present at the final retry: `crates/log/src/refetch.rs:186` and `:282`
+  (not owned by this group) — `if`/`else` arms of mismatched type
+  (`UnboundedReceiver<..>` vs. `TypedSubscription<..>`/`TxDataSubscription`), which also blocks
+  `kardamom-batcher` and `kardamom-validator`'s full-crate gates below.
+
+## Round B follow-up 2 (`followup-roundb-D-2.md` + coordinator addenda)
+
+Working-copy identity at the end of this pass: change_id `pryrnqkovrrqmplqpyowwtukmusxkmwn`,
+commit_id `8b21eb989cb52641df7b7dcc2f54562e5264adaa` (a jj working-copy snapshot in a shared
+workspace, not a git commit — the commit_id moves on the next snapshot; the change_id is
+stable).
+
+### Done
+
+1. R3 (`xchain.rs` line budget): confirmed still 462 code lines (632 total, blank/comment-only
+   excluded), `SkippedSeqCheck`/`sealer_rejects_a_skipped_seq`/`gap_halts_pair_not_chain` live in
+   `scenarios/xchain_skipped_seq.rs`, re-exported.
+2. `derivation.rs:398` (now further down after edits) `cast_precision_loss`: confirmed already
+   `f64::from(u32::try_from(sent.len()).context(..)?)`.
+3. R16 `sequencer/tests/replicated_shard_racing.rs`: the `for seed in 0..8u64` body (previously
+   ending in `canonical.iter().for_each(|r| assert_dense_ascending_nonce(..))`, which the
+   reviewer correctly still counts as a loop) is now one call:
+   `check_interleaving(seed, &a, &b, &stream)`, a new function holding the shuffle, merge, and
+   both assertion loops as siblings (no nesting).
+6. `xchain_two_stacks.rs::nudge_until`: rewritten on `metrics::poll_until`, with the "unmet"
+   detail carried in a `Cell<String>` (`detail.take()` in the timeout message).
+7. `kardamom-semantics.rs::pick_live`: `futures::stream::iter(addrs).filter_map(|a| async move
+   { .. }).next().await`; needed `std::pin::pin!` around the stream (a plain `.next()` on an
+   unpinned `FilterMap` does not compile — `futures::StreamExt::next` requires `Unpin`).
+   `futures.workspace = true` added to `crates/e2e/Cargo.toml`'s `[dependencies]`.
+8. `harness/l1_verified.rs`: `read_until_headers_end`/`read_until_length` unified into one
+   `read_until<T>(sock, buf, done: impl FnMut(&[u8]) -> Option<T>)`.
+9. `multi_archive_reader.rs::Iterator::next`: `let Self { b_reader, a_indexes } = self;
+   b_reader.by_ref().find_map(|raw| Self::classify(a_indexes, raw))`, with `classify` holding
+   the match (batcher-owned file, listed here since the item spanned both docs).
+13, 14, 17, 19: batcher/deployer items — see `status-batcher.md`.
+16 (partial — see Not done): `send_filler_transfers`/nudge logic, `check_origin_step`/
+   `check_origin_finalized`, `sample_root_once`, `parse_line` — not converted to the named
+   structs/methods the brief describes; ran out of round before reaching this item. The
+   `RootSampler`-shaped part of it (item 30's producer thread) IS done, as free functions
+   (`sample_root_once`, `sampler_tick`, `run_sampler`, `drain_samples`) rather than a
+   `RootSampler { dir, last, tx }` struct — see item 30 below for the reasoning.
+20. `harness/proc.rs::free_tcp_port`: confirmed already removed (replaced by
+    `kardamom_obs::testkit::free_port().port()` in an earlier pass); nothing left to do.
+21. `ingress/tests/routing_test.rs`: `const MS: [NonZeroU32; 4]`, `for m in MS`. When this later
+    tripped `clippy::needless_for_each` on the per-`m` result-checking loop (converting it to a
+    plain `for` would have nested it inside `for m in MS`), the whole per-`m` case was extracted
+    into `each_tx_lands_on_keccak_partition_for(m)`, called once per iteration; its two internal
+    loops are then unnested siblings, satisfying both clippy and R16.
+22. `Funding` enum (`FundAndImpersonate`/`FundOnly`) on `kardamom_deployer::testkit::AnvilRig`
+    — see `status-batcher.md` for the fix to a real bug this surfaced (batcher-crate tests were
+    wrongly set to `FundOnly` for the keyless placeholder `BATCHER` address, which only works
+    impersonated; `harness/l1/mod.rs`'s `BATCHER_ADDR`, a real dev key, is the one that should
+    be `FundOnly` — that's the address the brief's "batcher FundOnly" language refers to).
+    `harness/l1/mod.rs` call site updated.
+23. `harness/proc.rs:185,212`: confirmed the leading `{name}:` is already present
+    (`format!("{}: {needle:?}", proc.name)` / `format!("{}: {}", proc.name, path.display())`) —
+    already correct from an earlier pass, nothing further to do.
+25. `obs/tests/common/mod.rs:21`: comment fixed to "`l` drops at the end of this scope" (was
+    "at its last use").
+28. `kardamom-semantics.rs`: the four `NonZeroUsize::new(N).unwrap()` inline literals in
+    `Accounts::nonce_params`/`consistency_params` became named consts (`NONCE_SENDERS`,
+    `NONCE_TXS_PER_SENDER`, `CONSISTENCY_SENDERS`, `CONSISTENCY_TRANSFERS_PER_SENDER`).
+    `ingress/benches/{latency,throughput}.rs`, `ingress/tests/{pending_receipts_test,
+    receipt_subscription_test,end_to_end_test}.rs`: same treatment (`SHARDS`/`CHAIN_ID`/
+    `ONE_HUNDRED_TXS_SHARDS` consts) — see `status-batcher.md`/this doc's ingress section for
+    the follow-on `MockChannels::new(NonZeroUsize)` migration these interact with.
+29. `harness/l1/mod.rs::provider_for`: returns `Result<impl Provider + Clone>`, `.expect(..)` on
+    the URL parse replaced with `.context(..)?`. Every caller updated to propagate with `?`:
+    the two internal call sites in `L1::new`/`lockbox_logs`, and `pub fn provider(&self)` itself
+    (now `-> Result<impl Provider + Clone>`, was infallible) plus its two external callers
+    (`scenarios/da_parity.rs:310`, `scenarios/bridge.rs:251`) and 5 more internal `self.provider()`
+    call sites (`mine`, `warp_past_window`, `initiate_upgrade`, `upgrade_nonce`,
+    `seal_batch`/`set_automine`/`finalized_block_number`), all inside `Result`-returning methods.
+30. R5, mutex → channel/watch:
+    - `scenarios/bridge.rs::find_attested_output`'s sampler: was two `Arc<Mutex<..>>` (observed
+      roots, last error) shared between the sampler thread and the poll. Now an `mpsc::Sender<
+      SampleEvent>`/`Receiver<SampleEvent>` — the sampler thread sends `SampleEvent::Root`
+      (deduped against its own last-seen root) or `SampleEvent::Err`; the poll owns plain `Vec<
+      B256>`/`Option<String>` accumulators and drains the channel each tick via
+      `drain_samples`. No mutex, no `.expect("poisoned")` anywhere in the path.
+    - `harness/l1_verified.rs::VerifiedL1`: was `Arc<Mutex<Fault>>`, read with `.lock().unwrap()`
+      per request (many concurrent per-connection tasks) and written by `set_fault`. Converted
+      to `tokio::sync::watch::channel(Fault::None)` — a `Sender<Fault>` held by `VerifiedL1`,
+      a cloned `Receiver<Fault>` per connection task, `*fault_rx.borrow()` to read the current
+      value (no lock to poison), `self.fault.send(f)` to write. This is the "single current
+      value, many concurrent readers" shape a `watch` channel is for, not the "one producer, one
+      consumer stream" shape `mpsc` is for — different from the `bridge.rs` case above, but both
+      are R5's "no mutex where a channel works." Unit test
+      `faults_actually_mutate_the_proxied_reply` still passes unchanged.
+
+Coordinator addendum items (this round):
+- `CursorReconcile`: `LocalStack::spawn_interop_watcher` now takes `cursor_reconcile:
+  kardamom_da_watcher::interop::CursorReconcile` directly (not `dest_rpc: Option<&str>` with an
+  internal conversion, which was this group's first pass and re-introduced the invalid-state
+  boundary the coordinator's note explains removing). `tests/chain_semantics/xchain.rs`'s
+  `interop_rig` helper and both direct `spawn_interop_watcher` call sites (S14's two watchers)
+  now build `CursorReconcile::Rpc(..)`/`CursorReconcile::Skip` at the call site; `b_feed_url` is
+  `.clone()`d at its first (Rpc) use since it is borrowed again later as a feed URL, `a_feed_url`
+  is moved at its last use.
+- `u64_word`/`word_u64` dedup (item 26, unblocked once `kardamom_types::xchain` exposed both):
+  `scenarios/mod.rs` no longer defines `u64_word` — it re-exports
+  `kardamom_types::xchain::{u64_word, word_u64}`. `xchain_two_stacks.rs`'s manual
+  `u64::from_be_bytes(seq_word.as_slice()[24..32].try_into().unwrap())` replaced with
+  `word_u64(seq_word)`.
+- The bench-crate move (coordinator addendum, not a numbered item): `crates/e2e/src/harness/
+  l2.rs` imported `kardamom_bench::mnemonic` and re-exported `kardamom_bench::signers::
+  DerivedSigner` solely so `full-pipeline-e2e` could build dev-signer accounts; `kardamom-bench`
+  itself was stale against the merged `kardamom-stm` and blocked every e2e gate all session.
+  Moved `crates/bench/src/mnemonic.rs` and `crates/bench/src/signers.rs` verbatim (R1-R16 fixes
+  only) to `crates/deployer/src/mnemonic.rs`/`signers.rs`, gated `#[cfg(any(test, feature =
+  "test-support"))]` beside `dev_keys`/`abi`. R16 fix along the way:
+  `signers::presign_transfers` had a genuine `'outer: for .. { for .. { break 'outer } }` nested
+  loop; rewritten as `(0..txs_per_signer).flat_map(|o| signers.iter().map(move |s| (o, s))).
+  take(count).map(presign_one).collect()` with `presign_one` as the per-slot helper.
+  `crates/deployer/Cargo.toml`: `alloy-signer-local` gained the `mnemonic` feature (already
+  unconditional, used in `main.rs`); added `alloy-eips`/`rand`, both optional, gated into
+  `test-support`. `harness/l2.rs` now imports from `kardamom_deployer`. Removed `dep:
+  kardamom-bench` from `full-pipeline-e2e`'s feature list and the `[dependencies]` line entirely
+  — confirmed with `grep -rn kardamom_bench crates/e2e/` that nothing else referenced it.
+  `crates/e2e` no longer depends on `kardamom-bench` at all, transitively or otherwise; this is
+  what finally unblocked `cargo check -p e2e --all-targets --all-features`, which had been
+  blocked all session by `kardamom-bench` being stale against the merged `kardamom-stm`. The
+  bench crate's own copies were left in place, per instruction (its group switches at merge).
+- `services.rs`'s `spawn_interop_watcher` signature change (group C): `LocalStack::
+  spawn_interop_watcher` in `harness/mod.rs` updated to match (see `CursorReconcile` above).
+- `kardamom_obs::testkit::poll_until`/`poll_sync` landed: `harness/metrics.rs`'s own copies
+  replaced with `pub use kardamom_obs::testkit::{poll_until, poll_sync};` re-exports (identical
+  signatures, confirmed by grep before switching). Of the five test poll loops the brief named,
+  four are fixed (`da_watcher/tests/l1_watcher.rs:259`, `da_watcher/tests/
+  interop_watcher.rs:74`, `ingress/tests/replicated_cluster_test.rs:197`, `obs/tests/common/
+  mod.rs:37` — all four crates already carried a `kardamom-obs` dev-dependency with
+  `test-support`); the fifth, `validator/tests/prover_spool.rs:44`, is **not** fixed —
+  `crates/validator/Cargo.toml` has no `kardamom-obs` dev-dependency at all, and Cargo.toml is
+  outside this group's `tests/**`-only scope for `crates/validator`. Whoever owns
+  `crates/validator/Cargo.toml` needs to add `kardamom-obs = { path = "../obs", features =
+  ["test-support"] }` to `[dev-dependencies]` before this last site can switch.
+- `ingress`'s `MockChannels::new(usize)` → `MockChannels::new(NonZeroUsize)` (group C's R13
+  change): applied to every call site in this group's `crates/ingress/tests/**` and `crates/
+  ingress/benches/**` files per the coordinator's replacement table, as named `const
+  NonZeroUsize` items where the value is a fixed literal (`rate_limit_test.rs`'s shared
+  `SHARDS`, `protocol_limits_test.rs`'s `SHARDS`, `pending_receipts_test.rs`'s `MOCK_SHARDS`,
+  `end_to_end_test.rs`'s `TWO_MOCK_SHARDS`, both benches' `MOCK_SHARDS`), and as `NonZeroUsize::
+  try_from(m)`/`NonZeroUsize::new(shards as usize)` at call sites where the shard count is a
+  loop or function parameter, not a literal (`routing_test.rs`, `replicated_cluster_test.rs`),
+  matching the coordinator's own fallback guidance for that case. `crates/bench/tests/
+  alloc_profile_ingress.rs` and `crates/bench/src/harness/inprocess.rs` were explicitly left
+  for the bench group, per the table.
+
+### Not done
+
+16 (see above): `NudgeSender`, `BlockOrigin::check_step`/`check_finalized`, `RootSampler`,
+`VectorParser` — not reached.
+
+### Deviations from the brief, with reasons
+
+- Item 30's sampler is four free functions (`sample_root_once`, `sampler_tick`, `run_sampler`,
+  `drain_samples`) in `bridge.rs`, not a `RootSampler { dir, last, tx }` struct with a `tick`/
+  `run` method as item 16 separately asks for. The mutex-to-channel change (the actual R5 ask)
+  is done and tested; the struct wrapping is cosmetic on top of it and was not reached before
+  the round ended.
+
+### Behavior changes to record (item 24)
+
+- `derivation.rs`: a scenario now runs every pair check before the rule-4 checks (same accepted
+  inputs; a different first failure message on a genuine divergence — whichever check the
+  scenario's structure now reaches first, not necessarily rule 4 anymore).
+- `xchain.rs:650` (line number as of the brief; the file has since shifted with the R3 split —
+  the site is `nudge_until_settled`'s scrape-error path): a `/metrics` scrape error inside the
+  settle-poll now fails the poll outright, instead of the old behavior of reading the metric as
+  `0.0` and continuing to poll. A stack whose executor's metrics endpoint goes unreachable mid-
+  test now surfaces that as a real failure instead of silently treating it as "count is still
+  zero."
+
+### Gates (this round)
+
+- `cargo check -p e2e --all-targets --all-features`: **clean** (previously blocked all session
+  by the stale `kardamom-bench` dependency; the bench-crate move above resolved it).
+- `cargo fmt -p e2e --check`: clean.
+- `cargo test -p e2e --lib --all-features`: 2 passed, 0 failed (the crate's only `#[cfg(test)]`
+  unit tests — `chain_semantics`/`kardamom-semantics` integration tests need real Aeron/JVM
+  infra not available in this sandbox; `cargo test -p e2e --all-features --no-run` confirms
+  every test target, including `kardamom-semantics` and `chain_semantics/main.rs`, compiles).
+- `cargo clippy -p e2e --all-targets --all-features -- -D warnings -W clippy::pedantic -W
+  unreachable_pub`: clean in every file this group owns (verified with a `grep -A20
+  'crates/e2e/'` filter over the raw clippy output). Two remaining hits, both in `harness/
+  services.rs` (not owned by this group — off-limits except the one narrow `free_udp_port`
+  edit authorized earlier): `services.rs:246` `needless_pass_by_value` on `cursor_reconcile:
+  CursorReconcile` (clippy wants `&CursorReconcile`; the parameter is genuinely only read via
+  `.cli_args()`), `services.rs:368` `unnecessary_wraps` on `add_archive_endpoints`'s `Result<()>`
+  return (it never actually returns `Err`). With `-D unreachable_pub` instead of `-W`, the run
+  additionally dies in `crates/state/src/checkpoint/manifest.rs:46,57` and `crates/state/src/
+  trie/mod.rs:67,84` (4 `pub` items clippy wants `pub(crate)`) — `crates/state` is not owned by
+  this group at all; retried at intervals across the whole session, never cleared.
+- Forbidden-pattern grep: prints nothing for `crates/e2e/**` outside `tests?/`.
+- `crates/validator --tests --all-features`: blocked at the final retry by
+  `crates/validator/src/parallel/engine.rs:94,95,111` (`kardamom_exec_core` unresolved — a
+  missing `Cargo.toml` dependency edge, not this group's file) and, earlier in the session, by
+  `crates/validator/src/interop/serve/mod.rs:301,349` (`send_messages` unresolved, a
+  `CursorFeed` trait-bound mismatch) and by `crates/stm` (an `AccountFields` tuple-vs-struct
+  refactor landing mid-session in `crates/stm/src/{execute/*,mv.rs}`). None owned by this
+  group; each retried multiple times, none cleared by the final check.
+
+## Round B follow-up 2, item 16 (coordinator reply: "not reached" is not accepted for R15)
+
+Working-copy identity at the end of this pass: change_id `pryrnqkovrrqmplqpyowwtukmusxkmwn`,
+commit_id `a9c4f70f5f74b7b9f95443a4957acea4b883733c`.
+
+- **`BlockOrigin::check_step`/`check_finalized`** (`derivation.rs`): `check_origin_step(p, b)` →
+  `impl BlockOrigin { fn check_step(&self, prev: &Self) }`, called as `w[1].check_step(&w[0])`;
+  `check_origin_finalized(b, l1_finalized)` → `fn check_finalized(&self, l1_finalized: u64)`.
+- **`VectorParser`** (`rpc_vectors.rs`): `parse_line(ln, line, &mut pending, &mut out)` →
+  `VectorParser { pending: Option<Value>, out: Vec<(Value, Value)> }` with a `parse_line(&mut
+  self, ln, line)` method and a `finish(self) -> Result<Vec<(Value, Value)>>` that checks no
+  request is left pending.
+- **`RootSampler`** (`bridge.rs`): the four free functions from item 30's mutex→channel pass
+  (`sample_root_once`, `sampler_tick`, `run_sampler`, `drain_samples`) became `RootSampler {
+  dir, last, tx }` with `tick(&mut self) -> bool` and `run(mut self, stop: &AtomicBool)`.
+  `sample_root_once` stays a free function (a pure read+classify with no natural receiver
+  state beyond the two params `tick` already threads into it); `drain_samples` (the poll side,
+  not the sampler thread's own state) also stays free, since it does not belong to
+  `RootSampler` — it runs on the consumer side, draining the channel `RootSampler` sends into.
+- **`NudgeSender`** (`harness/l2.rs`, new `pub struct`/`impl`, used from all three files): a
+  `(signer: DerivedSigner, payee: Address, nonce: u64)` triple with `send(&mut self, rpc:
+  &L2Client, chain_id: u64) -> Result<Option<SignedTransfer>>` (signs and sends one 1-wei
+  transfer at the current nonce; advances the nonce only on a landed send, so a failed send
+  retries the same nonce), plus `nonce()`/`signer()`/`payee()` accessors and a `next_nonce(&mut
+  self) -> Result<u64>` (advances unconditionally, checked, for a caller that signs a
+  non-transfer tx shape but shares the same nonce sequence). `NudgeSender` owns its `signer`
+  (by value, not `&'a DerivedSigner`) specifically so it can be embedded as a field in a struct
+  that also holds other state referencing the same logical sender (`DeliveryRun`, `ChainSender`)
+  without becoming self-referential; every call site that used to hold a borrowed signer now
+  clones it once at construction (`DerivedSigner: Clone`, cheap — a `PrivateKeySigner` plus an
+  `Address`).
+  - `derivation.rs::send_filler_transfers`: now builds one `NudgeSender` and calls `.send()` in
+    a loop. **Behavior change**: the original loop assigned nonces `0..count` unconditionally
+    (a failed send just left a gap in the nonce sequence — the doc comment already says this is
+    fine, "the spam is filler, not the thing under test"); `NudgeSender::send`'s retry-same-
+    nonce-on-failure semantics means a failed attempt is retried at the same nonce instead of
+    skipped. `count` still bounds the number of attempts (not landed sends), so callers reading
+    the returned `Vec<B256>`'s length are unaffected — it still means "how many actually landed."
+  - `xchain.rs::DeliveryRun`: `sender: &'a DerivedSigner`, `payee: Address`, `nonce: u64` fields
+    replaced by one `nudge: l2::NudgeSender` field; `deploy_receiver` (a CREATE tx, not a
+    transfer, so it can't go through `NudgeSender::send`) uses `next_nonce()` for the shared
+    sequence and `self.nudge.signer()` for signing; `nudge_once_if_unsettled` now calls
+    `self.nudge.send(&self.t.rpc, self.t.chain_id)` and pushes the returned tx into `user_txs`
+    on `Some`.
+  - `xchain_two_stacks.rs::ChainSender`: same restructuring — `signer`/`payee`/`nonce` fields
+    replaced by one `nudge: l2::NudgeSender` field, with `signer()`/`payee()`/`next_nonce()`
+    forwarding methods kept (`send_message` needs the raw signer and a shared nonce for its own
+    `sendMessage` calldata, not a transfer); `send_nudge` now just calls `self.nudge.send(..)`.
+    Three call sites outside `ChainSender` itself updated: `sender_b.signer` → `sender_b.
+    signer()`, `sender_b.signer.address.create(0)` → `sender_b.signer().address.create(0)`,
+    `leg.sender_a.payee` → `leg.sender_a.payee()`.
+
+Also fixed in this pass, on the coordinator's further messages:
+- `LocalStack::spawn_interop_watcher` (`harness/mod.rs`) now takes `cursor_reconcile: &
+  kardamom_da_watcher::interop::CursorReconcile` (group C changed `services::
+  spawn_interop_watcher` to the same, to fix a pedantic `needless_pass_by_value` hit); `tests/
+  chain_semantics/xchain.rs`'s `interop_rig` and its two callers, and the two direct
+  `spawn_interop_watcher` call sites in S14, updated to pass `&CursorReconcile::..`.
+- `tests/chain_semantics/xchain.rs:333`: a second, pre-existing `needless_for_each` hit
+  (`diffs.iter().for_each(|d| eprintln!(..))`, inside a `match` arm, not nested in another
+  loop) — converted to a plain `for`.
+
+### Gates (this round)
+
+- `cargo check -p e2e --all-targets --all-features`: clean.
+- `cargo test -p e2e --lib --all-features`: 2 passed, 0 failed (unchanged).
+- `cargo fmt -p e2e --check`: clean.
+- `cargo clippy -p e2e --all-targets --all-features -- -D warnings -W clippy::pedantic -D
+  unreachable_pub`: **fully clean** — the `crates/state` `unreachable_pub` items are fixed
+  (group A) and `services.rs`'s two pedantic hits are fixed (group C), so this gate now passes
+  with no filtering needed, `-D unreachable_pub` included.
+- Forbidden-pattern grep: prints nothing for `crates/e2e/**` outside `tests?/`.

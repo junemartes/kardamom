@@ -30,6 +30,7 @@
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -183,11 +184,17 @@ pub struct ResyncConfig {
     pub confirm_timeout_ms: u64,
 }
 
+/// [`ResyncConfig::default`]'s dedup ring capacity: `2^17` entries.
+const DEFAULT_DEDUP_CAPACITY: NonZeroU64 = NonZeroU64::new(1 << 17).unwrap();
+/// [`ResyncConfig::default`]'s resync entry threshold, as a percent of
+/// [`DEFAULT_DEDUP_CAPACITY`].
+const DEFAULT_ENTER_PERCENT: NonZeroU64 = NonZeroU64::new(25).unwrap();
+
 impl Default for ResyncConfig {
     fn default() -> Self {
         Self {
-            dedup_capacity: NonZeroU64::new(1 << 17).expect("1 << 17 != 0"),
-            enter_percent: NonZeroU64::new(25).expect("25 != 0"),
+            dedup_capacity: DEFAULT_DEDUP_CAPACITY,
+            enter_percent: DEFAULT_ENTER_PERCENT,
             boundary_silence_ms: 10_000,
             publish_stall_ms: 10_000,
             exit_hold_ms: 2_000,
@@ -230,7 +237,7 @@ impl ResyncConfig {
     /// [`ResyncConfigError::ThresholdTooSmall`] if the product rounds down
     /// to a threshold of 0 records (which would mean "resync on every
     /// watermark tick"). Neither is silently clamped: a threshold that
-    /// must be at least 1 is a `NonZeroU64`, not a `.max(1)` fixup.
+    /// must be at least 1 is a `NonZeroU64`, never rounded up in place.
     pub fn enter_threshold(&self) -> Result<NonZeroU64, ResyncConfigError> {
         let product = self
             .dedup_capacity
@@ -335,19 +342,56 @@ fn drain_bounded<T>(
 ) -> Vec<T> {
     let mut out = Vec::new();
     for _ in 0..max {
-        match rx.try_recv() {
-            Ok(item) => out.push(item),
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
-                if !*dead {
-                    *dead = true;
-                    tracing::warn!(partition, "{}", on_dead);
-                }
-                break;
-            }
+        match drain_bounded_step(rx, dead, partition, on_dead) {
+            ControlFlow::Continue(item) => out.push(item),
+            ControlFlow::Break(()) => break,
         }
     }
     out
+}
+
+/// Fold one contiguity reject into `drops`/`lowest`, for
+/// [`ResyncController::drain_contiguity_rejects`]'s loop. `nonce <
+/// expected` proves the ref already committed (see that method's doc
+/// comment), so it drops; otherwise it is a gap rewind, deduplicated per
+/// sender to the lowest `expected`.
+fn fold_contiguity_reject(
+    sender: Address,
+    nonce: u64,
+    expected: u64,
+    drops: &mut Vec<(Address, u64)>,
+    lowest: &mut HashMap<Address, u64>,
+) {
+    if nonce < expected {
+        drops.push((sender, nonce));
+    } else {
+        lowest
+            .entry(sender)
+            .and_modify(|e| *e = (*e).min(expected))
+            .or_insert(expected);
+    }
+}
+
+/// One [`drain_bounded`] step: `Continue` carries the next item; `Break`
+/// means the channel is empty, or disconnected (latching `*dead` and
+/// warning once on the first disconnect this sees).
+fn drain_bounded_step<T>(
+    rx: &Receiver<T>,
+    dead: &mut bool,
+    partition: u32,
+    on_dead: &str,
+) -> ControlFlow<(), T> {
+    match rx.try_recv() {
+        Ok(item) => ControlFlow::Continue(item),
+        Err(TryRecvError::Empty) => ControlFlow::Break(()),
+        Err(TryRecvError::Disconnected) => {
+            if !*dead {
+                *dead = true;
+                tracing::warn!(partition, "{}", on_dead);
+            }
+            ControlFlow::Break(())
+        }
+    }
 }
 
 /// One drain of the receipts channel: `(raised_floors, confirmations)`.
@@ -433,27 +477,39 @@ impl ResyncController {
             "floor-update producer disconnected; resync floors are frozen",
         );
         for u in updates {
-            // A deposit consumes no L2 nonce. It is neither a
-            // confirmation (it never corresponds to a published TxRef)
-            // nor floor evidence.
-            if u.deposit {
-                continue;
-            }
-            confirmations.push((u.sender, u.executed_nonce));
-            if u.skip_reason.is_some() {
-                continue;
-            }
-            let floor = u.executed_nonce.saturating_add(1);
-            let e = self.floors.entry(u.sender).or_insert(0);
-            if floor > *e {
-                *e = floor;
-                raised.push((u.sender, floor));
-            }
+            self.fold_floor_update(u, &mut raised, &mut confirmations);
         }
         if !raised.is_empty() {
             metrics::record_floor_senders(self.partition, self.floors.len());
         }
         (raised, confirmations)
+    }
+
+    /// Fold one floor update into `raised`/`confirmations`, for
+    /// [`Self::drain_floor_updates`]'s loop.
+    ///
+    /// A deposit (filler nonce 0) consumes no L2 nonce, so it is neither
+    /// a confirmation (it never corresponds to a published `TxRef`) nor
+    /// floor evidence.
+    fn fold_floor_update(
+        &mut self,
+        u: FloorUpdate,
+        raised: &mut Vec<(Address, u64)>,
+        confirmations: &mut Vec<(Address, u64)>,
+    ) {
+        if u.deposit {
+            return;
+        }
+        confirmations.push((u.sender, u.executed_nonce));
+        if u.skip_reason.is_some() {
+            return;
+        }
+        let floor = u.executed_nonce.saturating_add(1);
+        let e = self.floors.entry(u.sender).or_insert(0);
+        if floor > *e {
+            *e = floor;
+            raised.push((u.sender, floor));
+        }
     }
 
     /// Drain pending contiguity rejects into `(committed_drops,
@@ -491,14 +547,7 @@ impl ResyncController {
             "contiguity-reject producer disconnected",
         );
         for (sender, nonce, expected) in rejects {
-            if nonce < expected {
-                drops.push((sender, nonce));
-            } else {
-                lowest
-                    .entry(sender)
-                    .and_modify(|e| *e = (*e).min(expected))
-                    .or_insert(expected);
-            }
+            fold_contiguity_reject(sender, nonce, expected, &mut drops, &mut lowest);
         }
         (drops, lowest.into_iter().collect())
     }

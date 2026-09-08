@@ -37,7 +37,7 @@ use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_rlp::Decodable;
 use alloy_trie::nodes::{RlpNode, TrieNode};
 use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY, TrieAccount};
-use kardamom_types::{ExecutionWitness, WitnessProofs};
+use kardamom_types::{ExecutionWitness, WitnessAccount, WitnessProofs, WitnessSlot};
 
 use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
@@ -223,59 +223,62 @@ impl<'a> WitnessAnchor<'a> {
         let mut proven: BTreeMap<Address, Option<TrieAccount>> = BTreeMap::new();
         for acct in &self.witness.accounts {
             let leaf = accounts_trie.lookup(keccak256(acct.address))?;
-            match leaf {
-                Lookup::Found(value) => {
-                    let mut slice = value.as_slice();
-                    let ta = TrieAccount::decode(&mut slice)
-                        .map_err(|_| AnchorError::Malformed("account leaf not a TrieAccount"))?;
-                    if !acct.exists {
-                        return Err(AnchorError::Refuted {
-                            what: format!("account {} witnessed absent but included", acct.address),
-                        });
-                    }
-                    // The same normalization rule applies at the anchor.
-                    // The state table stores "no code" as ZERO, but the
-                    // trie leaf always uses KECCAK_EMPTY, and execution
-                    // treats the two identically. So the witness (a
-                    // capture of table reads) compares under the same
-                    // mapping the recompute already writes with.
-                    let witness_code_hash = crate::code_hash::to_revm_code_hash(acct.code_hash);
-                    if ta.nonce != acct.nonce
-                        || ta.balance != acct.balance
-                        || ta.code_hash != witness_code_hash
-                    {
-                        return Err(AnchorError::Refuted {
-                            what: format!("account {} fields diverge from trie leaf", acct.address),
-                        });
-                    }
-                    proven.insert(acct.address, Some(ta));
-                }
-                Lookup::Absent => {
-                    // The state table may keep an EIP-161-empty account
-                    // as a row (a touched, zero-fee coinbase is the live
-                    // shape), while the trie rightly excludes it.
-                    // Execution semantics treat empty and absent the
-                    // same, so the anchor does too: a witnessed-but-empty
-                    // account is consistent with exclusion. Anything
-                    // non-empty witnessed as present still gets refuted.
-                    let empty = crate::code_hash::is_empty_account(
-                        acct.nonce,
-                        acct.balance,
-                        acct.code_hash,
-                    );
-                    if acct.exists && !empty {
-                        return Err(AnchorError::Refuted {
-                            what: format!(
-                                "account {} witnessed present but excluded",
-                                acct.address
-                            ),
-                        });
-                    }
-                    proven.insert(acct.address, None);
-                }
-            }
+            proven.insert(acct.address, Self::prove_one_account(acct, leaf)?);
         }
         Ok(proven)
+    }
+
+    /// Prove one witness account against its trie lookup. The loop in
+    /// [`Self::prove_accounts`] stays free of a branch.
+    fn prove_one_account(
+        acct: &WitnessAccount,
+        leaf: Lookup,
+    ) -> Result<Option<TrieAccount>, AnchorError> {
+        match leaf {
+            Lookup::Found(value) => {
+                let mut slice = value.as_slice();
+                let ta = TrieAccount::decode(&mut slice)
+                    .map_err(|_| AnchorError::Malformed("account leaf not a TrieAccount"))?;
+                if !acct.exists {
+                    return Err(AnchorError::Refuted {
+                        what: format!("account {} witnessed absent but included", acct.address),
+                    });
+                }
+                // The same normalization rule applies at the anchor. The
+                // state table stores "no code" as ZERO, but the trie leaf
+                // always uses KECCAK_EMPTY, and execution treats the two
+                // identically. So the witness (a capture of table reads)
+                // compares under the same mapping the recompute already
+                // writes with.
+                let witness_code_hash = crate::code_hash::to_revm_code_hash(acct.code_hash);
+                if ta.nonce != acct.nonce
+                    || ta.balance != acct.balance
+                    || ta.code_hash != witness_code_hash
+                {
+                    return Err(AnchorError::Refuted {
+                        what: format!("account {} fields diverge from trie leaf", acct.address),
+                    });
+                }
+                Ok(Some(ta))
+            }
+            Lookup::Absent => {
+                // The state table may keep an EIP-161-empty account as a
+                // row (a touched, zero-fee coinbase is the live shape),
+                // while the trie rightly excludes it. Execution semantics
+                // treat empty and absent the same, so the anchor does
+                // too: a witnessed-but-empty account is consistent with
+                // exclusion. Anything non-empty witnessed as present
+                // still gets refuted.
+                let empty =
+                    crate::code_hash::is_empty_account(acct.nonce, acct.balance, acct.code_hash);
+                if acct.exists && !empty {
+                    return Err(AnchorError::Refuted {
+                        what: format!("account {} witnessed present but excluded", acct.address),
+                    });
+                }
+                Ok(None)
+            }
+        }
     }
 
     /// Prove every witness storage slot against its account's proven
@@ -297,32 +300,39 @@ impl<'a> WitnessAnchor<'a> {
             let trie = storage_tries
                 .entry(slot.address)
                 .or_insert_with(|| SparseTrie::new(sroot, &self.store));
-            match trie
+            let lookup = trie
                 .lookup(keccak256(slot.key))
-                .map_err(|e| in_storage_trie(slot.address, e))?
-            {
-                Lookup::Found(value) => {
-                    let mut slice = value.as_slice();
-                    let got = U256::decode(&mut slice)
-                        .map_err(|_| AnchorError::Malformed("storage leaf not an RLP word"))?;
-                    if got != slot.value || slot.value.is_zero() {
-                        return Err(AnchorError::Refuted {
-                            what: format!(
-                                "slot {}/{} value diverges from trie leaf",
-                                slot.address, slot.key
-                            ),
-                        });
-                    }
+                .map_err(|e| in_storage_trie(slot.address, e))?;
+            Self::check_one_slot(slot, lookup)?;
+        }
+        Ok(())
+    }
+
+    /// Check one witness storage slot against its trie lookup. The loop
+    /// in [`Self::prove_storage`] stays free of a branch.
+    fn check_one_slot(slot: &WitnessSlot, lookup: Lookup) -> Result<(), AnchorError> {
+        match lookup {
+            Lookup::Found(value) => {
+                let mut slice = value.as_slice();
+                let got = U256::decode(&mut slice)
+                    .map_err(|_| AnchorError::Malformed("storage leaf not an RLP word"))?;
+                if got != slot.value || slot.value.is_zero() {
+                    return Err(AnchorError::Refuted {
+                        what: format!(
+                            "slot {}/{} value diverges from trie leaf",
+                            slot.address, slot.key
+                        ),
+                    });
                 }
-                Lookup::Absent => {
-                    if !slot.value.is_zero() {
-                        return Err(AnchorError::Refuted {
-                            what: format!(
-                                "slot {}/{} witnessed non-zero but excluded",
-                                slot.address, slot.key
-                            ),
-                        });
-                    }
+            }
+            Lookup::Absent => {
+                if !slot.value.is_zero() {
+                    return Err(AnchorError::Refuted {
+                        what: format!(
+                            "slot {}/{} witnessed non-zero but excluded",
+                            slot.address, slot.key
+                        ),
+                    });
                 }
             }
         }
@@ -334,11 +344,18 @@ impl<'a> WitnessAnchor<'a> {
     /// [`WitnessAnchor::prove_accounts`].
     fn verify_code_blobs(&self) -> Result<(), AnchorError> {
         for entry in &self.witness.code {
-            if keccak256(&entry.code) != entry.code_hash {
-                return Err(AnchorError::Refuted {
-                    what: format!("code blob does not hash to {}", entry.code_hash),
-                });
-            }
+            Self::check_one_code_blob(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Check one carried code blob's hash. The loop in
+    /// [`Self::verify_code_blobs`] stays free of a branch.
+    fn check_one_code_blob(entry: &kardamom_types::delta::CodeEntry) -> Result<(), AnchorError> {
+        if keccak256(&entry.code) != entry.code_hash {
+            return Err(AnchorError::Refuted {
+                what: format!("code blob does not hash to {}", entry.code_hash),
+            });
         }
         Ok(())
     }
@@ -454,17 +471,28 @@ impl ProvenPre {
         writes: &[(B256, U256)],
     ) -> Result<(), AnchorError> {
         for (key, value) in writes {
-            if value.is_zero() {
-                trie.remove(keccak256(key))
-                    .map_err(|e| in_storage_trie(addr, e))?;
-            } else {
-                let mut rlp = Vec::new();
-                alloy_rlp::Encodable::encode(value, &mut rlp);
-                trie.insert(keccak256(key), rlp)
-                    .map_err(|e| in_storage_trie(addr, e))?;
-            }
+            Self::apply_one_storage_write(trie, addr, *key, *value)?;
         }
         Ok(())
+    }
+
+    /// Clear or upsert one storage slot in `trie`. The loop in
+    /// [`Self::apply_storage_writes`] stays free of a branch.
+    fn apply_one_storage_write(
+        trie: &mut SparseTrie<'_, '_>,
+        addr: Address,
+        key: B256,
+        value: U256,
+    ) -> Result<(), AnchorError> {
+        if value.is_zero() {
+            trie.remove(keccak256(key))
+                .map_err(|e| in_storage_trie(addr, e))
+        } else {
+            let mut rlp = Vec::new();
+            alloy_rlp::Encodable::encode(&value, &mut rlp);
+            trie.insert(keccak256(key), rlp)
+                .map_err(|e| in_storage_trie(addr, e))
+        }
     }
 
     /// Build one account's post-state trie leaf from the delta's field
@@ -496,13 +524,25 @@ impl ProvenPre {
             .copied()
             .or_else(|| pre_acct.map(|ta| ta.storage_root))
             .unwrap_or(EMPTY_ROOT_HASH);
-        let (nonce, balance, code_hash) = match delta.accounts.get(&addr) {
+        let crate::delta::AccountFields {
+            nonce,
+            balance,
+            code_hash,
+        } = match delta.accounts.get(&addr) {
             Some(v) => *v,
             None => match pre_acct {
-                Some(ta) => (ta.nonce, ta.balance, ta.code_hash),
+                Some(ta) => crate::delta::AccountFields {
+                    nonce: ta.nonce,
+                    balance: ta.balance,
+                    code_hash: ta.code_hash,
+                },
                 // Storage write to an account with no pre leaf, and no
                 // account-field change. All the fields are empty.
-                None => (0, U256::ZERO, KECCAK_EMPTY),
+                None => crate::delta::AccountFields {
+                    nonce: 0,
+                    balance: U256::ZERO,
+                    code_hash: KECCAK_EMPTY,
+                },
             },
         };
         // The delta stores "no code" as ZERO in some write paths. The

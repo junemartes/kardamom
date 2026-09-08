@@ -15,8 +15,8 @@ use rkyv::rancor;
 use super::{
     CANONICAL_ID_LEN, EGRESS_KIND_BOUNDARY, EGRESS_KIND_CONTIGUITY_REJECT, EGRESS_KIND_RELAYED,
     EGRESS_KIND_REMOTE_ORIGIN_REJECT, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
-    RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError, encode_kind_2u64,
-    rd_i32, rd_len, rd_slice, rd_u64, too_short,
+    RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF, RemoteOriginRejectReason, SENDER_LEN,
+    WireError, encode_kind_2u64, rd_i32, rd_len, rd_slice, rd_u8, rd_u64, too_short,
 };
 
 // ── decode (egress: cluster to Rust) ────────────────────────────────────────
@@ -52,7 +52,7 @@ pub enum EgressItem {
         origin_chain_id: u64,
         first_seq: u64,
         expected_next_seq: u64,
-        reason: u8,
+        reason: RemoteOriginRejectReason,
     },
 }
 
@@ -117,11 +117,17 @@ impl EgressItem {
     }
 
     fn decode_remote_origin_reject(buf: &[u8]) -> Result<Self, WireError> {
+        let RemoteOriginReject {
+            origin_chain_id,
+            first_seq,
+            expected_next_seq,
+            reason,
+        } = RemoteOriginReject::decode(buf)?;
         Ok(Self::RemoteOriginReject {
-            origin_chain_id: rd_u64(buf, 1)?,
-            first_seq: rd_u64(buf, 9)?,
-            expected_next_seq: rd_u64(buf, 17)?,
-            reason: *buf.get(25).ok_or_else(|| too_short(buf, 25, 1))?,
+            origin_chain_id,
+            first_seq,
+            expected_next_seq,
+            reason,
         })
     }
 }
@@ -316,18 +322,41 @@ pub fn encode_contiguity_reject(sender: Address, nonce: u64, expected: u64) -> V
     b
 }
 
-/// Frame a remote-origin reject exactly as the Java service does.
-pub fn encode_remote_origin_reject(
-    origin_chain_id: u64,
-    first_seq: u64,
-    expected_next_seq: u64,
-    reason: u8,
-) -> Vec<u8> {
-    let mut b = Vec::with_capacity(1 + 8 + 8 + 8 + 1);
-    b.push(EGRESS_KIND_REMOTE_ORIGIN_REJECT);
-    b.extend_from_slice(&origin_chain_id.to_le_bytes());
-    b.extend_from_slice(&first_seq.to_le_bytes());
-    b.extend_from_slice(&expected_next_seq.to_le_bytes());
-    b.push(reason);
-    b
+/// A remote-origin reject frame:
+/// `[kind:u8=6][origin_chain_id:u64][first_seq:u64][expected_next_seq:u64][reason:u8]`.
+/// Groups the fields the frame carries, mirroring the
+/// [`EgressItem::RemoteOriginReject`] variant it decodes into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteOriginReject {
+    pub origin_chain_id: u64,
+    pub first_seq: u64,
+    pub expected_next_seq: u64,
+    pub reason: RemoteOriginRejectReason,
+}
+
+impl RemoteOriginReject {
+    /// Frame this reject exactly as the Java service does.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(1 + 8 + 8 + 8 + 1);
+        b.push(EGRESS_KIND_REMOTE_ORIGIN_REJECT);
+        b.extend_from_slice(&self.origin_chain_id.to_le_bytes());
+        b.extend_from_slice(&self.first_seq.to_le_bytes());
+        b.extend_from_slice(&self.expected_next_seq.to_le_bytes());
+        b.push(self.reason.to_u8());
+        b
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if `buf` is too short. Every `reason` byte
+    /// decodes (see [`RemoteOriginRejectReason::from`]).
+    fn decode(buf: &[u8]) -> Result<Self, WireError> {
+        Ok(Self {
+            origin_chain_id: rd_u64(buf, 1)?,
+            first_seq: rd_u64(buf, 9)?,
+            expected_next_seq: rd_u64(buf, 17)?,
+            reason: RemoteOriginRejectReason::from(rd_u8(buf, 25)?),
+        })
+    }
 }

@@ -138,24 +138,35 @@ async fn main() -> Result<()> {
     };
 
     let base = args.account_base;
+    let l1 = match (&args.l1_rpc, args.settlement) {
+        (Some(r), Some(s)) => Some((r.as_str(), s)),
+        _ => None,
+    };
     for case in &args.cases {
-        println!("==> ===== SEMANTICS CASE: {case} =====");
-        let started = std::time::Instant::now();
-        let l1 = match (&args.l1_rpc, args.settlement) {
-            (Some(r), Some(s)) => Some((r.as_str(), s)),
-            _ => None,
-        };
-        let result = run_case(case, &target, base, args.ingress_metrics.is_some(), l1).await;
-        match result {
-            Ok(()) => println!("==> SEMANTICS CASE {case}: PASS ({:?})", started.elapsed()),
-            Err(e) => {
-                println!("SEMANTICS FAIL: case {case}: {e:#}");
-                std::process::exit(1);
-            }
-        }
+        run_and_report_case(case, &target, base, args.ingress_metrics.is_some(), l1).await;
     }
     println!("==> semantics verdict PASS ({} cases)", args.cases.len());
     Ok(())
+}
+
+/// Run one semantics case, print PASS/FAIL, and exit the process on the
+/// first failure — a case suite stops at the first violation.
+async fn run_and_report_case(
+    case: &str,
+    target: &Target,
+    base: usize,
+    have_ingress_metrics: bool,
+    l1: Option<(&str, alloy_primitives::Address)>,
+) {
+    println!("==> ===== SEMANTICS CASE: {case} =====");
+    let started = std::time::Instant::now();
+    match run_case(case, target, base, have_ingress_metrics, l1).await {
+        Ok(()) => println!("==> SEMANTICS CASE {case}: PASS ({:?})", started.elapsed()),
+        Err(e) => {
+            println!("SEMANTICS FAIL: case {case}: {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// This shard's account range, anchored at the operator-supplied
@@ -165,6 +176,16 @@ async fn main() -> Result<()> {
 struct Accounts {
     base: usize,
 }
+
+/// `nonce_params`'s sender count.
+const NONCE_SENDERS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(4).unwrap();
+/// `nonce_params`'s txs-per-sender count.
+const NONCE_TXS_PER_SENDER: std::num::NonZeroUsize = std::num::NonZeroUsize::new(16).unwrap();
+/// `consistency_params`'s sender count.
+const CONSISTENCY_SENDERS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(3).unwrap();
+/// `consistency_params`'s transfers-per-sender count.
+const CONSISTENCY_TRANSFERS_PER_SENDER: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(12).unwrap();
 
 impl Accounts {
     /// `self.base + offset`, checked.
@@ -183,8 +204,8 @@ impl Accounts {
     /// blocks, without proving more.
     fn nonce_params(&self) -> nonce_unordered::Params {
         nonce_unordered::Params {
-            senders: std::num::NonZeroUsize::new(4).unwrap(),
-            txs_per_sender: std::num::NonZeroUsize::new(16).unwrap(),
+            senders: NONCE_SENDERS,
+            txs_per_sender: NONCE_TXS_PER_SENDER,
             sender_base: self.base,
             ..nonce_unordered::Params::default()
         }
@@ -196,8 +217,8 @@ impl Accounts {
     /// Returns an error when `self.base + 10` overflows.
     fn consistency_params(&self) -> Result<consistency::Params> {
         Ok(consistency::Params {
-            senders: std::num::NonZeroUsize::new(3).unwrap(),
-            transfers_per_sender: std::num::NonZeroUsize::new(12).unwrap(),
+            senders: CONSISTENCY_SENDERS,
+            transfers_per_sender: CONSISTENCY_TRANSFERS_PER_SENDER,
             sender_base: self.at(10)?,
             // Here tx_bal uses UDP multicast, not IPC. A dropped BAL leaves a
             // block unverified, and the design allows this (it is never a
@@ -282,10 +303,9 @@ async fn run_case(
 
 /// First address whose `/metrics` answers.
 async fn pick_live(addrs: &[SocketAddr]) -> Option<SocketAddr> {
-    for a in addrs {
-        if e2e::harness::metrics::scrape(*a).await.is_ok() {
-            return Some(*a);
-        }
-    }
-    None
+    use futures::StreamExt;
+
+    let stream = futures::stream::iter(addrs)
+        .filter_map(|a| async move { e2e::harness::metrics::scrape(*a).await.ok().map(|_| *a) });
+    std::pin::pin!(stream).next().await
 }

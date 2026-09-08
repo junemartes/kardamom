@@ -1,7 +1,7 @@
 //! Static configuration for an `IngressProxy` instance.
 
-use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ pub struct IngressConfig {
     /// Optional UDS path for the binary line protocol.
     pub binary_uds_path: Option<PathBuf>,
     /// Number of sequencer partitions (M). Routes on `keccak(sender) % M`.
-    pub partition_count_m: u32,
+    pub partition_count_m: NonZeroU32,
     /// The stable identity of this ingress replica. An active/active
     /// deployment runs N replicas. This id namespaces `correlation_id`, so
     /// the `(replica, sequence)` pair stays unique:
@@ -38,8 +38,9 @@ pub struct IngressConfig {
     /// Max time the proxy waits for a receipt and a watermark before it
     /// times out the client.
     pub pending_receipt_timeout: Duration,
-    /// L2 chain id (returned by `eth_chainId`).
-    pub chain_id: u64,
+    /// L2 chain id (returned by `eth_chainId`). EIP-155 forbids chain id
+    /// 0.
+    pub chain_id: NonZeroU64,
     /// Receipt-cache capacity. Eviction order is arbitrary; see
     /// [`crate::receipt_cache::ReceiptCache`].
     pub receipt_cache_capacity: NonZeroUsize,
@@ -67,17 +68,17 @@ impl Default for IngressConfig {
     fn default() -> Self {
         use nonzero_ext::nonzero;
         Self {
-            jsonrpc_bind: "127.0.0.1:0".parse().unwrap(),
+            jsonrpc_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             binary_tcp_bind: None,
             binary_uds_path: None,
-            partition_count_m: 8,
+            partition_count_m: nonzero!(8u32),
             ingress_id: 0,
             rate_limit_per_ip_per_sec: nonzero!(10_000u32),
             rate_limit_burst: nonzero!(1_000u32),
             sig_verify_batch_depth: nonzero!(64usize),
             sig_verify_flush_window: Duration::from_micros(50),
             pending_receipt_timeout: Duration::from_secs(30),
-            chain_id: 1,
+            chain_id: nonzero!(1u64),
             // 128k gives about a 27s query horizon at 4,800 tx/s (about
             // 77MB across both indexes at bench-receipt sizes). Eviction
             // order is arbitrary (DashMap), so the horizon is a lower
@@ -115,7 +116,7 @@ mod tests {
     #[test]
     fn default_matches_spec() {
         let cfg = IngressConfig::default();
-        assert_eq!(cfg.partition_count_m, 8);
+        assert_eq!(cfg.partition_count_m.get(), 8);
         assert_eq!(cfg.sig_verify_batch_depth.get(), 64);
         assert_eq!(cfg.sig_verify_flush_window, Duration::from_micros(50));
     }

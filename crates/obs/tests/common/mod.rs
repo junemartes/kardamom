@@ -10,16 +10,16 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Bind an ephemeral port, then release it. Racy (another process can grab
 /// it before the caller rebinds), so a caller that needs the port to stay
 /// free retries on a bind failure.
-pub fn free_port() -> SocketAddr {
+pub(crate) fn free_port() -> SocketAddr {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = l.local_addr().expect("local_addr");
-    drop(l); // release the port before the caller rebinds it
-    addr
+    l.local_addr().expect("local_addr")
+    // `l` drops at the end of this scope, releasing the port before the
+    // caller rebinds it.
 }
 
 /// Scrape `/metrics` at `addr`, retrying the connect until `budget`
@@ -31,24 +31,24 @@ pub fn free_port() -> SocketAddr {
 ///
 /// Panics if the connect never succeeds within `budget`, or if the
 /// blocking task itself panics.
-pub async fn scrape(addr: SocketAddr, budget: Duration) -> String {
+pub(crate) async fn scrape(addr: SocketAddr, budget: Duration) -> String {
     tokio::task::spawn_blocking(move || {
-        let deadline = Instant::now() + budget;
-        loop {
-            match TcpStream::connect(addr) {
-                Ok(mut s) => {
-                    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                    write!(s, "GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
-                    let mut out = String::new();
-                    s.read_to_string(&mut out).unwrap();
-                    return out;
-                }
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(e) => panic!("exporter never came up on {addr}: {e}"),
-            }
-        }
+        kardamom_obs::testkit::poll_sync(
+            &format!("exporter on {addr}"),
+            budget,
+            Duration::from_millis(100),
+            || {
+                let Ok(mut s) = TcpStream::connect(addr) else {
+                    return Ok(None);
+                };
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                write!(s, "GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
+                let mut out = String::new();
+                s.read_to_string(&mut out).unwrap();
+                Ok(Some(out))
+            },
+        )
+        .unwrap()
     })
     .await
     .expect("scrape task panicked")

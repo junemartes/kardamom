@@ -5,7 +5,7 @@
 //! check them, and it measures the latency of each call, since the
 //! "RPC never hangs" checks are latency limits.
 //!
-//! Signing reuses `kardamom_bench`'s mnemonic derivation (the anvil dev
+//! Signing reuses `kardamom_deployer`'s mnemonic derivation (the anvil dev
 //! mnemonic, funded by `deploy/cluster/config/genesis/dev.toml`) and the
 //! same `TxLegacy` to sign to `encode_2718` pattern that `kardamom-load`
 //! uses.
@@ -21,8 +21,8 @@ use anyhow::{Context, Result};
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::rpc_params;
-use kardamom_bench::mnemonic;
-pub use kardamom_bench::signers::DerivedSigner;
+use kardamom_deployer::mnemonic;
+pub use kardamom_deployer::signers::DerivedSigner;
 
 /// The anvil/hardhat dev mnemonic. Accounts #0 through #17 are prefunded
 /// by `deploy/cluster/config/genesis/dev.toml`.
@@ -316,6 +316,78 @@ pub fn sign_transfer(
             what: "transfer",
         },
     )
+}
+
+/// A `(signer, payee, running nonce)` triple that sends 1-wei nudge
+/// transfers, advancing its nonce only when a send lands. This is the one
+/// "sign, send, and advance the nonce on success" operation every
+/// scenario that nudges a chain with real transfers — to make a
+/// pipelined commit durable, or just to keep L2 busy — otherwise
+/// duplicated.
+pub struct NudgeSender {
+    signer: DerivedSigner,
+    payee: Address,
+    nonce: u64,
+}
+
+impl NudgeSender {
+    #[must_use]
+    pub fn new(signer: DerivedSigner, payee: Address, nonce: u64) -> Self {
+        Self {
+            signer,
+            payee,
+            nonce,
+        }
+    }
+
+    /// The current nonce — the one the next [`Self::send`] will attempt.
+    #[must_use]
+    pub fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    /// The signer this sender signs and sends with.
+    #[must_use]
+    pub fn signer(&self) -> &DerivedSigner {
+        &self.signer
+    }
+
+    /// The payee [`Self::send`] sends 1-wei transfers to.
+    #[must_use]
+    pub fn payee(&self) -> Address {
+        self.payee
+    }
+
+    /// The current nonce, advancing it unconditionally. For a caller that
+    /// signs its own transaction shape (not a plain 1-wei transfer) but
+    /// needs the same nonce sequence [`Self::send`] advances.
+    ///
+    /// # Errors
+    /// Returns an error when the nonce overflows.
+    pub fn next_nonce(&mut self) -> Result<u64> {
+        let n = self.nonce;
+        self.nonce = self
+            .nonce
+            .checked_add(1)
+            .context("sender nonce overflows")?;
+        Ok(n)
+    }
+
+    /// Sign and send one 1-wei transfer at the current nonce, against
+    /// `chain_id` through `rpc`. Returns the transfer if the send
+    /// landed — the nonce advances only then, so a failed send retries
+    /// the same nonce next time.
+    ///
+    /// # Errors
+    /// Returns an error when signing the transfer fails.
+    pub async fn send(&mut self, rpc: &L2Client, chain_id: u64) -> Result<Option<SignedTransfer>> {
+        let tx = sign_transfer(&self.signer, chain_id, self.nonce, self.payee, 1)?;
+        if rpc.send_raw(&tx.raw).await.result.is_ok() {
+            self.nonce += 1;
+            return Ok(Some(tx));
+        }
+        Ok(None)
+    }
 }
 
 /// Sign a legacy contract-creation transaction. `init_code` is the

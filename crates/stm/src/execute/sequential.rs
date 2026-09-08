@@ -5,7 +5,7 @@ use super::metrics::StmOutcome;
 use kardamom_exec_core::block_env::ExecEnv;
 use kardamom_exec_core::delta::PendingDelta;
 use kardamom_exec_core::error::ExecutorError;
-use kardamom_exec_core::exec_types::TxIndex;
+use kardamom_exec_core::exec_types::{TxIndex, TxSlot};
 use kardamom_exec_core::executor::DecodedTx;
 use kardamom_exec_core::executor::Executor;
 use kardamom_footprint::classifier::Stats;
@@ -115,50 +115,71 @@ fn sequential_inner<'a, S: StateDatabase + Sync>(
 ) -> Result<(Vec<Receipt>, PendingDelta), ExecutorError> {
     let mut scope = Executor::new(snapshot, base, env)?;
     let n = txs.len();
-    let mut receipts = Vec::with_capacity(n);
-    let mut delta = PendingDelta::new();
-    let mut cumulative = 0u64;
     let timing = std::env::var_os("KARDAMOM_SEQ_TIMING").is_some();
-    let mut exec_ns = 0u64;
+    let mut acc = SeqAcc::new(n, timing);
     for (i, record) in txs.enumerate() {
-        let t0 = timing.then(std::time::Instant::now);
-        let (receipt, ws) = match record.decoded {
-            Some(d) => scope.execute_tx_decoded(
-                record.tx_idx,
-                record.position,
-                record.envelope,
-                d,
-                i as u64,
-                cumulative,
-                None,
-                None,
-            )?,
-            // Undecodable: the inline path produces the skip receipt.
-            None => scope.execute_tx(
-                record.tx_idx,
-                record.position,
-                record.envelope,
-                i as u64,
-                cumulative,
-                None,
-                None,
-            )?,
-        };
-        if let Some(t0) = t0 {
-            exec_ns = exec_ns.saturating_add(nanos(t0.elapsed()));
-        }
-        cumulative = receipt.cumulative_gas_used;
-        delta.apply(ws);
-        receipts.push(receipt);
+        acc.apply_one(&mut scope, i as u64, record)?;
     }
     if timing && n > 0 {
         eprintln!(
             "seq block {}: execute_tx sum {:.1}ms ({n} txs{label_suffix})",
             env.block_number,
-            exec_ns as f64 / 1e6,
+            acc.exec_ns as f64 / 1e6,
         );
     }
-    Ok((receipts, delta))
+    Ok((acc.receipts, acc.delta))
+}
+
+/// [`sequential_inner`]'s running state: the receipts and delta built so
+/// far, the cumulative gas counter, and the optional timing sum. The
+/// `for` loop in [`sequential_inner`] stays free of a branch.
+struct SeqAcc {
+    receipts: Vec<Receipt>,
+    delta: PendingDelta,
+    cumulative: u64,
+    exec_ns: u64,
+    timing: bool,
+}
+
+impl SeqAcc {
+    fn new(capacity: usize, timing: bool) -> Self {
+        Self {
+            receipts: Vec::with_capacity(capacity),
+            delta: PendingDelta::new(),
+            cumulative: 0,
+            exec_ns: 0,
+            timing,
+        }
+    }
+
+    /// Execute one record against `scope`, fold its receipt and write
+    /// set into `self`, and add its timing sample when timing is on.
+    fn apply_one<S: StateDatabase + Sync>(
+        &mut self,
+        scope: &mut Executor<&S>,
+        i: u64,
+        record: SeqTx<'_>,
+    ) -> Result<(), ExecutorError> {
+        let t0 = self.timing.then(std::time::Instant::now);
+        let slot = TxSlot {
+            tx_idx: record.tx_idx,
+            tx_position: record.position,
+            tx_index_in_block: i,
+            cumulative_gas_used_before: self.cumulative,
+        };
+        let (receipt, ws) = match record.decoded {
+            Some(d) => scope.execute_tx_decoded(slot, record.envelope, d, None, None)?,
+            // Undecodable: the inline path produces the skip receipt.
+            None => scope.execute_tx(slot, record.envelope, None, None)?,
+        };
+        if let Some(t0) = t0 {
+            self.exec_ns = self.exec_ns.saturating_add(nanos(t0.elapsed()));
+        }
+        self.cumulative = receipt.cumulative_gas_used;
+        self.delta.apply(ws);
+        self.receipts.push(receipt);
+        Ok(())
+    }
 }
 
 /// The sequential reference path (also the fallback): `Executor` per

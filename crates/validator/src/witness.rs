@@ -91,24 +91,50 @@ pub fn anchor_block_witness<K: kardamom_state::trie::cursor::ReadKind>(
     // fixed-point step. Fail rather than loop forever.
     loop {
         let proofs = walk_proofs(tx, tables, &acct_targets, &slot_targets, pre_state_root)?;
-        match verify_witness_anchored(witness, &proofs)
-            .and_then(|pre| recompute_post_root(witness, &proofs, &pre, delta))
-        {
-            Ok(post_root) => return Ok((proofs, post_root)),
-            Err(AnchorError::MissingNode {
-                path,
-                account,
-                hash,
-            }) => {
-                if !add_missing_target(&mut acct_targets, &mut slot_targets, path, account) {
-                    return Err(EngineError::WitnessUnanchored(format!(
-                        "capture fixed point stalled: node {hash} at {path:?} \
-                         (account {account:?}) missing from its own walk"
-                    )));
-                }
+        let Some(post_root) = try_anchor_round(
+            witness,
+            delta,
+            &proofs,
+            &mut acct_targets,
+            &mut slot_targets,
+        )?
+        else {
+            continue;
+        };
+        return Ok((proofs, post_root));
+    }
+}
+
+/// One fixed-point round: verify the witness against `proofs` and
+/// recompute the post-state root. `Ok(None)` means the walk found a
+/// missing node and grew the targets for another round; the `loop` in
+/// [`anchor_block_witness`] stays free of a branch.
+fn try_anchor_round(
+    witness: &mut ExecutionWitness,
+    delta: &PendingDelta,
+    proofs: &WitnessProofs,
+    acct_targets: &mut BTreeSet<Nibbles>,
+    slot_targets: &mut BTreeMap<Address, BTreeSet<Nibbles>>,
+) -> Result<Option<B256>, EngineError> {
+    match verify_witness_anchored(witness, proofs)
+        .and_then(|pre| recompute_post_root(proofs, &pre, delta))
+    {
+        Ok(post_root) => Ok(Some(post_root)),
+        Err(AnchorError::MissingNode {
+            path,
+            account,
+            hash,
+        }) => {
+            if add_missing_target(acct_targets, slot_targets, path, account) {
+                Ok(None)
+            } else {
+                Err(EngineError::WitnessUnanchored(format!(
+                    "capture fixed point stalled: node {hash} at {path:?} \
+                     (account {account:?}) missing from its own walk"
+                )))
             }
-            Err(e) => return Err(EngineError::from(e)),
         }
+        Err(e) => Err(EngineError::from(e)),
     }
 }
 
@@ -240,7 +266,7 @@ pub fn reexecute_stateless(
     records: &[BufferedRecord],
     env: ExecEnv,
     expected_bal: &alloy_eip7928::BlockAccessList,
-    granularity: u16,
+    granularity: core::num::NonZeroU16,
 ) -> Result<BlockExecOutput, EngineError> {
     kardamom_engine::stateless::execute_block_stateless(
         witness,

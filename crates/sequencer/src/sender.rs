@@ -19,7 +19,7 @@ use kardamom_types::TxEnvelope;
 /// This function is `#[inline]`, so the compiler folds it into the caller.
 #[inline]
 #[must_use]
-pub fn sender_of(envelope: &TxEnvelope) -> Address {
+pub(crate) fn sender_of(envelope: &TxEnvelope) -> Address {
     envelope.sender
 }
 

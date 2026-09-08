@@ -62,13 +62,18 @@ impl TouchTable {
     pub(super) fn clear(&mut self) {
         self.stamp = self.stamp.wrapping_add(1);
         if self.stamp == 0 {
-            // The stamp wrapped after billions of blocks. Hard-clear so
-            // no stale slot can resurrect, then restart at 1.
-            for s in &mut self.slots {
-                s.stamp = 0;
-            }
-            self.stamp = 1;
+            self.hard_clear();
         }
+    }
+
+    /// The stamp wrapped after billions of blocks. Hard-clear so no
+    /// stale slot can resurrect, then restart at 1. [`Self::clear`]'s
+    /// branch stays free of a loop.
+    fn hard_clear(&mut self) {
+        for s in &mut self.slots {
+            s.stamp = 0;
+        }
+        self.stamp = 1;
     }
 
     /// Record `idx` as the latest toucher of `hash`, and return the
@@ -81,21 +86,41 @@ impl TouchTable {
     pub(super) fn upsert(&mut self, hash: u64, idx: u32) -> Option<u32> {
         let mut i = hash as usize & self.mask;
         loop {
-            let slot = &mut self.slots[i];
-            if slot.stamp != self.stamp {
-                slot.hash = hash;
-                slot.idx = idx;
-                slot.stamp = self.stamp;
-                return None;
+            if let Probe::Done(r) = self.probe_slot(hash, idx, &mut i) {
+                return r;
             }
-            if slot.hash == hash {
-                let prev = slot.idx;
-                slot.idx = idx;
-                return Some(prev);
-            }
-            i = (i + 1) & self.mask;
         }
     }
+
+    /// One linear-probe step at index `*i`: claim an empty or stale
+    /// slot, update an existing match, or advance `*i` to the next
+    /// slot. The `while` loop in [`Self::upsert`] stays free of a
+    /// branch.
+    fn probe_slot(&mut self, hash: u64, idx: u32, i: &mut usize) -> Probe {
+        let slot = &mut self.slots[*i];
+        if slot.stamp != self.stamp {
+            slot.hash = hash;
+            slot.idx = idx;
+            slot.stamp = self.stamp;
+            return Probe::Done(None);
+        }
+        if slot.hash == hash {
+            let prev = slot.idx;
+            slot.idx = idx;
+            return Probe::Done(Some(prev));
+        }
+        *i = (*i + 1) & self.mask;
+        Probe::Continue
+    }
+}
+
+/// One [`TouchTable::probe_slot`] step's outcome.
+enum Probe {
+    /// The probe finished: `Some(prev)` on an existing match, `None` on
+    /// an empty or stale slot claimed for `idx`.
+    Done(Option<u32>),
+    /// No decision yet; keep probing the next slot.
+    Continue,
 }
 
 /// Per-shard last-toucher tables for sharded admission.

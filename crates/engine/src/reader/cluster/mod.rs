@@ -270,24 +270,34 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
     }
 }
 
+impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
+    /// Receive and decode one egress frame, ingesting it into the
+    /// reorder buffer. A malformed frame is dropped, and logged, not
+    /// fatal: the cluster stream is authoritative, so this should never
+    /// happen in practice. The loop in [`TxOrderingSubscription::next`]
+    /// stays free of a match.
+    fn ingest_one_frame(&mut self) -> Result<(), ExecutorError> {
+        let Some(bytes) = self.egress.recv() else {
+            return Err(ExecutorError::TxOrderingClosed);
+        };
+        match EgressItem::decode(&bytes) {
+            Ok(item) => self.ingest(item),
+            Err(e) => {
+                tracing::warn!(error = %e, "dropping malformed cluster egress frame");
+                Ok(())
+            }
+        }
+    }
+}
+
 impl<E: ClusterEgress> TxOrderingSubscription for ClusterTxOrderingSubscription<E> {
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
         loop {
-            if let Some(out) = self.try_deliver()? {
-                return Ok(out);
-            }
-            let Some(bytes) = self.egress.recv() else {
-                return Err(ExecutorError::TxOrderingClosed);
+            let Some(out) = self.try_deliver()? else {
+                self.ingest_one_frame()?;
+                continue;
             };
-            match EgressItem::decode(&bytes) {
-                Ok(item) => self.ingest(item)?,
-                Err(e) => {
-                    // A malformed frame is dropped, and logged. The cluster
-                    // stream is authoritative, so this should never happen in
-                    // practice.
-                    tracing::warn!(error = %e, "dropping malformed cluster egress frame");
-                }
-            }
+            return Ok(out);
         }
     }
 }

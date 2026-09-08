@@ -43,7 +43,7 @@ pub(crate) struct CheckpointManifest {
 
 impl CheckpointManifest {
     #[must_use]
-    pub fn encode(&self) -> String {
+    pub(crate) fn encode(&self) -> String {
         format!(
             "version=1\nblock={}\nimage_keccak={:#x}\ngenesis_digest={:#x}\n",
             self.block, self.image_keccak, self.genesis_digest
@@ -54,7 +54,7 @@ impl CheckpointManifest {
     ///
     /// Returns [`StateError::Recovery`] if `text` is missing `block`,
     /// `image_keccak`, or `genesis_digest`, or any of them fails to parse.
-    pub fn parse(text: &str) -> Result<Self, StateError> {
+    pub(crate) fn parse(text: &str) -> Result<Self, StateError> {
         let mut block = None;
         let mut image_keccak = None;
         let mut genesis_digest = None;

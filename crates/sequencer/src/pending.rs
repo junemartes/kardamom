@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum InsertOutcome {
+pub(crate) enum InsertOutcome {
     Inserted,
     Replaced,
     /// The buffer was full. The furthest-future buffered nonce
@@ -41,7 +41,7 @@ pub enum InsertOutcome {
 }
 
 #[derive(Debug)]
-pub struct PendingBuffer<T> {
+pub(crate) struct PendingBuffer<T> {
     /// `None` means the buffer is disabled (every insert is rejected as
     /// [`InsertOutcome::DroppedBufferDisabled`]): a meaningful, valid
     /// setting, not an error, so it is `Option<NonZeroUsize>` rather than
@@ -53,7 +53,7 @@ pub struct PendingBuffer<T> {
 impl<T> PendingBuffer<T> {
     /// `capacity == 0` disables the buffer.
     #[must_use]
-    pub fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         Self {
             capacity: NonZeroUsize::new(capacity),
             inner: BTreeMap::new(),
@@ -80,7 +80,7 @@ impl<T> PendingBuffer<T> {
     /// `NonZeroUsize` on this path (the disabled case returns above), and
     /// `at_capacity` requires `len() >= capacity`, so the buffer always
     /// holds at least one entry on this path.
-    pub fn insert(&mut self, nonce: u64, value: T) -> InsertOutcome {
+    pub(crate) fn insert(&mut self, nonce: u64, value: T) -> InsertOutcome {
         let Some(capacity) = self.capacity else {
             return InsertOutcome::DroppedBufferDisabled;
         };
@@ -124,7 +124,7 @@ impl<T> PendingBuffer<T> {
     /// the data loss the rebuffer exists to prevent. Any overshoot is
     /// transient and bounded to one drained batch; the next successful
     /// flush drains it back out.
-    pub fn reinsert(&mut self, nonce: u64, value: T) {
+    pub(crate) fn reinsert(&mut self, nonce: u64, value: T) {
         self.inner.insert(nonce, value);
     }
 
@@ -134,7 +134,7 @@ impl<T> PendingBuffer<T> {
     /// below an executed-truth floor are proven duplicates of already
     /// executed transactions, so dropping them can never create a
     /// canonical gap.
-    pub fn drop_below(&mut self, floor: u64) -> usize {
+    pub(crate) fn drop_below(&mut self, floor: u64) -> usize {
         let keep = self.inner.split_off(&floor);
         let dropped = self.inner.len();
         self.inner = keep;
@@ -143,7 +143,7 @@ impl<T> PendingBuffer<T> {
 
     /// Drain the contiguous run of nonces starting at `start`. Stops at the
     /// first gap. Returned items are removed from the buffer.
-    pub fn drain_consecutive_from(&mut self, start: u64) -> DrainConsecutive<'_, T> {
+    pub(crate) fn drain_consecutive_from(&mut self, start: u64) -> DrainConsecutive<'_, T> {
         DrainConsecutive {
             buf: self,
             next: start,
@@ -151,12 +151,12 @@ impl<T> PendingBuffer<T> {
     }
 
     /// Remove and return the value at `nonce` if present.
-    pub fn remove(&mut self, nonce: u64) -> Option<T> {
+    pub(crate) fn remove(&mut self, nonce: u64) -> Option<T> {
         self.inner.remove(&nonce)
     }
 }
 
-pub struct DrainConsecutive<'a, T> {
+pub(crate) struct DrainConsecutive<'a, T> {
     buf: &'a mut PendingBuffer<T>,
     next: u64,
 }

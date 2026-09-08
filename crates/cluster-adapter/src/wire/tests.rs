@@ -110,13 +110,13 @@ fn ingress_layout_is_kind_sender_nonce_id_then_fields() {
 }
 
 fn remote_epoch() -> kardamom_types::xchain::RemoteEpochRecord {
-    use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
+    use kardamom_types::xchain::{NonEmptyVec, RemoteEpochRecord, XChainMessage};
     RemoteEpochRecord {
         origin_chain_id: 412_346,
         anchor_number: 0x0011_2233_4455_6677,
         anchor_hash: B256::repeat_byte(0x5A),
         first_seq: 9,
-        messages: vec![
+        messages: NonEmptyVec::new(
             XChainMessage {
                 source_hash: B256::repeat_byte(0xE1),
                 seq: 9,
@@ -127,7 +127,7 @@ fn remote_epoch() -> kardamom_types::xchain::RemoteEpochRecord {
                 input: (&[0xCAu8, 0xFE][..]).into(),
                 callback: None,
             },
-            XChainMessage {
+            vec![XChainMessage {
                 source_hash: B256::repeat_byte(0xE2),
                 seq: 10,
                 origin_sender: Address::repeat_byte(0xA1),
@@ -136,8 +136,8 @@ fn remote_epoch() -> kardamom_types::xchain::RemoteEpochRecord {
                 gas_limit: 100_000,
                 input: (&[][..]).into(),
                 callback: None,
-            },
-        ],
+            }],
+        ),
     }
 }
 
@@ -242,7 +242,7 @@ fn contiguity_reject_roundtrip() {
 
 /// The header anchor is bound by the canonical id. A relayed body whose
 /// anchor differs from the id the sealer deduped on is rejected by the
-/// consumer, so a forged header cannot poison a peer's lane (audit H3).
+/// consumer, so a forged header cannot poison a peer's lane.
 #[test]
 fn remote_epoch_body_anchor_is_bound_by_the_canonical_id() {
     let rec = remote_epoch();
@@ -262,7 +262,13 @@ fn remote_epoch_body_anchor_is_bound_by_the_canonical_id() {
 
 #[test]
 fn remote_origin_reject_roundtrip() {
-    let b = encode_remote_origin_reject(412_346, 7, 5, REMOTE_ORIGIN_REJECT_SEQ_MISMATCH);
+    let b = RemoteOriginReject {
+        origin_chain_id: 412_346,
+        first_seq: 7,
+        expected_next_seq: 5,
+        reason: RemoteOriginRejectReason::SeqMismatch,
+    }
+    .encode();
     assert_eq!(b[0], EGRESS_KIND_REMOTE_ORIGIN_REJECT);
     assert_eq!(
         b[0], 6,
@@ -283,8 +289,8 @@ fn remote_origin_reject_roundtrip() {
             assert_eq!(origin_chain_id, 412_346);
             assert_eq!(first_seq, 7);
             assert_eq!(expected_next_seq, 5);
-            assert_eq!(reason, REMOTE_ORIGIN_REJECT_SEQ_MISMATCH);
-            assert_eq!(remote_origin_reject_reason(reason), "seq_mismatch");
+            assert_eq!(reason, RemoteOriginRejectReason::SeqMismatch);
+            assert_eq!(reason.as_str(), "seq_mismatch");
         }
         other => panic!("expected RemoteOriginReject, got {other:?}"),
     }
@@ -292,7 +298,29 @@ fn remote_origin_reject_roundtrip() {
         EgressItem::decode(&b[..25]),
         Err(WireError::TooShort { at: 25, .. })
     ));
-    assert_eq!(remote_origin_reject_reason(0xFF), "unknown");
+}
+
+/// A reject reason byte a newer sealer added and this build does not name
+/// yet still decodes the whole frame, instead of failing it: the wire
+/// stays forward compatible.
+#[test]
+fn remote_origin_reject_unknown_reason_round_trips() {
+    let mut b = RemoteOriginReject {
+        origin_chain_id: 412_346,
+        first_seq: 7,
+        expected_next_seq: 5,
+        reason: RemoteOriginRejectReason::SeqMismatch,
+    }
+    .encode();
+    b[25] = 0xFF; // a code no named variant claims
+    match EgressItem::decode(&b).unwrap() {
+        EgressItem::RemoteOriginReject { reason, .. } => {
+            assert_eq!(reason, RemoteOriginRejectReason::Unknown(0xFF));
+            assert_eq!(reason.as_str(), "unknown");
+            assert_eq!(reason.to_u8(), 0xFF);
+        }
+        other => panic!("expected RemoteOriginReject, got {other:?}"),
+    }
 }
 
 #[test]
@@ -344,13 +372,21 @@ fn truncated_egress_errors_cleanly() {
 /// A remote epoch whose first message carries a callback: the `Some` arm of
 /// the archived `Option<Callback>`, which no other wire test covers.
 fn remote_epoch_with_callback() -> RemoteEpochRecord {
-    let mut rec = remote_epoch();
-    rec.messages[0].callback = Some(Callback {
+    let rec = remote_epoch();
+    // `NonEmptyVec` has no mutable indexing (nothing that reads one needs
+    // to check its length, so nothing writes into it either); rebuild the
+    // first message with a callback instead of mutating in place.
+    let mut first = rec.messages.first().clone();
+    first.callback = Some(Callback {
         target: Address::repeat_byte(0xC1),
         gas_limit: 90_000,
         context: B256::repeat_byte(0xC2),
     });
-    rec
+    let rest = rec.messages.iter().skip(1).cloned().collect();
+    RemoteEpochRecord {
+        messages: kardamom_types::xchain::NonEmptyVec::new(first, rest),
+        ..rec
+    }
 }
 
 /// An L1 epoch with one deposit: the archived `Deposit` carries a `u128`
@@ -389,9 +425,9 @@ fn decode_record(buf: &[u8]) -> TxOrderingMessage {
 }
 
 /// The decoder copies each rkyv body into a 16-aligned buffer before it
-/// reads it (audit 2026-09-03, L2). This test walks the input through every
-/// offset mod 16, so the decode never depends on where the allocator placed
-/// the frame. Both epoch kinds carry a `u128`-bearing archived type.
+/// reads it. This test walks the input through every offset mod 16, so the
+/// decode never depends on where the allocator placed the frame. Both
+/// epoch kinds carry a `u128`-bearing archived type.
 #[test]
 fn epoch_bodies_decode_from_every_input_offset() {
     let remote = remote_epoch_with_callback();

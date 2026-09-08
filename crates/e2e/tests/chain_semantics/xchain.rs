@@ -14,11 +14,15 @@ struct InteropRig {
     watcher: e2e::harness::services::Spawned,
 }
 
-/// `dest_rpc` is the destination's own JSON-RPC that serves
-/// `eth_getStorageAt` (the validator feed URL), for the watcher's startup
-/// cursor reconcile. `None` skips the reconcile — the right choice for a
-/// stack with no validator.
-async fn interop_rig(stack: &LocalStack, dest_rpc: Option<&str>) -> InteropRig {
+/// `cursor_reconcile` says whether (and against which JSON-RPC) the
+/// watcher's startup cursor reconcile runs. `CursorReconcile::Skip` is the
+/// right choice for a stack with no validator; `CursorReconcile::Rpc`
+/// names the destination's own JSON-RPC serving `eth_getStorageAt` (the
+/// validator feed URL).
+async fn interop_rig(
+    stack: &LocalStack,
+    cursor_reconcile: &kardamom_da_watcher::interop::CursorReconcile,
+) -> InteropRig {
     use e2e::scenarios::xchain;
     use kardamom_da_watcher::interop::mock::MockInteropFeed;
 
@@ -27,7 +31,12 @@ async fn interop_rig(stack: &LocalStack, dest_rpc: Option<&str>) -> InteropRig {
     let feed = MockInteropFeed::new(xchain::ORIGIN_CHAIN_ID).await;
     let cursor_file = stack.root().join("interop-pair.cursor");
     let watcher = stack
-        .spawn_interop_watcher(xchain::ORIGIN_CHAIN_ID, &feed.url(), &cursor_file, dest_rpc)
+        .spawn_interop_watcher(
+            xchain::ORIGIN_CHAIN_ID,
+            &feed.url(),
+            &cursor_file,
+            cursor_reconcile,
+        )
         .expect("spawn interop watcher");
     InteropRig {
         t,
@@ -76,7 +85,11 @@ async fn s12_xchain_delivery() {
         feed,
         cursor_file,
         mut watcher,
-    } = interop_rig(&stack, Some(&dest_rpc)).await;
+    } = interop_rig(
+        &stack,
+        &kardamom_da_watcher::interop::CursorReconcile::Rpc(dest_rpc),
+    )
+    .await;
 
     let outcome = xchain::delivery(&t, &feed, &exec_dir, &cursor_file, watcher.metrics_addr)
         .await
@@ -168,7 +181,7 @@ async fn s14_xchain_two_stacks() {
             e2e::harness::DEV_CHAIN_ID.get(),
             &a_feed_url,
             &b_cursor,
-            Some(&b_feed_url),
+            &kardamom_da_watcher::interop::CursorReconcile::Rpc(b_feed_url.clone()),
         )
         .expect("spawn B's watcher of A");
 
@@ -188,7 +201,12 @@ async fn s14_xchain_two_stacks() {
     // Leg 2: the callback comes home through B's validator feed.
     let a_cursor = stack_a.root().join("lane-from-b.cursor");
     let _watcher_on_a = stack_a
-        .spawn_interop_watcher(CHAIN_B_ID, &b_feed_url, &a_cursor, Some(&a_feed_url))
+        .spawn_interop_watcher(
+            CHAIN_B_ID,
+            &b_feed_url,
+            &a_cursor,
+            &kardamom_da_watcher::interop::CursorReconcile::Rpc(a_feed_url),
+        )
         .expect("spawn A's watcher of B");
     xchain_two_stacks::callback_leg(&a, &b, &a_exec_dir, &a_cursor, outcome)
         .await
@@ -234,7 +252,7 @@ async fn s13_xchain_da_parity() {
         feed,
         cursor_file,
         mut watcher,
-    } = interop_rig(&stack, None).await;
+    } = interop_rig(&stack, &kardamom_da_watcher::interop::CursorReconcile::Skip).await;
 
     // 1. The S12 delivery flow, unchanged — every layer's evidence asserted.
     let outcome = xchain::delivery(&t, &feed, &exec_dir, &cursor_file, watcher.metrics_addr)
@@ -312,7 +330,7 @@ async fn s13_xchain_da_parity() {
             }
             Ok(diffs) => {
                 eprintln!("S13 deep_compare (reconstructed vs live executor):");
-                for d in diffs {
+                for d in &diffs {
                     eprintln!("  {d}");
                 }
             }

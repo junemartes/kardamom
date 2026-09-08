@@ -86,11 +86,12 @@ mod exec_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use ports::{StateWriterQueue, StateWriterSignal, TxReceiptsPublication};
+pub use ports::{Either, StateWriterQueue, StateWriterSignal, TxReceiptsPublication};
 pub use types::{
-    BalHandoff, BlockExec, BlockExecOutput, BufferedRecord, ExecutorConfig, ResumePoint,
+    BalHandoff, BlockExecOutput, BlockExecStrategy, BufferedRecord, ExecutorConfig, NoBlockExec,
+    ResumePoint,
 };
-pub use wiring::{EngineWiring, Inbound, Outbound, RoleHooks, SnapshotDb};
+pub use wiring::{EngineWiring, ExecPorts, Inbound, Outbound, RoleHooks, SnapshotDb};
 
 pub(crate) use commit_thread::spawn_commit;
 pub(crate) use exec_thread::{ExecHooks, ExecInputs, spawn_exec};
@@ -122,7 +123,7 @@ impl Executor {
     /// Returns `Err` when any of the reader, exec, or commit threads
     /// reports a fatal error (for example, a `BoundaryMisaligned` or a
     /// proven receipt divergence).
-    pub fn run<W: EngineWiring>(
+    pub fn run<W: EngineWiring + 'static>(
         cfg: ExecutorConfig,
         inbound: Inbound<W>,
         outbound: Outbound<W>,
@@ -144,9 +145,9 @@ impl Executor {
         } = hooks;
 
         let (tx_data_handles, tx_ordering_handle, rx_r2e) = spawn_readers(inbound, &cfg, &start);
-        let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(cfg.receipt_queue_depth);
+        let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(cfg.receipt_queue_depth.get());
 
-        let exec = spawn_exec(ExecInputs {
+        let exec = spawn_exec(ExecInputs::<W> {
             cfg,
             rx: rx_r2e,
             tx: tx_e2c,
@@ -202,7 +203,7 @@ fn spawn_readers<W: EngineWiring>(
         join_recovery,
     } = inbound;
     let buffer = JoinBuffer::new();
-    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(cfg.receipt_queue_depth);
+    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(cfg.receipt_queue_depth.get());
     let tx_data_handles: Vec<JoinHandle<ThreadResult>> = tx_data
         .into_iter()
         .map(|sub| spawn_tx_data_reader(sub, buffer.clone()))
@@ -260,6 +261,9 @@ impl Threads {
         exec: JoinHandle<ThreadResult>,
         commit: JoinHandle<ThreadResult>,
     ) -> Result<(), ExecutorError> {
+        // A panicked thread here means a logic bug, not a runtime failure
+        // the caller can recover from. Propagate it as a panic on this
+        // thread too, instead of hiding it behind an `Err`.
         let r_ordering = tx_ordering.join().expect("tx_ordering reader panic");
         let r_exec = exec.join().expect("exec panic");
         let r_commit = commit.join().expect("commit panic");
@@ -282,6 +286,8 @@ impl Threads {
     fn join_tx_data(handles: Vec<JoinHandle<ThreadResult>>) -> Result<(), ExecutorError> {
         handles
             .into_iter()
+            // A panicked reader thread means a logic bug; propagate it as
+            // a panic here too, the same as `join_pipeline` above.
             .map(|h| h.join().expect("tx_data reader panic"))
             .fold(Ok(()), Result::and)
     }

@@ -37,4 +37,4 @@ mod engine_tests;
 pub use claims::ClaimIndex;
 pub(crate) use dump::{claims_json, records_json};
 pub(crate) use engine::execute_block_sequential;
-pub use engine::{BlockInputs, execute_block_parallel, parallel_block_exec};
+pub use engine::{BlockInputs, ParallelBlockExec, execute_block_parallel, parallel_block_exec};

@@ -9,6 +9,7 @@ use rkyv::with::Map;
 use rkyv::{Archive, Deserialize, Serialize};
 
 use super::leaf::{MsgLeaf, no_callback_hash};
+use super::{MAX_DATA_BYTES, MAX_MESSAGE_GAS};
 use crate::wire;
 
 /// Response requested by a message's sender: enqueued through the
@@ -115,6 +116,39 @@ pub struct XChainMessage {
 }
 
 impl XChainMessage {
+    /// Check this message against the Outbox's own send-time bounds: no
+    /// value (v1 delivery is value-free), a gas limit within
+    /// [`MAX_MESSAGE_GAS`], and calldata within [`MAX_DATA_BYTES`]. An
+    /// honest origin can never trip these; a message that does came from a
+    /// malicious or corrupt feed, never from the shared derivation rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bound that failed.
+    pub fn check_bounds(&self) -> Result<(), BoundsFault> {
+        if self.value != 0 {
+            return Err(BoundsFault::ValueNotAllowed {
+                seq: self.seq,
+                value: self.value,
+            });
+        }
+        if self.gas_limit > MAX_MESSAGE_GAS {
+            return Err(BoundsFault::GasLimitAboveCap {
+                seq: self.seq,
+                gas_limit: self.gas_limit,
+                cap: MAX_MESSAGE_GAS,
+            });
+        }
+        if self.input.len() > MAX_DATA_BYTES {
+            return Err(BoundsFault::DataAboveCap {
+                seq: self.seq,
+                len: self.input.len(),
+                cap: MAX_DATA_BYTES,
+            });
+        }
+        Ok(())
+    }
+
     /// Recompute this message's Outbox commitment. `origin_chain_id` and
     /// `dest_chain_id` come from the enclosing [`RemoteEpochRecord`] and the
     /// deriving chain respectively — they are not duplicated on the wire.
@@ -137,6 +171,179 @@ impl XChainMessage {
     }
 }
 
+impl OutboxMessage {
+    /// Check this message against the Outbox's own send-time bounds,
+    /// before it is copied into an [`XChainMessage`]. Same limits as
+    /// [`XChainMessage::check_bounds`]; running this on the borrowed
+    /// message first means a batch that fails never pays for the copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bound that failed.
+    pub fn check_bounds(&self) -> Result<(), BoundsFault> {
+        if self.value != 0 {
+            return Err(BoundsFault::ValueNotAllowed {
+                seq: self.seq,
+                value: self.value,
+            });
+        }
+        if self.gas_limit > MAX_MESSAGE_GAS {
+            return Err(BoundsFault::GasLimitAboveCap {
+                seq: self.seq,
+                gas_limit: self.gas_limit,
+                cap: MAX_MESSAGE_GAS,
+            });
+        }
+        if self.data.len() > MAX_DATA_BYTES {
+            return Err(BoundsFault::DataAboveCap {
+                seq: self.seq,
+                len: self.data.len(),
+                cap: MAX_DATA_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Why an [`XChainMessage`] fails the Outbox's send-time bounds. The origin
+/// `Outbox` rejects each of these at send time, so a message that carries
+/// one did not come from an honest origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BoundsFault {
+    /// v1 messaging carries no value.
+    #[error("message seq {seq} carries value {value}; v1 delivery is value-free")]
+    ValueNotAllowed { seq: u64, value: u128 },
+    /// `gas_limit` above the cap the `Outbox` accepts.
+    #[error("message seq {seq} gas limit {gas_limit} is above the cap {cap}")]
+    GasLimitAboveCap { seq: u64, gas_limit: u64, cap: u64 },
+    /// `data` longer than the length the `Outbox` accepts.
+    #[error("message seq {seq} data length {len} is above the cap {cap}")]
+    DataAboveCap { seq: u64, len: usize, cap: usize },
+}
+
+/// A [`Vec<T>`] that is never empty, checked once at construction or at
+/// the wire boundary. Nothing that reads one needs to check its length
+/// first.
+#[derive(Clone, Debug, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck(verify))]
+pub struct NonEmptyVec<T>(Vec<T>);
+
+impl<T> NonEmptyVec<T> {
+    /// Build from a first element plus the rest, in order.
+    #[must_use]
+    pub fn new(first: T, rest: Vec<T>) -> Self {
+        let mut items = Vec::with_capacity(rest.len().saturating_add(1));
+        items.push(first);
+        items.extend(rest);
+        Self(items)
+    }
+
+    /// The one place this type's non-empty invariant is read off the
+    /// storage. `len`, `first`, and `last` all derive from this instead of
+    /// each repeating the same panic path.
+    ///
+    /// Storage stays a bare `Vec<T>` — not a `(first, rest)` field split —
+    /// because the archived bytes of a `NonEmptyVec` must stay identical to
+    /// a plain `Vec<T>`'s (see `status-validator.md`, Round B follow-up 2):
+    /// changing the shape would change every `RemoteEpochRecord` on the
+    /// wire. So the invariant lives here, at read time, instead of in the
+    /// type.
+    ///
+    /// # Panics
+    ///
+    /// Never, in practice: `new` and the wire decoder both guarantee at
+    /// least one element.
+    fn split(&self) -> (&T, &[T]) {
+        self.0.split_first().expect("non-empty by construction")
+    }
+
+    /// The element count. Never zero.
+    #[must_use]
+    pub fn len(&self) -> core::num::NonZeroUsize {
+        let (_, rest) = self.split();
+        core::num::NonZeroUsize::MIN.saturating_add(rest.len())
+    }
+
+    /// The first element. Always present.
+    #[must_use]
+    pub fn first(&self) -> &T {
+        self.split().0
+    }
+
+    /// The last element. Always present.
+    #[must_use]
+    pub fn last(&self) -> &T {
+        let (first, rest) = self.split();
+        rest.last().unwrap_or(first)
+    }
+
+    /// Every element, in order.
+    pub fn iter(&self) -> core::slice::Iter<'_, T> {
+        self.0.iter()
+    }
+
+    /// Every element, as a slice.
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<'a, T> IntoIterator for &'a NonEmptyVec<T> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<T: rkyv::Archive> core::fmt::Debug for ArchivedNonEmptyVec<T>
+where
+    rkyv::Archived<T>: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+/// Rejects an archived [`NonEmptyVec`] with zero elements. The derived
+/// field check already validates the inner `Vec`'s bytes; this adds the
+/// one invariant a byte-level check cannot see.
+mod non_empty_verify {
+    use rkyv::bytecheck::Verify;
+    use rkyv::rancor::{Fallible, Source, fail};
+
+    use super::ArchivedNonEmptyVec;
+
+    #[derive(Debug)]
+    struct EmptyNonEmptyVec;
+
+    impl core::fmt::Display for EmptyNonEmptyVec {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("NonEmptyVec archive has zero elements")
+        }
+    }
+
+    impl core::error::Error for EmptyNonEmptyVec {}
+
+    // SAFETY: `verify` only reads `self.0.is_empty()`; it does not read or
+    // rely on the element bytes the derived field check already validated.
+    unsafe impl<T, C> Verify<C> for ArchivedNonEmptyVec<T>
+    where
+        T: rkyv::Archive,
+        C: Fallible + ?Sized,
+        C::Error: Source,
+    {
+        fn verify(&self, _: &mut C) -> Result<(), C::Error> {
+            if self.0.is_empty() {
+                fail!(EmptyNonEmptyVec);
+            }
+            Ok(())
+        }
+    }
+}
+
 /// One origin chain's contiguous batch of messages, as it travels on the
 /// canonical stream.
 ///
@@ -145,8 +352,8 @@ impl XChainMessage {
 /// epochs, an EMPTY record is invalid — remote origins advance only when
 /// messages exist (the no-skip rule is enforced on the dense per-pair `seq`,
 /// not on origin blocks), so an empty batch has nothing to say.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
-#[rkyv(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug), bytecheck(verify))]
 pub struct RemoteEpochRecord {
     /// The origin chain.
     pub origin_chain_id: u64,
@@ -161,24 +368,67 @@ pub struct RemoteEpochRecord {
     pub anchor_hash: B256,
     /// Sequence number of `messages[0]`.
     pub first_seq: u64,
-    /// The batch, in seq order, dense from `first_seq`. Non-empty by
-    /// construction ([`super::derive_remote_epoch`] rejects empty input).
-    pub messages: Vec<XChainMessage>,
+    /// The batch, in seq order, dense from `first_seq`.
+    pub messages: NonEmptyVec<XChainMessage>,
+}
+
+/// Rejects an archived [`RemoteEpochRecord`] that leaves no room for the
+/// lane cursor after it (`first_seq + messages.len()` overflows `u64` —
+/// one more than `last_seq` itself needing to fit). This is the same bound
+/// the producer's batch-range check and the validator's `SeqRange::new`
+/// both check, so the wire decoder agrees with what can actually be
+/// produced or accepted: [`super::derive_remote_epoch`] and the
+/// validator's `check_remote_epoch` both reject this before a record is
+/// ever built or accepted; this closes the same gap at the wire boundary,
+/// where a corrupt or malicious archive skips those checks.
+mod remote_epoch_verify {
+    use rkyv::bytecheck::Verify;
+    use rkyv::rancor::{Fallible, Source, fail};
+
+    use super::ArchivedRemoteEpochRecord;
+
+    #[derive(Debug)]
+    struct RemoteEpochSeqOverflow;
+
+    impl core::fmt::Display for RemoteEpochSeqOverflow {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("RemoteEpochRecord archive's seq range overflows u64")
+        }
+    }
+
+    impl core::error::Error for RemoteEpochSeqOverflow {}
+
+    // SAFETY: `verify` only reads `first_seq` and the message count, both
+    // already validated as plain values by the derived field check; it
+    // performs no unchecked memory access.
+    unsafe impl<C> Verify<C> for ArchivedRemoteEpochRecord
+    where
+        C: Fallible + ?Sized,
+        C::Error: Source,
+    {
+        fn verify(&self, _: &mut C) -> Result<(), C::Error> {
+            let first_seq = self.first_seq.to_native();
+            let len = u64::try_from(self.messages.0.len()).ok();
+            if len.and_then(|l| first_seq.checked_add(l)).is_none() {
+                fail!(RemoteEpochSeqOverflow);
+            }
+            Ok(())
+        }
+    }
 }
 
 impl RemoteEpochRecord {
     /// Sequence number of the last message in the batch.
     ///
-    /// Saturates instead of underflowing when the batch is empty (an empty
-    /// `RemoteEpochRecord` is not a valid record, but the derived `Default`
-    /// still constructs one, so this must not wrap or panic).
+    /// Saturates instead of overflowing: [`super::derive_remote_epoch`],
+    /// the validator's `check_remote_epoch`, and the wire decoder's
+    /// [`Verify`](rkyv::bytecheck::Verify) impl below all reject a batch
+    /// whose seq range does not fit `u64` before a real record reaches
+    /// here, but this method's own contract stays total, the same way it
+    /// did before `messages` was a [`NonEmptyVec`].
     #[must_use]
     pub fn last_seq(&self) -> u64 {
-        // `unwrap_or(u64::MAX)` keeps this saturating end to end: a `Vec`
-        // longer than `u64::MAX` never occurs in practice, and this method's
-        // contract is to never wrap or panic even on a default-constructed,
-        // structurally-invalid record.
-        let len = u64::try_from(self.messages.len()).unwrap_or(u64::MAX);
+        let len = u64::try_from(self.messages.len().get()).unwrap_or(u64::MAX);
         self.first_seq.saturating_add(len).saturating_sub(1)
     }
 
@@ -194,12 +444,12 @@ impl RemoteEpochRecord {
     /// instead of moving the sealer's per-peer position.
     #[must_use]
     pub fn canonical_id(&self) -> B256 {
-        let mut buf = Vec::with_capacity(8 + 8 + 32 + 16);
-        buf.extend_from_slice(&self.origin_chain_id.to_be_bytes());
-        buf.extend_from_slice(&self.anchor_number.to_be_bytes());
-        buf.extend_from_slice(self.anchor_hash.as_slice());
-        buf.extend_from_slice(&self.first_seq.to_be_bytes());
-        buf.extend_from_slice(&self.last_seq().to_be_bytes());
-        keccak256(&buf)
+        super::keccak_concat(&[
+            &self.origin_chain_id.to_be_bytes(),
+            &self.anchor_number.to_be_bytes(),
+            self.anchor_hash.as_slice(),
+            &self.first_seq.to_be_bytes(),
+            &self.last_seq().to_be_bytes(),
+        ])
     }
 }

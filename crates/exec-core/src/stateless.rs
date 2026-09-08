@@ -23,6 +23,8 @@
 //!   `pre_state_root`. [`execute_block_anchored`] closes this gap with an
 //!   MPT proof on both ends.
 
+use core::num::NonZeroU16;
+
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
@@ -293,18 +295,20 @@ pub fn execute_block_stateless(
     records: &[BufferedRecord],
     env: ExecEnv,
     expected_bal: &alloy_eip7928::BlockAccessList,
-    granularity: u16,
+    granularity: NonZeroU16,
 ) -> Result<BlockExecOutput, ExecutorError> {
-    for rec in records {
-        if let BufferedRecord::Tx { envelope, .. } = rec {
-            verify_record_identity(envelope)?;
-        }
-        // Deposits and cross-chain messages: identity stays a trusted
-        // input until the witness is L1-anchored. See the module docs.
-    }
+    // Deposits and cross-chain messages: identity stays a trusted input
+    // until the witness is L1-anchored. See the module docs.
+    records
+        .iter()
+        .filter_map(|rec| match rec {
+            BufferedRecord::Tx { envelope, .. } => Some(envelope),
+            _ => None,
+        })
+        .try_for_each(verify_record_identity)?;
     let db = WitnessDb::from_witness(witness);
     let (out, raw_bal) = execute_block_with_bal(&db, parent, records, env)?;
-    let recomputed = crate::bal_ladder::quantize(raw_bal, granularity);
+    let recomputed = crate::bal_ladder::quantize(raw_bal, granularity.get());
     if &recomputed != expected_bal {
         return Err(ExecutorError::Divergence(format!(
             "stateless BAL mismatch at block {}: recomputed {} account entr{} vs published {} \
@@ -353,7 +357,7 @@ pub fn execute_block_anchored(
     records: &[BufferedRecord],
     env: ExecEnv,
     expected_bal: &alloy_eip7928::BlockAccessList,
-    granularity: u16,
+    granularity: NonZeroU16,
 ) -> Result<AnchoredBlockOutput, ExecutorError> {
     let pre = crate::anchor::verify_witness_anchored(witness, proofs)?;
     let pre_state_root = pre.root;
@@ -388,15 +392,18 @@ fn first_bal_difference(
     b: &alloy_eip7928::BlockAccessList,
 ) -> alloc::string::String {
     use alloc::string::ToString;
-    for (x, y) in a.iter().zip(b.iter()) {
-        if x.address != y.address {
-            return format!("{} vs {}", x.address, y.address);
-        }
-        if x != y {
-            return x.address.to_string();
-        }
-    }
-    "(entry-count mismatch)".to_string()
+    a.iter()
+        .zip(b.iter())
+        .find_map(|(x, y)| {
+            if x.address != y.address {
+                Some(format!("{} vs {}", x.address, y.address))
+            } else if x != y {
+                Some(x.address.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "(entry-count mismatch)".to_string())
 }
 
 #[cfg(all(test, feature = "std"))]

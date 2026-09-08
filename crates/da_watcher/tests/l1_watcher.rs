@@ -229,6 +229,18 @@ async fn backpressure_holds_cursor_so_next_tick_retries() {
     assert_eq!(cursor, Some(150)); // The cursor did not advance.
 }
 
+/// Once `published` reaches 2 entries, trip `flag` and report done.
+fn trip_backpressure_once_published(
+    published: &std::sync::Arc<std::sync::Mutex<Vec<kardamom_types::EpochRecord>>>,
+    flag: &std::sync::Arc<std::sync::Mutex<bool>>,
+) -> bool {
+    if published.lock().unwrap().len() < 2 {
+        return false;
+    }
+    *flag.lock().unwrap() = true;
+    true
+}
+
 /// A partially published range must resume at the first block that did
 /// not publish. It must not re-emit the blocks that did publish, and
 /// must not skip past them.
@@ -244,13 +256,12 @@ async fn partial_range_resumes_at_the_first_unpublished_block() {
     let flag = pub_.fail_with_backpressure.clone();
     let published = pub_.published.clone();
     std::thread::spawn(move || {
-        loop {
-            if published.lock().unwrap().len() >= 2 {
-                *flag.lock().unwrap() = true;
-                return;
-            }
-            std::thread::yield_now();
-        }
+        let _ = kardamom_obs::testkit::poll_sync(
+            "backpressure trip after 2 published",
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(1),
+            || Ok(trip_backpressure_once_published(&published, &flag).then_some(())),
+        );
     });
     let n = process_once(&pub_, &src, lockbox(), &mut cursor)
         .await

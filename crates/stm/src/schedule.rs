@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use kardamom_footprint::Cell;
 #[cfg(test)]
 use kardamom_footprint::classifier::Stats;
-use kardamom_footprint::{TxObs, decoded_view};
+use kardamom_footprint::{EnvelopeView, TxObs, decoded_view};
 use kardamom_types::TxEnvelope;
 
 /// A block's execution plan over local tx positions `0..n`. Every tx is in
@@ -61,21 +61,25 @@ pub(crate) fn scheduling_view_decoded(
     envelope: &TxEnvelope,
     decoded: Option<&kardamom_exec_core::executor::DecodedTx>,
 ) -> TxObs {
-    let (to, selector, args, has_value) = match decoded {
+    let view = match decoded {
         Some(d) => decoded_view(&d.0),
-        None => (None, None, Vec::new(), false),
+        None => EnvelopeView {
+            to: None,
+            selector: None,
+            args: Vec::new(),
+            has_value: false,
+        },
     };
-    view_from_parts(local_idx, envelope, to, selector, args, has_value)
+    view_from_parts(local_idx, envelope, view)
 }
 
-fn view_from_parts(
-    local_idx: u32,
-    envelope: &TxEnvelope,
-    to: Option<alloy_primitives::Address>,
-    selector: Option<[u8; 4]>,
-    args: Vec<alloy_primitives::U256>,
-    has_value: bool,
-) -> TxObs {
+fn view_from_parts(local_idx: u32, envelope: &TxEnvelope, view: EnvelopeView) -> TxObs {
+    let EnvelopeView {
+        to,
+        selector,
+        args,
+        has_value,
+    } = view;
     TxObs {
         index: u64::from(local_idx),
         block: 0,
@@ -129,42 +133,65 @@ impl DagBuilder {
         exclude: &HashSet<Cell>,
     ) -> Vec<u32> {
         let mut preds: Vec<u32> = Vec::new();
-        if let Some(cells) = cells {
-            if let Some(b) = self.last_barrier {
-                preds.push(b);
-            }
-            for c in cells {
-                if exclude.contains(&c) {
-                    continue;
-                }
-                if let Some(&p) = self.last_toucher.get(&c)
-                    && p != i
-                {
-                    preds.push(p);
-                }
-                self.last_toucher.insert(c, i);
-            }
-            self.since_barrier.push(i);
-        } else {
-            // ⊤: a barrier. It depends on every transaction since the
-            // previous barrier (those cover the previous barrier
-            // transitively). With none in between, it depends on the
-            // previous barrier itself.
-            self.cold += 1;
-            if self.since_barrier.is_empty() {
-                if let Some(b) = self.last_barrier {
-                    preds.push(b);
-                }
-            } else {
-                preds.extend(self.since_barrier.iter().copied());
-            }
-            self.last_barrier = Some(i);
-            self.since_barrier.clear();
+        match cells {
+            Some(cells) => self.admit_predicted(i, cells, exclude, &mut preds),
+            None => self.admit_cold(i, &mut preds),
         }
         preds.sort_unstable();
         preds.dedup();
         self.edges += preds.len();
         preds
+    }
+
+    /// Admit a predicted (non-cold) transaction: the barrier predecessor
+    /// first, then each cell's last toucher. [`Self::admit`]'s branch
+    /// stays free of a loop.
+    fn admit_predicted(
+        &mut self,
+        i: u32,
+        cells: impl IntoIterator<Item = Cell>,
+        exclude: &HashSet<Cell>,
+        preds: &mut Vec<u32>,
+    ) {
+        if let Some(b) = self.last_barrier {
+            preds.push(b);
+        }
+        for c in cells {
+            self.admit_cell(i, c, exclude, preds);
+        }
+        self.since_barrier.push(i);
+    }
+
+    /// Admit one predicted cell: skip an excluded cell, else record its
+    /// last toucher as a predecessor and update the toucher map. The
+    /// `for` loop in [`Self::admit_predicted`] stays free of a branch.
+    fn admit_cell(&mut self, i: u32, c: Cell, exclude: &HashSet<Cell>, preds: &mut Vec<u32>) {
+        if exclude.contains(&c) {
+            return;
+        }
+        if let Some(&p) = self.last_toucher.get(&c)
+            && p != i
+        {
+            preds.push(p);
+        }
+        self.last_toucher.insert(c, i);
+    }
+
+    /// Admit a cold (barrier) transaction: depends on every transaction
+    /// since the previous barrier (those cover the previous barrier
+    /// transitively). With none in between, it depends on the previous
+    /// barrier itself. [`Self::admit`]'s branch stays free of a loop.
+    fn admit_cold(&mut self, i: u32, preds: &mut Vec<u32>) {
+        self.cold += 1;
+        if self.since_barrier.is_empty() {
+            if let Some(b) = self.last_barrier {
+                preds.push(b);
+            }
+        } else {
+            preds.extend(self.since_barrier.iter().copied());
+        }
+        self.last_barrier = Some(i);
+        self.since_barrier.clear();
     }
 }
 
@@ -190,14 +217,26 @@ pub(crate) fn build(
     for (i, env) in envelopes.iter().enumerate() {
         let view = scheduling_view_decoded(i as u32, env, decoded[i].as_ref());
         let preds = dag.admit(i as u32, stats.predict(&view), exclude);
-        for p in preds {
-            s.children[p as usize].push(i as u32);
-            s.indegree[i] += 1;
-        }
+        record_preds(&mut s, i, &preds);
     }
     s.cold = dag.cold;
     s.edges = dag.edges;
     s
+}
+
+/// Record `i`'s predecessors as `s`'s edges: each predecessor gets `i`
+/// as a child, and `i`'s indegree grows by one per predecessor. The
+/// `for` loop in [`build`] stays free of a nested loop.
+#[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "test envelope counts stay far below u32::MAX"
+)]
+fn record_preds(s: &mut BlockSchedule, i: usize, preds: &[u32]) {
+    for p in preds {
+        s.children[*p as usize].push(i as u32);
+        s.indegree[i] += 1;
+    }
 }
 
 #[cfg(test)]

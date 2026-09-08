@@ -12,13 +12,13 @@ use alloy_primitives::Address;
 use crate::pending::{InsertOutcome, PendingBuffer};
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum ProcessAction<T> {
+pub(crate) enum ProcessAction<T> {
     Publish { nonce: u64, payload: T },
     ReportDuplicate { nonce: u64, expected_nonce: u64 },
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum NonceOutcome {
+pub(crate) enum NonceOutcome {
     Matched,
     Buffered,
     /// This nonce was buffered. A further-future nonce (`evicted_nonce`)
@@ -40,13 +40,13 @@ pub enum NonceOutcome {
 }
 
 #[derive(Debug)]
-pub struct ProcessResult<T> {
+pub(crate) struct ProcessResult<T> {
     pub actions: Vec<ProcessAction<T>>,
     pub outcome: NonceOutcome,
 }
 
 #[derive(Debug)]
-pub struct PartitionState<T> {
+pub(crate) struct PartitionState<T> {
     max_pending_per_sender: usize,
     next: HashMap<Address, u64>,
     pending: HashMap<Address, PendingBuffer<T>>,
@@ -54,7 +54,7 @@ pub struct PartitionState<T> {
 
 impl<T> PartitionState<T> {
     #[must_use]
-    pub fn new(max_pending_per_sender: usize) -> Self {
+    pub(crate) fn new(max_pending_per_sender: usize) -> Self {
         Self {
             max_pending_per_sender,
             next: HashMap::new(),
@@ -63,7 +63,7 @@ impl<T> PartitionState<T> {
     }
 
     #[must_use]
-    pub fn next_nonce(&self, sender: Address) -> u64 {
+    pub(crate) fn next_nonce(&self, sender: Address) -> u64 {
         self.next.get(&sender).copied().unwrap_or(0)
     }
 
@@ -73,18 +73,18 @@ impl<T> PartitionState<T> {
     /// (`Self::seed_next_nonce`, at 0 for a cold sender) before it falls
     /// through to [`Self::process`].
     #[must_use]
-    pub fn next_nonce_known(&self, sender: Address) -> Option<u64> {
+    pub(crate) fn next_nonce_known(&self, sender: Address) -> Option<u64> {
         self.next.get(&sender).copied()
     }
 
-    pub fn seed_next_nonce(&mut self, sender: Address, n: u64) {
+    pub(crate) fn seed_next_nonce(&mut self, sender: Address, n: u64) {
         self.next.insert(sender, n);
     }
 
     /// Primary-side: handle an incoming transaction. Returns publish
     /// actions in canonical order. The caller drives the outbound
     /// publishers.
-    pub fn process(&mut self, sender: Address, nonce: u64, payload: T) -> ProcessResult<T> {
+    pub(crate) fn process(&mut self, sender: Address, nonce: u64, payload: T) -> ProcessResult<T> {
         let expected = self.next_nonce(sender);
         if nonce < expected {
             return ProcessResult {
@@ -127,21 +127,37 @@ impl<T> PartitionState<T> {
             nonce,
             payload: first_payload,
         }];
-        let mut advanced = nonce.saturating_add(1);
-        if let Some(buf) = self.pending.get_mut(&sender) {
-            for (n, p) in buf.drain_consecutive_from(advanced) {
-                actions.push(ProcessAction::Publish {
-                    nonce: n,
-                    payload: p,
-                });
-                advanced = n.saturating_add(1);
-            }
-        }
+        let advanced = self.drain_consecutive_into(sender, nonce.saturating_add(1), &mut actions);
         self.next.insert(sender, advanced);
         ProcessResult {
             actions,
             outcome: NonceOutcome::Matched,
         }
+    }
+
+    /// Drain `sender`'s pending buffer of the run starting at `from`,
+    /// publishing each into `actions`, and return the nonce past the last
+    /// one drained (`from` itself, if the sender has no buffer or nothing
+    /// contiguous). [`Self::process`]'s tail after publishing the matched
+    /// nonce.
+    fn drain_consecutive_into(
+        &mut self,
+        sender: Address,
+        from: u64,
+        actions: &mut Vec<ProcessAction<T>>,
+    ) -> u64 {
+        let mut advanced = from;
+        let Some(buf) = self.pending.get_mut(&sender) else {
+            return advanced;
+        };
+        for (n, p) in buf.drain_consecutive_from(advanced) {
+            actions.push(ProcessAction::Publish {
+                nonce: n,
+                payload: p,
+            });
+            advanced = n.saturating_add(1);
+        }
+        advanced
     }
 
     /// Push a payload back into the pending buffer, so the next call to
@@ -154,7 +170,7 @@ impl<T> PartitionState<T> {
     /// whose ref did not actually land on B. This also marks the sender as
     /// "drain-pending", so a later call to [`Self::drain_pending`] can
     /// resume the publish without fresh ingress.
-    pub fn reinsert_for_retry(&mut self, sender: Address, nonce: u64, payload: T) {
+    pub(crate) fn reinsert_for_retry(&mut self, sender: Address, nonce: u64, payload: T) {
         // Rewind expected nonce so the retry treats it as a Match.
         self.next.insert(sender, nonce);
         let buf = self
@@ -181,7 +197,7 @@ impl<T> PartitionState<T> {
     /// ascending nonce). Senders are visited in arbitrary order. Within a
     /// sender, the nonces are strictly ascending and dense, which is the
     /// only order the canonical log cares about.
-    pub fn drain_pending(&mut self) -> Vec<(Address, u64, T)> {
+    pub(crate) fn drain_pending(&mut self) -> Vec<(Address, u64, T)> {
         let mut out = Vec::new();
         // Borrow `pending` and `next` as separate fields. This avoids
         // snapshotting the sender list into a `Vec` first.
@@ -226,7 +242,7 @@ impl<T> PartitionState<T> {
     /// This advances only on execution evidence from the receipts stream,
     /// never on locally inferred stream gaps. A client-abandoned nonce
     /// hole produces no receipt, so it never advances the floor.
-    pub fn advance_floor(&mut self, sender: Address, floor: u64) -> Option<(u64, usize)> {
+    pub(crate) fn advance_floor(&mut self, sender: Address, floor: u64) -> Option<(u64, usize)> {
         let cur = self.next_nonce(sender);
         if floor <= cur {
             return None;

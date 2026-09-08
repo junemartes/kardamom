@@ -26,12 +26,11 @@
 //! For deposit-free ranges (the common case, and everything the load
 //! harness produces), the reconstructed root is exact.
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::B256;
 use kardamom_state::{StateEnv, StateSnapshot, StateWriter, TrieMode, seed_genesis};
 use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
 use kardamom_types::{
-    AccountChange, BPosition, BlockBoundary, CodeEntry, Receipt, SnapshotSource, StateDatabase,
-    TxEnvelope,
+    AccountChange, BPosition, BlockBoundary, CodeEntry, Receipt, SnapshotSource, TxEnvelope,
 };
 
 use crate::actor::{StateWriterQueue, StateWriterSignal};
@@ -40,6 +39,8 @@ use crate::delta::PendingDelta;
 use crate::exec_types::TxIndex;
 use crate::executor::{Executor, execute_xchain_tx};
 use crate::persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
+use kardamom_exec_core::exec_types::TxSlot;
+use kardamom_exec_core::executor::XChainDelivery;
 
 /// One block to re-execute: its boundary metadata and ordered transactions.
 ///
@@ -107,29 +108,6 @@ struct Counters {
     /// sequence gives the same reconstructed root. We keep them consistent so
     /// the per-tx receipts stay internally coherent.
     global_pos: u64,
-}
-
-/// Build a storage-read closure for the block-close protocol actions: the
-/// parent (pipelined, not-yet-durable) layer first, then the snapshot.
-/// `parent` is `None` for offline replay, which commits one block at a
-/// time with no pipelined layer to consult.
-///
-/// Both the live exec thread ([`crate::actor`]) and this module use this
-/// one function, so a change to the read order cannot land in only one of
-/// them. This is consensus-critical: a diverging read order changes which
-/// block sees an active feature turn on.
-pub(crate) fn layered_storage_read<'a>(
-    parent: Option<&'a PendingDelta>,
-    snap: &'a impl StateDatabase,
-) -> impl Fn(Address, B256) -> Result<U256, crate::error::ExecutorError> + 'a {
-    move |addr, slot| {
-        if let Some(v) = parent.and_then(|p| p.storage.get(&(addr, slot))) {
-            return Ok(*v);
-        }
-        snap.storage(addr, slot).map_err(|e| {
-            crate::error::ExecutorError::State(format!("block-close read {addr}/{slot}: {e:?}"))
-        })
-    }
 }
 
 /// Re-execute `blocks`, in canonical order, into the state DB at `env`.
@@ -255,7 +233,12 @@ impl BlockAcc {
             BlockItem::Exec(e) => e,
         };
         let tx_position = BPosition::from_index(counters.global_pos);
-        let tx_idx = TxIndex(counters.tx_idx);
+        let slot = TxSlot {
+            tx_idx: TxIndex(counters.tx_idx),
+            tx_position,
+            tx_index_in_block: self.tx_index_in_block,
+            cumulative_gas_used_before: self.cumulative_gas,
+        };
         // Replay executes one durably committed block at a time against its
         // own committed snapshot. There is no pipelined parent layer.
         let (receipt, ws) = match exec_item {
@@ -267,26 +250,16 @@ impl BlockAcc {
                 None,
                 &self.delta,
                 exec_env,
-                tx_idx,
-                tx_position,
-                origin_chain_id,
-                message,
-                self.tx_index_in_block,
-                self.cumulative_gas,
+                slot,
+                XChainDelivery {
+                    origin_chain_id,
+                    message,
+                },
                 None,
             )?,
-            ExecItem::Tx(tx) => Executor::execute_once(
-                snapshot,
-                None,
-                &self.delta,
-                exec_env,
-                tx_idx,
-                tx_position,
-                tx,
-                self.tx_index_in_block,
-                self.cumulative_gas,
-                None,
-            )?,
+            ExecItem::Tx(tx) => {
+                Executor::execute_once(snapshot, None, &self.delta, exec_env, slot, tx, None)?
+            }
         };
         self.delta.apply(ws);
         // Replay applies no block gas limit, so nothing else bounds this
@@ -349,12 +322,13 @@ impl<'a> Replay<'a> {
         mut acc: BlockAcc,
     ) -> Result<(), ReplayError> {
         // Offline replay commits one block at a time with no pipelined
-        // layer, so this reads only the snapshot.
+        // layer, so this reads only `acc.delta` then the snapshot.
         kardamom_exec_core::features::apply_block_close_actions(
             &mut acc.delta,
             block.block_number,
             block.l2_timestamp,
-            layered_storage_read(None, snapshot),
+            None,
+            snapshot,
         )?;
 
         let block_delta = acc.delta.finalize(block.block_number, acc.receipts);

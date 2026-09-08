@@ -9,23 +9,21 @@ use kardamom_types::{BlockBoundary, SnapshotSource};
 
 use crate::delta::PendingDelta;
 use crate::exec_types::TxIndex;
-use crate::reader::{EpochObserver, ReaderToExec, RemoteEpochObserver};
+use crate::reader::ReaderToExec;
 
-use super::ports::{StateWriterQueue, StateWriterSignal};
-use super::types::{
-    BalHandoff, BlockExec, BufferedRecord, ExecToCommit, ExecutorConfig, ResumePoint,
-};
+use super::types::{BalHandoff, BufferedRecord, ExecToCommit, ExecutorConfig, ResumePoint};
+use super::wiring::{ExecPorts, SnapshotDb};
 
 /// The optional role-specific hooks `ExecState` carries: BAL capture,
 /// footprint-shadow capture, a whole-block execution strategy, and the two
 /// epoch observers. Grouped so `ExecInputs` and `spawn_exec` pass one value
 /// instead of five loose parameters.
-pub(crate) struct ExecHooks<Db, E> {
+pub(crate) struct ExecHooks<W: ExecPorts> {
     pub(super) bal_tx: Option<Sender<BalHandoff>>,
     pub(super) shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
-    pub(super) block_exec: Option<BlockExec<Db>>,
-    pub(super) epoch_observer: Option<E>,
-    pub(super) remote_epoch_observer: Option<Box<dyn RemoteEpochObserver>>,
+    pub(super) block_exec: Option<W::BlockExec>,
+    pub(super) epoch_observer: Option<W::Epoch>,
+    pub(super) remote_epoch_observer: Option<W::RemoteEpoch>,
 }
 
 /// Every input [`ExecState::new`] and `spawn_exec` need: the config, the
@@ -33,27 +31,27 @@ pub(crate) struct ExecHooks<Db, E> {
 /// optional hooks. `Executor::run` builds one of these from the grouped
 /// `Outbound`/`RoleHooks` it already destructures, instead of forwarding
 /// twelve positional arguments.
-pub(crate) struct ExecInputs<S: SnapshotSource, Q, P, E> {
+pub(crate) struct ExecInputs<W: ExecPorts> {
     pub(super) cfg: ExecutorConfig,
     pub(super) rx: Receiver<ReaderToExec>,
     pub(super) tx: Sender<ExecToCommit>,
-    pub(super) snapshots: S,
-    pub(super) sw_signal: Q,
-    pub(super) sw_queue: P,
+    pub(super) snapshots: W::Snapshots,
+    pub(super) sw_signal: W::WriterSignal,
+    pub(super) sw_queue: W::WriterQueue,
     pub(super) start: ResumePoint,
-    pub(super) hooks: ExecHooks<S::Db, E>,
+    pub(super) hooks: ExecHooks<W>,
 }
 
 /// The exec thread's mutable loop state. Each `spawn_exec` thread has one
 /// instance. Each `ReaderToExec` arm is one method, split across
 /// `exec_records.rs`, `exec_markers.rs`, and `exec_boundary.rs`.
-pub(super) struct ExecState<S: SnapshotSource, Q, P, E> {
+pub(super) struct ExecState<W: ExecPorts> {
     pub(super) cfg: ExecutorConfig,
     pub(super) rx: Receiver<ReaderToExec>,
     pub(super) tx: Sender<ExecToCommit>,
-    pub(super) snapshots: S,
-    pub(super) sw_signal: Q,
-    pub(super) sw_queue: P,
+    pub(super) snapshots: W::Snapshots,
+    pub(super) sw_signal: W::WriterSignal,
+    pub(super) sw_queue: W::WriterQueue,
     pub(super) bal_tx: Option<Sender<BalHandoff>>,
     /// Footprint shadow handoff (`crate::shadow`), one per block. Only the
     /// executor role uses this; it is `None` elsewhere. The whole-block
@@ -64,19 +62,19 @@ pub(super) struct ExecState<S: SnapshotSource, Q, P, E> {
     /// blocks. Both stay empty when the shadow is off.
     pub(super) shadow_captures: Vec<crate::shadow::ShadowTxCapture>,
     pub(super) shadow_serial: u32,
-    pub(super) block_exec: Option<BlockExec<S::Db>>,
+    pub(super) block_exec: Option<W::BlockExec>,
     /// A role-specific epoch check, statically dispatched. See
     /// [`crate::reader::EpochObserver`]. `None` means the code trusts the
     /// ordered stream.
-    pub(super) epoch_observer: Option<E>,
+    pub(super) epoch_observer: Option<W::Epoch>,
     /// The interop mirror of `epoch_observer`, invoked per `RemoteEpoch`
     /// marker. `None` everywhere until the destination-validator
     /// `RemoteEpochVerifier` lands.
-    pub(super) remote_epoch_observer: Option<Box<dyn RemoteEpochObserver>>,
+    pub(super) remote_epoch_observer: Option<W::RemoteEpoch>,
     /// The snapshot source returns owned snapshots keyed by block number:
     /// the block just committed. This is the [`ResumePoint`]'s `block` field
     /// (0 on a fresh start).
-    pub(super) snapshot: S::Db,
+    pub(super) snapshot: SnapshotDb<W>,
     pub(super) delta: PendingDelta,
     /// EIP-7928 capture: the per-block Bal. The code resets it at each
     /// boundary. It is maintained only when a publisher is attached
@@ -93,7 +91,7 @@ pub(super) struct ExecState<S: SnapshotSource, Q, P, E> {
     /// lazily, at the block's first tx. The rebuild seeds it with the
     /// parent and anything already in the live delta, for example deposits
     /// that landed before the first tx.
-    pub(super) scope: Option<crate::executor::Executor<S::Db>>,
+    pub(super) scope: Option<crate::executor::Executor<SnapshotDb<W>>>,
     /// Pipelined commit, at depth K. At each boundary, the code submits the
     /// finalized delta to the writer, but does not wait for it. The next
     /// block executes against the snapshot, then the merged unsettled layer,
@@ -164,13 +162,7 @@ pub(super) struct ExecState<S: SnapshotSource, Q, P, E> {
     pub(super) tx_applied_error: metrics::Counter,
 }
 
-impl<S, Q, P, E> ExecState<S, Q, P, E>
-where
-    S: SnapshotSource + 'static,
-    Q: StateWriterSignal + 'static,
-    P: StateWriterQueue + 'static,
-    E: EpochObserver + 'static,
-{
+impl<W: ExecPorts> ExecState<W> {
     /// Seed the loop state from the [`ResumePoint`] cursor.
     ///
     /// The canonical stream source delivers records from the persisted
@@ -179,7 +171,7 @@ where
     /// absolute counters here, instead of replaying from record 0 and
     /// counting through them. A fresh start uses [`ResumePoint::GENESIS`],
     /// the same seeding with all-zero values.
-    pub(super) fn new(inputs: ExecInputs<S, Q, P, E>) -> Self {
+    pub(super) fn new(inputs: ExecInputs<W>) -> Self {
         let ExecInputs {
             cfg,
             rx,

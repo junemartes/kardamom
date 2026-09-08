@@ -248,7 +248,7 @@ pub async fn finalize_withdrawal(
         proof,
     } = ticket;
 
-    let oracle = WithdrawalOutputOracle::new(l1.oracle, l1.provider());
+    let oracle = WithdrawalOutputOracle::new(l1.oracle, l1.provider()?);
     let finder = OutputFinder {
         oracle: &oracle,
         validator_state_dir,
@@ -291,6 +291,75 @@ struct FinalizeCall {
     state_root: B256,
     withdrawals_root: B256,
     proof: Vec<B256>,
+}
+
+/// One [`OutputFinder::find_attested_output`] sampler event: a newly
+/// observed root (deduped against the last-seen one), or a read error.
+/// The sampler thread and the poll below are one producer and one
+/// consumer, so this travels over an `mpsc` channel — no mutex.
+enum SampleEvent {
+    Root(B256),
+    Err(String),
+}
+
+/// One sampler tick's read, turned into an event: `None` when nothing
+/// changed (the root repeats `last`, or the read found nothing yet).
+fn sample_root_once(dir: &std::path::Path, last: Option<B256>) -> Option<SampleEvent> {
+    match read_validator_state_root(dir) {
+        Ok(Some(r)) if Some(r) != last => Some(SampleEvent::Root(r)),
+        Ok(_) => None,
+        Err(e) => Some(SampleEvent::Err(format!("{e:?}"))),
+    }
+}
+
+/// The root-sampler thread's own state: the validator state dir it
+/// reads, the last root it sent (for dedup), and the channel it sends
+/// new samples over. The spawned thread owns one of these; the poll in
+/// [`OutputFinder::find_attested_output`] owns only the receiving half.
+struct RootSampler {
+    dir: std::path::PathBuf,
+    last: Option<B256>,
+    tx: std::sync::mpsc::Sender<SampleEvent>,
+}
+
+impl RootSampler {
+    /// One tick: sample, then send the event (if any). Returns `false`
+    /// when the consumer has dropped its receiver (the poll finished),
+    /// telling [`Self::run`] to stop.
+    fn tick(&mut self) -> bool {
+        let Some(ev) = sample_root_once(&self.dir, self.last) else {
+            return true;
+        };
+        if let SampleEvent::Root(r) = ev {
+            self.last = Some(r);
+        }
+        self.tx.send(ev).is_ok()
+    }
+
+    /// The sampler thread body: sample every 100 ms (off the poll's own
+    /// cadence, so a fast block cannot slip between two samples) until
+    /// `stop` is set or the consumer goes away.
+    fn run(mut self, stop: &std::sync::atomic::AtomicBool) {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) && self.tick() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// Drain every sample [`run_sampler`] has sent so far into the consumer's
+/// own accumulators — a non-blocking read, since the poll tick must not
+/// block on the sampler.
+fn drain_samples(
+    rx: &std::sync::mpsc::Receiver<SampleEvent>,
+    observed: &mut Vec<B256>,
+    last_err: &mut Option<String>,
+) {
+    for ev in rx.try_iter() {
+        match ev {
+            SampleEvent::Root(r) => observed.push(r),
+            SampleEvent::Err(e) => *last_err = Some(e),
+        }
+    }
 }
 
 /// The most recently observed root (checked newest-first) that, paired
@@ -343,77 +412,44 @@ impl<P: Provider + Clone> OutputFinder<'_, P> {
     /// unreadable, the last read error (the signal that the stack fell
     /// over, as opposed to attestation never covering the withdrawal).
     async fn find_attested_output(&self) -> Result<(U256, B256)> {
-        let observed: std::sync::Arc<std::sync::Mutex<Vec<B256>>> = std::sync::Arc::default();
+        let (tx, rx) = std::sync::mpsc::channel::<SampleEvent>();
+        let sampler_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = {
+            let stop = sampler_stop.clone();
+            let sampler = RootSampler {
+                dir: self.validator_state_dir.to_path_buf(),
+                last: None,
+                tx,
+            };
+            std::thread::Builder::new()
+                .name("s2-root-sampler".into())
+                .spawn(move || sampler.run(&stop))
+                .context("spawn S2 root sampler")?
+        };
+
+        let mut observed: Vec<B256> = Vec::new();
         // Keep the most recent read error. A validator that died leaves its
         // mdbx environment in an unsteady state. The resulting
         // `MDBX_WANNA_RECOVERY` error, on the read-only open, is the signal
         // that tells "the stack fell over" apart from "the withdrawal was
         // never attested". The sampler owns this read, so it must carry the
         // error out to the failure message.
-        let last_err: std::sync::Arc<std::sync::Mutex<Option<String>>> = std::sync::Arc::default();
-        let sampler_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let sampler = {
-            let observed = observed.clone();
-            let last_err = last_err.clone();
-            let stop = sampler_stop.clone();
-            let dir = self.validator_state_dir.to_path_buf();
-            std::thread::Builder::new()
-                .name("s2-root-sampler".into())
-                .spawn(move || {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        match read_validator_state_root(&dir) {
-                            Ok(Some(r)) => {
-                                let mut seen = observed.lock().expect("observed roots poisoned");
-                                if seen.last() != Some(&r) {
-                                    seen.push(r);
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                *last_err.lock().expect("sampler error poisoned") =
-                                    Some(format!("{e:?}"));
-                            }
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                })
-                .context("spawn S2 root sampler")?
-        };
-
+        let mut last_err: Option<String> = None;
         let found = poll_until(
             "an attested output committing to this withdrawal",
             Duration::from_secs(90),
             Duration::from_millis(500),
-            || async {
-                let count = self
-                    .oracle
-                    .outputCount()
-                    .call()
-                    .await
-                    .unwrap_or(U256::ZERO)
-                    .to::<u64>();
-                // Newest first: the withdrawal's block is near the head.
-                for i in (0..count).rev() {
-                    let idx = U256::from(i);
-                    let Ok(posted) = self.oracle.outputRootAt(idx).call().await else {
-                        continue;
-                    };
-                    let roots = observed.lock().expect("observed roots poisoned").clone();
-                    if let Some(root) =
-                        matching_observed_root(&roots, posted, self.withdrawals_root)
-                    {
-                        return Ok(Some((idx, root)));
-                    }
-                }
-                Ok(None)
+            async || {
+                drain_samples(&rx, &mut observed, &mut last_err);
+                self.find_matching_posted_output(&observed).await
             },
         )
         .await;
         sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = sampler.join();
         found.with_context(|| {
-            let roots = observed.lock().expect("observed roots poisoned").len();
-            match last_err.lock().expect("sampler error poisoned").as_deref() {
+            let roots = observed.len();
+            match last_err.as_deref() {
                 // A read error means the stack fell over. It does not mean
                 // attestation is broken, so say so instead of blaming the
                 // attester.
@@ -429,6 +465,30 @@ impl<P: Provider + Clone> OutputFinder<'_, P> {
                 ),
             }
         })
+    }
+
+    /// One poll tick of [`Self::find_attested_output`]: scan every posted
+    /// output, newest first (the withdrawal's block is near the head), for
+    /// one that commits to `self.withdrawals_root` paired with an observed
+    /// validator state root.
+    async fn find_matching_posted_output(&self, observed: &[B256]) -> Result<Option<(U256, B256)>> {
+        let count = self
+            .oracle
+            .outputCount()
+            .call()
+            .await
+            .unwrap_or(U256::ZERO)
+            .to::<u64>();
+        for i in (0..count).rev() {
+            let idx = U256::from(i);
+            let Ok(posted) = self.oracle.outputRootAt(idx).call().await else {
+                continue;
+            };
+            if let Some(root) = matching_observed_root(observed, posted, self.withdrawals_root) {
+                return Ok(Some((idx, root)));
+            }
+        }
+        Ok(None)
     }
 }
 

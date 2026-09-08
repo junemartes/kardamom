@@ -74,10 +74,11 @@ pub use handles::simple::{
 };
 pub use handles::tx_data::{TxDataPublisherHandle, TxDataSubscriberHandle};
 pub use handles::tx_receipts::{
-    TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle, TxReceiptsSubscriberHandle,
+    TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle, TxReceiptsReceiver,
+    TxReceiptsSubscriberHandle,
 };
 pub use pending::IdleBackoff;
-pub use runtime::{AeronRuntime, PubHandle};
+pub use runtime::{AeronRuntime, PollRecv, PubHandle, TxDataSubscription, TypedSubscription};
 
 use std::time::Duration;
 
@@ -88,13 +89,63 @@ type Pub = rusteron_client::AeronPublication;
 type Sub = rusteron_client::AeronSubscription;
 type Header = rusteron_client::AeronHeader;
 
-/// Closure that decodes one Aeron fragment, position, and publisher
-/// `session_id`, and forwards the decoded value (or its raw bytes)
-/// somewhere Send-friendly. Boxed so different message types can share the
-/// subscription registration path. Most consumers ignore `session_id`. The
-/// `tx_data` subscription uses it to build a [`kardamom_types::TxDataLoc`],
-/// so concurrent ingress publishers on one shard stay distinct.
-pub type DeliverFn = Box<dyn FnMut(&[u8], BPosition, i32) + Send>;
+/// One undecoded fragment delivered off a subscription: the raw payload
+/// bytes plus the stream position and publisher `session_id` from the
+/// same header read (see `thread::header_loc`). Most consumers ignore
+/// `session`. The `tx_data` subscription uses it to build a
+/// [`kardamom_types::TxDataLoc`], so concurrent ingress publishers on one
+/// shard stay distinct.
+///
+/// This is the concrete, non-generic payload that crosses the
+/// `OpenSubscription` command to the dedicated Aeron thread: nothing
+/// downstream of the command channel is erased into a trait object.
+/// Decoding into a caller's own message type — over any
+/// [`crate::codec::WireMessage`] a downstream crate defines — happens on
+/// the consumer side, in [`runtime::TypedSubscription::recv`] and its
+/// siblings, not on the Aeron thread. `bytes` is copied out of the
+/// fragment assembler's buffer once per delivery (`buffer.to_vec()`), so
+/// the decode can run after the callback returns.
+pub struct RawFrame {
+    pub bytes: Vec<u8>,
+    pub pos: BPosition,
+    pub session: i32,
+}
+
+/// Where an [`AeronRuntime::open_subscription_raw`]-family call sends its
+/// [`RawFrame`]s. Exactly two shapes exist in this crate, both concrete
+/// (no `dyn`):
+///
+/// - `Tokio`: an async consumer, decoded lazily on `recv`/`try_recv`
+///   (every subscriber handle in [`handles`]).
+/// - `Crossbeam`: a plain OS thread that waits on this subscription
+///   alongside other crossbeam channels via `crossbeam_channel::Select`
+///   (`kardamom_cluster_adapter`'s session thread). Tokio's channels do
+///   not implement crossbeam's `SelectHandle`, so a `Select`-based
+///   consumer needs this variant instead of the `Tokio` one.
+///
+/// Both variants forward to the same fragment callback
+/// ([`thread::AssembledDeliver`]); the enum, not a boxed closure, is what
+/// lets one non-generic `RuntimeCmd::OpenSubscription` field carry either.
+pub(super) enum FrameSink {
+    Tokio(tokio::sync::mpsc::UnboundedSender<RawFrame>),
+    Crossbeam(crossbeam_channel::Sender<RawFrame>),
+}
+
+impl FrameSink {
+    /// Best effort: a closed receiver (the consumer dropped its side)
+    /// just means this frame is discarded, the same as every other
+    /// dropped-receiver send in this module.
+    fn send(&self, frame: RawFrame) {
+        match self {
+            FrameSink::Tokio(tx) => {
+                let _ = tx.send(frame);
+            }
+            FrameSink::Crossbeam(tx) => {
+                let _ = tx.send(frame);
+            }
+        }
+    }
+}
 
 const ADD_PUB_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_SUB_TIMEOUT: Duration = Duration::from_secs(5);
@@ -113,10 +164,18 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 // Send/Sync compile-time assertions.
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "called only from the const-eval assertions below; never \
+              run, so the compiler cannot see a live call"
+)]
 fn assert_send_sync<T: Send + Sync>() {}
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "called only from the const-eval assertions below; never \
+              run, so the compiler cannot see a live call"
+)]
 fn assert_send<T: Send>() {}
 
 const _: fn() = || {

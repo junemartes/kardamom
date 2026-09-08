@@ -26,7 +26,7 @@ use kardamom_batcher::testkit::{
     AcceptingVerifier, BATCHER, DEV_OWNER, L2_CHAIN_ID, advance_past_window, env_tx,
 };
 use kardamom_deployer::Deployer;
-use kardamom_deployer::testkit::{AnvilRig, OracleInitArgs};
+use kardamom_deployer::testkit::{AnvilRig, Funding, OracleInitArgs};
 use kardamom_types::{BPosition, BlockBoundaryStart, BlockRecordsDigest, PublicOutputs};
 
 const VKEY: B256 = B256::repeat_byte(0x5E);
@@ -72,7 +72,14 @@ impl<P: Provider + Clone> Scenario<P> {
 }
 
 async fn setup() -> Option<Scenario<impl Provider + Clone>> {
-    let rig = AnvilRig::spawn(&[DEV_OWNER, BATCHER]).await?;
+    let rig = AnvilRig::spawn(
+        alloy_node_bindings::Anvil::new(),
+        &[
+            (DEV_OWNER, Funding::FundAndImpersonate),
+            (BATCHER, Funding::FundAndImpersonate),
+        ],
+    )
+    .await?;
     let deployer = Deployer::new(rig.provider.clone(), DEV_OWNER);
     let verifier = AcceptingVerifier::deploy(rig.provider.clone())
         .await

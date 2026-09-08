@@ -2,6 +2,7 @@
 //! batches. It publishes each batch, then any boundary, on `tx_receipts`.
 //! It uses must-deliver retry logic.
 
+use std::ops::ControlFlow;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -72,6 +73,45 @@ struct Batch {
     closed: bool,
 }
 
+impl Batch {
+    fn new() -> Self {
+        Self {
+            receipts: Vec::new(),
+            boundary: None,
+            closed: false,
+        }
+    }
+
+    /// Fold one drained item into the batch. Returns whether the caller
+    /// should keep draining. The `while` loop in
+    /// [`CommitLoop::collect_batch`] stays free of a branch.
+    fn absorb(&mut self, drained: Drained) -> ControlFlow<()> {
+        match drained {
+            Drained::Receipt(r) => {
+                self.receipts.push(r);
+                ControlFlow::Continue(())
+            }
+            Drained::Boundary(b) => {
+                self.boundary = Some(b);
+                ControlFlow::Continue(())
+            }
+            Drained::Empty => ControlFlow::Break(()),
+            Drained::Closed => {
+                self.closed = true;
+                ControlFlow::Break(())
+            }
+        }
+    }
+}
+
+/// One non-blocking receive result from the exec-to-commit channel.
+enum Drained {
+    Receipt(Receipt),
+    Boundary(BlockBoundary),
+    Empty,
+    Closed,
+}
+
 /// Drains the exec-to-commit channel into adaptive receipt batches, and
 /// must-deliver publishes each one on `tx_receipts`.
 struct CommitLoop<C> {
@@ -87,30 +127,29 @@ impl<C: TxReceiptsPublication> CommitLoop<C> {
     /// receipts gathered so far, and this keeps the stream order. Returns
     /// `None` when the channel is already closed with nothing queued.
     fn collect_batch(&self) -> Option<Batch> {
-        let mut receipts: Vec<Receipt> = Vec::new();
-        let mut boundary = None;
+        let mut batch = Batch::new();
         match self.rx.recv() {
-            Ok(ExecToCommit::Receipt(r)) => receipts.push(r),
-            Ok(ExecToCommit::Boundary(b)) => boundary = Some(b),
+            Ok(ExecToCommit::Receipt(r)) => batch.receipts.push(r),
+            Ok(ExecToCommit::Boundary(b)) => batch.boundary = Some(b),
             Err(_) => return None,
         }
-        let mut closed = false;
-        while boundary.is_none() && receipts.len() < RECEIPT_BATCH_MAX {
-            match self.rx.try_recv() {
-                Ok(ExecToCommit::Receipt(r)) => receipts.push(r),
-                Ok(ExecToCommit::Boundary(b)) => boundary = Some(b),
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    closed = true;
-                    break;
-                }
-            }
+        while batch.boundary.is_none()
+            && batch.receipts.len() < RECEIPT_BATCH_MAX
+            && batch.absorb(self.try_drain_one()).is_continue()
+        {}
+        Some(batch)
+    }
+
+    /// Try one non-blocking receive. The `while` loop in
+    /// [`Self::collect_batch`] matches the result and stays free of a
+    /// nested branch.
+    fn try_drain_one(&self) -> Drained {
+        match self.rx.try_recv() {
+            Ok(ExecToCommit::Receipt(r)) => Drained::Receipt(r),
+            Ok(ExecToCommit::Boundary(b)) => Drained::Boundary(b),
+            Err(crossbeam_channel::TryRecvError::Empty) => Drained::Empty,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Drained::Closed,
         }
-        Some(Batch {
-            receipts,
-            boundary,
-            closed,
-        })
     }
 
     /// Must-deliver publish of a receipt batch.
@@ -139,13 +178,26 @@ impl<C: TxReceiptsPublication> CommitLoop<C> {
         // instead of advancing.
         let mut from = 0usize;
         while from < receipts.len() {
-            let (published, err) = self.tx_receipts_pub.publish_receipts(&receipts[from..]);
-            from = from.saturating_add(published);
-            if let Some(e) = err {
-                retry.retry(e, "tx_receipts publish failed; retrying (must-deliver)")?;
-            }
+            from = self.publish_batch_step(receipts, from, &mut retry)?;
         }
         Ok(())
+    }
+
+    /// Publish one must-deliver attempt starting at `from`, retrying on
+    /// failure. Returns the resume point for the next attempt. The `while`
+    /// loop in [`Self::publish_batch`] stays free of a branch.
+    fn publish_batch_step(
+        &mut self,
+        receipts: &[Receipt],
+        from: usize,
+        retry: &mut MustDeliver,
+    ) -> Result<usize, ExecutorError> {
+        let (published, err) = self.tx_receipts_pub.publish_receipts(&receipts[from..]);
+        let from = from.saturating_add(published);
+        if let Some(e) = err {
+            retry.retry(e, "tx_receipts publish failed; retrying (must-deliver)")?;
+        }
+        Ok(from)
     }
 
     /// Must-deliver publish of one boundary. Same retry rule as
@@ -162,21 +214,30 @@ impl<C: TxReceiptsPublication> CommitLoop<C> {
     }
 
     fn run(mut self) -> Result<(), ExecutorError> {
-        loop {
-            let Some(batch) = self.collect_batch() else {
-                return Ok(());
-            };
-            self.publish_batch(&batch.receipts)?;
-            if let Some(b) = &batch.boundary {
-                self.publish_boundary(b)?;
-            }
-            if batch.closed {
-                return Ok(());
-            }
+        let mut closed = false;
+        while !closed && let Some(batch) = self.collect_batch() {
+            closed = self.publish_one_batch(&batch)?;
         }
+        Ok(())
+    }
+
+    /// Publish one collected batch's receipts and boundary. Returns
+    /// whether the batch closes the stream. The loop in [`Self::run`]
+    /// stays free of a branch.
+    fn publish_one_batch(&mut self, batch: &Batch) -> Result<bool, ExecutorError> {
+        self.publish_batch(&batch.receipts)?;
+        if let Some(b) = &batch.boundary {
+            self.publish_boundary(b)?;
+        }
+        Ok(batch.closed)
     }
 }
 
+/// Spawn the commit thread.
+///
+/// # Panics
+///
+/// Panics if the OS refuses to spawn the thread.
 pub(crate) fn spawn_commit<C>(
     tx_receipts_pub: C,
     rx: Receiver<ExecToCommit>,

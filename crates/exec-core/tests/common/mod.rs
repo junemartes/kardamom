@@ -26,7 +26,7 @@ use kardamom_types::BPosition;
 /// Build a [`TxSlot`] from plain integers: `tx_idx` and `tx_position`
 /// are given separately, since some tests need a `BPosition` that does
 /// not equal its `TxIndex`.
-pub fn slot(
+pub(crate) fn slot(
     tx_idx: u64,
     tx_position: u64,
     tx_index_in_block: u64,
@@ -48,7 +48,7 @@ pub fn slot(
     clippy::cast_precision_loss,
     reason = "a nanosecond-scale timing report; f64 precision loss here is irrelevant"
 )]
-pub fn ns_per_op(reps: usize, n: usize, mut f: impl FnMut()) -> f64 {
+pub(crate) fn ns_per_op(reps: usize, n: usize, mut f: impl FnMut()) -> f64 {
     let t = std::time::Instant::now();
     for _ in 0..reps {
         f();
@@ -61,7 +61,10 @@ pub fn ns_per_op(reps: usize, n: usize, mut f: impl FnMut()) -> f64 {
 /// every leaf, and return the resulting root plus every retained proof
 /// node of 32 bytes or more. Nodes smaller than that are inline in their
 /// parents and never separately fetched, so they are dropped.
-pub fn retained_nodes(entries: &BTreeMap<B256, Vec<u8>>, targets: &[B256]) -> (B256, Vec<Bytes>) {
+pub(crate) fn retained_nodes(
+    entries: &BTreeMap<B256, Vec<u8>>,
+    targets: &[B256],
+) -> (B256, Vec<Bytes>) {
     let target_nibbles: Vec<Nibbles> = targets.iter().map(|k| Nibbles::unpack(k)).collect();
     let mut hb = HashBuilder::default().with_proof_retainer(ProofRetainer::new(target_nibbles));
     for (k, v) in entries {

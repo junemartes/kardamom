@@ -246,24 +246,17 @@ fn first_mismatch<K: Ord, V: PartialEq + std::fmt::Display>(
     computed: &BTreeMap<K, V>,
     describe: impl Fn(&K) -> String,
 ) -> Option<String> {
-    for (k, v) in claimed {
-        match computed.get(k) {
-            Some(o) if o == v => {}
-            Some(o) => {
-                return Some(format!(
-                    "{field} {}: claimed {v}, recomputed {o}",
-                    describe(k)
-                ));
-            }
-            None => {
-                return Some(format!(
-                    "{field} {}: claimed {v}, recomputed absent",
-                    describe(k)
-                ));
-            }
-        }
-    }
-    None
+    claimed.iter().find_map(|(k, v)| match computed.get(k) {
+        Some(o) if o == v => None,
+        Some(o) => Some(format!(
+            "{field} {}: claimed {v}, recomputed {o}",
+            describe(k)
+        )),
+        None => Some(format!(
+            "{field} {}: claimed {v}, recomputed absent",
+            describe(k)
+        )),
+    })
 }
 
 /// The reverse pass: find the first recomputed write the claims never mention.
@@ -282,7 +275,7 @@ fn first_unclaimed<K: Ord, V: std::fmt::Display>(
 
 impl ClaimSlice {
     /// Human-readable first difference, for the divergence reason.
-    pub fn diff_summary(&self, other: &Self) -> String {
+    pub(crate) fn diff_summary(&self, other: &Self) -> String {
         let slot_key = |k: &(Address, B256)| format!("{:?}/{:?}", k.0, k.1);
         let addr_key = |a: &Address| format!("{a:?}");
         // Keep this pass order: it is load-bearing for message stability.

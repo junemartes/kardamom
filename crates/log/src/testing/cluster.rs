@@ -83,7 +83,7 @@ impl AeronTestCluster {
     ///
     /// Returns an error if building the Aeron Docker image fails, or
     /// if the container fails to start.
-    pub async fn single_node() -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn single_node() -> anyhow::Result<Self> {
         if let Ok(dir) = std::env::var("KARDAMOM_AERON_DIR") {
             let aeron_dir = PathBuf::from(dir);
             // Convention: the archive dir lives next to aeron.dir,
@@ -112,7 +112,7 @@ impl AeronTestCluster {
     ///
     /// Returns an error if building the Aeron Docker image fails, or
     /// if any of the `n` containers fails to start.
-    pub async fn multi_node(n: std::num::NonZeroUsize) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn multi_node(n: std::num::NonZeroUsize) -> anyhow::Result<Self> {
         ensure_image_built().await?;
         let n = n.get();
         let mut nodes = Vec::with_capacity(n);
@@ -198,7 +198,7 @@ impl AeronTestCluster {
     /// # Errors
     ///
     /// Returns an error if the Docker container fails to stop.
-    pub async fn stop(&mut self, i: usize) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn stop(&mut self, i: usize) -> anyhow::Result<()> {
         if let Node::Container(c) = &mut self.nodes[i] {
             c.container.stop().await?;
         }
@@ -312,7 +312,7 @@ pub async fn recv_within(
 /// Aeron's `MediaDriver.ensureDirectoryIsRecreated` removes and
 /// recreates the inner `dir/` subdir on every start, so the
 /// bind-mounted parent stays intact.
-async fn spawn_node() -> Result<Node, Box<dyn std::error::Error>> {
+async fn spawn_node() -> anyhow::Result<Node> {
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -330,7 +330,10 @@ async fn spawn_node() -> Result<Node, Box<dyn std::error::Error>> {
         std::fs::set_permissions(d, p)?;
     }
 
-    let root_str = root.to_str().ok_or("mount path not utf-8")?.to_string();
+    let root_str = root
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("mount path not utf-8"))?
+        .to_string();
     let aeron_dir_in_container = format!("{root_str}/dir");
     let archive_dir_in_container = format!("{root_str}/archive/dir");
 
@@ -357,7 +360,7 @@ async fn spawn_node() -> Result<Node, Box<dyn std::error::Error>> {
 /// idempotent. This shells out to the docker CLI because
 /// testcontainers has no "build if missing" helper. Cached layers make
 /// repeat runs fast.
-async fn ensure_image_built() -> Result<(), Box<dyn std::error::Error>> {
+async fn ensure_image_built() -> anyhow::Result<()> {
     use tokio::process::Command;
     let image_ref = format!("{AERON_IMAGE_NAME}:{AERON_IMAGE_TAG}");
     let out = Command::new("docker")
@@ -374,7 +377,7 @@ async fn ensure_image_built() -> Result<(), Box<dyn std::error::Error>> {
         .status()
         .await?;
     if !status.success() {
-        return Err(format!("docker build failed (status {status:?})").into());
+        return Err(anyhow::anyhow!("docker build failed (status {status:?})"));
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     Ok(())

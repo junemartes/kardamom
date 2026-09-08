@@ -179,7 +179,7 @@ fn ingress_submission_allocation_profile() {
             pending_receipt_timeout: Duration::from_secs(10),
             ..IngressConfig::default()
         };
-        let (mock, rx_vec) = MockChannels::new(cfg.partition_count_m as usize);
+        let (mock, rx_vec) = MockChannels::new(cfg.partition_count_m.get() as usize);
         let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
         spawn_receipt_pump(&mock, rx_vec, nonce_by_hash.clone(), position.clone());
         spawn_watermark_ticker(&mock, position.clone());

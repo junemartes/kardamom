@@ -24,6 +24,8 @@ use alloy_rlp::Encodable;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use kardamom_engine::actor::BalHandoff;
 use kardamom_log::aeron_live::PubHandle;
+use std::num::NonZeroU16;
+
 use kardamom_types::{BalFrame, BlockDelta};
 
 /// Default attribution granularity written into the frame: K-tx chunks
@@ -44,17 +46,16 @@ use kardamom_types::{BalFrame, BlockDelta};
 /// the override, for external consumers or divergence forensics. If the
 /// chunk-collapsed path ever diverges live, the flight recorder dumps
 /// replay inputs at the point of failure; see `kardamom_validator::flight`.
-const DEFAULT_GRANULARITY: u16 = 8;
+const DEFAULT_GRANULARITY: NonZeroU16 = NonZeroU16::new(8).unwrap();
 
 /// Attribution granularity written into the frame. It is
 /// [`DEFAULT_GRANULARITY`] unless overridden by `KARDAMOM_BAL_GRANULARITY`
 /// (1 means per-tx; other K values mean K-tx chunks, the size ladder's
 /// rungs).
-fn configured_granularity() -> u16 {
+fn configured_granularity() -> NonZeroU16 {
     std::env::var("KARDAMOM_BAL_GRANULARITY")
         .ok()
         .and_then(|v| v.parse().ok())
-        .filter(|k| *k >= 1)
         .unwrap_or(DEFAULT_GRANULARITY)
 }
 
@@ -90,9 +91,9 @@ fn aligned(bytes: &[u8]) -> rkyv::util::AlignedVec {
 fn encode_frame(
     delta: BlockDelta,
     bal: revm::state::bal::Bal,
-    granularity: u16,
+    granularity: NonZeroU16,
 ) -> Result<(Vec<u8>, usize), String> {
-    let alloy_bal = quantize(bal.into_alloy_bal(), granularity);
+    let alloy_bal = quantize(bal.into_alloy_bal(), granularity.get());
     let mut bal_rlp = Vec::new();
     alloy_bal.encode(&mut bal_rlp);
     let bal_bytes = bal_rlp.len();
@@ -119,9 +120,17 @@ pub fn run_bal_publisher(rx: Receiver<BalHandoff>, pubh: PubHandle) {
         .unwrap_or_default();
     let mut retained: std::collections::VecDeque<(u64, Vec<u8>)> = Default::default();
 
-    tracing::info!(granularity, ?measure, "BAL publisher started");
+    tracing::info!(
+        granularity = granularity.get(),
+        ?measure,
+        "BAL publisher started"
+    );
     loop {
-        let (boundary, delta, bal) = match rx.recv_timeout(Duration::from_millis(500)) {
+        let BalHandoff {
+            boundary,
+            delta,
+            bal,
+        } = match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(v) => v,
             Err(RecvTimeoutError::Timeout) => {
                 // Idle tick: no block closed in the last 500ms. Use trace

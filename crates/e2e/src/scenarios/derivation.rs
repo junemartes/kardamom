@@ -90,6 +90,26 @@ pub fn read_block_origins(state_dir: &Path) -> Result<Vec<BlockOrigin>> {
         .collect())
 }
 
+/// Send `count` filler L2 transfers from `signer` to `to`, at nonces
+/// `0..count`. Returns the hash of each one that actually landed (a
+/// transient send failure just skips that nonce; the spam is filler, not
+/// the thing under test).
+async fn send_filler_transfers(
+    t: &Target,
+    signer: &l2::DerivedSigner,
+    to: Address,
+    count: u64,
+) -> Result<Vec<alloy_primitives::B256>> {
+    let mut sender = l2::NudgeSender::new(signer.clone(), to, 0);
+    let mut sent = Vec::new();
+    for _ in 0..count {
+        if let Some(tx) = sender.send(&t.rpc, t.chain_id).await? {
+            sent.push(tx.hash);
+        }
+    }
+    Ok(sent)
+}
+
 /// Checks rules 1, 2, and 4 over the whole chain built so far.
 ///
 /// `l1_finalized` is the L1 finalized tip observed after the chain
@@ -101,64 +121,73 @@ pub fn read_block_origins(state_dir: &Path) -> Result<Vec<BlockOrigin>> {
 /// skips an L1 block, or when an origin exceeds `l1_finalized`.
 pub fn assert_origin_sequence_is_sound(blocks: &[BlockOrigin], l1_finalized: u64) -> Result<()> {
     anyhow::ensure!(!blocks.is_empty(), "no blocks were produced");
+    blocks.windows(2).try_for_each(|w| w[1].check_step(&w[0]))?;
+    blocks
+        .iter()
+        .try_for_each(|b| b.check_finalized(l1_finalized))
+}
 
-    let mut prev: Option<BlockOrigin> = None;
-    for b in blocks {
-        // `l1_origin == 0` means "no epoch adopted yet". These are the
-        // blocks a chain produces between genesis and its first epoch. The
-        // step out of 0 is the watcher's seed, which deliberately skips
-        // historical L1 (see the spec's Non-Goals). So this step is not a
-        // skip in the rule-2 sense.
-        //
-        // Known gap: because the seed starts where it does, deposits made
-        // in L1 blocks before it are unrecoverable, since nothing derives
-        // them. The spec's `l1_origin_genesis` edge case will close this
-        // gap. Until then, a chain's verifiable history starts at its
-        // first epoch, not at L1 genesis.
-        let crossing_the_seed = prev.is_some_and(|p| p.l1_origin == 0) && b.l1_origin > 0;
-        if let Some(p) = prev
-            && !crossing_the_seed
-        {
-            // Rule 1: monotonic. A regression would make deposit derivation
-            // ambiguous: two blocks would claim different origins for the
-            // same stretch of L1.
-            anyhow::ensure!(
-                b.l1_origin >= p.l1_origin,
-                "l1_origin regressed: block {} has origin {}, block {} had {}",
-                b.block_number,
-                b.l1_origin,
-                p.block_number,
-                p.l1_origin
-            );
-            // Rule 2: no skipping. Every L1 block between two origins must
-            // have had its own epoch, so the origin may step by only one. A
-            // jump means an epoch was dropped, along with any deposits it
-            // carried. This is exactly the censorship this design exists
-            // to prevent.
-            // `p.l1_origin` is a state-DB-derived value; saturating keeps
-            // the comparison correct even at the u64 boundary, where no
-            // step could count as a skip.
-            anyhow::ensure!(
-                b.l1_origin <= p.l1_origin.saturating_add(1),
-                "l1_origin skipped from {} to {} between blocks {} and {}: \
-                 an epoch (and any deposits in it) was dropped",
-                p.l1_origin,
-                b.l1_origin,
-                p.block_number,
-                b.block_number
-            );
+impl BlockOrigin {
+    /// Rules 1 and 2 against `prev`, the block immediately before `self`:
+    /// the origin is monotonic and steps by at most one L1 block.
+    ///
+    /// `l1_origin == 0` means "no epoch adopted yet". These are the blocks
+    /// a chain produces between genesis and its first epoch. The step out
+    /// of 0 is the watcher's seed, which deliberately skips historical L1
+    /// (see the spec's Non-Goals), so that step is not a skip in the
+    /// rule-2 sense.
+    ///
+    /// Known gap: because the seed starts where it does, deposits made in
+    /// L1 blocks before it are unrecoverable, since nothing derives them.
+    /// The spec's `l1_origin_genesis` edge case will close this gap.
+    /// Until then, a chain's verifiable history starts at its first
+    /// epoch, not at L1 genesis.
+    fn check_step(&self, prev: &Self) -> Result<()> {
+        let crossing_the_seed = prev.l1_origin == 0 && self.l1_origin > 0;
+        if crossing_the_seed {
+            return Ok(());
         }
-        // Rule 4: the origin is always an L1 block that is already final.
+        // Rule 1: monotonic. A regression would make deposit derivation
+        // ambiguous: two blocks would claim different origins for the
+        // same stretch of L1.
         anyhow::ensure!(
-            b.l1_origin <= l1_finalized,
+            self.l1_origin >= prev.l1_origin,
+            "l1_origin regressed: block {} has origin {}, block {} had {}",
+            self.block_number,
+            self.l1_origin,
+            prev.block_number,
+            prev.l1_origin
+        );
+        // Rule 2: no skipping. Every L1 block between two origins must
+        // have had its own epoch, so the origin may step by only one. A
+        // jump means an epoch was dropped, along with any deposits it
+        // carried. This is exactly the censorship this design exists to
+        // prevent. `prev.l1_origin` is a state-DB-derived value;
+        // saturating keeps the comparison correct even at the u64
+        // boundary, where no step could count as a skip.
+        anyhow::ensure!(
+            self.l1_origin <= prev.l1_origin.saturating_add(1),
+            "l1_origin skipped from {} to {} between blocks {} and {}: \
+             an epoch (and any deposits in it) was dropped",
+            prev.l1_origin,
+            self.l1_origin,
+            prev.block_number,
+            self.block_number
+        );
+        Ok(())
+    }
+
+    /// Rule 4: the origin is always an L1 block that is already final.
+    fn check_finalized(&self, l1_finalized: u64) -> Result<()> {
+        anyhow::ensure!(
+            self.l1_origin <= l1_finalized,
             "block {} claims origin {} beyond the L1 finalized tip {}",
-            b.block_number,
-            b.l1_origin,
+            self.block_number,
+            self.l1_origin,
             l1_finalized
         );
-        prev = Some(*b);
+        Ok(())
     }
-    Ok(())
 }
 
 /// The origin advances during ordinary operation, and the
@@ -215,14 +244,10 @@ pub async fn deposits_lead_their_block_under_load(
     let beneficiary = &signers[1];
     let spammer = &signers[0];
 
-    // Keep L2 busy so the epoch lands amongst regular traffic.
-    let mut sent = Vec::new();
-    for nonce in 0..6u64 {
-        let tx = l2::sign_transfer(spammer, t.chain_id, nonce, signers[2].address, 1)?;
-        if t.rpc.send_raw(&tx.raw).await.result.is_ok() {
-            sent.push(tx.hash);
-        }
-    }
+    // Keep L2 busy so the epoch lands amongst regular traffic. Only the
+    // side effect (filler traffic landing) matters here; the returned
+    // hashes go unused, unlike `stalled_l1_does_not_stall_l2`'s count.
+    let _sent = send_filler_transfers(t, spammer, signers[2].address, 6).await?;
 
     let (block_hash, log_index) = l1
         .deposit_eth(beneficiary.address, U256::from(5_000_000_000_000_000u64))
@@ -370,13 +395,8 @@ pub async fn stalled_l1_does_not_stall_l2(t: &Target, l1: &L1, state_dir: &Path)
 
     // L2 keeps taking work with L1 completely idle.
     let signers = l2::dev_signers_total(2)?;
-    let mut accepted = 0.0;
-    for nonce in 0..4u64 {
-        let tx = l2::sign_transfer(&signers[0], t.chain_id, nonce, signers[1].address, 1)?;
-        if t.rpc.send_raw(&tx.raw).await.result.is_ok() {
-            accepted += 1.0;
-        }
-    }
+    let sent = send_filler_transfers(t, &signers[0], signers[1].address, 4).await?;
+    let accepted = f64::from(u32::try_from(sent.len()).context("accepted count overflows u32")?);
     anyhow::ensure!(accepted > 0.0, "no L2 txs were accepted while L1 was idle");
     t.wait_executor_applied(applied_before + accepted, Duration::from_secs(20))
         .await

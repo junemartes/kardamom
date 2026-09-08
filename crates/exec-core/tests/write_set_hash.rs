@@ -8,7 +8,7 @@
 //! paths agree with each other.
 
 use alloy_primitives::{Address, B256, Keccak256, U256, address};
-use kardamom_exec_core::delta::WriteSet;
+use kardamom_exec_core::delta::{AccountFields, WriteSet};
 
 /// The v2 contract, spelled out independently of the implementation:
 ///
@@ -54,11 +54,11 @@ fn expected(ws: &WriteSet) -> B256 {
     let mut h = Keccak256::new();
     h.update([0x02u8]);
     varint(&mut h, ws.accounts.len() as u64);
-    for (addr, (nonce, balance, code_hash)) in &ws.accounts {
-        let bal = minimal(balance);
-        let tag: u8 = if *code_hash == keccak_empty {
+    for (addr, fields) in &ws.accounts {
+        let bal = minimal(&fields.balance);
+        let tag: u8 = if fields.code_hash == keccak_empty {
             0
-        } else if code_hash.is_zero() {
+        } else if fields.code_hash.is_zero() {
             1
         } else {
             2
@@ -69,10 +69,10 @@ fn expected(ws: &WriteSet) -> B256 {
             reason = "minimal() returns a length in 0..=32: fits u8"
         )]
         h.update([bal.len() as u8 | (tag << 6)]);
-        varint(&mut h, *nonce);
+        varint(&mut h, fields.nonce);
         h.update(&bal);
         if tag == 2 {
-            h.update(code_hash.as_slice());
+            h.update(fields.code_hash.as_slice());
         }
     }
     varint(&mut h, ws.storage.len() as u64);
@@ -110,7 +110,11 @@ fn addr(i: u8) -> Address {
 fn account(ws: &mut WriteSet, i: u8, nonce: u64, balance: u64) {
     ws.accounts.push((
         addr(i),
-        (nonce, U256::from(balance), B256::with_last_byte(i)),
+        AccountFields {
+            nonce,
+            balance: U256::from(balance),
+            code_hash: B256::with_last_byte(i),
+        },
     ));
 }
 

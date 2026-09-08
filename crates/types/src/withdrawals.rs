@@ -111,16 +111,47 @@ fn hash_leaf(leaf: B256) -> B256 {
     keccak256(buf)
 }
 
-/// Domain-hash the withdrawal hashes into the tree's leaf level. Pad up to
-/// the next power-of-two size with the zero leaf. This is the fixed-shape
-/// convention that the on-chain positional verifier reconstructs.
-fn leaf_level(leaves: &[B256]) -> Vec<B256> {
-    let mut level = leaves.to_vec();
-    // `0usize.next_power_of_two()` is already 1, so the empty case needs
-    // no extra floor.
-    let target = level.len().next_power_of_two();
-    level.resize(target, B256::ZERO);
-    level.into_iter().map(hash_leaf).collect()
+/// One level of the withdrawal tree during root or proof construction:
+/// hashed nodes, padded to a power-of-two length so every node has a
+/// sibling ([`Self::sibling`]) and the level halves cleanly into the one
+/// above it ([`Self::up`]).
+struct Level(Vec<B256>);
+
+impl Level {
+    /// Domain-hash `leaves` into the tree's leaf level, padded up to the
+    /// next power-of-two size with the zero leaf. This is the fixed-shape
+    /// convention that the on-chain positional verifier reconstructs.
+    fn leaves(leaves: &[B256]) -> Self {
+        let mut level = leaves.to_vec();
+        // `0usize.next_power_of_two()` is already 1, so the empty case
+        // needs no extra floor.
+        let target = level.len().next_power_of_two();
+        level.resize(target, B256::ZERO);
+        Self(level.into_iter().map(hash_leaf).collect())
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The single remaining node, once [`Self::up`] has reduced the level
+    /// to one.
+    fn root(&self) -> B256 {
+        self.0[0]
+    }
+
+    /// The sibling of the node at `idx`. `idx ^ 1` toggles the low bit, so
+    /// an even index reads its odd neighbor and an odd index reads its
+    /// even one — the pair [`Self::up`] combines next. Always in range:
+    /// `Self` is never built or reduced to an odd, non-one length.
+    fn sibling(&self, idx: usize) -> B256 {
+        self.0[idx ^ 1]
+    }
+
+    /// The level above: sibling pairs combined with [`hash_pair`].
+    fn up(&self) -> Self {
+        Self(self.0.chunks(2).map(|p| hash_pair(p[0], p[1])).collect())
+    }
 }
 
 /// Merkle root over `leaves`: withdrawal hashes, in withdrawal-nonce order
@@ -131,11 +162,23 @@ pub fn withdrawals_root(leaves: &[B256]) -> B256 {
     if leaves.is_empty() {
         return B256::ZERO;
     }
-    let mut level = leaf_level(leaves);
+    let mut level = Level::leaves(leaves);
     while level.len() > 1 {
-        level = level.chunks(2).map(|p| hash_pair(p[0], p[1])).collect();
+        level = level.up();
     }
-    level[0]
+    level.root()
+}
+
+/// A withdrawal-tree leaf index, checked once against the leaf count.
+/// Nothing that holds one needs to re-check the bound.
+#[derive(Clone, Copy)]
+struct LeafIndex(usize);
+
+impl LeafIndex {
+    /// `None` if `index >= leaf_count`.
+    fn new(index: usize, leaf_count: usize) -> Option<Self> {
+        (index < leaf_count).then_some(Self(index))
+    }
 }
 
 /// Sibling path for the leaf at `index`, from the bottom up. Its length
@@ -144,28 +187,22 @@ pub fn withdrawals_root(leaves: &[B256]) -> B256 {
 ///
 /// # Panics
 ///
-/// Panics if `leaves` is empty or `index >= leaves.len()`. Without this
-/// check, `index = usize::MAX` wraps `idx + 1` back to a small in-range
-/// value and returns a wrong sibling with no panic at all — this bound
-/// turns that into a loud, immediate failure instead.
+/// Panics if `leaves` is empty or `index >= leaves.len()`. The bound is
+/// parsed once into a [`LeafIndex`], so the loop below never does its own
+/// range check.
 #[must_use]
 pub fn withdrawal_proof(leaves: &[B256], index: usize) -> Vec<B256> {
-    assert!(
-        index < leaves.len(),
-        "withdrawal_proof: index {index} out of range for {} leaves",
-        leaves.len()
-    );
-    let mut level = leaf_level(leaves);
-    let mut idx = index;
+    let Some(LeafIndex(mut idx)) = LeafIndex::new(index, leaves.len()) else {
+        panic!(
+            "withdrawal_proof: index {index} out of range for {} leaves",
+            leaves.len()
+        );
+    };
+    let mut level = Level::leaves(leaves);
     let mut proof = Vec::new();
     while level.len() > 1 {
-        let sibling = if idx.is_multiple_of(2) {
-            level[idx + 1]
-        } else {
-            level[idx - 1]
-        };
-        proof.push(sibling);
-        level = level.chunks(2).map(|p| hash_pair(p[0], p[1])).collect();
+        proof.push(level.sibling(idx));
+        level = level.up();
         idx /= 2;
     }
     proof
@@ -180,14 +217,20 @@ pub fn recompute_root(leaf: B256, index: usize, proof: &[B256]) -> B256 {
     let mut node = hash_leaf(leaf);
     let mut idx = index;
     for sibling in proof {
-        node = if idx & 1 == 0 {
-            hash_pair(node, *sibling)
-        } else {
-            hash_pair(*sibling, node)
-        };
+        node = combine_with_sibling(node, *sibling, idx);
         idx >>= 1;
     }
     node
+}
+
+/// Combine `node` with `sibling` in proof order: `sibling` goes on the
+/// left when `idx` is odd, on the right when `idx` is even.
+fn combine_with_sibling(node: B256, sibling: B256, idx: usize) -> B256 {
+    if idx & 1 == 0 {
+        hash_pair(node, sibling)
+    } else {
+        hash_pair(sibling, node)
+    }
 }
 
 /// Output root: `keccak256(abi.encodePacked(OUTPUT_VERSION, state_root, withdrawals_root))`.

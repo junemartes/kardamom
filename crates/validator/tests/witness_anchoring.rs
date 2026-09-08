@@ -36,6 +36,9 @@ use common::{CHAIN_ID, RECIPIENT, S0, S1, ZEROER, ZEROER_CODE, tx};
 /// SSTORE(3, 0x2a); STOP. Writes a fresh slot: the storage-insert shape.
 const WRITER: Address = address!("00000000000000000000000000000000000000Bb");
 const WRITER_CODE: [u8; 6] = [0x60, 0x2a, 0x60, 0x03, 0x55, 0x00];
+/// `execute_block_anchored`'s BAL granularity for an unquantized (K=1)
+/// frame.
+const GRANULARITY_1: std::num::NonZeroU16 = std::num::NonZeroU16::new(1).unwrap();
 
 fn exec_env() -> ExecEnv {
     ExecEnv::new(
@@ -187,7 +190,7 @@ fn guest_reverify(
         records,
         exec_env(),
         bal,
-        1,
+        GRANULARITY_1,
     )
     .expect("guest execution");
     assert_eq!(anchored.pre_state_root, pre_root);
@@ -258,11 +261,11 @@ fn export_prover_fixture_if_requested(
     };
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&input).expect("serialize input");
     let mut digest = BlockRecordsDigest::new(1);
-    for r in records {
+    records.iter().for_each(|r| {
         if let BufferedRecord::Tx { envelope, .. } = r {
             digest.add_tx(&envelope.raw_tx);
         }
-    }
+    });
     let expected = PublicOutputs {
         pre_state_root: anchored.pre_state_root,
         post_state_root: anchored.post_state_root,
@@ -310,7 +313,7 @@ fn assert_tamper_rejected(
         records,
         exec_env(),
         bal,
-        1,
+        GRANULARITY_1,
     )
     .expect_err("tampered proofs must fail");
     assert!(

@@ -34,8 +34,8 @@ use anyhow::{Context, Result};
 use kardamom_da_watcher::interop::mock::MockInteropFeed;
 use kardamom_types::StateDatabase;
 use kardamom_types::xchain::{
-    Callback, INBOX, OUTBOX, OutboxMessage, derive_remote_epoch, msg_leaf, remote_source_hash,
-    xchain_anchor_hash, xchain_tx_sender,
+    Anchor, Callback, INBOX, Inbox, OUTBOX, Outbox, OutboxMessage, XChainMessage,
+    remote_source_hash, xchain_tx_sender,
 };
 
 use super::{
@@ -43,6 +43,8 @@ use super::{
 };
 use crate::harness::l2::{self, DerivedSigner};
 use crate::harness::metrics;
+
+pub use super::xchain_skipped_seq::{gap_halts_pair_not_chain, sealer_rejects_a_skipped_seq};
 
 /// The simulated origin chain's id — anything ≠ the stack's 412346.
 pub const ORIGIN_CHAIN_ID: u64 = 412_399;
@@ -53,13 +55,10 @@ pub(crate) fn message_delivered_topic0() -> B256 {
     keccak256("MessageDelivered(uint64,uint64,bool)")
 }
 
-// The Outbox / Inbox storage slots, the `MessageSent` topic, and the
-// `u64` word form have one definition, in `kardamom_types::xchain`. The
-// tests there pin each value against `forge inspect` and `cast index`.
-pub(crate) use kardamom_types::xchain::{
-    inbox_delivered_slot, inbox_next_seq_slot, message_sent_topic0, outbox_nonces_slot,
-    sent_messages_slot as outbox_sent_messages_slot, u64_word,
-};
+// The Outbox / Inbox storage slots and the `MessageSent` topic have one
+// definition, on `kardamom_types::xchain::{Outbox, Inbox}`. The tests
+// there pin each value against `forge inspect` and `cast index`.
+pub(crate) use super::u64_word;
 
 /// Minimal "Receiver-style" runtime, deployed via an ordinary CREATE tx
 /// through the ingress: copies the first 32 bytes of calldata into storage
@@ -98,9 +97,13 @@ pub(crate) fn feed_msg(
 ) -> OutboxMessage {
     OutboxMessage {
         origin_block_number: origin_block,
-        // The watcher recomputes the anchor and rejects a feed that chooses
-        // its own (audit M4), so the scripted feed must serve the real one.
-        origin_block_hash: xchain_anchor_hash(ORIGIN_CHAIN_ID, origin_block),
+        // The watcher recomputes the anchor and rejects a feed that
+        // chooses its own, so the scripted feed must serve the real one.
+        origin_block_hash: Anchor {
+            origin_chain_id: ORIGIN_CHAIN_ID,
+            block_number: origin_block,
+        }
+        .hash(),
         dest_chain_id: crate::harness::DEV_CHAIN_ID.get(),
         seq,
         sender: Address::repeat_byte(0xA1),
@@ -149,9 +152,7 @@ struct DeliveryRun<'a> {
     executor_state_dir: &'a Path,
     cursor_file: &'a Path,
     watcher_metrics: SocketAddr,
-    sender: &'a DerivedSigner,
-    payee: Address,
-    nonce: u64,
+    nudge: l2::NudgeSender,
     user_txs: Vec<l2::SignedTransfer>,
 }
 
@@ -161,7 +162,7 @@ impl<'a> DeliveryRun<'a> {
         executor_state_dir: &'a Path,
         cursor_file: &'a Path,
         watcher_metrics: SocketAddr,
-        sender: &'a DerivedSigner,
+        sender: &DerivedSigner,
         payee: Address,
     ) -> Self {
         Self {
@@ -169,9 +170,7 @@ impl<'a> DeliveryRun<'a> {
             executor_state_dir,
             cursor_file,
             watcher_metrics,
-            sender,
-            payee,
-            nonce: 0,
+            nudge: l2::NudgeSender::new(sender.clone(), payee, 0),
             user_txs: Vec::new(),
         }
     }
@@ -196,10 +195,11 @@ impl<'a> DeliveryRun<'a> {
     /// Deploy the receiver via the harness (an ordinary CREATE tx) at
     /// nonce 0, and record it. Returns the receiver's address.
     async fn deploy_receiver(&mut self) -> Result<Address> {
+        let nonce = self.nudge.next_nonce()?;
         let deploy = l2::sign_create(
-            self.sender,
+            self.nudge.signer(),
             self.t.chain_id,
-            self.nonce,
+            nonce,
             &RECEIVER_INIT_CODE,
         )?;
         self.t
@@ -210,14 +210,13 @@ impl<'a> DeliveryRun<'a> {
             .map_err(|e| anyhow::anyhow!("deploy receiver: {e}"))?;
         let receipt = await_l2_receipt(self.t, deploy.hash, "the receiver deploy").await?;
         assert_receipt_ok(&receipt, "the receiver deploy")?;
-        let receiver = self.sender.address.create(self.nonce);
+        let receiver = self.nudge.signer().address.create(nonce);
         if let Some(created) = receipt_field(&receipt, "contractAddress") {
             anyhow::ensure!(
                 created.eq_ignore_ascii_case(&receiver.to_string()),
                 "receiver deployed at {created}, expected {receiver}"
             );
         }
-        self.nonce += 1;
         self.user_txs.push(deploy);
         Ok(receiver)
     }
@@ -228,27 +227,39 @@ impl<'a> DeliveryRun<'a> {
     /// Extends `user_txs` with every nudge that landed, and advances
     /// `nonce` past them.
     async fn nudge_until_settled(&mut self) -> Result<()> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            let next_seq = read_slot(
-                self.executor_state_dir,
-                INBOX,
-                inbox_next_seq_slot(ORIGIN_CHAIN_ID),
-            )?;
-            if next_seq == U256::from(3) {
-                return Ok(());
-            }
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "executor state never settled on Inbox.nextSeq == 3 (got {next_seq})"
-            );
-            let nudge = l2::sign_transfer(self.sender, self.t.chain_id, self.nonce, self.payee, 1)?;
-            if self.t.rpc.send_raw(&nudge.raw).await.result.is_ok() {
-                self.nonce += 1;
-                self.user_txs.push(nudge);
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+        let last_seq = std::cell::Cell::new(U256::ZERO);
+        metrics::poll_until(
+            "executor state to settle on Inbox.nextSeq == 3",
+            Duration::from_secs(60),
+            Duration::from_millis(300),
+            async || self.nudge_once_if_unsettled(&last_seq).await,
+        )
+        .await
+        .with_context(|| format!("got {}", last_seq.get()))
+    }
+
+    /// One [`Self::nudge_until_settled`] tick: `Some(())` once the
+    /// executor's Inbox cursor reaches 3 (delivery settled); otherwise
+    /// send one more nudge transfer (extending `user_txs` and advancing
+    /// `nonce` when it lands) and ask for another tick. `last_seq` records
+    /// the cursor read, for the caller's timeout message.
+    async fn nudge_once_if_unsettled(
+        &mut self,
+        last_seq: &std::cell::Cell<U256>,
+    ) -> Result<Option<()>> {
+        let next_seq = read_slot(
+            self.executor_state_dir,
+            INBOX,
+            Inbox::next_seq_slot(ORIGIN_CHAIN_ID),
+        )?;
+        last_seq.set(next_seq);
+        if next_seq == U256::from(3) {
+            return Ok(Some(()));
         }
+        if let Some(tx) = self.nudge.send(&self.t.rpc, self.t.chain_id).await? {
+            self.user_txs.push(tx);
+        }
+        Ok(None)
     }
 
     /// The delivered flags in `Inbox` storage, and the receiver
@@ -258,7 +269,7 @@ impl<'a> DeliveryRun<'a> {
             let status = read_slot(
                 self.executor_state_dir,
                 INBOX,
-                inbox_delivered_slot(ORIGIN_CHAIN_ID, seq),
+                Inbox::delivered_slot(ORIGIN_CHAIN_ID, seq),
             )?;
             anyhow::ensure!(
                 status == U256::from(1),
@@ -282,7 +293,7 @@ impl<'a> DeliveryRun<'a> {
         let lane_nonce = read_slot(
             self.executor_state_dir,
             OUTBOX,
-            outbox_nonces_slot(ORIGIN_CHAIN_ID),
+            Outbox::nonces_slot(ORIGIN_CHAIN_ID),
         )?;
         anyhow::ensure!(
             lane_nonce == U256::from(1),
@@ -294,21 +305,25 @@ impl<'a> DeliveryRun<'a> {
         response_data.extend_from_slice(&word);
         response_data.extend_from_slice(keccak256([0u8; 0]).as_slice()); // empty return data
         response_data.extend_from_slice(cb.context.as_slice());
-        let response_leaf = msg_leaf(
+        // Responses never carry a callback — depth is capped at 1.
+        let response_leaf = XChainMessage {
+            seq: 0,
+            origin_sender: INBOX,
+            target: cb.target,
+            value: 0,
+            gas_limit: cb.gas_limit,
+            input: bytes::Bytes::from(response_data),
+            callback: None,
+            ..Default::default()
+        }
+        .leaf(
             crate::harness::DEV_CHAIN_ID.get(), // the response's ORIGIN is this chain
             ORIGIN_CHAIN_ID,
-            0,
-            INBOX,
-            cb.target,
-            0,
-            cb.gas_limit,
-            keccak256(&response_data),
-            B256::ZERO, // responses never carry a callback — depth is capped at 1
         );
         let sent_slot = read_slot(
             self.executor_state_dir,
             OUTBOX,
-            outbox_sent_messages_slot(response_leaf),
+            Outbox::sent_messages_slot(response_leaf),
         )?;
         anyhow::ensure!(
             sent_slot == U256::from(1),
@@ -507,7 +522,7 @@ fn assert_delivery_logs(receipts: &[serde_json::Value]) -> Result<()> {
         .context("no logs")?;
     let sent = logs2
         .iter()
-        .find(|l| log_topic0(l) == Some(message_sent_topic0()))
+        .find(|l| log_topic0(l) == Some(Outbox::message_sent_topic0()))
         .with_context(|| format!("callback: no MessageSent log: {}", receipts[2]))?;
     anyhow::ensure!(
         log_address(sent).is_some_and(|a| a.eq_ignore_ascii_case(&OUTBOX.to_string())),
@@ -585,213 +600,12 @@ pub async fn delivery(
     run.assert_watcher_and_relay_metrics(&baseline).await?;
 
     Ok(DeliveryOutcome {
-        next_nonce: run.nonce,
+        next_nonce: run.nudge.nonce(),
         user_txs: run.user_txs,
         messages: script.messages,
         receiver,
         payload_word: script.payload_word,
     })
-}
-
-/// The sealer-guard arm (audit H2/H9/M6): a kind-5 record that SKIPS the
-/// lane cursor reaches the cluster through the real sequencers, and the
-/// sealer answers with a reject frame instead of sealing a hole.
-///
-/// Runs after [`delivery`]: seqs 0..2 are delivered, seq 3 is pending, and
-/// the sealer's lane cursor for the origin is 3. The injected record starts
-/// at seq 5. Evidence:
-///
-/// * the sequencers count `kardamom_sequencer_remote_origin_reject_total`
-///   with reason `seq_mismatch` (the reject frame reached the offering
-///   session and was decoded);
-/// * the sealer logged `cluster REMOTE-ORIGIN-REJECT … expectedNextSeq=3`;
-/// * nothing executed: `Inbox.nextSeq` is still 3, and seq 5 has no receipt.
-///
-/// The lane stays intact: [`gap_halts_pair_not_chain`] runs next and
-/// delivers seq 3 through the same sealer, which proves the reject did not
-/// move the lane cursor and did not poison the dedup window.
-pub async fn sealer_rejects_a_skipped_seq(
-    t: &Target,
-    aeron_dir: &Path,
-    sealer_logs: &[std::path::PathBuf],
-    executor_state_dir: &Path,
-    outcome: &DeliveryOutcome,
-) -> Result<()> {
-    let rejects_before = t
-        .sequencer_metric_sum(super::SEQ_REMOTE_ORIGIN_REJECT)
-        .await
-        .unwrap_or(0.0);
-
-    // A well-formed record at seq 5 (skipping 3 and 4) in a later origin
-    // block, derived by the SAME rule the watcher runs: the sealer must
-    // reject it on the lane cursor alone, not on its shape.
-    let payee = outcome.receiver;
-    let skipped = derive_remote_epoch(
-        t.chain_id,
-        ORIGIN_CHAIN_ID,
-        5,
-        &[feed_msg(5, 110, payee, &[0x55], None)],
-    )
-    .context("derive the skipping record")?;
-    anyhow::ensure!(skipped.first_seq == 5 && skipped.anchor_number == 110);
-    crate::harness::inject::publish_remote_epoch(aeron_dir, skipped).await?;
-
-    // The sequencers relayed it, and each one got the reject frame back.
-    metrics::poll_until(
-        "a sealer REMOTE-ORIGIN-REJECT counted by the sequencers",
-        Duration::from_secs(30),
-        Duration::from_millis(250),
-        || async {
-            let now = t
-                .sequencer_metric_sum(super::SEQ_REMOTE_ORIGIN_REJECT)
-                .await
-                .unwrap_or(0.0);
-            Ok((now >= rejects_before + 1.0).then_some(now))
-        },
-    )
-    .await?;
-
-    // The sealer named the reason in its log: the lane cursor was 3. The
-    // sealer prints before it offers, so the line is there by now; the
-    // poll only covers a slow log flush.
-    let needle = "REMOTE-ORIGIN-REJECT memberId=";
-    let detail = format!("origin={ORIGIN_CHAIN_ID} firstSeq=5 expectedNextSeq=3 reason=1");
-    metrics::poll_until(
-        "the sealer REMOTE-ORIGIN-REJECT log line",
-        Duration::from_secs(10),
-        Duration::from_millis(250),
-        || async {
-            let logs: String = sealer_logs
-                .iter()
-                .map(|p| std::fs::read_to_string(p).unwrap_or_default())
-                .collect();
-            Ok(logs
-                .lines()
-                .any(|l| l.contains(needle) && l.contains(&detail))
-                .then_some(()))
-        },
-    )
-    .await?;
-
-    // Nothing executed. The lane cursor is untouched, and the skipping
-    // record's message has no receipt.
-    let next_seq = read_slot(
-        executor_state_dir,
-        INBOX,
-        inbox_next_seq_slot(ORIGIN_CHAIN_ID),
-    )?;
-    anyhow::ensure!(
-        next_seq == U256::from(3),
-        "Inbox.nextSeq must stay 3 after the reject, got {next_seq}"
-    );
-    let gone = t
-        .rpc
-        .receipt(remote_source_hash(ORIGIN_CHAIN_ID, 5))
-        .await
-        .result
-        .map_err(|e| anyhow::anyhow!("receipt probe for the skipping seq: {e}"))?;
-    anyhow::ensure!(
-        gone.is_none(),
-        "seq 5 skipped the lane and must never execute: {gone:?}"
-    );
-    Ok(())
-}
-
-/// The adversarial arm: the feed swallows one seq. The watcher must
-/// fail-stop — the PROCESS exits nonzero, nothing is skipped — while the
-/// chain itself keeps sealing blocks. Pair-scoped fault domain, proven.
-///
-/// # Errors
-/// Returns an error when the watcher does not exit nonzero within 60s,
-/// when its log names no derivation fault, when the pending seq is never
-/// delivered, when the chain does not keep sealing new blocks, or when
-/// the swallowed seq unexpectedly executes.
-pub async fn gap_halts_pair_not_chain(
-    t: &Target,
-    feed: &MockInteropFeed,
-    watcher: &mut crate::harness::services::Spawned,
-    outcome: DeliveryOutcome,
-) -> Result<()> {
-    let signers = l2::dev_signers_total(2)?;
-    let sender: &DerivedSigner = &signers[0];
-    let payee = signers[1].address;
-    let mut nonce = outcome.next_nonce;
-
-    // seq 4 is swallowed by the feed — the hole. seq 5 (block 104) closes
-    // block 102, delivering the pending seq 3; seq 6 (block 105) closes
-    // block 104, whose batch starts at 5 while the lane cursor says 4:
-    // SeqSkipped, the terminal pair fault.
-    feed.gap_next(1);
-    feed.push_message(feed_msg(4, 103, payee, &[0x04], None));
-    feed.push_message(feed_msg(5, 104, payee, &[0x05], None));
-    feed.push_message(feed_msg(6, 105, payee, &[0x06], None));
-
-    // The interop path runs ALONE in this process, so the pair fault is a
-    // process exit — and it must be NONZERO: a fail-stop that looks like a
-    // clean shutdown would hide the halt from the orchestrator.
-    let exit = watcher
-        .proc
-        .wait_exit(Duration::from_secs(60))
-        .context("watcher did not exit after the seq gap — it skipped or stalled")?;
-    anyhow::ensure!(
-        exit.is_some_and(|code| code != 0),
-        "watcher must exit NONZERO on a derivation fault, got {exit:?}"
-    );
-    let log = std::fs::read_to_string(&watcher.proc.log_path).unwrap_or_default();
-    anyhow::ensure!(
-        log.contains("remote epoch derivation fault"),
-        "watcher log must name the derivation fault; tail:\n{}",
-        watcher.proc.log_tail(15)
-    );
-
-    // seq 3 (pending from the happy path) was delivered on the way to the
-    // fault; the swallowed seq 4 and everything after it must NEVER execute.
-    await_l2_receipt(
-        t,
-        remote_source_hash(ORIGIN_CHAIN_ID, 3),
-        "xchain delivery seq 3",
-    )
-    .await?;
-
-    // THE CHAIN KEEPS SEALING. New ordinary transactions land in new blocks
-    // after the watcher's death — the fault stopped one pair, not the chain.
-    let head_at_halt = super::metric_u64(t.executor_metric(super::EXEC_BLOCK_NUMBER).await?)?;
-    for _ in 0..2 {
-        let tx = l2::sign_transfer(sender, t.chain_id, nonce, payee, 1)?;
-        nonce += 1;
-        t.rpc
-            .send_raw(&tx.raw)
-            .await
-            .result
-            .map_err(|e| anyhow::anyhow!("post-halt transfer rejected: {e}"))?;
-        let r = await_l2_receipt(t, tx.hash, "a post-halt transfer").await?;
-        assert_receipt_ok(&r, "a post-halt transfer")?;
-    }
-    // `head_at_halt` is a metric-derived value; a bad or adversarial
-    // reading must fail loudly, not silently wrap the threshold.
-    let past_halt = head_at_halt
-        .checked_add(1)
-        .context("head_at_halt overflows")?;
-    t.wait_executor_block(
-        past_halt,
-        Duration::from_secs(30),
-        Duration::from_millis(250),
-        "the head to advance past the halt",
-    )
-    .await?;
-
-    // And the hole was never stepped over: the swallowed seq has no receipt.
-    let gone = t
-        .rpc
-        .receipt(remote_source_hash(ORIGIN_CHAIN_ID, 4))
-        .await
-        .result
-        .map_err(|e| anyhow::anyhow!("receipt probe for the swallowed seq: {e}"))?;
-    anyhow::ensure!(
-        gone.is_none(),
-        "seq 4 was swallowed by the feed and must never execute: {gone:?}"
-    );
-    Ok(())
 }
 
 pub(crate) fn log_address(log: &serde_json::Value) -> Option<&str> {

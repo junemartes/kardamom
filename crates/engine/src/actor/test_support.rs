@@ -2,6 +2,7 @@
 //! signed-legacy-transaction builders, remote-epoch fixtures, writer-signal
 //! and writer-queue test doubles, and the commit-channel drain helper.
 
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -12,7 +13,7 @@ use alloy_primitives::{Address, Bytes as AlloyBytes, TxKind as APTxKind, U256, k
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
-use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage, remote_source_hash};
+use kardamom_types::xchain::{NonEmptyVec, RemoteEpochRecord, XChainMessage, remote_source_hash};
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource,
     TxEnvelope as KtTxEnvelope,
@@ -21,12 +22,12 @@ use revm::primitives::KECCAK_EMPTY;
 
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
-use crate::reader::{NoEpochCheck, ReaderToExec, RemoteEpochObserver};
+use crate::reader::{NoEpochCheck, NoRemoteEpochCheck, ReaderToExec, RemoteEpochObserver};
 use crate::state::MockStateDatabase;
 
 use super::{
-    BalHandoff, BlockExec, ExecHooks, ExecInputs, ExecToCommit, ExecutorConfig, ResumePoint,
-    StateWriterQueue, StateWriterSignal, spawn_exec,
+    BalHandoff, BlockExecStrategy, ExecHooks, ExecInputs, ExecPorts, ExecToCommit, ExecutorConfig,
+    NoBlockExec, ResumePoint, StateWriterQueue, StateWriterSignal, spawn_exec,
 };
 
 pub(super) fn pos(off: i32) -> BPosition {
@@ -159,12 +160,18 @@ pub(super) fn drain_commits(rx: &Receiver<ExecToCommit>) -> (Vec<u64>, Vec<u64>)
     let mut receipts = Vec::new();
     let mut boundaries = Vec::new();
     while let Ok(m) = rx.recv() {
-        match m {
-            ExecToCommit::Receipt(r) => receipts.push(r.block_number),
-            ExecToCommit::Boundary(b) => boundaries.push(b.block_number),
-        }
+        push_commit(m, &mut receipts, &mut boundaries);
     }
     (receipts, boundaries)
+}
+
+/// Sort one drained message into `receipts` or `boundaries`. The `while`
+/// loop in [`drain_commits`] stays free of a branch.
+fn push_commit(m: ExecToCommit, receipts: &mut Vec<u64>, boundaries: &mut Vec<u64>) {
+    match m {
+        ExecToCommit::Receipt(r) => receipts.push(r.block_number),
+        ExecToCommit::Boundary(b) => boundaries.push(b.block_number),
+    }
 }
 
 /// Records every submitted block, and applies it to a shared
@@ -192,24 +199,27 @@ impl StateWriterQueue for ApplyingRecordingQueue {
 }
 
 /// Build a remote-epoch record with `n` messages, for the interop tests.
-pub(super) fn remote_epoch_fixture(origin: u64, n: u64) -> RemoteEpochRecord {
+///
+/// # Panics
+///
+/// Panics if `n == 0`: a remote epoch always carries at least one message.
+pub(super) fn remote_epoch_fixture(origin: u64, n: NonZeroU64) -> RemoteEpochRecord {
+    let message_at = |seq: u64| XChainMessage {
+        source_hash: remote_source_hash(origin, seq),
+        seq,
+        origin_sender: Address::repeat_byte(0xA5),
+        target: Address::repeat_byte(0xB6),
+        value: 0,
+        gas_limit: 100_000,
+        input: bytes::Bytes::default(),
+        callback: None,
+    };
     RemoteEpochRecord {
         origin_chain_id: origin,
         anchor_number: 900,
         anchor_hash: alloy_primitives::B256::repeat_byte(0x0A),
         first_seq: 0,
-        messages: (0..n)
-            .map(|seq| XChainMessage {
-                source_hash: remote_source_hash(origin, seq),
-                seq,
-                origin_sender: Address::repeat_byte(0xA5),
-                target: Address::repeat_byte(0xB6),
-                value: 0,
-                gas_limit: 100_000,
-                input: bytes::Bytes::default(),
-                callback: None,
-            })
-            .collect(),
+        messages: NonEmptyVec::new(message_at(0), (1..n.get()).map(message_at).collect()),
     }
 }
 
@@ -217,7 +227,7 @@ pub(super) fn remote_epoch_fixture(origin: u64, n: u64) -> RemoteEpochRecord {
 /// dispatches for one record. The caller appends the closing boundary.
 pub(super) fn remote_epoch_records(record: RemoteEpochRecord) -> Vec<ReaderToExec> {
     let origin = record.origin_chain_id;
-    let messages = record.messages.clone();
+    let messages: Vec<XChainMessage> = record.messages.iter().cloned().collect();
     let mut out = vec![ReaderToExec::RemoteEpoch {
         tx_idx: TxIndex(0),
         record: Box::new(record),
@@ -267,28 +277,52 @@ pub(super) fn feed_commits(messages: Vec<ExecToCommit>) -> Receiver<ExecToCommit
 /// few dozen).
 const RIG_COMMIT_CAPACITY: usize = 128;
 
+/// The exec-only port bundle every `ExecRig` names as its `W: ExecPorts`.
+/// A zero-sized marker: `ExecRig` owns the actual port values, this type
+/// only carries their types through to `spawn_exec`. Epoch checking is
+/// always [`NoEpochCheck`], since no test in this crate supplies a
+/// non-trivial epoch observer.
+struct TestPorts<S, Q, P, R, B>(std::marker::PhantomData<(S, Q, P, R, B)>);
+
+impl<S, Q, P, R, B> ExecPorts for TestPorts<S, Q, P, R, B>
+where
+    S: SnapshotSource + 'static,
+    Q: StateWriterSignal + 'static,
+    P: StateWriterQueue + 'static,
+    R: RemoteEpochObserver<S::Db> + 'static,
+    B: BlockExecStrategy<S::Db> + 'static,
+{
+    type Snapshots = S;
+    type WriterSignal = Q;
+    type WriterQueue = P;
+    type Epoch = NoEpochCheck;
+    type RemoteEpoch = R;
+    type BlockExec = B;
+}
+
 /// Builder for `spawn_exec`'s test fixtures. Every exec test wires the same
 /// twelve-argument call, with nine of the twelve almost always `None`. This
 /// collects them: `cfg` is always `ExecutorConfig::default()` and `start`
 /// is always `ResumePoint::GENESIS` in every current test, so both start
 /// there; the hook builders opt in only where a test needs one.
 ///
-/// `E` is fixed to [`NoEpochCheck`], since no test in this crate supplies a
-/// non-trivial epoch observer.
-pub(super) struct ExecRig<S: SnapshotSource, Q, P> {
+/// `R` defaults to [`NoRemoteEpochCheck`]; [`Self::remote`] swaps it for a
+/// test's own observer type. `B` defaults to [`NoBlockExec`];
+/// [`Self::block_exec`] swaps it for a test's own strategy type.
+pub(super) struct ExecRig<S: SnapshotSource, Q, P, R = NoRemoteEpochCheck, B = NoBlockExec> {
     snapshots: S,
     sw_signal: Q,
     sw_queue: P,
     start: ResumePoint,
     bal_tx: Option<Sender<BalHandoff>>,
     shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
-    block_exec: Option<BlockExec<<S as SnapshotSource>::Db>>,
-    remote_epoch_observer: Option<Box<dyn RemoteEpochObserver>>,
+    block_exec: Option<B>,
+    remote_epoch_observer: Option<R>,
     tx_e2c: Sender<ExecToCommit>,
     rx_e2c: Receiver<ExecToCommit>,
 }
 
-impl<S, Q, P> ExecRig<S, Q, P>
+impl<S, Q, P> ExecRig<S, Q, P, NoRemoteEpochCheck, NoBlockExec>
 where
     S: SnapshotSource + 'static,
     Q: StateWriterSignal + 'static,
@@ -309,7 +343,45 @@ where
             rx_e2c,
         }
     }
+}
 
+impl<S, Q, P, B> ExecRig<S, Q, P, NoRemoteEpochCheck, B>
+where
+    S: SnapshotSource + 'static,
+    Q: StateWriterSignal + 'static,
+    P: StateWriterQueue + 'static,
+    B: BlockExecStrategy<S::Db> + 'static,
+{
+    /// Swap in a test's own remote-epoch observer. Consumes the default
+    /// [`NoRemoteEpochCheck`] rig and returns one typed for `R`, since a
+    /// struct field cannot change type through `&mut self`.
+    pub(super) fn remote<R: RemoteEpochObserver<S::Db> + 'static>(
+        self,
+        observer: R,
+    ) -> ExecRig<S, Q, P, R, B> {
+        ExecRig {
+            snapshots: self.snapshots,
+            sw_signal: self.sw_signal,
+            sw_queue: self.sw_queue,
+            start: self.start,
+            bal_tx: self.bal_tx,
+            shadow_tx: self.shadow_tx,
+            block_exec: self.block_exec,
+            remote_epoch_observer: Some(observer),
+            tx_e2c: self.tx_e2c,
+            rx_e2c: self.rx_e2c,
+        }
+    }
+}
+
+impl<S, Q, P, R, B> ExecRig<S, Q, P, R, B>
+where
+    S: SnapshotSource + 'static,
+    Q: StateWriterSignal + 'static,
+    P: StateWriterQueue + 'static,
+    R: RemoteEpochObserver<S::Db> + 'static,
+    B: BlockExecStrategy<S::Db> + 'static,
+{
     pub(super) fn start(mut self, start: ResumePoint) -> Self {
         self.start = start;
         self
@@ -325,14 +397,25 @@ where
         self
     }
 
-    pub(super) fn block_exec(mut self, strategy: BlockExec<S::Db>) -> Self {
-        self.block_exec = Some(strategy);
-        self
-    }
-
-    pub(super) fn remote(mut self, observer: Box<dyn RemoteEpochObserver>) -> Self {
-        self.remote_epoch_observer = Some(observer);
-        self
+    /// Swap in a test's own whole-block strategy. Consumes the default
+    /// [`NoBlockExec`] rig and returns one typed for `B2`, since a struct
+    /// field cannot change type through `&mut self`.
+    pub(super) fn block_exec<B2: BlockExecStrategy<S::Db> + 'static>(
+        self,
+        strategy: B2,
+    ) -> ExecRig<S, Q, P, R, B2> {
+        ExecRig {
+            snapshots: self.snapshots,
+            sw_signal: self.sw_signal,
+            sw_queue: self.sw_queue,
+            start: self.start,
+            bal_tx: self.bal_tx,
+            shadow_tx: self.shadow_tx,
+            block_exec: Some(strategy),
+            remote_epoch_observer: self.remote_epoch_observer,
+            tx_e2c: self.tx_e2c,
+            rx_e2c: self.rx_e2c,
+        }
     }
 
     /// Spawns the exec thread. Returns its handle, and the exec-to-commit
@@ -353,7 +436,7 @@ where
         Receiver<ExecToCommit>,
     ) {
         let rx_e2c = self.rx_e2c;
-        let h = spawn_exec::<S, Q, P, NoEpochCheck>(ExecInputs {
+        let h = spawn_exec::<TestPorts<S, Q, P, R, B>>(ExecInputs {
             cfg: ExecutorConfig::default(),
             rx,
             tx: self.tx_e2c,

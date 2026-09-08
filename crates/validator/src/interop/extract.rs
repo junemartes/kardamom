@@ -5,7 +5,7 @@
 //!
 //! The recompute discipline mirrors `decode_message_passed`
 //! (`kardamom-types::withdrawals`): the leaf is rebuilt from the DECODED
-//! fields via the shared [`msg_leaf`] rule and compared against the
+//! fields via the shared [`MsgLeaf`] rule and compared against the
 //! event-carried `msgHash` — event data is never trusted, so predeploy/
 //! bytecode drift (the runtime bytecode is duplicated by hand in
 //! `chains/dev-interop.toml`) is caught at extraction instead of shipped to
@@ -25,7 +25,7 @@ use std::num::NonZeroU16;
 use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_sol_types::{SolEvent, sol};
 
-use kardamom_types::xchain::{Callback, OUTBOX, OutboxMessage, msg_leaf};
+use kardamom_types::xchain::{Anchor, Callback, MsgLeaf, OUTBOX, Outbox, OutboxMessage};
 use kardamom_types::{Receipt, WireLog};
 
 use crate::parallel::ClaimIndex;
@@ -52,16 +52,6 @@ sol! {
         SolCallback callback
     );
 }
-
-// The slot of `sentMessages[msg_hash]` has one definition, in
-// `kardamom_types::xchain`. The e2e scenarios read the same slot with the
-// same function. The forge-vector test below pins it at this call site too.
-pub use kardamom_types::xchain::{SENT_MESSAGES_SLOT_INDEX, sent_messages_slot};
-
-/// The deterministic anchor for one origin block, served as the feed's
-/// `originBlockHash`. Defined in `kardamom-types` so the watcher recomputes
-/// the same value and rejects a feed that chooses its own (audit M4).
-pub use kardamom_types::xchain::xchain_anchor_hash;
 
 /// One log's site: which chain observed it, and where. Shared by
 /// [`decode_message_sent`] and [`check_leaf`], and by the errors they
@@ -204,7 +194,11 @@ fn decode_message_sent(
     Ok(Some(DecodedSend {
         message: OutboxMessage {
             origin_block_number: site.block,
-            origin_block_hash: xchain_anchor_hash(site.origin_chain_id, site.block),
+            origin_block_hash: Anchor {
+                origin_chain_id: site.origin_chain_id,
+                block_number: site.block,
+            }
+            .hash(),
             dest_chain_id: decoded.destChainId,
             seq: decoded.seq,
             sender: decoded.sender,
@@ -242,20 +236,21 @@ fn check_leaf(
     value: u128,
     callback: Option<&Callback>,
 ) -> Result<B256, OutboxExtractError> {
-    let computed = msg_leaf(
-        site.origin_chain_id,
-        decoded.destChainId,
-        decoded.seq,
-        decoded.sender,
-        decoded.target,
+    let computed = MsgLeaf {
+        origin_chain_id: site.origin_chain_id,
+        dest_chain_id: decoded.destChainId,
+        seq: decoded.seq,
+        sender: decoded.sender,
+        target: decoded.target,
         value,
-        decoded.gasLimit,
-        keccak256(&decoded.data),
-        callback.map_or_else(
+        gas_limit: decoded.gasLimit,
+        data_hash: keccak256(&decoded.data),
+        cb_hash: callback.map_or_else(
             kardamom_types::xchain::no_callback_hash,
             Callback::commitment,
         ),
-    );
+    }
+    .hash();
     if computed != decoded.msgHash {
         return Err(OutboxExtractError::LeafMismatch {
             site,
@@ -278,13 +273,9 @@ fn cross_check_claim(
     granularity: NonZeroU16,
     claims: &ClaimIndex,
 ) -> Result<(), OutboxExtractError> {
-    let slot = sent_messages_slot(send.msg_hash);
+    let slot = Outbox::sent_messages_slot(send.msg_hash);
     let bal_index = tx_index + 1;
-    let claim_index = if granularity.get() > 1 {
-        kardamom_engine::bal_ladder::chunk_of(bal_index, u64::from(granularity.get()))
-    } else {
-        bal_index
-    };
+    let claim_index = kardamom_engine::bal_ladder::claim_index(bal_index, granularity);
     let mismatch = |detail: String| OutboxExtractError::ClaimMismatch {
         block,
         tx_index,
@@ -331,17 +322,18 @@ pub(crate) mod tests_support {
         let sender = Address::repeat_byte(0xA1);
         let target = Address::repeat_byte(0xB2);
         let cb_hash = callback.as_ref().map_or(B256::ZERO, Callback::commitment);
-        let msg_hash = msg_leaf(
-            origin,
-            dest,
+        let msg_hash = MsgLeaf {
+            origin_chain_id: origin,
+            dest_chain_id: dest,
             seq,
             sender,
             target,
-            0,
-            200_000,
-            keccak256(data),
+            value: 0,
+            gas_limit: 200_000,
+            data_hash: keccak256(data),
             cb_hash,
-        );
+        }
+        .hash();
         let ev = MessageSent {
             destChainId: dest,
             seq,
@@ -429,7 +421,7 @@ mod tests {
     fn sent_messages_slot_matches_forge_vectors() {
         // cast index bytes32 0x1111..11 1
         assert_eq!(
-            sent_messages_slot(B256::repeat_byte(0x11)),
+            Outbox::sent_messages_slot(B256::repeat_byte(0x11)),
             "0x7deb3b60ec0f1bf56dbdd0ffedbadafddeaa08947884ff0f215ce93ee1826102"
                 .parse::<B256>()
                 .unwrap()
@@ -437,7 +429,7 @@ mod tests {
         // cast index bytes32 0x0df14340..4d3c 1 (the cross-language msg_leaf
         // vector from kardamom-types/Outbox.t.sol as the mapping key).
         assert_eq!(
-            sent_messages_slot(
+            Outbox::sent_messages_slot(
                 "0x0df14340efd8c8b32f4c333c3dca8470b0bae319a3dfe32adb213df2b8834d3c"
                     .parse()
                     .unwrap()
@@ -478,7 +470,11 @@ mod tests {
         assert_eq!(msgs[0].origin_block_number, 42);
         assert_eq!(
             msgs[0].origin_block_hash,
-            xchain_anchor_hash(SELF_CHAIN, 42),
+            Anchor {
+                origin_chain_id: SELF_CHAIN,
+                block_number: 42,
+            }
+            .hash(),
             "anchor is the deterministic position commitment"
         );
         assert_eq!(msgs[1].seq, 1);
@@ -524,7 +520,7 @@ mod tests {
         let mut idx = ClaimIndex::default();
         for (bal_index, msg_hash) in sends {
             idx.storage
-                .entry((OUTBOX, sent_messages_slot(*msg_hash)))
+                .entry((OUTBOX, Outbox::sent_messages_slot(*msg_hash)))
                 .or_default()
                 .push((*bal_index, U256::ONE));
         }
@@ -570,7 +566,7 @@ mod tests {
         let mut claims = claims_for(&[(1, h0), (2, h1)]);
         claims
             .storage
-            .get_mut(&(OUTBOX, sent_messages_slot(h1)))
+            .get_mut(&(OUTBOX, Outbox::sent_messages_slot(h1)))
             .unwrap()[0]
             .1 = U256::ZERO;
         assert!(collect_outbox_messages(SELF_CHAIN, 7, &receipts, Some((nz(1), &claims))).is_err());

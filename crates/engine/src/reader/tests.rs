@@ -1,5 +1,6 @@
 //! Tests for the reader / join module.
 
+use std::num::NonZeroU64;
 use std::thread;
 use std::time::Duration;
 
@@ -304,20 +305,24 @@ fn channel_b_reader_drops_a_duplicate_epoch() {
     assert_eq!(out.len(), 2, "one marker + one deposit, not two of each");
 }
 
-fn remote_record(origin: u64, first_seq: u64, n: u64) -> RemoteEpochRecord {
+fn remote_record(origin: u64, first_seq: u64, n: NonZeroU64) -> RemoteEpochRecord {
+    let message_at = |seq: u64| XChainMessage {
+        source_hash: kardamom_types::xchain::remote_source_hash(origin, seq),
+        seq,
+        gas_limit: 100_000,
+        ..Default::default()
+    };
     RemoteEpochRecord {
         origin_chain_id: origin,
         anchor_number: 40,
         anchor_hash: alloy_primitives::B256::repeat_byte(0xAB),
         first_seq,
-        messages: (first_seq..first_seq + n)
-            .map(|seq| XChainMessage {
-                source_hash: kardamom_types::xchain::remote_source_hash(origin, seq),
-                seq,
-                gas_limit: 100_000,
-                ..Default::default()
-            })
-            .collect(),
+        messages: kardamom_types::xchain::NonEmptyVec::new(
+            message_at(first_seq),
+            (first_seq + 1..first_seq + n.get())
+                .map(message_at)
+                .collect(),
+        ),
     }
 }
 
@@ -326,7 +331,7 @@ fn remote_record(origin: u64, first_seq: u64, n: u64) -> RemoteEpochRecord {
 #[test]
 fn channel_b_reader_expands_a_remote_epoch_into_marker_plus_messages() {
     let origin = 412_346u64;
-    let rec = remote_record(origin, 5, 2);
+    let rec = remote_record(origin, 5, NonZeroU64::new(2).expect("2 is nonzero"));
     let out = run_ordering(
         vec![
             Ok((pos(0), TxOrderingMessage::RemoteEpoch(rec.clone()))),
@@ -367,7 +372,7 @@ fn channel_b_reader_expands_a_remote_epoch_into_marker_plus_messages() {
 /// nothing. A second expansion would double-deliver every message.
 #[test]
 fn channel_b_reader_drops_a_duplicate_remote_epoch() {
-    let rec = remote_record(412_346, 0, 1);
+    let rec = remote_record(412_346, 0, NonZeroU64::new(1).expect("1 is nonzero"));
     let out = run_ordering(
         vec![
             Ok((pos(0), TxOrderingMessage::RemoteEpoch(rec.clone()))),

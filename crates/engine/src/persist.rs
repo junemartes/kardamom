@@ -92,6 +92,26 @@ impl MdbxWriterSignal {
     pub fn new(rx: SnapshotReceiver) -> Self {
         Self { rx }
     }
+
+    /// One poll attempt for [`StateWriterSignal::wait_committed`]. Peeks
+    /// the already-published snapshot first: the target block may already
+    /// be published, with its wake-up token already used by a prior call,
+    /// so no new `recv()` notification would ever arrive. Peeking avoids
+    /// that deadlock. Returns `None` to ask the caller to poll again.
+    fn poll_committed(&mut self, await_at_least: u64) -> Option<Result<u64, ExecutorError>> {
+        if let Some(s) = self.rx.current()
+            && s.block_number() >= await_at_least
+        {
+            return Some(Ok(s.block_number()));
+        }
+        match self.rx.recv() {
+            Some(s) if s.block_number() >= await_at_least => Some(Ok(s.block_number())),
+            Some(_) => None,
+            None => Some(Err(ExecutorError::State(
+                "state writer stopped before committing block".into(),
+            ))),
+        }
+    }
 }
 
 impl StateWriterSignal for MdbxWriterSignal {
@@ -101,23 +121,10 @@ impl StateWriterSignal for MdbxWriterSignal {
 
     fn wait_committed(&mut self, await_at_least: u64) -> Result<u64, ExecutorError> {
         loop {
-            // Peek first. The target block may already be published, with its
-            // wake-up token already used by a prior call. Then no new `recv()`
-            // notification will ever arrive. Peeking avoids this deadlock.
-            if let Some(s) = self.rx.current()
-                && s.block_number() >= await_at_least
-            {
-                return Ok(s.block_number());
-            }
-            match self.rx.recv() {
-                Some(s) if s.block_number() >= await_at_least => return Ok(s.block_number()),
-                Some(_) => {}
-                None => {
-                    return Err(ExecutorError::State(
-                        "state writer stopped before committing block".into(),
-                    ));
-                }
-            }
+            let Some(outcome) = self.poll_committed(await_at_least) else {
+                continue;
+            };
+            return outcome;
         }
     }
 }

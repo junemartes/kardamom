@@ -146,32 +146,43 @@ impl<'a> GapRun<'a> {
     async fn assert_parked_timed_out(&self, pair: &mut ParkedPair) -> Result<()> {
         while let Some(j) = pair.parked.join_next().await {
             let (nonce, out) = j.context("parked join")?;
-            match out.result {
-                Err(RpcError::Call { code, message }) => {
-                    anyhow::ensure!(
-                        code == CODE_TIMEOUT,
-                        "gap nonce {nonce}: expected {CODE_TIMEOUT}, got {code} ({message})"
-                    );
-                }
-                Err(RpcError::Transport(m)) => {
-                    anyhow::bail!(
-                        "gap nonce {nonce}: transport-level failure ({m}) — client \
-                                   aborted before the server's bounded timeout"
-                    )
-                }
-                Ok(h) => anyhow::bail!("gap nonce {nonce} unexpectedly landed as {h}"),
-            }
-            // `park` is a Target-supplied Duration; `Mul` panics on overflow,
-            // so a patient upper bound saturates instead.
-            let upper = self.park.saturating_mul(3);
-            anyhow::ensure!(
-                out.elapsed >= self.park / 2 && out.elapsed < upper,
-                "gap nonce {nonce}: timeout latency {:?} outside [{:?}, {:?})",
-                out.elapsed,
-                self.park / 2,
-                upper
-            );
+            self.assert_one_parked_timed_out(nonce, &out)?;
         }
+        Ok(())
+    }
+
+    /// One parked submission's timeout check: the error is the bounded
+    /// server timeout, and its latency falls in `[park/2, park*3)`.
+    fn assert_one_parked_timed_out(
+        &self,
+        nonce: u64,
+        out: &RpcOutcome<alloy_primitives::B256>,
+    ) -> Result<()> {
+        match &out.result {
+            Err(RpcError::Call { code, message }) => {
+                anyhow::ensure!(
+                    *code == CODE_TIMEOUT,
+                    "gap nonce {nonce}: expected {CODE_TIMEOUT}, got {code} ({message})"
+                );
+            }
+            Err(RpcError::Transport(m)) => {
+                anyhow::bail!(
+                    "gap nonce {nonce}: transport-level failure ({m}) — client \
+                               aborted before the server's bounded timeout"
+                )
+            }
+            Ok(h) => anyhow::bail!("gap nonce {nonce} unexpectedly landed as {h}"),
+        }
+        // `park` is a Target-supplied Duration; `Mul` panics on overflow,
+        // so a patient upper bound saturates instead.
+        let upper = self.park.saturating_mul(3);
+        anyhow::ensure!(
+            out.elapsed >= self.park / 2 && out.elapsed < upper,
+            "gap nonce {nonce}: timeout latency {:?} outside [{:?}, {:?})",
+            out.elapsed,
+            self.park / 2,
+            upper
+        );
         Ok(())
     }
 

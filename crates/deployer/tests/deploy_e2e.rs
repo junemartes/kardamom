@@ -4,7 +4,8 @@
 use alloy_primitives::{Address, Bytes, U256, address};
 use alloy_sol_types::sol;
 
-use kardamom_deployer::testkit::AnvilRig;
+use kardamom_deployer::dev_keys::DEV_OWNER;
+use kardamom_deployer::testkit::{AnvilRig, Funding};
 use kardamom_deployer::{ContractId, Deployer, FactoryStatus, Op, encode_address_pair};
 
 sol! {
@@ -16,15 +17,23 @@ sol! {
     }
 }
 
-const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
-
 #[tokio::test]
 async fn cross_chain_address_parity() {
-    let Some(rig_a) = AnvilRig::spawn(&[DEV_OWNER]).await else {
+    let Some(rig_a) = AnvilRig::spawn(
+        alloy_node_bindings::Anvil::new(),
+        &[(DEV_OWNER, Funding::FundAndImpersonate)],
+    )
+    .await
+    else {
         eprintln!("SKIP: anvil unavailable");
         return;
     };
-    let Some(rig_b) = AnvilRig::spawn(&[DEV_OWNER]).await else {
+    let Some(rig_b) = AnvilRig::spawn(
+        alloy_node_bindings::Anvil::new(),
+        &[(DEV_OWNER, Funding::FundAndImpersonate)],
+    )
+    .await
+    else {
         eprintln!("SKIP: anvil unavailable");
         return;
     };
@@ -52,7 +61,12 @@ async fn cross_chain_address_parity() {
 #[tokio::test]
 #[ignore = "anvil flake: reverts intermittently with 'atomic multi-L2 upgrade: Reverted'; tracked separately"]
 async fn multi_l2_deploy_and_atomic_upgrade() {
-    let Some(rig) = AnvilRig::spawn(&[DEV_OWNER]).await else {
+    let Some(rig) = AnvilRig::spawn(
+        alloy_node_bindings::Anvil::new(),
+        &[(DEV_OWNER, Funding::FundAndImpersonate)],
+    )
+    .await
+    else {
         eprintln!("SKIP: anvil unavailable");
         return;
     };

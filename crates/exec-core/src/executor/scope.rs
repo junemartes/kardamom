@@ -5,7 +5,7 @@
 use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256};
 use kardamom_types::{Receipt, SkipReason, StateDatabase, TxEnvelope};
-use revm::context::result::{EVMError, ExecutionResult};
+use revm::context::result::ExecutionResult;
 use revm::database::CacheDB;
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
 
@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use crate::block_env::ExecEnv;
 use crate::delta::{PendingDelta, WriteSet};
 use crate::error::ExecutorError;
-use crate::exec_types::{ReceiptStatus, TxIndex, TxSlot};
+use crate::exec_types::{ReceiptStatus, TxSlot};
 
 use super::db::{SnapshotDb, seed_cache_layer};
 use super::skip::skip_reason_of_tx;
@@ -266,9 +266,7 @@ impl<S: StateDatabase> Executor<S> {
         // AddressMap; `WriteSet::finish` sorts the entries afterward.
         let ws = WriteSet::from_evm_state(&outcome.state);
         if let Some((bal, bal_index)) = bal {
-            for (addr, account) in &outcome.state {
-                bal.update_account(bal_index, *addr, account);
-            }
+            Self::record_bal_writes(&outcome.state, bal, bal_index);
         }
         Self::capture_touches(&outcome.state, touches);
         // Fold this tx's writes into the block cache. Later txs read
@@ -290,6 +288,18 @@ impl<S: StateDatabase> Executor<S> {
             write_set_hash,
         })?;
         Ok((receipt, ws))
+    }
+
+    /// Record every touched account's EIP-7928 claim at `bal_index`. The
+    /// one loop in [`Self::execute_tx`]'s caller stays at one loop level.
+    fn record_bal_writes(
+        state: &revm::state::EvmState,
+        bal: &mut revm::state::bal::Bal,
+        bal_index: u64,
+    ) {
+        for (addr, account) in state {
+            bal.update_account(bal_index, *addr, account);
+        }
     }
 
     /// Record which touched accounts and slots this outcome only READ, for
@@ -314,12 +324,13 @@ impl<S: StateDatabase> Executor<S> {
         if !account.is_touched() {
             t.account_reads.push(addr);
         }
-        for (key, slot) in &account.storage {
-            if slot.original_value == slot.present_value {
-                t.slot_reads
-                    .push((addr, B256::from(key.to_be_bytes::<32>())));
-            }
-        }
+        t.slot_reads.extend(
+            account
+                .storage
+                .iter()
+                .filter(|(_, slot)| slot.original_value == slot.present_value)
+                .map(|(key, _)| (addr, B256::from(key.to_be_bytes::<32>()))),
+        );
     }
 
     /// Assemble one executed tx's receipt: the status/gas/logs the outcome
@@ -446,22 +457,6 @@ impl<S: StateDatabase> Executor<S> {
         let mut scope = Executor::new(snapshot, parent, env)?;
         scope.seed_layer(delta)?;
         scope.execute_tx(slot, inbound_envelope, bal, None)
-    }
-}
-
-/// Map a non-validation revm error on a derived tx (a deposit or a 0x7D
-/// delivery) to the engine error. The `EVMError::Transaction` arm is
-/// handled by the caller as a deterministic failed receipt. Everything
-/// else (database, header, custom) is local or is a block-env fault, not
-/// derivable from the record. It stays fatal, so crash recovery replays
-/// cleanly.
-pub(super) fn derived_tx_rejection<DbErr: core::fmt::Debug>(
-    err: EVMError<DbErr>,
-    idx: TxIndex,
-) -> ExecutorError {
-    ExecutorError::Execution {
-        idx,
-        detail: format!("{err:?}"),
     }
 }
 

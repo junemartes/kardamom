@@ -90,7 +90,7 @@ struct Args {
     metrics_addr: std::net::SocketAddr,
     /// Host identifier; stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
-    host_id: String,
+    host_id: kardamom_obs::HostId,
     /// The cluster's first-seen dedup window (`[resync] dedup_capacity`).
     /// Must equal the JVM's `-Dkardamom.cluster.dedupCapacity`: the lag
     /// horizon the resync mechanism protects.
@@ -107,7 +107,7 @@ struct Args {
     /// the validator). Falls back to `channels.tx_receipts_executor_count`.
     /// Not relevant when receipts ride multicast (the cluster deploy).
     #[arg(long)]
-    executor_count: Option<u32>,
+    executor_count: Option<NonZeroU32>,
 }
 
 /// Fold the CLI and env overrides into the TOML-loaded config:
@@ -240,7 +240,7 @@ impl ResyncWiring {
         cluster_egress: kardamom_cluster_adapter::LiveEgress,
         receipts_rt: &AeronRuntime,
         channels: &ChannelsConfig,
-        executor_count: Option<u32>,
+        executor_count: Option<NonZeroU32>,
         shutdown: &Shutdown,
     ) -> Result<Self> {
         // Three feeds go into the publish loop's ResyncController:
@@ -279,7 +279,7 @@ impl ResyncWiring {
         let receipts_sub = TxReceiptsSubscriberHandle::open_auto(
             receipts_rt,
             channels,
-            executor_count.unwrap_or(channels.tx_receipts_executor_count),
+            executor_count.or(channels.tx_receipts_executor_count),
         )
         .context("open tx_receipts")?;
         let receipts_task =
@@ -338,7 +338,7 @@ impl SpawnedLoops {
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init_service!("sequencer", args.metrics_addr, &args.host_id).await?;
+    kardamom_obs::init_service!("sequencer", args.metrics_addr, args.host_id.as_ref()).await?;
     let raw = std::fs::read_to_string(&args.config).context("read config")?;
     let mut cfg: SequencerConfig = toml::from_str(&raw).context("parse config")?;
     apply_cli_overrides(&args, &mut cfg)?;

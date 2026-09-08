@@ -1105,3 +1105,594 @@ This closes every item from all four coordinator review rounds
 (Phase A, the FIX/REVERSED follow-up, Phase C, and rounds 2-4) for the
 batcher group (`kardamom-batcher`, `kardamom-da-watcher`,
 `kardamom-deployer`).
+
+# Round B — re-audit of the main delta (`reaudit-main.md`)
+
+This round's files: `crates/deployer/**`, `crates/batcher/**`, plus the test targets of
+`kardamom-validator`, `kardamom-da-watcher`, `kardamom-ingress`, `kardamom-sequencer` (see
+`status-e2e.md`'s Round B section for the `crates/e2e/**` half of this pass).
+
+## Deployer — `reaudit-main.md`'s deployer section
+
+- R9, `deployer/tests/interop_genesis_predeploy.rs` `artifact_runtime` — the test used to
+  assert `std::env::var_os("CI").is_none()` inside the missing-artifact branch, so it meant
+  two different things in two environments. Now a `Mode { RequireArtifact, SkipIfAbsent }`
+  read once per test (`Mode::from_env()`), and `artifact_runtime(workspace, contract, mode)`
+  returns `Result<Option<Bytes>, String>` for the caller (`assert_predeploy`) to act on,
+  instead of asserting internally.
+
+## Cross-crate R14 rows onto `kardamom-deployer` (from `status-validator.md`)
+
+- `resolve_env_key` — `deployer/src/main.rs`'s `parse_key` and
+  `validator/src/bin/kardamom-validator/args.rs`'s `resolve_attester_key` parsed the same
+  `env:VAR` convention twice. Added `pub struct KeyFlag(String)` with `KeyFlag::new(flag)` and
+  `fn resolve(self) -> anyhow::Result<String>` to `crates/deployer/src/lib.rs`; `parse_key` now
+  calls `KeyFlag::new(key).resolve()?` and strips `0x` itself, as the finding asked. **Not
+  done on the validator side**: `args.rs` is `crates/validator/src`, owned by a different
+  group this round; flagging for that group to switch `resolve_attester_key` to
+  `kardamom_deployer::KeyFlag`.
+- The shared `sol!` ABI — `validator/tests/withdrawal_e2e.rs` and
+  `e2e/src/harness/l1/contracts.rs` each declared their own `ETHLockbox`/
+  `WithdrawalOutputOracle` bindings, and the two had drifted (the e2e copy carried extra
+  events). Added `crates/deployer/src/abi.rs` (behind `#[cfg(any(test, feature =
+  "test-support"))]`, same gate as `testkit`) with one `sol!` block holding the union of both
+  — `ETHLockbox` (`depositETH`, `outputOracle`, `finalizeWithdrawal`, `initiateUpgrade`,
+  `upgradeNonce`, both events) and `WithdrawalOutputOracle` (`deleteOutput`, `outputCount`,
+  `outputRootAt`, `isFinalizable`). Both call sites now `use kardamom_deployer::abi::{ETHLockbox,
+  WithdrawalOutputOracle};` instead of declaring their own. `deployer/tests/deploy_e2e.rs`
+  keeps its own smaller `ETHLockbox` (`depositETH`/`depositNonce`/`l2Minter`) — a different
+  subset, not a duplicate of this one.
+- `dev_keys` — the anvil dev-account key/address constants were written out in
+  `validator/tests/withdrawal_e2e.rs`, `validator/tests/stateless_reexec.rs`, and
+  `e2e/src/harness/l1/contracts.rs`. Added `crates/deployer/src/dev_keys.rs` (same gate as
+  `abi`) with `DEV_OWNER`, `L2_MINTER`, `ATTESTER_KEY`/`ATTESTER_ADDR`,
+  `CHALLENGER_KEY`/`CHALLENGER_ADDR`, `BATCHER_KEY`/`BATCHER_ADDR`. All three call sites now
+  import from it (`e2e`'s `contracts.rs` aliases `CHALLENGER_KEY`/`CHALLENGER_ADDR` to its own
+  `DEPOSITOR_KEY`/`DEPOSITOR_ADDR` names via `pub use .. as ..`, since the two crates name the
+  same anvil account by its two different roles: depositor in e2e's scenarios, challenger in
+  the oracle's own tests). As a bonus (not part of this finding, same file already touched for
+  the AnvilRig row below): `deployer/tests/deploy_e2e.rs` and
+  `deployer/tests/factory_address_sync.rs` also switched their own local `DEV_OWNER` consts to
+  `kardamom_deployer::dev_keys::DEV_OWNER`.
+- Enabling the above on the validator side needed `features = ["test-support"]` added to the
+  `kardamom-deployer` dev-dependency in `crates/validator/Cargo.toml` (the one line; nothing
+  else in that file touched). This is a file outside this round's owned directories
+  (`crates/validator/tests/**`), but the task brief's item 2 named this exact change, so it
+  was made.
+
+## `L1BringUp::prime_anvil` / `withdrawal_e2e.rs` → `kardamom_deployer::testkit::AnvilRig`
+
+- `deployer/src/testkit.rs` `AnvilRig::spawn` now takes the caller's `Anvil` builder
+  (`spawn(anvil: Anvil, fund: &[Address])`) instead of always building a bare `Anvil::new()`
+  internally — needed so `e2e`'s `L1::launch` (`--slots-in-an-epoch 1`, `block_time(1)`) and
+  `validator/tests/withdrawal_e2e.rs` (`block_time(1)`) can each keep their own anvil flags
+  while sharing the fund/impersonate/predeploy step. Updated all six existing callers
+  (`deployer/tests/deploy_e2e.rs` x3, `batcher/tests/{anvil_e2e (x2), optimistic_e2e,
+  optimistic_proof_e2e, proof_submission_e2e, section6_conformance}.rs`) to pass
+  `alloy_node_bindings::Anvil::new()` explicitly; behavior for all of them is unchanged (same
+  default builder as before).
+- `validator/tests/withdrawal_e2e.rs`'s `setup()` no longer hand-rolls `anvil_setCode` /
+  `anvil_setBalance` / `anvil_impersonateAccount`; it calls `AnvilRig::spawn(Anvil::new()
+  .block_time(1), &[DEV_OWNER])` and keeps its own `deposit_provider(&anvil)` (50ms poll
+  tuning) for the deploy provider, discarding `AnvilRig`'s own untuned provider — the same
+  split `e2e`'s `L1::launch` uses.
+- **Known behavior difference, not a regression**: `AnvilRig::spawn` funds *and* impersonates
+  every address in `fund`. `e2e`'s old `prime_anvil` funded the batcher EOA without
+  impersonating it (the batcher signs real blob transactions, so it needs a real balance, not
+  impersonation). Passing `&[DEV_OWNER, BATCHER_ADDR]` now also impersonates the batcher
+  account; this matches the existing convention every batcher test already uses
+  (`AnvilRig::spawn(.., &[DEV_OWNER, BATCHER])`) and does not stop the batcher signing with its
+  real key, but it is a small behavior change worth a second look.
+- **Not addressed**: `AnvilRig::spawn` turns every setup failure (a genuine RPC error, not
+  just "anvil is not installed") into `None`, the same skip path as a missing binary. `L1::
+  launch`'s doc still promises an `Err` for a funding/impersonation failure. This predates this
+  round (all six existing callers already accept it) and is out of scope for an ABI/dev-key
+  dedup pass; flagging it here since this round's migration extends the same contract to two
+  more call sites.
+
+## Cross-crate — `kardamom_obs::testkit` (from both crates' Phase B deferred rows)
+
+`kardamom-obs` now has a `testkit` module (`free_port`, `scrape`) behind its own
+`test-support` feature (added by the group owning `crates/obs` this round). Switched every
+copy of the verbatim `free_port`/`scrape` pair:
+
+- `batcher/tests/metrics_endpoint.rs`, `da_watcher/tests/metrics_endpoint.rs`,
+  `ingress/tests/metrics_endpoint.rs`, `sequencer/tests/metrics_endpoint.rs` — each now
+  `use kardamom_obs::testkit::{free_port, scrape};` and drops its own copies (`ingress`'s copy
+  also dropped a manual `drop(l)`, an R4 hit that comes free with the switch).
+- Added `kardamom-obs = { path = "../obs", features = ["test-support"] }` to the
+  `[dev-dependencies]` of `crates/batcher/Cargo.toml`, `crates/da_watcher/Cargo.toml`,
+  `crates/ingress/Cargo.toml`, `crates/sequencer/Cargo.toml` (none had a `kardamom-obs`
+  dev-dependency before; only the production `[dependencies]` entry existed).
+- `free_udp_port` moved to `crates/obs/src/testkit.rs` (`pub fn free_udp_port() -> SocketAddr`,
+  same shape as `free_port`); done as a follow-up item once group C's `services.rs` landed. See
+  `status-e2e.md`'s Round B section for the full list of callers updated (`harness/{proc,
+  sealer,aeron,services}.rs`, plus `e2e/Cargo.toml`'s new `kardamom-obs` dependency).
+  `harness/proc.rs`'s `free_tcp_port` stays as its own copy — different shape
+  (`Result<u16>`), and out of scope for this specific item.
+- `crates/ingress/benches/{latency,throughput}.rs`: `partition_count_m: 8` → `NonZeroU32::new
+  (8).unwrap()`, the same fix applied to the seven `crates/ingress/tests/*.rs` files that hit
+  the `NonZero<u32>`/`NonZero<u64>` migration.
+- `crates/obs/tests/common/mod.rs`: `free_port`/`scrape` narrowed from `pub` to `pub(crate)`
+  (each `tests/*.rs` file compiles as its own binary crate; these were never reachable from
+  outside it) — closes the two `unreachable_pub` hits group C flagged. Also dropped a manual
+  `drop(l)` in `free_port` while touching it (R4): `l`'s last use is `local_addr()`, so it
+  already drops there with no explicit call needed.
+- `crates/da_watcher/tests/interop_watcher.rs`: `CursorFile` no longer derives `Clone` (group
+  C's R5 fix). `a_restart_resumes_exactly_from_the_persisted_cursor` reopens
+  `CursorFile::open(&cursor_path)` after each watcher task exits (the lock releases when the
+  task's `CursorFile` drops) instead of cloning a live handle; a block scope ends the
+  reopened handle used for the mid-test read before the second `spawn_resuming` reopens it, so
+  no manual `drop` was needed. Also dropped the two "Audit M4" doc-comment references (R1). All
+  14 tests in the file pass.
+
+## R16 sweep (STYLE.md's expanded "no nested loops" rule)
+
+The coordinator confirmed the broadest reading (any loop/branch nesting, either direction, in
+every owned file) is required, not optional. Fixed beyond the first pass above:
+
+- `deployer/src/deployer.rs` `verify`: the per-entry `for entry in &entries { ..; if erc1967_impl
+  != entry.current_impl { push } }` split into a fetch loop (no branch: one `get_storage_at`
+  call per entry, pushed unconditionally) and a pure `.zip(..).filter_map(..)` comparison —
+  `find_impl_mismatches`. `dedup_impl_specs`'s `for s in specs { if .. { } else { } }` became
+  `specs.iter_mut().for_each(|s| resolve_impl_dedup(..))`, the if/else moved into the named
+  helper.
+- `deployer/build.rs` and `batcher/build.rs` (the byte-identical `walk_sol_files_into`):
+  `for entry in entries.flatten() { if is_dir { recurse } else if is_sol { push } }` →
+  `entries.flatten().for_each(|entry| visit_sol_entry(&entry.path(), out))`, with the branch in
+  the new `visit_sol_entry`.
+- `batcher/src/rereplicate.rs`: `mirror_archive`'s and `diff_mirror`'s three `for entry in
+  read_dir(..)? { .. if .. { continue } .. }` loops are now `read_dir(..)?.try_for_each(|entry|
+  -> Result<(), BatcherError> { .. })` (one inline in `diff_mirror`'s second loop is a new
+  `MultiArchiveConfig::insert_a_spec_entry`-style extraction is not needed there — the closure
+  itself carries no further nesting). `heal_from_mirror`'s `for name in segments { .. }` became
+  `segments.iter().try_for_each(|name| heal_one_segment(..))`. `files_differ`'s compare loop
+  keeps its `if n == 0 { return }` EOF check (the read loop's natural terminal condition, same
+  class as the shared poll primitives — see `status-e2e.md`) but the byte-compare itself moved
+  to a `chunk_differs` helper. `read_stable_with`'s bounded retry-with-early-return loop is kept
+  as the base case: forcing it through a combinator needs a value-carrying early exit a plain
+  `Result`-returning `try_for_each` cannot express without a sentinel-`Err` hack.
+- `batcher/src/frame.rs` `encode`: the `for block in &payload.blocks { .. for rec in
+  &block.remote_epochs { .. } .. for tx in &block.txs { .. } }` triple structure is now
+  `payload.blocks.iter().try_for_each(encode_block_frame)`, with `encode_block_frame` itself
+  calling `try_for_each` once per its own two inner collections (`encode_remote_epoch`,
+  `encode_tx_frame`) — no loop is nested inside another anymore. `encode_remote_epoch`'s
+  `for msg in &rec.messages { .. match &msg.callback { .. } }` is now `rec.messages.iter()
+  .try_for_each(encode_xchain_message)`, the match moved into that new function.
+- `batcher/src/multi_archive_reader.rs`: `MultiArchiveConfig::parse_a_spec`'s `for entry in
+  .. { .. }` is now `.try_for_each(|entry| Self::insert_a_spec_entry(&mut out, entry))`, a new
+  associated function. `load_a_index`'s `for rec in reader { if .. { return Err } }` is now
+  `reader.try_for_each(..)`. `MultiArchiveReader::next` (the `Iterator` impl)'s `loop { match
+  rec.value { .. } }` is kept: this loop *is* the skip-until-found logic every custom
+  filtering `Iterator::next` needs, the same class of base case as `poll_until`.
+- `batcher/src/live/run.rs` `ReaderHandles::surface_errors`: the `for h in self.join_handles {
+  if .. { return } }` search is now `self.join_handles.into_iter().find_map(stream_reader_failure)
+  .unwrap_or(feed_err)`.
+- `batcher/src/live/feed.rs` `FeedLoop::run`: the `loop { match timeout(..).await { 6 arms } }`
+  reactor loop's whole match moved into a new `handle_event` method; the loop is now two lines
+  with no visible branch.
+- `batcher/src/bin/kardamom-batcher.rs` `scan_offline_archives`: `for rec in reader { match
+  rec? { .. } }` → `reader.try_for_each(|rec| -> anyhow::Result<()> { match rec? { .. } Ok(())
+  })`.
+- `batcher/src/bin/kardamom-batch-watcher.rs`, `kardamom-batch-claimer.rs`,
+  `kardamom-proof-submitter.rs`: each binary's `loop { match attempt().await { 4-5 arms } if
+  interval == 0 { return } sleep }` reactor loop's match moved into a `report_*_outcome`
+  function; the claimer and submitter variants return `bool` (their `Claimed`/`Submitted` arms
+  used `continue` to retry immediately, skipping the poll interval) so the loop keeps that
+  short-circuit via `if report_..._outcome(outcome) { continue; }` — the smallest control-flow
+  branch this shape can reduce to without losing the immediate-retry behavior.
+- `validator/tests/witness_anchoring.rs`: `for r in records { if let BufferedRecord::Tx { .. }
+  = r { digest.add_tx(..) } }` → `records.iter().for_each(|r| { if let .. })`.
+- `validator/tests/prover_spool.rs` `wait_for_snapshot`: the `if let Some(s) = ..
+  && s.block_number() == block { return s }` guard inside the poll loop moved to a new
+  `snapshot_at` function.
+- `da_watcher/tests/l1_watcher.rs`: the spin-wait thread's `loop { if published.len() >= 2 {
+  trip; return } yield_now() }` moved its condition into `trip_backpressure_once_published`.
+- `ingress/tests/replicated_cluster_test.rs`: the drain task's `while let Some(env) = ..
+  { .. if let Some(receipt) = exec.observe(..) { send } }` moved the per-envelope work into
+  `observe_and_forward`. `correlation_id_unique_and_namespaced_across_replicas`'s `for replica
+  { let mut futs = ..; for _ in 0..N { push } for r in join_all(..).await { assert } }` (a
+  genuine loop-in-loop-in-loop) collapsed the two inner loops into `.map(..).collect()` and
+  `.for_each(..)`, leaving only the outer `for replica` with no nested loop.
+- `ingress/tests/routing_test.rs`: the same triple-nested shape (`for m in [..] { for _ in
+  0..32 { push } for r in results { assert } for s in spawns { abort } }`) collapsed the same
+  way — `.map(..).collect()`, `.for_each(..)`, `.for_each(..)`, leaving one outer loop.
+- `ingress/tests/receipt_subscription_test.rs`: `for rx in &mut shard_rx { if let Ok(e) = ..
+  { .. break } }` → `shard_rx.iter_mut().find_map(|rx| rx.try_recv().ok())`.
+- `sequencer/tests/replicated_shard_racing.rs`: `for (loc, env) in &stream { if let Some(r) =
+  refs.iter().find(..) { .. } }` → `stream.iter().for_each(|(loc, env)| { if let .. })`.
+- `sequencer/tests/multi_sequencer_dual_write.rs` `find_signers_for_partition`: the `while
+  out.len() < n { .. if .. { push } seed += 1 }` search became `(seed_start..).map(signer)
+  .filter(..).take(n).collect()`.
+- `obs/tests/dashboards.rs`: the triple-nested `for stem { .. for (i, p) in panels.enumerate()
+  { .. if .. { continue } for (j, t) in targets.enumerate() { assert } } }` split into
+  `assert_dashboard_valid`/`assert_panel_valid`, each a single `.for_each` with no nested loop.
+- `obs/tests/init_without_runtime.rs`: the `for _ in 0..5 { .. match init(..).await { .. } }`
+  retry-with-first-success loop moved into a new `init_on_a_free_port` function; the caller now
+  has no loop at all.
+
+**Accepted as terminal/base case, not rewritten further** (documented at each site, and in
+`status-e2e.md` for the ones this round shares the reasoning with): `crates/e2e/src/harness/
+metrics.rs`'s `poll_until`/`poll_sync` (the shared primitives the fixes above now call),
+`bin/kardamom-semantics.rs`'s `pick_live`, `harness/l1_verified.rs`'s two read loops'
+EOF checks, `batcher/src/rereplicate.rs`'s `read_stable_with` and `files_differ`'s `if n == 0`
+check, `batcher/src/multi_archive_reader.rs`'s `Iterator for MultiArchiveReader::next`,
+`obs/tests/common/mod.rs`'s `scrape` (identical shape to `kardamom_obs::testkit::scrape`), and
+`batcher/src/l1.rs`'s already-documented "Keep this as a loop" `for d in descriptors { for vh
+in .. }` (a measured stack-depth constraint from `verify_blob_against_hash`'s KZG check,
+predates this round). A repeat grep after all of the above turns up no further sites in this
+group's files outside this list.
+
+## Gate results
+
+- `cargo fmt -p kardamom-deployer -p kardamom-batcher -- --check`: clean. The validator/
+  da_watcher/ingress/sequencer/obs test files this round touched were checked file by file with
+  `rustfmt --edition 2024 --check` (see below for why not `cargo fmt -p <pkg>` on those); clean.
+- `cargo check -p kardamom-deployer --all-targets --features test-support`: clean (final
+  check, after the R16 pass).
+- `cargo check -p kardamom-batcher --all-targets --all-features`: clean at one point mid-round
+  (confirmed after the `resolve_env_key`/testkit work); **blocked** at the final retry by
+  `crates/log/src/refetch.rs:186` and `:282` (not owned by this group) — two `if`/`else`
+  expressions whose arms have mismatched types (`UnboundedReceiver<(TxDataLoc, TxEnvelope)>`
+  vs. `TxDataSubscription`, and the `Deposit` analog), from an in-flight `kardamom-log` change.
+  Retried repeatedly (error count dropped from 15 to 2 across retries, but did not clear by the
+  end of the session).
+- `cargo test -p kardamom-da-watcher --test interop_watcher --test l1_watcher --test
+  metrics_endpoint --all-features`: all pass (14 + 11 + 1 tests).
+- `cargo test -p kardamom-obs --tests --all-features`: all pass.
+- `cargo test -p kardamom-ingress --tests --all-features` and `cargo test -p
+  kardamom-sequencer --test metrics_endpoint --all-features`: all pass (sequencer's other test
+  binaries could not be re-verified after the R16 edits — same `kardamom-log` blocker as
+  batcher above, since `kardamom-sequencer` also depends on it).
+- `cargo check -p kardamom-validator --tests --all-features`: blocked throughout the session,
+  first by `crates/validator/src`/`crates/engine/src` (`RemoteEpochObserver`'s R6 migration),
+  later by `crates/exec-core/src/anchor/mod.rs` (`WitnessSlot`/`WitnessCode` not found) and
+  `crates/types/src/xchain/message.rs` (`NonEmptyVec<T>`'s `Archive` bound) — all in crates
+  outside this round's ownership, all still in flight at the final retry.
+  `witness_anchoring.rs`, `prover_spool.rs`, `forged_envelope_chaos.rs`, `stateless_reexec.rs`,
+  and `withdrawal_e2e.rs` were checked for syntax/formatting only (`rustfmt --check`, clean);
+  their type-check against the crate's own lib could not be confirmed this session.
+- `cargo clippy -p kardamom-deployer -p kardamom-batcher --all-targets --all-features -- -D
+  warnings -W clippy::pedantic -D unreachable_pub`: blocked by an in-flight
+  `crates/types/src/xchain/mod.rs` pedantic hit (`needless_for_each`) that clippy attributes to
+  the whole invocation once `kardamom-types` is a dependency; retried repeatedly, still
+  failing at the time of this report. No pedantic warning was seen in this round's own files
+  before that point.
+- The forbidden-pattern grep (`debug_assert!`, `.max(1)`, `Box<dyn`,
+  `allow(clippy::too_many_arguments)`) prints nothing for `crates/deployer/**`,
+  `crates/batcher/**`, or any of the validator/da_watcher/ingress/sequencer test files this
+  round touched.
+
+## Round B (group C: da_watcher, interop-feed, cluster-adapter, cluster-client, sequencer, log, ingress, obs)
+
+This section reports the `reaudit-main.md` `da_watcher`, `cluster-adapter`, and `interop-feed`
+findings, from the agent that owns those directories in Round B. It answers the "left untouched
+pending the group C agent's report" note above.
+
+### da_watcher (`crates/da_watcher/src/**`)
+
+- R2 (`bin/kardamom-da-watcher.rs` `main` 193 lines): already resolved by the merge. `main` is
+  about 20 lines; the work is split across `resolve_paths`, `serve`, `DaWatcherService`
+  (`open_publishers`, `start_deposits_recorder`), `spawn_watchers`, and
+  `await_shutdown_or_fail_stop`.
+- R15 (`reconcile_cursor` standalone fn): now `ReconcileRetry::reconcile(&self, reader, origin,
+  cursor)` in `interop/reconcile.rs`. The per-read decision (equal/stale/ahead) is a `verdict`
+  helper returning `ControlFlow`, so the retry loop's body is one `match` (R16: no
+  if/else/match with a multi-statement body directly in the loop).
+- R13 (`retry.attempts.max(1)`): `ReconcileRetry.attempts` is `NonZeroU32`; the loop is
+  `for attempt in 1..=self.attempts.get()`, no manual counter (R12 too).
+- R6 (`DestinationStateReader` `#[async_trait]`): now a native RPITIT trait
+  (`fn inbox_next_seq(&self, ..) -> impl Future<Output = ..> + Send`), `reconcile`'s bound is
+  `R: DestinationStateReader` (no `?Sized`, no `dyn`).
+- R9 (`RpcDestinationReader::connect`'s placeholder `origin: 0`): new
+  `ReconcileError::Connect { url, detail }` variant; `connect` no longer builds a `Read` error.
+- R5 (test `Scripted { values: Arc<Mutex<..>>, reads: Arc<Mutex<..>> }`): `Arc` dropped, both
+  fields are plain `Mutex`, since the test never clones `Scripted`.
+- R15 (binary's 25-line reconcile block): moved to `InteropPath::reconcile(&mut self)`.
+- R9 (`dest_rpc: Option<String>` + `--interop-skip-cursor-reconcile` flag, two ways to encode
+  one choice): `CursorReconcile { Rpc(String), Skip }` in `interop/reconcile.rs`, with
+  `CursorReconcile::parse(dest_rpc, skip) -> Result<Self, MissingCursorReconcile>` and
+  `cli_args(&self) -> Vec<String>`. The binary parses it once in `resolve_paths`; `InteropPath`
+  stores `cursor_reconcile: CursorReconcile` instead of `dest_rpc: Option<String>`.
+  `crates/e2e/src/harness/services.rs::spawn_interop_watcher` (the one e2e file this group
+  owns) now builds the same `CursorReconcile` value internally and calls `.cli_args()`, instead
+  of writing the `--interop-skip-cursor-reconcile`/`--interop-dest-rpc` flags by hand; its own
+  `dest_rpc: Option<&str>` parameter is unchanged, so the rest of `harness/mod.rs` (owned by
+  the e2e group) needs no change.
+- R9 (`watchers.iter().any(|(name, h)| *name == "interop" ..)`): new
+  `enum WatcherKind { L1, Interop }` (with `label()`) is the vector's key instead of a string.
+- R2/R14 (`watcher.rs` `spawn` 121 lines, `Lagged`/`Derive` arm duplication): already resolved
+  by the merge — `spawn` is short, and `InteropLoop::handle_outcome` is one `match` with
+  `Err(e @ (InteropError::Derive(_) | InteropError::CursorOverflow { .. }))` merging the two
+  fault arms that would otherwise duplicate (fault metric, `error!`, break).
+- R3 (`watcher.rs` 515 → 643 lines): already resolved — `mod tests` lives in
+  `tests/interop_watcher.rs` (owned by the tests-directory agent); `watcher.rs` itself is 241
+  code lines.
+- R10/R15 (`for m in &batch { check_anchor(origin, m)?; }`): now
+  `batch.iter().try_for_each(|m| m.check_anchor(origin))?`, now that
+  `kardamom_types::xchain::OutboxMessage::check_anchor(&self, origin_chain_id)` is a method
+  (landed in `crates/types` during this round, outside this group).
+- R5 (`cursor.rs` `CursorFile` `_lock: Arc<File>` + `Clone`): `Clone` dropped, `_lock: File`
+  held by value. Production never cloned it (the binary moves it into `spawn`); only the
+  crate's own tests did, and the one test that did is rewritten to a block-scoped guard
+  instead of `clone()`+`drop()`.
+- R4 (`cursor.rs` tests' `drop(first)`/`drop(clone)`): gone with the `Clone` removal above; the
+  test now uses a block scope to end the guard's lifetime.
+- R12 (`source.rs` `floor_seq.unwrap_or(from.saturating_add(skipped))`,
+  `mock.rs` `skipped: floor - from`): the fallback now lives once, in
+  `kardamom_interop_feed::Lag::resolve(from, skipped, floor_seq, floor_block)` (see
+  interop-feed below), with its own doc stating why the fallback is safe.
+  `mock.rs`'s `floor - from` gets a one-line comment: the enclosing `if from < floor` rules
+  out underflow.
+- R13 (`source.rs` `max_reconnect_attempts.max(1)`): already resolved by the merge —
+  `with_reconnect(backoff, max_attempts: NonZeroU32)` takes the type directly.
+- R16 (`mock.rs` `subscribe_outbox`'s `loop { loop { match .. } select! {..} } }`): the inner
+  loop is now `FeedHandler::drain_script(&self, sink, from, next) -> Result<ControlFlow<(),
+  usize>, String>`; the outer loop is `loop { match self.drain_script(..).await? { Break(())
+  => return Ok(()), Continue(n) => next = n } select! {..} }`.
+- R16, second pass (`source.rs::ensure_subscribed`'s `for attempt { match self.connect(..)
+  .await { Ok(()) => {..; return Ok(())} Err(e) => {..; last = Some(e); sleep().await} } }`):
+  the match's arm bodies move into a new `try_connect(&mut self, from, attempt) ->
+  ControlFlow<(), RemoteSourceError>` (success logs and breaks with `()`; failure logs, sleeps
+  the backoff, and continues with the error). `ensure_subscribed` is now `for attempt in
+  0..self.max_reconnect_attempts.get() { match self.try_connect(from, attempt).await {
+  Break(()) => return Ok(()), Continue(e) => last = Some(e) } }` — the same
+  `loop`/`for`-plus-`ControlFlow`-helper shape as `mock.rs` above and `reconcile.rs`'s
+  `ReconcileRetry::reconcile`.
+- R16, second pass (`bin/kardamom-da-watcher.rs::await_shutdown_or_fail_stop`): two sites.
+  The halt-detection `loop { if .. { break ".." } if .. { break ".." } sleep().await; }`
+  (inside an anonymous `async {}` block passed to `select!`) is now a named `watch_for_halt`
+  async fn whose body is `loop { match check_halt(..) { Break(reason) => return reason,
+  Continue(()) => sleep().await } }`, with the two `if`s moved into `check_halt` (a plain,
+  loop-free function, so they are not nested with anything). The shutdown loop's `if
+  handle.task.is_finished() { tracing::error!(..) }` — a single-line log guard, no exemption
+  under the second R16 message — moves into a new `shutdown_one(kind, handle)` async fn; the
+  `for (kind, handle) in watchers` loop's body is now the one call `shutdown_one(kind,
+  handle).await?;`, with no branch of its own left in the loop.
+- R1 (audit ids): deleted from `reconcile.rs` (module doc and a test doc, "audit H9" x2),
+  `watcher.rs` ("audit M4"), and the binary (the reconcile block's own comment, rewritten
+  without the phase marker). **Not done**: `tests/interop_watcher.rs:243,262` still say
+  "Audit M4" — that file belongs to the tests-directory agent.
+
+### cluster-adapter (`crates/cluster-adapter/src/**`)
+
+- R9 (`remote_origin_reject_reason(code: u8) -> &'static str`, five loose
+  `REMOTE_ORIGIN_REJECT_*` consts): replaced by
+  `enum RemoteOriginRejectReason { SeqMismatch, AnchorRegressed, SlotCountMismatch,
+  UnknownOrigin, BadRange }` in `wire/mod.rs`, with `as_str()` and
+  `TryFrom<u8>` (an unknown code is `WireError::BadRemoteOriginRejectReason(u8)`, not a silent
+  `"unknown"` string).
+- R15 (`encode_remote_origin_reject(origin, first_seq, expected, reason)`, 4 loose params):
+  `struct RemoteOriginReject { origin_chain_id, first_seq, expected_next_seq, reason }` in
+  `wire/egress.rs`, with `encode(&self)` and `decode(buf) -> Result<Self, WireError>`;
+  `EgressItem::decode_remote_origin_reject` now calls `RemoteOriginReject::decode` and
+  destructures it. `EgressItem::RemoteOriginReject`'s field shape is unchanged (only the
+  `reason` field's type changed, from `u8` to the new enum), so callers matching it with
+  `{ .. }` (`crates/engine/src/reader/cluster/mod.rs`, `crates/ingress/src/cluster.rs`) needed
+  no change; `crates/sequencer/src/bin/kardamom-sequencer/feeds.rs` (this group's own file)
+  changed `wire::remote_origin_reject_reason(reason)` to `reason.as_str()`.
+- R14 (`decode_egress`'s hand-written `buf.get(25).ok_or(TooShort{..})` for the reason byte):
+  a new `rd_u8` helper in `wire/mod.rs`, alongside the existing `rd_u32`/`rd_i32`/`rd_u64`.
+- R14 (`wire/egress.rs` decodes `RT_EPOCH` and `RT_REMOTE_EPOCH` bodies with the same
+  three-line unaligned-copy shape): already resolved by the merge — both call the shared
+  `decode_rkyv_body::<T>(fields) -> Result<T, rancor::Error>` helper.
+- R9 (`encode_ingress_remote_epoch` rejects an empty `messages` with a runtime check): **done**
+  — the types group landed `RemoteEpochRecord::messages: NonEmptyVec<XChainMessage>` mid-round;
+  the runtime check is now unreachable (a `NonEmptyVec` cannot be empty), so it is deleted, not
+  kept as a defensive check on an invariant the type now enforces. `remote_epoch_slots`
+  (`wire/mod.rs`) and `watcher.rs:134`'s metric read use `.len().get()` (`NonEmptyVec::len()`
+  returns `NonZeroUsize`) instead of `.len()`. `wire/tests.rs`'s `remote_epoch()`/
+  `remote_epoch_with_callback()` fixtures build the field with `NonEmptyVec::new(first, rest)`;
+  the callback fixture no longer mutates `messages[0]` in place (`NonEmptyVec` has no mutable
+  index, by design — nothing that reads one needs to check its length, so nothing writes into
+  it either), it rebuilds the first message and rewraps.
+- R1 (audit ids): deleted from `wire/mod.rs` ("audit H2/H9", "audit H3") and `wire/tests.rs`
+  ("audit H3", "audit 2026-09-03, L2").
+- R14 (feeds.rs's `on_reject_frame`/`on_remote_origin_reject_frame` sharing a
+  kind-byte-check/decode/log/count shape): reviewed, kept as two methods. They differ in what
+  they do with the decoded item (forward on a channel vs. log-and-count), and the file already
+  checks the kind byte before decoding for a stated hot-path reason (relayed records arrive at
+  full line rate); merging into one `handle_reject(frame)` that fully decodes every frame
+  would remove that early-exit. Judgment call, not a hard rule.
+
+### interop-feed (`crates/interop-feed/src/lib.rs`)
+
+- R9 (`OutboxEventDto::Lagged`'s `floor_seq`/`floor_block` fallback repeated at each
+  consumer): new `pub struct Lag { floor, floor_block }` with
+  `Lag::resolve(from, skipped, floor_seq, floor_block) -> Self`, so `da_watcher/src/interop/
+  source.rs` no longer repeats `floor_seq.unwrap_or(from.saturating_add(skipped))` inline. The
+  DTO's wire shape is unchanged (`kardamom-validator`'s `serve.rs` still produces the same
+  JSON).
+- R1 (`signature: Option<Bytes>` doc naming `docs/specs/egress-node-spec.md`, section 5):
+  spec-document name deleted; the rule itself ("an unsigned attestation carries no authority")
+  was already stated in the paragraph above it. Also fixed while in this file: two "E1"/"E2"
+  phase-name references (`OutboxFeedApi`'s doc, the wire-shape test's assert message).
+
+### Cross-file items this agent could not do (owned elsewhere)
+
+- `crates/da_watcher/tests/interop_watcher.rs:343,362`: `cursor_file.clone()` — `CursorFile`
+  no longer implements `Clone` (see R5 above). Needs a block-scoped guard, or two separate
+  `CursorFile::open` calls, matching the fix already applied to `cursor.rs`'s own test.
+- `crates/da_watcher/tests/interop_watcher.rs:243,262`: "Audit M4" comments, R1.
+- `crates/engine/src/reader/threads.rs:310`: `self.send_expanded(messages, ..)` expects
+  `Vec<XChainMessage>`; `messages` (from a `RemoteEpochRecord`, or wherever this reader builds
+  its own) is now `NonEmptyVec<XChainMessage>`. Needs `messages.iter().cloned().collect()` (or
+  a `send_expanded` overload taking anything `IntoIterator<Item = T>`), owned by the engine
+  group.
+- `crates/engine/src/bin_support.rs:148`: `LiveTxDataSub.rx: tokio::sync::mpsc
+  ::UnboundedReceiver<(TxDataLoc, TxEnvelope)>` — `AeronRuntime::open_tx_data_subscription`
+  (see `status-log.md`'s DeliverFn item) now returns `kardamom_log::aeron_live
+  ::TxDataSubscription`, not a raw tokio receiver. One-line field-type fix; `LiveTxDataSub`'s
+  own `recv`/`try_recv` calls need no change, since `TxDataSubscription` exposes the same two
+  method names with the same signatures. Owned by the engine group; blocks `cargo check -p
+  kardamom-engine` and everything that depends on it (`kardamom-executor`, `e2e` under
+  `full-pipeline-e2e`, `kardamom-validator`).
+
+### Gates (da_watcher, cluster-adapter, interop-feed)
+
+- `cargo clippy -p kardamom-da-watcher -p kardamom-cluster-adapter -p kardamom-interop-feed
+  --lib --bins --all-features -- -D warnings -W clippy::pedantic -D unreachable_pub`: clean.
+  `--all-targets` on `kardamom-da-watcher` fails only in `tests/interop_watcher.rs` (owned by
+  the tests-directory agent, see above); `kardamom-cluster-adapter`'s own `tests/` directory
+  is likewise not owned by this group.
+- `cargo test -p kardamom-da-watcher -p kardamom-cluster-adapter -p kardamom-interop-feed
+  --lib`: 23, 25, 9 tests pass.
+- `cargo fmt -p kardamom-da-watcher -p kardamom-cluster-adapter -p kardamom-interop-feed --
+  --check`: clean.
+- Forbidden-pattern grep: prints nothing for `crates/da_watcher/src/**`,
+  `crates/cluster-adapter/src/**`, or `crates/interop-feed/src/**` outside `tests?/`.
+
+## Round B follow-up 2 (`followup-roundb-D-2.md` + coordinator addenda)
+
+Working-copy identity at the end of this pass: change_id `pryrnqkovrrqmplqpyowwtukmusxkmwn`,
+commit_id `8b21eb989cb52641df7b7dcc2f54562e5264adaa` (jj working-copy snapshot in a shared
+workspace; see `status-e2e.md`'s matching section for the same note).
+
+### Done
+
+4. R16, the three poll binaries (`kardamom-batch-watcher`, `kardamom-batch-claimer`,
+   `kardamom-proof-submitter`): rewritten on `ControlFlow<()>`. `PollLoop` (in `live/poll.rs`)
+   now exposes `async fn gate(&self, retry: Retry) -> ControlFlow<()>` — the retry/interval
+   decision, the actual reusable "skeleton" — and each binary defines its own small struct
+   (`Watcher`/`Claimer`/`Submitter`) holding its fixed inputs plus a `PollLoop`, with a `tick(
+   &self, provider: &P) -> ControlFlow<()>` method whose body is the step call followed by
+   `self.gate.gate(retry).await`. `main` drives it with `while let ControlFlow::Continue(()) =
+   x.tick(&provider).await {}`. This keeps the first brief's `PollLoop`/`Retry` types (the
+   second brief's suggested shape doesn't need a `Retry` enum at all, folding "now" vs. "after
+   interval" into the tick itself, but `Retry` already existed and both claimer/submitter's
+   `report_*_outcome` functions return it to say "retry now" on a successful claim/submit — kept
+   it as the thing `gate` consumes, rather than removing it). Deviation: the `while let` loop
+   itself lives in each binary's `main`, not the library — "the shared loop skeleton lives in
+   the library" is read here as `PollLoop::gate`, since the `while let` line has nothing left to
+   share (it is one line, and the three binaries' `tick` methods differ in every other respect).
+8. `l1_verified.rs` — batcher-owned half of item 8 does not apply (the file is e2e's); see
+   `status-e2e.md`.
+9. `multi_archive_reader.rs::Iterator::next` — see `status-e2e.md` (listed there since the item
+   spanned docs); implemented in this crate's file.
+10. `rereplicate.rs::read_stable_with`: rewritten as `(1..attempts.get()).try_fold(first, |prev,
+    _| one_attempt(&mut read, &prev))` matching on `std::ops::ControlFlow<Result<Vec<u8>,
+    BatcherError>, Vec<u8>>` (`Break` carries the terminal `Result`, `Continue` carries the next
+    comparison baseline). `one_attempt` is a sibling free function, not `Self::one_attempt` as
+    the brief's text suggests — there is no struct here to hang it off (the module is all free
+    functions); the brief's `Self::` was descriptive, not literal. `one_attempt` initially took
+    `prev: Vec<u8>` by value; clippy pedantic (`needless_pass_by_value`) flagged it since `prev`
+    is only ever compared, not moved — changed to `prev: &[u8]`, with the call site borrowing
+    the `try_fold` accumulator instead of moving it.
+11. `rereplicate.rs::files_differ`: rewritten on `std::iter::from_fn` producing one
+    `chunk_differs` result per chunk (`None` at EOF), `.find_map` stopping at the first `Ok(true)`
+    or `Err`.
+12. `frame.rs`: `FrameEncoder { buf: Vec<u8> }` (first brief's shape) renamed to the second
+    brief's `FrameWriter(Vec<u8>)` tuple struct; `message` renamed `xchain_message`. All
+    internal `self.buf`/`enc.buf` references updated to `self.0`/`enc.0` — a blanket
+    string-replace accidentally also touched the unrelated `Reader` struct's own (separately
+    named) `buf` field two-hundred-odd lines down; caught immediately by the resulting `E0609`
+    compile errors and reverted just those four lines.
+13. `live/run.rs::stream_reader_failure`: moved into `impl<G> ReaderHandles<G>` as
+    `Self::stream_reader_failure`, called from `surface_errors` via `Self::stream_reader_failure`
+    instead of the bare free-function name.
+14. `rereplicate.rs::HealReport::heal_segment` (confirmed already a method from an earlier pass)
+    and `chunk_differs(fb, ba: &[u8], bb: &mut [u8])` (confirmed already `&[u8]`, also from an
+    earlier pass) — the one remaining piece was the doc comment, which said "the next `ba.len()`
+    bytes" when the code reads `bb.len()` bytes (`fb.read_exact(bb)`); fixed.
+15. `deployer.rs`: confirmed already `ImplDedup { factory, seen: HashMap<ImplKey, Address> }`
+    with `fn resolve(&mut self, s: &mut DeploymentSpec)`, from an earlier pass.
+17. `interop_genesis_predeploy.rs`: `Mode::artifact_runtime`/`Mode::assert_predeploy` as methods
+    (self by value, not `&self` — `Mode: Copy`, and clippy pedantic's
+    `trivially_copy_pass_by_ref` fires on a 1-byte `&self`; the brief's `&self` was descriptive
+    shape guidance, and following it literally fails the clippy gate), `.context(..)?` at the
+    three inner sites (`serde_json::from_str`, `.as_str()`, `hex::decode`), test returns
+    `anyhow::Result<()>`.
+19. `batcher/build.rs` and `deployer/build.rs`: the shared `.sol` `rerun-if-changed` walk
+    (`emit_sol_rerun_triggers`/`walk_sol_files`/`walk_sol_files_into`/`visit_sol_entry`) moved
+    into a new file, `crates/deployer/build_support/sol_watch.rs`, `#[path]`-included by both
+    build scripts (`#[path = "build_support/sol_watch.rs"]` from `deployer/build.rs`,
+    `#[path = "../deployer/build_support/sol_watch.rs"]` from `batcher/build.rs`) — a build
+    script has no stable way to depend on a sibling crate's build-time code as an actual crate
+    dependency, so `#[path]` inclusion (not a new library crate) is the mechanism. `deployer/
+    build.rs` kept its own extra `remappings.txt` rerun trigger, which `batcher/build.rs` never
+    had. `emit_sol_rerun_triggers` needed `pub(crate)`, not `pub` — `unreachable_pub` fires on a
+    `pub` item in a binary crate (a build script) with nothing outside its own module tree that
+    could reach it; each build script's own `pub(crate)` resolves independently since the shared
+    file compiles as part of each binary separately.
+22. `AnvilRig::spawn`'s `Funding` enum: confirmed correct in `harness/l1/mod.rs` (`FundOnly` for
+    `BATCHER_ADDR`, the real dev key #2 that signs genuine EIP-4844 blob txs) and in `deployer/
+    tests/deploy_e2e.rs`, `validator/tests/withdrawal_e2e.rs` (`FundAndImpersonate` only). Bug
+    found and fixed in this pass, in this crate's own tests: all 5 batcher test files
+    (`anvil_e2e.rs`, `section6_conformance.rs`, `proof_submission_e2e.rs`,
+    `optimistic_proof_e2e.rs`, `optimistic_e2e.rs`) had set the keyless placeholder `BATCHER`
+    address (`0x…0BA7`) to `Funding::FundOnly`, but every one of those files then calls
+    `.postBatch(..).from(BATCHER).send()` on `rig.provider` — a wallet-less `RootProvider` that
+    can only send as an address anvil is impersonating. `FundOnly` on a keyless address makes
+    that send fail with "no signer" at runtime; `cargo check` cannot catch it, and `cargo test`
+    only catches it if anvil is actually installed (a missing anvil silently skips the test via
+    the `SKIP: anvil unavailable` convention). Caught by re-reading each file's `.from(BATCHER)`
+    call sites against the addendum's exact framing ("brief said batcher FundOnly" — the address
+    named `BATCHER`, a keyless test fixture used only inside these 5 files, is not the same
+    thing the brief meant by "the batcher," which is `harness/l1/mod.rs`'s real-key
+    `BATCHER_ADDR`). Fixed all 5 to `FundAndImpersonate`; `anvil_e2e.rs`'s
+    `setup_wallet_and_settlement` (which signs with a real anvil key, not `rig.provider`) was
+    already correct and untouched. `cargo test -p kardamom-deployer`/`-p kardamom-batcher`
+    (including `anvil_e2e.rs`, `section6_conformance.rs`, and `deploy_e2e.rs`'s
+    `cross_chain_address_parity`, all of which actually run against a real anvil in this sandbox)
+    confirms the fix end to end, not just at compile time.
+
+### Not done
+
+- Item 16's `NudgeSender`/`BlockOrigin`/`VectorParser` methods (e2e-owned files) — see
+  `status-e2e.md`.
+
+### Cross-crate (item 26, `u64_word`/`word_u64`)
+
+`kardamom_types::xchain::layout.rs` now exposes both `pub fn u64_word`/`pub fn word_u64`. This
+crate (`frame.rs`, etc.) never had its own copy — the dedup was entirely on the e2e side, see
+`status-e2e.md`.
+
+### Gates (this round)
+
+- `cargo check -p kardamom-deployer -p kardamom-batcher --all-targets --all-features`: clean.
+- `cargo fmt -p kardamom-deployer -p kardamom-batcher -- --check`: clean.
+- `cargo test -p kardamom-deployer --all-features`: 39 passed (including `mnemonic::tests::*`
+  and `signers::tests::presign_round_robins_across_signers`, moved from `kardamom-bench` — see
+  `status-e2e.md`), 0 failed, 1 ignored (the pre-existing `multi_l2_deploy_and_atomic_upgrade`
+  anvil flake, unrelated to this round).
+- `cargo test -p kardamom-batcher --all-features`: 66 passed (including `anvil_e2e.rs`'s two
+  tests and `section6_conformance.rs`, all running against real anvil in this sandbox), 0
+  failed.
+- `cargo clippy -p kardamom-deployer --all-targets --all-features -- -D warnings -W
+  clippy::pedantic -D unreachable_pub`: **clean**, including `-D unreachable_pub` (deployer has
+  no dependency edge onto `crates/state`, so it does not hit that crate's blocker — see below).
+- `cargo clippy -p kardamom-batcher --all-targets --all-features -- -D warnings -W
+  clippy::pedantic -D unreachable_pub`: blocked by `crates/state/src/checkpoint/manifest.rs:
+  46,57` and `crates/state/src/trie/mod.rs:67,84` (4 `pub` items clippy wants `pub(crate)`; not
+  owned by this group, retried repeatedly across the whole session, never cleared). With `-W
+  unreachable_pub` instead of `-D` (isolating this crate's own code), `kardamom-batcher` itself
+  is clean.
+- Forbidden-pattern grep: prints nothing for `crates/deployer/**` or `crates/batcher/**` outside
+  `tests?/`.
+
+## Round B follow-up 2, gate re-run (crates/state fixed)
+
+With `crates/state`'s `unreachable_pub` items fixed (group A), re-ran the full gate:
+
+- `cargo clippy -p kardamom-batcher --all-targets --all-features -- -D warnings -W
+  clippy::pedantic -D unreachable_pub`: **fully clean** (previously blocked only by
+  `crates/state`, not this crate's own code — see the earlier "Gates (this round)" section for
+  the deferred detail).
+- `cargo test -p kardamom-batcher --all-features`: 66 passed, 0 failed (unchanged).
+- `cargo fmt -p kardamom-batcher --check`: clean.
+
+`crates/validator/Cargo.toml` now carries `kardamom-obs = { path = "../obs", features =
+["test-support"] }` in `[dev-dependencies]` (group A), unblocking the fifth `poll_until`/
+`poll_sync` migration site named in the earlier addendum:
+`crates/validator/tests/prover_spool.rs::wait_for_snapshot` now calls `kardamom_obs::testkit::
+poll_sync` instead of a hand-rolled `loop { .. std::thread::sleep(..) }`. While fixing this, a
+second, unrelated compile break in the same file surfaced: `kardamom_engine::stateless::
+execute_block_anchored`'s `granularity` parameter is now `NonZero<u16>` (an exec-core API
+change, parallel to the `BalFrame.granularity` migration from the first Round B pass); `input.
+granularity` (from `kardamom_types::ProverInput`, still a plain `u16` — that type itself did not
+change) needed `std::num::NonZeroU16::new(input.granularity).expect("granularity must be
+nonzero")` at the call site. `cargo test -p kardamom-validator --test prover_spool
+--all-features`: 1 passed, 0 failed. The crate-wide `cargo check -p kardamom-validator --tests
+--all-features` is still blocked, now by `crates/stm/src/execute/tail.rs` (`TxResult` unresolved,
+`rewrite_frag_sink` unresolved, `Tail::fold_hash_validate` missing — an in-progress refactor in
+a crate this group does not own), retried twice, unchanged both times.

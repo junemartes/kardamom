@@ -268,7 +268,8 @@ pub fn spawn_fake_executor(
 ///
 /// Panics if the server fails to bind.
 pub async fn start_test_server(cfg: IngressConfig) -> TestServer {
-    let shards = usize::try_from(cfg.partition_count_m).expect("u32 fits usize");
+    let shards = std::num::NonZeroUsize::try_from(cfg.partition_count_m)
+        .expect("NonZeroU32 fits NonZeroUsize on every platform this targets");
     let (mock, shard_rx) = MockChannels::new(shards);
     let proxy = IngressProxy::new(cfg, mock.clone(), mock.clone());
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();

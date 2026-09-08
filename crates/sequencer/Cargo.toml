@@ -69,6 +69,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 kardamom-sequencer = { path = ".", features = ["testing"] }
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
+kardamom-obs = { path = "../obs", features = ["test-support"] }
 proptest = "1"
 rand = "0.9"
 

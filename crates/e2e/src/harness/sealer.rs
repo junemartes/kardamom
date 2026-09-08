@@ -14,8 +14,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use kardamom_obs::testkit::free_udp_port;
 
-use super::proc::{ExistingFile, Proc, free_udp_port, resolve_artifact, wait_for_log_line};
+use super::proc::{ExistingFile, Proc, resolve_artifact, wait_for_log_line};
 
 /// Find `kardamom-cluster-node.jar`. Use `KARDAMOM_CLUSTER_JAR` if set,
 /// otherwise use the gradle shadowJar output in the repo.
@@ -88,7 +89,7 @@ impl<'a> SealerLaunch<'a> {
         remote_origins: &'a [u64],
     ) -> Result<Self> {
         let jar = cluster_jar(repo_root)?;
-        let endpoint_sets = Self::reserve_endpoint_sets(members)?;
+        let endpoint_sets = Self::reserve_endpoint_sets(members);
         let (members_str, ingress_endpoints) = Self::format_member_strings(&endpoint_sets);
         Ok(Self {
             root,
@@ -104,17 +105,9 @@ impl<'a> SealerLaunch<'a> {
 
     /// Five UDP endpoints per member: ingress, consensus, log, catchup,
     /// archive.
-    fn reserve_endpoint_sets(members: NonZeroUsize) -> Result<Vec<[u16; 5]>> {
+    fn reserve_endpoint_sets(members: NonZeroUsize) -> Vec<[u16; 5]> {
         (0..members.get())
-            .map(|_| {
-                Ok([
-                    free_udp_port()?,
-                    free_udp_port()?,
-                    free_udp_port()?,
-                    free_udp_port()?,
-                    free_udp_port()?,
-                ])
-            })
+            .map(|_| std::array::from_fn(|_| free_udp_port().port()))
             .collect()
     }
 
@@ -217,27 +210,30 @@ impl<'a> SealerLaunch<'a> {
     /// Poll member logs for a LEADER line. A 1-member cluster elects
     /// itself; with more members, any one of them can gain the role.
     fn await_leader(&self) -> Result<()> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            let led = self.procs.iter().any(|p| {
-                std::fs::read_to_string(&p.log_path).is_ok_and(|s| s.contains("role=LEADER"))
-            });
-            if led {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                let tails: Vec<String> = self
-                    .procs
-                    .iter()
-                    .map(|p| format!("--- {} ---\n{}", p.name, p.log_tail(30)))
-                    .collect();
-                anyhow::bail!(
-                    "no sealer member became LEADER in 60s:\n{}",
-                    tails.join("\n")
-                );
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        super::metrics::poll_sync(
+            "a sealer member to become LEADER",
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            || Ok(self.any_member_is_leader().then_some(())),
+        )
+        .map_err(|_| {
+            let tails: Vec<String> = self
+                .procs
+                .iter()
+                .map(|p| format!("--- {} ---\n{}", p.name, p.log_tail(30)))
+                .collect();
+            anyhow::anyhow!(
+                "no sealer member became LEADER in 60s:\n{}",
+                tails.join("\n")
+            )
+        })
+    }
+
+    /// Whether any member's log has printed a LEADER role line.
+    fn any_member_is_leader(&self) -> bool {
+        self.procs
+            .iter()
+            .any(|p| std::fs::read_to_string(&p.log_path).is_ok_and(|s| s.contains("role=LEADER")))
     }
 
     fn finish(self) -> SealerCluster {

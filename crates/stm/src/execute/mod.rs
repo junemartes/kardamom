@@ -10,10 +10,13 @@
 //! self-abort): validation plus whole-block sequential fallback
 //! (invariant #3) carries correctness alone.
 
+mod acquire;
 mod config;
 mod graph;
 mod handle;
+mod hash_validate;
 mod metrics;
+mod predecessor;
 mod prepare;
 mod recycle;
 mod sequential;
@@ -22,6 +25,7 @@ mod tail;
 mod touch;
 mod view;
 mod worker;
+mod worker_execute;
 
 /// A state backend usable by one worker pool: the pool's workers read
 /// it from more than one thread, and it lives at least as long as the

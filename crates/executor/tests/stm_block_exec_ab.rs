@@ -12,12 +12,15 @@ use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
 use revm::primitives::KECCAK_EMPTY;
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 
+use kardamom_engine::actor::BlockExecStrategy;
 use kardamom_engine::{
     BPosition, MockStateDatabase, TxEnvelope as KtTxEnvelope, TxIndex, actor::BufferedRecord,
     block_env::ExecEnv,
 };
-use kardamom_executor::parallel::{StmExecConfig, stm_block_exec};
+use kardamom_executor::parallel::{StmBlockExec, StmExecConfig};
 
 fn tx_record(
     signer: &PrivateKeySigner,
@@ -132,14 +135,17 @@ fn stm_strategy_matches_sequential_capture_byte_for_byte() {
     let seq = kardamom_engine::stateless::execute_block_capture(&snap, None, &records, env)
         .expect("sequential");
 
-    for workers in [1usize, 4, 8] {
+    for workers in [1usize, 4, 8].map(|n| NonZeroUsize::new(n).expect("worker counts are non-zero"))
+    {
         // B: the Block-STM strategy (fresh pool per worker count).
-        let strategy = stm_block_exec::<MockStateDatabase>(StmExecConfig {
+        let strategy = StmBlockExec::<MockStateDatabase>::spawn(StmExecConfig {
             workers,
             pin_cores: Vec::new(),
             keep_hot: false,
         });
-        let stm = strategy(&snap, None, &records, env, 1).expect("stm strategy");
+        let stm = strategy
+            .execute_block(&snap, None, &records, env, 1)
+            .expect("stm strategy");
 
         assert_eq!(
             stm.receipts, seq.receipts,

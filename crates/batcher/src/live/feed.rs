@@ -75,54 +75,57 @@ impl<P: Provider> FeedLoop<P> {
     /// Run until the channel closes or a post fails after its retry budget.
     async fn run(mut self, mut rx: Receiver<ReaderToExec>) -> Result<()> {
         loop {
-            match tokio::time::timeout(self.cfg.flush, rx.recv()).await {
-                Ok(Some(ReaderToExec::Tx {
-                    envelope, position, ..
-                })) => self.acc.observe_tx(envelope, position),
-                // Deposits are absent from DA by design. A reconstructor
-                // re-derives them from L1 (this mirrors MultiArchiveReader
-                // skipping DepositRefs offline). Skip the epoch marker for
-                // the same reason: a reconstructor reads the origin from
-                // the block boundary and re-derives that L1 block's
-                // deposits itself. XChain is the per-message expansion of a
-                // RemoteEpoch record (below): the messages already travel
-                // by value inside the buffered record, so these expanded
-                // dispatches add nothing new, the same way the exec side
-                // expands them again from the record.
-                Ok(Some(
-                    ReaderToExec::Deposit { .. }
-                    | ReaderToExec::Epoch { .. }
-                    | ReaderToExec::XChain { .. },
-                )) => {}
-                // Remote-epoch records travel in DA. Unlike deposits, they
-                // are not derivable again from this chain's L1 origin. So
-                // the record, with its messages and calldata by value, is
-                // buffered into the block it leads. It travels in the KAR1
-                // v2 payload for the reconstruction replay to run again.
-                Ok(Some(ReaderToExec::RemoteEpoch { record, .. })) => {
-                    self.acc.observe_remote_epoch(*record);
-                }
-                Ok(Some(ReaderToExec::Boundary(b))) => {
-                    self.observe_boundary(&b)?;
-                    if let Some(group) = self
-                        .pending
-                        .take_if(|g| g.blocks.len() >= self.cfg.blocks_per_batch.get())
-                    {
-                        self.post_group(group).await?;
-                    }
-                }
-                // Flush timeout.
-                Err(_) => {
-                    if let Some(group) = self
-                        .pending
-                        .take_if(|g| g.since.elapsed() >= self.cfg.flush)
-                    {
-                        self.post_group(group).await?;
-                    }
-                }
-                Ok(None) => bail!("tx_ordering reader channel closed; see reader thread error"),
-            }
+            let event = tokio::time::timeout(self.cfg.flush, rx.recv()).await;
+            self.handle_event(event).await?;
         }
+    }
+
+    /// One [`Self::run`] tick: a channel event (a new record to buffer, or
+    /// the channel closing), or the flush timeout, whichever comes first.
+    async fn handle_event(
+        &mut self,
+        event: Result<Option<ReaderToExec>, tokio::time::error::Elapsed>,
+    ) -> Result<()> {
+        match event {
+            Ok(Some(ReaderToExec::Tx {
+                envelope, position, ..
+            })) => self.acc.observe_tx(envelope, position),
+            // Deposits are absent from DA by design. A reconstructor
+            // re-derives them from L1 (this mirrors MultiArchiveReader
+            // skipping DepositRefs offline). Skip the epoch marker for
+            // the same reason: a reconstructor reads the origin from the
+            // block boundary and re-derives that L1 block's deposits
+            // itself. XChain is the per-message expansion of a
+            // RemoteEpoch record (below): the messages already travel by
+            // value inside the buffered record, so these expanded
+            // dispatches add nothing new, the same way the exec side
+            // expands them again from the record.
+            Ok(Some(
+                ReaderToExec::Deposit { .. }
+                | ReaderToExec::Epoch { .. }
+                | ReaderToExec::XChain { .. },
+            )) => {}
+            // Remote-epoch records travel in DA. Unlike deposits, they
+            // are not derivable again from this chain's L1 origin. So the
+            // record, with its messages and calldata by value, is
+            // buffered into the block it leads. It travels in the KAR1 v2
+            // payload for the reconstruction replay to run again.
+            Ok(Some(ReaderToExec::RemoteEpoch { record, .. })) => {
+                self.acc.observe_remote_epoch(*record);
+            }
+            Ok(Some(ReaderToExec::Boundary(b))) => {
+                self.observe_boundary(&b)?;
+                let full = self.cfg.blocks_per_batch.get();
+                self.flush_if(|g| g.blocks.len() >= full).await?;
+            }
+            // Flush timeout.
+            Err(_) => {
+                let flush = self.cfg.flush;
+                self.flush_if(|g| g.since.elapsed() >= flush).await?;
+            }
+            Ok(None) => bail!("tx_ordering reader channel closed; see reader thread error"),
+        }
+        Ok(())
     }
 
     /// Close the current block. Buffer it for posting, unless L1 already
@@ -165,6 +168,16 @@ impl<P: Provider> FeedLoop<P> {
             reason = "pending-block count never nears 2^52"
         )]
         gauge!(live_metric_names::PENDING_BLOCKS).set(group.blocks.len() as f64);
+        Ok(())
+    }
+
+    /// Post the pending group if `ready` says it's due — the shape both
+    /// the `Boundary` arm (the group fills) and the flush-timeout arm (the
+    /// flush deadline elapses) share.
+    async fn flush_if(&mut self, ready: impl FnOnce(&PendingGroup) -> bool) -> Result<()> {
+        if let Some(group) = self.pending.take_if(|g| ready(g)) {
+            self.post_group(group).await?;
+        }
         Ok(())
     }
 

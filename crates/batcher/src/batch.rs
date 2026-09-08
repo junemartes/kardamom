@@ -19,6 +19,8 @@
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope};
 
+use crate::multi_archive_reader::ResolvedRecord;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedTx {
     pub position: BPosition,
@@ -72,6 +74,23 @@ impl BatchAccumulator {
             end_tx_idx: b.end_tx_idx,
             remote_epochs,
             txs,
+        }
+    }
+
+    /// Feed one record resolved from the archive reader (or the live
+    /// reader stack). Returns the closed block at a `Boundary` record;
+    /// `None` for a `Tx` or `RemoteEpoch` record, which only buffer.
+    pub fn observe(&mut self, rec: ResolvedRecord) -> Option<ClosedBlock> {
+        match rec {
+            ResolvedRecord::Tx { position, env, .. } => {
+                self.observe_tx(env, position);
+                None
+            }
+            ResolvedRecord::RemoteEpoch { record, .. } => {
+                self.observe_remote_epoch(record);
+                None
+            }
+            ResolvedRecord::Boundary { marker, .. } => Some(self.observe_boundary(&marker)),
         }
     }
 

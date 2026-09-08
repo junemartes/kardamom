@@ -307,7 +307,7 @@ pub async fn assert_batches_on_l1(
     expected: usize,
     da_store: &FsBlobStore,
 ) -> Result<()> {
-    let provider = l1.provider();
+    let provider = l1.provider()?;
     let descriptors = read_posted_batches(&provider, settlement, 0)
         .await
         .context("read BatchPosted logs")?;

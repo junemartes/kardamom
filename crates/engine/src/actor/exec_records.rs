@@ -11,19 +11,14 @@ use crate::delta::{PendingDelta, WriteSet};
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
 use crate::executor::execute_xchain_tx;
-use crate::reader::EpochObserver;
+use kardamom_exec_core::exec_types::TxSlot;
+use kardamom_exec_core::executor::XChainDelivery;
 
 use super::exec_thread::{ExecState, Flow};
-use super::ports::{StateWriterQueue, StateWriterSignal};
 use super::types::{BufferedRecord, ExecToCommit};
+use super::wiring::{ExecPorts, SnapshotDb};
 
-impl<S, Q, P, E> ExecState<S, Q, P, E>
-where
-    S: SnapshotSource + 'static,
-    Q: StateWriterSignal + 'static,
-    P: StateWriterQueue + 'static,
-    E: EpochObserver + 'static,
-{
+impl<W: ExecPorts> ExecState<W> {
     /// Buffer `rec` for the whole-block strategy to replay at the
     /// boundary, instead of executing it now. Returns the `Flow::Continue`
     /// the caller must return immediately, with no further work this call.
@@ -63,7 +58,7 @@ where
     /// whole-block strategy.
     pub(super) fn exec_env(&self, block_number: u64) -> ExecEnv {
         ExecEnv {
-            chain_id: self.cfg.chain_id,
+            chain_id: self.cfg.chain_id.get(),
             block_number,
             l2_timestamp: self.current_l2_ts,
         }
@@ -79,24 +74,24 @@ where
     /// fields (for example `bal_tx`, `tx_index_in_block`) while the
     /// returned scope stays borrowed.
     fn scope_or_init<'a>(
-        scope: &'a mut Option<crate::executor::Executor<S::Db>>,
-        snapshots: &S,
+        scope: &'a mut Option<crate::executor::Executor<SnapshotDb<W>>>,
+        snapshots: &W::Snapshots,
         parent: Option<&PendingDelta>,
         delta: &PendingDelta,
         current_block: u64,
         env: ExecEnv,
-    ) -> Result<&'a mut crate::executor::Executor<S::Db>, ExecutorError> {
-        if scope.is_none() {
+    ) -> Result<&'a mut crate::executor::Executor<SnapshotDb<W>>, ExecutorError> {
+        if let Some(sc) = scope {
+            Ok(sc)
+        } else {
             let mut sc = crate::executor::Executor::new(
                 snapshots.snapshot_after(current_block.saturating_sub(1)),
                 parent,
                 env,
             )?;
             sc.seed_layer(delta)?;
-            *scope = Some(sc);
+            Ok(scope.insert(sc))
         }
-        // `scope` was just checked, or just set, to `Some`.
-        Ok(scope.as_mut().expect("scope just initialized"))
     }
 
     /// Post-execution bookkeeping, shared by the Tx and Deposit arms. It
@@ -175,12 +170,15 @@ where
             .shadow_tx
             .as_ref()
             .map(|_| crate::executor::TouchSet::default());
-        let result = sc.execute_tx(
+        let slot = TxSlot {
             tx_idx,
-            position,
+            tx_position: position,
+            tx_index_in_block: self.tx_index_in_block,
+            cumulative_gas_used_before: self.cumulative_gas_used,
+        };
+        let result = sc.execute_tx(
+            slot,
             &envelope,
-            self.tx_index_in_block,
-            self.cumulative_gas_used,
             self.bal_tx
                 .as_ref()
                 .map(|_| (&mut self.block_bal, self.tx_index_in_block + 1)),
@@ -256,12 +254,15 @@ where
             self.current_block,
             env,
         )?;
-        let result = sc.execute_deposit(
+        let slot = TxSlot {
             tx_idx,
-            position,
+            tx_position: position,
+            tx_index_in_block: self.tx_index_in_block,
+            cumulative_gas_used_before: self.cumulative_gas_used,
+        };
+        let result = sc.execute_deposit(
+            slot,
             &deposit,
-            self.tx_index_in_block,
-            self.cumulative_gas_used,
             self.bal_tx
                 .as_ref()
                 .map(|_| (&mut self.block_bal, self.tx_index_in_block + 1)),
@@ -296,17 +297,22 @@ where
         }
         let env = self.exec_env(self.current_block);
         let apply_start = Instant::now();
+        let slot = TxSlot {
+            tx_idx,
+            tx_position: position,
+            tx_index_in_block: self.tx_index_in_block,
+            cumulative_gas_used_before: self.cumulative_gas_used,
+        };
         let result = execute_xchain_tx(
             &self.snapshot,
             self.parent.as_ref(),
             &self.delta,
             env,
-            tx_idx,
-            position,
-            origin_chain_id,
-            &message,
-            self.tx_index_in_block,
-            self.cumulative_gas_used,
+            slot,
+            XChainDelivery {
+                origin_chain_id,
+                message: &message,
+            },
             self.bal_tx
                 .as_ref()
                 .map(|_| (&mut self.block_bal, self.tx_index_in_block + 1)),

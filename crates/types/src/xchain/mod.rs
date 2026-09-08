@@ -28,7 +28,7 @@
 //!     stream.
 //!   * [`RemoteEpochRecord`] — one origin's contiguous message batch as it
 //!     travels on the canonical stream.
-//!   * [`msg_leaf`] — the commitment the Outbox predeploy stores; must stay
+//!   * [`MsgLeaf`] — the commitment the Outbox predeploy stores; must stay
 //!     byte-identical to `Outbox.hashMessage` (see `contracts/src/Outbox.sol`).
 //!
 //! The module splits into: [`ids`] (address and hash derivation), [`message`]
@@ -51,18 +51,22 @@ mod layout_tests;
 mod tests;
 
 pub use abi::{INBOX_DELIVER_SIGNATURE, deliver_calldata, inbox_deliver_selector};
-pub use derive::{XChainError, check_anchor, derive_remote_epoch};
-pub use ids::{alias_remote_address, remote_source_hash, xchain_anchor_hash, xchain_tx_sender};
-pub use layout::{
-    INBOX_DELIVERED_SLOT_INDEX, INBOX_NEXT_SEQ_SLOT_INDEX, MESSAGE_SENT_SIGNATURE,
-    OUTBOX_NONCES_SLOT_INDEX, OUTBOX_SEND_MESSAGE_SIGNATURE, SENT_MESSAGES_SLOT_INDEX,
-    inbox_delivered_slot, inbox_next_seq_slot, mapping_slot, message_sent_topic0,
-    outbox_nonces_slot, outbox_send_message_selector, sent_messages_slot, u64_word,
+pub use derive::{XChainError, derive_remote_epoch};
+pub use ids::{Anchor, alias_remote_address, remote_source_hash, xchain_tx_sender};
+pub use layout::{Inbox, Outbox, u64_word, word_u64};
+pub use leaf::{MsgLeaf, no_callback_hash, xchain_leaf_domain};
+pub use message::{
+    BoundsFault, Callback, NonEmptyVec, OutboxMessage, RemoteEpochRecord, XChainMessage,
 };
-pub use leaf::{MsgLeaf, msg_leaf, no_callback_hash, xchain_leaf_domain};
-pub use message::{Callback, OutboxMessage, RemoteEpochRecord, XChainMessage};
 
-use alloy_primitives::{Address, address};
+use alloy_primitives::{Address, B256, address, keccak256};
+
+/// `keccak256` over concatenated byte slices, for the several fixed-shape
+/// preimages in this module (an anchor, an alias, a canonical id, a mapping
+/// slot) that would otherwise each hand-build the same kind of buffer.
+fn keccak_concat(parts: &[&[u8]]) -> B256 {
+    keccak256(parts.concat())
+}
 
 /// Domain of [`remote_source_hash`] in the source-hash scheme shared with
 /// deposits (`crate::epoch`: 0 = user deposit, 1 = reserved system tx).
@@ -72,7 +76,7 @@ pub const XCHAIN_SOURCE_DOMAIN: u64 = 2;
 /// alias scheme is a chain-splitting change and must bump this.
 pub const XCHAIN_ALIAS_TAG: &str = "KARDAMOM_XCHAIN_ALIAS_V0";
 
-/// Tag string hashed into [`xchain_anchor_hash`]. Versioned like
+/// Tag string hashed into [`Anchor::hash`]. Versioned like
 /// [`XCHAIN_ALIAS_TAG`]: a change here changes every record id.
 pub const XCHAIN_ANCHOR_TAG: &str = "KARDAMOM_XCHAIN_ANCHOR_V0";
 

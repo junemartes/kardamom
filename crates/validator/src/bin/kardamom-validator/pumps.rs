@@ -2,17 +2,22 @@
 //! `tx_receipts`, and the committed-block metrics/attester poller. Each runs
 //! on the binary's tokio runtime for the process lifetime.
 
-use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsSubscriberHandle};
-use kardamom_log::config::ChannelsConfig;
-use kardamom_state::SnapshotReceiver;
+use kardamom_log::aeron_live::{
+    AeronRuntime, TxReceiptsReceiver, TxReceiptsSubscriberHandle, TypedSubscription,
+};
+use kardamom_log::config::{ChannelUri, ChannelsConfig};
+use kardamom_state::{SnapshotReceiver, StateSnapshot};
 use kardamom_validator::attester::AttesterHandle;
 use kardamom_validator::{BalBuffer, ClaimBuffer, ReceiptBuffer, metrics};
 use tokio_util::sync::CancellationToken;
+
+/// Silence window on `tx_bal` before the pump reopens the subscription.
+/// See [`spawn_bal_pump`] for why silence, not just absence, triggers it.
+const BAL_SILENCE_REOPEN: Duration = Duration::from_secs(60);
 
 /// `tx_bal`: per-block `BlockDelta` (BAL). This is a simple multicast or IPC
 /// subscription, wrapped in a silence watchdog. A multicast image that
@@ -42,45 +47,76 @@ pub(crate) fn spawn_bal_pump(
     extract_claims: Option<Arc<ClaimBuffer>>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    const BAL_SILENCE_REOPEN: Duration = Duration::from_secs(60);
     let bal_channel = channels.tx_bal_channel.clone();
     let bal_stream_id = channels.tx_bal_stream_id;
-    let mut bal_rx =
-        open_bal_sub(rt, &bal_channel, bal_stream_id).context("open tx_bal subscription")?;
-    let reopen_rt = rt.clone();
-    tokio::spawn(async move {
-        loop {
-            let recv = tokio::select! {
-                biased;
-                // Release the runtime clone promptly on shutdown.
-                () = shutdown.cancelled() => return,
-                r = tokio::time::timeout(BAL_SILENCE_REOPEN, bal_rx.recv()) => r,
-            };
-            let frame = match recv {
-                Ok(Some((_pos, frame))) => frame,
-                Ok(None) => return, // The runtime is shutting down.
-                Err(_) => {
-                    metrics::counter_bal_sub_reopen();
-                    tracing::warn!(
-                        silence_s = BAL_SILENCE_REOPEN.as_secs(),
-                        "tx_bal silent — reopening the subscription \
-                         (never-joined or dead multicast image, #144)"
-                    );
-                    match open_bal_sub(&reopen_rt, &bal_channel, bal_stream_id) {
-                        Ok(rx) => bal_rx = rx,
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "tx_bal reopen failed; retrying after the next window"
-                        ),
-                    }
-                    continue;
-                }
-            };
-            index_claims(&frame, &claims, extract_claims.as_deref());
-            bals.insert(frame.delta().clone());
-        }
-    });
+    let bal_rx = open_bal_sub(rt, bal_channel.as_str(), bal_stream_id)
+        .context("open tx_bal subscription")?;
+    let mut pump = BalPump {
+        bal_rx,
+        reopen_rt: rt.clone(),
+        bal_channel,
+        bal_stream_id,
+        claims,
+        extract_claims,
+        bals,
+    };
+    tokio::spawn(async move { while pump.step(&shutdown).await.is_some() {} });
     Ok(())
+}
+
+/// The `tx_bal` pump's live subscription plus its fixed reopen target and
+/// insertion buffers. Grouped so [`Self::step`] takes `&mut self` instead
+/// of one argument per port.
+struct BalPump {
+    bal_rx: TypedSubscription<kardamom_types::BalFrame>,
+    reopen_rt: AeronRuntime,
+    bal_channel: ChannelUri,
+    bal_stream_id: i32,
+    claims: Arc<ClaimBuffer>,
+    extract_claims: Option<Arc<ClaimBuffer>>,
+    bals: Arc<BalBuffer>,
+}
+
+impl BalPump {
+    /// One receive step: wait for a frame under the silence watchdog,
+    /// index and insert it, or reopen the subscription after a silent
+    /// window. Returns `None` once shutdown is requested or the runtime
+    /// is gone, which releases this task's `AeronRuntime` clone.
+    async fn step(&mut self, shutdown: &CancellationToken) -> Option<()> {
+        let recv = tokio::select! {
+            biased;
+            // Release the runtime clone promptly on shutdown.
+            () = shutdown.cancelled() => return None,
+            r = tokio::time::timeout(BAL_SILENCE_REOPEN, self.bal_rx.recv()) => r,
+        };
+        let frame = match recv {
+            Ok(Some((_pos, frame))) => frame,
+            Ok(None) => return None, // The runtime is shutting down.
+            Err(_) => {
+                metrics::counter_bal_sub_reopen();
+                tracing::warn!(
+                    silence_s = BAL_SILENCE_REOPEN.as_secs(),
+                    "tx_bal silent — reopening the subscription \
+                     (never-joined or dead multicast image, #144)"
+                );
+                match open_bal_sub(
+                    &self.reopen_rt,
+                    self.bal_channel.as_str(),
+                    self.bal_stream_id,
+                ) {
+                    Ok(rx) => self.bal_rx = rx,
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "tx_bal reopen failed; retrying after the next window"
+                    ),
+                }
+                return Some(());
+            }
+        };
+        index_claims(&frame, &self.claims, self.extract_claims.as_deref());
+        self.bals.insert(frame.delta().clone());
+        Some(())
+    }
 }
 
 /// Open the `tx_bal` subscription: on startup, and again to reopen after
@@ -91,23 +127,20 @@ fn open_bal_sub(
     rt: &AeronRuntime,
     channel: &str,
     stream_id: i32,
-) -> std::result::Result<
-    tokio::sync::mpsc::UnboundedReceiver<(kardamom_types::BPosition, kardamom_types::BalFrame)>,
-    kardamom_log::error::LogError,
-> {
+) -> std::result::Result<TypedSubscription<kardamom_types::BalFrame>, kardamom_log::error::LogError>
+{
     rt.open_subscription::<kardamom_types::BalFrame>(channel, stream_id)
 }
 
 /// Decode the frame's access list, and insert it into `claims` (and
-/// `extract_claims`, if given). A decode failure, or a wire granularity of
-/// 0 (never legal — see [`kardamom_types::BalFrame::granularity`]), falls
-/// back to sequential re-execution (the merged write-set check is
-/// unaffected), never to a verification gap. This is the one place the
-/// validator reads `granularity` off the wire; every downstream consumer
-/// takes a [`NonZeroU16`], parsed once here. Skips an empty list: empty
-/// blocks never take claims, since the parallel path short-circuits before
-/// its take, so inserting them would grow the buffer for the whole idle
-/// period. Quantized frames carry their granularity, so verification
+/// `extract_claims`, if given). A decode failure falls back to sequential
+/// re-execution (the merged write-set check is unaffected), never to a
+/// verification gap. `granularity` carries its own never-zero guarantee
+/// from the wire decode, so every downstream consumer takes a
+/// [`std::num::NonZeroU16`] with nothing left to check here. Skips an empty list:
+/// empty blocks never take claims, since the parallel path short-circuits
+/// before its take, so inserting them would grow the buffer for the whole
+/// idle period. Quantized frames carry their granularity, so verification
 /// coarsens to the chunk, with batches aligned to it. The validator's
 /// ladder view always follows the wire.
 fn index_claims(
@@ -120,13 +153,7 @@ fn index_claims(
         granularity,
         delta,
     } = frame;
-    let Some(granularity) = NonZeroU16::new(*granularity) else {
-        tracing::warn!(
-            block = delta.block_number,
-            "BAL frame granularity is 0 (never legal); block validates sequentially"
-        );
-        return;
-    };
+    let granularity = *granularity;
     let mut slice: &[u8] = bal_rlp;
     match <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(&mut slice) {
         Ok(bal) if !bal.is_empty() => {
@@ -167,22 +194,41 @@ pub(crate) fn spawn_receipts_pump(
     receipts: Arc<ReceiptBuffer>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let executor_count = executor_count_flag.unwrap_or(channels.tx_receipts_executor_count);
-    let mut rx = TxReceiptsSubscriberHandle::open_auto(rt, channels, executor_count)
+    // The flag, parsed to `NonZeroU32` (an explicit 0 is the same
+    // "unset" `open_auto` warns about), takes precedence; with no flag,
+    // the channel config's own typed count carries forward unchanged.
+    let executor_count = match executor_count_flag {
+        Some(n) => std::num::NonZeroU32::new(n),
+        None => channels.tx_receipts_executor_count,
+    };
+    let rx = TxReceiptsSubscriberHandle::open_auto(rt, channels, executor_count)
         .context("open tx_receipts")?
         .into_receiver();
-    tokio::spawn(async move {
-        loop {
-            let next = tokio::select! {
-                biased;
-                () = shutdown.cancelled() => return,
-                r = rx.recv() => r,
-            };
-            let Some((_pos, r)) = next else { return };
-            receipts.insert(r);
-        }
-    });
+    let mut pump = ReceiptsPump { rx, receipts };
+    tokio::spawn(async move { while pump.step(&shutdown).await.is_some() {} });
     Ok(())
+}
+
+/// The `tx_receipts` pump's live receiver plus its insertion buffer.
+struct ReceiptsPump {
+    rx: TxReceiptsReceiver,
+    receipts: Arc<ReceiptBuffer>,
+}
+
+impl ReceiptsPump {
+    /// One receive step. Returns `None` once shutdown is requested or the
+    /// sender side is gone, either of which releases this task's
+    /// `AeronRuntime` clone.
+    async fn step(&mut self, shutdown: &CancellationToken) -> Option<()> {
+        let next = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return None,
+            r = self.rx.recv() => r,
+        };
+        let (_pos, r) = next?;
+        self.receipts.insert(r);
+        Some(())
+    }
 }
 
 /// Background poller: expose the committed-block and state-root height
@@ -201,38 +247,54 @@ pub(crate) fn spawn_commit_poller(
     tokio::spawn(async move {
         // Park on the snapshot watch: one wake per commit. Each publish
         // is a new committed block.
-        let mut watch = snap_rx.watch();
-        loop {
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                changed = watch.changed() => {
-                    if changed.is_err() {
-                        // Writer gone: shutdown path.
-                        return;
-                    }
+        let mut poller = CommitPoller {
+            watch: snap_rx.watch(),
+            attester_handle,
+            attestation_store,
+        };
+        while poller.step(&shutdown).await.is_some() {}
+    });
+}
+
+/// The commit poller's live snapshot watch plus the report targets.
+struct CommitPoller {
+    watch: tokio::sync::watch::Receiver<Option<StateSnapshot>>,
+    attester_handle: Option<AttesterHandle>,
+    attestation_store: Option<Arc<kardamom_validator::interop::AttestationStore>>,
+}
+
+impl CommitPoller {
+    /// One step: wait for the next committed snapshot, and report its
+    /// height and state root. Returns `None` once shutdown is requested
+    /// or the writer side is gone.
+    async fn step(&mut self, shutdown: &CancellationToken) -> Option<()> {
+        tokio::select! {
+            () = shutdown.cancelled() => return None,
+            // Writer gone: shutdown path.
+            changed = self.watch.changed() => changed.ok()?,
+        }
+        let Some(snap) = self.watch.borrow_and_update().clone() else {
+            // No snapshot published yet: nothing to report this tick.
+            return Some(());
+        };
+        let block = snap.block_number();
+        metrics::set_committed_block(block);
+        match snap.state_root() {
+            Ok(Some(root)) => {
+                metrics::set_state_root_block(block);
+                tracing::debug!(block, state_root = %root, "validator committed block");
+                if let Some(h) = &self.attester_handle {
+                    h.submit_root(block, root);
+                }
+                if let Some(s) = &self.attestation_store {
+                    s.push(block, root);
                 }
             }
-            let Some(snap) = watch.borrow_and_update().clone() else {
-                continue;
-            };
-            let block = snap.block_number();
-            metrics::set_committed_block(block);
-            match snap.state_root() {
-                Ok(Some(root)) => {
-                    metrics::set_state_root_block(block);
-                    tracing::debug!(block, state_root = %root, "validator committed block");
-                    if let Some(h) = attester_handle.as_ref() {
-                        h.submit_root(block, root);
-                    }
-                    if let Some(s) = attestation_store.as_ref() {
-                        s.push(block, root);
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(block, error = %e, "state_root read failed");
-                }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(block, error = %e, "state_root read failed");
             }
         }
-    });
+        Some(())
+    }
 }

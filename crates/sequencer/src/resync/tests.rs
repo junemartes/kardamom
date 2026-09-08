@@ -268,8 +268,8 @@ fn enter_threshold_rejects_a_product_that_rounds_to_zero() {
     // 2 * 25 / 100 == 0: neither `dedup_capacity` nor `enter_percent` is
     // individually invalid (both are nonzero), but the pair yields a
     // threshold of 0 records, which would mean "resync on every
-    // watermark tick". This must be a validation error, not a silent
-    // `.max(1)` clamp to 1.
+    // watermark tick". This must be a validation error, never rounded
+    // up to 1 in place.
     let cfg = ResyncConfig {
         dedup_capacity: NonZeroU64::new(2).unwrap(),
         enter_percent: NonZeroU64::new(25).unwrap(),

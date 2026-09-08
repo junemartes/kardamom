@@ -40,7 +40,8 @@ pub mod mock;
 pub use cursor::{CursorError, CursorFile};
 pub use publisher::RemoteEpochPublisher;
 pub use reconcile::{
-    DestinationStateReader, ReconcileError, ReconcileRetry, RpcDestinationReader, reconcile_cursor,
+    CursorReconcile, DestinationStateReader, MissingCursorReconcile, ReconcileError,
+    ReconcileRetry, RpcDestinationReader,
 };
 pub use source::{RemoteChainSource, RemoteSourceError, WsRemoteChainSource};
 pub use watcher::{InteropError, InteropWatcherConfig, process_once, spawn};

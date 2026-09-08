@@ -40,7 +40,7 @@ mod tx_env;
 mod write_set;
 mod xchain;
 
-pub use db::{SnapshotDb, SnapshotRef, StateRefError};
+pub use db::{SnapshotDb, SnapshotRef, StateRefError, account_info};
 pub use deposit::execute_deposit_tx;
 pub use scope::{Executor, TouchSet};
 pub use skip::skip_reason_of_tx;

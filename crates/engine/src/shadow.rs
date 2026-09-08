@@ -76,7 +76,12 @@ impl ShadowBlock {
             .into_iter()
             .enumerate()
             .map(|(i, c)| {
-                let (to, selector, args, has_value) = envelope_view(&c.envelope.raw_tx);
+                let kardamom_footprint::EnvelopeView {
+                    to,
+                    selector,
+                    args,
+                    has_value,
+                } = envelope_view(&c.envelope.raw_tx);
                 // Account reads (BALANCE/EXTCODE* subjects) stay out of the
                 // conflict cells, for parity with the offline yardstick. See
                 // the note on `kardamom_footprint::Cell`.

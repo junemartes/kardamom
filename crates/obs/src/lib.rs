@@ -13,6 +13,50 @@ use anyhow::{Context, Result, anyhow};
 use metrics_exporter_prometheus::{ExporterFuture, PrometheusBuilder, PrometheusRecorder};
 
 pub mod bin;
+#[cfg(feature = "test-support")]
+pub mod testkit;
+
+/// A non-empty host identifier, stamped on every metric this service
+/// exports. Parses once at a binary's CLI boundary (`impl FromStr`), so a
+/// blank `--host-id` fails argument parsing instead of reaching [`init`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostId(String);
+
+impl std::str::FromStr for HostId {
+    type Err = HostIdEmpty;
+
+    fn from_str(s: &str) -> Result<Self, HostIdEmpty> {
+        if s.is_empty() {
+            Err(HostIdEmpty)
+        } else {
+            Ok(Self(s.to_string()))
+        }
+    }
+}
+
+impl AsRef<str> for HostId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for HostId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A host id must be non-empty.
+#[derive(Debug)]
+pub struct HostIdEmpty;
+
+impl std::fmt::Display for HostIdEmpty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("host_id must be non-empty")
+    }
+}
+
+impl std::error::Error for HostIdEmpty {}
 
 /// [`init`] with the version and git-sha values filled in at the call
 /// site, so each binary stamps its own crate version. A plain helper
@@ -132,16 +176,30 @@ impl Exporter {
             if !built.as_ref().err().is_some_and(is_addr_in_use) {
                 break;
             }
-            tracing::warn!(
-                metrics_addr = %self.metrics_addr,
-                attempt,
-                max = bind_retries,
-                "metrics port in use (squatter not yet reaped?); retrying bind"
-            );
-            tokio::time::sleep(bind_retry_delay).await;
-            built = self.build();
+            built = self
+                .retry_bind(attempt, bind_retries, bind_retry_delay)
+                .await;
         }
         built
+    }
+
+    /// One retry for [`Self::build_with_retry`]'s loop, once it has
+    /// decided (via the `AddrInUse` check) that this attempt should
+    /// retry: log, wait `delay`, then rebuild.
+    async fn retry_bind(
+        &self,
+        attempt: u32,
+        max: u32,
+        delay: Duration,
+    ) -> Result<(PrometheusRecorder, ExporterFuture)> {
+        tracing::warn!(
+            metrics_addr = %self.metrics_addr,
+            attempt,
+            max,
+            "metrics port in use (squatter not yet reaped?); retrying bind"
+        );
+        tokio::time::sleep(delay).await;
+        self.build()
     }
 
     /// Register and set the build-info and liveness gauges.
@@ -206,4 +264,22 @@ pub async fn init(
         "kardamom_obs: prometheus exporter installed"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod host_id_tests {
+    use super::HostId;
+    use std::str::FromStr;
+
+    #[test]
+    fn rejects_empty() {
+        assert!(HostId::from_str("").is_err());
+    }
+
+    #[test]
+    fn accepts_non_empty() {
+        let id = HostId::from_str("local").unwrap();
+        assert_eq!(id.as_ref(), "local");
+        assert_eq!(id.to_string(), "local");
+    }
 }

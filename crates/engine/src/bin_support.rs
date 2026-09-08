@@ -20,12 +20,12 @@ use anyhow::{Context, Result};
 
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::{AeronConfig, ChannelsConfig};
-use kardamom_log::refetch::{ArchiveRefetcher, RefetchConfig};
+use kardamom_log::refetch::RefetchConfig;
 use kardamom_state::Durability;
-use kardamom_types::{AccountChange, BPosition, CodeEntry, Deposit, TxDataLoc, TxEnvelope};
+use kardamom_types::{AccountChange, CodeEntry, TxDataLoc, TxEnvelope};
 
 use crate::error::ExecutorError;
-use crate::reader::{JoinRecovery, JoinRecoveryFactory, TxDataSubscription};
+use crate::reader::{JoinRecoveryFactory, TxDataSubscription};
 
 /// CLI mirror of [`kardamom_state::Durability`]. Clap renders the variants
 /// as `durable` and `safe-no-sync`.
@@ -60,17 +60,19 @@ fn load_genesis(path: &Path) -> Result<kardamom_types::Genesis> {
 /// # Errors
 ///
 /// Returns `Err` when `--chain` names a file that does not exist, does not
-/// parse as genesis TOML, or fails semantic validation; or when
-/// `--chain-id` disagrees with the genesis file's `chain_id`.
+/// parse as genesis TOML, or fails semantic validation; when
+/// `--chain-id` disagrees with the genesis file's `chain_id`; or when the
+/// resolved chain id is zero.
 pub fn resolve_genesis(
     chain: Option<&Path>,
     chain_id_flag: u64,
-) -> Result<(Option<kardamom_types::Genesis>, u64)> {
+) -> Result<(Option<kardamom_types::Genesis>, std::num::NonZeroU64)> {
     let genesis = match chain {
         Some(path) => Some(load_genesis(path)?),
         None => None,
     };
     let chain_id = genesis.as_ref().map_or(chain_id_flag, |g| g.chain_id);
+    let chain_id = std::num::NonZeroU64::new(chain_id).context("chain id must not be zero")?;
     if let Some(g) = &genesis
         && chain_id_flag != 1
         && chain_id_flag != g.chain_id
@@ -145,7 +147,7 @@ pub fn bounded_join_timeout(resuming: bool) -> Duration {
 /// binary's `EngineWiring` can name it as its `TxData` type.
 pub struct LiveTxDataSub {
     sequencer_id: u8,
-    rx: tokio::sync::mpsc::UnboundedReceiver<(TxDataLoc, TxEnvelope)>,
+    rx: kardamom_log::aeron_live::TxDataSubscription,
 }
 
 impl TxDataSubscription for LiveTxDataSub {
@@ -154,22 +156,18 @@ impl TxDataSubscription for LiveTxDataSub {
     }
 
     fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError> {
-        let item = self.rx.blocking_recv().ok_or(ExecutorError::TxDataClosed {
-            sequencer_id: self.sequencer_id,
-        })?;
-        // The channel is unbounded (see the struct doc): this gauge is the
-        // operator's signal that it is growing without limit, when the
-        // engine reader stalls.
         #[allow(
             clippy::cast_precision_loss,
-            reason = "queue depth stays far below 2^52"
+            reason = "a queue depth stays far below 2^52"
         )]
         metrics::gauge!(
             crate::metrics::TX_DATA_QUEUE_DEPTH,
             "shard" => self.sequencer_id.to_string()
         )
         .set(self.rx.len() as f64);
-        Ok(item)
+        self.rx.blocking_recv().ok_or(ExecutorError::TxDataClosed {
+            sequencer_id: self.sequencer_id,
+        })
     }
 }
 
@@ -193,9 +191,9 @@ impl TxDataSubscription for LiveTxDataSub {
 pub fn open_tx_data_subs(
     rt: &AeronRuntime,
     channels: &ChannelsConfig,
-    shards: u8,
+    shards: std::num::NonZeroU8,
 ) -> Result<Vec<LiveTxDataSub>> {
-    (0..shards)
+    (0..shards.get())
         .map(|shard_id| {
             let rx = rt
                 .open_tx_data_subscription(
@@ -215,53 +213,12 @@ pub fn open_tx_data_subs(
 // Join-miss archive refetch wiring.
 // ---------------------------------------------------------------------------
 
-/// [`JoinRecovery`] over the remote durability archives, via
-/// [`kardamom_log::refetch::ArchiveRefetcher`].
-struct ArchiveJoinRecovery {
-    refetcher: ArchiveRefetcher,
-    tx_data_stream_base: i32,
-    tx_deposits_stream_id: i32,
-}
-
-impl JoinRecovery for ArchiveJoinRecovery {
-    fn recover_tx_data(
-        &mut self,
-        shard_id: u8,
-        session_id: i32,
-        from: BPosition,
-        sink: &mut dyn FnMut(TxDataLoc, TxEnvelope),
-    ) -> Result<u64, String> {
-        let stream_id = self
-            .tx_data_stream_base
-            .checked_add(i32::from(shard_id))
-            .ok_or_else(|| {
-                format!(
-                    "tx_data stream id overflow: base {} + shard {shard_id}",
-                    self.tx_data_stream_base
-                )
-            })?;
-        self.refetcher
-            .fetch_tx_data(stream_id, session_id, from, sink)
-            .map_err(|e| e.to_string())
-    }
-
-    fn recover_deposits(
-        &mut self,
-        from: BPosition,
-        sink: &mut dyn FnMut(BPosition, Deposit),
-    ) -> Result<u64, String> {
-        self.refetcher
-            .fetch_deposits(self.tx_deposits_stream_id, from, sink)
-            .map_err(|e| e.to_string())
-    }
-}
-
 /// Build the join-miss refetch factory from config. Return `None` when no
 /// durability-archive endpoints are configured (single-host or IPC runs),
 /// or the node-local transport endpoints are missing. The reader thread
-/// calls the factory, because the refetcher's Aeron resources are
-/// thread-bound. The refetcher itself is fully lazy: no Aeron resources
-/// exist until the first join miss.
+/// builds the [`JoinRecovery`](crate::reader::JoinRecovery) from the
+/// factory, because its Aeron resources are thread-bound. Those resources
+/// are fully lazy: none exist until the first join miss.
 pub fn archive_join_recovery(
     channels: &ChannelsConfig,
     aeron_cfg: &AeronConfig,
@@ -291,15 +248,11 @@ pub fn archive_join_recovery(
         aeron_dir: aeron_dir.map(std::path::Path::to_path_buf),
         aeron: aeron_cfg.clone(),
     };
-    let tx_data_stream_base = channels.tx_data_stream_id_base;
-    let tx_deposits_stream_id = channels.tx_deposits_stream_id;
-    Some(Box::new(move || {
-        Some(Box::new(ArchiveJoinRecovery {
-            refetcher: ArchiveRefetcher::new(cfg),
-            tx_data_stream_base,
-            tx_deposits_stream_id,
-        }) as Box<dyn JoinRecovery>)
-    }))
+    Some(JoinRecoveryFactory {
+        cfg,
+        tx_data_stream_base: channels.tx_data_stream_id_base,
+        tx_deposits_stream_id: channels.tx_deposits_stream_id,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +517,7 @@ mod tests {
             Some("10.0.0.1:40130"),
         );
         assert!(f.is_some(), "fully configured ⇒ factory");
-        // The factory is safe to run without Aeron; it is fully lazy.
-        assert!(f.unwrap()().is_some());
+        // The factory is safe to build without Aeron; it is fully lazy.
+        let _recovery = f.unwrap().build();
     }
 }

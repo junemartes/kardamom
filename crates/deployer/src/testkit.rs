@@ -16,6 +16,17 @@ use crate::{ContractId, Deployer, Op, encode_address_arg};
 /// account: 1000 ETH.
 const FUND_WEI: u128 = 1_000_000_000_000_000_000_000;
 
+/// Whether a funded dev account is also impersonated, so a test can call
+/// as it with no signature (`FundAndImpersonate`), or funded only, so it
+/// keeps signing real transactions with its own key (`FundOnly` — the
+/// batcher EOA, which must sign genuine EIP-4844 blob transactions that
+/// an impersonated account cannot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Funding {
+    FundAndImpersonate,
+    FundOnly,
+}
+
 /// A spawned anvil instance and a provider connected to it, with the
 /// ERC-7955 CREATE2 factory runtime installed. Returned by
 /// [`AnvilRig::spawn`].
@@ -25,12 +36,15 @@ pub struct AnvilRig {
 }
 
 impl AnvilRig {
-    /// Spawn anvil, install the ERC-7955 factory runtime, and fund and
-    /// impersonate every address in `fund`. Returns `None` if anvil is not
-    /// installed — the convention every e2e test in this workspace uses to
-    /// skip cleanly, rather than fail, when the local toolchain lacks it.
-    pub async fn spawn(fund: &[Address]) -> Option<Self> {
-        let anvil = Anvil::new().try_spawn().ok()?;
+    /// Spawn `anvil` (already configured with the flags the caller needs,
+    /// for example `Anvil::new().block_time(1)`), install the ERC-7955
+    /// factory runtime, and fund every address in `fund` — impersonating
+    /// it too, unless its [`Funding`] says `FundOnly`. Returns `None` if
+    /// anvil is not installed — the convention every e2e test in this
+    /// workspace uses to skip cleanly, rather than fail, when the local
+    /// toolchain lacks it.
+    pub async fn spawn(anvil: Anvil, fund: &[(Address, Funding)]) -> Option<Self> {
+        let anvil = anvil.try_spawn().ok()?;
         let provider: RootProvider = ProviderBuilder::new()
             .disable_recommended_fillers()
             .connect_http(anvil.endpoint_url());
@@ -40,15 +54,17 @@ impl AnvilRig {
             .raw_request("anvil_setCode".into(), (ERC7955_FACTORY, bytes_hex))
             .await
             .ok()?;
-        for addr in fund {
+        for (addr, funding) in fund {
             let _: serde_json::Value = provider
                 .raw_request("anvil_setBalance".into(), (*addr, U256::from(FUND_WEI)))
                 .await
                 .ok()?;
-            let _: serde_json::Value = provider
-                .raw_request("anvil_impersonateAccount".into(), (*addr,))
-                .await
-                .ok()?;
+            if *funding == Funding::FundAndImpersonate {
+                let _: serde_json::Value = provider
+                    .raw_request("anvil_impersonateAccount".into(), (*addr,))
+                    .await
+                    .ok()?;
+            }
         }
         Some(AnvilRig { anvil, provider })
     }

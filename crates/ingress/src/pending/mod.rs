@@ -135,7 +135,7 @@ struct Watermarks {
 /// duplicate can easily afford.
 pub(crate) const DEFAULT_TX_ERROR_GRACE: Duration = Duration::from_millis(500);
 
-pub struct PendingReceipts {
+pub(crate) struct PendingReceipts {
     policy: AckPolicy,
     map: PendingMap,
     /// Latest watermarks observed: one `watch` slot per kind. A `watch`
@@ -166,7 +166,7 @@ impl Default for PendingReceipts {
 }
 
 impl PendingReceipts {
-    pub fn new(policy: AckPolicy) -> Self {
+    pub(crate) fn new(policy: AckPolicy) -> Self {
         Self::with_error_grace(policy, DEFAULT_TX_ERROR_GRACE)
     }
 
@@ -196,7 +196,7 @@ impl PendingReceipts {
     /// client disconnect, which cancels the RPC handler, the wait owns
     /// the only strong `Arc`, so every end path frees the entry and
     /// reaps its slot.
-    pub fn register(&self, sender: Address, nonce: u64) -> PendingWait {
+    pub(crate) fn register(&self, sender: Address, nonce: u64) -> PendingWait {
         let (tx, rx) = oneshot::channel();
         let entry = Arc::new(Mutex::new(Entry {
             responder: Some(tx),
@@ -217,7 +217,7 @@ impl PendingReceipts {
     /// already passed the receipt's B-position, this releases the client
     /// right away. Otherwise it stores the receipt and waits for the
     /// next watermark update.
-    pub async fn on_receipt(&self, sender: Address, nonce: u64, receipt: Receipt) {
+    pub(crate) async fn on_receipt(&self, sender: Address, nonce: u64, receipt: Receipt) {
         let key = (sender, nonce);
         let Some(entry) = self.map.lookup(&key) else {
             return;
@@ -275,7 +275,7 @@ impl PendingReceipts {
     /// arrived, even one still gated on a durability watermark,
     /// suppresses the error outright. Returns silently if no client is
     /// parked for that key, since the error is best-effort.
-    pub async fn on_tx_error(&self, sender: Address, nonce: u64, reason: TxErrorReason) {
+    pub(crate) async fn on_tx_error(&self, sender: Address, nonce: u64, reason: TxErrorReason) {
         let key = (sender, nonce);
         // The deferred release holds only a Weak across the grace sleep.
         // So a client that disconnects mid-grace lets its entry die
@@ -321,14 +321,14 @@ impl PendingReceipts {
     /// Called when a new quorum-watermark snapshot arrives. The drain
     /// runs inline, so the release happens on the same tick, with no
     /// scheduler hop.
-    pub async fn update_quorum_watermark(&self, wm: QuorumWatermark) {
+    pub(crate) async fn update_quorum_watermark(&self, wm: QuorumWatermark) {
         self.quorum.send_replace(Some(wm.position));
         self.release_satisfied().await;
     }
 
     /// Called when a new local-fsync watermark snapshot arrives, from
     /// the per-recorder stream for the local host.
-    pub async fn update_local_watermark(&self, wm: FsyncWatermark) {
+    pub(crate) async fn update_local_watermark(&self, wm: FsyncWatermark) {
         self.local.send_replace(Some(wm.position));
         self.release_satisfied().await;
     }
@@ -381,13 +381,7 @@ impl PendingReceipts {
             prefix.into_values().collect()
         };
         for weak in drained {
-            let Some(entry) = weak.upgrade() else {
-                continue; // The waiter is gone.
-            };
-            let mut e = entry.lock().await;
-            if let (Some(receipt), Some(resp)) = (e.receipt.clone(), e.responder.take()) {
-                let _ = resp.send(Ok(ReceiptResponse { receipt }));
-            }
+            release_one(weak).await;
         }
     }
 
@@ -406,8 +400,22 @@ impl PendingReceipts {
     /// of live parks: every drop path reaps its own slot before the
     /// entry dies, so a dead `Weak` never outlives a reader's
     /// opportunistic reap.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.map.len()
+    }
+}
+
+/// Resolve one drained-satisfied entry, for [`PendingReceipts::release_satisfied`]'s
+/// loop: if the waiter is still there and holds both a receipt and a
+/// responder, send the receipt. A waiter that dropped (`upgrade` fails),
+/// or already sent (no responder left), is a no-op.
+async fn release_one(weak: Weak<Mutex<Entry>>) {
+    let Some(entry) = weak.upgrade() else {
+        return; // The waiter is gone.
+    };
+    let mut e = entry.lock().await;
+    if let (Some(receipt), Some(resp)) = (e.receipt.clone(), e.responder.take()) {
+        let _ = resp.send(Ok(ReceiptResponse { receipt }));
     }
 }
 
@@ -424,7 +432,7 @@ impl PendingReceipts {
 /// entry dies right there. `Drop` also reaps the map slot, guarded by
 /// identity so a replacement registration is untouched, and refreshes
 /// the queue-depth gauge.
-pub struct PendingWait {
+pub(crate) struct PendingWait {
     rx: oneshot::Receiver<Result<ReceiptResponse, IngressError>>,
     key: (Address, u64),
     map: PendingMap,
@@ -432,7 +440,7 @@ pub struct PendingWait {
 }
 
 impl PendingWait {
-    pub async fn await_with_timeout(
+    pub(crate) async fn await_with_timeout(
         mut self,
         timeout: Duration,
     ) -> Result<ReceiptResponse, IngressError> {

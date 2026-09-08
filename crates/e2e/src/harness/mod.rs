@@ -126,12 +126,14 @@ impl LocalStack {
 
     /// Spawn the interop watcher (`kardamom-da-watcher` in interop mode)
     /// against `feed_url`, publishing remote epochs into this stack's Aeron
-    /// dir. `dest_rpc` is this stack's own JSON-RPC that serves
-    /// `eth_getStorageAt` (the validator feed URL) for the startup cursor
-    /// reconcile; `None` skips the reconcile. The caller owns the returned
-    /// process — the xchain scenario observes its exit (the pair-scoped
-    /// fail-stop) directly — and it still dies with the test via
-    /// `PR_SET_PDEATHSIG`, so nothing leaks.
+    /// dir. `cursor_reconcile` says whether (and where) it reconciles its
+    /// startup cursor against this stack's own JSON-RPC (the validator
+    /// feed URL) — building the pair at the caller, instead of taking a
+    /// raw `Option<&str>` here, means the invalid "a URL that is somehow
+    /// also skip" state cannot exist at this boundary. The caller owns the
+    /// returned process — the xchain scenario observes its exit (the
+    /// pair-scoped fail-stop) directly — and it still dies with the test
+    /// via `PR_SET_PDEATHSIG`, so nothing leaks.
     ///
     /// # Errors
     /// Returns an error when the binary is not built or the process fails
@@ -141,19 +143,20 @@ impl LocalStack {
         origin_chain_id: u64,
         feed_url: &str,
         cursor_file: &std::path::Path,
-        dest_rpc: Option<&str>,
+        cursor_reconcile: &kardamom_da_watcher::interop::CursorReconcile,
     ) -> Result<services::Spawned> {
         services::spawn_interop_watcher(
             &self.service_spec(),
             origin_chain_id,
             feed_url,
             cursor_file,
-            dest_rpc,
+            cursor_reconcile,
         )
     }
 
     /// Log files of the sealer cluster members, for scenarios that grep
     /// the sealer's stdout signals (`cluster REMOTE-ORIGIN-REJECT …`).
+    #[must_use]
     pub fn sealer_logs(&self) -> Vec<PathBuf> {
         self.sealer
             .procs

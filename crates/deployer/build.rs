@@ -14,6 +14,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
 
+#[path = "build_support/sol_watch.rs"]
+mod sol_watch;
+
 /// Solidity dependencies under `contracts/lib/`. `(dir_name, forge_install_spec)`.
 const LIB_DEPS: &[(&str, &str)] = &[
     ("forge-std", "foundry-rs/forge-std"),
@@ -49,21 +52,7 @@ fn main() -> Result<()> {
         .to_path_buf();
     let contracts_root = workspace_root.join("contracts");
 
-    // Add a rerun trigger for each .sol file, found recursively. This makes a
-    // new contract under contracts/src/<subdir>/ invalidate the cached build.
-    // Cargo's rerun-if-changed on a directory tracks only direct children,
-    // not subdirectories.
-    for entry in walk_sol_files(&contracts_root.join("src")) {
-        println!("cargo:rerun-if-changed={}", entry.display());
-    }
-    println!(
-        "cargo:rerun-if-changed={}",
-        contracts_root.join("src").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        contracts_root.join("foundry.toml").display()
-    );
+    sol_watch::emit_sol_rerun_triggers(&contracts_root);
     println!(
         "cargo:rerun-if-changed={}",
         contracts_root.join("remappings.txt").display()
@@ -186,28 +175,5 @@ fn hex_nibble(c: u8) -> Result<u8> {
         b'a'..=b'f' => Ok(c - b'a' + 10),
         b'A'..=b'F' => Ok(c - b'A' + 10),
         _ => Err(anyhow!("invalid hex char: {}", c as char)),
-    }
-}
-
-/// Return every `*.sol` file under `dir`, found recursively. This fills the
-/// `cargo:rerun-if-changed=...` list, so the build reruns when a contract is
-/// added or removed anywhere in the tree.
-fn walk_sol_files(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    walk_sol_files_into(dir, &mut out);
-    out
-}
-
-fn walk_sol_files_into(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk_sol_files_into(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("sol") {
-            out.push(path);
-        }
     }
 }

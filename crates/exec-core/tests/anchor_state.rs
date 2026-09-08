@@ -17,7 +17,7 @@ use bytes::Bytes as WireBytes;
 use kardamom_exec_core::anchor::{
     AnchorError, NodeStore, recompute_post_root, verify_witness_anchored,
 };
-use kardamom_exec_core::delta::PendingDelta;
+use kardamom_exec_core::delta::{AccountFields, PendingDelta};
 use kardamom_types::{ExecutionWitness, WitnessAccount, WitnessProofs, WitnessSlot};
 
 mod common;
@@ -229,14 +229,24 @@ fn honest_witness_verifies_and_recomputes_the_oracle_post_root() {
     // zeroed (a storage deletion collapse), B is untouched, and a FRESH
     // account is created.
     let mut delta = PendingDelta::new();
-    delta
-        .accounts
-        .insert(A, (6, U256::from(900_000), KECCAK_EMPTY));
+    delta.accounts.insert(
+        A,
+        AccountFields {
+            nonce: 6,
+            balance: U256::from(900_000),
+            code_hash: KECCAK_EMPTY,
+        },
+    );
     delta.storage.insert((A, S1), U256::from(1111));
     delta.storage.insert((A, S2), U256::ZERO);
-    delta
-        .accounts
-        .insert(FRESH, (0, U256::from(100_000), KECCAK_EMPTY));
+    delta.accounts.insert(
+        FRESH,
+        AccountFields {
+            nonce: 0,
+            balance: U256::from(100_000),
+            code_hash: KECCAK_EMPTY,
+        },
+    );
 
     // Witness for FRESH: the execution read it (absent) before creating it.
     let mut w = w;
@@ -404,7 +414,14 @@ fn emptying_a_preexisting_account_fails_closed() {
     // empty, which needs an account-trie deletion. Live execution
     // cannot reach this, and version 0 does not support it.
     let mut delta = PendingDelta::new();
-    delta.accounts.insert(B, (0, U256::ZERO, KECCAK_EMPTY));
+    delta.accounts.insert(
+        B,
+        AccountFields {
+            nonce: 0,
+            balance: U256::ZERO,
+            code_hash: KECCAK_EMPTY,
+        },
+    );
 
     let mut have: Vec<Bytes> = Vec::new();
     let err = loop {
@@ -434,7 +451,14 @@ fn emptying_a_preexisting_account_fails_closed() {
     });
     w2.accounts.sort_by_key(|a| a.address);
     let mut delta2 = PendingDelta::new();
-    delta2.accounts.insert(FRESH, (0, U256::ZERO, B256::ZERO));
+    delta2.accounts.insert(
+        FRESH,
+        AccountFields {
+            nonce: 0,
+            balance: U256::ZERO,
+            code_hash: B256::ZERO,
+        },
+    );
     let (post, _) = anchored(&all, |proofs| {
         let pre = verify_witness_anchored(&w2, proofs)?;
         recompute_post_root(proofs, &pre, &delta2)

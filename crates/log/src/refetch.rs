@@ -35,17 +35,17 @@
 //! driver) costs one short attempt before the mirror serves the range.
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use kardamom_types::{BPosition, Deposit, TxDataLoc, TxEnvelope};
 use rusteron_archive::AeronArchiveReplayParams;
-use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{info, warn};
 
-use crate::aeron_live::AeronRuntime;
+use crate::aeron_live::{AeronRuntime, PollRecv, TxDataSubscription, TypedSubscription};
 use crate::archive_catalog::ArchiveCatalog;
-use crate::config::AeronConfig;
+use crate::config::{AeronConfig, ChannelUri};
 use crate::error::LogError;
 use crate::recorder::{ArchiveSession, connect_archive_with_timeout};
 use crate::term_layout::TermLayout;
@@ -97,8 +97,8 @@ pub struct ArchiveRefetcher {
     /// refetches: a new bounded replay onto the same channel forms a fresh
     /// image on the same subscription. This map stays small, bounded by
     /// publisher restarts.
-    tx_data_subs: HashMap<(i32, i32), UnboundedReceiver<(TxDataLoc, TxEnvelope)>>,
-    deposit_subs: HashMap<(i32, i32), UnboundedReceiver<(BPosition, Deposit)>>,
+    tx_data_subs: HashMap<(i32, i32), TxDataSubscription>,
+    deposit_subs: HashMap<(i32, i32), TypedSubscription<Deposit>>,
 }
 
 /// A live archive control session and the endpoint it is connected to.
@@ -159,7 +159,7 @@ impl ArchiveRefetcher {
         stream_id: i32,
         session_id: i32,
         from: BPosition,
-        sink: &mut dyn FnMut(TxDataLoc, TxEnvelope),
+        mut sink: impl FnMut(TxDataLoc, TxEnvelope),
     ) -> Result<u64, LogError> {
         let endpoints = self.cfg.tx_data_endpoints.clone();
         self.ensure_session(&endpoints)?;
@@ -248,7 +248,7 @@ impl ArchiveRefetcher {
         &mut self,
         stream_id: i32,
         from: BPosition,
-        sink: &mut dyn FnMut(BPosition, Deposit),
+        mut sink: impl FnMut(BPosition, Deposit),
     ) -> Result<u64, LogError> {
         let endpoints = self.cfg.tx_deposits_endpoints.clone();
         self.ensure_session(&endpoints)?;
@@ -259,53 +259,77 @@ impl ArchiveRefetcher {
                 "refetch: no tx_deposits recordings (stream {stream_id}) on this archive"
             )));
         }
-        let mut delivered = 0u64;
+        // Compute each recording's replay plan up front (a real archive
+        // error here still propagates via `?`), then keep only the ones
+        // with something to replay. This is what lets the loop below
+        // skip an empty range without an `if` of its own.
+        let mut plans = Vec::with_capacity(recs.len());
         for rec in recs {
             let from_raw = rec
                 .raw_position(from)
                 .unwrap_or(rec.start_position)
                 .max(rec.start_position);
             let (len, endpoint) = self.replay_bounds(&rec, from_raw)?;
-            if len <= 0 {
-                continue;
-            }
-            let plan = ReplayPlan {
-                from_raw,
-                len,
-                endpoint,
-            };
+            plans.push((
+                rec,
+                ReplayPlan {
+                    from_raw,
+                    len,
+                    endpoint,
+                },
+            ));
+        }
 
-            // Subscription before replay start; see the matching comment
-            // in `fetch_tx_data`. Take it out of the map (or open a
-            // fresh one), and put it back once done, on every path.
-            let key = (stream_id, rec.session_id);
-            let mut rx = if let Some(rx) = self.deposit_subs.remove(&key) {
-                rx
-            } else {
-                let sub_uri = format!(
-                    "aeron:udp?endpoint={}|session-id={}",
-                    plan.endpoint, rec.session_id
-                );
-                self.ensure_runtime()?
-                    .open_subscription::<Deposit>(&sub_uri, stream_id)?
-            };
-
-            let session = self.ensure_session(&endpoints)?;
-            let replay_result = Self::start_bounded_replay(session, &rec, stream_id, &plan);
-            let this_delivered = if replay_result.is_ok() {
-                Self::drain(&mut rx, |(pos, dep)| sink(pos, dep))
-            } else {
-                0
-            };
-            self.deposit_subs.insert(key, rx);
-            if let Err(e) = replay_result {
-                warn!(error = %e, "refetch: deposit replay start failed; rotating endpoint");
-                self.rotate();
-                return Err(e);
-            }
-            delivered += this_delivered;
+        let mut delivered = 0u64;
+        for (rec, plan) in plans.into_iter().filter(|(_, plan)| plan.len > 0) {
+            delivered +=
+                self.replay_one_deposit_recording(stream_id, &endpoints, &rec, &plan, &mut sink)?;
         }
         info!(stream_id, delivered, "tx_deposits refetch drained");
+        Ok(delivered)
+    }
+
+    /// One deposit recording's replay, for [`Self::fetch_deposits`]'s loop:
+    /// swap its subscription in (or open a fresh one), replay the bounded
+    /// range, drain what arrives into `sink`, then swap the subscription
+    /// back. On a failed replay start, rotates the endpoint and returns
+    /// the error.
+    fn replay_one_deposit_recording(
+        &mut self,
+        stream_id: i32,
+        endpoints: &[String],
+        rec: &FoundRecording,
+        plan: &ReplayPlan,
+        sink: &mut impl FnMut(BPosition, Deposit),
+    ) -> Result<u64, LogError> {
+        // Subscription before replay start; see the matching comment in
+        // `fetch_tx_data`. Take it out of the map (or open a fresh one),
+        // and put it back once done, on every path.
+        let key = (stream_id, rec.session_id);
+        let mut rx = if let Some(rx) = self.deposit_subs.remove(&key) {
+            rx
+        } else {
+            let sub_uri = format!(
+                "aeron:udp?endpoint={}|session-id={}",
+                plan.endpoint, rec.session_id
+            );
+            self.ensure_runtime()?
+                .open_subscription::<Deposit>(&sub_uri, stream_id)?
+        };
+
+        let session = self.ensure_session(endpoints)?;
+        let replay_result = Self::start_bounded_replay(session, rec, stream_id, plan);
+        let delivered = if replay_result.is_ok() {
+            Self::drain(&mut rx, |(pos, dep)| sink(pos, dep))
+        } else {
+            0
+        };
+        self.deposit_subs.insert(key, rx);
+        if let Err(e) = replay_result {
+            warn!(error = %e, "refetch: deposit replay start failed; rotating endpoint");
+            self.rotate();
+            return Err(e);
+        }
         Ok(delivered)
     }
 
@@ -361,9 +385,12 @@ impl ArchiveRefetcher {
             let idx = self.next_endpoint.wrapping_add(attempt) % endpoints.len();
             let ep = &endpoints[idx];
             let mut acfg = self.cfg.aeron.clone();
-            acfg.archive_control_request_channel = format!("aeron:udp?endpoint={ep}");
-            acfg.archive_control_response_channel =
-                format!("aeron:udp?endpoint={}", self.cfg.response_endpoint);
+            acfg.archive_control_request_channel =
+                ChannelUri::new_trusted(format!("aeron:udp?endpoint={ep}"));
+            acfg.archive_control_response_channel = ChannelUri::new_trusted(format!(
+                "aeron:udp?endpoint={}",
+                self.cfg.response_endpoint
+            ));
             match connect_archive_with_timeout(
                 self.cfg.aeron_dir.as_deref(),
                 &acfg,
@@ -395,7 +422,14 @@ impl ArchiveRefetcher {
     }
 
     fn list_or_rotate(&mut self, stream_id: i32) -> Result<Vec<FoundRecording>, LogError> {
-        let session = &self.live.as_ref().expect("ensured by caller").session;
+        // Every caller runs `ensure_session` immediately before this, which
+        // returns `&mut self` right after, so the borrow cannot be passed
+        // through; re-deriving it here is what that forces.
+        let session = &self
+            .live
+            .as_ref()
+            .expect("ensure_session ran just above")
+            .session;
         match Self::list_recordings(session, stream_id) {
             Ok(recs) => Ok(recs),
             Err(e) => {
@@ -449,7 +483,14 @@ impl ArchiveRefetcher {
         rec: &FoundRecording,
         from_raw: i64,
     ) -> Result<(i64, String), LogError> {
-        let session = &self.live.as_ref().expect("ensured by caller").session;
+        // Same constraint as `list_or_rotate`: the caller's `ensure_session`
+        // borrow cannot cross this method's own `&mut self` rotate-on-error
+        // path, so it re-derives here instead.
+        let session = &self
+            .live
+            .as_ref()
+            .expect("ensure_session ran just above")
+            .session;
         let archive = &session.archive;
         // An active recording uses the current recorded position; a stopped
         // one uses its stop position.
@@ -523,23 +564,36 @@ impl ArchiveRefetcher {
     /// blocking receive with an idle timeout via [`recv_timeout`]: the
     /// thread parks on the channel and wakes on the next fragment. No
     /// `try_recv` + sleep busy loop, and no runtime of its own.
-    fn drain<T>(rx: &mut UnboundedReceiver<T>, mut deliver: impl FnMut(T)) -> u64 {
+    fn drain<S: PollRecv>(rx: &mut S, mut deliver: impl FnMut(S::Item)) -> u64 {
         let deadline = Instant::now() + DRAIN_CAP;
         let mut delivered = 0u64;
         loop {
-            let budget = DRAIN_IDLE.min(deadline.saturating_duration_since(Instant::now()));
-            if budget.is_zero() {
-                return delivered;
-            }
-            match recv_timeout(rx, budget) {
-                Ok(Some(item)) => {
-                    deliver(item);
-                    delivered += 1;
+            match drain_step(rx, deadline) {
+                ControlFlow::Break(()) => return delivered,
+                ControlFlow::Continue(item) => {
+                    delivered += {
+                        deliver(item);
+                        1
+                    }
                 }
-                // Idle timeout (replay exhausted) or channel closed (runtime gone).
-                Err(RecvTimeout) | Ok(None) => return delivered,
             }
         }
+    }
+}
+
+/// One [`ArchiveRefetcher::drain`] step: `Break` means the idle budget ran out
+/// or the source ended (replay exhausted, or the runtime is gone); either
+/// way the caller stops. `Continue` carries one item the caller delivers
+/// and counts.
+fn drain_step<S: PollRecv>(rx: &mut S, deadline: Instant) -> ControlFlow<(), S::Item> {
+    let budget = DRAIN_IDLE.min(deadline.saturating_duration_since(Instant::now()));
+    if budget.is_zero() {
+        return ControlFlow::Break(());
+    }
+    match recv_timeout(rx, budget) {
+        Ok(Some(item)) => ControlFlow::Continue(item),
+        // Idle timeout (replay exhausted) or channel closed (runtime gone).
+        Err(RecvTimeout) | Ok(None) => ControlFlow::Break(()),
     }
 }
 
@@ -570,8 +624,9 @@ impl FoundRecording {
 /// The wait in [`recv_timeout`] elapsed with nothing received.
 struct RecvTimeout;
 
-/// Blocking receive with a timeout on a tokio `UnboundedReceiver` from a
-/// thread that is NOT inside a tokio runtime. tokio's receiver only offers
+/// Blocking receive with a timeout on a [`PollRecv`] subscription from a
+/// thread that is NOT inside a tokio runtime. Both `PollRecv`
+/// implementations wrap a tokio `UnboundedReceiver`, which only offers
 /// `blocking_recv` (no timeout) and async `recv` (needs a timer for
 /// `timeout`), so this drives `poll_recv` by hand with a waker that unparks
 /// the calling thread: park until woken or the deadline, re-poll, repeat.
@@ -579,10 +634,10 @@ struct RecvTimeout;
 ///
 /// `Ok(None)` means the channel closed; `Err(RecvTimeout)` means the deadline
 /// passed.
-fn recv_timeout<T>(
-    rx: &mut UnboundedReceiver<T>,
+fn recv_timeout<S: PollRecv>(
+    rx: &mut S,
     timeout: Duration,
-) -> Result<Option<T>, RecvTimeout> {
+) -> Result<Option<S::Item>, RecvTimeout> {
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
 
@@ -596,19 +651,33 @@ fn recv_timeout<T>(
         }
     }
 
+    /// One poll-and-maybe-park step. `Break` carries [`recv_timeout`]'s
+    /// answer: a ready item, or a timeout past `deadline`. `Continue`
+    /// means the poll was pending and this thread parked until either
+    /// woken or `deadline`; the caller polls again.
+    fn step<S: PollRecv>(
+        rx: &mut S,
+        cx: &mut Context<'_>,
+        deadline: Instant,
+    ) -> ControlFlow<Result<Option<S::Item>, RecvTimeout>> {
+        if let Poll::Ready(item) = rx.poll_recv(cx) {
+            return ControlFlow::Break(Ok(item));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return ControlFlow::Break(Err(RecvTimeout));
+        }
+        std::thread::park_timeout(deadline - now);
+        ControlFlow::Continue(())
+    }
+
     let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
     let mut cx = Context::from_waker(&waker);
     let deadline = Instant::now() + timeout;
     loop {
-        match rx.poll_recv(&mut cx) {
-            Poll::Ready(item) => return Ok(item),
-            Poll::Pending => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(RecvTimeout);
-                }
-                std::thread::park_timeout(deadline - now);
-            }
+        match step(rx, &mut cx, deadline) {
+            ControlFlow::Break(result) => return result,
+            ControlFlow::Continue(()) => {}
         }
     }
 }

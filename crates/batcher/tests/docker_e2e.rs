@@ -73,41 +73,49 @@ async fn aeron_cluster_starts_and_batcher_round_trips_the_m_plus_one_topology() 
     .expect("open multi archive reader");
     assert_eq!(reader.a_archive_count(), 2);
 
-    for rec in reader {
-        match rec.expect("decode") {
-            ResolvedRecord::Tx { position, env, .. } => {
-                batcher.accumulator().observe_tx(env, position);
-            }
-            ResolvedRecord::RemoteEpoch { record, .. } => {
-                batcher.accumulator().observe_remote_epoch(record);
-            }
-            ResolvedRecord::Boundary { marker, .. } => {
-                let closed = batcher.accumulator().observe_boundary(&marker);
-                let pack = pack_blocks(&cfg, std::slice::from_ref(&closed)).expect("pack");
-                let reconstructed =
-                    reconstruct(&pack.blobs).expect("reconstruct round-trips the pipeline");
-                assert_eq!(reconstructed.len(), 1);
-                assert_eq!(reconstructed[0].block_number, 1);
-                assert_eq!(
-                    reconstructed[0].txs.len(),
-                    archives.canonical_order.len(),
-                    "resolved tx count should match the fixture"
-                );
-                // Canonical alternation: a0[0], a1[0], a0[1], a1[1].
-                let got: Vec<u64> = reconstructed[0]
-                    .txs
-                    .iter()
-                    .map(|tx| tx.correlation_id)
-                    .collect();
-                assert_eq!(got, archives.canonical_order);
-                batcher.on_closed_block(closed).expect("post");
-            }
-        }
-    }
+    reader.for_each(|rec| {
+        apply_resolved_record(
+            &mut batcher,
+            &cfg,
+            &archives.canonical_order,
+            rec.expect("decode"),
+        );
+    });
 
     assert_eq!(
         batcher.sender().sent.len(),
         1,
         "exactly one batch should have been forwarded to the sender"
     );
+}
+
+/// One resolved record from the multi-archive reader: feed it into the
+/// accumulator, or, at a boundary, pack the closed block, reconstruct it,
+/// and check the canonical alternation (a0\[0\], a1\[0\], a0\[1\], a1\[1\])
+/// against `canonical_order`.
+fn apply_resolved_record(
+    batcher: &mut Batcher<MockSender>,
+    cfg: &BatcherConfig,
+    canonical_order: &[u64],
+    rec: ResolvedRecord,
+) {
+    let Some(closed) = batcher.accumulator().observe(rec) else {
+        return;
+    };
+    let pack = pack_blocks(cfg, std::slice::from_ref(&closed)).expect("pack");
+    let reconstructed = reconstruct(&pack.blobs).expect("reconstruct round-trips the pipeline");
+    assert_eq!(reconstructed.len(), 1);
+    assert_eq!(reconstructed[0].block_number, 1);
+    assert_eq!(
+        reconstructed[0].txs.len(),
+        canonical_order.len(),
+        "resolved tx count should match the fixture"
+    );
+    let got: Vec<u64> = reconstructed[0]
+        .txs
+        .iter()
+        .map(|tx| tx.correlation_id)
+        .collect();
+    assert_eq!(got, canonical_order);
+    batcher.on_closed_block(closed).expect("post");
 }

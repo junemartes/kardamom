@@ -12,8 +12,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use kardamom_obs::testkit::free_udp_port;
 
-use super::proc::{ExistingFile, Proc, free_udp_port, resolve_artifact, wait_for_file};
+use super::proc::{ExistingFile, Proc, resolve_artifact, wait_for_file};
 
 /// Find the aeron-all jar. Use `KARDAMOM_AERON_ALL_JAR` if set, else the
 /// `just aeron-driver-up` cache path.
@@ -49,7 +50,11 @@ impl MediaDriver {
         let archive_dir = root.join("md-archive");
         std::fs::create_dir_all(&aeron_dir)?;
         std::fs::create_dir_all(&archive_dir)?;
-        let (ctrl, ctrl_rsp, repl) = (free_udp_port()?, free_udp_port()?, free_udp_port()?);
+        let (ctrl, ctrl_rsp, repl) = (
+            free_udp_port().port(),
+            free_udp_port().port(),
+            free_udp_port().port(),
+        );
 
         let mut cmd = Command::new("java");
         cmd.args([

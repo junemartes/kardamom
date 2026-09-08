@@ -24,18 +24,18 @@
 use thiserror::Error;
 
 /// SBE schema id for `io.aeron.cluster.codecs`.
-pub const SCHEMA_ID: u16 = 111;
+pub(crate) const SCHEMA_ID: u16 = 111;
 /// Schema version we encode at.
-pub const SCHEMA_VERSION: u16 = 16;
+pub(crate) const SCHEMA_VERSION: u16 = 16;
 /// SBE message header length in bytes.
-pub const HEADER_LEN: usize = 8;
+pub(crate) const HEADER_LEN: usize = 8;
 
-pub const TEMPLATE_SESSION_MESSAGE_HEADER: u16 = 1;
-pub const TEMPLATE_SESSION_EVENT: u16 = 2;
-pub const TEMPLATE_SESSION_CONNECT_REQUEST: u16 = 3;
-pub const TEMPLATE_SESSION_CLOSE_REQUEST: u16 = 4;
-pub const TEMPLATE_SESSION_KEEP_ALIVE: u16 = 5;
-pub const TEMPLATE_NEW_LEADER_EVENT: u16 = 6;
+pub(crate) const TEMPLATE_SESSION_MESSAGE_HEADER: u16 = 1;
+pub(crate) const TEMPLATE_SESSION_EVENT: u16 = 2;
+pub(crate) const TEMPLATE_SESSION_CONNECT_REQUEST: u16 = 3;
+pub(crate) const TEMPLATE_SESSION_CLOSE_REQUEST: u16 = 4;
+pub(crate) const TEMPLATE_SESSION_KEEP_ALIVE: u16 = 5;
+pub(crate) const TEMPLATE_NEW_LEADER_EVENT: u16 = 6;
 
 const BLOCK_SESSION_MESSAGE_HEADER: u16 = 24;
 #[cfg(test)]
@@ -65,7 +65,7 @@ pub enum EventCode {
 
 /// Errors decoding a cluster-protocol frame.
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum DecodeError {
+pub(crate) enum DecodeError {
     #[error("buffer too short: need {need} bytes at offset {at}, have {have}")]
     TooShort { at: usize, need: usize, have: usize },
     #[error("schema id mismatch: expected {SCHEMA_ID}, got {got}")]
@@ -79,7 +79,7 @@ pub enum DecodeError {
 
 /// Decoded SBE message header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MessageHeader {
+pub(crate) struct MessageHeader {
     pub block_length: u16,
     pub template_id: u16,
     pub schema_id: u16,
@@ -90,7 +90,7 @@ impl MessageHeader {
     /// # Errors
     ///
     /// Returns an error if `buf` is shorter than [`HEADER_LEN`].
-    pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+    pub(crate) fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
         Ok(Self {
             block_length: rd_u16(buf, 0)?,
             template_id: rd_u16(buf, 2)?,
@@ -220,7 +220,7 @@ fn put_var(buf: &mut Vec<u8>, bytes: &[u8]) {
 /// Encode a `SessionConnectRequest`. `app_version` is the client's semantic
 /// protocol version. `response_channel` is the client's egress channel URI.
 #[must_use]
-pub fn encode_session_connect_request(
+pub(crate) fn encode_session_connect_request(
     correlation_id: i64,
     response_stream_id: i32,
     app_version: i32,
@@ -247,7 +247,7 @@ pub fn encode_session_connect_request(
 /// only encodes this message, never decodes it back.
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionConnectRequest {
+pub(crate) struct SessionConnectRequest {
     pub correlation_id: i64,
     pub response_stream_id: i32,
     pub app_version: i32,
@@ -261,7 +261,9 @@ pub struct SessionConnectRequest {
 /// Returns an error if `buf` is too short, its schema id does not match,
 /// or its template id is not `SessionConnectRequest`.
 #[cfg(test)]
-pub fn decode_session_connect_request(buf: &[u8]) -> Result<SessionConnectRequest, DecodeError> {
+pub(crate) fn decode_session_connect_request(
+    buf: &[u8],
+) -> Result<SessionConnectRequest, DecodeError> {
     let f = Frame::parse(buf)?.expect_template(TEMPLATE_SESSION_CONNECT_REQUEST)?;
     let body = f.body;
     let correlation_id = rd_i64(body, 0)?;
@@ -293,7 +295,10 @@ fn encode_two_i64(block_length: u16, template_id: u16, a: i64, b: i64) -> Vec<u8
 }
 
 #[must_use]
-pub fn encode_session_keep_alive(leadership_term_id: i64, cluster_session_id: i64) -> Vec<u8> {
+pub(crate) fn encode_session_keep_alive(
+    leadership_term_id: i64,
+    cluster_session_id: i64,
+) -> Vec<u8> {
     encode_two_i64(
         BLOCK_SESSION_KEEP_ALIVE,
         TEMPLATE_SESSION_KEEP_ALIVE,
@@ -303,7 +308,10 @@ pub fn encode_session_keep_alive(leadership_term_id: i64, cluster_session_id: i6
 }
 
 #[must_use]
-pub fn encode_session_close_request(leadership_term_id: i64, cluster_session_id: i64) -> Vec<u8> {
+pub(crate) fn encode_session_close_request(
+    leadership_term_id: i64,
+    cluster_session_id: i64,
+) -> Vec<u8> {
     encode_two_i64(
         BLOCK_SESSION_CLOSE_REQUEST,
         TEMPLATE_SESSION_CLOSE_REQUEST,
@@ -321,7 +329,7 @@ pub fn encode_session_close_request(leadership_term_id: i64, cluster_session_id:
 /// or its template id is not `want_template`. Test-only: the live client
 /// only encodes `KeepAlive`/`CloseRequest`, never decodes them back.
 #[cfg(test)]
-pub fn decode_two_i64(buf: &[u8], want_template: u16) -> Result<(i64, i64), DecodeError> {
+pub(crate) fn decode_two_i64(buf: &[u8], want_template: u16) -> Result<(i64, i64), DecodeError> {
     let f = Frame::parse(buf)?.expect_template(want_template)?;
     Ok((rd_i64(f.body, 0)?, rd_i64(f.body, 8)?))
 }
@@ -330,7 +338,7 @@ pub fn decode_two_i64(buf: &[u8], want_template: u16) -> Result<(i64, i64), Deco
 
 /// Wrap an application `payload` in a `SessionMessageHeader` for ingress.
 #[must_use]
-pub fn wrap_session_message(
+pub(crate) fn wrap_session_message(
     leadership_term_id: i64,
     cluster_session_id: i64,
     timestamp: i64,
@@ -352,7 +360,7 @@ pub fn wrap_session_message(
 
 /// A decoded egress `SessionMessageHeader` plus its application payload slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionMessage<'a> {
+pub(crate) struct SessionMessage<'a> {
     pub leadership_term_id: i64,
     pub cluster_session_id: i64,
     pub timestamp: i64,
@@ -362,7 +370,7 @@ pub struct SessionMessage<'a> {
 // ── SessionEvent (egress) ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionEvent {
+pub(crate) struct SessionEvent {
     pub cluster_session_id: i64,
     pub correlation_id: i64,
     pub leadership_term_id: i64,
@@ -377,7 +385,7 @@ pub struct SessionEvent {
 /// decodes this message (a server sends it), never encodes it.
 #[cfg(test)]
 #[must_use]
-pub fn encode_session_event(ev: &SessionEvent) -> Vec<u8> {
+pub(crate) fn encode_session_event(ev: &SessionEvent) -> Vec<u8> {
     let mut b = Vec::new();
     put_header(&mut b, BLOCK_SESSION_EVENT_MIN, TEMPLATE_SESSION_EVENT);
     b.extend_from_slice(&ev.cluster_session_id.to_le_bytes());
@@ -411,7 +419,7 @@ fn decode_session_event(h: MessageHeader, body: &[u8]) -> Result<SessionEvent, D
 // ── NewLeaderEvent (egress) ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewLeaderEvent {
+pub(crate) struct NewLeaderEvent {
     pub leadership_term_id: i64,
     pub cluster_session_id: i64,
     pub leader_member_id: i32,
@@ -423,7 +431,7 @@ pub struct NewLeaderEvent {
 /// message (a server sends it), never encodes it.
 #[cfg(test)]
 #[must_use]
-pub fn encode_new_leader_event(ev: &NewLeaderEvent) -> Vec<u8> {
+pub(crate) fn encode_new_leader_event(ev: &NewLeaderEvent) -> Vec<u8> {
     let mut b = Vec::new();
     put_header(&mut b, BLOCK_NEW_LEADER_EVENT, TEMPLATE_NEW_LEADER_EVENT);
     b.extend_from_slice(&ev.leadership_term_id.to_le_bytes());
@@ -451,7 +459,7 @@ fn decode_new_leader_event(h: MessageHeader, body: &[u8]) -> Result<NewLeaderEve
 /// A decoded egress frame from the cluster. `Other` keeps the template id
 /// for any message the client does not act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Egress<'a> {
+pub(crate) enum Egress<'a> {
     SessionEvent(SessionEvent),
     NewLeader(NewLeaderEvent),
     SessionMessage(SessionMessage<'a>),
@@ -465,7 +473,7 @@ pub enum Egress<'a> {
 /// Returns an error if `buf` is too short, or its schema id does not
 /// match. An unrecognized template id is not an error: it decodes as
 /// [`Egress::Other`].
-pub fn decode_egress(buf: &[u8]) -> Result<Egress<'_>, DecodeError> {
+pub(crate) fn decode_egress(buf: &[u8]) -> Result<Egress<'_>, DecodeError> {
     let f = Frame::parse(buf)?;
     match f.header.template_id {
         TEMPLATE_SESSION_EVENT => Ok(Egress::SessionEvent(decode_session_event(

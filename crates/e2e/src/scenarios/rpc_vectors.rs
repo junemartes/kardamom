@@ -190,34 +190,60 @@ fn encode_2718<T: Encodable2718>(signed: T) -> Vec<u8> {
 /// comments and blank lines. Every `>>` line must be followed by a `<<`
 /// line.
 fn parse(text: &str) -> Result<Vec<(Value, Value)>> {
-    let mut out = Vec::new();
-    let mut pending: Option<Value> = None;
-    for (ln, line) in text.lines().enumerate() {
-        let line = line.trim();
+    let mut parser = VectorParser::default();
+    text.lines()
+        .enumerate()
+        .try_for_each(|(ln, line)| parser.parse_line(ln, line.trim()))?;
+    parser.finish()
+}
+
+/// State for parsing a vector file's `>> request` / `<< expectation` line
+/// pairs: the request stashed by a `>>` line, awaiting its `<<`
+/// expectation, and the pairs parsed so far.
+#[derive(Default)]
+struct VectorParser {
+    pending: Option<Value>,
+    out: Vec<(Value, Value)>,
+}
+
+impl VectorParser {
+    /// One line: skip a comment or a blank line, stash a `>>` request, or
+    /// pair a `<<` expectation with the stashed request.
+    fn parse_line(&mut self, ln: usize, line: &str) -> Result<()> {
         if line.is_empty() || line.starts_with('#') {
-            continue;
+            return Ok(());
         }
         if let Some(req) = line.strip_prefix(">> ") {
             ensure!(
-                pending.is_none(),
+                self.pending.is_none(),
                 "line {}: request without expectation",
                 ln + 1
             );
-            pending = Some(serde_json::from_str(req).with_context(|| format!("line {}", ln + 1))?);
+            self.pending =
+                Some(serde_json::from_str(req).with_context(|| format!("line {}", ln + 1))?);
         } else if let Some(exp) = line.strip_prefix("<< ") {
-            let req = pending
+            let req = self
+                .pending
                 .take()
                 .with_context(|| format!("line {}: expectation without request", ln + 1))?;
-            out.push((
+            self.out.push((
                 req,
                 serde_json::from_str(exp).with_context(|| format!("line {}", ln + 1))?,
             ));
         } else {
             bail!("line {}: expected '>> ', '<< ', or comment", ln + 1);
         }
+        Ok(())
     }
-    ensure!(pending.is_none(), "trailing request without expectation");
-    Ok(out)
+
+    /// The parsed pairs, once the file is fully read.
+    fn finish(self) -> Result<Vec<(Value, Value)>> {
+        ensure!(
+            self.pending.is_none(),
+            "trailing request without expectation"
+        );
+        Ok(self.out)
+    }
 }
 
 /// Replace whole-string `${NAME}` tokens. The matchers `${ANY}` and
@@ -263,15 +289,12 @@ fn matches(expect: &Value, actual: &Value) -> Result<()> {
             ensure!(e.eq_ignore_ascii_case(a), "hex mismatch: want {e}, got {a}");
             Ok(())
         }
-        (Value::Object(e), Value::Object(a)) => {
-            for (k, ev) in e {
-                let av = a
-                    .get(k)
-                    .with_context(|| format!("missing key {k:?} (want {ev})"))?;
-                matches(ev, av).with_context(|| format!("at key {k:?}"))?;
-            }
-            Ok(())
-        }
+        (Value::Object(e), Value::Object(a)) => e.iter().try_for_each(|(k, ev)| {
+            let av = a
+                .get(k)
+                .with_context(|| format!("missing key {k:?} (want {ev})"))?;
+            matches(ev, av).with_context(|| format!("at key {k:?}"))
+        }),
         (Value::Array(e), Value::Array(a)) => {
             ensure!(
                 e.len() == a.len(),
@@ -279,10 +302,9 @@ fn matches(expect: &Value, actual: &Value) -> Result<()> {
                 e.len(),
                 a.len()
             );
-            for (i, (ev, av)) in e.iter().zip(a).enumerate() {
-                matches(ev, av).with_context(|| format!("at index {i}"))?;
-            }
-            Ok(())
+            e.iter().zip(a).enumerate().try_for_each(|(i, (ev, av))| {
+                matches(ev, av).with_context(|| format!("at index {i}"))
+            })
         }
         _ => {
             ensure!(expect == actual, "want {expect}, got {actual}");

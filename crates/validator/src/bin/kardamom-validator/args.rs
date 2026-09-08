@@ -9,6 +9,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_engine::bin_support::StateDurabilityArg;
 use kardamom_engine::reader::cluster::ClusterConfig;
+use kardamom_validator::interop::{
+    DEFAULT_FEED_MAX_SUBSCRIPTIONS, DEFAULT_FEED_MAX_SUBSCRIPTIONS_PER_DEST, RetentionBlocks,
+};
 
 /// Default `--shards`.
 const DEFAULT_SHARDS: NonZeroU8 = NonZeroU8::new(8).expect("compile-time constant");
@@ -19,12 +22,11 @@ const DEFAULT_CHAIN_ID: NonZeroU64 = NonZeroU64::new(1).expect("compile-time con
 const DEFAULT_VALIDATION_BATCH_SIZE: NonZeroUsize =
     NonZeroUsize::new(8).expect("compile-time constant");
 /// Default `--attester-post-interval`.
-const DEFAULT_ATTESTER_POST_INTERVAL: NonZeroU64 =
-    NonZeroU64::new(1).expect("compile-time constant");
+const DEFAULT_ATTESTER_POST_INTERVAL: PostInterval =
+    PostInterval::new(NonZeroU64::new(1).expect("compile-time constant"));
 /// Default `--feed-retention-blocks`.
-const DEFAULT_FEED_RETENTION_BLOCKS: NonZeroU64 =
-    NonZeroU64::new(1024).expect("compile-time constant");
-
+const DEFAULT_FEED_RETENTION_BLOCKS: RetentionBlocks =
+    RetentionBlocks::new(NonZeroU64::new(1024).expect("compile-time constant"));
 /// Top-level config the `kardamom-validator` binary deserializes from
 /// `--config`. Same `[cluster]` section shape as the executor's.
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -126,8 +128,8 @@ pub(crate) struct Args {
 
     // --- L1 output attestation: all three flags are required to enable it. ---
     /// L1 JSON-RPC endpoint the attester posts withdrawal outputs to.
-    #[arg(long, env = "KARDAMOM_L1_RPC_URL")]
-    pub(crate) l1_rpc_url: Option<String>,
+    #[arg(long, env = "KARDAMOM_L1_RPC_URL", value_parser = parse_l1_rpc_url)]
+    pub(crate) l1_rpc_url: Option<reqwest::Url>,
     /// Address of the deployed `WithdrawalOutputOracle` proxy.
     #[arg(long, env = "KARDAMOM_OUTPUT_ORACLE")]
     pub(crate) output_oracle: Option<alloy_primitives::Address>,
@@ -140,9 +142,9 @@ pub(crate) struct Args {
     pub(crate) lockbox: Option<alloy_primitives::Address>,
     /// Attester private key: raw hex, or `env:VAR` to read it from the
     /// environment, the deployer's key convention. Must be the oracle's
-    /// permissioned `attester`.
-    #[arg(long, env = "KARDAMOM_ATTESTER_KEY")]
-    pub(crate) attester_key: Option<String>,
+    /// permissioned `attester`. Resolved into a signer at parse time.
+    #[arg(long, env = "KARDAMOM_ATTESTER_KEY", value_parser = AttesterKey::parse)]
+    pub(crate) attester_key: Option<AttesterKey>,
     /// Post one L1 output per this many L2 blocks.
     /// Re-execute each block as seeded parallel batches, driven by the
     /// EIP-7928 BAL. Falls back
@@ -169,11 +171,11 @@ pub(crate) struct Args {
     /// (`min(available_parallelism, 8)`). Hard-capped at 40, since the
     /// mdbx reader-slot budget (`MAX_READERS = 64`) reserves the rest for
     /// the exec thread, RPC, and compaction.
-    #[arg(long, env = "KARDAMOM_VALIDATION_WORKERS", default_value_t = 0)]
-    pub(crate) validation_workers: usize,
+    #[arg(long, env = "KARDAMOM_VALIDATION_WORKERS", default_value_t = WorkerCount::Auto)]
+    pub(crate) validation_workers: WorkerCount,
 
     #[arg(long, env = "KARDAMOM_ATTESTER_POST_INTERVAL", default_value_t = DEFAULT_ATTESTER_POST_INTERVAL)]
-    pub(crate) attester_post_interval: NonZeroU64,
+    pub(crate) attester_post_interval: PostInterval,
 
     // --- Interop serving surfaces (the outbox and attestation feeds) -----
     /// Enable the interop feed server on this address (`host:port`; port 0
@@ -187,29 +189,62 @@ pub(crate) struct Args {
     /// A subscriber whose cursor falls below the window is told `Lagged`;
     /// deeper backfill is a v2 concern (the data is in DA).
     #[arg(long, env = "KARDAMOM_FEED_RETENTION_BLOCKS", default_value_t = DEFAULT_FEED_RETENTION_BLOCKS)]
-    pub(crate) feed_retention_blocks: NonZeroU64,
+    pub(crate) feed_retention_blocks: RetentionBlocks,
     /// Cap on live feed subscriptions of both kinds (outbox and
     /// attestations) across all clients. A subscribe over the cap gets an
     /// RPC error. Default 256.
-    #[arg(long, env = "KARDAMOM_FEED_MAX_SUBSCRIPTIONS", default_value_t = 256)]
-    pub feed_max_subscriptions: usize,
+    #[arg(
+        long,
+        env = "KARDAMOM_FEED_MAX_SUBSCRIPTIONS",
+        default_value_t = DEFAULT_FEED_MAX_SUBSCRIPTIONS
+    )]
+    pub feed_max_subscriptions: NonZeroUsize,
     /// Cap on live outbox subscriptions for one destination chain. A
     /// subscribe over the cap gets an RPC error. Default 8.
     #[arg(
         long,
         env = "KARDAMOM_FEED_MAX_SUBSCRIPTIONS_PER_DEST",
-        default_value_t = 8
+        default_value_t = DEFAULT_FEED_MAX_SUBSCRIPTIONS_PER_DEST
     )]
-    pub feed_max_subscriptions_per_dest: usize,
+    pub feed_max_subscriptions_per_dest: NonZeroUsize,
     /// File the feed server's actually-bound address is written to
     /// (`host:port` + newline), for harnesses that pass port 0.
     #[arg(long, env = "KARDAMOM_SERVE_FEED_ADDR_FILE")]
     pub(crate) serve_feed_addr_file: Option<PathBuf>,
 }
 
+/// The attester's private key, parsed once at the CLI boundary: `env:VAR`
+/// (the deployer's key convention) is read from the environment
+/// immediately, and the result is parsed into a signer. Downstream code
+/// (`Written::spawn_attester`) takes the resolved signer directly, and
+/// never re-parses the raw flag value.
+// `PrivateKeySigner`'s own `Debug` impl prints only the address and chain
+// id, never the key material, so deriving `Debug` here (required for
+// `Args`'s own derive) does not log the secret.
+#[derive(Debug, Clone)]
+pub(crate) struct AttesterKey(PrivateKeySigner);
+
+impl AttesterKey {
+    #[must_use]
+    pub(crate) fn into_signer(self) -> PrivateKeySigner {
+        self.0
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error (as a `String`, clap's custom-parser convention)
+    /// if `key` names an unset `env:VAR`, or its resolved value is not a
+    /// valid private key.
+    fn parse(key: &str) -> std::result::Result<Self, String> {
+        resolve_attester_key(key)
+            .map(Self)
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Resolve the attester key flag: raw hex, or `env:VAR`, the deployer's
 /// key convention, read from the environment; then parse it into a signer.
-pub(crate) fn resolve_attester_key(key: &str) -> Result<PrivateKeySigner> {
+fn resolve_attester_key(key: &str) -> Result<PrivateKeySigner> {
     let raw = match key.strip_prefix("env:") {
         Some(var) => {
             std::env::var(var).with_context(|| format!("read attester key from env var {var}"))?
@@ -218,4 +253,80 @@ pub(crate) fn resolve_attester_key(key: &str) -> Result<PrivateKeySigner> {
     };
     let hex = raw.trim().trim_start_matches("0x");
     PrivateKeySigner::from_str(hex).context("parse attester private key")
+}
+
+/// `--l1-rpc-url`'s `clap` value parser: parses once at the CLI boundary,
+/// so `Written::spawn_attester` takes an already-valid `reqwest::Url`
+/// instead of parsing the flag's raw string itself.
+fn parse_l1_rpc_url(s: &str) -> std::result::Result<reqwest::Url, String> {
+    s.parse::<reqwest::Url>().map_err(|e| e.to_string())
+}
+
+/// Blocks between L1 output posts, parsed once at the CLI boundary. A
+/// `NonZeroU64` wrapper by name: distinguishes "how many blocks between
+/// posts" from any other `NonZeroU64` this crate threads (for example
+/// [`kardamom_validator::interop::RetentionBlocks`]) at every call site
+/// that takes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PostInterval(NonZeroU64);
+
+impl PostInterval {
+    #[must_use]
+    pub(crate) const fn new(n: NonZeroU64) -> Self {
+        Self(n)
+    }
+
+    #[must_use]
+    pub(crate) fn get(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
+impl FromStr for PostInterval {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
+
+impl std::fmt::Display for PostInterval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Worker threads in the parallel-validation pool, parsed once at the CLI
+/// boundary: `--validation-workers 0` (or unset) is `Auto`, resolved to
+/// `min(available_parallelism, 8)` at the one call site
+/// (`build_block_exec`); anything else is a caller-fixed `Fixed` count,
+/// hard-capped at 40 there. The `0`-means-auto sentinel is parsed into
+/// this type once, instead of `build_block_exec` re-deriving "auto" from
+/// a bare `usize` via `NonZeroUsize::new(..).is_none()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerCount {
+    Auto,
+    Fixed(NonZeroUsize),
+}
+
+impl FromStr for WorkerCount {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.parse::<usize>()? {
+            0 => Ok(Self::Auto),
+            n => Ok(Self::Fixed(
+                NonZeroUsize::new(n).expect("n != 0, matched above"),
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "0"),
+            Self::Fixed(n) => write!(f, "{n}"),
+        }
+    }
 }

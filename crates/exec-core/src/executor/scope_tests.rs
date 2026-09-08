@@ -7,7 +7,7 @@ use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSignerSync;
 use alloy_primitives::Bytes as AlloyBytes;
-use alloy_primitives::{TxKind as APTxKind, U256, address, keccak256};
+use alloy_primitives::{B256, TxKind as APTxKind, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
 use kardamom_types::TxEnvelope as KtTxEnvelope;
@@ -156,7 +156,7 @@ fn simple_transfer_produces_write_set_and_success_receipt() {
     // the recipient (balance).
     assert!(ws.account(&from).is_some());
     assert!(ws.account(&to).is_some());
-    assert_eq!(ws.account(&to).unwrap().1, U256::from(1_000u64));
+    assert_eq!(ws.account(&to).unwrap().balance, U256::from(1_000u64));
     // No storage or code writes for a plain transfer.
     assert!(ws.storage.is_empty());
     assert!(ws.code.is_empty());
@@ -216,8 +216,8 @@ fn second_tx_sees_first_tx_balance_via_delta() {
     );
     assert!(r2.status);
     assert_eq!(r2.tx_hash, tx2.tx_hash);
-    assert_eq!(ws2.account(&to).unwrap().1, U256::from(150u64));
-    assert_eq!(ws2.account(&from).unwrap().0, 2); // nonce
+    assert_eq!(ws2.account(&to).unwrap().balance, U256::from(150u64));
+    assert_eq!(ws2.account(&from).unwrap().nonce, 2); // nonce
     // RPC enrichment: tx2 sees a higher nonce and transaction_index.
     // cumulative_gas_used adds up across both txs in the block.
     assert_eq!(r2.nonce, 1);
@@ -322,4 +322,50 @@ fn execute_tx_captures_with_a_seeded_delta() {
             || a.nonce_changes.iter().any(|c| c.block_access_index == 2)
     });
     assert!(has_tx2, "tx2's claims missing from BAL: {alloy:?}");
+}
+
+/// A deposit that revm rejects at validation returns a failed receipt,
+/// not an error, on the block scope. The scope keeps running: a normal
+/// tx right after it still executes.
+#[test]
+fn deposit_validation_failure_on_the_scope_does_not_poison_the_block() {
+    let signer = PrivateKeySigner::random();
+    let from = signer.address();
+    let to = address!("0000000000000000000000000000000000004321");
+    let snap = MockStateDatabase::builder()
+        .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
+        .build();
+    let env = ExecEnv::new(1, &boundary(1));
+    let mut scope = Executor::new(&snap, None, env).expect("scope");
+
+    // `gas_limit: 0` is below the intrinsic cost: revm rejects it at
+    // validation.
+    let deposit = kardamom_types::Deposit {
+        source_hash: B256::repeat_byte(0x11),
+        from,
+        to: Some(to),
+        mint: 1_000,
+        value: U256::ZERO,
+        gas_limit: 0,
+        is_system_transaction: false,
+        input: Bytes::new(),
+    };
+    let (receipt, ws) = scope
+        .execute_deposit(slot(0, 0, 0, 0), &deposit, None)
+        .expect("a failed receipt, not an error");
+    assert!(receipt.is_invalid_skip());
+    assert_eq!(receipt.skip_reason, Some(SkipReason::GasLimit));
+    // The mint stays even though the inner call never ran.
+    assert_eq!(
+        ws.account(&from).unwrap().balance,
+        U256::from(10u128.pow(18) + 1_000)
+    );
+
+    // The scope keeps running: the sender's real next tx still executes.
+    let tx = signed_transfer(&signer, to, 1_000, 0);
+    let (r2, _) = scope
+        .execute_tx(slot(1, 1, 1, receipt.cumulative_gas_used), &tx, None, None)
+        .expect("execute");
+    assert!(r2.status);
+    assert!(!r2.is_invalid_skip());
 }

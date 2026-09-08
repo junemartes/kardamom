@@ -6,17 +6,11 @@ use core::num::NonZeroU32;
 /// Always at least 1, so a routing computation that divides by it can
 /// never divide by zero.
 ///
-/// Phase B: `ingress/src/routing.rs`'s `partition_count_m` guards this
-/// invariant today with only a `debug_assert!`, compiled out in release,
-/// so a zero `--shards` value divides by zero at runtime instead of
-/// failing at startup. Parsing the CLI `shards` argument
+/// Parse the CLI `shards` argument into this type at the boundary
 /// (`ingress/src/bin/kardamom-ingress/main.rs`,
-/// `executor/src/bin/kardamom-executor/args.rs`) into `ShardCount`, and
-/// changing `ingress/src/config.rs`'s field to match, moves the check to
-/// the boundary; `engine/src/bin_support.rs` and
-/// `bench/src/harness/inprocess.rs` would then read `.get()` instead of a
-/// raw `u32`. Not done here: every one of those sites is outside
-/// `crates/types`.
+/// `executor/src/bin/kardamom-executor/args.rs`), and read `.get()`
+/// downstream, so a zero shard count fails at startup instead of reaching
+/// a routing computation that divides by it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ShardCount(NonZeroU32);
 

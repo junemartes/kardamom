@@ -39,23 +39,28 @@ pub fn run_capture<S: StateDatabase>(
         let mut cumulative = 0u64;
         for (i, envelope) in block.iter().enumerate() {
             let mut bal = revm::state::bal::Bal::new();
+            let slot = kardamom_engine::exec_types::TxSlot {
+                tx_idx: TxIndex(global),
+                tx_position: BPosition::from_index(global),
+                tx_index_in_block: i as u64,
+                cumulative_gas_used_before: cumulative,
+            };
             let (receipt, ws) = Executor::execute_once(
                 snap,
                 None,
                 &delta,
                 env,
-                TxIndex(global),
-                BPosition::from_index(global),
+                slot,
                 envelope,
-                i as u64,
-                cumulative,
                 // This is a per-transaction Bal at index 1: this transaction's
                 // touches are the whole list, so reads attribute exactly.
                 Some((&mut bal, 1)),
             )
             .expect("capture execute");
             if !receipt.status {
-                let (to, selector, args, _) = envelope_view(&envelope.raw_tx);
+                let kardamom_footprint::EnvelopeView {
+                    to, selector, args, ..
+                } = envelope_view(&envelope.raw_tx);
                 panic!(
                     "capture tx failed (block {bi} idx {i}): sender={} to={:?} selector={:02x?} args0={:?}",
                     envelope.sender,
@@ -66,7 +71,12 @@ pub fn run_capture<S: StateDatabase>(
             }
             cumulative = receipt.cumulative_gas_used;
 
-            let (to, selector, args, has_value) = envelope_view(&envelope.raw_tx);
+            let kardamom_footprint::EnvelopeView {
+                to,
+                selector,
+                args,
+                has_value,
+            } = envelope_view(&envelope.raw_tx);
             let mut reads = Vec::new();
             let mut writes = Vec::new();
             let alloy_bal = bal.into_alloy_bal();

@@ -1,5 +1,5 @@
 use super::config::MAX_BLOCK_TXS;
-use super::config::nanos;
+use super::config::{BlockTxCount, nanos};
 use super::metrics::{Metrics, PaddedLen, TxResult};
 use super::recycle::RecyclePools;
 use super::session::BoundLayers;
@@ -281,6 +281,56 @@ pub(super) struct BlockCtx<S: StateDatabase> {
     pub(super) metrics: Metrics,
 }
 
+/// A completing node's ready-children buffer: the first 8 stay on the
+/// stack; the rest spill to a heap `Vec`. No per-completion allocation
+/// on the common case, where a node has few children.
+#[derive(Default)]
+struct ReadyBuf {
+    buf: [u32; 8],
+    n: usize,
+    spill: Vec<u32>,
+}
+
+impl ReadyBuf {
+    fn push(&mut self, c: u32) {
+        if self.n < self.buf.len() {
+            self.buf[self.n] = c;
+            self.n += 1;
+        } else {
+            self.spill.push(c);
+        }
+    }
+
+    /// Every buffered index, stack entries first, then the spill.
+    fn drain(&mut self) -> impl Iterator<Item = u32> + '_ {
+        self.buf[..self.n]
+            .iter()
+            .copied()
+            .chain(self.spill.drain(..))
+    }
+}
+
+/// The prune pass's cross-worker ready set: each entry names the
+/// worker a newly-ready child was assigned to, so `prune` can hand it
+/// off once every worker's completed buffer has drained.
+#[derive(Default)]
+struct ReadySet(Vec<(usize, u32)>);
+
+impl ReadySet {
+    fn push(&mut self, worker: usize, idx: u32) {
+        self.0.push((worker, idx));
+    }
+}
+
+impl IntoIterator for ReadySet {
+    type Item = (usize, u32);
+    type IntoIter = std::vec::IntoIter<(usize, u32)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 /// Lock order (the engine's one hard rule): the graph lock may be taken
 /// while holding nothing, and a queue lock may be taken while holding
 /// nothing or the graph lock's results, but never while the graph lock
@@ -295,6 +345,22 @@ impl<S: StateDatabase> BlockCtx<S> {
         for q in &self.queues {
             q.cv.notify_all();
         }
+    }
+
+    /// Index `idx`'s envelope slot, pairing the index with the
+    /// invariant every reader relies on: admission sets a slot before
+    /// the index that names it becomes visible (through the ready
+    /// queue, the bag, or a batch flush), so every later read here
+    /// finds it populated.
+    ///
+    /// # Panics
+    /// Panics if the slot is unset, which means an index reached a
+    /// reader before admission finished writing it: a scheduler
+    /// invariant violation, not a caller contract.
+    pub(super) fn slot(&self, idx: usize) -> &TxSlot {
+        self.slots[idx]
+            .get()
+            .expect("admission sets a slot before its index becomes visible")
     }
 
     /// This block's read base, once [`LayerBinder::bind`](super::session::LayerBinder::bind)
@@ -374,20 +440,19 @@ impl<S: StateDatabase> BlockCtx<S> {
     /// front holds the oldest entries, most likely to have warm state,
     /// and the two ends rarely contend.
     pub(super) fn steal(&self, thief: usize) -> Option<u32> {
-        let mut best: Option<(usize, usize)> = None;
-        for (w, qh) in self.queues.iter().enumerate() {
-            if w == thief {
-                continue;
-            }
-            // Hint only; the victim's own lock confirms below.
-            let len = qh.len.load(Ordering::Acquire);
-            // Any queued transaction is stealable; queues hold 0 or 1
-            // items almost always, since a domain releases one ready
-            // transaction at a time under DAG chains.
-            if len >= 1 && best.is_none_or(|(_, b)| len > b) {
-                best = Some((w, len));
-            }
-        }
+        // Any queued transaction is stealable; queues hold 0 or 1 items
+        // almost always, since a domain releases one ready transaction
+        // at a time under DAG chains. Hint lengths only; the victim's
+        // own lock confirms below. Ties keep the earliest worker index,
+        // matching a left-to-right scan.
+        let best = self
+            .queues
+            .iter()
+            .enumerate()
+            .filter(|&(w, _)| w != thief)
+            .map(|(w, qh)| (w, qh.len.load(Ordering::Acquire)))
+            .filter(|&(_, len)| len >= 1)
+            .max_by_key(|&(w, len)| (len, std::cmp::Reverse(w)));
         let (victim, _) = best?;
         let vq = &self.queues[victim];
         // Verification stays under the victim's lock, deliberately. This
@@ -420,11 +485,12 @@ impl<S: StateDatabase> BlockCtx<S> {
             // is irrelevant, since coverage is off in bag mode (every
             // dependency is an edge).
             self.bag.push(idx);
-            for qh in &self.queues {
-                if qh.parked.load(Ordering::Acquire) {
-                    qh.cv.notify_one();
-                    break;
-                }
+            if let Some(qh) = self
+                .queues
+                .iter()
+                .find(|qh| qh.parked.load(Ordering::Acquire))
+            {
+                qh.cv.notify_one();
             }
             return;
         }
@@ -454,27 +520,15 @@ impl<S: StateDatabase> BlockCtx<S> {
         // Collect under the lock, dispatch after: the bag push is
         // lock-free, but keeping the child-list critical section minimal
         // matters while the feed races to register on this node.
-        // Fixed-size stack buffer, plus a spill vec: no per-completion
-        // allocation. The block scopes the lock; it ends before dispatch.
-        let (ready_buf, n_ready, spill) = {
+        let mut ready = {
             let mut list = node.children.lock().expect("children poisoned");
             self.close_node(job, node);
-            let mut ready_buf = [0u32; 8];
-            let mut n_ready = 0usize;
-            let mut spill: Vec<u32> = Vec::new();
-            for c in list.iter() {
-                let child = &self.nodes[*c as usize];
-                if child.indegree.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    if n_ready < ready_buf.len() {
-                        ready_buf[n_ready] = *c;
-                        n_ready += 1;
-                    } else {
-                        spill.push(*c);
-                    }
-                }
-            }
+            let mut ready = ReadyBuf::default();
+            list.iter()
+                .filter_map(|&c| self.collect_if_ready(c))
+                .for_each(|c| ready.push(c));
             list.clear();
-            (ready_buf, n_ready, spill)
+            ready
         };
         self.finished.fetch_add(1, Ordering::SeqCst);
         self.metrics.completions.fetch_add(1, Ordering::Relaxed);
@@ -484,18 +538,21 @@ impl<S: StateDatabase> BlockCtx<S> {
         // streams on one core exactly as the FIFO scheduler streamed
         // it, without a queue. The rest go to the bag for whoever is
         // free.
-        let mut keep: Option<u32> = None;
-        for c in ready_buf.iter().take(n_ready).chain(spill.iter()) {
-            if keep.is_none() {
-                keep = Some(*c);
-            } else {
-                self.push_ready(0, *c);
-            }
-        }
+        let mut it = ready.drain();
+        let keep = it.next();
+        it.for_each(|c| self.push_ready(0, c));
         if self.drained() {
             self.wake_all();
         }
         keep
+    }
+
+    /// Decrement child `c`'s indegree, and return it when this was its
+    /// last outstanding predecessor. `None` means another predecessor is
+    /// still outstanding.
+    fn collect_if_ready(&self, c: u32) -> Option<u32> {
+        let child = &self.nodes[c as usize];
+        (child.indegree.fetch_sub(1, Ordering::AcqRel) == 1).then_some(c)
     }
 
     /// Apply parked completions to the live DAG: close each finished
@@ -504,49 +561,17 @@ impl<S: StateDatabase> BlockCtx<S> {
     /// Takes no global lock, only the finished nodes' own mutexes.
     pub(super) fn prune(&self, forced: bool) -> usize {
         let t0 = std::time::Instant::now();
-        let mut applied = 0usize;
-        let mut ready: Vec<(usize, u32)> = Vec::new();
-        for (w, buf) in self.completed.iter().enumerate() {
-            // Skip untouched buffers without paying for their mutex.
-            if self.completed_len[w].0.load(Ordering::Acquire) == 0 {
-                continue;
-            }
-            let drained: Vec<u32> = {
-                let mut b = buf.lock().expect("completed poisoned");
-                if b.is_empty() {
-                    continue;
-                }
-                self.completed_len[w].0.fetch_sub(
-                    u32::try_from(b.len()).expect("queue length bounded by MAX_BLOCK_TXS"),
-                    Ordering::AcqRel,
-                );
-                std::mem::take(&mut *b)
-            };
-            for job in drained {
-                applied += 1;
-                // Leave once. Closing is the node's exit from the graph.
-                // A second close would strand every edge registered in
-                // between, so this is asserted rather than assumed. The
-                // list is drained in place so its capacity survives for
-                // the next block that reuses this arena slot.
-                let node = &self.nodes[job as usize];
-                let mut list = node.children.lock().expect("children poisoned");
-                self.close_node(job, node);
-                for c in list.iter() {
-                    let child = &self.nodes[*c as usize];
-                    if child.indegree.fetch_sub(1, Ordering::AcqRel) == 1 {
-                        ready.push((child.worker.load(Ordering::Acquire), *c));
-                    }
-                }
-                list.clear();
-            }
-        }
+        let mut ready = ReadySet::default();
+        let applied: usize = self
+            .completed
+            .iter()
+            .enumerate()
+            .map(|(w, buf)| self.drain_worker(w, buf, &mut ready))
+            .sum();
         if applied > 0 {
             self.pending.fetch_sub(applied as u64, Ordering::SeqCst);
-            self.finished.fetch_add(
-                u32::try_from(applied).expect("applied count bounded by MAX_BLOCK_TXS"),
-                Ordering::SeqCst,
-            );
+            self.finished
+                .fetch_add(BlockTxCount::new(applied).get(), Ordering::SeqCst);
         }
         self.metrics
             .prune_ns
@@ -565,6 +590,66 @@ impl<S: StateDatabase> BlockCtx<S> {
             self.wake_all();
         }
         applied
+    }
+
+    /// Drain worker `w`'s completed buffer, close each finished node,
+    /// fold its newly ready children into `ready`, and return the
+    /// drained count.
+    fn drain_worker(&self, w: usize, buf: &Mutex<Vec<u32>>, ready: &mut ReadySet) -> usize {
+        // Skip untouched buffers without paying for their mutex.
+        if self.completed_len[w].0.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        let Some(drained) = Self::take_drained(&self.completed_len[w], buf) else {
+            return 0;
+        };
+        let n = drained.len();
+        for job in drained {
+            self.close_and_collect(job, ready);
+        }
+        n
+    }
+
+    /// Take worker `w`'s completed buffer under its lock, and lower its
+    /// atomic length counter to match, unless the buffer is empty.
+    fn take_drained(len: &PaddedLen, buf: &Mutex<Vec<u32>>) -> Option<Vec<u32>> {
+        let mut b = buf.lock().expect("completed poisoned");
+        if b.is_empty() {
+            return None;
+        }
+        len.0
+            .fetch_sub(BlockTxCount::new(b.len()).get(), Ordering::AcqRel);
+        Some(std::mem::take(&mut *b))
+    }
+
+    /// Leave `job`'s node once, and fold each of its children into
+    /// `ready` when this closed edge was their last outstanding
+    /// predecessor. Closing is the node's exit from the graph; a second
+    /// close would strand every edge registered in between, so this is
+    /// asserted rather than assumed. The child list is drained in place
+    /// so its capacity survives for the next block that reuses this
+    /// arena slot. The `for` loop in [`Self::drain_worker`] stays free
+    /// of a branch.
+    fn close_and_collect(&self, job: u32, ready: &mut ReadySet) {
+        let node = &self.nodes[job as usize];
+        let mut list = node.children.lock().expect("children poisoned");
+        self.close_node(job, node);
+        for c in list.iter() {
+            self.queue_ready_child(*c, ready);
+        }
+        list.clear();
+    }
+
+    /// Decrement child `c`'s indegree, and record it as ready, with its
+    /// assigned worker, when this was its last outstanding predecessor.
+    /// The `for` loop in [`Self::close_and_collect`] stays free of a
+    /// branch.
+    fn queue_ready_child(&self, c: u32, ready: &mut ReadySet) {
+        let child = &self.nodes[c as usize];
+        if child.indegree.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        ready.push(child.worker.load(Ordering::Acquire), c);
     }
 
     pub(super) fn drained(&self) -> bool {

@@ -15,6 +15,7 @@
 //! transfer within the same tx). Add a `destroyed` flag when the runtime
 //! needs it.
 
+use alloc::format;
 use alloc::vec::Vec;
 
 use alloy_primitives::{Address, B256, KECCAK256_EMPTY, U256};
@@ -22,9 +23,34 @@ use bytes::Bytes;
 use kardamom_types::delta::CodeEntry as WireCodeEntry;
 use kardamom_types::{AccountChange, BlockDelta, StorageChange};
 
-/// One account entry in a [`WriteSet`]: (address, (nonce, balance,
-/// `code_hash`)).
-pub type AccountEntry = (Address, (u64, U256, B256));
+/// One account's basic fields: nonce, balance, and code hash. This is
+/// the same triple [`kardamom_types::StateDatabase::basic`] returns, and
+/// every write-set or delta account entry carries it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AccountFields {
+    pub nonce: u64,
+    pub balance: U256,
+    pub code_hash: B256,
+}
+
+impl From<(u64, U256, B256)> for AccountFields {
+    fn from((nonce, balance, code_hash): (u64, U256, B256)) -> Self {
+        Self {
+            nonce,
+            balance,
+            code_hash,
+        }
+    }
+}
+
+impl From<AccountFields> for (u64, U256, B256) {
+    fn from(f: AccountFields) -> Self {
+        (f.nonce, f.balance, f.code_hash)
+    }
+}
+
+/// One account entry in a [`WriteSet`]: (address, fields).
+pub type AccountEntry = (Address, AccountFields);
 /// One storage entry in a [`WriteSet`]: ((address, `slot_key`), value).
 pub type StorageEntry = ((Address, B256), U256);
 /// One code entry in a [`WriteSet`]: (`code_hash`, bytecode).
@@ -61,7 +87,7 @@ impl WriteSet {
 
     /// Look up an account by key. This is a linear search, which is safe
     /// because the set is tiny, and works before `finish` runs.
-    pub fn account(&self, addr: &Address) -> Option<&(u64, U256, B256)> {
+    pub fn account(&self, addr: &Address) -> Option<&AccountFields> {
         self.accounts
             .iter()
             .find(|(a, _)| a == addr)
@@ -141,45 +167,13 @@ impl WriteSet {
     fn encode<S: WsSink>(&self, s: &mut S) {
         s.put(&[WS_ENCODING_V2]);
         put_varint(s, self.accounts.len() as u64);
-        for (addr, (nonce, balance, code_hash)) in &self.accounts {
-            let (bal, blen) = minimal_be(balance);
-            // Revm uses KECCAK256_EMPTY as the code hash for every
-            // account without code, so it is worth one tag value instead
-            // of 32 bytes on every externally owned account (EOA).
-            let code_tag: u8 = if *code_hash == KECCAK256_EMPTY {
-                0
-            } else if code_hash.is_zero() {
-                1
-            } else {
-                2
-            };
-            s.put(addr.as_slice());
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "minimal_be returns a length in 0..=32: fits u8"
-            )]
-            s.put(&[blen as u8 | (code_tag << 6)]);
-            put_varint(s, *nonce);
-            s.put(&bal[32 - blen..]);
-            if code_tag == 2 {
-                s.put(code_hash.as_slice());
-            }
+        for (addr, fields) in &self.accounts {
+            Self::put_account_entry(s, *addr, fields.nonce, &fields.balance, fields.code_hash);
         }
         put_varint(s, self.storage.len() as u64);
         let mut prev: Option<&Address> = None;
         for ((addr, key), value) in &self.storage {
-            let (val, vlen) = minimal_be(value);
-            let same = prev == Some(addr);
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "minimal_be returns a length in 0..=32: fits u8"
-            )]
-            s.put(&[vlen as u8 | (u8::from(same) << 6)]);
-            if !same {
-                s.put(addr.as_slice());
-            }
-            s.put(key.as_slice());
-            s.put(&val[32 - vlen..]);
+            Self::put_storage_entry(s, addr, prev, *key, value);
             prev = Some(addr);
         }
         put_varint(s, self.code.len() as u64);
@@ -188,6 +182,65 @@ impl WriteSet {
             put_varint(s, bytes.len() as u64);
             s.put(bytes.as_ref());
         }
+    }
+
+    /// Encode one account entry: address, flags (balance length and code
+    /// tag), varint nonce, minimal-width balance, and the code hash only
+    /// when the tag calls for it. See [`WriteSet::encode`]'s format doc.
+    fn put_account_entry<S: WsSink>(
+        s: &mut S,
+        addr: Address,
+        nonce: u64,
+        balance: &U256,
+        code_hash: B256,
+    ) {
+        let (bal, blen) = minimal_be(balance);
+        // Revm uses KECCAK256_EMPTY as the code hash for every account
+        // without code, so it is worth one tag value instead of 32 bytes
+        // on every externally owned account (EOA).
+        let code_tag: u8 = if code_hash == KECCAK256_EMPTY {
+            0
+        } else if code_hash.is_zero() {
+            1
+        } else {
+            2
+        };
+        s.put(addr.as_slice());
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "minimal_be returns a length in 0..=32: fits u8"
+        )]
+        s.put(&[blen as u8 | (code_tag << 6)]);
+        put_varint(s, nonce);
+        s.put(&bal[32 - blen..]);
+        if code_tag == 2 {
+            s.put(code_hash.as_slice());
+        }
+    }
+
+    /// Encode one storage entry: flags (value length and an
+    /// address-repeat bit), the address only when it differs from the
+    /// previous entry's, the key, and the minimal-width value. See
+    /// [`WriteSet::encode`]'s format doc.
+    fn put_storage_entry<S: WsSink>(
+        s: &mut S,
+        addr: &Address,
+        prev: Option<&Address>,
+        key: B256,
+        value: &U256,
+    ) {
+        let (val, vlen) = minimal_be(value);
+        let same = prev == Some(addr);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "minimal_be returns a length in 0..=32: fits u8"
+        )]
+        s.put(&[vlen as u8 | (u8::from(same) << 6)]);
+        if !same {
+            s.put(addr.as_slice());
+        }
+        s.put(key.as_slice());
+        s.put(&val[32 - vlen..]);
     }
 }
 
@@ -236,22 +289,22 @@ impl WsSink for alloy_primitives::Keccak256 {
     }
 }
 
-/// LEB128 encoding, canonical (minimal length).
+/// LEB128 encoding, canonical (minimal length). Emits a continuation byte
+/// (high bit set) for every 7-bit group above the last, then the final
+/// group with the high bit clear.
 #[inline]
 fn put_varint<S: WsSink>(s: &mut S, mut v: u64) {
     let mut buf = [0u8; 10];
     let mut n = 0;
-    loop {
-        let byte = (v & 0x7f) as u8;
+    while v >= 0x80 {
+        buf[n] = (v & 0x7f) as u8 | 0x80;
         v >>= 7;
-        if v == 0 {
-            buf[n] = byte;
-            n += 1;
-            break;
-        }
-        buf[n] = byte | 0x80;
         n += 1;
     }
+    // `v < 0x80` here (the loop above exits only then), so this mirrors
+    // the masked cast above rather than needing an `as`-cast allow.
+    buf[n] = (v & 0x7f) as u8;
+    n += 1;
     s.put(&buf[..n]);
 }
 
@@ -279,7 +332,7 @@ pub struct PendingDelta {
     // `finalize`, which sorts once, after dedup, off the
     // execution-critical path. Iteration order here is nondeterministic.
     // Any serialization must go through `finalize`, and it does.
-    pub accounts: DeltaMap<Address, (u64, U256, B256)>,
+    pub accounts: DeltaMap<Address, AccountFields>,
     pub storage: DeltaMap<(Address, B256), U256>,
     pub code: DeltaMap<B256, Bytes>,
 }
@@ -333,11 +386,11 @@ impl PendingDelta {
         let mut accounts: Vec<AccountChange> = self
             .accounts
             .into_iter()
-            .map(|(address, (nonce, balance, code_hash))| AccountChange {
+            .map(|(address, fields)| AccountChange {
                 address,
-                nonce,
-                balance,
-                code_hash,
+                nonce: fields.nonce,
+                balance: fields.balance,
+                code_hash: fields.code_hash,
             })
             .collect();
         accounts.sort_unstable_by_key(|a| a.address);
@@ -367,6 +420,49 @@ impl PendingDelta {
     }
 }
 
+/// The state layers behind one point in a block, in read-priority order:
+/// this block's own writes so far, then the merged unsettled-parent layer,
+/// then the durable snapshot. The block-close protocol actions and the
+/// remote-epoch observer hook both read through this, so a diverging read
+/// order between them cannot land in only one.
+pub struct ParentState<'a, S> {
+    delta: &'a PendingDelta,
+    parent: Option<&'a PendingDelta>,
+    snapshot: &'a S,
+}
+
+impl<'a, S: kardamom_types::StateDatabase> ParentState<'a, S> {
+    #[must_use]
+    pub fn new(delta: &'a PendingDelta, parent: Option<&'a PendingDelta>, snapshot: &'a S) -> Self {
+        Self {
+            delta,
+            parent,
+            snapshot,
+        }
+    }
+
+    /// Read one storage slot through the layers, in priority order: this
+    /// block's own writes, the unsettled parent, then the snapshot.
+    /// Reading the snapshot alone would be wrong for two reasons: it lags
+    /// by up to K unsettled blocks, and it cannot see the current block's
+    /// own writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the snapshot read fails.
+    pub fn storage(&self, addr: Address, slot: B256) -> Result<U256, crate::error::ExecutorError> {
+        if let Some(v) = self.delta.storage.get(&(addr, slot)) {
+            return Ok(*v);
+        }
+        if let Some(v) = self.parent.and_then(|p| p.storage.get(&(addr, slot))) {
+            return Ok(*v);
+        }
+        self.snapshot.storage(addr, slot).map_err(|e| {
+            crate::error::ExecutorError::State(format!("parent read {addr}/{slot}: {e:?}"))
+        })
+    }
+}
+
 // NOTE: there is no `block_delta_root` or state-root function here. The
 // executor does not compute or publish a state-root commitment. The sealed
 // BlockBoundary on tx_receipts is slim. The state writer flushes the delta
@@ -377,8 +473,12 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, U256};
 
-    fn sample_account(b: u64, n: u64) -> (u64, U256, B256) {
-        (n, U256::from(b), B256::repeat_byte(0xCC))
+    fn sample_account(b: u64, n: u64) -> AccountFields {
+        AccountFields {
+            nonce: n,
+            balance: U256::from(b),
+            code_hash: B256::repeat_byte(0xCC),
+        }
     }
 
     #[test]
@@ -468,9 +568,9 @@ mod tests {
             .push(((addr, B256::from(U256::from(1u64))), U256::from(200u64)));
         delta.apply(ws2);
 
-        let (nonce, balance, _ch) = delta.accounts[&addr];
-        assert_eq!(balance, U256::from(15u64));
-        assert_eq!(nonce, 2);
+        let fields = delta.accounts[&addr];
+        assert_eq!(fields.balance, U256::from(15u64));
+        assert_eq!(fields.nonce, 2);
         assert_eq!(
             delta.storage[&(addr, B256::from(U256::from(1u64)))],
             U256::from(200u64)

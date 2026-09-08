@@ -64,58 +64,102 @@ impl<T> ScriptedQueue<T> {
         }
         Ok(None)
     }
+
+    /// Number of items still queued. Lets a pump-contract test prove that a
+    /// retry, while a held record is backpressured, does not also poll the
+    /// next item off the queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the queue mutex is poisoned.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.queue.lock().unwrap().len()
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod pump_contract {
-    //! The three plumbing assertions every `ScriptedQueue<T>`-backed pump
-    //! shares: idle reports no work, a closed queue surfaces disconnect,
-    //! and backpressure propagates without consuming the item. Each origin
-    //! module ([`crate::epoch`], [`crate::remote_epoch`]) keeps its own
-    //! record-specific "forwards verbatim" test; this owns the rest.
+    //! The plumbing assertions every `ScriptedQueue<T>`-backed pump shares:
+    //! idle reports no work, a closed queue surfaces disconnect,
+    //! backpressure holds the popped record without dropping it, a retry
+    //! under continued backpressure does not also poll the next record,
+    //! and the held record is relayed exactly once once backpressure
+    //! clears. Each origin module ([`crate::epoch`],
+    //! [`crate::remote_epoch`]) keeps its own record-specific "forwards
+    //! verbatim" test; this owns the rest.
 
     use super::ScriptedQueue;
     use crate::error::SequencerError;
     use crate::outbound::fakes::InMemoryTxOrderingRefPublisher;
+    use crate::pump::Pump;
 
-    /// Run the three shared assertions for one origin pump. `dummy`
-    /// stands in for a well-formed record; `process` is [`crate::epoch::
-    /// process_epoch`] or [`crate::remote_epoch::process_remote_epoch`],
-    /// closed over its own subscriber type via `T`.
+    /// Run the shared assertions for one origin pump. `first` and `second`
+    /// stand in for two well-formed, distinct records; `process` is
+    /// [`crate::epoch::process_epoch`] or
+    /// [`crate::remote_epoch::process_remote_epoch`], closed over its own
+    /// subscriber type via `T`.
     ///
     /// # Panics
     ///
     /// Panics (via the assertions) when a pump under test does not honor
-    /// the shared idle/closed/backpressure contract.
-    pub fn run<T: Clone>(
-        dummy: &T,
+    /// the shared idle/closed/backpressure/retry contract.
+    pub(crate) fn run<T: Clone>(
+        first: &T,
+        second: &T,
         mut process: impl FnMut(
             &mut ScriptedQueue<T>,
             &mut InMemoryTxOrderingRefPublisher,
+            &mut Pump<T>,
         ) -> Result<bool, SequencerError>,
     ) {
         // Idle subscription reports no work.
         let mut sub = ScriptedQueue::<T>::default();
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
-        assert!(!process(&mut sub, &mut pubr).unwrap());
+        let mut pump = Pump::default();
+        assert!(!process(&mut sub, &mut pubr, &mut pump).unwrap());
 
         // Closed subscription surfaces disconnect.
         let mut sub = ScriptedQueue::<T>::default();
         sub.close();
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
+        let mut pump = Pump::default();
         assert!(matches!(
-            process(&mut sub, &mut pubr),
+            process(&mut sub, &mut pubr, &mut pump),
             Err(SequencerError::IngressDisconnected)
         ));
 
-        // Backpressure propagates so the caller retries.
+        // Backpressure holds the popped record, and a retry while
+        // backpressure continues does not poll a second record off the
+        // queue.
         let mut sub = ScriptedQueue::<T>::default();
-        sub.push(kardamom_types::BPosition::default(), dummy.clone());
+        sub.push(kardamom_types::BPosition::default(), first.clone());
+        sub.push(kardamom_types::BPosition::default(), second.clone());
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
+        let mut pump = Pump::default();
         *pubr.fail_with_backpressure.lock().unwrap() = true;
         assert!(matches!(
-            process(&mut sub, &mut pubr),
+            process(&mut sub, &mut pubr, &mut pump),
             Err(SequencerError::Backpressure)
         ));
+        assert!(pump.is_held(), "the popped record is held, not dropped");
+        assert_eq!(
+            sub.len(),
+            1,
+            "the second record stays queued while the first is held"
+        );
+        assert!(matches!(
+            process(&mut sub, &mut pubr, &mut pump),
+            Err(SequencerError::Backpressure)
+        ));
+        assert_eq!(sub.len(), 1, "the retry does not poll past the held record");
+
+        // Once backpressure clears, the held record is relayed exactly
+        // once, then the queue resumes with the second record.
+        *pubr.fail_with_backpressure.lock().unwrap() = false;
+        assert!(process(&mut sub, &mut pubr, &mut pump).unwrap());
+        assert!(!pump.is_held(), "the slot empties on success");
+        assert!(process(&mut sub, &mut pubr, &mut pump).unwrap());
+        assert!(!process(&mut sub, &mut pubr, &mut pump).unwrap());
     }
 }

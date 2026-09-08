@@ -346,7 +346,7 @@ fn golden_xchain_message() -> kardamom_types::xchain::XChainMessage {
 }
 
 fn golden_remote_epoch_record() -> kardamom_types::xchain::RemoteEpochRecord {
-    use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
+    use kardamom_types::xchain::{NonEmptyVec, RemoteEpochRecord, XChainMessage};
     let first = golden_xchain_message();
     let second = XChainMessage {
         seq: 10,
@@ -358,7 +358,7 @@ fn golden_remote_epoch_record() -> kardamom_types::xchain::RemoteEpochRecord {
         anchor_number: 0x0011_2233_4455_6677,
         anchor_hash: B256::repeat_byte(0x5A),
         first_seq: 9,
-        messages: vec![first, second],
+        messages: NonEmptyVec::new(first, vec![second]),
     }
 }
 

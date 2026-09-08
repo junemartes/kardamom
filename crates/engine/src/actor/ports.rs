@@ -1,16 +1,21 @@
 //! Outbound ports of the executor actor: the `tx_receipts` publication and the
 //! two state-writer seams (a durability signal and a hand-off queue).
 //!
-//! [`TxReceiptsPublication`] has a forwarding impl for its boxed form. A
-//! binary that picks a role-specific wrapper at runtime (for example, the
-//! validator's attester tee) can name `Box<dyn TxReceiptsPublication>` as
-//! that associated type in its [`EngineWiring`](super::EngineWiring). The
-//! API does not force boxing; the caller chooses it.
+//! [`Either`] lets a binary that picks a role-specific wrapper at runtime
+//! (for example, the validator's optional attester tee, or its optional
+//! outbox extraction) name one concrete, dyn-free type as that associated
+//! type in its [`EngineWiring`](super::EngineWiring). Two independent
+//! optional layers compose as `Either<Outer<Either<Inner<P>, P>>,
+//! Either<Inner<P>, P>>`; nesting further composes the same way.
 
 use kardamom_types::{BlockBoundary, BlockDelta, Receipt};
 
+use crate::block_env::ExecEnv;
+use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 use crate::exec_types::CMessage;
+
+use super::types::{BlockExecOutput, BlockExecStrategy, BufferedRecord};
 
 /// Publication handle for `tx_receipts`.
 pub trait TxReceiptsPublication: Send {
@@ -36,12 +41,15 @@ pub trait TxReceiptsPublication: Send {
     /// the whole slice into one `Vec<Receipt>` wire frame, so a batch pays
     /// one encode and one blocking ack instead of one ack per receipt.
     fn publish_receipts(&mut self, receipts: &[Receipt]) -> (usize, Option<ExecutorError>) {
-        for (i, r) in receipts.iter().enumerate() {
-            if let Err(e) = self.publish(CMessage::Receipt(r.clone())) {
-                return (i, Some(e));
-            }
+        let failed_at = receipts.iter().enumerate().find_map(|(i, r)| {
+            self.publish(CMessage::Receipt(r.clone()))
+                .err()
+                .map(|e| (i, e))
+        });
+        match failed_at {
+            Some((i, e)) => (i, Some(e)),
+            None => (receipts.len(), None),
         }
-        (receipts.len(), None)
     }
 }
 
@@ -81,14 +89,44 @@ pub trait StateWriterQueue: Send {
     fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError>;
 }
 
-// The validator boxes its receipts sink so the optional attester tee can
-// wrap it at runtime.
-impl TxReceiptsPublication for Box<dyn TxReceiptsPublication> {
+/// One of two [`TxReceiptsPublication`] shapes, chosen at construction
+/// time. A wiring seam that needs "this sink, or that other sink" at
+/// runtime (an optional decorator layer, for example) names this instead
+/// of boxing a trait object: the choice is a value, not an allocation or
+/// a vtable call.
+pub enum Either<A, B> {
+    Left(A),
+    Right(B),
+}
+
+impl<A: TxReceiptsPublication, B: TxReceiptsPublication> TxReceiptsPublication for Either<A, B> {
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
-        (**self).publish(msg)
+        match self {
+            Self::Left(a) => a.publish(msg),
+            Self::Right(b) => b.publish(msg),
+        }
     }
 
     fn publish_receipts(&mut self, receipts: &[Receipt]) -> (usize, Option<ExecutorError>) {
-        (**self).publish_receipts(receipts)
+        match self {
+            Self::Left(a) => a.publish_receipts(receipts),
+            Self::Right(b) => b.publish_receipts(receipts),
+        }
+    }
+}
+
+impl<A: BlockExecStrategy<D>, B: BlockExecStrategy<D>, D> BlockExecStrategy<D> for Either<A, B> {
+    fn execute_block(
+        &self,
+        snapshot: &D,
+        parent: Option<&PendingDelta>,
+        records: &[BufferedRecord],
+        env: ExecEnv,
+        block_number: u64,
+    ) -> Result<BlockExecOutput, ExecutorError> {
+        match self {
+            Self::Left(a) => a.execute_block(snapshot, parent, records, env, block_number),
+            Self::Right(b) => b.execute_block(snapshot, parent, records, env, block_number),
+        }
     }
 }

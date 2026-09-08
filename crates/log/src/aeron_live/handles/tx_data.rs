@@ -1,8 +1,6 @@
 //! `TxData`: per-shard envelope channel (proxy → seq/exec/batcher).
 
-use tokio::sync::mpsc::UnboundedReceiver;
-
-use super::super::{AeronRuntime, PubHandle};
+use super::super::{AeronRuntime, PubHandle, TxDataSubscription};
 use crate::aeron_live::handles::simple::declare_channel_handles;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
@@ -26,6 +24,7 @@ declare_channel_handles! {
     /// concurrent ingress publishers.
     subscriber TxDataSubscriberHandle(
         item = (TxDataLoc, TxEnvelope),
+        rx = TxDataSubscription,
         subscribe = AeronRuntime::open_tx_data_subscription
     );
     open(ch, sequencer_id: u8) = (

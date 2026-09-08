@@ -122,7 +122,7 @@ impl<Backend: ProxyBackend> IngressHandlers<Backend> {
 #[async_trait::async_trait]
 impl<Backend: ProxyBackend> IngressEthApiServer for IngressHandlers<Backend> {
     async fn chain_id(&self) -> RpcResult<U256> {
-        Ok(U256::from(self.proxy.config().chain_id))
+        Ok(U256::from(self.proxy.config().chain_id.get()))
     }
 
     async fn block_number(&self) -> RpcResult<U256> {
@@ -208,6 +208,15 @@ impl SenderFilter {
     }
 }
 
+/// One feed poll's outcome, for [`ReceiptSubscription::next_event`]'s
+/// `select!` arms: an event to send, a filtered-out item to skip, or the
+/// feed closing, which ends the subscription.
+enum NextEvent {
+    Event(ReceiptEvent),
+    FilteredOut,
+    FeedClosed,
+}
+
 /// Owns one `kardamom_subscribeReceipts` session end to end: the two
 /// upstream feeds, the sender filter, and the sink the events go out on.
 struct ReceiptSubscription {
@@ -235,42 +244,50 @@ impl ReceiptSubscription {
     /// subscription.
     async fn next_event(&mut self) -> Option<ReceiptEvent> {
         loop {
-            let event = tokio::select! {
+            let next = tokio::select! {
                 () = self.sink.closed() => return None,
-                r = self.receipts.recv() => match r {
-                    Ok(rcpt) => {
-                        if !self.filter.allows(rcpt.from) {
-                            continue;
-                        }
-                        ReceiptEvent::Receipt {
-                            receipt: Box::new(RpcReceipt::from(&rcpt).0),
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        ReceiptEvent::Lagged { skipped: n }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                },
-                e = self.errors.recv() => match e {
-                    Ok(err) => {
-                        if !self.filter.allows(err.sender) {
-                            continue;
-                        }
-                        let (reason, expected_nonce) = describe_tx_error(&err.reason);
-                        ReceiptEvent::TxError {
-                            sender: err.sender,
-                            nonce: err.nonce,
-                            reason,
-                            expected_nonce,
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        ReceiptEvent::Lagged { skipped: n }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                },
+                r = self.receipts.recv() => self.on_receipt_result(r),
+                e = self.errors.recv() => self.on_error_result(e),
             };
-            return Some(event);
+            match next {
+                NextEvent::Event(event) => return Some(event),
+                NextEvent::FilteredOut => {}
+                NextEvent::FeedClosed => return None,
+            }
+        }
+    }
+
+    /// One `receipts` feed poll, for [`Self::next_event`]'s `select!` arm.
+    fn on_receipt_result(&self, r: Result<Receipt, broadcast::error::RecvError>) -> NextEvent {
+        match r {
+            Ok(rcpt) if !self.filter.allows(rcpt.from) => NextEvent::FilteredOut,
+            Ok(rcpt) => NextEvent::Event(ReceiptEvent::Receipt {
+                receipt: Box::new(RpcReceipt::from(&rcpt).0),
+            }),
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                NextEvent::Event(ReceiptEvent::Lagged { skipped: n })
+            }
+            Err(broadcast::error::RecvError::Closed) => NextEvent::FeedClosed,
+        }
+    }
+
+    /// One `errors` feed poll, for [`Self::next_event`]'s `select!` arm.
+    fn on_error_result(&self, e: Result<TxError, broadcast::error::RecvError>) -> NextEvent {
+        match e {
+            Ok(err) if !self.filter.allows(err.sender) => NextEvent::FilteredOut,
+            Ok(err) => {
+                let (reason, expected_nonce) = describe_tx_error(&err.reason);
+                NextEvent::Event(ReceiptEvent::TxError {
+                    sender: err.sender,
+                    nonce: err.nonce,
+                    reason,
+                    expected_nonce,
+                })
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                NextEvent::Event(ReceiptEvent::Lagged { skipped: n })
+            }
+            Err(broadcast::error::RecvError::Closed) => NextEvent::FeedClosed,
         }
     }
 
@@ -509,7 +526,7 @@ mod tests {
     #[tokio::test]
     async fn chain_id_round_trips() {
         let cfg = IngressConfig {
-            chain_id: 31337,
+            chain_id: std::num::NonZeroU64::new(31337).unwrap(),
             ..IngressConfig::default()
         };
         let TestServer { addr, handle, .. } = start_test_server(cfg).await;

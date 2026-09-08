@@ -2,6 +2,7 @@
 //! in-memory [`MockChannels`], with a simple fake executor that reflects
 //! every published `TxEnvelope` straight back as a success `Receipt`.
 
+use anyhow::Context as _;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 
 use kardamom_ingress::{IngressConfig, IngressHandle, IngressProxy, MockChannels};
@@ -31,7 +32,9 @@ pub async fn spawn_inprocess_ingress(
     shards: u32,
     max_in_flight: usize,
 ) -> anyhow::Result<(HttpClient, InProcessIngress)> {
-    let (mock, shard_rxs) = MockChannels::new(shards as usize);
+    let shard_count =
+        std::num::NonZeroUsize::new(shards as usize).context("shard count must be non-zero")?;
+    let (mock, shard_rxs) = MockChannels::new(shard_count);
     let receipt_tx = mock.receipt_bus.clone();
 
     // One fake-executor task runs per shard. It drains published envelopes and
@@ -68,8 +71,9 @@ pub async fn spawn_inprocess_ingress(
     }
 
     let cfg = IngressConfig {
-        chain_id,
-        partition_count_m: shards,
+        chain_id: std::num::NonZeroU64::new(chain_id).context("chain id must be non-zero")?,
+        partition_count_m: std::num::NonZeroU32::new(shards)
+            .context("shard count must be non-zero")?,
         ack_policy: AckPolicy::OnOffer,
         ..IngressConfig::default()
     };

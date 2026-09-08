@@ -65,7 +65,7 @@ use std::num::NonZeroUsize;
 
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
-use kardamom_types::xchain::{Callback, RemoteEpochRecord, XChainMessage};
+use kardamom_types::xchain::{Callback, NonEmptyVec, RemoteEpochRecord, XChainMessage};
 
 use crate::error::BatcherError;
 
@@ -113,14 +113,33 @@ pub fn encode(payload: &Kar1Payload) -> Result<Vec<u8>, BatcherError> {
         .len()
         .try_into()
         .map_err(|_| BatcherError::Frame("block_count overflows u32".into()))?;
-    let mut buf = Vec::with_capacity(HEADER_LEN + payload.blocks.len() * 24);
-    buf.extend_from_slice(&MAGIC);
-    buf.push(VERSION);
-    buf.push(if payload.compressed { FLAG_ZSTD } else { 0 });
-    buf.extend_from_slice(&block_count.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
+    let mut enc = FrameWriter::new(HEADER_LEN + payload.blocks.len() * 24);
+    enc.0.extend_from_slice(&MAGIC);
+    enc.0.push(VERSION);
+    enc.0.push(if payload.compressed { FLAG_ZSTD } else { 0 });
+    enc.0.extend_from_slice(&block_count.to_le_bytes());
+    enc.0.extend_from_slice(&0u16.to_le_bytes());
 
-    for block in &payload.blocks {
+    payload
+        .blocks
+        .iter()
+        .try_for_each(|block| enc.block(block))?;
+    Ok(enc.finish())
+}
+
+/// A KAR1 byte buffer under construction. One method per frame kind, each
+/// appending to the same buffer, so no frame-encoding function threads
+/// `buf: &mut Vec<u8>` as a loose parameter.
+struct FrameWriter(Vec<u8>);
+
+impl FrameWriter {
+    fn new(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    /// Encode one [`BlockFrame`]: its header, then its leading
+    /// remote-epoch records, then its txs.
+    fn block(&mut self, block: &BlockFrame) -> Result<(), BatcherError> {
         let tx_count: u32 = block
             .txs
             .len()
@@ -131,71 +150,87 @@ pub fn encode(payload: &Kar1Payload) -> Result<Vec<u8>, BatcherError> {
             .len()
             .try_into()
             .map_err(|_| BatcherError::Frame("remote_epoch_count overflows u32".into()))?;
-        buf.extend_from_slice(&block.block_number.to_le_bytes());
-        buf.extend_from_slice(&block.l2_timestamp.to_le_bytes());
-        buf.extend_from_slice(&remote_epoch_count.to_le_bytes());
-        for rec in &block.remote_epochs {
-            encode_remote_epoch(&mut buf, rec)?;
-        }
-        buf.extend_from_slice(&tx_count.to_le_bytes());
-
-        for tx in &block.txs {
-            let raw_len: u32 = tx
-                .raw_tx
-                .len()
-                .try_into()
-                .map_err(|_| BatcherError::Frame("raw_tx_len overflows u32".into()))?;
-            buf.extend_from_slice(&tx.correlation_id.to_le_bytes());
-            buf.extend_from_slice(tx.sender.as_slice());
-            buf.extend_from_slice(tx.tx_hash.as_slice());
-            buf.extend_from_slice(&raw_len.to_le_bytes());
-            buf.extend_from_slice(tx.raw_tx.as_ref());
-        }
+        self.0.extend_from_slice(&block.block_number.to_le_bytes());
+        self.0.extend_from_slice(&block.l2_timestamp.to_le_bytes());
+        self.0.extend_from_slice(&remote_epoch_count.to_le_bytes());
+        block
+            .remote_epochs
+            .iter()
+            .try_for_each(|rec| self.remote_epoch(rec))?;
+        self.0.extend_from_slice(&tx_count.to_le_bytes());
+        block.txs.iter().try_for_each(|tx| self.tx(tx))
     }
-    Ok(buf)
-}
 
-/// Encode one [`RemoteEpochRecord`] — the exact record off the canonical
-/// stream, messages by value including calldata. `source_hash`/`seq` are
-/// carried verbatim (like a tx frame's `sender`/`tx_hash`): the codec
-/// round-trips bytes; re-derivation and verification stay the validator's
-/// job, never the DA layer's.
-fn encode_remote_epoch(buf: &mut Vec<u8>, rec: &RemoteEpochRecord) -> Result<(), BatcherError> {
-    let msg_count: u32 = rec
-        .messages
-        .len()
-        .try_into()
-        .map_err(|_| BatcherError::Frame("remote epoch msg_count overflows u32".into()))?;
-    buf.extend_from_slice(&rec.origin_chain_id.to_le_bytes());
-    buf.extend_from_slice(&rec.anchor_number.to_le_bytes());
-    buf.extend_from_slice(rec.anchor_hash.as_slice());
-    buf.extend_from_slice(&rec.first_seq.to_le_bytes());
-    buf.extend_from_slice(&msg_count.to_le_bytes());
-    for msg in &rec.messages {
+    /// Encode one [`TxFrame`]: correlation id, sender, hash, then the raw
+    /// signed transaction bytes.
+    fn tx(&mut self, tx: &TxFrame) -> Result<(), BatcherError> {
+        let raw_len: u32 = tx
+            .raw_tx
+            .len()
+            .try_into()
+            .map_err(|_| BatcherError::Frame("raw_tx_len overflows u32".into()))?;
+        self.0.extend_from_slice(&tx.correlation_id.to_le_bytes());
+        self.0.extend_from_slice(tx.sender.as_slice());
+        self.0.extend_from_slice(tx.tx_hash.as_slice());
+        self.0.extend_from_slice(&raw_len.to_le_bytes());
+        self.0.extend_from_slice(tx.raw_tx.as_ref());
+        Ok(())
+    }
+
+    /// Encode one [`RemoteEpochRecord`] — the exact record off the
+    /// canonical stream, messages by value including calldata.
+    /// `source_hash`/`seq` are carried verbatim (like a tx frame's
+    /// `sender`/`tx_hash`): the codec round-trips bytes; re-derivation and
+    /// verification stay the validator's job, never the DA layer's.
+    fn remote_epoch(&mut self, rec: &RemoteEpochRecord) -> Result<(), BatcherError> {
+        let msg_count: u32 = rec
+            .messages
+            .len()
+            .get()
+            .try_into()
+            .map_err(|_| BatcherError::Frame("remote epoch msg_count overflows u32".into()))?;
+        self.0.extend_from_slice(&rec.origin_chain_id.to_le_bytes());
+        self.0.extend_from_slice(&rec.anchor_number.to_le_bytes());
+        self.0.extend_from_slice(rec.anchor_hash.as_slice());
+        self.0.extend_from_slice(&rec.first_seq.to_le_bytes());
+        self.0.extend_from_slice(&msg_count.to_le_bytes());
+        rec.messages
+            .iter()
+            .try_for_each(|msg| self.xchain_message(msg))
+    }
+
+    /// Encode one [`XChainMessage`]: its fields, then a callback flag byte
+    /// (0 = none, 1 = present) followed by the callback fields when
+    /// present.
+    fn xchain_message(&mut self, msg: &XChainMessage) -> Result<(), BatcherError> {
         let input_len: u32 = msg
             .input
             .len()
             .try_into()
             .map_err(|_| BatcherError::Frame("xchain input_len overflows u32".into()))?;
-        buf.extend_from_slice(msg.source_hash.as_slice());
-        buf.extend_from_slice(&msg.seq.to_le_bytes());
-        buf.extend_from_slice(msg.origin_sender.as_slice());
-        buf.extend_from_slice(msg.target.as_slice());
-        buf.extend_from_slice(&msg.value.to_le_bytes());
-        buf.extend_from_slice(&msg.gas_limit.to_le_bytes());
-        buf.extend_from_slice(&input_len.to_le_bytes());
-        buf.extend_from_slice(msg.input.as_ref());
+        self.0.extend_from_slice(msg.source_hash.as_slice());
+        self.0.extend_from_slice(&msg.seq.to_le_bytes());
+        self.0.extend_from_slice(msg.origin_sender.as_slice());
+        self.0.extend_from_slice(msg.target.as_slice());
+        self.0.extend_from_slice(&msg.value.to_le_bytes());
+        self.0.extend_from_slice(&msg.gas_limit.to_le_bytes());
+        self.0.extend_from_slice(&input_len.to_le_bytes());
+        self.0.extend_from_slice(msg.input.as_ref());
         match &msg.callback {
-            None => buf.push(0),
+            None => self.0.push(0),
             Some(cb) => {
-                buf.push(1);
-                buf.extend_from_slice(cb.target.as_slice());
-                buf.extend_from_slice(&cb.gas_limit.to_le_bytes());
-                buf.extend_from_slice(cb.context.as_slice());
+                self.0.push(1);
+                self.0.extend_from_slice(cb.target.as_slice());
+                self.0.extend_from_slice(&cb.gas_limit.to_le_bytes());
+                self.0.extend_from_slice(cb.context.as_slice());
             }
         }
+        Ok(())
     }
-    Ok(())
+
+    fn finish(self) -> Vec<u8> {
+        self.0
+    }
 }
 
 /// Min `XChainMessage` size: `source_hash`(32) + `seq`(8) +
@@ -243,12 +278,16 @@ fn decode_remote_epoch(r: &mut Reader<'_>) -> Result<RemoteEpochRecord, BatcherE
             callback,
         });
     }
+    let mut messages = messages.into_iter();
+    let first = messages
+        .next()
+        .ok_or_else(|| BatcherError::Frame("remote epoch record carries no messages".into()))?;
     Ok(RemoteEpochRecord {
         origin_chain_id,
         anchor_number,
         anchor_hash,
         first_seq,
-        messages,
+        messages: NonEmptyVec::new(first, messages.collect()),
     })
 }
 

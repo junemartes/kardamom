@@ -33,7 +33,7 @@ use kardamom_batcher::multi_archive_reader::{
 use kardamom_batcher::recon::reconstruct;
 use kardamom_batcher::settlement::IKardamomL2Settlement;
 use kardamom_batcher::testkit::{MPlusOneArchives, write_m_plus_one_archives};
-use kardamom_deployer::testkit::AnvilRig;
+use kardamom_deployer::testkit::{AnvilRig, Funding};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg};
 use tempfile::TempDir;
 
@@ -66,36 +66,7 @@ fn drive_batcher_pipeline(archives: &MPlusOneArchives, cfg: &BatcherConfig) -> P
         "test fixture should populate two A archives"
     );
 
-    for rec in reader {
-        match rec.expect("decode") {
-            ResolvedRecord::Tx { position, env, .. } => {
-                batcher.accumulator().observe_tx(env, position);
-            }
-            ResolvedRecord::RemoteEpoch { record, .. } => {
-                batcher.accumulator().observe_remote_epoch(record);
-            }
-            ResolvedRecord::Boundary { marker, .. } => {
-                let closed = batcher.accumulator().observe_boundary(&marker);
-                let pack = pack_blocks(cfg, std::slice::from_ref(&closed)).expect("pack");
-
-                // Reconstruct locally from the blobs just packed. This
-                // mirrors what a section 6 L1-observer client does after
-                // downloading sidecar bytes from the beacon node.
-                let reconstructed = reconstruct(&pack.blobs).expect("reconstruct");
-                assert_eq!(reconstructed.len(), 1);
-                let block = &reconstructed[0];
-                assert_eq!(block.block_number, 42);
-                assert_eq!(
-                    block.txs.len(),
-                    archives.canonical_order.len(),
-                    "resolved tx count should match the fixture"
-                );
-                assert_canonical_order(&block.txs, &archives.canonical_order);
-
-                batcher.on_closed_block(closed).expect("on_closed");
-            }
-        }
-    }
+    reader.for_each(|rec| apply_resolved_record(&mut batcher, cfg, archives, rec.expect("decode")));
 
     assert_eq!(batcher.sender().sent.len(), 1, "exactly one batch posted");
     let posted = batcher.sender().sent[0].clone();
@@ -106,6 +77,36 @@ fn drive_batcher_pipeline(archives: &MPlusOneArchives, cfg: &BatcherConfig) -> P
         "batch must contain at least one blob"
     );
     posted
+}
+
+/// One resolved record from the multi-archive reader: feed it into the
+/// accumulator, or, at a boundary, pack the closed block, reconstruct it
+/// from the just-packed blobs (mirroring what a section 6 L1-observer
+/// client does after downloading sidecar bytes from the beacon node), and
+/// check it against the fixture.
+fn apply_resolved_record(
+    batcher: &mut Batcher<MockSender>,
+    cfg: &BatcherConfig,
+    archives: &MPlusOneArchives,
+    rec: ResolvedRecord,
+) {
+    let Some(closed) = batcher.accumulator().observe(rec) else {
+        return;
+    };
+    let pack = pack_blocks(cfg, std::slice::from_ref(&closed)).expect("pack");
+
+    let reconstructed = reconstruct(&pack.blobs).expect("reconstruct");
+    assert_eq!(reconstructed.len(), 1);
+    let block = &reconstructed[0];
+    assert_eq!(block.block_number, 42);
+    assert_eq!(
+        block.txs.len(),
+        archives.canonical_order.len(),
+        "resolved tx count should match the fixture"
+    );
+    assert_canonical_order(&block.txs, &archives.canonical_order);
+
+    batcher.on_closed_block(closed).expect("on_closed");
 }
 
 /// Deploy `KardamomL2Settlement`, post `posted` with stub versioned
@@ -119,7 +120,14 @@ fn drive_batcher_pipeline(archives: &MPlusOneArchives, cfg: &BatcherConfig) -> P
 /// emits the hashes; it never opens the blob bytes, so a stub is enough to
 /// exercise the post-batch and event-emission path.
 async fn post_batch_to_anvil_and_verify_event(posted: &PostedBatch) -> Option<()> {
-    let rig = AnvilRig::spawn(&[DEV_OWNER, BATCHER]).await?;
+    let rig = AnvilRig::spawn(
+        alloy_node_bindings::Anvil::new(),
+        &[
+            (DEV_OWNER, Funding::FundAndImpersonate),
+            (BATCHER, Funding::FundAndImpersonate),
+        ],
+    )
+    .await?;
     let provider = rig.provider;
 
     let deployer = Deployer::new(provider.clone(), DEV_OWNER);

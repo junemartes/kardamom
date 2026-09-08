@@ -68,6 +68,7 @@ kardamom-ingress = { path = ".", features = ["test-support"] }
 # by the cluster watermark observer unit tests.
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-obs = { path = "../obs", features = ["test-support"] }
 metrics = { workspace = true }
 rand = "0.9"
 reqwest = { workspace = true }

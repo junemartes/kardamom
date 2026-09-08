@@ -15,15 +15,16 @@ path = "src/bin/print_factory_address.rs"
 [features]
 default = []
 # Exposes the anvil-plus-ERC-7955 e2e test scaffold (`testkit`) to
-# downstream crates' own tests.
-test-support = ["dep:alloy-node-bindings"]
+# downstream crates' own tests, plus the mnemonic-derived dev-signer
+# helpers (`mnemonic`, `signers`) e2e harnesses build accounts from.
+test-support = ["dep:alloy-node-bindings", "dep:alloy-eips", "dep:rand"]
 
 [dependencies]
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-contract.workspace = true
 alloy-sol-types.workspace = true
-alloy-signer-local.workspace = true
+alloy-signer-local = { workspace = true, features = ["mnemonic"] }
 alloy-rpc-types-eth.workspace = true
 alloy-network.workspace = true
 alloy-consensus.workspace = true
@@ -34,6 +35,9 @@ anyhow.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 alloy-node-bindings = { workspace = true, optional = true }
+# Only for `mnemonic`/`signers`, behind `test-support`.
+alloy-eips = { workspace = true, optional = true }
+rand = { version = "0.8", optional = true }
 
 [build-dependencies]
 anyhow.workspace = true

@@ -11,7 +11,11 @@ fn msg(seq: u64, dest: u64) -> OutboxMessage {
 fn msg_in_block(seq: u64, dest: u64, block: u64) -> OutboxMessage {
     OutboxMessage {
         origin_block_number: block,
-        origin_block_hash: xchain_anchor_hash(ORIGIN, block),
+        origin_block_hash: Anchor {
+            origin_chain_id: ORIGIN,
+            block_number: block,
+        }
+        .hash(),
         dest_chain_id: dest,
         seq,
         sender: Address::repeat_byte(0xA1),
@@ -68,7 +72,10 @@ fn derivation_orders_by_seq_regardless_of_input_order() {
     assert_eq!(fwd, rev);
     assert_eq!(fwd.first_seq, 5);
     assert_eq!(fwd.last_seq(), 6);
-    assert_eq!(fwd.messages[0].source_hash, remote_source_hash(ORIGIN, 5));
+    assert_eq!(
+        fwd.messages.first().source_hash,
+        remote_source_hash(ORIGIN, 5)
+    );
 }
 
 #[test]
@@ -166,16 +173,16 @@ fn canonical_id_known_vector_is_pinned() {
         anchor_number: 0x0011_2233_4455_6677,
         anchor_hash: B256::repeat_byte(0x5A),
         first_seq: 9,
-        messages: alloc::vec![
+        messages: NonEmptyVec::new(
             XChainMessage {
                 seq: 9,
                 ..Default::default()
             },
-            XChainMessage {
+            alloc::vec![XChainMessage {
                 seq: 10,
                 ..Default::default()
-            },
-        ],
+            }],
+        ),
     };
     let mut preimage = alloc::vec::Vec::new();
     preimage.extend_from_slice(&412_346u64.to_be_bytes());
@@ -219,12 +226,30 @@ fn a_batch_that_spans_two_origin_blocks_is_rejected() {
 }
 
 #[test]
+fn a_multi_block_batch_with_an_over_cap_message_faults_on_bounds_first() {
+    // The over-cap message sits in the block-100 half, so the bounds
+    // check (run on the borrowed messages, before `check_one_block`)
+    // rejects the batch before the multi-block check ever runs.
+    let mut over_cap = msg_in_block(0, SELF, 100);
+    over_cap.gas_limit = MAX_MESSAGE_GAS + 1;
+    let e =
+        derive_remote_epoch(SELF, ORIGIN, 0, &[over_cap, msg_in_block(1, SELF, 101)]).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            XChainError::Bounds(BoundsFault::GasLimitAboveCap { seq: 0, .. })
+        ),
+        "got {e:?}"
+    );
+}
+
+#[test]
 fn anchor_check_rejects_a_feed_chosen_hash() {
     let good = msg(3, SELF);
-    assert_eq!(check_anchor(ORIGIN, &good), Ok(()));
+    assert_eq!(good.check_anchor(ORIGIN), Ok(()));
     let mut bad = msg(3, SELF);
     bad.origin_block_hash = B256::repeat_byte(0xEE);
-    let e = check_anchor(ORIGIN, &bad).unwrap_err();
+    let e = bad.check_anchor(ORIGIN).unwrap_err();
     assert!(
         matches!(
             e,
@@ -238,8 +263,12 @@ fn anchor_check_rejects_a_feed_chosen_hash() {
     );
     // The anchor from another origin is also wrong.
     let mut other = msg(3, SELF);
-    other.origin_block_hash = xchain_anchor_hash(ORIGIN + 1, 100);
-    assert!(check_anchor(ORIGIN, &other).is_err());
+    other.origin_block_hash = (Anchor {
+        origin_chain_id: ORIGIN + 1,
+        block_number: 100,
+    })
+    .hash();
+    assert!(other.check_anchor(ORIGIN).is_err());
 }
 
 /// `keccak256("KARDAMOM_XCHAIN_ANCHOR_V0" ‖ origin_be8 ‖ block_be8)`.
@@ -249,14 +278,26 @@ fn anchor_hash_known_vector_is_pinned() {
     preimage.extend_from_slice(b"KARDAMOM_XCHAIN_ANCHOR_V0");
     preimage.extend_from_slice(&412_346u64.to_be_bytes());
     preimage.extend_from_slice(&42u64.to_be_bytes());
-    assert_eq!(xchain_anchor_hash(412_346, 42), keccak256(&preimage));
+    let anchor = Anchor {
+        origin_chain_id: 412_346,
+        block_number: 42,
+    };
+    assert_eq!(anchor.hash(), keccak256(&preimage));
     assert_ne!(
-        xchain_anchor_hash(412_346, 42),
-        xchain_anchor_hash(412_346, 43)
+        anchor.hash(),
+        Anchor {
+            origin_chain_id: 412_346,
+            block_number: 43,
+        }
+        .hash()
     );
     assert_ne!(
-        xchain_anchor_hash(412_346, 42),
-        xchain_anchor_hash(412_347, 42)
+        anchor.hash(),
+        Anchor {
+            origin_chain_id: 412_347,
+            block_number: 42,
+        }
+        .hash()
     );
 }
 
@@ -266,18 +307,19 @@ fn leaf_recomputable_from_wire_record() {
     // verifier holding only the RemoteEpochRecord and the pair identity
     // can recompute every Outbox commitment.
     let rec = derive_remote_epoch(SELF, ORIGIN, 0, &[msg(0, SELF)]).unwrap();
-    let m = &rec.messages[0];
-    let expect = msg_leaf(
-        ORIGIN,
-        SELF,
-        0,
-        Address::repeat_byte(0xA1),
-        Address::repeat_byte(0xB2),
-        0,
-        200_000,
-        keccak256([0xCA, 0xFE]),
-        no_callback_hash(),
-    );
+    let m = rec.messages.first();
+    let expect = MsgLeaf {
+        origin_chain_id: ORIGIN,
+        dest_chain_id: SELF,
+        seq: 0,
+        sender: Address::repeat_byte(0xA1),
+        target: Address::repeat_byte(0xB2),
+        value: 0,
+        gas_limit: 200_000,
+        data_hash: keccak256([0xCA, 0xFE]),
+        cb_hash: no_callback_hash(),
+    }
+    .hash();
     assert_eq!(m.leaf(ORIGIN, SELF), expect);
 }
 
@@ -299,32 +341,24 @@ fn leaf_known_vector_is_pinned() {
     // Anchored output for fixed inputs — must match Outbox.hashMessage in
     // contracts/test/Outbox.t.sol (the cross-language tie). Changing the
     // leaf layout flips this and forces a review conversation.
-    let leaf = msg_leaf(
-        1,
-        2,
-        3,
-        Address::repeat_byte(0x04),
-        Address::repeat_byte(0x05),
-        6,
-        7,
-        keccak256([0x08]),
-        B256::ZERO,
-    );
+    let leaf = MsgLeaf {
+        origin_chain_id: 1,
+        dest_chain_id: 2,
+        seq: 3,
+        sender: Address::repeat_byte(0x04),
+        target: Address::repeat_byte(0x05),
+        value: 6,
+        gas_limit: 7,
+        data_hash: keccak256([0x08]),
+        cb_hash: B256::ZERO,
+    }
+    .hash();
     // Same inputs, same value, asserted in contracts/test/Outbox.t.sol —
     // the cross-language tie.
     assert_eq!(
         leaf,
         b256!("0df14340efd8c8b32f4c333c3dca8470b0bae319a3dfe32adb213df2b8834d3c")
     );
-}
-
-#[test]
-fn last_seq_does_not_underflow_on_an_empty_default_record() {
-    // Defect: `first_seq + messages.len() - 1` underflowed when `messages`
-    // was empty. `Default` makes the empty case constructible even though
-    // the type docs call it invalid, so the method must not panic or wrap.
-    let empty = RemoteEpochRecord::default();
-    assert_eq!(empty.last_seq(), 0);
 }
 
 #[test]
@@ -345,12 +379,17 @@ fn seq_overflow_is_a_fault_not_a_panic() {
         matches!(e, XChainError::SeqOverflow { seq: u64::MAX }),
         "got {e:?}"
     );
-    // A hostile record does not panic `last_seq`. The value is meaningless
-    // for an invalid record; only the absence of a panic matters.
+    // `first_seq` near `u64::MAX` plus a multi-message batch does not
+    // panic `last_seq`; it saturates instead.
     let r = RemoteEpochRecord {
+        origin_chain_id: 0,
+        anchor_number: 0,
+        anchor_hash: B256::ZERO,
         first_seq: u64::MAX,
-        messages: alloc::vec![XChainMessage::default(), XChainMessage::default()],
-        ..Default::default()
+        messages: NonEmptyVec::new(
+            XChainMessage::default(),
+            alloc::vec![XChainMessage::default()],
+        ),
     };
     let _ = r.last_seq();
 }
@@ -362,7 +401,10 @@ fn outbox_bounds_are_mirrored_on_the_producer() {
     m.value = 1;
     let e = derive_remote_epoch(SELF, ORIGIN, 0, &[m]).unwrap_err();
     assert!(
-        matches!(e, XChainError::ValueNotAllowed { seq: 0, value: 1 }),
+        matches!(
+            e,
+            XChainError::Bounds(BoundsFault::ValueNotAllowed { seq: 0, value: 1 })
+        ),
         "got {e:?}"
     );
     // Gas limit.
@@ -372,11 +414,11 @@ fn outbox_bounds_are_mirrored_on_the_producer() {
     assert!(
         matches!(
             e,
-            XChainError::GasLimitAboveCap {
+            XChainError::Bounds(BoundsFault::GasLimitAboveCap {
                 seq: 0,
                 gas_limit: 10_000_001,
                 cap: MAX_MESSAGE_GAS
-            }
+            })
         ),
         "got {e:?}"
     );
@@ -387,11 +429,11 @@ fn outbox_bounds_are_mirrored_on_the_producer() {
     assert!(
         matches!(
             e,
-            XChainError::DataAboveCap {
+            XChainError::Bounds(BoundsFault::DataAboveCap {
                 seq: 0,
                 len: 65_537,
                 cap: MAX_DATA_BYTES
-            }
+            })
         ),
         "got {e:?}"
     );
@@ -404,8 +446,8 @@ fn honest_maxima_pass_the_producer_checks() {
     m.gas_limit = MAX_MESSAGE_GAS;
     m.data = AlloyBytes::from(alloc::vec![0xFFu8; MAX_DATA_BYTES]);
     let r = derive_remote_epoch(SELF, ORIGIN, 0, &[m]).unwrap();
-    assert_eq!(r.messages[0].gas_limit, MAX_MESSAGE_GAS);
-    assert_eq!(r.messages[0].input.len(), MAX_DATA_BYTES);
+    assert_eq!(r.messages.first().gas_limit, MAX_MESSAGE_GAS);
+    assert_eq!(r.messages.first().input.len(), MAX_DATA_BYTES);
 }
 
 // Value pins. The Solidity side asserts the same values in
@@ -446,5 +488,72 @@ fn remote_source_hash_known_vector_is_pinned() {
     assert_eq!(
         remote_source_hash(ORIGIN, 7),
         b256!("4f9bc7dd342a5ae3eae82c238c74109eb4322fd0c8898b7e21487d7e0750e1e4")
+    );
+}
+
+/// A hostile archive with its `messages` count forced to zero must not
+/// decode. `messages` is `RemoteEpochRecord`'s last field, so its
+/// archived length word is the archive's trailing 4 bytes (checked
+/// against a second, differently-sized record so this is not an assumed
+/// offset).
+#[test]
+fn an_archive_with_zero_messages_fails_to_decode() {
+    let one = derive_remote_epoch(SELF, ORIGIN, 0, &[msg(0, SELF)]).unwrap();
+    let two = derive_remote_epoch(SELF, ORIGIN, 0, &[msg(0, SELF), msg(1, SELF)]).unwrap();
+    let one_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&one).unwrap();
+    let two_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&two).unwrap();
+    // The last 4 bytes are the only ones that must encode a length: they
+    // read as 1 and 2 respectively, and every other trailing byte the
+    // pointer word covers is free to differ between the two records too.
+    let one_len_word = &one_bytes[one_bytes.len() - 4..];
+    let two_len_word = &two_bytes[two_bytes.len() - 4..];
+    assert_eq!(one_len_word, 1u32.to_le_bytes());
+    assert_eq!(two_len_word, 2u32.to_le_bytes());
+
+    let mut corrupted = one_bytes.to_vec();
+    let end = corrupted.len();
+    corrupted[end - 4..].copy_from_slice(&0u32.to_le_bytes());
+    assert!(
+        rkyv::from_bytes::<RemoteEpochRecord, rkyv::rancor::Error>(&corrupted).is_err(),
+        "a zero-length messages archive must not decode"
+    );
+}
+
+/// The other half of `RemoteEpochRecord`'s `Verify` impl: an archive whose
+/// `first_seq + messages.len()` overflows `u64` must not decode, and one
+/// right at the boundary (where it still fits) must. This is the same
+/// bound `derive_remote_epoch`'s `check_range_fits` and the validator's
+/// `SeqRange::new` both enforce — pinning it here proves the wire decoder
+/// agrees with what the producer can build and the validator can accept.
+#[test]
+fn an_archive_whose_seq_range_overflows_u64_fails_to_decode() {
+    let one_msg = |seq: u64| XChainMessage {
+        seq,
+        ..Default::default()
+    };
+    let overflowing = RemoteEpochRecord {
+        origin_chain_id: ORIGIN,
+        anchor_number: 0,
+        anchor_hash: B256::ZERO,
+        first_seq: u64::MAX,
+        messages: NonEmptyVec::new(one_msg(u64::MAX), alloc::vec![]),
+    };
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&overflowing).unwrap();
+    assert!(
+        rkyv::from_bytes::<RemoteEpochRecord, rkyv::rancor::Error>(&bytes).is_err(),
+        "first_seq + len (u64::MAX + 1) overflows u64; must not decode"
+    );
+
+    // The positive control, one below the boundary: `first_seq + len`
+    // (`u64::MAX - 1 + 1 == u64::MAX`) fits, so this one decodes.
+    let at_the_boundary = RemoteEpochRecord {
+        first_seq: u64::MAX - 1,
+        messages: NonEmptyVec::new(one_msg(u64::MAX - 1), alloc::vec![]),
+        ..overflowing
+    };
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&at_the_boundary).unwrap();
+    assert!(
+        rkyv::from_bytes::<RemoteEpochRecord, rkyv::rancor::Error>(&bytes).is_ok(),
+        "first_seq + len (u64::MAX) fits u64; must decode"
     );
 }

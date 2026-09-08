@@ -203,7 +203,7 @@ impl Cli {
             b_segment,
             a_segments,
         };
-        let reader = MultiArchiveReader::open(&multi_cfg)?;
+        let mut reader = MultiArchiveReader::open(&multi_cfg)?;
         info!(
             a_archive_count = reader.a_archive_count(),
             "opened M-archive reader"
@@ -220,23 +220,18 @@ impl Cli {
         let mut tx_count: u64 = 0;
         let mut block_count: u64 = 0;
         let mut remote_epoch_count: u64 = 0;
-        for rec in reader {
-            match rec? {
-                ResolvedRecord::Tx { position, env, .. } => {
-                    tx_count += 1;
-                    batcher.accumulator().observe_tx(env, position);
-                }
-                ResolvedRecord::RemoteEpoch { record, .. } => {
-                    remote_epoch_count += 1;
-                    batcher.accumulator().observe_remote_epoch(record);
-                }
-                ResolvedRecord::Boundary { marker, .. } => {
-                    block_count += 1;
-                    let closed = batcher.accumulator().observe_boundary(&marker);
-                    batcher.on_closed_block(closed)?;
-                }
+        reader.try_for_each(|rec| -> anyhow::Result<()> {
+            let rec = rec?;
+            match &rec {
+                ResolvedRecord::Tx { .. } => tx_count += 1,
+                ResolvedRecord::RemoteEpoch { .. } => remote_epoch_count += 1,
+                ResolvedRecord::Boundary { .. } => block_count += 1,
             }
-        }
+            if let Some(closed) = batcher.accumulator().observe(rec) {
+                batcher.on_closed_block(closed)?;
+            }
+            Ok(())
+        })?;
         info!(
             tx_count,
             block_count,
@@ -245,6 +240,24 @@ impl Cli {
             "archive scan complete"
         );
         Ok(batcher)
+    }
+
+    /// Post every batch in `sent_batches` to L1 in order, each one guarded
+    /// by the previous call's returned index (a CAS replay guard). Returns
+    /// the index after the last successful post.
+    async fn post_all_batches<P: alloy_provider::Provider>(
+        provider: &P,
+        settlement: Address,
+        mut prev_index: u64,
+        sent_batches: &[PostedBatch],
+        da_store: &kardamom_batcher::FsBlobStore,
+    ) -> anyhow::Result<u64> {
+        for batch in sent_batches {
+            prev_index = post_batch(provider, settlement, prev_index, batch, da_store)
+                .await
+                .context("post batch to L1")?;
+        }
+        Ok(prev_index)
     }
 
     /// Broadcast `sent_batches` to L1 when `--dry-run=false` (with the L1
@@ -256,18 +269,15 @@ impl Cli {
             let (provider, da_store) = live::connect_l1(rpc, key, da_dir).await?;
 
             // Start from the contract's current index (CAS replay guard).
-            let mut prev_index = live::read_last_batch_index(&provider, settlement).await?;
+            let prev_index = live::read_last_batch_index(&provider, settlement).await?;
             info!(%settlement, start_index = prev_index, "live L1 posting");
 
-            for batch in sent_batches {
-                prev_index = post_batch(&provider, settlement, prev_index, batch, &da_store)
-                    .await
-                    .context("post batch to L1")?;
-            }
+            let head_index =
+                Self::post_all_batches(&provider, settlement, prev_index, sent_batches, &da_store)
+                    .await?;
             info!(
                 posted = sent_batches.len(),
-                head_index = prev_index,
-                "live posting complete"
+                head_index, "live posting complete"
             );
         } else {
             if self.l1_rpc.is_some() || self.settlement.is_some() {

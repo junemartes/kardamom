@@ -107,11 +107,8 @@ pub fn encode_ingress_epoch(epoch: &EpochRecord) -> Result<Vec<u8>, WireError> {
 /// Returns an error if `rec` fails to rkyv-serialize, or its message
 /// count overflows `u32`.
 pub fn encode_ingress_remote_epoch(rec: &RemoteEpochRecord) -> Result<Vec<u8>, WireError> {
-    if rec.messages.is_empty() {
-        return Err(WireError::BadRemoteEpoch(
-            "empty remote epoch has no seq range".into(),
-        ));
-    }
+    // `rec.messages` is a `NonEmptyVec`, so an empty record cannot be
+    // built. No empty-batch check is needed at the wire boundary.
     let body = rkyv::to_bytes::<rkyv::rancor::Error>(rec)
         .map_err(|e| WireError::BadRemoteEpoch(e.to_string()))?;
     let slots = u32::try_from(remote_epoch_slots(rec)).map_err(|_| {

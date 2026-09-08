@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -77,23 +77,23 @@ pub async fn scrape(addr: SocketAddr) -> Result<Scrape> {
 /// `timeout` passes. On timeout, this fails with `what` as the message.
 /// Callers should put context in `what`.
 ///
+/// Re-exported from [`kardamom_obs::testkit`], the shared home for this
+/// helper across the workspace.
+///
 /// # Errors
 /// Returns an error when `f` itself errors, or when `timeout` passes
 /// before `f` returns `Some(v)`.
-pub async fn poll_until<T>(
-    what: &str,
-    timeout: Duration,
-    interval: Duration,
-    mut f: impl AsyncFnMut() -> Result<Option<T>>,
-) -> Result<T> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(v) = f().await? {
-            return Ok(v);
-        }
-        if Instant::now() >= deadline {
-            anyhow::bail!("timed out ({timeout:?}) waiting for {what}");
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
+pub use kardamom_obs::testkit::poll_until;
+
+/// Blocking analog of [`poll_until`], for code that runs off the tokio
+/// runtime (a spawned OS thread, or a sync bring-up path). Poll `f` every
+/// `interval` until it returns `Some(v)`, or until `timeout` passes. On
+/// timeout, this fails with `what` as the message.
+///
+/// Re-exported from [`kardamom_obs::testkit`], the shared home for this
+/// helper across the workspace.
+///
+/// # Errors
+/// Returns an error when `f` itself errors, or when `timeout` passes
+/// before `f` returns `Some(v)`.
+pub use kardamom_obs::testkit::poll_sync;

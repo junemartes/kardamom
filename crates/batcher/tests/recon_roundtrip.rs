@@ -110,28 +110,28 @@ fn remote_epoch(
     inputs: &[&[u8]],
     with_callback: bool,
 ) -> kardamom_types::xchain::RemoteEpochRecord {
-    use kardamom_types::xchain::{Callback, RemoteEpochRecord, XChainMessage, remote_source_hash};
-    let messages = inputs
-        .iter()
-        .enumerate()
-        .map(|(i, input)| {
-            let seq = first_seq + i as u64;
-            XChainMessage {
-                source_hash: remote_source_hash(origin, seq),
-                seq,
-                origin_sender: Address::repeat_byte(0xA1),
-                target: Address::repeat_byte(0xB2),
-                value: 0,
-                gas_limit: 150_000,
-                input: Bytes::copy_from_slice(input),
-                callback: with_callback.then(|| Callback {
-                    target: Address::repeat_byte(0xCB),
-                    gas_limit: 90_000,
-                    context: B256::repeat_byte(0x42),
-                }),
-            }
-        })
-        .collect();
+    use kardamom_types::xchain::{
+        Callback, NonEmptyVec, RemoteEpochRecord, XChainMessage, remote_source_hash,
+    };
+    let mut built = inputs.iter().enumerate().map(|(i, input)| {
+        let seq = first_seq + i as u64;
+        XChainMessage {
+            source_hash: remote_source_hash(origin, seq),
+            seq,
+            origin_sender: Address::repeat_byte(0xA1),
+            target: Address::repeat_byte(0xB2),
+            value: 0,
+            gas_limit: 150_000,
+            input: Bytes::copy_from_slice(input),
+            callback: with_callback.then(|| Callback {
+                target: Address::repeat_byte(0xCB),
+                gas_limit: 90_000,
+                context: B256::repeat_byte(0x42),
+            }),
+        }
+    });
+    let first = built.next().expect("fixture always carries a message");
+    let messages = NonEmptyVec::new(first, built.collect());
     RemoteEpochRecord {
         origin_chain_id: origin,
         anchor_number: 100 + first_seq,
@@ -189,7 +189,11 @@ fn roundtrip_max_size_messages_span_blobs() {
     let reconstructed = reconstruct(&batch.blobs).unwrap();
     assert_eq!(reconstructed, expected_frames(&blocks));
     assert_eq!(
-        reconstructed[0].remote_epochs[0].messages[0].input.len(),
+        reconstructed[0].remote_epochs[0]
+            .messages
+            .first()
+            .input
+            .len(),
         MAX_DATA_BYTES
     );
 }

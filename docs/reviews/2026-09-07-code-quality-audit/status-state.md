@@ -1186,3 +1186,337 @@ Rerun after all three fixes above, same commands, same target dir:
 4. `cargo fmt -p kardamom-state -p kardamom-types` — no changes; `-- --check` clean.
 
 Also reran `cargo check --workspace --all-targets` — passes cleanly (exit 0).
+
+## Round B (re-audit of the main delta, `crates/types` only)
+
+Scope: `reaudit-main.md`'s `types` section, plus the cross-crate items the
+round B brief assigned to the types owner. `crates/state` is untouched in
+this round (the merged delta added nothing to `crates/state`).
+
+### Done
+
+- R3, `crates/types/src/xchain.rs` split. The merge had already split it
+  into `xchain/{abi,derive,ids,layout,leaf,message,mod}.rs` plus test
+  siblings; this round finishes the split the reaudit still found lacking:
+  `derive.rs` split into a private `Batch` newtype (one method per verdict:
+  `check_no_duplicates`, `check_starts_at_expected`, `check_dense`,
+  `check_range_fits`, `check_destination`, `check_one_block`) called from a
+  five-line `derive_remote_epoch` entry point. Every file in `xchain/` is
+  under 500 code lines (largest: `derive.rs` at 184, `tests.rs` at 401).
+- R2, `crates/types/src/xchain/derive.rs` `derive_remote_epoch`: the `Batch`
+  split above also fixes the 101-line function; each method is under 20
+  lines.
+- R15, `crates/types/src/xchain/layout.rs`: the eight standalone layout fns
+  become two unit structs, `Outbox` and `Inbox`, with associated fns and
+  consts (`Outbox::nonces_slot`, `Outbox::sent_messages_slot`,
+  `Outbox::send_message_selector`, `Outbox::message_sent_topic0`,
+  `Inbox::next_seq_slot`, `Inbox::delivered_slot`); `mapping_slot` and
+  `u64_word` are now private helpers, not exported.
+- R15, `crates/types/src/xchain/derive.rs` / `ids.rs`: `check_anchor(origin,
+  msg)` is now `OutboxMessage::check_anchor(&self, origin)`;
+  `xchain_anchor_hash(origin, block)` is now `Anchor { origin_chain_id,
+  block_number }.hash()`.
+- R14, `crates/types/src/xchain/mod.rs`: one `keccak_concat(&[&[u8]])`
+  helper, used by `Anchor::hash`, `alias_remote_address`,
+  `RemoteEpochRecord::canonical_id`, `layout::mapping_slot`, and
+  `Inbox::delivered_slot` (the two call sites that built the same 64-byte
+  buffer twice).
+- R14 (cross-crate, item 3 of the brief): one
+  `XChainMessage::check_bounds(&self) -> Result<(), BoundsFault>` in
+  `crates/types/src/xchain/message.rs`, with a `BoundsFault` enum
+  (`ValueNotAllowed`, `GasLimitAboveCap`, `DataAboveCap`). `derive_remote_epoch`
+  calls it via `messages.iter().try_for_each(XChainMessage::check_bounds)?`
+  after building the `Vec<XChainMessage>` (so it now runs after the
+  `MultiBlockBatch` check, not before — no test in `tests.rs` combines the
+  two in one batch, so this reorder changes no observable behavior).
+  `XChainError` replaces its three duplicate variants with one
+  `Bounds(#[from] BoundsFault)`. The validator's `interop::verify::check_messages`
+  calls the same method and maps the fault into `RemoteEpochFault::Bounds`
+  (see `status-validator.md`).
+- R10, `crates/types/src/xchain/derive.rs`: the imperative `for w in
+  ordered.windows(2)` gap-check loop and the `ordered.iter().find(..)`
+  bounds loop are `Batch::check_dense`'s and `Batch::check_destination`'s
+  `try_for_each`/`find` bodies now; no manual loop remains in the batch
+  checks.
+- R9, `crates/types/src/xchain/derive.rs`: `split_first` was already in
+  place from the earlier round; unchanged.
+- R1: deleted every audit id and phase reference in `crates/types`:
+  `check_anchor`'s "audit M4" doc line (now `xchain_anchor_hash`'s replacement,
+  `Anchor::hash`'s doc), `canonical_id`'s "audit H3", `xchain_anchor_hash`'s
+  "the job of spec §10" (now "a separate, later check, never this field's
+  job" on `Anchor::hash`), and `tests.rs`/`layout_tests.rs`'s "Value pins
+  (audit 2026-09-03, L3)" / "(audit L4)" comment headers (the `forge
+  inspect` / `cast index` regeneration commands stay, as the brief
+  instructs). `crates/types/src/limits.rs`'s `ShardCount` doc lost its
+  "Phase B" heading and its literal `debug_assert!` mention (reworded so
+  the grep gate does not fire on prose).
+- R11/R14, `crates/types/src/xchain/leaf.rs`: deleted the `msg_leaf`
+  compatibility wrapper and its `#[allow(clippy::too_many_arguments)]`
+  (the grep-forbidden allow). `crates/validator/src/interop/extract.rs`
+  (ours) now calls `MsgLeaf { .. }.hash()` directly at both call sites
+  (`check_leaf`, and the `tests_support::honest_sent_log_full` fixture).
+- Item 4 (cross-crate), `crates/types/src/delta.rs`: `BalFrame.granularity`
+  is now `NonZeroU16`, parsed once by rkyv at the wire boundary rather than
+  re-checked by every reader. Verified safe before making the change: the
+  wire codec (`kardamom_log::codec`) uses rkyv's checked (`bytecheck`)
+  archive access, so a zeroed granularity byte pattern is a clean decode
+  `Err`, never a bytecheck panic or unchecked/UB read; a decode failure
+  drops the fragment and logs, which lands the frame in the existing,
+  already-tested `bal_missing` soft path (`validator_bal_missing_total`,
+  "not a proven divergence: log it and count it" — confirmed by reading
+  `crates/validator/src/seams.rs` and `crates/validator/src/metrics.rs`).
+  Added `delta::tests::a_zeroed_granularity_byte_pattern_fails_to_decode`,
+  which serializes two otherwise-identical frames differing only in
+  `granularity`, diffs the byte buffers to find the granularity bytes with
+  no assumption about rkyv's endianness, zeroes them in a third buffer,
+  and asserts `rkyv::from_bytes` returns `Err`. This is the one intended
+  behavior change in this round with its test, per the brief's
+  behavior-preservation rule.
+  `crates/validator/src/bin/kardamom-validator/pumps.rs::index_claims`
+  (already the boundary read site from an earlier round) no longer needs
+  its own `NonZeroU16::new(..) else { warn; return }` guard — the type now
+  carries the guarantee.
+
+### Callers outside this group, needed for the workspace to build again
+
+- `Outbox`/`Inbox`/`u64_word` (all eight renamed layout items):
+  `crates/e2e/src/scenarios/xchain.rs` (imports the old free-fn names:
+  `inbox_delivered_slot`, `inbox_next_seq_slot`, `message_sent_topic0`,
+  `outbox_nonces_slot`, `sent_messages_slot`, `u64_word`),
+  `crates/e2e/src/scenarios/xchain_two_stacks.rs` (all eight),
+  `crates/e2e/src/scenarios/xchain_da_parity.rs` (`inbox_next_seq_slot`,
+  `inbox_delivered_slot`). `crates/da_watcher` and `crates/engine` already
+  self-migrated to `Inbox::next_seq_slot` / `OutboxMessage::check_anchor`
+  during this round (confirmed by reading `da_watcher/src/interop/{reconcile,watcher}.rs`
+  and `engine/src/actor/exec_tests/interop.rs`); `crates/da_watcher/tests/interop_watcher.rs`
+  (an integration test, not a `src/` file) still imports the old
+  `xchain_anchor_hash` name and needs `Anchor { .. }.hash()`.
+- `msg_leaf` → `MsgLeaf { .. }.hash()`: `crates/e2e/src/scenarios/xchain.rs:297`.
+- `BalFrame.granularity: u16 → NonZeroU16`: `crates/executor/src/bal.rs`
+  (`configured_granularity() -> u16` at line 53, and `encode_frame`'s
+  `granularity: u16` parameter and the `BalFrame { granularity, .. }`
+  literal at line 102 — confirmed by `cargo check -p kardamom-executor`,
+  the one failure attributable to this change, distinct from an unrelated
+  concurrent `NonZero<usize>` migration in `crates/executor/src/parallel.rs`)
+  and `crates/e2e/src/harness/inject.rs:100` (`granularity: 1` literal).
+  No `crates/engine`, `crates/bench`, or `crates/exec-core` call site reads
+  `BalFrame.granularity` directly (grepped `\.granularity\b` across all
+  three; the only exec-core `granularity: u16` parameters, in
+  `stateless.rs`, are independent function arguments, not a `BalFrame`
+  field read).
+
+### Gates
+
+- `cargo check -p kardamom-types --all-targets --all-features`: clean.
+- `cargo test -p kardamom-types --all-features`: 68 lib + 19 integration
+  (`rkyv_roundtrip`), 0 failures, including the new granularity-decode
+  test.
+- `cargo fmt -p kardamom-types -- --check`: clean.
+- `cargo clippy -p kardamom-types --all-targets --all-features -- -D
+  warnings -W clippy::pedantic -D unreachable_pub`: zero warnings.
+- Forbidden-pattern grep (`debug_assert!`, `.max(1)`, `Box<dyn`,
+  `allow(clippy::too_many_arguments)`) over `crates/types`: no hits outside
+  test paths.
+- No file in `crates/types/src/xchain/` or `crates/types/src/limits.rs`/`delta.rs`
+  exceeds 500 code lines.
+
+## Round B, follow-up
+
+Three items from a mid-round coordinator message, plus a broadened R16
+sweep, addressed after the original Round B section above was written.
+
+### 1. `NonEmptyVec<XChainMessage>` (R9: no defensive check for a
+structurally-enforceable invariant)
+
+`RemoteEpochRecord::messages` was `Vec<XChainMessage>`, documented
+"non-empty by construction" but not enforced by the type — three
+downstream crates re-checked `is_empty()`/re-cast `.len()` at runtime
+instead.
+
+- Added `NonEmptyVec<T>` in `crates/types/src/xchain/message.rs`: a
+  single-field wrapper around `Vec<T>`, archived with rkyv's
+  `#[rkyv(bytecheck(verify))]` plus a hand-written `Verify` impl that
+  rejects a decoded archive with zero elements (mirrors rkyv's own
+  `ArchivedVec`/`ArchivedDuration` verify pattern). API: `new(first: T,
+  rest: Vec<T>)`, `len() -> NonZeroUsize`, `first()`/`last() -> &T`,
+  `iter()`, `as_slice()`, `as_mut_slice()`, `impl IntoIterator for
+  &NonEmptyVec<T>`. Deliberately no `Default`, no `Index`, no `Deref` —
+  nothing lets a caller reach for `[0]` or `.is_empty()` again.
+- `RemoteEpochRecord.messages` is now `NonEmptyVec<XChainMessage>`;
+  `Default` dropped from the struct's derive (a `NonEmptyVec` cannot be
+  built empty, so there is no default value); `last_seq()` simplified to
+  `first_seq.saturating_add(len().get() - 1)` — no underflow guard
+  needed, since `len().get() >= 1` always.
+- `crates/types/src/xchain/derive.rs::derive_remote_epoch`: builds the
+  record via `NonEmptyVec::new(first, rest)` from the batch's own
+  proven-non-empty `(first, rest)` split, instead of collecting into a
+  plain `Vec` and never re-checking it.
+- Test changes in `crates/types/src/xchain/tests.rs`: three struct
+  literals updated to `NonEmptyVec::new`; `[0]` indexing replaced with
+  `.first()`; deleted
+  `last_seq_does_not_underflow_on_an_empty_default_record` (the empty
+  case it guarded against is now unrepresentable); added
+  `an_archive_with_zero_messages_fails_to_decode`, which serializes a
+  1- and a 2-message record, confirms empirically that the archive's
+  trailing 4 bytes are exactly `messages`' length word (not an assumed
+  offset), zeroes that word in the 1-message archive, and asserts
+  `rkyv::from_bytes` rejects it — proof the `Verify` wiring is live, not
+  just present. `crates/types/tests/rkyv_roundtrip.rs`'s
+  `golden_remote_epoch_record` fixture updated the same way; its pinned
+  hex bytes are UNCHANGED (`NonEmptyVec<T>` archives identically to
+  `Vec<T>` — a single-field tuple struct adds no wire bytes), confirmed
+  by `remote_epoch_record_golden_bytes_are_pinned` still passing.
+
+**Callers outside this group, needing the same `NonEmptyVec::new(first,
+rest)` / `.len().get()` / `.first()`/`.last()` treatment** (checked
+against the tree at the time of this report; several were already fixed
+by their owning groups before this report was written):
+
+- `crates/cluster-adapter/src/wire/tests.rs:119` (struct literal,
+  `messages: vec![...]`) and `:357` (`rec.messages[0].callback = ...`) —
+  still pending as of this report; `wire/ingress.rs` and `wire/mod.rs`
+  (the production code) were already fixed by the owning group.
+- No other pending callers found: `crates/da_watcher/src/interop/watcher.rs`,
+  `crates/engine/src/reader/tests.rs`, `crates/engine/src/actor/test_support.rs`,
+  `crates/engine/src/reader/threads.rs`, `crates/sequencer/src/remote_epoch.rs`,
+  `crates/sequencer/src/outbound/cluster.rs`, and `crates/batcher/src/frame.rs`'s
+  own wire decoder (`decode_remote_epoch`, the second "wire boundary" a
+  coordinator message asked for) were already updated by their owning
+  groups by the time this report was written.
+
+### 2. R16, broadened form, across every owned production file
+
+A later coordinator message confirmed `docs/STYLE.md`'s R16 was
+deliberately broadened (by the repository owner) to: no loop containing
+an `if`/`else`/`match`/`let-else` in its body, and no loop inside a
+branch, in either direction — not just "no nested loops." Applied across
+every file this group owns. One production site, `crates/types` only
+(the validator-side sites are in the validator status doc):
+
+- `crates/types/src/genesis.rs::AllocEntry::to_alloc`: the `for entry in
+  &self.alloc { ...; if let Some(c) = entry.code.as_ref() { ... } }` loop
+  had an `if let` in its body. Split into `AllocEntry::code_hash()` and
+  `AllocEntry::code_entry() -> Option<CodeEntry>`, then two iterator
+  chains: `.iter().map(...)` for `accounts`, `.iter().filter_map(AllocEntry::code_entry)`
+  for `code`. No loop left.
+- `crates/types/src/withdrawals.rs::withdrawal_proof`: the `while
+  level.len() > 1 { let sibling = if ... else ...; ... }` loop had an
+  `if`/`else` in its body. Extracted to `fn sibling_of(level: &[B256],
+  idx: usize) -> B256`; the loop's body is now three plain statements
+  (push the helper's result, requantize `level`, halve `idx`).
+- `crates/types/src/withdrawals.rs::recompute_root`: same pattern, `for
+  sibling in proof { node = if ... else ...; ... }`. Extracted to `fn
+  combine_with_sibling(node: B256, sibling: B256, idx: usize) -> B256`.
+- Everything else already had branch-free loop bodies (verified by
+  grepping every `for`/`while`/`loop` site in `crates/types/src` and
+  reading each): `ack_policy.rs`, `position.rs`, `prover.rs`,
+  `xchain/mod.rs::keccak_concat`, `witness.rs::digest`'s three hashing
+  loops, and every test-file loop except none found needing a fix in
+  `crates/types` test files (the one test-side fix, `serve/tests.rs`, is
+  in the validator group).
+
+Behavior preservation: both `withdrawals.rs` extractions keep the exact
+same left/right ordering logic, just as named functions instead of
+inline branches; `proofs_recompute_root_all_sizes` (which specifically
+exercises `withdrawal_proof`+`recompute_root` together, sizes 1 through
+9) still passes.
+
+### Gates (this follow-up)
+
+- `cargo check -p kardamom-types --all-targets`: clean.
+- `cargo test -p kardamom-types --all-targets`: 69 lib + 19 integration
+  tests, all pass (one fewer lib test than the original Round B count:
+  the deleted underflow test; one more: the new zero-messages-archive
+  test — net even, but the coverage moved from an unrepresentable
+  in-memory case to the real wire-decode boundary).
+- `cargo fmt -p kardamom-types -- --check`: clean.
+- `cargo clippy -p kardamom-types --all-targets --no-deps -- -D warnings
+  -W clippy::pedantic -D unreachable_pub`: clean (required adding `#
+  Panics` doc sections to `NonEmptyVec::len`/`first`/`last`, since
+  clippy's `missing_panics_doc` cannot see that the panic is
+  unreachable by construction).
+- Forbidden-pattern grep: unchanged, clean.
+
+## Round B, follow-up 2 (`crates/types` only)
+
+Reversed the follow-up round's `NonEmptyVec` restructure ruling (that
+round's `(first, rest)` field-split plan was never implemented; a
+coordinator ruling before implementation kept `Vec<T>` storage instead,
+since the golden `RemoteEpochRecord` vector in `xchain/tests.rs` pins the
+archived bytes byte-for-byte and a field split would change them).
+Consolidated the three `.expect("non-empty by construction")` sites
+(`len`, `first`, `last`) into one private `fn split(&self) -> (&T, &[T])`
+in `message.rs`; the other three derive from it without their own panic.
+
+Restored `RemoteEpochRecord::last_seq() -> u64` to its original
+`saturating_add`/`saturating_sub` form (a prior round in this same pass
+had made it return `Option<u64>`, which broke three non-owned call sites
+in `cluster-adapter`/`da_watcher` — all reverted to their original form).
+The overflow guard instead moved to the wire boundary: `#[rkyv(bytecheck
+(verify))]` on `RemoteEpochRecord`'s own derive, with a hand-written
+`Verify` impl (`mod remote_epoch_verify`, mirroring `NonEmptyVec`'s own
+`non_empty_verify`) rejecting an archive whose `first_seq + (messages.len()
+- 1)` does not fit `u64`.
+
+Fixed a real behavior regression from the same earlier round:
+`derive_remote_epoch`'s bounds check had moved to run AFTER
+`check_one_block` and after copying every message into `Bytes`, instead of
+before (so a batch that spans two blocks AND carries an over-cap message
+wasted the copy, then reported `MultiBlockBatch` instead of `Bounds`).
+Added `OutboxMessage::check_bounds` (mirrors `XChainMessage::check_bounds`)
+and moved the check back to running on the borrowed messages before
+`check_one_block`; added
+`a_multi_block_batch_with_an_over_cap_message_faults_on_bounds_first` to
+`xchain/tests.rs` to pin the restored order.
+
+`withdrawals.rs`'s `sibling_of`/`combine_with_sibling` (extracted the
+prior Round B follow-up, see above) still used unchecked `level[idx + 1]`
+/ `level[idx - 1]` and a bare `assert!` at `withdrawal_proof`'s boundary.
+Replaced with a `Level(Vec<B256>)` newtype (`Level::leaves`,
+`Level::sibling` using `idx ^ 1` instead of `+1`/`-1`, `Level::up`) and a
+`LeafIndex::new(index, leaf_count) -> Option<Self>` parsed once at
+`withdrawal_proof`'s boundary instead of the `assert!`; the function's
+public signature and panic contract are unchanged (two non-owned callers,
+`crates/e2e/src/scenarios/bridge.rs` and
+`crates/validator/tests/withdrawal_e2e.rs`, needed no change).
+
+`genesis.rs::Genesis::to_alloc` walked `self.alloc` twice, hashing each
+code-carrying entry's code twice (`AccountChange::code_hash` from one
+pass, `AllocEntry::code_entry()`'s own `code_hash()` call from the other).
+Now one `.map(...).unzip()` pass computes `code_hash` once per entry and
+reuses it for both outputs; `AllocEntry::code_entry()` is deleted.
+
+`xchain/mod.rs::keccak_concat`'s manual `for p in parts { buf
+.extend_from_slice(p) }` loop became `keccak256(parts.concat())`.
+`NonEmptyVec::new`'s `Vec::with_capacity(rest.len() + 1)` became
+`rest.len().saturating_add(1)`.
+
+### Gates (follow-up 2)
+
+- `cargo check -p kardamom-types --all-features --all-targets`: clean.
+- `cargo test -p kardamom-types --lib`: 72 passed (up from 69: the new
+  `word_u64`/`u64_word` round-trip test from the prior addendum, the new
+  multi-block-plus-over-cap test above, and a self-review-pass addition
+  below; `withdrawals::tests` all pass, including the panic test for
+  `withdrawal_proof`'s now-`LeafIndex`-backed bound).
+- `cargo fmt -p kardamom-types -- --check`: clean.
+- `cargo clippy -p kardamom-types --all-features --all-targets -- -D
+  warnings -D clippy::pedantic -D unreachable_pub`: clean.
+- Forbidden-pattern grep: unchanged, clean.
+
+A self-review pass before reporting done caught a real defect in the
+`Verify` impl: it checked `first_seq + (len - 1)` (room for `last_seq`)
+instead of `first_seq + len` (room for `next_cursor`, one more — the bound
+the ruling specifies and the producer's `check_range_fits`/the validator's
+`SeqRange::new` both already use). Fixed to `first_seq.checked_add(len)
+.is_none()`; added `an_archive_whose_seq_range_overflows_u64_fails_to_
+decode` (positive and negative control at the exact `u64::MAX` boundary)
+to `xchain/tests.rs`, which passes against the fix and would have caught
+the original off-by-one. Also simplified `NonEmptyVec::len`'s
+`unwrap_or(NonZeroUsize::MIN)` fallback (a `.max(1)`-shaped sentinel) to
+`NonZeroUsize::MIN.saturating_add(rest.len())`.
+
+Full detail on the validator-side half of this round (SeqRange, the R15
+method conversions, the R1 comment fixes, the slots.rs lock-poisoning fix,
+and the workspace-build state) is in `status-validator.md`'s "Round B,
+follow-up 2" section.

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use alloy_primitives::U256;
 use kardamom_exec_core::features::{
-    FEATURE_HEALTH_CHECK, HEALTH_BEACON_SLOT, activation_slot, unpack_beacon,
+    Beacon, FEATURE_HEALTH_CHECK, HEALTH_BEACON_SLOT, activation_slot,
 };
 use kardamom_types::upgrades::CHAIN_STATE;
 
@@ -15,12 +15,12 @@ use crate::actor::test_support::{
 };
 
 /// Read the beacon out of a submitted block delta.
-fn beacon_in(delta: &kardamom_types::BlockDelta) -> Option<(u64, u64, u64)> {
+fn beacon_in(delta: &kardamom_types::BlockDelta) -> Option<Beacon> {
     delta
         .storage
         .iter()
         .find(|s| s.address == CHAIN_STATE && s.key == HEALTH_BEACON_SLOT)
-        .map(|s| unpack_beacon(s.value))
+        .map(|s| Beacon::unpack(s.value))
 }
 
 /// Two empty blocks, with the flag never scheduled. The chain must be
@@ -92,7 +92,11 @@ fn an_active_feature_beats_once_per_block() {
         let beat = i as u64 + 1;
         assert_eq!(
             beacon_in(delta),
-            Some((beat, boundary.block_number, boundary.l2_timestamp)),
+            Some(Beacon {
+                count: beat,
+                block_number: boundary.block_number,
+                timestamp_ms: boundary.l2_timestamp,
+            }),
             "block {} must carry beat {beat} with its own header fields",
             boundary.block_number
         );
@@ -140,8 +144,19 @@ fn activation_is_judged_against_the_blocks_own_header_timestamp() {
     assert_eq!(beacon_in(&log[0].1), None, "block 1 is before activation");
     assert_eq!(
         beacon_in(&log[1].1),
-        Some((1, 2, 5_000)),
+        Some(Beacon {
+            count: 1,
+            block_number: 2,
+            timestamp_ms: 5_000,
+        }),
         "activation is inclusive: the block AT T beats"
     );
-    assert_eq!(beacon_in(&log[2].1), Some((2, 3, 5_001)));
+    assert_eq!(
+        beacon_in(&log[2].1),
+        Some(Beacon {
+            count: 2,
+            block_number: 3,
+            timestamp_ms: 5_001,
+        })
+    );
 }

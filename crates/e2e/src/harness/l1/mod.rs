@@ -1,10 +1,11 @@
 //! Anvil as the L1, with the bridge contracts deployed.
 //!
-//! Bring-up predeploys the ERC-7955 factory with `anvil_setCode`, funds
-//! and impersonates `DEV_OWNER`, bootstraps the kardamom factory, then
-//! deploys the `WithdrawalOutputOracle` and `ETHLockbox` atomically, with
-//! the oracle's address predicted and wired into the lockbox's
-//! initializer.
+//! Bring-up spawns anvil through
+//! [`kardamom_deployer::testkit::AnvilRig`], which predeploys the
+//! ERC-7955 factory bytecode and funds and impersonates `DEV_OWNER`, then
+//! bootstraps the kardamom factory and deploys the
+//! `WithdrawalOutputOracle` and `ETHLockbox` atomically, with the
+//! oracle's address predicted and wired into the lockbox's initializer.
 //!
 //! Two anvil flags matter here:
 //! - `--slots-in-an-epoch 1`, so the `finalized` tag advances. The
@@ -23,7 +24,6 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result};
-use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_pair, encode_oracle_init_args};
 
 pub use contracts::*;
@@ -59,76 +59,42 @@ pub(crate) async fn await_l1_receipt(
 /// tests (50 ms poll). It takes the URL by value and captures no
 /// lifetime, so the result works where `'static` is required
 /// (`deposit_logs` hands it to `L1Source`).
+///
+/// # Errors
+/// Returns an error when `url` does not parse as a URL.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "a &str parameter would tie the returned impl Provider's captured lifetime to \
                the borrow (edition 2024 RPIT auto-capture), breaking the 'static callers \
                need; the value is read, not stored, so this is a deliberate exception"
 )]
-fn provider_for(url: String) -> impl Provider + Clone {
+fn provider_for(url: String) -> Result<impl Provider + Clone> {
     let p = ProviderBuilder::new()
         .disable_recommended_fillers()
-        .connect_http(url.parse().expect("valid anvil RPC url"));
+        .connect_http(url.parse().context("parse anvil RPC url")?);
     p.client().set_poll_interval(Duration::from_millis(50));
-    p
+    Ok(p)
 }
 
 /// Bring-up state for deploying the bridge contracts onto a fresh anvil
-/// instance. Holds the raw provider (for `anvil_*` cheatcodes), the
-/// wrapped [`Deployer`] (for factory and contract calls), and the L2
-/// chain id every step needs, so each bring-up step reads them as state
-/// instead of taking them as loose parameters.
+/// instance, once [`kardamom_deployer::testkit::AnvilRig::spawn`] has
+/// funded and impersonated the deploy accounts and predeployed the
+/// ERC-7955 factory bytecode. Holds the wrapped [`Deployer`] (for factory
+/// and contract calls) and the L2 chain id every step needs, so each
+/// bring-up step reads them as state instead of taking them as loose
+/// parameters.
 struct L1BringUp<P: Provider<alloy_network::Ethereum> + Clone> {
-    provider: P,
     deployer: Deployer<P>,
     l2_chain_id: u64,
 }
 
 impl<P: Provider<alloy_network::Ethereum> + Clone> L1BringUp<P> {
     fn new(provider: P, l2_chain_id: u64) -> Self {
-        let deployer = Deployer::new(provider.clone(), DEV_OWNER);
+        let deployer = Deployer::new(provider, DEV_OWNER);
         Self {
-            provider,
             deployer,
             l2_chain_id,
         }
-    }
-
-    /// Fund and impersonate the accounts the deploy needs, and predeploy
-    /// the ERC-7955 factory bytecode anvil does not ship with.
-    async fn prime_anvil(&self) -> Result<()> {
-        let _: serde_json::Value = self
-            .provider
-            .raw_request(
-                "anvil_setCode".into(),
-                (ERC7955_FACTORY, format!("0x{ERC7955_RUNTIME_HEX}")),
-            )
-            .await
-            .context("predeploy ERC-7955 factory")?;
-        let _: serde_json::Value = self
-            .provider
-            .raw_request(
-                "anvil_setBalance".into(),
-                (DEV_OWNER, U256::from(1_000_000_000_000_000_000_000u128)),
-            )
-            .await
-            .context("fund DEV_OWNER")?;
-        let _: serde_json::Value = self
-            .provider
-            .raw_request("anvil_impersonateAccount".into(), (DEV_OWNER,))
-            .await
-            .context("impersonate DEV_OWNER")?;
-        // The batcher signs real blob transactions, so it needs a real
-        // balance.
-        let _: serde_json::Value = self
-            .provider
-            .raw_request(
-                "anvil_setBalance".into(),
-                (BATCHER_ADDR, U256::from(1_000_000_000_000_000_000_000u128)),
-            )
-            .await
-            .context("fund the batcher EOA")?;
-        Ok(())
     }
 
     async fn ensure_factory(&self) -> Result<()> {
@@ -245,18 +211,31 @@ impl L1 {
     /// when the deployed oracle address does not match the address
     /// predicted before the deploy.
     pub async fn launch(l2_chain_id: u64) -> Result<Option<Self>> {
-        let Ok(anvil) = alloy_node_bindings::Anvil::new()
+        let anvil = alloy_node_bindings::Anvil::new()
             .block_time(1)
             .arg("--slots-in-an-epoch")
-            .arg("1")
-            .try_spawn()
+            .arg("1");
+        // Funds and impersonates DEV_OWNER, funds the batcher EOA only (it
+        // signs real blob transactions, so it needs a real balance, not
+        // impersonation), and predeploys the ERC-7955 factory bytecode
+        // anvil does not ship with.
+        let Some(rig) = kardamom_deployer::testkit::AnvilRig::spawn(
+            anvil,
+            &[
+                (
+                    DEV_OWNER,
+                    kardamom_deployer::testkit::Funding::FundAndImpersonate,
+                ),
+                (BATCHER_ADDR, kardamom_deployer::testkit::Funding::FundOnly),
+            ],
+        )
+        .await
         else {
             return Ok(None);
         };
 
-        let deploy_provider = provider_for(anvil.endpoint());
+        let deploy_provider = provider_for(rig.anvil.endpoint())?;
         let bring_up = L1BringUp::new(deploy_provider, l2_chain_id);
-        bring_up.prime_anvil().await?;
         bring_up.ensure_factory().await?;
 
         let predicted_oracle = bring_up.deploy_bridge_contracts().await?;
@@ -265,7 +244,7 @@ impl L1 {
             .await?;
 
         Ok(Some(Self {
-            anvil,
+            anvil: rig.anvil,
             lockbox: addrs.lockbox,
             oracle: addrs.oracle,
             settlement: addrs.settlement,
@@ -278,8 +257,10 @@ impl L1 {
     }
 
     /// A provider with no wallet (reads and anvil_* cheatcodes).
-    #[must_use]
-    pub fn provider(&self) -> impl Provider + Clone {
+    ///
+    /// # Errors
+    /// Returns an error when the anvil endpoint does not parse as a URL.
+    pub fn provider(&self) -> Result<impl Provider + Clone> {
         provider_for(self.anvil.endpoint())
     }
 
@@ -302,7 +283,7 @@ impl L1 {
     /// # Errors
     /// Returns an error when the `evm_mine` RPC call fails.
     pub async fn mine(&self, n: u64) -> Result<()> {
-        let p = self.provider();
+        let p = self.provider()?;
         for _ in 0..n {
             let _: serde_json::Value = p
                 .raw_request("evm_mine".into(), ())
@@ -319,7 +300,7 @@ impl L1 {
     /// Returns an error when the `evm_increaseTime` RPC call fails, or
     /// when the follow-up mine ([`Self::mine`]) fails.
     pub async fn warp_past_window(&self) -> Result<()> {
-        let p = self.provider();
+        let p = self.provider()?;
         let _: serde_json::Value = p
             .raw_request("evm_increaseTime".into(), (FINALIZATION_WINDOW + 10,))
             .await
@@ -396,7 +377,7 @@ impl L1 {
         feature_id: U256,
         activation_timestamp: u64,
     ) -> Result<(B256, u64)> {
-        let provider = self.provider();
+        let provider = self.provider()?;
         let lockbox = ETHLockbox::new(self.lockbox, &provider);
         let receipt = lockbox
             .initiateUpgrade(feature_id, activation_timestamp)
@@ -447,7 +428,7 @@ impl L1 {
     /// # Errors
     /// Returns an error when the `upgradeNonce` call fails.
     pub async fn upgrade_nonce(&self) -> Result<u64> {
-        let provider = self.provider();
+        let provider = self.provider()?;
         let lockbox = ETHLockbox::new(self.lockbox, &provider);
         lockbox
             .upgradeNonce()
@@ -491,7 +472,7 @@ impl L1 {
         }
 
         let _: serde_json::Value = self
-            .provider()
+            .provider()?
             .raw_request("evm_mine".into(), ())
             .await
             .context("evm_mine (seal batch)")?;
@@ -513,7 +494,7 @@ impl L1 {
     /// [`resume_block_production`](Self::resume_block_production).
     async fn set_automine(&self, on: bool) -> Result<()> {
         let _: serde_json::Value = self
-            .provider()
+            .provider()?
             .raw_request("evm_setAutomine".into(), (on,))
             .await
             .with_context(|| format!("evm_setAutomine({on})"))?;
@@ -547,7 +528,7 @@ impl L1 {
     /// finalized a block yet.
     pub async fn finalized_block_number(&self) -> Result<u64> {
         let block = self
-            .provider()
+            .provider()?
             .get_block_by_number(alloy_eips::BlockNumberOrTag::Finalized)
             .await
             .context("get finalized block")?
@@ -572,7 +553,7 @@ impl L1 {
         // Use `provider_for`, not `provider()`. `provider()` returns an
         // `impl Provider` that captures `&self`, but `L1Source` needs
         // `'static`.
-        let source = kardamom_da_watcher::RpcL1Source::new(provider_for(self.anvil.endpoint()));
+        let source = kardamom_da_watcher::RpcL1Source::new(provider_for(self.anvil.endpoint())?);
         kardamom_da_watcher::L1Source::lockbox_logs(&source, self.lockbox, from_block, to_block)
             .await
             .context("read lockbox logs")

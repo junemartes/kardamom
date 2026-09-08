@@ -6,7 +6,7 @@ use crate::mv::MvCache;
 use crate::mv::ReadRecord;
 use alloy_primitives::B256;
 use alloy_primitives::U256;
-use kardamom_exec_core::delta::PendingDelta;
+use kardamom_exec_core::delta::{AccountFields, PendingDelta};
 use kardamom_exec_core::executor::SnapshotRef;
 use kardamom_types::StateDatabase;
 use revm::database::DatabaseRef;
@@ -42,20 +42,25 @@ impl<S: StateDatabase> DatabaseRef for BlockInput<'_, S> {
         &self,
         address: alloy_primitives::Address,
     ) -> Result<Option<AccountInfo>, Self::Error> {
-        for mv in self.mv_layers {
-            if let Some((_, a)) = mv.read_account(u32::MAX, &address) {
-                return Ok(Some(account_info(a.nonce, a.balance, a.code_hash)));
-            }
+        if let Some((_, a)) = self
+            .mv_layers
+            .iter()
+            .find_map(|mv| mv.read_account(u32::MAX, &address))
+        {
+            return Ok(Some(account_info(AccountFields {
+                nonce: a.nonce,
+                balance: a.balance,
+                code_hash: a.code_hash,
+            })));
         }
-        for layer in self
+        if let Some(fields) = self
             .layers
             .iter()
             .map(std::convert::AsRef::as_ref)
             .chain(self.base)
+            .find_map(|layer| layer.accounts.get(&address))
         {
-            if let Some((nonce, balance, code_hash)) = layer.accounts.get(&address) {
-                return Ok(Some(account_info(*nonce, *balance, *code_hash)));
-            }
+            return Ok(Some(account_info(*fields)));
         }
         SnapshotRef {
             inner: self.snapshot,
@@ -64,26 +69,25 @@ impl<S: StateDatabase> DatabaseRef for BlockInput<'_, S> {
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
-        for mv in self.mv_layers {
-            if let Some(code) = mv.read_code(&code_hash) {
-                return Ok(revm::state::Bytecode::new_raw(
-                    alloy_primitives::Bytes::copy_from_slice(&code),
-                ));
-            }
+        if let Some(code) = self
+            .mv_layers
+            .iter()
+            .find_map(|mv| mv.read_code(&code_hash))
+        {
+            return Ok(revm::state::Bytecode::new_raw(
+                alloy_primitives::Bytes::copy_from_slice(&code),
+            ));
         }
-        for layer in self
+        if let Some(code) = self
             .layers
             .iter()
             .map(std::convert::AsRef::as_ref)
             .chain(self.base)
+            .find_map(|layer| layer.code.get(&code_hash).filter(|c| !c.is_empty()))
         {
-            if let Some(code) = layer.code.get(&code_hash)
-                && !code.is_empty()
-            {
-                return Ok(revm::state::Bytecode::new_raw(
-                    alloy_primitives::Bytes::copy_from_slice(code),
-                ));
-            }
+            return Ok(revm::state::Bytecode::new_raw(
+                alloy_primitives::Bytes::copy_from_slice(code),
+            ));
         }
         SnapshotRef {
             inner: self.snapshot,
@@ -97,20 +101,21 @@ impl<S: StateDatabase> DatabaseRef for BlockInput<'_, S> {
         index: U256,
     ) -> Result<U256, Self::Error> {
         let key = B256::from(index.to_be_bytes::<32>());
-        for mv in self.mv_layers {
-            if let Some((_, v)) = mv.read_slot(u32::MAX, &address, &key) {
-                return Ok(v);
-            }
+        if let Some((_, v)) = self
+            .mv_layers
+            .iter()
+            .find_map(|mv| mv.read_slot(u32::MAX, &address, &key))
+        {
+            return Ok(v);
         }
-        for layer in self
+        if let Some(v) = self
             .layers
             .iter()
             .map(std::convert::AsRef::as_ref)
             .chain(self.base)
+            .find_map(|layer| layer.storage.get(&(address, key)))
         {
-            if let Some(v) = layer.storage.get(&(address, key)) {
-                return Ok(*v);
-            }
+            return Ok(*v);
         }
         SnapshotRef {
             inner: self.snapshot,
@@ -282,7 +287,11 @@ impl<S: StateDatabase> MvView<'_, S> {
         if let Some((ver, a)) = self.mv.read_account(self.idx, &address) {
             self.n_mv_hit += 1;
             self.reads.push(ReadRecord::Account(address, Some(ver)));
-            return Ok(Some(account_info(a.nonce, a.balance, a.code_hash)));
+            return Ok(Some(account_info(AccountFields {
+                nonce: a.nonce,
+                balance: a.balance,
+                code_hash: a.code_hash,
+            })));
         }
         self.reads.push(ReadRecord::Account(address, None));
         // Probe predecessor mv layers first (newest first, at
@@ -290,23 +299,29 @@ impl<S: StateDatabase> MvView<'_, S> {
         // pending-delta layers, then the base layer, all before the
         // cache. The pool-lifetime cache mirrors
         // the backend only, and these layers change per block.
-        for mv in self.base.mv_layers {
-            if let Some((_, a)) = mv.read_account(u32::MAX, &address) {
-                self.n_base_hit += 1;
-                return Ok(Some(account_info(a.nonce, a.balance, a.code_hash)));
-            }
+        if let Some((_, a)) = self
+            .base
+            .mv_layers
+            .iter()
+            .find_map(|mv| mv.read_account(u32::MAX, &address))
+        {
+            self.n_base_hit += 1;
+            return Ok(Some(account_info(AccountFields {
+                nonce: a.nonce,
+                balance: a.balance,
+                code_hash: a.code_hash,
+            })));
         }
-        for layer in self
+        if let Some(fields) = self
             .base
             .layers
             .iter()
             .map(std::convert::AsRef::as_ref)
             .chain(self.base.base)
+            .find_map(|layer| layer.accounts.get(&address))
         {
-            if let Some((nonce, balance, code_hash)) = layer.accounts.get(&address) {
-                self.n_base_hit += 1;
-                return Ok(Some(account_info(*nonce, *balance, *code_hash)));
-            }
+            self.n_base_hit += 1;
+            return Ok(Some(account_info(*fields)));
         }
         let sh = BaseCache::shard(&address);
         if let Some(a) = self.base_cache.accounts[sh]
@@ -376,23 +391,25 @@ impl<S: StateDatabase> MvView<'_, S> {
             return Ok(v);
         }
         self.reads.push(ReadRecord::Slot(address, key, None));
-        for mv in self.base.mv_layers {
-            if let Some((_, v)) = mv.read_slot(u32::MAX, &address, &key) {
-                self.n_base_hit += 1;
-                return Ok(v);
-            }
+        if let Some((_, v)) = self
+            .base
+            .mv_layers
+            .iter()
+            .find_map(|mv| mv.read_slot(u32::MAX, &address, &key))
+        {
+            self.n_base_hit += 1;
+            return Ok(v);
         }
-        for layer in self
+        if let Some(v) = self
             .base
             .layers
             .iter()
             .map(std::convert::AsRef::as_ref)
             .chain(self.base.base)
+            .find_map(|layer| layer.storage.get(&(address, key)))
         {
-            if let Some(v) = layer.storage.get(&(address, key)) {
-                self.n_base_hit += 1;
-                return Ok(*v);
-            }
+            self.n_base_hit += 1;
+            return Ok(*v);
         }
         let sh = BaseCache::shard(&address);
         if let Some(v) = self.base_cache.storage[sh]

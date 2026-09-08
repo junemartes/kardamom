@@ -55,39 +55,3 @@ impl MsgLeaf {
         keccak256(buf)
     }
 }
-
-/// Compatibility wrapper over [`MsgLeaf::hash`], kept only for the two
-/// external callers this group cannot change directly:
-/// `crates/e2e/src/scenarios/xchain.rs` and
-/// `crates/validator/src/interop/extract.rs`. **Phase B**: move both onto
-/// `MsgLeaf::hash` at merge, then delete this function.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "compatibility wrapper for the two Phase-B external callers named above; \
-              MsgLeaf::hash is the real, argument-struct-based rule"
-)]
-#[must_use]
-pub fn msg_leaf(
-    origin_chain_id: u64,
-    dest_chain_id: u64,
-    seq: u64,
-    sender: Address,
-    target: Address,
-    value: u128,
-    gas_limit: u64,
-    data_hash: B256,
-    cb_hash: B256,
-) -> B256 {
-    MsgLeaf {
-        origin_chain_id,
-        dest_chain_id,
-        seq,
-        sender,
-        target,
-        value,
-        gas_limit,
-        data_hash,
-        cb_hash,
-    }
-    .hash()
-}

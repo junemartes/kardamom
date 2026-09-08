@@ -12,12 +12,10 @@
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use kardamom_types::SnapshotSource;
-
 use crate::error::ExecutorError;
-use crate::reader::{EpochObserver, ReaderToExec};
+use crate::reader::ReaderToExec;
 
-use super::ports::{StateWriterQueue, StateWriterSignal};
+use super::wiring::ExecPorts;
 
 // Re-exported so sibling arm modules (`exec_records`, `exec_markers`,
 // `exec_boundary`, `exec_settle`) can import both `ExecState` and `Flow`
@@ -54,61 +52,60 @@ pub(super) enum Flow {
     Stop,
 }
 
-impl<S, Q, P, E> ExecState<S, Q, P, E>
-where
-    S: SnapshotSource + 'static,
-    Q: StateWriterSignal + 'static,
-    P: StateWriterQueue + 'static,
-    E: EpochObserver + 'static,
-{
+impl<W: ExecPorts> ExecState<W> {
     /// The exec thread's main loop. It receives a message, or runs the idle
     /// probe, then dispatches to the matching handler. It stops cleanly when
     /// the commit channel's receiver is gone, or the reader channel closes.
     fn run(&mut self) -> Result<(), ExecutorError> {
-        loop {
-            let msg = match self.recv_next() {
-                Recv::Msg(m) => m,
-                Recv::Closed => {
-                    self.on_closed();
-                    return Ok(());
-                }
-                Recv::IdleProbe => match self.on_idle_probe()? {
-                    Flow::Continue => continue,
-                    Flow::Stop => return Ok(()),
-                },
-            };
-            let flow = match msg {
-                ReaderToExec::Tx {
-                    tx_idx,
-                    envelope,
-                    position,
-                } => self.on_tx(tx_idx, envelope, position)?,
-                ReaderToExec::Epoch {
-                    tx_idx,
-                    epoch,
-                    position,
-                } => self.on_epoch(tx_idx, &epoch, position)?,
-                ReaderToExec::Deposit {
-                    tx_idx,
-                    deposit,
-                    position,
-                } => self.on_deposit(tx_idx, deposit, position)?,
-                ReaderToExec::RemoteEpoch {
-                    tx_idx,
-                    record,
-                    position,
-                } => self.on_remote_epoch(tx_idx, &record, position)?,
-                ReaderToExec::XChain {
-                    tx_idx,
-                    origin_chain_id,
-                    message,
-                    position,
-                } => self.on_xchain(tx_idx, origin_chain_id, message, position)?,
-                ReaderToExec::Boundary(start) => self.on_boundary(&start)?,
-            };
-            if let Flow::Stop = flow {
-                return Ok(());
+        while let Flow::Continue = self.recv_and_dispatch()? {}
+        Ok(())
+    }
+
+    /// One receive-then-dispatch step: [`Self::recv_next`], then either
+    /// the idle probe or the matching `on_*` handler. [`Self::run`] stays
+    /// a plain loop over this.
+    fn recv_and_dispatch(&mut self) -> Result<Flow, ExecutorError> {
+        let msg = match self.recv_next() {
+            Recv::Msg(m) => m,
+            Recv::Closed => {
+                self.on_closed();
+                return Ok(Flow::Stop);
             }
+            Recv::IdleProbe => return self.on_idle_probe(),
+        };
+        self.dispatch(msg)
+    }
+
+    /// Dispatch one canonical-stream message to its handler.
+    fn dispatch(&mut self, msg: ReaderToExec) -> Result<Flow, ExecutorError> {
+        match msg {
+            ReaderToExec::Tx {
+                tx_idx,
+                envelope,
+                position,
+            } => self.on_tx(tx_idx, envelope, position),
+            ReaderToExec::Epoch {
+                tx_idx,
+                epoch,
+                position,
+            } => self.on_epoch(tx_idx, &epoch, position),
+            ReaderToExec::Deposit {
+                tx_idx,
+                deposit,
+                position,
+            } => self.on_deposit(tx_idx, deposit, position),
+            ReaderToExec::RemoteEpoch {
+                tx_idx,
+                record,
+                position,
+            } => self.on_remote_epoch(tx_idx, &record, position),
+            ReaderToExec::XChain {
+                tx_idx,
+                origin_chain_id,
+                message,
+                position,
+            } => self.on_xchain(tx_idx, origin_chain_id, message, position),
+            ReaderToExec::Boundary(start) => self.on_boundary(&start),
         }
     }
 
@@ -132,15 +129,14 @@ where
     }
 }
 
-pub(crate) fn spawn_exec<S, Q, P, E>(
-    inputs: ExecInputs<S, Q, P, E>,
-) -> JoinHandle<Result<(), ExecutorError>>
-where
-    S: SnapshotSource + 'static,
-    Q: StateWriterSignal + 'static,
-    P: StateWriterQueue + 'static,
-    E: EpochObserver + 'static,
-{
+/// Spawn the exec thread.
+///
+/// # Panics
+///
+/// Panics if the OS refuses to spawn the thread.
+pub(crate) fn spawn_exec<W: ExecPorts + 'static>(
+    inputs: ExecInputs<W>,
+) -> JoinHandle<Result<(), ExecutorError>> {
     thread::Builder::new()
         .name("executor-exec".into())
         .spawn(move || -> Result<(), ExecutorError> { ExecState::new(inputs).run() })

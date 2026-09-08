@@ -165,11 +165,7 @@ fn exec_settles_inflight_commits_while_idle() {
     let mut boundaries = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while boundaries.len() < 3 && std::time::Instant::now() < deadline {
-        match rx_e2c.recv_timeout(Duration::from_millis(100)) {
-            Ok(ExecToCommit::Boundary(b)) => boundaries.push(b.block_number),
-            Ok(ExecToCommit::Receipt(_)) => panic!("no receipts in this scenario"),
-            Err(_) => {}
-        }
+        poll_one_boundary(&rx_e2c, &mut boundaries);
     }
     assert_eq!(
         boundaries,
@@ -184,4 +180,14 @@ fn exec_settles_inflight_commits_while_idle() {
 
     drop(tx_r2e);
     h.join().expect("no panic").expect("exec ok");
+}
+
+/// One bounded poll for the next boundary. The `while` loop above stays
+/// free of a branch.
+fn poll_one_boundary(rx: &crossbeam_channel::Receiver<ExecToCommit>, boundaries: &mut Vec<u64>) {
+    match rx.recv_timeout(Duration::from_millis(100)) {
+        Ok(ExecToCommit::Boundary(b)) => boundaries.push(b.block_number),
+        Ok(ExecToCommit::Receipt(_)) => panic!("no receipts in this scenario"),
+        Err(_) => {}
+    }
 }

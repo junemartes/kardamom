@@ -3,10 +3,13 @@
 //! single-channel IPC mode (one shared channel) or through MDS fan-in
 //! over per-replica unicast endpoints.
 
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use std::collections::VecDeque;
+use std::num::NonZeroU32;
+
+use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{error, info, warn};
 
-use super::super::{AeronRuntime, DeliverFn, PubHandle};
+use super::super::{AeronRuntime, PubHandle, RawFrame, TypedSubscription};
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
@@ -27,19 +30,20 @@ use kardamom_types::{BPosition, BlockBoundary, Receipt};
 /// limit this fallback has today.
 fn attach_mds_endpoints(
     kind: &str,
-    executor_count: u32,
+    executor_count: Option<NonZeroU32>,
     endpoint_of: impl Fn(u32) -> Option<String>,
     attach: impl Fn(&str) -> Result<(), LogError>,
 ) -> Result<(), LogError> {
-    if executor_count == 0 {
+    let Some(executor_count) = executor_count else {
         warn!(
             kind,
             "tx_receipts MDS enabled but executor_count is 0 — this subscription will \
              receive nothing; set --executor-count / KARDAMOM_EXECUTOR_COUNT or \
              channels.tx_receipts_executor_count"
         );
-    }
-    for i in 0..executor_count {
+        return Ok(());
+    };
+    for i in 0..executor_count.get() {
         let endpoint = endpoint_of(i).ok_or_else(|| {
             LogError::Aeron(format!(
                 "tx_receipts {kind} endpoint({i}) is None (MDS misconfigured)"
@@ -131,7 +135,7 @@ trait MdsSubscriber: Sized {
     fn open_auto(
         rt: &AeronRuntime,
         ch: &ChannelsConfig,
-        executor_count: u32,
+        executor_count: Option<NonZeroU32>,
     ) -> Result<Self, LogError> {
         if !ch.tx_receipts_mds_enabled() {
             return Self::open(rt, ch);
@@ -291,30 +295,20 @@ impl TxReceiptsPublisherHandle {
 /// [`add_destination`](Self::add_destination). The retained `sub_id` is
 /// what `add_destination`/`remove_destination` target.
 pub struct TxReceiptsSubscriberHandle {
-    rx: UnboundedReceiver<(BPosition, Receipt)>,
+    /// The receive path: same fields and `recv`/`try_recv` bodies as the
+    /// standalone [`TxReceiptsReceiver`]. Held by composition so the fan-out
+    /// loop lives in one place; see [`TxReceiptsReceiver::recv`].
+    receiver: TxReceiptsReceiver,
     mds: MdsSub,
 }
 
 impl TxReceiptsSubscriberHandle {
-    /// Fan a `Vec<Receipt>` batch frame (the only receipt wire format; see
-    /// [`TxReceiptsPublisherHandle::publish_receipts`]) back out into
-    /// per-receipt deliveries, preserving in-frame order. Consumers keep
-    /// the exact `(BPosition, Receipt)` stream they always had.
-    fn batch_fanout_deliver(
-        msg_tx: tokio::sync::mpsc::UnboundedSender<(BPosition, Receipt)>,
-    ) -> DeliverFn {
-        Box::new(move |bytes: &[u8], pos: BPosition, _session: i32| {
-            match codec::materialize::<Vec<Receipt>>(bytes) {
-                Ok(batch) => {
-                    for r in batch {
-                        let _ = msg_tx.send((pos, r));
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e, "decode failed on tx_receipts batch delivery");
-                }
-            }
-        })
+    pub async fn recv(&mut self) -> Option<(BPosition, Receipt)> {
+        self.receiver.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Option<(BPosition, Receipt)> {
+        self.receiver.try_recv()
     }
 
     /// The single-shared-channel subscriber (IPC default).
@@ -341,7 +335,7 @@ impl TxReceiptsSubscriberHandle {
     pub fn open_auto(
         rt: &AeronRuntime,
         ch: &ChannelsConfig,
-        executor_count: u32,
+        executor_count: Option<NonZeroU32>,
     ) -> Result<Self, LogError> {
         <Self as MdsSubscriber>::open_auto(rt, ch, executor_count)
     }
@@ -382,15 +376,8 @@ impl TxReceiptsSubscriberHandle {
         self.mds.remove_destination(uri)
     }
 
-    pub async fn recv(&mut self) -> Option<(BPosition, Receipt)> {
-        self.rx.recv().await
-    }
-
-    pub fn try_recv(&mut self) -> Option<(BPosition, Receipt)> {
-        self.rx.try_recv().ok()
-    }
-
-    /// Drop the handle's `AeronRuntime` clone, keeping only the receiver.
+    /// Drop the handle's `AeronRuntime` clone, keeping only the receive
+    /// path.
     ///
     /// Use this when the receiver moves into a long-lived pump task that
     /// ends on `recv() == None`. Keeping the whole handle there creates an
@@ -408,8 +395,45 @@ impl TxReceiptsSubscriberHandle {
     /// attached at open time survive; they live in the driver, not in
     /// this handle).
     #[must_use]
-    pub fn into_receiver(self) -> UnboundedReceiver<(BPosition, Receipt)> {
-        self.rx
+    pub fn into_receiver(self) -> TxReceiptsReceiver {
+        self.receiver
+    }
+}
+
+/// A [`TxReceiptsSubscriberHandle`] with its `AeronRuntime` clone dropped
+/// and no MDS operations left, keeping only the receive path. See
+/// [`TxReceiptsSubscriberHandle::into_receiver`].
+pub struct TxReceiptsReceiver {
+    rx: UnboundedReceiver<RawFrame>,
+    pending: VecDeque<(BPosition, Receipt)>,
+}
+
+impl TxReceiptsReceiver {
+    pub async fn recv(&mut self) -> Option<(BPosition, Receipt)> {
+        while self.pending.is_empty() {
+            self.pending = decode_receipt_batch(&self.rx.recv().await?);
+        }
+        self.pending.pop_front()
+    }
+
+    pub fn try_recv(&mut self) -> Option<(BPosition, Receipt)> {
+        while self.pending.is_empty() {
+            self.pending = decode_receipt_batch(&self.rx.try_recv().ok()?);
+        }
+        self.pending.pop_front()
+    }
+}
+
+/// Decode one `tx_receipts` batch frame into its individual receipts, in
+/// frame order. A malformed frame logs and yields no receipts, so the
+/// caller's loop tries the next frame instead of ending the subscription.
+fn decode_receipt_batch(frame: &RawFrame) -> VecDeque<(BPosition, Receipt)> {
+    match codec::materialize::<Vec<Receipt>>(&frame.bytes) {
+        Ok(batch) => batch.into_iter().map(|r| (frame.pos, r)).collect(),
+        Err(e) => {
+            error!(error = %e, "decode failed on tx_receipts batch delivery");
+            VecDeque::new()
+        }
     }
 }
 
@@ -417,28 +441,26 @@ impl MdsSubscriber for TxReceiptsSubscriberHandle {
     const KIND: &'static str = "receipt";
 
     fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        let (msg_tx, rx) = unbounded_channel();
-        rt.open_subscription_with_deliver(
-            &ch.tx_receipts_channel,
-            ch.tx_receipts_stream_id,
-            Self::batch_fanout_deliver(msg_tx),
-        )?;
+        let (_sub_id, rx) =
+            rt.open_subscription_raw(&ch.tx_receipts_channel, ch.tx_receipts_stream_id)?;
         Ok(Self {
-            rx,
+            receiver: TxReceiptsReceiver {
+                rx,
+                pending: VecDeque::new(),
+            },
             mds: MdsSub::new(None, rt, "receipts"),
         })
     }
 
     fn open_mds(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
         require_mds(ch)?;
-        let (msg_tx, rx) = unbounded_channel();
-        let sub_id = rt.open_subscription_with_deliver(
-            &ch.tx_receipts_control_channel,
-            ch.tx_receipts_stream_id,
-            Self::batch_fanout_deliver(msg_tx),
-        )?;
+        let (sub_id, rx) =
+            rt.open_subscription_raw(&ch.tx_receipts_control_channel, ch.tx_receipts_stream_id)?;
         Ok(Self {
-            rx,
+            receiver: TxReceiptsReceiver {
+                rx,
+                pending: VecDeque::new(),
+            },
             mds: MdsSub::new(Some(sub_id), rt, "receipts"),
         })
     }
@@ -458,7 +480,7 @@ impl MdsSubscriber for TxReceiptsSubscriberHandle {
 /// channel, and [`open_mds`](Self::open_mds) plus
 /// [`add_destination`](Self::add_destination) for the fan-in path.
 pub struct TxReceiptsBoundarySubscriberHandle {
-    rx: UnboundedReceiver<(BPosition, BlockBoundary)>,
+    rx: TypedSubscription<BlockBoundary>,
     mds: MdsSub,
 }
 
@@ -498,7 +520,7 @@ impl TxReceiptsBoundarySubscriberHandle {
     pub fn open_auto(
         rt: &AeronRuntime,
         ch: &ChannelsConfig,
-        executor_count: u32,
+        executor_count: Option<NonZeroU32>,
     ) -> Result<Self, LogError> {
         <Self as MdsSubscriber>::open_auto(rt, ch, executor_count)
     }
@@ -530,7 +552,7 @@ impl TxReceiptsBoundarySubscriberHandle {
     }
 
     pub fn try_recv(&mut self) -> Option<(BPosition, BlockBoundary)> {
-        self.rx.try_recv().ok()
+        self.rx.try_recv()
     }
 }
 
@@ -565,5 +587,57 @@ impl MdsSubscriber for TxReceiptsBoundarySubscriberHandle {
 
     fn mds(&self) -> &MdsSub {
         &self.mds
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One raw batch frame must fan out to every receipt it carries, in
+    /// order, before the receiver goes back to the raw channel. This is
+    /// consumer-side behavior (`TxReceiptsReceiver`, what
+    /// `into_receiver()` returns), so the test needs no `AeronRuntime`.
+    #[test]
+    fn one_batch_frame_fans_out_to_every_receipt_in_order() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut receiver = TxReceiptsReceiver {
+            rx,
+            pending: VecDeque::new(),
+        };
+        let pos = BPosition {
+            term_id: 1,
+            term_offset: 2,
+        };
+        let batch = vec![
+            Receipt {
+                nonce: 0,
+                ..Default::default()
+            },
+            Receipt {
+                nonce: 1,
+                ..Default::default()
+            },
+            Receipt {
+                nonce: 2,
+                ..Default::default()
+            },
+        ];
+        tx.send(RawFrame {
+            bytes: codec::encode(&batch).unwrap().to_vec(),
+            pos,
+            session: 0,
+        })
+        .unwrap();
+
+        for expected in &batch {
+            let (got_pos, got) = receiver.try_recv().expect("fanned-out receipt");
+            assert_eq!(got_pos, pos);
+            assert_eq!(&got, expected);
+        }
+        assert!(
+            receiver.try_recv().is_none(),
+            "every receipt in the one frame was already drained"
+        );
     }
 }

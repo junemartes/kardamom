@@ -64,7 +64,7 @@ impl StateRoot {
     /// # Errors
     ///
     /// Returns [`StateError`] if a table read fails.
-    pub fn storage_root_incremental(
+    pub(crate) fn storage_root_incremental(
         tx: &RwTxSync,
         storage_trie: Database,
         hashed_storage: Database,
@@ -81,7 +81,7 @@ impl StateRoot {
     /// # Errors
     ///
     /// Returns [`StateError`] if a table read fails.
-    pub fn state_root_incremental(
+    pub(crate) fn state_root_incremental(
         tx: &RwTxSync,
         account_trie: Database,
         hashed_accounts: Database,

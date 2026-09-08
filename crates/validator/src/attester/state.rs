@@ -65,7 +65,7 @@ pub(crate) struct AttestState {
 
 impl AttestState {
     #[must_use]
-    pub fn new(last_attested: u64, interval: NonZeroU64) -> Self {
+    pub(crate) fn new(last_attested: u64, interval: NonZeroU64) -> Self {
         Self {
             pending: BTreeMap::new(),
             last_attested,
@@ -79,7 +79,7 @@ impl AttestState {
     /// Buffer a committed block's state root. It becomes attestable only
     /// once the receipt stream confirms that block's receipts are
     /// complete. See [`next_attestable`](Self::next_attestable).
-    pub fn on_root(&mut self, block: u64, state_root: B256) {
+    pub(crate) fn on_root(&mut self, block: u64, state_root: B256) {
         if block > self.last_attested {
             self.roots.insert(block, state_root);
         }
@@ -91,7 +91,7 @@ impl AttestState {
     /// cheaper. An output at block B commits to every withdrawal through
     /// B, and this keeps one L1 transaction per catch-up burst.
     #[must_use]
-    pub fn next_attestable(&self) -> Option<(u64, B256)> {
+    pub(crate) fn next_attestable(&self) -> Option<(u64, B256)> {
         self.roots
             .range(..=self.receipts_through)
             .next_back()
@@ -117,7 +117,7 @@ impl AttestState {
     ///   flight. Reaching here means that gate failed. Report it clearly,
     ///   and still keep the leaves, because the alternative is silently
     ///   stranding a user's withdrawal on top of the defect.
-    pub fn on_leaves(&mut self, block: u64, leaves: Vec<B256>) {
+    pub(crate) fn on_leaves(&mut self, block: u64, leaves: Vec<B256>) {
         self.receipts_through = self.receipts_through.max(block);
         if leaves.is_empty() {
             return;
@@ -145,7 +145,7 @@ impl AttestState {
 
     /// True once `block`'s state root warrants a new output.
     #[must_use]
-    pub fn due(&self, block: u64) -> bool {
+    pub(crate) fn due(&self, block: u64) -> bool {
         block >= self.last_attested.saturating_add(self.interval.get())
     }
 
@@ -155,7 +155,7 @@ impl AttestState {
     /// [`mark_attested`] does that, after a successful post, so a failed
     /// post retries with the same accumulated set.
     #[must_use]
-    pub fn leaves_through(&self, block: u64) -> Vec<B256> {
+    pub(crate) fn leaves_through(&self, block: u64) -> Vec<B256> {
         self.pending
             .range(..=block)
             .flat_map(|(_, l)| l.iter().copied())
@@ -163,7 +163,7 @@ impl AttestState {
     }
 
     /// A successful post covered everything up to `block`.
-    pub fn mark_attested(&mut self, block: u64) {
+    pub(crate) fn mark_attested(&mut self, block: u64) {
         // Record where this process's own coverage begins, before the
         // floor moves. See `own_attest_floor`.
         self.own_attest_floor
@@ -177,7 +177,7 @@ impl AttestState {
     }
 
     #[must_use]
-    pub fn last_attested(&self) -> u64 {
+    pub(crate) fn last_attested(&self) -> u64 {
         self.last_attested
     }
 }

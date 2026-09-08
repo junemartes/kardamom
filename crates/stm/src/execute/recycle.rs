@@ -81,23 +81,7 @@ impl SpentBlock {
             g.extend(bufs.into_iter().take(room));
         }
         if let Ok(nodes) = Arc::try_unwrap(nodes) {
-            for nd in &nodes {
-                nd.open.store(false, Ordering::Relaxed);
-                nd.children.lock().expect("node poisoned").clear();
-                nd.indegree.store(0, Ordering::Relaxed);
-                nd.worker.store(0, Ordering::Relaxed);
-                nd.queued.store(false, Ordering::Relaxed);
-                nd.fifo_preds.lock().expect("node poisoned").clear();
-            }
-            pools
-                .arenas
-                .lock()
-                .expect("pools poisoned")
-                .push(SpentArena {
-                    slots,
-                    results,
-                    nodes,
-                });
+            Self::park_nodes(nodes, slots, results, &pools);
         }
         match Arc::try_unwrap(mv) {
             Ok(cache) => {
@@ -108,5 +92,32 @@ impl SpentBlock {
                 pools.mv_parked.lock().expect("pools poisoned").push(shared);
             }
         }
+    }
+
+    /// Reset every node in a no-longer-shared arena, and park it in the
+    /// pool for reuse. [`Self::reap`]'s branch stays free of a loop.
+    fn park_nodes(
+        nodes: Vec<Node>,
+        slots: Vec<std::sync::OnceLock<TxSlot>>,
+        results: Vec<std::sync::OnceLock<Result<TxResult, ExecutorError>>>,
+        pools: &RecyclePools,
+    ) {
+        for nd in &nodes {
+            nd.open.store(false, Ordering::Relaxed);
+            nd.children.lock().expect("node poisoned").clear();
+            nd.indegree.store(0, Ordering::Relaxed);
+            nd.worker.store(0, Ordering::Relaxed);
+            nd.queued.store(false, Ordering::Relaxed);
+            nd.fifo_preds.lock().expect("node poisoned").clear();
+        }
+        pools
+            .arenas
+            .lock()
+            .expect("pools poisoned")
+            .push(SpentArena {
+                slots,
+                results,
+                nodes,
+            });
     }
 }

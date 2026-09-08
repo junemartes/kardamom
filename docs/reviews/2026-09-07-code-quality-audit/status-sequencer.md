@@ -1072,3 +1072,85 @@ R4: deleted a dead `drop(refs);` in `tests/sequencer_step.rs`'s
 — `refs` is `rig.refs()`'s owned `Vec` (round 3), not a mutex guard, so
 the manual drop no longer releases anything. `clippy -D warnings` and
 `cargo fmt -p kardamom-sequencer -- --check` both clean.
+
+## Round B (group C: da_watcher, interop-feed, cluster-adapter, cluster-client, sequencer, log, ingress, obs)
+
+`crate-sequencer.md`/`dry-sequencer.md` findings from `reaudit-main.md`, plus the two
+cross-cutting items (`fakes.rs` leftovers, `cluster-client` `unreachable_pub`) this round's
+brief assigned by name.
+
+### sequencer (`crates/sequencer/src/**`)
+
+- R1 (audit ids): deleted from `feeds.rs` ("audit H2/H9", "audit H2" x2), `epoch.rs` ("audit
+  H2" in the doc, "Audit H2:" on a test), `remote_epoch.rs` (same two spots).
+- R10 (`feeds.rs` reject branch: kind-byte check, decode, log, metric): already fine per the
+  finding's own note; the `reason` field is now `RemoteOriginRejectReason` (see the
+  cluster-adapter Round B note in `status-batcher.md`), and `feeds.rs` calls `reason.as_str()`
+  instead of `wire::remote_origin_reject_reason(reason)`.
+- Leftover from the merge, `fakes.rs` `pump_contract::run`: took no `pending` parameter and
+  was unused (the four idle/closed/backpressure/retry tests in `epoch.rs` and
+  `remote_epoch.rs` had their own, fully duplicated bodies instead of calling it). Fixed:
+  `run<T: Clone>(first: &T, second: &T, process: impl FnMut(&mut ScriptedQueue<T>, &mut
+  InMemoryTxOrderingRefPublisher, &mut Option<(BPosition, T)>) -> Result<bool,
+  SequencerError>)` now covers idle, closed, backpressure-holds-the-record,
+  retry-does-not-poll-past-the-held-record (the two previously-dropped assertions, restored as
+  `sub.len()` checks before and after a repeated backpressured call), and
+  relay-once-backpressure-clears. `epoch.rs` and `remote_epoch.rs` each replace their four
+  duplicated tests with one `#[test] fn {epoch,remote_epoch}_pump_honors_the_shared_contract()`
+  calling `pump_contract::run`.
+- `ScriptedQueue<T>::len(&self) -> usize` (`#[cfg(test)]`, `pub(crate)`) added, for the
+  retry-does-not-poll-past-the-held-record assertion above.
+- R11/R14 (`PendingEpoch`/`PendingRemoteEpoch` type aliases over a tuple, one generic
+  `Pump<T>` to replace `process_epoch`/`process_remote_epoch`'s line-for-line duplicate):
+  **done**. New `crate::pump` module: `Held<T> { pos, record }` replaces both tuple aliases,
+  and `Pump<T> { held: Option<Held<T>> }`'s `step(poll, publish, on_relayed)` is the one body
+  both `process_epoch` and `process_remote_epoch` now call — each becomes a thin wrapper
+  supplying its own `poll`/`publish` closures, plus an `on_relayed` hook (`|_| {}` for epochs,
+  a metric call for remote epochs, since that was the only place the two bodies actually
+  differed). `bin/kardamom-sequencer/feeds.rs`'s `OriginPump<S, P, Pending>` needed no change
+  beyond its doc: `Pending` is now `Pump<EpochRecord>`/`Pump<RemoteEpochRecord>`, inferred the
+  same way `PendingEpoch`/`PendingRemoteEpoch` were. `fakes.rs`'s `pump_contract::run` and both
+  `epoch.rs`/`remote_epoch.rs` tests updated to pass `&mut Pump::default()` instead of `&mut
+  None`; `Pump::is_held()` (`#[cfg(test)]`, `pub(crate)`) replaces the old `pending.is_some()`
+  assertions, since `held` is a private field.
+- Pre-existing gate-blockers found and fixed in this group's own directory while running the
+  full gate: `state/mod.rs` (12 items) and `pending.rs`/`sender.rs` (10 items) had `pub` types
+  and methods inside `pub(crate) mod state`/`pub(crate) mod pending`/`pub(crate) mod sender` —
+  all narrowed to `pub(crate)`. `fakes.rs`'s `pump_contract::run` (new, this round) needed the
+  same fix. None of these are called from outside the crate.
+- R1 comment fix, unrelated file this group touched for the grep gate: `resync/mod.rs`'s
+  `enter_threshold` doc said "not a `.max(1)` fixup", which the mechanical grep matches
+  literally; reworded to "never rounded up in place" (no behavior change).
+
+### cluster-client (`crates/cluster-client/src/protocol.rs`)
+
+- R8 (26 `unreachable_pub` errors under `-D unreachable_pub`): `protocol` is `pub(crate) mod
+  protocol` in `lib.rs`, so every `pub` item inside it was unreachable from outside the crate.
+  All 26 (9 consts, `DecodeError`, `MessageHeader` + `decode`, `SessionConnectRequest` +
+  `decode_session_connect_request`, `encode_session_keep_alive`,
+  `encode_session_close_request`, `decode_two_i64`, `wrap_session_message`, `SessionMessage`,
+  `SessionEvent`, `encode_session_event`, `NewLeaderEvent`, `encode_new_leader_event`,
+  `Egress`, `decode_egress`) narrowed to `pub(crate)` — `session` (a sibling module) and the
+  crate's own tests are the only consumers.
+
+### Item 4 (`crates/log`/`crates/obs`), sequencer-side caller
+
+- `tx_receipts_executor_count`: see `status-log.md`'s Round B section for the type change.
+  `bin/kardamom-sequencer/main.rs`'s `ResyncWiring::spawn` changed
+  `executor_count.unwrap_or(channels.tx_receipts_executor_count)` to
+  `executor_count.or(channels.tx_receipts_executor_count.map(NonZeroU32::get)).unwrap_or(0)`.
+
+### Gates
+
+- `cargo clippy -p kardamom-sequencer -p kardamom-cluster-client --all-targets --all-features
+  -- -D warnings -W clippy::pedantic -D unreachable_pub`: clean (0 warnings) after the
+  `pending.rs`/`sender.rs`/`state/mod.rs`/`fakes.rs` `pub(crate)` fixes above.
+- `cargo test -p kardamom-sequencer -p kardamom-cluster-client`: 72 and 28 tests pass (the two
+  new `pump_contract::run`-based tests included).
+- `cargo fmt -p kardamom-sequencer -p kardamom-cluster-client -- --check`: clean.
+- Forbidden-pattern grep: prints nothing for `crates/sequencer/src/**` or
+  `crates/cluster-client/src/**` outside `tests?/`/`test_support`.
+- `cargo check -p kardamom-validator --bins --all-features`: clean —
+  `bin/kardamom-validator/pumps.rs:163`'s `tx_receipts_executor_count` call site was already
+  updated (by another agent) to the new `Option<NonZeroU32>` type by the time this round
+  checked it.

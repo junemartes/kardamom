@@ -18,6 +18,34 @@ mod common;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// Bind port 0 with a throwaway listener, to pick a free port, then run
+/// `kardamom_obs::init` on it. The pick-then-rebind window is racy:
+/// another process can grab the port in between, and the exporter binds
+/// eagerly, so init fails if it does. Retry with a fresh port in that
+/// case. A bind failure happens before the global recorder installs, so
+/// calling init again is safe.
+///
+/// # Panics
+///
+/// Panics if `init` never succeeds within 5 attempts.
+async fn init_on_a_free_port() -> SocketAddr {
+    let mut last_err = None;
+    for _ in 0..5 {
+        let free: SocketAddr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        match kardamom_obs::init("obs-test", free, "runtime-host", "0.0.0", "deadbeef").await {
+            Ok(()) => return free,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    panic!(
+        "init never succeeded on a freshly-picked free port: {:#}",
+        last_err.expect("at least one attempt records an error")
+    );
+}
+
 #[test]
 fn init_and_scrape_on_current_thread_runtime() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -25,30 +53,7 @@ fn init_and_scrape_on_current_thread_runtime() {
         .build()
         .unwrap();
     rt.block_on(async {
-        // Bind port 0 with a throwaway listener, to pick a free port, then
-        // reuse it. The pick-then-rebind window is racy: another process
-        // can grab the port in between, and the exporter binds eagerly, so
-        // init fails if it does. Retry with a fresh port in that case. A
-        // bind failure happens before the global recorder installs, so
-        // calling init again is safe.
-        let mut free: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let mut last_err = None;
-        for _ in 0..5 {
-            free = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap();
-            match kardamom_obs::init("obs-test", free, "runtime-host", "0.0.0", "deadbeef").await {
-                Ok(()) => {
-                    last_err = None;
-                    break;
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        if let Some(e) = last_err {
-            panic!("init never succeeded on a freshly-picked free port: {e:#}");
-        }
+        let free = init_on_a_free_port().await;
 
         metrics::gauge!("kardamom_obs_test_gauge").set(42.0);
 

@@ -2,10 +2,14 @@
 //! lives in `main.rs`; state recovery in `state.rs`; role adapters in
 //! `wiring.rs`.
 
+use std::num::NonZeroU8;
 use std::path::PathBuf;
 
 use clap::Parser;
 use kardamom_engine::bin_support::StateDurabilityArg;
+
+/// Default `--shards`: the sequencer\'s default `partition_count`.
+const DEFAULT_SHARDS: NonZeroU8 = NonZeroU8::new(8).unwrap();
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,8 +41,8 @@ pub(crate) struct Args {
     pub(crate) recorder_id: u32,
     /// Number of tx_data shards to subscribe to. The default is 8, to match
     /// the default `partition_count` in the sequencer.
-    #[arg(long, default_value_t = 8)]
-    pub(crate) shards: u8,
+    #[arg(long, default_value_t = DEFAULT_SHARDS)]
+    pub(crate) shards: NonZeroU8,
     /// Execute blocks through the Block-STM engine (block-at-a-time; a
     /// streaming pipeline is a planned follow-up). When off, the binary
     /// uses the streaming per-tx path, byte-for-byte as before. Output is

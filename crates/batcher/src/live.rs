@@ -25,6 +25,7 @@
 
 mod cursor;
 mod feed;
+pub mod poll;
 mod run;
 mod sender;
 

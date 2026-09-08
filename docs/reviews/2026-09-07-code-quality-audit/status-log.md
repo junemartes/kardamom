@@ -480,3 +480,193 @@ pass; `cargo fmt -p kardamom-log -p kardamom-obs -- --check` clean;
 `cargo check --workspace --all-targets` clean. `cargo check -p
 kardamom-log --features docker-e2e --all-targets` also compiles clean
 (the `SingleNodeRig` change touches all three docker-e2e test files).
+
+## Round B (group C: da_watcher, interop-feed, cluster-adapter, cluster-client, sequencer, log, ingress, obs)
+
+Item 4 of this round's brief: the four deferred R6/R9/R13/R14 rows Phase A/C left for Phase B
+because their fix crosses into other crates.
+
+- **`DeliverFn` (`aeron_live/mod.rs`)**: **removed entirely** — no `Box<dyn` remains anywhere
+  in `crates/log` or `crates/cluster-adapter`. R6 has no wiring-seam exemption, so the earlier
+  "kept as the one erasure point, documented" answer in this section was reversed once that
+  was made explicit; the two designs offered (a generic subscription handle, or a typed
+  channel the Aeron thread sends into) are both implemented, split by what each consumer needs:
+  - A new `RawFrame { bytes: Vec<u8>, pos: BPosition, session: i32 }` (`pub`, in
+    `aeron_live/mod.rs`) is the one concrete, non-generic payload that crosses
+    `RuntimeCmd::OpenSubscription` to the dedicated Aeron thread. Decoding into a caller's own
+    message type (over any `crate::codec::WireMessage` a downstream crate defines — the set
+    stays genuinely open, proven by `kardamom-validator`'s own `BalFrame` instantiation) moves
+    off the Aeron thread entirely, onto the consumer, decoded lazily on `recv`/`try_recv`.
+  - `FrameSink` (`pub(super)`, in `aeron_live/mod.rs`) is a plain two-variant enum — `Tokio` or
+    `Crossbeam` — naming which of the two channel kinds this crate's subscriptions ever need,
+    not a trait object: `Tokio` for every async consumer in `crates/log` itself; `Crossbeam`
+    for `kardamom-cluster-adapter`'s session thread, a plain OS thread that waits on this
+    receiver alongside another crossbeam channel via `crossbeam_channel::Select` (tokio's
+    channels do not implement `Select`'s `SelectHandle` trait, so that consumer could not use
+    the `Tokio` variant). This set is closed by this module's own design, unlike `T` — two
+    delivery mechanisms, not two message types.
+  - `AeronRuntime::open_subscription_raw`/`open_subscription_raw_crossbeam` replace
+    `open_subscription_with_deliver`, returning a `RawFrame` receiver of the matching kind
+    instead of taking a closure. `TypedSubscription<T>` (`open_subscription`,
+    `open_subscription_merged`, `open_subscription_with_id`) and the new `TxDataSubscription`
+    (`open_tx_data_subscription`) wrap the tokio receiver and decode on `recv`/`try_recv`; a
+    malformed frame logs and is skipped, matching the old inline-decode closures' tolerance
+    exactly (pinned by a new test, see below). `crates/cluster-adapter/src/live/mod.rs`'s
+    `open_egress` uses the crossbeam variant directly, since its session thread needs the raw
+    bytes on a `Select`-compatible receiver; `session_loop.rs`'s `frame_rx` field and
+    `drain_egress`'s `self.driver.on_egress(&frame.bytes)` changed type accordingly, no
+    behavior change (egress frames were always relayed verbatim, pos/session unused).
+  - `TxReceiptsSubscriberHandle`'s batch fan-out (one raw frame → several `(BPosition,
+    Receipt)` items) needed a small owned buffer instead of a stateless per-frame decode:
+    `pending: VecDeque<(BPosition, Receipt)>`, refilled by `decode_receipt_batch` each time it
+    empties. `into_receiver()` now returns a new `TxReceiptsReceiver` (same `recv`/`try_recv`,
+    no `MdsSub`/`AeronRuntime` — the whole point of `into_receiver`) instead of the raw tokio
+    type; `crates/ingress/src/aeron_adapters.rs` (owned by this group) gained one
+    `impl_pump_source!(TxReceiptsReceiver, Receipt)` line for it.
+  - `refetch.rs`'s `drain`/`recv_timeout` (a from-scratch `poll_recv`-driven timeout, run from
+    a plain thread with no tokio runtime entered) could no longer operate on a raw
+    `UnboundedReceiver<T>` directly, since `TypedSubscription`/`TxDataSubscription` decode
+    lazily instead of storing decoded items in the channel. New `PollRecv` trait (`pub`, one
+    `poll_recv` method) implemented by both, so `drain`/`recv_timeout` stay generic — the same
+    manual `Waker`-driven design, unchanged behavior, now over the trait instead of the
+    concrete tokio type.
+  - Two new tests pin the decode-on-read behavior no Docker-gated test reaches:
+    `runtime::tests::typed_subscription_skips_a_malformed_frame_and_decodes_the_next` and
+    `tx_receipts::tests::one_batch_frame_fans_out_to_every_receipt_in_order`. Neither needs an
+    `AeronRuntime` — both build a bare `unbounded_channel` and send `RawFrame`s by hand.
+- **`HostId` (`lib.rs`)**: `pub struct HostId(String)` with `impl FromStr` (rejects empty),
+  `AsRef<str>`, `Display`. `init(host_id: &str, ..)` is unchanged — its own `is_empty` check
+  stays, since binaries this group does not own still pass a raw `&str`. The three binaries
+  this group owns (`da_watcher`, `sequencer`, `ingress`) changed their `--host-id` clap field
+  from `String` to `kardamom_obs::HostId` (clap derives the parser from `FromStr`), so an
+  empty host id now fails argument parsing instead of reaching `init`. Every other binary's
+  `kardamom_obs::init(...)`/`init_service!(...)` call needs no change.
+- **`tx_receipts_executor_count` (`config/mod.rs`)**: `u32` → `Option<NonZeroU32>`; `0` is now
+  `None` ("no known executor count", MDS still enabled with a warning), any positive count is
+  `Some`. `Default` sets `None`. `validate()`'s `2 * i64::from(self.tx_receipts_executor_count)`
+  is now `.map_or(0, std::num::NonZeroU32::get)` first. A `0` in a config file now fails to
+  parse instead of loading as "no executor count"; `config/tests.rs`'s
+  `mds_executor_count_zero_is_rejected` pins the new rejection. Callers this group owns:
+  `crates/ingress/src/bin/kardamom-ingress/main.rs` and
+  `crates/sequencer/src/bin/kardamom-sequencer/main.rs`, both changed from `.unwrap_or(..)` to
+  `.or(channels.tx_receipts_executor_count.map(NonZeroU32::get)).unwrap_or(0)`. Not owned by
+  this group: `crates/validator/src/bin/kardamom-validator/pumps.rs:163` — already updated to
+  the new type by the time this round checked it (another agent's concurrent edit).
+- **Refetch sinks (`refetch.rs`)**: `fetch_tx_data`'s and `fetch_deposits`'s
+  `sink: &mut dyn FnMut(..)` are now `sink: impl FnMut(..)` (owned, not `&mut dyn`).
+  `crates/engine/src/bin_support.rs`'s `ArchiveJoinRecovery` (the only caller, owned by
+  another group) needed **no change**: `&mut dyn FnMut(A, B)` already implements `FnMut(A,
+  B)` via std's blanket impl, so its existing `sink: &mut dyn FnMut(..)` parameter satisfies
+  the new `impl FnMut(..)` bound as-is. Confirmed with `cargo check -p kardamom-engine
+  --all-features`: clean, unchanged.
+
+### Other findings fixed while in these files
+
+- Pre-existing gate-blocker: `crates/log/tests/common/mod.rs`'s `tx_envelope`/`tx_ref` were
+  `pub` with no external consumer (the module is `mod common;`-included per test file, never
+  a library item); narrowed to `pub(crate)`.
+- `redundant_closure_for_method_calls` (pedantic): `config/mod.rs`'s `.map_or(0, |n|
+  n.get())` (introduced by the `tx_receipts_executor_count` change above) is
+  `.map_or(0, std::num::NonZeroU32::get)`.
+
+### R16, second pass (no single-line guard exemption)
+
+The coordinator's second R16 message named four specific sites by shape; all four are fixed
+here (the fifth and sixth, in `da_watcher`, are reported in `status-batcher.md`'s section):
+
+- `refetch.rs::fetch_deposits`'s `if len <= 0 { continue; }` inside its `for rec in recs`
+  loop: the loop is split in two. A first pass builds `plans: Vec<(FoundRecording,
+  ReplayPlan)>` (still a `for`, but with no branch in its body — only the fallible
+  `replay_bounds` call, propagated with `?`, which still ends the whole function on a real
+  archive error). The second pass iterates `plans.into_iter().filter(|(_, plan)| plan.len >
+  0)`, so the length check is gone from inside a loop body entirely. The loop's other
+  branches (the subscription-reuse `if let`/`else`, the `if replay_result.is_ok() {..} else
+  {0}`, the `if let Err(e) = replay_result { return }`) are unchanged — the coordinator's
+  message named only the length check, and pulling the resource lifecycle logic (a
+  subscription must go back into `deposit_subs` on every path) into an iterator chain would
+  need a much larger rewrite than what was asked.
+- `crates/obs/src/testkit.rs::scrape`'s `for _ in 0..40 { if let Ok(r) = .. && .. { return }
+  sleep().await; }`: the `if` moves into a new `try_scrape(url) -> ControlFlow<String>`
+  helper; the loop is now `for _ in 0..40 { match try_scrape(url).await { Break(body) =>
+  return body, Continue(()) => sleep().await } }`.
+
+- `cargo clippy -p kardamom-log --all-targets --all-features -- -D warnings -W
+  clippy::pedantic -D unreachable_pub`: clean.
+- `cargo test -p kardamom-log --lib`: 38 pass (36 plus the two new decode-on-read tests
+  above). Docker-gated tests
+  (`docker-e2e`/`aeron_live_e2e.rs`, `offer_connect_race.rs`, `offer_starvation.rs`) not run,
+  per the brief.
+- `cargo fmt -p kardamom-log -- --check`: clean.
+- Forbidden-pattern grep: prints nothing for `crates/log/src/**` outside `tests?/` — no
+  `Box<dyn` remains at all now that `DeliverFn` is gone (see above). Except:
+  `crates/log/src/testing/cluster.rs`'s five `Box<dyn std::error::Error>` return types match
+  the grep literally, but that module is a Docker-test harness gated behind
+  `docker-e2e`/`testing` (`crates/log/src/testing/mod.rs`'s own doc: "Gated behind
+  `#[cfg(any(test, feature = \"testing\"))]`"); the grep's exclusion list only names
+  `test_support`, not `testing/`, which looks like a gap in the pattern rather than a real
+  production-code hit. Left unchanged; flagging here rather than silently passing it.
+- **obs (`crates/obs/src/**`)**: `HostId` above; also added `kardamom_obs::testkit`
+  (`free_port`, `scrape`, feature `test-support`, `reqwest` optional dep) per item 6 — see
+  that item's own report. `cargo clippy -p kardamom-obs --lib --all-features -- -D warnings -W
+  clippy::pedantic -D unreachable_pub`: clean. `cargo clippy -p kardamom-obs --all-targets
+  ...`: blocked by `crates/obs/tests/common/mod.rs`'s pre-existing `pub fn free_port`/`pub
+  async fn scrape` (unreachable pub) — that file is under `crates/obs/tests/**`, outside this
+  group's file list (`crates/obs/src/**` only), so left unfixed and reported here instead.
+
+## Round B, second follow-up: behavior notes and a migration
+
+- **`refetch.rs::fetch_deposits` now computes every replay plan before it
+  replays any.** The loop used to compute one recording's bounds, replay
+  it, then move to the next. It now builds `plans` for every recording
+  first, then replays. A `replay_bounds` error on recording N now aborts
+  the call before recording 1 is replayed, where the old code replayed
+  and delivered recordings `1..N-1` first, then failed on N. This is
+  correct: `fetch_deposits` is a best-effort recovery path
+  (`ArchiveJoinRecovery`), its caller retries the whole call on error,
+  and deposit volume is tiny, so re-replaying an already-delivered
+  recording on retry is cheap and idempotent (the caller's join index
+  dedups by position). No caller was found that depends on the old
+  partial-progress delivery order.
+- **Migration: `tx_receipts_executor_count = 0` in an existing
+  `channels.toml` now fails to load.** The field is
+  `Option<NonZeroU32>`; `0` in TOML is a parse error, where it used to
+  parse as a literal `0` meaning "no known count." An operator config
+  that spells the disabled case as `0` must change it to omit the key
+  entirely (the default is `None`, which means the same thing). This is
+  also documented on the field's doc comment in
+  `crates/log/src/config/mod.rs`.
+- **`ChannelUri`, a new non-empty-string newtype for the fixed Aeron
+  channel fields** (`tx_ordering_channel`, `tx_receipts_channel`,
+  `tx_errors_channel`, `tx_deposits_channel`, `tx_remote_epochs_channel`,
+  `tx_bal_channel`, `quorum_watermark_channel`,
+  `archive_control_request_channel`, `archive_control_response_channel`),
+  added in `crates/log/src/config/mod.rs`. `Deref<Target = str>` means
+  almost every existing `&cfg.some_channel` call site needed no change.
+  `tx_receipts_control_channel` stays `String` (empty is its "MDS off"
+  sentinel, not a URI); the `*_channel_template` fields stay `String`
+  (not a URI until `{sid}`/`{rid}` is substituted).
+  **Note for the coordinator**: an earlier Round B message deferred this
+  item ("`ChannelUri` waits for the bench workspace merge"); the second
+  follow-up's item 13 asked for it explicitly, so it is added here. If
+  the deferral still stands, this needs reverting before the bench merge
+  lands, since `crates/bench/**` reads these same fields (see the
+  cross-file caller list below).
+  One caller outside this group's files needs a matching change:
+  `crates/validator/src/bin/kardamom-validator/pumps.rs:73`'s `BalPump`
+  struct has a `bal_channel: String` field; `pumps.rs:50` now assigns it
+  a `ChannelUri` (via `channels.tx_bal_channel.clone()`), which fails to
+  compile until that field's type changes to `ChannelUri` (or the
+  assignment adds `.to_string()`). `crates/executor/src/bin/kardamom-executor/main.rs:176`,
+  `crates/e2e/benches/e2e_throughput.rs:53`, and
+  `crates/e2e/src/harness/inject.rs:111,151,175` all continue to compile
+  unchanged, through `Deref`/`From<&str>`.
+- **`AssembledDeliver::handle_aeron_fragment_handler` (`aeron_live/thread.rs`)
+  copies every fragment (`buffer.to_vec()`) on the Aeron polling thread,
+  for every subscription.** This is the necessary cost of the
+  decode-on-read design (`TypedSubscription`/`TxReceiptsReceiver`
+  decoding off the Aeron thread, from an earlier round): the fragment
+  assembler's buffer is borrowed and reused by rusteron on the next
+  poll, and the channel this hands frames to needs an owned `Vec<u8>` to
+  outlive that reuse. Removing the copy means decoding back on the Aeron
+  thread, which reverses that design. Left as is; not measured under
+  load in this round.

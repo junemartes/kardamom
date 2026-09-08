@@ -233,7 +233,10 @@ fn mds_contract_parses_from_toml_and_aligns_both_sides() {
         .expect("load MDS")
         .channels;
     assert!(ch.tx_receipts_mds_enabled());
-    assert_eq!(ch.tx_receipts_executor_count, 3);
+    assert_eq!(
+        ch.tx_receipts_executor_count,
+        Some(std::num::NonZeroU32::new(3).unwrap())
+    );
     // Executor side (replica 1) and ingress side (destination index 1)
     // resolve to the exact same endpoint: base + 2*1 = 40022 (receipts).
     assert_eq!(
@@ -278,6 +281,15 @@ fn mds_valid_base_port_accepted() {
 }
 
 #[test]
+fn mds_executor_count_zero_is_rejected() {
+    // `tx_receipts_executor_count` is a `NonZeroU32` at the config
+    // boundary. A `0` in the file must fail to parse, not silently
+    // become "no executors".
+    let err = load(&mds_toml("40020", 0)).expect_err("a zero executor count must be rejected");
+    assert!(matches!(err, LogError::Config(_)), "got {err:?}");
+}
+
+#[test]
 fn non_mds_base_port_zero_is_rejected() {
     // `BasePort` rejects 0 at parse time, MDS on or off. A garbage port
     // value in a config file is an error, not dead data this loader
@@ -299,9 +311,9 @@ fn non_mds_base_port_absent_loads() {
 }
 
 #[test]
-fn executor_count_defaults_to_zero() {
+fn executor_count_defaults_to_none() {
     // Default (IPC) config never attaches MDS destinations.
-    assert_eq!(ChannelsConfig::default().tx_receipts_executor_count, 0);
+    assert_eq!(ChannelsConfig::default().tx_receipts_executor_count, None);
 }
 
 #[test]

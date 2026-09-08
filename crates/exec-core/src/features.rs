@@ -18,14 +18,16 @@
 //! engine's boundary), the offline replay driver, and the stateless/zk guest
 //! shape. A block-close action implemented in only some of them causes a
 //! consensus divergence. [`apply_block_close_actions`] is the single
-//! implementation for all drivers. It takes only a state-read function as a
-//! parameter, so a driver adopts it in one line and cannot get the
-//! semantics subtly wrong.
+//! implementation for all drivers. It takes the block's mutable delta, the
+//! unsettled parent layer, and the read-only snapshot, so a driver calls it
+//! with its own three layers and cannot get the semantics subtly wrong.
 
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{B256, U256, keccak256};
+use kardamom_types::StateDatabase;
 use kardamom_types::upgrades::CHAIN_STATE;
 
-use crate::delta::PendingDelta;
+use crate::delta::{ParentState, PendingDelta};
+use crate::error::ExecutorError;
 
 /// Health check. This is the first feature, and it exercises the upgrade
 /// path itself. It must match `KardamomChainState.FEATURE_HEALTH_CHECK`.
@@ -120,10 +122,10 @@ pub struct BlockCloseOutcome {
 /// block's own writes (an upgrade deposit landing in this block activates a
 /// feature for this block), and their writes must go into the same delta.
 ///
-/// `read_slot` supplies the state layers this function cannot see: the
-/// caller's unsettled-parent layer, then its state snapshot, in that order.
-/// This function also reads the `delta` layer, so the full read order is
-/// `delta -> parent -> snapshot`, the same order the EVM uses. Reading the
+/// `parent` and `snapshot` supply the state layers this function cannot see
+/// on its own: the caller's unsettled-parent layer, then its state
+/// snapshot. Together with `delta`, [`ParentState`] gives the same
+/// `delta -> parent -> snapshot` read order the EVM uses. Reading the
 /// snapshot alone would be wrong for two reasons: it lags by up to K
 /// unsettled blocks, and it cannot hold the current block's own writes.
 ///
@@ -137,30 +139,20 @@ pub struct BlockCloseOutcome {
 ///
 /// # Errors
 ///
-/// Returns `E` when `read_slot` fails to read a state layer.
-pub fn apply_block_close_actions<E, F>(
+/// Returns `Err` when a `ParentState` read fails.
+pub fn apply_block_close_actions<S: StateDatabase>(
     delta: &mut PendingDelta,
     block_number: u64,
     header_ts_ms: u64,
-    mut read_slot: F,
-) -> Result<BlockCloseOutcome, E>
-where
-    F: FnMut(Address, B256) -> Result<U256, E>,
-{
+    parent: Option<&PendingDelta>,
+    snapshot: &S,
+) -> Result<BlockCloseOutcome, ExecutorError> {
     let mut out = BlockCloseOutcome::default();
 
-    // Read through delta first, so a feature scheduled by a deposit in
-    // this block is visible to this block's close.
-    let mut read = |addr: Address, slot: B256, delta: &PendingDelta| -> Result<U256, E> {
-        match delta.storage.get(&(addr, slot)) {
-            Some(v) => Ok(*v),
-            None => read_slot(addr, slot),
-        }
-    };
-
-    let activation = read(CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK), delta)?;
+    let read = ParentState::new(delta, parent, snapshot);
+    let activation = read.storage(CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK))?;
     if is_active(activation, header_ts_ms) {
-        let prior = Beacon::unpack(read(CHAIN_STATE, HEALTH_BEACON_SLOT, delta)?);
+        let prior = Beacon::unpack(read.storage(CHAIN_STATE, HEALTH_BEACON_SLOT)?);
         let beat = prior.count.saturating_add(1);
         delta.storage.insert(
             (CHAIN_STATE, HEALTH_BEACON_SLOT),
@@ -180,15 +172,49 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::convert::Infallible;
+    use crate::state::MockStateDatabase;
+    use alloy_primitives::Address;
 
-    /// A state with nothing in it. Every read misses.
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "must match apply_block_close_actions's read_slot: F bound; this fixture never fails"
-    )]
-    fn empty(_a: Address, _s: B256) -> Result<U256, Infallible> {
-        Ok(U256::ZERO)
+    /// A snapshot that errors on every storage read, to exercise
+    /// `apply_block_close_actions`'s error path. `basic`, `code_by_hash`,
+    /// and the receipt lookups are never called here; each returns its own
+    /// error too, so a future caller cannot get a silent default instead.
+    #[derive(Debug, thiserror::Error)]
+    #[error("db down")]
+    struct DbDownError;
+
+    impl kardamom_types::StateError for DbDownError {}
+
+    struct FailingDb;
+
+    impl StateDatabase for FailingDb {
+        type Error = DbDownError;
+
+        fn basic(&self, _address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error> {
+            Err(DbDownError)
+        }
+
+        fn storage(&self, _address: Address, _key: B256) -> Result<U256, Self::Error> {
+            Err(DbDownError)
+        }
+
+        fn code_by_hash(&self, _code_hash: B256) -> Result<bytes::Bytes, Self::Error> {
+            Err(DbDownError)
+        }
+
+        fn get_receipt(
+            &self,
+            _pos: kardamom_types::BPosition,
+        ) -> Result<Option<kardamom_types::Receipt>, Self::Error> {
+            Err(DbDownError)
+        }
+
+        fn get_tx_position(
+            &self,
+            _tx_hash: B256,
+        ) -> Result<Option<kardamom_types::BPosition>, Self::Error> {
+            Err(DbDownError)
+        }
     }
 
     #[test]
@@ -245,7 +271,8 @@ mod tests {
     #[test]
     fn dormant_feature_writes_nothing() {
         let mut delta = PendingDelta::new();
-        let out = apply_block_close_actions(&mut delta, 5, 1_000, empty).unwrap();
+        let snap = MockStateDatabase::builder().build();
+        let out = apply_block_close_actions(&mut delta, 5, 1_000, None, &snap).unwrap();
         assert_eq!(out.health_beat, None);
         assert!(
             delta.storage.is_empty(),
@@ -256,14 +283,14 @@ mod tests {
     #[test]
     fn scheduled_but_not_yet_reached_writes_nothing() {
         let mut delta = PendingDelta::new();
-        let read = |_a: Address, s: B256| -> Result<U256, Infallible> {
-            if s == activation_slot(FEATURE_HEALTH_CHECK) {
-                Ok(U256::from(2_000u64))
-            } else {
-                Ok(U256::ZERO)
-            }
-        };
-        let out = apply_block_close_actions(&mut delta, 5, 1_999, read).unwrap();
+        let snap = MockStateDatabase::builder()
+            .storage(
+                CHAIN_STATE,
+                activation_slot(FEATURE_HEALTH_CHECK),
+                U256::from(2_000u64),
+            )
+            .build();
+        let out = apply_block_close_actions(&mut delta, 5, 1_999, None, &snap).unwrap();
         assert_eq!(out.health_beat, None);
         assert!(delta.storage.is_empty());
     }
@@ -271,14 +298,14 @@ mod tests {
     #[test]
     fn active_feature_records_the_beacon() {
         let mut delta = PendingDelta::new();
-        let read = |_a: Address, s: B256| -> Result<U256, Infallible> {
-            if s == activation_slot(FEATURE_HEALTH_CHECK) {
-                Ok(U256::from(1_000u64))
-            } else {
-                Ok(U256::ZERO)
-            }
-        };
-        let out = apply_block_close_actions(&mut delta, 7, 1_500, read).unwrap();
+        let snap = MockStateDatabase::builder()
+            .storage(
+                CHAIN_STATE,
+                activation_slot(FEATURE_HEALTH_CHECK),
+                U256::from(1_000u64),
+            )
+            .build();
+        let out = apply_block_close_actions(&mut delta, 7, 1_500, None, &snap).unwrap();
         assert_eq!(out.health_beat, Some(1));
         let w = delta.storage[&(CHAIN_STATE, HEALTH_BEACON_SLOT)];
         assert_eq!(
@@ -302,7 +329,8 @@ mod tests {
             U256::from(900u64),
         );
 
-        let out = apply_block_close_actions(&mut delta, 3, 1_000, empty).unwrap();
+        let snap = MockStateDatabase::builder().build();
+        let out = apply_block_close_actions(&mut delta, 3, 1_000, None, &snap).unwrap();
         assert_eq!(
             out.health_beat,
             Some(1),
@@ -313,19 +341,24 @@ mod tests {
     #[test]
     fn beat_count_continues_from_prior_state() {
         let mut delta = PendingDelta::new();
-        let read = |_a: Address, s: B256| -> Result<U256, Infallible> {
-            if s == activation_slot(FEATURE_HEALTH_CHECK) {
-                Ok(U256::from(1u64))
-            } else {
-                Ok(Beacon {
+        let snap = MockStateDatabase::builder()
+            .storage(
+                CHAIN_STATE,
+                activation_slot(FEATURE_HEALTH_CHECK),
+                U256::from(1u64),
+            )
+            .storage(
+                CHAIN_STATE,
+                HEALTH_BEACON_SLOT,
+                Beacon {
                     count: 9,
                     block_number: 100,
                     timestamp_ms: 500,
                 }
-                .pack())
-            }
-        };
-        let out = apply_block_close_actions(&mut delta, 101, 750, read).unwrap();
+                .pack(),
+            )
+            .build();
+        let out = apply_block_close_actions(&mut delta, 101, 750, None, &snap).unwrap();
         assert_eq!(out.health_beat, Some(10));
         assert_eq!(
             Beacon::unpack(delta.storage[&(CHAIN_STATE, HEALTH_BEACON_SLOT)]),
@@ -356,24 +389,27 @@ mod tests {
             }
             .pack(),
         );
-        let read = |_a: Address, _s: B256| -> Result<U256, Infallible> {
-            // Stale backing value that must not win.
-            Ok(Beacon {
-                count: 99,
-                block_number: 99,
-                timestamp_ms: 99,
-            }
-            .pack())
-        };
-        let out = apply_block_close_actions(&mut delta, 2, 2, read).unwrap();
+        // Stale backing value that must not win.
+        let snap = MockStateDatabase::builder()
+            .storage(
+                CHAIN_STATE,
+                HEALTH_BEACON_SLOT,
+                Beacon {
+                    count: 99,
+                    block_number: 99,
+                    timestamp_ms: 99,
+                }
+                .pack(),
+            )
+            .build();
+        let out = apply_block_close_actions(&mut delta, 2, 2, None, &snap).unwrap();
         assert_eq!(out.health_beat, Some(5));
     }
 
     #[test]
     fn read_errors_propagate() {
         let mut delta = PendingDelta::new();
-        let read = |_a: Address, _s: B256| -> Result<U256, &'static str> { Err("db down") };
-        let err = apply_block_close_actions(&mut delta, 1, 1, read).unwrap_err();
-        assert_eq!(err, "db down");
+        let err = apply_block_close_actions(&mut delta, 1, 1, None, &FailingDb).unwrap_err();
+        assert!(matches!(err, ExecutorError::State(_)), "got {err:?}");
     }
 }

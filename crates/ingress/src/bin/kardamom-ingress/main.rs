@@ -19,7 +19,7 @@
 mod recorders;
 
 use std::net::SocketAddr;
-use std::num::{NonZeroU8, NonZeroU64};
+use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -74,7 +74,7 @@ struct Args {
     /// Static-membership fallback: ingress attaches replicas `0..N` once
     /// at startup. Membership is static for the life of the process.
     #[arg(long, env = "KARDAMOM_EXECUTOR_COUNT")]
-    executor_count: Option<u32>,
+    executor_count: Option<NonZeroU32>,
     /// Number of `tx_data` shards (M). Defaults to 8. Zero is rejected at
     /// parse time: it would make `partition_for`'s modulus zero, and it
     /// would leave the shard-handle vector empty.
@@ -106,7 +106,7 @@ struct Args {
     metrics_addr: SocketAddr,
     /// Host identifier. Stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
-    host_id: String,
+    host_id: kardamom_obs::HostId,
     /// The stable identity of this ingress replica. An active/active
     /// deployment runs N replicas. This id namespaces `correlation_id`,
     /// so `(replica, sequence)` stays unique, and it is stamped as a
@@ -207,18 +207,11 @@ impl IngressService {
         let args = &self.args;
         let mut cfg = IngressConfig {
             jsonrpc_bind: args.jsonrpc_bind,
-            // `IngressConfig::partition_count_m` stays a plain `u32`:
-            // `crates/bench` builds `IngressConfig { partition_count_m:
-            // shards, .. }` literals with a `u32` shard count.
-            // `IngressProxy::new` is the one place that re-parses this
-            // back into a `NonZeroU32`.
-            partition_count_m: u32::from(args.shards.get()),
+            partition_count_m: NonZeroU32::from(args.shards),
             ingress_id: args.ingress_id,
             ack_policy: args.ack_policy.clone().into(),
             rpc_max_connections: args.rpc_max_connections,
-            // Same reasoning as `partition_count_m`: `IngressConfig::chain_id`
-            // stays a plain `u64` for `crates/bench`'s config literals.
-            chain_id: args.chain_id.get(),
+            chain_id: args.chain_id,
             pending_receipt_timeout: Duration::from_millis(args.pending_receipt_timeout_ms),
             ..IngressConfig::default()
         };
@@ -263,11 +256,10 @@ impl IngressService {
         };
 
         // tx_receipts MDS membership: prefer the CLI or env
-        // `--executor-count`, and fall back to the log-config field. The
+        // `--executor-count`, and fall back to the log-config field, or
+        // `None` (no known executor count) when neither is set. The
         // proxy reads this only when MDS is enabled.
-        let executor_count = args
-            .executor_count
-            .unwrap_or(channels.tx_receipts_executor_count);
+        let executor_count = args.executor_count.or(channels.tx_receipts_executor_count);
 
         let publication = LiveIngressPublication::open(&rt, channels, args.shards)
             .context("open IngressPublication")?;
@@ -345,7 +337,7 @@ impl IngressService {
         let cfg = self.build_config();
         tracing::info!(
             jsonrpc_bind = %cfg.jsonrpc_bind,
-            shards = cfg.partition_count_m,
+            shards = cfg.partition_count_m.get(),
             ingress_id = cfg.ingress_id,
             ack_policy = ?cfg.ack_policy,
             "kardamom-ingress starting"
@@ -417,7 +409,7 @@ impl RunningIngress {
 async fn main() -> Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init_service!("ingress", args.metrics_addr, &args.host_id).await?;
+    kardamom_obs::init_service!("ingress", args.metrics_addr, args.host_id.as_ref()).await?;
     kardamom_ingress::metrics::describe();
 
     // Runtime tunables come from defaults and CLI flags. The TOML file

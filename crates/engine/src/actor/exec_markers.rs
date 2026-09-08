@@ -3,22 +3,17 @@
 //! the record's alignment count.
 
 use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{BPosition, EpochRecord, SnapshotSource};
+use kardamom_types::{BPosition, EpochRecord};
 
+use crate::delta::ParentState;
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
-use crate::reader::EpochObserver;
+use crate::reader::{EpochObserver, RemoteEpochObserver};
 
 use super::exec_thread::{ExecState, Flow};
-use super::ports::{StateWriterQueue, StateWriterSignal};
+use super::wiring::ExecPorts;
 
-impl<S, Q, P, E> ExecState<S, Q, P, E>
-where
-    S: SnapshotSource + 'static,
-    Q: StateWriterSignal + 'static,
-    P: StateWriterQueue + 'static,
-    E: EpochObserver + 'static,
-{
+impl<W: ExecPorts> ExecState<W> {
     pub(super) fn on_epoch(
         &mut self,
         tx_idx: TxIndex,
@@ -55,32 +50,14 @@ where
         // messages that follow start at a slot the sealer also reserved.
         self.check_in_order("RemoteEpoch", tx_idx, position)?;
         // Checked BEFORE the record's messages execute, so a rejected
-        // record fail-stops instead of committing. The observer reads the
-        // parent state through the same lookup order as
-        // `apply_block_close_actions`: the live delta first, then the
-        // unsettled parent blocks, then the committed snapshot. A read
-        // that skipped the pipelined parents would seed the lane cursor
-        // one block low and halt on the next honest record.
-        let Self {
-            delta,
-            parent,
-            snapshot,
-            remote_epoch_observer,
-            ..
-        } = self;
-        if let Some(obs) = remote_epoch_observer.as_mut() {
-            let parent_storage = |addr: alloy_primitives::Address, slot: alloy_primitives::B256| {
-                if let Some(v) = delta.storage.get(&(addr, slot)) {
-                    return Ok(*v);
-                }
-                if let Some(v) = parent.as_ref().and_then(|p| p.storage.get(&(addr, slot))) {
-                    return Ok(*v);
-                }
-                snapshot
-                    .storage(addr, slot)
-                    .map_err(|e| format!("parent read {addr}/{slot}: {e:?}"))
-            };
-            obs.observe(record, &parent_storage)?;
+        // record fail-stops instead of committing. `ParentState` reads the
+        // live delta first, then the unsettled parent blocks, then the
+        // committed snapshot. A read that skipped the pipelined parents
+        // would seed the lane cursor one block low and halt on the next
+        // honest record.
+        if let Some(obs) = self.remote_epoch_observer.as_mut() {
+            let parent_state = ParentState::new(&self.delta, self.parent.as_ref(), &self.snapshot);
+            obs.observe(record, &parent_state)?;
         }
         tracing::debug!(
             target: "kardamom_executor::exec",

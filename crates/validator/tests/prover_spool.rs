@@ -8,7 +8,7 @@
 //! task, against a production `StateWriter` (`TrieMode::Incremental`) and
 //! the MVCC `StateSnapshot` pin: the live wiring, minus the tokio loop.
 //!
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_signer_local::PrivateKeySigner;
@@ -40,19 +40,19 @@ fn boundary(block_number: u64, ts: u64) -> BlockBoundary {
 /// and return it. Used for both the pre-state pin and the post-commit
 /// root check, so one poll loop serves every wait in this test.
 fn wait_for_snapshot(writer: &WriterHandle, block: u64) -> StateSnapshot {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(s) = writer.snapshot_rx.current()
-            && s.block_number() == block
-        {
-            return s;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "writer never committed block {block}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    kardamom_obs::testkit::poll_sync(
+        &format!("writer committed block {block}"),
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        || Ok(snapshot_at(writer, block)),
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// The writer's committed snapshot, if it has reached `block`.
+fn snapshot_at(writer: &WriterHandle, block: u64) -> Option<StateSnapshot> {
+    let s = writer.snapshot_rx.current()?;
+    (s.block_number() == block).then_some(s)
 }
 
 /// Set up a production `StateWriter` and commit the seed block (block 1)
@@ -178,7 +178,7 @@ fn spool_and_guest_reverify(
         &guest_records,
         genv,
         &expected_bal,
-        input.granularity,
+        std::num::NonZeroU16::new(input.granularity).expect("granularity must be nonzero"),
     )
     .expect("guest-shape re-verification");
     assert_eq!(anchored.pre_state_root, outputs.pre_state_root);

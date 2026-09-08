@@ -101,12 +101,8 @@ where
     S: IngressSubscription + Clone,
 {
     pub(crate) cfg: IngressConfig,
-    /// `cfg.partition_count_m`, parsed once as a `NonZeroU32`. The field
-    /// on `IngressConfig` stays a plain `u32`, since `crates/bench` builds
-    /// `IngressConfig { partition_count_m: shards, .. }` literals with a
-    /// `u32` shard count (see `crates/bench/src/harness/inprocess.rs`).
-    /// This is the one, sole conversion point, done once in
-    /// [`IngressProxy::new`] rather than on every `partition_for` call.
+    /// A copy of `cfg.partition_count_m`, for `partition_for` to read
+    /// without going through `cfg`.
     pub(crate) partition_count_m: NonZeroU32,
     pub(crate) rate_limiter: Arc<PerIpLimiter>,
     pub(crate) verifier: Arc<BatchVerifier>,
@@ -172,16 +168,8 @@ where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
 {
-    /// # Panics
-    ///
-    /// Panics if `cfg.partition_count_m` is zero. Every producer of
-    /// `IngressConfig` in this workspace rules this out at its own
-    /// boundary: the `--shards` CLI flag parses as `NonZeroU8`, and
-    /// `IngressConfig::default()` sets 8. The field itself stays a plain
-    /// `u32` for `crates/bench`'s `IngressConfig { .. }` literals.
     pub fn new(cfg: IngressConfig, publication: P, subscription: S) -> Self {
-        let partition_count_m = NonZeroU32::new(cfg.partition_count_m)
-            .expect("IngressConfig::partition_count_m must be non-zero");
+        let partition_count_m = cfg.partition_count_m;
         let rate_limiter = Arc::new(PerIpLimiter::new(
             cfg.rate_limit_per_ip_per_sec,
             cfg.rate_limit_burst,

@@ -70,7 +70,8 @@ alloy-contract.workspace = true
 alloy-sol-types.workspace = true
 alloy-node-bindings.workspace = true
 alloy-signer-local.workspace = true
-kardamom-deployer = { path = "../deployer" }
+kardamom-deployer = { path = "../deployer", features = ["test-support"] }
+kardamom-obs = { path = "../obs", features = ["test-support"] }
 # `MockStateDatabaseBuilder` is not re-exported through
 # `kardamom_engine::state` (only the built `MockStateDatabase` is); the
 # shared test fixtures need to name the builder type directly.

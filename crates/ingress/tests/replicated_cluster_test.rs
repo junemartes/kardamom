@@ -96,6 +96,25 @@ impl FakeExec {
         }
     }
 
+    /// Feed one envelope into the fake executor at `(shard, term)`, and
+    /// forward the receipt it returns (first sighting only; a duplicate
+    /// re-publish yields none).
+    fn observe_and_forward(
+        &self,
+        receipt_bus: &tokio::sync::broadcast::Sender<Receipt>,
+        shard: usize,
+        env: &kardamom_types::TxEnvelope,
+        term: i32,
+    ) {
+        let pos = BPosition {
+            term_id: i32::try_from(shard).expect("shard count fits in i32"),
+            term_offset: term,
+        };
+        if let Some(receipt) = self.observe(shard, env, pos) {
+            let _ = receipt_bus.send(receipt);
+        }
+    }
+
     fn seen_count(&self) -> usize {
         self.inner.lock().unwrap().seen_count
     }
@@ -117,7 +136,8 @@ struct Cluster {
 
 impl Cluster {
     fn start(replicas: u16, shards: u32) -> Self {
-        let (mock, receivers) = MockChannels::new(shards as usize);
+        let (mock, receivers) =
+            MockChannels::new(std::num::NonZeroUsize::new(shards as usize).unwrap());
         let exec = FakeExec::new(shards as usize);
 
         // This is one drain task per shard. Multiple ingress publishers
@@ -133,13 +153,7 @@ impl Cluster {
                     let mut term: i32 = 0;
                     while let Some(env) = rx.recv().await {
                         term += 1;
-                        let pos = BPosition {
-                            term_id: i32::try_from(shard).expect("shard count fits in i32"),
-                            term_offset: term,
-                        };
-                        if let Some(receipt) = exec.observe(shard, &env, pos) {
-                            let _ = receipt_bus.send(receipt);
-                        }
+                        exec.observe_and_forward(&receipt_bus, shard, &env, term);
                     }
                 })
             })
@@ -148,7 +162,7 @@ impl Cluster {
         let proxies = (0..replicas)
             .map(|id| {
                 let cfg = IngressConfig {
-                    partition_count_m: shards,
+                    partition_count_m: NonZeroU32::new(shards).expect("shards is non-zero"),
                     ingress_id: id,
                     // OnOffer releases as soon as the receipt arrives.
                     // This keeps the harness receipt-driven, with no
@@ -181,13 +195,14 @@ impl Cluster {
 /// This is not a fixed sleep: it checks that a state was reached, not
 /// that time passed.
 async fn poll_until<F: Fn() -> bool>(what: &str, cond: F) {
-    for _ in 0..2000 {
-        if cond() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    panic!("condition never met: {what}");
+    kardamom_obs::testkit::poll_until(
+        what,
+        Duration::from_secs(4),
+        Duration::from_millis(2),
+        async || Ok(cond().then_some(())),
+    )
+    .await
+    .unwrap();
 }
 
 /// `correlation_id`s stay globally unique across replicas, and carry
@@ -199,14 +214,13 @@ async fn correlation_id_unique_and_namespaced_across_replicas() {
     let cluster = Cluster::start(K, 4);
 
     for replica in 0..K as usize {
-        let mut futs = Vec::new();
-        for _ in 0..N {
-            let raw = sign_legacy(&PrivateKeySigner::random(), 0);
-            futs.push(cluster.submit(replica, raw));
-        }
-        for r in futures::future::join_all(futs).await {
-            assert!(r.status);
-        }
+        let futs: Vec<_> = (0..N)
+            .map(|_| cluster.submit(replica, sign_legacy(&PrivateKeySigner::random(), 0)))
+            .collect();
+        futures::future::join_all(futs)
+            .await
+            .iter()
+            .for_each(|r| assert!(r.status));
     }
 
     let ids = cluster.exec.correlation_ids();

@@ -48,7 +48,7 @@ mod tests;
 #[cfg(any(test, feature = "testing"))]
 pub use egress::encode_contiguity_reject;
 pub use egress::{
-    EgressItem, encode_egress_boundary, encode_egress_record, encode_remote_origin_reject,
+    EgressItem, RemoteOriginReject, encode_egress_boundary, encode_egress_record,
     encode_replay_done, encode_replay_unavailable,
 };
 #[cfg(any(test, feature = "testing"))]
@@ -125,9 +125,9 @@ pub const KIND_ORIGIN_RECORD: u8 = 4;
 ///
 /// `first_seq` and `last_seq` are the record's seq range. The sealer keeps
 /// a `next_seq` per origin and accepts a record only if `first_seq` equals
-/// it (the lane contiguity guard, audit H2/H9). It also checks
+/// it (the lane contiguity guard). It also checks
 /// `slot_count == 2 + last_seq - first_seq`, so a frame cannot claim more
-/// slots than its body fills (audit H3). Every header field is bound by
+/// slots than its body fills. Every header field is bound by
 /// `canonical_id`, which commits to the origin, the anchor, and the seq
 /// range. A rejected frame answers the offering session with
 /// [`EGRESS_KIND_REMOTE_ORIGIN_REJECT`].
@@ -180,27 +180,71 @@ pub const EGRESS_KIND_CONTIGUITY_REJECT: u8 = 5;
 /// `EGRESS_KIND_REMOTE_ORIGIN_REJECT`.
 pub const EGRESS_KIND_REMOTE_ORIGIN_REJECT: u8 = 6;
 
-/// `first_seq` is not the sealer's `next_seq` for the origin.
-pub const REMOTE_ORIGIN_REJECT_SEQ_MISMATCH: u8 = 1;
-/// `anchor_number` does not advance the origin's adopted anchor.
-pub const REMOTE_ORIGIN_REJECT_ANCHOR_REGRESSED: u8 = 2;
-/// `slot_count != 2 + last_seq - first_seq`.
-pub const REMOTE_ORIGIN_REJECT_SLOT_COUNT_MISMATCH: u8 = 3;
-/// `origin_chain_id` is not in the sealer's remote-origin allowlist.
-pub const REMOTE_ORIGIN_REJECT_UNKNOWN_ORIGIN: u8 = 4;
-/// `last_seq < first_seq`, or the range overflows.
-pub const REMOTE_ORIGIN_REJECT_BAD_RANGE: u8 = 5;
+/// Why the sealer refused a [`KIND_REMOTE_ORIGIN_RECORD`] frame. The wire
+/// byte (in an [`EGRESS_KIND_REMOTE_ORIGIN_REJECT`] frame) is the
+/// discriminant below. Matches the Java `REMOTE_ORIGIN_REJECT_*` constants.
+///
+/// `Unknown(u8)` keeps the wire forward compatible: a code a newer sealer
+/// sends and this build does not name yet still decodes, logs, and counts,
+/// instead of failing the whole frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteOriginRejectReason {
+    /// `first_seq` is not the sealer's `next_seq` for the origin.
+    SeqMismatch,
+    /// `anchor_number` does not advance the origin's adopted anchor.
+    AnchorRegressed,
+    /// `slot_count != 2 + last_seq - first_seq`.
+    SlotCountMismatch,
+    /// `origin_chain_id` is not in the sealer's remote-origin allowlist.
+    UnknownOrigin,
+    /// `last_seq < first_seq`, or the range overflows.
+    BadRange,
+    /// A wire code this build does not name. Carries the raw byte so it
+    /// still round-trips through [`Self::to_u8`].
+    Unknown(u8),
+}
 
-/// Human-readable label for a remote-origin reject reason. Used as a
-/// metric label and in log lines. Unknown codes map to `"unknown"`.
-pub fn remote_origin_reject_reason(code: u8) -> &'static str {
-    match code {
-        REMOTE_ORIGIN_REJECT_SEQ_MISMATCH => "seq_mismatch",
-        REMOTE_ORIGIN_REJECT_ANCHOR_REGRESSED => "anchor_regressed",
-        REMOTE_ORIGIN_REJECT_SLOT_COUNT_MISMATCH => "slot_count_mismatch",
-        REMOTE_ORIGIN_REJECT_UNKNOWN_ORIGIN => "unknown_origin",
-        REMOTE_ORIGIN_REJECT_BAD_RANGE => "bad_range",
-        _ => "unknown",
+impl RemoteOriginRejectReason {
+    /// Human-readable label, for a metric label and log lines.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SeqMismatch => "seq_mismatch",
+            Self::AnchorRegressed => "anchor_regressed",
+            Self::SlotCountMismatch => "slot_count_mismatch",
+            Self::UnknownOrigin => "unknown_origin",
+            Self::BadRange => "bad_range",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// The wire byte this reason encodes as. The inverse of
+    /// [`From<u8>`](#impl-From<u8>-for-RemoteOriginRejectReason).
+    #[must_use]
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::SeqMismatch => 1,
+            Self::AnchorRegressed => 2,
+            Self::SlotCountMismatch => 3,
+            Self::UnknownOrigin => 4,
+            Self::BadRange => 5,
+            Self::Unknown(code) => code,
+        }
+    }
+}
+
+impl From<u8> for RemoteOriginRejectReason {
+    /// Every byte decodes: 1 through 5 to a named reason, anything else to
+    /// `Unknown`. There is no undecodable reject reason.
+    fn from(code: u8) -> Self {
+        match code {
+            1 => Self::SeqMismatch,
+            2 => Self::AnchorRegressed,
+            3 => Self::SlotCountMismatch,
+            4 => Self::UnknownOrigin,
+            5 => Self::BadRange,
+            other => Self::Unknown(other),
+        }
     }
 }
 
@@ -246,7 +290,10 @@ pub fn epoch_slots(epoch: &EpochRecord) -> u64 {
 /// so a decoding bug surfaces as a slot mismatch, not an off-by-one.
 #[must_use]
 pub fn remote_epoch_slots(rec: &kardamom_types::xchain::RemoteEpochRecord) -> u64 {
-    1 + rec.messages.len() as u64
+    // `usize` message counts cannot reach `u64::MAX - 1` on any real
+    // target, so this add cannot overflow. `saturating_add` states that
+    // as an invariant instead of an unchecked `+`.
+    1u64.saturating_add(rec.messages.len().get() as u64)
 }
 
 /// Canonical id length (a 32-byte hash). Matches Java `CANONICAL_ID_LEN`.
@@ -301,6 +348,9 @@ fn encode_kind_2u64(kind: u8, a: u64, b: u64) -> Vec<u8> {
 // (shared with the SBE session codec). A `None` maps to this codec's own
 // [`WireError::TooShort`], with this codec's offsets.
 
+fn rd_u8(b: &[u8], at: usize) -> Result<u8, WireError> {
+    b.get(at).copied().ok_or_else(|| too_short(b, at, 1))
+}
 fn rd_u32(b: &[u8], at: usize) -> Result<u32, WireError> {
     bytes::u32_le(b, at).ok_or_else(|| too_short(b, at, 4))
 }

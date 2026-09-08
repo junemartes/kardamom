@@ -1,5 +1,6 @@
 //! End-to-end latency. The path is: client, proxy, mock executor, receipt.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +13,9 @@ use kardamom_ingress::test_support::{receipt_for, sign_legacy};
 use kardamom_ingress::{IngressProxy, MockChannels};
 use kardamom_types::{BPosition, QuorumWatermark};
 
+const SHARDS: NonZeroU32 = NonZeroU32::new(8).unwrap();
+const MOCK_SHARDS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(8).unwrap();
+
 fn bench_e2e_latency(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -21,11 +25,11 @@ fn bench_e2e_latency(c: &mut Criterion) {
 
     let proxy = rt.block_on(async {
         let cfg = IngressConfig {
-            partition_count_m: 8,
+            partition_count_m: SHARDS,
             pending_receipt_timeout: Duration::from_secs(2),
             ..IngressConfig::default()
         };
-        let (mock, mut rx_vec) = MockChannels::new(8);
+        let (mock, mut rx_vec) = MockChannels::new(MOCK_SHARDS);
         let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
         for (i, mut rx) in rx_vec.drain(..).enumerate() {
             let receipt_bus = mock.receipt_bus.clone();

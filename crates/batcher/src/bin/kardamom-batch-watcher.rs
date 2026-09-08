@@ -17,6 +17,10 @@ use alloy_provider::ProviderBuilder;
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use clap::Parser;
+use kardamom_batcher::error::BatcherError;
+use std::ops::ControlFlow;
+
+use kardamom_batcher::live::poll::{PollLoop, Retry, parse_interval_secs};
 use kardamom_batcher::{WatchOutcome, watch_and_challenge};
 
 #[derive(Debug, Parser)]
@@ -32,8 +36,9 @@ struct Args {
     /// and single-block proof files are read from here.
     #[arg(long, env = "KARDAMOM_SPOOL_DIR")]
     spool_dir: PathBuf,
-    #[arg(long, default_value_t = 15)]
-    interval_secs: u64,
+    /// 0 means run once and stop.
+    #[arg(long, default_value = "15", value_parser = parse_interval_secs)]
+    interval_secs: Option<Duration>,
 }
 
 #[tokio::main]
@@ -45,37 +50,59 @@ async fn main() -> Result<()> {
         .wallet(signer)
         .connect_http(args.l1_rpc_url.parse().context("parse --l1-rpc-url")?);
 
-    loop {
-        match watch_and_challenge(provider.clone(), args.oracle, &args.spool_dir).await {
-            Ok(WatchOutcome::Challenged {
+    let watcher = Watcher {
+        oracle: args.oracle,
+        spool_dir: args.spool_dir,
+        gate: PollLoop::new(args.interval_secs),
+    };
+    while let ControlFlow::Continue(()) = watcher.tick(&provider).await {}
+    Ok(())
+}
+
+/// One `kardamom-batch-watcher` reactor tick: compare the pending claim
+/// against the prover spool, challenge on divergence, then gate the next
+/// tick on the outcome.
+struct Watcher {
+    oracle: Address,
+    spool_dir: PathBuf,
+    gate: PollLoop,
+}
+
+impl Watcher {
+    async fn tick(&self, provider: &(impl alloy_provider::Provider + Clone)) -> ControlFlow<()> {
+        let outcome = watch_and_challenge(provider.clone(), self.oracle, &self.spool_dir).await;
+        report_watch_outcome(outcome);
+        self.gate.gate(Retry::AfterInterval).await
+    }
+}
+
+/// Log one [`watch_and_challenge`] attempt's outcome.
+fn report_watch_outcome(outcome: Result<WatchOutcome, BatcherError>) {
+    match outcome {
+        Ok(WatchOutcome::Challenged {
+            batch_index,
+            block_offset,
+        }) => {
+            tracing::warn!(
                 batch_index,
                 block_offset,
-            }) => {
-                tracing::warn!(
-                    batch_index,
-                    block_offset,
-                    "CHALLENGE submitted — divergence proven"
-                );
-            }
-            Ok(WatchOutcome::ClaimHonest { batch_index }) => {
-                tracing::debug!(batch_index, "pending claim matches the spool");
-            }
-            Ok(WatchOutcome::ProofNotReady {
+                "CHALLENGE submitted — divergence proven"
+            );
+        }
+        Ok(WatchOutcome::ClaimHonest { batch_index }) => {
+            tracing::debug!(batch_index, "pending claim matches the spool");
+        }
+        Ok(WatchOutcome::ProofNotReady {
+            batch_index,
+            divergent_block,
+        }) => {
+            tracing::warn!(
                 batch_index,
                 divergent_block,
-            }) => {
-                tracing::warn!(
-                    batch_index,
-                    divergent_block,
-                    "divergence detected — awaiting single-block proof (zk-host --prove)"
-                );
-            }
-            Ok(WatchOutcome::NothingPending) => tracing::debug!("no pending claims"),
-            Err(e) => tracing::error!(error = %e, "watch attempt failed"),
+                "divergence detected — awaiting single-block proof (zk-host --prove)"
+            );
         }
-        if args.interval_secs == 0 {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_secs(args.interval_secs)).await;
+        Ok(WatchOutcome::NothingPending) => tracing::debug!("no pending claims"),
+        Err(e) => tracing::error!(error = %e, "watch attempt failed"),
     }
 }

@@ -1,26 +1,21 @@
 //! The `BoundaryStart` arm: alignment check, the optional whole-block
 //! strategy, block-close protocol actions, and the commit handoff.
 
+use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
-use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource};
+use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta};
 
 use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
-use crate::reader::EpochObserver;
 
 use super::exec_thread::{ExecState, Flow};
-use super::ports::{StateWriterQueue, StateWriterSignal};
-use super::types::ExecToCommit;
+use super::ports::StateWriterQueue;
+use super::types::{BalHandoff, BlockExecStrategy, ExecToCommit};
+use super::wiring::ExecPorts;
 
-impl<S, Q, P, E> ExecState<S, Q, P, E>
-where
-    S: SnapshotSource + 'static,
-    Q: StateWriterSignal + 'static,
-    P: StateWriterQueue + 'static,
-    E: EpochObserver + 'static,
-{
+impl<W: ExecPorts> ExecState<W> {
     /// Run the block-close protocol actions for the block being sealed.
     ///
     /// This supplies the two state layers that `exec-core` cannot see on its
@@ -36,8 +31,8 @@ where
         block_number: u64,
         header_ts_ms: u64,
     ) -> Result<(), ExecutorError> {
-        // Destructure by field: `delta` is borrowed mutably, while the
-        // closure reads `parent` and `snapshot`.
+        // Destructure by field: `delta` is borrowed mutably, while
+        // `apply_block_close_actions` reads `parent` and `snapshot`.
         let Self {
             delta,
             parent,
@@ -49,7 +44,8 @@ where
             delta,
             block_number,
             header_ts_ms,
-            crate::replay::layered_storage_read(parent.as_ref(), snapshot),
+            parent.as_ref(),
+            snapshot,
         )?;
 
         if let Some(beat) = outcome.health_beat {
@@ -112,7 +108,7 @@ where
         };
         let env = self.exec_env(block_number);
         let apply_start = Instant::now();
-        let out = exec_block(
+        let out = exec_block.execute_block(
             &self.snapshot,
             self.parent.as_ref(),
             &self.buffered,
@@ -140,13 +136,17 @@ where
             }
             None => {}
         }
-        for r in out.receipts {
+        let flow = out.receipts.into_iter().try_for_each(|r| {
             self.block_receipts.push(r.clone());
-            if self.tx.send(ExecToCommit::Receipt(r)).is_err() {
-                return Ok(Flow::Stop);
+            match self.tx.send(ExecToCommit::Receipt(r)) {
+                Ok(()) => ControlFlow::Continue(()),
+                Err(_) => ControlFlow::Break(()),
             }
+        });
+        match flow {
+            ControlFlow::Continue(()) => Ok(Flow::Continue),
+            ControlFlow::Break(()) => Ok(Flow::Stop),
         }
-        Ok(Flow::Continue)
     }
 
     /// EIP-7928 handoff: move the block's Bal, and a receipts-free copy of
@@ -163,11 +163,11 @@ where
         let block_number = boundary.block_number;
         let bal_delta = pending.clone().finalize(block_number, Vec::new());
         btx.try_handoff(
-            (
-                boundary.clone(),
-                bal_delta,
-                std::mem::take(&mut self.block_bal),
-            ),
+            BalHandoff {
+                boundary: boundary.clone(),
+                delta: bal_delta,
+                bal: std::mem::take(&mut self.block_bal),
+            },
             block_number,
             BAL_HANDOFF,
             || {},

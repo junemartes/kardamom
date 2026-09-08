@@ -8,6 +8,9 @@
 //! Determinism does not depend on the demux shape. It depends on
 //! canonical ordering, which tx_ordering preserves.
 
+const QUEUE_DEPTH_128: NonZeroUsize = NonZeroUsize::new(128).unwrap();
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::thread;
 use std::time::Duration;
 
@@ -21,10 +24,11 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_engine::{
-    BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
-    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ResumePoint,
-    RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
-    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, EngineWiring, ExecPorts, Executor, ExecutorConfig,
+    ExecutorError, Inbound, MockStateDatabase, MutatingSnapshotSource, NoBlockExec, NoEpochCheck,
+    NoRemoteEpochCheck, Outbound, ResumePoint, RoleHooks, StateWriterSignal, TxDataSubscription,
+    TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication,
+    TxRef, WriterApplyingQueue,
 };
 
 struct ChanTxDataSub {
@@ -68,14 +72,19 @@ impl StateWriterSignal for Imm {
 
 /// Port types for this test's channel-backed fakes.
 struct TestWiring;
-impl EngineWiring for TestWiring {
-    type TxData = ChanTxDataSub;
-    type TxOrdering = ChanTxOrderingSub;
-    type TxReceipts = ChanReceiptsPub;
+impl ExecPorts for TestWiring {
     type Snapshots = MutatingSnapshotSource;
     type WriterSignal = Imm;
     type WriterQueue = WriterApplyingQueue;
     type Epoch = NoEpochCheck;
+    type RemoteEpoch = NoRemoteEpochCheck;
+    type BlockExec = NoBlockExec;
+}
+
+impl EngineWiring for TestWiring {
+    type TxData = ChanTxDataSub;
+    type TxOrdering = ChanTxOrderingSub;
+    type TxReceipts = ChanReceiptsPub;
 }
 
 fn bpos(off: i32) -> BPosition {
@@ -160,8 +169,8 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
     drop(b_tx);
 
     let cfg = ExecutorConfig {
-        chain_id: 1,
-        receipt_queue_depth: 128,
+        chain_id: NonZeroU64::MIN,
+        receipt_queue_depth: QUEUE_DEPTH_128,
         ..Default::default()
     };
     let tx_data_subs = vec![ChanTxDataSub {

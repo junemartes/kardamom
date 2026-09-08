@@ -29,7 +29,7 @@ use kardamom_batcher::prover_submit::IKardamomProofOracle;
 use kardamom_batcher::settlement::IKardamomL2Settlement;
 use kardamom_batcher::testkit::{BATCHER, DEV_OWNER, L2_CHAIN_ID};
 use kardamom_deployer::Deployer;
-use kardamom_deployer::testkit::{AnvilRig, OracleInitArgs};
+use kardamom_deployer::testkit::{AnvilRig, Funding, OracleInitArgs};
 
 sol!(
     #[sol(rpc)]
@@ -118,7 +118,14 @@ struct Scenario<P: Provider + Clone> {
 }
 
 async fn setup(fx: &Fixtures) -> Option<Scenario<impl Provider + Clone>> {
-    let rig = AnvilRig::spawn(&[DEV_OWNER, BATCHER]).await?;
+    let rig = AnvilRig::spawn(
+        alloy_node_bindings::Anvil::new(),
+        &[
+            (DEV_OWNER, Funding::FundAndImpersonate),
+            (BATCHER, Funding::FundAndImpersonate),
+        ],
+    )
+    .await?;
 
     // The real SP1 verifier, settlement, and oracle v2, wired to both. The
     // batch and block vkey are the fixture's guest vkey. Genesis is the

@@ -100,7 +100,11 @@ fn assert_beat_every_block(v: &ChainStateView, first_active: u64, role: &str) ->
         .checked_sub(first_active)
         .map(|d| d + 1)
         .context("head is behind the first active block")?;
-    let (beats, beacon_block, beacon_ts) = v.beacon;
+    let kardamom_exec_core::features::Beacon {
+        count: beats,
+        block_number: beacon_block,
+        timestamp_ms: beacon_ts,
+    } = v.beacon;
     anyhow::ensure!(
         beats == expected,
         "{role}: beacon beat {beats} times through block {}, expected {expected} \

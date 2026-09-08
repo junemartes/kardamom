@@ -9,6 +9,9 @@
 //! real. Run `cargo bench` locally to compare hardware-relative numbers.
 //! The spec target is over 50k tx/s on plain transfers, on one core.
 
+const QUEUE_DEPTH_512: NonZeroUsize = NonZeroUsize::new(512).unwrap();
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::thread;
 use std::time::Duration;
 
@@ -30,11 +33,11 @@ use kardamom_engine::block_env::ExecEnv;
 // from the actor `kardamom_engine::Executor` imported below.
 use kardamom_engine::executor::Executor as ExecCore;
 use kardamom_engine::{
-    BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
-    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, PendingDelta,
-    ResumePoint, RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
-    TxIndex, TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef,
-    WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, EngineWiring, ExecPorts, Executor, ExecutorConfig,
+    ExecutorError, Inbound, MockStateDatabase, MutatingSnapshotSource, NoBlockExec, NoEpochCheck,
+    NoRemoteEpochCheck, Outbound, PendingDelta, ResumePoint, RoleHooks, StateWriterSignal,
+    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxIndex, TxOrderingMessage,
+    TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
 };
 
 const SSTORE_42_AT_VAR_KEY: [u8; 8] = [
@@ -120,11 +123,13 @@ fn bench_transfer_step(c: &mut Criterion) {
                 None,
                 &delta,
                 env,
-                TxIndex(0),
-                pos(0),
+                kardamom_engine::exec_types::TxSlot {
+                    tx_idx: TxIndex(0),
+                    tx_position: pos(0),
+                    tx_index_in_block: 0,
+                    cumulative_gas_used_before: 0,
+                },
                 &env_tx,
-                0,
-                0,
                 None,
             )
             .unwrap();
@@ -161,11 +166,13 @@ fn bench_sstore_step(c: &mut Criterion) {
                 None,
                 &delta,
                 env,
-                TxIndex(0),
-                pos(0),
+                kardamom_engine::exec_types::TxSlot {
+                    tx_idx: TxIndex(0),
+                    tx_position: pos(0),
+                    tx_index_in_block: 0,
+                    cumulative_gas_used_before: 0,
+                },
                 &env_tx,
-                0,
-                0,
                 None,
             )
             .unwrap();
@@ -216,14 +223,19 @@ impl StateWriterSignal for Imm {
 
 /// Port types for the bench's channel-backed fakes.
 struct BenchWiring;
-impl EngineWiring for BenchWiring {
-    type TxData = ChanTxDataSub;
-    type TxOrdering = ChanTxOrderingSub;
-    type TxReceipts = ChanReceiptsPub;
+impl ExecPorts for BenchWiring {
     type Snapshots = MutatingSnapshotSource;
     type WriterSignal = Imm;
     type WriterQueue = WriterApplyingQueue;
     type Epoch = NoEpochCheck;
+    type RemoteEpoch = NoRemoteEpochCheck;
+    type BlockExec = NoBlockExec;
+}
+
+impl EngineWiring for BenchWiring {
+    type TxData = ChanTxDataSub;
+    type TxOrdering = ChanTxOrderingSub;
+    type TxReceipts = ChanReceiptsPub;
 }
 
 fn bench_actor_throughput(c: &mut Criterion) {
@@ -288,8 +300,8 @@ fn bench_actor_throughput(c: &mut Criterion) {
             let h = thread::spawn(move || {
                 Executor::run::<BenchWiring>(
                     ExecutorConfig {
-                        chain_id: 1,
-                        receipt_queue_depth: 512,
+                        chain_id: NonZeroU64::MIN,
+                        receipt_queue_depth: QUEUE_DEPTH_512,
                         ..Default::default()
                     },
                     Inbound {

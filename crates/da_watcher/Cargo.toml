@@ -43,6 +43,7 @@ tokio-util = { workspace = true }
 [dev-dependencies]
 # Enables the in-memory fakes for this crate's own integration tests.
 kardamom-da-watcher = { path = ".", features = ["testing", "test-support"] }
+kardamom-obs = { path = "../obs", features = ["test-support"] }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

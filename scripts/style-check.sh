@@ -27,6 +27,14 @@ forbidden() {
         -e 'debug_assert!' -e '\.max\(1\)' -e 'Box<dyn' -e 'allow\(clippy::too_many_arguments\)' \
         crates guest 2>/dev/null \
         | grep -vE '/tests?/|_tests?\.rs:|/tests\.rs:|/test_support' || true)"
+    # `Box<` and `dyn` split over two lines by rustfmt: report the file and
+    # the line of the `Box<`.
+    local wrapped
+    wrapped="$(grep -rnE --include='*.rs' -A1 -e 'Box<$' crates guest 2>/dev/null \
+        | grep -E -B1 '^[^:]+-[0-9]+-\s*dyn ' \
+        | grep -E ':[0-9]+:' \
+        | grep -vE '/tests?/|_tests?\.rs:|/tests\.rs:|/test_support' || true)"
+    hits="${hits}${wrapped:+$'\n'$wrapped}"
     if [ -n "$hits" ]; then
         echo "$hits"
         return 1

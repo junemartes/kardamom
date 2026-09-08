@@ -8,7 +8,7 @@
 //! transform data the same way by construction, not by separate
 //! maintenance.
 
-use core::num::NonZeroU64;
+use core::num::{NonZeroU16, NonZeroU64};
 
 use alloc::vec::Vec;
 
@@ -43,41 +43,68 @@ pub fn merge_bal_fragments(
     // previous value) would appear in the merged result but not in the
     // sequential one. `key` mirrors revm's comparison: the whole value for
     // nonce, balance, and storage, and the code hash for code.
+    fn push_if_changed<T: Clone + PartialEq, K: PartialEq + ?Sized>(
+        dst: &mut revm::state::bal::BalWrites<T>,
+        idx: revm::state::bal::BalIndex,
+        v: T,
+        key: &impl Fn(&T) -> &K,
+    ) {
+        match dst.writes.last() {
+            Some((_, last)) if key(last) == key(&v) => {}
+            _ => dst.writes.push((idx, v)),
+        }
+    }
+
     fn append<T: Clone + PartialEq, K: PartialEq + ?Sized>(
         dst: &mut revm::state::bal::BalWrites<T>,
         src: revm::state::bal::BalWrites<T>,
         key: impl Fn(&T) -> &K,
     ) {
         for (idx, v) in src.writes {
-            match dst.writes.last() {
-                Some((_, last)) if key(last) == key(&v) => {}
-                _ => dst.writes.push((idx, v)),
-            }
+            push_if_changed(dst, idx, v, &key);
+        }
+    }
+
+    /// Merge one storage slot's writes into `dst`, inserting the whole
+    /// entry on a slot `dst` has not seen yet.
+    fn merge_storage_slot<K: Ord, T: Clone + PartialEq>(
+        dst: &mut alloc::collections::BTreeMap<K, revm::state::bal::BalWrites<T>>,
+        slot: K,
+        writes: revm::state::bal::BalWrites<T>,
+    ) {
+        let Some(dw) = dst.get_mut(&slot) else {
+            dst.insert(slot, writes);
+            return;
+        };
+        append(dw, writes, |v| v);
+    }
+
+    /// Merge one account's fragment into `out`, inserting the whole entry
+    /// on an address `out` has not seen yet.
+    fn merge_account(
+        out: &mut revm::state::bal::Bal,
+        addr: alloy_primitives::Address,
+        acct: revm::state::bal::AccountBal,
+    ) {
+        let Some(tgt) = out.accounts.get_mut(&addr) else {
+            out.accounts.insert(addr, acct);
+            return;
+        };
+        append(&mut tgt.account_info.nonce, acct.account_info.nonce, |v| v);
+        append(
+            &mut tgt.account_info.balance,
+            acct.account_info.balance,
+            |v| v,
+        );
+        append(&mut tgt.account_info.code, acct.account_info.code, |v| &v.0);
+        for (slot, writes) in acct.storage.storage {
+            merge_storage_slot(&mut tgt.storage.storage, slot, writes);
         }
     }
 
     let mut out = revm::state::bal::Bal::new();
-    for frag in fragments {
-        for (addr, acct) in frag.accounts {
-            if let Some(tgt) = out.accounts.get_mut(&addr) {
-                append(&mut tgt.account_info.nonce, acct.account_info.nonce, |v| v);
-                append(
-                    &mut tgt.account_info.balance,
-                    acct.account_info.balance,
-                    |v| v,
-                );
-                append(&mut tgt.account_info.code, acct.account_info.code, |v| &v.0);
-                for (slot, writes) in acct.storage.storage {
-                    if let Some(dw) = tgt.storage.storage.get_mut(&slot) {
-                        append(dw, writes, |v| v);
-                    } else {
-                        tgt.storage.storage.insert(slot, writes);
-                    }
-                }
-            } else {
-                out.accounts.insert(addr, acct);
-            }
-        }
+    for (addr, acct) in fragments.into_iter().flat_map(|frag| frag.accounts) {
+        merge_account(&mut out, addr, acct);
     }
     out
 }
@@ -92,9 +119,23 @@ pub fn chunk_of(index: u64, k: NonZeroU64) -> u64 {
     Granularity(k).chunk_of(index)
 }
 
+/// The claim-index space a BAL index lives in, at wire granularity `k`:
+/// the index itself at `k == 1` (per-tx claims), or its chunk number at
+/// `k > 1` (chunk-collapsed claims). The validator looks up seeds and
+/// verifies claims in this space, so a claim built at one granularity
+/// and checked at another must use this one rule.
+#[must_use]
+pub fn claim_index(bal_index: u64, k: NonZeroU16) -> u64 {
+    if k.get() > 1 {
+        chunk_of(bal_index, NonZeroU64::from(k))
+    } else {
+        bal_index
+    }
+}
+
 /// A parsed-once BAL attribution granularity, always nonzero. `chunk_of`
-/// and `dedup_changes` (the two functions [`quantize`] used to pass `k`
-/// to as a loose parameter) are its methods instead.
+/// and `dedup_changes` read it as `self` instead of taking `k` as a
+/// loose parameter.
 #[derive(Clone, Copy)]
 struct Granularity(NonZeroU64);
 

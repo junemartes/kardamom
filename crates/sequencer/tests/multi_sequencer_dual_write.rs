@@ -47,16 +47,11 @@ fn m_partitions() -> PartitionCount {
 type SenderAtPos = HashMap<(u8, BPosition), (Address, u64)>;
 
 fn find_signers_for_partition(target: u32, n: usize, seed_start: u64) -> Vec<PrivateKeySigner> {
-    let mut out = Vec::with_capacity(n);
-    let mut seed = seed_start;
-    while out.len() < n {
-        let s = signer(seed);
-        if m_partitions().index_of(s.address()) == target {
-            out.push(s);
-        }
-        seed += 1;
-    }
-    out
+    (seed_start..)
+        .map(signer)
+        .filter(|s| m_partitions().index_of(s.address()) == target)
+        .take(n)
+        .collect()
 }
 
 /// The M sequencers under test, each paired with its own [`Rig`] (its own

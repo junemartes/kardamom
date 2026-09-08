@@ -332,25 +332,39 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     /// Returns an error when [`Self::addresses`] or an L1 storage read fails.
     pub async fn verify(&self) -> Result<VerifyReport, DeployError> {
         let entries = self.addresses(None).await?;
-        let mut mismatches = Vec::new();
-        let slot_u256 = U256::from_be_bytes(*ERC1967_IMPL_SLOT);
-
-        for entry in &entries {
-            let raw_slot: U256 = self.provider.get_storage_at(entry.proxy, slot_u256).await?;
-            let erc1967_impl = Address::from_word(B256::from(raw_slot));
-            if erc1967_impl != entry.current_impl {
-                mismatches.push(VerifyMismatch {
-                    id: entry.id,
-                    proxy: entry.proxy,
-                    registry_impl: entry.current_impl,
-                    erc1967_impl,
-                });
-            }
-        }
+        let mismatches = self.find_impl_mismatches(&entries).await?;
         Ok(VerifyReport {
             entries,
             mismatches,
         })
+    }
+
+    /// Check each registry entry's ERC1967 storage slot against its
+    /// registered `currentImpl`, and collect the mismatches.
+    async fn find_impl_mismatches(
+        &self,
+        entries: &[RegistryEntry],
+    ) -> Result<Vec<VerifyMismatch>, DeployError> {
+        let slot_u256 = U256::from_be_bytes(*ERC1967_IMPL_SLOT);
+        // Read every proxy's ERC1967 impl slot first (one L1 call each, in
+        // registry order); the comparison against the registered impl is
+        // then a plain, synchronous filter.
+        let mut erc1967_impls = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let raw_slot: U256 = self.provider.get_storage_at(entry.proxy, slot_u256).await?;
+            erc1967_impls.push(Address::from_word(B256::from(raw_slot)));
+        }
+        Ok(entries
+            .iter()
+            .zip(erc1967_impls)
+            .filter(|(entry, erc1967_impl)| *erc1967_impl != entry.current_impl)
+            .map(|(entry, erc1967_impl)| VerifyMismatch {
+                id: entry.id,
+                proxy: entry.proxy,
+                registry_impl: entry.current_impl,
+                erc1967_impl,
+            })
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -409,25 +423,59 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 // Free helpers
 // ---------------------------------------------------------------------------
 
-/// Impl-dedup pass used by [`Deployer::apply`]. Within each `(id, impl_salt)`
+/// A dedup group's key: one `(id, impl_salt)` pair shares one impl
+/// deploy. Named instead of a bare tuple, so the map it keys reads as
+/// what it is.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ImplKey {
+    id: B256,
+    impl_salt: B256,
+}
+
+/// Impl-dedup pass used by [`Deployer::apply`]. Within each [`ImplKey`]
 /// group, the first spec keeps `target_impl = zero`, so the factory does a
 /// CREATE2 of the impl. The other specs reference the impl through
 /// `target_impl`, computed offline from the factory address and the spec's
 /// `impl_salt` and `impl_initcode`.
 fn dedup_impl_specs(factory: Address, specs: &mut [DeploymentSpec]) {
-    let mut seen_impl: std::collections::HashMap<(B256, B256), Address> =
-        std::collections::HashMap::new();
+    let mut dedup = ImplDedup::new(factory);
     for s in specs {
-        let key = (s.id, s.impl_salt);
-        if let Some(addr) = seen_impl.get(&key) {
-            s.target_impl = *addr;
-        } else {
-            let computed =
-                crate::addresses::app_impl_address(factory, s.impl_salt, &s.impl_initcode);
-            seen_impl.insert(key, computed);
-            // The first spec in the group keeps target_impl = zero.
-            // The factory does a CREATE2 for the impl.
+        dedup.resolve(s);
+    }
+}
+
+/// [`dedup_impl_specs`]'s state: the factory address every impl deploys
+/// through, and the impls already seen this pass.
+struct ImplDedup {
+    factory: Address,
+    seen: std::collections::HashMap<ImplKey, Address>,
+}
+
+impl ImplDedup {
+    fn new(factory: Address) -> Self {
+        Self {
+            factory,
+            seen: std::collections::HashMap::new(),
         }
+    }
+
+    /// One spec's impl-dedup step. The first spec for its [`ImplKey`]
+    /// keeps `target_impl = zero` — the factory does a CREATE2 of the
+    /// impl. Every later spec in the group references that impl through
+    /// `target_impl`, computed offline from the factory address and the
+    /// spec's `impl_salt` and `impl_initcode`.
+    fn resolve(&mut self, s: &mut DeploymentSpec) {
+        let key = ImplKey {
+            id: s.id,
+            impl_salt: s.impl_salt,
+        };
+        if let Some(addr) = self.seen.get(&key) {
+            s.target_impl = *addr;
+            return;
+        }
+        let computed =
+            crate::addresses::app_impl_address(self.factory, s.impl_salt, &s.impl_initcode);
+        self.seen.insert(key, computed);
     }
 }
 

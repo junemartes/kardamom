@@ -1,4 +1,11 @@
 //! Sharded admission's byte-identical check.
+//!
+//! Dependency discovery split across cell-space shards must produce the
+//! same bytes as the serial feed. The shapes that matter are the ones
+//! where a shard boundary could hide an edge: a hot single-cell chain
+//! (all transactions in one shard), transfers (two cells per
+//! transaction, usually in different shards), and racing lying-stats
+//! repetitions.
 #![allow(
     clippy::cast_possible_truncation,
     reason = "fixture indices (signer count, tx count) stay far below u8/u32::MAX in every test"
@@ -10,58 +17,52 @@ use alloy_primitives::{Address, TxKind, U256, keccak256};
 use common::*;
 use kardamom_exec_core::delta::PendingDelta;
 use kardamom_exec_core::exec_types::TxIndex;
+use kardamom_exec_core::state::MockStateDatabase;
 use kardamom_footprint::classifier::Stats;
 use kardamom_footprint::{Cell, TxObs};
-use kardamom_stm::execute::execute_block_sequential;
+use kardamom_stm::execute::{StmOutcome, execute_block_sequential};
 use kardamom_types::{BPosition, TxEnvelope};
 
-/// Sharded admission: dependency discovery split across cell-space
-/// shards must produce the same bytes as the serial feed. The shapes
-/// that matter are the ones where a shard boundary could hide an edge: a
-/// hot single-cell chain (all transactions in one shard), transfers (two
-/// cells per transaction, usually in different shards), and racing
-/// lying-stats repetitions.
+/// Run one block through the sharded pool with `shards` admission
+/// shards and `workers` worker threads.
+fn run_sharded(
+    database: &MockStateDatabase,
+    recs: &[(TxIndex, BPosition, TxEnvelope)],
+    stats: &Stats,
+    workers: usize,
+    shards: usize,
+) -> StmOutcome {
+    kardamom_stm::execute::with_pool(
+        kardamom_stm::execute::PoolConfig {
+            workers: nz(workers),
+            admit_shards: std::num::NonZeroUsize::new(shards),
+            ..Default::default()
+        },
+        |pool| {
+            pool.run_block(
+                vec![database.clone(); workers],
+                PendingDelta::new(),
+                env(),
+                recs,
+                stats,
+            )
+            .unwrap()
+        },
+    )
+}
 
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "race-hunting retry loop kept whole, per the audit's R10 KEEP list"
-)]
-fn sharded_admission_byte_identical() {
-    let sg = signers(4);
-    let database = db(&sg);
-    let run_sharded = |recs: &[(TxIndex, BPosition, TxEnvelope)],
-                       stats: &Stats,
-                       workers: usize,
-                       shards: usize| {
-        kardamom_stm::execute::with_pool(
-            kardamom_stm::execute::PoolConfig {
-                workers: nz(workers),
-                admit_shards: std::num::NonZeroUsize::new(shards),
-                ..Default::default()
-            },
-            |pool| {
-                pool.run_block(
-                    vec![database.clone(); workers],
-                    PendingDelta::new(),
-                    env(),
-                    recs,
-                    stats,
-                )
-                .unwrap()
-            },
-        )
-    };
-
-    // 1. Hot chain: 24 increments of one slot. Every transaction's
-    //    conflict cell lands in the same shard, so one shard carries the
-    //    whole chain.
+/// Hot chain: 24 increments of one slot. Every transaction's conflict
+/// cell lands in the same shard, so one shard carries the whole chain.
+fn hot_chain_matches_across_shards(
+    sg: &[alloy_signer_local::PrivateKeySigner],
+    database: &MockStateDatabase,
+) {
     let recs = records(counter_chain(&sg[..3], 8));
-    let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
+    let seq = execute_block_sequential(database, None, env(), &recs).unwrap();
     let stats = counter_stats();
     for shards in [1, 2, 3, 4] {
         for workers in [1, 4] {
-            let out = run_sharded(&recs, &stats, workers, shards);
+            let out = run_sharded(database, &recs, &stats, workers, shards);
             assert_eq!(out.wounds, 0, "ordered chain must not wound (k={shards})");
             assert_identical(
                 &seq,
@@ -71,15 +72,20 @@ fn sharded_admission_byte_identical() {
             );
         }
     }
+}
 
-    // 2. Transfers: two cells per transaction, so most transactions span
-    //    shards, and the per-batch guard is what keeps them from
-    //    dispatching early.
-    let recs2 = records(transfer_block(&sg));
-    let seq2 = execute_block_sequential(&database, None, env(), &recs2).unwrap();
+/// Transfers: two cells per transaction, so most transactions span
+/// shards, and the per-batch guard is what keeps them from dispatching
+/// early.
+fn transfers_match_across_shards(
+    sg: &[alloy_signer_local::PrivateKeySigner],
+    database: &MockStateDatabase,
+) {
+    let recs2 = records(transfer_block(sg));
+    let seq2 = execute_block_sequential(database, None, env(), &recs2).unwrap();
     for shards in [2, 3] {
         for workers in [1, 2, 4] {
-            let out = run_sharded(&recs2, &Stats::default(), workers, shards);
+            let out = run_sharded(database, &recs2, &Stats::default(), workers, shards);
             assert_identical(
                 &seq2,
                 &out.receipts,
@@ -88,12 +94,16 @@ fn sharded_admission_byte_identical() {
             );
         }
     }
+}
 
-    // 3. Table pressure: a block big enough to fill the per-shard
-    //    tables. The 24-transaction cases above pass even with a broken
-    //    probe walk, since they never fill a table. This case catches a
-    //    mis-sized shard table: the bug it was written for made `upsert`
-    //    spin forever at k=3.
+/// Table pressure: a block big enough to fill the per-shard tables. The
+/// 24-transaction cases above pass even with a broken probe walk, since
+/// they never fill a table. This case catches a mis-sized shard table:
+/// the bug it was written for made `upsert` spin forever at k=3.
+fn table_pressure_matches_across_shards(
+    sg: &[alloy_signer_local::PrivateKeySigner],
+    database: &MockStateDatabase,
+) {
     let many: Vec<TxEnvelope> = (0..1500u64)
         .map(|n| {
             let s = &sg[(n % 4) as usize];
@@ -107,9 +117,9 @@ fn sharded_admission_byte_identical() {
         })
         .collect();
     let recs_many = records(many);
-    let seq_many = execute_block_sequential(&database, None, env(), &recs_many).unwrap();
+    let seq_many = execute_block_sequential(database, None, env(), &recs_many).unwrap();
     for shards in [2, 3, 5] {
-        let out = run_sharded(&recs_many, &Stats::default(), 4, shards);
+        let out = run_sharded(database, &recs_many, &Stats::default(), 4, shards);
         assert_identical(
             &seq_many,
             &out.receipts,
@@ -117,9 +127,14 @@ fn sharded_admission_byte_identical() {
             &format!("sharded pressure k={shards}"),
         );
     }
+}
 
-    // 4. Lying stats: mispredicted footprints race, so validation and
-    //    repair must still land on identical bytes under sharding.
+/// Lying stats: mispredicted footprints race, so validation and repair
+/// must still land on identical bytes under sharding.
+fn lying_stats_match_across_shards(
+    sg: &[alloy_signer_local::PrivateKeySigner],
+    database: &MockStateDatabase,
+) {
     let lying = {
         let obs: Vec<TxObs> = (0..4)
             .map(|i| {
@@ -144,10 +159,10 @@ fn sharded_admission_byte_identical() {
             .collect();
         Stats::learn(&obs)
     };
-    let recs3 = records(counter_block(&sg, 0));
-    let seq3 = execute_block_sequential(&database, None, env(), &recs3).unwrap();
+    let recs3 = records(counter_block(sg, 0));
+    let seq3 = execute_block_sequential(database, None, env(), &recs3).unwrap();
     for rep in 0..25 {
-        let out = run_sharded(&recs3, &lying, 4, 3);
+        let out = run_sharded(database, &recs3, &lying, 4, 3);
         assert_identical(
             &seq3,
             &out.receipts,
@@ -155,4 +170,14 @@ fn sharded_admission_byte_identical() {
             &format!("sharded lying rep={rep}"),
         );
     }
+}
+
+#[test]
+fn sharded_admission_byte_identical() {
+    let sg = signers(4);
+    let database = db(&sg);
+    hot_chain_matches_across_shards(&sg, &database);
+    transfers_match_across_shards(&sg, &database);
+    table_pressure_matches_across_shards(&sg, &database);
+    lying_stats_match_across_shards(&sg, &database);
 }

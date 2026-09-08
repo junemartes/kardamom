@@ -21,6 +21,7 @@ pub mod rpc_vectors;
 pub mod upgrade;
 pub mod xchain;
 pub mod xchain_da_parity;
+mod xchain_skipped_seq;
 pub mod xchain_two_stacks;
 
 use std::net::SocketAddr;
@@ -56,6 +57,13 @@ pub const VALIDATOR_EPOCH_FAULTS: &str = "validator_epoch_faults_total";
 pub const VALIDATOR_DIVERGENCE: &str = "validator_divergence_total";
 pub const TRIE_SHADOW_CHECKS: &str = "kardamom_state_trie_shadow_checks_total";
 pub const TRIE_SHADOW_MISMATCH: &str = "kardamom_state_trie_shadow_mismatch_total";
+
+/// A `u64` as one left-padded 32-byte word (`u64_word`), and its inverse
+/// (`word_u64`): the `abi.encode` of a `uint64`, and the value form of a
+/// `uint64` event topic. Re-exported from `kardamom_types::xchain`, the
+/// one shared copy — contracts, the validator, and these scenarios all
+/// need the same packing.
+pub(crate) use kardamom_types::xchain::{u64_word, word_u64};
 
 /// Convert a scraped metric value to the `u64` every counter and gauge
 /// this crate reads really is. A scraped value that fails this check
@@ -462,15 +470,15 @@ pub struct ChainStateView {
     /// Raw activation timestamp (ms) of the health-check feature. 0 means
     /// the feature is never scheduled.
     pub activation: U256,
-    /// Health beacon, unpacked: `(beats, block_number, timestamp_ms)`.
-    pub beacon: (u64, u64, u64),
+    /// Health beacon, unpacked from its storage word.
+    pub beacon: kardamom_exec_core::features::Beacon,
 }
 
 impl ChainStateView {
     /// Beats recorded so far.
     #[must_use]
     pub fn beats(&self) -> u64 {
-        self.beacon.0
+        self.beacon.count
     }
 }
 
@@ -485,7 +493,7 @@ impl ChainStateView {
 /// or when a slot read fails.
 pub fn read_chain_state(state_dir: &Path) -> Result<ChainStateView> {
     use kardamom_exec_core::features::{
-        FEATURE_HEALTH_CHECK, HEALTH_BEACON_SLOT, activation_slot, unpack_beacon,
+        Beacon, FEATURE_HEALTH_CHECK, HEALTH_BEACON_SLOT, activation_slot,
     };
     use kardamom_types::StateDatabase;
     use kardamom_types::upgrades::CHAIN_STATE;
@@ -496,7 +504,7 @@ pub fn read_chain_state(state_dir: &Path) -> Result<ChainStateView> {
     let activation = snap
         .storage(CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK))
         .context("read activation slot")?;
-    let beacon = unpack_beacon(
+    let beacon = Beacon::unpack(
         snap.storage(CHAIN_STATE, HEALTH_BEACON_SLOT)
             .context("read beacon slot")?,
     );

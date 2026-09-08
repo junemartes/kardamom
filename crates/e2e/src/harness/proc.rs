@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -97,15 +97,17 @@ impl Proc {
             )]
             libc::kill(self.child.id() as i32, libc::SIGTERM);
         }
-        let deadline = Instant::now() + grace;
-        while Instant::now() < deadline {
-            if !self.is_alive() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        let exited = super::metrics::poll_sync(
+            "process exit after SIGTERM",
+            grace,
+            Duration::from_millis(50),
+            || Ok((!self.is_alive()).then_some(())),
+        )
+        .is_ok();
+        if !exited {
+            self.kill();
         }
-        self.kill();
-        false
+        exited
     }
 
     /// Send SIGSTOP to freeze the process without killing it (the
@@ -138,19 +140,17 @@ impl Proc {
     /// its exit code (the inner `None` means a signal killed it), or
     /// `None` on timeout.
     pub fn wait_exit(&mut self, timeout: Duration) -> Option<Option<i32>> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Some(status.code()),
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        return None;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(_) => return None,
-            }
-        }
+        super::metrics::poll_sync(
+            "process exit",
+            timeout,
+            Duration::from_millis(50),
+            || match self.child.try_wait() {
+                Ok(Some(status)) => Ok(Some(status.code())),
+                Ok(None) => Ok(None),
+                Err(e) => Err(anyhow::anyhow!(e)),
+            },
+        )
+        .ok()
     }
 
     /// Last `n` lines of the process log (best-effort, for failure dumps).
@@ -182,29 +182,25 @@ impl Drop for Proc {
 /// Returns an error when `proc` exits before logging `needle`, or when
 /// `timeout` passes first.
 pub(crate) fn wait_for_log_line(proc: &mut Proc, needle: &str, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(s) = std::fs::read_to_string(&proc.log_path)
-            && s.contains(needle)
-        {
-            return Ok(());
-        }
-        if !proc.is_alive() {
-            anyhow::bail!(
-                "{} exited before logging {needle:?}; log tail:\n{}",
-                proc.name,
-                proc.log_tail(40)
+    super::metrics::poll_sync(
+        &format!("{}: {needle:?}", proc.name),
+        timeout,
+        Duration::from_millis(100),
+        || {
+            if let Ok(s) = std::fs::read_to_string(&proc.log_path)
+                && s.contains(needle)
+            {
+                return Ok(Some(()));
+            }
+            anyhow::ensure!(
+                proc.is_alive(),
+                "{} exited before logging {needle:?}",
+                proc.name
             );
-        }
-        if Instant::now() >= deadline {
-            anyhow::bail!(
-                "{}: timed out ({timeout:?}) waiting for {needle:?}; log tail:\n{}",
-                proc.name,
-                proc.log_tail(40)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+            Ok(None)
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("{e}; log tail:\n{}", proc.log_tail(40)))
 }
 
 /// Poll until `path` exists (media-driver readiness files).
@@ -213,28 +209,24 @@ pub(crate) fn wait_for_log_line(proc: &mut Proc, needle: &str, timeout: Duration
 /// Returns an error when `proc` exits before `path` appears, or when
 /// `timeout` passes first.
 pub(crate) fn wait_for_file(proc: &mut Proc, path: &Path, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if path.exists() {
-            return Ok(());
-        }
-        if !proc.is_alive() {
-            anyhow::bail!(
-                "{} exited before {} appeared; log tail:\n{}",
-                proc.name,
-                path.display(),
-                proc.log_tail(40)
-            );
-        }
-        if Instant::now() >= deadline {
-            anyhow::bail!(
-                "{}: timed out ({timeout:?}) waiting for {}",
+    super::metrics::poll_sync(
+        &format!("{}: {}", proc.name, path.display()),
+        timeout,
+        Duration::from_millis(100),
+        || {
+            if path.exists() {
+                return Ok(Some(()));
+            }
+            anyhow::ensure!(
+                proc.is_alive(),
+                "{} exited before {} appeared",
                 proc.name,
                 path.display()
             );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+            Ok(None)
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("{e}; log tail:\n{}", proc.log_tail(40)))
 }
 
 /// A path checked, once, to exist and be a regular file.
@@ -291,19 +283,4 @@ impl std::fmt::Display for ExistingFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0.display())
     }
-}
-
-/// Reserve a free TCP port on loopback. The listener drops before this
-/// function returns, so there is a small reuse race. This is fine for
-/// tests, since the OS cycles ephemeral ports instead of reissuing the
-/// same one right away.
-pub(crate) fn free_tcp_port() -> Result<u16> {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").context("reserve tcp port")?;
-    Ok(l.local_addr()?.port())
-}
-
-/// Reserve a free UDP port on loopback (same caveat as [`free_tcp_port`]).
-pub(crate) fn free_udp_port() -> Result<u16> {
-    let s = std::net::UdpSocket::bind("127.0.0.1:0").context("reserve udp port")?;
-    Ok(s.local_addr()?.port())
 }

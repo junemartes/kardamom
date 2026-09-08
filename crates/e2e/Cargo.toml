@@ -27,10 +27,10 @@ full-pipeline-e2e = [
     "dep:clap",
     "dep:jsonrpsee",
     "dep:kardamom-batcher",
-    "dep:kardamom-bench",
     "dep:kardamom-da-watcher",
     "dep:kardamom-exec-core",
     "dep:kardamom-deployer",
+    "dep:kardamom-obs",
     "dep:kardamom-state",
     "dep:libc",
     "dep:serde_json",
@@ -53,6 +53,7 @@ kardamom-types.workspace = true
 
 alloy-primitives.workspace = true
 bytes.workspace = true
+futures.workspace = true
 rkyv.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -71,13 +72,15 @@ alloy-sol-types = { workspace = true, optional = true }
 # validator feed) the xchain scenario drives as its simulated origin.
 kardamom-da-watcher = { path = "../da_watcher", optional = true, features = ["test-support"] }
 kardamom-exec-core = { path = "../exec-core", optional = true }
-kardamom-deployer = { path = "../deployer", optional = true }
+kardamom-deployer = { path = "../deployer", optional = true, features = ["test-support"] }
+# `testkit` (free_port/free_udp_port/scrape) is the shared home for the
+# ephemeral-port and metrics-scrape helpers every harness process needs.
+kardamom-obs = { path = "../obs", optional = true, features = ["test-support"] }
 anyhow = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
 clap = { workspace = true, optional = true }
 jsonrpsee = { workspace = true, features = ["http-client"], optional = true }
 kardamom-batcher = { path = "../batcher", optional = true }
-kardamom-bench = { path = "../bench", optional = true }
 kardamom-state = { path = "../state", optional = true }
 libc = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -103,7 +106,7 @@ libc.workspace = true
 hdrhistogram.workspace = true
 jsonrpsee = { workspace = true, features = ["http-client"] }
 kardamom-da-watcher = { path = "../da_watcher" }
-kardamom-deployer = { path = "../deployer" }
+kardamom-deployer = { path = "../deployer", features = ["test-support"] }
 kardamom-ingress = { path = "../ingress" }
 kardamom-sequencer = { path = "../sequencer", features = ["testing"] }
 kardamom-state = { path = "../state" }

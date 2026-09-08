@@ -8,6 +8,7 @@
 //! acks with the tx hash before any receipt exists, and receipts stream,
 //! deduped and filterable, over one WebSocket subscription.
 
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
@@ -23,11 +24,13 @@ use kardamom_ingress::test_support::{
 
 use alloy_signer_local::PrivateKeySigner;
 
+const CHAIN_ID: NonZeroU64 = NonZeroU64::new(1).unwrap();
+
 /// `IngressConfig::default()` with `chain_id: 1`, the config every test
 /// in this file starts from.
 fn chain_one() -> IngressConfig {
     IngressConfig {
-        chain_id: 1,
+        chain_id: CHAIN_ID,
         ..IngressConfig::default()
     }
 }
@@ -103,14 +106,10 @@ async fn async_submit_acks_before_any_receipt_exists() {
     assert_eq!(hash, *env.tx_hash(), "ack carries the canonical tx hash");
 
     // The envelope must be on a tx_data shard.
-    let mut published = None;
-    for rx in &mut shard_rx {
-        if let Ok(e) = rx.try_recv() {
-            published = Some(e);
-            break;
-        }
-    }
-    let published = published.expect("envelope published to a tx_data shard");
+    let published = shard_rx
+        .iter_mut()
+        .find_map(|rx| rx.try_recv().ok())
+        .expect("envelope published to a tx_data shard");
     assert_eq!(published.tx_hash, hash);
 }
 

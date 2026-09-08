@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use kardamom_log::aeron_live::{AeronRuntime, DeliverFn, PubHandle};
+use kardamom_log::aeron_live::{AeronRuntime, PubHandle, RawFrame};
 use thiserror::Error;
 
 use crate::gateway::{ClusterEgress, ClusterIngress, OfferOutcome};
@@ -163,9 +163,8 @@ pub struct ReplayOnConnect {
 
 /// What a session announces or replays on establishment: [`connect_with`]'s
 /// option group. [`connect`] is the no-announcement, no-replay,
-/// no-filter default. Every connect variant used to be its own thin
-/// wrapper forwarding one different flag; this collapses them into one
-/// struct plus one function.
+/// no-filter default. One struct plus one function covers every connect
+/// variant, instead of one thin wrapper per flag.
 #[derive(Default)]
 pub struct ConnectOptions {
     /// Send a replay request whenever a session is established. Implies
@@ -287,21 +286,18 @@ impl SessionConnect {
         Ok(Self { rt, cfg, opts })
     }
 
-    /// Open the egress subscription. The deliver closure ships each raw
-    /// frame to the session thread. Egress frames are relayed verbatim —
-    /// the cluster assigns the canonical index, so the Aeron position and
-    /// session of the egress image do not matter.
+    /// Open the egress subscription. Raw frames ship to the session
+    /// thread verbatim — the cluster assigns the canonical index, so the
+    /// Aeron position and session of the egress image do not matter. The
+    /// session thread is a plain OS thread that waits on this receiver
+    /// alongside another crossbeam channel via `crossbeam_channel::Select`
+    /// (see [`SessionLoop::idle_wait`](super::session_loop::SessionLoop)),
+    /// so this needs the crossbeam-backed subscription, not the tokio one
+    /// every async consumer of `AeronRuntime` uses.
     fn open_egress(self) -> Result<EgressOpened, LiveError> {
-        let (frame_tx, frame_rx) = unbounded::<Vec<u8>>();
-        let deliver: DeliverFn = Box::new(move |bytes: &[u8], _pos, _session| {
-            let _ = frame_tx.send(bytes.to_vec());
-        });
-        self.rt
-            .open_subscription_with_deliver(
-                &self.cfg.egress_channel,
-                self.cfg.egress_stream_id,
-                deliver,
-            )
+        let (_sub_id, frame_rx) = self
+            .rt
+            .open_subscription_raw_crossbeam(&self.cfg.egress_channel, self.cfg.egress_stream_id)
             .map_err(|e| LiveError(format!("open egress subscription: {e}")))?;
         Ok(EgressOpened {
             base: self,
@@ -314,7 +310,7 @@ impl SessionConnect {
 /// receiver [`SessionConnect::open_egress`] created.
 struct EgressOpened {
     base: SessionConnect,
-    frame_rx: Receiver<Vec<u8>>,
+    frame_rx: Receiver<RawFrame>,
 }
 
 impl EgressOpened {

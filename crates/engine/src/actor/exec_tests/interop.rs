@@ -1,5 +1,6 @@
 //! Interop P1: remote epochs execute as 0x7D deliveries.
 
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
 use crate::error::ExecutorError;
@@ -11,19 +12,20 @@ use crate::actor::test_support::{
 };
 
 struct RecordingRemoteObserver(Arc<Mutex<Vec<u64>>>);
-impl crate::reader::RemoteEpochObserver for RecordingRemoteObserver {
+impl<S: kardamom_types::StateDatabase> crate::reader::RemoteEpochObserver<S>
+    for RecordingRemoteObserver
+{
     fn observe(
         &mut self,
         rec: &kardamom_types::xchain::RemoteEpochRecord,
-        parent_storage: &crate::reader::ParentStorageReader<'_>,
+        parent: &crate::delta::ParentState<'_, S>,
     ) -> Result<(), ExecutorError> {
         // The seam gives the observer a parent-state read. A fresh chain
         // reads zero for the Inbox lane cursor.
-        let next_seq = parent_storage(
+        let next_seq = parent.storage(
             kardamom_types::xchain::INBOX,
-            kardamom_types::xchain::inbox_next_seq_slot(rec.origin_chain_id),
-        )
-        .map_err(ExecutorError::State)?;
+            kardamom_types::xchain::Inbox::next_seq_slot(rec.origin_chain_id),
+        )?;
         assert_eq!(next_seq, alloy_primitives::U256::ZERO);
         self.0.lock().unwrap().push(rec.origin_chain_id);
         Ok(())
@@ -38,7 +40,7 @@ fn remote_epoch_messages_execute_as_0x7d_receipts() {
     use kardamom_types::xchain;
 
     let origin: u64 = 424_242;
-    let record = remote_epoch_fixture(origin, 2);
+    let record = remote_epoch_fixture(origin, NonZeroU64::new(2).expect("2 is nonzero"));
 
     let snap = MockStateDatabase::builder().build();
     let mut records = remote_epoch_records(record);
@@ -49,7 +51,7 @@ fn remote_epoch_messages_execute_as_0x7d_receipts() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let (rig, writer_log) = ExecRig::recording(StaticSnapshotSource(snap), ImmediateCommit);
     let (h, rx_e2c) = rig
-        .remote(Box::new(RecordingRemoteObserver(observed.clone())))
+        .remote(RecordingRemoteObserver(observed.clone()))
         .spawn(rx_r2e);
     h.join().expect("no panic").expect("exec ok");
 
@@ -82,6 +84,93 @@ fn remote_epoch_messages_execute_as_0x7d_receipts() {
     assert_eq!(log[0].1.receipts.len(), 2);
 }
 
+/// A minimal whole-block strategy for
+/// [`whole_block_strategy_receives_buffered_xchain_records`]: it records
+/// what arrived, and executes the `XChain` arms sequentially through the
+/// shared executor entry point, exactly as the streaming path does.
+struct RecordingXChainStrategy {
+    seen: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl crate::actor::BlockExecStrategy<MockStateDatabase> for RecordingXChainStrategy {
+    fn execute_block(
+        &self,
+        snapshot: &MockStateDatabase,
+        _parent: Option<&crate::delta::PendingDelta>,
+        records: &[crate::actor::types::BufferedRecord],
+        env: crate::block_env::ExecEnv,
+        _block_number: u64,
+    ) -> Result<crate::actor::types::BlockExecOutput, ExecutorError> {
+        let (delta, receipts, _) = records.iter().enumerate().try_fold(
+            (crate::delta::PendingDelta::new(), Vec::new(), 0u64),
+            |(mut delta, mut receipts, cumulative), (i, rec)| {
+                let Some((r, ws)) =
+                    self.apply_one(snapshot, &delta, env, i as u64, cumulative, rec)?
+                else {
+                    return Ok((delta, receipts, cumulative));
+                };
+                let cumulative = r.cumulative_gas_used;
+                delta.apply(ws);
+                receipts.push(r);
+                Ok::<_, ExecutorError>((delta, receipts, cumulative))
+            },
+        )?;
+        Ok(crate::actor::types::BlockExecOutput {
+            receipts,
+            delta,
+            bal: None,
+        })
+    }
+}
+
+impl RecordingXChainStrategy {
+    /// Handle one buffered record. `Tx` and `Deposit` only mark their kind
+    /// seen. `XChain` also executes, and returns its receipt and write set
+    /// for the caller to fold into the block's delta.
+    fn apply_one(
+        &self,
+        snapshot: &MockStateDatabase,
+        delta: &crate::delta::PendingDelta,
+        env: crate::block_env::ExecEnv,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+        rec: &crate::actor::types::BufferedRecord,
+    ) -> Result<Option<(kardamom_types::Receipt, crate::delta::WriteSet)>, ExecutorError> {
+        use crate::actor::types::BufferedRecord;
+        use crate::executor::execute_xchain_tx;
+
+        match rec {
+            BufferedRecord::Tx { .. } => {
+                self.seen.lock().unwrap().push("tx");
+                Ok(None)
+            }
+            BufferedRecord::Deposit { .. } => {
+                self.seen.lock().unwrap().push("deposit");
+                Ok(None)
+            }
+            BufferedRecord::XChain {
+                tx_idx,
+                origin_chain_id,
+                message,
+                position,
+            } => {
+                self.seen.lock().unwrap().push("xchain");
+                let slot = kardamom_exec_core::exec_types::TxSlot {
+                    tx_idx: *tx_idx,
+                    tx_position: *position,
+                    tx_index_in_block,
+                    cumulative_gas_used_before,
+                };
+                let delivery = kardamom_exec_core::executor::XChainDelivery {
+                    origin_chain_id: *origin_chain_id,
+                    message,
+                };
+                execute_xchain_tx(snapshot, None, delta, env, slot, delivery, None).map(Some)
+            }
+        }
+    }
+}
+
 /// Whole-block execution (the validator's parallel path) BUFFERS cross-chain
 /// messages like deposits and hands them to the strategy at the boundary.
 /// The strategy here dispatches through `execute_xchain_tx` exactly as the
@@ -89,13 +178,10 @@ fn remote_epoch_messages_execute_as_0x7d_receipts() {
 /// unchanged.
 #[test]
 fn whole_block_strategy_receives_buffered_xchain_records() {
-    use crate::actor::types::{BlockExec, BlockExecOutput, BufferedRecord};
-    use crate::delta::PendingDelta;
-    use crate::executor::execute_xchain_tx;
     use kardamom_types::xchain;
 
     let origin: u64 = 424_242;
-    let record = remote_epoch_fixture(origin, 2);
+    let record = remote_epoch_fixture(origin, NonZeroU64::new(2).expect("2 is nonzero"));
 
     let snap = MockStateDatabase::builder().build();
     let mut records = remote_epoch_records(record);
@@ -103,51 +189,10 @@ fn whole_block_strategy_receives_buffered_xchain_records() {
     records.push(boundary_msg(1, 3, 1_700_000_000));
     let rx_r2e = feed(records);
 
-    // A minimal whole-block strategy: record what arrived, execute the
-    // XChain arms sequentially through the shared executor entry point.
     let seen_kinds = Arc::new(Mutex::new(Vec::<&'static str>::new()));
-    let seen = seen_kinds.clone();
-    let strategy: BlockExec<MockStateDatabase> =
-        Box::new(move |snapshot, _parent, records, env, _block| {
-            let mut receipts = Vec::new();
-            let mut delta = PendingDelta::new();
-            let mut cumulative = 0u64;
-            for (i, rec) in records.iter().enumerate() {
-                match rec {
-                    BufferedRecord::Tx { .. } => seen.lock().unwrap().push("tx"),
-                    BufferedRecord::Deposit { .. } => seen.lock().unwrap().push("deposit"),
-                    BufferedRecord::XChain {
-                        tx_idx,
-                        origin_chain_id,
-                        message,
-                        position,
-                    } => {
-                        seen.lock().unwrap().push("xchain");
-                        let (r, ws) = execute_xchain_tx(
-                            snapshot,
-                            None,
-                            &delta,
-                            env,
-                            *tx_idx,
-                            *position,
-                            *origin_chain_id,
-                            message,
-                            i as u64,
-                            cumulative,
-                            None,
-                        )?;
-                        cumulative = r.cumulative_gas_used;
-                        delta.apply(ws);
-                        receipts.push(r);
-                    }
-                }
-            }
-            Ok(BlockExecOutput {
-                receipts,
-                delta,
-                bal: None,
-            })
-        });
+    let strategy = RecordingXChainStrategy {
+        seen: seen_kinds.clone(),
+    };
 
     let (rig, _writer_log) = ExecRig::recording(StaticSnapshotSource(snap), ImmediateCommit);
     let (h, rx_e2c) = rig.block_exec(strategy).spawn(rx_r2e);
@@ -173,11 +218,13 @@ fn whole_block_strategy_receives_buffered_xchain_records() {
 }
 
 struct RejectingRemoteObserver;
-impl crate::reader::RemoteEpochObserver for RejectingRemoteObserver {
+impl<S: kardamom_types::StateDatabase> crate::reader::RemoteEpochObserver<S>
+    for RejectingRemoteObserver
+{
     fn observe(
         &mut self,
         rec: &kardamom_types::xchain::RemoteEpochRecord,
-        _parent_storage: &crate::reader::ParentStorageReader<'_>,
+        _parent: &crate::delta::ParentState<'_, S>,
     ) -> Result<(), ExecutorError> {
         Err(ExecutorError::State(format!(
             "remote epoch rejected (origin {})",
@@ -190,12 +237,12 @@ impl crate::reader::RemoteEpochObserver for RejectingRemoteObserver {
 /// execute — the same posture as a rejected L1 epoch.
 #[test]
 fn rejected_remote_epoch_halts_before_messages_execute() {
-    let record = remote_epoch_fixture(424_242, 2);
+    let record = remote_epoch_fixture(424_242, NonZeroU64::new(2).expect("2 is nonzero"));
     let snap = MockStateDatabase::builder().build();
     let rx_r2e = feed(remote_epoch_records(record));
 
     let (rig, _writer_log) = ExecRig::recording(StaticSnapshotSource(snap), ImmediateCommit);
-    let (h, rx_e2c) = rig.remote(Box::new(RejectingRemoteObserver)).spawn(rx_r2e);
+    let (h, rx_e2c) = rig.remote(RejectingRemoteObserver).spawn(rx_r2e);
     let res = h.join().expect("no panic");
     assert!(matches!(res, Err(ExecutorError::State(_))), "got {res:?}");
     assert!(

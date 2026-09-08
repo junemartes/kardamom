@@ -35,7 +35,7 @@ use alloy_primitives::{B256, U256};
 use anyhow::{Context, Result};
 use kardamom_batcher::batch::{ClosedBlock, RecordedTx};
 use kardamom_types::xchain::{
-    INBOX, RemoteEpochRecord, derive_remote_epoch, remote_source_hash, xchain_tx_sender,
+    INBOX, Inbox, RemoteEpochRecord, derive_remote_epoch, remote_source_hash, xchain_tx_sender,
 };
 use kardamom_types::{BPosition, StateDatabase, TX_TYPE_XCHAIN, TxEnvelope};
 
@@ -375,15 +375,15 @@ pub fn assert_reconstructed_interop_state(
 
     // Lane state: equal across the two DBs AND equal to the expected values
     // (equality alone could be vacuously satisfied by two empty DBs).
-    let next_seq_slot = xchain::inbox_next_seq_slot(origin);
+    let next_seq_slot = Inbox::next_seq_slot(origin);
     let live_next = xchain::read_slot(executor_dir, INBOX, next_seq_slot)?;
     let recon_next = xchain::read_slot(recon_dir, INBOX, next_seq_slot)?;
     anyhow::ensure!(
         live_next == U256::from(3) && recon_next == live_next,
         "Inbox.nextSeq[{origin}] must be 3 on both sides (live {live_next}, rebuilt {recon_next})"
     );
-    for seq in 0..3u64 {
-        let slot = xchain::inbox_delivered_slot(origin, seq);
+    (0..3u64).try_for_each(|seq| {
+        let slot = Inbox::delivered_slot(origin, seq);
         let live = xchain::read_slot(executor_dir, INBOX, slot)?;
         let recon = xchain::read_slot(recon_dir, INBOX, slot)?;
         anyhow::ensure!(
@@ -391,7 +391,8 @@ pub fn assert_reconstructed_interop_state(
             "Inbox.delivered[{origin}][{seq}] must be success on both sides \
              (live {live}, rebuilt {recon})"
         );
-    }
+        Ok(())
+    })?;
     let stored = xchain::read_slot(recon_dir, outcome.receiver, B256::ZERO)?;
     anyhow::ensure!(
         B256::from(stored.to_be_bytes::<32>()) == outcome.payload_word,

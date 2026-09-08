@@ -69,6 +69,7 @@ toml.workspace = true
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-deployer = { path = "../deployer", features = ["test-support"] }
 kardamom-batcher = { path = ".", features = ["test-support"] }
+kardamom-obs = { path = "../obs", features = ["test-support"] }
 tempfile.workspace = true
 proptest = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

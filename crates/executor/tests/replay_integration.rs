@@ -8,6 +8,9 @@
 //! through the in-process `JoinBuffer`. The expected receipts and slim
 //! boundaries on tx_receipts are unchanged from before the split.
 
+const QUEUE_DEPTH_64: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::thread;
 use std::time::Duration;
 
@@ -23,10 +26,11 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_engine::{
-    BPosition, BlockBoundary, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig,
-    ExecutorError, Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound,
-    ResumePoint, RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
-    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundary, BlockBoundaryStart, CMessage, EngineWiring, ExecPorts, Executor,
+    ExecutorConfig, ExecutorError, Inbound, MockStateDatabase, MutatingSnapshotSource, NoBlockExec,
+    NoEpochCheck, NoRemoteEpochCheck, Outbound, ResumePoint, RoleHooks, StateWriterSignal,
+    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription,
+    TxReceiptsPublication, TxRef, WriterApplyingQueue,
 };
 
 /// Bridge a crossbeam receiver of `(BPosition, TxEnvelope)` into a
@@ -79,14 +83,19 @@ impl StateWriterSignal for Imm {
 
 /// Port types for this test's channel-backed fakes.
 struct TestWiring;
-impl EngineWiring for TestWiring {
-    type TxData = ChanTxDataSub;
-    type TxOrdering = ChanTxOrderingSub;
-    type TxReceipts = ChanReceiptsPub;
+impl ExecPorts for TestWiring {
     type Snapshots = MutatingSnapshotSource;
     type WriterSignal = Imm;
     type WriterQueue = WriterApplyingQueue;
     type Epoch = NoEpochCheck;
+    type RemoteEpoch = NoRemoteEpochCheck;
+    type BlockExec = NoBlockExec;
+}
+
+impl EngineWiring for TestWiring {
+    type TxData = ChanTxDataSub;
+    type TxOrdering = ChanTxOrderingSub;
+    type TxReceipts = ChanReceiptsPub;
 }
 
 /// Proxy-style envelope builder: sign, encode raw_tx, and fill in sender
@@ -183,8 +192,8 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
     drop(b_tx);
 
     let cfg = ExecutorConfig {
-        chain_id: 1,
-        receipt_queue_depth: 64,
+        chain_id: NonZeroU64::MIN,
+        receipt_queue_depth: QUEUE_DEPTH_64,
         ..Default::default()
     };
     let writer_q = WriterApplyingQueue::new(snap.clone());

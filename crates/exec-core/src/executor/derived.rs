@@ -7,13 +7,14 @@
 //! `to`); [`DerivedCall`] and [`DerivedCall::derived_receipt`] name that
 //! shared shape once, instead of writing it out four times.
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{B256, U256};
 use kardamom_types::Receipt;
 use kardamom_types::{Deposit, WireLog};
 use revm::context::TxEnv;
-use revm::context::result::ExecutionResult;
+use revm::context::result::{EVMError, ExecResultAndState, ExecutionResult};
 use revm::primitives::Log;
-use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
+use revm::state::EvmState;
+use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
 
 use alloc::format;
 use alloc::vec::Vec;
@@ -22,12 +23,13 @@ use crate::block_env::ExecEnv;
 use crate::error::ExecutorError;
 use crate::exec_types::TxSlot;
 
+use super::skip::{DerivedTxIdentity, Rejection, skip_reason_of_tx};
+
 /// A revm transaction outcome, reduced to what a receipt needs. Both
-/// derived-tx call shapes (`transact_commit`, and `transact` with a
-/// separate commit) produce one of these from their
-/// `&ExecutionResult` — never an engine error, since a revert or halt on
-/// a derived tx is a receipt fact, not a failure. This is the `match
-/// &outcome.result { ... }` block that used to appear four times.
+/// derived-tx call shapes build one of these from the `&ExecutionResult`
+/// [`DerivedCall::transact`] returns — never an engine error, since a
+/// revert or halt on a derived tx is a receipt fact, not a failure. One
+/// classification of the EVM result serves every derived path.
 pub(super) struct CallOutcome {
     pub(super) status_success: bool,
     pub(super) gas_used: u64,
@@ -49,18 +51,12 @@ impl From<&ExecutionResult> for CallOutcome {
     }
 }
 
-/// The one difference between a deposit's and a cross-chain delivery's
-/// receipt: the canonical id (`source_hash`, either way — not a 2718
-/// keccak) and the caller/callee pair. Both fillers (`nonce: 0`,
-/// `effective_gas_price: 0`) are shared, so they live in
-/// [`DerivedCall::derived_receipt`] itself, not here. Every field is
-/// `Copy`, so this is too.
-#[derive(Clone, Copy)]
-pub(super) struct DerivedIdentity {
-    pub(super) tx_hash: B256,
-    pub(super) tx_type: u8,
-    pub(super) from: Address,
-    pub(super) to: Option<Address>,
+/// The result of [`DerivedCall::transact_or_skip`]'s inner call: it ran
+/// (the caller inspects the outcome for revert/halt/success through
+/// [`CallOutcome`]), or revm rejected it at validation before it ran.
+pub(super) enum DerivedOutcome {
+    Ran(ExecResultAndState<ExecutionResult, EvmState>),
+    Rejected(Rejection),
 }
 
 /// The shared execution context for one derived transaction (a deposit
@@ -68,9 +64,9 @@ pub(super) struct DerivedIdentity {
 /// access to the cache it executes against. Both the fresh-cache
 /// reference path (`deposit.rs`, `xchain.rs`) and the Executor's
 /// block-scope path (`scope_derived.rs`) build one of these per derived
-/// tx, so [`DerivedCall::credit_mint`], [`DerivedCall::transact_commit`],
-/// and [`DerivedCall::derived_receipt`] read `slot`/`env`/`cache` as
-/// state instead of as loose parameters repeated at every call site.
+/// tx, so [`DerivedCall::credit_mint`], [`DerivedCall::transact`], and
+/// [`DerivedCall::derived_receipt`] read `slot`/`env`/`cache` as state
+/// instead of as loose parameters repeated at every call site.
 /// Built fresh right before use and dropped after — the free-path
 /// callers construct one and hold it for the whole derived-tx sequence;
 /// the Executor path constructs a temporary per call, since `Executor`
@@ -129,24 +125,34 @@ where
         Ok(())
     }
 
-    /// Run one fee-free, nonce-check-off inner call and commit its
-    /// state, in one step. A deposit's inner call and a cross-chain
-    /// delivery's inner call ([`super::xchain::ValuelessMessage`]) share
-    /// this exact shape — build a fresh EVM over `self.cache` with the
-    /// nonce check off, `transact_commit`, and reduce the result to a
-    /// [`CallOutcome`]. Free-path only (`deposit.rs`, `xchain.rs`): the
-    /// Executor's block-scope path
-    /// ([`super::scope_derived::Executor::execute_deposit`] and
-    /// `execute_xchain`) toggles the block-scope EVM's own config
-    /// instead, through `transact_without_nonce_check`, since it must
-    /// reuse the block cache rather than build a fresh EVM per tx.
+    /// Run one fee-free, nonce-check-off inner call: build a fresh EVM
+    /// over `self.cache` with the nonce check off, and execute. Both
+    /// derived-tx call shapes (the free-cache reference path in
+    /// `deposit.rs`/`xchain.rs`, and the Executor's block-scope path in
+    /// `scope_derived.rs`) share this one hand-built EVM, instead of each
+    /// building its own.
+    ///
+    /// The state is NOT committed here. A deposit's write-set capture
+    /// reads the raw per-tx state before it is folded into the caller's
+    /// cache, so the caller commits once it has read what it needs from
+    /// the returned state.
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorError::Execution`] when the inner call fails
-    /// non-deterministically or a database read fails. A revert or halt
-    /// is not an error — it reaches [`CallOutcome`] as a failed receipt.
-    pub(super) fn transact_commit(&mut self, tx_env: TxEnv) -> Result<CallOutcome, ExecutorError> {
+    /// Returns the revm [`EVMError`]. [`EVMError::Transaction`] is
+    /// deterministic input invalidity — every replica computes the same
+    /// rejection from the same state and tx, so the caller turns it into
+    /// a failed receipt through `skip_reason_of_tx` rather than an engine
+    /// error. Every other variant is a database error or a block-env
+    /// fault, not derivable from the record; the caller turns it into an
+    /// [`ExecutorError`] through `derived_tx_rejection`. A revert or halt
+    /// is not an error either way — it reaches [`CallOutcome`] as a
+    /// failed receipt.
+    pub(super) fn transact(
+        &mut self,
+        tx_env: TxEnv,
+    ) -> Result<ExecResultAndState<ExecutionResult, EvmState>, EVMError<<D as revm::Database>::Error>>
+    {
         let mut cfg = self.env.cfg_env();
         cfg.disable_nonce_check = true;
         let mut evm = Context::mainnet()
@@ -154,18 +160,57 @@ where
             .with_block(self.env.block_env())
             .with_cfg(cfg)
             .build_mainnet();
-        let result = evm
-            .transact_commit(tx_env)
-            .map_err(|e| ExecutorError::Execution {
-                idx: self.slot.tx_idx,
-                detail: format!("{e:?}"),
-            })?;
-        Ok(CallOutcome::from(&result))
+        evm.transact(tx_env)
     }
 
-    /// Build a derived transaction's receipt. `nonce: 0` is never a real
-    /// nonce for either kind — consumers branch on `tx_type`. Both kinds
-    /// pay no fee (`effective_gas_price: 0`); a deposit's mint and a
+    /// [`Self::transact`], with revm's validation rejection turned into a
+    /// [`Rejection`] instead of an error. All four derived-tx call sites
+    /// (the free-cache reference path in `deposit.rs`/`xchain.rs`, and the
+    /// Executor's block-scope path in `scope_derived.rs`, one each) share
+    /// this one dispatch, instead of writing the three-way match out four
+    /// times.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::Execution`] for a database or block-env
+    /// fault, not derivable from the record. A revm validation rejection
+    /// is not an error; it comes back as `Ok(DerivedOutcome::Rejected(_))`.
+    pub(super) fn transact_or_skip(
+        &mut self,
+        tx_env: TxEnv,
+    ) -> Result<DerivedOutcome, ExecutorError> {
+        match self.transact(tx_env) {
+            Ok(o) => Ok(DerivedOutcome::Ran(o)),
+            // Deterministic input invalidity: every replica computes the
+            // same rejection from the same state and tx.
+            Err(EVMError::Transaction(e)) => Ok(DerivedOutcome::Rejected(Rejection {
+                reason: skip_reason_of_tx(&e),
+                detail: format!("{e:?}"),
+            })),
+            Err(e) => Err(self.derived_tx_rejection(&e)),
+        }
+    }
+
+    /// Map a non-validation revm error on this derived tx to the engine
+    /// error. The `EVMError::Transaction` arm is handled by
+    /// [`Self::transact_or_skip`] as a [`Rejection`]. Everything else
+    /// (database, header, custom) is local or is a block-env fault, not
+    /// derivable from the record. It stays fatal, so crash recovery
+    /// replays cleanly.
+    fn derived_tx_rejection<DbErr: core::fmt::Debug>(
+        &self,
+        err: &EVMError<DbErr>,
+    ) -> ExecutorError {
+        ExecutorError::Execution {
+            idx: self.slot.tx_idx,
+            detail: format!("{err:?}"),
+        }
+    }
+
+    /// Build a derived transaction's receipt. `identity.nonce` is 0 for
+    /// both kinds — a deposit and a cross-chain delivery carry no real
+    /// nonce, and consumers branch on `tx_type` instead. Both kinds pay
+    /// no fee (`effective_gas_price: 0`); a deposit's mint and a
     /// delivery's quota gate are the value transfer, not a fee.
     ///
     /// # Errors
@@ -176,7 +221,7 @@ where
     /// defined error instead of a wrong receipt.
     pub(super) fn derived_receipt(
         &self,
-        identity: DerivedIdentity,
+        identity: DerivedTxIdentity,
         outcome: &CallOutcome,
         write_set_hash: B256,
     ) -> Result<Receipt, ExecutorError> {
@@ -200,7 +245,7 @@ where
             gas_used: outcome.gas_used,
             logs: wire_logs,
             write_set_hash,
-            nonce: 0,
+            nonce: identity.nonce,
             from: identity.from,
             to: identity.to,
             contract_address: None,

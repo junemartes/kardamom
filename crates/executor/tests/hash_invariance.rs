@@ -7,15 +7,13 @@
 //! flips the hash.
 
 use alloy_primitives::{Address, B256, U256};
+use kardamom_engine::delta::AccountFields;
 use kardamom_engine::delta::WriteSet;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-fn build(
-    accounts: &[(Address, (u64, U256, B256))],
-    storage: &[((Address, B256), U256)],
-) -> WriteSet {
+fn build(accounts: &[(Address, AccountFields)], storage: &[((Address, B256), U256)]) -> WriteSet {
     let mut ws = WriteSet::default();
     for (a, c) in accounts {
         ws.accounts.push((*a, *c));
@@ -30,20 +28,24 @@ fn build(
     ws
 }
 
-type AccountVec = Vec<(Address, (u64, U256, B256))>;
+type AccountVec = Vec<(Address, AccountFields)>;
 type StorageVec = Vec<((Address, B256), U256)>;
 
 fn sample(seed: u64) -> (AccountVec, StorageVec) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let n_acc: u64 = 32;
     let n_sto: u64 = 128;
-    let accounts: Vec<(Address, (u64, U256, B256))> = (0..n_acc)
+    let accounts: AccountVec = (0..n_acc)
         .map(|i| {
             let mut a = [0u8; 20];
             rng.fill(&mut a);
             (
                 Address::from(a),
-                (i, U256::from(i * 7), B256::repeat_byte((i % 256) as u8)),
+                AccountFields {
+                    nonce: i,
+                    balance: U256::from(i * 7),
+                    code_hash: B256::repeat_byte((i % 256) as u8),
+                },
             )
         })
         .collect();
@@ -85,6 +87,6 @@ fn flipping_one_balance_changes_hash() {
     let (accounts, storage) = sample(99);
     let base = build(&accounts, &storage).hash();
     let mut accounts_b = accounts.clone();
-    accounts_b[0].1.1 += U256::from(1u64);
+    accounts_b[0].1.balance += U256::from(1u64);
     assert_ne!(build(&accounts_b, &storage).hash(), base);
 }

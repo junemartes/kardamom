@@ -9,6 +9,13 @@ publish = false
 name = "kardamom_obs"
 path = "src/lib.rs"
 
+[features]
+# `testkit`: shared `/metrics` smoke-test and bounded-polling helpers for
+# the other crates in the workspace (`free_port`, `free_udp_port`,
+# `scrape`, `poll_until`, `poll_sync`). Off by default: it pulls in
+# `reqwest`, which a production build of this crate never needs.
+test-support = ["dep:reqwest"]
+
 [dependencies]
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
@@ -17,6 +24,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # The exporter is spawned onto the caller's runtime (see `init`).
 tokio = { workspace = true, features = ["rt", "net", "time"] }
+# Only for `testkit::scrape`, behind `test-support`.
+reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

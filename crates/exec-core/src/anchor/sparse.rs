@@ -56,24 +56,47 @@ impl Node {
                 key,
                 child: Box::new(Node::Unresolved(child)),
             },
-            TrieNode::Branch(b) => {
-                let mut children: [Option<Box<Node>>; 16] = Default::default();
-                let mut stack = b.stack.into_iter();
-                for (i, slot) in children.iter_mut().enumerate() {
-                    #[allow(
-                        clippy::cast_possible_truncation,
-                        reason = "`i` indexes a 16-element array: always < 16, fits u8"
-                    )]
-                    if b.state_mask.is_bit_set(i as u8) {
-                        let r = stack
-                            .next()
-                            .ok_or(AnchorError::Malformed("branch mask exceeds stack"))?;
-                        *slot = Some(Box::new(Node::Unresolved(r)));
-                    }
-                }
-                Node::Branch { children }
-            }
+            TrieNode::Branch(b) => Node::Branch {
+                children: Self::resolve_branch_children(b)?,
+            },
         })
+    }
+
+    /// Resolve a branch's 16 child slots: an unresolved reference where
+    /// `state_mask` sets the bit, `None` where it does not. [`Self::resolve`]'s
+    /// match arm stays free of a loop.
+    fn resolve_branch_children(
+        b: alloy_trie::nodes::BranchNode,
+    ) -> Result<[Option<Box<Node>>; 16], AnchorError> {
+        let mut children: [Option<Box<Node>>; 16] = Default::default();
+        let mut stack = b.stack.into_iter();
+        for (i, slot) in children.iter_mut().enumerate() {
+            Self::resolve_branch_slot(slot, i, b.state_mask, &mut stack)?;
+        }
+        Ok(children)
+    }
+
+    /// Resolve one branch child slot. `children.iter_mut().enumerate()`
+    /// in [`Self::resolve_branch_children`] stays free of a branch.
+    fn resolve_branch_slot(
+        slot: &mut Option<Box<Node>>,
+        i: usize,
+        state_mask: TrieMask,
+        stack: &mut impl Iterator<Item = RlpNode>,
+    ) -> Result<(), AnchorError> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "`i` indexes a 16-element array: always < 16, fits u8"
+        )]
+        let bit_set = state_mask.is_bit_set(i as u8);
+        if !bit_set {
+            return Ok(());
+        }
+        let r = stack
+            .next()
+            .ok_or(AnchorError::Malformed("branch mask exceeds stack"))?;
+        *slot = Some(Box::new(Node::Unresolved(r)));
+        Ok(())
     }
 
     fn resolved(self, at: &Nibbles, store: &NodeStore<'_>) -> Result<Node, AnchorError> {
@@ -367,20 +390,30 @@ impl<'s, 'p> Walk<'s, 'p> {
     /// vanished.
     fn collapse_branch(
         &self,
-        children: [Option<Box<Node>>; 16],
+        mut children: [Option<Box<Node>>; 16],
         depth: usize,
     ) -> Result<Option<Node>, AnchorError> {
+        // Take each survivor as the scan finds it, so the found value
+        // carries forward with no second, fallible lookup by index.
+        // Taking at most two (the branch stays as-is past the second)
+        // leaves every other slot untouched.
         let mut survivors = children
-            .iter()
+            .iter_mut()
             .enumerate()
-            .filter(|(_, c)| c.is_some())
-            .map(|(i, _)| i);
+            .filter_map(|(i, c)| c.take().map(|node| (i, *node)));
         let first = survivors.next();
         let second = survivors.next();
         match (first, second) {
             (None, _) => Ok(None),
-            (Some(_), Some(_)) => Ok(Some(Node::Branch { children })),
-            (Some(i), None) => Ok(Some(self.splice_survivor(children, i, depth)?)),
+            (Some((i, survivor)), None) => Ok(Some(self.splice_survivor(survivor, i, depth)?)),
+            (Some((i1, n1)), Some((i2, n2))) => {
+                // Two or more survivors keep the branch as-is: put the
+                // two taken back, and every untaken slot is already
+                // exactly as it was.
+                children[i1] = Some(Box::new(n1));
+                children[i2] = Some(Box::new(n2));
+                Ok(Some(Node::Branch { children }))
+            }
         }
     }
 
@@ -390,13 +423,7 @@ impl<'s, 'p> Walk<'s, 'p> {
     /// exists to feed. The splice itself is [`Node::merge_extension`]:
     /// once resolved, a survivor spliced up through one nibble is the
     /// same shape as a child merged up through an extension's key.
-    fn splice_survivor(
-        &self,
-        mut children: [Option<Box<Node>>; 16],
-        i: usize,
-        depth: usize,
-    ) -> Result<Node, AnchorError> {
-        let survivor = children[i].take().expect("survivor indexed");
+    fn splice_survivor(&self, survivor: Node, i: usize, depth: usize) -> Result<Node, AnchorError> {
         let mut nib = Nibbles::new();
         #[allow(
             clippy::cast_possible_truncation,
@@ -513,21 +540,39 @@ impl Node {
                 ExtensionNode::new(*key, child.rlp_ref()).encode(out);
             }
             Node::Branch { children } => {
-                let mut stack = Vec::new();
-                let mut mask = TrieMask::default();
-                for (i, c) in children.iter().enumerate() {
-                    if let Some(c) = c {
-                        stack.push(c.rlp_ref());
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            reason = "`i` indexes a 16-element array: always < 16, fits u8"
-                        )]
-                        mask.set_bit(i as u8);
-                    }
-                }
+                let (stack, mask) = Self::branch_rlp_refs(children);
                 BranchNode::new(stack, mask).encode(out);
             }
         }
+    }
+
+    /// This branch's child RLP references and state mask, in one pass.
+    /// [`Self::encode_node`]'s match arm stays free of a loop.
+    fn branch_rlp_refs(children: &[Option<Box<Node>>; 16]) -> (Vec<RlpNode>, TrieMask) {
+        let mut stack = Vec::new();
+        let mut mask = TrieMask::default();
+        for (i, c) in children.iter().enumerate() {
+            Self::push_branch_child(&mut stack, &mut mask, i, c.as_deref());
+        }
+        (stack, mask)
+    }
+
+    /// Push one branch child's RLP reference and set its mask bit, or do
+    /// nothing for an empty slot. `children.iter().enumerate()` in
+    /// [`Self::branch_rlp_refs`] stays free of a branch.
+    fn push_branch_child(
+        stack: &mut Vec<RlpNode>,
+        mask: &mut TrieMask,
+        i: usize,
+        c: Option<&Node>,
+    ) {
+        let Some(c) = c else { return };
+        stack.push(c.rlp_ref());
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "`i` indexes a 16-element array: always < 16, fits u8"
+        )]
+        mask.set_bit(i as u8);
     }
 
     /// This node's reference form, as seen from its parent. Untouched

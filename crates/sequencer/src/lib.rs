@@ -36,6 +36,7 @@ mod nonce_decode;
 pub mod outbound;
 pub mod partition;
 pub(crate) mod pending;
+pub mod pump;
 pub mod remote_epoch;
 pub mod resync;
 pub(crate) mod sender;

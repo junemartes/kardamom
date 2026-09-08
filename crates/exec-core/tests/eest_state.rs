@@ -30,6 +30,7 @@ use std::path::Path;
 use alloy_primitives::{Address, B256, Bytes as AlloyBytes, U256, keccak256};
 use alloy_rlp::Encodable;
 use kardamom_exec_core::block_env::ExecEnv;
+use kardamom_exec_core::delta::AccountFields;
 use kardamom_exec_core::executor::Executor;
 use kardamom_exec_core::state::MockStateDatabase;
 use kardamom_exec_core::{TxIndex, WriteSet};
@@ -83,7 +84,7 @@ fn xfail_match<'a>(xfails: &'a [Xfail], id: &str) -> Option<&'a Xfail> {
 #[derive(Default)]
 struct Alloc {
     /// addr to (nonce, balance, `code_hash`)
-    accounts: BTreeMap<Address, (u64, U256, B256)>,
+    accounts: BTreeMap<Address, AccountFields>,
     /// (addr, slot) to value
     storage: BTreeMap<(Address, B256), U256>,
 }
@@ -103,37 +104,35 @@ impl Alloc {
     }
 
     fn state_root(&self) -> B256 {
-        let accounts = self
-            .accounts
-            .iter()
-            .filter_map(|(addr, (nonce, balance, code_hash))| {
-                // Kardamom's empty-code sentinel is `B256::ZERO`
-                // (normalized to `KECCAK_EMPTY` at the snapshot
-                // boundary). The trie always encodes `KECCAK_EMPTY`.
-                let code_hash = if *code_hash == B256::ZERO {
-                    KECCAK_EMPTY
-                } else {
-                    *code_hash
-                };
-                // EIP-161: empty accounts do not exist in the state trie.
-                if *nonce == 0 && balance.is_zero() && code_hash == KECCAK_EMPTY {
-                    return None;
-                }
-                let storage_root = alloy_trie::root::storage_root_unhashed(
-                    self.storage
-                        .range((*addr, B256::ZERO)..=(*addr, B256::repeat_byte(0xff)))
-                        .map(|((_, k), v)| (*k, *v)),
-                );
-                Some((
-                    *addr,
-                    alloy_trie::TrieAccount {
-                        nonce: *nonce,
-                        balance: *balance,
-                        storage_root,
-                        code_hash,
-                    },
-                ))
-            });
+        let accounts = self.accounts.iter().filter_map(|(addr, fields)| {
+            let (nonce, balance) = (&fields.nonce, &fields.balance);
+            // Kardamom's empty-code sentinel is `B256::ZERO`
+            // (normalized to `KECCAK_EMPTY` at the snapshot
+            // boundary). The trie always encodes `KECCAK_EMPTY`.
+            let code_hash = if fields.code_hash == B256::ZERO {
+                KECCAK_EMPTY
+            } else {
+                fields.code_hash
+            };
+            // EIP-161: empty accounts do not exist in the state trie.
+            if *nonce == 0 && balance.is_zero() && code_hash == KECCAK_EMPTY {
+                return None;
+            }
+            let storage_root = alloy_trie::root::storage_root_unhashed(
+                self.storage
+                    .range((*addr, B256::ZERO)..=(*addr, B256::repeat_byte(0xff)))
+                    .map(|((_, k), v)| (*k, *v)),
+            );
+            Some((
+                *addr,
+                alloy_trie::TrieAccount {
+                    nonce: *nonce,
+                    balance: *balance,
+                    storage_root,
+                    code_hash,
+                },
+            ))
+        });
         alloy_trie::root::state_root_unhashed(accounts)
     }
 }
@@ -272,9 +271,14 @@ fn seed_account(
     if !info.code.is_empty() {
         db = db.code(code_hash, bytes::Bytes::from(info.code.to_vec()));
     }
-    alloc
-        .accounts
-        .insert(addr, (info.nonce, info.balance, code_hash));
+    alloc.accounts.insert(
+        addr,
+        AccountFields {
+            nonce: info.nonce,
+            balance: info.balance,
+            code_hash,
+        },
+    );
     for (key, value) in &info.storage {
         let k = B256::from(*key);
         db = db.storage(addr, k, *value);
@@ -341,10 +345,12 @@ impl PostCheck<'_> {
                 None => diffs.push(format!("{addr}: missing (want {want_tuple:?})")),
                 Some(g) => {
                     let norm = |h: B256| if h == KECCAK_EMPTY { B256::ZERO } else { h };
-                    if (g.0, g.1, norm(g.2)) != (want_tuple.0, want_tuple.1, norm(want_tuple.2)) {
+                    if (g.nonce, g.balance, norm(g.code_hash))
+                        != (want_tuple.0, want_tuple.1, norm(want_tuple.2))
+                    {
                         diffs.push(format!(
                             "{addr}: got (nonce={}, bal={}, code={}), want (nonce={}, bal={}, code={})",
-                            g.0, g.1, g.2, want_tuple.0, want_tuple.1, want_tuple.2
+                            g.nonce, g.balance, g.code_hash, want_tuple.0, want_tuple.1, want_tuple.2
                         ));
                     }
                 }

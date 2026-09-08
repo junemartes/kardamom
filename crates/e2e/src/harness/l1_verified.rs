@@ -56,7 +56,12 @@ pub enum Fault {
 /// A running mock endpoint. Dropping it stops the server.
 pub struct VerifiedL1 {
     addr: SocketAddr,
-    fault: Arc<std::sync::Mutex<Fault>>,
+    /// The current fault mode, one writer ([`Self::set_fault`]) and many
+    /// concurrent readers (one per in-flight connection task) — a
+    /// `watch` channel, not a mutex: a reader borrows the latest value
+    /// with no lock to poison, and holds no guard across the `.await`
+    /// that follows.
+    fault: tokio::sync::watch::Sender<Fault>,
     /// Requests served. This lets a test prove the validator actually
     /// went through here, instead of reaching anvil directly.
     served: Arc<AtomicU64>,
@@ -69,10 +74,6 @@ impl VerifiedL1 {
     /// # Errors
     /// Returns an error when the ephemeral port fails to bind or the
     /// client cannot connect to `upstream`.
-    ///
-    /// # Panics
-    /// The spawned connection task panics if the fault mutex is poisoned
-    /// (a prior handler panicked while holding the lock).
     pub async fn spawn(upstream: &str) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -81,11 +82,10 @@ impl VerifiedL1 {
         let client: HttpClient = HttpClientBuilder::default()
             .build(upstream)
             .context("connect mock verified-L1 to anvil")?;
-        let fault = Arc::new(std::sync::Mutex::new(Fault::None));
+        let (fault, fault_rx) = tokio::sync::watch::channel(Fault::None);
         let served = Arc::new(AtomicU64::new(0));
 
         let task = tokio::spawn({
-            let fault = fault.clone();
             let served = served.clone();
             async move {
                 loop {
@@ -93,16 +93,16 @@ impl VerifiedL1 {
                         return;
                     };
                     let client = client.clone();
-                    let fault = fault.clone();
+                    let fault_rx = fault_rx.clone();
                     let served = served.clone();
                     tokio::spawn(async move {
                         // One request per connection is enough for a mock.
                         // alloy opens as many connections as it needs.
                         if let Ok(Some(body)) = read_http_request(&mut sock).await {
-                            // Copy the fault out before awaiting. Holding a
-                            // std MutexGuard across an await would make the
-                            // future non-Send.
-                            let active = *fault.lock().unwrap();
+                            // Copy the fault out before awaiting: a `watch`
+                            // borrow, like a mutex guard, must not cross an
+                            // `.await` (it would make the future non-Send).
+                            let active = *fault_rx.borrow();
                             let reply = handle(&client, &body, active).await;
                             served.fetch_add(1, Ordering::Relaxed);
                             let bytes = reply.to_string().into_bytes();
@@ -133,13 +133,12 @@ impl VerifiedL1 {
         format!("http://{}", self.addr)
     }
 
-    /// Start lying (or stop). Takes effect on the next request.
-    ///
-    /// # Panics
-    /// Panics when the fault mutex is poisoned (a prior handler panicked
-    /// while holding the lock).
+    /// Start lying (or stop). Takes effect on the next request. A no-op
+    /// `Err` (every receiver dropped) can only happen after the server
+    /// task itself has exited, which only happens when `self` is
+    /// dropping — so there is nothing useful to do with it here.
     pub fn set_fault(&self, f: Fault) {
-        *self.fault.lock().unwrap() = f;
+        let _ = self.fault.send(f);
     }
 
     #[must_use]
@@ -151,17 +150,12 @@ impl VerifiedL1 {
 /// Read one HTTP request, returning its body. `None` on a clean close.
 async fn read_http_request(sock: &mut tokio::net::TcpStream) -> Result<Option<Vec<u8>>> {
     let mut buf = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 1024];
-    // Headers first: read until the blank line.
-    let header_end = loop {
-        let n = sock.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(None);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(i) = find_subslice(&buf, b"\r\n\r\n") {
-            break i + 4;
-        }
+    let Some(header_end) = read_until(sock, &mut buf, |b| {
+        find_subslice(b, b"\r\n\r\n").map(|i| i + 4)
+    })
+    .await?
+    else {
+        return Ok(None);
     };
     let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
     let len: usize = headers
@@ -175,14 +169,34 @@ async fn read_http_request(sock: &mut tokio::net::TcpStream) -> Result<Option<Ve
     let target_len = header_end
         .checked_add(len)
         .context("Content-Length header overflows the buffer size")?;
-    while buf.len() < target_len {
+    // A clean close before `target_len` is reached (`None`) is not an
+    // error here: the body is simply whatever arrived, same as before.
+    let _ = read_until(sock, &mut buf, |b| (b.len() >= target_len).then_some(())).await?;
+    Ok(Some(buf[header_end..].to_vec()))
+}
+
+/// Read from `sock` into `buf`, appending each chunk read, until `done`
+/// matches against the accumulated bytes and returns `Some`. `None` on a
+/// clean close before `done` ever matches.
+async fn read_until<T>(
+    sock: &mut tokio::net::TcpStream,
+    buf: &mut Vec<u8>,
+    mut done: impl FnMut(&[u8]) -> Option<T>,
+) -> Result<Option<T>> {
+    if let Some(t) = done(buf) {
+        return Ok(Some(t));
+    }
+    let mut chunk = [0u8; 1024];
+    loop {
         let n = sock.read(&mut chunk).await?;
         if n == 0 {
-            break;
+            return Ok(None);
         }
         buf.extend_from_slice(&chunk[..n]);
+        if let Some(t) = done(buf) {
+            return Ok(Some(t));
+        }
     }
-    Ok(Some(buf[header_end..].to_vec()))
 }
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {

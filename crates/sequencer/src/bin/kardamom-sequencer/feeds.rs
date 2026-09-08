@@ -34,7 +34,6 @@ use kardamom_sequencer::partition::PartitionCount;
 use kardamom_sequencer::remote_epoch::process_remote_epoch;
 use kardamom_sequencer::resync::{FloorUpdate, ResyncController, SharedWatermark};
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
-use kardamom_types::{BPosition, Receipt};
 
 /// The egress-watermark feed: the silence authority. It measures
 /// boundary-arrival gaps. Idle traffic still emits a boundary every
@@ -169,10 +168,10 @@ impl EgressWatermarkFeed {
     /// `frame` was a remote-origin reject, so the caller does not also
     /// check it for a boundary.
     ///
-    /// The sealer rejected a remote-origin record this sequencer relayed
-    /// (audit H2/H9). The record is the watcher's, and the watcher
-    /// reconciles its cursor with the destination at startup, so this is
-    /// informational here: log loudly and count it.
+    /// The sealer rejected a remote-origin record this sequencer relayed.
+    /// The record is the watcher's, and the watcher reconciles its cursor
+    /// with the destination at startup, so this is informational here: log
+    /// loudly and count it.
     fn on_remote_origin_reject_frame(&mut self, frame: &[u8]) -> bool {
         if frame.first() != Some(&wire::EGRESS_KIND_REMOTE_ORIGIN_REJECT) {
             return false;
@@ -184,7 +183,7 @@ impl EgressWatermarkFeed {
             reason,
         }) = EgressItem::decode(frame)
         {
-            let reason = wire::remote_origin_reject_reason(reason);
+            let reason = reason.as_str();
             tracing::error!(
                 partition = self.partition,
                 origin = origin_chain_id,
@@ -276,11 +275,7 @@ impl ReceiptFloorFeed {
         tokio::spawn(self.run(rx, shutdown))
     }
 
-    async fn run(
-        self,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<(BPosition, Receipt)>,
-        shutdown: Shutdown,
-    ) {
+    async fn run(self, mut rx: kardamom_log::aeron_live::TxReceiptsReceiver, shutdown: Shutdown) {
         loop {
             let receipt = tokio::select! {
                 biased;
@@ -400,7 +395,7 @@ where
         // between backoff sleeps. `OriginPump`'s one-slot `pending` holds
         // a popped epoch across a backpressured offer, and the next tick
         // retries it before it polls again, so a backpressured epoch is
-        // never dropped (audit H2).
+        // never dropped.
         let shutdown_for_deposits = shutdown.clone();
         let join_deposits = tokio::task::spawn_blocking(move || {
             OriginPump::new(shutdown_for_deposits, epoch_subscription, epoch_pub).run(process_epoch)
@@ -426,10 +421,10 @@ where
 /// One origin-advancing pump: poll `sub`, publish through `publ`, and
 /// idle-backoff, until `shutdown` fires or the source disconnects.
 ///
-/// `Pending` is the one-slot retry state (`epoch::PendingEpoch` or
-/// `remote_epoch::PendingRemoteEpoch`). `step` holds a popped record
-/// here across a `Backpressure` result and retries it before it polls
-/// again, so a backpressured record is never dropped (audit H2).
+/// `Pending` is `kardamom_sequencer::pump::Pump<EpochRecord>` or
+/// `Pump<RemoteEpochRecord>` — the one-slot retry state that holds a
+/// popped record across a `Backpressure` result and retries it before it
+/// polls again, so a backpressured record is never dropped.
 struct OriginPump<S, P, Pending> {
     shutdown: Shutdown,
     sub: S,
@@ -454,19 +449,33 @@ impl<S, P, Pending: Default> OriginPump<S, P, Pending> {
         mut step: impl FnMut(&mut S, &mut P, &mut Pending) -> Result<bool, SequencerError>,
     ) -> Result<(), SequencerError> {
         let mut idle = IdleBackoff::new(Duration::from_micros(1), Duration::from_micros(100), 1);
-        loop {
-            if self.shutdown.is_signaled() {
-                return Ok(());
+        while !self.shutdown.is_signaled() && self.tick(&mut step, &mut idle)? {}
+        Ok(())
+    }
+
+    /// One [`Self::run`] iteration: dispatch on `step`'s outcome. Returns
+    /// whether the loop should keep going; `false` only on a clean
+    /// `IngressDisconnected` exit.
+    fn tick(
+        &mut self,
+        step: &mut impl FnMut(&mut S, &mut P, &mut Pending) -> Result<bool, SequencerError>,
+        idle: &mut IdleBackoff,
+    ) -> Result<bool, SequencerError> {
+        match step(&mut self.sub, &mut self.publ, &mut self.pending) {
+            Ok(true) => {
+                idle.reset();
+                Ok(true)
             }
-            match step(&mut self.sub, &mut self.publ, &mut self.pending) {
-                Ok(true) => idle.reset(),
-                Ok(false) => std::thread::sleep(idle.idle_wait()),
-                Err(SequencerError::Backpressure) => {
-                    std::thread::sleep(Duration::from_micros(10));
-                }
-                Err(SequencerError::IngressDisconnected) => return Ok(()),
-                Err(e) => return Err(e),
+            Ok(false) => {
+                std::thread::sleep(idle.idle_wait());
+                Ok(true)
             }
+            Err(SequencerError::Backpressure) => {
+                std::thread::sleep(Duration::from_micros(10));
+                Ok(true)
+            }
+            Err(SequencerError::IngressDisconnected) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 }

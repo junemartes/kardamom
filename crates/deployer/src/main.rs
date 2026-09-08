@@ -441,21 +441,14 @@ async fn run_verify(rpc_url: String, owner: Address) -> Result<()> {
     print_entries(&report.entries);
     if report.mismatches.is_empty() {
         println!("all entries match ERC1967 impl slot");
-    } else {
-        for m in &report.mismatches {
-            print_mismatch(m);
-        }
-        bail!("verify: {} mismatch(es) found", report.mismatches.len());
+        return Ok(());
     }
-    Ok(())
+    report.mismatches.iter().for_each(print_mismatch);
+    bail!("verify: {} mismatch(es) found", report.mismatches.len());
 }
 
 fn parse_key(key: &str) -> Result<PrivateKeySigner> {
-    let hex = if let Some(var_name) = key.strip_prefix("env:") {
-        std::env::var(var_name).with_context(|| format!("env var `{var_name}` not set"))?
-    } else {
-        key.to_string()
-    };
+    let hex = kardamom_deployer::KeyFlag::new(key).resolve()?;
     let hex = hex.strip_prefix("0x").unwrap_or(&hex);
     PrivateKeySigner::from_str(hex).context("invalid private key")
 }

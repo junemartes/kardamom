@@ -11,7 +11,7 @@ use alloy_sol_types::SolEvent;
 
 use kardamom_batcher::settlement::IKardamomL2Settlement;
 use kardamom_deployer::Deployer;
-use kardamom_deployer::testkit::AnvilRig;
+use kardamom_deployer::testkit::{AnvilRig, Funding};
 
 const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
 const BATCHER: Address = address!("0000000000000000000000000000000000000BA7");
@@ -86,7 +86,14 @@ impl<P: Provider + Clone> Scenario<P> {
 /// Deploy a `KardamomL2Settlement` with `BATCHER` (an impersonated dev
 /// account) as its `l1Batcher`.
 async fn setup() -> Option<Scenario<impl Provider + Clone>> {
-    let rig = AnvilRig::spawn(&[DEV_OWNER, BATCHER]).await?;
+    let rig = AnvilRig::spawn(
+        alloy_node_bindings::Anvil::new(),
+        &[
+            (DEV_OWNER, Funding::FundAndImpersonate),
+            (BATCHER, Funding::FundAndImpersonate),
+        ],
+    )
+    .await?;
     let deployer = Deployer::new(rig.provider.clone(), DEV_OWNER);
     let settlement_addr = deployer
         .deploy_settlement(DEV_OWNER, L2_CHAIN_ID, BATCHER)
@@ -157,7 +164,11 @@ async fn setup_wallet_and_settlement() -> Option<Scenario<impl Provider + Clone>
     use alloy_network::EthereumWallet;
     use alloy_signer_local::PrivateKeySigner;
 
-    let rig = AnvilRig::spawn(&[DEV_OWNER]).await?;
+    let rig = AnvilRig::spawn(
+        alloy_node_bindings::Anvil::new(),
+        &[(DEV_OWNER, Funding::FundAndImpersonate)],
+    )
+    .await?;
     let batcher_signer: PrivateKeySigner = rig.anvil.keys()[2].clone().into();
     let batcher_addr = batcher_signer.address();
     let provider = ProviderBuilder::new()

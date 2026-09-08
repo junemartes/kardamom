@@ -12,7 +12,12 @@ fn ws(
     code: &[(B256, bytes::Bytes)],
 ) -> WriteSet {
     let mut w = WriteSet::default();
-    w.accounts.extend_from_slice(accounts);
+    w.accounts.extend(accounts.iter().map(|(addr, fields)| {
+        (
+            *addr,
+            kardamom_exec_core::delta::AccountFields::from(*fields),
+        )
+    }));
     w.storage.extend_from_slice(storage);
     for c in code {
         w.code.push(c.clone());

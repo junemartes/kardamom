@@ -1,6 +1,7 @@
 //! The `ReaderToExec` message, the `tx_data` reader thread, and the
 //! `tx_ordering` reader thread.
 
+use std::ops::ControlFlow;
 use std::thread::{self, JoinHandle};
 
 use tracing::{debug, warn};
@@ -92,16 +93,37 @@ where
         .name(format!("executor-reader-a{sid}"))
         .spawn(move || {
             loop {
-                match tx_data_sub.next() {
-                    Ok((loc, env)) => {
-                        buffer.insert(TxDataKey::new(sid, loc.session_id, loc.position), env);
-                    }
-                    Err(ExecutorError::TxDataClosed { .. }) => return Ok(()),
-                    Err(e) => return Err(e),
+                match tx_data_step(&mut tx_data_sub, &buffer, sid)? {
+                    TxDataStep::Inserted => {}
+                    TxDataStep::Closed => return Ok(()),
                 }
             }
         })
         .expect("spawn tx_data reader")
+}
+
+/// One `tx_data` receive step: insert the envelope into the join buffer, or
+/// report a clean subscription close. The loop in [`spawn_tx_data_reader`]
+/// stays a plain dispatch on the result.
+fn tx_data_step<D: TxDataSubscription>(
+    tx_data_sub: &mut D,
+    buffer: &JoinBuffer,
+    sid: u8,
+) -> Result<TxDataStep, ExecutorError> {
+    match tx_data_sub.next() {
+        Ok((loc, env)) => {
+            buffer.insert(TxDataKey::new(sid, loc.session_id, loc.position), env);
+            Ok(TxDataStep::Inserted)
+        }
+        Err(ExecutorError::TxDataClosed { .. }) => Ok(TxDataStep::Closed),
+        Err(e) => Err(e),
+    }
+}
+
+/// Outcome of one [`tx_data_step`] call.
+enum TxDataStep {
+    Inserted,
+    Closed,
 }
 
 /// Continue the loop, or stop cleanly because the exec sink closed. This
@@ -119,7 +141,7 @@ struct OrderingLoop<S> {
     buffer: JoinBuffer,
     cfg: ReaderConfig,
     exec_out: S,
-    recovery: Option<Box<dyn JoinRecovery>>,
+    recovery: Option<JoinRecovery>,
     next_tx_idx: TxIndex,
     last_warn_len: usize,
     // Canonical-id dedup. Under the MDS topology, the P sequencers per
@@ -138,7 +160,7 @@ impl<S: ExecSink> OrderingLoop<S> {
         buffer: JoinBuffer,
         cfg: ReaderConfig,
         exec_out: S,
-        recovery: Option<Box<dyn JoinRecovery>>,
+        recovery: Option<JoinRecovery>,
         start_tx_idx: TxIndex,
     ) -> Self {
         let seen_canonical_ids = DedupWindow::new(cfg.dedup_window);
@@ -179,13 +201,17 @@ impl<S: ExecSink> OrderingLoop<S> {
         items: Vec<T>,
         make: impl Fn(TxIndex, T) -> ReaderToExec,
     ) -> Flow {
-        for item in items {
+        let flow = items.into_iter().try_for_each(|item| {
             let tx_idx = self.next_idx();
-            if let Flow::Stop = self.send(make(tx_idx, item)) {
-                return Flow::Stop;
+            match self.send(make(tx_idx, item)) {
+                Flow::Continue => ControlFlow::Continue(()),
+                Flow::Stop => ControlFlow::Break(()),
             }
+        });
+        match flow {
+            ControlFlow::Continue(()) => Flow::Continue,
+            ControlFlow::Break(()) => Flow::Stop,
         }
-        Flow::Continue
     }
 
     /// A `TxRef`: dedup, join against the buffer, warn on buffer growth,
@@ -300,7 +326,7 @@ impl<S: ExecSink> OrderingLoop<S> {
             return Flow::Continue;
         }
         let origin_chain_id = rec.origin_chain_id;
-        let messages = rec.messages.clone();
+        let messages: Vec<XChainMessage> = rec.messages.iter().cloned().collect();
         let marker_idx = self.next_idx();
         if let Flow::Stop = self.send(ReaderToExec::RemoteEpoch {
             tx_idx: marker_idx,
@@ -315,6 +341,52 @@ impl<S: ExecSink> OrderingLoop<S> {
             message: Box::new(message),
             position: BPosition::from_index(tx_idx.0),
         })
+    }
+
+    /// One receive-then-dispatch step: pull the next `tx_ordering` message,
+    /// and dispatch it to its handler. Returns `Flow::Stop` on a clean
+    /// `tx_ordering` close. The loop in [`spawn_tx_ordering_reader`] stays
+    /// a plain dispatch on the result.
+    fn step<O: TxOrderingSubscription>(
+        &mut self,
+        tx_ordering_sub: &mut O,
+    ) -> Result<Flow, ExecutorError> {
+        let (position, msg) = match tx_ordering_sub.next() {
+            Ok(p) => p,
+            Err(ExecutorError::TxOrderingClosed) => return Ok(Flow::Stop),
+            Err(e) => return Err(e),
+        };
+        match msg {
+            TxOrderingMessage::TxRef(tx_ref) => self.on_tx_ref(tx_ref, position),
+            TxOrderingMessage::Epoch(epoch) => Ok(self.expand_epoch(epoch, position)),
+            TxOrderingMessage::RemoteEpoch(rec) => Ok(self.expand_remote_epoch(rec, position)),
+            TxOrderingMessage::DepositRef(dep_ref) => {
+                // A ref here means the stream carries deposits outside an
+                // epoch record. This chain derives all deposits from
+                // epochs, so this is a protocol violation, not a
+                // recoverable condition. Fail loudly instead of silently
+                // dropping a deposit.
+                tracing::error!(
+                    target: "kardamom_executor::reader",
+                    source_hash = ?dep_ref.source_hash,
+                    "legacy DepositRef on the canonical stream; this chain derives \
+                     deposits from epochs"
+                );
+                Err(ExecutorError::State(format!(
+                    "legacy DepositRef {:?}: deposits are carried by epochs on this chain",
+                    dep_ref.source_hash
+                )))
+            }
+            TxOrderingMessage::BoundaryStart(b) => {
+                debug!(
+                    target: "kardamom_executor::reader",
+                    block_number = b.block_number,
+                    end_tx_idx = ?b.end_tx_idx,
+                    "forwarding BlockBoundaryStart"
+                );
+                Ok(self.send(ReaderToExec::Boundary(b)))
+            }
+        }
     }
 }
 
@@ -351,49 +423,10 @@ where
     thread::Builder::new()
         .name("executor-reader-b".into())
         .spawn(move || {
-            let recovery: Option<Box<dyn JoinRecovery>> = recovery_factory.and_then(|f| f());
+            let recovery: Option<JoinRecovery> = recovery_factory.map(JoinRecoveryFactory::build);
             let mut state = OrderingLoop::new(buffer, cfg, exec_out, recovery, start_tx_idx);
-            loop {
-                let (position, msg) = match tx_ordering_sub.next() {
-                    Ok(p) => p,
-                    Err(ExecutorError::TxOrderingClosed) => return Ok(()),
-                    Err(e) => return Err(e),
-                };
-                let flow = match msg {
-                    TxOrderingMessage::TxRef(tx_ref) => state.on_tx_ref(tx_ref, position)?,
-                    TxOrderingMessage::Epoch(epoch) => state.expand_epoch(epoch, position),
-                    TxOrderingMessage::RemoteEpoch(rec) => state.expand_remote_epoch(rec, position),
-                    TxOrderingMessage::DepositRef(dep_ref) => {
-                        // A ref here means the stream carries deposits
-                        // outside an epoch record. This chain derives all
-                        // deposits from epochs, so this is a protocol
-                        // violation, not a recoverable condition. Fail
-                        // loudly instead of silently dropping a deposit.
-                        tracing::error!(
-                            target: "kardamom_executor::reader",
-                            source_hash = ?dep_ref.source_hash,
-                            "legacy DepositRef on the canonical stream; this chain derives \
-                             deposits from epochs"
-                        );
-                        return Err(ExecutorError::State(format!(
-                            "legacy DepositRef {:?}: deposits are carried by epochs on this chain",
-                            dep_ref.source_hash
-                        )));
-                    }
-                    TxOrderingMessage::BoundaryStart(b) => {
-                        debug!(
-                            target: "kardamom_executor::reader",
-                            block_number = b.block_number,
-                            end_tx_idx = ?b.end_tx_idx,
-                            "forwarding BlockBoundaryStart"
-                        );
-                        state.send(ReaderToExec::Boundary(b))
-                    }
-                };
-                if let Flow::Stop = flow {
-                    return Ok(());
-                }
-            }
+            while let Flow::Continue = state.step(&mut tx_ordering_sub)? {}
+            Ok(())
         })
         .expect("spawn tx_ordering reader")
 }

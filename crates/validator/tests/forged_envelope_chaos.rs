@@ -39,15 +39,18 @@ use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use kardamom_engine::{
-    BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
-    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ResumePoint,
-    RoleHooks, StateDatabase, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
-    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, EngineWiring, ExecPorts, Executor, ExecutorConfig,
+    ExecutorError, Inbound, MockStateDatabase, MutatingSnapshotSource, NoBlockExec, NoEpochCheck,
+    NoRemoteEpochCheck, Outbound, ResumePoint, RoleHooks, StateDatabase, StateWriterSignal,
+    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription,
+    TxReceiptsPublication, TxRef, WriterApplyingQueue,
 };
 use kardamom_validator::{Divergence, latch_integrity_failure};
 use revm::primitives::KECCAK_EMPTY;
 
 const CHAIN_ID: u64 = 1;
+/// [`CHAIN_ID`], as `ExecutorConfig::chain_id` now requires.
+const CHAIN_ID_NONZERO: std::num::NonZeroU64 = std::num::NonZeroU64::new(CHAIN_ID).unwrap();
 const SINK: Address = address!("00000000000000000000000000000000DEAD0666");
 const LOOT: u64 = 250_000;
 
@@ -89,14 +92,19 @@ impl StateWriterSignal for Imm {
 
 /// Port types for this test's channel-backed fakes.
 struct TestWiring;
-impl EngineWiring for TestWiring {
-    type TxData = ChanTxDataSub;
-    type TxOrdering = ChanTxOrderingSub;
-    type TxReceipts = ChanReceiptsPub;
+impl ExecPorts for TestWiring {
     type Snapshots = MutatingSnapshotSource;
     type WriterSignal = Imm;
     type WriterQueue = WriterApplyingQueue;
     type Epoch = NoEpochCheck;
+    type RemoteEpoch = NoRemoteEpochCheck;
+    type BlockExec = NoBlockExec;
+}
+
+impl EngineWiring for TestWiring {
+    type TxData = ChanTxDataSub;
+    type TxOrdering = ChanTxOrderingSub;
+    type TxReceipts = ChanReceiptsPub;
 }
 
 fn bpos(off: i32) -> BPosition {
@@ -171,7 +179,7 @@ fn run_pipeline(
     drop(b_tx);
 
     let cfg = ExecutorConfig {
-        chain_id: CHAIN_ID,
+        chain_id: CHAIN_ID_NONZERO,
         verify_record_identity,
         ..Default::default()
     };

@@ -57,25 +57,20 @@ impl<S: StateDatabase> DatabaseRef for SnapshotRef<'_, S> {
             .inner
             .basic(address)
             .map_err(|e| StateRefError(e.to_string()))?;
-        Ok(a.map(|(nonce, balance, code_hash)| AccountInfo {
-            balance,
-            nonce,
-            // Genesis-seeded EOAs carry `code_hash = B256::ZERO` in the
-            // state DB. Revm's CacheDB normalizes zero code hashes to
-            // KECCAK_EMPTY when accounts pass through an execution scope
-            // (`CacheDB::insert_contract`). Without normalizing here too,
-            // the code_hash an account's write set carries would depend on
-            // where it was read from: the mdbx snapshot gives ZERO, but the
-            // intra-scope commit cache gives KECCAK_EMPTY. The executor
-            // batches per block, and the validator batches per BAL chunk.
-            // So a fresh account touched by two txs that straddle a
-            // validator batch boundary, but share an executor block, could
-            // produce a false receipt divergence and a validator
-            // fail-stop. Both spellings of "no code" must hash the same.
-            code_hash: crate::code_hash::to_revm_code_hash(code_hash),
-            account_id: None,
-            code: None,
-        }))
+        // Genesis-seeded EOAs carry `code_hash = B256::ZERO` in the state
+        // DB. Revm's CacheDB normalizes zero code hashes to KECCAK_EMPTY
+        // when accounts pass through an execution scope
+        // (`CacheDB::insert_contract`). Without normalizing here too, the
+        // code_hash an account's write set carries would depend on where
+        // it was read from: the mdbx snapshot gives ZERO, but the
+        // intra-scope commit cache gives KECCAK_EMPTY. The executor
+        // batches per block, and the validator batches per BAL chunk. So
+        // a fresh account touched by two txs that straddle a validator
+        // batch boundary, but share an executor block, could produce a
+        // false receipt divergence and a validator fail-stop. Both
+        // spellings of "no code" must hash the same; `account_info`
+        // normalizes it.
+        Ok(a.map(crate::delta::AccountFields::from).map(account_info))
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -124,6 +119,23 @@ pub struct StateRefError(pub String);
 
 impl revm::database_interface::DBErrorMarker for StateRefError {}
 
+/// Build a revm [`AccountInfo`] from the three fields every state-read
+/// layer stores, normalizing the code hash once (see
+/// [`crate::code_hash::to_revm_code_hash`]). Every read source (a
+/// state-DB snapshot, a pending delta, or an in-progress commit cache)
+/// builds this same four-field record, on both the streaming executor
+/// and `kardamom-stm`'s Block-STM path.
+#[must_use]
+pub fn account_info(fields: crate::delta::AccountFields) -> AccountInfo {
+    AccountInfo {
+        nonce: fields.nonce,
+        balance: fields.balance,
+        code_hash: crate::code_hash::to_revm_code_hash(fields.code_hash),
+        account_id: None,
+        code: None,
+    }
+}
+
 /// Seed one delta layer into a block cache. Later inserts overwrite
 /// earlier ones, so seeding parent then delta composes the `snapshot`,
 /// `parent`, `delta` view.
@@ -137,19 +149,19 @@ pub(super) fn seed_cache_layer<DB: DatabaseRef>(
     cache: &mut CacheDB<DB>,
     layer: &PendingDelta,
 ) -> Result<(), String> {
-    for (addr, (nonce, balance, code_hash)) in &layer.accounts {
+    for (addr, fields) in &layer.accounts {
         let code = layer
             .code
-            .get(code_hash)
+            .get(&fields.code_hash)
             .cloned()
             .filter(|b| !b.is_empty())
             .map(|b| Bytecode::new_raw(AlloyBytes::from(b)));
         cache.insert_account_info(
             *addr,
             AccountInfo {
-                balance: *balance,
-                nonce: *nonce,
-                code_hash: *code_hash,
+                balance: fields.balance,
+                nonce: fields.nonce,
+                code_hash: fields.code_hash,
                 account_id: None,
                 code,
             },

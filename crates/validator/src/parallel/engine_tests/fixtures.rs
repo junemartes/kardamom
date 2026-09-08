@@ -16,6 +16,8 @@ use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::exec_types::TxIndex;
 use kardamom_engine::executor::{Executor, execute_deposit_tx, execute_xchain_tx};
+use kardamom_exec_core::exec_types::TxSlot;
+use kardamom_exec_core::executor::XChainDelivery;
 use kardamom_types::{BPosition, BlockBoundaryStart, Deposit, StateDatabase, TxEnvelope};
 
 use crate::parallel::ClaimIndex;
@@ -147,6 +149,12 @@ pub(crate) fn exec_record<S: StateDatabase>(
     bal: Option<&mut revm::state::bal::Bal>,
 ) -> (kardamom_types::Receipt, kardamom_engine::delta::WriteSet) {
     let bal = bal.map(|b| (b, i + 1));
+    let slot = |tx_idx: TxIndex, position: BPosition| TxSlot {
+        tx_idx,
+        tx_position: position,
+        tx_index_in_block: i,
+        cumulative_gas_used_before: cumulative,
+    };
     match rec {
         BufferedRecord::Tx {
             tx_idx,
@@ -157,11 +165,8 @@ pub(crate) fn exec_record<S: StateDatabase>(
             parent,
             delta,
             env(),
-            *tx_idx,
-            *position,
+            slot(*tx_idx, *position),
             envelope,
-            i,
-            cumulative,
             bal,
         )
         .expect("seq execute"),
@@ -174,11 +179,8 @@ pub(crate) fn exec_record<S: StateDatabase>(
             parent,
             delta,
             env(),
-            *tx_idx,
-            *position,
+            slot(*tx_idx, *position),
             deposit,
-            i,
-            cumulative,
             bal,
         )
         .expect("seq deposit"),
@@ -192,12 +194,11 @@ pub(crate) fn exec_record<S: StateDatabase>(
             parent,
             delta,
             env(),
-            *tx_idx,
-            *position,
-            *origin_chain_id,
-            message,
-            i,
-            cumulative,
+            slot(*tx_idx, *position),
+            XChainDelivery {
+                origin_chain_id: *origin_chain_id,
+                message,
+            },
             bal,
         )
         .expect("seq xchain"),
@@ -215,26 +216,50 @@ pub(crate) fn seq_capture<S: StateDatabase>(
     records: &[BufferedRecord],
     assert_status: bool,
 ) -> (PendingDelta, revm::state::bal::Bal) {
-    let mut bal = revm::state::bal::Bal::new();
-    let mut delta = PendingDelta::new();
-    let mut cumulative = 0u64;
+    let mut acc = SeqCaptureAcc {
+        delta: PendingDelta::new(),
+        bal: revm::state::bal::Bal::new(),
+        cumulative: 0,
+    };
     for (i, rec) in records.iter().enumerate() {
+        acc.apply_record(snap, parent, rec, i, assert_status);
+    }
+    (acc.delta, acc.bal)
+}
+
+/// The running fold [`seq_capture`] threads through its records: the
+/// merged delta, the captured `Bal`, and the cumulative gas so far. The
+/// loop in [`seq_capture`] stays free of a branch.
+struct SeqCaptureAcc {
+    delta: PendingDelta,
+    bal: revm::state::bal::Bal,
+    cumulative: u64,
+}
+
+impl SeqCaptureAcc {
+    fn apply_record<S: StateDatabase>(
+        &mut self,
+        snap: &S,
+        parent: Option<&PendingDelta>,
+        rec: &BufferedRecord,
+        i: usize,
+        assert_status: bool,
+    ) {
         let (r, ws) = exec_record(
             snap,
             parent,
-            &delta,
+            &self.delta,
             rec,
             i as u64,
-            cumulative,
-            Some(&mut bal),
+            self.cumulative,
+            Some(&mut self.bal),
         );
         if assert_status {
             assert!(r.status, "record {i} must execute");
         }
-        cumulative = r.cumulative_gas_used;
-        delta.apply(ws);
+        self.cumulative = r.cumulative_gas_used;
+        self.delta.apply(ws);
     }
-    (delta, bal)
 }
 
 /// Build a claim index by executing the block sequentially through the
@@ -253,7 +278,7 @@ pub(crate) fn seq_delta<S: StateDatabase>(snap: &S, records: &[BufferedRecord]) 
 /// Each test gets one small pool: the production strategy holds a
 /// persistent pool, but tests build a fresh one so each case is isolated.
 pub(crate) fn test_pool() -> kardamom_stm::pool::WorkerPool {
-    kardamom_stm::pool::WorkerPool::new(4, Vec::new())
+    kardamom_stm::pool::WorkerPool::new(std::num::NonZeroUsize::new(4).expect("4 != 0"), &[])
 }
 
 /// A fixture batch size or worker count. Every caller passes a literal

@@ -39,11 +39,12 @@
 //! (`learn_sequential`), so a pool that saw cheap transfers re-enters
 //! parallel execution when heavier blocks arrive.
 
+use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 
-use kardamom_engine::actor::{BlockExec, BlockExecOutput, BufferedRecord};
+use kardamom_engine::actor::{BlockExecOutput, BlockExecStrategy, BufferedRecord};
 use kardamom_engine::bal_ladder::merge_bal_fragments;
 use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
@@ -67,49 +68,67 @@ struct BlockRequest<S> {
 /// Executor-facing STM configuration (from the CLI to the pool).
 #[derive(Debug, Clone)]
 pub struct StmExecConfig {
-    pub workers: usize,
+    pub workers: NonZeroUsize,
     pub pin_cores: Vec<usize>,
     pub keep_hot: bool,
 }
 
-/// Spawn the pool-server thread, and return the [`BlockExec`] strategy
-/// that feeds it. The pool (workers, tail lanes, reaper) lives for the
-/// server thread's lifetime. Dropping the strategy closes the request
-/// channel and shuts the server down.
-pub fn stm_block_exec<S>(cfg: StmExecConfig) -> BlockExec<S>
+/// The Block-STM whole-block strategy: a handle to the pool-server
+/// thread. The pool (workers, tail lanes, reaper) lives for the server
+/// thread's lifetime. Dropping this handle closes the request channel
+/// and shuts the server down.
+pub struct StmBlockExec<S> {
+    req_tx: Sender<BlockRequest<S>>,
+}
+
+impl<S> StmBlockExec<S>
 where
     S: StateDatabase + Clone + Sync + 'static,
 {
-    let (req_tx, req_rx) = bounded::<BlockRequest<S>>(1);
-    let workers = cfg.workers.max(1);
-    std::thread::Builder::new()
-        .name("stm-pool-server".into())
-        .spawn(move || pool_server(cfg, req_rx))
-        .expect("spawn stm pool server");
+    /// Spawn the pool-server thread and return the strategy that feeds it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pool-server thread cannot be spawned; the executor
+    /// cannot run without it.
+    #[must_use]
+    pub fn spawn(cfg: StmExecConfig) -> Self {
+        let (req_tx, req_rx) = bounded::<BlockRequest<S>>(1);
+        std::thread::Builder::new()
+            .name("stm-pool-server".into())
+            .spawn(move || pool_server(cfg, req_rx))
+            .expect("spawn stm pool server");
+        Self { req_tx }
+    }
+}
 
-    Box::new(
-        move |snapshot: &S,
-              parent: Option<&PendingDelta>,
-              records: &[BufferedRecord],
-              env: ExecEnv,
-              block: u64| {
-            let _ = workers;
-            let (reply_tx, reply_rx) = bounded(1);
-            req_tx
-                .send(BlockRequest {
-                    snapshot: snapshot.clone(),
-                    parent: parent.cloned(),
-                    records: records.to_vec(),
-                    env,
-                    block,
-                    reply: reply_tx,
-                })
-                .map_err(|_| ExecutorError::State("stm pool server gone".into()))?;
-            reply_rx
-                .recv()
-                .map_err(|_| ExecutorError::State("stm pool server dropped a block".into()))?
-        },
-    )
+impl<S> BlockExecStrategy<S> for StmBlockExec<S>
+where
+    S: StateDatabase + Clone + Sync + 'static,
+{
+    fn execute_block(
+        &self,
+        snapshot: &S,
+        parent: Option<&PendingDelta>,
+        records: &[BufferedRecord],
+        env: ExecEnv,
+        block: u64,
+    ) -> Result<BlockExecOutput, ExecutorError> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.req_tx
+            .send(BlockRequest {
+                snapshot: snapshot.clone(),
+                parent: parent.cloned(),
+                records: records.to_vec(),
+                env,
+                block,
+                reply: reply_tx,
+            })
+            .map_err(|_| ExecutorError::State("stm pool server gone".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| ExecutorError::State("stm pool server dropped a block".into()))?
+    }
 }
 
 fn pool_server<S: StateDatabase + Clone + Sync + 'static>(
@@ -117,7 +136,7 @@ fn pool_server<S: StateDatabase + Clone + Sync + 'static>(
     rx: Receiver<BlockRequest<S>>,
 ) {
     let pool_cfg = PoolConfig {
-        workers: cfg.workers.max(1),
+        workers: cfg.workers,
         pin_cores: cfg.pin_cores.clone(),
         keep_hot: cfg.keep_hot,
         ..PoolConfig::default()
@@ -185,7 +204,7 @@ fn segment(records: &[BufferedRecord]) -> Vec<Segment> {
 
 fn run_one<S: StateDatabase + Clone + Sync + 'static>(
     pool: &PoolHandle<'_, S>,
-    workers: usize,
+    workers: NonZeroUsize,
     stats: &Stats,
     req: &BlockRequest<S>,
 ) -> Result<BlockExecOutput, ExecutorError> {
@@ -221,7 +240,7 @@ fn run_one<S: StateDatabase + Clone + Sync + 'static>(
                 // One independent snapshot per worker (`fork_view`). A
                 // refused fork shares the strategy's view: correct, but
                 // serialized, and it is counted.
-                let snapshots: Vec<S> = (0..workers)
+                let snapshots: Vec<S> = (0..workers.get())
                     .map(|_| {
                         req.snapshot.fork_view().unwrap_or_else(|| {
                             metrics::counter!("kardamom_executor_snapshot_fork_fallback_total")

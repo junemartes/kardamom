@@ -7,9 +7,7 @@
 //! pairs and their method signatures are exactly what the hand-written
 //! copies exposed.
 
-use tokio::sync::mpsc::UnboundedReceiver;
-
-use super::super::{AeronRuntime, PubHandle};
+use super::super::{AeronRuntime, PubHandle, TypedSubscription};
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::xchain::RemoteEpochRecord;
@@ -22,8 +20,8 @@ use kardamom_types::{BPosition, EpochRecord, FsyncWatermark, QuorumWatermark, Tx
 ///   `open(rt, ch, ...)` constructor and the caller-supplied publish
 ///   methods pasted verbatim into its `impl` (so `publish`'s exact
 ///   signature stays per type);
-/// - a subscriber struct wrapping an `UnboundedReceiver<(BPosition, $msg)>`
-///   with the same-shaped `open` plus the standard `recv` and `try_recv`.
+/// - a subscriber struct wrapping a `TypedSubscription<$msg>` with the
+///   same-shaped `open` plus the standard `recv` and `try_recv`.
 ///
 /// `open(ch, ...)` binds the `ChannelsConfig` parameter name (and any
 /// extra parameters) used by the `$channel`/`$stream` selection
@@ -63,7 +61,7 @@ macro_rules! declare_channel_handles {
 
         $(#[$sub_doc])*
         pub struct $sub_name {
-            rx: UnboundedReceiver<(BPosition, $msg)>,
+            rx: TypedSubscription<$msg>,
         }
 
         impl $sub_name {
@@ -87,7 +85,7 @@ macro_rules! declare_channel_handles {
             }
 
             pub fn try_recv(&mut self) -> Option<(BPosition, $msg)> {
-                self.rx.try_recv().ok()
+                self.rx.try_recv()
             }
         }
     };
@@ -97,13 +95,15 @@ macro_rules! declare_channel_handles {
     // publisher `session_id` too) and whose open call is not the generic
     // `open_subscription::<$msg>`. `subscribe` names an `AeronRuntime`
     // method with signature `fn(&self, uri: &str, stream_id: i32) ->
-    // Result<UnboundedReceiver<$item>, LogError>`, called through its type
-    // path so the receiver (`rt`) passes as the first argument.
+    // Result<$rx, LogError>`, called through its type path so the
+    // receiver (`rt`) passes as the first argument. `$rx` owns its
+    // decode, so `recv`/`try_recv` here are plain delegation, not a
+    // channel read.
     (
         $(#[$pub_doc:meta])*
         publisher $pub_name:ident { $($pub_methods:tt)* }
         $(#[$sub_doc:meta])*
-        subscriber $sub_name:ident(item = $item:ty, subscribe = $subscribe:path);
+        subscriber $sub_name:ident(item = $item:ty, rx = $rxty:ty, subscribe = $subscribe:path);
         open($ch:ident $(, $arg:ident: $argty:ty)*) = ($channel:expr, $stream:expr);
     ) => {
         $(#[$pub_doc])*
@@ -133,7 +133,7 @@ macro_rules! declare_channel_handles {
 
         $(#[$sub_doc])*
         pub struct $sub_name {
-            rx: UnboundedReceiver<$item>,
+            rx: $rxty,
         }
 
         impl $sub_name {
@@ -157,7 +157,7 @@ macro_rules! declare_channel_handles {
             }
 
             pub fn try_recv(&mut self) -> Option<$item> {
-                self.rx.try_recv().ok()
+                self.rx.try_recv()
             }
         }
     };

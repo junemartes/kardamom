@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use alloy_primitives::keccak256;
-use kardamom_engine::actor::{BlockExec, BufferedRecord};
+use kardamom_engine::actor::{BlockExecOutput, BlockExecStrategy, BufferedRecord};
 use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::error::ExecutorError;
@@ -40,20 +40,32 @@ use crate::witness::{anchor_block_witness, capture_block_witness};
 /// without `--parallel-validation`. It has the same semantics as the
 /// engine's streaming path, since it delegates to the shared sequential
 /// driver, but records flow through the whole-block buffer, so the flight
-/// ring, the spool's feed, sees every block.
-pub fn sequential_block_exec<D: StateDatabase + Sync + 'static>(
+/// ring, the spool's feed, sees every block. Build one with
+/// [`sequential_block_exec`].
+pub struct SequentialBlockExec {
     flight: Arc<FlightRing>,
-) -> BlockExec<D> {
-    Box::new(
-        move |snapshot: &D,
-              parent: Option<&PendingDelta>,
-              records: &[BufferedRecord],
-              env: ExecEnv,
-              block: u64| {
-            flight.push(block, std::num::NonZeroU16::MIN, env, records, None);
-            execute_block_sequential(snapshot, parent, records, env)
-        },
-    )
+}
+
+/// Build the validator's sequential-only whole-block execution strategy.
+/// See [`SequentialBlockExec`].
+#[must_use]
+pub fn sequential_block_exec(flight: Arc<FlightRing>) -> SequentialBlockExec {
+    SequentialBlockExec { flight }
+}
+
+impl<D: StateDatabase + Sync + 'static> BlockExecStrategy<D> for SequentialBlockExec {
+    fn execute_block(
+        &self,
+        snapshot: &D,
+        parent: Option<&PendingDelta>,
+        records: &[BufferedRecord],
+        env: ExecEnv,
+        block_number: u64,
+    ) -> Result<BlockExecOutput, ExecutorError> {
+        self.flight
+            .push(block_number, std::num::NonZeroU16::MIN, env, records, None);
+        execute_block_sequential(snapshot, parent, records, env)
+    }
 }
 
 /// Convert exec-core records to the prover wire form; the guest rebuilds

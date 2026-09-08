@@ -34,6 +34,24 @@ use crate::error::BatcherError;
 /// (`archive-mark.dat`) is deliberately not copied. See the module doc.
 const CATALOG_FILE: &str = "archive.catalog";
 
+/// Every `.rec` segment file directly under `dir`, in `read_dir` order. A
+/// `read_dir` error on `dir` itself fails eagerly; a per-entry read error
+/// surfaces from the returned iterator instead of being dropped silently.
+///
+/// # Errors
+/// Returns an error when `dir` cannot be listed.
+fn rec_entries(
+    dir: &Path,
+) -> Result<impl Iterator<Item = Result<std::fs::DirEntry, BatcherError>>, BatcherError> {
+    Ok(std::fs::read_dir(dir)?.filter_map(|entry| match entry {
+        Ok(entry) => {
+            let path = entry.path();
+            (path.is_file() && path.extension().is_some_and(|x| x == "rec")).then_some(Ok(entry))
+        }
+        Err(e) => Some(Err(e.into())),
+    }))
+}
+
 /// What a [`mirror_archive`] run copied.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MirrorReport {
@@ -77,18 +95,15 @@ pub fn mirror_archive(source_dir: &Path, dest_dir: &Path) -> Result<MirrorReport
         report.catalog_copied = true;
     }
 
-    for entry in std::fs::read_dir(source_dir)? {
+    rec_entries(source_dir)?.try_for_each(|entry| -> Result<(), BatcherError> {
         let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() || path.extension().is_none_or(|x| x != "rec") {
-            continue;
-        }
-        let bytes = std::fs::copy(&path, dest_dir.join(entry.file_name()))?;
+        let bytes = std::fs::copy(entry.path(), dest_dir.join(entry.file_name()))?;
         report.segments_copied += 1;
         // A report field, not a control value: saturate rather than wrap
         // on an implausible multi-exabyte total.
         report.bytes_copied = report.bytes_copied.saturating_add(bytes);
-    }
+        Ok(())
+    })?;
 
     if report.segments_copied == 0 {
         return Err(BatcherError::Reconstruct(format!(
@@ -121,6 +136,26 @@ fn read_stable(path: &Path, attempts: NonZeroUsize) -> Result<Vec<u8>, BatcherEr
     })
 }
 
+/// One [`read_stable_with`] attempt after the first: read again, and
+/// either stop — with the read's error, or with the now-stable bytes —
+/// or keep going with the new bytes as the next comparison baseline.
+fn one_attempt<F>(
+    read: &mut F,
+    prev: &[u8],
+) -> std::ops::ControlFlow<Result<Vec<u8>, BatcherError>, Vec<u8>>
+where
+    F: FnMut() -> Result<Vec<u8>, BatcherError>,
+{
+    match read() {
+        Err(e) => std::ops::ControlFlow::Break(Err(e)),
+        Ok(next) if next == prev => std::ops::ControlFlow::Break(Ok(next)),
+        Ok(next) => {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::ops::ControlFlow::Continue(next)
+        }
+    }
+}
+
 /// Core of [`read_stable`], parameterized over the reader for testability.
 /// `attempts` is the total number of reads to make; fewer than 2 cannot
 /// confirm stability, so it fails immediately rather than silently reading
@@ -129,16 +164,11 @@ fn read_stable_with<F>(attempts: NonZeroUsize, mut read: F) -> Result<Vec<u8>, B
 where
     F: FnMut() -> Result<Vec<u8>, BatcherError>,
 {
-    let mut prev = read()?;
-    for _ in 1..attempts.get() {
-        let next = read()?;
-        if next == prev {
-            return Ok(next);
-        }
-        prev = next;
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let first = read()?;
+    match (1..attempts.get()).try_fold(first, |prev, _| one_attempt(&mut read, &prev)) {
+        std::ops::ControlFlow::Break(result) => result,
+        std::ops::ControlFlow::Continue(_) => Err(BatcherError::Corruption("unstable read".into())),
     }
-    Err(BatcherError::Corruption("unstable read".into()))
 }
 
 /// Verify that `dest_dir` mirrors `source_dir`: every source `.rec` must
@@ -205,29 +235,25 @@ impl MirrorDiff {
 pub fn diff_mirror(source_dir: &Path, dest_dir: &Path) -> Result<MirrorDiff, BatcherError> {
     let mut diff = MirrorDiff::default();
     let mut source_names = std::collections::HashSet::new();
-    for entry in std::fs::read_dir(source_dir)? {
+    rec_entries(source_dir)?.try_for_each(|entry| -> Result<(), BatcherError> {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().is_none_or(|x| x != "rec") {
-            continue;
-        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let dest = dest_dir.join(entry.file_name());
         if !dest.is_file() || files_differ(&path, &dest)? {
             diff.diverged.push(name.clone());
         }
         source_names.insert(name);
-    }
-    for entry in std::fs::read_dir(dest_dir)? {
+        Ok(())
+    })?;
+    rec_entries(dest_dir)?.try_for_each(|entry| -> Result<(), BatcherError> {
         let entry = entry?;
-        if entry.path().extension().is_none_or(|x| x != "rec") {
-            continue;
-        }
         let name = entry.file_name().to_string_lossy().into_owned();
         if !source_names.contains(&name) {
             diff.dest_only.push(name);
         }
-    }
+        Ok(())
+    })?;
     diff.diverged.sort();
     diff.dest_only.sort();
     Ok(diff)
@@ -244,16 +270,31 @@ fn files_differ(a: &Path, b: &Path) -> Result<bool, BatcherError> {
     let mut fb = std::io::BufReader::new(std::fs::File::open(b)?);
     let mut ba = vec![0u8; 64 * 1024];
     let mut bb = vec![0u8; 64 * 1024];
-    loop {
-        let n = fa.read(&mut ba)?;
-        if n == 0 {
-            return Ok(false);
-        }
-        fb.read_exact(&mut bb[..n])?;
-        if ba[..n] != bb[..n] {
-            return Ok(true);
-        }
-    }
+    // One chunk per `Some`; `None` at EOF ends the iterator. Each item is
+    // that chunk's `chunk_differs` result, so `find_map` below stops at
+    // the first differing chunk or the first read error, whichever comes
+    // first.
+    std::iter::from_fn(|| match fa.read(&mut ba) {
+        Ok(0) => None,
+        Ok(n) => Some(chunk_differs(&mut fb, &ba[..n], &mut bb[..n])),
+        Err(e) => Some(Err(e.into())),
+    })
+    .find_map(|differs| match differs {
+        Ok(false) => None,
+        stop => Some(stop),
+    })
+    .unwrap_or(Ok(false))
+}
+
+/// Read the next `bb.len()` bytes of `fb` into `bb`, and compare against
+/// `ba`.
+fn chunk_differs(
+    fb: &mut impl std::io::Read,
+    ba: &[u8],
+    bb: &mut [u8],
+) -> Result<bool, BatcherError> {
+    fb.read_exact(bb)?;
+    Ok(ba != bb)
 }
 
 /// What a [`heal_from_mirror`] run repaired.
@@ -287,7 +328,21 @@ pub fn heal_from_mirror(
         ));
     }
     let mut report = HealReport::default();
-    for name in segments {
+    segments
+        .iter()
+        .try_for_each(|name| report.heal_segment(source_dir, dest_dir, name))?;
+    Ok(report)
+}
+
+impl HealReport {
+    /// Copy one named `.rec` segment from `source_dir` into `dest_dir`,
+    /// and record it in `self`. `name` must be a bare `.rec` file name.
+    fn heal_segment(
+        &mut self,
+        source_dir: &Path,
+        dest_dir: &Path,
+        name: &str,
+    ) -> Result<(), BatcherError> {
         // Accept only bare `.rec` file names. Reject anything path-like.
         #[allow(
             clippy::case_sensitive_file_extension_comparisons,
@@ -309,12 +364,12 @@ pub fn heal_from_mirror(
         }
         // A report field, not a control value: saturate rather than wrap
         // on an implausible multi-exabyte total.
-        report.bytes_copied = report
+        self.bytes_copied = self
             .bytes_copied
             .saturating_add(std::fs::copy(&src, dest_dir.join(name))?);
-        report.segments_healed += 1;
+        self.segments_healed += 1;
+        Ok(())
     }
-    Ok(report)
 }
 
 #[cfg(test)]

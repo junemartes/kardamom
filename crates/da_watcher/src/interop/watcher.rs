@@ -32,7 +32,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
-use kardamom_types::xchain::{XChainError, check_anchor, derive_remote_epoch};
+use kardamom_types::xchain::{XChainError, derive_remote_epoch};
 
 use crate::interop::cursor::CursorFile;
 use crate::interop::publisher::{PublishError, RemoteEpochPublisher};
@@ -119,18 +119,19 @@ where
     })?;
 
     // The anchor is a pure function of (origin, block). The feed must not
-    // choose it, so recompute it here and reject a message that differs
-    // (audit M4). Terminal for the pair, like every derivation fault.
-    for m in &batch {
-        check_anchor(origin, m).map_err(InteropError::Derive)?;
-    }
+    // choose it, so recompute it here and reject a message that differs.
+    // Terminal for the pair, like every derivation fault.
+    batch
+        .iter()
+        .try_for_each(|m| m.check_anchor(origin))
+        .map_err(InteropError::Derive)?;
 
     // The batch goes in verbatim: ordering, gap, duplicate, multi-block and
     // foreign-destination verdicts all belong to the shared rule, which the
     // destination's verifier re-runs against the resulting record.
     let record = derive_remote_epoch(self_chain_id, origin, *cursor, &batch)
         .map_err(InteropError::Derive)?;
-    let messages = record.messages.len();
+    let messages = record.messages.len().get();
     let last_seq = record.last_seq();
 
     match publisher.publish(&record) {

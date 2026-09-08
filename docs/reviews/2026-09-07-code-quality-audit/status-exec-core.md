@@ -1498,3 +1498,433 @@ seem worth introducing that dependency for a single call site.
 
 Both items in this round were in-crate only — the round-1 cross-crate
 call-site list is unchanged.
+
+# Round B
+
+Scope: the `exec-core` section of `reaudit-main.md` (the re-audit of the five
+commits that landed on `main` after the Phase A/C fork), plus two cross-crate
+R14 helpers this crate is the natural home for.
+
+## Findings from `reaudit-main.md`, mapped to the merged layout
+
+- R11 `deposit.rs:51` `#[allow(clippy::too_many_arguments)]` on
+  `failed_deposit_receipt` — done. Grouped `tx_position`, `block_number`,
+  `tx_index_in_block`, `cumulative_gas_used_before` into `skip::SkipContext`,
+  cutting the function to 6 params. No allow needed.
+- R11 `xchain.rs:83` `#[allow(clippy::too_many_arguments)]` on
+  `failed_xchain_receipt` — done, same `SkipContext` grouping (5 params).
+- R11 the `#[cfg_attr(not(feature = "std"), allow(unused_variables))]` pair
+  on both functions — kept, each still carries its reason; the logging split
+  the reaudit suggested (one shared `#[cfg(feature = "std")]` helper) was not
+  applied, since the two functions' log fields differ (deposit logs
+  `gas_limit`, xchain logs `origin_chain_id`/`seq`) and a shared helper would
+  need its own parameter grouping for no line saved.
+- R14 `failed_deposit_receipt`/`failed_xchain_receipt`/`scope.rs`'s
+  `skip_receipt` sharing one 16-field `Receipt` literal — done.
+  `skip::Executor::failed_derived_receipt(identity: DerivedTxIdentity, ctx:
+  SkipContext, ws, bal, reason)` in `crates/exec-core/src/executor/skip.rs`
+  builds the receipt and records the write set into the BAL; both
+  `failed_deposit_receipt` and `failed_xchain_receipt` keep their own log
+  line (text preserved) and delegate to it.
+- R14 the `Err(EVMError::Transaction(e))` arms shared between
+  `deposit.rs`/`scope_derived.rs::execute_deposit` and
+  `xchain.rs`/`scope_derived.rs::execute_xchain` — done as a byproduct of the
+  `failed_derived_receipt`/`SkipContext` unification above: all four call
+  sites now build a `SkipContext` and call the shared constructor instead of
+  duplicating the arm.
+- R4 `deposit.rs:201` `drop(evm)` — already resolved before this round (the
+  round-B brief's state note); confirmed by grep: no manual `drop(` calls
+  anywhere under `crates/exec-core/src/executor/`.
+- R2 `execute_deposit_tx` (106 lines) / `Executor::execute_deposit` (109
+  lines) over 100 — already resolved before this round; both are 74/78 lines
+  now (`deposit.rs`, `scope_derived.rs`), and shrank further with the
+  `SkipContext` call-site simplification above. `execute_xchain_tx` (71) and
+  `Executor::execute_xchain` (73) are likewise under the bound. No further
+  split needed.
+- R2 the `old_and_new_xchain_paths_agree` test (147 lines) — done. Extracted
+  `run_xchain_case` (the run-both-paths-and-compare body) and
+  `assert_xchain_case_shape` (the per-case shape match) as sibling functions
+  in the test module; the `for` loop over `cases` is now one call per case.
+  This also satisfies the coordinator's extended R16 (no loop containing an
+  `if`/`match`, and vice versa): the loop body is a single function call,
+  and the `if`/`match` moved into non-loop functions.
+- R3 `xchain.rs` (237 -> 553 code lines in the reaudit's count, now higher
+  still after the `SkipContext`/`skip` changes) — done. Moved `mod tests`
+  to a sibling `xchain_tests.rs` (matching `scope.rs`/`scope_tests.rs`'s
+  existing pattern). `xchain.rs` is 155 code lines now; `scope.rs` was
+  already split (259 lines) and needed no further action.
+- R11 `xchain_value_rejection`'s `Option<(SkipReason, String)>` — done.
+  Named `skip::Rejection { reason, detail }`; the function now returns
+  `Result<(), Rejection>`, matching the reaudit's suggested alternative.
+- R15 `mint_only_write_set`, `failed_deposit_receipt`, `failed_xchain_receipt`,
+  `xchain_value_rejection`, `derived_tx_rejection` — done, all moved into
+  `impl<S: StateDatabase> Executor<S>` blocks (in `deposit.rs`, `xchain.rs`,
+  and `scope.rs` respectively), consistent with the existing
+  `Executor::skip_receipt` precedent (the `S` bound is unused inside the
+  body; it exists so the type can be named as `Executor::<S>::method(...)`
+  from the generic call sites, exactly like `skip_receipt` already did).
+  `xchain_gas_budget` is the one exception: left as a free function in
+  `xchain.rs`, with a doc note explaining why — its only caller,
+  `tx_env_from_xchain`, builds a `TxEnv` before any `Executor`/`S` type is in
+  scope, so attaching it to `Executor<S>` would need an unrelated phantom
+  generic with no caller ever supplying `S`. The reaudit's other suggested
+  receivers for these functions (`Deposit`, `XChainMessage`) are foreign
+  types defined in `kardamom-types`; an inherent impl on them is blocked by
+  Rust's orphan rule without editing that crate, which another agent owns
+  this round.
+- R1 the `xchain.rs` test doc "the calldata floor alone is far above the old
+  fixed overhead" — already fixed before this round (no match found; the
+  round-B brief's state note said only the two `too_many_arguments` allows
+  and the test's `too_many_lines` allow were left).
+
+## Cross-crate R14 helpers added (in-crate, both halves owned)
+
+- `account_info` (`dry-stm.md`): `crates/stm/src/execute/config.rs` and
+  `crates/exec-core/src/executor/db.rs` each built the same 5-field
+  `AccountInfo` from `(nonce, balance, code_hash)`, normalizing the code
+  hash. Added `pub fn account_info(nonce, balance, code_hash) -> AccountInfo`
+  in `crates/exec-core/src/executor/db.rs` (re-exported as
+  `kardamom_exec_core::executor::account_info`, per the audit's own
+  suggested location), built on the existing private
+  `code_hash::to_revm_code_hash`. `db.rs`'s own `SnapshotRef::basic_ref` now
+  calls it. `crates/stm/src/execute/config.rs`'s `account_info` keeps its
+  name and signature (no stm call-site changes) but now delegates to the
+  shared function; its local `CodeHash` newtype (used only there) is
+  deleted.
+- `claim_index` (`dry-validator.md`): the wire-granularity rule ("chunk_of
+  above K=1, the raw index at K=1") was written at
+  `crates/validator/src/parallel/engine.rs:381` and
+  `crates/validator/src/interop/extract.rs:279` (a third, structurally
+  similar but not identical site, `engine.rs`'s `verify_units`, was left
+  alone — it branches into different verification code per arm, not just an
+  index computation). Added `pub fn claim_index(bal_index: u64, k:
+  NonZeroU16) -> u64` to `crates/exec-core/src/bal_ladder.rs`, beside
+  `chunk_of`. Updated `crates/validator/src/parallel/engine.rs`'s
+  `run_batches` to call it (removed the now-unused local `k` binding).
+  `crates/validator/src/interop/extract.rs` is not owned by this group; by
+  the time this landed, that file already matched the merged
+  `RemoteEpochObserver` shape from concurrent interop-group work (see the
+  engine Round B report), so no coordination was needed there, but the
+  `claim_index` call was not applied — that one-line swap
+  (`let claim_index = if granularity.get() > 1 { chunk_of(...) } else {
+  bal_index };` -> `let claim_index = kardamom_engine::bal_ladder::claim_index(bal_index,
+  granularity);`) is left for that group to pick up.
+
+## Gates
+
+- `cargo clippy -p kardamom-exec-core --all-features --no-deps --lib --tests
+  -- -D warnings -W clippy::pedantic -D unreachable_pub`: clean, except three
+  pre-existing `unreachable_pub` findings in `tests/common/mod.rs` (`slot`,
+  `ns_per_op`, `retained_nodes`), untouched by this round and outside the
+  files this round's items name.
+- `cargo test -p kardamom-exec-core --lib`: 61/61 pass (up from 54; the
+  `xchain_tests.rs` split and the `features.rs` `ParentState` rewrite added
+  test coverage, none removed). `cargo test -p kardamom-exec-core` (every
+  integration test binary): all pass.
+- `cargo fmt -p kardamom-exec-core -- --check`: clean.
+- Forbidden-pattern grep (`debug_assert!`, `.max(1)`, `Box<dyn`,
+  `allow(clippy::too_many_arguments)`) over `crates/exec-core`, test dirs
+  excluded: no hits.
+
+## Not done / cross-file items for other groups
+
+- `crates/validator/src/interop/extract.rs:278-281`: swap the inline
+  granularity branch for `kardamom_engine::bal_ladder::claim_index(bal_index,
+  granularity)` (see above). Not edited: outside this group's files.
+
+## Coordinator follow-up 2: R16, extended (nesting between a loop and a branch)
+
+Swept `crates/exec-core/src` for a `for`/`while`/`loop` with an `if`/`else`/
+`match` directly in its body, and for an `if`/`else`/`match` arm whose body
+directly contains a `for`/`while`/`loop`. Every site, fixed with either an
+iterator chain or a named helper (the loop's or branch's body becomes one
+call), preserving byte-for-byte behavior (checked against the write-set hash
+and encoding test suites, and the sparse-trie oracle test, after every file):
+
+- `delta.rs` `WriteSet::encode`: both the accounts loop (an `if`/`else if`/
+  `else` computing the code tag, then an `if` for the code-hash byte) and the
+  storage loop (an `if !same` for the address-repeat byte) had a branch
+  directly in a `for`. Extracted `put_account_entry`/`put_storage_entry` as
+  `WriteSet` methods; each loop's body is now one call.
+- `delta.rs` `put_varint`: a bare `loop { ...; if v == 0 { write; break } else
+  { write } }`. Rewrote as the standard LEB128 idiom, `while v >= 0x80 { emit
+  continuation byte; v >>= 7 } emit final byte`, which moves the stopping
+  condition into the `while` guard instead of a branch in the body. Verified
+  byte-identical against the original shift-then-check algorithm by hand for
+  the zero, one-byte, and multi-byte-boundary cases, then against the full
+  `write_set_hash`/`write_set_encoding` test suites (all pass, including the
+  fixture tests that pin exact expected hashes).
+- `executor/scope.rs` `execute_tx`: `if let Some((bal, bal_index)) = bal {
+  for (addr, account) in &outcome.state { bal.update_account(..) } }` (a loop
+  inside a branch) -> extracted `record_bal_writes`.
+- `executor/scope.rs` `record_account_touch`: `for (key, slot) in
+  &account.storage { if slot.original_value == slot.present_value {..} }` ->
+  `.iter().filter(..).map(..)` fed to `t.slot_reads.extend(..)`.
+- `executor/write_set.rs` `write_set_from_cache`: `for (addr, account) in
+  &state.accounts { match account.account_state {..continue..} ...; if
+  info.code_hash != KECCAK_EMPTY && let Some(code) = .. {..} }` -> extracted
+  `WriteSet::push_cache_account`.
+- `executor/write_set.rs` `WriteSet::push_evm_state_storage`: `for (key, slot)
+  in storage { if slot.original_value != slot.present_value {..} }` ->
+  `.filter(..).map(..)` fed to `self.storage.extend(..)`.
+- `executor/write_set.rs` `WriteSet::from_evm_state_deposit`: the re-walk `for
+  account in state.values() { if !touched {continue} ...; if !created && ..
+  {..} }` -> extracted `WriteSet::readd_called_contract_code`.
+- `executor/write_set.rs` `retain_changed`: both loops (`for (addr, triple) in
+  &ws.accounts { match ..; if changed {push} }` and the storage equivalent)
+  had a branch directly inside. Grouped `snapshot`/`parent`/`delta`/`idx` into
+  a `RetainLayers` struct (avoids threading 4+ loose args into two new
+  methods) with `push_if_account_changed`/`push_if_slot_changed`; each loop's
+  body is now one call.
+- `executor/write_set.rs` `write_set_from_evm_state_inner`: `for (addr,
+  account) in state { if !account.is_touched() { continue } ... }` ->
+  extracted `WriteSet::push_evm_state_account`.
+- `bal_ladder.rs` `merge_bal_fragments`: three levels deep (`for frag in
+  fragments { for (addr, acct) in .. { if let Some(tgt) = .. { ...; for (slot,
+  writes) in .. { if let Some(dw) = .. {..} else {..} } } else {..} } }`) —
+  also a plain nested-loop violation (the original R16 clause) on top of the
+  branch nesting. Flattened the outer two loops with
+  `fragments.into_iter().flat_map(|frag| frag.accounts)`; extracted
+  `merge_account` (uses a `let-else` guard instead of `if let`/`else`) and
+  `merge_storage_slot` (same), and `push_if_changed` for the innermost
+  `append` helper's own loop body. No consumer of `merge_bal_fragments`
+  exists in this crate's own tests; validated indirectly through
+  `kardamom-validator`'s and `kardamom-stm`'s BAL-merge-dependent parity
+  tests, all still passing.
+- `anchor/sparse.rs` `Node::resolve`'s `TrieNode::Branch` arm and
+  `Node::encode_node`'s `Node::Branch` arm: each had a `for` loop directly
+  inside a `match` arm (loop inside a branch), and each loop's body had its
+  own `if`. Extracted `resolve_branch_children`/`resolve_branch_slot` and
+  `branch_rlp_refs`/`push_branch_child` respectively.
+- `anchor/mod.rs` `WitnessAnchor::prove_accounts`: `for acct in
+  &self.witness.accounts { match lookup {..return Err(..)..} }` -> extracted
+  `prove_one_account`.
+- `anchor/mod.rs` `WitnessAnchor::prove_storage`: `for slot in
+  &self.witness.storage { let-else; ...; match lookup {..} }` -> extracted
+  `check_one_slot` (the `let-else` guard itself is not a branch; the `match`
+  that followed it was).
+- `anchor/mod.rs` `WitnessAnchor::verify_code_blobs`: `for entry in
+  &self.witness.code { if keccak256(..) != .. {..} }` -> extracted
+  `check_one_code_blob`.
+- `anchor/mod.rs` `ProvenPre::apply_storage_writes`: `for (key, value) in
+  writes { if value.is_zero() {..} else {..} }` -> extracted
+  `apply_one_storage_write`.
+- `stateless.rs` `execute_block_stateless`: `for rec in records { if let
+  BufferedRecord::Tx { envelope, .. } = rec { verify_record_identity(..)?; }
+  }` -> `.filter_map(..).try_for_each(verify_record_identity)`.
+- `stateless.rs` `first_bal_difference`: `for (x,y) in a.iter().zip(b.iter())
+  { if .. { return .. } if .. { return .. } }` -> `.find_map(..)`, the loop
+  removed entirely.
+
+Reviewed and left alone (matched a search pattern but is not a real nesting):
+- `anchor/mod.rs` `recompute_post_root`'s `for addr in touched { let-else;
+  ...; accounts_trie.insert(..)?; }`: the `let-else`'s `else { continue }` is
+  a guard clause, not a branch wrapping the rest of the loop body — the rest
+  of the body is flat, unconditional code. Judgment call: a `let-else` used
+  this way is the language's own sanctioned replacement for exactly the
+  nested `if let {..} else { continue }` shape R16 forbids, so counting it as
+  a violation would be circular. Applied the same reading throughout (see
+  `write_set.rs`'s `RetainLayers` methods and the anchor-tree fixes above,
+  which use the same idiom deliberately).
+- `bal_ladder.rs`, `delta.rs`, `write_set.rs`: several `.fold(..)`,
+  `.map(..)`, `.retain(..)` closures contain an `if`/`match`; not a loop
+  keyword, so out of scope (this is the iterator-chain style the rule itself
+  recommends in place of a loop).
+
+## Gates (after the R16 pass)
+
+- `cargo test -p kardamom-exec-core` (lib + all 9 integration test binaries):
+  all pass, same counts as before this pass (61 lib tests; `write_set_hash`,
+  `write_set_encoding`, `anchor_sparse`, `anchor_state`, `touch_set`,
+  `cfg_pinning`, `code_hash_scope_invariance`, `decode_cost`, `hash_cost` all
+  green).
+- `cargo clippy -p kardamom-exec-core --all-features --no-deps --lib -- -D
+  warnings -W clippy::pedantic -D unreachable_pub`: clean.
+- `cargo fmt -p kardamom-exec-core -- --check`: clean.
+
+## Round B follow-up 2 (coordinator's two post-round briefs)
+
+Two coordinator briefs landed after Round B closed:
+`followup-roundb-B.md` (mechanical out-param/dead-arm/tuple-to-struct fixes)
+and `followup-roundb-B-2.md` (an Opus reviewer's line-by-line pass over the
+whole diff). Corrections this section makes to earlier claims in this file:
+the R11 row below claiming the three `cfg_attr` allows "each still carry
+their reason" was false (none carried one); the R1 claim that
+`xchain_tests.rs`'s "the old fixed overhead" line was "already fixed before
+this round" was false (the test split moved the file, not the words). Both
+are now actually fixed; see below.
+
+### `AccountFields` (brief 1, item 19)
+
+Replaced the `(u64, U256, B256)` account-entry tuple with a named
+`pub struct AccountFields { nonce: u64, balance: U256, code_hash: B256 }` in
+`delta.rs`. `AccountEntry` is now `(Address, AccountFields)`.
+`WriteSet::account` returns `Option<&AccountFields>`.
+`PendingDelta.accounts` is `DeltaMap<Address, AccountFields>` (no unowned
+caller iterates it directly — confirmed by grep — so it converts too, not
+just the `WriteSet` side). `kardamom_exec_core::executor::account_info` now
+takes one `AccountFields` argument instead of three positional ones.
+
+Fixed every owned call site: `write_set.rs` (`push_if_account_changed`,
+`push_cache_account`, `push_evm_state_account`, `record_into_bal`,
+`from_evm_state_deposit`'s retain), `db.rs` (`account_info`,
+`seed_cache_layer`, `basic_ref`), `deposit.rs`, `xchain.rs`,
+`scope_derived.rs`, `anchor/mod.rs`'s `post_account_leaf`, and every
+`exec-core/tests/*.rs` integration test that built an `AccountEntry` or a
+`PendingDelta.accounts` entry (`write_set_hash.rs`, `write_set_encoding.rs`,
+`hash_cost.rs`, `eest_state.rs`, `anchor_state.rs`).
+
+`WriteSet` derives `Debug, Default, Clone, PartialEq, Eq` — no rkyv, so the
+wire encoding (`WS_ENCODING_V2`, a custom hand-written byte layout in
+`WriteSet::encode`) is untouched by this change. The golden-hash tests
+(`write_set_hash.rs`, `write_set_encoding.rs`) pin that layout byte-for-byte
+and all pass unchanged, confirming the field write order did not drift.
+
+`kardamom_types::StateDatabase::basic` (in `crates/types`, unowned) still
+returns `Option<(u64, U256, B256)>` — that boundary is out of scope this
+round. Every owned `impl StateDatabase`/read site converts once, at the
+boundary, with `.map(AccountFields::from)` (a `From<(u64, U256, B256)> for
+AccountFields` and the reverse `From<AccountFields> for (u64, U256, B256)`
+both exist in `delta.rs`).
+
+Unowned call sites found, not edited (still on the tuple, and correctly so
+until `StateDatabase::basic`'s return type changes, which is out of this
+group's scope): `crates/executor/tests/hash_invariance.rs`, `crates/state/**`
+(`writer/tests.rs`, `trie/mod.rs`, `testing.rs`, `trie/incremental_tests.rs`,
+`snapshot.rs`), `crates/validator/tests/stateless_reexec.rs`,
+`crates/validator/src/interop/verify/tests.rs`, `crates/types/src/state.rs`
+(the trait itself).
+
+`crates/validator/src/parallel/engine.rs`'s `seed_one_account` (owned,
+`parallel/**`) and `crates/validator/src/parallel/dump.rs`'s divergence-dump
+JSON builder both converted to `AccountFields` (through
+`kardamom_engine::delta::AccountFields`, since `crates/validator` only
+depends on `kardamom-exec-core` as a dev-dependency, not a normal one).
+
+`cargo test -p kardamom-stm --test equivalence_sharded --test
+equivalence_scheduler --test equivalence_streaming` and `cargo test -p
+kardamom-validator --lib` (90 tests, including
+`parallel::engine_tests::parity::*`, which exercises `seed_one_account` and
+the batch-execute path) all pass, confirming the conversion is
+behavior-preserving on both the STM and the validator-parallel side.
+
+### R14 (brief 2, items 9-13)
+
+- **Item 9** (`DerivedTxIdentity`/`DerivedIdentity` merge): deleted
+  `derived.rs`'s `DerivedIdentity`; `skip.rs`'s `DerivedTxIdentity` is now
+  the one type, with a `nonce: u64` field added (0 for a deposit or a
+  cross-chain delivery, the real envelope nonce for a canonical skip).
+  Updated all 6 construction sites (`deposit.rs` x2, `xchain.rs` x2,
+  `scope_derived.rs` x2) and `derived.rs`'s `derived_receipt` signature.
+- **Item 10** (`ReceiptParts`): merged the two `skip.rs` `Receipt` literals.
+  `skip_receipt` no longer builds its own `Receipt`; it logs, builds a
+  `DerivedTxIdentity` with the real nonce, and delegates to
+  `failed_derived_receipt` (which now reads `nonce` from the identity
+  instead of hardcoding 0). `derived_receipt` in `derived.rs` does the same
+  (`nonce: identity.nonce`, always 0 there). This leaves two `Receipt`
+  literals in the crate: `scope.rs`'s `build_tx_receipt` (a real 2718 tx —
+  computed `contract_address`, real `effective_gas_price`, a `ReceiptStatus`
+  mapping with a `Halt` reason) and `derived.rs`'s `derived_receipt` (an
+  executed derived tx — real gas/logs, no `skip_reason`). Assessed and
+  declined to force these two into the same `ReceiptParts` as the skip
+  shape: the field derivations diverge enough (contract-address logic,
+  status representation, real vs. always-empty logs) that a single
+  universal constructor would need enough optional/defaulted fields to
+  become its own footgun in a consensus-critical hash path, for a smaller
+  win than the two skip.rs sites the brief text concretely asks for
+  ("the two skip.rs sites become one" — done). Flagging this call for a
+  second opinion in the next review round instead of taking it further
+  unreviewed.
+- **Item 11** (`DepositFailure::from_validation`): added
+  `pub(super) struct DepositFailure` with one generic associated fn,
+  `from_validation<S, D>(cache, deposit, slot, block_number, reason, detail,
+  bal)`, in `deposit.rs`. Both `execute_deposit_tx`'s and
+  `Executor::execute_deposit`'s `DerivedOutcome::Rejected` arms (previously
+  16 duplicated lines each) now call it.
+- **Item 12** (`derived_call` helper): added
+  `Executor::<S>::derived_call(&mut self, slot) -> DerivedCall<'_,
+  CacheDB<SnapshotDb<S>>>` in `scope_derived.rs`. Replaced all 5
+  `DerivedCall::new(revm::context_interface::ContextTr::db_mut(&mut
+  *self.evm), &self.env, slot)` call sites with `self.derived_call(slot)`.
+- **Item 13** (stm's `account_info` forwarding wrapper): not this group's
+  file (`crates/stm/src/execute/config.rs`) — done as part of the stm
+  sub-agent's work; see `status-stm.md`.
+
+### R11 (brief 2, item 5): three no-reason `allow`s
+
+`deposit.rs`, `xchain.rs`, and `skip.rs` each carried a bare
+`#[cfg_attr(not(feature = "std"), allow(unused_variables))]` on their
+failed-receipt constructor, with no `reason =`. Replaced all three with one
+shared `skip.rs::log_invalid(reason, detail, block_number, InvalidTx<'_>)`:
+an `InvalidTx` enum (`CanonicalSkip`, `Deposit`, `XChain`) carrying each
+site's extra log fields, a `#[cfg(feature = "std")]` body that matches on
+the variant and calls the same `tracing::error!` with byte-identical text
+and field sets to before, then `record_invalid_tx_skipped`, and a
+`#[cfg(not(feature = "std"))]` no-op twin so nothing is unused under
+`no_std`. `InvalidTx` derives `Copy` (clippy `needless_pass_by_value`) and
+carries one `#[cfg_attr(not(feature = "std"), allow(dead_code, reason =
+"the no_std build of log_invalid ignores every field"))]` — one allow with
+a reason, replacing three without one. Verified with `cargo check
+--no-default-features` and `cargo clippy --no-default-features -- -D
+warnings -W clippy::pedantic`: both clean, no dead-code/unused warnings
+either way.
+
+### R1 comment fixes (brief 2's table, exec-core rows)
+
+- `xchain_tests.rs`: "far above the old fixed overhead. The budget now
+  covers it" → "far above `XCHAIN_DELIVERY_OVERHEAD`. The budget covers
+  it" (no more "old"/"now").
+- `bal_ladder.rs`: "the two functions [`quantize`] used to pass `k` to as a
+  loose parameter" → states the current shape only (`chunk_of` and
+  `dedup_changes` read it as `self`), no history.
+- `derived.rs`: "the `match &outcome.result { ... }` block that used to
+  appear four times" → "One classification of the EVM result serves every
+  derived path," no history.
+- `features.rs`: "It takes only a state-read function as a parameter" (the
+  code no longer matches — `apply_block_close_actions` takes `delta`,
+  `parent`, and `snapshot`) → rewritten to name the actual three parameters.
+
+### `.expect`/`.unwrap` (brief 2, items 26-27, exec-core rows)
+
+- `anchor/sparse.rs:422` (`children[i].take().expect("survivor indexed")`):
+  removed. `collapse_branch` now takes each survivor as its scan finds it
+  (`children.iter_mut().enumerate().filter_map(|(i, c)| c.take().map(|node|
+  (i, *node)))`), so the value carries forward with no second, fallible
+  lookup by index. The "two or more survivors" arm puts the (at most two)
+  taken values back before returning the branch unchanged; every other slot
+  was never touched. `splice_survivor` now takes `Node` by value instead of
+  `Box<Node>` (clippy `boxed_local`). Verified against
+  `deletion_collapses_to_single_leaf_and_to_empty`,
+  `cascaded_deletes_under_shared_prefixes`, and
+  `sparse_mutations_equal_oracle_across_shapes` in `anchor_sparse.rs`, and
+  the whole `anchor_state.rs` suite: all pass unchanged.
+- `exec_types.rs`'s `TxIndex::next` (`checked_add(1).expect(...)`): left as
+  is. It already carries a `# Panics` doc explaining the bound (2^64
+  records) is why a saturating add would be wrong here (it would repeat an
+  id instead of ending the chain); no change needed.
+- `merge_bal_fragments` (`bal_ladder.rs`) callers/pins (item 28): no direct
+  caller in `crates/exec-core/tests/*` or `crates/validator/tests/*` by
+  name — it runs inside `stateless.rs`'s `execute_block_stateless`/
+  `execute_block_anchored`, which `crates/validator/tests/stateless_reexec.rs`
+  exercises (currently blocked from compiling by the unrelated, pre-existing
+  `NonZeroU16` mismatch reported earlier in this file's "Round B" section —
+  unowned, not something this group can fix). `bal_ladder.rs`'s own
+  in-crate unit test (`quantize_collapses_within_chunks_and_keeps_last`)
+  pins `quantize`, one of `merge_bal_fragments`'s two building blocks, but
+  not the merge itself directly.
+
+### Gates (after this section's changes)
+
+- `cargo clippy -p kardamom-exec-core --all-targets --all-features -- -D
+  warnings -W clippy::pedantic -D unreachable_pub`: clean.
+- `cargo clippy -p kardamom-exec-core --no-default-features -- -D warnings
+  -W clippy::pedantic`: clean (the `no_std` build).
+- `cargo test -p kardamom-exec-core` (lib + all integration test binaries):
+  all green, same shape as the previous gate section plus the new
+  `AccountFields` and `InvalidTx` coverage exercised transitively by every
+  existing test.
+- `cargo fmt -p kardamom-exec-core -- --check`: clean.
+- Forbidden-pattern grep (`debug_assert!`, `.max(1)`, `Box<dyn`,
+  `allow(clippy::too_many_arguments)`), `crates/exec-core/src` only: no
+  hits.
+- Forbidden-pattern grep: no hits.

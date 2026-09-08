@@ -52,22 +52,34 @@ pub fn alias_remote_address(origin_chain_id: u64, sender: Address) -> Address {
     Address::from_slice(&h.as_slice()[12..])
 }
 
-/// Deterministic anchor for one origin block. The origin validator serves it
-/// as the feed's `originBlockHash`, and the watcher recomputes it.
-///
-/// Kardamom blocks carry no canonical hash in v0. The sealed boundary is
-/// slim, and the RPC returns `blockHash: null`. So this is a position
-/// commitment, not a content commitment. Every validator of one chain
-/// serves the same anchor for a block, so racing relayers derive
-/// byte-identical records, and `canonical_id` dedup collapses them. The
-/// watcher rejects a feed message whose anchor differs from this function,
-/// because the feed must not choose the anchor. Content authenticity is the
-/// job of spec §10, never of this field.
-#[must_use]
-pub fn xchain_anchor_hash(origin_chain_id: u64, block_number: u64) -> B256 {
-    let mut buf = Vec::with_capacity(XCHAIN_ANCHOR_TAG.len() + 16);
-    buf.extend_from_slice(XCHAIN_ANCHOR_TAG.as_bytes());
-    buf.extend_from_slice(&origin_chain_id.to_be_bytes());
-    buf.extend_from_slice(&block_number.to_be_bytes());
-    keccak256(&buf)
+/// Position of one origin block: the origin chain and the block number
+/// inside it. Deterministically anchored by `Anchor::hash` — never a
+/// content commitment, since Kardamom blocks carry no canonical hash in v0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchor {
+    pub origin_chain_id: u64,
+    pub block_number: u64,
+}
+
+impl Anchor {
+    /// The deterministic anchor the origin validator serves as the feed's
+    /// `originBlockHash`, and the watcher recomputes to check it.
+    ///
+    /// Kardamom blocks carry no canonical hash in v0. The sealed boundary is
+    /// slim, and the RPC returns `blockHash: null`. So this is a position
+    /// commitment, not a content commitment. Every validator of one chain
+    /// serves the same anchor for a block, so racing relayers derive
+    /// byte-identical records, and `RemoteEpochRecord::canonical_id` dedup
+    /// collapses them. The watcher rejects a feed message whose anchor
+    /// differs from this hash, because the feed must not choose the anchor.
+    /// Content authenticity is a separate, later check, never this field's
+    /// job.
+    #[must_use]
+    pub fn hash(&self) -> B256 {
+        super::keccak_concat(&[
+            XCHAIN_ANCHOR_TAG.as_bytes(),
+            &self.origin_chain_id.to_be_bytes(),
+            &self.block_number.to_be_bytes(),
+        ])
+    }
 }

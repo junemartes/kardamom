@@ -14,7 +14,7 @@ use alloc::format;
 
 use kardamom_types::StateDatabase;
 
-use crate::delta::{PendingDelta, WriteSet};
+use crate::delta::{AccountFields, PendingDelta, WriteSet};
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
 
@@ -37,8 +37,8 @@ impl WriteSet {
     /// See the module docs above this impl for the fabrication rationale.
     pub fn record_into_bal(&self, bal: &mut revm::state::bal::Bal, bal_index: u64) {
         let mut entries = BalEntries::default();
-        for (addr, (nonce, balance, code_hash)) in &self.accounts {
-            entries.account(self, *addr, *nonce, *balance, *code_hash);
+        for (addr, fields) in &self.accounts {
+            entries.account(self, *addr, fields.nonce, fields.balance, fields.code_hash);
         }
         for ((addr, key), value) in &self.storage {
             entries.slot(*addr, *key, *value);
@@ -69,12 +69,17 @@ impl WriteSet {
         addr: Address,
         storage: impl IntoIterator<Item = (&'a U256, &'a revm::state::EvmStorageSlot)>,
     ) {
-        for (key, slot) in storage {
-            if slot.original_value != slot.present_value {
-                let b_key = B256::from(key.to_be_bytes::<32>());
-                self.storage.push(((addr, b_key), slot.present_value));
-            }
-        }
+        self.storage.extend(
+            storage
+                .into_iter()
+                .filter(|(_, slot)| slot.original_value != slot.present_value)
+                .map(|(key, slot)| {
+                    (
+                        (addr, B256::from(key.to_be_bytes::<32>())),
+                        slot.present_value,
+                    )
+                }),
+        );
     }
 
     /// Build a `WriteSet` from revm's per-tx `EvmState`. Only touched
@@ -110,14 +115,14 @@ impl WriteSet {
         // sides — `seed_cache_layer` can put kardamom's convention into
         // the scope's cache.
         let mut ws = write_set_from_evm_state_inner(state);
-        ws.accounts.retain(|(addr, (nonce, balance, code_hash))| {
+        ws.accounts.retain(|(addr, fields)| {
             let Some(account) = state.get(addr) else {
                 return true;
             };
             let original = &account.original_info;
-            *nonce != original.nonce
-                || *balance != original.balance
-                || crate::code_hash::to_wire_code_hash(*code_hash)
+            fields.nonce != original.nonce
+                || fields.balance != original.balance
+                || crate::code_hash::to_wire_code_hash(fields.code_hash)
                     != crate::code_hash::to_wire_code_hash(original.code_hash)
         });
 
@@ -126,24 +131,31 @@ impl WriteSet {
         // bytecode lands in `cache.contracts` on load, so it must be
         // re-added here.
         for account in state.values() {
-            if !account.is_touched() {
-                continue;
-            }
-            let info = &account.info;
-            if !account.is_created()
-                && info.code_hash != KECCAK_EMPTY
-                && let Some(code) = info.code.as_ref()
-                && !code.is_empty()
-                && !ws.code.iter().any(|(h, _)| *h == info.code_hash)
-            {
-                ws.code.push((
-                    info.code_hash,
-                    Bytes::copy_from_slice(code.original_bytes().as_ref()),
-                ));
-            }
+            ws.readd_called_contract_code(account);
         }
         ws.finish();
         ws
+    }
+
+    /// Re-add a called (not created) contract's bytecode, unless it is
+    /// untouched, already present, or empty. The loop in
+    /// [`Self::from_evm_state_deposit`] stays free of a branch.
+    fn readd_called_contract_code(&mut self, account: &revm::state::Account) {
+        if !account.is_touched() {
+            return;
+        }
+        let info = &account.info;
+        if !account.is_created()
+            && info.code_hash != KECCAK_EMPTY
+            && let Some(code) = info.code.as_ref()
+            && !code.is_empty()
+            && !self.code.iter().any(|(h, _)| *h == info.code_hash)
+        {
+            self.code.push((
+                info.code_hash,
+                Bytes::copy_from_slice(code.original_bytes().as_ref()),
+            ));
+        }
     }
 }
 
@@ -253,16 +265,38 @@ impl BalEntries {
 pub(super) fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
     let mut ws = WriteSet::default();
     for (addr, account) in &state.accounts {
+        ws.push_cache_account(*addr, account, state);
+    }
+    ws.finish();
+    ws
+}
+
+impl WriteSet {
+    /// Push one `CacheDB` account entry, and its code and storage, unless
+    /// the cache never actually observed it. The single loop in
+    /// [`write_set_from_cache`] stays at one loop level.
+    fn push_cache_account(
+        &mut self,
+        addr: Address,
+        account: &revm::database::DbAccount,
+        state: &revm::database::Cache,
+    ) {
         match account.account_state {
             revm::database::AccountState::None | revm::database::AccountState::NotExisting => {
-                continue;
+                return;
             }
             revm::database::AccountState::Touched
             | revm::database::AccountState::StorageCleared => {}
         }
         let info = &account.info;
-        ws.accounts
-            .push((*addr, (info.nonce, info.balance, info.code_hash)));
+        self.accounts.push((
+            addr,
+            AccountFields {
+                nonce: info.nonce,
+                balance: info.balance,
+                code_hash: info.code_hash,
+            },
+        ));
 
         // CacheDB stores bytecode separately, by code_hash. Resolve it
         // through the `contracts` map. Skip KECCAK_EMPTY (the canonical
@@ -272,16 +306,14 @@ pub(super) fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
             && let Some(code) = state.contracts.get(&info.code_hash)
             && !code.is_empty()
         {
-            ws.code.push((
+            self.code.push((
                 info.code_hash,
                 Bytes::copy_from_slice(code.original_bytes().as_ref()),
             ));
         }
 
-        ws.push_cache_storage(*addr, &account.storage);
+        self.push_cache_storage(addr, &account.storage);
     }
-    ws.finish();
-    ws
 }
 
 /// Filter a write set down to values that changed.
@@ -307,50 +339,18 @@ pub(super) fn retain_changed<S: StateDatabase>(
     delta: &PendingDelta,
     idx: TxIndex,
 ) -> Result<WriteSet, ExecutorError> {
-    let state_err = |detail: alloc::string::String| ExecutorError::Execution { idx, detail };
-
+    let layers = RetainLayers {
+        snapshot,
+        parent,
+        delta,
+        idx,
+    };
     let mut out = WriteSet::default();
-    for (addr, triple) in &ws.accounts {
-        let pre = match delta
-            .accounts
-            .get(addr)
-            .or_else(|| parent.and_then(|p| p.accounts.get(addr)))
-        {
-            Some(v) => Some(*v),
-            None => snapshot
-                .basic(*addr)
-                .map_err(|e| state_err(format!("retain basic({addr:?}): {e}")))?,
-        };
-        let changed = match pre {
-            Some((n, b, c)) => {
-                triple.0 != n
-                    || triple.1 != b
-                    || crate::code_hash::to_wire_code_hash(triple.2)
-                        != crate::code_hash::to_wire_code_hash(c)
-            }
-            // No prior account: keep a real creation, but drop an
-            // account touched into existence with nothing in it (a
-            // beneficiary at zero reward, and similar cases).
-            None => !crate::code_hash::is_empty_account(triple.0, triple.1, triple.2),
-        };
-        if changed {
-            out.accounts.push((*addr, *triple));
-        }
+    for (addr, fields) in &ws.accounts {
+        layers.push_if_account_changed(&mut out, *addr, *fields)?;
     }
     for ((addr, key), value) in &ws.storage {
-        let pre = match delta
-            .storage
-            .get(&(*addr, *key))
-            .or_else(|| parent.and_then(|p| p.storage.get(&(*addr, *key))))
-        {
-            Some(v) => *v,
-            None => snapshot
-                .storage(*addr, *key)
-                .map_err(|e| state_err(format!("retain storage({addr:?}, {key:?}): {e}")))?,
-        };
-        if *value != pre {
-            out.storage.push(((*addr, *key), *value));
-        }
+        layers.push_if_slot_changed(&mut out, *addr, *key, *value)?;
     }
     // Code entries carry only bytecode this record created. That is
     // always a real change, so code passes through unfiltered.
@@ -362,20 +362,127 @@ pub(super) fn retain_changed<S: StateDatabase>(
     Ok(out)
 }
 
+/// The pre-execution view [`retain_changed`] compares a write set
+/// against: this tx's own pending delta, the unsettled parent, then the
+/// snapshot, in that order. Grouped so each per-entry check takes one
+/// struct instead of four loose layers.
+struct RetainLayers<'a, S> {
+    snapshot: &'a S,
+    parent: Option<&'a PendingDelta>,
+    delta: &'a PendingDelta,
+    idx: TxIndex,
+}
+
+impl<S: StateDatabase> RetainLayers<'_, S> {
+    fn state_err(&self, detail: alloc::string::String) -> ExecutorError {
+        ExecutorError::Execution {
+            idx: self.idx,
+            detail,
+        }
+    }
+
+    /// Push `(addr, fields)` into `out` if it differs from the
+    /// pre-execution view, or if it creates an account with real content.
+    /// [`retain_changed`]'s account loop stays at one loop level.
+    fn push_if_account_changed(
+        &self,
+        out: &mut WriteSet,
+        addr: Address,
+        fields: AccountFields,
+    ) -> Result<(), ExecutorError> {
+        let pre = match self
+            .delta
+            .accounts
+            .get(&addr)
+            .or_else(|| self.parent.and_then(|p| p.accounts.get(&addr)))
+        {
+            Some(v) => Some(*v),
+            None => self
+                .snapshot
+                .basic(addr)
+                .map_err(|e| self.state_err(format!("retain basic({addr:?}): {e}")))?
+                .map(AccountFields::from),
+        };
+        let changed = match pre {
+            Some(p) => {
+                fields.nonce != p.nonce
+                    || fields.balance != p.balance
+                    || crate::code_hash::to_wire_code_hash(fields.code_hash)
+                        != crate::code_hash::to_wire_code_hash(p.code_hash)
+            }
+            // No prior account: keep a real creation, but drop an
+            // account touched into existence with nothing in it (a
+            // beneficiary at zero reward, and similar cases).
+            None => {
+                !crate::code_hash::is_empty_account(fields.nonce, fields.balance, fields.code_hash)
+            }
+        };
+        if changed {
+            out.accounts.push((addr, fields));
+        }
+        Ok(())
+    }
+
+    /// Push `((addr, key), value)` into `out` if it differs from the
+    /// pre-execution view. [`retain_changed`]'s storage loop stays at one
+    /// loop level.
+    fn push_if_slot_changed(
+        &self,
+        out: &mut WriteSet,
+        addr: Address,
+        key: B256,
+        value: U256,
+    ) -> Result<(), ExecutorError> {
+        let pre = match self
+            .delta
+            .storage
+            .get(&(addr, key))
+            .or_else(|| self.parent.and_then(|p| p.storage.get(&(addr, key))))
+        {
+            Some(v) => *v,
+            None => self
+                .snapshot
+                .storage(addr, key)
+                .map_err(|e| self.state_err(format!("retain storage({addr:?}, {key:?}): {e}")))?,
+        };
+        if value != pre {
+            out.storage.push(((addr, key), value));
+        }
+        Ok(())
+    }
+}
+
 /// The emission rules the Block-STM engine (`kardamom-stm`) must match
 /// when it builds per-tx write sets from its own revm outcomes: touched
 /// accounts, changed slots, and created code only.
 fn write_set_from_evm_state_inner(state: &revm::state::EvmState) -> WriteSet {
     let mut ws = WriteSet::default();
     for (addr, account) in state {
+        ws.push_evm_state_account(*addr, account);
+    }
+    ws.finish();
+    ws
+}
+
+impl WriteSet {
+    /// Push one revm `EvmState` account entry, and its code and storage,
+    /// unless revm never marked it touched (a read only). The single loop
+    /// in [`write_set_from_evm_state_inner`] stays at one loop level.
+    fn push_evm_state_account(&mut self, addr: Address, account: &revm::state::Account) {
         // Only emit accounts revm marked as touched. Untouched entries are
         // only reads.
         if !account.is_touched() {
-            continue;
+            return;
         }
         let info = &account.info;
-        ws.accounts
-            .push((*addr, (info.nonce, info.balance, info.code_hash)));
+        self.accounts.push((
+            addr,
+            AccountFields {
+                nonce: info.nonce,
+                balance: info.balance,
+                code_hash: info.code_hash,
+            },
+        ));
 
         // Code bytes: only for accounts created this tx. Revm also loads
         // the bytecode of every contract that is merely called (`info.code`
@@ -387,14 +494,12 @@ fn write_set_from_evm_state_inner(state: &revm::state::EvmState) -> WriteSet {
             && info.code_hash != KECCAK_EMPTY
             && !code.is_empty()
         {
-            ws.code.push((
+            self.code.push((
                 info.code_hash,
                 Bytes::copy_from_slice(code.original_bytes().as_ref()),
             ));
         }
 
-        ws.push_evm_state_storage(*addr, &account.storage);
+        self.push_evm_state_storage(addr, &account.storage);
     }
-    ws.finish();
-    ws
 }

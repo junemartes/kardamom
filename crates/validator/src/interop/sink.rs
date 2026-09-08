@@ -84,33 +84,43 @@ impl<P: TxReceiptsPublication> ExtractingReceiptSink<P> {
     fn flush_through(&mut self, block: u64) -> Result<(), ExecutorError> {
         let flushed = self.pending.drain_through(block);
         for (b, receipts) in flushed {
-            let claims = self.claims.take(b, self.claim_wait);
-            if claims.is_none() {
-                metrics::counter_outbox_unchecked();
-                tracing::warn!(
-                    block = b,
-                    "no BAL claims for an outbox-sending block; messages served UNCHECKED \
-                     (own re-execution; the write-set path already flagged the missing frame)"
-                );
-            }
-            let msgs = match collect_outbox_messages(
-                self.chain_id,
-                b,
-                &receipts,
-                claims.as_ref().map(|(g, idx)| (*g, idx.as_ref())),
-            ) {
-                Ok(msgs) => msgs,
-                Err(fault) => {
-                    let reason = format!("outbox extraction failed: {fault}");
-                    return Err(ExecutorError::Divergence(self.divergence.halt(reason)));
-                }
-            };
-            metrics::counter_outbox_extracted(msgs.len());
-            self.store.append_block(b, msgs);
+            self.extract_and_serve_block(b, &receipts)?;
         }
         // The boundary block itself may have had no outbox receipts —
         // retention still advances.
         self.store.append_block(block, Vec::new());
+        Ok(())
+    }
+
+    /// Cross-check one block's buffered receipts against its BAL claims
+    /// (unchecked, and counted, if the claims never arrived), extract its
+    /// outbox messages, and feed the serving store.
+    fn extract_and_serve_block(
+        &self,
+        block: u64,
+        receipts: &[Receipt],
+    ) -> Result<(), ExecutorError> {
+        let claims = self.claims.take(block, self.claim_wait);
+        if claims.is_none() {
+            metrics::counter_outbox_unchecked();
+            tracing::warn!(
+                block,
+                "no BAL claims for an outbox-sending block; messages served UNCHECKED \
+                 (own re-execution; the write-set path already flagged the missing frame)"
+            );
+        }
+        let msgs = collect_outbox_messages(
+            self.chain_id,
+            block,
+            receipts,
+            claims.as_ref().map(|(g, idx)| (*g, idx.as_ref())),
+        )
+        .map_err(|fault| {
+            let reason = format!("outbox extraction failed: {fault}");
+            ExecutorError::Divergence(self.divergence.halt(reason))
+        })?;
+        metrics::counter_outbox_extracted(msgs.len());
+        self.store.append_block(block, msgs);
         Ok(())
     }
 }
@@ -143,12 +153,15 @@ mod tests {
     use alloy_primitives::{B256, U256};
     use kardamom_types::{BlockBoundary, WireLog};
 
-    use crate::interop::extract::sent_messages_slot;
     use crate::interop::extract::tests_support::{honest_sent_log, log_msg_hash};
+    use crate::interop::store::LaneFloor;
     use crate::parallel::ClaimIndex;
+    use kardamom_types::xchain::Outbox;
 
-    fn nz(n: u64) -> std::num::NonZeroU64 {
-        std::num::NonZeroU64::new(n).expect("fixture retention")
+    fn nz(n: u64) -> crate::interop::store::RetentionBlocks {
+        crate::interop::store::RetentionBlocks::new(
+            std::num::NonZeroU64::new(n).expect("fixture retention"),
+        )
     }
 
     struct OkSink;
@@ -189,7 +202,7 @@ mod tests {
         let log = honest_sent_log(CHAIN, 412_347, 0, &[0xCA]);
         let mut idx = ClaimIndex::default();
         idx.storage
-            .entry((OUTBOX, sent_messages_slot(log_msg_hash(&log))))
+            .entry((OUTBOX, Outbox::sent_messages_slot(log_msg_hash(&log))))
             .or_default()
             .push((1, U256::ONE));
         claims.insert(5, std::num::NonZeroU16::MIN, idx);
@@ -270,6 +283,6 @@ mod tests {
         // Retention 2, head 8: the block-1 message aged out.
         let scan = store.from_seq(412_347, 0);
         assert!(scan.msgs.is_empty());
-        assert_eq!(scan.floor_seq, Some(1));
+        assert_eq!(scan.floor_seq, LaneFloor::Known(1));
     }
 }
