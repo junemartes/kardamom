@@ -34,6 +34,8 @@ pub enum IngressError {
     Expired((Address, u64)),
     #[error("ingress overloaded: {0} submissions pending — retry with backoff")]
     Overloaded(usize),
+    #[error("ingress draining for shutdown — retry on another replica")]
+    Draining,
     #[error(
         "transaction gas limit {0} exceeds the EIP-7825 per-tx cap of \
          {cap} — the tx can never execute",
@@ -50,7 +52,9 @@ impl From<IngressError> for ErrorObjectOwned {
     fn from(err: IngressError) -> Self {
         let code = match &err {
             // Limit exceeded, a server-specific and retryable overload class.
-            IngressError::RateLimited(_) | IngressError::Overloaded(_) => -32005,
+            IngressError::RateLimited(_) | IngressError::Overloaded(_) | IngressError::Draining => {
+                -32005
+            }
             // Invalid params.
             IngressError::Decode(_)
             | IngressError::SignatureInvalid

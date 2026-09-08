@@ -11,6 +11,7 @@ prints one line per violation.
 """
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -194,6 +195,122 @@ must_contain(
     f"SEMANTICS_PARK_MS:-{tx_ttl_ms}",
     "chain-semantics park default equals tx_ttl_ms",
 )
+
+# --- the shard map and the generated sequencer job ------------------------------------
+# config/shard-map.toml is the routing truth. The checked-in sequencer job
+# must equal render-sequencer-job.py's steady render for it, and the ingress
+# job must read it. Outside a resize the map is the identity map over
+# partition_count, at version 0, and no resize marker exists.
+SHARD_MAP = CLUSTER / "config" / "shard-map.toml"
+if (CLUSTER / "config" / "shard-map.next.toml").exists():
+    err("config/shard-map.next.toml exists: a resize is in flight; finish it before committing")
+if not SHARD_MAP.exists():
+    err("config/shard-map.toml missing (render: scripts/render-shard-map.py --identity <lanes>)")
+else:
+    map_text = SHARD_MAP.read_text()
+    m_tab = re.search(r"^table\s*=\s*\[([^\]]*)\]", map_text, re.M | re.S)
+    m_ver = re.search(r"^version\s*=\s*(\d+)", map_text, re.M)
+    table = [int(x) for x in re.findall(r"\d+", m_tab.group(1))] if m_tab else []
+    if len(table) != 256:
+        err(f"config/shard-map.toml: table has {len(table)} entries, expected 256")
+    elif partition_count.isdigit():
+        pc = int(partition_count)
+        if max(table) + 1 != pc:
+            err(f"config/shard-map.toml: {max(table) + 1} active lanes != partition_count {pc}")
+        if m_ver and m_ver.group(1) == "0" and table != [v % pc for v in range(256)]:
+            err("config/shard-map.toml: version 0 must be the identity map lane = vslot % partition_count")
+    rendered = subprocess.run(
+        [sys.executable, str(CLUSTER / "scripts" / "render-sequencer-job.py")],
+        capture_output=True,
+        text=True,
+    )
+    if rendered.returncode != 0:
+        err(f"render-sequencer-job.py failed: {rendered.stderr.strip()}")
+    elif rendered.stdout != (jobs / "sequencer.nomad.hcl").read_text():
+        err(
+            "nomad/sequencer.nomad.hcl differs from the steady render; run "
+            "scripts/render-sequencer-job.py > nomad/sequencer.nomad.hcl"
+        )
+must_contain(jobs / "ingress.nomad.hcl", '"--shard-map", "/local/shard-map.toml"', "ingress reads the shard map")
+must_contain(jobs / "ingress.nomad.hcl", 'file("config/shard-map.toml")', "ingress job templates the shard map")
+ingress_kill = re.search(r'kill_timeout\s*=\s*"(\d+)s"', (jobs / "ingress.nomad.hcl").read_text())
+if not ingress_kill:
+    err("nomad/ingress.nomad.hcl: missing kill_timeout for the graceful drain")
+elif tx_ttl_ms.isdigit() and int(ingress_kill.group(1)) * 1000 < int(tx_ttl_ms) + 5000:
+    err(f"nomad/ingress.nomad.hcl: kill_timeout {ingress_kill.group(1)}s must cover tx_ttl_ms {tx_ttl_ms} plus 5s")
+
+
+# --- chaos.sh sender-to-shard table ------------------------------------------------
+# chaos.sh pins a case's load to a shard through ACCT_SHARD, a table over the
+# 16 funded Anvil dev accounts. Recompute it: vslot = keccak256(address)[7],
+# then the shard map. keccak-256 is inlined, so this needs no dependency.
+RC = [
+    0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
+    0x000000000000808B, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
+    0x000000000000008A, 0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
+    0x000000008000808B, 0x800000000000008B, 0x8000000000008089, 0x8000000000008003,
+    0x8000000000008002, 0x8000000000000080, 0x000000000000800A, 0x800000008000000A,
+    0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+]
+ROT = [[0, 36, 3, 41, 18], [1, 44, 10, 45, 2], [62, 6, 43, 15, 61], [28, 55, 25, 21, 56], [27, 20, 39, 8, 14]]
+MASK64 = (1 << 64) - 1
+
+
+def _rol(x: int, n: int) -> int:
+    n %= 64
+    return ((x << n) | (x >> (64 - n))) & MASK64 if n else x
+
+
+def _keccak_f(a: list[list[int]]) -> list[list[int]]:
+    for rc in RC:
+        c = [a[x][0] ^ a[x][1] ^ a[x][2] ^ a[x][3] ^ a[x][4] for x in range(5)]
+        d = [c[(x - 1) % 5] ^ _rol(c[(x + 1) % 5], 1) for x in range(5)]
+        a = [[a[x][y] ^ d[x] for y in range(5)] for x in range(5)]
+        b = [[0] * 5 for _ in range(5)]
+        for x in range(5):
+            for y in range(5):
+                b[y][(2 * x + 3 * y) % 5] = _rol(a[x][y], ROT[x][y])
+        a = [[b[x][y] ^ ((~b[(x + 1) % 5][y]) & b[(x + 2) % 5][y]) for y in range(5)] for x in range(5)]
+        a[0][0] ^= rc
+    return a
+
+
+def keccak256(data: bytes) -> bytes:
+    rate = 136
+    buf = bytearray(data)
+    buf.append(0x01)
+    while len(buf) % rate:
+        buf.append(0)
+    buf[-1] |= 0x80
+    a = [[0] * 5 for _ in range(5)]
+    for off in range(0, len(buf), rate):
+        block = buf[off : off + rate]
+        for i in range(rate // 8):
+            a[i % 5][i // 5] ^= int.from_bytes(block[8 * i : 8 * i + 8], "little")
+        a = _keccak_f(a)
+    return b"".join(a[i % 5][i // 5].to_bytes(8, "little") for i in range(4))
+
+
+assert keccak256(b"").hex() == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+
+# The Anvil dev mnemonic accounts 0..15. Genesis funds them (config/genesis/dev.toml).
+ANVIL_ACCOUNTS = [
+    "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266", "70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    "3C44CdDdB6a900fa2b585dd299e03d12FA4293BC", "90F79bf6EB2c4f870365E785982E1f101E93b906",
+    "15d34AAf54267DB7D7c367839AAf71A00a2C6A65", "9965507D1a55bcC2695C58ba16FB37d819B0A4dc",
+    "976EA74026E726554dB657fA54763abd0C3a0aa9", "14dC79964da2C08b23698B3D3cc7Ca32193d9955",
+    "23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f", "a0Ee7A142d267C1f36714E4a8F75612F20a79720",
+    "Bcd4042DE499D14e55001CcbB24a551F3b954096", "71bE63f3384f5fb98995898A86B02Fb2426c5788",
+    "FABB0ac9d68B0B445fB7357272Ff202C5651694a", "1CBd3b2770909D4e10f157cABC84C7264073C9Ec",
+    "dF3e18d64BC6A983f673Ab319CCaE4f1a57C7097", "cd3B766CCDd6AE721141F452C550Ca635964ce71",
+]
+if SHARD_MAP.exists() and len(table) == 256:
+    expected_shards = " ".join(str(table[keccak256(bytes.fromhex(a))[7]]) for a in ANVIL_ACCOUNTS)
+    m_acct = re.search(r"^ACCT_SHARD=\(([^)]*)\)", (CLUSTER / "scripts" / "chaos.sh").read_text(), re.M)
+    if not m_acct:
+        err("scripts/chaos.sh: missing ACCT_SHARD table")
+    elif " ".join(m_acct.group(1).split()) != expected_shards:
+        err(f"scripts/chaos.sh: ACCT_SHARD=({m_acct.group(1)}) but the shard map gives ({expected_shards})")
 
 # --- executor nonce query -----------------------------------------------------------
 # Every executor serves the query on ports.executor_nonce_query. Both sequencer

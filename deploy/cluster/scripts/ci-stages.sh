@@ -159,7 +159,7 @@ stage_semantics() {
     "${SEMANTICS_BIN}" \
       --rpc http://192.168.56.31:8545 --chain-id 412346 \
       --executor-metrics 192.168.56.41:9004,192.168.56.42:9004,192.168.56.43:9004 \
-      --sequencer-metrics 192.168.56.21:9001,192.168.56.22:9001 \
+      --sequencer-metrics 192.168.56.21:9001,192.168.56.22:9001,192.168.56.21:9011,192.168.56.22:9011 \
       --validator-metrics 192.168.56.61:9006 \
       --pending-receipt-timeout-ms "${SEMANTICS_PARK_MS:-30000}" \
       --account-base "${SEMANTICS_ACCOUNT_BASE:-1}" \

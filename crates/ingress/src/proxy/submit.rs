@@ -153,6 +153,10 @@ where
             count_reject("overloaded");
             return Err(IngressError::Overloaded(depth));
         }
+        if self.is_draining() {
+            count_reject("draining");
+            return Err(IngressError::Draining);
+        }
 
         if let Err(e) = self.rate_limiter.check(client_ip) {
             let _ = e; // This error carries no data.
