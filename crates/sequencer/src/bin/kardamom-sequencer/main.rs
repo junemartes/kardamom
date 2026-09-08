@@ -73,6 +73,23 @@ struct Args {
     /// `partition_index as u8`.
     #[arg(long)]
     sequencer_id: Option<u8>,
+    /// The own tx_data lane (`lane`). Defaults to the sequencer id.
+    #[arg(long, env = "KARDAMOM_LANE")]
+    lane: Option<u8>,
+    /// The vslots this replica serves (`vslots`), as ranges: `0-7,16`.
+    /// Defaults to the identity map over the partition count.
+    #[arg(long, env = "KARDAMOM_VSLOTS")]
+    vslots: Option<String>,
+    /// The old lanes to read during a resize (`extra_lanes`).
+    #[arg(long, env = "KARDAMOM_EXTRA_LANES", value_delimiter = ',')]
+    extra_lanes: Vec<u8>,
+    /// The incoming vslots that start in shadow mode (`shadow_vslots`).
+    #[arg(long, env = "KARDAMOM_SHADOW_VSLOTS")]
+    shadow_vslots: Option<String>,
+    /// The shadow warm-up in ms (`shadow_warm_ms`). Defaults to
+    /// `tx_ttl_ms + 5000`.
+    #[arg(long, env = "KARDAMOM_SHADOW_WARM_MS")]
+    shadow_warm_ms: Option<u64>,
     /// The lifetime of a transaction that waits on a nonce gap, in ms
     /// (`tx_ttl_ms`). The deploy passes the same value to the ingress as
     /// `--pending-receipt-timeout-ms`.
@@ -134,6 +151,21 @@ fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
     }
     if !args.executor_query_endpoints.is_empty() {
         cfg.lookup.executor_endpoints = args.executor_query_endpoints.clone();
+    }
+    if let Some(lane) = args.lane {
+        cfg.lane = Some(lane);
+    }
+    if let Some(text) = args.vslots.as_deref() {
+        cfg.vslots = Some(text.parse().context("--vslots")?);
+    }
+    if !args.extra_lanes.is_empty() {
+        cfg.extra_lanes = args.extra_lanes.clone();
+    }
+    if let Some(text) = args.shadow_vslots.as_deref() {
+        cfg.shadow_vslots = text.parse().context("--shadow-vslots")?;
+    }
+    if let Some(warm) = args.shadow_warm_ms {
+        cfg.shadow_warm_ms = Some(warm);
     }
     if args.partition_offset != 0 {
         // An explicit --sequencer-id combined with rotation would
@@ -207,6 +239,11 @@ async fn main() -> anyhow::Result<()> {
         partition_index = cfg.partition_index,
         sequencer_id = cfg.sequencer_id,
         tx_ttl_ms = cfg.tx_ttl_ms,
+        lane = cfg.lane(),
+        extra_lanes = ?cfg.extra_lanes,
+        vslots = %cfg.vslot_set().context("vslots")?,
+        shadow_vslots = %cfg.shadow_vslots,
+        shadow_warm_ms = cfg.shadow_warm().as_millis() as u64,
         "kardamom-sequencer starting"
     );
 
@@ -215,9 +252,19 @@ async fn main() -> anyhow::Result<()> {
         .channels;
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
 
-    let shard_id = cfg.sequencer_id;
-    let tx_data_sub = TxDataSubscriberHandle::open(&rt, &channels, shard_id)
-        .context("open TxDataSubscriberHandle")?;
+    // One subscription per lane: the own lane, then the old lanes of a
+    // resize. Every lane shares the multicast group; a lane is a stream
+    // id. The shadow warm-up starts when the sequencer is constructed,
+    // after these open.
+    let tx_data_subs: Vec<(u8, TxDataSubscriberHandle)> = cfg
+        .lanes()
+        .into_iter()
+        .map(|lane| {
+            TxDataSubscriberHandle::open(&rt, &channels, lane)
+                .with_context(|| format!("open TxDataSubscriberHandle lane={lane}"))
+                .map(|h| (lane, h))
+        })
+        .collect::<Result<_, _>>()?;
     let tx_deposits_sub = TxDepositsSubscriberHandle::open(&rt, &channels)
         .context("open TxDepositsSubscriberHandle")?;
     let tx_remote_epochs_sub = TxRemoteEpochsSubscriberHandle::open(&rt, &channels)
@@ -311,8 +358,7 @@ async fn main() -> anyhow::Result<()> {
     let receipts_task = feeds::spawn_receipt_floor_feed(
         receipts_sub,
         shutdown.clone(),
-        cfg.partition_count,
-        cfg.partition_index,
+        cfg.vslot_set().context("vslots")?,
         floor_tx.clone(),
     );
 
@@ -340,7 +386,7 @@ async fn main() -> anyhow::Result<()> {
     // origin pumps.
     let (join_main, join_deposits, join_remote_epochs) = feeds::spawn_publish_loops(
         cfg_clone,
-        LiveTxDataSub::new(tx_data_sub, shard_id),
+        LiveTxDataSub::new(tx_data_subs),
         cluster_pub.clone(),
         cluster_pub.clone(),
         cluster_pub,

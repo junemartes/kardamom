@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use crate::scenarios::Target;
 use aeron::MediaDriver;
 use sealer::SealerCluster;
-use services::{IngressOptions, ServiceSpec, Spawned, SpawnedIngress};
+use services::{IngressOptions, SequencerOptions, ServiceSpec, Spawned, SpawnedIngress};
 
 /// The dev chain id (`deploy/cluster/config/genesis/dev.toml`).
 pub const DEV_CHAIN_ID: u64 = 412_346;
@@ -630,16 +630,97 @@ impl LocalStack {
     /// the process has connected its cluster session. Scenarios that hold a
     /// [`scenarios::Target`] rebuild it: the metrics port changed.
     pub fn restart_sequencer(&mut self, index: u32) -> Result<()> {
+        let opts = SequencerOptions {
+            log_tag: "-restarted".into(),
+            ..SequencerOptions::default()
+        };
+        self.restart_sequencer_with(index, &opts)
+    }
+
+    /// [`Self::restart_sequencer`] with explicit lane-plane options: the
+    /// resize runbook restarts a shard with a new vslot set.
+    pub fn restart_sequencer_with(&mut self, index: u32, opts: &SequencerOptions) -> Result<()> {
         let i = index as usize;
         self.sequencers[i].proc.kill();
-        let mut respawned = services::spawn_sequencer(&self.service_spec(), index)?;
+        let respawned = Self::spawn_sequencer_ready(&self.service_spec(), index, opts)?;
+        self.sequencers[i] = respawned;
+        Ok(())
+    }
+
+    /// Start one more sequencer process, at the next index. The resize
+    /// runbook starts the new shard this way. The call returns once the
+    /// process has connected its cluster session.
+    pub fn add_sequencer(&mut self, opts: &SequencerOptions) -> Result<u32> {
+        let index = self.sequencers.len() as u32;
+        let spawned = Self::spawn_sequencer_ready(&self.service_spec(), index, opts)?;
+        self.sequencers.push(spawned);
+        Ok(index)
+    }
+
+    fn spawn_sequencer_ready(
+        spec: &ServiceSpec<'_>,
+        index: u32,
+        opts: &SequencerOptions,
+    ) -> Result<Spawned> {
+        let mut spawned = services::spawn_sequencer_with(spec, index, opts)?;
         crate::harness::proc::wait_for_log_line(
-            &mut respawned.proc,
+            &mut spawned.proc,
             "tx_ordering via Aeron Cluster",
             Duration::from_secs(60),
         )?;
-        self.sequencers[i] = respawned;
+        Ok(spawned)
+    }
+
+    /// The metrics address of sequencer `index`.
+    pub fn sequencer_metrics(&self, index: u32) -> std::net::SocketAddr {
+        self.sequencers[index as usize].metrics_addr
+    }
+
+    /// Kill the ingress and start a fresh one on the same RPC port, with
+    /// `shard_map` as its `--shard-map`. This is the resize runbook's
+    /// "switch the ingress" step. Parked submits die with the old process;
+    /// clients see a transport error and resubmit. The call returns once
+    /// the new process listens.
+    pub fn restart_ingress(&mut self, shard_map: Option<&Path>) -> Result<()> {
+        let port: u16 = self
+            .ingress
+            .rpc_url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .context("ingress rpc port")?;
+        self.ingress.proc.kill();
+        let mut respawned = services::spawn_ingress_at(
+            &self.service_spec(),
+            &self.cfg.ingress,
+            Some(port),
+            shard_map,
+        )?;
+        crate::harness::proc::wait_for_log_line(
+            &mut respawned.proc,
+            "JSON-RPC listening",
+            Duration::from_secs(60),
+        )?;
+        self.ingress = respawned;
         Ok(())
+    }
+
+    /// Write `map` as a `--shard-map` TOML file in the stack root.
+    pub fn write_shard_map(&self, map: &kardamom_types::shard_map::ShardMap) -> Result<PathBuf> {
+        let path = self
+            .root
+            .path()
+            .join(format!("shard-map-v{}.toml", map.version()));
+        let table: Vec<String> = map.table().iter().map(|l| l.to_string()).collect();
+        std::fs::write(
+            &path,
+            format!(
+                "version = {}\ntable = [{}]\n",
+                map.version(),
+                table.join(", ")
+            ),
+        )?;
+        Ok(path)
     }
 
     /// Restart the executor against the same state directory and metrics

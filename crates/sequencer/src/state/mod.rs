@@ -238,6 +238,18 @@ impl<T> PartitionState<T> {
         self.pending.values().map(PendingBuffer::len).sum()
     }
 
+    /// The parked entries per bucket, where `bucket` maps a sender to its
+    /// bucket (the vslot). The cost is one call per sender with a buffer.
+    pub fn pending_depth_by<F: Fn(Address) -> u8>(&self, bucket: F) -> [u32; 256] {
+        let mut out = [0u32; 256];
+        for (sender, buf) in &self.pending {
+            if !buf.is_empty() {
+                out[bucket(*sender) as usize] += buf.len() as u32;
+            }
+        }
+        out
+    }
+
     /// Walk every sender whose pending buffer has an entry at its expected
     /// next nonce, and emit `Publish` actions for the contiguous run. The
     /// primary loop uses this to flush backpressured-then-rebuffered

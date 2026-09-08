@@ -17,7 +17,7 @@ use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;
-use kardamom_sequencer::inbound::TxDataSubscriber;
+use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
 use kardamom_sequencer::outbound::fakes::{
     InMemoryTxErrorPublisher, InMemoryTxOrderingRefPublisher,
 };
@@ -25,12 +25,12 @@ use kardamom_sequencer::sequencer::Sequencer;
 
 struct DequeTxData(VecDeque<(TxDataLoc, TxEnvelope)>);
 impl TxDataSubscriber for DequeTxData {
-    fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError> {
-        Ok(self.0.pop_front())
-    }
-
-    fn lane(&self) -> u8 {
-        0
+    fn poll(&mut self) -> Result<Option<Inbound>, SequencerError> {
+        Ok(self.0.pop_front().map(|(loc, envelope)| Inbound {
+            lane: 0,
+            loc,
+            envelope,
+        }))
     }
 }
 

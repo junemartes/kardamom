@@ -23,7 +23,6 @@ use crate::error::IngressError;
 use crate::pending::PendingReceipts;
 use crate::rate_limit::PerIpLimiter;
 use crate::receipt_cache::ReceiptCache;
-use crate::routing::partition_for;
 use crate::seen_receipts::SeenReceipts;
 use crate::sig_verify::BatchVerifier;
 use crate::tx_error_dedup::TxErrorDedup;
@@ -250,7 +249,7 @@ where
     /// and tooling use this.
     #[inline]
     pub fn partition_for(&self, sender: alloy_primitives::Address) -> u32 {
-        partition_for(sender, self.cfg.partition_count_m)
+        self.cfg.lane_for(sender)
     }
 
     /// Read-only access to the configured `IngressConfig`.

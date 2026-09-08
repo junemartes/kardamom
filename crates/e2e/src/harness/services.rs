@@ -231,14 +231,48 @@ pub struct Spawned {
     pub state_dir: Option<PathBuf>,
 }
 
+/// The lane-plane knobs of one sequencer process. The default is the
+/// identity map: lane `index`, the slots of partition `index` under
+/// `partition_count = shards`. A resize sets the rest. See
+/// `docs/specs/dynamic-sequencer-sizing.md`, section 3.5.
+#[derive(Clone, Debug, Default)]
+pub struct SequencerOptions {
+    /// `--partition-count`. Defaults to the stack's shard count.
+    pub partition_count: Option<u32>,
+    /// `--lane`.
+    pub lane: Option<u8>,
+    /// `--vslots`, in the text form `0-7,16`.
+    pub vslots: Option<String>,
+    /// `--extra-lanes`.
+    pub extra_lanes: Vec<u8>,
+    /// `--shadow-vslots`.
+    pub shadow_vslots: Option<String>,
+    /// `--shadow-warm-ms`.
+    pub shadow_warm: Option<Duration>,
+    /// A suffix for the log file name, so a restarted process does not
+    /// overwrite the log of the one it replaced.
+    pub log_tag: String,
+}
+
 pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
-    let cfg_path = spec.root.join(format!("sequencer-{index}.toml"));
+    spawn_sequencer_with(spec, index, &SequencerOptions::default())
+}
+
+pub fn spawn_sequencer_with(
+    spec: &ServiceSpec<'_>,
+    index: u32,
+    opts: &SequencerOptions,
+) -> Result<Spawned> {
+    let partition_count = opts.partition_count.unwrap_or(spec.shards);
+    let cfg_path = spec
+        .root
+        .join(format!("sequencer-{index}{}.toml", opts.log_tag));
     std::fs::write(
         &cfg_path,
         format!(
             "partition_count = {}\npartition_index = 0\nsequencer_id = 0\n\
              max_pending_per_sender = 512\nbackpressure_policy = \"return_immediately\"\n\n{}",
-            spec.shards,
+            partition_count,
             cluster_toml(spec.cluster_ingress_endpoints)
         ),
     )?;
@@ -250,9 +284,25 @@ pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
         .arg("--aeron-dir")
         .arg(spec.aeron_dir)
         .args(["--partition-index", &index.to_string()])
-        .args(["--partition-count", &spec.shards.to_string()])
-        .args(["--sequencer-id", &index.to_string()])
-        .args(["--tx-ttl-ms", &spec.tx_ttl.as_millis().to_string()])
+        .args(["--partition-count", &partition_count.to_string()])
+        .args(["--sequencer-id", &index.to_string()]);
+    if let Some(lane) = opts.lane {
+        cmd.args(["--lane", &lane.to_string()]);
+    }
+    if let Some(v) = opts.vslots.as_deref() {
+        cmd.args(["--vslots", v]);
+    }
+    if !opts.extra_lanes.is_empty() {
+        let lanes: Vec<String> = opts.extra_lanes.iter().map(|l| l.to_string()).collect();
+        cmd.args(["--extra-lanes", &lanes.join(",")]);
+    }
+    if let Some(v) = opts.shadow_vslots.as_deref() {
+        cmd.args(["--shadow-vslots", v]);
+    }
+    if let Some(warm) = opts.shadow_warm {
+        cmd.args(["--shadow-warm-ms", &warm.as_millis().to_string()]);
+    }
+    cmd.args(["--tx-ttl-ms", &spec.tx_ttl.as_millis().to_string()])
         .args([
             "--executor-query-endpoints",
             &format!("http://{}", spec.executor_query),
@@ -268,7 +318,8 @@ pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
     let proc = Proc::spawn(
         &format!("sequencer-{index}"),
         cmd,
-        spec.root.join(format!("sequencer-{index}.log")),
+        spec.root
+            .join(format!("sequencer-{index}{}.log", opts.log_tag)),
     )?;
     Ok(Spawned {
         proc,
@@ -454,18 +505,36 @@ pub struct SpawnedIngress {
 }
 
 pub fn spawn_ingress(spec: &ServiceSpec<'_>, opts: &IngressOptions) -> Result<SpawnedIngress> {
+    spawn_ingress_at(spec, opts, None, None)
+}
+
+/// Spawn the ingress, or respawn it. `fixed_rpc_port` keeps the RPC URL
+/// scenarios already hold. `shard_map` is the `--shard-map` file of a
+/// resize; `None` is the identity map over the shard count.
+pub fn spawn_ingress_at(
+    spec: &ServiceSpec<'_>,
+    opts: &IngressOptions,
+    fixed_rpc_port: Option<u16>,
+    shard_map: Option<&Path>,
+) -> Result<SpawnedIngress> {
     let cfg_path = spec.root.join("ingress.toml");
     std::fs::write(&cfg_path, cluster_toml(spec.cluster_ingress_endpoints))?;
     let metrics_port = free_tcp_port()?;
-    let rpc_port = free_tcp_port()?;
+    let rpc_port = match fixed_rpc_port {
+        Some(p) => p,
+        None => free_tcp_port()?,
+    };
     let mut cmd = Command::new(bin("kardamom-ingress")?);
     cmd.arg("--config")
         .arg(&cfg_path)
         .arg("--aeron-dir")
         .arg(spec.aeron_dir)
         .args(["--jsonrpc-bind", &format!("127.0.0.1:{rpc_port}")])
-        .args(["--shards", &spec.shards.to_string()])
-        .args(["--ack-policy", "on-offer"])
+        .args(["--shards", &spec.shards.to_string()]);
+    if let Some(map) = shard_map {
+        cmd.arg("--shard-map").arg(map);
+    }
+    cmd.args(["--ack-policy", "on-offer"])
         .args(["--chain-id", &spec.chain_id.to_string()])
         .args([
             "--pending-receipt-timeout-ms",
@@ -486,7 +555,12 @@ pub fn spawn_ingress(spec: &ServiceSpec<'_>, opts: &IngressOptions) -> Result<Sp
         cmd.arg("--archive-durability");
     }
     common_service_env(&mut cmd);
-    let proc = Proc::spawn("ingress", cmd, spec.root.join("ingress.log"))?;
+    let log_name = if fixed_rpc_port.is_some() {
+        "ingress-restarted.log"
+    } else {
+        "ingress.log"
+    };
+    let proc = Proc::spawn("ingress", cmd, spec.root.join(log_name))?;
     Ok(SpawnedIngress {
         proc,
         metrics_addr: format!("127.0.0.1:{metrics_port}").parse()?,

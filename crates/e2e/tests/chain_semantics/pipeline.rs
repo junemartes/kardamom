@@ -15,6 +15,26 @@ async fn s3_nonces_unordered_all_land() {
         .expect("S3");
 }
 
+/// The resize protocol, scripted from 2 to 3 shards under load: zero
+/// loss within `tx_ttl`, and no wedge. Milestone 5's exit criterion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
+async fn s16_scripted_resize_moves_senders_with_zero_loss() {
+    let park = Duration::from_secs(4);
+    let mut stack = LocalStack::launch(StackConfig {
+        ingress: IngressOptions {
+            pending_receipt_timeout: park,
+            ..IngressOptions::default()
+        },
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack");
+    resize::run(&mut stack, resize::Params::default())
+        .await
+        .expect("S16");
+}
+
 /// F02.1: a restarted sequencer regains an established sender through the
 /// executor nonce lookup, with no twin to publish a receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

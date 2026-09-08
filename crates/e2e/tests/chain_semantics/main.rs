@@ -28,7 +28,7 @@ use e2e::harness::services::IngressOptions;
 use e2e::harness::{LocalStack, StackConfig};
 use e2e::scenarios::{
     bridge, consistency, crash_recovery, da_parity, derivation, divergence, nonce_gap,
-    nonce_unordered, rpc_liveness, rpc_vectors, sequencer_restart, upgrade,
+    nonce_unordered, resize, rpc_liveness, rpc_vectors, sequencer_restart, upgrade,
 };
 
 /// The client request bound. It stays above every server park bound
