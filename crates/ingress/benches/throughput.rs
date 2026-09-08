@@ -4,43 +4,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
-use alloy_primitives::{Address, B256, Bytes, Signature, TxKind, U256};
-use alloy_rlp::Encodable;
+use alloy_primitives::Bytes;
 use alloy_signer_local::PrivateKeySigner;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use k256::ecdsa::{RecoveryId, signature::hazmat::PrehashSigner};
 
 use kardamom_ingress::config::IngressConfig;
+use kardamom_ingress::test_support::{receipt_for, sign_legacy};
 use kardamom_ingress::{IngressProxy, MockChannels};
-use kardamom_types::{BPosition, QuorumWatermark, Receipt};
-
-fn sign(s: &PrivateKeySigner, nonce: u64) -> Bytes {
-    let tx = TxLegacy {
-        chain_id: Some(1),
-        nonce,
-        gas_price: 1_000_000_000,
-        gas_limit: 21_000,
-        to: TxKind::Call(Address::ZERO),
-        value: U256::ZERO,
-        input: Default::default(),
-    };
-    let (sig, rid): (k256::ecdsa::Signature, RecoveryId) = s
-        .credential()
-        .sign_prehash(tx.signature_hash().as_slice())
-        .unwrap();
-    let alloy_sig = Signature::from_signature_and_parity(sig, rid.is_y_odd());
-    let env: TxEnvelope = tx.into_signed(alloy_sig).into();
-    let mut buf = Vec::new();
-    env.encode(&mut buf);
-    Bytes::from(buf)
-}
-
-fn nonce_of(raw: &bytes::Bytes) -> u64 {
-    use alloy_consensus::transaction::Transaction;
-    use alloy_rlp::Decodable;
-    TxEnvelope::decode(&mut raw.as_ref()).unwrap().nonce()
-}
+use kardamom_types::{BPosition, QuorumWatermark};
 
 const BATCH: usize = 1024;
 
@@ -66,21 +37,10 @@ fn bench_throughput(c: &mut Criterion) {
                 while let Some(envelope) = rx.recv().await {
                     local += 1;
                     let pos = BPosition {
-                        term_id: i as i32,
+                        term_id: i32::try_from(i).expect("shard count fits in i32"),
                         term_offset: local,
                     };
-                    let nonce = nonce_of(&envelope.raw_tx);
-                    let receipt = Receipt {
-                        tx_idx: pos,
-                        tx_hash: envelope.tx_hash,
-                        status: true,
-                        gas_used: 21_000,
-                        logs: Vec::new(),
-                        write_set_hash: B256::ZERO,
-                        from: envelope.sender,
-                        nonce,
-                        ..Default::default()
-                    };
+                    let receipt = receipt_for(&envelope, pos);
                     let _ = receipt_bus.send(receipt);
                     let _ = watermark_bus.send(QuorumWatermark { position: pos });
                 }
@@ -89,7 +49,7 @@ fn bench_throughput(c: &mut Criterion) {
         proxy
     });
     let pre: Vec<Bytes> = (0..BATCH)
-        .map(|_| sign(&PrivateKeySigner::random(), 0))
+        .map(|_| sign_legacy(&PrivateKeySigner::random(), 0))
         .collect();
 
     let mut group = c.benchmark_group("ingress/throughput");

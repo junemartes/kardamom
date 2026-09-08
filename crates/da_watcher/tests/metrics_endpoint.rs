@@ -29,10 +29,10 @@ async fn da_watcher_metrics_endpoint_serves_expected_counters() {
 }
 
 fn free_port() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = l.local_addr().unwrap();
-    drop(l);
-    a
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
 }
 
 async fn scrape(url: &str) -> String {

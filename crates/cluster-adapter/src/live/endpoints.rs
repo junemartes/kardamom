@@ -59,13 +59,9 @@ pub(super) fn open_next_member_pub(
     }
     let start = ids.iter().position(|&id| id == current).unwrap_or(0);
     // Try every member once, starting from the one after `current`.
-    for step in 1..=ids.len() {
-        let id = ids[(start + step) % ids.len()];
-        if let Some(p) = open_leader_pub(rt, endpoints, id, stream_id) {
-            return Some((id, p));
-        }
-    }
-    None
+    (1..=ids.len())
+        .map(|step| ids[(start + step) % ids.len()])
+        .find_map(|id| open_leader_pub(rt, endpoints, id, stream_id).map(|p| (id, p)))
 }
 
 pub(super) fn to_aligned(bytes: &[u8]) -> AlignedVec {
@@ -77,8 +73,7 @@ pub(super) fn to_aligned(bytes: &[u8]) -> AlignedVec {
 pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

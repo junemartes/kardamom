@@ -32,7 +32,9 @@ mod manifest;
 #[cfg(test)]
 mod tests;
 
-pub use manifest::{CheckpointManifest, manifest_path, read_manifest, verify_checkpoint};
+#[cfg(test)]
+pub(crate) use manifest::manifest_path;
+pub(crate) use manifest::{CheckpointManifest, read_manifest, verify_checkpoint};
 
 use manifest::stored_genesis_digest;
 pub(crate) use manifest::{check_image_identity, file_keccak, publish_checkpoint};
@@ -64,16 +66,56 @@ pub(crate) fn checkpoint_name(block: u64) -> String {
     format!("checkpoint-{block:018}")
 }
 
-pub(crate) fn parse_checkpoint_block(name: &str) -> Option<u64> {
-    name.strip_prefix("checkpoint-")
-        .and_then(|s| s.parse().ok())
+/// What a directory entry name means, in any of the places this module
+/// scans a directory: a checkpoints directory (`Checkpoint`, `Tmp`), or a
+/// single checkpoint's, or the state directory's, own listing
+/// (`MdbxData`). Parsed once per entry name; each scanner matches on the
+/// variant it cares about and ignores the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckpointEntry {
+    /// A `checkpoint-<block>` entry. [`checkpoint_name`] is the encoder.
+    Checkpoint(u64),
+    /// A hidden `.checkpoint-*.tmp` entry, left by a writer that crashed
+    /// mid-compact.
+    Tmp,
+    /// An mdbx data file, using either naming convention the mdbx build
+    /// may use: subdir-mode `mdbx.dat` or `data.mdbx`, or any name
+    /// ending in `.dat`.
+    MdbxData,
+    /// Anything else: a `.rejected-*` quarantined image, an operator
+    /// file, or an unrelated entry.
+    Other,
 }
 
-/// Returns true if `name` names an mdbx data file, using either naming
-/// convention the mdbx build may use: subdir-mode `mdbx.dat` or
-/// `data.mdbx`, or any name ending in `.dat`.
-fn is_mdbx_data_name(name: &str) -> bool {
-    name.ends_with(".dat") || name == "mdbx.dat" || name == "data.mdbx"
+impl CheckpointEntry {
+    fn parse(name: &str) -> Self {
+        if let Some(block) = name
+            .strip_prefix("checkpoint-")
+            .and_then(|s| s.parse().ok())
+        {
+            return Self::Checkpoint(block);
+        }
+        #[allow(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = "this crate is the only writer of the .tmp suffix (see create_checkpoint), \
+                      always lowercase; a case-insensitive match would accept names this crate \
+                      itself never produces"
+        )]
+        let is_tmp = name.starts_with(".checkpoint-") && name.ends_with(".tmp");
+        if is_tmp {
+            return Self::Tmp;
+        }
+        #[allow(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = "mdbx always emits a lowercase extension; a case-insensitive match would \
+                      accept names mdbx itself never produces"
+        )]
+        let is_mdbx_data = name.ends_with(".dat") || name == "mdbx.dat" || name == "data.mdbx";
+        if is_mdbx_data {
+            return Self::MdbxData;
+        }
+        Self::Other
+    }
 }
 
 /// Delete `path`, whether it is a directory or a single file. A
@@ -97,12 +139,31 @@ fn read_dir_or_absent(dir: &Path) -> Result<Option<std::fs::ReadDir>, StateError
     }
 }
 
+/// List `dir`'s entries as `(name, path)` pairs, or an empty list if
+/// `dir` does not exist. Every scanner in this module reads a directory
+/// this way, then matches [`CheckpointEntry::parse`] on the name.
+fn entry_names(dir: &Path) -> Result<Vec<(String, PathBuf)>, StateError> {
+    let Some(rd) = read_dir_or_absent(dir)? else {
+        return Ok(Vec::new());
+    };
+    rd.map(|e| {
+        let e = e?;
+        Ok((e.file_name().to_string_lossy().into_owned(), e.path()))
+    })
+    .collect()
+}
+
 /// Create a checkpoint of `env` under `checkpoints_dir`, named by its
 /// committed block. Returns the checkpoint's block and path.
 ///
 /// If a checkpoint for the same block already exists, this function
 /// treats it as a no-op success. It is idempotent. The live env stays
 /// online throughout.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the checkpoints directory, the compaction,
+/// or the manifest write fails.
 pub fn create_checkpoint(
     env: &StateEnv,
     checkpoints_dir: &Path,
@@ -138,12 +199,9 @@ pub fn create_checkpoint(
 /// crashed mid-compact. This is safe to run before compacting, because
 /// each directory has a single checkpoint writer.
 fn sweep_stale_tmp(checkpoints_dir: &Path) -> Result<(), StateError> {
-    for entry in std::fs::read_dir(checkpoints_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let s = name.to_string_lossy();
-        if s.starts_with(".checkpoint-") && s.ends_with(".tmp") {
-            remove_dir_or_file(&entry.path())?;
+    for (name, path) in entry_names(checkpoints_dir)? {
+        if CheckpointEntry::parse(&name) == CheckpointEntry::Tmp {
+            remove_dir_or_file(&path)?;
         }
     }
     Ok(())
@@ -153,40 +211,40 @@ fn sweep_stale_tmp(checkpoints_dir: &Path) -> Result<(), StateError> {
 /// `None` if there are none, or the directory does not exist. A
 /// checkpoint is either a directory holding `mdbx.dat`, or a single
 /// file, depending on the mdbx build.
-pub fn latest_checkpoint(checkpoints_dir: &Path) -> Result<Option<CheckpointInfo>, StateError> {
-    let Some(rd) = read_dir_or_absent(checkpoints_dir)? else {
-        return Ok(None);
-    };
-    let mut best: Option<CheckpointInfo> = None;
-    for entry in rd {
-        let entry = entry?;
-        let name = entry.file_name();
-        if let Some(block) = parse_checkpoint_block(&name.to_string_lossy())
-            && best.as_ref().is_none_or(|b| block > b.block)
-        {
-            best = Some(CheckpointInfo {
-                block,
-                path: entry.path(),
-            });
-        }
-    }
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the directory listing fails partway through.
+pub(crate) fn latest_checkpoint(
+    checkpoints_dir: &Path,
+) -> Result<Option<CheckpointInfo>, StateError> {
+    let best = entry_names(checkpoints_dir)?
+        .into_iter()
+        .filter_map(|(name, path)| match CheckpointEntry::parse(&name) {
+            CheckpointEntry::Checkpoint(block) => Some(CheckpointInfo { block, path }),
+            CheckpointEntry::Tmp | CheckpointEntry::MdbxData | CheckpointEntry::Other => None,
+        })
+        // `min_by_key` keeps the first of equal keys, unlike `max_by_key`
+        // (which keeps the last); this matches the original loop's
+        // `block > best.block` strict comparison.
+        .min_by_key(|c| std::cmp::Reverse(c.block));
     Ok(best)
 }
 
 /// Delete every checkpoint older than the `keep_from` block, and keep
 /// newer ones. Returns how many were removed. This bounds checkpoint
 /// disk use.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the directory listing or a removal fails.
 pub fn prune_checkpoints(checkpoints_dir: &Path, keep_from: u64) -> Result<usize, StateError> {
-    let Some(rd) = read_dir_or_absent(checkpoints_dir)? else {
-        return Ok(0);
-    };
-    let mut removed = 0;
-    for entry in rd {
-        let entry = entry?;
-        if let Some(block) = parse_checkpoint_block(&entry.file_name().to_string_lossy())
+    let mut removed = 0usize;
+    for (name, path) in entry_names(checkpoints_dir)? {
+        if let CheckpointEntry::Checkpoint(block) = CheckpointEntry::parse(&name)
             && block < keep_from
         {
-            remove_dir_or_file(&entry.path())?;
+            remove_dir_or_file(&path)?;
             removed += 1;
         }
     }
@@ -197,7 +255,13 @@ pub fn prune_checkpoints(checkpoints_dir: &Path, keep_from: u64) -> Result<usize
 /// absent. This copies the compacted mdbx env files across, and returns
 /// the restored `last_committed_block`. The caller then opens
 /// `state_dir` normally, and the standard resume path replays the tail.
-pub fn restore_checkpoint(
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the checkpoint fails verification, if
+/// `state_dir` already holds a populated state DB, or if the file copy
+/// fails.
+pub(crate) fn restore_checkpoint(
     checkpoint: &Path,
     state_dir: &Path,
     expected_genesis: Option<B256>,
@@ -241,6 +305,11 @@ pub fn restore_checkpoint(
 /// wedge the node in a restart loop.
 ///
 /// Returns `Ok(None)` when no restorable checkpoint remains.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the checkpoint directory cannot be listed, or
+/// if a checkpoint fails verification and then cannot even be quarantined.
 pub fn restore_best_checkpoint(
     checkpoints_dir: &Path,
     state_dir: &Path,
@@ -261,8 +330,7 @@ pub fn restore_best_checkpoint(
                 let name = ckpt
                     .path
                     .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "checkpoint".into());
+                    .map_or_else(|| "checkpoint".into(), |n| n.to_string_lossy().into_owned());
                 let rejected = ckpt.path.with_file_name(format!(".rejected-{name}"));
                 warn!(
                     checkpoint = %ckpt.path.display(),
@@ -272,15 +340,24 @@ pub fn restore_best_checkpoint(
                 );
                 // If even the rename fails, the loop cannot make progress.
                 // Report the original refusal instead of spinning.
-                std::fs::rename(&ckpt.path, &rejected).map_err(|re| {
-                    StateError::Recovery(format!(
-                        "checkpoint {} failed verification ({e}) and could not be                          quarantined: {re}",
-                        ckpt.path.display()
-                    ))
-                })?;
+                std::fs::rename(&ckpt.path, &rejected)
+                    .map_err(|re| quarantine_failed_message(&ckpt.path, &e, &re))?;
             }
         }
     }
+}
+
+/// Builds the error for a checkpoint that failed verification and could
+/// not be quarantined. Its text has a unit test.
+fn quarantine_failed_message(
+    path: &Path,
+    verify_err: &StateError,
+    rename_err: &std::io::Error,
+) -> StateError {
+    StateError::Recovery(format!(
+        "checkpoint {} failed verification ({verify_err}) and could not be quarantined: {rename_err}",
+        path.display()
+    ))
 }
 
 /// Resolve a checkpoint's mdbx data file. This is either
@@ -308,12 +385,9 @@ pub(crate) fn checkpoint_data_file(checkpoint: &Path) -> Result<PathBuf, StateEr
 
 /// Find the mdbx data file inside a subdir-mode checkpoint directory.
 fn find_mdbx_data(dir: &Path) -> Result<Option<PathBuf>, StateError> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let s = name.to_string_lossy();
-        if entry.path().is_file() && is_mdbx_data_name(&s) {
-            return Ok(Some(entry.path()));
+    for (name, path) in entry_names(dir)? {
+        if path.is_file() && CheckpointEntry::parse(&name) == CheckpointEntry::MdbxData {
+            return Ok(Some(path));
         }
     }
     Ok(None)
@@ -328,6 +402,11 @@ fn find_mdbx_data(dir: &Path) -> Result<Option<PathBuf>, StateError> {
 /// The resync fallback uses this. A cursor below the cluster's
 /// retention floor can never catch up, so its DB is unusable as-is. But
 /// an automated path must not delete state outright.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the directory listing, or a remove or
+/// rename, fails.
 pub fn park_state_db(state_dir: &Path) -> Result<Option<PathBuf>, StateError> {
     if !has_state_db(state_dir)? {
         return Ok(None);
@@ -355,15 +434,12 @@ pub fn park_state_db(state_dir: &Path) -> Result<Option<PathBuf>, StateError> {
 /// a checkpoint, when the directory is empty, or resume the existing
 /// DB. This check does not open the env, which would itself create the
 /// data file.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the directory listing fails partway through.
 pub fn has_state_db(dir: &Path) -> Result<bool, StateError> {
-    let Some(rd) = read_dir_or_absent(dir)? else {
-        return Ok(false);
-    };
-    for entry in rd {
-        let name = entry?.file_name();
-        if is_mdbx_data_name(&name.to_string_lossy()) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(entry_names(dir)?
+        .iter()
+        .any(|(name, _)| CheckpointEntry::parse(name) == CheckpointEntry::MdbxData))
 }

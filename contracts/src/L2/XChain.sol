@@ -17,6 +17,12 @@ library XChain {
     address internal constant INBOX = 0x42000000000000000000000000000000000000e1;
 
     /// @notice Response requested by a message sender. Zeroed = none.
+    /// @dev    Only the fully zeroed struct is "none" (`isNone`). A struct
+    ///         with `target == address(0)` and a nonzero `context` or
+    ///         `gasLimit` is a real callback: the response goes to address
+    ///         zero on the origin and uses one seq. The Rust side treats it
+    ///         the same way. A sender that wants no response must zero all
+    ///         three fields.
     struct Callback {
         address target; // contract on the ORIGIN chain
         uint64 gasLimit; // response delivery budget on the origin

@@ -9,6 +9,7 @@
 //! sequencer in-process. This test proves the same guarantee through
 //! `eth_sendRawTransaction`.
 
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use alloy_primitives::Address;
@@ -18,8 +19,8 @@ use super::{SeqCounters, Target};
 use crate::harness::l2::{self, SignedTransfer};
 
 pub struct Params {
-    pub senders: usize,
-    pub txs_per_sender: usize,
+    pub senders: NonZeroUsize,
+    pub txs_per_sender: NonZeroUsize,
     /// First dev-mnemonic account index to use. Senders occupy the range
     /// `sender_base..sender_base+senders`.
     pub sender_base: usize,
@@ -29,31 +30,55 @@ pub struct Params {
 impl Default for Params {
     fn default() -> Self {
         Self {
-            senders: 8,
-            txs_per_sender: 64,
+            senders: NonZeroUsize::new(8).unwrap(),
+            txs_per_sender: NonZeroUsize::new(64).unwrap(),
             sender_base: 1,
             shuffle_seed: 0xC0FF_EED0_0D42,
         }
     }
 }
 
+/// # Errors
+/// Returns an error when a transfer fails to sign or send, when fewer
+/// transactions land than were submitted, when the executor's applied
+/// count does not match, when the sequencer's health counters moved, or
+/// when a spot-checked receipt is missing.
 pub async fn run(t: &Target, p: Params) -> Result<()> {
-    let signers = l2::dev_signers((p.sender_base + p.senders) as u32)?;
+    // This is a total signer count already (not a highest index), so it
+    // takes no `+ 1`.
+    let signers = l2::dev_signers_total(
+        p.sender_base
+            .checked_add(p.senders.get())
+            .context("sender_base + senders overflows")?,
+    )?;
     let to = Address::from([0x51u8; 20]);
     let baseline = SeqCounters::snapshot(t).await?;
     let applied_before = t
-        .executor_metric(super::EXEC_TX_APPLIED)
-        .await
+        .executor_metric_opt(super::EXEC_TX_APPLIED)
+        .await?
         .unwrap_or(0.0);
+
+    // `senders * txs_per_sender` sizes the whole run; a Params product this
+    // large must fail loudly rather than silently wrap the allocation.
+    let total = p
+        .senders
+        .get()
+        .checked_mul(p.txs_per_sender.get())
+        .context("senders * txs_per_sender overflows")?;
 
     // Sign a dense nonce run for each sender, then shuffle each run on its
     // own (a per-sender seed offset makes the orders differ).
-    let mut planned: Vec<SignedTransfer> = Vec::with_capacity(p.senders * p.txs_per_sender);
+    let mut planned: Vec<SignedTransfer> = Vec::with_capacity(total);
     for (i, signer) in signers[p.sender_base..].iter().enumerate() {
-        let mut run: Vec<SignedTransfer> = (0..p.txs_per_sender)
+        let mut run: Vec<SignedTransfer> = (0..p.txs_per_sender.get())
             .map(|n| l2::sign_transfer(signer, t.chain_id, n as u64, to, 1))
             .collect::<Result<_>>()?;
-        l2::seeded_shuffle(&mut run, p.shuffle_seed + i as u64 + 1);
+        // A wrapped-to-zero sum (only reachable with a shuffle_seed within
+        // `senders` of u64::MAX) falls back to the minimum seed, instead of
+        // panicking.
+        let seed = std::num::NonZeroU64::new(p.shuffle_seed.wrapping_add(i as u64).wrapping_add(1))
+            .unwrap_or(std::num::NonZeroU64::MIN);
+        l2::seeded_shuffle(&mut run, seed);
         planned.extend(run);
     }
 
@@ -69,7 +94,6 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         });
     }
 
-    let total = p.senders * p.txs_per_sender;
     let mut landed = 0usize;
     while let Some(joined) = set.join_next().await {
         let (tx, out) = joined.context("submit task join")?;
@@ -92,15 +116,27 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
     }
     anyhow::ensure!(landed == total, "landed {landed}/{total}");
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "total is a test-parameter-sized transaction count, always small enough for \
+                   f64 to represent exactly"
+    )]
+    let total_f64 = total as f64;
     // The executor applied exactly the batch. Wait, with a time limit, for
     // the counter to catch up with the last acks.
-    t.wait_executor_applied(applied_before + total as f64, Duration::from_secs(30))
+    t.wait_executor_applied(applied_before + total_f64, Duration::from_secs(30))
         .await?;
     let applied_after = t.executor_metric(super::EXEC_TX_APPLIED).await?;
+    let expected_applied = applied_before + total_f64;
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact equality is the intended check: an executor that applied exactly the \
+                   batch scrapes back bit-identical to the sum computed here"
+    )]
+    let applied_matches = applied_after == expected_applied;
     anyhow::ensure!(
-        applied_after == applied_before + total as f64,
-        "executor applied {applied_after} != {} + {total}",
-        applied_before
+        applied_matches,
+        "executor applied {applied_after} != {expected_applied}"
     );
 
     // No past-nonce drops and no reorder-buffer sheds: the pipeline
@@ -109,7 +145,7 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
 
     // Each receipt is queryable on its own. Spot-check one receipt per
     // sender.
-    for i in 0..p.senders {
+    for i in 0..p.senders.get() {
         let signer = &signers[p.sender_base + i];
         let probe = l2::sign_transfer(signer, t.chain_id, 0, to, 1)?;
         let r = t.rpc.receipt(probe.hash).await;

@@ -1,18 +1,6 @@
 //! Footprint classifier: for each `(to, selector)` pair, learn which state
 //! cells a call touches, from the slot addresses the BAL already reports.
 //!
-//! An earlier version recovered mapping base slots by keccak inversion:
-//! it tested observed slots against `keccak(pad(sender|arg) ++ pad(p))` for
-//! small `p`, so a mapping entry could be predicted for a caller never seen
-//! before. Measurement removed this: it changed no schedule on any
-//! workload, while it cost most of the CPU time before caching.
-//!
-//! Two txs share a derived key only when they touch the same mapping
-//! entry. In practice such pairs already share something the cheap tiers
-//! predict: the pool's fixed reserve slots, or their own sender accounts.
-//! So derived keys produced cells that never matched between transactions:
-//! cost with no benefit.
-//!
 //! What remains needs no hashing at all:
 //! - Tier 1, from the envelope: the sender's account cell, and the
 //!   recipient's account cell when value moves.
@@ -79,6 +67,7 @@ pub struct Stats {
 }
 
 impl Stats {
+    #[must_use]
     pub fn learn(obs: &[TxObs]) -> Self {
         let mut s = Self::default();
         for o in obs {
@@ -113,9 +102,52 @@ impl Stats {
         }
     }
 
+    /// True when `n` observations out of `observations` total meet the
+    /// fixed-prediction bar: seen on at least 60% of calls. The one
+    /// spelling of this threshold; `predict`, `predict_domains`, and
+    /// `class_shares` all read it through here.
+    fn is_frequent(n: u64, observations: u64) -> bool {
+        n.saturating_mul(10) >= observations.saturating_mul(6)
+    }
+
+    /// Tier 2/3 predicted keys for a trained selector: fixed slots and
+    /// frequently touched accounts, each named through the caller's own
+    /// key type. `account`/`fixed` let [`Stats::predict`] and
+    /// [`Stats::predict_domains`] share this one walk of `slot_seen`/
+    /// `account_seen` while returning `Cell`s or `DomainKey`s
+    /// respectively.
+    ///
+    /// Returns `Some(vec![])` for a tx with no selector (tier 1 is the
+    /// whole footprint, exact and never cold), and `None` when the
+    /// selector was never trained (cold — `Tail` in the scheduler).
+    fn predicted_keys<K>(
+        &self,
+        o: &TxObs,
+        account: impl Fn(Address) -> K,
+        fixed: impl Fn(Address, B256) -> K,
+    ) -> Option<Vec<K>> {
+        let (Some(to), Some(sel)) = (o.to, o.selector) else {
+            return Some(Vec::new());
+        };
+        let e = self.by_selector.get(&(to, sel))?;
+        let mut keys = Vec::new();
+        for ((addr, slot), n) in &e.slot_seen {
+            if Self::is_frequent(*n, e.observations) {
+                keys.push(fixed(*addr, *slot));
+            }
+        }
+        for (a, n) in &e.account_seen {
+            if Self::is_frequent(*n, e.observations) {
+                keys.push(account(*a));
+            }
+        }
+        Some(keys)
+    }
+
     /// Predict the cell set of a holdout observation from learned
     /// formulas and fixed slots. Returns `None` when the selector was never
     /// trained (cold — `Tail` in the scheduler).
+    #[must_use]
     pub fn predict(&self, o: &TxObs) -> Option<BTreeSet<Cell>> {
         let mut cells = BTreeSet::new();
         // Tier 1, exact: always available from the envelope.
@@ -125,24 +157,7 @@ impl Stats {
         {
             cells.insert(Cell::Account(to));
         }
-        // A tx with no selector (native transfer or create) is fully
-        // covered by tier 1: exact, no stats needed, never cold.
-        let (Some(to), Some(sel)) = (o.to, o.selector) else {
-            return Some(cells);
-        };
-        let e = self.by_selector.get(&(to, sel))?;
-        // Fixed slots: seen in at least 60% of observations.
-        for ((addr, slot), n) in &e.slot_seen {
-            if *n * 10 >= e.observations * 6 {
-                cells.insert(Cell::Slot(*addr, *slot));
-            }
-        }
-        // Frequently touched accounts (fee-sink style) predict as touched.
-        for (a, n) in &e.account_seen {
-            if *n * 10 >= e.observations * 6 {
-                cells.insert(Cell::Account(*a));
-            }
-        }
+        cells.extend(self.predicted_keys(o, Cell::Account, Cell::Slot)?);
         Some(cells)
     }
 
@@ -152,6 +167,7 @@ impl Stats {
     /// everything), but it names mapping entries symbolically instead of
     /// hashing them. This keeps admission cheap enough to stay off the
     /// critical path.
+    #[must_use]
     pub fn predict_domains(&self, o: &TxObs) -> Option<Vec<DomainKey>> {
         let mut keys: Vec<DomainKey> = Vec::with_capacity(8);
         keys.push(DomainKey::Account(o.sender));
@@ -160,24 +176,7 @@ impl Stats {
         {
             keys.push(DomainKey::Account(to));
         }
-        let (Some(to), Some(sel)) = (o.to, o.selector) else {
-            // A tx with no selector (native transfer or create): tier 1 is
-            // the whole footprint, exact and never cold.
-            keys.sort_unstable();
-            keys.dedup();
-            return Some(keys);
-        };
-        let e = self.by_selector.get(&(to, sel))?;
-        for ((addr, slot), n) in &e.slot_seen {
-            if *n * 10 >= e.observations * 6 {
-                keys.push(DomainKey::Fixed(*addr, *slot));
-            }
-        }
-        for (a, n) in &e.account_seen {
-            if *n * 10 >= e.observations * 6 {
-                keys.push(DomainKey::Account(*a));
-            }
-        }
+        keys.extend(self.predicted_keys(o, DomainKey::Account, DomainKey::Fixed)?);
         keys.sort_unstable();
         keys.dedup();
         Some(keys)
@@ -187,51 +186,43 @@ impl Stats {
     /// total). The remainder is footprint this classifier does not model —
     /// a missed edge at worst, which the engine wound-repairs and the
     /// shadow counts.
+    #[must_use]
     pub fn class_shares(&self) -> (u64, u64) {
-        let (mut fixedish, mut total) = (0u64, 0u64);
-        for e in self.by_selector.values() {
-            total += e.slot_obs;
-            for n in e.slot_seen.values() {
-                if *n * 10 >= e.observations.max(1) * 6 {
-                    fixedish += *n;
-                }
-            }
-        }
-        (fixedish, total)
+        self.by_selector
+            .values()
+            .fold((0u64, 0u64), |(fixedish, total), e| {
+                let fixed_here: u64 = e
+                    .slot_seen
+                    .values()
+                    .filter(|n| Self::is_frequent(**n, e.observations))
+                    .sum();
+                (fixedish + fixed_here, total + e.slot_obs)
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{U256, address};
+    use crate::testkit::addr;
+    use alloy_primitives::address;
 
     const POOL: Address = address!("00000000000000000000000000000000000000E0");
     const SEL: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
     /// A slot every call of this selector touches: a pool's reserves.
     const RESERVES: B256 = B256::with_last_byte(3);
 
-    fn addr(i: u8) -> Address {
-        let mut b = [0u8; 20];
-        b[19] = i;
-        Address::from(b)
-    }
-
     /// A swap-shaped observation: the sender's account, and the pool's
     /// fixed reserve slot that every call touches.
     fn swap_obs(index: u64, sender: Address) -> TxObs {
-        TxObs {
+        crate::testkit::obs(
             index,
-            block: 1,
             sender,
-            to: Some(POOL),
-            selector: Some(SEL),
-            args: vec![U256::from(1u64)],
-            gas: 30_000,
-            has_value: false,
-            reads: vec![Cell::Slot(POOL, RESERVES)],
-            writes: vec![Cell::Account(sender), Cell::Slot(POOL, RESERVES)],
-        }
+            POOL,
+            SEL,
+            vec![Cell::Account(sender), Cell::Slot(POOL, RESERVES)],
+            vec![Cell::Slot(POOL, RESERVES)],
+        )
     }
 
     /// The property the whole design rests on: a slot touched by most
@@ -241,6 +232,10 @@ mod tests {
     fn fixed_slot_predicts_for_an_unseen_sender() {
         let mut stats = Stats::default();
         for i in 0..4 {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "loop bound is small (<=10): fits u8"
+            )]
             stats.learn_obs(&swap_obs(i, addr(i as u8 + 1)));
         }
         let unseen = swap_obs(99, addr(200));
@@ -262,6 +257,10 @@ mod tests {
     fn same_domain_for_the_pool_distinct_for_senders() {
         let mut stats = Stats::default();
         for i in 0..4 {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "loop bound is small (<=10): fits u8"
+            )]
             stats.learn_obs(&swap_obs(i, addr(i as u8 + 1)));
         }
         let a = stats.predict_domains(&swap_obs(10, addr(50))).unwrap();
@@ -281,6 +280,10 @@ mod tests {
     fn rare_slot_is_not_predicted() {
         let mut stats = Stats::default();
         for i in 0..10 {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "loop bound is small (<=10): fits u8"
+            )]
             let mut o = swap_obs(i, addr(i as u8 + 1));
             if i == 0 {
                 // One call touches an extra slot.
@@ -311,6 +314,10 @@ mod tests {
 
     #[test]
     fn incremental_learning_matches_batch() {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "loop bound is small (<=10): fits u8"
+        )]
         let obs: Vec<TxObs> = (0..4).map(|i| swap_obs(i, addr(i as u8 + 1))).collect();
         let batch = Stats::learn(&obs);
         let mut inc = Stats::default();

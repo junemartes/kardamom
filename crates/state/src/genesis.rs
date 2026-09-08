@@ -18,14 +18,11 @@ use signet_libmdbx::WriteFlags;
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::{KEY_GENESIS_APPLIED, KEY_GENESIS_DIGEST, encode_u32};
-use crate::schema::{
-    AccountValue, TABLE_ACCOUNTS, TABLE_CODE, TABLE_META, encode_account_key, encode_account_value,
-    encode_code_key,
-};
+use crate::schema::{TABLE_ACCOUNTS, TABLE_CODE, TABLE_META};
 
 /// An order-insensitive digest of a genesis allocation. This is a keccak
 /// hash over the sorted account entries (address, nonce, balance,
-/// code_hash) and the sorted code hashes. Bytecode is content-addressed,
+/// `code_hash`) and the sorted code hashes. Bytecode is content-addressed,
 /// so the hash pins the bytes.
 ///
 /// The digest is stored at seed time under [`KEY_GENESIS_DIGEST`], and
@@ -53,6 +50,11 @@ pub fn genesis_digest(accounts: &[AccountChange], code: &[CodeEntry]) -> B256 {
 
 /// Returns true if genesis has already been seeded into this env. This
 /// checks whether the [`KEY_GENESIS_APPLIED`] flag is present.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the read transaction or the `meta` table
+/// read fails.
 pub fn genesis_applied(env: &StateEnv) -> Result<bool, StateError> {
     let txn = env.raw().begin_ro_sync()?;
     let meta = txn.open_db(Some(TABLE_META))?;
@@ -78,6 +80,12 @@ pub fn genesis_applied(env: &StateEnv) -> Result<bool, StateError> {
 ///
 /// `storage_root` is stored as `B256::ZERO`. v0 keeps no per-account MPT
 /// roots, to match [`crate::writer::StateWriter`].
+///
+/// # Errors
+///
+/// Returns [`StateError::GenesisMismatch`] if the env was already seeded
+/// with a different allocation, and [`StateError`] if the transaction or
+/// a table write fails.
 pub fn seed_genesis(
     env: &StateEnv,
     accounts: &[AccountChange],
@@ -85,121 +93,133 @@ pub fn seed_genesis(
 ) -> Result<bool, StateError> {
     let digest = genesis_digest(accounts, code);
     let txn = env.raw().begin_rw_sync()?;
-    let meta = txn.open_db(Some(TABLE_META))?;
-    if txn
-        .get::<Vec<u8>>(meta.dbi(), KEY_GENESIS_APPLIED)?
-        .is_some()
-    {
-        // Already seeded. Check that the supplied allocation matches the
-        // one this env was seeded from, then report a no-op.
-        match crate::meta::read_meta_b256(&txn, meta, KEY_GENESIS_DIGEST)? {
-            Some(stored) => {
-                drop(txn);
-                if stored != digest {
-                    return Err(StateError::GenesisMismatch {
-                        stored,
-                        supplied: digest,
-                    });
-                }
-            }
-            None => {
-                // This env was seeded before the digest existed. We cannot
-                // verify the original allocation, so we backfill from the
-                // supplied one. Future restarts can then detect drift.
-                txn.put(
-                    meta,
-                    KEY_GENESIS_DIGEST,
-                    crate::meta::encode_b256(digest),
-                    WriteFlags::UPSERT,
-                )?;
-                txn.commit()?;
-            }
-        }
+    let seed = GenesisSeed::open(&txn)?;
+
+    if seed.already_applied()? {
+        seed.check_or_backfill_digest(digest)?;
+        txn.commit()?;
         return Ok(false);
     }
 
-    let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS))?;
-    let code_db = txn.open_db(Some(TABLE_CODE))?;
-
-    for change in accounts {
-        let key = encode_account_key(change.address);
-        let v = AccountValue {
-            nonce: change.nonce,
-            balance: change.balance,
-            code_hash: change.code_hash,
-            storage_root: B256::ZERO,
-        };
-        txn.put(
-            accounts_db,
-            key,
-            encode_account_value(&v),
-            WriteFlags::UPSERT,
-        )?;
-    }
-
-    for entry in code {
-        let key = encode_code_key(entry.code_hash);
-        // Code is content-addressed. NO_OVERWRITE skips a redundant write
-        // when two allocations share the same bytecode.
-        match txn.put(code_db, key, &entry.code, WriteFlags::NO_OVERWRITE) {
-            Ok(()) => {}
-            Err(signet_libmdbx::MdbxError::KeyExist) => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
+    seed.write_allocations(accounts, code)?;
 
     // Build the initial hashed-state mirror and account trie. This lets a
     // from-genesis validator start at the correct world-state root before
     // block 1. This step is harmless for the executor: its writer runs
     // with `TrieMode::Off` and ignores these tables.
-    let trie_tables = crate::trie::TrieTables::open(&txn)?;
-    let genesis_delta = kardamom_types::BlockDelta {
-        block_number: 0,
-        accounts: accounts.to_vec(),
-        storage: Vec::new(),
-        code: code.to_vec(),
-        receipts: Vec::new(),
-    };
-    let root = crate::trie::update_for_block(&txn, &trie_tables, &genesis_delta)?;
-    txn.put(
-        meta,
-        crate::meta::KEY_STATE_ROOT,
-        crate::meta::encode_b256(root),
-        WriteFlags::UPSERT,
-    )?;
+    seed.seed_trie(accounts, code)?;
 
     // The flag and digest commit atomically with the allocations, in one
     // read-write transaction. A crash mid-seed aborts everything, so the
     // next start re-seeds cleanly. The put order within the transaction
     // does not matter.
     txn.put(
-        meta,
+        seed.meta,
         KEY_GENESIS_DIGEST,
         crate::meta::encode_b256(digest),
         WriteFlags::UPSERT,
     )?;
-    txn.put(meta, KEY_GENESIS_APPLIED, encode_u32(1), WriteFlags::UPSERT)?;
+    txn.put(
+        seed.meta,
+        KEY_GENESIS_APPLIED,
+        encode_u32(1),
+        WriteFlags::UPSERT,
+    )?;
     txn.commit()?;
     Ok(true)
+}
+
+/// The tables genesis seeding touches, opened once per attempt on one
+/// read-write transaction.
+struct GenesisSeed<'a> {
+    txn: &'a signet_libmdbx::tx::aliases::RwTxSync,
+    meta: signet_libmdbx::Database,
+    accounts_db: signet_libmdbx::Database,
+    code_db: signet_libmdbx::Database,
+}
+
+impl<'a> GenesisSeed<'a> {
+    fn open(txn: &'a signet_libmdbx::tx::aliases::RwTxSync) -> Result<Self, StateError> {
+        Ok(Self {
+            meta: txn.open_db(Some(TABLE_META))?,
+            accounts_db: txn.open_db(Some(TABLE_ACCOUNTS))?,
+            code_db: txn.open_db(Some(TABLE_CODE))?,
+            txn,
+        })
+    }
+
+    /// Whether [`KEY_GENESIS_APPLIED`] is already set on this env.
+    fn already_applied(&self) -> Result<bool, StateError> {
+        Ok(self
+            .txn
+            .get::<Vec<u8>>(self.meta.dbi(), KEY_GENESIS_APPLIED)?
+            .is_some())
+    }
+
+    /// For an env that already carries [`KEY_GENESIS_APPLIED`]: check the
+    /// supplied allocation's digest against the stored one, or, if this env
+    /// was seeded before the digest existed, backfill it from the supplied
+    /// allocation so future restarts can detect drift.
+    fn check_or_backfill_digest(&self, digest: B256) -> Result<(), StateError> {
+        let Some(stored) = crate::meta::read_meta_b256(self.txn, self.meta, KEY_GENESIS_DIGEST)?
+        else {
+            self.txn.put(
+                self.meta,
+                KEY_GENESIS_DIGEST,
+                crate::meta::encode_b256(digest),
+                WriteFlags::UPSERT,
+            )?;
+            return Ok(());
+        };
+        if stored != digest {
+            return Err(StateError::GenesisMismatch {
+                stored,
+                supplied: digest,
+            });
+        }
+        Ok(())
+    }
+
+    /// Write every account and code entry of the allocation.
+    fn write_allocations(
+        &self,
+        accounts: &[AccountChange],
+        code: &[CodeEntry],
+    ) -> Result<(), StateError> {
+        crate::schema::write_accounts(self.txn, self.accounts_db, accounts)?;
+        crate::schema::write_code(self.txn, self.code_db, code)?;
+        Ok(())
+    }
+
+    /// Seed the hashed-state mirror and account trie from the allocation, as
+    /// one synthetic genesis block, and persist the resulting world-state
+    /// root. This lets a from-genesis validator start at the correct root
+    /// before block 1; it is harmless for the executor, whose writer runs
+    /// with `TrieMode::Off` and ignores these tables.
+    fn seed_trie(
+        &self,
+        accounts: &[AccountChange],
+        code: &[CodeEntry],
+    ) -> Result<B256, StateError> {
+        let genesis_delta = kardamom_types::BlockDelta {
+            block_number: 0,
+            accounts: accounts.to_vec(),
+            storage: Vec::new(),
+            code: code.to_vec(),
+            receipts: Vec::new(),
+        };
+        crate::trie::commit_trie_root(self.txn, &genesis_delta)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::env::{Durability, StateEnvBuilder};
     use crate::snapshot::StateSnapshot;
+    use crate::testing::temp_env;
     use alloy_primitives::{Address, U256, keccak256};
     use bytes::Bytes;
     use kardamom_types::StateDatabase;
-
-    fn temp_env() -> (tempfile::TempDir, StateEnv) {
-        let dir = tempfile::tempdir().unwrap();
-        let env = StateEnvBuilder::new(dir.path())
-            .durability(Durability::SafeNoSync)
-            .open()
-            .unwrap();
-        (dir, env)
-    }
 
     #[test]
     fn seed_genesis_writes_accounts_and_code() {
@@ -335,7 +355,7 @@ mod tests {
         }];
         assert!(seed_genesis(&env, &accounts, &[]).unwrap());
 
-        // Simulate a legacy env by removing the stored digest.
+        // Simulate an env seeded before the digest key existed.
         {
             let txn = env.raw().begin_rw_sync().unwrap();
             let meta = txn.open_db(Some(TABLE_META)).unwrap();

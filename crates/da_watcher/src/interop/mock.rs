@@ -2,7 +2,7 @@
 //! feed, and the simulated external validator the two-chain e2e harness drives.
 //!
 //! It is a REAL jsonrpsee WebSocket server implementing the real
-//! [`OutboxFeedApi`](crate::interop::feed::OutboxFeedApi), because the parts of
+//! `OutboxFeedApi` from `kardamom_interop_feed`, because the parts of
 //! the destination side most likely to be wrong are the transport ones:
 //! resume-from-cursor, reconnect, and lag recovery. An in-process channel would
 //! test the derivation rule (already covered in `kardamom_types::xchain`) and
@@ -17,50 +17,47 @@
 //! * **It does not repair its script.** [`MockInteropFeed::gap_next`] makes it
 //!   swallow messages, producing exactly the hole in the dense seq that the
 //!   no-skip rule exists to catch.
-//! * **It carries no finality stamps or anchor proofs.** v1 is feed-trust mode
-//!   (spec §10 tier T0); see [`crate::interop::feed`].
+//! * **It carries no finality stamps or anchor proofs.** v1 is feed-trust
+//!   mode: the watcher executes what the feed says, with no independent
+//!   check.
 //!
 //! ## Retention model
 //!
-//! Everything pushed is retained forever and served from `cursor.seq` onward,
-//! which is the contract a real feed offers within its retention window. Lag
-//! markers are the exception: they are per-subscription runtime events rather
-//! than log entries, so each is delivered at most once across the mock's
-//! lifetime — otherwise a subscriber that recovered from a lag by
-//! re-subscribing would be handed the same lag again, forever.
+//! Everything pushed is retained and served from `cursor.seq` onward, which
+//! is the contract a real feed offers within its retention window.
+//! [`MockInteropFeed::set_floor`] models the window's edge the way the
+//! validator's store does: messages below the floor are gone, and EVERY
+//! subscribe with a cursor below the floor gets a `Lagged` frame naming the
+//! floor, then the retained suffix. A subscriber that re-subscribes from
+//! the same cursor gets the same answer, exactly like the real server.
+//! [`MockInteropFeed::push_head`] scripts the origin's `head` event.
 
-use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::server::{PendingSubscriptionSink, Server, ServerHandle};
 use kardamom_types::xchain::OutboxMessage;
 use tokio::sync::watch;
 
-use crate::interop::feed::{OutboxCursor, OutboxEventDto, OutboxFeedApiServer, OutboxMessageDto};
+use kardamom_interop_feed::{OutboxCursor, OutboxEventDto, OutboxFeedApiServer, OutboxMessageDto};
 
 /// One entry of the mock's retained script.
 #[derive(Clone, Debug)]
 enum FeedItem {
     Message(Box<OutboxMessage>),
-    /// Identified so it can be delivered at most once — see the module docs.
-    Lagged {
-        skipped: u64,
-        id: u64,
-    },
+    /// The origin closed every block through this one.
+    Head(u64),
 }
 
 struct FeedState {
     origin_chain_id: u64,
     script: Mutex<Vec<FeedItem>>,
-    /// Lag markers already delivered, by id.
-    emitted_lagged: Mutex<BTreeSet<u64>>,
+    /// First seq the feed serves. A subscribe below it gets `Lagged`.
+    floor: Mutex<u64>,
     /// Messages the feed will swallow before retaining any more.
     swallow: Mutex<u64>,
-    next_lagged_id: AtomicU64,
     /// `dest_chain_id` of every subscription received, in order. Its length is
     /// the re-subscription count the reconnect/lag tests assert on.
     subscribed_dests: Mutex<Vec<u64>>,
@@ -81,15 +78,15 @@ pub struct MockInteropFeed {
 impl MockInteropFeed {
     /// Bind a feed for `origin_chain_id` on an ephemeral loopback port.
     ///
-    /// Panics on bind failure: a test environment that cannot bind loopback is
-    /// broken in a way no caller can handle.
+    /// # Panics
+    /// Panics on bind failure: a test environment that cannot bind loopback
+    /// is broken in a way no caller can handle.
     pub async fn new(origin_chain_id: u64) -> Self {
         let state = Arc::new(FeedState {
             origin_chain_id,
             script: Mutex::new(Vec::new()),
-            emitted_lagged: Mutex::new(BTreeSet::new()),
+            floor: Mutex::new(0),
             swallow: Mutex::new(0),
-            next_lagged_id: AtomicU64::new(0),
             subscribed_dests: Mutex::new(Vec::new()),
             items: watch::channel(0usize).0,
             close_epoch: watch::channel(0u64).0,
@@ -109,12 +106,8 @@ impl MockInteropFeed {
         }
     }
 
-    /// The peer chain this feed claims to be.
-    pub fn origin_chain_id(&self) -> u64 {
-        self.state.origin_chain_id
-    }
-
     /// WebSocket endpoint to point a [`crate::interop::WsRemoteChainSource`] at.
+    #[must_use]
     pub fn url(&self) -> String {
         format!("ws://{}", self.addr)
     }
@@ -122,6 +115,10 @@ impl MockInteropFeed {
     /// Retain a message and serve it to every subscriber whose cursor is at or
     /// below its seq — unless [`Self::gap_next`] armed a swallow, in which case
     /// the message is dropped on the floor as a lossy feed would drop it.
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned (a prior panic while holding
+    /// it), which only happens after the test has already failed.
     pub fn push_message(&self, msg: OutboxMessage) {
         {
             let mut swallow = self.state.swallow.lock().unwrap();
@@ -138,13 +135,30 @@ impl MockInteropFeed {
         self.state.items.send_replace(len);
     }
 
-    /// Script a lag marker at the current stream position: the next subscriber
-    /// to reach it is told `skipped` items were lost. Delivered at most once.
-    pub fn push_lagged(&self, skipped: u64) {
-        let id = self.state.next_lagged_id.fetch_add(1, Ordering::SeqCst);
+    /// Raise the feed floor: messages below `seq` are gone, and every
+    /// subscribe with a cursor below `seq` gets a `Lagged` frame first —
+    /// the real server's retention edge.
+    pub fn set_floor(&self, seq: u64) {
+        let len = {
+            let mut floor = self.state.floor.lock().unwrap();
+            *floor = (*floor).max(seq);
+            let mut script = self.state.script.lock().unwrap();
+            script.retain(|item| match item {
+                FeedItem::Message(m) => m.seq >= *floor,
+                FeedItem::Head(_) => true,
+            });
+            script.len()
+        };
+        self.state.items.send_replace(len);
+    }
+
+    /// Script a `head` event: the origin closed every block through
+    /// `block`. A subscriber with an open batch from an earlier block
+    /// closes it.
+    pub fn push_head(&self, block: u64) {
         let len = {
             let mut script = self.state.script.lock().unwrap();
-            script.push(FeedItem::Lagged { skipped, id });
+            script.push(FeedItem::Head(block));
             script.len()
         };
         self.state.items.send_replace(len);
@@ -153,6 +167,10 @@ impl MockInteropFeed {
     /// Make the feed swallow the next `n` pushed messages — a hole in the
     /// dense per-pair seq, which the destination must halt on rather than
     /// step over.
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned (a prior panic while holding
+    /// it), which only happens after the test has already failed.
     pub fn gap_next(&self, n: u64) {
         *self.state.swallow.lock().unwrap() += n;
     }
@@ -168,13 +186,13 @@ impl MockInteropFeed {
 
     /// How many subscriptions this feed has served since it started. Greater
     /// than one means a subscriber went through its resume path.
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned (a prior panic while holding
+    /// it), which only happens after the test has already failed.
+    #[must_use]
     pub fn subscription_count(&self) -> usize {
         self.state.subscribed_dests.lock().unwrap().len()
-    }
-
-    /// The `dest_chain_id` each subscription asked for, in order.
-    pub fn subscribed_dests(&self) -> Vec<u64> {
-        self.state.subscribed_dests.lock().unwrap().clone()
     }
 }
 
@@ -201,6 +219,35 @@ impl OutboxFeedApiServer for FeedHandler {
             .unwrap()
             .push(dest_chain_id);
 
+        // The retention edge, judged on EVERY subscribe like the real
+        // server: a cursor below the floor is told so, then served from
+        // the floor.
+        let floor = *self.state.floor.lock().unwrap();
+        let mut from = cursor.seq;
+        if from < floor {
+            let floor_block = self
+                .state
+                .script
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|i| match i {
+                    FeedItem::Message(m) => Some(m.origin_block_number),
+                    FeedItem::Head(_) => None,
+                });
+            let event = OutboxEventDto::Lagged {
+                skipped: floor - from,
+                floor_seq: Some(floor),
+                floor_block,
+            };
+            let msg = serde_json::value::to_raw_value(&event)
+                .map_err(|e| format!("serialize feed event: {e}"))?;
+            if sink.send(msg).await.is_err() {
+                return Ok(());
+            }
+            from = floor;
+        }
+
         let mut next = 0usize;
         loop {
             loop {
@@ -212,16 +259,13 @@ impl OutboxFeedApiServer for FeedHandler {
                     // Honouring the cursor is the whole contract: a resumed
                     // subscriber must see exactly the same suffix a fresh one
                     // at that cursor would.
-                    FeedItem::Message(m) if m.seq < cursor.seq => continue,
+                    FeedItem::Message(m) if m.seq < from => continue,
                     FeedItem::Message(m) => OutboxEventDto::Message(Box::new(
                         OutboxMessageDto::from_outbox_message(self.state.origin_chain_id, &m),
                     )),
-                    FeedItem::Lagged { skipped, id } => {
-                        if !self.state.emitted_lagged.lock().unwrap().insert(id) {
-                            continue;
-                        }
-                        OutboxEventDto::Lagged { skipped }
-                    }
+                    FeedItem::Head(block) => OutboxEventDto::Head {
+                        block_number: block,
+                    },
                 };
                 let msg = serde_json::value::to_raw_value(&event)
                     .map_err(|e| format!("serialize feed event: {e}"))?;

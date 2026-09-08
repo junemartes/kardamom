@@ -38,18 +38,12 @@
 //! - `TxData{Publisher,Subscriber}Handle`: per-shard envelope channel. The
 //!   proxy/ingress publishes; sequencers, executors, and batchers
 //!   subscribe.
-//! - `TxOrdering{Publisher,Subscriber}Handle`: canonical orderer of tiny
-//!   `TxOrderingMessage` records (`TxRef | BoundaryStart`). Sequencers
-//!   race to publish, the sealer also publishes boundaries, and the
-//!   executor/batcher subscribe.
 //! - `TxReceipts{Publisher,ReceiptSubscriber,BoundarySubscriber}Handle`:
 //!   receipts plus slim boundaries (not recorded). The executor
 //!   publishes; the proxy/state writer subscribe.
-//! - `ReceiptCache{Publisher,Subscriber}Handle`: the proxy-executor
-//!   receipt cache (not recorded).
 //! - `FsyncWatermark{Publisher,Subscriber}Handle`: per-recorder fsync
-//!   watermark streams feeding the quorum aggregator.
-//! - `Quorum{Publisher,Subscriber}Handle`: the aggregated quorum
+//!   watermark streams; ingress subscribes and fans them out.
+//! - `Quorum{Publisher,Subscriber}Handle`: the single durable quorum
 //!   watermark.
 //!
 //! This module has an unconditional dependency on rusteron.
@@ -98,7 +92,7 @@ type Header = rusteron_client::AeronHeader;
 /// `session_id`, and forwards the decoded value (or its raw bytes)
 /// somewhere Send-friendly. Boxed so different message types can share the
 /// subscription registration path. Most consumers ignore `session_id`. The
-/// tx_data subscription uses it to build a [`kardamom_types::TxDataLoc`],
+/// `tx_data` subscription uses it to build a [`kardamom_types::TxDataLoc`],
 /// so concurrent ingress publishers on one shard stay distinct.
 pub type DeliverFn = Box<dyn FnMut(&[u8], BPosition, i32) + Send>;
 

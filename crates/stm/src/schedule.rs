@@ -24,36 +24,39 @@
 //! scheduler grades, so its `false_independent_total` is a live upper bound on the
 //! validation failures this schedule can produce.
 
+#[cfg(test)]
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+use kardamom_footprint::Cell;
+#[cfg(test)]
 use kardamom_footprint::classifier::Stats;
-use kardamom_footprint::{Cell, TxObs, decoded_view, envelope_view};
+use kardamom_footprint::{TxObs, decoded_view};
 use kardamom_types::TxEnvelope;
 
 /// A block's execution plan over local tx positions `0..n`. Every tx is in
 /// the DAG; ready = indegree 0.
+///
+/// Used only by this file's tests. The live executor admits
+/// transactions in `execute::session`, which keeps its own last-toucher
+/// index (`execute::touch`).
+#[cfg(test)]
 #[derive(Debug, Default)]
-pub struct BlockSchedule {
+pub(crate) struct BlockSchedule {
     /// DAG edges: `children[i]` = local positions depending on i.
-    pub children: Vec<Vec<u32>>,
+    pub(crate) children: Vec<Vec<u32>>,
     /// Incoming-edge count per tx.
-    pub indegree: Vec<u32>,
+    pub(crate) indegree: Vec<u32>,
     /// Cold (barrier) txs — diagnostics.
-    pub cold: usize,
+    pub(crate) cold: usize,
     /// Edge count — diagnostics.
-    pub edges: usize,
+    pub(crate) edges: usize,
 }
 
-/// Scheduling-time view of one tx (no ground truth — nothing has executed).
-pub fn scheduling_view(local_idx: u32, envelope: &TxEnvelope) -> TxObs {
-    let (to, selector, args, has_value) = envelope_view(&envelope.raw_tx);
-    view_from_parts(local_idx, envelope, to, selector, args, has_value)
-}
-
-/// [`scheduling_view`] over a pre-decoded envelope. `None` means
+/// Scheduling-time view of one tx, over a pre-decoded envelope. `None` means
 /// undecodable: the tier-1-only degenerate view, the same as a failed
 /// decode.
-pub fn scheduling_view_decoded(
+pub(crate) fn scheduling_view_decoded(
     local_idx: u32,
     envelope: &TxEnvelope,
     decoded: Option<&kardamom_exec_core::executor::DecodedTx>,
@@ -65,7 +68,6 @@ pub fn scheduling_view_decoded(
     view_from_parts(local_idx, envelope, to, selector, args, has_value)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn view_from_parts(
     local_idx: u32,
     envelope: &TxEnvelope,
@@ -75,7 +77,7 @@ fn view_from_parts(
     has_value: bool,
 ) -> TxObs {
     TxObs {
-        index: local_idx as u64,
+        index: u64::from(local_idx),
         block: 0,
         sender: envelope.sender,
         to,
@@ -94,8 +96,13 @@ fn view_from_parts(
 /// full predecessor set right away, and execution may start before i+1
 /// exists. Pure bookkeeping, no locks. The engine integrates it under its
 /// per-block graph lock.
+///
+/// Used only by this file's tests. The live executor admits
+/// transactions in `execute::session`, which keeps its own last-toucher
+/// index (`execute::touch`).
+#[cfg(test)]
 #[derive(Debug, Default)]
-pub struct DagBuilder {
+pub(crate) struct DagBuilder {
     // Per-cell last toucher: a chain in canonical order. Reader and writer
     // modes are not split here, matching the predictions. This is
     // conservative; offline grading priced the same over-merge at about
@@ -106,55 +113,53 @@ pub struct DagBuilder {
     // transitively).
     last_barrier: Option<u32>,
     since_barrier: Vec<u32>,
-    pub cold: usize,
-    pub edges: usize,
+    pub(crate) cold: usize,
+    pub(crate) edges: usize,
 }
 
+#[cfg(test)]
 impl DagBuilder {
     /// Admit transaction i (must be called in canonical order) and return
     /// its deduplicated predecessor list. `cells` is the prediction;
     /// `None` means cold, so this becomes a barrier.
-    pub fn admit(
+    pub(crate) fn admit(
         &mut self,
         i: u32,
         cells: Option<impl IntoIterator<Item = Cell>>,
         exclude: &HashSet<Cell>,
     ) -> Vec<u32> {
         let mut preds: Vec<u32> = Vec::new();
-        match cells {
-            Some(cells) => {
+        if let Some(cells) = cells {
+            if let Some(b) = self.last_barrier {
+                preds.push(b);
+            }
+            for c in cells {
+                if exclude.contains(&c) {
+                    continue;
+                }
+                if let Some(&p) = self.last_toucher.get(&c)
+                    && p != i
+                {
+                    preds.push(p);
+                }
+                self.last_toucher.insert(c, i);
+            }
+            self.since_barrier.push(i);
+        } else {
+            // ⊤: a barrier. It depends on every transaction since the
+            // previous barrier (those cover the previous barrier
+            // transitively). With none in between, it depends on the
+            // previous barrier itself.
+            self.cold += 1;
+            if self.since_barrier.is_empty() {
                 if let Some(b) = self.last_barrier {
                     preds.push(b);
                 }
-                for c in cells {
-                    if exclude.contains(&c) {
-                        continue;
-                    }
-                    if let Some(&p) = self.last_toucher.get(&c)
-                        && p != i
-                    {
-                        preds.push(p);
-                    }
-                    self.last_toucher.insert(c, i);
-                }
-                self.since_barrier.push(i);
+            } else {
+                preds.extend(self.since_barrier.iter().copied());
             }
-            None => {
-                // ⊤: a barrier. It depends on every transaction since the
-                // previous barrier (those cover the previous barrier
-                // transitively). With none in between, it depends on the
-                // previous barrier itself.
-                self.cold += 1;
-                if self.since_barrier.is_empty() {
-                    if let Some(b) = self.last_barrier {
-                        preds.push(b);
-                    }
-                } else {
-                    preds.extend(self.since_barrier.iter().copied());
-                }
-                self.last_barrier = Some(i);
-                self.since_barrier.clear();
-            }
+            self.last_barrier = Some(i);
+            self.since_barrier.clear();
         }
         preds.sort_unstable();
         preds.dedup();
@@ -164,7 +169,12 @@ impl DagBuilder {
 }
 
 /// Batch convenience over [`DagBuilder`] (tests, offline analysis).
-pub fn build(
+#[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "test envelope counts stay far below u32::MAX"
+)]
+pub(crate) fn build(
     stats: &Stats,
     envelopes: &[TxEnvelope],
     decoded: &[Option<kardamom_exec_core::executor::DecodedTx>],

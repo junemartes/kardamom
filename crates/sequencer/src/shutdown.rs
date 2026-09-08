@@ -15,6 +15,7 @@ pub struct Shutdown {
 }
 
 impl Shutdown {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             token: CancellationToken::new(),
@@ -22,6 +23,7 @@ impl Shutdown {
     }
 
     /// Wrap an existing token (share one cancellation tree with other tasks).
+    #[must_use]
     pub fn from_token(token: CancellationToken) -> Self {
         Self { token }
     }
@@ -30,18 +32,20 @@ impl Shutdown {
         self.token.cancel();
     }
 
+    #[must_use]
     pub fn is_signaled(&self) -> bool {
         self.token.is_cancelled()
     }
 
     /// The underlying token, for tasks that want to `select!` on it directly.
+    #[must_use]
     pub fn token(&self) -> CancellationToken {
         self.token.clone()
     }
 
     /// Resolves once [`Shutdown::signal`] has been called.
     pub async fn cancelled(&self) {
-        self.token.cancelled().await
+        self.token.cancelled().await;
     }
 }
 

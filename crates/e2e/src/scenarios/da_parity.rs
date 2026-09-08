@@ -70,32 +70,45 @@ struct Executed {
     transaction_index: u64,
 }
 
+/// One sender's dense transfer run: `txs_per_sender` transfers, nonces
+/// `0..txs_per_sender`.
+///
+/// # Errors
+/// Returns an error when signing a transfer fails.
+fn sign_sender_run(
+    signer: &l2::DerivedSigner,
+    chain_id: u64,
+    txs_per_sender: usize,
+    to: Address,
+) -> Result<Vec<SignedTransfer>> {
+    (0..txs_per_sender)
+        .map(|n| l2::sign_transfer(signer, chain_id, n as u64, to, 1))
+        .collect()
+}
+
 /// Run the workload, then recover the canonical blocks it produced from
 /// the pipeline's own receipts.
+///
+/// # Errors
+/// Returns an error when a transfer fails to send, when its receipt is
+/// missing or unplaceable, or when the workload produced no blocks.
 pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
-    let signers = l2::dev_signers((p.sender_base + p.senders) as u32)?;
+    // This is a total signer count already (not a highest index), so it
+    // takes no `+ 1`.
+    let signers = l2::dev_signers_total(
+        p.sender_base
+            .checked_add(p.senders)
+            .context("sender_base + senders overflows")?,
+    )?;
     let to = Address::from([0x88u8; 20]);
 
-    let mut planned: Vec<SignedTransfer> = Vec::new();
-    for signer in &signers[p.sender_base..] {
-        for n in 0..p.txs_per_sender {
-            planned.push(l2::sign_transfer(signer, t.chain_id, n as u64, to, 1)?);
-        }
-    }
+    let runs = signers[p.sender_base..]
+        .iter()
+        .map(|signer| sign_sender_run(signer, t.chain_id, p.txs_per_sender, to))
+        .collect::<Result<Vec<Vec<SignedTransfer>>>>()?;
+    let planned: Vec<SignedTransfer> = runs.into_iter().flatten().collect();
 
-    let mut set = tokio::task::JoinSet::new();
-    for tx in planned.clone() {
-        let rpc = t.rpc.clone();
-        set.spawn(async move {
-            let out = rpc.send_raw(&tx.raw).await;
-            (tx, out)
-        });
-    }
-    while let Some(j) = set.join_next().await {
-        let (tx, out) = j.context("submit join")?;
-        out.result
-            .map_err(|e| anyhow::anyhow!("sender {} nonce {}: {e}", tx.sender, tx.nonce))?;
-    }
+    super::submit_all(t, planned.clone()).await?;
 
     // Locate every transaction in the canonical chain. The receipt appears
     // when the transaction executes, so this needs no drain. The values
@@ -103,8 +116,9 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
     let mut executed = Vec::with_capacity(planned.len());
     for tx in planned {
         let receipt = await_l2_receipt(t, tx.hash, &format!("workload tx {}", tx.hash)).await?;
-        let (block_number, transaction_index) = receipt_placement(&receipt)
+        let placement = receipt_placement(&receipt)
             .with_context(|| format!("place receipt for {}", tx.hash))?;
+        let (block_number, transaction_index) = (placement.block, placement.index);
         assert_receipt_ok(
             &receipt,
             &format!("tx {} (DA parity needs a clean workload)", tx.hash),
@@ -143,7 +157,9 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
         blocks.push(ClosedBlock {
             block_number,
             // This value is synthetic. See the module docs.
-            l2_timestamp: 1_700_000_000 + block_number,
+            // `block_number` is a wire/L2 block value; saturating keeps a
+            // synthesized timestamp finite instead of wrapping.
+            l2_timestamp: 1_700_000_000u64.saturating_add(block_number),
             end_tx_idx: BPosition::from_index(end),
             remote_epochs: vec![],
             txs: recorded,
@@ -156,6 +172,11 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
 /// Post `blocks` to the settlement contract as real EIP-4844 blob
 /// transactions, one batch per block. Check that L1's compare-and-set
 /// batch indices advance with no gaps.
+///
+/// # Errors
+/// Returns an error when a block fails to pack or post, when the posted
+/// batch index skips or repeats, or when the final count does not match
+/// `blocks.len()`.
 pub async fn post_to_l1(
     l1: &L1,
     settlement: Address,
@@ -178,11 +199,47 @@ pub async fn post_to_l1(
         prev_index = next;
     }
     anyhow::ensure!(
-        prev_index as usize == blocks.len(),
+        prev_index == blocks.len() as u64,
         "posted {prev_index} batches for {} blocks",
         blocks.len()
     );
     Ok(())
+}
+
+/// Run `kardamom-reconstruct` against `da_dir`, requiring the rebuilt
+/// state root to equal `expect_root`.
+///
+/// The parts of a `kardamom-reconstruct` invocation that stay fixed
+/// across the main run and its non-vacuity control: the L1 endpoint, the
+/// settlement contract, and the DA store and genesis to rebuild from.
+struct Reconstruct<'a> {
+    l1_rpc: &'a str,
+    settlement: Address,
+    da_dir: &'a Path,
+    genesis: &'a Path,
+}
+
+impl Reconstruct<'_> {
+    /// Run `kardamom-reconstruct` against `state_dir`, requiring the
+    /// rebuilt state root to equal `expect_root`.
+    ///
+    /// # Errors
+    /// Returns an error when the binary is not built or fails to run.
+    fn run(&self, state_dir: &Path, expect_root: B256) -> Result<std::process::Output> {
+        let bin = crate::harness::services::bin("kardamom-reconstruct")?;
+        std::process::Command::new(bin)
+            .args(["--l1-rpc", self.l1_rpc])
+            .args(["--settlement", &self.settlement.to_string()])
+            .arg("--da-store")
+            .arg(self.da_dir)
+            .arg("--chain")
+            .arg(self.genesis)
+            .arg("--state-dir")
+            .arg(state_dir)
+            .args(["--expect-root", &format!("{expect_root:#x}")])
+            .output()
+            .context("run kardamom-reconstruct")
+    }
 }
 
 /// Rebuild the chain from L1 alone. Require the root to equal
@@ -190,7 +247,11 @@ pub async fn post_to_l1(
 ///
 /// This runs the real `kardamom-reconstruct` binary, not the library. This
 /// exercises the operator-facing path, including its `--expect-root` gate.
-/// No caller used that gate anywhere before this scenario.
+///
+/// # Errors
+/// Returns an error when the binary is not built, when it fails to run,
+/// when it rejects the correct root, or when the non-vacuity control
+/// (a deliberately wrong root) is accepted.
 pub fn reconstruct_and_compare(
     l1_rpc: &str,
     settlement: Address,
@@ -199,19 +260,13 @@ pub fn reconstruct_and_compare(
     state_dir: &Path,
     expected_root: B256,
 ) -> Result<()> {
-    let bin = crate::harness::services::bin("kardamom-reconstruct")?;
-    let out = std::process::Command::new(bin)
-        .args(["--l1-rpc", l1_rpc])
-        .args(["--settlement", &settlement.to_string()])
-        .arg("--da-store")
-        .arg(da_dir)
-        .arg("--chain")
-        .arg(genesis)
-        .arg("--state-dir")
-        .arg(state_dir)
-        .args(["--expect-root", &format!("{expected_root:#x}")])
-        .output()
-        .context("run kardamom-reconstruct")?;
+    let reconstruct = Reconstruct {
+        l1_rpc,
+        settlement,
+        da_dir,
+        genesis,
+    };
+    let out = reconstruct.run(state_dir, expected_root)?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     anyhow::ensure!(
         out.status.success(),
@@ -232,19 +287,7 @@ pub fn reconstruct_and_compare(
     let mut wrong = expected_root.0;
     wrong[0] ^= 0xFF;
     let control_dir = state_dir.with_extension("control");
-    let bin = crate::harness::services::bin("kardamom-reconstruct")?;
-    let control = std::process::Command::new(bin)
-        .args(["--l1-rpc", l1_rpc])
-        .args(["--settlement", &settlement.to_string()])
-        .arg("--da-store")
-        .arg(da_dir)
-        .arg("--chain")
-        .arg(genesis)
-        .arg("--state-dir")
-        .arg(&control_dir)
-        .args(["--expect-root", &format!("{:#x}", B256::from(wrong))])
-        .output()
-        .context("run kardamom-reconstruct (non-vacuity control)")?;
+    let control = reconstruct.run(&control_dir, B256::from(wrong))?;
     anyhow::ensure!(
         !control.status.success(),
         "kardamom-reconstruct ACCEPTED a wrong expected root — the parity gate is vacuous"
@@ -254,6 +297,10 @@ pub fn reconstruct_and_compare(
 
 /// Verify that the L1 log alone yields the batches just posted. This is
 /// what a recovery operator starts from.
+///
+/// # Errors
+/// Returns an error when the batch count, ordering, or blob presence does
+/// not match `expected`, or when recovering blocks from the blobs fails.
 pub async fn assert_batches_on_l1(
     l1: &L1,
     settlement: Address,

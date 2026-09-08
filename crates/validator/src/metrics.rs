@@ -2,32 +2,35 @@
 //! of the other services: thin wrappers over the `metrics` facade, so the
 //! call sites stay readable and the names live in one place.
 
-pub const DIVERGENCE_TOTAL: &str = "validator_divergence_total";
-pub const BLOCKS_VERIFIED_TOTAL: &str = "validator_blocks_verified_total";
-pub const BAL_MISSING_TOTAL: &str = "validator_bal_missing_total";
-pub const RECEIPT_MISSING_TOTAL: &str = "validator_receipt_missing_total";
-pub const COMMITTED_BLOCK: &str = "validator_committed_block";
-pub const STATE_ROOT_BLOCK: &str = "validator_state_root_block";
+const DIVERGENCE_TOTAL: &str = "validator_divergence_total";
+const BLOCKS_VERIFIED_TOTAL: &str = "validator_blocks_verified_total";
+const BAL_MISSING_TOTAL: &str = "validator_bal_missing_total";
+const RECEIPT_MISSING_TOTAL: &str = "validator_receipt_missing_total";
+const COMMITTED_BLOCK: &str = "validator_committed_block";
+const STATE_ROOT_BLOCK: &str = "validator_state_root_block";
 /// Epochs whose deposits were re-derived from L1 and matched.
-pub const EPOCHS_VERIFIED_TOTAL: &str = "validator_epochs_verified_total";
+const EPOCHS_VERIFIED_TOTAL: &str = "validator_epochs_verified_total";
 /// Epochs that failed verification. This is a chain fault, always paired
 /// with a divergence.
-pub const EPOCH_FAULTS_TOTAL: &str = "validator_epoch_faults_total";
+const EPOCH_FAULTS_TOTAL: &str = "validator_epoch_faults_total";
 /// Epochs skipped because L1 was unreachable. Not a fault: an RPC outage
 /// must not read as a divergence. A sustained non-zero rate means
 /// verification coverage has holes.
-pub const EPOCHS_UNVERIFIED_TOTAL: &str = "validator_epochs_unverified_total";
+const EPOCHS_UNVERIFIED_TOTAL: &str = "validator_epochs_unverified_total";
 /// Remote-epoch records (interop) that passed the inline pair-sequence checks.
-pub const REMOTE_EPOCHS_VERIFIED_TOTAL: &str = "validator_remote_epochs_verified_total";
+const REMOTE_EPOCHS_VERIFIED_TOTAL: &str = "validator_remote_epochs_verified_total";
 /// Remote-epoch records that FAILED verification — a chain fault, always
 /// paired with a divergence.
-pub const REMOTE_EPOCH_FAULTS_TOTAL: &str = "validator_remote_epoch_faults_total";
+const REMOTE_EPOCH_FAULTS_TOTAL: &str = "validator_remote_epoch_faults_total";
 /// Outbox messages extracted from re-executed receipts and fed to the serving
 /// feed store (egress spec E1).
-pub const OUTBOX_EXTRACTED_TOTAL: &str = "validator_outbox_extracted_total";
+const OUTBOX_EXTRACTED_TOTAL: &str = "validator_outbox_extracted_total";
 /// Blocks whose extracted outbox messages could not be cross-checked against
-/// BAL claims (claims never arrived). NOT a fault — the bal_missing posture.
+/// BAL claims (claims never arrived). NOT a fault — the `bal_missing` posture.
 pub const OUTBOX_UNCHECKED_TOTAL: &str = "validator_outbox_unchecked_total";
+/// Feed subscriptions rejected because a cap was hit (per destination or
+/// total; see `interop::serve::FeedServerLimits`).
+pub const FEED_SUBSCRIPTION_REJECTED_TOTAL: &str = "validator_feed_subscription_rejected_total";
 
 /// Register metric descriptions. Call once at startup, after `kardamom_obs::init`.
 pub fn describe() {
@@ -47,6 +50,10 @@ pub fn describe() {
         RECEIPT_MISSING_TOTAL,
         "Receipts for which no published receipt arrived within the wait window"
     );
+    metrics::describe_counter!(
+        FEED_SUBSCRIPTION_REJECTED_TOTAL,
+        "Feed subscriptions rejected because a subscription cap was hit"
+    );
     metrics::describe_gauge!(COMMITTED_BLOCK, "Highest block the validator has committed");
     metrics::describe_gauge!(
         STATE_ROOT_BLOCK,
@@ -56,8 +63,8 @@ pub fn describe() {
     );
 }
 
-pub const RESYNC_TOTAL: &str = "validator_resync_total";
-pub const BAL_SUB_REOPEN_TOTAL: &str = "validator_bal_sub_reopen_total";
+const RESYNC_TOTAL: &str = "validator_resync_total";
+const BAL_SUB_REOPEN_TOTAL: &str = "validator_bal_sub_reopen_total";
 
 /// Replay-window-overrun resync outcomes, labeled
 /// `outcome=peer-checkpoint|unrecoverable`. This is the validator twin of
@@ -68,7 +75,7 @@ pub fn resync_counter(outcome: &'static str) -> metrics::Counter {
     metrics::counter!(RESYNC_TOTAL, "outcome" => outcome)
 }
 
-/// The tx_bal subscription reopened after prolonged silence. This is a
+/// The `tx_bal` subscription reopened after prolonged silence. This is a
 /// never-joined or silently-dead multicast image healing itself.
 /// Sustained growth means BAL delivery to this node is genuinely broken.
 pub fn counter_bal_sub_reopen() {
@@ -107,9 +114,17 @@ pub fn counter_outbox_unchecked() {
     metrics::counter!(OUTBOX_UNCHECKED_TOTAL).increment(1);
 }
 
+pub fn counter_feed_subscription_rejected() {
+    metrics::counter!(FEED_SUBSCRIPTION_REJECTED_TOTAL).increment(1);
+}
+
 /// Blocks re-executed as seeded parallel batches. The label is the batch count.
 pub fn counter_parallel_block(batches: usize) {
     metrics::counter!("kardamom_validator_parallel_blocks_total").increment(1);
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "batch counts stay far below 2^52; f64 represents them exactly"
+    )]
     metrics::histogram!("kardamom_validator_parallel_batches").record(batches as f64);
 }
 
@@ -141,6 +156,10 @@ pub fn counter_receipt_missing() {
 
 /// Record that the validator has committed `block`.
 pub fn set_committed_block(block: u64) {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "block numbers stay far below 2^52; f64 represents them exactly"
+    )]
     metrics::gauge!(COMMITTED_BLOCK).set(block as f64);
 }
 
@@ -149,6 +168,10 @@ pub fn set_committed_block(block: u64) {
 /// so the "state root advancing" signal is a real measurement, not a
 /// mirror of the committed-block gauge.
 pub fn set_state_root_block(block: u64) {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "block numbers stay far below 2^52; f64 represents them exactly"
+    )]
     metrics::gauge!(STATE_ROOT_BLOCK).set(block as f64);
 }
 

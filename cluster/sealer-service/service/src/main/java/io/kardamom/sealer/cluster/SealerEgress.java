@@ -223,6 +223,31 @@ final class SealerEgress {
         offerToSession(session, pos);
     }
 
+    /**
+     * Frame and offer a remote-origin reject to the offering session:
+     * {@code [kind:6][origin:u64 LE][first_seq:u64 LE][expected:u64 LE][reason:u8]}.
+     */
+    void offerRemoteOriginReject(
+            final ClientSession session,
+            final long originChainId,
+            final long firstSeq,
+            final long expectedNextSeq,
+            final byte reason) {
+        final MutableDirectBuffer buf = egressBuffer;
+        int pos = 0;
+        buf.putByte(pos, SealerWire.EGRESS_KIND_REMOTE_ORIGIN_REJECT);
+        pos += Byte.BYTES;
+        buf.putLong(pos, originChainId, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, firstSeq, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, expectedNextSeq, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putByte(pos, reason);
+        pos += Byte.BYTES;
+        offerToSession(session, pos);
+    }
+
     /** Retain an already-framed egress frame for future replays, up to a limit. */
     private void retain(final int length, final boolean boundary, final long key) {
         final byte[] copy = new byte[length];

@@ -1,27 +1,35 @@
 //! `kardamom-ingress`: the standalone proxy (ingress) service process.
 //!
-//! This opens M tx_data publishers, a receipt-cache publisher, and
+//! This opens M `tx_data` publishers, a receipt-cache publisher, and
 //! subscribers for the receipts, quorum-watermark, fsync-watermark,
 //! receipt-cache, and block-boundary streams. It wires them into an
 //! [`IngressProxy`] and starts its JSON-RPC server, plus optional TCP and
 //! UDS binary protocol listeners. It idles on SIGTERM or Ctrl-C.
 //!
 //! The live Aeron adapters behind the proxy's channel traits live in
-//! `kardamom_ingress::aeron_adapters`. The tx_data archive-recorder
+//! `kardamom_ingress::aeron_adapters`. The `tx_data` archive-recorder
 //! threads, and their ready barrier, live in [`recorders`].
+//!
+//! [`IngressService`] owns everything `main` needs to open the runtime:
+//! the parsed args, the resolved log config, and the parsed TOML file
+//! config. [`IngressService::run`] opens Aeron, the recorders, the
+//! optional cluster watermark watcher, and the proxy itself, and returns
+//! a [`RunningIngress`] that owns everything needed to shut back down.
 
 mod recorders;
 
 use std::net::SocketAddr;
+use std::num::{NonZeroU8, NonZeroU64};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use kardamom_cluster_adapter::LiveCluster;
 use kardamom_ingress::aeron_adapters::{LiveIngressPublication, LiveIngressSubscription};
 use kardamom_ingress::cluster::cluster_watermark_observer;
 use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
-use kardamom_ingress::proxy::IngressProxy;
+use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::LogConfig;
 use kardamom_obs::bin::wait_for_shutdown;
@@ -57,27 +65,26 @@ struct Args {
     /// `ack_policy` includes a local-fsync gate. Defaults to 0.
     #[arg(long, default_value_t = 0)]
     recorder_id: u8,
-    /// Number of executor replicas to attach to the tx_receipts MDS
+    /// Number of executor replicas to attach to the `tx_receipts` MDS
     /// (fan-in) subscription at startup. Used only when MDS is enabled,
     /// with `tx_receipts_control_channel` set. When unset on the CLI,
     /// this falls back to `channels.tx_receipts_executor_count` from the
     /// log config.
     ///
     /// Static-membership fallback: ingress attaches replicas `0..N` once
-    /// at startup. The real design watches Consul for the
-    /// `executor-receipts` service, and adds or removes destinations as
-    /// membership changes. See the TODO(consul-watch) on
-    /// `ChannelsConfig::tx_receipts_executor_count`.
+    /// at startup. Membership is static for the life of the process.
     #[arg(long, env = "KARDAMOM_EXECUTOR_COUNT")]
     executor_count: Option<u32>,
-    /// Number of tx_data shards (M). Defaults to 8.
-    #[arg(long, default_value_t = 8)]
-    shards: u32,
-    /// Records each per-shard tx_data publication to the Aeron Archive, so
-    /// the executor can replay full transaction envelopes on crash
+    /// Number of `tx_data` shards (M). Defaults to 8. Zero is rejected at
+    /// parse time: it would make `partition_for`'s modulus zero, and it
+    /// would leave the shard-handle vector empty.
+    #[arg(long, default_value = "8")]
+    shards: NonZeroU8,
+    /// Records each per-shard `tx_data` publication to the Aeron Archive,
+    /// so the executor can replay full transaction envelopes on crash
     /// recovery, through `kardamom_log::replay`. Off by default, since
     /// single-host IPC has no archive. The cluster sets this on the node
-    /// where the ArchivingMediaDriver runs.
+    /// where the `ArchivingMediaDriver` runs.
     #[arg(long, env = "KARDAMOM_ARCHIVE_DURABILITY", default_value_t = false)]
     archive_durability: bool,
     /// Durability gate before acking a submit. Mirrors `AckPolicy`:
@@ -89,10 +96,9 @@ struct Args {
     ///   - `on-local-fsync-and-quorum`: waits for both.
     ///
     /// Defaults to `on-offer`, because no process in the deployed
-    /// topology runs a `QuorumAggregator` yet. Nothing publishes the
+    /// topology runs a `QuorumAggregator` yet: nothing publishes the
     /// quorum watermark, so a quorum-gated policy would park every submit
-    /// forever. Change the default back to `on-quorum`, the design's
-    /// production default, once the aggregator is wired in.
+    /// forever.
     #[arg(long, default_value = "on-offer")]
     ack_policy: AckPolicyArg,
     /// Address for the Prometheus /metrics HTTP listener.
@@ -128,8 +134,9 @@ struct Args {
     /// for clients, since the ingress recovers senders from the tx's own
     /// EIP-155 signature. But tooling that queries `eth_chainId` before
     /// signing needs this value to match the executor's `--chain-id`.
-    #[arg(long, env = "KARDAMOM_CHAIN_ID", default_value_t = 1)]
-    chain_id: u64,
+    /// EIP-155 forbids chain id 0, so this is rejected at parse time.
+    #[arg(long, env = "KARDAMOM_CHAIN_ID", default_value = "1")]
+    chain_id: NonZeroU64,
     /// Max time, in milliseconds, that a submit parks waiting for its
     /// receipt and ack gate before the client gets a `-32000` timeout.
     /// This bounds every `eth_sendRawTransaction` call. A nonce-gap tx
@@ -162,129 +169,160 @@ impl From<AckPolicyArg> for kardamom_types::AckPolicy {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<()> {
-    kardamom_obs::bin::init_tracing();
-    let args = Args::parse();
-    kardamom_obs::init_service!("ingress", args.metrics_addr, &args.host_id).await?;
-    kardamom_ingress::metrics::describe();
-    // v0 config loading: runtime tunables come from defaults and CLI
-    // flags. The TOML file supplies the optional `[cluster]` section, the
-    // Aeron Cluster client connection that the on-quorum watermark
-    // observer below uses. A future revision will derive Deserialize for
-    // the full IngressConfig.
-    let raw = std::fs::read_to_string(&args.config).context("read ingress config")?;
-    let file_cfg: IngressFileConfig = toml::from_str(&raw).context("parse ingress config")?;
+/// Everything opened on the way to a running proxy: the Aeron runtime,
+/// the `tx_data` archive recorder threads, and the `tx_data` publication
+/// and `tx_receipts` subscription built on top of it.
+struct OpenedAeron {
+    rt: AeronRuntime,
+    recorder_handles: Vec<std::thread::JoinHandle<()>>,
+    publication: LiveIngressPublication,
+    subscription: LiveIngressSubscription,
+}
 
-    let mut cfg = IngressConfig {
-        jsonrpc_bind: args.jsonrpc_bind,
-        partition_count_m: args.shards,
-        ingress_id: args.ingress_id,
-        ack_policy: args.ack_policy.into(),
-        rpc_max_connections: args.rpc_max_connections,
-        chain_id: args.chain_id,
-        pending_receipt_timeout: Duration::from_millis(args.pending_receipt_timeout_ms),
-        ..IngressConfig::default()
-    };
-    // Clear the binary-protocol binds for the v0 deployment. An operator
-    // who wants them enabled can set them in a follow-up that drives the
-    // config from TOML.
-    cfg.binary_tcp_bind = None;
-    cfg.binary_uds_path = None;
+/// Owns everything needed to open the ingress runtime: the parsed CLI
+/// args, the resolved Aeron/channels config, and the parsed cluster TOML
+/// file config. `main` builds one of these, then calls [`Self::run`].
+struct IngressService {
+    args: Args,
+    log_cfg: LogConfig,
+    file_cfg: IngressFileConfig,
+    stop: CancellationToken,
+}
 
-    tracing::info!(
-        jsonrpc_bind = %cfg.jsonrpc_bind,
-        shards = cfg.partition_count_m,
-        ingress_id = cfg.ingress_id,
-        ack_policy = ?cfg.ack_policy,
-        "kardamom-ingress starting"
-    );
-
-    let resolved = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
-    let channels = resolved.channels;
-    let aeron_cfg = resolved.aeron;
-    let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-
-    // These are archive recorders for tx_data, one per shard, co-located
-    // with the publishers here. They make the full transaction envelopes
-    // durable, so the executor can replay them on crash recovery. Without
-    // them, only the canonical order survives a restart, not the bytes
-    // needed to re-execute.
-    //
-    // Each recorder reports its startup outcome on `recorder_ready`.
-    // `main` blocks on all of them, after the tx_data publications open
-    // and before it serves RPC, so no transaction can be accepted before
-    // its shard's recording is active. Recovery replays from record 0 and
-    // needs every envelope, so a gap at the start of the stream would
-    // permanently break executor crash recovery. A recorder startup
-    // failure is fatal: the operator asked for --archive-durability, so
-    // serving without it would be a silent lie.
-    let stop = CancellationToken::new();
-    let (recorder_handles, recorder_ready) = if args.archive_durability {
-        spawn_tx_data_recorders(
-            args.aeron_dir.clone(),
-            channels.clone(),
-            aeron_cfg.clone(),
-            args.shards as u8,
-            &stop,
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    // tx_receipts MDS membership: prefer the CLI or env
-    // `--executor-count`, and fall back to the log-config field. The
-    // proxy reads this only when MDS is enabled.
-    let executor_count = args
-        .executor_count
-        .unwrap_or(channels.tx_receipts_executor_count);
-
-    let publication = LiveIngressPublication::open(&rt, &channels, args.shards as u8)
-        .context("open IngressPublication")?;
-
-    // This is the recorder barrier; see the recorder-spawn comment above.
-    // With the tx_data publications now open, every shard's recording can
-    // start. This waits for all of them to be confirmed active, or to
-    // fail startup, before the JSON-RPC server accepts its first
-    // transaction.
-    if args.archive_durability {
-        wait_for_recorders(recorder_ready)
-            .await
-            .context("archive durability requested but tx_data recorders failed to start")?;
+impl IngressService {
+    fn new(args: Args, log_cfg: LogConfig, file_cfg: IngressFileConfig) -> Self {
+        Self {
+            args,
+            log_cfg,
+            file_cfg,
+            stop: CancellationToken::new(),
+        }
     }
-    let subscription =
-        LiveIngressSubscription::open(&rt, &channels, args.recorder_id, executor_count)
-            .context("open IngressSubscription")?;
 
-    // This connects the cluster watermark to the on-quorum ack gate. In
-    // the cluster-only topology, no standalone sealer publishes the
-    // durable watermark. Instead, the ingress connects to the Aeron
-    // Cluster (Raft) as a client, and folds its egress progress into an
-    // increasing durable count. A record or boundary on egress is a
-    // Raft-quorum-durability signal, and this feeds the proxy's
-    // watermark bus. This step runs only when the ack policy gates on
-    // quorum. The `LiveCluster` guard stays in scope, so the session
-    // outlives the loop.
-    let _cluster_guard = if cfg.ack_policy.requires_quorum() {
-        let mut live = file_cfg.cluster.to_live();
+    /// Builds the runtime `IngressConfig` from the CLI args. The v0
+    /// deployment keeps the binary protocol off; an operator who wants it
+    /// enabled can set the binds in a follow-up that drives the config
+    /// from TOML.
+    fn build_config(&self) -> IngressConfig {
+        let args = &self.args;
+        let mut cfg = IngressConfig {
+            jsonrpc_bind: args.jsonrpc_bind,
+            // `IngressConfig::partition_count_m` stays a plain `u32`:
+            // `crates/bench` builds `IngressConfig { partition_count_m:
+            // shards, .. }` literals with a `u32` shard count.
+            // `IngressProxy::new` is the one place that re-parses this
+            // back into a `NonZeroU32`.
+            partition_count_m: u32::from(args.shards.get()),
+            ingress_id: args.ingress_id,
+            ack_policy: args.ack_policy.clone().into(),
+            rpc_max_connections: args.rpc_max_connections,
+            // Same reasoning as `partition_count_m`: `IngressConfig::chain_id`
+            // stays a plain `u64` for `crates/bench`'s config literals.
+            chain_id: args.chain_id.get(),
+            pending_receipt_timeout: Duration::from_millis(args.pending_receipt_timeout_ms),
+            ..IngressConfig::default()
+        };
+        cfg.binary_tcp_bind = None;
+        cfg.binary_uds_path = None;
+        cfg
+    }
+
+    /// Opens the Aeron runtime, the `tx_data` archive recorders, and the
+    /// `tx_data` publication and `tx_receipts` subscription.
+    ///
+    /// These are archive recorders for `tx_data`, one per shard, co-located
+    /// with the publishers. They make the full transaction envelopes
+    /// durable, so the executor can replay them on crash recovery. Without
+    /// them, only the canonical order survives a restart, not the bytes
+    /// needed to re-execute.
+    ///
+    /// Each recorder reports its startup outcome on its own `oneshot`. This
+    /// blocks on all of them, after the `tx_data` publications open and before
+    /// it returns, so no transaction can be accepted before its shard's
+    /// recording is active. Recovery replays from record 0 and needs every
+    /// envelope, so a gap at the start of the stream would permanently break
+    /// executor crash recovery. A recorder startup failure is fatal: the
+    /// operator asked for `--archive-durability`, so serving without it
+    /// would be a silent lie.
+    async fn open_aeron_side(&self) -> Result<OpenedAeron> {
+        let args = &self.args;
+        let channels = &self.log_cfg.channels;
+        let aeron_cfg = &self.log_cfg.aeron;
+        let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+
+        let (recorder_handles, recorder_ready) = if args.archive_durability {
+            spawn_tx_data_recorders(
+                args.aeron_dir.as_deref(),
+                channels,
+                aeron_cfg,
+                args.shards,
+                &self.stop,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        // tx_receipts MDS membership: prefer the CLI or env
+        // `--executor-count`, and fall back to the log-config field. The
+        // proxy reads this only when MDS is enabled.
+        let executor_count = args
+            .executor_count
+            .unwrap_or(channels.tx_receipts_executor_count);
+
+        let publication = LiveIngressPublication::open(&rt, channels, args.shards)
+            .context("open IngressPublication")?;
+
+        // This is the recorder barrier: with the tx_data publications now
+        // open, every shard's recording can start.
+        if args.archive_durability {
+            wait_for_recorders(recorder_ready)
+                .await
+                .context("archive durability requested but tx_data recorders failed to start")?;
+        }
+        let subscription =
+            LiveIngressSubscription::open(&rt, channels, args.recorder_id, executor_count)
+                .context("open IngressSubscription")?;
+
+        Ok(OpenedAeron {
+            rt,
+            recorder_handles,
+            publication,
+            subscription,
+        })
+    }
+
+    /// Connects to the cluster as a client and folds its egress progress
+    /// into the proxy's on-quorum watermark bus. No standalone sealer
+    /// publishes the durable watermark in the cluster-only topology, so this
+    /// is the source of it: a record or boundary on egress is a
+    /// Raft-quorum-durability signal.
+    ///
+    /// Returns the `LiveCluster` guard; the caller must keep it alive for as
+    /// long as the returned watermark thread runs.
+    fn spawn_cluster_watermark(
+        &self,
+        subscription: &LiveIngressSubscription,
+    ) -> Result<LiveCluster> {
+        let args = &self.args;
+        let mut live = self.file_cfg.cluster.to_live();
         if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
             live.egress_channel = format!("aeron:udp?endpoint={ep}");
         }
-        // This is a dedicated cluster runtime, with its own Aeron thread
-        // and the same aeron dir, so the cluster session never contends
-        // with the tx_data publish and receipts work.
+        // This is a dedicated cluster runtime, with its own Aeron thread and
+        // the same aeron dir, so the cluster session never contends with the
+        // tx_data publish and receipts work.
         let cluster_rt =
             AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
         let (guard, mut observer) =
             cluster_watermark_observer(cluster_rt, live).context("connect cluster watermark")?;
         // A dedicated std thread runs a blocking egress poll, since the
         // observer holds the `!Send` cluster client. It sends the durable
-        // count to the bus. The thread stops on the shutdown token, or
-        // when the observer ends. The bus is a tokio `broadcast` channel,
-        // so the send never blocks. A send with no live receiver is not
-        // an error here.
+        // count to the bus. The thread stops on the shutdown token, or when
+        // the observer ends. The bus is a tokio `broadcast` channel, so the
+        // send never blocks. A send with no live receiver is not an error
+        // here.
         let wm_tx = subscription.watermark_sender();
-        let wm_stop = stop.clone();
+        let wm_stop = self.stop.clone();
         std::thread::Builder::new()
             .name("cluster-watermark".into())
             .spawn(move || {
@@ -297,23 +335,99 @@ async fn main() -> Result<()> {
             })
             .context("spawn cluster watermark thread")?;
         tracing::info!("kardamom-ingress: on-quorum watermark via Aeron Cluster egress");
-        Some(guard)
-    } else {
-        None
-    };
-
-    let proxy = IngressProxy::new(cfg, publication, subscription);
-    let handle = proxy.start().await.context("IngressProxy::start")?;
-    tracing::info!(jsonrpc_addr = %handle.jsonrpc_addr, "JSON-RPC listening");
-
-    wait_for_shutdown().await;
-    tracing::info!("kardamom-ingress: shutdown signal received");
-    handle.jsonrpc_handle.stop().ok();
-    handle.jsonrpc_handle.stopped().await;
-    stop.cancel();
-    for h in recorder_handles {
-        let _ = h.join();
+        Ok(guard)
     }
-    drop(rt);
+
+    /// Builds the config, opens Aeron, optionally starts the cluster
+    /// watermark watcher, and starts the proxy's listeners. Returns a
+    /// [`RunningIngress`] that owns everything needed to shut back down.
+    async fn run(self) -> Result<RunningIngress> {
+        let cfg = self.build_config();
+        tracing::info!(
+            jsonrpc_bind = %cfg.jsonrpc_bind,
+            shards = cfg.partition_count_m,
+            ingress_id = cfg.ingress_id,
+            ack_policy = ?cfg.ack_policy,
+            "kardamom-ingress starting"
+        );
+
+        let opened = self.open_aeron_side().await?;
+        let cluster_guard = if cfg.ack_policy.requires_quorum() {
+            Some(self.spawn_cluster_watermark(&opened.subscription)?)
+        } else {
+            None
+        };
+
+        let proxy = IngressProxy::new(cfg, opened.publication, opened.subscription);
+        let handle = proxy.start().await.context("IngressProxy::start")?;
+        tracing::info!(jsonrpc_addr = %handle.jsonrpc_addr, "JSON-RPC listening");
+
+        Ok(RunningIngress {
+            handle,
+            stop: self.stop,
+            recorder_handles: opened.recorder_handles,
+            // Declared before `_cluster_guard`: struct fields drop in
+            // declaration order, so `_rt` drops before `_cluster_guard`
+            // when `RunningIngress::shutdown` consumes `self`. This
+            // matches the original `main`'s explicit `drop(rt)` before
+            // `_cluster_guard` went out of scope.
+            _rt: opened.rt,
+            _cluster_guard: cluster_guard,
+        })
+    }
+}
+
+/// A started ingress process: the JSON-RPC handle, the shutdown token,
+/// the recorder thread handles, the Aeron runtime, and the optional
+/// cluster watermark guard. [`Self::shutdown`] waits for the shutdown
+/// signal and tears everything down in the right order.
+struct RunningIngress {
+    handle: IngressHandle,
+    stop: CancellationToken,
+    recorder_handles: Vec<std::thread::JoinHandle<()>>,
+    /// See the field-order comment in [`IngressService::run`]: this must
+    /// stay declared before `_cluster_guard`. Held only for its `Drop`
+    /// side effect (closing the Aeron runtime); the leading underscore
+    /// marks it never read, not that it is unused — dropping it is the
+    /// point.
+    _rt: AeronRuntime,
+    /// Held only for its `Drop` side effect; never read.
+    _cluster_guard: Option<LiveCluster>,
+}
+
+impl RunningIngress {
+    /// Waits for the shutdown signal, stops the JSON-RPC server, cancels
+    /// the recorder stop token, and joins the recorder threads. `self` is
+    /// consumed here, so `_rt` and `_cluster_guard` drop at the end of
+    /// this call, in field declaration order: `_rt` first, then
+    /// `_cluster_guard`.
+    async fn shutdown(self) {
+        wait_for_shutdown().await;
+        tracing::info!("kardamom-ingress: shutdown signal received");
+        self.handle.jsonrpc_handle.stop().ok();
+        self.handle.jsonrpc_handle.stopped().await;
+        self.stop.cancel();
+        for h in self.recorder_handles {
+            let _ = h.join();
+        }
+    }
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> Result<()> {
+    kardamom_obs::bin::init_tracing();
+    let args = Args::parse();
+    kardamom_obs::init_service!("ingress", args.metrics_addr, &args.host_id).await?;
+    kardamom_ingress::metrics::describe();
+
+    // Runtime tunables come from defaults and CLI flags. The TOML file
+    // supplies only the optional `[cluster]` section, the Aeron Cluster
+    // client connection that the on-quorum watermark observer uses.
+    let raw = std::fs::read_to_string(&args.config).context("read ingress config")?;
+    let file_cfg: IngressFileConfig = toml::from_str(&raw).context("parse ingress config")?;
+    let resolved = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
+
+    let running = IngressService::new(args, resolved, file_cfg).run().await?;
+    running.shutdown().await;
     Ok(())
 }

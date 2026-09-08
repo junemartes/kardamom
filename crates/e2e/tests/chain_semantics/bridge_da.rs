@@ -3,7 +3,7 @@
 // main.rs.
 
 /// S1: bridge a deposit in. `depositETH` on L1 appears on L2 as a receipt
-/// keyed by the OP-style source_hash. The minted account can then spend
+/// keyed by the OP-style `source_hash`. The minted account can then spend
 /// the funds (the ingress serves no `eth_getBalance`, so behavior is the
 /// proof).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -74,8 +74,7 @@ async fn s2_bridge_withdrawal_round_trip() {
 /// equal the state root the validator computed on its own. This is the
 /// "batcher's state matches the validator's" guarantee. This test posts
 /// real EIP-4844 blobs to anvil and runs the real
-/// `kardamom-reconstruct --expect-root` binary (no caller used its gate
-/// anywhere before this scenario).
+/// `kardamom-reconstruct --expect-root` binary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s8_da_parity_batcher_matches_validator() {
@@ -95,14 +94,7 @@ async fn s8_da_parity_batcher_matches_validator() {
         .expect("S8 workload");
 
     // 2. Post them to L1 as real blob transactions.
-    let da_dir = tempfile::tempdir().expect("da dir");
-    let da_store = kardamom_batcher::da_store::FsBlobStore::open(da_dir.path()).expect("da store");
-    da_parity::post_to_l1(l1, l1.settlement, &blocks, &da_store)
-        .await
-        .expect("S8 post to L1");
-    da_parity::assert_batches_on_l1(l1, l1.settlement, blocks.len(), &da_store)
-        .await
-        .expect("S8 L1 batch log");
+    let da_dir = post_and_verify_da(l1, &blocks, "S8").await;
 
     // 3. The parity target: the validator's own committed root, read from
     //    its live database once the chain has settled on it.
@@ -112,11 +104,12 @@ async fn s8_da_parity_batcher_matches_validator() {
         Duration::from_secs(60),
         Duration::from_millis(500),
         || async {
-            let committed = t
+            let committed_f64 = t
                 .validator_metric(e2e::scenarios::VALIDATOR_COMMITTED_BLOCK)
                 .await
-                .unwrap_or(0.0) as u64;
-            let head = blocks.last().map(|b| b.block_number).unwrap_or(0);
+                .unwrap_or(0.0);
+            let committed = e2e::scenarios::metric_u64(committed_f64)?;
+            let head = blocks.last().map_or(0, |b| b.block_number);
             if committed < head {
                 return Ok(None);
             }

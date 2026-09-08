@@ -7,6 +7,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Deterministic canonical-ordering state machine for the Kardamom sealer.
@@ -36,9 +37,13 @@ import java.util.Optional;
  *       with the current count and a timestamp floored to 250 ms, then
  *       advances the block number.</li>
  *   <li><b>Remote origins</b> — {@link #onRemoteOriginRecord} tracks a
- *       per-peer anchor position for cross-chain message batches. This is
- *       independent of the L1 origin, and it is not stamped into
- *       boundaries.</li>
+ *       per-peer anchor and a per-peer lane cursor ({@code nextSeq}). A
+ *       record is accepted only if the origin is in the configured
+ *       allowlist, its {@code firstSeq} equals the lane cursor, its
+ *       {@code slotCount} matches its seq range, and its anchor advances.
+ *       A rejected record is answered with a reject outcome and never
+ *       enters the dedup window. The peer position is independent of the
+ *       L1 origin, and it is not stamped into boundaries.</li>
  *   <li><b>Snapshot</b> — {@link #takeSnapshot()} and {@link #load(byte[], int)}
  *       round-trip the full state for cluster snapshots.</li>
  * </ul>
@@ -66,10 +71,29 @@ public final class CanonicalSealerState {
      * which is exactly the pre-origin state. Version 4 adds the per-peer
      * remote-origin map after that, on the same terms: an older snapshot
      * restores an empty peer map, which is exactly the state a pre-interop
-     * chain was in. A cluster can upgrade in place without a coordinated
-     * snapshot migration.
+     * chain was in. Version 5 widens each peer entry with the lane cursor
+     * ({@code nextSeqKnown} + {@code nextSeq}). A v4 entry loads with an
+     * unknown cursor, so the peer re-seeds its cursor on its next record
+     * (trust-on-first-sight). A cluster can upgrade in place without a
+     * coordinated snapshot migration.
      */
-    private static final int SNAPSHOT_VERSION = 4;
+    private static final int SNAPSHOT_VERSION = 5;
+
+    /** Remote-origin reject reason: {@code firstSeq} is not the lane cursor. */
+    public static final byte REMOTE_REJECT_SEQ_MISMATCH = 1;
+    /** Remote-origin reject reason: the anchor does not advance. */
+    public static final byte REMOTE_REJECT_ANCHOR_REGRESSED = 2;
+    /** Remote-origin reject reason: {@code slotCount != 2 + lastSeq - firstSeq}. */
+    public static final byte REMOTE_REJECT_SLOT_COUNT_MISMATCH = 3;
+    /** Remote-origin reject reason: the origin is not in the allowlist. */
+    public static final byte REMOTE_REJECT_UNKNOWN_ORIGIN = 4;
+    /** Remote-origin reject reason: {@code lastSeq < firstSeq}, or the range overflows. */
+    public static final byte REMOTE_REJECT_BAD_RANGE = 5;
+
+    /** Snapshot bytes per remote-origin entry from version 5 on. */
+    private static final int REMOTE_ENTRY_LEN_V5 = 8 + 8 + 1 + 8;
+    /** Snapshot bytes per remote-origin entry in version 4. */
+    private static final int REMOTE_ENTRY_LEN_V4 = 8 + 8;
 
     /**
      * FIFO first-seen window. It is insertion-ordered, so the oldest inserted
@@ -100,23 +124,54 @@ public final class CanonicalSealerState {
     private final LinkedHashMap<ByteBuffer, Long> expectedNonce;
 
     /**
-     * Per-peer remote origin: {@code originChainId} → the anchor position of
-     * the last remote batch adopted from that peer (see
-     * {@link #onRemoteOriginRecord}). Peers are INDEPENDENT — one peer's
-     * position never gates another's, which is why this is a map and not the
-     * single scalar {@link #l1Origin} is (there is exactly one L1, but any
-     * number of peers).
+     * Per-peer remote-origin state: the anchor position of the last remote
+     * batch adopted from the peer, and the peer's lane cursor. Immutable, so
+     * the map replaces an entry instead of mutating it.
+     */
+    public static final class RemotePeer {
+        /** The anchor last adopted from this peer. */
+        public final long anchorNumber;
+        /**
+         * True when {@link #nextSeq} is known. False only for a peer loaded
+         * from a version-4 snapshot, which had no cursor. Such a peer seeds
+         * its cursor from its next record.
+         */
+        public final boolean nextSeqKnown;
+        /** The first seq of this lane that is not yet ordered (unsigned). */
+        public final long nextSeq;
+
+        RemotePeer(long anchorNumber, boolean nextSeqKnown, long nextSeq) {
+            this.anchorNumber = anchorNumber;
+            this.nextSeqKnown = nextSeqKnown;
+            this.nextSeq = nextSeq;
+        }
+    }
+
+    /**
+     * Per-peer remote origin: {@code originChainId} → {@link RemotePeer}
+     * (see {@link #onRemoteOriginRecord}). Peers are INDEPENDENT — one
+     * peer's position never gates another's, which is why this is a map and
+     * not the single scalar {@link #l1Origin} is (there is exactly one L1,
+     * but any number of peers).
      *
      * <p>Insertion-ordered so {@link #takeSnapshot()} serialises it
-     * deterministically. Unbounded on purpose, unlike {@link #expectedNonce}:
-     * the key space is the operator-configured peer registry (a handful of
-     * chain ids), not attacker-supplied addresses, and an LRU floor here would
-     * silently re-seed an evicted peer at whatever anchor arrives — a
-     * monotonicity hole rather than the honest degradation it is for senders.
-     * If the peer set ever became open, bound it at the registry size, not at
-     * the dedup capacity.</p>
+     * deterministically. Bounded by {@link #remoteOriginAllowlist}: a record
+     * from an origin outside the allowlist is rejected before it can add an
+     * entry, so the map never grows past the configured peer set. An LRU
+     * floor here would silently re-seed an evicted peer at whatever anchor
+     * arrives, which is a monotonicity hole, so the bound is the allowlist
+     * and not the dedup capacity.</p>
      */
-    private final LinkedHashMap<Long, Long> remoteOrigins;
+    private final LinkedHashMap<Long, RemotePeer> remoteOrigins;
+
+    /**
+     * The peer chain ids this sealer accepts remote-origin records from. An
+     * empty set disables interop: every kind-5 record is rejected. This is
+     * configuration that every member must agree on, like the dedup
+     * capacity, because it decides accept-or-reject in the replicated state
+     * machine. It is not part of the snapshot.
+     */
+    private final Set<Long> remoteOriginAllowlist;
 
     /** Cumulative count of canonical (first-seen) records relayed. */
     private long canonicalCount;
@@ -155,10 +210,25 @@ public final class CanonicalSealerState {
         this(dedupCapacity, GENESIS_BLOCK_NUMBER);
     }
 
+    /**
+     * Create a state with an EMPTY remote-origin allowlist: interop is
+     * disabled, and every remote-origin record is rejected.
+     */
     public CanonicalSealerState(int dedupCapacity, long initialBlockNumber) {
+        this(dedupCapacity, initialBlockNumber, Set.of());
+    }
+
+    /**
+     * Create a state at genesis with the given remote-origin allowlist.
+     *
+     * @param remoteOrigins the peer chain ids this sealer accepts remote
+     *        batches from; empty disables interop
+     */
+    public CanonicalSealerState(int dedupCapacity, long initialBlockNumber, Set<Long> remoteOrigins) {
         if (dedupCapacity <= 0) {
             throw new IllegalArgumentException("dedupCapacity must be > 0, got " + dedupCapacity);
         }
+        this.remoteOriginAllowlist = Set.copyOf(remoteOrigins);
         this.dedupCapacity = dedupCapacity;
         this.dedup = new LinkedHashSet<>();
         this.expectedNonce = new LinkedHashMap<>(16, 0.75f, true) {
@@ -419,27 +489,82 @@ public final class CanonicalSealerState {
     }
 
     /**
+     * Outcome of {@link #onRemoteOriginRecord}. It is exactly one of:
+     * <ul>
+     *   <li>dropped duplicate — {@code advance} is empty, {@code rejected}
+     *       is false;</li>
+     *   <li>relayed — {@code advance} holds the forced boundary (if any)
+     *       and the record to relay;</li>
+     *   <li>rejected — {@code rejected} is true, {@code reason} is one of
+     *       the {@code REMOTE_REJECT_*} codes, and {@code expectedNextSeq}
+     *       carries the lane cursor (0 unless the reason is a seq
+     *       mismatch).</li>
+     * </ul>
+     */
+    public static final class RemoteOriginOutcome {
+        public final Optional<RemoteOriginAdvance> advance;
+        public final boolean rejected;
+        public final byte reason;
+        public final long expectedNextSeq;
+
+        private RemoteOriginOutcome(
+                Optional<RemoteOriginAdvance> advance, boolean rejected, byte reason, long expectedNextSeq) {
+            this.advance = advance;
+            this.rejected = rejected;
+            this.reason = reason;
+            this.expectedNextSeq = expectedNextSeq;
+        }
+
+        static RemoteOriginOutcome duplicate() {
+            return new RemoteOriginOutcome(Optional.empty(), false, (byte) 0, 0L);
+        }
+
+        static RemoteOriginOutcome relayed(RemoteOriginAdvance a) {
+            return new RemoteOriginOutcome(Optional.of(a), false, (byte) 0, 0L);
+        }
+
+        static RemoteOriginOutcome rejected(byte reason, long expectedNextSeq) {
+            return new RemoteOriginOutcome(Optional.empty(), true, reason, expectedNextSeq);
+        }
+    }
+
+    /**
      * Process one REMOTE-ORIGIN record: a batch of cross-chain messages a peer
      * chain produced, carried by its own ingress kind (see
      * {@code KIND_REMOTE_ORIGIN_RECORD} in
-     * {@code crates/cluster-adapter/src/wire.rs}). The shape mirrors
-     * {@link #onOriginRecord}, in the same order:
+     * {@code crates/cluster-adapter/src/wire}). The steps, in order:
      *
      * <ol>
-     *   <li>drop it if the canonical id is a duplicate — the Rust-side
-     *       canonical id already mixes the origin chain id into its preimage,
-     *       so ONE dedup window covers every peer without collisions and the
-     *       M-watcher fan-in (every watcher forwards every remote batch) is
-     *       absorbed exactly as the epoch fan-in is;</li>
+     *   <li>drop it if the canonical id is already in the dedup window. The
+     *       Rust-side canonical id mixes the origin chain id, the anchor, and
+     *       the seq range into its preimage, so ONE dedup window covers every
+     *       peer, and the M-watcher fan-in (every watcher forwards every
+     *       remote batch) is absorbed exactly as the epoch fan-in is. This
+     *       check runs FIRST, so a re-offer of an adopted record is never
+     *       read as a lane regression;</li>
+     *   <li>reject it if {@code originChainId} is not in the allowlist;</li>
+     *   <li>reject it if the seq range is malformed, or if
+     *       {@code slotCount != 2 + lastSeq - firstSeq} (the marker plus one
+     *       slot per message). The sealer never parses the payload, so this
+     *       is the only place the claimed slot count meets the claimed
+     *       range;</li>
+     *   <li>reject it if THIS peer's lane cursor is known and
+     *       {@code firstSeq} differs from it. This is the lane contiguity
+     *       guard: a record that skips or repeats a seq never seals. An
+     *       unknown peer seeds its cursor at {@code firstSeq}
+     *       (trust-on-first-sight, like the contiguity guard's unknown
+     *       senders);</li>
      *   <li>reject it if {@code anchorNumber} does not advance THIS peer's
-     *       position — peers are independent, so the check reads and writes
-     *       only that peer's entry and one peer's stall can never gate
-     *       another's;</li>
+     *       position (the second guard). Peers are independent, so the
+     *       checks read and write only that peer's entry;</li>
+     *   <li>only now insert the id into the dedup window. A rejected id
+     *       never enters the window, so a racing copy of the same record is
+     *       rejected the same way and never absorbed as a "duplicate";</li>
      *   <li>close the currently open block (if it holds any records) so the
      *       batch LEADS a block, keeping its contiguous slot range inside one
-     *       block and its marker aligned with the block start — the deposit
-     *       reasoning, unchanged;</li>
-     *   <li>relay the payload verbatim at the first slot and consume
+     *       block and its marker aligned with the block start;</li>
+     *   <li>adopt the anchor, set the lane cursor to {@code lastSeq + 1},
+     *       relay the payload verbatim at the first slot, and consume
      *       {@code slotCount} slots, exactly as the epoch path does.</li>
      * </ol>
      *
@@ -447,63 +572,78 @@ public final class CanonicalSealerState {
      * carries {@code l1Origin} because there is exactly one L1; a per-peer
      * stamp would grow EVERY boundary by the peer count for data that is
      * already recoverable from the stream itself (the relayed markers, which
-     * replay preserves). The map below therefore exists only for dedup's
-     * companion checks — monotonicity and the forced boundary. Do not add
-     * fields to {@link Boundary} for it.</p>
+     * replay preserves). Do not add fields to {@link Boundary} for it.</p>
      *
-     * <p>An unknown peer seeds at whatever anchor arrives (trust-on-first
-     * -sight, like the contiguity guard's unknown senders): this state machine
-     * has no more access to a peer chain than it has to L1, so the first
-     * position it can possibly know is the first one ordered. Every position
-     * after that must strictly advance.</p>
+     * <p>All seq and anchor comparisons are unsigned: the Rust side sends
+     * u64 values.</p>
      *
      * @param originChainId the peer chain this batch came from
      * @param anchorNumber the peer-side position this batch is anchored at
-     * @param slotCount canonical slots claimed (1 + message count); must be >= 1
-     * @return empty if the record was a duplicate; otherwise the forced
-     *         boundary (if any) and the relayed record
-     * @throws IllegalArgumentException if {@code anchorNumber} does not advance
-     *         that peer's position or {@code slotCount} is below 1
+     * @param slotCount canonical slots claimed (1 + message count)
+     * @param firstSeq the seq of the batch's first message
+     * @param lastSeq the seq of the batch's last message
+     * @return the outcome: duplicate, relayed, or rejected with a reason
      */
-    public Optional<RemoteOriginAdvance> onRemoteOriginRecord(
+    public RemoteOriginOutcome onRemoteOriginRecord(
             byte[] canonicalId32,
             long originChainId,
             long anchorNumber,
             long slotCount,
+            long firstSeq,
+            long lastSeq,
             byte[] payload,
             long leaderClockMillis) {
-        if (slotCount < 1) {
-            // Same reason as the epoch path: a zero-width record would let the
-            // next record reuse this index, and the consumer keys BY index.
-            throw new IllegalArgumentException("slotCount must be >= 1, got " + slotCount);
+        checkId(canonicalId32);
+        ByteBuffer key = ByteBuffer.wrap(canonicalId32.clone()).asReadOnlyBuffer();
+        // Dedup LOOKUP first: the racing watchers' normal re-offers carry
+        // the position already adopted and would read as lane regressions
+        // if checked before this.
+        if (dedup.contains(key)) {
+            return RemoteOriginOutcome.duplicate();
         }
-        // Dedup FIRST, for the same reason the epoch path does: the racing
-        // watchers' normal re-offers carry the position already adopted and
-        // would all read as regressions if checked before dedup.
-        if (!firstSeen(canonicalId32)) {
-            return Optional.empty();
+        if (!remoteOriginAllowlist.contains(originChainId)) {
+            return RemoteOriginOutcome.rejected(REMOTE_REJECT_UNKNOWN_ORIGIN, 0L);
         }
-        Long adopted = remoteOrigins.get(originChainId);
-        if (adopted != null && anchorNumber <= adopted.longValue()) {
-            // Not a duplicate, yet claiming a position at or below the one
-            // already adopted FOR THIS PEER: two producers disagree about that
-            // peer's chain. Rejecting keeps the per-peer position monotonic,
-            // which the destination-side ordering depends on. Other peers'
-            // entries are untouched.
-            throw new IllegalArgumentException(
-                    "remote origin must advance for chain " + originChainId
-                            + ": have " + adopted + ", got " + anchorNumber);
+        if (Long.compareUnsigned(lastSeq, firstSeq) < 0) {
+            return RemoteOriginOutcome.rejected(REMOTE_REJECT_BAD_RANGE, 0L);
         }
+        long span = lastSeq - firstSeq; // unsigned, no overflow: lastSeq >= firstSeq
+        if (Long.compareUnsigned(span, Long.MAX_VALUE - 2) > 0) {
+            return RemoteOriginOutcome.rejected(REMOTE_REJECT_BAD_RANGE, 0L);
+        }
+        if (slotCount != span + 2) {
+            // A zero-width or over-wide record would let the next record
+            // reuse a slot, or leave slots no message fills. The consumer
+            // keys BY index, so this must fail here and not downstream.
+            return RemoteOriginOutcome.rejected(REMOTE_REJECT_SLOT_COUNT_MISMATCH, 0L);
+        }
+        RemotePeer peer = remoteOrigins.get(originChainId);
+        if (peer != null) {
+            if (peer.nextSeqKnown && peer.nextSeq != firstSeq) {
+                // Not a duplicate, yet not the next slice of this lane: the
+                // record skips or repeats a seq. Sealing it would commit a
+                // permanent lane hole that no retry can fill.
+                return RemoteOriginOutcome.rejected(REMOTE_REJECT_SEQ_MISMATCH, peer.nextSeq);
+            }
+            if (Long.compareUnsigned(anchorNumber, peer.anchorNumber) <= 0) {
+                // Claiming a position at or below the one already adopted
+                // FOR THIS PEER: two producers disagree about that peer's
+                // chain. Other peers' entries are untouched.
+                return RemoteOriginOutcome.rejected(REMOTE_REJECT_ANCHOR_REGRESSED, 0L);
+            }
+        }
+        // Every check passed. Only now does the id enter the window.
+        insertFresh(key);
         Boundary forced = null;
         if (canonicalCount > lastBoundaryCount) {
             forced = onTick(leaderClockMillis);
         }
-        remoteOrigins.put(originChainId, anchorNumber);
+        remoteOrigins.put(originChainId, new RemotePeer(anchorNumber, true, lastSeq + 1));
         long index = canonicalCount;
         // Relayed at the FIRST slot of its range; the rest is consumed here so
         // the next record starts past this batch's messages.
         canonicalCount += slotCount;
-        return Optional.of(new RemoteOriginAdvance(forced, new Relayed(index, payload)));
+        return RemoteOriginOutcome.relayed(new RemoteOriginAdvance(forced, new Relayed(index, payload)));
     }
 
     /** L1 origin currently stamped into boundaries. */
@@ -516,7 +656,23 @@ public final class CanonicalSealerState {
      * no batch from that peer has been ordered yet.
      */
     public Optional<Long> remoteOriginOf(long originChainId) {
-        return Optional.ofNullable(remoteOrigins.get(originChainId));
+        RemotePeer p = remoteOrigins.get(originChainId);
+        return p == null ? Optional.empty() : Optional.of(p.anchorNumber);
+    }
+
+    /**
+     * The lane cursor for {@code originChainId}: the first seq not yet
+     * ordered. Empty if the peer is unknown, or if its cursor is unknown
+     * (loaded from a version-4 snapshot).
+     */
+    public Optional<Long> remoteNextSeqOf(long originChainId) {
+        RemotePeer p = remoteOrigins.get(originChainId);
+        return (p == null || !p.nextSeqKnown) ? Optional.empty() : Optional.of(p.nextSeq);
+    }
+
+    /** The configured remote-origin allowlist (read-only). */
+    public Set<Long> remoteOriginAllowlist() {
+        return remoteOriginAllowlist;
     }
 
     /** Number of peer chains with an adopted remote-origin position. */
@@ -579,12 +735,14 @@ public final class CanonicalSealerState {
      * blockNumber(8) | idCount(4) | idCount * 32 | senderCount(4) |
      * senderCount * (sender 20 + expectedNonce 8) | l1Origin(8) |
      * lastL2Timestamp(8) | lastBoundaryCount(8) | remoteCount(4) |
-     * remoteCount * (originChainId 8 + anchorNumber 8).</p>
+     * remoteCount * (originChainId 8 + anchorNumber 8 + nextSeqKnown 1 +
+     * nextSeq 8).</p>
      *
      * <p>The version-3 origin trio is added after the version-2 sender map,
      * and the version-4 peer map after the trio, so version-1 through
      * version-3 parsing stays byte-identical and older snapshots keep
-     * loading.</p>
+     * loading. Version 5 widens each peer entry by 9 bytes (the lane
+     * cursor); a version-4 snapshot is parsed with the 16-byte entry.</p>
      */
     public byte[] takeSnapshot() {
         int idCount = dedup.size();
@@ -593,7 +751,7 @@ public final class CanonicalSealerState {
         int size = 4 + 4 + 8 + 8 + 4 + idCount * CANONICAL_ID_LEN
                 + 4 + senderCount * (SENDER_LEN + 8)
                 + 8 + 8 + 8
-                + 4 + remoteCount * (8 + 8);
+                + 4 + remoteCount * REMOTE_ENTRY_LEN_V5;
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
         buf.putInt(SNAPSHOT_VERSION);
@@ -620,11 +778,13 @@ public final class CanonicalSealerState {
         buf.putLong(l1Origin);
         buf.putLong(lastL2Timestamp);
         buf.putLong(lastBoundaryCount);
-        // v4 tail: the per-peer remote origins, in insertion order.
+        // v5 tail: the per-peer remote origins, in insertion order.
         buf.putInt(remoteCount);
-        for (Map.Entry<Long, Long> e : remoteOrigins.entrySet()) {
+        for (Map.Entry<Long, RemotePeer> e : remoteOrigins.entrySet()) {
             buf.putLong(e.getKey());
-            buf.putLong(e.getValue());
+            buf.putLong(e.getValue().anchorNumber);
+            buf.put(e.getValue().nextSeqKnown ? (byte) 1 : (byte) 0);
+            buf.putLong(e.getValue().nextSeq);
         }
         return buf.array();
     }
@@ -636,6 +796,16 @@ public final class CanonicalSealerState {
      * {@code blockNumber} resume from the same values.
      */
     public static CanonicalSealerState load(byte[] snapshot, int dedupCapacity) {
+        return load(snapshot, dedupCapacity, Set.of());
+    }
+
+    /**
+     * Restore a state with the given remote-origin allowlist. The allowlist
+     * is configuration, not snapshot content: a peer entry whose origin is
+     * no longer allowlisted stays in the map (its history is replicated
+     * state), but its next record is rejected.
+     */
+    public static CanonicalSealerState load(byte[] snapshot, int dedupCapacity, Set<Long> remoteOrigins) {
         ByteBuffer buf = ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN);
         int magic = buf.getInt();
         if (magic != SNAPSHOT_MAGIC) {
@@ -668,7 +838,7 @@ public final class CanonicalSealerState {
                             + buf.remaining() + " remaining");
         }
 
-        CanonicalSealerState state = new CanonicalSealerState(dedupCapacity, blockNumber);
+        CanonicalSealerState state = new CanonicalSealerState(dedupCapacity, blockNumber, remoteOrigins);
         for (int i = 0; i < idCount; i++) {
             byte[] raw = new byte[CANONICAL_ID_LEN];
             buf.get(raw);
@@ -706,16 +876,25 @@ public final class CanonicalSealerState {
         }
         if (version >= 4) {
             int remoteCount = buf.getInt();
-            if (remoteCount < 0 || (long) remoteCount * (8 + 8) > buf.remaining()) {
+            int entryLen = version >= 5 ? REMOTE_ENTRY_LEN_V5 : REMOTE_ENTRY_LEN_V4;
+            if (remoteCount < 0 || (long) remoteCount * entryLen > buf.remaining()) {
                 throw new IllegalArgumentException(
                         "truncated snapshot: remoteCount " + remoteCount + " needs "
-                                + ((long) remoteCount * (8 + 8)) + " bytes, only "
+                                + ((long) remoteCount * entryLen) + " bytes, only "
                                 + buf.remaining() + " remaining");
             }
             for (int i = 0; i < remoteCount; i++) {
                 long originChainId = buf.getLong();
                 long anchorNumber = buf.getLong();
-                state.remoteOrigins.put(originChainId, anchorNumber);
+                boolean nextSeqKnown = false;
+                long nextSeq = 0L;
+                if (version >= 5) {
+                    nextSeqKnown = buf.get() != 0;
+                    nextSeq = buf.getLong();
+                }
+                // A v4 entry has no cursor. The peer keeps its anchor guard
+                // and seeds its cursor from its next record.
+                state.remoteOrigins.put(originChainId, new RemotePeer(anchorNumber, nextSeqKnown, nextSeq));
             }
         }
         // A version-1 snapshot (before the guard existed) restores an empty
@@ -725,7 +904,9 @@ public final class CanonicalSealerState {
         // which is exactly the state that chain was in. A version-1 through
         // version-3 snapshot (before interop) restores an empty peer map,
         // and each peer re-seeds on its next batch, the same
-        // trust-on-first-sight behavior.
+        // trust-on-first-sight behavior. A version-4 snapshot restores each
+        // peer's anchor with an unknown lane cursor. The cursor seeds from
+        // the peer's next record.
         state.canonicalCount = canonicalCount;
         return state;
     }

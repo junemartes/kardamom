@@ -8,7 +8,7 @@ use alloy_primitives::Bytes as AlloyBytes;
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use kardamom_types::Deposit;
-use kardamom_types::xchain::{self, XChainMessage};
+use kardamom_types::xchain;
 use revm::context::TxEnv;
 use revm::primitives::TxKind;
 
@@ -19,9 +19,9 @@ use crate::exec_types::TxIndex;
 
 /// A decoded 2718 envelope, ready for `TxEnv` derivation.
 ///
-/// This newtype owns both halves of the old free-function pair
-/// (`decode_alloy_envelope` and `tx_env_from_alloy`). It stays independent
-/// of [`super::Executor`]. The Block-STM engine decodes off-thread, in
+/// This newtype owns both decoding ([`DecodedTx::decode`]) and `TxEnv`
+/// derivation ([`DecodedTx::tx_env`]). It stays independent of
+/// [`super::Executor`]. The Block-STM engine decodes off-thread, in
 /// `prepare`, and hands the decoded value to a worker later.
 #[derive(Debug, Clone)]
 pub struct DecodedTx(pub alloy_consensus::TxEnvelope);
@@ -30,6 +30,11 @@ impl DecodedTx {
     /// Decode from the `raw_tx` bytes carried in a
     /// `kardamom_types::TxEnvelope`. The proxy already verified the
     /// signature. This method only needs the typed accessors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::Execution`] when `raw_tx` fails to decode
+    /// as a 2718 envelope.
     pub fn decode(raw_tx: &Bytes, tx_idx: TxIndex) -> Result<Self, ExecutorError> {
         let mut slice: &[u8] = raw_tx.as_ref();
         alloy_consensus::TxEnvelope::decode_2718(&mut slice)
@@ -58,13 +63,11 @@ impl core::ops::Deref for DecodedTx {
 /// Convert a recovered tx envelope into a `TxEnv`. `signer` is the sender
 /// the proxy already populated; this function never recomputes it.
 ///
-/// This uses a full struct literal on purpose. It used to end in
-/// `..Default::default()`, which silently dropped `tx_type`, `access_list`,
-/// `gas_priority_fee`, and `authorization_list`. That made 2930, 1559, and
-/// 7702 txs execute with legacy semantics: no access-list warmth, no
-/// priority-fee split, and set-code txs treated as plain calls. Every
-/// field is now populated from the envelope. A revm field addition now
-/// causes a compile error, forcing a decision instead of a silent default.
+/// Use a full struct literal. A revm field addition must break the build,
+/// forcing a decision instead of a silent `..Default::default()` (which
+/// would drop `tx_type`, `access_list`, `gas_priority_fee`, or
+/// `authorization_list`, and make 2930, 1559, and 7702 txs execute with
+/// legacy semantics).
 fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Address) -> TxEnv {
     use revm::context_interface::either::Either;
     TxEnv {
@@ -128,17 +131,32 @@ pub(super) fn tx_env_from_deposit(dep: &Deposit) -> TxEnv {
 /// Build a `TxEnv` for one cross-chain delivery. The call is fee-free
 /// (`gas_price = 0`), carries no nonce, and its caller is the aliased
 /// origin Outbox — the only address `Inbox.deliver` accepts. `gas_limit`
-/// adds [`super::xchain::XCHAIN_DELIVERY_OVERHEAD`] on top of the
-/// message's own budget, to also pay for the Inbox's own bookkeeping.
-pub(super) fn tx_env_from_xchain(origin_chain_id: u64, message: &XChainMessage) -> TxEnv {
+/// is [`super::xchain::xchain_gas_budget`]: the message's own budget, plus
+/// [`super::xchain::XCHAIN_DELIVERY_OVERHEAD`] for the Inbox's bookkeeping,
+/// plus the intrinsic gas of the delivery calldata.
+///
+/// Both delivery paths (the free `execute_xchain_tx` and
+/// `Executor::execute_xchain`) build their `TxEnv` here, so the budget
+/// cannot drift between them.
+///
+/// The parameter type is the enforcement: a bare `&XChainMessage` could
+/// carry an unbounded wire `gas_limit`. Taking
+/// [`super::xchain::ValuelessMessage`] instead means only a value
+/// [`ValuelessMessage::new`](super::xchain::ValuelessMessage::new) has
+/// already bounded to the block gas limit can reach this function at
+/// all.
+pub(super) fn tx_env_from_xchain(
+    origin_chain_id: u64,
+    message: &super::xchain::ValuelessMessage<'_>,
+) -> TxEnv {
+    let calldata = xchain::deliver_calldata(origin_chain_id, message);
+    let gas_limit = super::xchain::xchain_gas_budget(message.gas_limit, &calldata);
     TxEnv {
         caller: xchain::xchain_tx_sender(origin_chain_id),
         kind: TxKind::Call(xchain::INBOX),
         value: alloy_primitives::U256::ZERO,
-        data: AlloyBytes::from(xchain::deliver_calldata(origin_chain_id, message)),
-        gas_limit: message
-            .gas_limit
-            .saturating_add(super::xchain::XCHAIN_DELIVERY_OVERHEAD),
+        data: AlloyBytes::from(calldata),
+        gas_limit,
         gas_price: 0,
         nonce: 0,
         chain_id: None,
@@ -146,7 +164,6 @@ pub(super) fn tx_env_from_xchain(origin_chain_id: u64, message: &XChainMessage) 
     }
 }
 
-// -- tx_env_from_alloy typed-field mapping ----------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,7 +183,7 @@ mod tests {
             gas_limit: 21_000,
             to: APTxKind::Call(address!("0x1111111111111111111111111111111111111111")),
             value: U256::from(5),
-            input: Default::default(),
+            input: AlloyBytes::default(),
         };
         let env: alloy_consensus::TxEnvelope = tx.into_signed(dummy_sig()).into();
         let te = tx_env_from_alloy(&env, Address::ZERO);
@@ -193,7 +210,7 @@ mod tests {
             to: APTxKind::Call(address!("0x1111111111111111111111111111111111111111")),
             value: U256::ZERO,
             access_list: al,
-            input: Default::default(),
+            input: AlloyBytes::default(),
         };
         let env: alloy_consensus::TxEnvelope = tx.into_signed(dummy_sig()).into();
         let te = tx_env_from_alloy(&env, Address::ZERO);
@@ -224,9 +241,9 @@ mod tests {
             max_priority_fee_per_gas: 2,
             to: address!("0x1111111111111111111111111111111111111111"),
             value: U256::ZERO,
-            access_list: Default::default(),
+            access_list: alloy_eips::eip2930::AccessList::default(),
             authorization_list: alloc::vec![signed_auth],
-            input: Default::default(),
+            input: AlloyBytes::default(),
         };
         let env: alloy_consensus::TxEnvelope = tx.into_signed(dummy_sig()).into();
         let te = tx_env_from_alloy(&env, Address::ZERO);

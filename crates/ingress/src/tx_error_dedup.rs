@@ -2,7 +2,7 @@
 //! replicas.
 //!
 //! With P=2 replicas racing per shard, both replicas nonce-order the same
-//! tx_data stream. So a per-tx rejection, today `DuplicatedTx`, is emitted
+//! `tx_data` stream. So a per-tx rejection, today `DuplicatedTx`, is emitted
 //! by both, and arrives up to P times at ingress. Worse, a rejection from
 //! one replica can race a success from its twin: a replica whose nonce
 //! floor is briefly stale, for example a rejoiner fast-forwarding, may
@@ -15,7 +15,7 @@
 //!   watcher calls this for every first-copy receipt. A success observed
 //!   within the window suppresses any rejection for the same key, so
 //!   success overrides rejection.
-//! - [`observe_error`](TxErrorDedup::observe_error): the tx_errors
+//! - [`observe_error`](TxErrorDedup::observe_error): the `tx_errors`
 //!   watcher calls this. It processes the first error of a given reason
 //!   class for a key within the window, and drops later copies, the
 //!   twin's duplicate emission.
@@ -41,6 +41,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::mem::Discriminant;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -51,12 +52,12 @@ use kardamom_types::TxErrorReason;
 /// milliseconds, and the rejection-vs-success race window, the
 /// ordering-to-receipt latency, well under a second. It must also stay
 /// far below a plausible client retry of the same nonce.
-pub const DEFAULT_WINDOW: Duration = Duration::from_secs(10);
+pub(crate) const DEFAULT_WINDOW: Duration = Duration::from_secs(10);
 
 /// Default entry capacity. Terminal marks are needed only for the
 /// in-flight window. Tens of thousands is far more than a few seconds of
 /// traffic needs.
-pub const DEFAULT_CAPACITY: usize = 1 << 16;
+pub(crate) const DEFAULT_CAPACITY: NonZeroUsize = NonZeroUsize::new(1 << 16).unwrap();
 
 /// Last terminal observation for a `(sender, nonce)` key.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,11 +80,11 @@ struct Inner {
 }
 
 /// Thread-safe, bounded, TTL-windowed terminal-outcome tracker for
-/// tx_errors.
-pub struct TxErrorDedup {
+/// `tx_errors`.
+pub(crate) struct TxErrorDedup {
     inner: Mutex<Inner>,
     window: Duration,
-    capacity: usize,
+    capacity: NonZeroUsize,
 }
 
 impl Default for TxErrorDedup {
@@ -93,8 +94,8 @@ impl Default for TxErrorDedup {
 }
 
 impl TxErrorDedup {
-    pub fn new(window: Duration, capacity: usize) -> Self {
-        assert!(capacity > 0, "TxErrorDedup capacity must be > 0");
+    #[must_use]
+    pub(crate) fn new(window: Duration, capacity: NonZeroUsize) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
@@ -108,7 +109,7 @@ impl TxErrorDedup {
     /// Records that a receipt for `(sender, nonce)` was observed. This
     /// suppresses any rejection for the same key that arrives within the
     /// window, since success overrides rejection.
-    pub fn record_success(&self, sender: Address, nonce: u64) {
+    pub(crate) fn record_success(&self, sender: Address, nonce: u64) {
         self.record_success_at(sender, nonce, Instant::now());
     }
 
@@ -116,7 +117,13 @@ impl TxErrorDedup {
     /// `false` if it should drop the error as a replica duplicate or as
     /// overridden by success. Processing an error records it, so the
     /// twin's copy of the same emission returns `false`.
-    pub fn observe_error(&self, sender: Address, nonce: u64, reason: &TxErrorReason) -> bool {
+    #[must_use]
+    pub(crate) fn observe_error(
+        &self,
+        sender: Address,
+        nonce: u64,
+        reason: &TxErrorReason,
+    ) -> bool {
         self.observe_error_at(sender, nonce, reason, Instant::now())
     }
 
@@ -155,6 +162,18 @@ impl TxErrorDedup {
 }
 
 impl Inner {
+    /// Removes `key` from `map` only if its stored timestamp still equals
+    /// `at`. A key refreshed since `at` was recorded, in `purge` or
+    /// `insert`'s order queue, has a newer timestamp by the time its old
+    /// queue entry is reached, so this leaves the refresh alone.
+    fn remove_if_current(&mut self, key: (Address, u64), at: Instant) {
+        if let Some(&(_, cur_at)) = self.map.get(&key)
+            && cur_at == at
+        {
+            self.map.remove(&key);
+        }
+    }
+
     /// Drops entries older than `window`. Skips order-queue entries that
     /// were refreshed after they were enqueued.
     fn purge(&mut self, now: Instant, window: Duration) {
@@ -163,28 +182,20 @@ impl Inner {
                 break;
             }
             self.order.pop_front();
-            if let Some(&(_, cur_at)) = self.map.get(&key)
-                && cur_at == at
-            {
-                self.map.remove(&key);
-            }
+            self.remove_if_current(key, at);
         }
     }
 
     /// Inserts or refreshes `key`. Evicts the oldest live entries past
     /// `capacity`.
-    fn insert(&mut self, key: (Address, u64), mark: Mark, now: Instant, capacity: usize) {
+    fn insert(&mut self, key: (Address, u64), mark: Mark, now: Instant, capacity: NonZeroUsize) {
         self.map.insert(key, (mark, now));
         self.order.push_back((key, now));
-        while self.map.len() > capacity {
+        while self.map.len() > capacity.get() {
             let Some((old_key, old_at)) = self.order.pop_front() else {
                 break; // Unreachable: map.len() > 0 means order entries exist.
             };
-            if let Some(&(_, cur_at)) = self.map.get(&old_key)
-                && cur_at == old_at
-            {
-                self.map.remove(&old_key);
-            }
+            self.remove_if_current(old_key, old_at);
         }
     }
 }
@@ -195,8 +206,12 @@ mod tests {
 
     const WINDOW: Duration = Duration::from_secs(5);
 
+    fn capacity(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap()
+    }
+
     fn dedup() -> TxErrorDedup {
-        TxErrorDedup::new(WINDOW, 16)
+        TxErrorDedup::new(WINDOW, capacity(16))
     }
 
     fn dup_reason(expected_nonce: u64) -> TxErrorReason {
@@ -277,7 +292,7 @@ mod tests {
 
     #[test]
     fn capacity_bound_evicts_oldest() {
-        let d = TxErrorDedup::new(WINDOW, 4);
+        let d = TxErrorDedup::new(WINDOW, capacity(4));
         let now = Instant::now();
         for i in 0..6u8 {
             assert!(d.observe_error_at(Address::repeat_byte(i), 0, &dup_reason(0), now));

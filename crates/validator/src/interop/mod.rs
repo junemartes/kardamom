@@ -1,6 +1,4 @@
-//! The validator's interop role (`docs/specs/egress-node-spec.md` v2,
-//! `docs/specs/interop-outbox-messaging-spec.md` §5/§10): one binary, roles
-//! by config.
+//! The validator's interop role: one binary, roles by config.
 //!
 //! - [`verify`] — destination side: the [`RemoteEpochVerifier`] wired on the
 //!   engine's `RemoteEpochObserver` seam (inline pair-sequence checks;
@@ -16,11 +14,12 @@
 pub mod extract;
 pub mod serve;
 pub mod sink;
+pub mod state_rpc;
 pub mod store;
 pub mod verify;
 
 pub use extract::{OutboxExtractError, collect_outbox_messages, sent_messages_slot};
-pub use serve::{FeedServerState, start_feed_server};
+pub use serve::{FeedServerLimits, FeedServerState, start_feed_server};
 pub use sink::ExtractingReceiptSink;
-pub use store::{AttestationStore, FeedStore};
+pub use store::{AttestationStore, FeedStore, LaneScan};
 pub use verify::{RemoteEpochFault, RemoteEpochVerifier, check_remote_epoch};

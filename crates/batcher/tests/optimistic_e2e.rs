@@ -10,10 +10,11 @@
 //! at the first divergent offset, slashed, and rewound. Then it is
 //! honestly re-claimed and finalized.
 
-use alloy_node_bindings::Anvil;
-use alloy_primitives::{Address, B256, U256, address};
-use alloy_provider::{Provider, ProviderBuilder};
-use alloy_sol_types::sol;
+use std::num::NonZeroU64;
+use std::path::Path;
+
+use alloy_primitives::{Address, B256, U256};
+use alloy_provider::Provider;
 use kardamom_batcher::BatchAccumulator;
 use kardamom_batcher::batcher::pack_blocks;
 use kardamom_batcher::optimistic::{
@@ -21,47 +22,25 @@ use kardamom_batcher::optimistic::{
 };
 use kardamom_batcher::prover_submit::IKardamomProofOracle;
 use kardamom_batcher::settlement::IKardamomL2Settlement;
-use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
-use kardamom_deployer::{
-    ContractId, Deployer, Op, encode_address_arg, encode_proof_oracle_init_args,
+use kardamom_batcher::testkit::{
+    AcceptingVerifier, BATCHER, DEV_OWNER, L2_CHAIN_ID, advance_past_window, env_tx,
 };
-use kardamom_types::{
-    BPosition, BlockBoundaryStart, BlockRecordsDigest, PublicOutputs, TxEnvelope,
-};
+use kardamom_deployer::Deployer;
+use kardamom_deployer::testkit::{AnvilRig, OracleInitArgs};
+use kardamom_types::{BPosition, BlockBoundaryStart, BlockRecordsDigest, PublicOutputs};
 
-sol!(
-    #[sol(rpc)]
-    AcceptingVerifier,
-    concat!(
-        env!("CARGO_WORKSPACE_DIR"),
-        "/contracts/out/KardamomProofOracle.t.sol/AcceptingVerifier.json"
-    )
-);
-
-const DEV_OWNER: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-const BATCHER: Address = address!("00000000000000000000000000000000000000BA");
-const L2_CHAIN_ID: u64 = 412346;
 const VKEY: B256 = B256::repeat_byte(0x5E);
 const GENESIS_ROOT: B256 = B256::repeat_byte(0x99);
-const WINDOW: u64 = 3600;
-
-fn env_tx(i: u64) -> TxEnvelope {
-    TxEnvelope {
-        correlation_id: i,
-        raw_tx: vec![0xF0u8, i as u8, 0xBA, 0x12].into(),
-        sender: Address::repeat_byte(0x11),
-        tx_hash: B256::repeat_byte(i as u8 + 1),
-    }
-}
+const WINDOW: NonZeroU64 = NonZeroU64::new(3600).unwrap();
 
 /// The honest per-block roots the "validator" computed.
 fn honest_root(block: u64) -> B256 {
-    B256::repeat_byte(0xA0u8.wrapping_add(block as u8))
+    B256::repeat_byte(0xA0u8.wrapping_add(u8::try_from(block).unwrap()))
 }
 
 /// Write a spool entry the way the validator's spool would. The 160-byte
 /// expected-outputs layout feeds both the claim poster and the watcher.
-fn write_spool_block(spool: &std::path::Path, block: u64, pre: B256, digest: B256) {
+fn write_spool_block(spool: &Path, block: u64, pre: B256, digest: B256) {
     let out = PublicOutputs {
         pre_state_root: pre,
         post_state_root: honest_root(block),
@@ -74,96 +53,80 @@ fn write_spool_block(spool: &std::path::Path, block: u64, pre: B256, digest: B25
     std::fs::write(dir.join("expected-outputs.bin"), out.encode()).unwrap();
 }
 
-#[tokio::test]
-async fn optimistic_claim_finalize_and_challenge_paths() {
-    let Some(anvil) = Anvil::new().try_spawn().ok() else {
-        eprintln!("SKIP: anvil unavailable");
-        return;
-    };
-    let provider = ProviderBuilder::new()
-        .disable_recommended_fillers()
-        .connect_http(anvil.endpoint_url());
-    let bytes_hex = format!("0x{ERC7955_RUNTIME_HEX}");
-    for req in [
-        (
-            "anvil_setCode",
-            serde_json::json!([ERC7955_FACTORY, bytes_hex]),
-        ),
-        (
-            "anvil_setBalance",
-            serde_json::json!([DEV_OWNER, U256::from(10u128.pow(21))]),
-        ),
-        (
-            "anvil_setBalance",
-            serde_json::json!([BATCHER, U256::from(10u128.pow(21))]),
-        ),
-        ("anvil_impersonateAccount", serde_json::json!([DEV_OWNER])),
-        ("anvil_impersonateAccount", serde_json::json!([BATCHER])),
-    ] {
-        let _: serde_json::Value = provider
-            .raw_request(req.0.into(), req.1)
-            .await
-            .expect("anvil setup");
+/// Anvil, a funded owner/batcher pair, and a deployed settlement plus a
+/// proof oracle (accepting verifier, real challenge window, real bond).
+/// Everything the two scenarios below need.
+struct Scenario<P: Provider + Clone> {
+    _anvil: alloy_node_bindings::AnvilInstance,
+    provider: P,
+    oracle: IKardamomProofOracle::IKardamomProofOracleInstance<P>,
+    oracle_addr: Address,
+    settlement: IKardamomL2Settlement::IKardamomL2SettlementInstance<P>,
+    spool_dir: tempfile::TempDir,
+}
+
+impl<P: Provider + Clone> Scenario<P> {
+    fn spool(&self) -> &Path {
+        self.spool_dir.path()
     }
+}
 
-    // --- Deploy settlement + oracle v2 (accepting verifier, real window,
-    // real bond).
-    let deployer = Deployer::new(provider.clone(), DEV_OWNER);
-    deployer.ensure_factory(DEV_OWNER).await.unwrap();
-    deployer
-        .apply(
-            &[Op::Deploy {
-                l2_chain_id: L2_CHAIN_ID,
-                id: ContractId::KardamomL2Settlement,
-                init_args: encode_address_arg(BATCHER),
-            }],
+async fn setup() -> Option<Scenario<impl Provider + Clone>> {
+    let rig = AnvilRig::spawn(&[DEV_OWNER, BATCHER]).await?;
+    let deployer = Deployer::new(rig.provider.clone(), DEV_OWNER);
+    let verifier = AcceptingVerifier::deploy(rig.provider.clone())
+        .await
+        .unwrap();
+    let deployment = deployer
+        .deploy_settlement_and_oracle(
             DEV_OWNER,
+            L2_CHAIN_ID,
+            BATCHER,
+            OracleInitArgs {
+                verifier: *verifier.address(),
+                batch_vkey: VKEY,
+                block_vkey: VKEY,
+                genesis_root: GENESIS_ROOT,
+                challenge_window_secs: WINDOW,
+                min_bond_wei: U256::from(10u128.pow(18)), // 1 ETH bond
+            },
         )
-        .await
-        .expect("deploy settlement");
-    let settlement_addr = deployer.addresses(Some(L2_CHAIN_ID)).await.unwrap()[0].proxy;
-    let verifier = AcceptingVerifier::deploy(provider.clone()).await.unwrap();
-    deployer
-        .apply(
-            &[Op::Deploy {
-                l2_chain_id: L2_CHAIN_ID,
-                id: ContractId::KardamomProofOracle,
-                init_args: encode_proof_oracle_init_args(
-                    settlement_addr,
-                    *verifier.address(),
-                    VKEY,
-                    VKEY,
-                    GENESIS_ROOT,
-                    WINDOW,
-                    U256::from(10u128.pow(18)), // 1 ETH bond
-                ),
-            }],
-            DEV_OWNER,
-        )
-        .await
-        .expect("deploy oracle");
-    let oracle_addr = deployer
-        .addresses(Some(L2_CHAIN_ID))
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|e| e.id == ContractId::KardamomProofOracle.id())
-        .unwrap()
-        .proxy;
-    let oracle = IKardamomProofOracle::new(oracle_addr, provider.clone());
+        .await;
+    let oracle = IKardamomProofOracle::new(deployment.oracle, rig.provider.clone());
+    let settlement = IKardamomL2Settlement::new(deployment.settlement, rig.provider.clone());
+    let spool_dir = tempfile::tempdir().unwrap();
+    Some(Scenario {
+        _anvil: rig.anvil,
+        provider: rig.provider,
+        oracle,
+        oracle_addr: deployment.oracle,
+        settlement,
+        spool_dir,
+    })
+}
 
-    // --- A real batch: blocks 7..8 through the accumulator.
+/// A real batch (blocks 7..8) plus the digests the honest spool needs.
+struct RealBatch {
+    records_commitment: B256,
+    d7: B256,
+    d8: B256,
+}
+
+/// Pack blocks 7..8 through the accumulator and write the honest spool
+/// entries the validator would have produced for them, chained from
+/// `block7_pre` (the root the honest chain currently starts from).
+fn build_real_batch_and_spool(spool: &Path, block7_pre: B256) -> RealBatch {
     let mut acc = BatchAccumulator::new();
     acc.observe_tx(env_tx(0), BPosition::from_index(0));
     acc.observe_tx(env_tx(1), BPosition::from_index(1));
-    let b1 = acc.observe_boundary(BlockBoundaryStart {
+    let b1 = acc.observe_boundary(&BlockBoundaryStart {
         block_number: 7,
         end_tx_idx: BPosition::from_index(2),
         l2_timestamp: 1_700_000_007,
         l1_origin: 0,
     });
     acc.observe_tx(env_tx(2), BPosition::from_index(2));
-    let b2 = acc.observe_boundary(BlockBoundaryStart {
+    let b2 = acc.observe_boundary(&BlockBoundaryStart {
         block_number: 8,
         end_tx_idx: BPosition::from_index(3),
         l2_timestamp: 1_700_000_008,
@@ -175,9 +138,6 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
     )
     .unwrap();
 
-    // The spool the "validator" produced. The digests must be the
-    // batcher's per-block digests (shared primitives). The roots are the
-    // honest chain.
     let d7 = {
         let mut d = BlockRecordsDigest::new(7);
         d.add_tx(&env_tx(0).raw_tx);
@@ -189,20 +149,43 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
         d.add_tx(&env_tx(2).raw_tx);
         d.finish()
     };
-    let spool_dir = tempfile::tempdir().unwrap();
-    let spool = spool_dir.path().to_path_buf();
-    write_spool_block(&spool, 7, GENESIS_ROOT, d7);
-    write_spool_block(&spool, 8, honest_root(7), d8);
+    write_spool_block(spool, 7, block7_pre, d7);
+    write_spool_block(spool, 8, honest_root(7), d8);
+    RealBatch {
+        records_commitment: batch.records_commitment,
+        d7,
+        d8,
+    }
+}
 
-    let settlement = IKardamomL2Settlement::new(settlement_addr, provider.clone());
+/// Write the single-block proof-and-public-values files a prover would
+/// produce for block 8, honest throughout.
+fn write_single_block_proof_files(spool: &Path, d8: B256) {
+    let dir = spool.join("block-8");
+    let honest_pv = PublicOutputs {
+        pre_state_root: honest_root(7),
+        post_state_root: honest_root(8),
+        block_number: 8,
+        records_digest: d8,
+        bal_commitment: B256::repeat_byte(0xBA),
+    };
+    std::fs::write(dir.join("public-values.bin"), honest_pv.encode()).unwrap();
+    std::fs::write(dir.join("proof.bin"), b"mock-proof").unwrap();
+}
 
-    // ================= Scenario A: honest claim, zero proofs =============
-    let out = claim_next_batch(provider.clone(), oracle_addr, &spool)
+/// The equilibrium: no batch, then a real batch posted, honestly claimed
+/// from the spool, watched clean, and finalized once the window elapses.
+/// Zero proofs generated.
+async fn scenario_a_honest_claim_and_finalize<P: Provider + Clone>(
+    s: &Scenario<P>,
+    batch: &RealBatch,
+) {
+    let out = claim_next_batch(s.provider.clone(), s.oracle_addr, s.spool())
         .await
         .unwrap();
     assert_eq!(out, ClaimOutcome::NoBatchPosted { batch_index: 1 });
 
-    settlement
+    s.settlement
         .postBatch(
             0,
             vec![B256::repeat_byte(0xA1)],
@@ -218,25 +201,18 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
         .await
         .unwrap();
 
-    let out = claim_next_batch(provider.clone(), oracle_addr, &spool)
+    let out = claim_next_batch(s.provider.clone(), s.oracle_addr, s.spool())
         .await
         .unwrap();
     assert_eq!(out, ClaimOutcome::Claimed { batch_index: 1 });
 
-    let out = watch_and_challenge(provider.clone(), oracle_addr, &spool)
+    let out = watch_and_challenge(s.provider.clone(), s.oracle_addr, s.spool())
         .await
         .unwrap();
     assert_eq!(out, WatchOutcome::ClaimHonest { batch_index: 1 });
 
-    let _: serde_json::Value = provider
-        .raw_request("evm_increaseTime".into(), serde_json::json!([WINDOW + 1]))
-        .await
-        .unwrap();
-    let _: serde_json::Value = provider
-        .raw_request("evm_mine".into(), serde_json::json!([]))
-        .await
-        .unwrap();
-    oracle
+    advance_past_window(&s.provider, WINDOW).await;
+    s.oracle
         .finalizeBatch(1)
         .send()
         .await
@@ -244,11 +220,21 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
         .get_receipt()
         .await
         .unwrap();
-    assert_eq!(oracle.stateRoot().call().await.unwrap(), honest_root(8));
-    assert_eq!(oracle.lastFinalizedBatch().call().await.unwrap(), 1);
 
-    // ================= Scenario B: lying claim, one proof ================
-    settlement
+    assert_eq!(s.oracle.stateRoot().call().await.unwrap(), honest_root(8));
+    assert_eq!(s.oracle.lastFinalizedBatch().call().await.unwrap(), 1);
+}
+
+/// The lie: a claim with correct digests (the fold check passes) but a
+/// wrong root at offset 1. The watcher detects the divergence once the
+/// single-block proof lands, and challenges it. The batch rewinds without
+/// moving the root.
+async fn lying_claim_is_challenged_and_rewound<P: Provider + Clone>(
+    s: &Scenario<P>,
+    batch: &RealBatch,
+) {
+    // ----- act: post the batch, then the liar claims it -----
+    s.settlement
         .postBatch(
             1,
             vec![B256::repeat_byte(0xA2)],
@@ -263,18 +249,12 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
         .get_receipt()
         .await
         .unwrap();
-    // Batch 2 reuses the 7..8 range shape. The spool's honest roots chain
-    // from the current state root, so rewrite the spool for the new
-    // pre-root context (the honest chain now starts at honest_root(8)).
-    // For simplicity, the lie keeps offset 0 honest and lies at offset 1.
-    write_spool_block(&spool, 7, honest_root(8), d7);
-    write_spool_block(&spool, 8, honest_root(7), d8);
 
     // The liar claims directly. The digests are correct (the fold passes),
     // but the root is wrong at offset 1.
     let lie = B256::repeat_byte(0x66);
-    oracle
-        .claimBatch(2, vec![honest_root(7), lie], vec![d7, d8])
+    s.oracle
+        .claimBatch(2, vec![honest_root(7), lie], vec![batch.d7, batch.d8])
         .value(U256::from(10u128.pow(18)))
         .from(DEV_OWNER)
         .send()
@@ -284,8 +264,9 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
         .await
         .unwrap();
 
-    // The watcher detects the divergence but the proof is not ready.
-    let out = watch_and_challenge(provider.clone(), oracle_addr, &spool)
+    // ----- act + assert: the watcher sees the divergence, but the proof
+    // is not ready yet -----
+    let out = watch_and_challenge(s.provider.clone(), s.oracle_addr, s.spool())
         .await
         .unwrap();
     assert_eq!(
@@ -296,23 +277,17 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
         }
     );
 
-    // The prover produces the single-block files (the zk-host --prove
-    // shape). The public values are the honest block 8; the proof is a
-    // mock (accepting verifier).
-    let dir = spool.join("block-8");
-    let honest_pv = PublicOutputs {
-        pre_state_root: honest_root(7),
-        post_state_root: honest_root(8),
-        block_number: 8,
-        records_digest: d8,
-        bal_commitment: B256::repeat_byte(0xBA),
-    };
-    std::fs::write(dir.join("public-values.bin"), honest_pv.encode()).unwrap();
-    std::fs::write(dir.join("proof.bin"), b"mock-proof").unwrap();
+    // ----- act: the prover produces the single-block files (the
+    // zk-host --prove shape); the watcher challenges -----
+    write_single_block_proof_files(s.spool(), batch.d8);
 
-    let out = watch_and_challenge(provider.clone(), oracle_addr, &spool)
+    let out = watch_and_challenge(s.provider.clone(), s.oracle_addr, s.spool())
         .await
         .unwrap();
+
+    // ----- assert: challenged, and the rewind leaves the root unchanged
+    // (the slash is credited to the challenger, the provider's default
+    // account) -----
     assert_eq!(
         out,
         WatchOutcome::Challenged {
@@ -320,27 +295,20 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
             block_offset: 1
         }
     );
+    assert_eq!(s.oracle.stateRoot().call().await.unwrap(), honest_root(8));
+    assert_eq!(s.oracle.highestClaimedBatch().call().await.unwrap(), 1);
+}
 
-    // Rewind: the root is unchanged, the batch reopens, and the slash is
-    // credited to the challenger (the provider's default account submitted
-    // the challenge).
-    assert_eq!(oracle.stateRoot().call().await.unwrap(), honest_root(8));
-    assert_eq!(oracle.highestClaimedBatch().call().await.unwrap(), 1);
-
-    // Honest re-claim from the spool, then finalize.
-    let out = claim_next_batch(provider.clone(), oracle_addr, &spool)
+/// The re-claim: an honest claim on the reopened batch, then finalize once
+/// the window elapses.
+async fn honest_reclaim_finalizes<P: Provider + Clone>(s: &Scenario<P>) {
+    // ----- act -----
+    let out = claim_next_batch(s.provider.clone(), s.oracle_addr, s.spool())
         .await
         .unwrap();
     assert_eq!(out, ClaimOutcome::Claimed { batch_index: 2 });
-    let _: serde_json::Value = provider
-        .raw_request("evm_increaseTime".into(), serde_json::json!([WINDOW + 1]))
-        .await
-        .unwrap();
-    let _: serde_json::Value = provider
-        .raw_request("evm_mine".into(), serde_json::json!([]))
-        .await
-        .unwrap();
-    oracle
+    advance_past_window(&s.provider, WINDOW).await;
+    s.oracle
         .finalizeBatch(2)
         .send()
         .await
@@ -348,6 +316,27 @@ async fn optimistic_claim_finalize_and_challenge_paths() {
         .get_receipt()
         .await
         .unwrap();
-    assert_eq!(oracle.lastFinalizedBatch().call().await.unwrap(), 2);
-    assert_eq!(oracle.stateRoot().call().await.unwrap(), honest_root(8));
+
+    // ----- assert -----
+    assert_eq!(s.oracle.lastFinalizedBatch().call().await.unwrap(), 2);
+    assert_eq!(s.oracle.stateRoot().call().await.unwrap(), honest_root(8));
+}
+
+#[tokio::test]
+async fn optimistic_claim_finalize_and_challenge_paths() {
+    // ----- setup -----
+    let Some(s) = setup().await else {
+        eprintln!("SKIP: anvil unavailable");
+        return;
+    };
+
+    // ----- act + assert: scenario A, then scenario B on the same chain -----
+    let batch_a = build_real_batch_and_spool(s.spool(), GENESIS_ROOT);
+    scenario_a_honest_claim_and_finalize(&s, &batch_a).await;
+
+    // The honest chain now starts at honest_root(8), block 1's finalized
+    // root.
+    let batch_b = build_real_batch_and_spool(s.spool(), honest_root(8));
+    lying_claim_is_challenged_and_rewound(&s, &batch_b).await;
+    honest_reclaim_finalizes(&s).await;
 }

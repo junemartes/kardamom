@@ -17,20 +17,12 @@ fn each_commit_publishes_a_post_commit_snapshot() {
     assert!(snap0.basic(addr).unwrap().is_none());
 
     // Apply block 1.
-    writer
-        .delta_tx
-        .send(common::simple_delta(1, addr, 100, 0, 0))
-        .unwrap();
-    let snap1 = writer.snapshot_rx.recv().unwrap();
+    let snap1 = common::commit_block(&writer, 1, addr, 100, 0, 0);
     assert_eq!(snap1.block_number(), 1);
     assert!(snap1.basic(addr).unwrap().is_some());
 
     // Apply block 2.
-    writer
-        .delta_tx
-        .send(common::simple_delta(2, addr, 200, 0, 0))
-        .unwrap();
-    let snap2 = writer.snapshot_rx.recv().unwrap();
+    let snap2 = common::commit_block(&writer, 2, addr, 200, 0, 0);
     assert_eq!(snap2.block_number(), 2);
 
     writer.shutdown().unwrap();
@@ -44,11 +36,7 @@ fn tx_hash_lookup_round_trips_through_writer() {
     let addr = address!("0x00000000000000000000000000000000000000bb");
     let _ = writer.snapshot_rx.recv();
 
-    writer
-        .delta_tx
-        .send(common::simple_delta(7, addr, 700, 1, 1))
-        .unwrap();
-    let snap = writer.snapshot_rx.recv().unwrap();
+    let snap = common::commit_block(&writer, 7, addr, 700, 1, 1);
 
     // Find the receipt for block 7 by reading the BlockBoundary's end_tx_idx.
     let pos = common::bpos(7);

@@ -64,6 +64,10 @@ fn expected(ws: &WriteSet) -> B256 {
             2
         };
         h.update(addr.as_slice());
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "minimal() returns a length in 0..=32: fits u8"
+        )]
         h.update([bal.len() as u8 | (tag << 6)]);
         varint(&mut h, *nonce);
         h.update(&bal);
@@ -76,6 +80,10 @@ fn expected(ws: &WriteSet) -> B256 {
     for ((addr, key), value) in &ws.storage {
         let val = minimal(value);
         let same = prev == Some(*addr);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "minimal() returns a length in 0..=32: fits u8"
+        )]
         h.update([val.len() as u8 | (u8::from(same) << 6)]);
         if !same {
             h.update(addr.as_slice());
@@ -131,12 +139,12 @@ fn transfer_shaped_write_set_matches_the_contract() {
 fn defi_shaped_write_set_matches_the_contract() {
     let mut ws = WriteSet::default();
     for i in 0..3 {
-        account(&mut ws, i, i as u64, 10_000 + i as u64);
+        account(&mut ws, i, u64::from(i), 10_000 + u64::from(i));
     }
     for i in 0..8u8 {
         ws.storage.push((
             (addr(0xC0), B256::with_last_byte(i)),
-            U256::from(i as u64 * 7 + 1),
+            U256::from(u64::from(i) * 7 + 1),
         ));
     }
     ws.finish();
@@ -162,7 +170,7 @@ fn matches_across_the_inline_boundary() {
     for count in 0..12u8 {
         let mut ws = WriteSet::default();
         for i in 0..count {
-            account(&mut ws, i, i as u64, i as u64 * 13);
+            account(&mut ws, i, u64::from(i), u64::from(i) * 13);
         }
         ws.finish();
         assert_eq!(

@@ -22,20 +22,9 @@ fn four_readers_with_distinct_snapshots() {
     let _ = writer.snapshot_rx.recv();
 
     // Preload 4 blocks, and capture a snapshot after each one.
-    let mut snapshots = Vec::new();
-    for block in 1..=4u64 {
-        writer
-            .delta_tx
-            .send(common::simple_delta(
-                block,
-                addr,
-                1000 + block,
-                7,
-                block * 100,
-            ))
-            .unwrap();
-        snapshots.push(writer.snapshot_rx.recv().unwrap());
-    }
+    let snapshots: Vec<_> = (1..=4u64)
+        .map(|block| common::commit_block(&writer, block, addr, 1000 + block, 7, block * 100))
+        .collect();
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
@@ -55,19 +44,7 @@ fn four_readers_with_distinct_snapshots() {
     }
 
     // Concurrently apply blocks 5..=12.
-    for block in 5..=12u64 {
-        writer
-            .delta_tx
-            .send(common::simple_delta(
-                block,
-                addr,
-                1000 + block,
-                7,
-                block * 100,
-            ))
-            .unwrap();
-        writer.snapshot_rx.recv().unwrap();
-    }
+    common::commit_range(&writer, 5..=12, addr);
 
     // Let readers race for a bit longer.
     thread::sleep(Duration::from_millis(50));

@@ -1,6 +1,5 @@
 //! The prover input. This holds everything that one block's anchored
-//! stateless execution needs, as a single rkyv frame. See
-//! docs/agents/no-std-exec-core-spec.md.
+//! stateless execution needs, as a single rkyv frame.
 //!
 //! On the host side, the validator's capture and anchoring assemble this
 //! from the output of `capture_block_witness` and `anchor_block_witness`.
@@ -15,7 +14,7 @@
 
 use alloc::vec::Vec;
 
-use alloy_primitives::{B256, Keccak256, U256};
+use alloy_primitives::{B256, Keccak256};
 use bytes::Bytes;
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -57,8 +56,53 @@ pub struct ProverInput {
     pub granularity: u16,
 }
 
-/// The single-block proof's public outputs (v2, spec PR 5 slice 0). This is
-/// a dispute-ready, 160-byte abi shape. A Solidity call to
+/// A 160-byte, five-word Solidity ABI frame. [`PublicOutputs`] and
+/// [`BatchPublicOutputs`] both encode and decode this exact shape, so
+/// this is the one place their layout lives — an offset drift between
+/// the block oracle and the batch oracle would otherwise be silent.
+struct Words160([u8; 160]);
+
+impl Words160 {
+    const LEN: usize = 160;
+
+    fn new() -> Self {
+        Self([0u8; Self::LEN])
+    }
+
+    /// `None` if `bytes` is not exactly [`Self::LEN`] bytes.
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self(bytes.try_into().ok()?))
+    }
+
+    fn put_b256(&mut self, i: usize, v: B256) {
+        self.0[i * 32..i * 32 + 32].copy_from_slice(v.as_slice());
+    }
+
+    fn put_u64(&mut self, i: usize, v: u64) {
+        self.0[i * 32..i * 32 + 32].copy_from_slice(&crate::abi::word_u64(v));
+    }
+
+    fn b256(&self, i: usize) -> B256 {
+        B256::from_slice(&self.0[i * 32..i * 32 + 32])
+    }
+
+    /// `None` if word `i` does not fit in a `u64`: its top 24 bytes are
+    /// not all zero.
+    fn u64_checked(&self, i: usize) -> Option<u64> {
+        let word = &self.0[i * 32..i * 32 + 32];
+        if word[..24].iter().any(|&b| b != 0) {
+            return None;
+        }
+        Some(u64::from_be_bytes(word[24..32].try_into().unwrap()))
+    }
+
+    fn into_bytes(self) -> [u8; Self::LEN] {
+        self.0
+    }
+}
+
+/// The single-block proof's public outputs. This is a dispute-ready,
+/// 160-byte abi shape. A Solidity call to
 /// `abi.decode(publicValues, (bytes32, bytes32, uint256, bytes32, bytes32))`
 /// reads it directly: `pre_state_root || post_state_root ||
 /// block_number(u256) || records_digest || bal_commitment`. `records_digest`
@@ -78,30 +122,26 @@ pub struct PublicOutputs {
 impl PublicOutputs {
     pub const ENCODED_LEN: usize = 160;
 
+    #[must_use]
     pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
-        let mut out = [0u8; Self::ENCODED_LEN];
-        out[0..32].copy_from_slice(self.pre_state_root.as_slice());
-        out[32..64].copy_from_slice(self.post_state_root.as_slice());
-        out[64..96].copy_from_slice(&U256::from(self.block_number).to_be_bytes::<32>());
-        out[96..128].copy_from_slice(self.records_digest.as_slice());
-        out[128..160].copy_from_slice(self.bal_commitment.as_slice());
-        out
+        let mut w = Words160::new();
+        w.put_b256(0, self.pre_state_root);
+        w.put_b256(1, self.post_state_root);
+        w.put_u64(2, self.block_number);
+        w.put_b256(3, self.records_digest);
+        w.put_b256(4, self.bal_commitment);
+        w.into_bytes()
     }
 
+    #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != Self::ENCODED_LEN {
-            return None;
-        }
-        let n = U256::from_be_slice(&bytes[64..96]);
-        if n > U256::from(u64::MAX) {
-            return None;
-        }
+        let w = Words160::from_bytes(bytes)?;
         Some(Self {
-            pre_state_root: B256::from_slice(&bytes[0..32]),
-            post_state_root: B256::from_slice(&bytes[32..64]),
-            block_number: n.to::<u64>(),
-            records_digest: B256::from_slice(&bytes[96..128]),
-            bal_commitment: B256::from_slice(&bytes[128..160]),
+            pre_state_root: w.b256(0),
+            post_state_root: w.b256(1),
+            block_number: w.u64_checked(2)?,
+            records_digest: w.b256(3),
+            bal_commitment: w.b256(4),
         })
     }
 }
@@ -119,6 +159,7 @@ pub struct BlockRecordsDigest {
 }
 
 impl BlockRecordsDigest {
+    #[must_use]
     pub fn new(block_number: u64) -> Self {
         let mut h = Keccak256::new();
         h.update(b"KREC");
@@ -126,12 +167,24 @@ impl BlockRecordsDigest {
         Self { h }
     }
 
+    /// # Panics
+    ///
+    /// Panics if `raw_tx` is 4 GiB or larger: the digest format is a
+    /// fixed-width `u32` length prefix (see the wire layout above), and a
+    /// silently truncated length would let two different transactions
+    /// share one digest. No transaction reaches this size in practice —
+    /// the ingress and gas limits reject it long before that — so this
+    /// turns an impossible-in-practice case into a loud failure instead
+    /// of a silent one.
     pub fn add_tx(&mut self, raw_tx: &[u8]) {
         self.h.update([0x01]);
-        self.h.update((raw_tx.len() as u32).to_le_bytes());
+        let len = u32::try_from(raw_tx.len())
+            .unwrap_or_else(|_| panic!("raw_tx is {} bytes, over u32::MAX", raw_tx.len()));
+        self.h.update(len.to_le_bytes());
         self.h.update(raw_tx);
     }
 
+    #[must_use]
     pub fn finish(self) -> B256 {
         self.h.finalize()
     }
@@ -172,32 +225,26 @@ pub struct BatchPublicOutputs {
 impl BatchPublicOutputs {
     pub const ENCODED_LEN: usize = 160;
 
+    #[must_use]
     pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
-        let mut out = [0u8; Self::ENCODED_LEN];
-        out[0..32].copy_from_slice(self.pre_state_root.as_slice());
-        out[32..64].copy_from_slice(self.post_state_root.as_slice());
-        out[64..96].copy_from_slice(&U256::from(self.first_block).to_be_bytes::<32>());
-        out[96..128].copy_from_slice(&U256::from(self.last_block).to_be_bytes::<32>());
-        out[128..160].copy_from_slice(self.records_commitment.as_slice());
-        out
+        let mut w = Words160::new();
+        w.put_b256(0, self.pre_state_root);
+        w.put_b256(1, self.post_state_root);
+        w.put_u64(2, self.first_block);
+        w.put_u64(3, self.last_block);
+        w.put_b256(4, self.records_commitment);
+        w.into_bytes()
     }
 
+    #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != Self::ENCODED_LEN {
-            return None;
-        }
-        let word = |i: usize| U256::from_be_slice(&bytes[i..i + 32]);
-        let first = word(64);
-        let last = word(96);
-        if first > U256::from(u64::MAX) || last > U256::from(u64::MAX) {
-            return None;
-        }
+        let w = Words160::from_bytes(bytes)?;
         Some(Self {
-            pre_state_root: B256::from_slice(&bytes[0..32]),
-            post_state_root: B256::from_slice(&bytes[32..64]),
-            first_block: first.to::<u64>(),
-            last_block: last.to::<u64>(),
-            records_commitment: B256::from_slice(&bytes[128..160]),
+            pre_state_root: w.b256(0),
+            post_state_root: w.b256(1),
+            first_block: w.u64_checked(2)?,
+            last_block: w.u64_checked(3)?,
+            records_commitment: w.b256(4),
         })
     }
 }

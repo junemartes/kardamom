@@ -1,6 +1,5 @@
 //! Interop: the cross-chain source adapter, where the origin is a PEER
-//! KARDAMOM CHAIN instead of L1 (`docs/specs/interop-outbox-messaging-spec.md`
-//! §5–§6).
+//! KARDAMOM CHAIN instead of L1.
 //!
 //! The shape is the L1 pipeline's, seam for seam, because the guarantee is the
 //! same one: an externally-sourced transaction stream must be derived
@@ -20,14 +19,14 @@
 //!
 //! ## Scope of this slice
 //!
-//! v1 is **feed-trust** (spec §10 tier T0): the watcher executes what the feed
-//! says. Finality stamps, `AnchorProof`s, and the L1-anchored gate that spec
-//! §10 makes mandatory before value moves are a later slice; they ADD to the
-//! wire contract in [`feed`] rather than reshaping it.
+//! v1 is **feed-trust**: the watcher executes what the feed says. Finality
+//! stamps, `AnchorProof`s, and the L1-anchored gate required before value
+//! moves are a later slice; they ADD to the wire contract in
+//! `kardamom_interop_feed` rather than reshaping it.
 
 pub mod cursor;
-pub mod feed;
 pub mod publisher;
+pub mod reconcile;
 pub mod source;
 pub mod watcher;
 
@@ -39,10 +38,9 @@ pub mod watcher;
 pub mod mock;
 
 pub use cursor::{CursorError, CursorFile};
-pub use feed::{
-    OutboxCursor, OutboxEventDto, OutboxFeedApiServer, OutboxMessageDto, SUBSCRIBE_OUTBOX_METHOD,
-    UNSUBSCRIBE_OUTBOX_METHOD,
-};
 pub use publisher::RemoteEpochPublisher;
+pub use reconcile::{
+    DestinationStateReader, ReconcileError, ReconcileRetry, RpcDestinationReader, reconcile_cursor,
+};
 pub use source::{RemoteChainSource, RemoteSourceError, WsRemoteChainSource};
 pub use watcher::{InteropError, InteropWatcherConfig, process_once, spawn};

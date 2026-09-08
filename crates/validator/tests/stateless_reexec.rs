@@ -23,7 +23,7 @@ use kardamom_state::{AccountTrieParts, state_root, storage_root};
 use kardamom_types::{BPosition, Deposit, TxEnvelope};
 use kardamom_validator::witness::{capture_block_witness, reexecute_stateless};
 
-const CHAIN_ID: u64 = 412346;
+const CHAIN_ID: u64 = 412_346;
 const DEAD: Address = address!("000000000000000000000000000000000000dEaD");
 /// Pre-seeded contract: slot0 = SLOAD(0) + 1, a genuine snapshot storage
 /// read feeding a write, then falls off the end (STOP).
@@ -51,7 +51,7 @@ fn signed_tx(nonce: u64, to: Address, value: u64, gas_limit: u64) -> TxEnvelope 
         gas_limit,
         to: TxKind::Call(to),
         value: U256::from(value),
-        input: Default::default(),
+        input: alloy_primitives::Bytes::default(),
     };
     let sig = s.sign_transaction_sync(&mut tx).unwrap();
     let env = alloy_consensus::TxEnvelope::Legacy(tx.into_signed(sig));
@@ -264,17 +264,14 @@ fn forged_bal_fails_closed() {
     let recs = records();
     let (_, witness, raw_bal) = capture_block_witness(&genesis(), None, &recs, env()).unwrap();
 
-    // Bump one claimed post-balance. The recomputed BAL can no longer
-    // equal the input, so the replay must refuse to attest it.
+    // Bump one claimed post-balance. The recomputed BAL differs from the
+    // input, so the replay must refuse to attest it.
     let mut forged = raw_bal.clone();
-    let mut tampered = false;
-    for acct in forged.iter_mut() {
-        if let Some(c) = acct.balance_changes.first_mut() {
-            c.post_balance += alloy_primitives::U256::from(1u64);
-            tampered = true;
-            break;
-        }
-    }
+    let tampered = forged
+        .iter_mut()
+        .find_map(|acct| acct.balance_changes.first_mut())
+        .map(|c| c.post_balance += alloy_primitives::U256::from(1u64))
+        .is_some();
     assert!(tampered, "setup: no balance change to tamper with");
     let err = reexecute_stateless(&witness, None, &recs, env(), &forged, 1);
     assert!(

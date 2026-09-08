@@ -345,6 +345,12 @@ if [[ -n "${KARDAMOM_CLUSTER_SNAPSHOT_S:-}" ]]; then
   echo "==> cluster: snapshot interval override: ${KARDAMOM_CLUSTER_SNAPSHOT_S}s"
   CLUSTER_ARGS+=(-var "cluster_snapshot_interval_s=${KARDAMOM_CLUSTER_SNAPSHOT_S}")
 fi
+# Remote-origin allowlist override. When unset, this uses the jobspec
+# default (the dev-interop peer chain ids).
+if [[ -n "${KARDAMOM_REMOTE_ORIGINS:-}" ]]; then
+  echo "==> cluster: remote-origin allowlist override: ${KARDAMOM_REMOTE_ORIGINS}"
+  CLUSTER_ARGS+=(-var "cluster_remote_origins=${KARDAMOM_REMOTE_ORIGINS}")
+fi
 image_ref_args cluster
 CLUSTER_ARGS+=(${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"})
 run_job "cluster.nomad.hcl" ${CLUSTER_ARGS[@]+"${CLUSTER_ARGS[@]}"}

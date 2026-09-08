@@ -9,6 +9,7 @@
 mod submit;
 mod watchers;
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,39 +25,51 @@ use crate::pending::PendingReceipts;
 use crate::rate_limit::PerIpLimiter;
 use crate::receipt_cache::ReceiptCache;
 use crate::routing::partition_for;
-use crate::seen_receipts::SeenReceipts;
 use crate::sig_verify::BatchVerifier;
 use crate::tx_error_dedup::TxErrorDedup;
 
-/// Drains a `broadcast::Receiver<T>` and forwards each item to `f`. Skips
-/// `Lagged` and exits on `Closed`. The four proxy watcher tasks use this.
-fn spawn_broadcast_watcher<T, F, Fut>(mut rx: broadcast::Receiver<T>, mut f: F)
+/// Owns a `broadcast::Receiver<T>` and drains it. Skips `Lagged` and
+/// returns on `Closed`. The proxy's watcher tasks spawn [`Self::run`].
+pub(crate) struct BroadcastWatcher<T> {
+    rx: broadcast::Receiver<T>,
+}
+
+impl<T> BroadcastWatcher<T>
 where
     T: Clone + Send + 'static,
-    F: FnMut(T) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send,
 {
-    tokio::spawn(async move {
+    pub(crate) fn new(rx: broadcast::Receiver<T>) -> Self {
+        Self { rx }
+    }
+
+    /// Drains `self`, calling `f` with each item, until the sender side
+    /// closes.
+    pub(crate) async fn run<F>(mut self, mut f: F)
+    where
+        F: AsyncFnMut(T),
+    {
         loop {
-            match rx.recv().await {
+            match self.rx.recv().await {
                 Ok(item) => f(item).await,
                 Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
             }
         }
-    });
+    }
 }
 
 /// Packs a replica id and a per-replica sequence into a globally unique,
 /// opaque `correlation_id`: the top 16 bits are `ingress_id`, and the low
 /// 48 bits are `seq`. See [`IngressProxy::next_correlation_id`].
 #[inline]
-pub fn pack_correlation_id(ingress_id: u16, seq: u64) -> u64 {
-    ((ingress_id as u64) << 48) | (seq & 0x0000_FFFF_FFFF_FFFF)
+#[must_use]
+pub(crate) fn pack_correlation_id(ingress_id: u16, seq: u64) -> u64 {
+    (u64::from(ingress_id) << 48) | (seq & 0x0000_FFFF_FFFF_FFFF)
 }
 
 /// Extracts the originating `ingress_id` from a packed `correlation_id`.
 #[inline]
+#[must_use]
 pub fn ingress_id_of(correlation_id: u64) -> u16 {
     (correlation_id >> 48) as u16
 }
@@ -88,16 +101,18 @@ where
     S: IngressSubscription + Clone,
 {
     pub(crate) cfg: IngressConfig,
+    /// `cfg.partition_count_m`, parsed once as a `NonZeroU32`. The field
+    /// on `IngressConfig` stays a plain `u32`, since `crates/bench` builds
+    /// `IngressConfig { partition_count_m: shards, .. }` literals with a
+    /// `u32` shard count (see `crates/bench/src/harness/inprocess.rs`).
+    /// This is the one, sole conversion point, done once in
+    /// [`IngressProxy::new`] rather than on every `partition_for` call.
+    pub(crate) partition_count_m: NonZeroU32,
     pub(crate) rate_limiter: Arc<PerIpLimiter>,
     pub(crate) verifier: Arc<BatchVerifier>,
     pub(crate) pending: Arc<PendingReceipts>,
     pub(crate) cache: Arc<ReceiptCache>,
-    /// First-wins tx-hash dedup for the tx_receipts MDS fan-in. Drops the
-    /// duplicate receipt copies that the N executor replicas emit, so a
-    /// tx's must-deliver ack fires exactly once. This is a no-op on the
-    /// single-executor IPC path. See [`crate::seen_receipts`].
-    pub(crate) seen_receipts: Arc<SeenReceipts>,
-    /// Consumer-side tx_errors dedup for P racing sequencer replicas.
+    /// Consumer-side `tx_errors` dedup for P racing sequencer replicas.
     /// Drops the twin's duplicate copy of each per-tx rejection, and
     /// suppresses a rejection once a success for the same
     /// `(sender, nonce)` was observed. This is a no-op on a
@@ -106,12 +121,12 @@ where
     pub(crate) publication: P,
     pub(crate) subscription: S,
     pub(crate) correlation_seq: Arc<AtomicU64>,
-    /// The highest `BlockBoundary.block_number` observed on tx_receipts.
+    /// The highest `BlockBoundary.block_number` observed on `tx_receipts`.
     /// `eth_blockNumber` reads this. `AtomicU64` is enough here: the
-    /// value only increases, one writer, the BlockBoundary watcher, sets
+    /// value only increases, one writer, the `BlockBoundary` watcher, sets
     /// it, and many readers read it.
     pub(crate) latest_block_number: Arc<AtomicU64>,
-    /// Post-dedup receipt re-broadcast. The tx_receipts watcher forwards
+    /// Post-dedup receipt re-broadcast. The `tx_receipts` watcher forwards
     /// each first-seen receipt here, so `kardamom_subscribeReceipts`
     /// sessions see exactly one copy per tx, instead of the raw
     /// N-replica MDS fan-in.
@@ -124,10 +139,8 @@ where
 /// Capacity of the deduped receipt and error re-broadcast feeds. A
 /// subscriber that lags more than this many items gets a `Lagged`
 /// notification, and must fall back to `eth_getTransactionReceipt` for
-/// the gap. At 8192, a subscriber stalled for about 1.7s at 4,800 tx/s
-/// overflowed the ring; this was the leading suspect for the small share
-/// of silent feed misses under sustained load. 32k tolerates about 7s at
-/// that rate, for about 10MB of buffered receipts.
+/// the gap. 32k holds about 7s of buffered receipts at 4,800 tx/s, about
+/// 10MB.
 const FEED_CAPACITY: usize = 32 * 1024;
 
 impl<P, S> Clone for IngressProxy<P, S>
@@ -138,11 +151,11 @@ where
     fn clone(&self) -> Self {
         Self {
             cfg: self.cfg.clone(),
+            partition_count_m: self.partition_count_m,
             rate_limiter: self.rate_limiter.clone(),
             verifier: self.verifier.clone(),
             pending: self.pending.clone(),
             cache: self.cache.clone(),
-            seen_receipts: self.seen_receipts.clone(),
             tx_error_dedup: self.tx_error_dedup.clone(),
             publication: self.publication.clone(),
             subscription: self.subscription.clone(),
@@ -159,7 +172,16 @@ where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
 {
+    /// # Panics
+    ///
+    /// Panics if `cfg.partition_count_m` is zero. Every producer of
+    /// `IngressConfig` in this workspace rules this out at its own
+    /// boundary: the `--shards` CLI flag parses as `NonZeroU8`, and
+    /// `IngressConfig::default()` sets 8. The field itself stays a plain
+    /// `u32` for `crates/bench`'s `IngressConfig { .. }` literals.
     pub fn new(cfg: IngressConfig, publication: P, subscription: S) -> Self {
+        let partition_count_m = NonZeroU32::new(cfg.partition_count_m)
+            .expect("IngressConfig::partition_count_m must be non-zero");
         let rate_limiter = Arc::new(PerIpLimiter::new(
             cfg.rate_limit_per_ip_per_sec,
             cfg.rate_limit_burst,
@@ -170,15 +192,14 @@ where
         ));
         let pending = Arc::new(PendingReceipts::new(cfg.ack_policy));
         let cache = Arc::new(ReceiptCache::new(cfg.receipt_cache_capacity));
-        let seen_receipts = Arc::new(SeenReceipts::default());
         let tx_error_dedup = Arc::new(TxErrorDedup::default());
         let me = Self {
             cfg,
+            partition_count_m,
             rate_limiter,
             verifier,
             pending,
             cache,
-            seen_receipts,
             tx_error_dedup,
             publication,
             subscription,
@@ -200,7 +221,7 @@ where
         me
     }
 
-    /// The highest `BlockBoundary.block_number` observed on tx_receipts.
+    /// The highest `BlockBoundary.block_number` observed on `tx_receipts`.
     /// Backs `eth_blockNumber`.
     #[inline]
     pub fn latest_block_number(&self) -> u64 {
@@ -224,9 +245,9 @@ where
         pack_correlation_id(self.cfg.ingress_id, seq)
     }
 
-    /// Looks up a receipt by `tx_hash` in the in-memory tx_receipts
+    /// Looks up a receipt by `tx_hash` in the in-memory `tx_receipts`
     /// index. The executor publishes the enriched `Receipt` onto
-    /// tx_receipts. Ingress subscribes, and answers
+    /// `tx_receipts`. Ingress subscribes, and answers
     /// `eth_getTransactionReceipt` straight from RAM, with no state-DB
     /// join. Returns `None` for a tx that has not yet been observed,
     /// including one evicted from the bounded cache.
@@ -250,7 +271,7 @@ where
     /// and tooling use this.
     #[inline]
     pub fn partition_for(&self, sender: alloy_primitives::Address) -> u32 {
-        partition_for(sender, self.cfg.partition_count_m)
+        partition_for(sender, self.partition_count_m)
     }
 
     /// Read-only access to the configured `IngressConfig`.
@@ -261,6 +282,10 @@ where
 
     /// Starts every configured listener: jsonrpsee HTTP and WS, an
     /// optional TCP listener, and an optional UDS listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns `IngressError::Internal` if a listener fails to bind.
     pub async fn start(self) -> Result<IngressHandle, IngressError>
     where
         P: 'static,
@@ -277,7 +302,7 @@ where
                 // This is a best-effort unlink of a stale socket.
                 let _ = std::fs::remove_file(&path);
                 crate::binary::spawn_uds_listener(self.clone(), &path)
-                    .map_err(|e| IngressError::Internal(format!("uds bind: {e}")))?;
+                    .map_err(|e| IngressError::internal("uds bind", e))?;
             }
         }
         Ok(IngressHandle {

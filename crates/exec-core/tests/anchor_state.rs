@@ -4,7 +4,7 @@
 //! roots (the primitive `kardamom-state`'s oracle wraps).
 //!
 //! `anchor_sparse.rs` proves the raw sparse-trie mechanics. This file
-//! proves the state semantics layered on them: TrieAccount leaves,
+//! proves the state semantics layered on them: `TrieAccount` leaves,
 //! per-account storage roots, exclusion proofs for absent accounts and
 //! explicit-zero slots, EIP-161 empty-account handling, and refutation of
 //! every witness lie.
@@ -12,14 +12,16 @@
 use std::collections::{BTreeMap, HashMap};
 
 use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256};
-use alloy_trie::proof::ProofRetainer;
-use alloy_trie::{EMPTY_ROOT_HASH, HashBuilder, KECCAK_EMPTY, Nibbles, TrieAccount};
+use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY, TrieAccount};
 use bytes::Bytes as WireBytes;
 use kardamom_exec_core::anchor::{
     AnchorError, NodeStore, recompute_post_root, verify_witness_anchored,
 };
 use kardamom_exec_core::delta::PendingDelta;
 use kardamom_types::{ExecutionWitness, WitnessAccount, WitnessProofs, WitnessSlot};
+
+mod common;
+use common::retained_nodes;
 
 const A: Address = address!("00000000000000000000000000000000000000A1");
 const B: Address = address!("00000000000000000000000000000000000000B2");
@@ -30,7 +32,7 @@ const S1: B256 = B256::with_last_byte(1);
 const S2: B256 = B256::with_last_byte(2);
 const S3: B256 = B256::with_last_byte(3); // explicit-zero read
 
-/// Full reference state: account to (TrieAccount, storage map).
+/// Full reference state: account to (`TrieAccount`, storage map).
 type RefState = BTreeMap<Address, (TrieAccount, BTreeMap<B256, U256>)>;
 
 fn base_state() -> RefState {
@@ -70,7 +72,7 @@ fn base_state() -> RefState {
             (
                 TrieAccount {
                     nonce: 1,
-                    balance: U256::from(i as u64 + 1),
+                    balance: U256::from(u64::from(i) + 1),
                     storage_root: EMPTY_ROOT_HASH,
                     code_hash: KECCAK_EMPTY,
                 },
@@ -90,7 +92,7 @@ fn oracle_state_root(st: &RefState) -> B256 {
 fn all_nodes(st: &RefState) -> (B256, HashMap<B256, Bytes>) {
     let mut nodes = HashMap::new();
     // Account trie with all keys as proof targets.
-    let mut entries: Vec<(B256, Vec<u8>)> = st
+    let entries: BTreeMap<B256, Vec<u8>> = st
         .iter()
         .map(|(addr, (ta, _))| {
             let mut rlp = Vec::new();
@@ -98,24 +100,16 @@ fn all_nodes(st: &RefState) -> (B256, HashMap<B256, Bytes>) {
             (keccak256(addr), rlp)
         })
         .collect();
-    entries.sort_by_key(|(k, _)| *k);
-    let targets: Vec<Nibbles> = entries.iter().map(|(k, _)| Nibbles::unpack(k)).collect();
-    let mut hb = HashBuilder::default().with_proof_retainer(ProofRetainer::new(targets));
-    for (k, v) in &entries {
-        hb.add_leaf(Nibbles::unpack(k), v);
-    }
-    let root = hb.root();
-    for node in hb.take_proof_nodes().into_inner().into_values() {
-        if node.len() >= 32 {
-            nodes.insert(keccak256(&node), node);
-        }
-    }
+    let targets: Vec<B256> = entries.keys().copied().collect();
+    let (root, account_nodes) = retained_nodes(&entries, &targets);
+    nodes.extend(account_nodes.into_iter().map(|n| (keccak256(&n), n)));
+
     // Each non-empty storage trie, all keys as targets.
     for (_, storage) in st.values() {
         if storage.is_empty() {
             continue;
         }
-        let mut sentries: Vec<(B256, Vec<u8>)> = storage
+        let sentries: BTreeMap<B256, Vec<u8>> = storage
             .iter()
             .filter(|(_, v)| !v.is_zero())
             .map(|(k, v)| {
@@ -124,18 +118,9 @@ fn all_nodes(st: &RefState) -> (B256, HashMap<B256, Bytes>) {
                 (keccak256(k), rlp)
             })
             .collect();
-        sentries.sort_by_key(|(k, _)| *k);
-        let stargets: Vec<Nibbles> = sentries.iter().map(|(k, _)| Nibbles::unpack(k)).collect();
-        let mut shb = HashBuilder::default().with_proof_retainer(ProofRetainer::new(stargets));
-        for (k, v) in &sentries {
-            shb.add_leaf(Nibbles::unpack(k), v);
-        }
-        let _ = shb.root();
-        for node in shb.take_proof_nodes().into_inner().into_values() {
-            if node.len() >= 32 {
-                nodes.insert(keccak256(&node), node);
-            }
-        }
+        let stargets: Vec<B256> = sentries.keys().copied().collect();
+        let (_, storage_nodes) = retained_nodes(&sentries, &stargets);
+        nodes.extend(storage_nodes.into_iter().map(|n| (keccak256(&n), n)));
     }
     (root, nodes)
 }
@@ -293,15 +278,30 @@ fn honest_witness_verifies_and_recomputes_the_oracle_post_root() {
     // set. This is exactly the capture loop's shape.
     let (sparse_post, proofs) = anchored(&all, |proofs| {
         let pre = verify_witness_anchored(&w, proofs)?;
-        recompute_post_root(&w, proofs, &pre, &delta)
+        recompute_post_root(proofs, &pre, &delta)
     });
     assert_eq!(sparse_post, oracle_post, "post root equals the oracle");
 
     // The final proof set also verifies standalone (the guest shape: one
     // shot, no retry).
     let pre = verify_witness_anchored(&w, &proofs).expect("guest-shape verify");
-    let again = recompute_post_root(&w, &proofs, &pre, &delta).expect("guest-shape recompute");
+    let again = recompute_post_root(&proofs, &pre, &delta).expect("guest-shape recompute");
     assert_eq!(again, oracle_post);
+}
+
+// Each call site passes a distinct closure, so a generic parameter
+// monomorphizes for free here — no need to box or type-erase it.
+fn refuted(
+    w: &ExecutionWitness,
+    proofs: &WitnessProofs,
+    mutate: impl Fn(&mut ExecutionWitness),
+) -> bool {
+    let mut lie = w.clone();
+    mutate(&mut lie);
+    matches!(
+        verify_witness_anchored(&lie, proofs),
+        Err(AnchorError::Refuted { .. })
+    )
 }
 
 #[test]
@@ -313,26 +313,21 @@ fn every_witness_lie_is_refuted() {
     // A complete proof set for the honest witness (fixed point once).
     let (_, proofs) = anchored(&all, |proofs| verify_witness_anchored(&w, proofs));
 
-    let refuted = |mutate: &dyn Fn(&mut ExecutionWitness)| {
-        let mut lie = w.clone();
-        mutate(&mut lie);
-        matches!(
-            verify_witness_anchored(&lie, &proofs),
-            Err(AnchorError::Refuted { .. })
-        )
-    };
-
     assert!(
-        refuted(&|w| w.accounts[0].balance = U256::from(1)),
+        refuted(&w, &proofs, |w| w.accounts[0].balance = U256::from(1)),
         "balance lie"
     );
-    assert!(refuted(&|w| w.accounts[0].nonce += 1), "nonce lie");
     assert!(
-        refuted(&|w| w.accounts[0].code_hash = B256::repeat_byte(0x66)),
+        refuted(&w, &proofs, |w| w.accounts[0].nonce += 1),
+        "nonce lie"
+    );
+    assert!(
+        refuted(&w, &proofs, |w| w.accounts[0].code_hash =
+            B256::repeat_byte(0x66)),
         "code_hash lie"
     );
     assert!(
-        refuted(&|w| {
+        refuted(&w, &proofs, |w| {
             // Claim the absent account exists, with state. Merely
             // flipping `exists` on all-zero fields is EIP-161-empty,
             // which execution semantics treat as equivalent to absent.
@@ -360,7 +355,7 @@ fn every_witness_lie_is_refuted() {
             .expect("empty-but-present must verify as absent");
     }
     assert!(
-        refuted(&|w| {
+        refuted(&w, &proofs, |w| {
             // Claim an existing account absent.
             let i = w.accounts.iter().position(|a| a.address == B).unwrap();
             w.accounts[i].exists = false;
@@ -368,21 +363,21 @@ fn every_witness_lie_is_refuted() {
         "presence lie"
     );
     assert!(
-        refuted(&|w| {
+        refuted(&w, &proofs, |w| {
             let i = w.storage.iter().position(|s| s.key == S1).unwrap();
             w.storage[i].value = U256::from(999);
         }),
         "slot value lie"
     );
     assert!(
-        refuted(&|w| {
+        refuted(&w, &proofs, |w| {
             let i = w.storage.iter().position(|s| s.key == S3).unwrap();
             w.storage[i].value = U256::from(1); // zero slot claimed non-zero
         }),
         "explicit-zero lie"
     );
     assert!(
-        refuted(&|w| {
+        refuted(&w, &proofs, |w| {
             let i = w.storage.iter().position(|s| s.key == S2).unwrap();
             w.storage[i].value = U256::ZERO; // non-zero slot claimed zero
         }),
@@ -415,7 +410,7 @@ fn emptying_a_preexisting_account_fails_closed() {
     let err = loop {
         let proofs = proofs_from(have.clone());
         match verify_witness_anchored(&w, &proofs)
-            .and_then(|pre| recompute_post_root(&w, &proofs, &pre, &delta))
+            .and_then(|pre| recompute_post_root(&proofs, &pre, &delta))
         {
             Err(AnchorError::MissingNode { hash, .. }) => have.push(all[&hash].clone()),
             Err(e) => break e,
@@ -442,7 +437,7 @@ fn emptying_a_preexisting_account_fails_closed() {
     delta2.accounts.insert(FRESH, (0, U256::ZERO, B256::ZERO));
     let (post, _) = anchored(&all, |proofs| {
         let pre = verify_witness_anchored(&w2, proofs)?;
-        recompute_post_root(&w2, proofs, &pre, &delta2)
+        recompute_post_root(proofs, &pre, &delta2)
     });
     assert_eq!(post, root, "touched-but-empty leaves the root unchanged");
 }

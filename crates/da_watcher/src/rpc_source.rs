@@ -6,9 +6,8 @@
 //!     lockbox address and the `DepositInitiated` and `UpgradeInitiated`
 //!     event signatures, then ABI-decode each result into a [`LockboxLog`].
 //!
-//! Ported from `crates/node/src/l1_source_rpc.rs`. The contracts'
-//! bytecode-hash CI check byte-pins the event signature to the on-chain
-//! `ETHLockbox.sol` ABI.
+//! The contracts' bytecode-hash CI check byte-pins the event signature to
+//! the on-chain `ETHLockbox.sol` ABI.
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider;

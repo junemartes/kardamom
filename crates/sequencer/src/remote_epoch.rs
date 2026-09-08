@@ -23,8 +23,9 @@
 //!
 //! Remote epochs are not nonce-gated and have no state-machine interaction, so
 //! this is the same poll → publish pump the epoch path is, running independent
-//! of both it and the tx_data → TxRef path.
+//! of both it and the `tx_data` → `TxRef` path.
 
+use kardamom_log::aeron_live::TxRemoteEpochsSubscriberHandle;
 use kardamom_types::BPosition;
 use kardamom_types::xchain::RemoteEpochRecord;
 
@@ -39,64 +40,78 @@ pub trait RemoteEpochSubscriber: Send {
     /// * `Ok(Some((pos, record)))` — a record was available and is yielded.
     /// * `Ok(None)` — no fragment available right now (caller should back off).
     /// * `Err(SequencerError::IngressDisconnected)` — subscription closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SequencerError::IngressDisconnected`] when the
+    /// subscription is closed.
     fn poll(&mut self) -> Result<Option<(BPosition, RemoteEpochRecord)>, SequencerError>;
 }
 
-/// Single-step remote-epoch pump: pull one record off the subscription and
-/// forward it on `tx_ordering`. Returns `Ok(true)` if a record was processed
-/// (caller should keep going), `Ok(false)` if the subscription is idle.
+/// The live adapter: a miss is not an error, the pump backs off.
+impl RemoteEpochSubscriber for TxRemoteEpochsSubscriberHandle {
+    fn poll(&mut self) -> Result<Option<(BPosition, RemoteEpochRecord)>, SequencerError> {
+        Ok(self.try_recv())
+    }
+}
+
+/// One record popped from the subscription but not yet accepted by the
+/// cluster. The pump holds it here across a `Backpressure` result and
+/// retries it before it polls again.
+pub type PendingRemoteEpoch = Option<(BPosition, RemoteEpochRecord)>;
+
+/// Single-step remote-epoch pump: take the pending record if there is one,
+/// else pull one record off the subscription, and forward it on
+/// `tx_ordering`. Returns `Ok(true)` if a record was processed (caller
+/// should keep going), `Ok(false)` if the subscription is idle.
 ///
-/// On `SequencerError::Backpressure` the caller retries the same record next
-/// tick — the record is durable on `tx_remote_epochs`, so there is no rewind
-/// state to manage.
-pub fn process_remote_epoch<S, P>(sub: &mut S, b: &mut P) -> Result<bool, SequencerError>
+/// On `SequencerError::Backpressure` the record goes into `pending`, and
+/// the next call retries the SAME record before it polls for a new one.
+/// The poll is destructive (`try_recv`), so without this slot a
+/// backpressured record would be lost. The watcher persists its cursor
+/// after the media-driver ack, so it would never re-publish the record,
+/// and the pair's lane would have a permanent hole (audit H2).
+/// `Backpressure` includes "not connected", so a leader election would
+/// otherwise drain every sequencer's backlog at once.
+pub fn process_remote_epoch<S, P>(
+    sub: &mut S,
+    b: &mut P,
+    pending: &mut PendingRemoteEpoch,
+) -> Result<bool, SequencerError>
 where
     S: RemoteEpochSubscriber,
     P: TxOrderingRefPublisher,
 {
-    let Some((_pos, record)) = sub.poll()? else {
-        return Ok(false);
+    let (pos, record) = match pending.take() {
+        Some(held) => held,
+        None => match sub.poll()? {
+            Some(next) => next,
+            None => return Ok(false),
+        },
     };
-    b.try_publish_remote_epoch(&record)?;
+    if let Err(e) = b.try_publish_remote_epoch(&record) {
+        if matches!(e, SequencerError::Backpressure) {
+            *pending = Some((pos, record));
+        }
+        return Err(e);
+    }
     crate::metrics::record_remote_epoch_relayed(record.origin_chain_id, record.messages.len());
     Ok(true)
 }
 
 #[cfg(any(test, feature = "testing"))]
 pub mod fakes {
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-
-    use super::*;
+    use super::{BPosition, RemoteEpochRecord, RemoteEpochSubscriber, SequencerError};
+    use crate::fakes::ScriptedQueue;
 
     /// In-memory [`RemoteEpochSubscriber`] driven by a scripted queue. Push
-    /// test inputs via [`ScriptedRemoteEpochs::push`]; the sequencer drains
+    /// test inputs via `ScriptedRemoteEpochs::push`; the sequencer drains
     /// them FIFO.
-    #[derive(Default, Clone)]
-    pub struct ScriptedRemoteEpochs {
-        pub queue: Arc<Mutex<VecDeque<(BPosition, RemoteEpochRecord)>>>,
-        pub closed: Arc<Mutex<bool>>,
-    }
-
-    impl ScriptedRemoteEpochs {
-        pub fn push(&self, pos: BPosition, record: RemoteEpochRecord) {
-            self.queue.lock().unwrap().push_back((pos, record));
-        }
-
-        pub fn close(&self) {
-            *self.closed.lock().unwrap() = true;
-        }
-    }
+    pub type ScriptedRemoteEpochs = ScriptedQueue<RemoteEpochRecord>;
 
     impl RemoteEpochSubscriber for ScriptedRemoteEpochs {
         fn poll(&mut self) -> Result<Option<(BPosition, RemoteEpochRecord)>, SequencerError> {
-            if let Some(item) = self.queue.lock().unwrap().pop_front() {
-                return Ok(Some(item));
-            }
-            if *self.closed.lock().unwrap() {
-                return Err(SequencerError::IngressDisconnected);
-            }
-            Ok(None)
+            self.poll_next()
         }
     }
 }
@@ -114,14 +129,17 @@ mod tests {
         RemoteEpochRecord {
             origin_chain_id: origin,
             anchor_number: 100 + first_seq,
-            anchor_hash: B256::repeat_byte(first_seq as u8),
+            anchor_hash: B256::repeat_byte(u8::try_from(first_seq).unwrap()),
             first_seq,
             messages: (0..messages)
-                .map(|i| XChainMessage {
-                    source_hash: B256::repeat_byte(0xE0 + i as u8),
-                    seq: first_seq + i as u64,
-                    gas_limit: 100_000,
-                    ..Default::default()
+                .map(|i| {
+                    let i = u64::try_from(i).unwrap();
+                    XChainMessage {
+                        source_hash: B256::repeat_byte(u8::try_from(0xE0 + i).unwrap()),
+                        seq: first_seq + i,
+                        gas_limit: 100_000,
+                        ..Default::default()
+                    }
                 })
                 .collect(),
         }
@@ -137,7 +155,7 @@ mod tests {
         let r = record(412_346, 7, 3);
         sub.push(BPosition::default(), r.clone());
 
-        assert!(process_remote_epoch(&mut sub, &mut pubr).unwrap());
+        assert!(process_remote_epoch(&mut sub, &mut pubr, &mut None).unwrap());
 
         let got = pubr.remote_epochs.lock().unwrap();
         assert_eq!(got.len(), 1);
@@ -156,7 +174,7 @@ mod tests {
         sub.push(BPosition::default(), record(412_346, 1, 1));
 
         for _ in 0..3 {
-            assert!(process_remote_epoch(&mut sub, &mut pubr).unwrap());
+            assert!(process_remote_epoch(&mut sub, &mut pubr, &mut None).unwrap());
         }
         let got = pubr.remote_epochs.lock().unwrap();
         assert_eq!(
@@ -169,7 +187,7 @@ mod tests {
     fn idle_subscription_reports_no_work() {
         let mut sub = ScriptedRemoteEpochs::default();
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
-        assert!(!process_remote_epoch(&mut sub, &mut pubr).unwrap());
+        assert!(!process_remote_epoch(&mut sub, &mut pubr, &mut None).unwrap());
     }
 
     #[test]
@@ -178,7 +196,7 @@ mod tests {
         sub.close();
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
         assert!(matches!(
-            process_remote_epoch(&mut sub, &mut pubr),
+            process_remote_epoch(&mut sub, &mut pubr, &mut None),
             Err(SequencerError::IngressDisconnected)
         ));
     }
@@ -189,11 +207,46 @@ mod tests {
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
         *pubr.fail_with_backpressure.lock().unwrap() = true;
         sub.push(BPosition::default(), record(412_346, 2, 1));
+        let mut pending = None;
 
         assert!(matches!(
-            process_remote_epoch(&mut sub, &mut pubr),
+            process_remote_epoch(&mut sub, &mut pubr, &mut pending),
             Err(SequencerError::Backpressure)
         ));
         assert!(pubr.remote_epochs.lock().unwrap().is_empty());
+        assert!(pending.is_some(), "the popped record is held, not dropped");
+    }
+
+    /// Audit H2: a backpressured publish followed by a successful one relays
+    /// the same record exactly once, and the record behind it is not
+    /// skipped. This is the lane-hole fix: the sequencer never drops.
+    #[test]
+    fn a_backpressured_record_is_retried_and_relayed_exactly_once() {
+        let mut sub = ScriptedRemoteEpochs::default();
+        let mut pubr = InMemoryTxOrderingRefPublisher::default();
+        let first = record(412_346, 2, 1);
+        let second = record(412_346, 3, 2);
+        sub.push(BPosition::default(), first.clone());
+        sub.push(BPosition::default(), second.clone());
+        let mut pending = None;
+
+        *pubr.fail_with_backpressure.lock().unwrap() = true;
+        assert!(matches!(
+            process_remote_epoch(&mut sub, &mut pubr, &mut pending),
+            Err(SequencerError::Backpressure)
+        ));
+        assert!(matches!(
+            process_remote_epoch(&mut sub, &mut pubr, &mut pending),
+            Err(SequencerError::Backpressure)
+        ));
+
+        *pubr.fail_with_backpressure.lock().unwrap() = false;
+        assert!(process_remote_epoch(&mut sub, &mut pubr, &mut pending).unwrap());
+        assert!(pending.is_none(), "the slot empties on success");
+        assert!(process_remote_epoch(&mut sub, &mut pubr, &mut pending).unwrap());
+        assert!(!process_remote_epoch(&mut sub, &mut pubr, &mut pending).unwrap());
+
+        let got = pubr.remote_epochs.lock().unwrap();
+        assert_eq!(*got, vec![first, second], "each record once, in order");
     }
 }

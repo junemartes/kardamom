@@ -10,16 +10,16 @@
 //!
 //! The batcher reads from `M + 1` archives, not one:
 //!
-//! - The **TxOrdering archive** carries the canonical orderer payload. It
+//! - The **`TxOrdering` archive** carries the canonical orderer payload. It
 //!   holds only `TxOrderingMessage` records (`TxRef + BoundaryStart`). Each
 //!   record is small.
-//! - The **per-sequencer tx_data archives** carry the bulk `TxEnvelope`
+//! - The **per-sequencer `tx_data` archives** carry the bulk `TxEnvelope`
 //!   bytes. There is one archive per sequencer. [`multi_archive_reader`]
 //!   opens each archive on demand.
 //!
 //! [`multi_archive_reader::MultiArchiveReader`] connects the two archives. It
 //! walks the ordering archive in canonical order. For each `TxRef`, it looks
-//! up the position in the matching tx_data index. It yields
+//! up the position in the matching `tx_data` index. It yields
 //! [`multi_archive_reader::ResolvedRecord`]s. The existing
 //! [`batch::BatchAccumulator`] can consume these records as-is.
 //!
@@ -42,6 +42,8 @@ pub mod prover_submit;
 pub mod recon;
 pub mod rereplicate;
 pub mod settlement;
+#[cfg(any(test, feature = "test-support", feature = "docker-e2e"))]
+pub mod testkit;
 
 pub use batch::{BatchAccumulator, ClosedBlock, RecordedTx};
 pub use batcher::{Batcher, MockSender, PostedBatch, Sender};

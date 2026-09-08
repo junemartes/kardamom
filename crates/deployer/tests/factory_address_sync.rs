@@ -1,7 +1,7 @@
 //! Checks that the FACTORY constant in KardamomUUPSBase.sol matches the
 //! address that `addresses::factory_proxy_address(...)` computes for the
 //! canonical dev/test owner. A production owner gives a different address
-//! and a different KardamomUUPSBase build. This test covers only the dev
+//! and a different `KardamomUUPSBase` build. This test covers only the dev
 //! path used in local and CI testing.
 
 use std::path::PathBuf;

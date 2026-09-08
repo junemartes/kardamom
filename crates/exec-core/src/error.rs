@@ -71,9 +71,9 @@ pub enum ExecutorError {
     #[error("tx_receipts publication closed")]
     TxReceiptsClosed,
 
-    /// The tx_ordering reader pulled a [`kardamom_types::TxRef`], but the
-    /// referenced envelope never appeared on tx_data within the join
-    /// timeout. Either the tx_data publisher failed, or the sequencer
+    /// The `tx_ordering` reader pulled a [`kardamom_types::TxRef`], but the
+    /// referenced envelope never appeared on `tx_data` within the join
+    /// timeout. Either the `tx_data` publisher failed, or the sequencer
     /// published a ref to a position it never wrote. Both are upstream bugs.
     #[error(
         "join timeout: TxRef(sequencer_id={sequencer_id}, tx_data_position={tx_data_position:?}) not found within {timeout_ms} ms"
@@ -85,7 +85,7 @@ pub enum ExecutorError {
     },
 
     /// Mirror of [`Self::JoinTimeout`] for the deposit path. The
-    /// tx_ordering reader pulled a [`kardamom_types::DepositRef`], but the
+    /// `tx_ordering` reader pulled a [`kardamom_types::DepositRef`], but the
     /// referenced [`kardamom_types::Deposit`] never landed on `tx_deposits`
     /// within the join timeout. Either the DA watcher failed, or the
     /// sequencer republished a ref to a position the watcher never wrote.

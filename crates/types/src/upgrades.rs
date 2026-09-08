@@ -18,8 +18,6 @@
 //! tie: it cross-checks the address, bytecode, `SYSTEM_UPGRADER`, and the
 //! `setFeature` selector against the compiled artifacts. The end-to-end
 //! test scenarios enforce it too, through the live chain.
-//!
-//! See `docs/specs/2026-08-16-l1-upgrade-feature-flags-design.md`.
 
 use alloc::vec::Vec;
 
@@ -59,6 +57,7 @@ pub const SET_FEATURE_SELECTOR: [u8; 4] = [0x8a, 0xfd, 0xb8, 0x54];
 ///
 /// `activation_timestamp` is in epoch milliseconds, this chain's
 /// `block.timestamp` unit. `0` means "activate immediately".
+#[must_use]
 pub fn encode_set_feature(feature_id: U256, activation_timestamp: u64) -> Bytes {
     let mut out = Vec::with_capacity(68);
     out.extend_from_slice(&SET_FEATURE_SELECTOR);

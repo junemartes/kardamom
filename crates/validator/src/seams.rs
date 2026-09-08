@@ -14,15 +14,15 @@ use crate::buffers::{BalBuffer, ReceiptBuffer};
 use crate::{Divergence, metrics};
 
 /// How long the exec thread waits for a block's BAL before it skips the check.
-pub const BAL_WAIT: Duration = Duration::from_secs(5);
+const BAL_WAIT: Duration = Duration::from_secs(5);
 /// How long the commit thread waits for a tx's published receipt before it skips.
-pub const RECEIPT_WAIT: Duration = Duration::from_secs(5);
+const RECEIPT_WAIT: Duration = Duration::from_secs(5);
 
 /// Returns `true` when two block deltas have the same write-set (accounts,
 /// storage, code). Receipts are checked separately via `tx_receipts`, so this
 /// function skips them on purpose. The validator and the executor both build
 /// these vectors from sorted maps, so equal content means equal order.
-pub fn write_set_eq(a: &BlockDelta, b: &BlockDelta) -> bool {
+fn write_set_eq(a: &BlockDelta, b: &BlockDelta) -> bool {
     a.accounts == b.accounts && a.storage == b.storage && a.code == b.code
 }
 
@@ -62,13 +62,13 @@ fn write_set_diff_summary(local: &BlockDelta, bal: &BlockDelta) -> String {
 /// the canonical order, and the per-block `gas_used` sums. A divergence in
 /// one of them implies a divergence in a checked field, so comparing them
 /// would only re-verify arithmetic, not execution.
-pub fn receipt_consistent(local: &Receipt, published: &Receipt) -> bool {
+fn receipt_consistent(local: &Receipt, published: &Receipt) -> bool {
     local.status == published.status
         && local.gas_used == published.gas_used
         && local.write_set_hash == published.write_set_hash
         && local.logs == published.logs
-        // The typed skip cause (#241) is part of the deterministic
-        // transition: same input, same reason on every replica.
+        // The typed skip cause is part of the deterministic transition:
+        // same input, same reason on every replica.
         && local.skip_reason == published.skip_reason
 }
 
@@ -94,10 +94,8 @@ pub struct ValidatorWriterQueue<Q: StateWriterQueue> {
     /// Blocks at or below this value were verified before a restart.
     /// Crash recovery replays them to rebuild state, but re-execution
     /// against already-applied state gives empty deltas (every tx skips as
-    /// nonce-too-low). Comparing those against retained BAL frames caused
-    /// false divergences: each stop-and-restart replayed again and
-    /// diverged again, turning a short stall into a permanent restart
-    /// loop.
+    /// nonce-too-low). Comparing those against retained BAL frames would
+    /// report a false divergence on every replay of these blocks.
     verify_floor: u64,
 }
 
@@ -142,29 +140,23 @@ impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
             return self.inner.submit(block, delta);
         }
         self.high_water = block.block_number;
-        match self.bals.take(block.block_number, self.wait) {
-            Some(bal) => {
-                if write_set_eq(&delta, &bal) {
-                    metrics::counter_block_verified();
-                } else {
-                    let summary = write_set_diff_summary(&delta, &bal);
-                    let reason =
-                        format!("block {} write-set != BAL: {summary}", block.block_number);
-                    self.divergence.record(reason.clone());
-                    // Use `Divergence`, not `State`: it is fatal and the
-                    // engine does not retry it.
-                    return Err(ExecutorError::Divergence(reason));
-                }
+        if let Some(bal) = self.bals.take(block.block_number, self.wait) {
+            if write_set_eq(&delta, &bal) {
+                metrics::counter_block_verified();
+            } else {
+                let summary = write_set_diff_summary(&delta, &bal);
+                let reason = format!("block {} write-set != BAL: {summary}", block.block_number);
+                // `Divergence` is fatal; the engine does not retry it.
+                return Err(ExecutorError::Divergence(self.divergence.halt(reason)));
             }
-            None => {
-                // The BAL never arrived, so this block stays unverified.
-                // This is not a proven divergence: log it and count it.
-                tracing::warn!(
-                    block = block.block_number,
-                    "no BAL received within timeout; block left unverified"
-                );
-                metrics::counter_bal_missing();
-            }
+        } else {
+            // The BAL never arrived, so this block stays unverified. This
+            // is not a proven divergence: log it and count it.
+            tracing::warn!(
+                block = block.block_number,
+                "no BAL received within timeout; block left unverified"
+            );
+            metrics::counter_bal_missing();
         }
         // Send the delta to the trie-aware writer; this advances the MPT state root.
         self.inner.submit(block, delta)
@@ -220,57 +212,52 @@ impl TxReceiptsPublication for ValidatorReceiptSink {
         // buffer. Without this latch, a retrying caller would find an
         // empty buffer, land in the "unverified" arm, and commit past a
         // proven mismatch.
-        if self.divergence.is_halted() {
-            return Err(ExecutorError::Divergence(
-                self.divergence
-                    .reason()
-                    .unwrap_or_else(|| "validator halted on divergence".into()),
-            ));
+        if let Some(reason) = self
+            .divergence
+            .halt_reason("validator halted on divergence")
+        {
+            return Err(ExecutorError::Divergence(reason));
         }
         match msg {
-            CMessage::Receipt(local) => match self.receipts.take(local.tx_idx, self.wait) {
-                Some(published) => {
-                    if receipt_consistent(&local, &published) {
-                        Ok(())
-                    } else {
-                        // Include the tx identity, not only the mismatch, so
-                        // responders can find the transaction without a
-                        // separate hash lookup.
-                        let reason = format!(
-                            "receipt mismatch at tx_idx {:?}: local(status={}, gas={}, wsh={}, \
-                             logs={}) vs published(status={}, gas={}, wsh={}, logs={}) \
-                             [tx_hash={} from={} to={:?} block={} tx_index={}]",
-                            local.tx_idx,
-                            local.status,
-                            local.gas_used,
-                            local.write_set_hash,
-                            local.logs.len(),
-                            published.status,
-                            published.gas_used,
-                            published.write_set_hash,
-                            published.logs.len(),
-                            local.tx_hash,
-                            local.from,
-                            local.to,
-                            local.block_number,
-                            local.transaction_index,
-                        );
-                        // Dump the flight ring first, on a best-effort basis.
-                        // The stop is permanent, so this is the only chance
-                        // to capture the block inputs behind the mismatch.
-                        if let Some(f) = self.flight.as_ref() {
-                            f.dump_receipt_divergence(&local, &published);
-                        }
-                        self.divergence.record(reason.clone());
-                        Err(ExecutorError::Divergence(reason))
-                    }
-                }
-                None => {
+            CMessage::Receipt(local) => {
+                let Some(published) = self.receipts.take(local.tx_idx, self.wait) else {
                     // No published receipt to compare against, so skip the check.
                     metrics::counter_receipt_missing();
-                    Ok(())
+                    return Ok(());
+                };
+                if receipt_consistent(&local, &published) {
+                    return Ok(());
                 }
-            },
+                // Include the tx identity, not only the mismatch, so
+                // responders can find the transaction without a separate
+                // hash lookup.
+                let reason = format!(
+                    "receipt mismatch at tx_idx {:?}: local(status={}, gas={}, wsh={}, \
+                     logs={}) vs published(status={}, gas={}, wsh={}, logs={}) \
+                     [tx_hash={} from={} to={:?} block={} tx_index={}]",
+                    local.tx_idx,
+                    local.status,
+                    local.gas_used,
+                    local.write_set_hash,
+                    local.logs.len(),
+                    published.status,
+                    published.gas_used,
+                    published.write_set_hash,
+                    published.logs.len(),
+                    local.tx_hash,
+                    local.from,
+                    local.to,
+                    local.block_number,
+                    local.transaction_index,
+                );
+                // Dump the flight ring first, on a best-effort basis. The
+                // stop is permanent, so this is the only chance to capture
+                // the block inputs behind the mismatch.
+                if let Some(f) = self.flight.as_ref() {
+                    f.dump_receipt_divergence(&local, &published);
+                }
+                Err(ExecutorError::Divergence(self.divergence.halt(reason)))
+            }
             // A block boundary carries no per-tx data to check.
             CMessage::BlockBoundary(_) => Ok(()),
         }
@@ -433,7 +420,7 @@ mod tests {
         let ring = crate::flight::FlightRing::new();
         ring.push(
             7,
-            20,
+            std::num::NonZeroU16::new(20).expect("fixture granularity"),
             kardamom_engine::block_env::ExecEnv {
                 chain_id: 1,
                 block_number: 7,
@@ -497,7 +484,7 @@ mod tests {
         let log = |topic: u8| WireLog {
             address: Address::from([0x22; 20]),
             topics: vec![B256::repeat_byte(topic)],
-            data: Default::default(),
+            data: bytes::Bytes::default(),
         };
         let mut published = receipt(0, true, 21_000, 0xab);
         published.logs = vec![log(0x01)];

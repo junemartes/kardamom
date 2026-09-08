@@ -21,8 +21,6 @@
 //! implementation for all drivers. It takes only a state-read function as a
 //! parameter, so a driver adopts it in one line and cannot get the
 //! semantics subtly wrong.
-//!
-//! See `docs/specs/2026-08-16-l1-upgrade-feature-flags-design.md`.
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use kardamom_types::upgrades::CHAIN_STATE;
@@ -45,6 +43,7 @@ pub const HEALTH_BEACON_SLOT: B256 = B256::new([
 /// Storage slot that holds `featureId`'s activation timestamp. This follows
 /// the Solidity mapping rule `keccak256(pad32(key) ++ pad32(slot))`, with the
 /// mapping at slot 0.
+#[must_use]
 pub fn activation_slot(feature_id: u64) -> B256 {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(&U256::from(feature_id).to_be_bytes::<32>());
@@ -64,25 +63,46 @@ pub fn activation_slot(feature_id: u64) -> B256 {
 /// check gives the same result on every replica. Using the header's own
 /// timestamp is what makes "active from the first block at or after T" a
 /// statement about the chain, not about execution plumbing.
+#[must_use]
 pub fn is_active(stored_activation: U256, header_ts_ms: u64) -> bool {
     !stored_activation.is_zero() && stored_activation <= U256::from(header_ts_ms)
 }
 
-/// Pack a health beacon into one word: `count | block << 64 | timestamp << 128`.
-///
-/// Fields saturate instead of wrapping, so an unlikely overflow can never
-/// corrupt a neighbor field. A wrapped count bleeding into the block-number
-/// field would look like a wildly wrong beacon, not a stuck counter. This
-/// mirrors `KardamomChainState.health()`.
-pub fn pack_beacon(count: u64, block_number: u64, timestamp_ms: u64) -> U256 {
-    U256::from(count) | (U256::from(block_number) << 64) | (U256::from(timestamp_ms) << 128)
+/// A health beacon: a heartbeat counter, the block it was last recorded
+/// at, and that block's header timestamp. Packed into one storage word
+/// as `count | block << 64 | timestamp << 128`, mirroring
+/// `KardamomChainState.health()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Beacon {
+    pub count: u64,
+    pub block_number: u64,
+    pub timestamp_ms: u64,
 }
 
-/// Inverse of [`pack_beacon`].
-pub fn unpack_beacon(word: U256) -> (u64, u64, u64) {
-    let mask = U256::from(u64::MAX);
-    let field = |shift: usize| -> u64 { ((word >> shift) & mask).to::<u64>() };
-    (field(0), field(64), field(128))
+impl Beacon {
+    /// Pack into one word. Each field is already a native `u64`, so it
+    /// fits its 64-bit lane exactly and cannot bleed into a neighbor:
+    /// the type is what bounds them, not a runtime saturate or wrap.
+    /// `64 + 128 < 256`, so all three lanes fit the `U256` word with
+    /// room to spare.
+    #[must_use]
+    pub fn pack(self) -> U256 {
+        U256::from(self.count)
+            | (U256::from(self.block_number) << 64)
+            | (U256::from(self.timestamp_ms) << 128)
+    }
+
+    /// Inverse of [`Beacon::pack`].
+    #[must_use]
+    pub fn unpack(word: U256) -> Self {
+        let mask = U256::from(u64::MAX);
+        let field = |shift: usize| -> u64 { ((word >> shift) & mask).to::<u64>() };
+        Self {
+            count: field(0),
+            block_number: field(64),
+            timestamp_ms: field(128),
+        }
+    }
 }
 
 /// What the block-close pass did, for logging and metrics. This is empty
@@ -114,6 +134,10 @@ pub struct BlockCloseOutcome {
 /// cause a mismatch with a validator that recomputes claims from
 /// transactions. The write is still cross-checked between roles, because
 /// the validator compares the whole `BlockDelta`.
+///
+/// # Errors
+///
+/// Returns `E` when `read_slot` fails to read a state layer.
 pub fn apply_block_close_actions<E, F>(
     delta: &mut PendingDelta,
     block_number: u64,
@@ -136,11 +160,16 @@ where
 
     let activation = read(CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK), delta)?;
     if is_active(activation, header_ts_ms) {
-        let (beats, _, _) = unpack_beacon(read(CHAIN_STATE, HEALTH_BEACON_SLOT, delta)?);
-        let beat = beats.saturating_add(1);
+        let prior = Beacon::unpack(read(CHAIN_STATE, HEALTH_BEACON_SLOT, delta)?);
+        let beat = prior.count.saturating_add(1);
         delta.storage.insert(
             (CHAIN_STATE, HEALTH_BEACON_SLOT),
-            pack_beacon(beat, block_number, header_ts_ms),
+            Beacon {
+                count: beat,
+                block_number,
+                timestamp_ms: header_ts_ms,
+            }
+            .pack(),
         );
         out.health_beat = Some(beat);
     }
@@ -154,6 +183,10 @@ mod tests {
     use core::convert::Infallible;
 
     /// A state with nothing in it. Every read misses.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "must match apply_block_close_actions's read_slot: F bound; this fixture never fails"
+    )]
     fn empty(_a: Address, _s: B256) -> Result<U256, Infallible> {
         Ok(U256::ZERO)
     }
@@ -191,14 +224,22 @@ mod tests {
 
     #[test]
     fn beacon_round_trips() {
-        let w = pack_beacon(42, 1234, 1_700_000_000_250);
-        assert_eq!(unpack_beacon(w), (42, 1234, 1_700_000_000_250));
+        let beacon = Beacon {
+            count: 42,
+            block_number: 1234,
+            timestamp_ms: 1_700_000_000_250,
+        };
+        assert_eq!(Beacon::unpack(beacon.pack()), beacon);
     }
 
     #[test]
     fn beacon_fields_do_not_bleed_at_maxima() {
-        let w = pack_beacon(u64::MAX, u64::MAX, u64::MAX);
-        assert_eq!(unpack_beacon(w), (u64::MAX, u64::MAX, u64::MAX));
+        let beacon = Beacon {
+            count: u64::MAX,
+            block_number: u64::MAX,
+            timestamp_ms: u64::MAX,
+        };
+        assert_eq!(Beacon::unpack(beacon.pack()), beacon);
     }
 
     #[test]
@@ -240,7 +281,14 @@ mod tests {
         let out = apply_block_close_actions(&mut delta, 7, 1_500, read).unwrap();
         assert_eq!(out.health_beat, Some(1));
         let w = delta.storage[&(CHAIN_STATE, HEALTH_BEACON_SLOT)];
-        assert_eq!(unpack_beacon(w), (1, 7, 1_500));
+        assert_eq!(
+            Beacon::unpack(w),
+            Beacon {
+                count: 1,
+                block_number: 7,
+                timestamp_ms: 1_500
+            }
+        );
     }
 
     /// The layering that lets an immediate upgrade activate in its own
@@ -269,14 +317,23 @@ mod tests {
             if s == activation_slot(FEATURE_HEALTH_CHECK) {
                 Ok(U256::from(1u64))
             } else {
-                Ok(pack_beacon(9, 100, 500))
+                Ok(Beacon {
+                    count: 9,
+                    block_number: 100,
+                    timestamp_ms: 500,
+                }
+                .pack())
             }
         };
         let out = apply_block_close_actions(&mut delta, 101, 750, read).unwrap();
         assert_eq!(out.health_beat, Some(10));
         assert_eq!(
-            unpack_beacon(delta.storage[&(CHAIN_STATE, HEALTH_BEACON_SLOT)]),
-            (10, 101, 750)
+            Beacon::unpack(delta.storage[&(CHAIN_STATE, HEALTH_BEACON_SLOT)]),
+            Beacon {
+                count: 10,
+                block_number: 101,
+                timestamp_ms: 750
+            }
         );
     }
 
@@ -290,12 +347,23 @@ mod tests {
             (CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK)),
             U256::from(1u64),
         );
-        delta
-            .storage
-            .insert((CHAIN_STATE, HEALTH_BEACON_SLOT), pack_beacon(4, 1, 1));
+        delta.storage.insert(
+            (CHAIN_STATE, HEALTH_BEACON_SLOT),
+            Beacon {
+                count: 4,
+                block_number: 1,
+                timestamp_ms: 1,
+            }
+            .pack(),
+        );
         let read = |_a: Address, _s: B256| -> Result<U256, Infallible> {
             // Stale backing value that must not win.
-            Ok(pack_beacon(99, 99, 99))
+            Ok(Beacon {
+                count: 99,
+                block_number: 99,
+                timestamp_ms: 99,
+            }
+            .pack())
         };
         let out = apply_block_close_actions(&mut delta, 2, 2, read).unwrap();
         assert_eq!(out.health_beat, Some(5));

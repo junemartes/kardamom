@@ -40,25 +40,30 @@ pub mod walker;
 mod incremental_tests;
 
 pub use alloy_trie::Nibbles;
-pub use prefix_set::PrefixSet;
-pub use walker::TrieUpdates;
+pub(crate) use prefix_set::PrefixSet;
+pub(crate) use walker::TrieUpdates;
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::Encodable;
 use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY, TrieAccount, root};
 use signet_libmdbx::Database;
 use signet_libmdbx::tx::aliases::RwTxSync;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::StateError;
 
 /// Node-incremental state-root computation over the stored trie
 /// tables. The pure `state_root` and `storage_root` rebuild functions
 /// below remain the shadow-check oracle.
-pub struct StateRoot;
+pub(crate) struct StateRoot;
 
 impl StateRoot {
     /// One account's storage-trie root, computed incrementally.
     /// `prefix_set` holds `keccak(slot)` for the account's changed slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if a table read fails.
     pub fn storage_root_incremental(
         tx: &RwTxSync,
         storage_trie: Database,
@@ -72,62 +77,27 @@ impl StateRoot {
     /// The world-state account-trie root, computed incrementally.
     /// `prefix_set` holds `keccak(addr)` for every changed account,
     /// including accounts with only a storage-root change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if a table read fails.
     pub fn state_root_incremental(
         tx: &RwTxSync,
         account_trie: Database,
         hashed_accounts: Database,
         prefix_set: &PrefixSet,
     ) -> Result<(B256, TrieUpdates), StateError> {
-        let leaf = |p: &AccountTrieParts| {
-            let mut buf = Vec::new();
-            p.to_trie_account().encode(&mut buf);
-            buf
-        };
-        walker::account_root(tx, account_trie, hashed_accounts, prefix_set, &leaf)
+        walker::account_root(tx, account_trie, hashed_accounts, prefix_set)
     }
 }
 
-/// Persist a walk's [`TrieUpdates`] to a node table.
-///
-/// This does three things, in order:
-///
-/// 1. Range-delete each cleared subtrie prefix. These are stale nodes
-///    that a leaf rebuild may have orphaned under extensions.
-/// 2. Upsert each produced branch node.
-/// 3. Delete each collapsed path.
-///
-/// Clears must run before upserts, so freshly produced nodes inside a
-/// cleared region survive.
-///
-/// `account_hash` namespaces storage-trie keys; pass `None` for the
-/// account trie. The writer and the test harness both use this function.
-pub fn apply_trie_updates(
-    txn: &RwTxSync,
-    db: Database,
-    account_hash: Option<&B256>,
-    updates: &TrieUpdates,
-) -> Result<(), StateError> {
-    use signet_libmdbx::WriteFlags;
-    let key = |path: &alloy_trie::Nibbles| -> Vec<u8> { cursor::node_key(account_hash, path) };
-    for path in &updates.cleared {
-        del_prefix(txn, db, &key(path))?;
-    }
-    for (path, node) in &updates.upserts {
-        txn.put(
-            db,
-            key(path),
-            node::encode_branch_node(node),
-            WriteFlags::UPSERT,
-        )?;
-    }
-    for path in &updates.removals {
-        match txn.del(db, key(path), None) {
-            Ok(_) => {}
-            Err(signet_libmdbx::MdbxError::NotFound) => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
+/// The account-trie leaf value: the RLP-encoded [`TrieAccount`]. The only
+/// leaf shape the walker and the proof generator produce, so both call
+/// this directly instead of threading a closure through the walk.
+pub(crate) fn account_leaf_rlp(p: &AccountTrieParts) -> Vec<u8> {
+    let mut buf = Vec::new();
+    p.to_trie_account().encode(&mut buf);
+    buf
 }
 
 /// The four trie tables, opened once per block-commit txn.
@@ -139,6 +109,9 @@ pub struct TrieTables {
 }
 
 impl TrieTables {
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if any of the four trie tables fails to open.
     pub fn open<K: cursor::ReadKind>(txn: &signet_libmdbx::TxSync<K>) -> Result<Self, StateError> {
         use crate::schema::{
             TABLE_ACCOUNT_TRIE, TABLE_HASHED_ACCOUNTS, TABLE_HASHED_STORAGE, TABLE_STORAGE_TRIE,
@@ -150,172 +123,309 @@ impl TrieTables {
             hashed_storage: txn.open_db(Some(TABLE_HASHED_STORAGE))?,
         })
     }
-}
 
-/// Delete every row in `db` whose key starts with `prefix`. This drops
-/// a deleted account's whole hashed-storage or storage-trie subtree.
-fn del_prefix(txn: &RwTxSync, db: Database, prefix: &[u8]) -> Result<(), StateError> {
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    {
-        let mut cur = txn.cursor(db)?;
-        let mut item = cur.set_range::<Vec<u8>, Vec<u8>>(prefix)?;
-        while let Some((k, _)) = item {
-            if !k.starts_with(prefix) {
-                break;
-            }
-            keys.push(k);
-            item = cur.next::<Vec<u8>, Vec<u8>>()?;
+    /// Persist a walk's [`TrieUpdates`] to a node table.
+    ///
+    /// This does three things, in order:
+    ///
+    /// 1. Range-delete each cleared subtrie prefix. These are stale nodes
+    ///    that a leaf rebuild may have orphaned under extensions.
+    /// 2. Upsert each produced branch node.
+    /// 3. Delete each collapsed path.
+    ///
+    /// Clears must run before upserts, so freshly produced nodes inside a
+    /// cleared region survive.
+    ///
+    /// `account_hash` namespaces storage-trie keys and picks the table:
+    /// `Some` writes `storage_trie`, `None` writes `account_trie`. The
+    /// writer and the test harness both use this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if a table write or delete fails.
+    fn apply_updates(
+        &self,
+        txn: &RwTxSync,
+        account_hash: Option<&B256>,
+        updates: &TrieUpdates,
+    ) -> Result<(), StateError> {
+        use signet_libmdbx::WriteFlags;
+        let db = match account_hash {
+            Some(_) => self.storage_trie,
+            None => self.account_trie,
+        };
+        let key = |path: &alloy_trie::Nibbles| -> Vec<u8> { cursor::node_key(account_hash, path) };
+        for path in &updates.cleared {
+            crate::schema::del_prefix(txn, db, &key(path))?;
         }
-    }
-    for k in keys {
-        match txn.del(db, k, None) {
-            Ok(_) => {}
-            Err(signet_libmdbx::MdbxError::NotFound) => {}
-            Err(e) => return Err(e.into()),
+        for (path, node) in &updates.upserts {
+            txn.put(
+                db,
+                key(path),
+                node::encode_branch_node(node),
+                WriteFlags::UPSERT,
+            )?;
         }
+        for path in &updates.removals {
+            crate::schema::del_if_present(txn, db, key(path))?;
+        }
+        Ok(())
     }
-    Ok(())
-}
 
-/// Apply one block's `BlockDelta` to the hashed-state mirror and the
-/// stored tries. Returns the new canonical world-state root.
-///
-/// This runs inside the writer's block-commit transaction, so the root
-/// advances atomically with the state. It mirrors the equivalence-tested
-/// harness: storage tries first, stamping each account's `storage_root`
-/// into the hashed account, then the account trie.
-pub fn update_for_block(
-    txn: &RwTxSync,
-    t: &TrieTables,
-    delta: &kardamom_types::BlockDelta,
-) -> Result<B256, StateError> {
-    use alloy_primitives::keccak256;
-    use signet_libmdbx::WriteFlags;
-    use std::collections::{BTreeMap, BTreeSet};
-
-    let mut touched: BTreeSet<Address> = BTreeSet::new();
-    let mut new_sroot: BTreeMap<Address, B256> = BTreeMap::new();
-
-    // --- storage tries first ---
-    let mut stor_by: BTreeMap<Address, Vec<(B256, U256)>> = BTreeMap::new();
-    for s in &delta.storage {
-        stor_by.entry(s.address).or_default().push((s.key, s.value));
+    /// Group one block's storage changes by account.
+    fn group_storage_by_account(
+        delta: &kardamom_types::BlockDelta,
+    ) -> BTreeMap<Address, Vec<(B256, U256)>> {
+        let mut stor_by: BTreeMap<Address, Vec<(B256, U256)>> = BTreeMap::new();
+        for s in &delta.storage {
+            stor_by.entry(s.address).or_default().push((s.key, s.value));
+        }
+        stor_by
     }
-    for (addr, changes) in &stor_by {
-        let ah = keccak256(addr);
-        let mut changed = Vec::with_capacity(changes.len());
+
+    /// Write every changed storage slot, then advance each changed account's
+    /// storage-trie root. Adds every account with a storage change to
+    /// `touched`. Returns the new storage root per such account.
+    fn update_storage_tries(
+        &self,
+        txn: &RwTxSync,
+        stor_by: &BTreeMap<Address, Vec<(B256, U256)>>,
+        touched: &mut BTreeSet<Address>,
+    ) -> Result<BTreeMap<Address, B256>, StateError> {
+        use alloy_primitives::keccak256;
+
+        let mut new_sroot: BTreeMap<Address, B256> = BTreeMap::new();
+        for (addr, changes) in stor_by {
+            let ah = keccak256(addr);
+            let changed = self.write_account_slots(txn, ah, changes)?;
+            let ps = PrefixSet::from_b256s(changed);
+            let (sr, up) = StateRoot::storage_root_incremental(
+                txn,
+                self.storage_trie,
+                self.hashed_storage,
+                ah,
+                &ps,
+            )?;
+            self.apply_updates(txn, Some(&ah), &up)?;
+            new_sroot.insert(*addr, sr);
+            touched.insert(*addr);
+        }
+        Ok(new_sroot)
+    }
+
+    /// Write one account's changed storage slots into `hashed_storage`.
+    /// Returns `keccak(slot)` for each changed slot, for the caller's
+    /// `PrefixSet`.
+    fn write_account_slots(
+        &self,
+        txn: &RwTxSync,
+        ah: B256,
+        changes: &[(B256, U256)],
+    ) -> Result<Vec<B256>, StateError> {
+        use alloy_primitives::keccak256;
+        use signet_libmdbx::WriteFlags;
+
+        let mut changed_hashes = Vec::with_capacity(changes.len());
         for (slot, val) in changes {
             let sh = keccak256(slot);
-            changed.push(sh);
+            changed_hashes.push(sh);
             let mut key = ah.as_slice().to_vec();
             key.extend_from_slice(sh.as_slice());
             if val.is_zero() {
                 // An absent-key delete is fine. Any other mdbx failure must
                 // surface, or the mirror silently diverges from the reference.
-                match txn.del(t.hashed_storage, key, None) {
-                    Ok(_) | Err(signet_libmdbx::MdbxError::NotFound) => {}
-                    Err(e) => return Err(e.into()),
-                }
+                crate::schema::del_if_present(txn, self.hashed_storage, key)?;
             } else {
                 txn.put(
-                    t.hashed_storage,
+                    self.hashed_storage,
                     key,
                     val.to_be_bytes::<32>(),
                     WriteFlags::UPSERT,
                 )?;
             }
         }
-        let ps = PrefixSet::from_b256s(changed);
-        let (sr, up) =
-            StateRoot::storage_root_incremental(txn, t.storage_trie, t.hashed_storage, ah, &ps)?;
-        apply_trie_updates(txn, t.storage_trie, Some(&ah), &up)?;
-        new_sroot.insert(*addr, sr);
-        touched.insert(*addr);
+        Ok(changed_hashes)
     }
 
-    let mut basics: BTreeMap<Address, (u64, U256, B256)> = BTreeMap::new();
-    for a in &delta.accounts {
-        basics.insert(a.address, (a.nonce, a.balance, a.code_hash));
-        touched.insert(a.address);
-    }
+    /// Write the `hashed_accounts` row for every touched account: its basic
+    /// fields (from `basics`, or the existing row if this block did not
+    /// change them) plus its current storage root (from `new_sroot`, or the
+    /// existing row's). An EIP-161-empty account deletes the row and its
+    /// storage-trie subtree instead.
+    fn write_hashed_accounts(
+        &self,
+        txn: &RwTxSync,
+        touched: &BTreeSet<Address>,
+        basics: &BTreeMap<Address, (u64, U256, B256)>,
+        new_sroot: &BTreeMap<Address, B256>,
+    ) -> Result<(), StateError> {
+        use alloy_primitives::keccak256;
+        use signet_libmdbx::WriteFlags;
 
-    // --- hashed_accounts rows for every touched account ---
-    for addr in &touched {
-        let ah = keccak256(addr);
-        let existing = cursor::get_hashed_account(txn, t.hashed_accounts, &ah)?;
-        let (nonce, balance, code_hash) = match basics.get(addr) {
-            Some(b) => *b,
-            None => existing
-                .map(|e| (e.nonce, e.balance, e.code_hash))
-                .unwrap_or((0, U256::ZERO, B256::ZERO)),
-        };
-        let storage_root = new_sroot
-            .get(addr)
-            .copied()
-            .or_else(|| existing.map(|e| e.storage_root))
-            .unwrap_or(EMPTY_ROOT_HASH);
-        let parts = AccountTrieParts {
-            nonce,
-            balance,
-            code_hash,
-            storage_root,
-        };
-        if parts.is_empty() {
-            match txn.del(t.hashed_accounts, ah.as_slice(), None) {
-                Ok(_) | Err(signet_libmdbx::MdbxError::NotFound) => {}
-                Err(e) => return Err(e.into()),
+        for addr in touched {
+            let ah = keccak256(addr);
+            let existing = cursor::get_hashed_account(txn, self.hashed_accounts, &ah)?;
+            let (nonce, balance, code_hash) = match basics.get(addr) {
+                Some(b) => *b,
+                None => existing.map_or((0, U256::ZERO, B256::ZERO), |e| {
+                    (e.nonce, e.balance, e.code_hash)
+                }),
+            };
+            let storage_root = new_sroot
+                .get(addr)
+                .copied()
+                .or_else(|| existing.map(|e| e.storage_root))
+                .unwrap_or(EMPTY_ROOT_HASH);
+            let parts = AccountTrieParts {
+                nonce,
+                balance,
+                code_hash,
+                storage_root,
+            };
+            if parts.is_empty() {
+                crate::schema::del_if_present(txn, self.hashed_accounts, ah.as_slice())?;
+                crate::schema::del_prefix(txn, self.hashed_storage, ah.as_slice())?;
+                crate::schema::del_prefix(txn, self.storage_trie, ah.as_slice())?;
+            } else {
+                txn.put(
+                    self.hashed_accounts,
+                    ah.as_slice(),
+                    cursor::encode_account_leaf(&parts),
+                    WriteFlags::UPSERT,
+                )?;
             }
-            del_prefix(txn, t.hashed_storage, ah.as_slice())?;
-            del_prefix(txn, t.storage_trie, ah.as_slice())?;
-        } else {
-            txn.put(
-                t.hashed_accounts,
-                ah.as_slice(),
-                cursor::encode_account_leaf(&parts),
-                WriteFlags::UPSERT,
-            )?;
         }
+        Ok(())
     }
 
-    // --- account trie ---
-    let ps = PrefixSet::from_b256s(touched.iter().map(keccak256));
-    let (root, up) =
-        StateRoot::state_root_incremental(txn, t.account_trie, t.hashed_accounts, &ps)?;
-    apply_trie_updates(txn, t.account_trie, None, &up)?;
-    Ok(root)
+    /// Advance the account trie for every touched account, and persist the
+    /// resulting branch-node updates. Returns the new world-state root.
+    fn update_account_trie(
+        &self,
+        txn: &RwTxSync,
+        touched: &BTreeSet<Address>,
+    ) -> Result<B256, StateError> {
+        use alloy_primitives::keccak256;
+
+        let ps = PrefixSet::from_b256s(touched.iter().map(keccak256));
+        let (root, up) =
+            StateRoot::state_root_incremental(txn, self.account_trie, self.hashed_accounts, &ps)?;
+        self.apply_updates(txn, None, &up)?;
+        Ok(root)
+    }
+
+    /// An independent full rebuild of the world-state root from the hashed
+    /// mirror, used by the writer's shadow-check. This takes a different
+    /// code path than the incremental walker, using alloy-trie's one-shot
+    /// pre-hashed root builders, so a walker bug would show up as a
+    /// divergence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if a table read fails.
+    pub(crate) fn rebuild_root(&self, txn: &RwTxSync) -> Result<B256, StateError> {
+        let mut accts: Vec<(B256, TrieAccount)> = Vec::new();
+        crate::schema::for_each_row(txn, self.hashed_accounts, |k, v| {
+            let ah = B256::from_slice(&k);
+            let parts = cursor::decode_account_leaf(&v)?;
+            let mut acc = parts.to_trie_account();
+            acc.storage_root = self.storage_root_for(txn, &ah)?;
+            accts.push((ah, acc));
+            Ok(std::ops::ControlFlow::Continue(()))
+        })?;
+        Ok(root::state_root_unsorted(accts))
+    }
+
+    /// One account's storage root, recomputed from the hashed storage
+    /// mirror. [`rebuild_root`](Self::rebuild_root)'s per-account oracle.
+    fn storage_root_for(&self, txn: &RwTxSync, ah: &B256) -> Result<B256, StateError> {
+        let mut pairs: Vec<(B256, U256)> = Vec::new();
+        crate::schema::for_each_prefix(txn, self.hashed_storage, ah.as_slice(), |k, v| {
+            pairs.push((B256::from_slice(&k[32..64]), U256::from_be_slice(&v)));
+            Ok(std::ops::ControlFlow::Continue(()))
+        })?;
+        Ok(root::storage_root_unsorted(pairs))
+    }
 }
 
-/// An independent full rebuild of the world-state root from the hashed
-/// mirror, used by the writer's shadow-check. This takes a different
-/// code path than the incremental walker, using alloy-trie's one-shot
-/// pre-hashed root builders, so a walker bug would show up as a
-/// divergence.
-pub fn rebuild_root(txn: &RwTxSync, t: &TrieTables) -> Result<B256, StateError> {
-    // Per-account storage root recomputed from the hashed storage mirror.
-    let storage_root_for = |ah: &B256| -> Result<B256, StateError> {
-        let mut cur = txn.cursor(t.hashed_storage)?;
-        let mut pairs: Vec<(B256, U256)> = Vec::new();
-        let mut item = cur.set_range::<Vec<u8>, Vec<u8>>(ah.as_slice())?;
-        while let Some((k, v)) = item {
-            if k.len() != 64 || &k[0..32] != ah.as_slice() {
-                break;
-            }
-            pairs.push((B256::from_slice(&k[32..64]), U256::from_be_slice(&v)));
-            item = cur.next::<Vec<u8>, Vec<u8>>()?;
-        }
-        Ok(root::storage_root_unsorted(pairs))
-    };
+impl TrieTables {
+    /// Apply one block's `BlockDelta` to the hashed-state mirror and the
+    /// stored tries. Returns the new canonical world-state root.
+    ///
+    /// This runs inside the writer's block-commit transaction, so the root
+    /// advances atomically with the state. It mirrors the equivalence-tested
+    /// harness: storage tries first, stamping each account's `storage_root`
+    /// into the hashed account, then the account trie.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if a table read or write fails.
+    pub fn update_for_block(
+        &self,
+        txn: &RwTxSync,
+        delta: &kardamom_types::BlockDelta,
+    ) -> Result<B256, StateError> {
+        let mut touched: BTreeSet<Address> = BTreeSet::new();
 
-    let mut accts: Vec<(B256, TrieAccount)> = Vec::new();
-    crate::schema::for_each_row(txn, t.hashed_accounts, |k, v| {
-        let ah = B256::from_slice(&k);
-        let parts = cursor::decode_account_leaf(&v)?;
-        let mut acc = parts.to_trie_account();
-        acc.storage_root = storage_root_for(&ah)?;
-        accts.push((ah, acc));
-        Ok(std::ops::ControlFlow::Continue(()))
-    })?;
-    Ok(root::state_root_unsorted(accts))
+        // --- storage tries first ---
+        let stor_by = Self::group_storage_by_account(delta);
+        let new_sroot = self.update_storage_tries(txn, &stor_by, &mut touched)?;
+
+        let mut basics: BTreeMap<Address, (u64, U256, B256)> = BTreeMap::new();
+        for a in &delta.accounts {
+            basics.insert(a.address, (a.nonce, a.balance, a.code_hash));
+            touched.insert(a.address);
+        }
+
+        self.write_hashed_accounts(txn, &touched, &basics, &new_sroot)?;
+
+        self.update_account_trie(txn, &touched)
+    }
+}
+
+/// Compatibility wrapper over [`TrieTables::update_for_block`], kept for
+/// `crates/validator/tests/witness_anchoring.rs`, an external caller this
+/// group cannot change directly. **Phase B**: move it onto the method at
+/// merge, then delete this function.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if a table read or write fails.
+pub fn update_for_block(
+    txn: &RwTxSync,
+    t: &TrieTables,
+    delta: &kardamom_types::BlockDelta,
+) -> Result<B256, StateError> {
+    t.update_for_block(txn, delta)
+}
+
+/// Open [`TrieTables`], run [`update_for_block`] on `delta`, and persist
+/// the resulting root under `KEY_STATE_ROOT` in the same transaction.
+/// This is the common tail of genesis seeding and trie-bootstrap-from-state,
+/// each folding its source into one synthetic `BlockDelta` first.
+///
+/// The writer's per-block commit path (`writer::apply`) keeps its own
+/// version of this tail instead of calling this: it must run the
+/// shadow-check oracle between the trie update and the meta put, which
+/// this shared tail has no room for.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if a table read or write fails.
+pub(crate) fn commit_trie_root(
+    txn: &RwTxSync,
+    delta: &kardamom_types::BlockDelta,
+) -> Result<B256, StateError> {
+    let tables = TrieTables::open(txn)?;
+    let root = tables.update_for_block(txn, delta)?;
+    let meta = txn.open_db(Some(crate::schema::TABLE_META))?;
+    txn.put(
+        meta,
+        crate::meta::KEY_STATE_ROOT,
+        crate::meta::encode_b256(root),
+        signet_libmdbx::WriteFlags::UPSERT,
+    )?;
+    Ok(root)
 }
 
 /// The basic account fields needed to form an account-trie leaf.
@@ -374,6 +484,7 @@ impl AccountTrieParts {
 }
 
 /// The canonical empty world-state root.
+#[must_use]
 pub fn empty_root() -> B256 {
     EMPTY_ROOT_HASH
 }

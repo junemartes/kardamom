@@ -14,13 +14,14 @@
 //! recovered from the secp256k1 signature (pure-Rust k256). Any mismatch
 //! aborts with [`ExecutorError::RecordIdentity`].
 //!
-//! Known gaps, left open on purpose (documented in the spec):
+//! Known gaps, left open on purpose:
 //!
 //! - Deposits: `source_hash` derives from L1 data the guest does not yet
-//!   carry (deposit-derivation phases D and E). Deposit identity stays a
-//!   trusted input until the witness is L1-anchored.
-//! - The witness itself is unanchored until phase 3b (MPT proofs against
-//!   `pre_state_root`).
+//!   carry. Deposit identity stays a trusted input until the witness is
+//!   L1-anchored.
+//! - [`execute_block_stateless`] does not anchor the witness to
+//!   `pre_state_root`. [`execute_block_anchored`] closes this gap with an
+//!   MPT proof on both ends.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -33,7 +34,7 @@ use kardamom_types::{BPosition, ExecutionWitness, Receipt, StateDatabase, TxEnve
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
-use crate::exec_types::TxIndex;
+use crate::exec_types::{TxIndex, TxSlot};
 use crate::executor::{DecodedTx, Executor};
 use crate::witness::WitnessDb;
 
@@ -57,7 +58,7 @@ pub enum BufferedRecord {
     /// travels with the message: execution aliases the sender and
     /// authenticates the Inbox call per origin, and the message itself
     /// does not repeat the pair identity. Boxed like the reader's own
-    /// XChain arm, so this rare interop variant does not grow the enum on
+    /// `XChain` arm, so this rare interop variant does not grow the enum on
     /// every Tx clone.
     XChain {
         tx_idx: TxIndex,
@@ -90,13 +91,17 @@ pub struct BlockExecOutput {
 /// validator's sequential re-execution path (`execute_block_sequential`
 /// delegates here), so it defines the exact semantics a stateless replay
 /// must reproduce.
+///
+/// # Errors
+///
+/// Returns an [`ExecutorError`] when a record fails to execute.
 pub fn execute_block<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
     records: &[BufferedRecord],
     env: ExecEnv,
 ) -> Result<BlockExecOutput, ExecutorError> {
-    execute_block_inner(snapshot, parent, records, env, None).map(|(out, _)| out)
+    execute_block_inner(snapshot, parent, records, env, None)
 }
 
 /// [`execute_block`] with EIP-7928 capture, kept in revm form. The
@@ -104,14 +109,17 @@ pub fn execute_block<S: StateDatabase>(
 /// for the executor's boundary handoff to the BAL publisher. This is the
 /// executor strategy's sequential arm: same driver and capture hooks as
 /// [`execute_block_with_bal`], just a different output shape.
+///
+/// # Errors
+///
+/// Returns an [`ExecutorError`] when a record fails to execute.
 pub fn execute_block_capture<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
     records: &[BufferedRecord],
     env: ExecEnv,
 ) -> Result<BlockExecOutput, ExecutorError> {
-    let mut bal = revm::state::bal::Bal::new();
-    let (mut out, _) = execute_block_inner(snapshot, parent, records, env, Some(&mut bal))?;
+    let (mut out, bal) = execute_block_capturing(snapshot, parent, records, env)?;
     out.bal = Some(bal);
     Ok(out)
 }
@@ -120,15 +128,34 @@ pub fn execute_block_capture<S: StateDatabase>(
 /// raw (granularity-1) access list, built through the same per-tx capture
 /// hooks the live executor publishes from: `Bal::update_account` for txs,
 /// and the synthetic-WriteSet path for deposits.
+///
+/// # Errors
+///
+/// Returns an [`ExecutorError`] when a record fails to execute.
 pub fn execute_block_with_bal<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
     records: &[BufferedRecord],
     env: ExecEnv,
 ) -> Result<(BlockExecOutput, alloy_eip7928::BlockAccessList), ExecutorError> {
-    let mut bal = revm::state::bal::Bal::new();
-    let (out, _) = execute_block_inner(snapshot, parent, records, env, Some(&mut bal))?;
+    let (out, bal) = execute_block_capturing(snapshot, parent, records, env)?;
     Ok((out, bal.into_alloy_bal()))
+}
+
+/// The shared work behind [`execute_block_capture`] and
+/// [`execute_block_with_bal`]: run [`execute_block_inner`] with capture
+/// on, and return the block's raw `Bal` alongside the output. The two
+/// public wrappers differ only in how they reshape this `Bal` for their
+/// own output.
+fn execute_block_capturing<S: StateDatabase>(
+    snapshot: &S,
+    parent: Option<&PendingDelta>,
+    records: &[BufferedRecord],
+    env: ExecEnv,
+) -> Result<(BlockExecOutput, revm::state::bal::Bal), ExecutorError> {
+    let mut bal = revm::state::bal::Bal::new();
+    let out = execute_block_inner(snapshot, parent, records, env, Some(&mut bal))?;
+    Ok((out, bal))
 }
 
 fn execute_block_inner<S: StateDatabase>(
@@ -137,7 +164,7 @@ fn execute_block_inner<S: StateDatabase>(
     records: &[BufferedRecord],
     env: ExecEnv,
     mut bal: Option<&mut revm::state::bal::Bal>,
-) -> Result<(BlockExecOutput, ()), ExecutorError> {
+) -> Result<BlockExecOutput, ExecutorError> {
     let mut delta = PendingDelta::new();
     let mut receipts = Vec::with_capacity(records.len());
     let mut cumulative = 0u64;
@@ -153,26 +180,26 @@ fn execute_block_inner<S: StateDatabase>(
         delta.apply(ws);
         receipts.push(receipt);
     }
-    Ok((
-        BlockExecOutput {
-            receipts,
-            delta,
-            bal: None,
-        },
-        (),
-    ))
+    Ok(BlockExecOutput {
+        receipts,
+        delta,
+        bal: None,
+    })
 }
 
 /// Execute one canonical record inside an existing block scope. This is
 /// the tx-versus-deposit dispatch that every whole-block strategy shares.
 /// A tx runs in the scope. A deposit also runs in the scope: it reuses
 /// the block cache, and toggles the nonce check for its inner call (see
-/// [`Executor::execute_deposit`]). This replaces the old snapshot,
-/// parent, and delta re-seed per deposit.
+/// [`Executor::execute_deposit`]).
 ///
 /// This is the single home of consensus-critical record dispatch. The
 /// sequential driver above, the validator's parallel batches, and (through
 /// the driver) the zk guest all execute records through here.
+///
+/// # Errors
+///
+/// Returns an [`ExecutorError`] when the record fails to execute.
 pub fn execute_record_in_scope<S: StateDatabase>(
     scope: &mut Executor<&S>,
     rec: &BufferedRecord,
@@ -180,37 +207,34 @@ pub fn execute_record_in_scope<S: StateDatabase>(
     cumulative: u64,
     bal: Option<(&mut revm::state::bal::Bal, u64)>,
 ) -> Result<(Receipt, crate::delta::WriteSet), ExecutorError> {
+    let slot_of = |tx_idx: &TxIndex, position: &kardamom_types::BPosition| TxSlot {
+        tx_idx: *tx_idx,
+        tx_position: *position,
+        tx_index_in_block: idx_in_block,
+        cumulative_gas_used_before: cumulative,
+    };
     match rec {
         BufferedRecord::Tx {
             tx_idx,
             envelope,
             position,
-        } => scope.execute_tx(
-            *tx_idx,
-            *position,
-            envelope,
-            idx_in_block,
-            cumulative,
-            bal,
-            None,
-        ),
+        } => scope.execute_tx(slot_of(tx_idx, position), envelope, bal, None),
         BufferedRecord::Deposit {
             tx_idx,
             deposit,
             position,
-        } => scope.execute_deposit(*tx_idx, *position, deposit, idx_in_block, cumulative, bal),
+        } => scope.execute_deposit(slot_of(tx_idx, position), deposit, bal),
         BufferedRecord::XChain {
             tx_idx,
             origin_chain_id,
             message,
             position,
         } => scope.execute_xchain(
-            *tx_idx,
-            *position,
-            *origin_chain_id,
-            message,
-            idx_in_block,
-            cumulative,
+            slot_of(tx_idx, position),
+            crate::executor::XChainDelivery {
+                origin_chain_id: *origin_chain_id,
+                message,
+            },
             bal,
         ),
     }
@@ -219,6 +243,11 @@ pub fn execute_record_in_scope<S: StateDatabase>(
 /// Re-derive a tx record's identity from its raw bytes. This closes the
 /// trust boundary in-guest. The live pipeline takes `sender` and
 /// `tx_hash` from the proxy on faith; a proof must not.
+///
+/// # Errors
+///
+/// Returns [`ExecutorError::RecordIdentity`] when the computed `tx_hash`
+/// or recovered sender disagrees with the envelope.
 pub fn verify_record_identity(envelope: &TxEnvelope) -> Result<(), ExecutorError> {
     let computed_hash = keccak256(&envelope.raw_tx);
     if computed_hash != envelope.tx_hash {
@@ -247,14 +276,17 @@ pub fn verify_record_identity(envelope: &TxEnvelope) -> Result<(), ExecutorError
 /// [`crate::bal_ladder`], and requires structural equality with the
 /// input.
 ///
+/// On success, the proof may bind [`bal_commitment`]`(expected_bal)` as a
+/// public output. The recomputed list is structurally equal, so the
+/// commitment attests to the published artifact.
+///
+/// # Errors
+///
 /// This fails closed in three ways: identity forgery
 /// ([`ExecutorError::RecordIdentity`]), witness incompleteness
 /// ([`crate::witness::WitnessError`] surfaced through execution), and BAL
 /// inequality ([`ExecutorError::Divergence`], the same error class the
-/// live validator fail-stops on). On success, the proof may bind
-/// [`bal_commitment`]`(expected_bal)` as a public output. The recomputed
-/// list is structurally equal, so the commitment attests to the
-/// published artifact.
+/// live validator fail-stops on).
 pub fn execute_block_stateless(
     witness: &ExecutionWitness,
     parent: Option<&PendingDelta>,
@@ -287,11 +319,11 @@ pub fn execute_block_stateless(
     Ok(out)
 }
 
-/// The phase-3b proof shape: a stateless execution anchored to the
-/// chain's root history. These fields are the proof's public outputs, an
-/// inductive chain from genesis. The L1 verifier holds the running root,
-/// checks `pre_state_root` continuity and `bal_commitment` against the
-/// posted frame, and advances to `post_state_root`.
+/// A stateless execution anchored to the chain's root history. These
+/// fields are the proof's public outputs, an inductive chain from
+/// genesis. The L1 verifier holds the running root, checks
+/// `pre_state_root` continuity and `bal_commitment` against the posted
+/// frame, and advances to `post_state_root`.
 #[derive(Debug)]
 pub struct AnchoredBlockOutput {
     pub out: BlockExecOutput,
@@ -308,6 +340,12 @@ pub struct AnchoredBlockOutput {
 /// and the post-state root is recomputed from the carried node set after
 /// the last step. A prover that fabricates state has nowhere left to
 /// stand: the witness must hash-link into a root the L1 already holds.
+///
+/// # Errors
+///
+/// Returns an [`ExecutorError`] when the witness fails to anchor, a
+/// record fails identity or execution, or the recomputed BAL diverges
+/// from `expected_bal`.
 pub fn execute_block_anchored(
     witness: &ExecutionWitness,
     proofs: &kardamom_types::WitnessProofs,
@@ -318,11 +356,9 @@ pub fn execute_block_anchored(
     granularity: u16,
 ) -> Result<AnchoredBlockOutput, ExecutorError> {
     let pre = crate::anchor::verify_witness_anchored(witness, proofs)?;
-    let pre_state_root = witness
-        .pre_state_root
-        .expect("verify_witness_anchored requires the root");
+    let pre_state_root = pre.root;
     let out = execute_block_stateless(witness, parent, records, env, expected_bal, granularity)?;
-    let post_state_root = crate::anchor::recompute_post_root(witness, proofs, &pre, &out.delta)?;
+    let post_state_root = crate::anchor::recompute_post_root(proofs, &pre, &out.delta)?;
     Ok(AnchoredBlockOutput {
         pre_state_root,
         post_state_root,
@@ -336,6 +372,7 @@ pub fn execute_block_anchored(
 /// RLP encoding. These are the same bytes the executor publishes in
 /// `BalFrame.bal_rlp`, so an L1 verifier can check the proof's public
 /// output against the posted frame without re-encoding.
+#[must_use]
 pub fn bal_commitment(bal: &alloy_eip7928::BlockAccessList) -> alloy_primitives::B256 {
     use alloy_rlp::Encodable;
     let mut rlp = Vec::new();
@@ -379,13 +416,13 @@ mod tests {
                 .parse()
                 .unwrap();
         let mut tx = TxLegacy {
-            chain_id: Some(412346),
+            chain_id: Some(412_346),
             nonce: 0,
             gas_price: 1_000_000_000,
             gas_limit: 21_000,
             to: alloy_primitives::TxKind::Call(Address::repeat_byte(0xdd)),
             value: alloy_primitives::U256::from(1u64),
-            input: Default::default(),
+            input: alloy_primitives::Bytes::default(),
         };
         let sig = signer.sign_transaction_sync(&mut tx).unwrap();
         let env = alloy_consensus::TxEnvelope::Legacy(tx.into_signed(sig));

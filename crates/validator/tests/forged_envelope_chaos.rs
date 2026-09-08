@@ -21,10 +21,10 @@
 //! - flag on, forged sender: `RecordIdentity` stops the pipeline before
 //!   the first EVM step, the integrity latch is set, and the victim is
 //!   untouched.
-//! - flag off, the same forgery: the theft commits. This is the
-//!   documented blind spot from before this check existed, pinned as a test so the
-//!   executor-side decision (defense-in-depth against latency) rests on
-//!   a red/green fact, not a claim.
+//! - flag off, the same forgery: the theft commits. This is a documented
+//!   blind spot, pinned as a test so the executor-side decision
+//!   (defense-in-depth against latency) rests on a red/green fact, not a
+//!   claim.
 
 use std::thread;
 use std::time::Duration;
@@ -195,10 +195,8 @@ fn run_pipeline(
         )
     });
 
-    let mut out = Vec::new();
-    while let Ok(m) = c_rx.recv_timeout(Duration::from_secs(5)) {
-        out.push(m);
-    }
+    let out: Vec<_> =
+        std::iter::from_fn(|| c_rx.recv_timeout(Duration::from_secs(5)).ok()).collect();
     let res = h.join().expect("no panic");
     (res, out, snap)
 }
@@ -274,12 +272,11 @@ fn forged_sender_commits_theft_with_verification_off() {
 
     let (res, out, snap) = run_pipeline(envelope_claiming(&attacker, victim), victim, false);
 
-    // This is the documented blind spot from before this check existed:
-    // with the check off, the
-    // proxy's claimed sender is trusted, and the attacker-signed tx
-    // spends the victim's funds. If closing the executor-side gap ever
-    // flips this test, that is the intended signal: delete it alongside
-    // the flag decision.
+    // This is the documented blind spot: with the check off, the proxy's
+    // claimed sender is trusted, and the attacker-signed tx spends the
+    // victim's funds. If closing the executor-side gap ever flips this
+    // test, that is the intended signal: delete it alongside the flag
+    // decision.
     res.expect("with verification off the forgery executes");
     assert!(
         out.iter()

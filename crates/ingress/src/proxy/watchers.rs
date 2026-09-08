@@ -1,13 +1,15 @@
 //! Background stream watchers that [`IngressProxy::new`] spawns:
-//! tx_receipts, tx_errors, the two watermark streams, and block boundaries.
+//! `tx_receipts`, `tx_errors`, the two watermark streams, and block
+//! boundaries.
 
 use std::sync::atomic::Ordering;
 
 use kardamom_types::{BlockBoundary, Receipt, TxError};
 
 use crate::channels::{IngressPublication, IngressSubscription};
+use crate::seen_receipts::SeenReceipts;
 
-use super::{IngressProxy, spawn_broadcast_watcher};
+use super::{BroadcastWatcher, IngressProxy};
 
 impl<P, S> IngressProxy<P, S>
 where
@@ -17,13 +19,12 @@ where
     pub(super) fn spawn_block_boundary_watcher(&self) {
         let rx = self.subscription.subscribe_block_boundaries();
         let latest = self.latest_block_number.clone();
-        spawn_broadcast_watcher(rx, move |b: BlockBoundary| {
-            let latest = latest.clone();
-            // `fetch_max` keeps the counter increasing without a lock.
-            async move {
+        // `fetch_max` keeps the counter increasing without a lock.
+        tokio::spawn(
+            BroadcastWatcher::new(rx).run(async move |b: BlockBoundary| {
                 latest.fetch_max(b.block_number, Ordering::AcqRel);
-            }
-        });
+            }),
+        );
     }
 
     pub(super) fn spawn_tx_errors_watcher(&self) {
@@ -46,22 +47,17 @@ where
         let pending = self.pending.clone();
         let dedup = self.tx_error_dedup.clone();
         let feed = self.tx_error_feed.clone();
-        spawn_broadcast_watcher(rx, move |err: TxError| {
-            let pending = pending.clone();
-            let dedup = dedup.clone();
-            let feed = feed.clone();
-            async move {
-                if !dedup.observe_error(err.sender, err.nonce, &err.reason) {
-                    metrics::counter!(crate::metrics::TX_ERROR_DUPLICATE_TOTAL).increment(1);
-                    return;
-                }
-                // This re-broadcasts the deduped event to subscription-mode
-                // clients. `send` errors only when no subscriber exists,
-                // which is fine.
-                let _ = feed.send(err.clone());
-                pending.on_tx_error(err.sender, err.nonce, err.reason).await;
+        tokio::spawn(BroadcastWatcher::new(rx).run(async move |err: TxError| {
+            if !dedup.observe_error(err.sender, err.nonce, &err.reason) {
+                metrics::counter!(crate::metrics::TX_ERROR_DUPLICATE_TOTAL).increment(1);
+                return;
             }
-        });
+            // This re-broadcasts the deduped event to subscription-mode
+            // clients. `send` errors only when no subscriber exists,
+            // which is fine.
+            let _ = feed.send(err.clone());
+            pending.on_tx_error(err.sender, err.nonce, err.reason).await;
+        }));
     }
 
     pub(super) fn spawn_tx_receipts_watcher(&self) {
@@ -86,19 +82,16 @@ where
         let rx = self.subscription.subscribe_receipts();
         let pending = self.pending.clone();
         let cache = self.cache.clone();
-        let seen = self.seen_receipts.clone();
+        // Only this task ever touches `seen`, so it owns the set by
+        // value, with no `Arc` or lock.
+        let mut seen = SeenReceipts::default();
         let error_dedup = self.tx_error_dedup.clone();
         let feed = self.receipt_feed.clone();
-        spawn_broadcast_watcher(rx, move |receipt: Receipt| {
-            let pending = pending.clone();
-            let cache = cache.clone();
-            let seen = seen.clone();
-            let error_dedup = error_dedup.clone();
-            let feed = feed.clone();
-            async move {
-                // First-wins: `insert` returns false if the hash was
-                // already present. That means this is a duplicate replica
-                // copy, so drop it.
+        tokio::spawn(
+            BroadcastWatcher::new(rx).run(async move |receipt: Receipt| {
+                // First-wins: `insert` returns false if the hash was already
+                // present. That means this is a duplicate replica copy, so
+                // drop it.
                 if !seen.insert(receipt.tx_hash) {
                     metrics::counter!(crate::metrics::RECEIPT_DUPLICATE_TOTAL).increment(1);
                     return;
@@ -115,25 +108,23 @@ where
                 // which is fine.
                 let _ = feed.send(receipt.clone());
                 pending.on_receipt(sender, nonce, receipt).await;
-            }
-        });
+            }),
+        );
     }
 
     pub(super) fn spawn_quorum_watermark_watcher(&self) {
         let rx = self.subscription.subscribe_watermark();
         let pending = self.pending.clone();
-        spawn_broadcast_watcher(rx, move |w| {
-            let pending = pending.clone();
-            async move { pending.update_quorum_watermark(w).await }
-        });
+        tokio::spawn(BroadcastWatcher::new(rx).run(async move |w| {
+            pending.update_quorum_watermark(w).await;
+        }));
     }
 
     pub(super) fn spawn_local_fsync_watermark_watcher(&self) {
         let rx = self.subscription.subscribe_local_fsync_watermark();
         let pending = self.pending.clone();
-        spawn_broadcast_watcher(rx, move |w| {
-            let pending = pending.clone();
-            async move { pending.update_local_watermark(w).await }
-        });
+        tokio::spawn(BroadcastWatcher::new(rx).run(async move |w| {
+            pending.update_local_watermark(w).await;
+        }));
     }
 }

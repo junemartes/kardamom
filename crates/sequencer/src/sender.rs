@@ -8,11 +8,8 @@
 //! path. This keeps the §3 nonce-check budget at 3 microseconds or less per
 //! transaction.
 //!
-//! This module is a thin accessor. It exists for two reasons:
-//!  1. It makes the trust assumption explicit at call sites. `sender_of(env)`
-//!     reads better than `env.sender`.
-//!  2. It gives one place to add a debug-only panic if the field is ever
-//!     `Address::ZERO` in test builds. That would show the proxy regressed.
+//! This module is a thin accessor. It exists to make the trust assumption
+//! explicit at call sites: `sender_of(env)` reads better than `env.sender`.
 
 use alloy_primitives::Address;
 use kardamom_types::TxEnvelope;
@@ -20,13 +17,9 @@ use kardamom_types::TxEnvelope;
 /// Return the proxy-populated sender for a [`TxEnvelope`].
 ///
 /// This function is `#[inline]`, so the compiler folds it into the caller.
-/// The `debug_assert!` check is removed in release builds.
 #[inline]
+#[must_use]
 pub fn sender_of(envelope: &TxEnvelope) -> Address {
-    debug_assert!(
-        envelope.sender != Address::ZERO,
-        "TxEnvelope.sender must be populated by the proxy; got Address::ZERO"
-    );
     envelope.sender
 }
 
@@ -41,7 +34,7 @@ mod tests {
             correlation_id: 7,
             raw_tx: Bytes::from_static(b"raw"),
             sender,
-            tx_hash: Default::default(),
+            tx_hash: alloy_primitives::B256::default(),
         }
     }
 

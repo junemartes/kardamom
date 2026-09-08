@@ -8,6 +8,7 @@
 //! Forge is the source of truth for contract compilation. This script only
 //! runs forge and embeds the result. It needs `forge` on the PATH.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -131,9 +132,15 @@ fn emit_embedded_module(contracts_root: &Path) -> Result<()> {
             .join(format!("{contract_name}.sol"))
             .join(format!("{contract_name}.json"));
         let bin_path = write_creation_bin(&artifact_path, &out_dir, contract_name)?;
-        body.push_str(&format!(
-            "pub const {const_name}: &[u8] = include_bytes!({bin_path:?});\n"
-        ));
+        #[allow(
+            clippy::unnecessary_debug_formatting,
+            reason = "needs a quoted, escaped Rust string literal for include_bytes!, not a \
+                      plain path string from .display()"
+        )]
+        let _ = writeln!(
+            body,
+            "pub const {const_name}: &[u8] = include_bytes!({bin_path:?});"
+        );
     }
     std::fs::write(&out_file, body).with_context(|| format!("write {}", out_file.display()))?;
     Ok(())
@@ -167,13 +174,10 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return Err(anyhow!("odd-length hex string"));
     }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for pair in s.as_bytes().chunks(2) {
-        let hi = hex_nibble(pair[0])?;
-        let lo = hex_nibble(pair[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
+    s.as_bytes()
+        .chunks(2)
+        .map(|pair| Ok((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?))
+        .collect::<Result<Vec<u8>>>()
 }
 
 fn hex_nibble(c: u8) -> Result<u8> {
@@ -195,9 +199,8 @@ fn walk_sol_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn walk_sol_files_into(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
     for entry in entries.flatten() {
         let path = entry.path();

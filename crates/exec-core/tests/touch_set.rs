@@ -10,12 +10,14 @@ use alloy_network::TxSignerSync;
 use alloy_primitives::{Address, B256, TxKind, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_exec_core::block_env::ExecEnv;
-use kardamom_exec_core::exec_types::TxIndex;
 use kardamom_exec_core::executor::{Executor, TouchSet};
 use kardamom_exec_core::state::MockStateDatabase;
-use kardamom_types::{BPosition, TxEnvelope};
+use kardamom_types::TxEnvelope;
 
-const CHAIN_ID: u64 = 412346;
+mod common;
+use common::slot;
+
+const CHAIN_ID: u64 = 412_346;
 /// PUSH1 0, SLOAD, STOP. Reads slot 0, writes nothing.
 const READER: Address = address!("00000000000000000000000000000000000000AA");
 const READER_CODE: [u8; 4] = [0x60, 0x00, 0x54, 0x00];
@@ -49,7 +51,7 @@ fn call(nonce: u64, to: Address) -> TxEnvelope {
         gas_limit: 100_000,
         to: TxKind::Call(to),
         value: U256::ZERO,
-        input: Default::default(),
+        input: alloy_primitives::Bytes::default(),
     };
     let sig = s.sign_transaction_sync(&mut tx).unwrap();
     let env = alloy_consensus::TxEnvelope::Legacy(tx.into_signed(sig));
@@ -100,15 +102,7 @@ fn sload_only_call_lands_in_reads() {
     let mut scope = Executor::new(&db, None, env()).unwrap();
     let mut touches = TouchSet::default();
     let (receipt, _ws) = scope
-        .execute_tx(
-            TxIndex(0),
-            BPosition::from_index(0),
-            &call(0, READER),
-            0,
-            0,
-            None,
-            Some(&mut touches),
-        )
+        .execute_tx(slot(0, 0, 0, 0), &call(0, READER), None, Some(&mut touches))
         .unwrap();
     assert!(receipt.status, "setup: call must succeed");
     assert!(
@@ -129,11 +123,8 @@ fn balance_subject_lands_in_account_reads() {
     let mut touches = TouchSet::default();
     let (receipt, _ws) = scope
         .execute_tx(
-            TxIndex(0),
-            BPosition::from_index(0),
+            slot(0, 0, 0, 0),
             &call(0, BAL_READER),
-            0,
-            0,
             None,
             Some(&mut touches),
         )
@@ -151,15 +142,7 @@ fn sstore_call_is_a_write_not_a_read() {
     let mut scope = Executor::new(&db, None, env()).unwrap();
     let mut touches = TouchSet::default();
     let (receipt, ws) = scope
-        .execute_tx(
-            TxIndex(0),
-            BPosition::from_index(0),
-            &call(0, WRITER),
-            0,
-            0,
-            None,
-            Some(&mut touches),
-        )
+        .execute_tx(slot(0, 0, 0, 0), &call(0, WRITER), None, Some(&mut touches))
         .unwrap();
     assert!(receipt.status, "setup: call must succeed");
     assert!(
@@ -185,15 +168,7 @@ fn touches_none_is_a_no_op() {
     let db = db();
     let mut scope = Executor::new(&db, None, env()).unwrap();
     let (receipt, _) = scope
-        .execute_tx(
-            TxIndex(0),
-            BPosition::from_index(0),
-            &call(0, READER),
-            0,
-            0,
-            None,
-            None,
-        )
+        .execute_tx(slot(0, 0, 0, 0), &call(0, READER), None, None)
         .unwrap();
     assert!(receipt.status);
 }

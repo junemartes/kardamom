@@ -27,21 +27,18 @@
 //! - [`watcher::spawn`]: wraps `process_once` in a `tokio::time::interval`
 //!   loop with structured logging. Returns a [`watcher::WatcherHandle`].
 //!
-//! ## Spec inheritance
+//! ## Semantics
 //!
-//! This crate inherits its semantics (cursor lifecycle, NotFinalized
-//! handling, per-log error continuation, OP source-hash derivation, address
-//! aliasing) from `docs/agents/l1-deposit-monitor-spec.md`. This crate is
-//! the new-architecture port of that work. It keeps the L1-side logic and
-//! replaces the in-memory `Node::submit_deposit_transaction` call with a
-//! publish to the Aeron `tx_deposits` channel.
+//! The cursor lifecycle, `NotFinalized` handling, per-log error
+//! continuation, OP source-hash derivation, and address aliasing follow the
+//! deposit-monitor contract. This crate owns the L1-side logic and
+//! publishes to the Aeron `tx_deposits` channel.
 //!
 //! Out of scope for this crate:
 //! - Executor deposit execution (mint pre-credit plus the inner EVM call).
 //!   That lives downstream, in `executor`: the executor consumes
 //!   `tx_ordering`, dedups `DepositRef` by `source_hash`, resolves the
-//!   `Deposit` from `tx_deposits`, and runs the deposit. Wiring this up is a
-//!   separate follow-up.
+//!   `Deposit` from `tx_deposits`, and runs the deposit.
 //! - Reorg handling. Finalized blocks do not reorg in normal Ethereum
 //!   operation; the watcher trusts finality.
 //! - L1-attributes / system txs (OP `is_system_transaction = true`).
@@ -65,10 +62,8 @@ pub mod rpc_source;
 pub mod source;
 pub mod watcher;
 
-// The deposit-derivation rule moved to `kardamom_types::epoch`, so the
-// verifier can share it. A second copy would verify nothing (see
-// docs/agents/l1-origin-deposit-derivation-spec.md). This module re-exports
-// it, so existing callers keep working.
+// The deposit-derivation rule lives in `kardamom_types::epoch`, so the
+// verifier shares it. A second copy would verify nothing.
 pub use kardamom_types::epoch::{
     DepositLog, LockboxLog, UpgradeLog, alias_l1_address, deposit_from_log, source_hash,
     source_hash_system, upgrade_from_log,

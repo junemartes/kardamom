@@ -7,12 +7,12 @@
 //!
 //! | message               | template | dir     | root block |
 //! |-----------------------|----------|---------|------------|
-//! | SessionMessageHeader  | 1        | both    | 24         |
-//! | SessionEvent          | 2        | egress  | ≥32        |
-//! | SessionConnectRequest | 3        | ingress | 16         |
-//! | SessionCloseRequest   | 4        | ingress | 16         |
-//! | SessionKeepAlive      | 5        | ingress | 16         |
-//! | NewLeaderEvent        | 6        | egress  | 20         |
+//! | `SessionMessageHeader`  | 1        | both    | 24         |
+//! | `SessionEvent`          | 2        | egress  | ≥32        |
+//! | `SessionConnectRequest` | 3        | ingress | 16         |
+//! | `SessionCloseRequest`   | 4        | ingress | 16         |
+//! | `SessionKeepAlive`      | 5        | ingress | 16         |
+//! | `NewLeaderEvent`        | 6        | egress  | 20         |
 //!
 //! Every SBE message is `[messageHeader(8)][root block][var-length fields…]`.
 //! `messageHeader` is `blockLength:u16, templateId:u16, schemaId:u16,
@@ -38,10 +38,12 @@ pub const TEMPLATE_SESSION_KEEP_ALIVE: u16 = 5;
 pub const TEMPLATE_NEW_LEADER_EVENT: u16 = 6;
 
 const BLOCK_SESSION_MESSAGE_HEADER: u16 = 24;
+#[cfg(test)]
 const BLOCK_SESSION_EVENT_MIN: u16 = 32;
 const BLOCK_SESSION_CONNECT_REQUEST: u16 = 16;
 const BLOCK_SESSION_CLOSE_REQUEST: u16 = 16;
 const BLOCK_SESSION_KEEP_ALIVE: u16 = 16;
+#[cfg(test)]
 const BLOCK_NEW_LEADER_EVENT: u16 = 20;
 
 /// `EventCode` enum from the schema (a `SessionEvent.code`).
@@ -68,8 +70,11 @@ pub enum DecodeError {
     TooShort { at: usize, need: usize, have: usize },
     #[error("schema id mismatch: expected {SCHEMA_ID}, got {got}")]
     SchemaMismatch { got: u16 },
+    #[cfg(test)]
     #[error("unexpected template id {got} (wanted {want})")]
     TemplateMismatch { want: u16, got: u16 },
+    #[error("declared length {declared} does not fit in this platform's usize")]
+    LenOverflow { declared: u32 },
 }
 
 /// Decoded SBE message header.
@@ -82,6 +87,9 @@ pub struct MessageHeader {
 }
 
 impl MessageHeader {
+    /// # Errors
+    ///
+    /// Returns an error if `buf` is shorter than [`HEADER_LEN`].
     pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
         Ok(Self {
             block_length: rd_u16(buf, 0)?,
@@ -92,14 +100,58 @@ impl MessageHeader {
     }
 }
 
+/// A decoded SBE message header, plus the body slice past it
+/// (`buf[HEADER_LEN..]`). [`Frame::parse`] proves the header decodes and
+/// the schema id matches in one place, so no decoder re-slices `buf` or
+/// re-checks the schema; it only takes a `Frame`.
+#[derive(Debug, Clone, Copy)]
+struct Frame<'a> {
+    header: MessageHeader,
+    body: &'a [u8],
+}
+
+impl<'a> Frame<'a> {
+    fn parse(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        let header = MessageHeader::decode(buf)?;
+        if header.schema_id != SCHEMA_ID {
+            return Err(DecodeError::SchemaMismatch {
+                got: header.schema_id,
+            });
+        }
+        Ok(Self {
+            header,
+            body: &buf[HEADER_LEN..],
+        })
+    }
+
+    /// Check the template id, for the messages a decoder wants exactly one
+    /// of (the ingress-only and egress-only messages). [`decode_egress`]
+    /// dispatches on the template id instead, since it accepts several.
+    #[cfg(test)]
+    fn expect_template(self, want: u16) -> Result<Self, DecodeError> {
+        if self.header.template_id != want {
+            return Err(DecodeError::TemplateMismatch {
+                want,
+                got: self.header.template_id,
+            });
+        }
+        Ok(self)
+    }
+}
+
 // ── byte helpers ────────────────────────────────────────────────────────────
 
-fn need(buf: &[u8], at: usize, n: usize) -> Result<&[u8], DecodeError> {
-    buf.get(at..at + n).ok_or(DecodeError::TooShort {
-        at,
-        need: n,
-        have: buf.len().saturating_sub(at),
-    })
+/// Read `n` bytes at `at`. Returns the slice and the offset just past it
+/// (`at + n`), so a caller chaining a further read never computes that
+/// offset itself.
+fn need(buf: &[u8], at: usize, n: usize) -> Result<(&[u8], usize), DecodeError> {
+    at.checked_add(n)
+        .and_then(|end| buf.get(at..end).map(|s| (s, end)))
+        .ok_or(DecodeError::TooShort {
+            at,
+            need: n,
+            have: buf.len().saturating_sub(at),
+        })
 }
 
 // Exact-width LE reads come from [`crate::bytes`], shared with the
@@ -127,13 +179,20 @@ fn rd_i64(buf: &[u8], at: usize) -> Result<i64, DecodeError> {
     crate::bytes::i64_le(buf, at).ok_or_else(|| too_short(buf, at, 8))
 }
 
+/// Read a `u32` length prefix at `at`, converted to `usize`. A real error
+/// instead of a `usize::MAX` sentinel: this can only fail on a target
+/// where `usize` is narrower than `u32`.
+fn rd_len(buf: &[u8], at: usize) -> Result<usize, DecodeError> {
+    let declared = rd_u32(buf, at)?;
+    usize::try_from(declared).map_err(|_| DecodeError::LenOverflow { declared })
+}
+
 /// Read a var-length field (`length:u32` plus bytes) starting at `at` in
 /// `body`. Return the bytes and the offset just past them.
 fn rd_var(body: &[u8], at: usize) -> Result<(&[u8], usize), DecodeError> {
-    let len = rd_u32(body, at)? as usize;
-    let start = at + 4;
-    let bytes = need(body, start, len)?;
-    Ok((bytes, start + len))
+    let len = rd_len(body, at)?;
+    let (_, start) = need(body, at, 4)?;
+    need(body, start, len)
 }
 
 fn put_header(buf: &mut Vec<u8>, block_length: u16, template_id: u16) {
@@ -143,8 +202,16 @@ fn put_header(buf: &mut Vec<u8>, block_length: u16, template_id: u16) {
     buf.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
 }
 
+// Every `put_var` caller passes a local config string (a channel URI, a
+// credentials blob, a detail string), not wire input. A bound this far
+// past any realistic config value is a `try_from` + `expect`, not a
+// `Result` cascaded through three `pub fn encode_*` functions and
+// `SessionDriver::poll_outbound`'s hot path; revisit if a caller ever
+// passes attacker-sized data here.
 fn put_var(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    let len = u32::try_from(bytes.len())
+        .expect("session-protocol var field (channel URI/credentials/detail) exceeds u32::MAX");
+    buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(bytes);
 }
 
@@ -152,6 +219,7 @@ fn put_var(buf: &mut Vec<u8>, bytes: &[u8]) {
 
 /// Encode a `SessionConnectRequest`. `app_version` is the client's semantic
 /// protocol version. `response_channel` is the client's egress channel URI.
+#[must_use]
 pub fn encode_session_connect_request(
     correlation_id: i64,
     response_stream_id: i32,
@@ -175,7 +243,9 @@ pub fn encode_session_connect_request(
     b
 }
 
-/// Decoded `SessionConnectRequest` (owned).
+/// Decoded `SessionConnectRequest` (owned). Test-only: the live client
+/// only encodes this message, never decodes it back.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConnectRequest {
     pub correlation_id: i64,
@@ -186,14 +256,18 @@ pub struct SessionConnectRequest {
     pub client_info: String,
 }
 
+/// # Errors
+///
+/// Returns an error if `buf` is too short, its schema id does not match,
+/// or its template id is not `SessionConnectRequest`.
+#[cfg(test)]
 pub fn decode_session_connect_request(buf: &[u8]) -> Result<SessionConnectRequest, DecodeError> {
-    let h = MessageHeader::decode(buf)?;
-    expect(&h, SCHEMA_ID, TEMPLATE_SESSION_CONNECT_REQUEST)?;
-    let body = &buf[HEADER_LEN..];
+    let f = Frame::parse(buf)?.expect_template(TEMPLATE_SESSION_CONNECT_REQUEST)?;
+    let body = f.body;
     let correlation_id = rd_i64(body, 0)?;
     let response_stream_id = rd_i32(body, 8)?;
     let app_version = rd_i32(body, 12)?;
-    let (chan, p1) = rd_var(body, h.block_length as usize)?;
+    let (chan, p1) = rd_var(body, f.header.block_length as usize)?;
     let (creds, p2) = rd_var(body, p1)?;
     let (info, _p3) = rd_var(body, p2)?;
     Ok(SessionConnectRequest {
@@ -208,7 +282,7 @@ pub fn decode_session_connect_request(buf: &[u8]) -> Result<SessionConnectReques
 
 // ── SessionKeepAlive / SessionCloseRequest (ingress) ────────────────────────
 
-/// Encode the two-i64 body shared by KeepAlive and CloseRequest. This is
+/// Encode the two-i64 body shared by `KeepAlive` and `CloseRequest`. This is
 /// the encode-side mirror of [`decode_two_i64`].
 fn encode_two_i64(block_length: u16, template_id: u16, a: i64, b: i64) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -218,6 +292,7 @@ fn encode_two_i64(block_length: u16, template_id: u16, a: i64, b: i64) -> Vec<u8
     buf
 }
 
+#[must_use]
 pub fn encode_session_keep_alive(leadership_term_id: i64, cluster_session_id: i64) -> Vec<u8> {
     encode_two_i64(
         BLOCK_SESSION_KEEP_ALIVE,
@@ -227,6 +302,7 @@ pub fn encode_session_keep_alive(leadership_term_id: i64, cluster_session_id: i6
     )
 }
 
+#[must_use]
 pub fn encode_session_close_request(leadership_term_id: i64, cluster_session_id: i64) -> Vec<u8> {
     encode_two_i64(
         BLOCK_SESSION_CLOSE_REQUEST,
@@ -236,18 +312,24 @@ pub fn encode_session_close_request(leadership_term_id: i64, cluster_session_id:
     )
 }
 
-/// Decode the two-i64 body shared by KeepAlive and CloseRequest. Return
+/// Decode the two-i64 body shared by `KeepAlive` and `CloseRequest`. Return
 /// `(leadership_term_id, cluster_session_id)`.
+///
+/// # Errors
+///
+/// Returns an error if `buf` is too short, its schema id does not match,
+/// or its template id is not `want_template`. Test-only: the live client
+/// only encodes `KeepAlive`/`CloseRequest`, never decodes them back.
+#[cfg(test)]
 pub fn decode_two_i64(buf: &[u8], want_template: u16) -> Result<(i64, i64), DecodeError> {
-    let h = MessageHeader::decode(buf)?;
-    expect(&h, SCHEMA_ID, want_template)?;
-    let body = &buf[HEADER_LEN..];
-    Ok((rd_i64(body, 0)?, rd_i64(body, 8)?))
+    let f = Frame::parse(buf)?.expect_template(want_template)?;
+    Ok((rd_i64(f.body, 0)?, rd_i64(f.body, 8)?))
 }
 
 // ── SessionMessageHeader (both directions: wraps an app payload) ────────────
 
 /// Wrap an application `payload` in a `SessionMessageHeader` for ingress.
+#[must_use]
 pub fn wrap_session_message(
     leadership_term_id: i64,
     cluster_session_id: i64,
@@ -291,8 +373,10 @@ pub struct SessionEvent {
 }
 
 /// Encode a minimal `SessionEvent`, with root block 32 and no optional
-/// trailing fields. This is mainly for tests and a future in-Rust cluster
-/// mock.
+/// trailing fields. Test and mock-server helper: the live client only
+/// decodes this message (a server sends it), never encodes it.
+#[cfg(test)]
+#[must_use]
 pub fn encode_session_event(ev: &SessionEvent) -> Vec<u8> {
     let mut b = Vec::new();
     put_header(&mut b, BLOCK_SESSION_EVENT_MIN, TEMPLATE_SESSION_EVENT);
@@ -305,7 +389,7 @@ pub fn encode_session_event(ev: &SessionEvent) -> Vec<u8> {
     b
 }
 
-fn decode_session_event(h: &MessageHeader, body: &[u8]) -> Result<SessionEvent, DecodeError> {
+fn decode_session_event(h: MessageHeader, body: &[u8]) -> Result<SessionEvent, DecodeError> {
     let cluster_session_id = rd_i64(body, 0)?;
     let correlation_id = rd_i64(body, 8)?;
     let leadership_term_id = rd_i64(body, 16)?;
@@ -335,6 +419,10 @@ pub struct NewLeaderEvent {
     pub ingress_endpoints: String,
 }
 
+/// Test and mock-server helper: the live client only decodes this
+/// message (a server sends it), never encodes it.
+#[cfg(test)]
+#[must_use]
 pub fn encode_new_leader_event(ev: &NewLeaderEvent) -> Vec<u8> {
     let mut b = Vec::new();
     put_header(&mut b, BLOCK_NEW_LEADER_EVENT, TEMPLATE_NEW_LEADER_EVENT);
@@ -345,7 +433,7 @@ pub fn encode_new_leader_event(ev: &NewLeaderEvent) -> Vec<u8> {
     b
 }
 
-fn decode_new_leader_event(h: &MessageHeader, body: &[u8]) -> Result<NewLeaderEvent, DecodeError> {
+fn decode_new_leader_event(h: MessageHeader, body: &[u8]) -> Result<NewLeaderEvent, DecodeError> {
     let leadership_term_id = rd_i64(body, 0)?;
     let cluster_session_id = rd_i64(body, 8)?;
     let leader_member_id = rd_i32(body, 16)?;
@@ -371,26 +459,33 @@ pub enum Egress<'a> {
 }
 
 /// Decode one egress frame. Used by the live egress poll loop.
+///
+/// # Errors
+///
+/// Returns an error if `buf` is too short, or its schema id does not
+/// match. An unrecognized template id is not an error: it decodes as
+/// [`Egress::Other`].
 pub fn decode_egress(buf: &[u8]) -> Result<Egress<'_>, DecodeError> {
-    let h = MessageHeader::decode(buf)?;
-    if h.schema_id != SCHEMA_ID {
-        return Err(DecodeError::SchemaMismatch { got: h.schema_id });
-    }
-    let body = &buf[HEADER_LEN..];
-    match h.template_id {
-        TEMPLATE_SESSION_EVENT => Ok(Egress::SessionEvent(decode_session_event(&h, body)?)),
-        TEMPLATE_NEW_LEADER_EVENT => Ok(Egress::NewLeader(decode_new_leader_event(&h, body)?)),
+    let f = Frame::parse(buf)?;
+    match f.header.template_id {
+        TEMPLATE_SESSION_EVENT => Ok(Egress::SessionEvent(decode_session_event(
+            f.header, f.body,
+        )?)),
+        TEMPLATE_NEW_LEADER_EVENT => Ok(Egress::NewLeader(decode_new_leader_event(
+            f.header, f.body,
+        )?)),
         TEMPLATE_SESSION_MESSAGE_HEADER => {
-            let leadership_term_id = rd_i64(body, 0)?;
-            let cluster_session_id = rd_i64(body, 8)?;
-            let timestamp = rd_i64(body, 16)?;
-            let payload = body
-                .get(h.block_length as usize..)
-                .ok_or(DecodeError::TooShort {
-                    at: h.block_length as usize,
-                    need: 0,
-                    have: body.len(),
-                })?;
+            let leadership_term_id = rd_i64(f.body, 0)?;
+            let cluster_session_id = rd_i64(f.body, 8)?;
+            let timestamp = rd_i64(f.body, 16)?;
+            let payload =
+                f.body
+                    .get(f.header.block_length as usize..)
+                    .ok_or(DecodeError::TooShort {
+                        at: f.header.block_length as usize,
+                        need: 0,
+                        have: f.body.len(),
+                    })?;
             Ok(Egress::SessionMessage(SessionMessage {
                 leadership_term_id,
                 cluster_session_id,
@@ -400,19 +495,6 @@ pub fn decode_egress(buf: &[u8]) -> Result<Egress<'_>, DecodeError> {
         }
         other => Ok(Egress::Other { template_id: other }),
     }
-}
-
-fn expect(h: &MessageHeader, schema: u16, template: u16) -> Result<(), DecodeError> {
-    if h.schema_id != schema {
-        return Err(DecodeError::SchemaMismatch { got: h.schema_id });
-    }
-    if h.template_id != template {
-        return Err(DecodeError::TemplateMismatch {
-            want: template,
-            got: h.template_id,
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -432,7 +514,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::identity_op)] // (0<<16)|(3<<8) mirrors the major.minor version packing
+    #[allow(
+        clippy::identity_op,
+        reason = "(0<<16)|(3<<8) mirrors the major.minor version packing"
+    )]
     fn session_connect_request_roundtrip() {
         let bytes = encode_session_connect_request(
             42,

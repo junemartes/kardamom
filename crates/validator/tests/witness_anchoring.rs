@@ -16,65 +16,26 @@
 //! zeroes a storage slot (a storage-trie deletion collapse, where the
 //! fixed point must pull the off-path sibling), and another that writes
 //! a fresh slot.
-
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, B256, TxKind, U256, address, keccak256};
+//!
+use alloy_primitives::{Address, B256, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
-use kardamom_engine::actor::BufferedRecord;
-use kardamom_engine::exec_types::TxIndex;
+use kardamom_engine::actor::{BlockExecOutput, BufferedRecord};
+use kardamom_engine::stateless::AnchoredBlockOutput;
 use kardamom_engine::{ExecEnv, MockStateDatabase};
 use kardamom_state::trie::{TrieTables, update_for_block};
-use kardamom_state::{Durability, StateEnvBuilder};
+use kardamom_state::{Durability, StateEnv, StateEnvBuilder};
 use kardamom_types::{
-    AccountChange, BPosition, BlockBoundaryStart, BlockDelta, StorageChange, TxEnvelope,
+    AccountChange, BPosition, BlockBoundaryStart, BlockDelta, BlockRecordsDigest, ExecutionWitness,
+    ProverInput, ProverRecord, PublicOutputs, StorageChange, WitnessProofs,
 };
 use kardamom_validator::witness::{anchor_block_witness, capture_block_witness};
 
-const CHAIN_ID: u64 = 412346;
-const RECIPIENT: Address = address!("000000000000000000000000000000000000dEaD");
-
-/// SSTORE(0, 0); STOP. Zeroes slot 0: the storage-deletion shape.
-const ZEROER: Address = address!("00000000000000000000000000000000000000Aa");
-const ZEROER_CODE: [u8; 6] = [0x60, 0x00, 0x60, 0x00, 0x55, 0x00];
+mod common;
+use common::{CHAIN_ID, RECIPIENT, S0, S1, ZEROER, ZEROER_CODE, tx};
 
 /// SSTORE(3, 0x2a); STOP. Writes a fresh slot: the storage-insert shape.
 const WRITER: Address = address!("00000000000000000000000000000000000000Bb");
 const WRITER_CODE: [u8; 6] = [0x60, 0x2a, 0x60, 0x03, 0x55, 0x00];
-
-const S0: B256 = B256::with_last_byte(0);
-const S1: B256 = B256::with_last_byte(1);
-
-fn tx(signer: &PrivateKeySigner, to: Address, nonce: u64, value: u64, i: u64) -> BufferedRecord {
-    let mut inner = TxLegacy {
-        chain_id: Some(CHAIN_ID),
-        nonce,
-        gas_price: 0,
-        gas_limit: 300_000,
-        to: TxKind::Call(to),
-        value: U256::from(value),
-        input: Default::default(),
-    };
-    let sig = signer.sign_transaction_sync(&mut inner).unwrap();
-    let env: alloy_consensus::TxEnvelope = inner.into_signed(sig).into();
-    let mut raw = Vec::new();
-    env.encode_2718(&mut raw);
-    let tx_hash = keccak256(&raw);
-    BufferedRecord::Tx {
-        tx_idx: TxIndex(i),
-        position: BPosition {
-            term_id: 0,
-            term_offset: (i * 64) as i32,
-        },
-        envelope: TxEnvelope {
-            correlation_id: i,
-            raw_tx: raw.into(),
-            sender: signer.address(),
-            tx_hash,
-        },
-    }
-}
 
 fn exec_env() -> ExecEnv {
     ExecEnv::new(
@@ -88,18 +49,10 @@ fn exec_env() -> ExecEnv {
     )
 }
 
-#[test]
-fn capture_anchor_guest_and_live_trie_agree() {
-    // This test is deterministic, so it also doubles as the
-    // prover-fixture generator.
-    let signer = PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(0x5A)).unwrap();
-    let sender = signer.address();
-    let zeroer_hash = keccak256(ZEROER_CODE);
-    let writer_hash = keccak256(WRITER_CODE);
-
-    // --- Pre-state, seeded identically into the mock (execution) and the
-    // libmdbx trie (anchoring): the sender, both contracts (ZEROER holds
-    // two live slots, so zeroing one collapses a branch), background noise.
+/// Seed identically into the mock (execution) and the libmdbx trie
+/// (anchoring): the sender, both contracts (`ZEROER` holds two live
+/// slots, so zeroing one collapses a branch), and background noise.
+fn seed_delta(sender: Address, zeroer_hash: B256, writer_hash: B256) -> BlockDelta {
     let mut seed = BlockDelta {
         block_number: 0,
         accounts: vec![
@@ -141,24 +94,15 @@ fn capture_anchor_guest_and_live_trie_agree() {
         seed.accounts.push(AccountChange {
             address: Address::repeat_byte(0xC0u8.wrapping_add(i)),
             nonce: 1,
-            balance: U256::from(i as u64 + 1),
+            balance: U256::from(u64::from(i) + 1),
             code_hash: B256::ZERO,
         });
     }
+    seed
+}
 
-    let dir = tempfile::tempdir().unwrap();
-    let env = StateEnvBuilder::new(dir.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
-    let pre_root = {
-        let txn = env.raw().begin_rw_sync().unwrap();
-        let tables = TrieTables::open(&txn).unwrap();
-        let root = update_for_block(&txn, &tables, &seed).unwrap();
-        txn.commit().unwrap();
-        root
-    };
-
+/// The same pre-state as [`seed_delta`], as the mock execution database.
+fn seed_mock(sender: Address, zeroer_hash: B256, writer_hash: B256) -> MockStateDatabase {
     let mut mock = MockStateDatabase::builder()
         .account(
             sender,
@@ -175,21 +119,40 @@ fn capture_anchor_guest_and_live_trie_agree() {
     for i in 0u8..16 {
         mock = mock.account(
             Address::repeat_byte(0xC0u8.wrapping_add(i)),
-            U256::from(i as u64 + 1),
+            U256::from(u64::from(i) + 1),
             1,
             alloy_primitives::KECCAK256_EMPTY,
         );
     }
-    let snap = mock.build();
+    mock.build()
+}
 
-    // --- The block: transfer to a fresh account, zero a slot, and write a slot.
-    let records = vec![
-        tx(&signer, RECIPIENT, 0, 250_000, 0),
-        tx(&signer, ZEROER, 1, 0, 1),
-        tx(&signer, WRITER, 2, 0, 2),
-    ];
+/// Commit `seed` into the trie-backed `env`, and return the resulting root.
+fn commit_seed(env: &StateEnv, seed: &BlockDelta) -> B256 {
+    let txn = env.raw().begin_rw_sync().unwrap();
+    let tables = TrieTables::open(&txn).unwrap();
+    let root = update_for_block(&txn, &tables, seed).unwrap();
+    txn.commit().unwrap();
+    root
+}
+
+/// Capture the block's witness against `snap`, then anchor it against the
+/// committed trie in `env`: the capture fixed point. Asserts the zeroing
+/// write landed in the delta, and that a real trie yields real proofs.
+fn capture_and_anchor(
+    env: &StateEnv,
+    snap: &MockStateDatabase,
+    pre_root: B256,
+    records: &[BufferedRecord],
+) -> (
+    BlockExecOutput,
+    ExecutionWitness,
+    alloy_eip7928::BlockAccessList,
+    WitnessProofs,
+    B256,
+) {
     let (out, mut witness, bal) =
-        capture_block_witness(&snap, None, &records, exec_env()).expect("capture");
+        capture_block_witness(snap, None, records, exec_env()).expect("capture");
     assert!(
         out.delta
             .storage
@@ -198,21 +161,32 @@ fn capture_anchor_guest_and_live_trie_agree() {
         "the zeroing write must be in the delta"
     );
 
-    // --- Anchor against the committed trie: the capture fixed point.
     let ro = env.raw().begin_ro_sync().unwrap();
     let tables = TrieTables::open(&ro).unwrap();
     let (proofs, post_root) =
         anchor_block_witness(&ro, &tables, pre_root, &mut witness, &out.delta).expect("anchor");
     assert!(!proofs.nodes.is_empty(), "a real trie yields real proofs");
+    (out, witness, bal, proofs, post_root)
+}
 
-    // --- Guest shape: one shot over the witness and proofs alone.
+/// Re-execute in the guest shape, one shot over the witness and proofs
+/// alone, and check it reproduces the capture side's roots and receipts.
+fn guest_reverify(
+    witness: &ExecutionWitness,
+    proofs: &WitnessProofs,
+    records: &[BufferedRecord],
+    bal: &alloy_eip7928::BlockAccessList,
+    pre_root: B256,
+    post_root: B256,
+    out: &BlockExecOutput,
+) -> AnchoredBlockOutput {
     let anchored = kardamom_engine::stateless::execute_block_anchored(
-        &witness,
-        &proofs,
+        witness,
+        proofs,
         None,
-        &records,
+        records,
         exec_env(),
-        &bal,
+        bal,
         1,
     )
     .expect("guest execution");
@@ -220,130 +194,122 @@ fn capture_anchor_guest_and_live_trie_agree() {
     assert_eq!(anchored.post_state_root, post_root);
     assert_eq!(anchored.block_number, 1);
     assert_eq!(anchored.out.receipts, out.receipts, "receipts identical");
+    anchored
+}
 
-    // --- Prover fixture export (spec 3c): when KARDAMOM_EMIT_PROVER_FIXTURE=dir
-    // is set, serialize the exact ProverInput this test just validated,
-    // plus the expected 104-byte PublicOutputs. The SP1 host runner
-    // (guest/kardamom-zk-host) runs the real guest ELF against these and
-    // checks byte equality: the guest/host round-trip contract.
-    if let Ok(dir) = std::env::var("KARDAMOM_EMIT_PROVER_FIXTURE") {
-        use kardamom_types::{ProverInput, ProverRecord, PublicOutputs};
-        let mut bal_rlp = Vec::new();
-        alloy_rlp::Encodable::encode(&bal, &mut bal_rlp);
-        let input = ProverInput {
-            chain_id: CHAIN_ID,
-            boundary: BlockBoundaryStart {
-                block_number: 1,
-                end_tx_idx: BPosition::from_index(0),
-                l2_timestamp: 1_700_000_000,
-                l1_origin: 0,
-            },
-            witness: witness.clone(),
-            proofs: proofs.clone(),
-            records: records
-                .iter()
-                .map(|r| match r {
-                    BufferedRecord::Tx {
-                        tx_idx,
-                        envelope,
-                        position,
-                    } => ProverRecord::Tx {
-                        tx_idx: tx_idx.0,
-                        envelope: envelope.clone(),
-                        position: *position,
-                    },
-                    BufferedRecord::Deposit {
-                        tx_idx,
-                        deposit,
-                        position,
-                    } => ProverRecord::Deposit {
-                        tx_idx: tx_idx.0,
-                        deposit: deposit.clone(),
-                        position: *position,
-                    },
-                    // Cross-chain (0x7D) deliveries have no prover-wire
-                    // shape yet (see `wire_records` in `prover.rs`). This
-                    // fixture's block never carries one.
-                    BufferedRecord::XChain { .. } => {
-                        panic!("prover fixture export does not support xchain records yet")
-                    }
-                })
-                .collect(),
-            bal_rlp: bal_rlp.into(),
-            granularity: 1,
-        };
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&input).expect("serialize input");
-        let mut digest = kardamom_types::BlockRecordsDigest::new(1);
-        for r in &records {
-            if let BufferedRecord::Tx { envelope, .. } = r {
-                digest.add_tx(&envelope.raw_tx);
-            }
-        }
-        let expected = PublicOutputs {
-            pre_state_root: anchored.pre_state_root,
-            post_state_root: anchored.post_state_root,
-            block_number: anchored.block_number,
-            records_digest: digest.finish(),
-            bal_commitment: anchored.bal_commitment,
-        };
-        std::fs::write(format!("{dir}/prover-input.rkyv"), &bytes).unwrap();
-        std::fs::write(format!("{dir}/expected-outputs.bin"), expected.encode()).unwrap();
-    }
-
-    // --- The closing assertion: the live incremental writer lands on the
-    // guest's recomputed root for the same block.
-    let live_root = {
-        let txn = env.raw().begin_rw_sync().unwrap();
-        let tables = TrieTables::open(&txn).unwrap();
-        let mut delta = BlockDelta {
-            block_number: 1,
-            accounts: out
-                .delta
-                .accounts
-                .iter()
-                .map(|(address, (nonce, balance, code_hash))| AccountChange {
-                    address: *address,
-                    nonce: *nonce,
-                    balance: *balance,
-                    code_hash: *code_hash,
-                })
-                .collect(),
-            storage: out
-                .delta
-                .storage
-                .iter()
-                .map(|((address, key), value)| StorageChange {
-                    address: *address,
-                    key: *key,
-                    value: *value,
-                })
-                .collect(),
-            code: Vec::new(),
-            receipts: Vec::new(),
-        };
-        delta.accounts.sort_by_key(|a| a.address);
-        delta.storage.sort_by_key(|s| (s.address, s.key));
-        let root = update_for_block(&txn, &tables, &delta).unwrap();
-        txn.commit().unwrap();
-        root
+/// When `KARDAMOM_EMIT_PROVER_FIXTURE=dir` is set, serialize the exact
+/// `ProverInput` this test just validated, plus the expected 104-byte
+/// `PublicOutputs`. The SP1 host runner (`guest/kardamom-zk-host`) runs
+/// the real guest ELF against these and checks byte equality: the
+/// guest/host round-trip contract.
+fn export_prover_fixture_if_requested(
+    witness: &ExecutionWitness,
+    proofs: &WitnessProofs,
+    records: &[BufferedRecord],
+    bal: &alloy_eip7928::BlockAccessList,
+    anchored: &AnchoredBlockOutput,
+) {
+    let Ok(dir) = std::env::var("KARDAMOM_EMIT_PROVER_FIXTURE") else {
+        return;
     };
-    assert_eq!(
-        live_root, post_root,
-        "guest recompute and live incremental trie must agree"
-    );
+    let mut bal_rlp = Vec::new();
+    alloy_rlp::Encodable::encode(bal, &mut bal_rlp);
+    let input = ProverInput {
+        chain_id: CHAIN_ID,
+        boundary: BlockBoundaryStart {
+            block_number: 1,
+            end_tx_idx: BPosition::from_index(0),
+            l2_timestamp: 1_700_000_000,
+            l1_origin: 0,
+        },
+        witness: witness.clone(),
+        proofs: proofs.clone(),
+        records: records
+            .iter()
+            .map(|r| match r {
+                BufferedRecord::Tx {
+                    tx_idx,
+                    envelope,
+                    position,
+                } => ProverRecord::Tx {
+                    tx_idx: tx_idx.0,
+                    envelope: envelope.clone(),
+                    position: *position,
+                },
+                BufferedRecord::Deposit {
+                    tx_idx,
+                    deposit,
+                    position,
+                } => ProverRecord::Deposit {
+                    tx_idx: tx_idx.0,
+                    deposit: deposit.clone(),
+                    position: *position,
+                },
+                // Cross-chain (0x7D) deliveries have no prover-wire
+                // shape yet (see `wire_records` in `prover.rs`). This
+                // fixture's block never carries one.
+                BufferedRecord::XChain { .. } => {
+                    panic!("prover fixture export does not support xchain records yet")
+                }
+            })
+            .collect(),
+        bal_rlp: bal_rlp.into(),
+        granularity: 1,
+    };
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&input).expect("serialize input");
+    let mut digest = BlockRecordsDigest::new(1);
+    for r in records {
+        if let BufferedRecord::Tx { envelope, .. } = r {
+            digest.add_tx(&envelope.raw_tx);
+        }
+    }
+    let expected = PublicOutputs {
+        pre_state_root: anchored.pre_state_root,
+        post_state_root: anchored.post_state_root,
+        block_number: anchored.block_number,
+        records_digest: digest.finish(),
+        bal_commitment: anchored.bal_commitment,
+    };
+    std::fs::write(format!("{dir}/prover-input.rkyv"), &bytes).unwrap();
+    std::fs::write(format!("{dir}/expected-outputs.bin"), expected.encode()).unwrap();
+}
 
-    // --- Tamper: corrupt one proof node byte, and the guest must reject it.
+/// Commit `out`'s delta to the live incremental writer as block 1, and
+/// return the resulting root: the closing assertion checks this equals
+/// the guest's recomputed root for the same block.
+fn commit_live_and_get_root(env: &StateEnv, out: &BlockExecOutput) -> B256 {
+    let txn = env.raw().begin_rw_sync().unwrap();
+    let tables = TrieTables::open(&txn).unwrap();
+    // `finalize` sorts accounts and storage (and would emit `code`, but
+    // this block's records are all `Call`s to already-deployed
+    // contracts, so `out.delta.code` is empty here — not a deliberate
+    // omission, just this test's actual data). Receipts are not needed
+    // for the trie-commit step, so `Vec::new()`.
+    let delta = out.delta.clone().finalize(1, Vec::new());
+    let root = update_for_block(&txn, &tables, &delta).unwrap();
+    txn.commit().unwrap();
+    root
+}
+
+/// Corrupt one proof node byte, and check the guest rejects it: the
+/// anchor's tamper-evidence contract.
+fn assert_tamper_rejected(
+    witness: &ExecutionWitness,
+    proofs: &WitnessProofs,
+    records: &[BufferedRecord],
+    bal: &alloy_eip7928::BlockAccessList,
+) {
     let mut bad = proofs.clone();
     let mut b0 = bad.nodes[0].to_vec();
     b0[0] ^= 0x01;
     bad.nodes[0] = b0.into();
     let err = kardamom_engine::stateless::execute_block_anchored(
-        &witness,
+        witness,
         &bad,
         None,
-        &records,
+        records,
         exec_env(),
-        &bal,
+        bal,
         1,
     )
     .expect_err("tampered proofs must fail");
@@ -354,4 +320,44 @@ fn capture_anchor_guest_and_live_trie_agree() {
         ),
         "got: {err:?}"
     );
+}
+
+#[test]
+// This test is deterministic, so it also doubles as the prover-fixture
+// generator (see `export_prover_fixture_if_requested`).
+fn capture_anchor_guest_and_live_trie_agree() {
+    let signer = PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(0x5A)).unwrap();
+    let sender = signer.address();
+    let zeroer_hash = keccak256(ZEROER_CODE);
+    let writer_hash = keccak256(WRITER_CODE);
+
+    let seed = seed_delta(sender, zeroer_hash, writer_hash);
+    let snap = seed_mock(sender, zeroer_hash, writer_hash);
+
+    let dir = tempfile::tempdir().unwrap();
+    let env = StateEnvBuilder::new(dir.path())
+        .durability(Durability::SafeNoSync)
+        .open()
+        .unwrap();
+    let pre_root = commit_seed(&env, &seed);
+
+    // --- The block: transfer to a fresh account, zero a slot, and write a slot.
+    let records = vec![
+        tx(&signer, RECIPIENT, 0, 250_000, 0),
+        tx(&signer, ZEROER, 1, 0, 1),
+        tx(&signer, WRITER, 2, 0, 2),
+    ];
+    let (out, witness, bal, proofs, post_root) =
+        capture_and_anchor(&env, &snap, pre_root, &records);
+
+    let anchored = guest_reverify(&witness, &proofs, &records, &bal, pre_root, post_root, &out);
+    export_prover_fixture_if_requested(&witness, &proofs, &records, &bal, &anchored);
+
+    let live_root = commit_live_and_get_root(&env, &out);
+    assert_eq!(
+        live_root, post_root,
+        "guest recompute and live incremental trie must agree"
+    );
+
+    assert_tamper_rejected(&witness, &proofs, &records, &bal);
 }

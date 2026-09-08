@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
                 );
             }
             Ok(WatchOutcome::ClaimHonest { batch_index }) => {
-                tracing::debug!(batch_index, "pending claim matches the spool")
+                tracing::debug!(batch_index, "pending claim matches the spool");
             }
             Ok(WatchOutcome::ProofNotReady {
                 batch_index,

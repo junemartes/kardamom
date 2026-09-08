@@ -23,7 +23,8 @@
 //! Egress (cluster to Rust executor):
 //! ```text
 //!   relayed record:  [kind:u8 = 1][index:u64][payload_len:u32][relayed payload…]
-//!   block boundary:  [kind:u8 = 2][block_number:u64][end_tx_idx:u64][l2_timestamp:u64]
+//!   block boundary:  [kind:u8 = 2][block_number:u64][end_tx_idx:u64][l2_timestamp:u64][l1_origin:u64]
+//!   remote reject:   [kind:u8 = 6][origin_chain_id:u64][first_seq:u64][expected_next_seq:u64][reason:u8]
 //! ```
 //! `index` is the 0-based canonical record index that the leader's
 //! replicated state machine assigns. The executor maps it to
@@ -44,15 +45,35 @@ mod ingress;
 #[cfg(test)]
 mod tests;
 
+#[cfg(any(test, feature = "testing"))]
+pub use egress::encode_contiguity_reject;
 pub use egress::{
-    EgressItem, decode_egress, encode_contiguity_reject, encode_egress_boundary,
-    encode_egress_record, encode_replay_done, encode_replay_unavailable,
+    EgressItem, encode_egress_boundary, encode_egress_record, encode_remote_origin_reject,
+    encode_replay_done, encode_replay_unavailable,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use ingress::encode_ingress_depositref;
 pub use ingress::{
-    decode_ingress_batch, decode_replay_request, encode_ingress_batch, encode_ingress_depositref,
-    encode_ingress_epoch, encode_ingress_remote_epoch, encode_ingress_txref, encode_replay_request,
-    encode_subscribe, ingress_sender_nonce, split_ingress,
+    encode_ingress_batch, encode_ingress_epoch, encode_ingress_remote_epoch, encode_ingress_txref,
+    encode_replay_request, encode_subscribe, ingress_sender_nonce, split_ingress,
 };
+
+/// A `TxRef` fixture for wire and publish tests: distinct-enough bytes to
+/// prove `tag` round-trips, not a value with consensus meaning. Shared by
+/// every test that needs *a* `TxRef` rather than a specific one.
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn txref(tag: u8) -> kardamom_types::TxRef {
+    kardamom_types::TxRef::new(
+        alloy_primitives::B256::repeat_byte(tag),
+        1,
+        kardamom_types::BPosition {
+            term_id: 0,
+            term_offset: i32::from(tag),
+        },
+        0,
+    )
+}
 
 /// Ingress app-message kind (the leading tag byte).
 pub const KIND_INGRESS_RECORD: u8 = 0;
@@ -67,9 +88,8 @@ pub const KIND_SUBSCRIBE: u8 = 2;
 /// cluster offer carries the whole batch. The service unpacks it and
 /// processes each entry exactly like an individually offered record, so
 /// consensus determinism, dedup, the contiguity guard, and the egress
-/// format all stay unchanged. Batching only amortizes ingress transport
-/// cost: each ~75-byte ref used to pay for a full offer round trip.
-/// Matches Java `KIND_BATCH`.
+/// format all stay unchanged. Batching amortizes the per-offer round
+/// trip: each entry is about 75 bytes. Matches Java `KIND_BATCH`.
 pub const KIND_BATCH: u8 = 3;
 /// Ingress kind: an origin-advancing record
 /// `[kind:u8 = 4][canonical_id:32][l1_origin:u64][slot_count:u32][record_type:u8][fields…]`.
@@ -77,19 +97,18 @@ pub const KIND_BATCH: u8 = 3;
 /// The service dedupes it by `canonical_id`, like a normal record. But it
 /// closes the current block first, so the record's contents lead a new
 /// block, and it adopts `l1_origin` for later boundaries. This is
-/// deliberately a separate kind, not a record_type the service would have
+/// deliberately a separate kind, not a `record_type` the service would have
 /// to parse. That way the sealer stays schema-agnostic (it never learns
-/// what an epoch or a deposit is), the hot-path TxRef framing stays
+/// what an epoch or a deposit is), the hot-path `TxRef` framing stays
 /// untouched, and the origin reaches the Raft state machine as ordered
 /// data. If the sealer read L1 directly instead, replicas would become
 /// non-deterministic. This record carries no guard header, because
 /// deposits are not nonce-gated, so there is nothing to check for
 /// contiguity. Kind 4, because [`KIND_BATCH`] holds 3. Matches Java
-/// `KIND_ORIGIN_RECORD`. See
-/// `docs/agents/l1-origin-deposit-derivation-spec.md`.
+/// `KIND_ORIGIN_RECORD`.
 pub const KIND_ORIGIN_RECORD: u8 = 4;
 /// Ingress kind: a REMOTE-ORIGIN-ADVANCING record
-/// `[kind:u8 = 5][canonical_id:32][origin_chain_id:u64][anchor_number:u64][slot_count:u32][record_type:u8][fields…]`.
+/// `[kind:u8 = 5][canonical_id:32][origin_chain_id:u64][anchor_number:u64][slot_count:u32][first_seq:u64][last_seq:u64][record_type:u8][fields…]`.
 ///
 /// [`KIND_ORIGIN_RECORD`] for a peer Kardamom chain instead of L1. Same
 /// posture — deduped on `canonical_id`, block closed before the record is
@@ -104,12 +123,20 @@ pub const KIND_ORIGIN_RECORD: u8 = 4;
 ///   part of the L2 block's identity; a peer chain's anchor is not, so a
 ///   remote origin advances per-pair bookkeeping only.
 ///
+/// `first_seq` and `last_seq` are the record's seq range. The sealer keeps
+/// a `next_seq` per origin and accepts a record only if `first_seq` equals
+/// it (the lane contiguity guard, audit H2/H9). It also checks
+/// `slot_count == 2 + last_seq - first_seq`, so a frame cannot claim more
+/// slots than its body fills (audit H3). Every header field is bound by
+/// `canonical_id`, which commits to the origin, the anchor, and the seq
+/// range. A rejected frame answers the offering session with
+/// [`EGRESS_KIND_REMOTE_ORIGIN_REJECT`].
+///
 /// A distinct KIND rather than a `record_type` under [`KIND_ORIGIN_RECORD`]
 /// for the same reason kind 4 exists at all: the sealer branches on the frame
 /// tag and never opens the payload, so it needs no notion of what a remote
 /// epoch is. Kind 5 because 0–4 are taken. Matches Java
-/// `KIND_REMOTE_ORIGIN_RECORD`. See
-/// `docs/specs/interop-outbox-messaging-spec.md` §7.
+/// `KIND_REMOTE_ORIGIN_RECORD`.
 pub const KIND_REMOTE_ORIGIN_RECORD: u8 = 5;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >=
@@ -142,6 +169,40 @@ pub const EGRESS_KIND_REPLAY_DONE: u8 = 4;
 /// unconfirmed ledger to `expected` and republishes, turning a silent gap
 /// into a recoverable signal. Matches Java `EGRESS_KIND_CONTIGUITY_REJECT`.
 pub const EGRESS_KIND_CONTIGUITY_REJECT: u8 = 5;
+/// Egress kind: remote-origin reject. The sealer refused a
+/// [`KIND_REMOTE_ORIGIN_RECORD`] frame:
+/// `[kind:u8 = 6][origin_chain_id:u64][first_seq:u64][expected_next_seq:u64][reason:u8]`.
+/// The service sends this only to the offering session, like the
+/// contiguity reject. The sequencer logs it and counts it. It does not
+/// republish: the record is the watcher's, and the watcher reconciles its
+/// cursor with the destination's `Inbox.nextSeq` at startup. `reason` is
+/// one of the `REMOTE_ORIGIN_REJECT_*` codes. Matches Java
+/// `EGRESS_KIND_REMOTE_ORIGIN_REJECT`.
+pub const EGRESS_KIND_REMOTE_ORIGIN_REJECT: u8 = 6;
+
+/// `first_seq` is not the sealer's `next_seq` for the origin.
+pub const REMOTE_ORIGIN_REJECT_SEQ_MISMATCH: u8 = 1;
+/// `anchor_number` does not advance the origin's adopted anchor.
+pub const REMOTE_ORIGIN_REJECT_ANCHOR_REGRESSED: u8 = 2;
+/// `slot_count != 2 + last_seq - first_seq`.
+pub const REMOTE_ORIGIN_REJECT_SLOT_COUNT_MISMATCH: u8 = 3;
+/// `origin_chain_id` is not in the sealer's remote-origin allowlist.
+pub const REMOTE_ORIGIN_REJECT_UNKNOWN_ORIGIN: u8 = 4;
+/// `last_seq < first_seq`, or the range overflows.
+pub const REMOTE_ORIGIN_REJECT_BAD_RANGE: u8 = 5;
+
+/// Human-readable label for a remote-origin reject reason. Used as a
+/// metric label and in log lines. Unknown codes map to `"unknown"`.
+pub fn remote_origin_reject_reason(code: u8) -> &'static str {
+    match code {
+        REMOTE_ORIGIN_REJECT_SEQ_MISMATCH => "seq_mismatch",
+        REMOTE_ORIGIN_REJECT_ANCHOR_REGRESSED => "anchor_regressed",
+        REMOTE_ORIGIN_REJECT_SLOT_COUNT_MISMATCH => "slot_count_mismatch",
+        REMOTE_ORIGIN_REJECT_UNKNOWN_ORIGIN => "unknown_origin",
+        REMOTE_ORIGIN_REJECT_BAD_RANGE => "bad_range",
+        _ => "unknown",
+    }
+}
 
 /// Record discriminant inside the relayed payload.
 pub const RT_TXREF: u8 = 0;
@@ -149,9 +210,8 @@ pub const RT_DEPOSITREF: u8 = 1;
 /// An rkyv-encoded [`EpochRecord`]: the L1 origin's deposits, in log order.
 pub const RT_EPOCH: u8 = 2;
 /// An rkyv-encoded [`RemoteEpochRecord`]: one peer Kardamom chain's outbox
-/// batch, in seq order (`docs/specs/interop-outbox-messaging-spec.md`).
-/// Origin-advancing like `RT_EPOCH`, but tracked per peer in the sealer and
-/// never stamped into boundaries.
+/// batch, in seq order. Origin-advancing like `RT_EPOCH`, but tracked per
+/// peer in the sealer and never stamped into boundaries.
 pub const RT_REMOTE_EPOCH: u8 = 3;
 
 /// How many canonical slots an epoch occupies. This is one slot for the
@@ -174,6 +234,7 @@ pub const RT_REMOTE_EPOCH: u8 = 3;
 /// The count travels on the frame because the Java sealer never parses
 /// the payload. Every consumer that does parse it re-derives this value
 /// and fail-stops on a mismatch.
+#[must_use]
 pub fn epoch_slots(epoch: &EpochRecord) -> u64 {
     1 + epoch.deposits.len() as u64
 }
@@ -183,6 +244,7 @@ pub fn epoch_slots(epoch: &EpochRecord) -> u64 {
 /// cross-chain batch. `derive_remote_epoch` rejects empty batches, so the
 /// range is always ≥ 2; the `1 +` stays for shape-uniformity with epochs and
 /// so a decoding bug surfaces as a slot mismatch, not an off-by-one.
+#[must_use]
 pub fn remote_epoch_slots(rec: &kardamom_types::xchain::RemoteEpochRecord) -> u64 {
     1 + rec.messages.len() as u64
 }
@@ -212,6 +274,12 @@ pub enum WireError {
     BadEpoch(String),
     #[error("bad remote epoch record: {0}")]
     BadRemoteEpoch(String),
+    #[error("batch entry count {entries} overflows the u16 wire count")]
+    BatchTooLarge { entries: usize },
+    #[error("length {len} overflows the u32 wire length prefix")]
+    EntryTooLarge { len: usize },
+    #[error("declared length {declared} does not fit in this platform's usize")]
+    LenOverflow { declared: u32 },
 }
 
 // ── shared helpers (both directions) ────────────────────────────────────────
@@ -242,10 +310,30 @@ fn rd_i32(b: &[u8], at: usize) -> Result<i32, WireError> {
 fn rd_u64(b: &[u8], at: usize) -> Result<u64, WireError> {
     bytes::u64_le(b, at).ok_or_else(|| too_short(b, at, 8))
 }
-fn too_short(b: &[u8], at: usize, need: usize) -> WireError {
+
+/// Read a `u32` length prefix at `at`, converted to `usize`. A real error
+/// instead of a `usize::MAX` sentinel: this can only fail on a target
+/// where `usize` is narrower than `u32`.
+pub(super) fn rd_len(b: &[u8], at: usize) -> Result<usize, WireError> {
+    let declared = rd_u32(b, at)?;
+    usize::try_from(declared).map_err(|_| WireError::LenOverflow { declared })
+}
+
+pub(super) fn too_short(b: &[u8], at: usize, need: usize) -> WireError {
     WireError::TooShort {
         at,
         need,
         have: b.len().saturating_sub(at),
     }
+}
+
+/// Read a `len`-byte slice at `at`, or [`WireError::TooShort`] with this
+/// codec's offsets. Shared by every fixed-width field read in the ingress
+/// and egress decoders (sender addresses, canonical ids, relayed
+/// payloads), so each site is one call instead of a hand-rolled
+/// `TooShort { .. }` literal.
+pub(super) fn rd_slice(b: &[u8], at: usize, len: usize) -> Result<&[u8], WireError> {
+    at.checked_add(len)
+        .and_then(|end| b.get(at..end))
+        .ok_or_else(|| too_short(b, at, len))
 }

@@ -1,21 +1,21 @@
 //! Lag detection and receipt-floor resync.
 //!
-//! Implements docs/agents/sequencer-lag-resync-spec.md. A replica that
-//! falls far enough behind its twin can drain re-offers past the
+//! A replica that falls far enough behind its twin can drain re-offers past the
 //! cluster's first-seen dedup horizon. This orders the same transaction
 //! canonically twice, which is fatal to the executor and poisons recovery
 //! replay. The guard splits into a provably safe response, and cheap
 //! triggers:
 //!
-//! - Response ([`should_skip`](ResyncController::should_skip)): while in
-//!   resync mode, skip a publish only if the sender's executed-truth
-//!   floor (derived from the tx_receipts stream, [`FloorUpdate`]) proves
-//!   the nonce already executed. A skip backed by a receipt needs no
+//! - Response ([`ResyncController::floor`], read through
+//!   `Sequencer::proven_executed`): while in resync mode, skip a publish
+//!   only if the sender's executed-truth floor (derived from the
+//!   `tx_receipts` stream, [`FloorUpdate`]) proves the nonce already
+//!   executed. A skip backed by a receipt needs no
 //!   dedup-window guarantee at all. Everything unproven is published, so
 //!   every degraded mode (missed receipts, late subscribe) degrades
 //!   toward publish, the side the layered dedup windows guard, and never
-//!   toward skip (a canonical nonce gap, which nothing guards; see the
-//!   removed fast-forward note in [`crate::state`]).
+//!   toward skip (a canonical nonce gap, which nothing guards; see
+//!   [`crate::state::PartitionState::advance_floor`]'s note).
 //! - Triggers: the primary signal is the canonical-count watermark. The
 //!   cluster broadcasts every boundary (`end_tx_idx`, the global
 //!   canonical count) to publisher sessions too, so the horizon is
@@ -29,6 +29,7 @@
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -38,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::metrics;
 
-/// One executed-truth observation from the tx_receipts stream.
+/// One executed-truth observation from the `tx_receipts` stream.
 /// `sender`'s transaction at `executed_nonce` produced a receipt, so the
 /// sender's floor is at least `executed_nonce + 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +59,45 @@ pub struct FloorUpdate {
     /// specific handling (drop on `NonceTooLow`, evict on `NonceTooHigh`)
     /// is a future step.
     pub skip_reason: Option<kardamom_types::SkipReason>,
+}
+
+impl FloorUpdate {
+    /// A non-skip execution receipt for `sender` at `nonce`: confirms the
+    /// publish, and is floor evidence (raises the floor to `nonce + 1`).
+    #[must_use]
+    pub fn executed(sender: Address, nonce: u64) -> Self {
+        Self {
+            sender,
+            executed_nonce: nonce,
+            deposit: false,
+            skip_reason: None,
+        }
+    }
+
+    /// A skip receipt for `sender` at `nonce`: confirms the publish, but
+    /// is not floor evidence (it consumed no nonce).
+    #[must_use]
+    pub fn skip(sender: Address, nonce: u64, reason: kardamom_types::SkipReason) -> Self {
+        Self {
+            sender,
+            executed_nonce: nonce,
+            deposit: false,
+            skip_reason: Some(reason),
+        }
+    }
+
+    /// A deposit receipt for `sender`: carries the filler nonce 0, and is
+    /// neither a confirmation nor floor evidence (see the `deposit` field
+    /// doc for why).
+    #[must_use]
+    pub fn deposit(sender: Address) -> Self {
+        Self {
+            sender,
+            executed_nonce: 0,
+            deposit: true,
+            skip_reason: None,
+        }
+    }
 }
 
 /// Shared state between the egress-watermark FEED thread and the publish
@@ -83,12 +123,14 @@ pub struct SharedWatermark {
 }
 
 impl SharedWatermark {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
     pub fn store(&self, count: u64) {
         self.count.store(count, Ordering::Release);
     }
+    #[must_use]
     pub fn load(&self) -> u64 {
         self.count.load(Ordering::Acquire)
     }
@@ -99,6 +141,7 @@ impl SharedWatermark {
         self.lag_gap_ms.fetch_max(gap_ms, Ordering::AcqRel);
     }
     /// Controller: consume the pending lag flag, if any.
+    #[must_use]
     pub fn take_lag(&self) -> Option<u64> {
         match self.lag_gap_ms.swap(0, Ordering::AcqRel) {
             0 => None,
@@ -113,12 +156,15 @@ impl SharedWatermark {
 pub struct ResyncConfig {
     /// Must equal the cluster's `-Dkardamom.cluster.dedupCapacity`: the
     /// horizon this mechanism protects. Logged at startup for the
-    /// contract check.
-    pub dedup_capacity: u64,
+    /// contract check. Never zero: a zero-capacity dedup window is not a
+    /// valid deployment, so serde rejects a `0` at TOML-parse time, the
+    /// same parse-once boundary `SequencerConfig::partition_count` uses.
+    pub dedup_capacity: NonZeroU64,
     /// Watermark-jump and gap enter threshold, as a percent of the
     /// capacity. This is an integer so the config stays `Eq` (the spec's
-    /// 0.25 fraction is 25 here).
-    pub enter_percent: u64,
+    /// 0.25 fraction is 25 here). Never zero: a zero percent would mean
+    /// "always resync", which is never the intended setting.
+    pub enter_percent: NonZeroU64,
     /// Boundary-silence trigger. No watermark change for this long
     /// enters resync. Sized as the spec's `boundary_silence_ticks ×
     /// cluster tick interval` (5 × 2000 ms deploy tick).
@@ -140,8 +186,8 @@ pub struct ResyncConfig {
 impl Default for ResyncConfig {
     fn default() -> Self {
         Self {
-            dedup_capacity: 1 << 17,
-            enter_percent: 25,
+            dedup_capacity: NonZeroU64::new(1 << 17).expect("1 << 17 != 0"),
+            enter_percent: NonZeroU64::new(25).expect("25 != 0"),
             boundary_silence_ms: 10_000,
             publish_stall_ms: 10_000,
             exit_hold_ms: 2_000,
@@ -150,10 +196,77 @@ impl Default for ResyncConfig {
     }
 }
 
+/// A `[resync]` setting combination this process refuses to run with.
+#[derive(Debug, thiserror::Error)]
+pub enum ResyncConfigError {
+    #[error(
+        "resync: dedup_capacity {dedup_capacity} * enter_percent {enter_percent} overflows u64"
+    )]
+    ThresholdOverflow {
+        dedup_capacity: u64,
+        enter_percent: u64,
+    },
+    #[error(
+        "resync: dedup_capacity {dedup_capacity} * enter_percent {enter_percent} / 100 rounds \
+         down to 0; raise enter_percent or dedup_capacity"
+    )]
+    ThresholdTooSmall {
+        dedup_capacity: u64,
+        enter_percent: u64,
+    },
+    #[error("resync: dedup_capacity {dedup_capacity} does not fit in usize on this target")]
+    CapacityNotUsize { dedup_capacity: u64 },
+}
+
 impl ResyncConfig {
-    /// Watermark jump/gap threshold in records.
-    pub fn enter_threshold(&self) -> u64 {
-        (self.dedup_capacity.saturating_mul(self.enter_percent) / 100).max(1)
+    /// Watermark jump/gap threshold in records, computed once (by
+    /// [`ResyncController::new`]) rather than on every [`ResyncController::observe`]
+    /// call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResyncConfigError::ThresholdOverflow`] if
+    /// `dedup_capacity * enter_percent` overflows `u64`, or
+    /// [`ResyncConfigError::ThresholdTooSmall`] if the product rounds down
+    /// to a threshold of 0 records (which would mean "resync on every
+    /// watermark tick"). Neither is silently clamped: a threshold that
+    /// must be at least 1 is a `NonZeroU64`, not a `.max(1)` fixup.
+    pub fn enter_threshold(&self) -> Result<NonZeroU64, ResyncConfigError> {
+        let product = self
+            .dedup_capacity
+            .get()
+            .checked_mul(self.enter_percent.get())
+            .ok_or(ResyncConfigError::ThresholdOverflow {
+                dedup_capacity: self.dedup_capacity.get(),
+                enter_percent: self.enter_percent.get(),
+            })?;
+        NonZeroU64::new(product / 100).ok_or(ResyncConfigError::ThresholdTooSmall {
+            dedup_capacity: self.dedup_capacity.get(),
+            enter_percent: self.enter_percent.get(),
+        })
+    }
+
+    /// Check this `[resync]` section at the config parse-once boundary,
+    /// before anything is built from it: [`Self::enter_threshold`] must
+    /// compute, and `dedup_capacity` must fit in a `usize` on this
+    /// target. [`ResyncController::new`] and [`ResyncChannel::open`]
+    /// repeat these same checks (they can be called directly, without
+    /// going through [`SequencerConfig::validate`]), so a caller that
+    /// already validated pays only for the redundant check, never for a
+    /// bypassed one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResyncConfigError`] for the same reasons as
+    /// [`Self::enter_threshold`] and [`ResyncChannel::open`].
+    pub fn validate(&self) -> Result<(), ResyncConfigError> {
+        self.enter_threshold()?;
+        usize::try_from(self.dedup_capacity.get()).map_err(|_| {
+            ResyncConfigError::CapacityNotUsize {
+                dedup_capacity: self.dedup_capacity.get(),
+            }
+        })?;
+        Ok(())
     }
 }
 
@@ -171,8 +284,15 @@ pub enum EnterReason {
 /// publish loop thread owns this. It is fed by the receipts thread
 /// ([`FloorUpdate`] mpsc) and the egress-watermark thread
 /// ([`SharedWatermark`]).
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent flags (resync active, each receiver dead, a boundary has been seen), not a state machine to collapse into one enum"
+)]
 pub struct ResyncController {
     cfg: ResyncConfig,
+    /// `cfg.enter_threshold()`, computed once at construction rather than
+    /// on every [`Self::observe`] call.
+    enter_threshold: NonZeroU64,
     partition: u32,
     active: bool,
     floors: HashMap<Address, u64>,
@@ -202,6 +322,34 @@ pub struct ResyncController {
 /// cannot starve the publish path.
 const FLOOR_DRAIN_PER_ITER: usize = 1024;
 
+/// Drain up to `max` items off a bounded `try_recv` channel. Stops early
+/// on `Empty`. On `Disconnected`, latches `*dead` and warns once (repeat
+/// disconnects on later calls stay silent), instead of once per drained
+/// batch. Shared by every bounded drain in this controller.
+fn drain_bounded<T>(
+    rx: &Receiver<T>,
+    dead: &mut bool,
+    max: usize,
+    partition: u32,
+    on_dead: &str,
+) -> Vec<T> {
+    let mut out = Vec::new();
+    for _ in 0..max {
+        match rx.try_recv() {
+            Ok(item) => out.push(item),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                if !*dead {
+                    *dead = true;
+                    tracing::warn!(partition, "{}", on_dead);
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// One drain of the receipts channel: `(raised_floors, confirmations)`.
 /// Both are `(sender, nonce-or-floor)` lists. See
 /// [`ResyncController::drain_floor_updates`].
@@ -213,15 +361,21 @@ pub type ReceiptDrain = (Vec<(Address, u64)>, Vec<(Address, u64)>);
 pub type RejectDrain = (Vec<(Address, u64)>, Vec<(Address, u64)>);
 
 impl ResyncController {
+    /// # Errors
+    ///
+    /// Returns [`ResyncConfigError`] if `cfg`'s watermark-jump threshold
+    /// cannot be computed (see [`ResyncConfig::enter_threshold`]).
     pub fn new(
         cfg: ResyncConfig,
         partition: u32,
         floor_rx: Receiver<FloorUpdate>,
         reject_rx: Receiver<(Address, u64, u64)>,
         watermark: SharedWatermark,
-    ) -> Self {
+    ) -> Result<Self, ResyncConfigError> {
+        let enter_threshold = cfg.enter_threshold()?;
         let mut c = Self {
             cfg,
+            enter_threshold,
             partition,
             active: false,
             floors: HashMap::new(),
@@ -238,13 +392,15 @@ impl ResyncController {
         // Startup trigger. A restarted replica cannot know what its twin
         // ordered while it was away. Begin filtered until calm.
         c.enter(EnterReason::Startup);
-        c
+        Ok(c)
     }
 
+    #[must_use]
     pub fn active(&self) -> bool {
         self.active
     }
 
+    #[must_use]
     pub fn floor(&self, sender: Address) -> Option<u64> {
         self.floors.get(&sender).copied()
     }
@@ -262,48 +418,36 @@ impl ResyncController {
     ///   commit and only a receipt proves the ref survived into the
     ///   committed stream) and including nonce 0.
     ///
-    ///   Nonce 0 used to be excluded wholesale, because a deposit receipt
-    ///   (filler nonce 0) could not be told apart from a genuine nonce-0
-    ///   transaction, and must not confirm one. The cost was silent and
-    ///   unbounded: a one-transaction sender's nonce-0 ref could never be
-    ///   confirmed, so the ledger re-offered it every confirm timeout
-    ///   forever, rewinding that sender's nonce floor on every sweep.
-    ///   With `Receipt::tx_type`, the two are distinguishable at the
-    ///   source, so the exclusion is now exactly "is this a deposit?".
+    ///   A deposit receipt (filler nonce 0) must not confirm a genuine
+    ///   nonce-0 transaction. `Receipt::tx_type` tells the two apart at
+    ///   the source, so the exclusion is exactly "is this a deposit?",
+    ///   not "is the nonce 0?".
     pub fn drain_floor_updates(&mut self) -> ReceiptDrain {
         let mut raised = Vec::new();
         let mut confirmations = Vec::new();
-        for _ in 0..FLOOR_DRAIN_PER_ITER {
-            match self.floor_rx.try_recv() {
-                Ok(u) => {
-                    // A deposit consumes no L2 nonce. It is neither a
-                    // confirmation (it never corresponds to a published
-                    // TxRef) nor floor evidence.
-                    if u.deposit {
-                        continue;
-                    }
-                    confirmations.push((u.sender, u.executed_nonce));
-                    if u.skip_reason.is_some() {
-                        continue;
-                    }
-                    let floor = u.executed_nonce.saturating_add(1);
-                    let e = self.floors.entry(u.sender).or_insert(0);
-                    if floor > *e {
-                        *e = floor;
-                        raised.push((u.sender, floor));
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    if !self.floor_rx_dead {
-                        self.floor_rx_dead = true;
-                        tracing::warn!(
-                            partition = self.partition,
-                            "floor-update producer disconnected; resync floors are frozen"
-                        );
-                    }
-                    break;
-                }
+        let updates = drain_bounded(
+            &self.floor_rx,
+            &mut self.floor_rx_dead,
+            FLOOR_DRAIN_PER_ITER,
+            self.partition,
+            "floor-update producer disconnected; resync floors are frozen",
+        );
+        for u in updates {
+            // A deposit consumes no L2 nonce. It is neither a
+            // confirmation (it never corresponds to a published TxRef)
+            // nor floor evidence.
+            if u.deposit {
+                continue;
+            }
+            confirmations.push((u.sender, u.executed_nonce));
+            if u.skip_reason.is_some() {
+                continue;
+            }
+            let floor = u.executed_nonce.saturating_add(1);
+            let e = self.floors.entry(u.sender).or_insert(0);
+            if floor > *e {
+                *e = floor;
+                raised.push((u.sender, floor));
             }
         }
         if !raised.is_empty() {
@@ -339,29 +483,21 @@ impl ResyncController {
     pub fn drain_contiguity_rejects(&mut self) -> RejectDrain {
         let mut drops: Vec<(Address, u64)> = Vec::new();
         let mut lowest: HashMap<Address, u64> = HashMap::new();
-        for _ in 0..FLOOR_DRAIN_PER_ITER {
-            match self.reject_rx.try_recv() {
-                Ok((sender, nonce, expected)) => {
-                    if nonce < expected {
-                        drops.push((sender, nonce));
-                    } else {
-                        lowest
-                            .entry(sender)
-                            .and_modify(|e| *e = (*e).min(expected))
-                            .or_insert(expected);
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    if !self.reject_rx_dead {
-                        self.reject_rx_dead = true;
-                        tracing::warn!(
-                            partition = self.partition,
-                            "contiguity-reject producer disconnected"
-                        );
-                    }
-                    break;
-                }
+        let rejects = drain_bounded(
+            &self.reject_rx,
+            &mut self.reject_rx_dead,
+            FLOOR_DRAIN_PER_ITER,
+            self.partition,
+            "contiguity-reject producer disconnected",
+        );
+        for (sender, nonce, expected) in rejects {
+            if nonce < expected {
+                drops.push((sender, nonce));
+            } else {
+                lowest
+                    .entry(sender)
+                    .and_modify(|e| *e = (*e).min(expected))
+                    .or_insert(expected);
             }
         }
         (drops, lowest.into_iter().collect())
@@ -385,9 +521,21 @@ impl ResyncController {
             // Record the gauge only on change. observe runs every loop
             // iteration, and the metrics macro allocates its label each call.
             metrics::record_canonical_watermark(self.partition, w);
-            let jump = w.saturating_sub(self.last_watermark);
-            if self.watermark_seen && jump >= self.cfg.enter_threshold() {
-                self.enter(EnterReason::WatermarkJump { gap: jump });
+            if w >= self.last_watermark {
+                let jump = w - self.last_watermark;
+                if self.watermark_seen && jump >= self.enter_threshold.get() {
+                    self.enter(EnterReason::WatermarkJump { gap: jump });
+                }
+            } else {
+                // The canonical count must never go backwards. Log this
+                // instead of silently clamping the jump to 0: a
+                // regression is a sealer fault, not a routine event.
+                tracing::warn!(
+                    partition = self.partition,
+                    previous = self.last_watermark,
+                    observed = w,
+                    "canonical watermark regressed; this should never happen (sealer fault?)"
+                );
             }
             self.last_watermark = w;
             self.watermark_seen = true;
@@ -399,10 +547,9 @@ impl ResyncController {
     /// work pending.
     pub fn note_publish_stall(&mut self, now: Instant) {
         let since = *self.stall_since.get_or_insert(now);
-        if now.duration_since(since).as_millis() as u64 >= self.cfg.publish_stall_ms {
-            self.enter(EnterReason::PublishStall {
-                stalled_ms: now.duration_since(since).as_millis() as u64,
-            });
+        let stalled_ms = u64::try_from(now.duration_since(since).as_millis()).unwrap_or(u64::MAX);
+        if stalled_ms >= self.cfg.publish_stall_ms {
+            self.enter(EnterReason::PublishStall { stalled_ms });
             self.stall_since = Some(now); // re-arm, to avoid re-enter spam
         }
     }
@@ -446,7 +593,8 @@ impl ResyncController {
             return;
         }
         let since = *self.calm_since.get_or_insert(now);
-        if now.duration_since(since).as_millis() as u64 >= self.cfg.exit_hold_ms {
+        let calm_ms = u64::try_from(now.duration_since(since).as_millis()).unwrap_or(u64::MAX);
+        if calm_ms >= self.cfg.exit_hold_ms {
             self.active = false;
             self.calm_since = None;
             tracing::info!(
@@ -459,27 +607,64 @@ impl ResyncController {
     }
 }
 
-/// What [`resync_channel`] hands back: the controller (publish loop),
-/// the floor-update sender (receipts thread), the `(sender, nonce,
-/// expected)` contiguity-reject sender (egress-watermark thread), and
-/// the shared watermark (egress-watermark thread).
-pub type ResyncChannel = (
-    ResyncController,
-    Sender<FloorUpdate>,
-    Sender<(Address, u64, u64)>,
-    SharedWatermark,
-);
+/// What [`ResyncChannel::open`] hands back: the controller (publish
+/// loop), the floor-update sender (receipts thread), the `(sender,
+/// nonce, expected)` contiguity-reject sender (egress-watermark thread),
+/// and the shared watermark (egress-watermark thread). A named struct,
+/// not a positional tuple: the four fields have four different owners on
+/// the sequencer binary side, so a `.0`/`.1`/`.2`/`.3` call site would
+/// carry no information about which is which.
+pub struct ResyncChannel {
+    pub controller: ResyncController,
+    pub floor_tx: Sender<FloorUpdate>,
+    pub reject_tx: Sender<(Address, u64, u64)>,
+    pub watermark: SharedWatermark,
+}
 
-/// Build the controller, plus the sender halves of the floor-update
-/// channel (handed to the receipts thread) and the contiguity-reject
-/// channel (handed to the egress-watermark thread, alongside the shared
-/// watermark).
-pub fn resync_channel(cfg: ResyncConfig, partition: u32) -> ResyncChannel {
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let (reject_tx, reject_rx) = crossbeam_channel::unbounded();
-    let watermark = SharedWatermark::new();
-    let controller = ResyncController::new(cfg, partition, rx, reject_rx, watermark.clone());
-    (controller, tx, reject_tx, watermark)
+impl ResyncChannel {
+    /// Build the controller, plus the sender halves of the floor-update
+    /// channel (handed to the receipts thread) and the contiguity-reject
+    /// channel (handed to the egress-watermark thread, alongside the
+    /// shared watermark).
+    ///
+    /// Both channels are bounded to `cfg.dedup_capacity`: the cluster's
+    /// first-seen dedup horizon, the same resync window the rest of this
+    /// module protects. A backlog past that many entries already means
+    /// the publish loop has stalled longer than the window this
+    /// mechanism covers, so the producer side drops on overflow instead
+    /// of growing without bound (see [`crate::feeds`] on the sequencer
+    /// binary side).
+    ///
+    /// Each channel is `crossbeam_channel::bounded`, which allocates
+    /// every slot up front rather than growing on demand: at the default
+    /// `dedup_capacity` (2^17), each channel's backing ring buffer is
+    /// about 6 MB, so this allocates about 12 MB total.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResyncConfigError`] if `cfg`'s watermark-jump threshold
+    /// cannot be computed (see [`ResyncConfig::enter_threshold`]), or if
+    /// `cfg.dedup_capacity` does not fit in a `usize` on this target
+    /// (only possible on a 32-bit target with a `dedup_capacity` above
+    /// `u32::MAX`).
+    pub fn open(cfg: ResyncConfig, partition: u32) -> Result<Self, ResyncConfigError> {
+        let cap = usize::try_from(cfg.dedup_capacity.get()).map_err(|_| {
+            ResyncConfigError::CapacityNotUsize {
+                dedup_capacity: cfg.dedup_capacity.get(),
+            }
+        })?;
+        let (floor_tx, floor_rx) = crossbeam_channel::bounded(cap);
+        let (reject_tx, reject_rx) = crossbeam_channel::bounded(cap);
+        let watermark = SharedWatermark::new();
+        let controller =
+            ResyncController::new(cfg, partition, floor_rx, reject_rx, watermark.clone())?;
+        Ok(Self {
+            controller,
+            floor_tx,
+            reject_tx,
+            watermark,
+        })
+    }
 }
 
 #[cfg(test)]

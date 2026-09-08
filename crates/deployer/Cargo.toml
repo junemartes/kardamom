@@ -12,6 +12,12 @@ path = "src/main.rs"
 name = "print-factory-address"
 path = "src/bin/print_factory_address.rs"
 
+[features]
+default = []
+# Exposes the anvil-plus-ERC-7955 e2e test scaffold (`testkit`) to
+# downstream crates' own tests.
+test-support = ["dep:alloy-node-bindings"]
+
 [dependencies]
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
@@ -27,6 +33,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
+alloy-node-bindings = { workspace = true, optional = true }
 
 [build-dependencies]
 anyhow.workspace = true
@@ -35,5 +42,6 @@ serde_json.workspace = true
 [dev-dependencies]
 alloy-node-bindings.workspace = true
 kardamom-types.workspace = true
+kardamom-deployer = { path = ".", features = ["test-support"] }
 tempfile = "3"
 toml.workspace = true

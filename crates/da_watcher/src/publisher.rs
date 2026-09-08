@@ -5,8 +5,7 @@
 //!
 //! The unit is an epoch, not a deposit. One record covers one finalized L1
 //! block. It carries that block's deposits by value, and the watcher emits
-//! it even when there are no deposits. See
-//! `docs/agents/l1-origin-deposit-derivation-spec.md`.
+//! it even when there are no deposits.
 
 use kardamom_types::{BPosition, EpochRecord};
 
@@ -33,6 +32,10 @@ pub enum PublishError {
 pub trait EpochPublisher: Send + Sync + 'static {
     /// Publish one epoch. Return the assigned wire position, similar to
     /// Aeron's offer position, so a caller can correlate it.
+    ///
+    /// # Errors
+    /// Returns [`PublishError`] when the transport is backpressured, closed,
+    /// or fails.
     fn publish(&self, epoch: &EpochRecord) -> Result<BPosition, PublishError>;
 }
 
@@ -40,7 +43,7 @@ pub trait EpochPublisher: Send + Sync + 'static {
 pub mod fakes {
     use std::sync::{Arc, Mutex};
 
-    use super::*;
+    use super::{BPosition, EpochPublisher, EpochRecord, PublishError};
 
     /// In-memory [`EpochPublisher`] that records every published epoch in
     /// order. Its synthetic `BPosition` advances by `64` per record, so a
@@ -60,7 +63,8 @@ pub mod fakes {
             v.push(epoch.clone());
             Ok(BPosition {
                 term_id: 0,
-                term_offset: (v.len() as i32) * 64,
+                // A fake position; test record counts never approach i32::MAX.
+                term_offset: i32::try_from(v.len()).expect("record count fits in i32") * 64,
             })
         }
     }
@@ -75,7 +79,7 @@ mod tests {
     fn epoch(n: u64) -> EpochRecord {
         EpochRecord {
             l1_number: n,
-            l1_hash: B256::repeat_byte(n as u8),
+            l1_hash: B256::repeat_byte(u8::try_from(n).unwrap()),
             deposits: Vec::new(),
         }
     }

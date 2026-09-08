@@ -120,6 +120,12 @@ impl AeronRuntime {
     /// Calls [`spawn_with_dir`](Self::spawn_with_dir) when a directory is
     /// given, or [`spawn_default`](Self::spawn_default) otherwise. This is
     /// the shape every service binary's optional `--aeron-dir` flag needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to start (see
+    /// [`spawn_with_dir`](Self::spawn_with_dir) and
+    /// [`spawn_default`](Self::spawn_default)).
     pub fn spawn(aeron_dir: Option<&std::path::Path>) -> Result<Self, LogError> {
         match aeron_dir {
             Some(dir) => Self::spawn_with_dir(dir),
@@ -129,6 +135,12 @@ impl AeronRuntime {
 
     /// Build an Aeron client (using the default `aeron_dir`) and spawn the
     /// dedicated Aeron thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if building the default `AeronContext` fails, or
+    /// if the Aeron thread fails to start within 10 s (see
+    /// [`spawn_with`](Self::spawn_with)).
     pub fn spawn_default() -> Result<Self, LogError> {
         Self::spawn_with(|| {
             rusteron_client::AeronContext::new()
@@ -139,15 +151,15 @@ impl AeronRuntime {
     /// Spawn pointing at a specific `aeron.dir` (the Media Driver's
     /// shared-memory directory). Used by e2e tests that bind-mount the
     /// container's aeron.dir into the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `aeron_dir` is not UTF-8 or contains a NUL
+    /// byte, or if the Aeron thread fails to start (see
+    /// [`spawn_with`](Self::spawn_with)).
     pub fn spawn_with_dir(aeron_dir: impl Into<std::path::PathBuf>) -> Result<Self, LogError> {
         let aeron_dir = aeron_dir.into();
-        let aeron_dir_str = aeron_dir
-            .to_str()
-            .ok_or_else(|| LogError::Aeron(format!("aeron.dir is not UTF-8: {aeron_dir:?}")))?
-            .to_string();
-        let aeron_dir_c = std::ffi::CString::new(aeron_dir_str.clone()).map_err(|_| {
-            LogError::Aeron(format!("aeron.dir contains a NUL byte: {aeron_dir_str}"))
-        })?;
+        let aeron_dir_c = crate::ffi::dir_cstring(&aeron_dir)?;
         Self::spawn_with(move || {
             let ctx = rusteron_client::AeronContext::new()
                 .map_err(|e| LogError::Aeron(format!("AeronContext::new: {e}")))?;
@@ -160,8 +172,15 @@ impl AeronRuntime {
     /// Spawn the Aeron thread, building the `AeronContext` inside the
     /// thread with the caller-supplied closure. The closure runs on the
     /// Aeron thread. This is the only way to feed it custom configuration
-    /// without crossing the `!Send + !Sync` boundary that AeronContext
+    /// without crossing the `!Send + !Sync` boundary that `AeronContext`
     /// sits on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `make_ctx` fails, if building the `Aeron`
+    /// client from the resulting context fails, if the OS thread spawn
+    /// fails, or if the Aeron thread does not signal a successful start
+    /// within 10 s.
     pub fn spawn_with<F>(make_ctx: F) -> Result<Self, LogError>
     where
         F: FnOnce() -> Result<rusteron_client::AeronContext, LogError> + Send + 'static,
@@ -172,7 +191,7 @@ impl AeronRuntime {
         let join = std::thread::Builder::new()
             .name("kardamom-aeron".into())
             .spawn(move || {
-                let aeron = match make_ctx().and_then(build_aeron) {
+                let aeron = match make_ctx().and_then(|ctx| build_aeron(&ctx)) {
                     Ok(a) => a,
                     Err(e) => {
                         let _ = started_tx.send(Err(e));
@@ -208,6 +227,12 @@ impl AeronRuntime {
 
     /// Open a publication on the Aeron thread, returning a `Send + Sync`
     /// handle that forwards every offer through the command channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the publication
+    /// (a malformed channel URI, or the driver's `add_publication`
+    /// timeout elapsing), or if the command round trip itself times out.
     pub fn open_publication(&self, uri: &str, stream_id: i32) -> Result<PubHandle, LogError> {
         let uri = uri.to_string();
         let pub_id = request(
@@ -229,6 +254,12 @@ impl AeronRuntime {
     /// assigned `sub_id` (used to attach MDS destinations; most callers
     /// ignore it). Used by adapters that must demultiplex fragments
     /// themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the subscription
+    /// (a malformed channel URI, or the driver's `add_subscription`
+    /// timeout elapsing), or if the command round trip itself times out.
     pub fn open_subscription_with_deliver(
         &self,
         uri: &str,
@@ -251,6 +282,12 @@ impl AeronRuntime {
     /// Attach a source endpoint to a multi-destination subscription (one
     /// opened `control-mode=manual`). Blocks until the driver confirms the
     /// attach. Idempotent: re-adding an already-attached `uri` is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `sub_id` is unknown, if the driver rejects or
+    /// times out the destination attach, or if the command round trip
+    /// itself times out.
     pub fn add_destination(&self, sub_id: u32, uri: &str) -> Result<(), LogError> {
         let uri = uri.to_string();
         request(
@@ -261,6 +298,11 @@ impl AeronRuntime {
     }
 
     /// Detach a previously-attached source endpoint from an MDS subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command round trip to the Aeron thread
+    /// times out.
     pub fn remove_destination(&self, sub_id: u32, uri: &str) -> Result<(), LogError> {
         let uri = uri.to_string();
         request(
@@ -272,52 +314,52 @@ impl AeronRuntime {
 
     /// Open a typed subscription, returning an mpsc receiver of decoded
     /// messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the subscription
+    /// (see [`open_subscription_merged`](Self::open_subscription_merged)).
     pub fn open_subscription<T>(
         &self,
         uri: &str,
         stream_id: i32,
     ) -> Result<UnboundedReceiver<(BPosition, T)>, LogError>
     where
-        T: rkyv::Archive + Send + 'static,
-        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-            + for<'a> rkyv::bytecheck::CheckBytes<
-                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
-            >,
+        T: crate::codec::WireMessage,
     {
-        self.open_subscription_merged(std::slice::from_ref(&uri), stream_id)
+        self.open_subscription_merged(uri, &[], stream_id)
     }
 
     /// Open one or more subscriptions on the same `stream_id`, all feeding
     /// a single mpsc receiver. Each URI becomes its own Aeron subscription
     /// (its own `SubEntry`). Fragments from every one are decoded and
-    /// merged into the returned channel in the Aeron thread's poll order,
-    /// the same merge the shared-multicast path produced from multiple
-    /// images of one subscription.
+    /// merged into the returned channel in the Aeron thread's poll order.
     ///
-    /// This is the tx_ordering MDC subscriber primitive: the executor
+    /// This is the `tx_ordering` MDC subscriber primitive: the executor
     /// passes one MDC control URI per publisher (the sealer and each
     /// sequencer), and the downstream reader sees a single ordered
-    /// `(BPosition, T)` stream, exactly as before. With a single URI it is
-    /// identical to [`Self::open_subscription`].
+    /// `(BPosition, T)` stream, exactly as before. With no `rest` URIs it
+    /// is identical to [`Self::open_subscription`].
+    ///
+    /// Takes `first` plus `rest` instead of one slice, so the empty-URI
+    /// case cannot be constructed and needs no runtime check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add any of the
+    /// underlying subscriptions (see
+    /// [`open_subscription_with_deliver`](Self::open_subscription_with_deliver)).
     pub fn open_subscription_merged<T>(
         &self,
-        uris: &[&str],
+        first: &str,
+        rest: &[&str],
         stream_id: i32,
     ) -> Result<UnboundedReceiver<(BPosition, T)>, LogError>
     where
-        T: rkyv::Archive + Send + 'static,
-        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-            + for<'a> rkyv::bytecheck::CheckBytes<
-                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
-            >,
+        T: crate::codec::WireMessage,
     {
-        if uris.is_empty() {
-            return Err(LogError::Aeron(
-                "open_subscription_merged requires at least one URI".into(),
-            ));
-        }
         let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
-        for uri in uris {
+        for uri in std::iter::once(first).chain(rest.iter().copied()) {
             self.open_subscription_with_deliver(uri, stream_id, typed_deliver(msg_tx.clone()))?;
         }
         Ok(msg_rx)
@@ -328,30 +370,38 @@ impl AeronRuntime {
     /// with [`add_destination`](Self::add_destination). Open the
     /// subscription on a `control-mode=manual` channel to make it
     /// multi-destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the subscription
+    /// (see
+    /// [`open_subscription_with_deliver`](Self::open_subscription_with_deliver)).
     pub fn open_subscription_with_id<T>(
         &self,
         uri: &str,
         stream_id: i32,
     ) -> Result<(u32, UnboundedReceiver<(BPosition, T)>), LogError>
     where
-        T: rkyv::Archive + Send + 'static,
-        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-            + for<'a> rkyv::bytecheck::CheckBytes<
-                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
-            >,
+        T: crate::codec::WireMessage,
     {
         let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
         let sub_id = self.open_subscription_with_deliver(uri, stream_id, typed_deliver(msg_tx))?;
         Ok((sub_id, msg_rx))
     }
 
-    /// Open a tx_data subscription yielding `(TxDataLoc, TxEnvelope)`,
+    /// Open a `tx_data` subscription yielding `(TxDataLoc, TxEnvelope)`,
     /// pairing each envelope with its Aeron publisher `session_id`. The
     /// session id keeps concurrent (active/active) ingress publishers on
     /// one shard distinct. It is what the sequencer stamps into
     /// `TxRef.tx_data_session_id`, and what the executor keys its join
     /// buffer on. With a single publisher, every fragment carries the same
-    /// session id, so behavior is unchanged.
+    /// session id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the subscription
+    /// (see
+    /// [`open_subscription_with_deliver`](Self::open_subscription_with_deliver)).
     pub fn open_tx_data_subscription(
         &self,
         uri: &str,
@@ -381,9 +431,7 @@ impl AeronRuntime {
 /// behavior cannot drift between them.
 fn typed_deliver<T>(msg_tx: tokio::sync::mpsc::UnboundedSender<(BPosition, T)>) -> DeliverFn
 where
-    T: rkyv::Archive + Send + 'static,
-    T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+    T: crate::codec::WireMessage,
 {
     Box::new(move |bytes: &[u8], pos: BPosition, _session: i32| {
         match codec::materialize::<T>(bytes) {
@@ -421,7 +469,7 @@ impl rusteron_client::AeronErrorHandlerCallback for TracingErrorHandler {
     }
 }
 
-fn build_aeron(ctx: rusteron_client::AeronContext) -> Result<Rc<AeronClient>, LogError> {
+fn build_aeron(ctx: &rusteron_client::AeronContext) -> Result<Rc<AeronClient>, LogError> {
     let handler = rusteron_client::Handler::leak(TracingErrorHandler);
     ctx.set_error_handler(Some(&handler))
         .map_err(|e| LogError::Aeron(format!("set_error_handler: {e}")))?;
@@ -429,7 +477,7 @@ fn build_aeron(ctx: rusteron_client::AeronContext) -> Result<Rc<AeronClient>, Lo
     // lifetime. Forgetting the wrapper suppresses its drop-time
     // release()-was-never-called complaint.
     std::mem::forget(handler);
-    let aeron = AeronClient::new(&ctx).map_err(|e| LogError::Aeron(format!("Aeron::new: {e}")))?;
+    let aeron = AeronClient::new(ctx).map_err(|e| LogError::Aeron(format!("Aeron::new: {e}")))?;
     aeron
         .start()
         .map_err(|e| LogError::Aeron(format!("Aeron::start: {e}")))?;
@@ -452,6 +500,11 @@ impl PubHandle {
     /// Blocking publish with `BPosition` ack. Waits [`ACK_TIMEOUT`] for the
     /// Aeron thread's reply. See that constant for why the ack always
     /// resolves first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron offer fails or times out, or if the
+    /// command round trip to the Aeron thread itself times out.
     pub fn publish_bytes(&self, bytes: AlignedVec) -> Result<BPosition, LogError> {
         let pub_id = self.pub_id;
         request(
@@ -470,6 +523,11 @@ impl PubHandle {
     }
 
     /// Encode a typed message and publish blockingly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `msg` fails to encode, or if the publish
+    /// itself fails (see [`publish_bytes`](Self::publish_bytes)).
     pub fn publish<T>(&self, msg: &T) -> Result<BPosition, LogError>
     where
         T: for<'a> rkyv::Serialize<

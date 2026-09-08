@@ -24,8 +24,8 @@ use crate::reader::ReaderConfig;
 /// - `block`: the last durably-committed block (`last_committed_block`).
 ///   The first boundary delivered after resume is `block + 1`. Execution
 ///   resumes against the state snapshot taken after `block`.
-/// - `record_count`: the cumulative count of canonical records (TxRef and
-///   DepositRef) applied through `block`
+/// - `record_count`: the cumulative count of canonical records (`TxRef` and
+///   `DepositRef`) applied through `block`
 ///   (`last_fsynced_b_position.as_index()`). The reader assigns this index
 ///   to the first delivered record, so the boundary alignment check
 ///   (absolute counts) still holds across the restart. `record_count` is
@@ -55,6 +55,7 @@ impl ResumePoint {
 
     /// True when this cursor points mid-chain (a crash-recovery restart)
     /// rather than at genesis.
+    #[must_use]
     pub fn is_resume(&self) -> bool {
         self.block > 0
     }
@@ -118,10 +119,10 @@ pub type BalHandoff = (
     revm::state::bal::Bal,
 );
 
-// The buffered-record and block-output types moved to the `no_std` exec
-// core with the phase-3 stateless driver, since they are its input and
-// output shapes. Re-exported here so every pre-move path still resolves.
-// They still mirror the payload arms of `crate::reader::ReaderToExec`.
+// The buffered-record and block-output shapes live in the `no_std`
+// `kardamom-exec-core` crate, since they are its stateless driver's input
+// and output types. This re-export keeps the path resolving here too.
+// They mirror the payload arms of `crate::reader::ReaderToExec`.
 pub use kardamom_exec_core::stateless::{BlockExecOutput, BufferedRecord};
 
 /// Optional whole-block execution strategy. `None` (the executor) keeps the
@@ -129,13 +130,12 @@ pub use kardamom_exec_core::stateless::{BlockExecOutput, BufferedRecord};
 /// parallel verifier) makes the exec thread buffer a block's records and
 /// execute them together at the boundary. This is what lets batches run
 /// concurrently, seeded from BAL claims.
-/// Parameters: snapshot, parent layer, records, env, block_number. The
+/// Parameters: snapshot, parent layer, records, env, `block_number`. The
 /// parent layer is the actor's merged, not-yet-durable writes. The depth-K
 /// commit pipeline lets execution run up to K blocks ahead of fsync, so the
-/// snapshot alone can be K blocks stale. Ignoring the parent layer executes
-/// against old state. Under load, this caused the validator to skip
-/// transactions (nonce mismatch) that the executor had already executed.
-/// This was a proven divergence, found in the first DeFi gate.
+/// snapshot alone can be K blocks stale. A strategy that ignores the parent
+/// layer executes against stale state: under load, it can skip a
+/// transaction (nonce mismatch) that the executor already executed.
 pub type BlockExec<D> = Box<
     dyn Fn(
             &D,

@@ -20,11 +20,12 @@
 //! pending-registry leak on cancelled RPC futures, fixed by the
 //! Weak-indexed registry).
 
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+use alloy_consensus::{SignableTransaction, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::{Address, Bytes, Signature, TxKind, U256};
+use alloy_primitives::{Address, Bytes, Signature, U256};
 use anyhow::{Context, Result};
 
 use super::{CODE_INTERNAL, CODE_INVALID, Target};
@@ -52,19 +53,23 @@ fn expect_call_error<T: std::fmt::Debug>(out: &RpcOutcome<T>, code: i32, what: &
     }
 }
 
+/// A call that must answer promptly with a specific RPC error code:
+/// [`assert_fast`] then [`expect_call_error`], under the same `what`.
+fn expect_fast_error<T: std::fmt::Debug>(
+    out: &RpcOutcome<T>,
+    code: i32,
+    bound: Duration,
+    what: &str,
+) -> Result<()> {
+    assert_fast(out, bound, what)?;
+    expect_call_error(out, code, what)
+}
+
 /// A structurally valid legacy transaction whose signature cannot recover
 /// (s is far beyond the curve order). This exercises the signature-verify
 /// rejection path, not the RLP decoder.
 fn unrecoverable_tx(chain_id: u64, to: Address) -> Bytes {
-    let tx = TxLegacy {
-        chain_id: Some(chain_id),
-        nonce: 0,
-        gas_price: 1_000_000_000,
-        gas_limit: 21_000,
-        to: TxKind::Call(to),
-        value: U256::from(1u64),
-        input: Bytes::new(),
-    };
+    let tx = l2::legacy_tx(chain_id, 0, 21_000, to, U256::from(1u64));
     let sig = Signature::new(U256::from(1u64), U256::MAX, false);
     let envelope: TxEnvelope = tx.into_signed(sig).into();
     let mut bytes = Vec::with_capacity(110);
@@ -88,8 +93,11 @@ impl Default for Params {
     }
 }
 
+/// # Errors
+/// Returns an error when any endpoint in the module docs' matrix answers
+/// slowly, with the wrong error code, or with the wrong result.
 pub async fn run(t: &Target, p: Params) -> Result<()> {
-    let signers = l2::dev_signers(p.sender.max(p.parked_sender) as u32 + 1)?;
+    let signers = l2::dev_signers_through(p.sender.max(p.parked_sender))?;
     let sender = &signers[p.sender];
     let to = Address::from([0x55u8; 20]);
     let fast = Duration::from_secs(2);
@@ -115,27 +123,28 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         .rpc
         .send_raw(&Bytes::from_static(b"\xde\xad\xbe\xef"))
         .await;
-    assert_fast(&out, fast, "malformed RLP submit")?;
-    expect_call_error(&out, CODE_INVALID, "malformed RLP submit")?;
+    expect_fast_error(&out, CODE_INVALID, fast, "malformed RLP submit")?;
 
     // Unrecoverable signature.
     let out = t.rpc.send_raw(&unrecoverable_tx(t.chain_id, to)).await;
-    assert_fast(&out, fast, "unrecoverable-sig submit")?;
-    expect_call_error(&out, CODE_INVALID, "unrecoverable-sig submit")?;
+    expect_fast_error(&out, CODE_INVALID, fast, "unrecoverable-sig submit")?;
 
     // A different transaction at the landed (sender, nonce 0) slot. This
-    // checks identity-honest semantics. The old contract answered with the
-    // slot's canonical hash: a submit response that carried another
-    // transaction's identity. That let an upstream receipt mix-up silently
-    // poison a client's view of what landed. The contract now gives a
-    // prompt, named nonce-conflict rejection (like "nonce too low"). The
-    // liveness property under test, a bounded and non-hanging answer,
-    // still holds through this error path.
+    // checks identity-honest semantics: the contract gives a prompt, named
+    // nonce-conflict rejection (like "nonce too low"), never the slot's
+    // canonical hash (which would carry another transaction's identity and
+    // silently poison a client's view of what landed). The liveness
+    // property under test, a bounded and non-hanging answer, still holds
+    // through this error path.
     let tx0_alt = l2::sign_transfer(sender, t.chain_id, 0, to, 2)?;
     anyhow::ensure!(tx0_alt.hash != tx0.hash, "alt tx must differ");
     let out = t.rpc.send_raw(&tx0_alt.raw).await;
-    assert_fast(&out, fast, "different-tx-at-landed-slot submit")?;
-    expect_call_error(&out, CODE_INVALID, "different-tx-at-landed-slot submit")?;
+    expect_fast_error(
+        &out,
+        CODE_INVALID,
+        fast,
+        "different-tx-at-landed-slot submit",
+    )?;
 
     // Idempotent raw resubmit.
     let out = t.rpc.send_raw(&tx0.raw).await;
@@ -182,11 +191,14 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
 
     // Deferred read endpoints: clean error, never a hang.
     let out = t.rpc.get_balance(sender.address).await;
-    assert_fast(&out, fast, "eth_getBalance (deferred)")?;
-    expect_call_error(&out, CODE_INTERNAL, "eth_getBalance (deferred)")?;
+    expect_fast_error(&out, CODE_INTERNAL, fast, "eth_getBalance (deferred)")?;
     let out = t.rpc.get_transaction_count(sender.address).await;
-    assert_fast(&out, fast, "eth_getTransactionCount (deferred)")?;
-    expect_call_error(&out, CODE_INTERNAL, "eth_getTransactionCount (deferred)")?;
+    expect_fast_error(
+        &out,
+        CODE_INTERNAL,
+        fast,
+        "eth_getTransactionCount (deferred)",
+    )?;
 
     // The parked submit resolves with the server timeout, which is bounded.
     let out = parked.await.context("parked submit join")?;
@@ -201,21 +213,33 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
 /// promptly, with a transport-level refusal, never an indefinite park.
 /// Run this on a stack with a small `--rpc-max-connections` value (`cap`)
 /// and a short pending-receipt timeout.
+///
+/// # Errors
+/// Returns an error when a parked submit or the over-cap probe fails to
+/// build a client, when the over-cap probe is slow or not a transport
+/// refusal, when a parked submit does not time out with `-32000`, or when
+/// capacity does not recover within 10s of the parked submits timing out.
 pub async fn connection_cap_refusal(
     rpc_url: &str,
     chain_id: u64,
-    cap: usize,
+    cap: NonZeroUsize,
     park: Duration,
     sender_base: usize,
 ) -> Result<()> {
-    let signers = l2::dev_signers((sender_base + cap) as u32 + 1)?;
+    let signers = l2::dev_signers_through(
+        sender_base
+            .checked_add(cap.get())
+            .context("sender_base + cap overflows")?,
+    )?;
     let to = Address::from([0x56u8; 20]);
 
     // Occupy exactly `cap` connections with parked nonce-gap submits. Each
     // client opens one HTTP connection.
     let mut parked = tokio::task::JoinSet::new();
-    for i in 0..cap {
-        let client = L2Client::new(rpc_url, park * 3)?;
+    for i in 0..cap.get() {
+        // `park` is a Target-supplied Duration; `Mul` panics on overflow, so
+        // a patient client timeout saturates instead.
+        let client = L2Client::new(rpc_url, park.saturating_mul(3))?;
         let tx = l2::sign_transfer(&signers[sender_base + i], chain_id, 5, to, 1)?;
         parked.spawn(async move { client.send_raw(&tx.raw).await });
     }
@@ -267,18 +291,29 @@ pub async fn connection_cap_refusal(
 /// server park bound passes. With the Weak-indexed registry, the dropped
 /// handler future kills its entry, and its `Drop` implementation reaps
 /// the slot. This test checks that property end to end.
-pub async fn queue_depth_canary(t: &Target, sender_base: usize, n: usize) -> Result<()> {
-    let signers = l2::dev_signers((sender_base + n) as u32)?;
+///
+/// # Errors
+/// Returns an error when a canary client fails to build, when a canary
+/// submit is not a client-side transport abort, or when the ingress
+/// queue depth does not return to baseline within its budget.
+pub async fn queue_depth_canary(t: &Target, sender_base: usize, n: NonZeroUsize) -> Result<()> {
+    // This is a total signer count already (not a highest index), so it
+    // takes no `+ 1`.
+    let signers = l2::dev_signers_total(
+        sender_base
+            .checked_add(n.get())
+            .context("sender_base + n overflows")?,
+    )?;
     let to = Address::from([0x57u8; 20]);
     let depth_before = t
-        .ingress_metric(super::INGRESS_QUEUE_DEPTH)
-        .await
+        .ingress_metric_opt(super::INGRESS_QUEUE_DEPTH)
+        .await?
         .unwrap_or(0.0);
 
     // These clients give up long before the server's park bound. Each drop
     // abandons its parked submit_raw future on the server.
     let mut aborted = tokio::task::JoinSet::new();
-    for i in 0..n {
+    for i in 0..n.get() {
         let client = L2Client::new(&t.rpc.url, Duration::from_millis(500))?;
         let tx = l2::sign_transfer(&signers[sender_base + i], t.chain_id, 9, to, 1)?;
         aborted.spawn(async move { client.send_raw(&tx.raw).await });
@@ -296,7 +331,10 @@ pub async fn queue_depth_canary(t: &Target, sender_base: usize, n: usize) -> Res
     // be cleaned up.
     poll_until(
         "ingress queue depth back to baseline after client aborts",
-        t.pending_receipt_timeout + Duration::from_secs(10),
+        // `pending_receipt_timeout` is a Target config Duration; `Add`
+        // panics on overflow, so the poll budget saturates instead.
+        t.pending_receipt_timeout
+            .saturating_add(Duration::from_secs(10)),
         Duration::from_millis(500),
         || async {
             let d = t.ingress_metric(super::INGRESS_QUEUE_DEPTH).await?;
@@ -305,8 +343,8 @@ pub async fn queue_depth_canary(t: &Target, sender_base: usize, n: usize) -> Res
     )
     .await
     .context(
-        "#81 leak regression: cancelled RPC futures left (sender, nonce) entries in the \
-         pending registry (fixed in #91 — did the Weak-indexed registry regress?)",
+        "leak regression: a cancelled RPC future left a (sender, nonce) entry in the \
+         pending registry — the Weak-indexed registry should reap it on drop",
     )?;
     Ok(())
 }

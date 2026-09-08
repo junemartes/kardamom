@@ -1,20 +1,23 @@
 //! `kardamom-sequencer`: per-partition sequencer process.
 //!
-//! Parses a TOML [`SequencerConfig`], opens its shard's tx_data subscriber,
-//! the Aeron Cluster (Raft) ref publisher (tx_ordering), and a tx_errors
+//! Parses a TOML [`SequencerConfig`], opens its shard's `tx_data` subscriber,
+//! the Aeron Cluster (Raft) ref publisher (`tx_ordering`), and a `tx_errors`
 //! publisher for rejection signals. Runs the sequencer main loop on a
 //! dedicated blocking thread until SIGTERM or Ctrl-C.
 //!
 //! The lag-detection and receipt-floor feed threads live in [`feeds`].
-//! The aeron_live-handle-to-sequencer-trait adapters live in [`adapters`].
+//! The `aeron_live` handles implement the sequencer's subscriber/publisher
+//! traits directly (`kardamom_sequencer::{inbound, epoch, remote_epoch,
+//! outbound}`), so no local adapter wrappers are needed here.
 
-mod adapters;
 mod feeds;
 
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
     TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
@@ -24,7 +27,7 @@ use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::sequencer::Shutdown;
 
-use adapters::{LiveEpochSub, LiveRemoteEpochSub, LiveTxDataSub, LiveTxErrorPub};
+use feeds::PublishLoops;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -50,7 +53,7 @@ struct Args {
     partition_index: Option<u32>,
     /// Override the partition count (M).
     #[arg(long)]
-    partition_count: Option<u32>,
+    partition_count: Option<NonZeroU32>,
     /// Replica-group shard rotation. The effective partition becomes
     /// `(partition_index + partition_offset) % partition_count`, and
     /// `sequencer_id` follows it, unless explicitly overridden. This lets
@@ -58,17 +61,17 @@ struct Args {
     /// node-derived `--partition-index` while it serves a rotated shard.
     /// So the two replicas of any shard land on different nodes,
     /// deterministically. This is incompatible with an explicit
-    /// `--sequencer-id`: the tx_data subscription and `TxRef.shard_id`
+    /// `--sequencer-id`: the `tx_data` subscription and `TxRef.shard_id`
     /// must both follow the rotated shard.
     ///
     /// Racing replicas are safe by construction. Refs encode
-    /// deterministically from the shared per-shard tx_data stream, and
-    /// the Aeron Cluster dedups records by canonical_id first-seen. This
+    /// deterministically from the shared per-shard `tx_data` stream, and
+    /// the Aeron Cluster dedups records by `canonical_id` first-seen. This
     /// is the same mechanism that already absorbs the M duplicate
-    /// DepositRefs.
+    /// `DepositRefs`.
     #[arg(long, default_value_t = 0)]
     partition_offset: u32,
-    /// Override the sequencer id embedded in every tx_ordering `TxRef`.
+    /// Override the sequencer id embedded in every `tx_ordering` `TxRef`.
     /// If omitted and the TOML did not set it, falls back to
     /// `partition_index as u8`.
     #[arg(long)]
@@ -77,9 +80,9 @@ struct Args {
     #[arg(long)]
     core_id: Option<usize>,
     /// This node's cluster-egress endpoint `ip:port` (cluster mode). Sets
-    /// or overrides the [cluster] egress_channel as
+    /// or overrides the `[cluster] egress_channel` as
     /// `aeron:udp?endpoint=<ip:port>`. The Nomad job injects this per node
-    /// as ${meta.node_ip}:<cluster_egress_port>.
+    /// as `${meta.node_ip}:<cluster_egress_port>`.
     #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
     cluster_egress_endpoint: Option<String>,
     /// Address for the Prometheus /metrics HTTP listener.
@@ -90,18 +93,17 @@ struct Args {
     host_id: String,
     /// The cluster's first-seen dedup window (`[resync] dedup_capacity`).
     /// Must equal the JVM's `-Dkardamom.cluster.dedupCapacity`: the lag
-    /// horizon the resync mechanism protects. See
-    /// docs/agents/sequencer-lag-resync-spec.md.
+    /// horizon the resync mechanism protects.
     #[arg(long, env = "KARDAMOM_CLUSTER_DEDUP_CAPACITY")]
-    cluster_dedup_capacity: Option<u64>,
+    cluster_dedup_capacity: Option<NonZeroU64>,
     /// Watermark-jump enter threshold as a percent of the dedup capacity
     /// (`[resync] enter_percent`).
     #[arg(long, env = "KARDAMOM_RESYNC_ENTER_PERCENT")]
-    resync_enter_percent: Option<u64>,
+    resync_enter_percent: Option<NonZeroU64>,
     /// Boundary-silence resync trigger, ms (`[resync] boundary_silence_ms`).
     #[arg(long, env = "KARDAMOM_RESYNC_BOUNDARY_SILENCE_MS")]
     resync_boundary_silence_ms: Option<u64>,
-    /// Executor replica count for the tx_receipts MDS fan-in (parity with
+    /// Executor replica count for the `tx_receipts` MDS fan-in (parity with
     /// the validator). Falls back to `channels.tx_receipts_executor_count`.
     /// Not relevant when receipts ride multicast (the cluster deploy).
     #[arg(long)]
@@ -117,7 +119,7 @@ fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
         cfg.partition_index = i;
     }
     if let Some(m) = args.partition_count {
-        cfg.partition_count = m;
+        cfg.partition_count = kardamom_sequencer::partition::PartitionCount::new(m);
     }
     if args.partition_offset != 0 {
         // An explicit --sequencer-id combined with rotation would
@@ -133,7 +135,8 @@ fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
              (sequencer_id == partition_index)"
         );
         let raw_index = cfg.partition_index;
-        cfg.rotate_partition(args.partition_offset);
+        cfg.rotate_partition(args.partition_offset)
+            .context("rotate partition")?;
         tracing::info!(
             raw_index,
             offset = args.partition_offset,
@@ -144,7 +147,10 @@ fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
     if let Some(id) = args.sequencer_id {
         cfg.sequencer_id = id;
     } else if cfg.sequencer_id == 0 && cfg.partition_index != 0 {
-        cfg.sequencer_id = cfg.partition_index as u8;
+        // A count above 256 would otherwise truncate silently:
+        // sequencer_id is a u8 on the wire (TxRef.shard_id).
+        cfg.sequencer_id = u8::try_from(cfg.partition_index)
+            .context("partition_index does not fit in sequencer_id (u8)")?;
     }
     if let Some(c) = args.core_id {
         cfg.core_id = Some(c);
@@ -168,6 +174,166 @@ fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
     Ok(())
 }
 
+/// The Aeron subscriptions and publisher this sequencer needs, all opened
+/// on the same runtime `rt`.
+struct Handles {
+    data_sub: TxDataSubscriberHandle,
+    deposits_sub: TxDepositsSubscriberHandle,
+    remote_epochs_sub: TxRemoteEpochsSubscriberHandle,
+    errors_pub: TxErrorsPublisherHandle,
+}
+
+impl Handles {
+    /// Open every handle this sequencer needs, for `shard_id`.
+    fn open(rt: &AeronRuntime, channels: &ChannelsConfig, shard_id: u8) -> Result<Self> {
+        Ok(Self {
+            data_sub: TxDataSubscriberHandle::open(rt, channels, shard_id)
+                .context("open TxDataSubscriberHandle")?,
+            deposits_sub: TxDepositsSubscriberHandle::open(rt, channels)
+                .context("open TxDepositsSubscriberHandle")?,
+            remote_epochs_sub: TxRemoteEpochsSubscriberHandle::open(rt, channels)
+                .context("open TxRemoteEpochsSubscriberHandle")?,
+            errors_pub: TxErrorsPublisherHandle::open(rt, channels)
+                .context("open TxErrorsPublisherHandle")?,
+        })
+    }
+}
+
+/// Lag detection and receipt-floor resync: the egress-watermark task, the
+/// receipts-floor task, and the `ResyncController` handed to the publish
+/// loops. Split from the controller into its own field, so the caller
+/// can move `controller` into the publish loops and still join the two
+/// feed tasks afterward through `feeds`.
+struct ResyncWiring {
+    controller: kardamom_sequencer::resync::ResyncController,
+    feeds: ResyncFeeds,
+}
+
+/// The egress-watermark and receipts-floor tasks, plus the `tx_data`
+/// runtime.
+struct ResyncFeeds {
+    watermark_task: tokio::task::JoinHandle<()>,
+    receipts_task: tokio::task::JoinHandle<()>,
+    #[allow(
+        dead_code,
+        reason = "held only so main_rt (the tx_data runtime) drops after the two feed tasks above are joined (see ResyncFeeds::join), and before the caller's receipts_rt goes out of scope — matching the resource teardown order the two runtimes' isolation comments assume; never read, its value is its Drop impl"
+    )]
+    main_rt: AeronRuntime,
+}
+
+impl ResyncFeeds {
+    /// Await both feed tasks, then let `main_rt` drop.
+    async fn join(self) {
+        if let Err(e) = self.watermark_task.await {
+            tracing::warn!(?e, "egress-watermark task panicked");
+        }
+        if let Err(e) = self.receipts_task.await {
+            tracing::warn!(?e, "receipts-floors task panicked");
+        }
+    }
+}
+
+impl ResyncWiring {
+    fn spawn(
+        cfg: &SequencerConfig,
+        main_rt: AeronRuntime,
+        cluster_egress: kardamom_cluster_adapter::LiveEgress,
+        receipts_rt: &AeronRuntime,
+        channels: &ChannelsConfig,
+        executor_count: Option<u32>,
+        shutdown: &Shutdown,
+    ) -> Result<Self> {
+        // Three feeds go into the publish loop's ResyncController:
+        //  1. The egress-watermark thread. The cluster broadcasts every
+        //     boundary to this publisher session. Decode `end_tx_idx` (the
+        //     global canonical count) into the shared watermark, and discard
+        //     the records.
+        //  2. The receipts thread: tx_receipts to per-sender executed-truth
+        //     floors (only this shard's senders).
+        //  3. The controller itself, handed to the Sequencer through
+        //     enable_resync.
+        let kardamom_sequencer::resync::ResyncChannel {
+            controller,
+            floor_tx,
+            reject_tx,
+            watermark,
+        } = kardamom_sequencer::resync::ResyncChannel::open(
+            cfg.resync.clone(),
+            cfg.partition_index,
+        )
+        .context("build resync channel")?;
+
+        let watermark_task = feeds::EgressWatermarkFeed::new(
+            cfg.resync.boundary_silence_ms,
+            cfg.partition_index,
+            watermark,
+            reject_tx,
+        )
+        .spawn(cluster_egress, shutdown.clone());
+
+        // Note: in MDS mode, each attached destination binds its UDP
+        // socket, so two sequencer replicas on one host would collide. MDS
+        // receipts with co-located replicas needs per-group endpoint bases
+        // before this can be enabled here. The cluster deploy rides the
+        // shared multicast channel instead.
+        let receipts_sub = TxReceiptsSubscriberHandle::open_auto(
+            receipts_rt,
+            channels,
+            executor_count.unwrap_or(channels.tx_receipts_executor_count),
+        )
+        .context("open tx_receipts")?;
+        let receipts_task =
+            feeds::ReceiptFloorFeed::new(cfg.partition_count, cfg.partition_index, floor_tx)
+                .spawn(receipts_sub, shutdown.clone());
+
+        Ok(Self {
+            controller,
+            feeds: ResyncFeeds {
+                watermark_task,
+                receipts_task,
+                main_rt,
+            },
+        })
+    }
+}
+
+/// The three publish-loop handles, plus the cluster session guard they
+/// depend on.
+struct SpawnedLoops {
+    #[allow(
+        dead_code,
+        reason = "never read; kept alive until join_all returns for its Drop impl (see SpawnedLoops::join_all)"
+    )]
+    cluster_guard: LiveCluster,
+    main: feeds::LoopHandle,
+    deposits: feeds::LoopHandle,
+    remote_epochs: feeds::LoopHandle,
+}
+
+impl SpawnedLoops {
+    /// Await one handle and log its outcome. `label` names the loop in
+    /// the "returned cleanly" / "returned an error" lines, `panic_label`
+    /// names it in the "panicked" line.
+    async fn join_one(handle: feeds::LoopHandle, label: &str, panic_label: &str) {
+        match handle.await {
+            Ok(Ok(())) => tracing::info!("sequencer {label} returned cleanly"),
+            Ok(Err(e)) => tracing::error!(error = %e, "sequencer {label} returned an error"),
+            Err(e) => tracing::error!(error = %e, "sequencer {panic_label} panicked"),
+        }
+    }
+
+    /// Await every publish loop, in order, then let `cluster_guard` fall
+    /// out of scope. This also closes the egress channel, which unblocks
+    /// the watermark feed. The feed also checks the shutdown token on
+    /// each tick. The receipts task exits on the token, or on the closed
+    /// floor channel after the main loop ends.
+    async fn join_all(self) {
+        Self::join_one(self.main, "main loop", "task").await;
+        Self::join_one(self.deposits, "epoch pump", "epoch task").await;
+        Self::join_one(self.remote_epochs, "remote-epoch pump", "remote-epoch task").await;
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
@@ -181,8 +347,8 @@ async fn main() -> anyhow::Result<()> {
     // JVM's -Dkardamom.cluster.dedupCapacity (see cluster.nomad.hcl).
     kardamom_sequencer::metrics::record_start_time();
     tracing::info!(
-        dedup_capacity = cfg.resync.dedup_capacity,
-        enter_percent = cfg.resync.enter_percent,
+        dedup_capacity = cfg.resync.dedup_capacity.get(),
+        enter_percent = cfg.resync.enter_percent.get(),
         boundary_silence_ms = cfg.resync.boundary_silence_ms,
         "resync contract: dedup_capacity must equal the cluster's -Dkardamom.cluster.dedupCapacity"
     );
@@ -199,19 +365,9 @@ async fn main() -> anyhow::Result<()> {
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
 
     let shard_id = cfg.sequencer_id;
-    let tx_data_sub = TxDataSubscriberHandle::open(&rt, &channels, shard_id)
-        .context("open TxDataSubscriberHandle")?;
-    let tx_deposits_sub = TxDepositsSubscriberHandle::open(&rt, &channels)
-        .context("open TxDepositsSubscriberHandle")?;
-    let tx_remote_epochs_sub = TxRemoteEpochsSubscriberHandle::open(&rt, &channels)
-        .context("open TxRemoteEpochsSubscriberHandle")?;
-    let tx_errors_pub =
-        TxErrorsPublisherHandle::open(&rt, &channels).context("open TxErrorsPublisherHandle")?;
+    let handles = Handles::open(&rt, &channels, shard_id)?;
 
     let shutdown = Shutdown::new();
-    let shutdown_for_main = shutdown.clone();
-    let shutdown_for_deposits = shutdown.clone();
-    let shutdown_for_remote_epochs = shutdown.clone();
 
     tracing::info!(
         "nonce floors: sequencer holds no state-DB reader; cold senders seed at \
@@ -220,12 +376,11 @@ async fn main() -> anyhow::Result<()> {
          coverage of established senders until resync floors catch up (F02.1 \
          re-opened)"
     );
-    let cfg_clone = cfg.clone();
 
     // tx_ordering always publishes to the Aeron Cluster (Raft) ingress. The
     // cluster-session guard (`LiveCluster`) and its dedicated Aeron runtime
     // must outlive both publish loops. So bind the guard in the outer
-    // scope; it is dropped only after the `join_*` awaits below.
+    // scope; it is dropped only after the publish loops are joined.
     //
     // This is a dedicated cluster runtime (its own Aeron thread, same
     // aeron dir), so the cluster session never contends with the tx_data
@@ -240,28 +395,6 @@ async fn main() -> anyhow::Result<()> {
         .context("connect cluster ref publisher")?;
     tracing::info!("kardamom-sequencer: tx_ordering via Aeron Cluster");
 
-    // Lag detection and receipt-floor resync (see the sequencer-lag-resync
-    // spec). Three feeds go into the publish loop's ResyncController:
-    //  1. The egress-watermark thread. The cluster broadcasts every
-    //     boundary to this publisher session. Decode `end_tx_idx` (the
-    //     global canonical count) into the shared watermark, and discard
-    //     the records.
-    //  2. The receipts thread: tx_receipts to per-sender executed-truth
-    //     floors (only this shard's senders).
-    //  3. The controller itself, handed to the Sequencer through
-    //     enable_resync.
-    let (resync_controller, floor_tx, reject_tx, watermark) =
-        kardamom_sequencer::resync::resync_channel(cfg.resync.clone(), cfg.partition_index);
-
-    let watermark_task = feeds::spawn_egress_watermark_feed(
-        cluster_egress,
-        cfg.resync.boundary_silence_ms,
-        cfg.partition_index,
-        watermark,
-        reject_tx,
-        shutdown.clone(),
-    );
-
     // A dedicated receipts runtime. Receipt decode runs at full line
     // rate, and the main `rt`'s polling thread must stay dedicated to the
     // tx_data subscription (the same isolation reason as `cluster_rt`
@@ -269,77 +402,49 @@ async fn main() -> anyhow::Result<()> {
     // sustainable ingest rate.
     let receipts_rt =
         AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
-    // Note: in MDS mode, each attached destination binds its UDP
-    // socket, so two sequencer replicas on one host would collide. MDS
-    // receipts with co-located replicas needs per-group endpoint bases
-    // before this can be enabled here. The cluster deploy rides the
-    // shared multicast channel instead.
-    let receipts_sub = TxReceiptsSubscriberHandle::open_auto(
+    let resync = ResyncWiring::spawn(
+        &cfg,
+        rt,
+        cluster_egress,
         &receipts_rt,
         &channels,
-        args.executor_count
-            .unwrap_or(channels.tx_receipts_executor_count),
-    )
-    .context("open tx_receipts")?;
-    let receipts_task = feeds::spawn_receipt_floor_feed(
-        receipts_sub,
-        shutdown.clone(),
-        cfg.partition_count,
-        cfg.partition_index,
-        floor_tx,
-    );
+        args.executor_count,
+        &shutdown,
+    )?;
 
     // Cloning shares the single session thread, and offers serialize
     // through it. All three loops use `cluster_pub` (it implements
     // `TxOrderingRefPublisher`): the canonical `TxRef` loop and the two
     // origin pumps.
-    let (join_main, join_deposits, join_remote_epochs) = feeds::spawn_publish_loops(
-        cfg_clone,
-        LiveTxDataSub::new(tx_data_sub),
-        cluster_pub.clone(),
-        cluster_pub.clone(),
-        cluster_pub,
-        LiveTxErrorPub::new(tx_errors_pub),
-        LiveEpochSub::new(tx_deposits_sub),
-        LiveRemoteEpochSub::new(tx_remote_epochs_sub),
-        Some(resync_controller),
-        shutdown_for_main,
-        shutdown_for_deposits,
-        shutdown_for_remote_epochs,
-    );
+    let (join_main, join_deposits, join_remote_epochs) = PublishLoops {
+        cfg: cfg.clone(),
+        tx_data: handles.data_sub,
+        main_pub: cluster_pub.clone(),
+        epoch_pub: cluster_pub.clone(),
+        remote_epoch_pub: cluster_pub,
+        tx_errors: handles.errors_pub,
+        epochs: handles.deposits_sub,
+        remote_epochs: handles.remote_epochs_sub,
+        resync: Some(resync.controller),
+        shutdown: shutdown.clone(),
+    }
+    .spawn();
+    let loops = SpawnedLoops {
+        cluster_guard,
+        main: join_main,
+        deposits: join_deposits,
+        remote_epochs: join_remote_epochs,
+    };
 
     wait_for_shutdown().await;
     tracing::info!("kardamom-sequencer: shutdown signal received");
     shutdown.signal();
-    match join_main.await {
-        Ok(Ok(())) => tracing::info!("sequencer main loop returned cleanly"),
-        Ok(Err(e)) => tracing::error!(error = %e, "sequencer main loop returned an error"),
-        Err(e) => tracing::error!(error = %e, "sequencer task panicked"),
-    }
-    match join_deposits.await {
-        Ok(Ok(())) => tracing::info!("sequencer epoch pump returned cleanly"),
-        Ok(Err(e)) => tracing::error!(error = %e, "sequencer epoch pump returned an error"),
-        Err(e) => tracing::error!(error = %e, "sequencer epoch task panicked"),
-    }
-    match join_remote_epochs.await {
-        Ok(Ok(())) => tracing::info!("sequencer remote-epoch pump returned cleanly"),
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "sequencer remote-epoch pump returned an error")
-        }
-        Err(e) => tracing::error!(error = %e, "sequencer remote-epoch task panicked"),
-    }
-    // Drop the cluster session only after every loop has stopped. This
-    // also closes the egress channel, which unblocks the watermark feed.
-    // The feed also checks the shutdown token on each tick. The receipts
-    // task exits on the token, or on the closed floor channel after the
-    // main loop ends.
-    drop(cluster_guard);
-    if let Err(e) = watermark_task.await {
-        tracing::warn!(?e, "egress-watermark task panicked");
-    }
-    if let Err(e) = receipts_task.await {
-        tracing::warn!(?e, "receipts-floors task panicked");
-    }
-    drop(rt);
+    // The cluster session (`cluster_guard`) stays alive until every
+    // publish loop has stopped; `join_all` drops it as soon as it
+    // returns. `resync.feeds.join()` then awaits the two resync feed
+    // tasks and, when it returns, drops `rt` — before `receipts_rt`,
+    // still a local here, drops at the end of `main`.
+    loops.join_all().await;
+    resync.feeds.join().await;
     Ok(())
 }

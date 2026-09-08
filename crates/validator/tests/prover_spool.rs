@@ -5,63 +5,27 @@
 //! trie-aware writer then commits for the same block.
 //!
 //! This drives `spool_block`, the per-block body of the async spool
-//! task, against a production `StateWriter` (TrieMode::Incremental) and
+//! task, against a production `StateWriter` (`TrieMode::Incremental`) and
 //! the MVCC `StateSnapshot` pin: the live wiring, minus the tokio loop.
-
+//!
 use std::time::{Duration, Instant};
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, B256, TxKind, U256, address, keccak256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_engine::actor::BufferedRecord;
 use kardamom_engine::exec_types::TxIndex;
+use kardamom_engine::stateless::AnchoredBlockOutput;
 use kardamom_engine::{ExecEnv, error::ExecutorError};
-use kardamom_state::writer::{StateWriter, WriteBatch};
-use kardamom_state::{Durability, StateEnvBuilder, TrieMode};
+use kardamom_state::writer::{StateWriter, WriteBatch, WriterHandle};
+use kardamom_state::{Durability, StateEnvBuilder, StateSnapshot, TrieMode};
 use kardamom_types::{
     AccountChange, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CodeEntry,
-    ProverInput, StorageChange, TxEnvelope,
+    ProverInput, PublicOutputs, StorageChange,
 };
-use kardamom_validator::prover::spool_block;
+use kardamom_validator::prover::{PinnedPreState, spool_block};
 
-const CHAIN_ID: u64 = 412346;
-const RECIPIENT: Address = address!("000000000000000000000000000000000000dEaD");
-const ZEROER: Address = address!("00000000000000000000000000000000000000Aa");
-const ZEROER_CODE: [u8; 6] = [0x60, 0x00, 0x60, 0x00, 0x55, 0x00];
-const S0: B256 = B256::with_last_byte(0);
-const S1: B256 = B256::with_last_byte(1);
-
-fn tx(signer: &PrivateKeySigner, to: Address, nonce: u64, value: u64, i: u64) -> BufferedRecord {
-    let mut inner = TxLegacy {
-        chain_id: Some(CHAIN_ID),
-        nonce,
-        gas_price: 0,
-        gas_limit: 300_000,
-        to: TxKind::Call(to),
-        value: U256::from(value),
-        input: Default::default(),
-    };
-    let sig = signer.sign_transaction_sync(&mut inner).unwrap();
-    let env: alloy_consensus::TxEnvelope = inner.into_signed(sig).into();
-    let mut raw = Vec::new();
-    env.encode_2718(&mut raw);
-    let tx_hash = keccak256(&raw);
-    BufferedRecord::Tx {
-        tx_idx: TxIndex(i),
-        position: BPosition {
-            term_id: 0,
-            term_offset: (i * 64) as i32,
-        },
-        envelope: TxEnvelope {
-            correlation_id: i,
-            raw_tx: raw.into(),
-            sender: signer.address(),
-            tx_hash,
-        },
-    }
-}
+mod common;
+use common::{CHAIN_ID, RECIPIENT, S0, S1, ZEROER, ZEROER_CODE, tx};
 
 fn boundary(block_number: u64, ts: u64) -> BlockBoundary {
     BlockBoundary {
@@ -72,25 +36,38 @@ fn boundary(block_number: u64, ts: u64) -> BlockBoundary {
     }
 }
 
-#[test]
-fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
-    let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x77)).unwrap();
-    let sender = signer.address();
-    let zeroer_hash = keccak256(ZEROER_CODE);
+/// Wait (up to 10s) for the writer's committed snapshot to reach `block`,
+/// and return it. Used for both the pre-state pin and the post-commit
+/// root check, so one poll loop serves every wait in this test.
+fn wait_for_snapshot(writer: &WriterHandle, block: u64) -> StateSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(s) = writer.snapshot_rx.current()
+            && s.block_number() == block
+        {
+            return s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "writer never committed block {block}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
-    // When KARDAMOM_EMIT_BATCH_SPOOL=dir is set, the spool lands there
-    // (blocks 2 and 3, a real contiguous batch) for the zk-host batch
-    // round trip.
-    let export = std::env::var("KARDAMOM_EMIT_BATCH_SPOOL").ok();
+/// Set up a production `StateWriter` and commit the seed block (block 1)
+/// through it: accounts, code, storage, trie, and meta all land as live
+/// commits do. Returns the writer, the spool dir, and the committed
+/// snapshot at block 1 (the spool's pre-state pin for block 2).
+fn setup_seeded_writer(sender: Address) -> (tempfile::TempDir, WriterHandle, StateSnapshot) {
+    let zeroer_hash = keccak256(ZEROER_CODE);
     let dir = tempfile::tempdir().unwrap();
     let env = StateEnvBuilder::new(dir.path().join("state"))
         .durability(Durability::SafeNoSync)
         .open()
         .unwrap();
-    let mut writer = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
+    let writer = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
 
-    // --- Block 1: the seed, through the production writer (accounts,
-    // code, storage, trie, and meta all land as live commits do).
     let seed = BlockDelta {
         block_number: 1,
         accounts: vec![
@@ -130,24 +107,23 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
         .send(WriteBatch::new(boundary(1, 1_700_000_000), seed))
         .unwrap();
 
-    // Wait for the committed snapshot at block 1: the spool's pre-state pin.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let snap = loop {
-        if let Some(s) = writer.snapshot_rx.current()
-            && s.block_number() == 1
-        {
-            break s;
-        }
-        assert!(Instant::now() < deadline, "writer never committed block 1");
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let snap1 = wait_for_snapshot(&writer, 1);
+    (dir, writer, snap1)
+}
 
-    // --- Block 2: transfer to a fresh account and zero a slot (a
-    // storage deletion collapse, the anchoring shape that needs the
-    // fixed point).
+/// Spool block 2 (a transfer to a fresh account, and a storage-deletion
+/// collapse — the anchoring shape that needs the fixed point) against
+/// `snap1`, then re-verify the spooled frame one-shot in the guest
+/// shape. Returns the spooled outputs and the guest's anchored
+/// re-execution, whose delta the caller commits to the live writer next.
+fn spool_and_guest_reverify(
+    spool: &std::path::Path,
+    signer: &PrivateKeySigner,
+    snap1: &StateSnapshot,
+) -> (PublicOutputs, AnchoredBlockOutput) {
     let records = vec![
-        tx(&signer, RECIPIENT, 0, 250_000, 0),
-        tx(&signer, ZEROER, 1, 0, 1),
+        tx(signer, RECIPIENT, 0, 250_000, 0),
+        tx(signer, ZEROER, 1, 0, 1),
     ];
     let env2 = ExecEnv::new(
         CHAIN_ID,
@@ -158,12 +134,10 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
             l1_origin: 0,
         },
     );
-    let spool = export
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| dir.path().join("spool"));
-    let outputs = spool_block(&spool, CHAIN_ID, &snap, 2, env2, &records).expect("spool block 2");
+    let pinned2 = PinnedPreState::new(snap1.clone(), 2).expect("snap1 pinned at block 1");
+    let outputs = spool_block(spool, CHAIN_ID, &pinned2, env2, &records).expect("spool block 2");
 
-    // (a) The spooled frame re-verifies one-shot in the guest shape.
+    // The spooled frame re-verifies one-shot in the guest shape.
     let bytes = std::fs::read(spool.join("block-2/prover-input.rkyv")).unwrap();
     let expected = std::fs::read(spool.join("block-2/expected-outputs.bin")).unwrap();
     assert_eq!(expected, outputs.encode());
@@ -211,73 +185,38 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
     assert_eq!(anchored.post_state_root, outputs.post_state_root);
     assert_eq!(anchored.bal_commitment, outputs.bal_commitment);
 
-    // (b) The live writer commits block 2 and lands on the spooled post
-    // root: the proof queue and the chain agree before any proving happens.
-    let mut delta2 = BlockDelta {
-        block_number: 2,
-        accounts: anchored
-            .out
-            .delta
-            .accounts
-            .iter()
-            .map(|(address, (nonce, balance, code_hash))| AccountChange {
-                address: *address,
-                nonce: *nonce,
-                balance: *balance,
-                code_hash: *code_hash,
-            })
-            .collect(),
-        storage: anchored
-            .out
-            .delta
-            .storage
-            .iter()
-            .map(|((address, key), value)| StorageChange {
-                address: *address,
-                key: *key,
-                value: *value,
-            })
-            .collect(),
-        code: Vec::new(),
-        receipts: Vec::new(),
-    };
-    delta2.accounts.sort_by_key(|a| a.address);
-    delta2.storage.sort_by_key(|s| (s.address, s.key));
+    (outputs, anchored)
+}
+
+/// Commit `anchored`'s delta to the live writer as block 2, wait for it
+/// to land, and return the committed trie root: the proof queue and the
+/// chain must agree before any proving happens.
+fn commit_block_2_and_wait_root(writer: &mut WriterHandle, anchored: &AnchoredBlockOutput) -> B256 {
+    // `finalize` sorts accounts and storage (and would emit `code`, but
+    // this block's records are all `Call`s to an already-deployed
+    // contract, so `anchored.out.delta.code` is empty here — not a
+    // deliberate omission, just this test's actual data). Receipts are
+    // not needed for the trie-commit step, so `Vec::new()`.
+    let delta2 = anchored.out.delta.clone().finalize(2, Vec::new());
     writer
         .delta_tx
         .send(WriteBatch::new(boundary(2, 1_700_000_002), delta2))
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let live_root = loop {
-        if let Some(s) = writer.snapshot_rx.current()
-            && s.block_number() == 2
-        {
-            break s.state_root().unwrap().expect("trie root at block 2");
-        }
-        assert!(Instant::now() < deadline, "writer never committed block 2");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert_eq!(
-        live_root, outputs.post_state_root,
-        "spooled post root must equal the live writer's root"
-    );
+    wait_for_snapshot(writer, 2)
+        .state_root()
+        .unwrap()
+        .expect("trie root at block 2")
+}
 
-    // --- Block 3: one more transfer, spooled against the pinned
-    // snapshot at block 2, the second half of a real contiguous batch.
-    // The batch guest requires the root chain to link 2 to 3.
-    let snap2 = {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(s) = writer.snapshot_rx.current()
-                && s.block_number() == 2
-            {
-                break s;
-            }
-            assert!(Instant::now() < deadline, "no snapshot at block 2");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    };
-    let records3 = vec![tx(&signer, RECIPIENT, 2, 111, 0)];
+/// Spool block 3 (one more transfer) against the pinned snapshot at
+/// block 2, the second half of a real contiguous batch. The batch guest
+/// requires the root chain to link 2 to 3.
+fn spool_block_3(
+    spool: &std::path::Path,
+    signer: &PrivateKeySigner,
+    snap2: StateSnapshot,
+) -> PublicOutputs {
+    let records3 = vec![tx(signer, RECIPIENT, 2, 111, 0)];
     let env3 = ExecEnv::new(
         CHAIN_ID,
         &BlockBoundaryStart {
@@ -287,25 +226,43 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
             l1_origin: 0,
         },
     );
-    let outputs3 =
-        spool_block(&spool, CHAIN_ID, &snap2, 3, env3, &records3).expect("spool block 3");
+    let pinned3 = PinnedPreState::new(snap2, 3).expect("snap2 pinned at block 2");
+    spool_block(spool, CHAIN_ID, &pinned3, env3, &records3).expect("spool block 3")
+}
+
+#[test]
+fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
+    let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x77)).unwrap();
+
+    // When KARDAMOM_EMIT_BATCH_SPOOL=dir is set, the spool lands there
+    // (blocks 2 and 3, a real contiguous batch) for the zk-host batch
+    // round trip.
+    let export = std::env::var("KARDAMOM_EMIT_BATCH_SPOOL").ok();
+    let (dir, mut writer, snap1) = setup_seeded_writer(signer.address());
+    let spool = export.map_or_else(|| dir.path().join("spool"), std::path::PathBuf::from);
+
+    let (outputs, anchored) = spool_and_guest_reverify(&spool, &signer, &snap1);
+
+    let live_root = commit_block_2_and_wait_root(&mut writer, &anchored);
+    assert_eq!(
+        live_root, outputs.post_state_root,
+        "spooled post root must equal the live writer's root"
+    );
+
+    let snap2 = wait_for_snapshot(&writer, 2);
+    let outputs3 = spool_block_3(&spool, &signer, snap2);
     assert_eq!(
         outputs3.pre_state_root, outputs.post_state_root,
         "the spooled chain must link 2 -> 3"
     );
 
-    // A spool against the wrong pre-state snapshot must be rejected.
-    let stale = spool_block(
-        &spool, CHAIN_ID, &snap, // Still pinned at block 1.
-        3,     // But claims to be block 3 (pre-state 2).
-        env2, &records,
-    );
+    // A pin against the wrong pre-state snapshot must be rejected:
+    // `snap1` is still pinned at block 1, but this claims block 3
+    // (pre-state 2).
+    let stale = PinnedPreState::new(snap1, 3);
     assert!(
-        matches!(
-            stale,
-            Err(ExecutorError::WitnessUnanchored(_)) | Err(ExecutorError::State(_))
-        ),
-        "wrong-window spool must fail closed: {stale:?}"
+        matches!(stale, Err(ExecutorError::WitnessUnanchored(_))),
+        "wrong-window pin must fail closed: {stale:?}"
     );
 
     writer.shutdown().unwrap();

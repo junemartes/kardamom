@@ -13,41 +13,36 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use super::proc::{Proc, free_udp_port, wait_for_file};
+use super::proc::{ExistingFile, Proc, free_udp_port, resolve_artifact, wait_for_file};
 
 /// Find the aeron-all jar. Use `KARDAMOM_AERON_ALL_JAR` if set, else the
 /// `just aeron-driver-up` cache path.
-pub fn aeron_all_jar() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("KARDAMOM_AERON_ALL_JAR") {
-        let p = PathBuf::from(p);
-        anyhow::ensure!(
-            p.is_file(),
-            "KARDAMOM_AERON_ALL_JAR={} not found",
-            p.display()
-        );
-        return Ok(p);
-    }
-    let cached = PathBuf::from("/tmp/kardamom-aeron-local/aeron-all-1.45.0.jar");
-    anyhow::ensure!(
-        cached.is_file(),
-        "aeron-all jar not found at {} — run `just aeron-driver-up` once (it downloads the \
-         jar) or set KARDAMOM_AERON_ALL_JAR",
-        cached.display()
-    );
-    Ok(cached)
+///
+/// # Errors
+/// Returns an error when neither location holds a file.
+fn aeron_all_jar() -> Result<ExistingFile> {
+    resolve_artifact(
+        "KARDAMOM_AERON_ALL_JAR",
+        PathBuf::from("/tmp/kardamom-aeron-local/aeron-all-1.45.0.jar"),
+        "run `just aeron-driver-up` once (it downloads the jar) or set KARDAMOM_AERON_ALL_JAR",
+    )
 }
 
 pub struct MediaDriver {
     pub proc: Proc,
     pub aeron_dir: PathBuf,
-    pub archive_dir: PathBuf,
+    pub(crate) archive_dir: PathBuf,
     /// The archive's UDP control endpoint. Refetch clients, such as the
     /// executor's join-miss recovery, address the archive at this
     /// endpoint.
-    pub archive_control_endpoint: String,
+    pub(crate) archive_control_endpoint: String,
 }
 
 impl MediaDriver {
+    /// # Errors
+    /// Returns an error when the aeron-all jar is missing, when the temp
+    /// directories cannot be created, when the driver process fails to
+    /// spawn, or when its readiness files do not appear within 30s.
     pub fn launch(root: &Path) -> Result<Self> {
         let jar = aeron_all_jar()?;
         let aeron_dir = root.join("md-aeron");
@@ -89,7 +84,7 @@ impl MediaDriver {
         ))
         .args([
             "-cp",
-            &jar.display().to_string(),
+            &jar.to_string(),
             "io.aeron.archive.ArchivingMediaDriver",
         ]);
 

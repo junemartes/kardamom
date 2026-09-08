@@ -1,8 +1,8 @@
 //! `BatchAccumulator` groups transactions into per-block batches at
 //! `BlockBoundaryStart` markers.
 //!
-//! The sealer emits boundaries onto B. Today, the
-//! batcher reads only tx_ordering. It never queries the live sequencer.
+//! The sealer emits boundaries onto B. The batcher reads only `tx_ordering`.
+//! It never queries the live sequencer.
 //!
 //! The accumulator is stream-oriented. It reads one ordered sequence of
 //! records, with transactions, remote-epoch records, and boundary markers
@@ -42,6 +42,7 @@ pub struct BatchAccumulator {
 }
 
 impl BatchAccumulator {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -62,7 +63,7 @@ impl BatchAccumulator {
 
     /// Observe a boundary. Closes the current block and returns it. The next
     /// calls to `observe_tx` add to the next block.
-    pub fn observe_boundary(&mut self, b: BlockBoundaryStart) -> ClosedBlock {
+    pub fn observe_boundary(&mut self, b: &BlockBoundaryStart) -> ClosedBlock {
         let txs = std::mem::take(&mut self.pending);
         let remote_epochs = std::mem::take(&mut self.pending_remote_epochs);
         ClosedBlock {
@@ -75,6 +76,7 @@ impl BatchAccumulator {
     }
 
     /// Number of buffered txs not yet attributed to a block.
+    #[must_use]
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }

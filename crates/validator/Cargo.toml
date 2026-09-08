@@ -23,6 +23,12 @@ rkyv.workspace = true
 alloy-eip7928.workspace = true
 alloy-rlp.workspace = true
 kardamom-engine = { workspace = true }
+# Named directly so the startup builder can hold the cluster session guard
+# as a concrete field instead of a generic parameter (see `wiring::Startup`).
+kardamom-cluster-adapter = { path = "../cluster-adapter" }
+# `reqwest::Url` is the type `alloy_provider::connect_http` requires. Named
+# directly so the attester config holds a parsed URL, not a raw string.
+reqwest = { workspace = true }
 # The shared persistent worker pool (scheduler unification B1): BAL-seeded
 # batches dispatch onto it instead of spawning one OS thread per batch.
 kardamom-stm = { path = "../stm" }
@@ -30,7 +36,7 @@ kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
 kardamom-state = { path = "../state" }
 kardamom-obs = { path = "../obs" }
-alloy-primitives.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-provider.workspace = true
 alloy-network.workspace = true
 alloy-contract.workspace = true
@@ -65,5 +71,9 @@ alloy-sol-types.workspace = true
 alloy-node-bindings.workspace = true
 alloy-signer-local.workspace = true
 kardamom-deployer = { path = "../deployer" }
+# `MockStateDatabaseBuilder` is not re-exported through
+# `kardamom_engine::state` (only the built `MockStateDatabase` is); the
+# shared test fixtures need to name the builder type directly.
+kardamom-exec-core = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

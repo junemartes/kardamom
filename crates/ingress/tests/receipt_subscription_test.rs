@@ -8,58 +8,38 @@
 //! acks with the tx hash before any receipt exists, and receipts stream,
 //! deduped and filterable, over one WebSocket subscription.
 
-mod common;
-
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
 use jsonrpsee::core::client::{ClientT, Subscription, SubscriptionClientT};
-use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::rpc_params;
 use jsonrpsee::ws_client::WsClientBuilder;
 use serde_json::Value;
 
-use kardamom_ingress::channels::MockChannels;
 use kardamom_ingress::config::IngressConfig;
-use kardamom_ingress::json_rpc::start_jsonrpc_server;
-use kardamom_ingress::proxy::IngressProxy;
-use kardamom_types::{BPosition, Receipt};
+use kardamom_ingress::test_support::{
+    SignedTx, TestServer, http_client, receipt, sign_legacy_tx, start_test_server,
+};
 
 use alloy_signer_local::PrivateKeySigner;
 
-const SHARDS: usize = 8;
-
-async fn start_stack() -> (
-    MockChannels,
-    Vec<tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>>,
-    SocketAddr,
-    jsonrpsee::server::ServerHandle,
-) {
-    let cfg = IngressConfig {
+/// `IngressConfig::default()` with `chain_id: 1`, the config every test
+/// in this file starts from.
+fn chain_one() -> IngressConfig {
+    IngressConfig {
         chain_id: 1,
         ..IngressConfig::default()
-    };
-    let (mock, rx) = MockChannels::new(SHARDS);
-    let proxy = IngressProxy::new(cfg, mock.clone(), mock.clone());
-    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let (local, handle) = start_jsonrpc_server(proxy, bind).await.unwrap();
-    (mock, rx, local, handle)
+    }
 }
 
-fn receipt_for(sender: Address, nonce: u64, tx_hash: B256, idx: i32) -> Receipt {
-    Receipt {
-        tx_idx: BPosition {
-            term_id: 0,
-            term_offset: idx,
-        },
-        tx_hash,
-        status: true,
-        gas_used: 21_000,
-        from: sender,
-        nonce,
-        ..Default::default()
-    }
+/// Awaits the next subscription frame, with a 5s timeout. `what` names the
+/// frame in the panic message on timeout, disconnect, or decode error.
+async fn next_event(sub: &mut Subscription<Value>, what: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), sub.next())
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+        .unwrap_or_else(|| panic!("subscription ended waiting for {what}"))
+        .unwrap_or_else(|e| panic!("{what}: {e}"))
 }
 
 /// With `pending_shed_depth: 0`, a shed-everything test hook, every
@@ -68,20 +48,22 @@ fn receipt_for(sender: Address, nonce: u64, tx_hash: B256, idx: i32) -> Receipt 
 #[tokio::test]
 async fn overloaded_ingress_sheds_submissions_with_a_clear_error() {
     let cfg = IngressConfig {
-        chain_id: 1,
         pending_shed_depth: 0,
-        ..IngressConfig::default()
+        ..chain_one()
     };
-    let (mock, _rx) = MockChannels::new(SHARDS);
-    let proxy = IngressProxy::new(cfg, mock.clone(), mock.clone());
-    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let (local, _handle) = start_jsonrpc_server(proxy, bind).await.unwrap();
-    let client = HttpClientBuilder::default()
-        .build(format!("http://{local}"))
-        .unwrap();
+    // `_mock`, `_shard_rx`, and `_handle` are bound, not skipped with `..`:
+    // an unbound field of a destructured struct drops immediately, and
+    // dropping `handle` stops the server before the test can use it.
+    let TestServer {
+        mock: _mock,
+        shard_rx: _shard_rx,
+        addr,
+        handle: _handle,
+    } = start_test_server(cfg).await;
+    let client = http_client(addr);
 
     let signer = PrivateKeySigner::random();
-    let (_env, raw, _addr) = common::sign_legacy_tx(&signer, 0);
+    let SignedTx { raw, .. } = sign_legacy_tx(&signer, 0);
     let res: Result<B256, _> = client
         .request("kardamom_sendRawTransactionAsync", rpc_params![raw])
         .await;
@@ -97,13 +79,16 @@ async fn overloaded_ingress_sheds_submissions_with_a_clear_error() {
 /// is published. It must not park, unlike `eth_sendRawTransaction`.
 #[tokio::test]
 async fn async_submit_acks_before_any_receipt_exists() {
-    let (_mock, mut rx, local, _handle) = start_stack().await;
-    let client = HttpClientBuilder::default()
-        .build(format!("http://{local}"))
-        .unwrap();
+    let TestServer {
+        mock: _mock,
+        mut shard_rx,
+        addr,
+        handle: _handle,
+    } = start_test_server(chain_one()).await;
+    let client = http_client(addr);
 
     let signer = PrivateKeySigner::random();
-    let (env, raw, _addr) = common::sign_legacy_tx(&signer, 0);
+    let SignedTx { env, raw, .. } = sign_legacy_tx(&signer, 0);
 
     // A 2s bound is generous for an in-process round trip, and far below
     // the parked path's receipt timeout. A regression to parking fails
@@ -119,8 +104,8 @@ async fn async_submit_acks_before_any_receipt_exists() {
 
     // The envelope must be on a tx_data shard.
     let mut published = None;
-    for shard_rx in &mut rx {
-        if let Ok(e) = shard_rx.try_recv() {
+    for rx in &mut shard_rx {
+        if let Ok(e) = rx.try_recv() {
             published = Some(e);
             break;
         }
@@ -134,9 +119,14 @@ async fn async_submit_acks_before_any_receipt_exists() {
 /// one. The optional sender filter drops receipts from other senders.
 #[tokio::test]
 async fn subscription_streams_deduped_and_filtered_receipts() {
-    let (mock, _rx, local, _handle) = start_stack().await;
+    let TestServer {
+        mock,
+        shard_rx: _shard_rx,
+        addr,
+        handle: _handle,
+    } = start_test_server(chain_one()).await;
     let ws = WsClientBuilder::default()
-        .build(format!("ws://{local}"))
+        .build(format!("ws://{addr}"))
         .await
         .unwrap();
 
@@ -158,23 +148,19 @@ async fn subscription_streams_deduped_and_filtered_receipts() {
     let h_watch = B256::repeat_byte(0x02);
     let h_watch2 = B256::repeat_byte(0x03);
     mock.receipt_bus
-        .send(receipt_for(other, 0, h_other, 1))
+        .send(receipt(other, 0, h_other, 1))
         .unwrap();
     mock.receipt_bus
-        .send(receipt_for(watched, 0, h_watch, 2))
+        .send(receipt(watched, 0, h_watch, 2))
         .unwrap();
     mock.receipt_bus
-        .send(receipt_for(watched, 0, h_watch, 2))
+        .send(receipt(watched, 0, h_watch, 2))
         .unwrap(); // Replica duplicate.
     mock.receipt_bus
-        .send(receipt_for(watched, 1, h_watch2, 3))
+        .send(receipt(watched, 1, h_watch2, 3))
         .unwrap();
 
-    let first = tokio::time::timeout(Duration::from_secs(5), sub.next())
-        .await
-        .expect("first notification")
-        .unwrap()
-        .unwrap();
+    let first = next_event(&mut sub, "first notification").await;
     assert_eq!(first["type"], "receipt");
     assert_eq!(
         first["receipt"]["transactionHash"],
@@ -182,11 +168,7 @@ async fn subscription_streams_deduped_and_filtered_receipts() {
         "foreign-sender receipt must have been filtered out"
     );
 
-    let second = tokio::time::timeout(Duration::from_secs(5), sub.next())
-        .await
-        .expect("second notification")
-        .unwrap()
-        .unwrap();
+    let second = next_event(&mut sub, "second notification").await;
     assert_eq!(
         second["receipt"]["transactionHash"],
         format!("{h_watch2:#x}"),
@@ -199,9 +181,14 @@ async fn subscription_streams_deduped_and_filtered_receipts() {
 /// forever.
 #[tokio::test]
 async fn subscription_streams_tx_errors() {
-    let (mock, _rx, local, _handle) = start_stack().await;
+    let TestServer {
+        mock,
+        shard_rx: _shard_rx,
+        addr,
+        handle: _handle,
+    } = start_test_server(chain_one()).await;
     let ws = WsClientBuilder::default()
-        .build(format!("ws://{local}"))
+        .build(format!("ws://{addr}"))
         .await
         .unwrap();
     let mut sub: Subscription<Value> = ws
@@ -222,11 +209,7 @@ async fn subscription_streams_tx_errors() {
         })
         .unwrap();
 
-    let ev = tokio::time::timeout(Duration::from_secs(5), sub.next())
-        .await
-        .expect("error notification")
-        .unwrap()
-        .unwrap();
+    let ev = next_event(&mut sub, "error notification").await;
     assert_eq!(ev["type"], "txError");
     assert_eq!(ev["sender"], format!("{sender:#x}"));
     assert_eq!(ev["nonce"], 7);

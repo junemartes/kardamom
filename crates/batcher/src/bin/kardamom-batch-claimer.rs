@@ -48,13 +48,13 @@ async fn main() -> Result<()> {
                 continue;
             }
             Ok(ClaimOutcome::NoBatchPosted { batch_index }) => {
-                tracing::debug!(batch_index, "batch not posted yet")
+                tracing::debug!(batch_index, "batch not posted yet");
             }
             Ok(ClaimOutcome::SpoolNotReady {
                 batch_index,
                 missing_block,
             }) => {
-                tracing::debug!(batch_index, missing_block, "spool not caught up")
+                tracing::debug!(batch_index, missing_block, "spool not caught up");
             }
             Err(e) => tracing::error!(error = %e, "claim attempt failed"),
         }

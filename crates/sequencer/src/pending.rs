@@ -7,10 +7,10 @@
 //! expected nonce, waiting to drain as a contiguous run once the gap fills.
 //! The lowest buffered nonces are closest to `expected`, and most likely to
 //! become drainable soon. The highest are furthest away. Evicting the
-//! smallest nonce (the old behavior) punches a gap directly in front of the
-//! run. This wedges the sender permanently: every later nonce stays
-//! "future" forever, with no recovery path. Dropping the furthest-future
-//! nonce instead never breaks the low run. The dropped transaction is a
+//! smallest nonce would punch a gap directly in front of the run, and
+//! wedge the sender permanently: every later nonce would stay "future"
+//! forever, with no recovery path. Dropping the furthest-future nonce
+//! instead never breaks the low run. The dropped transaction is a
 //! far-future nonce that the client resubmits long before it is needed. So
 //! overflow degrades to transient shedding, not a permanent wedge.
 //!
@@ -18,6 +18,7 @@
 //! contiguous run that starts at `start`. The first gap stops the drain.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InsertOutcome {
@@ -41,43 +42,52 @@ pub enum InsertOutcome {
 
 #[derive(Debug)]
 pub struct PendingBuffer<T> {
-    capacity: usize,
+    /// `None` means the buffer is disabled (every insert is rejected as
+    /// [`InsertOutcome::DroppedBufferDisabled`]): a meaningful, valid
+    /// setting, not an error, so it is `Option<NonZeroUsize>` rather than
+    /// a `usize` with a `0` sentinel checked at each call site.
+    capacity: Option<NonZeroUsize>,
     inner: BTreeMap<u64, T>,
 }
 
 impl<T> PendingBuffer<T> {
+    /// `capacity == 0` disables the buffer.
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            capacity,
+            capacity: NonZeroUsize::new(capacity),
             inner: BTreeMap::new(),
         }
     }
 
-    pub fn len(&self) -> usize {
+    /// Test-only: the production code never queries the buffer's size or
+    /// membership; it only drains and inserts.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
         self.inner.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    pub fn contains(&self, nonce: u64) -> bool {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn contains(&self, nonce: u64) -> bool {
         self.inner.contains_key(&nonce)
     }
 
-    /// Lowest buffered nonce, if any.
-    pub fn lowest_nonce(&self) -> Option<u64> {
-        self.inner.keys().next().copied()
-    }
-
+    /// # Panics
+    ///
+    /// Panics if the buffer is at capacity but empty. `capacity` is a
+    /// `NonZeroUsize` on this path (the disabled case returns above), and
+    /// `at_capacity` requires `len() >= capacity`, so the buffer always
+    /// holds at least one entry on this path.
     pub fn insert(&mut self, nonce: u64, value: T) -> InsertOutcome {
-        if self.capacity == 0 {
+        let Some(capacity) = self.capacity else {
             return InsertOutcome::DroppedBufferDisabled;
-        }
+        };
         // Pre-compute these values. Then the match arms below do not need
         // to re-borrow `self.inner` after taking an entry handle.
         let already_present = self.inner.contains_key(&nonce);
-        let at_capacity = !already_present && self.inner.len() >= self.capacity;
+        let at_capacity = !already_present && self.inner.len() >= capacity.get();
         if already_present {
             self.inner.insert(nonce, value);
             return InsertOutcome::Replaced;
@@ -226,13 +236,16 @@ mod tests {
         let cap = 4;
         let mut b: PendingBuffer<u32> = PendingBuffer::new(cap);
         // Buffer the run just above expected first...
-        for n in 10..10 + cap as u64 {
-            assert!(matches!(b.insert(n, n as u32), InsertOutcome::Inserted));
+        for n in 10..10 + u64::try_from(cap).unwrap() {
+            assert!(matches!(
+                b.insert(n, u32::try_from(n).unwrap()),
+                InsertOutcome::Inserted
+            ));
         }
         // Then flood higher nonces. Every one is rejected, and the run is untouched.
         for n in 100..120u64 {
             assert!(matches!(
-                b.insert(n, n as u32),
+                b.insert(n, u32::try_from(n).unwrap()),
                 InsertOutcome::RejectedTooFar { .. }
             ));
         }

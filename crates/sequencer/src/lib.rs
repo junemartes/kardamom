@@ -2,7 +2,7 @@
 //!
 //! The sequencer is stateless. The in-memory `next_nonce` map is a cache,
 //! and the sequencer can rebuild it from canonical sources. A cold sender
-//! starts at nonce 0. In the warm steady state, the tx_data tail gives
+//! starts at nonce 0. In the warm steady state, the `tx_data` tail gives
 //! visibility: every matched envelope advances the sender's nonce. The
 //! receipt-floor resync (`crate::resync`) recovers committed floors out of
 //! band. The sequencer holds no state-DB reader.
@@ -28,18 +28,22 @@
 pub mod config;
 pub mod epoch;
 pub mod error;
+#[cfg(any(test, feature = "testing"))]
+pub mod fakes;
 pub mod inbound;
 pub mod metrics;
 mod nonce_decode;
 pub mod outbound;
 pub mod partition;
-pub mod pending;
+pub(crate) mod pending;
 pub mod remote_epoch;
 pub mod resync;
-pub mod sender;
+pub(crate) mod sender;
 pub mod sequencer;
 pub mod shutdown;
-pub mod state;
+pub(crate) mod state;
+#[cfg(any(test, feature = "testing"))]
+pub mod testkit;
 mod unconfirmed;
 
 pub use config::{BackpressurePolicy, SequencerConfig};

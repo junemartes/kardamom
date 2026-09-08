@@ -63,6 +63,21 @@ impl Default for Params {
     }
 }
 
+/// Require that the feature at `state_dir` has never been scheduled or
+/// fired.
+///
+/// # Errors
+/// Returns an error when the state directory cannot be read, or when the
+/// feature is already scheduled or has already fired.
+fn assert_feature_dormant(state_dir: &Path) -> Result<()> {
+    let before = read_chain_state(state_dir)?;
+    anyhow::ensure!(
+        before.activation.is_zero() && before.beats() == 0,
+        "the feature must start unscheduled and unfired: {before:?}"
+    );
+    Ok(())
+}
+
 /// Wait until `state_dir` has committed at least `block` and return the view.
 async fn state_at_or_past(state_dir: &Path, block: u64, what: &str) -> Result<ChainStateView> {
     poll_until(
@@ -123,24 +138,19 @@ async fn assert_validator_agrees(
     let v = state_at_or_past(validator_state_dir, through_block, "validator").await?;
     assert_beat_every_block(&v, first_active, "validator")?;
 
-    poll_until(
-        "validator verified past the activation block",
+    t.wait_validator_metric_above(
+        VALIDATOR_BLOCKS_VERIFIED,
+        0.0,
         Duration::from_secs(60),
         Duration::from_millis(250),
-        || async {
-            let verified = t
-                .validator_metric(VALIDATOR_BLOCKS_VERIFIED)
-                .await
-                .unwrap_or(0.0);
-            Ok((verified > 0.0).then_some(verified))
-        },
+        "validator verified past the activation block",
     )
     .await
     .context("validator verifying blocks")?;
 
     let divergence = t
-        .validator_metric(VALIDATOR_DIVERGENCE)
-        .await
+        .validator_metric_opt(VALIDATOR_DIVERGENCE)
+        .await?
         .unwrap_or(0.0);
     anyhow::ensure!(
         divergence == 0.0,
@@ -183,7 +193,7 @@ async fn upgrade_and_await(
         "a system deposit must execute at gas price 0: {receipt}"
     );
 
-    let (block, _) = receipt_placement(&receipt)?;
+    let block = receipt_placement(&receipt)?.block;
     Ok(block)
 }
 
@@ -193,6 +203,12 @@ async fn upgrade_and_await(
 
 /// The requested full-flow exercise: multisig-authorized L1 transaction turns
 /// a protocol feature on, and it stays on for every subsequent block.
+///
+/// # Errors
+/// Returns an error when the feature is not dormant beforehand, when the
+/// upgrade transaction fails, when the executor never writes an
+/// activation timestamp, when the beacon does not beat every block from
+/// activation, or when the validator disagrees.
 pub async fn activates_immediately(
     t: &Target,
     l1: &L1,
@@ -200,17 +216,18 @@ pub async fn activates_immediately(
     validator_state_dir: &Path,
 ) -> Result<()> {
     // --- Pre: the feature is dormant and has never fired. ----------------
-    let before = read_chain_state(executor_state_dir)?;
-    anyhow::ensure!(
-        before.activation.is_zero() && before.beats() == 0,
-        "the feature must start unscheduled and unfired: {before:?}"
-    );
+    assert_feature_dormant(executor_state_dir)?;
 
     // --- L1 → L2: schedule with activation 0 (immediately). --------------
     let activation_block = upgrade_and_await(t, l1, FEATURE_HEALTH_CHECK, 0).await?;
 
     // --- Let a few more blocks close, then take ONE consistent read. -----
-    let v = state_at_or_past(executor_state_dir, activation_block + 3, "executor").await?;
+    // `activation_block` is a state-DB-derived block height; a bad or
+    // adversarial value must fail loudly, not silently wrap the lookup.
+    let target_block = activation_block
+        .checked_add(3)
+        .context("activation_block overflows")?;
+    let v = state_at_or_past(executor_state_dir, target_block, "executor").await?;
     anyhow::ensure!(
         !v.activation.is_zero(),
         "setFeature did not write an activation timestamp: {v:?}"
@@ -231,25 +248,28 @@ pub async fn activates_immediately(
 
 /// A scheduled upgrade must do nothing until the chain's own clock reaches the
 /// activation time, then fire from the first block at or after it.
+///
+/// # Errors
+/// Returns an error when the feature is not dormant beforehand, when the
+/// upgrade transaction fails, when the feature fires before its
+/// activation time, when no block reaches the activation timestamp, when
+/// the beacon does not beat every block from the first active one, or
+/// when the validator disagrees.
 pub async fn activates_at_timestamp(
     t: &Target,
     l1: &L1,
     executor_state_dir: &Path,
     validator_state_dir: &Path,
 ) -> Result<()> {
-    let before = read_chain_state(executor_state_dir)?;
-    anyhow::ensure!(
-        before.activation.is_zero() && before.beats() == 0,
-        "the feature must start unscheduled and unfired: {before:?}"
-    );
+    assert_feature_dormant(executor_state_dir)?;
 
     // The chain's clock is the sealer's leader clock in MILLISECONDS, so the
     // schedule is anchored to the chain's own notion of now — reading it off
     // the head block rather than from wall-clock keeps the two in the same
     // frame even if the host clock and the sealer's disagree.
     // Wait, do not read once. The launch barrier guarantees block 1
-    // exists. A restarted or slow executor can still race this read
-    // (issue #250: the one-shot read failed three times in one CI day).
+    // exists, but a restarted or slow executor can still lag behind that
+    // guarantee, so a single read can race the header actually landing.
     let head_ts = crate::harness::metrics::poll_until(
         "a committed head block to anchor the schedule",
         std::time::Duration::from_secs(30),
@@ -341,6 +361,11 @@ pub async fn activates_at_timestamp(
 /// Neither side of the flag store is reachable without authority: not the L1
 /// entry point (any address but the factory owner), and not the L2 predeploy
 /// (any sender but the derivation pipeline's system address).
+///
+/// # Errors
+/// Returns an error when the unauthorized L1 upgrade unexpectedly
+/// succeeds or consumes a nonce, when the intruder's L2 call unexpectedly
+/// succeeds, or when the flag store changed despite both rejections.
 pub async fn authority_is_enforced(
     t: &Target,
     l1: &L1,
@@ -365,7 +390,7 @@ pub async fn authority_is_enforced(
     // setFeature(FEATURE_UNUSED, 0) sent as an ordinary L2 transaction. It
     // reaches the predeploy and reverts on the sender check, which is exactly
     // the defence-in-depth the contract exists to provide.
-    let signers: Vec<DerivedSigner> = l2::dev_signers(p.intruder as u32 + 1)?;
+    let signers: Vec<DerivedSigner> = l2::dev_signers_through(p.intruder)?;
     let intruder = &signers[p.intruder];
     let calldata = kardamom_types::upgrades::encode_set_feature(U256::from(FEATURE_UNUSED), 0);
     let call = l2::sign_call(

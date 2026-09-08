@@ -1145,6 +1145,7 @@ name = "kardamom-zk-guest"
 version = "0.1.0"
 dependencies = [
  "alloy-eip7928",
+ "alloy-primitives",
  "alloy-rlp",
  "kardamom-exec-core",
  "kardamom-types",

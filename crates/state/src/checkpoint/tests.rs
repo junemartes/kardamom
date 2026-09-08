@@ -52,6 +52,19 @@ fn seed_test_genesis(env: &StateEnv) {
     crate::genesis::seed_genesis(env, &accounts, &[]).unwrap();
 }
 
+/// Open a fresh tempdir-backed env at `dir`, seed genesis, and commit
+/// blocks `1..=upto` for `addr`. Every checkpoint test's fixture setup:
+/// open, seed, commit.
+fn seeded_env_with_blocks(dir: &std::path::Path, addr: Address, upto: u64) -> StateEnv {
+    let env = StateEnvBuilder::new(dir)
+        .durability(Durability::SafeNoSync)
+        .open()
+        .unwrap();
+    seed_test_genesis(&env);
+    commit_blocks(&env, addr, upto);
+    env
+}
+
 #[test]
 fn checkpoint_restore_roundtrips_state() {
     let src_dir = tempfile::tempdir().unwrap();
@@ -61,12 +74,7 @@ fn checkpoint_restore_roundtrips_state() {
 
     // Build a DB with 5 committed blocks.
     {
-        let env = StateEnvBuilder::new(src_dir.path())
-            .durability(Durability::SafeNoSync)
-            .open()
-            .unwrap();
-        seed_test_genesis(&env);
-        commit_blocks(&env, addr, 5);
+        let env = seeded_env_with_blocks(src_dir.path(), addr, 5);
 
         let info = create_checkpoint(&env, ckpt_dir.path()).unwrap();
         assert_eq!(info.block, 5);
@@ -98,12 +106,7 @@ fn restore_refuses_a_tampered_image() {
     let ckpt = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
     let addr = Address::from([0x21; 20]);
-    let env = StateEnvBuilder::new(src.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
-    seed_test_genesis(&env);
-    commit_blocks(&env, addr, 3);
+    let env = seeded_env_with_blocks(src.path(), addr, 3);
     let c = create_checkpoint(&env, ckpt.path()).unwrap();
     drop(env);
 
@@ -135,12 +138,7 @@ fn restore_refuses_a_foreign_chain() {
     let ckpt = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
     let addr = Address::from([0x22; 20]);
-    let env = StateEnvBuilder::new(src.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
-    seed_test_genesis(&env);
-    commit_blocks(&env, addr, 2);
+    let env = seeded_env_with_blocks(src.path(), addr, 2);
     let c = create_checkpoint(&env, ckpt.path()).unwrap();
     let ours = stored_genesis_digest(&env).unwrap();
     drop(env);
@@ -167,12 +165,7 @@ fn restore_refuses_an_unmanifested_image() {
     let ckpt = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
     let addr = Address::from([0x23; 20]);
-    let env = StateEnvBuilder::new(src.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
-    seed_test_genesis(&env);
-    commit_blocks(&env, addr, 1);
+    let env = seeded_env_with_blocks(src.path(), addr, 1);
     let c = create_checkpoint(&env, ckpt.path()).unwrap();
     drop(env);
 
@@ -193,12 +186,7 @@ fn restore_best_quarantines_bad_and_falls_back() {
     let ckpt = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
     let addr = Address::from([0x24; 20]);
-    let env = StateEnvBuilder::new(src.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
-    seed_test_genesis(&env);
-    commit_blocks(&env, addr, 2);
+    let env = seeded_env_with_blocks(src.path(), addr, 2);
     let good = create_checkpoint(&env, ckpt.path()).unwrap();
     commit_blocks(&env, addr, 5);
     let torn = create_checkpoint(&env, ckpt.path()).unwrap();
@@ -216,7 +204,7 @@ fn restore_best_quarantines_bad_and_falls_back() {
     assert!(!torn.path.exists());
     let rejected: Vec<_> = std::fs::read_dir(ckpt.path())
         .unwrap()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with(".rejected-"))
         .collect();
@@ -242,12 +230,7 @@ fn latest_picks_highest_block_and_prune_trims() {
     let ckpt_dir = tempfile::tempdir().unwrap();
     let addr = Address::from([0x7; 20]);
 
-    let env = StateEnvBuilder::new(src_dir.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
-    seed_test_genesis(&env);
-    commit_blocks(&env, addr, 3);
+    let env = seeded_env_with_blocks(src_dir.path(), addr, 3);
     let c3 = create_checkpoint(&env, ckpt_dir.path()).unwrap();
     assert_eq!(c3.block, 3);
     // Advance and checkpoint again.
@@ -273,12 +256,7 @@ fn create_sweeps_stale_tmp_and_leaves_no_residue() {
     let src_dir = tempfile::tempdir().unwrap();
     let ckpt_dir = tempfile::tempdir().unwrap();
     let addr = Address::from([0x5; 20]);
-    let env = StateEnvBuilder::new(src_dir.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
-    seed_test_genesis(&env);
-    commit_blocks(&env, addr, 2);
+    let env = seeded_env_with_blocks(src_dir.path(), addr, 2);
 
     // Plant a stale temp directory, as if from a crashed earlier writer.
     let stale = ckpt_dir.path().join(".checkpoint-000000000000000001.tmp");
@@ -305,15 +283,26 @@ fn restore_refuses_to_clobber_populated_dir() {
     let src_dir = tempfile::tempdir().unwrap();
     let ckpt_dir = tempfile::tempdir().unwrap();
     let addr = Address::from([0x9; 20]);
-    let env = StateEnvBuilder::new(src_dir.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
-    seed_test_genesis(&env);
-    commit_blocks(&env, addr, 2);
+    let env = seeded_env_with_blocks(src_dir.path(), addr, 2);
     let c = create_checkpoint(&env, ckpt_dir.path()).unwrap();
 
     // Restoring over the live, populated source directory must be refused.
     let err = restore_checkpoint(&c.path, src_dir.path(), None).unwrap_err();
     assert!(matches!(err, StateError::Recovery(_)));
+}
+
+#[test]
+fn quarantine_failed_message_has_a_readable_gap() {
+    // Defect: the message had "could not be" followed by 26 spaces and
+    // then "quarantined", a stray run of literal spaces baked into the
+    // format string instead of one space.
+    let path = std::path::Path::new("/checkpoints/checkpoint-9");
+    let verify_err = StateError::Recovery("bad manifest".into());
+    let rename_err = std::io::Error::other("permission denied");
+    let StateError::Recovery(msg) = quarantine_failed_message(path, &verify_err, &rename_err)
+    else {
+        panic!("expected StateError::Recovery");
+    };
+    assert!(msg.contains("could not be quarantined:"), "got {msg:?}");
+    assert!(!msg.contains("be  quarantined"), "got {msg:?}");
 }

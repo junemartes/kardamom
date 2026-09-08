@@ -53,6 +53,7 @@ pub struct PartitionState<T> {
 }
 
 impl<T> PartitionState<T> {
+    #[must_use]
     pub fn new(max_pending_per_sender: usize) -> Self {
         Self {
             max_pending_per_sender,
@@ -61,14 +62,17 @@ impl<T> PartitionState<T> {
         }
     }
 
+    #[must_use]
     pub fn next_nonce(&self, sender: Address) -> u64 {
         self.next.get(&sender).copied().unwrap_or(0)
     }
 
     /// Returns the cached next nonce for `sender`, or `None` if this
-    /// partition has never seen the sender. The cache-miss hydration path
-    /// uses this: a `None` triggers a one-time canonical lookup against
-    /// the state DB before it falls through to [`Self::process`].
+    /// partition has never seen the sender. The sequencer holds no
+    /// state-DB reader: a `None` means the caller must seed a floor
+    /// (`Self::seed_next_nonce`, at 0 for a cold sender) before it falls
+    /// through to [`Self::process`].
+    #[must_use]
     pub fn next_nonce_known(&self, sender: Address) -> Option<u64> {
         self.next.get(&sender).copied()
     }
@@ -181,18 +185,31 @@ impl<T> PartitionState<T> {
         let mut out = Vec::new();
         // Borrow `pending` and `next` as separate fields. This avoids
         // snapshotting the sender list into a `Vec` first.
-        for (&sender, buf) in self.pending.iter_mut() {
+        for (&sender, buf) in &mut self.pending {
             let expected = self.next.get(&sender).copied().unwrap_or(0);
-            let mut advanced = expected;
-            for (n, p) in buf.drain_consecutive_from(expected) {
-                out.push((sender, n, p));
-                advanced = n.saturating_add(1);
-            }
-            if advanced > expected {
+            if let Some(advanced) = Self::drain_sender_run(buf, sender, expected, &mut out) {
                 self.next.insert(sender, advanced);
             }
         }
         out
+    }
+
+    /// Drain `buf`'s contiguous run starting at `expected`, tagged with
+    /// `sender`, into `out`. Returns the sender's new next-nonce if
+    /// anything drained. The helper method for the inner loop of
+    /// [`Self::drain_pending`].
+    fn drain_sender_run(
+        buf: &mut PendingBuffer<T>,
+        sender: Address,
+        expected: u64,
+        out: &mut Vec<(Address, u64, T)>,
+    ) -> Option<u64> {
+        let mut advanced = None;
+        for (n, p) in buf.drain_consecutive_from(expected) {
+            out.push((sender, n, p));
+            advanced = Some(n.saturating_add(1));
+        }
+        advanced
     }
 
     /// Advance `sender`'s expected nonce to an executed-truth floor. A
@@ -206,11 +223,9 @@ impl<T> PartitionState<T> {
     /// Returns `Some((previous_next_nonce, dropped_count))` when the floor
     /// advanced, or `None` when it was already at or behind `next`.
     ///
-    /// This is the sound replacement for the removed stream-adaptive
-    /// fast-forward (see the note below). It advances only on execution
-    /// evidence from the receipts stream, never on locally inferred stream
-    /// gaps. A client-abandoned nonce hole produces no receipt, so it never
-    /// advances the floor. See docs/agents/sequencer-lag-resync-spec.md.
+    /// This advances only on execution evidence from the receipts stream,
+    /// never on locally inferred stream gaps. A client-abandoned nonce
+    /// hole produces no receipt, so it never advances the floor.
     pub fn advance_floor(&mut self, sender: Address, floor: u64) -> Option<(u64, usize)> {
         let cur = self.next_nonce(sender);
         if floor <= cur {
@@ -219,29 +234,19 @@ impl<T> PartitionState<T> {
         let dropped = self
             .pending
             .get_mut(&sender)
-            .map(|b| b.drop_below(floor))
-            .unwrap_or(0);
+            .map_or(0, |b| b.drop_below(floor));
         self.next.insert(sender, floor);
         Some((cur, dropped))
     }
 
-    // NOTE: `fast_forward_stalled` (the stream-adaptive nonce-floor
-    // fast-forward) was removed. A sequencer cannot locally tell "the twin
-    // already ordered the gap" (the rejoin case it was built for) apart
-    // from "nobody ordered the gap" (a client-abandoned nonce hole: a
-    // transaction dropped at ingress under overload, or during a chaos
-    // outage, so it never reached tx_data at all).
-    //
-    // In the second case, both replicas adopt the same hole and publish a
-    // canonical stream with a nonce gap. Every executor fail-stops on that
-    // (revm's NonceTooHigh is fatal). A stalled sender must stall here,
-    // where it is recoverable, and never poison the canonical stream.
-    //
-    // A sound fix needs a global signal, such as hydrating floors from a
-    // canonical or receipt stream, not a local timeout. See
-    // docs/reviews/2026-07-17-30-commit-review/fixes-CI-replay-loop.md
-    // (round 4).
+    // A sequencer cannot locally tell "the twin already ordered the gap"
+    // apart from "nobody ordered the gap" (a client-abandoned nonce
+    // hole). So a stalled sender must stall here, where it is
+    // recoverable, and never poison the canonical stream with a locally
+    // inferred gap.
 }
 
+#[cfg(test)]
+mod proptest_tests;
 #[cfg(test)]
 mod tests;

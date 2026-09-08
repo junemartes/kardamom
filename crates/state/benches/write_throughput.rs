@@ -8,9 +8,11 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use kardamom_state::env::{Durability, StateEnvBuilder};
-use kardamom_state::{StateWriter, WriteBatch};
-use kardamom_types::{AccountChange, BPosition, BlockBoundary, BlockDelta, Receipt};
+use kardamom_state::WriteBatch;
+use kardamom_types::{AccountChange, BlockBoundary, BlockDelta, Receipt};
+
+#[path = "../tests/common/mod.rs"]
+mod common;
 
 fn big_batch(block: u64) -> WriteBatch {
     // The target is about 25 MB: 100 bytes per account, times 250k
@@ -29,10 +31,7 @@ fn big_batch(block: u64) -> WriteBatch {
             }
         })
         .collect();
-    let pos = BPosition {
-        term_id: 0,
-        term_offset: (block * 1024) as i32,
-    };
+    let pos = common::bpos(block);
     let mut hash_bytes = [0u8; 32];
     hash_bytes[24..].copy_from_slice(&block.to_be_bytes());
     let tx_hash = B256::from(hash_bytes);
@@ -69,12 +68,7 @@ fn bench_apply(c: &mut Criterion) {
     group.bench_function("apply_25mb_block", |b| {
         b.iter_batched(
             || {
-                let dir = tempfile::tempdir().unwrap();
-                let env = StateEnvBuilder::new(dir.path())
-                    .durability(Durability::SafeNoSync)
-                    .open()
-                    .unwrap();
-                let writer = StateWriter::spawn(env).unwrap();
+                let (dir, writer) = common::open_tmp_writer();
                 // Drain the initial snapshot.
                 writer.snapshot_rx.recv().unwrap();
                 (dir, writer)
