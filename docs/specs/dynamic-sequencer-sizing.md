@@ -2,7 +2,9 @@
 
 - **Date:** 2026-09-03
 - **First draft:** 2026-08-31
-- **Status:** Draft. Design review in progress.
+- **Status:** Implemented. Milestones 1 to 8 landed as PRs #256, #268,
+  #269, #270, #271, #272, #273, and the doc repair (2026-09-07). See
+  section 6 for the deviations.
 - **Topic:** Change the number of active sequencer shards at run time. Keep
   the canonical log correct. Keep the availability cost bounded.
 - **Supersedes:** the non-goal "shard scaling" in
@@ -386,6 +388,8 @@ Residual effects:
 
 ## 5. Risks and open questions
 
+See also section 6 for what the implementation changed.
+
 - **Same-nonce replacement during the overlap.** A replacement can race a
   laggard replica. The guard's `nonce < expected` path drops it as
   committed. The ingress can detect a same-nonce resubmit only in its own
@@ -406,3 +410,33 @@ Residual effects:
 - **Clock skew between replicas.** The expiry uses local clocks. The two
   replicas of a shard can expire an entry a few milliseconds apart. The
   effect is one spurious error at most. It cannot cause a loss.
+
+## 6. Implementation notes
+
+The implementation follows this spec with these deviations:
+
+- **Warm-up timer start (3.5, step 2).** The timer starts when the
+  sequencer is constructed, after every lane subscription opened, not when
+  the old-lane subscription reports connected. The Aeron runtime does not
+  expose the connected state. The margin in `shadow_warm_ms` (default
+  `tx_ttl_ms + 5000`) covers the join.
+- **Sequencer node count (3.8).** `node_classes.sequencer.count` does not
+  follow the active lane count. Two lanes share a node through the port
+  lane, and a resize adds no machines. The count only needs to stay at 2 or
+  more, so both replicas of a lane land on distinct nodes.
+- **Least-moves map (3.2).** `render-shard-map.py` moves slots only to the
+  lanes that gain. A lane that gains nothing runs through the resize with
+  no shadow phase, and the overlap job leaves its arguments byte-identical,
+  so Nomad does not restart it.
+- **Lookup trigger (3.4).** The core asks for a lookup on every park of a
+  sender with no known receipt floor, not only on the first cold envelope.
+  The lookup task dedups the senders in flight and bounds the retry rate to
+  one lookup per timeout per sender. So a timed-out lookup retries on the
+  sender's next park.
+- **Rebuffered entries (3.3).** A backpressure rebuffer carries no deadline
+  instead of a refreshed one. It waits on the publisher, not on a nonce
+  gap, and it lives until the publisher recovers. This is the behaviour
+  the section describes, with no heap growth under sustained backpressure.
+- **Explicit-set validation (3.2).** A replica with an explicit `vslots`
+  skips the identity-map checks, so a shard on lane 2 under a 3-lane map is
+  a valid config. `partition_count` then only labels the metrics.

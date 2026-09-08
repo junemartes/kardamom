@@ -77,9 +77,10 @@ impl<T> PartitionState<T> {
     }
 
     /// Returns the cached next nonce for `sender`, or `None` if this
-    /// partition has never seen the sender. The cache-miss hydration path
-    /// uses this: a `None` triggers a one-time canonical lookup against
-    /// the state DB before it falls through to [`Self::process`].
+    /// partition has never seen the sender. The sequencer seeds an unseen
+    /// sender at 0 before [`Self::process`]. Committed truth arrives later
+    /// through [`Self::advance_floor`]: from a receipt, or from the
+    /// executor nonce lookup that a park triggers (`crate::lookup`).
     pub fn next_nonce_known(&self, sender: Address) -> Option<u64> {
         self.next.get(&sender).copied()
     }
