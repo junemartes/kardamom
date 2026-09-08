@@ -83,6 +83,8 @@ impl SequencerConfig {
         if self.partition_count == 0 {
             return Err(ConfigError::ZeroPartitions);
         }
+        crate::partition::validate_partition_count(self.partition_count)
+            .map_err(ConfigError::LanePlane)?;
         if self.partition_index >= self.partition_count {
             return Err(ConfigError::IndexOutOfRange {
                 index: self.partition_index,
@@ -119,6 +121,8 @@ impl SequencerConfig {
 pub enum ConfigError {
     #[error("partition_count must be >= 1")]
     ZeroPartitions,
+    #[error("partition_count does not fit the lane plane: {0}")]
+    LanePlane(#[from] crate::partition::PartitionConfigError),
     #[error("partition_index {index} >= partition_count {count}")]
     IndexOutOfRange { index: u32, count: u32 },
 }
@@ -142,6 +146,17 @@ mod tests {
             cfg.validate(),
             Err(ConfigError::IndexOutOfRange { .. })
         ));
+    }
+
+    #[test]
+    fn partition_count_outside_the_lane_plane_rejected() {
+        for count in [3u32, 16] {
+            let cfg = SequencerConfig {
+                partition_count: count,
+                ..Default::default()
+            };
+            assert!(matches!(cfg.validate(), Err(ConfigError::LanePlane(_))));
+        }
     }
 
     #[test]

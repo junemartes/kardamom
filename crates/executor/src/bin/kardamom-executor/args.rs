@@ -35,10 +35,6 @@ pub(crate) struct Args {
     /// path ignores it.
     #[arg(long, env = "KARDAMOM_RECORDER_ID", default_value_t = 0)]
     pub(crate) recorder_id: u32,
-    /// Number of tx_data shards to subscribe to. The default is 8, to match
-    /// the default `partition_count` in the sequencer.
-    #[arg(long, default_value_t = 8)]
-    pub(crate) shards: u8,
     /// Execute blocks through the Block-STM engine (block-at-a-time; a
     /// streaming pipeline is a planned follow-up). When off, the binary
     /// uses the streaming per-tx path, byte-for-byte as before. Output is

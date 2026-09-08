@@ -130,7 +130,6 @@ job "batcher" {
           # batcher's own cluster client session: 40231, distinct
           # from the validator's 40230 on the same node.
           "--cluster-egress-endpoint", "${meta.node_ip}:40231",
-          "--shards", "2",
           # Join-miss archive refetch (tx_data and tx_deposits). Same
           # contract as the validator's flags, with distinct ports on
           # the shared aux node.

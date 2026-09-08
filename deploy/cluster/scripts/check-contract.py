@@ -34,6 +34,12 @@ def scalar(text: str, key: str) -> str:
     return m.group(1).strip().strip('"').strip("'")
 
 
+def must_not_contain(path: Path, needle: str, why: str) -> None:
+    rel = path.relative_to(REPO)
+    if path.exists() and needle in path.read_text():
+        err(f"{rel}: must not contain {needle!r} ({why})")
+
+
 def must_contain(path: Path, needle: str, why: str) -> None:
     rel = path.relative_to(REPO)
     if not path.exists():
@@ -131,6 +137,40 @@ must_contain(
 )
 must_contain(jobs / "ingress.nomad.hcl", f"static = {ingress_rpc}", "ingress RPC port")
 must_contain(jobs / "executor.nomad.hcl", f'"{chain_id}"', "L2 chain id")
+
+# --- shard count (M) and the lane plane ------------------------------------------
+# partition_count is the active shard count. The lane plane is fixed at 8
+# lanes in code (kardamom_types::shard_map::LANE_COUNT), and the identity
+# map v0 needs a count that divides 256. So M must be 1, 2, 4, or 8. The
+# ingress and both sequencer replica groups take M. The consumers (the
+# executor, the validator, the batcher) open every lane and take no count.
+# See docs/specs/dynamic-sequencer-sizing.md.
+partition_count = scalar(gv, "partition_count")
+if partition_count not in ("1", "2", "4", "8"):
+    err(f"group_vars/all.yml: partition_count must be 1, 2, 4, or 8, got {partition_count!r}")
+must_contain(
+    jobs / "ingress.nomad.hcl",
+    f'"--shards", "{partition_count}"',
+    "ingress active shard count (M) mirrors partition_count",
+)
+seq_job = (jobs / "sequencer.nomad.hcl").read_text()
+seq_count_flags = seq_job.count(f'"--partition-count", "{partition_count}"')
+if seq_count_flags != 2:
+    err(
+        f"nomad/sequencer.nomad.hcl: expected both replica groups to pass "
+        f'"--partition-count", "{partition_count}" (found {seq_count_flags})'
+    )
+must_contain(
+    CLUSTER / "config" / "sequencer.toml.tpl",
+    f"partition_count = {partition_count}",
+    "sequencer template partition_count mirrors group_vars",
+)
+for job in ("executor", "validator", "batcher"):
+    must_not_contain(
+        jobs / f"{job}.nomad.hcl",
+        '"--shards"',
+        f"{job} opens the fixed lane plane and takes no shard count",
+    )
 
 # --- config templates -----------------------------------------------------------
 # Cluster-only: tx_ordering is carried by the Aeron Cluster (Raft), not the

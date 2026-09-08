@@ -107,6 +107,8 @@ pub struct ServiceSpec<'a> {
     pub root: &'a Path,
     pub aeron_dir: &'a Path,
     pub cluster_ingress_endpoints: &'a str,
+    /// The active shard count (M). The sequencers and the ingress take it.
+    /// The consumers open the fixed lane plane and take no count.
     pub shards: u32,
     pub chain_id: u64,
     pub genesis: &'a Path,
@@ -289,7 +291,6 @@ pub fn spawn_executor_at(
         .arg(&cfg_path)
         .arg("--aeron-dir")
         .arg(spec.aeron_dir)
-        .args(["--shards", &spec.shards.to_string()])
         .args(["--chain-id", &spec.chain_id.to_string()])
         .arg("--chain")
         .arg(spec.genesis)
@@ -366,7 +367,6 @@ pub fn spawn_validator(spec: &ServiceSpec<'_>, opts: &ValidatorOptions<'_>) -> R
         .arg(&cfg_path)
         .arg("--aeron-dir")
         .arg(spec.aeron_dir)
-        .args(["--shards", &spec.shards.to_string()])
         .args(["--chain-id", &spec.chain_id.to_string()])
         .arg("--chain")
         .arg(spec.genesis)

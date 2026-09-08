@@ -1,6 +1,6 @@
 //! `kardamom-ingress`: the standalone proxy (ingress) service process.
 //!
-//! This opens M tx_data publishers, a receipt-cache publisher, and
+//! This opens one tx_data publisher per lane, a receipt-cache publisher, and
 //! subscribers for the receipts, quorum-watermark, fsync-watermark,
 //! receipt-cache, and block-boundary streams. It wires them into an
 //! [`IngressProxy`] and starts its JSON-RPC server, plus optional TCP and
@@ -28,6 +28,7 @@ use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_types::QuorumWatermark;
 use tokio_util::sync::CancellationToken;
 
+use kardamom_types::shard_map::LANE_COUNT;
 use recorders::{spawn_tx_data_recorders, wait_for_recorders};
 
 #[derive(Debug, Parser)]
@@ -70,7 +71,9 @@ struct Args {
     /// `ChannelsConfig::tx_receipts_executor_count`.
     #[arg(long, env = "KARDAMOM_EXECUTOR_COUNT")]
     executor_count: Option<u32>,
-    /// Number of tx_data shards (M). Defaults to 8.
+    /// The active shard count (M). The ingress opens every lane of the
+    /// lane plane, and the identity map routes senders to the first M.
+    /// So M must be 1, 2, 4, or 8. Defaults to 8.
     #[arg(long, default_value_t = 8)]
     shards: u32,
     /// Records each per-shard tx_data publication to the Aeron Archive, so
@@ -175,6 +178,7 @@ async fn main() -> Result<()> {
     // the full IngressConfig.
     let raw = std::fs::read_to_string(&args.config).context("read ingress config")?;
     let file_cfg: IngressFileConfig = toml::from_str(&raw).context("parse ingress config")?;
+    kardamom_types::shard_map::validate_shard_count(args.shards).context("--shards")?;
 
     let mut cfg = IngressConfig {
         jsonrpc_bind: args.jsonrpc_bind,
@@ -195,6 +199,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         jsonrpc_bind = %cfg.jsonrpc_bind,
         shards = cfg.partition_count_m,
+        lanes = LANE_COUNT,
         ingress_id = cfg.ingress_id,
         ack_policy = ?cfg.ack_policy,
         "kardamom-ingress starting"
@@ -205,8 +210,9 @@ async fn main() -> Result<()> {
     let aeron_cfg = resolved.aeron;
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
 
-    // These are archive recorders for tx_data, one per shard, co-located
-    // with the publishers here. They make the full transaction envelopes
+    // These are archive recorders for tx_data, one per lane, co-located
+    // with the publishers here. An idle lane records an empty stream.
+    // They make the full transaction envelopes
     // durable, so the executor can replay them on crash recovery. Without
     // them, only the canonical order survives a restart, not the bytes
     // needed to re-execute.
@@ -225,7 +231,7 @@ async fn main() -> Result<()> {
             args.aeron_dir.clone(),
             channels.clone(),
             aeron_cfg.clone(),
-            args.shards as u8,
+            LANE_COUNT,
             &stop,
         )
     } else {
@@ -239,7 +245,7 @@ async fn main() -> Result<()> {
         .executor_count
         .unwrap_or(channels.tx_receipts_executor_count);
 
-    let publication = LiveIngressPublication::open(&rt, &channels, args.shards as u8)
+    let publication = LiveIngressPublication::open(&rt, &channels, LANE_COUNT)
         .context("open IngressPublication")?;
 
     // This is the recorder barrier; see the recorder-spawn comment above.

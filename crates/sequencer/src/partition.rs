@@ -18,18 +18,12 @@ pub fn partition_for(sender: Address, m: u32) -> u32 {
     kardamom_types::shard_map::partition_for(sender, m)
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum PartitionConfigError {
-    #[error("partition count must be >= 1")]
-    Zero,
-}
+pub use kardamom_types::shard_map::ShardMapError as PartitionConfigError;
 
+/// Validate the partition count against the lane plane. `m` must be 1,
+/// 2, 4, or 8. See `kardamom_types::shard_map::validate_shard_count`.
 pub fn validate_partition_count(m: u32) -> Result<(), PartitionConfigError> {
-    if m == 0 {
-        Err(PartitionConfigError::Zero)
-    } else {
-        Ok(())
-    }
+    kardamom_types::shard_map::validate_shard_count(m).map(|_| ())
 }
 
 #[cfg(test)]
@@ -59,9 +53,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_positive() {
+    fn validate_accepts_the_lane_plane_divisors() {
         assert!(validate_partition_count(1).is_ok());
+        assert!(validate_partition_count(2).is_ok());
         assert!(validate_partition_count(8).is_ok());
-        assert!(validate_partition_count(64).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_counts_outside_the_lane_plane() {
+        assert!(validate_partition_count(3).is_err());
+        assert!(validate_partition_count(64).is_err());
     }
 }
