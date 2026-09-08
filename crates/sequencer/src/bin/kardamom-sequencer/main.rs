@@ -295,7 +295,7 @@ async fn main() -> anyhow::Result<()> {
     // origin pumps.
     let (join_main, join_deposits, join_remote_epochs) = feeds::spawn_publish_loops(
         cfg_clone,
-        LiveTxDataSub::new(tx_data_sub),
+        LiveTxDataSub::new(tx_data_sub, shard_id),
         cluster_pub.clone(),
         cluster_pub.clone(),
         cluster_pub,

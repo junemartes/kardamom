@@ -31,6 +31,12 @@ pub trait TxDataSubscriber: Send {
     ///  - `Err(IngressDisconnected)` when the subscription is permanently
     ///    closed.
     fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError>;
+
+    /// The tx_data lane this subscription reads. Every envelope from
+    /// `poll` lives on this lane. The sequencer stamps it into
+    /// `TxRef::shard_id`, so the executor joins the ref against the
+    /// archive that holds the envelope.
+    fn lane(&self) -> u8;
 }
 
 // ===========================================================================
@@ -51,6 +57,8 @@ pub mod fakes {
     pub struct ScriptedTxData {
         pub queue: VecDeque<(TxDataLoc, TxEnvelope)>,
         pub disconnected: bool,
+        /// The lane the fake reads. Defaults to 0.
+        pub lane: u8,
     }
 
     impl TxDataSubscriber for ScriptedTxData {
@@ -59,6 +67,10 @@ pub mod fakes {
                 return Err(SequencerError::IngressDisconnected);
             }
             Ok(self.queue.pop_front())
+        }
+
+        fn lane(&self) -> u8 {
+            self.lane
         }
     }
 }

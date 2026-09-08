@@ -62,6 +62,9 @@ pub enum ExecutorError {
         oldest_block: u64,
     },
 
+    /// `sequencer_id` is the tx_data lane index, `TxRef::shard_id`. It
+    /// names the archive that holds the envelope, not the process that
+    /// published the ref.
     #[error("tx_data[{sequencer_id}] subscription closed")]
     TxDataClosed { sequencer_id: u8 },
 
@@ -75,8 +78,9 @@ pub enum ExecutorError {
     /// referenced envelope never appeared on tx_data within the join
     /// timeout. Either the tx_data publisher failed, or the sequencer
     /// published a ref to a position it never wrote. Both are upstream bugs.
+    /// `sequencer_id` is the lane the ref names, `TxRef::shard_id`.
     #[error(
-        "join timeout: TxRef(sequencer_id={sequencer_id}, tx_data_position={tx_data_position:?}) not found within {timeout_ms} ms"
+        "join timeout: TxRef(lane={sequencer_id}, tx_data_position={tx_data_position:?}) not found within {timeout_ms} ms"
     )]
     JoinTimeout {
         sequencer_id: u8,

@@ -81,6 +81,13 @@ struct RefMetadata {
     correlation_id: u64,
     /// Carries through to `TxRef.tx_hash`.
     tx_hash: alloy_primitives::B256,
+    /// The tx_data lane that holds the envelope. Carries through to
+    /// `TxRef.shard_id`. The executor joins the ref against the archive of
+    /// this lane. The subscription that received the envelope sets it.
+    /// Today the sequencer reads one lane, and the lane equals
+    /// `cfg.sequencer_id`. A resize lets one sequencer read several lanes
+    /// (see `docs/specs/dynamic-sequencer-sizing.md`).
+    lane: u8,
     /// The Aeron-offer position the proxy got back when it published this
     /// envelope onto tx_data. Downstream consumers use this to look up
     /// the envelope on the A archive.
@@ -149,7 +156,7 @@ impl Sequencer {
     fn make_txref(&self, meta: &RefMetadata) -> kardamom_types::TxRef {
         kardamom_types::TxRef::new(
             meta.tx_hash,
-            self.cfg.sequencer_id,
+            meta.lane,
             meta.tx_data_position,
             meta.tx_data_session_id,
         )
@@ -442,6 +449,7 @@ impl Sequencer {
         let meta = RefMetadata {
             correlation_id: envelope.correlation_id,
             tx_hash: envelope.tx_hash,
+            lane: channel_a.lane(),
             tx_data_position: tx_data_loc.position,
             tx_data_session_id: tx_data_loc.session_id,
         };

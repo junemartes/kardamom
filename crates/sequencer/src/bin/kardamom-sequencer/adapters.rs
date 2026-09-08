@@ -14,11 +14,13 @@ use kardamom_types::{BPosition, EpochRecord, TxDataLoc, TxEnvelope, TxError};
 
 pub struct LiveTxDataSub {
     handle: TxDataSubscriberHandle,
+    /// The lane the handle was opened on.
+    lane: u8,
 }
 
 impl LiveTxDataSub {
-    pub fn new(handle: TxDataSubscriberHandle) -> Self {
-        Self { handle }
+    pub fn new(handle: TxDataSubscriberHandle, lane: u8) -> Self {
+        Self { handle, lane }
     }
 }
 
@@ -27,6 +29,10 @@ impl TxDataSubscriber for LiveTxDataSub {
         // try_recv is non-blocking. The Sequencer's run loop handles
         // backoff when poll returns None.
         Ok(self.handle.try_recv())
+    }
+
+    fn lane(&self) -> u8 {
+        self.lane
     }
 }
 

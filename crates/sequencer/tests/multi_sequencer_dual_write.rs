@@ -88,7 +88,14 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
     let mut sequencers: Vec<Sequencer> = Vec::with_capacity(M as usize);
     let mut b_pubs: Vec<InMemoryTxOrderingRefPublisher> = Vec::with_capacity(M as usize);
     let mut rcs: Vec<InMemoryTxErrorPublisher> = Vec::with_capacity(M as usize);
-    let mut channels_a: Vec<ScriptedTxData> = (0..M).map(|_| ScriptedTxData::default()).collect();
+    // Each fake reads the lane of its shard. The sequencer stamps that lane
+    // into every ref.
+    let mut channels_a: Vec<ScriptedTxData> = (0..M)
+        .map(|i| ScriptedTxData {
+            lane: i as u8,
+            ..Default::default()
+        })
+        .collect();
     // sender_at_pos maps (shard, pos) to (sender, nonce). It checks that
     // the canonical B refs resolve to the expected envelopes.
     let mut sender_at_pos: HashMap<(u8, BPosition), (Address, u64)> = HashMap::new();
