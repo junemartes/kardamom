@@ -61,12 +61,17 @@ SEQ_IPS=()
 for ((i = 0; i < SEQ_COUNT; i++)); do SEQ_IPS+=("${IP_PREFIX}.$((SEQ_IP_START + i))"); done
 
 # --- image pin, as deploy.sh does --------------------------------------------
-IMAGE_REF_ARGS=()
+# One digest per service. The sequencer job and the ingress job each
+# take their own image_ref; the manifest line for one service must
+# never reach the other job, or the ingress runs the sequencer binary.
 DIGEST_MANIFEST="${DIGEST_MANIFEST:-${CLUSTER_DIR}/images.digests}"
-if [[ -f "${DIGEST_MANIFEST}" ]]; then
-  ref="$(awk '$1 == "sequencer" {print $2; exit}' "${DIGEST_MANIFEST}")"
-  [[ -n "${ref}" ]] && IMAGE_REF_ARGS=(-var "image_ref=${ref}")
-fi
+image_ref_args() { # <service> -> prints "-var image_ref=<ref>" or nothing
+  local ref=""
+  [[ -f "${DIGEST_MANIFEST}" ]] \
+    && ref="$(awk -v s="$1" '$1 == s { r = $2 } END { print r }' "${DIGEST_MANIFEST}" | tr -d '[:space:]\r')"
+  [[ -n "${ref}" ]] && printf -- '-var\nimage_ref=%s\n' "${ref}"
+  return 0
+}
 
 # --- helpers -------------------------------------------------------------------
 map_lanes() { # <map file> -> active lane count
@@ -100,10 +105,12 @@ wait_metric() { # <ip> <port> <metric> <want> <what> <timeout-s>
     sleep 2; t=$(( t + 2 ))
   done
 }
-run_job() { # <file> <what>
-  log "nomad job run $1 ($2)"
+run_job() { # <file> <service> <what>
+  local -a image_args=()
+  mapfile -t image_args < <(image_ref_args "$2")
+  log "nomad job run ${image_args[*]} $1 ($3)"
   if [[ "${DRY_RUN}" == "1" ]]; then return 0; fi
-  ( cd "${CLUSTER_DIR}" && nomad job run "${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}" "$1" ) \
+  ( cd "${CLUSTER_DIR}" && nomad job run "${image_args[@]+"${image_args[@]}"}" "$1" ) \
     || fail "nomad job run $1 failed"
 }
 wait_running() { # <job> <timeout-s>
@@ -145,7 +152,7 @@ for ((lane = 0; lane < TARGET; lane++)); do
   grep -q "\"--shadow-vslots\"" <(sed -n "/group \"seq-${lane}\"/,/^  }/p" "${JOB}") && GAINING+=("${lane}")
 done
 log "lanes that gain vslots (shadow first): ${GAINING[*]:-none}"
-run_job nomad/sequencer.nomad.hcl "overlap: new lanes in shadow mode"
+run_job nomad/sequencer.nomad.hcl sequencer "overlap: new lanes in shadow mode"
 wait_running sequencer 300
 
 # --- step 2: warm-up ----------------------------------------------------------------
@@ -163,7 +170,7 @@ fi
 
 # --- step 3: switch the ingress -------------------------------------------------------
 cp "${NEXT_MAP}" "${MAP}"
-run_job nomad/ingress.nomad.hcl "ingress on map $(sed -n -E 's/^version = //p' "${MAP}")"
+run_job nomad/ingress.nomad.hcl ingress "ingress on map $(sed -n -E 's/^version = //p' "${MAP}")"
 wait_running ingress 300
 
 # --- step 4: drain ----------------------------------------------------------------------
@@ -182,7 +189,21 @@ fi
 
 # --- step 5: the steady job -------------------------------------------------------------
 python3 "${SCRIPT_DIR}/render-sequencer-job.py" --map "${MAP}" > "${JOB}"
-run_job nomad/sequencer.nomad.hcl "steady: final vslot sets"
+run_job nomad/sequencer.nomad.hcl sequencer "steady: final vslot sets"
 wait_running sequencer 300
 rm -f "${NEXT_MAP}"
-log "done: ${TARGET} active lanes. Commit config/shard-map.toml and nomad/sequencer.nomad.hcl."
+log "done: ${TARGET} active lanes."
+# check-contract.py requires partition_count and the ingress --shards to
+# equal the active lane count of the committed map, and accepts a steady
+# count of 1, 2, 4, or 8 only. A committed resize that leaves them
+# behind fails the contract check. Say so here, so the operator commits
+# all four files together.
+case "${TARGET}" in
+  1|2|4|8)
+    log "commit together: config/shard-map.toml, nomad/sequencer.nomad.hcl,"
+    log "  ansible/group_vars/all.yml (partition_count: ${TARGET}),"
+    log "  nomad/ingress.nomad.hcl (\"--shards\", \"${TARGET}\")." ;;
+  *)
+    log "${TARGET} lanes is a transient count: the contract accepts a steady count of 1, 2, 4, or 8."
+    log "  Resize again toward one of those before you commit the map and the job." ;;
+esac

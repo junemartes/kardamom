@@ -305,12 +305,63 @@ ANVIL_ACCOUNTS = [
     "dF3e18d64BC6A983f673Ab319CCaE4f1a57C7097", "cd3B766CCDd6AE721141F452C550Ca635964ce71",
 ]
 if SHARD_MAP.exists() and len(table) == 256:
-    expected_shards = " ".join(str(table[keccak256(bytes.fromhex(a))[7]]) for a in ANVIL_ACCOUNTS)
-    m_acct = re.search(r"^ACCT_SHARD=\(([^)]*)\)", (CLUSTER / "scripts" / "chaos.sh").read_text(), re.M)
+    chaos_text = (CLUSTER / "scripts" / "chaos.sh").read_text()
+    vslots = [keccak256(bytes.fromhex(a))[7] for a in ANVIL_ACCOUNTS]
+    expected_shards = " ".join(str(table[v]) for v in vslots)
+    m_acct = re.search(r"^ACCT_SHARD=\(([^)]*)\)", chaos_text, re.M)
     if not m_acct:
         err("scripts/chaos.sh: missing ACCT_SHARD table")
     elif " ".join(m_acct.group(1).split()) != expected_shards:
         err(f"scripts/chaos.sh: ACCT_SHARD=({m_acct.group(1)}) but the shard map gives ({expected_shards})")
+    expected_vslots = " ".join(str(v) for v in vslots)
+    m_vslot = re.search(r"^ACCT_VSLOT=\(([^)]*)\)", chaos_text, re.M)
+    if not m_vslot:
+        err("scripts/chaos.sh: missing ACCT_VSLOT table")
+    elif " ".join(m_vslot.group(1).split()) != expected_vslots:
+        err(f"scripts/chaos.sh: ACCT_VSLOT=({m_vslot.group(1)}) but keccak gives ({expected_vslots})")
+
+    # The sequencer shard's account walk. chaos.sh pins the shard-0 cases to a
+    # shard-0 sender and the resize case to a sender that moves under the
+    # fewest-moves 2-to-3 render, and burns every skipped account. Walk that
+    # allocation over the shard's case list (ci-stages.sh appends the two
+    # dynamic-sizing cases), so a table or case-list change that runs out of
+    # funded accounts fails here, not two hours into the shard.
+    workflow = CLUSTER.parent.parent / ".github" / "workflows" / "cluster-e2e.yml"
+    m_shard = re.search(r'chaos-sequencer\)\s*\{([^}]*)\}', workflow.read_text()) if workflow.exists() else None
+    m_cases = re.search(r'CHAOS_CASES=([^"]*)"', m_shard.group(1)) if m_shard else None
+    if not m_cases:
+        err("workflows/cluster-e2e.yml: no chaos-sequencer shard with CHAOS_CASES")
+    else:
+        cases = m_cases.group(1).split()
+        if "sequencer-replica-kill" in cases and "resize-scale-out-in" not in cases:
+            cases += ["lookup-blackout", "resize-scale-out-in"]
+        run_load = "0" if "RUN_LOAD=0" in m_shard.group(1) else "1"
+        next_render = subprocess.run(
+            [sys.executable, str(CLUSTER / "scripts" / "render-shard-map.py"), "--from", str(SHARD_MAP), "--lanes", "3"],
+            capture_output=True,
+            text=True,
+        )
+        m_next = re.search(r"^table\s*=\s*\[([^\]]*)\]", next_render.stdout, re.M | re.S)
+        next_table = [int(x) for x in re.findall(r"\d+", m_next.group(1))] if m_next else table
+        shard0 = {"sequencer-replica-kill", "sequencer-lapse", "graceful-sequencer", "hard-sequencer", "lookup-blackout"}
+
+        def moves(acct: int) -> bool:
+            return next_table[vslots[acct]] != table[vslots[acct]]
+
+        acct = 7
+        for case in cases:
+            if case in shard0:
+                while acct <= 15 and table[vslots[acct]] != 0:
+                    acct += 1
+            elif case == "resize-scale-out-in":
+                while acct <= 15 and not moves(acct):
+                    acct += 1
+                if acct > 15 and run_load == "0":
+                    acct = next((a for a in range(1, 7) if moves(a)), 16)
+            if acct > 15:
+                err(f"scripts/chaos.sh: the chaos-sequencer shard runs out of funded accounts at {case} (#{acct} > 15)")
+                break
+            acct = acct + 1 if acct >= 7 else 16
 
 # --- executor nonce query -----------------------------------------------------------
 # Every executor serves the query on ports.executor_nonce_query. Both sequencer
