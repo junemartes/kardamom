@@ -24,7 +24,7 @@ step "rustfmt" cargo fmt --all -- --check
 forbidden() {
     local hits
     hits="$(grep -rnE --include='*.rs' \
-        -e 'debug_assert!' -e '\.max\(1\)' -e 'Box<dyn' -e 'allow\(clippy::too_many_arguments\)' \
+        -e 'debug_assert!' -e '\.max\(1\)' -e '\bdyn\b' -e 'allow\(clippy::too_many_arguments\)' \
         crates guest 2>/dev/null \
         | grep -vE '/tests?/|_tests?\.rs:|/tests\.rs:|/test_support' || true)"
     # `Box<` and `dyn` split over two lines by rustfmt: report the file and
@@ -40,7 +40,7 @@ forbidden() {
         return 1
     fi
 }
-step "forbidden patterns (debug_assert!, .max(1), Box<dyn, allow(too_many_arguments))" forbidden
+step "forbidden patterns (debug_assert!, .max(1), dyn, allow(too_many_arguments))" forbidden
 
 if [ "$failed" -ne 0 ]; then
     echo "style check failed. See docs/STYLE.md." >&2

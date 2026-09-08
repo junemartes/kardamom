@@ -134,6 +134,10 @@ struct Chunk<'a> {
     results: Results<'a>,
     base: usize,
     end: usize,
+    /// The whole block's tx count, already proven `<= MAX_BLOCK_TXS`.
+    /// [`Self::validate`] derives this chunk's indices from it, so no
+    /// per-index `.expect(..)` repeats the bound.
+    count: super::config::BlockTxCount,
 }
 
 impl Chunk<'_> {
@@ -157,7 +161,7 @@ impl Chunk<'_> {
     /// `i` must lie in the calling chunk's exclusive range.
     unsafe fn hash_one(&self, out: &HashOut, i: usize) {
         let r = self.results.get(i);
-        if !r.sink_touched {
+        if r.sink_fee_delta.is_none() {
             return;
         }
         unsafe { out.set(i, r.ws.hash()) };
@@ -166,17 +170,23 @@ impl Chunk<'_> {
     /// This chunk's validate pass: every wounded index — a recorded
     /// read the final mv lists no longer support.
     fn validate(&self, mv: &crate::mv::MvCache) -> Vec<usize> {
-        (self.base..self.end)
-            .filter(|&i| {
-                let idx = super::config::BlockTxIndex::new(i)
-                    .expect("chunk range bounded by MAX_BLOCK_TXS")
-                    .get();
+        // `BlockTxIndex` widens losslessly to `usize`: it is a `u32`
+        // already proven `<= MAX_BLOCK_TXS` (4,096), far inside
+        // `usize`'s range on every platform this workspace builds for.
+        self.count
+            .indices()
+            .skip(self.base)
+            // A lane whose `base` sits at or past `end` owns no index.
+            // Width zero is the correct value.
+            .take(self.end.saturating_sub(self.base))
+            .filter(|idx| {
                 self.results
-                    .get(i)
+                    .get(idx.get() as usize)
                     .reads
                     .iter()
-                    .any(|rec| !mv.validate(idx, rec))
+                    .any(|rec| !mv.validate(idx.get(), rec))
             })
+            .map(|idx| idx.get() as usize)
             .collect()
     }
 }
@@ -272,6 +282,15 @@ fn fold_inline(results: Results<'_>, recycle: &RecyclePools) -> PendingDelta {
     fold.finish()
 }
 
+/// [`serial_hash_and_validate`]'s two phase timers, bundled so the
+/// function takes one argument for them instead of two loose ones. Both
+/// fields are references, so this is `Copy`.
+#[derive(Clone, Copy)]
+struct SerialTimers<'a> {
+    val_ns: &'a std::sync::atomic::AtomicU64,
+    fold_ns: &'a std::sync::atomic::AtomicU64,
+}
+
 /// The opt-in fully-serial tail (`KARDAMOM_STM_SERIAL_TAIL`): validate
 /// every recorded read on this one thread, then fold and hash only if
 /// nothing wounded. See `block_tail`'s serial-vs-lanes doc for why this
@@ -282,21 +301,25 @@ fn serial_hash_and_validate<S: StateDatabase>(
     hashes: &mut [B256],
     delta_out: Option<&DeltaOut>,
     recycle: &RecyclePools,
-    val_ns: &std::sync::atomic::AtomicU64,
-    fold_ns: &std::sync::atomic::AtomicU64,
+    timers: SerialTimers<'_>,
 ) -> (std::sync::Arc<PendingDelta>, Vec<usize>) {
+    let SerialTimers { val_ns, fold_ns } = timers;
     let t0 = std::time::Instant::now();
-    let wounded: Vec<usize> = (0..tx_results.len())
-        .filter(|i| {
-            let idx = super::config::BlockTxIndex::new(*i)
-                .expect("result range bounded by MAX_BLOCK_TXS")
-                .get();
+    // `BlockTxIndex` widens losslessly to `usize`: it is a `u32` already
+    // proven `<= MAX_BLOCK_TXS` (4,096), far inside `usize`'s range on
+    // every platform this workspace builds for.
+    let count = super::config::BlockTxCount::new(tx_results.len())
+        .expect("admission caps a block at MAX_BLOCK_TXS");
+    let wounded: Vec<usize> = count
+        .indices()
+        .filter(|idx| {
             tx_results
-                .get(*i)
+                .get(idx.get() as usize)
                 .reads
                 .iter()
-                .any(|rec| !ctx.mv.validate(idx, rec))
+                .any(|rec| !ctx.mv.validate(idx.get(), rec))
         })
+        .map(|idx| idx.get() as usize)
         .collect();
     val_ns.fetch_add(nanos(t0.elapsed()), Ordering::Relaxed);
     if !wounded.is_empty() {
@@ -313,9 +336,107 @@ fn serial_hash_and_validate<S: StateDatabase>(
     tx_results
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.sink_touched)
+        .filter(|(_, r)| r.sink_fee_delta.is_some())
         .for_each(|(i, r)| hashes[i] = r.ws.hash());
     (delta_arc, wounded)
+}
+
+/// [`lanes_hash_and_validate`]'s inputs, bundled so the function takes
+/// one argument for them instead of seven loose parameters.
+struct LaneHashInput<'a, S: StateDatabase> {
+    tx_results: Results<'a>,
+    count: super::config::BlockTxCount,
+    n_res: usize,
+    ctx: &'a BlockCtx<S>,
+    delta_out: Option<&'a DeltaOut>,
+    recycle: &'a RecyclePools,
+    lanes: &'a crate::pool::WorkerPool,
+}
+
+/// The persistent-lanes tail (the production default): hash and
+/// validate, chunked by index, on threads the pool created once.
+/// Per-block scoped spawns cost a large share of the tail once the
+/// witness hash got cheap. The fold runs here, on the tail thread,
+/// concurrently with the lanes and without a join before the release
+/// point.
+fn lanes_hash_and_validate<S: StateDatabase>(
+    input: &LaneHashInput<'_, S>,
+    hashes: &mut [B256],
+    timers: SerialTimers<'_>,
+) -> (std::sync::Arc<PendingDelta>, Vec<usize>) {
+    // Every field is `Copy` (a small integer, or a reference), so a
+    // field access here copies it out instead of borrowing `input`.
+    let tx_results = input.tx_results;
+    let count = input.count;
+    let n_res = input.n_res;
+    let ctx = input.ctx;
+    let delta_out = input.delta_out;
+    let recycle = input.recycle;
+    let lanes = input.lanes;
+    let SerialTimers { val_ns, fold_ns } = timers;
+    // An empty block has no chunks to hash: `lanes.run(0, ..)` is a
+    // no-op.
+    let (n_ch, chunk) = std::num::NonZeroUsize::new(n_res).map_or((0, 0), |n| {
+        let n_ch = lanes.workers().get().min(n.get());
+        (n_ch, n_res.div_ceil(n_ch))
+    });
+    let mut wounded_parts: Vec<Vec<usize>> = (0..n_ch).map(|_| Vec::new()).collect();
+    let out = HashOut(hashes.as_mut_ptr());
+    let wounded_out = WoundedOut(wounded_parts.as_mut_ptr());
+    let mv = &ctx.mv;
+    let lane_metrics = &ctx.metrics;
+    let results_ref = tx_results;
+    let lane_body = |ci: usize| {
+        let t_lane0 = std::time::Instant::now();
+        let base = ci * chunk;
+        let end = (base + chunk).min(n_res);
+        let c = Chunk {
+            results: results_ref,
+            base,
+            end,
+            count,
+        };
+        // SAFETY: chunk `ci` owns `[base, end)` exclusively; no
+        // other chunk writes into it.
+        unsafe { c.hash_into(&out) };
+        let t0 = std::time::Instant::now();
+        let local = c.validate(mv);
+        val_ns.fetch_add(nanos(t0.elapsed()), Ordering::Relaxed);
+        lane_metrics
+            .commit_lane_ns
+            .fetch_add(nanos(t_lane0.elapsed()), Ordering::Relaxed);
+        if !local.is_empty() {
+            // SAFETY: `ci` is this lane's own chunk index.
+            unsafe { wounded_out.set(ci, local) };
+        }
+    };
+    std::thread::scope(|sc| {
+        // One scoped thread only to drive the lanes, so the fold can
+        // run on this thread concurrently and reach the release point
+        // without waiting for the hash work.
+        let driver = sc.spawn(|| {
+            lanes
+                .run(n_ch, &|_lane, i| lane_body(i))
+                .expect("tail lane panicked");
+        });
+        let t_fold = std::time::Instant::now();
+        let delta_arc = std::sync::Arc::new(fold_inline(tx_results, recycle));
+        fold_ns.fetch_add(nanos(t_fold.elapsed()), Ordering::Relaxed);
+        if let Some(d) = &delta_out
+            && d.speculative
+        {
+            d.release(ctx.env.block_number, delta_arc.clone(), false);
+        }
+        // The closure already turned a contained lane panic into this
+        // thread's own panic; joining re-raises it here, so a lane
+        // panic still fails the block instead of the tail thread
+        // running past it with partial hashes.
+        driver.join().expect("lane driver");
+        // Lanes are done, since run() returned inside the driver, so
+        // the borrow is over. Collect the per-chunk lists in order.
+        let wounded: Vec<usize> = wounded_parts.into_iter().flatten().collect();
+        (delta_arc, wounded)
+    })
 }
 
 impl<S: StateDatabase + Sync> Tail<S> {
@@ -336,6 +457,12 @@ impl<S: StateDatabase + Sync> Tail<S> {
         let tx_results = Results(&self.ctx.results[..self.n]);
         let t_h = std::time::Instant::now();
         let n_res = tx_results.len();
+        // Proves the `MAX_BLOCK_TXS` bound once, here, at the point
+        // `n_res` is computed. Every index this tail derives from it
+        // (the serial path and the chunked lanes) reuses this proof
+        // instead of re-checking the bound as an `.expect(..)` claim.
+        let count = super::config::BlockTxCount::new(n_res)
+            .expect("admission caps a block at MAX_BLOCK_TXS");
         let mut hashes: Vec<B256> = vec![B256::ZERO; n_res];
         let val_ns = std::sync::atomic::AtomicU64::new(0);
         let fold_ns = std::sync::atomic::AtomicU64::new(0);
@@ -368,82 +495,28 @@ impl<S: StateDatabase + Sync> Tail<S> {
                 &mut hashes,
                 delta_out,
                 recycle,
-                &val_ns,
-                &fold_ns,
+                SerialTimers {
+                    val_ns: &val_ns,
+                    fold_ns: &fold_ns,
+                },
             )
         } else {
-            // Persistent lanes (crate::pool): hash and validate,
-            // chunked by index, on threads the pool created once.
-            // Per-block scoped spawns cost a large share of the tail
-            // once the witness hash got cheap. The fold runs here, on
-            // the tail thread, concurrently with the lanes and without
-            // a join before the release point.
-
-            // An empty block has no chunks to hash: `n_ch` stays 0, and
-            // `lanes.run(0, ..)` is a no-op, rather than clamping
-            // `n_res` up to 1 to keep the later `div_ceil` from a zero
-            // divisor.
-            let n_ch = std::num::NonZeroUsize::new(n_res)
-                .map_or(0, |n| lanes.workers().get().min(n.get()));
-            let chunk = if n_ch == 0 { 0 } else { n_res.div_ceil(n_ch) };
-            let mut wounded_parts: Vec<Vec<usize>> = (0..n_ch).map(|_| Vec::new()).collect();
-            let out = HashOut(hashes.as_mut_ptr());
-            let wounded_out = WoundedOut(wounded_parts.as_mut_ptr());
-            let mv = &ctx.mv;
-            let val_ns_ref = &val_ns;
-            let lane_metrics = &ctx.metrics;
-            let results_ref = tx_results;
-            let lane_body = |ci: usize| {
-                let t_lane0 = std::time::Instant::now();
-                let base = ci * chunk;
-                let end = (base + chunk).min(n_res);
-                let c = Chunk {
-                    results: results_ref,
-                    base,
-                    end,
-                };
-                // SAFETY: chunk `ci` owns `[base, end)` exclusively; no
-                // other chunk writes into it.
-                unsafe { c.hash_into(&out) };
-                let t0 = std::time::Instant::now();
-                let local = c.validate(mv);
-                val_ns_ref.fetch_add(nanos(t0.elapsed()), Ordering::Relaxed);
-                lane_metrics
-                    .commit_lane_ns
-                    .fetch_add(nanos(t_lane0.elapsed()), Ordering::Relaxed);
-                if !local.is_empty() {
-                    // SAFETY: `ci` is this lane's own chunk index.
-                    unsafe { wounded_out.set(ci, local) };
-                }
-            };
-            std::thread::scope(|sc| {
-                // One scoped thread only to drive the lanes, so the
-                // fold can run on this thread concurrently and reach
-                // the release point without waiting for the hash work.
-                let driver = sc.spawn(|| {
-                    lanes
-                        .run(n_ch, &|_lane, i| lane_body(i))
-                        .expect("tail lane panicked");
-                });
-                let t_fold = std::time::Instant::now();
-                let delta_arc = std::sync::Arc::new(fold_inline(tx_results, recycle));
-                fold_ns.fetch_add(nanos(t_fold.elapsed()), Ordering::Relaxed);
-                if let Some(d) = &delta_out
-                    && d.speculative
-                {
-                    d.release(ctx.env.block_number, delta_arc.clone(), false);
-                }
-                // The closure already turned a contained lane panic into
-                // this thread's own panic; joining re-raises it here, so
-                // a lane panic still fails the block instead of the tail
-                // thread running past it with partial hashes.
-                driver.join().expect("lane driver");
-                // Lanes are done, since run() returned inside the
-                // driver, so the borrow is over. Collect the per-chunk
-                // lists in order.
-                let wounded: Vec<usize> = wounded_parts.into_iter().flatten().collect();
-                (delta_arc, wounded)
-            })
+            lanes_hash_and_validate(
+                &LaneHashInput {
+                    tx_results,
+                    count,
+                    n_res,
+                    ctx,
+                    delta_out,
+                    recycle,
+                    lanes,
+                },
+                &mut hashes,
+                SerialTimers {
+                    val_ns: &val_ns,
+                    fold_ns: &fold_ns,
+                },
+            )
         };
         self.hash_ns = self.hash_ns.saturating_add(nanos(t_h.elapsed()));
         self.val_ns = val_ns.load(Ordering::Relaxed);
@@ -589,7 +662,7 @@ impl<S: StateDatabase + Sync> Tail<S> {
             busy_us: m.busy_ns.load(Ordering::Relaxed) / 1_000,
             parallel_span_us,
             ramp_us,
-            commit_us: u64::try_from(t_commit.as_micros()).unwrap_or(u64::MAX),
+            commit_us: nanos(t_commit) / 1_000,
             commit_hash_us: hash_ns / 1_000,
             commit_delta_us: delta_ns / 1_000,
             decode_us: decode_ns / 1_000,

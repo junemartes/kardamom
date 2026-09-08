@@ -154,6 +154,20 @@ impl<S: L1Source, P: EpochPublisher> Tick<'_, S, P> {
         }))
     }
 
+    /// Take block `number`'s logs out of `by_block` (empty when the block
+    /// had none) and publish its epoch. For [`process_once`]'s loop.
+    ///
+    /// # Errors
+    /// Same as [`Self::publish_one_epoch`].
+    async fn publish_block(
+        &mut self,
+        by_block: &mut std::collections::BTreeMap<u64, Vec<LockboxLog>>,
+        number: u64,
+    ) -> Result<PublishStep, MonitorError> {
+        let logs = by_block.remove(&number).unwrap_or_default();
+        self.publish_one_epoch(number, logs).await
+    }
+
     /// Derive block `number`'s epoch from `logs` and its L1 hash, and
     /// publish it. Advances the cursor to `number` on a successful
     /// publish.
@@ -271,8 +285,7 @@ where
 
     let mut published_count = 0usize;
     for number in range.from_block..=range.tip {
-        let logs = range.by_block.remove(&number).unwrap_or_default();
-        match tick.publish_one_epoch(number, logs).await? {
+        match tick.publish_block(&mut range.by_block, number).await? {
             PublishStep::Published => published_count += 1,
             PublishStep::Halt => return Ok(published_count),
         }

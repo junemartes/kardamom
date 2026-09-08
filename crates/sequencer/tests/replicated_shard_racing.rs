@@ -242,6 +242,23 @@ fn rejoining_replica_with_empty_db_stalls_but_never_corrupts() {
 /// during a chaos outage, so it never reaches `tx_data`. The sender stalls
 /// at the hole, and every published nonce run stays dense: nothing past
 /// the hole is ever published.
+/// Reconstruct `(sender, nonce)` for `loc`/`env`'s published ref, if it
+/// published, and record it in `per_sender`. For
+/// `client_abandoned_nonce_hole_is_never_published_past`'s loop.
+fn record_sender_nonce(
+    refs: &[TxRef],
+    loc: &TxDataLoc,
+    env: &TxEnvelope,
+    per_sender: &mut HashMap<Address, Vec<u64>>,
+) {
+    let Some(r) = refs.iter().find(|r| r.tx_data_position == loc.position) else {
+        return;
+    };
+    let e = alloy_consensus::TxEnvelope::decode(&mut env.raw_tx.as_ref()).unwrap();
+    assert_eq!(r.tx_hash, env.tx_hash);
+    per_sender.entry(env.sender).or_default().push(e.nonce());
+}
+
 #[test]
 fn client_abandoned_nonce_hole_is_never_published_past() {
     let full = shard_stream();
@@ -265,25 +282,27 @@ fn client_abandoned_nonce_hole_is_never_published_past() {
     // Nothing at or past the hole appears, and every sender's run is
     // gapless.
     let mut per_sender: HashMap<_, Vec<u64>> = HashMap::new();
-    for (loc, env) in stream.iter() {
-        // Reconstruct (sender, nonce) for each published ref via its position.
-        if let Some(r) = refs.iter().find(|r| r.tx_data_position == loc.position) {
-            let e = alloy_consensus::TxEnvelope::decode(&mut env.raw_tx.as_ref()).unwrap();
-            assert_eq!(r.tx_hash, env.tx_hash);
-            per_sender.entry(env.sender).or_default().push(e.nonce());
-        }
+    for (loc, env) in &stream {
+        record_sender_nonce(&refs, loc, env, &mut per_sender);
     }
-    for (sender, mut nonces) in per_sender {
-        nonces.sort_unstable();
-        let expect_len = if sender == victim {
-            3 // 0,1,2, stalled at the hole
-        } else {
-            usize::try_from(TX_PER_SENDER).unwrap()
-        };
-        assert_eq!(
-            nonces,
-            (0..expect_len as u64).collect::<Vec<_>>(),
-            "sender {sender:?} must publish a dense prefix only"
-        );
+    for (sender, nonces) in per_sender {
+        assert_dense_prefix(sender, nonces, victim);
     }
+}
+
+/// `sender`'s published nonces must be the dense prefix `0..expect_len`:
+/// 3 (stalled at the hole) for `victim`, the full run otherwise. For
+/// `client_abandoned_nonce_hole_is_never_published_past`'s loop.
+fn assert_dense_prefix(sender: Address, mut nonces: Vec<u64>, victim: Address) {
+    nonces.sort_unstable();
+    let expect_len = if sender == victim {
+        3 // 0,1,2, stalled at the hole
+    } else {
+        usize::try_from(TX_PER_SENDER).unwrap()
+    };
+    assert_eq!(
+        nonces,
+        (0..expect_len as u64).collect::<Vec<_>>(),
+        "sender {sender:?} must publish a dense prefix only"
+    );
 }

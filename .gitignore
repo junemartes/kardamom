@@ -27,3 +27,6 @@ __pycache__/
 deploy/cluster/images.digests
 deploy/cluster/images.digests.sigbundle
 
+
+# dhat heap profiles written by crates/bench alloc_profile tests
+crates/bench/dhat-heap*.json

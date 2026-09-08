@@ -55,21 +55,13 @@ impl CheckpointManifest {
     /// Returns [`StateError::Recovery`] if `text` is missing `block`,
     /// `image_keccak`, or `genesis_digest`, or any of them fails to parse.
     pub(crate) fn parse(text: &str) -> Result<Self, StateError> {
-        let mut block = None;
-        let mut image_keccak = None;
-        let mut genesis_digest = None;
-        for line in text.lines() {
-            let Some((k, v)) = line.split_once('=') else {
-                continue;
-            };
-            match k.trim() {
-                "block" => block = v.trim().parse::<u64>().ok(),
-                "image_keccak" => image_keccak = v.trim().parse::<B256>().ok(),
-                "genesis_digest" => genesis_digest = v.trim().parse::<B256>().ok(),
-                _ => {}
-            }
-        }
-        match (block, image_keccak, genesis_digest) {
+        let fields = text
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .fold(ManifestFields::default(), |f, (k, v)| {
+                f.with(k.trim(), v.trim())
+            });
+        match (fields.block, fields.image_keccak, fields.genesis_digest) {
             (Some(block), Some(image_keccak), Some(genesis_digest)) => Ok(Self {
                 block,
                 image_keccak,
@@ -80,6 +72,31 @@ impl CheckpointManifest {
                     .into(),
             )),
         }
+    }
+}
+
+/// Accumulates [`CheckpointManifest::parse`]'s three optional fields
+/// while it folds over the manifest's `key=value` lines.
+#[derive(Default)]
+struct ManifestFields {
+    block: Option<u64>,
+    image_keccak: Option<B256>,
+    genesis_digest: Option<B256>,
+}
+
+impl ManifestFields {
+    /// Fold in one already-trimmed `key`/`value` pair. An unrecognized
+    /// key is ignored (the format is forward-compatible); a recognized
+    /// key that fails to parse clears that field, matching a malformed
+    /// or duplicate line overwriting an earlier valid one.
+    fn with(mut self, k: &str, v: &str) -> Self {
+        match k {
+            "block" => self.block = v.parse::<u64>().ok(),
+            "image_keccak" => self.image_keccak = v.parse::<B256>().ok(),
+            "genesis_digest" => self.genesis_digest = v.parse::<B256>().ok(),
+            _ => {}
+        }
+        self
     }
 }
 
@@ -104,12 +121,8 @@ pub(crate) fn file_keccak(path: &Path) -> Result<B256, StateError> {
     let mut f = std::fs::File::open(path)?;
     let mut hasher = alloy_primitives::Keccak256::new();
     let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
+    while let Some(n) = std::num::NonZeroUsize::new(f.read(&mut buf)?) {
+        hasher.update(&buf[..n.get()]);
     }
     Ok(hasher.finalize())
 }

@@ -10,7 +10,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use kardamom_cluster_client::session::{DriverEvent, SessionDriver};
 use kardamom_log::aeron_live::{AeronRuntime, IdleBackoff, PubHandle, RawFrame};
 
-use super::endpoints::{now_ms, open_leader_pub, open_next_member_pub, to_aligned};
+use super::endpoints::{now_ms, now_ms_i64, open_leader_pub, open_next_member_pub, to_aligned};
 use super::{LiveClusterConfig, OfferReq, ReplayOnConnect};
 use crate::gateway::OfferOutcome;
 
@@ -392,10 +392,7 @@ impl SessionLoop {
             return;
         }
         let req = crate::wire::encode_subscribe();
-        if let Some(framed) = self
-            .driver
-            .wrap_app(&req, i64::try_from(now).unwrap_or(i64::MAX))
-        {
+        if let Some(framed) = self.driver.wrap_app(&req, now_ms_i64(now)) {
             if let Err(e) = self.ingress.publish_bytes(to_aligned(&framed)) {
                 tracing::warn!(
                     error = %e,
@@ -430,10 +427,7 @@ impl SessionLoop {
             self.replay_resend.last_ms = Some(now);
         } else if self.replay_resend.due(now) {
             let req = crate::wire::encode_replay_request(cursor.0, cursor.1);
-            if let Some(framed) = self
-                .driver
-                .wrap_app(&req, i64::try_from(now).unwrap_or(i64::MAX))
-            {
+            if let Some(framed) = self.driver.wrap_app(&req, now_ms_i64(now)) {
                 // This is a retrying publish, not best-effort. This rare,
                 // critical message is sent exactly when the ingress
                 // publication is at its busiest (mass reconnects under
@@ -494,22 +488,25 @@ impl SessionLoop {
     /// any offer was serviced (feeds `worked`).
     fn handle_offers(&mut self, now: u64) -> bool {
         let mut worked = false;
-        while let Some(OfferReq { payload, reply }) = next_item(&self.req_rx, &mut self.req_rx_dead)
-        {
+        while let Some(req) = next_item(&self.req_rx, &mut self.req_rx_dead) {
             worked = true;
-            let outcome = match self
-                .driver
-                .wrap_app(&payload, i64::try_from(now).unwrap_or(i64::MAX))
-            {
-                Some(framed) => match self.ingress.publish_bytes(to_aligned(&framed)) {
-                    Ok(_) => OfferOutcome::Accepted,
-                    Err(_) => OfferOutcome::BackPressured,
-                },
-                None => OfferOutcome::NotConnected,
-            };
-            let _ = reply.send(outcome);
+            self.handle_one_offer(req, now);
         }
         worked
+    }
+
+    /// One offer request, for [`Self::handle_offers`]'s loop: wrap and
+    /// publish the payload, then reply with the outcome.
+    fn handle_one_offer(&mut self, req: OfferReq, now: u64) {
+        let OfferReq { payload, reply } = req;
+        let outcome = match self.driver.wrap_app(&payload, now_ms_i64(now)) {
+            Some(framed) => match self.ingress.publish_bytes(to_aligned(&framed)) {
+                Ok(_) => OfferOutcome::Accepted,
+                Err(_) => OfferOutcome::BackPressured,
+            },
+            None => OfferOutcome::NotConnected,
+        };
+        let _ = reply.send(outcome);
     }
 
     /// Wait for work instead of sleeping through it. Block until an

@@ -58,5 +58,4 @@ The judgment rules (R1, R5, R6, R7, R9, R10, R14, R15, R16) are reviewed by read
 
 ## Audit
 
-The audit of 2026-09-07 applied these rules to the whole workspace. Its report, per-crate
-findings, and status files are under `docs/reviews/2026-09-07-code-quality-audit/`.
+The audit of 2026-09-07 applied these rules to the whole workspace (PR #275).

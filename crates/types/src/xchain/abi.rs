@@ -30,11 +30,6 @@ pub fn inbox_deliver_selector() -> [u8; 4] {
 /// the static callback tuple inlined as three words — then `data`'s length
 /// word and its right-padded bytes. `callback: None` encodes as the zeroed
 /// tuple, which is exactly what `XChain.isNone` tests for.
-///
-/// # Panics
-///
-/// Panics if `msg.input` is 4 GiB or larger — no calldata this crate
-/// produces reaches that size; the ingress and gas limits rule it out.
 pub fn deliver_calldata(origin_chain_id: u64, msg: &XChainMessage) -> Vec<u8> {
     const HEAD_WORDS: usize = 10;
     // `HEAD_WORDS * 32`: the byte offset where `data`'s tail begins, as the
@@ -60,7 +55,7 @@ pub fn deliver_calldata(origin_chain_id: u64, msg: &XChainMessage) -> Vec<u8> {
         .address(cb.target)
         .u64(cb.gas_limit)
         .bytes(cb.context.as_slice())
-        .u64(u64::try_from(data.len()).expect("calldata is under u64::MAX bytes"))
+        .u64(crate::num::usize_to_u64(data.len()))
         .into_vec();
     out.extend_from_slice(data);
     out.resize(out.len() + (padded_len - data.len()), 0);

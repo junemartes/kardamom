@@ -136,10 +136,8 @@ pub(crate) fn write_flight_dump(
 ) -> std::io::Result<std::path::PathBuf> {
     let dir = std::env::var("KARDAMOM_FLIGHT_DIR").unwrap_or_else(|_| "/opt/kardamom/state".into());
     let path = std::path::Path::new(&dir).join(file_name);
-    std::fs::write(
-        &path,
-        serde_json::to_vec_pretty(payload).unwrap_or_default(),
-    )?;
+    let bytes = serde_json::to_vec_pretty(payload).map_err(std::io::Error::other)?;
+    std::fs::write(&path, bytes)?;
     Ok(path)
 }
 

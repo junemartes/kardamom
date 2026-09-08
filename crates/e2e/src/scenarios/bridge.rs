@@ -472,6 +472,9 @@ impl<P: Provider + Clone> OutputFinder<'_, P> {
     /// one that commits to `self.withdrawals_root` paired with an observed
     /// validator state root.
     async fn find_matching_posted_output(&self, observed: &[B256]) -> Result<Option<(U256, B256)>> {
+        // A poll tick: a transient RPC failure here just means "nothing
+        // found this tick", the same as scanning zero outputs — the next
+        // tick retries.
         let count = self
             .oracle
             .outputCount()
@@ -480,15 +483,19 @@ impl<P: Provider + Clone> OutputFinder<'_, P> {
             .unwrap_or(U256::ZERO)
             .to::<u64>();
         for i in (0..count).rev() {
-            let idx = U256::from(i);
-            let Ok(posted) = self.oracle.outputRootAt(idx).call().await else {
-                continue;
-            };
-            if let Some(root) = matching_observed_root(observed, posted, self.withdrawals_root) {
-                return Ok(Some((idx, root)));
+            if let Some(found) = self.matching_output_at(U256::from(i), observed).await {
+                return Ok(Some(found));
             }
         }
         Ok(None)
+    }
+
+    /// Read one posted output and check whether it commits to an observed
+    /// root. `None` on an RPC failure (the same poll-retry convention as
+    /// [`Self::find_matching_posted_output`]) or on no match.
+    async fn matching_output_at(&self, idx: U256, observed: &[B256]) -> Option<(U256, B256)> {
+        let posted = self.oracle.outputRootAt(idx).call().await.ok()?;
+        matching_observed_root(observed, posted, self.withdrawals_root).map(|root| (idx, root))
     }
 }
 

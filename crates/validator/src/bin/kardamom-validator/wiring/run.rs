@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_engine::bin_support;
 use kardamom_engine::{
-    Either, EngineWiring, ExecPorts, Executor, ExecutorError, Inbound, Outbound, RoleHooks,
+    Either, EngineWiring, ExecPorts, Executor, ExecutorError, Outbound, RoleHooks,
 };
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_state::StateEnv;
@@ -100,15 +100,20 @@ pub(crate) struct Ready {
 
 /// The validator role's port types. The epoch check is the L1-re-deriving
 /// [`epoch_verify::EpochVerifier`].
-struct ValidatorWiring;
+///
+/// `pub(super)` so [`super::startup::Opened::open_streams`] can name it
+/// for [`bin_support::open_inbound`].
+pub(super) struct ValidatorWiring;
 
 /// The validator's whole-block execution strategy, chosen at startup:
 /// seeded parallel batches (`--parallel-validation`), or the prover
 /// spool's sequential path (`--prove-batches` alone). `None` (neither
 /// flag) keeps the engine's streaming per-tx path byte-for-byte; see
 /// [`build_block_exec`].
-type ValidatorBlockExec =
-    Either<kardamom_validator::parallel::ParallelBlockExec, kardamom_validator::prover::SequentialBlockExec>;
+type ValidatorBlockExec = Either<
+    kardamom_validator::parallel::ParallelBlockExec,
+    kardamom_validator::prover::SequentialBlockExec,
+>;
 
 impl ExecPorts for ValidatorWiring {
     type Snapshots = kardamom_engine::MdbxSnapshotSource;
@@ -287,10 +292,8 @@ impl Ready {
                                         },
                                     streams:
                                         StreamsState {
-                                            tx_data_subs,
-                                            join_recovery,
+                                            inbound,
                                             cluster_guard,
-                                            tx_ordering_sub,
                                             divergence,
                                             pump_shutdown,
                                             ..
@@ -312,13 +315,7 @@ impl Ready {
         let join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
             Executor::run::<ValidatorWiring>(
                 cfg,
-                Inbound {
-                    tx_data: tx_data_subs,
-                    tx_ordering: tx_ordering_sub,
-                    // Join-miss archive refetch (None on single-host/IPC
-                    // runs).
-                    join_recovery,
-                },
+                inbound,
                 Outbound {
                     tx_receipts: tx_receipts_pub,
                     snapshots,
@@ -469,20 +466,22 @@ fn build_block_exec(
             WorkerCount::Fixed(n) => n.min(MAX_WORKERS),
         };
         tracing::info!(
-            batch_size = args.validation_batch_size.get(),
+            batch_size = args.validation_batch_size.get().get(),
             workers = workers.get(),
             "parallel validation ENABLED (seeded BAL batches on the shared pool)"
         );
-        Some(Either::Left(kardamom_validator::parallel::parallel_block_exec(
-            claims,
-            args.validation_batch_size,
-            workers,
-            Some(flight),
-        )))
+        Some(Either::Left(
+            kardamom_validator::parallel::parallel_block_exec(
+                claims,
+                args.validation_batch_size,
+                workers,
+                Some(flight),
+            ),
+        ))
     } else if args.prove_batches.is_some() {
-        Some(Either::Right(kardamom_validator::prover::sequential_block_exec(
-            flight,
-        )))
+        Some(Either::Right(
+            kardamom_validator::prover::sequential_block_exec(flight),
+        ))
     } else {
         None
     }
@@ -547,31 +546,37 @@ impl Shutdown {
     /// Wait for the engine loop to finish, or a shutdown signal, whichever
     /// comes first; then shut everything down in order and classify the
     /// result.
-    async fn wait(mut self) -> EngineOutcome {
+    async fn wait(self) -> EngineOutcome {
+        let Self {
+            join,
+            pumps,
+            rt,
+            cluster_guard,
+            mut writer,
+            divergence,
+        } = self;
         // Exit on whichever comes first: an operator shutdown signal, or
         // the engine loop finishing on its own (a divergence stop or a
         // stream error). Waiting only for SIGTERM would leave a halted
         // validator looking "alive", with metrics up and the chain
         // frozen, hiding the very stop signal the divergence machinery
         // exists to surface.
-        let engine_result = tokio::select! {
-            () = bin_support::wait_for_shutdown() => {
-                tracing::info!("kardamom-validator: shutdown signal received; dropping runtime");
-                None
-            }
-            res = &mut self.join => Some(res),
-        };
+        //
         // Order matters: cancel the pumps first so the tx_bal pump
         // releases its AeronRuntime clone, then release the runtime and
         // the cluster session.
-        self.pumps.cancel();
-        stop_streams(self.cluster_guard, self.rt);
-        let joined = match engine_result {
-            Some(r) => r,
-            None => self.join.await,
-        };
-        let engine_error = classify_engine_result(joined, &self.divergence);
-        if let Err(e) = self.writer.shutdown() {
+        let joined = bin_support::EngineShutdown {
+            bin_name: "kardamom-validator",
+            join,
+            streams: bin_support::LiveStreams { rt, cluster_guard },
+            before_drop: || {
+                pumps.cancel();
+            },
+        }
+        .wait()
+        .await;
+        let engine_error = classify_engine_result(joined, &divergence);
+        if let Err(e) = writer.shutdown() {
             tracing::error!(error = %e, "state writer shutdown returned an error");
         }
         // If this line is present in the log, the clean-shutdown path ran
@@ -581,14 +586,6 @@ impl Shutdown {
         tracing::info!("validator shutdown: state writer stopped");
         engine_error
     }
-}
-
-/// Release the cluster session and the Aeron runtime. `rt`, bound last,
-/// drops first at this function's scope end, then `cluster_guard`: the
-/// order the caller's cancelled pumps expect.
-fn stop_streams(cluster_guard: LiveCluster, rt: AeronRuntime) {
-    let _held_cluster_guard = cluster_guard;
-    let _held_rt = rt;
 }
 
 /// The joined engine loop's outcome: a clean return, an engine-level

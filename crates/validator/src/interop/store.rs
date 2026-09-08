@@ -235,6 +235,9 @@ impl FeedStore {
         let retention_blocks = self.retention_blocks.get();
         self.state.read(|g| {
             let cutoff = g.head_block.saturating_sub(retention_blocks);
+            // No resume block (a fresh, non-resumed store) means no
+            // resume floor: 0 imposes none, since `cutoff` already sets
+            // the real lower bound.
             let floor_block = cutoff.max(self.resume_block.unwrap_or(0));
             match g.lanes.get(&dest) {
                 Some(lane) => {
@@ -322,6 +325,8 @@ impl AttestationStore {
                 .filter(|a| a.block_number >= from_block)
                 .copied()
                 .collect(),
+            // An empty ring has no floor to report; 0 reads as "no
+            // attestation has been evicted yet", the correct default.
             floor: g.front().map_or(0, |a| a.block_number),
         })
     }

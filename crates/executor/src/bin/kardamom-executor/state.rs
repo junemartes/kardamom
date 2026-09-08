@@ -1,6 +1,8 @@
 //! State backend startup: checkpoint serve/restore, env open, the durable
 //! cursor, the periodic checkpointer task, and the resume decision.
 
+use std::ops::ControlFlow;
+
 use anyhow::{Context, Result};
 use kardamom_engine::ResumePoint;
 use kardamom_state::checkpoint::{create_checkpoint, prune_checkpoints};
@@ -52,20 +54,19 @@ pub(crate) fn prepare_state(
                 &args.checkpoint_peers,
                 expected_genesis,
             )?;
-            match restored {
-                Some((block, path)) => {
-                    tracing::info!(
-                        restored_block = block,
-                        checkpoint = %path.display(),
-                        "restored state from checkpoint; will replay tail from here"
-                    );
-                }
-                None => tracing::info!(
+            if let Some((block, path)) = restored {
+                tracing::info!(
+                    restored_block = block,
+                    checkpoint = %path.display(),
+                    "restored state from checkpoint; will replay tail from here"
+                );
+            } else {
+                tracing::info!(
                     checkpoint_dir = %ckpt_dir.display(),
                     "no checkpoint available locally or from peers; fresh start will \
                      replay from genesis (refused if the chain outgrew the cluster \
                      retention window — then a peer checkpoint or rebuild-from-L1 is required)"
-                ),
+                );
             }
         }
     }
@@ -105,44 +106,72 @@ pub(crate) fn prepare_state(
 /// whole call. It prunes to `checkpoint_keep`, and stops when
 /// `shutdown` is cancelled. Call this inside a tokio runtime.
 fn spawn_checkpointer(args: &Args, env: &StateEnv, shutdown: CancellationToken) {
-    let (Some(ckpt_dir), true) = (
-        args.checkpoint_dir.clone(),
-        args.checkpoint_interval_secs > 0,
-    ) else {
+    let (Some(ckpt_dir), Some(interval_secs)) =
+        (args.checkpoint_dir.clone(), args.checkpoint_interval_secs.0)
+    else {
         return;
     };
-    let ckpt_env = env.clone();
-    let interval = std::time::Duration::from_secs(args.checkpoint_interval_secs);
-    let keep = args.checkpoint_keep;
+    let checkpointer = Checkpointer {
+        env: env.clone(),
+        dir: ckpt_dir,
+        keep: args.checkpoint_keep.get(),
+    };
+    let interval = std::time::Duration::from_secs(interval_secs.get());
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
-        // The first tick fires immediately; the old thread slept first.
+        // The first tick fires immediately.
         ticker.tick().await;
         loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = ticker.tick() => {}
-            }
-            let env = ckpt_env.clone();
-            let dir = ckpt_dir.clone();
-            let ran = tokio::task::spawn_blocking(move || checkpoint_once(&env, &dir, keep)).await;
-            if let Err(e) = ran {
-                tracing::warn!(error = %e, "checkpointer task panicked");
-            }
+            let ControlFlow::Continue(()) = checkpointer.tick(&mut ticker, &shutdown).await else {
+                return;
+            };
         }
     });
 }
 
-/// One checkpoint + prune round; failures are logged, never fatal.
-fn checkpoint_once(env: &StateEnv, ckpt_dir: &std::path::Path, keep: u64) {
-    match create_checkpoint(env, ckpt_dir) {
-        Ok(info) => {
-            if info.block > keep
-                && let Err(e) = prune_checkpoints(ckpt_dir, info.block - keep + 1)
-            {
-                tracing::warn!(error = %e, "checkpoint prune failed");
-            }
+/// One periodic checkpoint task's fixed inputs: the state env, the
+/// checkpoint directory, and how many past checkpoints to retain.
+struct Checkpointer {
+    env: StateEnv,
+    dir: std::path::PathBuf,
+    keep: u64,
+}
+
+impl Checkpointer {
+    /// Wait for the next checkpoint tick, or the shutdown signal, then
+    /// run one checkpoint round if it was a tick. Returns
+    /// [`ControlFlow::Break`] once `shutdown` fires, so the caller's
+    /// loop stops.
+    async fn tick(
+        &self,
+        ticker: &mut tokio::time::Interval,
+        shutdown: &CancellationToken,
+    ) -> ControlFlow<()> {
+        tokio::select! {
+            () = shutdown.cancelled() => return ControlFlow::Break(()),
+            _ = ticker.tick() => {}
         }
-        Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
+        let env = self.env.clone();
+        let dir = self.dir.clone();
+        let keep = self.keep;
+        let ran = tokio::task::spawn_blocking(move || Self::once(&env, &dir, keep)).await;
+        if let Err(e) = ran {
+            tracing::warn!(error = %e, "checkpointer task panicked");
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// One checkpoint + prune round; failures are logged, never fatal.
+    fn once(env: &StateEnv, dir: &std::path::Path, keep: u64) {
+        match create_checkpoint(env, dir) {
+            Ok(info) => {
+                if info.block > keep
+                    && let Err(e) = prune_checkpoints(dir, info.block - keep + 1)
+                {
+                    tracing::warn!(error = %e, "checkpoint prune failed");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
+        }
     }
 }

@@ -6,39 +6,45 @@
 //!   - `sstore_step`      : `execute_tx` against an SSTORE-heavy contract.
 //!
 //! This bench does not assert throughput floors, because CI variance is
-//! real. Run `cargo bench` locally to compare hardware-relative numbers.
-//! The spec target is over 50k tx/s on plain transfers, on one core.
+//! real. It prints numbers for a human to compare; run `cargo bench`
+//! locally to compare hardware-relative numbers.
+//!
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "indices and counters here are bounded by small, fixed bench parameters, never near a truncation boundary"
+)]
 
-const QUEUE_DEPTH_512: NonZeroUsize = NonZeroUsize::new(512).unwrap();
 use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::thread;
 use std::time::Duration;
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::{
-    Address, Bytes as AlloyBytes, TxKind as APTxKind, U256, address, keccak256,
-};
+use alloy_primitives::{Address, Bytes as AlloyBytes, U256, address};
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
 use revm::state::Bytecode;
 
+use kardamom_engine::actor::fixtures::{
+    ChanReceiptsPub, ChanTxDataSub, ChanTxOrderingSub, Imm, LegacyTx, TestWiring,
+};
 use kardamom_engine::block_env::ExecEnv;
 // The exec-core Executor (the per-block EVM scope) is a different type
 // from the actor `kardamom_engine::Executor` imported below.
 use kardamom_engine::executor::Executor as ExecCore;
 use kardamom_engine::{
-    BPosition, BlockBoundaryStart, CMessage, EngineWiring, ExecPorts, Executor, ExecutorConfig,
-    ExecutorError, Inbound, MockStateDatabase, MutatingSnapshotSource, NoBlockExec, NoEpochCheck,
-    NoRemoteEpochCheck, Outbound, PendingDelta, ResumePoint, RoleHooks, StateWriterSignal,
-    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxIndex, TxOrderingMessage,
-    TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, Executor, ExecutorConfig, Inbound, MockStateDatabase,
+    MutatingSnapshotSource, Outbound, PendingDelta, ResumePoint, RoleHooks, TxEnvelope, TxIndex,
+    TxOrderingMessage, TxRef, WriterApplyingQueue,
 };
+
+/// `ExecutorConfig::receipt_queue_depth` for [`bench_actor_throughput`]:
+/// at least `BATCH` slots, plus headroom.
+const QUEUE_DEPTH_512: NonZeroUsize = NonZeroUsize::new(512).unwrap();
 
 const SSTORE_42_AT_VAR_KEY: [u8; 8] = [
     0x60, 0x42, // PUSH1 0x42 (value)
@@ -48,52 +54,68 @@ const SSTORE_42_AT_VAR_KEY: [u8; 8] = [
     0x00, // STOP
 ];
 
-fn wrap_envelope(
-    signer: &PrivateKeySigner,
-    alloy_env: alloy_consensus::TxEnvelope,
-) -> KtTxEnvelope {
-    let raw_tx = Bytes::from(alloy_env.encoded_2718());
-    let tx_hash = keccak256(&raw_tx);
-    KtTxEnvelope {
-        correlation_id: 0,
-        raw_tx,
-        sender: signer.address(),
-        tx_hash,
-    }
-}
-
-fn signed_transfer(signer: &PrivateKeySigner, to: Address, nonce: u64) -> KtTxEnvelope {
-    let mut tx = TxLegacy {
-        chain_id: Some(1),
+fn signed_transfer(signer: &PrivateKeySigner, to: Address, nonce: u64) -> TxEnvelope {
+    LegacyTx {
+        chain_id: 1,
+        to,
         nonce,
-        gas_price: 0,
+        value: 1,
         gas_limit: 21_000,
-        to: APTxKind::Call(to),
-        value: U256::from(1u64),
-        input: AlloyBytes::new(),
-    };
-    let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-    wrap_envelope(signer, tx.into_signed(sig).into())
+        gas_price: 0,
+    }
+    .sign(signer)
 }
 
-fn signed_sstore_call(signer: &PrivateKeySigner, contract: Address, nonce: u64) -> KtTxEnvelope {
-    let mut tx = TxLegacy {
-        chain_id: Some(1),
+fn signed_sstore_call(signer: &PrivateKeySigner, contract: Address, nonce: u64) -> TxEnvelope {
+    LegacyTx {
+        chain_id: 1,
+        to: contract,
         nonce,
-        gas_price: 0,
+        value: 0,
         gas_limit: 100_000,
-        to: APTxKind::Call(contract),
-        value: U256::ZERO,
-        input: AlloyBytes::new(),
-    };
-    let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-    wrap_envelope(signer, tx.into_signed(sig).into())
+        gas_price: 0,
+    }
+    .sign(signer)
 }
 
 fn pos(off: i32) -> BPosition {
     BPosition {
         term_id: 0,
         term_offset: off,
+    }
+}
+
+/// One repeated single-transaction bench: build a fresh
+/// [`PendingDelta`] and a fresh transaction each iteration, so no state
+/// accumulates across iterations, and run it through
+/// [`ExecCore::execute_once`] at nonce 0. `snap` and `env` stay fixed
+/// for the whole group; `mk` builds the transaction.
+struct TxBench<'a, F: Fn() -> TxEnvelope> {
+    snap: &'a MockStateDatabase,
+    env: ExecEnv,
+    mk: F,
+}
+
+impl<F: Fn() -> TxEnvelope> TxBench<'_, F> {
+    fn run(&self, c: &mut Criterion, group: &str, name: &str) {
+        let mut group = c.benchmark_group(group);
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let delta = PendingDelta::new();
+                let env_tx = (self.mk)();
+                let slot = kardamom_engine::exec_types::TxSlot {
+                    tx_idx: TxIndex(0),
+                    tx_position: pos(0),
+                    tx_index_in_block: 0,
+                    cumulative_gas_used_before: 0,
+                };
+                let _ =
+                    ExecCore::execute_once(self.snap, None, &delta, self.env, slot, &env_tx, None)
+                        .unwrap();
+            });
+        });
+        group.finish();
     }
 }
 
@@ -110,32 +132,12 @@ fn bench_transfer_step(c: &mut Criterion) {
         l2_timestamp: 0,
     };
 
-    let mut group = c.benchmark_group("transfer_step");
-    group.throughput(Throughput::Elements(1));
-    // Bench the per-tx CPU cost of a single transfer at nonce 0. The
-    // snapshot rebuilds each iteration, so state does not accumulate.
-    group.bench_function("plain_transfer", |b| {
-        b.iter(|| {
-            let delta = PendingDelta::new();
-            let env_tx = signed_transfer(&signer, to, 0);
-            let _ = ExecCore::execute_once(
-                &snap,
-                None,
-                &delta,
-                env,
-                kardamom_engine::exec_types::TxSlot {
-                    tx_idx: TxIndex(0),
-                    tx_position: pos(0),
-                    tx_index_in_block: 0,
-                    cumulative_gas_used_before: 0,
-                },
-                &env_tx,
-                None,
-            )
-            .unwrap();
-        })
-    });
-    group.finish();
+    TxBench {
+        snap: &snap,
+        env,
+        mk: || signed_transfer(&signer, to, 0),
+    }
+    .run(c, "transfer_step", "plain_transfer");
 }
 
 fn bench_sstore_step(c: &mut Criterion) {
@@ -155,87 +157,38 @@ fn bench_sstore_step(c: &mut Criterion) {
         l2_timestamp: 0,
     };
 
-    let mut group = c.benchmark_group("sstore_step");
-    group.throughput(Throughput::Elements(1));
-    group.bench_function("sstore_one_slot", |b| {
-        b.iter(|| {
-            let delta = PendingDelta::new();
-            let env_tx = signed_sstore_call(&signer, contract, 0);
-            let (_r, _ws) = ExecCore::execute_once(
-                &snap,
-                None,
-                &delta,
-                env,
-                kardamom_engine::exec_types::TxSlot {
-                    tx_idx: TxIndex(0),
-                    tx_position: pos(0),
-                    tx_index_in_block: 0,
-                    cumulative_gas_used_before: 0,
-                },
-                &env_tx,
-                None,
-            )
-            .unwrap();
-        })
-    });
-    group.finish();
+    TxBench {
+        snap: &snap,
+        env,
+        mk: || signed_sstore_call(&signer, contract, 0),
+    }
+    .run(c, "sstore_step", "sstore_one_slot");
 }
 
 // Actor end-to-end: `BATCH` txs per iteration; reports throughput in tx/s.
-struct ChanTxDataSub {
-    sequencer_id: u8,
-    rx: Receiver<(BPosition, KtTxEnvelope)>,
-}
-impl TxDataSubscription for ChanTxDataSub {
-    fn sequencer_id(&self) -> u8 {
-        self.sequencer_id
-    }
-    fn next(&mut self) -> Result<(kardamom_types::TxDataLoc, KtTxEnvelope), ExecutorError> {
-        self.rx
-            .recv()
-            .map(|(pos, env)| (kardamom_types::TxDataLoc::new(0, pos), env))
-            .map_err(|_| ExecutorError::TxDataClosed {
-                sequencer_id: self.sequencer_id,
-            })
-    }
-}
-struct ChanTxOrderingSub(Receiver<(BPosition, TxOrderingMessage)>);
-impl TxOrderingSubscription for ChanTxOrderingSub {
-    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
-        self.0.recv().map_err(|_| ExecutorError::TxOrderingClosed)
-    }
-}
-struct ChanReceiptsPub(Sender<CMessage>);
-impl TxReceiptsPublication for ChanReceiptsPub {
-    fn publish(&mut self, m: CMessage) -> Result<(), ExecutorError> {
-        self.0.send(m).map_err(|_| ExecutorError::TxReceiptsClosed)
-    }
-}
-struct Imm;
-impl StateWriterSignal for Imm {
-    fn committed(&mut self) -> Result<u64, ExecutorError> {
-        Ok(u64::MAX)
-    }
-    fn wait_committed(&mut self, b: u64) -> Result<u64, ExecutorError> {
-        Ok(b)
-    }
-}
 
-/// Port types for the bench's channel-backed fakes.
-struct BenchWiring;
-impl ExecPorts for BenchWiring {
-    type Snapshots = MutatingSnapshotSource;
-    type WriterSignal = Imm;
-    type WriterQueue = WriterApplyingQueue;
-    type Epoch = NoEpochCheck;
-    type RemoteEpoch = NoRemoteEpochCheck;
-    type BlockExec = NoBlockExec;
-}
+/// This bench's channel-backed wiring: one `tx_data` sequencer, one
+/// `tx_ordering`, one `tx_receipts`.
+type Wiring = TestWiring<ChanTxDataSub, ChanTxOrderingSub, ChanReceiptsPub>;
 
-impl EngineWiring for BenchWiring {
-    type TxData = ChanTxDataSub;
-    type TxOrdering = ChanTxOrderingSub;
-    type TxReceipts = ChanReceiptsPub;
+/// Sign transfer `i`, and publish it onto `a_tx` (`tx_data`) then
+/// `b_tx` (`tx_ordering`, as a `TxRef`).
+fn send_one(
+    a_tx: &Sender<(BPosition, TxEnvelope)>,
+    b_tx: &Sender<(BPosition, TxOrderingMessage)>,
+    signer: &PrivateKeySigner,
+    to: Address,
+    i: u64,
+) {
+    let tx_data_position = pos((i as i32) * 200);
+    let env = signed_transfer(signer, to, i);
+    let tx_hash = env.tx_hash;
+    a_tx.send((tx_data_position, env)).unwrap();
+    b_tx.send((
+        pos(i as i32),
+        TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position, 0)),
+    ))
+    .unwrap();
 }
 
 fn bench_actor_throughput(c: &mut Criterion) {
@@ -260,45 +213,42 @@ fn bench_actor_throughput(c: &mut Criterion) {
             // end-to-end actor throughput. The demux split itself adds one
             // extra crossbeam hop per tx, which should be negligible next
             // to revm time.
-            let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>((BATCH as usize) + 8);
+            let (a_tx, a_rx) = bounded::<(BPosition, TxEnvelope)>((BATCH as usize) + 8);
             let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>((BATCH as usize) + 8);
             let (c_tx, c_rx) = bounded::<CMessage>((BATCH as usize) + 8);
 
-            for i in 0..BATCH {
-                let tx_data_position = pos((i as i32) * 200);
-                let env = signed_transfer(&signer, to, i);
-                let tx_hash = env.tx_hash;
-                a_tx.send((tx_data_position, env)).unwrap();
+            // `a_tx`/`b_tx` move into this block and drop at its end,
+            // closing both channels so the executor thread sees EOF once
+            // it drains everything sent here.
+            {
+                let a_tx = a_tx;
+                let b_tx = b_tx;
+                for i in 0..BATCH {
+                    send_one(&a_tx, &b_tx, &signer, to, i);
+                }
                 b_tx.send((
-                    pos(i as i32),
-                    TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position, 0)),
+                    pos(BATCH as i32),
+                    TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
+                        block_number: 1,
+                        // end_tx_idx is the cumulative count of canonical
+                        // records through this block (encoded through
+                        // `BPosition::from_index`). The executor compares this
+                        // against its applied-record count: here, all `BATCH`
+                        // txs. It is not the last tx's index.
+                        end_tx_idx: BPosition::from_index(BATCH),
+                        l2_timestamp: 0,
+                        l1_origin: 0,
+                    }),
                 ))
                 .unwrap();
             }
-            b_tx.send((
-                pos(BATCH as i32),
-                TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
-                    block_number: 1,
-                    // end_tx_idx is the cumulative count of canonical
-                    // records through this block (encoded through
-                    // `BPosition::from_index`). The executor compares this
-                    // against its applied-record count: here, all `BATCH`
-                    // txs. It is not the last tx's index.
-                    end_tx_idx: BPosition::from_index(BATCH),
-                    l2_timestamp: 0,
-                    l1_origin: 0,
-                }),
-            ))
-            .unwrap();
-            drop(a_tx);
-            drop(b_tx);
 
             let tx_data_subs = vec![ChanTxDataSub {
                 sequencer_id: 0,
                 rx: a_rx,
             }];
             let h = thread::spawn(move || {
-                Executor::run::<BenchWiring>(
+                Executor::run::<Wiring>(
                     ExecutorConfig {
                         chain_id: NonZeroU64::MIN,
                         receipt_queue_depth: QUEUE_DEPTH_512,
@@ -322,9 +272,7 @@ fn bench_actor_throughput(c: &mut Criterion) {
 
             let mut got = 0u64;
             while let Ok(m) = c_rx.recv_timeout(Duration::from_secs(10)) {
-                if matches!(m, CMessage::Receipt(_)) {
-                    got += 1;
-                }
+                got += u64::from(matches!(m, CMessage::Receipt(_)));
             }
             assert_eq!(got, BATCH);
             h.join().expect("no panic").expect("ok");

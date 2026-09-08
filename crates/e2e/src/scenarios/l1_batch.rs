@@ -110,7 +110,10 @@ pub async fn l1_batch(t: &Target, l1_rpc: &str, settlement: Address) -> Result<(
             .checked_add(1)
             .with_context(|| format!("batch {} l2_block_end overflows", d.index))?;
     }
-    let covered = posted.last().map_or(0, |d| d.l2_block_end);
+    let covered = posted
+        .last()
+        .with_context(|| format!("no BatchPosted events although lastBatchIndex={last}"))?
+        .l2_block_end;
 
     // 3. Coverage tracks the executed head.
     #[allow(

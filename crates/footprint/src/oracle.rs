@@ -63,11 +63,9 @@ fn pair(a: u64, b: u64) -> (u64, u64) {
 /// Insert one local tx position's conflicts against the rest of `ws`
 /// (or all of `rs`) into `pairs`.
 fn insert_pairs_with(txs: &[&TxObs], w: usize, rest: &[usize], pairs: &mut HashSet<(u64, u64)>) {
-    for &other in rest {
-        if other != w {
-            pairs.insert(pair(txs[w].index, txs[other].index));
-        }
-    }
+    rest.iter().filter(|&&other| other != w).for_each(|&other| {
+        pairs.insert(pair(txs[w].index, txs[other].index));
+    });
 }
 
 /// A cell-to-touchers index: which local tx positions read (without
@@ -86,20 +84,22 @@ impl CellIndex {
     fn index_tx<S: BuildHasher>(
         &mut self,
         i: usize,
-        reads: BTreeSet<Cell>,
+        reads: &BTreeSet<Cell>,
         written: BTreeSet<Cell>,
         exclude: &HashSet<Cell, S>,
     ) {
-        for c in reads {
-            if !exclude.contains(&c) && !written.contains(&c) {
+        reads
+            .iter()
+            .filter(|c| !exclude.contains(c) && !written.contains(c))
+            .for_each(|&c| {
                 self.readers.entry(c).or_default().push(i);
-            }
-        }
-        for c in written {
-            if !exclude.contains(&c) {
+            });
+        written
+            .into_iter()
+            .filter(|c| !exclude.contains(c))
+            .for_each(|c| {
                 self.writers.entry(c).or_default().push(i);
-            }
-        }
+            });
     }
 
     /// Build the direct-conflict pair set from this index.
@@ -142,7 +142,7 @@ pub(crate) fn conflict_pairs<S: BuildHasher>(
     let mut index = CellIndex::default();
     for (i, o) in txs.iter().enumerate() {
         let (reads, written) = cells_of(o);
-        index.index_tx(i, reads, written, exclude);
+        index.index_tx(i, &reads, written, exclude);
     }
     index.pairs(txs)
 }
@@ -153,16 +153,19 @@ pub(crate) fn conflict_pairs<S: BuildHasher>(
 pub(crate) fn critical_path(txs: &[&TxObs], pairs: &HashSet<(u64, u64)>) -> u64 {
     let pos: HashMap<u64, usize> = txs.iter().enumerate().map(|(i, o)| (o.index, i)).collect();
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); txs.len()];
-    for (a, b) in pairs {
-        if let (Some(&ia), Some(&ib)) = (pos.get(a), pos.get(b)) {
-            preds[ib].push(ia);
-        }
-    }
+    pairs
+        .iter()
+        .filter_map(|(a, b)| Some((*pos.get(a)?, *pos.get(b)?)))
+        .for_each(|(ia, ib)| preds[ib].push(ia));
     let mut cp = vec![0u64; txs.len()];
     for i in 0..txs.len() {
+        // 0 is the correct base case: a tx with no predecessor starts the
+        // critical path at its own gas, not at a missing-data sentinel.
         let best = preds[i].iter().map(|p| cp[*p]).max().unwrap_or(0);
         cp[i] = best + txs[i].gas;
     }
+    // 0 is the correct empty-block critical path, not a missing-data
+    // sentinel.
     cp.into_iter().max().unwrap_or(0)
 }
 
@@ -185,15 +188,8 @@ pub(crate) struct Predictions {
 impl Predictions {
     /// Predict each tx's cell set with `stats`.
     pub(crate) fn of(stats: &Stats, txs: &[&TxObs]) -> Self {
-        let mut cells: PredictedCells = Vec::with_capacity(txs.len());
-        let mut cold = 0usize;
-        for o in txs {
-            let p = stats.predict(o);
-            if p.is_none() {
-                cold += 1;
-            }
-            cells.push(p);
-        }
+        let cells: PredictedCells = txs.iter().map(|o| stats.predict(o)).collect();
+        let cold = cells.iter().filter(|p| p.is_none()).count();
         Self { cells, cold }
     }
 
@@ -223,17 +219,25 @@ impl Predictions {
         exclude: &HashSet<Cell, S>,
         pairs: &mut HashSet<(u64, u64)>,
     ) {
-        for j in (i + 1)..txs.len() {
-            let conflict = match (&self.cells[i], &self.cells[j]) {
-                (Some(a), Some(b)) => {
-                    let mut inter = a.intersection(b).filter(|c| !exclude.contains(c));
-                    inter.next().is_some()
-                }
-                _ => true, // wildcard
-            };
-            if conflict {
+        ((i + 1)..txs.len())
+            .filter(|&j| self.predicted_conflict(i, j, exclude))
+            .for_each(|j| {
                 pairs.insert(pair(txs[i].index, txs[j].index));
-            }
+            });
+    }
+
+    /// Whether predictions `i` and `j` conflict: a wildcard (no
+    /// prediction) conflicts with everything, otherwise any shared,
+    /// non-excluded predicted cell is a conflict.
+    fn predicted_conflict<S: BuildHasher>(
+        &self,
+        i: usize,
+        j: usize,
+        exclude: &HashSet<Cell, S>,
+    ) -> bool {
+        match (&self.cells[i], &self.cells[j]) {
+            (Some(a), Some(b)) => a.intersection(b).any(|c| !exclude.contains(c)),
+            _ => true, // wildcard
         }
     }
 }
@@ -249,9 +253,9 @@ pub fn universal_writes(obs: &[TxObs], threshold: f64) -> Vec<(Cell, f64)> {
     for c in obs.iter().flat_map(|o| &o.writes) {
         *count.entry(*c).or_default() += 1;
     }
-    // No `.max(1)` guard needed: when `obs` is empty, `count` is too (the
-    // loop above never ran), so the closure below — the only reader of
-    // `n` — never executes.
+    // No "floor at 1" guard needed: when `obs` is empty, `count` is too
+    // (the loop above never ran), so the closure below — the only
+    // reader of `n` — never executes.
     let n = obs.len() as f64;
     let mut v: Vec<(Cell, f64)> = count
         .into_iter()
@@ -277,18 +281,31 @@ pub fn analyze<S: BuildHasher>(
         ..Default::default()
     };
 
+    // 0 is the correct max block for an empty `obs`: `per_block_oracle`
+    // then walks an empty block range, not a missing-data sentinel.
     let max_block = obs.iter().map(|o| o.block).max().unwrap_or(0);
     report.blocks = Report::per_block_oracle(obs, max_block, exclude);
 
     let TrainSplit { train, holdout } = Holdout::split(obs, max_block, train_frac);
-    if !train.is_empty() && !holdout.is_empty() {
-        let mut stats = Stats::default();
-        for o in &train {
-            stats.learn_obs(o);
-        }
-        report.grading = Some(holdout.grade(&stats, exclude));
-    }
+    report.grading = grade_holdout(&train, &holdout, exclude);
     report
+}
+
+/// Train a fresh `Stats` on `train` and grade `holdout` with it. `None`
+/// when either side is empty: a grading needs both.
+fn grade_holdout<S: BuildHasher>(
+    train: &[TxObs],
+    holdout: &Holdout<'_>,
+    exclude: &HashSet<Cell, S>,
+) -> Option<Grading> {
+    if train.is_empty() || holdout.is_empty() {
+        return None;
+    }
+    let stats = train.iter().fold(Stats::default(), |mut s, o| {
+        s.learn_obs(o);
+        s
+    });
+    Some(holdout.grade(&stats, exclude))
 }
 
 impl Report {
@@ -299,23 +316,30 @@ impl Report {
         max_block: u64,
         exclude: &HashSet<Cell, S>,
     ) -> Vec<BlockOracle> {
-        let mut blocks = Vec::new();
-        for b in 1..=max_block {
-            let txs: Vec<&TxObs> = obs.iter().filter(|o| o.block == b).collect();
-            if txs.is_empty() {
-                continue;
-            }
-            let pairs = conflict_pairs(&txs, actual_cells, exclude);
-            let gas: u64 = txs.iter().map(|o| o.gas).sum();
-            blocks.push(BlockOracle {
-                block: b,
-                txs: txs.len(),
-                gas,
-                critical_path_gas: critical_path(&txs, &pairs),
-                conflict_pairs: pairs.len(),
-            });
+        (1..=max_block)
+            .filter_map(|b| Self::one_block_oracle(obs, b, exclude))
+            .collect()
+    }
+
+    /// One block's oracle numbers, or `None` if it has no observations.
+    fn one_block_oracle<S: BuildHasher>(
+        obs: &[TxObs],
+        block: u64,
+        exclude: &HashSet<Cell, S>,
+    ) -> Option<BlockOracle> {
+        let txs: Vec<&TxObs> = obs.iter().filter(|o| o.block == block).collect();
+        if txs.is_empty() {
+            return None;
         }
-        blocks
+        let pairs = conflict_pairs(&txs, actual_cells, exclude);
+        let gas: u64 = txs.iter().map(|o| o.gas).sum();
+        Some(BlockOracle {
+            block,
+            txs: txs.len(),
+            gas,
+            critical_path_gas: critical_path(&txs, &pairs),
+            conflict_pairs: pairs.len(),
+        })
     }
 }
 
@@ -370,28 +394,71 @@ impl<'a> Holdout<'a> {
             holdout_txs: self.txs.len(),
             ..Default::default()
         };
-        for b in (self.split + 1)..=self.max_block {
-            let txs: Vec<&TxObs> = self.txs.iter().filter(|o| o.block == b).copied().collect();
-            if txs.is_empty() {
-                continue;
-            }
-            let true_pairs = conflict_pairs(&txs, actual_cells, exclude);
-            let predictions = Predictions::of(stats, &txs);
-            let pred_pairs = predictions.pairs(&txs, exclude);
+        (self.split + 1..=self.max_block)
+            .filter_map(|b| self.grade_block(b, stats, exclude))
+            .for_each(|delta| delta.fold_into(&mut g));
+        g
+    }
 
-            g.cold_txs += predictions.cold;
-            g.true_pairs += true_pairs.len();
-            g.predicted_pairs += pred_pairs.len();
-            g.missed_pairs += true_pairs.difference(&pred_pairs).count();
-            g.false_pairs += pred_pairs.difference(&true_pairs).count();
-            g.gas += txs.iter().map(|o| o.gas).sum::<u64>();
-            g.oracle_cp_gas += critical_path(&txs, &true_pairs);
+    /// One holdout block's grading contribution, or `None` if it has no
+    /// observations.
+    fn grade_block<S: BuildHasher>(
+        &self,
+        block: u64,
+        stats: &Stats,
+        exclude: &HashSet<Cell, S>,
+    ) -> Option<GradeDelta> {
+        let txs: Vec<&TxObs> = self
+            .txs
+            .iter()
+            .filter(|o| o.block == block)
+            .copied()
+            .collect();
+        if txs.is_empty() {
+            return None;
+        }
+        let true_pairs = conflict_pairs(&txs, actual_cells, exclude);
+        let predictions = Predictions::of(stats, &txs);
+        let pred_pairs = predictions.pairs(&txs, exclude);
+        Some(GradeDelta {
+            cold_txs: predictions.cold,
+            true_pairs: true_pairs.len(),
+            predicted_pairs: pred_pairs.len(),
+            missed_pairs: true_pairs.difference(&pred_pairs).count(),
+            false_pairs: pred_pairs.difference(&true_pairs).count(),
+            gas: txs.iter().map(|o| o.gas).sum::<u64>(),
+            oracle_cp_gas: critical_path(&txs, &true_pairs),
             // The predicted graph must be safe for scheduling. A missed
             // pair would abort at runtime, but for the achievable-
             // speedup bound we schedule by predictions alone.
-            g.predicted_cp_gas += critical_path(&txs, &pred_pairs);
-        }
-        g
+            predicted_cp_gas: critical_path(&txs, &pred_pairs),
+        })
+    }
+}
+
+/// One holdout block's grading numbers, folded into a [`Grading`] total by
+/// [`GradeDelta::fold_into`].
+struct GradeDelta {
+    cold_txs: usize,
+    true_pairs: usize,
+    predicted_pairs: usize,
+    missed_pairs: usize,
+    false_pairs: usize,
+    gas: u64,
+    oracle_cp_gas: u64,
+    predicted_cp_gas: u64,
+}
+
+impl GradeDelta {
+    fn fold_into(self, g: &mut Grading) {
+        g.cold_txs += self.cold_txs;
+        g.true_pairs += self.true_pairs;
+        g.predicted_pairs += self.predicted_pairs;
+        g.missed_pairs += self.missed_pairs;
+        g.false_pairs += self.false_pairs;
+        g.gas += self.gas;
+        g.oracle_cp_gas += self.oracle_cp_gas;
+        g.predicted_cp_gas += self.predicted_cp_gas;
     }
 }
 
@@ -482,8 +549,8 @@ impl core::fmt::Display for Grading {
             },
             self.false_pairs,
             // `predicted_pairs` can be a real 0; the numerator is then 0
-            // too, so the guard (not a `.max(1)` clamp) gives the right
-            // 0.0%.
+            // too, so the guard (not a floor-at-1 clamp) gives the
+            // right 0.0%.
             if self.predicted_pairs > 0 {
                 self.false_pairs as f64 / self.predicted_pairs as f64 * 100.0
             } else {

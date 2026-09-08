@@ -10,8 +10,38 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use alloy_primitives::{U256, address};
+use alloy_primitives::{Address, U256, address};
+use kardamom_state::StateSnapshot;
 use kardamom_types::StateDatabase;
+
+/// One reader thread's frozen view: its snapshot, the address it reads,
+/// its index (for the drift assertion message), and the values it
+/// expects never to drift from.
+struct Reader<'a> {
+    snap: &'a StateSnapshot,
+    addr: Address,
+    index: usize,
+    expected_balance: U256,
+    expected_slot: U256,
+}
+
+impl Reader<'_> {
+    /// Read this reader's frozen view in a tight loop until `stop` is
+    /// set, asserting it never drifts from `expected_balance`/
+    /// `expected_slot`.
+    fn run(&self, stop: &AtomicBool) {
+        while !stop.load(Ordering::Relaxed) {
+            let (_, bal, _) = self.snap.basic(self.addr).unwrap().unwrap();
+            assert_eq!(
+                bal, self.expected_balance,
+                "reader {} saw drift",
+                self.index
+            );
+            let slot = self.snap.storage(self.addr, common::slot_key(7)).unwrap();
+            assert_eq!(slot, self.expected_slot, "reader {} saw drift", self.index);
+        }
+    }
+}
 
 #[test]
 fn four_readers_with_distinct_snapshots() {
@@ -32,15 +62,16 @@ fn four_readers_with_distinct_snapshots() {
         let expected_balance = U256::from(1001 + i as u64);
         let expected_slot = U256::from(((i + 1) as u64) * 100);
         let stop = stop.clone();
-        let handle = thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                let (_, bal, _) = snap.basic(addr).unwrap().unwrap();
-                assert_eq!(bal, expected_balance, "reader {i} saw drift");
-                let slot = snap.storage(addr, common::slot_key(7)).unwrap();
-                assert_eq!(slot, expected_slot, "reader {i} saw drift");
+        handles.push(thread::spawn(move || {
+            Reader {
+                snap: &snap,
+                addr,
+                index: i,
+                expected_balance,
+                expected_slot,
             }
-        });
-        handles.push(handle);
+            .run(&stop);
+        }));
     }
 
     // Concurrently apply blocks 5..=12.

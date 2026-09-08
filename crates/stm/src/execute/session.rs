@@ -337,7 +337,7 @@ impl<S: StateDatabase + Sync> BlockSession<'_, '_, S> {
                 } else if map.len() >= STICKY_CAP {
                     hashed
                 } else {
-                    let w = self.pool.least_loaded(hashed);
+                    let w = self.pool.least_loaded();
                     map.insert(key, w);
                     w
                 }

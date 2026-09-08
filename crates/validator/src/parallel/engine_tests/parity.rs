@@ -7,6 +7,7 @@
 
 use alloy_primitives::{B256, U256, address};
 use alloy_signer_local::PrivateKeySigner;
+use kardamom_engine::PendingDelta;
 use kardamom_engine::actor::BufferedRecord;
 use kardamom_engine::error::ExecutorError;
 use kardamom_engine::state::MockStateDatabase;
@@ -31,29 +32,44 @@ fn parallel_batches_equal_sequential_on_a_fully_dependent_chain() {
     let expected = seq_delta(&snap, &txs);
 
     for batch_size in [1usize, 5, 10] {
-        let inputs = BlockInputs {
-            snapshot: &snap,
-            parent: None,
-            txs: &txs,
-            claims: &claims,
-            env: env(),
-            granularity: nz16(1),
-        };
-        let out = execute_block_parallel(&test_pool(), &inputs, nz(batch_size))
-            .unwrap_or_else(|e| panic!("batch_size {batch_size}: {e:?}"));
-        assert_eq!(
-            out.delta.accounts, expected.accounts,
-            "batch_size {batch_size}: account state must equal sequential"
-        );
-        assert_eq!(out.delta.storage, expected.storage);
-        assert_eq!(out.receipts.len(), txs.len());
-        // Block-cumulative gas must be monotonic and match the total.
-        let total: u64 = out.receipts.iter().map(|r| r.gas_used).sum();
-        assert_eq!(out.receipts.last().unwrap().cumulative_gas_used, total);
-        for w in out.receipts.windows(2) {
-            assert!(w[0].cumulative_gas_used < w[1].cumulative_gas_used);
-        }
+        assert_parity_at(batch_size, &snap, &txs, &claims, &expected);
     }
+}
+
+/// Execute `txs` in parallel batches of `batch_size` and assert the
+/// result is byte-identical to `expected` (the sequential delta), with
+/// monotonic per-block cumulative gas.
+fn assert_parity_at(
+    batch_size: usize,
+    snap: &MockStateDatabase,
+    txs: &[BufferedRecord],
+    claims: &ClaimIndex,
+    expected: &PendingDelta,
+) {
+    let inputs = BlockInputs {
+        snapshot: snap,
+        parent: None,
+        txs,
+        claims,
+        env: env(),
+        granularity: nz16(1),
+    };
+    let out = execute_block_parallel(&test_pool(), &inputs, nz(batch_size))
+        .unwrap_or_else(|e| panic!("batch_size {batch_size}: {e:?}"));
+    assert_eq!(
+        out.delta.accounts, expected.accounts,
+        "batch_size {batch_size}: account state must equal sequential"
+    );
+    assert_eq!(out.delta.storage, expected.storage);
+    assert_eq!(out.receipts.len(), txs.len());
+    // Block-cumulative gas must be monotonic and match the total.
+    let total: u64 = out.receipts.iter().map(|r| r.gas_used).sum();
+    assert_eq!(out.receipts.last().unwrap().cumulative_gas_used, total);
+    assert!(
+        out.receipts
+            .windows(2)
+            .all(|w| w[0].cumulative_gas_used < w[1].cumulative_gas_used)
+    );
 }
 
 /// K = 20 end-to-end: quantized wire claims and chunk-aligned batches
@@ -331,34 +347,49 @@ fn xchain_records_execute_in_parallel_blocks() {
     let expected = seq_delta(&snap, &records);
 
     for batch_size in [1usize, 2, 5] {
-        let out = execute_block_parallel(
-            &test_pool(),
-            &BlockInputs {
-                snapshot: &snap,
-                parent: None,
-                txs: &records,
-                claims: &claims,
-                env: env(),
-                granularity: nz16(1),
-            },
-            nz(batch_size),
-        )
-        .unwrap_or_else(|e| panic!("batch_size {batch_size}: {e:?}"));
-        assert_eq!(out.delta.accounts, expected.accounts);
-        assert_eq!(out.delta.storage, expected.storage);
-        assert_eq!(out.receipts.len(), records.len());
-        // The deliveries surface as 0x7D receipts keyed by their
-        // remote source hash, exactly as on the streaming path.
-        for (seq, idx) in [(0u64, 1usize), (1, 3)] {
-            let r = &out.receipts[idx];
-            assert_eq!(r.tx_type, kardamom_types::TX_TYPE_XCHAIN);
-            assert_eq!(
-                r.tx_hash,
-                kardamom_types::xchain::remote_source_hash(origin, seq)
-            );
-            assert_eq!(r.from, kardamom_types::xchain::xchain_tx_sender(origin));
-            assert_eq!(r.to, Some(kardamom_types::xchain::INBOX));
-        }
+        assert_xchain_parity_at(batch_size, &snap, &records, &claims, &expected, origin);
+    }
+}
+
+/// Execute `records` in parallel batches of `batch_size`, assert the
+/// result matches `expected` (the sequential delta), and check that both
+/// 0x7D delivery receipts land at their expected index with the right
+/// identity.
+fn assert_xchain_parity_at(
+    batch_size: usize,
+    snap: &MockStateDatabase,
+    records: &[BufferedRecord],
+    claims: &ClaimIndex,
+    expected: &PendingDelta,
+    origin: u64,
+) {
+    let out = execute_block_parallel(
+        &test_pool(),
+        &BlockInputs {
+            snapshot: snap,
+            parent: None,
+            txs: records,
+            claims,
+            env: env(),
+            granularity: nz16(1),
+        },
+        nz(batch_size),
+    )
+    .unwrap_or_else(|e| panic!("batch_size {batch_size}: {e:?}"));
+    assert_eq!(out.delta.accounts, expected.accounts);
+    assert_eq!(out.delta.storage, expected.storage);
+    assert_eq!(out.receipts.len(), records.len());
+    // The deliveries surface as 0x7D receipts keyed by their remote
+    // source hash, exactly as on the streaming path.
+    for (seq, idx) in [(0u64, 1usize), (1, 3)] {
+        let r = &out.receipts[idx];
+        assert_eq!(r.tx_type, kardamom_types::TX_TYPE_XCHAIN);
+        assert_eq!(
+            r.tx_hash,
+            kardamom_types::xchain::remote_source_hash(origin, seq)
+        );
+        assert_eq!(r.from, kardamom_types::xchain::xchain_tx_sender(origin));
+        assert_eq!(r.to, Some(kardamom_types::xchain::INBOX));
     }
 }
 

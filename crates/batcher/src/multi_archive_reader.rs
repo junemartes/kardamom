@@ -165,12 +165,11 @@ impl MultiArchiveReader {
         self.a_indexes.len()
     }
 
-    /// Number of envelopes indexed for sequencer `sid` (0 if unknown).
+    /// Number of envelopes indexed for sequencer `sid`, or `None` when
+    /// `sid` has no configured `tx_data` archive.
     #[must_use]
-    pub fn a_archive_len(&self, sid: u8) -> usize {
-        self.a_indexes
-            .get(&sid)
-            .map_or(0, std::collections::HashMap::len)
+    pub fn a_archive_len(&self, sid: u8) -> Option<usize> {
+        self.a_indexes.get(&sid).map(std::collections::HashMap::len)
     }
 
     fn resolve(

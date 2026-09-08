@@ -162,15 +162,14 @@ impl ArchiveRefetcher {
         mut sink: impl FnMut(TxDataLoc, TxEnvelope),
     ) -> Result<u64, LogError> {
         let endpoints = self.cfg.tx_data_endpoints.clone();
-        self.ensure_session(&endpoints)?;
-        let recs = self.list_or_rotate(stream_id)?;
+        let recs = self.list_or_rotate(&endpoints, stream_id)?;
         let Some(rec) = FoundRecording::resolve_session(recs, session_id) else {
             self.rotate();
             return Err(LogError::Aeron(format!(
                 "refetch: no recording for stream {stream_id} session {session_id} on this archive"
             )));
         };
-        let Some(plan) = self.prepare_replay(&rec, from, stream_id, session_id)? else {
+        let Some(plan) = self.prepare_replay(&endpoints, &rec, from, stream_id, session_id)? else {
             return Ok(0);
         };
 
@@ -251,8 +250,7 @@ impl ArchiveRefetcher {
         mut sink: impl FnMut(BPosition, Deposit),
     ) -> Result<u64, LogError> {
         let endpoints = self.cfg.tx_deposits_endpoints.clone();
-        self.ensure_session(&endpoints)?;
-        let recs = self.list_or_rotate(stream_id)?;
+        let recs = self.list_or_rotate(&endpoints, stream_id)?;
         if recs.is_empty() {
             self.rotate();
             return Err(LogError::Aeron(format!(
@@ -269,7 +267,7 @@ impl ArchiveRefetcher {
                 .raw_position(from)
                 .unwrap_or(rec.start_position)
                 .max(rec.start_position);
-            let (len, endpoint) = self.replay_bounds(&rec, from_raw)?;
+            let (len, endpoint) = self.replay_bounds(&endpoints, &rec, from_raw)?;
             plans.push((
                 rec,
                 ReplayPlan {
@@ -358,62 +356,58 @@ impl ArchiveRefetcher {
                 "refetch: no archive endpoints configured".into(),
             ));
         }
-        let stale = match &self.live {
-            Some(live) => !endpoints.iter().any(|e| e == &live.endpoint),
-            None => true,
+        // `take` moves the old session out and ends its borrow at once.
+        // The `&mut self` call below then needs no borrow of `self.live`.
+        let live = match self.live.take() {
+            Some(live) if endpoints.iter().any(|e| e == &live.endpoint) => live,
+            _ => self.reconnect(endpoints)?,
         };
-        if stale {
-            return self.reconnect(endpoints);
-        }
-        Ok(&self
-            .live
-            .as_ref()
-            .expect("stale is false only when the match above found self.live already Some")
-            .session)
+        Ok(&self.live.insert(live).session)
     }
 
-    /// The reconnect loop behind [`Self::ensure_session`], split out so
-    /// `ensure_session` can return `&ArchiveSession` without also holding
-    /// a live borrow across this function's own `&mut self` use.
-    fn reconnect(&mut self, endpoints: &[String]) -> Result<&ArchiveSession, LogError> {
+    /// Try each endpoint once, starting at the rotation cursor, until one
+    /// connects. Behind [`Self::ensure_session`].
+    fn reconnect(&mut self, endpoints: &[String]) -> Result<Live, LogError> {
         let mut last_err: Option<LogError> = None;
         for attempt in 0..endpoints.len() {
-            // `next_endpoint` advances with `wrapping_add` (below and in
-            // `rotate`), so it can reach `usize::MAX` after enough
-            // rotations; add the same way here, so this never panics on
-            // overflow.
-            let idx = self.next_endpoint.wrapping_add(attempt) % endpoints.len();
-            let ep = &endpoints[idx];
-            let mut acfg = self.cfg.aeron.clone();
-            acfg.archive_control_request_channel =
-                ChannelUri::new_trusted(format!("aeron:udp?endpoint={ep}"));
-            acfg.archive_control_response_channel = ChannelUri::new_trusted(format!(
-                "aeron:udp?endpoint={}",
-                self.cfg.response_endpoint
-            ));
-            match connect_archive_with_timeout(
-                self.cfg.aeron_dir.as_deref(),
-                &acfg,
-                CONNECT_TIMEOUT,
-            ) {
-                Ok(session) => {
-                    info!(endpoint = %ep, "refetch: archive control connected");
-                    self.next_endpoint = idx;
-                    let live = self.live.insert(Live {
-                        endpoint: ep.clone(),
-                        session,
-                    });
-                    return Ok(&live.session);
-                }
-                Err(e) => {
-                    warn!(endpoint = %ep, error = %e, "refetch: archive control connect failed");
-                    last_err = Some(e);
-                }
+            match self.try_endpoint(endpoints, attempt) {
+                Ok(live) => return Ok(live),
+                Err(e) => last_err = Some(e),
             }
         }
-        self.live = None;
+        // `self.live` is already `None`: the only caller,
+        // `ensure_session`, `take`s it before calling `reconnect`.
         self.next_endpoint = self.next_endpoint.wrapping_add(1);
         Err(last_err.unwrap_or_else(|| LogError::Aeron("refetch: no endpoint reachable".into())))
+    }
+
+    /// Connect the control session at rotation offset `attempt` from the
+    /// cursor. Advances the cursor to this endpoint on success.
+    fn try_endpoint(&mut self, endpoints: &[String], attempt: usize) -> Result<Live, LogError> {
+        // The cursor advances with `wrapping_add` here and in `rotate`, so
+        // it can reach `usize::MAX` after enough rotations. Add the same
+        // way, so this never panics on overflow.
+        let idx = self.next_endpoint.wrapping_add(attempt) % endpoints.len();
+        let ep = &endpoints[idx];
+        let mut acfg = self.cfg.aeron.clone();
+        acfg.archive_control_request_channel =
+            ChannelUri::new_trusted(format!("aeron:udp?endpoint={ep}"));
+        acfg.archive_control_response_channel =
+            ChannelUri::new_trusted(format!("aeron:udp?endpoint={}", self.cfg.response_endpoint));
+        match connect_archive_with_timeout(self.cfg.aeron_dir.as_deref(), &acfg, CONNECT_TIMEOUT) {
+            Ok(session) => {
+                info!(endpoint = %ep, "refetch: archive control connected");
+                self.next_endpoint = idx;
+                Ok(Live {
+                    endpoint: ep.clone(),
+                    session,
+                })
+            }
+            Err(e) => {
+                warn!(endpoint = %ep, error = %e, "refetch: archive control connect failed");
+                Err(e)
+            }
+        }
     }
 
     fn rotate(&mut self) {
@@ -421,15 +415,14 @@ impl ArchiveRefetcher {
         self.next_endpoint = self.next_endpoint.wrapping_add(1);
     }
 
-    fn list_or_rotate(&mut self, stream_id: i32) -> Result<Vec<FoundRecording>, LogError> {
-        // Every caller runs `ensure_session` immediately before this, which
-        // returns `&mut self` right after, so the borrow cannot be passed
-        // through; re-deriving it here is what that forces.
-        let session = &self
-            .live
-            .as_ref()
-            .expect("ensure_session ran just above")
-            .session;
+    fn list_or_rotate(
+        &mut self,
+        endpoints: &[String],
+        stream_id: i32,
+    ) -> Result<Vec<FoundRecording>, LogError> {
+        // `ensure_session` returns the cached session when it is fresh.
+        // This call is cheap; it does not reconnect.
+        let session = self.ensure_session(endpoints)?;
         match Self::list_recordings(session, stream_id) {
             Ok(recs) => Ok(recs),
             Err(e) => {
@@ -448,13 +441,14 @@ impl ArchiveRefetcher {
     /// before returning, matching [`Self::list_or_rotate`].
     fn prepare_replay(
         &mut self,
+        endpoints: &[String],
         rec: &FoundRecording,
         from: BPosition,
         stream_id: i32,
         session_id: i32,
     ) -> Result<Option<ReplayPlan>, LogError> {
         let from_raw = rec.raw_position(from)?;
-        let (len, endpoint) = match self.replay_bounds(rec, from_raw) {
+        let (len, endpoint) = match self.replay_bounds(endpoints, rec, from_raw) {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "refetch: replay bounds failed; rotating endpoint");
@@ -480,17 +474,13 @@ impl ArchiveRefetcher {
     /// archive. Also returns the replay destination endpoint.
     fn replay_bounds(
         &mut self,
+        endpoints: &[String],
         rec: &FoundRecording,
         from_raw: i64,
     ) -> Result<(i64, String), LogError> {
-        // Same constraint as `list_or_rotate`: the caller's `ensure_session`
-        // borrow cannot cross this method's own `&mut self` rotate-on-error
-        // path, so it re-derives here instead.
-        let session = &self
-            .live
-            .as_ref()
-            .expect("ensure_session ran just above")
-            .session;
+        // `ensure_session` returns the cached session when it is fresh.
+        // This call is cheap; it does not reconnect.
+        let session = self.ensure_session(endpoints)?;
         let archive = &session.archive;
         // An active recording uses the current recorded position; a stopped
         // one uses its stop position.
@@ -571,10 +561,8 @@ impl ArchiveRefetcher {
             match drain_step(rx, deadline) {
                 ControlFlow::Break(()) => return delivered,
                 ControlFlow::Continue(item) => {
-                    delivered += {
-                        deliver(item);
-                        1
-                    }
+                    deliver(item);
+                    delivered += 1;
                 }
             }
         }

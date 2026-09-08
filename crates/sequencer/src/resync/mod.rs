@@ -40,6 +40,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::metrics;
 
+/// Milliseconds since `since`, saturated to `u64::MAX`. An elapsed time
+/// this large never happens in practice, and saturating keeps a
+/// threshold comparison (`elapsed_ms >= cfg.some_ms`) correct even in
+/// that unreachable case.
+#[must_use]
+pub fn elapsed_ms_saturating(now: Instant, since: Instant) -> u64 {
+    kardamom_types::time::duration_to_ms_saturating(now.duration_since(since))
+}
+
 /// One executed-truth observation from the `tx_receipts` stream.
 /// `sender`'s transaction at `executed_nonce` produced a receipt, so the
 /// sender's floor is at least `executed_nonce + 1`.
@@ -596,7 +605,7 @@ impl ResyncController {
     /// work pending.
     pub fn note_publish_stall(&mut self, now: Instant) {
         let since = *self.stall_since.get_or_insert(now);
-        let stalled_ms = u64::try_from(now.duration_since(since).as_millis()).unwrap_or(u64::MAX);
+        let stalled_ms = elapsed_ms_saturating(now, since);
         if stalled_ms >= self.cfg.publish_stall_ms {
             self.enter(EnterReason::PublishStall { stalled_ms });
             self.stall_since = Some(now); // re-arm, to avoid re-enter spam
@@ -642,7 +651,7 @@ impl ResyncController {
             return;
         }
         let since = *self.calm_since.get_or_insert(now);
-        let calm_ms = u64::try_from(now.duration_since(since).as_millis()).unwrap_or(u64::MAX);
+        let calm_ms = elapsed_ms_saturating(now, since);
         if calm_ms >= self.cfg.exit_hold_ms {
             self.active = false;
             self.calm_since = None;

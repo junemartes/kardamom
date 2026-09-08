@@ -54,13 +54,15 @@ impl Prefix {
         // add is the honest ceiling, not a silent wrap.
         self.cumulative = self.cumulative.saturating_add(r.receipt.gas_used);
         r.receipt.cumulative_gas_used = self.cumulative;
-        self.sink_running = self.sink_running.checked_add(r.fee_delta).ok_or_else(|| {
+        // No sink touch credits nothing: ZERO is the additive identity.
+        let fee_delta = r.sink_fee_delta.unwrap_or(U256::ZERO);
+        self.sink_running = self.sink_running.checked_add(fee_delta).ok_or_else(|| {
             ExecutorError::State(format!(
                 "stm: block {} fee-sink accumulator overflowed U256{context}",
                 self.block_number
             ))
         })?;
-        if r.sink_touched {
+        if r.sink_fee_delta.is_some() {
             if let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK) {
                 entry.1.balance = self.sink_running;
             }
@@ -223,7 +225,9 @@ impl<S: StateDatabase + Sync> Tail<S> {
             .filter_map(std::sync::OnceLock::get)
             .filter_map(|r| r.as_ref().ok())
             .try_fold(U256::ZERO, |acc, r| {
-                acc.checked_add(r.fee_delta).ok_or_else(|| {
+                // No sink touch credits nothing: ZERO is the additive identity.
+                let fee_delta = r.sink_fee_delta.unwrap_or(U256::ZERO);
+                acc.checked_add(fee_delta).ok_or_else(|| {
                     ExecutorError::State(format!(
                         "stm: block {} fee-sum overflowed U256 summing per-tx fee credits",
                         self.ctx.env.block_number
@@ -343,7 +347,7 @@ impl<S: StateDatabase + Sync> Tail<S> {
         receipts: &mut Vec<kardamom_types::Receipt>,
     ) {
         let r = result_mut(cell);
-        if r.sink_touched {
+        if r.sink_fee_delta.is_some() {
             r.receipt.write_set_hash = hash;
         }
         out_frags.extend(r.bal_frag.take());
@@ -428,7 +432,7 @@ impl<S: StateDatabase + Sync> Tail<S> {
         if !wounded_set.contains(&i) {
             // Bounded by the block gas limit (see `serial_prefix`).
             self.prefix.apply(&mut r, " during repair")?;
-            if r.sink_touched {
+            if r.sink_fee_delta.is_some() {
                 r.receipt.write_set_hash = r.ws.hash();
             }
             self.out_frags.extend(r.bal_frag.take());

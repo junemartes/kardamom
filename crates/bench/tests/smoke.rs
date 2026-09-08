@@ -3,8 +3,7 @@
 //! `MockChannels` with a fake-executor receipt loop, for a short
 //! window, and checks that the write-path histogram is not empty.
 //!
-//! This replaces the former in-process-`Node` smoke test, from before
-//! the removal of `kardamom-node`; the bench now targets the cluster
+//! This test covers the write path: the bench targets the cluster
 //! ingress. `transfers` is the write-path workflow, using
 //! `eth_sendRawTransaction` with parked-receipt release, which ingress
 //! serves. An `eth_call`-based workflow is deferred until ingress
@@ -18,19 +17,20 @@ use kardamom_bench::{Benchmark, MixedWorkflow, TransfersWorkflow};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bench_records_samples_against_inprocess_ingress() {
-    let chain_id = 1u64;
-    let concurrency = 4u32;
+    let chain_id = std::num::NonZeroU64::MIN;
+    let concurrency = std::num::NonZeroU32::new(4).expect("4 != 0");
     let max_in_flight = 4u32;
 
-    let (client, ingress) = spawn_inprocess_ingress(chain_id, 1, max_in_flight as usize)
-        .await
-        .expect("spawn in-process ingress");
+    let (client, ingress) =
+        spawn_inprocess_ingress(chain_id, std::num::NonZeroU32::MIN, max_in_flight as usize)
+            .await
+            .expect("spawn in-process ingress");
 
     let bench = Benchmark {
         workflow: TransfersWorkflow::default(),
         timeout: Duration::from_secs(5),
         concurrency,
-        txs_per_task: 50,
+        txs_per_task: std::num::NonZeroU32::new(50).expect("50 != 0"),
         max_in_flight,
     };
 

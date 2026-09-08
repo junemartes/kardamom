@@ -199,7 +199,9 @@ pub fn split_ingress(buf: &[u8]) -> Result<([u8; 32], &[u8]), WireError> {
     let payload = buf
         .get(INGRESS_CANONICAL_ID_OFFSET..)
         .ok_or_else(|| too_short(buf, INGRESS_CANONICAL_ID_OFFSET, 0))?;
-    let cid: [u8; 32] = rd_slice(payload, 0, CANONICAL_ID_LEN)?.try_into().unwrap();
+    let cid: [u8; 32] = rd_slice(payload, 0, CANONICAL_ID_LEN)?
+        .try_into()
+        .expect("rd_slice(.., CANONICAL_ID_LEN) returns a CANONICAL_ID_LEN-byte slice on Ok");
     Ok((cid, payload))
 }
 

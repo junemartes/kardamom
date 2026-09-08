@@ -37,12 +37,14 @@ pub struct Params {
     pub txs_each: NonZeroUsize,
 }
 
+const DEFAULT_TXS_EACH: NonZeroUsize = NonZeroUsize::new(12).unwrap();
+
 impl Default for Params {
     fn default() -> Self {
         Self {
             before: 13,
             after: 14,
-            txs_each: NonZeroUsize::new(12).unwrap(),
+            txs_each: DEFAULT_TXS_EACH,
         }
     }
 }

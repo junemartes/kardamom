@@ -151,9 +151,9 @@ pub fn pack_blocks(
     cfg: &BatcherConfig,
     blocks: &[ClosedBlock],
 ) -> Result<PostedBatch, BatcherError> {
-    if blocks.is_empty() {
+    let (Some(first_block), Some(last_block)) = (blocks.first(), blocks.last()) else {
         return Err(BatcherError::Frame("cannot pack zero blocks".into()));
-    }
+    };
     let payload = build_payload(blocks);
     let framed = frame_encode(&payload)?;
     let to_pack = if cfg.compress {
@@ -168,8 +168,8 @@ pub fn pack_blocks(
             blobs.len()
         )));
     }
-    let l2_block_start = blocks.first().map_or(0, |b| b.block_number);
-    let l2_block_end = blocks.last().map_or(0, |b| b.block_number);
+    let l2_block_start = first_block.block_number;
+    let l2_block_end = last_block.block_number;
     let records_commitment = kardamom_types::batch_records_commitment(blocks.iter().map(|b| {
         let mut d = kardamom_types::BlockRecordsDigest::new(b.block_number);
         for t in &b.txs {

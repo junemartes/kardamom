@@ -199,12 +199,10 @@ pub fn create_checkpoint(
 /// crashed mid-compact. This is safe to run before compacting, because
 /// each directory has a single checkpoint writer.
 fn sweep_stale_tmp(checkpoints_dir: &Path) -> Result<(), StateError> {
-    for (name, path) in entry_names(checkpoints_dir)? {
-        if CheckpointEntry::parse(&name) == CheckpointEntry::Tmp {
-            remove_dir_or_file(&path)?;
-        }
-    }
-    Ok(())
+    entry_names(checkpoints_dir)?
+        .into_iter()
+        .filter(|(name, _)| CheckpointEntry::parse(name) == CheckpointEntry::Tmp)
+        .try_for_each(|(_, path)| remove_dir_or_file(&path))
 }
 
 /// Return the highest-block checkpoint under `checkpoints_dir`. Returns
@@ -239,16 +237,15 @@ pub(crate) fn latest_checkpoint(
 ///
 /// Returns [`StateError`] if the directory listing or a removal fails.
 pub fn prune_checkpoints(checkpoints_dir: &Path, keep_from: u64) -> Result<usize, StateError> {
-    let mut removed = 0usize;
-    for (name, path) in entry_names(checkpoints_dir)? {
-        if let CheckpointEntry::Checkpoint(block) = CheckpointEntry::parse(&name)
-            && block < keep_from
-        {
-            remove_dir_or_file(&path)?;
-            removed += 1;
-        }
-    }
-    Ok(removed)
+    entry_names(checkpoints_dir)?
+        .into_iter()
+        .filter_map(|(name, path)| match CheckpointEntry::parse(&name) {
+            CheckpointEntry::Checkpoint(block) if block < keep_from => Some(path),
+            _ => None,
+        })
+        .try_fold(0usize, |removed, path| {
+            remove_dir_or_file(&path).map(|()| removed + 1)
+        })
 }
 
 /// Restore `checkpoint` into `state_dir`. `state_dir` must be empty or
@@ -321,30 +318,32 @@ pub fn restore_best_checkpoint(
         };
         match restore_checkpoint(&ckpt.path, state_dir, expected_genesis) {
             Ok(block) => return Ok(Some((block, ckpt.path))),
-            Err(e) => {
-                // A failure after verification, such as I/O failing
-                // mid-copy, may have staged a partial data file. A
-                // leftover file would make the next attempt refuse with
-                // "state dir already holds a DB".
-                let _ = std::fs::remove_file(state_dir.join("mdbx.dat"));
-                let name = ckpt
-                    .path
-                    .file_name()
-                    .map_or_else(|| "checkpoint".into(), |n| n.to_string_lossy().into_owned());
-                let rejected = ckpt.path.with_file_name(format!(".rejected-{name}"));
-                warn!(
-                    checkpoint = %ckpt.path.display(),
-                    error = %e,
-                    quarantined_as = %rejected.display(),
-                    "checkpoint failed verification; quarantining and trying the next-newest"
-                );
-                // If even the rename fails, the loop cannot make progress.
-                // Report the original refusal instead of spinning.
-                std::fs::rename(&ckpt.path, &rejected)
-                    .map_err(|re| quarantine_failed_message(&ckpt.path, &e, &re))?;
-            }
+            Err(e) => quarantine_checkpoint(&ckpt.path, state_dir, &e)?,
         }
     }
+}
+
+/// Quarantine a checkpoint that failed verification: clean up any
+/// partial restore, rename it out of the scan path, and log why. The
+/// caller retries with the next-newest checkpoint.
+fn quarantine_checkpoint(path: &Path, state_dir: &Path, e: &StateError) -> Result<(), StateError> {
+    // A failure after verification, such as I/O failing mid-copy, may
+    // have staged a partial data file. A leftover file would make the
+    // next attempt refuse with "state dir already holds a DB".
+    let _ = std::fs::remove_file(state_dir.join("mdbx.dat"));
+    let name = path
+        .file_name()
+        .map_or_else(|| "checkpoint".into(), |n| n.to_string_lossy().into_owned());
+    let rejected = path.with_file_name(format!(".rejected-{name}"));
+    warn!(
+        checkpoint = %path.display(),
+        error = %e,
+        quarantined_as = %rejected.display(),
+        "checkpoint failed verification; quarantining and trying the next-newest"
+    );
+    // If even the rename fails, the loop cannot make progress. Report
+    // the original refusal instead of spinning.
+    std::fs::rename(path, &rejected).map_err(|re| quarantine_failed_message(path, e, &re))
 }
 
 /// Builds the error for a checkpoint that failed verification and could
@@ -385,12 +384,12 @@ pub(crate) fn checkpoint_data_file(checkpoint: &Path) -> Result<PathBuf, StateEr
 
 /// Find the mdbx data file inside a subdir-mode checkpoint directory.
 fn find_mdbx_data(dir: &Path) -> Result<Option<PathBuf>, StateError> {
-    for (name, path) in entry_names(dir)? {
-        if path.is_file() && CheckpointEntry::parse(&name) == CheckpointEntry::MdbxData {
-            return Ok(Some(path));
-        }
-    }
-    Ok(None)
+    Ok(entry_names(dir)?
+        .into_iter()
+        .find(|(name, path)| {
+            path.is_file() && CheckpointEntry::parse(name) == CheckpointEntry::MdbxData
+        })
+        .map(|(_, path)| path))
 }
 
 /// Move a stale state DB aside into `<state_dir>/stale/`. The next
@@ -416,15 +415,18 @@ pub fn park_state_db(state_dir: &Path) -> Result<Option<PathBuf>, StateError> {
         std::fs::remove_dir_all(&parked)?;
     }
     std::fs::create_dir_all(&parked)?;
-    for entry in std::fs::read_dir(state_dir)? {
-        let entry = entry?;
-        if entry.path() == parked {
-            continue;
-        }
-        std::fs::rename(entry.path(), parked.join(entry.file_name()))?;
-    }
+    std::fs::read_dir(state_dir)?.try_for_each(|entry| park_one(&entry?, &parked))?;
     info!(parked = %parked.display(), "parked stale state DB");
     Ok(Some(parked))
+}
+
+/// Move one `read_dir` entry into `parked`, unless it already is
+/// `parked` itself (the directory this same call just created).
+fn park_one(entry: &std::fs::DirEntry, parked: &Path) -> Result<(), StateError> {
+    if entry.path() != parked {
+        std::fs::rename(entry.path(), parked.join(entry.file_name()))?;
+    }
+    Ok(())
 }
 
 /// Returns true if `dir` already contains an mdbx data file, meaning a

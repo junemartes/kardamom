@@ -449,7 +449,7 @@ async fn run_verify(rpc_url: String, owner: Address) -> Result<()> {
 
 fn parse_key(key: &str) -> Result<PrivateKeySigner> {
     let hex = kardamom_deployer::KeyFlag::new(key).resolve()?;
-    let hex = hex.strip_prefix("0x").unwrap_or(&hex);
+    let hex = kardamom_deployer::strip_hex_prefix(&hex);
     PrivateKeySigner::from_str(hex).context("invalid private key")
 }
 

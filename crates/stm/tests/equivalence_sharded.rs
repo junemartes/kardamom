@@ -60,17 +60,15 @@ fn hot_chain_matches_across_shards(
     let recs = records(counter_chain(&sg[..3], 8));
     let seq = execute_block_sequential(database, None, env(), &recs).unwrap();
     let stats = counter_stats();
-    for shards in [1, 2, 3, 4] {
-        for workers in [1, 4] {
-            let out = run_sharded(database, &recs, &stats, workers, shards);
-            assert_eq!(out.wounds, 0, "ordered chain must not wound (k={shards})");
-            assert_identical(
-                &seq,
-                &out.receipts,
-                &out.delta,
-                &format!("sharded chain k={shards} w={workers}"),
-            );
-        }
+    for (shards, workers) in shard_worker_pairs([1, 2, 3, 4], [1, 4]) {
+        let out = run_sharded(database, &recs, &stats, workers, shards);
+        assert_eq!(out.wounds, 0, "ordered chain must not wound (k={shards})");
+        assert_identical(
+            &seq,
+            &out.receipts,
+            &out.delta,
+            &format!("sharded chain k={shards} w={workers}"),
+        );
     }
 }
 
@@ -83,16 +81,14 @@ fn transfers_match_across_shards(
 ) {
     let recs2 = records(transfer_block(sg));
     let seq2 = execute_block_sequential(database, None, env(), &recs2).unwrap();
-    for shards in [2, 3] {
-        for workers in [1, 2, 4] {
-            let out = run_sharded(database, &recs2, &Stats::default(), workers, shards);
-            assert_identical(
-                &seq2,
-                &out.receipts,
-                &out.delta,
-                &format!("sharded transfers k={shards} w={workers}"),
-            );
-        }
+    for (shards, workers) in shard_worker_pairs([2, 3], [1, 2, 4]) {
+        let out = run_sharded(database, &recs2, &Stats::default(), workers, shards);
+        assert_identical(
+            &seq2,
+            &out.receipts,
+            &out.delta,
+            &format!("sharded transfers k={shards} w={workers}"),
+        );
     }
 }
 

@@ -103,6 +103,14 @@ fn run_once_returns_false_when_empty() {
     assert!(!rig.step(&mut seq).unwrap());
 }
 
+/// `seed`'s signer's envelope, kept only if its address routes to a
+/// shard other than `cfg.partition_index`. For `wrong_shard_message_skipped`.
+fn other_shard_envelope(cfg: &SequencerConfig, seed: u64) -> Option<kardamom_types::TxEnvelope> {
+    let s = signer(seed);
+    let routed = cfg.partition_count.index_of(s.address());
+    (routed != cfg.partition_index).then(|| signed_tx_envelope(&s, 0, 1))
+}
+
 #[test]
 fn wrong_shard_message_skipped() {
     let cfg = SequencerConfig {
@@ -114,15 +122,9 @@ fn wrong_shard_message_skipped() {
     let mut seq = Sequencer::new(cfg.clone()).unwrap();
 
     // Find a signer whose address routes to a shard != 0.
-    let mut seed = 1u64;
-    let env = loop {
-        let s = signer(seed);
-        let p = cfg.partition_count.index_of(s.address());
-        if p != cfg.partition_index {
-            break signed_tx_envelope(&s, 0, 1);
-        }
-        seed += 1;
-    };
+    let env = (1u64..)
+        .find_map(|seed| other_shard_envelope(&cfg, seed))
+        .expect("some seed routes to a shard other than 0");
 
     let mut rig = Rig::default();
     rig.push(TxDataLoc::new(0, pos(0)), env);

@@ -112,8 +112,8 @@ pub struct RawFrame {
 }
 
 /// Where an [`AeronRuntime::open_subscription_raw`]-family call sends its
-/// [`RawFrame`]s. Exactly two shapes exist in this crate, both concrete
-/// (no `dyn`):
+/// [`RawFrame`]s. Exactly two shapes exist in this crate, both concrete,
+/// with no dynamic dispatch:
 ///
 /// - `Tokio`: an async consumer, decoded lazily on `recv`/`try_recv`
 ///   (every subscriber handle in [`handles`]).

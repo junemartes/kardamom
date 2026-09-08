@@ -3725,6 +3725,7 @@ name = "kardamom-bench"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eip7928",
  "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-primitives",
@@ -3734,6 +3735,7 @@ dependencies = [
  "anyhow",
  "clap",
  "core_affinity",
+ "crossbeam-channel",
  "dhat",
  "hdrhistogram",
  "humantime",
@@ -3741,6 +3743,7 @@ dependencies = [
  "kardamom-engine",
  "kardamom-footprint",
  "kardamom-ingress",
+ "kardamom-obs",
  "kardamom-state",
  "kardamom-stm",
  "kardamom-types",
@@ -3928,7 +3931,6 @@ dependencies = [
  "metrics",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
- "reqwest 0.13.4",
  "revm",
  "rkyv",
  "serde",

@@ -107,12 +107,12 @@ impl<W: ExecPorts> ExecState<W> {
     pub(super) fn settle_at_boundary(&mut self) -> Result<Flow, ExecutorError> {
         let mut durable = self.sw_signal.committed()?;
         if self.inflight.len() >= COMMIT_PIPELINE_DEPTH.get()
-            && self
+            && let Some(oldest) = self
                 .inflight
                 .front()
-                .is_some_and(|(b, _)| b.block_number > durable)
+                .filter(|(b, _)| b.block_number > durable)
+                .map(|(b, _)| b.block_number)
         {
-            let oldest = self.inflight.front().map_or(0, |(b, _)| b.block_number);
             let commit_wait = Instant::now();
             durable = self.sw_signal.wait_committed(oldest)?;
             metrics::histogram!(crate::metrics::STATE_COMMIT_DURATION_SECONDS)

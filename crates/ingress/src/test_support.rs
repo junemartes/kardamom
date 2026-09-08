@@ -151,11 +151,17 @@ pub fn nonce_of(raw: &impl AsRef<[u8]>) -> u64 {
 #[must_use]
 pub fn signer_for_shard(target_shard: u32, m: NonZeroU32) -> PrivateKeySigner {
     loop {
-        let s = PrivateKeySigner::random();
-        if partition_for(s.address(), m) == target_shard {
+        if let Some(s) = try_signer_for_shard(target_shard, m) {
             return s;
         }
     }
+}
+
+/// One [`signer_for_shard`] draw: a random signer, kept only if it routes
+/// to `target_shard`.
+fn try_signer_for_shard(target_shard: u32, m: NonZeroU32) -> Option<PrivateKeySigner> {
+    let s = PrivateKeySigner::random();
+    (partition_for(s.address(), m) == target_shard).then_some(s)
 }
 
 /// Builds the `BPosition` a fake test executor assigns to the

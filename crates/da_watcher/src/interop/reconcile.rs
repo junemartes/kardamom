@@ -174,13 +174,34 @@ impl ReconcileRetry {
         // code path after it, and so no unreachable arm to write.
         let mut attempt = 1;
         loop {
-            let next_seq = reader.inbox_next_seq(origin_chain_id).await?;
-            match self.verdict(origin_chain_id, cursor, next_seq, attempt) {
-                ControlFlow::Break(result) => return result,
-                ControlFlow::Continue(()) => {
-                    tokio::time::sleep(self.pause).await;
-                    attempt += 1;
-                }
+            match self.tick(reader, origin_chain_id, cursor, attempt).await? {
+                ControlFlow::Break(v) => return Ok(v),
+                ControlFlow::Continue(a) => attempt = a,
+            }
+        }
+    }
+
+    /// One [`Self::reconcile`] attempt: read the destination's `nextSeq`,
+    /// then apply [`Self::verdict`]. `Break` carries the reconcile's
+    /// final cursor. `Continue` carries the next attempt number, after
+    /// pausing. The `Err` case (from either the read or [`Self::verdict`])
+    /// flows through the outer `Result`, not nested inside `ControlFlow`.
+    async fn tick<R: DestinationStateReader>(
+        &self,
+        reader: &R,
+        origin_chain_id: u64,
+        cursor: u64,
+        attempt: u32,
+    ) -> Result<ControlFlow<u64, u32>, ReconcileError> {
+        let next_seq = reader.inbox_next_seq(origin_chain_id).await?;
+        match self.verdict(origin_chain_id, cursor, next_seq, attempt) {
+            ControlFlow::Break(result) => result.map(ControlFlow::Break),
+            ControlFlow::Continue(()) => {
+                tokio::time::sleep(self.pause).await;
+                // `verdict` breaks once `attempt == self.attempts.get()`
+                // (a `NonZeroU32`), so `Continue` only runs below that
+                // bound: `attempt + 1` cannot overflow `u32`.
+                Ok(ControlFlow::Continue(attempt + 1))
             }
         }
     }

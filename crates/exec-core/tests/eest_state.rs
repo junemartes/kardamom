@@ -95,11 +95,17 @@ impl Alloc {
             self.accounts.insert(*addr, *acct);
         }
         for ((addr, key), value) in &ws.storage {
-            if value.is_zero() {
-                self.storage.remove(&(*addr, *key));
-            } else {
-                self.storage.insert((*addr, *key), *value);
-            }
+            self.apply_storage(*addr, *key, *value);
+        }
+    }
+
+    /// Set one storage slot. A zero value removes the slot, since a
+    /// storage slot at zero does not exist in the trie.
+    fn apply_storage(&mut self, addr: Address, key: B256, value: U256) {
+        if value.is_zero() {
+            self.storage.remove(&(addr, key));
+        } else {
+            self.storage.insert((addr, key), value);
         }
     }
 
@@ -279,13 +285,15 @@ fn seed_account(
             code_hash,
         },
     );
-    for (key, value) in &info.storage {
-        let k = B256::from(*key);
-        db = db.storage(addr, k, *value);
-        if !value.is_zero() {
-            alloc.storage.insert((addr, k), *value);
-        }
-    }
+    db = info.storage.iter().fold(db, |db, (key, value)| {
+        db.storage(addr, B256::from(*key), *value)
+    });
+    alloc.storage.extend(
+        info.storage
+            .iter()
+            .filter(|(_, value)| !value.is_zero())
+            .map(|(key, value)| ((addr, B256::from(*key)), *value)),
+    );
     db
 }
 
@@ -329,33 +337,37 @@ impl PostCheck<'_> {
     /// accounts. This is far more useful for triage than two root
     /// hashes.
     fn mismatch_detail(&self, root: B256) -> String {
-        let mut diffs = Vec::new();
-        for (addr, want) in &self.t.post_state {
-            let got = self.alloc.accounts.get(addr);
-            let want_tuple = (
-                want.nonce,
-                want.balance,
-                if want.code.is_empty() {
-                    B256::ZERO
-                } else {
-                    keccak256(&want.code)
-                },
-            );
-            match got {
-                None => diffs.push(format!("{addr}: missing (want {want_tuple:?})")),
-                Some(g) => {
-                    let norm = |h: B256| if h == KECCAK_EMPTY { B256::ZERO } else { h };
-                    if (g.nonce, g.balance, norm(g.code_hash))
-                        != (want_tuple.0, want_tuple.1, norm(want_tuple.2))
-                    {
-                        diffs.push(format!(
-                            "{addr}: got (nonce={}, bal={}, code={}), want (nonce={}, bal={}, code={})",
-                            g.nonce, g.balance, g.code_hash, want_tuple.0, want_tuple.1, want_tuple.2
-                        ));
+        let diffs: Vec<String> = self
+            .t
+            .post_state
+            .iter()
+            .filter_map(|(addr, want)| {
+                let got = self.alloc.accounts.get(addr);
+                let want_tuple = (
+                    want.nonce,
+                    want.balance,
+                    if want.code.is_empty() {
+                        B256::ZERO
+                    } else {
+                        keccak256(&want.code)
+                    },
+                );
+                match got {
+                    None => Some(format!("{addr}: missing (want {want_tuple:?})")),
+                    Some(g) => {
+                        let norm = |h: B256| if h == KECCAK_EMPTY { B256::ZERO } else { h };
+                        ((g.nonce, g.balance, norm(g.code_hash))
+                            != (want_tuple.0, want_tuple.1, norm(want_tuple.2)))
+                        .then(|| {
+                            format!(
+                                "{addr}: got (nonce={}, bal={}, code={}), want (nonce={}, bal={}, code={})",
+                                g.nonce, g.balance, g.code_hash, want_tuple.0, want_tuple.1, want_tuple.2
+                            )
+                        })
                     }
                 }
-            }
-        }
+            })
+            .collect();
         format!(
             "state root mismatch: got {root}, want {} (receipt status={} gas={}{}){}",
             self.t.hash,
@@ -450,16 +462,17 @@ impl Stats {
             Ok(s) => s,
             Err(e) => return self.record_parse_failure(path, e),
         };
-        for (name, unit) in suite.0 {
-            let Some(posts) = unit.post.get(&FORK) else {
-                continue;
-            };
-            for (i, t) in posts.iter().enumerate() {
-                let id = format!("{name}[{i}]");
-                let outcome = run_case(&unit, t);
-                self.record_case(id, outcome, xfails);
-            }
-        }
+        suite
+            .0
+            .iter()
+            .filter_map(|(name, unit)| unit.post.get(&FORK).map(|posts| (name, unit, posts)))
+            .flat_map(|(name, unit, posts)| {
+                posts
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, t)| (format!("{name}[{i}]"), run_case(unit, t)))
+            })
+            .for_each(|(id, outcome)| self.record_case(id, outcome, xfails));
     }
 
     /// Walk every fixture JSON file under `walk_root` and run its cases.
@@ -521,31 +534,38 @@ impl Stats {
             walk_root.display()
         );
 
-        if !self.parse_failures.is_empty() {
-            println!("-- unparseable files ({}):", self.parse_failures.len());
-            for p in self.parse_failures.iter().take(10) {
-                println!("   {p}");
-            }
-        }
-        if !self.unexpected_failures.is_empty() {
-            println!(
-                "-- UNEXPECTED FAILURES ({}):",
-                self.unexpected_failures.len()
-            );
-            for (id, msg) in self.unexpected_failures.iter().take(50) {
-                println!("   {id}: {msg}");
-            }
-        }
-        if !self.unexpected_passes.is_empty() {
-            println!(
-                "-- UNEXPECTED PASSES ({}) — remove stale xfail entries:",
-                self.unexpected_passes.len()
-            );
-            for id in self.unexpected_passes.iter().take(50) {
-                println!("   {id}");
-            }
-        }
+        print_section(
+            "-- unparseable files",
+            &self.parse_failures,
+            10,
+            Clone::clone,
+        );
+        print_section(
+            "-- UNEXPECTED FAILURES",
+            &self.unexpected_failures,
+            50,
+            |(id, msg)| format!("{id}: {msg}"),
+        );
+        print_section(
+            "-- UNEXPECTED PASSES (remove stale xfail entries)",
+            &self.unexpected_passes,
+            50,
+            Clone::clone,
+        );
     }
+}
+
+/// Print up to `limit` items under `header`, or nothing when `items` is
+/// empty. Shared by [`Stats::print_summary`]'s three overflow sections.
+fn print_section<T>(header: &str, items: &[T], limit: usize, fmt: impl Fn(&T) -> String) {
+    if items.is_empty() {
+        return;
+    }
+    println!("{header} ({}):", items.len());
+    items
+        .iter()
+        .take(limit)
+        .for_each(|it| println!("   {}", fmt(it)));
 }
 
 #[test]

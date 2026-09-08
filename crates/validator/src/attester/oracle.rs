@@ -97,16 +97,29 @@ impl<P: Provider<Ethereum> + Clone> OutputPoster<P> {
     pub async fn latest_attested_block(&self) -> Result<Option<u64>, AttesterError> {
         let oracle = IWithdrawalOutputOracle::new(self.oracle, self.provider.clone());
         for i in (0..self.output_count().await?).rev() {
-            let o = oracle.getOutput(U256::from(i)).call().await?;
-            if !o.deleted {
-                return Ok(Some(o.l2BlockNumber));
+            if let Some(block) = self.live_output_block(&oracle, i).await? {
+                return Ok(Some(block));
             }
-            tracing::warn!(
-                output_index = i,
-                l2_block = o.l2BlockNumber,
-                "on-chain output was deleted by a challenge; resuming attestation below it"
-            );
         }
+        Ok(None)
+    }
+
+    /// Output `i`'s L2 block, if it is still live, or `None` (after
+    /// logging) if it was deleted by a challenge.
+    async fn live_output_block(
+        &self,
+        oracle: &IWithdrawalOutputOracle::IWithdrawalOutputOracleInstance<P>,
+        i: u64,
+    ) -> Result<Option<u64>, AttesterError> {
+        let o = oracle.getOutput(U256::from(i)).call().await?;
+        if !o.deleted {
+            return Ok(Some(o.l2BlockNumber));
+        }
+        tracing::warn!(
+            output_index = i,
+            l2_block = o.l2BlockNumber,
+            "on-chain output was deleted by a challenge; resuming attestation below it"
+        );
         Ok(None)
     }
 }

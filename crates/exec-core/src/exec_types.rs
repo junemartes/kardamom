@@ -22,17 +22,18 @@ pub struct TxIndex(pub u64);
 impl TxIndex {
     pub const ZERO: TxIndex = TxIndex(0);
 
-    /// # Panics
+    /// The next counter value.
     ///
-    /// Panics if the counter would overflow `u64`. A saturating add would
-    /// be wrong here: it would repeat an id instead of ending the chain.
-    #[must_use]
-    pub fn next(self) -> Self {
-        TxIndex(
-            self.0
-                .checked_add(1)
-                .expect("TxIndex counter overflowed u64"),
-        )
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ExecutorError::TxIndexOverflow`] on `u64` overflow. A
+    /// saturating add would be wrong here: it would repeat an id instead
+    /// of ending the chain.
+    pub fn next(self) -> Result<Self, crate::error::ExecutorError> {
+        self.0
+            .checked_add(1)
+            .map(TxIndex)
+            .ok_or(crate::error::ExecutorError::TxIndexOverflow)
     }
 }
 
@@ -80,7 +81,15 @@ mod tests {
 
     #[test]
     fn tx_index_next_increments() {
-        assert_eq!(TxIndex(5).next(), TxIndex(6));
+        assert_eq!(TxIndex(5).next().unwrap(), TxIndex(6));
+    }
+
+    #[test]
+    fn tx_index_next_stops_at_overflow() {
+        assert!(matches!(
+            TxIndex(u64::MAX).next(),
+            Err(crate::error::ExecutorError::TxIndexOverflow)
+        ));
     }
 
     #[test]

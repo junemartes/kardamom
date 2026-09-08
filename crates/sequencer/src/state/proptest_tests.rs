@@ -33,23 +33,29 @@ proptest! {
             );
         }
         for (s, ns) in per_sender_published {
-            // Strictly ascending.
-            prop_assert!(
-                ns.windows(2).all(|w| w[1] > w[0]),
-                "sender {}: nonces {:?} not ascending",
-                s,
-                ns
-            );
-            // Dense starting at 0.
-            if !ns.is_empty() {
-                prop_assert_eq!(ns[0], 0, "sender {}: must start at 0", s);
-                prop_assert!(
-                    ns.iter().enumerate().all(|(i, n)| *n == i as u64),
-                    "sender {}: not dense from 0: {:?}",
-                    s,
-                    ns
-                );
-            }
+            check_sender_run(s, &ns)?;
         }
     }
+}
+
+/// `ns`, one sender's published nonces, must be strictly ascending and
+/// (if non-empty) dense starting at 0. For
+/// `published_nonces_per_sender_are_ascending_and_dense`'s loop.
+fn check_sender_run(s: Address, ns: &[u64]) -> Result<(), proptest::test_runner::TestCaseError> {
+    prop_assert!(
+        ns.windows(2).all(|w| w[1] > w[0]),
+        "sender {}: nonces {:?} not ascending",
+        s,
+        ns
+    );
+    if !ns.is_empty() {
+        prop_assert_eq!(ns[0], 0, "sender {}: must start at 0", s);
+        prop_assert!(
+            ns.iter().enumerate().all(|(i, n)| *n == i as u64),
+            "sender {}: not dense from 0: {:?}",
+            s,
+            ns
+        );
+    }
+    Ok(())
 }

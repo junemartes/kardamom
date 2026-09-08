@@ -106,18 +106,17 @@ impl<'p> NodeStore<'p> {
     /// Returns [`AnchorError::ProofSetNotCanonical`] when `proofs.nodes` is
     /// not sorted by hash with no duplicate.
     pub fn new(proofs: &'p WitnessProofs) -> Result<Self, AnchorError> {
-        let mut nodes = BTreeMap::new();
-        let mut prev: Option<B256> = None;
-        for raw in &proofs.nodes {
-            let hash = keccak256(raw);
-            if let Some(p) = prev
-                && p >= hash
-            {
-                return Err(AnchorError::ProofSetNotCanonical);
-            }
-            prev = Some(hash);
-            nodes.insert(hash, raw.as_ref());
-        }
+        let (_, nodes) = proofs.nodes.iter().try_fold(
+            (None::<B256>, BTreeMap::new()),
+            |(prev, mut nodes), raw| {
+                let hash = keccak256(raw);
+                if prev.is_some_and(|prev| prev >= hash) {
+                    return Err(AnchorError::ProofSetNotCanonical);
+                }
+                nodes.insert(hash, raw.as_ref());
+                Ok((Some(hash), nodes))
+            },
+        )?;
         Ok(Self { nodes })
     }
 
@@ -291,21 +290,33 @@ impl<'a> WitnessAnchor<'a> {
     ) -> Result<(), AnchorError> {
         let mut storage_tries: BTreeMap<Address, SparseTrie<'_, '_>> = BTreeMap::new();
         for slot in &self.witness.storage {
-            let Some(pre) = proven.get(&slot.address) else {
-                return Err(AnchorError::Refuted {
-                    what: format!("slot under unwitnessed account {}", slot.address),
-                });
-            };
-            let sroot = pre.map_or(EMPTY_ROOT_HASH, |ta| ta.storage_root);
-            let trie = storage_tries
-                .entry(slot.address)
-                .or_insert_with(|| SparseTrie::new(sroot, &self.store));
-            let lookup = trie
-                .lookup(keccak256(slot.key))
-                .map_err(|e| in_storage_trie(slot.address, e))?;
-            Self::check_one_slot(slot, lookup)?;
+            self.check_one_witness_slot(slot, proven, &mut storage_tries)?;
         }
         Ok(())
+    }
+
+    /// Check one witness storage slot against its account's proven
+    /// storage trie, building that trie on first use. The loop in
+    /// [`Self::prove_storage`] stays free of a branch.
+    fn check_one_witness_slot<'s>(
+        &'s self,
+        slot: &WitnessSlot,
+        proven: &BTreeMap<Address, Option<TrieAccount>>,
+        storage_tries: &mut BTreeMap<Address, SparseTrie<'s, 'a>>,
+    ) -> Result<(), AnchorError> {
+        let Some(pre) = proven.get(&slot.address) else {
+            return Err(AnchorError::Refuted {
+                what: format!("slot under unwitnessed account {}", slot.address),
+            });
+        };
+        let sroot = pre.map_or(EMPTY_ROOT_HASH, |ta| ta.storage_root);
+        let trie = storage_tries
+            .entry(slot.address)
+            .or_insert_with(|| SparseTrie::new(sroot, &self.store));
+        let lookup = trie
+            .lookup(keccak256(slot.key))
+            .map_err(|e| in_storage_trie(slot.address, e))?;
+        Self::check_one_slot(slot, lookup)
     }
 
     /// Check one witness storage slot against its trie lookup. The loop
@@ -415,16 +426,28 @@ pub fn recompute_post_root(
         .copied()
         .collect();
     for addr in touched {
-        let Some(post) = pre.post_account_leaf(addr, delta, &new_storage_root)? else {
-            // EIP-161: touched-but-empty never enters the trie.
-            continue;
-        };
-        let mut rlp = Vec::new();
-        alloy_rlp::Encodable::encode(&post, &mut rlp);
-        accounts_trie.insert(keccak256(addr), rlp)?;
+        insert_touched_leaf(&mut accounts_trie, pre, addr, delta, &new_storage_root)?;
     }
 
     Ok(accounts_trie.root())
+}
+
+/// Recompute one touched account's post-state trie leaf, and insert it
+/// into `accounts_trie`. EIP-161: a touched-but-empty account never
+/// enters the trie, so this is a no-op then.
+fn insert_touched_leaf(
+    accounts_trie: &mut SparseTrie<'_, '_>,
+    pre: &ProvenPre,
+    addr: Address,
+    delta: &PendingDelta,
+    new_storage_root: &BTreeMap<Address, B256>,
+) -> Result<(), AnchorError> {
+    let Some(post) = pre.post_account_leaf(addr, delta, new_storage_root)? else {
+        return Ok(());
+    };
+    let mut rlp = Vec::new();
+    alloy_rlp::Encodable::encode(&post, &mut rlp);
+    accounts_trie.insert(keccak256(addr), rlp)
 }
 
 impl ProvenPre {

@@ -262,25 +262,57 @@ impl OutboxFeedApiServer for FeedHandler {
             from = floor;
         }
 
+        let mut ctx = DrainCtx {
+            handler: self,
+            sink: &sink,
+            from,
+            closed: &mut closed,
+            items: &mut items,
+        };
         let mut next = 0usize;
         loop {
-            match self.drain_script(&sink, from, next).await? {
-                ControlFlow::Break(()) => return Ok(()),
+            match ctx.drain_next(next).await {
+                ControlFlow::Break(result) => return result,
                 ControlFlow::Continue(n) => next = n,
             }
-            tokio::select! {
-                () = sink.closed() => return Ok(()),
-                // An `Err` return, not `Ok(())`: jsonrpsee treats a clean
-                // return as "no further message" and leaves the subscriber
-                // waiting forever, which is a hang rather than the session
-                // drop this is meant to simulate.
-                _ = closed.changed() => return Err("feed session closed".into()),
-                r = items.changed() => {
-                    if r.is_err() {
-                        return Ok(());
-                    }
-                }
-            }
+        }
+    }
+}
+
+/// Fixed context for one [`FeedHandler::subscribe_outbox`] subscription's
+/// drain loop: the handler, the sink, the cursor floor, and the two wake
+/// signals. Only [`DrainCtx::drain_next`]'s own `next` parameter changes
+/// across calls.
+struct DrainCtx<'a> {
+    handler: &'a FeedHandler,
+    sink: &'a jsonrpsee::core::server::SubscriptionSink,
+    from: u64,
+    closed: &'a mut watch::Receiver<u64>,
+    items: &'a mut watch::Receiver<usize>,
+}
+
+impl DrainCtx<'_> {
+    /// One [`FeedHandler::subscribe_outbox`] pass: drain the script from
+    /// `next`, then wait for more items, sink close, or session close.
+    /// `Break` carries the subscription's final result; `Continue`
+    /// carries the next unsent script index to resume from.
+    async fn drain_next(&mut self, next: usize) -> ControlFlow<SubscriptionResult, usize> {
+        let next = match self.handler.drain_script(self.sink, self.from, next).await {
+            Ok(ControlFlow::Break(())) => return ControlFlow::Break(Ok(())),
+            Ok(ControlFlow::Continue(n)) => n,
+            Err(e) => return ControlFlow::Break(Err(e.into())),
+        };
+        tokio::select! {
+            () = self.sink.closed() => ControlFlow::Break(Ok(())),
+            // An `Err` return, not `Ok(())`: jsonrpsee treats a clean
+            // return as "no further message" and leaves the subscriber
+            // waiting forever, which is a hang rather than the session
+            // drop this is meant to simulate.
+            _ = self.closed.changed() => ControlFlow::Break(Err("feed session closed".into())),
+            r = self.items.changed() => match r {
+                Ok(()) => ControlFlow::Continue(next),
+                Err(_) => ControlFlow::Break(Ok(())),
+            },
         }
     }
 }

@@ -75,24 +75,35 @@ impl BlockTxIndex {
     }
 }
 
-/// A count bounded by `MAX_BLOCK_TXS`, parsed once where it is
-/// computed, so a caller never repeats the bound as a claim in an
-/// `.expect(..)` message.
+/// A count bounded by `MAX_BLOCK_TXS`, checked once at construction.
+/// Every later `u32` use of the value is then infallible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct BlockTxCount(u32);
 
 impl BlockTxCount {
-    /// # Panics
-    /// Panics if `n` exceeds `MAX_BLOCK_TXS`. Both callers count
-    /// entries admission already capped at that bound, so this is a
-    /// scheduler-invariant check, not a caller contract.
-    pub(super) fn new(n: usize) -> Self {
-        assert!(n <= MAX_BLOCK_TXS, "count exceeds MAX_BLOCK_TXS: {n}");
-        Self(u32::try_from(n).expect("MAX_BLOCK_TXS fits u32"))
+    /// # Errors
+    /// Returns an error if `n` exceeds `MAX_BLOCK_TXS`.
+    pub(super) fn new(n: usize) -> Result<Self, kardamom_exec_core::error::ExecutorError> {
+        if n > MAX_BLOCK_TXS {
+            return Err(kardamom_exec_core::error::ExecutorError::State(format!(
+                "stm pool: count exceeds MAX_BLOCK_TXS={MAX_BLOCK_TXS} (gas-limit math says impossible): {n}"
+            )));
+        }
+        // MAX_BLOCK_TXS fits comfortably in u32, so this cannot fail
+        // once the bound above holds.
+        Ok(Self(u32::try_from(n).expect("MAX_BLOCK_TXS fits u32")))
     }
 
     pub(super) fn get(self) -> u32 {
         self.0
+    }
+
+    /// Every index this count admits, `0..self`. Each one is already
+    /// proven to fit [`BlockTxIndex`]: a caller that gets its indices
+    /// from here never repeats the `MAX_BLOCK_TXS` bound as a claim in
+    /// its own `.expect(..)`.
+    pub(super) fn indices(self) -> impl Iterator<Item = BlockTxIndex> {
+        (0..self.0).map(BlockTxIndex)
     }
 }
 
@@ -269,11 +280,12 @@ impl Default for PoolConfig {
 pub(super) use kardamom_exec_core::executor::account_info;
 
 /// A duration's nanoseconds as `u64`, for the pool's timing counters.
-/// Saturates instead of wrapping: a duration over `u64::MAX` nanoseconds
-/// (about 584 years) cannot happen on a real timer, so this only ever
-/// widens in practice.
+/// A duration over `u64::MAX` nanoseconds is about 584 years. A real
+/// timer never produces one, so this only proves the sum total.
 pub(super) fn nanos(d: std::time::Duration) -> u64 {
-    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+    d.as_secs()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::from(d.subsec_nanos()))
 }
 
 /// The block-global EIP-7928 BAL fragment index for local index `i`:

@@ -1,17 +1,30 @@
 //! This module has the harness configuration, built by the CLI, and the
 //! serialized report types.
 
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, U256, address};
 use serde::Serialize;
 
 use crate::load::accounting::Verdict;
 
+/// [`LoadConfig::default`]'s `target_tps`.
+const DEFAULT_TARGET_TPS: NonZeroU32 = NonZeroU32::new(200).unwrap();
+/// [`LoadConfig::default`]'s `sender_range` width.
+const DEFAULT_SENDER_RANGE_WIDTH: NonZeroU32 = NonZeroU32::new(16).unwrap();
+/// [`LoadConfig::default`]'s `max_in_flight`.
+const DEFAULT_MAX_IN_FLIGHT: NonZeroU32 = NonZeroU32::new(256).unwrap();
+/// [`LoadConfig::default`]'s `ramp_step_secs`.
+const DEFAULT_RAMP_STEP_SECS: NonZeroU64 = NonZeroU64::new(15).unwrap();
+/// [`LoadConfig::default`]'s `to`: a well-known burn address, never a
+/// real funded account.
+const DEFAULT_TO: Address = address!("0x000000000000000000000000000000000000dEaD");
+
 /// The default Anvil and Hardhat test mnemonic. Genesis prefunds
 /// accounts 0 through 15.
-pub const ANVIL_MNEMONIC: &str = "test test test test test test test test test test test junk";
+pub use crate::ANVIL_MNEMONIC;
 
 /// The set of transactions that must be 100% receipted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,8 +38,72 @@ pub enum Completeness {
     Offered,
 }
 
+impl std::str::FromStr for Completeness {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "accepted" => Ok(Self::Accepted),
+            "offered" => Ok(Self::Offered),
+            other => anyhow::bail!("unknown completeness {other:?} (accepted|offered)"),
+        }
+    }
+}
+
+/// The senders a run uses: `count` accounts starting at `offset` in the
+/// mnemonic table. [`SenderRange::new`] checks the two add without
+/// overflow once, at the boundary, so every reader can trust the pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SenderRange {
+    offset: u32,
+    count: NonZeroU32,
+    /// `offset + count`, computed once at construction time.
+    derive_count: u32,
+}
+
+impl SenderRange {
+    /// Build a range. Returns an error only if `offset + count` would
+    /// overflow `u32`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `offset + count` overflows `u32`.
+    pub fn new(offset: u32, count: NonZeroU32) -> anyhow::Result<Self> {
+        let derive_count = offset
+            .checked_add(count.get())
+            .ok_or_else(|| anyhow::anyhow!("sender_offset + senders overflows u32"))?;
+        Ok(Self {
+            offset,
+            count,
+            derive_count,
+        })
+    }
+
+    /// The first account index in the mnemonic table.
+    #[must_use]
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+
+    /// The number of sender accounts.
+    #[must_use]
+    pub fn count(&self) -> NonZeroU32 {
+        self.count
+    }
+
+    /// `offset + count`: the number of signers to derive so that
+    /// `signers[offset..]` has exactly `count` elements.
+    #[must_use]
+    pub fn derive_count(&self) -> u32 {
+        self.derive_count
+    }
+}
+
 /// The full harness configuration, built by the CLI.
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent CLI flag, built from Args; grouping them would rename flags"
+)]
 pub struct LoadConfig {
     /// The ingress JSON-RPC URL.
     pub rpc: String,
@@ -35,12 +112,11 @@ pub struct LoadConfig {
     /// The soak duration.
     pub duration: Duration,
     /// The ramp ceiling, or the chaos-mode fixed rate, in tx/s.
-    pub target_tps: u32,
-    /// The number of sender accounts.
-    pub senders: u32,
-    /// The first account index in the mnemonic table. This reserves the
-    /// low accounts.
-    pub sender_offset: u32,
+    /// Non-zero: `ramp_to_max`'s `while rate <= target_tps` loop and the
+    /// soak-rate `clamp(1, target_tps)` both need a real upper bound.
+    pub target_tps: NonZeroU32,
+    /// The sender accounts this run uses.
+    pub sender_range: SenderRange,
     /// The starting nonce for each sender.
     pub nonce_start: u64,
     /// The BIP-39 mnemonic the senders derive from.
@@ -49,25 +125,30 @@ pub struct LoadConfig {
     pub to: Address,
     /// The wei value of each transfer.
     pub value: U256,
-    /// The workload family: plain transfers, or the DeFi mix of a CLOB,
-    /// a swap pool, and a vault. See `load::defi`. The DeFi workload
+    /// The workload family: plain transfers, or the `DeFi` mix of a CLOB,
+    /// a swap pool, and a vault. See `load::defi`. The `DeFi` workload
     /// deploys its contracts from the first sender before the ramp, and
     /// reports gas-centric throughput.
     pub workload: Workload,
     /// The legacy gas price, in wei.
     pub gas_price: u128,
-    /// The limit on outstanding submits. This bounds open-loop back pressure.
-    pub max_in_flight: u32,
+    /// The limit on outstanding submits. This bounds open-loop back
+    /// pressure. Non-zero: `Semaphore::new` with 0 permits would never
+    /// admit a submit.
+    pub max_in_flight: NonZeroU32,
     /// The maximum allowed gap between the sealer and the executor block.
     pub max_gap: u64,
     /// How long to keep draining receipts after the send window ends.
     pub drain_timeout: Duration,
     /// The number of per-submit retry attempts on a transient failure.
     pub retry_submit: u32,
-    /// The ramp increment for each step, in tx/s.
-    pub ramp_step_tps: u32,
-    /// The number of seconds held at each ramp step.
-    pub ramp_step_secs: u64,
+    /// The ramp increment for each step, in tx/s. Non-zero: it is a
+    /// divisor at `per_sender_estimate`, and a step count of 0 would
+    /// never advance the ramp.
+    pub ramp_step_tps: NonZeroU32,
+    /// The number of seconds held at each ramp step. Non-zero: it is a
+    /// divisor in the ramp's `Mgas/s` display.
+    pub ramp_step_secs: NonZeroU64,
     /// The fraction of the discovered maximum rate to soak at.
     pub soak_fraction: f64,
     /// The completeness criterion.
@@ -81,10 +162,10 @@ pub struct LoadConfig {
     ///
     /// Use this for CI invariant gating on a weak or shared host. Edge
     /// discovery on such a host measures the hypervisor, not the stack,
-    /// so pass or fail becomes host luck: one load shard's ceiling can
-    /// swing from 800 to 18. Correctness, meaning zero loss, no gaps,
-    /// and keeping pace, does not depend on rate. Gate on correctness at
-    /// a rate the weakest runner can sustain, and leave performance
+    /// so pass or fail becomes host luck: the sustainable ceiling is
+    /// host-dependent. Correctness, meaning zero loss, no gaps, and
+    /// keeping pace, does not depend on rate. Gate on correctness at a
+    /// rate the weakest runner can sustain, and leave performance
     /// numbers to the perf suite on dedicated hardware.
     pub fixed_rate: bool,
     /// The services to scrape.
@@ -116,6 +197,73 @@ pub struct LoadConfig {
     pub output: Option<PathBuf>,
 }
 
+impl LoadConfig {
+    /// The submit mode: subscribe when `subscribe` is set, blocking
+    /// otherwise.
+    pub(crate) fn submit_mode(&self) -> crate::load::engine::SubmitMode {
+        if self.subscribe {
+            crate::load::engine::SubmitMode::Subscribe
+        } else {
+            crate::load::engine::SubmitMode::Blocking
+        }
+    }
+
+    /// Whether a submit should confirm through the feed instead of a
+    /// per-transaction re-fetch: `feed_confirm` has no effect in
+    /// subscribe mode, which is already feed-driven.
+    pub(crate) fn feed_confirm_on(&self) -> bool {
+        self.feed_confirm && !self.subscribe
+    }
+}
+
+impl Default for LoadConfig {
+    /// Sensible defaults, matching `kardamom-load`'s own CLI defaults
+    /// where one exists. `kardamom-perf`'s `load_cfg` builds on this
+    /// with `..Default::default()`, setting only the dozen fields its
+    /// ramp and soak phases actually vary, instead of repeating every
+    /// field. `rpc`, `chain_id`, and `sender_range` have no sensible
+    /// default beyond a placeholder: every real caller sets them.
+    fn default() -> Self {
+        Self {
+            rpc: String::new(),
+            chain_id: None,
+            duration: Duration::from_secs(300),
+            target_tps: DEFAULT_TARGET_TPS,
+            sender_range: SenderRange::new(0, DEFAULT_SENDER_RANGE_WIDTH)
+                .expect("0 + 16 never overflows"),
+            nonce_start: 0,
+            mnemonic: ANVIL_MNEMONIC.to_string(),
+            to: DEFAULT_TO,
+            value: U256::from(1u64),
+            workload: Workload::default(),
+            gas_price: 1_000_000_000,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            max_gap: 5,
+            drain_timeout: Duration::from_secs(90),
+            retry_submit: 2,
+            ramp_step_tps: NonZeroU32::MIN,
+            ramp_step_secs: DEFAULT_RAMP_STEP_SECS,
+            soak_fraction: 0.8,
+            completeness: Completeness::Accepted,
+            assert_all_delivered: false,
+            chaos_mode: false,
+            fixed_rate: false,
+            scrape: vec!["executor".into(), "ingress".into()],
+            metrics_via_docker: true,
+            subscribe: false,
+            feed_confirm: false,
+            executor_nodes: vec![
+                "kardamom-executor-0".into(),
+                "kardamom-executor-1".into(),
+                "kardamom-executor-2".into(),
+            ],
+            ingress_node: "kardamom-ingress-0".into(),
+            sequencer_nodes: vec!["kardamom-sequencer-0".into(), "kardamom-sequencer-1".into()],
+            output: None,
+        }
+    }
+}
+
 /// The workload family the harness drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -123,6 +271,23 @@ pub enum Workload {
     #[default]
     Transfers,
     Defi,
+}
+
+impl Workload {
+    /// The lowercase name this variant parses from and prints as.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Transfers => "transfers",
+            Self::Defi => "defi",
+        }
+    }
+}
+
+impl std::fmt::Display for Workload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl std::str::FromStr for Workload {

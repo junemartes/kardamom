@@ -33,6 +33,7 @@ pub mod fakes {
     //! In-memory `ClusterIngress`/`ClusterEgress` fakes.
 
     use std::collections::VecDeque;
+    use std::ops::ControlFlow;
     use std::sync::{Arc, Mutex};
 
     use super::{ClusterEgress, ClusterIngress, OfferOutcome};
@@ -114,17 +115,30 @@ pub mod fakes {
     impl ClusterEgress for FakeEgress {
         fn recv(&mut self) -> Option<Vec<u8>> {
             loop {
-                if let Some(v) = self.queue.lock().unwrap().pop_front() {
-                    return Some(v);
+                match self.poll_once() {
+                    ControlFlow::Break(result) => return result,
+                    ControlFlow::Continue(()) => {}
                 }
-                if *self.closed.lock().unwrap() {
-                    return None;
-                }
-                // Deterministic tests always close before the queue drains.
-                // This code path runs only on misuse. Yield to avoid a hot
-                // spin.
-                std::thread::yield_now();
             }
+        }
+    }
+
+    impl FakeEgress {
+        /// One [`ClusterEgress::recv`] poll. `Break` carries the answer: the
+        /// next queued payload, or `None` once closed and empty. `Continue`
+        /// means the caller polls again after a yield.
+        fn poll_once(&mut self) -> ControlFlow<Option<Vec<u8>>> {
+            if let Some(v) = self.queue.lock().unwrap().pop_front() {
+                return ControlFlow::Break(Some(v));
+            }
+            if *self.closed.lock().unwrap() {
+                return ControlFlow::Break(None);
+            }
+            // Deterministic tests always close before the queue drains.
+            // This code path runs only on misuse. Yield to avoid a hot
+            // spin.
+            std::thread::yield_now();
+            ControlFlow::Continue(())
         }
     }
 }

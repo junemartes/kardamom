@@ -106,6 +106,9 @@ impl ClusterIngress for LiveIngress {
         {
             return OfferOutcome::NotConnected; // session thread gone
         }
+        // `RecvError` means the session thread dropped `reply_tx` without
+        // answering, which only happens when it is gone: the same
+        // condition `OfferOutcome::NotConnected` reports above.
         reply_rx.recv().unwrap_or(OfferOutcome::NotConnected)
     }
 }

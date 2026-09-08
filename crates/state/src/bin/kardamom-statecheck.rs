@@ -78,27 +78,50 @@ struct Args {
     expect_root: Option<String>,
 }
 
-fn parse_args() -> Args {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut dir: Option<String> = None;
-    let mut compare: Option<String> = None;
-    let mut expect_root: Option<String> = None;
-    let mut it = args.into_iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--compare" => compare = Some(it.next().unwrap_or_else(|| usage())),
-            "--expect-root" => expect_root = Some(it.next().unwrap_or_else(|| usage())),
+/// Accumulates [`Args`]'s fields while [`parse_args`] walks the argument
+/// list, so the loop body is one call to [`Self::take`] instead of the
+/// match living inline in the loop.
+#[derive(Default)]
+struct ArgsBuilder {
+    dir: Option<String>,
+    compare: Option<String>,
+    expect_root: Option<String>,
+}
+
+impl ArgsBuilder {
+    /// Consume one argument `a`, pulling its value from `it` when `a` is
+    /// a flag that takes one. Exits the process via [`usage`] on an
+    /// unrecognized or misplaced argument.
+    fn take(&mut self, a: &str, it: &mut impl Iterator<Item = String>) {
+        match a {
+            "--compare" => self.compare = Some(it.next().unwrap_or_else(|| usage())),
+            "--expect-root" => self.expect_root = Some(it.next().unwrap_or_else(|| usage())),
             "--help" | "-h" => usage(),
-            _ if dir.is_none() => dir = Some(a),
+            _ if self.dir.is_none() => self.dir = Some(a.to_string()),
             _ => usage(),
         }
     }
-    let Some(dir) = dir else { usage() };
-    Args {
-        dir,
-        compare,
-        expect_root,
+
+    /// Finish parsing. Exits via [`usage`] if no positional `dir` was
+    /// given.
+    fn build(self) -> Args {
+        let Some(dir) = self.dir else { usage() };
+        Args {
+            dir,
+            compare: self.compare,
+            expect_root: self.expect_root,
+        }
     }
+}
+
+fn parse_args() -> Args {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut it = args.into_iter();
+    let mut parsed = ArgsBuilder::default();
+    while let Some(a) = it.next() {
+        parsed.take(&a, &mut it);
+    }
+    parsed.build()
 }
 
 impl Args {
@@ -148,9 +171,7 @@ impl Args {
                 );
             }
             Ok(diffs) => {
-                for d in &diffs {
-                    println!("statecheck: DIFF: {d}");
-                }
+                print_diffs(&diffs);
                 failed = true;
             }
             Err(e) => {
@@ -159,6 +180,13 @@ impl Args {
             }
         }
         failed
+    }
+}
+
+/// Print every table diff, one line each.
+fn print_diffs(diffs: &[String]) {
+    for d in diffs {
+        println!("statecheck: DIFF: {d}");
     }
 }
 

@@ -53,6 +53,22 @@ pub struct SelectorStats {
     pub account_seen: BTreeMap<Address, u64>,
 }
 
+impl SelectorStats {
+    /// Fold one touched cell into this selector's stats: a slot bumps its
+    /// per-slot count, an account bumps its per-account count.
+    fn record_cell(&mut self, cell: &Cell) {
+        match cell {
+            Cell::Slot(addr, slot) => {
+                self.slot_obs += 1;
+                *self.slot_seen.entry((*addr, *slot)).or_default() += 1;
+            }
+            Cell::Account(a) => {
+                *self.account_seen.entry(*a).or_default() += 1;
+            }
+        }
+    }
+}
+
 /// Live-stats entry cap (spec "Stats footprint"): a bounded cardinality
 /// whose eviction costs nothing by construction. A cold selector schedules
 /// as `Tail` with or without stats, so entries the cap refuses lose nothing.
@@ -89,17 +105,10 @@ impl Stats {
         }
         let e = self.by_selector.entry((to, sel)).or_default();
         e.observations += 1;
-        for cell in o.reads.iter().chain(o.writes.iter()) {
-            match cell {
-                Cell::Slot(addr, slot) => {
-                    e.slot_obs += 1;
-                    *e.slot_seen.entry((*addr, *slot)).or_default() += 1;
-                }
-                Cell::Account(a) => {
-                    *e.account_seen.entry(*a).or_default() += 1;
-                }
-            }
-        }
+        o.reads
+            .iter()
+            .chain(o.writes.iter())
+            .for_each(|cell| e.record_cell(cell));
     }
 
     /// True when `n` observations out of `observations` total meet the
@@ -130,17 +139,18 @@ impl Stats {
             return Some(Vec::new());
         };
         let e = self.by_selector.get(&(to, sel))?;
-        let mut keys = Vec::new();
-        for ((addr, slot), n) in &e.slot_seen {
-            if Self::is_frequent(*n, e.observations) {
-                keys.push(fixed(*addr, *slot));
-            }
-        }
-        for (a, n) in &e.account_seen {
-            if Self::is_frequent(*n, e.observations) {
-                keys.push(account(*a));
-            }
-        }
+        let mut keys: Vec<K> = e
+            .slot_seen
+            .iter()
+            .filter(|(_, n)| Self::is_frequent(**n, e.observations))
+            .map(|(&(addr, slot), _)| fixed(addr, slot))
+            .collect();
+        keys.extend(
+            e.account_seen
+                .iter()
+                .filter(|(_, n)| Self::is_frequent(**n, e.observations))
+                .map(|(&a, _)| account(a)),
+        );
         Some(keys)
     }
 
@@ -285,10 +295,9 @@ mod tests {
                 reason = "loop bound is small (<=10): fits u8"
             )]
             let mut o = swap_obs(i, addr(i as u8 + 1));
-            if i == 0 {
-                // One call touches an extra slot.
-                o.writes.push(Cell::Slot(POOL, B256::with_last_byte(0x77)));
-            }
+            // One call touches an extra slot.
+            o.writes
+                .extend((i == 0).then(|| Cell::Slot(POOL, B256::with_last_byte(0x77))));
             stats.learn_obs(&o);
         }
         let p = stats.predict(&swap_obs(20, addr(90))).unwrap();

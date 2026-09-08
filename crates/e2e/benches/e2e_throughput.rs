@@ -21,11 +21,31 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
+/// Publish `batch` synthetic envelopes, each with a distinct correlation
+/// id, sender, and hash derived from its index.
 #[cfg(feature = "full-pipeline-e2e")]
 #[allow(
     clippy::cast_possible_truncation,
     reason = "wrapping the per-message low byte past 255 is fine here"
 )]
+fn publish_batch(publisher: &kardamom_log::aeron_live::TxDataPublisherHandle, batch: usize) {
+    use alloy_primitives::{Address, B256};
+    use bytes::Bytes;
+    use kardamom_types::TxEnvelope;
+
+    for i in 0..batch {
+        let low_byte = i as u8;
+        let env = TxEnvelope {
+            correlation_id: i as u64,
+            raw_tx: Bytes::from(vec![0xCDu8; 96]),
+            sender: Address::repeat_byte(low_byte ^ 0xAB),
+            tx_hash: B256::repeat_byte(low_byte ^ 0x5A),
+        };
+        publisher.publish(&env).expect("publish");
+    }
+}
+
+#[cfg(feature = "full-pipeline-e2e")]
 fn run_e2e_throughput(c: &mut Criterion) {
     use alloy_primitives::{Address, B256};
     use bytes::Bytes;
@@ -86,18 +106,7 @@ fn run_e2e_throughput(c: &mut Criterion) {
     for &batch in &[1usize, 64, 1024] {
         group.throughput(Throughput::Elements(batch as u64));
         group.bench_function(format!("batch={batch}"), |b| {
-            b.iter(|| {
-                for i in 0..batch {
-                    let low_byte = i as u8;
-                    let env = TxEnvelope {
-                        correlation_id: i as u64,
-                        raw_tx: Bytes::from(vec![0xCDu8; 96]),
-                        sender: Address::repeat_byte(low_byte ^ 0xAB),
-                        tx_hash: B256::repeat_byte(low_byte ^ 0x5A),
-                    };
-                    publisher.publish(&env).expect("publish");
-                }
-            });
+            b.iter(|| publish_batch(&publisher, batch));
         });
     }
     group.finish();

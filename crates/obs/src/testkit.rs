@@ -50,15 +50,24 @@ pub fn free_udp_port() -> SocketAddr {
 /// budget (40 attempts, 50 ms apart).
 pub async fn scrape(url: &str) -> String {
     for _ in 1..40 {
-        if let ControlFlow::Break(body) = try_scrape(url).await {
+        if let ControlFlow::Break(body) = scrape_attempt(url).await {
             return body;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     match try_scrape(url).await {
         ControlFlow::Break(body) => body,
         ControlFlow::Continue(()) => panic!("exporter not ready at {url}"),
     }
+}
+
+/// One [`scrape`] retry attempt: try once, then (if not ready yet) sleep
+/// 50 ms before the caller retries.
+async fn scrape_attempt(url: &str) -> ControlFlow<String> {
+    let outcome = try_scrape(url).await;
+    if outcome.is_continue() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    outcome
 }
 
 /// One scrape attempt: a successful response breaks out with its body, a
@@ -87,11 +96,27 @@ pub async fn poll_until<T>(
 ) -> anyhow::Result<T> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match poll_outcome(f().await?, deadline, timeout, what)? {
+        match poll_until_step(f().await?, deadline, timeout, what, interval).await? {
             ControlFlow::Break(v) => return Ok(v),
-            ControlFlow::Continue(()) => tokio::time::sleep(interval).await,
+            ControlFlow::Continue(()) => {}
         }
     }
+}
+
+/// One [`poll_until`] step: apply [`poll_outcome`], then (if it says
+/// retry) sleep `interval` before the caller polls again.
+async fn poll_until_step<T>(
+    item: Option<T>,
+    deadline: std::time::Instant,
+    timeout: std::time::Duration,
+    what: &str,
+    interval: std::time::Duration,
+) -> anyhow::Result<ControlFlow<T>> {
+    let outcome = poll_outcome(item, deadline, timeout, what)?;
+    if outcome.is_continue() {
+        tokio::time::sleep(interval).await;
+    }
+    Ok(outcome)
 }
 
 /// Blocking twin of [`poll_until`], for code that runs off the tokio
@@ -109,11 +134,27 @@ pub fn poll_sync<T>(
 ) -> anyhow::Result<T> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match poll_outcome(f()?, deadline, timeout, what)? {
+        match poll_sync_step(f()?, deadline, timeout, what, interval)? {
             ControlFlow::Break(v) => return Ok(v),
-            ControlFlow::Continue(()) => std::thread::sleep(interval),
+            ControlFlow::Continue(()) => {}
         }
     }
+}
+
+/// One [`poll_sync`] step: apply [`poll_outcome`], then (if it says
+/// retry) sleep `interval` before the caller polls again.
+fn poll_sync_step<T>(
+    item: Option<T>,
+    deadline: std::time::Instant,
+    timeout: std::time::Duration,
+    what: &str,
+    interval: std::time::Duration,
+) -> anyhow::Result<ControlFlow<T>> {
+    let outcome = poll_outcome(item, deadline, timeout, what)?;
+    if outcome.is_continue() {
+        std::thread::sleep(interval);
+    }
+    Ok(outcome)
 }
 
 /// Shared dispatch behind [`poll_until`] and [`poll_sync`]: `Some(v)`

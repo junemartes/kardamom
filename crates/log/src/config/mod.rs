@@ -432,6 +432,8 @@ impl ChannelsConfig {
                      tx_receipts_control_channel enables MDS"
                     .to_string());
             };
+            // Unset means no receipt fan-out: 0 replicas need 0 extra
+            // ports, so `base + 1` alone bounds the highest port.
             let executor_count = self
                 .tx_receipts_executor_count
                 .map_or(0, std::num::NonZeroU32::get);

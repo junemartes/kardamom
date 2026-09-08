@@ -68,6 +68,8 @@ impl Slots {
             return Err(SubscriptionCap::Total);
         }
         if let Some(d) = dest {
+            // No entry means no subscription has counted against `d`
+            // yet: 0 is the correct starting count, not a sentinel.
             let per_dest = g.per_dest.get(&d).copied().unwrap_or(0);
             if per_dest >= limits.max_subscriptions_per_dest.get() {
                 return Err(SubscriptionCap::PerDest);

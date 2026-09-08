@@ -259,12 +259,23 @@ impl BatchRun {
     /// One block's records digest, folded over its tx records.
     fn block_records_digest(input: &kardamom_types::ProverInput) -> alloy_primitives::B256 {
         let mut digest = kardamom_types::BlockRecordsDigest::new(input.boundary.block_number);
-        for r in &input.records {
-            if let kardamom_types::ProverRecord::Tx { envelope, .. } = r {
-                digest.add_tx(&envelope.raw_tx);
-            }
-        }
+        input
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                kardamom_types::ProverRecord::Tx { envelope, .. } => Some(envelope),
+                kardamom_types::ProverRecord::Deposit { .. } => None,
+            })
+            .for_each(|envelope| digest.add_tx(&envelope.raw_tx));
         digest.finish()
+    }
+
+    /// Read and decode one block's `expected-outputs.bin`.
+    fn read_expected_output(&self, n: u64) -> anyhow::Result<kardamom_types::PublicOutputs> {
+        let expected_bytes =
+            std::fs::read(format!("{}/block-{n}/expected-outputs.bin", self.spool))
+                .with_context(|| format!("expected outputs for block {n}"))?;
+        kardamom_types::PublicOutputs::decode(&expected_bytes).context("expected-outputs layout")
     }
 
     /// Read every block's `expected-outputs.bin` in `self.range`
@@ -272,22 +283,18 @@ impl BatchRun {
     /// boundary roots: the first block's pre-state root and the last
     /// block's post-state root.
     fn expected_boundary_roots(&self) -> anyhow::Result<BoundaryRoots> {
-        let mut pre = None;
-        let mut post = None;
-        for n in self.range.first..=self.range.last {
-            let expected_bytes =
-                std::fs::read(format!("{}/block-{n}/expected-outputs.bin", self.spool))
-                    .with_context(|| format!("expected outputs for block {n}"))?;
-            let expected = kardamom_types::PublicOutputs::decode(&expected_bytes)
-                .context("expected-outputs layout")?;
-            if n == self.range.first {
-                pre = Some(expected.pre_state_root);
-            }
-            post = Some(expected.post_state_root);
-        }
+        let outputs: Vec<kardamom_types::PublicOutputs> = (self.range.first..=self.range.last)
+            .map(|n| self.read_expected_output(n))
+            .collect::<anyhow::Result<_>>()?;
         Ok(BoundaryRoots {
-            pre: pre.expect("BlockRange guarantees at least one block"),
-            post: post.expect("BlockRange guarantees at least one block"),
+            pre: outputs
+                .first()
+                .context("BlockRange guarantees at least one block")?
+                .pre_state_root,
+            post: outputs
+                .last()
+                .context("BlockRange guarantees at least one block")?
+                .post_state_root,
         })
     }
 

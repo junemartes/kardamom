@@ -87,18 +87,13 @@ pub fn envelope_view(raw: &[u8]) -> EnvelopeView {
 /// [`envelope_view`] over an already-decoded envelope. Callers that hold
 /// the decoded tx (the STM engine decodes once, for both schedule and
 /// execution) skip the second RLP pass.
-///
-/// # Panics
-///
-/// Never panics: the selector conversion only runs on a slice
-/// `get(..4)` already proved is exactly 4 bytes long.
 #[must_use]
 pub fn decoded_view(env: &alloy_consensus::TxEnvelope) -> EnvelopeView {
     use alloy_consensus::Transaction;
     let has_value = env.value() > U256::ZERO;
     let to = env.to();
     let input = env.input();
-    let selector: Option<[u8; 4]> = input.get(..4).map(|s| s.try_into().unwrap());
+    let selector: Option<[u8; 4]> = input.first_chunk::<4>().copied();
     let args: Vec<U256> = if input.len() > 4 {
         input[4..]
             .chunks(32)

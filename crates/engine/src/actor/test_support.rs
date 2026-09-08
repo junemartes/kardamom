@@ -1,17 +1,14 @@
 //! Shared fixtures for the actor's test modules: canonical-position and
-//! signed-legacy-transaction builders, remote-epoch fixtures, writer-signal
-//! and writer-queue test doubles, and the commit-channel drain helper.
+//! legacy-transaction builders (over [`super::fixtures::LegacyTx`]),
+//! remote-epoch fixtures, writer-signal and writer-queue test doubles, and
+//! the commit-channel drain helper.
 
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, Bytes as AlloyBytes, TxKind as APTxKind, U256, keccak256};
+use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
-use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
 use kardamom_types::xchain::{NonEmptyVec, RemoteEpochRecord, XChainMessage, remote_source_hash};
 use kardamom_types::{
@@ -81,35 +78,25 @@ pub(super) fn tx_msg(
     }
 }
 
-/// Build a signed legacy transfer, wrapped as a `kardamom_types::TxEnvelope`.
-/// This matches what the proxy hands downstream, with `sender` and
-/// `tx_hash` stamped. `pub(crate)`: `reader::tests` and `replay::tests`
-/// also build this fixture, and import this one copy instead of their own.
+/// This crate's own fixtures' shape: chain id 1, a 21,000-gas transfer,
+/// over [`super::fixtures::LegacyTx`]. `pub(crate)`: `reader::tests` and
+/// `replay::tests` also build this fixture, and import this one copy
+/// instead of their own.
 pub(crate) fn legacy(
     signer: &PrivateKeySigner,
     to: Address,
     nonce: u64,
     value: u64,
 ) -> KtTxEnvelope {
-    let mut tx = TxLegacy {
-        chain_id: Some(1),
+    super::fixtures::LegacyTx {
+        chain_id: 1,
+        to,
         nonce,
-        gas_price: 0,
+        value,
         gas_limit: 21_000,
-        to: APTxKind::Call(to),
-        value: U256::from(value),
-        input: AlloyBytes::new(),
-    };
-    let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-    let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
-    let raw_tx = Bytes::from(alloy_env.encoded_2718());
-    let tx_hash = keccak256(&raw_tx);
-    KtTxEnvelope {
-        correlation_id: 0,
-        raw_tx,
-        sender: signer.address(),
-        tx_hash,
+        gas_price: 0,
     }
+    .sign(signer)
 }
 
 pub(super) struct ImmediateCommit;

@@ -116,8 +116,7 @@ impl TxJob<'_> {
             receipt,
             ws,
             reads: Vec::new(),
-            fee_delta: U256::ZERO,
-            sink_touched: false,
+            sink_fee_delta: None,
             bal_frag: None,
         }
     }
@@ -259,8 +258,6 @@ fn build_tx_result<S: StateDatabase>(
     let pub_ns = nanos(t_pub.elapsed());
     metrics.publish_ns.fetch_add(pub_ns, Ordering::Relaxed);
     let sink_fee_delta = sink_fee_delta(&ws, sink_start_balance, env.block_number, job.tx_idx)?;
-    let sink_touched = sink_fee_delta.is_some();
-    let fee_delta = sink_fee_delta.unwrap_or(U256::ZERO);
     let reads = {
         // Take this transaction's read log back out of the worker's
         // view. The replacement comes from the recycle pool (cleared,
@@ -272,7 +269,11 @@ fn build_tx_result<S: StateDatabase>(
     };
     // Hashing now is pure waste when the commit pass must re-hash after
     // patching the accumulator's absolute balance.
-    let write_set_hash = if sink_touched { B256::ZERO } else { ws.hash() };
+    let write_set_hash = if sink_fee_delta.is_some() {
+        B256::ZERO
+    } else {
+        ws.hash()
+    };
     let receipt = build_receipt(ReceiptArgs {
         position: job.position,
         envelope: job.envelope,
@@ -292,16 +293,15 @@ fn build_tx_result<S: StateDatabase>(
         ws,
         reads,
         bal_frag,
-        fee_delta,
-        sink_touched,
+        sink_fee_delta,
     })
 }
 
 /// One scan answers both sink questions: whether this transaction
 /// touched the fee sink at all, and if so, its credit this transaction
 /// (see [`fee_delta_from_sink`]). `None` means the sink was not
-/// touched; the caller derives `sink_touched` from that instead of
-/// carrying a second, separately-fallible bool.
+/// touched. The caller carries the `Option` straight onto `TxResult`
+/// instead of splitting it into a bool and a sentinel value.
 fn sink_fee_delta(
     ws: &WriteSet,
     sink_start_balance: U256,

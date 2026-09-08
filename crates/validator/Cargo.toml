@@ -62,6 +62,9 @@ path = "src/bin/kardamom-validator/main.rs"
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 crossbeam-channel = "0.5"
+# `actor::fixtures::ChannelHarness`: the channel-backed engine harness
+# `forged_envelope_chaos.rs` drives, shared with `kardamom-executor`.
+kardamom-engine = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 alloy-network.workspace = true
 alloy-primitives.workspace = true

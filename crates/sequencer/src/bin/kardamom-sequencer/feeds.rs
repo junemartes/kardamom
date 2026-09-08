@@ -15,6 +15,7 @@
 //! Async-capable work, such as the receipts fan-in on an existing tokio
 //! channel, is a plain task. It uses `select!` on `Shutdown::cancelled`.
 
+use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
@@ -32,7 +33,9 @@ use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::partition::PartitionCount;
 use kardamom_sequencer::remote_epoch::process_remote_epoch;
-use kardamom_sequencer::resync::{FloorUpdate, ResyncController, SharedWatermark};
+use kardamom_sequencer::resync::{
+    FloorUpdate, ResyncController, SharedWatermark, elapsed_ms_saturating,
+};
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
 
 /// The egress-watermark feed: the silence authority. It measures
@@ -220,7 +223,7 @@ impl EgressWatermarkFeed {
         let Some(prev) = self.last_boundary_at else {
             return;
         };
-        let gap = u64::try_from(now.duration_since(prev).as_millis()).unwrap_or(u64::MAX);
+        let gap = elapsed_ms_saturating(now, prev);
         if gap >= self.silence_ms {
             self.watermark.flag_lag(gap);
             seq_metrics::record_lag_suspected(self.partition);
@@ -277,45 +280,66 @@ impl ReceiptFloorFeed {
 
     async fn run(self, mut rx: kardamom_log::aeron_live::TxReceiptsReceiver, shutdown: Shutdown) {
         loop {
-            let receipt = tokio::select! {
-                biased;
-                () = shutdown.cancelled() => return,
-                msg = rx.recv() => match msg {
-                    Some((_pos, receipt)) => receipt,
-                    // The subscription closed. The runtime shut down.
-                    // Nothing more to feed.
-                    None => return,
-                },
-            };
-            // Forward every partition-matched receipt. The controller splits
-            // floor evidence (skip and deposit receipts excluded, since they
-            // consume no L2 nonce) from publish confirmations (skip receipts
-            // count as confirmations: ordering is the claim). See
-            // `ResyncController::drain_floor_updates` for the split.
-            //
-            // Only this shard's senders can appear in this replica's publish
-            // stream, so the floor map stays bounded to them.
-            if self.partition_count.index_of(receipt.from) != self.partition_index {
-                continue;
+            match self.tick(&mut rx, &shutdown).await {
+                ControlFlow::Break(()) => return,
+                ControlFlow::Continue(()) => {}
             }
-            let update = FloorUpdate {
-                sender: receipt.from,
-                executed_nonce: receipt.nonce,
-                skip_reason: receipt.skip_reason,
-                deposit: receipt.is_deposit(),
-            };
-            match self.floor_tx.try_send(update) {
-                Ok(()) => {}
-                // The publish loop is stalled past the resync window already.
-                // Dropping is safe: an unproven skip just falls through to
-                // publish, the side every degraded mode already degrades
-                // toward (see the module doc on `crate::resync`).
-                Err(crossbeam_channel::TrySendError::Full(_)) => {
-                    tracing::warn!("receipt-floor channel full; dropping");
-                }
-                // The publish loop is gone. Exit.
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => return,
+        }
+    }
+
+    /// One [`Self::run`] pass: wait for the next receipt or shutdown,
+    /// then forward it. `Break` means the task should stop: shutdown,
+    /// the subscription closed, or the publish loop is gone.
+    async fn tick(
+        &self,
+        rx: &mut kardamom_log::aeron_live::TxReceiptsReceiver,
+        shutdown: &Shutdown,
+    ) -> ControlFlow<()> {
+        let receipt = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return ControlFlow::Break(()),
+            msg = rx.recv() => match msg {
+                Some((_pos, receipt)) => receipt,
+                // The subscription closed. The runtime shut down.
+                // Nothing more to feed.
+                None => return ControlFlow::Break(()),
+            },
+        };
+        self.forward_one_receipt(&receipt)
+    }
+
+    /// Filter, build, and forward one receipt, for [`Self::tick`].
+    /// `Break` means the publish loop is gone and the task should stop.
+    fn forward_one_receipt(&self, receipt: &kardamom_types::Receipt) -> ControlFlow<()> {
+        // Forward every partition-matched receipt. The controller splits
+        // floor evidence (skip and deposit receipts excluded, since they
+        // consume no L2 nonce) from publish confirmations (skip receipts
+        // count as confirmations: ordering is the claim). See
+        // `ResyncController::drain_floor_updates` for the split.
+        //
+        // Only this shard's senders can appear in this replica's publish
+        // stream, so the floor map stays bounded to them.
+        if self.partition_count.index_of(receipt.from) != self.partition_index {
+            return ControlFlow::Continue(());
+        }
+        let update = FloorUpdate {
+            sender: receipt.from,
+            executed_nonce: receipt.nonce,
+            skip_reason: receipt.skip_reason,
+            deposit: receipt.is_deposit(),
+        };
+        match self.floor_tx.try_send(update) {
+            Ok(()) => ControlFlow::Continue(()),
+            // The publish loop is stalled past the resync window already.
+            // Dropping is safe: an unproven skip just falls through to
+            // publish, the side every degraded mode already degrades
+            // toward (see the module doc on `crate::resync`).
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                tracing::warn!("receipt-floor channel full; dropping");
+                ControlFlow::Continue(())
             }
+            // The publish loop is gone. Exit.
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => ControlFlow::Break(()),
         }
     }
 }

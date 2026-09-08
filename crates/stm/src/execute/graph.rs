@@ -570,8 +570,10 @@ impl<S: StateDatabase> BlockCtx<S> {
             .sum();
         if applied > 0 {
             self.pending.fetch_sub(applied as u64, Ordering::SeqCst);
-            self.finished
-                .fetch_add(BlockTxCount::new(applied).get(), Ordering::SeqCst);
+            let applied_count = BlockTxCount::new(applied)
+                .expect("admission caps a block at MAX_BLOCK_TXS")
+                .get();
+            self.finished.fetch_add(applied_count, Ordering::SeqCst);
         }
         self.metrics
             .prune_ns
@@ -617,8 +619,10 @@ impl<S: StateDatabase> BlockCtx<S> {
         if b.is_empty() {
             return None;
         }
-        len.0
-            .fetch_sub(BlockTxCount::new(b.len()).get(), Ordering::AcqRel);
+        let drained_count = BlockTxCount::new(b.len())
+            .expect("admission caps a block at MAX_BLOCK_TXS")
+            .get();
+        len.0.fetch_sub(drained_count, Ordering::AcqRel);
         Some(std::mem::take(&mut *b))
     }
 

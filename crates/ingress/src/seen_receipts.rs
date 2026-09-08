@@ -29,7 +29,7 @@ use alloy_primitives::B256;
 
 /// Default ring capacity. 1<<16 hashes is about 2 MiB, a small cost. It is
 /// far larger than the N-replica duplicate window for any realistic N.
-pub(crate) const DEFAULT_CAPACITY: usize = 1 << 16;
+pub(crate) const DEFAULT_CAPACITY: NonZeroUsize = NonZeroUsize::new(1 << 16).unwrap();
 
 /// Bounded, first-wins set of receipt tx hashes. Owned by one task; see
 /// the module docs.
@@ -77,7 +77,7 @@ impl SeenReceipts {
 
 impl Default for SeenReceipts {
     fn default() -> Self {
-        Self::new(NonZeroUsize::new(DEFAULT_CAPACITY).expect("DEFAULT_CAPACITY is nonzero"))
+        Self::new(DEFAULT_CAPACITY)
     }
 }
 

@@ -176,7 +176,10 @@ impl WsRemoteChainSource {
         self.pending.clear();
     }
 
-    async fn connect(&mut self, from: u64) -> Result<(), RemoteSourceError> {
+    async fn connect(
+        &mut self,
+        from: u64,
+    ) -> Result<Subscription<OutboxEventDto>, RemoteSourceError> {
         let client = WsClientBuilder::default()
             .build(&self.url)
             .await
@@ -190,8 +193,7 @@ impl WsRemoteChainSource {
             .await
             .map_err(|e| RemoteSourceError::Transport(format!("subscribe: {e}")))?;
         self.client = Some(client);
-        self.subscription = Some(subscription);
-        Ok(())
+        Ok(subscription)
     }
 
     /// Ensure a live subscription at `from`, reconnecting with retry if
@@ -202,45 +204,51 @@ impl WsRemoteChainSource {
         &mut self,
         from: u64,
     ) -> Result<&mut Subscription<OutboxEventDto>, RemoteSourceError> {
-        if self.subscription.is_none() {
-            self.connect_with_retry(from).await?;
-        }
-        // `connect_with_retry` above returns `Err` when every attempt
-        // fails, so reaching here (fresh connect or already subscribed)
-        // always finds `Some`.
-        Ok(self.subscription.as_mut().unwrap())
+        let sub = match self.subscription.take() {
+            Some(sub) => sub,
+            None => self.connect_with_retry(from).await?,
+        };
+        Ok(self.subscription.insert(sub))
     }
 
     /// Retry [`try_connect`] up to `max_reconnect_attempts` times, pausing
     /// `reconnect_backoff` between attempts. Only the last attempt's error
     /// is returned: earlier ones are logged, since only the final attempt
     /// decides whether the caller gives up.
-    async fn connect_with_retry(&mut self, from: u64) -> Result<(), RemoteSourceError> {
+    async fn connect_with_retry(
+        &mut self,
+        from: u64,
+    ) -> Result<Subscription<OutboxEventDto>, RemoteSourceError> {
         let last_attempt = self.max_reconnect_attempts.get() - 1;
         for attempt in 0..last_attempt {
-            if let ControlFlow::Break(()) = self.try_connect(from, attempt).await {
-                return Ok(());
+            if let ControlFlow::Break(sub) = self.try_connect(from, attempt).await {
+                return Ok(sub);
             }
         }
         match self.try_connect(from, last_attempt).await {
-            ControlFlow::Break(()) => Ok(()),
+            ControlFlow::Break(sub) => Ok(sub),
             ControlFlow::Continue(e) => Err(e),
         }
     }
 
     /// One `ensure_subscribed` attempt: success breaks out of the retry
-    /// loop, failure logs, sleeps the reconnect backoff, and hands back
-    /// its error for the caller's final error if every attempt fails.
-    async fn try_connect(&mut self, from: u64, attempt: u32) -> ControlFlow<(), RemoteSourceError> {
+    /// loop with the new subscription, failure logs, sleeps the reconnect
+    /// backoff, and hands back its error for the caller's final error if
+    /// every attempt fails.
+    async fn try_connect(
+        &mut self,
+        from: u64,
+        attempt: u32,
+    ) -> ControlFlow<Subscription<OutboxEventDto>, RemoteSourceError> {
         match self.connect(from).await {
-            Ok(()) => {
+            Ok(sub) => {
                 debug!(
                     target: "da_watcher::interop",
                     origin = self.origin_chain_id,
                     cursor = from,
                     "subscribed to outbox feed"
                 );
-                ControlFlow::Break(())
+                ControlFlow::Break(sub)
             }
             Err(e) => {
                 warn!(

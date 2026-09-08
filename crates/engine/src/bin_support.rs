@@ -347,6 +347,70 @@ pub fn connect_cluster_ordering(
         .context("connect cluster tx_ordering subscription")
 }
 
+/// Everything [`open_inbound`] needs, gathered so the function reads no
+/// eight-argument list.
+pub struct InboundConfig<'a> {
+    pub rt: &'a AeronRuntime,
+    pub channels: &'a ChannelsConfig,
+    pub aeron_cfg: &'a AeronConfig,
+    pub shards: std::num::NonZeroU8,
+    pub aeron_dir: Option<&'a Path>,
+    pub archive_control_response_endpoint: Option<&'a str>,
+    pub replay_destination_endpoint: Option<&'a str>,
+    pub cluster_cfg: kardamom_cluster_adapter::LiveClusterConfig,
+    pub cursor: crate::reader::cluster::ReplayCursor,
+    /// Names this binary in the `tx_ordering via Aeron Cluster` log line.
+    pub bin_name: &'a str,
+    /// The executor is the chosen emitter of the `kardamom_sealer_*`
+    /// re-export; the validator suppresses its own copy to avoid a
+    /// second, lagging series.
+    pub suppress_sealer_metrics: bool,
+}
+
+/// Open the shared inbound side of the engine, both role binaries run
+/// unchanged: the M `tx_data` streams (bridged async-to-sync, always live
+/// multicast, join-miss gaps recovered in-band by archive refetch), and
+/// the one `tx_ordering` subscription (always the Aeron Cluster egress).
+/// Returns the ready-to-run [`Inbound`] plus the
+/// [`kardamom_cluster_adapter::LiveCluster`] guard, which the caller
+/// holds until shutdown.
+///
+/// # Errors
+///
+/// Returns `Err` when opening the `tx_data` subscriptions or the cluster
+/// ordering connection fails.
+pub fn open_inbound<W>(
+    cfg: InboundConfig<'_>,
+) -> Result<(crate::Inbound<W>, kardamom_cluster_adapter::LiveCluster)>
+where
+    W: crate::EngineWiring<TxData = LiveTxDataSub, TxOrdering = LiveTxOrderingSub>,
+{
+    let tx_data = open_tx_data_subs(cfg.rt, cfg.channels, cfg.shards)?;
+    let join_recovery = archive_join_recovery(
+        cfg.channels,
+        cfg.aeron_cfg,
+        cfg.aeron_dir,
+        cfg.archive_control_response_endpoint,
+        cfg.replay_destination_endpoint,
+    );
+    let (cluster_guard, cluster_sub) =
+        connect_cluster_ordering(cfg.aeron_dir, cfg.cluster_cfg, cfg.cursor)?;
+    tracing::info!("{}: tx_ordering via Aeron Cluster", cfg.bin_name);
+    let tx_ordering = if cfg.suppress_sealer_metrics {
+        cluster_sub.suppress_sealer_metrics()
+    } else {
+        cluster_sub
+    };
+    Ok((
+        crate::Inbound {
+            tx_data,
+            tx_ordering,
+            join_recovery,
+        },
+        cluster_guard,
+    ))
+}
+
 /// Resync-fallback context: everything [`ResyncFallback::stage_peer_checkpoint`]
 /// and [`ResyncFallback::log_resume_prepared`] need, gathered once so
 /// neither takes it as loose parameters.
@@ -480,6 +544,78 @@ pub fn replay_unavailable_fallback(
 // ---------------------------------------------------------------------------
 
 pub use kardamom_obs::bin::{init_tracing, wait_for_shutdown};
+
+/// The Aeron runtime and the cluster-session guard that must outlive the
+/// engine loop. Field order is drop order: `rt` ends first, then
+/// `cluster_guard`.
+pub struct LiveStreams {
+    pub rt: AeronRuntime,
+    pub cluster_guard: kardamom_cluster_adapter::LiveCluster,
+}
+
+/// End both streams. Dropping `streams` at the end of this function
+/// already does the work, in field-declaration order; the function
+/// exists so the call site names the point at which both streams end,
+/// instead of a bare `drop`.
+fn stop_streams(_streams: LiveStreams) {}
+
+/// The state [`EngineShutdown::wait`] needs, gathered so `wait` reads no
+/// argument list of its own.
+///
+/// `bin_name` names this binary in the `shutdown signal received` log
+/// line. `before_drop` runs after the wait resolves, but before `streams`
+/// ends; a caller with extra state to release first (the validator
+/// cancels its pumps here, so the `tx_bal` pump releases its
+/// `AeronRuntime` clone before `streams.rt` drops) passes that step. A
+/// caller with nothing extra passes `|| {}`.
+pub struct EngineShutdown<'a, B: FnOnce()> {
+    pub bin_name: &'a str,
+    pub join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
+    pub streams: LiveStreams,
+    pub before_drop: B,
+}
+
+impl<B: FnOnce()> EngineShutdown<'_, B> {
+    /// Wait for whichever comes first: an operator shutdown signal, or the
+    /// engine loop finishing on its own. Exiting on the first of the two,
+    /// instead of only on SIGTERM, avoids an errored or halted node
+    /// looking "alive": metrics up, pipeline dead or frozen, instead of
+    /// exiting so the orchestrator restarts it into the crash-recovery
+    /// path.
+    ///
+    /// Returns the joined engine result once the loop has actually
+    /// finished, whether that happened before or after the shutdown
+    /// signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the engine loop's task panicked, so no join
+    /// result survives. The inner `Result` carries the engine loop's own
+    /// error, if it returned one cleanly.
+    pub async fn wait(
+        self,
+    ) -> std::result::Result<Result<(), ExecutorError>, tokio::task::JoinError> {
+        let Self {
+            bin_name,
+            mut join,
+            streams,
+            before_drop,
+        } = self;
+        let engine_result = tokio::select! {
+            () = wait_for_shutdown() => {
+                tracing::info!("{bin_name}: shutdown signal received; dropping runtime");
+                None
+            }
+            res = &mut join => Some(res),
+        };
+        before_drop();
+        stop_streams(streams);
+        match engine_result {
+            Some(r) => r,
+            None => join.await,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

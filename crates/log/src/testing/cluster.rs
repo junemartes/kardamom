@@ -243,13 +243,12 @@ pub struct SingleNodeRig {
     pub cfg: crate::config::LogConfig,
 }
 
-/// Assert that Docker is reachable, with a clear failure message.
-/// `docker info` is the same check every docker-e2e test in this crate
-/// used to run inline. Every docker-e2e test is explicit opt-in
-/// (`--ignored`), an environment where Docker is required; its absence
-/// is an error, not a skip condition, so a caller runs this before doing
-/// anything else, rather than let a missing daemon fail some later step
-/// with a confusing error.
+/// Assert that Docker is reachable, with a clear failure message. Every
+/// docker-e2e test shares this one `docker info` check. Every docker-e2e
+/// test is explicit opt-in (`--ignored`), an environment where Docker is
+/// required; its absence is an error, not a skip condition, so a caller
+/// runs this before doing anything else, rather than let a missing
+/// daemon fail some later step with a confusing error.
 ///
 /// # Panics
 ///
@@ -285,14 +284,24 @@ pub async fn recv_within(
         .checked_add(budget)
         .expect("test-fixture budget stays well under the clock's addable range");
     while std::time::Instant::now() < deadline {
-        if let Ok(Some((_pos, env))) =
-            tokio::time::timeout(Duration::from_millis(50), sub.recv()).await
-            && want(&env)
-        {
+        if let Some(env) = recv_attempt(sub, &want).await {
             return Some(env);
         }
     }
     None
+}
+
+/// One [`recv_within`] poll attempt: a single `sub.recv()` with a 50 ms
+/// timeout. Returns the envelope only when `want` also matches it.
+async fn recv_attempt(
+    sub: &mut crate::aeron_live::TxDataSubscriberHandle,
+    want: impl Fn(&kardamom_types::TxEnvelope) -> bool,
+) -> Option<kardamom_types::TxEnvelope> {
+    let (_pos, env) = tokio::time::timeout(Duration::from_millis(50), sub.recv())
+        .await
+        .ok()
+        .flatten()?;
+    want(&env).then_some(env)
 }
 
 /// Build the host tempdir and bind-mounted container.

@@ -71,6 +71,14 @@ struct KeyedInner<K: BufKey, V> {
     cursor: Option<u64>,
 }
 
+/// One cycle of [`KeyedBuffer::take`]'s wait loop.
+enum TakeStep<'a, K: BufKey, V> {
+    /// The final result: found, or given up on.
+    Done(Option<V>),
+    /// Not ready yet; wait another cycle with this guard.
+    Retry(std::sync::MutexGuard<'a, KeyedInner<K, V>>),
+}
+
 impl<K: BufKey, V> KeyedBuffer<K, V> {
     fn new(cap: NonZeroUsize, lookbehind: u64) -> Self {
         Self {
@@ -94,7 +102,10 @@ impl<K: BufKey, V> KeyedBuffer<K, V> {
     /// returns. Returns whether the map changed, so the caller knows to
     /// notify waiters.
     fn insert_locked(&self, key: K, value: V) -> bool {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self
+            .inner
+            .lock()
+            .expect("verification buffer lock poisoned");
         // This is a late arrival below the consumer's cursor: no future
         // take will request it. Dropping it here, plus the prune in
         // `take`, stops the buffer from holding dead entries.
@@ -118,42 +129,68 @@ impl<K: BufKey, V> KeyedBuffer<K, V> {
         // that never arrives never times out, and the consumer hangs
         // forever on one lost item while the buffer keeps filling.
         let deadline = std::time::Instant::now() + timeout;
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self
+            .inner
+            .lock()
+            .expect("verification buffer lock poisoned");
         // Requests only increase: everything below `key` is already
         // resolved (taken, skipped, or timed out) and can be pruned.
         // Remember the cursor so late re-arrivals are dropped at insert.
         g.cursor = Some(g.cursor.map_or(key.index(), |c| c.max(key.index())));
         g.map = std::mem::take(&mut g.map).split_off(&key);
         loop {
-            if let Some(v) = g.map.remove(&key) {
-                return Some(v);
-            }
-            // Catch-up check: if the live head (the highest buffered key)
-            // is far ahead of `key`, this item has aged out of the live
-            // stream's buffer and will never arrive. Return None now
-            // instead of waiting out the timeout, so the validator catches
-            // up fast after a cold start or a lapse longer than the live
-            // buffer. A caught-up validator asks for keys near the head, so
-            // this check never triggers and verification runs as normal.
-            if let Some((&head, _)) = g.map.last_key_value()
-                && head.index() > key.index().saturating_add(self.lookbehind)
-            {
-                return None;
-            }
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return g.map.remove(&key);
-            };
-            let (g2, wait) = self.cv.wait_timeout(g, remaining).unwrap();
-            g = g2;
-            if wait.timed_out() {
-                return g.map.remove(&key);
+            match self.take_step(g, &key, deadline) {
+                TakeStep::Done(result) => return result,
+                TakeStep::Retry(next_g) => g = next_g,
             }
         }
     }
 
+    /// One wait cycle of [`Self::take`]: try the value, then the
+    /// catch-up check, then wait out the remaining deadline (or take the
+    /// final value at the deadline). `Done` carries the result to
+    /// return; `Retry` carries the guard for another cycle.
+    fn take_step<'a>(
+        &'a self,
+        mut g: std::sync::MutexGuard<'a, KeyedInner<K, V>>,
+        key: &K,
+        deadline: std::time::Instant,
+    ) -> TakeStep<'a, K, V> {
+        if let Some(v) = g.map.remove(key) {
+            return TakeStep::Done(Some(v));
+        }
+        // Catch-up check: if the live head (the highest buffered key) is
+        // far ahead of `key`, this item has aged out of the live
+        // stream's buffer and will never arrive. Return None now
+        // instead of waiting out the timeout, so the validator catches
+        // up fast after a cold start or a lapse longer than the live
+        // buffer. A caught-up validator asks for keys near the head, so
+        // this check never triggers and verification runs as normal.
+        if let Some((&head, _)) = g.map.last_key_value()
+            && head.index() > key.index().saturating_add(self.lookbehind)
+        {
+            return TakeStep::Done(None);
+        }
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return TakeStep::Done(g.map.remove(key));
+        };
+        let (mut g2, wait) = self
+            .cv
+            .wait_timeout(g, remaining)
+            .expect("verification buffer lock poisoned");
+        if wait.timed_out() {
+            return TakeStep::Done(g2.map.remove(key));
+        }
+        TakeStep::Retry(g2)
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.inner.lock().unwrap().map.len()
+        self.inner
+            .lock()
+            .expect("verification buffer lock poisoned")
+            .map
+            .len()
     }
 }
 

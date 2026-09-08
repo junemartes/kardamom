@@ -313,12 +313,13 @@ mod tests {
         assert_eq!(pack_correlation_id(7, 0), 7u64 << 48);
         assert_eq!(pack_correlation_id(7, 5), (7u64 << 48) | 5);
         // This round-trips the replica id back out.
-        for id in [0u16, 1, 7, 256, u16::MAX] {
-            for seq in [0u64, 1, 1_000_000, (1u64 << 48) - 1] {
-                let c = pack_correlation_id(id, seq);
-                assert_eq!(ingress_id_of(c), id, "id={id} seq={seq}");
-                assert_eq!(c & 0x0000_FFFF_FFFF_FFFF, seq, "seq preserved");
-            }
+        let cases = [0u16, 1, 7, 256, u16::MAX]
+            .into_iter()
+            .flat_map(|id| [0u64, 1, 1_000_000, (1u64 << 48) - 1].map(move |seq| (id, seq)));
+        for (id, seq) in cases {
+            let c = pack_correlation_id(id, seq);
+            assert_eq!(ingress_id_of(c), id, "id={id} seq={seq}");
+            assert_eq!(c & 0x0000_FFFF_FFFF_FFFF, seq, "seq preserved");
         }
     }
 

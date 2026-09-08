@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use alloy_primitives::{Address, B256, U256};
 
 use crate::env::{Durability, StateEnv, StateEnvBuilder};
-use crate::trie::AccountTrieParts;
+use crate::trie::{AccountTrieParts, BasicFields};
 
 /// Open a fresh tempdir-backed env. Returns the tempdir guard, so the
 /// caller controls its lifetime.
@@ -63,10 +63,10 @@ pub(crate) fn put_plain_accounts(env: &StateEnv, rows: &[(Address, u64, u64)]) {
 /// incremental trie's randomized tests both check the production
 /// incremental path against.
 pub(crate) fn model_state_root(
-    accounts: &BTreeMap<Address, (u64, U256, B256)>,
+    accounts: &BTreeMap<Address, BasicFields>,
     storage: &BTreeMap<Address, BTreeMap<B256, U256>>,
 ) -> B256 {
-    crate::trie::state_root(accounts.iter().map(|(addr, &(nonce, balance, code_hash))| {
+    crate::trie::state_root(accounts.iter().map(|(addr, basics)| {
         let sroot = storage
             .get(addr)
             .map_or_else(crate::trie::empty_root, |slots| {
@@ -75,9 +75,9 @@ pub(crate) fn model_state_root(
         (
             *addr,
             AccountTrieParts {
-                nonce,
-                balance,
-                code_hash,
+                nonce: basics.nonce,
+                balance: basics.balance,
+                code_hash: basics.code_hash,
                 storage_root: sroot,
             },
         )

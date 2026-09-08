@@ -2,11 +2,11 @@
 //! stack, ramps to the edge, profiles the sealer leader under steady
 //! load, and produces a report.
 //!
-//! The pipeline drives the same deploy and cluster DinD stack the
+//! The pipeline drives the same deploy and cluster `DinD` stack the
 //! cluster-e2e CI uses, through `ci-cluster.sh` from the orchestrator
 //! container, and reuses the `kardamom-load` harness as a library for
 //! the load phases. Profiling attaches async-profiler, in itimer mode
-//! so no perf_events are needed inside the nested containers, to the
+//! so no `perf_events` are needed inside the nested containers, to the
 //! JVM of whichever sealer node is the current Raft leader. The
 //! pipeline detects the leader as the busiest sealer container under load.
 
@@ -25,6 +25,10 @@ pub struct OutDir(pub PathBuf);
 
 impl OutDir {
     /// Create `<base>/<utc-timestamp>/` and return it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created.
     pub fn create(base: &std::path::Path) -> anyhow::Result<Self> {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -34,6 +38,7 @@ impl OutDir {
         Ok(Self(dir))
     }
 
+    #[must_use]
     pub fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }

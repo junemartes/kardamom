@@ -225,7 +225,52 @@ async fn s14_xchain_two_stacks() {
     eprintln!("S14: total {:?}", started.elapsed());
 }
 
-/// S13: the interop chain rebuilt from its OWN DA (spec §16 Q8). The S12
+/// Print `state_diff`'s rows, one per line, under a header naming the
+/// comparison.
+fn print_state_diffs(diffs: &[String]) {
+    eprintln!("S13 deep_compare (reconstructed vs live executor):");
+    for d in diffs {
+        eprintln!("  {d}");
+    }
+}
+
+/// FORENSICS before the S13 panic: a root mismatch from two opaque hashes
+/// is undiagnosable once CI drops the temp dirs. Name the collected set
+/// and the first differing rows table-by-table so the next occurrence is
+/// attributable from the log alone. (headers/receipts rows differ
+/// benignly: replay synthesizes timestamps and carries `l1_origin` 0 —
+/// the accounts/storage lines are the signal.)
+///
+/// # Panics
+/// Always panics, with `e`'s message plus the forensics collected above.
+fn report_s13_da_parity_failure(
+    canonical: &e2e::scenarios::xchain_da_parity::CanonicalBlocks,
+    recon_dir: &std::path::Path,
+    exec_dir: &std::path::Path,
+    e: &anyhow::Error,
+) -> ! {
+    use e2e::scenarios::xchain_da_parity;
+
+    eprintln!("S13 collected canonical set:");
+    for b in &canonical.blocks {
+        eprintln!(
+            "  block {}: {} record(s), {} tx(s)",
+            b.block_number,
+            b.remote_epochs.len(),
+            b.txs.len()
+        );
+    }
+    match xchain_da_parity::state_diff(recon_dir, exec_dir) {
+        Ok(diffs) if diffs.is_empty() => {
+            eprintln!("S13 deep_compare: no table diffs (?)");
+        }
+        Ok(diffs) => print_state_diffs(&diffs),
+        Err(de) => eprintln!("S13 deep_compare failed: {de:#}"),
+    }
+    panic!("S13 DA parity: {e:#}");
+}
+
+/// S13: the interop chain rebuilt from its OWN DA. The S12
 /// delivery flow runs unchanged on a `DevInterop` stack that also carries the
 /// anvil L1 (the S8 DA-posting idiom); the canonical blocks — remote-epoch
 /// records attached to the block each one led — are recovered from the
@@ -307,36 +352,7 @@ async fn s13_xchain_da_parity() {
         recon_dir.path(),
         expected_root,
     ) {
-        // FORENSICS before the panic: a root mismatch from two opaque hashes
-        // is undiagnosable once CI drops the temp dirs (this fired ONCE on a
-        // CI runner and never reproduced locally across contention, repeated
-        // runs, and the same block composition). Name the collected set and
-        // the first differing rows table-by-table so the next occurrence is
-        // attributable from the log alone. (headers/receipts rows differ
-        // benignly: replay synthesizes timestamps and carries l1_origin 0 —
-        // the accounts/storage lines are the signal.)
-        eprintln!("S13 collected canonical set:");
-        for b in &canonical.blocks {
-            eprintln!(
-                "  block {}: {} record(s), {} tx(s)",
-                b.block_number,
-                b.remote_epochs.len(),
-                b.txs.len()
-            );
-        }
-        match xchain_da_parity::state_diff(recon_dir.path(), &exec_dir) {
-            Ok(diffs) if diffs.is_empty() => {
-                eprintln!("S13 deep_compare: no table diffs (?)");
-            }
-            Ok(diffs) => {
-                eprintln!("S13 deep_compare (reconstructed vs live executor):");
-                for d in &diffs {
-                    eprintln!("  {d}");
-                }
-            }
-            Err(de) => eprintln!("S13 deep_compare failed: {de:#}"),
-        }
-        panic!("S13 DA parity: {e:#}");
+        report_s13_da_parity_failure(&canonical, recon_dir.path(), &exec_dir, &e);
     }
 
     // 6. The rebuilt DB reproduces the interop substance: lane state equal to

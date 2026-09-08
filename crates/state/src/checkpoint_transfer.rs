@@ -109,22 +109,36 @@ pub fn serve_checkpoints(
     info!(%addr, dir = %checkpoints_dir.display(), "serving checkpoints to peers");
     let task = tokio::spawn(async move {
         loop {
-            let stream = match listener.accept().await {
-                Ok((s, _)) => s,
-                Err(e) => {
-                    warn!(error = %e, "checkpoint server accept failed");
-                    continue;
-                }
+            let Some(stream) = accept_logged(&listener).await else {
+                continue;
             };
-            let dir = checkpoints_dir.clone();
-            tokio::spawn(async move {
-                if let Err(e) = serve_one(stream, &dir).await {
-                    warn!(error = %e, "checkpoint transfer to peer failed");
-                }
-            });
+            spawn_serve(stream, checkpoints_dir.clone());
         }
     });
     Ok(CheckpointServer { addr, task })
+}
+
+/// Accept one connection, logging and swallowing an accept error instead
+/// of returning it: one bad accept must not take down the server loop.
+async fn accept_logged(listener: &TcpListener) -> Option<tokio::net::TcpStream> {
+    match listener.accept().await {
+        Ok((stream, _)) => Some(stream),
+        Err(e) => {
+            warn!(error = %e, "checkpoint server accept failed");
+            None
+        }
+    }
+}
+
+/// Serve one accepted connection on its own task, logging a transfer
+/// failure instead of propagating it: one peer's failure must not affect
+/// any other.
+fn spawn_serve(stream: tokio::net::TcpStream, dir: PathBuf) {
+    tokio::spawn(async move {
+        if let Err(e) = serve_one(stream, &dir).await {
+            warn!(error = %e, "checkpoint transfer to peer failed");
+        }
+    });
 }
 
 /// Response head + open image file for the newest checkpoint, or the error
@@ -207,12 +221,8 @@ async fn serve_one(stream: tokio::net::TcpStream, checkpoints_dir: &Path) -> std
     // IO_TIMEOUT, a slow one streams on.
     let mut file = tokio::fs::File::from_std(file);
     let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        timeout(IO_TIMEOUT, wr.write_all(&buf[..n])).await??;
+    while let Some(n) = std::num::NonZeroUsize::new(file.read(&mut buf).await?) {
+        timeout(IO_TIMEOUT, wr.write_all(&buf[..n.get()])).await??;
     }
     timeout(IO_TIMEOUT, wr.flush()).await??;
     info!(block, bytes = len, "served checkpoint to peer");
@@ -304,26 +314,48 @@ pub(crate) fn fetch_latest_checkpoint(
 /// This function logs and skips individual peer failures; one live peer
 /// is enough. As the best-so-far block rises, later peers with nothing
 /// newer are skipped without a download.
+#[must_use]
 pub fn fetch_best_checkpoint(
     peers: &[String],
     checkpoints_dir: &Path,
     min_block: u64,
     expected_genesis: Option<B256>,
 ) -> Option<CheckpointInfo> {
-    let mut best: Option<CheckpointInfo> = None;
-    for peer in peers {
+    peers.iter().fold(None, |best, peer| {
         // A peer advertising `u64::MAX` must not wrap the floor back to 0
         // and disable the "newer only" filter for every later peer.
         let floor = best
             .as_ref()
-            .map_or(min_block, |b| b.block.saturating_add(1));
-        match fetch_latest_checkpoint(peer, checkpoints_dir, floor, expected_genesis) {
-            Ok(Some(c)) => best = Some(c),
-            Ok(None) => {}
-            Err(e) => warn!(peer, error = %e, "checkpoint fetch from peer failed"),
+            .map_or(min_block, |b: &CheckpointInfo| b.block.saturating_add(1));
+        fetch_one_peer(peer, checkpoints_dir, floor, expected_genesis).or(best)
+    })
+}
+
+/// Fetch from one peer, logging and swallowing a failure: one bad peer
+/// must not stop the scan of the rest.
+fn fetch_one_peer(
+    peer: &str,
+    checkpoints_dir: &Path,
+    floor: u64,
+    expected_genesis: Option<B256>,
+) -> Option<CheckpointInfo> {
+    match fetch_latest_checkpoint(peer, checkpoints_dir, floor, expected_genesis) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(peer, error = %e, "checkpoint fetch from peer failed");
+            None
         }
     }
-    best
+}
+
+/// One step of [`CheckpointFetch::read_head_line`].
+enum HeadLine {
+    /// The blank line or EOF that ends the head.
+    Done,
+    /// The accumulated head exceeds [`MAX_HEAD`].
+    TooLarge,
+    /// An ordinary line, already appended to the caller's `head`.
+    More,
 }
 
 /// One peer checkpoint fetch: the connection, and the context every step
@@ -361,21 +393,35 @@ impl<'a> CheckpointFetch<'a> {
     /// Read the raw head, line by line, up to the blank line that ends it.
     fn read_head_text(&mut self) -> Result<String, StateError> {
         let mut head = String::new();
-        let mut line = String::new();
         loop {
-            line.clear();
-            let n = self.reader.read_line(&mut line)?;
-            if n == 0 || line == "\r\n" || line == "\n" {
-                break;
-            }
-            head.push_str(&line);
-            if head.len() > MAX_HEAD {
-                return Err(StateError::Recovery(
-                    "checkpoint peer response head too large".into(),
-                ));
+            match self.read_head_line(&mut head)? {
+                HeadLine::Done => break,
+                HeadLine::TooLarge => {
+                    return Err(StateError::Recovery(
+                        "checkpoint peer response head too large".into(),
+                    ));
+                }
+                HeadLine::More => {}
             }
         }
         Ok(head)
+    }
+
+    /// Read one line into `head`. `Done` at the blank line or EOF that
+    /// ends the head, `TooLarge` once `head` exceeds [`MAX_HEAD`],
+    /// `More` for every other line.
+    fn read_head_line(&mut self, head: &mut String) -> Result<HeadLine, StateError> {
+        let mut line = String::new();
+        let n = self.reader.read_line(&mut line)?;
+        if n == 0 || line == "\r\n" || line == "\n" {
+            return Ok(HeadLine::Done);
+        }
+        head.push_str(&line);
+        Ok(if head.len() > MAX_HEAD {
+            HeadLine::TooLarge
+        } else {
+            HeadLine::More
+        })
     }
 
     /// Copy exactly `len` bytes from the response body into a fresh file
@@ -503,20 +549,11 @@ impl PeerResponse {
     /// Parse the checkpoint-specific headers this client understands. Any
     /// other header, or one it fails to parse, is ignored.
     fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> ParsedHeaders {
-        let mut headers = ParsedHeaders::default();
-        for l in lines {
-            let Some((k, v)) = l.split_once(':') else {
-                continue;
-            };
-            match k.trim().to_ascii_lowercase().as_str() {
-                framing::HDR_BLOCK => headers.block = v.trim().parse().ok(),
-                "content-length" => headers.content_length = v.trim().parse().ok(),
-                framing::HDR_KECCAK => headers.keccak = v.trim().parse().ok(),
-                framing::HDR_GENESIS => headers.genesis = v.trim().parse().ok(),
-                _ => {}
-            }
-        }
-        headers
+        lines
+            .filter_map(|l| l.split_once(':'))
+            .fold(ParsedHeaders::default(), |h, (k, v)| {
+                h.with(&k.trim().to_ascii_lowercase(), v.trim())
+            })
     }
 }
 
@@ -530,146 +567,23 @@ struct ParsedHeaders {
     genesis: Option<B256>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn write_checkpoint(dir: &Path, block: u64, contents: &[u8]) -> PathBuf {
-        write_checkpoint_as(dir, block, contents, B256::repeat_byte(0x6E))
-    }
-
-    /// Write an image and a manifest that correctly describes it, under a
-    /// given chain identity.
-    fn write_checkpoint_as(dir: &Path, block: u64, contents: &[u8], genesis: B256) -> PathBuf {
-        let p = dir.join(checkpoint_name(block));
-        std::fs::create_dir_all(&p).unwrap();
-        std::fs::write(p.join("mdbx.dat"), contents).unwrap();
-        let manifest = crate::checkpoint::CheckpointManifest {
-            block,
-            image_keccak: alloy_primitives::keccak256(contents),
-            genesis_digest: genesis,
-        };
-        std::fs::write(crate::checkpoint::manifest_path(&p), manifest.encode()).unwrap();
-        p
-    }
-
-    /// Read the image bytes of a dir-mode checkpoint.
-    fn image_bytes(checkpoint: &Path) -> Vec<u8> {
-        std::fs::read(crate::checkpoint::checkpoint_data_file(checkpoint).unwrap()).unwrap()
-    }
-
-    fn serve_ephemeral(dir: PathBuf) -> SocketAddr {
-        serve_checkpoints("127.0.0.1:0".parse().unwrap(), dir)
-            .unwrap()
-            .addr
-    }
-
-    /// The client is sync; run it off the runtime so the server task runs.
-    async fn fetch(
-        addr: SocketAddr,
-        local: PathBuf,
-        min_block: u64,
-    ) -> Result<Option<CheckpointInfo>, StateError> {
-        tokio::task::spawn_blocking(move || {
-            fetch_latest_checkpoint(&addr.to_string(), &local, min_block, None)
-        })
-        .await
-        .unwrap()
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fetch_round_trips_newest_checkpoint() {
-        let served = tempfile::tempdir().unwrap();
-        write_checkpoint(served.path(), 3, b"old image");
-        write_checkpoint(served.path(), 7, b"newest image bytes");
-        let addr = serve_ephemeral(served.path().to_path_buf());
-
-        let local = tempfile::tempdir().unwrap();
-        let got = fetch(addr, local.path().to_path_buf(), 0)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.block, 7);
-        assert_eq!(image_bytes(&got.path), b"newest image bytes");
-        // No temp files remain.
-        assert!(
-            std::fs::read_dir(local.path()).unwrap().all(|e| !e
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".tmp"))
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fetch_from_empty_peer_returns_none() {
-        let served = tempfile::tempdir().unwrap();
-        let addr = serve_ephemeral(served.path().to_path_buf());
-        let local = tempfile::tempdir().unwrap();
-        assert!(
-            fetch(addr, local.path().to_path_buf(), 0)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fetch_best_picks_newest_across_peers_and_survives_dead_peer() {
-        let served_a = tempfile::tempdir().unwrap();
-        write_checkpoint(served_a.path(), 5, b"a5");
-        let served_b = tempfile::tempdir().unwrap();
-        write_checkpoint(served_b.path(), 9, b"b9");
-        let addr_a = serve_ephemeral(served_a.path().to_path_buf());
-        let addr_b = serve_ephemeral(served_b.path().to_path_buf());
-
-        let local = tempfile::tempdir().unwrap();
-        let peers = vec![
-            "127.0.0.1:1".to_string(), // A dead peer: connection is refused, so it is skipped.
-            addr_a.to_string(),
-            addr_b.to_string(),
-        ];
-        let local_dir = local.path().to_path_buf();
-        let best =
-            tokio::task::spawn_blocking(move || fetch_best_checkpoint(&peers, &local_dir, 0, None))
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(best.block, 9);
-        assert_eq!(image_bytes(&best.path), b"b9");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn min_block_filters_stale_peer_checkpoint() {
-        let served = tempfile::tempdir().unwrap();
-        write_checkpoint(served.path(), 6, b"below the floor");
-        let addr = serve_ephemeral(served.path().to_path_buf());
-        let local = tempfile::tempdir().unwrap();
-        // The peer's newest checkpoint (block 6) is below the required
-        // floor (block 10). It is skipped, and nothing is written locally.
-        assert!(
-            fetch(addr, local.path().to_path_buf(), 10)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(std::fs::read_dir(local.path()).unwrap().count(), 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn existing_local_checkpoint_short_circuits_transfer() {
-        let served = tempfile::tempdir().unwrap();
-        write_checkpoint(served.path(), 4, b"peer bytes");
-        let addr = serve_ephemeral(served.path().to_path_buf());
-
-        let local = tempfile::tempdir().unwrap();
-        write_checkpoint(local.path(), 4, b"local bytes");
-        let got = fetch(addr, local.path().to_path_buf(), 0)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.block, 4);
-        // The local copy is kept. The peer's copy does not overwrite it.
-        assert_eq!(image_bytes(&got.path), b"local bytes");
+impl ParsedHeaders {
+    /// Fold in one already-lowercased header key and trimmed value. An
+    /// unrecognized key is ignored; a recognized key that fails to parse
+    /// clears that field, matching a malformed or duplicate header
+    /// overwriting an earlier valid one.
+    fn with(mut self, k: &str, v: &str) -> Self {
+        match k {
+            framing::HDR_BLOCK => self.block = v.parse().ok(),
+            "content-length" => self.content_length = v.parse().ok(),
+            framing::HDR_KECCAK => self.keccak = v.parse().ok(),
+            framing::HDR_GENESIS => self.genesis = v.parse().ok(),
+            _ => {}
+        }
+        self
     }
 }
+
+#[cfg(test)]
+#[path = "checkpoint_transfer_tests.rs"]
+mod tests;

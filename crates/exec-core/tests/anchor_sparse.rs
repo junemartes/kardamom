@@ -59,22 +59,32 @@ fn fixed_point<T>(
     op: impl Fn(&NodeStore<'_>) -> Result<T, AnchorError>,
 ) -> (T, usize) {
     let mut have = seed;
-    let mut rounds = 0;
-    loop {
-        rounds += 1;
-        assert!(rounds <= all_nodes.len() + 2, "fixed point diverged");
-        let proofs = proofs_from(have.clone());
-        let store = NodeStore::new(&proofs).expect("canonical set");
-        match op(&store) {
-            Ok(v) => return (v, rounds),
-            Err(AnchorError::MissingNode { hash, .. }) => {
-                let node = all_nodes
-                    .get(&hash)
-                    .unwrap_or_else(|| panic!("fixed point wants unknown node {hash}"));
-                have.push(node.clone());
-            }
-            Err(e) => panic!("unexpected anchor error: {e:?}"),
+    (1..=all_nodes.len() + 2)
+        .find_map(|rounds| fixed_point_round(&mut have, all_nodes, &op).map(|v| (v, rounds)))
+        .expect("fixed point diverged")
+}
+
+/// One [`fixed_point`] round: try `op` over the nodes gathered so far,
+/// and on a missing-node refusal, add the node it named. `None` means
+/// "not converged yet"; the `loop` in [`fixed_point`] dispatches only
+/// on whether this returns.
+fn fixed_point_round<T>(
+    have: &mut Vec<Bytes>,
+    all_nodes: &HashMap<B256, Bytes>,
+    op: &impl Fn(&NodeStore<'_>) -> Result<T, AnchorError>,
+) -> Option<T> {
+    let proofs = proofs_from(have.clone());
+    let store = NodeStore::new(&proofs).expect("canonical set");
+    match op(&store) {
+        Ok(v) => Some(v),
+        Err(AnchorError::MissingNode { hash, .. }) => {
+            let node = all_nodes
+                .get(&hash)
+                .unwrap_or_else(|| panic!("fixed point wants unknown node {hash}"));
+            have.push(node.clone());
+            None
         }
+        Err(e) => panic!("unexpected anchor error: {e:?}"),
     }
 }
 
@@ -145,54 +155,76 @@ fn lookup_without_proof_names_the_missing_node() {
 #[test]
 fn sparse_mutations_equal_oracle_across_shapes() {
     for n in [1u64, 2, 3, 8, 33, 200] {
-        let entries = base_state(n);
-        let (root, all) = reference(&entries);
+        check_shape_mutations(n);
+    }
+}
 
-        // Mutation set: update low keys, delete every third, insert fresh.
-        let updates: Vec<(B256, Option<Vec<u8>>)> = (0..n)
-            .filter(|i| i % 3 == 0)
-            .map(|i| (key(i), None)) // delete
-            .chain(
-                (0..n)
-                    .filter(|i| i % 3 == 1)
-                    .map(|i| (key(i), Some(val(i + 7_000)))),
-            )
-            .chain((n..n + 5).map(|i| (key(i), Some(val(i))))) // insert
-            .collect();
+/// One shape's worth of
+/// [`sparse_mutations_equal_oracle_across_shapes`]: build the mutation
+/// set, fold it into the oracle map and into the sparse trie under
+/// test, and check the two roots agree.
+fn check_shape_mutations(n: u64) {
+    let entries = base_state(n);
+    let (root, all) = reference(&entries);
 
-        // Oracle: apply to the full map, one-shot root.
-        let mut post = entries.clone();
+    // Mutation set: update low keys, delete every third, insert fresh.
+    let updates: Vec<(B256, Option<Vec<u8>>)> = (0..n)
+        .filter(|i| i % 3 == 0)
+        .map(|i| (key(i), None)) // delete
+        .chain(
+            (0..n)
+                .filter(|i| i % 3 == 1)
+                .map(|i| (key(i), Some(val(i + 7_000)))),
+        )
+        .chain((n..n + 5).map(|i| (key(i), Some(val(i))))) // insert
+        .collect();
+
+    // Oracle: apply to the full map, one-shot root.
+    let mut post = entries.clone();
+    for (k, v) in &updates {
+        apply_map_update(&mut post, *k, v.as_ref());
+    }
+    let (oracle_root, _) = reference(&post);
+
+    // Sparse: seed with the written keys' pre-paths (the read set).
+    // Let the fixed point pull in deletion-collapse siblings.
+    let touched: Vec<B256> = updates.iter().map(|(k, _)| *k).collect();
+    let seed = paths_for(&entries, &touched);
+    let (sparse_root, rounds) = fixed_point(seed, &all, |store| {
+        let mut trie = SparseTrie::new(root, store);
         for (k, v) in &updates {
-            match v {
-                Some(v) => {
-                    post.insert(*k, v.clone());
-                }
-                None => {
-                    post.remove(k);
-                }
-            }
+            apply_trie_update(&mut trie, *k, v.as_ref())?;
         }
-        let (oracle_root, _) = reference(&post);
+        Ok(trie.root())
+    });
+    assert_eq!(
+        sparse_root, oracle_root,
+        "n={n}: sparse recompute diverged from the oracle"
+    );
+    assert!(rounds <= all.len() + 1, "n={n}: fixed point too slow");
+}
 
-        // Sparse: seed with the written keys' pre-paths (the read set).
-        // Let the fixed point pull in deletion-collapse siblings.
-        let touched: Vec<B256> = updates.iter().map(|(k, _)| *k).collect();
-        let seed = paths_for(&entries, &touched);
-        let (sparse_root, rounds) = fixed_point(seed, &all, |store| {
-            let mut trie = SparseTrie::new(root, store);
-            for (k, v) in &updates {
-                match v {
-                    Some(v) => trie.insert(*k, v.clone())?,
-                    None => trie.remove(*k)?,
-                }
-            }
-            Ok(trie.root())
-        });
-        assert_eq!(
-            sparse_root, oracle_root,
-            "n={n}: sparse recompute diverged from the oracle"
-        );
-        assert!(rounds <= all.len() + 1, "n={n}: fixed point too slow");
+/// One update applied to the oracle's flat map.
+fn apply_map_update(post: &mut BTreeMap<B256, Vec<u8>>, k: B256, v: Option<&Vec<u8>>) {
+    match v {
+        Some(v) => {
+            post.insert(k, v.clone());
+        }
+        None => {
+            post.remove(&k);
+        }
+    }
+}
+
+/// One update applied to the sparse trie under test.
+fn apply_trie_update(
+    trie: &mut SparseTrie<'_, '_>,
+    k: B256,
+    v: Option<&Vec<u8>>,
+) -> Result<(), AnchorError> {
+    match v {
+        Some(v) => trie.insert(k, v.clone()),
+        None => trie.remove(k),
     }
 }
 

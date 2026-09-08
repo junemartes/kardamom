@@ -42,7 +42,12 @@ impl Scrape {
 ///
 /// # Errors
 /// Returns an error when the connection fails, when a read or write times
-/// out, or when the response is not valid UTF-8.
+/// out, when the response is not valid UTF-8, when the response has no
+/// header/body separator, or when the status line is not `200`. A caller
+/// depends on this: `*_metric_opt`'s `Ok(None)` means the scrape
+/// succeeded and the counter is genuinely absent, so any other failure
+/// (a dead port, an unregistered exporter, a non-metrics server on that
+/// port) must surface as `Err`, not as an empty or partial body.
 fn scrape_blocking(addr: SocketAddr, timeout: Duration) -> Result<Scrape> {
     let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)
         .with_context(|| format!("connect {addr}"))?;
@@ -55,11 +60,18 @@ fn scrape_blocking(addr: SocketAddr, timeout: Duration) -> Result<Scrape> {
     stream
         .read_to_string(&mut buf)
         .context("read scrape response")?;
-    let body = buf
+    let (head, body) = buf
         .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_string())
-        .unwrap_or(buf);
-    Ok(Scrape(body))
+        .with_context(|| format!("{addr}: scrape response has no header/body separator"))?;
+    let status_line = head
+        .lines()
+        .next()
+        .with_context(|| format!("{addr}: scrape response has no status line"))?;
+    anyhow::ensure!(
+        status_line.split_whitespace().nth(1) == Some("200"),
+        "{addr}: scrape returned {status_line:?}, not 200 OK"
+    );
+    Ok(Scrape(body.to_string()))
 }
 
 /// Async wrapper for [`scrape_blocking`].

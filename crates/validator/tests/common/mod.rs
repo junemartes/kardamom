@@ -6,48 +6,41 @@
 //! module is that one shared shape; each binary still owns its own
 //! block-specific setup (seeding, the writer, the spool) on top of it.
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, B256, TxKind, U256, address, keccak256};
+use alloy_primitives::{Address, B256, address};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_engine::actor::BufferedRecord;
+use kardamom_engine::actor::fixtures::LegacyTx;
 use kardamom_engine::exec_types::TxIndex;
 use kardamom_types::{BPosition, TxEnvelope};
 
-pub const CHAIN_ID: u64 = 412_346;
-pub const RECIPIENT: Address = address!("000000000000000000000000000000000000dEaD");
+pub(crate) const CHAIN_ID: u64 = 412_346;
+pub(crate) const RECIPIENT: Address = address!("000000000000000000000000000000000000dEaD");
 
 /// SSTORE(0, 0); STOP. Zeroes slot 0: the storage-deletion shape.
-pub const ZEROER: Address = address!("00000000000000000000000000000000000000Aa");
-pub const ZEROER_CODE: [u8; 6] = [0x60, 0x00, 0x60, 0x00, 0x55, 0x00];
+pub(crate) const ZEROER: Address = address!("00000000000000000000000000000000000000Aa");
+pub(crate) const ZEROER_CODE: [u8; 6] = [0x60, 0x00, 0x60, 0x00, 0x55, 0x00];
 
-pub const S0: B256 = B256::with_last_byte(0);
-pub const S1: B256 = B256::with_last_byte(1);
+pub(crate) const S0: B256 = B256::with_last_byte(0);
+pub(crate) const S1: B256 = B256::with_last_byte(1);
 
 /// A signed legacy transfer from `signer` to `to`, as a canonical-record
 /// `BufferedRecord::Tx` at bal index `i`.
-pub fn tx(
+pub(crate) fn tx(
     signer: &PrivateKeySigner,
     to: Address,
     nonce: u64,
     value: u64,
     i: u64,
 ) -> BufferedRecord {
-    let mut inner = TxLegacy {
-        chain_id: Some(CHAIN_ID),
+    let envelope = LegacyTx {
+        chain_id: CHAIN_ID,
+        to,
         nonce,
-        gas_price: 0,
+        value,
         gas_limit: 300_000,
-        to: TxKind::Call(to),
-        value: U256::from(value),
-        input: alloy_primitives::Bytes::default(),
-    };
-    let sig = signer.sign_transaction_sync(&mut inner).unwrap();
-    let env: alloy_consensus::TxEnvelope = inner.into_signed(sig).into();
-    let mut raw = Vec::new();
-    env.encode_2718(&mut raw);
-    let tx_hash = keccak256(&raw);
+        gas_price: 0,
+    }
+    .sign(signer);
     BufferedRecord::Tx {
         tx_idx: TxIndex(i),
         position: BPosition {
@@ -56,9 +49,7 @@ pub fn tx(
         },
         envelope: TxEnvelope {
             correlation_id: i,
-            raw_tx: raw.into(),
-            sender: signer.address(),
-            tx_hash,
+            ..envelope
         },
     }
 }

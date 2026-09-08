@@ -9,6 +9,7 @@ use alloy_primitives::B256;
 
 use super::ids::{Anchor, remote_source_hash};
 use super::message::{BoundsFault, NonEmptyVec, OutboxMessage, RemoteEpochRecord, XChainMessage};
+use crate::num::usize_to_u64;
 
 /// The producer/verifier batch, sorted by `seq`. Each method below checks
 /// one verdict; [`derive_remote_epoch`] chains them into the derivation
@@ -95,9 +96,10 @@ impl<'a> Batch<'a> {
     /// (`last_seq + 1`), which the validator computes as its lane position.
     fn check_range_fits(&self) -> Result<(), XChainError> {
         let first = self.first.seq;
-        let len = u64::try_from(self.ordered.len())
-            .map_err(|_| XChainError::SeqOverflow { seq: first })?;
-        if first.checked_add(len).is_some() {
+        if first
+            .checked_add(usize_to_u64(self.ordered.len()))
+            .is_some()
+        {
             Ok(())
         } else {
             Err(XChainError::SeqOverflow { seq: first })

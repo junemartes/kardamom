@@ -209,7 +209,7 @@ where
 /// completing without a shutdown signal is the pair's halt signal.
 pub fn spawn<S, P>(
     publisher: P,
-    mut source: S,
+    source: S,
     config: InteropWatcherConfig,
     cursor_file: Option<CursorFile>,
 ) -> WatcherHandle
@@ -217,36 +217,24 @@ where
     S: RemoteChainSource,
     P: RemoteEpochPublisher,
 {
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let origin = source.origin_chain_id();
-    let interop_loop = InteropLoop {
+    let mut interop_loop = InteropLoop {
         cursor_file,
         origin,
         origin_label: origin.to_string(),
         retry_interval: config.retry_interval,
+        publisher,
+        source,
+        self_chain_id: config.self_chain_id,
+        shutdown_rx,
     };
     let task = tokio::spawn(async move {
         let mut cursor = config.start_seq;
         loop {
-            let cursor_before = cursor;
-            let outcome = tokio::select! {
-                biased;
-                _ = &mut shutdown_rx => {
-                    info!(target: "da_watcher::interop", origin, "shutting down");
-                    break;
-                }
-                // Cancelled mid-pass only by the shutdown branch above; the
-                // dropped future can cost at most an un-consumed feed item,
-                // which the cursor-authoritative resume replays.
-                r = process_once(&publisher, &mut source, config.self_chain_id, &mut cursor) => r,
-            };
-            interop_loop.persist_cursor(cursor, cursor_before);
-            if interop_loop
-                .handle_outcome(outcome, cursor)
-                .await
-                .is_break()
-            {
-                break;
+            match interop_loop.tick(&mut cursor).await {
+                ControlFlow::Break(()) => break,
+                ControlFlow::Continue(()) => {}
             }
         }
     });
@@ -256,17 +244,54 @@ where
     }
 }
 
-/// Per-pair loop state shared by [`InteropLoop::persist_cursor`] and
-/// [`InteropLoop::handle_outcome`]: the cursor file, the origin chain id
-/// (for logging), and the retryable-error backoff.
-struct InteropLoop {
+/// Per-pair loop state: the cursor file, the origin chain id (for
+/// logging), the retryable-error backoff, and the seams `tick` owns for
+/// its whole task lifetime (`publisher`, `source`, `self_chain_id`,
+/// `shutdown_rx`).
+struct InteropLoop<S, P> {
     cursor_file: Option<CursorFile>,
     origin: u64,
     origin_label: String,
     retry_interval: Duration,
+    publisher: P,
+    source: S,
+    self_chain_id: u64,
+    shutdown_rx: oneshot::Receiver<()>,
 }
 
-impl InteropLoop {
+impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropLoop<S, P> {
+    /// One [`spawn`] pass: run `process_once` (or handle shutdown),
+    /// persist the cursor when it advanced, then apply the outcome.
+    /// `Break` ends the task: shutdown, or a fail-stop outcome.
+    async fn tick(&mut self, cursor: &mut u64) -> ControlFlow<()> {
+        let cursor_before = *cursor;
+        let outcome = tokio::select! {
+            biased;
+            _ = &mut self.shutdown_rx => {
+                info!(target: "da_watcher::interop", origin = self.origin, "shutting down");
+                return ControlFlow::Break(());
+            }
+            // Cancelled mid-pass only by the shutdown branch above; the
+            // dropped future can cost at most an un-consumed feed item,
+            // which the cursor-authoritative resume replays.
+            r = process_once(&self.publisher, &mut self.source, self.self_chain_id, cursor) => r,
+        };
+        self.persist_cursor(*cursor, cursor_before);
+        // Takes the specific fields it needs, not `&self`: `self` also
+        // carries `source`/`publisher`, and `tokio::spawn` requires the
+        // whole task future to be `Send`, which a `&self` held across
+        // this `.await` would need `S: Sync`/`P: Sync` for, with no
+        // reason to require that of either trait.
+        Self::handle_outcome(
+            self.origin,
+            &self.origin_label,
+            self.retry_interval,
+            outcome,
+            *cursor,
+        )
+        .await
+    }
+
     /// Persist the cursor after a pass that advanced it. Never called
     /// before the publish it records: a cursor that dies STALE (crash
     /// before this call) is harmless, because the restart re-derives a
@@ -303,18 +328,19 @@ impl InteropLoop {
     /// publisher closed, or the batch broke the derivation rule (a
     /// fail-stop fault).
     async fn handle_outcome(
-        &self,
+        origin: u64,
+        origin_label: &str,
+        retry_interval: Duration,
         outcome: Result<usize, InteropError>,
         cursor: u64,
     ) -> ControlFlow<()> {
-        let origin = self.origin;
         match outcome {
             Ok(_) => {
-                record_tick(&self.origin_label, "ok");
+                record_tick(origin_label, "ok");
                 ControlFlow::Continue(())
             }
             Err(InteropError::Source(e)) => {
-                record_tick(&self.origin_label, "feed_error");
+                record_tick(origin_label, "feed_error");
                 warn!(
                     target: "da_watcher::interop",
                     origin,
@@ -322,16 +348,16 @@ impl InteropLoop {
                     error = %e,
                     "outbox feed unavailable; the pair stalls until it recovers"
                 );
-                tokio::time::sleep(self.retry_interval).await;
+                tokio::time::sleep(retry_interval).await;
                 ControlFlow::Continue(())
             }
             Err(InteropError::PublisherClosed) => {
-                record_tick(&self.origin_label, "publisher_closed");
+                record_tick(origin_label, "publisher_closed");
                 warn!(target: "da_watcher::interop", origin, "publisher closed; exiting");
                 ControlFlow::Break(())
             }
             Err(InteropError::Lagged { cursor: at, floor }) => {
-                record_tick(&self.origin_label, "fault");
+                record_tick(origin_label, "fault");
                 error!(
                     target: "da_watcher::interop",
                     origin,
@@ -344,7 +370,7 @@ impl InteropLoop {
                 ControlFlow::Break(())
             }
             Err(e @ (InteropError::Derive(_) | InteropError::CursorOverflow { .. })) => {
-                record_tick(&self.origin_label, "fault");
+                record_tick(origin_label, "fault");
                 error!(
                     target: "da_watcher::interop",
                     origin,

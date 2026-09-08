@@ -125,15 +125,14 @@ impl BlockGrade {
         exclude: &HashSet<Cell, S>,
     ) {
         let (reads, writes) = actual_cells(o);
-        for c in reads.union(&writes) {
-            if exclude.contains(c) {
-                continue;
-            }
-            self.cells_actual += 1;
-            if set.contains(c) {
-                self.cells_hit += 1;
-            }
-        }
+        let (actual, hit) = reads
+            .union(&writes)
+            .filter(|c| !exclude.contains(c))
+            .fold((0usize, 0usize), |(actual, hit), c| {
+                (actual + 1, hit + usize::from(set.contains(c)))
+            });
+        self.cells_actual += actual;
+        self.cells_hit += hit;
     }
 
     /// Wave structure of the predicted DAG (canonical order is the
@@ -158,13 +157,14 @@ impl BlockGrade {
             .collect();
         edges.sort_unstable();
         let mut level = vec![0usize; graded.len()];
-        for (lo, hi) in &edges {
-            if level[*lo] + 1 > level[*hi] {
-                level[*hi] = level[*lo] + 1;
-            }
+        for &(lo, hi) in &edges {
+            level[hi] = level[hi].max(level[lo] + 1);
         }
+        // 0 is the correct wave count for an empty `graded`, not a
+        // missing-data sentinel.
         self.predicted_waves = level.iter().max().map_or(0, |m| m + 1);
         // A plain histogram: count how many nodes land at each level.
+        // 0 is the correct width when there are no waves.
         self.predicted_width = level
             .iter()
             .fold(vec![0usize; self.predicted_waves], |mut w, l| {

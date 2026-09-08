@@ -17,6 +17,7 @@
 //!   secp256k1 does not expose that.
 
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,6 +53,24 @@ struct VerifyRequest {
     env: TxEnvelope,
     raw_tx: Bytes,
     respond: oneshot::Sender<Result<(Address, B256), IngressError>>,
+}
+
+impl VerifyRequest {
+    /// Recovers this request and sends the result to its waiting caller.
+    /// A dropped receiver (the caller went away) is not an error here.
+    fn recover_and_respond(self) {
+        let res = recover_single(&self.env, &self.raw_tx);
+        let _ = self.respond.send(res);
+    }
+}
+
+/// Takes the next request off the shared cursor. The lock guard dies
+/// with this call, before the caller starts recovery, so a worker never
+/// holds the shared cursor lock across the 42µs of ECDSA work.
+fn next_request(
+    cursor: &std::sync::Mutex<std::vec::IntoIter<VerifyRequest>>,
+) -> Option<VerifyRequest> {
+    cursor.lock_ignore_poison().next()
 }
 
 /// A recovery ring with a bounded depth and a flush window.
@@ -100,17 +119,28 @@ impl FlushLoop {
     /// of the window. This ends when the channel closes, which happens
     /// when the owning `BatchVerifier` drops.
     async fn run(mut self) {
-        let depth = self.depth.get();
         loop {
-            let mut buf = Vec::with_capacity(depth);
-            if self.rx.recv_many(&mut buf, depth).await == 0 {
-                return;
+            match self.run_one_batch().await {
+                ControlFlow::Break(()) => return,
+                ControlFlow::Continue(()) => {}
             }
-            if buf.len() < depth {
-                self.fill_until_deadline(&mut buf).await;
-            }
-            BatchVerifier::process_batch(buf, self.parallelism).await;
         }
+    }
+
+    /// One [`Self::run`] pass: fill a batch (racing the flush window once
+    /// it holds at least one request), then flush it. `Break` means the
+    /// channel closed.
+    async fn run_one_batch(&mut self) -> ControlFlow<()> {
+        let depth = self.depth.get();
+        let mut buf = Vec::with_capacity(depth);
+        if self.rx.recv_many(&mut buf, depth).await == 0 {
+            return ControlFlow::Break(());
+        }
+        if buf.len() < depth {
+            self.fill_until_deadline(&mut buf).await;
+        }
+        BatchVerifier::process_batch(buf, self.parallelism).await;
+        ControlFlow::Continue(())
     }
 
     /// Races the flush window's deadline against further arrivals until
@@ -185,17 +215,15 @@ impl BatchVerifier {
     /// or BLS aggregation uses. Parallelism is the only gain available
     /// here.
     async fn process_batch(batch: Vec<VerifyRequest>, parallelism: NonZeroUsize) {
-        if batch.is_empty() {
+        let Some(batch_len) = NonZeroUsize::new(batch.len()) else {
             return;
-        }
+        };
         // Below the threshold, splitting costs more than it saves: one
         // chunk is 42µs of work against the cost of a spawn_blocking hop.
         let workers = if batch.len() < PARALLEL_THRESHOLD || parallelism == NonZeroUsize::MIN {
             1
         } else {
-            parallelism
-                .min(NonZeroUsize::new(batch.len()).expect("batch is non-empty here"))
-                .get()
+            parallelism.min(batch_len).get()
         };
         if workers == 1 {
             let _ = tokio::task::spawn_blocking(move || Self::recover_chunk(batch)).await;
@@ -216,11 +244,8 @@ impl BatchVerifier {
             .map(|_| {
                 let cursor = cursor.clone();
                 tokio::task::spawn_blocking(move || {
-                    loop {
-                        let next = cursor.lock_ignore_poison().next();
-                        let Some(req) = next else { break };
-                        let res = recover_single(&req.env, &req.raw_tx);
-                        let _ = req.respond.send(res);
+                    while let Some(req) = next_request(&cursor) {
+                        req.recover_and_respond();
                     }
                 })
             })
@@ -236,8 +261,7 @@ impl BatchVerifier {
     /// caller.
     fn recover_chunk(batch: Vec<VerifyRequest>) {
         for req in batch {
-            let res = recover_single(&req.env, &req.raw_tx);
-            let _ = req.respond.send(res);
+            req.recover_and_respond();
         }
     }
 

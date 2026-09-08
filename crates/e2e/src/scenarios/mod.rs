@@ -41,6 +41,15 @@ pub const CODE_INVALID: i32 = -32602;
 pub const CODE_INTERNAL: i32 = -32603;
 
 /// Metric names asserted across scenarios.
+///
+/// `EXEC_TX_APPLIED`'s literal duplicates `crates/engine/src/metrics.rs::
+/// TX_APPLIED_TOTAL`, unlike `INGRESS_QUEUE_DEPTH` below: `e2e` does not
+/// otherwise depend on `kardamom-engine` (a production execution-engine
+/// crate pulling in `revm`, `kardamom-state`, and
+/// `kardamom-cluster-adapter`), and adding that dependency to this test
+/// harness for one string constant is a worse trade than the
+/// duplication. Flagged for the coordinator; see `status-e2e.md`'s Final
+/// pass follow-up section.
 pub const EXEC_TX_APPLIED: &str = "kardamom_executor_tx_applied_total";
 pub const EXEC_BLOCK_NUMBER: &str = "kardamom_executor_block_number";
 pub const SEQ_DROPPED_PAST: &str = "kardamom_sequencer_tx_dropped_past_total";
@@ -48,7 +57,7 @@ pub const SEQ_EVICTIONS: &str = "kardamom_sequencer_pending_evictions_total";
 pub const SEQ_REMOTE_EPOCHS_RELAYED: &str = "kardamom_sequencer_remote_epochs_relayed_total";
 pub const SEQ_REMOTE_MESSAGES_RELAYED: &str = "kardamom_sequencer_remote_messages_relayed_total";
 pub const SEQ_REMOTE_ORIGIN_REJECT: &str = "kardamom_sequencer_remote_origin_reject_total";
-pub const INGRESS_QUEUE_DEPTH: &str = "kardamom_ingress_queue_depth";
+pub const INGRESS_QUEUE_DEPTH: &str = kardamom_ingress::metrics::QUEUE_DEPTH;
 pub const VALIDATOR_COMMITTED_BLOCK: &str = "validator_committed_block";
 pub const VALIDATOR_BLOCKS_VERIFIED: &str = "validator_blocks_verified_total";
 pub const VALIDATOR_BAL_MISSING: &str = "validator_bal_missing_total";

@@ -200,6 +200,10 @@ impl LocalStack {
             Duration::from_secs(90),
             Duration::from_millis(250),
             async || {
+                // A bring-up poll: the executor's HTTP server may not be
+                // listening yet, so a scrape error here means "not ready",
+                // the same as a genuinely absent counter. The 90s timeout
+                // below still catches a stack that never comes up.
                 let v = super::metrics::scrape(exec_addr)
                     .await
                     .ok()

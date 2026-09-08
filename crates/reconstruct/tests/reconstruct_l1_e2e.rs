@@ -115,7 +115,10 @@ async fn post_and_recover_frames(
             .expect("post batch to L1");
     }
     assert_eq!(prev_index, 2, "two batches posted");
-    assert!(da_store.len() >= 2, "DA store holds the posted blobs");
+    assert!(
+        da_store.len().unwrap() >= 2,
+        "DA store holds the posted blobs"
+    );
 
     let descriptors = read_posted_batches(post_provider, settlement, 0)
         .await

@@ -408,8 +408,8 @@ mod remote_epoch_verify {
     {
         fn verify(&self, _: &mut C) -> Result<(), C::Error> {
             let first_seq = self.first_seq.to_native();
-            let len = u64::try_from(self.messages.0.len()).ok();
-            if len.and_then(|l| first_seq.checked_add(l)).is_none() {
+            let len = crate::num::usize_to_u64(self.messages.0.len());
+            if first_seq.checked_add(len).is_none() {
                 fail!(RemoteEpochSeqOverflow);
             }
             Ok(())
@@ -428,7 +428,7 @@ impl RemoteEpochRecord {
     /// did before `messages` was a [`NonEmptyVec`].
     #[must_use]
     pub fn last_seq(&self) -> u64 {
-        let len = u64::try_from(self.messages.len().get()).unwrap_or(u64::MAX);
+        let len = crate::num::usize_to_u64(self.messages.len().get());
         self.first_seq.saturating_add(len).saturating_sub(1)
     }
 

@@ -13,6 +13,7 @@
 //! dedup absorbs copies that did commit, and voided ones get ordered.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
@@ -134,22 +135,37 @@ impl<T> UnconfirmedLedger<T> {
     ) -> Vec<(UnconfirmedKey, T)> {
         let mut stale: Vec<UnconfirmedKey> = Vec::new();
         while stale.len() < max {
-            let Some((queued_at, key)) = self.expiry.front().copied() else {
-                break;
-            };
-            if now.duration_since(queued_at) < timeout {
-                break;
-            }
-            self.expiry.pop_front();
-            if self
-                .entries
-                .get(&key)
-                .is_some_and(|(_, at)| *at == queued_at)
-            {
-                stale.push(key);
+            match self.expire_step(now, timeout) {
+                ControlFlow::Break(()) => break,
+                ControlFlow::Continue(Some(key)) => stale.push(key),
+                ControlFlow::Continue(None) => {}
             }
         }
         self.take_descending(stale)
+    }
+
+    /// One [`Self::sweep_expired`] step: pop the front expiry entry if it
+    /// is past `timeout`. `Break` means the front is empty, or still
+    /// live, so the sweep stops. `Continue(Some(key))` means the popped
+    /// entry is still current and joins the sweep; `Continue(None)` means
+    /// it was stale (lazily deleted) and is skipped.
+    fn expire_step(
+        &mut self,
+        now: Instant,
+        timeout: Duration,
+    ) -> ControlFlow<(), Option<UnconfirmedKey>> {
+        let Some((queued_at, key)) = self.expiry.front().copied() else {
+            return ControlFlow::Break(());
+        };
+        if now.duration_since(queued_at) < timeout {
+            return ControlFlow::Break(());
+        }
+        self.expiry.pop_front();
+        let current = self
+            .entries
+            .get(&key)
+            .is_some_and(|(_, at)| *at == queued_at);
+        ControlFlow::Continue(current.then_some(key))
     }
 
     /// Remove `keys` (ascending nonce per sender) from the map. Returns

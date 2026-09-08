@@ -109,10 +109,9 @@ mod tests {
         assert!(lim.check(b).is_ok());
     }
 
-    // Regression test for the unbounded-map defect: `PerIpLimiter` used to
-    // add one `DashMap` entry per distinct client IP and never remove one.
     // A bucket that fully refills while idle must be evicted on sweep, so
-    // the map stays bounded to the set of recently active clients.
+    // the map stays bounded to the set of recently active clients, not one
+    // `DashMap` entry per distinct client IP ever seen.
     #[test]
     fn sweep_evicts_a_fully_refilled_bucket() {
         let lim = PerIpLimiter::new(nonzero!(1_000u32), nonzero!(1u32));

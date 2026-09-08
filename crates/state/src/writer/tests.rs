@@ -35,14 +35,21 @@ fn boundary(block: u64) -> BlockBoundary {
 /// run.
 fn record_delta_in_model(
     delta: &BlockDelta,
-    accts: &mut BTreeMap<Address, (u64, U256, B256)>,
+    accts: &mut BTreeMap<Address, trie::BasicFields>,
     stor: &mut BTreeMap<Address, BTreeMap<B256, U256>>,
 ) {
     for s in &delta.storage {
         stor.entry(s.address).or_default().insert(s.key, s.value);
     }
     for a in &delta.accounts {
-        accts.insert(a.address, (a.nonce, a.balance, a.code_hash));
+        accts.insert(
+            a.address,
+            trie::BasicFields {
+                nonce: a.nonce,
+                balance: a.balance,
+                code_hash: a.code_hash,
+            },
+        );
     }
 }
 
@@ -79,7 +86,7 @@ fn trie_writer_root_matches_model_and_persists() {
         },
     ];
 
-    let mut model_accts: BTreeMap<Address, (u64, U256, B256)> = BTreeMap::new();
+    let mut model_accts: BTreeMap<Address, trie::BasicFields> = BTreeMap::new();
     let mut model_stor: BTreeMap<Address, BTreeMap<B256, U256>> = BTreeMap::new();
 
     // Submit all blocks, then shut down. `shutdown()` drains every queued

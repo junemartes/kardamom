@@ -66,8 +66,8 @@ async fn aeron_live_send_friendly_round_trip() {
     let mut received: Vec<TxEnvelope> = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while received.len() < 50 && std::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(50), subscriber.recv()).await {
-            Ok(Some((_pos, env))) => received.push(env),
+        match recv_step(&mut subscriber).await {
+            Ok(Some(env)) => received.push(env),
             Ok(None) => break,
             Err(_) => {}
         }
@@ -86,4 +86,15 @@ async fn aeron_live_send_friendly_round_trip() {
 
     drop(rt);
     drop(cluster);
+}
+
+/// One receive-loop step: `subscriber.recv()` with a 50 ms timeout.
+/// `Ok(Some(env))` is one message; `Ok(None)` means the subscription
+/// ended; `Err(_)` means the timeout elapsed with nothing yet.
+async fn recv_step(
+    subscriber: &mut TxDataSubscriberHandle,
+) -> Result<Option<TxEnvelope>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(Duration::from_millis(50), subscriber.recv())
+        .await
+        .map(|item| item.map(|(_pos, env)| env))
 }

@@ -26,6 +26,7 @@
 //! sharing of the archive handle is not supported.
 
 use std::cell::RefCell;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
@@ -398,25 +399,41 @@ impl Recorder {
 
         let mut logged_waiting = false;
         while !stop.is_cancelled() {
-            match Self::active_recording_for_stream(archive, stream_id) {
-                Ok(Some(id)) => {
-                    info!(recording_id = id, ?kind, "recording ready");
-                    return Some(id);
-                }
-                Ok(None) => {
-                    if !logged_waiting {
-                        info!(
-                            ?kind,
-                            "waiting for a publisher on the stream so the recording materializes"
-                        );
-                        logged_waiting = true;
-                    }
-                }
-                Err(e) => warn!(error = %e, ?kind, "list_recordings_for_uri failed; retrying"),
+            match Self::poll_recording(archive, stream_id, kind, &mut logged_waiting) {
+                ControlFlow::Break(id) => return Some(id),
+                ControlFlow::Continue(()) => {}
             }
-            std::thread::sleep(Duration::from_millis(500));
         }
         None
+    }
+
+    /// One [`Self::find_or_start_recording`] poll step. `Break` carries the
+    /// recording id once the catalog lists it. `Continue` means it does
+    /// not exist yet; the caller waits and polls again.
+    fn poll_recording(
+        archive: &Archive,
+        stream_id: i32,
+        kind: RecorderKind,
+        logged_waiting: &mut bool,
+    ) -> ControlFlow<i64> {
+        match Self::active_recording_for_stream(archive, stream_id) {
+            Ok(Some(id)) => {
+                info!(recording_id = id, ?kind, "recording ready");
+                return ControlFlow::Break(id);
+            }
+            Ok(None) => {
+                if !*logged_waiting {
+                    info!(
+                        ?kind,
+                        "waiting for a publisher on the stream so the recording materializes"
+                    );
+                    *logged_waiting = true;
+                }
+            }
+            Err(e) => warn!(error = %e, ?kind, "list_recordings_for_uri failed; retrying"),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        ControlFlow::Continue(())
     }
 
     #[must_use]

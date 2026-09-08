@@ -317,44 +317,62 @@ impl<S: L1EpochSource> Verifier<S> {
             // Bounded: the loop breaks once `attempt >= VERIFY_ATTEMPTS`
             // (a small constant), so this never approaches `u32::MAX`.
             attempt += 1;
-            match verify_one(self.source.as_ref(), self.lockbox, epoch, self.anchor).await {
-                Ok(()) => {
-                    return VerifyVerdict::Verified(Anchor {
-                        number: epoch.l1_number,
-                        hash: epoch.l1_hash,
-                    });
-                }
-                Err(VerifyOutcome::Fault(fault)) => return VerifyVerdict::Fault(fault),
-                Err(VerifyOutcome::Unavailable(e)) if attempt < VERIFY_ATTEMPTS => {
-                    tracing::debug!(
-                        l1_number = epoch.l1_number,
-                        attempt,
-                        error = %e,
-                        "epoch verification retrying"
-                    );
-                    tokio::time::sleep(VERIFY_RETRY_DELAY).await;
-                }
-                Err(VerifyOutcome::Unavailable(e)) => {
-                    // Out of retries. If L1 simply does not have this block,
-                    // the epoch is anchored to something that never happened:
-                    // rule 4, a fault. Any other transport failure stays a
-                    // coverage gap.
-                    if is_missing_block(&e) {
-                        return VerifyVerdict::Fault(EpochFault::BlockBeyondFinality {
-                            l1_number: epoch.l1_number,
-                            attempts: attempt,
-                        });
-                    }
-                    tracing::warn!(
-                        l1_number = epoch.l1_number,
-                        attempts = attempt,
-                        error = %e,
-                        "epoch verification gave up: L1 unavailable"
-                    );
-                    return VerifyVerdict::Unverified;
-                }
+            match self.verify_attempt(epoch, attempt).await {
+                std::ops::ControlFlow::Break(verdict) => return verdict,
+                std::ops::ControlFlow::Continue(()) => {}
             }
         }
+    }
+
+    /// One retry attempt: `Break` carries the final verdict, `Continue`
+    /// means the caller's loop should try again (after this attempt's
+    /// own retry-delay sleep, when a retry is warranted).
+    async fn verify_attempt(
+        &self,
+        epoch: &EpochRecord,
+        attempt: u32,
+    ) -> std::ops::ControlFlow<VerifyVerdict> {
+        match verify_one(self.source.as_ref(), self.lockbox, epoch, self.anchor).await {
+            Ok(()) => std::ops::ControlFlow::Break(VerifyVerdict::Verified(Anchor {
+                number: epoch.l1_number,
+                hash: epoch.l1_hash,
+            })),
+            Err(VerifyOutcome::Fault(fault)) => {
+                std::ops::ControlFlow::Break(VerifyVerdict::Fault(fault))
+            }
+            Err(VerifyOutcome::Unavailable(e)) if attempt < VERIFY_ATTEMPTS => {
+                tracing::debug!(
+                    l1_number = epoch.l1_number,
+                    attempt,
+                    error = %e,
+                    "epoch verification retrying"
+                );
+                tokio::time::sleep(VERIFY_RETRY_DELAY).await;
+                std::ops::ControlFlow::Continue(())
+            }
+            Err(VerifyOutcome::Unavailable(e)) => {
+                std::ops::ControlFlow::Break(Self::give_up(epoch, attempt, &e))
+            }
+        }
+    }
+
+    /// Out of retries. If L1 simply does not have this block, the epoch
+    /// is anchored to something that never happened: rule 4, a fault.
+    /// Any other transport failure stays a coverage gap.
+    fn give_up(epoch: &EpochRecord, attempt: u32, e: &anyhow::Error) -> VerifyVerdict {
+        if is_missing_block(e) {
+            return VerifyVerdict::Fault(EpochFault::BlockBeyondFinality {
+                l1_number: epoch.l1_number,
+                attempts: attempt,
+            });
+        }
+        tracing::warn!(
+            l1_number = epoch.l1_number,
+            attempts = attempt,
+            error = %e,
+            "epoch verification gave up: L1 unavailable"
+        );
+        VerifyVerdict::Unverified
     }
 
     /// Apply one epoch's verdict: bump the metric, record a divergence on

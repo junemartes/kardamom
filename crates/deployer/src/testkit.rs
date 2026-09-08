@@ -55,18 +55,26 @@ impl AnvilRig {
             .await
             .ok()?;
         for (addr, funding) in fund {
-            let _: serde_json::Value = provider
-                .raw_request("anvil_setBalance".into(), (*addr, U256::from(FUND_WEI)))
-                .await
-                .ok()?;
-            if *funding == Funding::FundAndImpersonate {
-                let _: serde_json::Value = provider
-                    .raw_request("anvil_impersonateAccount".into(), (*addr,))
-                    .await
-                    .ok()?;
-            }
+            Self::fund_one(&provider, *addr, *funding).await?;
         }
         Some(AnvilRig { anvil, provider })
+    }
+
+    /// Fund one dev account, and impersonate it too when `funding` asks
+    /// for that. Returns `None` on any anvil RPC failure, matching
+    /// `spawn`'s skip-cleanly convention.
+    async fn fund_one(provider: &RootProvider, addr: Address, funding: Funding) -> Option<()> {
+        let _: serde_json::Value = provider
+            .raw_request("anvil_setBalance".into(), (addr, U256::from(FUND_WEI)))
+            .await
+            .ok()?;
+        if funding == Funding::FundAndImpersonate {
+            let _: serde_json::Value = provider
+                .raw_request("anvil_impersonateAccount".into(), (addr,))
+                .await
+                .ok()?;
+        }
+        Some(())
     }
 }
 

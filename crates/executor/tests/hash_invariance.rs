@@ -1,10 +1,17 @@
-//! Tests for write_set_hash: permutation invariance and sensitivity to value
+//! Tests for `write_set_hash`: permutation invariance and sensitivity to value
 //! changes.
 //!
 //! Property: take a `WriteSet` `ws`. Build `ws'` by inserting the same
 //! (addr, kind, key, value) tuples in a random shuffled order. Then
 //! `ws'.hash() == ws.hash()`. Sensitivity: a change to any single value
 //! flips the hash.
+//!
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "indices and counts here are bounded by the small fixed test fixtures, never near a truncation boundary"
+)]
 
 use alloy_primitives::{Address, B256, U256};
 use kardamom_engine::delta::AccountFields;
@@ -58,18 +65,29 @@ fn sample(seed: u64) -> (AccountVec, StorageVec) {
     (accounts, storage)
 }
 
+/// Shuffle a fresh clone of `accounts` and `storage` with `rng`, and
+/// assert the shuffled build's hash still equals `base`.
+fn assert_permutation_stable(
+    accounts: &AccountVec,
+    storage: &StorageVec,
+    base: B256,
+    rng: &mut ChaCha8Rng,
+) {
+    let mut a = accounts.clone();
+    let mut s = storage.clone();
+    a.shuffle(rng);
+    s.shuffle(rng);
+    assert_eq!(build(&a, &s).hash(), base);
+}
+
 #[test]
 fn permuting_input_does_not_change_hash() {
-    let (accounts, storage) = sample(0xDEADBEEF);
+    let (accounts, storage) = sample(0xDEAD_BEEF);
     let base = build(&accounts, &storage).hash();
 
-    let mut rng = ChaCha8Rng::seed_from_u64(0xC0FFEE);
+    let mut rng = ChaCha8Rng::seed_from_u64(0xC0_FFEE);
     for _ in 0..16 {
-        let mut a = accounts.clone();
-        let mut s = storage.clone();
-        a.shuffle(&mut rng);
-        s.shuffle(&mut rng);
-        assert_eq!(build(&a, &s).hash(), base);
+        assert_permutation_stable(&accounts, &storage, base, &mut rng);
     }
 }
 

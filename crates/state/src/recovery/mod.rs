@@ -55,6 +55,9 @@ pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> 
     let txn = env.raw().begin_ro_sync()?;
     let meta = txn.open_db(Some(TABLE_META))?;
 
+    // An absent cursor means genesis: nothing has committed or fsynced
+    // yet, so the zero defaults below are correct recovery points, not
+    // missing-data sentinels.
     let last_committed_block = read_meta_u64(&txn, meta, KEY_LAST_COMMITTED_BLOCK)?.unwrap_or(0);
     let last_committed_end_tx_position =
         read_meta_b_position(&txn, meta, KEY_LAST_COMMITTED_END_TX_POSITION)?

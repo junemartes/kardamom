@@ -142,13 +142,18 @@ impl<P: Provider<Ethereum> + Clone> AttesterLoop<P> {
             "attester task started"
         );
         while let Some(msg) = self.rx.recv().await {
-            match msg {
-                AttesterMsg::Leaves { block, leaves } => self.state.on_leaves(block, leaves),
-                AttesterMsg::Root { block, state_root } => self.state.on_root(block, state_root),
-            }
+            self.fold_msg(msg);
             self.post_due().await;
         }
         tracing::info!("attester task stopping (all handles dropped)");
+    }
+
+    /// Fold one attester message into `self.state`.
+    fn fold_msg(&mut self, msg: AttesterMsg) {
+        match msg {
+            AttesterMsg::Leaves { block, leaves } => self.state.on_leaves(block, leaves),
+            AttesterMsg::Root { block, state_root } => self.state.on_root(block, state_root),
+        }
     }
 
     /// Post an output if a block is attestable now. A root is attestable

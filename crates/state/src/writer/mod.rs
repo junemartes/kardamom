@@ -225,30 +225,38 @@ impl StateWriter {
                 info!("delta channel closed; writer shutting down");
                 return Ok(());
             };
-            let block = batch.boundary.block_number;
-            let size = batch.approx_size_bytes();
-            debug!(block, size_bytes = size, "applying block delta");
-            if let Err(e) = self.apply(&batch) {
-                // Report this clearly on both channels: tracing for
-                // production, and stderr unconditionally. A halted state
-                // writer strands every consumer of the snapshot channel.
-                // They block instead of erroring, so a silent failure
-                // here is hard to find.
-                eprintln!("kardamom-state-writer HALTING: block {block} apply failed: {e}");
-                error!(block, error = %e, "block apply failed; halting writer");
-                return Err(e);
+            self.apply_and_publish(&batch)?;
+        }
+    }
+
+    /// Apply one batch and publish the snapshot after it. Reports a
+    /// failure clearly on both channels — tracing for production, and
+    /// stderr unconditionally — before returning it: a halted state
+    /// writer strands every consumer of the snapshot channel, which
+    /// blocks instead of erroring, so a silent failure here is hard to
+    /// find.
+    fn apply_and_publish(&self, batch: &WriteBatch) -> Result<(), StateError> {
+        let block = batch.boundary.block_number;
+        let size = batch.approx_size_bytes();
+        debug!(block, size_bytes = size, "applying block delta");
+        if let Err(e) = self.apply(batch) {
+            eprintln!("kardamom-state-writer HALTING: block {block} apply failed: {e}");
+            error!(block, error = %e, "block apply failed; halting writer");
+            return Err(e);
+        }
+        // Publish the snapshot after this block. `SnapshotHandle::publish`
+        // drops the old snapshot, which releases its read-only transaction.
+        match StateSnapshot::open(&self.env) {
+            Ok(snap) => {
+                self.snapshot_handle.publish(snap);
+                Ok(())
             }
-            // Publish the snapshot after this block. `SnapshotHandle::publish`
-            // drops the old snapshot, which releases its read-only transaction.
-            match StateSnapshot::open(&self.env) {
-                Ok(snap) => self.snapshot_handle.publish(snap),
-                Err(e) => {
-                    eprintln!(
-                        "kardamom-state-writer HALTING: snapshot open failed after block {block}: {e}"
-                    );
-                    warn!(block, error = %e, "snapshot open failed after commit");
-                    return Err(e);
-                }
+            Err(e) => {
+                eprintln!(
+                    "kardamom-state-writer HALTING: snapshot open failed after block {block}: {e}"
+                );
+                warn!(block, error = %e, "snapshot open failed after commit");
+                Err(e)
             }
         }
     }

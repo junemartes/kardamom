@@ -401,12 +401,18 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         }
     }
 
-    /// The worker with the least sticky-assign load so far this block,
-    /// or `hashed` if the load table is empty. The borrow ends with this
-    /// function's return.
-    pub(super) fn least_loaded(&self, hashed: usize) -> usize {
+    /// The worker with the least sticky-assign load so far this block.
+    /// The borrow ends with this function's return.
+    ///
+    /// # Panics
+    /// Panics if the load table is empty. `with_pool` builds it as
+    /// `vec![0; workers]` off a `NonZeroUsize` worker count, so it is
+    /// never empty.
+    pub(super) fn least_loaded(&self) -> usize {
         let load = self.assign_load.borrow();
-        (0..load.len()).min_by_key(|w| load[*w]).unwrap_or(hashed)
+        (0..load.len())
+            .min_by_key(|w| load[*w])
+            .expect("the worker count is non-zero")
     }
 
     /// Whether an idle worker should steal a ready transaction from a

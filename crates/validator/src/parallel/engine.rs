@@ -15,7 +15,7 @@ use kardamom_engine::error::ExecutorError;
 use kardamom_stm::pool::WorkerPool;
 use kardamom_types::{Receipt, StateDatabase};
 
-use super::claims::{ClaimIndex, batch_ranges};
+use super::claims::{BatchSize, ClaimIndex, batch_ranges};
 use super::dump::dump_divergence_inputs;
 
 /// A batch's result: its receipts, with local cumulative gas (the caller
@@ -316,7 +316,7 @@ pub struct BlockOutcome {
 pub fn execute_block_parallel<S: StateDatabase + Sync>(
     pool: &WorkerPool,
     inputs: &BlockInputs<'_, S>,
-    batch_size: NonZeroUsize,
+    batch_size: BatchSize,
 ) -> Result<BlockOutcome, ExecutorError> {
     if inputs.txs.is_empty() {
         return Ok(BlockOutcome {
@@ -333,7 +333,11 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
     // so seeds, are chunk-indexed at K > 1. The pool only distributes the
     // indices of these pre-computed ranges, so it cannot re-batch.
     let g = NonZeroUsize::from(inputs.granularity);
-    let effective_batch = if g.get() > 1 { g } else { batch_size };
+    let effective_batch = if g.get() > 1 {
+        BatchSize::new(g)
+    } else {
+        batch_size
+    };
     let ranges = batch_ranges(inputs.txs.len(), effective_batch);
     let forks = fork_snapshots(pool, inputs.snapshot);
     let outcomes = run_batches(pool, &ranges, &forks, inputs)?;
@@ -497,7 +501,7 @@ pub(crate) fn execute_block_sequential<S: StateDatabase>(
 /// blocks validate in parallel too. Build one with [`parallel_block_exec`].
 pub struct ParallelBlockExec {
     claims: Arc<crate::ClaimBuffer>,
-    batch_size: NonZeroUsize,
+    batch_size: BatchSize,
     // Built once and held here, so workers persist across blocks, instead
     // of spawning one OS thread per batch per block.
     pool: Arc<WorkerPool>,
@@ -508,7 +512,7 @@ pub struct ParallelBlockExec {
 /// [`ParallelBlockExec`].
 pub fn parallel_block_exec(
     claims: Arc<crate::ClaimBuffer>,
-    batch_size: NonZeroUsize,
+    batch_size: BatchSize,
     workers: NonZeroUsize,
     flight: Option<Arc<crate::flight::FlightRing>>,
 ) -> ParallelBlockExec {

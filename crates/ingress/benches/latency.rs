@@ -9,9 +9,8 @@ use alloy_signer_local::PrivateKeySigner;
 use criterion::{Criterion, criterion_group, criterion_main};
 
 use kardamom_ingress::config::IngressConfig;
-use kardamom_ingress::test_support::{receipt_for, sign_legacy};
+use kardamom_ingress::test_support::{sign_legacy, spawn_fake_executor};
 use kardamom_ingress::{IngressProxy, MockChannels};
-use kardamom_types::{BPosition, QuorumWatermark};
 
 const SHARDS: NonZeroU32 = NonZeroU32::new(8).unwrap();
 const MOCK_SHARDS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(8).unwrap();
@@ -29,25 +28,11 @@ fn bench_e2e_latency(c: &mut Criterion) {
             pending_receipt_timeout: Duration::from_secs(2),
             ..IngressConfig::default()
         };
-        let (mock, mut rx_vec) = MockChannels::new(MOCK_SHARDS);
+        let (mock, rx_vec) = MockChannels::new(MOCK_SHARDS);
         let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
-        for (i, mut rx) in rx_vec.drain(..).enumerate() {
-            let receipt_bus = mock.receipt_bus.clone();
-            let watermark_bus = mock.watermark_bus.clone();
-            tokio::spawn(async move {
-                let mut local: i32 = 0;
-                while let Some(envelope) = rx.recv().await {
-                    local += 1;
-                    let pos = BPosition {
-                        term_id: i32::try_from(i).expect("shard count fits in i32"),
-                        term_offset: local,
-                    };
-                    let receipt = receipt_for(&envelope, pos);
-                    let _ = receipt_bus.send(receipt);
-                    let _ = watermark_bus.send(QuorumWatermark { position: pos });
-                }
-            });
-        }
+        // One shared position space across shards, so no receipt parks
+        // above a watermark that a later shard moves backward.
+        let _echo_tasks = spawn_fake_executor(&mock, rx_vec);
         proxy
     });
 

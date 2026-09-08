@@ -49,7 +49,7 @@ impl<W: ExecPorts> ExecState<W> {
                 expected: self.expected_tx_idx,
             });
         }
-        self.expected_tx_idx = self.expected_tx_idx.next();
+        self.expected_tx_idx = self.expected_tx_idx.next()?;
         Ok(())
     }
 

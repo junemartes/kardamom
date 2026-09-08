@@ -41,6 +41,30 @@ fn transfers_byte_identical_across_worker_counts() {
     }
 }
 
+/// Regression: 5 transactions over 4 workers, the exact case that
+/// crashed `Chunk::validate` (the last lane's `base` landed past its
+/// `end` because 5 does not divide evenly by 4, and a bare subtraction
+/// panicked instead of yielding a zero-width chunk).
+#[test]
+fn uneven_chunk_width_five_txs_four_workers() {
+    let sg = signers(5);
+    let database = db(&sg);
+    let recs = records(counter_block(&sg, 0));
+    assert_eq!(
+        recs.len(),
+        5,
+        "this regression needs exactly 5 transactions"
+    );
+    let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
+    let out = execute_block_stm(&database, None, env(), &recs, &Stats::default(), nz(4)).unwrap();
+    assert_identical(
+        &seq,
+        &out.receipts,
+        &out.delta,
+        "uneven chunk width n_res=5 workers=4",
+    );
+}
+
 /// Regression for the defect where `predict_us` and `commit_fold_us`
 /// always reported zero: the `Metrics` atomics behind them were never
 /// written. `push_tx` now times the decode and predict phases directly,
@@ -162,9 +186,7 @@ fn wrongly_trained_stats_still_produce_identical_bytes() {
     let mut fallbacks = 0;
     for rep in 0..25 {
         let out = execute_block_stm(&database, None, env(), &recs, &lying_stats, nz(4)).unwrap();
-        if out.fallback {
-            fallbacks += 1;
-        }
+        fallbacks += i32::from(out.fallback);
         assert_identical(
             &seq,
             &out.receipts,

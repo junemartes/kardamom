@@ -31,15 +31,21 @@ use kardamom_exec_core::delta::{AccountFields, WriteSet};
 ///   per entry:   [32] hash, var len, [len] bytes
 /// ```
 fn varint(h: &mut Keccak256, mut v: u64) {
-    loop {
-        let b = (v & 0x7f) as u8;
+    while v >= 0x80 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "`& 0x7f` masks to 7 bits: fits u8"
+        )]
+        h.update([(v & 0x7f) as u8 | 0x80]);
         v >>= 7;
-        if v == 0 {
-            h.update([b]);
-            return;
-        }
-        h.update([b | 0x80]);
     }
+    // `v < 0x80` here (the loop above exits only then), so this mirrors
+    // the masked cast above rather than needing another allow.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "`& 0x7f` masks to 7 bits: fits u8"
+    )]
+    h.update([(v & 0x7f) as u8]);
 }
 
 /// Minimal big-endian bytes (zero encodes as nothing).
@@ -49,47 +55,74 @@ fn minimal(v: &U256) -> Vec<u8> {
     be[lead..].to_vec()
 }
 
+/// One account entry, independent of [`WriteSet::encode`]'s own
+/// `put_account_entry`: address, flags (balance length and code tag),
+/// varint nonce, minimal-width balance, and the code hash only when the
+/// tag calls for it.
+fn hash_account_entry(
+    h: &mut Keccak256,
+    addr: &Address,
+    fields: &AccountFields,
+    keccak_empty: B256,
+) {
+    let bal = minimal(&fields.balance);
+    let tag: u8 = if fields.code_hash == keccak_empty {
+        0
+    } else if fields.code_hash.is_zero() {
+        1
+    } else {
+        2
+    };
+    h.update(addr.as_slice());
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "minimal() returns a length in 0..=32: fits u8"
+    )]
+    h.update([bal.len() as u8 | (tag << 6)]);
+    varint(h, fields.nonce);
+    h.update(&bal);
+    if tag == 2 {
+        h.update(fields.code_hash.as_slice());
+    }
+}
+
+/// One storage entry, independent of [`WriteSet::encode`]'s own
+/// `put_storage_entry`: flags (value length and an address-repeat bit),
+/// the address only when it differs from the previous entry's, the key,
+/// and the minimal-width value.
+fn hash_storage_entry(
+    h: &mut Keccak256,
+    addr: &Address,
+    prev: Option<Address>,
+    key: B256,
+    value: &U256,
+) {
+    let val = minimal(value);
+    let same = prev == Some(*addr);
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "minimal() returns a length in 0..=32: fits u8"
+    )]
+    h.update([val.len() as u8 | (u8::from(same) << 6)]);
+    if !same {
+        h.update(addr.as_slice());
+    }
+    h.update(key.as_slice());
+    h.update(&val);
+}
+
 fn expected(ws: &WriteSet) -> B256 {
     let keccak_empty = alloy_primitives::keccak256([]);
     let mut h = Keccak256::new();
     h.update([0x02u8]);
     varint(&mut h, ws.accounts.len() as u64);
     for (addr, fields) in &ws.accounts {
-        let bal = minimal(&fields.balance);
-        let tag: u8 = if fields.code_hash == keccak_empty {
-            0
-        } else if fields.code_hash.is_zero() {
-            1
-        } else {
-            2
-        };
-        h.update(addr.as_slice());
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "minimal() returns a length in 0..=32: fits u8"
-        )]
-        h.update([bal.len() as u8 | (tag << 6)]);
-        varint(&mut h, fields.nonce);
-        h.update(&bal);
-        if tag == 2 {
-            h.update(fields.code_hash.as_slice());
-        }
+        hash_account_entry(&mut h, addr, fields, keccak_empty);
     }
     varint(&mut h, ws.storage.len() as u64);
     let mut prev: Option<Address> = None;
     for ((addr, key), value) in &ws.storage {
-        let val = minimal(value);
-        let same = prev == Some(*addr);
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "minimal() returns a length in 0..=32: fits u8"
-        )]
-        h.update([val.len() as u8 | (u8::from(same) << 6)]);
-        if !same {
-            h.update(addr.as_slice());
-        }
-        h.update(key.as_slice());
-        h.update(&val);
+        hash_storage_entry(&mut h, addr, prev, *key, value);
         prev = Some(*addr);
     }
     varint(&mut h, ws.code.len() as u64);
@@ -172,17 +205,23 @@ fn code_carrying_write_set_takes_the_fallback_and_still_matches() {
 #[test]
 fn matches_across_the_inline_boundary() {
     for count in 0..12u8 {
-        let mut ws = WriteSet::default();
-        for i in 0..count {
-            account(&mut ws, i, u64::from(i), u64::from(i) * 13);
-        }
-        ws.finish();
-        assert_eq!(
-            ws.hash(),
-            expected(&ws),
-            "write set with {count} accounts diverged"
-        );
+        check_account_count(count);
     }
+}
+
+/// Build a write set with `count` accounts and check its hash against
+/// the independent oracle.
+fn check_account_count(count: u8) {
+    let mut ws = WriteSet::default();
+    for i in 0..count {
+        account(&mut ws, i, u64::from(i), u64::from(i) * 13);
+    }
+    ws.finish();
+    assert_eq!(
+        ws.hash(),
+        expected(&ws),
+        "write set with {count} accounts diverged"
+    );
 }
 
 /// Sanity check: the hash actually distinguishes different content. A

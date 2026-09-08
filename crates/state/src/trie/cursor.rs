@@ -102,15 +102,8 @@ pub(crate) fn encode_account_leaf(p: &AccountTrieParts) -> [u8; 104] {
 /// this prefix".
 fn padded_key(prefix: &Nibbles) -> [u8; 32] {
     let mut out = [0u8; 32];
-    for (i, n) in prefix.to_vec().into_iter().enumerate() {
-        if i >= 64 {
-            break;
-        }
-        if i % 2 == 0 {
-            out[i / 2] |= n << 4;
-        } else {
-            out[i / 2] |= n;
-        }
+    for (i, pair) in prefix.to_vec().chunks(2).take(32).enumerate() {
+        out[i] = (pair[0] << 4) | pair.get(1).copied().unwrap_or(0);
     }
     out
 }
@@ -133,17 +126,31 @@ pub(crate) fn collect_hashed_accounts_under<K: ReadKind>(
     let mut cur = tx.cursor(db)?;
     let mut item = cur.set_range::<Vec<u8>, Vec<u8>>(&start)?;
     while let Some((k, v)) = item {
-        if k.len() != 32 {
+        let Some(row) = account_row(&k, &v, prefix)? else {
             break;
-        }
-        let key = B256::from_slice(&k);
-        if !key_starts_with(&key, prefix) {
-            break;
-        }
-        out.push((key, decode_account_leaf(&v)?));
+        };
+        out.push(row);
         item = cur.next::<Vec<u8>, Vec<u8>>()?;
     }
     Ok(out)
+}
+
+/// One `hashed_accounts` cursor row, or `None` if `k` is not a 32-byte
+/// key under `prefix` — the point [`collect_hashed_accounts_under`]
+/// stops at.
+fn account_row(
+    k: &[u8],
+    v: &[u8],
+    prefix: &Nibbles,
+) -> Result<Option<(B256, AccountTrieParts)>, StateError> {
+    if k.len() != 32 {
+        return Ok(None);
+    }
+    let key = B256::from_slice(k);
+    if !key_starts_with(&key, prefix) {
+        return Ok(None);
+    }
+    Ok(Some((key, decode_account_leaf(v)?)))
 }
 
 /// Collect `(keccak(slot), value)` for one account's hashed storage
@@ -162,22 +169,37 @@ pub(crate) fn collect_hashed_storage_under<K: ReadKind>(
     let mut cur = tx.cursor(db)?;
     let mut item = cur.set_range::<Vec<u8>, Vec<u8>>(&start)?;
     while let Some((k, v)) = item {
-        if k.len() != 64 || &k[0..32] != account_hash.as_slice() {
+        let Some(row) = storage_row(&k, &v, account_hash, prefix)? else {
             break;
-        }
-        let slot_hash = B256::from_slice(&k[32..64]);
-        if !key_starts_with(&slot_hash, prefix) {
-            break;
-        }
-        if v.len() != 32 {
-            return Err(StateError::BadEncoding {
-                table: HASHED_STOR,
-                expected: 32,
-                got: v.len(),
-            });
-        }
-        out.push((slot_hash, U256::from_be_slice(&v)));
+        };
+        out.push(row);
         item = cur.next::<Vec<u8>, Vec<u8>>()?;
     }
     Ok(out)
+}
+
+/// One `hashed_storage` cursor row, or `None` if `k` is not a slot key
+/// for `account_hash` under `prefix` — the point
+/// [`collect_hashed_storage_under`] stops at.
+fn storage_row(
+    k: &[u8],
+    v: &[u8],
+    account_hash: &B256,
+    prefix: &Nibbles,
+) -> Result<Option<(B256, U256)>, StateError> {
+    if k.len() != 64 || &k[0..32] != account_hash.as_slice() {
+        return Ok(None);
+    }
+    let slot_hash = B256::from_slice(&k[32..64]);
+    if !key_starts_with(&slot_hash, prefix) {
+        return Ok(None);
+    }
+    if v.len() != 32 {
+        return Err(StateError::BadEncoding {
+            table: HASHED_STOR,
+            expected: 32,
+            got: v.len(),
+        });
+    }
+    Ok(Some((slot_hash, U256::from_be_slice(v))))
 }

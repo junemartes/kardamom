@@ -12,6 +12,7 @@ use alloy_primitives::{Address, B256, TxKind, U256, keccak256};
 use common::*;
 use kardamom_exec_core::delta::PendingDelta;
 use kardamom_exec_core::exec_types::TxIndex;
+use kardamom_exec_core::state::MockStateDatabase;
 use kardamom_footprint::classifier::Stats;
 use kardamom_footprint::{Cell, TxObs};
 use kardamom_stm::execute::{execute_block_sequential, execute_block_stm};
@@ -202,8 +203,21 @@ fn an_open_gate_never_declines() {
             ..Default::default()
         },
         |pool| {
-            let mut base = PendingDelta::new();
-            for round in 0..3 {
+            // Round 0 also checks against the sequential oracle; every
+            // later round only re-checks the gate stays open.
+            let out0 = pool
+                .run_block(
+                    vec![database.clone(); 4],
+                    PendingDelta::new(),
+                    env(),
+                    &block,
+                    &Stats::default(),
+                )
+                .expect("block");
+            assert!(!out0.declined, "round 0 declined with the gate open");
+            assert_identical(&seq, &out0.receipts, &out0.delta, "open gate");
+            let mut base = out0.delta.clone();
+            for round in 1..3 {
                 let out = pool
                     .run_block(
                         vec![database.clone(); 4],
@@ -214,12 +228,85 @@ fn an_open_gate_never_declines() {
                     )
                     .expect("block");
                 assert!(!out.declined, "round {round} declined with the gate open");
-                if round == 0 {
-                    assert_identical(&seq, &out.receipts, &out.delta, "open gate");
-                }
                 base = out.delta.clone();
             }
         },
+    );
+}
+
+/// One `hot_chain_streams_through_the_fifo` attempt at `workers`.
+/// Asserts correctness (no wound, one hot domain, byte-identical),
+/// unconditionally; returns whether this attempt also hit the eager
+/// streaming shape (fifo-covered, few edges), which only some attempts
+/// reach when the host descheduled the feed thread.
+///
+/// This test pins the FIFO scheduler's mechanics (eager coverage,
+/// single-worker domains). The bag scheduler has neither; it is pinned
+/// by `bag_hot_chain_byte_identical`.
+fn eager_chain_shape_once(
+    workers: usize,
+    database: &MockStateDatabase,
+    recs: &[(TxIndex, BPosition, TxEnvelope)],
+    seq: &(Vec<kardamom_types::Receipt>, PendingDelta),
+    stats: &Stats,
+) -> bool {
+    let out = kardamom_stm::execute::with_pool(
+        kardamom_stm::execute::PoolConfig {
+            workers: nz(workers),
+            scheduler: kardamom_stm::execute::Scheduler::Fifo(
+                kardamom_stm::execute::FifoOptions::default(),
+            ),
+            ..Default::default()
+        },
+        |pool| {
+            pool.run_block(
+                vec![database.clone(); workers],
+                PendingDelta::new(),
+                env(),
+                recs,
+                stats,
+            )
+            .unwrap()
+        },
+    );
+    assert_eq!(out.wounds, 0, "an ordered chain must never wound");
+    assert_eq!(
+        out.dispatch.iter().filter(|c| **c > 0).count(),
+        1,
+        "one hot domain must land on one worker: {:?}",
+        out.dispatch
+    );
+    assert_identical(
+        seq,
+        &out.receipts,
+        &out.delta,
+        &format!("eager chain w={workers}"),
+    );
+    // The point of eager mode: links seen pending on the same worker
+    // are FIFO-covered, not edged. That is 23 counter links plus
+    // sender links, minus whatever completed at admission.
+    out.fifo_covered >= 20 && out.edges <= 4
+}
+
+/// The classification asserts inside [`eager_chain_shape_once`] need
+/// the streaming shape: the feed admits links while their predecessors
+/// are still queued. Workers legitimately outrun the feed when the
+/// host deschedules the feed thread. Predecessors then complete before
+/// admission (the engine's "p already finished and published, no edge
+/// needed" path), and both counters degrade with no engine fault.
+/// Correctness is asserted on every attempt; the streaming shape is
+/// asserted on at least one of 20.
+fn check_eager_chain(
+    workers: usize,
+    database: &MockStateDatabase,
+    recs: &[(TxIndex, BPosition, TxEnvelope)],
+    seq: &(Vec<kardamom_types::Receipt>, PendingDelta),
+    stats: &Stats,
+) {
+    let shaped = (0..20).any(|_| eager_chain_shape_once(workers, database, recs, seq, stats));
+    assert!(
+        shaped,
+        "20 attempts, workers outran the feed every time (w={workers})"
     );
 }
 
@@ -229,7 +316,6 @@ fn an_open_gate_never_declines() {
 /// ordering mistake visible in state, since the final count and every
 /// intermediate receipt depend on execution order, so this cannot pass
 /// by luck.
-
 #[test]
 fn hot_chain_streams_through_the_fifo() {
     let sg = signers(3);
@@ -240,64 +326,7 @@ fn hot_chain_streams_through_the_fifo() {
     let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
     let stats = counter_stats();
     for workers in [1, 4] {
-        // The classification asserts below need the streaming shape: the
-        // feed admits links while their predecessors are still queued.
-        // Workers legitimately outrun the feed when the host deschedules
-        // the feed thread. Predecessors then complete before admission
-        // (the engine's "p already finished and published, no edge
-        // needed" path), and both counters degrade with no engine fault.
-        // Correctness is asserted on every attempt; the streaming shape
-        // is asserted on at least one.
-        let mut shaped = false;
-        for _attempt in 0..20 {
-            // This test pins the FIFO scheduler's mechanics (eager
-            // coverage, single-worker domains). The bag scheduler has
-            // neither; it is pinned by `bag_hot_chain_byte_identical`.
-            let out = kardamom_stm::execute::with_pool(
-                kardamom_stm::execute::PoolConfig {
-                    workers: nz(workers),
-                    scheduler: kardamom_stm::execute::Scheduler::Fifo(
-                        kardamom_stm::execute::FifoOptions::default(),
-                    ),
-                    ..Default::default()
-                },
-                |pool| {
-                    pool.run_block(
-                        vec![database.clone(); workers],
-                        PendingDelta::new(),
-                        env(),
-                        &recs,
-                        &stats,
-                    )
-                    .unwrap()
-                },
-            );
-            assert_eq!(out.wounds, 0, "an ordered chain must never wound");
-            assert_eq!(
-                out.dispatch.iter().filter(|c| **c > 0).count(),
-                1,
-                "one hot domain must land on one worker: {:?}",
-                out.dispatch
-            );
-            assert_identical(
-                &seq,
-                &out.receipts,
-                &out.delta,
-                &format!("eager chain w={workers}"),
-            );
-            // The point of eager mode: links seen pending on the same
-            // worker are FIFO-covered, not edged. That is 23 counter
-            // links plus sender links, minus whatever completed at
-            // admission.
-            if out.fifo_covered >= 20 && out.edges <= 4 {
-                shaped = true;
-                break;
-            }
-        }
-        assert!(
-            shaped,
-            "20 attempts, workers outran the feed every time (w={workers})"
-        );
+        check_eager_chain(workers, &database, &recs, &seq, &stats);
     }
     let key = (COUNTER, B256::ZERO);
     assert_eq!(seq.1.storage.get(&key), Some(&U256::from(24u64)));
@@ -412,18 +441,15 @@ fn bag_hot_chain_byte_identical() {
     let recs = records(counter_chain(&sg, 8));
     let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
     let stats = counter_stats();
-    for workers in [1, 2, 4] {
-        for rep in 0..5 {
-            let out =
-                execute_block_stm(&database, None, env(), &recs, &stats, nz(workers)).unwrap();
-            assert_eq!(out.wounds, 0, "an ordered chain must never wound (bag)");
-            assert_identical(
-                &seq,
-                &out.receipts,
-                &out.delta,
-                &format!("bag hot chain w={workers} rep={rep}"),
-            );
-        }
+    for (workers, rep) in shard_worker_pairs([1, 2, 4], [0, 1, 2, 3, 4]) {
+        let out = execute_block_stm(&database, None, env(), &recs, &stats, nz(workers)).unwrap();
+        assert_eq!(out.wounds, 0, "an ordered chain must never wound (bag)");
+        assert_identical(
+            &seq,
+            &out.receipts,
+            &out.delta,
+            &format!("bag hot chain w={workers} rep={rep}"),
+        );
     }
     let key = (COUNTER, B256::ZERO);
     assert_eq!(seq.1.storage.get(&key), Some(&U256::from(24u64)));

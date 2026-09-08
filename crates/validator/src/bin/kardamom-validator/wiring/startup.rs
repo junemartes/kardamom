@@ -172,7 +172,8 @@ impl Opened {
     /// The cluster-session guard (`LiveCluster`) and its dedicated Aeron
     /// runtime must outlive the validator loop; both are carried forward
     /// as fields so they drop only at [`run::Ready::run`]'s shutdown, in
-    /// the order [`super::run::stop_streams`] documents. Fresh validators
+    /// the order [`kardamom_engine::bin_support::EngineShutdown::wait`]
+    /// documents. Fresh validators
     /// start at genesis and receive the full retained canonical stream.
     /// The replay request is re-sent on every session start, so a
     /// validator whose session dies mid-chaos catches back up instead of
@@ -185,27 +186,26 @@ impl Opened {
     /// naming the next block would overflow).
     pub(crate) fn open_streams(self) -> Result<Streamed> {
         let args = &self.base.args;
-        let tx_data_subs =
-            bin_support::open_tx_data_subs(&self.base.rt, &self.base.channels, args.shards)?;
-        let join_recovery = bin_support::archive_join_recovery(
-            &self.base.channels,
-            &self.base.aeron_cfg,
-            args.aeron_dir.as_deref(),
-            args.archive_control_response_endpoint.as_deref(),
-            args.replay_destination_endpoint.as_deref(),
-        );
-
-        let (cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
-            args.aeron_dir.as_deref(),
-            self.base.file_cfg.cluster.to_live(),
-            bin_support::cluster_replay_cursor(&self.state.start),
-        )?;
-        tracing::info!("kardamom-validator: tx_ordering via Aeron Cluster");
         // The kardamom_sealer_* re-export is the executor's job. A
         // validator emitting a second, lagging copy of the series would
         // break sum()-style queries and contradict the documented
-        // observation point.
-        let tx_ordering_sub = cluster_sub.suppress_sealer_metrics();
+        // observation point, so `open_inbound` suppresses it here.
+        let (inbound, cluster_guard) =
+            bin_support::open_inbound::<super::run::ValidatorWiring>(bin_support::InboundConfig {
+                rt: &self.base.rt,
+                channels: &self.base.channels,
+                aeron_cfg: &self.base.aeron_cfg,
+                shards: args.shards,
+                aeron_dir: args.aeron_dir.as_deref(),
+                archive_control_response_endpoint: args
+                    .archive_control_response_endpoint
+                    .as_deref(),
+                replay_destination_endpoint: args.replay_destination_endpoint.as_deref(),
+                cluster_cfg: self.base.file_cfg.cluster.to_live(),
+                cursor: bin_support::cluster_replay_cursor(&self.state.start),
+                bin_name: "kardamom-validator",
+                suppress_sealer_metrics: true,
+            })?;
 
         // --- Verification streams: tx_bal (BAL) and tx_receipts. ---
         let divergence = Divergence::new();
@@ -234,10 +234,8 @@ impl Opened {
         Ok(Streamed {
             opened: self,
             streams: StreamsState {
-                tx_data_subs,
-                join_recovery,
+                inbound,
                 cluster_guard,
-                tx_ordering_sub,
                 divergence,
                 bals,
                 claims,
@@ -289,10 +287,8 @@ impl Opened {
 /// verification and interop buffers they feed. Everything
 /// [`Opened::open_streams`] adds.
 pub(crate) struct StreamsState {
-    pub(super) tx_data_subs: Vec<bin_support::LiveTxDataSub>,
-    pub(super) join_recovery: Option<kardamom_engine::reader::JoinRecoveryFactory>,
+    pub(super) inbound: kardamom_engine::Inbound<super::run::ValidatorWiring>,
     pub(super) cluster_guard: LiveCluster,
-    pub(super) tx_ordering_sub: bin_support::LiveTxOrderingSub,
     pub(super) divergence: Arc<Divergence>,
     pub(super) bals: Arc<BalBuffer>,
     pub(super) claims: Arc<ClaimBuffer>,

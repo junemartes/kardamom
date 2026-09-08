@@ -324,18 +324,19 @@ async fn genuine_rejection_from_both_replicas_reaches_the_client_once() {
     let _rx1 = partition_rx.remove(0);
     let h = tokio::spawn(async move {
         let mut rx0 = rx0;
-        if let Some(envelope) = rx0.recv().await {
-            let nonce = nonce_of(&envelope.raw_tx);
-            // Both replicas reject. The copies can disagree on expected_nonce.
-            for expected in [7u64, 8u64] {
-                let _ = error_bus.send(kardamom_types::TxError {
-                    sender: envelope.sender,
-                    nonce,
-                    reason: kardamom_types::TxErrorReason::DuplicatedTx {
-                        expected_nonce: expected,
-                    },
-                });
-            }
+        let Some(envelope) = rx0.recv().await else {
+            return;
+        };
+        let nonce = nonce_of(&envelope.raw_tx);
+        // Both replicas reject. The copies can disagree on expected_nonce.
+        for expected in [7u64, 8u64] {
+            let _ = error_bus.send(kardamom_types::TxError {
+                sender: envelope.sender,
+                nonce,
+                reason: kardamom_types::TxErrorReason::DuplicatedTx {
+                    expected_nonce: expected,
+                },
+            });
         }
     });
 

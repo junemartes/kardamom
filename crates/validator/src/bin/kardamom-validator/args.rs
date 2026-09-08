@@ -12,6 +12,7 @@ use kardamom_engine::reader::cluster::ClusterConfig;
 use kardamom_validator::interop::{
     DEFAULT_FEED_MAX_SUBSCRIPTIONS, DEFAULT_FEED_MAX_SUBSCRIPTIONS_PER_DEST, RetentionBlocks,
 };
+use kardamom_validator::parallel::BatchSize;
 
 /// Default `--shards`.
 const DEFAULT_SHARDS: NonZeroU8 = NonZeroU8::new(8).expect("compile-time constant");
@@ -19,8 +20,8 @@ const DEFAULT_SHARDS: NonZeroU8 = NonZeroU8::new(8).expect("compile-time constan
 /// sentinel — see the field's doc.
 const DEFAULT_CHAIN_ID: NonZeroU64 = NonZeroU64::new(1).expect("compile-time constant");
 /// Default `--validation-batch-size`.
-const DEFAULT_VALIDATION_BATCH_SIZE: NonZeroUsize =
-    NonZeroUsize::new(8).expect("compile-time constant");
+const DEFAULT_VALIDATION_BATCH_SIZE: BatchSize =
+    BatchSize::new(NonZeroUsize::new(8).expect("compile-time constant"));
 /// Default `--attester-post-interval`.
 const DEFAULT_ATTESTER_POST_INTERVAL: PostInterval =
     PostInterval::new(NonZeroU64::new(1).expect("compile-time constant"));
@@ -166,7 +167,7 @@ pub(crate) struct Args {
     /// default), batches are chunk-aligned to the frame's K, and the
     /// worker count below is the real parallelism control.
     #[arg(long, env = "KARDAMOM_VALIDATION_BATCH_SIZE", default_value_t = DEFAULT_VALIDATION_BATCH_SIZE)]
-    pub(crate) validation_batch_size: NonZeroUsize,
+    pub(crate) validation_batch_size: BatchSize,
     /// Worker threads in the parallel-validation pool. 0 means auto
     /// (`min(available_parallelism, 8)`). Hard-capped at 40, since the
     /// mdbx reader-slot budget (`MAX_READERS = 64`) reserves the rest for
@@ -313,12 +314,8 @@ impl FromStr for WorkerCount {
     type Err = std::num::ParseIntError;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.parse::<usize>()? {
-            0 => Ok(Self::Auto),
-            n => Ok(Self::Fixed(
-                NonZeroUsize::new(n).expect("n != 0, matched above"),
-            )),
-        }
+        let n: usize = s.parse()?;
+        Ok(NonZeroUsize::new(n).map_or(Self::Auto, Self::Fixed))
     }
 }
 

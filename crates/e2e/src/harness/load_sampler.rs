@@ -25,6 +25,10 @@ impl LoadSampler {
                     return;
                 };
                 while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Best-effort diagnostics only: a read or clock
+                    // failure here writes a blank/zero field, not a
+                    // stopped sampler. Nothing downstream reads this file
+                    // for a pass/fail decision.
                     let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
                     let epoch_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

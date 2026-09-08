@@ -71,9 +71,28 @@ pub(super) fn to_aligned(bytes: &[u8]) -> AlignedVec {
 }
 
 pub(super) fn now_ms() -> u64 {
+    // `map_or(0, ..)` is a deliberate, not a masked, default: a clock set
+    // before 1970 (`duration_since` failing) reports as epoch, a valid
+    // timestamp, rather than panicking. `duration_to_ms_saturating`
+    // handles the (unreachable in practice) far end.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .map_or(0, kardamom_types::time::duration_to_ms_saturating)
+}
+
+/// `now` (milliseconds since the Unix epoch) as an `i64`, saturated to
+/// `i64::MAX`. `wrap_app` takes a signed timestamp; `now` could not reach
+/// `i64::MAX` milliseconds for hundreds of millions of years, so the
+/// clamp is unreachable in practice, but keeps this infallible rather
+/// than panicking.
+pub(super) fn now_ms_i64(now: u64) -> i64 {
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "now is clamped to i64::MAX by the .min() below"
+    )]
+    {
+        now.min(i64::MAX.unsigned_abs()) as i64
+    }
 }
 
 #[cfg(test)]

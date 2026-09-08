@@ -178,7 +178,7 @@ fn spool_and_guest_reverify(
         &guest_records,
         genv,
         &expected_bal,
-        std::num::NonZeroU16::new(input.granularity).expect("granularity must be nonzero"),
+        input.granularity,
     )
     .expect("guest-shape re-verification");
     assert_eq!(anchored.pre_state_root, outputs.pre_state_root);

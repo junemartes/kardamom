@@ -238,59 +238,6 @@ impl FrameWriter {
 /// `input_len`(4) + callback flag(1).
 const MIN_XCHAIN_MSG_BYTES: NonZeroUsize = NonZeroUsize::new(109).unwrap();
 
-fn decode_remote_epoch(r: &mut Reader<'_>) -> Result<RemoteEpochRecord, BatcherError> {
-    let origin_chain_id = r.read_u64_le()?;
-    let anchor_number = r.read_u64_le()?;
-    let anchor_hash = B256::from_slice(r.read_bytes(32)?);
-    let first_seq = r.read_u64_le()?;
-    let msg_count = r.read_u32_le()?;
-    let mut messages = Vec::with_capacity(r.capacity_hint(msg_count, MIN_XCHAIN_MSG_BYTES));
-    for _ in 0..msg_count {
-        let source_hash = B256::from_slice(r.read_bytes(32)?);
-        let seq = r.read_u64_le()?;
-        let origin_sender = Address::from_slice(r.read_bytes(20)?);
-        let target = Address::from_slice(r.read_bytes(20)?);
-        let value = r.read_u128_le()?;
-        let gas_limit = r.read_u64_le()?;
-        let input_len = r.read_u32_le()?;
-        let input = Bytes::copy_from_slice(r.read_bytes(input_len as usize)?);
-        let callback = match r.read_u8()? {
-            0 => None,
-            1 => Some(Callback {
-                target: Address::from_slice(r.read_bytes(20)?),
-                gas_limit: r.read_u64_le()?,
-                context: B256::from_slice(r.read_bytes(32)?),
-            }),
-            other => {
-                return Err(BatcherError::Frame(format!(
-                    "invalid callback flag: {other}"
-                )));
-            }
-        };
-        messages.push(XChainMessage {
-            source_hash,
-            seq,
-            origin_sender,
-            target,
-            value,
-            gas_limit,
-            input,
-            callback,
-        });
-    }
-    let mut messages = messages.into_iter();
-    let first = messages
-        .next()
-        .ok_or_else(|| BatcherError::Frame("remote epoch record carries no messages".into()))?;
-    Ok(RemoteEpochRecord {
-        origin_chain_id,
-        anchor_number,
-        anchor_hash,
-        first_seq,
-        messages: NonEmptyVec::new(first, messages.collect()),
-    })
-}
-
 /// Min `BlockFrame` size: `block_number`(8) + `l2_timestamp`(8) +
 /// `remote_epoch_count`(4) + `tx_count`(4).
 const MIN_BLOCK_FRAME_BYTES: NonZeroUsize = NonZeroUsize::new(24).unwrap();
@@ -326,59 +273,11 @@ pub fn decode(bytes: &[u8]) -> Result<Kar1Payload, BatcherError> {
     let blocks = (0..block_count).try_fold(
         Vec::with_capacity(r.capacity_hint(block_count, MIN_BLOCK_FRAME_BYTES)),
         |mut acc, _| -> Result<_, BatcherError> {
-            acc.push(decode_block_frame(&mut r)?);
+            acc.push(r.decode_block_frame()?);
             Ok(acc)
         },
     )?;
     Ok(Kar1Payload { blocks, compressed })
-}
-
-/// Decode one [`BlockFrame`]: its header, then its remote-epoch and tx
-/// sections. Its own function so [`decode`]'s block loop does not nest a
-/// loop inside a loop.
-fn decode_block_frame(r: &mut Reader<'_>) -> Result<BlockFrame, BatcherError> {
-    let block_number = r.read_u64_le()?;
-    let l2_timestamp = r.read_u64_le()?;
-    let remote_epoch_count = r.read_u32_le()?;
-    let remote_epochs = (0..remote_epoch_count).try_fold(
-        Vec::with_capacity(r.capacity_hint(remote_epoch_count, MIN_REMOTE_EPOCH_RECORD_BYTES)),
-        |mut acc, _| -> Result<_, BatcherError> {
-            acc.push(decode_remote_epoch(r)?);
-            Ok(acc)
-        },
-    )?;
-    let tx_count = r.read_u32_le()?;
-    let txs = (0..tx_count).try_fold(
-        Vec::with_capacity(r.capacity_hint(tx_count, MIN_TX_FRAME_BYTES)),
-        |mut acc, _| -> Result<_, BatcherError> {
-            acc.push(decode_tx_frame(r)?);
-            Ok(acc)
-        },
-    )?;
-    Ok(BlockFrame {
-        block_number,
-        l2_timestamp,
-        remote_epochs,
-        txs,
-    })
-}
-
-/// Decode one [`TxFrame`]. Its own function so [`decode_block_frame`]'s tx
-/// loop does not nest a loop inside a loop.
-fn decode_tx_frame(r: &mut Reader<'_>) -> Result<TxFrame, BatcherError> {
-    let correlation_id = r.read_u64_le()?;
-    let sender_bytes = r.read_bytes(20)?;
-    let sender = Address::from_slice(sender_bytes);
-    let hash_bytes = r.read_bytes(32)?;
-    let tx_hash = B256::from_slice(hash_bytes);
-    let raw_tx_len = r.read_u32_le()?;
-    let raw_tx_bytes = r.read_bytes(raw_tx_len as usize)?;
-    Ok(TxFrame {
-        correlation_id,
-        sender,
-        tx_hash,
-        raw_tx: Bytes::copy_from_slice(raw_tx_bytes),
-    })
 }
 
 /// Holds only the unread remainder of the buffer, so no position field
@@ -408,25 +307,137 @@ impl<'a> Reader<'a> {
         self.buf = rest;
         Ok(s)
     }
+    /// Read exactly `N` bytes as an array. `split_first_chunk` proves the
+    /// length at the type level, so there is no fallible conversion after
+    /// the short-read check.
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N], BatcherError> {
+        let (chunk, rest) = self.buf.split_first_chunk::<N>().ok_or_else(|| {
+            BatcherError::Frame(format!("short read: want {N}, have {}", self.buf.len()))
+        })?;
+        self.buf = rest;
+        Ok(*chunk)
+    }
     fn read_u8(&mut self) -> Result<u8, BatcherError> {
-        Ok(self.read_bytes(1)?[0])
+        Ok(self.read_array::<1>()?[0])
     }
     fn read_u16_le(&mut self) -> Result<u16, BatcherError> {
-        let b = self.read_bytes(2)?;
-        Ok(u16::from_le_bytes([b[0], b[1]]))
+        Ok(u16::from_le_bytes(self.read_array()?))
     }
     fn read_u32_le(&mut self) -> Result<u32, BatcherError> {
-        let b = self.read_bytes(4)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        Ok(u32::from_le_bytes(self.read_array()?))
     }
     fn read_u64_le(&mut self) -> Result<u64, BatcherError> {
-        let b = self.read_bytes(8)?;
-        Ok(u64::from_le_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
+        Ok(u64::from_le_bytes(self.read_array()?))
     }
     fn read_u128_le(&mut self) -> Result<u128, BatcherError> {
-        let b = self.read_bytes(16)?;
-        Ok(u128::from_le_bytes(b.try_into().expect("16 bytes")))
+        Ok(u128::from_le_bytes(self.read_array()?))
+    }
+
+    /// Decode one [`BlockFrame`]: its header, then its remote-epoch and
+    /// tx sections. Its own method so [`decode`]'s block loop does not
+    /// nest a loop inside a loop.
+    fn decode_block_frame(&mut self) -> Result<BlockFrame, BatcherError> {
+        let block_number = self.read_u64_le()?;
+        let l2_timestamp = self.read_u64_le()?;
+        let remote_epoch_count = self.read_u32_le()?;
+        let remote_epochs = (0..remote_epoch_count).try_fold(
+            Vec::with_capacity(
+                self.capacity_hint(remote_epoch_count, MIN_REMOTE_EPOCH_RECORD_BYTES),
+            ),
+            |mut acc, _| -> Result<_, BatcherError> {
+                acc.push(self.decode_remote_epoch()?);
+                Ok(acc)
+            },
+        )?;
+        let tx_count = self.read_u32_le()?;
+        let txs = (0..tx_count).try_fold(
+            Vec::with_capacity(self.capacity_hint(tx_count, MIN_TX_FRAME_BYTES)),
+            |mut acc, _| -> Result<_, BatcherError> {
+                acc.push(self.decode_tx_frame()?);
+                Ok(acc)
+            },
+        )?;
+        Ok(BlockFrame {
+            block_number,
+            l2_timestamp,
+            remote_epochs,
+            txs,
+        })
+    }
+
+    /// Decode one [`TxFrame`]. Its own method so [`Self::decode_block_
+    /// frame`]'s tx loop does not nest a loop inside a loop.
+    fn decode_tx_frame(&mut self) -> Result<TxFrame, BatcherError> {
+        let correlation_id = self.read_u64_le()?;
+        let sender = Address::from_slice(self.read_bytes(20)?);
+        let tx_hash = B256::from_slice(self.read_bytes(32)?);
+        let raw_tx_len = self.read_u32_le()?;
+        let raw_tx_bytes = self.read_bytes(raw_tx_len as usize)?;
+        Ok(TxFrame {
+            correlation_id,
+            sender,
+            tx_hash,
+            raw_tx: Bytes::copy_from_slice(raw_tx_bytes),
+        })
+    }
+
+    /// Decode one [`RemoteEpochRecord`]: its header, then its (non-empty)
+    /// messages.
+    fn decode_remote_epoch(&mut self) -> Result<RemoteEpochRecord, BatcherError> {
+        let origin_chain_id = self.read_u64_le()?;
+        let anchor_number = self.read_u64_le()?;
+        let anchor_hash = B256::from_slice(self.read_bytes(32)?);
+        let first_seq = self.read_u64_le()?;
+        let msg_count = self.read_u32_le()?;
+        let mut messages = Vec::with_capacity(self.capacity_hint(msg_count, MIN_XCHAIN_MSG_BYTES));
+        for _ in 0..msg_count {
+            messages.push(self.decode_xchain_message()?);
+        }
+        let mut messages = messages.into_iter();
+        let first = messages
+            .next()
+            .ok_or_else(|| BatcherError::Frame("remote epoch record carries no messages".into()))?;
+        Ok(RemoteEpochRecord {
+            origin_chain_id,
+            anchor_number,
+            anchor_hash,
+            first_seq,
+            messages: NonEmptyVec::new(first, messages.collect()),
+        })
+    }
+
+    /// Decode one `XChainMessage`, including its optional callback tail.
+    fn decode_xchain_message(&mut self) -> Result<XChainMessage, BatcherError> {
+        let source_hash = B256::from_slice(self.read_bytes(32)?);
+        let seq = self.read_u64_le()?;
+        let origin_sender = Address::from_slice(self.read_bytes(20)?);
+        let target = Address::from_slice(self.read_bytes(20)?);
+        let value = self.read_u128_le()?;
+        let gas_limit = self.read_u64_le()?;
+        let input_len = self.read_u32_le()?;
+        let input = Bytes::copy_from_slice(self.read_bytes(input_len as usize)?);
+        let callback = match self.read_u8()? {
+            0 => None,
+            1 => Some(Callback {
+                target: Address::from_slice(self.read_bytes(20)?),
+                gas_limit: self.read_u64_le()?,
+                context: B256::from_slice(self.read_bytes(32)?),
+            }),
+            other => {
+                return Err(BatcherError::Frame(format!(
+                    "invalid callback flag: {other}"
+                )));
+            }
+        };
+        Ok(XChainMessage {
+            source_hash,
+            seq,
+            origin_sender,
+            target,
+            value,
+            gas_limit,
+            input,
+            callback,
+        })
     }
 }

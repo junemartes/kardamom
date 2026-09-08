@@ -7,27 +7,40 @@
 //! with a non-zero code on a failing verdict. See
 //! `kardamom_bench::load` for the algorithm.
 
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
 use alloy_primitives::{Address, U256};
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
 
-use kardamom_bench::load::{self, ANVIL_MNEMONIC, Completeness, LoadConfig};
+use kardamom_bench::load::{self, ANVIL_MNEMONIC, Completeness, LoadConfig, SenderRange};
+
+/// Default `--target-tps`.
+const DEFAULT_TARGET_TPS: NonZeroU32 = NonZeroU32::new(200).unwrap();
+/// Default `--senders`.
+const DEFAULT_SENDERS: NonZeroU32 = NonZeroU32::new(16).unwrap();
+/// Default `--max-in-flight`.
+const DEFAULT_MAX_IN_FLIGHT: NonZeroU32 = NonZeroU32::new(256).unwrap();
+/// Default `--ramp-step-secs`.
+const DEFAULT_RAMP_STEP_SECS: NonZeroU64 = NonZeroU64::new(15).unwrap();
 
 #[derive(Parser, Debug)]
 #[command(
     name = "kardamom-load",
     about = "Sustained-load + chaos verification harness."
 )]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent CLI flag; grouping them would rename flags"
+)]
 struct Args {
     /// The ingress JSON-RPC URL.
     #[arg(long)]
     rpc: String,
 
-    /// The L2 chain ID. When omitted, the code probes it with eth_chainId.
+    /// The L2 chain ID. When omitted, the code probes it with `eth_chainId`.
     #[arg(long)]
     chain_id: Option<u64>,
 
@@ -36,13 +49,14 @@ struct Args {
     duration: Duration,
 
     /// The ramp ceiling in soak mode, or the fixed rate in chaos mode,
-    /// in tx/s.
-    #[arg(long, default_value_t = 200)]
-    target_tps: u32,
+    /// in tx/s. Non-zero: it is a `clamp` and a `while` ceiling below.
+    #[arg(long, default_value_t = DEFAULT_TARGET_TPS)]
+    target_tps: NonZeroU32,
 
-    /// The number of sender accounts.
-    #[arg(long, default_value_t = 16)]
-    senders: u32,
+    /// The number of sender accounts. Non-zero: `SignerSet::new`
+    /// rejects an empty derived-signer set.
+    #[arg(long, default_value_t = DEFAULT_SENDERS)]
+    senders: NonZeroU32,
 
     /// The first account index in the mnemonic table. This reserves
     /// the low accounts.
@@ -70,8 +84,8 @@ struct Args {
     gas_price: u128,
 
     /// The limit on outstanding submits. This bounds open-loop back pressure.
-    #[arg(long = "max-in-flight", default_value_t = 256)]
-    max_in_flight: u32,
+    #[arg(long = "max-in-flight", default_value_t = DEFAULT_MAX_IN_FLIGHT)]
+    max_in_flight: NonZeroU32,
 
     /// The maximum allowed gap between the sealer and executor block.
     #[arg(long = "max-gap", default_value_t = 5)]
@@ -81,40 +95,42 @@ struct Args {
     #[arg(long = "drain-timeout", value_parser = humantime::parse_duration, default_value = "90s")]
     drain_timeout: Duration,
 
-    /// The number of per-submit retry attempts on a transient failure.
-    /// Submit through kardamom_sendRawTransactionAsync and a WebSocket
-    /// receipt subscription, instead of the parked eth_sendRawTransaction.
+    /// Submit through `kardamom_sendRawTransactionAsync` and a
+    /// WebSocket receipt subscription, instead of the parked
+    /// `eth_sendRawTransaction`.
     #[arg(long, default_value_t = false)]
     subscribe: bool,
 
     /// In blocking mode, confirm receipts through the WebSocket feed
-    /// instead of a per-transaction eth_getTransactionReceipt re-fetch.
+    /// instead of a per-transaction `eth_getTransactionReceipt` re-fetch.
     /// This halves the HTTP request load.
     #[arg(long, default_value_t = false)]
     feed_confirm: bool,
-    /// The workload family: plain transfers, or the DeFi mix of a
+    /// The workload family: plain transfers, or the `DeFi` mix of a
     /// CLOB, a swap pool, and a vault, with gas-centric reporting.
     #[arg(long, default_value = "transfers", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<kardamom_bench::load::Workload>().map_err(|e| e.to_string())))]
     workload: kardamom_bench::load::Workload,
 
+    /// The number of per-submit retry attempts on a transient failure.
     #[arg(long = "retry-submit", default_value_t = 2)]
     retry_submit: u32,
 
-    /// The ramp increment for each step, in tx/s. 0 means target_tps / 8.
-    #[arg(long = "ramp-step-tps", default_value_t = 0)]
-    ramp_step_tps: u32,
+    /// The ramp increment for each step, in tx/s. Unset means auto:
+    /// `target_tps` / 8.
+    #[arg(long = "ramp-step-tps")]
+    ramp_step_tps: Option<NonZeroU32>,
 
     /// The number of seconds held at each ramp step.
-    #[arg(long = "ramp-step-secs", default_value_t = 15)]
-    ramp_step_secs: u64,
+    #[arg(long = "ramp-step-secs", default_value_t = DEFAULT_RAMP_STEP_SECS)]
+    ramp_step_secs: NonZeroU64,
 
     /// The fraction of the discovered maximum rate to soak at.
     #[arg(long = "soak-fraction", default_value_t = 0.8)]
     soak_fraction: f64,
 
     /// The completeness criterion: accepted or offered.
-    #[arg(long, default_value = "accepted")]
-    completeness: String,
+    #[arg(long, default_value = "accepted", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<Completeness>().map_err(|e| e.to_string())))]
+    completeness: Completeness,
 
     /// Fail the run unless the completeness criterion is met.
     #[arg(long = "assert-all-delivered", default_value_t = false)]
@@ -125,7 +141,7 @@ struct Args {
     #[arg(long = "chaos-mode", default_value_t = false)]
     chaos_mode: bool,
 
-    /// The fixed-rate framing: skip the ramp, and soak at target_tps
+    /// The fixed-rate framing: skip the ramp, and soak at `target_tps`
     /// with the strict verdict. Use this for CI invariant gating on a
     /// shared or weak host, where edge discovery measures the
     /// hypervisor rather than the stack.
@@ -177,25 +193,29 @@ fn csv(s: &str) -> Vec<String> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    kardamom_obs::bin::init_tracing();
 
     let args = Args::parse();
 
-    let completeness = match args.completeness.to_lowercase().as_str() {
-        "accepted" => Completeness::Accepted,
-        "offered" => Completeness::Offered,
-        other => anyhow::bail!("--completeness must be 'accepted' or 'offered', got '{other}'"),
-    };
     let to = Address::from_str(args.to.trim())
         .map_err(|e| anyhow::anyhow!("--to is not a valid address: {e}"))?;
-    let ramp_step_tps = if args.ramp_step_tps == 0 {
-        (args.target_tps / 8).max(1)
-    } else {
-        args.ramp_step_tps
+    // Unset `--ramp-step-tps` means "auto": target_tps / 8. Every
+    // downstream use reads the resulting `NonZeroU32`; a `--target-tps`
+    // too low for that to clear 0 is a config error, not a value to
+    // silently floor.
+    let ramp_step_tps = match args.ramp_step_tps {
+        Some(explicit) => explicit,
+        None => args
+            .target_tps
+            .get()
+            .checked_div(8)
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "auto --ramp-step-tps needs --target-tps >= 8; target_tps={} auto-computes to 0 — pass --ramp-step-tps explicitly",
+                    args.target_tps
+                )
+            })?,
     };
 
     let cfg = LoadConfig {
@@ -204,8 +224,7 @@ async fn main() -> anyhow::Result<()> {
         chain_id: args.chain_id,
         duration: args.duration,
         target_tps: args.target_tps,
-        senders: args.senders,
-        sender_offset: args.sender_offset,
+        sender_range: SenderRange::new(args.sender_offset, args.senders)?,
         nonce_start: args.nonce_start,
         mnemonic: args.mnemonic,
         to,
@@ -218,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
         ramp_step_tps,
         ramp_step_secs: args.ramp_step_secs,
         soak_fraction: args.soak_fraction,
-        completeness,
+        completeness: args.completeness,
         assert_all_delivered: args.assert_all_delivered,
         chaos_mode: args.chaos_mode,
         fixed_rate: args.fixed_rate,
@@ -237,4 +256,39 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Args;
+
+    /// Each flag carries its own help text.
+    #[test]
+    fn retry_submit_and_subscribe_have_their_own_help_text() {
+        let cmd = Args::command();
+        let retry = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "retry_submit")
+            .expect("retry_submit argument exists");
+        let retry_help = retry.get_help().expect("retry_submit has help").to_string();
+        assert!(
+            retry_help.contains("retry attempts"),
+            "unexpected help text for --retry-submit: {retry_help}"
+        );
+
+        let subscribe = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "subscribe")
+            .expect("subscribe argument exists");
+        let subscribe_help = subscribe
+            .get_help()
+            .expect("subscribe has help")
+            .to_string();
+        assert!(
+            subscribe_help.contains("kardamom_sendRawTransactionAsync"),
+            "unexpected help text for --subscribe: {subscribe_help}"
+        );
+    }
 }

@@ -59,11 +59,14 @@ pub struct Params {
     pub max_bal_missing: f64,
 }
 
+const DEFAULT_SENDERS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+const DEFAULT_TRANSFERS_PER_SENDER: NonZeroUsize = NonZeroUsize::new(24).unwrap();
+
 impl Default for Params {
     fn default() -> Self {
         Self {
-            senders: NonZeroUsize::new(4).unwrap(),
-            transfers_per_sender: NonZeroUsize::new(24).unwrap(),
+            senders: DEFAULT_SENDERS,
+            transfers_per_sender: DEFAULT_TRANSFERS_PER_SENDER,
             sender_base: 1,
             max_bal_missing: 0.0,
         }

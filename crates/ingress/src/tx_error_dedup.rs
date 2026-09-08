@@ -42,6 +42,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::mem::Discriminant;
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -177,13 +178,27 @@ impl Inner {
     /// Drops entries older than `window`. Skips order-queue entries that
     /// were refreshed after they were enqueued.
     fn purge(&mut self, now: Instant, window: Duration) {
-        while let Some(&(key, at)) = self.order.front() {
-            if now.duration_since(at) < window {
-                break;
+        loop {
+            match self.purge_step(now, window) {
+                ControlFlow::Break(()) => return,
+                ControlFlow::Continue(()) => {}
             }
-            self.order.pop_front();
-            self.remove_if_current(key, at);
         }
+    }
+
+    /// One [`Self::purge`] step: drop the order queue's front entry if it
+    /// is older than `window`. `Break` means the queue is empty, or its
+    /// front entry is still live, so purging stops.
+    fn purge_step(&mut self, now: Instant, window: Duration) -> ControlFlow<()> {
+        let Some(&(key, at)) = self.order.front() else {
+            return ControlFlow::Break(());
+        };
+        if now.duration_since(at) < window {
+            return ControlFlow::Break(());
+        }
+        self.order.pop_front();
+        self.remove_if_current(key, at);
+        ControlFlow::Continue(())
     }
 
     /// Inserts or refreshes `key`. Evicts the oldest live entries past

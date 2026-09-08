@@ -69,18 +69,21 @@ impl FsBlobStore {
     }
 
     /// Number of blobs currently held (counts `*.blob` files).
-    #[must_use]
-    pub fn len(&self) -> usize {
-        std::fs::read_dir(&self.dir).map_or(0, |rd| {
-            rd.filter_map(Result::ok)
-                .filter(|e| e.path().extension().is_some_and(|x| x == "blob"))
-                .count()
-        })
+    ///
+    /// # Errors
+    /// Returns an error when the store's directory cannot be read.
+    pub fn len(&self) -> Result<usize, BatcherError> {
+        let rd = std::fs::read_dir(&self.dir)?;
+        Ok(rd
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "blob"))
+            .count())
     }
 
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// # Errors
+    /// Returns an error when the store's directory cannot be read.
+    pub fn is_empty(&self) -> Result<bool, BatcherError> {
+        Ok(self.len()? == 0)
     }
 }
 
@@ -118,12 +121,12 @@ mod tests {
     fn put_then_fetch_roundtrips_blob_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let store = FsBlobStore::open(dir.path()).unwrap();
-        assert!(store.is_empty());
+        assert!(store.is_empty().unwrap());
 
         let blobs = pack_to_blobs(b"kardamom da store round trip payload").unwrap();
         let vh = B256::repeat_byte(0x11);
         store.put(vh, &blobs[0]).unwrap();
-        assert_eq!(store.len(), 1);
+        assert_eq!(store.len().unwrap(), 1);
 
         let got = store.fetch_blob(vh).unwrap();
         assert_eq!(got.as_slice(), blobs[0].as_slice());

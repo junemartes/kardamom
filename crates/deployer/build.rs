@@ -111,7 +111,9 @@ fn forge_build(contracts_root: &Path) -> Result<()> {
 }
 
 fn emit_embedded_module(contracts_root: &Path) -> Result<()> {
-    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR set by cargo"));
+    let out_dir = std::env::var_os("OUT_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("OUT_DIR not set (cargo always sets it for build scripts)"))?;
     let out_file = out_dir.join("embedded_artifacts.rs");
 
     let mut body = String::new();

@@ -202,7 +202,10 @@ impl BlockOrigin {
 /// origin does not advance after L1 mines new blocks.
 pub async fn origin_advances_over_an_idle_l1(l1: &L1, state_dir: &Path) -> Result<()> {
     let start = read_block_origins(state_dir)?;
-    let start_origin = start.last().map_or(0, |b| b.l1_origin);
+    let start_origin = start
+        .last()
+        .map(|b| b.l1_origin)
+        .context("no blocks at scenario start")?;
 
     // Advance L1 well past finality several times over.
     l1.mine(12).await?;
@@ -420,7 +423,10 @@ pub async fn stalled_l1_does_not_stall_l2(t: &Target, l1: &L1, state_dir: &Path)
     let resumed = read_block_origins(state_dir)?;
     let l1_finalized = l1.finalized_block_number().await?;
     assert_origin_sequence_is_sound(&resumed, l1_finalized)?;
-    let resumed_origin = resumed.last().map_or(0, |b| b.l1_origin);
+    let resumed_origin = resumed
+        .last()
+        .map(|b| b.l1_origin)
+        .context("no blocks after L1 resumed")?;
     anyhow::ensure!(
         resumed_origin > frozen_origin,
         "origin did not resume after L1 restarted: {resumed_origin} vs {frozen_origin}"

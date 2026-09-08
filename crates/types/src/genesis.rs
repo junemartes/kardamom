@@ -27,6 +27,7 @@ pub struct AllocEntry {
     pub balance: U256,
     #[serde(default, deserialize_with = "deserialize_code")]
     pub code: Option<Bytes>,
+    /// Starting nonce. Omitted means 0.
     pub nonce: Option<u64>,
 }
 

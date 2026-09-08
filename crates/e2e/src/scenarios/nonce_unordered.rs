@@ -27,11 +27,14 @@ pub struct Params {
     pub shuffle_seed: u64,
 }
 
+const DEFAULT_SENDERS: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+const DEFAULT_TXS_PER_SENDER: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+
 impl Default for Params {
     fn default() -> Self {
         Self {
-            senders: NonZeroUsize::new(8).unwrap(),
-            txs_per_sender: NonZeroUsize::new(64).unwrap(),
+            senders: DEFAULT_SENDERS,
+            txs_per_sender: DEFAULT_TXS_PER_SENDER,
             sender_base: 1,
             shuffle_seed: 0xC0FF_EED0_0D42,
         }

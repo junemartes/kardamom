@@ -1,5 +1,6 @@
 //! The streaming L1 sender.
 
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -67,51 +68,72 @@ impl<P: Provider> LiveSender<P> {
         cursor.last_batch_index = self.next_index()?;
         let mut attempt: u32 = 0;
         loop {
-            let res = post_batch(
-                &self.provider,
-                self.settlement,
-                self.prev_index,
-                batch,
-                &self.da_store,
-            )
-            .await;
-            let e = match res {
-                Ok(next) => {
-                    self.prev_index = next;
-                    break;
-                }
-                Err(e) => e,
-            };
-            if self.reconcile_after_error(batch, &e).await? {
-                break;
+            match self.attempt_post(batch, attempt).await? {
+                ControlFlow::Break(()) => break,
+                ControlFlow::Continue(a) => attempt = a,
             }
-            // Bounded by `max_retries` below; saturate rather than wrap so
-            // an implausibly long retry run still compares as "too many",
-            // not silently back to zero.
-            attempt = attempt.saturating_add(1);
-            if attempt > self.max_retries {
-                return Err(e).with_context(|| {
-                    format!(
-                        "post batch (prev_index {}) after {attempt} attempts",
-                        self.prev_index
-                    )
-                });
-            }
-            counter!(live_metric_names::L1_POST_RETRIES).increment(1);
-            let backoff = Duration::from_secs(1 << attempt.min(4));
-            warn!(
-                attempt,
-                backoff_s = backoff.as_secs(),
-                error = %format!("{e:#}"),
-                "L1 post failed; retrying"
-            );
-            tokio::time::sleep(backoff).await;
         }
         cursor
             .store(&self.cursor_path)
             .context("persist cursor after confirmed post")?;
         self.record_post_metrics(batch);
         Ok(())
+    }
+
+    /// One `post_confirmed` retry-loop iteration: try the post, and
+    /// either confirm it (the send landed, or reconciliation found it
+    /// already landed — either way `self.prev_index` is current when
+    /// this returns `Break`) or back off and report the next attempt
+    /// count to retry with.
+    ///
+    /// # Errors
+    /// Returns an error when reconciliation itself fails, or when
+    /// `attempt` (after this failure) exceeds `self.max_retries`.
+    async fn attempt_post(
+        &mut self,
+        batch: &PostedBatch,
+        attempt: u32,
+    ) -> Result<ControlFlow<(), u32>> {
+        let e = match post_batch(
+            &self.provider,
+            self.settlement,
+            self.prev_index,
+            batch,
+            &self.da_store,
+        )
+        .await
+        {
+            Ok(next) => {
+                self.prev_index = next;
+                return Ok(ControlFlow::Break(()));
+            }
+            Err(e) => e,
+        };
+        if self.reconcile_after_error(batch, &e).await? {
+            return Ok(ControlFlow::Break(()));
+        }
+        // Bounded by `max_retries` below; saturate rather than wrap so
+        // an implausibly long retry run still compares as "too many",
+        // not silently back to zero.
+        let attempt = attempt.saturating_add(1);
+        if attempt > self.max_retries {
+            return Err(e).with_context(|| {
+                format!(
+                    "post batch (prev_index {}) after {attempt} attempts",
+                    self.prev_index
+                )
+            });
+        }
+        counter!(live_metric_names::L1_POST_RETRIES).increment(1);
+        let backoff = Duration::from_secs(1 << attempt.min(4));
+        warn!(
+            attempt,
+            backoff_s = backoff.as_secs(),
+            error = %format!("{e:#}"),
+            "L1 post failed; retrying"
+        );
+        tokio::time::sleep(backoff).await;
+        Ok(ControlFlow::Continue(attempt))
     }
 
     /// Ask the chain whether a send failure's transaction actually landed.

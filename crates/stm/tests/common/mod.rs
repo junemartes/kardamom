@@ -219,18 +219,29 @@ pub(crate) fn hunt_wounds(
     extra: usize,
     mut attempt: impl FnMut(usize) -> bool,
 ) -> (usize, usize) {
-    let mut wounded = 0usize;
-    let mut attempts = 0usize;
-    for rep in 0..max {
-        if attempt(rep) {
-            wounded += 1;
-        }
-        attempts = rep + 1;
+    let outcome = (0..max).try_fold((0usize, 0usize), |(wounded, _), rep| {
+        let wounded = wounded + usize::from(attempt(rep));
+        let attempts = rep + 1;
         if wounded > 0 && rep >= extra {
-            break;
+            std::ops::ControlFlow::Break((wounded, attempts))
+        } else {
+            std::ops::ControlFlow::Continue((wounded, attempts))
         }
+    });
+    match outcome {
+        std::ops::ControlFlow::Continue(v) | std::ops::ControlFlow::Break(v) => v,
     }
-    (wounded, attempts)
+}
+
+/// Every `(a, b)` pair from two fixed lists, flattened so a caller
+/// walks one `for` loop instead of nesting two. Used both for
+/// `(shards, workers)` sweeps and for `(workers, rep)` sweeps.
+pub(crate) fn shard_worker_pairs<const N: usize, const M: usize>(
+    a: [usize; N],
+    b: [usize; M],
+) -> impl Iterator<Item = (usize, usize)> {
+    a.into_iter()
+        .flat_map(move |x| b.into_iter().map(move |y| (x, y)))
 }
 
 pub(crate) fn assert_identical(

@@ -139,6 +139,10 @@ impl LocalStack {
     /// report whether both are stable across this interval with the
     /// validator not behind. `last_exec`/`last_val` carry the previous
     /// tick's sample, so two consecutive identical reads mean settled.
+    /// A counter that has not registered yet is not settled: it is not
+    /// "stable at 0", so this tick reports `false` and the poll retries,
+    /// instead of two absent reads looking identical and settling
+    /// vacuously.
     async fn drain_settled_once(
         &self,
         exec_addr: SocketAddr,
@@ -146,17 +150,24 @@ impl LocalStack {
         last_exec: &mut f64,
         last_val: &mut f64,
     ) -> Result<bool> {
-        let exec_block = super::metrics::scrape(exec_addr)
+        let Some(exec_block) = super::metrics::scrape(exec_addr)
             .await?
             .value(crate::scenarios::EXEC_BLOCK_NUMBER)
-            .unwrap_or(0.0);
+        else {
+            return Ok(false);
+        };
         let val_block = match val_addr {
             // No validator: treat its half as already settled.
             None => exec_block,
-            Some(addr) => super::metrics::scrape(addr)
-                .await?
-                .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK)
-                .unwrap_or(0.0),
+            Some(addr) => {
+                let Some(v) = super::metrics::scrape(addr)
+                    .await?
+                    .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK)
+                else {
+                    return Ok(false);
+                };
+                v
+            }
         };
         #[allow(
             clippy::float_cmp,

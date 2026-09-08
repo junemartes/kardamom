@@ -8,6 +8,12 @@ use super::services::IngressOptions;
 /// The dev chain id (`deploy/cluster/config/genesis/dev.toml`).
 pub const DEV_CHAIN_ID: NonZeroU64 = NonZeroU64::new(412_346).unwrap();
 
+/// Default shard count: [`StackConfig::default`]. Matches the deployed
+/// cluster's shard count.
+const DEFAULT_SHARDS: NonZeroU32 = NonZeroU32::new(2).unwrap();
+
+const DEFAULT_CLUSTER_TICK_MS: NonZeroU64 = NonZeroU64::new(250).unwrap();
+
 /// Stack settings a scenario can tune. The defaults match the deployed
 /// shape where it matters (shards=2, like the cluster), and use a
 /// test-friendly value where it does not (250 ms boundary ticks).
@@ -103,9 +109,9 @@ impl Genesis {
 impl Default for StackConfig {
     fn default() -> Self {
         Self {
-            shards: NonZeroU32::new(2).unwrap(),
+            shards: DEFAULT_SHARDS,
             sealer_members: NonZeroUsize::MIN,
-            cluster_tick_ms: NonZeroU64::new(250).unwrap(),
+            cluster_tick_ms: DEFAULT_CLUSTER_TICK_MS,
             ingress: IngressOptions::default(),
             validator: false,
             validator_parallel: false,

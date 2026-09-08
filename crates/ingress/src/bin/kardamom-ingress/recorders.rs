@@ -91,21 +91,7 @@ pub(crate) async fn wait_for_recorders(ready: Vec<RecorderReady>) -> Result<()> 
     const RECORDER_READY_TIMEOUT: Duration = Duration::from_secs(60);
     let all = async {
         for rx in ready {
-            match rx.await {
-                Ok((sid, Ok(recording_id))) => {
-                    tracing::info!(
-                        shard = sid,
-                        recording_id,
-                        "tx_data recording confirmed active"
-                    );
-                }
-                Ok((sid, Err(e))) => {
-                    anyhow::bail!("tx_data recorder for shard {sid} failed to start: {e}");
-                }
-                Err(_) => {
-                    anyhow::bail!("a tx_data recorder thread exited before reporting readiness");
-                }
-            }
+            report_ready(rx.await)?;
         }
         Ok(())
     };
@@ -114,5 +100,29 @@ pub(crate) async fn wait_for_recorders(ready: Vec<RecorderReady>) -> Result<()> 
         Err(_) => anyhow::bail!(
             "timed out ({RECORDER_READY_TIMEOUT:?}) waiting for a tx_data recording to become active"
         ),
+    }
+}
+
+/// One recorder's readiness report, for [`wait_for_recorders`]'s loop.
+/// Logs on success. Fails on a reported startup error, or on the
+/// recorder thread exiting before it reported readiness.
+fn report_ready(
+    result: Result<(u8, Result<i64, String>), oneshot::error::RecvError>,
+) -> Result<()> {
+    match result {
+        Ok((sid, Ok(recording_id))) => {
+            tracing::info!(
+                shard = sid,
+                recording_id,
+                "tx_data recording confirmed active"
+            );
+            Ok(())
+        }
+        Ok((sid, Err(e))) => {
+            anyhow::bail!("tx_data recorder for shard {sid} failed to start: {e}");
+        }
+        Err(_) => {
+            anyhow::bail!("a tx_data recorder thread exited before reporting readiness");
+        }
     }
 }

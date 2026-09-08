@@ -63,9 +63,9 @@ impl GuestBlock {
     /// Run one block through [`execute_block_anchored`]: rebuild the
     /// records and digest, rebuild `ExecEnv` from the boundary and chain
     /// id, decode the published BAL RLP, and execute. Both guest
-    /// binaries (`main.rs`, `bin/batch.rs`) panic identically on any of
-    /// the three failure modes (BAL decode, anchored execution), so the
-    /// `.expect(...)` calls live here instead of being written twice.
+    /// binaries (`main.rs`, `bin/batch.rs`) panic identically on either
+    /// failure mode (BAL decode, anchored execution), so the
+    /// `.expect(...)` call lives here instead of being written twice.
     ///
     /// # Panics
     ///
@@ -76,6 +76,7 @@ impl GuestBlock {
     pub fn run(input: ProverInput) -> GuestRun {
         let block = Self::from_records(input.boundary.block_number, input.records);
         let env = ExecEnv::new(input.chain_id, &input.boundary);
+        let granularity = input.granularity;
         let mut bal_slice: &[u8] = &input.bal_rlp;
         let expected_bal = alloy_eip7928::BlockAccessList::decode(&mut bal_slice)
             .expect("published BAL frame decodes");
@@ -86,7 +87,7 @@ impl GuestBlock {
             &block.records,
             env,
             &expected_bal,
-            input.granularity,
+            granularity,
         )
         .expect("anchored stateless execution");
         GuestRun {

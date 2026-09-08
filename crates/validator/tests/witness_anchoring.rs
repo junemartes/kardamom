@@ -257,15 +257,17 @@ fn export_prover_fixture_if_requested(
             })
             .collect(),
         bal_rlp: bal_rlp.into(),
-        granularity: 1,
+        granularity: std::num::NonZeroU16::MIN,
     };
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&input).expect("serialize input");
     let mut digest = BlockRecordsDigest::new(1);
-    records.iter().for_each(|r| {
-        if let BufferedRecord::Tx { envelope, .. } = r {
-            digest.add_tx(&envelope.raw_tx);
-        }
-    });
+    records
+        .iter()
+        .filter_map(|r| match r {
+            BufferedRecord::Tx { envelope, .. } => Some(envelope),
+            _ => None,
+        })
+        .for_each(|envelope| digest.add_tx(&envelope.raw_tx));
     let expected = PublicOutputs {
         pre_state_root: anchored.pre_state_root,
         post_state_root: anchored.post_state_root,

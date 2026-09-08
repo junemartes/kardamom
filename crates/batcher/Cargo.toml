@@ -65,6 +65,9 @@ clap.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
 toml.workspace = true
 
+[build-dependencies]
+anyhow.workspace = true
+
 [dev-dependencies]
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-deployer = { path = "../deployer", features = ["test-support"] }

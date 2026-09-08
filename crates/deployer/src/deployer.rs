@@ -276,19 +276,10 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
             return Err(DeployError::FactoryNotDeployed(factory_proxy));
         }
 
-        let factory = IKardamomFactory::new(factory_proxy, &self.provider);
-
         let l2s: Vec<u64> = if let Some(id) = l2_chain_id {
             vec![id]
         } else {
-            let count =
-                Self::factory_count_u64(factory.l2ChainIdCount().call().await?, "l2ChainIdCount")?;
-            let mut out = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
-            for i in 0..count {
-                let v: U256 = factory.l2ChainIdAt(U256::from(i)).call().await?;
-                out.push(v.to());
-            }
-            out
+            self.all_l2_chain_ids().await?
         };
 
         let mut entries = Vec::new();
@@ -298,14 +289,42 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         Ok(entries)
     }
 
+    /// The `IKardamomFactory` binding at this deployer's owner-derived
+    /// proxy address.
+    fn factory(&self) -> IKardamomFactory::IKardamomFactoryInstance<&P> {
+        IKardamomFactory::new(self.factory_address(), &self.provider)
+    }
+
+    /// Read an L1 counter through `factory_count_u64`, and a `Vec`
+    /// pre-sized to hold that many items. A capacity hint only: `count`
+    /// from an L1 call exceeding `usize` (32-bit hosts only) just costs a
+    /// realloc, not correctness.
+    fn sized_output<T>(count: U256, field: &str) -> Result<(u64, Vec<T>), DeployError> {
+        let count = Self::factory_count_u64(count, field)?;
+        let out = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        Ok((count, out))
+    }
+
+    /// Enumerate `l2ChainIdAt(i)` for `i` in `0..l2ChainIdCount()`: every
+    /// L2 chain id the factory has registered.
+    async fn all_l2_chain_ids(&self) -> Result<Vec<u64>, DeployError> {
+        let factory = self.factory();
+        let (count, mut out) =
+            Self::sized_output(factory.l2ChainIdCount().call().await?, "l2ChainIdCount")?;
+        for i in 0..count {
+            let v: U256 = factory.l2ChainIdAt(U256::from(i)).call().await?;
+            out.push(v.to());
+        }
+        Ok(out)
+    }
+
     /// Read all registry entries for one L2: enumerate `idAt(l2, i)` for
     /// `i` in `0..idCount(l2)`, then fetch each entry. Its own method so
     /// `addresses` iterates only its outer `l2s` loop.
     async fn entries_for_l2(&self, l2: u64) -> Result<Vec<RegistryEntry>, DeployError> {
-        let factory = IKardamomFactory::new(self.factory_address(), &self.provider);
-        let count =
-            Self::factory_count_u64(factory.idCount(U256::from(l2)).call().await?, "idCount")?;
-        let mut out = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        let factory = self.factory();
+        let (count, mut out) =
+            Self::sized_output(factory.idCount(U256::from(l2)).call().await?, "idCount")?;
         for i in 0..count {
             let id: B256 = factory.idAt(U256::from(l2), U256::from(i)).call().await?;
             let e: IKardamomFactory::Entry = factory.entry(U256::from(l2), id).call().await?;

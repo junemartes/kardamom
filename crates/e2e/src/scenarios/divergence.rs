@@ -86,7 +86,9 @@ pub async fn corrupt_bal_halts_validator(stack: &mut LocalStack, t: &Target) -> 
         code == Some(2),
         "validator exited with {code:?}, expected the divergence fail-stop's exit 2"
     );
-    let log = stack.validator_log().unwrap_or_default();
+    let log = stack
+        .validator_log()
+        .context("read validator log after the divergence exit")?;
     anyhow::ensure!(
         log.contains("divergence"),
         "validator log carries no divergence line; tail:\n{}",

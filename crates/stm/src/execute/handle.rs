@@ -82,25 +82,30 @@ impl<S: StateDatabase> PoolShared<S> {
                 HotCtx::Shutdown => return None,
                 // keep_hot: hold the core's frequency, hand it over
                 // instantly to whoever needs it (the commit tail pins
-                // its threads here).
-                HotCtx::Spin => Self::spin_hot(),
+                // its threads here). `poll_hot` already ran the spin
+                // before returning this, so there is nothing left to
+                // do but poll again.
+                HotCtx::Spin => {}
             }
         }
     }
 
-    /// One `next_ctx_hot` poll: shutdown, a fresh context, or neither
-    /// yet.
+    /// One `next_ctx_hot` poll: shutdown, a fresh context, or a spin
+    /// (already run, lock released first) before the next poll.
     fn poll_hot(&self, seen: &mut u64) -> HotCtx<S> {
-        let st = self.state.lock().expect("pool poisoned");
-        if st.shutdown {
-            return HotCtx::Shutdown;
-        }
-        if st.generation != *seen
-            && let Some(c) = &st.ctx
         {
-            *seen = st.generation;
-            return HotCtx::Ready(c.clone());
+            let st = self.state.lock().expect("pool poisoned");
+            if st.shutdown {
+                return HotCtx::Shutdown;
+            }
+            if st.generation != *seen
+                && let Some(c) = &st.ctx
+            {
+                *seen = st.generation;
+                return HotCtx::Ready(c.clone());
+            }
         }
+        Self::spin_hot();
         HotCtx::Spin
     }
 
@@ -217,6 +222,29 @@ impl<S: super::StmBackend> PoolThreads<S> {
     /// This pool's tail-thread sender, cloned for [`PoolHandle::tail`].
     fn tail_sender(&self) -> std::sync::mpsc::Sender<TailJob<S>> {
         self.tail_tx.clone()
+    }
+
+    /// Spawn worker `w`'s thread on `scope`: pin it to its assigned core
+    /// (a warning, not a failure, if the pin does not take), then run
+    /// its loop until the pool shuts down.
+    fn spawn_worker<'scope>(
+        scope: &'scope std::thread::Scope<'scope, '_>,
+        shared_ref: &'scope PoolShared<S>,
+        w: usize,
+        pin_cores: &[usize],
+        hot: bool,
+    ) {
+        let pin = pin_cores.to_vec();
+        scope.spawn(move || {
+            if crate::pin_current(w, &pin) == Some(false) {
+                tracing::warn!(
+                    worker = w,
+                    core = pin[w % pin.len()],
+                    "stm: worker pin failed"
+                );
+            }
+            worker_loop(shared_ref, w, hot);
+        });
     }
 
     /// Spawn the reaper: it drops junk freight and scrubs recyclable
@@ -547,18 +575,7 @@ pub fn with_pool<S: super::StmBackend, R>(
         };
         let threads = PoolThreads::spawn(scope, shared_ref, &tail_resources);
         for w in 0..workers {
-            let pin = pin_cores.clone();
-            let hot = cfg_keep_hot;
-            scope.spawn(move || {
-                if crate::pin_current(w, &pin) == Some(false) {
-                    tracing::warn!(
-                        worker = w,
-                        core = pin[w % pin.len()],
-                        "stm: worker pin failed"
-                    );
-                }
-                worker_loop(shared_ref, w, hot);
-            });
+            PoolThreads::spawn_worker(scope, shared_ref, w, &pin_cores, cfg_keep_hot);
         }
         let handle = PoolHandle {
             shared: shared_ref,

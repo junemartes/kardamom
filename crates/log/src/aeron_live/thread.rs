@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TryRecvError};
+use tracing::warn;
 
 use super::pending::{IdleBackoff, PendingPublish, PubEntry, drain_pending};
 use super::runtime::RuntimeCmd;
@@ -65,12 +66,39 @@ struct SubEntry {
     /// The leaked delegate the assembler forwards to. Retained so it can
     /// be released when the subscription row is dropped.
     inner: rusteron_client::Handler<AssembledDeliver>,
+    /// Set once `poll` errors, cleared once it succeeds again. Latches
+    /// the warning to one line per transition, since `poll` runs on
+    /// every pass of the thread's hot loop.
+    poll_failed: bool,
 }
 
 impl Drop for SubEntry {
     fn drop(&mut self) {
         self.assembler.release();
         self.inner.release();
+    }
+}
+
+impl SubEntry {
+    /// One [`AeronThread::poll_subscriptions`] poll. Returns whether this
+    /// entry delivered at least one fragment. A poll error counts as no
+    /// fragments: one failed image must not stop polling the others. Logs
+    /// once on the transition into the error state, not on every failed
+    /// poll, since this runs on every pass of the thread's hot loop.
+    fn poll_once(&mut self) -> bool {
+        match self.sub.poll(Some(&self.assembler), 64) {
+            Ok(fragments) => {
+                self.poll_failed = false;
+                fragments > 0
+            }
+            Err(e) => {
+                if !self.poll_failed {
+                    warn!(error = ?e, "subscription poll failed");
+                    self.poll_failed = true;
+                }
+                false
+            }
+        }
     }
 }
 
@@ -247,8 +275,7 @@ impl AeronThread {
     fn poll_subscriptions(&mut self) -> bool {
         let mut worked = false;
         for entry in &mut self.subs {
-            let fragments = entry.sub.poll(Some(&entry.assembler), 64);
-            worked |= fragments.unwrap_or(0) > 0;
+            worked |= entry.poll_once();
         }
         worked
     }
@@ -323,6 +350,7 @@ impl AeronThread {
             sub,
             assembler,
             inner,
+            poll_failed: false,
         });
         Ok(id)
     }
@@ -443,14 +471,15 @@ fn poll_until_attached(
     loop {
         match poll_attach_step(dest, start, uri) {
             ControlFlow::Break(result) => return result,
-            ControlFlow::Continue(()) => std::thread::sleep(Duration::from_millis(2)),
+            ControlFlow::Continue(()) => {}
         }
     }
 }
 
 /// One attach-poll for [`poll_until_attached`]'s loop. `Break` carries the
 /// answer: ready, a poll error, or a timeout past `ADD_SUB_TIMEOUT`.
-/// `Continue` means poll again after the caller's wait.
+/// `Continue` means the caller polls again, after this waits at the
+/// fixed 2 ms cadence.
 fn poll_attach_step(
     dest: &rusteron_client::AeronAsyncDestination,
     start: Instant,
@@ -470,6 +499,7 @@ fn poll_attach_step(
             "add destination {uri} timed out"
         ))));
     }
+    std::thread::sleep(Duration::from_millis(2));
     ControlFlow::Continue(())
 }
 

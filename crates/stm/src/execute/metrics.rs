@@ -37,14 +37,15 @@ pub(super) struct TxResult {
     /// folds the fragments in canonical order.
     pub(super) bal_frag: Option<revm::state::bal::Bal>,
     /// This transaction's exact credit to the fee sink (the value after,
-    /// minus the block-start value seen).
-    pub(super) fee_delta: U256,
+    /// minus the block-start value seen), or `None` when this
+    /// transaction did not touch the fee sink.
+    ///
     /// The write set contains the fee sink, so its hash is finalized at
     /// commit, after the prefix balance is computed. Hashing it during
     /// execution would be wasted work. Offline measurement found this
     /// case at nearly every transaction, so the saved keccak is not an
     /// edge case.
-    pub(super) sink_touched: bool,
+    pub(super) sink_fee_delta: Option<U256>,
 }
 
 /// Outcome of one block through the STM engine.

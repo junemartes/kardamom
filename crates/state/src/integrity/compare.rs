@@ -14,6 +14,17 @@ use crate::schema::{
     TABLE_TX_HASH_INDEX, decode_receipt_value,
 };
 
+/// One cursor row, or `None` at end of table.
+type Row = Option<(Vec<u8>, Vec<u8>)>;
+
+/// One cursor row's key and value, already known present — unlike
+/// [`Row`], which also allows end-of-table. [`TableCompare::compare_both`]
+/// takes one of these per side instead of two loose `Vec<u8>` scalars.
+struct KeyValue {
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
 const SHARED_TABLES: &[&str] = &[
     TABLE_ACCOUNTS,
     TABLE_STORAGE,
@@ -82,53 +93,89 @@ impl<'a> TableCompare<'a> {
         let mut ia = ca.first::<Vec<u8>, Vec<u8>>()?;
         let mut ib = cb.first::<Vec<u8>, Vec<u8>>()?;
         while self.diffs.len() < MAX_DIFFS_PER_TABLE {
-            match (&ia, &ib) {
-                (None, None) => break,
-                (Some((ka, va)), Some((kb, vb))) => {
-                    if ka != kb {
-                        self.push(format!(
-                            "{}: key mismatch a={:02x?} b={:02x?}",
-                            self.table,
-                            super::head(ka),
-                            super::head(kb)
-                        ));
-                        // Advance the smaller side to resynchronize.
-                        if ka < kb {
-                            ia = ca.next::<Vec<u8>, Vec<u8>>()?;
-                        } else {
-                            ib = cb.next::<Vec<u8>, Vec<u8>>()?;
-                        }
-                        continue;
-                    }
-                    if va != vb {
-                        let message = self.value_diff_message(ka, va, vb);
-                        self.push(message);
-                    }
-                    ia = ca.next::<Vec<u8>, Vec<u8>>()?;
-                    ib = cb.next::<Vec<u8>, Vec<u8>>()?;
-                }
-                (Some((ka, _)), None) => {
-                    self.push(format!(
-                        "{}: extra key in a: {:02x?}",
-                        self.table,
-                        super::head(ka)
-                    ));
-                    ia = ca.next::<Vec<u8>, Vec<u8>>()?;
-                }
-                (None, Some((kb, _))) => {
-                    self.push(format!(
-                        "{}: extra key in b: {:02x?}",
-                        self.table,
-                        super::head(kb)
-                    ));
-                    ib = cb.next::<Vec<u8>, Vec<u8>>()?;
-                }
-            }
+            let Some(next) = self.compare_step(&mut ca, &mut cb, ia, ib)? else {
+                break;
+            };
+            (ia, ib) = next;
         }
         if self.diffs.len() >= MAX_DIFFS_PER_TABLE {
             self.push(format!("{}: further diffs truncated", self.table));
         }
         Ok(self.diffs)
+    }
+
+    /// One step of the synchronized two-cursor walk: compare the current
+    /// pair, push any diff, and advance. `None` means both cursors are
+    /// exhausted.
+    fn compare_step<K: signet_libmdbx::TransactionKind>(
+        &mut self,
+        ca: &mut signet_libmdbx::Cursor<'_, K>,
+        cb: &mut signet_libmdbx::Cursor<'_, K>,
+        ia: Row,
+        ib: Row,
+    ) -> Result<Option<(Row, Row)>, StateError> {
+        match (ia, ib) {
+            (None, None) => Ok(None),
+            (Some((ka, va)), Some((kb, vb))) => self.compare_both(
+                ca,
+                cb,
+                KeyValue { key: ka, value: va },
+                KeyValue { key: kb, value: vb },
+            ),
+            (Some((ka, _)), None) => {
+                self.push(format!(
+                    "{}: extra key in a: {:02x?}",
+                    self.table,
+                    super::head(&ka)
+                ));
+                Ok(Some((ca.next::<Vec<u8>, Vec<u8>>()?, None)))
+            }
+            (None, Some((kb, _))) => {
+                self.push(format!(
+                    "{}: extra key in b: {:02x?}",
+                    self.table,
+                    super::head(&kb)
+                ));
+                Ok(Some((None, cb.next::<Vec<u8>, Vec<u8>>()?)))
+            }
+        }
+    }
+
+    /// The `(Some, Some)` arm of [`Self::compare_step`]: a key mismatch
+    /// pushes one diff and resyncs by advancing the smaller side; a
+    /// matching key with differing values pushes a value diff and
+    /// advances both.
+    fn compare_both<K: signet_libmdbx::TransactionKind>(
+        &mut self,
+        ca: &mut signet_libmdbx::Cursor<'_, K>,
+        cb: &mut signet_libmdbx::Cursor<'_, K>,
+        a: KeyValue,
+        b: KeyValue,
+    ) -> Result<Option<(Row, Row)>, StateError> {
+        let KeyValue { key: ka, value: va } = a;
+        let KeyValue { key: kb, value: vb } = b;
+        if ka != kb {
+            self.push(format!(
+                "{}: key mismatch a={:02x?} b={:02x?}",
+                self.table,
+                super::head(&ka),
+                super::head(&kb)
+            ));
+            // Advance the smaller side to resynchronize.
+            return Ok(Some(if ka < kb {
+                (ca.next::<Vec<u8>, Vec<u8>>()?, Some((kb, vb)))
+            } else {
+                (Some((ka, va)), cb.next::<Vec<u8>, Vec<u8>>()?)
+            }));
+        }
+        if va != vb {
+            let message = self.value_diff_message(&ka, &va, &vb);
+            self.push(message);
+        }
+        Ok(Some((
+            ca.next::<Vec<u8>, Vec<u8>>()?,
+            cb.next::<Vec<u8>, Vec<u8>>()?,
+        )))
     }
 
     /// One value-mismatch message for `key` in this table. Byte lengths

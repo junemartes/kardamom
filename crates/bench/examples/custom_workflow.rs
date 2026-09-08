@@ -17,7 +17,7 @@ use jsonrpsee::rpc_params;
 use kardamom_bench::Benchmark;
 use kardamom_bench::benchmark::Prepared;
 use kardamom_bench::harness::Harness;
-use kardamom_bench::workflow::BenchWorkflow;
+use kardamom_bench::workflow::{BenchWorkflow, DispatchOutcome};
 use kardamom_types::AllocEntry;
 
 const METHOD: &str = "eth_blockNumber";
@@ -41,24 +41,27 @@ impl BenchWorkflow for BlockNumberWorkflow {
         Ok(Vec::new())
     }
 
-    async fn prepare(
+    fn prepare(
         &self,
         _client: &HttpClient,
         n_tasks: u32,
         txs_per_task: u32,
-    ) -> anyhow::Result<Prepared<Self::Item>> {
+    ) -> impl std::future::Future<Output = anyhow::Result<Prepared<Self::Item>>> + Send {
         // `eth_blockNumber` needs no real warmup. Produce unit markers so the
         // harness still exercises the warmup path.
         let warmup = vec![(); 64];
         let main = (0..n_tasks)
             .map(|_| vec![(); txs_per_task as usize])
             .collect();
-        Ok(Prepared { warmup, main })
+        std::future::ready(Ok(Prepared { warmup, main }))
     }
 
-    async fn dispatch(&self, client: &HttpClient, _item: ()) -> (&'static str, bool) {
+    async fn dispatch(&self, client: &HttpClient, _item: ()) -> DispatchOutcome {
         let r: Result<U256, _> = client.request(METHOD, rpc_params![]).await;
-        (METHOD, r.is_ok())
+        DispatchOutcome {
+            method: METHOD,
+            success: r.is_ok(),
+        }
     }
 }
 
@@ -70,13 +73,13 @@ async fn main() -> anyhow::Result<()> {
     let bench = Benchmark {
         workflow: BlockNumberWorkflow,
         timeout: Duration::from_secs(3),
-        concurrency: 8,
-        txs_per_task: 5_000,
+        concurrency: std::num::NonZeroU32::new(8).expect("8 != 0"),
+        txs_per_task: std::num::NonZeroU32::new(5_000).expect("5_000 != 0"),
         max_in_flight: 8,
     };
 
     Harness {
-        chain_id: 412_346,
+        chain_id: std::num::NonZeroU64::new(412_346).unwrap(),
         bench,
         flame_out: "/tmp/k-custom-flame.svg".into(),
         report_json: None,

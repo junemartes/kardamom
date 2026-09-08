@@ -329,9 +329,9 @@ pub(crate) fn for_each_row<K: signet_libmdbx::TransactionKind>(
     let mut cur = txn.cursor(db)?;
     let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
     while let Some((k, v)) = item {
-        if f(k, v)?.is_break() {
+        let std::ops::ControlFlow::Continue(()) = f(k, v)? else {
             return Ok(());
-        }
+        };
         item = cur.next::<Vec<u8>, Vec<u8>>()?;
     }
     Ok(())
@@ -434,13 +434,10 @@ pub(crate) fn for_each_prefix<K: signet_libmdbx::TransactionKind>(
 ) -> Result<(), StateError> {
     let mut cur = txn.cursor(db)?;
     let mut item = cur.set_range::<Vec<u8>, Vec<u8>>(prefix)?;
-    while let Some((k, v)) = item {
-        if !k.starts_with(prefix) {
-            break;
-        }
-        if f(k, v)?.is_break() {
+    while let Some((k, v)) = item.take_if(|(k, _)| k.starts_with(prefix)) {
+        let std::ops::ControlFlow::Continue(()) = f(k, v)? else {
             return Ok(());
-        }
+        };
         item = cur.next::<Vec<u8>, Vec<u8>>()?;
     }
     Ok(())

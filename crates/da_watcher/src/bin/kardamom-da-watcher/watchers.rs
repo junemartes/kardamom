@@ -156,13 +156,21 @@ impl Watchers {
     /// one fired.
     async fn watch_for_halt(&self) -> &'static str {
         loop {
-            match self.check_halt() {
+            match self.poll_halt_step().await {
                 ControlFlow::Break(reason) => return reason,
-                ControlFlow::Continue(()) => {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
+                ControlFlow::Continue(()) => {}
             }
         }
+    }
+
+    /// One [`Self::watch_for_halt`] poll: check the halt conditions, then
+    /// wait 200 ms before the caller polls again.
+    async fn poll_halt_step(&self) -> ControlFlow<&'static str> {
+        let result = self.check_halt();
+        if result.is_continue() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        result
     }
 
     /// The two conditions [`Self::watch_for_halt`] polls for: every

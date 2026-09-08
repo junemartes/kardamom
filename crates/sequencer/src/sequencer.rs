@@ -47,8 +47,10 @@
 //! See also [`crate::outbound`] for the trait surface and the in-memory
 //! fakes used by tests.
 
+use std::ops::ControlFlow;
 use std::time::Duration;
 
+use kardamom_types::num::usize_to_u64;
 use kardamom_types::{BPosition, TxError, TxErrorReason};
 use tracing::{trace, warn};
 
@@ -211,38 +213,58 @@ impl Sequencer {
     where
         B: TxOrderingRefPublisher,
     {
-        // Chunked batch publish. Each chunk rides one cluster app message
-        // (KIND_BATCH), which amortizes the per-offer session round trip
-        // that dominated the sequencer's per-transaction cost. The chunk
-        // must stay under one Aeron MTU (about 1408 bytes): the
-        // hand-rolled cluster ingress path does not survive fragmented
-        // session messages. With the guard header (sender 20 bytes, nonce
-        // 8 bytes), each entry is 75 bytes plus a 4 byte length prefix.
-        // 16 x 79 + 3 is about 1.27 KB, which stays under the MTU with
-        // margin (20 x 79 + 3, about 1.58 KB, would not). A 16:1 ratio
-        // still amortizes away the dominant per-offer cost.
-        const BATCH_MAX: usize = 16;
+        // Chunked batch publish; see `flush_chunk`'s doc for the chunk
+        // size and the MTU budget behind it.
         let mut rest = std::collections::VecDeque::from(drained);
         while !rest.is_empty() {
-            let chunk = BATCH_MAX.min(rest.len());
-            let refs: Vec<(kardamom_types::TxRef, alloy_primitives::Address, u64)> = rest
-                .iter()
-                .take(chunk)
-                .map(|(s, n, m)| (self.make_txref(m), *s, *n))
-                .collect();
-            let (published, err) = b.try_publish_ref_batch(&refs);
-            self.record_published_prefix(&mut rest, published, ctx);
-            match err {
-                None => {}
-                Some(SequencerError::Backpressure) => {
-                    self.hot.backpressure.increment(1);
-                    self.rebuffer_rest(&mut rest);
-                    return Err(SequencerError::Backpressure);
-                }
-                Some(e) => return Err(e),
+            if let ControlFlow::Break(result) = self.flush_chunk(b, &mut rest, ctx) {
+                return result;
             }
         }
         Ok(())
+    }
+
+    /// One [`Self::flush_drained`] chunk: publish up to `BATCH_MAX` refs
+    /// off the front of `rest`, and record what published. `Break` carries
+    /// the flush's final error. `Continue` means the caller sends the next
+    /// chunk.
+    fn flush_chunk<B>(
+        &mut self,
+        b: &mut B,
+        rest: &mut std::collections::VecDeque<(alloy_primitives::Address, u64, RefMetadata)>,
+        ctx: &'static str,
+    ) -> ControlFlow<Result<(), SequencerError>>
+    where
+        B: TxOrderingRefPublisher,
+    {
+        // Each chunk rides one cluster app message (KIND_BATCH), which
+        // amortizes the per-offer session round trip that dominated the
+        // sequencer's per-transaction cost. The chunk must stay under one
+        // Aeron MTU (about 1408 bytes): the hand-rolled cluster ingress
+        // path does not survive fragmented session messages. With the
+        // guard header (sender 20 bytes, nonce 8 bytes), each entry is 75
+        // bytes plus a 4 byte length prefix. 16 x 79 + 3 is about 1.27 KB,
+        // which stays under the MTU with margin (20 x 79 + 3, about 1.58
+        // KB, would not). A 16:1 ratio still amortizes away the dominant
+        // per-offer cost.
+        const BATCH_MAX: usize = 16;
+        let chunk = BATCH_MAX.min(rest.len());
+        let refs: Vec<(kardamom_types::TxRef, alloy_primitives::Address, u64)> = rest
+            .iter()
+            .take(chunk)
+            .map(|(s, n, m)| (self.make_txref(m), *s, *n))
+            .collect();
+        let (published, err) = b.try_publish_ref_batch(&refs);
+        self.record_published_prefix(rest, published, ctx);
+        match err {
+            None => ControlFlow::Continue(()),
+            Some(SequencerError::Backpressure) => {
+                self.hot.backpressure.increment(1);
+                self.rebuffer_rest(rest);
+                ControlFlow::Break(Err(SequencerError::Backpressure))
+            }
+            Some(e) => ControlFlow::Break(Err(e)),
+        }
     }
 
     /// Drain the `published` prefix off `rest`: bump the publish metric,
@@ -260,16 +282,29 @@ impl Sequencer {
         ctx: &'static str,
     ) {
         for (sender, n, meta) in rest.drain(..published) {
-            self.hot.publish.increment(1);
-            trace!(
-                nonce = n,
-                correlation_id = meta.correlation_id,
-                ctx,
-                "published ref"
-            );
-            if self.resync.is_some() {
-                self.unconfirmed.record_published(sender, n, meta);
-            }
+            self.record_one_published(sender, n, meta, ctx);
+        }
+    }
+
+    /// One published ref, for [`Self::record_published_prefix`]'s loop:
+    /// bumps the publish metric, traces it, and (if resync is active)
+    /// records it in the unconfirmed ledger.
+    fn record_one_published(
+        &mut self,
+        sender: alloy_primitives::Address,
+        n: u64,
+        meta: RefMetadata,
+        ctx: &'static str,
+    ) {
+        self.hot.publish.increment(1);
+        trace!(
+            nonce = n,
+            correlation_id = meta.correlation_id,
+            ctx,
+            "published ref"
+        );
+        if self.resync.is_some() {
+            self.unconfirmed.record_published(sender, n, meta);
         }
     }
 
@@ -314,32 +349,34 @@ impl Sequencer {
             self.unconfirmed.confirm_through(sender, confirmed);
         }
         for (sender, floor) in raised {
-            if let Some((from, dropped)) = self.state.advance_floor(sender, floor) {
-                metrics::record_floor_advance(self.cfg.partition_index);
-                // Every dropped buffered entry is a receipt-proven
-                // duplicate, skipped without relying on any dedup
-                // window. This is the spec's
-                // `resync_skipped_executed_total`. There is no
-                // separate flush-time filter: floors drain before any
-                // publish action is computed, so the state machine's
-                // floor is always current when `process` runs. A
-                // proven-stale incoming envelope takes the ordinary
-                // `Past`/DuplicatedTx path below, and is counted
-                // there.
-                metrics::record_resync_skip(
-                    self.cfg.partition_index,
-                    u64::try_from(dropped).unwrap_or(u64::MAX),
-                );
-                trace!(
-                    sender = ?sender,
-                    from,
-                    floor,
-                    dropped,
-                    "resync: receipt floor advanced nonce state"
-                );
-            }
+            self.apply_one_floor_update(sender, floor);
         }
         r.observe(std::time::Instant::now());
+    }
+
+    /// One receipt-proven floor update, for [`Self::apply_receipt_drain`]'s
+    /// loop: advance the state machine's floor, and record the drops it
+    /// proves, if the floor actually moved.
+    fn apply_one_floor_update(&mut self, sender: alloy_primitives::Address, floor: u64) {
+        let Some((from, dropped)) = self.state.advance_floor(sender, floor) else {
+            return;
+        };
+        metrics::record_floor_advance(self.cfg.partition_index);
+        // Every dropped buffered entry is a receipt-proven duplicate,
+        // skipped without relying on any dedup window. This is the
+        // spec's `resync_skipped_executed_total`. There is no separate
+        // flush-time filter: floors drain before any publish action is
+        // computed, so the state machine's floor is always current when
+        // `process` runs. A proven-stale incoming envelope takes the
+        // ordinary `Past`/DuplicatedTx path below, and is counted there.
+        metrics::record_resync_skip(self.cfg.partition_index, usize_to_u64(dropped));
+        trace!(
+            sender = ?sender,
+            from,
+            floor,
+            dropped,
+            "resync: receipt floor advanced nonce state"
+        );
     }
 
     /// The sealer rejected this sequencer's ref because its nonce was not
@@ -355,28 +392,42 @@ impl Sequencer {
     fn apply_contiguity_rejects(&mut self, r: &mut crate::resync::ResyncController) {
         let (drops, rewinds) = r.drain_contiguity_rejects();
         for (sender, n) in drops {
-            if self.unconfirmed.drop_committed(sender, n) {
-                trace!(
-                    sender = ?sender,
-                    nonce = n,
-                    "contiguity reject proves commitment; dropping unconfirmed entry (#85)"
-                );
-            }
+            self.drop_committed_and_trace(sender, n);
         }
         for (sender, expected) in rewinds {
-            let taken = self.unconfirmed.take_gap_rewinds(sender, expected);
-            if taken.is_empty() {
-                continue;
-            }
-            metrics::record_ref_republished(self.cfg.partition_index, taken.len());
-            warn!(
-                sender = ?sender,
-                expected,
-                count = taken.len(),
-                "sealer contiguity reject; rewinding unconfirmed refs for republish (#85)"
-            );
-            self.rewind_for_republish(taken);
+            self.rewind_one_gap(sender, expected);
         }
+    }
+
+    /// One committed-proof contiguity reject, for
+    /// [`Self::apply_contiguity_rejects`]'s first loop.
+    fn drop_committed_and_trace(&mut self, sender: alloy_primitives::Address, n: u64) {
+        if self.unconfirmed.drop_committed(sender, n) {
+            trace!(
+                sender = ?sender,
+                nonce = n,
+                "contiguity reject proves commitment; dropping unconfirmed entry (#85)"
+            );
+        }
+    }
+
+    /// One gap contiguity reject, for
+    /// [`Self::apply_contiguity_rejects`]'s second loop: rewind every
+    /// unconfirmed ref the ledger holds for `sender` at or after
+    /// `expected`, if any.
+    fn rewind_one_gap(&mut self, sender: alloy_primitives::Address, expected: u64) {
+        let taken = self.unconfirmed.take_gap_rewinds(sender, expected);
+        if taken.is_empty() {
+            return;
+        }
+        metrics::record_ref_republished(self.cfg.partition_index, taken.len());
+        warn!(
+            sender = ?sender,
+            expected,
+            count = taken.len(),
+            "sealer contiguity reject; rewinding unconfirmed refs for republish (#85)"
+        );
+        self.rewind_for_republish(taken);
     }
 
     /// Rewind refs past the confirm timeout for republish. See
@@ -600,28 +651,41 @@ impl Sequencer {
     {
         let mut publishes = Vec::new();
         for action in actions {
-            match action {
-                ProcessAction::Publish { nonce: n, payload } => {
-                    publishes.push((sender, n, payload));
-                }
-                ProcessAction::ReportDuplicate {
-                    nonce: n,
-                    expected_nonce,
-                } => {
-                    // Suppressed for receipt-proven skips (see above).
-                    // The client's transaction executed, so there is
-                    // nothing to report.
-                    if !self.proven_executed(sender, n) {
-                        rc.publish_error(TxError {
-                            sender,
-                            nonce: n,
-                            reason: TxErrorReason::DuplicatedTx { expected_nonce },
-                        });
-                    }
+            self.collect_one_action(rc, sender, action, &mut publishes);
+        }
+        publishes
+    }
+
+    /// One process action, for [`Self::collect_publishes`]'s loop: a
+    /// publish appends to `publishes`; a non-proven duplicate reports on
+    /// `rc`. A receipt-proven skip is suppressed: the client's
+    /// transaction already executed, so there is nothing to report.
+    fn collect_one_action<R>(
+        &self,
+        rc: &mut R,
+        sender: alloy_primitives::Address,
+        action: ProcessAction<RefMetadata>,
+        publishes: &mut Vec<(alloy_primitives::Address, u64, RefMetadata)>,
+    ) where
+        R: TxErrorPublisher,
+    {
+        match action {
+            ProcessAction::Publish { nonce: n, payload } => {
+                publishes.push((sender, n, payload));
+            }
+            ProcessAction::ReportDuplicate {
+                nonce: n,
+                expected_nonce,
+            } => {
+                if !self.proven_executed(sender, n) {
+                    rc.publish_error(TxError {
+                        sender,
+                        nonce: n,
+                        reason: TxErrorReason::DuplicatedTx { expected_nonce },
+                    });
                 }
             }
         }
-        publishes
     }
 
     /// Pin this thread to the configured core (if any) and loop until

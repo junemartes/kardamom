@@ -7,9 +7,7 @@
 //! which panic loudly instead of truncating if a future fixture ever grows
 //! past what those fields hold.
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, B256, TxKind, U256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_engine::actor::BufferedRecord;
 use kardamom_engine::block_env::ExecEnv;
@@ -43,28 +41,22 @@ pub(crate) fn tx(
     value: u64,
     i: u64,
 ) -> BufferedRecord {
-    let inner = TxLegacy {
-        chain_id: Some(1),
+    let envelope = kardamom_engine::actor::fixtures::LegacyTx {
+        chain_id: 1,
+        to,
         nonce,
-        gas_price: 1_000_000_000,
+        value,
         gas_limit: 100_000,
-        to: TxKind::Call(to),
-        value: U256::from(value),
-        input: alloy_primitives::Bytes::default(),
-    };
-    let mut m = inner;
-    let sig = signer.sign_transaction_sync(&mut m).unwrap();
-    let env: alloy_consensus::TxEnvelope = m.into_signed(sig).into();
-    let mut raw = Vec::new();
-    alloy_eips::eip2718::Encodable2718::encode_2718(&env, &mut raw);
+        gas_price: 1_000_000_000,
+    }
+    .sign(signer);
     BufferedRecord::Tx {
         tx_idx: TxIndex(i),
         position: position(i),
         envelope: TxEnvelope {
             correlation_id: i,
-            raw_tx: raw.into(),
-            sender: signer.address(),
             tx_hash: alloy_primitives::B256::repeat_byte(fixture_byte(i) + 1),
+            ..envelope
         },
     }
 }
@@ -281,10 +273,9 @@ pub(crate) fn test_pool() -> kardamom_stm::pool::WorkerPool {
     kardamom_stm::pool::WorkerPool::new(std::num::NonZeroUsize::new(4).expect("4 != 0"), &[])
 }
 
-/// A fixture batch size or worker count. Every caller passes a literal
-/// `> 0`.
-pub(crate) fn nz(n: usize) -> std::num::NonZeroUsize {
-    std::num::NonZeroUsize::new(n).expect("fixture batch size")
+/// A fixture batch size. Every caller passes a literal `> 0`.
+pub(crate) fn nz(n: usize) -> crate::parallel::BatchSize {
+    crate::parallel::BatchSize::new(std::num::NonZeroUsize::new(n).expect("fixture batch size"))
 }
 
 /// A fixture wire granularity. Every caller passes a literal `> 0`.

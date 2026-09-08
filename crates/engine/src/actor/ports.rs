@@ -3,7 +3,7 @@
 //!
 //! [`Either`] lets a binary that picks a role-specific wrapper at runtime
 //! (for example, the validator's optional attester tee, or its optional
-//! outbox extraction) name one concrete, dyn-free type as that associated
+//! outbox extraction) name one concrete, statically dispatched type as that associated
 //! type in its [`EngineWiring`](super::EngineWiring). Two independent
 //! optional layers compose as `Either<Outer<Either<Inner<P>, P>>,
 //! Either<Inner<P>, P>>`; nesting further composes the same way.

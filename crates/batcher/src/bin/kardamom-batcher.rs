@@ -197,7 +197,7 @@ impl Cli {
         let b_segment = self
             .channel_b_segment
             .clone()
-            .expect("clap: --channel-b-segment required unless --live");
+            .context("--channel-b-segment is required unless --live")?;
         let a_segments = MultiArchiveConfig::parse_a_spec(&self.channel_a_archive)?;
         let multi_cfg = MultiArchiveConfig {
             b_segment,

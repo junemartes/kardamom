@@ -86,7 +86,9 @@ pub async fn submit_next_proof<P: Provider>(
     let Ok(pv) = std::fs::read(dir.join("public-values.bin")) else {
         return Ok(SubmitOutcome::ProofNotReady { batch_index: next });
     };
-    let proof = std::fs::read(dir.join("proof.bin")).unwrap_or_default();
+    let Ok(proof) = std::fs::read(dir.join("proof.bin")) else {
+        return Ok(SubmitOutcome::ProofNotReady { batch_index: next });
+    };
 
     // Fail fast on the client side for anything the contract would reject.
     // This is cheaper than a revert, and gives a precise error instead of a

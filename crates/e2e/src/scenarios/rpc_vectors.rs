@@ -82,24 +82,23 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
     Ok(())
 }
 
-/// Run every request/expectation pair in one vector file.
-async fn run_vector_file(
-    t: &Target,
-    subs: &BTreeMap<String, Value>,
-    file: &str,
-    text: &str,
-) -> Result<()> {
-    for (i, (req, expect)) in parse(text)
-        .with_context(|| format!("parse vectors/rpc/{file}.io"))?
-        .into_iter()
-        .enumerate()
-    {
-        let req = substitute(req, subs);
-        let expect = substitute(expect, subs);
-        let method = req["method"]
+/// One request/expectation pair from a vector file, with its position for
+/// error messages.
+struct RpcVectorCase<'a> {
+    file: &'a str,
+    index: usize,
+    req: Value,
+    expect: Value,
+}
+
+impl RpcVectorCase<'_> {
+    /// Send `self.req` and check the reply against `self.expect`.
+    async fn check(&self, t: &Target) -> Result<()> {
+        let method = self.req["method"]
             .as_str()
-            .with_context(|| format!("{file}[{i}]: request has no method"))?;
-        let params: Vec<Value> = req["params"].as_array().cloned().unwrap_or_default();
+            .with_context(|| format!("{}[{}]: request has no method", self.file, self.index))?;
+        // JSON-RPC params are optional; a missing array means the call takes none.
+        let params: Vec<Value> = self.req["params"].as_array().cloned().unwrap_or_default();
 
         let outcome = t.rpc.raw_call(method, &params).await;
         let actual = match outcome.result {
@@ -108,10 +107,37 @@ async fn run_vector_file(
                 json!({ "error": { "code": code, "message": message } })
             }
             Err(RpcError::Transport(e)) => {
-                bail!("{file}[{i}] {method}: transport error (the contract forbids these): {e}")
+                bail!(
+                    "{}[{}] {method}: transport error (the contract forbids these): {e}",
+                    self.file,
+                    self.index
+                )
             }
         };
-        matches(&expect, &actual).with_context(|| format!("{file}[{i}] {method}: got {actual}"))?;
+        matches(&self.expect, &actual)
+            .with_context(|| format!("{}[{}] {method}: got {actual}", self.file, self.index))
+    }
+}
+
+/// Run every request/expectation pair in one vector file.
+async fn run_vector_file(
+    t: &Target,
+    subs: &BTreeMap<String, Value>,
+    file: &str,
+    text: &str,
+) -> Result<()> {
+    let cases = parse(text)
+        .with_context(|| format!("parse vectors/rpc/{file}.io"))?
+        .into_iter()
+        .enumerate()
+        .map(|(index, (req, expect))| RpcVectorCase {
+            file,
+            index,
+            req: substitute(req, subs),
+            expect: substitute(expect, subs),
+        });
+    for case in cases {
+        case.check(t).await?;
     }
     Ok(())
 }

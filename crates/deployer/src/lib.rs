@@ -33,6 +33,14 @@ pub use spec::{
     encode_address_pair, encode_init_calldata, encode_oracle_init_args,
 };
 
+/// Strip an optional `0x` prefix from a hex string. The prefix is
+/// optional input, not an error case, so a string without it passes
+/// through unchanged.
+#[must_use]
+pub fn strip_hex_prefix(s: &str) -> &str {
+    s.strip_prefix("0x").unwrap_or(s)
+}
+
 /// A private-key CLI flag: either the hex key itself, or `env:VAR` to read
 /// it from an environment variable. This is the one place the workspace
 /// parses that convention.

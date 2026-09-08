@@ -106,23 +106,32 @@ fn all_nodes(st: &RefState) -> (B256, HashMap<B256, Bytes>) {
 
     // Each non-empty storage trie, all keys as targets.
     for (_, storage) in st.values() {
-        if storage.is_empty() {
-            continue;
-        }
-        let sentries: BTreeMap<B256, Vec<u8>> = storage
-            .iter()
-            .filter(|(_, v)| !v.is_zero())
-            .map(|(k, v)| {
-                let mut rlp = Vec::new();
-                alloy_rlp::Encodable::encode(v, &mut rlp);
-                (keccak256(k), rlp)
-            })
-            .collect();
-        let stargets: Vec<B256> = sentries.keys().copied().collect();
-        let (_, storage_nodes) = retained_nodes(&sentries, &stargets);
-        nodes.extend(storage_nodes.into_iter().map(|n| (keccak256(&n), n)));
+        nodes.extend(storage_trie_nodes(storage));
     }
     (root, nodes)
+}
+
+/// One account's storage-trie nodes, keyed by hash. Empty for an empty
+/// storage map: there is no trie to retain nodes from.
+fn storage_trie_nodes(storage: &BTreeMap<B256, U256>) -> HashMap<B256, Bytes> {
+    if storage.is_empty() {
+        return HashMap::new();
+    }
+    let sentries: BTreeMap<B256, Vec<u8>> = storage
+        .iter()
+        .filter(|(_, v)| !v.is_zero())
+        .map(|(k, v)| {
+            let mut rlp = Vec::new();
+            alloy_rlp::Encodable::encode(v, &mut rlp);
+            (keccak256(k), rlp)
+        })
+        .collect();
+    let stargets: Vec<B256> = sentries.keys().copied().collect();
+    let (_, storage_nodes) = retained_nodes(&sentries, &stargets);
+    storage_nodes
+        .into_iter()
+        .map(|n| (keccak256(&n), n))
+        .collect()
 }
 
 fn proofs_from(nodes: impl IntoIterator<Item = Bytes>) -> WitnessProofs {
@@ -202,20 +211,36 @@ fn anchored<T>(
 ) -> (T, WitnessProofs) {
     let mut have: Vec<Bytes> = Vec::new();
     for round in 0..(all.len() + 2) {
-        let proofs = proofs_from(have.clone());
-        match op(&proofs) {
-            Ok(v) => return (v, proofs),
-            Err(AnchorError::MissingNode { hash, .. }) => {
-                have.push(
-                    all.get(&hash)
-                        .unwrap_or_else(|| panic!("round {round}: unknown node {hash}"))
-                        .clone(),
-                );
-            }
-            Err(e) => panic!("unexpected anchor error: {e:?}"),
+        if let Some(result) = fixed_point_step(all, &mut have, &op, round) {
+            return result;
         }
     }
     panic!("fixed point diverged");
+}
+
+/// One [`anchored`] round: try `op` over the nodes gathered so far, and
+/// on a missing-node refusal, add the node it named and ask for another
+/// round. `None` means "not converged yet"; the `for` loop in
+/// [`anchored`] dispatches only on whether this returns.
+fn fixed_point_step<T>(
+    all: &HashMap<B256, Bytes>,
+    have: &mut Vec<Bytes>,
+    op: &impl Fn(&WitnessProofs) -> Result<T, AnchorError>,
+    round: usize,
+) -> Option<(T, WitnessProofs)> {
+    let proofs = proofs_from(have.clone());
+    match op(&proofs) {
+        Ok(v) => Some((v, proofs)),
+        Err(AnchorError::MissingNode { hash, .. }) => {
+            have.push(
+                all.get(&hash)
+                    .unwrap_or_else(|| panic!("round {round}: unknown node {hash}"))
+                    .clone(),
+            );
+            None
+        }
+        Err(e) => panic!("unexpected anchor error: {e:?}"),
+    }
 }
 
 #[test]

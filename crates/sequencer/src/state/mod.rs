@@ -202,12 +202,25 @@ impl<T> PartitionState<T> {
         // Borrow `pending` and `next` as separate fields. This avoids
         // snapshotting the sender list into a `Vec` first.
         for (&sender, buf) in &mut self.pending {
-            let expected = self.next.get(&sender).copied().unwrap_or(0);
-            if let Some(advanced) = Self::drain_sender_run(buf, sender, expected, &mut out) {
-                self.next.insert(sender, advanced);
-            }
+            Self::drain_one_sender(&mut self.next, buf, sender, &mut out);
         }
         out
+    }
+
+    /// One sender's drain, for [`Self::drain_pending`]'s loop: an
+    /// associated function over the disjoint `next`/`pending` fields, so
+    /// the loop's own `&mut self.pending` borrow and this call's
+    /// `&mut self.next` borrow coexist.
+    fn drain_one_sender(
+        next: &mut HashMap<Address, u64>,
+        buf: &mut PendingBuffer<T>,
+        sender: Address,
+        out: &mut Vec<(Address, u64, T)>,
+    ) {
+        let expected = next.get(&sender).copied().unwrap_or(0);
+        if let Some(advanced) = Self::drain_sender_run(buf, sender, expected, out) {
+            next.insert(sender, advanced);
+        }
     }
 
     /// Drain `buf`'s contiguous run starting at `expected`, tagged with

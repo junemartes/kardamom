@@ -197,7 +197,15 @@ pub fn spool_block(
         records_digest: digest.finish(),
         bal_commitment: keccak256(&bal_rlp),
     };
-    let input = assemble_prover_input(chain_id, env, witness, proofs, records, bal_rlp, 1)?;
+    let input = assemble_prover_input(ProverInputParts {
+        chain_id,
+        env,
+        witness,
+        proofs,
+        records,
+        bal_rlp,
+        granularity: std::num::NonZeroU16::MIN,
+    })?;
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&input)
         .map_err(|e| ExecutorError::State(format!("serialize prover input: {e}")))?;
 
@@ -236,17 +244,30 @@ fn write_frame(
         .map_err(|e| ExecutorError::State(format!("write spool frame: {e}")))
 }
 
-/// Build the wire frame. The boundary carried is the one the block ran
-/// under; `env` holds its fields, rebuilt to the exact live shape.
-fn assemble_prover_input(
+/// [`assemble_prover_input`]'s seven fields, gathered so the function
+/// reads no seven-argument list.
+struct ProverInputParts<'a> {
     chain_id: u64,
     env: ExecEnv,
     witness: ExecutionWitness,
     proofs: WitnessProofs,
-    records: &[BufferedRecord],
+    records: &'a [BufferedRecord],
     bal_rlp: Vec<u8>,
-    granularity: u16,
-) -> Result<ProverInput, ExecutorError> {
+    granularity: std::num::NonZeroU16,
+}
+
+/// Build the wire frame. The boundary carried is the one the block ran
+/// under; `parts.env` holds its fields, rebuilt to the exact live shape.
+fn assemble_prover_input(parts: ProverInputParts<'_>) -> Result<ProverInput, ExecutorError> {
+    let ProverInputParts {
+        chain_id,
+        env,
+        witness,
+        proofs,
+        records,
+        bal_rlp,
+        granularity,
+    } = parts;
     Ok(ProverInput {
         chain_id,
         boundary: BlockBoundaryStart {
@@ -280,9 +301,9 @@ pub fn spawn_prover_spool(
         let mut cursor = SpoolCursor::new();
         loop {
             // Writer gone => the chain is shutting down; exit the task.
-            if watch.changed().await.is_err() {
+            let Ok(()) = watch.changed().await else {
                 return;
-            }
+            };
             let Some(snap) = watch.borrow_and_update().clone() else {
                 continue;
             };
@@ -294,28 +315,35 @@ pub fn spawn_prover_spool(
             let Some((_, env, records)) = cursor.take_records(&flight, next, at) else {
                 continue;
             };
-            match spool_block(&spool_dir, chain_id, &pinned, env, &records) {
-                Ok(outputs) => {
-                    crate::metrics::counter_prover_spooled();
-                    tracing::info!(
-                        block = next,
-                        post_root = %outputs.post_state_root,
-                        "prover spool: frame written"
-                    );
-                }
-                Err(e) => {
-                    // An anchoring failure here is a real integrity
-                    // signal, one of the same classes the guest stops on.
-                    // But the spool is an observer, not a verifier seam:
-                    // log it loudly and keep the chain alive. The
-                    // verification paths own the stop.
-                    crate::metrics::counter_prover_failed();
-                    tracing::error!(block = next, error = %e, "prover spool: block failed");
-                }
-            }
+            record_spool_result(
+                next,
+                spool_block(&spool_dir, chain_id, &pinned, env, &records),
+            );
             cursor.advance(next);
         }
     })
+}
+
+/// Log one spooled block's outcome, and bump its metric. The spool is an
+/// observer, not a verifier seam: even an anchoring failure — a real
+/// integrity signal, one of the same classes the guest stops on — is
+/// logged loudly and the chain stays alive. The verification paths own
+/// the stop.
+fn record_spool_result(block: u64, result: Result<PublicOutputs, ExecutorError>) {
+    match result {
+        Ok(outputs) => {
+            crate::metrics::counter_prover_spooled();
+            tracing::info!(
+                block,
+                post_root = %outputs.post_state_root,
+                "prover spool: frame written"
+            );
+        }
+        Err(e) => {
+            crate::metrics::counter_prover_failed();
+            tracing::error!(block, error = %e, "prover spool: block failed");
+        }
+    }
 }
 
 /// Outcome of one pin-state update: either the next block to prove is

@@ -31,12 +31,8 @@ use std::time::Duration;
 async fn init_on_a_free_port() -> SocketAddr {
     let mut last_err = None;
     for _ in 0..5 {
-        let free: SocketAddr = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        match kardamom_obs::init("obs-test", free, "runtime-host", "0.0.0", "deadbeef").await {
-            Ok(()) => return free,
+        match try_init_on_a_free_port().await {
+            Ok(free) => return free,
             Err(e) => last_err = Some(e),
         }
     }
@@ -44,6 +40,19 @@ async fn init_on_a_free_port() -> SocketAddr {
         "init never succeeded on a freshly-picked free port: {:#}",
         last_err.expect("at least one attempt records an error")
     );
+}
+
+/// One [`init_on_a_free_port`] attempt: pick a free port, then run `init`
+/// on it. Returns the port on success, so the caller does not need to
+/// re-derive it.
+async fn try_init_on_a_free_port() -> anyhow::Result<SocketAddr> {
+    let free: SocketAddr = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    kardamom_obs::init("obs-test", free, "runtime-host", "0.0.0", "deadbeef")
+        .await
+        .map(|()| free)
 }
 
 #[test]

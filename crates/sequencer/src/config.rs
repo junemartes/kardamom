@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::partition::PartitionCount;
 
+/// [`SequencerConfig::default`]'s partition count.
+const DEFAULT_PARTITION_COUNT: NonZeroU32 = NonZeroU32::new(8).unwrap();
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SequencerConfig {
@@ -63,7 +66,7 @@ pub enum BackpressurePolicy {
 impl Default for SequencerConfig {
     fn default() -> Self {
         Self {
-            partition_count: PartitionCount::new(NonZeroU32::new(8).expect("8 != 0")),
+            partition_count: PartitionCount::new(DEFAULT_PARTITION_COUNT),
             partition_index: 0,
             sequencer_id: 0,
             max_pending_per_sender: 16,

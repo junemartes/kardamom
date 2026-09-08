@@ -30,6 +30,7 @@ full-pipeline-e2e = [
     "dep:kardamom-da-watcher",
     "dep:kardamom-exec-core",
     "dep:kardamom-deployer",
+    "dep:kardamom-ingress",
     "dep:kardamom-obs",
     "dep:kardamom-state",
     "dep:libc",
@@ -73,6 +74,9 @@ alloy-sol-types = { workspace = true, optional = true }
 kardamom-da-watcher = { path = "../da_watcher", optional = true, features = ["test-support"] }
 kardamom-exec-core = { path = "../exec-core", optional = true }
 kardamom-deployer = { path = "../deployer", optional = true, features = ["test-support"] }
+# The metric name `INGRESS_QUEUE_DEPTH` re-exports; e2e itself never
+# drives the ingress binary directly (Target-L/-C spawn it as a process).
+kardamom-ingress = { path = "../ingress", optional = true }
 # `testkit` (free_port/free_udp_port/scrape) is the shared home for the
 # ephemeral-port and metrics-scrape helpers every harness process needs.
 kardamom-obs = { path = "../obs", optional = true, features = ["test-support"] }

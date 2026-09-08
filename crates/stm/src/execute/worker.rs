@@ -265,7 +265,6 @@ impl<S: StateDatabase> Acquire<'_, S> {
     fn spin(&self) -> bool {
         let spin_start = std::time::Instant::now();
         loop {
-            Self::spin_burst();
             match self.spin_poll(spin_start) {
                 SpinPoll::Found => return true,
                 SpinPoll::GiveUp => return false,
@@ -286,6 +285,7 @@ impl<S: StateDatabase> Acquire<'_, S> {
     /// spinning, or give up (the block ended or the spin budget ran
     /// out). The `loop` in [`Self::spin`] stays free of a branch.
     fn spin_poll(&self, spin_start: std::time::Instant) -> SpinPoll {
+        Self::spin_burst();
         // Lock-free probe: a dry worker spinning here for tens of
         // microseconds must not contend with the feed's push into this
         // very queue.
@@ -518,6 +518,85 @@ fn record_result<S: StateDatabase>(
     std::ops::ControlFlow::Continue(())
 }
 
+/// [`JobArgs::run`]'s fixed-per-block inputs, bundled so the method
+/// takes one argument for them instead of five loose parameters.
+struct JobArgs<'a, S: StateDatabase> {
+    ctx: &'a BlockCtx<S>,
+    bound: &'a BoundLayers,
+    worker: usize,
+    n_workers: usize,
+    job: u32,
+}
+
+impl<S: StateDatabase> JobArgs<'_, S> {
+    /// Run one job to completion: execute it, fold its timing and
+    /// write-domain counts into `locals`, record its result, and (only
+    /// on success) release the next job it unblocks. Returns
+    /// [`std::ops::ControlFlow::Break`] when the block aborted, so
+    /// [`run_worker_block`]'s loop stops. This is the whole
+    /// per-iteration step; the loop only dispatches on it.
+    fn run(
+        self,
+        evm: &mut WorkerEvm<'_, S>,
+        read_stash: &mut Vec<Vec<ReadRecord>>,
+        locals: &mut LocalTotals,
+        local_next: &mut Option<u32>,
+    ) -> std::ops::ControlFlow<()> {
+        let JobArgs {
+            ctx,
+            bound,
+            worker,
+            n_workers,
+            job,
+        } = self;
+        let slot = ctx.slot(job as usize);
+        let t_busy_at = nanos(ctx.started.elapsed());
+        let r = execute_one(
+            evm,
+            TxJob {
+                local_idx: job,
+                tx_idx: slot.tx_idx,
+                position: slot.position,
+                envelope: &slot.envelope,
+                decoded: slot.decoded.as_ref(),
+            },
+            ExecCtx {
+                mv: &ctx.mv,
+                metrics: &ctx.metrics,
+                env: ctx.env,
+                sink_start_balance: bound.sink_start_balance,
+                bal_base: ctx.bal_base,
+            },
+            &mut || take_read_buf(read_stash, &ctx.recycle),
+        );
+        // Timestamps stay worker-local and fold once per block. Stamping
+        // them globally cost two clock reads and two contended
+        // read-modify-writes per transaction. On a small transfer, the
+        // instrumentation was a measurable share of the work it claimed
+        // to measure.
+        let done_at = nanos(ctx.started.elapsed());
+        let (own, foreign) = record_write_domains(&r, worker, n_workers);
+        locals.record(t_busy_at, done_at, own, foreign);
+        let outcome = record_result(ctx, job, r);
+        if outcome.is_continue() {
+            complete_job(ctx, worker, job, local_next);
+        }
+        outcome
+    }
+}
+
+/// End this worker's block: no more jobs are ready, and none will
+/// become ready (either the block drained, or it aborted upstream).
+/// Flushes the worker's local metrics before it parks.
+fn end_of_block<S: StateDatabase>(
+    ctx: &BlockCtx<S>,
+    worker: usize,
+    evm: &mut WorkerEvm<'_, S>,
+    locals: &LocalTotals,
+) {
+    flush_local_metrics(ctx, worker, evm, locals);
+}
+
 pub(super) fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
     let Some(bound) = wait_for_binding(ctx) else {
         return;
@@ -536,40 +615,18 @@ pub(super) fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usiz
     let n_workers = ctx.queues.len();
     loop {
         let Some(job) = next_job(ctx, worker, qh, &mut local_next) else {
-            flush_local_metrics(ctx, worker, &mut evm, &locals);
-            return;
+            return end_of_block(ctx, worker, &mut evm, &locals);
         };
-        let slot = ctx.slot(job as usize);
-        let t_busy_at = nanos(ctx.started.elapsed());
-        let r = execute_one(
-            &mut evm,
-            TxJob {
-                local_idx: job,
-                tx_idx: slot.tx_idx,
-                position: slot.position,
-                envelope: &slot.envelope,
-                decoded: slot.decoded.as_ref(),
-            },
-            ExecCtx {
-                mv: &ctx.mv,
-                metrics: &ctx.metrics,
-                env: ctx.env,
-                sink_start_balance: bound.sink_start_balance,
-                bal_base: ctx.bal_base,
-            },
-            &mut || take_read_buf(&mut read_stash, &ctx.recycle),
-        );
-        // Timestamps stay worker-local and fold once per block. Stamping
-        // them globally cost two clock reads and two contended
-        // read-modify-writes per transaction. On a small transfer, the
-        // instrumentation was a measurable share of the work it claimed
-        // to measure.
-        let done_at = nanos(ctx.started.elapsed());
-        let (own, foreign) = record_write_domains(&r, worker, n_workers);
-        locals.record(t_busy_at, done_at, own, foreign);
-        match record_result(ctx, job, r) {
-            std::ops::ControlFlow::Break(()) => return,
-            std::ops::ControlFlow::Continue(()) => complete_job(ctx, worker, job, &mut local_next),
+        let outcome = JobArgs {
+            ctx,
+            bound,
+            worker,
+            n_workers,
+            job,
+        }
+        .run(&mut evm, &mut read_stash, &mut locals, &mut local_next);
+        if outcome.is_break() {
+            return;
         }
     }
 }

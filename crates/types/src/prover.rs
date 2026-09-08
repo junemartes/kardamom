@@ -13,6 +13,7 @@
 //! artifact, with no re-encoding ambiguity.
 
 use alloc::vec::Vec;
+use core::num::NonZeroU16;
 
 use alloy_primitives::{B256, Keccak256};
 use bytes::Bytes;
@@ -53,7 +54,9 @@ pub struct ProverInput {
     /// the guest re-derives it and compares.
     #[rkyv(with = wire::BytesVec)]
     pub bal_rlp: Bytes,
-    pub granularity: u16,
+    /// The BAL attribution granularity this frame was quantized at.
+    /// Never zero — a wire frame with granularity 0 does not decode.
+    pub granularity: NonZeroU16,
 }
 
 /// A 160-byte, five-word Solidity ABI frame. [`PublicOutputs`] and
@@ -93,7 +96,7 @@ impl Words160 {
         if word[..24].iter().any(|&b| b != 0) {
             return None;
         }
-        Some(u64::from_be_bytes(word[24..32].try_into().unwrap()))
+        Some(u64::from_be_bytes(*word.last_chunk::<8>()?))
     }
 
     fn into_bytes(self) -> [u8; Self::LEN] {

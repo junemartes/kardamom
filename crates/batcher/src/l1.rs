@@ -175,21 +175,29 @@ pub fn recover_blocks<S: BlobSource>(
     descriptors: &[BatchDescriptor],
     source: &S,
 ) -> Result<Vec<BlockFrame>, BatcherError> {
-    // Keep this as a loop. `verify_blob_against_hash`'s KZG check already
-    // uses most of the default test-thread stack; the extra frames an
-    // iterator/closure chain adds here are enough to overflow it.
     let mut blocks = Vec::new();
     for d in descriptors {
-        let mut blobs = Vec::with_capacity(d.versioned_hashes.len());
-        for vh in &d.versioned_hashes {
-            let blob = source.fetch_blob(*vh)?;
-            verify_blob_against_hash(*vh, &blob)?;
-            blobs.push(blob);
-        }
-        let frames = reconstruct(&blobs)?;
-        blocks.extend(frames);
+        blocks.extend(recover_one_batch(d, source)?);
     }
     Ok(blocks)
+}
+
+/// Fetch and verify one batch's blobs, then decode them. This function
+/// uses a plain `for` loop, not an iterator chain: `verify_blob_against_
+/// hash`'s KZG check already uses most of the default test-thread stack,
+/// and the extra frames a closure chain adds here are enough to overflow
+/// it.
+fn recover_one_batch<S: BlobSource>(
+    d: &BatchDescriptor,
+    source: &S,
+) -> Result<Vec<BlockFrame>, BatcherError> {
+    let mut blobs = Vec::with_capacity(d.versioned_hashes.len());
+    for vh in &d.versioned_hashes {
+        let blob = source.fetch_blob(*vh)?;
+        verify_blob_against_hash(*vh, &blob)?;
+        blobs.push(blob);
+    }
+    reconstruct(&blobs)
 }
 
 /// Prove that `blob`'s bytes are the ones L1 committed to as

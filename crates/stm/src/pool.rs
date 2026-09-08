@@ -123,9 +123,16 @@ impl Shared {
             let Some(job) = self.wait_for_next_job(&mut seen) else {
                 return;
             };
-            self.run_lane_chunks(li, job);
-            self.signal_if_last();
+            self.run_job(li, job);
         }
+    }
+
+    /// Run every chunk this lane claims from `job`, then signal the
+    /// caller once every lane has drained it. The `loop` in
+    /// [`Self::lane_loop`] stays free of a branch.
+    fn run_job(&self, li: usize, job: Job) {
+        self.run_lane_chunks(li, job);
+        self.signal_if_last();
     }
 
     /// Wait for a job newer than `seen`, updating it in place. Returns
@@ -165,8 +172,8 @@ impl Shared {
         JobWait::Retry(g)
     }
 
-    /// Signal the caller once every lane has drained the current job.
-    /// The `if` in [`Self::lane_loop`] stays free of a loop.
+    /// Signal the caller once every lane has drained the current job:
+    /// the fetch-sub result of 1 means this call is the last lane out.
     fn signal_if_last(&self) {
         if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
             // Last one out wakes the caller.

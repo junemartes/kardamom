@@ -71,6 +71,12 @@ pub enum ExecutorError {
     #[error("tx_receipts publication closed")]
     TxReceiptsClosed,
 
+    /// The executor-local `TxIndex` counter reached `u64::MAX` and cannot
+    /// advance. This would need more than `u64::MAX` transactions in one
+    /// process lifetime.
+    #[error("TxIndex counter overflowed u64")]
+    TxIndexOverflow,
+
     /// The `tx_ordering` reader pulled a [`kardamom_types::TxRef`], but the
     /// referenced envelope never appeared on `tx_data` within the join
     /// timeout. Either the `tx_data` publisher failed, or the sequencer
@@ -81,7 +87,7 @@ pub enum ExecutorError {
     JoinTimeout {
         sequencer_id: u8,
         tx_data_position: BPosition,
-        timeout_ms: u64,
+        timeout_ms: u128,
     },
 
     /// Mirror of [`Self::JoinTimeout`] for the deposit path. The
@@ -95,7 +101,7 @@ pub enum ExecutorError {
     DepositJoinTimeout {
         source_hash: B256,
         deposit_position: BPosition,
-        timeout_ms: u64,
+        timeout_ms: u128,
     },
 }
 

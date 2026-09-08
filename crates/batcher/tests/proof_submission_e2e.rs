@@ -220,3 +220,47 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
         .unwrap();
     assert_eq!(out, SubmitOutcome::NoBatchPosted { batch_index: 2 });
 }
+
+/// A `public-values.bin` file with no matching `proof.bin` must report
+/// `ProofNotReady`, not submit an empty proof to the oracle.
+#[tokio::test]
+async fn missing_proof_file_reports_not_ready() {
+    let Some(s) = setup().await else {
+        eprintln!("SKIP: anvil unavailable");
+        return;
+    };
+    let settlement = IKardamomL2Settlement::new(s.settlement_addr, s.provider.clone());
+    let batch = build_real_batch();
+    settlement
+        .postBatch(
+            0,
+            vec![B256::repeat_byte(0xA1)],
+            batch.l2_block_start,
+            batch.l2_block_end,
+            batch.records_commitment,
+        )
+        .from(BATCHER)
+        .send()
+        .await
+        .expect("postBatch")
+        .get_receipt()
+        .await
+        .expect("postBatch receipt");
+
+    let pv = BatchPublicOutputs {
+        pre_state_root: GENESIS_ROOT,
+        post_state_root: POST_ROOT,
+        first_block: batch.l2_block_start,
+        last_block: batch.l2_block_end,
+        records_commitment: batch.records_commitment,
+    };
+    let dir: PathBuf = s.proofs_dir.path().join("batch-7-8");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("public-values.bin"), pv.encode()).unwrap();
+
+    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
+        .await
+        .unwrap();
+    assert_eq!(out, SubmitOutcome::ProofNotReady { batch_index: 1 });
+    assert_eq!(s.oracle.lastFinalizedBatch().call().await.unwrap(), 0);
+}

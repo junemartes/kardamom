@@ -154,23 +154,30 @@ impl StateEnvBuilder {
             )));
         }
 
-        // Create every named DB once, so handles are cached in the
-        // environment. A downstream read-only transaction then does not
-        // need to call `create_db`. Skip this step in read-only mode: the
-        // tables already exist, and a read-write transaction is not
-        // possible in that mode.
+        // Skip table creation in read-only mode: the tables already
+        // exist, and a read-write transaction is not possible in that
+        // mode.
         if !self.read_only {
-            let txn = env.begin_rw_sync()?;
-            for name in ALL_TABLES {
-                txn.create_db(Some(name), DatabaseFlags::empty())?;
-            }
-            txn.commit()?;
+            Self::create_all_tables(&env)?;
         }
 
         Ok(StateEnv {
             env: Arc::new(env),
             path: self.path,
         })
+    }
+
+    /// Create every named DB once, so handles are cached in the
+    /// environment. A downstream read-only transaction then does not
+    /// need to call `create_db`.
+    fn create_all_tables(env: &Environment) -> Result<(), StateError> {
+        let txn = env.begin_rw_sync()?;
+        ALL_TABLES.iter().try_for_each(|name| {
+            txn.create_db(Some(name), DatabaseFlags::empty())
+                .map(|_| ())
+        })?;
+        txn.commit()?;
+        Ok(())
     }
 }
 

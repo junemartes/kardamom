@@ -75,6 +75,8 @@ impl StateSnapshot {
     fn open_on(env: Arc<Environment>) -> Result<Self, StateError> {
         let txn = env.begin_ro_sync()?;
         let meta = txn.open_db(Some(TABLE_META))?;
+        // An absent key means genesis: no block has committed yet, so 0 is
+        // the correct block number, not a missing-data sentinel.
         let block_number = read_meta_u64(&txn, meta, KEY_LAST_COMMITTED_BLOCK)?.unwrap_or(0);
         let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS))?;
         let storage_db = txn.open_db(Some(TABLE_STORAGE))?;

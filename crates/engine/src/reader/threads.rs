@@ -133,6 +133,13 @@ enum Flow {
     Stop,
 }
 
+/// Why [`OrderingLoop::send_expanded`]'s item loop stopped early: the exec
+/// sink closed (not an error), or the record counter overflowed (fatal).
+enum ExpandHalt {
+    Stopped,
+    Failed(ExecutorError),
+}
+
 /// The `tx_ordering` reader's per-message loop state: the join buffer and its
 /// optional archive recovery, the canonical-id dedup window, the
 /// executor-local record counter, and the exec sink. One instance lives for
@@ -176,10 +183,16 @@ impl<S: ExecSink> OrderingLoop<S> {
     }
 
     /// Allot the next executor-local record index.
-    fn next_idx(&mut self) -> TxIndex {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the counter would overflow `u64`. This reader
+    /// thread would need to process more than `u64::MAX` records first,
+    /// which cannot happen within a process lifetime.
+    fn next_idx(&mut self) -> Result<TxIndex, ExecutorError> {
         let idx = self.next_tx_idx;
-        self.next_tx_idx = self.next_tx_idx.next();
-        idx
+        self.next_tx_idx = self.next_tx_idx.next()?;
+        Ok(idx)
     }
 
     /// Send one message to the exec sink. `Stop` means the exec thread is
@@ -200,17 +213,21 @@ impl<S: ExecSink> OrderingLoop<S> {
         &mut self,
         items: Vec<T>,
         make: impl Fn(TxIndex, T) -> ReaderToExec,
-    ) -> Flow {
-        let flow = items.into_iter().try_for_each(|item| {
-            let tx_idx = self.next_idx();
+    ) -> Result<Flow, ExecutorError> {
+        let outcome = items.into_iter().try_for_each(|item| {
+            let tx_idx = match self.next_idx() {
+                Ok(idx) => idx,
+                Err(e) => return ControlFlow::Break(ExpandHalt::Failed(e)),
+            };
             match self.send(make(tx_idx, item)) {
                 Flow::Continue => ControlFlow::Continue(()),
-                Flow::Stop => ControlFlow::Break(()),
+                Flow::Stop => ControlFlow::Break(ExpandHalt::Stopped),
             }
         });
-        match flow {
-            ControlFlow::Continue(()) => Flow::Continue,
-            ControlFlow::Break(()) => Flow::Stop,
+        match outcome {
+            ControlFlow::Continue(()) => Ok(Flow::Continue),
+            ControlFlow::Break(ExpandHalt::Stopped) => Ok(Flow::Stop),
+            ControlFlow::Break(ExpandHalt::Failed(e)) => Err(e),
         }
     }
 
@@ -233,9 +250,9 @@ impl<S: ExecSink> OrderingLoop<S> {
         }
         let wait = JoinWait::new(&self.buffer, &mut self.recovery, &tx_ref, &self.cfg)?;
         let Some(env) = wait.run() else {
-            // `timeout_ms` is a config value, always small; `u64::MAX` is an
-            // unreachable fallback, kept only so this never panics.
-            let timeout_ms = u64::try_from(self.cfg.join_timeout.as_millis()).unwrap_or(u64::MAX);
+            // `Duration::as_millis` already returns `u128`, so this needs no
+            // fallible narrowing to a smaller integer.
+            let timeout_ms = self.cfg.join_timeout.as_millis();
             warn!(
                 target: "kardamom_executor::reader",
                 sequencer_id = tx_ref.shard_id,
@@ -251,7 +268,7 @@ impl<S: ExecSink> OrderingLoop<S> {
             });
         };
         self.warn_on_buffer_growth();
-        let tx_idx = self.next_idx();
+        let tx_idx = self.next_idx()?;
         Ok(self.send(ReaderToExec::Tx {
             tx_idx,
             envelope: env,
@@ -283,23 +300,27 @@ impl<S: ExecSink> OrderingLoop<S> {
     /// transaction. The deposits travel inside the epoch record. Unlike a
     /// `DepositRef`, there is no side-stream join to wait on; nothing here
     /// can time out or go missing.
-    fn expand_epoch(&mut self, epoch: EpochRecord, position: BPosition) -> Flow {
+    fn expand_epoch(
+        &mut self,
+        epoch: EpochRecord,
+        position: BPosition,
+    ) -> Result<Flow, ExecutorError> {
         if !self.seen_canonical_ids.first_seen(epoch.canonical_id()) {
             debug!(
                 target: "kardamom_executor::reader",
                 l1_number = epoch.l1_number,
                 "skipping duplicate Epoch (MDS racing sequencers)"
             );
-            return Flow::Continue;
+            return Ok(Flow::Continue);
         }
         let deposits = epoch.deposits.clone();
-        let marker_idx = self.next_idx();
+        let marker_idx = self.next_idx()?;
         if let Flow::Stop = self.send(ReaderToExec::Epoch {
             tx_idx: marker_idx,
             epoch,
             position,
         }) {
-            return Flow::Stop;
+            return Ok(Flow::Stop);
         }
         self.send_expanded(deposits, |tx_idx, deposit| ReaderToExec::Deposit {
             tx_idx,
@@ -315,7 +336,11 @@ impl<S: ExecSink> OrderingLoop<S> {
     /// republish byte-identical records, collapsed here on `canonical_id`.
     /// Messages travel inside the record, so as with epoch deposits there
     /// is no side-stream join to wait on.
-    fn expand_remote_epoch(&mut self, rec: RemoteEpochRecord, position: BPosition) -> Flow {
+    fn expand_remote_epoch(
+        &mut self,
+        rec: RemoteEpochRecord,
+        position: BPosition,
+    ) -> Result<Flow, ExecutorError> {
         if !self.seen_canonical_ids.first_seen(rec.canonical_id()) {
             debug!(
                 target: "kardamom_executor::reader",
@@ -323,17 +348,17 @@ impl<S: ExecSink> OrderingLoop<S> {
                 first_seq = rec.first_seq,
                 "skipping duplicate RemoteEpoch (MDS racing sequencers)"
             );
-            return Flow::Continue;
+            return Ok(Flow::Continue);
         }
         let origin_chain_id = rec.origin_chain_id;
         let messages: Vec<XChainMessage> = rec.messages.iter().cloned().collect();
-        let marker_idx = self.next_idx();
+        let marker_idx = self.next_idx()?;
         if let Flow::Stop = self.send(ReaderToExec::RemoteEpoch {
             tx_idx: marker_idx,
             record: Box::new(rec),
             position,
         }) {
-            return Flow::Stop;
+            return Ok(Flow::Stop);
         }
         self.send_expanded(messages, |tx_idx, message| ReaderToExec::XChain {
             tx_idx,
@@ -358,8 +383,8 @@ impl<S: ExecSink> OrderingLoop<S> {
         };
         match msg {
             TxOrderingMessage::TxRef(tx_ref) => self.on_tx_ref(tx_ref, position),
-            TxOrderingMessage::Epoch(epoch) => Ok(self.expand_epoch(epoch, position)),
-            TxOrderingMessage::RemoteEpoch(rec) => Ok(self.expand_remote_epoch(rec, position)),
+            TxOrderingMessage::Epoch(epoch) => self.expand_epoch(epoch, position),
+            TxOrderingMessage::RemoteEpoch(rec) => self.expand_remote_epoch(rec, position),
             TxOrderingMessage::DepositRef(dep_ref) => {
                 // A ref here means the stream carries deposits outside an
                 // epoch record. This chain derives all deposits from

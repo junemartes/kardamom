@@ -222,29 +222,41 @@ impl TrieTables {
         ah: B256,
         changes: &[(B256, U256)],
     ) -> Result<Vec<B256>, StateError> {
+        changes
+            .iter()
+            .map(|(slot, val)| self.write_one_slot(txn, ah, *slot, *val))
+            .collect()
+    }
+
+    /// Write (or delete, if zero) one account's changed storage slot into
+    /// `hashed_storage`. Returns `keccak(slot)`, for the caller's
+    /// `PrefixSet`.
+    fn write_one_slot(
+        &self,
+        txn: &RwTxSync,
+        ah: B256,
+        slot: B256,
+        val: U256,
+    ) -> Result<B256, StateError> {
         use alloy_primitives::keccak256;
         use signet_libmdbx::WriteFlags;
 
-        let mut changed_hashes = Vec::with_capacity(changes.len());
-        for (slot, val) in changes {
-            let sh = keccak256(slot);
-            changed_hashes.push(sh);
-            let mut key = ah.as_slice().to_vec();
-            key.extend_from_slice(sh.as_slice());
-            if val.is_zero() {
-                // An absent-key delete is fine. Any other mdbx failure must
-                // surface, or the mirror silently diverges from the reference.
-                crate::schema::del_if_present(txn, self.hashed_storage, key)?;
-            } else {
-                txn.put(
-                    self.hashed_storage,
-                    key,
-                    val.to_be_bytes::<32>(),
-                    WriteFlags::UPSERT,
-                )?;
-            }
+        let sh = keccak256(slot);
+        let mut key = ah.as_slice().to_vec();
+        key.extend_from_slice(sh.as_slice());
+        if val.is_zero() {
+            // An absent-key delete is fine. Any other mdbx failure must
+            // surface, or the mirror silently diverges from the reference.
+            crate::schema::del_if_present(txn, self.hashed_storage, key)?;
+        } else {
+            txn.put(
+                self.hashed_storage,
+                key,
+                val.to_be_bytes::<32>(),
+                WriteFlags::UPSERT,
+            )?;
         }
-        Ok(changed_hashes)
+        Ok(sh)
     }
 
     /// Write the `hashed_accounts` row for every touched account: its basic
@@ -256,44 +268,64 @@ impl TrieTables {
         &self,
         txn: &RwTxSync,
         touched: &BTreeSet<Address>,
-        basics: &BTreeMap<Address, (u64, U256, B256)>,
+        basics: &BTreeMap<Address, BasicFields>,
+        new_sroot: &BTreeMap<Address, B256>,
+    ) -> Result<(), StateError> {
+        touched
+            .iter()
+            .try_for_each(|addr| self.write_one_hashed_account(txn, *addr, basics, new_sroot))
+    }
+
+    /// Write (or delete, if EIP-161-empty) the `hashed_accounts` row for
+    /// one touched account. Basic fields come from `basics`, or the
+    /// existing row if this block did not change them; the storage root
+    /// comes from `new_sroot`, or the existing row's.
+    fn write_one_hashed_account(
+        &self,
+        txn: &RwTxSync,
+        addr: Address,
+        basics: &BTreeMap<Address, BasicFields>,
         new_sroot: &BTreeMap<Address, B256>,
     ) -> Result<(), StateError> {
         use alloy_primitives::keccak256;
         use signet_libmdbx::WriteFlags;
 
-        for addr in touched {
-            let ah = keccak256(addr);
-            let existing = cursor::get_hashed_account(txn, self.hashed_accounts, &ah)?;
-            let (nonce, balance, code_hash) = match basics.get(addr) {
-                Some(b) => *b,
-                None => existing.map_or((0, U256::ZERO, B256::ZERO), |e| {
-                    (e.nonce, e.balance, e.code_hash)
-                }),
-            };
-            let storage_root = new_sroot
-                .get(addr)
-                .copied()
-                .or_else(|| existing.map(|e| e.storage_root))
-                .unwrap_or(EMPTY_ROOT_HASH);
-            let parts = AccountTrieParts {
-                nonce,
-                balance,
-                code_hash,
-                storage_root,
-            };
-            if parts.is_empty() {
-                crate::schema::del_if_present(txn, self.hashed_accounts, ah.as_slice())?;
-                crate::schema::del_prefix(txn, self.hashed_storage, ah.as_slice())?;
-                crate::schema::del_prefix(txn, self.storage_trie, ah.as_slice())?;
-            } else {
-                txn.put(
-                    self.hashed_accounts,
-                    ah.as_slice(),
-                    cursor::encode_account_leaf(&parts),
-                    WriteFlags::UPSERT,
-                )?;
-            }
+        let ah = keccak256(addr);
+        let existing = cursor::get_hashed_account(txn, self.hashed_accounts, &ah)?;
+        let BasicFields {
+            nonce,
+            balance,
+            code_hash,
+        } = match basics.get(&addr) {
+            Some(b) => *b,
+            None => existing.map_or(BasicFields::EMPTY, |e| BasicFields {
+                nonce: e.nonce,
+                balance: e.balance,
+                code_hash: e.code_hash,
+            }),
+        };
+        let storage_root = new_sroot
+            .get(&addr)
+            .copied()
+            .or_else(|| existing.map(|e| e.storage_root))
+            .unwrap_or(EMPTY_ROOT_HASH);
+        let parts = AccountTrieParts {
+            nonce,
+            balance,
+            code_hash,
+            storage_root,
+        };
+        if parts.is_empty() {
+            crate::schema::del_if_present(txn, self.hashed_accounts, ah.as_slice())?;
+            crate::schema::del_prefix(txn, self.hashed_storage, ah.as_slice())?;
+            crate::schema::del_prefix(txn, self.storage_trie, ah.as_slice())?;
+        } else {
+            txn.put(
+                self.hashed_accounts,
+                ah.as_slice(),
+                cursor::encode_account_leaf(&parts),
+                WriteFlags::UPSERT,
+            )?;
         }
         Ok(())
     }
@@ -371,9 +403,16 @@ impl TrieTables {
         let stor_by = Self::group_storage_by_account(delta);
         let new_sroot = self.update_storage_tries(txn, &stor_by, &mut touched)?;
 
-        let mut basics: BTreeMap<Address, (u64, U256, B256)> = BTreeMap::new();
+        let mut basics: BTreeMap<Address, BasicFields> = BTreeMap::new();
         for a in &delta.accounts {
-            basics.insert(a.address, (a.nonce, a.balance, a.code_hash));
+            basics.insert(
+                a.address,
+                BasicFields {
+                    nonce: a.nonce,
+                    balance: a.balance,
+                    code_hash: a.code_hash,
+                },
+            );
             touched.insert(a.address);
         }
 
@@ -426,6 +465,29 @@ pub(crate) fn commit_trie_root(
         signet_libmdbx::WriteFlags::UPSERT,
     )?;
     Ok(root)
+}
+
+/// The three basic account fields [`TrieTables::write_one_hashed_account`]
+/// needs from its `basics` map: [`AccountTrieParts`] minus `storage_root`,
+/// which comes from a separate map (the account and its storage root are
+/// computed by different passes over the delta). `pub(crate)`: the
+/// writer's tests model the same three fields, instead of an unnamed
+/// tuple (R11).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BasicFields {
+    pub(crate) nonce: u64,
+    pub(crate) balance: U256,
+    pub(crate) code_hash: B256,
+}
+
+impl BasicFields {
+    /// The fields a brand-new account (no existing row, not in this
+    /// block's delta) would have.
+    const EMPTY: Self = Self {
+        nonce: 0,
+        balance: U256::ZERO,
+        code_hash: B256::ZERO,
+    };
 }
 
 /// The basic account fields needed to form an account-trie leaf.

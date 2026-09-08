@@ -71,6 +71,8 @@ impl SkippedSeqCheck<'_> {
             Duration::from_secs(10),
             Duration::from_millis(250),
             || async {
+                // A poll tick, not a final read: a log not yet flushed to
+                // disk reads as empty and the next tick retries it.
                 let logs: String = self
                     .sealer_logs
                     .iter()
@@ -196,7 +198,8 @@ pub async fn gap_halts_pair_not_chain(
         exit.is_some_and(|code| code != 0),
         "watcher must exit NONZERO on a derivation fault, got {exit:?}"
     );
-    let log = std::fs::read_to_string(&watcher.proc.log_path).unwrap_or_default();
+    let log = std::fs::read_to_string(&watcher.proc.log_path)
+        .with_context(|| format!("read watcher log {}", watcher.proc.log_path.display()))?;
     anyhow::ensure!(
         log.contains("remote epoch derivation fault"),
         "watcher log must name the derivation fault; tail:\n{}",

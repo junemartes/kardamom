@@ -435,7 +435,8 @@ pub fn assert_reconstructed_interop_state(
         let live_logs = live
             .get("logs")
             .and_then(|l| l.as_array())
-            .map_or(0, Vec::len);
+            .with_context(|| format!("live receipt for seq {seq} has no logs array"))?
+            .len();
         anyhow::ensure!(
             receipt.logs.len() == live_logs,
             "seq {seq}: rebuilt {} log(s) != live {live_logs}",

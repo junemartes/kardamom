@@ -120,8 +120,8 @@ fn happy_path_in_order_resolution() {
     .unwrap();
 
     assert_eq!(reader.a_archive_count(), 2);
-    assert_eq!(reader.a_archive_len(0), 2);
-    assert_eq!(reader.a_archive_len(1), 2);
+    assert_eq!(reader.a_archive_len(0), Some(2));
+    assert_eq!(reader.a_archive_len(1), Some(2));
 
     let records: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(records.len(), 5);

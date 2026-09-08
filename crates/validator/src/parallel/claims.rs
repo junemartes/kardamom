@@ -325,10 +325,44 @@ impl ClaimSlice {
     }
 }
 
+/// Transactions per parallel batch, parsed once at the CLI boundary
+/// (`--validation-batch-size`). A `NonZeroUsize` wrapper by name:
+/// distinguishes "how many transactions per batch" from the pool's worker
+/// count, another bare `NonZeroUsize` this crate threads through the same
+/// call paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchSize(NonZeroUsize);
+
+impl BatchSize {
+    #[must_use]
+    pub const fn new(n: NonZeroUsize) -> Self {
+        Self(n)
+    }
+
+    #[must_use]
+    pub fn get(self) -> NonZeroUsize {
+        self.0
+    }
+}
+
+impl std::str::FromStr for BatchSize {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
+
+impl std::fmt::Display for BatchSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Split `n` transactions into batches of at most `batch_size`, returning
 /// inclusive bal-index ranges (`1..=n`, matching revm's convention).
-pub(crate) fn batch_ranges(n: usize, batch_size: NonZeroUsize) -> Vec<(u64, u64)> {
-    let bs = batch_size.get();
+pub(crate) fn batch_ranges(n: usize, batch_size: BatchSize) -> Vec<(u64, u64)> {
+    let bs = batch_size.get().get();
     (0..n)
         .step_by(bs)
         .map(|start| {
@@ -349,8 +383,8 @@ mod tests {
         B256::repeat_byte(b)
     }
 
-    fn nz(n: usize) -> NonZeroUsize {
-        NonZeroUsize::new(n).expect("fixture batch size")
+    fn nz(n: usize) -> BatchSize {
+        BatchSize::new(NonZeroUsize::new(n).expect("fixture batch size"))
     }
 
     #[test]

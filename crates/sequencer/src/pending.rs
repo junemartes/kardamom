@@ -18,6 +18,7 @@
 //! contiguous run that starts at `start`. The first gap stops the drain.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::num::NonZeroUsize;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -74,34 +75,22 @@ impl<T> PendingBuffer<T> {
         self.inner.contains_key(&nonce)
     }
 
-    /// # Panics
-    ///
-    /// Panics if the buffer is at capacity but empty. `capacity` is a
-    /// `NonZeroUsize` on this path (the disabled case returns above), and
-    /// `at_capacity` requires `len() >= capacity`, so the buffer always
-    /// holds at least one entry on this path.
     pub(crate) fn insert(&mut self, nonce: u64, value: T) -> InsertOutcome {
         let Some(capacity) = self.capacity else {
             return InsertOutcome::DroppedBufferDisabled;
         };
-        // Pre-compute these values. Then the match arms below do not need
-        // to re-borrow `self.inner` after taking an entry handle.
-        let already_present = self.inner.contains_key(&nonce);
-        let at_capacity = !already_present && self.inner.len() >= capacity.get();
-        if already_present {
-            self.inner.insert(nonce, value);
-            return InsertOutcome::Replaced;
-        }
-        if at_capacity {
+        // `Some(max)` means `nonce` is not already buffered, the buffer
+        // is full, and `max` is its highest buffered nonce: the capacity
+        // check itself yields the key it proves exists, so there is no
+        // second, fallible lookup.
+        let full_max = (!self.inner.contains_key(&nonce) && self.inner.len() >= capacity.get())
+            .then(|| self.inner.keys().next_back().copied())
+            .flatten();
+        if let Some(max) = full_max {
             // The buffer is full. Keep the lowest `capacity` nonces (the
             // drainable run). The furthest-future nonce loses: either an
             // already-buffered max, or this incoming nonce if it is the
             // new max.
-            let max = *self
-                .inner
-                .keys()
-                .next_back()
-                .expect("non-empty since len >= capacity >= 1");
             if nonce > max {
                 // The incoming nonce is the furthest future. Reject it, and keep the run.
                 return InsertOutcome::RejectedTooFar { nonce };
@@ -110,8 +99,16 @@ impl<T> PendingBuffer<T> {
             self.inner.insert(nonce, value);
             return InsertOutcome::EvictedFuture { evicted_nonce: max };
         }
-        self.inner.insert(nonce, value);
-        InsertOutcome::Inserted
+        match self.inner.entry(nonce) {
+            Entry::Occupied(mut e) => {
+                e.insert(value);
+                InsertOutcome::Replaced
+            }
+            Entry::Vacant(e) => {
+                e.insert(value);
+                InsertOutcome::Inserted
+            }
+        }
     }
 
     /// Insert without capacity enforcement, even for a disabled, capacity-0

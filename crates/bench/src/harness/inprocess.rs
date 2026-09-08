@@ -2,6 +2,9 @@
 //! in-memory [`MockChannels`], with a simple fake executor that reflects
 //! every published `TxEnvelope` straight back as a success `Receipt`.
 
+use std::num::{NonZeroU32, NonZeroU64};
+use std::ops::ControlFlow;
+
 use anyhow::Context as _;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 
@@ -17,23 +20,27 @@ use crate::config::{MAX_IN_FLIGHT_SLACK, REQUEST_TIMEOUT};
 /// stops everything on [`InProcessIngress::shutdown`].
 ///
 /// This is the stand-in behind the profiling
-/// [`Harness`](crate::harness::Harness) and the crate's smoke tests,
-/// used since the removal of `kardamom-node`. It exercises the real
-/// ingress hot path (signature recovery, routing, RPC framing, receipt
-/// release) with no live Aeron media driver and no real sequencer,
-/// executor, or sealer. A full in-process Aeron pipeline harness is a
-/// follow-up item.
+/// [`Harness`](crate::harness::Harness) and the crate's smoke tests.
+/// It exercises the real ingress hot path (signature recovery, routing,
+/// RPC framing, receipt release) with no live Aeron media driver and no
+/// real sequencer, executor, or sealer.
 ///
 /// `ack_policy` is forced to [`AckPolicy::OnOffer`], so a submission is
 /// released as soon as its receipt arrives. There is no recorder or
 /// quorum watermark here.
+///
+/// # Errors
+///
+/// Returns an error if the in-process RPC server cannot bind its
+/// ephemeral loopback port, if the jsonrpsee client cannot connect to
+/// it, or if `shards` exceeds `i32::MAX` (each shard's index becomes a
+/// fake receipt's `term_id`).
 pub async fn spawn_inprocess_ingress(
-    chain_id: u64,
-    shards: u32,
+    chain_id: NonZeroU64,
+    shards: NonZeroU32,
     max_in_flight: usize,
 ) -> anyhow::Result<(HttpClient, InProcessIngress)> {
-    let shard_count =
-        std::num::NonZeroUsize::new(shards as usize).context("shard count must be non-zero")?;
+    let shard_count = kardamom_types::num::nonzero_u32_to_usize(shards);
     let (mock, shard_rxs) = MockChannels::new(shard_count);
     let receipt_tx = mock.receipt_bus.clone();
 
@@ -42,38 +49,21 @@ pub async fn spawn_inprocess_ingress(
     // the parked submission. `from` and `nonce` match what the proxy parked
     // on, because it keys pending submissions by `(sender, nonce)`.
     let mut fake_exec = Vec::with_capacity(shard_rxs.len());
-    for (shard, mut rx) in shard_rxs.into_iter().enumerate() {
-        let receipt_tx = receipt_tx.clone();
-        fake_exec.push(tokio::spawn(async move {
-            let mut idx: i32 = 0;
-            while let Some(env) = rx.recv().await {
-                idx = idx.wrapping_add(1);
-                let nonce = decode_nonce(env.raw_tx.as_ref()).unwrap_or(0);
-                let receipt = Receipt {
-                    tx_idx: BPosition {
-                        term_id: shard as i32,
-                        term_offset: idx,
-                    },
-                    tx_hash: env.tx_hash,
-                    status: true,
-                    gas_used: 21_000,
-                    nonce,
-                    from: env.sender,
-                    ..Default::default()
-                };
-                // A send error means the broadcast bus has no receivers.
-                // The proxy is gone, so there is nothing left to release.
-                if receipt_tx.send(receipt).is_err() {
-                    break;
-                }
-            }
-        }));
+    for (shard, rx) in shard_rxs.into_iter().enumerate() {
+        // Convert here, synchronously, so an out-of-range shard count
+        // fails `spawn_inprocess_ingress` up front, instead of panicking
+        // inside a spawned task the harness caller never awaits.
+        let term_id = i32::try_from(shard).context("shard index exceeds i32::MAX")?;
+        fake_exec.push(tokio::spawn(run_fake_executor(
+            term_id,
+            rx,
+            receipt_tx.clone(),
+        )));
     }
 
     let cfg = IngressConfig {
-        chain_id: std::num::NonZeroU64::new(chain_id).context("chain id must be non-zero")?,
-        partition_count_m: std::num::NonZeroU32::new(shards)
-            .context("shard count must be non-zero")?,
+        chain_id,
+        partition_count_m: shards,
         ack_policy: AckPolicy::OnOffer,
         ..IngressConfig::default()
     };
@@ -86,6 +76,54 @@ pub async fn spawn_inprocess_ingress(
         .max_concurrent_requests(max_in_flight + MAX_IN_FLIGHT_SLACK)
         .build(&url)?;
     Ok((client, InProcessIngress { handle, fake_exec }))
+}
+
+/// One shard's fake-executor task: drain published envelopes and send
+/// a success receipt back on the receipt bus, so the proxy releases
+/// the parked submission. `from` and `nonce` match what the proxy
+/// parked on, because it keys pending submissions by `(sender, nonce)`.
+/// `term_id` is this shard's index, already validated to fit `i32` by
+/// [`spawn_inprocess_ingress`].
+async fn run_fake_executor(
+    term_id: i32,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>,
+    receipt_tx: tokio::sync::broadcast::Sender<Receipt>,
+) {
+    let mut idx: i32 = 0;
+    while let Some(env) = rx.recv().await {
+        idx = idx.wrapping_add(1);
+        let ControlFlow::Continue(()) = reflect_receipt(term_id, idx, &env, &receipt_tx) else {
+            break;
+        };
+    }
+}
+
+/// Build and publish one fake receipt for `env`. Returns
+/// [`ControlFlow::Break`] once the broadcast bus has no receivers left
+/// (the proxy is gone, so there is nothing left to release).
+fn reflect_receipt(
+    term_id: i32,
+    idx: i32,
+    env: &kardamom_types::TxEnvelope,
+    receipt_tx: &tokio::sync::broadcast::Sender<Receipt>,
+) -> ControlFlow<()> {
+    let nonce = decode_nonce(env.raw_tx.as_ref()).unwrap_or(0);
+    let receipt = Receipt {
+        tx_idx: BPosition {
+            term_id,
+            term_offset: idx,
+        },
+        tx_hash: env.tx_hash,
+        status: true,
+        gas_used: 21_000,
+        nonce,
+        from: env.sender,
+        ..Default::default()
+    };
+    if receipt_tx.send(receipt).is_err() {
+        return ControlFlow::Break(());
+    }
+    ControlFlow::Continue(())
 }
 
 /// Owns the in-process ingress server and the fake-executor reflector
