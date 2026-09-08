@@ -193,7 +193,7 @@ async fn attester_posts_output_matching_rust_root() {
     lockbox
         .depositETH(
             address!("0000000000000000000000000000000000001234"),
-            0,
+            21_000,
             Bytes::new(),
         )
         .value(U256::from(5_000_000_000_000_000_000u128))
@@ -251,7 +251,7 @@ async fn full_withdrawal_finalize_and_challenge() {
     lockbox
         .depositETH(
             address!("0000000000000000000000000000000000001234"),
-            0,
+            21_000,
             Bytes::new(),
         )
         .value(U256::from(5_000_000_000_000_000_000u128))

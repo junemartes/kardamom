@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import {CalldataGas} from "../common/CalldataGas.sol";
 import {KardamomUUPSBase} from "../factory/KardamomUUPSBase.sol";
 
 /// @notice A minimal view of the output oracle. The lockbox reads it when
@@ -94,6 +95,7 @@ contract ETHLockbox is KardamomUUPSBase {
     );
 
     error ZeroDeposit();
+    error GasLimitBelowIntrinsic();
     error AlreadyFinalized();
     error BadInclusionProof();
     error OutputRootMismatch();
@@ -132,8 +134,16 @@ contract ETHLockbox is KardamomUUPSBase {
     // On-ramp (deposit)
     // -------------------------------------------------------------------------
 
+    /// @notice Deposit ETH and schedule an L2 call to `to` with `data`.
+    /// @dev    The L2 executor uses `gasLimit` as the derived tx's gas limit.
+    ///         A limit below the intrinsic gas of `data` can never execute,
+    ///         so it is rejected here, on the paid side (audit C2). The floor
+    ///         is `max(21_000 + 16 * nonZero + 4 * zero, 21_000 + 10 * (zero
+    ///         + 4 * nonZero))`: the standard intrinsic gas and the EIP-7623
+    ///         calldata floor, both of which the L2 applies.
     function depositETH(address to, uint64 gasLimit, bytes calldata data) external payable {
         if (msg.value == 0) revert ZeroDeposit();
+        if (gasLimit < CalldataGas.intrinsicGas(data, 0)) revert GasLimitBelowIntrinsic();
         unchecked {
             depositNonce += 1;
         }

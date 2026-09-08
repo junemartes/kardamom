@@ -394,7 +394,7 @@ pub async fn run_feed<P: Provider>(
             // Remote-epoch records travel in DA. Unlike deposits, they are
             // not derivable again from this chain's L1 origin. So the
             // record, with its messages and calldata by value, is buffered
-            // into the block it leads. It travels in the KAR1 v2 payload
+            // into the block it leads. It travels in the KAR1 v3 payload
             // for the reconstruction replay to run again.
             Ok(Some(ReaderToExec::RemoteEpoch { record, .. })) => acc.observe_remote_epoch(*record),
             // The per-message expansion of the record above. The messages

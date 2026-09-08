@@ -53,9 +53,12 @@ use crate::harness::l2::{self, DerivedSigner};
 /// patched-genesis copy for it.
 pub const CHAIN_B_ID: u64 = 412_347;
 
-/// ABI-encode `Outbox.sendMessage(destChainId, target, gasLimit, data, cb)`.
-/// Head: 4 static params + the callback tuple inlined (3 words) = 7 words,
-/// so `data`'s offset is 0xE0; `cb = None` encodes the zeroed tuple
+/// Hop budget of every user send in this scenario (`<= Outbox.MAX_HOPS`).
+pub const USER_HOPS: u8 = 1;
+
+/// ABI-encode `Outbox.sendMessage(destChainId, target, gasLimit, hops, data,
+/// cb)`. Head: 5 static params + the callback tuple inlined (3 words) = 8
+/// words, so `data`'s offset is 0x100; `cb = None` encodes the zeroed tuple
 /// (`XChain.isNone`).
 pub fn send_message_calldata(
     dest_chain_id: u64,
@@ -66,12 +69,13 @@ pub fn send_message_calldata(
 ) -> Vec<u8> {
     let selector = outbox_send_message_selector();
     let cb = cb.unwrap_or_default();
-    let mut out = Vec::with_capacity(4 + 8 * 32 + data.len().div_ceil(32) * 32);
+    let mut out = Vec::with_capacity(4 + 9 * 32 + data.len().div_ceil(32) * 32);
     out.extend_from_slice(&selector);
     out.extend_from_slice(u64_word(dest_chain_id).as_slice());
     out.extend_from_slice(super::xchain::address_word(target).as_slice());
     out.extend_from_slice(u64_word(gas_limit).as_slice());
-    out.extend_from_slice(u64_word(7 * 32).as_slice()); // offset of `data`
+    out.extend_from_slice(u64_word(u64::from(USER_HOPS)).as_slice());
+    out.extend_from_slice(u64_word(8 * 32).as_slice()); // offset of `data`
     out.extend_from_slice(super::xchain::address_word(cb.target).as_slice());
     out.extend_from_slice(u64_word(cb.gas_limit).as_slice());
     out.extend_from_slice(cb.context.as_slice());
@@ -411,6 +415,7 @@ mod abi_tests {
             uint64 destChainId,
             address target,
             uint64 gasLimit,
+            uint8 hops,
             bytes data,
             SolCb cb
         );
@@ -436,6 +441,7 @@ mod abi_tests {
                     destChainId: CHAIN_B_ID,
                     target,
                     gasLimit: 250_000,
+                    hops: USER_HOPS,
                     data: alloy_primitives::Bytes::copy_from_slice(data),
                     cb: SolCb {
                         target: c.target,

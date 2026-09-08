@@ -71,19 +71,20 @@ pub const MAX_MESSAGE_GAS: u64 = 10_000_000;
 /// mirrors `Outbox.MAX_DATA_BYTES` (`contracts/src/L2/Outbox.sol`).
 pub const MAX_DATA_BYTES: usize = 65_536;
 
-/// Fixed bytes one [`RemoteEpochRecord`] adds to the KAR1 v2 DA frame,
+/// Fixed bytes one [`RemoteEpochRecord`] adds to the KAR1 v3 DA frame,
 /// before its messages: `origin_chain_id` (8) + `anchor_number` (8) +
 /// `anchor_hash` (32) + `first_seq` (8) + `msg_count` (4).
 pub const REMOTE_EPOCH_FIXED_WIRE_BYTES: usize = 8 + 8 + 32 + 8 + 4;
 
-/// Fixed bytes one [`XChainMessage`] adds to the KAR1 v2 DA frame, on top
+/// Fixed bytes one [`XChainMessage`] adds to the KAR1 v3 DA frame, on top
 /// of its calldata: `source_hash` (32) + `seq` (8) + `origin_sender` (20) +
-/// `target` (20) + `value` (16) + `gas_limit` (8) + `input_len` (4) +
-/// callback flag (1) + callback body (20 + 8 + 32). The callback body is
-/// always charged, so the bound holds with or without a callback.
-pub const XCHAIN_MSG_FIXED_WIRE_BYTES: usize = 32 + 8 + 20 + 20 + 16 + 8 + 4 + 1 + 20 + 8 + 32;
+/// `target` (20) + `value` (16) + `gas_limit` (8) + `hops` (1) +
+/// `input_len` (4) + callback flag (1) + callback body (20 + 8 + 32). The
+/// callback body is always charged, so the bound holds with or without a
+/// callback. The sum is 170. `Outbox.MESSAGE_WIRE_OVERHEAD` mirrors it.
+pub const XCHAIN_MSG_FIXED_WIRE_BYTES: usize = 32 + 8 + 20 + 20 + 16 + 8 + 1 + 4 + 1 + 20 + 8 + 32;
 
-/// Cap on the KAR1 v2 wire size of one [`RemoteEpochRecord`]. See
+/// Cap on the KAR1 v3 wire size of one [`RemoteEpochRecord`]. See
 /// [`remote_epoch_wire_bytes`]. [`derive_remote_epoch`] rejects a larger
 /// record.
 ///
@@ -107,11 +108,18 @@ pub fn xchain_tx_sender(origin_chain_id: u64) -> Address {
 }
 
 /// First `abi.encode` word of [`msg_leaf`]. Must equal
-/// `Outbox.LEAF_DOMAIN_XCHAIN`. Domain-separates message leaves from every
-/// other keccak commitment in the system (withdrawal leaves, tree nodes).
+/// `XChain.LEAF_DOMAIN`. Domain-separates message leaves from every other
+/// keccak commitment in the system (withdrawal leaves, tree nodes). V1 added
+/// the `hops` word; a V0 leaf can never equal a V1 leaf.
 pub fn xchain_leaf_domain() -> B256 {
-    keccak256("KARDAMOM_XCHAIN_MESSAGE_V0")
+    keccak256("KARDAMOM_XCHAIN_MESSAGE_V1")
 }
+
+/// Largest hop budget of a user-initiated send. Mirrors `Outbox.MAX_HOPS`.
+/// A send made inside a delivery carries one hop less than the delivery it
+/// runs in, so one paid send starts at most this many derived sends along
+/// any chain of deliveries.
+pub const MAX_HOPS: u8 = 4;
 
 /// Canonical id of a cross-chain tx on the destination:
 ///
@@ -203,9 +211,18 @@ pub struct Callback {
 }
 
 impl Callback {
+    /// True for the all-zero struct, the wire form of "no callback".
+    pub fn is_zero(&self) -> bool {
+        self.target == Address::ZERO && self.gas_limit == 0 && self.context == B256::ZERO
+    }
+
     /// `keccak256(abi.encode(target, gasLimit, context))` — the `cbHash` word
-    /// of [`msg_leaf`]. Must equal `Outbox.hashCallback`.
+    /// of [`msg_leaf`]. Must equal `XChain.hashCallback`, which returns ZERO
+    /// for the zero struct (the same value as [`no_callback_hash`]).
     pub fn commitment(&self) -> B256 {
+        if self.is_zero() {
+            return B256::ZERO;
+        }
         let mut buf = [0u8; 96];
         buf[12..32].copy_from_slice(self.target.as_slice());
         buf[56..64].copy_from_slice(&self.gas_limit.to_be_bytes());
@@ -250,6 +267,9 @@ pub struct OutboxMessage {
     pub value: u128,
     /// Gas budget for the inner call on the destination.
     pub gas_limit: u64,
+    /// Remaining hop budget: how many further derived sends a delivery of
+    /// this message may start along one chain (audit H6).
+    pub hops: u8,
     /// Inner-call calldata.
     pub data: AlloyBytes,
     /// Requested response, if any.
@@ -283,6 +303,8 @@ pub struct XChainMessage {
     pub value: u128,
     /// Gas budget for the inner call.
     pub gas_limit: u64,
+    /// Remaining hop budget (see [`OutboxMessage::hops`]).
+    pub hops: u8,
     /// Inner-call calldata.
     #[rkyv(with = wire::BytesVec)]
     pub input: Bytes,
@@ -309,6 +331,7 @@ impl XChainMessage {
             self.target,
             self.value,
             self.gas_limit,
+            self.hops,
             keccak256(&self.input),
             self.callback
                 .as_ref()
@@ -319,11 +342,12 @@ impl XChainMessage {
 }
 
 /// The commitment the Outbox predeploy stores per message:
-/// `keccak256(abi.encode(LEAF_DOMAIN_XCHAIN, originChainId, destChainId, seq,
-/// sender, target, value, gasLimit, keccak256(data), cbHash))` — ten static
-/// 32-byte words. Must stay byte-identical to `Outbox.hashMessage`. Origin
-/// AND destination chain ids inside the leaf make replay across pairs
-/// impossible.
+/// `keccak256(abi.encode(LEAF_DOMAIN, originChainId, destChainId, seq,
+/// sender, target, value, gasLimit, hops, keccak256(data), cbHash))` — eleven
+/// static 32-byte words. Must stay byte-identical to `XChain.hashMessage`.
+/// Origin AND destination chain ids inside the leaf make replay across pairs
+/// impossible. `hops` in the leaf makes the hop budget part of what the
+/// destination verifies (audit H6).
 #[allow(clippy::too_many_arguments)]
 pub fn msg_leaf(
     origin_chain_id: u64,
@@ -333,10 +357,11 @@ pub fn msg_leaf(
     target: Address,
     value: u128,
     gas_limit: u64,
+    hops: u8,
     data_hash: B256,
     cb_hash: B256,
 ) -> B256 {
-    let mut buf = [0u8; 320];
+    let mut buf = [0u8; 352];
     buf[0..32].copy_from_slice(xchain_leaf_domain().as_slice());
     buf[56..64].copy_from_slice(&origin_chain_id.to_be_bytes());
     buf[88..96].copy_from_slice(&dest_chain_id.to_be_bytes());
@@ -345,8 +370,9 @@ pub fn msg_leaf(
     buf[172..192].copy_from_slice(target.as_slice());
     buf[208..224].copy_from_slice(&value.to_be_bytes());
     buf[248..256].copy_from_slice(&gas_limit.to_be_bytes());
-    buf[256..288].copy_from_slice(data_hash.as_slice());
-    buf[288..320].copy_from_slice(cb_hash.as_slice());
+    buf[287] = hops;
+    buf[288..320].copy_from_slice(data_hash.as_slice());
+    buf[320..352].copy_from_slice(cb_hash.as_slice());
     keccak256(buf)
 }
 
@@ -355,7 +381,7 @@ pub fn msg_leaf(
 /// (`XChain.Callback`), which Solidity resolves into the signature exactly as
 /// written here.
 pub const INBOX_DELIVER_SIGNATURE: &str =
-    "deliver(uint64,uint64,address,address,uint256,uint64,bytes,(address,uint64,bytes32))";
+    "deliver(uint64,uint64,address,address,uint256,uint64,uint8,bytes,(address,uint64,bytes32))";
 
 /// 4-byte function selector of [`INBOX_DELIVER_SIGNATURE`].
 pub fn inbox_deliver_selector() -> [u8; 4] {
@@ -364,17 +390,18 @@ pub fn inbox_deliver_selector() -> [u8; 4] {
 }
 
 /// ABI-encode `Inbox.deliver(originChainId, seq, originSender, target, value,
-/// gasLimit, data, cb)` for one message — the calldata of the derived 0x7D tx.
+/// gasLimit, hops, data, cb)` for one message — the calldata of the derived
+/// 0x7D tx.
 ///
 /// Hand-rolled: the execution edge is `no_std` and must not grow an ABI
 /// codegen dependency for one fixed call; byte-parity with `alloy-sol-types`
-/// is pinned in tests. Layout: a 10-word head — the six static params, the
-/// offset word for `data` (0x140, the tail begins right after the head), and
+/// is pinned in tests. Layout: an 11-word head — the seven static params, the
+/// offset word for `data` (0x160, the tail begins right after the head), and
 /// the static callback tuple inlined as three words — then `data`'s length
 /// word and its right-padded bytes. `callback: None` encodes as the zeroed
 /// tuple, which is exactly what `XChain.isNone` tests for.
 pub fn deliver_calldata(origin_chain_id: u64, msg: &XChainMessage) -> Vec<u8> {
-    const HEAD_WORDS: usize = 10;
+    const HEAD_WORDS: usize = 11;
     let data = msg.input.as_ref();
     let padded_len = data.len().div_ceil(32) * 32;
     let mut out = Vec::with_capacity(4 + (HEAD_WORDS + 1) * 32 + padded_len);
@@ -385,6 +412,7 @@ pub fn deliver_calldata(origin_chain_id: u64, msg: &XChainMessage) -> Vec<u8> {
     push_word_address(&mut out, msg.target);
     push_word_u128(&mut out, msg.value);
     push_word_u64(&mut out, msg.gas_limit);
+    push_word_u64(&mut out, u64::from(msg.hops));
     push_word_u64(&mut out, (HEAD_WORDS * 32) as u64);
     let cb = msg.callback.unwrap_or_default();
     push_word_address(&mut out, cb.target);
@@ -442,11 +470,12 @@ pub const INBOX_NEXT_SEQ_SLOT_INDEX: u64 = 1;
 /// Solidity signature of `Outbox.sendMessage`. The callback struct flattens
 /// to its tuple type, as in [`INBOX_DELIVER_SIGNATURE`].
 pub const OUTBOX_SEND_MESSAGE_SIGNATURE: &str =
-    "sendMessage(uint64,address,uint64,bytes,(address,uint64,bytes32))";
+    "sendMessage(uint64,address,uint64,uint8,bytes,(address,uint64,bytes32))";
 
-/// Solidity signature of the `Outbox.MessageSent` event.
+/// Solidity signature of the `Outbox.MessageSent` event. The `uint8` after
+/// `gasLimit` is the hop budget (audit H6).
 pub const MESSAGE_SENT_SIGNATURE: &str = "MessageSent(uint64,uint64,address,address,uint256,\
-                                          uint64,bytes,bytes32,(address,uint64,bytes32))";
+                                          uint64,uint8,bytes,bytes32,(address,uint64,bytes32))";
 
 /// 4-byte function selector of [`OUTBOX_SEND_MESSAGE_SIGNATURE`].
 pub fn outbox_send_message_selector() -> [u8; 4] {
@@ -693,6 +722,7 @@ pub fn derive_remote_epoch(
                 target: m.target,
                 value: m.value,
                 gas_limit: m.gas_limit,
+                hops: m.hops,
                 input: Bytes::copy_from_slice(m.data.as_ref()),
                 callback: m.callback,
             })
@@ -765,7 +795,7 @@ pub fn check_anchor(origin_chain_id: u64, msg: &OutboxMessage) -> Result<(), XCh
     Ok(())
 }
 
-/// The KAR1 v2 wire size of one record whose messages carry calldata of
+/// The KAR1 v3 wire size of one record whose messages carry calldata of
 /// the given lengths: [`REMOTE_EPOCH_FIXED_WIRE_BYTES`] plus
 /// [`XCHAIN_MSG_FIXED_WIRE_BYTES`] and the calldata length per message.
 pub fn remote_epoch_wire_bytes(data_lens: impl IntoIterator<Item = usize>) -> usize {
@@ -798,6 +828,7 @@ mod tests {
             target: Address::repeat_byte(0xB2),
             value: 0,
             gas_limit: 200_000,
+            hops: 0,
             data: AlloyBytes::from(alloc::vec![0xCA, 0xFE]),
             callback: None,
         }
@@ -1209,6 +1240,7 @@ mod tests {
             Address::repeat_byte(0xB2),
             0,
             200_000,
+            0,
             keccak256([0xCA, 0xFE]),
             no_callback_hash(),
         );
@@ -1228,6 +1260,46 @@ mod tests {
         assert_ne!(base.commitment(), no_callback_hash());
     }
 
+    /// The zero struct commits to ZERO, like `XChain.hashCallback` (audit
+    /// M5). Any nonzero field makes it a real callback.
+    #[test]
+    fn zero_callback_commits_to_zero_like_solidity() {
+        assert_eq!(Callback::default().commitment(), B256::ZERO);
+        assert_eq!(Callback::default().commitment(), no_callback_hash());
+        assert!(Callback::default().is_zero());
+        let almost = Callback {
+            gas_limit: 1,
+            ..Callback::default()
+        };
+        assert!(!almost.is_zero());
+        assert_ne!(almost.commitment(), B256::ZERO);
+    }
+
+    /// A message with `callback: Some(zero)` and one with `None` commit to
+    /// the same leaf, so a feed that carries the zero struct verifies.
+    #[test]
+    fn zero_callback_and_none_share_a_leaf() {
+        let rec = derive_remote_epoch(SELF, ORIGIN, 0, &[msg(0, SELF)]).unwrap();
+        let none = rec.messages[0].clone();
+        let mut zero = none.clone();
+        zero.callback = Some(Callback::default());
+        assert_eq!(none.leaf(ORIGIN, SELF), zero.leaf(ORIGIN, SELF));
+    }
+
+    /// Cross-language pin of the callback commitment (audit L3).
+    #[test]
+    fn callback_known_vector_is_pinned() {
+        let cb = Callback {
+            target: Address::repeat_byte(0x01),
+            gas_limit: 100_000,
+            context: B256::repeat_byte(0x02),
+        };
+        assert_eq!(
+            cb.commitment(),
+            b256!("3cc4851e518423fb0983f20dc6198ffd6ef901107d7b7911ffc4e8f942442b05")
+        );
+    }
+
     #[test]
     fn leaf_known_vector_is_pinned() {
         // Anchored output for fixed inputs — must match Outbox.hashMessage in
@@ -1241,6 +1313,7 @@ mod tests {
             Address::repeat_byte(0x05),
             6,
             7,
+            9,
             keccak256([0x08]),
             B256::ZERO,
         );
@@ -1248,8 +1321,22 @@ mod tests {
         // the cross-language tie.
         assert_eq!(
             leaf,
-            b256!("0df14340efd8c8b32f4c333c3dca8470b0bae319a3dfe32adb213df2b8834d3c")
+            b256!("3bffc28cda803d8ff97702a187a7218fd692b9f36b265256736d6c159f89696f")
         );
+        // The hop budget is committed: one hop more is another leaf.
+        let other = msg_leaf(
+            1,
+            2,
+            3,
+            Address::repeat_byte(0x04),
+            Address::repeat_byte(0x05),
+            6,
+            7,
+            10,
+            keccak256([0x08]),
+            B256::ZERO,
+        );
+        assert_ne!(leaf, other);
     }
 
     // ── Value pins (audit 2026-09-03, L3). The Solidity side asserts the same
@@ -1341,12 +1428,13 @@ mod tests {
 
     #[test]
     fn send_message_selector_and_topic_match_forge_inspect() {
+        // Both moved with the `uint8 hops` parameter (audit H6, #264).
         // forge inspect Outbox methodIdentifiers
-        assert_eq!(outbox_send_message_selector(), [0xbd, 0x1b, 0x0f, 0xd9]);
+        assert_eq!(outbox_send_message_selector(), [0xf6, 0xc9, 0x3f, 0x27]);
         // forge inspect Outbox events
         assert_eq!(
             message_sent_topic0(),
-            b256!("a00ff5f6f9bf2c30c7cd578b6a82c98b08f2d33a5677222b9d8b925c62a48082")
+            b256!("7694e56ef67389e1cc3c1007e8453316be24d66249432418367acfe4caa9d125")
         );
     }
 }
@@ -1371,6 +1459,7 @@ mod deliver_abi_tests {
             address target,
             uint256 value,
             uint64 gasLimit,
+            uint8 hops,
             bytes data,
             SolCb cb
         );
@@ -1386,6 +1475,7 @@ mod deliver_abi_tests {
             target: Address::repeat_byte(0xB9),
             value: 0,
             gas_limit: 250_000,
+            hops: 3,
             input: Bytes::copy_from_slice(data),
             callback,
         }
@@ -1402,6 +1492,7 @@ mod deliver_abi_tests {
             target: m.target,
             value: U256::from(m.value),
             gasLimit: m.gas_limit,
+            hops: m.hops,
             data: AlloyBytes::copy_from_slice(m.input.as_ref()),
             cb: SolCb {
                 target: cb.target,

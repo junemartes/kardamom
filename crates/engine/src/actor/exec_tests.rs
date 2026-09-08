@@ -615,6 +615,7 @@ fn remote_epoch_fixture(origin: u64, n: u64) -> kardamom_types::xchain::RemoteEp
                 target: Address::repeat_byte(0xB6),
                 value: 0,
                 gas_limit: 100_000,
+                hops: 0,
                 input: Default::default(),
                 callback: None,
             })

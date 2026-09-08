@@ -1145,6 +1145,7 @@ mod tests {
                     source_hash: kardamom_types::xchain::remote_source_hash(origin, seq),
                     seq,
                     gas_limit: 100_000,
+                    hops: 0,
                     ..Default::default()
                 })
                 .collect(),

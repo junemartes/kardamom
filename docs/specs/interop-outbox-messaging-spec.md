@@ -104,7 +104,8 @@ A generalization of `L2ToL1MessagePasser`, at a reserved predeploy address (e.g.
 function sendMessage(
     uint64 destChainId,
     address target,
-    uint256 gasLimit,        // execution budget on dest, capped (§12)
+    uint64 gasLimit,         // execution budget on dest, at most MAX_MESSAGE_GAS
+    uint8 hops,              // hop budget (#264, audit H6); see the rules below
     bytes calldata data,
     Callback calldata cb     // optional; zeroed = none (§9)
 ) external payable returns (uint64 seq);
@@ -133,10 +134,29 @@ function sendMessage(
   - Either way the BAL cross-check is unchanged: the claimed `sentMessages` slot
     write (post-value, via `ClaimIndex`) must exist for every extracted message.
 - **Message leaf** (in `crates/types/src/xchain.rs`, the single shared copy):
-  `msg_leaf = keccak(abi.encode(LEAF_DOMAIN_XCHAIN, originChainId, destChainId,
-  seq, sender, target, value, gasLimit, keccak(data), cbHash))`. Origin **and**
-  destination chain ids inside the leaf make replay across pairs impossible;
-  `value` inside the leaf puts the burn amount under the commitment (§13).
+  `msg_leaf = keccak(abi.encode(LEAF_DOMAIN, originChainId, destChainId,
+  seq, sender, target, value, gasLimit, hops, keccak(data), cbHash))`.
+  Eleven words. `LEAF_DOMAIN = keccak("KARDAMOM_XCHAIN_MESSAGE_V1")`. V1
+  added the `hops` word (#264). A V0 leaf can never equal a V1 leaf. Origin
+  **and** destination chain ids inside the leaf make replay across pairs
+  impossible; `value` inside the leaf puts the burn amount under the
+  commitment (§13).
+- **Hop budget** (#264, audit H6). `MAX_HOPS = 4`. Outside a delivery, a
+  send needs `hops <= MAX_HOPS`. Inside a delivery with budget `h`, a send
+  needs `h > 0` and `hops == h - 1`. A delivery with `hops == 0` cannot
+  send. The auto-response carries `hops = 0`.
+- **Per-block destination budgets** (#264, audit C3). The Outbox keys two
+  budgets by `(destChainId, block.number)`, so they reset every origin block:
+  - Gas: `MAX_BLOCK_DEST_GAS = 30_000_000`. A send charges
+    `gasLimit + DELIVERY_OVERHEAD + intrinsic(data) + cb.gasLimit`.
+    `DELIVERY_OVERHEAD = 462_000` equals
+    `kardamom_exec_core::XCHAIN_DELIVERY_OVERHEAD`.
+  - Bytes: `MAX_BLOCK_DEST_BYTES = 600_000`, counted as
+    `sum(MESSAGE_WIRE_OVERHEAD + data.length)` with
+    `MESSAGE_WIRE_OVERHEAD = 170` (`XCHAIN_MSG_FIXED_WIRE_BYTES`). A record
+    adds 60 fixed bytes, so one record stays under
+    `MAX_REMOTE_EPOCH_WIRE_BYTES = 630_784`.
+  - `MAX_MESSAGE_GAS = 10_000_000` bounds `gasLimit` and `cb.gasLimit`.
 
 ## 5. Extraction and the egress node (origin side)
 
@@ -329,10 +349,16 @@ A callback is **just a message** flowing the other way — no new pipeline.
   `Option<Callback>` decode treat it the same way. A sender that wants no
   response must zero all three fields.
 - On delivery completion (success *or* failure — failure must call back, or the
-  origin app waits forever), B's Inbox sends via B's Outbox:
-  `kind = Callback, inReplyTo = (originChainId, seq), payload = { status,
-  returnDataHash, context }` — return data by hash, bounded; apps that need the
-  full return payload emit it themselves from `target`.
+  origin app waits forever), B's Inbox sends via B's Outbox a message to
+  `cb.target` with `hops = 0` and this calldata (#264, audit H5):
+  `onXChainResult(address requester, uint64 requestSeq, bool ok,
+  bytes32 retHash, bool truncated, bytes32 context)`. `retHash` is the
+  keccak of at most `MAX_RETURN_BYTES = 256` bytes of return data;
+  `truncated` says the data was longer. Apps that need the full return
+  payload emit it themselves from `target`.
+- A response target must make three checks: `requester == address(this)`,
+  `msg.sender == XChain.INBOX`, and `Inbox(INBOX).xDomainSender() ==
+  (peerChainId, INBOX)`.
 - **Depth is capped at one**: the Outbox rejects a callback spec on a message of
   kind Callback. No ping-pong loops by construction.
 - **Prepaid at send time.** The response executes on the *origin* chain, so
@@ -927,15 +953,15 @@ An audit of the interop protocol on 2026-09-03 found the items below open on
 "pending" when no PR exists yet.
 
 - C1 — #260
-- C2 — #260
-- C3 — pending
+- C2 — #260 (executor), #264 (contract)
+- C3 — #264
 - C4 — pending
 - H1 — #255
 - H2 — #263
 - H3 — #263 (partial: ingress session authentication stays open)
-- H4 — pending
-- H5 — pending
-- H6 — pending
+- H4 — #264
+- H5 — #264
+- H6 — #264
 - H7 — #259
 - H8 — #258
 - H9 — #263
@@ -943,12 +969,14 @@ An audit of the interop protocol on 2026-09-03 found the items below open on
 - M2 — #260
 - M3 — #260
 - M4 — #263
-- M5 — pending
+- M5 — #264
 - M6 — #263
 - M7 — #258
 - M8 — #259
 - M9 — #258
 - M10 — #258
+- L5 — #264
+- L9 — #264
 
 #263 (H2, H3 in part, H9, M4, M6) changes the sealer lane rules. The kind-5
 header carries `first_seq` and `last_seq`. The header is 69 bytes. The sealer
@@ -979,3 +1007,13 @@ The destination validator seeds its lane verifier from the same slot. It checks
 the first record too. `canonical_id` now commits to `anchor_number`. The
 watcher recomputes `xchain_anchor_hash` and rejects a feed message with a
 different anchor.
+
+#264 (C2 contract side, C3, H4, H5, H6, M5, L5, L9) hardens the contracts.
+The leaf is V1 with the `hops` word (§4). The response ABI is
+`onXChainResult(requester, requestSeq, ok, retHash, truncated, context)` (§9).
+The Outbox keeps per-block destination gas and byte budgets (§4).
+`ETHLockbox.depositETH` rejects a gas limit below the calldata intrinsic gas.
+`Inbox.deliver` checks its gas before the inner call, copies at most 256
+return bytes, and never reverts after the sender and replay checks.
+`Callback::commitment()` is zero for the zero struct. `nextSeq` is `seq + 1`.
+Tests pin the Outbox and Inbox storage slots.

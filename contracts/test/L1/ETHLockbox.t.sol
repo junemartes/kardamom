@@ -89,6 +89,23 @@ contract ETHLockboxTest is Test {
         lockbox.depositETH{value: 0}(address(0xB0B), 0, hex"");
     }
 
+    /// Audit C2: a deposit must carry at least the intrinsic gas of its own
+    /// calldata, or the L2 can never execute it.
+    function test_depositETH_rejects_gas_below_intrinsic() public {
+        vm.deal(address(this), 10 ether);
+        vm.expectRevert(ETHLockbox.GasLimitBelowIntrinsic.selector);
+        lockbox.depositETH{value: 1 ether}(address(0xB0B), 20_999, hex"");
+        lockbox.depositETH{value: 1 ether}(address(0xB0B), 21_000, hex"");
+
+        // Ten nonzero bytes: the EIP-7623 floor (21_400) is above the
+        // standard intrinsic gas (21_160).
+        bytes memory data = hex"01020304050607080910";
+        vm.expectRevert(ETHLockbox.GasLimitBelowIntrinsic.selector);
+        lockbox.depositETH{value: 1 ether}(address(0xB0B), 21_399, data);
+        lockbox.depositETH{value: 1 ether}(address(0xB0B), 21_400, data);
+        assertEq(lockbox.depositNonce(), 2);
+    }
+
     // ---------------------------------------------------------------------
     // Withdrawal off-ramp
     // ---------------------------------------------------------------------

@@ -7,10 +7,19 @@ pragma solidity ^0.8.26;
 ///         single Solidity copy of `kardamom-types`' `xchain.rs` and must stay
 ///         identical to it — the cross-language tie is pinned by vectors in
 ///         `test/L2/Outbox.t.sol` asserted against Rust-computed values.
+/// @notice The part of the Inbox the Outbox reads for the hop rule (audit H6).
+interface IInboxDeliveryState {
+    /// @notice True while `Inbox.deliver` runs the inner call.
+    function inDelivery() external view returns (bool);
+    /// @notice Hop budget of the delivery in progress. Zero outside one.
+    function currentHops() external view returns (uint8);
+}
+
 library XChain {
     /// @notice First `abi.encode` word of a message leaf. Must equal
-    ///         `kardamom_types::xchain::xchain_leaf_domain()`.
-    bytes32 internal constant LEAF_DOMAIN = keccak256("KARDAMOM_XCHAIN_MESSAGE_V0");
+    ///         `kardamom_types::xchain::xchain_leaf_domain()`. V1 added the
+    ///         `hops` word (audit H6); a V0 leaf can never equal a V1 leaf.
+    bytes32 internal constant LEAF_DOMAIN = keccak256("KARDAMOM_XCHAIN_MESSAGE_V1");
 
     /// @notice Canonical predeploy addresses, mirrored in `xchain.rs`.
     address internal constant OUTBOX = 0x42000000000000000000000000000000000000E0;
@@ -68,9 +77,12 @@ library XChain {
         return cb.target == address(0) && cb.gasLimit == 0 && cb.context == bytes32(0);
     }
 
-    /// @notice The message leaf: ten static words. Must equal
+    /// @notice The message leaf: eleven static words. Must equal
     ///         `xchain.rs::msg_leaf`. Origin AND destination chain ids inside
-    ///         the leaf make replay across pairs impossible.
+    ///         the leaf make replay across pairs impossible. `hops` is the
+    ///         message's remaining hop budget (audit H6): the destination
+    ///         commits to it, so a derived send cannot claim more hops than
+    ///         the paid send that started the chain.
     function hashMessage(
         uint64 originChainId,
         uint64 destChainId,
@@ -79,6 +91,7 @@ library XChain {
         address target,
         uint256 value,
         uint64 gasLimit,
+        uint8 hops,
         bytes32 dataHash,
         bytes32 cbHash
     ) internal pure returns (bytes32) {
@@ -92,9 +105,16 @@ library XChain {
                 target,
                 value,
                 gasLimit,
+                hops,
                 dataHash,
                 cbHash
             )
         );
+    }
+
+    /// @notice The delivery state the Inbox exposes to the Outbox's hop rule.
+    ///         Both are predeploys, so the Outbox reads the constant `INBOX`.
+    function inbox() internal pure returns (IInboxDeliveryState) {
+        return IInboxDeliveryState(INBOX);
     }
 }

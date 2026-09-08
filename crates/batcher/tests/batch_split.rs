@@ -186,6 +186,7 @@ fn record_at_the_derivation_cap_fits_in_five_blobs() {
             target: Address::repeat_byte(0xB2),
             value: 0,
             gas_limit: 150_000,
+            hops: 0,
             input: Bytes::from(vec![i as u8; n]),
             callback: Some(kardamom_types::xchain::Callback {
                 target: Address::repeat_byte(0xCB),
@@ -241,6 +242,7 @@ fn wire_constants_match_the_encoder() {
             target: Address::repeat_byte(0xB2),
             value: 0,
             gas_limit: 150_000,
+            hops: 0,
             input: Bytes::new(),
             callback: Some(kardamom_types::xchain::Callback {
                 target: Address::repeat_byte(0xCB),
