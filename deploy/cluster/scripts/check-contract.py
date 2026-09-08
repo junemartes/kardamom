@@ -172,6 +172,29 @@ for job in ("executor", "validator", "batcher"):
         f"{job} opens the fixed lane plane and takes no shard count",
     )
 
+# --- transaction lifetime (tx_ttl) --------------------------------------------------
+# One value drives the sequencer expiry and the ingress submit park. The
+# chain-semantics stage parks for the same time by default.
+tx_ttl_ms = scalar(gv, "tx_ttl_ms")
+if not tx_ttl_ms.isdigit() or int(tx_ttl_ms) == 0:
+    err(f"group_vars/all.yml: tx_ttl_ms must be a positive integer, got {tx_ttl_ms!r}")
+seq_ttl_flags = seq_job.count(f'"--tx-ttl-ms", "{tx_ttl_ms}"')
+if seq_ttl_flags != 2:
+    err(
+        f"nomad/sequencer.nomad.hcl: expected both replica groups to pass "
+        f'"--tx-ttl-ms", "{tx_ttl_ms}" (found {seq_ttl_flags})'
+    )
+must_contain(
+    jobs / "ingress.nomad.hcl",
+    f'"--pending-receipt-timeout-ms", "{tx_ttl_ms}"',
+    "ingress submit park equals tx_ttl_ms",
+)
+must_contain(
+    CLUSTER / "scripts" / "ci-stages.sh",
+    f"SEMANTICS_PARK_MS:-{tx_ttl_ms}",
+    "chain-semantics park default equals tx_ttl_ms",
+)
+
 # --- config templates -----------------------------------------------------------
 # Cluster-only: tx_ordering is carried by the Aeron Cluster (Raft), not the
 # legacy MDC pub/sub, so the old sealer channel_b_mdc_control ⊆ tx_ordering_mdc_

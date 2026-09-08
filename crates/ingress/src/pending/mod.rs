@@ -274,6 +274,7 @@ impl PendingReceipts {
                 let err = match reason {
                     TxErrorReason::DuplicatedTx { .. } => IngressError::Duplicate((sender, nonce)),
                     TxErrorReason::Evicted { .. } => IngressError::Evicted((sender, nonce)),
+                    TxErrorReason::Expired { .. } => IngressError::Expired((sender, nonce)),
                 };
                 // This only releases the waiter. The woken waiter's Drop
                 // removes the slot.

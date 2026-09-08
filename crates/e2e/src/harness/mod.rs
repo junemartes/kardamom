@@ -194,8 +194,7 @@ fn assemble_spec<'a>(
     root: &'a Path,
     driver: &'a MediaDriver,
     sealer: &'a SealerCluster,
-    shards: u32,
-    chain_id: u64,
+    cfg: &StackConfig,
     genesis: &'a Path,
     log_config: Option<&'a Path>,
 ) -> ServiceSpec<'a> {
@@ -203,8 +202,9 @@ fn assemble_spec<'a>(
         root,
         aeron_dir: &driver.aeron_dir,
         cluster_ingress_endpoints: &sealer.ingress_endpoints,
-        shards,
-        chain_id,
+        shards: cfg.shards,
+        tx_ttl: cfg.ingress.pending_receipt_timeout,
+        chain_id: cfg.chain_id,
         genesis,
         log_config,
     }
@@ -328,8 +328,7 @@ impl LocalStack {
             root.path(),
             &driver,
             &sealer,
-            cfg.shards,
-            cfg.chain_id,
+            &cfg,
             &genesis,
             log_config.as_deref(),
         );
@@ -582,8 +581,7 @@ impl LocalStack {
             self.root.path(),
             &self.driver,
             &self.sealer,
-            self.cfg.shards,
-            self.cfg.chain_id,
+            &self.cfg,
             &self.genesis,
             self.log_config.as_deref(),
         )

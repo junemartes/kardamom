@@ -3,6 +3,7 @@
 //! that starts at 0. This is true for any shuffle of `(sender, nonce)` pairs.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use alloy_primitives::Address;
 use proptest::prelude::*;
@@ -20,7 +21,7 @@ proptest! {
     fn published_nonces_per_sender_are_ascending_and_dense(
         seq in proptest::collection::vec((0u8..4u8, 0u64..16u64), 0..200),
     ) {
-        let mut st: PartitionState<u64> = PartitionState::new(16);
+        let mut st: PartitionState<u64> = PartitionState::new(16, Duration::from_secs(30));
         let mut per_sender_published: HashMap<Address, Vec<u64>> = HashMap::new();
         for (sidx, nonce) in seq {
             let r = st.process(addr(sidx), nonce, nonce);

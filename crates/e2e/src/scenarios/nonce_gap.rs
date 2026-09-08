@@ -9,10 +9,11 @@
 //!    4 and 5 never ran.
 //! 2. Gap isolation: while one sender is gapped, other senders keep landing
 //!    transactions at normal latency (the no-wedge property).
-//! 3. Late fill: submitting nonce 3 drains the sequencer-buffered {4,5}.
-//!    Receipts appear for all three, and resubmitting the timed-out raw
-//!    transactions returns instantly from the receipt cache with the same
-//!    hashes.
+//! 3. Expiry and late fill: the parked {4,5} waited on the gap for
+//!    `tx_ttl`, so the sequencer expired them (the explicit end of a
+//!    transaction's lifetime; see docs/specs/dynamic-sequencer-sizing.md,
+//!    section 3.3). Submitting nonce 3 lands 3 alone. Resubmitting the
+//!    expired raw transactions lands them with the same hashes.
 //! 4. Disorder variant: a fresh sender submits {5,3,1,0,2,4} in that wire
 //!    order, staggered, and all six land (a reorder window, with no gap).
 //!
@@ -56,6 +57,9 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         .executor_metric(super::EXEC_TX_APPLIED)
         .await
         .unwrap_or(0.0);
+    // The expiry baseline. Read it before the park, because the sequencer
+    // expires the pair at about the same instant the ingress times out.
+    let expired_start = t.sequencer_metric_sum(super::SEQ_EXPIRED).await?;
 
     // --- Step 1a: the contiguous prefix {0,1,2} lands normally. -------------
     let gapped = &signers[p.gapped];
@@ -138,39 +142,50 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         anyhow::ensure!(body.is_none(), "gap nonce {n} has a receipt — it executed");
     }
 
-    // --- Step 3: late fill. Nonce 3 arrives; the sequencer drains {3,4,5}. ---
+    // --- Step 3a: the parked pair expired on the sequencer. ---------------
+    // The sequencer's tx_ttl equals the ingress park. Every replica of the
+    // shard expires the pair a few ms after the ingress timed out, so the
+    // counter sums to at least 2 (one replica) across the shard's
+    // replicas. Wait for it before the late fill, so the fill cannot race
+    // the sweep.
+    poll_until(
+        "sequencer expired the parked pair",
+        Duration::from_secs(10),
+        Duration::from_millis(200),
+        || async {
+            let n = t.sequencer_metric_sum(super::SEQ_EXPIRED).await?;
+            Ok((n >= expired_start + 2.0).then_some(()))
+        },
+    )
+    .await
+    .context("nonces 4/5 must expire after tx_ttl")?;
+
+    // --- Step 3b: late fill. Nonce 3 lands alone. ---------------------------
     let tx3 = l2::sign_transfer(gapped, t.chain_id, 3, to, 1)?;
     let out = t.rpc.send_raw(&tx3.raw).await;
     out.result
         .map_err(|e| anyhow::anyhow!("late fill nonce 3 failed: {e}"))?;
-    // The pipeline executed 4 and 5 as part of the drained run. Their
-    // receipts appear with no resubmission.
-    poll_until(
-        "drained gap receipts (4,5)",
-        Duration::from_secs(10),
-        Duration::from_millis(200),
-        || async {
-            let r4 = t.rpc.receipt(tx4.hash).await.result.ok().flatten();
-            let r5 = t.rpc.receipt(tx5.hash).await.result.ok().flatten();
-            Ok((r4.is_some() && r5.is_some()).then_some(()))
-        },
-    )
-    .await
-    .context("nonces 4/5 must execute once the gap fills")?;
-    // An idempotent resubmit of the original raw transactions returns
-    // immediately from the receipt cache, with the same hashes.
+    t.wait_executor_applied(applied_start + 7.0, Duration::from_secs(15))
+        .await
+        .context("nonce 3 applied")?;
+    for (n, tx) in [(4u64, &tx4), (5u64, &tx5)] {
+        let r = t.rpc.receipt(tx.hash).await;
+        let body = r.result.map_err(|e| anyhow::anyhow!("receipt({n}): {e}"))?;
+        anyhow::ensure!(
+            body.is_none(),
+            "expired nonce {n} has a receipt — the sequencer kept it past tx_ttl"
+        );
+    }
+
+    // --- Step 3c: the client resubmits the expired pair. ---------------------
+    // The resubmits take the full path, since no receipt exists yet. They
+    // land with the same hashes.
     for tx in [&tx4, &tx5] {
         let out = t.rpc.send_raw(&tx.raw).await;
         let h = out
             .result
-            .map_err(|e| anyhow::anyhow!("cached resubmit nonce {}: {e}", tx.nonce))?;
-        anyhow::ensure!(h == tx.hash, "cached resubmit returned {h} != {}", tx.hash);
-        anyhow::ensure!(
-            out.elapsed < Duration::from_secs(2),
-            "cached resubmit nonce {} took {:?} — not served from cache",
-            tx.nonce,
-            out.elapsed
-        );
+            .map_err(|e| anyhow::anyhow!("resubmit of expired nonce {}: {e}", tx.nonce))?;
+        anyhow::ensure!(h == tx.hash, "resubmit returned {h} != {}", tx.hash);
     }
     t.wait_executor_applied(applied_start + 9.0, Duration::from_secs(15))
         .await

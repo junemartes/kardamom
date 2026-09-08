@@ -45,6 +45,7 @@ pub const EXEC_TX_APPLIED: &str = "kardamom_executor_tx_applied_total";
 pub const EXEC_BLOCK_NUMBER: &str = "kardamom_executor_block_number";
 pub const SEQ_DROPPED_PAST: &str = "kardamom_sequencer_tx_dropped_past_total";
 pub const SEQ_EVICTIONS: &str = "kardamom_sequencer_pending_evictions_total";
+pub const SEQ_EXPIRED: &str = "kardamom_sequencer_pending_expired_total";
 pub const SEQ_REMOTE_EPOCHS_RELAYED: &str = "kardamom_sequencer_remote_epochs_relayed_total";
 pub const SEQ_REMOTE_MESSAGES_RELAYED: &str = "kardamom_sequencer_remote_messages_relayed_total";
 pub const SEQ_REMOTE_ORIGIN_REJECT: &str = "kardamom_sequencer_remote_origin_reject_total";

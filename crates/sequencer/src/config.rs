@@ -24,6 +24,14 @@ pub struct SequencerConfig {
     pub sequencer_id: u8,
     /// Per-sender future-nonce buffer capacity. Default 16.
     pub max_pending_per_sender: usize,
+    /// The lifetime of a transaction that waits on a nonce gap, in
+    /// milliseconds. A parked entry older than this expires with an
+    /// explicit `Expired` error on the tx_errors channel. The deploy
+    /// drives this value and the ingress `pending_receipt_timeout` from
+    /// one `group_vars` value. Default 30 000. See
+    /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.3.
+    #[serde(default = "default_tx_ttl_ms")]
+    pub tx_ttl_ms: u64,
     /// This field is unused. It is accepted only for config compatibility.
     /// It used to bound the stream-adaptive nonce-floor fast-forward. That
     /// feature was removed: it adopted client-abandoned nonce gaps into the
@@ -51,6 +59,10 @@ fn default_nonce_floor_lag_ms() -> u64 {
     5_000
 }
 
+fn default_tx_ttl_ms() -> u64 {
+    30_000
+}
+
 // The `[cluster]` TOML section has one definition. Every cluster client
 // shares it, re-exported from `kardamom-cluster-adapter`.
 pub use kardamom_cluster_adapter::ClusterConfig;
@@ -69,6 +81,7 @@ impl Default for SequencerConfig {
             partition_index: 0,
             sequencer_id: 0,
             max_pending_per_sender: 16,
+            tx_ttl_ms: default_tx_ttl_ms(),
             nonce_floor_lag_ms: default_nonce_floor_lag_ms(),
             core_id: None,
             backpressure_policy: BackpressurePolicy::ReturnImmediately,
@@ -85,6 +98,9 @@ impl SequencerConfig {
         }
         crate::partition::validate_partition_count(self.partition_count)
             .map_err(ConfigError::LanePlane)?;
+        if self.tx_ttl_ms == 0 {
+            return Err(ConfigError::ZeroTtl);
+        }
         if self.partition_index >= self.partition_count {
             return Err(ConfigError::IndexOutOfRange {
                 index: self.partition_index,
@@ -121,6 +137,8 @@ impl SequencerConfig {
 pub enum ConfigError {
     #[error("partition_count must be >= 1")]
     ZeroPartitions,
+    #[error("tx_ttl_ms must be >= 1")]
+    ZeroTtl,
     #[error("partition_count does not fit the lane plane: {0}")]
     LanePlane(#[from] crate::partition::PartitionConfigError),
     #[error("partition_index {index} >= partition_count {count}")]
@@ -157,6 +175,25 @@ mod tests {
             };
             assert!(matches!(cfg.validate(), Err(ConfigError::LanePlane(_))));
         }
+    }
+
+    #[test]
+    fn zero_ttl_rejected() {
+        let cfg = SequencerConfig {
+            tx_ttl_ms: 0,
+            ..Default::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::ZeroTtl)));
+    }
+
+    #[test]
+    fn tx_ttl_defaults_when_the_toml_omits_it() {
+        let cfg: SequencerConfig = toml::from_str(
+            "partition_count = 2\npartition_index = 0\nsequencer_id = 0\n\
+             max_pending_per_sender = 16\nbackpressure_policy = \"return_immediately\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tx_ttl_ms, 30_000);
     }
 
     #[test]

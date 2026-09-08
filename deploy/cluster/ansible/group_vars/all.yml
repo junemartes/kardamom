@@ -25,6 +25,13 @@ partition_count: 2               # M active sequencer shards: 1, 2, 4, or 8
 # validator, and the batcher take no count. Mirrors, checked by
 # scripts/check-contract.py: ingress.nomad.hcl --shards,
 # sequencer.nomad.hcl --partition-count, config/sequencer.toml.tpl.
+# The transaction lifetime, in ms. A transaction that waits on a nonce gap
+# in a sequencer expires after this time with an explicit error. The
+# ingress parks a submit for the same time. One value drives both:
+# sequencer.nomad.hcl --tx-ttl-ms (both groups), ingress.nomad.hcl
+# --pending-receipt-timeout-ms, and the chain-semantics park default in
+# scripts/ci-stages.sh. scripts/check-contract.py checks the mirrors.
+tx_ttl_ms: 30000
 
 # --- ports ----------------------------------------------------------------
 ports:

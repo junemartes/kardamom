@@ -101,6 +101,32 @@ async fn eviction_releases_the_parked_wait_with_an_evicted_error() {
 }
 
 #[tokio::test]
+async fn expiry_releases_the_parked_wait_with_an_expired_error() {
+    // A sequencer expiry (the transaction waited on a nonce gap for
+    // tx_ttl) must error the parked submit with an explicit reason. The
+    // client then knows to resubmit after the gap fills.
+    let p = Arc::new(PendingReceipts::new(AckPolicy::OnOffer));
+    let sender = Address::repeat_byte(0x78);
+    let nonce = 31u64;
+
+    let wait = p.register(sender, nonce);
+    let waiter = tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(5)).await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    p.on_tx_error(sender, nonce, TxErrorReason::Expired { expected_nonce: 28 })
+        .await;
+
+    let res = waiter.await.expect("join");
+    match res {
+        Err(IngressError::Expired((s, n))) => {
+            assert_eq!((s, n), (sender, nonce));
+        }
+        other => panic!("expected Expired release, got {other:?}"),
+    }
+    assert_eq!(p.len(), 0, "entry removed on release");
+}
+
+#[tokio::test]
 async fn success_arriving_within_the_grace_overrides_a_rejection() {
     // With racing sequencer replicas, replica A's DuplicatedTx can
     // arrive before replica B's receipt for the same tx. The rejection
