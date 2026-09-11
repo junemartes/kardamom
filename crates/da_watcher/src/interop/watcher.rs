@@ -376,8 +376,8 @@ impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropLoop<S, P> {
                     origin,
                     cursor,
                     error = %e,
-                    "fail-stop fault; STOPPING this pair (a feed gap is never skipped; \
-                     operator intervention required)"
+                    "remote epoch derivation fault; STOPPING this pair (a feed gap is never \
+                     skipped; operator intervention required)"
                 );
                 ControlFlow::Break(())
             }
