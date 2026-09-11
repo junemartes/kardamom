@@ -38,42 +38,42 @@ case_hard_ingress() {
   assert_count ingress 2 "${CHAOS_RESTART_SLO_S}"
 }
 
-# Sequencers run 2 racing replicas per shard (job groups seq-a/seq-b, 4
+# Sequencers run 2 racing replicas per shard (one job group per lane, seq-0/seq-1, 4
 # allocs total). A kill no longer stalls its shard: the twin on the
 # other node keeps ordering. So these cases also check live pipeline
 # progress.
 # The load is pinned to shard 0 (account selection in run_case),
-# and the stop targets a seq-a alloc specifically. An arbitrary alloc
+# and the stop targets a seq-0 alloc specifically. An arbitrary alloc
 # used to mean about half the runs killed a replica the pinned load
 # never used.
 case_graceful_sequencer() {
-  inject_graceful_group sequencer seq-a
+  inject_graceful_group sequencer seq-0
   assert_progress
   assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
 }
 
 # This uses an explicit task name. `name=sequencer` would match both
-# the sequencer-a and sequencer-b task containers, and kill an
+# the sequencer-0 and sequencer-1 task containers, and kill an
 # arbitrary one.
 case_hard_sequencer() {
-  inject_hard kardamom-sequencer-0 sequencer-a
+  inject_hard kardamom-sequencer-0 sequencer-0
   assert_progress
   assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
 }
 
 case_sequencer_replica_kill() {
-  # Hard-kill a specific replica: seq-a on node-0, shard 0's replica A.
-  # Its twin is seq-b on node-1. The case's load is pinned to shard 0
+  # Hard-kill a specific replica: lane 0's replica on node-0. Its twin
+  # is lane 0's replica on node-1 (same lane, same port, other node). The case's load is pinned to shard 0
   # (see the account selection in run_case), so the assertions actually
   # cover the shard that lost a replica. It must stay live with no
   # stall: the racing twin never stopped, and the cluster dedups its
   # refs. The killed replica restarts to full strength (4/4) and comes
   # back healthy. Established-sender coverage on the rejoiner is a known
   # gap (see assert_replica_healthy).
-  inject_hard kardamom-sequencer-0 sequencer-a
+  inject_hard kardamom-sequencer-0 sequencer-0
   assert_progress
   assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
-  # seq-a on node-0: sequencer ip lane starts at .21, seq-a metrics :9001.
+  # lane 0 on node-0: sequencer ip lane starts at .21, lane 0 metrics :9001.
   assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
 }
 

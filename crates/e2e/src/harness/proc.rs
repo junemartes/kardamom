@@ -5,9 +5,10 @@
 //! the stack's temp root. This code polls readiness from those log files
 //! or from the component's network surface, never from a fixed sleep.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -154,6 +155,52 @@ impl Proc {
     }
 
     /// Last `n` lines of the process log (best-effort, for failure dumps).
+    /// Block until `needle` appears in the log, the process exits, or
+    /// `timeout` passes. A process that exits first, or a timeout, is an
+    /// error that carries the log tail.
+    ///
+    /// # Errors
+    /// Returns an error when the process exits before it logs `needle`,
+    /// or when `timeout` passes first.
+    pub fn wait_for_log_line(&mut self, needle: &str, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let ControlFlow::Break(result) = self.poll_log_line(needle, deadline, timeout) {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// One [`Self::wait_for_log_line`] poll: `Break` when the line is
+    /// there, the process is gone, or the deadline passed.
+    fn poll_log_line(
+        &mut self,
+        needle: &str,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> ControlFlow<Result<()>> {
+        let found = std::fs::read_to_string(&self.log_path).is_ok_and(|s| s.contains(needle));
+        if found {
+            return ControlFlow::Break(Ok(()));
+        }
+        if !self.is_alive() {
+            return ControlFlow::Break(Err(anyhow::anyhow!(
+                "{} exited before logging {needle:?}; log tail:\n{}",
+                self.name,
+                self.log_tail(40)
+            )));
+        }
+        if Instant::now() >= deadline {
+            return ControlFlow::Break(Err(anyhow::anyhow!(
+                "{}: timed out ({timeout:?}) waiting for {needle:?}; log tail:\n{}",
+                self.name,
+                self.log_tail(40)
+            )));
+        }
+        ControlFlow::Continue(())
+    }
+
     #[must_use]
     pub fn log_tail(&self, n: usize) -> String {
         match std::fs::read_to_string(&self.log_path) {

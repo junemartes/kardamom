@@ -1,10 +1,10 @@
-//! Target-agnostic chain-semantics scenario drivers.
+//! `Target`-agnostic chain-semantics scenario drivers.
 //!
 //! Each scenario proves one part of the spec
 //! (`docs/agents/chain-semantics-e2e-suite-spec.md`) through external seams
 //! only: the ingress JSON-RPC and the per-service Prometheus endpoints.
 //! Nothing here knows how the pipeline started. So the same drivers run
-//! against the Target-L local stack, and also against the Target-C
+//! against the `Target`-L local stack, and also against the `Target`-C
 //! `ci-cluster.sh` `DinD` cluster, unchanged.
 
 pub mod bridge;
@@ -16,8 +16,10 @@ pub mod divergence;
 pub mod l1_batch;
 pub mod nonce_gap;
 pub mod nonce_unordered;
+pub mod resize;
 pub mod rpc_liveness;
 pub mod rpc_vectors;
+pub mod sequencer_restart;
 pub mod upgrade;
 pub mod xchain;
 pub mod xchain_da_parity;
@@ -54,6 +56,10 @@ pub const EXEC_TX_APPLIED: &str = "kardamom_executor_tx_applied_total";
 pub const EXEC_BLOCK_NUMBER: &str = "kardamom_executor_block_number";
 pub const SEQ_DROPPED_PAST: &str = "kardamom_sequencer_tx_dropped_past_total";
 pub const SEQ_EVICTIONS: &str = "kardamom_sequencer_pending_evictions_total";
+pub const SEQ_EXPIRED: &str = "kardamom_sequencer_pending_expired_total";
+pub const SEQ_NONCE_LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
+pub const SEQ_SHADOW_VSLOTS: &str = "kardamom_sequencer_shadow_vslots";
+pub const SEQ_PENDING_DEPTH: &str = "kardamom_sequencer_pending_depth";
 pub const SEQ_REMOTE_EPOCHS_RELAYED: &str = "kardamom_sequencer_remote_epochs_relayed_total";
 pub const SEQ_REMOTE_MESSAGES_RELAYED: &str = "kardamom_sequencer_remote_messages_relayed_total";
 pub const SEQ_REMOTE_ORIGIN_REJECT: &str = "kardamom_sequencer_remote_origin_reject_total";
@@ -73,6 +79,18 @@ pub const TRIE_SHADOW_MISMATCH: &str = "kardamom_state_trie_shadow_mismatch_tota
 /// one shared copy — contracts, the validator, and these scenarios all
 /// need the same packing.
 pub(crate) use kardamom_types::xchain::{u64_word, word_u64};
+
+/// A count as a metric value, for a comparison against a scraped counter.
+/// Every count this crate compares is far below 2^52, so the `f64`
+/// mantissa holds it exactly.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "every count this crate compares stays far below 2^52, where f64 is exact"
+)]
+pub fn count_as_f64(n: u64) -> f64 {
+    n as f64
+}
 
 /// Convert a scraped metric value to the `u64` every counter and gauge
 /// this crate reads really is. A scraped value that fails this check

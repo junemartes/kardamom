@@ -219,8 +219,11 @@ case_archive_corruption() {
   # a closed loop. Every verify and mark-valid call is scoped to that
   # recording (segment name is <recordingId>-<base>.rec).
   local seg="" seg_name="" rid="" flip_at=-1 cand cand_name cand_rid cand_out cand_flip
+  # The ingress records all 8 tx_data lanes. Only the active lanes carry
+  # data frames, so the candidate window must cover the idle lanes and
+  # the per-restart sessions of every lane.
   for cand in $(docker exec kardamom-ingress-0 bash -lc \
-      'ls -S /opt/kardamom/archive/dir/*.rec 2>/dev/null | head -6'); do
+      'ls -S /opt/kardamom/archive/dir/*.rec 2>/dev/null | head -48'); do
     cand_name="$(basename "${cand}")"
     cand_rid="${cand_name%%-*}"
     # Recording ids are per-archive counters, so the victim's

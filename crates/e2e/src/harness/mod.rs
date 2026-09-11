@@ -1,4 +1,4 @@
-//! Target-L: the single-host local stack for the chain-semantics suite.
+//! `Target`-L: the single-host local stack for the chain-semantics suite.
 //!
 //! One `LocalStack::launch` call brings up the following, on per-test temp
 //! directories and OS-assigned ports (so concurrent stacks never collide):
@@ -70,6 +70,9 @@ pub struct LocalStack {
     /// archive-durability `channels.toml`, written once at launch). Also
     /// reused by [`Self::service_spec`] for a restarted service.
     log_config: Option<PathBuf>,
+    /// The executor's nonce query port. Picked before the sequencers
+    /// spawn, and reused by a restarted executor.
+    executor_query_port: u16,
     root: tempfile::TempDir,
     keep: bool,
     shutdown_report: ShutdownReport,
@@ -169,6 +172,7 @@ impl LocalStack {
     /// from the launch-time state (same genesis, same `--log-config`).
     fn service_spec(&self) -> ServiceSpec<'_> {
         launch::StackLaunch::new(&self.cfg, self.root.path(), &self.driver, &self.sealer)
+            .with_executor_query_port(self.executor_query_port)
             .assemble_spec(&self.genesis, self.log_config.as_deref())
     }
 

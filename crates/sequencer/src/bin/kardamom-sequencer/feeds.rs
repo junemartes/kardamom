@@ -5,7 +5,9 @@
 //! `ResyncController`: a replica that falls behind its twin past the
 //! cluster's dedup window can double-order a transaction, so these feeds
 //! detect the lag and drive the sequencer into a receipt-proof-only
-//! publish mode until it clears. `PublishLoops::spawn` runs the
+//! publish mode until it clears. The nonce lookup task answers the
+//! core's requests with an executor's committed nonce, as floor evidence
+//! of the same kind as a receipt. `PublishLoops::spawn` runs the
 //! canonical `TxRef` loop and the `DepositRef` epoch pump on blocking
 //! tasks.
 //!
@@ -15,6 +17,7 @@
 //! Async-capable work, such as the receipts fan-in on an existing tokio
 //! channel, is a plain task. It uses `select!` on `Shutdown::cancelled`.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
@@ -29,14 +32,67 @@ use kardamom_log::aeron_live::{
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::epoch::process_epoch;
 use kardamom_sequencer::error::SequencerError;
+use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
+use kardamom_sequencer::lookup::{self, LookupConfig, LookupRequester};
 use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
-use kardamom_sequencer::partition::PartitionCount;
 use kardamom_sequencer::remote_epoch::process_remote_epoch;
 use kardamom_sequencer::resync::{
     FloorUpdate, ResyncController, SharedWatermark, elapsed_ms_saturating,
 };
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
+use kardamom_types::shard_map::{VslotSet, vslot_for};
+
+/// One `tx_data` lane subscription: the lane index the sequencer stamps
+/// into every ref off it, and the handle that reads it.
+pub(crate) struct LaneSub {
+    pub(crate) lane: u8,
+    pub(crate) handle: TxDataSubscriberHandle,
+}
+
+/// The live `tx_data` subscription set: one handle per lane the sequencer
+/// reads. The own lane comes first. A resize adds the old lanes. The poll
+/// walks the lanes in rotation, so a busy old lane cannot starve the own
+/// lane. Never empty: the constructor takes the own lane apart from the
+/// old ones.
+pub(crate) struct LaneSubscriptions {
+    lanes: Vec<LaneSub>,
+    /// The lane the next poll tries first.
+    next: usize,
+}
+
+impl LaneSubscriptions {
+    pub(crate) fn new(own: LaneSub, old: Vec<LaneSub>) -> Self {
+        let lanes = std::iter::once(own).chain(old).collect();
+        Self { lanes, next: 0 }
+    }
+}
+
+impl TxDataSubscriber for LaneSubscriptions {
+    fn poll(&mut self) -> Result<Option<Inbound>, SequencerError> {
+        // try_recv is non-blocking. The Sequencer's run loop handles
+        // backoff when poll returns None.
+        let n = self.lanes.len();
+        let lanes = &mut self.lanes;
+        let found = (0..n)
+            .map(|i| self.next.saturating_add(i) % n)
+            .find_map(|idx| {
+                let sub = &mut lanes[idx];
+                sub.handle.try_recv().map(|(loc, envelope)| {
+                    let inbound = Inbound {
+                        lane: sub.lane,
+                        loc,
+                        envelope,
+                    };
+                    (idx, inbound)
+                })
+            });
+        Ok(found.map(|(idx, inbound)| {
+            self.next = idx.saturating_add(1) % n;
+            inbound
+        }))
+    }
+}
 
 /// The egress-watermark feed: the silence authority. It measures
 /// boundary-arrival gaps. Idle traffic still emits a boundary every
@@ -237,8 +293,10 @@ impl EgressWatermarkFeed {
     }
 }
 
-/// The `tx_receipts`-to-per-sender executed-truth floor feed. Only this
-/// shard's senders reach the floor channel.
+/// The `tx_receipts`-to-per-sender executed-truth floor feed. Only the
+/// senders of this replica's vslots reach the floor channel. The set is
+/// the replica's whole set, shadow slots included: floors must advance
+/// for the incoming senders during the warm-up too.
 ///
 /// The receipts handle already fans in over a tokio unbounded channel. The
 /// Aeron poll thread is the producer. So this is a plain async task. It
@@ -246,22 +304,13 @@ impl EgressWatermarkFeed {
 /// `floor_tx` stays a std channel, because its consumer is the sync
 /// `ResyncController` in the publish loop.
 pub(crate) struct ReceiptFloorFeed {
-    partition_count: PartitionCount,
-    partition_index: u32,
+    vslots: VslotSet,
     floor_tx: crossbeam_channel::Sender<FloorUpdate>,
 }
 
 impl ReceiptFloorFeed {
-    pub(crate) fn new(
-        partition_count: PartitionCount,
-        partition_index: u32,
-        floor_tx: crossbeam_channel::Sender<FloorUpdate>,
-    ) -> Self {
-        Self {
-            partition_count,
-            partition_index,
-            floor_tx,
-        }
+    pub(crate) fn new(vslots: VslotSet, floor_tx: crossbeam_channel::Sender<FloorUpdate>) -> Self {
+        Self { vslots, floor_tx }
     }
 
     /// Spawn as a plain async task. The handle reduces to its receiver
@@ -311,15 +360,17 @@ impl ReceiptFloorFeed {
     /// Filter, build, and forward one receipt, for [`Self::tick`].
     /// `Break` means the publish loop is gone and the task should stop.
     fn forward_one_receipt(&self, receipt: &kardamom_types::Receipt) -> ControlFlow<()> {
-        // Forward every partition-matched receipt. The controller splits
-        // floor evidence (skip and deposit receipts excluded, since they
-        // consume no L2 nonce) from publish confirmations (skip receipts
-        // count as confirmations: ordering is the claim). See
-        // `ResyncController::drain_floor_updates` for the split.
+        // Forward every receipt of this replica's vslots, nonce 0
+        // included. A deposit receipt carries `Receipt::tx_type ==
+        // TX_TYPE_DEPOSIT`, so the controller tells it apart from a
+        // genuine nonce-0 transaction receipt. It excludes deposits and
+        // skip receipts from floor evidence (they consume no L2 nonce),
+        // and counts skip receipts as publish confirmations (ordering is
+        // the claim). See `ResyncController::drain_floor_updates`.
         //
-        // Only this shard's senders can appear in this replica's publish
-        // stream, so the floor map stays bounded to them.
-        if self.partition_count.index_of(receipt.from) != self.partition_index {
+        // Only this replica's senders can appear in its publish stream,
+        // so the floor map stays bounded to them.
+        if !self.vslots.contains(vslot_for(receipt.from)) {
             return ControlFlow::Continue(());
         }
         let update = FloorUpdate {
@@ -344,15 +395,249 @@ impl ReceiptFloorFeed {
     }
 }
 
+/// One lookup result, from a query task back to the drain.
+struct LookupDone {
+    sender: Address,
+    result: Result<u64, String>,
+}
+
+/// The nonce lookup task. It drains the core's requests, dedups the
+/// senders in flight, bounds the concurrency and the per-sender retry
+/// rate, queries the executors, and delivers each answer as a
+/// `FloorUpdate`. See `kardamom_sequencer::lookup`.
+///
+/// One query runs on its own task, so a slow executor never blocks the
+/// drain. The endpoints rotate per query, and a query walks the list until
+/// one endpoint answers within the timeout.
+pub(crate) struct NonceLookupFeed {
+    cfg: LookupConfig,
+    partition: u32,
+    floor_tx: crossbeam_channel::Sender<FloorUpdate>,
+    client: reqwest::Client,
+    endpoints: std::sync::Arc<[String]>,
+    done_tx: tokio::sync::mpsc::UnboundedSender<LookupDone>,
+    done_rx: tokio::sync::mpsc::UnboundedReceiver<LookupDone>,
+    in_flight: HashSet<Address>,
+    /// The last request time per sender. It bounds the retry rate to one
+    /// lookup per timeout per sender.
+    recent: HashMap<Address, Instant>,
+    next_endpoint: usize,
+}
+
+impl NonceLookupFeed {
+    /// The `recent` map is pruned once it holds this many senders.
+    const RECENT_CAP: usize = 4096;
+
+    /// Build the feed. Fails only when the HTTP client cannot be built.
+    pub(crate) fn new(
+        cfg: LookupConfig,
+        partition: u32,
+        floor_tx: crossbeam_channel::Sender<FloorUpdate>,
+    ) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder().timeout(cfg.timeout()).build()?;
+        let endpoints: std::sync::Arc<[String]> = cfg.executor_endpoints.clone().into();
+        let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
+        Ok(Self {
+            cfg,
+            partition,
+            floor_tx,
+            client,
+            endpoints,
+            done_tx,
+            done_rx,
+            in_flight: HashSet::new(),
+            recent: HashMap::new(),
+            next_endpoint: 0,
+        })
+    }
+
+    /// Spawn the drain as a plain async task over the core's requests.
+    pub(crate) fn spawn(
+        self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
+        shutdown: Shutdown,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(self.run(rx, shutdown))
+    }
+
+    async fn run(
+        mut self,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
+        shutdown: Shutdown,
+    ) {
+        while self.tick(&mut rx, &shutdown).await.is_continue() {}
+    }
+
+    /// One [`Self::run`] pass: wait for a finished query, a new request,
+    /// or shutdown. `Break` means the task should stop: shutdown, a
+    /// closed channel, or the publish loop is gone.
+    async fn tick(
+        &mut self,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Address>,
+        shutdown: &Shutdown,
+    ) -> ControlFlow<()> {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => ControlFlow::Break(()),
+            done = self.done_rx.recv() => match done {
+                Some(done) => self.on_done(done),
+                None => ControlFlow::Break(()),
+            },
+            req = rx.recv() => match req {
+                Some(sender) => {
+                    self.on_request(sender);
+                    ControlFlow::Continue(())
+                }
+                None => ControlFlow::Break(()),
+            },
+        }
+    }
+
+    /// One finished query: count it, and forward an answer above nonce 0
+    /// as floor evidence. `Break` means the publish loop is gone.
+    fn on_done(&mut self, done: LookupDone) -> ControlFlow<()> {
+        self.in_flight.remove(&done.sender);
+        seq_metrics::record_nonce_lookups_in_flight(self.partition, self.in_flight.len());
+        let nonce = match done.result {
+            Ok(nonce) => nonce,
+            Err(e) => {
+                let outcome = if e.contains("timed out") {
+                    "timeout"
+                } else {
+                    "error"
+                };
+                seq_metrics::record_nonce_lookup(self.partition, outcome);
+                tracing::warn!(sender = ?done.sender, error = %e, "nonce lookup failed");
+                return ControlFlow::Continue(());
+            }
+        };
+        seq_metrics::record_nonce_lookup(self.partition, "ok");
+        tracing::debug!(sender = ?done.sender, nonce, "nonce lookup answered");
+        // A committed nonce `c` proves every nonce below it executed.
+        // Nonce 0 proves nothing.
+        let Some(executed_nonce) = nonce.checked_sub(1) else {
+            return ControlFlow::Continue(());
+        };
+        let update = FloorUpdate {
+            sender: done.sender,
+            executed_nonce,
+            skip_reason: None,
+            deposit: false,
+        };
+        match self.floor_tx.send(update) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(_) => ControlFlow::Break(()),
+        }
+    }
+
+    /// One request from the core: drop it if the sender is in flight or
+    /// asked within the last timeout, shed it at the concurrency bound,
+    /// else start a query task.
+    fn on_request(&mut self, sender: Address) {
+        let now = Instant::now();
+        let timeout = self.cfg.timeout();
+        let asked_recently = self
+            .recent
+            .get(&sender)
+            .is_some_and(|t| now.duration_since(*t) < timeout);
+        if self.in_flight.contains(&sender) || asked_recently {
+            return;
+        }
+        if self.in_flight.len() >= self.cfg.max_in_flight.get() {
+            seq_metrics::record_nonce_lookup(self.partition, "shed");
+            return;
+        }
+        if self.recent.len() >= Self::RECENT_CAP {
+            self.recent.retain(|_, t| now.duration_since(*t) < timeout);
+        }
+        self.recent.insert(sender, now);
+        self.in_flight.insert(sender);
+        seq_metrics::record_nonce_lookups_in_flight(self.partition, self.in_flight.len());
+        self.spawn_query(sender);
+    }
+
+    /// Start one query task for `sender`, rotating the first endpoint.
+    fn spawn_query(&mut self, sender: Address) {
+        let first = self.next_endpoint % self.endpoints.len();
+        self.next_endpoint = self.next_endpoint.wrapping_add(1);
+        let client = self.client.clone();
+        let endpoints = self.endpoints.clone();
+        let done_tx = self.done_tx.clone();
+        tokio::spawn(async move {
+            let result = query_executors(&client, &endpoints, first, sender).await;
+            let _ = done_tx.send(LookupDone { sender, result });
+        });
+    }
+}
+
+/// Query the endpoints from `first` in rotation. The first answer wins.
+async fn query_executors(
+    client: &reqwest::Client,
+    endpoints: &[String],
+    first: usize,
+    sender: Address,
+) -> Result<u64, String> {
+    let n = endpoints.len();
+    let mut last_err = String::from("no executor endpoints");
+    for endpoint in (0..n).map(|i| &endpoints[first.saturating_add(i) % n]) {
+        if let ControlFlow::Break(nonce) =
+            query_endpoint(client, endpoint, sender, &mut last_err).await
+        {
+            return Ok(nonce);
+        }
+    }
+    Err(last_err)
+}
+
+/// One endpoint of [`query_executors`]'s rotation: `Break` carries the
+/// answer; on failure the error lands in `last_err`.
+async fn query_endpoint(
+    client: &reqwest::Client,
+    endpoint: &str,
+    sender: Address,
+    last_err: &mut String,
+) -> ControlFlow<u64> {
+    match query_one(client, endpoint, sender).await {
+        Ok(nonce) => ControlFlow::Break(nonce),
+        Err(e) => {
+            *last_err = format!("{endpoint}: {e}");
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+async fn query_one(
+    client: &reqwest::Client,
+    endpoint: &str,
+    sender: Address,
+) -> Result<u64, String> {
+    let resp = client
+        .post(endpoint)
+        .header("content-type", "application/json")
+        .body(lookup::request_body(sender))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                "timed out".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    lookup::parse_answer(&body)
+}
+
 pub(crate) type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
 
-/// Argument group for [`spawn_publish_loops`]: the config, the `tx_data`
-/// subscription, the three `tx_ordering` publishers, the `tx_errors`
-/// publisher, the two origin subscriptions, the resync controller, and
-/// one shutdown token. Each spawned loop clones the token itself.
+/// Argument group for [`PublishLoops::spawn`]: the config, the `tx_data`
+/// lane subscriptions, the three `tx_ordering` publishers, the `tx_errors`
+/// publisher, the two origin subscriptions, the resync controller, the
+/// nonce lookup requester, and one shutdown token. Each spawned loop
+/// clones the token itself.
 pub(crate) struct PublishLoops<P> {
     pub(crate) cfg: SequencerConfig,
-    pub(crate) tx_data: TxDataSubscriberHandle,
+    pub(crate) tx_data: LaneSubscriptions,
     /// The canonical `TxRef` loop's publisher.
     pub(crate) main_pub: P,
     /// The L1 epoch pump's publisher.
@@ -363,6 +648,8 @@ pub(crate) struct PublishLoops<P> {
     pub(crate) epochs: TxDepositsSubscriberHandle,
     pub(crate) remote_epochs: TxRemoteEpochsSubscriberHandle,
     pub(crate) resync: Option<ResyncController>,
+    /// `None` when the binary has no executor endpoints.
+    pub(crate) lookup: Option<LookupRequester>,
     pub(crate) shutdown: Shutdown,
 }
 
@@ -391,6 +678,7 @@ where
             epochs: epoch_subscription,
             remote_epochs: remote_epoch_subscription,
             resync,
+            lookup,
             shutdown,
         } = self;
 
@@ -402,6 +690,9 @@ where
             let mut sequencer = Sequencer::new(cfg)?;
             if let Some(controller) = resync {
                 sequencer.enable_resync(controller);
+            }
+            if let Some(requester) = lookup {
+                sequencer.enable_nonce_lookup(requester);
             }
             let mut ports = Ports {
                 tx_data: &mut tx_data,

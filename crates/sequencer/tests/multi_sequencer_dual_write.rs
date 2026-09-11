@@ -24,6 +24,7 @@ use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
 use kardamom_sequencer::config::SequencerConfig;
+use kardamom_sequencer::inbound::fakes::ScriptedTxData;
 use kardamom_sequencer::outbound::fakes::InMemoryTxOrderingRefPublisher;
 use kardamom_sequencer::partition::PartitionCount;
 use kardamom_sequencer::sequencer::Sequencer;
@@ -77,7 +78,13 @@ fn build_harness() -> Harness {
             ..Default::default()
         };
         sequencers.push(Sequencer::new(cfg).unwrap());
+        // Each fake reads the lane of its shard. The sequencer stamps that
+        // lane into every ref.
         rigs.push(Rig {
+            tx_data: ScriptedTxData {
+                lane: u8::try_from(i).unwrap(),
+                ..Default::default()
+            },
             refs: b.clone(),
             ..Default::default()
         });

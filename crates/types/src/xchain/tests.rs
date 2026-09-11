@@ -557,3 +557,74 @@ fn an_archive_whose_seq_range_overflows_u64_fails_to_decode() {
         "first_seq + len (u64::MAX) fits u64; must decode"
     );
 }
+
+/// Messages that fill the wire budget exactly. Each message stays at or
+/// under `MAX_DATA_BYTES`, so only the record cap can trip. One origin
+/// block for the whole record.
+fn messages_at_wire_cap() -> alloc::vec::Vec<OutboxMessage> {
+    let per_message = XCHAIN_MSG_FIXED_WIRE_BYTES;
+    let mut budget = MAX_REMOTE_EPOCH_WIRE_BYTES - REMOTE_EPOCH_FIXED_WIRE_BYTES;
+    let lens = core::iter::from_fn(|| {
+        (budget > 0).then(|| {
+            let len = core::cmp::min(MAX_DATA_BYTES, budget - per_message);
+            budget -= per_message + len;
+            len
+        })
+    });
+    lens.zip(0u64..)
+        .map(|(len, seq)| {
+            let mut m = msg(seq, SELF);
+            m.data = AlloyBytes::from(alloc::vec![0xAA; len]);
+            m
+        })
+        .collect()
+}
+
+/// A record at the wire cap derives. One more calldata byte trips
+/// `RecordTooLarge`.
+#[test]
+fn record_wire_cap_is_exact() {
+    let at_cap = messages_at_wire_cap();
+    assert!(at_cap.iter().all(|m| m.data.len() <= MAX_DATA_BYTES));
+    assert_eq!(
+        remote_epoch_wire_bytes(at_cap.iter().map(|m| m.data.len())),
+        MAX_REMOTE_EPOCH_WIRE_BYTES
+    );
+    assert!(derive_remote_epoch(SELF, ORIGIN, 0, &at_cap).is_ok());
+
+    // Grow a message that has room under `MAX_DATA_BYTES` by one byte.
+    let mut over = at_cap.clone();
+    let idx = over
+        .iter()
+        .position(|m| m.data.len() < MAX_DATA_BYTES)
+        .expect("the last message has room");
+    let mut data = over[idx].data.to_vec();
+    data.push(0xBB);
+    over[idx].data = AlloyBytes::from(data);
+    let e = derive_remote_epoch(SELF, ORIGIN, 0, &over).unwrap_err();
+    assert_eq!(
+        e,
+        XChainError::RecordTooLarge {
+            bytes: MAX_REMOTE_EPOCH_WIRE_BYTES + 1,
+            cap: MAX_REMOTE_EPOCH_WIRE_BYTES,
+        }
+    );
+}
+
+/// The cap counts fixed bytes per message. So many empty messages trip
+/// it too, not only large calldata.
+#[test]
+fn record_wire_cap_counts_empty_messages() {
+    let n = MAX_REMOTE_EPOCH_WIRE_BYTES / XCHAIN_MSG_FIXED_WIRE_BYTES + 1;
+    let batch: Vec<OutboxMessage> = (0..crate::num::usize_to_u64(n))
+        .map(|seq| {
+            let mut m = msg(seq, SELF);
+            m.data = AlloyBytes::new();
+            m
+        })
+        .collect();
+    assert!(matches!(
+        derive_remote_epoch(SELF, ORIGIN, 0, &batch).unwrap_err(),
+        XChainError::RecordTooLarge { .. }
+    ));
+}

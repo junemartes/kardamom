@@ -1,12 +1,14 @@
 use super::*;
 
+const TTL: Duration = Duration::from_secs(30);
+
 fn s(byte: u8) -> Address {
     Address::repeat_byte(byte)
 }
 
 #[test]
 fn match_publishes_and_advances() {
-    let mut st: PartitionState<u32> = PartitionState::new(4);
+    let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
     let out = st.process(s(1), 0, 100);
     assert_eq!(
         out.actions,
@@ -21,7 +23,7 @@ fn match_publishes_and_advances() {
 
 #[test]
 fn match_drains_subsequent_buffered() {
-    let mut st: PartitionState<u32> = PartitionState::new(8);
+    let mut st: PartitionState<u32> = PartitionState::new(8, TTL);
     assert!(matches!(
         st.process(s(1), 1, 11).outcome,
         NonceOutcome::Buffered
@@ -53,7 +55,7 @@ fn match_drains_subsequent_buffered() {
 
 #[test]
 fn past_reports_duplicate() {
-    let mut st: PartitionState<u32> = PartitionState::new(4);
+    let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
     st.process(s(1), 0, 0);
     st.process(s(1), 1, 1);
     let out = st.process(s(1), 0, 999);
@@ -70,7 +72,7 @@ fn past_reports_duplicate() {
 
 #[test]
 fn future_is_buffered() {
-    let mut st: PartitionState<u32> = PartitionState::new(4);
+    let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
     let out = st.process(s(1), 5, 55);
     assert_eq!(out.actions, vec![]);
     assert_eq!(out.outcome, NonceOutcome::Buffered);
@@ -82,7 +84,7 @@ fn buffer_full_rejects_furthest_future() {
     // Capacity 2, buffer holds {5,6}. Incoming 7 is the furthest future
     // value, so it is rejected. It does not evict the low run. The old
     // behavior evicted 5 and wedged the sender.
-    let mut st: PartitionState<u32> = PartitionState::new(2);
+    let mut st: PartitionState<u32> = PartitionState::new(2, TTL);
     st.process(s(1), 5, 5);
     st.process(s(1), 6, 6);
     let out = st.process(s(1), 7, 7);
@@ -97,7 +99,7 @@ fn overflow_then_expected_arrives_drains_full_run_no_wedge() {
     // order. The sender is never permanently wedged. The old evict-oldest
     // behavior would have dropped 0's successors and stalled the sender
     // forever.
-    let mut st: PartitionState<u32> = PartitionState::new(4);
+    let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
     // expected is 0; buffer the near run 1..=4 (fills capacity 4).
     for n in 1..=4u64 {
         st.process(s(1), n, u32::try_from(n).unwrap());
@@ -132,7 +134,7 @@ fn overflow_then_expected_arrives_drains_full_run_no_wedge() {
 #[test]
 fn full_buffer_backpressure_rebuffer_loses_nothing() {
     let cap = 4;
-    let mut st: PartitionState<u32> = PartitionState::new(cap);
+    let mut st: PartitionState<u32> = PartitionState::new(cap, TTL);
     // Fill the buffer to capacity with the future run 1..=cap.
     for n in 1..=cap as u64 {
         assert!(matches!(
@@ -164,7 +166,7 @@ fn full_buffer_backpressure_rebuffer_loses_nothing() {
 // also bypasses the disabled-buffer drop.
 #[test]
 fn disabled_buffer_still_rebuffers_backpressured_match() {
-    let mut st: PartitionState<u32> = PartitionState::new(0);
+    let mut st: PartitionState<u32> = PartitionState::new(0, TTL);
     let out = st.process(s(1), 0, 100);
     assert_eq!(out.actions.len(), 1);
     st.reinsert_for_retry(s(1), 0, 100);
@@ -174,7 +176,7 @@ fn disabled_buffer_still_rebuffers_backpressured_match() {
 
 #[test]
 fn advance_floor_drops_proven_and_advances() {
-    let mut st: PartitionState<u32> = PartitionState::new(8);
+    let mut st: PartitionState<u32> = PartitionState::new(8, TTL);
     // Cold-rejoin shape: expected is 0, but the twin already ordered 0..=4
     // (executed). The replica buffered 3,4 (stale duplicates) and 5,6
     // (live traffic it must regain coverage of).
@@ -192,7 +194,7 @@ fn advance_floor_drops_proven_and_advances() {
 
 #[test]
 fn advance_floor_never_regresses() {
-    let mut st: PartitionState<u32> = PartitionState::new(4);
+    let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
     st.process(s(1), 0, 0);
     st.process(s(1), 1, 1);
     assert_eq!(st.next_nonce(s(1)), 2);
@@ -204,7 +206,7 @@ fn advance_floor_never_regresses() {
 
 #[test]
 fn reinsert_for_retry_rewinds_next_nonce() {
-    let mut st: PartitionState<u32> = PartitionState::new(4);
+    let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
     st.process(s(1), 0, 100);
     assert_eq!(st.next_nonce(s(1)), 1);
     // Simulate backpressure. Roll back, and put payload 100 back in the buffer.
@@ -222,4 +224,111 @@ fn reinsert_for_retry_rewinds_next_nonce() {
         }]
     );
     assert_eq!(st.next_nonce(s(1)), 1);
+}
+
+#[test]
+fn parked_entry_expires_at_ttl() {
+    let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
+    let t0 = Instant::now();
+    assert_eq!(
+        st.process_at(t0, s(1), 5, 55).outcome,
+        NonceOutcome::Buffered
+    );
+    assert!(
+        st.sweep_expired(t0 + TTL.saturating_sub(Duration::from_millis(1)), 256)
+            .is_empty(),
+        "nothing expires before the deadline"
+    );
+    assert_eq!(st.sweep_expired(t0 + TTL, 256), vec![(s(1), 5)]);
+    assert!(
+        st.sweep_expired(t0 + TTL, 256).is_empty(),
+        "an expiry is reported once"
+    );
+    assert_eq!(st.pending_len(), 0);
+    // The entry is gone. The same nonce parks anew.
+    assert_eq!(
+        st.process_at(t0 + TTL, s(1), 5, 55).outcome,
+        NonceOutcome::Buffered
+    );
+}
+
+#[test]
+fn rebuffered_entry_does_not_expire() {
+    // A backpressure rebuffer does not wait on a nonce gap. It waits on
+    // the publisher, and it lives until the publisher recovers.
+    let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
+    let t0 = Instant::now();
+    st.process_at(t0, s(1), 0, 100);
+    st.reinsert_for_retry(s(1), 0, 100);
+    assert!(st.sweep_expired(t0 + TTL * 10, 256).is_empty());
+    assert_eq!(st.drain_pending(), vec![(s(1), 0, 100)]);
+}
+
+#[test]
+fn a_parked_run_that_was_rebuffered_keeps_no_stale_deadline() {
+    // 1 and 2 park at t0. 0 arrives and the run 0..=2 drains. The publish
+    // backpressures, and the run rebuffers. At t0 + TTL the stale
+    // deadlines of 1 and 2 must not expire the rebuffered entries.
+    let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
+    let t0 = Instant::now();
+    st.process_at(t0, s(1), 1, 1);
+    st.process_at(t0, s(1), 2, 2);
+    let out = st.process_at(t0, s(1), 0, 0);
+    assert_eq!(out.actions.len(), 3);
+    for (n, p) in [(2u64, 2u32), (1, 1), (0, 0)] {
+        st.reinsert_for_retry(s(1), n, p);
+    }
+    assert!(st.sweep_expired(t0 + TTL, 256).is_empty());
+    let drained: Vec<u64> = st.drain_pending().into_iter().map(|(_, n, _)| n).collect();
+    assert_eq!(drained, vec![0, 1, 2]);
+}
+
+#[test]
+fn an_entry_at_the_expected_nonce_never_expires() {
+    // 5 parks at t0. A receipt floor then makes 5 the expected nonce. The
+    // entry is drainable, so its stale deadline must not expire it.
+    let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
+    let t0 = Instant::now();
+    st.process_at(t0, s(1), 5, 55);
+    assert_eq!(st.advance_floor(s(1), 5), Some((0, 0)));
+    assert!(st.sweep_expired(t0 + TTL, 256).is_empty());
+    assert_eq!(st.drain_pending(), vec![(s(1), 5, 55)]);
+}
+
+#[test]
+fn a_replaced_entry_takes_the_new_deadline() {
+    let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
+    let t0 = Instant::now();
+    let later = Duration::from_secs(10);
+    st.process_at(t0, s(1), 5, 55);
+    assert_eq!(
+        st.process_at(t0 + later, s(1), 5, 56).outcome,
+        NonceOutcome::BufferedReplaced
+    );
+    assert!(st.sweep_expired(t0 + TTL, 256).is_empty());
+    assert_eq!(st.sweep_expired(t0 + TTL + later, 256), vec![(s(1), 5)]);
+}
+
+#[test]
+fn a_floor_dropped_entry_leaves_only_a_stale_deadline() {
+    // 5 parks. A floor at 8 drops it as a proven duplicate. The sweep
+    // finds nothing to expire.
+    let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
+    let t0 = Instant::now();
+    st.process_at(t0, s(1), 5, 55);
+    assert_eq!(st.advance_floor(s(1), 8), Some((0, 1)));
+    assert!(st.sweep_expired(t0 + TTL, 256).is_empty());
+}
+
+#[test]
+fn sweep_is_bounded_per_call() {
+    let mut st: PartitionState<u32> = PartitionState::new(8, TTL);
+    let t0 = Instant::now();
+    for n in 1..=5u64 {
+        st.process_at(t0, s(1), n, u32::try_from(n).unwrap());
+    }
+    assert_eq!(st.sweep_expired(t0 + TTL, 2).len(), 2);
+    assert_eq!(st.sweep_expired(t0 + TTL, 2).len(), 2);
+    assert_eq!(st.sweep_expired(t0 + TTL, 2).len(), 1);
+    assert!(st.sweep_expired(t0 + TTL, 2).is_empty());
 }

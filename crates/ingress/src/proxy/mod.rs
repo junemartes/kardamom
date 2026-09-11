@@ -12,6 +12,7 @@ mod watchers;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
 use tokio::sync::broadcast;
@@ -24,7 +25,6 @@ use crate::error::IngressError;
 use crate::pending::PendingReceipts;
 use crate::rate_limit::PerIpLimiter;
 use crate::receipt_cache::ReceiptCache;
-use crate::routing::partition_for;
 use crate::sig_verify::BatchVerifier;
 use crate::tx_error_dedup::TxErrorDedup;
 
@@ -130,6 +130,10 @@ where
     /// Post-dedup tx-error re-broadcast, the same pattern as
     /// `receipt_feed`.
     pub(crate) tx_error_feed: broadcast::Sender<TxError>,
+    /// The graceful drain flag. Once set, new submits get `Draining`,
+    /// and the parked ones keep waiting for their receipts. See
+    /// [`Self::begin_drain`].
+    pub(crate) draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Capacity of the deduped receipt and error re-broadcast feeds. A
@@ -138,6 +142,9 @@ where
 /// the gap. 32k holds about 7s of buffered receipts at 4,800 tx/s, about
 /// 10MB.
 const FEED_CAPACITY: usize = 32 * 1024;
+
+/// The graceful drain polls the parked count this often.
+const DRAIN_POLL: Duration = Duration::from_millis(50);
 
 impl<P, S> Clone for IngressProxy<P, S>
 where
@@ -159,6 +166,7 @@ where
             latest_block_number: self.latest_block_number.clone(),
             receipt_feed: self.receipt_feed.clone(),
             tx_error_feed: self.tx_error_feed.clone(),
+            draining: self.draining.clone(),
         }
     }
 }
@@ -195,6 +203,7 @@ where
             latest_block_number: Arc::new(AtomicU64::new(0)),
             receipt_feed: broadcast::channel(FEED_CAPACITY).0,
             tx_error_feed: broadcast::channel(FEED_CAPACITY).0,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         me.spawn_tx_receipts_watcher();
         me.spawn_tx_errors_watcher();
@@ -259,7 +268,7 @@ where
     /// and tooling use this.
     #[inline]
     pub fn partition_for(&self, sender: alloy_primitives::Address) -> u32 {
-        partition_for(sender, self.partition_count_m)
+        self.cfg.lane_for(sender)
     }
 
     /// Read-only access to the configured `IngressConfig`.
@@ -270,6 +279,48 @@ where
 
     /// Starts every configured listener: jsonrpsee HTTP and WS, an
     /// optional TCP listener, and an optional UDS listener.
+    /// Start the graceful drain. New submits get `Draining` (a retryable
+    /// error: the client goes to the other replica). Parked submits keep
+    /// waiting for their receipts. Reads keep working. The deploy's
+    /// `kill_timeout` covers `tx_ttl`, so a parked submit resolves before
+    /// the process exits. See `docs/specs/dynamic-sequencer-sizing.md`,
+    /// section 3.6.
+    pub fn begin_drain(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(
+            pending = self.pending.len(),
+            "ingress: draining; new submits refused"
+        );
+    }
+
+    /// The number of parked submits.
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// True once [`Self::begin_drain`] ran.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until no submit is parked, or `timeout` passes. Returns the
+    /// number of submits still parked.
+    pub async fn drain(&self, timeout: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.parked_before(deadline) {
+            tokio::time::sleep(DRAIN_POLL).await;
+        }
+        self.pending.len()
+    }
+
+    /// True while a submit is still parked and `deadline` has not passed.
+    fn parked_before(&self, deadline: tokio::time::Instant) -> bool {
+        !self.pending.is_empty() && tokio::time::Instant::now() < deadline
+    }
+
     ///
     /// # Errors
     ///

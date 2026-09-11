@@ -5,7 +5,9 @@
 //! pure-functional design isolates the algorithm from the Aeron I/O
 //! surface. Every nontrivial test in this crate exercises it directly.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 
@@ -45,20 +47,39 @@ pub(crate) struct ProcessResult<T> {
     pub outcome: NonceOutcome,
 }
 
+/// One parked entry's expiry, as the deadline heap orders it: earliest
+/// `at` first. The heap entry can be stale; [`PendingBuffer::expire`]
+/// checks the deadline against the slot before anything expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ParkedDeadline {
+    at: Instant,
+    sender: Address,
+    nonce: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct PartitionState<T> {
     max_pending_per_sender: usize,
+    /// The lifetime of an entry that waits on a nonce gap.
+    tx_ttl: Duration,
     next: HashMap<Address, u64>,
     pending: HashMap<Address, PendingBuffer<T>>,
+    /// The expiry heap, earliest deadline first. An entry here can be
+    /// stale. The sweep checks each popped deadline against the buffer
+    /// slot before it expires anything. So a replace, a rebuffer, a
+    /// drain, or a floor drop needs no heap surgery.
+    deadlines: BinaryHeap<Reverse<ParkedDeadline>>,
 }
 
 impl<T> PartitionState<T> {
     #[must_use]
-    pub(crate) fn new(max_pending_per_sender: usize) -> Self {
+    pub(crate) fn new(max_pending_per_sender: usize, tx_ttl: Duration) -> Self {
         Self {
             max_pending_per_sender,
+            tx_ttl,
             next: HashMap::new(),
             pending: HashMap::new(),
+            deadlines: BinaryHeap::new(),
         }
     }
 
@@ -71,7 +92,9 @@ impl<T> PartitionState<T> {
     /// partition has never seen the sender. The sequencer holds no
     /// state-DB reader: a `None` means the caller must seed a floor
     /// (`Self::seed_next_nonce`, at 0 for a cold sender) before it falls
-    /// through to [`Self::process`].
+    /// through to [`Self::process`]. Committed truth arrives later through
+    /// [`Self::advance_floor`]: from a receipt, or from the executor nonce
+    /// lookup that a park triggers (`crate::lookup`).
     #[must_use]
     pub(crate) fn next_nonce_known(&self, sender: Address) -> Option<u64> {
         self.next.get(&sender).copied()
@@ -83,8 +106,21 @@ impl<T> PartitionState<T> {
 
     /// Primary-side: handle an incoming transaction. Returns publish
     /// actions in canonical order. The caller drives the outbound
-    /// publishers.
+    /// publishers. A future nonce parks with a deadline of now plus
+    /// `tx_ttl`.
     pub(crate) fn process(&mut self, sender: Address, nonce: u64, payload: T) -> ProcessResult<T> {
+        self.process_at(Instant::now(), sender, nonce, payload)
+    }
+
+    /// [`Self::process`] with an explicit clock. Tests drive the expiry
+    /// through this.
+    pub(crate) fn process_at(
+        &mut self,
+        now: Instant,
+        sender: Address,
+        nonce: u64,
+        payload: T,
+    ) -> ProcessResult<T> {
         let expected = self.next_nonce(sender);
         if nonce < expected {
             return ProcessResult {
@@ -96,22 +132,9 @@ impl<T> PartitionState<T> {
             };
         }
         if nonce > expected {
-            let buf = self
-                .pending
-                .entry(sender)
-                .or_insert_with(|| PendingBuffer::new(self.max_pending_per_sender));
-            let outcome = match buf.insert(nonce, payload) {
-                InsertOutcome::Inserted => NonceOutcome::Buffered,
-                InsertOutcome::Replaced => NonceOutcome::BufferedReplaced,
-                InsertOutcome::EvictedFuture { evicted_nonce } => {
-                    NonceOutcome::BufferedEvicting { evicted_nonce }
-                }
-                InsertOutcome::RejectedTooFar { nonce } => NonceOutcome::RejectedTooFar { nonce },
-                InsertOutcome::DroppedBufferDisabled => NonceOutcome::BufferedDisabled,
-            };
             return ProcessResult {
                 actions: vec![],
-                outcome,
+                outcome: self.park(now, sender, nonce, payload),
             };
         }
 
@@ -133,6 +156,36 @@ impl<T> PartitionState<T> {
             actions,
             outcome: NonceOutcome::Matched,
         }
+    }
+
+    /// Park a future nonce with a deadline of `now + tx_ttl`. A parked
+    /// entry (inserted, replaced, or inserted with an eviction) also goes
+    /// on the deadline heap; a rejected one does not.
+    fn park(&mut self, now: Instant, sender: Address, nonce: u64, payload: T) -> NonceOutcome {
+        let deadline = now + self.tx_ttl;
+        let buf = self
+            .pending
+            .entry(sender)
+            .or_insert_with(|| PendingBuffer::new(self.max_pending_per_sender));
+        let (outcome, parked) = match buf.insert(nonce, payload, deadline) {
+            InsertOutcome::Inserted => (NonceOutcome::Buffered, true),
+            InsertOutcome::Replaced => (NonceOutcome::BufferedReplaced, true),
+            InsertOutcome::EvictedFuture { evicted_nonce } => {
+                (NonceOutcome::BufferedEvicting { evicted_nonce }, true)
+            }
+            InsertOutcome::RejectedTooFar { nonce } => {
+                (NonceOutcome::RejectedTooFar { nonce }, false)
+            }
+            InsertOutcome::DroppedBufferDisabled => (NonceOutcome::BufferedDisabled, false),
+        };
+        if parked {
+            self.deadlines.push(Reverse(ParkedDeadline {
+                at: deadline,
+                sender,
+                nonce,
+            }));
+        }
+        outcome
     }
 
     /// Drain `sender`'s pending buffer of the run starting at `from`,
@@ -186,6 +239,65 @@ impl<T> PartitionState<T> {
         // buffer accounted for the rebuffered items moments ago. Capacity
         // applies only to fresh ingress.
         buf.reinsert(nonce, payload);
+    }
+
+    /// Expire the parked entries whose deadline is at or before `now`.
+    /// Returns `(sender, nonce)` for each expired entry, at most `max` per
+    /// call. The cost is proportional to the popped heap entries, not to
+    /// the senders.
+    ///
+    /// Only an entry above the sender's expected nonce can expire. Such an
+    /// entry waits on a nonce gap. An entry at or below the expected nonce
+    /// is drainable, or was rewound for a retry, and the state machine
+    /// owns its fate. A popped deadline that no longer matches the slot is
+    /// stale (see [`PendingBuffer::expire`]), and it expires nothing.
+    pub(crate) fn sweep_expired(&mut self, now: Instant, max: usize) -> Vec<(Address, u64)> {
+        std::iter::from_fn(|| self.pop_due(now).map(|d| self.expire_parked(d)))
+            .flatten()
+            .take(max)
+            .collect()
+    }
+
+    /// Pop the earliest heap entry if its deadline is at or before `now`.
+    fn pop_due(&mut self, now: Instant) -> Option<ParkedDeadline> {
+        let Reverse(head) = self.deadlines.peek().copied()?;
+        (head.at <= now).then(|| {
+            self.deadlines.pop();
+            head
+        })
+    }
+
+    /// Expire one popped heap entry, if it still names a live parked
+    /// entry above the sender's expected nonce.
+    fn expire_parked(&mut self, d: ParkedDeadline) -> Option<(Address, u64)> {
+        if d.nonce <= self.next_nonce(d.sender) {
+            return None;
+        }
+        self.pending
+            .get_mut(&d.sender)?
+            .expire(d.nonce, d.at)
+            .map(|_| (d.sender, d.nonce))
+    }
+
+    /// The number of parked entries in the pending buffers of every
+    /// sender. Test-only: the production code reads the per-vslot depths.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.values().map(PendingBuffer::len).sum()
+    }
+
+    /// The parked entries per bucket, where `bucket` maps a sender to its
+    /// bucket (the vslot). The cost is one call per sender with a buffer.
+    /// A depth past `u32::MAX` saturates.
+    pub(crate) fn pending_depth_by<F: Fn(Address) -> u8>(&self, bucket: F) -> [u32; 256] {
+        self.pending
+            .iter()
+            .fold([0u32; 256], |mut depth, (sender, buf)| {
+                let slot = &mut depth[usize::from(bucket(*sender))];
+                *slot = slot.saturating_add(u32::try_from(buf.len()).unwrap_or(u32::MAX));
+                depth
+            })
     }
 
     /// Walk every sender whose pending buffer has an entry at its expected

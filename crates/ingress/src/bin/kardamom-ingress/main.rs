@@ -1,6 +1,6 @@
 //! `kardamom-ingress`: the standalone proxy (ingress) service process.
 //!
-//! This opens M `tx_data` publishers, a receipt-cache publisher, and
+//! This opens one `tx_data` publisher per lane, a receipt-cache publisher, and
 //! subscribers for the receipts, quorum-watermark, fsync-watermark,
 //! receipt-cache, and block-boundary streams. It wires them into an
 //! [`IngressProxy`] and starts its JSON-RPC server, plus optional TCP and
@@ -36,7 +36,12 @@ use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_types::QuorumWatermark;
 use tokio_util::sync::CancellationToken;
 
+use kardamom_types::shard_map::{LANE_COUNT, ShardMap, validate_shard_count};
 use recorders::{spawn_tx_data_recorders, wait_for_recorders};
+
+/// The lane plane as the non-zero count the publisher and recorder
+/// openers take: every lane opens, whatever the active shard count.
+const LANE_PLANE: NonZeroU8 = NonZeroU8::new(LANE_COUNT).unwrap();
 
 #[derive(Debug, Parser)]
 #[command(
@@ -75,12 +80,19 @@ struct Args {
     /// at startup. Membership is static for the life of the process.
     #[arg(long, env = "KARDAMOM_EXECUTOR_COUNT")]
     executor_count: Option<NonZeroU32>,
-    /// Number of `tx_data` shards (M). Defaults to 8. Zero is rejected at
-    /// parse time: it would make `partition_for`'s modulus zero, and it
-    /// would leave the shard-handle vector empty.
+    /// The active shard count (M). The ingress opens every lane of the
+    /// lane plane, and the identity map routes senders to the first M.
+    /// So M must be 1, 2, 4, or 8. Defaults to 8. `--shard-map` replaces
+    /// the identity map. Zero is rejected at parse time.
     #[arg(long, default_value = "8")]
     shards: NonZeroU8,
-    /// Records each per-shard `tx_data` publication to the Aeron Archive,
+    /// A TOML file with the versioned vslot-to-lane map: `version = N`
+    /// and `table = [256 lanes]`. It replaces the identity map. A resize
+    /// re-renders this file and restarts the ingress. See
+    /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.2.
+    #[arg(long, env = "KARDAMOM_SHARD_MAP")]
+    shard_map: Option<PathBuf>,
+    /// Records each per-lane `tx_data` publication to the Aeron Archive,
     /// so the executor can replay full transaction envelopes on crash
     /// recovery, through `kardamom_log::replay`. Off by default, since
     /// single-host IPC has no archive. The cluster sets this on the node
@@ -203,11 +215,13 @@ impl IngressService {
     /// deployment keeps the binary protocol off; an operator who wants it
     /// enabled can set the binds in a follow-up that drives the config
     /// from TOML.
-    fn build_config(&self) -> IngressConfig {
+    fn build_config(&self) -> Result<IngressConfig> {
         let args = &self.args;
+        validate_shard_count(u32::from(args.shards.get())).context("--shards")?;
         let mut cfg = IngressConfig {
             jsonrpc_bind: args.jsonrpc_bind,
             partition_count_m: NonZeroU32::from(args.shards),
+            shard_map: self.load_shard_map()?,
             ingress_id: args.ingress_id,
             ack_policy: args.ack_policy.clone().into(),
             rpc_max_connections: args.rpc_max_connections,
@@ -217,17 +231,29 @@ impl IngressService {
         };
         cfg.binary_tcp_bind = None;
         cfg.binary_uds_path = None;
-        cfg
+        Ok(cfg)
+    }
+
+    /// Read and validate the `--shard-map` file, when one is given.
+    fn load_shard_map(&self) -> Result<Option<ShardMap>> {
+        let Some(path) = self.args.shard_map.as_deref() else {
+            return Ok(None);
+        };
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read shard map {}", path.display()))?;
+        let map: ShardMap =
+            toml::from_str(&text).with_context(|| format!("parse shard map {}", path.display()))?;
+        Ok(Some(map))
     }
 
     /// Opens the Aeron runtime, the `tx_data` archive recorders, and the
     /// `tx_data` publication and `tx_receipts` subscription.
     ///
-    /// These are archive recorders for `tx_data`, one per shard, co-located
-    /// with the publishers. They make the full transaction envelopes
-    /// durable, so the executor can replay them on crash recovery. Without
-    /// them, only the canonical order survives a restart, not the bytes
-    /// needed to re-execute.
+    /// These are archive recorders for `tx_data`, one per lane, co-located
+    /// with the publishers. An idle lane records an empty stream. They
+    /// make the full transaction envelopes durable, so the executor can
+    /// replay them on crash recovery. Without them, only the canonical
+    /// order survives a restart, not the bytes needed to re-execute.
     ///
     /// Each recorder reports its startup outcome on its own `oneshot`. This
     /// blocks on all of them, after the `tx_data` publications open and before
@@ -248,7 +274,7 @@ impl IngressService {
                 args.aeron_dir.as_deref(),
                 channels,
                 aeron_cfg,
-                args.shards,
+                LANE_PLANE,
                 &self.stop,
             )
         } else {
@@ -261,11 +287,11 @@ impl IngressService {
         // proxy reads this only when MDS is enabled.
         let executor_count = args.executor_count.or(channels.tx_receipts_executor_count);
 
-        let publication = LiveIngressPublication::open(&rt, channels, args.shards)
+        let publication = LiveIngressPublication::open(&rt, channels, LANE_PLANE)
             .context("open IngressPublication")?;
 
         // This is the recorder barrier: with the tx_data publications now
-        // open, every shard's recording can start.
+        // open, every lane's recording can start.
         if args.archive_durability {
             wait_for_recorders(recorder_ready)
                 .await
@@ -334,10 +360,16 @@ impl IngressService {
     /// watermark watcher, and starts the proxy's listeners. Returns a
     /// [`RunningIngress`] that owns everything needed to shut back down.
     async fn run(self) -> Result<RunningIngress> {
-        let cfg = self.build_config();
+        let cfg = self.build_config()?;
+        let map_version = cfg.shard_map.as_ref().map(ShardMap::version);
+        metrics::gauge!(kardamom_ingress::metrics::SHARD_MAP_VERSION)
+            .set(f64::from(map_version.unwrap_or(0)));
         tracing::info!(
             jsonrpc_bind = %cfg.jsonrpc_bind,
             shards = cfg.partition_count_m.get(),
+            lanes = LANE_COUNT,
+            shard_map_version = ?map_version,
+            active_lanes = cfg.shard_map.as_ref().map(ShardMap::active_lanes),
             ingress_id = cfg.ingress_id,
             ack_policy = ?cfg.ack_policy,
             "kardamom-ingress starting"
@@ -350,12 +382,16 @@ impl IngressService {
             None
         };
 
+        let drain_timeout = cfg.pending_receipt_timeout;
         let proxy = IngressProxy::new(cfg, opened.publication, opened.subscription);
+        let drainer = proxy.clone();
         let handle = proxy.start().await.context("IngressProxy::start")?;
         tracing::info!(jsonrpc_addr = %handle.jsonrpc_addr, "JSON-RPC listening");
 
         Ok(RunningIngress {
             handle,
+            drainer,
+            drain_timeout,
             stop: self.stop,
             recorder_handles: opened.recorder_handles,
             // Declared before `_cluster_guard`: struct fields drop in
@@ -375,6 +411,10 @@ impl IngressService {
 /// signal and tears everything down in the right order.
 struct RunningIngress {
     handle: IngressHandle,
+    /// A proxy clone for the graceful drain at shutdown.
+    drainer: IngressProxy<LiveIngressPublication, LiveIngressSubscription>,
+    /// How long the drain waits for parked submits: the park bound.
+    drain_timeout: Duration,
     stop: CancellationToken,
     recorder_handles: Vec<std::thread::JoinHandle<()>>,
     /// See the field-order comment in [`IngressService::run`]: this must
@@ -388,14 +428,20 @@ struct RunningIngress {
 }
 
 impl RunningIngress {
-    /// Waits for the shutdown signal, stops the JSON-RPC server, cancels
-    /// the recorder stop token, and joins the recorder threads. `self` is
-    /// consumed here, so `_rt` and `_cluster_guard` drop at the end of
-    /// this call, in field declaration order: `_rt` first, then
-    /// `_cluster_guard`.
+    /// Waits for the shutdown signal, drains the parked submits, stops the
+    /// JSON-RPC server, cancels the recorder stop token, and joins the
+    /// recorder threads. `self` is consumed here, so `_rt` and
+    /// `_cluster_guard` drop at the end of this call, in field declaration
+    /// order: `_rt` first, then `_cluster_guard`.
     async fn shutdown(self) {
         wait_for_shutdown().await;
         tracing::info!("kardamom-ingress: shutdown signal received");
+        // The graceful drain: refuse new submits, let the parked ones finish
+        // within the park bound, then stop the server. The Nomad job's
+        // kill_timeout covers this wait.
+        self.drainer.begin_drain();
+        let still_parked = self.drainer.drain(self.drain_timeout).await;
+        tracing::info!(still_parked, "kardamom-ingress: drain finished");
         self.handle.jsonrpc_handle.stop().ok();
         self.handle.jsonrpc_handle.stopped().await;
         self.stop.cancel();

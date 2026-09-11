@@ -51,7 +51,10 @@ mod layout_tests;
 mod tests;
 
 pub use abi::{INBOX_DELIVER_SIGNATURE, deliver_calldata, inbox_deliver_selector};
-pub use derive::{XChainError, derive_remote_epoch};
+pub use derive::{
+    MAX_REMOTE_EPOCH_WIRE_BYTES, REMOTE_EPOCH_FIXED_WIRE_BYTES, XCHAIN_MSG_FIXED_WIRE_BYTES,
+    XChainError, derive_remote_epoch, remote_epoch_wire_bytes,
+};
 pub use ids::{Anchor, alias_remote_address, remote_source_hash, xchain_tx_sender};
 pub use layout::{Inbox, Outbox, u64_word, word_u64};
 pub use leaf::{MsgLeaf, no_callback_hash, xchain_leaf_domain};

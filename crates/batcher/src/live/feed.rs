@@ -12,7 +12,10 @@ use kardamom_engine::reader::ReaderToExec;
 use kardamom_types::BlockBoundaryStart;
 
 use crate::batch::{BatchAccumulator, ClosedBlock};
-use crate::batcher::{BatcherConfig, metric_names, pack_blocks};
+use crate::batcher::{
+    BatcherConfig, MAX_BLOBS_PER_BATCH, PostedBatch, metric_names, pack_block_groups,
+};
+use crate::error::BatcherError;
 
 use super::cursor::BatchCursor;
 use super::live_metric_names;
@@ -23,6 +26,8 @@ use super::sender::LiveSender;
 pub(crate) struct FeedConfig {
     pub blocks_per_batch: NonZeroUsize,
     pub compress: bool,
+    /// The L2 chain id. See [`BatcherConfig::chain_id`].
+    pub chain_id: u64,
     /// Post a partial group if the oldest pending block has waited this long.
     pub flush: Duration,
     /// Drop closed blocks at or below this number without posting. L1
@@ -61,6 +66,7 @@ impl<P: Provider> FeedLoop<P> {
         let pack_cfg = BatcherConfig {
             blocks_per_batch: cfg.blocks_per_batch,
             compress: cfg.compress,
+            chain_id: cfg.chain_id,
             ..Default::default()
         };
         Self {
@@ -181,12 +187,73 @@ impl<P: Provider> FeedLoop<P> {
         Ok(())
     }
 
-    /// Pack and post `group`.
+    /// Pack and post `group`. A group that overflows the blob ceiling
+    /// splits into several posts, one cursor each. A single block that
+    /// overflows on its own is fatal: the loop stops with a log line that
+    /// names the block.
     async fn post_group(&mut self, group: PendingGroup) -> Result<()> {
         gauge!(live_metric_names::PENDING_BLOCKS).set(0.0);
-        let batch = pack_blocks(&self.pack_cfg, &group.blocks)?;
-        self.sender.post_confirmed(&batch, group.cursor).await
+        let batches = pack_block_groups(&self.pack_cfg, &group.blocks).map_err(log_pack_error)?;
+        if batches.len() > 1 {
+            tracing::warn!(
+                blocks = group.blocks.len(),
+                batches = batches.len(),
+                "group split to stay under the blob ceiling"
+            );
+        }
+        for batch in &batches {
+            self.post_one(batch, &group).await?;
+        }
+        Ok(())
     }
+
+    /// Post one packed batch of `group`, confirming through the cursor of
+    /// the block the batch ends at. The last batch confirms the group's
+    /// own cursor.
+    async fn post_one(&mut self, batch: &PostedBatch, group: &PendingGroup) -> Result<()> {
+        let cursor = group_cursor_at(group, batch.l2_block_end)?;
+        self.sender.post_confirmed(batch, cursor).await
+    }
+}
+
+/// The cursor a post that ends at `block_number` confirms: the group's
+/// cursor when that is the group's last block, else the cursor just past
+/// the named block.
+fn group_cursor_at(group: &PendingGroup, block_number: u64) -> Result<BatchCursor> {
+    if group.cursor.next_block == block_number.saturating_add(1) {
+        return Ok(group.cursor);
+    }
+    let end = group
+        .blocks
+        .iter()
+        .find(|b| b.block_number == block_number)
+        .with_context(|| format!("batch end block {block_number} is not in the group"))?;
+    Ok(BatchCursor {
+        next_index: end.end_tx_idx.as_index(),
+        next_block: block_number
+            .checked_add(1)
+            .context("block_number overflowed u64")?,
+        // `LiveSender::post_confirmed` stamps `last_batch_index`.
+        last_batch_index: 0,
+    })
+}
+
+/// Log a fatal single-block overflow by name before the error stops the
+/// loop; every other pack error passes through.
+fn log_pack_error(e: BatcherError) -> anyhow::Error {
+    if let BatcherError::BlockTooLarge {
+        block_number,
+        blobs,
+    } = &e
+    {
+        tracing::error!(
+            block = block_number,
+            blobs,
+            ceiling = MAX_BLOBS_PER_BATCH,
+            "FATAL: one block alone exceeds the blob ceiling; the batcher cannot post it"
+        );
+    }
+    e.into()
 }
 
 /// # Errors

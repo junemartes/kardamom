@@ -27,8 +27,15 @@ pub enum IngressError {
          once the nonce is within the reorder window"
     )]
     Evicted((Address, u64)),
+    #[error(
+        "expired: the sequencer dropped (sender, nonce) {0:?} after it waited on a \
+         nonce gap for tx_ttl — resubmit once the gap fills"
+    )]
+    Expired((Address, u64)),
     #[error("ingress overloaded: {0} submissions pending — retry with backoff")]
     Overloaded(usize),
+    #[error("ingress draining for shutdown — retry on another replica")]
+    Draining,
     #[error(
         "transaction gas limit {0} exceeds the EIP-7825 per-tx cap of \
          {cap} — the tx can never execute",
@@ -56,7 +63,9 @@ impl From<IngressError> for ErrorObjectOwned {
     fn from(err: IngressError) -> Self {
         let code = match &err {
             // Limit exceeded, a server-specific and retryable overload class.
-            IngressError::RateLimited(_) | IngressError::Overloaded(_) => -32005,
+            IngressError::RateLimited(_) | IngressError::Overloaded(_) | IngressError::Draining => {
+                -32005
+            }
             // Invalid params.
             IngressError::Decode(_)
             | IngressError::SignatureInvalid
@@ -64,10 +73,12 @@ impl From<IngressError> for ErrorObjectOwned {
             | IngressError::GasLimitExceedsCap(_)
             | IngressError::UnsupportedTxType(_) => -32602,
             // Generic server error. Evicted is retryable once the sender's
-            // nonce is back within the reorder window.
+            // nonce is back within the reorder window. Expired is
+            // retryable once the nonce gap fills.
             IngressError::PartitionUnavailable(_)
             | IngressError::Timeout
-            | IngressError::Evicted(_) => -32000,
+            | IngressError::Evicted(_)
+            | IngressError::Expired(_) => -32000,
             // Internal error.
             IngressError::Internal(_) => -32603,
         };

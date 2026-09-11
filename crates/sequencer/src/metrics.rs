@@ -12,6 +12,29 @@ pub(crate) const TX_PUBLISHED_TO_B: &str = "kardamom_sequencer_tx_published_to_b
 pub(crate) const TX_BUFFERED_FUTURE: &str = "kardamom_sequencer_tx_buffered_future_total";
 pub(crate) const TX_DROPPED_PAST: &str = "kardamom_sequencer_tx_dropped_past_total";
 pub(crate) const PENDING_BUFFER_EVICTIONS: &str = "kardamom_sequencer_pending_evictions_total";
+/// Parked entries that waited on a nonce gap past `tx_ttl`. Each one got
+/// an explicit `Expired` error on `tx_errors`.
+pub(crate) const PENDING_BUFFER_EXPIRED: &str = "kardamom_sequencer_pending_expired_total";
+/// Nonce lookups. `NONCE_LOOKUP_REQUESTS` counts the parks that asked for
+/// one. `NONCE_LOOKUPS` counts the queries the task ran, by `outcome`
+/// (`ok`, `error`, `timeout`, `shed`). `NONCE_LOOKUPS_IN_FLIGHT` is the
+/// concurrent query gauge.
+pub(crate) const NONCE_LOOKUP_REQUESTS: &str = "kardamom_sequencer_nonce_lookup_requests_total";
+pub(crate) const NONCE_LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
+pub(crate) const NONCE_LOOKUPS_IN_FLIGHT: &str = "kardamom_sequencer_nonce_lookups_in_flight";
+/// Envelopes dropped by the wrong-shard guard: their vslot is not in this
+/// replica's set. During a resize, a new shard reads the old lanes whole,
+/// so this counts the other shards' traffic. It is not an error.
+pub(crate) const WRONG_SHARD_DROPPED: &str = "kardamom_sequencer_wrong_shard_dropped_total";
+/// Refs the state machine advanced past in shadow mode without an offer.
+pub(crate) const SHADOW_SUPPRESSED: &str = "kardamom_sequencer_shadow_suppressed_total";
+/// The number of vslots in shadow mode. 0 means the replica publishes for
+/// its whole set.
+pub(crate) const SHADOW_VSLOTS: &str = "kardamom_sequencer_shadow_vslots";
+/// The parked entries per vslot, refreshed once per second. The resize
+/// runbook reads it for the moved vslots before it restarts the old
+/// shard.
+pub(crate) const PENDING_DEPTH: &str = "kardamom_sequencer_pending_depth";
 pub(crate) const BACKPRESSURE_EVENTS: &str = "kardamom_sequencer_backpressure_total";
 pub(crate) const NONCE_CHECK_DURATION_SECONDS: &str =
     "kardamom_sequencer_nonce_check_duration_seconds";
@@ -62,6 +85,10 @@ pub struct HotMetrics {
     pub buffered_future: metrics::Counter,
     pub dropped_past: metrics::Counter,
     pub evictions: metrics::Counter,
+    pub expired: metrics::Counter,
+    pub lookup_requests: metrics::Counter,
+    pub wrong_shard: metrics::Counter,
+    pub shadow_suppressed: metrics::Counter,
     pub backpressure: metrics::Counter,
     pub nonce_check_seconds: metrics::Histogram,
 }
@@ -76,6 +103,10 @@ impl HotMetrics {
             buffered_future: counter!(TX_BUFFERED_FUTURE, "partition" => p.clone()),
             dropped_past: counter!(TX_DROPPED_PAST, "partition" => p.clone()),
             evictions: counter!(PENDING_BUFFER_EVICTIONS, "partition" => p.clone()),
+            expired: counter!(PENDING_BUFFER_EXPIRED, "partition" => p.clone()),
+            lookup_requests: counter!(NONCE_LOOKUP_REQUESTS, "partition" => p.clone()),
+            wrong_shard: counter!(WRONG_SHARD_DROPPED, "partition" => p.clone()),
+            shadow_suppressed: counter!(SHADOW_SUPPRESSED, "partition" => p.clone()),
             backpressure: counter!(BACKPRESSURE_EVENTS, "partition" => p.clone()),
             nonce_check_seconds: histogram!(NONCE_CHECK_DURATION_SECONDS, "partition" => p),
         }
@@ -93,6 +124,34 @@ fn bump(name: &'static str, partition: u32, n: u64) {
 /// [`bump`].
 fn set(name: &'static str, partition: u32, v: f64) {
     gauge!(name, "partition" => partition.to_string()).set(v);
+}
+
+/// A count as a gauge value. Every count in this module stays far under
+/// 2^52, so the `f64` mantissa holds it exactly.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a gauge value; no count here nears 2^52, so the f64 mantissa holds it exactly"
+)]
+fn gauge_value(n: usize) -> f64 {
+    n as f64
+}
+
+pub fn record_shadow_vslots(partition: u32, n: usize) {
+    set(SHADOW_VSLOTS, partition, gauge_value(n));
+}
+
+pub fn record_pending_depth(partition: u32, vslot: u8, depth: u32) {
+    gauge!(PENDING_DEPTH, "partition" => partition.to_string(), "vslot" => vslot.to_string())
+        .set(f64::from(depth));
+}
+
+pub fn record_nonce_lookup(partition: u32, outcome: &'static str) {
+    counter!(NONCE_LOOKUPS, "partition" => partition.to_string(), "outcome" => outcome)
+        .increment(1);
+}
+
+pub fn record_nonce_lookups_in_flight(partition: u32, n: usize) {
+    set(NONCE_LOOKUPS_IN_FLIGHT, partition, gauge_value(n));
 }
 
 pub(crate) fn record_resync_mode(partition: u32, active: bool) {
@@ -128,12 +187,7 @@ pub(crate) fn record_resync_skip(partition: u32, count: u64) {
 }
 
 pub(crate) fn record_floor_senders(partition: u32, senders: usize) {
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "a gauge value; the sender count never nears 2^52, so the f64 mantissa holds it exactly"
-    )]
-    let senders = senders as f64;
-    set(RECEIPT_FLOOR_SENDERS, partition, senders);
+    set(RECEIPT_FLOOR_SENDERS, partition, gauge_value(senders));
 }
 
 pub(crate) fn record_floor_advance(partition: u32) {
@@ -150,12 +204,7 @@ pub(crate) fn record_canonical_watermark(partition: u32, count: u64) {
 }
 
 pub(crate) fn record_unconfirmed_refs(partition: u32, n: usize) {
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "a gauge value; the unconfirmed-ref count never nears 2^52, so the f64 mantissa holds it exactly"
-    )]
-    let n = n as f64;
-    set(REF_UNCONFIRMED, partition, n);
+    set(REF_UNCONFIRMED, partition, gauge_value(n));
 }
 
 pub(crate) fn record_ref_republished(partition: u32, n: usize) {
@@ -191,7 +240,15 @@ mod tests {
         hot.buffered_future.increment(0);
         hot.dropped_past.increment(0);
         hot.evictions.increment(0);
+        hot.expired.increment(0);
+        hot.lookup_requests.increment(0);
+        hot.wrong_shard.increment(0);
+        hot.shadow_suppressed.increment(0);
         hot.backpressure.increment(0);
+        record_shadow_vslots(0, 0);
+        record_pending_depth(0, 0, 0);
+        record_nonce_lookup(0, "ok");
+        record_nonce_lookups_in_flight(0, 0);
         hot.nonce_check_seconds.record(0.0015);
         record_start_time();
         record_lag_suspected(0);

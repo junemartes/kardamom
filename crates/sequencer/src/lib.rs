@@ -3,19 +3,24 @@
 //! The sequencer is stateless. The in-memory `next_nonce` map is a cache,
 //! and the sequencer can rebuild it from canonical sources. A cold sender
 //! starts at nonce 0. In the warm steady state, the `tx_data` tail gives
-//! visibility: every matched envelope advances the sender's nonce. The
-//! receipt-floor resync (`crate::resync`) recovers committed floors out of
-//! band. The sequencer holds no state-DB reader.
+//! visibility: every matched envelope advances the sender's nonce. Two
+//! sources recover committed floors out of band: the receipt-floor resync
+//! (`crate::resync`) and the executor nonce lookup (`crate::lookup`). The
+//! sequencer holds no state-DB reader.
 //!
-//! Topology:
-//!   - The proxy shards senders by address (`keccak(sender) % M`).
-//!   - Each shard has an ordered group of K sequencers: one **preferred**
-//!     sequencer, and the rest are followers. The proxy forwards
-//!     transactions to the preferred sequencer. If no ack arrives within
-//!     about 1 ms, the proxy retries the next follower and promotes it.
-//!   - Sequencers are symmetric. There is no primary/standby distinction
-//!     and no lease. The "preferred" pointer lives in the proxy's routing
-//!     table, not in any sequencer's state.
+//! Topology (see `docs/specs/dynamic-sequencer-sizing.md`):
+//!   - The ingress routes a sender by virtual slot,
+//!     `vslot = keccak256(sender)[..8] % 256`, through a versioned map from
+//!     vslot to `tx_data` lane (`kardamom_types::shard_map`).
+//!   - Each active lane has two racing replicas. Both read the lane's
+//!     `tx_data` stream, both run the same state machine, and both offer the
+//!     same refs. The Aeron Cluster dedups by canonical id, first seen.
+//!     There is no preferred replica, no lease, and no routing table in a
+//!     sequencer.
+//!   - A replica serves a vslot set. A resize moves vslots between lanes:
+//!     the gaining replica reads the old lane too, warms up in shadow mode,
+//!     and then publishes in parallel with the old shard until the ingress
+//!     switches maps and the old shard drains.
 //!
 //! ## Sender trust
 //!
@@ -31,6 +36,7 @@ pub mod error;
 #[cfg(any(test, feature = "testing"))]
 pub mod fakes;
 pub mod inbound;
+pub mod lookup;
 pub mod metrics;
 mod nonce_decode;
 pub mod outbound;

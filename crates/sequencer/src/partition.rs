@@ -1,20 +1,25 @@
 //! Sender-to-partition routing.
 //!
-//! This algorithm must match `kardamom_ingress::routing::partition_for`
-//! exactly. Take the first 8 bytes of `keccak256(sender.as_slice())` as a
-//! big-endian `u64`, then compute `% m`. The proxy routes by this rule. The
-//! sequencer must agree byte-for-byte, or messages go to the wrong
-//! partition.
+//! The rule lives in `kardamom_types::shard_map`. The ingress uses the
+//! same module (`kardamom_ingress::routing::partition_for`), so the two
+//! sides agree byte for byte by construction. The rule has two levels. The
+//! fixed level is `vslot = keccak256(sender)[..8] % 256`. The dynamic
+//! level is a map from vslot to lane. Today the map is the identity
+//! `lane = vslot % M`, which equals the legacy rule
+//! `keccak256(sender)[..8] % M`. See `docs/specs/dynamic-sequencer-sizing.md`.
 
 use std::num::NonZeroU32;
 
-use alloy_primitives::{Address, keccak256};
+use alloy_primitives::Address;
+use kardamom_types::shard_map::{ShardMap, ShardMapError, partition_for, validate_shard_count};
 use serde::{Deserialize, Serialize};
 
 /// The total number of sequencer partitions (M). Never zero: the only
-/// constructor takes a `NonZeroU32`, so this can never divide by zero.
+/// constructor takes a `NonZeroU32`, so [`Self::index_of`] never divides
+/// by zero. A count outside the lane plane (not 1, 2, 4, or 8) is legal
+/// only with an explicit vslot set; [`Self::identity_map`] reports it.
 /// `#[serde(transparent)]` keeps the TOML/CLI representation a plain
-/// integer, unchanged from the bare `NonZeroU32` this type replaces.
+/// integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct PartitionCount(NonZeroU32);
@@ -30,22 +35,22 @@ impl PartitionCount {
         self.0.get()
     }
 
-    /// Compute the partition index for a sender address.
-    ///
-    /// # Panics
-    ///
-    /// Never: `keccak256` always returns exactly 32 bytes, so the
-    /// leading 8-byte slice always converts to a `[u8; 8]`.
+    /// Compute the partition index for a sender address: the legacy rule
+    /// `keccak256(sender)[..8] % M`.
     #[must_use]
     pub fn index_of(&self, sender: Address) -> u32 {
-        let h = keccak256(sender.as_slice());
-        let leading = u64::from_be_bytes(h[..8].try_into().expect("8 bytes"));
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "leading % u64::from(self.get()) is always < self.get(), which fits in u32"
-        )]
-        let idx = (leading % u64::from(self.get())) as u32;
-        idx
+        partition_for(sender, self.0)
+    }
+
+    /// The identity map `lane = vslot % M` over this count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardMapError`] when the count is above the lane plane
+    /// or does not divide the virtual slot count.
+    pub fn identity_map(&self) -> Result<ShardMap, ShardMapError> {
+        let lanes = validate_shard_count(self.get())?;
+        ShardMap::identity(u32::from(lanes))
     }
 }
 
@@ -72,5 +77,19 @@ mod tests {
     fn stable_per_address() {
         let a = address!("00000000000000000000000000000000DeadBeef");
         assert_eq!(m(8).index_of(a), m(8).index_of(a));
+    }
+
+    #[test]
+    fn identity_map_accepts_the_lane_plane_divisors() {
+        for n in [1, 2, 4, 8] {
+            assert!(m(n).identity_map().is_ok());
+        }
+    }
+
+    #[test]
+    fn identity_map_rejects_counts_outside_the_lane_plane() {
+        for n in [3, 64] {
+            assert!(m(n).identity_map().is_err());
+        }
     }
 }

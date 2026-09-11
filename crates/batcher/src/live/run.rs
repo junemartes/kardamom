@@ -1,6 +1,6 @@
 //! Live service wiring: CLI args, the reader stack, and the feed-loop task.
 
-use std::num::{NonZeroU8, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -71,9 +71,8 @@ pub struct LiveArgs {
     pub cursor_file: PathBuf,
     pub log_config: Option<PathBuf>,
     pub aeron_dir: Option<PathBuf>,
-    /// Number of `tx_data` subscriptions to open. Nonzero at the type
-    /// level: 0 opens no readers, so every join would miss forever.
-    pub shards: NonZeroU8,
+    /// The L2 chain id. See [`BatcherConfig::chain_id`].
+    pub chain_id: u64,
     pub cluster_egress_endpoint: Option<String>,
     pub replay_destination_endpoint: Option<String>,
     pub archive_control_response_endpoint: Option<String>,
@@ -111,6 +110,7 @@ impl LiveArgs {
             replay_from_index = cursor.next_index,
             replay_from_block = cursor.next_block,
             skip_through_block,
+            chain_id = self.chain_id,
             "live batcher starting"
         );
         Ok(L1Side {
@@ -164,7 +164,7 @@ impl RunConfig {
         cursor: BatchCursor,
     ) -> Result<ReaderStack<impl Send + use<>>> {
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-        let tx_data_subs = bin_support::open_tx_data_subs(&rt, &self.channels, args.shards)?;
+        let tx_data_subs = bin_support::open_tx_data_subs(&rt, &self.channels)?;
         let join_recovery = bin_support::archive_join_recovery(
             &self.channels,
             &self.aeron_cfg,
@@ -311,6 +311,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
     let feed_cfg = FeedConfig {
         blocks_per_batch: args.blocks_per_batch,
         compress: args.compress,
+        chain_id: args.chain_id,
         flush: Duration::from_millis(args.flush_ms.get()),
         skip_through_block: l1.skip_through_block,
     };

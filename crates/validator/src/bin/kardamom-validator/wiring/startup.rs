@@ -54,7 +54,7 @@ impl Startup {
         }
 
         tracing::info!(
-            shards = args.shards.get(),
+            lanes = kardamom_types::shard_map::LANE_COUNT,
             chain_id = args.chain_id.get(),
             "kardamom-validator starting"
         );
@@ -195,7 +195,6 @@ impl Opened {
                 rt: &self.base.rt,
                 channels: &self.base.channels,
                 aeron_cfg: &self.base.aeron_cfg,
-                shards: args.shards,
                 aeron_dir: args.aeron_dir.as_deref(),
                 archive_control_response_endpoint: args
                     .archive_control_response_endpoint

@@ -1,7 +1,7 @@
 //! `kardamom-validator`: monolithic validator node.
 //!
 //! It follows the sequencer by subscribing to the same canonical streams
-//! the executor reads (`tx_data` x M, `tx_ordering` from the Aeron
+//! the executor reads (`tx_data` x 8 lanes, `tx_ordering` from the Aeron
 //! Cluster (Raft) egress, `tx_deposits`). It re-executes every block
 //! through the shared `kardamom-engine` pipeline, and commits to its own
 //! libmdbx state through the trie-aware writer, advancing a canonical

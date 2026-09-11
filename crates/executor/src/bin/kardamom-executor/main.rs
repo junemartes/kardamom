@@ -1,7 +1,7 @@
 //! `kardamom-executor`: standalone executor service process.
 //!
-//! Opens M `tx_data` subscribers, one `tx_ordering` subscriber, and one
-//! `tx_receipts` publisher through the log layer's Aeron runtime. It wires
+//! Opens one `tx_data` subscriber per lane, one `tx_ordering` subscriber,
+//! and one `tx_receipts` publisher through the log layer's Aeron runtime. It wires
 //! them into the executor's reader, exec, and commit thread topology, and
 //! runs until SIGTERM or Ctrl-C. The state backend is the libmdbx-backed
 //! `kardamom-state` writer, opened at `--state-dir`: chain state commits
@@ -54,6 +54,9 @@ struct WriterAdapters {
     footprint_shadow: Option<crossbeam_channel::Sender<kardamom_engine::shadow::ShadowBlock>>,
     /// Kept alive so the BAL publisher thread keeps running; not read.
     _bal_publisher: std::thread::JoinHandle<()>,
+    /// The nonce query listener, when `--nonce-query-addr` is set. Kept
+    /// alive so its accept task keeps running; not read.
+    _nonce_query: Option<kardamom_state::NonceQueryServer>,
 }
 
 /// Seed genesis into `env` if not already seeded, spawn the state
@@ -79,6 +82,14 @@ fn spawn_writer_and_bal(
         seeded,
         "state env opened"
     );
+
+    // The nonce query endpoint reads the committed state through its own
+    // short-lived snapshots. It must exist before the writer takes `env`.
+    let nonce_query = args
+        .nonce_query_addr
+        .map(|addr| kardamom_state::serve_nonce_queries(addr, env.clone()))
+        .transpose()
+        .context("bind nonce query address")?;
 
     // Spawn the writer, and build the three executor adapters from its
     // handle. The snapshot-swap channel feeds reads (the snapshot source
@@ -122,6 +133,7 @@ fn spawn_writer_and_bal(
         bal_tx,
         footprint_shadow,
         _bal_publisher: bal_publisher,
+        _nonce_query: nonce_query,
     })
 }
 
@@ -156,7 +168,7 @@ async fn main() -> Result<()> {
     let file_cfg = load_file_config(&args)?;
 
     tracing::info!(
-        shards = args.shards.get(),
+        lanes = kardamom_types::shard_map::LANE_COUNT,
         chain_id = args.chain_id,
         "kardamom-executor starting"
     );
@@ -201,7 +213,7 @@ async fn main() -> Result<()> {
     // stay live always: the reader's join-miss refetch recovers any
     // down-window or lapse gap in-band, against the remote durability
     // archives.
-    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
+    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,
@@ -244,6 +256,7 @@ async fn main() -> Result<()> {
         bal_tx,
         footprint_shadow,
         _bal_publisher,
+        _nonce_query,
     } = spawn_writer_and_bal(&args, env, genesis.as_ref(), &rt_pub, &channels)?;
 
     // `verify_record_identity` stays off here by decision, not omission.

@@ -18,8 +18,14 @@ pub struct IngressConfig {
     pub binary_tcp_bind: Option<SocketAddr>,
     /// Optional UDS path for the binary line protocol.
     pub binary_uds_path: Option<PathBuf>,
-    /// Number of sequencer partitions (M). Routes on `keccak(sender) % M`.
+    /// Number of sequencer partitions (M). Routes on `keccak(sender) % M`
+    /// when `shard_map` is `None`.
     pub partition_count_m: NonZeroU32,
+    /// The versioned vslot-to-lane map. `None` means the identity map
+    /// `lane = vslot % M`, the legacy rule. A resize installs a map
+    /// through the ingress config. See
+    /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.2.
+    pub shard_map: Option<kardamom_types::shard_map::ShardMap>,
     /// The stable identity of this ingress replica. An active/active
     /// deployment runs N replicas. This id namespaces `correlation_id`, so
     /// the `(replica, sequence)` pair stays unique:
@@ -64,6 +70,19 @@ pub struct IngressConfig {
     pub pending_shed_depth: usize,
 }
 
+impl IngressConfig {
+    /// The `tx_data` lane of `sender`: the shard map, or the identity rule
+    /// over `partition_count_m`.
+    #[inline]
+    #[must_use]
+    pub fn lane_for(&self, sender: alloy_primitives::Address) -> u32 {
+        match &self.shard_map {
+            Some(map) => u32::from(map.lane_for(sender)),
+            None => crate::routing::partition_for(sender, self.partition_count_m),
+        }
+    }
+}
+
 impl Default for IngressConfig {
     fn default() -> Self {
         use nonzero_ext::nonzero;
@@ -72,6 +91,7 @@ impl Default for IngressConfig {
             binary_tcp_bind: None,
             binary_uds_path: None,
             partition_count_m: nonzero!(8u32),
+            shard_map: None,
             ingress_id: 0,
             rate_limit_per_ip_per_sec: nonzero!(10_000u32),
             rate_limit_burst: nonzero!(1_000u32),

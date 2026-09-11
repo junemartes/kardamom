@@ -110,6 +110,11 @@ job "ingress" {
     task "ingress" {
       driver = "docker"
 
+      # The graceful drain: on stop, the ingress refuses new submits and
+      # lets the parked ones finish within the park bound (tx_ttl_ms in
+      # group_vars/all.yml). This gives it that long plus a margin.
+      kill_timeout = "40s"
+
       config {
         # This budget covers 8192 rpc connections, the WS feed,
         # aeron, and docker overhead. The default container nofile
@@ -144,8 +149,18 @@ job "ingress" {
           "--config", "/local/ingress.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
+          # The active shard count (M). Mirrors partition_count in
+          # group_vars/all.yml. The ingress opens all 8 lanes and routes
+          # to the first M. check-contract.py checks this mirror.
           "--shards", "2",
+          # The versioned vslot-to-lane map (config/shard-map.toml). A
+          # resize re-renders it and rolls this job; see
+          # scripts/scale-sequencers.sh.
+          "--shard-map", "/local/shard-map.toml",
           "--jsonrpc-bind", "0.0.0.0:8545",
+          # The submit park bound. It equals the sequencer transaction
+          # lifetime (tx_ttl_ms in group_vars/all.yml).
+          "--pending-receipt-timeout-ms", "30000",
           # Use a stable per-replica id (alloc index 0 or 1). This
           # namespaces correlation_id, so the two active/active
           # replicas never collide. See
@@ -183,6 +198,12 @@ job "ingress" {
       template {
         destination = "local/ingress.toml"
         data        = file("config/ingress.toml")
+      }
+
+      # The shard map, rendered by scripts/render-shard-map.py.
+      template {
+        destination = "local/shard-map.toml"
+        data        = file("config/shard-map.toml")
       }
 
       # Cluster LogConfig (UDP multicast channels). Comes from one

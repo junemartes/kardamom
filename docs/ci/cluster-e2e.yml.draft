@@ -1,7 +1,10 @@
 # =============================================================================
 # DRAFT — OPERATOR ACTION REQUIRED (this bot cannot push workflow files).
-# Replace .github/workflows/cluster-e2e.yml with this file. Sole delta vs the
-# committed workflow: the job-level `permissions` block below, which grants
+# Replace .github/workflows/cluster-e2e.yml with this file. Two deltas vs the
+# committed workflow. (1) The chaos-sequencer shard lists the dynamic
+# sequencer sizing cases (lookup-blackout, resize-scale-out-in); until this
+# lands, deploy/cluster/scripts/ci-stages.sh appends them to that shard.
+# (2) The job-level `permissions` block below, which grants
 # `id-token: write` so the image push path (ci-images.sh / lib-signing.sh,
 # attested-identity P0.5) can mint the GitHub OIDC token cosign keyless
 # signing needs. Until this lands, ACTIONS_ID_TOKEN_REQUEST_URL stays unset
@@ -197,7 +200,10 @@ jobs:
             # with NO stall (P=2 replicas per shard as of the replicated-
             # sequencer-shards change). validator-lapse pauses the validator
             # under load and asserts it resumes verifying with coverage held.
-            chaos-sequencer) { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-sequencer hard-sequencer sequencer-replica-kill sequencer-lapse validator-lapse validator-join"; } ;;
+            # lookup-blackout and resize-scale-out-in are the dynamic
+            # sequencer sizing cases (chaos-cases-resize.sh). They run
+            # last: the resize leaves the shard map at a later version.
+            chaos-sequencer) { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-sequencer hard-sequencer sequencer-replica-kill sequencer-lapse validator-lapse validator-join lookup-blackout resize-scale-out-in"; } ;;
             # The clustered sealer (Phase 3) is a 3-member Aeron Cluster (Raft).
             # These cases hard-kill the LEADER (must re-elect within the SLO), a
             # FOLLOWER (quorum 2/3 holds, no stall), and TWO whole nodes (quorum

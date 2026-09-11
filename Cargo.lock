@@ -4098,6 +4098,7 @@ dependencies = [
  "rand 0.9.4",
  "reqwest 0.13.4",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -4119,6 +4120,8 @@ dependencies = [
  "kardamom-types",
  "metrics",
  "rkyv",
+ "serde",
+ "serde_json",
  "signet-libmdbx",
  "tempfile",
  "thiserror 2.0.18",
@@ -4156,6 +4159,7 @@ dependencies = [
  "bytes",
  "rkyv",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

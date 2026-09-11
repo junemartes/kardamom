@@ -14,6 +14,8 @@ use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 use super::ports::JoinRecovery;
 
 /// A `tx_data` join key: `(sequencer_id, session_id, tx_data_position)`.
+/// Here `sequencer_id` is the `tx_data` lane index (`TxRef::shard_id`),
+/// not a publisher identity.
 ///
 /// The key includes `session_id` (the Aeron publisher session), because
 /// Aeron positions are per-session. Under active/active ingress, two

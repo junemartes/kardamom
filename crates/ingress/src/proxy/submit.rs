@@ -15,7 +15,6 @@ use crate::channels::{IngressPublication, IngressSubscription};
 use crate::error::IngressError;
 use crate::metrics::count_reject;
 use crate::pending::ReceiptResponse;
-use crate::routing::partition_for;
 
 use super::{IngressProxy, ValidatedSubmission};
 
@@ -144,6 +143,10 @@ where
             count_reject("overloaded");
             return Err(IngressError::Overloaded(depth));
         }
+        if self.is_draining() {
+            count_reject("draining");
+            return Err(IngressError::Draining);
+        }
 
         if let Err(e) = self.rate_limiter.check(client_ip) {
             let _ = e; // This error carries no data.
@@ -201,7 +204,7 @@ where
         v: &ValidatedSubmission,
         raw_tx: AlloyBytes,
     ) -> Result<(), IngressError> {
-        let shard = partition_for(v.sender, self.partition_count_m) as usize;
+        let shard = kardamom_types::num::u32_to_usize(self.cfg.lane_for(v.sender));
         let correlation_id = self.next_correlation_id();
         self.publication
             .publish_tx_data(

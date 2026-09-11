@@ -41,6 +41,11 @@ pub struct BatcherConfig {
     pub compress: bool,
     /// zstd compression level when `compress` is true.
     pub compression_level: i32,
+    /// The L2 chain id of the chain this batcher posts for. The records
+    /// commitment digests each remote-epoch message leaf, and the leaf
+    /// commits to the destination chain id. Defaults to 1, like the
+    /// sibling services' `--chain-id`.
+    pub chain_id: u64,
 }
 
 impl Default for BatcherConfig {
@@ -49,9 +54,13 @@ impl Default for BatcherConfig {
             blocks_per_batch: NonZeroUsize::MIN,
             compress: true,
             compression_level: DEFAULT_LEVEL,
+            chain_id: 1,
         }
     }
 }
+
+/// The most blobs one L1 post can carry (EIP-4844).
+pub const MAX_BLOBS_PER_BATCH: usize = 6;
 
 /// A batch ready to post to L1.
 #[derive(Clone, Debug)]
@@ -61,7 +70,7 @@ pub struct PostedBatch {
     pub l2_block_end: u64,
     /// The batch records commitment: the fold of per-block digests over the
     /// batch's L2 tx identities. It uses the same `kardamom-types::prover`
-    /// primitives as the batch guest. The settlement contract stores it, and
+    /// primitives as the batch guest. The `settlement` contract stores it, and
     /// the proof's public values must carry it for the proof oracle.
     pub records_commitment: alloy_primitives::B256,
 }
@@ -89,7 +98,7 @@ impl Sender for MockSender {
 }
 
 /// In-process batcher state. It is generic over `Sender`, so tests can use
-/// [`MockSender`] instead of the real settlement client.
+/// [`MockSender`] instead of the real `settlement` client.
 pub struct Batcher<S> {
     cfg: BatcherConfig,
     accumulator: BatchAccumulator,
@@ -130,11 +139,12 @@ impl<S: Sender> Batcher<S> {
             return Ok(());
         }
         let group = std::mem::take(&mut self.pending_blocks);
-        let batch = pack_blocks(&self.cfg, &group)?;
-        let blob_count = batch.blobs.len() as u64;
-        self.sender.post(batch)?;
-        counter!(metric_names::BATCHES_POSTED).increment(1);
-        counter!(metric_names::BLOBS_POSTED).increment(blob_count);
+        for batch in pack_block_groups(&self.cfg, &group)? {
+            let blob_count = batch.blobs.len() as u64;
+            self.sender.post(batch)?;
+            counter!(metric_names::BATCHES_POSTED).increment(1);
+            counter!(metric_names::BLOBS_POSTED).increment(blob_count);
+        }
         Ok(())
     }
 }
@@ -142,11 +152,12 @@ impl<S: Sender> Batcher<S> {
 /// A pure helper that turns a group of `ClosedBlock`s into a `PostedBatch`.
 ///
 /// Steps: encode KAR1, compress with zstd if enabled, then pack into at
-/// most 6 blobs.
+/// most [`MAX_BLOBS_PER_BATCH`] blobs. A group that overflows the ceiling
+/// is an error. Use [`pack_block_groups`] to split such a group.
 ///
 /// # Errors
-/// Returns an error when `blocks` is empty, or when frame encoding or blob
-/// packing fails.
+/// Returns an error when `blocks` is empty, when frame encoding or blob
+/// packing fails, or when the group overflows the blob ceiling.
 pub fn pack_blocks(
     cfg: &BatcherConfig,
     blocks: &[ClosedBlock],
@@ -162,27 +173,133 @@ pub fn pack_blocks(
         framed
     };
     let blobs = pack_to_blobs(&to_pack)?;
-    if blobs.len() > 6 {
+    if blobs.len() > MAX_BLOBS_PER_BATCH {
+        if let [only] = blocks {
+            return Err(BatcherError::BlockTooLarge {
+                block_number: only.block_number,
+                blobs: blobs.len(),
+            });
+        }
         return Err(BatcherError::Blob(format!(
-            "batch overflowed 6-blob ceiling: produced {}",
+            "batch overflowed {MAX_BLOBS_PER_BATCH}-blob ceiling: produced {}",
             blobs.len()
         )));
     }
     let l2_block_start = first_block.block_number;
     let l2_block_end = last_block.block_number;
-    let records_commitment = kardamom_types::batch_records_commitment(blocks.iter().map(|b| {
-        let mut d = kardamom_types::BlockRecordsDigest::new(b.block_number);
-        for t in &b.txs {
-            d.add_tx(&t.envelope.raw_tx);
-        }
-        d.finish()
-    }));
+    let records_commitment = kardamom_types::batch_records_commitment(
+        blocks.iter().map(|b| block_records_digest(cfg.chain_id, b)),
+    );
     Ok(PostedBatch {
         blobs,
         l2_block_start,
         l2_block_end,
         records_commitment,
     })
+}
+
+/// Split a group of `ClosedBlock`s into as many batches as the blob
+/// ceiling needs, in block order.
+///
+/// The rule: take the largest prefix that packs to at most
+/// [`MAX_BLOBS_PER_BATCH`] blobs, post it, then repeat on the rest. A
+/// prefix search by bisection assumes that a longer prefix packs to more
+/// blobs. zstd can break that assumption. That only costs an extra batch:
+/// every batch this function returns did pack within the ceiling. A block
+/// that overflows the ceiling on its own returns
+/// [`BatcherError::BlockTooLarge`].
+///
+/// # Errors
+/// Returns [`BatcherError::BlockTooLarge`] for a block that overflows on
+/// its own, and every [`pack_blocks`] error otherwise.
+pub fn pack_block_groups(
+    cfg: &BatcherConfig,
+    blocks: &[ClosedBlock],
+) -> Result<Vec<PostedBatch>, BatcherError> {
+    let mut out = Vec::new();
+    let mut rest = blocks;
+    while !rest.is_empty() {
+        let (batch, taken) = pack_largest_prefix(cfg, rest)?;
+        out.push(batch);
+        rest = &rest[taken..];
+    }
+    Ok(out)
+}
+
+/// Pack the largest prefix of `blocks` that fits the blob ceiling. Returns
+/// the batch and the prefix length.
+fn pack_largest_prefix(
+    cfg: &BatcherConfig,
+    blocks: &[ClosedBlock],
+) -> Result<(PostedBatch, usize), BatcherError> {
+    match pack_blocks(cfg, blocks) {
+        Ok(batch) => return Ok((batch, blocks.len())),
+        Err(e) if e.is_blob_overflow() => {}
+        Err(e) => return Err(e),
+    }
+    // The whole group overflows. A single block does not reach here: it
+    // fails as `BlockTooLarge` above. Bisect on the prefix length.
+    let mut search = PrefixSearch {
+        best: None,
+        lo: 0,
+        hi: blocks.len(),
+    };
+    while search.open() {
+        search.probe(cfg, blocks)?;
+    }
+    match search.best {
+        Some(found) => Ok(found),
+        // No prefix of length >= 1 fit, so the first block alone overflows.
+        None => pack_blocks(cfg, &blocks[..1]).map(|b| (b, 1)),
+    }
+}
+
+/// The bisection state of [`pack_largest_prefix`]: the longest
+/// known-good prefix is `lo` (with its batch in `best`); `hi` is known to
+/// overflow.
+struct PrefixSearch {
+    best: Option<(PostedBatch, usize)>,
+    lo: usize,
+    hi: usize,
+}
+
+impl PrefixSearch {
+    /// True while a prefix length between `lo` and `hi` is untested.
+    fn open(&self) -> bool {
+        self.hi.saturating_sub(self.lo) > 1
+    }
+
+    /// Pack the midpoint prefix, and move `lo` or `hi` to it.
+    fn probe(&mut self, cfg: &BatcherConfig, blocks: &[ClosedBlock]) -> Result<(), BatcherError> {
+        let mid = self.lo.midpoint(self.hi);
+        match pack_blocks(cfg, &blocks[..mid]) {
+            Ok(batch) => {
+                self.best = Some((batch, mid));
+                self.lo = mid;
+                Ok(())
+            }
+            Err(e) if e.is_blob_overflow() => {
+                self.hi = mid;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The per-block records digest the L1 commitment folds. Remote-epoch
+/// records lead the block, so their arms come before the tx arms. See
+/// [`kardamom_types::BlockRecordsDigest`] for the layout.
+#[must_use]
+pub fn block_records_digest(chain_id: u64, block: &ClosedBlock) -> alloy_primitives::B256 {
+    let mut d = kardamom_types::BlockRecordsDigest::new(block.block_number);
+    for rec in &block.remote_epochs {
+        d.add_remote_epoch(chain_id, rec);
+    }
+    for t in &block.txs {
+        d.add_tx(&t.envelope.raw_tx);
+    }
+    d.finish()
 }
 
 fn build_payload(blocks: &[ClosedBlock]) -> Kar1Payload {

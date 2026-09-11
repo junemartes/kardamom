@@ -72,6 +72,10 @@ impl PendingMap {
         self.0.insert(key, weak);
     }
 
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// Looks up the live entry for `key`. A dead `Weak`, unobservable in
     /// practice, see the module docs, looks the same as an absent key:
     /// the parked client is gone either way.
@@ -302,6 +306,7 @@ impl PendingReceipts {
                 let err = match reason {
                     TxErrorReason::DuplicatedTx { .. } => IngressError::Duplicate((sender, nonce)),
                     TxErrorReason::Evicted { .. } => IngressError::Evicted((sender, nonce)),
+                    TxErrorReason::Expired { .. } => IngressError::Expired((sender, nonce)),
                 };
                 // This only releases the waiter. The woken waiter's Drop
                 // removes the slot.
@@ -402,6 +407,10 @@ impl PendingReceipts {
     /// opportunistic reap.
     pub(crate) fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }
 

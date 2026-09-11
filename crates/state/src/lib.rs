@@ -11,6 +11,7 @@ pub mod genesis;
 pub mod geometry;
 pub mod integrity;
 pub mod meta;
+pub mod nonce_query;
 pub mod recovery;
 pub mod schema;
 pub mod snapshot;
@@ -30,6 +31,7 @@ pub use env::{Durability, StateEnv, StateEnvBuilder};
 pub use error::StateError;
 pub use genesis::{genesis_applied, genesis_digest, seed_genesis};
 pub use integrity::{IntegrityReport, deep_compare, sweep};
+pub use nonce_query::{NonceQueryServer, committed_nonce, serve_nonce_queries};
 pub use recovery::{
     RecoveryPoint, bootstrap_trie_from_state, has_trie, read_all_headers, read_recovery_point,
 };

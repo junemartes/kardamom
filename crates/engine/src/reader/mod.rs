@@ -1,8 +1,10 @@
 //! `TxData` / `tx_ordering` reader threads and join buffer.
 //!
 //! `tx_ordering` carries only ~16-32 B [`TxOrderingMessage`] records (`TxRef`
-//! or `BoundaryStart`). The full envelope bytes live on M per-sequencer
-//! **`tx_data`** archives.
+//! or `BoundaryStart`). The full envelope bytes live on the per-lane
+//! **`tx_data`** archives. The lane plane has a fixed size
+//! (`kardamom_types::shard_map::LANE_COUNT`, 8). Below, M is that lane
+//! count. An idle lane has a reader thread that blocks and never inserts.
 //!
 //! This module owns the M+1 reader thread topology:
 //!

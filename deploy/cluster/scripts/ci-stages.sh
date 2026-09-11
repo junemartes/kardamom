@@ -159,7 +159,7 @@ stage_semantics() {
     "${SEMANTICS_BIN}" \
       --rpc http://192.168.56.31:8545 --chain-id 412346 \
       --executor-metrics 192.168.56.41:9004,192.168.56.42:9004,192.168.56.43:9004 \
-      --sequencer-metrics 192.168.56.21:9001,192.168.56.22:9001 \
+      --sequencer-metrics 192.168.56.21:9001,192.168.56.22:9001,192.168.56.21:9011,192.168.56.22:9011 \
       --validator-metrics 192.168.56.61:9006 \
       --pending-receipt-timeout-ms "${SEMANTICS_PARK_MS:-30000}" \
       --account-base "${SEMANTICS_ACCOUNT_BASE:-1}" \
@@ -192,8 +192,21 @@ stage_chaos() {
   # exercises leader-kill, follower-kill, and quorum-loss-recover. A
   # shard can override CHAOS_CASES to run the component (executor,
   # ingress, sequencer, sealer) cases instead.
+  # The dynamic-sizing cases (chaos-cases-resize.sh) ride the sequencer
+  # shard, last: the resize leaves the shard map at a later version, so
+  # ACCT_SHARD no longer pins the cases after it. The workflow lists the
+  # shard's base cases; this appends the two until the workflow lists
+  # them itself (docs/ci/cluster-e2e.yml.draft).
+  local cases="${CHAOS_CASES:-cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover}"
+  case " ${cases} " in
+    *" sequencer-replica-kill "*)
+      case " ${cases} " in
+        *" resize-scale-out-in "*) ;;
+        *) cases="${cases} lookup-blackout resize-scale-out-in" ;;
+      esac ;;
+  esac
   CHAOS_TPS="${CHAOS_TPS:-50}" CHAOS_CASE_S="${CHAOS_CASE_S:-45}" \
-    CHAOS_CASES="${CHAOS_CASES:-cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover}" \
+    CHAOS_CASES="${cases}" \
     CHAOS_RESTART_SLO_S="${CHAOS_RESTART_SLO_S:-60}" \
     CHAOS_RESCHEDULE_SLO_S="${CHAOS_RESCHEDULE_SLO_S:-150}" \
     CHAOS_LEADER_SLO_S="${CHAOS_LEADER_SLO_S:-30}" \

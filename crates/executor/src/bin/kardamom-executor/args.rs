@@ -2,15 +2,13 @@
 //! lives in `main.rs`; state recovery in `state.rs`; role adapters in
 //! `wiring.rs`.
 
-use std::num::{NonZeroU8, NonZeroU64, NonZeroUsize, ParseIntError};
+use std::num::{NonZeroU64, NonZeroUsize, ParseIntError};
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::Parser;
 use kardamom_engine::bin_support::StateDurabilityArg;
 
-/// Default `--shards`: the sequencer's default `partition_count`.
-const DEFAULT_SHARDS: NonZeroU8 = NonZeroU8::new(8).unwrap();
 /// Default `--checkpoint-keep`.
 const DEFAULT_CHECKPOINT_KEEP: NonZeroU64 = NonZeroU64::new(3).unwrap();
 
@@ -59,11 +57,6 @@ pub(crate) struct Args {
     /// `tx_receipts_mds_enabled()` is true.
     #[arg(long, env = "KARDAMOM_RECORDER_ID", default_value_t = 0)]
     pub(crate) recorder_id: u32,
-    /// Number of `tx_data` shards to subscribe to. The default is 8, to match
-    /// the default `partition_count` in the sequencer. Non-zero:
-    /// `MockChannels::new(0)` makes an empty shard set.
-    #[arg(long, default_value_t = DEFAULT_SHARDS)]
-    pub(crate) shards: NonZeroU8,
     /// Execute blocks through the Block-STM engine (block-at-a-time). When
     /// off, the binary uses the streaming per-tx path, with byte-for-byte
     /// identical output. Output is byte-identical either way: receipts,
@@ -158,6 +151,12 @@ pub(crate) struct Args {
     /// (`REPLAY_UNAVAILABLE`). Requires `--checkpoint-dir`.
     #[arg(long, env = "KARDAMOM_CHECKPOINT_PEERS", value_delimiter = ',')]
     pub(crate) checkpoint_peers: Vec<String>,
+    /// Serve read-only account nonce queries (`eth_getTransactionCount`)
+    /// on this address. The sequencers ask it for the committed nonce of a
+    /// cold sender. Off when unset. See
+    /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.4.
+    #[arg(long, env = "KARDAMOM_NONCE_QUERY_ADDR")]
+    pub(crate) nonce_query_addr: Option<std::net::SocketAddr>,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9004")]
     pub(crate) metrics_addr: std::net::SocketAddr,

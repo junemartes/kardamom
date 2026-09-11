@@ -1,34 +1,27 @@
-//! This module routes a sender to a partition. `partition = keccak256(sender)[..8] % M`.
+//! This module routes a sender to a partition.
+//!
+//! The rule lives in `kardamom_types::shard_map`. The sequencer uses the
+//! same module. So the two sides agree byte for byte by construction. The
+//! rule has two levels. The fixed level is `vslot = keccak256(sender)[..8]
+//! % 256`. The dynamic level is a map from vslot to lane. Today the map is
+//! the identity `lane = vslot % M`, which equals the legacy rule
+//! `keccak256(sender)[..8] % M`. See `docs/specs/dynamic-sequencer-sizing.md`.
 
 use std::num::NonZeroU32;
 
-use alloy_primitives::{Address, keccak256};
+use alloy_primitives::Address;
 
 /// Returns the partition index for `sender`, out of `m` partitions.
-///
-/// Take the first 8 bytes of `keccak256(sender)` as a big-endian `u64`.
-/// Then compute `% m`.
-///
-/// # Panics
-///
-/// Never panics in practice: `keccak256` always returns 32 bytes, so the
-/// leading 8-byte slice always converts to a `[u8; 8]`.
 #[inline]
 #[must_use]
 pub fn partition_for(sender: Address, m: NonZeroU32) -> u32 {
-    let h = keccak256(sender.as_slice());
-    let leading = u64::from_be_bytes(h[..8].try_into().expect("8 bytes"));
-    // The result is `leading % m`, which is always < m <= u32::MAX, so
-    // the narrowing cast back to u32 never truncates.
-    #[allow(clippy::cast_possible_truncation)]
-    let partition = (leading % u64::from(m.get())) as u32;
-    partition
+    kardamom_types::shard_map::partition_for(sender, m)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
+    use alloy_primitives::{address, keccak256};
 
     fn nz(m: u32) -> NonZeroU32 {
         NonZeroU32::new(m).expect("test m is non-zero")
@@ -41,6 +34,17 @@ mod tests {
         let p2 = partition_for(a, nz(8));
         assert_eq!(p1, p2);
         assert!(p1 < 8);
+    }
+
+    #[test]
+    fn matches_the_legacy_rule() {
+        // The legacy rule: keccak256(sender)[..8] as a big-endian u64, % m.
+        let a = address!("00000000000000000000000000000000DeadBeef");
+        let h = keccak256(a.as_slice());
+        let prefix = u64::from_be_bytes(h[..8].try_into().unwrap());
+        for m in [2u32, 8] {
+            assert_eq!(u64::from(partition_for(a, nz(m))), prefix % u64::from(m));
+        }
     }
 
     #[test]

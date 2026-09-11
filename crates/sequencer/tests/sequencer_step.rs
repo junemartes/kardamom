@@ -73,6 +73,36 @@ fn future_nonce_buffered_then_drained() {
 }
 
 #[test]
+fn parked_future_nonce_expires_with_an_explicit_error() {
+    // A future nonce parks. After tx_ttl it expires. The client gets an
+    // `Expired` error on tx_errors, and the ref never publishes.
+    let s = signer(9);
+    let env1 = signed_tx_envelope(&s, 1, 900);
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(0)), env1);
+    let cfg = SequencerConfig {
+        tx_ttl_ms: std::num::NonZeroU64::new(20).unwrap(),
+        ..one_partition_cfg()
+    };
+    let mut seq = Sequencer::new(cfg).unwrap();
+
+    rig.step(&mut seq).unwrap();
+    assert!(rig.errors().is_empty(), "no error before tx_ttl");
+
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    rig.step(&mut seq).unwrap();
+    let errors = rig.errors();
+    assert_eq!(errors.len(), 1, "one Expired error");
+    assert_eq!(errors[0].sender, s.address());
+    assert_eq!(errors[0].nonce, 1);
+    assert_eq!(
+        errors[0].reason,
+        kardamom_sequencer::TxErrorReason::Expired { expected_nonce: 0 }
+    );
+    assert!(rig.refs().is_empty(), "an expired entry never publishes");
+}
+
+#[test]
 fn b_backpressure_rewinds_state_and_retry_succeeds() {
     let s = signer(4);
     let env = signed_tx_envelope(&s, 0, 100);

@@ -36,6 +36,10 @@ pub(super) struct StackLaunch<'a> {
     root: &'a Path,
     driver: &'a MediaDriver,
     sealer: &'a SealerCluster,
+    /// The executor's nonce query port. Picked once at bring-up and kept
+    /// for every respawn, so a restarted executor serves the address the
+    /// sequencers already query.
+    executor_query_port: u16,
 }
 
 impl<'a> StackLaunch<'a> {
@@ -50,7 +54,19 @@ impl<'a> StackLaunch<'a> {
             root,
             driver,
             sealer,
+            executor_query_port: kardamom_obs::testkit::free_port().port(),
         }
+    }
+
+    /// Reuse the nonce query port of an earlier bring-up.
+    pub(super) fn with_executor_query_port(mut self, port: u16) -> Self {
+        self.executor_query_port = port;
+        self
+    }
+
+    /// The nonce query port this launch hands the services.
+    pub(super) fn executor_query_port(&self) -> u16 {
+        self.executor_query_port
     }
 
     /// Materialise the genesis for `cfg.chain_id`: the canonical TOML
@@ -159,6 +175,8 @@ impl<'a> StackLaunch<'a> {
             aeron_dir: &self.driver.aeron_dir,
             cluster_ingress_endpoints: &self.sealer.ingress_endpoints,
             shards: self.cfg.shards,
+            tx_ttl: self.cfg.ingress.pending_receipt_timeout.as_duration(),
+            executor_query: std::net::SocketAddr::from(([127, 0, 0, 1], self.executor_query_port)),
             chain_id: self.cfg.chain_id.get(),
             genesis,
             log_config,
@@ -279,6 +297,7 @@ impl LocalStack {
         };
 
         let stack_launch = StackLaunch::new(&cfg, root.path(), &driver, &sealer);
+        let executor_query_port = stack_launch.executor_query_port();
         let genesis = stack_launch.materialise_genesis(genesis.path())?;
         let log_config = stack_launch.write_archive_log_config()?;
         let spec = stack_launch.assemble_spec(&genesis, log_config.as_deref());
@@ -324,6 +343,7 @@ impl LocalStack {
             l1,
             genesis,
             log_config,
+            executor_query_port,
             root,
             keep,
             shutdown_report: ShutdownReport::default(),

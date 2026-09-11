@@ -1,6 +1,6 @@
 //! CLI + file-config surface of `kardamom-validator`.
 
-use std::num::{NonZeroU8, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -14,8 +14,6 @@ use kardamom_validator::interop::{
 };
 use kardamom_validator::parallel::BatchSize;
 
-/// Default `--shards`.
-const DEFAULT_SHARDS: NonZeroU8 = NonZeroU8::new(8).expect("compile-time constant");
 /// Default `--chain-id`. Also `resolve_genesis`'s "no explicit override"
 /// sentinel — see the field's doc.
 const DEFAULT_CHAIN_ID: NonZeroU64 = NonZeroU64::new(1).expect("compile-time constant");
@@ -54,9 +52,6 @@ pub(crate) struct Args {
     /// Aeron Media Driver directory (`aeron.dir`).
     #[arg(long)]
     pub(crate) aeron_dir: Option<PathBuf>,
-    /// Number of `tx_data` shards to subscribe to.
-    #[arg(long, default_value_t = DEFAULT_SHARDS)]
-    pub(crate) shards: NonZeroU8,
     /// Number of executor replicas whose `tx_receipts` endpoints to attach,
     /// when `tx_receipts` MDS is enabled. Falls back to
     /// `channels.tx_receipts_executor_count`.

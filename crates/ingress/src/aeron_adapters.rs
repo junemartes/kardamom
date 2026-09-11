@@ -36,19 +36,22 @@ pub struct LiveIngressPublication {
 }
 
 impl LiveIngressPublication {
+    /// Open one `tx_data` publisher per lane. `lanes` is the lane plane
+    /// size, not the active shard count.
+    ///
     /// # Errors
     ///
-    /// Returns `IngressError::Internal` if any shard's `tx_data` handle
+    /// Returns `IngressError::Internal` if any lane's `tx_data` handle
     /// fails to open.
     pub fn open(
         rt: &AeronRuntime,
         channels: &ChannelsConfig,
-        shards: NonZeroU8,
+        lanes: NonZeroU8,
     ) -> Result<Self, IngressError> {
-        let tx_data = (0..shards.get())
-            .map(|sid| {
-                TxDataPublisherHandle::open(rt, channels, sid)
-                    .map_err(|e| IngressError::internal(format!("open tx_data[{sid}]"), e))
+        let tx_data = (0..lanes.get())
+            .map(|lane| {
+                TxDataPublisherHandle::open(rt, channels, lane)
+                    .map_err(|e| IngressError::internal(format!("open tx_data[{lane}]"), e))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { tx_data })

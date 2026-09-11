@@ -107,7 +107,17 @@ pub struct ServiceSpec<'a> {
     pub root: &'a Path,
     pub aeron_dir: &'a Path,
     pub cluster_ingress_endpoints: &'a str,
+    /// The active shard count (M). The sequencers and the ingress take it.
+    /// The consumers open the fixed lane plane and take no count.
     pub shards: std::num::NonZeroU32,
+    /// The transaction lifetime. The sequencers take it as `--tx-ttl-ms`.
+    /// The ingress takes the same value as `--pending-receipt-timeout-ms`
+    /// (see [`IngressOptions`]). One value drives both, as in the deploy.
+    pub tx_ttl: Duration,
+    /// The executor's nonce query address. The executor serves it, and
+    /// every sequencer queries it. The stack picks the port before the
+    /// sequencers spawn, so a restarted executor keeps it.
+    pub executor_query: SocketAddr,
     pub chain_id: u64,
     pub genesis: &'a Path,
     /// `--log-config` for every service. `None` uses the built-in
@@ -161,7 +171,6 @@ impl ServiceSpec<'_> {
             .arg(&cfg_path)
             .arg("--aeron-dir")
             .arg(self.aeron_dir)
-            .args(["--shards", &self.shards.get().to_string()])
             .args(["--chain-id", &self.chain_id.to_string()])
             .arg("--chain")
             .arg(self.genesis)
@@ -313,20 +322,77 @@ impl SpawnPlan {
     }
 }
 
+/// The lane-plane knobs of one sequencer process. The default is the
+/// identity map: lane `index`, the slots of partition `index` under
+/// `partition_count = shards`. A resize sets the rest. The text forms
+/// go to the binary's flags as they are; the binary parses them. See
+/// `docs/specs/dynamic-sequencer-sizing.md`, section 3.5.
+#[derive(Clone, Debug, Default)]
+pub struct SequencerOptions {
+    /// `--partition-count`. Defaults to the stack's shard count.
+    pub partition_count: Option<std::num::NonZeroU32>,
+    /// `--lane`.
+    pub lane: Option<u8>,
+    /// `--vslots`, in the text form `0-7,16`.
+    pub vslots: Option<String>,
+    /// `--extra-lanes`.
+    pub extra_lanes: Vec<u8>,
+    /// `--shadow-vslots`.
+    pub shadow_vslots: Option<String>,
+    /// `--shadow-warm-ms`.
+    pub shadow_warm: Option<Duration>,
+    /// A suffix for the log file name, so a restarted process does not
+    /// overwrite the log of the one it replaced.
+    pub log_tag: String,
+}
+
+impl SequencerOptions {
+    /// Add the lane-plane flags this option set names to `cmd`.
+    fn add_lane_args(&self, cmd: &mut Command) {
+        if let Some(lane) = self.lane {
+            cmd.args(["--lane", &lane.to_string()]);
+        }
+        if let Some(v) = self.vslots.as_deref() {
+            cmd.args(["--vslots", v]);
+        }
+        if !self.extra_lanes.is_empty() {
+            let lanes: Vec<String> = self.extra_lanes.iter().map(u8::to_string).collect();
+            cmd.args(["--extra-lanes", &lanes.join(",")]);
+        }
+        if let Some(v) = self.shadow_vslots.as_deref() {
+            cmd.args(["--shadow-vslots", v]);
+        }
+        if let Some(warm) = self.shadow_warm {
+            cmd.args(["--shadow-warm-ms", &warm.as_millis().to_string()]);
+        }
+    }
+}
+
+/// # Errors
+/// Returns an error under the same conditions as [`spawn_sequencer_with`].
+pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
+    spawn_sequencer_with(spec, index, &SequencerOptions::default())
+}
+
 /// # Errors
 /// Returns an error when the binary is not built, when the config file
 /// cannot be written, or when the process fails to spawn.
-pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
+pub fn spawn_sequencer_with(
+    spec: &ServiceSpec<'_>,
+    index: u32,
+    opts: &SequencerOptions,
+) -> Result<Spawned> {
+    let partition_count = opts.partition_count.unwrap_or(spec.shards);
     // partition_index and sequencer_id are placeholders here; the CLI
     // flags below (`--partition-index`, `--sequencer-id`) are what the
     // binary actually uses. max_pending_per_sender and
     // backpressure_policy have no CLI flag, so they must live in the file.
     let prefix = format!(
-        "partition_count = {}\npartition_index = 0\nsequencer_id = 0\n\
+        "partition_count = {partition_count}\npartition_index = 0\nsequencer_id = 0\n\
          max_pending_per_sender = 512\nbackpressure_policy = \"return_immediately\"\n\n",
-        spec.shards
     );
-    let cfg_path = spec.write_cluster_config(&format!("sequencer-{index}"), &prefix)?;
+    let name = format!("sequencer-{index}{}", opts.log_tag);
+    let cfg_path = spec.write_cluster_config(&name, &prefix)?;
     let metrics_port = free_port().port();
     let egress_port = free_udp_port().port();
     let mut cmd = Command::new(bin("kardamom-sequencer")?);
@@ -335,8 +401,14 @@ pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
         .arg("--aeron-dir")
         .arg(spec.aeron_dir)
         .args(["--partition-index", &index.to_string()])
-        .args(["--partition-count", &spec.shards.get().to_string()])
-        .args(["--sequencer-id", &index.to_string()])
+        .args(["--partition-count", &partition_count.to_string()])
+        .args(["--sequencer-id", &index.to_string()]);
+    opts.add_lane_args(&mut cmd);
+    cmd.args(["--tx-ttl-ms", &spec.tx_ttl.as_millis().to_string()])
+        .args([
+            "--executor-query-endpoints",
+            &format!("http://{}", spec.executor_query),
+        ])
         .args([
             "--cluster-egress-endpoint",
             &format!("127.0.0.1:{egress_port}"),
@@ -348,7 +420,7 @@ pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
     SpawnPlan {
         name: format!("sequencer-{index}"),
         cmd,
-        log: spec.root.join(format!("sequencer-{index}.log")),
+        log: spec.root.join(format!("{name}.log")),
         metrics_port,
         state_dir: None,
     }
@@ -406,6 +478,7 @@ pub fn spawn_executor_at(
         egress_port,
         host_id: "e2e-exec",
     })?;
+    cmd.args(["--nonce-query-addr", &spec.executor_query.to_string()]);
     // The footprint shadow is on for every e2e executor. It only
     // measures: execution stays sequential, and the handoff never blocks.
     // Running it here gives the shadow thread real multi-process pipeline
@@ -570,17 +643,36 @@ pub struct SpawnedIngress {
 /// Returns an error when the binary is not built, when the config file
 /// cannot be written, or when the process fails to spawn.
 pub fn spawn_ingress(spec: &ServiceSpec<'_>, opts: &IngressOptions) -> Result<SpawnedIngress> {
+    spawn_ingress_at(spec, opts, None, None)
+}
+
+/// Spawn the ingress, or respawn it. `fixed_rpc_port` keeps the RPC URL
+/// scenarios already hold. `shard_map` is the `--shard-map` file of a
+/// resize; `None` is the identity map over the shard count.
+///
+/// # Errors
+/// Returns an error when the binary is not built, when the config file
+/// cannot be written, or when the process fails to spawn.
+pub fn spawn_ingress_at(
+    spec: &ServiceSpec<'_>,
+    opts: &IngressOptions,
+    fixed_rpc_port: Option<u16>,
+    shard_map: Option<&Path>,
+) -> Result<SpawnedIngress> {
     let cfg_path = spec.write_cluster_config("ingress", "")?;
     let metrics_port = free_port().port();
-    let rpc_port = free_port().port();
+    let rpc_port = fixed_rpc_port.unwrap_or_else(|| free_port().port());
     let mut cmd = Command::new(bin("kardamom-ingress")?);
     cmd.arg("--config")
         .arg(&cfg_path)
         .arg("--aeron-dir")
         .arg(spec.aeron_dir)
         .args(["--jsonrpc-bind", &format!("127.0.0.1:{rpc_port}")])
-        .args(["--shards", &spec.shards.get().to_string()])
-        .args(["--ack-policy", "on-offer"])
+        .args(["--shards", &spec.shards.get().to_string()]);
+    if let Some(map) = shard_map {
+        cmd.arg("--shard-map").arg(map);
+    }
+    cmd.args(["--ack-policy", "on-offer"])
         .args(["--chain-id", &spec.chain_id.to_string()])
         .args([
             "--pending-receipt-timeout-ms",
@@ -605,7 +697,13 @@ pub fn spawn_ingress(spec: &ServiceSpec<'_>, opts: &IngressOptions) -> Result<Sp
         cmd.arg("--archive-durability");
     }
     common_service_env(&mut cmd);
-    let proc = Proc::spawn("ingress", cmd, spec.root.join("ingress.log"))?;
+    // A respawn logs to its own file, so the first process's log survives.
+    let log_name = if fixed_rpc_port.is_some() {
+        "ingress-restarted.log"
+    } else {
+        "ingress.log"
+    };
+    let proc = Proc::spawn("ingress", cmd, spec.root.join(log_name))?;
     Ok(SpawnedIngress {
         proc,
         metrics_addr: format!("127.0.0.1:{metrics_port}").parse()?,

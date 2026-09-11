@@ -1,14 +1,14 @@
 //! `kardamom-sequencer`: per-partition sequencer process.
 //!
-//! Parses a TOML [`SequencerConfig`], opens its shard's `tx_data` subscriber,
-//! the Aeron Cluster (Raft) ref publisher (`tx_ordering`), and a `tx_errors`
-//! publisher for rejection signals. Runs the sequencer main loop on a
-//! dedicated blocking thread until SIGTERM or Ctrl-C.
+//! Parses a TOML [`SequencerConfig`], opens one `tx_data` subscriber per
+//! lane it reads, the Aeron Cluster (Raft) ref publisher (`tx_ordering`),
+//! and a `tx_errors` publisher for rejection signals. Runs the sequencer
+//! main loop on a dedicated blocking thread until SIGTERM or Ctrl-C.
 //!
-//! The lag-detection and receipt-floor feed threads live in [`feeds`].
-//! The `aeron_live` handles implement the sequencer's subscriber/publisher
-//! traits directly (`kardamom_sequencer::{inbound, epoch, remote_epoch,
-//! outbound}`), so no local adapter wrappers are needed here.
+//! The lag-detection, receipt-floor, and nonce-lookup feed tasks live in
+//! [`feeds`]. The `aeron_live` handles implement the sequencer's
+//! subscriber/publisher traits directly (`kardamom_sequencer::{epoch,
+//! remote_epoch, outbound}`); the lane set is [`feeds::LaneSubscriptions`].
 
 mod feeds;
 
@@ -25,9 +25,11 @@ use kardamom_log::aeron_live::{
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_sequencer::config::SequencerConfig;
+use kardamom_sequencer::lookup::LookupRequester;
 use kardamom_sequencer::sequencer::Shutdown;
+use kardamom_types::shard_map::VslotSet;
 
-use feeds::PublishLoops;
+use feeds::{LaneSub, LaneSubscriptions, PublishLoops};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -76,6 +78,28 @@ struct Args {
     /// `partition_index as u8`.
     #[arg(long)]
     sequencer_id: Option<u8>,
+    /// The own `tx_data` lane (`lane`). Defaults to the sequencer id.
+    #[arg(long, env = "KARDAMOM_LANE")]
+    lane: Option<u8>,
+    /// The vslots this replica serves (`vslots`), as ranges: `0-7,16`.
+    /// Defaults to the identity map over the partition count.
+    #[arg(long, env = "KARDAMOM_VSLOTS")]
+    vslots: Option<VslotSet>,
+    /// The old lanes to read during a resize (`extra_lanes`).
+    #[arg(long, env = "KARDAMOM_EXTRA_LANES", value_delimiter = ',')]
+    extra_lanes: Vec<u8>,
+    /// The incoming vslots that start in shadow mode (`shadow_vslots`).
+    #[arg(long, env = "KARDAMOM_SHADOW_VSLOTS")]
+    shadow_vslots: Option<VslotSet>,
+    /// The shadow warm-up in ms (`shadow_warm_ms`). Defaults to
+    /// `tx_ttl_ms + 5000`.
+    #[arg(long, env = "KARDAMOM_SHADOW_WARM_MS")]
+    shadow_warm_ms: Option<u64>,
+    /// The lifetime of a transaction that waits on a nonce gap, in ms
+    /// (`tx_ttl_ms`). The deploy passes the same value to the ingress as
+    /// `--pending-receipt-timeout-ms`. Zero is rejected.
+    #[arg(long, env = "KARDAMOM_TX_TTL_MS")]
+    tx_ttl_ms: Option<NonZeroU64>,
     /// Override the CPU core to pin to.
     #[arg(long)]
     core_id: Option<usize>,
@@ -103,6 +127,11 @@ struct Args {
     /// Boundary-silence resync trigger, ms (`[resync] boundary_silence_ms`).
     #[arg(long, env = "KARDAMOM_RESYNC_BOUNDARY_SILENCE_MS")]
     resync_boundary_silence_ms: Option<u64>,
+    /// The executor nonce query endpoints, as a comma-separated list of
+    /// `http://host:port` (`[lookup] executor_endpoints`). Empty means no
+    /// lookup. See `docs/specs/dynamic-sequencer-sizing.md`, section 3.4.
+    #[arg(long, env = "KARDAMOM_EXECUTOR_QUERY_ENDPOINTS", value_delimiter = ',')]
+    executor_query_endpoints: Vec<String>,
     /// Executor replica count for the `tx_receipts` MDS fan-in (parity with
     /// the validator). Falls back to `channels.tx_receipts_executor_count`.
     /// Not relevant when receipts ride multicast (the cluster deploy).
@@ -111,7 +140,8 @@ struct Args {
 }
 
 /// Fold the CLI and env overrides into the TOML-loaded config:
-/// partition index and count, the replica-group shard rotation,
+/// partition index and count, the lane and vslot layout, the transaction
+/// lifetime, the lookup endpoints, the replica-group shard rotation,
 /// sequencer id fallback, core pin, per-node cluster egress endpoint, and
 /// the resync contract settings.
 fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
@@ -121,6 +151,7 @@ fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
     if let Some(m) = args.partition_count {
         cfg.partition_count = kardamom_sequencer::partition::PartitionCount::new(m);
     }
+    apply_layout_overrides(args, cfg);
     if args.partition_offset != 0 {
         // An explicit --sequencer-id combined with rotation would
         // subscribe to tx_data stream `sequencer_id`, while the
@@ -174,21 +205,58 @@ fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
     Ok(())
 }
 
+/// The lane, vslot, shadow, lifetime, and lookup overrides of
+/// [`apply_cli_overrides`]. A flag left unset keeps the TOML value.
+fn apply_layout_overrides(args: &Args, cfg: &mut SequencerConfig) {
+    if let Some(ttl) = args.tx_ttl_ms {
+        cfg.tx_ttl_ms = ttl;
+    }
+    if !args.executor_query_endpoints.is_empty() {
+        cfg.lookup
+            .executor_endpoints
+            .clone_from(&args.executor_query_endpoints);
+    }
+    if let Some(lane) = args.lane {
+        cfg.lane = Some(lane);
+    }
+    if let Some(set) = args.vslots {
+        cfg.vslots = Some(set);
+    }
+    if !args.extra_lanes.is_empty() {
+        cfg.extra_lanes.clone_from(&args.extra_lanes);
+    }
+    if let Some(set) = args.shadow_vslots {
+        cfg.shadow_vslots = set;
+    }
+    if let Some(warm) = args.shadow_warm_ms {
+        cfg.shadow_warm_ms = Some(warm);
+    }
+}
+
 /// The Aeron subscriptions and publisher this sequencer needs, all opened
 /// on the same runtime `rt`.
 struct Handles {
-    data_sub: TxDataSubscriberHandle,
+    /// One subscription per lane: the own lane, then the old lanes of a
+    /// resize. Every lane shares the multicast group; a lane is a stream
+    /// id. The shadow warm-up starts when the sequencer is constructed,
+    /// after these open.
+    data_subs: LaneSubscriptions,
     deposits_sub: TxDepositsSubscriberHandle,
     remote_epochs_sub: TxRemoteEpochsSubscriberHandle,
     errors_pub: TxErrorsPublisherHandle,
 }
 
 impl Handles {
-    /// Open every handle this sequencer needs, for `shard_id`.
-    fn open(rt: &AeronRuntime, channels: &ChannelsConfig, shard_id: u8) -> Result<Self> {
+    /// Open every handle this sequencer needs, for the lanes of `cfg`.
+    fn open(rt: &AeronRuntime, channels: &ChannelsConfig, cfg: &SequencerConfig) -> Result<Self> {
+        let own = Self::open_lane(rt, channels, cfg.lane())?;
+        let old = cfg
+            .extra_lanes
+            .iter()
+            .map(|lane| Self::open_lane(rt, channels, *lane))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            data_sub: TxDataSubscriberHandle::open(rt, channels, shard_id)
-                .context("open TxDataSubscriberHandle")?,
+            data_subs: LaneSubscriptions::new(own, old),
             deposits_sub: TxDepositsSubscriberHandle::open(rt, channels)
                 .context("open TxDepositsSubscriberHandle")?,
             remote_epochs_sub: TxRemoteEpochsSubscriberHandle::open(rt, channels)
@@ -197,23 +265,35 @@ impl Handles {
                 .context("open TxErrorsPublisherHandle")?,
         })
     }
+
+    /// Open the `tx_data` subscription of one lane.
+    fn open_lane(rt: &AeronRuntime, channels: &ChannelsConfig, lane: u8) -> Result<LaneSub> {
+        let handle = TxDataSubscriberHandle::open(rt, channels, lane)
+            .with_context(|| format!("open TxDataSubscriberHandle lane={lane}"))?;
+        Ok(LaneSub { lane, handle })
+    }
 }
 
-/// Lag detection and receipt-floor resync: the egress-watermark task, the
-/// receipts-floor task, and the `ResyncController` handed to the publish
-/// loops. Split from the controller into its own field, so the caller
-/// can move `controller` into the publish loops and still join the two
-/// feed tasks afterward through `feeds`.
+/// Lag detection, receipt-floor resync, and the nonce lookup: the
+/// egress-watermark task, the receipts-floor task, the lookup task, the
+/// `ResyncController` and the `LookupRequester` handed to the publish
+/// loops. The feed tasks sit in their own field, so the caller can move
+/// `controller` and `lookup` into the publish loops and still join the
+/// tasks afterward through `feeds`.
 struct ResyncWiring {
     controller: kardamom_sequencer::resync::ResyncController,
+    /// `None` when the config has no executor query endpoints.
+    lookup: Option<LookupRequester>,
     feeds: ResyncFeeds,
 }
 
-/// The egress-watermark and receipts-floor tasks, plus the `tx_data`
-/// runtime.
+/// The egress-watermark, receipts-floor, and nonce-lookup tasks, plus the
+/// `tx_data` runtime.
 struct ResyncFeeds {
     watermark_task: tokio::task::JoinHandle<()>,
     receipts_task: tokio::task::JoinHandle<()>,
+    /// `None` when the nonce lookup is off.
+    lookup_task: Option<tokio::task::JoinHandle<()>>,
     #[allow(
         dead_code,
         reason = "held only so main_rt (the tx_data runtime) drops after the two feed tasks above are joined (see ResyncFeeds::join), and before the caller's receipts_rt goes out of scope — matching the resource teardown order the two runtimes' isolation comments assume; never read, its value is its Drop impl"
@@ -229,6 +309,13 @@ impl ResyncFeeds {
         }
         if let Err(e) = self.receipts_task.await {
             tracing::warn!(?e, "receipts-floors task panicked");
+        }
+        // The lookup task exits on the token, or on the closed request
+        // channel after the main loop ends.
+        if let Some(task) = self.lookup_task
+            && let Err(e) = task.await
+        {
+            tracing::warn!(?e, "nonce-lookup task panicked");
         }
     }
 }
@@ -282,18 +369,47 @@ impl ResyncWiring {
             executor_count.or(channels.tx_receipts_executor_count),
         )
         .context("open tx_receipts")?;
-        let receipts_task =
-            feeds::ReceiptFloorFeed::new(cfg.partition_count, cfg.partition_index, floor_tx)
-                .spawn(receipts_sub, shutdown.clone());
+        let vslots = cfg.vslot_set().context("vslots")?;
+        let receipts_task = feeds::ReceiptFloorFeed::new(vslots, floor_tx.clone())
+            .spawn(receipts_sub, shutdown.clone());
+
+        // The nonce lookup task. It shares the floor channel with the
+        // receipts feed: an executor's committed nonce is floor evidence
+        // of the same kind as a receipt.
+        let (lookup, lookup_task) = Self::spawn_lookup(cfg, floor_tx, shutdown)?;
 
         Ok(Self {
             controller,
+            lookup,
             feeds: ResyncFeeds {
                 watermark_task,
                 receipts_task,
+                lookup_task,
                 main_rt,
             },
         })
+    }
+
+    /// Spawn the nonce lookup task when the config names executor
+    /// endpoints. Returns the requester for the publish loop and the task
+    /// handle, or `None` for both when the lookup is off.
+    #[allow(
+        clippy::type_complexity,
+        reason = "one optional pair, read once by the caller"
+    )]
+    fn spawn_lookup(
+        cfg: &SequencerConfig,
+        floor_tx: crossbeam_channel::Sender<kardamom_sequencer::resync::FloorUpdate>,
+        shutdown: &Shutdown,
+    ) -> Result<(Option<LookupRequester>, Option<tokio::task::JoinHandle<()>>)> {
+        if !cfg.lookup.enabled() {
+            return Ok((None, None));
+        }
+        let (requester, rx) = LookupRequester::channel();
+        let task = feeds::NonceLookupFeed::new(cfg.lookup.clone(), cfg.partition_index, floor_tx)
+            .context("nonce lookup: http client build failed")?
+            .spawn(rx, shutdown.clone());
+        Ok((Some(requester), Some(task)))
     }
 }
 
@@ -334,6 +450,28 @@ impl SpawnedLoops {
     }
 }
 
+/// Say where committed nonce floors come from: the `tx_receipts` stream,
+/// and the executor nonce lookup when the config names endpoints.
+fn log_nonce_floor_sources(cfg: &SequencerConfig) {
+    if cfg.lookup.enabled() {
+        tracing::info!(
+            endpoints = ?cfg.lookup.executor_endpoints,
+            timeout_ms = cfg.lookup.timeout_ms.get(),
+            max_in_flight = cfg.lookup.max_in_flight.get(),
+            "nonce floors: cold senders seed at 0; committed floors come from the \
+             tx_receipts stream and from the executor nonce lookup, so a restarted \
+             replica regains an established sender on its first park (F02.1 closed)"
+        );
+    } else {
+        tracing::warn!(
+            "nonce floors: no executor query endpoints; cold senders seed at 0 and \
+             committed floors come from the tx_receipts stream only. A restarted \
+             replica does NOT regain coverage of an established sender until a \
+             receipt arrives (F02.1). Set --executor-query-endpoints."
+        );
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
@@ -356,6 +494,12 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         partition_index = cfg.partition_index,
         sequencer_id = cfg.sequencer_id,
+        tx_ttl_ms = cfg.tx_ttl_ms.get(),
+        lane = cfg.lane(),
+        extra_lanes = ?cfg.extra_lanes,
+        vslots = %cfg.vslot_set().context("vslots")?,
+        shadow_vslots = %cfg.shadow_vslots,
+        shadow_warm_ms = kardamom_types::time::duration_to_ms_saturating(cfg.shadow_warm()),
         "kardamom-sequencer starting"
     );
 
@@ -364,18 +508,11 @@ async fn main() -> anyhow::Result<()> {
         .channels;
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
 
-    let shard_id = cfg.sequencer_id;
-    let handles = Handles::open(&rt, &channels, shard_id)?;
+    let handles = Handles::open(&rt, &channels, &cfg)?;
 
     let shutdown = Shutdown::new();
 
-    tracing::info!(
-        "nonce floors: sequencer holds no state-DB reader; cold senders seed at \
-         0 and committed floors are recovered from the tx_receipts stream via \
-         the receipt-floor resync. NOTE: a restarted replica does NOT regain \
-         coverage of established senders until resync floors catch up (F02.1 \
-         re-opened)"
-    );
+    log_nonce_floor_sources(&cfg);
 
     // tx_ordering always publishes to the Aeron Cluster (Raft) ingress. The
     // cluster-session guard (`LiveCluster`) and its dedicated Aeron runtime
@@ -418,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
     // origin pumps.
     let (join_main, join_deposits, join_remote_epochs) = PublishLoops {
         cfg: cfg.clone(),
-        tx_data: handles.data_sub,
+        tx_data: handles.data_subs,
         main_pub: cluster_pub.clone(),
         epoch_pub: cluster_pub.clone(),
         remote_epoch_pub: cluster_pub,
@@ -426,6 +563,7 @@ async fn main() -> anyhow::Result<()> {
         epochs: handles.deposits_sub,
         remote_epochs: handles.remote_epochs_sub,
         resync: Some(resync.controller),
+        lookup: resync.lookup,
         shutdown: shutdown.clone(),
     }
     .spawn();

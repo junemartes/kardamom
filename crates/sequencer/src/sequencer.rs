@@ -48,15 +48,17 @@
 //! fakes used by tests.
 
 use std::ops::ControlFlow;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kardamom_types::num::usize_to_u64;
+use kardamom_types::shard_map::{VslotSet, vslot_for};
 use kardamom_types::{BPosition, TxError, TxErrorReason};
 use tracing::{trace, warn};
 
 use crate::config::{ConfigError, SequencerConfig};
 use crate::error::SequencerError;
-use crate::inbound::TxDataSubscriber;
+use crate::inbound::{Inbound, TxDataSubscriber};
+use crate::lookup::LookupRequester;
 use crate::metrics;
 use crate::nonce_decode::decode_nonce;
 use crate::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
@@ -82,6 +84,12 @@ struct RefMetadata {
     correlation_id: u64,
     /// Carries through to `TxRef.tx_hash`.
     tx_hash: alloy_primitives::B256,
+    /// The `tx_data` lane that holds the envelope. Carries through to
+    /// `TxRef.shard_id`. The executor joins the ref against the archive of
+    /// this lane. The subscription that received the envelope sets it. A
+    /// resize lets one sequencer read several lanes (see
+    /// `docs/specs/dynamic-sequencer-sizing.md`).
+    lane: u8,
     /// The Aeron-offer position the proxy got back when it published this
     /// envelope onto `tx_data`. Downstream consumers use this to look up
     /// the envelope on the A archive.
@@ -130,6 +138,51 @@ where
     }
 }
 
+/// A resize warm-up in progress: the slots in shadow mode, and when the
+/// mode ends. In shadow mode the state machine runs for these slots, but
+/// the ref publisher and the `tx_errors` publisher stay silent. The
+/// value exists only while at least one slot is in shadow.
+#[derive(Debug, Clone, Copy)]
+struct ShadowWindow {
+    vslots: VslotSet,
+    until: Instant,
+}
+
+/// The last pending-depth report: when it ran, and the depths it
+/// reported. The report runs once per second and emits only the changed
+/// vslots.
+#[derive(Debug, Clone, Copy)]
+struct DepthReport {
+    at: Instant,
+    depths: [u32; 256],
+}
+
+impl DepthReport {
+    /// The report interval.
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    fn new(now: Instant) -> Self {
+        Self {
+            at: now,
+            depths: [0; 256],
+        }
+    }
+
+    /// Emit the changed vslots of `depths` for `partition`, if the interval
+    /// has passed, and remember them.
+    fn tick(&mut self, now: Instant, partition: u32, depths: &[u32; 256]) {
+        if now.duration_since(self.at) < Self::INTERVAL {
+            return;
+        }
+        self.at = now;
+        (0u8..=u8::MAX)
+            .zip(depths.iter().zip(self.depths.iter()))
+            .filter(|(_, (new, old))| new != old)
+            .for_each(|(vslot, (new, _))| metrics::record_pending_depth(partition, vslot, *new));
+        self.depths = *depths;
+    }
+}
+
 pub struct Sequencer {
     cfg: SequencerConfig,
     state: PartitionState<RefMetadata>,
@@ -146,6 +199,15 @@ pub struct Sequencer {
     /// [`crate::unconfirmed`] for the ledger semantics and the
     /// expiry-queue mechanics.
     unconfirmed: UnconfirmedLedger<RefMetadata>,
+    /// The nonce lookup seam. `None` when the binary has no executor
+    /// endpoints (tests, IPC dev runs). See [`crate::lookup`].
+    lookup: Option<LookupRequester>,
+    /// The virtual slots this replica serves. The wrong-shard guard drops
+    /// an envelope outside the set.
+    vslots: VslotSet,
+    /// The resize warm-up, while one is in progress.
+    shadow: Option<ShadowWindow>,
+    depth: DepthReport,
 }
 
 impl Sequencer {
@@ -159,13 +221,82 @@ impl Sequencer {
         cfg.validate()?;
         let cap = cfg.max_pending_per_sender;
         let hot = metrics::HotMetrics::new(cfg.partition_index);
+        let vslots = cfg.vslot_set()?;
+        // The warm-up starts here. The binary constructs the sequencer
+        // after it opened every lane subscription, so this is the moment
+        // the old lanes are open. The margin in `shadow_warm` covers the
+        // join.
+        let now = Instant::now();
+        let shadow = (!cfg.shadow_vslots.is_empty()).then(|| ShadowWindow {
+            vslots: cfg.shadow_vslots,
+            until: now + cfg.shadow_warm(),
+        });
+        metrics::record_shadow_vslots(cfg.partition_index, cfg.shadow_vslots.len());
         Ok(Self {
+            state: PartitionState::new(cap, cfg.tx_ttl()),
             cfg,
             hot,
-            state: PartitionState::new(cap),
             resync: None,
             unconfirmed: UnconfirmedLedger::new(),
+            lookup: None,
+            vslots,
+            shadow,
+            depth: DepthReport::new(now),
         })
+    }
+
+    /// The virtual slots this replica serves.
+    #[must_use]
+    pub fn vslots(&self) -> &VslotSet {
+        &self.vslots
+    }
+
+    /// The slots still in shadow mode. Empty outside a resize warm-up.
+    #[must_use]
+    pub fn shadow_vslots(&self) -> VslotSet {
+        self.shadow.map_or(VslotSet::EMPTY, |s| s.vslots)
+    }
+
+    /// True when `sender` is in a shadow slot. Cheap outside a warm-up:
+    /// no hash runs.
+    #[inline]
+    fn in_shadow(&self, sender: alloy_primitives::Address) -> bool {
+        self.shadow
+            .is_some_and(|s| s.vslots.contains(vslot_for(sender)))
+    }
+
+    /// Publish a `tx_errors` event, unless the sender is in shadow mode.
+    /// The shard that publishes the refs also owns the errors.
+    fn publish_error<R>(&self, rc: &mut R, err: TxError)
+    where
+        R: TxErrorPublisher,
+    {
+        if self.in_shadow(err.sender) {
+            return;
+        }
+        rc.publish_error(err);
+    }
+
+    /// End shadow mode when the warm-up has passed. After the warm-up,
+    /// this replica's buffers are a superset of the old shard's live
+    /// state for the incoming slots, so publishing in parallel is safe:
+    /// both shards publish identical refs, and the sealer dedups them.
+    fn shadow_tick(&mut self, now: Instant) {
+        let Some(window) = self.shadow.filter(|s| now >= s.until) else {
+            return;
+        };
+        tracing::info!(
+            vslots = %window.vslots,
+            "shadow warm-up passed; publishing for the incoming vslots"
+        );
+        self.shadow = None;
+        metrics::record_shadow_vslots(self.cfg.partition_index, 0);
+    }
+
+    /// Enable the nonce lookup. A park of a sender with no known floor
+    /// then asks the lookup task for the sender's committed nonce.
+    pub fn enable_nonce_lookup(&mut self, lookup: LookupRequester) {
+        self.lookup = Some(lookup);
     }
 
     /// Enable lag detection and receipt-floor resync. The controller
@@ -190,10 +321,10 @@ impl Sequencer {
 
     /// Build the wire `TxRef` for a drained ref (shared by the single and
     /// batch publish paths).
-    fn make_txref(&self, meta: &RefMetadata) -> kardamom_types::TxRef {
+    fn make_txref(meta: &RefMetadata) -> kardamom_types::TxRef {
         kardamom_types::TxRef::new(
             meta.tx_hash,
-            self.cfg.sequencer_id,
+            meta.lane,
             meta.tx_data_position,
             meta.tx_data_session_id,
         )
@@ -215,13 +346,39 @@ impl Sequencer {
     {
         // Chunked batch publish; see `flush_chunk`'s doc for the chunk
         // size and the MTU budget behind it.
-        let mut rest = std::collections::VecDeque::from(drained);
+        let mut rest = std::collections::VecDeque::from(self.suppress_shadow(drained, ctx));
         while !rest.is_empty() {
             if let ControlFlow::Break(result) = self.flush_chunk(b, &mut rest, ctx) {
                 return result;
             }
         }
         Ok(())
+    }
+
+    /// In shadow mode, the refs of the shadow slots advance the state
+    /// machine and nothing else. The old shard publishes them. They
+    /// enter no ledger: only the shard that offered a ref owns its
+    /// republish. Per-sender order survives the split, and the order
+    /// across senders does not matter to the canonical log. Returns the
+    /// refs that stay to be offered.
+    fn suppress_shadow(
+        &mut self,
+        drained: Vec<(alloy_primitives::Address, u64, RefMetadata)>,
+        ctx: &'static str,
+    ) -> Vec<(alloy_primitives::Address, u64, RefMetadata)> {
+        if self.shadow.is_none() {
+            return drained;
+        }
+        let (shadow, live): (Vec<_>, Vec<_>) = drained
+            .into_iter()
+            .partition(|(sender, _, _)| self.in_shadow(*sender));
+        if !shadow.is_empty() {
+            self.hot
+                .shadow_suppressed
+                .increment(usize_to_u64(shadow.len()));
+            trace!(count = shadow.len(), ctx, "shadow mode: refs not offered");
+        }
+        live
     }
 
     /// One [`Self::flush_drained`] chunk: publish up to `BATCH_MAX` refs
@@ -252,7 +409,7 @@ impl Sequencer {
         let refs: Vec<(kardamom_types::TxRef, alloy_primitives::Address, u64)> = rest
             .iter()
             .take(chunk)
-            .map(|(s, n, m)| (self.make_txref(m), *s, *n))
+            .map(|(s, n, m)| (Self::make_txref(m), *s, *n))
             .collect();
         let (published, err) = b.try_publish_ref_batch(&refs);
         self.record_published_prefix(rest, published, ctx);
@@ -351,7 +508,7 @@ impl Sequencer {
         for (sender, floor) in raised {
             self.apply_one_floor_update(sender, floor);
         }
-        r.observe(std::time::Instant::now());
+        r.observe(Instant::now());
     }
 
     /// One receipt-proven floor update, for [`Self::apply_receipt_drain`]'s
@@ -435,7 +592,7 @@ impl Sequencer {
     /// gap, no loss). Bounded per iteration.
     fn sweep_confirm_timeouts(&mut self) {
         let timeout = std::time::Duration::from_millis(self.cfg.resync.confirm_timeout_ms);
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let expired = self.unconfirmed.sweep_expired(timeout, now, 256);
         if !expired.is_empty() {
             metrics::record_ref_republished(self.cfg.partition_index, expired.len());
@@ -472,6 +629,67 @@ impl Sequencer {
             .is_some_and(|r| r.floor(sender).is_some_and(|f| f > nonce))
     }
 
+    /// Ask for the committed nonce of `sender` after a park, when no
+    /// receipt has proven a floor for it yet. A cold replica heals through
+    /// this. A sender with a known floor parks for an ordinary reason (a
+    /// gap the client has not filled), and a lookup would say nothing
+    /// new. The lookup task dedups senders and bounds the rate, so a
+    /// request per park is cheap. See [`crate::lookup`].
+    fn request_lookup(&mut self, sender: alloy_primitives::Address) {
+        let floor_known = self
+            .resync
+            .as_ref()
+            .is_some_and(|r| r.floor(sender).is_some());
+        let Some(lookup) = self.lookup.as_mut().filter(|_| !floor_known) else {
+            return;
+        };
+        self.hot.lookup_requests.increment(1);
+        lookup.request(sender);
+    }
+
+    /// Expire the parked entries whose lifetime (`tx_ttl`) has passed, and
+    /// tell their parked submit calls and receipt subscribers. An entry
+    /// waits on a nonce gap for at most `tx_ttl`. After that, the client
+    /// gets an explicit error and can resubmit once the gap fills. This
+    /// runs on every iteration, so an idle sequencer expires on time. The
+    /// sweep is bounded per iteration. See
+    /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.3.
+    fn expiry_tick<R>(&mut self, rc: &mut R)
+    where
+        R: TxErrorPublisher,
+    {
+        let now = Instant::now();
+        for (sender, nonce) in self.state.sweep_expired(now, 256) {
+            self.report_expired(rc, sender, nonce);
+        }
+        self.shadow_tick(now);
+        let depths = self.state.pending_depth_by(vslot_for);
+        self.depth.tick(now, self.cfg.partition_index, &depths);
+    }
+
+    /// One expired entry, for [`Self::expiry_tick`]'s loop: count it,
+    /// trace it, and report `Expired` to the client.
+    fn report_expired<R>(&self, rc: &mut R, sender: alloy_primitives::Address, nonce: u64)
+    where
+        R: TxErrorPublisher,
+    {
+        self.hot.expired.increment(1);
+        trace!(
+            sender = ?sender,
+            nonce,
+            "pending entry expired after tx_ttl; reporting Expired"
+        );
+        let expected_nonce = self.state.next_nonce(sender);
+        self.publish_error(
+            rc,
+            TxError {
+                sender,
+                nonce,
+                reason: TxErrorReason::Expired { expected_nonce },
+            },
+        );
+    }
+
     /// Tell an evicted transaction's parked submit call, and any receipt
     /// subscribers, that it will never be sequenced. A silent eviction
     /// would leave the client waiting forever, with its later nonces
@@ -480,13 +698,15 @@ impl Sequencer {
     where
         R: TxErrorPublisher,
     {
-        rc.publish_error(TxError {
-            sender,
-            nonce,
-            reason: TxErrorReason::Evicted {
-                expected_nonce: self.state.next_nonce(sender),
+        let expected_nonce = self.state.next_nonce(sender);
+        self.publish_error(
+            rc,
+            TxError {
+                sender,
+                nonce,
+                reason: TxErrorReason::Evicted { expected_nonce },
             },
-        });
+        );
     }
 
     /// Drive one ingress message through the state machine. Returns
@@ -509,6 +729,7 @@ impl Sequencer {
         // Resync bookkeeping runs first, every iteration. See `resync_tick`.
         self.resync_tick();
         let (channel_a, b, rc) = ports.split();
+        self.expiry_tick(rc);
 
         let pending = self.state.drain_pending();
         if !pending.is_empty() {
@@ -521,22 +742,30 @@ impl Sequencer {
         // canonical stream and fatally hit NonceTooHigh on every executor.
         // See PartitionState's note.
 
-        let Some((tx_data_loc, envelope)) = channel_a.poll()? else {
+        let Some(Inbound {
+            lane,
+            loc: tx_data_loc,
+            envelope,
+        }) = channel_a.poll()?
+        else {
             return Ok(false);
         };
         self.hot.ingest.increment(1);
 
         let sender = sender_of(&envelope);
 
-        // Defensive: drop messages routed to the wrong shard. Otherwise, a
-        // routing disagreement between proxy and sequencer would silently
-        // corrupt nonce state.
-        let part = self.cfg.partition_count.index_of(sender);
-        if part != self.cfg.partition_index {
-            warn!(
-                expected = self.cfg.partition_index,
-                got = part,
-                "tx_data envelope for wrong shard; skipping"
+        // The wrong-shard guard: drop an envelope whose vslot is not in
+        // this replica's set. A routing disagreement between the ingress
+        // and the sequencer would otherwise corrupt nonce state silently.
+        // During a resize, a new shard reads the old lanes whole, so most
+        // envelopes there belong to other shards. That is the normal
+        // case, so this is a counter and a trace, not a warning.
+        let vslot = vslot_for(sender);
+        if !self.vslots.contains(vslot) {
+            self.hot.wrong_shard.increment(1);
+            trace!(
+                lane,
+                vslot, "tx_data envelope outside this replica's vslots; skipping"
             );
             return Ok(true);
         }
@@ -561,11 +790,12 @@ impl Sequencer {
         let meta = RefMetadata {
             correlation_id: envelope.correlation_id,
             tx_hash: envelope.tx_hash,
+            lane,
             tx_data_position: tx_data_loc.position,
             tx_data_session_id: tx_data_loc.session_id,
         };
 
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let result = self.state.process(sender, nonce, meta);
         self.hot
             .nonce_check_seconds
@@ -593,14 +823,17 @@ impl Sequencer {
     {
         match result.outcome {
             NonceOutcome::Matched => {}
-            NonceOutcome::Buffered
-            | NonceOutcome::BufferedReplaced
-            | NonceOutcome::BufferedDisabled => {
+            NonceOutcome::Buffered | NonceOutcome::BufferedReplaced => {
+                self.hot.buffered_future.increment(1);
+                self.request_lookup(sender);
+            }
+            NonceOutcome::BufferedDisabled => {
                 self.hot.buffered_future.increment(1);
             }
             NonceOutcome::BufferedEvicting { evicted_nonce } => {
                 self.hot.buffered_future.increment(1);
                 self.hot.evictions.increment(1);
+                self.request_lookup(sender);
                 self.report_evicted(rc, sender, evicted_nonce);
             }
             NonceOutcome::RejectedTooFar { nonce: rejected } => {
@@ -678,11 +911,14 @@ impl Sequencer {
                 expected_nonce,
             } => {
                 if !self.proven_executed(sender, n) {
-                    rc.publish_error(TxError {
-                        sender,
-                        nonce: n,
-                        reason: TxErrorReason::DuplicatedTx { expected_nonce },
-                    });
+                    self.publish_error(
+                        rc,
+                        TxError {
+                            sender,
+                            nonce: n,
+                            reason: TxErrorReason::DuplicatedTx { expected_nonce },
+                        },
+                    );
                 }
             }
         }
@@ -748,7 +984,7 @@ impl Sequencer {
                 // cluster session, which maps here) is the publish-stall
                 // resync trigger.
                 if let Some(r) = self.resync.as_mut() {
-                    r.note_publish_stall(std::time::Instant::now());
+                    r.note_publish_stall(Instant::now());
                 }
                 std::thread::sleep(Duration::from_micros(10));
                 Ok(true)

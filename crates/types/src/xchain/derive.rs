@@ -92,6 +92,20 @@ impl<'a> Batch<'a> {
         })
     }
 
+    /// The record's KAR1 v2 wire size is at most
+    /// [`MAX_REMOTE_EPOCH_WIRE_BYTES`], so one record always fits in a DA
+    /// batch on its own.
+    fn check_wire_size(&self) -> Result<(), XChainError> {
+        let bytes = remote_epoch_wire_bytes(self.ordered.iter().map(|m| m.data.len()));
+        if bytes > MAX_REMOTE_EPOCH_WIRE_BYTES {
+            return Err(XChainError::RecordTooLarge {
+                bytes,
+                cap: MAX_REMOTE_EPOCH_WIRE_BYTES,
+            });
+        }
+        Ok(())
+    }
+
     /// The record's seq range fits in `u64`, with room for the next cursor
     /// (`last_seq + 1`), which the validator computes as its lane position.
     fn check_range_fits(&self) -> Result<(), XChainError> {
@@ -173,6 +187,7 @@ pub fn derive_remote_epoch(
     batch.check_destination(self_chain_id)?;
     batch.ordered.iter().try_for_each(|m| m.check_bounds())?;
     batch.check_one_block()?;
+    batch.check_wire_size()?;
 
     let to_xchain_message = |m: &OutboxMessage| XChainMessage {
         source_hash: remote_source_hash(origin_chain_id, m.seq),
@@ -199,12 +214,54 @@ pub fn derive_remote_epoch(
     })
 }
 
+/// Fixed bytes one [`RemoteEpochRecord`] adds to the KAR1 v2 DA frame,
+/// before its messages: `origin_chain_id` (8) + `anchor_number` (8) +
+/// `anchor_hash` (32) + `first_seq` (8) + `msg_count` (4).
+pub const REMOTE_EPOCH_FIXED_WIRE_BYTES: usize = 8 + 8 + 32 + 8 + 4;
+
+/// Fixed bytes one [`XChainMessage`] adds to the KAR1 v2 DA frame, on top
+/// of its calldata: `source_hash` (32) + `seq` (8) + `origin_sender` (20) +
+/// `target` (20) + `value` (16) + `gas_limit` (8) + `input_len` (4) +
+/// callback flag (1) + callback body (20 + 8 + 32). The callback body is
+/// always charged, so the bound holds with or without a callback.
+pub const XCHAIN_MSG_FIXED_WIRE_BYTES: usize = 32 + 8 + 20 + 20 + 16 + 8 + 4 + 1 + 20 + 8 + 32;
+
+/// Cap on the KAR1 v2 wire size of one [`RemoteEpochRecord`]. See
+/// [`remote_epoch_wire_bytes`]. [`derive_remote_epoch`] rejects a larger
+/// record.
+///
+/// Arithmetic: one EIP-4844 blob carries 4096 field elements of 31 payload
+/// bytes each, `126_976` bytes. The batcher posts at most 6 blobs per batch,
+/// and it must post a block that holds one record on its own. Five blobs
+/// hold `634_880` bytes. The batcher also adds a 4-byte length prefix, a
+/// 12-byte KAR1 header, a 24-byte block header, and zero or more L2 txs.
+/// A 4_096-byte headroom covers the headers. So one record at the cap,
+/// alone in a block, fits in 5 blobs, fewer than the 6-blob ceiling.
+/// A record that carries 65_536-byte calldata in every message holds at
+/// most 9 messages under this cap.
+pub const MAX_REMOTE_EPOCH_WIRE_BYTES: usize = 5 * 126_976 - 4_096;
+
+/// The KAR1 v2 wire size of one record whose messages carry calldata of
+/// the given lengths: [`REMOTE_EPOCH_FIXED_WIRE_BYTES`] plus
+/// [`XCHAIN_MSG_FIXED_WIRE_BYTES`] and the calldata length per message.
+/// Saturates at `usize::MAX`, far past the cap.
+pub fn remote_epoch_wire_bytes(data_lens: impl IntoIterator<Item = usize>) -> usize {
+    data_lens
+        .into_iter()
+        .fold(REMOTE_EPOCH_FIXED_WIRE_BYTES, |acc, n| {
+            acc.saturating_add(XCHAIN_MSG_FIXED_WIRE_BYTES)
+                .saturating_add(n)
+        })
+}
+
 /// Why a remote epoch could not be derived. All variants are fail-stop for a
 /// verifier and bugs (or a malicious feed) for a producer.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum XChainError {
     #[error("remote epochs advance only with messages; an empty batch is invalid")]
     Empty,
+    #[error("remote epoch record is {bytes} wire bytes; the cap is {cap}")]
+    RecordTooLarge { bytes: usize, cap: usize },
     #[error("two outbox messages share seq {seq} for one origin")]
     DuplicateSeq { seq: u64 },
     #[error("outbox seq skipped: expected {expected}, found {found}")]

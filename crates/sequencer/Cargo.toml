@@ -46,7 +46,10 @@ kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true
 metrics.workspace = true
+# The nonce lookup client (`lookup`): one JSON-RPC POST per cold sender.
+reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true }
@@ -61,7 +64,6 @@ criterion.workspace = true
 # DHAT heap profiling for the ignored-by-default allocation harness
 # (tests/alloc_profile.rs) — same setup as crates/bench/tests/alloc_profile.rs.
 dhat = "0.3"
-reqwest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Pull in our own `testing` feature so integration tests under `tests/`
 # always have access to the `fakes` modules without needing

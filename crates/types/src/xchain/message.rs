@@ -270,6 +270,16 @@ impl<T> NonEmptyVec<T> {
         self.split().0
     }
 
+    /// The first element, for in-place edits. Always present.
+    ///
+    /// # Panics
+    ///
+    /// Never, in practice: `new` and the wire decoder both guarantee at
+    /// least one element.
+    pub fn first_mut(&mut self) -> &mut T {
+        self.0.first_mut().expect("non-empty by construction")
+    }
+
     /// The last element. Always present.
     #[must_use]
     pub fn last(&self) -> &T {

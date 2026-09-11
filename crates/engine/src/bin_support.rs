@@ -171,11 +171,13 @@ impl TxDataSubscription for LiveTxDataSub {
     }
 }
 
-/// Open the M per-shard `tx_data` subscriptions. Each subscription hands
-/// the engine's reader thread its tokio receiver directly. The reader
-/// thread blocks on it, off the tokio runtime. When the [`AeronRuntime`]
-/// drops, every subscription's sender closes. Then `next()` returns
-/// `TxDataClosed`.
+/// Open one `tx_data` subscription per lane of the lane plane
+/// (`LANE_COUNT`, today 8). A consumer does not know the active shard
+/// count. It reads every lane, and an idle lane costs one handle and one
+/// blocked reader thread. Each subscription hands the engine's reader
+/// thread its tokio receiver directly. The reader thread blocks on it,
+/// off the tokio runtime. When the [`AeronRuntime`] drops, every
+/// subscription's sender closes. Then `next()` returns `TxDataClosed`.
 ///
 /// This always uses live multicast, even on a crash-recovery resume: no
 /// consumer node records `tx_data`, so an archive replay-merge against the
@@ -191,16 +193,15 @@ impl TxDataSubscription for LiveTxDataSub {
 pub fn open_tx_data_subs(
     rt: &AeronRuntime,
     channels: &ChannelsConfig,
-    shards: std::num::NonZeroU8,
 ) -> Result<Vec<LiveTxDataSub>> {
-    (0..shards.get())
+    (0..kardamom_types::shard_map::LANE_COUNT)
         .map(|shard_id| {
             let rx = rt
                 .open_tx_data_subscription(
                     &channels.tx_data_channel(shard_id),
                     channels.tx_data_stream_id(shard_id),
                 )
-                .with_context(|| format!("open tx_data subscription shard={shard_id}"))?;
+                .with_context(|| format!("open tx_data subscription lane={shard_id}"))?;
             Ok(LiveTxDataSub {
                 sequencer_id: shard_id,
                 rx,
@@ -353,7 +354,6 @@ pub struct InboundConfig<'a> {
     pub rt: &'a AeronRuntime,
     pub channels: &'a ChannelsConfig,
     pub aeron_cfg: &'a AeronConfig,
-    pub shards: std::num::NonZeroU8,
     pub aeron_dir: Option<&'a Path>,
     pub archive_control_response_endpoint: Option<&'a str>,
     pub replay_destination_endpoint: Option<&'a str>,
@@ -385,7 +385,7 @@ pub fn open_inbound<W>(
 where
     W: crate::EngineWiring<TxData = LiveTxDataSub, TxOrdering = LiveTxOrderingSub>,
 {
-    let tx_data = open_tx_data_subs(cfg.rt, cfg.channels, cfg.shards)?;
+    let tx_data = open_tx_data_subs(cfg.rt, cfg.channels)?;
     let join_recovery = archive_join_recovery(
         cfg.channels,
         cfg.aeron_cfg,

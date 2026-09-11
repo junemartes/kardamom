@@ -15,6 +15,15 @@ pub fn usize_to_u64(n: usize) -> u64 {
     n as u64
 }
 
+/// Widen a `u32` count to `usize`, for a value that is `u32` on the wire
+/// but `usize` once held in memory. `usize` is at least 32 bits on every
+/// target this workspace builds for; the `const` assert pins it.
+#[must_use]
+pub fn u32_to_usize(n: u32) -> usize {
+    const _: () = assert!(usize::BITS >= u32::BITS);
+    n as usize
+}
+
 /// Widen a `NonZeroU32` count or index to `NonZeroUsize`, for a value
 /// that is `u32` on the wire but `usize` once held in memory.
 ///

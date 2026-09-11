@@ -24,8 +24,10 @@ use super::threads::ReaderToExec;
 /// available. It returns `Err(ExecutorError::TxDataClosed { sequencer_id })`
 /// when the subscription closes cleanly.
 pub trait TxDataSubscription: Send {
-    /// Sequencer id this subscription is bound to. It keys the join buffer
-    /// and appears in diagnostics.
+    /// The `tx_data` lane this subscription reads. The value is the lane
+    /// index, `TxRef::shard_id`. It names the archive that holds the
+    /// envelope, not the process that published the ref. It keys the join
+    /// buffer and appears in diagnostics.
     fn sequencer_id(&self) -> u8;
 
     /// # Errors

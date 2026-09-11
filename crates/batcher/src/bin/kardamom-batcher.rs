@@ -21,7 +21,7 @@
 //!     `kardamom-reconstruct` tool inverts.
 
 use std::net::SocketAddr;
-use std::num::{NonZeroU8, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use alloy_primitives::Address;
@@ -65,6 +65,12 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_compress: bool,
 
+    /// The L2 chain id of the chain this batcher posts for. The records
+    /// commitment digests each remote-epoch message leaf, and the leaf
+    /// commits to this id. Same default as the sibling services.
+    #[arg(long, env = "KARDAMOM_CHAIN_ID", default_value_t = 1)]
+    chain_id: u64,
+
     /// Skip L1 broadcast; only inspect the archive. Live posting requires
     /// `--dry-run=false` plus `--l1-rpc`, `--l1-key`, `--settlement`, and
     /// `--da-store`.
@@ -86,7 +92,7 @@ struct Cli {
     #[arg(long, env = "KARDAMOM_L1_RPC")]
     l1_rpc: Option<String>,
 
-    /// The batcher EOA private key (hex). Must equal the settlement's
+    /// The batcher EOA private key (hex). Must equal the `settlement`'s
     /// `l1Batcher`.
     #[arg(long, env = "KARDAMOM_L1_KEY")]
     l1_key: Option<String>,
@@ -107,11 +113,6 @@ struct Cli {
     /// Aeron media-driver directory.
     #[arg(long, env = "KARDAMOM_AERON_DIR")]
     aeron_dir: Option<PathBuf>,
-
-    /// Number of sender shards (`tx_data` channels to subscribe). Must be
-    /// nonzero: 0 opens no readers, so every join misses.
-    #[arg(long, default_value = "1")]
-    shards: NonZeroU8,
 
     /// This node's cluster-egress endpoint `ip:port`. It overrides the
     /// config's `egress_channel`, and the Nomad job injects it per node.
@@ -213,6 +214,7 @@ impl Cli {
             BatcherConfig {
                 blocks_per_batch: self.blocks_per_batch,
                 compress: !self.no_compress,
+                chain_id: self.chain_id,
                 ..Default::default()
             },
             MockSender::default(),
@@ -321,7 +323,6 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         cursor_file,
         log_config: cli.log_config.clone(),
         aeron_dir: cli.aeron_dir.clone(),
-        shards: cli.shards,
         cluster_egress_endpoint: cli.cluster_egress_endpoint.clone(),
         replay_destination_endpoint: cli.replay_destination_endpoint.clone(),
         archive_control_response_endpoint: cli.archive_control_response_endpoint.clone(),
@@ -329,6 +330,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         compress: !cli.no_compress,
         flush_ms: cli.flush_ms,
         l1_retries: cli.l1_retries,
+        chain_id: cli.chain_id,
     })
     .await
 }

@@ -151,7 +151,6 @@ job "validator" {
           # node; distinct ports keep captures and debugging
           # unambiguous.
           "--cluster-egress-endpoint", "${meta.node_ip}:40230",
-          "--shards", "2",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",
           # Use the validator's own state directory under the shared

@@ -161,15 +161,15 @@ val_metric_req() { # <metric-name> <why>
 # --- sequencer shard-0 replica probes ----------------------------------------
 
 seqa_metric() { # <metric-name> -> integer sum across label lines (empty on scrape failure)
-  # seq-a runs on node-0. The sequencer IP lane starts at .21, and seq-a
-  # exposes metrics on :9001. This tries the bridge IP first, then falls
+  # Lane 0's replica on node-0. The sequencer IP lane starts at .21, and
+  # lane 0 exposes metrics on :9001 (9001 + 10 * lane). This tries the bridge IP first, then falls
   # back to docker exec, mirroring assert_replica_healthy's probe.
   local body
   body="$(fetch_metrics 192.168.56.21 kardamom-sequencer-0 9001 || true)"
   prom_value "${body}" "$1" sum
 }
-seqb_twin_metric() { # <metric-name> — shard 0's replica B: seq-b on node-1 (.22:9011)
+seqb_twin_metric() { # <metric-name> — lane 0's other replica, on node-1 (.22:9001)
   local body
-  body="$(fetch_metrics 192.168.56.22 kardamom-sequencer-1 9011 || true)"
+  body="$(fetch_metrics 192.168.56.22 kardamom-sequencer-1 9001 || true)"
   prom_value "${body}" "$1" sum
 }
