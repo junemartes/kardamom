@@ -290,12 +290,21 @@ fn mds_executor_count_zero_is_rejected() {
 }
 
 #[test]
-fn non_mds_base_port_zero_is_rejected() {
-    // `BasePort` rejects 0 at parse time, MDS on or off. A garbage port
-    // value in a config file is an error, not dead data this loader
-    // ignores because MDS happens to be off.
-    let err = load("[channels]\ntx_receipts_endpoint_base_port = 0\n")
-        .expect_err("a zero base port must be rejected");
+fn non_mds_base_port_zero_loads_as_unset() {
+    // The deployed `channels.toml` renders `0` when MDS is off. It loads
+    // as `None`, the same as an absent key.
+    let f = write_tmp("[channels]\ntx_receipts_endpoint_base_port = 0\n");
+    let ch = LogConfig::from_toml_path(f.path())
+        .expect("a zero base port loads as unset")
+        .channels;
+    assert_eq!(ch.tx_receipts_endpoint_base_port, None);
+}
+
+#[test]
+fn non_mds_negative_base_port_is_rejected() {
+    // A garbage port value is an error, MDS on or off.
+    let err = load("[channels]\ntx_receipts_endpoint_base_port = -1\n")
+        .expect_err("a negative base port must be rejected");
     assert!(matches!(err, LogError::Config(_)), "got {err:?}");
 }
 
@@ -358,4 +367,17 @@ fn tx_receipts_boundary_stream_id_is_one_past_the_receipt_stream() {
         ch.tx_receipts_boundary_stream_id(),
         ch.tx_receipts_stream_id + 1
     );
+}
+
+#[test]
+fn the_deployed_channels_template_loads() {
+    // `deploy/cluster/config/channels.toml.tpl` is what every service in
+    // the container cluster reads. It must parse with this crate's types,
+    // zero sentinels included.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/cluster/config/channels.toml.tpl"
+    );
+    let cfg = LogConfig::from_toml_path(Path::new(path)).expect("deployed channels.toml.tpl loads");
+    assert_eq!(cfg.channels.tx_receipts_endpoint_base_port, None);
 }

@@ -550,4 +550,20 @@ mod tests {
         };
         assert!(matches!(cfg.validate(), Err(ConfigError::Resync(_))));
     }
+
+    #[test]
+    fn the_deployed_sequencer_template_loads_and_validates() {
+        // `deploy/cluster/config/sequencer.toml.tpl` is what the container
+        // cluster's sequencers read. It must parse with this crate's types
+        // and pass `validate`.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/cluster/config/sequencer.toml.tpl"
+        );
+        let raw = std::fs::read_to_string(path).expect("read the deployed template");
+        let cfg: SequencerConfig =
+            toml::from_str(&raw).expect("deployed sequencer.toml.tpl parses");
+        cfg.validate()
+            .expect("deployed sequencer.toml.tpl validates");
+    }
 }

@@ -48,6 +48,18 @@ impl TryFrom<i32> for BasePort {
     }
 }
 
+/// The TOML form of `tx_receipts_endpoint_base_port`: absent or `0` is
+/// "unset", any other value must be a valid [`BasePort`].
+fn base_port_or_unset<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<BasePort>, D::Error> {
+    let raw = Option::<i32>::deserialize(d)?;
+    raw.filter(|v| *v != 0)
+        .map(BasePort::try_from)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
 impl From<BasePort> for i32 {
     fn from(value: BasePort) -> Self {
         i32::from(value.0.get())
@@ -308,10 +320,11 @@ pub struct ChannelsConfig {
     pub tx_receipts_endpoint_host: String,
     /// Base UDP port for per-replica receipt endpoints. Replica `i` uses
     /// `base_port + 2*i` for receipts and `+ 2*i + 1` for boundaries.
-    /// `None` (the default) unless MDS is enabled. A TOML value of `0` or
-    /// less is a config error, MDS on or off: a non-positive port is
-    /// always a mistake, never a value this loader ignores.
-    #[serde(default)]
+    /// `None` unless MDS is enabled: the key is absent, or it is `0`, the
+    /// value the deployed `channels.toml` renders when MDS is off. A
+    /// negative value, or a value past 65535, is a config error, MDS on or
+    /// off. With MDS on, [`Self::validate`] requires a port.
+    #[serde(default, deserialize_with = "base_port_or_unset")]
     pub tx_receipts_endpoint_base_port: Option<BasePort>,
     /// Egress/ingress NIC subnet pinned on the per-replica receipt and
     /// boundary endpoints (for example `192.168.56.0/24`), appended as
