@@ -1,19 +1,46 @@
-# kardamom LogConfig for the multi-host cluster (Aeron UDP multicast).
+# kardamom LogConfig for the multi-host cluster.
 #
 # Every pipeline service is launched with `--log-config /local/channels.toml`.
 # The file deserializes into `kardamom_log::config::LogConfig` (schema:
 # crates/log/src/config/mod.rs). A field omitted here inherits the built-in
 # default; an unknown key is rejected.
 #
-# Transport model: every application channel is a UDP multicast group. One
-# shared URI is valid on every node, so no per-node rendering is needed.
+# Transport model: `[discovery]` is on, so every application stream is a
+# dynamic Aeron MDC publication that registers its control endpoint with
+# the local Consul agent, and every consumer joins the publishers the
+# catalog lists through one multi-destination subscription per stream. The
+# `[channels]` URIs below name the stream ids; their multicast groups apply
+# only with `[discovery] enabled = false`, the single-transport fallback.
+# See docs/aeron-discovery.md for the contract and the ports each job
+# allocates.
+#
 # The canonical order (tx_ordering) rides the Aeron Cluster (Raft) sealer,
 # through the [cluster] section of each service config, not a channel here.
 #
-# Address plan: multicast DATA groups are ODD on 192.168.56.0/24 (the driver
-# derives the even control address as data-1), spaced by 2 so derived control
-# addresses never collide; `interface` pins egress, ttl=1 keeps traffic on-
-# segment.
+# Address plan of the fallback groups: multicast DATA groups are ODD on
+# 192.168.56.0/24 (the driver derives the even control address as data-1),
+# spaced by 2 so derived control addresses never collide; `interface` pins
+# egress, ttl=1 keeps traffic on-segment.
+
+[discovery]
+# On: the dynamic MDC transport with Consul discovery. Off: the static
+# multicast groups below.
+enabled = true
+# The local Consul agent (ansible/roles/consul; client_addr 0.0.0.0).
+consul_http_addr = "http://127.0.0.1:8500"
+# The discovery scope. chain_id mirrors group_vars/all.yml chain_id;
+# scripts/check-contract.py checks the mirror.
+cluster_id = "dev"
+chain_id = 412346
+datacenter = "dc1"
+# The cluster NIC every control endpoint and receive endpoint binds
+# (group_vars/all.yml ip_prefix).
+advertise_interface = "192.168.56.0/24"
+# The Aeron flow control of every publication, as the `fc` URI parameter.
+# Empty keeps the driver default, the same policy the multicast groups
+# use: the fastest receiver paces the publisher, a lagging consumer
+# recovers through the archive refetch, never by holding the stream.
+flow_control = ""
 
 [aeron]
 # Archive control rides aeron:ipc (the LogConfig default — restated here for
@@ -27,11 +54,14 @@ archive_control_response_channel = "aeron:ipc"
 # Where the sealer-archive segment files live (bind-mounted; paths.archive_dir).
 archive_dir = "/opt/kardamom/archive"
 # Remote durability archives for the join-miss refetch (crates/log/src/refetch.rs):
-# a consumer whose live multicast missed an envelope replays the missing range
-# from these archives instead of dying. tx_data is recorded by BOTH ingress
-# nodes (multicast ⇒ each archive is a full mirror — either endpoint serves any
-# range; consumers rotate on failure). tx_deposits is recorded by the
-# da-watcher's node (aux). Ports = service_ports.aeron_archive_control (8010).
+# a consumer whose live subscription missed an envelope replays the missing
+# range from these archives instead of dying. With `[discovery]` on, the
+# refetch client reads the archive endpoints from the `kardamom-aeron-archive`
+# records the aeron job registers (nomad/aeron.system.nomad.hcl), and these
+# static lists are the fallback. tx_data is recorded by BOTH ingress nodes,
+# each ingress archive recording every ingress publisher, so either endpoint
+# serves any range; consumers rotate on failure. tx_deposits is recorded by
+# the da-watcher's node (aux). Ports = service_ports.aeron_archive_control.
 tx_data_archive_endpoints = ["192.168.56.31:8010", "192.168.56.32:8010"]
 tx_deposits_archive_endpoints = ["192.168.56.61:8010"]
 

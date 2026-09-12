@@ -78,6 +78,10 @@ job "aeron" {
   group "aeron" {
     network {
       mode = "host"
+      # The archive control endpoint, registered below.
+      port "archive_control" {
+        static = 8010
+      }
     }
 
     # Persistent archive segment volume on the VM disk. Recorders use
@@ -132,6 +136,30 @@ job "aeron" {
         # small heap is plenty. The JVM honors _JAVA_OPTIONS
         # regardless of the image entrypoint.
         _JAVA_OPTIONS = "-Xmx160m"
+      }
+
+      # The archive record of the discovery contract
+      # (docs/aeron-discovery.md): the consumers' refetch client reads
+      # the archive control endpoints from these records, filtered by
+      # the topics each node's archive records. `archive_topics` is
+      # node meta the Nomad agent template stamps per node class
+      # (ansible/roles/nomad/templates/nomad.hcl.j2): the ingress nodes
+      # record tx_data, the aux node records tx_deposits, every other
+      # node records nothing and lists no topic. Nomad owns this record;
+      # the runtime never registers an archive. The record outlives every
+      # publisher, so retained recordings stay discoverable.
+      service {
+        name     = "kardamom-aeron-archive"
+        port     = "archive_control"
+        address  = "${meta.node_ip}"
+        provider = "consul"
+        meta {
+          discovery_version = "1"
+          cluster_id        = "dev"
+          chain_id          = "412346"
+          archive_id        = "${node.unique.name}"
+          topics            = "${meta.archive_topics}"
+        }
       }
 
       # Trimmed from 768 MB. One media driver runs on every

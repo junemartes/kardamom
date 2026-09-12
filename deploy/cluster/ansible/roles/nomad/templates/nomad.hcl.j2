@@ -59,6 +59,10 @@ client {
     # node_index: this node's 0-based index within its class (the <i> of
     # <class>-<i>). sequencer.nomad.hcl forms KARDAMOM_HOST_ID from it.
     node_index    = "{{ node_index | default(sequencer_id | default('0')) }}"
+    # archive_topics: the topics this node's Aeron archive records, for
+    # the kardamom-aeron-archive service record (nomad/aeron.system.nomad.hcl).
+    # The ingress nodes record tx_data, the aux node records tx_deposits.
+    archive_topics = "{{ 'tx_data' if role == 'ingress' else ('tx_deposits' if role == 'aux' else '') }}"
   }
 }
 

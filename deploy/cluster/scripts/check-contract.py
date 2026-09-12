@@ -435,6 +435,23 @@ else:
     err("group_vars/all.yml: missing node_classes.executor ip_start/count")
 
 # --- config templates -----------------------------------------------------------
+# The [discovery] section of channels.toml.tpl mirrors the chain id and the
+# cluster subnet, and the Nomad service records repeat the chain id.
+channels_tpl = CLUSTER / "config" / "channels.toml.tpl"
+must_contain(channels_tpl, f"chain_id = {chain_id}", "[discovery] chain_id mirror")
+ip_prefix = scalar(gv, "ip_prefix")
+must_contain(
+    channels_tpl,
+    f'advertise_interface = "{ip_prefix}.0/24"',
+    "[discovery] advertise_interface is the cluster subnet",
+)
+for job in ("aeron.system", "cluster"):
+    must_contain(
+        jobs / f"{job}.nomad.hcl",
+        f'chain_id          = "{chain_id}"',
+        "discovery service record chain_id mirror",
+    )
+
 # tx_ordering is carried by the Aeron Cluster (Raft). channels.toml.tpl is
 # consumed via --log-config by every pipeline service; spot-check the flag is
 # actually wired.

@@ -98,6 +98,9 @@ job "executor" {
       # chosen from data. This stays unset in normal operation, and is
       # harmless (log-only) when set.
       env {
+        # The UDP ports the discovered receipt, boundary, and BAL
+        # publications bind on this node. One executor runs per node.
+        KARDAMOM_MDC_PORTS = "40320-40329"
         # BAL attribution granularity. K=20 measured a 31% reduction
         # in frame bytes on contract workloads
         # (docs/agents/2026-08-01-bal-phase1-measurement and the DeFi
