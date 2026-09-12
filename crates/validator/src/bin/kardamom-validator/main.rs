@@ -42,14 +42,15 @@ use wiring::Startup;
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    Startup::init(args)
+    let ready = Startup::init(args)
         .await?
         .open_state()?
         .open_streams()?
         .spawn_pumps()?
         .spawn_writer()?
         .spawn_attester()?
-        .build_sink()
-        .run()
-        .await
+        .build_sink();
+    // The run future carries every open handle by value, so it lives on
+    // the heap instead of the main task's stack.
+    Box::pin(ready.run()).await
 }

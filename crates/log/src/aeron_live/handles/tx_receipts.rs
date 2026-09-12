@@ -175,6 +175,14 @@ pub struct TxReceiptsPublisherHandle {
 }
 
 impl TxReceiptsPublisherHandle {
+    /// Wrap two publications opened elsewhere: the receipt stream and
+    /// the boundary side-stream, for example two discovered dynamic MDC
+    /// publications.
+    #[must_use]
+    pub fn from_publications(inner: PubHandle, boundary: PubHandle) -> Self {
+        Self { inner, boundary }
+    }
+
     /// The single-shared-channel publisher (IPC default). Use when
     /// `ch.tx_receipts_mds_enabled()` is false.
     ///
@@ -303,6 +311,21 @@ pub struct TxReceiptsSubscriberHandle {
 }
 
 impl TxReceiptsSubscriberHandle {
+    /// Wrap a raw receipt-frame subscription opened elsewhere, for
+    /// example a discovered multi-destination subscription whose
+    /// destinations a reconcile task owns. `add_destination` and
+    /// `remove_destination` are not available on it.
+    #[must_use]
+    pub fn from_raw(rx: UnboundedReceiver<RawFrame>, rt: &AeronRuntime) -> Self {
+        Self {
+            receiver: TxReceiptsReceiver {
+                rx,
+                pending: VecDeque::new(),
+            },
+            mds: MdsSub::new(None, rt, "receipts"),
+        }
+    }
+
     pub async fn recv(&mut self) -> Option<(BPosition, Receipt)> {
         self.receiver.recv().await
     }
@@ -485,6 +508,16 @@ pub struct TxReceiptsBoundarySubscriberHandle {
 }
 
 impl TxReceiptsBoundarySubscriberHandle {
+    /// Wrap a boundary subscription opened elsewhere; see
+    /// [`TxReceiptsSubscriberHandle::from_raw`].
+    #[must_use]
+    pub fn from_subscription(rx: TypedSubscription<BlockBoundary>, rt: &AeronRuntime) -> Self {
+        Self {
+            rx,
+            mds: MdsSub::new(None, rt, "boundary"),
+        }
+    }
+
     /// The single-shared-channel boundary subscriber (IPC default).
     ///
     /// # Errors

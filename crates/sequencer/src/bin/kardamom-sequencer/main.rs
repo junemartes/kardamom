@@ -20,7 +20,7 @@ use clap::Parser;
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
-    TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
+    TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_log::discovery::StreamPlane;
@@ -337,7 +337,7 @@ impl ResyncWiring {
         main_rt: AeronRuntime,
         cluster_egress: kardamom_cluster_adapter::LiveEgress,
         receipts_rt: &AeronRuntime,
-        channels: &ChannelsConfig,
+        plane: &mut StreamPlane,
         executor_count: Option<NonZeroU32>,
         shutdown: &Shutdown,
     ) -> Result<Self> {
@@ -369,17 +369,13 @@ impl ResyncWiring {
         )
         .spawn(cluster_egress, shutdown.clone());
 
-        // Note: in MDS mode, each attached destination binds its UDP
-        // socket, so two sequencer replicas on one host would collide. MDS
-        // receipts with co-located replicas needs per-group endpoint bases
-        // before this can be enabled here. The cluster deploy rides the
-        // shared multicast channel instead.
-        let receipts_sub = TxReceiptsSubscriberHandle::open_auto(
-            receipts_rt,
-            channels,
-            executor_count.or(channels.tx_receipts_executor_count),
-        )
-        .context("open tx_receipts")?;
+        // The receipts subscription follows the plane's transport. A
+        // discovered subscription receives on OS-chosen ports, so
+        // co-located replicas never collide.
+        let executor_count = executor_count.or(plane.channels().tx_receipts_executor_count);
+        let receipts_sub = plane
+            .tx_receipts_subscriber(receipts_rt, executor_count)
+            .context("open tx_receipts")?;
         let vslots = cfg.vslot_set().context("vslots")?;
         let receipts_task = feeds::ReceiptFloorFeed::new(vslots, floor_tx.clone())
             .spawn(receipts_sub, shutdown.clone());
@@ -515,7 +511,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
-    let channels: ChannelsConfig = log_cfg.channels.clone();
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
     let mut plane = StreamPlane::from_config(&log_cfg, &format!("sequencer-{}", cfg.lane()))
         .context("build the stream plane")?;
@@ -556,7 +551,7 @@ async fn main() -> anyhow::Result<()> {
         rt,
         cluster_egress,
         &receipts_rt,
-        &channels,
+        &mut plane,
         args.executor_count,
         &shutdown,
     )?;

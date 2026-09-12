@@ -6,10 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use kardamom_log::aeron_live::{
-    AeronRuntime, TxReceiptsReceiver, TxReceiptsSubscriberHandle, TypedSubscription,
-};
+use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsReceiver, TypedSubscription};
 use kardamom_log::config::{ChannelUri, ChannelsConfig};
+use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{SnapshotReceiver, StateSnapshot};
 use kardamom_validator::attester::AttesterHandle;
 use kardamom_validator::{BalBuffer, ClaimBuffer, ReceiptBuffer, metrics};
@@ -173,7 +172,8 @@ fn index_claims(
     }
 }
 
-/// `tx_receipts`: the executor's published receipts (MDS fan-in in the cluster).
+/// `tx_receipts`: the executor's published receipts, over every publisher
+/// the plane discovers, or the static channel's members.
 ///
 /// Keep the `into_receiver()` call: it matters for shutdown. The handle
 /// carries an `AeronRuntime` clone, for MDS destination churn, and moving
@@ -182,14 +182,13 @@ fn index_claims(
 /// what ends `recv()`, and this task would hold the clone that blocks it.
 /// Without this, the validator would ignore SIGTERM entirely, since
 /// `drop(rt)` would become a no-op, leaving the engine's `tx_data`
-/// subscriptions open and the join below never returning. MDS
-/// destinations attach inside `open_tx_receipts`, so nothing needs the
-/// clone after this point. The `shutdown` token gives a second, explicit
-/// exit. The pump then stops at the same time as the others, instead of
-/// waiting for `recv` to see the runtime shut down.
+/// subscriptions open and the join below never returning. The `shutdown`
+/// token gives a second, explicit exit. The pump then stops at the same
+/// time as the others, instead of waiting for `recv` to see the runtime
+/// shut down.
 pub(crate) fn spawn_receipts_pump(
     rt: &AeronRuntime,
-    channels: &ChannelsConfig,
+    plane: &mut StreamPlane,
     executor_count_flag: Option<u32>,
     receipts: Arc<ReceiptBuffer>,
     shutdown: CancellationToken,
@@ -199,9 +198,10 @@ pub(crate) fn spawn_receipts_pump(
     // the channel config's own typed count carries forward unchanged.
     let executor_count = match executor_count_flag {
         Some(n) => std::num::NonZeroU32::new(n),
-        None => channels.tx_receipts_executor_count,
+        None => plane.channels().tx_receipts_executor_count,
     };
-    let rx = TxReceiptsSubscriberHandle::open_auto(rt, channels, executor_count)
+    let rx = plane
+        .tx_receipts_subscriber(rt, executor_count)
         .context("open tx_receipts")?
         .into_receiver();
     let mut pump = ReceiptsPump { rx, receipts };

@@ -38,6 +38,7 @@ use kardamom_engine::{
 use kardamom_executor::ExecutorFileConfig;
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::LogConfig;
+use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{StateWriter, seed_genesis};
 
 use args::Args;
@@ -159,6 +160,52 @@ fn load_file_config(args: &Args) -> Result<ExecutorFileConfig> {
     Ok(file_cfg)
 }
 
+/// The resolved log config, the stream plane, and the two Aeron
+/// runtimes: everything [`main`] opens before it touches state.
+struct Transport {
+    channels: kardamom_log::config::ChannelsConfig,
+    aeron_cfg: kardamom_log::config::AeronConfig,
+    plane: StreamPlane,
+    rt: AeronRuntime,
+    rt_pub: AeronRuntime,
+}
+
+/// Resolve the log config and open the stream plane and the runtimes.
+///
+/// The archive-replay recovery connects its own archive client. It needs
+/// the archive control channels and media-driver dir from the
+/// `AeronConfig`, so the CLI `--aeron-dir` overrides it when given, and
+/// recovery joins the same driver as the runtime.
+///
+/// `rt_pub` is a separate Aeron runtime and thread for the `tx_receipts`
+/// publication. One Aeron thread would otherwise service both the
+/// `tx_ordering` subscription poll and the per-tx receipt and boundary
+/// publishes. Under sustained load, the publish work delays the
+/// `tx_ordering` poll past Aeron's flow-control Status-Message deadline.
+/// Then the sealer drops this subscriber, its image dies, and the
+/// executor freezes (the reader stops, and exec blocks on reading).
+/// Isolating the publisher on its own thread keeps the subscription poll
+/// timely no matter the receipt load.
+fn open_transport(args: &Args) -> Result<Transport> {
+    let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
+    let plane = StreamPlane::from_config(&log_cfg, &format!("executor-{}", args.recorder_id))
+        .context("build the stream plane")?;
+    let mut aeron_cfg = log_cfg.aeron;
+    if let Some(dir) = args.aeron_dir.as_ref() {
+        aeron_cfg.aeron_dir.clone_from(dir);
+    }
+    let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+    let rt_pub =
+        AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
+    Ok(Transport {
+        channels: log_cfg.channels,
+        aeron_cfg,
+        plane,
+        rt,
+        rt_pub,
+    })
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     bin_support::init_tracing();
@@ -173,29 +220,13 @@ async fn main() -> Result<()> {
         "kardamom-executor starting"
     );
 
-    let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
-    let channels = log_cfg.channels;
-    // Archive-replay recovery (below) connects its own archive client. It
-    // needs the archive control channels and media-driver dir from the
-    // AeronConfig. Use the CLI `--aeron-dir` when given, so it joins the
-    // same driver as the runtime.
-    let mut aeron_cfg = log_cfg.aeron;
-    if let Some(dir) = args.aeron_dir.as_ref() {
-        aeron_cfg.aeron_dir = dir.clone();
-    }
-    let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-
-    // Separate Aeron runtime and thread for the tx_receipts publication.
-    // The executor's single Aeron thread would otherwise service both the
-    // tx_ordering subscription poll and the per-tx receipt and boundary
-    // publishes. Under sustained load, the publish work delays the
-    // tx_ordering poll past Aeron's flow-control Status-Message deadline.
-    // Then the sealer drops this subscriber from the tx_ordering MDC, its
-    // image dies, and the executor freezes (the reader stops, and exec
-    // blocks on reading). Isolating the publisher on its own thread keeps
-    // the subscription poll timely no matter the receipt load.
-    let rt_pub =
-        AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
+    let Transport {
+        channels,
+        aeron_cfg,
+        mut plane,
+        rt,
+        rt_pub,
+    } = open_transport(&args)?;
 
     // --- State backend and crash-recovery decision. This runs before the
     // subscriptions, because the tx_ordering subscription branches on
@@ -246,7 +277,7 @@ async fn main() -> Result<()> {
     // suppresses it).
     let tx_ordering_sub = cluster_sub;
 
-    let tx_receipts_pub = wiring::open_tx_receipts_pub(&rt_pub, &channels, &args)?;
+    let tx_receipts_pub = wiring::open_tx_receipts_pub(&rt_pub, &mut plane, &args).await?;
 
     let WriterAdapters {
         mut writer,
@@ -320,6 +351,8 @@ async fn main() -> Result<()> {
     });
 
     let engine_error = run_engine(rt, cluster_guard, shutdown, join).await;
+    // The plane's registrations deregister once the engine has stopped.
+    plane.shutdown().await;
     // Stop the state writer thread (this closes the delta channel, joins
     // it, and surfaces its final result). The executor task has finished,
     // so its adapter clones of the delta sender are already dropped.

@@ -12,8 +12,10 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -26,7 +28,10 @@ use super::record::{PUBLISHER_SERVICE, PublisherRecord, Scope, Topic};
 use super::registration::Registration;
 use super::watch::{Membership, MembershipWatch, WatchTiming};
 use super::{Instance, catalog_from_config, scope_from_config};
-use crate::aeron_live::{AeronRuntime, Destinations, PubHandle, TypedSubscription};
+use crate::aeron_live::{
+    AeronRuntime, Destinations, PubHandle, RawFrame, TxReceiptsBoundarySubscriberHandle,
+    TxReceiptsPublisherHandle, TxReceiptsSubscriberHandle, TypedSubscription,
+};
 use crate::codec::WireMessage;
 use crate::config::{ChannelsConfig, DiscoveryConfig, LogConfig};
 use crate::error::LogError;
@@ -141,6 +146,18 @@ impl Discovered {
     ) -> Result<TypedSubscription<T>, LogError> {
         let (sub_id, rx) =
             rt.open_subscription_with_id::<T>(MANUAL_SUBSCRIPTION_URI, key.stream_id)?;
+        self.start_reconcile(rt.destinations(sub_id), key);
+        Ok(rx)
+    }
+
+    /// Open a multi-destination subscription for `key` delivering raw
+    /// frames, and start its watch and reconcile tasks.
+    fn open_raw_subscription(
+        &mut self,
+        rt: &AeronRuntime,
+        key: StreamKey,
+    ) -> Result<UnboundedReceiver<RawFrame>, LogError> {
+        let (sub_id, rx) = rt.open_subscription_raw(MANUAL_SUBSCRIPTION_URI, key.stream_id)?;
         self.start_reconcile(rt.destinations(sub_id), key);
         Ok(rx)
     }
@@ -370,6 +387,104 @@ impl StreamPlane {
                 .open_subscription::<H::Msg>(rt, key)
                 .map(H::from_subscription),
         }
+    }
+
+    /// The `tx_receipts` publisher: the receipt stream and the boundary
+    /// side-stream. Static: the per-replica MDS endpoint when the
+    /// channels enable MDS, else the shared channel. Discovered: two
+    /// dynamic MDC publications, each registered under its own topic.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either publication fails to open or register.
+    pub async fn tx_receipts_publisher(
+        &mut self,
+        rt: &AeronRuntime,
+        replica_idx: u32,
+    ) -> Result<TxReceiptsPublisherHandle, LogError> {
+        let (receipts_key, boundaries_key) = (self.receipts_key(), self.boundaries_key());
+        let Some(d) = &mut self.discovered else {
+            return if self.channels.tx_receipts_mds_enabled() {
+                TxReceiptsPublisherHandle::open_mds(rt, &self.channels, replica_idx)
+            } else {
+                TxReceiptsPublisherHandle::open(rt, &self.channels)
+            };
+        };
+        let receipts = d.open_publication(rt, receipts_key).await?;
+        let boundaries = d.open_publication(rt, boundaries_key).await?;
+        Ok(TxReceiptsPublisherHandle::from_publications(
+            receipts, boundaries,
+        ))
+    }
+
+    /// The `tx_receipts` subscriber. Static: `open_auto` over the
+    /// channels, attaching `executor_count` replica endpoints under MDS.
+    /// Discovered: one multi-destination subscription the reconcile task
+    /// fills from the catalog, so `executor_count` is unused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn tx_receipts_subscriber(
+        &mut self,
+        rt: &AeronRuntime,
+        executor_count: Option<NonZeroU32>,
+    ) -> Result<TxReceiptsSubscriberHandle, LogError> {
+        let key = self.receipts_key();
+        match &mut self.discovered {
+            None => TxReceiptsSubscriberHandle::open_auto(rt, &self.channels, executor_count),
+            Some(d) => d
+                .open_raw_subscription(rt, key)
+                .map(|rx| TxReceiptsSubscriberHandle::from_raw(rx, rt)),
+        }
+    }
+
+    /// The block-boundary twin of [`Self::tx_receipts_subscriber`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn tx_receipt_boundaries_subscriber(
+        &mut self,
+        rt: &AeronRuntime,
+        executor_count: Option<NonZeroU32>,
+    ) -> Result<TxReceiptsBoundarySubscriberHandle, LogError> {
+        let key = self.boundaries_key();
+        match &mut self.discovered {
+            None => {
+                TxReceiptsBoundarySubscriberHandle::open_auto(rt, &self.channels, executor_count)
+            }
+            Some(d) => d
+                .open_subscription(rt, key)
+                .map(|rx| TxReceiptsBoundarySubscriberHandle::from_subscription(rx, rt)),
+        }
+    }
+
+    fn receipts_key(&self) -> StreamKey {
+        StreamKey {
+            topic: Topic::TxReceipts,
+            stream_id: self.channels.tx_receipts_stream_id,
+            lane: None,
+        }
+    }
+
+    fn boundaries_key(&self) -> StreamKey {
+        StreamKey {
+            topic: Topic::TxReceiptBoundaries,
+            stream_id: self.channels.tx_receipts_boundary_stream_id(),
+            lane: None,
+        }
+    }
+
+    /// A token that stops the watch and reconcile tasks when cancelled.
+    /// A caller that must release its Aeron runtime before it can await
+    /// [`Self::shutdown`] cancels this first. Static planes hand out a
+    /// token nothing listens to.
+    #[must_use]
+    pub fn cancellation(&self) -> CancellationToken {
+        self.discovered
+            .as_ref()
+            .map_or_else(CancellationToken::new, |d| d.cancel.clone())
     }
 
     /// Stop the watch and reconcile tasks and deregister every

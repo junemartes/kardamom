@@ -282,7 +282,10 @@ impl Ready {
                                 Streamed {
                                     opened:
                                         Opened {
-                                            base: Startup { args, rt, .. },
+                                            base:
+                                                Startup {
+                                                    args, rt, plane, ..
+                                                },
                                             state:
                                                 OpenedState {
                                                     expected_genesis,
@@ -343,6 +346,7 @@ impl Ready {
             join,
             pump_shutdown,
             rt,
+            plane,
             cluster_guard,
             writer,
             divergence,
@@ -360,6 +364,7 @@ struct Running {
     join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
     pump_shutdown: tokio_util::sync::CancellationToken,
     rt: AeronRuntime,
+    plane: kardamom_log::discovery::StreamPlane,
     cluster_guard: LiveCluster,
     writer: kardamom_state::WriterHandle,
     divergence: Arc<Divergence>,
@@ -376,6 +381,7 @@ impl Running {
             join: self.join,
             pumps: self.pump_shutdown,
             rt: self.rt,
+            plane: self.plane,
             cluster_guard: self.cluster_guard,
             writer: self.writer,
             divergence: self.divergence.clone(),
@@ -537,6 +543,9 @@ struct Shutdown {
     /// field name does not repeat this struct's own name).
     pumps: tokio_util::sync::CancellationToken,
     rt: AeronRuntime,
+    /// Its discovery tasks stop with the pumps, before `rt` drops; its
+    /// registrations deregister once the streams have ended.
+    plane: kardamom_log::discovery::StreamPlane,
     cluster_guard: LiveCluster,
     writer: kardamom_state::WriterHandle,
     divergence: Arc<Divergence>,
@@ -551,10 +560,12 @@ impl Shutdown {
             join,
             pumps,
             rt,
+            plane,
             cluster_guard,
             mut writer,
             divergence,
         } = self;
+        let discovery = plane.cancellation();
         // Exit on whichever comes first: an operator shutdown signal, or
         // the engine loop finishing on its own (a divergence stop or a
         // stream error). Waiting only for SIGTERM would leave a halted
@@ -571,10 +582,12 @@ impl Shutdown {
             streams: bin_support::LiveStreams { rt, cluster_guard },
             before_drop: || {
                 pumps.cancel();
+                discovery.cancel();
             },
         }
         .wait()
         .await;
+        plane.shutdown().await;
         let engine_error = classify_engine_result(joined, &divergence);
         if let Err(e) = writer.shutdown() {
             tracing::error!(error = %e, "state writer shutdown returned an error");

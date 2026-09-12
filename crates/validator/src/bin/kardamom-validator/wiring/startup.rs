@@ -9,6 +9,7 @@ use kardamom_engine::ResumePoint;
 use kardamom_engine::bin_support;
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
+use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{StateEnv, StateEnvBuilder, read_recovery_point};
 use kardamom_validator::flight::FlightRing;
 use kardamom_validator::{BalBuffer, ClaimBuffer, Divergence, ReceiptBuffer};
@@ -23,6 +24,8 @@ pub(crate) struct Startup {
     pub(super) channels: ChannelsConfig,
     pub(super) aeron_cfg: AeronConfig,
     pub(super) rt: AeronRuntime,
+    /// The stream plane the verification subscriptions open through.
+    pub(super) plane: StreamPlane,
 }
 
 impl Startup {
@@ -61,6 +64,8 @@ impl Startup {
 
         let log_cfg =
             LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
+        let plane =
+            StreamPlane::from_config(&log_cfg, "validator").context("build the stream plane")?;
         let channels = log_cfg.channels;
         let mut aeron_cfg = log_cfg.aeron;
         if let Some(dir) = args.aeron_dir.as_ref() {
@@ -74,6 +79,7 @@ impl Startup {
             channels,
             aeron_cfg,
             rt,
+            plane,
         })
     }
 
