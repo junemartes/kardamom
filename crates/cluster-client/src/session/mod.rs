@@ -258,45 +258,47 @@ impl SessionDriver {
     pub fn on_egress(&mut self, frame: &[u8]) -> Vec<DriverEvent> {
         match decode_egress(frame) {
             Ok(Egress::SessionEvent(ev)) => self.on_session_event(ev),
-            Ok(Egress::NewLeader(nl)) => {
-                // The same session continues under a new leadership term.
-                // Re-point ingress, but do not reconnect: the session id
-                // stays the same. Foreign-session filter: the shared egress
-                // channel also carries other sessions' NewLeaderEvents.
-                // Only our own event may change our term or re-point our
-                // ingress.
-                if let SessionState::Connected {
-                    cluster_session_id,
-                    leadership_term_id,
-                    leader_member_id,
-                    ..
-                } = &mut self.state
-                {
-                    if nl.cluster_session_id != *cluster_session_id {
-                        return Vec::new();
-                    }
-                    *leadership_term_id = nl.leadership_term_id;
-                    *leader_member_id = nl.leader_member_id;
-                    vec![DriverEvent::Reconnect {
-                        leader_member_id: nl.leader_member_id,
-                        ingress_endpoints: nl.ingress_endpoints,
-                    }]
-                } else {
-                    Vec::new()
-                }
-            }
-            Ok(Egress::SessionMessage(m)) => {
-                // Only surface messages for our session.
-                match self.state {
-                    SessionState::Connected {
-                        cluster_session_id, ..
-                    } if cluster_session_id == m.cluster_session_id => {
-                        vec![DriverEvent::AppMessage(m.payload.to_vec())]
-                    }
-                    _ => Vec::new(),
-                }
-            }
+            Ok(Egress::NewLeader(nl)) => self.on_new_leader(nl),
+            Ok(Egress::SessionMessage(m)) => self.on_session_message(&m),
             Ok(Egress::Other { .. }) | Err(_) => Vec::new(),
+        }
+    }
+
+    /// Handle a new-leader event. The same session continues under a new
+    /// leadership term. Re-point ingress, but do not reconnect: the session
+    /// id stays the same. Foreign-session filter: the shared egress channel
+    /// also carries other sessions' `NewLeaderEvent`s. Only our own event
+    /// may change our term or re-point our ingress.
+    fn on_new_leader(&mut self, nl: crate::protocol::NewLeaderEvent) -> Vec<DriverEvent> {
+        let SessionState::Connected {
+            cluster_session_id,
+            leadership_term_id,
+            leader_member_id,
+            ..
+        } = &mut self.state
+        else {
+            return Vec::new();
+        };
+        if nl.cluster_session_id != *cluster_session_id {
+            return Vec::new();
+        }
+        *leadership_term_id = nl.leadership_term_id;
+        *leader_member_id = nl.leader_member_id;
+        vec![DriverEvent::Reconnect {
+            leader_member_id: nl.leader_member_id,
+            ingress_endpoints: nl.ingress_endpoints,
+        }]
+    }
+
+    /// Handle one session message. Only surface messages for our session.
+    fn on_session_message(&self, m: &crate::protocol::SessionMessage) -> Vec<DriverEvent> {
+        match self.state {
+            SessionState::Connected {
+                cluster_session_id, ..
+            } if cluster_session_id == m.cluster_session_id => {
+                vec![DriverEvent::AppMessage(m.payload.to_vec())]
+            }
+            _ => Vec::new(),
         }
     }
 
