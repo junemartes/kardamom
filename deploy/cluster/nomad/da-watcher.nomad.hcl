@@ -5,8 +5,8 @@
 #   kardamom-da-watcher --l1-rpc http://192.168.56.10:8546 --lockbox <addr> \
 #       --aeron-dir <dir> --poll-interval-secs 1
 #
-# --l1-rpc points at the in-cluster anvil on r1 (control_ip:anvil_l1 =
-# 192.168.56.10:8546). --lockbox is the chain-specific Lockbox
+# --l1-rpc defaults to the in-cluster anvil on r1 (control_ip:anvil_l1 =
+# 192.168.56.10:8546), through the `l1_rpc_url` variable below. --lockbox is the chain-specific Lockbox
 # contract address. It is not known until the deployer deploys it, so
 # it is exposed as the HCL variable `lockbox_address` below, with a
 # clearly marked placeholder default. Override it at submit time:
@@ -14,6 +14,19 @@
 #
 # This shares the node's Aeron media driver, through the bind-mounted
 # tmpfs aeron.dir.
+
+# The L1 endpoint the watcher derives epochs from. The default is the
+# in-cluster anvil on the control node. When the L1 light client is
+# deployed (l1-light-client.nomad.hcl), scripts/deploy.sh points this at
+# the light client, the same as the validator. The watcher is the epoch
+# SOURCE, so a lying endpoint here produces bad epochs at the source
+# rather than false halts (issue #163). Routing it through a verifying
+# client closes that.
+variable "l1_rpc_url" {
+  type        = string
+  description = "L1 JSON-RPC the watcher derives epochs from. Default: the in-cluster anvil. Point it at the light client on a real network."
+  default     = "http://192.168.56.10:8546"
+}
 
 variable "lockbox_address" {
   type        = string
@@ -97,7 +110,7 @@ job "da-watcher" {
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
         ]
         args = [
-          "--l1-rpc", "http://192.168.56.10:8546",
+          "--l1-rpc", "${var.l1_rpc_url}",
           "--lockbox", "${var.lockbox_address}",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",

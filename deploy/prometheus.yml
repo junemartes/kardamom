@@ -2,6 +2,12 @@ global:
   scrape_interval: 1s
   evaluation_interval: 5s
 
+# Alert rules (deploy/alerts.yml). Prometheus evaluates them and shows
+# firing alerts on its /alerts page. No Alertmanager is wired; route the
+# alerts there when a pager exists.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 # One scrape job per kardamom service. Each `static_configs.targets` is the
 # list of host:port pairs running that service. To add a host, append
 # `host-N:<port>` to the matching job's `targets` — every metric is already
@@ -46,3 +52,11 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["host.docker.internal:9006"]
+
+  # The validator exports on :9007 locally (crates/validator args.rs).
+  # The cluster deploy moves it to :9006 on the validator node, where
+  # no ingress runs; see deploy/cluster/nomad/validator.nomad.hcl.
+  - job_name: kardamom-validator
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9007"]

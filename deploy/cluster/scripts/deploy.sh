@@ -401,6 +401,14 @@ if [ -n "${L1_LIGHT_CLIENT_EXECUTION_RPC:-}" ] && [ -n "${L1_LIGHT_CLIENT_CONSEN
     -var "l1_rpc_url=http://${AUX_IP:-192.168.56.61}:${L1_LIGHT_CLIENT_PORT:-8548}"
     -var "lockbox_address=${LOCKBOX_ADDRESS}"
   )
+  # The da-watcher derives the epochs the validator checks. It reads
+  # L1 through the same light client, so the epoch source is verified
+  # too, not only the check against it (issue #163). This trades a
+  # trusted endpoint for a verifying one: a withholding provider now
+  # stalls epoch derivation instead of feeding it bad data.
+  DA_WATCHER_ARGS+=(
+    -var "l1_rpc_url=http://${AUX_IP:-192.168.56.61}:${L1_LIGHT_CLIENT_PORT:-8548}"
+  )
 fi
 image_ref_args validator
 run_job "validator.nomad.hcl" ${VALIDATOR_ARGS[@]+"${VALIDATOR_ARGS[@]}"} ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}

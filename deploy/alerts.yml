@@ -1,0 +1,55 @@
+# Prometheus alert rules for the kardamom stack. Loaded through
+# `rule_files` in prometheus.yml. Check with:
+#   promtool check rules deploy/alerts.yml
+#
+# These rules make silent coverage gaps visible. The validator verifies
+# each epoch against L1. When L1 does not answer, the epoch commits
+# unverified and only a counter moves. Nothing else in the system
+# notices, and that is exactly where a targeted forgery would sit
+# (issue #163). An alert turns that counter into a signal.
+groups:
+  - name: kardamom-validator
+    rules:
+      - alert: KardamomValidatorEpochsUnverified
+        # A coverage gap: L1 did not answer inside the retry window, so
+        # the validator committed an epoch without checking it. This is
+        # not a chain fault. It means the L1 data path is not delivering.
+        expr: increase(validator_epochs_unverified_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "validator committed unverified epochs ({{ $labels.host_id }})"
+          description: "{{ $value }} epochs committed without an L1 check in the last 10m. The L1 endpoint (or the light client in front of it) is not answering. Verification coverage is dropping silently."
+
+      - alert: KardamomValidatorEpochFault
+        # A chain fault: the epoch on the canonical stream disagrees
+        # with L1. The validator fail-stops on this, so the counter
+        # moves once and the process exits. Page on it.
+        expr: increase(validator_epoch_faults_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "validator epoch fault ({{ $labels.host_id }})"
+          description: "An epoch on the canonical stream does not match L1. The validator halts on this. Inspect the validator log for the fault reason."
+
+      - alert: KardamomValidatorDivergence
+        # The validator's re-execution disagrees with the executor's
+        # published result. Same severity as an epoch fault.
+        expr: increase(validator_divergence_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "validator divergence ({{ $labels.host_id }})"
+          description: "Re-execution diverged from the published block. The validator halts on this. Inspect the divergence dump."
+
+      - alert: KardamomValidatorDown
+        expr: up{job="kardamom-validator"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "validator scrape target down"
+          description: "Prometheus cannot scrape the validator. A halted validator (epoch fault or divergence) looks like this too."
