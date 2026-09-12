@@ -42,33 +42,7 @@ pub(crate) fn prepare_state(
             kardamom_state::serve_checkpoints(addr, ckpt_dir.clone())
                 .context("bind checkpoint serve address")?;
         }
-        // The state dir is fresh only if it has no mdbx data file. Check this
-        // without opening the env: opening would create the data file itself
-        // and defeat the restore.
-        let fresh = !kardamom_state::checkpoint::has_state_db(&args.state_dir)
-            .context("probe state dir")?;
-        if fresh {
-            let restored = kardamom_engine::bin_support::restore_or_fetch_checkpoint(
-                ckpt_dir,
-                &args.state_dir,
-                &args.checkpoint_peers,
-                expected_genesis,
-            )?;
-            if let Some((block, path)) = restored {
-                tracing::info!(
-                    restored_block = block,
-                    checkpoint = %path.display(),
-                    "restored state from checkpoint; will replay tail from here"
-                );
-            } else {
-                tracing::info!(
-                    checkpoint_dir = %ckpt_dir.display(),
-                    "no checkpoint available locally or from peers; fresh start will \
-                     replay from genesis (refused if the chain outgrew the cluster \
-                     retention window — then a peer checkpoint or rebuild-from-L1 is required)"
-                );
-            }
-        }
+        restore_if_fresh(args, ckpt_dir, expected_genesis)?;
     }
 
     // Open the libmdbx state env and read the durable cursor.
@@ -96,6 +70,50 @@ pub(crate) fn prepare_state(
     }
 
     Ok(PreparedState { env, start })
+}
+
+/// Restores from a checkpoint, but only on a fresh state dir. A non-fresh
+/// dir already has a chain to resume, so a restore here would overwrite
+/// it.
+fn restore_if_fresh(
+    args: &Args,
+    ckpt_dir: &std::path::Path,
+    expected_genesis: Option<alloy_primitives::B256>,
+) -> Result<()> {
+    // The state dir is fresh only if it has no mdbx data file. Check this
+    // without opening the env: opening would create the data file itself
+    // and defeat the restore.
+    let fresh =
+        !kardamom_state::checkpoint::has_state_db(&args.state_dir).context("probe state dir")?;
+    if !fresh {
+        return Ok(());
+    }
+    let restored = kardamom_engine::bin_support::restore_or_fetch_checkpoint(
+        ckpt_dir,
+        &args.state_dir,
+        &args.checkpoint_peers,
+        expected_genesis,
+    )?;
+    log_restore_outcome(ckpt_dir, restored);
+    Ok(())
+}
+
+/// Logs whether the fresh-start restore found a checkpoint to replay from.
+fn log_restore_outcome(ckpt_dir: &std::path::Path, restored: Option<(u64, std::path::PathBuf)>) {
+    let Some((block, path)) = restored else {
+        tracing::info!(
+            checkpoint_dir = %ckpt_dir.display(),
+            "no checkpoint available locally or from peers; fresh start will \
+             replay from genesis (refused if the chain outgrew the cluster \
+             retention window — then a peer checkpoint or rebuild-from-L1 is required)"
+        );
+        return;
+    };
+    tracing::info!(
+        restored_block = block,
+        checkpoint = %path.display(),
+        "restored state from checkpoint; will replay tail from here"
+    );
 }
 
 /// Start periodic checkpointing, if the args ask for it. It gives fast
@@ -131,14 +149,20 @@ impl CheckpointRound {
     /// One checkpoint + prune round; failures are logged, never fatal.
     fn once(&self) {
         match create_checkpoint(&self.env, &self.dir) {
-            Ok(info) => {
-                if info.block > self.keep
-                    && let Err(e) = prune_checkpoints(&self.dir, info.block - self.keep + 1)
-                {
-                    tracing::warn!(error = %e, "checkpoint prune failed");
-                }
-            }
+            Ok(info) => self.prune_stale(info.block),
             Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
+        }
+    }
+
+    /// Prunes checkpoints that fall outside the retention window behind
+    /// `block`. Does nothing until the chain has produced more than
+    /// `self.keep` checkpoints. Failures are logged, never fatal.
+    fn prune_stale(&self, block: u64) {
+        if block <= self.keep {
+            return;
+        }
+        if let Err(e) = prune_checkpoints(&self.dir, block - self.keep + 1) {
+            tracing::warn!(error = %e, "checkpoint prune failed");
         }
     }
 }

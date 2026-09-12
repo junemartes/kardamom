@@ -93,9 +93,7 @@ pub fn pregenerate(
                         value,
                         input: Bytes::new(),
                     };
-                    let signed = s.sign_raw(tx).map_err(|e| {
-                        anyhow::anyhow!("signing tx (sender {sender} nonce {nonce}): {e}")
-                    })?;
+                    let signed = s.sign_raw(tx).map_err(|e| sign_error(sender, nonce, &e))?;
                     Ok(PlannedTx {
                         raw: signed.raw,
                         hash: signed.hash,
@@ -106,6 +104,11 @@ pub fn pregenerate(
                 .collect::<anyhow::Result<Vec<PlannedTx>>>()
         })
         .collect()
+}
+
+/// The error for a failed presign at `(sender, nonce)`.
+fn sign_error(sender: usize, nonce: u64, e: &anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!("signing tx (sender {sender} nonce {nonce}): {e}")
 }
 
 #[cfg(test)]

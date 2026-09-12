@@ -21,7 +21,7 @@
 
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -39,6 +39,7 @@ use kardamom_log::aeron_live::{
 use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
 use kardamom_log::recorder::{RecorderKind, RecorderThreads, record_stream_until_stopped};
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 #[path = "kardamom-da-watcher/publishers.rs"]
 mod publishers;
@@ -305,18 +306,22 @@ impl Args {
     /// is never treated as 0), or `--interop-start-seq` on first boot.
     fn interop_start_seq(&self, cursor_file: &CursorFile) -> anyhow::Result<u64> {
         match cursor_file.load().context("load --interop-cursor-file")? {
-            Some(persisted) => {
-                if self.interop_start_seq != 0 && self.interop_start_seq != persisted {
-                    tracing::info!(
-                        persisted,
-                        flag = self.interop_start_seq,
-                        "cursor file exists; ignoring --interop-start-seq"
-                    );
-                }
-                Ok(persisted)
-            }
+            Some(persisted) => Ok(self.resolve_persisted_start_seq(persisted)),
             None => Ok(self.interop_start_seq),
         }
+    }
+
+    /// Log when `--interop-start-seq` conflicts with a persisted cursor.
+    /// Return the value to use: the persisted cursor always wins.
+    fn resolve_persisted_start_seq(&self, persisted: u64) -> u64 {
+        if self.interop_start_seq != 0 && self.interop_start_seq != persisted {
+            tracing::info!(
+                persisted,
+                flag = self.interop_start_seq,
+                "cursor file exists; ignoring --interop-start-seq"
+            );
+        }
+        persisted
     }
 }
 
@@ -452,29 +457,13 @@ impl DaWatcherService {
         let mut recorders = RecorderThreads::new();
         recorders
             .spawn("da-watcher-tx-deposits-recorder".into(), move |stop| {
-                // Shared recorder-thread body (kardamom_log::recorder):
-                // connect a thread-confined archive session, record
-                // tx_deposits, report the startup outcome on `ready`, and
-                // hold until `stop`.
-                if let Err(e) = record_stream_until_stopped(
+                Self::run_tx_deposits_recorder(
                     aeron_dir.as_deref(),
                     &aeron_cfg,
-                    &channels.tx_deposits_channel,
-                    channels.tx_deposits_stream_id,
-                    RecorderKind::TxDeposits,
+                    &channels,
                     &stop,
-                    |outcome| {
-                        if let Ok(recording_id) = &outcome {
-                            tracing::info!(
-                                recording_id = *recording_id,
-                                "da-watcher: recording tx_deposits"
-                            );
-                        }
-                        let _ = ready_tx.send(outcome);
-                    },
-                ) {
-                    tracing::error!(error = %e, "tx_deposits recorder exited with error");
-                }
+                    ready_tx,
+                );
             })
             .context("spawn tx_deposits recorder thread")?;
         // This budget is generous: normally one catalog-poll tick is about
@@ -496,5 +485,43 @@ impl DaWatcherService {
             ),
         }
         Ok(recorders)
+    }
+
+    /// Run the shared recorder-thread body (`kardamom_log::recorder`):
+    /// connect a thread-confined archive session, record `tx_deposits`,
+    /// report the startup outcome on `ready_tx`, and hold until `stop`.
+    fn run_tx_deposits_recorder(
+        aeron_dir: Option<&Path>,
+        aeron_cfg: &AeronConfig,
+        channels: &ChannelsConfig,
+        stop: &CancellationToken,
+        ready_tx: oneshot::Sender<Result<i64, String>>,
+    ) {
+        if let Err(e) = record_stream_until_stopped(
+            aeron_dir,
+            aeron_cfg,
+            &channels.tx_deposits_channel,
+            channels.tx_deposits_stream_id,
+            RecorderKind::TxDeposits,
+            stop,
+            move |outcome| Self::report_deposit_recording_ready(outcome, ready_tx),
+        ) {
+            tracing::error!(error = %e, "tx_deposits recorder exited with error");
+        }
+    }
+
+    /// Log a successful recording start, then report the startup
+    /// outcome on `ready_tx`.
+    fn report_deposit_recording_ready(
+        outcome: Result<i64, String>,
+        ready_tx: oneshot::Sender<Result<i64, String>>,
+    ) {
+        if let Ok(recording_id) = &outcome {
+            tracing::info!(
+                recording_id = *recording_id,
+                "da-watcher: recording tx_deposits"
+            );
+        }
+        let _ = ready_tx.send(outcome);
     }
 }

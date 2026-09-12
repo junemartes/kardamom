@@ -34,79 +34,80 @@ use alloc::vec::Vec;
 pub fn merge_bal_fragments(
     fragments: impl IntoIterator<Item = revm::state::bal::Bal>,
 ) -> revm::state::bal::Bal {
-    // Append `src`'s writes, replaying the sequential capture's dedup rule.
-    // A write at a new index is recorded only when its value differs from
-    // the last recorded one (`BalWrites::update_with_key`). A per-tx
-    // fragment cannot know this on its own, since its list saw only its
-    // own tx. Without this step, an unchanged-value write (for example, a
-    // deposit that touches the fee sink, or a slot rewritten to its
-    // previous value) would appear in the merged result but not in the
-    // sequential one. `key` mirrors revm's comparison: the whole value for
-    // nonce, balance, and storage, and the code hash for code.
-    fn push_if_changed<T: Clone + PartialEq, K: PartialEq + ?Sized>(
-        dst: &mut revm::state::bal::BalWrites<T>,
-        idx: revm::state::bal::BalIndex,
-        v: T,
-        key: &impl Fn(&T) -> &K,
-    ) {
-        match dst.writes.last() {
-            Some((_, last)) if key(last) == key(&v) => {}
-            _ => dst.writes.push((idx, v)),
-        }
-    }
-
-    fn append<T: Clone + PartialEq, K: PartialEq + ?Sized>(
-        dst: &mut revm::state::bal::BalWrites<T>,
-        src: revm::state::bal::BalWrites<T>,
-        key: impl Fn(&T) -> &K,
-    ) {
-        for (idx, v) in src.writes {
-            push_if_changed(dst, idx, v, &key);
-        }
-    }
-
-    /// Merge one storage slot's writes into `dst`, inserting the whole
-    /// entry on a slot `dst` has not seen yet.
-    fn merge_storage_slot<K: Ord, T: Clone + PartialEq>(
-        dst: &mut alloc::collections::BTreeMap<K, revm::state::bal::BalWrites<T>>,
-        slot: K,
-        writes: revm::state::bal::BalWrites<T>,
-    ) {
-        let Some(dw) = dst.get_mut(&slot) else {
-            dst.insert(slot, writes);
-            return;
-        };
-        append(dw, writes, |v| v);
-    }
-
-    /// Merge one account's fragment into `out`, inserting the whole entry
-    /// on an address `out` has not seen yet.
-    fn merge_account(
-        out: &mut revm::state::bal::Bal,
-        addr: alloy_primitives::Address,
-        acct: revm::state::bal::AccountBal,
-    ) {
-        let Some(tgt) = out.accounts.get_mut(&addr) else {
-            out.accounts.insert(addr, acct);
-            return;
-        };
-        append(&mut tgt.account_info.nonce, acct.account_info.nonce, |v| v);
-        append(
-            &mut tgt.account_info.balance,
-            acct.account_info.balance,
-            |v| v,
-        );
-        append(&mut tgt.account_info.code, acct.account_info.code, |v| &v.0);
-        for (slot, writes) in acct.storage.storage {
-            merge_storage_slot(&mut tgt.storage.storage, slot, writes);
-        }
-    }
-
     let mut out = revm::state::bal::Bal::new();
     for (addr, acct) in fragments.into_iter().flat_map(|frag| frag.accounts) {
         merge_account(&mut out, addr, acct);
     }
     out
+}
+
+/// Append `src`'s writes into `dst`, replaying the sequential capture's
+/// dedup rule (see [`push_if_changed`]).
+fn append<T: Clone + PartialEq, K: PartialEq + ?Sized>(
+    dst: &mut revm::state::bal::BalWrites<T>,
+    src: revm::state::bal::BalWrites<T>,
+    key: impl Fn(&T) -> &K,
+) {
+    for (idx, v) in src.writes {
+        push_if_changed(dst, idx, v, &key);
+    }
+}
+
+/// Record one write at `idx`, only when its value differs from the last
+/// recorded one (`BalWrites::update_with_key`). A per-tx fragment cannot
+/// know this on its own, since its list saw only its own tx. Without
+/// this step, an unchanged-value write (for example, a deposit that
+/// touches the fee sink, or a slot rewritten to its previous value)
+/// would appear in the merged result but not in the sequential one.
+/// `key` mirrors revm's comparison: the whole value for nonce, balance,
+/// and storage, and the code hash for code.
+fn push_if_changed<T: Clone + PartialEq, K: PartialEq + ?Sized>(
+    dst: &mut revm::state::bal::BalWrites<T>,
+    idx: revm::state::bal::BalIndex,
+    v: T,
+    key: &impl Fn(&T) -> &K,
+) {
+    match dst.writes.last() {
+        Some((_, last)) if key(last) == key(&v) => {}
+        _ => dst.writes.push((idx, v)),
+    }
+}
+
+/// Merge one storage slot's writes into `dst`, inserting the whole
+/// entry on a slot `dst` has not seen yet.
+fn merge_storage_slot<K: Ord, T: Clone + PartialEq>(
+    dst: &mut alloc::collections::BTreeMap<K, revm::state::bal::BalWrites<T>>,
+    slot: K,
+    writes: revm::state::bal::BalWrites<T>,
+) {
+    let Some(dw) = dst.get_mut(&slot) else {
+        dst.insert(slot, writes);
+        return;
+    };
+    append(dw, writes, |v| v);
+}
+
+/// Merge one account's fragment into `out`, inserting the whole entry
+/// on an address `out` has not seen yet.
+fn merge_account(
+    out: &mut revm::state::bal::Bal,
+    addr: alloy_primitives::Address,
+    acct: revm::state::bal::AccountBal,
+) {
+    let Some(tgt) = out.accounts.get_mut(&addr) else {
+        out.accounts.insert(addr, acct);
+        return;
+    };
+    append(&mut tgt.account_info.nonce, acct.account_info.nonce, |v| v);
+    append(
+        &mut tgt.account_info.balance,
+        acct.account_info.balance,
+        |v| v,
+    );
+    append(&mut tgt.account_info.code, acct.account_info.code, |v| &v.0);
+    for (slot, writes) in acct.storage.storage {
+        merge_storage_slot(&mut tgt.storage.storage, slot, writes);
+    }
 }
 
 /// The chunk number for a 1-based BAL index, at granularity `k`.

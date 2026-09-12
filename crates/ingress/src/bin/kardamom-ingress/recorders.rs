@@ -49,32 +49,41 @@ pub(crate) fn spawn_tx_data_recorders(
             let (ready_tx, ready_rx) = oneshot::channel();
             recorders
                 .spawn(format!("ingress-tx-data-recorder-{sid}"), move |stop| {
-                    if let Err(e) = record_stream_until_stopped(
+                    let outcome = record_stream_until_stopped(
                         aeron_dir.as_deref(),
                         &aeron_cfg,
                         &channels.tx_data_channel(sid),
                         channels.tx_data_stream_id(sid),
                         RecorderKind::TxData { sequencer_id: sid },
                         &stop,
-                        |outcome| {
-                            if let Ok(recording_id) = &outcome {
-                                tracing::info!(
-                                    shard = sid,
-                                    recording_id = *recording_id,
-                                    "ingress: recording tx_data shard"
-                                );
-                            }
-                            let _ = ready_tx.send((sid, outcome));
-                        },
-                    ) {
-                        tracing::error!(shard = sid, error = %e, "tx_data recorder exited with error");
-                    }
+                        |outcome| report_recorder_outcome(sid, outcome, ready_tx),
+                    );
+                    let _ = outcome
+                        .inspect_err(|e| tracing::error!(shard = sid, error = %e, "tx_data recorder exited with error"));
                 })
                 .map(|()| ready_rx)
         })
         .collect::<std::io::Result<Vec<_>>>()
         .context("spawn tx_data recorder thread")?;
     Ok((recorders, ready))
+}
+
+/// Logs an active recording, then reports one shard's startup outcome
+/// on its `oneshot`. This is the callback [`record_stream_until_stopped`]
+/// calls once, from inside `spawn_tx_data_recorders`.
+fn report_recorder_outcome(
+    sid: u8,
+    outcome: Result<i64, String>,
+    ready_tx: oneshot::Sender<(u8, Result<i64, String>)>,
+) {
+    if let Ok(recording_id) = &outcome {
+        tracing::info!(
+            shard = sid,
+            recording_id = *recording_id,
+            "ingress: recording tx_data shard"
+        );
+    }
+    let _ = ready_tx.send((sid, outcome));
 }
 
 /// Waits until every recorder thread reports readiness. Fails on the

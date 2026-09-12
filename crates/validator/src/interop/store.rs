@@ -145,6 +145,18 @@ impl Lane {
             self.floor = LaneFloor::Known(front.seq.saturating_add(1));
         }
     }
+
+    /// Scans this lane from `from_seq` onward: everything retained, plus
+    /// its floor and the store's current head.
+    fn scan(&self, from_seq: u64, floor_block: u64, head_block: u64) -> LaneScan {
+        let idx = self.msgs.partition_point(|m| m.seq < from_seq);
+        LaneScan {
+            msgs: self.msgs.range(idx..).cloned().collect(),
+            floor_seq: self.floor,
+            floor_block,
+            head_block,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -240,15 +252,7 @@ impl FeedStore {
             // the real lower bound.
             let floor_block = cutoff.max(self.resume_block.unwrap_or(0));
             match g.lanes.get(&dest) {
-                Some(lane) => {
-                    let idx = lane.msgs.partition_point(|m| m.seq < from_seq);
-                    LaneScan {
-                        msgs: lane.msgs.range(idx..).cloned().collect(),
-                        floor_seq: lane.floor,
-                        floor_block,
-                        head_block: g.head_block,
-                    }
-                }
+                Some(lane) => lane.scan(from_seq, floor_block, g.head_block),
                 None => LaneScan {
                     msgs: Vec::new(),
                     // No message for this lane since the start.

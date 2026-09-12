@@ -372,18 +372,28 @@ impl BalPublisher {
         deadline: Instant,
     ) -> Option<PublishOutcome> {
         match self.pubh.publish_bytes(frame.aligned()) {
-            Ok(_) => return Some(PublishOutcome::Ok),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("NOT_CONNECTED") {
-                    tracing::debug!(block, "BAL: no subscriber; frame retained for replay");
-                    return Some(PublishOutcome::NotConnected);
-                }
-                if Instant::now() >= deadline {
-                    tracing::warn!(block, error = %e, "BAL live publish deadline exhausted; frame retained for replay");
-                    return Some(PublishOutcome::DeadlineExhausted);
-                }
-            }
+            Ok(_) => Some(PublishOutcome::Ok),
+            Err(e) => Self::classify_publish_error(&e, block, deadline),
+        }
+    }
+
+    /// Classifies one `publish_bytes` failure. Returns `Some` when
+    /// retrying is pointless: `NOT_CONNECTED` is terminal, and a spent
+    /// deadline stops the retry loop. Returns `None` when the caller
+    /// should sleep and retry.
+    fn classify_publish_error(
+        e: &kardamom_log::LogError,
+        block: u64,
+        deadline: Instant,
+    ) -> Option<PublishOutcome> {
+        let msg = e.to_string();
+        if msg.contains("NOT_CONNECTED") {
+            tracing::debug!(block, "BAL: no subscriber; frame retained for replay");
+            return Some(PublishOutcome::NotConnected);
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(block, error = %e, "BAL live publish deadline exhausted; frame retained for replay");
+            return Some(PublishOutcome::DeadlineExhausted);
         }
         None
     }

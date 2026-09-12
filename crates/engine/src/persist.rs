@@ -257,39 +257,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let addr = Address::from([0xAB; 20]);
 
-        // First boot: commit blocks 1..=3, then shut down.
-        {
-            let env = StateEnvBuilder::new(dir.path())
-                .durability(Durability::SafeNoSync)
-                .open()
-                .unwrap();
-            let mut handle = StateWriter::spawn(env).unwrap();
-            let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
-            with_queue(&handle.delta_tx, |queue| {
-                for b in 1..=3 {
-                    queue
-                        .submit(boundary(b), block_delta(b, addr, b * 10))
-                        .unwrap();
-                }
-            });
-            assert_eq!(signal.wait_committed(3).unwrap(), 3);
-            handle.shutdown().unwrap();
-        }
+        commit_three_blocks_then_shutdown(dir.path(), addr);
+        assert_reopened_state_persisted(dir.path(), addr);
+    }
 
-        // Second boot: reopen the same path; the chain state survived.
-        {
-            let env = StateEnvBuilder::new(dir.path())
-                .durability(Durability::SafeNoSync)
-                .open()
-                .unwrap();
-            let rp = read_recovery_point(&env).unwrap();
-            assert_eq!(rp.last_committed_block, 3);
+    /// First boot: commit blocks 1..=3 through a fresh writer, then shut it
+    /// down.
+    fn commit_three_blocks_then_shutdown(dir: &std::path::Path, addr: Address) {
+        let env = StateEnvBuilder::new(dir)
+            .durability(Durability::SafeNoSync)
+            .open()
+            .unwrap();
+        let mut handle = StateWriter::spawn(env).unwrap();
+        let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
+        with_queue(&handle.delta_tx, |queue| {
+            for b in 1..=3 {
+                queue
+                    .submit(boundary(b), block_delta(b, addr, b * 10))
+                    .unwrap();
+            }
+        });
+        assert_eq!(signal.wait_committed(3).unwrap(), 3);
+        handle.shutdown().unwrap();
+    }
 
-            let snap = StateSnapshot::open(&env).unwrap();
-            let (nonce, balance, _) = snap.basic(addr).unwrap().unwrap();
-            assert_eq!(nonce, 3);
-            assert_eq!(balance, U256::from(30u64));
-        }
+    /// Second boot: reopen the env at `dir` and check the chain state
+    /// survived.
+    fn assert_reopened_state_persisted(dir: &std::path::Path, addr: Address) {
+        let env = StateEnvBuilder::new(dir)
+            .durability(Durability::SafeNoSync)
+            .open()
+            .unwrap();
+        let rp = read_recovery_point(&env).unwrap();
+        assert_eq!(rp.last_committed_block, 3);
+
+        let snap = StateSnapshot::open(&env).unwrap();
+        let (nonce, balance, _) = snap.basic(addr).unwrap().unwrap();
+        assert_eq!(nonce, 3);
+        assert_eq!(balance, U256::from(30u64));
     }
 
     #[test]

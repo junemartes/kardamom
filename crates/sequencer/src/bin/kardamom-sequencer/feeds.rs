@@ -17,6 +17,8 @@
 //! Async-capable work, such as the receipts fan-in on an existing tokio
 //! channel, is a plain task. It uses `select!` on `Shutdown::cancelled`.
 
+mod steps;
+
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
@@ -192,33 +194,22 @@ impl EgressWatermarkFeed {
         if frame.first() != Some(&wire::EGRESS_KIND_CONTIGUITY_REJECT) {
             return false;
         }
-        if let Ok(EgressItem::ContiguityReject {
+        let Ok(EgressItem::ContiguityReject {
             sender,
             nonce,
             expected,
         }) = EgressItem::decode(frame)
-        {
-            tracing::warn!(
-                partition = self.partition,
-                ?sender,
-                nonce,
-                expected,
-                "sealer contiguity reject received"
-            );
-            match self.reject_tx.try_send((sender, nonce, expected)) {
-                Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
-                Err(crossbeam_channel::TrySendError::Full(_)) => {
-                    // The publish loop is stalled past the resync window
-                    // already. Dropping is safe: the confirm-timeout sweep
-                    // still rewinds and republishes the affected ref, only
-                    // later.
-                    tracing::warn!(
-                        partition = self.partition,
-                        "contiguity-reject channel full; dropping"
-                    );
-                }
-            }
-        }
+        else {
+            return true;
+        };
+        tracing::warn!(
+            partition = self.partition,
+            ?sender,
+            nonce,
+            expected,
+            "sealer contiguity reject received"
+        );
+        self.forward_contiguity_reject(sender, nonce, expected);
         true
     }
 
@@ -330,7 +321,7 @@ impl ReceiptFloorFeed {
         loop {
             match self.tick(&mut rx, &shutdown).await {
                 ControlFlow::Break(()) => return,
-                ControlFlow::Continue(()) => {}
+                ControlFlow::Continue(()) => (),
             }
         }
     }
@@ -479,10 +470,7 @@ impl NonceLookupFeed {
                 None => ControlFlow::Break(()),
             },
             req = self.rx.recv() => match req {
-                Some(sender) => {
-                    self.on_request(sender);
-                    ControlFlow::Continue(())
-                }
+                Some(sender) => self.on_lookup_request(sender),
                 None => ControlFlow::Break(()),
             },
         }
@@ -495,16 +483,7 @@ impl NonceLookupFeed {
         seq_metrics::record_nonce_lookups_in_flight(self.partition, self.in_flight.len());
         let nonce = match done.result {
             Ok(nonce) => nonce,
-            Err(e) => {
-                let outcome = if e.contains("timed out") {
-                    "timeout"
-                } else {
-                    "error"
-                };
-                seq_metrics::record_nonce_lookup(self.partition, outcome);
-                tracing::warn!(sender = ?done.sender, error = %e, "nonce lookup failed");
-                return ControlFlow::Continue(());
-            }
+            Err(e) => return self.record_lookup_error(done.sender, &e),
         };
         seq_metrics::record_nonce_lookup(self.partition, "ok");
         tracing::debug!(sender = ?done.sender, nonce, "nonce lookup answered");

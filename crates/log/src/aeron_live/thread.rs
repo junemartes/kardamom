@@ -92,13 +92,21 @@ impl SubEntry {
                 fragments > 0
             }
             Err(e) => {
-                if !self.poll_failed {
-                    warn!(error = ?e, "subscription poll failed");
-                    self.poll_failed = true;
-                }
+                self.note_poll_failure(&e);
                 false
             }
         }
+    }
+
+    /// Log on the transition into the poll-failed state, then latch it. A
+    /// run of failing polls on the thread's hot loop then logs once, not
+    /// on every pass.
+    fn note_poll_failure(&mut self, e: &impl std::fmt::Debug) {
+        if self.poll_failed {
+            return;
+        }
+        warn!(error = ?e, "subscription poll failed");
+        self.poll_failed = true;
     }
 }
 
@@ -164,9 +172,8 @@ impl AeronThread {
     /// disconnects.
     fn run(mut self) -> Result<(), LogError> {
         loop {
-            match self.step() {
-                ControlFlow::Break(()) => return Ok(()),
-                ControlFlow::Continue(()) => {}
+            if let ControlFlow::Break(()) = self.step() {
+                return Ok(());
             }
         }
     }
@@ -227,15 +234,21 @@ impl AeronThread {
         } else {
             self.backoff.idle_wait()
         };
-        match self.wait_for_cmd(wait) {
-            ControlFlow::Break(()) => ControlFlow::Break(()),
-            ControlFlow::Continue(handled) => {
-                if handled {
-                    self.backoff.reset();
-                }
-                ControlFlow::Continue(())
-            }
+        let outcome = self.wait_for_cmd(wait);
+        self.finish_wait(outcome)
+    }
+
+    /// Turn [`Self::wait_for_cmd`]'s outcome into `step`'s outcome. A stop
+    /// signal passes through unchanged. A handled command also resets the
+    /// idle backoff, matching every other work path this pass took.
+    fn finish_wait(&mut self, outcome: ControlFlow<(), bool>) -> ControlFlow<()> {
+        let ControlFlow::Continue(handled) = outcome else {
+            return ControlFlow::Break(());
+        };
+        if handled {
+            self.backoff.reset();
         }
+        ControlFlow::Continue(())
     }
 
     /// Drain every queued command (non-blocking). Publishes are enqueued
@@ -469,9 +482,8 @@ fn poll_until_attached(
     uri: &str,
 ) -> Result<(), LogError> {
     loop {
-        match poll_attach_step(dest, start, uri) {
-            ControlFlow::Break(result) => return result,
-            ControlFlow::Continue(()) => {}
+        if let ControlFlow::Break(result) = poll_attach_step(dest, start, uri) {
+            return result;
         }
     }
 }

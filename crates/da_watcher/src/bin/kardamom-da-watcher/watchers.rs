@@ -154,9 +154,8 @@ impl Watchers {
     /// one fired.
     async fn watch_for_halt(&self) -> &'static str {
         loop {
-            match self.poll_halt_step().await {
-                ControlFlow::Break(reason) => return reason,
-                ControlFlow::Continue(()) => {}
+            if let ControlFlow::Break(reason) = self.poll_halt_step().await {
+                return reason;
             }
         }
     }

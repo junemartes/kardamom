@@ -137,26 +137,41 @@ pub fn collect_outbox_messages(
     receipts
         .iter()
         .flat_map(|receipt| receipt.logs.iter().map(move |log| (receipt, log)))
-        .try_fold(Vec::new(), |mut out, (receipt, log)| {
-            let site = LogSite {
-                origin_chain_id,
-                block: block_number,
-                tx_index: receipt.transaction_index,
-            };
-            if let Some(msg) = decode_message_sent(site, log)? {
-                if let Some((granularity, idx)) = claims {
-                    cross_check_claim(
-                        block_number,
-                        receipt.transaction_index,
-                        &msg,
-                        granularity,
-                        idx,
-                    )?;
-                }
-                out.push(msg.message);
-            }
-            Ok(out)
+        .try_fold(Vec::new(), |out, (receipt, log)| {
+            accumulate_outbox_message(out, origin_chain_id, block_number, receipt, log, claims)
         })
+}
+
+/// Decodes one log as an outbox send, cross-checks it against `claims`
+/// when given, and appends it to `out`. Returns `out` unchanged for a
+/// log that is not a `MessageSent` from the Outbox predeploy.
+fn accumulate_outbox_message(
+    mut out: Vec<OutboxMessage>,
+    origin_chain_id: u64,
+    block_number: u64,
+    receipt: &Receipt,
+    log: &WireLog,
+    claims: Option<(NonZeroU16, &ClaimIndex)>,
+) -> Result<Vec<OutboxMessage>, OutboxExtractError> {
+    let site = LogSite {
+        origin_chain_id,
+        block: block_number,
+        tx_index: receipt.transaction_index,
+    };
+    let Some(msg) = decode_message_sent(site, log)? else {
+        return Ok(out);
+    };
+    if let Some((granularity, idx)) = claims {
+        cross_check_claim(
+            block_number,
+            receipt.transaction_index,
+            &msg,
+            granularity,
+            idx,
+        )?;
+    }
+    out.push(msg.message);
+    Ok(out)
 }
 
 /// One decoded send plus the fields the claim cross-check needs.

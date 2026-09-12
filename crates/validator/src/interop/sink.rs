@@ -123,6 +123,15 @@ impl<P: TxReceiptsPublication> ExtractingReceiptSink<P> {
         self.store.append_block(block, msgs);
         Ok(())
     }
+
+    /// Buffers `r` for later outbox extraction, if it has any
+    /// outbox-address logs.
+    fn buffer_if_outbox(&mut self, r: &Receipt) {
+        if !r.logs.iter().any(|l| l.address == OUTBOX) {
+            return;
+        }
+        self.pending.push(r.block_number, r.clone());
+    }
 }
 
 impl<P: TxReceiptsPublication> TxReceiptsPublication for ExtractingReceiptSink<P> {
@@ -132,11 +141,7 @@ impl<P: TxReceiptsPublication> TxReceiptsPublication for ExtractingReceiptSink<P
         // diverging block must never reach the feed.
         let mut boundary = None;
         match &msg {
-            CMessage::Receipt(r) => {
-                if r.logs.iter().any(|l| l.address == OUTBOX) {
-                    self.pending.push(r.block_number, r.clone());
-                }
-            }
+            CMessage::Receipt(r) => self.buffer_if_outbox(r),
             CMessage::BlockBoundary(b) => boundary = Some(b.block_number),
         }
         self.inner.publish(msg)?;

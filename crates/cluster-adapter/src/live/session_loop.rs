@@ -305,31 +305,11 @@ impl SessionLoop {
 
     fn on_driver_event(&mut self, ev: DriverEvent) {
         match ev {
-            DriverEvent::AppMessage(payload) => {
-                self.subscribe_confirmed = true;
-                let wanted = self
-                    .egress_kind_filter
-                    .as_ref()
-                    .is_none_or(|ks| payload.first().is_some_and(|k| ks.contains(k)));
-                if wanted && self.egress_alive && self.out_tx.send(payload).is_err() {
-                    self.egress_alive = false;
-                }
-            }
+            DriverEvent::AppMessage(payload) => self.on_app_message(payload),
             DriverEvent::Reconnect {
                 leader_member_id,
                 ingress_endpoints,
-            } => {
-                if let Some(p) = open_leader_pub(
-                    &self.rt,
-                    &ingress_endpoints,
-                    leader_member_id,
-                    self.cfg.ingress_stream_id,
-                ) {
-                    self.ingress = p;
-                    self.endpoints = ingress_endpoints;
-                    self.target_member = leader_member_id;
-                }
-            }
+            } => self.on_reconnect(leader_member_id, ingress_endpoints),
             DriverEvent::Connected { cluster_session_id } => {
                 tracing::info!(cluster_session_id, "cluster session opened");
                 // Canonical-stream consumers request replay from their
@@ -343,6 +323,37 @@ impl SessionLoop {
             DriverEvent::Failed(reason) => {
                 tracing::error!(%reason, "cluster session failed");
             }
+        }
+    }
+
+    /// One app payload from egress. The session filter already passed, so
+    /// this confirms the subscribe. The kind filter then decides whether the
+    /// consumer sees the payload. A closed consumer channel ends the egress
+    /// direction.
+    fn on_app_message(&mut self, payload: Vec<u8>) {
+        self.subscribe_confirmed = true;
+        let wanted = self
+            .egress_kind_filter
+            .as_ref()
+            .is_none_or(|ks| payload.first().is_some_and(|k| ks.contains(k)));
+        if wanted && self.egress_alive && self.out_tx.send(payload).is_err() {
+            self.egress_alive = false;
+        }
+    }
+
+    /// Re-point ingress at a new leader. The endpoints and the target member
+    /// move together with the publication, so a failed open keeps all three
+    /// on the old leader.
+    fn on_reconnect(&mut self, leader_member_id: i32, ingress_endpoints: String) {
+        if let Some(p) = open_leader_pub(
+            &self.rt,
+            &ingress_endpoints,
+            leader_member_id,
+            self.cfg.ingress_stream_id,
+        ) {
+            self.ingress = p;
+            self.endpoints = ingress_endpoints;
+            self.target_member = leader_member_id;
         }
     }
 
@@ -426,32 +437,39 @@ impl SessionLoop {
             self.replay_cursor_at_send = cursor;
             self.replay_resend.last_ms = Some(now);
         } else if self.replay_resend.due(now) {
-            let req = crate::wire::encode_replay_request(cursor.0, cursor.1);
-            if let Some(framed) = self.driver.wrap_app(&req, now_ms_i64(now)) {
-                // This is a retrying publish, not best-effort. This rare,
-                // critical message is sent exactly when the ingress
-                // publication is at its busiest (mass reconnects under
-                // churn). A best-effort deadline would drop it every 3s, in
-                // lockstep with the backpressure that caused the stall.
-                // This call runs inline on this loop, not on a helper
-                // thread, to keep client-side ordering in the replay path
-                // correct. The ack wait is bounded (10s), and the 90s
-                // cluster session timeout tolerates it. The `Result` is
-                // still checked, not discarded.
-                if let Err(e) = self.ingress.publish_bytes(to_aligned(&framed)) {
-                    tracing::warn!(
-                        error = %e,
-                        "cluster replay request publish failed (will resend)"
-                    );
-                }
-                tracing::info!(
-                    next_index = cursor.0,
-                    next_block = cursor.1,
-                    "cluster replay requested"
-                );
-                self.replay_cursor_at_send = cursor;
-            }
+            self.publish_replay_request(cursor, now);
         }
+    }
+
+    /// Send one replay request for `cursor`, and move the progress
+    /// checkpoint to it. The driver drops the request while the session is
+    /// not established, and the caller then resends it.
+    fn publish_replay_request(&mut self, cursor: (u64, u64), now: u64) {
+        let req = crate::wire::encode_replay_request(cursor.0, cursor.1);
+        let Some(framed) = self.driver.wrap_app(&req, now_ms_i64(now)) else {
+            return;
+        };
+        // This is a retrying publish, not best-effort. This rare, critical
+        // message is sent exactly when the ingress publication is at its
+        // busiest (mass reconnects under churn). A best-effort deadline
+        // would drop it every 3s, in lockstep with the backpressure that
+        // caused the stall. This call runs inline on this loop, not on a
+        // helper thread, to keep client-side ordering in the replay path
+        // correct. The ack wait is bounded (10s), and the 90s cluster
+        // session timeout tolerates it. The `Result` is still checked, not
+        // discarded.
+        if let Err(e) = self.ingress.publish_bytes(to_aligned(&framed)) {
+            tracing::warn!(
+                error = %e,
+                "cluster replay request publish failed (will resend)"
+            );
+        }
+        tracing::info!(
+            next_index = cursor.0,
+            next_block = cursor.1,
+            "cluster replay requested"
+        );
+        self.replay_cursor_at_send = cursor;
     }
 
     /// Duty 2: connect and keep-alive frames. The driver self-heals: it

@@ -225,26 +225,32 @@ impl Segments {
                 tx_idx,
                 envelope,
                 position,
-            } => {
-                let seg_tx = SegTx {
+            } => self.push_tx(
+                i,
+                SegTx {
                     tx_idx: *tx_idx,
                     position: *position,
                     envelope: envelope.clone(),
-                };
-                match self.0.last_mut() {
-                    Some(Segment::Txs { txs, .. }) => txs.push(seg_tx),
-                    _ => self.0.push(Segment::Txs {
-                        start: i,
-                        txs: vec![seg_tx],
-                    }),
-                }
-            }
+                },
+            ),
             BufferedRecord::Deposit { .. } | BufferedRecord::XChain { .. } => {
                 self.0.push(Segment::Singleton {
                     at: i,
                     rec: rec.clone(),
                 });
             }
+        }
+    }
+
+    /// Extends the last run of consecutive transactions with `seg_tx`, or
+    /// starts a new run at block-global index `i`.
+    fn push_tx(&mut self, i: u64, seg_tx: SegTx) {
+        match self.0.last_mut() {
+            Some(Segment::Txs { txs, .. }) => txs.push(seg_tx),
+            _ => self.0.push(Segment::Txs {
+                start: i,
+                txs: vec![seg_tx],
+            }),
         }
     }
 }

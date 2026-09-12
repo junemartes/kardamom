@@ -4,9 +4,23 @@
 
 use kardamom_da_watcher::interop::RemoteEpochPublisher;
 use kardamom_da_watcher::{EpochPublisher, PublishError};
+use kardamom_log::LogError;
 use kardamom_log::aeron_live::{TxDepositsPublisherHandle, TxRemoteEpochsPublisherHandle};
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, EpochRecord};
+
+/// Classify a publish failure as backpressure or a transport error.
+///
+/// Matches Aeron's own `BACK_PRESSURED` token from `offer_code_str`, not
+/// the prose "back-pressure".
+fn classify_publish_error(e: &LogError) -> PublishError {
+    let msg = e.to_string();
+    if msg.contains("BACK_PRESSURED") {
+        PublishError::Backpressure
+    } else {
+        PublishError::Transport(msg)
+    }
+}
 
 /// Live [`EpochPublisher`] backed by an Aeron `tx_deposits` publication.
 /// It publishes one epoch per finalized L1 block on `tx_deposits`. The
@@ -24,19 +38,9 @@ impl LiveTxDepositsPublisher {
 
 impl EpochPublisher for LiveTxDepositsPublisher {
     fn publish(&self, epoch: &EpochRecord) -> Result<BPosition, PublishError> {
-        match self.handle.publish(epoch) {
-            Ok(pos) => Ok(pos),
-            Err(e) => {
-                let msg = e.to_string();
-                // Match Aeron's own `BACK_PRESSURED` token from
-                // `offer_code_str`, not the prose "back-pressure".
-                if msg.contains("BACK_PRESSURED") {
-                    Err(PublishError::Backpressure)
-                } else {
-                    Err(PublishError::Transport(msg))
-                }
-            }
-        }
+        self.handle
+            .publish(epoch)
+            .map_err(|e| classify_publish_error(&e))
     }
 }
 
@@ -64,18 +68,8 @@ impl RemoteEpochPublisher for LiveRemoteEpochsPublisher {
     /// existed, leaving a permanent hole in the pair's dense seq that the
     /// destination halts on and no retry can fill.
     fn publish(&self, record: &RemoteEpochRecord) -> Result<BPosition, PublishError> {
-        match self.handle.publish(record) {
-            Ok(pos) => Ok(pos),
-            Err(e) => {
-                let msg = e.to_string();
-                // Match Aeron's own `BACK_PRESSURED` token from
-                // `offer_code_str`, not the prose "back-pressure".
-                if msg.contains("BACK_PRESSURED") {
-                    Err(PublishError::Backpressure)
-                } else {
-                    Err(PublishError::Transport(msg))
-                }
-            }
-        }
+        self.handle
+            .publish(record)
+            .map_err(|e| classify_publish_error(&e))
     }
 }

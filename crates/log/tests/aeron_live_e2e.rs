@@ -66,11 +66,13 @@ async fn aeron_live_send_friendly_round_trip() {
     let mut received: Vec<TxEnvelope> = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while received.len() < 50 && std::time::Instant::now() < deadline {
-        match recv_step(&mut subscriber).await {
-            Ok(Some(env)) => received.push(env),
-            Ok(None) => break,
-            Err(_) => {}
-        }
+        let Ok(step) = recv_step(&mut subscriber).await else {
+            continue; // recv timed out this attempt; retry until the deadline
+        };
+        let Some(env) = step else {
+            break; // subscription ended
+        };
+        received.push(env);
     }
 
     assert_eq!(

@@ -219,48 +219,57 @@ impl TxReceiptsPublication for ValidatorReceiptSink {
             return Err(ExecutorError::Divergence(reason));
         }
         match msg {
-            CMessage::Receipt(local) => {
-                let Some(published) = self.receipts.take(local.tx_idx, self.wait) else {
-                    // No published receipt to compare against, so skip the check.
-                    metrics::counter_receipt_missing();
-                    return Ok(());
-                };
-                if receipt_consistent(&local, &published) {
-                    return Ok(());
-                }
-                // Include the tx identity, not only the mismatch, so
-                // responders can find the transaction without a separate
-                // hash lookup.
-                let reason = format!(
-                    "receipt mismatch at tx_idx {:?}: local(status={}, gas={}, wsh={}, \
-                     logs={}) vs published(status={}, gas={}, wsh={}, logs={}) \
-                     [tx_hash={} from={} to={:?} block={} tx_index={}]",
-                    local.tx_idx,
-                    local.status,
-                    local.gas_used,
-                    local.write_set_hash,
-                    local.logs.len(),
-                    published.status,
-                    published.gas_used,
-                    published.write_set_hash,
-                    published.logs.len(),
-                    local.tx_hash,
-                    local.from,
-                    local.to,
-                    local.block_number,
-                    local.transaction_index,
-                );
-                // Dump the flight ring first, on a best-effort basis. The
-                // stop is permanent, so this is the only chance to capture
-                // the block inputs behind the mismatch.
-                if let Some(f) = self.flight.as_ref() {
-                    f.dump_receipt_divergence(&local, &published);
-                }
-                Err(ExecutorError::Divergence(self.divergence.halt(reason)))
-            }
+            CMessage::Receipt(local) => self.check_receipt(&local),
             // A block boundary carries no per-tx data to check.
             CMessage::BlockBoundary(_) => Ok(()),
         }
+    }
+}
+
+impl ValidatorReceiptSink {
+    /// Cross-checks one local receipt against the executor's published
+    /// receipt. `Ok` when they match, or when no published receipt
+    /// turned up in time to compare (counted as `receipt_missing`).
+    /// `Err` halts the validator on a proven mismatch, after a
+    /// best-effort flight dump.
+    fn check_receipt(&self, local: &Receipt) -> Result<(), ExecutorError> {
+        let Some(published) = self.receipts.take(local.tx_idx, self.wait) else {
+            // No published receipt to compare against, so skip the check.
+            metrics::counter_receipt_missing();
+            return Ok(());
+        };
+        if receipt_consistent(local, &published) {
+            return Ok(());
+        }
+        // Include the tx identity, not only the mismatch, so
+        // responders can find the transaction without a separate
+        // hash lookup.
+        let reason = format!(
+            "receipt mismatch at tx_idx {:?}: local(status={}, gas={}, wsh={}, \
+             logs={}) vs published(status={}, gas={}, wsh={}, logs={}) \
+             [tx_hash={} from={} to={:?} block={} tx_index={}]",
+            local.tx_idx,
+            local.status,
+            local.gas_used,
+            local.write_set_hash,
+            local.logs.len(),
+            published.status,
+            published.gas_used,
+            published.write_set_hash,
+            published.logs.len(),
+            local.tx_hash,
+            local.from,
+            local.to,
+            local.block_number,
+            local.transaction_index,
+        );
+        // Dump the flight ring first, on a best-effort basis. The
+        // stop is permanent, so this is the only chance to capture
+        // the block inputs behind the mismatch.
+        if let Some(f) = self.flight.as_ref() {
+            f.dump_receipt_divergence(local, &published);
+        }
+        Err(ExecutorError::Divergence(self.divergence.halt(reason)))
     }
 }
 

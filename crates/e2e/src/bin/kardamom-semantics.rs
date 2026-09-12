@@ -243,6 +243,16 @@ async fn l1_batch_case(t: &Target, l1: Option<(&str, alloy_primitives::Address)>
     l1_batch::l1_batch(t, rpc, settlement).await
 }
 
+/// Print a note when ingress `/metrics` is unreachable.
+///
+/// Only the queue-depth probe needs ingress metrics, and Target L
+/// already covers it.
+fn warn_if_no_ingress_metrics(have_ingress_metrics: bool) {
+    if !have_ingress_metrics {
+        println!("    (ingress /metrics not reachable — queue-depth probe skipped)");
+    }
+}
+
 async fn run_case(
     case: &str,
     t: &Target,
@@ -265,11 +275,7 @@ async fn run_case(
             .await
         }
         "rpc-liveness" => {
-            if !have_ingress_metrics {
-                // Only the queue-depth probe needs ingress metrics, and
-                // Target L already covers it.
-                println!("    (ingress /metrics not reachable — queue-depth probe skipped)");
-            }
+            warn_if_no_ingress_metrics(have_ingress_metrics);
             rpc_liveness::run(
                 t,
                 rpc_liveness::Params {

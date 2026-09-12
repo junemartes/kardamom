@@ -62,7 +62,7 @@ where
             match self.rx.recv().await {
                 Ok(item) => self.watcher.on_item(item).await,
                 Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => (),
             }
         }
     }

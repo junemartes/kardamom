@@ -330,7 +330,7 @@ impl<S: L1EpochSource> Verifier<S> {
             attempt += 1;
             match self.verify_attempt(epoch, attempt).await {
                 std::ops::ControlFlow::Break(verdict) => return verdict,
-                std::ops::ControlFlow::Continue(()) => {}
+                std::ops::ControlFlow::Continue(()) => (),
             }
         }
     }

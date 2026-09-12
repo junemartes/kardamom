@@ -94,19 +94,27 @@ impl<'a> Sweep<'a> {
         }
     }
 
+    /// Checks the schema version: the key must be present, must decode, and
+    /// must hold [`SCHEMA_VERSION`].
+    fn check_schema_version(&mut self) -> Result<(), StateError> {
+        let Some(b) = self.get_meta(KEY_SCHEMA_VERSION)? else {
+            self.problem("schema_version missing".into());
+            return Ok(());
+        };
+        match decode_u32(&b) {
+            Ok(v) if v == SCHEMA_VERSION => (),
+            Ok(v) => self.problem(format!("schema_version {v} != expected {SCHEMA_VERSION}")),
+            Err(e) => self.problem(format!("schema_version undecodable: {e}")),
+        }
+        Ok(())
+    }
+
     /// Checks meta: schema version, genesis, and cursors.
     ///
     /// Returns the decoded `last_committed_end_tx_position` cursor. The
     /// headers and receipts checks cross-reference this value.
     pub(super) fn meta(&mut self) -> Result<Option<BPosition>, StateError> {
-        match self.get_meta(KEY_SCHEMA_VERSION)? {
-            Some(b) => match decode_u32(&b) {
-                Ok(v) if v == SCHEMA_VERSION => {}
-                Ok(v) => self.problem(format!("schema_version {v} != expected {SCHEMA_VERSION}")),
-                Err(e) => self.problem(format!("schema_version undecodable: {e}")),
-            },
-            None => self.problem("schema_version missing".into()),
-        }
+        self.check_schema_version()?;
         let genesis_applied = self.get_meta(KEY_GENESIS_APPLIED)?.is_some();
         if !genesis_applied {
             self.problem("genesis_applied flag missing (DB never seeded)".into());
@@ -161,20 +169,26 @@ impl<'a> Sweep<'a> {
             Err(e) => self.problem(format!("headers[{block}] undecodable: {e}")),
         }
         if let Some(p) = state.prev_block {
-            match p.checked_add(1) {
-                Some(expected) if block != expected => {
-                    self.problem(format!("headers gap: {p} -> {block}"));
-                }
-                Some(_) => {}
-                None => self.problem(format!(
-                    "headers key {p} has no successor block number (u64 overflow)"
-                )),
-            }
+            self.check_block_follows(p, block);
         }
         state.first_block.get_or_insert(block);
         state.prev_block = Some(block);
         self.r.headers += 1;
         ControlFlow::Continue(())
+    }
+
+    /// Checks that `block` directly follows `prev` in the header chain. A
+    /// skipped block number, or a `prev` with no successor, is a problem.
+    fn check_block_follows(&mut self, prev: u64, block: u64) {
+        match prev.checked_add(1) {
+            Some(expected) if block != expected => {
+                self.problem(format!("headers gap: {prev} -> {block}"));
+            }
+            Some(_) => (),
+            None => self.problem(format!(
+                "headers key {prev} has no successor block number (u64 overflow)"
+            )),
+        }
     }
 
     /// Checks the properties that only hold once the whole `headers` table has
@@ -243,40 +257,56 @@ impl<'a> Sweep<'a> {
         value: &[u8],
         meta_end_tx: Option<BPosition>,
     ) -> Result<(), StateError> {
-        match (decode_b_position(key), decode_receipt_value(value)) {
-            (Ok(pos), Ok(receipt)) => {
-                if receipt.tx_idx != pos {
-                    self.problem(format!(
-                        "receipts[{pos:?}] carries tx_idx {:?}",
-                        receipt.tx_idx
-                    ));
-                }
-                // Index must map this receipt's hash back to this position.
-                match self
-                    .txn
-                    .get::<Vec<u8>>(tx_hash_db.dbi(), &encode_tx_hash_key(receipt.tx_hash))?
-                {
-                    Some(index_bytes) => match decode_tx_hash_value(&index_bytes) {
-                        Ok(indexed_pos) if indexed_pos == pos => {}
-                        Ok(indexed_pos) => self.problem(format!(
-                            "tx_hash_index[{}] -> {indexed_pos:?}, receipt sits at {pos:?}",
-                            receipt.tx_hash
-                        )),
-                        Err(e) => self.problem(format!("tx_hash_index[{}]: {e}", receipt.tx_hash)),
-                    },
-                    None => self.problem(format!(
-                        "receipt {:?} missing from tx_hash_index",
-                        receipt.tx_hash
-                    )),
-                }
-                if let Some(m) = meta_end_tx
-                    && pos > m
-                {
-                    self.problem(format!("receipt at {pos:?} beyond meta cursor {m:?}"));
-                }
+        let pos = match decode_b_position(key) {
+            Ok(pos) => pos,
+            Err(e) => {
+                self.problem(format!("receipts key: {e}"));
+                return Ok(());
             }
-            (Err(e), _) => self.problem(format!("receipts key: {e}")),
-            (_, Err(e)) => self.problem(format!("receipts value at {key:02x?}: {e}")),
+        };
+        let receipt = match decode_receipt_value(value) {
+            Ok(receipt) => receipt,
+            Err(e) => {
+                self.problem(format!("receipts value at {key:02x?}: {e}"));
+                return Ok(());
+            }
+        };
+        if receipt.tx_idx != pos {
+            self.problem(format!(
+                "receipts[{pos:?}] carries tx_idx {:?}",
+                receipt.tx_idx
+            ));
+        }
+        self.check_receipt_indexed(tx_hash_db, receipt.tx_hash, pos)?;
+        if let Some(m) = meta_end_tx
+            && pos > m
+        {
+            self.problem(format!("receipt at {pos:?} beyond meta cursor {m:?}"));
+        }
+        Ok(())
+    }
+
+    /// The `tx_hash_index` entry for one receipt: it must exist, and it must
+    /// map `tx_hash` back to `pos`.
+    fn check_receipt_indexed(
+        &mut self,
+        tx_hash_db: Database,
+        tx_hash: B256,
+        pos: BPosition,
+    ) -> Result<(), StateError> {
+        let Some(index_bytes) = self
+            .txn
+            .get::<Vec<u8>>(tx_hash_db.dbi(), &encode_tx_hash_key(tx_hash))?
+        else {
+            self.problem(format!("receipt {tx_hash:?} missing from tx_hash_index"));
+            return Ok(());
+        };
+        match decode_tx_hash_value(&index_bytes) {
+            Ok(indexed_pos) if indexed_pos == pos => (),
+            Ok(indexed_pos) => self.problem(format!(
+                "tx_hash_index[{tx_hash}] -> {indexed_pos:?}, receipt sits at {pos:?}"
+            )),
+            Err(e) => self.problem(format!("tx_hash_index[{tx_hash}]: {e}")),
         }
         Ok(())
     }
@@ -292,23 +322,38 @@ impl<'a> Sweep<'a> {
         let txn = self.txn;
         for_each_row(txn, tx_hash_db, |k, v| {
             index_entries += 1;
-            match decode_tx_hash_value(&v) {
-                Ok(pos) => {
-                    if txn
-                        .get::<Vec<u8>>(receipts_db.dbi(), &crate::meta::encode_b_position(pos))?
-                        .is_none()
-                    {
-                        self.problem(format!(
-                            "tx_hash_index entry {:02x?} -> {pos:?} has no receipt",
-                            super::head(&k)
-                        ));
-                    }
-                }
-                Err(e) => self.problem(format!("tx_hash_index value: {e}")),
-            }
+            self.check_index_row(receipts_db, &k, &v)?;
             Ok(ControlFlow::Continue(()))
         })?;
         Ok(index_entries)
+    }
+
+    /// One `tx_hash_index` row: the value must decode, and the position it
+    /// holds must have a receipt.
+    fn check_index_row(
+        &mut self,
+        receipts_db: Database,
+        k: &[u8],
+        v: &[u8],
+    ) -> Result<(), StateError> {
+        let pos = match decode_tx_hash_value(v) {
+            Ok(pos) => pos,
+            Err(e) => {
+                self.problem(format!("tx_hash_index value: {e}"));
+                return Ok(());
+            }
+        };
+        if self
+            .txn
+            .get::<Vec<u8>>(receipts_db.dbi(), &crate::meta::encode_b_position(pos))?
+            .is_none()
+        {
+            self.problem(format!(
+                "tx_hash_index entry {:02x?} -> {pos:?} has no receipt",
+                super::head(k)
+            ));
+        }
+        Ok(())
     }
 
     /// Checks accounts: rows decode, and declared code exists.
@@ -317,26 +362,41 @@ impl<'a> Sweep<'a> {
         let code_db = self.txn.open_db(Some(TABLE_CODE))?;
         let txn = self.txn;
         for_each_row(txn, accounts_db, |k, v| {
-            match decode_account_value(&v) {
-                Ok(a) => {
-                    if a.code_hash != B256::ZERO
-                        && a.code_hash != KECCAK_EMPTY
-                        && txn
-                            .get::<Vec<u8>>(code_db.dbi(), &encode_code_key(a.code_hash))?
-                            .is_none()
-                    {
-                        self.problem(format!(
-                            "account {:02x?} declares missing code {}",
-                            super::head(&k),
-                            a.code_hash
-                        ));
-                    }
-                }
-                Err(e) => self.problem(format!("accounts value at {:02x?}: {e}", super::head(&k))),
-            }
+            self.check_account_row(code_db, &k, &v)?;
             self.r.accounts += 1;
             Ok(ControlFlow::Continue(()))
         })?;
+        Ok(())
+    }
+
+    /// One `accounts` row: the value must decode, and any code hash it
+    /// declares must have a row in the `code` table.
+    fn check_account_row(
+        &mut self,
+        code_db: Database,
+        k: &[u8],
+        v: &[u8],
+    ) -> Result<(), StateError> {
+        let a = match decode_account_value(v) {
+            Ok(a) => a,
+            Err(e) => {
+                self.problem(format!("accounts value at {:02x?}: {e}", super::head(k)));
+                return Ok(());
+            }
+        };
+        if a.code_hash != B256::ZERO
+            && a.code_hash != KECCAK_EMPTY
+            && self
+                .txn
+                .get::<Vec<u8>>(code_db.dbi(), &encode_code_key(a.code_hash))?
+                .is_none()
+        {
+            self.problem(format!(
+                "account {:02x?} declares missing code {}",
+                super::head(k),
+                a.code_hash
+            ));
+        }
         Ok(())
     }
 

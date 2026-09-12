@@ -123,17 +123,7 @@ fn build_real_batch() -> RealBatch {
     .expect("pack batch");
     assert_eq!((batch.l2_block_start, batch.l2_block_end), (7, 8));
 
-    let expected_commitment = batch_records_commitment([7u64, 8].map(|n| {
-        let mut d = kardamom_types::BlockRecordsDigest::new(n);
-        match n {
-            7 => {
-                d.add_tx(&env_tx(0).raw_tx);
-                d.add_tx(&env_tx(1).raw_tx);
-            }
-            _ => d.add_tx(&env_tx(2).raw_tx),
-        }
-        d.finish()
-    }));
+    let expected_commitment = batch_records_commitment([7u64, 8].map(block_records_digest));
     assert_eq!(
         batch.records_commitment, expected_commitment,
         "batcher and guest-side commitment must agree"
@@ -143,6 +133,20 @@ fn build_real_batch() -> RealBatch {
         l2_block_end: batch.l2_block_end,
         records_commitment: expected_commitment,
     }
+}
+
+/// The guest-side records digest for block `n`, over the same envelope
+/// txs [`build_real_batch`] feeds to the accumulator for that block.
+fn block_records_digest(n: u64) -> B256 {
+    let mut d = kardamom_types::BlockRecordsDigest::new(n);
+    match n {
+        7 => {
+            d.add_tx(&env_tx(0).raw_tx);
+            d.add_tx(&env_tx(1).raw_tx);
+        }
+        _ => d.add_tx(&env_tx(2).raw_tx),
+    }
+    d.finish()
 }
 
 /// Write the prover's batch output files (zk-host batch layout) claiming

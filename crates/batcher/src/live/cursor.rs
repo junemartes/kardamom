@@ -126,16 +126,7 @@ pub(crate) async fn read_l1_truth<P: Provider>(
 ///   fork the DA history.
 pub(crate) fn reconcile(cursor: Option<BatchCursor>, l1: L1Truth) -> Result<(BatchCursor, u64)> {
     match cursor {
-        None => {
-            if l1.last_batch_index > 0 {
-                warn!(
-                    covered_through_block = l1.covered_through_block,
-                    "no cursor file but L1 has batches; genesis replay will skip re-posting \
-                     (requires cluster retention back to genesis)"
-                );
-            }
-            Ok((BatchCursor::genesis(), l1.covered_through_block))
-        }
+        None => Ok(genesis_reconcile(l1)),
         Some(c) if c.last_batch_index > l1.last_batch_index => bail!(
             "cursor file says batch {} was posted but L1 lastBatchIndex is {} — the L1 chain \
              regressed under a surviving cursor (anvil reset?); refusing to guess. Delete the \
@@ -145,6 +136,20 @@ pub(crate) fn reconcile(cursor: Option<BatchCursor>, l1: L1Truth) -> Result<(Bat
         ),
         Some(c) => Ok((c, l1.covered_through_block)),
     }
+}
+
+/// Build the starting cursor when no cursor file exists. Warns if L1
+/// already has batches: genesis replay then skips re-posting them, which
+/// needs cluster retention back to genesis.
+fn genesis_reconcile(l1: L1Truth) -> (BatchCursor, u64) {
+    if l1.last_batch_index > 0 {
+        warn!(
+            covered_through_block = l1.covered_through_block,
+            "no cursor file but L1 has batches; genesis replay will skip re-posting \
+             (requires cluster retention back to genesis)"
+        );
+    }
+    (BatchCursor::genesis(), l1.covered_through_block)
 }
 
 #[cfg(test)]

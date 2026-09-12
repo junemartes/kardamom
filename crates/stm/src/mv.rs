@@ -426,17 +426,7 @@ mod tests {
         let hash = alloy_primitives::keccak256(&code);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let reader = {
-            let mv = mv.clone();
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                let mut observed = 0u64;
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    observed += poll_created_account_visible(&mv, created);
-                }
-                observed
-            })
-        };
+        let reader = spawn_created_account_reader(&mv, created, &stop);
 
         // Publish the same CREATE write set repeatedly into fresh caches
         // so the reader keeps racing the window.
@@ -456,6 +446,24 @@ mod tests {
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         reader.join().expect("reader must not panic");
+    }
+
+    /// Start the racing reader. It polls until `stop` is set, and joins
+    /// with the count of repetitions that observed the created account.
+    fn spawn_created_account_reader(
+        mv: &std::sync::Arc<MvCache>,
+        created: Address,
+        stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<u64> {
+        let mv = mv.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut observed = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                observed += poll_created_account_visible(&mv, created);
+            }
+            observed
+        })
     }
 
     /// Poll once for the created account. Returns 1 if observed, after

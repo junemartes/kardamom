@@ -130,20 +130,24 @@ impl<'p> NodeStore<'p> {
         at: &alloy_trie::Nibbles,
     ) -> Result<TrieNode, AnchorError> {
         let (bytes, hash) = match r.as_hash() {
-            Some(h) => match self.nodes.get(&h) {
-                Some(b) => (*b, h),
-                None => {
-                    return Err(AnchorError::MissingNode {
-                        hash: h,
-                        path: *at,
-                        account: None,
-                    });
-                }
-            },
+            Some(h) => (self.node_bytes(h, at)?, h),
             None => (r.as_slice(), B256::ZERO),
         };
         let mut slice = bytes;
         TrieNode::decode(&mut slice).map_err(|_| AnchorError::NodeDecode { hash })
+    }
+
+    /// The carried bytes of the node the set keys under `hash`. A miss
+    /// names both the hash and the nibble position `at`.
+    fn node_bytes(&self, hash: B256, at: &alloy_trie::Nibbles) -> Result<&'p [u8], AnchorError> {
+        self.nodes
+            .get(&hash)
+            .copied()
+            .ok_or(AnchorError::MissingNode {
+                hash,
+                path: *at,
+                account: None,
+            })
     }
 }
 
@@ -234,50 +238,57 @@ impl<'a> WitnessAnchor<'a> {
         leaf: Lookup,
     ) -> Result<Option<TrieAccount>, AnchorError> {
         match leaf {
-            Lookup::Found(value) => {
-                let mut slice = value.as_slice();
-                let ta = TrieAccount::decode(&mut slice)
-                    .map_err(|_| AnchorError::Malformed("account leaf not a TrieAccount"))?;
-                if !acct.exists {
-                    return Err(AnchorError::Refuted {
-                        what: format!("account {} witnessed absent but included", acct.address),
-                    });
-                }
-                // The same normalization rule applies at the anchor. The
-                // state table stores "no code" as ZERO, but the trie leaf
-                // always uses KECCAK_EMPTY, and execution treats the two
-                // identically. So the witness (a capture of table reads)
-                // compares under the same mapping the recompute already
-                // writes with.
-                let witness_code_hash = crate::code_hash::to_revm_code_hash(acct.code_hash);
-                if ta.nonce != acct.nonce
-                    || ta.balance != acct.balance
-                    || ta.code_hash != witness_code_hash
-                {
-                    return Err(AnchorError::Refuted {
-                        what: format!("account {} fields diverge from trie leaf", acct.address),
-                    });
-                }
-                Ok(Some(ta))
-            }
-            Lookup::Absent => {
-                // The state table may keep an EIP-161-empty account as a
-                // row (a touched, zero-fee coinbase is the live shape),
-                // while the trie rightly excludes it. Execution semantics
-                // treat empty and absent the same, so the anchor does
-                // too: a witnessed-but-empty account is consistent with
-                // exclusion. Anything non-empty witnessed as present
-                // still gets refuted.
-                let empty =
-                    crate::code_hash::is_empty_account(acct.nonce, acct.balance, acct.code_hash);
-                if acct.exists && !empty {
-                    return Err(AnchorError::Refuted {
-                        what: format!("account {} witnessed present but excluded", acct.address),
-                    });
-                }
-                Ok(None)
-            }
+            Lookup::Found(value) => Self::prove_included_account(acct, &value).map(Some),
+            Lookup::Absent => Self::prove_excluded_account(acct).map(|()| None),
         }
+    }
+
+    /// Prove one witness account against the account leaf the trie
+    /// carries. Returns the decoded leaf, which the storage walk reads
+    /// the proven storage root from.
+    fn prove_included_account(
+        acct: &WitnessAccount,
+        value: &[u8],
+    ) -> Result<TrieAccount, AnchorError> {
+        let mut slice = value;
+        let ta = TrieAccount::decode(&mut slice)
+            .map_err(|_| AnchorError::Malformed("account leaf not a TrieAccount"))?;
+        if !acct.exists {
+            return Err(AnchorError::Refuted {
+                what: format!("account {} witnessed absent but included", acct.address),
+            });
+        }
+        // The same normalization rule applies at the anchor. The state
+        // table stores "no code" as ZERO, but the trie leaf always uses
+        // KECCAK_EMPTY, and execution treats the two identically. So the
+        // witness (a capture of table reads) compares under the same
+        // mapping the recompute already writes with.
+        let witness_code_hash = crate::code_hash::to_revm_code_hash(acct.code_hash);
+        if ta.nonce != acct.nonce || ta.balance != acct.balance || ta.code_hash != witness_code_hash
+        {
+            return Err(AnchorError::Refuted {
+                what: format!("account {} fields diverge from trie leaf", acct.address),
+            });
+        }
+        Ok(ta)
+    }
+
+    /// Prove one witness account against the trie's exclusion of it.
+    ///
+    /// The state table may keep an EIP-161-empty account as a row (a
+    /// touched, zero-fee coinbase is the live shape), while the trie
+    /// rightly excludes it. Execution semantics treat empty and absent
+    /// the same, so the anchor does too: a witnessed-but-empty account
+    /// is consistent with exclusion. Anything non-empty witnessed as
+    /// present still gets refuted.
+    fn prove_excluded_account(acct: &WitnessAccount) -> Result<(), AnchorError> {
+        let empty = crate::code_hash::is_empty_account(acct.nonce, acct.balance, acct.code_hash);
+        if acct.exists && !empty {
+            return Err(AnchorError::Refuted {
+                what: format!("account {} witnessed present but excluded", acct.address),
+            });
+        }
+        Ok(())
     }
 
     /// Prove every witness storage slot against its account's proven
@@ -323,29 +334,33 @@ impl<'a> WitnessAnchor<'a> {
     /// in [`Self::prove_storage`] stays free of a branch.
     fn check_one_slot(slot: &WitnessSlot, lookup: Lookup) -> Result<(), AnchorError> {
         match lookup {
-            Lookup::Found(value) => {
-                let mut slice = value.as_slice();
-                let got = U256::decode(&mut slice)
-                    .map_err(|_| AnchorError::Malformed("storage leaf not an RLP word"))?;
-                if got != slot.value || slot.value.is_zero() {
-                    return Err(AnchorError::Refuted {
-                        what: format!(
-                            "slot {}/{} value diverges from trie leaf",
-                            slot.address, slot.key
-                        ),
-                    });
-                }
-            }
-            Lookup::Absent => {
-                if !slot.value.is_zero() {
-                    return Err(AnchorError::Refuted {
-                        what: format!(
-                            "slot {}/{} witnessed non-zero but excluded",
-                            slot.address, slot.key
-                        ),
-                    });
-                }
-            }
+            Lookup::Found(value) => Self::check_included_slot(slot, &value),
+            // A zero slot has no leaf, so exclusion proves the witnessed
+            // zero.
+            Lookup::Absent if slot.value.is_zero() => Ok(()),
+            Lookup::Absent => Err(AnchorError::Refuted {
+                what: format!(
+                    "slot {}/{} witnessed non-zero but excluded",
+                    slot.address, slot.key
+                ),
+            }),
+        }
+    }
+
+    /// Check one witness storage slot against the leaf the trie carries.
+    /// The leaf must decode to the witnessed value, and a witnessed zero
+    /// never has a leaf.
+    fn check_included_slot(slot: &WitnessSlot, value: &[u8]) -> Result<(), AnchorError> {
+        let mut slice = value;
+        let got = U256::decode(&mut slice)
+            .map_err(|_| AnchorError::Malformed("storage leaf not an RLP word"))?;
+        if got != slot.value || slot.value.is_zero() {
+            return Err(AnchorError::Refuted {
+                what: format!(
+                    "slot {}/{} value diverges from trie leaf",
+                    slot.address, slot.key
+                ),
+            });
         }
         Ok(())
     }

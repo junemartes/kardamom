@@ -45,14 +45,84 @@ fn publish_batch(publisher: &kardamom_log::aeron_live::TxDataPublisherHandle, ba
     }
 }
 
+/// Drain `subscriber` until it closes, or `drain_stop_rx` reports the
+/// stop signal.
+///
+/// Runs on its own current-thread runtime, so it does not compete with
+/// the benchmark's worker threads.
 #[cfg(feature = "full-pipeline-e2e")]
-fn run_e2e_throughput(c: &mut Criterion) {
+fn drain_local_rt(
+    subscriber: kardamom_log::aeron_live::TxDataSubscriberHandle,
+    drain_stop_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let local_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("drain runtime");
+    local_rt.block_on(drain_until_stopped(subscriber, drain_stop_rx));
+}
+
+/// Drain `subscriber` until it closes, or `drain_stop_rx` reports the
+/// stop signal.
+#[cfg(feature = "full-pipeline-e2e")]
+async fn drain_until_stopped(
+    mut subscriber: kardamom_log::aeron_live::TxDataSubscriberHandle,
+    mut drain_stop_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        if drain_step(&mut subscriber, &mut drain_stop_rx)
+            .await
+            .is_break()
+        {
+            return;
+        }
+    }
+}
+
+/// One drain step: race a receive against the stop signal.
+///
+/// Returns `Break` when the subscriber closed, or the stop signal
+/// changed.
+#[cfg(feature = "full-pipeline-e2e")]
+async fn drain_step(
+    subscriber: &mut kardamom_log::aeron_live::TxDataSubscriberHandle,
+    drain_stop_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> std::ops::ControlFlow<()> {
+    tokio::select! {
+        msg = subscriber.recv() => msg.map_or(std::ops::ControlFlow::Break(()), |_| std::ops::ControlFlow::Continue(())),
+        _ = drain_stop_rx.changed() => std::ops::ControlFlow::Break(()),
+    }
+}
+
+/// One round trip: publish an envelope on `latency_publisher`, then wait
+/// for `latency_subscriber` to receive it (or a 1s timeout).
+#[cfg(feature = "full-pipeline-e2e")]
+async fn round_trip_once(
+    latency_publisher: &kardamom_log::aeron_live::TxDataPublisherHandle,
+    latency_subscriber: &mut kardamom_log::aeron_live::TxDataSubscriberHandle,
+) {
     use alloy_primitives::{Address, B256};
     use bytes::Bytes;
+    use kardamom_types::TxEnvelope;
+
+    let env = TxEnvelope {
+        correlation_id: 0,
+        raw_tx: Bytes::from(vec![0u8; 64]),
+        sender: Address::ZERO,
+        tx_hash: B256::ZERO,
+    };
+    latency_publisher.publish(&env).expect("publish");
+    let _ = tokio::time::timeout(Duration::from_secs(1), latency_subscriber.recv())
+        .await
+        .expect("round-trip timed out")
+        .expect("subscriber closed");
+}
+
+#[cfg(feature = "full-pipeline-e2e")]
+fn run_e2e_throughput(c: &mut Criterion) {
     use kardamom_log::aeron_live::{AeronRuntime, TxDataPublisherHandle, TxDataSubscriberHandle};
     use kardamom_log::config::LogConfig;
     use kardamom_log::testing::AeronTestCluster;
-    use kardamom_types::TxEnvelope;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -77,30 +147,14 @@ fn run_e2e_throughput(c: &mut Criterion) {
     let sequencer_id = 0u8;
     let publisher = TxDataPublisherHandle::open(&aeron_rt, &cfg.channels, sequencer_id)
         .expect("tx_data publisher");
-    let mut subscriber = TxDataSubscriberHandle::open(&aeron_rt, &cfg.channels, sequencer_id)
+    let subscriber = TxDataSubscriberHandle::open(&aeron_rt, &cfg.channels, sequencer_id)
         .expect("tx_data subscriber for drain");
 
     // A background draining task. Without it, every batch fills the term
     // buffer, and the publisher hits back-pressure. It drains as fast as
     // the subscriber can deliver; the values do not matter here.
-    let (drain_stop_tx, mut drain_stop_rx) = tokio::sync::watch::channel(false);
-    let drain_handle = std::thread::spawn(move || {
-        let local_rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("drain runtime");
-        local_rt.block_on(async move {
-            loop {
-                tokio::select! {
-                    msg = subscriber.recv() => match msg {
-                        Some(_) => {}
-                        None => break,
-                    },
-                    _ = drain_stop_rx.changed() => break,
-                }
-            }
-        });
-    });
+    let (drain_stop_tx, drain_stop_rx) = tokio::sync::watch::channel(false);
+    let drain_handle = std::thread::spawn(move || drain_local_rt(subscriber, drain_stop_rx));
 
     let mut group = c.benchmark_group("e2e/tx_data_publish_throughput");
     for &batch in &[1usize, 64, 1024] {
@@ -127,21 +181,7 @@ fn run_e2e_throughput(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("e2e/tx_data_round_trip_latency");
     group.bench_function("single_message", |b| {
-        b.iter(|| {
-            let env = TxEnvelope {
-                correlation_id: 0,
-                raw_tx: Bytes::from(vec![0u8; 64]),
-                sender: Address::ZERO,
-                tx_hash: B256::ZERO,
-            };
-            latency_publisher.publish(&env).expect("publish");
-            rt.block_on(async {
-                let _ = tokio::time::timeout(Duration::from_secs(1), latency_subscriber.recv())
-                    .await
-                    .expect("round-trip timed out")
-                    .expect("subscriber closed");
-            });
-        });
+        b.iter(|| rt.block_on(round_trip_once(&latency_publisher, &mut latency_subscriber)));
     });
     group.finish();
 

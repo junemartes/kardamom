@@ -222,12 +222,8 @@ where
     ///
     /// Returns the socket error when a reply cannot be written.
     pub(crate) async fn run(mut self) -> std::io::Result<()> {
-        loop {
-            match self.step().await? {
-                ControlFlow::Break(()) => return Ok(()),
-                ControlFlow::Continue(()) => {}
-            }
-        }
+        while self.step().await?.is_continue() {}
+        Ok(())
     }
 
     /// One full frame cycle: read the header, then (unless it closed the

@@ -303,14 +303,9 @@ impl PendingReceipts {
                 return;
             }
             if let Some(resp) = e.responder.take() {
-                let err = match reason {
-                    TxErrorReason::DuplicatedTx { .. } => IngressError::Duplicate((sender, nonce)),
-                    TxErrorReason::Evicted { .. } => IngressError::Evicted((sender, nonce)),
-                    TxErrorReason::Expired { .. } => IngressError::Expired((sender, nonce)),
-                };
                 // This only releases the waiter. The woken waiter's Drop
                 // removes the slot.
-                let _ = resp.send(Err(err));
+                let _ = resp.send(Err(reason_to_error(sender, nonce, &reason)));
             }
         };
         if grace.is_zero() {
@@ -353,29 +348,8 @@ impl PendingReceipts {
     /// waiter's Drop.
     async fn release_satisfied(&self) {
         let latest = self.watermarks();
-        // The effective release watermark is the minimum over the
-        // watermark kinds the policy requires. If a required watermark
-        // is absent, nothing releases.
-        let mut effective: Option<BPosition> = None;
-        if self.policy.requires_local_fsync() {
-            match latest.local {
-                Some(p) => effective = Some(p),
-                None => return,
-            }
-        }
-        if self.policy.requires_quorum() {
-            match latest.quorum {
-                Some(p) => {
-                    effective = Some(match effective {
-                        Some(e) if e <= p => e,
-                        _ => p,
-                    });
-                }
-                None => return,
-            }
-        }
-        let Some(eff) = effective else {
-            return; // OnOffer never parks.
+        let Some(eff) = self.effective_watermark(&latest) else {
+            return; // A required watermark is absent, or OnOffer never parks.
         };
         // This drains the satisfied prefix: keys with tx_idx <= eff. The
         // seq value never reaches u64::MAX, so this bound is exact.
@@ -388,6 +362,21 @@ impl PendingReceipts {
         for weak in drained {
             release_one(weak).await;
         }
+    }
+
+    /// The minimum position over the watermark kinds [`Self::policy`]
+    /// requires, for [`Self::release_satisfied`]. `None` when a required
+    /// watermark kind has not arrived yet, so nothing releases.
+    fn effective_watermark(&self, latest: &Watermarks) -> Option<BPosition> {
+        let mut effective: Option<BPosition> = None;
+        if self.policy.requires_local_fsync() {
+            effective = Some(latest.local?);
+        }
+        if self.policy.requires_quorum() {
+            let quorum = latest.quorum?;
+            effective = Some(effective.map_or(quorum, |e| e.min(quorum)));
+        }
+        effective
     }
 
     /// Returns whether the configured policy is satisfied for `target`,
@@ -411,6 +400,16 @@ impl PendingReceipts {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+}
+
+/// Maps a sequencer rejection reason to the JSON-RPC error the parked
+/// client receives, for [`PendingReceipts::on_tx_error`].
+fn reason_to_error(sender: Address, nonce: u64, reason: &TxErrorReason) -> IngressError {
+    match reason {
+        TxErrorReason::DuplicatedTx { .. } => IngressError::Duplicate((sender, nonce)),
+        TxErrorReason::Evicted { .. } => IngressError::Evicted((sender, nonce)),
+        TxErrorReason::Expired { .. } => IngressError::Expired((sender, nonce)),
     }
 }
 
