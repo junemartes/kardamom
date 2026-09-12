@@ -260,7 +260,7 @@ impl ReceiptSubscription {
             };
             match next {
                 NextEvent::Event(event) => return Some(event),
-                NextEvent::FilteredOut => {}
+                NextEvent::FilteredOut => (),
                 NextEvent::FeedClosed => return None,
             }
         }

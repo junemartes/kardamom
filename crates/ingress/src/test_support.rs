@@ -247,24 +247,36 @@ pub fn spawn_fake_executor(
 ) -> Vec<JoinHandle<()>> {
     let next_pos = Arc::new(AtomicI32::new(0));
     rx.into_iter()
-        .map(|mut rx| {
-            let receipt_bus = mock.receipt_bus.clone();
-            let watermark_bus = mock.watermark_bus.clone();
-            let next_pos = next_pos.clone();
-            tokio::spawn(async move {
-                while let Some(envelope) = rx.recv().await {
-                    let offset = next_pos
-                        .fetch_add(1, Ordering::SeqCst)
-                        .checked_add(1)
-                        .expect("fixture positions fit i32");
-                    let position = pos(offset);
-                    let receipt = receipt_for(&envelope, position);
-                    let _ = receipt_bus.send(receipt);
-                    let _ = watermark_bus.send(QuorumWatermark { position });
-                }
-            })
+        .map(|rx| {
+            tokio::spawn(relay_fake_receipts(
+                rx,
+                mock.receipt_bus.clone(),
+                mock.watermark_bus.clone(),
+                next_pos.clone(),
+            ))
         })
         .collect()
+}
+
+/// Drains one shard's fake-executor mailbox: builds and sends a receipt
+/// and a matching watermark for every envelope. `next_pos` is one
+/// counter shared across every shard, so positions never go backward.
+async fn relay_fake_receipts(
+    mut rx: UnboundedReceiver<TxEnvelope>,
+    receipt_bus: tokio::sync::broadcast::Sender<Receipt>,
+    watermark_bus: tokio::sync::broadcast::Sender<QuorumWatermark>,
+    next_pos: Arc<AtomicI32>,
+) {
+    while let Some(envelope) = rx.recv().await {
+        let offset = next_pos
+            .fetch_add(1, Ordering::SeqCst)
+            .checked_add(1)
+            .expect("fixture positions fit i32");
+        let position = pos(offset);
+        let receipt = receipt_for(&envelope, position);
+        let _ = receipt_bus.send(receipt);
+        let _ = watermark_bus.send(QuorumWatermark { position });
+    }
 }
 
 /// Starts an in-process JSON-RPC server over [`MockChannels`], with no

@@ -50,6 +50,20 @@ fn legacy(e: &TxEnvelope) -> &Signed<TxLegacy> {
     }
 }
 
+/// Spawns one scoped worker per [`worker_range`] share of `envs` and
+/// `raws`, joined automatically when the scope in `sc` ends.
+fn spawn_recovery_workers<'scope, 'env>(
+    sc: &'scope std::thread::Scope<'scope, 'env>,
+    envs: &'env [TxEnvelope],
+    raws: &'env [Bytes],
+    threads: usize,
+) {
+    (0..threads).for_each(|w| {
+        let range = worker_range(w, threads, envs.len());
+        sc.spawn(move || recover_range(envs, raws, range));
+    });
+}
+
 #[test]
 fn ingress_stage_costs() {
     let signer = PrivateKeySigner::random();
@@ -103,14 +117,7 @@ fn ingress_stage_costs() {
     // batch verifier's process_batch runs them in a plain sequential loop.
     for threads in [1usize, 2, 4] {
         let t = std::time::Instant::now();
-        std::thread::scope(|sc| {
-            (0..threads).for_each(|w| {
-                let envs = &envs;
-                let raws = &raws;
-                let range = worker_range(w, threads, envs.len());
-                sc.spawn(move || recover_range(envs, raws, range));
-            });
-        });
+        std::thread::scope(|sc| spawn_recovery_workers(sc, &envs, &raws, threads));
         let el = t.elapsed().as_secs_f64();
         eprintln!(
             "INGRESS recovery threads={threads}: {:.0} tx/s ({:.1}x vs 1 thread, {:.1} µs/tx effective)",

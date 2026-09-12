@@ -154,12 +154,7 @@ impl FlushLoop {
     /// of the window. This ends when the channel closes, which happens
     /// when the owning `BatchVerifier` drops.
     async fn run(mut self) {
-        loop {
-            match self.run_one_batch().await {
-                ControlFlow::Break(()) => return,
-                ControlFlow::Continue(()) => {}
-            }
-        }
+        while self.run_one_batch().await.is_continue() {}
     }
 
     /// One [`Self::run`] pass: fill a batch (racing the flush window once
@@ -249,14 +244,13 @@ impl FlushLoop {
         };
         loop {
             let remaining = depth - buf.len();
-            tokio::select! {
+            let filled = tokio::select! {
                 biased;
                 () = tokio::time::sleep_until(deadline) => return,
-                n = self.rx.recv_many(buf, remaining) => {
-                    if n == 0 || buf.len() >= depth {
-                        return;
-                    }
-                }
+                n = self.rx.recv_many(buf, remaining) => n,
+            };
+            if filled == 0 || buf.len() >= depth {
+                return;
             }
         }
     }

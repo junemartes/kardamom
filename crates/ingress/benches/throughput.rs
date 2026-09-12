@@ -43,24 +43,24 @@ fn bench_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("ingress/throughput");
     group.throughput(Throughput::Elements(BATCH as u64));
     group.bench_function("submit_raw_batch_1024", |b| {
-        b.to_async(&rt).iter(|| {
-            let proxy = proxy.clone();
-            let pre = pre.clone();
-            async move {
-                let mut futs = Vec::with_capacity(BATCH);
-                for raw in pre {
-                    let p = proxy.clone();
-                    futs.push(async move {
-                        p.submit_raw("127.0.0.1".parse().unwrap(), raw)
-                            .await
-                            .unwrap()
-                    });
-                }
-                let _ = futures::future::join_all(futs).await;
-            }
-        });
+        b.to_async(&rt)
+            .iter(|| submit_batch(proxy.clone(), pre.clone()));
     });
     group.finish();
+}
+
+/// Submits a batch of transactions at the same time, and waits for
+/// every receipt.
+async fn submit_batch(proxy: Arc<IngressProxy<MockChannels, MockChannels>>, pre: Vec<Bytes>) {
+    let futs = pre.into_iter().map(|raw| {
+        let p = proxy.clone();
+        async move {
+            p.submit_raw("127.0.0.1".parse().unwrap(), raw)
+                .await
+                .unwrap()
+        }
+    });
+    let _ = futures::future::join_all(futs).await;
 }
 
 criterion_group!(benches, bench_throughput);
