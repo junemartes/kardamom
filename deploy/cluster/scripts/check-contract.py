@@ -435,21 +435,46 @@ else:
     err("group_vars/all.yml: missing node_classes.executor ip_start/count")
 
 # --- config templates -----------------------------------------------------------
-# The [discovery] section of channels.toml.tpl mirrors the chain id and the
-# cluster subnet, and the Nomad service records repeat the chain id.
+# The [discovery] section of channels.toml.tpl mirrors the chain id and reads
+# the rest of its scope from the node through Nomad template placeholders.
+# The Nomad agent template stamps that node meta, and the Nomad service
+# records repeat the chain id and read the same cluster_id meta.
 channels_tpl = CLUSTER / "config" / "channels.toml.tpl"
 must_contain(channels_tpl, f"chain_id = {chain_id}", "[discovery] chain_id mirror")
-ip_prefix = scalar(gv, "ip_prefix")
+for placeholder in (
+    'cluster_id = "{{ env "meta.cluster_id" }}"',
+    'datacenter = "{{ env "node.datacenter" }}"',
+    'advertise_interface = "{{ env "meta.node_ip" }}/32"',
+    'tx_data_archive_endpoints = [{{ range service "ingress.kardamom-aeron-archive" }}',
+    'tx_deposits_archive_endpoints = [{{ range service "aux.kardamom-aeron-archive" }}',
+):
+    must_contain(channels_tpl, placeholder, "[discovery] scope comes from the node")
+# Every multicast `interface=` value is a placeholder, never an address
+# literal: the node's own address comes from meta.node_ip at render time.
+for m in re.finditer(r"interface=([^|\"]+)", channels_tpl.read_text()):
+    if re.search(r"\d+\.\d+\.\d+\.\d+", m.group(1)):
+        err(
+            f"{channels_tpl.relative_to(REPO)}: interface={m.group(1)} is an address literal;"
+            " use the meta.node_ip placeholder"
+        )
 must_contain(
-    channels_tpl,
-    f'advertise_interface = "{ip_prefix}.0/24"',
-    "[discovery] advertise_interface is the cluster subnet",
+    jobs / "aeron.system.nomad.hcl",
+    'tags = ["${meta.role}"]',
+    "the archive record carries the role tag the channel template selects on",
 )
+nomad_tpl = CLUSTER / "ansible" / "roles" / "nomad" / "templates" / "nomad.hcl.j2"
+for meta_key in ("cluster_id", "node_ip", "archive_topics"):
+    must_contain(nomad_tpl, f"    {meta_key} ", f"node meta {meta_key} feeds discovery")
 for job in ("aeron.system", "cluster"):
     must_contain(
         jobs / f"{job}.nomad.hcl",
         f'chain_id          = "{chain_id}"',
         "discovery service record chain_id mirror",
+    )
+    must_contain(
+        jobs / f"{job}.nomad.hcl",
+        'cluster_id        = "${meta.cluster_id}"',
+        "discovery service record cluster_id comes from the node",
     )
 
 # tx_ordering is carried by the Aeron Cluster (Raft). channels.toml.tpl is

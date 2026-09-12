@@ -136,7 +136,7 @@ job "cluster" {
         provider = "consul"
         meta {
           discovery_version = "1"
-          cluster_id        = "dev"
+          cluster_id        = "${meta.cluster_id}"
           chain_id          = "412346"
           member_id         = "${meta.node_index}"
         }

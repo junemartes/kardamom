@@ -153,9 +153,14 @@ job "aeron" {
         port     = "archive_control"
         address  = "${meta.node_ip}"
         provider = "consul"
+        # The node role, so a template can select the archives of one
+        # role: config/channels.toml.tpl renders its fallback archive
+        # lists from `ingress.kardamom-aeron-archive` and
+        # `aux.kardamom-aeron-archive`.
+        tags = ["${meta.role}"]
         meta {
           discovery_version = "1"
-          cluster_id        = "dev"
+          cluster_id        = "${meta.cluster_id}"
           chain_id          = "412346"
           archive_id        = "${node.unique.name}"
           topics            = "${meta.archive_topics}"

@@ -357,14 +357,78 @@ fn tx_receipts_boundary_stream_id_is_one_past_the_receipt_stream() {
 #[test]
 fn the_deployed_channels_template_loads() {
     // `deploy/cluster/config/channels.toml.tpl` is what every service in
-    // the container cluster reads. It must parse with this crate's types,
-    // zero sentinels included.
+    // the container cluster reads. Nomad renders it on the node, filling
+    // the placeholders from the node meta and datacenter; this test fills
+    // them the same way, and fails on a placeholder it does not know, so
+    // the set of node inputs the template depends on stays explicit. The
+    // result must parse with this crate's types, zero sentinels included.
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../deploy/cluster/config/channels.toml.tpl"
     );
-    let cfg = LogConfig::from_toml_path(Path::new(path)).expect("deployed channels.toml.tpl loads");
+    let template = std::fs::read_to_string(path).expect("read channels.toml.tpl");
+    let node = [
+        ("meta.cluster_id", "kardamom-dev"),
+        ("node.datacenter", "dc1"),
+        ("meta.node_ip", "192.168.56.31"),
+    ];
+    let rendered = node.iter().fold(template, |text, (key, value)| {
+        text.replace(&format!("{{{{ env \"{key}\" }}}}"), value)
+    });
+    let rendered = render_service_ranges(&rendered, "192.168.56.41", 8010);
+    assert!(
+        !rendered.contains("{{"),
+        "channels.toml.tpl has a placeholder this test does not fill"
+    );
+    let cfg = load(&rendered).expect("rendered channels.toml.tpl loads");
     assert_eq!(cfg.channels.tx_receipts_endpoint_base_port, None);
+    assert_eq!(cfg.discovery.cluster_id, "kardamom-dev");
+    assert_eq!(
+        cfg.discovery
+            .advertise_interface
+            .map(String::from)
+            .as_deref(),
+        Some("192.168.56.31/32")
+    );
+    assert_eq!(cfg.aeron.tx_data_archive_endpoints, ["192.168.56.41:8010"]);
+    assert_eq!(
+        cfg.aeron.tx_deposits_archive_endpoints,
+        ["192.168.56.41:8010"]
+    );
+    assert!(
+        cfg.channels
+            .tx_data_channel(0)
+            .contains("interface=192.168.56.31/32")
+    );
+}
+
+/// Expand every `{{ range service "..." }}...{{ end }}` block of a Nomad
+/// template as Consul would for one instance at `address:port`.
+fn render_service_ranges(template: &str, address: &str, port: u16) -> String {
+    const OPEN: &str = "{{ range service \"";
+    const NAME_CLOSE: &str = "\" }}";
+    const END: &str = "{{ end }}";
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + OPEN.len()..];
+        let body_start =
+            after_open.find(NAME_CLOSE).expect("service name closes") + NAME_CLOSE.len();
+        let body_end = body_start
+            + after_open[body_start..]
+                .find(END)
+                .expect("range block ends");
+        let body = &after_open[body_start..body_end];
+        out.push_str(
+            &body
+                .replace("{{ .Address }}", address)
+                .replace("{{ .Port }}", &port.to_string()),
+        );
+        rest = &after_open[body_end + END.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[test]

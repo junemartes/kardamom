@@ -45,7 +45,7 @@ voting set.
 | --- | --- | --- |
 | `enabled` | `false` | Off keeps every stream on its static `[channels]` URI. |
 | `consul_http_addr` | `http://127.0.0.1:8500` | The local Consul agent. |
-| `consul_token_file` | none | A file holding the ACL token. Sent as `X-Consul-Token`, never logged. |
+| `consul_token_file` | none | A file holding the ACL token. Sent as `X-Consul-Token`, never logged. Unset, the token comes from the environment (below). |
 | `cluster_id` | empty | Discovery scope. Required when enabled. |
 | `chain_id` | `0` | Discovery scope. |
 | `datacenter` | empty | Consul datacenter of the catalog queries. Empty means the agent's own. |
@@ -68,6 +68,14 @@ is absent or ambiguous on the host fails startup.
 | --- | --- |
 | `NOMAD_ALLOC_ID` | The instance id. Every service id of a process starts with it. Absent in a local run, where a process id and clock stamp replace it. |
 | `KARDAMOM_MDC_PORTS` | The UDP port range `first-last` the process's publications bind. Absent, the OS picks a port per publication. Every port is bind-probed before it is advertised. |
+| `CONSUL_HTTP_TOKEN`, then `CONSUL_TOKEN` | The ACL token, when `consul_token_file` is unset. `CONSUL_TOKEN` is the name Nomad sets on a task with a Consul workload identity. Absent, no token is sent. |
+
+On the ACL profile the token needs `service:write` on
+`kardamom-mdc-publisher` for the agent registration, `service:read` on
+`kardamom-mdc-publisher`, `kardamom-aeron-archive` and
+`kardamom-cluster-member`, and `node:read` for the health queries. How
+the token reaches the task is the deployment profile's concern, not the
+runtime's.
 
 Receive ports are never configured: every destination binds an OS-chosen
 port on the advertised interface.
@@ -148,12 +156,35 @@ readiness waits for the new session's recording. The ingress serves only
 once every one of its own lanes has a live recording. The DA watcher
 records its own `tx_deposits` publication the same way.
 
-## The container cluster
+## Deployment profiles
 
-`deploy/cluster/config/channels.toml.tpl` sets `enabled = true`,
-`cluster_id = "dev"`, the chain id, and
-`advertise_interface = "192.168.56.0/24"`. `scripts/check-contract.py`
-checks the mirrors.
+`deploy/cluster/config/channels.toml.tpl` sets `enabled = true` and the
+chain id, and reads the rest of the scope from the node. Every job
+renders the file as a Nomad template on its node:
+
+| Key | Placeholder | Source |
+| --- | --- | --- |
+| `cluster_id` | `{{ env "meta.cluster_id" }}` | The profile's `cluster_id`, stamped as node meta by `roles/nomad`. |
+| `datacenter` | `{{ env "node.datacenter" }}` | The profile's `datacenter`, the Nomad agent's own. |
+| `advertise_interface` | `{{ env "meta.node_ip" }}/32` | The node's private address, resolved by `roles/netinfo` and stamped as node meta. |
+
+So the local profile (explicit `node_ip` per inventory host) and the
+production profile (`node_ip` resolved from the vSwitch address or the
+private interface) use one file, and an elastic node that joins from the
+image gets its scope from its own agent. The `kardamom-aeron-archive` and
+`kardamom-cluster-member` records read `${meta.cluster_id}` the same way.
+
+The file names no fixed address. The multicast fallback channels pin
+their `interface` to `{{ env "meta.node_ip" }}/32` too, and the fallback
+archive lists render from the archive records: the `kardamom-aeron-archive`
+service carries the node role as a tag, and the template lists
+`ingress.kardamom-aeron-archive` for `tx_data` and
+`aux.kardamom-aeron-archive` for `tx_deposits`. Every job renders the file
+with `change_mode = "noop"`: a change in the archive set rewrites the file,
+and the running process follows the catalog through discovery instead of
+restarting. `scripts/check-contract.py` checks the chain id mirror, the
+placeholders, the role tag, and the node meta the Nomad agent template
+stamps.
 
 | Job | `KARDAMOM_MDC_PORTS` | Publications |
 | --- | --- | --- |

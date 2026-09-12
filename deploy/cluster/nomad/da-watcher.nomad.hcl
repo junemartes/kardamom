@@ -120,6 +120,10 @@ job "da-watcher" {
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }
 
       resources {
