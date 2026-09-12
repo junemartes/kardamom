@@ -1,0 +1,26 @@
+# Managed by the elastic image (roles/elastic_image). cloud-init enables
+# this unit at first boot after it wrote /etc/kardamom/node.yml. The unit
+# runs the playbook release of the image against the local host. A failed
+# run leaves the Consul and Nomad agents disabled, retries a bounded
+# number of times, then stays failed and visible in systemctl.
+[Unit]
+Description=kardamom node bootstrap (ansible-playbook, local connection)
+After=network-online.target cloud-final.service
+Wants=network-online.target
+ConditionPathExists=/etc/kardamom/node.yml
+StartLimitIntervalSec=1800
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=60
+Environment=ANSIBLE_COLLECTIONS_PATH={{ elastic_image_ansible_root }}/collections
+Environment=ANSIBLE_ROLES_PATH={{ elastic_image_ansible_root }}/release/roles
+Environment=ANSIBLE_LOG_PATH=/var/log/kardamom-bootstrap.log
+Environment=ANSIBLE_NOCOLOR=1
+ExecStart={{ elastic_image_ansible_root }}/venv/bin/ansible-playbook --connection=local --inventory /etc/kardamom/inventory.ini --extra-vars @/etc/kardamom/node.yml {{ elastic_image_ansible_root }}/release/bootstrap.yml
+
+[Install]
+WantedBy=multi-user.target

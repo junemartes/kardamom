@@ -1,0 +1,175 @@
+---
+# Prepare the elastic node image. The play creates one clean Cloud server
+# through the Hetzner API, configures it with the shared roles in image
+# mode (binaries, packages, the playbook release, the bootstrap unit, no
+# node identity), snapshots it, and deletes the server. The token comes
+# from the HCLOUD_TOKEN environment variable and never enters a file.
+#   HCLOUD_TOKEN=... ansible-playbook image.yml \
+#     -e bootstrap_revision=$(git rev-parse --short HEAD) \
+#     -e image_ssh_key=<hcloud ssh key name> [-e image_location=fsn1]
+# The snapshot's description is <cluster_id>-elastic-<bootstrap_revision>;
+# pass it as elastic_image to terraform/hetzner.
+
+- name: Create the image build server
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    hcloud_api: "https://api.hetzner.cloud/v1"
+    hcloud_token: "{{ lookup('ansible.builtin.env', 'HCLOUD_TOKEN') }}"
+    image_base: "ubuntu-22.04"
+    image_location: "fsn1"
+    image_server_type: "cx22"
+    image_build_name: "{{ cluster_id }}-image-build"
+  tasks:
+    - name: Check the image build inputs
+      no_log: true
+      ansible.builtin.assert:
+        that:
+          - hcloud_token | length > 0
+          - image_ssh_key is defined
+          - bootstrap_revision is defined
+        fail_msg: "image.yml needs HCLOUD_TOKEN in the environment, image_ssh_key and bootstrap_revision"
+
+    - name: Create the build server
+      ansible.builtin.uri:
+        url: "{{ hcloud_api }}/servers"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ hcloud_token }}"
+        body_format: json
+        body:
+          name: "{{ image_build_name }}"
+          server_type: "{{ image_server_type }}"
+          image: "{{ image_base }}"
+          location: "{{ image_location }}"
+          ssh_keys: ["{{ image_ssh_key }}"]
+          labels:
+            kardamom.cluster: "{{ cluster_id }}"
+            kardamom.image-build: "true"
+          start_after_create: true
+        status_code: [201]
+      register: image_create
+      no_log: true
+      changed_when: true
+
+    - name: Remember the build server
+      ansible.builtin.set_fact:
+        image_server_id: "{{ image_create.json.server.id }}"
+        image_server_ip: "{{ image_create.json.server.public_net.ipv4.ip }}"
+
+    - name: Wait for the build server to run
+      ansible.builtin.uri:
+        url: "{{ hcloud_api }}/servers/{{ image_server_id }}"
+        headers:
+          Authorization: "Bearer {{ hcloud_token }}"
+      register: image_server
+      until: image_server.json.server.status == "running"
+      retries: 30
+      delay: 10
+      no_log: true
+
+    - name: Wait for SSH on the build server
+      ansible.builtin.wait_for:
+        host: "{{ image_server_ip }}"
+        port: 22
+        timeout: 300
+
+    - name: Add the build server to the play
+      ansible.builtin.add_host:
+        name: image-build
+        groups: image_build
+        ansible_host: "{{ image_server_ip }}"
+        ansible_user: root
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new"
+      changed_when: false
+
+- name: Configure the image
+  hosts: image_build
+  become: true
+  vars:
+    image_build: true
+    deployment_profile: "production"
+    kardamom_node: "image-build"
+    role: "elastic"
+    tier: "worker"
+  roles:
+    - profile
+    - common
+    - docker
+    - consul
+    - nomad
+    - elastic_image
+
+- name: Snapshot the image and delete the build server
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    hcloud_api: "https://api.hetzner.cloud/v1"
+    hcloud_token: "{{ lookup('ansible.builtin.env', 'HCLOUD_TOKEN') }}"
+    image_server_id: "{{ hostvars['localhost']['image_server_id'] }}"
+  tasks:
+    - name: Shut the build server down
+      ansible.builtin.uri:
+        url: "{{ hcloud_api }}/servers/{{ image_server_id }}/actions/shutdown"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ hcloud_token }}"
+        status_code: [201]
+      no_log: true
+      changed_when: true
+
+    - name: Wait for the build server to stop
+      ansible.builtin.uri:
+        url: "{{ hcloud_api }}/servers/{{ image_server_id }}"
+        headers:
+          Authorization: "Bearer {{ hcloud_token }}"
+      register: image_server
+      until: image_server.json.server.status == "off"
+      retries: 30
+      delay: 10
+      no_log: true
+
+    - name: Create the snapshot
+      ansible.builtin.uri:
+        url: "{{ hcloud_api }}/servers/{{ image_server_id }}/actions/create_image"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ hcloud_token }}"
+        body_format: json
+        body:
+          type: snapshot
+          description: "{{ cluster_id }}-elastic-{{ bootstrap_revision }}"
+          labels:
+            kardamom.cluster: "{{ cluster_id }}"
+            kardamom.bootstrap-revision: "{{ bootstrap_revision }}"
+        status_code: [201]
+      register: image_snapshot
+      no_log: true
+      changed_when: true
+
+    - name: Wait for the snapshot
+      ansible.builtin.uri:
+        url: "{{ hcloud_api }}/actions/{{ image_snapshot.json.action.id }}"
+        headers:
+          Authorization: "Bearer {{ hcloud_token }}"
+      register: image_action
+      until: image_action.json.action.status == "success"
+      retries: 60
+      delay: 10
+      no_log: true
+
+    - name: Delete the build server
+      ansible.builtin.uri:
+        url: "{{ hcloud_api }}/servers/{{ image_server_id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ hcloud_token }}"
+        status_code: [200]
+      no_log: true
+      changed_when: true
+
+    - name: Report the image
+      ansible.builtin.debug:
+        msg: "elastic image {{ image_snapshot.json.image.id }}: {{ cluster_id }}-elastic-{{ bootstrap_revision }}"

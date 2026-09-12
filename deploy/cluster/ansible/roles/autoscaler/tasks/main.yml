@@ -1,0 +1,163 @@
+---
+# Install the Nomad Autoscaler and the hcloud-server target on a core
+# host, and render its configuration and the pool policies from the pool
+# contract. The contract values are never copied into hand-written HCL.
+
+- name: Check the required inputs
+  no_log: true
+  ansible.builtin.assert:
+    that:
+      - autoscaler_pool_contract_file | length > 0
+      - autoscaler_hcloud_plugin_url | length > 0
+      - autoscaler_hcloud_plugin_sha256 | length == 64
+      - autoscaler_prometheus_addr | length > 0
+      - autoscaler_hcloud_token | length > 0
+    fail_msg: >-
+      the autoscaler role needs autoscaler_pool_contract_file, autoscaler_hcloud_plugin_url,
+      autoscaler_hcloud_plugin_sha256 (64 hex), autoscaler_prometheus_addr and
+      autoscaler_hcloud_token
+
+- name: Load the pool contract
+  ansible.builtin.set_fact:
+    autoscaler_contract: "{{ lookup('ansible.builtin.file', autoscaler_pool_contract_file) | from_json }}"
+
+- name: Check the pool contract
+  ansible.builtin.assert:
+    that:
+      - autoscaler_contract.version | int == 1
+      - autoscaler_contract.cluster_id == cluster_id
+      - autoscaler_contract.pools | length > 0
+    fail_msg: "{{ autoscaler_pool_contract_file }} is not a version 1 contract of cluster {{ cluster_id }}"
+
+- name: Create the nomad-autoscaler system group
+  ansible.builtin.group:
+    name: nomad-autoscaler
+    system: true
+
+- name: Create the nomad-autoscaler system user
+  ansible.builtin.user:
+    name: nomad-autoscaler
+    group: nomad-autoscaler
+    system: true
+    shell: /usr/sbin/nologin
+    home: /opt/nomad-autoscaler
+    create_home: false
+
+- name: Create the Autoscaler directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: nomad-autoscaler
+    group: nomad-autoscaler
+    mode: "0750"
+  loop:
+    - "{{ autoscaler_config_dir }}"
+    - "{{ autoscaler_config_dir }}/policies"
+    - /opt/nomad-autoscaler
+    - "{{ autoscaler_plugin_dir }}"
+
+- name: Download the Nomad Autoscaler release
+  vars:
+    autoscaler_release_url: "https://releases.hashicorp.com/nomad-autoscaler/{{ autoscaler_version }}"
+  ansible.builtin.get_url:
+    url: "{{ autoscaler_release_url }}/nomad-autoscaler_{{ autoscaler_version }}_linux_{{ common_hashicorp_arch }}.zip"
+    dest: "/opt/nomad-autoscaler/nomad-autoscaler_{{ autoscaler_version }}.zip"
+    checksum: "sha256:{{ autoscaler_release_url }}/nomad-autoscaler_{{ autoscaler_version }}_SHA256SUMS"
+    mode: "0644"
+
+- name: Install the Nomad Autoscaler binary
+  ansible.builtin.unarchive:
+    src: "/opt/nomad-autoscaler/nomad-autoscaler_{{ autoscaler_version }}.zip"
+    dest: /usr/local/bin
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+    creates: /usr/local/bin/nomad-autoscaler
+
+- name: Install the hcloud-server target plugin
+  ansible.builtin.get_url:
+    url: "{{ autoscaler_hcloud_plugin_url }}"
+    dest: "{{ autoscaler_plugin_dir }}/hcloud-server"
+    checksum: "sha256:{{ autoscaler_hcloud_plugin_sha256 }}"
+    owner: nomad-autoscaler
+    group: nomad-autoscaler
+    mode: "0755"
+  notify: Restart nomad-autoscaler
+
+- name: Render the Autoscaler configuration
+  ansible.builtin.template:
+    src: autoscaler.hcl.j2
+    dest: "{{ autoscaler_config_dir }}/autoscaler.hcl"
+    owner: nomad-autoscaler
+    group: nomad-autoscaler
+    mode: "0640"
+  no_log: true
+  notify: Restart nomad-autoscaler
+
+- name: Render one node-capacity policy per pool
+  ansible.builtin.template:
+    src: pool-policy.hcl.j2
+    dest: "{{ autoscaler_config_dir }}/policies/pool-{{ item.key }}.hcl"
+    owner: nomad-autoscaler
+    group: nomad-autoscaler
+    mode: "0640"
+  loop: "{{ autoscaler_contract.pools | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  notify: Restart nomad-autoscaler
+
+- name: Render the ingress allocation policy
+  ansible.builtin.template:
+    src: ingress-policy.hcl.j2
+    dest: "{{ autoscaler_config_dir }}/policies/ingress-allocs.hcl"
+    owner: nomad-autoscaler
+    group: nomad-autoscaler
+    mode: "0640"
+  notify: Restart nomad-autoscaler
+
+- name: List the rendered policy files
+  ansible.builtin.find:
+    paths: "{{ autoscaler_config_dir }}/policies"
+    patterns: "*.hcl"
+  register: autoscaler_policy_files
+
+- name: Remove the policy of a pool that left the contract
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ autoscaler_policy_files.files | map(attribute='path') | reject('in', autoscaler_expected_policies) | list }}"
+  vars:
+    autoscaler_expected_policies: >-
+      {{ (autoscaler_contract.pools.keys() | map('regex_replace', '^(.*)$', autoscaler_config_dir ~ '/policies/pool-\1.hcl') | list)
+         + [autoscaler_config_dir ~ '/policies/ingress-allocs.hcl'] }}
+  notify: Restart nomad-autoscaler
+
+- name: Record the applied policy revision
+  ansible.builtin.copy:
+    dest: "{{ autoscaler_config_dir }}/policy-revision"
+    content: |
+      contract_sha256={{ lookup('ansible.builtin.file', autoscaler_pool_contract_file) | hash('sha256') }}
+      bootstrap_revision={{ autoscaler_contract.bootstrap_revision }}
+      plugin_revision={{ autoscaler_hcloud_plugin_revision }}
+      policies_enabled={{ autoscaler_policies_enabled | bool }}
+      scale_in_enabled={{ autoscaler_scale_in_enabled | bool }}
+    owner: nomad-autoscaler
+    group: nomad-autoscaler
+    mode: "0640"
+
+- name: Install the nomad-autoscaler systemd unit
+  ansible.builtin.template:
+    src: nomad-autoscaler.service.j2
+    dest: /etc/systemd/system/nomad-autoscaler.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart nomad-autoscaler
+
+- name: Enable and start nomad-autoscaler
+  ansible.builtin.systemd:
+    name: nomad-autoscaler
+    enabled: true
+    state: started
+    daemon_reload: true
