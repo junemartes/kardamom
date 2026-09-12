@@ -116,9 +116,19 @@ group_is_gone() { [ "$(count_running_group "$1" "$2")" = "0" ] && echo ok; }
 # hard-killed and comes back cold; its lookups for the pinned sender
 # fail (the failure outcomes count), the twin keeps the lane live, and
 # the log stays correct. Then the routes return, and the replica is
-# killed once more: the newborn's first park is answered by the lookup
-# (the ok outcome counts), the parked transaction drains, and the lane
-# makes progress.
+# killed once more with only the receipt path blocked: the newborn's
+# first park is answered by the lookup (the ok outcome counts), the
+# parked transaction drains, and the lane makes progress.
+#
+# Why phase 2 blocks the receipt path: a receipt-proven floor makes the
+# sequencer skip the lookup by design, and with a live twin the first
+# receipt beats the first park often (measured: the newborn published
+# 23559 transactions with zero lookup requests). Receipts ride UDP
+# multicast from the executors; the lookup is TCP to the executors. An
+# iptables rule on the node drops the executors' UDP and passes the
+# TCP. In phase 1 the route blackhole blocks both: a receiver cannot
+# send status messages to a blackholed executor, so no receipt image
+# forms, and every park requests a lookup.
 case_lookup_blackout() {
   local node="kardamom-sequencer-0" ip="192.168.56.21" port=9001
   local executors="192.168.56.41 192.168.56.42 192.168.56.43"
@@ -156,12 +166,20 @@ case_lookup_blackout() {
   lookup_snapshot "${ip}" "${node}" "${port}" "lookup-blackout: blackout phase"
   restore_routes
   [ "${failed}" = "0" ] || fail "lookup-blackout: blackout phase failed"
-  log "lookup-blackout: routes restored; hard-killing the replica again for an answered lookup"
+  log "lookup-blackout: routes restored; dropping the executors' UDP on ${node} (receipts, not lookups), then hard-killing the replica again for an answered lookup"
+  for e in ${executors}; do
+    docker exec "${node}" iptables -w 5 -I INPUT -p udp -s "${e}" -j DROP \
+      || fail "lookup-blackout: could not drop UDP from ${e} on ${node}"
+  done
+  restore_udp() { local x; for x in ${executors}; do docker exec "${node}" iptables -w 5 -D INPUT -p udp -s "${x}" -j DROP 2>/dev/null || true; done; }
   (
     inject_hard "${node}" sequencer-0
     assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
     wait_until "cold replica's lookup answered" 120 lookups_ok_past "${ip}" "${node}" "${port}" 0
   ) || failed=1
+  # The block is short: the lookup answers within seconds of the
+  # restart, and the node's other replica needs its receipts back.
+  restore_udp
   lookup_snapshot "${ip}" "${node}" "${port}" "lookup-blackout: answered phase"
   if [ "${failed}" != "0" ]; then
     ingress_snapshot "lookup-blackout: answered phase"
