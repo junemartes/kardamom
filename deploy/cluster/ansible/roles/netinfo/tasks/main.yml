@@ -1,0 +1,42 @@
+---
+# Resolve the private address of this host. The rules, in order:
+#   1. vswitch_address: a dedicated host on the vSwitch VLAN. The address
+#      is an IPAM input of the dedicated inventory.
+#   2. node_ip: the local inventories pass it explicitly.
+#   3. private_interface: resolve the address of that interface.
+# The play fails when no rule applies, or when the interface has no IPv4
+# address or more than one. A host never guesses its address from the
+# default public route. node_ip is the cross-role contract that the consul
+# and nomad roles bind to, so the role sets that name, not a prefixed one.
+
+- name: Use the vSwitch address as the private address  # noqa: var-naming[no-role-prefix]
+  when: vswitch_address is defined
+  ansible.builtin.set_fact:
+    node_ip: "{{ vswitch_address }}"
+
+- name: Resolve the private address from the interface selector
+  when: node_ip is not defined
+  vars:
+    netinfo_iface_key: "{{ private_interface | replace('-', '_') | replace('.', '_') | replace(':', '_') }}"
+  block:
+    - name: Check the interface selector
+      ansible.builtin.assert:
+        that:
+          - private_interface | length > 0
+          - netinfo_iface_key in ansible_facts
+        fail_msg: "{{ inventory_hostname }}: no node_ip and no interface '{{ private_interface }}'"
+
+    - name: Check that the interface has exactly one IPv4 address
+      ansible.builtin.assert:
+        that:
+          - "'ipv4' in ansible_facts[netinfo_iface_key]"
+          - ansible_facts[netinfo_iface_key].ipv4_secondaries | default([]) | length == 0
+        fail_msg: "{{ inventory_hostname }}: interface '{{ private_interface }}' has no IPv4 address or more than one"
+
+    - name: Set the private address  # noqa: var-naming[no-role-prefix]
+      ansible.builtin.set_fact:
+        node_ip: "{{ ansible_facts[netinfo_iface_key].ipv4.address }}"
+
+- name: Report the private address
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: private address {{ node_ip }}"

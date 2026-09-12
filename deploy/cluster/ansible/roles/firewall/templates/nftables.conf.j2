@@ -1,0 +1,33 @@
+#!/usr/sbin/nft -f
+# Managed by Ansible (roles/firewall). One table; the Docker tables stay.
+
+table inet kardamom {}
+flush table inet kardamom
+
+table inet kardamom {
+  set private_v4 {
+    type ipv4_addr
+    flags interval
+    elements = { {{ private_cidrs | join(', ') }} }
+  }
+
+  set ssh_v4 {
+    type ipv4_addr
+    flags interval
+    elements = { {{ ssh_allowed_cidrs | join(', ') }} }
+  }
+
+  chain input {
+    type filter hook input priority 0; policy drop;
+    iif "lo" accept
+    ct state established,related accept
+    ct state invalid drop
+    ip protocol icmp accept
+    ip6 nexthdr icmpv6 accept
+    ip saddr @private_v4 accept
+    ip saddr @ssh_v4 tcp dport 22 accept
+{% for port in public_tcp_ports %}
+    tcp dport {{ port }} accept
+{% endfor %}
+  }
+}

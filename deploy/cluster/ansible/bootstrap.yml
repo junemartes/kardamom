@@ -1,0 +1,33 @@
+---
+# Configure a host and join it to the substrate. The order is: the
+# credential enrollment of an elastic node, the deployment profile check,
+# the base packages, the vSwitch VLAN on a dedicated host, the private
+# address, Docker, the host firewall, then the Consul and Nomad agents. The same roles serve the local profile
+# (Vagrant VMs, the container CI path) and the production profile
+# (Hetzner dedicated core and Cloud pools). The local Docker registry
+# runs on the control node of the local profile only. All values derive
+# from group_vars/all.yml and the inventory of the profile.
+
+- name: Configure every host and join it to the substrate
+  hosts: "{{ provision_hosts | default('all') }}"
+  become: true
+  roles:
+    - role: enroll
+      when: enrollment_argv is defined
+    - profile
+    - common
+    - role: vswitch
+      when: vswitch_vlan_id is defined
+    - netinfo
+    - docker
+    - role: firewall
+      when: deployment_profile == 'production'
+    - consul
+    - nomad
+
+- name: Run the local Docker registry on the control node
+  hosts: control
+  become: true
+  roles:
+    - role: registry
+      when: deployment_profile == 'local'

@@ -1,0 +1,30 @@
+---
+# The host firewall of the production profile. A Hetzner Cloud Firewall
+# filters the public interface only; private Network traffic reaches the
+# host unfiltered. This rule set accepts everything from the private
+# ranges (Consul, Nomad, Aeron UDP, the service ports), SSH from
+# ssh_allowed_cidrs, and the public_tcp_ports list. It drops the rest of
+# the input path. The kardamom containers use host networking, so they
+# need no bridge rule. The rule set owns one table and leaves the Docker
+# tables in place.
+
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+
+- name: Render the nftables rule set
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0600"
+    validate: nft -c -f %s
+  notify: Reload nftables
+
+- name: Enable and start nftables
+  ansible.builtin.systemd:
+    name: nftables
+    enabled: true
+    state: started

@@ -1,0 +1,5 @@
+---
+# The MTU of the Hetzner vSwitch VLAN. The vSwitch carries at most 1400
+# bytes per frame; the Cloud Network side uses 1450. Aeron datagram sizing
+# on the dedicated hosts must fit 1400.
+vswitch_mtu: 1400

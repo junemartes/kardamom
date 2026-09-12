@@ -1,0 +1,77 @@
+---
+# Check the deployment profile and the host identity before any role
+# changes the host. The production profile fails closed: it refuses to
+# run without gossip encryption, ACLs, agent TLS, three voting servers,
+# DNS join names and the private address ranges.
+
+- name: Check the deployment profile name
+  ansible.builtin.assert:
+    that:
+      - deployment_profile in ['local', 'production']
+    fail_msg: "deployment_profile must be local or production, got '{{ deployment_profile }}'"
+
+# An elastic node has no inventory entry. Its Cloud server name is its
+# OS hostname, and that name is the node identity the Autoscaler maps
+# through unique.hostname.
+- name: Take the node name from the hostname  # noqa: var-naming[no-role-prefix]
+  when: kardamom_node is not defined
+  ansible.builtin.set_fact:
+    kardamom_node: "{{ ansible_facts['hostname'] }}"
+
+- name: Check the host identity variables
+  ansible.builtin.assert:
+    that:
+      - kardamom_node is defined
+      - role is defined
+      - tier is defined
+    fail_msg: "{{ inventory_hostname }}: every host needs kardamom_node, role and tier"
+
+- name: Check that the local profile passes an explicit node address
+  when: deployment_profile == 'local' and not (image_build | default(false) | bool)
+  ansible.builtin.assert:
+    that:
+      - node_ip is defined
+    fail_msg: "{{ inventory_hostname }}: the local profile needs node_ip in the inventory"
+
+- name: Check the production inputs
+  when: deployment_profile == 'production' and not (image_build | default(false) | bool)
+  no_log: true
+  ansible.builtin.assert:
+    that:
+      - consul_gossip_key | length > 0
+      - consul_acl_enabled | bool
+      - consul_agent_token | length > 0
+      - nomad_acl_enabled | bool
+      - nomad_consul_token | length > 0
+      - consul_tls_dir | length > 0
+      - nomad_tls_dir | length > 0
+      - consul_server_expect | int == 3
+      - nomad_server_expect | int == 3
+      - consul_retry_join | length >= 3
+      - private_cidrs | length > 0
+      - not (kardamom_in_container | default(false) | bool)
+    fail_msg: >-
+      {{ inventory_hostname }}: the production profile requires
+      consul_gossip_key, consul_acl_enabled, consul_agent_token,
+      nomad_acl_enabled, nomad_consul_token, consul_tls_dir, nomad_tls_dir,
+      three expected servers, three or more consul_retry_join names and
+      private_cidrs
+
+# The first boot of an elastic node passes bootstrap_revision from the
+# user data. The image carries the release it was built from. A mismatch
+# means the pool points at the wrong image; refuse the node.
+- name: Read the playbook release of the image
+  when: bootstrap_revision is defined and not (image_build | default(false) | bool)
+  ansible.builtin.slurp:
+    src: /opt/kardamom/ansible/RELEASE
+  register: profile_release
+
+- name: Check that the image carries the expected playbook release
+  when: bootstrap_revision is defined and not (image_build | default(false) | bool)
+  ansible.builtin.assert:
+    that:
+      - (profile_release.content | b64decode | trim) == bootstrap_revision
+    fail_msg: >-
+      {{ inventory_hostname }}: the image carries playbook release
+      {{ profile_release.content | b64decode | trim }}, the pool expects
+      {{ bootstrap_revision }}

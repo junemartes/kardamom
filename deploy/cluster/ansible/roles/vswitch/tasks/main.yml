@@ -1,0 +1,38 @@
+---
+# Configure the vSwitch VLAN on a dedicated host: the VLAN interface, its
+# address in the vswitch subnet of the Cloud Network, and the route to the
+# Cloud Network through the subnet gateway. The inputs come from the
+# dedicated inventory, one set per host:
+#   vswitch_parent      the physical interface, for example enp0s31f6
+#   vswitch_vlan_id     the vSwitch VLAN id, 4000 to 4091
+#   vswitch_address     this host's address in the vswitch subnet
+#   vswitch_prefix_len  the vswitch subnet prefix length
+#   vswitch_gateway     the vswitch subnet gateway, its first address
+#   cloud_network_cidr  the Cloud Network range, routed through the gateway
+
+- name: Check the vSwitch inputs
+  ansible.builtin.assert:
+    that:
+      - vswitch_parent is defined
+      - vswitch_vlan_id | int >= 4000
+      - vswitch_vlan_id | int <= 4091
+      - vswitch_address is defined
+      - vswitch_prefix_len is defined
+      - vswitch_gateway is defined
+      - cloud_network_cidr is defined
+    fail_msg: >-
+      {{ inventory_hostname }}: a vSwitch host needs vswitch_parent,
+      vswitch_vlan_id, vswitch_address, vswitch_prefix_len, vswitch_gateway
+      and cloud_network_cidr
+
+- name: Render the netplan file of the vSwitch VLAN
+  ansible.builtin.template:
+    src: vswitch.netplan.yaml.j2
+    dest: /etc/netplan/60-kardamom-vswitch.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Apply netplan
+
+- name: Apply the network configuration before the agents start
+  ansible.builtin.meta: flush_handlers

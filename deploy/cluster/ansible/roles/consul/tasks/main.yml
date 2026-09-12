@@ -38,6 +38,9 @@
     creates: /usr/local/bin/consul
 
 - name: Render the Consul configuration
+  # The rendered file carries tokens on the production profile; log nothing about it there.
+  no_log: "{{ deployment_profile == 'production' }}"
+  when: not (image_build | default(false) | bool)
   ansible.builtin.template:
     src: consul.hcl.j2
     dest: /etc/consul.d/consul.hcl
@@ -56,6 +59,7 @@
   notify: Restart consul
 
 - name: Enable and start Consul
+  when: not (image_build | default(false) | bool)
   ansible.builtin.systemd:
     name: consul
     enabled: true
