@@ -175,14 +175,7 @@ impl BalPump {
         let granularity = *granularity;
         let mut slice: &[u8] = bal_rlp;
         match <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(&mut slice) {
-            Ok(bal) if !bal.is_empty() => {
-                let idx = Arc::new(kardamom_validator::parallel::ClaimIndex::from_alloy(&bal));
-                self.claims
-                    .insert_arc(delta.block_number, granularity, idx.clone());
-                if let Some(ec) = &self.extract_claims {
-                    ec.insert_arc(delta.block_number, granularity, idx);
-                }
-            }
+            Ok(bal) if !bal.is_empty() => self.index_bal(delta.block_number, granularity, &bal),
             Ok(_) => {}
             Err(e) => tracing::warn!(
                 block = delta.block_number,
@@ -191,6 +184,23 @@ impl BalPump {
                 "BAL access-list decode failed; block validates sequentially"
             ),
         }
+    }
+
+    /// Indexes one decoded access list under the claim buffers, and again
+    /// under the extract-mode buffer, when one is wired.
+    fn index_bal(
+        &self,
+        block_number: u64,
+        granularity: std::num::NonZeroU16,
+        bal: &alloy_eip7928::BlockAccessList,
+    ) {
+        let idx = Arc::new(kardamom_validator::parallel::ClaimIndex::from_alloy(bal));
+        self.claims
+            .insert_arc(block_number, granularity, idx.clone());
+        let Some(ec) = &self.extract_claims else {
+            return;
+        };
+        ec.insert_arc(block_number, granularity, idx);
     }
 }
 
@@ -328,21 +338,25 @@ impl CommitPoller {
         let block = snap.block_number();
         metrics::set_committed_block(block);
         match snap.state_root() {
-            Ok(Some(root)) => {
-                metrics::set_state_root_block(block);
-                tracing::debug!(block, state_root = %root, "validator committed block");
-                if let Some(h) = &self.attester_handle {
-                    h.submit_root(block, root);
-                }
-                if let Some(s) = &self.attestation_store {
-                    s.push(block, root);
-                }
-            }
+            Ok(Some(root)) => self.report_root(block, root),
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(block, error = %e, "state_root read failed");
             }
         }
         Some(())
+    }
+
+    /// Reports one observed state root: the metric, the log line, and
+    /// the attester and interop attestation stream, when either is wired.
+    fn report_root(&self, block: u64, root: alloy_primitives::B256) {
+        metrics::set_state_root_block(block);
+        tracing::debug!(block, state_root = %root, "validator committed block");
+        if let Some(h) = &self.attester_handle {
+            h.submit_root(block, root);
+        }
+        if let Some(s) = &self.attestation_store {
+            s.push(block, root);
+        }
     }
 }

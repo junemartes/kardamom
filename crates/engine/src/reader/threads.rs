@@ -109,7 +109,7 @@ impl<D: TxDataSubscription + 'static> TxDataReader<D> {
     fn run(mut self) -> Result<(), ExecutorError> {
         loop {
             match self.step()? {
-                TxDataStep::Inserted => {}
+                TxDataStep::Inserted => (),
                 TxDataStep::Closed => return Ok(()),
             }
         }

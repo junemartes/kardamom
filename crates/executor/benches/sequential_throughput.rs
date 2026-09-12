@@ -191,93 +191,102 @@ fn send_one(
     .unwrap();
 }
 
+/// Counts the `Receipt` messages `c_rx` delivers before it times out.
+fn count_receipts(c_rx: &crossbeam_channel::Receiver<CMessage>) -> u64 {
+    let mut got = 0u64;
+    while let Ok(m) = c_rx.recv_timeout(Duration::from_secs(10)) {
+        got += u64::from(matches!(m, CMessage::Receipt(_)));
+    }
+    got
+}
+
+/// One `actor_throughput` iteration: builds an isolated executor wiring,
+/// drains `batch` transfers through it, and checks it delivered them all.
+fn run_one_batch(batch: u64) {
+    let signer = PrivateKeySigner::random();
+    let from = signer.address();
+    let to = address!("00000000000000000000000000000000DEAD0001");
+    let snap = MockStateDatabase::builder()
+        .account(from, U256::MAX, 0, KECCAK_EMPTY)
+        .build();
+    let writer_q = WriterApplyingQueue::new(snap.clone());
+    let snapshots = MutatingSnapshotSource(snap);
+
+    // Wiring after the join-buffer architecture update: preload all
+    // envelopes onto a single tx_data, and all TxRefs onto tx_ordering,
+    // before the executor starts. This bench measures end-to-end actor
+    // throughput. The demux split itself adds one extra crossbeam hop
+    // per tx, which should be negligible next to revm time.
+    let (a_tx, a_rx) = bounded::<(BPosition, TxEnvelope)>((batch as usize) + 8);
+    let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>((batch as usize) + 8);
+    let (c_tx, c_rx) = bounded::<CMessage>((batch as usize) + 8);
+
+    // `a_tx`/`b_tx` move into this block and drop at its end, closing
+    // both channels so the executor thread sees EOF once it drains
+    // everything sent here.
+    {
+        let a_tx = a_tx;
+        let b_tx = b_tx;
+        for i in 0..batch {
+            send_one(&a_tx, &b_tx, &signer, to, i);
+        }
+        b_tx.send((
+            pos(batch as i32),
+            TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
+                block_number: 1,
+                // end_tx_idx is the cumulative count of canonical records
+                // through this block (encoded through
+                // `BPosition::from_index`). The executor compares this
+                // against its applied-record count: here, all `batch`
+                // txs. It is not the last tx's index.
+                end_tx_idx: BPosition::from_index(batch),
+                l2_timestamp: 0,
+                l1_origin: 0,
+            }),
+        ))
+        .unwrap();
+    }
+
+    let tx_data_subs = vec![ChanTxDataSub {
+        sequencer_id: 0,
+        rx: a_rx,
+    }];
+    let h = thread::spawn(move || {
+        Executor::<Wiring>::new(
+            ExecutorConfig {
+                chain_id: NonZeroU64::MIN,
+                receipt_queue_depth: QUEUE_DEPTH_512,
+                ..Default::default()
+            },
+            Inbound {
+                tx_data: tx_data_subs,
+                tx_ordering: ChanTxOrderingSub(b_rx),
+                join_recovery: None,
+            },
+            Outbound {
+                tx_receipts: ChanReceiptsPub(c_tx),
+                snapshots,
+                writer_signal: Imm,
+                writer_queue: writer_q,
+            },
+            ResumePoint::GENESIS,
+            RoleHooks::none(),
+        )
+        .run()
+    });
+
+    let got = count_receipts(&c_rx);
+    assert_eq!(got, batch);
+    h.join().expect("no panic").expect("ok");
+}
+
 fn bench_actor_throughput(c: &mut Criterion) {
     const BATCH: u64 = 256;
     let mut group = c.benchmark_group("actor_throughput");
     group.throughput(Throughput::Elements(BATCH));
 
     group.bench_function(BenchmarkId::from_parameter("transfers_256"), |b| {
-        b.iter(|| {
-            let signer = PrivateKeySigner::random();
-            let from = signer.address();
-            let to = address!("00000000000000000000000000000000DEAD0001");
-            let snap = MockStateDatabase::builder()
-                .account(from, U256::MAX, 0, KECCAK_EMPTY)
-                .build();
-            let writer_q = WriterApplyingQueue::new(snap.clone());
-            let snapshots = MutatingSnapshotSource(snap);
-
-            // Wiring after the join-buffer architecture update: preload all
-            // envelopes onto a single tx_data, and all TxRefs onto
-            // tx_ordering, before the executor starts. This bench measures
-            // end-to-end actor throughput. The demux split itself adds one
-            // extra crossbeam hop per tx, which should be negligible next
-            // to revm time.
-            let (a_tx, a_rx) = bounded::<(BPosition, TxEnvelope)>((BATCH as usize) + 8);
-            let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>((BATCH as usize) + 8);
-            let (c_tx, c_rx) = bounded::<CMessage>((BATCH as usize) + 8);
-
-            // `a_tx`/`b_tx` move into this block and drop at its end,
-            // closing both channels so the executor thread sees EOF once
-            // it drains everything sent here.
-            {
-                let a_tx = a_tx;
-                let b_tx = b_tx;
-                for i in 0..BATCH {
-                    send_one(&a_tx, &b_tx, &signer, to, i);
-                }
-                b_tx.send((
-                    pos(BATCH as i32),
-                    TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
-                        block_number: 1,
-                        // end_tx_idx is the cumulative count of canonical
-                        // records through this block (encoded through
-                        // `BPosition::from_index`). The executor compares this
-                        // against its applied-record count: here, all `BATCH`
-                        // txs. It is not the last tx's index.
-                        end_tx_idx: BPosition::from_index(BATCH),
-                        l2_timestamp: 0,
-                        l1_origin: 0,
-                    }),
-                ))
-                .unwrap();
-            }
-
-            let tx_data_subs = vec![ChanTxDataSub {
-                sequencer_id: 0,
-                rx: a_rx,
-            }];
-            let h = thread::spawn(move || {
-                Executor::<Wiring>::new(
-                    ExecutorConfig {
-                        chain_id: NonZeroU64::MIN,
-                        receipt_queue_depth: QUEUE_DEPTH_512,
-                        ..Default::default()
-                    },
-                    Inbound {
-                        tx_data: tx_data_subs,
-                        tx_ordering: ChanTxOrderingSub(b_rx),
-                        join_recovery: None,
-                    },
-                    Outbound {
-                        tx_receipts: ChanReceiptsPub(c_tx),
-                        snapshots,
-                        writer_signal: Imm,
-                        writer_queue: writer_q,
-                    },
-                    ResumePoint::GENESIS,
-                    RoleHooks::none(),
-                )
-                .run()
-            });
-
-            let mut got = 0u64;
-            while let Ok(m) = c_rx.recv_timeout(Duration::from_secs(10)) {
-                got += u64::from(matches!(m, CMessage::Receipt(_)));
-            }
-            assert_eq!(got, BATCH);
-            h.join().expect("no panic").expect("ok");
-        });
+        b.iter(|| run_one_batch(BATCH));
     });
     group.finish();
 }
