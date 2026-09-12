@@ -118,10 +118,10 @@ backend ingress
   # TCP-connect liveness, which is correct here: a replica that
   # accepts connections serves traffic, and the conn-cap wedge class
   # is gone with subscribe mode.
-  # The ingress replicas come from the kardamom-ingress Consul service
+  # The ingress replicas come from the ingress-jsonrpc Consul service
   # through the node resolver, so a new replica joins the pool without a
   # job change. The slot count bounds the pool.
-  server-template ingress 8 kardamom-ingress.service.consul:8545 resolvers consul resolve-prefer ipv4 init-addr none check
+  server-template ingress 8 ingress-jsonrpc.service.consul:8545 resolvers consul resolve-prefer ipv4 init-addr none check
 EOF
       }
 

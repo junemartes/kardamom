@@ -228,19 +228,7 @@ job "ingress" {
       }
 
       # The RPC front door as a Consul service: the rpc-proxy pool is
-      # kardamom-ingress.service.consul.
-      service {
-        name     = "kardamom-ingress"
-        port     = "jsonrpc"
-        provider = "consul"
-        check {
-          type     = "tcp"
-          port     = "jsonrpc"
-          interval = "10s"
-          timeout  = "2s"
-        }
-      }
-
+      # ingress-jsonrpc.service.consul.
       service {
         name     = "ingress-jsonrpc"
         port     = "jsonrpc"

@@ -21,6 +21,12 @@ workloads_cert_identity: >-
      default('^https://github\.com/junemartes/kardamom/\.github/workflows/[^@]+@refs/', true) }}
 workloads_cert_issuer: "{{ lookup('env', 'KARDAMOM_CERT_OIDC_ISSUER') | default('https://token.actions.githubusercontent.com', true) }}"
 workloads_image_services: [aeron, cluster, sequencer, ingress, executor, validator, da-watcher, batcher]
+# The variables every job derives its placement and its peer lists from.
+# A job receives the ones its file declares (tasks/job.yml).
+workloads_common_vars:
+  datacenter: "{{ datacenter }}"
+  executor_count: "{{ node_classes.executor.count }}"
+  sealer_count: "{{ node_classes.sealer.count }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 workloads_l1_rpc: "{{ lookup('env', 'L1_RPC') }}"

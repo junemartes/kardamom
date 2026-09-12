@@ -10,7 +10,11 @@ NOMAD_HTTP := 4646
 # The control node address comes from the node contract of the container
 # root at run time. Nothing in this tree names an address.
 NODE_CONTRACT := terraform/containers/node-contract.json
-NOMAD_ADDR ?= http://$(shell python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nodes"]["control-0"]["ip"])' $(NODE_CONTRACT) 2>/dev/null):$(NOMAD_HTTP)
+CONTROL_ADDRESS_CMD := python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nodes"]["control-0"]["ip"])' $(NODE_CONTRACT)
+CONTROL_ADDRESS = $(shell $(CONTROL_ADDRESS_CMD) 2>/dev/null)
+# Without a contract (the VM path) NOMAD_ADDR stays empty and the role uses
+# its own default.
+NOMAD_ADDR ?= $(if $(CONTROL_ADDRESS),http://$(CONTROL_ADDRESS):$(NOMAD_HTTP))
 TAG := dev
 # Per-deploy image digest manifest (attested-identity P0.1): written at push
 # time by ansible/images.yml, read by ansible/deploy.yml to pin every job's
@@ -89,9 +93,10 @@ clean:
 # lifecycle: apply, converge, test, diagnose, destroy. CI runs these targets
 # as workflow steps; ansible/local.yml runs them inside the orchestrator.
 TF_CONTAINERS := terraform/containers
-# Images are pushed from inside the control node, where the registry name
-# resolves; the host daemon needs no insecure-registry entry.
-export REGISTRY_PUSH_NODE ?= control-0
+# On the container path, images are pushed from inside the control node,
+# where the registry name resolves; the host daemon needs no
+# insecure-registry entry. The VM path pushes from the host.
+container-up: export REGISTRY_PUSH_NODE ?= control-0
 # Extra vars for ansible/cluster.yml, as one JSON object without a single quote.
 CLUSTER_VARS :=
 CLUSTER_VARS_ARG = $(if $(CLUSTER_VARS),--extra-vars '$(CLUSTER_VARS)')
@@ -103,7 +108,7 @@ container-up:
 	tofu -chdir=$(TF_CONTAINERS) init -input=false
 	tofu -chdir=$(TF_CONTAINERS) apply -auto-approve -input=false
 	tofu -chdir=$(TF_CONTAINERS) output -json node_contract > $(NODE_CONTRACT)
-	NOMAD_ADDR=http://$$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nodes"]["control-0"]["ip"])' $(NODE_CONTRACT)):$(NOMAD_HTTP) \
+	NOMAD_ADDR=http://$$($(CONTROL_ADDRESS_CMD)):$(NOMAD_HTTP) \
 	  ansible-playbook -i localhost, ansible/cluster.yml $(CLUSTER_VARS_ARG)
 
 ## container-test: the smoke, load and chaos gates (RUN_LOAD, RUN_CHAOS, ...)

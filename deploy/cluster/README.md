@@ -40,14 +40,15 @@ no file in the tree names its address:
 Every node runs its Consul agent as the node resolver (`roles/consul`: DNS
 on the loopback port 53, the host's previous resolvers as recursors). A
 dedicated node is `<class>-<i>.node.<datacenter>.consul`; a service is
-`<service>.service.consul` (`registry`, `anvil`, `kardamom-ingress`). The
+`<service>.service.consul` (`registry`, `anvil`, `ingress-jsonrpc`). The
 Nomad jobs derive every peer list from a count and the datacenter, so a
 job file, a config file or a script never names an address.
 `scripts/check-contract.py` rejects an address literal anywhere in
 `nomad/`, `config/`, `scripts/`, `ansible/`, the Makefile, the justfile
 and the e2e workflow. The two exceptions are environment files: the
 Terraform variables of a Hetzner deployment, and the Vagrantfile with
-`ansible/inventory.ini` for the VM path.
+`ansible/inventory.ini` for the VM path. An image build captures the
+recursors of the build server, so every elastic node forwards to them.
 
 Scripts that run on the Docker host, outside the cluster resolver, ask
 Docker for a container's address (`node_address` in `lib-topology.sh`),
