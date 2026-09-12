@@ -5,7 +5,8 @@
 //! sealer records the sealer's `tx_ordering` MDC publication. Other recorders
 //! tail `TxData` and `TxDeposits` streams so the executor can replay full
 //! transaction and deposit envelopes on crash recovery (see
-//! [`Recorder::start_stream`]).
+//! [`Recorder::start_stream`]). A producer binary spawns those through
+//! [`RecorderThreads`], which stops and joins them when it drops.
 //!
 //! This module has an unconditional dependency on rusteron.
 //!
@@ -255,6 +256,75 @@ pub fn record_stream_until_stopped(
     // Hold the recording (and its archive session) alive until shutdown.
     futures::executor::block_on(stop.cancelled());
     Ok(())
+}
+
+/// The stream-recorder threads one producer binary spawned, and the one
+/// stop token they share. Dropping this value stops the threads: it
+/// cancels the token, then joins every thread. A thread that already
+/// records wakes at once from its park on the token. A thread still in
+/// startup returns at its next catalog poll, within about 500 ms, or
+/// when its archive connect times out. So a caller on a tokio worker
+/// joins through `spawn_blocking` on the normal exit path, and lets a
+/// `?` return drop the value in place.
+pub struct RecorderThreads {
+    stop: CancellationToken,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl RecorderThreads {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            stop: CancellationToken::new(),
+            threads: Vec::new(),
+        }
+    }
+
+    /// Spawn one recorder thread named `name`. `body` receives a clone of
+    /// the shared stop token, and runs [`record_stream_until_stopped`]
+    /// with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS error when the thread cannot be spawned.
+    pub fn spawn(
+        &mut self,
+        name: String,
+        body: impl FnOnce(CancellationToken) + Send + 'static,
+    ) -> std::io::Result<()> {
+        let stop = self.stop.clone();
+        let handle = std::thread::Builder::new()
+            .name(name)
+            .spawn(move || body(stop))?;
+        self.threads.push(handle);
+        Ok(())
+    }
+
+    /// Stop every thread, then join it. Dropping the value does the same;
+    /// this method names the point at which the threads end, so a caller
+    /// can move the blocking join off its async runtime.
+    pub fn join(mut self) {
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.cancel();
+        for handle in self.threads.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Default for RecorderThreads {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for RecorderThreads {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
 }
 
 pub struct Recorder {

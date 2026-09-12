@@ -57,8 +57,8 @@ use kardamom_types::{Receipt, StateDatabase};
 
 /// A state snapshot the STM pool can fork and share across worker
 /// threads. This groups the bound this module repeats on
-/// [`StmBlockExec::spawn`], `pool_server`, and `run_one`, so it is
-/// written once.
+/// [`StmBlockExec::spawn`], `PoolServer`, and `SegCtx`, so it is written
+/// once.
 pub trait SharedState: StateDatabase + Clone + Sync + 'static {}
 impl<T: StateDatabase + Clone + Sync + 'static> SharedState for T {}
 
@@ -105,7 +105,7 @@ where
         let (req_tx, req_rx) = bounded::<BlockRequest<S>>(1);
         std::thread::Builder::new()
             .name("stm-pool-server".into())
-            .spawn(move || pool_server(&cfg, &req_rx))
+            .spawn(move || PoolServer::new(cfg, req_rx).run())
             .expect("spawn stm pool server");
         Self { req_tx }
     }
@@ -140,27 +140,48 @@ where
     }
 }
 
-fn pool_server<S: SharedState>(cfg: &StmExecConfig, rx: &Receiver<BlockRequest<S>>) {
-    let pool_cfg = PoolConfig {
-        workers: cfg.workers,
-        pin_cores: cfg.pin_cores.clone(),
-        keep_hot: cfg.keep_hot,
-        ..PoolConfig::default()
-    };
-    // Footprint stats persist across blocks. Each block's observed write
-    // sets train the next block's predictions (cold start is
-    // serial-heavy; the decline gate covers it).
-    let stats = Stats::default();
-    let workers = pool_cfg.workers;
-    with_pool::<S, _>(pool_cfg, |pool| {
-        while let Ok(req) = rx.recv() {
-            let out = run_one(pool, workers, &stats, &req);
+/// The pool-server thread's state: the pool config, the request channel,
+/// and the footprint stats. The stats persist across blocks: each block's
+/// observed write sets train the next block's predictions (cold start is
+/// serial-heavy; the decline gate covers it).
+struct PoolServer<S> {
+    cfg: StmExecConfig,
+    rx: Receiver<BlockRequest<S>>,
+    stats: Stats,
+}
+
+impl<S: SharedState> PoolServer<S> {
+    fn new(cfg: StmExecConfig, rx: Receiver<BlockRequest<S>>) -> Self {
+        Self {
+            cfg,
+            rx,
+            stats: Stats::default(),
+        }
+    }
+
+    /// Bring up the pool, serve requests until the strategy handle drops,
+    /// then tear the pool down.
+    fn run(self) {
+        let pool_cfg = PoolConfig {
+            workers: self.cfg.workers,
+            pin_cores: self.cfg.pin_cores.clone(),
+            keep_hot: self.cfg.keep_hot,
+            ..PoolConfig::default()
+        };
+        let workers = pool_cfg.workers;
+        with_pool::<S, _>(pool_cfg, |pool| self.serve(pool, workers));
+        tracing::info!("stm pool server stopped");
+    }
+
+    /// Execute every request on `pool` until the request channel closes.
+    fn serve(&self, pool: &PoolHandle<'_, S>, workers: NonZeroUsize) {
+        while let Ok(req) = self.rx.recv() {
+            let out = SegCtx::new(pool, workers, &self.stats, &req).run();
             // If the strategy is gone mid-shutdown, drop the reply: keep
             // draining until the request channel closes.
             let _ = req.reply.send(out);
         }
-    });
-    tracing::info!("stm pool server stopped");
+    }
 }
 
 /// One transaction inside a [`Segment::Txs`] run: its block-global
@@ -182,105 +203,53 @@ enum Segment {
     Singleton { at: u64, rec: BufferedRecord },
 }
 
-fn segment(records: &[BufferedRecord]) -> Vec<Segment> {
-    let mut segs = Vec::new();
-    for (i, rec) in records.iter().enumerate() {
-        push_segment(&mut segs, i as u64, rec);
-    }
-    segs
-}
+/// A block's records split into segments, in canonical order.
+struct Segments(Vec<Segment>);
 
-/// Fold one record into `segs`. It extends the last run of
-/// consecutive transactions, starts a new run, or pushes a singleton
-/// for a deposit or a cross-chain delivery.
-fn push_segment(segs: &mut Vec<Segment>, i: u64, rec: &BufferedRecord) {
-    match rec {
-        BufferedRecord::Tx {
-            tx_idx,
-            envelope,
-            position,
-        } => {
-            let seg_tx = SegTx {
-                tx_idx: *tx_idx,
-                position: *position,
-                envelope: envelope.clone(),
-            };
-            match segs.last_mut() {
-                Some(Segment::Txs { txs, .. }) => txs.push(seg_tx),
-                _ => segs.push(Segment::Txs {
-                    start: i,
-                    txs: vec![seg_tx],
-                }),
+impl Segments {
+    /// Split `records` at deposit and cross-chain-delivery positions.
+    fn split(records: &[BufferedRecord]) -> Self {
+        let mut segs = Self(Vec::new());
+        for (i, rec) in records.iter().enumerate() {
+            segs.push(i as u64, rec);
+        }
+        segs
+    }
+
+    /// Fold one record in. It extends the last run of consecutive
+    /// transactions, starts a new run, or pushes a singleton for a
+    /// deposit or a cross-chain delivery.
+    fn push(&mut self, i: u64, rec: &BufferedRecord) {
+        match rec {
+            BufferedRecord::Tx {
+                tx_idx,
+                envelope,
+                position,
+            } => {
+                let seg_tx = SegTx {
+                    tx_idx: *tx_idx,
+                    position: *position,
+                    envelope: envelope.clone(),
+                };
+                match self.0.last_mut() {
+                    Some(Segment::Txs { txs, .. }) => txs.push(seg_tx),
+                    _ => self.0.push(Segment::Txs {
+                        start: i,
+                        txs: vec![seg_tx],
+                    }),
+                }
+            }
+            BufferedRecord::Deposit { .. } | BufferedRecord::XChain { .. } => {
+                self.0.push(Segment::Singleton {
+                    at: i,
+                    rec: rec.clone(),
+                });
             }
         }
-        BufferedRecord::Deposit { .. } | BufferedRecord::XChain { .. } => {
-            segs.push(Segment::Singleton {
-                at: i,
-                rec: rec.clone(),
-            });
-        }
     }
 }
 
-fn run_one<S: SharedState>(
-    pool: &PoolHandle<'_, S>,
-    workers: NonZeroUsize,
-    stats: &Stats,
-    req: &BlockRequest<S>,
-) -> Result<BlockExecOutput, ExecutorError> {
-    if req.records.is_empty() {
-        return Ok(BlockExecOutput {
-            receipts: Vec::new(),
-            delta: PendingDelta::new(),
-            // The boundary handoff publishes every block, empty included
-            // (streaming hands off an empty per-block Bal the same way).
-            bal: Some(revm::state::bal::Bal::new()),
-        });
-    }
-
-    // Decline gate: same statistic, same threshold, and same learning
-    // discipline as the pool's own gate. The sequential arm here is the
-    // shared capture driver (deposits included), so it needs no
-    // segmentation and no fixups.
-    if !pool.parallel_worth_it() {
-        let started = Instant::now();
-        let out = execute_block_capture(&req.snapshot, req.parent.as_ref(), &req.records, req.env);
-        pool.learn_sequential(started.elapsed(), req.records.len());
-        return out;
-    }
-
-    let mut accum = SegAccum::new(req.records.len());
-    let ctx = SegCtx {
-        pool,
-        workers,
-        stats,
-        req,
-    };
-    for seg in segment(&req.records) {
-        ctx.process_segment(seg, &mut accum)?;
-    }
-    let SegAccum {
-        seg_layers,
-        receipts,
-        frags,
-        ..
-    } = accum;
-
-    // Block delta: the segments' writes folded in canonical order. The
-    // parent layer stays out, because the exec thread owns cross-block
-    // accounting; double-counting it would be a silent divergence.
-    let mut delta = PendingDelta::new();
-    for l in &seg_layers {
-        delta.merge_from(l);
-    }
-    Ok(BlockExecOutput {
-        receipts,
-        delta,
-        bal: Some(merge_bal_fragments(frags)),
-    })
-}
-
-/// The state `run_one` threads across a block's segments, in canonical
+/// The state [`SegCtx::run`] threads across a block's segments, in canonical
 /// order: each segment's read layer, its receipts so far, its BAL
 /// fragments, and the running cumulative gas total.
 struct SegAccum {
@@ -312,7 +281,75 @@ struct SegCtx<'a, S: SharedState> {
     req: &'a BlockRequest<S>,
 }
 
-impl<S: SharedState> SegCtx<'_, S> {
+impl<'a, S: SharedState> SegCtx<'a, S> {
+    fn new(
+        pool: &'a PoolHandle<'a, S>,
+        workers: NonZeroUsize,
+        stats: &'a Stats,
+        req: &'a BlockRequest<S>,
+    ) -> Self {
+        Self {
+            pool,
+            workers,
+            stats,
+            req,
+        }
+    }
+
+    /// Execute the request's block: the sequential arm when the decline
+    /// gate says parallelism is not worth it, else one segment at a time
+    /// on the pool.
+    fn run(&self) -> Result<BlockExecOutput, ExecutorError> {
+        let req = self.req;
+        if req.records.is_empty() {
+            return Ok(BlockExecOutput {
+                receipts: Vec::new(),
+                delta: PendingDelta::new(),
+                // The boundary handoff publishes every block, empty
+                // included (streaming hands off an empty per-block Bal the
+                // same way).
+                bal: Some(revm::state::bal::Bal::new()),
+            });
+        }
+
+        // Decline gate: same statistic, same threshold, and same learning
+        // discipline as the pool's own gate. The sequential arm here is
+        // the shared capture driver (deposits included), so it needs no
+        // segmentation and no fixups.
+        if !self.pool.parallel_worth_it() {
+            let started = Instant::now();
+            let out =
+                execute_block_capture(&req.snapshot, req.parent.as_ref(), &req.records, req.env);
+            self.pool
+                .learn_sequential(started.elapsed(), req.records.len());
+            return out;
+        }
+
+        let mut accum = SegAccum::new(req.records.len());
+        for seg in Segments::split(&req.records).0 {
+            self.process_segment(seg, &mut accum)?;
+        }
+        let SegAccum {
+            seg_layers,
+            receipts,
+            frags,
+            ..
+        } = accum;
+
+        // Block delta: the segments' writes folded in canonical order. The
+        // parent layer stays out, because the exec thread owns cross-block
+        // accounting; double-counting it would be a silent divergence.
+        let mut delta = PendingDelta::new();
+        for l in &seg_layers {
+            delta.merge_from(l);
+        }
+        Ok(BlockExecOutput {
+            receipts,
+            delta,
+            bal: Some(merge_bal_fragments(frags)),
+        })
+    }
+
     /// Execute one segment and fold its results into `accum`.
     fn process_segment(&self, seg: Segment, accum: &mut SegAccum) -> Result<(), ExecutorError> {
         match seg {

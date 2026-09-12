@@ -13,7 +13,7 @@ use kardamom_da_watcher::interop::mock::MockInteropFeed;
 use kardamom_da_watcher::interop::publisher::fakes::InMemoryRemoteEpochPublisher;
 use kardamom_da_watcher::interop::source::WsRemoteChainSource;
 use kardamom_da_watcher::interop::{
-    CursorFile, InteropError, InteropWatcherConfig, RemoteChainSource, process_once, spawn,
+    CursorFile, InteropError, InteropWatcher, InteropWatcherConfig, RemoteChainSource,
 };
 use kardamom_da_watcher::watcher::WatcherHandle;
 
@@ -57,7 +57,7 @@ fn spawn_resuming(
 ) -> WatcherHandle {
     let source = WsRemoteChainSource::new(ORIGIN, SELF, feed.url())
         .with_reconnect(Duration::from_millis(20), NonZeroU32::new(50).unwrap());
-    spawn(
+    InteropWatcher::spawn(
         publisher,
         source,
         InteropWatcherConfig {
@@ -66,6 +66,26 @@ fn spawn_resuming(
             retry_interval: Duration::from_millis(20),
         },
         cursor_file,
+    )
+}
+
+/// A watcher over a scripted source, resumed at `cursor`, driven by hand
+/// through `process_once`. The publisher is cloned in, so the test keeps
+/// its own handle on the published records.
+fn watcher<S: RemoteChainSource>(
+    publisher: &InMemoryRemoteEpochPublisher,
+    source: S,
+    cursor: u64,
+) -> InteropWatcher<S, InMemoryRemoteEpochPublisher> {
+    InteropWatcher::new(
+        publisher.clone(),
+        source,
+        InteropWatcherConfig {
+            self_chain_id: SELF,
+            start_seq: cursor,
+            retry_interval: Duration::from_millis(20),
+        },
+        None,
     )
 }
 
@@ -105,21 +125,17 @@ async fn a_declined_publish_holds_the_cursor() {
     let mut source = ScriptedRemoteSource::new(ORIGIN);
     source.push_batch(Ok(vec![msg(0, 100)]));
     source.push_batch(Ok(vec![msg(0, 100)]));
-    let mut cursor = 0u64;
+    let mut w = watcher(&publisher, source, 0u64);
 
-    let n = process_once(&publisher, &mut source, SELF, &mut cursor)
-        .await
-        .unwrap();
+    let n = w.process_once().await.unwrap();
     assert_eq!(n, 0);
-    assert_eq!(cursor, 0, "cursor must not pass an unpublished record");
+    assert_eq!(w.cursor(), 0, "cursor must not pass an unpublished record");
 
     *publisher.fail_with_backpressure.lock().unwrap() = false;
-    let n = process_once(&publisher, &mut source, SELF, &mut cursor)
-        .await
-        .unwrap();
+    let n = w.process_once().await.unwrap();
     assert_eq!(n, 1);
-    assert_eq!(cursor, 1);
-    assert_eq!(source.cursors, vec![0, 0], "the retry re-reads from 0");
+    assert_eq!(w.cursor(), 1);
+    assert_eq!(w.source().cursors, vec![0, 0], "the retry re-reads from 0");
 }
 
 /// A feed failure stalls the pair; it does not fault it. The distinction
@@ -133,13 +149,11 @@ async fn a_feed_failure_is_retryable_not_a_fault() {
     let publisher = InMemoryRemoteEpochPublisher::default();
     let mut source = ScriptedRemoteSource::new(ORIGIN);
     source.push_batch(Err(RemoteSourceError::Transport("peer down".into())));
-    let mut cursor = 7u64;
+    let mut w = watcher(&publisher, source, 7u64);
 
-    let err = process_once(&publisher, &mut source, SELF, &mut cursor)
-        .await
-        .unwrap_err();
+    let err = w.process_once().await.unwrap_err();
     assert!(matches!(err, InteropError::Source(_)), "got {err:?}");
-    assert_eq!(cursor, 7);
+    assert_eq!(w.cursor(), 7);
 }
 
 /// Messages group by ORIGIN BLOCK, not by arrival: three messages across
@@ -158,7 +172,7 @@ async fn one_record_per_origin_block() {
     feed.push_message(msg(3, 102));
 
     wait_until(|| publisher.records().len() >= 2, "two records").await;
-    let _ = handle.shutdown.send(());
+    handle.join().await.unwrap();
 
     let records = publisher.records();
     assert_eq!(records.len(), 2, "one record per origin block, no more");
@@ -274,11 +288,9 @@ async fn a_multi_block_batch_is_a_fault() {
     let publisher = InMemoryRemoteEpochPublisher::default();
     let mut source = ScriptedRemoteSource::new(ORIGIN);
     source.push_batch(Ok(vec![msg(0, 100), msg(1, 101)]));
-    let mut cursor = 0u64;
+    let mut w = watcher(&publisher, source, 0u64);
 
-    let err = process_once(&publisher, &mut source, SELF, &mut cursor)
-        .await
-        .unwrap_err();
+    let err = w.process_once().await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -289,7 +301,7 @@ async fn a_multi_block_batch_is_a_fault() {
         ),
         "got {err:?}"
     );
-    assert_eq!(cursor, 0);
+    assert_eq!(w.cursor(), 0);
     assert!(publisher.records().is_empty());
 }
 
@@ -313,7 +325,7 @@ async fn a_reconnect_reproduces_byte_identical_records() {
     feed.push_message(msg(2, 101));
     feed.push_message(msg(3, 102));
     wait_until(|| publisher.records().len() >= 2, "two records").await;
-    let _ = handle.shutdown.send(());
+    handle.join().await.unwrap();
 
     let records = publisher.records();
     assert_eq!(records.len(), 2, "the replay must not duplicate a record");
@@ -358,8 +370,7 @@ async fn a_restart_resumes_exactly_from_the_persisted_cursor() {
     feed.push_message(msg(2, 101));
     feed.push_message(msg(3, 102)); // sentinel: closes 101
     wait_until(|| publisher.records().len() >= 2, "two records").await;
-    let _ = handle.shutdown.send(());
-    handle.task.await.unwrap();
+    handle.join().await.unwrap();
     // The watcher's task has exited, so its `CursorFile` (and the lock it
     // holds) has dropped; reopening now is safe. The block scope ends
     // this reopened handle before the next spawn reopens the file.
@@ -386,8 +397,7 @@ async fn a_restart_resumes_exactly_from_the_persisted_cursor() {
     feed.push_message(msg(4, 103)); // closes 102
     feed.push_message(msg(5, 104)); // closes 103
     wait_until(|| publisher.records().len() >= 4, "four records").await;
-    let _ = handle.shutdown.send(());
-    handle.task.await.unwrap();
+    handle.join().await.unwrap();
 
     let seqs: Vec<u64> = publisher
         .records()
@@ -429,12 +439,10 @@ async fn a_crash_between_publish_and_persist_resumes_stale_and_dedup_absorbs() {
     {
         let mut source = ScriptedRemoteSource::new(ORIGIN);
         source.push_batch(Ok(vec![msg(0, 100), msg(1, 100)]));
-        let mut cursor = cursor_file.load().unwrap().unwrap_or(0);
-        let n = process_once(&publisher, &mut source, SELF, &mut cursor)
-            .await
-            .unwrap();
+        let mut w = watcher(&publisher, source, cursor_file.load().unwrap().unwrap_or(0));
+        let n = w.process_once().await.unwrap();
         assert_eq!(n, 1);
-        assert_eq!(cursor, 2, "in-memory cursor advanced past the publish");
+        assert_eq!(w.cursor(), 2, "in-memory cursor advanced past the publish");
     }
     assert_eq!(cursor_file.load().unwrap(), None, "nothing durable yet");
 
@@ -443,21 +451,17 @@ async fn a_crash_between_publish_and_persist_resumes_stale_and_dedup_absorbs() {
     let mut source = ScriptedRemoteSource::new(ORIGIN);
     source.push_batch(Ok(vec![msg(0, 100), msg(1, 100)]));
     source.push_batch(Ok(vec![msg(2, 101)]));
-    let mut cursor = cursor_file.load().unwrap().unwrap_or(0);
-    assert_eq!(cursor, 0, "resumed stale — the harmless side");
-    let n = process_once(&publisher, &mut source, SELF, &mut cursor)
-        .await
-        .unwrap();
+    let mut w = watcher(&publisher, source, cursor_file.load().unwrap().unwrap_or(0));
+    assert_eq!(w.cursor(), 0, "resumed stale — the harmless side");
+    let n = w.process_once().await.unwrap();
     assert_eq!(
         n, 1,
         "the re-publish is reported successful to the producer"
     );
-    cursor_file.persist(cursor).unwrap();
-    let n = process_once(&publisher, &mut source, SELF, &mut cursor)
-        .await
-        .unwrap();
+    cursor_file.persist(w.cursor()).unwrap();
+    let n = w.process_once().await.unwrap();
     assert_eq!(n, 1);
-    cursor_file.persist(cursor).unwrap();
+    cursor_file.persist(w.cursor()).unwrap();
 
     // The duplicate was absorbed, not executed twice: one copy of each
     // record, one dedup hit, and the lane is dense.
@@ -535,10 +539,8 @@ async fn a_lagged_marker_terminates_next_batch() {
 
     // Through `process_once`: the terminal variant, cursor unchanged.
     let publisher = InMemoryRemoteEpochPublisher::default();
-    let mut cursor = 0u64;
-    let err = process_once(&publisher, &mut source, SELF, &mut cursor)
-        .await
-        .unwrap_err();
+    let mut w = watcher(&publisher, source, 0u64);
+    let err = w.process_once().await.unwrap_err();
     assert!(
         matches!(
             err,
@@ -549,10 +551,10 @@ async fn a_lagged_marker_terminates_next_batch() {
         ),
         "got {err:?}"
     );
-    assert_eq!(cursor, 0);
+    assert_eq!(w.cursor(), 0);
     // A cursor at the floor is served; the head closes the block.
     feed.push_head(103);
-    let batch = tokio::time::timeout(Duration::from_secs(5), source.next_batch(3))
+    let batch = tokio::time::timeout(Duration::from_secs(5), w.source_mut().next_batch(3))
         .await
         .expect("the batch must close on the head")
         .unwrap();
@@ -577,7 +579,7 @@ async fn a_head_event_closes_a_single_message_block() {
     feed.push_message(msg(1, 105));
     feed.push_head(106);
     wait_until(|| publisher.records().len() >= 2, "two records").await;
-    let _ = handle.shutdown.send(());
+    handle.join().await.unwrap();
 
     let records = publisher.records();
     assert_eq!(records[0].anchor_number, 100);

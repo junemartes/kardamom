@@ -52,8 +52,8 @@ pub use error::BatcherError;
 pub use frame::{BlockFrame, Kar1Payload, TxFrame};
 pub use l1::{BatchDescriptor, post_batch, read_posted_batches, recover_blocks};
 pub use multi_archive_reader::{MultiArchiveConfig, MultiArchiveReader, ResolvedRecord};
-pub use optimistic::{ClaimOutcome, WatchOutcome, claim_next_batch, watch_and_challenge};
-pub use prover_submit::{SubmitOutcome, submit_next_proof};
+pub use optimistic::{BatchClaimer, BatchWatcher, ClaimOutcome, WatchOutcome};
+pub use prover_submit::{ProofSubmitter, SubmitOutcome};
 pub use rereplicate::{
     HealReport, MirrorReport, diff_mirror, heal_from_mirror, mirror_archive, verify_mirror,
 };

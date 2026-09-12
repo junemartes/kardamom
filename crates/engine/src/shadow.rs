@@ -128,27 +128,6 @@ pub(crate) fn write_cells(ws: &WriteSet) -> Vec<Cell> {
         .collect()
 }
 
-/// Read `KARDAMOM_FOOTPRINT_SHADOW`. If it is `1`, spawn the shadow thread
-/// and return the exec side's sender. The thread exits when the executor
-/// drops the sender. No join handle is needed, because the thread owns no
-/// state that anything waits for.
-///
-/// # Panics
-///
-/// Panics if the OS refuses to spawn the thread.
-pub fn spawn_from_env() -> Option<Sender<ShadowBlock>> {
-    if std::env::var("KARDAMOM_FOOTPRINT_SHADOW").ok().as_deref() != Some("1") {
-        return None;
-    }
-    let (tx, rx) = bounded::<ShadowBlock>(8);
-    std::thread::Builder::new()
-        .name("footprint-shadow".into())
-        .spawn(move || Shadow::new().run(&rx))
-        .expect("spawn footprint-shadow");
-    tracing::info!(target: "kardamom_executor::shadow", "footprint shadow ENABLED (measurement only; execution stays sequential)");
-    Some(tx)
-}
-
 /// One graded block's outcome: everything the metrics emission and the
 /// summary log line need, gathered so neither takes it as loose
 /// parameters.
@@ -211,25 +190,49 @@ impl GradedBlock {
     }
 }
 
-/// Grading state: the classifier stats trained across blocks, and the
-/// grading exclusion set (the Accumulator boundary). One instance serves
-/// the shadow thread's whole life; test code builds one instance to grade
-/// a block without a thread.
-pub(crate) struct Shadow {
+/// The shadow thread's state: the block channel it drains, the classifier
+/// stats trained across blocks, and the grading exclusion set (the
+/// Accumulator boundary). One instance serves the shadow thread's whole
+/// life; test code builds one instance to grade a block without a thread.
+pub struct Shadow {
+    rx: Receiver<ShadowBlock>,
     stats: Stats,
     exclude: HashSet<Cell>,
 }
 
 impl Shadow {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(rx: Receiver<ShadowBlock>) -> Self {
         Self {
+            rx,
             stats: Stats::default(),
             exclude: HashSet::from([Cell::Account(FEE_SINK)]),
         }
     }
 
-    fn run(mut self, rx: &Receiver<ShadowBlock>) {
-        for block in rx {
+    /// Read `KARDAMOM_FOOTPRINT_SHADOW`. If it is `1`, spawn the shadow
+    /// thread and return the exec side's sender. The thread exits when the
+    /// executor drops the sender. No join handle is needed, because the
+    /// thread owns no state that anything waits for.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS refuses to spawn the thread.
+    pub fn spawn_from_env() -> Option<Sender<ShadowBlock>> {
+        if std::env::var("KARDAMOM_FOOTPRINT_SHADOW").ok().as_deref() != Some("1") {
+            return None;
+        }
+        let (tx, rx) = bounded::<ShadowBlock>(8);
+        std::thread::Builder::new()
+            .name("footprint-shadow".into())
+            .spawn(move || Self::new(rx).run())
+            .expect("spawn footprint-shadow");
+        tracing::info!(target: "kardamom_executor::shadow", "footprint shadow ENABLED (measurement only; execution stays sequential)");
+        Some(tx)
+    }
+
+    /// Grade every block until the exec side drops its sender.
+    fn run(mut self) {
+        while let Ok(block) = self.rx.recv() {
             self.process_block(block);
         }
     }

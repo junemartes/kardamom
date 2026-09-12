@@ -20,12 +20,12 @@
 //!   [`kardamom_types::Deposit`] records the watcher emits. Production wraps
 //!   `kardamom_log::aeron_live::TxDepositsPublisherHandle`. Tests use the
 //!   in-memory fake in [`publisher::fakes`].
-//! - [`watcher::process_once`]: a pure, single-pass function for one tick.
-//!   It reads the finalized tip, fetches logs in `(cursor, tip]`, builds a
-//!   `Deposit` from each log, publishes on `tx_deposits`, and advances the
-//!   cursor.
-//! - [`watcher::spawn`]: wraps `process_once` in a `tokio::time::interval`
-//!   loop with structured logging. Returns a [`watcher::WatcherHandle`].
+//! - [`watcher::L1Watcher`]: the watcher state. `process_once` is one
+//!   pass for one tick. It reads the finalized tip, fetches logs in
+//!   `(cursor, tip]`, builds a `Deposit` from each log, publishes on
+//!   `tx_deposits`, and advances the cursor. `spawn` wraps it in a
+//!   `tokio::time::interval` loop with structured logging. Returns a
+//!   [`watcher::WatcherHandle`].
 //!
 //! ## Semantics
 //!
@@ -50,7 +50,7 @@
 //! Kardamom chain as the origin instead of L1. It mirrors the layering
 //! above, seam for seam: `RemoteChainSource` matches [`source::L1Source`],
 //! `RemoteEpochPublisher` matches [`publisher::EpochPublisher`], and
-//! `interop::watcher::process_once` matches [`watcher::process_once`]. It
+//! `interop::InteropWatcher` matches [`watcher::L1Watcher`]. It
 //! shares nothing else. The derivation rule lives in
 //! `kardamom_types::xchain`, for the same reason the deposit rule lives in
 //! `kardamom_types::epoch`.
@@ -71,4 +71,4 @@ pub use kardamom_types::epoch::{
 pub use publisher::{EpochPublisher, PublishError};
 pub use rpc_source::RpcL1Source;
 pub use source::{L1Source, L1SourceError};
-pub use watcher::{DaWatcherConfig, MonitorError, WatcherHandle, process_once, spawn};
+pub use watcher::{DaWatcherConfig, L1Watcher, MonitorError, WatcherHandle};

@@ -72,55 +72,65 @@ pub enum ReaderToExec {
     Boundary(BlockBoundaryStart),
 }
 
-/// Spawn one `tx_data` reader thread for `tx_data_sub`. It inserts every
-/// `(TxDataLoc, envelope)` into `buffer`, keyed by a [`TxDataKey`] built from
-/// `tx_data_sub.sequencer_id()` and the location's session and position. It
-/// returns `Ok(())` when the subscription closes cleanly, or the first
-/// error.
-///
-/// # Panics
-///
-/// Panics if the OS refuses to spawn the thread.
-pub fn spawn_tx_data_reader<D>(
-    mut tx_data_sub: D,
+/// One `tx_data` reader thread's state: its subscription, the shared join
+/// buffer it inserts into, and the sequencer id that keys each insert.
+pub struct TxDataReader<D> {
+    sub: D,
     buffer: JoinBuffer,
-) -> JoinHandle<Result<(), ExecutorError>>
-where
-    D: TxDataSubscription + 'static,
-{
-    let sid = tx_data_sub.sequencer_id();
-    thread::Builder::new()
-        .name(format!("executor-reader-a{sid}"))
-        .spawn(move || {
-            loop {
-                match tx_data_step(&mut tx_data_sub, &buffer, sid)? {
-                    TxDataStep::Inserted => {}
-                    TxDataStep::Closed => return Ok(()),
-                }
-            }
-        })
-        .expect("spawn tx_data reader")
+    sid: u8,
 }
 
-/// One `tx_data` receive step: insert the envelope into the join buffer, or
-/// report a clean subscription close. The loop in [`spawn_tx_data_reader`]
-/// stays a plain dispatch on the result.
-fn tx_data_step<D: TxDataSubscription>(
-    tx_data_sub: &mut D,
-    buffer: &JoinBuffer,
-    sid: u8,
-) -> Result<TxDataStep, ExecutorError> {
-    match tx_data_sub.next() {
-        Ok((loc, env)) => {
-            buffer.insert(TxDataKey::new(sid, loc.session_id, loc.position), env);
-            Ok(TxDataStep::Inserted)
+impl<D: TxDataSubscription + 'static> TxDataReader<D> {
+    /// Build the reader for `sub`. The sequencer id comes from the
+    /// subscription, so every insert carries the lane it arrived on.
+    pub fn new(sub: D, buffer: JoinBuffer) -> Self {
+        let sid = sub.sequencer_id();
+        Self { sub, buffer, sid }
+    }
+
+    /// Spawn the reader on its own OS thread. It inserts every
+    /// `(TxDataLoc, envelope)` into the join buffer, keyed by a
+    /// [`TxDataKey`] built from the sequencer id and the location's
+    /// session and position. The thread returns `Ok(())` when the
+    /// subscription closes cleanly, or the first error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS refuses to spawn the thread.
+    pub fn spawn(self) -> JoinHandle<Result<(), ExecutorError>> {
+        thread::Builder::new()
+            .name(format!("executor-reader-a{}", self.sid))
+            .spawn(move || self.run())
+            .expect("spawn tx_data reader")
+    }
+
+    /// The reader loop: one [`Self::step`] per record until the
+    /// subscription closes.
+    fn run(mut self) -> Result<(), ExecutorError> {
+        loop {
+            match self.step()? {
+                TxDataStep::Inserted => {}
+                TxDataStep::Closed => return Ok(()),
+            }
         }
-        Err(ExecutorError::TxDataClosed { .. }) => Ok(TxDataStep::Closed),
-        Err(e) => Err(e),
+    }
+
+    /// One `tx_data` receive step: insert the envelope into the join
+    /// buffer, or report a clean subscription close.
+    fn step(&mut self) -> Result<TxDataStep, ExecutorError> {
+        match self.sub.next() {
+            Ok((loc, env)) => {
+                self.buffer
+                    .insert(TxDataKey::new(self.sid, loc.session_id, loc.position), env);
+                Ok(TxDataStep::Inserted)
+            }
+            Err(ExecutorError::TxDataClosed { .. }) => Ok(TxDataStep::Closed),
+            Err(e) => Err(e),
+        }
     }
 }
 
-/// Outcome of one [`tx_data_step`] call.
+/// Outcome of one [`TxDataReader::step`] call.
 enum TxDataStep {
     Inserted,
     Closed,
@@ -133,18 +143,19 @@ enum Flow {
     Stop,
 }
 
-/// Why [`OrderingLoop::send_expanded`]'s item loop stopped early: the exec
+/// Why [`TxOrderingReader::send_expanded`]'s item loop stopped early: the exec
 /// sink closed (not an error), or the record counter overflowed (fatal).
 enum ExpandHalt {
     Stopped,
     Failed(ExecutorError),
 }
 
-/// The `tx_ordering` reader's per-message loop state: the join buffer and its
-/// optional archive recovery, the canonical-id dedup window, the
-/// executor-local record counter, and the exec sink. One instance lives for
-/// the reader thread's whole life.
-struct OrderingLoop<S> {
+/// The `tx_ordering` reader thread's state: the subscription, the join
+/// buffer and its optional archive recovery, the canonical-id dedup window,
+/// the executor-local record counter, and the exec sink. One instance lives
+/// for the reader thread's whole life.
+pub struct TxOrderingReader<O, S> {
+    sub: O,
     buffer: JoinBuffer,
     cfg: ReaderConfig,
     exec_out: S,
@@ -162,16 +173,64 @@ struct OrderingLoop<S> {
     seen_canonical_ids: DedupWindow,
 }
 
-impl<S: ExecSink> OrderingLoop<S> {
-    fn new(
-        buffer: JoinBuffer,
-        cfg: ReaderConfig,
-        exec_out: S,
-        recovery: Option<JoinRecovery>,
-        start_tx_idx: TxIndex,
-    ) -> Self {
+/// Everything [`TxOrderingReader::spawn`] needs. `start_tx_idx` seeds the
+/// executor-local record counter: 0 on a fresh start, or the persisted
+/// cursor's record count on a resume. The canonical source delivers from
+/// the cursor onward, and downstream checks the indices this reader
+/// assigns against absolute boundary counts.
+///
+/// `recovery_factory`, when wired, turns a join miss into an archive
+/// refetch instead of an immediate death; see [`JoinRecovery`]. The reader
+/// builds it once, inside its own thread, because the recovery's Aeron
+/// resources are thread-bound.
+pub struct TxOrderingInputs<O, S> {
+    pub sub: O,
+    pub buffer: JoinBuffer,
+    pub cfg: ReaderConfig,
+    pub exec_out: S,
+    pub start_tx_idx: TxIndex,
+    pub recovery_factory: Option<JoinRecoveryFactory>,
+}
+
+impl<O, S> TxOrderingReader<O, S>
+where
+    O: TxOrderingSubscription + 'static,
+    S: ExecSink,
+{
+    /// Spawn the single `tx_ordering` reader thread. It pulls
+    /// [`TxOrderingMessage`] records in canonical order. For each `TxRef`,
+    /// it joins against the buffer with a bounded wait, and forwards
+    /// `(position, envelope)` to the exec sink. For each `BoundaryStart`,
+    /// it forwards directly.
+    ///
+    /// The state is built on the spawned thread, so the archive recovery's
+    /// Aeron resources stay thread-bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS refuses to spawn the thread.
+    pub fn spawn(inputs: TxOrderingInputs<O, S>) -> JoinHandle<Result<(), ExecutorError>> {
+        thread::Builder::new()
+            .name("executor-reader-b".into())
+            .spawn(move || Self::new(inputs).run())
+            .expect("spawn tx_ordering reader")
+    }
+
+    /// Build the loop state. Runs on the reader thread, so the recovery
+    /// factory builds its Aeron resources there.
+    fn new(inputs: TxOrderingInputs<O, S>) -> Self {
+        let TxOrderingInputs {
+            sub,
+            buffer,
+            cfg,
+            exec_out,
+            start_tx_idx,
+            recovery_factory,
+        } = inputs;
+        let recovery = recovery_factory.map(JoinRecoveryFactory::build);
         let seen_canonical_ids = DedupWindow::new(cfg.dedup_window);
         Self {
+            sub,
             buffer,
             cfg,
             exec_out,
@@ -368,15 +427,19 @@ impl<S: ExecSink> OrderingLoop<S> {
         })
     }
 
+    /// The reader loop: one [`Self::step`] per message until the
+    /// subscription closes or the exec sink stops.
+    fn run(mut self) -> Result<(), ExecutorError> {
+        while let Flow::Continue = self.step()? {}
+        Ok(())
+    }
+
     /// One receive-then-dispatch step: pull the next `tx_ordering` message,
     /// and dispatch it to its handler. Returns `Flow::Stop` on a clean
-    /// `tx_ordering` close. The loop in [`spawn_tx_ordering_reader`] stays
-    /// a plain dispatch on the result.
-    fn step<O: TxOrderingSubscription>(
-        &mut self,
-        tx_ordering_sub: &mut O,
-    ) -> Result<Flow, ExecutorError> {
-        let (position, msg) = match tx_ordering_sub.next() {
+    /// `tx_ordering` close. The loop in [`Self::run`] stays a plain
+    /// dispatch on the result.
+    fn step(&mut self) -> Result<Flow, ExecutorError> {
+        let (position, msg) = match self.sub.next() {
             Ok(p) => p,
             Err(ExecutorError::TxOrderingClosed) => return Ok(Flow::Stop),
             Err(e) => return Err(e),
@@ -413,45 +476,4 @@ impl<S: ExecSink> OrderingLoop<S> {
             }
         }
     }
-}
-
-/// Spawn the single `tx_ordering` reader thread. It pulls
-/// [`TxOrderingMessage`] records in canonical order. For each `TxRef`, it
-/// joins against `buffer` with a bounded wait, and forwards `(position,
-/// envelope)` to `exec_out`. For each `BoundaryStart`, it forwards directly.
-///
-/// `start_tx_idx` seeds the executor-local record counter: 0 on a fresh
-/// start, or the persisted cursor's record count on a resume. The canonical
-/// source delivers from the cursor onward, and downstream checks the
-/// indices this reader assigns against absolute boundary counts.
-///
-/// `recovery_factory`, when wired, turns a join miss into an archive
-/// refetch instead of an immediate death; see [`JoinRecovery`]. It runs
-/// once, inside this thread, because the recovery's Aeron resources are
-/// thread-bound.
-///
-/// # Panics
-///
-/// Panics if the OS refuses to spawn the thread.
-pub fn spawn_tx_ordering_reader<O, S>(
-    mut tx_ordering_sub: O,
-    buffer: JoinBuffer,
-    cfg: ReaderConfig,
-    exec_out: S,
-    start_tx_idx: TxIndex,
-    recovery_factory: Option<JoinRecoveryFactory>,
-) -> JoinHandle<Result<(), ExecutorError>>
-where
-    O: TxOrderingSubscription + 'static,
-    S: ExecSink,
-{
-    thread::Builder::new()
-        .name("executor-reader-b".into())
-        .spawn(move || {
-            let recovery: Option<JoinRecovery> = recovery_factory.map(JoinRecoveryFactory::build);
-            let mut state = OrderingLoop::new(buffer, cfg, exec_out, recovery, start_tx_idx);
-            while let Flow::Continue = state.step(&mut tx_ordering_sub)? {}
-            Ok(())
-        })
-        .expect("spawn tx_ordering reader")
 }

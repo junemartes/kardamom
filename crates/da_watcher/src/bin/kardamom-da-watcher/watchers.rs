@@ -7,10 +7,8 @@ use std::time::Duration;
 
 use alloy_provider::ProviderBuilder;
 
-use kardamom_da_watcher::interop::{
-    CursorReconcile, WsRemoteChainSource, spawn as spawn_interop_watcher,
-};
-use kardamom_da_watcher::{RpcL1Source, WatcherHandle, spawn as spawn_watcher};
+use kardamom_da_watcher::interop::{CursorReconcile, InteropWatcher, WsRemoteChainSource};
+use kardamom_da_watcher::{L1Watcher, RpcL1Source, WatcherHandle};
 use kardamom_log::aeron_live::{TxDepositsPublisherHandle, TxRemoteEpochsPublisherHandle};
 use kardamom_obs::bin::wait_for_shutdown;
 
@@ -70,7 +68,7 @@ impl Watchers {
             );
             handles.push((
                 WatcherKind::L1,
-                spawn_watcher(
+                L1Watcher::spawn(
                     LiveTxDepositsPublisher::new(tx_deposits_pub),
                     RpcL1Source::new(provider),
                     l1.cfg,
@@ -99,7 +97,7 @@ impl Watchers {
             );
             handles.push((
                 WatcherKind::Interop,
-                spawn_interop_watcher(
+                InteropWatcher::spawn(
                     LiveRemoteEpochsPublisher::new(tx_remote_epochs_pub),
                     source,
                     interop.cfg,
@@ -193,15 +191,14 @@ impl Watchers {
     }
 
     /// One watcher's shutdown: log if it exited on its own (a fail-stop,
-    /// not a requested shutdown), ask it to stop, then join it.
+    /// not a requested shutdown), then ask it to stop and join it.
     async fn shutdown_one(kind: WatcherKind, handle: WatcherHandle) -> anyhow::Result<()> {
         let name = kind.label();
         if handle.task.is_finished() {
             tracing::error!(watcher = name, "watcher exited without a shutdown request");
         }
-        let _ = handle.shutdown.send(());
         handle
-            .task
+            .join()
             .await
             .map_err(|e| anyhow::anyhow!("{name} watcher task panicked: {e}"))?;
         Ok(())

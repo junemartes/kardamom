@@ -3,7 +3,7 @@
 //! `SnapshotSource`, `StateWriterQueue`, and `StateWriterSignal` seams
 //! (`crate::actor`).
 //!
-//! The executor's exec thread (`crate::actor::spawn_exec`) drives all three.
+//! The executor's exec thread (`crate::actor::ExecState`) drives all three.
 //! For each block, it calls `submit` for the delta, calls `wait_committed` for
 //! the writer's durable ack, then opens the post-commit snapshot with
 //! `snapshot_after`. These adapters are thin glue. All storage logic lives in

@@ -46,6 +46,30 @@ struct PendingGroup {
     cursor: BatchCursor,
 }
 
+impl PendingGroup {
+    /// The cursor a post that ends at `block_number` confirms: the group's
+    /// cursor when that is the group's last block, else the cursor just
+    /// past the named block.
+    fn cursor_at(&self, block_number: u64) -> Result<BatchCursor> {
+        if self.cursor.next_block == block_number.saturating_add(1) {
+            return Ok(self.cursor);
+        }
+        let end = self
+            .blocks
+            .iter()
+            .find(|b| b.block_number == block_number)
+            .with_context(|| format!("batch end block {block_number} is not in the group"))?;
+        Ok(BatchCursor {
+            next_index: end.end_tx_idx.as_index(),
+            next_block: block_number
+                .checked_add(1)
+                .context("block_number overflowed u64")?,
+            // `LiveSender::post_confirmed` stamps `last_batch_index`.
+            last_batch_index: 0,
+        })
+    }
+}
+
 /// The live feed loop's state: the accumulator, the close policy's pending
 /// group, and the sender it posts confirmed batches to. `ReaderToExec`
 /// records flow through the accumulator, then the close policy, then to
@@ -53,7 +77,8 @@ struct PendingGroup {
 /// until that channel closes or a post fails and stops the loop. This is
 /// crash-only: there is no graceful drain. The cursor is at-least-once, and
 /// a restart re-observes records.
-struct FeedLoop<P> {
+pub(crate) struct FeedLoop<P> {
+    rx: Receiver<ReaderToExec>,
     sender: LiveSender<P>,
     cfg: FeedConfig,
     pack_cfg: BatcherConfig,
@@ -62,7 +87,7 @@ struct FeedLoop<P> {
 }
 
 impl<P: Provider> FeedLoop<P> {
-    fn new(sender: LiveSender<P>, cfg: FeedConfig) -> Self {
+    pub(crate) fn new(rx: Receiver<ReaderToExec>, sender: LiveSender<P>, cfg: FeedConfig) -> Self {
         let pack_cfg = BatcherConfig {
             blocks_per_batch: cfg.blocks_per_batch,
             compress: cfg.compress,
@@ -70,6 +95,7 @@ impl<P: Provider> FeedLoop<P> {
             ..Default::default()
         };
         Self {
+            rx,
             sender,
             cfg,
             pack_cfg,
@@ -79,9 +105,13 @@ impl<P: Provider> FeedLoop<P> {
     }
 
     /// Run until the channel closes or a post fails after its retry budget.
-    async fn run(mut self, mut rx: Receiver<ReaderToExec>) -> Result<()> {
+    ///
+    /// # Errors
+    /// Returns an error when the ordering channel closes, or when
+    /// [`LiveSender::post_confirmed`] fails after its retry budget.
+    pub(crate) async fn run(mut self) -> Result<()> {
         loop {
-            let event = tokio::time::timeout(self.cfg.flush, rx.recv()).await;
+            let event = tokio::time::timeout(self.cfg.flush, self.rx.recv()).await;
             self.handle_event(event).await?;
         }
     }
@@ -211,31 +241,9 @@ impl<P: Provider> FeedLoop<P> {
     /// the block the batch ends at. The last batch confirms the group's
     /// own cursor.
     async fn post_one(&mut self, batch: &PostedBatch, group: &PendingGroup) -> Result<()> {
-        let cursor = group_cursor_at(group, batch.l2_block_end)?;
+        let cursor = group.cursor_at(batch.l2_block_end)?;
         self.sender.post_confirmed(batch, cursor).await
     }
-}
-
-/// The cursor a post that ends at `block_number` confirms: the group's
-/// cursor when that is the group's last block, else the cursor just past
-/// the named block.
-fn group_cursor_at(group: &PendingGroup, block_number: u64) -> Result<BatchCursor> {
-    if group.cursor.next_block == block_number.saturating_add(1) {
-        return Ok(group.cursor);
-    }
-    let end = group
-        .blocks
-        .iter()
-        .find(|b| b.block_number == block_number)
-        .with_context(|| format!("batch end block {block_number} is not in the group"))?;
-    Ok(BatchCursor {
-        next_index: end.end_tx_idx.as_index(),
-        next_block: block_number
-            .checked_add(1)
-            .context("block_number overflowed u64")?,
-        // `LiveSender::post_confirmed` stamps `last_batch_index`.
-        last_batch_index: 0,
-    })
 }
 
 /// Log a fatal single-block overflow by name before the error stops the
@@ -254,15 +262,4 @@ fn log_pack_error(e: BatcherError) -> anyhow::Error {
         );
     }
     e.into()
-}
-
-/// # Errors
-/// Returns an error when the ordering channel closes, or when
-/// [`LiveSender::post_confirmed`] fails after its retry budget.
-pub(crate) async fn run_feed<P: Provider>(
-    rx: Receiver<ReaderToExec>,
-    sender: LiveSender<P>,
-    cfg: FeedConfig,
-) -> Result<()> {
-    FeedLoop::new(sender, cfg).run(rx).await
 }

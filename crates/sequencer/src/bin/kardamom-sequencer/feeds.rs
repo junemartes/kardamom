@@ -30,13 +30,12 @@ use kardamom_log::aeron_live::{
     TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::epoch::process_epoch;
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
 use kardamom_sequencer::lookup::{self, LookupConfig, LookupRequester};
 use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
-use kardamom_sequencer::remote_epoch::process_remote_epoch;
+use kardamom_sequencer::pump::{OriginLane, Pump};
 use kardamom_sequencer::resync::{
     FloorUpdate, ResyncController, SharedWatermark, elapsed_ms_saturating,
 };
@@ -412,6 +411,9 @@ struct LookupDone {
 pub(crate) struct NonceLookupFeed {
     cfg: LookupConfig,
     partition: u32,
+    /// The core's lookup requests.
+    rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
+    shutdown: Shutdown,
     floor_tx: crossbeam_channel::Sender<FloorUpdate>,
     client: reqwest::Client,
     endpoints: std::sync::Arc<[String]>,
@@ -428,10 +430,13 @@ impl NonceLookupFeed {
     /// The `recent` map is pruned once it holds this many senders.
     const RECENT_CAP: usize = 4096;
 
-    /// Build the feed. Fails only when the HTTP client cannot be built.
+    /// Build the feed over the core's request channel. Fails only when
+    /// the HTTP client cannot be built.
     pub(crate) fn new(
         cfg: LookupConfig,
         partition: u32,
+        rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
+        shutdown: Shutdown,
         floor_tx: crossbeam_channel::Sender<FloorUpdate>,
     ) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder().timeout(cfg.timeout()).build()?;
@@ -440,6 +445,8 @@ impl NonceLookupFeed {
         Ok(Self {
             cfg,
             partition,
+            rx,
+            shutdown,
             floor_tx,
             client,
             endpoints,
@@ -452,38 +459,26 @@ impl NonceLookupFeed {
     }
 
     /// Spawn the drain as a plain async task over the core's requests.
-    pub(crate) fn spawn(
-        self,
-        rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
-        shutdown: Shutdown,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run(rx, shutdown))
+    pub(crate) fn spawn(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(self.run())
     }
 
-    async fn run(
-        mut self,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
-        shutdown: Shutdown,
-    ) {
-        while self.tick(&mut rx, &shutdown).await.is_continue() {}
+    async fn run(mut self) {
+        while self.tick().await.is_continue() {}
     }
 
     /// One [`Self::run`] pass: wait for a finished query, a new request,
     /// or shutdown. `Break` means the task should stop: shutdown, a
     /// closed channel, or the publish loop is gone.
-    async fn tick(
-        &mut self,
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Address>,
-        shutdown: &Shutdown,
-    ) -> ControlFlow<()> {
+    async fn tick(&mut self) -> ControlFlow<()> {
         tokio::select! {
             biased;
-            () = shutdown.cancelled() => ControlFlow::Break(()),
+            () = self.shutdown.cancelled() => ControlFlow::Break(()),
             done = self.done_rx.recv() => match done {
                 Some(done) => self.on_done(done),
                 None => ControlFlow::Break(()),
             },
-            req = rx.recv() => match req {
+            req = self.rx.recv() => match req {
                 Some(sender) => {
                     self.on_request(sender);
                     ControlFlow::Continue(())
@@ -560,72 +555,83 @@ impl NonceLookupFeed {
     fn spawn_query(&mut self, sender: Address) {
         let first = self.next_endpoint % self.endpoints.len();
         self.next_endpoint = self.next_endpoint.wrapping_add(1);
-        let client = self.client.clone();
-        let endpoints = self.endpoints.clone();
+        let query = ExecutorQuery::new(self.client.clone(), self.endpoints.clone(), first, sender);
         let done_tx = self.done_tx.clone();
         tokio::spawn(async move {
-            let result = query_executors(&client, &endpoints, first, sender).await;
+            let result = query.run().await;
             let _ = done_tx.send(LookupDone { sender, result });
         });
     }
 }
 
-/// Query the endpoints from `first` in rotation. The first answer wins.
-async fn query_executors(
-    client: &reqwest::Client,
-    endpoints: &[String],
+/// One nonce query: the HTTP client, the executor endpoints, the
+/// rotation start, and the sender asked about. It walks the endpoints
+/// from `first` until one answers within the timeout.
+struct ExecutorQuery {
+    client: reqwest::Client,
+    endpoints: std::sync::Arc<[String]>,
     first: usize,
     sender: Address,
-) -> Result<u64, String> {
-    let n = endpoints.len();
-    let mut last_err = String::from("no executor endpoints");
-    for endpoint in (0..n).map(|i| &endpoints[first.saturating_add(i) % n]) {
-        if let ControlFlow::Break(nonce) =
-            query_endpoint(client, endpoint, sender, &mut last_err).await
-        {
-            return Ok(nonce);
-        }
-    }
-    Err(last_err)
 }
 
-/// One endpoint of [`query_executors`]'s rotation: `Break` carries the
-/// answer; on failure the error lands in `last_err`.
-async fn query_endpoint(
-    client: &reqwest::Client,
-    endpoint: &str,
-    sender: Address,
-    last_err: &mut String,
-) -> ControlFlow<u64> {
-    match query_one(client, endpoint, sender).await {
-        Ok(nonce) => ControlFlow::Break(nonce),
-        Err(e) => {
-            *last_err = format!("{endpoint}: {e}");
-            ControlFlow::Continue(())
+impl ExecutorQuery {
+    fn new(
+        client: reqwest::Client,
+        endpoints: std::sync::Arc<[String]>,
+        first: usize,
+        sender: Address,
+    ) -> Self {
+        Self {
+            client,
+            endpoints,
+            first,
+            sender,
         }
     }
-}
 
-async fn query_one(
-    client: &reqwest::Client,
-    endpoint: &str,
-    sender: Address,
-) -> Result<u64, String> {
-    let resp = client
-        .post(endpoint)
-        .header("content-type", "application/json")
-        .body(lookup::request_body(sender))
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                "timed out".to_string()
-            } else {
-                e.to_string()
+    /// Query the endpoints from `first` in rotation. The first answer
+    /// wins.
+    async fn run(self) -> Result<u64, String> {
+        let n = self.endpoints.len();
+        let mut last_err = String::from("no executor endpoints");
+        for endpoint in (0..n).map(|i| &self.endpoints[self.first.saturating_add(i) % n]) {
+            if let ControlFlow::Break(nonce) = self.query_endpoint(endpoint, &mut last_err).await {
+                return Ok(nonce);
             }
-        })?;
-    let body = resp.text().await.map_err(|e| e.to_string())?;
-    lookup::parse_answer(&body)
+        }
+        Err(last_err)
+    }
+
+    /// One endpoint of [`Self::run`]'s rotation: `Break` carries the
+    /// answer; on failure the error lands in `last_err`.
+    async fn query_endpoint(&self, endpoint: &str, last_err: &mut String) -> ControlFlow<u64> {
+        match self.query_one(endpoint).await {
+            Ok(nonce) => ControlFlow::Break(nonce),
+            Err(e) => {
+                *last_err = format!("{endpoint}: {e}");
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    async fn query_one(&self, endpoint: &str) -> Result<u64, String> {
+        let resp = self
+            .client
+            .post(endpoint)
+            .header("content-type", "application/json")
+            .body(lookup::request_body(self.sender))
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    "timed out".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+        let body = resp.text().await.map_err(|e| e.to_string())?;
+        lookup::parse_answer(&body)
+    }
 }
 
 pub(crate) type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
@@ -705,7 +711,7 @@ where
         // Independent pump for tx_deposits to epoch on tx_ordering. The
         // epoch path is not nonce-gated. It is a simple poll-and-publish
         // loop that runs alongside the canonical TxData-to-TxRef path. It
-        // stays on spawn_blocking. `process_epoch` does a sync Aeron poll
+        // stays on spawn_blocking. The epoch lane does a sync Aeron poll
         // and a sync cluster offer. So the loop polls `is_signaled`
         // between backoff sleeps. `OriginPump`'s one-slot `pending` holds
         // a popped epoch across a backpressured offer, and the next tick
@@ -713,7 +719,12 @@ where
         // never dropped.
         let shutdown_for_deposits = shutdown.clone();
         let join_deposits = tokio::task::spawn_blocking(move || {
-            OriginPump::new(shutdown_for_deposits, epoch_subscription, epoch_pub).run(process_epoch)
+            OriginPump::<_, _, Pump<kardamom_types::EpochRecord>>::new(
+                shutdown_for_deposits,
+                epoch_subscription,
+                epoch_pub,
+            )
+            .run()
         });
 
         // Independent pump for tx_remote_epochs to a remote-origin record
@@ -721,12 +732,12 @@ where
         // with the same one-slot retry.
         let shutdown_for_remote_epochs = shutdown.clone();
         let join_remote_epochs = tokio::task::spawn_blocking(move || {
-            OriginPump::new(
+            OriginPump::<_, _, Pump<kardamom_types::xchain::RemoteEpochRecord>>::new(
                 shutdown_for_remote_epochs,
                 remote_epoch_subscription,
                 remote_epoch_pub,
             )
-            .run(process_remote_epoch)
+            .run()
         });
 
         (join_main, join_deposits, join_remote_epochs)
@@ -747,7 +758,10 @@ struct OriginPump<S, P, Pending> {
     pending: Pending,
 }
 
-impl<S, P, Pending: Default> OriginPump<S, P, Pending> {
+impl<S, P, Pending> OriginPump<S, P, Pending>
+where
+    Pending: OriginLane<S, P> + Default,
+{
     fn new(shutdown: Shutdown, sub: S, publ: P) -> Self {
         Self {
             shutdown,
@@ -757,26 +771,18 @@ impl<S, P, Pending: Default> OriginPump<S, P, Pending> {
         }
     }
 
-    /// Run until `shutdown` fires or the source disconnects. `step` is
-    /// [`process_epoch`] or [`process_remote_epoch`].
-    fn run(
-        mut self,
-        mut step: impl FnMut(&mut S, &mut P, &mut Pending) -> Result<bool, SequencerError>,
-    ) -> Result<(), SequencerError> {
+    /// Run until `shutdown` fires or the source disconnects.
+    fn run(mut self) -> Result<(), SequencerError> {
         let mut idle = IdleBackoff::new(Duration::from_micros(1), Duration::from_micros(100), 1);
-        while !self.shutdown.is_signaled() && self.tick(&mut step, &mut idle)? {}
+        while !self.shutdown.is_signaled() && self.tick(&mut idle)? {}
         Ok(())
     }
 
-    /// One [`Self::run`] iteration: dispatch on `step`'s outcome. Returns
-    /// whether the loop should keep going; `false` only on a clean
-    /// `IngressDisconnected` exit.
-    fn tick(
-        &mut self,
-        step: &mut impl FnMut(&mut S, &mut P, &mut Pending) -> Result<bool, SequencerError>,
-        idle: &mut IdleBackoff,
-    ) -> Result<bool, SequencerError> {
-        match step(&mut self.sub, &mut self.publ, &mut self.pending) {
+    /// One [`Self::run`] iteration: dispatch on the lane's relay outcome.
+    /// Returns whether the loop should keep going; `false` only on a
+    /// clean `IngressDisconnected` exit.
+    fn tick(&mut self, idle: &mut IdleBackoff) -> Result<bool, SequencerError> {
+        match self.pending.relay(&mut self.sub, &mut self.publ) {
             Ok(true) => {
                 idle.reset();
                 Ok(true)

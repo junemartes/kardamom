@@ -1,6 +1,5 @@
 //! Tests for the reader / join module.
 
-use std::num::NonZeroU64;
 use std::thread;
 use std::time::Duration;
 
@@ -11,7 +10,7 @@ use crate::exec_types::TxIndex;
 use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
 use crossbeam_channel::bounded;
-use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
+use kardamom_types::xchain::XChainMessage;
 use kardamom_types::{
     BPosition, BlockBoundaryStart, Deposit, EpochRecord, TxDataLoc, TxEnvelope, TxOrderingMessage,
     TxRef,
@@ -25,7 +24,7 @@ fn envelope(signer: &PrivateKeySigner, nonce: u64) -> TxEnvelope {
     crate::actor::test_support::legacy(signer, Address::from([0x22u8; 20]), nonce, 1)
 }
 
-fn pos(off: i32) -> BPosition {
+pub(super) fn pos(off: i32) -> BPosition {
     BPosition {
         term_id: 0,
         term_offset: off,
@@ -57,7 +56,12 @@ fn assert_deposit_at(i: usize, expected: &Deposit, got: &ReaderToExec) {
 /// position, not the record's shared position — every position-keyed
 /// receipt consumer needs a distinct position per message) and
 /// `expected`'s source hash.
-fn assert_xchain_at(i: usize, origin: u64, expected: &XChainMessage, got: &ReaderToExec) {
+pub(super) fn assert_xchain_at(
+    i: usize,
+    origin: u64,
+    expected: &XChainMessage,
+    got: &ReaderToExec,
+) {
     match got {
         ReaderToExec::XChain {
             tx_idx,
@@ -123,7 +127,7 @@ impl TxOrderingSubscription for VecTxOrderingSub {
 ///
 /// Returns the reader thread's error, if any (for example a
 /// `JoinTimeout`, when `queue` names an envelope `buf` never receives).
-fn run_ordering(
+pub(super) fn run_ordering(
     queue: Vec<Result<(BPosition, TxOrderingMessage), ExecutorError>>,
     buf: JoinBuffer,
     cfg: ReaderConfig,
@@ -132,7 +136,14 @@ fn run_ordering(
         queue: VecDeque::from(queue),
     };
     let (tx, rx) = bounded::<ReaderToExec>(8);
-    let h = spawn_tx_ordering_reader(b, buf, cfg, tx, TxIndex::ZERO, None);
+    let h = TxOrderingReader::spawn(TxOrderingInputs {
+        sub: b,
+        buffer: buf,
+        cfg,
+        exec_out: tx,
+        start_tx_idx: TxIndex::ZERO,
+        recovery_factory: None,
+    });
     h.join().expect("no panic")?;
     Ok(drain(&rx))
 }
@@ -148,7 +159,7 @@ fn channel_a_reader_drains_into_buffer() {
             Ok((loc(100), envelope(&signer, 1))),
         ]),
     };
-    let h = spawn_tx_data_reader(a, buf.clone());
+    let h = TxDataReader::new(a, buf.clone()).spawn();
     h.join().expect("no panic").expect("ok");
     assert_eq!(buf.len(), 2);
     assert!(buf.take(TxDataKey::new(3, 0, pos(0))).is_some());
@@ -305,86 +316,6 @@ fn channel_b_reader_drops_a_duplicate_epoch() {
     assert_eq!(out.len(), 2, "one marker + one deposit, not two of each");
 }
 
-fn remote_record(origin: u64, first_seq: u64, n: NonZeroU64) -> RemoteEpochRecord {
-    let message_at = |seq: u64| XChainMessage {
-        source_hash: kardamom_types::xchain::remote_source_hash(origin, seq),
-        seq,
-        gas_limit: 100_000,
-        ..Default::default()
-    };
-    RemoteEpochRecord {
-        origin_chain_id: origin,
-        anchor_number: 40,
-        anchor_hash: alloy_primitives::B256::repeat_byte(0xAB),
-        first_seq,
-        messages: kardamom_types::xchain::NonEmptyVec::new(
-            message_at(first_seq),
-            (first_seq + 1..first_seq + n.get())
-                .map(message_at)
-                .collect(),
-        ),
-    }
-}
-
-/// A remote epoch expands exactly like an L1 epoch: the marker plus one
-/// dispatch per message, `tx_idx` contiguous across the whole range.
-#[test]
-fn channel_b_reader_expands_a_remote_epoch_into_marker_plus_messages() {
-    let origin = 412_346u64;
-    let rec = remote_record(origin, 5, NonZeroU64::new(2).expect("2 is nonzero"));
-    let out = run_ordering(
-        vec![
-            Ok((pos(0), TxOrderingMessage::RemoteEpoch(rec.clone()))),
-            Ok((
-                pos(3),
-                TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
-                    block_number: 1,
-                    // Marker + 2 messages = 3 slots consumed.
-                    end_tx_idx: pos(3),
-                    l2_timestamp: 1_700_000_000,
-                    l1_origin: 0,
-                }),
-            )),
-        ],
-        JoinBuffer::new(),
-        ReaderConfig::default(),
-    )
-    .expect("ok");
-    assert_eq!(out.len(), 4, "marker + 2 messages + boundary");
-    match &out[0] {
-        ReaderToExec::RemoteEpoch { tx_idx, record, .. } => {
-            assert_eq!(*tx_idx, TxIndex(0));
-            assert_eq!(record.origin_chain_id, origin);
-            assert_eq!(record.first_seq, 5);
-        }
-        other => panic!("expected RemoteEpoch marker, got {other:?}"),
-    }
-    for (i, expected) in rec.messages.iter().enumerate() {
-        assert_xchain_at(i, origin, expected, &out[1 + i]);
-    }
-    match &out[3] {
-        ReaderToExec::Boundary(b) => assert_eq!(b.end_tx_idx, pos(3)),
-        other => panic!("expected Boundary, got {other:?}"),
-    }
-}
-
-/// A duplicate remote epoch from a racing sequencer must dispatch
-/// nothing. A second expansion would double-deliver every message.
-#[test]
-fn channel_b_reader_drops_a_duplicate_remote_epoch() {
-    let rec = remote_record(412_346, 0, NonZeroU64::new(1).expect("1 is nonzero"));
-    let out = run_ordering(
-        vec![
-            Ok((pos(0), TxOrderingMessage::RemoteEpoch(rec.clone()))),
-            Ok((pos(2), TxOrderingMessage::RemoteEpoch(rec))),
-        ],
-        JoinBuffer::new(),
-        ReaderConfig::default(),
-    )
-    .expect("ok");
-    assert_eq!(out.len(), 2, "one marker + one message, not two of each");
-}
-
 /// Race test: `TxRef` arrives before its envelope. The B reader spins,
 /// and picks it up once the A reader inserts.
 #[test]
@@ -416,7 +347,14 @@ fn channel_b_reader_tolerates_a_publisher_lag() {
         ))]),
     };
     let (tx, rx) = bounded::<ReaderToExec>(2);
-    let h = spawn_tx_ordering_reader(b, buf, cfg, tx, TxIndex::ZERO, None);
+    let h = TxOrderingReader::spawn(TxOrderingInputs {
+        sub: b,
+        buffer: buf,
+        cfg,
+        exec_out: tx,
+        start_tx_idx: TxIndex::ZERO,
+        recovery_factory: None,
+    });
     h.join().expect("no panic").expect("ok");
     a_inserter.join().unwrap();
 
@@ -563,7 +501,8 @@ fn reader_joins_two_sessions_at_same_position() {
             Ok((TxDataLoc::new(200, pos(0)), env_b.clone())),
         ]),
     };
-    spawn_tx_data_reader(a, buf.clone())
+    TxDataReader::new(a, buf.clone())
+        .spawn()
         .join()
         .expect("no panic")
         .expect("ok");

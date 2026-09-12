@@ -98,80 +98,103 @@ pub(crate) fn prepare_state(
     Ok(PreparedState { env, start })
 }
 
-/// Periodic checkpointing. It gives fast recovery for other nodes, and
-/// for this node after a future wipe. `compact_to` runs against an
-/// online read-only snapshot, so it never blocks the writer. This runs
-/// as a tokio interval task. Each tick runs the mdbx compaction on
-/// `spawn_blocking`, so the transaction stays on one thread for the
-/// whole call. It prunes to `checkpoint_keep`, and stops when
-/// `shutdown` is cancelled. Call this inside a tokio runtime.
+/// Start periodic checkpointing, if the args ask for it. It gives fast
+/// recovery for other nodes, and for this node after a future wipe. Call
+/// this inside a tokio runtime.
 fn spawn_checkpointer(args: &Args, env: &StateEnv, shutdown: CancellationToken) {
     let (Some(ckpt_dir), Some(interval_secs)) =
         (args.checkpoint_dir.clone(), args.checkpoint_interval_secs.0)
     else {
         return;
     };
-    let checkpointer = Checkpointer {
+    let round = CheckpointRound {
         env: env.clone(),
         dir: ckpt_dir,
         keep: args.checkpoint_keep.get(),
     };
     let interval = std::time::Duration::from_secs(interval_secs.get());
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        // The first tick fires immediately.
-        ticker.tick().await;
-        loop {
-            let ControlFlow::Continue(()) = checkpointer.tick(&mut ticker, &shutdown).await else {
-                return;
-            };
-        }
-    });
+    Checkpointer::new(round, interval, shutdown).spawn();
 }
 
-/// One periodic checkpoint task's fixed inputs: the state env, the
-/// checkpoint directory, and how many past checkpoints to retain.
-struct Checkpointer {
+/// One checkpoint round's fixed inputs: the state env, the checkpoint
+/// directory, and how many past checkpoints to retain. Cloned into each
+/// round's blocking task, so the mdbx transaction stays on one thread for
+/// the whole call.
+#[derive(Clone)]
+struct CheckpointRound {
     env: StateEnv,
     dir: std::path::PathBuf,
     keep: u64,
 }
 
-impl Checkpointer {
-    /// Wait for the next checkpoint tick, or the shutdown signal, then
-    /// run one checkpoint round if it was a tick. Returns
-    /// [`ControlFlow::Break`] once `shutdown` fires, so the caller's
-    /// loop stops.
-    async fn tick(
-        &self,
-        ticker: &mut tokio::time::Interval,
-        shutdown: &CancellationToken,
-    ) -> ControlFlow<()> {
-        tokio::select! {
-            () = shutdown.cancelled() => return ControlFlow::Break(()),
-            _ = ticker.tick() => {}
-        }
-        let env = self.env.clone();
-        let dir = self.dir.clone();
-        let keep = self.keep;
-        let ran = tokio::task::spawn_blocking(move || Self::once(&env, &dir, keep)).await;
-        if let Err(e) = ran {
-            tracing::warn!(error = %e, "checkpointer task panicked");
-        }
-        ControlFlow::Continue(())
-    }
-
+impl CheckpointRound {
     /// One checkpoint + prune round; failures are logged, never fatal.
-    fn once(env: &StateEnv, dir: &std::path::Path, keep: u64) {
-        match create_checkpoint(env, dir) {
+    fn once(&self) {
+        match create_checkpoint(&self.env, &self.dir) {
             Ok(info) => {
-                if info.block > keep
-                    && let Err(e) = prune_checkpoints(dir, info.block - keep + 1)
+                if info.block > self.keep
+                    && let Err(e) = prune_checkpoints(&self.dir, info.block - self.keep + 1)
                 {
                     tracing::warn!(error = %e, "checkpoint prune failed");
                 }
             }
             Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
         }
+    }
+}
+
+/// The periodic checkpoint task's state: the round inputs, the interval
+/// ticker, and the shutdown signal. `compact_to` runs against an online
+/// read-only snapshot, so it never blocks the writer.
+struct Checkpointer {
+    round: CheckpointRound,
+    ticker: tokio::time::Interval,
+    shutdown: CancellationToken,
+}
+
+impl Checkpointer {
+    fn new(
+        round: CheckpointRound,
+        interval: std::time::Duration,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            round,
+            ticker: tokio::time::interval(interval),
+            shutdown,
+        }
+    }
+
+    /// Start the interval task. It stops when `shutdown` is cancelled.
+    fn spawn(self) {
+        tokio::spawn(self.run());
+    }
+
+    /// The interval loop. The first tick fires immediately and is
+    /// skipped.
+    async fn run(mut self) {
+        self.ticker.tick().await;
+        loop {
+            let ControlFlow::Continue(()) = self.tick().await else {
+                return;
+            };
+        }
+    }
+
+    /// Wait for the next checkpoint tick, or the shutdown signal, then
+    /// run one checkpoint round if it was a tick. Returns
+    /// [`ControlFlow::Break`] once `shutdown` fires, so the caller's
+    /// loop stops.
+    async fn tick(&mut self) -> ControlFlow<()> {
+        tokio::select! {
+            () = self.shutdown.cancelled() => return ControlFlow::Break(()),
+            _ = self.ticker.tick() => {}
+        }
+        let round = self.round.clone();
+        let ran = tokio::task::spawn_blocking(move || round.once()).await;
+        if let Err(e) = ran {
+            tracing::warn!(error = %e, "checkpointer task panicked");
+        }
+        ControlFlow::Continue(())
     }
 }

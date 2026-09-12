@@ -101,9 +101,17 @@ struct Handler {
 /// nothing outside this crate names it.
 const SUBSCRIPTION_CAP_ERROR_CODE: i32 = -32010;
 
-async fn send_event<T: serde::Serialize>(sink: &SubscriptionSink, event: &T) -> Result<(), ()> {
-    let msg = serde_json::value::to_raw_value(event).map_err(|_| ())?;
-    sink.send(msg).await.map_err(|_| ())
+/// Typed send on a subscription sink: serialize one event and push it.
+/// `Err` means the sink closed, so the feed ends.
+trait SendEvent {
+    async fn send_event<T: serde::Serialize + Sync>(&self, event: &T) -> Result<(), ()>;
+}
+
+impl SendEvent for SubscriptionSink {
+    async fn send_event<T: serde::Serialize + Sync>(&self, event: &T) -> Result<(), ()> {
+        let msg = serde_json::value::to_raw_value(event).map_err(|_| ())?;
+        self.send(msg).await.map_err(|_| ())
+    }
 }
 
 /// One outbox subscriber's live cursor state: the next seq to serve, and
@@ -182,7 +190,7 @@ impl LaneSession {
     ) -> Result<(), ()> {
         for m in msgs {
             let ev = self.message_frame(origin, m);
-            send_event(sink, &ev).await?;
+            sink.send_event(&ev).await?;
         }
         Ok(())
     }
@@ -200,7 +208,25 @@ struct OutboxFeed<'a> {
     session: LaneSession,
 }
 
-impl OutboxFeed<'_> {
+impl<'a> OutboxFeed<'a> {
+    fn new(
+        sink: &'a SubscriptionSink,
+        wake: tokio::sync::watch::Receiver<u64>,
+        store: Arc<FeedStore>,
+        dest_chain_id: u64,
+        start_seq: u64,
+    ) -> Self {
+        let origin = store.origin_chain_id();
+        Self {
+            sink,
+            wake,
+            store,
+            dest_chain_id,
+            origin,
+            session: LaneSession::new(start_seq),
+        }
+    }
+
     /// Run the subscription until the sink closes.
     async fn serve(mut self) -> SubscriptionResult {
         while self.step().await.is_some() {}
@@ -214,7 +240,7 @@ impl OutboxFeed<'_> {
     async fn step(&mut self) -> Option<()> {
         let scan = self.store.from_seq(self.dest_chain_id, self.session.next);
         if let Some(ev) = self.session.lag_frame(&scan) {
-            send_event(self.sink, &ev).await.ok()?;
+            self.sink.send_event(&ev).await.ok()?;
             return Some(());
         }
         self.session
@@ -222,7 +248,7 @@ impl OutboxFeed<'_> {
             .await
             .ok()?;
         if let Some(ev) = self.session.head_frame(scan.head_block) {
-            send_event(self.sink, &ev).await.ok()?;
+            self.sink.send_event(&ev).await.ok()?;
         }
         tokio::select! {
             () = self.sink.closed() => None,
@@ -247,55 +273,67 @@ impl OutboxFeedApiServer for Handler {
         // Tap before accept: nothing appended in between may be missed.
         let wake = self.state.store.subscribe();
         let sink = pending.accept().await?;
-        let origin = self.state.store.origin_chain_id();
-        OutboxFeed {
-            sink: &sink,
+        OutboxFeed::new(
+            &sink,
             wake,
-            store: self.state.store.clone(),
+            self.state.store.clone(),
             dest_chain_id,
-            origin,
-            session: LaneSession::new(cursor.seq),
-        }
+            cursor.seq,
+        )
         .serve()
         .await
     }
 }
 
-/// One `subscribe_attestations` connection: sink, wake channel, and the
-/// server state the attestation frames read from. Concrete, not generic —
-/// this shape has exactly one caller.
+/// One `subscribe_attestations` connection: sink, wake channel, the
+/// server state the attestation frames read from, and the next block to
+/// scan from. Concrete, not generic — this shape has exactly one caller.
 struct AttestationFeed<'a> {
     sink: &'a SubscriptionSink,
     wake: tokio::sync::watch::Receiver<u64>,
     state: Arc<FeedServerState>,
+    next: u64,
 }
 
-impl AttestationFeed<'_> {
-    /// Run the subscription from `start` until the sink closes.
-    async fn serve(mut self, start: u64) -> SubscriptionResult {
-        let mut next = start;
-        while let Some(after) = self.step(next).await {
-            next = after;
+impl<'a> AttestationFeed<'a> {
+    fn new(
+        sink: &'a SubscriptionSink,
+        wake: tokio::sync::watch::Receiver<u64>,
+        state: Arc<FeedServerState>,
+        start: u64,
+    ) -> Self {
+        Self {
+            sink,
+            wake,
+            state,
+            next: start,
         }
+    }
+
+    /// Run the subscription until the sink closes.
+    async fn serve(mut self) -> SubscriptionResult {
+        while self.step().await.is_some() {}
         Ok(())
     }
 
-    /// One step of the scan-and-wait loop: scan from `next`, send a
+    /// One step of the scan-and-wait loop: scan from the cursor, send a
     /// `Lagged` frame if the cursor aged out of retention, else send each
-    /// retained attestation and wait for new data. Returns the next
-    /// cursor to scan from, or `None` once the sink closes.
-    async fn step(&mut self, next: u64) -> Option<u64> {
-        let scan = self.state.attestations.from_block(next);
-        if next < scan.floor {
-            // The guard above proves `scan.floor > next`; `saturating_sub`
-            // states that bound instead of leaving it to a bare `-`.
-            let skipped = scan.floor.saturating_sub(next);
-            send_event(self.sink, &AttestationEventDto::Lagged { skipped })
+    /// retained attestation and wait for new data. Advances the cursor.
+    /// Returns `None` once the sink closes.
+    async fn step(&mut self) -> Option<()> {
+        let scan = self.state.attestations.from_block(self.next);
+        if self.next < scan.floor {
+            // The guard above proves `scan.floor > self.next`;
+            // `saturating_sub` states that bound instead of leaving it to
+            // a bare `-`.
+            let skipped = scan.floor.saturating_sub(self.next);
+            self.sink
+                .send_event(&AttestationEventDto::Lagged { skipped })
                 .await
                 .ok()?;
-            return Some(scan.floor);
+            self.next = scan.floor;
+            return Some(());
         }
-        let mut next = next;
         for a in &scan.items {
             let ev = AttestationEventDto::Attestation(Box::new(AttestationDto {
                 chain_id: self.state.chain_id,
@@ -306,14 +344,14 @@ impl AttestationFeed<'_> {
                 // optional (see the DTO docs).
                 signature: None,
             }));
-            send_event(self.sink, &ev).await.ok()?;
+            self.sink.send_event(&ev).await.ok()?;
             // A wrap here (`block_number == u64::MAX`) would stall the
             // subscriber's cursor instead of advancing it.
-            next = a.block_number.saturating_add(1);
+            self.next = a.block_number.saturating_add(1);
         }
         tokio::select! {
             () = self.sink.closed() => None,
-            r = self.wake.changed() => r.ok().map(|()| next),
+            r = self.wake.changed() => r.ok(),
         }
     }
 }
@@ -331,13 +369,9 @@ impl AttestationFeedApiServer for Handler {
         };
         let wake = self.state.attestations.subscribe();
         let sink = pending.accept().await?;
-        AttestationFeed {
-            sink: &sink,
-            wake,
-            state: self.state.clone(),
-        }
-        .serve(cursor.block_number)
-        .await
+        AttestationFeed::new(&sink, wake, self.state.clone(), cursor.block_number)
+            .serve()
+            .await
     }
 }
 

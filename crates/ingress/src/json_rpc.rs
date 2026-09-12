@@ -186,14 +186,9 @@ impl<Backend: ProxyBackend> IngressKardamomApiServer for IngressHandlers<Backend
                 .filter(|s| !s.is_empty())
                 .map(|s| s.into_iter().collect()),
         );
-        ReceiptSubscription {
-            receipts,
-            errors,
-            filter,
-            sink,
-        }
-        .run()
-        .await?;
+        ReceiptSubscription::new(receipts, errors, filter, sink)
+            .run()
+            .await?;
         Ok(())
     }
 }
@@ -227,6 +222,20 @@ struct ReceiptSubscription {
 }
 
 impl ReceiptSubscription {
+    fn new(
+        receipts: broadcast::Receiver<Receipt>,
+        errors: broadcast::Receiver<TxError>,
+        filter: SenderFilter,
+        sink: SubscriptionSink,
+    ) -> Self {
+        Self {
+            receipts,
+            errors,
+            filter,
+            sink,
+        }
+    }
+
     /// Forwards events to the sink until the sink closes, a feed
     /// disconnects, or the subscriber goes away.
     async fn run(mut self) -> Result<(), String> {

@@ -545,37 +545,40 @@ pub fn replay_unavailable_fallback(
 
 pub use kardamom_obs::bin::{init_tracing, wait_for_shutdown};
 
-/// The Aeron runtime and the cluster-session guard that must outlive the
-/// engine loop. Field order is drop order: `rt` ends first, then
-/// `cluster_guard`.
+/// The stop token, the Aeron runtime, and the cluster-session guard that
+/// must outlive the engine loop. Field order is drop order: `stop`
+/// cancels its token first, then `rt` ends, then `cluster_guard`.
+///
+/// The token stops the binary's side tasks. The validator's pumps must
+/// release their `AeronRuntime` clone before `rt` drops (see the
+/// validator's `pumps::BalPump`), and the executor's checkpointer task
+/// ends on it. Dropping the `AeronRuntime` closes every subscription's
+/// sender, so the reader threads' `blocking_recv` returns `None` and the
+/// engine sees `TxDataClosed`. The `tx_ordering` reader blocks on the
+/// cluster egress `recv()`, which returns `None` only once the
+/// `LiveCluster` guard drops, so the reader sees `TxOrderingClosed` next.
 pub struct LiveStreams {
+    pub stop: tokio_util::sync::DropGuard,
     pub rt: AeronRuntime,
     pub cluster_guard: kardamom_cluster_adapter::LiveCluster,
 }
 
-/// End both streams. Dropping `streams` at the end of this function
+/// End the streams. Dropping `streams` at the end of this function
 /// already does the work, in field-declaration order; the function
-/// exists so the call site names the point at which both streams end,
+/// exists so the call site names the point at which the streams end,
 /// instead of a bare `drop`.
 fn stop_streams(_streams: LiveStreams) {}
 
 /// The state [`EngineShutdown::wait`] needs, gathered so `wait` reads no
-/// argument list of its own.
-///
-/// `bin_name` names this binary in the `shutdown signal received` log
-/// line. `before_drop` runs after the wait resolves, but before `streams`
-/// ends; a caller with extra state to release first (the validator
-/// cancels its pumps here, so the `tx_bal` pump releases its
-/// `AeronRuntime` clone before `streams.rt` drops) passes that step. A
-/// caller with nothing extra passes `|| {}`.
-pub struct EngineShutdown<'a, B: FnOnce()> {
+/// argument list of its own. `bin_name` names this binary in the
+/// `shutdown signal received` log line.
+pub struct EngineShutdown<'a> {
     pub bin_name: &'a str,
     pub join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
     pub streams: LiveStreams,
-    pub before_drop: B,
 }
 
-impl<B: FnOnce()> EngineShutdown<'_, B> {
+impl EngineShutdown<'_> {
     /// Wait for whichever comes first: an operator shutdown signal, or the
     /// engine loop finishing on its own. Exiting on the first of the two,
     /// instead of only on SIGTERM, avoids an errored or halted node
@@ -599,7 +602,6 @@ impl<B: FnOnce()> EngineShutdown<'_, B> {
             bin_name,
             mut join,
             streams,
-            before_drop,
         } = self;
         let engine_result = tokio::select! {
             () = wait_for_shutdown() => {
@@ -608,7 +610,6 @@ impl<B: FnOnce()> EngineShutdown<'_, B> {
             }
             res = &mut join => Some(res),
         };
-        before_drop();
         stop_streams(streams);
         match engine_result {
             Some(r) => r,

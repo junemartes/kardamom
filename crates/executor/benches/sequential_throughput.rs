@@ -248,7 +248,7 @@ fn bench_actor_throughput(c: &mut Criterion) {
                 rx: a_rx,
             }];
             let h = thread::spawn(move || {
-                Executor::run::<Wiring>(
+                Executor::<Wiring>::new(
                     ExecutorConfig {
                         chain_id: NonZeroU64::MIN,
                         receipt_queue_depth: QUEUE_DEPTH_512,
@@ -268,6 +268,7 @@ fn bench_actor_throughput(c: &mut Criterion) {
                     ResumePoint::GENESIS,
                     RoleHooks::none(),
                 )
+                .run()
             });
 
             let mut got = 0u64;

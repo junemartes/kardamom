@@ -1,7 +1,7 @@
 //! An end-to-end anvil test of the closing contract: a real batch
 //! (accumulator, records commitment, `postBatch`) posted to the
 //! settlement, a batch proof's output files in the zk-host layout, and
-//! `submit_next_proof` advancing the `KardamomProofOracle`'s root chain.
+//! `ProofSubmitter::submit_next` advancing the `KardamomProofOracle`'s root chain.
 //! The batcher, settlement, prover queue, and oracle all align on the
 //! L1-as-truth cursor.
 //!
@@ -17,7 +17,7 @@ use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider;
 use kardamom_batcher::BatchAccumulator;
 use kardamom_batcher::batcher::pack_blocks;
-use kardamom_batcher::prover_submit::{IKardamomProofOracle, SubmitOutcome, submit_next_proof};
+use kardamom_batcher::prover_submit::{IKardamomProofOracle, ProofSubmitter, SubmitOutcome};
 use kardamom_batcher::settlement::IKardamomL2Settlement;
 use kardamom_batcher::testkit::{AcceptingVerifier, BATCHER, DEV_OWNER, L2_CHAIN_ID, env_tx};
 use kardamom_deployer::Deployer;
@@ -172,7 +172,8 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
     let batch = build_real_batch();
 
     // ----- act: nothing posted yet -----
-    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
+    let out = ProofSubmitter::new(s.oracle_addr, s.proofs_dir.path())
+        .submit_next(s.provider.clone())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::NoBatchPosted { batch_index: 1 });
@@ -197,7 +198,8 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
 
     // ----- act + assert: batch posted, but the prover has not produced
     // files yet -----
-    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
+    let out = ProofSubmitter::new(s.oracle_addr, s.proofs_dir.path())
+        .submit_next(s.provider.clone())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::ProofNotReady { batch_index: 1 });
@@ -206,7 +208,8 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
     write_batch_proof_files(s.proofs_dir.path(), &batch);
 
     // ----- act + assert: submit advances the oracle's root chain -----
-    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
+    let out = ProofSubmitter::new(s.oracle_addr, s.proofs_dir.path())
+        .submit_next(s.provider.clone())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::Submitted { batch_index: 1 });
@@ -215,7 +218,8 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
 
     // ----- act + assert: idempotence at the cursor — batch 2 is not
     // posted, so this returns NoBatchPosted -----
-    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
+    let out = ProofSubmitter::new(s.oracle_addr, s.proofs_dir.path())
+        .submit_next(s.provider.clone())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::NoBatchPosted { batch_index: 2 });
@@ -258,7 +262,8 @@ async fn missing_proof_file_reports_not_ready() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("public-values.bin"), pv.encode()).unwrap();
 
-    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
+    let out = ProofSubmitter::new(s.oracle_addr, s.proofs_dir.path())
+        .submit_next(s.provider.clone())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::ProofNotReady { batch_index: 1 });

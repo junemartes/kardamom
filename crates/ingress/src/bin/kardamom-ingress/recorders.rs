@@ -8,19 +8,17 @@
 //! serves RPC.
 //!
 //! The threads stay std threads: they hold Aeron archive sessions
-//! (`!Send`). The seam to the async shell is tokio: a
-//! [`CancellationToken`] for stop, and one `oneshot` per recorder for
-//! readiness.
+//! (`!Send`). The seam to the async shell is tokio: the stop token inside
+//! [`RecorderThreads`], and one `oneshot` per recorder for readiness.
 
 use std::num::NonZeroU8;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kardamom_log::config::{AeronConfig, ChannelsConfig};
-use kardamom_log::recorder::{RecorderKind, record_stream_until_stopped};
+use kardamom_log::recorder::{RecorderKind, RecorderThreads, record_stream_until_stopped};
 use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
 
 /// Readiness report of one recorder: its shard id and the recording id (or
 /// the startup failure reason).
@@ -29,30 +27,28 @@ pub(crate) type RecorderReady = oneshot::Receiver<(u8, Result<i64, String>)>;
 /// Spawns one archive recorder thread for each `tx_data` lane. Each thread
 /// connects its own thread-confined archive session, starts recording its
 /// shard's `tx_data` publication, reports its startup outcome on its
-/// `oneshot`, and holds the recording alive until `stop` is cancelled.
-/// The `ArchivingMediaDriver` runs the recording itself. The thread only
-/// keeps the session connected and re-adopts an existing recording after
-/// a restart.
+/// `oneshot`, and holds the recording alive until the returned
+/// [`RecorderThreads`] drops. The `ArchivingMediaDriver` runs the
+/// recording itself. The thread only keeps the session connected and
+/// re-adopts an existing recording after a restart.
 ///
-/// Returns the join handles (for teardown) and one readiness receiver per
-/// lane, in lane order.
+/// Returns the threads (dropping them stops and joins every recorder) and
+/// one readiness receiver per lane, in lane order.
 pub(crate) fn spawn_tx_data_recorders(
     aeron_dir: Option<&Path>,
     channels: &ChannelsConfig,
     aeron_cfg: &AeronConfig,
     lanes: NonZeroU8,
-    stop: &CancellationToken,
-) -> (Vec<std::thread::JoinHandle<()>>, Vec<RecorderReady>) {
-    (0..lanes.get())
+) -> Result<(RecorderThreads, Vec<RecorderReady>)> {
+    let mut recorders = RecorderThreads::new();
+    let ready = (0..lanes.get())
         .map(|sid| {
             let aeron_dir = aeron_dir.map(Path::to_path_buf);
             let channels = channels.clone();
             let aeron_cfg = aeron_cfg.clone();
-            let stop = stop.clone();
             let (ready_tx, ready_rx) = oneshot::channel();
-            let handle = std::thread::Builder::new()
-                .name(format!("ingress-tx-data-recorder-{sid}"))
-                .spawn(move || {
+            recorders
+                .spawn(format!("ingress-tx-data-recorder-{sid}"), move |stop| {
                     if let Err(e) = record_stream_until_stopped(
                         aeron_dir.as_deref(),
                         &aeron_cfg,
@@ -74,10 +70,11 @@ pub(crate) fn spawn_tx_data_recorders(
                         tracing::error!(shard = sid, error = %e, "tx_data recorder exited with error");
                     }
                 })
-                .expect("spawn tx_data recorder thread");
-            (handle, ready_rx)
+                .map(|()| ready_rx)
         })
-        .unzip()
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("spawn tx_data recorder thread")?;
+    Ok((recorders, ready))
 }
 
 /// Waits until every recorder thread reports readiness. Fails on the

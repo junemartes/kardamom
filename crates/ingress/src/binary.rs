@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
-use crate::channels::{IngressPublication, IngressSubscription, ProxyBackend};
+use crate::channels::{IngressPublication, IngressSubscription};
 use crate::error::IngressError;
 use crate::proxy::IngressProxy;
 
@@ -38,7 +38,7 @@ pub(crate) const STATUS_INTERNAL: u8 = 9;
 pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// A frame length already checked against `MAX_FRAME_BYTES`. Parsed once
-/// at the wire boundary, so `handle_connection` never re-checks it.
+/// at the wire boundary, so `ConnectionLoop` never re-checks it.
 #[derive(Clone, Copy)]
 struct FrameLen(usize);
 
@@ -64,7 +64,7 @@ impl TryFrom<u32> for FrameLen {
     }
 }
 
-/// Every stream `handle_connection` reads and writes frames on.
+/// Every stream `ConnectionLoop` reads and writes frames on.
 pub(crate) trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
 
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> AsyncStream for T {}
@@ -73,7 +73,7 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> AsyncStream for T 
 /// paired with the client IP the connection's rate-limit key should use.
 /// [`accept_loop`] is generic over this, so the TCP and UDS listeners
 /// share one accept-and-dispatch loop instead of two copies of it.
-trait Accept {
+pub(crate) trait Accept {
     type Stream: AsyncStream + Send + 'static;
 
     async fn accept_one(&self) -> std::io::Result<(Self::Stream, IpAddr)>;
@@ -99,65 +99,77 @@ impl Accept for UnixListener {
     }
 }
 
-/// Accepts connections from `listener` until it errors, spawning one
-/// [`handle_connection`] task per connection.
-async fn accept_loop<L, P, S>(listener: L, proxy: IngressProxy<P, S>) -> std::io::Result<()>
+/// The accept loop's state: the bound listener and the proxy every
+/// connection goes through.
+pub(crate) struct Acceptor<L, P, S>
+where
+    P: IngressPublication + Clone,
+    S: IngressSubscription + Clone,
+{
+    listener: L,
+    proxy: IngressProxy<P, S>,
+}
+
+impl<L, P, S> Acceptor<L, P, S>
 where
     L: Accept,
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
 {
-    loop {
-        let (sock, client_ip) = listener.accept_one().await?;
-        let proxy = proxy.clone();
+    fn new(listener: L, proxy: IngressProxy<P, S>) -> Self {
+        Self { listener, proxy }
+    }
+
+    /// Accept connections until the listener errors, spawning one
+    /// [`ConnectionLoop`] task per connection.
+    async fn run(self) -> std::io::Result<()> {
+        loop {
+            self.accept_one().await?;
+        }
+    }
+
+    /// Accept one connection and hand it its own task.
+    async fn accept_one(&self) -> std::io::Result<()> {
+        let (sock, client_ip) = self.listener.accept_one().await?;
+        let proxy = self.proxy.clone();
         tokio::spawn(async move {
-            let _ = handle_connection::<_, (P, S)>(sock, client_ip, proxy).await;
+            let _ = ConnectionLoop::new(sock, client_ip, proxy).run().await;
         });
+        Ok(())
     }
 }
 
-pub(crate) fn spawn_tcp_listener<P, S>(
-    proxy: IngressProxy<P, S>,
-    addr: SocketAddr,
-) -> JoinHandle<std::io::Result<()>>
+impl<P, S> Acceptor<TcpListener, P, S>
 where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
 {
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(addr).await?;
-        accept_loop(listener, proxy).await
-    })
+    /// Bind `addr` on the spawned task and accept until the listener
+    /// errors.
+    pub(crate) fn spawn_tcp(
+        proxy: IngressProxy<P, S>,
+        addr: SocketAddr,
+    ) -> JoinHandle<std::io::Result<()>> {
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(addr).await?;
+            Self::new(listener, proxy).run().await
+        })
+    }
 }
 
-pub(crate) fn spawn_uds_listener<P, S>(
-    proxy: IngressProxy<P, S>,
-    path: &Path,
-) -> std::io::Result<JoinHandle<std::io::Result<()>>>
+impl<P, S> Acceptor<UnixListener, P, S>
 where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
 {
-    // Bind now, so a bind error shows up right away.
-    let listener = UnixListener::bind(path)?;
-    Ok(tokio::spawn(accept_loop(listener, proxy)))
-}
-
-pub(crate) async fn handle_connection<W: AsyncStream, B: ProxyBackend>(
-    sock: W,
-    client_ip: IpAddr,
-    proxy: IngressProxy<B::Pub, B::Sub>,
-) -> std::io::Result<()> {
-    let mut conn = ConnectionLoop {
-        sock,
-        client_ip,
-        proxy,
-    };
-    loop {
-        match conn.step().await? {
-            ControlFlow::Break(()) => return Ok(()),
-            ControlFlow::Continue(()) => {}
-        }
+    /// Bind `path` now, so a bind error shows up right away, then accept
+    /// until the listener errors.
+    pub(crate) fn spawn_uds(
+        proxy: IngressProxy<P, S>,
+        path: &Path,
+    ) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
+        let listener = UnixListener::bind(path)?;
+        Ok(tokio::spawn(Self::new(listener, proxy).run()))
     }
 }
 
@@ -195,6 +207,29 @@ where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
 {
+    pub(crate) fn new(sock: W, client_ip: IpAddr, proxy: IngressProxy<P, S>) -> Self {
+        Self {
+            sock,
+            client_ip,
+            proxy,
+        }
+    }
+
+    /// Serve frames until the peer closes the connection or a write
+    /// fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the socket error when a reply cannot be written.
+    pub(crate) async fn run(mut self) -> std::io::Result<()> {
+        loop {
+            match self.step().await? {
+                ControlFlow::Break(()) => return Ok(()),
+                ControlFlow::Continue(()) => {}
+            }
+        }
+    }
+
     /// One full frame cycle: read the header, then (unless it closed the
     /// connection or was too large) the body, then dispatch it.
     /// `Break(())` means the connection ended, on any of the three read
@@ -223,7 +258,7 @@ where
         if let Ok(len) = FrameLen::try_from(u32::from_be_bytes(len_buf)) {
             Ok(HeaderOutcome::Len(len))
         } else {
-            write_reply(&mut self.sock, STATUS_DECODE, b"frame too large").await?;
+            self.reply(STATUS_DECODE, b"frame too large").await?;
             Ok(HeaderOutcome::TooLarge)
         }
     }
@@ -242,37 +277,32 @@ where
     /// Submit one decoded frame and write its reply.
     async fn dispatch_frame(&mut self, raw: Bytes) -> std::io::Result<()> {
         match self.proxy.submit_raw(self.client_ip, raw).await {
-            Ok(resp) => {
-                write_reply(&mut self.sock, STATUS_OK, resp.receipt.tx_hash.as_slice()).await
-            }
+            Ok(resp) => self.reply(STATUS_OK, resp.receipt.tx_hash.as_slice()).await,
             Err(e) => {
                 let (status, msg) = map_err(&e);
-                write_reply(&mut self.sock, status, msg.as_bytes()).await
+                self.reply(status, msg.as_bytes()).await
             }
         }
     }
-}
 
-async fn write_reply<W: AsyncWriteExt + Unpin>(
-    sock: &mut W,
-    status: u8,
-    payload: &[u8],
-) -> std::io::Result<()> {
-    sock.write_all(&[status]).await?;
-    // `payload` is always a 32-byte tx_hash or a short UTF-8 error
-    // message, both far below `u32::MAX`. This is a narrowing cast on a
-    // length that goes out over the wire, so a payload that ever did
-    // violate that invariant fails the write instead of silently
-    // truncating the length header and corrupting the frame.
-    let len = u32::try_from(payload.len()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "reply payload exceeds u32::MAX",
-        )
-    })?;
-    sock.write_all(&len.to_be_bytes()).await?;
-    sock.write_all(payload).await?;
-    sock.flush().await
+    /// Write one `status, len, payload` reply frame.
+    async fn reply(&mut self, status: u8, payload: &[u8]) -> std::io::Result<()> {
+        self.sock.write_all(&[status]).await?;
+        // `payload` is always a 32-byte tx_hash or a short UTF-8 error
+        // message, both far below `u32::MAX`. This is a narrowing cast on
+        // a length that goes out over the wire, so a payload that ever did
+        // violate that invariant fails the write instead of silently
+        // truncating the length header and corrupting the frame.
+        let len = u32::try_from(payload.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "reply payload exceeds u32::MAX",
+            )
+        })?;
+        self.sock.write_all(&len.to_be_bytes()).await?;
+        self.sock.write_all(payload).await?;
+        self.sock.flush().await
+    }
 }
 
 fn map_err(e: &IngressError) -> (u8, String) {
@@ -303,7 +333,8 @@ mod tests {
         let p2 = proxy.clone();
         tokio::spawn(async move {
             let (sock, peer) = listener.accept().await.unwrap();
-            handle_connection::<_, (MockChannels, MockChannels)>(sock, peer.ip(), p2)
+            ConnectionLoop::new(sock, peer.ip(), p2)
+                .run()
                 .await
                 .unwrap();
         });
@@ -332,7 +363,8 @@ mod tests {
         let p2 = proxy.clone();
         tokio::spawn(async move {
             let (sock, peer) = listener.accept().await.unwrap();
-            handle_connection::<_, (MockChannels, MockChannels)>(sock, peer.ip(), p2)
+            ConnectionLoop::new(sock, peer.ip(), p2)
+                .run()
                 .await
                 .unwrap();
         });

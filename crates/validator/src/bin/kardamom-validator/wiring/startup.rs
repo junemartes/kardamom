@@ -221,7 +221,7 @@ impl Opened {
         let interop_serve = self.open_interop_serve(feed_resume_block);
 
         // One token stops every pump. It is cancelled BEFORE `rt` drops
-        // (see `pumps::spawn_bal_pump` for the runtime-clone deadlock it
+        // (see `pumps::BalPump` for the runtime-clone deadlock it
         // prevents).
         let pump_shutdown = tokio_util::sync::CancellationToken::new();
 

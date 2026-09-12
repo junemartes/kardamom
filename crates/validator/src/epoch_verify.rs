@@ -260,15 +260,8 @@ impl EpochVerifier {
         divergence: Arc<Divergence>,
         rt: &tokio::runtime::Handle,
     ) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<EpochRecord>(EPOCH_QUEUE_CAP);
-        let div = divergence.clone();
-        rt.spawn(async move {
-            let mut verifier = Verifier::new(source, lockbox);
-            while let Some(epoch) = rx.recv().await {
-                let verdict = verifier.verify_with_retry(&epoch).await;
-                verifier.record_verdict(&div, verdict);
-            }
-        });
+        let (tx, rx) = tokio::sync::mpsc::channel::<EpochRecord>(EPOCH_QUEUE_CAP);
+        rt.spawn(Verifier::new(source, lockbox, divergence.clone(), rx).run());
         Self {
             previous_origin: None,
             divergence,
@@ -288,20 +281,38 @@ enum VerifyVerdict {
     Unverified,
 }
 
-/// The content-check driver: reads L1 through `source`, and carries the
-/// anchor forward across epochs.
+/// The content-check task's state: the epoch queue from the exec thread,
+/// the L1 source, the lockbox, the divergence sink, and the anchor carried
+/// forward across epochs.
 struct Verifier<S: L1EpochSource> {
+    rx: tokio::sync::mpsc::Receiver<EpochRecord>,
     source: Arc<S>,
     lockbox: Address,
+    divergence: Arc<Divergence>,
     anchor: Option<Anchor>,
 }
 
 impl<S: L1EpochSource> Verifier<S> {
-    fn new(source: Arc<S>, lockbox: Address) -> Self {
+    fn new(
+        source: Arc<S>,
+        lockbox: Address,
+        divergence: Arc<Divergence>,
+        rx: tokio::sync::mpsc::Receiver<EpochRecord>,
+    ) -> Self {
         Self {
+            rx,
             source,
             lockbox,
+            divergence,
             anchor: None,
+        }
+    }
+
+    /// Verify each queued epoch until the exec side drops its sender.
+    async fn run(mut self) {
+        while let Some(epoch) = self.rx.recv().await {
+            let verdict = self.verify_with_retry(&epoch).await;
+            self.record_verdict(verdict);
         }
     }
 
@@ -332,7 +343,7 @@ impl<S: L1EpochSource> Verifier<S> {
         epoch: &EpochRecord,
         attempt: u32,
     ) -> std::ops::ControlFlow<VerifyVerdict> {
-        match verify_one(self.source.as_ref(), self.lockbox, epoch, self.anchor).await {
+        match self.verify_one(epoch).await {
             Ok(()) => std::ops::ControlFlow::Break(VerifyVerdict::Verified(Anchor {
                 number: epoch.l1_number,
                 hash: epoch.l1_hash,
@@ -358,9 +369,11 @@ impl<S: L1EpochSource> Verifier<S> {
 
     /// Out of retries. If L1 simply does not have this block, the epoch
     /// is anchored to something that never happened: rule 4, a fault.
-    /// Any other transport failure stays a coverage gap.
+    /// Any other transport failure stays a coverage gap. A "not found"
+    /// error is a statement about the chain; any other error is about the
+    /// network.
     fn give_up(epoch: &EpochRecord, attempt: u32, e: &anyhow::Error) -> VerifyVerdict {
-        if is_missing_block(e) {
+        if e.to_string().contains("not found") {
             return VerifyVerdict::Fault(EpochFault::BlockBeyondFinality {
                 l1_number: epoch.l1_number,
                 attempts: attempt,
@@ -377,7 +390,7 @@ impl<S: L1EpochSource> Verifier<S> {
 
     /// Apply one epoch's verdict: bump the metric, record a divergence on
     /// a fault, and advance the anchor on success.
-    fn record_verdict(&mut self, divergence: &Divergence, verdict: VerifyVerdict) {
+    fn record_verdict(&mut self, verdict: VerifyVerdict) {
         match verdict {
             VerifyVerdict::Verified(new_anchor) => {
                 metrics::counter_epoch_verified();
@@ -385,12 +398,54 @@ impl<S: L1EpochSource> Verifier<S> {
             }
             VerifyVerdict::Fault(fault) => {
                 metrics::counter_epoch_fault();
-                divergence.record(format!("epoch verification failed: {fault}"));
+                self.divergence
+                    .record(format!("epoch verification failed: {fault}"));
             }
             VerifyVerdict::Unverified => {
                 metrics::counter_epoch_unverified();
             }
         }
+    }
+
+    /// One content check against L1: the block ids, the parent chain link
+    /// to the anchor, then the lockbox logs.
+    async fn verify_one(&self, epoch: &EpochRecord) -> Result<(), VerifyOutcome> {
+        let (hash, parent) = self
+            .source
+            .block_ids(epoch.l1_number)
+            .await
+            .map_err(VerifyOutcome::Unavailable)?;
+        // Chain the origins together. Verifying each block alone would let
+        // an L1 endpoint serve any hash it likes for any number. Requiring
+        // block N to descend from block N-1 forces it to fabricate a
+        // consistent chain instead. This check costs nothing, since the
+        // parent hash came back in the same header. It only checks the
+        // immediate predecessor, which the sequence rules already require.
+        if let Some(Anchor {
+            number: prev_number,
+            hash: prev_hash,
+        }) = self.anchor
+            // `prev_number` came from a verified epoch, but it is still an
+            // L1 wire value, not this process's own counter: check it
+            // rather than assume it is not already `u64::MAX`. `None` here
+            // (an impossible predecessor number) just skips the
+            // immediate-parent check; the sequence rules already reject
+            // any actual gap.
+            && prev_number.checked_add(1) == Some(epoch.l1_number)
+            && parent != prev_hash
+        {
+            return Err(VerifyOutcome::Fault(EpochFault::ParentMismatch {
+                l1_number: epoch.l1_number,
+                expected_parent: prev_hash,
+                got_parent: parent,
+            }));
+        }
+        let logs = self
+            .source
+            .lockbox_logs(self.lockbox, epoch.l1_number, epoch.l1_number)
+            .await
+            .map_err(VerifyOutcome::Unavailable)?;
+        compare_against_l1(epoch, hash, &logs).map_err(VerifyOutcome::Fault)
     }
 }
 
@@ -408,57 +463,10 @@ const EPOCH_QUEUE_CAP: usize = 64;
 const VERIFY_ATTEMPTS: u32 = 8;
 const VERIFY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Tell "L1 does not have this block" apart from "L1 did not answer". The
-/// first is a statement about the chain; the second is about the network.
-fn is_missing_block(e: &anyhow::Error) -> bool {
-    e.to_string().contains("not found")
-}
-
 /// Outcome of one content check, separating a chain fault from an L1 outage.
 enum VerifyOutcome {
     Fault(EpochFault),
     Unavailable(anyhow::Error),
-}
-
-async fn verify_one<S: L1EpochSource + ?Sized>(
-    source: &S,
-    lockbox: Address,
-    epoch: &EpochRecord,
-    previous: Option<Anchor>,
-) -> Result<(), VerifyOutcome> {
-    let (hash, parent) = source
-        .block_ids(epoch.l1_number)
-        .await
-        .map_err(VerifyOutcome::Unavailable)?;
-    // Chain the origins together. Verifying each block alone would let an
-    // L1 endpoint serve any hash it likes for any number. Requiring block N
-    // to descend from block N-1 forces it to fabricate a consistent chain
-    // instead. This check costs nothing, since the parent hash came back in
-    // the same header. It only checks the immediate predecessor, which the
-    // sequence rules already require.
-    if let Some(Anchor {
-        number: prev_number,
-        hash: prev_hash,
-    }) = previous
-        // `prev_number` came from a verified epoch, but it is still an L1
-        // wire value, not this process's own counter: check it rather
-        // than assume it is not already `u64::MAX`. `None` here (an
-        // impossible predecessor number) just skips the immediate-parent
-        // check; the sequence rules already reject any actual gap.
-        && prev_number.checked_add(1) == Some(epoch.l1_number)
-        && parent != prev_hash
-    {
-        return Err(VerifyOutcome::Fault(EpochFault::ParentMismatch {
-            l1_number: epoch.l1_number,
-            expected_parent: prev_hash,
-            got_parent: parent,
-        }));
-    }
-    let logs = source
-        .lockbox_logs(lockbox, epoch.l1_number, epoch.l1_number)
-        .await
-        .map_err(VerifyOutcome::Unavailable)?;
-    compare_against_l1(epoch, hash, &logs).map_err(VerifyOutcome::Fault)
 }
 
 impl EpochObserver for EpochVerifier {
