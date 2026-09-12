@@ -157,34 +157,49 @@ impl Resize {
     }
 
     /// No replica of an active lane may be resyncing or holding parked
-    /// entries; a replica that does not answer is not in the way.
+    /// entries. A replica parks entries for a few seconds while a
+    /// sender's nonce gap fills in, and resyncs for a few seconds after
+    /// a restart, so the guard waits one TTL plus a margin for both
+    /// gauges to read zero. A replica parked past that is the sealer
+    /// backpressure the guard exists for. A replica that does not answer
+    /// is not in the way: not every node runs every lane.
     async fn preflight(&self, current: u32) -> anyhow::Result<()> {
         if self.dry_run {
             return Ok(());
         }
         for lane in 0..current {
-            self.assert_lane_idle(lane).await?;
+            self.wait_lane_idle(lane).await?;
         }
         Ok(())
     }
 
-    async fn assert_lane_idle(&self, lane: u32) -> anyhow::Result<()> {
+    async fn wait_lane_idle(&self, lane: u32) -> anyhow::Result<()> {
         for replica in &self.sequencers {
-            let resync = self.lane_metric(replica, lane, RESYNC).await.unwrap_or(0);
-            anyhow::ensure!(
-                resync == 0,
-                "replica {}:{} is in resync mode (sealer backpressure); not resizing",
-                replica.ip,
-                lane_port(lane)
-            );
-            let pending = self.lane_metric(replica, lane, PENDING).await.unwrap_or(0);
-            anyhow::ensure!(
-                pending == 0,
-                "replica {}:{} holds {pending} parked entries; not resizing",
-                replica.ip,
-                lane_port(lane)
-            );
+            self.wait_replica_idle(replica, lane).await?;
         }
+        Ok(())
+    }
+
+    async fn replica_idle(&self, replica: &Probed, lane: u32) -> bool {
+        let resync = self.lane_metric(replica, lane, RESYNC).await.unwrap_or(0);
+        let pending = self.lane_metric(replica, lane, PENDING).await.unwrap_or(0);
+        resync == 0 && pending == 0
+    }
+
+    async fn wait_replica_idle(&self, replica: &Probed, lane: u32) -> anyhow::Result<()> {
+        let budget = Budget::new(self.tx_ttl.saturating_add(WAIT_MARGIN), METRIC_INTERVAL);
+        let outcome = poll::until(budget, |_| async {
+            Ok(self.replica_idle(replica, lane).await.then_some(()))
+        })
+        .await?;
+        outcome.or_fail(|t| {
+            anyhow::anyhow!(
+                "replica {}:{} is in resync mode or holds parked entries after {}s (sealer backpressure); not resizing",
+                replica.ip,
+                lane_port(lane),
+                t.as_secs()
+            )
+        })?;
         Ok(())
     }
 
