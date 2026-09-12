@@ -1,16 +1,52 @@
 ---
-# Container substrate only; run.yml owns locking and cleanup for full runs.
-- name: Create cluster nodes and inventory
+# Container substrate: reads the node contract of terraform/containers and
+# provisions the nodes. `make container-up` applies the root, writes the
+# contract and runs this playbook through cluster.yml.
+- name: Read the node contract and prepare the host
   hosts: localhost
   connection: local
   become: false
   gather_facts: false
   vars:
     ansible_python_interpreter: "{{ ansible_playbook_python }}"
-  vars_files: [group_vars/all.yml]
-  roles:
-    - topology
-    - container_nodes
+    node_contract_file: "{{ playbook_dir }}/../terraform/containers/node-contract.json"
+    node_contract: "{{ lookup('ansible.builtin.file', node_contract_file) | from_json }}"
+  tasks:
+    - name: Require node contract version 1
+      ansible.builtin.assert:
+        that:
+          - node_contract.version | int == 1
+          - node_contract.nodes | length > 0
+        fail_msg: "{{ node_contract_file }} is not a version 1 node contract; run `tofu apply` in terraform/containers."
+
+    - name: Add container nodes to in-memory inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: "{{ [item.role, 'container_nodes'] }}"
+        ansible_host: "{{ item.container }}"
+        ansible_connection: community.docker.docker
+        ansible_user: root
+        ansible_python_interpreter: /usr/bin/python3
+        kardamom_in_container: true
+        kardamom_node: "{{ item.name }}"
+        node_ip: "{{ item.ip }}"
+        role: "{{ item.role }}"
+        tier: "{{ item.tier }}"
+        node_index: "{{ item.index }}"
+        control_plane: "{{ item.control_plane }}"
+      loop: "{{ node_contract.nodes | dict2items | map(attribute='value') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Keep the bridge name for the plays after provisioning
+      ansible.builtin.set_fact:
+        node_contract_bridge: "{{ node_contract.network.bridge }}"
+
+    - name: Prepare the host network for Aeron multicast
+      ansible.builtin.include_role:
+        name: host_prep
+      vars:
+        host_prep_bridge: "{{ node_contract_bridge }}"
 
 - name: Provision container substrate
   ansible.builtin.import_playbook: bootstrap.yml
@@ -29,5 +65,6 @@
   tasks:
     - name: Reapply host network settings
       ansible.builtin.include_role:
-        name: container_nodes
-        tasks_from: host
+        name: host_prep
+      vars:
+        host_prep_bridge: "{{ node_contract_bridge }}"

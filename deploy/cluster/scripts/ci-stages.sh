@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Test stages sourced by run-tests.sh. Failures propagate to ansible/run.yml.
+# Test stages sourced by run-tests.sh. Failures propagate to `make container-test`.
 # Requires lib.sh, ROOT and LOAD_BIN. This library owns no deployment lifecycle.
 
 # --- 7. Sustained-load invariant gate (Rust harness: fixed-rate soak;

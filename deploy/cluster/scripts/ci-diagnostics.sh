@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Best-effort diagnostics invoked by ansible/run.yml before teardown.
+# Best-effort diagnostics; `make container-diagnostics` runs it after a failure.
 # On failure, dump every job's status and each allocation's stdout and
 # stderr before teardown. Otherwise, the container removal in the entry
 # script's cleanup erases the only evidence of why an alloc failed. The

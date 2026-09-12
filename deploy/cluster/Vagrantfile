@@ -4,7 +4,7 @@
 # 12-node kardamom cluster. Mirrors the node-class model in
 # ansible/group_vars/all.yml (node_classes — the canonical contract): nodes are
 # <class>-<i> at ip_prefix.<ip_start+i>, matching ansible/inventory.ini and the
-# containers ansible/run.yml materialises for CI. libvirt is the primary
+# containers terraform/containers materialises for CI. libvirt is the primary
 # provider; VirtualBox is a best-effort fallback. Static private IPs on
 # 192.168.56.0/24.
 #

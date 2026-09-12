@@ -1,0 +1,3 @@
+---
+# The Linux bridge of the container network, from the node contract.
+host_prep_bridge: kardamom-br0

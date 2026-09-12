@@ -24,7 +24,8 @@ name: cluster-e2e
 # multi-node cluster as privileged systemd+DinD containers on a 192.168.56.0/24
 # bridge (the VM-less analogue of `make up`), provisions it with the UNMODIFIED
 # bootstrap.yml, deploys the Nomad jobs, and runs the pipeline smoke + sustained-load
-# + chaos suite. See deploy/cluster/ansible/run.yml and scripts/chaos.sh.
+# + chaos suite. See deploy/cluster/terraform/containers, the container-*
+# targets of deploy/cluster/Makefile and scripts/chaos.sh.
 #
 # The deploy uses the CLUSTERED sealer (Phase 3): a 3-member Aeron Cluster (Raft)
 # replaces the single sealer. The cluster transport is unconditional in the Rust
@@ -147,7 +148,7 @@ jobs:
           # cgroup v2 + systemd-in-container needs this on some runners.
           sudo modprobe ip_tables || true
 
-      # Build the Java cluster node jar BEFORE the image build: ansible/run.yml
+      # Build the Java cluster node jar BEFORE the image build: ansible/images.yml
       # stages cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar
       # into cluster.Dockerfile's context and builds/pushes kardamom-cluster:dev.
       - name: Build cluster sealer jar (gradle shadowJar)
@@ -156,7 +157,7 @@ jobs:
 
       # Build the service binaries once on the host; ci-service.Dockerfile then
       # wraps each into a thin image (the in-image workspace build is too slow).
-      # kardamom-load is the sustained-load + chaos harness ansible/run.yml runs from
+      # kardamom-load is the sustained-load + chaos harness run-tests.sh runs from
       # target/release (it stays on the runner, not in a service image).
       - name: cargo build --release (service binaries + load harness)
         run: |
@@ -176,25 +177,29 @@ jobs:
           cargo build --release -p e2e --features full-pipeline-e2e \
             --bin kardamom-semantics
 
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.12.6
+
       - name: Install Nomad CLI
         run: |
           ver="$(sed -n 's/^nomad_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
           curl -fsSL "https://releases.hashicorp.com/nomad/${ver}/nomad_${ver}_linux_amd64.zip" -o /tmp/nomad.zip
           sudo unzip -o /tmp/nomad.zip -d /usr/local/bin
 
-      # Select this shard's stage(s). ansible/run.yml reads RUN_LOAD / RUN_CHAOS /
+      # Select this shard's stage(s). run-tests.sh reads RUN_LOAD / RUN_CHAOS /
       # CHAOS_CASES from the env. Every shard runs the full (not PR-short)
       # durations.
       - name: Configure shard (${{ matrix.shard }})
         run: |
-          # Runner identity for the #124 correlation stamps in ansible/run.yml.
+          # Runner identity for the #124 correlation stamps in the deployment.
           echo "RUNNER_NAME=${{ runner.name }}" >> "$GITHUB_ENV"
           case "${{ matrix.shard }}" in
             # 300 tps is an INVARIANT-gate rate, not a perf target: every
             # 4-core runner sustains it (accept 0.995+ across all recorded
             # runs) while still exercising real backpressure. Edge discovery
             # on these VMs measured the hypervisor, not the stack (see the
-            # fixed-rate rationale in ansible/run.yml).
+            # fixed-rate rationale in ci-stages.sh).
             load)            { echo "RUN_LOAD=1"; echo "RUN_CHAOS=0"; echo "LOAD_DURATION_S=300"; echo "LOAD_TARGET_TPS=300"; echo "LOAD_SENDERS=6"; } ;;
             chaos-executor)  { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-executor hard-executor node-failure-executor state-checkpoint-restore replay-window-resync"; } ;;
             # archive-driver-loss kills the Aeron SUBSTRATE (ArchivingMediaDriver
@@ -257,5 +262,15 @@ jobs:
           # Chaos knobs shared by all chaos shards (no-op on the load shard).
           { echo "CHAOS_TPS=200"; echo "CHAOS_CASE_S=120"; echo "CHAOS_RESCHEDULE_SLO_S=200"; echo "CHAOS_LEADER_SLO_S=45"; } >> "$GITHUB_ENV"
 
-      - name: Bring up cluster + run shard (${{ matrix.shard }})
-        run: ansible-playbook -i localhost, deploy/cluster/ansible/run.yml
+      # The lifecycle is the Makefile's: apply terraform/containers, provision
+      # and deploy through ansible/cluster.yml, then run this shard's gates.
+      # The runner is ephemeral, so nothing destroys the cluster.
+      - name: Bring up cluster (${{ matrix.shard }})
+        run: make -C deploy/cluster container-up
+
+      - name: Run shard (${{ matrix.shard }})
+        run: make -C deploy/cluster container-test
+
+      - name: Collect diagnostics
+        if: failure()
+        run: make -C deploy/cluster container-diagnostics

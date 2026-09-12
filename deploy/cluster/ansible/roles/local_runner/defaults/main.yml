@@ -3,6 +3,11 @@ local_runner_operation: all
 local_runner_container: kardamom-orch
 local_runner_build: "{{ local_runner_operation in ['all', 'build'] }}"
 local_runner_root: "{{ (playbook_dir ~ '/../../..') | realpath }}"
+# Keep the nodes after the run, also after a failure. KEEP=1 sets it.
+local_runner_keep: "{{ lookup('ansible.builtin.env', 'KEEP') | default('0', true) == '1' }}"
+# Run the smoke, load and chaos gates after the deployment.
+local_runner_tests: true
+# Extra vars for cluster.yml, as a JSON object (the CLUSTER_VARS of the Makefile).
 local_runner_vars: {}
 local_runner_environment_keys:
   - KEEP
