@@ -70,7 +70,7 @@ run "contract" {
   }
 
   assert {
-    condition     = alltrue([for c in docker_container.node : anytrue([for n in c.networks_advanced : n.name == "kardamom-net" && n.ipv4_address == null])])
-    error_message = "a container joins the network without a declared address"
+    condition     = length(distinct([for c in docker_container.node : one(c.networks_advanced).ipv4_address])) == length(docker_container.node) && one(docker_container.node["aux-0"].networks_advanced).ipv4_address == "10.99.0.10"
+    error_message = "every node gets its own address, in name order from host 10"
   }
 }

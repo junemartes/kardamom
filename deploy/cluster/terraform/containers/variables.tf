@@ -45,3 +45,14 @@ variable "ready_timeout" {
   type        = number
   default     = 180
 }
+
+variable "address_offset" {
+  type        = number
+  description = "The host number of the first node address in the subnet; the nodes follow in name order."
+  default     = 10
+
+  validation {
+    condition     = var.address_offset >= 2
+    error_message = "address_offset must leave the gateway (host 1) free."
+  }
+}

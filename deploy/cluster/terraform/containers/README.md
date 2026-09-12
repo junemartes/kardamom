@@ -7,8 +7,10 @@ systemd and Docker-in-Docker container per node of the node-class model.
 
 The root reads `node_classes` from `../../ansible/group_vars/all.yml`
 (`contract_file`). The model stays in one place; `scripts/check-contract.py`
-checks that this root reads it. The network range is the `subnet` variable;
-Docker assigns every node address from it.
+checks that this root reads it. The network range is the `subnet` variable.
+Each node gets a stable address from it, in name order from `address_offset`
+(host 10), so a node keeps its address across a container restart. This root
+is the one place with an address plan; nothing else names an address.
 
 ## Resources
 

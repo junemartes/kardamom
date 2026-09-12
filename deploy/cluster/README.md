@@ -130,8 +130,9 @@ so the node-class model has one source. It creates:
   `ip_prefix`;
 - the `kardamom-node:ci` image from `docker/node.Dockerfile`;
 - two named volumes per node for the inner Docker engine;
-- one privileged systemd container per node, `kardamom-<class>-<i>`, at
-  the address Docker assigns, with a health check on `systemctl is-system-running`.
+- one privileged systemd container per node, `kardamom-<class>-<i>`, at a
+  stable address of the subnet (name order from host 10), with a health check
+  on `systemctl is-system-running`.
 
 `tofu apply` returns when systemd in every node is ready. `tofu output
 node_contract` is the version 1 node contract. `make container-up` writes it
