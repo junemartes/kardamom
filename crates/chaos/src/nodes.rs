@@ -12,6 +12,9 @@ use tokio::process::Command;
 
 /// The bound on one `docker` command.
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(20);
+/// The bound on a streamed copy into or out of a node: an archive or a
+/// checkpoint can be gigabytes on a slow runner.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A signal `docker kill -s` sends to an inner container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,23 +105,16 @@ impl Nodes {
         script: &str,
         stdin: Vec<u8>,
     ) -> anyhow::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        let mut child = Command::new("docker")
+        let child = Command::new("docker")
             .args(["exec", "-i", node, "bash", "-lc", script])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .with_context(|| format!("spawn docker exec -i {node}"))?;
-        let mut pipe = child.stdin.take().context("child stdin")?;
-        pipe.write_all(&stdin)
+        let out = feed_stdin_and_wait(child, stdin, STREAM_TIMEOUT)
             .await
-            .context("write to docker exec stdin")?;
-        pipe.shutdown().await.context("close docker exec stdin")?;
-        let out = tokio::time::timeout(Duration::from_secs(600), child.wait_with_output())
-            .await
-            .with_context(|| format!("docker exec -i {node} timed out"))?
-            .context("wait for docker exec")?;
+            .with_context(|| format!("docker exec -i {node}"))?;
         anyhow::ensure!(
             out.status.success(),
             "docker exec -i {node} failed ({}): {}",
@@ -145,7 +141,7 @@ impl Nodes {
         let run = Command::new("docker")
             .args(["exec", node, "bash", "-lc", script])
             .output();
-        let out = tokio::time::timeout(Duration::from_secs(600), run)
+        let out = tokio::time::timeout(STREAM_TIMEOUT, run)
             .await
             .with_context(|| format!("docker exec {node} timed out"))?
             .with_context(|| format!("spawn docker exec {node}"))?;
@@ -294,6 +290,25 @@ impl Nodes {
     }
 }
 
+/// Write `stdin` to the child, close its input, and wait for it within
+/// `bound`. The input handle drops before the wait: a pipe's shutdown
+/// closes nothing, and a reader that waits for the end of its input, such
+/// as `cat > file`, would otherwise wait until the bound.
+async fn feed_stdin_and_wait(
+    mut child: tokio::process::Child,
+    stdin: Vec<u8>,
+    bound: Duration,
+) -> anyhow::Result<Output> {
+    use tokio::io::AsyncWriteExt;
+    let mut pipe = child.stdin.take().context("child stdin")?;
+    pipe.write_all(&stdin).await.context("write to stdin")?;
+    drop(pipe);
+    tokio::time::timeout(bound, child.wait_with_output())
+        .await
+        .context("timed out")?
+        .context("wait for the child")
+}
+
 /// Whether a container name is `kardamom-<class>-<i>` for a pipeline
 /// class: executor, sequencer, ingress, sealer, or aux.
 fn is_pipeline_node(name: &str) -> bool {
@@ -313,6 +328,23 @@ fn is_pipeline_node(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cat` only exits at the end of its input, so this passes only if
+    /// the input handle closes before the wait.
+    #[tokio::test]
+    async fn feeding_stdin_reaches_the_end_of_input() {
+        let child = Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn cat");
+        let out = feed_stdin_and_wait(child, b"catalog bytes".to_vec(), Duration::from_secs(5))
+            .await
+            .expect("cat ends once its input ends");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"catalog bytes");
+    }
 
     #[test]
     fn pipeline_node_names() {
