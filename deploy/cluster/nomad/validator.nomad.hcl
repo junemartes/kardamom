@@ -14,8 +14,8 @@
 # chaos cases kill executor tasks and nodes (node-failure kills the
 # executor-2 node outright), and a validator co-located there would die
 # as collateral, indistinguishable from a fail-stop. Ports on the aux
-# node: cluster egress 40230, metrics 9006. No conflicts, since no
-# executor runs on the same node.
+# node: cluster egress on a Nomad dynamic port, metrics 9006. No
+# conflicts, since no executor runs on the same node.
 #
 # This job uses file() for its templates, so submit it from the
 # deploy/cluster/ directory. ansible/deploy.yml does this.
@@ -118,6 +118,10 @@ job "validator" {
 
     network {
       mode = "host"
+      # The cluster egress (response) port, unique per allocation. A
+      # fixed port sat in the node's ephemeral range, where the shared
+      # media driver's port-0 discovery sockets could take it first.
+      port "egress" {}
     }
 
     task "validator" {
@@ -156,13 +160,10 @@ job "validator" {
           "--config", "/local/validator.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
-          # This node's cluster-egress (response) endpoint, for the
-          # validator's own cluster client session. Port 40230 stays
-          # distinct from 40210, the executors' egress port convention
-          # on their nodes. Nothing else binds either port on the aux
-          # node; distinct ports keep captures and debugging
-          # unambiguous.
-          "--cluster-egress-endpoint", "${meta.node_ip}:40230",
+          # This allocation's cluster-egress (response) endpoint, for
+          # the validator's own cluster client session: the node IP and
+          # a Nomad dynamic port.
+          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",
           # Use the validator's own state directory under the shared

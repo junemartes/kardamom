@@ -200,4 +200,4 @@ cluster_ports:
   archive_control: 40204
 cluster_ingress_stream_id: 101
 cluster_egress_stream_id: 102
-cluster_egress_port: 40210   # egress response port of the ingress and executor clients (on the client's node IP); a sequencer takes a Nomad dynamic port
+cluster_egress_port: 40210   # egress response port of the ingress client (on its node IP); every other cluster client takes a Nomad dynamic port

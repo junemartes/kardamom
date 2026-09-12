@@ -14,8 +14,8 @@
 #
 # Placement: the aux node, next to the validator and da-watcher,
 # outside the chaos suite's blast radius. Ports on the aux node:
-# cluster egress 40231, refetch 40133/40143, metrics 9002 (the
-# validator holds 40230/40131/40141/9006).
+# cluster egress on a Nomad dynamic port, refetch 40133/40143, metrics
+# 9002 (the validator holds 40131/40141/9006 and its own dynamic port).
 #
 # ansible/deploy.yml deploys the settlement address, with
 # kardamom-deploy against anvil, and injects it at submit time:
@@ -107,6 +107,10 @@ job "batcher" {
 
     network {
       mode = "host"
+      # The cluster egress (response) port, unique per allocation. A
+      # fixed port sat in the node's ephemeral range, where the shared
+      # media driver's port-0 discovery sockets could take it first.
+      port "egress" {}
     }
 
     task "batcher" {
@@ -138,10 +142,11 @@ job "batcher" {
           "--config", "/local/batcher.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
-          # This node's cluster-egress (response) endpoint, for the
-          # batcher's own cluster client session: 40231, distinct
-          # from the validator's 40230 on the same node.
-          "--cluster-egress-endpoint", "${meta.node_ip}:40231",
+          # This allocation's cluster-egress (response) endpoint, for
+          # the batcher's own cluster client session: the node IP and a
+          # Nomad dynamic port, so it never clashes with the validator's
+          # on the same node.
+          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
           # Join-miss archive refetch (tx_data and tx_deposits). Same
           # contract as the validator's flags, with distinct ports on
           # the shared aux node.
