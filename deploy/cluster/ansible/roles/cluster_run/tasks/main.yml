@@ -37,7 +37,7 @@
     - name: Converge substrate images and workloads
       ansible.builtin.command:
         argv:
-          - "{{ ansible_playbook_python | dirname }}/ansible-playbook"
+          - "{{ cluster_run_playbook_binary }}"
           - -i
           - localhost,
           - "{{ playbook_dir }}/cluster.yml"

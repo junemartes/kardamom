@@ -6,3 +6,10 @@ cluster_run_lock: /tmp/kardamom-cluster-locks/deploy.lock.d
 cluster_run_dir: "{{ playbook_dir }}/.."
 # Explicit extra vars for the child convergence playbook. Environment is inherited.
 cluster_run_vars: {}
+# The ansible-playbook that runs the child playbook: the one next to this
+# interpreter (a pipx or venv install), else the first one on PATH (a user
+# install with the system interpreter).
+cluster_run_playbook_binary: >-
+  {{ lookup('ansible.builtin.first_found', {'files': ['ansible-playbook'],
+     'paths': [ansible_playbook_python | dirname] + lookup('ansible.builtin.env', 'PATH').split(':'),
+     'skip': true}) | default('ansible-playbook', true) }}

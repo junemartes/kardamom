@@ -21,9 +21,16 @@
     patterns: 'libaeron*.so'
   register: images_library_search
 
+# rusteron-client and rusteron-archive each build their own Aeron C tree,
+# and the two libaeron.so differ. The service binaries link the archive
+# crate's build, so prefer its directories when they exist.
 - name: Select Aeron build outputs
   ansible.builtin.set_fact:
     images_library_paths: >-
+      {{ (images_library_found | select('search', '/rusteron-archive-') | list)
+         or images_library_found }}
+  vars:
+    images_library_found: >-
       {{ images_library_search.files | map(attribute='path')
          | select('search', '/out/build/lib/libaeron[^/]*\.so$') | sort | list }}
 

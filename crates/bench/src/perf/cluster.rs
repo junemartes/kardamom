@@ -51,7 +51,11 @@ pub(crate) fn docker_exec(container: &str, script: &str) -> anyhow::Result<Strin
 }
 
 /// Build and deploy a fresh chain through the same Ansible lifecycle as CI.
-pub(crate) fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
+///
+/// # Errors
+///
+/// Returns an error if the `ansible-playbook` run fails.
+pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
     let playbook = repo_root.join("deploy/cluster/ansible/local.yml");
     let vars = serde_json::json!({
         "local_runner_operation": "reset",
