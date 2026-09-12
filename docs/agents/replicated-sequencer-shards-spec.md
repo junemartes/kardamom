@@ -117,7 +117,7 @@ summed). A rejoining replica shows a burst of
   (dynamic resharding), for which this change is the availability
   groundwork.~~ **Superseded**: `docs/specs/dynamic-sequencer-sizing.md`
   changes the active lane count at run time with a config-only map and
-  `scripts/scale-sequencers.sh`.
+  `kardamom-cluster scale-sequencers`.
 - Sealer dedup-window resizing: replicas add duplicate *volume* but no new
   unique ids, and live-join keeps re-offers inside the window; revisit only if
   replay-on-restart is ever introduced.

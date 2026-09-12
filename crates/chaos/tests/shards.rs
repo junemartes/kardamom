@@ -28,9 +28,8 @@
 
 #![cfg(feature = "cluster-e2e")]
 
-use std::time::Duration;
-
-use kardamom_chaos::rpc::Rpc;
+use kardamom_chaos::lifecycle::DeployVars;
+use kardamom_chaos::stages::VerdictMode;
 use kardamom_chaos::{Harness, Knobs, Lifecycle, Shard};
 
 /// The funded account of the smoke gate. A reuse run on a used chain
@@ -40,6 +39,44 @@ fn gate_account() -> anyhow::Result<u32> {
         v.parse()
             .map_err(|e| anyhow::anyhow!("KARDAMOM_CHAOS_GATE_ACCOUNT: {e}"))
     })
+}
+
+/// The two shards without chaos: the sustained load, and the
+/// chain-semantics suite.
+#[derive(Debug, Clone, Copy)]
+enum Stage {
+    Load,
+    Semantics,
+}
+
+impl Stage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Semantics => "semantics",
+        }
+    }
+
+    /// The shard's values below the environment: the load shard soaks
+    /// five minutes at 300 tps, the invariant-gate rate every 4-core
+    /// runner sustains; the semantics shard runs no load.
+    fn env(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Load => &[
+                ("LOAD_DURATION_S", "300"),
+                ("LOAD_TARGET_TPS", "300"),
+                ("LOAD_SENDERS", "6"),
+            ],
+            Self::Semantics => &[("RUN_LOAD", "0")],
+        }
+    }
+
+    async fn run(self, harness: &Harness) -> anyhow::Result<()> {
+        match self {
+            Self::Load => harness.soak().await,
+            Self::Semantics => harness.semantics().await,
+        }
+    }
 }
 
 fn reuse() -> bool {
@@ -62,10 +99,7 @@ async fn run_shard(shard: Shard) -> anyhow::Result<()> {
         lifecycle.up(&shard.deploy_vars()).await?
     };
     let mut harness = Harness::new(contract, knobs, lifecycle.clone())?;
-    kardamom_chaos::log(format!("smoke gate against {}", harness.rpc_url));
-    Rpc::new(&harness.rpc_url, harness.knobs.chain_id)?
-        .transfer_smoke(gate_account()?, Duration::from_secs(60))
-        .await?;
+    harness.smoke_gate(gate_account()?).await?;
     let cases = case_list(shard);
     kardamom_chaos::log(format!(
         "chaos suite: shard={} cases=[{}] tps={} case_s={}",
@@ -78,10 +112,43 @@ async fn run_shard(shard: Shard) -> anyhow::Result<()> {
         harness.run_case(case).await?;
     }
     kardamom_chaos::log(format!("chaos suite PASSED ({})", cases.join(" ")));
+    harness.ingress_churn().await?;
+    harness.validator_verdict(VerdictMode::Progress).await?;
+    kardamom_chaos::log("cluster-e2e PASSED");
     if !reuse() {
         lifecycle.down().await?;
     }
     Ok(())
+}
+
+async fn run_stage(stage: Stage) -> anyhow::Result<()> {
+    let knobs = Knobs::read(stage.env())?;
+    let lifecycle = Lifecycle::in_workspace();
+    let contract = if reuse() {
+        lifecycle.contract()?
+    } else {
+        lifecycle.up(&DeployVars::default()).await?
+    };
+    let harness = Harness::new(contract, knobs, lifecycle.clone())?;
+    harness.smoke_gate(gate_account()?).await?;
+    stage.run(&harness).await?;
+    harness.ingress_churn().await?;
+    harness.validator_verdict(VerdictMode::Sync).await?;
+    kardamom_chaos::log("cluster-e2e PASSED");
+    if !reuse() {
+        lifecycle.down().await?;
+    }
+    Ok(())
+}
+
+async fn stage_test(stage: Stage) {
+    if let Err(e) = run_stage(stage).await {
+        eprintln!("{e:#}");
+        panic!(
+            "shard {} failed; the cluster stays up for diagnostics",
+            stage.name()
+        );
+    }
 }
 
 async fn shard_test(shard: Shard) {
@@ -92,6 +159,18 @@ async fn shard_test(shard: Shard) {
             shard.name()
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
+async fn load() {
+    stage_test(Stage::Load).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
+async fn semantics() {
+    stage_test(Stage::Semantics).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

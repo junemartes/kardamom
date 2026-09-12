@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 CLUSTER = Path(__file__).resolve().parent.parent
+CHAOS = CLUSTER.parent.parent / "crates" / "chaos" / "src"
 REPO = CLUSTER.parent.parent
 GROUP_VARS = CLUSTER / "ansible" / "group_vars" / "all.yml"
 
@@ -231,8 +232,8 @@ must_contain(
     "ingress submit park equals tx_ttl_ms",
 )
 must_contain(
-    CLUSTER / "scripts" / "ci-stages.sh",
-    f"SEMANTICS_PARK_MS:-{tx_ttl_ms}",
+    CHAOS / "knobs.rs",
+    f'"SEMANTICS_PARK_MS", {int(tx_ttl_ms):_}',
     "chain-semantics park default equals tx_ttl_ms",
 )
 
@@ -280,9 +281,9 @@ elif tx_ttl_ms.isdigit() and int(ingress_kill.group(1)) * 1000 < int(tx_ttl_ms) 
     err(f"nomad/ingress.nomad.hcl: kill_timeout {ingress_kill.group(1)}s must cover tx_ttl_ms {tx_ttl_ms} plus 5s")
 
 
-# --- chaos.sh sender-to-shard table ------------------------------------------------
-# chaos.sh pins a case's load to a shard through ACCT_SHARD, a table over the
-# 16 funded Anvil dev accounts. Recompute it: vslot = keccak256(address)[7],
+# --- the chaos suite's sender-to-shard table -----------------------------------------
+# crates/chaos pins a case's load to a shard through ACCT_SHARD, a table over
+# the 16 funded Anvil dev accounts (src/accounts.rs). Recompute it: vslot = keccak256(address)[7],
 # then the shard map. keccak-256 is inlined, so this needs no dependency.
 RC = [
     0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
@@ -345,37 +346,37 @@ ANVIL_ACCOUNTS = [
     "dF3e18d64BC6A983f673Ab319CCaE4f1a57C7097", "cd3B766CCDd6AE721141F452C550Ca635964ce71",
 ]
 if SHARD_MAP.exists() and len(table) == 256:
-    chaos_text = (CLUSTER / "scripts" / "chaos.sh").read_text()
+    accounts_text = (CHAOS / "accounts.rs").read_text()
     vslots = [keccak256(bytes.fromhex(a))[7] for a in ANVIL_ACCOUNTS]
     expected_shards = " ".join(str(table[v]) for v in vslots)
-    m_acct = re.search(r"^ACCT_SHARD=\(([^)]*)\)", chaos_text, re.M)
+    m_acct = re.search(r"ACCT_SHARD: \[u8; 16\] = \[([^\]]*)\]", accounts_text)
     if not m_acct:
-        err("scripts/chaos.sh: missing ACCT_SHARD table")
-    elif " ".join(m_acct.group(1).split()) != expected_shards:
-        err(f"scripts/chaos.sh: ACCT_SHARD=({m_acct.group(1)}) but the shard map gives ({expected_shards})")
+        err("crates/chaos/src/accounts.rs: missing ACCT_SHARD table")
+    elif " ".join(m_acct.group(1).replace(",", " ").split()) != expected_shards:
+        err(f"crates/chaos/src/accounts.rs: ACCT_SHARD=({m_acct.group(1)}) but the shard map gives ({expected_shards})")
     expected_vslots = " ".join(str(v) for v in vslots)
-    m_vslot = re.search(r"^ACCT_VSLOT=\(([^)]*)\)", chaos_text, re.M)
+    m_vslot = re.search(r"ACCT_VSLOT: \[u8; 16\] = \[([^\]]*)\]", accounts_text)
     if not m_vslot:
-        err("scripts/chaos.sh: missing ACCT_VSLOT table")
-    elif " ".join(m_vslot.group(1).split()) != expected_vslots:
-        err(f"scripts/chaos.sh: ACCT_VSLOT=({m_vslot.group(1)}) but keccak gives ({expected_vslots})")
+        err("crates/chaos/src/accounts.rs: missing ACCT_VSLOT table")
+    elif " ".join(m_vslot.group(1).replace(",", " ").split()) != expected_vslots:
+        err(f"crates/chaos/src/accounts.rs: ACCT_VSLOT=({m_vslot.group(1)}) but keccak gives ({expected_vslots})")
 
-    # The sequencer shard's account walk. chaos.sh pins the shard-0 cases to a
-    # shard-0 sender and the resize case to a sender that moves under the
+    # The sequencer shard's account walk. The suite pins the shard-0 cases to
+    # a shard-0 sender and the resize case to a sender that moves under the
     # fewest-moves 2-to-3 render, and burns every skipped account. Walk that
-    # allocation over the shard's case list (ci-stages.sh appends the two
-    # dynamic-sizing cases), so a table or case-list change that runs out of
-    # funded accounts fails here, not two hours into the shard.
-    workflow = CLUSTER.parent.parent / ".github" / "workflows" / "cluster-e2e.yml"
-    m_shard = re.search(r'chaos-sequencer\)\s*\{([^}]*)\}', workflow.read_text()) if workflow.exists() else None
-    m_cases = re.search(r'CHAOS_CASES=([^"]*)"', m_shard.group(1)) if m_shard else None
-    if not m_cases:
-        err("workflows/cluster-e2e.yml: no chaos-sequencer shard with CHAOS_CASES")
+    # allocation over the shard's case list (Shard::Sequencer in
+    # src/shard.rs), so a table or case-list change that runs out of funded
+    # accounts fails here, not two hours into the shard.
+    shard_text = (CHAOS / "shard.rs").read_text()
+    m_shard = re.search(r"Self::Sequencer => &\[([^\]]*)\]", shard_text)
+    if not m_shard:
+        err("crates/chaos/src/shard.rs: no case list for Shard::Sequencer")
     else:
-        cases = m_cases.group(1).split()
-        if "sequencer-replica-kill" in cases and "resize-scale-out-in" not in cases:
-            cases += ["lookup-blackout", "resize-scale-out-in"]
-        run_load = "0" if "RUN_LOAD=0" in m_shard.group(1) else "1"
+        cases = re.findall(r'"([a-z0-9-]+)"', m_shard.group(1))
+        # A chaos shard runs no load, so the resize case may take a
+        # load-reserve account (Accounts::take_reserve).
+        must_contain(CHAOS / "shard.rs", '("RUN_LOAD", "0")', "chaos shards run no load")
+        run_load = "0"
         next_render = subprocess.run(
             [sys.executable, str(CLUSTER / "scripts" / "render-shard-map.py"), "--from", str(SHARD_MAP), "--lanes", "3"],
             capture_output=True,
@@ -399,7 +400,7 @@ if SHARD_MAP.exists() and len(table) == 256:
                 if acct > 15 and run_load == "0":
                     acct = next((a for a in range(1, 7) if moves(a)), 16)
             if acct > 15:
-                err(f"scripts/chaos.sh: the chaos-sequencer shard runs out of funded accounts at {case} (#{acct} > 15)")
+                err(f"crates/chaos/src/shard.rs: the chaos-sequencer shard runs out of funded accounts at {case} (#{acct} > 15)")
                 break
             acct = acct + 1 if acct >= 7 else 16
 
@@ -498,15 +499,13 @@ must_contain(
 )
 must_contain(REPO / "chains" / "dev.toml", f"chain_id = {chain_id}", "dev chain id")
 
-# --- scripts --------------------------------------------------------------------
+# --- the chaos crate ------------------------------------------------------------
 must_contain(
-    CLUSTER / "scripts" / "smoke.sh",
-    f"http://$(node_address kardamom-ingress-0):{ingress_rpc}",
-    "default ingress RPC URL, resolved through Docker",
+    CHAOS / "harness.rs",
+    f"INGRESS_RPC_PORT: u16 = {ingress_rpc};",
+    "the suite's ingress RPC port",
 )
-must_contain(
-    CLUSTER / "scripts" / "smoke.sh", f"CHAIN_ID:-{chain_id}", "default chain id"
-)
+must_contain(CHAOS / "knobs.rs", f'"CHAIN_ID", {int(chain_id):_}', "the suite's default chain id")
 
 # --- versions pinned elsewhere in the repo ---------------------------------------
 must_contain(

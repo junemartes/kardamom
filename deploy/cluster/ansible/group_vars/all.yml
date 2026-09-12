@@ -97,7 +97,7 @@ partition_count: 2               # M active sequencer shards: 1, 2, 4, or 8
 # ingress parks a submit for the same time. One value drives both:
 # sequencer.nomad.hcl --tx-ttl-ms (both groups), ingress.nomad.hcl
 # --pending-receipt-timeout-ms, and the chain-semantics park default in
-# scripts/ci-stages.sh. scripts/check-contract.py checks the mirrors.
+# crates/chaos/src/knobs.rs. scripts/check-contract.py checks the mirrors.
 tx_ttl_ms: 30000
 
 # --- ports ----------------------------------------------------------------
@@ -170,7 +170,7 @@ aeron_tmpfs_size: "2g"
 #                    share a node. Keep count >= 2 so both replicas of a lane
 #                    land on distinct nodes. The Aeron Cluster dedups the
 #                    racing refs (canonical_id first-seen), so a replica kill
-#                    costs no lane downtime. scripts/scale-sequencers.sh
+#                    costs no lane downtime. `kardamom-cluster scale-sequencers`
 #                    changes the active lane count at run time.
 #   ingress     2    active/active RPC front door        (tier: worker)
 #                    both join the tx_receipts multicast group and route to

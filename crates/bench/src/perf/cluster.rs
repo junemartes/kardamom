@@ -61,13 +61,12 @@ pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
         "local_runner_operation": "reset",
         "local_runner_build": !skip_build,
         "local_runner_keep": true,
+        "local_runner_tests": false,
     });
     let out = Command::new("ansible-playbook")
         .args(["-i", "localhost,"])
         .arg(&playbook)
         .args(["--extra-vars", &vars.to_string()])
-        .env("RUN_LOAD", "0")
-        .env("RUN_CHAOS", "0")
         .output()
         .context("run Ansible cluster lifecycle")?;
     if !out.status.success() {
@@ -78,7 +77,7 @@ pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
         );
     }
     println!("{}", String::from_utf8_lossy(&out.stdout));
-    println!("==> cluster up; smoke + ingress-churn gates passed");
+    println!("==> cluster up; no gate ran (the perf run is the load)");
     Ok(())
 }
 

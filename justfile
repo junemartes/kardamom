@@ -435,12 +435,6 @@ cluster-doctor:
     else
         echo "  WARN  docker daemon not running"
     fi
-    # Smoke test (scripts/smoke.sh) prefers foundry's cast; non-fatal.
-    if have cast; then
-        echo "  ok    cast — $(cast --version 2>&1 | head -1)"
-    else
-        echo "  WARN  cast not found — 'make smoke' needs foundry (repo: 'just bootstrap')"
-    fi
     if [[ "$rc" == "0" ]]; then
         echo ">> all good — 'cd deploy/cluster && make up'"
     else

@@ -21,7 +21,7 @@ Modes:
       render, so it serves through the overlap.
 
 The checked-in job file must equal the steady render for the checked-in
-map. scripts/check-contract.py checks that. scripts/scale-sequencers.sh
+map. scripts/check-contract.py checks that. `kardamom-cluster scale-sequencers`
 drives the two renders of a resize.
 """
 

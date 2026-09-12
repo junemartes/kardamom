@@ -12,8 +12,9 @@
     - [cargo, build, --release, -p, kardamom-ingress, -p, kardamom-sequencer, -p, kardamom-executor,
        -p, kardamom-validator, -p, kardamom-da-watcher, -p, kardamom-batcher, -p, kardamom-reconstruct, --bins]
     - [cargo, build, --release, -p, kardamom-deployer, --bin, kardamom-deploy]
-    - [cargo, build, --release, -p, kardamom-bench, --bin, kardamom-load]
     - [cargo, build, --release, -p, e2e, --features, full-pipeline-e2e, --bin, kardamom-semantics]
+    - [cargo, build, --release, -p, kardamom-chaos, --bin, kardamom-cluster]
+    - [cargo, test, --release, -p, kardamom-chaos, --features, cluster-e2e, --no-run]
   changed_when: true
 
 - name: Build sealer jar
@@ -34,7 +35,23 @@
     dest: "/work/target/release/kardamom-{{ item }}"
     remote_src: true
     mode: "0755"
-  loop: [ingress, sequencer, executor, validator, da-watcher, batcher, reconstruct, deploy, load, semantics]
+  loop: [ingress, sequencer, executor, validator, da-watcher, batcher, reconstruct, deploy, semantics, cluster]
+
+# The shard test executable carries a build hash in its name; the most
+# recent one is this build's.
+- name: Find the shard test executable
+  ansible.builtin.find:
+    paths: /ltarget/release/deps
+    patterns: 'shards-*'
+    excludes: '*.d'
+  register: local_runner_shards
+
+- name: Stage the shard test executable
+  ansible.builtin.copy:
+    src: "{{ (local_runner_shards.files | sort(attribute='mtime') | last).path }}"
+    dest: /work/target/release/kardamom-chaos-shards
+    remote_src: true
+    mode: "0755"
 
 # Preserve separate cached build directories so the image role can detect
 # conflicting copies of the same library instead of silently choosing one.
