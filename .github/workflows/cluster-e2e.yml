@@ -72,6 +72,12 @@ jobs:
       - name: Ansible docker connection plugin
         run: ansible-galaxy collection install ansible.posix community.docker
 
+      # The runner image puts pipx's ansible-core first on PATH, and its venv
+      # has no requests. community.docker's container and network modules run
+      # on the controller with that interpreter and need it.
+      - name: Docker API client dependency for the Ansible interpreter
+        run: pipx inject ansible-core requests
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: foundry-rs/foundry-toolchain@v1
         with:
