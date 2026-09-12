@@ -24,7 +24,7 @@ use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
 use crate::da_store::FsBlobStore;
 
 use super::cursor::{BatchCursor, L1Truth, read_l1_truth, reconcile};
-use super::feed::{FeedConfig, run_feed};
+use super::feed::{FeedConfig, FeedLoop};
 use super::sender::LiveSender;
 
 /// Top-level config the batcher reads from `--config` in live mode. It uses
@@ -315,7 +315,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         flush: Duration::from_millis(args.flush_ms.get()),
         skip_through_block: l1.skip_through_block,
     };
-    let mut feed = tokio::spawn(run_feed(feed_rx, sender, feed_cfg));
+    let mut feed = tokio::spawn(FeedLoop::new(feed_rx, sender, feed_cfg).run());
     let feed_result = tokio::select! {
         r = &mut feed => r.context("feed task panicked")?,
         () = bin_support::wait_for_shutdown() => {

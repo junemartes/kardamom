@@ -9,7 +9,7 @@
 //! permissionless; the proof is the authorization, and the key only pays
 //! gas.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy_primitives::Address;
@@ -21,7 +21,7 @@ use kardamom_batcher::error::BatcherError;
 use std::ops::ControlFlow;
 
 use kardamom_batcher::live::poll::{PollLoop, Retry, parse_interval_secs};
-use kardamom_batcher::{SubmitOutcome, submit_next_proof};
+use kardamom_batcher::{ProofSubmitter, SubmitOutcome};
 
 #[derive(Debug, Parser)]
 #[command(name = "kardamom-proof-submitter", version)]
@@ -52,46 +52,55 @@ async fn main() -> Result<()> {
         .wallet(signer)
         .connect_http(args.l1_rpc_url.parse().context("parse --l1-rpc-url")?);
 
-    let submitter = Submitter {
-        oracle: args.oracle,
-        proofs_dir: args.proofs_dir,
-        gate: PollLoop::new(args.interval_secs),
-    };
-    while let ControlFlow::Continue(()) = submitter.tick(&provider).await {}
+    Submitter::new(args.oracle, &args.proofs_dir, args.interval_secs)
+        .run(&provider)
+        .await;
     Ok(())
 }
 
-/// One `kardamom-proof-submitter` reactor tick: submit the next batch's
-/// proof when it is ready, then gate the next tick on the outcome.
+/// The `kardamom-proof-submitter` reactor: the proof submitter and the
+/// poll gate. Each tick submits the next batch's proof when it is ready,
+/// then gates the next tick on the outcome.
 struct Submitter {
-    oracle: Address,
-    proofs_dir: PathBuf,
+    submitter: ProofSubmitter,
     gate: PollLoop,
 }
 
 impl Submitter {
-    async fn tick(&self, provider: &(impl alloy_provider::Provider + Clone)) -> ControlFlow<()> {
-        let outcome = submit_next_proof(provider.clone(), self.oracle, &self.proofs_dir).await;
-        self.gate.gate(report_submit_outcome(outcome)).await
+    fn new(oracle: Address, proofs_dir: &Path, interval: Option<Duration>) -> Self {
+        Self {
+            submitter: ProofSubmitter::new(oracle, proofs_dir),
+            gate: PollLoop::new(interval),
+        }
     }
-}
 
-/// Log one [`submit_next_proof`] attempt's outcome. Retry immediately on a
-/// successful submit, to try the next batch without waiting out the poll
-/// interval.
-fn report_submit_outcome(outcome: Result<SubmitOutcome, BatcherError>) -> Retry {
-    match outcome {
-        Ok(SubmitOutcome::Submitted { batch_index }) => {
-            tracing::info!(batch_index, "proof submitted; root advanced");
-            return Retry::Now;
-        }
-        Ok(SubmitOutcome::NoBatchPosted { batch_index }) => {
-            tracing::debug!(batch_index, "batch not posted yet");
-        }
-        Ok(SubmitOutcome::ProofNotReady { batch_index }) => {
-            tracing::debug!(batch_index, "proof files not ready yet");
-        }
-        Err(e) => tracing::error!(error = %e, "submission attempt failed"),
+    /// Tick until the gate stops the loop.
+    async fn run(&self, provider: &(impl alloy_provider::Provider + Clone)) {
+        while let ControlFlow::Continue(()) = self.tick(provider).await {}
     }
-    Retry::AfterInterval
+
+    async fn tick(&self, provider: &(impl alloy_provider::Provider + Clone)) -> ControlFlow<()> {
+        let outcome = self.submitter.submit_next(provider.clone()).await;
+        self.gate.gate(Self::report(outcome)).await
+    }
+
+    /// Log one submit attempt's outcome. Retry immediately on a
+    /// successful submit, to try the next batch without waiting out the
+    /// poll interval.
+    fn report(outcome: Result<SubmitOutcome, BatcherError>) -> Retry {
+        match outcome {
+            Ok(SubmitOutcome::Submitted { batch_index }) => {
+                tracing::info!(batch_index, "proof submitted; root advanced");
+                return Retry::Now;
+            }
+            Ok(SubmitOutcome::NoBatchPosted { batch_index }) => {
+                tracing::debug!(batch_index, "batch not posted yet");
+            }
+            Ok(SubmitOutcome::ProofNotReady { batch_index }) => {
+                tracing::debug!(batch_index, "proof files not ready yet");
+            }
+            Err(e) => tracing::error!(error = %e, "submission attempt failed"),
+        }
+        Retry::AfterInterval
+    }
 }

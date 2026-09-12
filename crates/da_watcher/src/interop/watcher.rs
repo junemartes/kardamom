@@ -83,172 +83,11 @@ pub enum InteropError {
     CursorOverflow { last_seq: u64 },
 }
 
-/// One processing pass: take the next origin block's batch, derive its record,
-/// publish it, advance the cursor. Public so tests can exercise it without a
-/// task or a timer.
-///
-/// Returns `Ok(1)` when a record was published and `Ok(0)` when the publisher
-/// declined it (backpressure or a transient transport failure). On `Ok(0)` the
-/// cursor is unchanged and the next pass re-derives the SAME batch — safe
-/// because re-derivation is byte-identical, so a record that did land is
-/// collapsed by cluster dedup rather than executed twice.
-///
-/// # Errors
-/// - [`InteropError::Source`] if the feed failed. Cursor unchanged; retry.
-/// - [`InteropError::Derive`] if the batch broke the sequence rules. Cursor
-///   unchanged; the caller must STOP (never skip).
-/// - [`InteropError::Lagged`] if the feed floor is above the cursor. Cursor
-///   unchanged; the caller must STOP.
-/// - [`InteropError::PublisherClosed`] if the sink is shut.
-/// - [`InteropError::CursorOverflow`] if advancing the cursor past the
-///   published batch would wrap `u64`.
-pub async fn process_once<S, P>(
-    publisher: &P,
-    source: &mut S,
-    self_chain_id: u64,
-    cursor: &mut u64,
-) -> Result<usize, InteropError>
-where
-    S: RemoteChainSource,
-    P: RemoteEpochPublisher,
-{
-    let origin = source.origin_chain_id();
-    let batch = source.next_batch(*cursor).await.map_err(|e| match e {
-        RemoteSourceError::Lagged { cursor, floor, .. } => InteropError::Lagged { cursor, floor },
-        e => InteropError::Source(e),
-    })?;
-
-    // The anchor is a pure function of (origin, block). The feed must not
-    // choose it, so recompute it here and reject a message that differs.
-    // Terminal for the pair, like every derivation fault.
-    batch
-        .iter()
-        .try_for_each(|m| m.check_anchor(origin))
-        .map_err(InteropError::Derive)?;
-
-    // The batch goes in verbatim: ordering, gap, duplicate, multi-block and
-    // foreign-destination verdicts all belong to the shared rule, which the
-    // destination's verifier re-runs against the resulting record.
-    let record = derive_remote_epoch(self_chain_id, origin, *cursor, &batch)
-        .map_err(InteropError::Derive)?;
-    let messages = record.messages.len().get();
-    let last_seq = record.last_seq();
-
-    match publisher.publish(&record) {
-        Ok(pos) => {
-            *cursor = last_seq
-                .checked_add(1)
-                .ok_or(InteropError::CursorOverflow { last_seq })?;
-            let origin_label = origin.to_string();
-            ::metrics::counter!(metrics::REMOTE_EPOCHS_PUBLISHED_TOTAL, "origin" => origin_label.clone())
-                .increment(1);
-            ::metrics::counter!(metrics::REMOTE_MESSAGES_TOTAL, "origin" => origin_label.clone())
-                .increment(messages as u64);
-            // Metric value; f64 precision loss only above 2^52, never
-            // reached by a per-pair cursor.
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "metric value; never nears 2^52 for a per-pair cursor"
-            )]
-            ::metrics::gauge!(metrics::REMOTE_CURSOR_SEQ, "origin" => origin_label)
-                .set(*cursor as f64);
-            debug!(
-                target: "da_watcher::interop",
-                origin,
-                origin_block = record.anchor_number,
-                first_seq = record.first_seq,
-                last_seq,
-                messages,
-                ?pos,
-                "published remote epoch"
-            );
-            Ok(1)
-        }
-        Err(PublishError::Backpressure) => {
-            warn!(
-                target: "da_watcher::interop",
-                origin,
-                first_seq = record.first_seq,
-                "remote epoch publish backpressured; will retry from the same cursor"
-            );
-            Ok(0)
-        }
-        Err(PublishError::Closed) => Err(InteropError::PublisherClosed),
-        Err(PublishError::Transport(detail)) => {
-            // Never "log and carry on": a skipped record is a permanent hole
-            // in the pair's dense seq, which is exactly what the destination
-            // would later halt on.
-            warn!(
-                target: "da_watcher::interop",
-                origin,
-                first_seq = record.first_seq,
-                %detail,
-                "remote epoch publish failed; retrying from the same cursor"
-            );
-            Ok(0)
-        }
-    }
-}
-
-/// Spawn the interop watcher for one pair. Returns the same
-/// [`WatcherHandle`] shape the L1 watcher uses.
-///
-/// The loop is stream-driven rather than timer-driven — `next_batch` blocks
-/// until an origin block closes — so there is no tick interval, only the
-/// failure-path pace in [`InteropWatcherConfig::retry_interval`].
-///
-/// `cursor_file`, when given, is persisted after every pass that advanced the
-/// cursor — that is, strictly AFTER the publish it describes (see the write
-/// site below for why that ordering is load-bearing). `config.start_seq` is
-/// the caller's resume position either way; loading the file (and preferring
-/// it over the CLI seed) is the binary's job, so the loop has exactly one
-/// notion of "where am I".
-///
-/// The task ends on shutdown, on a closed publisher, on a derivation fault,
-/// or on a feed lag. The last two are the fail-stop: the handle's `task`
-/// completing without a shutdown signal is the pair's halt signal.
-pub fn spawn<S, P>(
-    publisher: P,
-    source: S,
-    config: InteropWatcherConfig,
-    cursor_file: Option<CursorFile>,
-) -> WatcherHandle
-where
-    S: RemoteChainSource,
-    P: RemoteEpochPublisher,
-{
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let origin = source.origin_chain_id();
-    let mut interop_loop = InteropLoop {
-        cursor_file,
-        origin,
-        origin_label: origin.to_string(),
-        retry_interval: config.retry_interval,
-        publisher,
-        source,
-        self_chain_id: config.self_chain_id,
-        shutdown_rx,
-    };
-    let task = tokio::spawn(async move {
-        let mut cursor = config.start_seq;
-        loop {
-            match interop_loop.tick(&mut cursor).await {
-                ControlFlow::Break(()) => break,
-                ControlFlow::Continue(()) => {}
-            }
-        }
-    });
-    WatcherHandle {
-        task,
-        shutdown: shutdown_tx,
-    }
-}
-
-/// Per-pair loop state: the cursor file, the origin chain id (for
-/// logging), the retryable-error backoff, and the seams `tick` owns for
-/// its whole task lifetime (`publisher`, `source`, `self_chain_id`,
-/// `shutdown_rx`).
-struct InteropLoop<S, P> {
+/// The interop watcher's state for one pair: the cursor file, the
+/// origin chain id (for logging), the retryable-error backoff, the
+/// publisher, the source, our chain id, and the per-pair cursor (the
+/// first seq not yet canonicalised).
+pub struct InteropWatcher<S, P> {
     cursor_file: Option<CursorFile>,
     origin: u64,
     origin_label: String,
@@ -256,40 +95,221 @@ struct InteropLoop<S, P> {
     publisher: P,
     source: S,
     self_chain_id: u64,
-    shutdown_rx: oneshot::Receiver<()>,
+    cursor: u64,
 }
 
-impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropLoop<S, P> {
-    /// One [`spawn`] pass: run `process_once` (or handle shutdown),
-    /// persist the cursor when it advanced, then apply the outcome.
-    /// `Break` ends the task: shutdown, or a fail-stop outcome.
-    async fn tick(&mut self, cursor: &mut u64) -> ControlFlow<()> {
-        let cursor_before = *cursor;
+/// What [`InteropWatcher::report`] decided for the next pass.
+enum Pace {
+    /// Pass again at once.
+    Continue,
+    /// Wait out the retry interval, then pass again.
+    Retry,
+    /// Stop the pair.
+    Stop,
+}
+
+impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropWatcher<S, P> {
+    /// `cursor_file`, when given, is persisted after every pass that
+    /// advanced the cursor — that is, strictly AFTER the publish it
+    /// describes (see [`Self::persist_cursor`] for why that ordering is
+    /// load-bearing). `config.start_seq` is the caller's resume position
+    /// either way; loading the file (and preferring it over the CLI seed)
+    /// is the binary's job, so the loop has exactly one notion of "where
+    /// am I".
+    pub fn new(
+        publisher: P,
+        source: S,
+        config: InteropWatcherConfig,
+        cursor_file: Option<CursorFile>,
+    ) -> Self {
+        let origin = source.origin_chain_id();
+        Self {
+            cursor_file,
+            origin,
+            origin_label: origin.to_string(),
+            retry_interval: config.retry_interval,
+            publisher,
+            source,
+            self_chain_id: config.self_chain_id,
+            cursor: config.start_seq,
+        }
+    }
+
+    /// The first per-pair seq not yet canonicalised.
+    #[must_use]
+    pub fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// The remote source. Unit tests inspect the scripted fake through
+    /// it.
+    pub fn source(&self) -> &S {
+        &self.source
+    }
+
+    /// The remote source, mutably. Unit tests script the next batch
+    /// through it.
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
+    /// Spawn the interop watcher for one pair. Returns the same
+    /// [`WatcherHandle`] shape the L1 watcher uses.
+    ///
+    /// The loop is stream-driven rather than timer-driven — `next_batch`
+    /// blocks until an origin block closes — so there is no tick interval,
+    /// only the failure-path pace in [`InteropWatcherConfig::retry_interval`].
+    ///
+    /// The task ends on shutdown, on a closed publisher, on a derivation
+    /// fault, or on a feed lag. The last two are the fail-stop: the
+    /// handle's `task` completing without a shutdown signal is the pair's
+    /// halt signal.
+    pub fn spawn(
+        publisher: P,
+        source: S,
+        config: InteropWatcherConfig,
+        cursor_file: Option<CursorFile>,
+    ) -> WatcherHandle {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(Self::new(publisher, source, config, cursor_file).run(shutdown_rx));
+        WatcherHandle {
+            task,
+            shutdown: shutdown_tx,
+        }
+    }
+
+    /// The pass loop. `shutdown` stays outside the state, so the select
+    /// in [`Self::step`] can wait on it while the pass borrows `self`.
+    async fn run(mut self, mut shutdown: oneshot::Receiver<()>) {
+        while let ControlFlow::Continue(()) = self.step(&mut shutdown).await {}
+    }
+
+    /// One pass: run [`Self::process_once`] (or handle shutdown), persist
+    /// the cursor when it advanced, then apply the outcome. `Break` ends
+    /// the task: shutdown, or a fail-stop outcome.
+    async fn step(&mut self, shutdown: &mut oneshot::Receiver<()>) -> ControlFlow<()> {
+        let cursor_before = self.cursor;
         let outcome = tokio::select! {
             biased;
-            _ = &mut self.shutdown_rx => {
+            _ = shutdown => {
                 info!(target: "da_watcher::interop", origin = self.origin, "shutting down");
                 return ControlFlow::Break(());
             }
             // Cancelled mid-pass only by the shutdown branch above; the
             // dropped future can cost at most an un-consumed feed item,
             // which the cursor-authoritative resume replays.
-            r = process_once(&self.publisher, &mut self.source, self.self_chain_id, cursor) => r,
+            r = self.process_once() => r,
         };
-        self.persist_cursor(*cursor, cursor_before);
-        // Takes the specific fields it needs, not `&self`: `self` also
-        // carries `source`/`publisher`, and `tokio::spawn` requires the
-        // whole task future to be `Send`, which a `&self` held across
-        // this `.await` would need `S: Sync`/`P: Sync` for, with no
-        // reason to require that of either trait.
-        Self::handle_outcome(
-            self.origin,
-            &self.origin_label,
-            self.retry_interval,
-            outcome,
-            *cursor,
-        )
-        .await
+        self.persist_cursor(cursor_before);
+        match self.report(outcome) {
+            Pace::Continue => ControlFlow::Continue(()),
+            Pace::Retry => {
+                tokio::time::sleep(self.retry_interval).await;
+                ControlFlow::Continue(())
+            }
+            Pace::Stop => ControlFlow::Break(()),
+        }
+    }
+
+    /// One processing pass: take the next origin block's batch, derive its record,
+    /// publish it, advance the cursor. Public so tests can exercise it without a
+    /// task or a timer.
+    ///
+    /// Returns `Ok(1)` when a record was published and `Ok(0)` when the publisher
+    /// declined it (backpressure or a transient transport failure). On `Ok(0)` the
+    /// cursor is unchanged and the next pass re-derives the SAME batch — safe
+    /// because re-derivation is byte-identical, so a record that did land is
+    /// collapsed by cluster dedup rather than executed twice.
+    ///
+    /// # Errors
+    /// - [`InteropError::Source`] if the feed failed. Cursor unchanged; retry.
+    /// - [`InteropError::Derive`] if the batch broke the sequence rules. Cursor
+    ///   unchanged; the caller must STOP (never skip).
+    /// - [`InteropError::Lagged`] if the feed floor is above the cursor. Cursor
+    ///   unchanged; the caller must STOP.
+    /// - [`InteropError::PublisherClosed`] if the sink is shut.
+    /// - [`InteropError::CursorOverflow`] if advancing the cursor past the
+    ///   published batch would wrap `u64`.
+    pub async fn process_once(&mut self) -> Result<usize, InteropError> {
+        let origin = self.origin;
+        let cursor = self.cursor;
+        let batch = self.source.next_batch(cursor).await.map_err(|e| match e {
+            RemoteSourceError::Lagged { cursor, floor, .. } => {
+                InteropError::Lagged { cursor, floor }
+            }
+            e => InteropError::Source(e),
+        })?;
+
+        // The anchor is a pure function of (origin, block). The feed must
+        // not choose it, so recompute it here and reject a message that
+        // differs. Terminal for the pair, like every derivation fault.
+        batch
+            .iter()
+            .try_for_each(|m| m.check_anchor(origin))
+            .map_err(InteropError::Derive)?;
+
+        // The batch goes in verbatim: ordering, gap, duplicate, multi-block
+        // and foreign-destination verdicts all belong to the shared rule,
+        // which the destination's verifier re-runs against the resulting
+        // record.
+        let record = derive_remote_epoch(self.self_chain_id, origin, cursor, &batch)
+            .map_err(InteropError::Derive)?;
+        let messages = record.messages.len().get();
+        let last_seq = record.last_seq();
+
+        match self.publisher.publish(&record) {
+            Ok(pos) => {
+                self.cursor = last_seq
+                    .checked_add(1)
+                    .ok_or(InteropError::CursorOverflow { last_seq })?;
+                ::metrics::counter!(metrics::REMOTE_EPOCHS_PUBLISHED_TOTAL, "origin" => self.origin_label.clone())
+                    .increment(1);
+                ::metrics::counter!(metrics::REMOTE_MESSAGES_TOTAL, "origin" => self.origin_label.clone())
+                    .increment(messages as u64);
+                // Metric value; f64 precision loss only above 2^52, never
+                // reached by a per-pair cursor.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "metric value; never nears 2^52 for a per-pair cursor"
+                )]
+                ::metrics::gauge!(metrics::REMOTE_CURSOR_SEQ, "origin" => self.origin_label.clone())
+                    .set(self.cursor as f64);
+                debug!(
+                    target: "da_watcher::interop",
+                    origin,
+                    origin_block = record.anchor_number,
+                    first_seq = record.first_seq,
+                    last_seq,
+                    messages,
+                    ?pos,
+                    "published remote epoch"
+                );
+                Ok(1)
+            }
+            Err(PublishError::Backpressure) => {
+                warn!(
+                    target: "da_watcher::interop",
+                    origin,
+                    first_seq = record.first_seq,
+                    "remote epoch publish backpressured; will retry from the same cursor"
+                );
+                Ok(0)
+            }
+            Err(PublishError::Closed) => Err(InteropError::PublisherClosed),
+            Err(PublishError::Transport(detail)) => {
+                // Never "log and carry on": a skipped record is a permanent
+                // hole in the pair's dense seq, which is exactly what the
+                // destination would later halt on.
+                warn!(
+                    target: "da_watcher::interop",
+                    origin,
+                    first_seq = record.first_seq,
+                    %detail,
+                    "remote epoch publish failed; retrying from the same cursor"
+                );
+                Ok(0)
+            }
+        }
     }
 
     /// Persist the cursor after a pass that advanced it. Never called
@@ -297,9 +317,10 @@ impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropLoop<S, P> {
     /// before this call) is harmless, because the restart re-derives a
     /// byte-identical record and cluster dedup on `canonical_id` absorbs
     /// the re-publish. A cursor persisted AHEAD of its publish would be a
-    /// permanent lane hole instead, so this only runs when `cursor`
+    /// permanent lane hole instead, so this only runs when the cursor
     /// actually moved past `cursor_before`.
-    fn persist_cursor(&self, cursor: u64, cursor_before: u64) {
+    fn persist_cursor(&self, cursor_before: u64) {
+        let cursor = self.cursor;
         if cursor == cursor_before {
             return;
         }
@@ -323,24 +344,20 @@ impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropLoop<S, P> {
         }
     }
 
-    /// Record the tick outcome and, for a retryable feed error, pace the
-    /// retry. Returns [`ControlFlow::Break`] when the loop must stop: the
-    /// publisher closed, or the batch broke the derivation rule (a
+    /// Record the pass outcome and decide the pace of the next one:
+    /// [`Pace::Retry`] for a retryable feed error, [`Pace::Stop`] when
+    /// the publisher closed or the batch broke the derivation rule (a
     /// fail-stop fault).
-    async fn handle_outcome(
-        origin: u64,
-        origin_label: &str,
-        retry_interval: Duration,
-        outcome: Result<usize, InteropError>,
-        cursor: u64,
-    ) -> ControlFlow<()> {
+    fn report(&self, outcome: Result<usize, InteropError>) -> Pace {
+        let origin = self.origin;
+        let cursor = self.cursor;
         match outcome {
             Ok(_) => {
-                record_tick(origin_label, "ok");
-                ControlFlow::Continue(())
+                self.record_tick("ok");
+                Pace::Continue
             }
             Err(InteropError::Source(e)) => {
-                record_tick(origin_label, "feed_error");
+                self.record_tick("feed_error");
                 warn!(
                     target: "da_watcher::interop",
                     origin,
@@ -348,16 +365,15 @@ impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropLoop<S, P> {
                     error = %e,
                     "outbox feed unavailable; the pair stalls until it recovers"
                 );
-                tokio::time::sleep(retry_interval).await;
-                ControlFlow::Continue(())
+                Pace::Retry
             }
             Err(InteropError::PublisherClosed) => {
-                record_tick(origin_label, "publisher_closed");
+                self.record_tick("publisher_closed");
                 warn!(target: "da_watcher::interop", origin, "publisher closed; exiting");
-                ControlFlow::Break(())
+                Pace::Stop
             }
             Err(InteropError::Lagged { cursor: at, floor }) => {
-                record_tick(origin_label, "fault");
+                self.record_tick("fault");
                 error!(
                     target: "da_watcher::interop",
                     origin,
@@ -367,10 +383,10 @@ impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropLoop<S, P> {
                      cursor; reset the cursor or backfill from DA — operator intervention \
                      required)"
                 );
-                ControlFlow::Break(())
+                Pace::Stop
             }
             Err(e @ (InteropError::Derive(_) | InteropError::CursorOverflow { .. })) => {
-                record_tick(origin_label, "fault");
+                self.record_tick("fault");
                 error!(
                     target: "da_watcher::interop",
                     origin,
@@ -379,20 +395,18 @@ impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropLoop<S, P> {
                     "remote epoch derivation fault; STOPPING this pair (a feed gap is never \
                      skipped; operator intervention required)"
                 );
-                ControlFlow::Break(())
+                Pace::Stop
             }
         }
     }
-}
 
-/// Record the tick outcome. A pure metrics helper with no loop state
-/// (just the two strings), so it stays a free function rather than a
-/// method on [`InteropLoop`].
-fn record_tick(origin_label: &str, outcome: &'static str) {
-    ::metrics::counter!(
-        metrics::REMOTE_WATCHER_TICK_TOTAL,
-        "origin" => origin_label.to_string(),
-        "outcome" => outcome
-    )
-    .increment(1);
+    /// Count one pass under its outcome label.
+    fn record_tick(&self, outcome: &'static str) {
+        ::metrics::counter!(
+            metrics::REMOTE_WATCHER_TICK_TOTAL,
+            "origin" => self.origin_label.clone(),
+            "outcome" => outcome
+        )
+        .increment(1);
+    }
 }

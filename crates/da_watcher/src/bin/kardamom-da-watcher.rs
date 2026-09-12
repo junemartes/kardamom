@@ -402,10 +402,8 @@ async fn serve(
 
 /// The setup state `serve` builds once and both `open_publishers` and
 /// `start_deposits_recorder` read from: the Aeron runtime and directory,
-/// and the resolved channels/Aeron config. `spawn_watchers` and
-/// `await_shutdown_or_fail_stop` need none of this — they operate purely
-/// on the watcher handles and paths passed to them — so they stay free
-/// functions rather than methods here.
+/// and the resolved channels/Aeron config. The watcher lifecycle needs
+/// none of this; it lives on `Watchers`.
 struct DaWatcherService {
     aeron_rt: AeronRuntime,
     channels: ChannelsConfig,
