@@ -114,9 +114,8 @@ fn spawn_writer_and_bal(
     // property. The channel has a bounded depth, so a wedged publisher
     // back-pressures exec instead of dropping state transitions.
     let (bal_tx, bal_rx) = crossbeam_channel::bounded(8);
-    let bal_publisher = std::thread::Builder::new()
-        .name("bal-publisher".into())
-        .spawn(move || kardamom_executor::bal::run_bal_publisher(bal_rx, bal_pub))
+    let bal_publisher = kardamom_executor::bal::BalPublisher::new(bal_rx, bal_pub)
+        .spawn()
         .context("spawn BAL publisher")?;
 
     // Footprint shadow. Behind `KARDAMOM_FOOTPRINT_SHADOW=1`, the exec
