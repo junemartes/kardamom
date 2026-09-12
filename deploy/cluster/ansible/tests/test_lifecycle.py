@@ -121,7 +121,7 @@ class LifecycleTest(unittest.TestCase):
           - groups.container_nodes | length == 12
           - groups.sealer | length == 3
           - hostvars['ingress-1'].node_ip == '192.168.56.32'
-          - hostvars['sequencer-1'].node_index == 1
+          - hostvars['sequencer-1'].node_index | int == 1
           - hostvars['control-0'].ansible_user == 'root'
           - "'localhost' not in groups.container_nodes"
 ''')
