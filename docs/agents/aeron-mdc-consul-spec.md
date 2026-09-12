@@ -16,7 +16,10 @@ refetch and Aeron Cluster bootstrap also contain fixed server addresses.
 This couples application deployment to a particular network and prevents new
 nodes with arbitrary addresses from participating without configuration changes.
 
-Use dynamic MDC publications and Consul discovery for the application channels.
+Use **dynamic MDC publications** (`control-mode=dynamic`) and Consul discovery
+for every migrated application channel. Manual MDC publications and
+publisher-maintained subscriber endpoint lists are out of scope and must not
+be substituted for this design.
 Each consumer discovers every relevant publisher and subscribes directly to its
 control endpoint. Multiple publishers remain separate Aeron images; where useful,
 use a multi-destination subscription (MDS) to merge those images into the existing
@@ -175,8 +178,9 @@ A Consul outage must not tear down healthy existing data-plane connections.
 
 Dynamic MDC means receivers join the publisher's advertised control endpoint.
 This does not mean that Aeron discovers publishers itself. Use Consul for that
-step. Manual destination APIs may be used behind the abstraction when required
-for multi-publisher subscription merging or archive integration; document and
+step. Subscription destination APIs may be used behind an MDS abstraction to join
+multiple dynamic publishers or to integrate archives. This permission is only
+for subscriptions: every publisher remains in dynamic MDC mode. Document and
 test the resulting URI and image behavior for the repository's Aeron version.
 
 ## Archives, readiness and scale-in
