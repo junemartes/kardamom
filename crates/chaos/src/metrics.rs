@@ -167,6 +167,19 @@ pub fn sum_where(body: &str, metric: &str, label_fragment: &str) -> Option<i64> 
     )
 }
 
+/// The sample lines of the named metrics, with the `_total`-less
+/// prefix noise dropped: a line is kept when its name is one of
+/// `metrics` and its value is not zero. The zero samples of a gauge
+/// family like `pending_depth{vslot=...}` would drown the report.
+#[must_use]
+pub fn samples_of_interest(body: &str, metrics: &[&str]) -> Vec<String> {
+    body.lines()
+        .filter(|l| metrics.iter().any(|m| is_sample_of(l, m)))
+        .filter(|l| sample_value(l).is_some_and(|v| v != 0))
+        .map(str::to_string)
+        .collect()
+}
+
 /// The number of sample lines whose name starts with `prefix`.
 #[must_use]
 pub fn count_with_prefix(body: &str, prefix: &str) -> usize {
@@ -215,5 +228,29 @@ mod tests {
         assert_eq!(sum_where("", "any", "x"), None);
         assert_eq!(sum("", "any"), None);
         assert_eq!(count_with_prefix(BODY, "kardamom_sequencer_"), 3);
+    }
+
+    #[test]
+    fn samples_of_interest_keeps_named_nonzero_samples() {
+        let body = "kardamom_sequencer_pending_depth{vslot=\"4\"} 3\n\
+            kardamom_sequencer_pending_depth{vslot=\"5\"} 0\n\
+            kardamom_sequencer_resync_mode 0\n\
+            kardamom_sequencer_nonce_lookups_total{outcome=\"ok\"} 12\n\
+            kardamom_sequencer_backpressure_total 7\n";
+        let kept = samples_of_interest(
+            body,
+            &[
+                "kardamom_sequencer_pending_depth",
+                "kardamom_sequencer_resync_mode",
+                "kardamom_sequencer_nonce_lookups_total",
+            ],
+        );
+        assert_eq!(
+            kept,
+            vec![
+                "kardamom_sequencer_pending_depth{vslot=\"4\"} 3",
+                "kardamom_sequencer_nonce_lookups_total{outcome=\"ok\"} 12",
+            ]
+        );
     }
 }

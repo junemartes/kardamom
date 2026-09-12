@@ -118,6 +118,15 @@ async fn scale(cluster_dir: &Path, lanes: u32) -> anyhow::Result<String> {
     Ok(text)
 }
 
+/// Print the lane report of every sequencer replica of `lanes` lanes:
+/// the evidence behind a refused scale step, since the guard in the
+/// script samples each replica once and stops at the first hit.
+async fn report_lanes(h: &Harness, lanes: u8) {
+    for line in h.probes.sequencer_lane_report(lanes).await {
+        crate::log(format!("resize: {line}"));
+    }
+}
+
 fn tail(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
@@ -197,10 +206,13 @@ async fn scale_out_in_body(h: &mut Harness, cluster_dir: &Path) -> anyhow::Resul
     let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
     h.inject_hard(&refs, "sequencer-2").await?;
     h.assert_count("sequencer", 6, h.knobs.restart_slo).await?;
-    let out_log = scale_out
-        .await
-        .context("join the scale-out task")?
-        .map_err(|e| crate::chaos_fail!("resize: scale-out failed: {e}"))?;
+    let out_log = match scale_out.await.context("join the scale-out task")? {
+        Ok(log) => log,
+        Err(e) => {
+            report_lanes(h, 3).await;
+            return Err(crate::chaos_fail!("resize: scale-out failed: {e}"));
+        }
+    };
     crate::log(format!(
         "resize: scale-out 2 -> 3 done ({} steps)",
         out_log.lines().filter(|l| l.starts_with("==>")).count()
@@ -208,9 +220,10 @@ async fn scale_out_in_body(h: &mut Harness, cluster_dir: &Path) -> anyhow::Resul
     wait_map_version(h, 0, 1).await?;
     wait_map_version(h, 1, 1).await?;
     h.assert_progress().await?;
-    scale(cluster_dir, 2)
-        .await
-        .map_err(|e| crate::chaos_fail!("resize: scale-in failed: {e}"))?;
+    if let Err(e) = scale(cluster_dir, 2).await {
+        report_lanes(h, 3).await;
+        return Err(crate::chaos_fail!("resize: scale-in failed: {e}"));
+    }
     crate::log("resize: scale-in 3 -> 2 done");
     let hs: &Harness = h;
     let outcome = poll::until(Budget::secs(120, 3), |_| async move {

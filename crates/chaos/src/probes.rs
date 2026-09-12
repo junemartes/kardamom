@@ -21,6 +21,17 @@ pub const VALIDATOR_PORT: u16 = 9006;
 pub const SEQUENCER_LANE0_PORT: u16 = 9001;
 /// The Nomad task name inside the `cluster` job.
 pub const CLUSTER_TASK: &str = "cluster";
+/// The sequencer samples a lane report prints; see
+/// [`Probes::sequencer_lane_report`].
+const LANE_REPORT_METRICS: &[&str] = &[
+    "kardamom_sequencer_pending_depth",
+    "kardamom_sequencer_resync_mode",
+    "kardamom_sequencer_nonce_lookup_requests_total",
+    "kardamom_sequencer_nonce_lookups_total",
+    "kardamom_sequencer_nonce_lookups_in_flight",
+    "kardamom_sequencer_receipt_floor_senders",
+    "kardamom_sequencer_receipt_floor_advances_total",
+];
 
 /// One node the probes address.
 #[derive(Debug, Clone)]
@@ -112,8 +123,50 @@ impl Probes {
     /// Panics if `i` is not a sequencer index of this cluster.
     #[must_use]
     pub fn sequencer_lane0_target(&self, i: usize) -> Target {
+        self.sequencer_lane_target(i, 0)
+    }
+
+    /// The replica target of `lane` on sequencer node `i`. Lane `n`
+    /// exports on `9001 + 10 * n`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is not a sequencer index of this cluster.
+    #[must_use]
+    pub fn sequencer_lane_target(&self, i: usize, lane: u8) -> Target {
         let s = &self.sequencers[i];
-        Target::bridged(s.ip, &s.container, SEQUENCER_LANE0_PORT)
+        let port = SEQUENCER_LANE0_PORT.saturating_add(u16::from(lane).saturating_mul(10));
+        Target::bridged(s.ip, &s.container, port)
+    }
+
+    /// One line per sequencer replica of lanes `0..lanes`: the samples
+    /// that explain a refused resize (parked entries by vslot, the
+    /// resync flag, the nonce lookups, the receipt floors). A replica
+    /// that does not answer reports `no answer`. This is the evidence a
+    /// failed scale step prints.
+    pub async fn sequencer_lane_report(&self, lanes: u8) -> Vec<String> {
+        let replicas =
+            (0..lanes).flat_map(|lane| (0..self.sequencers.len()).map(move |i| (i, lane)));
+        let mut out = Vec::new();
+        for (i, lane) in replicas {
+            out.push(self.lane_report_line(i, lane).await);
+        }
+        out
+    }
+
+    async fn lane_report_line(&self, i: usize, lane: u8) -> String {
+        let name = &self.sequencers[i].container;
+        let Some(body) = self
+            .scrape
+            .fetch(&self.sequencer_lane_target(i, lane))
+            .await
+        else {
+            return format!("lane {lane} on {name}: no answer");
+        };
+        format!(
+            "lane {lane} on {name}: {}",
+            metrics::samples_of_interest(&body, LANE_REPORT_METRICS).join(" | ")
+        )
     }
 
     /// One executor's `/metrics` body.
