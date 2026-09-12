@@ -330,24 +330,29 @@ impl<S: StateDatabase + Sync> BlockSession<'_, '_, S> {
             None => i % self.workers,
         };
         let worker = match (self.pool.sticky_assign, domain) {
-            (true, Some(key)) => {
-                let mut map = self.pool.assign.borrow_mut();
-                if let Some(w) = map.get(&key) {
-                    *w
-                } else if map.len() >= STICKY_CAP {
-                    hashed
-                } else {
-                    let w = self.pool.least_loaded();
-                    map.insert(key, w);
-                    w
-                }
-            }
+            (true, Some(key)) => self.sticky_worker(key, hashed),
             _ => hashed,
         };
         if self.pool.sticky_assign {
             self.pool.assign_load.borrow_mut()[worker] += 1;
         }
         worker
+    }
+
+    /// The sticky worker for one domain: the worker it is already pinned
+    /// to, or a fresh pin to the least-loaded worker. Past `STICKY_CAP`
+    /// pins, `hashed` stands and the domain gets no pin.
+    fn sticky_worker(&self, key: DomainKey, hashed: usize) -> usize {
+        let mut map = self.pool.assign.borrow_mut();
+        if let Some(w) = map.get(&key) {
+            return *w;
+        }
+        if map.len() >= STICKY_CAP {
+            return hashed;
+        }
+        let w = self.pool.least_loaded();
+        map.insert(key, w);
+        w
     }
 
     /// Store the transaction's slot (the envelope owns it: no clone, no

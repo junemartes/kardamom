@@ -91,39 +91,45 @@ impl Prepared {
         // the observation), so preparation needs no position in the
         // block.
         let view = schedule::scheduling_view_decoded(0, envelope, decoded);
-        let (domains, domain_hashes, primary, cold) = match stats.predict_domains(&view) {
-            Some(predicted) => {
-                let (domains, domain_hashes, primary) = predicted
-                    .into_iter()
-                    .filter(|c| *c != DomainKey::Account(FEE_SINK))
-                    .fold(
-                        (Vec::new(), Vec::new(), None),
-                        |(mut domains, mut domain_hashes, primary): (_, _, Option<DomainKey>), c| {
-                            // The primary contention domain is the first
-                            // non-sender cell in canonical order. This is
-                            // stable across transactions of one flow, which
-                            // is what puts a pool's traffic on one thread.
-                            // It falls back to the sender cell, the
-                            // SenderChain lane, for tier-1-only
-                            // transactions.
-                            let is_sender = matches!(c, DomainKey::Account(a) if a == envelope.sender);
-                            let primary_is_sender =
-                                matches!(primary, Some(DomainKey::Account(a)) if a == envelope.sender);
-                            let primary = if primary.is_none() || (!is_sender && primary_is_sender) {
-                                Some(c)
-                            } else {
-                                primary
-                            };
-                            domain_hashes.push(Self::domain_hash64(&c));
-                            domains.push(c);
-                            (domains, domain_hashes, primary)
-                        },
-                    );
-                (domains, domain_hashes, primary, false)
-            }
-            None => (Vec::new(), Vec::new(), None, true),
+        // ⊤: an untrained selector predicts nothing, and the transaction
+        // orders behind everything outstanding.
+        let Some(predicted) = stats.predict_domains(&view) else {
+            return (Vec::new(), Vec::new(), None, true);
         };
-        (domains, domain_hashes, primary, cold)
+        let (domains, domain_hashes, primary) = predicted
+            .into_iter()
+            .filter(|c| *c != DomainKey::Account(FEE_SINK))
+            .fold((Vec::new(), Vec::new(), None), |acc, c| {
+                Self::fold_domain(acc, c, envelope)
+            });
+        (domains, domain_hashes, primary, false)
+    }
+
+    /// Fold one predicted contention cell into the running
+    /// `(domains, hashes, primary)` accumulator.
+    ///
+    /// The primary contention domain is the first non-sender cell in
+    /// canonical order. This is stable across transactions of one flow,
+    /// which is what puts a pool's traffic on one thread. It falls back
+    /// to the sender cell, the `SenderChain` lane, for tier-1-only
+    /// transactions.
+    fn fold_domain(
+        acc: (Vec<DomainKey>, Vec<u64>, Option<DomainKey>),
+        c: DomainKey,
+        envelope: &TxEnvelope,
+    ) -> (Vec<DomainKey>, Vec<u64>, Option<DomainKey>) {
+        let (mut domains, mut domain_hashes, primary) = acc;
+        let is_sender = matches!(c, DomainKey::Account(a) if a == envelope.sender);
+        let primary_is_sender =
+            matches!(primary, Some(DomainKey::Account(a)) if a == envelope.sender);
+        let primary = if primary.is_none() || (!is_sender && primary_is_sender) {
+            Some(c)
+        } else {
+            primary
+        };
+        domain_hashes.push(Self::domain_hash64(&c));
+        domains.push(c);
+        (domains, domain_hashes, primary)
     }
 
     /// Hash a contention cell to 64 bits (see [`TouchTable`]: equal

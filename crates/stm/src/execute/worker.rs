@@ -85,7 +85,7 @@ fn next_job<S: StateDatabase>(
         match acquire.poll_once() {
             JobPoll::Ready(i) => return Some(i),
             JobPoll::Done => return None,
-            JobPoll::Retry => {}
+            JobPoll::Retry => (),
         }
     }
 }
@@ -268,7 +268,7 @@ impl<S: StateDatabase> Acquire<'_, S> {
             match self.spin_poll(spin_start) {
                 SpinPoll::Found => return true,
                 SpinPoll::GiveUp => return false,
-                SpinPoll::Retry => {}
+                SpinPoll::Retry => (),
             }
         }
     }
