@@ -405,7 +405,7 @@ run_cpu_squeeze() {
   # the logs. The metric resets if the validator restarted
   # mid-squeeze, but a pre-restart divergence still shows in the old
   # alloc's log. The alloc-log scan is the shared implementation in
-  # validator-verdict.sh; ci-cluster.sh's §7c verdict runs the same
+  # validator-verdict.sh; run-tests.sh's §7c verdict runs the same
   # one, and the SIGPIPE doctrine is documented there.
   local div
   div="$(val_metric validator_divergence_total)"; div="$(printf '%.0f' "${div:-0}")"

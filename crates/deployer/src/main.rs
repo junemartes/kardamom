@@ -117,6 +117,14 @@ enum Command {
     Addresses {
         #[arg(long = "l2-chain-id")]
         l2_chain_id: Option<u64>,
+
+        /// Restrict results to a named contract, for example KardamomL2Settlement.
+        #[arg(long)]
+        contract: Option<String>,
+
+        /// Emit a JSON array for deployment automation.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Cross-check registry against ERC1967 impl slots.
@@ -206,9 +214,11 @@ async fn main() -> Result<()> {
             println!("ERC-7955 factory runtime installed at {ERC7955_FACTORY}");
             Ok(())
         }
-        Command::Addresses { l2_chain_id } => {
-            run_addresses(cli.rpc_url, cli.owner, l2_chain_id).await
-        }
+        Command::Addresses {
+            l2_chain_id,
+            contract,
+            json,
+        } => run_addresses(cli.rpc_url, cli.owner, l2_chain_id, contract, json).await,
         Command::Verify => run_verify(cli.rpc_url, cli.owner).await,
     }
 }
@@ -430,9 +440,38 @@ impl UpgradeArgs {
     }
 }
 
-async fn run_addresses(rpc_url: String, owner: Address, l2_chain_id: Option<u64>) -> Result<()> {
+async fn run_addresses(
+    rpc_url: String,
+    owner: Address,
+    l2_chain_id: Option<u64>,
+    contract: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let contract = contract.as_deref().map(parse_contract_id).transpose()?;
     let deployer = readonly_deployer(&rpc_url, owner)?;
-    print_addresses(&deployer, l2_chain_id).await
+    let mut entries = deployer.addresses(l2_chain_id).await?;
+    if let Some(contract) = contract {
+        entries.retain(|entry| entry.id == contract.id());
+    }
+    if json {
+        let records: Vec<_> = entries.iter().map(entry_json).collect();
+        println!("{}", serde_json::to_string(&records)?);
+    } else {
+        print_entries(&entries);
+    }
+    Ok(())
+}
+
+fn entry_json(entry: &RegistryEntry) -> serde_json::Value {
+    serde_json::json!({
+        "l2_chain_id": entry.l2_chain_id,
+        "id": entry.id.to_string(),
+        "proxy": entry.proxy.to_string(),
+        "impl": entry.current_impl.to_string(),
+        "version": entry.version,
+        "deployed_at": entry.deployed_at,
+        "upgraded_at": entry.upgraded_at,
+    })
 }
 
 async fn run_verify(rpc_url: String, owner: Address) -> Result<()> {

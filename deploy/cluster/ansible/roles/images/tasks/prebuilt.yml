@@ -1,0 +1,59 @@
+---
+- name: Create a private service image context
+  ansible.builtin.file:
+    path: "{{ images_staging.path }}/services/_aeronlibs"
+    state: directory
+    mode: "0755"
+
+- name: Stage prebuilt Linux service binaries
+  ansible.builtin.copy:
+    src: "{{ images_release_dir }}/kardamom-{{ item }}"
+    dest: "{{ images_staging.path }}/services/kardamom-{{ item }}"
+    remote_src: true
+    mode: "0755"
+  loop: "{{ images_services }}"
+
+- name: Find Aeron shared libraries from the release build
+  ansible.builtin.find:
+    paths: "{{ images_release_dir }}/build"
+    recurse: true
+    file_type: any
+    patterns: 'libaeron*.so'
+  register: images_library_search
+
+- name: Select Aeron build outputs
+  ansible.builtin.set_fact:
+    images_library_paths: >-
+      {{ images_library_search.files | map(attribute='path')
+         | select('search', '/out/build/lib/libaeron[^/]*\.so$') | sort | list }}
+
+- name: Require the Aeron runtime libraries
+  ansible.builtin.assert:
+    that:
+      - "'libaeron.so' in images_library_paths | map('basename') | list"
+      - "'libaeron_archive_c_client.so' in images_library_paths | map('basename') | list"
+    fail_msg: Build the Linux service binaries and Aeron shared libraries first.
+
+- name: Check library content for conflicting cached builds
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+    checksum_algorithm: sha256
+  loop: "{{ images_library_paths }}"
+  register: images_library_checksums
+
+- name: Reject different libraries with the same filename
+  ansible.builtin.assert:
+    that: >-
+      images_library_checksums.results | selectattr('item', 'search', '/' ~ (item | regex_escape) ~ '$')
+      | map(attribute='stat.checksum') | unique | length == 1
+    fail_msg: "Conflicting cached {{ item }} builds; clean the release build artifacts before packaging."
+  loop: "{{ images_library_paths | map('basename') | unique | list }}"
+
+- name: Stage Aeron runtime libraries
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ images_staging.path }}/services/_aeronlibs/{{ item | basename }}"
+    remote_src: true
+    mode: "0755"
+  loop: "{{ images_library_paths }}"

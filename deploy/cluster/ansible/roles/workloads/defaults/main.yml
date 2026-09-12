@@ -1,0 +1,40 @@
+---
+# Environment compatibility for existing CI shards. Ansible extra vars take precedence.
+workloads_cluster_dir: "{{ playbook_dir | dirname }}"
+workloads_nomad_binary: nomad
+workloads_nomad_addr: "{{ lookup('env', 'NOMAD_ADDR') | default('http://' ~ control_ip ~ ':' ~ ports.nomad_http, true) }}"
+workloads_nomad_token: "{{ lookup('env', 'NOMAD_TOKEN') }}"
+workloads_namespace: "{{ lookup('env', 'NOMAD_NAMESPACE') | default('default', true) }}"
+workloads_manifest: "{{ [workloads_cluster_dir, lookup('env', 'DIGEST_MANIFEST') | default('images.digests', true)] | path_join }}"
+workloads_require_signed: "{{ lookup('env', 'KARDAMOM_REQUIRE_SIGNED') | default('0', true) | bool }}"
+# Reuse the build path's pinned cache when cosign is not installed on PATH.
+workloads_cosign_binary: >-
+  {{ lookup('first_found', {'files': ['cosign'], 'paths': lookup('env', 'PATH').split(':') +
+     [lookup('env', 'KARDAMOM_COSIGN_CACHE') | default(
+       (lookup('env', 'XDG_CACHE_HOME') | default(lookup('env', 'HOME') ~ '/.cache', true)) ~ '/kardamom/cosign', true)
+       ~ '/' ~ (lookup('env', 'KARDAMOM_COSIGN_VERSION') | default(cosign_pinned_version, true))], 'skip': true}) | default('cosign', true) }}
+workloads_cert_identity: >-
+  {{ lookup('env', 'KARDAMOM_CERT_IDENTITY_RE') |
+     default('^https://github\.com/junemartes/kardamom/\.github/workflows/[^@]+@refs/', true) }}
+workloads_cert_issuer: "{{ lookup('env', 'KARDAMOM_CERT_OIDC_ISSUER') | default('https://token.actions.githubusercontent.com', true) }}"
+workloads_image_services: [aeron, cluster, sequencer, ingress, executor, validator, da-watcher, batcher]
+workloads_l1_rpc: "{{ lookup('env', 'L1_RPC') | default('http://' ~ control_ip ~ ':' ~ ports.anvil_l1, true) }}"
+workloads_settlement_address: "{{ lookup('env', 'SETTLEMENT_ADDRESS') }}"
+workloads_lockbox_address: "{{ lookup('env', 'LOCKBOX_ADDRESS') }}"
+workloads_deploy_binary: "{{ lookup('env', 'DEPLOY_BIN') | default(workloads_cluster_dir ~ '/../../target/release/kardamom-deploy', true) }}"
+workloads_l1_owner: "{{ lookup('env', 'L1_OWNER') | default('0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', true) }}"
+workloads_l1_owner_key: >-
+  {{ lookup('env', 'L1_OWNER_KEY') | default('0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80', true) }}
+workloads_batcher_eoa: "{{ lookup('env', 'BATCHER_EOA') | default('0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC', true) }}"
+workloads_chain_id: "{{ lookup('env', 'L2_CHAIN_ID') | default(chain_id, true) }}"
+workloads_cluster_retention: "{{ lookup('env', 'KARDAMOM_CLUSTER_RETENTION') }}"
+workloads_cluster_snapshot_s: "{{ lookup('env', 'KARDAMOM_CLUSTER_SNAPSHOT_S') }}"
+workloads_remote_origins: "{{ lookup('env', 'KARDAMOM_REMOTE_ORIGINS') }}"
+workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC') }}"
+workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"
+workloads_light_checkpoint: "{{ lookup('env', 'L1_LIGHT_CLIENT_CHECKPOINT') }}"
+workloads_light_network: "{{ lookup('env', 'L1_LIGHT_CLIENT_NETWORK') | default('mainnet', true) }}"
+workloads_aux_ip: "{{ lookup('env', 'AUX_IP') | default(ip_prefix ~ '.' ~ node_classes.aux.ip_start, true) }}"
+workloads_light_port: "{{ lookup('env', 'L1_LIGHT_CLIENT_PORT') | default('8548', true) }}"
+workloads_poll_delay: 3
+workloads_poll_retries: 80

@@ -1,0 +1,12 @@
+---
+- name: Run the container cluster lifecycle
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  vars_files: [group_vars/all.yml]
+  roles:
+    - topology
+    - cluster_run

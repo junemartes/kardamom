@@ -1,0 +1,16 @@
+---
+- name: Validate node class lane
+  ansible.builtin.assert:
+    that:
+      - topology_class.value.count is integer
+      - topology_class.value.count >= 0
+      - topology_class.value.ip_start is integer
+      - topology_class.value.ip_start >= 1
+      - topology_class.value.ip_start + topology_class.value.count <= 255
+
+- name: Expand class replicas
+  ansible.builtin.set_fact:
+    topology_nodes: "{{ topology_nodes + [{'name': topology_class.key ~ '-' ~ item,
+      'role': topology_class.key, 'tier': topology_class.value.tier, 'index': item,
+      'ip': ip_prefix ~ '.' ~ (topology_class.value.ip_start + item)}] }}"
+  loop: "{{ range(topology_class.value.count) | list }}"

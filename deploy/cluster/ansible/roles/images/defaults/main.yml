@@ -1,0 +1,18 @@
+---
+images_cluster_dir: "{{ playbook_dir | dirname }}"
+images_root: "{{ images_cluster_dir }}/../.."
+images_mode: source # source: Docker multi-stage Rust builds; prebuilt: CI/Linux binaries
+images_registry: "{{ lookup('env', 'REGISTRY') | default(registry_host ~ ':' ~ registry_port, true) }}"
+images_tag: "{{ lookup('env', 'TAG') | default(image_tag, true) }}"
+images_manifest: "{{ [images_cluster_dir, lookup('env', 'DIGEST_MANIFEST') | default('images.digests', true)] | path_join }}"
+images_services: [ingress, sequencer, executor, validator, da-watcher, batcher]
+images_release_dir: "{{ images_root }}/target/release"
+images_cluster_jar: "{{ images_root }}/cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar"
+images_push_node: "{{ lookup('env', 'REGISTRY_PUSH_NODE') }}" # e.g. control-0; empty pushes directly
+images_docker_binary: docker
+images_sign: "{{ lookup('env', 'ACTIONS_ID_TOKEN_REQUEST_URL') | length > 0 }}"
+# Per-image helpers evaluated inside the image loop.
+images_ref: "{{ images_registry }}/kardamom-{{ images_item.name }}:{{ images_tag }}"
+images_node_command: ["{{ images_docker_binary }}", exec, "kardamom-{{ images_push_node }}"]
+images_node_archive_path: "/tmp/{{ images_staging.path | basename }}.tar"
+images_node_archive: "kardamom-{{ images_push_node }}:{{ images_node_archive_path }}"

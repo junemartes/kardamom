@@ -1,0 +1,82 @@
+---
+- name: Validate deployment inputs and image provenance
+  ansible.builtin.import_tasks: preflight.yml
+
+- name: Initialize deployment state
+  ansible.builtin.set_fact:
+    workloads_jobs: {}
+    workloads_system_count: >-
+      {{ node_classes | dict2items | rejectattr('value.tier', 'equalto', 'control') | map(attribute='value.count') | sum }}
+
+- name: Deploy Aeron and the development L1
+  ansible.builtin.include_tasks: job.yml
+  loop:
+    - {name: aeron, file: aeron.system.nomad.hcl, retries: 200}
+    - {name: anvil}
+  loop_control:
+    loop_var: workloads_job
+    label: "{{ workloads_job.name }}"
+
+- name: Resolve settlement before deploying its consumers
+  ansible.builtin.import_tasks: settlement.yml
+
+# Submit sequencers without waiting: they may need downstream subscribers.
+# Ingress must subscribe to receipts before executors start publishing them.
+- name: Deploy pipeline dependencies
+  ansible.builtin.include_tasks: job.yml
+  loop:
+    - name: cluster
+      retries: 100
+      vars:
+        cluster_retention: "{{ workloads_cluster_retention }}"
+        cluster_snapshot_interval_s: "{{ workloads_cluster_snapshot_s }}"
+        cluster_remote_origins: "{{ workloads_remote_origins }}"
+    - {name: sequencer, wait: false}
+    - {name: ingress}
+    - {name: executor, wait: false}
+  loop_control:
+    loop_var: workloads_job
+    label: "{{ workloads_job.name }}"
+
+- name: Deploy optional L1 light client
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job:
+      name: l1-light-client
+      vars:
+        execution_rpc: "{{ workloads_light_execution_rpc }}"
+        consensus_rpc: "{{ workloads_light_consensus_rpc }}"
+        checkpoint: "{{ workloads_light_checkpoint }}"
+        network: "{{ workloads_light_network }}"
+  when: workloads_light_execution_rpc | length > 0
+
+- name: Deploy pipeline followers
+  ansible.builtin.include_tasks: job.yml
+  loop:
+    - name: validator
+      wait: false
+      vars:
+        l1_rpc_url: "{{ 'http://' ~ workloads_aux_ip ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0 else '' }}"
+        lockbox_address: "{{ workloads_lockbox_address if workloads_light_execution_rpc | length > 0 else '' }}"
+    - name: da-watcher
+      wait: false
+      vars:
+        lockbox_address: "{{ workloads_lockbox_address }}"
+  loop_control:
+    loop_var: workloads_job
+    label: "{{ workloads_job.name }}"
+
+- name: Wait for pipeline followers
+  ansible.builtin.include_tasks: wait.yml
+  loop: [sequencer, executor, validator, da-watcher]
+  loop_control:
+    loop_var: workloads_wait_job
+  when: not ansible_check_mode
+
+- name: Deploy the live batcher
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job:
+      name: batcher
+      vars:
+        settlement_address: "{{ workloads_resolved_settlement }}"

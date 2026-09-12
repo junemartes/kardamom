@@ -1,0 +1,70 @@
+---
+- name: Build image with BuildKit for {{ images_item.name }}
+  community.docker.docker_image_build:
+    docker_cli: "{{ images_docker_binary }}"
+    cli_context: "{{ images_context.stdout if lookup('env', 'DOCKER_HOST') | length == 0 else omit }}"
+    name: "{{ images_registry }}/kardamom-{{ images_item.name }}"
+    tag: "{{ images_tag }}"
+    path: "{{ images_item.path }}"
+    dockerfile: "{{ images_item.dockerfile }}"
+    args: "{{ images_item.args | default({}) }}"
+    rebuild: always # Re-evaluate changed source; BuildKit still reuses unchanged layers.
+  register: images_build
+
+- name: Require the build result in the local engine
+  ansible.builtin.assert:
+    that: images_build.image.Id is defined
+    fail_msg: Use a BuildKit builder that loads its result into the local Docker engine.
+
+- name: Transfer image to the registry node when required by Docker Desktop
+  when: images_push_node | length > 0
+  block:
+    - name: Export the built image
+      ansible.builtin.command:
+        argv: ["{{ images_docker_binary }}", image, save, --output, "{{ images_staging.path }}/image.tar", "{{ images_ref }}"]
+      changed_when: true
+
+    - name: Copy the archive to the registry node
+      ansible.builtin.command:
+        argv: ["{{ images_docker_binary }}", cp, "{{ images_staging.path }}/image.tar", "{{ images_node_archive }}"]
+      changed_when: true
+
+    - name: Load the archive into the registry node's Docker engine
+      ansible.builtin.command:
+        argv: "{{ images_node_command + ['docker', 'image', 'load', '--input', images_node_archive_path] }}"
+      changed_when: true
+
+  always:
+    - name: Remove the archive from the registry node
+      ansible.builtin.command:
+        argv: "{{ images_node_command + ['rm', '-f', images_node_archive_path] }}"
+      changed_when: false
+
+# docker_image_push returns an inspection taken BEFORE pushing and discards
+# the push response's digest. Capture this exact push via argv (no shell),
+# rather than trusting RepoDigests[0] or looking up a mutable registry tag.
+- name: Push the exact built image for {{ images_item.name }}
+  ansible.builtin.command:
+    argv: "{{ (images_node_command + ['docker'] if images_push_node | length > 0 else [images_docker_binary]) + ['push', images_ref] }}"
+  register: images_push
+  changed_when: true
+
+- name: Capture the digest reported by the push
+  ansible.builtin.set_fact:
+    images_push_digests: >-
+      {{ (images_push.stdout ~ '\n' ~ images_push.stderr) | regex_findall('digest: (sha256:[0-9a-f]{64})(?:\s|$)') | unique | list }}
+
+- name: Require one unambiguous digest from the completed push
+  ansible.builtin.assert:
+    that: images_push_digests | length == 1
+    fail_msg: The Docker push did not report one valid digest; the previous release manifest is unchanged.
+
+- name: Sign the pushed image by digest
+  ansible.builtin.command:
+    argv: ["{{ cosign_resolved_binary }}", sign, --yes, --allow-http-registry, "{{ images_ref }}@{{ images_push_digests[0] }}"]
+  changed_when: true
+  when: images_sign | bool
+
+- name: Record the immutable reference
+  ansible.builtin.set_fact:
+    images_records: "{{ images_records + [images_item.name ~ ' ' ~ images_ref ~ '@' ~ images_push_digests[0]] }}"

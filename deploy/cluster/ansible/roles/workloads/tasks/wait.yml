@@ -1,0 +1,26 @@
+---
+- name: Read current job version for {{ workloads_wait_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_wait_job }}?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_current_job
+
+- name: Wait for all desired allocations of {{ workloads_wait_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_wait_job }}/allocations?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_allocations
+  until: >-
+    (workloads_allocations.json | default([])
+     | selectattr('TaskGroup', 'equalto', item.Name)
+     | selectattr('JobVersion', 'equalto', workloads_current_job.json.Version)
+     | selectattr('DesiredStatus', 'equalto', 'run')
+     | selectattr('ClientStatus', 'equalto', 'running') | list | length)
+    >= (workloads_system_count | int if workloads_jobs[workloads_wait_job].Type == 'system' else item.Count | int)
+  retries: "{{ workloads_job.retries | default(workloads_poll_retries) }}"
+  delay: "{{ workloads_poll_delay }}"
+  loop: "{{ workloads_jobs[workloads_wait_job].TaskGroups }}"
+  loop_control:
+    label: "{{ workloads_wait_job }}/{{ item.Name }}"

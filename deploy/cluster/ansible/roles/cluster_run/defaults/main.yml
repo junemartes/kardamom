@@ -1,0 +1,8 @@
+---
+cluster_run_operation: up
+cluster_run_keep: "{{ lookup('ansible.builtin.env', 'KEEP') | default('0', true) == '1' }}"
+cluster_run_tests: true
+cluster_run_lock: /tmp/kardamom-cluster-locks/deploy.lock.d
+cluster_run_dir: "{{ playbook_dir }}/.."
+# Explicit extra vars for the child convergence playbook. Environment is inherited.
+cluster_run_vars: {}

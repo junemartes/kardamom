@@ -30,7 +30,7 @@
 # ingress1 VM IP.
 #
 # This job uses file() for its templates, so submit it from the
-# deploy/cluster/ directory. scripts/deploy.sh does this.
+# deploy/cluster/ directory. ansible/deploy.yml does this.
 
 variable "ack_policy" {
   type        = string
@@ -38,7 +38,7 @@ variable "ack_policy" {
   default     = "on-offer"
 }
 
-# Digest-pinned image. scripts/deploy.sh
+# Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests), so the task runs exactly the bytes
 # that deploy pushed. The empty default falls back to the mutable :dev

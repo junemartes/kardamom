@@ -4,7 +4,7 @@
 # All variables derive from group_vars/all.yml (single source of truth).
 
 - name: Provision base substrate on all cluster nodes
-  hosts: all
+  hosts: "{{ provision_hosts | default('all') }}"
   become: true
   roles:
     - common
