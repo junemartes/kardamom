@@ -469,9 +469,10 @@ impl Recorder {
 
         let mut logged_waiting = false;
         while !stop.is_cancelled() {
-            match Self::poll_recording(archive, stream_id, kind, &mut logged_waiting) {
-                ControlFlow::Break(id) => return Some(id),
-                ControlFlow::Continue(()) => {}
+            if let ControlFlow::Break(id) =
+                Self::poll_recording(archive, stream_id, kind, &mut logged_waiting)
+            {
+                return Some(id);
             }
         }
         None
@@ -491,19 +492,25 @@ impl Recorder {
                 info!(recording_id = id, ?kind, "recording ready");
                 return ControlFlow::Break(id);
             }
-            Ok(None) => {
-                if !*logged_waiting {
-                    info!(
-                        ?kind,
-                        "waiting for a publisher on the stream so the recording materializes"
-                    );
-                    *logged_waiting = true;
-                }
-            }
+            Ok(None) => Self::log_waiting_once(logged_waiting, kind),
             Err(e) => warn!(error = %e, ?kind, "list_recordings_for_uri failed; retrying"),
         }
         std::thread::sleep(Duration::from_millis(500));
         ControlFlow::Continue(())
+    }
+
+    /// Log the "waiting for a publisher" message once, then latch
+    /// `logged`, so [`Self::poll_recording`]'s retry loop stays quiet on
+    /// later polls.
+    fn log_waiting_once(logged: &mut bool, kind: RecorderKind) {
+        if *logged {
+            return;
+        }
+        info!(
+            ?kind,
+            "waiting for a publisher on the stream so the recording materializes"
+        );
+        *logged = true;
     }
 
     #[must_use]
