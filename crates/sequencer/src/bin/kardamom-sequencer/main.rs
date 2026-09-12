@@ -256,8 +256,6 @@ impl Handles {
         plane: &mut StreamPlane,
         cfg: &SequencerConfig,
     ) -> Result<Self> {
-        let channels = plane.channels().clone();
-        let channels = &channels;
         let own = Self::open_lane(rt, plane, cfg.lane())?;
         let old = cfg
             .extra_lanes
@@ -266,9 +264,11 @@ impl Handles {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             data_subs: LaneSubscriptions::new(own, old),
-            deposits_sub: TxDepositsSubscriberHandle::open(rt, channels)
+            deposits_sub: plane
+                .subscriber::<TxDepositsSubscriberHandle>(rt)
                 .context("open TxDepositsSubscriberHandle")?,
-            remote_epochs_sub: TxRemoteEpochsSubscriberHandle::open(rt, channels)
+            remote_epochs_sub: plane
+                .subscriber::<TxRemoteEpochsSubscriberHandle>(rt)
                 .context("open TxRemoteEpochsSubscriberHandle")?,
             errors_pub: plane
                 .publisher::<TxErrorsPublisherHandle>(rt)
@@ -532,10 +532,14 @@ async fn main() -> anyhow::Result<()> {
     // subscription on the main `rt`.
     let cluster_rt =
         AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
+    let mut cluster_cfg = cfg.cluster.to_live();
+    if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
+        cluster_cfg.ingress_endpoints = endpoints;
+    }
     let (cluster_guard, cluster_pub, cluster_egress) =
         kardamom_sequencer::outbound::cluster::cluster_ref_publisher_with_egress(
             cluster_rt,
-            cfg.cluster.to_live(),
+            cluster_cfg,
         )
         .context("connect cluster ref publisher")?;
     tracing::info!("kardamom-sequencer: tx_ordering via Aeron Cluster");

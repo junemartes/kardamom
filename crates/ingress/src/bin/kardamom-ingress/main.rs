@@ -349,9 +349,13 @@ impl IngressService {
     fn spawn_cluster_watermark(
         &self,
         subscription: &LiveIngressSubscription,
+        ingress_endpoints: Option<String>,
     ) -> Result<LiveCluster> {
         let args = &self.args;
         let mut live = self.file_cfg.cluster.to_live();
+        if let Some(endpoints) = ingress_endpoints {
+            live.ingress_endpoints = endpoints;
+        }
         if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
             live.egress_channel = format!("aeron:udp?endpoint={ep}");
         }
@@ -406,7 +410,8 @@ impl IngressService {
 
         let opened = self.open_aeron_side().await?;
         let cluster_guard = if cfg.ack_policy.requires_quorum() {
-            Some(self.spawn_cluster_watermark(&opened.subscription)?)
+            let members = opened.plane.cluster_ingress_endpoints().await?;
+            Some(self.spawn_cluster_watermark(&opened.subscription, members)?)
         } else {
             None
         };

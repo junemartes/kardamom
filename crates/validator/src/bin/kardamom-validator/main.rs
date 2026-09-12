@@ -45,7 +45,8 @@ async fn main() -> Result<()> {
     let ready = Startup::init(args)
         .await?
         .open_state()?
-        .open_streams()?
+        .open_streams()
+        .await?
         .spawn_pumps()?
         .spawn_writer()?
         .spawn_attester()?

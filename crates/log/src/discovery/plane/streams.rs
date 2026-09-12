@@ -8,10 +8,56 @@ use crate::aeron_live::{
     AeronRuntime, TxDataPublisherHandle, TxDataSubscriberHandle, TxDataSubscription,
     TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle, TxReceiptsSubscriberHandle,
 };
+use crate::aeron_live::{PubHandle, TypedSubscription};
 use crate::discovery::record::Topic;
 use crate::error::LogError;
+use kardamom_types::BalFrame;
 
 impl StreamPlane {
+    /// The `tx_bal` publisher, as the raw handle the executor's BAL
+    /// thread drives.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication fails to open or register.
+    pub async fn tx_bal_publisher(&mut self, rt: &AeronRuntime) -> Result<PubHandle, LogError> {
+        let key = self.tx_bal_key();
+        match &mut self.discovered {
+            None => rt.open_publication(
+                &self.channels.tx_bal_channel,
+                self.channels.tx_bal_stream_id,
+            ),
+            Some(d) => d.open_publication(rt, key).await,
+        }
+    }
+
+    /// The `tx_bal` subscription the validator's BAL pump reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription fails to open.
+    pub fn tx_bal_subscription(
+        &mut self,
+        rt: &AeronRuntime,
+    ) -> Result<TypedSubscription<BalFrame>, LogError> {
+        let key = self.tx_bal_key();
+        match &mut self.discovered {
+            None => rt.open_subscription::<BalFrame>(
+                &self.channels.tx_bal_channel,
+                self.channels.tx_bal_stream_id,
+            ),
+            Some(d) => d.open_subscription(rt, key),
+        }
+    }
+
+    fn tx_bal_key(&self) -> StreamKey {
+        StreamKey {
+            topic: Topic::TxBal,
+            stream_id: self.channels.tx_bal_stream_id,
+            lane: None,
+        }
+    }
+
     /// The `tx_receipts` publisher: the receipt stream and the boundary
     /// side-stream. Static: the per-replica MDS endpoint when the
     /// channels enable MDS, else the shared channel. Discovered: two

@@ -20,10 +20,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::catalog::{Catalog, RegistrationSpec};
+use super::catalog::{Catalog, Query, QueryResult, RegistrationSpec};
 use super::endpoint::{MANUAL_SUBSCRIPTION_URI, PortAllocator, advertise_ip, publication_uri};
 use super::reconcile::{DestinationPort, Reconciler};
-use super::record::{PUBLISHER_SERVICE, PublisherRecord, Scope, Topic};
+use super::record::{
+    ARCHIVE_SERVICE, CLUSTER_MEMBER_SERVICE, ClusterMemberRecord, PUBLISHER_SERVICE,
+    PublisherRecord, Scope, Topic,
+};
 use super::registration::Registration;
 use super::watch::{Membership, MembershipWatch, WatchTiming};
 use super::{Instance, catalog_from_config, scope_from_config};
@@ -168,15 +171,36 @@ impl Discovered {
     /// Start a watch over the publisher records matching `filter`, and
     /// return its membership receiver.
     fn watch(&mut self, filter: BTreeMap<String, String>) -> watch::Receiver<Membership> {
+        self.watch_service(PUBLISHER_SERVICE, filter)
+    }
+
+    /// Start a watch over the records of `service` matching `filter`.
+    fn watch_service(
+        &mut self,
+        service: &str,
+        filter: BTreeMap<String, String>,
+    ) -> watch::Receiver<Membership> {
         let (watch, membership) = MembershipWatch::new(
             self.catalog.clone(),
-            PUBLISHER_SERVICE.into(),
+            service.into(),
             filter,
             WatchTiming::from_config(&self.cfg),
             self.cancel.clone(),
         );
         self.tasks.push(tokio::spawn(watch.run()));
         membership
+    }
+
+    /// One immediate read of the records of `service` in this scope.
+    async fn read_service(&self, service: &str) -> Result<QueryResult, LogError> {
+        self.catalog
+            .query(&Query {
+                service: service.into(),
+                meta_equals: self.scope.meta(),
+                index: 0,
+                wait: Duration::ZERO,
+            })
+            .await
     }
 
     fn start_reconcile(&mut self, port: Destinations, key: StreamKey) {
@@ -282,6 +306,9 @@ impl ReconcileTask {
 
 mod streams;
 
+#[cfg(test)]
+mod tests;
+
 /// The seam every service opens its channels through. See the module
 /// doc.
 pub struct StreamPlane {
@@ -379,6 +406,49 @@ impl StreamPlane {
         let d = self.discovered.as_mut()?;
         let filter = topic_filter(topic, &d.scope);
         Some(d.watch(filter))
+    }
+
+    /// Watch every archive record in this scope. `None` on a static
+    /// plane. The refetch client reads its endpoints from it.
+    pub fn watch_archives(&mut self) -> Option<watch::Receiver<Membership>> {
+        let d = self.discovered.as_mut()?;
+        let filter = d.scope.meta();
+        Some(d.watch_service(ARCHIVE_SERVICE, filter))
+    }
+
+    /// The Aeron Cluster member ingress endpoints the catalog lists, as
+    /// the `memberId=host:port,...` string the cluster client takes.
+    /// `None` on a static plane, and `None` when the catalog lists no
+    /// member, so the static `[cluster]` endpoints apply. Resolved once:
+    /// the client learns later endpoint changes from the cluster itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog is unreachable or answers with a
+    /// malformed record.
+    pub async fn cluster_ingress_endpoints(&self) -> Result<Option<String>, LogError> {
+        let Some(d) = &self.discovered else {
+            return Ok(None);
+        };
+        let members = d
+            .read_service(CLUSTER_MEMBER_SERVICE)
+            .await?
+            .entries
+            .iter()
+            .map(ClusterMemberRecord::from_entry)
+            .collect::<Result<Vec<_>, _>>()?;
+        if members.is_empty() {
+            return Ok(None);
+        }
+        let mut members = members;
+        members.sort_by_key(|m| m.member_id);
+        let joined = members
+            .iter()
+            .map(|m| format!("{}={}", m.member_id, m.ingress))
+            .collect::<Vec<_>>()
+            .join(",");
+        info!(endpoints = %joined, "discovery: cluster member ingress endpoints");
+        Ok(Some(joined))
     }
 
     /// Open publisher handle `H`.

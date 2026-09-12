@@ -63,12 +63,12 @@ struct WriterAdapters {
 /// Seed genesis into `env` if not already seeded, spawn the state
 /// writer and its adapters, open the `tx_bal` publication, and start the
 /// BAL publisher thread.
-fn spawn_writer_and_bal(
+async fn spawn_writer_and_bal(
     args: &Args,
     env: kardamom_state::StateEnv,
     genesis: Option<&kardamom_types::Genesis>,
     rt_pub: &AeronRuntime,
-    channels: &kardamom_log::config::ChannelsConfig,
+    plane: &mut StreamPlane,
 ) -> Result<WriterAdapters> {
     // Seed genesis once into a fresh env (a no-op if already seeded, for
     // example on recovery). This must run before `StateWriter::spawn`, so
@@ -104,8 +104,9 @@ fn spawn_writer_and_bal(
     // validators can cross-check their re-execution. This publishes on
     // the isolated publication runtime (`rt_pub`), like receipts, so it
     // never stalls the subscription poll.
-    let bal_pub = rt_pub
-        .open_publication(&channels.tx_bal_channel, channels.tx_bal_stream_id)
+    let bal_pub = plane
+        .tx_bal_publisher(rt_pub)
+        .await
         .context("open tx_bal publication")?;
     // EIP-7928 BAL publisher. The exec thread hands off each block's
     // captured Bal and receipts-free delta. This thread encodes and
@@ -163,7 +164,6 @@ fn load_file_config(args: &Args) -> Result<ExecutorFileConfig> {
 /// The resolved log config, the stream plane, and the two Aeron
 /// runtimes: everything [`main`] opens before it touches state.
 struct Transport {
-    channels: kardamom_log::config::ChannelsConfig,
     aeron_cfg: kardamom_log::config::AeronConfig,
     plane: StreamPlane,
     rt: AeronRuntime,
@@ -198,12 +198,47 @@ fn open_transport(args: &Args) -> Result<Transport> {
     let rt_pub =
         AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
     Ok(Transport {
-        channels: log_cfg.channels,
         aeron_cfg,
         plane,
         rt,
         rt_pub,
     })
+}
+
+/// The one `tx_ordering` subscription, always the Aeron Cluster (Raft)
+/// egress. The cluster has already deduped and totally ordered the
+/// stream, and exposes a blocking `next()`, so no async-to-sync bridge is
+/// needed. Leader failover and reconnect, including crash-recovery replay
+/// of the canonical stream, are handled inside the cluster client, so the
+/// reader never sees an image rotation. The executor's skip-count and
+/// `DedupWindow` give idempotency across any reconnect overlap. The
+/// cluster-session guard (`LiveCluster`) must outlive the executor loop,
+/// so the caller binds it in its outer scope.
+///
+/// The member ingress endpoints come from the catalog when discovery
+/// lists them, else from the static `[cluster]` section. The executor is
+/// the chosen emitter of the `kardamom_sealer_*` re-export, on by default
+/// in the shared subscription.
+async fn connect_cluster(
+    args: &Args,
+    file_cfg: &ExecutorFileConfig,
+    plane: &StreamPlane,
+    start: &kardamom_engine::ResumePoint,
+) -> Result<(
+    kardamom_cluster_adapter::LiveCluster,
+    bin_support::LiveTxOrderingSub,
+)> {
+    let mut cluster_cfg = file_cfg.cluster.to_live();
+    if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
+        cluster_cfg.ingress_endpoints = endpoints;
+    }
+    let connected = bin_support::connect_cluster_ordering(
+        args.aeron_dir.as_deref(),
+        cluster_cfg,
+        bin_support::cluster_replay_cursor(start),
+    )?;
+    tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
+    Ok(connected)
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -221,7 +256,6 @@ async fn main() -> Result<()> {
     );
 
     let Transport {
-        channels,
         aeron_cfg,
         mut plane,
         rt,
@@ -246,36 +280,15 @@ async fn main() -> Result<()> {
     // archives.
     let tx_data_subs = bin_support::open_tx_data_subs(&rt, &mut plane)?;
     let join_recovery = bin_support::archive_join_recovery(
-        &channels,
+        &mut plane,
         &aeron_cfg,
         args.aeron_dir.as_deref(),
         args.archive_control_response_endpoint.as_deref(),
         args.replay_destination_endpoint.as_deref(),
     );
 
-    // One tx_ordering subscription, always the Aeron Cluster (Raft)
-    // egress. The cluster has already deduped and totally ordered the
-    // stream, and exposes a blocking `next()`, so no async-to-sync bridge
-    // is needed. Leader failover and reconnect, including crash-recovery
-    // replay of the canonical stream, are handled inside the cluster
-    // client, so the reader never sees an image rotation. The executor's
-    // skip-count and `DedupWindow` give idempotency across any reconnect
-    // overlap. (The single-sealer restart `BoundaryMisaligned` case
-    // cannot occur here: the cluster continues the committed count and
-    // block across leader failover.) The cluster-session guard
-    // (`LiveCluster`) must outlive the executor loop, so bind the guard
-    // in the outer scope. It is dropped only after the `join` await
-    // below.
-    let (cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
-        args.aeron_dir.as_deref(),
-        file_cfg.cluster.to_live(),
-        bin_support::cluster_replay_cursor(&start),
-    )?;
-    tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
-    // The executor is the chosen emitter of the kardamom_sealer_*
-    // re-export (on by default in the shared subscription; the validator
-    // suppresses it).
-    let tx_ordering_sub = cluster_sub;
+    let (cluster_guard, tx_ordering_sub) =
+        connect_cluster(&args, &file_cfg, &plane, &start).await?;
 
     let tx_receipts_pub = wiring::open_tx_receipts_pub(&rt_pub, &mut plane, &args).await?;
 
@@ -288,7 +301,7 @@ async fn main() -> Result<()> {
         footprint_shadow,
         _bal_publisher,
         _nonce_query,
-    } = spawn_writer_and_bal(&args, env, genesis.as_ref(), &rt_pub, &channels)?;
+    } = spawn_writer_and_bal(&args, env, genesis.as_ref(), &rt_pub, &mut plane).await?;
 
     // `verify_record_identity` stays off here by decision, not omission.
     // With the validator checking every record, a forged envelope

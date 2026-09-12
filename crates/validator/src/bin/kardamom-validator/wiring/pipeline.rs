@@ -19,7 +19,7 @@ impl Streamed {
     pub(crate) fn spawn_pumps(mut self) -> Result<Self> {
         crate::pumps::spawn_bal_pump(
             &self.opened.base.rt,
-            &self.opened.base.channels,
+            &mut self.opened.base.plane,
             self.streams.bals.clone(),
             self.streams.claims.clone(),
             self.streams
