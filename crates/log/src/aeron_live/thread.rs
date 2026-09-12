@@ -117,9 +117,11 @@ pub(super) fn run_aeron_thread(
 }
 
 /// Live MDS destination attachment, keyed by `(sub_id, uri)` for removal.
-/// `_handle`, the rusteron `AeronAsyncDestination`, removes its
+/// `handle`, the rusteron `AeronAsyncDestination`, removes its
 /// destination when dropped, so this must be retained for as long as the
-/// attachment should stay active.
+/// attachment should stay active. That drop passes the driver the raw
+/// pointer of `uri_c`, the C string the attach was made with, so `uri_c`
+/// must outlive `handle`: fields drop in declaration order.
 struct Destination {
     sub_id: u32,
     uri: String,
@@ -127,6 +129,8 @@ struct Destination {
     // command to the driver. The field is never read; its only purpose
     // is the drop.
     _handle: rusteron_client::AeronAsyncDestination,
+    // Read by the driver through `_handle`'s drop. Never read here.
+    _uri_c: std::ffi::CString,
 }
 
 /// The Aeron thread's whole state: every `!Send` rusteron object it owns,
@@ -137,9 +141,12 @@ struct AeronThread {
     aeron: Rc<AeronClient>,
     cmd_rx: CbReceiver<RuntimeCmd>,
     pubs: Vec<PubEntry>,
+    /// Declared before `subs`: a destination detaches through its
+    /// subscription, so every destination must drop while its
+    /// subscription is still open.
+    dests: Vec<Destination>,
     subs: Vec<SubEntry>,
     pending: VecDeque<PendingPublish>,
-    dests: Vec<Destination>,
     /// Escalating idle wait for the busy branch: base 100 microseconds (the
     /// established sub-poll/retry cadence), cap 1 ms (the empty-branch
     /// cadence), grace 10 (about 1 ms of consecutive emptiness before the
@@ -356,9 +363,9 @@ impl AeronThread {
     }
 
     /// Detach a source endpoint from an MDS subscription. Dropping the
-    /// retained `AeronAsyncDestination` issues the async remove command to
-    /// the driver. Best effort: a removed source's image also times out
-    /// on its own.
+    /// retained [`Destination`] issues the async remove command to the
+    /// driver. Best effort: a removed source's image also times out on
+    /// its own.
     fn cmd_remove_destination(&mut self, sub_id: u32, uri: &str) -> Result<(), LogError> {
         let before = self.dests.len();
         self.dests.retain(|d| !(d.sub_id == sub_id && d.uri == uri));
@@ -456,6 +463,7 @@ impl AeronThread {
             sub_id,
             uri: uri.to_string(),
             _handle: dest,
+            _uri_c: c,
         });
         Ok(())
     }
