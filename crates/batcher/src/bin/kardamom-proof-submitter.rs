@@ -2,7 +2,7 @@
 //! `KardamomProofOracle`, aligned with the settlement's L1-as-truth batch
 //! cursor. See the no-std-exec-core spec.
 //!
-//! A thin poster over [`kardamom_batcher::submit_next_proof`]. On each
+//! A thin poster over [`kardamom_batcher::ProofSubmitter`]. On each
 //! tick, it asks the oracle for the next unproven batch, looks for the
 //! prover's output files (`--proofs-dir/batch-<first>-<last>/`, the
 //! zk-host layout), and submits when both exist. Submission is

@@ -58,3 +58,5 @@ pub use threads::{ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_remote;

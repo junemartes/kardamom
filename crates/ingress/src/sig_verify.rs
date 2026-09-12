@@ -202,6 +202,15 @@ impl FlushLoop {
         } else {
             self.parallelism.min(batch_len).get()
         };
+        if workers == 1 {
+            let _ = tokio::task::spawn_blocking(move || {
+                batch
+                    .into_iter()
+                    .for_each(VerifyRequest::recover_and_respond);
+            })
+            .await;
+            return;
+        }
         // This uses a shared cursor, not a split. `split_off` reallocates
         // and copies the remaining tail once per chunk. Handing every
         // worker the same iterator moves each request exactly once, and
