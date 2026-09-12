@@ -126,9 +126,13 @@ group_is_gone() { [ "$(count_running_group "$1" "$2")" = "0" ] && echo ok; }
 case_lookup_blackout() {
   local node="kardamom-sequencer-0" ip="192.168.56.21" port=9001
   local executors="192.168.56.41 192.168.56.42 192.168.56.43"
-  local base_fail base_ok e
-  base_fail="$(seq_metric_where "${ip}" "${node}" "${port}" kardamom_sequencer_nonce_lookups_total 'outcome="timeout"' || true)"
-  base_fail=$(( ${base_fail:-0} + $(seq_metric_where "${ip}" "${node}" "${port}" kardamom_sequencer_nonce_lookups_total 'outcome="error"' || echo 0) ))
+  local e
+  # Both phases hard-kill the replica, and the replacement is a new
+  # process whose counters start at zero. So the baseline for each wait
+  # is zero, not the killed process's count. A baseline read from the
+  # old process fails the wait when it is 1 or more: an answered lookup
+  # is a one-off (the floor is known after it), so the newborn's "ok"
+  # count stays at exactly one and never rises past the old count.
   for e in ${executors}; do
     docker exec "${node}" ip route add blackhole "${e}/32" \
       || fail "lookup-blackout: could not blackhole ${e} on ${node}"
@@ -143,8 +147,9 @@ case_lookup_blackout() {
     assert_progress
     assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
     wait_until "cold replica's lookups failed with no executor reachable" 120 \
-      lookups_failed_past "${ip}" "${node}" "${port}" "${base_fail}"
+      lookups_failed_past "${ip}" "${node}" "${port}" 0
   } || failed=1
+  lookup_snapshot "${ip}" "${node}" "${port}" "lookup-blackout: blackout phase"
   restore_routes
   [ "${failed}" = "0" ] || fail "lookup-blackout: blackout phase failed"
   # Phase 2: freeze the twin, so the newborn cannot learn the sender's
@@ -153,19 +158,54 @@ case_lookup_blackout() {
   twin="$(inner_container "${twin_node}" sequencer-0)"
   [ -n "${twin}" ] || fail "lookup-blackout: no inner sequencer-0 container on ${twin_node}"
   log "lookup-blackout: routes restored; freezing the twin ${twin} on ${twin_node}, then hard-killing the replica again for an answered lookup"
-  base_ok="$(seq_metric_where "${ip}" "${node}" "${port}" kardamom_sequencer_nonce_lookups_total 'outcome="ok"' || echo 0)"
   freeze_verified "${twin_node}" "${twin}" "${port}" lookup-blackout "${twin_ip}"
   failed=0
   {
     inject_hard "${node}" sequencer-0
     # The frozen twin still counts as running for Nomad.
     assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
-    wait_until "cold replica's lookup answered" 120 lookups_ok_past "${ip}" "${node}" "${port}" "${base_ok:-0}"
+    wait_until "cold replica's lookup answered" 120 lookups_ok_past "${ip}" "${node}" "${port}" 0
   } || failed=1
+  lookup_snapshot "${ip}" "${node}" "${port}" "lookup-blackout: answered phase"
+  ingress_snapshot "lookup-blackout: answered phase"
+  [ "${failed}" = "0" ] || load_tail "lookup-blackout: answered phase"
   thaw_container "${twin_node}" "${twin}" \
     || log "lookup-blackout: SIGCONT on the twin failed (replaced mid-freeze?)"
   [ "${failed}" = "0" ] || fail "lookup-blackout: answered-lookup phase failed"
   assert_progress
+}
+# One log line of a replica's nonce and lookup counters. The waits above
+# watch one counter. On a red run, this line tells the cases apart: no
+# park at all (tx_ingested and tx_buffered_future stay at zero), a park
+# with the floor already known (requests stay at zero), or a lookup that
+# ran (requests and lookups rise). Never fails the case.
+lookup_snapshot() { # <ip> <node> <port> <ctx>
+  local body
+  body="$(fetch_metrics "$1" "$2" "$3" || true)"
+  [ -n "${body}" ] || { log "$4: no metrics from $2:$3"; return 0; }
+  log "$4: $(printf '%s\n' "${body}" | awk '
+    /^kardamom_sequencer_(tx_ingested|tx_buffered_future|tx_dropped_past|tx_published_to_b|pending_evictions|pending_expired|nonce_lookup_requests|nonce_lookups|wrong_shard_dropped|receipt_floor_advances)_total/ ||
+    /^kardamom_sequencer_(nonce_lookups_in_flight|pending_depth|receipt_floor_senders)[{ ]/ {
+      sub(/^kardamom_sequencer_/, "", $1); printf "%s=%s ", $1, $NF }')"
+}
+# One log line per ingress replica: received, accepted, and rejected by
+# reason. A stalled lane shows up here as timeouts or as
+# partition-unavailable rejects. Never fails the case.
+ingress_snapshot() { # <ctx>
+  local n body
+  for n in "${INGRESS_NODES[@]}"; do
+    body="$(fetch_metrics '' "${n}" "${INGRESS_PORT}" || true)"
+    log "$1: ${n}: $(printf '%s\n' "${body}" | awk '
+      /^kardamom_ingress_(tx_received|tx_accepted|tx_rejected)_total/ {
+        sub(/^kardamom_ingress_/, "", $1); printf "%s=%s ", $1, $NF }')"
+  done
+}
+# The tail of the background load's log. `logf` is run_case's local,
+# visible here through bash's dynamic scope. Silent when unset.
+load_tail() { # <ctx>
+  [ -n "${logf:-}" ] && [ -r "${logf}" ] || return 0
+  log "$1: kardamom-load log tail (${logf})"
+  tail -n 40 "${logf}"
 }
 lookups_failed_past() { # <ip> <node> <port> <baseline>
   local t o
