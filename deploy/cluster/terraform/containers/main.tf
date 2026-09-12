@@ -30,6 +30,13 @@ locals {
     }
   ]...)
 
+  # The address plan: node names in sorted order, from address_offset up.
+  # A node keeps its address across a container restart, which the
+  # cluster members and every cached name resolution depend on. This
+  # root is the one place that assigns addresses; everything else reads
+  # the node contract or resolves a name.
+  names = sort(keys(local.nodes))
+
   volumes = toset(["docker", "containerd"])
   ready   = "s=$(systemctl is-system-running); [ \"$s\" = running ] || [ \"$s\" = degraded ]"
 }
@@ -121,7 +128,8 @@ resource "docker_container" "node" {
   }
 
   networks_advanced {
-    name = docker_network.this.name
+    name         = docker_network.this.name
+    ipv4_address = cidrhost(var.subnet, var.address_offset + index(local.names, each.key))
   }
 
   labels {
