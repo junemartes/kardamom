@@ -366,3 +366,39 @@ fn the_deployed_channels_template_loads() {
     let cfg = LogConfig::from_toml_path(Path::new(path)).expect("deployed channels.toml.tpl loads");
     assert_eq!(cfg.channels.tx_receipts_endpoint_base_port, None);
 }
+
+#[test]
+fn discovery_section_parses_and_validates() {
+    let cfg = load(
+        r#"
+            [discovery]
+            enabled = true
+            cluster_id = "dev"
+            chain_id = 412346
+            advertise_interface = "192.168.56.0/24"
+            "#,
+    )
+    .expect("a complete discovery section loads");
+    assert!(cfg.discovery.enabled);
+    assert_eq!(
+        cfg.discovery.advertise_interface,
+        Some(InterfaceSelector::Network {
+            net: "192.168.56.0".parse().unwrap(),
+            prefix: 24
+        })
+    );
+    assert_eq!(cfg.discovery.consul_http_addr, "http://127.0.0.1:8500");
+}
+
+#[test]
+fn enabled_discovery_needs_a_cluster_id_and_an_interface() {
+    let no_cluster = load("[discovery]\nenabled = true\nadvertise_interface = \"eth1\"\n");
+    assert!(matches!(no_cluster, Err(LogError::Config(_))));
+    let no_interface = load("[discovery]\nenabled = true\ncluster_id = \"dev\"\n");
+    assert!(matches!(no_interface, Err(LogError::Config(_))));
+    let bad_prefix = load("[discovery]\nadvertise_interface = \"10.0.0.0/40\"\n");
+    assert!(matches!(bad_prefix, Err(LogError::Config(_))));
+    let disabled =
+        load("[discovery]\nenabled = false\n").expect("a disabled section needs nothing");
+    assert!(!disabled.discovery.enabled);
+}

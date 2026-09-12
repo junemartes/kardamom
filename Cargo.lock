@@ -3269,6 +3269,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "impl-codec"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4014,11 +4024,14 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "futures",
+ "if-addrs",
  "kardamom-types",
+ "reqwest 0.13.4",
  "rkyv",
  "rusteron-archive",
  "rusteron-client",
  "serde",
+ "serde_json",
  "tempfile",
  "testcontainers",
  "thiserror 2.0.18",
@@ -5531,6 +5544,7 @@ dependencies = [
  "rustls-platform-verifier 0.7.0",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls 0.26.4",

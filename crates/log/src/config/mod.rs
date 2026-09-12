@@ -10,9 +10,13 @@
 //! [`LogConfig::from_toml_path`] is the loader the service binaries use
 //! behind `--log-config`.
 
+mod discovery;
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+pub use discovery::{DiscoveryConfig, InterfaceSelector};
 
 use crate::error::LogError;
 
@@ -173,6 +177,7 @@ pub struct LogConfig {
     pub recorder_id: RecorderId,
     pub aeron: AeronConfig,
     pub channels: ChannelsConfig,
+    pub discovery: DiscoveryConfig,
 }
 
 impl LogConfig {
@@ -184,7 +189,8 @@ impl LogConfig {
     ///
     /// Returns an error if `path` cannot be read, if its contents do
     /// not parse as valid `LogConfig` TOML (including an unknown key),
-    /// or if the parsed config fails [`ChannelsConfig::validate`].
+    /// or if the parsed config fails [`ChannelsConfig::validate`] or
+    /// [`DiscoveryConfig::validate`].
     pub fn from_toml_path(path: &Path) -> Result<Self, LogError> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| LogError::Config(format!("read log-config {}: {e}", path.display())))?;
@@ -192,6 +198,7 @@ impl LogConfig {
             .map_err(|e| LogError::Config(format!("parse log-config {}: {e}", path.display())))?;
         cfg.channels
             .validate()
+            .and_then(|()| cfg.discovery.validate())
             .map_err(|e| LogError::Config(format!("invalid log-config {}: {e}", path.display())))?;
         Ok(cfg)
     }
