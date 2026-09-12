@@ -63,7 +63,7 @@
 # has_match are the assert primitives.
 #
 # Environment variables (all optional):
-#   RPC_URL                  ingress JSON-RPC      (default http://192.168.56.31:8545)
+#   RPC_URL                  ingress JSON-RPC      (default ingress-0 from Docker, :8545)
 #   LOAD_BIN                 kardamom-load path    (default <root>/target/release/kardamom-load)
 #   CHAOS_TPS                steady load rate      (default 50)
 #   CHAOS_CASE_S             per-case load window  (default 45)
@@ -103,6 +103,9 @@ source "${SCRIPT_DIR}/lib.sh"
 # ports, ...).
 # shellcheck source=deploy/cluster/scripts/lib-topology.sh
 source "${SCRIPT_DIR}/lib-topology.sh"
+# The cases index NODE_IP by node name. chaos.sh runs as its own process,
+# so it loads the arrays itself.
+topology_load
 # Scrape and parse (fetch_metrics bridge-first probe, prom_value).
 # shellcheck source=deploy/cluster/scripts/lib-metrics.sh
 source "${SCRIPT_DIR}/lib-metrics.sh"
@@ -113,7 +116,7 @@ source "${SCRIPT_DIR}/lib-metrics.sh"
 # shellcheck source=deploy/cluster/scripts/validator-verdict.sh
 source "${SCRIPT_DIR}/validator-verdict.sh"
 
-RPC_URL="${RPC_URL:-http://192.168.56.31:8545}"
+RPC_URL="${RPC_URL:-http://$(node_address kardamom-ingress-0):8545}"
 # Set the chain id explicitly. ingress eth_chainId returns a default
 # that differs from the cluster chain.
 CHAIN_ID="${CHAIN_ID:-412346}"

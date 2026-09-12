@@ -1,8 +1,22 @@
 # Managed by Ansible (roles/consul). Derives from group_vars/all.yml.
 datacenter   = "{{ datacenter }}"
+node_name    = "{{ kardamom_node }}"
 data_dir     = "/opt/consul"
 bind_addr    = "{{ node_ip }}"
 client_addr  = "{{ consul_client_addr }}"
+
+# Every node resolves cluster names through its own agent: the DNS
+# listener is the node resolver on the loopback port 53, and every name
+# outside the consul domain goes to the recursors in dns.hcl, the
+# resolvers the host had before. Nothing in the deploy names an address;
+# a dedicated node is <name>.node.{{ datacenter }}.consul and a service is
+# <service>.service.consul.
+addresses {
+  dns = "127.0.0.1"
+}
+ports {
+  dns = 53
+}
 # The join list is infrastructure DNS or the control node address, never
 # a Consul service record: Consul must not bootstrap through itself.
 retry_join   = {{ consul_retry_join | to_json }}

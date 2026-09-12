@@ -7,12 +7,18 @@ output "node_contract" {
     network = {
       name   = docker_network.this.name
       bridge = var.bridge_name
-      subnet = local.subnet
+      subnet = var.subnet
     }
     image = {
       name = docker_image.node.name
       id   = docker_image.node.image_id
     }
-    nodes = local.nodes
+    # The address is the one Docker assigned; it is read back after
+    # creation and changes on every replacement of the container.
+    nodes = {
+      for k, n in local.nodes : k => merge(n, {
+        ip = one([for net in docker_container.node[k].network_data : net.ip_address if net.network_name == docker_network.this.name])
+      })
+    }
   }
 }

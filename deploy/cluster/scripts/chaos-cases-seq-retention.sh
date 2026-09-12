@@ -36,8 +36,8 @@ SEQ_LAPSE_S="${SEQ_LAPSE_S:-30}"
 seqa_debug() {
   log "sequencer-lapse DEBUG: inner containers on kardamom-sequencer-0:"
   docker exec kardamom-sequencer-0 sh -c 'docker ps -a --format "{{.Names}} {{.Status}}" | head -6' 2>/dev/null || true
-  log "sequencer-lapse DEBUG: resync metrics at .21:9001:"
-  { fetch_metrics 192.168.56.21 kardamom-sequencer-0 9001 || true; } \
+  log "sequencer-lapse DEBUG: resync metrics at sequencer-0:9001:"
+  { fetch_metrics "${NODE_IP[kardamom-sequencer-0]}" kardamom-sequencer-0 9001 || true; } \
     | grep -E "resync|watermark|floor" | head -12 || true
   log "sequencer-lapse DEBUG: current sequencer-0 log tail:"
   docker exec kardamom-sequencer-0 sh -c \
@@ -81,7 +81,7 @@ run_sequencer_lapse() {
   # freeze_verified: the nested cgroup freezer inside a privileged DinD
   # node can silently no-op.
   log "sequencer-lapse: freezing ${inner} (SIGSTOP) for ${SEQ_LAPSE_S}s (lag_suspected=${l0} resync_entered=${r0} started=${started0:-?})"
-  freeze_verified kardamom-sequencer-0 "${inner}" 9001 sequencer-lapse 192.168.56.21
+  freeze_verified kardamom-sequencer-0 "${inner}" 9001 sequencer-lapse "${NODE_IP[kardamom-sequencer-0]}"
   sleep $(( SEQ_LAPSE_S - 3 ))
   thaw_container kardamom-sequencer-0 "${inner}" \
     || fail "sequencer-lapse: SIGCONT failed"
@@ -155,7 +155,7 @@ run_sequencer_lapse() {
   done
   log "sequencer-lapse: lapsed replica engaged resync (lag ${l0} -> ${l1:-?}, entered ${r0} -> ${r1:-?}, mode ${mode:-?})"
 
-  assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
+  assert_replica_healthy kardamom-sequencer-0 "${NODE_IP[kardamom-sequencer-0]}" 9001
   log "sequencer-lapse PASS: progress held, lag detected, resync engaged, replica healthy"
 }
 

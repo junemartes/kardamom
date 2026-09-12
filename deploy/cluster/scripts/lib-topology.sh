@@ -11,6 +11,7 @@
 #      other mirrors against it.
 #   2. topology_load(): builds the full generated node list (NODES plus
 #      NODE_IP, NODE_ROLE, NODE_TIER). It parses group_vars node_classes
+#      for the names and asks Docker for the addresses
 #      with the same no-PyYAML regex that run-tests.sh and smoke-load.sh
 #      each used to carry privately.
 #
@@ -45,7 +46,11 @@ if [ -n "${EXECUTOR_IPS:-}" ]; then
   # shellcheck disable=SC2128  # deliberate: env string -> array
   read -r -a EXECUTOR_IPS <<<"${EXECUTOR_IPS}"
 else
-  EXECUTOR_IPS=(192.168.56.41 192.168.56.42 192.168.56.43)
+  # The addresses the container network assigned, from Docker.
+  EXECUTOR_IPS=()
+  for _n in "${EXECUTOR_NODES[@]}"; do
+    EXECUTOR_IPS+=("$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${_n}" 2>/dev/null || true)")
+  done
 fi
 EXECUTOR_PORT="${EXECUTOR_PORT:-9004}"
 EXECUTOR_METRICS_PORT="${EXECUTOR_METRICS_PORT:-${EXECUTOR_PORT}}"
@@ -102,28 +107,40 @@ topology_load() {
   declare -ga NODES=()
   declare -gA NODE_IP=() NODE_ROLE=() NODE_TIER=()
   [ -f "${group_vars}" ] || return 1
-  local _name _ip _role _tier
-  while read -r _name _ip _role _tier; do
+  local _name _role _tier _ip
+  while read -r _name _role _tier; do
     [ -z "${_name}" ] && continue
     NODES+=("${_name}")
-    NODE_IP[${_name}]="${_ip}";     NODE_IP[kardamom-${_name}]="${_ip}"
     NODE_ROLE[${_name}]="${_role}"; NODE_ROLE[kardamom-${_name}]="${_role}"
     NODE_TIER[${_name}]="${_tier}"; NODE_TIER[kardamom-${_name}]="${_tier}"
+    # The address is the one the container network assigned. No file in
+    # the deploy tree names it; the scripts run on the Docker host, outside
+    # the cluster resolver, so they ask Docker.
+    _ip="$(node_address "kardamom-${_name}")" || _ip=""
+    NODE_IP[${_name}]="${_ip}";     NODE_IP[kardamom-${_name}]="${_ip}"
   done < <(python3 - "${group_vars}" <<'PY'
 # Parse node_classes with a plain regex. This avoids a PyYAML dependency,
 # the same approach scripts/check-contract.py uses, so it runs anywhere
 # python3 does. Class line:
-#   <name>: { count: N, ip_start: M, tier: T }
+#   <name>: { count: N, tier: T }
 import re, sys
 text = open(sys.argv[1]).read()
-pref = re.search(r'^ip_prefix:\s*"([\d.]+)"', text, re.M).group(1)
-for m in re.finditer(
-        r'^\s{2}(\w+):\s*\{\s*count:\s*(\d+),\s*ip_start:\s*(\d+),\s*tier:\s*(\w+)',
-        text, re.M):
-    cls, count, ip_start, tier = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+for m in re.finditer(r'^\s{2}(\w+):\s*\{\s*count:\s*(\d+),\s*tier:\s*(\w+)', text, re.M):
+    cls, count, tier = m.group(1), int(m.group(2)), m.group(3)
     for i in range(count):
-        print(f"{cls}-{i} {pref}.{ip_start + i} {cls} {tier}")
+        print(f"{cls}-{i} {cls} {tier}")
 PY
   )
   [ "${#NODES[@]}" -gt 0 ]
+}
+
+# The address of a node container on the cluster network, from Docker.
+# Prints nothing and returns 1 when the container does not exist.
+node_address() {
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1" 2>/dev/null
+}
+
+# The URL of the control node's Nomad API, for scripts on the Docker host.
+nomad_addr() {
+  echo "http://$(node_address kardamom-control-0):${NOMAD_HTTP_PORT:-4646}"
 }

@@ -54,8 +54,20 @@ variable "image_ref" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
+variable "l1_rpc" {
+  type        = string
+  description = "The L1 JSON-RPC endpoint. The default is the in-cluster anvil by its Consul service record."
+  default     = "http://anvil.service.consul:8546"
+}
+
 job "batcher" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {
@@ -101,7 +113,7 @@ job "batcher" {
       driver = "docker"
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-batcher:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-batcher:dev"
         # force_pull stays on for both paths; see the ingress job's
         # comment. The :dev fallback needs it. On the pinned path, the
         # 1.9.5 driver pulls the tag but resolves the image by digest,
@@ -135,7 +147,7 @@ job "batcher" {
           # the shared aux node.
           "--replay-destination-endpoint", "${meta.node_ip}:40133",
           "--archive-control-response-endpoint", "${meta.node_ip}:40143",
-          "--l1-rpc", "http://192.168.56.10:8546",
+          "--l1-rpc", var.l1_rpc,
           "--settlement", "${var.settlement_address}",
           "--da-store", "/opt/kardamom/batcher/da",
           "--cursor-file", "/opt/kardamom/batcher/cursor.json",

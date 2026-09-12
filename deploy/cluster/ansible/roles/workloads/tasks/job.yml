@@ -1,17 +1,26 @@
 ---
 # The CLI is only an HCL compiler: -output does not submit a job. It resolves
 # file("config/...") on the controller; all mutations use the Nomad HTTP API.
+# Nomad rejects a -var the file does not declare, so the shared variables
+# (datacenter, the class counts) pass only where the file declares them.
 - name: Compile job and config payloads for {{ workloads_job.name }}
+  vars:
+    workloads_job_file: "nomad/{{ workloads_job.file | default(workloads_job.name ~ '.nomad.hcl') }}"
+    workloads_declared: >-
+      {{ lookup('file', workloads_cluster_dir ~ '/' ~ workloads_job_file) | regex_findall('variable "(\w+)"') }}
+    workloads_vars: >-
+      {{ workloads_common_vars | dict2items | selectattr('key', 'in', workloads_declared) | items2dict
+         | combine(workloads_job.vars | default({})) }}
   ansible.builtin.command:
     argv: >-
       {{ [workloads_nomad_binary, 'job', 'run', '-output']
-         + (workloads_job.vars | default({}) | dict2items | rejectattr('value', 'equalto', '')
-            | map(attribute='key') | zip(workloads_job.vars | default({}) | dict2items
+         + (workloads_vars | dict2items | rejectattr('value', 'equalto', '')
+            | map(attribute='key') | zip(workloads_vars | dict2items
             | rejectattr('value', 'equalto', '') | map(attribute='value'))
             | map('join', '=') | map('regex_replace', '^', '-var=') | list)
          + (['-var=image_ref=' ~ workloads_image_refs[workloads_job.name]]
             if workloads_job.name in workloads_image_refs else [])
-         + ['nomad/' ~ (workloads_job.file | default(workloads_job.name ~ '.nomad.hcl'))] }}
+         + [workloads_job_file] }}
     chdir: "{{ workloads_cluster_dir }}"
   environment:
     NOMAD_NAMESPACE: "{{ workloads_namespace }}"

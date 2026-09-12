@@ -3,7 +3,7 @@
 # kardamom ingress JSON-RPC proxy. It checks that the receipt status
 # comes back as 0x1.
 #
-# Ingress endpoint: http://192.168.56.31:8545 (ingress_ip:ingress_rpc in
+# Ingress endpoint: http://<ingress-0>:8545 (ingress_rpc in
 # ansible/group_vars/all.yml). Signer: Anvil account #0, prefunded with
 # 1000 ETH in config/genesis/dev.toml.
 #
@@ -14,7 +14,9 @@
 # The script prints PASS or FAIL, and exits nonzero on failure.
 set -euo pipefail
 
-RPC_URL="${RPC_URL:-http://192.168.56.31:8545}"
+# shellcheck source=deploy/cluster/scripts/lib-topology.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-topology.sh"
+RPC_URL="${RPC_URL:-http://$(node_address kardamom-ingress-0):8545}"
 CHAIN_ID="${CHAIN_ID:-412346}"
 # Anvil account #0's private key. This key is public; use it for dev only.
 PK="${PK:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"

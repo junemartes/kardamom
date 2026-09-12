@@ -1,0 +1,3 @@
+# Managed by Ansible (roles/consul). Rendered once: the resolvers the host
+# had before its agent became the node resolver.
+recursors = {{ consul_recursors | to_json }}

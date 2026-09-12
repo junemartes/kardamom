@@ -1,16 +1,22 @@
 # This is the in-cluster L1 (anvil), for the smoke test and the
 # da_watcher and batcher L1 endpoint.
 #
-# This runs on the control node r1 (192.168.56.11), and exposes
+# This runs on the control node, and exposes
 # JSON-RPC on 0.0.0.0:8546 (ports.anvil_l1 in group_vars/all.yml).
-# da_watcher points its --l1-rpc at http://192.168.56.10:8546.
+# da_watcher points its --l1-rpc at http://anvil.service.consul:8546.
 #
 # This uses the upstream Foundry image, not the local registry, since
 # anvil is not a kardamom service. It uses host networking, so :8546 is
 # reachable at the VM IP.
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
 job "anvil" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   # Pin this to control-plane node r1.
@@ -24,6 +30,22 @@ job "anvil" {
 
     network {
       mode = "host"
+      port "l1" {
+        static = 8546
+      }
+    }
+
+    # The L1 is a Consul service: da-watcher and the batcher reach it as
+    # anvil.service.consul and the controller discovers it through Nomad.
+    service {
+      name     = "anvil"
+      port     = "l1"
+      provider = "consul"
+      check {
+        type     = "tcp"
+        interval = "10s"
+        timeout  = "2s"
+      }
     }
 
     task "anvil" {
