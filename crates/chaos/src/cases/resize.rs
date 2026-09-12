@@ -267,8 +267,21 @@ async fn lookups_ok(h: &Harness) -> i64 {
 
 /// Blackhole every executor from the sequencer node, hard-kill lane 0's
 /// replica so it comes back cold, and require its lookups to fail while
-/// the twin keeps the lane live; then restore the routes, kill it once
-/// more, and require an answered lookup.
+/// the twin keeps the lane live. Then restore the routes, drop only the
+/// executors' UDP on the node, kill the replica once more, and require
+/// an answered lookup.
+///
+/// Both phases hard-kill the replica, and the replacement is a new
+/// process whose counters start at zero, so each wait counts from zero:
+/// an answered lookup is a one-off (the floor is known after it), so the
+/// newborn's `ok` count stays at exactly one and never rises past the
+/// killed process's count.
+///
+/// Why phase 2 drops the UDP: a receipt-proven floor makes the sequencer
+/// skip the lookup by design, and with a live twin the first receipt
+/// often beats the first park. Receipts ride UDP from the executors; the
+/// lookup is TCP to the executors. In phase 1 the route blackhole blocks
+/// both, so every park requests a lookup that fails.
 pub(crate) async fn lookup_blackout(h: &mut Harness) -> anyhow::Result<()> {
     let node = h.probes.sequencers[0].container.clone();
     let executors: Vec<String> = h
@@ -277,7 +290,6 @@ pub(crate) async fn lookup_blackout(h: &mut Harness) -> anyhow::Result<()> {
         .iter()
         .map(|e| e.ip.to_string())
         .collect();
-    let base_fail = lookups_failed(h).await;
     for e in &executors {
         h.nodes
             .exec(&node, &format!("ip route add blackhole {e}/32"))
@@ -289,45 +301,95 @@ pub(crate) async fn lookup_blackout(h: &mut Harness) -> anyhow::Result<()> {
     crate::log(format!(
         "lookup-blackout: executors blackholed from {node}; hard-killing lane 0's replica there"
     ));
-    let phase1 = blackout_phase(h, &node, base_fail).await;
+    let phase1 = blackout_phase(h, &node).await;
     for e in &executors {
         let _ = h
             .nodes
             .exec(&node, &format!("ip route del blackhole {e}/32"))
             .await;
     }
+    lookup_snapshot(h, &node, "lookup-blackout: blackout phase").await;
     phase1.map_err(|e| crate::chaos_fail!("lookup-blackout: blackout phase failed: {e}"))?;
-    crate::log(
-        "lookup-blackout: routes restored; hard-killing the replica again for an answered lookup",
-    );
-    let base_ok = lookups_ok(h).await;
-    h.inject_hard(&[&node], "sequencer-0").await?;
-    h.assert_count("sequencer", 4, h.knobs.restart_slo).await?;
-    let hs: &Harness = h;
-    let outcome = poll::until(Budget::secs(120, 3), |_| async move {
-        Ok::<_, anyhow::Error>((lookups_ok(hs).await > base_ok).then_some(()))
-    })
-    .await?;
-    outcome.or_fail(|_| {
-        crate::chaos_fail!(
-            "lookup-blackout: cold replica's lookup answered: not reached within 120s"
-        )
-    })?;
+    crate::log(format!(
+        "lookup-blackout: routes restored; dropping the executors' UDP on {node} (receipts, not lookups), then hard-killing the replica again for an answered lookup"
+    ));
+    for e in &executors {
+        h.nodes
+            .exec(
+                &node,
+                &format!("iptables -w 5 -I INPUT -p udp -s {e} -j DROP"),
+            )
+            .await
+            .map_err(|err| {
+                crate::chaos_fail!("lookup-blackout: could not drop UDP from {e} on {node}: {err}")
+            })?;
+    }
+    let phase2 = answered_phase(h, &node).await;
+    // The block is short: the lookup answers within seconds of the
+    // restart, and the node's other replica needs its receipts back.
+    for e in &executors {
+        let _ = h
+            .nodes
+            .exec(
+                &node,
+                &format!("iptables -w 5 -D INPUT -p udp -s {e} -j DROP"),
+            )
+            .await;
+    }
+    lookup_snapshot(h, &node, "lookup-blackout: answered phase").await;
+    phase2.map_err(|e| crate::chaos_fail!("lookup-blackout: answered-lookup phase failed: {e}"))?;
     h.assert_progress().await
 }
 
-async fn blackout_phase(h: &mut Harness, node: &str, base_fail: i64) -> anyhow::Result<()> {
+async fn blackout_phase(h: &mut Harness, node: &str) -> anyhow::Result<()> {
     h.inject_hard(&[node], "sequencer-0").await?;
     h.assert_progress().await?;
     h.assert_count("sequencer", 4, h.knobs.restart_slo).await?;
     let hs: &Harness = h;
     let outcome = poll::until(Budget::secs(120, 3), |_| async move {
-        Ok::<_, anyhow::Error>((lookups_failed(hs).await > base_fail).then_some(()))
+        Ok::<_, anyhow::Error>((lookups_failed(hs).await > 0).then_some(()))
     })
     .await?;
     outcome
         .or_fail(|_| crate::chaos_fail!("lookup-blackout: cold replica's lookups failed with no executor reachable: not reached within 120s"))
         .map(|_| ())
+}
+
+async fn answered_phase(h: &mut Harness, node: &str) -> anyhow::Result<()> {
+    h.inject_hard(&[node], "sequencer-0").await?;
+    h.assert_count("sequencer", 4, h.knobs.restart_slo).await?;
+    let hs: &Harness = h;
+    let outcome = poll::until(Budget::secs(120, 3), |_| async move {
+        Ok::<_, anyhow::Error>((lookups_ok(hs).await > 0).then_some(()))
+    })
+    .await?;
+    outcome
+        .or_fail(|_| {
+            crate::chaos_fail!(
+                "lookup-blackout: cold replica's lookup answered: not reached within 120s"
+            )
+        })
+        .map(|_| ())
+}
+
+/// The lane report of lane 0 and the tail of the replica's own log, so a
+/// red run tells the cases apart: no park at all, a park with the floor
+/// already known (no request), or a lookup that ran. Never fails the
+/// case.
+async fn lookup_snapshot(h: &Harness, node: &str, ctx: &str) {
+    for line in h.probes.sequencer_lane_report(1).await {
+        crate::log(format!("{ctx}: {line}"));
+    }
+    let Some(inner) = h.nodes.inner_container(node, "sequencer-0").await else {
+        crate::log(format!("{ctx}: no inner sequencer-0 container on {node}"));
+        return;
+    };
+    let tail = h
+        .nodes
+        .inner_logs(node, &inner, 40)
+        .await
+        .unwrap_or_default();
+    crate::log(format!("{ctx}: log tail of {inner} on {node}\n{tail}"));
 }
 
 #[cfg(test)]
