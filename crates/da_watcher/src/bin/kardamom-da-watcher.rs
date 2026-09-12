@@ -37,9 +37,8 @@ use kardamom_log::aeron_live::{
     AeronRuntime, TxDepositsPublisherHandle, TxRemoteEpochsPublisherHandle,
 };
 use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
-use kardamom_log::recorder::{RecorderKind, record_stream_until_stopped};
+use kardamom_log::recorder::{RecorderKind, RecorderThreads, record_stream_until_stopped};
 use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
 
 #[path = "kardamom-da-watcher/publishers.rs"]
 mod publishers;
@@ -370,11 +369,10 @@ async fn serve(
         anyhow::bail!("--archive-durability records tx_deposits and requires the L1 path");
     }
 
-    let stop = CancellationToken::new();
-    let recorder_handle = if args.archive_durability {
-        Some(service.start_deposits_recorder(&stop).await?)
+    let recorders = if args.archive_durability {
+        service.start_deposits_recorder().await?
     } else {
-        None
+        RecorderThreads::new()
     };
 
     let watchers = Watchers::spawn(
@@ -386,17 +384,14 @@ async fn serve(
     )
     .await?;
     // A panicked watcher task or an all-fail-stopped exit both return `Err`
-    // here and skip the cleanup below, exactly as a bare early return would:
-    // the recorder thread is left running, detached, for the process exit
-    // to reap.
+    // here. That return drops `recorders` in place, which stops and joins
+    // the recorder thread. The thread is past startup, so it wakes at
+    // once from its park on the stop token.
     watchers.await_shutdown_or_fail_stop().await?;
 
-    stop.cancel();
-    if let Some(h) = recorder_handle {
-        // The recorder thread polls the stop flag; joining it blocks, so
-        // move the join off the runtime workers.
-        let _ = tokio::task::spawn_blocking(move || h.join()).await;
-    }
+    // Joining the recorder thread blocks, so move the join off the
+    // runtime workers.
+    let _ = tokio::task::spawn_blocking(move || recorders.join()).await;
     Ok(())
 }
 
@@ -439,8 +434,9 @@ impl DaWatcherService {
     /// an active recording before returning.
     ///
     /// The thread stays a std thread: it holds an Aeron archive session,
-    /// which is `!Send`. The seam to the async shell uses `stop` for
-    /// shutdown and a `oneshot` channel for readiness.
+    /// which is `!Send`. The seam to the async shell is the stop token
+    /// inside the returned [`RecorderThreads`], and a `oneshot` channel
+    /// for readiness. Dropping the returned value stops the thread.
     ///
     /// The watcher loop must not publish a single deposit before the
     /// recording is confirmed active. Recovery replays from record 0 and
@@ -448,18 +444,14 @@ impl DaWatcherService {
     /// permanently break executor crash recovery. The operator asked for
     /// `--archive-durability`, so returning before the recording is live
     /// would run without it while claiming otherwise.
-    async fn start_deposits_recorder(
-        &self,
-        stop: &CancellationToken,
-    ) -> anyhow::Result<std::thread::JoinHandle<()>> {
+    async fn start_deposits_recorder(&self) -> anyhow::Result<RecorderThreads> {
         let aeron_dir = self.aeron_dir.clone();
         let aeron_cfg = self.aeron_cfg.clone();
         let channels = self.channels.clone();
-        let stop = stop.clone();
         let (ready_tx, ready_rx) = oneshot::channel::<Result<i64, String>>();
-        let handle = std::thread::Builder::new()
-            .name("da-watcher-tx-deposits-recorder".into())
-            .spawn(move || {
+        let mut recorders = RecorderThreads::new();
+        recorders
+            .spawn("da-watcher-tx-deposits-recorder".into(), move |stop| {
                 // Shared recorder-thread body (kardamom_log::recorder):
                 // connect a thread-confined archive session, record
                 // tx_deposits, report the startup outcome on `ready`, and
@@ -503,6 +495,6 @@ impl DaWatcherService {
                  active within 60s"
             ),
         }
-        Ok(handle)
+        Ok(recorders)
     }
 }

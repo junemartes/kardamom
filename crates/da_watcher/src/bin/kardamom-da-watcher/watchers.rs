@@ -191,15 +191,14 @@ impl Watchers {
     }
 
     /// One watcher's shutdown: log if it exited on its own (a fail-stop,
-    /// not a requested shutdown), ask it to stop, then join it.
+    /// not a requested shutdown), then ask it to stop and join it.
     async fn shutdown_one(kind: WatcherKind, handle: WatcherHandle) -> anyhow::Result<()> {
         let name = kind.label();
         if handle.task.is_finished() {
             tracing::error!(watcher = name, "watcher exited without a shutdown request");
         }
-        let _ = handle.shutdown.send(());
         handle
-            .task
+            .join()
             .await
             .map_err(|e| anyhow::anyhow!("{name} watcher task panicked: {e}"))?;
         Ok(())

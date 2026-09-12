@@ -4,7 +4,7 @@
 //! deposit pump) polls [`Shutdown::is_signaled`] while the tokio shell awaits
 //! [`Shutdown::cancelled`] in `select!`.
 
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 /// Cooperative shutdown signal for the loop driver.
 /// The struct is cloneable. The signal handler task keeps one copy, and the
@@ -30,6 +30,13 @@ impl Shutdown {
 
     pub fn signal(&self) {
         self.token.cancel();
+    }
+
+    /// A guard that calls [`Shutdown::signal`] when it drops. A struct
+    /// that holds one signals as a normal field drop, with no call.
+    #[must_use]
+    pub fn guard(&self) -> DropGuard {
+        self.token.clone().drop_guard()
     }
 
     #[must_use]

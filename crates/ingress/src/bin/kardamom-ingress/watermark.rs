@@ -3,11 +3,11 @@
 
 use std::ops::ControlFlow;
 
-use kardamom_cluster_adapter::LiveEgress;
+use kardamom_cluster_adapter::{LiveCluster, LiveEgress};
 use kardamom_ingress::cluster::ClusterWatermarkObserver;
 use kardamom_types::QuorumWatermark;
 use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 /// The watermark thread's state: the egress observer, the watermark bus,
 /// and the stop token. The observer holds the `!Send` cluster client, so
@@ -20,25 +20,53 @@ pub(crate) struct ClusterWatermarkPump {
     stop: CancellationToken,
 }
 
+/// A running watermark thread: the guard that cancels its stop token,
+/// and the cluster session it polls. Field order is drop order: the
+/// token cancels first, then the session ends. The thread is not joined.
+/// Its egress poll returns only when the session ends, so the thread
+/// exits on its own right after this value drops.
+pub(crate) struct ClusterWatermark {
+    #[allow(
+        dead_code,
+        reason = "held only for its Drop impl, which cancels the thread's stop token; never read"
+    )]
+    stop: DropGuard,
+    #[allow(
+        dead_code,
+        reason = "held only for its Drop impl, which ends the cluster session; never read"
+    )]
+    cluster_guard: LiveCluster,
+}
+
 impl ClusterWatermarkPump {
     pub(crate) fn new(
         observer: ClusterWatermarkObserver<LiveEgress>,
         tx: broadcast::Sender<QuorumWatermark>,
-        stop: CancellationToken,
     ) -> Self {
-        Self { observer, tx, stop }
+        Self {
+            observer,
+            tx,
+            stop: CancellationToken::new(),
+        }
     }
 
-    /// Spawn the thread. It stops on the stop token, or when the
-    /// observer ends.
+    /// Spawn the thread. It stops when the returned [`ClusterWatermark`]
+    /// drops, or when the observer ends. `cluster_guard` is the session
+    /// the observer polls; the returned value keeps it alive for as long
+    /// as the thread runs.
     ///
     /// # Errors
     ///
     /// Returns the OS error if the thread cannot be spawned.
-    pub(crate) fn spawn(self) -> std::io::Result<std::thread::JoinHandle<()>> {
+    pub(crate) fn spawn(self, cluster_guard: LiveCluster) -> std::io::Result<ClusterWatermark> {
+        let stop = self.stop.clone().drop_guard();
         std::thread::Builder::new()
             .name("cluster-watermark".into())
-            .spawn(move || self.run())
+            .spawn(move || self.run())?;
+        Ok(ClusterWatermark {
+            stop,
+            cluster_guard,
+        })
     }
 
     fn run(mut self) {

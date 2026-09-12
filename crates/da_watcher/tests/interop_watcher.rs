@@ -172,7 +172,7 @@ async fn one_record_per_origin_block() {
     feed.push_message(msg(3, 102));
 
     wait_until(|| publisher.records().len() >= 2, "two records").await;
-    let _ = handle.shutdown.send(());
+    handle.join().await.unwrap();
 
     let records = publisher.records();
     assert_eq!(records.len(), 2, "one record per origin block, no more");
@@ -325,7 +325,7 @@ async fn a_reconnect_reproduces_byte_identical_records() {
     feed.push_message(msg(2, 101));
     feed.push_message(msg(3, 102));
     wait_until(|| publisher.records().len() >= 2, "two records").await;
-    let _ = handle.shutdown.send(());
+    handle.join().await.unwrap();
 
     let records = publisher.records();
     assert_eq!(records.len(), 2, "the replay must not duplicate a record");
@@ -370,8 +370,7 @@ async fn a_restart_resumes_exactly_from_the_persisted_cursor() {
     feed.push_message(msg(2, 101));
     feed.push_message(msg(3, 102)); // sentinel: closes 101
     wait_until(|| publisher.records().len() >= 2, "two records").await;
-    let _ = handle.shutdown.send(());
-    handle.task.await.unwrap();
+    handle.join().await.unwrap();
     // The watcher's task has exited, so its `CursorFile` (and the lock it
     // holds) has dropped; reopening now is safe. The block scope ends
     // this reopened handle before the next spawn reopens the file.
@@ -398,8 +397,7 @@ async fn a_restart_resumes_exactly_from_the_persisted_cursor() {
     feed.push_message(msg(4, 103)); // closes 102
     feed.push_message(msg(5, 104)); // closes 103
     wait_until(|| publisher.records().len() >= 4, "four records").await;
-    let _ = handle.shutdown.send(());
-    handle.task.await.unwrap();
+    handle.join().await.unwrap();
 
     let seqs: Vec<u64> = publisher
         .records()
@@ -581,7 +579,7 @@ async fn a_head_event_closes_a_single_message_block() {
     feed.push_message(msg(1, 105));
     feed.push_head(106);
     wait_until(|| publisher.records().len() >= 2, "two records").await;
-    let _ = handle.shutdown.send(());
+    handle.join().await.unwrap();
 
     let records = publisher.records();
     assert_eq!(records[0].anchor_number, 100);

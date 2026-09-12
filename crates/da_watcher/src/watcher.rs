@@ -32,14 +32,32 @@ pub struct DaWatcherConfig {
     pub poll_interval: Duration,
 }
 
-/// Handle to a running watcher task. Drop `shutdown`, or send `()` on it, to
-/// ask the loop to exit. `task` is the underlying tokio `JoinHandle`.
+/// Handle to a running watcher task. [`WatcherHandle::join`] asks the
+/// loop to exit and waits for it. Dropping the handle also asks the loop
+/// to exit, without the wait. `task` is the underlying tokio `JoinHandle`.
 pub struct WatcherHandle {
-    /// Underlying tokio task. `.await` this after sending `shutdown`, to join.
+    /// Underlying tokio task. Tests read `is_finished` on it, and hold
+    /// `shutdown` while they await it, to see a fail-stop.
     pub task: JoinHandle<()>,
-    /// Cooperative shutdown signal. Send `()`, or drop this, to ask the
-    /// watcher loop to exit at the next tick boundary.
+    /// Cooperative shutdown signal. Dropping this asks the watcher loop
+    /// to exit at the next tick boundary.
     pub shutdown: oneshot::Sender<()>,
+}
+
+impl WatcherHandle {
+    /// Ask the loop to exit, then wait for the task. Ending the sender is
+    /// the request; the block scope ends it before the await.
+    ///
+    /// # Errors
+    ///
+    /// Returns the join error when the watcher task panicked.
+    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
+        let Self { task, shutdown } = self;
+        {
+            let _request = shutdown;
+        }
+        task.await
+    }
 }
 
 /// Errors the watcher's tick loop reports up. A `Tip` or `Logs` error means
