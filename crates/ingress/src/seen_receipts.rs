@@ -1,4 +1,4 @@
-//! First-wins tx-hash dedup set for the tx_receipts MDS fan-in.
+//! First-wins tx-hash dedup set for the `tx_receipts` MDS fan-in.
 //!
 //! With the multi-destination subscription, all N executor replicas replay
 //! the same canonical order and emit identical receipts. So each receipt
@@ -18,37 +18,35 @@
 //! is harmless, because `on_receipt` and the cache insert are themselves
 //! idempotent. So this set is a fast-path optimization over sinks that are
 //! already idempotent, not a set that correctness depends on.
+//!
+//! Only the `tx_receipts` watcher task touches a `SeenReceipts` value, so it
+//! owns one directly, by value, with no `Arc` or lock.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::Mutex;
+use std::num::NonZeroUsize;
 
 use alloy_primitives::B256;
 
 /// Default ring capacity. 1<<16 hashes is about 2 MiB, a small cost. It is
 /// far larger than the N-replica duplicate window for any realistic N.
-pub const DEFAULT_CAPACITY: usize = 1 << 16;
+pub(crate) const DEFAULT_CAPACITY: NonZeroUsize = NonZeroUsize::new(1 << 16).unwrap();
 
-/// Thread-safe, bounded, first-wins set of receipt tx hashes.
-pub struct SeenReceipts {
-    inner: Mutex<Inner>,
-    capacity: usize,
-}
-
-struct Inner {
+/// Bounded, first-wins set of receipt tx hashes. Owned by one task; see
+/// the module docs.
+pub(crate) struct SeenReceipts {
     set: HashSet<B256>,
     /// Insertion order. Used to evict the oldest entry once `set` reaches
     /// `capacity`.
     order: VecDeque<B256>,
+    capacity: NonZeroUsize,
 }
 
 impl SeenReceipts {
-    pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "SeenReceipts capacity must be > 0");
+    #[must_use]
+    pub(crate) fn new(capacity: NonZeroUsize) -> Self {
         Self {
-            inner: Mutex::new(Inner {
-                set: HashSet::with_capacity(capacity),
-                order: VecDeque::with_capacity(capacity),
-            }),
+            set: HashSet::with_capacity(capacity.get()),
+            order: VecDeque::with_capacity(capacity.get()),
             capacity,
         }
     }
@@ -57,23 +55,23 @@ impl SeenReceipts {
     /// caller should process this receipt. Returns `false` if the hash was
     /// already present, as a duplicate replica copy; the caller should
     /// drop it.
-    pub fn insert(&self, tx_hash: B256) -> bool {
-        let mut g = self.inner.lock().expect("SeenReceipts poisoned");
-        if !g.set.insert(tx_hash) {
+    #[must_use]
+    pub(crate) fn insert(&mut self, tx_hash: B256) -> bool {
+        if !self.set.insert(tx_hash) {
             return false;
         }
-        g.order.push_back(tx_hash);
-        if g.order.len() > self.capacity
-            && let Some(evicted) = g.order.pop_front()
+        self.order.push_back(tx_hash);
+        if self.order.len() > self.capacity.get()
+            && let Some(evicted) = self.order.pop_front()
         {
-            g.set.remove(&evicted);
+            self.set.remove(&evicted);
         }
         true
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.inner.lock().unwrap().set.len()
+        self.set.len()
     }
 }
 
@@ -87,9 +85,13 @@ impl Default for SeenReceipts {
 mod tests {
     use super::*;
 
+    fn capacity(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap()
+    }
+
     #[test]
     fn first_wins_then_duplicates_dropped() {
-        let s = SeenReceipts::new(16);
+        let mut s = SeenReceipts::new(capacity(16));
         let h = B256::repeat_byte(0xAB);
         // The first copy is newly inserted, so the caller must process it.
         assert!(s.insert(h), "first receipt must be accepted");
@@ -101,7 +103,7 @@ mod tests {
 
     #[test]
     fn distinct_hashes_all_accepted() {
-        let s = SeenReceipts::new(16);
+        let mut s = SeenReceipts::new(capacity(16));
         for i in 0..8u8 {
             assert!(s.insert(B256::repeat_byte(i)));
         }
@@ -112,7 +114,7 @@ mod tests {
 
     #[test]
     fn fifo_eviction_bounds_size() {
-        let s = SeenReceipts::new(4);
+        let mut s = SeenReceipts::new(capacity(4));
         // Fill the set past its capacity.
         for i in 0..6u8 {
             assert!(s.insert(B256::repeat_byte(i)));

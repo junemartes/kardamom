@@ -34,12 +34,14 @@ pub enum AckPolicy {
 impl AckPolicy {
     /// Returns true if the ack gate must subscribe to the recorder's
     /// `FsyncWatermark` stream.
+    #[must_use]
     pub fn requires_local_fsync(self) -> bool {
         matches!(self, Self::OnLocalFsync | Self::OnLocalFsyncAndQuorum)
     }
 
     /// Returns true if the ack gate must subscribe to the shared
     /// `QuorumWatermark` stream.
+    #[must_use]
     pub fn requires_quorum(self) -> bool {
         matches!(self, Self::OnQuorum | Self::OnLocalFsyncAndQuorum)
     }

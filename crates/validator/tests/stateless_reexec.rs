@@ -12,6 +12,8 @@
 //! pre-credit and a proven-absent recipient), so the witness carries
 //! every table.
 
+use std::num::NonZeroU16;
+
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSignerSync;
@@ -19,11 +21,16 @@ use alloy_primitives::{Address, B256, TxKind, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_engine::actor::BufferedRecord;
 use kardamom_engine::{ExecEnv, MockStateDatabase, PendingDelta};
+use kardamom_exec_core::delta::AccountFields;
 use kardamom_state::{AccountTrieParts, state_root, storage_root};
 use kardamom_types::{BPosition, Deposit, TxEnvelope};
 use kardamom_validator::witness::{capture_block_witness, reexecute_stateless};
 
-const CHAIN_ID: u64 = 412346;
+const CHAIN_ID: u64 = 412_346;
+/// Per-tx BAL frames.
+const PER_TX: NonZeroU16 = NonZeroU16::new(1).unwrap();
+/// One BAL frame per two txs.
+const PER_TWO_TXS: NonZeroU16 = NonZeroU16::new(2).unwrap();
 const DEAD: Address = address!("000000000000000000000000000000000000dEaD");
 /// Pre-seeded contract: slot0 = SLOAD(0) + 1, a genuine snapshot storage
 /// read feeding a write, then falls off the end (STOP).
@@ -51,7 +58,7 @@ fn signed_tx(nonce: u64, to: Address, value: u64, gas_limit: u64) -> TxEnvelope 
         gas_limit,
         to: TxKind::Call(to),
         value: U256::from(value),
-        input: Default::default(),
+        input: alloy_primitives::Bytes::default(),
     };
     let sig = s.sign_transaction_sync(&mut tx).unwrap();
     let env = alloy_consensus::TxEnvelope::Legacy(tx.into_signed(sig));
@@ -126,42 +133,44 @@ fn env() -> ExecEnv {
 fn oracle_root(delta: &PendingDelta) -> B256 {
     // This is the genesis account set the mock was built from.
     let code_hash = keccak256(CONTRACT_CODE);
-    let mut accounts: std::collections::BTreeMap<Address, (u64, U256, B256)> = [
+    let mut accounts: std::collections::BTreeMap<Address, AccountFields> = [
         (signer().address(), (0, eth(1000), B256::ZERO)),
         (DECOY, (0, eth(1000), B256::ZERO)),
         (CONTRACT, (1, U256::ZERO, code_hash)),
     ]
     .into_iter()
+    .map(|(addr, fields)| (addr, AccountFields::from(fields)))
     .collect();
     let mut storage: std::collections::BTreeMap<(Address, B256), U256> =
         [((CONTRACT, B256::ZERO), U256::from(7u64))]
             .into_iter()
             .collect();
-    for (addr, v) in &delta.accounts {
-        accounts.insert(*addr, *v);
-    }
-    for (k, v) in &delta.storage {
-        storage.insert(*k, *v);
-    }
-    state_root(
-        accounts
-            .into_iter()
-            .map(|(addr, (nonce, balance, code_hash))| {
-                let slots = storage
-                    .iter()
-                    .filter(|((a, _), _)| *a == addr)
-                    .map(|((_, k), v)| (*k, *v));
-                (
-                    addr,
-                    AccountTrieParts {
-                        nonce,
-                        balance,
-                        code_hash,
-                        storage_root: storage_root(slots),
-                    },
-                )
-            }),
-    )
+    accounts.extend(delta.accounts.iter().map(|(addr, v)| (*addr, *v)));
+    storage.extend(delta.storage.iter().map(|(k, v)| (*k, *v)));
+    state_root(accounts.into_iter().map(
+        |(
+            addr,
+            AccountFields {
+                nonce,
+                balance,
+                code_hash,
+            },
+        )| {
+            let slots = storage
+                .iter()
+                .filter(|((a, _), _)| *a == addr)
+                .map(|((_, k), v)| (*k, *v));
+            (
+                addr,
+                AccountTrieParts {
+                    nonce,
+                    balance,
+                    code_hash,
+                    storage_root: storage_root(slots),
+                },
+            )
+        },
+    ))
 }
 
 #[test]
@@ -181,7 +190,7 @@ fn stateless_replay_reproduces_recorded_execution() {
 
     // Stateless replay: witness only, no state DB, with the published
     // BAL as a proof input (granularity 1 means per-tx frames).
-    let stateless = reexecute_stateless(&witness, None, &recs, env(), &raw_bal, 1).unwrap();
+    let stateless = reexecute_stateless(&witness, None, &recs, env(), &raw_bal, PER_TX).unwrap();
 
     assert_eq!(reference.receipts, stateless.receipts, "receipts diverged");
     assert_eq!(
@@ -255,7 +264,7 @@ fn stateless_replay_reproduces_recorded_execution() {
 
     // Quantized frames (K > 1) also verify through the same shared ladder.
     let quantized = kardamom_engine::bal_ladder::quantize(raw_bal.clone(), 2);
-    reexecute_stateless(&witness, None, &recs, env(), &quantized, 2)
+    reexecute_stateless(&witness, None, &recs, env(), &quantized, PER_TWO_TXS)
         .expect("stateless replay must verify against a K=2-quantized frame");
 }
 
@@ -264,19 +273,16 @@ fn forged_bal_fails_closed() {
     let recs = records();
     let (_, witness, raw_bal) = capture_block_witness(&genesis(), None, &recs, env()).unwrap();
 
-    // Bump one claimed post-balance. The recomputed BAL can no longer
-    // equal the input, so the replay must refuse to attest it.
+    // Bump one claimed post-balance. The recomputed BAL differs from the
+    // input, so the replay must refuse to attest it.
     let mut forged = raw_bal.clone();
-    let mut tampered = false;
-    for acct in forged.iter_mut() {
-        if let Some(c) = acct.balance_changes.first_mut() {
-            c.post_balance += alloy_primitives::U256::from(1u64);
-            tampered = true;
-            break;
-        }
-    }
+    let tampered = forged
+        .iter_mut()
+        .find_map(|acct| acct.balance_changes.first_mut())
+        .map(|c| c.post_balance += alloy_primitives::U256::from(1u64))
+        .is_some();
     assert!(tampered, "setup: no balance change to tamper with");
-    let err = reexecute_stateless(&witness, None, &recs, env(), &forged, 1);
+    let err = reexecute_stateless(&witness, None, &recs, env(), &forged, PER_TX);
     assert!(
         matches!(err, Err(kardamom_engine::ExecutorError::Divergence(_))),
         "forged BAL must be refused as a divergence, got: {err:?}"
@@ -285,7 +291,7 @@ fn forged_bal_fails_closed() {
     // A granularity mismatch is also refused: a K=2 frame never equals a
     // per-tx recomputation quantized at K=1.
     let quantized = kardamom_engine::bal_ladder::quantize(raw_bal, 2);
-    assert!(reexecute_stateless(&witness, None, &recs, env(), &quantized, 1).is_err());
+    assert!(reexecute_stateless(&witness, None, &recs, env(), &quantized, PER_TX).is_err());
 }
 
 #[test]
@@ -299,16 +305,16 @@ fn incomplete_witness_fails_closed() {
     tampered
         .accounts
         .retain(|a| a.address != signer().address());
-    let err = reexecute_stateless(&tampered, None, &recs, env(), &bal, 1);
+    let err = reexecute_stateless(&tampered, None, &recs, env(), &bal, PER_TX);
     assert!(err.is_err(), "replay over an incomplete witness must fail");
 
     // Drop the contract's read slot: same contract.
     let mut tampered = witness.clone();
     tampered.storage.retain(|s| s.address != CONTRACT);
-    assert!(reexecute_stateless(&tampered, None, &recs, env(), &bal, 1).is_err());
+    assert!(reexecute_stateless(&tampered, None, &recs, env(), &bal, PER_TX).is_err());
 
     // Drop the contract code: same contract.
     let mut tampered = witness;
     tampered.code.clear();
-    assert!(reexecute_stateless(&tampered, None, &recs, env(), &bal, 1).is_err());
+    assert!(reexecute_stateless(&tampered, None, &recs, env(), &bal, PER_TX).is_err());
 }

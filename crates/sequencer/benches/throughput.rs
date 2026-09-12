@@ -4,98 +4,48 @@
 //! The spec target is more than 100k tx/s per core for simple signatures.
 //! This bench measures `run_once` loop throughput on one thread.
 
-use std::collections::VecDeque;
-
-use alloy_consensus::{SignableTransaction, TxEnvelope as ConsensusEnvelope, TxLegacy};
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, U256};
-use alloy_rlp::Encodable;
-use alloy_signer_local::PrivateKeySigner;
-use bytes::Bytes;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::error::SequencerError;
-use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
-use kardamom_sequencer::outbound::fakes::{
-    InMemoryTxErrorPublisher, InMemoryTxOrderingRefPublisher,
-};
 use kardamom_sequencer::sequencer::Sequencer;
-
-struct DequeTxData(VecDeque<(TxDataLoc, TxEnvelope)>);
-impl TxDataSubscriber for DequeTxData {
-    fn poll(&mut self) -> Result<Option<Inbound>, SequencerError> {
-        Ok(self.0.pop_front().map(|(loc, envelope)| Inbound {
-            lane: 0,
-            loc,
-            envelope,
-        }))
-    }
-}
-
-fn signer(seed: u64) -> PrivateKeySigner {
-    let mut k = [0u8; 32];
-    k[24..].copy_from_slice(&seed.to_be_bytes());
-    PrivateKeySigner::from_bytes(&k.into()).unwrap()
-}
-
-fn signed_envelope(s: &PrivateKeySigner, n: u64, correlation_id: u64) -> TxEnvelope {
-    let mut tx = TxLegacy {
-        chain_id: Some(1),
-        nonce: n,
-        gas_price: 1,
-        gas_limit: 21_000,
-        to: Address::ZERO.into(),
-        value: U256::ZERO,
-        input: Default::default(),
-    };
-    let sig = s.sign_transaction_sync(&mut tx).unwrap();
-    let alloy_env: ConsensusEnvelope = tx.into_signed(sig).into();
-    let mut buf = Vec::with_capacity(256);
-    alloy_env.encode(&mut buf);
-    TxEnvelope {
-        correlation_id,
-        raw_tx: Bytes::from(buf),
-        sender: s.address(),
-        tx_hash: Default::default(),
-    }
-}
+use kardamom_sequencer::testkit::{Rig, one_partition_cfg, signed_envelope, signer};
 
 fn bench_in_order(c: &mut Criterion) {
     let signers: Vec<_> = (1..=64u64).map(signer).collect();
-    let mut batch: Vec<(TxDataLoc, TxEnvelope)> = Vec::with_capacity(64 * 16);
-    for (i, s) in signers.iter().enumerate() {
-        for n in 0u64..16 {
-            let correlation = (i * 16 + n as usize) as u64;
+    // The cartesian product of sender and nonce, in the same row-major
+    // order the original nested loop walked: `correlation` there was
+    // just `i * 16 + n`.
+    let batch: Vec<(TxDataLoc, TxEnvelope)> = signers
+        .iter()
+        .enumerate()
+        .flat_map(|(i, s)| (0u64..16).map(move |n| (i, s, n)))
+        .map(|(i, s, n)| {
+            let correlation = u64::try_from(i).unwrap() * 16 + n;
             let position = BPosition {
                 term_id: 0,
-                term_offset: (correlation as i32) * 64,
+                term_offset: i32::try_from(correlation).unwrap() * 64,
             };
-            batch.push((
+            (
                 TxDataLoc::new(0, position),
                 signed_envelope(s, n, correlation),
-            ));
-        }
-    }
+            )
+        })
+        .collect();
     c.bench_function("sequencer_run_once_1024_proxy_sender", |b| {
         b.iter_batched(
             || {
-                (
-                    Sequencer::new(SequencerConfig {
-                        partition_count: 1,
-                        partition_index: 0,
-                        sequencer_id: 0,
-                        max_pending_per_sender: 16,
-                        ..Default::default()
-                    }),
-                    DequeTxData(batch.clone().into_iter().collect()),
-                    InMemoryTxOrderingRefPublisher::default(),
-                    InMemoryTxErrorPublisher::default(),
-                )
+                let mut rig = Rig::default();
+                rig.tx_data.queue = batch.clone().into_iter().collect();
+                let seq = Sequencer::new(SequencerConfig {
+                    max_pending_per_sender: 16,
+                    ..one_partition_cfg()
+                })
+                .unwrap();
+                (seq, rig)
             },
-            |(mut seq, mut tx_data, mut bp, mut rc)| {
-                while seq.run_once(&mut tx_data, &mut bp, &mut rc).unwrap() {}
+            |(mut seq, mut rig)| {
+                while rig.step(&mut seq).unwrap() {}
             },
             BatchSize::SmallInput,
         );

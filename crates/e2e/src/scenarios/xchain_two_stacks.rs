@@ -1,4 +1,4 @@
-//! S14 — TWO real LocalStacks talking cross-chain, no mock anywhere: the
+//! S14 — TWO real `LocalStack`s talking cross-chain, no mock anywhere: the
 //! egress-E1 acceptance.
 //!
 //! Chain A (the repo-default 412346) and chain B (412347, a patched-genesis
@@ -38,16 +38,19 @@ use std::time::Duration;
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
 use kardamom_types::xchain::{
-    Callback, INBOX, OUTBOX, outbox_send_message_selector, remote_source_hash, xchain_tx_sender,
+    Callback, INBOX, Inbox, OUTBOX, Outbox, remote_source_hash, xchain_tx_sender,
 };
 
 use super::xchain::{
-    RECEIVER_INIT_CODE, inbox_delivered_slot, inbox_next_seq_slot, log_address, log_topic,
-    log_topic0, message_delivered_topic0, message_sent_topic0, outbox_nonces_slot, read_slot,
-    u64_word,
+    RECEIVER_INIT_CODE, assert_cursor_at_least, assert_delivery_receipt, log_address, log_topic,
+    log_topic0, message_delivered_topic0, read_slot,
 };
-use super::{Target, assert_receipt_ok, await_l2_receipt, receipt_field, receipt_placement};
+use super::{
+    Target, assert_receipt_ok, await_l2_receipt, receipt_field, receipt_placement, u64_word,
+    word_u64,
+};
 use crate::harness::l2::{self, DerivedSigner};
+use crate::harness::metrics::poll_until;
 
 /// Chain B's id — anything ≠ A's 412346; the harness materialises a
 /// patched-genesis copy for it.
@@ -57,6 +60,7 @@ pub const CHAIN_B_ID: u64 = 412_347;
 /// Head: 4 static params + the callback tuple inlined (3 words) = 7 words,
 /// so `data`'s offset is 0xE0; `cb = None` encodes the zeroed tuple
 /// (`XChain.isNone`).
+#[must_use]
 pub fn send_message_calldata(
     dest_chain_id: u64,
     target: Address,
@@ -64,7 +68,7 @@ pub fn send_message_calldata(
     data: &[u8],
     cb: Option<Callback>,
 ) -> Vec<u8> {
-    let selector = outbox_send_message_selector();
+    let selector = Outbox::send_message_selector();
     let cb = cb.unwrap_or_default();
     let mut out = Vec::with_capacity(4 + 8 * 32 + data.len().div_ceil(32) * 32);
     out.extend_from_slice(&selector);
@@ -81,72 +85,128 @@ pub fn send_message_calldata(
     out
 }
 
-/// Per-chain sender state: dev signer #0 plus its running nonce.
+/// Per-chain sender state: dev signer #0 plus its running nonce, and
+/// signer #1 as the payee — a thin wrapper over [`l2::NudgeSender`] that
+/// also signs `sendMessage` calls against the same nonce sequence.
 pub struct ChainSender {
-    signer: DerivedSigner,
-    payee: Address,
-    nonce: u64,
+    nudge: l2::NudgeSender,
 }
 
 impl ChainSender {
+    /// # Errors
+    /// Returns an error when signer derivation fails.
     pub fn new() -> Result<Self> {
-        let signers = l2::dev_signers(2)?;
+        let signers = l2::dev_signers_total(2)?;
         Ok(Self {
-            signer: signers[0].clone(),
-            payee: signers[1].address,
-            nonce: 0,
+            nudge: l2::NudgeSender::new(signers[0].clone(), signers[1].address, 0),
         })
     }
-}
 
-/// Submit one `sendMessage` on `t` and return the (asserted-successful)
-/// receipt's L2 block number plus the seq the Outbox assigned (from the
-/// `MessageSent` log's topic 2).
-async fn send_message(
-    t: &Target,
-    s: &mut ChainSender,
-    dest_chain_id: u64,
-    target: Address,
-    data: &[u8],
-    cb: Option<Callback>,
-    what: &str,
-) -> Result<(u64, u64)> {
-    let calldata = send_message_calldata(dest_chain_id, target, 150_000, data, cb);
-    let tx = l2::sign_call(
-        &s.signer,
-        t.chain_id,
-        s.nonce,
-        OUTBOX,
-        U256::ZERO,
-        &calldata,
-    )?;
-    s.nonce += 1;
-    t.rpc
-        .send_raw(&tx.raw)
+    /// The signer this sender signs and sends with.
+    fn signer(&self) -> &DerivedSigner {
+        self.nudge.signer()
+    }
+
+    /// The payee [`Self::send_nudge`] sends 1-wei transfers to.
+    fn payee(&self) -> Address {
+        self.nudge.payee()
+    }
+
+    /// The current nonce, advancing it by one.
+    ///
+    /// # Errors
+    /// Returns an error when the nonce overflows.
+    fn next_nonce(&mut self) -> Result<u64> {
+        self.nudge.next_nonce()
+    }
+
+    /// Submit one `sendMessage` on `t` and return the (asserted-successful)
+    /// receipt's L2 block number plus the seq the Outbox assigned (from
+    /// the `MessageSent` log's topic 2).
+    async fn send_message(
+        &mut self,
+        t: &Target,
+        dest_chain_id: u64,
+        target: Address,
+        data: &[u8],
+        cb: Option<Callback>,
+        what: &str,
+    ) -> Result<(u64, u64)> {
+        let calldata = send_message_calldata(dest_chain_id, target, 150_000, data, cb);
+        let nonce = self.next_nonce()?;
+        let tx = l2::sign_call(
+            self.signer(),
+            t.chain_id,
+            nonce,
+            OUTBOX,
+            U256::ZERO,
+            &calldata,
+        )?;
+        t.rpc
+            .send_raw(&tx.raw)
+            .await
+            .result
+            .map_err(|e| anyhow::anyhow!("{what}: submit sendMessage: {e}"))?;
+        let receipt = await_l2_receipt(t, tx.hash, what).await?;
+        assert_receipt_ok(&receipt, what)?;
+        let logs = receipt
+            .get("logs")
+            .and_then(|l| l.as_array())
+            .with_context(|| format!("{what}: receipt has no logs"))?;
+        let sent = logs
+            .iter()
+            .find(|l| {
+                log_topic0(l) == Some(Outbox::message_sent_topic0())
+                    && log_address(l).is_some_and(|a| a.eq_ignore_ascii_case(&OUTBOX.to_string()))
+            })
+            .with_context(|| format!("{what}: no MessageSent log from the Outbox: {receipt}"))?;
+        anyhow::ensure!(
+            log_topic(sent, 1) == Some(u64_word(dest_chain_id)),
+            "{what}: MessageSent destChainId topic mismatch: {sent}"
+        );
+        let seq_word = log_topic(sent, 2).with_context(|| format!("{what}: no seq topic"))?;
+        let seq = word_u64(seq_word);
+        let block = receipt_placement(&receipt)?.block;
+        Ok((block, seq))
+    }
+
+    /// Nudge the chain with 1-wei transfers from this sender, retrying
+    /// every 300ms, until `cond` reports settled (`Ok(None)`) or 60s
+    /// elapse. `cond` returns `Some(detail)` describing the unmet value
+    /// while waiting, which becomes part of the timeout message
+    /// (`"{what} ({detail})"`).
+    ///
+    /// Commits are pipelined and settle at later tx-carrying boundaries,
+    /// so state a caller is polling for needs real traffic to become
+    /// durable — bounded, never a fixed sleep.
+    async fn nudge_until<F>(&mut self, t: &Target, what: &str, mut cond: F) -> Result<()>
+    where
+        F: FnMut() -> Result<Option<String>>,
+    {
+        let detail = std::cell::Cell::new(String::new());
+        poll_until(
+            what,
+            Duration::from_secs(60),
+            Duration::from_millis(300),
+            async || {
+                let Some(d) = cond()? else {
+                    return Ok(Some(()));
+                };
+                detail.set(d);
+                self.send_nudge(t).await?;
+                Ok(None)
+            },
+        )
         .await
-        .result
-        .map_err(|e| anyhow::anyhow!("{what}: submit sendMessage: {e}"))?;
-    let receipt = await_l2_receipt(t, tx.hash, what).await?;
-    assert_receipt_ok(&receipt, what)?;
-    let logs = receipt
-        .get("logs")
-        .and_then(|l| l.as_array())
-        .with_context(|| format!("{what}: receipt has no logs"))?;
-    let sent = logs
-        .iter()
-        .find(|l| {
-            log_topic0(l) == Some(message_sent_topic0())
-                && log_address(l).is_some_and(|a| a.eq_ignore_ascii_case(&OUTBOX.to_string()))
-        })
-        .with_context(|| format!("{what}: no MessageSent log from the Outbox: {receipt}"))?;
-    anyhow::ensure!(
-        log_topic(sent, 1) == Some(u64_word(dest_chain_id)),
-        "{what}: MessageSent destChainId topic mismatch: {sent}"
-    );
-    let seq_word = log_topic(sent, 2).with_context(|| format!("{what}: no seq topic"))?;
-    let seq = u64::from_be_bytes(seq_word.as_slice()[24..32].try_into().unwrap());
-    let (block, _) = receipt_placement(&receipt)?;
-    Ok((block, seq))
+        .map_err(|e| anyhow::anyhow!("{e} ({})", detail.take()))
+    }
+
+    /// Send one 1-wei nudge transfer, and advance past its nonce only if
+    /// it landed.
+    async fn send_nudge(&mut self, t: &Target) -> Result<()> {
+        self.nudge.send(&t.rpc, t.chain_id).await?;
+        Ok(())
+    }
 }
 
 /// What the A→B leg proved; the callback leg builds on it.
@@ -163,10 +223,168 @@ pub struct ForwardOutcome {
     pub sender_b: ChainSender,
 }
 
+/// Leg 1's state: both chains, A's origin id, B's executor state dir, the
+/// two per-chain senders, the receiver deployed on B, and the payload
+/// word it carries. The steps below read and update this as state
+/// instead of taking and threading it through loose parameters.
+struct ForwardLeg<'a> {
+    a: &'a Target,
+    b: &'a Target,
+    a_chain_id: u64,
+    b_exec_dir: &'a Path,
+    b_cursor_file: &'a Path,
+    sender_a: ChainSender,
+    sender_b: ChainSender,
+    receiver_on_b: Address,
+    payload_word: B256,
+}
+
+impl<'a> ForwardLeg<'a> {
+    /// Derive both senders and deploy the receiver contract on B
+    /// (ordinary CREATE through B's ingress).
+    async fn new(
+        a: &'a Target,
+        b: &'a Target,
+        a_chain_id: u64,
+        b_exec_dir: &'a Path,
+        b_cursor_file: &'a Path,
+    ) -> Result<Self> {
+        let sender_a = ChainSender::new()?;
+        let mut sender_b = ChainSender::new()?;
+        let receiver_on_b = Self::deploy_receiver_on_b(b, &mut sender_b).await?;
+        Ok(Self {
+            a,
+            b,
+            a_chain_id,
+            b_exec_dir,
+            b_cursor_file,
+            sender_a,
+            sender_b,
+            receiver_on_b,
+            payload_word: B256::repeat_byte(0xA5),
+        })
+    }
+
+    async fn deploy_receiver_on_b(b: &Target, sender_b: &mut ChainSender) -> Result<Address> {
+        let nonce = sender_b.next_nonce()?;
+        let deploy = l2::sign_create(sender_b.signer(), b.chain_id, nonce, &RECEIVER_INIT_CODE)?;
+        b.rpc
+            .send_raw(&deploy.raw)
+            .await
+            .result
+            .map_err(|e| anyhow::anyhow!("deploy receiver on B: {e}"))?;
+        let receipt = await_l2_receipt(b, deploy.hash, "the receiver deploy on B").await?;
+        assert_receipt_ok(&receipt, "the receiver deploy on B")?;
+        Ok(sender_b.signer().address.create(0))
+    }
+
+    /// The REAL send on A: dest = B, target = the receiver, with
+    /// `callback` addressed back to A. No closer: A's validator sends a
+    /// `head` event once the next block closes, and B's watcher derives
+    /// the batch from it.
+    async fn send_forward(&mut self, callback: Callback) -> Result<()> {
+        let (_send_block, seq) = self
+            .sender_a
+            .send_message(
+                self.a,
+                self.b.chain_id,
+                self.receiver_on_b,
+                self.payload_word.as_slice(),
+                Some(callback),
+                "A->B sendMessage",
+            )
+            .await?;
+        anyhow::ensure!(
+            seq == 0,
+            "first message on the A->B lane must be seq 0, got {seq}"
+        );
+        Ok(())
+    }
+
+    /// The delivery on B: a 0x7D receipt keyed by the position-derived
+    /// id, with the `MessageDelivered` and callback `MessageSent` logs
+    /// checked.
+    async fn await_forward_delivery(&self) -> Result<()> {
+        let r = assert_delivery_receipt(self.b, self.a_chain_id, 0, "A->B delivery on B").await?;
+        let logs = r
+            .get("logs")
+            .and_then(|l| l.as_array())
+            .context("no logs")?;
+        anyhow::ensure!(
+            logs.iter().any(|l| {
+                log_topic0(l) == Some(message_delivered_topic0())
+                    && log_topic(l, 1) == Some(u64_word(self.a_chain_id))
+                    && log_topic(l, 2) == Some(u64_word(0))
+            }),
+            "no MessageDelivered(origin=A, seq=0) log: {r}"
+        );
+        // The callback: B's Inbox enqueued the response through B's OWN
+        // Outbox.
+        anyhow::ensure!(
+            logs.iter().any(|l| {
+                log_topic0(l) == Some(Outbox::message_sent_topic0())
+                    && log_address(l).is_some_and(|x| x.eq_ignore_ascii_case(&OUTBOX.to_string()))
+                    && log_topic(l, 1) == Some(u64_word(self.a_chain_id))
+            }),
+            "the callback response must be enqueued through B's Outbox toward A: {r}"
+        );
+        Ok(())
+    }
+
+    /// Contract + Inbox state on B, from B's executor DB. Commits are
+    /// pipelined, so nudge B with transfers until the delivery is
+    /// durable.
+    async fn settle_forward_state(&mut self) -> Result<()> {
+        let b_exec_dir = self.b_exec_dir;
+        let a_chain_id = self.a_chain_id;
+        self.sender_b
+            .nudge_until(self.b, "B's Inbox.nextSeq[A] never settled >= 1", || {
+                let next_seq = read_slot(b_exec_dir, INBOX, Inbox::next_seq_slot(a_chain_id))?;
+                Ok((next_seq < U256::ONE).then(|| format!("got {next_seq}")))
+            })
+            .await?;
+        let delivered = read_slot(
+            self.b_exec_dir,
+            INBOX,
+            Inbox::delivered_slot(self.a_chain_id, 0),
+        )?;
+        anyhow::ensure!(
+            delivered == U256::ONE,
+            "B's Inbox.delivered[A][0] = {delivered}, expected 1"
+        );
+        let stored = read_slot(self.b_exec_dir, self.receiver_on_b, B256::ZERO)?;
+        anyhow::ensure!(
+            B256::from(stored.to_be_bytes::<32>()) == self.payload_word,
+            "the receiver on B must hold A's calldata word: got {stored:#x}"
+        );
+        // The response occupies seq 0 of B's return lane to A.
+        let lane_nonce = read_slot(
+            self.b_exec_dir,
+            OUTBOX,
+            Outbox::nonces_slot(self.a_chain_id),
+        )?;
+        anyhow::ensure!(
+            lane_nonce >= U256::ONE,
+            "B's Outbox.nonces[A] = {lane_nonce}, expected >= 1 (the callback response)"
+        );
+        Ok(())
+    }
+
+    /// B's durable lane cursor advanced past the delivered seq.
+    fn assert_forward_cursor(&self) -> Result<()> {
+        assert_cursor_at_least(self.b_cursor_file, 1, "B's A-lane")
+    }
+}
+
 /// Leg 1 — A → B: a user tx on A sends through A's REAL Outbox; A's
 /// validator extracts and serves; B's watcher (already subscribed to A's
 /// validator feed) derives; B delivers 0x7D through its Inbox into the
 /// receiver contract.
+///
+/// # Errors
+/// Returns an error at any of the checks the module docs describe: the
+/// receiver deploy, the send, the delivery receipt and its logs, the
+/// settled Inbox/Outbox/receiver state on B, or B's durable cursor.
 pub async fn forward_leg(
     a: &Target,
     b: &Target,
@@ -174,144 +392,25 @@ pub async fn forward_leg(
     b_exec_dir: &Path,
     b_cursor_file: &Path,
 ) -> Result<ForwardOutcome> {
-    let mut sender_a = ChainSender::new()?;
-    let mut sender_b = ChainSender::new()?;
+    let mut leg = ForwardLeg::new(a, b, a_chain_id, b_exec_dir, b_cursor_file).await?;
 
-    // Receiver contract on B (ordinary CREATE through B's ingress).
-    let deploy = l2::sign_create(
-        &sender_b.signer,
-        b.chain_id,
-        sender_b.nonce,
-        &RECEIVER_INIT_CODE,
-    )?;
-    sender_b.nonce += 1;
-    b.rpc
-        .send_raw(&deploy.raw)
-        .await
-        .result
-        .map_err(|e| anyhow::anyhow!("deploy receiver on B: {e}"))?;
-    let receipt = await_l2_receipt(b, deploy.hash, "the receiver deploy on B").await?;
-    assert_receipt_ok(&receipt, "the receiver deploy on B")?;
-    let receiver_on_b = sender_b.signer.address.create(0);
-
-    // The REAL send on A: dest = B, target = the receiver, with a callback
-    // addressed back to A.
-    let payload_word = B256::repeat_byte(0xA5);
     let callback = Callback {
-        target: sender_a.payee, // an EOA on A — delivery trivially succeeds
+        target: leg.sender_a.payee(), // an EOA on A — delivery trivially succeeds
         gas_limit: 90_000,
         context: B256::repeat_byte(0x42),
     };
-    let (_send_block, seq) = send_message(
-        a,
-        &mut sender_a,
-        b.chain_id,
-        receiver_on_b,
-        payload_word.as_slice(),
-        Some(callback),
-        "A->B sendMessage",
-    )
-    .await?;
-    anyhow::ensure!(
-        seq == 0,
-        "first message on the A->B lane must be seq 0, got {seq}"
-    );
-    // No closer: A's validator sends a `head` event once the next block
-    // closes, and B's watcher derives the batch from it.
+    leg.send_forward(callback).await?;
 
-    // The delivery on B: a 0x7D receipt keyed by the position-derived id.
-    let source_hash = remote_source_hash(a_chain_id, 0);
-    let r = await_l2_receipt(b, source_hash, "A->B delivery on B").await?;
-    assert_receipt_ok(&r, "A->B delivery on B")?;
-    anyhow::ensure!(
-        receipt_field(&r, "effectiveGasPrice") == Some("0x0"),
-        "delivery must execute fee-free: {r}"
-    );
-    let to = receipt_field(&r, "to").context("delivery receipt has no `to`")?;
-    anyhow::ensure!(
-        to.eq_ignore_ascii_case(&INBOX.to_string()),
-        "delivery must call the Inbox predeploy, got {to}"
-    );
-    let from = receipt_field(&r, "from").context("delivery receipt has no `from`")?;
-    anyhow::ensure!(
-        from.eq_ignore_ascii_case(&xchain_tx_sender(a_chain_id).to_string()),
-        "delivery sender must be the aliased A Outbox, got {from}"
-    );
-    let logs = r
-        .get("logs")
-        .and_then(|l| l.as_array())
-        .context("no logs")?;
-    anyhow::ensure!(
-        logs.iter().any(|l| {
-            log_topic0(l) == Some(message_delivered_topic0())
-                && log_topic(l, 1) == Some(u64_word(a_chain_id))
-                && log_topic(l, 2) == Some(u64_word(0))
-        }),
-        "no MessageDelivered(origin=A, seq=0) log: {r}"
-    );
-    // The callback: B's Inbox enqueued the response through B's OWN Outbox.
-    anyhow::ensure!(
-        logs.iter().any(|l| {
-            log_topic0(l) == Some(message_sent_topic0())
-                && log_address(l).is_some_and(|x| x.eq_ignore_ascii_case(&OUTBOX.to_string()))
-                && log_topic(l, 1) == Some(u64_word(a_chain_id))
-        }),
-        "the callback response must be enqueued through B's Outbox toward A: {r}"
-    );
-    // Contract + Inbox state on B, from B's executor DB. Commits are
-    // pipelined, so nudge B with transfers until the delivery is durable.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let next_seq = read_slot(b_exec_dir, INBOX, inbox_next_seq_slot(a_chain_id))?;
-        if next_seq >= U256::ONE {
-            break;
-        }
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "B's Inbox.nextSeq[A] never settled >= 1 (got {next_seq})"
-        );
-        let payee = sender_b.payee;
-        let nudge = l2::sign_transfer(&sender_b.signer, b.chain_id, sender_b.nonce, payee, 1)?;
-        if b.rpc.send_raw(&nudge.raw).await.result.is_ok() {
-            sender_b.nonce += 1;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-    let delivered = read_slot(b_exec_dir, INBOX, inbox_delivered_slot(a_chain_id, 0))?;
-    anyhow::ensure!(
-        delivered == U256::ONE,
-        "B's Inbox.delivered[A][0] = {delivered}, expected 1"
-    );
-    let stored = read_slot(b_exec_dir, receiver_on_b, B256::ZERO)?;
-    anyhow::ensure!(
-        B256::from(stored.to_be_bytes::<32>()) == payload_word,
-        "the receiver on B must hold A's calldata word: got {stored:#x}"
-    );
-    // The response occupies seq 0 of B's return lane to A.
-    let lane_nonce = read_slot(b_exec_dir, OUTBOX, outbox_nonces_slot(a_chain_id))?;
-    anyhow::ensure!(
-        lane_nonce >= U256::ONE,
-        "B's Outbox.nonces[A] = {lane_nonce}, expected >= 1 (the callback response)"
-    );
-
-    // B's durable lane cursor advanced past the delivered seq.
-    let cursor = std::fs::read_to_string(b_cursor_file)
-        .with_context(|| format!("read B cursor {}", b_cursor_file.display()))?;
-    let cursor_seq: u64 = cursor
-        .trim()
-        .parse()
-        .with_context(|| format!("parse B cursor {cursor:?}"))?;
-    anyhow::ensure!(
-        cursor_seq >= 1,
-        "B's A-lane cursor must be >= 1, got {cursor_seq}"
-    );
+    leg.await_forward_delivery().await?;
+    leg.settle_forward_state().await?;
+    leg.assert_forward_cursor()?;
 
     Ok(ForwardOutcome {
-        receiver_on_b,
-        payload_word,
+        receiver_on_b: leg.receiver_on_b,
+        payload_word: leg.payload_word,
         callback,
-        sender_a,
-        sender_b,
+        sender_a: leg.sender_a,
+        sender_b: leg.sender_b,
     })
 }
 
@@ -319,6 +418,11 @@ pub async fn forward_leg(
 /// A's second watcher (subscribed to B's validator feed) derives the
 /// response, and `onXChainResult` is delivered ON A as a 0x7D from the
 /// aliased B Outbox — the round trip A→B→A, no mock anywhere.
+///
+/// # Errors
+/// Returns an error when the response delivery receipt or its
+/// `MessageDelivered` log is missing or wrong, when A's Inbox never
+/// settles the delivery, or when A's durable cursor does not advance.
 pub async fn callback_leg(
     a: &Target,
     b: &Target,
@@ -357,101 +461,18 @@ pub async fn callback_leg(
     );
 
     // A's Inbox marks the response delivered — nudge A until durable.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let delivered = read_slot(a_exec_dir, INBOX, inbox_delivered_slot(b.chain_id, 0))?;
-        if delivered == U256::ONE {
-            break;
-        }
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "A's Inbox.delivered[B][0] never settled at 1 (got {delivered})"
-        );
-        let payee = outcome.sender_a.payee;
-        let nudge = l2::sign_transfer(
-            &outcome.sender_a.signer,
-            a.chain_id,
-            outcome.sender_a.nonce,
-            payee,
-            1,
-        )?;
-        if a.rpc.send_raw(&nudge.raw).await.result.is_ok() {
-            outcome.sender_a.nonce += 1;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
+    outcome
+        .sender_a
+        .nudge_until(a, "A's Inbox.delivered[B][0] never settled at 1", || {
+            let delivered = read_slot(a_exec_dir, INBOX, Inbox::delivered_slot(b.chain_id, 0))?;
+            Ok((delivered != U256::ONE).then(|| format!("got {delivered}")))
+        })
+        .await?;
 
     // A's durable cursor for the B lane advanced past the response.
-    let cursor = std::fs::read_to_string(a_cursor_file)
-        .with_context(|| format!("read A cursor {}", a_cursor_file.display()))?;
-    let cursor_seq: u64 = cursor
-        .trim()
-        .parse()
-        .with_context(|| format!("parse A cursor {cursor:?}"))?;
-    anyhow::ensure!(
-        cursor_seq >= 1,
-        "A's B-lane cursor must be >= 1, got {cursor_seq}"
-    );
-    Ok(())
+    assert_cursor_at_least(a_cursor_file, 1, "A's B-lane")
 }
 
 #[cfg(test)]
-mod abi_tests {
-    use super::*;
-    use alloy_sol_types::{SolCall, sol};
-
-    sol! {
-        struct SolCb {
-            address target;
-            uint64 gasLimit;
-            bytes32 context;
-        }
-
-        function sendMessage(
-            uint64 destChainId,
-            address target,
-            uint64 gasLimit,
-            bytes data,
-            SolCb cb
-        );
-    }
-
-    /// The hand-rolled `sendMessage` calldata must match `alloy-sol-types`
-    /// byte for byte (audit 2026-09-03, L4). Empty, sub-word, and word+1
-    /// payloads exercise the zero-length tail, the right padding, and a
-    /// two-word tail.
-    #[test]
-    fn send_message_calldata_is_byte_identical_to_sol_types() {
-        assert_eq!(sendMessageCall::SELECTOR, outbox_send_message_selector());
-        let cb = Callback {
-            target: Address::repeat_byte(0x0C),
-            gas_limit: 90_000,
-            context: B256::repeat_byte(0x1D),
-        };
-        let target = Address::repeat_byte(0xB9);
-        for data in [&b""[..], &[0x01][..], &[0xEE; 33][..]] {
-            for callback in [None, Some(cb)] {
-                let c = callback.unwrap_or_default();
-                let expect = sendMessageCall {
-                    destChainId: CHAIN_B_ID,
-                    target,
-                    gasLimit: 250_000,
-                    data: alloy_primitives::Bytes::copy_from_slice(data),
-                    cb: SolCb {
-                        target: c.target,
-                        gasLimit: c.gas_limit,
-                        context: c.context,
-                    },
-                }
-                .abi_encode();
-                assert_eq!(
-                    send_message_calldata(CHAIN_B_ID, target, 250_000, data, callback),
-                    expect,
-                    "data len {}, callback {}",
-                    data.len(),
-                    callback.is_some()
-                );
-            }
-        }
-    }
-}
+#[path = "xchain_two_stacks_tests.rs"]
+mod abi_tests;

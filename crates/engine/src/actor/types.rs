@@ -2,6 +2,8 @@
 //! the run configuration, the BAL and whole-block-execution hand-off shapes,
 //! and the internal exec-to-commit envelope.
 
+use std::num::{NonZeroU64, NonZeroUsize};
+
 use kardamom_types::BlockBoundary;
 
 use crate::block_env::ExecEnv;
@@ -24,8 +26,8 @@ use crate::reader::ReaderConfig;
 /// - `block`: the last durably-committed block (`last_committed_block`).
 ///   The first boundary delivered after resume is `block + 1`. Execution
 ///   resumes against the state snapshot taken after `block`.
-/// - `record_count`: the cumulative count of canonical records (TxRef and
-///   DepositRef) applied through `block`
+/// - `record_count`: the cumulative count of canonical records (`TxRef` and
+///   `DepositRef`) applied through `block`
 ///   (`last_fsynced_b_position.as_index()`). The reader assigns this index
 ///   to the first delivered record, so the boundary alignment check
 ///   (absolute counts) still holds across the restart. `record_count` is
@@ -55,6 +57,7 @@ impl ResumePoint {
 
     /// True when this cursor points mid-chain (a crash-recovery restart)
     /// rather than at genesis.
+    #[must_use]
     pub fn is_resume(&self) -> bool {
         self.block > 0
     }
@@ -66,12 +69,26 @@ impl Default for ResumePoint {
     }
 }
 
+impl From<&kardamom_state::RecoveryPoint> for ResumePoint {
+    /// Build the resume cursor from the state writer's persisted recovery
+    /// point. `record_count` reads `last_fsynced_b_position` as an absolute
+    /// canonical record count, matching how the reader and exec threads
+    /// key their counters.
+    fn from(recovery: &kardamom_state::RecoveryPoint) -> Self {
+        Self {
+            block: recovery.last_committed_block,
+            record_count: recovery.last_fsynced_b_position.as_index(),
+            l2_timestamp: recovery.last_committed_l2_timestamp,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
-    pub chain_id: u64,
+    pub chain_id: NonZeroU64,
     /// Bound on the receipt queue between the exec and commit threads. A
     /// larger bound gives more amortization, at the cost of more memory.
-    pub receipt_queue_depth: usize,
+    pub receipt_queue_depth: NonZeroUsize,
     /// Reader-layer tunables (join buffer timeout, growth warning
     /// threshold). See [`ReaderConfig`].
     pub reader: ReaderConfig,
@@ -98,54 +115,93 @@ pub struct ExecutorConfig {
     pub verify_record_identity: bool,
 }
 
+/// Default [`ExecutorConfig::chain_id`]: chain id 1.
+const DEFAULT_CHAIN_ID: NonZeroU64 = NonZeroU64::new(1).expect("1 is nonzero");
+
+/// Default [`ExecutorConfig::receipt_queue_depth`].
+const DEFAULT_RECEIPT_QUEUE_DEPTH: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 is nonzero");
+
 impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
-            chain_id: 1,
-            receipt_queue_depth: 1024,
+            chain_id: DEFAULT_CHAIN_ID,
+            receipt_queue_depth: DEFAULT_RECEIPT_QUEUE_DEPTH,
             reader: ReaderConfig::default(),
             verify_record_identity: false,
         }
     }
 }
 
-/// Per-block EIP-7928 hand-off to the executor's BAL publisher thread: the
-/// boundary, the receipts-free merged delta for the frame's V1 section, and
-/// the captured Bal. Sent at each boundary when capture is enabled.
-pub type BalHandoff = (
-    BlockBoundary,
-    kardamom_types::BlockDelta,
-    revm::state::bal::Bal,
-);
+/// Per-block EIP-7928 hand-off to the executor's BAL publisher thread. Sent
+/// at each boundary when capture is enabled.
+pub struct BalHandoff {
+    pub boundary: BlockBoundary,
+    /// The receipts-free merged delta for the frame's V1 section.
+    pub delta: kardamom_types::BlockDelta,
+    pub bal: revm::state::bal::Bal,
+}
 
-// The buffered-record and block-output types moved to the `no_std` exec
-// core with the phase-3 stateless driver, since they are its input and
-// output shapes. Re-exported here so every pre-move path still resolves.
-// They still mirror the payload arms of `crate::reader::ReaderToExec`.
+// The buffered-record and block-output shapes live in the `no_std`
+// `kardamom-exec-core` crate, since they are its stateless driver's input
+// and output types. This re-export keeps the path resolving here too.
+// They mirror the payload arms of `crate::reader::ReaderToExec`.
 pub use kardamom_exec_core::stateless::{BlockExecOutput, BufferedRecord};
 
-/// Optional whole-block execution strategy. `None` (the executor) keeps the
-/// per-transaction streaming path unchanged. `Some` (the validator's
-/// parallel verifier) makes the exec thread buffer a block's records and
-/// execute them together at the boundary. This is what lets batches run
-/// concurrently, seeded from BAL claims.
-/// Parameters: snapshot, parent layer, records, env, block_number. The
-/// parent layer is the actor's merged, not-yet-durable writes. The depth-K
+/// Optional whole-block execution strategy.
+/// [`RoleHooks::block_exec`](super::wiring::RoleHooks::block_exec) carries
+/// `None` (the executor) to keep the per-transaction streaming
+/// path unchanged, or `Some` (the validator's parallel verifier) to make
+/// the exec thread buffer a block's records and execute them together at
+/// the boundary. This is what lets batches run concurrently, seeded from
+/// BAL claims.
+///
+/// The implementation set is closed: the validator's parallel verifier is
+/// one strategy, the executor's STM pool is another, and [`NoBlockExec`]
+/// is the third. [`ExecPorts::BlockExec`](super::wiring::ExecPorts) names
+/// one of them per wiring, so the exec thread calls it through a static
+/// type, not a boxed trait object.
+///
+/// `parent` is the actor's merged, not-yet-durable writes. The depth-K
 /// commit pipeline lets execution run up to K blocks ahead of fsync, so the
-/// snapshot alone can be K blocks stale. Ignoring the parent layer executes
-/// against old state. Under load, this caused the validator to skip
-/// transactions (nonce mismatch) that the executor had already executed.
-/// This was a proven divergence, found in the first DeFi gate.
-pub type BlockExec<D> = Box<
-    dyn Fn(
-            &D,
-            Option<&PendingDelta>,
-            &[BufferedRecord],
-            ExecEnv,
-            u64,
-        ) -> Result<BlockExecOutput, ExecutorError>
-        + Send,
->;
+/// snapshot alone can be K blocks stale. A strategy that ignores the parent
+/// layer executes against stale state: under load, it can skip a
+/// transaction (nonce mismatch) that the executor already executed.
+pub trait BlockExecStrategy<D>: Send {
+    /// Execute every record buffered for one block against `snapshot` and
+    /// `parent`, under `env`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when execution fails.
+    fn execute_block(
+        &self,
+        snapshot: &D,
+        parent: Option<&PendingDelta>,
+        records: &[BufferedRecord],
+        env: ExecEnv,
+        block_number: u64,
+    ) -> Result<BlockExecOutput, ExecutorError>;
+}
+
+/// No whole-block execution strategy: the streaming per-transaction path
+/// handles every record. This type has no values, so
+/// `RoleHooks::block_exec` can only ever be `None` for a wiring that names
+/// it, and `execute_block` never runs.
+#[derive(Debug, Clone, Copy)]
+pub enum NoBlockExec {}
+
+impl<D> BlockExecStrategy<D> for NoBlockExec {
+    fn execute_block(
+        &self,
+        _snapshot: &D,
+        _parent: Option<&PendingDelta>,
+        _records: &[BufferedRecord],
+        _env: ExecEnv,
+        _block_number: u64,
+    ) -> Result<BlockExecOutput, ExecutorError> {
+        match *self {}
+    }
+}
 
 /// Internal envelope routed from the exec thread to the commit thread.
 pub(crate) enum ExecToCommit {

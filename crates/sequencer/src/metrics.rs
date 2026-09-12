@@ -6,55 +6,57 @@
 
 use metrics::{counter, gauge, histogram};
 
+/// Read from outside the crate by the `/metrics` endpoint test.
 pub const TX_INGESTED: &str = "kardamom_sequencer_tx_ingested_total";
-pub const TX_PUBLISHED_TO_B: &str = "kardamom_sequencer_tx_published_to_b_total";
-pub const TX_BUFFERED_FUTURE: &str = "kardamom_sequencer_tx_buffered_future_total";
-pub const TX_DROPPED_PAST: &str = "kardamom_sequencer_tx_dropped_past_total";
-pub const PENDING_BUFFER_EVICTIONS: &str = "kardamom_sequencer_pending_evictions_total";
+pub(crate) const TX_PUBLISHED_TO_B: &str = "kardamom_sequencer_tx_published_to_b_total";
+pub(crate) const TX_BUFFERED_FUTURE: &str = "kardamom_sequencer_tx_buffered_future_total";
+pub(crate) const TX_DROPPED_PAST: &str = "kardamom_sequencer_tx_dropped_past_total";
+pub(crate) const PENDING_BUFFER_EVICTIONS: &str = "kardamom_sequencer_pending_evictions_total";
 /// Parked entries that waited on a nonce gap past `tx_ttl`. Each one got
-/// an explicit `Expired` error on tx_errors.
-pub const PENDING_BUFFER_EXPIRED: &str = "kardamom_sequencer_pending_expired_total";
+/// an explicit `Expired` error on `tx_errors`.
+pub(crate) const PENDING_BUFFER_EXPIRED: &str = "kardamom_sequencer_pending_expired_total";
 /// Nonce lookups. `NONCE_LOOKUP_REQUESTS` counts the parks that asked for
 /// one. `NONCE_LOOKUPS` counts the queries the task ran, by `outcome`
 /// (`ok`, `error`, `timeout`, `shed`). `NONCE_LOOKUPS_IN_FLIGHT` is the
 /// concurrent query gauge.
-pub const NONCE_LOOKUP_REQUESTS: &str = "kardamom_sequencer_nonce_lookup_requests_total";
-pub const NONCE_LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
-pub const NONCE_LOOKUPS_IN_FLIGHT: &str = "kardamom_sequencer_nonce_lookups_in_flight";
+pub(crate) const NONCE_LOOKUP_REQUESTS: &str = "kardamom_sequencer_nonce_lookup_requests_total";
+pub(crate) const NONCE_LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
+pub(crate) const NONCE_LOOKUPS_IN_FLIGHT: &str = "kardamom_sequencer_nonce_lookups_in_flight";
 /// Envelopes dropped by the wrong-shard guard: their vslot is not in this
 /// replica's set. During a resize, a new shard reads the old lanes whole,
 /// so this counts the other shards' traffic. It is not an error.
-pub const WRONG_SHARD_DROPPED: &str = "kardamom_sequencer_wrong_shard_dropped_total";
+pub(crate) const WRONG_SHARD_DROPPED: &str = "kardamom_sequencer_wrong_shard_dropped_total";
 /// Refs the state machine advanced past in shadow mode without an offer.
-pub const SHADOW_SUPPRESSED: &str = "kardamom_sequencer_shadow_suppressed_total";
+pub(crate) const SHADOW_SUPPRESSED: &str = "kardamom_sequencer_shadow_suppressed_total";
 /// The number of vslots in shadow mode. 0 means the replica publishes for
 /// its whole set.
-pub const SHADOW_VSLOTS: &str = "kardamom_sequencer_shadow_vslots";
+pub(crate) const SHADOW_VSLOTS: &str = "kardamom_sequencer_shadow_vslots";
 /// The parked entries per vslot, refreshed once per second. The resize
 /// runbook reads it for the moved vslots before it restarts the old
 /// shard.
-pub const PENDING_DEPTH: &str = "kardamom_sequencer_pending_depth";
-pub const BACKPRESSURE_EVENTS: &str = "kardamom_sequencer_backpressure_total";
-pub const NONCE_CHECK_DURATION_SECONDS: &str = "kardamom_sequencer_nonce_check_duration_seconds";
+pub(crate) const PENDING_DEPTH: &str = "kardamom_sequencer_pending_depth";
+pub(crate) const BACKPRESSURE_EVENTS: &str = "kardamom_sequencer_backpressure_total";
+pub(crate) const NONCE_CHECK_DURATION_SECONDS: &str =
+    "kardamom_sequencer_nonce_check_duration_seconds";
 
-// Lag detection and receipt-floor resync. See docs/agents/sequencer-lag-resync-spec.md.
-pub const RESYNC_MODE: &str = "kardamom_sequencer_resync_mode";
-pub const RESYNC_ENTERED: &str = "kardamom_sequencer_resync_entered_total";
+// Lag detection and receipt-floor resync.
+pub(crate) const RESYNC_MODE: &str = "kardamom_sequencer_resync_mode";
+pub(crate) const RESYNC_ENTERED: &str = "kardamom_sequencer_resync_entered_total";
 /// The egress FEED thread bumps this counter as soon as it sees a lag
 /// signature (a boundary-arrival gap past the silence threshold). This
 /// works even if the publish loop stalls, unlike `RESYNC_ENTERED`, which
 /// needs the publish loop to run. The chaos suite checks this counter.
-pub const RESYNC_LAG_SUSPECTED: &str = "kardamom_sequencer_resync_lag_suspected_total";
-pub const RESYNC_SKIPPED_EXECUTED: &str = "kardamom_sequencer_resync_skipped_executed_total";
-pub const RECEIPT_FLOOR_SENDERS: &str = "kardamom_sequencer_receipt_floor_senders";
-pub const RECEIPT_FLOOR_ADVANCES: &str = "kardamom_sequencer_receipt_floor_advances_total";
-pub const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_watermark";
+pub(crate) const RESYNC_LAG_SUSPECTED: &str = "kardamom_sequencer_resync_lag_suspected_total";
+pub(crate) const RESYNC_SKIPPED_EXECUTED: &str = "kardamom_sequencer_resync_skipped_executed_total";
+pub(crate) const RECEIPT_FLOOR_SENDERS: &str = "kardamom_sequencer_receipt_floor_senders";
+pub(crate) const RECEIPT_FLOOR_ADVANCES: &str = "kardamom_sequencer_receipt_floor_advances_total";
+pub(crate) const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_watermark";
 /// A gauge for refs that are published but not yet receipt-confirmed as
 /// committed. A counter for refs that are rewound and republished after
 /// the confirm timeout. A steady nonzero republish rate means offers land
 /// in a void (a dead-leader window), or receipts are not flowing.
-pub const REF_UNCONFIRMED: &str = "kardamom_sequencer_ref_unconfirmed";
-pub const REF_REPUBLISHED: &str = "kardamom_sequencer_ref_republished_total";
+pub(crate) const REF_UNCONFIRMED: &str = "kardamom_sequencer_ref_unconfirmed";
+pub(crate) const REF_REPUBLISHED: &str = "kardamom_sequencer_ref_republished_total";
 
 /// Remote epochs, and the messages inside them, relayed from
 /// `tx_remote_epochs` onto the canonical stream. Labeled by origin chain,
@@ -62,8 +64,8 @@ pub const REF_REPUBLISHED: &str = "kardamom_sequencer_ref_republished_total";
 /// pair must be attributable to the peer, not to a shard. Racing
 /// sequencers each count their own offer, so these are relay attempts.
 /// Cluster dedup collapses the M copies downstream.
-pub const REMOTE_EPOCHS_RELAYED: &str = "kardamom_sequencer_remote_epochs_relayed_total";
-pub const REMOTE_MESSAGES_RELAYED: &str = "kardamom_sequencer_remote_messages_relayed_total";
+pub(crate) const REMOTE_EPOCHS_RELAYED: &str = "kardamom_sequencer_remote_epochs_relayed_total";
+pub(crate) const REMOTE_MESSAGES_RELAYED: &str = "kardamom_sequencer_remote_messages_relayed_total";
 /// Remote-origin records the sealer rejected, by origin and reason
 /// (`seq_mismatch`, `anchor_regressed`, `slot_count_mismatch`,
 /// `unknown_origin`, `bad_range`). A nonzero `seq_mismatch` rate means a
@@ -111,13 +113,36 @@ impl HotMetrics {
     }
 }
 
+/// Increment a partition-labeled counter by `n`. Every per-partition
+/// counter recorder in this module is one call to this, instead of its
+/// own `counter!(NAME, "partition" => p.to_string()).increment(n)` line.
+fn bump(name: &'static str, partition: u32, n: u64) {
+    counter!(name, "partition" => partition.to_string()).increment(n);
+}
+
+/// Set a partition-labeled gauge to `v`. The gauge counterpart of
+/// [`bump`].
+fn set(name: &'static str, partition: u32, v: f64) {
+    gauge!(name, "partition" => partition.to_string()).set(v);
+}
+
+/// A count as a gauge value. Every count in this module stays far under
+/// 2^52, so the `f64` mantissa holds it exactly.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a gauge value; no count here nears 2^52, so the f64 mantissa holds it exactly"
+)]
+fn gauge_value(n: usize) -> f64 {
+    n as f64
+}
+
 pub fn record_shadow_vslots(partition: u32, n: usize) {
-    gauge!(SHADOW_VSLOTS, "partition" => partition.to_string()).set(n as f64);
+    set(SHADOW_VSLOTS, partition, gauge_value(n));
 }
 
 pub fn record_pending_depth(partition: u32, vslot: u8, depth: u32) {
     gauge!(PENDING_DEPTH, "partition" => partition.to_string(), "vslot" => vslot.to_string())
-        .set(depth as f64);
+        .set(f64::from(depth));
 }
 
 pub fn record_nonce_lookup(partition: u32, outcome: &'static str) {
@@ -126,43 +151,15 @@ pub fn record_nonce_lookup(partition: u32, outcome: &'static str) {
 }
 
 pub fn record_nonce_lookups_in_flight(partition: u32, n: usize) {
-    gauge!(NONCE_LOOKUPS_IN_FLIGHT, "partition" => partition.to_string()).set(n as f64);
+    set(NONCE_LOOKUPS_IN_FLIGHT, partition, gauge_value(n));
 }
 
-pub fn record_ingest(partition: u32) {
-    counter!(TX_INGESTED, "partition" => partition.to_string()).increment(1);
+pub(crate) fn record_resync_mode(partition: u32, active: bool) {
+    set(RESYNC_MODE, partition, if active { 1.0 } else { 0.0 });
 }
 
-pub fn record_publish(partition: u32) {
-    counter!(TX_PUBLISHED_TO_B, "partition" => partition.to_string()).increment(1);
-}
-
-pub fn record_buffered_future(partition: u32) {
-    counter!(TX_BUFFERED_FUTURE, "partition" => partition.to_string()).increment(1);
-}
-
-pub fn record_past(partition: u32) {
-    counter!(TX_DROPPED_PAST, "partition" => partition.to_string()).increment(1);
-}
-
-pub fn record_eviction(partition: u32) {
-    counter!(PENDING_BUFFER_EVICTIONS, "partition" => partition.to_string()).increment(1);
-}
-
-pub fn record_backpressure(partition: u32) {
-    counter!(BACKPRESSURE_EVENTS, "partition" => partition.to_string()).increment(1);
-}
-
-pub fn record_nonce_check_latency(partition: u32, seconds: f64) {
-    histogram!(NONCE_CHECK_DURATION_SECONDS, "partition" => partition.to_string()).record(seconds);
-}
-
-pub fn record_resync_mode(partition: u32, active: bool) {
-    gauge!(RESYNC_MODE, "partition" => partition.to_string()).set(if active { 1.0 } else { 0.0 });
-}
-
-pub fn record_resync_enter(partition: u32) {
-    counter!(RESYNC_ENTERED, "partition" => partition.to_string()).increment(1);
+pub(crate) fn record_resync_enter(partition: u32) {
+    bump(RESYNC_ENTERED, partition, 1);
     record_resync_mode(partition, true);
 }
 
@@ -172,45 +169,49 @@ pub fn record_resync_enter(partition: u32) {
 /// the startup resync). But a start time after a known event proves the
 /// process is new. This works over plain HTTP, with no docker-exec, which
 /// can hang for minutes after a thaw on CI runners.
-pub const START_TIME_SECONDS: &str = "kardamom_sequencer_start_time_seconds";
+pub(crate) const START_TIME_SECONDS: &str = "kardamom_sequencer_start_time_seconds";
 
 pub fn record_start_time() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+        .map_or(0.0, |d| d.as_secs_f64());
     metrics::gauge!(START_TIME_SECONDS).set(now);
 }
 
 pub fn record_lag_suspected(partition: u32) {
-    counter!(RESYNC_LAG_SUSPECTED, "partition" => partition.to_string()).increment(1);
+    bump(RESYNC_LAG_SUSPECTED, partition, 1);
 }
 
-pub fn record_resync_skip(partition: u32) {
-    counter!(RESYNC_SKIPPED_EXECUTED, "partition" => partition.to_string()).increment(1);
+pub(crate) fn record_resync_skip(partition: u32, count: u64) {
+    bump(RESYNC_SKIPPED_EXECUTED, partition, count);
 }
 
-pub fn record_floor_senders(partition: u32, senders: usize) {
-    gauge!(RECEIPT_FLOOR_SENDERS, "partition" => partition.to_string()).set(senders as f64);
+pub(crate) fn record_floor_senders(partition: u32, senders: usize) {
+    set(RECEIPT_FLOOR_SENDERS, partition, gauge_value(senders));
 }
 
-pub fn record_floor_advance(partition: u32) {
-    counter!(RECEIPT_FLOOR_ADVANCES, "partition" => partition.to_string()).increment(1);
+pub(crate) fn record_floor_advance(partition: u32) {
+    bump(RECEIPT_FLOOR_ADVANCES, partition, 1);
 }
 
-pub fn record_canonical_watermark(partition: u32, count: u64) {
-    gauge!(CANONICAL_WATERMARK, "partition" => partition.to_string()).set(count as f64);
+pub(crate) fn record_canonical_watermark(partition: u32, count: u64) {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a gauge value; the canonical tx count never nears 2^52, so the f64 mantissa holds it exactly"
+    )]
+    let count = count as f64;
+    set(CANONICAL_WATERMARK, partition, count);
 }
 
-pub fn record_unconfirmed_refs(partition: u32, n: usize) {
-    gauge!(REF_UNCONFIRMED, "partition" => partition.to_string()).set(n as f64);
+pub(crate) fn record_unconfirmed_refs(partition: u32, n: usize) {
+    set(REF_UNCONFIRMED, partition, gauge_value(n));
 }
 
-pub fn record_ref_republished(partition: u32, n: usize) {
-    counter!(REF_REPUBLISHED, "partition" => partition.to_string()).increment(n as u64);
+pub(crate) fn record_ref_republished(partition: u32, n: usize) {
+    bump(REF_REPUBLISHED, partition, n as u64);
 }
 
-pub fn record_remote_epoch_relayed(origin_chain_id: u64, messages: usize) {
+pub(crate) fn record_remote_epoch_relayed(origin_chain_id: u64, messages: usize) {
     let origin = origin_chain_id.to_string();
     counter!(REMOTE_EPOCHS_RELAYED, "origin" => origin.clone()).increment(1);
     counter!(REMOTE_MESSAGES_RELAYED, "origin" => origin).increment(messages as u64);
@@ -233,12 +234,25 @@ mod tests {
     fn record_helpers_smoke() {
         // The default recorder is a no-op until installed. These calls only
         // exercise the API surface, to keep it compiling.
-        record_ingest(0);
-        record_publish(0);
-        record_buffered_future(0);
-        record_past(0);
-        record_eviction(0);
-        record_backpressure(0);
-        record_nonce_check_latency(0, 0.0015);
+        let hot = HotMetrics::new(0);
+        hot.ingest.increment(0);
+        hot.publish.increment(0);
+        hot.buffered_future.increment(0);
+        hot.dropped_past.increment(0);
+        hot.evictions.increment(0);
+        hot.expired.increment(0);
+        hot.lookup_requests.increment(0);
+        hot.wrong_shard.increment(0);
+        hot.shadow_suppressed.increment(0);
+        hot.backpressure.increment(0);
+        record_shadow_vslots(0, 0);
+        record_pending_depth(0, 0, 0);
+        record_nonce_lookup(0, "ok");
+        record_nonce_lookups_in_flight(0, 0);
+        hot.nonce_check_seconds.record(0.0015);
+        record_start_time();
+        record_lag_suspected(0);
+        record_remote_epoch_relayed(0, 0);
+        record_remote_origin_reject(0, "seq_mismatch");
     }
 }

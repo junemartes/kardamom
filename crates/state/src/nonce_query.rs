@@ -30,10 +30,13 @@
 //! transaction, and the writer's page reclaim waits on old transactions.
 
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use alloy_primitives::Address;
 use kardamom_types::StateDatabase;
+use kardamom_types::num::usize_to_u64;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -59,37 +62,63 @@ pub struct NonceQueryServer {
 /// Serve account nonce queries on `addr`, forever. Binding happens before
 /// the task spawns, so a bad address fails startup with a clear error.
 /// Call this inside a tokio runtime.
+///
+/// # Errors
+///
+/// Returns the bind error when `addr` cannot be bound.
 pub fn serve_nonce_queries(addr: SocketAddr, env: StateEnv) -> std::io::Result<NonceQueryServer> {
     let std_listener = std::net::TcpListener::bind(addr)?;
     std_listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(std_listener)?;
     let addr = listener.local_addr()?;
     info!(%addr, "serving account nonce queries");
-    let task = tokio::spawn(async move {
-        loop {
-            let stream = match listener.accept().await {
-                Ok((s, _)) => s,
-                Err(e) => {
-                    warn!(error = %e, "nonce query accept failed");
-                    continue;
-                }
-            };
-            let env = env.clone();
-            tokio::spawn(async move {
-                if let Err(e) = serve_one(stream, env).await {
-                    warn!(error = %e, "nonce query connection failed");
-                }
-            });
-        }
-    });
+    let server = QueryServer { listener, env };
+    let task = tokio::spawn(server.run());
     Ok(NonceQueryServer { addr, task })
+}
+
+/// The accept loop: one task per connection.
+struct QueryServer {
+    listener: TcpListener,
+    env: StateEnv,
+}
+
+impl QueryServer {
+    async fn run(self) {
+        loop {
+            self.accept_one().await;
+        }
+    }
+
+    /// Accept one connection and serve it on its own task. An accept
+    /// error is logged; the loop goes on.
+    async fn accept_one(&self) {
+        let stream = match self.listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                warn!(error = %e, "nonce query accept failed");
+                return;
+            }
+        };
+        let env = self.env.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_one(stream, env).await {
+                warn!(error = %e, "nonce query connection failed");
+            }
+        });
+    }
 }
 
 /// The committed nonce of `address`, and the block of the snapshot that
 /// answered. An unknown account has nonce 0.
+///
+/// # Errors
+///
+/// Returns the state error when the snapshot cannot open or the read
+/// fails.
 pub fn committed_nonce(env: &StateEnv, address: Address) -> Result<(u64, u64), StateError> {
     let snapshot = StateSnapshot::open(env)?;
-    let nonce = snapshot.basic(address)?.map(|(n, _, _)| n).unwrap_or(0);
+    let nonce = snapshot.basic(address)?.map_or(0, |(n, _, _)| n);
     Ok((nonce, snapshot.block_number()))
 }
 
@@ -103,143 +132,206 @@ struct Request {
     params: Vec<serde_json::Value>,
 }
 
-fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> String {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": { "code": code, "message": message },
-    })
-    .to_string()
+/// The reply to one request: the HTTP status, the JSON body, and the
+/// snapshot block when a query ran.
+struct Reply {
+    status: &'static str,
+    body: String,
+    block: Option<u64>,
 }
 
-/// Answer one request body. Returns the HTTP status, the JSON body, and
-/// the snapshot block when a query ran.
-async fn answer(env: &StateEnv, body: &[u8]) -> (&'static str, String, Option<u64>) {
-    let request: Request = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(_) => {
-            metrics::counter!(NONCE_QUERIES, "outcome" => "bad_request").increment(1);
-            return (
-                "400 Bad Request",
-                rpc_error(serde_json::Value::Null, -32700, "parse error"),
-                None,
-            );
+impl Reply {
+    /// A JSON-RPC error body under `status`, counted as `outcome`.
+    fn error(
+        status: &'static str,
+        outcome: &'static str,
+        id: &serde_json::Value,
+        code: i64,
+        message: &str,
+    ) -> Self {
+        metrics::counter!(NONCE_QUERIES, "outcome" => outcome).increment(1);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message },
+        })
+        .to_string();
+        Self {
+            status,
+            body,
+            block: None,
         }
-    };
-    if request.method != "eth_getTransactionCount" {
-        metrics::counter!(NONCE_QUERIES, "outcome" => "bad_request").increment(1);
-        return (
-            "200 OK",
-            rpc_error(request.id, -32601, "method not found"),
-            None,
-        );
     }
-    let address = request
+
+    /// A malformed request, before any JSON-RPC id is known.
+    fn bad_request(code: i64, message: &str) -> Self {
+        Self::error(
+            "400 Bad Request",
+            "bad_request",
+            &serde_json::Value::Null,
+            code,
+            message,
+        )
+    }
+
+    /// A well-formed request the server cannot answer: the JSON-RPC error
+    /// rides a `200 OK`, as the protocol says.
+    fn rpc_error(id: &serde_json::Value, code: i64, message: &str) -> Self {
+        Self::error("200 OK", "bad_request", id, code, message)
+    }
+
+    /// A failed state read.
+    fn internal(id: &serde_json::Value, message: &str) -> Self {
+        Self::error("500 Internal Server Error", "error", id, -32603, message)
+    }
+
+    /// The committed `nonce` at `block`.
+    fn ok(id: &serde_json::Value, nonce: u64, block: u64) -> Self {
+        metrics::counter!(NONCE_QUERIES, "outcome" => "ok").increment(1);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": format!("{nonce:#x}"),
+        })
+        .to_string();
+        Self {
+            status: "200 OK",
+            body,
+            block: Some(block),
+        }
+    }
+
+    /// Write the HTTP/1.0 response and close.
+    async fn write<W: AsyncWriteExt + Unpin>(&self, wr: &mut W) -> std::io::Result<()> {
+        let block_header = self
+            .block
+            .map(|b| format!("x-state-block: {b}\r\n"))
+            .unwrap_or_default();
+        let head = format!(
+            "HTTP/1.0 {}\r\ncontent-type: application/json\r\n{block_header}\
+             content-length: {}\r\nconnection: close\r\n\r\n",
+            self.status,
+            self.body.len()
+        );
+        timeout(IO_TIMEOUT, wr.write_all(head.as_bytes())).await??;
+        timeout(IO_TIMEOUT, wr.write_all(self.body.as_bytes())).await??;
+        timeout(IO_TIMEOUT, wr.flush()).await??;
+        Ok(())
+    }
+}
+
+/// The address a well-formed `eth_getTransactionCount` request names.
+fn requested_address(request: &Request) -> Option<Address> {
+    request
         .params
         .first()
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<Address>().ok());
-    let Some(address) = address else {
-        metrics::counter!(NONCE_QUERIES, "outcome" => "bad_request").increment(1);
-        return (
-            "200 OK",
-            rpc_error(
-                request.id,
-                -32602,
-                "invalid params: expected [address, tag]",
-            ),
-            None,
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse::<Address>().ok())
+}
+
+/// Answer one request body.
+async fn answer(env: &StateEnv, body: &[u8]) -> Reply {
+    let Ok(request) = serde_json::from_slice::<Request>(body) else {
+        return Reply::bad_request(-32700, "parse error");
+    };
+    if request.method != "eth_getTransactionCount" {
+        return Reply::rpc_error(&request.id, -32601, "method not found");
+    }
+    let Some(address) = requested_address(&request) else {
+        return Reply::rpc_error(
+            &request.id,
+            -32602,
+            "invalid params: expected [address, tag]",
         );
     };
     let env = env.clone();
     let looked_up = tokio::task::spawn_blocking(move || committed_nonce(&env, address)).await;
     match looked_up {
-        Ok(Ok((nonce, block))) => {
-            metrics::counter!(NONCE_QUERIES, "outcome" => "ok").increment(1);
-            let body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request.id,
-                "result": format!("{nonce:#x}"),
-            })
-            .to_string();
-            ("200 OK", body, Some(block))
-        }
+        Ok(Ok((nonce, block))) => Reply::ok(&request.id, nonce, block),
         Ok(Err(e)) => {
-            metrics::counter!(NONCE_QUERIES, "outcome" => "error").increment(1);
             warn!(error = %e, %address, "nonce query: state read failed");
-            (
-                "500 Internal Server Error",
-                rpc_error(request.id, -32603, "state read failed"),
-                None,
-            )
+            Reply::internal(&request.id, "state read failed")
         }
         Err(e) => {
-            metrics::counter!(NONCE_QUERIES, "outcome" => "error").increment(1);
             warn!(error = %e, "nonce query: blocking task failed");
-            (
-                "500 Internal Server Error",
-                rpc_error(request.id, -32603, "internal error"),
-                None,
-            )
+            Reply::internal(&request.id, "internal error")
         }
+    }
+}
+
+/// The request head, parsed once: a `POST` with a body of a known,
+/// bounded size.
+struct RequestHead {
+    content_length: NonZeroUsize,
+}
+
+impl RequestHead {
+    /// Read the request line and the headers off `reader`. `None` for a
+    /// request that is not a `POST`; an error reply for a body that is
+    /// missing or oversized.
+    async fn read<R: AsyncBufReadExt + Unpin>(
+        reader: &mut R,
+    ) -> std::io::Result<Result<Option<Self>, Reply>> {
+        let mut line = String::new();
+        timeout(IO_TIMEOUT, reader.read_line(&mut line)).await??;
+        if !line.starts_with("POST ") {
+            return Ok(Ok(None));
+        }
+        let mut content_length: Option<usize> = None;
+        loop {
+            line.clear();
+            timeout(IO_TIMEOUT, reader.read_line(&mut line)).await??;
+            if let ControlFlow::Break(()) = Self::read_header(&line, &mut content_length) {
+                break;
+            }
+        }
+        let body_fits = |n: usize| (1..=MAX_BODY).contains(&n);
+        let head = content_length
+            .filter(|n| body_fits(*n))
+            .and_then(NonZeroUsize::new)
+            .map(|content_length| Some(Self { content_length }))
+            .ok_or_else(|| Reply::bad_request(-32600, "missing or oversized body"));
+        Ok(head)
+    }
+
+    /// One header line. `Break` at the blank line that ends the head, or
+    /// at the end of the stream. A `content-length` header sets
+    /// `content_length`; an unparsable value leaves it unset.
+    fn read_header(line: &str, content_length: &mut Option<usize>) -> ControlFlow<()> {
+        let header = line.trim_end();
+        if line.is_empty() || header.is_empty() {
+            return ControlFlow::Break(());
+        }
+        let length = header
+            .split_once(':')
+            .filter(|(key, _)| key.trim().eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse().ok());
+        if length.is_some() {
+            *content_length = length;
+        }
+        ControlFlow::Continue(())
     }
 }
 
 async fn serve_one(stream: TcpStream, env: StateEnv) -> std::io::Result<()> {
     let (rd, mut wr) = stream.into_split();
-    let mut reader = BufReader::new(rd).take((MAX_HEAD + MAX_BODY) as u64);
-    let mut line = String::new();
-    timeout(IO_TIMEOUT, reader.read_line(&mut line)).await??;
-    if !line.starts_with("POST ") {
-        return write_response(&mut wr, "404 Not Found", "", None).await;
-    }
-    let mut content_length = 0usize;
-    loop {
-        line.clear();
-        let n = timeout(IO_TIMEOUT, reader.read_line(&mut line)).await??;
-        let header = line.trim_end();
-        if n == 0 || header.is_empty() {
-            break;
+    let mut reader = BufReader::new(rd).take(usize_to_u64(MAX_HEAD.saturating_add(MAX_BODY)));
+    let head = match RequestHead::read(&mut reader).await? {
+        Ok(Some(head)) => head,
+        Ok(None) => {
+            return Reply {
+                status: "404 Not Found",
+                body: String::new(),
+                block: None,
+            }
+            .write(&mut wr)
+            .await;
         }
-        if let Some((key, value)) = header.split_once(':')
-            && key.trim().eq_ignore_ascii_case("content-length")
-        {
-            content_length = value.trim().parse().unwrap_or(0);
-        }
-    }
-    if content_length == 0 || content_length > MAX_BODY {
-        return write_response(
-            &mut wr,
-            "400 Bad Request",
-            &rpc_error(serde_json::Value::Null, -32600, "missing or oversized body"),
-            None,
-        )
-        .await;
-    }
-    let mut body = vec![0u8; content_length];
+        Err(reply) => return reply.write(&mut wr).await,
+    };
+    let mut body = vec![0u8; head.content_length.get()];
     timeout(IO_TIMEOUT, reader.read_exact(&mut body)).await??;
-    let (status, reply, block) = answer(&env, &body).await;
-    write_response(&mut wr, status, &reply, block).await
-}
-
-async fn write_response<W: AsyncWriteExt + Unpin>(
-    wr: &mut W,
-    status: &str,
-    body: &str,
-    block: Option<u64>,
-) -> std::io::Result<()> {
-    let block_header = block
-        .map(|b| format!("x-state-block: {b}\r\n"))
-        .unwrap_or_default();
-    let head = format!(
-        "HTTP/1.0 {status}\r\ncontent-type: application/json\r\n{block_header}\
-         content-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
-    timeout(IO_TIMEOUT, wr.write_all(head.as_bytes())).await??;
-    timeout(IO_TIMEOUT, wr.write_all(body.as_bytes())).await??;
-    timeout(IO_TIMEOUT, wr.flush()).await??;
-    Ok(())
+    answer(&env, &body).await.write(&mut wr).await
 }
 
 #[cfg(test)]

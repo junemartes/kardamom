@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use kardamom_log::aeron_live::{AeronRuntime, DeliverFn};
+use kardamom_log::aeron_live::{AeronRuntime, PubHandle, RawFrame};
 use thiserror::Error;
 
 use crate::gateway::{ClusterEgress, ClusterIngress, OfferOutcome};
@@ -106,6 +106,9 @@ impl ClusterIngress for LiveIngress {
         {
             return OfferOutcome::NotConnected; // session thread gone
         }
+        // `RecvError` means the session thread dropped `reply_tx` without
+        // answering, which only happens when it is gone: the same
+        // condition `OfferOutcome::NotConnected` reports above.
         reply_rx.recv().unwrap_or(OfferOutcome::NotConnected)
     }
 }
@@ -161,61 +164,69 @@ pub struct ReplayOnConnect {
     pub next_block: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// Connect to the cluster, and spawn the session thread. Returns the
-/// lifetime guard, plus the ingress and egress seams for the trait
-/// adapters.
+/// What a session announces or replays on establishment: [`connect_with`]'s
+/// option group. [`connect`] is the no-announcement, no-replay,
+/// no-filter default. One struct plus one function covers every connect
+/// variant, instead of one thin wrapper per flag.
+#[derive(Default)]
+pub struct ConnectOptions {
+    /// Send a replay request whenever a session is established. Implies
+    /// `subscribe` in practice — every replay consumer today is also a
+    /// canonical-stream consumer — but callers set both explicitly.
+    pub replay: Option<ReplayOnConnect>,
+    /// Send the egress-subscribe announcement whenever a session is
+    /// established. Use this for canonical-stream consumers (for example,
+    /// the ingress watermark observer, which derives watermarks only from
+    /// live egress). Without the announcement, the service excludes the
+    /// session from the per-record egress fan-out.
+    pub subscribe: bool,
+    /// Forward to the [`LiveEgress`] only egress app frames whose leading
+    /// kind byte is in this list. Everything else is dropped at the
+    /// source. Use this for publisher-side consumers that want only
+    /// boundaries (and the odd control frame), like the sequencer's
+    /// lag-detection feed. Relayed records arrive at full line rate, and
+    /// allocating and channelling each one to a receiver that discards it
+    /// measurably taxes the session thread, which also services the
+    /// publish offers.
+    pub egress_kind_filter: Option<Vec<u8>>,
+}
+
+/// Connect to the cluster with `opts`, and spawn the session thread.
+/// Returns the lifetime guard, plus the ingress and egress seams for the
+/// trait adapters.
+///
+/// # Errors
+///
+/// Returns an error if `cfg` is invalid, or the initial ingress
+/// publication or egress subscription fails to open.
+pub fn connect_with(
+    rt: AeronRuntime,
+    cfg: LiveClusterConfig,
+    opts: ConnectOptions,
+) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
+    SessionConnect::new(rt, cfg, opts)?
+        .open_egress()?
+        .open_ingress()?
+        .spawn_thread()
+}
+
+/// [`connect_with`] with every option at its default: no announcement, no
+/// replay, no egress filter.
+///
+/// # Errors
+///
+/// Returns an error if `cfg` is invalid, or the initial ingress
+/// publication or egress subscription fails to open.
 pub fn connect(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
-    connect_inner(rt, cfg, None, false, None)
-}
-
-/// [`connect`], plus an egress-subscribe announcement whenever a session
-/// is established. Use this for canonical-stream consumers that need no
-/// replay (for example, the ingress watermark observer, which derives
-/// watermarks only from live egress). Without the announcement, the
-/// service excludes the session from the per-record egress fan-out.
-pub fn connect_subscribed(
-    rt: AeronRuntime,
-    cfg: LiveClusterConfig,
-) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
-    connect_inner(rt, cfg, None, true, None)
-}
-
-/// [`connect`], plus a replay request whenever a session is established.
-/// This also sends the egress-subscribe announcement.
-pub fn connect_with_replay(
-    rt: AeronRuntime,
-    cfg: LiveClusterConfig,
-    replay: ReplayOnConnect,
-) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
-    connect_inner(rt, cfg, Some(replay), true, None)
-}
-
-/// [`connect`], but the session thread forwards to the [`LiveEgress`]
-/// only egress app frames whose leading kind byte is in `kinds`.
-/// Everything else is dropped at the source. Use this for publisher-side
-/// consumers that want only boundaries (and the odd control frame), like
-/// the sequencer's lag-detection feed. Relayed records arrive at full
-/// line rate, and allocating and channelling each one to a receiver that
-/// discards it measurably taxes the session thread, which also services
-/// the publish offers.
-pub fn connect_with_egress_kind_filter(
-    rt: AeronRuntime,
-    cfg: LiveClusterConfig,
-    kinds: &[u8],
-) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
-    // No SUBSCRIBE announcement. Boundaries broadcast to every session (see
-    // SealerClusteredService.offerBoundary), and contiguity rejects go
-    // directly to the offering session. So this feed needs no consumer
-    // registration, and stays out of the per-record fan-out.
-    connect_inner(rt, cfg, None, false, Some(kinds.to_vec()))
+    connect_with(rt, cfg, ConnectOptions::default())
 }
 
 /// Append a small term length to a cluster control channel, unless the
 /// URI already pins one. Used for both the egress channel
-/// ([`connect_inner`]) and every ingress publication
+/// ([`SessionConnect::open_egress`]) and every ingress publication
 /// ([`endpoints::open_leader_pub`]). Small terms matter on both sides: a
 /// publication's log allocates at its term length on the client, and as
 /// the matching image on every cluster member's tmpfs. Cluster ingress
@@ -236,9 +247,9 @@ fn with_control_term_length(uri: &str) -> String {
 
 /// Startup config validation. Both fields come from the operator's
 /// `[cluster]` TOML section (`egress_channel` usually through
-/// `--cluster-egress-endpoint`). An empty or missing section used to show
-/// up only as a silently dead session thread at runtime. Now [`connect`]
-/// fails startup with a config error instead.
+/// `--cluster-egress-endpoint`). [`connect`] fails startup with a config
+/// error when either is empty, instead of leaving a silently dead session
+/// thread.
 fn validate_config(cfg: &LiveClusterConfig) -> Result<(), LiveError> {
     if cfg.egress_channel.is_empty() {
         return Err(LiveError(
@@ -257,88 +268,144 @@ fn validate_config(cfg: &LiveClusterConfig) -> Result<(), LiveError> {
     Ok(())
 }
 
-fn connect_inner(
+/// Staged construction of a live cluster connection, so each stage's
+/// locals live on `self` instead of as one long function's local
+/// variables: [`Self::open_egress`], then [`Self::open_ingress`], then
+/// [`Self::spawn_thread`]. [`connect_with`] is the one caller.
+struct SessionConnect {
     rt: AeronRuntime,
-    mut cfg: LiveClusterConfig,
-    replay: Option<ReplayOnConnect>,
-    subscribe: bool,
-    egress_kind_filter: Option<Vec<u8>>,
-) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
-    validate_config(&cfg)?;
-    cfg.egress_channel = with_control_term_length(&cfg.egress_channel);
-    // Egress subscription: the deliver closure ships each raw frame to the
-    // session thread.
-    let (frame_tx, frame_rx) = unbounded::<Vec<u8>>();
-    // Egress frames are relayed verbatim. The cluster assigns the
-    // canonical index, so the Aeron position and session of the egress
-    // image do not matter.
-    let deliver: DeliverFn = Box::new(move |bytes: &[u8], _pos, _session| {
-        let _ = frame_tx.send(bytes.to_vec());
-    });
-    rt.open_subscription_with_deliver(&cfg.egress_channel, cfg.egress_stream_id, deliver)
-        .map_err(|e| LiveError(format!("open egress subscription: {e}")))?;
+    cfg: LiveClusterConfig,
+    opts: ConnectOptions,
+}
 
-    // Open the initial ingress publication here, not on the session
-    // thread. This way a failure reaches the caller and fails startup,
-    // instead of leaving the owning binary alive with a silently dead
-    // session thread. Skip dead member IDs, like the reconnect path does:
-    // any live member answers a connect (the leader with OK, a follower
-    // with a REDIRECT).
-    let initial = open_leader_pub(
-        &rt,
-        &cfg.ingress_endpoints,
-        cfg.initial_leader_member_id,
-        cfg.ingress_stream_id,
-    )
-    .map(|p| (cfg.initial_leader_member_id, p))
-    .or_else(|| {
-        open_next_member_pub(
-            &rt,
+impl SessionConnect {
+    fn new(
+        rt: AeronRuntime,
+        mut cfg: LiveClusterConfig,
+        opts: ConnectOptions,
+    ) -> Result<Self, LiveError> {
+        validate_config(&cfg)?;
+        cfg.egress_channel = with_control_term_length(&cfg.egress_channel);
+        Ok(Self { rt, cfg, opts })
+    }
+
+    /// Open the egress subscription. Raw frames ship to the session
+    /// thread verbatim — the cluster assigns the canonical index, so the
+    /// Aeron position and session of the egress image do not matter. The
+    /// session thread is a plain OS thread that waits on this receiver
+    /// alongside another crossbeam channel via `crossbeam_channel::Select`
+    /// (see [`SessionLoop::idle_wait`](super::session_loop::SessionLoop)),
+    /// so this needs the crossbeam-backed subscription, not the tokio one
+    /// every async consumer of `AeronRuntime` uses.
+    fn open_egress(self) -> Result<EgressOpened, LiveError> {
+        let (_sub_id, frame_rx) = self
+            .rt
+            .open_subscription_raw_crossbeam(&self.cfg.egress_channel, self.cfg.egress_stream_id)
+            .map_err(|e| LiveError(format!("open egress subscription: {e}")))?;
+        Ok(EgressOpened {
+            base: self,
+            frame_rx,
+        })
+    }
+}
+
+/// [`SessionConnect`] with its egress subscription open, holding the
+/// receiver [`SessionConnect::open_egress`] created.
+struct EgressOpened {
+    base: SessionConnect,
+    frame_rx: Receiver<RawFrame>,
+}
+
+impl EgressOpened {
+    /// Open the initial ingress publication here, not on the session
+    /// thread. This way a failure reaches the caller and fails startup,
+    /// instead of leaving the owning binary alive with a silently dead
+    /// session thread. Skip dead member IDs, like the reconnect path
+    /// does: any live member answers a connect (the leader with OK, a
+    /// follower with a REDIRECT).
+    fn open_ingress(self) -> Result<IngressOpened, LiveError> {
+        let cfg = &self.base.cfg;
+        let initial = open_leader_pub(
+            &self.base.rt,
             &cfg.ingress_endpoints,
             cfg.initial_leader_member_id,
             cfg.ingress_stream_id,
         )
-    })
-    .ok_or_else(|| {
-        LiveError(format!(
-            "no usable initial cluster ingress endpoint in {:?}",
-            cfg.ingress_endpoints
-        ))
-    })?;
-
-    let (req_tx, req_rx) = unbounded::<OfferReq>();
-    let (out_tx, out_rx) = unbounded::<Vec<u8>>();
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = stop.clone();
-
-    let join = thread::Builder::new()
-        .name("cluster-session".into())
-        .spawn(move || {
-            session_loop::run_session(
-                rt,
-                cfg,
-                initial,
-                replay,
-                subscribe,
-                egress_kind_filter,
-                SessionSeams {
-                    frame_rx,
-                    req_rx,
-                    out_tx,
-                    stop: stop_thread,
-                },
+        .map(|p| (cfg.initial_leader_member_id, p))
+        .or_else(|| {
+            open_next_member_pub(
+                &self.base.rt,
+                &cfg.ingress_endpoints,
+                cfg.initial_leader_member_id,
+                cfg.ingress_stream_id,
             )
         })
-        .map_err(|e| LiveError(format!("spawn session thread: {e}")))?;
+        .ok_or_else(|| {
+            LiveError(format!(
+                "no usable initial cluster ingress endpoint in {:?}",
+                cfg.ingress_endpoints
+            ))
+        })?;
+        Ok(IngressOpened {
+            egress: self,
+            initial,
+        })
+    }
+}
 
-    Ok((
-        LiveCluster {
-            stop,
-            join: Some(join),
-        },
-        LiveIngress { req_tx },
-        LiveEgress { out_rx },
-    ))
+/// [`EgressOpened`] with its initial ingress publication open, holding
+/// the `(member_id, publication)` pair [`EgressOpened::open_ingress`]
+/// found.
+struct IngressOpened {
+    egress: EgressOpened,
+    initial: (i32, PubHandle),
+}
+
+impl IngressOpened {
+    /// Spawn the session thread, consuming every stage's state.
+    fn spawn_thread(self) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
+        let Self {
+            egress:
+                EgressOpened {
+                    base: SessionConnect { rt, cfg, opts },
+                    frame_rx,
+                },
+            initial,
+        } = self;
+        let (req_tx, req_rx) = unbounded::<OfferReq>();
+        let (out_tx, out_rx) = unbounded::<Vec<u8>>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+
+        let join = thread::Builder::new()
+            .name("cluster-session".into())
+            .spawn(move || {
+                session_loop::run_session(
+                    rt,
+                    cfg,
+                    initial,
+                    opts.replay,
+                    opts.subscribe,
+                    opts.egress_kind_filter,
+                    SessionSeams {
+                        frame_rx,
+                        req_rx,
+                        out_tx,
+                        stop: stop_thread,
+                    },
+                );
+            })
+            .map_err(|e| LiveError(format!("spawn session thread: {e}")))?;
+
+        Ok((
+            LiveCluster {
+                stop,
+                join: Some(join),
+            },
+            LiveIngress { req_tx },
+            LiveEgress { out_rx },
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -363,9 +430,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_empty_egress_channel() {
-        // An empty [cluster] section used to leave the owning binary alive
-        // with a silently dead session thread. Now connect must fail
-        // instead.
+        // An empty [cluster] section must fail connect, not leave the
+        // owning binary alive with a silently dead session thread.
         let cfg = LiveClusterConfig {
             egress_channel: String::new(),
             ..valid_cfg()

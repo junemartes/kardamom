@@ -8,9 +8,6 @@
 //! Otherwise it reports "not yet", and the caller retries later. Submission
 //! is permissionless on the contract; the proof is the authorization.
 
-// The sol! macro generates an initialize function with 7 arguments for oracle v2.
-#![allow(clippy::too_many_arguments)]
-
 use std::path::Path;
 
 use alloy_primitives::Address;
@@ -24,6 +21,11 @@ use crate::settlement::IKardamomL2Settlement;
 sol!(
     #[sol(rpc)]
     #[derive(Debug)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the generated `initialize` function takes 8 arguments, fixed by the v2 \
+                  oracle's ABI (contracts/); this crate has no way to reshape it"
+    )]
     IKardamomProofOracle,
     concat!(
         env!("CARGO_WORKSPACE_DIR"),
@@ -45,6 +47,11 @@ pub enum SubmitOutcome {
 /// Submit the next unproven batch's proof, if the batch and its proof
 /// files both exist. `proofs_dir` holds the zk-host layout:
 /// `batch-<first>-<last>/{public-values.bin, proof.bin}`.
+///
+/// # Errors
+/// Returns an error when an L1 call fails, when `public-values.bin` is
+/// malformed or disagrees with the settlement's stored entry, or when
+/// `submitBatchProof` reverts.
 pub async fn submit_next_proof<P: Provider>(
     provider: P,
     oracle_addr: Address,
@@ -56,7 +63,9 @@ pub async fn submit_next_proof<P: Provider>(
         .call()
         .await
         .map_err(|e| BatcherError::L1(format!("lastFinalizedBatch: {e}")))?;
-    let next = last_finalized + 1;
+    let next = last_finalized
+        .checked_add(1)
+        .ok_or_else(|| BatcherError::L1("lastFinalizedBatch overflowed u64".into()))?;
 
     let settlement_addr = oracle
         .settlement()
@@ -74,11 +83,12 @@ pub async fn submit_next_proof<P: Provider>(
     }
 
     let dir = proofs_dir.join(format!("batch-{}-{}", entry.l2BlockStart, entry.l2BlockEnd));
-    let pv = match std::fs::read(dir.join("public-values.bin")) {
-        Ok(b) => b,
-        Err(_) => return Ok(SubmitOutcome::ProofNotReady { batch_index: next }),
+    let Ok(pv) = std::fs::read(dir.join("public-values.bin")) else {
+        return Ok(SubmitOutcome::ProofNotReady { batch_index: next });
     };
-    let proof = std::fs::read(dir.join("proof.bin")).unwrap_or_default();
+    let Ok(proof) = std::fs::read(dir.join("proof.bin")) else {
+        return Ok(SubmitOutcome::ProofNotReady { batch_index: next });
+    };
 
     // Fail fast on the client side for anything the contract would reject.
     // This is cheaper than a revert, and gives a precise error instead of a

@@ -23,10 +23,10 @@
 //! inside their binaries, with no fixture paths needed on the Target-C
 //! runner.
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
+use alloy_consensus::SignableTransaction;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSignerSync;
-use alloy_primitives::{Bytes, Signature, TxKind, U256};
+use alloy_primitives::{Bytes, Signature, U256};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -71,40 +71,79 @@ impl Default for Params {
     }
 }
 
+/// # Errors
+/// Returns an error when a vector file fails to parse, when a request
+/// carries no method, or when a response does not match its expectation.
 pub async fn run(t: &Target, p: Params) -> Result<()> {
     let subs = build_substitutions(t, &p)?;
     for (file, text) in VECTORS {
-        for (i, (req, expect)) in parse(text)
-            .with_context(|| format!("parse vectors/rpc/{file}.io"))?
-            .into_iter()
-            .enumerate()
-        {
-            let req = substitute(req, &subs);
-            let expect = substitute(expect, &subs);
-            let method = req["method"]
-                .as_str()
-                .with_context(|| format!("{file}[{i}]: request has no method"))?;
-            let params: Vec<Value> = req["params"].as_array().cloned().unwrap_or_default();
+        run_vector_file(t, &subs, file, text).await?;
+    }
+    Ok(())
+}
 
-            let outcome = t.rpc.raw_call(method, &params).await;
-            let actual = match outcome.result {
-                Ok(v) => json!({ "result": v }),
-                Err(RpcError::Call { code, message }) => {
-                    json!({ "error": { "code": code, "message": message } })
-                }
-                Err(RpcError::Transport(e)) => {
-                    bail!("{file}[{i}] {method}: transport error (the contract forbids these): {e}")
-                }
-            };
-            matches(&expect, &actual)
-                .with_context(|| format!("{file}[{i}] {method}: got {actual}"))?;
-        }
+/// One request/expectation pair from a vector file, with its position for
+/// error messages.
+struct RpcVectorCase<'a> {
+    file: &'a str,
+    index: usize,
+    req: Value,
+    expect: Value,
+}
+
+impl RpcVectorCase<'_> {
+    /// Send `self.req` and check the reply against `self.expect`.
+    async fn check(&self, t: &Target) -> Result<()> {
+        let method = self.req["method"]
+            .as_str()
+            .with_context(|| format!("{}[{}]: request has no method", self.file, self.index))?;
+        // JSON-RPC params are optional; a missing array means the call takes none.
+        let params: Vec<Value> = self.req["params"].as_array().cloned().unwrap_or_default();
+
+        let outcome = t.rpc.raw_call(method, &params).await;
+        let actual = match outcome.result {
+            Ok(v) => json!({ "result": v }),
+            Err(RpcError::Call { code, message }) => {
+                json!({ "error": { "code": code, "message": message } })
+            }
+            Err(RpcError::Transport(e)) => {
+                bail!(
+                    "{}[{}] {method}: transport error (the contract forbids these): {e}",
+                    self.file,
+                    self.index
+                )
+            }
+        };
+        matches(&self.expect, &actual)
+            .with_context(|| format!("{}[{}] {method}: got {actual}", self.file, self.index))
+    }
+}
+
+/// Run every request/expectation pair in one vector file.
+async fn run_vector_file(
+    t: &Target,
+    subs: &BTreeMap<String, Value>,
+    file: &str,
+    text: &str,
+) -> Result<()> {
+    let cases = parse(text)
+        .with_context(|| format!("parse vectors/rpc/{file}.io"))?
+        .into_iter()
+        .enumerate()
+        .map(|(index, (req, expect))| RpcVectorCase {
+            file,
+            index,
+            req: substitute(req, subs),
+            expect: substitute(expect, subs),
+        });
+    for case in cases {
+        case.check(t).await?;
     }
     Ok(())
 }
 
 fn build_substitutions(t: &Target, p: &Params) -> Result<BTreeMap<String, Value>> {
-    let signers = l2::dev_signers(p.sender.max(p.recipient) as u32 + 1)?;
+    let signers = l2::dev_signers_through(p.sender.max(p.recipient))?;
     let sender = &signers[p.sender];
     let recipient = signers[p.recipient].address;
 
@@ -114,15 +153,7 @@ fn build_substitutions(t: &Target, p: &Params) -> Result<BTreeMap<String, Value>
     // So decoding succeeds but recovery fails, which is the exact path
     // the signature-verify error covers.
     let badsig = {
-        let tx = TxLegacy {
-            chain_id: Some(t.chain_id),
-            nonce: 0,
-            gas_price: 1_000_000_000,
-            gas_limit: 21_000,
-            to: TxKind::Call(recipient),
-            value: U256::ONE,
-            input: Bytes::new(),
-        };
+        let tx = l2::legacy_tx(t.chain_id, 0, 21_000, recipient, U256::ONE);
         let sig = Signature::new(U256::ZERO, U256::ONE, false);
         encode_2718(tx.into_signed(sig))
     };
@@ -130,15 +161,7 @@ fn build_substitutions(t: &Target, p: &Params) -> Result<BTreeMap<String, Value>
     // A block's worth of gas: valid RLP and signature, but over the
     // per-transaction cap.
     let overcap = {
-        let mut tx = TxLegacy {
-            chain_id: Some(t.chain_id),
-            nonce: 0,
-            gas_price: 1_000_000_000,
-            gas_limit: 30_000_000,
-            to: TxKind::Call(recipient),
-            value: U256::ONE,
-            input: Bytes::new(),
-        };
+        let mut tx = l2::legacy_tx(t.chain_id, 0, 30_000_000, recipient, U256::ONE);
         let sig = sender
             .signer
             .sign_transaction_sync(&mut tx)
@@ -158,7 +181,7 @@ fn build_substitutions(t: &Target, p: &Params) -> Result<BTreeMap<String, Value>
             max_priority_fee_per_gas: 0,
             to: recipient,
             value: U256::ONE,
-            access_list: Default::default(),
+            access_list: alloy_eips::eip2930::AccessList::default(),
             blob_versioned_hashes: vec![alloy_primitives::B256::repeat_byte(0x01)],
             max_fee_per_blob_gas: 1,
             input: Bytes::new(),
@@ -193,34 +216,60 @@ fn encode_2718<T: Encodable2718>(signed: T) -> Vec<u8> {
 /// comments and blank lines. Every `>>` line must be followed by a `<<`
 /// line.
 fn parse(text: &str) -> Result<Vec<(Value, Value)>> {
-    let mut out = Vec::new();
-    let mut pending: Option<Value> = None;
-    for (ln, line) in text.lines().enumerate() {
-        let line = line.trim();
+    let mut parser = VectorParser::default();
+    text.lines()
+        .enumerate()
+        .try_for_each(|(ln, line)| parser.parse_line(ln, line.trim()))?;
+    parser.finish()
+}
+
+/// State for parsing a vector file's `>> request` / `<< expectation` line
+/// pairs: the request stashed by a `>>` line, awaiting its `<<`
+/// expectation, and the pairs parsed so far.
+#[derive(Default)]
+struct VectorParser {
+    pending: Option<Value>,
+    out: Vec<(Value, Value)>,
+}
+
+impl VectorParser {
+    /// One line: skip a comment or a blank line, stash a `>>` request, or
+    /// pair a `<<` expectation with the stashed request.
+    fn parse_line(&mut self, ln: usize, line: &str) -> Result<()> {
         if line.is_empty() || line.starts_with('#') {
-            continue;
+            return Ok(());
         }
         if let Some(req) = line.strip_prefix(">> ") {
             ensure!(
-                pending.is_none(),
+                self.pending.is_none(),
                 "line {}: request without expectation",
                 ln + 1
             );
-            pending = Some(serde_json::from_str(req).with_context(|| format!("line {}", ln + 1))?);
+            self.pending =
+                Some(serde_json::from_str(req).with_context(|| format!("line {}", ln + 1))?);
         } else if let Some(exp) = line.strip_prefix("<< ") {
-            let req = pending
+            let req = self
+                .pending
                 .take()
                 .with_context(|| format!("line {}: expectation without request", ln + 1))?;
-            out.push((
+            self.out.push((
                 req,
                 serde_json::from_str(exp).with_context(|| format!("line {}", ln + 1))?,
             ));
         } else {
             bail!("line {}: expected '>> ', '<< ', or comment", ln + 1);
         }
+        Ok(())
     }
-    ensure!(pending.is_none(), "trailing request without expectation");
-    Ok(out)
+
+    /// The parsed pairs, once the file is fully read.
+    fn finish(self) -> Result<Vec<(Value, Value)>> {
+        ensure!(
+            self.pending.is_none(),
+            "trailing request without expectation"
+        );
+        Ok(self.out)
+    }
 }
 
 /// Replace whole-string `${NAME}` tokens. The matchers `${ANY}` and
@@ -266,15 +315,12 @@ fn matches(expect: &Value, actual: &Value) -> Result<()> {
             ensure!(e.eq_ignore_ascii_case(a), "hex mismatch: want {e}, got {a}");
             Ok(())
         }
-        (Value::Object(e), Value::Object(a)) => {
-            for (k, ev) in e {
-                let av = a
-                    .get(k)
-                    .with_context(|| format!("missing key {k:?} (want {ev})"))?;
-                matches(ev, av).with_context(|| format!("at key {k:?}"))?;
-            }
-            Ok(())
-        }
+        (Value::Object(e), Value::Object(a)) => e.iter().try_for_each(|(k, ev)| {
+            let av = a
+                .get(k)
+                .with_context(|| format!("missing key {k:?} (want {ev})"))?;
+            matches(ev, av).with_context(|| format!("at key {k:?}"))
+        }),
         (Value::Array(e), Value::Array(a)) => {
             ensure!(
                 e.len() == a.len(),
@@ -282,10 +328,9 @@ fn matches(expect: &Value, actual: &Value) -> Result<()> {
                 e.len(),
                 a.len()
             );
-            for (i, (ev, av)) in e.iter().zip(a).enumerate() {
-                matches(ev, av).with_context(|| format!("at index {i}"))?;
-            }
-            Ok(())
+            e.iter().zip(a).enumerate().try_for_each(|(i, (ev, av))| {
+                matches(ev, av).with_context(|| format!("at index {i}"))
+            })
         }
         _ => {
             ensure!(expect == actual, "want {expect}, got {actual}");

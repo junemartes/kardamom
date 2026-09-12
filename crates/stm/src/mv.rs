@@ -24,7 +24,7 @@ use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
 use kardamom_exec_core::delta::WriteSet;
 
-/// One published account version: the (nonce, balance, code_hash) tuple a
+/// One published account version: the (nonce, balance, `code_hash`) tuple a
 /// `WriteSet` carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountVersion {
@@ -48,22 +48,24 @@ pub enum ReadRecord {
     Code(B256, bool),
 }
 
-/// Shard count. Widening this to 1024 was tested: the theory was that
-/// about 180 live cells over 64 shards made workers bounce each other's
-/// lock lines. The result was neutral, so shard collisions are not the
-/// cause of the contention, and the extra memory per block buys nothing.
-/// Do not widen this without a new measurement.
+/// Shard count. Do not widen this without a new measurement.
 const SHARDS: usize = 64;
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "h % SHARDS is < SHARDS, a small usize constant, so it always fits back in usize"
+)]
 fn shard_of(bytes: &[u8]) -> usize {
     // Addresses and slot keys are high-entropy in their low bytes (they
-    // are hashes or counters). Folding only the first 8 bytes clustered
-    // structured addresses, so fold the tail instead.
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for b in bytes.iter().rev().take(8) {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
+    // are hashes or counters). Fold the last 8 bytes; they carry the
+    // entropy.
+    let h = bytes
+        .iter()
+        .rev()
+        .take(8)
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3)
+        });
     (h % SHARDS as u64) as usize
 }
 
@@ -71,11 +73,103 @@ fn shard_of(bytes: &[u8]) -> usize {
 type Versions<V> = Vec<(u32, V)>;
 type Shard<K, V> = RwLock<FastMap<K, Versions<V>>>;
 
+/// Sharded cell storage: one `RwLock<FastMap<K, Versions<V>>>` per
+/// shard, published to and read from by `shard_of`'s index. Shared by
+/// `MvCache`'s account and storage tables, which only differ in `K`
+/// and `V`.
+struct Shards<K, V>(Vec<Shard<K, V>>);
+
+impl<K: Eq + std::hash::Hash + Copy, V: Copy> Shards<K, V> {
+    fn new(n: usize) -> Self {
+        Self(crate::shard_vec(n))
+    }
+
+    /// Sorted-insert publish: keeps results correct even if a
+    /// prediction miss let writers race out of index order —
+    /// validation still catches the miss.
+    ///
+    /// # Panics
+    /// Panics if `shard`'s lock is poisoned (a worker thread panicked
+    /// while holding it).
+    fn publish(&self, shard: usize, key: K, idx: u32, v: V) {
+        let mut g = self.0[shard].write().expect("mv poisoned");
+        let list = g.entry(key).or_default();
+        match list.binary_search_by_key(&idx, |(i, _)| *i) {
+            Ok(p) => list[p] = (idx, v),
+            Err(p) => list.insert(p, (idx, v)),
+        }
+    }
+
+    /// Highest version strictly below `idx`.
+    ///
+    /// # Panics
+    /// Panics if `shard`'s lock is poisoned (a worker thread panicked
+    /// while holding it).
+    fn read(&self, shard: usize, key: &K, idx: u32) -> Option<(u32, V)> {
+        let g = self.0[shard].read().expect("mv poisoned");
+        let list = g.get(key)?;
+        let p = list.partition_point(|(i, _)| *i < idx);
+        (p > 0).then(|| list[p - 1])
+    }
+
+    /// Visit every cell's latest version across all shards: `sink` gets
+    /// the key and the top (highest tx index) version, or nothing for
+    /// a cell with an empty version list.
+    fn fold_last_version(&self, mut sink: impl FnMut(K, &V)) {
+        for sh in &self.0 {
+            Self::fold_shard_last_version(sh, &mut sink);
+        }
+    }
+
+    /// Visit one shard's cells. The `for` loop in
+    /// [`Self::fold_last_version`] stays free of a branch.
+    fn fold_shard_last_version(sh: &Shard<K, V>, sink: &mut impl FnMut(K, &V)) {
+        let g = sh.read().expect("mv poisoned");
+        for (k, list) in g.iter() {
+            Self::sink_last_version(*k, list, sink);
+        }
+    }
+
+    /// Visit one cell's latest version, or nothing for an empty version
+    /// list. The `for` loop in [`Self::fold_shard_last_version`] stays
+    /// free of a branch.
+    fn sink_last_version(k: K, list: &Versions<V>, sink: &mut impl FnMut(K, &V)) {
+        let Some((_, v)) = list.last() else {
+            return;
+        };
+        sink(k, v);
+    }
+
+    /// Scrub every shard in place: past `keep_keys_cap` entries, drop
+    /// the whole map; otherwise keep the keys and clear each entry's
+    /// version vec, so the next block's publishes re-fill a warm
+    /// buffer.
+    fn scrub(&self, keep_keys_cap: usize) {
+        for sh in &self.0 {
+            Self::scrub_shard(sh, keep_keys_cap);
+        }
+    }
+
+    /// Scrub one shard in place: past `keep_keys_cap` entries, drop the
+    /// whole map; otherwise keep the keys and clear each entry's version
+    /// vec. The `for` loop in [`Self::scrub`] stays free of a branch.
+    fn scrub_shard(sh: &Shard<K, V>, keep_keys_cap: usize) {
+        let mut g = sh.write().expect("mv poisoned");
+        if g.len() > keep_keys_cap {
+            g.clear();
+            return;
+        }
+        for v in g.values_mut() {
+            v.clear();
+        }
+    }
+}
+
 /// Sharded multi-version store. Version lists are kept sorted by tx index
 /// via binary-search insert (append in the common pessimistic case).
 pub struct MvCache {
-    accounts: Vec<Shard<Address, AccountVersion>>,
-    storage: Vec<Shard<(Address, B256), U256>>,
+    accounts: Shards<Address, AccountVersion>,
+    storage: Shards<(Address, B256), U256>,
     /// Content-addressed CREATE bytecode. No versioning is needed, since
     /// a hash is its own content. Append-only.
     code: RwLock<FastMap<B256, Bytes>>,
@@ -88,14 +182,11 @@ impl Default for MvCache {
 }
 
 impl MvCache {
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            accounts: (0..SHARDS)
-                .map(|_| RwLock::new(FastMap::with_hasher(crate::FnvBuild)))
-                .collect(),
-            storage: (0..SHARDS)
-                .map(|_| RwLock::new(FastMap::with_hasher(crate::FnvBuild)))
-                .collect(),
+            accounts: Shards::new(SHARDS),
+            storage: Shards::new(SHARDS),
             code: RwLock::new(FastMap::with_hasher(crate::FnvBuild)),
         }
     }
@@ -115,54 +206,70 @@ impl MvCache {
     /// carry no version. `skip_account` is the fee sink, which this
     /// method never publishes (the `Accumulator` boundary).
     pub fn publish_write_set(&self, idx: u32, ws: &WriteSet, skip_account: Address) {
-        for (hash, code) in ws.code.iter() {
+        for (hash, code) in &ws.code {
             self.publish_code(*hash, Bytes::clone(code));
         }
-        for ((addr, key), value) in ws.storage.iter() {
+        for ((addr, key), value) in &ws.storage {
             self.publish_slot(idx, *addr, *key, *value);
         }
-        for (addr, (nonce, balance, code_hash)) in ws.accounts.iter() {
-            if *addr == skip_account {
-                continue;
-            }
-            self.publish_account(
+        for (addr, fields) in &ws.accounts {
+            self.publish_account_unless_skipped(
                 idx,
                 *addr,
                 AccountVersion {
-                    nonce: *nonce,
-                    balance: *balance,
-                    code_hash: *code_hash,
+                    nonce: fields.nonce,
+                    balance: fields.balance,
+                    code_hash: fields.code_hash,
                 },
+                skip_account,
             );
         }
+    }
+
+    /// Publish one account version, unless it is the skipped fee sink.
+    /// The `for` loop in [`Self::publish_write_set`] stays free of a
+    /// branch.
+    fn publish_account_unless_skipped(
+        &self,
+        idx: u32,
+        addr: Address,
+        v: AccountVersion,
+        skip_account: Address,
+    ) {
+        if addr == skip_account {
+            return;
+        }
+        self.publish_account(idx, addr, v);
     }
 
     /// Publish one transaction's account write. The sorted insert keeps
     /// results correct even if a prediction miss let writers race out of
     /// index order — validation still catches the miss.
+    ///
+    /// # Panics
+    /// Panics if this shard's lock is poisoned (a worker thread
+    /// panicked while holding it).
     pub fn publish_account(&self, idx: u32, addr: Address, v: AccountVersion) {
-        let mut g = self.accounts[shard_of(addr.as_slice())]
-            .write()
-            .expect("mv poisoned");
-        let list = g.entry(addr).or_default();
-        match list.binary_search_by_key(&idx, |(i, _)| *i) {
-            Ok(p) => list[p] = (idx, v),
-            Err(p) => list.insert(p, (idx, v)),
-        }
+        self.accounts
+            .publish(shard_of(addr.as_slice()), addr, idx, v);
     }
 
-    pub fn publish_slot(&self, idx: u32, addr: Address, key: B256, value: U256) {
-        let mut g = self.storage[shard_of(addr.as_slice())]
-            .write()
-            .expect("mv poisoned");
-        let list = g.entry((addr, key)).or_default();
-        match list.binary_search_by_key(&idx, |(i, _)| *i) {
-            Ok(p) => list[p] = (idx, value),
-            Err(p) => list.insert(p, (idx, value)),
-        }
+    /// Publish one transaction's storage write. See [`Self::publish_account`].
+    ///
+    /// # Panics
+    /// Panics if this shard's lock is poisoned (a worker thread
+    /// panicked while holding it).
+    pub(crate) fn publish_slot(&self, idx: u32, addr: Address, key: B256, value: U256) {
+        self.storage
+            .publish(shard_of(addr.as_slice()), (addr, key), idx, value);
     }
 
-    pub fn publish_code(&self, hash: B256, code: Bytes) {
+    /// Publish `CREATE`d bytecode, content-addressed. First write wins.
+    ///
+    /// # Panics
+    /// Panics if the code table's lock is poisoned (a worker thread
+    /// panicked while holding it).
+    pub(crate) fn publish_code(&self, hash: B256, code: Bytes) {
         self.code
             .write()
             .expect("mv poisoned")
@@ -171,23 +278,22 @@ impl MvCache {
     }
 
     /// Highest account version strictly below `idx`.
+    ///
+    /// # Panics
+    /// Panics if this shard's lock is poisoned (a worker thread
+    /// panicked while holding it).
     pub fn read_account(&self, idx: u32, addr: &Address) -> Option<(u32, AccountVersion)> {
-        let g = self.accounts[shard_of(addr.as_slice())]
-            .read()
-            .expect("mv poisoned");
-        let list = g.get(addr)?;
-        let p = list.partition_point(|(i, _)| *i < idx);
-        (p > 0).then(|| list[p - 1])
+        self.accounts.read(shard_of(addr.as_slice()), addr, idx)
     }
 
     /// Highest slot version strictly below `idx`.
+    ///
+    /// # Panics
+    /// Panics if this shard's lock is poisoned (a worker thread
+    /// panicked while holding it).
     pub fn read_slot(&self, idx: u32, addr: &Address, key: &B256) -> Option<(u32, U256)> {
-        let g = self.storage[shard_of(addr.as_slice())]
-            .read()
-            .expect("mv poisoned");
-        let list = g.get(&(*addr, *key))?;
-        let p = list.partition_point(|(i, _)| *i < idx);
-        (p > 0).then(|| list[p - 1])
+        self.storage
+            .read(shard_of(addr.as_slice()), &(*addr, *key), idx)
     }
 
     /// Between-block scrub for pooled reuse: drop every entry but keep
@@ -196,7 +302,7 @@ impl MvCache {
     /// publishes re-fill warm pages instead of mapping fresh ones. The
     /// caller must guarantee quiescence (the reaper scrubs only unwrapped
     /// caches).
-    pub fn scrub(&self) {
+    pub(crate) fn scrub(&self) {
         // Keep the keys and their version-vec buffers. Hot cells recur
         // block after block, so an entry with a cleared vec lets the
         // next block's publish push into a warm buffer instead of
@@ -205,60 +311,39 @@ impl MvCache {
         // would grow the maps without bound, so past the size cap this
         // falls back to a full clear.
         const KEEP_KEYS_CAP: usize = 1024; // per shard; about 64 shards
-        for sh in &self.accounts {
-            let mut g = sh.write().expect("mv poisoned");
-            if g.len() > KEEP_KEYS_CAP {
-                g.clear();
-            } else {
-                for v in g.values_mut() {
-                    v.clear();
-                }
-            }
-        }
-        for sh in &self.storage {
-            let mut g = sh.write().expect("mv poisoned");
-            if g.len() > KEEP_KEYS_CAP {
-                g.clear();
-            } else {
-                for v in g.values_mut() {
-                    v.clear();
-                }
-            }
-        }
+        self.accounts.scrub(KEEP_KEYS_CAP);
+        self.storage.scrub(KEEP_KEYS_CAP);
         self.code.write().expect("mv poisoned").clear();
     }
 
     /// Compute the block's final write view: for each cell, the highest
     /// version (the last writer's value, exactly what the commit fold
-    /// computes), plus all CREATEd code. The repair path uses this to
+    /// computes), plus all `CREATEd` code. The repair path uses this to
     /// turn a predecessor's mv layer into a mergeable delta. It costs a
     /// full fold and only runs on the rare paths that need a
     /// `PendingDelta` shape instead of probing the cache directly.
-    pub fn final_delta(&self) -> kardamom_exec_core::delta::PendingDelta {
+    pub(crate) fn final_delta(&self) -> kardamom_exec_core::delta::PendingDelta {
         let mut d = kardamom_exec_core::delta::PendingDelta::new();
-        for sh in &self.accounts {
-            let g = sh.read().expect("mv poisoned");
-            for (addr, list) in g.iter() {
-                if let Some((_, v)) = list.last() {
-                    d.accounts.insert(*addr, (v.nonce, v.balance, v.code_hash));
-                }
-            }
-        }
-        for sh in &self.storage {
-            let g = sh.read().expect("mv poisoned");
-            for ((addr, key), list) in g.iter() {
-                if let Some((_, v)) = list.last() {
-                    d.storage.insert((*addr, *key), *v);
-                }
-            }
-        }
+        self.accounts.fold_last_version(|addr, v: &AccountVersion| {
+            d.accounts.insert(
+                addr,
+                kardamom_exec_core::delta::AccountFields {
+                    nonce: v.nonce,
+                    balance: v.balance,
+                    code_hash: v.code_hash,
+                },
+            );
+        });
+        self.storage.fold_last_version(|key, v: &U256| {
+            d.storage.insert(key, *v);
+        });
         for (h, b) in self.code.read().expect("mv poisoned").iter() {
             d.code.insert(*h, b.clone());
         }
         d
     }
 
-    pub fn read_code(&self, hash: &B256) -> Option<Bytes> {
+    pub(crate) fn read_code(&self, hash: &B256) -> Option<Bytes> {
         self.code.read().expect("mv poisoned").get(hash).cloned()
     }
 
@@ -347,14 +432,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut observed = 0u64;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some((_, a)) = mv.read_account(1, &created) {
-                        assert!(
-                            mv.read_code(&a.code_hash).is_some(),
-                            "account visible with code_hash {:?} but its code is not",
-                            a.code_hash
-                        );
-                        observed += 1;
-                    }
+                    observed += poll_created_account_visible(&mv, created);
                 }
                 observed
             })
@@ -364,13 +442,36 @@ mod tests {
         // so the reader keeps racing the window.
         for _ in 0..2_000 {
             let mut ws = WriteSet::default();
-            ws.accounts.push((created, (1, U256::ZERO, hash)));
+            ws.accounts.push((
+                created,
+                kardamom_exec_core::delta::AccountFields {
+                    nonce: 1,
+                    balance: U256::ZERO,
+                    code_hash: hash,
+                },
+            ));
             ws.code.push((hash, code.clone()));
             ws.finish();
             mv.publish_write_set(0, &ws, Address::repeat_byte(0xEE));
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         reader.join().expect("reader must not panic");
+    }
+
+    /// Poll once for the created account. Returns 1 if observed, after
+    /// asserting its code is visible too; else 0. The `while` loop in
+    /// [`account_version_never_precedes_its_code`] stays free of a
+    /// branch.
+    fn poll_created_account_visible(mv: &MvCache, created: Address) -> u64 {
+        let Some((_, a)) = mv.read_account(1, &created) else {
+            return 0;
+        };
+        assert!(
+            mv.read_code(&a.code_hash).is_some(),
+            "account visible with code_hash {:?} but its code is not",
+            a.code_hash
+        );
+        1
     }
 
     #[test]

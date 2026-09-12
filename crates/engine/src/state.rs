@@ -6,8 +6,8 @@
 //! traits. `WriterApplyingQueue` stays here. It implements
 //! [`StateWriterQueue`], an actor seam that has no place in the `no_std` core.
 
-// This re-export keeps old `crate::state::…` and `kardamom_engine::state::…`
-// paths working.
+// This re-export makes the type resolve under `crate::state::…` and
+// `kardamom_engine::state::…` too.
 pub use kardamom_exec_core::state::{
     MockStateDatabase, MockStateError, MutatingSnapshotSource, StaticSnapshotSource,
 };
@@ -26,6 +26,7 @@ pub struct WriterApplyingQueue {
 }
 
 impl WriterApplyingQueue {
+    #[must_use]
     pub fn new(db: MockStateDatabase) -> Self {
         Self { db }
     }

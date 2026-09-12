@@ -148,6 +148,10 @@ check:
 clippy:
     PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+# Mechanical style checks from docs/STYLE.md. Run before you open a PR.
+style:
+    PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" scripts/style-check.sh
+
 # Run the test suite across all features.
 test:
     PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo test --workspace --all-targets --all-features --locked

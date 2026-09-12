@@ -19,29 +19,24 @@ where
     rkyv::from_bytes::<T, rkyv::rancor::Error>(&bytes).unwrap()
 }
 
+/// A `BPosition` literal. This crate's wire types carry so many of these
+/// that the two-field struct literal, spelled out, dominates every test
+/// that touches a position.
+fn pos(term_id: i32, term_offset: i32) -> BPosition {
+    BPosition {
+        term_id,
+        term_offset,
+    }
+}
+
 #[test]
 fn bposition_orders_by_term_then_offset() {
-    let a = BPosition {
-        term_id: 1,
-        term_offset: 100,
-    };
-    let b = BPosition {
-        term_id: 1,
-        term_offset: 200,
-    };
-    let c = BPosition {
-        term_id: 2,
-        term_offset: 0,
-    };
+    let a = pos(1, 100);
+    let b = pos(1, 200);
+    let c = pos(2, 0);
     assert!(a < b);
     assert!(b < c);
-    assert_eq!(
-        a,
-        BPosition {
-            term_id: 1,
-            term_offset: 100
-        }
-    );
+    assert_eq!(a, pos(1, 100));
 }
 
 #[test]
@@ -63,10 +58,7 @@ fn tx_envelope_roundtrip() {
 fn receipt_roundtrip() {
     let v = Receipt {
         tx_type: kardamom_types::TX_TYPE_LEGACY,
-        tx_idx: BPosition {
-            term_id: 3,
-            term_offset: 4096,
-        },
+        tx_idx: pos(3, 4096),
         tx_hash: B256::repeat_byte(0x44),
         status: true,
         gas_used: 21_000,
@@ -94,10 +86,7 @@ fn receipt_roundtrip_contract_creation() {
     // CREATE transaction variant: `to` is `None`, `contract_address` is `Some`.
     let v = Receipt {
         tx_type: kardamom_types::TX_TYPE_LEGACY,
-        tx_idx: BPosition {
-            term_id: 0,
-            term_offset: 0,
-        },
+        tx_idx: pos(0, 0),
         tx_hash: B256::repeat_byte(0x11),
         status: true,
         gas_used: 100_000,
@@ -118,14 +107,11 @@ fn receipt_roundtrip_contract_creation() {
 
 #[test]
 fn receipt_roundtrip_invalid_skip() {
-    // #92 skip marker + the typed cause (#241): the reason must survive
-    // the wire, and the discriminant is append-only.
+    // The skip reason must survive the wire, and the discriminant is
+    // append-only.
     let v = Receipt {
         tx_type: kardamom_types::TX_TYPE_LEGACY,
-        tx_idx: BPosition {
-            term_id: 1,
-            term_offset: 128,
-        },
+        tx_idx: pos(1, 128),
         tx_hash: B256::repeat_byte(0x99),
         status: false,
         gas_used: 0,
@@ -149,10 +135,7 @@ fn receipt_roundtrip_invalid_skip() {
 fn boundary_roundtrip() {
     let start = BlockBoundaryStart {
         block_number: 7,
-        end_tx_idx: BPosition {
-            term_id: 1,
-            term_offset: 999,
-        },
+        end_tx_idx: pos(1, 999),
         l2_timestamp: 1_700_000_000,
         l1_origin: 0,
     };
@@ -161,10 +144,7 @@ fn boundary_roundtrip() {
     // BlockBoundary has no state_root_commitment field.
     let end = BlockBoundary {
         block_number: 7,
-        end_tx_idx: BPosition {
-            term_id: 1,
-            term_offset: 999,
-        },
+        end_tx_idx: pos(1, 999),
         l2_timestamp: 1_700_000_000,
         l1_origin: 0,
     };
@@ -175,18 +155,12 @@ fn boundary_roundtrip() {
 fn watermark_roundtrip() {
     let w = FsyncWatermark {
         recorder_id: 2,
-        position: BPosition {
-            term_id: 4,
-            term_offset: 1024,
-        },
+        position: pos(4, 1024),
     };
     assert_eq!(roundtrip(&w), w);
 
     let q = QuorumWatermark {
-        position: BPosition {
-            term_id: 4,
-            term_offset: 1024,
-        },
+        position: pos(4, 1024),
     };
     assert_eq!(roundtrip(&q), q);
 }
@@ -235,10 +209,7 @@ fn deposit_roundtrip_create() {
 fn deposit_ref_roundtrip() {
     let r = DepositRef {
         source_hash: B256::repeat_byte(0xCD),
-        deposit_position: BPosition {
-            term_id: 2,
-            term_offset: 4096,
-        },
+        deposit_position: pos(2, 4096),
     };
     assert_eq!(roundtrip(&r), r);
 }
@@ -247,10 +218,7 @@ fn deposit_ref_roundtrip() {
 fn tx_ordering_message_deposit_ref_variant_roundtrips() {
     let r = DepositRef {
         source_hash: B256::repeat_byte(0x99),
-        deposit_position: BPosition {
-            term_id: 0,
-            term_offset: 64,
-        },
+        deposit_position: pos(0, 64),
     };
     let msg = TxOrderingMessage::DepositRef(r);
     assert_eq!(roundtrip(&msg), msg);
@@ -263,10 +231,7 @@ fn tx_ref_roundtrip() {
     let r = TxRef {
         tx_hash: alloy_primitives::B256::ZERO,
         shard_id: 5,
-        tx_data_position: BPosition {
-            term_id: 3,
-            term_offset: 4096,
-        },
+        tx_data_position: pos(3, 4096),
         tx_data_session_id: 0,
     };
     assert_eq!(roundtrip(&r), r);
@@ -277,10 +242,7 @@ fn channel_b_message_tx_ref_roundtrip() {
     let m = TxOrderingMessage::TxRef(TxRef {
         tx_hash: alloy_primitives::B256::ZERO,
         shard_id: 1,
-        tx_data_position: BPosition {
-            term_id: 2,
-            term_offset: 1024,
-        },
+        tx_data_position: pos(2, 1024),
         tx_data_session_id: 0,
     });
     assert_eq!(roundtrip(&m), m);
@@ -290,10 +252,7 @@ fn channel_b_message_tx_ref_roundtrip() {
 fn channel_b_message_boundary_roundtrip() {
     let m = TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
         block_number: 11,
-        end_tx_idx: BPosition {
-            term_id: 0,
-            term_offset: 8192,
-        },
+        end_tx_idx: pos(0, 8192),
         l2_timestamp: 1_700_000_000,
         l1_origin: 0,
     });
@@ -305,10 +264,7 @@ fn channel_b_message_helpers() {
     let r = TxRef {
         tx_hash: alloy_primitives::B256::ZERO,
         shard_id: 7,
-        tx_data_position: BPosition {
-            term_id: 0,
-            term_offset: 16,
-        },
+        tx_data_position: pos(0, 16),
         tx_data_session_id: 0,
     };
     let m: TxOrderingMessage = r.into();
@@ -390,7 +346,7 @@ fn golden_xchain_message() -> kardamom_types::xchain::XChainMessage {
 }
 
 fn golden_remote_epoch_record() -> kardamom_types::xchain::RemoteEpochRecord {
-    use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
+    use kardamom_types::xchain::{NonEmptyVec, RemoteEpochRecord, XChainMessage};
     let first = golden_xchain_message();
     let second = XChainMessage {
         seq: 10,
@@ -402,7 +358,7 @@ fn golden_remote_epoch_record() -> kardamom_types::xchain::RemoteEpochRecord {
         anchor_number: 0x0011_2233_4455_6677,
         anchor_hash: B256::repeat_byte(0x5A),
         first_seq: 9,
-        messages: vec![first, second],
+        messages: NonEmptyVec::new(first, vec![second]),
     }
 }
 

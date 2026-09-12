@@ -15,50 +15,79 @@
 //! transfer within the same tx). Add a `destroyed` flag when the runtime
 //! needs it.
 
+use alloc::format;
 use alloc::vec::Vec;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, KECCAK256_EMPTY, U256};
 use bytes::Bytes;
-use kardamom_types::delta::CodeEntry;
+use kardamom_types::delta::CodeEntry as WireCodeEntry;
 use kardamom_types::{AccountChange, BlockDelta, StorageChange};
+
+/// One account's basic fields: nonce, balance, and code hash. This is
+/// the same triple [`kardamom_types::StateDatabase::basic`] returns, and
+/// every write-set or delta account entry carries it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AccountFields {
+    pub nonce: u64,
+    pub balance: U256,
+    pub code_hash: B256,
+}
+
+impl From<(u64, U256, B256)> for AccountFields {
+    fn from((nonce, balance, code_hash): (u64, U256, B256)) -> Self {
+        Self {
+            nonce,
+            balance,
+            code_hash,
+        }
+    }
+}
+
+impl From<AccountFields> for (u64, U256, B256) {
+    fn from(f: AccountFields) -> Self {
+        (f.nonce, f.balance, f.code_hash)
+    }
+}
+
+/// One account entry in a [`WriteSet`]: (address, fields).
+pub type AccountEntry = (Address, AccountFields);
+/// One storage entry in a [`WriteSet`]: ((address, `slot_key`), value).
+pub type StorageEntry = ((Address, B256), U256);
+/// One code entry in a [`WriteSet`]: (`code_hash`, bytecode).
+pub type CodeEntry = (B256, Bytes);
 
 /// One transaction's write effects, as sorted small vectors.
 ///
-/// This used to store three `BTreeMap`s. A B-tree allocates a 1KB-class
-/// leaf node per map, even for a few entries. DHAT measured this at about
-/// 2.7KB of the roughly 5.4KB/tx execution-path total. A typical tx writes
-/// 2 to 4 accounts, 0 to 10 slots, and 0 or 1 code entries, so inline
-/// `SmallVec`s make the common case allocation-free. Canonical iteration
-/// (the hash contract) comes from sorting on build, not from tree order.
-/// Builders push entries, then call [`WriteSet::finish`]. [`WriteSet::hash`]
-/// debug-asserts that the set is sorted.
+/// A typical tx writes 2 to 4 accounts, 0 to 10 slots, and 0 or 1 code
+/// entries, so inline `SmallVec`s make the common case allocation-free —
+/// a `BTreeMap` allocates a 1KB-class leaf node per map even for a few
+/// entries. Canonical iteration (the hash contract) comes from sorting on
+/// build, not from tree order. Builders push entries, then call
+/// [`WriteSet::finish`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-#[allow(clippy::type_complexity)]
 pub struct WriteSet {
-    /// (address, (nonce, balance, code_hash)), sorted by address.
-    pub accounts: smallvec::SmallVec<[(Address, (u64, U256, B256)); 3]>,
-    /// ((address, slot_key), value), sorted by key.
-    pub storage: smallvec::SmallVec<[((Address, B256), U256); 8]>,
-    /// (code_hash, bytecode), sorted by hash.
-    pub code: smallvec::SmallVec<[(B256, Bytes); 1]>,
+    /// Sorted by address.
+    pub accounts: smallvec::SmallVec<[AccountEntry; 3]>,
+    /// Sorted by key.
+    pub storage: smallvec::SmallVec<[StorageEntry; 8]>,
+    /// Sorted by hash.
+    pub code: smallvec::SmallVec<[CodeEntry; 1]>,
 }
 
 impl WriteSet {
     /// Sort into canonical order. Builders push entries in revm's
-    /// nondeterministic HashMap iteration order. Call this before the set
+    /// nondeterministic `HashMap` iteration order. Call this before the set
     /// is hashed, applied, or compared. Keys are unique by construction
     /// (one entry per account or slot per tx), so an unstable sort is safe.
     pub fn finish(&mut self) {
         self.accounts.sort_unstable_by_key(|(a, _)| *a);
         self.storage.sort_unstable_by_key(|(k, _)| *k);
         self.code.sort_unstable_by_key(|(h, _)| *h);
-        debug_assert!(self.accounts.windows(2).all(|w| w[0].0 < w[1].0));
-        debug_assert!(self.storage.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
     /// Look up an account by key. This is a linear search, which is safe
     /// because the set is tiny, and works before `finish` runs.
-    pub fn account(&self, addr: &Address) -> Option<&(u64, U256, B256)> {
+    pub fn account(&self, addr: &Address) -> Option<&AccountFields> {
         self.accounts
             .iter()
             .find(|(a, _)| a == addr)
@@ -76,13 +105,8 @@ impl WriteSet {
         // sinks: a stack buffer for the common case, and the sponge itself
         // for a write set too large for the buffer (for example, a CREATE
         // that carries bytecode). So the two paths cannot drift apart.
-        debug_assert!(
-            self.accounts.windows(2).all(|w| w[0].0 < w[1].0)
-                && self.storage.windows(2).all(|w| w[0].0 < w[1].0),
-            "WriteSet::finish() not called before hash()"
-        );
-        let mut h = alloy_primitives::Keccak256::new();
         const INLINE: usize = 1024;
+        let mut h = alloy_primitives::Keccak256::new();
         // Worst case per entry, with every field at full width.
         let need = 1
             + 10
@@ -143,34 +167,13 @@ impl WriteSet {
     fn encode<S: WsSink>(&self, s: &mut S) {
         s.put(&[WS_ENCODING_V2]);
         put_varint(s, self.accounts.len() as u64);
-        for (addr, (nonce, balance, code_hash)) in &self.accounts {
-            let (bal, blen) = minimal_be(balance);
-            let code_tag: u8 = if *code_hash == KECCAK_EMPTY_HASH {
-                0
-            } else if code_hash.is_zero() {
-                1
-            } else {
-                2
-            };
-            s.put(addr.as_slice());
-            s.put(&[blen as u8 | (code_tag << 6)]);
-            put_varint(s, *nonce);
-            s.put(&bal[32 - blen..]);
-            if code_tag == 2 {
-                s.put(code_hash.as_slice());
-            }
+        for (addr, fields) in &self.accounts {
+            Self::put_account_entry(s, *addr, fields.nonce, &fields.balance, fields.code_hash);
         }
         put_varint(s, self.storage.len() as u64);
         let mut prev: Option<&Address> = None;
         for ((addr, key), value) in &self.storage {
-            let (val, vlen) = minimal_be(value);
-            let same = prev == Some(addr);
-            s.put(&[vlen as u8 | (u8::from(same) << 6)]);
-            if !same {
-                s.put(addr.as_slice());
-            }
-            s.put(key.as_slice());
-            s.put(&val[32 - vlen..]);
+            Self::put_storage_entry(s, addr, prev, *key, value);
             prev = Some(addr);
         }
         put_varint(s, self.code.len() as u64);
@@ -179,6 +182,65 @@ impl WriteSet {
             put_varint(s, bytes.len() as u64);
             s.put(bytes.as_ref());
         }
+    }
+
+    /// Encode one account entry: address, flags (balance length and code
+    /// tag), varint nonce, minimal-width balance, and the code hash only
+    /// when the tag calls for it. See [`WriteSet::encode`]'s format doc.
+    fn put_account_entry<S: WsSink>(
+        s: &mut S,
+        addr: Address,
+        nonce: u64,
+        balance: &U256,
+        code_hash: B256,
+    ) {
+        let (bal, blen) = minimal_be(balance);
+        // Revm uses KECCAK256_EMPTY as the code hash for every account
+        // without code, so it is worth one tag value instead of 32 bytes
+        // on every externally owned account (EOA).
+        let code_tag: u8 = if code_hash == KECCAK256_EMPTY {
+            0
+        } else if code_hash.is_zero() {
+            1
+        } else {
+            2
+        };
+        s.put(addr.as_slice());
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "minimal_be returns a length in 0..=32: fits u8"
+        )]
+        s.put(&[blen as u8 | (code_tag << 6)]);
+        put_varint(s, nonce);
+        s.put(&bal[32 - blen..]);
+        if code_tag == 2 {
+            s.put(code_hash.as_slice());
+        }
+    }
+
+    /// Encode one storage entry: flags (value length and an
+    /// address-repeat bit), the address only when it differs from the
+    /// previous entry's, the key, and the minimal-width value. See
+    /// [`WriteSet::encode`]'s format doc.
+    fn put_storage_entry<S: WsSink>(
+        s: &mut S,
+        addr: &Address,
+        prev: Option<&Address>,
+        key: B256,
+        value: &U256,
+    ) {
+        let (val, vlen) = minimal_be(value);
+        let same = prev == Some(addr);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "minimal_be returns a length in 0..=32: fits u8"
+        )]
+        s.put(&[vlen as u8 | (u8::from(same) << 6)]);
+        if !same {
+            s.put(addr.as_slice());
+        }
+        s.put(key.as_slice());
+        s.put(&val[32 - vlen..]);
     }
 }
 
@@ -200,14 +262,6 @@ impl WriteSet {
 
 /// Version byte for the write-set encoding. See [`WriteSet::encode`].
 const WS_ENCODING_V2: u8 = 0x02;
-
-/// `keccak256([])`. Revm uses this as the code hash for every account
-/// without code, so it is worth one tag value instead of 32 bytes on
-/// every externally owned account (EOA).
-const KECCAK_EMPTY_HASH: B256 = B256::new([
-    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
-    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
-]);
 
 /// A destination for the canonical encoding: a stack buffer or the hash
 /// sponge.
@@ -235,22 +289,22 @@ impl WsSink for alloy_primitives::Keccak256 {
     }
 }
 
-/// LEB128 encoding, canonical (minimal length).
+/// LEB128 encoding, canonical (minimal length). Emits a continuation byte
+/// (high bit set) for every 7-bit group above the last, then the final
+/// group with the high bit clear.
 #[inline]
 fn put_varint<S: WsSink>(s: &mut S, mut v: u64) {
     let mut buf = [0u8; 10];
     let mut n = 0;
-    loop {
-        let byte = (v & 0x7f) as u8;
+    while v >= 0x80 {
+        buf[n] = (v & 0x7f) as u8 | 0x80;
         v >>= 7;
-        if v == 0 {
-            buf[n] = byte;
-            n += 1;
-            break;
-        }
-        buf[n] = byte | 0x80;
         n += 1;
     }
+    // `v < 0x80` here (the loop above exits only then), so this mirrors
+    // the masked cast above rather than needing an `as`-cast allow.
+    buf[n] = (v & 0x7f) as u8;
+    n += 1;
     s.put(&buf[..n]);
 }
 
@@ -269,8 +323,8 @@ fn minimal_be(v: &U256) -> ([u8; 32], usize) {
 /// serialize to `kardamom_types::BlockDelta` at block close.
 #[derive(Debug, Default, Clone)]
 pub struct PendingDelta {
-    // These are hash maps on purpose (they used to be `BTreeMap`s). The
-    // accumulator only does upserts, gets, and unordered iteration, so it
+    // These are hash maps on purpose. The accumulator only does upserts,
+    // gets, and unordered iteration, so it
     // does not need order. B-tree construction was the single largest
     // fixed cost in the commit tail, about 170ns per node, and stayed
     // that way after several optimization attempts. The one consumer
@@ -278,7 +332,7 @@ pub struct PendingDelta {
     // `finalize`, which sorts once, after dedup, off the
     // execution-critical path. Iteration order here is nondeterministic.
     // Any serialization must go through `finalize`, and it does.
-    pub accounts: DeltaMap<Address, (u64, U256, B256)>,
+    pub accounts: DeltaMap<Address, AccountFields>,
     pub storage: DeltaMap<(Address, B256), U256>,
     pub code: DeltaMap<B256, Bytes>,
 }
@@ -287,6 +341,7 @@ pub struct PendingDelta {
 pub type DeltaMap<K, V> = hashbrown::HashMap<K, V, hashbrown::DefaultHashBuilder>;
 
 impl PendingDelta {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -295,15 +350,9 @@ impl PendingDelta {
     /// overwrite earlier ones. This matches the sequential execution
     /// model: the last tx to touch a slot wins for the block.
     pub fn apply(&mut self, ws: WriteSet) {
-        for (addr, v) in ws.accounts {
-            self.accounts.insert(addr, v);
-        }
-        for (k, v) in ws.storage {
-            self.storage.insert(k, v);
-        }
-        for (h, b) in ws.code {
-            self.code.insert(h, b);
-        }
+        self.accounts.extend(ws.accounts);
+        self.storage.extend(ws.storage);
+        self.code.extend(ws.code);
     }
 
     /// Merge another block's delta over this one. The other delta's writes
@@ -312,15 +361,12 @@ impl PendingDelta {
     /// one layer of cost, no matter the pipeline depth. `code` entries
     /// are `Bytes`, which are reference-counted, so clones are cheap.
     pub fn merge_from(&mut self, other: &PendingDelta) {
-        for (addr, v) in &other.accounts {
-            self.accounts.insert(*addr, *v);
-        }
-        for (k, v) in &other.storage {
-            self.storage.insert(*k, *v);
-        }
-        for (h, b) in &other.code {
-            self.code.insert(*h, b.clone());
-        }
+        self.accounts
+            .extend(other.accounts.iter().map(|(k, v)| (*k, *v)));
+        self.storage
+            .extend(other.storage.iter().map(|(k, v)| (*k, *v)));
+        self.code
+            .extend(other.code.iter().map(|(h, b)| (*h, b.clone())));
     }
 
     /// Finalize: produce a wire-shape `BlockDelta`, ready for the state
@@ -329,6 +375,7 @@ impl PendingDelta {
     /// them). The writer persists them into the `receipts` and
     /// `tx_hash_index` tables, so `eth_getTransactionReceipt` can answer
     /// from durable state after a restart.
+    #[must_use]
     pub fn finalize(self, block_number: u64, receipts: Vec<kardamom_types::Receipt>) -> BlockDelta {
         // This is the one place that establishes canonical order. The
         // accumulator maps are unordered. Every serialized or persisted
@@ -339,11 +386,11 @@ impl PendingDelta {
         let mut accounts: Vec<AccountChange> = self
             .accounts
             .into_iter()
-            .map(|(address, (nonce, balance, code_hash))| AccountChange {
+            .map(|(address, fields)| AccountChange {
                 address,
-                nonce,
-                balance,
-                code_hash,
+                nonce: fields.nonce,
+                balance: fields.balance,
+                code_hash: fields.code_hash,
             })
             .collect();
         accounts.sort_unstable_by_key(|a| a.address);
@@ -357,10 +404,10 @@ impl PendingDelta {
             })
             .collect();
         storage.sort_unstable_by_key(|s| (s.address, s.key));
-        let mut code: Vec<CodeEntry> = self
+        let mut code: Vec<WireCodeEntry> = self
             .code
             .into_iter()
-            .map(|(code_hash, code)| CodeEntry { code_hash, code })
+            .map(|(code_hash, code)| WireCodeEntry { code_hash, code })
             .collect();
         code.sort_unstable_by_key(|c| c.code_hash);
         BlockDelta {
@@ -370,6 +417,49 @@ impl PendingDelta {
             code,
             receipts,
         }
+    }
+}
+
+/// The state layers behind one point in a block, in read-priority order:
+/// this block's own writes so far, then the merged unsettled-parent layer,
+/// then the durable snapshot. The block-close protocol actions and the
+/// remote-epoch observer hook both read through this, so a diverging read
+/// order between them cannot land in only one.
+pub struct ParentState<'a, S> {
+    delta: &'a PendingDelta,
+    parent: Option<&'a PendingDelta>,
+    snapshot: &'a S,
+}
+
+impl<'a, S: kardamom_types::StateDatabase> ParentState<'a, S> {
+    #[must_use]
+    pub fn new(delta: &'a PendingDelta, parent: Option<&'a PendingDelta>, snapshot: &'a S) -> Self {
+        Self {
+            delta,
+            parent,
+            snapshot,
+        }
+    }
+
+    /// Read one storage slot through the layers, in priority order: this
+    /// block's own writes, the unsettled parent, then the snapshot.
+    /// Reading the snapshot alone would be wrong for two reasons: it lags
+    /// by up to K unsettled blocks, and it cannot see the current block's
+    /// own writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the snapshot read fails.
+    pub fn storage(&self, addr: Address, slot: B256) -> Result<U256, crate::error::ExecutorError> {
+        if let Some(v) = self.delta.storage.get(&(addr, slot)) {
+            return Ok(*v);
+        }
+        if let Some(v) = self.parent.and_then(|p| p.storage.get(&(addr, slot))) {
+            return Ok(*v);
+        }
+        self.snapshot.storage(addr, slot).map_err(|e| {
+            crate::error::ExecutorError::State(format!("parent read {addr}/{slot}: {e:?}"))
+        })
     }
 }
 
@@ -383,8 +473,12 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, U256};
 
-    fn sample_account(b: u64, n: u64) -> (u64, U256, B256) {
-        (n, U256::from(b), B256::repeat_byte(0xCC))
+    fn sample_account(b: u64, n: u64) -> AccountFields {
+        AccountFields {
+            nonce: n,
+            balance: U256::from(b),
+            code_hash: B256::repeat_byte(0xCC),
+        }
     }
 
     #[test]
@@ -474,9 +568,9 @@ mod tests {
             .push(((addr, B256::from(U256::from(1u64))), U256::from(200u64)));
         delta.apply(ws2);
 
-        let (nonce, balance, _ch) = delta.accounts[&addr];
-        assert_eq!(balance, U256::from(15u64));
-        assert_eq!(nonce, 2);
+        let fields = delta.accounts[&addr];
+        assert_eq!(fields.balance, U256::from(15u64));
+        assert_eq!(fields.nonce, 2);
         assert_eq!(
             delta.storage[&(addr, B256::from(U256::from(1u64)))],
             U256::from(200u64)

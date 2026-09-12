@@ -1,14 +1,14 @@
 //! This is an allocation profile of the ingress transaction-submission
 //! path. It is ignored by default; run it explicitly:
 //!
-//!   cargo test -p kardamom-bench --test alloc_profile_ingress --release -- \
+//!   cargo test -p kardamom-bench --test `alloc_profile_ingress` --release -- \
 //!     --ignored --nocapture
 //!
 //! It drives `IngressProxy::submit_raw`, the hot path shared by both
 //! the JSON-RPC and binary listeners: the overload valve, per-IP rate
 //! limit, RLP decode, batched secp256k1 recovery and keccak256
-//! tx_hash, receipt-cache lookup, pending-registry park, and the
-//! publish onto the tx_data shard seam. All this runs in-process
+//! `tx_hash`, receipt-cache lookup, pending-registry park, and the
+//! publish onto the `tx_data` shard seam. All this runs in-process
 //! against `MockChannels`, with no Aeron, no network, and no
 //! jsonrpsee, under the DHAT heap profiler. A harness pump synthesizes
 //! a `Receipt` for each published envelope, and a periodic
@@ -28,7 +28,14 @@
 //!   with the nonce read from a prebuilt hash map instead of decoded.
 //!
 //! Writes dhat-heap-ingress.json next to this crate's Cargo.toml,
-//! with per-callsite attribution viewable with dh_view.html.
+//! with per-callsite attribution viewable with `dh_view.html`.
+//!
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "indices and counters here are bounded by small, fixed test parameters (shard and sender counts), never near a truncation or precision boundary"
+)]
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -38,8 +45,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use alloy_primitives::{B256, Bytes, U256, keccak256};
-use kardamom_bench::mnemonic;
-use kardamom_bench::signers::presign_transfers;
+use kardamom_bench::signers::{SignerSet, presign_transfers};
 use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::{IngressProxy, MockChannels};
 use kardamom_types::{BPosition, QuorumWatermark, Receipt};
@@ -47,7 +53,7 @@ use kardamom_types::{BPosition, QuorumWatermark, Receipt};
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
+use kardamom_bench::ANVIL_MNEMONIC as ANVIL_PHRASE;
 const CHAIN_ID: u64 = 1;
 const SENDERS: u32 = 64;
 /// The submissions kept in flight for each driver batch. This is
@@ -59,43 +65,78 @@ const MEASURED: usize = 10 * INFLIGHT; // Inside the measured window.
 
 type Proxy = IngressProxy<MockChannels, MockChannels>;
 
-/// A fake downstream. It drains each tx_data shard, stamps a monotone
-/// tx_ordering position, and echoes a synthetic `Receipt`. The nonce
+/// The receipt-pump ports every shard's pump task shares: the receipt
+/// bus to publish onto, the pregenerated `tx_hash -> nonce` map, and
+/// the monotone `tx_ordering` position counter shared across shards.
+#[derive(Clone)]
+struct PumpPorts {
+    receipt_bus: tokio::sync::broadcast::Sender<Receipt>,
+    nonces: Arc<HashMap<B256, u64>>,
+    position: Arc<AtomicI32>,
+}
+
+/// A fake downstream. It drains each `tx_data` shard, stamps a monotone
+/// `tx_ordering` position, and echoes a synthetic `Receipt`. The nonce
 /// comes from the prebuilt `tx_hash -> nonce` map, so the pump does no
 /// per-transaction decoding. This keeps the harness's own allocation
 /// footprint near zero.
+///
+/// `nonce_by_hash` and `position` are `Arc`s the caller also keeps;
+/// taking them by value here just clones the handle, which is cheap.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "nonce_by_hash and position are Arcs the caller also keeps; taking them by value here just clones the handle"
+)]
 fn spawn_receipt_pump(
     mock: &MockChannels,
     rx_vec: Vec<tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>>,
     nonce_by_hash: Arc<HashMap<B256, u64>>,
     position: Arc<AtomicI32>,
 ) {
-    for mut rx in rx_vec {
-        let receipt_bus = mock.receipt_bus.clone();
-        let nonces = nonce_by_hash.clone();
-        let position = position.clone();
-        tokio::spawn(async move {
-            while let Some(envelope) = rx.recv().await {
-                let off = position.fetch_add(1, Ordering::Relaxed) + 1;
-                let nonce = *nonces.get(&envelope.tx_hash).expect("pregenerated tx");
-                let receipt = Receipt {
-                    tx_idx: BPosition {
-                        term_id: 0,
-                        term_offset: off,
-                    },
-                    tx_hash: envelope.tx_hash,
-                    status: true,
-                    gas_used: 21_000,
-                    logs: Vec::new(),
-                    write_set_hash: B256::ZERO,
-                    from: envelope.sender,
-                    nonce,
-                    ..Default::default()
-                };
-                let _ = receipt_bus.send(receipt);
-            }
-        });
+    let ports = PumpPorts {
+        receipt_bus: mock.receipt_bus.clone(),
+        nonces: nonce_by_hash,
+        position,
+    };
+    for rx in rx_vec {
+        tokio::spawn(pump_one_shard(rx, ports.clone()));
     }
+}
+
+/// Drain one `tx_data` shard: for each envelope, stamp a monotone
+/// `tx_ordering` position and echo a synthetic receipt.
+async fn pump_one_shard(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>,
+    ports: PumpPorts,
+) {
+    while let Some(envelope) = rx.recv().await {
+        reflect_one(&ports, &envelope);
+    }
+}
+
+/// Stamp a monotone `tx_ordering` position for `envelope`, and echo a
+/// synthetic success receipt onto `ports.receipt_bus`.
+fn reflect_one(ports: &PumpPorts, envelope: &kardamom_types::TxEnvelope) {
+    let off = ports.position.fetch_add(1, Ordering::Relaxed) + 1;
+    let nonce = *ports
+        .nonces
+        .get(&envelope.tx_hash)
+        .expect("pregenerated tx");
+    let receipt = Receipt {
+        tx_idx: BPosition {
+            term_id: 0,
+            term_offset: off,
+        },
+        tx_hash: envelope.tx_hash,
+        status: true,
+        gas_used: 21_000,
+        logs: Vec::new(),
+        write_set_hash: B256::ZERO,
+        from: envelope.sender,
+        nonce,
+        ..Default::default()
+    };
+    let _ = ports.receipt_bus.send(receipt);
 }
 
 /// A production quorum watermark is a periodic egress-progress
@@ -125,15 +166,23 @@ fn spawn_watermark_ticker(mock: &MockChannels, position: Arc<AtomicI32>) {
 /// the RPC server's per-request handler tasks.
 async fn submit_all(proxy: Arc<Proxy>, ip: IpAddr, raws: &[Bytes]) {
     for chunk in raws.chunks(INFLIGHT) {
-        let mut handles = Vec::with_capacity(chunk.len());
-        for raw in chunk {
+        submit_chunk(&proxy, ip, chunk).await;
+    }
+}
+
+/// Submit one chunk: spawn one task per submission, like the RPC
+/// server's per-request handler tasks, then await all of them.
+async fn submit_chunk(proxy: &Arc<Proxy>, ip: IpAddr, chunk: &[Bytes]) {
+    let handles: Vec<_> = chunk
+        .iter()
+        .map(|raw| {
             let p = proxy.clone();
             let raw = raw.clone();
-            handles.push(tokio::spawn(async move { p.submit_raw(ip, raw).await }));
-        }
-        for h in handles {
-            h.await.expect("driver task").expect("submission receipted");
-        }
+            tokio::spawn(async move { p.submit_raw(ip, raw).await })
+        })
+        .collect();
+    for h in handles {
+        h.await.expect("driver task").expect("submission receipted");
     }
 }
 
@@ -143,7 +192,7 @@ fn ingress_submission_allocation_profile() {
     // Pre-generate valid signed raw transactions: 64 mnemonic-derived
     // senders, with sequential nonces, interleaved in rotation, using
     // the kardamom_bench helpers.
-    let signers = mnemonic::derive_signers(ANVIL_PHRASE, SENDERS).unwrap();
+    let signers = SignerSet::derive(ANVIL_PHRASE, SENDERS).unwrap();
     let raws = presign_transfers(
         &signers,
         CHAIN_ID,
@@ -158,7 +207,7 @@ fn ingress_submission_allocation_profile() {
     let nonce_by_hash: Arc<HashMap<B256, u64>> = Arc::new(
         raws.iter()
             .enumerate()
-            .map(|(i, raw)| (keccak256(raw), i as u64 / SENDERS as u64))
+            .map(|(i, raw)| (keccak256(raw), i as u64 / u64::from(SENDERS)))
             .collect(),
     );
 
@@ -179,7 +228,9 @@ fn ingress_submission_allocation_profile() {
             pending_receipt_timeout: Duration::from_secs(10),
             ..IngressConfig::default()
         };
-        let (mock, rx_vec) = MockChannels::new(cfg.partition_count_m as usize);
+        let (mock, rx_vec) = MockChannels::new(kardamom_types::num::nonzero_u32_to_usize(
+            cfg.partition_count_m,
+        ));
         let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
         spawn_receipt_pump(&mock, rx_vec, nonce_by_hash.clone(), position.clone());
         spawn_watermark_ticker(&mock, position.clone());
@@ -193,35 +244,40 @@ fn ingress_submission_allocation_profile() {
 
     // This is the measured window under DHAT: the full in-process
     // submission round trip, with INFLIGHT submissions concurrent per batch.
-    let profiler = dhat::Profiler::builder().build();
-    let stats0 = dhat::HeapStats::get();
-    let t0 = std::time::Instant::now();
-    rt.block_on(submit_all(proxy.clone(), ip, &raws[WARMUP..]));
-    let wall = t0.elapsed();
-    let stats = dhat::HeapStats::get();
+    // `_profiler` lives for this whole block and drops at its end, which
+    // writes dhat-heap.json with per-callsite attribution. `rt` moves in
+    // too, so its explicit shutdown below runs, and completes, before
+    // that drop: the dump never races a background allocation.
+    {
+        let _profiler = dhat::Profiler::builder().build();
+        let stats0 = dhat::HeapStats::get();
+        let t0 = std::time::Instant::now();
+        rt.block_on(submit_all(proxy.clone(), ip, &raws[WARMUP..]));
+        let wall = t0.elapsed();
+        let stats = dhat::HeapStats::get();
 
-    let n = MEASURED as u64;
-    let allocs = stats.total_blocks - stats0.total_blocks;
-    let bytes = stats.total_bytes - stats0.total_bytes;
-    println!(
-        "==================== INGRESS ALLOCATION PROFILE ({n} submissions) ===================="
-    );
-    println!("allocs/op:      {:.2}", allocs as f64 / n as f64);
-    println!("bytes/op:       {:.0}", bytes as f64 / n as f64);
-    println!("peak heap:      {:.2} MB", stats.max_bytes as f64 / 1e6);
-    println!(
-        "wall/op:        {:.2} us (batch-concurrent, {INFLIGHT} in flight)",
-        wall.as_micros() as f64 / n as f64
-    );
-    println!(
-        "implied rate:   {:.0} ktx/s",
-        n as f64 / wall.as_secs_f64() / 1e3
-    );
+        let n = MEASURED as u64;
+        let allocs = stats.total_blocks - stats0.total_blocks;
+        let bytes = stats.total_bytes - stats0.total_bytes;
+        println!(
+            "==================== INGRESS ALLOCATION PROFILE ({n} submissions) ===================="
+        );
+        println!("allocs/op:      {:.2}", allocs as f64 / n as f64);
+        println!("bytes/op:       {:.0}", bytes as f64 / n as f64);
+        println!("peak heap:      {:.2} MB", stats.max_bytes as f64 / 1e6);
+        println!(
+            "wall/op:        {:.2} us (batch-concurrent, {INFLIGHT} in flight)",
+            wall.as_micros() as f64 / n as f64
+        );
+        println!(
+            "implied rate:   {:.0} ktx/s",
+            n as f64 / wall.as_secs_f64() / 1e3
+        );
 
-    // Quiesce the runtime (the pump, watcher, and ticker tasks) before
-    // finalizing the profiler, so the dump does not race a background
-    // allocation.
-    drop(rt);
-    drop(profiler); // This writes dhat-heap.json with per-callsite attribution.
+        // Quiesce the runtime (the pump, watcher, and ticker tasks): wait
+        // up to 5 seconds for every task to finish, so `_profiler`'s drop
+        // below does not race a background allocation.
+        rt.shutdown_timeout(Duration::from_secs(5));
+    }
     let _ = std::fs::rename("dhat-heap.json", "dhat-heap-ingress.json");
 }

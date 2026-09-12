@@ -14,33 +14,39 @@ use alloy_primitives::Bytes;
 include!(concat!(env!("OUT_DIR"), "/embedded_artifacts.rs"));
 
 /// Creation bytecode of `KardamomFactoryV1`. The ERC-7955 self-bootstrap uses it.
+#[must_use]
 pub fn factory_v1_creation() -> Bytes {
     Bytes::from_static(KARDAMOM_FACTORY_V1_CREATION)
 }
 
-/// Creation bytecode of OpenZeppelin's `ERC1967Proxy`. It is used to compute
+/// Creation bytecode of `OpenZeppelin`'s `ERC1967Proxy`. It is used to compute
 /// the kardamom factory proxy CREATE2 address.
+#[must_use]
 pub fn erc1967_proxy_creation() -> Bytes {
     Bytes::from_static(ERC1967_PROXY_CREATION)
 }
 
 /// Creation bytecode of `ETHLockbox`. The factory does a CREATE2 of this on demand.
+#[must_use]
 pub fn eth_lockbox_creation() -> Bytes {
     Bytes::from_static(ETH_LOCKBOX_CREATION)
 }
 
 /// Creation bytecode of `KardamomL2Settlement`, the DA sink contract.
+#[must_use]
 pub fn kardamom_l2_settlement_creation() -> Bytes {
     Bytes::from_static(KARDAMOM_L2_SETTLEMENT_CREATION)
 }
 
 /// Creation bytecode of `KardamomProofOracle`, the zk root chain.
+#[must_use]
 pub fn kardamom_proof_oracle_creation() -> Bytes {
     Bytes::from_static(KARDAMOM_PROOF_ORACLE_CREATION)
 }
 
 /// Creation bytecode of `WithdrawalOutputOracle`, the withdrawal output root
 /// registry. The factory does a CREATE2 of this on demand.
+#[must_use]
 pub fn withdrawal_output_oracle_creation() -> Bytes {
     Bytes::from_static(WITHDRAWAL_OUTPUT_ORACLE_CREATION)
 }

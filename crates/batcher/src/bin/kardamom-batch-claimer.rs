@@ -14,6 +14,10 @@ use alloy_provider::ProviderBuilder;
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use clap::Parser;
+use kardamom_batcher::error::BatcherError;
+use std::ops::ControlFlow;
+
+use kardamom_batcher::live::poll::{PollLoop, Retry, parse_interval_secs};
 use kardamom_batcher::{ClaimOutcome, claim_next_batch};
 
 #[derive(Debug, Parser)]
@@ -28,8 +32,9 @@ struct Args {
     /// The validator's prover spool (per-block expected-outputs).
     #[arg(long, env = "KARDAMOM_SPOOL_DIR")]
     spool_dir: PathBuf,
-    #[arg(long, default_value_t = 30)]
-    interval_secs: u64,
+    /// 0 means run once and stop.
+    #[arg(long, default_value = "30", value_parser = parse_interval_secs)]
+    interval_secs: Option<Duration>,
 }
 
 #[tokio::main]
@@ -41,26 +46,49 @@ async fn main() -> Result<()> {
         .wallet(signer)
         .connect_http(args.l1_rpc_url.parse().context("parse --l1-rpc-url")?);
 
-    loop {
-        match claim_next_batch(provider.clone(), args.oracle, &args.spool_dir).await {
-            Ok(ClaimOutcome::Claimed { batch_index }) => {
-                tracing::info!(batch_index, "batch claimed");
-                continue;
-            }
-            Ok(ClaimOutcome::NoBatchPosted { batch_index }) => {
-                tracing::debug!(batch_index, "batch not posted yet")
-            }
-            Ok(ClaimOutcome::SpoolNotReady {
-                batch_index,
-                missing_block,
-            }) => {
-                tracing::debug!(batch_index, missing_block, "spool not caught up")
-            }
-            Err(e) => tracing::error!(error = %e, "claim attempt failed"),
-        }
-        if args.interval_secs == 0 {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_secs(args.interval_secs)).await;
+    let claimer = Claimer {
+        oracle: args.oracle,
+        spool_dir: args.spool_dir,
+        gate: PollLoop::new(args.interval_secs),
+    };
+    while let ControlFlow::Continue(()) = claimer.tick(&provider).await {}
+    Ok(())
+}
+
+/// One `kardamom-batch-claimer` reactor tick: claim the next posted
+/// batch the spool has covered, then gate the next tick on the outcome.
+struct Claimer {
+    oracle: Address,
+    spool_dir: PathBuf,
+    gate: PollLoop,
+}
+
+impl Claimer {
+    async fn tick(&self, provider: &(impl alloy_provider::Provider + Clone)) -> ControlFlow<()> {
+        let outcome = claim_next_batch(provider.clone(), self.oracle, &self.spool_dir).await;
+        self.gate.gate(report_claim_outcome(outcome)).await
     }
+}
+
+/// Log one [`claim_next_batch`] attempt's outcome. Retry immediately on a
+/// successful claim, so the claimer catches up without waiting out the
+/// poll interval.
+fn report_claim_outcome(outcome: Result<ClaimOutcome, BatcherError>) -> Retry {
+    match outcome {
+        Ok(ClaimOutcome::Claimed { batch_index }) => {
+            tracing::info!(batch_index, "batch claimed");
+            return Retry::Now;
+        }
+        Ok(ClaimOutcome::NoBatchPosted { batch_index }) => {
+            tracing::debug!(batch_index, "batch not posted yet");
+        }
+        Ok(ClaimOutcome::SpoolNotReady {
+            batch_index,
+            missing_block,
+        }) => {
+            tracing::debug!(batch_index, missing_block, "spool not caught up");
+        }
+        Err(e) => tracing::error!(error = %e, "claim attempt failed"),
+    }
+    Retry::AfterInterval
 }

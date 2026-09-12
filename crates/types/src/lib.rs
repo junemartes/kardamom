@@ -21,6 +21,9 @@
 
 extern crate alloc;
 
+mod abi;
+mod rlp;
+
 pub mod ack_policy;
 pub mod boundary;
 pub mod delta;
@@ -29,11 +32,13 @@ pub mod envelope;
 pub mod epoch;
 pub mod genesis;
 pub mod limits;
+pub mod num;
 pub mod position;
 pub mod prover;
 pub mod receipt;
 pub mod shard_map;
 pub mod state;
+pub mod time;
 pub mod tx_error;
 pub mod tx_ordering;
 pub mod txref;

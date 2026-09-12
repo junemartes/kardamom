@@ -22,63 +22,41 @@
 use alloy_primitives::{Address, B256, Bytes, U256, address};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::sol;
 
-use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
+use kardamom_deployer::abi::{ETHLockbox, WithdrawalOutputOracle};
+use kardamom_deployer::dev_keys::{
+    ATTESTER_ADDR, ATTESTER_KEY, CHALLENGER_ADDR, CHALLENGER_KEY, DEV_OWNER, L2_MINTER,
+};
+use kardamom_deployer::testkit::{AnvilRig, Funding};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_pair, encode_oracle_init_args};
 use kardamom_types::withdrawals;
 use kardamom_validator::attester::OutputPoster;
 
-sol! {
-    #[sol(rpc)]
-    contract ETHLockbox {
-        struct WithdrawalTransaction {
-            uint256 nonce;
-            address sender;
-            address target;
-            uint256 value;
-        }
-        function depositETH(address to, uint64 gasLimit, bytes calldata data) external payable;
-        function outputOracle() external view returns (address);
-        function finalizeWithdrawal(
-            WithdrawalTransaction calldata wtx,
-            uint256 outputIndex,
-            bytes32 stateRoot,
-            bytes32 withdrawalsRoot,
-            uint256 leafIndex,
-            bytes32[] calldata proof
-        ) external;
-    }
-
-    #[sol(rpc)]
-    contract WithdrawalOutputOracle {
-        function deleteOutput(uint256 index) external;
-        function outputCount() external view returns (uint256);
-        function outputRootAt(uint256 index) external view returns (bytes32);
-    }
-}
-
-const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
 const L2_CHAIN_ID: u64 = 42;
 const WINDOW: u64 = 86_400; // 1 day
-const L2_MINTER: Address = address!("00000000000000000000000000000000000000BE");
 
-// Anvil's deterministic dev accounts (standard test mnemonic).
-const ATTESTER_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-const ATTESTER_ADDR: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-const CHALLENGER_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
-const CHALLENGER_ADDR: Address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
-
-fn wallet_provider(anvil: &alloy_node_bindings::AnvilInstance, key: &str) -> impl Provider + Clone {
-    let signer: PrivateKeySigner = key.parse().unwrap();
-    let p = ProviderBuilder::new()
-        .wallet(signer)
-        .connect_http(anvil.endpoint_url());
-    // alloy's default HTTP poll interval is slow. Tighten it, so
-    // `get_receipt` returns promptly against the local node.
+/// alloy's default HTTP poll interval is slow. Tighten it, so
+/// `get_receipt` returns promptly against the local node, and hand the
+/// provider back. `wallet_provider` and `deposit_provider` differ only
+/// in whether the builder carries a wallet filler, which changes the
+/// provider's concrete type — so they cannot share one function that
+/// returns `impl Provider`, only this common tail step.
+fn with_fast_polling<P: Provider + Clone>(p: P) -> P {
     p.client()
         .set_poll_interval(std::time::Duration::from_millis(50));
     p
+}
+
+fn wallet_provider(
+    anvil: &alloy_node_bindings::AnvilInstance,
+    key: &str,
+) -> impl Provider + Clone + use<> {
+    let signer: PrivateKeySigner = key.parse().unwrap();
+    with_fast_polling(
+        ProviderBuilder::new()
+            .wallet(signer)
+            .connect_http(anvil.endpoint_url()),
+    )
 }
 
 /// Spawn anvil, with interval mining so the receipt watcher always sees
@@ -86,35 +64,14 @@ fn wallet_provider(anvil: &alloy_node_bindings::AnvilInstance, key: &str) -> imp
 /// anvil handle (kept alive by the caller) plus the deployed oracle and
 /// lockbox addresses. Returns `None` if anvil is unavailable.
 async fn setup() -> Option<(alloy_node_bindings::AnvilInstance, Address, Address)> {
-    let anvil = alloy_node_bindings::Anvil::new()
-        .block_time(1)
-        .try_spawn()
-        .ok()?;
+    let rig = AnvilRig::spawn(
+        alloy_node_bindings::Anvil::new().block_time(1),
+        &[(DEV_OWNER, Funding::FundAndImpersonate)],
+    )
+    .await?;
+    let anvil = rig.anvil;
 
-    let deploy_provider = ProviderBuilder::new()
-        .disable_recommended_fillers()
-        .connect_http(anvil.endpoint_url());
-    deploy_provider
-        .client()
-        .set_poll_interval(std::time::Duration::from_millis(50));
-
-    let bytes_hex = format!("0x{ERC7955_RUNTIME_HEX}");
-    let _: serde_json::Value = deploy_provider
-        .raw_request("anvil_setCode".into(), (ERC7955_FACTORY, bytes_hex))
-        .await
-        .ok()?;
-    let _: serde_json::Value = deploy_provider
-        .raw_request(
-            "anvil_setBalance".into(),
-            (DEV_OWNER, U256::from(1_000_000_000_000_000_000_000u128)),
-        )
-        .await
-        .ok()?;
-    let _: serde_json::Value = deploy_provider
-        .raw_request("anvil_impersonateAccount".into(), (DEV_OWNER,))
-        .await
-        .ok()?;
-
+    let deploy_provider = deposit_provider(&anvil);
     let deployer = Deployer::new(deploy_provider.clone(), DEV_OWNER);
     deployer.ensure_factory(DEV_OWNER).await.unwrap();
 
@@ -167,13 +124,12 @@ async fn setup() -> Option<(alloy_node_bindings::AnvilInstance, Address, Address
     Some((anvil, oracle_addr, lockbox_addr))
 }
 
-fn deposit_provider(anvil: &alloy_node_bindings::AnvilInstance) -> impl Provider + Clone {
-    let p = ProviderBuilder::new()
-        .disable_recommended_fillers()
-        .connect_http(anvil.endpoint_url());
-    p.client()
-        .set_poll_interval(std::time::Duration::from_millis(50));
-    p
+fn deposit_provider(anvil: &alloy_node_bindings::AnvilInstance) -> impl Provider + Clone + use<> {
+    with_fast_polling(
+        ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url()),
+    )
 }
 
 #[tokio::test]
@@ -235,19 +191,8 @@ async fn attester_posts_output_matching_rust_root() {
     );
 }
 
-#[tokio::test]
-#[ignore = "post-warp finalizeWithdrawal hits an alloy/anvil receipt-watcher timing flake; \
-            the L1 protocol is covered by Foundry WithdrawalFlow.t.sol. Run with --ignored."]
-async fn full_withdrawal_finalize_and_challenge() {
-    let Some((anvil, oracle_addr, lockbox_addr)) = setup().await else {
-        eprintln!("SKIP: anvil unavailable");
-        return;
-    };
-    let attester_provider = wallet_provider(&anvil, ATTESTER_KEY);
-    let read_provider = deposit_provider(&anvil);
-    let lockbox = ETHLockbox::new(lockbox_addr, attester_provider.clone());
-
-    // Fund the lockbox.
+/// Fund the lockbox through a deposit, the on-ramp both scenarios need.
+async fn fund_lockbox(lockbox: &ETHLockbox::ETHLockboxInstance<impl Provider + Clone>) {
     lockbox
         .depositETH(
             address!("0000000000000000000000000000000000001234"),
@@ -261,53 +206,108 @@ async fn full_withdrawal_finalize_and_challenge() {
         .get_receipt()
         .await
         .unwrap();
+}
 
-    // Post an output that commits a single withdrawal of 1 wei to `recipient`.
-    let l2_sender = address!("00000000000000000000000000000000000000AA");
-    let recipient = address!("00000000000000000000000000000000000000CC");
-    let value = U256::from(1_000_000_000_000_000_000u128);
-    let leaves = vec![withdrawals::withdrawal_leaf(
-        U256::ZERO,
+/// The three parties/amount a withdrawal is between: who sent it on L2,
+/// who it pays out to on L1, and how much. Grouped so a helper taking a
+/// sender, a recipient, and a value together stays under the default
+/// clippy argument-count threshold.
+#[derive(Clone, Copy)]
+struct Parties {
+    l2_sender: Address,
+    recipient: Address,
+    value: U256,
+}
+
+/// One proposed withdrawal, with everything `finalizeWithdrawal` needs:
+/// the tx, its proof, the state/withdrawals roots the output committed
+/// to, and who it pays.
+struct ProposedWithdrawal {
+    wtx: ETHLockbox::WithdrawalTransaction,
+    proof: Vec<B256>,
+    state_root: B256,
+    wroot: B256,
+    recipient: Address,
+    value: U256,
+}
+
+/// Post an output committing a single withdrawal of `parties.value` to
+/// `parties.recipient`.
+async fn propose_single_withdrawal(
+    poster: &OutputPoster<impl Provider + Clone>,
+    parties: Parties,
+    nonce: U256,
+    l2_block: u64,
+) -> ProposedWithdrawal {
+    let Parties {
         l2_sender,
         recipient,
         value,
+    } = parties;
+    let leaves = vec![withdrawals::withdrawal_leaf(
+        nonce, l2_sender, recipient, value,
     )];
     let wroot = withdrawals::withdrawals_root(&leaves);
     let state_root = B256::from([0x99; 32]);
     let output_root = withdrawals::output_root(state_root, wroot);
-
-    let poster = OutputPoster::new(attester_provider.clone(), oracle_addr);
-    poster.propose_output(output_root, 100).await.unwrap();
-
+    poster.propose_output(output_root, l2_block).await.unwrap();
     let wtx = ETHLockbox::WithdrawalTransaction {
-        nonce: U256::ZERO,
+        nonce,
         sender: l2_sender,
         target: recipient,
         value,
     };
     let proof = withdrawals::withdrawal_proof(&leaves, 0);
+    ProposedWithdrawal {
+        wtx,
+        proof,
+        state_root,
+        wroot,
+        recipient,
+        value,
+    }
+}
 
-    // Before the window: finalize must revert.
+/// Before the challenge window elapses, `finalizeWithdrawal` must revert.
+async fn assert_finalize_before_window_reverts(
+    lockbox: &ETHLockbox::ETHLockboxInstance<impl Provider + Clone>,
+    w: &ProposedWithdrawal,
+) {
     let early = lockbox
         .finalizeWithdrawal(
-            wtx.clone(),
+            w.wtx.clone(),
             U256::ZERO,
-            state_root,
-            wroot,
+            w.state_root,
+            w.wroot,
             U256::ZERO,
-            proof.clone(),
+            w.proof.clone(),
         )
         .send()
         .await;
     assert!(early.is_err(), "finalize before window must revert");
+}
 
-    // Advance past the window, then finalize: the recipient gets paid.
+/// Advance past the challenge window, finalize, and check the recipient
+/// got paid.
+async fn advance_and_finalize(
+    attester_provider: &(impl Provider + Clone),
+    lockbox: &ETHLockbox::ETHLockboxInstance<impl Provider + Clone>,
+    read_provider: &impl Provider,
+    w: ProposedWithdrawal,
+) {
     let _: serde_json::Value = attester_provider
         .raw_request("evm_increaseTime".into(), (WINDOW + 10,))
         .await
         .unwrap();
     lockbox
-        .finalizeWithdrawal(wtx, U256::ZERO, state_root, wroot, U256::ZERO, proof)
+        .finalizeWithdrawal(
+            w.wtx,
+            U256::ZERO,
+            w.state_root,
+            w.wroot,
+            U256::ZERO,
+            w.proof,
+        )
         .gas(2_000_000)
         .send()
         .await
@@ -315,9 +315,26 @@ async fn full_withdrawal_finalize_and_challenge() {
         .get_receipt()
         .await
         .unwrap();
-    assert_eq!(read_provider.get_balance(recipient).await.unwrap(), value);
+    assert_eq!(
+        read_provider.get_balance(w.recipient).await.unwrap(),
+        w.value
+    );
+}
 
-    // Challenge path: delete a second, bad output, and it can never finalize.
+/// Challenge path: an output the challenger deletes can never finalize,
+/// even after the window elapses.
+async fn challenge_blocks_finalize(
+    anvil: &alloy_node_bindings::AnvilInstance,
+    oracle_addr: Address,
+    lockbox: &ETHLockbox::ETHLockboxInstance<impl Provider + Clone>,
+    poster: &OutputPoster<impl Provider + Clone>,
+    parties: Parties,
+) {
+    let Parties {
+        l2_sender,
+        recipient,
+        value,
+    } = parties;
     let bad_leaves = vec![withdrawals::withdrawal_leaf(
         U256::from(2u64),
         l2_sender,
@@ -332,7 +349,7 @@ async fn full_withdrawal_finalize_and_challenge() {
         .unwrap();
     let bad_index = poster.output_count().await.unwrap() - 1;
 
-    let challenger_provider = wallet_provider(&anvil, CHALLENGER_KEY);
+    let challenger_provider = wallet_provider(anvil, CHALLENGER_KEY);
     let oracle = WithdrawalOutputOracle::new(oracle_addr, challenger_provider.clone());
     oracle
         .deleteOutput(U256::from(bad_index))
@@ -365,4 +382,32 @@ async fn full_withdrawal_finalize_and_challenge() {
         .send()
         .await;
     assert!(blocked.is_err(), "deleted output must not finalize");
+}
+
+#[tokio::test]
+#[ignore = "post-warp finalizeWithdrawal hits an alloy/anvil receipt-watcher timing flake; \
+            the L1 protocol is covered by Foundry WithdrawalFlow.t.sol. Run with --ignored."]
+async fn full_withdrawal_finalize_and_challenge() {
+    let Some((anvil, oracle_addr, lockbox_addr)) = setup().await else {
+        eprintln!("SKIP: anvil unavailable");
+        return;
+    };
+    let attester_provider = wallet_provider(&anvil, ATTESTER_KEY);
+    let read_provider = deposit_provider(&anvil);
+    let lockbox = ETHLockbox::new(lockbox_addr, attester_provider.clone());
+
+    fund_lockbox(&lockbox).await;
+
+    let parties = Parties {
+        l2_sender: address!("00000000000000000000000000000000000000AA"),
+        recipient: address!("00000000000000000000000000000000000000CC"),
+        value: U256::from(1_000_000_000_000_000_000u128),
+    };
+    let poster = OutputPoster::new(attester_provider.clone(), oracle_addr);
+    let withdrawal = propose_single_withdrawal(&poster, parties, U256::ZERO, 100).await;
+
+    assert_finalize_before_window_reverts(&lockbox, &withdrawal).await;
+    advance_and_finalize(&attester_provider, &lockbox, &read_provider, withdrawal).await;
+
+    challenge_blocks_finalize(&anvil, oracle_addr, &lockbox, &poster, parties).await;
 }

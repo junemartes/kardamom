@@ -4,7 +4,7 @@
 //! This test follows the convention in
 //! `kardamom-kardamom_ingress::tests::docker_e2e.rs`. It is a topology
 //! smoke test. It proves that a single Aeron node can serve both the
-//! per-sequencer tx_data streams and the shared tx_ordering stream.
+//! per-sequencer `tx_data` streams and the shared `tx_ordering` stream.
 //!
 //! The full round-trip test needs an Aeron-backed `IngressSource` adapter
 //! that feeds a real sequencer process. That sequencer process performs
@@ -37,11 +37,11 @@ async fn aeron_cluster_starts_for_sequencer_e2e_smoke() {
 
 /// M+1 topology smoke test.
 /// Checks that the single-node Aeron harness exposes enough Archive
-/// endpoints to host M per-sequencer tx_data streams and the tx_ordering
-/// stream. Today the single-node container puts everything on one Media
-/// Driver and Archive, so this check always passes. The test pins this
-/// expectation. When the harness grows to multi-node, a failure here is
-/// deliberate, not silent.
+/// endpoints to host M per-sequencer `tx_data` streams and the
+/// `tx_ordering` stream. Today the single-node container puts everything
+/// on one Media Driver and Archive, so this check always passes. The
+/// test pins this expectation. When the harness grows to multi-node, a
+/// failure here is deliberate, not silent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker; run with `cargo test --features docker-e2e -- --ignored`"]
 async fn aeron_cluster_serves_m_plus_one_topology_smoke() {
@@ -61,7 +61,7 @@ async fn aeron_cluster_serves_m_plus_one_topology_smoke() {
     // A follow-up wiring PR will test the M+1 fanout end-to-end. For now,
     // this test checks that it can name 4 sequencer ids without the
     // harness rejecting them.
-    for sid in 0..M as u8 {
+    for sid in 0..u8::try_from(M).unwrap() {
         let _alias = format!("a-{sid}");
     }
     drop(cluster);

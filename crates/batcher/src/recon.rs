@@ -18,6 +18,9 @@ use crate::frame::{BlockFrame, Kar1Payload, decode as frame_decode};
 /// function unpacks the 31-byte field encoding. It checks whether the
 /// unpacked bytes are a zstd stream, and decompresses them if so. Then it
 /// decodes the KAR1 framing.
+///
+/// # Errors
+/// Returns an error when unpacking, decompression, or KAR1 decoding fails.
 pub fn reconstruct(blobs: &[Blob]) -> Result<Vec<BlockFrame>, BatcherError> {
     let raw = unpack_from_blobs(blobs)?;
     let framed = if is_zstd(&raw) {

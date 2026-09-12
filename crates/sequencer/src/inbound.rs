@@ -1,19 +1,20 @@
-//! Inbound tx_data subscription.
+//! Inbound `tx_data` subscription.
 //!
-//! Under the MDS topology, the sequencer subscribes to one tx_data stream
+//! Under the MDS topology, the sequencer subscribes to one `tx_data` stream
 //! (the one for its address shard). It sees every `TxEnvelope` that any
 //! proxy published there, paired with the Aeron `BPosition` of that
 //! fragment. The sequencer reorders envelopes by per-sender nonce, then
 //! republishes a `TxRef { tx_hash, shard_id, tx_data_position }` onto
-//! tx_ordering.
+//! `tx_ordering`.
 //!
 //! The inbound `TxEnvelope` already has `sender` and `tx_hash` set by
 //! the proxy. No recovery or hashing happens here.
 
-use crate::error::SequencerError;
 use kardamom_types::{TxDataLoc, TxEnvelope};
 
-/// One envelope off tx_data, with the lane it lives on. The sequencer
+use crate::error::SequencerError;
+
+/// One envelope off `tx_data`, with the lane it lives on. The sequencer
 /// stamps the lane into `TxRef::shard_id`, so the executor joins the ref
 /// against the archive that holds the envelope.
 #[derive(Debug)]
@@ -23,11 +24,11 @@ pub struct Inbound {
     pub envelope: TxEnvelope,
 }
 
-/// Subscription to one or more tx_data lanes.
+/// Subscription to one or more `tx_data` lanes.
 /// Yields an [`Inbound`] for each Aeron fragment: the envelope paired
 /// with its lane, its publisher `session_id`, and its `BPosition`.
-/// Production code wraps one `log` tx_data subscriber per lane. Tests use
-/// [`fakes::ScriptedTxData`].
+/// Production code wraps one `log` `tx_data` subscriber per lane. Tests
+/// use [`fakes::ScriptedTxData`].
 ///
 /// This has the same shape as the executor's `TxDataSubscription` trait.
 /// The difference: the sequencer is one of P concurrent subscribers per
@@ -41,6 +42,11 @@ pub trait TxDataSubscriber: Send {
     ///  - `Ok(None)` when no message is ready (caller backs off).
     ///  - `Err(IngressDisconnected)` when the subscription is permanently
     ///    closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SequencerError::IngressDisconnected`] when the
+    /// subscription is permanently closed.
     fn poll(&mut self) -> Result<Option<Inbound>, SequencerError>;
 }
 
@@ -52,9 +58,9 @@ pub trait TxDataSubscriber: Send {
 pub mod fakes {
     use std::collections::VecDeque;
 
-    use super::*;
+    use super::{Inbound, SequencerError, TxDataLoc, TxDataSubscriber, TxEnvelope};
 
-    /// In-memory tx_data subscription. It is scripted with `(loc, envelope)`
+    /// In-memory `tx_data` subscription. It is scripted with `(loc, envelope)`
     /// pairs in arrival order. Tests usually build a vector of envelopes and
     /// make increasing [`TxDataLoc`] values (session and position) before
     /// they run `Sequencer::run_once`.

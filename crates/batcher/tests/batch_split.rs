@@ -11,10 +11,30 @@ use kardamom_batcher::batcher::{
 use kardamom_batcher::blob::USABLE_BYTES_PER_BLOB;
 use kardamom_batcher::error::BatcherError;
 use kardamom_types::BPosition;
+use kardamom_types::num::usize_to_u64;
 use kardamom_types::xchain::{
-    MAX_REMOTE_EPOCH_WIRE_BYTES, REMOTE_EPOCH_FIXED_WIRE_BYTES, RemoteEpochRecord,
+    MAX_REMOTE_EPOCH_WIRE_BYTES, NonEmptyVec, REMOTE_EPOCH_FIXED_WIRE_BYTES, RemoteEpochRecord,
     XCHAIN_MSG_FIXED_WIRE_BYTES, XChainMessage, remote_epoch_wire_bytes, remote_source_hash,
 };
+
+/// Message `i` of a capped record: `n` bytes of calldata, with a callback.
+fn capped_message(origin: u64, i: usize, n: usize) -> XChainMessage {
+    let seq = usize_to_u64(i);
+    XChainMessage {
+        source_hash: remote_source_hash(origin, seq),
+        seq,
+        origin_sender: Address::repeat_byte(0xA1),
+        target: Address::repeat_byte(0xB2),
+        value: 0,
+        gas_limit: 150_000,
+        input: Bytes::from(vec![u8::try_from(i).unwrap(); n]),
+        callback: Some(kardamom_types::xchain::Callback {
+            target: Address::repeat_byte(0xCB),
+            gas_limit: 90_000,
+            context: B256::repeat_byte(0x42),
+        }),
+    }
+}
 
 fn pos(o: i32) -> BPosition {
     BPosition {
@@ -29,13 +49,13 @@ fn block_of(block_number: u64, raw_len: usize) -> ClosedBlock {
     ClosedBlock {
         block_number,
         l2_timestamp: 1_700_000_000 + block_number,
-        end_tx_idx: pos(block_number as i32 * 64),
+        end_tx_idx: pos(i32::try_from(block_number * 64).unwrap()),
         remote_epochs: Vec::new(),
         txs: vec![RecordedTx {
             position: pos(0),
             envelope: kardamom_types::TxEnvelope {
                 correlation_id: block_number,
-                raw_tx: Bytes::from(vec![block_number as u8; raw_len]),
+                raw_tx: Bytes::from(vec![u8::try_from(block_number).unwrap(); raw_len]),
                 sender: Address::repeat_byte(0x11),
                 tx_hash: B256::repeat_byte(0x22),
             },
@@ -46,7 +66,7 @@ fn block_of(block_number: u64, raw_len: usize) -> ClosedBlock {
 fn uncompressed() -> BatcherConfig {
     BatcherConfig {
         compress: false,
-        blocks_per_batch: 2,
+        blocks_per_batch: std::num::NonZeroUsize::new(2).unwrap(),
         ..Default::default()
     }
 }
@@ -176,24 +196,12 @@ fn record_at_the_derivation_cap_fits_in_five_blobs() {
         remote_epoch_wire_bytes(lens.iter().copied()),
         MAX_REMOTE_EPOCH_WIRE_BYTES
     );
-    let messages: Vec<XChainMessage> = lens
+    let mut built = lens
         .iter()
         .enumerate()
-        .map(|(i, &n)| XChainMessage {
-            source_hash: remote_source_hash(ORIGIN, i as u64),
-            seq: i as u64,
-            origin_sender: Address::repeat_byte(0xA1),
-            target: Address::repeat_byte(0xB2),
-            value: 0,
-            gas_limit: 150_000,
-            input: Bytes::from(vec![i as u8; n]),
-            callback: Some(kardamom_types::xchain::Callback {
-                target: Address::repeat_byte(0xCB),
-                gas_limit: 90_000,
-                context: B256::repeat_byte(0x42),
-            }),
-        })
-        .collect();
+        .map(|(i, &n)| capped_message(ORIGIN, i, n));
+    let first = built.next().expect("at least one message");
+    let messages = NonEmptyVec::new(first, built.collect());
     let record = RemoteEpochRecord {
         origin_chain_id: ORIGIN,
         anchor_number: 100,
@@ -234,20 +242,7 @@ fn wire_constants_match_the_encoder() {
         anchor_number: 100,
         anchor_hash: B256::repeat_byte(0x0B),
         first_seq: 0,
-        messages: vec![XChainMessage {
-            source_hash: remote_source_hash(412_346, 0),
-            seq: 0,
-            origin_sender: Address::repeat_byte(0xA1),
-            target: Address::repeat_byte(0xB2),
-            value: 0,
-            gas_limit: 150_000,
-            input: Bytes::new(),
-            callback: Some(kardamom_types::xchain::Callback {
-                target: Address::repeat_byte(0xCB),
-                gas_limit: 90_000,
-                context: B256::repeat_byte(0x42),
-            }),
-        }],
+        messages: NonEmptyVec::new(capped_message(412_346, 0, 0), Vec::new()),
     }];
     let payload = |b: BlockFrame| Kar1Payload {
         blocks: vec![b],

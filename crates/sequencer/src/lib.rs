@@ -2,7 +2,7 @@
 //!
 //! The sequencer is stateless. The in-memory `next_nonce` map is a cache,
 //! and the sequencer can rebuild it from canonical sources. A cold sender
-//! starts at nonce 0. In the warm steady state, the tx_data tail gives
+//! starts at nonce 0. In the warm steady state, the `tx_data` tail gives
 //! visibility: every matched envelope advances the sender's nonce. Two
 //! sources recover committed floors out of band: the receipt-floor resync
 //! (`crate::resync`) and the executor nonce lookup (`crate::lookup`). The
@@ -11,9 +11,9 @@
 //! Topology (see `docs/specs/dynamic-sequencer-sizing.md`):
 //!   - The ingress routes a sender by virtual slot,
 //!     `vslot = keccak256(sender)[..8] % 256`, through a versioned map from
-//!     vslot to tx_data lane (`kardamom_types::shard_map`).
+//!     vslot to `tx_data` lane (`kardamom_types::shard_map`).
 //!   - Each active lane has two racing replicas. Both read the lane's
-//!     tx_data stream, both run the same state machine, and both offer the
+//!     `tx_data` stream, both run the same state machine, and both offer the
 //!     same refs. The Aeron Cluster dedups by canonical id, first seen.
 //!     There is no preferred replica, no lease, and no routing table in a
 //!     sequencer.
@@ -33,19 +33,24 @@
 pub mod config;
 pub mod epoch;
 pub mod error;
+#[cfg(any(test, feature = "testing"))]
+pub mod fakes;
 pub mod inbound;
 pub mod lookup;
 pub mod metrics;
 mod nonce_decode;
 pub mod outbound;
 pub mod partition;
-pub mod pending;
+pub(crate) mod pending;
+pub mod pump;
 pub mod remote_epoch;
 pub mod resync;
-pub mod sender;
+pub(crate) mod sender;
 pub mod sequencer;
 pub mod shutdown;
-pub mod state;
+pub(crate) mod state;
+#[cfg(any(test, feature = "testing"))]
+pub mod testkit;
 mod unconfirmed;
 
 pub use config::{BackpressurePolicy, SequencerConfig};

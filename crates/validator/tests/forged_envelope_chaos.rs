@@ -21,83 +21,26 @@
 //! - flag on, forged sender: `RecordIdentity` stops the pipeline before
 //!   the first EVM step, the integrity latch is set, and the victim is
 //!   untouched.
-//! - flag off, the same forgery: the theft commits. This is the
-//!   documented blind spot from before this check existed, pinned as a test so the
-//!   executor-side decision (defense-in-depth against latency) rests on
-//!   a red/green fact, not a claim.
+//! - flag off, the same forgery: the theft commits. This is a documented
+//!   blind spot, pinned as a test so the executor-side decision
+//!   (defense-in-depth against latency) rests on a red/green fact, not a
+//!   claim.
 
-use std::thread;
-use std::time::Duration;
-
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::{
-    Address, Bytes as AlloyBytes, TxKind as APTxKind, U256, address, keccak256,
-};
+use alloy_primitives::{Address, U256, address};
 use alloy_signer_local::PrivateKeySigner;
-use bytes::Bytes;
-use crossbeam_channel::{Receiver, Sender, bounded};
+use kardamom_engine::actor::fixtures::{ChannelHarness, HarnessInput, HarnessOutcome, LegacyTx};
 use kardamom_engine::{
-    BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
-    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ResumePoint,
-    RoleHooks, StateDatabase, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
-    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, ExecutorConfig, ExecutorError, MockStateDatabase,
+    StateDatabase, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxRef,
 };
 use kardamom_validator::{Divergence, latch_integrity_failure};
 use revm::primitives::KECCAK_EMPTY;
 
 const CHAIN_ID: u64 = 1;
+/// [`CHAIN_ID`], as `ExecutorConfig::chain_id` now requires.
+const CHAIN_ID_NONZERO: std::num::NonZeroU64 = std::num::NonZeroU64::new(CHAIN_ID).unwrap();
 const SINK: Address = address!("00000000000000000000000000000000DEAD0666");
 const LOOT: u64 = 250_000;
-
-struct ChanTxDataSub {
-    rx: Receiver<(BPosition, KtTxEnvelope)>,
-}
-impl TxDataSubscription for ChanTxDataSub {
-    fn sequencer_id(&self) -> u8 {
-        0
-    }
-    fn next(&mut self) -> Result<(kardamom_types::TxDataLoc, KtTxEnvelope), ExecutorError> {
-        self.rx
-            .recv()
-            .map(|(pos, env)| (kardamom_types::TxDataLoc::new(0, pos), env))
-            .map_err(|_| ExecutorError::TxDataClosed { sequencer_id: 0 })
-    }
-}
-struct ChanTxOrderingSub(Receiver<(BPosition, TxOrderingMessage)>);
-impl TxOrderingSubscription for ChanTxOrderingSub {
-    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
-        self.0.recv().map_err(|_| ExecutorError::TxOrderingClosed)
-    }
-}
-struct ChanReceiptsPub(Sender<CMessage>);
-impl TxReceiptsPublication for ChanReceiptsPub {
-    fn publish(&mut self, m: CMessage) -> Result<(), ExecutorError> {
-        self.0.send(m).map_err(|_| ExecutorError::TxReceiptsClosed)
-    }
-}
-struct Imm;
-impl StateWriterSignal for Imm {
-    fn committed(&mut self) -> Result<u64, ExecutorError> {
-        Ok(u64::MAX)
-    }
-    fn wait_committed(&mut self, b: u64) -> Result<u64, ExecutorError> {
-        Ok(b)
-    }
-}
-
-/// Port types for this test's channel-backed fakes.
-struct TestWiring;
-impl EngineWiring for TestWiring {
-    type TxData = ChanTxDataSub;
-    type TxOrdering = ChanTxOrderingSub;
-    type TxReceipts = ChanReceiptsPub;
-    type Snapshots = MutatingSnapshotSource;
-    type WriterSignal = Imm;
-    type WriterQueue = WriterApplyingQueue;
-    type Epoch = NoEpochCheck;
-}
 
 fn bpos(off: i32) -> BPosition {
     BPosition {
@@ -112,25 +55,18 @@ fn bpos(off: i32) -> BPosition {
 /// `tx_hash` stays honest: a forged hash would already fail the reader's
 /// reference join, and hash forgery is covered by the exec-core unit tests.
 fn envelope_claiming(signer: &PrivateKeySigner, sender: Address) -> KtTxEnvelope {
-    let mut tx = TxLegacy {
-        chain_id: Some(CHAIN_ID),
+    let envelope = LegacyTx {
+        chain_id: CHAIN_ID,
+        to: SINK,
         nonce: 0,
-        gas_price: 0,
+        value: LOOT,
         gas_limit: 21_000,
-        to: APTxKind::Call(SINK),
-        value: U256::from(LOOT),
-        input: AlloyBytes::new(),
-    };
-    let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-    let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
-    let raw_tx = Bytes::from(alloy_env.encoded_2718());
-    let tx_hash = keccak256(&raw_tx);
-    KtTxEnvelope {
-        correlation_id: 0,
-        raw_tx,
-        sender,
-        tx_hash,
+        gas_price: 0,
     }
+    .sign(signer);
+    // The theft shape: keep the honestly-signed bytes and hash, but
+    // claim a different `sender` than the one that actually signed.
+    KtTxEnvelope { sender, ..envelope }
 }
 
 /// Drive one single-tx block through the full pipeline. Returns the
@@ -139,68 +75,40 @@ fn run_pipeline(
     envelope: KtTxEnvelope,
     victim: Address,
     verify_record_identity: bool,
-) -> (Result<(), ExecutorError>, Vec<CMessage>, MockStateDatabase) {
+) -> HarnessOutcome {
     let snap = MockStateDatabase::builder()
         .account(victim, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
         .build();
-    let writer_q = WriterApplyingQueue::new(snap.clone());
-    let snapshots = MutatingSnapshotSource(snap.clone());
-
-    let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>(8);
-    let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>(8);
-    let (c_tx, c_rx) = bounded::<CMessage>(8);
 
     let tx_hash = envelope.tx_hash;
-    a_tx.send((bpos(0), envelope)).unwrap();
-    b_tx.send((
-        bpos(0),
-        TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, bpos(0), 0)),
-    ))
-    .unwrap();
-    b_tx.send((
-        bpos(1),
-        TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
-            block_number: 1,
-            end_tx_idx: bpos(1),
-            l2_timestamp: 1_700_000_000,
-            l1_origin: 0,
-        }),
-    ))
-    .unwrap();
-    drop(a_tx);
-    drop(b_tx);
+    let tx_data = vec![(bpos(0), envelope)];
+    let tx_ordering = vec![
+        (
+            bpos(0),
+            TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, bpos(0), 0)),
+        ),
+        (
+            bpos(1),
+            TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
+                block_number: 1,
+                end_tx_idx: bpos(1),
+                l2_timestamp: 1_700_000_000,
+                l1_origin: 0,
+            }),
+        ),
+    ];
 
     let cfg = ExecutorConfig {
-        chain_id: CHAIN_ID,
+        chain_id: CHAIN_ID_NONZERO,
         verify_record_identity,
         ..Default::default()
     };
-    let tx_data_subs = vec![ChanTxDataSub { rx: a_rx }];
-    let h = thread::spawn(move || {
-        Executor::run::<TestWiring>(
-            cfg,
-            Inbound {
-                tx_data: tx_data_subs,
-                tx_ordering: ChanTxOrderingSub(b_rx),
-                join_recovery: None,
-            },
-            Outbound {
-                tx_receipts: ChanReceiptsPub(c_tx),
-                snapshots,
-                writer_signal: Imm,
-                writer_queue: writer_q,
-            },
-            ResumePoint::GENESIS,
-            RoleHooks::none(),
-        )
-    });
-
-    let mut out = Vec::new();
-    while let Ok(m) = c_rx.recv_timeout(Duration::from_secs(5)) {
-        out.push(m);
-    }
-    let res = h.join().expect("no panic");
-    (res, out, snap)
+    ChannelHarness::run(HarnessInput {
+        cfg,
+        tx_data,
+        tx_ordering,
+        snap,
+    })
 }
 
 #[test]
@@ -208,7 +116,11 @@ fn honest_traffic_executes_with_identity_verification_on() {
     let signer = PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(0x11)).unwrap();
     let sender = signer.address();
 
-    let (res, out, snap) = run_pipeline(envelope_claiming(&signer, sender), sender, true);
+    let HarnessOutcome {
+        result: res,
+        receipts: out,
+        state: snap,
+    } = run_pipeline(envelope_claiming(&signer, sender), sender, true);
 
     res.expect("honest envelope must pass the identity check");
     assert!(
@@ -227,7 +139,11 @@ fn forged_sender_halts_and_latches_with_verification_on() {
     let victim = address!("00000000000000000000000000000000000F1C71");
     assert_ne!(attacker.address(), victim);
 
-    let (res, out, snap) = run_pipeline(envelope_claiming(&attacker, victim), victim, true);
+    let HarnessOutcome {
+        result: res,
+        receipts: out,
+        state: snap,
+    } = run_pipeline(envelope_claiming(&attacker, victim), victim, true);
 
     // The pipeline halts with the identity error before the first EVM
     // step: nothing reaches the C stream, and nothing reaches the writer.
@@ -272,14 +188,17 @@ fn forged_sender_commits_theft_with_verification_off() {
         PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(0x33)).unwrap();
     let victim = address!("00000000000000000000000000000000000F1C72");
 
-    let (res, out, snap) = run_pipeline(envelope_claiming(&attacker, victim), victim, false);
+    let HarnessOutcome {
+        result: res,
+        receipts: out,
+        state: snap,
+    } = run_pipeline(envelope_claiming(&attacker, victim), victim, false);
 
-    // This is the documented blind spot from before this check existed:
-    // with the check off, the
-    // proxy's claimed sender is trusted, and the attacker-signed tx
-    // spends the victim's funds. If closing the executor-side gap ever
-    // flips this test, that is the intended signal: delete it alongside
-    // the flag decision.
+    // This is the documented blind spot: with the check off, the proxy's
+    // claimed sender is trusted, and the attacker-signed tx spends the
+    // victim's funds. If closing the executor-side gap ever flips this
+    // test, that is the intended signal: delete it alongside the flag
+    // decision.
     res.expect("with verification off the forgery executes");
     assert!(
         out.iter()

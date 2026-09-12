@@ -1,10 +1,11 @@
 //! The per-table checks that make up [`sweep`](super::sweep).
 //!
-//! Each check walks one table, or one coherent group for the receipt
-//! index. It appends findings to the shared [`IntegrityReport`], and
-//! increases the report's row counts. `sweep` calls these checks in a
-//! fixed order. Within each check, the iteration order matches the
-//! table's key order.
+//! [`Sweep`] owns the read-write transaction and the [`IntegrityReport`]
+//! being built. Each check method walks one table, or one coherent group
+//! for the receipt index. It appends findings to the report, and
+//! increases the report's row counts. [`super::sweep`] calls these
+//! methods in a fixed order. Within each check, the iteration order
+//! matches the table's key order.
 
 use std::ops::ControlFlow;
 
@@ -26,288 +27,351 @@ use crate::schema::{
     decode_account_value, decode_header_value, decode_receipt_value, decode_storage_value,
     decode_tx_hash_value, encode_code_key, encode_tx_hash_key, for_each_row,
 };
-use crate::trie::{TrieTables, rebuild_root};
+use crate::trie::TrieTables;
 
 use super::IntegrityReport;
 
-fn get_meta(txn: &RwTxSync, meta: Database, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
-    Ok(txn.get::<Vec<u8>>(meta.dbi(), key)?)
+/// Running trackers `Sweep::check_header_row` updates and
+/// `Sweep::check_header_chain_ends` reads once the walk over `headers`
+/// finishes.
+#[derive(Default)]
+struct HeaderChainState {
+    prev_block: Option<u64>,
+    first_block: Option<u64>,
+    last_header_end_tx: Option<BPosition>,
 }
 
-fn problem(p: String, r: &mut IntegrityReport) {
-    r.problems.push(p);
-}
-
-/// Checks meta: schema version, genesis, and cursors.
-///
-/// Returns the decoded `last_committed_end_tx_position` cursor. The
-/// headers and receipts checks cross-reference this value.
-pub(super) fn check_meta(
-    txn: &RwTxSync,
+/// One invariant sweep over one state DB: the transaction it reads from,
+/// and the report it is building. [`super::sweep`] runs every check
+/// method on one `Sweep`, in a fixed order, then takes the finished
+/// report with [`Sweep::finish`].
+pub(super) struct Sweep<'a> {
+    txn: &'a RwTxSync,
     meta: Database,
-    r: &mut IntegrityReport,
-) -> Result<Option<BPosition>, StateError> {
-    match get_meta(txn, meta, KEY_SCHEMA_VERSION)? {
-        Some(b) => match decode_u32(&b) {
-            Ok(v) if v == SCHEMA_VERSION => {}
-            Ok(v) => problem(
-                format!("schema_version {v} != expected {SCHEMA_VERSION}"),
-                r,
-            ),
-            Err(e) => problem(format!("schema_version undecodable: {e}"), r),
-        },
-        None => problem("schema_version missing".into(), r),
+    r: IntegrityReport,
+}
+
+impl<'a> Sweep<'a> {
+    pub(super) fn new(txn: &'a RwTxSync, meta: Database) -> Self {
+        Self {
+            txn,
+            meta,
+            r: IntegrityReport::default(),
+        }
     }
-    let genesis_applied = get_meta(txn, meta, KEY_GENESIS_APPLIED)?.is_some();
-    if !genesis_applied {
-        problem("genesis_applied flag missing (DB never seeded)".into(), r);
-    } else if get_meta(txn, meta, KEY_GENESIS_DIGEST)?.is_none() {
-        problem("genesis seeded but genesis_digest missing".into(), r);
+
+    /// Take the finished report. Call this after every check method.
+    pub(super) fn finish(self) -> IntegrityReport {
+        self.r
     }
-    r.last_committed_block = match get_meta(txn, meta, KEY_LAST_COMMITTED_BLOCK)? {
-        Some(b) => decode_u64(&b).unwrap_or_else(|e| {
-            r.problems
-                .push(format!("last_committed_block undecodable: {e}"));
-            0
-        }),
-        None => 0,
-    };
-    let meta_end_tx = match get_meta(txn, meta, KEY_LAST_COMMITTED_END_TX_POSITION)? {
-        Some(b) => match decode_b_position(&b) {
-            Ok(p) => Some(p),
+
+    fn get_meta(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        Ok(self.txn.get::<Vec<u8>>(self.meta.dbi(), key)?)
+    }
+
+    fn problem(&mut self, p: String) {
+        self.r.problems.push(p);
+    }
+
+    /// Read `key`, decode it, and record a problem naming `name` if it is
+    /// present but malformed. Returns `None` if the key is absent, or if
+    /// decoding failed (the problem is already recorded in that case).
+    fn decoded_meta<T>(
+        &mut self,
+        key: &[u8],
+        name: &str,
+        decode: fn(&[u8]) -> Result<T, StateError>,
+    ) -> Result<Option<T>, StateError> {
+        let Some(b) = self.get_meta(key)? else {
+            return Ok(None);
+        };
+        match decode(&b) {
+            Ok(v) => Ok(Some(v)),
             Err(e) => {
-                problem(
-                    format!("last_committed_end_tx_position undecodable: {e}"),
-                    r,
-                );
-                None
+                self.problem(format!("{name} undecodable: {e}"));
+                Ok(None)
             }
-        },
-        None => None,
-    };
-    Ok(meta_end_tx)
-}
+        }
+    }
 
-/// Checks headers: every row decodes, and keys are dense up to the meta
-/// cursor.
-pub(super) fn check_headers(
-    txn: &RwTxSync,
-    meta_end_tx: Option<BPosition>,
-    r: &mut IntegrityReport,
-) -> Result<(), StateError> {
-    let headers_db = txn.open_db(Some(TABLE_HEADERS))?;
-    let mut prev_block: Option<u64> = None;
-    let mut first_block: Option<u64> = None;
-    let mut last_header_end_tx = None;
-    for_each_row(txn, headers_db, |k, v| {
-        if k.len() != 8 {
-            problem(format!("headers key of length {} (expected 8)", k.len()), r);
-            return Ok(ControlFlow::Break(()));
+    /// Checks meta: schema version, genesis, and cursors.
+    ///
+    /// Returns the decoded `last_committed_end_tx_position` cursor. The
+    /// headers and receipts checks cross-reference this value.
+    pub(super) fn meta(&mut self) -> Result<Option<BPosition>, StateError> {
+        match self.get_meta(KEY_SCHEMA_VERSION)? {
+            Some(b) => match decode_u32(&b) {
+                Ok(v) if v == SCHEMA_VERSION => {}
+                Ok(v) => self.problem(format!("schema_version {v} != expected {SCHEMA_VERSION}")),
+                Err(e) => self.problem(format!("schema_version undecodable: {e}")),
+            },
+            None => self.problem("schema_version missing".into()),
         }
-        let block = u64::from_be_bytes(k[..8].try_into().expect("8 bytes"));
-        match decode_header_value(&v) {
-            Ok(h) => last_header_end_tx = Some(h.end_tx_idx),
-            Err(e) => problem(format!("headers[{block}] undecodable: {e}"), r),
+        let genesis_applied = self.get_meta(KEY_GENESIS_APPLIED)?.is_some();
+        if !genesis_applied {
+            self.problem("genesis_applied flag missing (DB never seeded)".into());
+        } else if self.get_meta(KEY_GENESIS_DIGEST)?.is_none() {
+            self.problem("genesis seeded but genesis_digest missing".into());
         }
-        if let Some(p) = prev_block
-            && block != p + 1
+        self.r.last_committed_block = match self.get_meta(KEY_LAST_COMMITTED_BLOCK)? {
+            Some(b) => decode_u64(&b).unwrap_or_else(|e| {
+                self.r
+                    .problems
+                    .push(format!("last_committed_block undecodable: {e}"));
+                0
+            }),
+            None => 0,
+        };
+        let meta_end_tx = self.decoded_meta(
+            KEY_LAST_COMMITTED_END_TX_POSITION,
+            "last_committed_end_tx_position",
+            decode_b_position,
+        )?;
+        Ok(meta_end_tx)
+    }
+
+    /// Checks headers: every row decodes, and keys are dense up to the meta
+    /// cursor.
+    pub(super) fn headers(&mut self, meta_end_tx: Option<BPosition>) -> Result<(), StateError> {
+        let headers_db = self.txn.open_db(Some(TABLE_HEADERS))?;
+        let txn = self.txn;
+        let mut state = HeaderChainState::default();
+        for_each_row(txn, headers_db, |k, v| {
+            Ok(self.check_header_row(&k, &v, &mut state))
+        })?;
+        self.check_header_chain_ends(&state, meta_end_tx);
+        Ok(())
+    }
+
+    /// One `headers` row: it must decode, and its block number must be one
+    /// past the previous row's.
+    fn check_header_row(
+        &mut self,
+        k: &[u8],
+        v: &[u8],
+        state: &mut HeaderChainState,
+    ) -> ControlFlow<()> {
+        let Ok(&key) = <&[u8; 8]>::try_from(k) else {
+            self.problem(format!("headers key of length {} (expected 8)", k.len()));
+            return ControlFlow::Break(());
+        };
+        let block = u64::from_be_bytes(key);
+        match decode_header_value(v) {
+            Ok(h) => state.last_header_end_tx = Some(h.end_tx_idx),
+            Err(e) => self.problem(format!("headers[{block}] undecodable: {e}")),
+        }
+        if let Some(p) = state.prev_block {
+            match p.checked_add(1) {
+                Some(expected) if block != expected => {
+                    self.problem(format!("headers gap: {p} -> {block}"));
+                }
+                Some(_) => {}
+                None => self.problem(format!(
+                    "headers key {p} has no successor block number (u64 overflow)"
+                )),
+            }
+        }
+        state.first_block.get_or_insert(block);
+        state.prev_block = Some(block);
+        self.r.headers += 1;
+        ControlFlow::Continue(())
+    }
+
+    /// Checks the properties that only hold once the whole `headers` table has
+    /// been walked: the chain starts at 0 or 1, ends at the meta cursor, and is
+    /// non-empty whenever the meta cursor says blocks are committed.
+    fn check_header_chain_ends(
+        &mut self,
+        state: &HeaderChainState,
+        meta_end_tx: Option<BPosition>,
+    ) {
+        if let Some(first) = state.first_block
+            && first > 1
         {
-            problem(format!("headers gap: {p} -> {block}"), r);
+            self.problem(format!("headers start at {first} (expected 0 or 1)"));
         }
-        first_block.get_or_insert(block);
-        prev_block = Some(block);
-        r.headers += 1;
-        Ok(ControlFlow::Continue(()))
-    })?;
-    if let Some(first) = first_block
-        && first > 1
-    {
-        problem(format!("headers start at {first} (expected 0 or 1)"), r);
-    }
-    if let Some(last) = prev_block
-        && last != r.last_committed_block
-    {
-        problem(
-            format!(
+        if let Some(last) = state.prev_block
+            && last != self.r.last_committed_block
+        {
+            self.problem(format!(
                 "last header {last} != meta last_committed_block {}",
-                r.last_committed_block
-            ),
-            r,
-        );
+                self.r.last_committed_block
+            ));
+        }
+        if self.r.last_committed_block > 0 && self.r.headers == 0 {
+            self.problem("meta cursor set but headers table empty".into());
+        }
+        if let (Some(h), Some(m)) = (state.last_header_end_tx, meta_end_tx)
+            && h != m
+        {
+            self.problem(format!("last header end_tx_idx {h:?} != meta cursor {m:?}"));
+        }
     }
-    if r.last_committed_block > 0 && r.headers == 0 {
-        problem("meta cursor set but headers table empty".into(), r);
-    }
-    if let (Some(h), Some(m)) = (last_header_end_tx, meta_end_tx)
-        && h != m
-    {
-        problem(
-            format!("last header end_tx_idx {h:?} != meta cursor {m:?}"),
-            r,
-        );
-    }
-    Ok(())
-}
 
-/// Checks receipts: every row decodes, and the index round-trips both ways.
-pub(super) fn check_receipts_index(
-    txn: &RwTxSync,
-    meta_end_tx: Option<BPosition>,
-    r: &mut IntegrityReport,
-) -> Result<(), StateError> {
-    let receipts_db = txn.open_db(Some(TABLE_RECEIPTS))?;
-    let tx_hash_db = txn.open_db(Some(TABLE_TX_HASH_INDEX))?;
-    for_each_row(txn, receipts_db, |k, v| {
-        match (decode_b_position(&k), decode_receipt_value(&v)) {
+    /// Checks receipts: every row decodes, and the index round-trips both ways.
+    pub(super) fn receipts_index(
+        &mut self,
+        meta_end_tx: Option<BPosition>,
+    ) -> Result<(), StateError> {
+        let receipts_db = self.txn.open_db(Some(TABLE_RECEIPTS))?;
+        let tx_hash_db = self.txn.open_db(Some(TABLE_TX_HASH_INDEX))?;
+        let txn = self.txn;
+        for_each_row(txn, receipts_db, |k, v| {
+            self.check_receipt_row(tx_hash_db, &k, &v, meta_end_tx)?;
+            self.r.receipts += 1;
+            Ok(ControlFlow::Continue(()))
+        })?;
+        // Check the reverse direction too: every index entry must point at
+        // an existing receipt. Counts alone would let dangling entries hide
+        // behind missing ones.
+        let index_entries = self.check_index_rows(receipts_db, tx_hash_db)?;
+        if index_entries != self.r.receipts {
+            self.problem(format!(
+                "tx_hash_index has {index_entries} entries, receipts has {}",
+                self.r.receipts
+            ));
+        }
+        Ok(())
+    }
+
+    /// One `receipts` row: it must decode, carry its own position, and have a
+    /// matching `tx_hash_index` entry that maps back to the same position.
+    fn check_receipt_row(
+        &mut self,
+        tx_hash_db: Database,
+        key: &[u8],
+        value: &[u8],
+        meta_end_tx: Option<BPosition>,
+    ) -> Result<(), StateError> {
+        match (decode_b_position(key), decode_receipt_value(value)) {
             (Ok(pos), Ok(receipt)) => {
                 if receipt.tx_idx != pos {
-                    problem(
-                        format!("receipts[{pos:?}] carries tx_idx {:?}", receipt.tx_idx),
-                        r,
-                    );
+                    self.problem(format!(
+                        "receipts[{pos:?}] carries tx_idx {:?}",
+                        receipt.tx_idx
+                    ));
                 }
                 // Index must map this receipt's hash back to this position.
-                match txn.get::<Vec<u8>>(tx_hash_db.dbi(), &encode_tx_hash_key(receipt.tx_hash))? {
-                    Some(b) => match decode_tx_hash_value(&b) {
-                        Ok(p) if p == pos => {}
-                        Ok(p) => problem(
-                            format!(
-                                "tx_hash_index[{}] -> {p:?}, receipt sits at {pos:?}",
-                                receipt.tx_hash
-                            ),
-                            r,
-                        ),
-                        Err(e) => problem(format!("tx_hash_index[{}]: {e}", receipt.tx_hash), r),
+                match self
+                    .txn
+                    .get::<Vec<u8>>(tx_hash_db.dbi(), &encode_tx_hash_key(receipt.tx_hash))?
+                {
+                    Some(index_bytes) => match decode_tx_hash_value(&index_bytes) {
+                        Ok(indexed_pos) if indexed_pos == pos => {}
+                        Ok(indexed_pos) => self.problem(format!(
+                            "tx_hash_index[{}] -> {indexed_pos:?}, receipt sits at {pos:?}",
+                            receipt.tx_hash
+                        )),
+                        Err(e) => self.problem(format!("tx_hash_index[{}]: {e}", receipt.tx_hash)),
                     },
-                    None => problem(
-                        format!("receipt {:?} missing from tx_hash_index", receipt.tx_hash),
-                        r,
-                    ),
+                    None => self.problem(format!(
+                        "receipt {:?} missing from tx_hash_index",
+                        receipt.tx_hash
+                    )),
                 }
                 if let Some(m) = meta_end_tx
                     && pos > m
                 {
-                    problem(format!("receipt at {pos:?} beyond meta cursor {m:?}"), r);
+                    self.problem(format!("receipt at {pos:?} beyond meta cursor {m:?}"));
                 }
             }
-            (Err(e), _) => problem(format!("receipts key: {e}"), r),
-            (_, Err(e)) => problem(format!("receipts value at {:02x?}: {e}", &k[..]), r),
+            (Err(e), _) => self.problem(format!("receipts key: {e}")),
+            (_, Err(e)) => self.problem(format!("receipts value at {key:02x?}: {e}")),
         }
-        r.receipts += 1;
-        Ok(ControlFlow::Continue(()))
-    })?;
-    // Check the reverse direction too: every index entry must point at
-    // an existing receipt. Counts alone would let dangling entries hide
-    // behind missing ones.
-    let mut index_entries = 0u64;
-    for_each_row(txn, tx_hash_db, |k, v| {
-        index_entries += 1;
-        match decode_tx_hash_value(&v) {
-            Ok(pos) => {
-                if txn
-                    .get::<Vec<u8>>(receipts_db.dbi(), &crate::meta::encode_b_position(pos))?
-                    .is_none()
-                {
-                    problem(
-                        format!(
-                            "tx_hash_index entry {:02x?} -> {pos:?} has no receipt",
-                            &k[..4]
-                        ),
-                        r,
-                    );
-                }
-            }
-            Err(e) => problem(format!("tx_hash_index value: {e}"), r),
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
-    if index_entries != r.receipts {
-        problem(
-            format!(
-                "tx_hash_index has {index_entries} entries, receipts has {}",
-                r.receipts
-            ),
-            r,
-        );
+        Ok(())
     }
-    Ok(())
-}
 
-/// Checks accounts: rows decode, and declared code exists.
-pub(super) fn check_accounts(txn: &RwTxSync, r: &mut IntegrityReport) -> Result<(), StateError> {
-    let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS))?;
-    let code_db = txn.open_db(Some(TABLE_CODE))?;
-    for_each_row(txn, accounts_db, |k, v| {
-        match decode_account_value(&v) {
-            Ok(a) => {
-                if a.code_hash != B256::ZERO
-                    && a.code_hash != KECCAK_EMPTY
-                    && txn
-                        .get::<Vec<u8>>(code_db.dbi(), &encode_code_key(a.code_hash))?
+    /// The reverse direction: every `tx_hash_index` entry must point at an
+    /// existing receipt. Returns the number of index rows seen.
+    fn check_index_rows(
+        &mut self,
+        receipts_db: Database,
+        tx_hash_db: Database,
+    ) -> Result<u64, StateError> {
+        let mut index_entries = 0u64;
+        let txn = self.txn;
+        for_each_row(txn, tx_hash_db, |k, v| {
+            index_entries += 1;
+            match decode_tx_hash_value(&v) {
+                Ok(pos) => {
+                    if txn
+                        .get::<Vec<u8>>(receipts_db.dbi(), &crate::meta::encode_b_position(pos))?
                         .is_none()
-                {
-                    problem(
-                        format!(
-                            "account {:02x?} declares missing code {}",
-                            &k[..4],
-                            a.code_hash
-                        ),
-                        r,
-                    );
+                    {
+                        self.problem(format!(
+                            "tx_hash_index entry {:02x?} -> {pos:?} has no receipt",
+                            super::head(&k)
+                        ));
+                    }
                 }
+                Err(e) => self.problem(format!("tx_hash_index value: {e}")),
             }
-            Err(e) => problem(format!("accounts value at {:02x?}: {e}", &k[..4]), r),
-        }
-        r.accounts += 1;
-        Ok(ControlFlow::Continue(()))
-    })?;
-    Ok(())
-}
-
-/// Checks storage: values decode.
-pub(super) fn check_storage(txn: &RwTxSync, r: &mut IntegrityReport) -> Result<(), StateError> {
-    let storage_db = txn.open_db(Some(TABLE_STORAGE))?;
-    for_each_row(txn, storage_db, |k, v| {
-        if k.len() != 52 {
-            problem(
-                format!("storage key of length {} (expected 52)", k.len()),
-                r,
-            );
-        } else if let Err(e) = decode_storage_value(&v) {
-            problem(format!("storage value at {:02x?}: {e}", &k[..4]), r);
-        }
-        r.storage_slots += 1;
-        Ok(ControlFlow::Continue(()))
-    })?;
-    Ok(())
-}
-
-/// Checks the trie: the persisted root must reproduce from the trie tables.
-pub(super) fn check_trie(
-    txn: &RwTxSync,
-    meta: Database,
-    r: &mut IntegrityReport,
-) -> Result<(), StateError> {
-    r.state_root = match get_meta(txn, meta, KEY_STATE_ROOT)? {
-        Some(b) => match decode_b256(&b) {
-            Ok(root) => Some(root),
-            Err(e) => {
-                problem(format!("state_root undecodable: {e}"), r);
-                None
-            }
-        },
-        None => None, // A plain (executor) writer has no root to verify.
-    };
-    if let Some(stored) = r.state_root {
-        let tables = TrieTables::open(txn)?;
-        let rebuilt = rebuild_root(txn, &tables)?;
-        r.rebuilt_root = Some(rebuilt);
-        if rebuilt != stored {
-            problem(
-                format!("trie rebuild {rebuilt} != stored state_root {stored}"),
-                r,
-            );
-        }
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(index_entries)
     }
-    Ok(())
+
+    /// Checks accounts: rows decode, and declared code exists.
+    pub(super) fn accounts(&mut self) -> Result<(), StateError> {
+        let accounts_db = self.txn.open_db(Some(TABLE_ACCOUNTS))?;
+        let code_db = self.txn.open_db(Some(TABLE_CODE))?;
+        let txn = self.txn;
+        for_each_row(txn, accounts_db, |k, v| {
+            match decode_account_value(&v) {
+                Ok(a) => {
+                    if a.code_hash != B256::ZERO
+                        && a.code_hash != KECCAK_EMPTY
+                        && txn
+                            .get::<Vec<u8>>(code_db.dbi(), &encode_code_key(a.code_hash))?
+                            .is_none()
+                    {
+                        self.problem(format!(
+                            "account {:02x?} declares missing code {}",
+                            super::head(&k),
+                            a.code_hash
+                        ));
+                    }
+                }
+                Err(e) => self.problem(format!("accounts value at {:02x?}: {e}", super::head(&k))),
+            }
+            self.r.accounts += 1;
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(())
+    }
+
+    /// Checks storage: values decode.
+    pub(super) fn storage(&mut self) -> Result<(), StateError> {
+        let storage_db = self.txn.open_db(Some(TABLE_STORAGE))?;
+        let txn = self.txn;
+        for_each_row(txn, storage_db, |k, v| {
+            if k.len() != 52 {
+                self.problem(format!("storage key of length {} (expected 52)", k.len()));
+            } else if let Err(e) = decode_storage_value(&v) {
+                self.problem(format!("storage value at {:02x?}: {e}", super::head(&k)));
+            }
+            self.r.storage_slots += 1;
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(())
+    }
+
+    /// Checks the trie: the persisted root must reproduce from the trie tables.
+    pub(super) fn trie(&mut self) -> Result<(), StateError> {
+        // `None` covers both an absent key (a plain, executor writer has no
+        // root to verify) and a present-but-malformed one (already recorded
+        // as a problem by `decoded_meta`).
+        self.r.state_root = self.decoded_meta(KEY_STATE_ROOT, "state_root", decode_b256)?;
+        if let Some(stored) = self.r.state_root {
+            let tables = TrieTables::open(self.txn)?;
+            let rebuilt = tables.rebuild_root(self.txn)?;
+            self.r.rebuilt_root = Some(rebuilt);
+            if rebuilt != stored {
+                self.problem(format!(
+                    "trie rebuild {rebuilt} != stored state_root {stored}"
+                ));
+            }
+        }
+        Ok(())
+    }
 }

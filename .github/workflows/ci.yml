@@ -63,6 +63,31 @@ jobs:
           prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+  # Mechanical checks from docs/STYLE.md (clippy pedantic, unreachable_pub,
+  # rustfmt, forbidden patterns). Same toolchain and cache as the clippy job.
+  style:
+    name: style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+      - name: Install system build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+      - name: CPU microarch cache key
+        id: cpukey
+        run: echo "cpu=$(grep -m1 '^flags' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
+      - run: scripts/style-check.sh
+
   build:
     name: build
     runs-on: ubuntu-latest

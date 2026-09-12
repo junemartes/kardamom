@@ -56,7 +56,12 @@ pub enum Fault {
 /// A running mock endpoint. Dropping it stops the server.
 pub struct VerifiedL1 {
     addr: SocketAddr,
-    fault: Arc<std::sync::Mutex<Fault>>,
+    /// The current fault mode, one writer ([`Self::set_fault`]) and many
+    /// concurrent readers (one per in-flight connection task) — a
+    /// `watch` channel, not a mutex: a reader borrows the latest value
+    /// with no lock to poison, and holds no guard across the `.await`
+    /// that follows.
+    fault: tokio::sync::watch::Sender<Fault>,
     /// Requests served. This lets a test prove the validator actually
     /// went through here, instead of reaching anvil directly.
     served: Arc<AtomicU64>,
@@ -65,6 +70,10 @@ pub struct VerifiedL1 {
 
 impl VerifiedL1 {
     /// Bind on an ephemeral port and proxy to `upstream` (anvil).
+    ///
+    /// # Errors
+    /// Returns an error when the ephemeral port fails to bind or the
+    /// client cannot connect to `upstream`.
     pub async fn spawn(upstream: &str) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -73,41 +82,24 @@ impl VerifiedL1 {
         let client: HttpClient = HttpClientBuilder::default()
             .build(upstream)
             .context("connect mock verified-L1 to anvil")?;
-        let fault = Arc::new(std::sync::Mutex::new(Fault::None));
+        let (fault, fault_rx) = tokio::sync::watch::channel(Fault::None);
         let served = Arc::new(AtomicU64::new(0));
 
         let task = tokio::spawn({
-            let fault = fault.clone();
             let served = served.clone();
             async move {
                 loop {
-                    let Ok((mut sock, _)) = listener.accept().await else {
+                    let Ok((sock, _)) = listener.accept().await else {
                         return;
                     };
-                    let client = client.clone();
-                    let fault = fault.clone();
-                    let served = served.clone();
-                    tokio::spawn(async move {
-                        // One request per connection is enough for a mock.
-                        // alloy opens as many connections as it needs.
-                        if let Ok(Some(body)) = read_http_request(&mut sock).await {
-                            // Copy the fault out before awaiting. Holding a
-                            // std MutexGuard across an await would make the
-                            // future non-Send.
-                            let active = *fault.lock().unwrap();
-                            let reply = handle(&client, &body, active).await;
-                            served.fetch_add(1, Ordering::Relaxed);
-                            let bytes = reply.to_string().into_bytes();
-                            let head = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                                 Content-Length: {}\r\nConnection: close\r\n\r\n",
-                                bytes.len()
-                            );
-                            let _ = sock.write_all(head.as_bytes()).await;
-                            let _ = sock.write_all(&bytes).await;
-                            let _ = sock.flush().await;
+                    tokio::spawn(
+                        Conn {
+                            client: client.clone(),
+                            fault_rx: fault_rx.clone(),
+                            served: served.clone(),
                         }
-                    });
+                        .serve(sock),
+                    );
                 }
             }
         });
@@ -120,50 +112,139 @@ impl VerifiedL1 {
         })
     }
 
+    #[must_use]
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
     }
 
-    /// Start lying (or stop). Takes effect on the next request.
+    /// Start lying (or stop). Takes effect on the next request. A no-op
+    /// `Err` (every receiver dropped) can only happen after the server
+    /// task itself has exited, which only happens when `self` is
+    /// dropping — so there is nothing useful to do with it here.
     pub fn set_fault(&self, f: Fault) {
-        *self.fault.lock().unwrap() = f;
+        let _ = self.fault.send(f);
     }
 
+    #[must_use]
     pub fn served(&self) -> u64 {
         self.served.load(Ordering::Relaxed)
+    }
+}
+
+/// One accepted connection's serving state: the upstream client, the
+/// current fault mode, and the served-request counter, each cloned once
+/// per connection from [`VerifiedL1::spawn`]'s shared state.
+struct Conn {
+    client: HttpClient,
+    fault_rx: tokio::sync::watch::Receiver<Fault>,
+    served: Arc<AtomicU64>,
+}
+
+impl Conn {
+    /// Serve one accepted connection: read its request, proxy it
+    /// upstream with the active fault applied, and write the reply back.
+    ///
+    /// One request per connection is enough for a mock. alloy opens as
+    /// many connections as it needs.
+    async fn serve(self, mut sock: tokio::net::TcpStream) {
+        let Ok(Some(body)) = read_http_request(&mut sock).await else {
+            return;
+        };
+        // Copy the fault out before awaiting: a `watch` borrow, like a
+        // mutex guard, must not cross an `.await` (it would make the
+        // future non-Send).
+        let active = *self.fault_rx.borrow();
+        let reply = handle(&self.client, &body, active).await;
+        self.served.fetch_add(1, Ordering::Relaxed);
+        let bytes = reply.to_string().into_bytes();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        );
+        let _ = sock.write_all(head.as_bytes()).await;
+        let _ = sock.write_all(&bytes).await;
+        let _ = sock.flush().await;
     }
 }
 
 /// Read one HTTP request, returning its body. `None` on a clean close.
 async fn read_http_request(sock: &mut tokio::net::TcpStream) -> Result<Option<Vec<u8>>> {
     let mut buf = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 1024];
-    // Headers first: read until the blank line.
-    let header_end = loop {
-        let n = sock.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(None);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(i) = find_subslice(&buf, b"\r\n\r\n") {
-            break i + 4;
-        }
+    let Some(header_end) = read_until(sock, &mut buf, |b| {
+        find_subslice(b, b"\r\n\r\n").map(|i| i + 4)
+    })
+    .await?
+    else {
+        return Ok(None);
     };
     let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+    // No Content-Length header means no body (a bare GET, for example). A
+    // present but unparseable one is a malformed request, not a missing
+    // body, so it errors instead of silently defaulting to 0.
     let len: usize = headers
         .split("content-length:")
         .nth(1)
         .and_then(|s| s.split("\r\n").next())
-        .and_then(|s| s.trim().parse().ok())
+        .map(|s| s.trim().parse::<usize>())
+        .transpose()
+        .context("Content-Length header is not a valid number")?
         .unwrap_or(0);
-    while buf.len() < header_end + len {
-        let n = sock.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
+    // `len` comes from the wire Content-Length header; a bad or hostile
+    // value must fail the request, not overflow the bound below.
+    let target_len = header_end
+        .checked_add(len)
+        .context("Content-Length header overflows the buffer size")?;
+    // A clean close before `target_len` is reached (`None`) is not an
+    // error here: the body is simply whatever arrived, same as before.
+    let _ = read_until(sock, &mut buf, |b| (b.len() >= target_len).then_some(())).await?;
     Ok(Some(buf[header_end..].to_vec()))
+}
+
+/// What one [`read_chunk_into`] read did.
+enum ReadStep<T> {
+    /// `done` matched: the caller's read is complete.
+    Done(T),
+    /// The peer closed the connection before `done` ever matched.
+    ConnectionClosed,
+    /// More bytes arrived, but `done` has not matched yet.
+    Pending,
+}
+
+/// Read one chunk from `sock`, append it to `buf`, and check `done`
+/// against the accumulated bytes.
+async fn read_chunk_into<T>(
+    sock: &mut tokio::net::TcpStream,
+    buf: &mut Vec<u8>,
+    done: &mut impl FnMut(&[u8]) -> Option<T>,
+) -> Result<ReadStep<T>> {
+    let mut chunk = [0u8; 1024];
+    let n = sock.read(&mut chunk).await?;
+    if n == 0 {
+        return Ok(ReadStep::ConnectionClosed);
+    }
+    buf.extend_from_slice(&chunk[..n]);
+    Ok(done(buf).map_or(ReadStep::Pending, ReadStep::Done))
+}
+
+/// Read from `sock` into `buf`, appending each chunk read, until `done`
+/// matches against the accumulated bytes and returns `Some`. `None` on a
+/// clean close before `done` ever matches.
+async fn read_until<T>(
+    sock: &mut tokio::net::TcpStream,
+    buf: &mut Vec<u8>,
+    mut done: impl FnMut(&[u8]) -> Option<T>,
+) -> Result<Option<T>> {
+    if let Some(t) = done(buf) {
+        return Ok(Some(t));
+    }
+    loop {
+        match read_chunk_into(sock, buf, &mut done).await? {
+            ReadStep::Done(t) => return Ok(Some(t)),
+            ReadStep::ConnectionClosed => return Ok(None),
+            ReadStep::Pending => {}
+        }
+    }
 }
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -174,8 +255,10 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 async fn handle(client: &HttpClient, body: &[u8], fault: Fault) -> serde_json::Value {
     let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return rpc_error(serde_json::Value::Null, &format!("bad request: {e}")),
+        Err(e) => return rpc_error(&serde_json::Value::Null, &format!("bad request: {e}")),
     };
+    // JSON-RPC defaults: a null id (a notification), an empty method (the
+    // upstream call then fails naturally), and no params.
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = req
@@ -197,7 +280,7 @@ async fn handle(client: &HttpClient, body: &[u8], fault: Fault) -> serde_json::V
     let upstream: Result<serde_json::Value, _> = client.request(method, rpc_args).await;
     let mut result = match upstream {
         Ok(v) => v,
-        Err(e) => return rpc_error(id, &format!("upstream: {e}")),
+        Err(e) => return rpc_error(&id, &format!("upstream: {e}")),
     };
 
     apply_fault(method, &params, &mut result, fault);
@@ -212,7 +295,6 @@ fn apply_fault(
     fault: Fault,
 ) {
     match fault {
-        Fault::None => {}
         Fault::SwallowLogs if method == "eth_getLogs" => {
             *result = serde_json::Value::Array(vec![]);
         }
@@ -247,7 +329,7 @@ fn block_at_or_after(
         .is_some_and(|n| n >= from_block)
 }
 
-fn rpc_error(id: serde_json::Value, msg: &str) -> serde_json::Value {
+fn rpc_error(id: &serde_json::Value, msg: &str) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -258,6 +340,10 @@ fn rpc_error(id: serde_json::Value, msg: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One `faults_actually_mutate_the_proxied_reply` case: a fault paired
+    /// with the check that proves it corrupted the reply.
+    type Check = fn(&serde_json::Value, &serde_json::Value);
 
     /// The mock must actually corrupt what it proxies. Without this check,
     /// a green fault-injection scenario would only prove that nothing
@@ -271,48 +357,39 @@ mod tests {
             "parentHash": format!("0x{}", "22".repeat(32)),
         });
 
-        let mut r = block.clone();
-        apply_fault("eth_getBlockByNumber", &[], &mut r, Fault::None);
-        assert_eq!(r, block, "None must pass through untouched");
-
-        let mut r = block.clone();
-        apply_fault(
-            "eth_getBlockByNumber",
-            &[],
-            &mut r,
-            Fault::WrongBlockHash { from_block: 0x10 },
-        );
-        assert_ne!(
-            r["hash"], block["hash"],
-            "hash must be corrupted at the threshold"
-        );
-
-        // Below the threshold, nothing changes. This lets a test arm a
-        // fault without invalidating epochs already verified.
-        let mut r = block.clone();
-        apply_fault(
-            "eth_getBlockByNumber",
-            &[],
-            &mut r,
-            Fault::WrongBlockHash { from_block: 0x11 },
-        );
-        assert_eq!(r, block, "below the threshold must pass through");
-
-        let mut r = block.clone();
-        apply_fault(
-            "eth_getBlockByNumber",
-            &[],
-            &mut r,
-            Fault::BrokenParentChain { from_block: 0x10 },
-        );
-        assert_eq!(
-            r["hash"], block["hash"],
-            "the block's OWN hash stays correct"
-        );
-        assert_ne!(
-            r["parentHash"], block["parentHash"],
-            "only ancestry is a lie"
-        );
+        // (fault, check) rows: one `apply_fault` call each, against the
+        // same block, checked by its own function.
+        let cases: [(Fault, Check); 4] = [
+            (Fault::None, |r, block| {
+                assert_eq!(r, block, "None must pass through untouched");
+            }),
+            (Fault::WrongBlockHash { from_block: 0x10 }, |r, block| {
+                assert_ne!(
+                    r["hash"], block["hash"],
+                    "hash must be corrupted at the threshold"
+                );
+            }),
+            // Below the threshold, nothing changes. This lets a test arm a
+            // fault without invalidating epochs already verified.
+            (Fault::WrongBlockHash { from_block: 0x11 }, |r, block| {
+                assert_eq!(r, block, "below the threshold must pass through");
+            }),
+            (Fault::BrokenParentChain { from_block: 0x10 }, |r, block| {
+                assert_eq!(
+                    r["hash"], block["hash"],
+                    "the block's OWN hash stays correct"
+                );
+                assert_ne!(
+                    r["parentHash"], block["parentHash"],
+                    "only ancestry is a lie"
+                );
+            }),
+        ];
+        for (fault, check) in cases {
+            let mut r = block.clone();
+            apply_fault("eth_getBlockByNumber", &[], &mut r, fault);
+            check(&r, &block);
+        }
 
         let mut logs = serde_json::json!([{ "address": "0xabc" }]);
         apply_fault("eth_getLogs", &[], &mut logs, Fault::SwallowLogs);

@@ -19,6 +19,27 @@ fn upgrade_stack_config() -> StackConfig {
     }
 }
 
+/// The tests below differ only in the scenario they drive. They share
+/// the same L1-backed, validator-carrying stack and the same `(target,
+/// l1, executor state dir, validator state dir)` hand-off. This skips
+/// the test with an early return when anvil is absent.
+async fn upgrade_case<F>(scenario: F, what: &str)
+where
+    F: AsyncFn(
+        &e2e::scenarios::Target,
+        &e2e::harness::l1::L1,
+        &std::path::Path,
+        &std::path::Path,
+    ) -> anyhow::Result<()>,
+{
+    let stack = launch_l1_or_skip!(upgrade_stack_config());
+    let t = target(&stack);
+    let l1 = stack.l1().expect("l1");
+    let exec_dir = stack.executor_state_dir().expect("executor state dir");
+    let val_dir = stack.validator_state_dir().expect("validator state dir");
+    scenario(&t, l1, &exec_dir, &val_dir).await.expect(what);
+}
+
 /// S13a: an upgrade transaction with no activation timestamp turns the
 /// feature on immediately, starting with the block that carried it. It
 /// keeps firing in every later block, on both the executor and the
@@ -26,15 +47,13 @@ fn upgrade_stack_config() -> StackConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13a_health_check_activates_immediately() {
-    let stack = launch_l1_or_skip!(upgrade_stack_config());
-    let t = target(&stack);
-    let l1 = stack.l1().expect("l1");
-    let exec_dir = stack.executor_state_dir().expect("executor state dir");
-    let val_dir = stack.validator_state_dir().expect("validator state dir");
-
-    upgrade::activates_immediately(&t, l1, &exec_dir, &val_dir)
-        .await
-        .expect("S13a");
+    upgrade_case(
+        async |t, l1, exec_dir, val_dir| {
+            upgrade::activates_immediately(t, l1, exec_dir, val_dir).await
+        },
+        "S13a",
+    )
+    .await;
 }
 
 /// S13b: an upgrade transaction carrying a future activation timestamp
@@ -48,15 +67,13 @@ async fn s13a_health_check_activates_immediately() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13b_health_check_activates_at_timestamp() {
-    let stack = launch_l1_or_skip!(upgrade_stack_config());
-    let t = target(&stack);
-    let l1 = stack.l1().expect("l1");
-    let exec_dir = stack.executor_state_dir().expect("executor state dir");
-    let val_dir = stack.validator_state_dir().expect("validator state dir");
-
-    upgrade::activates_at_timestamp(&t, l1, &exec_dir, &val_dir)
-        .await
-        .expect("S13b");
+    upgrade_case(
+        async |t, l1, exec_dir, val_dir| {
+            upgrade::activates_at_timestamp(t, l1, exec_dir, val_dir).await
+        },
+        "S13b",
+    )
+    .await;
 }
 
 /// S13c: both authority gates hold. An L1 account that is not the
@@ -67,12 +84,11 @@ async fn s13b_health_check_activates_at_timestamp() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13c_upgrade_authority_is_enforced() {
-    let stack = launch_l1_or_skip!(upgrade_stack_config());
-    let t = target(&stack);
-    let l1 = stack.l1().expect("l1");
-    let exec_dir = stack.executor_state_dir().expect("executor state dir");
-
-    upgrade::authority_is_enforced(&t, l1, &exec_dir, upgrade::Params::default())
-        .await
-        .expect("S13c");
+    upgrade_case(
+        async |t, l1, exec_dir, _val_dir| {
+            upgrade::authority_is_enforced(t, l1, exec_dir, upgrade::Params::default()).await
+        },
+        "S13c",
+    )
+    .await;
 }

@@ -43,7 +43,6 @@
 use std::fs::{File, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// Why the cursor file could not be read or written.
 #[derive(Debug, thiserror::Error)]
@@ -74,13 +73,12 @@ pub enum CursorError {
 /// One pair's persisted cursor. The value stored is the FIRST SEQ NOT YET
 /// PUBLISHED (the same convention as the in-memory cursor and the
 /// `REMOTE_CURSOR_SEQ` gauge).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CursorFile {
     path: PathBuf,
-    /// The advisory lock on `<path>.lock`. Every clone shares the handle, so
-    /// the lock lives as long as the last clone. The OS releases it when the
-    /// process exits, cleanly or not.
-    _lock: Arc<File>,
+    /// The advisory lock on `<path>.lock`. Held for the value's lifetime;
+    /// dropping it (or exiting the process) releases the lock.
+    _lock: File,
 }
 
 impl CursorFile {
@@ -88,6 +86,11 @@ impl CursorFile {
     /// [`CursorError::Locked`] when another watcher holds the lock. The
     /// cursor file itself is not created here; `load` reports it absent
     /// until the first `persist`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CursorError::Io`] if the lock file cannot be opened, or
+    /// [`CursorError::Locked`] if another watcher already holds the lock.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, CursorError> {
         let path = path.into();
         let lock_path = lock_path_of(&path);
@@ -111,12 +114,10 @@ impl CursorFile {
             }
             Err(TryLockError::Error(e)) => return Err(io(e)),
         }
-        Ok(Self {
-            path,
-            _lock: Arc::new(lock),
-        })
+        Ok(Self { path, _lock: lock })
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -124,6 +125,10 @@ impl CursorFile {
     /// Read the persisted cursor. `Ok(None)` when the file does not exist —
     /// the first-boot case, where the CLI seed applies. A file that exists
     /// but does not parse is [`CursorError::Corrupt`], never a silent 0.
+    ///
+    /// # Errors
+    /// Returns an error when the file exists but cannot be read, or its
+    /// contents do not parse as a `u64`.
     pub fn load(&self) -> Result<Option<u64>, CursorError> {
         let raw = match std::fs::read_to_string(&self.path) {
             Ok(raw) => raw,
@@ -148,6 +153,10 @@ impl CursorFile {
     /// rename over the target. A crash at any point leaves either the old
     /// complete value or the new complete value — never a torn write, which
     /// `load` would otherwise reject as corruption.
+    ///
+    /// # Errors
+    /// Returns an error when the temp file cannot be written, synced, or
+    /// renamed into place.
     pub fn persist(&self, next_seq: u64) -> Result<(), CursorError> {
         let io = |source| CursorError::Io {
             path: self.path.clone(),
@@ -245,24 +254,17 @@ mod tests {
     #[test]
     fn a_second_watcher_on_one_cursor_file_is_refused() {
         let path = temp_path("locked");
-        let first = CursorFile::open(&path).unwrap();
-        let err = CursorFile::open(&path).unwrap_err();
-        assert!(matches!(err, CursorError::Locked { .. }), "got {err:?}");
-        assert!(
-            lock_path_of(&path).exists(),
-            "lock file is a sibling of the cursor"
-        );
-
-        // A clone shares the lock: dropping the original keeps it held.
-        let clone = first.clone();
-        drop(first);
-        assert!(matches!(
-            CursorFile::open(&path),
-            Err(CursorError::Locked { .. })
-        ));
-
-        // The last handle releases it, so a restart can take it again.
-        drop(clone);
+        {
+            let _first = CursorFile::open(&path).unwrap();
+            let err = CursorFile::open(&path).unwrap_err();
+            assert!(matches!(err, CursorError::Locked { .. }), "got {err:?}");
+            assert!(
+                lock_path_of(&path).exists(),
+                "lock file is a sibling of the cursor"
+            );
+            // `_first` is still held here; a second open still fails.
+        }
+        // The block above released the lock, so a restart can take it again.
         CursorFile::open(&path).unwrap();
     }
 

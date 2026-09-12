@@ -2476,6 +2476,7 @@ dependencies = [
 name = "kardamom-zk-host"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "anyhow",
  "kardamom-types",
  "rkyv",

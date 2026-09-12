@@ -24,6 +24,7 @@ extern crate alloc;
 pub mod anchor;
 pub mod bal_ladder;
 pub mod block_env;
+mod code_hash;
 pub mod delta;
 pub mod error;
 pub mod exec_types;
@@ -39,7 +40,7 @@ pub mod witness;
 pub use block_env::ExecEnv;
 pub use delta::{PendingDelta, WriteSet};
 pub use error::{EngineError, ExecutorError};
-pub use exec_types::{CMessage, ReceiptStatus, TxIndex};
+pub use exec_types::{CMessage, ReceiptStatus, TxIndex, TxSlot};
 #[cfg(feature = "std")]
 pub use state::{MockStateDatabase, MockStateError, MutatingSnapshotSource, StaticSnapshotSource};
 pub use stateless::{

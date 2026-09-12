@@ -2,8 +2,6 @@
 //! the correct partitions and receive their receipts. A duplicate
 //! `(sender, nonce)` must be served from the receipt cache.
 
-mod common;
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,67 +9,38 @@ use alloy_primitives::B256;
 use alloy_signer_local::PrivateKeySigner;
 
 use kardamom_ingress::config::IngressConfig;
+use std::num::NonZeroU32;
+
 use kardamom_ingress::routing::partition_for;
+use kardamom_ingress::test_support::{
+    nonce_of, sign_legacy, signer_for_shard, spawn_fake_executor,
+};
 use kardamom_ingress::{IngressProxy, MockChannels};
 use kardamom_types::{BPosition, QuorumWatermark, Receipt};
 
-fn nonce_of(raw: &bytes::Bytes) -> u64 {
-    use alloy_consensus::TxEnvelope;
-    use alloy_consensus::transaction::Transaction;
-    use alloy_rlp::Decodable;
-    TxEnvelope::decode(&mut raw.as_ref()).unwrap().nonce()
-}
+/// The shard count every test below except `one_hundred_txs_route_and_receive_receipts`
+/// runs with.
+const TWO_SHARDS: NonZeroU32 = NonZeroU32::new(2).unwrap();
+/// [`TWO_SHARDS`], as the `MockChannels` shard count.
+const TWO_MOCK_SHARDS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(2).unwrap();
+
+const ONE_HUNDRED_TXS_SHARDS: NonZeroU32 = NonZeroU32::new(8).unwrap();
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_hundred_txs_route_and_receive_receipts() {
-    let m = 8u32;
+    let m = ONE_HUNDRED_TXS_SHARDS;
     let cfg = IngressConfig {
         partition_count_m: m,
         pending_receipt_timeout: Duration::from_secs(10),
         ..IngressConfig::default()
     };
-    let (mock, mut partition_rx) = MockChannels::new(m as usize);
+    let (mock, partition_rx) = MockChannels::new(std::num::NonZeroUsize::try_from(m).unwrap());
     let proxy = Arc::new(IngressProxy::new(cfg.clone(), mock.clone(), mock.clone()));
 
     // This is a fake executor. It drains each partition, and sends the
-    // receipt and watermark right away.
-    // Every receipt's `tx_idx` is a position in the sealer's single
-    // tx_ordering stream (see crates/log/src/watermark.rs: one archive
-    // recording, one durable watermark). So all partitions share one
-    // increasing position space. Giving each partition its own
-    // `term_id` instead would let the quorum watermark move backward,
-    // since `BPosition` is ordered `(term_id, term_offset)`, and any
-    // receipt parked above where the last watermark lands would never
-    // release.
-    let next_pos = Arc::new(std::sync::atomic::AtomicI32::new(0));
-    let mut handles = Vec::new();
-    for mut rx in partition_rx.drain(..) {
-        let receipt_bus = mock.receipt_bus.clone();
-        let watermark_bus = mock.watermark_bus.clone();
-        let next_pos = next_pos.clone();
-        handles.push(tokio::spawn(async move {
-            while let Some(envelope) = rx.recv().await {
-                let pos = BPosition {
-                    term_id: 0,
-                    term_offset: next_pos.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
-                };
-                let nonce = nonce_of(&envelope.raw_tx);
-                let receipt = Receipt {
-                    tx_idx: pos,
-                    tx_hash: envelope.tx_hash,
-                    status: true,
-                    gas_used: 21_000,
-                    logs: Vec::new(),
-                    write_set_hash: B256::ZERO,
-                    from: envelope.sender,
-                    nonce,
-                    ..Default::default()
-                };
-                let _ = receipt_bus.send(receipt);
-                let _ = watermark_bus.send(QuorumWatermark { position: pos });
-            }
-        }));
-    }
+    // receipt and watermark right away; see `spawn_fake_executor`'s doc
+    // for why all partitions share one increasing position space.
+    let handles = spawn_fake_executor(&mock, partition_rx);
 
     // These are 100 unique senders, one tx each.
     let mut signers = Vec::with_capacity(100);
@@ -81,7 +50,7 @@ async fn one_hundred_txs_route_and_receive_receipts() {
 
     let mut futs = Vec::new();
     for signer in &signers {
-        let raw = common::sign_legacy(signer, 0);
+        let raw = sign_legacy(signer, 0);
         let p = proxy.clone();
         let addr = signer.address();
         futs.push(async move {
@@ -103,7 +72,7 @@ async fn one_hundred_txs_route_and_receive_receipts() {
     // This is an idempotent retry: it resubmits the same tx for
     // signers[0]. It must hit the in-memory receipt cache, with no
     // executor round trip needed.
-    let raw0 = common::sign_legacy(&signers[0], 0);
+    let raw0 = sign_legacy(&signers[0], 0);
     let resp = proxy
         .submit_raw("127.0.0.1".parse().unwrap(), raw0)
         .await
@@ -115,25 +84,31 @@ async fn one_hundred_txs_route_and_receive_receipts() {
     }
 }
 
+/// Drain a shard's `tx_data` receiver forever, so no receipt ever comes
+/// back for an envelope on it.
+fn swallow_envelopes(mut rx: tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>) {
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn draining_refuses_new_submits_and_reports_parked_count() {
     // The graceful drain of a restart: a parked submit keeps waiting, a
     // new one gets a retryable error, and `drain` reports what is still
     // parked when the bound passes.
     let cfg = IngressConfig {
-        partition_count_m: 2,
+        partition_count_m: TWO_SHARDS,
         pending_receipt_timeout: Duration::from_secs(10),
         ..IngressConfig::default()
     };
-    let (mock, mut partition_rx) = MockChannels::new(2);
+    let (mock, mut partition_rx) = MockChannels::new(TWO_MOCK_SHARDS);
     let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
     // Swallow the envelopes: no receipt ever comes, so the submit parks.
-    for mut rx in partition_rx.drain(..) {
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    for rx in partition_rx.drain(..) {
+        swallow_envelopes(rx);
     }
     let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
     let signer = PrivateKeySigner::random();
-    let raw0 = common::sign_legacy(&signer, 0);
+    let raw0 = sign_legacy(&signer, 0);
     let parked = {
         let proxy = proxy.clone();
         tokio::spawn(async move { proxy.submit_raw(ip, raw0).await })
@@ -143,11 +118,15 @@ async fn draining_refuses_new_submits_and_reports_parked_count() {
 
     proxy.begin_drain();
     assert!(proxy.is_draining());
-    let raw1 = common::sign_legacy(&signer, 1);
-    match proxy.submit_raw(ip, raw1).await {
-        Err(kardamom_ingress::error::IngressError::Draining) => {}
-        other => panic!("expected Draining, got {other:?}"),
-    }
+    let raw1 = sign_legacy(&signer, 1);
+    let refused = proxy.submit_raw(ip, raw1).await;
+    assert!(
+        matches!(
+            refused,
+            Err(kardamom_ingress::error::IngressError::Draining)
+        ),
+        "expected Draining, got {refused:?}"
+    );
     // The bound passes with the first submit still parked.
     let still = proxy.drain(Duration::from_millis(200)).await;
     assert_eq!(still, 1);
@@ -157,11 +136,11 @@ async fn draining_refuses_new_submits_and_reports_parked_count() {
 #[tokio::test(flavor = "multi_thread")]
 async fn proxy_parks_until_watermark_advances() {
     let cfg = IngressConfig {
-        partition_count_m: 2,
+        partition_count_m: TWO_SHARDS,
         pending_receipt_timeout: Duration::from_secs(5),
         ..IngressConfig::default()
     };
-    let (mock, mut partition_rx) = MockChannels::new(2);
+    let (mock, mut partition_rx) = MockChannels::new(TWO_MOCK_SHARDS);
     let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
     // This is a fake executor for partition 0. It publishes the
@@ -197,13 +176,8 @@ async fn proxy_parks_until_watermark_advances() {
     });
 
     // This picks a signer whose address routes to partition 0.
-    let signer = loop {
-        let s = PrivateKeySigner::random();
-        if partition_for(s.address(), 2) == 0 {
-            break s;
-        }
-    };
-    let raw = common::sign_legacy(&signer, 0);
+    let signer = signer_for_shard(0, TWO_SHARDS);
+    let raw = sign_legacy(&signer, 0);
     let start = std::time::Instant::now();
     let resp = proxy
         .submit_raw("127.0.0.1".parse().unwrap(), raw)
@@ -224,12 +198,18 @@ async fn proxy_parks_until_watermark_advances() {
 /// canonical order, ingress receives the same receipt N times. The
 /// submit must resolve exactly once, first-wins by tx hash, with no
 /// panic and no double ack, and the receipt cache must hold a single
-/// entry for the tx_hash. This drives the full proxy receipt watcher
+/// entry for the `tx_hash`. This drives the full proxy receipt watcher
 /// path, which is what the live ingress uses.
 #[tokio::test(flavor = "multi_thread")]
 async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
+    // Three "executor replicas" all emit the identical receipt for the
+    // same tx, with the same tx_hash, sender, nonce, and position. This
+    // is exactly what N MDS sources deliver onto the aggregated
+    // subscription.
+    const REPLICAS: usize = 3;
+
     let cfg = IngressConfig {
-        partition_count_m: 2,
+        partition_count_m: TWO_SHARDS,
         // OnOffer releases as soon as the deduped receipt arrives. This
         // way, the test exercises the receipt path with no watermark
         // dependency.
@@ -237,14 +217,9 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
         pending_receipt_timeout: Duration::from_secs(5),
         ..IngressConfig::default()
     };
-    let (mock, mut partition_rx) = MockChannels::new(2);
+    let (mock, mut partition_rx) = MockChannels::new(TWO_MOCK_SHARDS);
     let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
-    // Three "executor replicas" all emit the identical receipt for the
-    // same tx, with the same tx_hash, sender, nonce, and position. This
-    // is exactly what N MDS sources deliver onto the aggregated
-    // subscription.
-    const REPLICAS: usize = 3;
     let receipt_bus = mock.receipt_bus.clone();
     let rx0 = partition_rx.remove(0);
     let _rx1 = partition_rx.remove(0);
@@ -269,19 +244,14 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
             };
             // This is the fan-in: the same receipt arrives once per
             // replica.
-            for _ in 0..REPLICAS {
+            (0..REPLICAS).for_each(|_| {
                 let _ = receipt_bus.send(receipt.clone());
-            }
+            });
         }
     });
 
-    let signer = loop {
-        let s = PrivateKeySigner::random();
-        if partition_for(s.address(), 2) == 0 {
-            break s;
-        }
-    };
-    let raw = common::sign_legacy(&signer, 0);
+    let signer = signer_for_shard(0, TWO_SHARDS);
+    let raw = sign_legacy(&signer, 0);
     // This resolves exactly once, despite REPLICAS identical receipts,
     // with no panic.
     let resp = proxy
@@ -302,7 +272,7 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
     // A second submit of the same tx is served from cache, idempotently.
     // This shows the duplicate copies did not corrupt or double-resolve
     // the pending state.
-    let raw_again = common::sign_legacy(&signer, 0);
+    let raw_again = sign_legacy(&signer, 0);
     let resp2 = proxy
         .submit_raw("127.0.0.1".parse().unwrap(), raw_again)
         .await
@@ -318,17 +288,17 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
 /// executor's receipt lands shortly after. The client must get the
 /// receipt: the dedup drops the duplicate rejections, and the success
 /// overrides the earlier rejection. This drives the full proxy watcher
-/// pipeline, tx_errors bus to dedup to pending grace to receipt bus
+/// pipeline, `tx_errors` bus to dedup to pending grace to receipt bus
 /// release, which is what the live ingress uses.
 #[tokio::test(flavor = "multi_thread")]
 async fn racing_replica_rejection_is_overridden_by_twin_success() {
     let cfg = IngressConfig {
-        partition_count_m: 2,
+        partition_count_m: TWO_SHARDS,
         ack_policy: kardamom_types::AckPolicy::OnOffer,
         pending_receipt_timeout: Duration::from_secs(5),
         ..IngressConfig::default()
     };
-    let (mock, mut partition_rx) = MockChannels::new(2);
+    let (mock, mut partition_rx) = MockChannels::new(TWO_MOCK_SHARDS);
     let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
     let receipt_bus = mock.receipt_bus.clone();
@@ -345,7 +315,7 @@ async fn racing_replica_rejection_is_overridden_by_twin_success() {
             let nonce = nonce_of(&envelope.raw_tx);
             // Replica A wrongly rejects. The rejection arrives from both
             // replicas, a 2x fan-out, and before the twin's receipt.
-            for _ in 0..2 {
+            (0..2).for_each(|_| {
                 let _ = error_bus.send(kardamom_types::TxError {
                     sender: envelope.sender,
                     nonce,
@@ -353,7 +323,7 @@ async fn racing_replica_rejection_is_overridden_by_twin_success() {
                         expected_nonce: nonce + 1,
                     },
                 });
-            }
+            });
             // The twin ordered it. The receipt lands shortly after, well
             // inside the rejection-release grace.
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -371,13 +341,8 @@ async fn racing_replica_rejection_is_overridden_by_twin_success() {
         }
     });
 
-    let signer = loop {
-        let s = PrivateKeySigner::random();
-        if partition_for(s.address(), 2) == 0 {
-            break s;
-        }
-    };
-    let raw = common::sign_legacy(&signer, 0);
+    let signer = signer_for_shard(0, TWO_SHARDS);
+    let raw = sign_legacy(&signer, 0);
     let resp = proxy
         .submit_raw("127.0.0.1".parse().unwrap(), raw)
         .await
@@ -395,12 +360,12 @@ async fn racing_replica_rejection_is_overridden_by_twin_success() {
 #[tokio::test(flavor = "multi_thread")]
 async fn genuine_rejection_from_both_replicas_reaches_the_client_once() {
     let cfg = IngressConfig {
-        partition_count_m: 2,
+        partition_count_m: TWO_SHARDS,
         ack_policy: kardamom_types::AckPolicy::OnOffer,
         pending_receipt_timeout: Duration::from_secs(5),
         ..IngressConfig::default()
     };
-    let (mock, mut partition_rx) = MockChannels::new(2);
+    let (mock, mut partition_rx) = MockChannels::new(TWO_MOCK_SHARDS);
     let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
     let error_bus = mock.tx_error_bus.clone();
@@ -408,28 +373,24 @@ async fn genuine_rejection_from_both_replicas_reaches_the_client_once() {
     let _rx1 = partition_rx.remove(0);
     let h = tokio::spawn(async move {
         let mut rx0 = rx0;
-        if let Some(envelope) = rx0.recv().await {
-            let nonce = nonce_of(&envelope.raw_tx);
-            // Both replicas reject. The copies can disagree on expected_nonce.
-            for expected in [7u64, 8u64] {
-                let _ = error_bus.send(kardamom_types::TxError {
-                    sender: envelope.sender,
-                    nonce,
-                    reason: kardamom_types::TxErrorReason::DuplicatedTx {
-                        expected_nonce: expected,
-                    },
-                });
-            }
+        let Some(envelope) = rx0.recv().await else {
+            return;
+        };
+        let nonce = nonce_of(&envelope.raw_tx);
+        // Both replicas reject. The copies can disagree on expected_nonce.
+        for expected in [7u64, 8u64] {
+            let _ = error_bus.send(kardamom_types::TxError {
+                sender: envelope.sender,
+                nonce,
+                reason: kardamom_types::TxErrorReason::DuplicatedTx {
+                    expected_nonce: expected,
+                },
+            });
         }
     });
 
-    let signer = loop {
-        let s = PrivateKeySigner::random();
-        if partition_for(s.address(), 2) == 0 {
-            break s;
-        }
-    };
-    let raw = common::sign_legacy(&signer, 0);
+    let signer = signer_for_shard(0, TWO_SHARDS);
+    let raw = sign_legacy(&signer, 0);
     let err = proxy
         .submit_raw("127.0.0.1".parse().unwrap(), raw)
         .await

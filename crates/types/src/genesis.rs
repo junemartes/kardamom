@@ -27,7 +27,21 @@ pub struct AllocEntry {
     pub balance: U256,
     #[serde(default, deserialize_with = "deserialize_code")]
     pub code: Option<Bytes>,
+    /// Starting nonce. Omitted means 0.
     pub nonce: Option<u64>,
+}
+
+impl AllocEntry {
+    /// This entry's code hash: `B256::ZERO` for an empty-code account, the
+    /// executor and validator convention. Kardamom does not use the
+    /// Ethereum `KECCAK_EMPTY` sentinel.
+    fn code_hash(&self) -> alloy_primitives::B256 {
+        self.code
+            .as_ref()
+            .map_or(alloy_primitives::B256::ZERO, |c| {
+                alloy_primitives::keccak256(c.as_ref())
+            })
+    }
 }
 
 impl Genesis {
@@ -41,45 +55,51 @@ impl Genesis {
     /// a [`crate::delta::CodeEntry`]. This shared builder keeps the
     /// rebuild-from-L1 reconstructor's genesis identical, byte for byte, to
     /// the live executor's genesis, so their state roots match.
+    #[must_use]
     pub fn to_alloc(&self) -> (Vec<crate::AccountChange>, Vec<crate::delta::CodeEntry>) {
-        use alloy_primitives::{B256, keccak256};
-        let mut accounts = Vec::with_capacity(self.alloc.len());
-        let mut code = Vec::new();
-        for entry in &self.alloc {
-            let nonce = entry.nonce.unwrap_or(0);
-            let code_hash = entry
-                .code
-                .as_ref()
-                .map(|c| keccak256(c.as_ref()))
-                .unwrap_or(B256::ZERO);
-            accounts.push(crate::AccountChange {
-                address: entry.address,
-                nonce,
-                balance: entry.balance,
-                code_hash,
-            });
-            if let Some(c) = entry.code.as_ref() {
-                code.push(crate::delta::CodeEntry {
+        // One pass, one `code_hash()` per entry: the account and its code
+        // entry (if any) both need the hash, so computing it here instead
+        // of once per collection avoids hashing the same code twice.
+        let (accounts, code): (Vec<_>, Vec<Option<_>>) = self
+            .alloc
+            .iter()
+            .map(|entry| {
+                let code_hash = entry.code_hash();
+                let account = crate::AccountChange {
+                    address: entry.address,
+                    nonce: entry.nonce.unwrap_or(0),
+                    balance: entry.balance,
+                    code_hash,
+                };
+                let code_entry = entry.code.as_ref().map(|c| crate::delta::CodeEntry {
                     code_hash,
                     code: c.0.clone(),
                 });
-            }
-        }
-        (accounts, code)
+                (account, code_entry)
+            })
+            .unzip();
+        (accounts, code.into_iter().flatten().collect())
     }
 
     /// Checks rules that the type and derive cannot express.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenesisError::ZeroChainId`] if `chain_id` is 0, or
+    /// [`GenesisError::DuplicateAlloc`] if two allocation entries share an
+    /// address.
     pub fn validate(&self) -> Result<(), GenesisError> {
         if self.chain_id == 0 {
             return Err(GenesisError::ZeroChainId);
         }
         let mut seen = alloc::collections::BTreeSet::new();
-        for entry in &self.alloc {
-            if !seen.insert(entry.address) {
-                return Err(GenesisError::DuplicateAlloc(entry.address));
+        self.alloc.iter().try_for_each(|entry| {
+            if seen.insert(entry.address) {
+                Ok(())
+            } else {
+                Err(GenesisError::DuplicateAlloc(entry.address))
             }
-        }
-        Ok(())
+        })
     }
 }
 

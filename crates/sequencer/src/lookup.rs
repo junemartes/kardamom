@@ -6,7 +6,7 @@
 //! stays parked until expiry. This is the open issue F02.1.
 //!
 //! The lookup closes it. When a transaction parks for a sender with no
-//! known floor, the core asks for a lookup through [`NonceLookup`]. The
+//! known floor, the core asks for a lookup through [`LookupRequester`]. The
 //! binary's lookup task queries an executor for the committed nonce and
 //! delivers the answer as a `FloorUpdate`. The floor rises through
 //! `advance_floor`, with a max merge. It never seeds the state machine.
@@ -19,31 +19,30 @@
 //! The core sends one request per park, and the task drops the duplicates.
 //! A timed-out lookup therefore retries on the sender's next park.
 
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::time::Duration;
+
 use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
 
-/// The lookup request seam. The core calls `request` off the state
-/// machine, once per park of a sender with no known floor.
-pub trait NonceLookup: Send {
-    fn request(&mut self, sender: Address);
-}
-
-/// The channel half the core holds. The lookup task in the binary owns
-/// the receiver.
+/// The lookup request seam: the channel half the core holds. The core
+/// calls [`Self::request`] off the state machine, once per park of a
+/// sender with no known floor. The lookup task in the binary owns the
+/// receiver.
 pub struct LookupRequester {
     tx: tokio::sync::mpsc::UnboundedSender<Address>,
 }
 
 impl LookupRequester {
     /// A requester and the receiver its task drains.
+    #[must_use]
     pub fn channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Address>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (Self { tx }, rx)
     }
-}
 
-impl NonceLookup for LookupRequester {
-    fn request(&mut self, sender: Address) {
+    /// Ask the task for `sender`'s committed nonce.
+    pub fn request(&mut self, sender: Address) {
         // A closed receiver means the task is gone. The park then waits
         // for a receipt or expires, as before the lookup existed.
         let _ = self.tx.send(sender);
@@ -59,30 +58,41 @@ pub struct LookupConfig {
     /// until one answers.
     pub executor_endpoints: Vec<String>,
     /// The bound of one query, in ms. It also bounds the retry rate: the
-    /// task starts no second lookup for a sender within this time.
-    pub timeout_ms: u64,
+    /// task starts no second lookup for a sender within this time. Never
+    /// zero: serde rejects a `0` at parse time.
+    pub timeout_ms: NonZeroU64,
     /// The bound of concurrent lookups. A burst of cold senders above
-    /// nonce 0 becomes at most this many queries in flight.
-    pub max_in_flight: usize,
+    /// nonce 0 becomes at most this many queries in flight. Never zero:
+    /// a zero bound would shed every lookup, which `executor_endpoints`
+    /// left empty already expresses.
+    pub max_in_flight: NonZeroUsize,
 }
 
 impl Default for LookupConfig {
     fn default() -> Self {
         Self {
             executor_endpoints: Vec::new(),
-            timeout_ms: 2_000,
-            max_in_flight: 64,
+            timeout_ms: NonZeroU64::new(2_000).unwrap(),
+            max_in_flight: NonZeroUsize::new(64).unwrap(),
         }
     }
 }
 
 impl LookupConfig {
+    #[must_use]
     pub fn enabled(&self) -> bool {
         !self.executor_endpoints.is_empty()
+    }
+
+    /// The bound of one query, [`Self::timeout_ms`] as a `Duration`.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.get())
     }
 }
 
 /// The JSON-RPC request body for one lookup.
+#[must_use]
 pub fn request_body(sender: Address) -> String {
     format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionCount","params":["{sender}","latest"]}}"#
@@ -90,6 +100,11 @@ pub fn request_body(sender: Address) -> String {
 }
 
 /// Parse the JSON-RPC answer into the account nonce.
+///
+/// # Errors
+///
+/// Returns the reason as text when the body is not JSON, carries an
+/// `error` member, has no `result`, or the result is not a hex quantity.
 pub fn parse_answer(body: &str) -> Result<u64, String> {
     #[derive(Deserialize)]
     struct Reply {

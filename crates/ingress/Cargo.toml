@@ -12,12 +12,20 @@ binary-protocol = []
 # harness). Off by default so `cargo test` works without Docker. Implies
 # `kardamom-log/docker-e2e` for the AeronTestCluster harness.
 docker-e2e = ["kardamom-log/docker-e2e"]
+# Exposes `test_support`: signing, receipt-building, and in-process-server
+# helpers shared by this crate's own tests, its `tests/`, and crates/bench.
+# No new dependency crate: `alloy-signer-local` and `k256` move here from
+# [dev-dependencies] (this crate's own tests enable this feature on itself,
+# through the [dev-dependencies] self-reference below), and jsonrpsee's
+# `http-client` gates on here instead of only in [dev-dependencies].
+test-support = ["dep:alloy-signer-local", "dep:k256", "jsonrpsee/http-client"]
 
 [dependencies]
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-eth.workspace = true
+alloy-signer-local = { workspace = true, optional = true }
 anyhow.workspace = true
 async-trait = "0.1"
 bytes.workspace = true
@@ -26,6 +34,7 @@ dashmap = "6"
 governor = "0.10"
 hyper = { version = "1", features = ["http1", "server"] }
 jsonrpsee.workspace = true
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"], optional = true }
 kardamom-log = { workspace = true, features = ["testing"] }
 # Cluster (Raft) transport adapter: the ingress on-quorum ack gate derives its
 # durable watermark from cluster egress progress (ClusterWatermark).
@@ -49,15 +58,17 @@ path = "src/bin/kardamom-ingress/main.rs"
 
 [dev-dependencies]
 libc.workspace = true
-alloy-signer-local.workspace = true
 criterion = { version = "0.7", features = ["async_tokio"] }
 futures.workspace = true
 jsonrpsee = { version = "0.26", features = ["server", "macros", "client", "http-client"] }
-k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+# `test_support` lives behind this crate's own `test-support` feature (see
+# [features] above); this is what turns it on for `tests/` and `benches/`.
+kardamom-ingress = { path = ".", features = ["test-support"] }
 # `testing` exposes cluster-adapter's in-memory gateway fakes (FakeEgress) used
 # by the cluster watermark observer unit tests.
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-obs = { path = "../obs", features = ["test-support"] }
 metrics = { workspace = true }
 rand = "0.9"
 reqwest = { workspace = true }

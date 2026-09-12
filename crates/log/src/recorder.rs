@@ -1,27 +1,22 @@
-//! Drives an Aeron Archive instance to record the tx_ordering stream and
-//! exposes the current durable recording position.
+//! Drives an Aeron Archive instance to record a stream and exposes the
+//! current durable recording position.
 //!
-//! Topology after the move to archive-at-the-sealer durability: one
-//! `Recorder` with `RecorderKind::TxOrdering` next to the sealer, recording
-//! the sealer's tx_ordering MDC publication (see [`Recorder::start_b_mdc`]).
-//! Its durable position is the watermark, published by
-//! [`run_durable_watermark_loop`]. The old N-recorder Q-of-N quorum
-//! aggregator no longer exists.
+//! Topology: one `Recorder` with `RecorderKind::TxOrdering` next to the
+//! sealer records the sealer's `tx_ordering` MDC publication. Other recorders
+//! tail `TxData` and `TxDeposits` streams so the executor can replay full
+//! transaction and deposit envelopes on crash recovery (see
+//! [`Recorder::start_stream`]).
 //!
 //! This module has an unconditional dependency on rusteron.
 //!
 //! ## Durability model
 //!
 //! The Aeron Archive daemon starts with `fileSyncLevel=1` (see
-//! [`crate::config::AeronConfig::file_sync_level`] and
-//! [`crate::supervisor`]). This makes it call `fdatasync` on the segment
-//! file after every recorded frame. As a result,
+//! [`crate::config::AeronConfig::file_sync_level`]). This makes it call
+//! `fdatasync` on the segment file after every recorded frame. As a result,
 //! [`rusteron_archive::AeronArchive::get_recording_position`] returns a
 //! position that is byte-durable on local storage. No separate fsync
-//! sidecar is needed. The durable-watermark loop
-//! ([`run_durable_watermark_loop`]) polls this position and republishes it
-//! as the single [`kardamom_types::QuorumWatermark`] that ingress gates its
-//! must-deliver ack on.
+//! sidecar is needed.
 //!
 //! ## Design note: thread confinement
 //!
@@ -31,55 +26,29 @@
 //! sharing of the archive handle is not supported.
 
 use std::cell::RefCell;
-use std::ffi::CString;
-use std::path::{Path, PathBuf};
+use std::ops::ControlFlow;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::{AeronConfig, ChannelsConfig, RecorderId};
+use crate::archive_catalog::ArchiveCatalog;
+use crate::config::AeronConfig;
 use crate::error::LogError;
 
 type Archive = rusteron_archive::AeronArchive;
-type AeronClient = rusteron_client::Aeron;
-
-/// Connect an Aeron client to the node-local Media Driver. When `aeron_dir`
-/// is `Some`, the client joins the driver at that shared-memory directory
-/// (the cluster's per-node tmpfs). Otherwise the C client uses its default
-/// lookup. The returned client is thread-confined (`!Send`) and must run on
-/// the calling thread (see the module's thread-confinement note).
-pub fn connect_client(aeron_dir: Option<&Path>) -> Result<AeronClient, LogError> {
-    let ctx = rusteron_client::AeronContext::new()
-        .map_err(|e| LogError::Aeron(format!("AeronContext::new: {e}")))?;
-    if let Some(dir) = aeron_dir {
-        let dir_s = dir
-            .to_str()
-            .ok_or_else(|| LogError::Aeron(format!("aeron.dir not UTF-8: {dir:?}")))?;
-        let dir_c = CString::new(dir_s)
-            .map_err(|_| LogError::Aeron(format!("aeron.dir contains NUL: {dir_s}")))?;
-        ctx.set_dir(dir_c.as_c_str())
-            .map_err(|e| LogError::Aeron(format!("set_dir: {e}")))?;
-    }
-    let aeron = AeronClient::new(&ctx).map_err(|e| LogError::Aeron(format!("Aeron::new: {e}")))?;
-    aeron
-        .start()
-        .map_err(|e| LogError::Aeron(format!("Aeron::start: {e}")))?;
-    Ok(aeron)
-}
 
 /// A connected Archive control session plus the archive-side Aeron client
-/// that must outlive it. `rusteron_archive` bundles its own `Aeron` type
-/// (distinct from `rusteron_client::Aeron`), so the recorder runs two client
-/// conductors against the same Media Driver: this one for archive control,
-/// and a [`connect_client`] one to publish the fsync watermark.
+/// that must outlive it. `rusteron_archive` bundles its own `Aeron` type,
+/// distinct from `rusteron_client::Aeron`.
 pub struct ArchiveSession {
     /// The archive's own Aeron client conductor. This field keeps the
     /// conductor alive for as long as `archive`. It is also exposed through
     /// [`ArchiveSession::aeron`], so a replay subscriber can open its
     /// multi-destination subscription on the same client.
-    _aeron: rusteron_archive::Aeron,
+    aeron_client: rusteron_archive::Aeron,
     pub archive: Archive,
 }
 
@@ -88,8 +57,9 @@ impl ArchiveSession {
     /// `control-mode=manual` subscription on this client, so the
     /// subscription and the archive control session share one
     /// media-driver conductor.
+    #[must_use]
     pub fn aeron(&self) -> &rusteron_archive::Aeron {
-        &self._aeron
+        &self.aeron_client
     }
 }
 
@@ -98,6 +68,12 @@ impl ArchiveSession {
 /// `aeron_dir`. The recorder uses this to drive `start_recording` and poll
 /// the durable recording position. The returned session is thread-confined:
 /// use it only on the calling thread.
+///
+/// # Errors
+///
+/// Returns an error if the archive control session fails to connect
+/// within 30 s (see
+/// [`connect_archive_with_timeout`]).
 pub fn connect_archive(
     aeron_dir: Option<&Path>,
     cfg: &AeronConfig,
@@ -110,6 +86,13 @@ pub fn connect_archive(
 /// pass a short timeout instead. One example is the join-miss refetch,
 /// which runs inside a join-timeout budget and must fail over quickly to
 /// another endpoint when an archive node is down.
+///
+/// # Errors
+///
+/// Returns an error if `aeron_dir` is not UTF-8 or contains a NUL
+/// byte, if any of the archive channel strings contain a NUL byte,
+/// or if the archive control session fails to connect within
+/// `connect_timeout`.
 pub fn connect_archive_with_timeout(
     aeron_dir: Option<&Path>,
     cfg: &AeronConfig,
@@ -118,11 +101,7 @@ pub fn connect_archive_with_timeout(
     let ctx = rusteron_archive::AeronContext::new()
         .map_err(|e| LogError::Aeron(format!("archive AeronContext::new: {e}")))?;
     if let Some(dir) = aeron_dir {
-        let dir_s = dir
-            .to_str()
-            .ok_or_else(|| LogError::Aeron(format!("aeron.dir not UTF-8: {dir:?}")))?;
-        let dir_c = CString::new(dir_s)
-            .map_err(|_| LogError::Aeron(format!("aeron.dir contains NUL: {dir_s}")))?;
+        let dir_c = crate::ffi::dir_cstring(dir)?;
         ctx.set_dir(dir_c.as_c_str())
             .map_err(|e| LogError::Aeron(format!("archive set_dir: {e}")))?;
     }
@@ -136,22 +115,33 @@ pub fn connect_archive_with_timeout(
         .map_err(|e| LogError::Aeron(format!("AeronArchiveContext::new: {e}")))?;
     actx.set_aeron(&aeron)
         .map_err(|e| LogError::Aeron(format!("archive set_aeron: {e}")))?;
-    let req = CString::new(cfg.archive_control_request_channel.as_str())
-        .map_err(|_| LogError::Aeron("archive control request channel NUL".into()))?;
-    let resp = CString::new(cfg.archive_control_response_channel.as_str())
-        .map_err(|_| LogError::Aeron("archive control response channel NUL".into()))?;
+    let req = crate::ffi::c_uri(
+        &cfg.archive_control_request_channel,
+        "archive control request channel",
+    )?;
+    let resp = crate::ffi::c_uri(
+        &cfg.archive_control_response_channel,
+        "archive control response channel",
+    )?;
     actx.set_control_request_channel(req.as_c_str())
         .map_err(|e| LogError::Aeron(format!("set_control_request_channel: {e}")))?;
     actx.set_control_response_channel(resp.as_c_str())
         .map_err(|e| LogError::Aeron(format!("set_control_response_channel: {e}")))?;
-    // The control-message timeout scales with the connect timeout. It never
-    // drops below the recorder's historical 60 s when connecting patiently.
-    // A short-timeout inline caller gets an equally quick per-operation
-    // failure.
+    // The control-message timeout scales with the connect timeout. The
+    // floor is 60 s when connecting patiently. A short-timeout inline
+    // caller gets an equally quick per-operation failure.
     let message_timeout_ns: u64 = if connect_timeout >= Duration::from_secs(30) {
         60_000_000_000
     } else {
-        (connect_timeout.as_nanos() as u64).max(1_000_000_000)
+        // Floor at 1 s in the `Duration` domain, before converting to
+        // nanoseconds, so a very short caller timeout still gives the
+        // archive a sane per-operation budget.
+        let floored = connect_timeout.max(Duration::from_secs(1));
+        u64::try_from(floored.as_nanos()).map_err(|_| {
+            LogError::Aeron(format!(
+                "connect_timeout {floored:?} does not fit u64 nanoseconds"
+            ))
+        })?
     };
     actx.set_message_timeout_ns(message_timeout_ns)
         .map_err(|e| LogError::Aeron(format!("set_message_timeout_ns: {e}")))?;
@@ -160,7 +150,7 @@ pub fn connect_archive_with_timeout(
         .poll_blocking(connect_timeout)
         .map_err(|e| LogError::Aeron(format!("archive connect poll: {e}")))?;
     Ok(ArchiveSession {
-        _aeron: aeron,
+        aeron_client: aeron,
         archive,
     })
 }
@@ -170,21 +160,22 @@ pub fn connect_archive_with_timeout(
 /// `TxOrdering` (recorded once, at the sealer) feeds the single durable
 /// watermark. `TxData` and `TxDeposits` are recorded so the executor can
 /// replay the full transaction and deposit envelopes on crash recovery (see
-/// [`crate::replay`]). Without them, only the canonical order survives a
+/// [`crate::refetch`]). Without them, only the canonical order survives a
 /// restart, not the bytes needed to re-execute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecorderKind {
-    /// TxOrdering canonical-orderer recorder (carries tiny TxRefs).
+    /// `TxOrdering` canonical-orderer recorder (carries tiny `TxRefs`).
     TxOrdering,
-    /// Per-sequencer TxData recorder (carries full `TxEnvelope` bytes).
+    /// Per-sequencer `TxData` recorder (carries full `TxEnvelope` bytes).
     TxData { sequencer_id: u8 },
-    /// TxDeposits recorder (carries full `Deposit` envelopes from the DA watcher).
+    /// `TxDeposits` recorder (carries full `Deposit` envelopes from the DA watcher).
     TxDeposits,
 }
 
 impl RecorderKind {
     /// Stream label used in operator-facing failure messages
     /// (`"start tx_data recording: ..."`).
+    #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             RecorderKind::TxOrdering => "tx_ordering",
@@ -196,12 +187,12 @@ impl RecorderKind {
 
 /// Body of a dedicated stream-recorder thread. This is the recorder-thread
 /// plus ready-barrier pattern shared by the producer binaries
-/// (`kardamom-ingress` records tx_data per shard; `kardamom-da-watcher`
-/// records tx_deposits). It connects a thread-confined archive session,
+/// (`kardamom-ingress` records `tx_data` per shard; `kardamom-da-watcher`
+/// records `tx_deposits`). It connects a thread-confined archive session,
 /// starts recording `(channel, stream_id)`, reports the startup outcome
 /// exactly once through `ready`, and holds the recording (and its archive
 /// session) alive until `stop` is cancelled. The recording itself runs in the
-/// ArchivingMediaDriver. This thread only keeps the session connected and
+/// `ArchivingMediaDriver`. This thread only keeps the session connected and
 /// re-adopts an existing recording on restart.
 ///
 /// `ready` receives `Ok(recording_id)` once the recording is confirmed
@@ -224,6 +215,13 @@ impl RecorderKind {
 /// still polls the archive on a bounded 500 ms cadence, because it waits
 /// on archive state, not on the stop signal. It checks
 /// `stop.is_cancelled()` on each tick.
+///
+/// # Errors
+///
+/// Returns an error if the archive control session fails to connect,
+/// or if starting the recording fails (see
+/// [`Recorder::start_stream`]). `ready` still receives the failure
+/// reason on every error path.
 pub fn record_stream_until_stopped(
     aeron_dir: Option<&Path>,
     aeron_cfg: &AeronConfig,
@@ -240,21 +238,19 @@ pub fn record_stream_until_stopped(
             return Err(e);
         }
     };
-    let mut should_stop = || stop.is_cancelled();
-    let recorder =
-        match Recorder::start_stream(session.archive, channel, stream_id, kind, &mut should_stop) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                // Stopped before the recording appeared (shutdown during
-                // startup). Report it so a waiting barrier does not hang.
-                ready(Err("stopped before the recording materialised".into()));
-                return Ok(());
-            }
-            Err(e) => {
-                ready(Err(format!("start {} recording: {e}", kind.label())));
-                return Err(e);
-            }
-        };
+    let recorder = match Recorder::start_stream(session.archive, channel, stream_id, kind, stop) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            // Stopped before the recording appeared (shutdown during
+            // startup). Report it so a waiting barrier does not hang.
+            ready(Err("stopped before the recording materialised".into()));
+            return Ok(());
+        }
+        Err(e) => {
+            ready(Err(format!("start {} recording: {e}", kind.label())));
+            return Err(e);
+        }
+    };
     ready(Ok(recorder.recording_id()));
     // Hold the recording (and its archive session) alive until shutdown.
     futures::executor::block_on(stop.cancelled());
@@ -263,88 +259,55 @@ pub fn record_stream_until_stopped(
 
 pub struct Recorder {
     /// Owned by the Recorder thread. `AeronArchive` is `!Send + !Sync`, so
-    /// this field is deliberately not `Arc<Archive>`. The recording-position
-    /// poll and the durable-watermark publish in
-    /// [`run_durable_watermark_loop`] both run on this thread.
-    // RAII: dropping this closes the archive session and stops the
-    // recording — held, never read (its last reader left with the
-    // durable-watermark decoder).
+    /// this field is deliberately not `Arc<Archive>`.
+    // RAII: dropping this field closes the archive session and stops the
+    // recording. The field is never read; its only purpose is the drop.
     _archive: Archive,
     recording_id: i64,
 }
 
 impl Recorder {
-    /// Start recording the sealer's tx_ordering MDC publication. This is the
-    /// archive-at-the-sealer durability path ("archive once at the
-    /// sealer"). The recording subscribes to the sealer's own MDC control
-    /// endpoint (`control_uri`, for example
-    /// `aeron:udp?control=<sealer-ip>:<port>|control-mode=dynamic`) on
-    /// `tx_ordering_stream_id`. Its byte-durable `get_recording_position()`
-    /// becomes the durable watermark that ingress gates its must-deliver
-    /// ack on.
-    ///
-    /// `recorder_id` and `archive_dir` stay in the signature for caller
-    /// compatibility (there is exactly one archive, conventionally recorder
-    /// 0). The durable-watermark path no longer needs either.
-    pub fn start_b_mdc(
-        // RAII: dropping this closes the archive session and stops the
-        // recording — held, never read (its last reader left with the
-        // durable-watermark decoder).
-        archive: Archive,
-        control_uri: &str,
-        ch: &ChannelsConfig,
-        recorder_id: RecorderId,
-        archive_dir: PathBuf,
-        should_stop: &mut dyn FnMut() -> bool,
-    ) -> Result<Option<Self>, LogError> {
-        let _ = (recorder_id, archive_dir);
-        Self::start_inner(
-            archive,
-            control_uri,
-            ch.tx_ordering_stream_id,
-            RecorderKind::TxOrdering,
-            "B-MDC",
-            should_stop,
-        )
-    }
-
     /// Start recording an arbitrary `(channel, stream_id)`. This is the
     /// generic entry point used by the per-sequencer `tx_data` recorder (in
     /// the sequencer process) and the `tx_deposits` recorder (in the DA
     /// watcher), so the executor can replay full transaction or deposit
     /// envelopes on crash recovery. `kind` selects the log label. The
     /// channel transport (IPC or UDP) picks the archive source location
-    /// automatically. Returns `Ok(None)` if `should_stop` fires before the
+    /// automatically. Returns `Ok(None)` if `stop` cancels before the
     /// recording appears.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `channel` contains a NUL byte, or if the
+    /// archive rejects `start_recording` for a reason other than the
+    /// stream already being recorded, or if fetching the recording's
+    /// descriptor fails once it appears.
     pub fn start_stream(
         // RAII: dropping this closes the archive session and stops the
-        // recording — held, never read (its last reader left with the
-        // durable-watermark decoder).
+        // recording.
         archive: Archive,
         channel: &str,
         stream_id: i32,
         kind: RecorderKind,
-        should_stop: &mut dyn FnMut() -> bool,
+        stop: &CancellationToken,
     ) -> Result<Option<Self>, LogError> {
-        Self::start_inner(archive, channel, stream_id, kind, "stream", should_stop)
+        Self::start_inner(archive, channel, stream_id, kind, "stream", stop)
     }
 
-    /// Returns `Ok(None)` if `should_stop` fired before a recording
-    /// appeared (clean shutdown during startup). Returns
-    /// `Ok(Some(recorder))` once recording.
+    /// Returns `Ok(None)` if `stop` cancels before a recording appeared
+    /// (clean shutdown during startup). Returns `Ok(Some(recorder))` once
+    /// recording.
     fn start_inner(
         // RAII: dropping this closes the archive session and stops the
-        // recording — held, never read (its last reader left with the
-        // durable-watermark decoder).
+        // recording.
         archive: Archive,
         channel: &str,
         stream_id: i32,
         kind: RecorderKind,
         ctx: &str,
-        should_stop: &mut dyn FnMut() -> bool,
+        stop: &CancellationToken,
     ) -> Result<Option<Self>, LogError> {
-        let channel_c = CString::new(channel)
-            .map_err(|e| LogError::Aeron(format!("{ctx} channel contains NUL: {e}")))?;
+        let channel_c = crate::ffi::c_uri(channel, &format!("{ctx} channel"))?;
 
         // SourceLocation selects how the archive subscribes to record the
         // stream. LOCAL records through a "spy" subscription that taps a
@@ -364,24 +327,22 @@ impl Recorder {
         // constants are public, so this function picks the value inline.
         let record_remote = !channel.trim_start().starts_with("aeron:ipc");
 
-        let recording_id = match Self::find_or_start_recording(
+        let Some(recording_id) = Self::find_or_start_recording(
             &archive,
             channel_c.as_c_str(),
             stream_id,
             kind,
             record_remote,
-            should_stop,
-        )? {
-            Some(id) => id,
-            None => return Ok(None), // shutdown before a recording appeared
+            stop,
+        ) else {
+            return Ok(None); // shutdown before a recording appeared
         };
 
         // Pull the descriptor once at startup so the term buffer length is
         // available to decode positions without a control-channel round-trip
-        // on every watermark tick.
-        // Descriptor fetch retained as a recording-liveness validation
-        // (its term length fed the deleted durable-watermark decoder).
-        let _ = fetch_descriptor(&archive, recording_id)?;
+        // on every watermark tick. The fetch also validates that the
+        // recording is live.
+        let _ = Self::fetch_descriptor(&archive, recording_id)?;
 
         Ok(Some(Self {
             _archive: archive,
@@ -391,31 +352,31 @@ impl Recorder {
 
     /// Resolve the recording id for `stream_id`: start the recording, then
     /// wait for it to appear in the archive catalog and return its id.
-    /// Returns `Ok(None)` if `should_stop` fires first.
+    /// Returns `None` if `stop` cancels first.
     ///
-    /// A recording started with auto_stop=false outlives the client that
+    /// A recording started with `auto_stop=false` outlives the client that
     /// started it. A recorder that restarts, or a fresh client against a
-    /// long-lived ArchivingMediaDriver (as in the cluster), then adopts the
-    /// existing recording. A second start_recording on the same (channel,
+    /// long-lived `ArchivingMediaDriver` (as in the cluster), then adopts the
+    /// existing recording. A second `start_recording` on the same (channel,
     /// stream) is rejected, which is fine.
     ///
     /// The catalog descriptor only appears once a publisher connects to the
     /// stream (Aeron lists in-progress recordings, not idle ones). In a
     /// cluster the recorders come up before the sealer or sequencers
-    /// publish tx_ordering, so this waits indefinitely, until `should_stop`,
-    /// instead of timing out. The process staying alive keeps the Nomad
-    /// alloc "running", so the rest of the pipeline can deploy and start
-    /// publishing. Discovery uses `list_recordings_for_uri`, which matches
-    /// by stream and no session id (the recorder does not know it), unlike
-    /// `find_last_matching_recording`.
+    /// publish `tx_ordering`, so this waits indefinitely, until `stop`
+    /// cancels, instead of timing out. The process staying alive keeps the
+    /// Nomad alloc "running", so the rest of the pipeline can deploy and
+    /// start publishing. Discovery uses `list_recordings_for_uri`, which
+    /// matches by stream and no session id (the recorder does not know it),
+    /// unlike `find_last_matching_recording`.
     fn find_or_start_recording(
         archive: &Archive,
         channel: &std::ffi::CStr,
         stream_id: i32,
         kind: RecorderKind,
         record_remote: bool,
-        should_stop: &mut dyn FnMut() -> bool,
-    ) -> Result<Option<i64>, LogError> {
+        stop: &CancellationToken,
+    ) -> Option<i64> {
         // Start the recording. The first caller wins. A second start on the
         // same (channel, stream) is rejected, which is harmless: the
         // recording already exists.
@@ -432,169 +393,137 @@ impl Recorder {
         match archive.start_recording(channel, stream_id, source_location, false) {
             Ok(sub_id) => info!(subscription_id = sub_id, ?kind, "recording initiated"),
             Err(e) => {
-                info!(error = %e, ?kind, "start_recording rejected (another recorder owns this stream)")
+                info!(error = %e, ?kind, "start_recording rejected (another recorder owns this stream)");
             }
         }
 
         let mut logged_waiting = false;
-        while !should_stop() {
-            match active_recording_for_stream(archive, stream_id) {
-                Ok(Some(id)) => {
-                    info!(recording_id = id, ?kind, "recording ready");
-                    return Ok(Some(id));
-                }
-                Ok(None) => {
-                    if !logged_waiting {
-                        info!(
-                            ?kind,
-                            "waiting for a publisher on the stream so the recording materializes"
-                        );
-                        logged_waiting = true;
-                    }
-                }
-                Err(e) => warn!(error = %e, ?kind, "list_recordings_for_uri failed; retrying"),
+        while !stop.is_cancelled() {
+            match Self::poll_recording(archive, stream_id, kind, &mut logged_waiting) {
+                ControlFlow::Break(id) => return Some(id),
+                ControlFlow::Continue(()) => {}
             }
-            std::thread::sleep(Duration::from_millis(500));
         }
-        Ok(None)
+        None
     }
 
+    /// One [`Self::find_or_start_recording`] poll step. `Break` carries the
+    /// recording id once the catalog lists it. `Continue` means it does
+    /// not exist yet; the caller waits and polls again.
+    fn poll_recording(
+        archive: &Archive,
+        stream_id: i32,
+        kind: RecorderKind,
+        logged_waiting: &mut bool,
+    ) -> ControlFlow<i64> {
+        match Self::active_recording_for_stream(archive, stream_id) {
+            Ok(Some(id)) => {
+                info!(recording_id = id, ?kind, "recording ready");
+                return ControlFlow::Break(id);
+            }
+            Ok(None) => {
+                if !*logged_waiting {
+                    info!(
+                        ?kind,
+                        "waiting for a publisher on the stream so the recording materializes"
+                    );
+                    *logged_waiting = true;
+                }
+            }
+            Err(e) => warn!(error = %e, ?kind, "list_recordings_for_uri failed; retrying"),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        ControlFlow::Continue(())
+    }
+
+    #[must_use]
     pub fn recording_id(&self) -> i64 {
         self.recording_id
     }
-}
 
-/// One-shot descriptor fetch through `list_recording`, returning the
-/// recording's term buffer length (needed to decode absolute positions into
-/// `BPosition`). This implements the
-/// `AeronArchiveRecordingDescriptorConsumerFuncCallback` trait on a small
-/// `Rc<RefCell<Captured>>` shim. `AeronArchive` itself is `!Send + !Sync`,
-/// which enforces single-thread access.
-fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<i32, LogError> {
-    use rusteron_archive::{
-        AeronArchiveRecordingDescriptor, AeronArchiveRecordingDescriptorConsumerFuncCallback,
-        Handler,
-    };
+    /// One-shot descriptor fetch through `list_recording`, returning the
+    /// recording's term buffer length (needed to decode absolute
+    /// positions into `BPosition`). This implements the
+    /// `AeronArchiveRecordingDescriptorConsumerFuncCallback` trait on a
+    /// small `Rc<RefCell<Captured>>` shim. `AeronArchive` itself is
+    /// `!Send + !Sync`, which enforces single-thread access.
+    fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<i32, LogError> {
+        use rusteron_archive::{
+            AeronArchiveRecordingDescriptor, AeronArchiveRecordingDescriptorConsumerFuncCallback,
+            Handler,
+        };
 
-    #[derive(Default)]
-    struct Captured {
-        term_buffer_length: i32,
-        seen: bool,
-    }
-
-    struct Consumer {
-        captured: Rc<RefCell<Captured>>,
-    }
-
-    impl AeronArchiveRecordingDescriptorConsumerFuncCallback for Consumer {
-        fn handle_aeron_archive_recording_descriptor_consumer_func(
-            &mut self,
-            desc: AeronArchiveRecordingDescriptor,
-        ) {
-            let mut g = self.captured.borrow_mut();
-            g.term_buffer_length = desc.term_buffer_length();
-            g.seen = true;
+        #[derive(Default)]
+        struct Captured {
+            term_buffer_length: i32,
+            seen: bool,
         }
-    }
 
-    let captured: Rc<RefCell<Captured>> = Rc::new(RefCell::new(Captured::default()));
-    let mut handler = Handler::leak(Consumer {
-        captured: captured.clone(),
-    });
-
-    // `list_recording` calls the consumer synchronously and drops the
-    // callback pointer once it returns. Release the leaked handler right
-    // after, on both the ok and error paths (release before `?`). Otherwise
-    // every call leaks the boxed `Consumer`, and the rusteron `Drop` guard
-    // logs a "release() was never called" error.
-    let res = archive.list_recording(recording_id, Some(&handler));
-    handler.release();
-    res.map_err(|e| LogError::Aeron(format!("list_recording: {e}")))?;
-
-    let g = captured.borrow();
-    if !g.seen {
-        return Err(LogError::Aeron(format!(
-            "list_recording({recording_id}) returned no descriptor"
-        )));
-    }
-    Ok(g.term_buffer_length)
-}
-
-/// Return the id of the most recent recording for `stream_id`, if any. This
-/// adopts the recording that another recorder already started for a shared
-/// stream (several recorders on one archive recording tx_ordering, or a
-/// restart against a long-lived archive). It lists by stream plus an empty
-/// channel fragment (matches any channel) and takes the highest recording
-/// id. Recordings run for the process lifetime (auto_stop=false), so the
-/// newest one is the live one. This pages through the whole catalog:
-/// recording ids are archive-global across all streams, so the newest
-/// recording for this stream can sit beyond any single page. Adopting a
-/// stale id would poll a dead recording's position. Aeron only lists
-/// recordings with an in-progress image, so this returns `None` until a
-/// publisher has connected to the stream.
-fn active_recording_for_stream(archive: &Archive, stream_id: i32) -> Result<Option<i64>, LogError> {
-    use rusteron_archive::{
-        AeronArchiveRecordingDescriptor, AeronArchiveRecordingDescriptorConsumerFuncCallback,
-        Handler,
-    };
-
-    struct Found {
-        /// Highest recording id seen for the stream.
-        latest: Option<i64>,
-    }
-
-    struct Consumer {
-        found: Rc<RefCell<Found>>,
-    }
-
-    impl AeronArchiveRecordingDescriptorConsumerFuncCallback for Consumer {
-        fn handle_aeron_archive_recording_descriptor_consumer_func(
-            &mut self,
-            desc: AeronArchiveRecordingDescriptor,
-        ) {
-            let id = desc.recording_id();
-            let mut g = self.found.borrow_mut();
-            g.latest = Some(g.latest.map_or(id, |cur| cur.max(id)));
+        struct Consumer {
+            captured: Rc<RefCell<Captured>>,
         }
-    }
 
-    const PAGE: i32 = 100;
-    let found: Rc<RefCell<Found>> = Rc::new(RefCell::new(Found { latest: None }));
-    // An empty channel fragment matches any channel; stream_id narrows to ours.
-    let any_channel = CString::new("").expect("empty fragment has no NUL");
-    // Page from record id 0 until a page comes back short. Each call
-    // delivers up to PAGE matching descriptors, scanning the catalog in id
-    // order.
-    let mut from_record_id: i64 = 0;
-    loop {
-        // This runs on every poll tick in `find_or_start_recording`'s wait
-        // loop. `list_recordings_for_uri` calls the consumer synchronously
-        // and drops the pointer on return, so release the leaked handler
-        // right away (before `?`, so the error path frees it too).
-        // Otherwise each tick leaks a boxed `Consumer`, and the rusteron
-        // `Drop` guard logs a "release() was never called" error at about
-        // 2 Hz, drowning the recorder's logs.
+        impl AeronArchiveRecordingDescriptorConsumerFuncCallback for Consumer {
+            fn handle_aeron_archive_recording_descriptor_consumer_func(
+                &mut self,
+                desc: AeronArchiveRecordingDescriptor,
+            ) {
+                let mut g = self.captured.borrow_mut();
+                g.term_buffer_length = desc.term_buffer_length();
+                g.seen = true;
+            }
+        }
+
+        let captured: Rc<RefCell<Captured>> = Rc::new(RefCell::new(Captured::default()));
         let mut handler = Handler::leak(Consumer {
-            found: found.clone(),
+            captured: captured.clone(),
         });
-        let res = archive.list_recordings_for_uri(
-            from_record_id,
-            PAGE,
-            any_channel.as_c_str(),
-            stream_id,
-            Some(&handler),
-        );
+
+        // `list_recording` calls the consumer synchronously and drops the
+        // callback pointer once it returns. Release the leaked handler
+        // right after, on both the ok and error paths (release before
+        // `?`). Otherwise every call leaks the boxed `Consumer`, and the
+        // rusteron `Drop` guard logs a "release() was never called"
+        // error.
+        let res = archive.list_recording(recording_id, Some(&handler));
         handler.release();
-        let count = res.map_err(|e| LogError::Aeron(format!("list_recordings_for_uri: {e}")))?;
-        if count < PAGE {
-            break; // catalog exhausted
+        res.map_err(|e| LogError::Aeron(format!("list_recording: {e}")))?;
+
+        let g = captured.borrow();
+        if !g.seen {
+            return Err(LogError::Aeron(format!(
+                "list_recording({recording_id}) returned no descriptor"
+            )));
         }
-        match found.borrow().latest {
-            Some(max_id) => from_record_id = max_id + 1,
-            None => break, // defensive: full page but no match recorded
-        }
+        Ok(g.term_buffer_length)
     }
 
-    let g = found.borrow();
-    Ok(g.latest)
+    /// Return the id of the most recent recording for `stream_id`, if
+    /// any. This adopts the recording that another recorder already
+    /// started for a shared stream (several recorders on one archive
+    /// recording `tx_ordering`, or a restart against a long-lived
+    /// archive). It lists by stream plus an empty channel fragment
+    /// (matches any channel) and takes the highest recording id.
+    /// Recordings run for the process lifetime (`auto_stop=false`), so
+    /// the newest one is the live one. This pages through the whole
+    /// catalog: recording ids are archive-global across all streams, so
+    /// the newest recording for this stream can sit beyond any single
+    /// page. Adopting a stale id would poll a dead recording's position.
+    /// Aeron only lists recordings with an in-progress image, so this
+    /// returns `None` until a publisher has connected to the stream.
+    fn active_recording_for_stream(
+        archive: &Archive,
+        stream_id: i32,
+    ) -> Result<Option<i64>, LogError> {
+        // This runs on every poll tick in `find_or_start_recording`'s
+        // wait loop. `for_each_recording_of_stream` releases its leaked
+        // handler before returning, on both the ok and error paths, so a
+        // tick never leaks a boxed consumer.
+        let mut latest: Option<i64> = None;
+        archive.for_each_recording_of_stream(stream_id, |desc| {
+            let id = desc.recording_id();
+            latest = Some(latest.map_or(id, |cur| cur.max(id)));
+        })?;
+        Ok(latest)
+    }
 }

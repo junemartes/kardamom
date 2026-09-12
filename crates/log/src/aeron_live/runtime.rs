@@ -3,6 +3,8 @@
 //! receivers). All Aeron work happens on the dedicated thread spawned here
 //! (see `super::thread`). This module only ships commands to it.
 
+use std::marker::PhantomData;
+use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +15,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::error;
 
 use super::thread::run_aeron_thread;
-use super::{ACK_TIMEOUT, AeronClient, DeliverFn};
+use super::{ACK_TIMEOUT, AeronClient, FrameSink, RawFrame};
 use crate::codec;
 use crate::error::LogError;
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
@@ -68,13 +70,13 @@ pub(super) enum RuntimeCmd {
         ack: CbSender<Result<u32, LogError>>,
     },
     /// Register a new subscription. The Aeron thread executes
-    /// `aeron.add_subscription()`, stores it in the sub table, and arranges
-    /// for the supplied `deliver` closure to run on each fragment. Replies
-    /// with the assigned `sub_id` (needed to attach MDS destinations).
+    /// `aeron.add_subscription()`, stores it in the sub table, and sends
+    /// each assembled fragment to `sink` as a [`RawFrame`]. Replies with
+    /// the assigned `sub_id` (needed to attach MDS destinations).
     OpenSubscription {
         uri: String,
         stream_id: i32,
-        deliver: DeliverFn,
+        sink: FrameSink,
         ack: CbSender<Result<u32, LogError>>,
     },
     /// Attach a source endpoint to a multi-destination
@@ -120,6 +122,12 @@ impl AeronRuntime {
     /// Calls [`spawn_with_dir`](Self::spawn_with_dir) when a directory is
     /// given, or [`spawn_default`](Self::spawn_default) otherwise. This is
     /// the shape every service binary's optional `--aeron-dir` flag needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to start (see
+    /// [`spawn_with_dir`](Self::spawn_with_dir) and
+    /// [`spawn_default`](Self::spawn_default)).
     pub fn spawn(aeron_dir: Option<&std::path::Path>) -> Result<Self, LogError> {
         match aeron_dir {
             Some(dir) => Self::spawn_with_dir(dir),
@@ -129,6 +137,12 @@ impl AeronRuntime {
 
     /// Build an Aeron client (using the default `aeron_dir`) and spawn the
     /// dedicated Aeron thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if building the default `AeronContext` fails, or
+    /// if the Aeron thread fails to start within 10 s (see
+    /// [`spawn_with`](Self::spawn_with)).
     pub fn spawn_default() -> Result<Self, LogError> {
         Self::spawn_with(|| {
             rusteron_client::AeronContext::new()
@@ -139,15 +153,15 @@ impl AeronRuntime {
     /// Spawn pointing at a specific `aeron.dir` (the Media Driver's
     /// shared-memory directory). Used by e2e tests that bind-mount the
     /// container's aeron.dir into the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `aeron_dir` is not UTF-8 or contains a NUL
+    /// byte, or if the Aeron thread fails to start (see
+    /// [`spawn_with`](Self::spawn_with)).
     pub fn spawn_with_dir(aeron_dir: impl Into<std::path::PathBuf>) -> Result<Self, LogError> {
         let aeron_dir = aeron_dir.into();
-        let aeron_dir_str = aeron_dir
-            .to_str()
-            .ok_or_else(|| LogError::Aeron(format!("aeron.dir is not UTF-8: {aeron_dir:?}")))?
-            .to_string();
-        let aeron_dir_c = std::ffi::CString::new(aeron_dir_str.clone()).map_err(|_| {
-            LogError::Aeron(format!("aeron.dir contains a NUL byte: {aeron_dir_str}"))
-        })?;
+        let aeron_dir_c = crate::ffi::dir_cstring(&aeron_dir)?;
         Self::spawn_with(move || {
             let ctx = rusteron_client::AeronContext::new()
                 .map_err(|e| LogError::Aeron(format!("AeronContext::new: {e}")))?;
@@ -160,8 +174,15 @@ impl AeronRuntime {
     /// Spawn the Aeron thread, building the `AeronContext` inside the
     /// thread with the caller-supplied closure. The closure runs on the
     /// Aeron thread. This is the only way to feed it custom configuration
-    /// without crossing the `!Send + !Sync` boundary that AeronContext
+    /// without crossing the `!Send + !Sync` boundary that `AeronContext`
     /// sits on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `make_ctx` fails, if building the `Aeron`
+    /// client from the resulting context fails, if the OS thread spawn
+    /// fails, or if the Aeron thread does not signal a successful start
+    /// within 10 s.
     pub fn spawn_with<F>(make_ctx: F) -> Result<Self, LogError>
     where
         F: FnOnce() -> Result<rusteron_client::AeronContext, LogError> + Send + 'static,
@@ -172,7 +193,7 @@ impl AeronRuntime {
         let join = std::thread::Builder::new()
             .name("kardamom-aeron".into())
             .spawn(move || {
-                let aeron = match make_ctx().and_then(build_aeron) {
+                let aeron = match make_ctx().and_then(|ctx| build_aeron(&ctx)) {
                     Ok(a) => a,
                     Err(e) => {
                         let _ = started_tx.send(Err(e));
@@ -208,6 +229,12 @@ impl AeronRuntime {
 
     /// Open a publication on the Aeron thread, returning a `Send + Sync`
     /// handle that forwards every offer through the command channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the publication
+    /// (a malformed channel URI, or the driver's `add_publication`
+    /// timeout elapsing), or if the command round trip itself times out.
     pub fn open_publication(&self, uri: &str, stream_id: i32) -> Result<PubHandle, LogError> {
         let uri = uri.to_string();
         let pub_id = request(
@@ -225,15 +252,59 @@ impl AeronRuntime {
         })
     }
 
-    /// Open a subscription with a raw deliver closure, returning the
-    /// assigned `sub_id` (used to attach MDS destinations; most callers
-    /// ignore it). Used by adapters that must demultiplex fragments
-    /// themselves.
-    pub fn open_subscription_with_deliver(
+    /// Open a subscription, returning its raw undecoded fragment stream
+    /// (as [`RawFrame`]s) plus the assigned `sub_id` (used to attach MDS
+    /// destinations; most callers ignore it). Used by adapters that
+    /// decode or demultiplex fragments themselves, on the consumer side
+    /// rather than on the Aeron thread — see [`FrameSink`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the subscription
+    /// (a malformed channel URI, or the driver's `add_subscription`
+    /// timeout elapsing), or if the command round trip itself times out.
+    pub fn open_subscription_raw(
         &self,
         uri: &str,
         stream_id: i32,
-        deliver: DeliverFn,
+    ) -> Result<(u32, UnboundedReceiver<RawFrame>), LogError> {
+        let (tx, rx) = unbounded_channel();
+        let sub_id = self.open_subscription_sink(uri, stream_id, FrameSink::Tokio(tx))?;
+        Ok((sub_id, rx))
+    }
+
+    /// Like [`open_subscription_raw`](Self::open_subscription_raw), but
+    /// for a plain OS thread that waits on this subscription alongside
+    /// other crossbeam channels via `crossbeam_channel::Select`
+    /// (`kardamom_cluster_adapter`'s session thread is the one consumer
+    /// today). Tokio's channels do not implement crossbeam's
+    /// `SelectHandle`, so that consumer needs a crossbeam receiver, not
+    /// the tokio one every other subscriber handle in this crate uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the subscription,
+    /// or if the command round trip itself times out.
+    pub fn open_subscription_raw_crossbeam(
+        &self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<(u32, crossbeam_channel::Receiver<RawFrame>), LogError> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let sub_id = self.open_subscription_sink(uri, stream_id, FrameSink::Crossbeam(tx))?;
+        Ok((sub_id, rx))
+    }
+
+    /// Shared by every `open_subscription*` method: register the
+    /// subscription and point its delivery at `sink`. Several calls can
+    /// share one clone of the same [`FrameSink::Tokio`] sender to merge
+    /// multiple subscriptions into one raw stream (see
+    /// [`open_subscription_merged`](Self::open_subscription_merged)).
+    fn open_subscription_sink(
+        &self,
+        uri: &str,
+        stream_id: i32,
+        sink: FrameSink,
     ) -> Result<u32, LogError> {
         let uri = uri.to_string();
         request(
@@ -241,7 +312,7 @@ impl AeronRuntime {
             |ack| RuntimeCmd::OpenSubscription {
                 uri,
                 stream_id,
-                deliver,
+                sink,
                 ack,
             },
             "open_subscription",
@@ -251,6 +322,12 @@ impl AeronRuntime {
     /// Attach a source endpoint to a multi-destination subscription (one
     /// opened `control-mode=manual`). Blocks until the driver confirms the
     /// attach. Idempotent: re-adding an already-attached `uri` is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `sub_id` is unknown, if the driver rejects or
+    /// times out the destination attach, or if the command round trip
+    /// itself times out.
     pub fn add_destination(&self, sub_id: u32, uri: &str) -> Result<(), LogError> {
         let uri = uri.to_string();
         request(
@@ -261,6 +338,11 @@ impl AeronRuntime {
     }
 
     /// Detach a previously-attached source endpoint from an MDS subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command round trip to the Aeron thread
+    /// times out.
     pub fn remove_destination(&self, sub_id: u32, uri: &str) -> Result<(), LogError> {
         let uri = uri.to_string();
         request(
@@ -270,57 +352,59 @@ impl AeronRuntime {
         )
     }
 
-    /// Open a typed subscription, returning an mpsc receiver of decoded
-    /// messages.
+    /// Open a typed subscription, returning a [`TypedSubscription`] that
+    /// decodes each fragment as `T` when the consumer calls
+    /// `recv`/`try_recv`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the subscription
+    /// (see [`open_subscription_merged`](Self::open_subscription_merged)).
     pub fn open_subscription<T>(
         &self,
         uri: &str,
         stream_id: i32,
-    ) -> Result<UnboundedReceiver<(BPosition, T)>, LogError>
+    ) -> Result<TypedSubscription<T>, LogError>
     where
-        T: rkyv::Archive + Send + 'static,
-        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-            + for<'a> rkyv::bytecheck::CheckBytes<
-                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
-            >,
+        T: crate::codec::WireMessage,
     {
-        self.open_subscription_merged(std::slice::from_ref(&uri), stream_id)
+        self.open_subscription_merged(uri, &[], stream_id)
     }
 
     /// Open one or more subscriptions on the same `stream_id`, all feeding
-    /// a single mpsc receiver. Each URI becomes its own Aeron subscription
-    /// (its own `SubEntry`). Fragments from every one are decoded and
-    /// merged into the returned channel in the Aeron thread's poll order,
-    /// the same merge the shared-multicast path produced from multiple
-    /// images of one subscription.
+    /// a single [`TypedSubscription`]. Each URI becomes its own Aeron
+    /// subscription (its own `SubEntry`), sharing one clone of the same
+    /// raw-frame sender, so fragments from every one merge into the
+    /// returned stream in the Aeron thread's poll order.
     ///
-    /// This is the tx_ordering MDC subscriber primitive: the executor
+    /// This is the `tx_ordering` MDC subscriber primitive: the executor
     /// passes one MDC control URI per publisher (the sealer and each
     /// sequencer), and the downstream reader sees a single ordered
-    /// `(BPosition, T)` stream, exactly as before. With a single URI it is
-    /// identical to [`Self::open_subscription`].
+    /// `(BPosition, T)` stream, exactly as before. With no `rest` URIs it
+    /// is identical to [`Self::open_subscription`].
+    ///
+    /// Takes `first` plus `rest` instead of one slice, so the empty-URI
+    /// case cannot be constructed and needs no runtime check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add any of the
+    /// underlying subscriptions (see
+    /// [`open_subscription_raw`](Self::open_subscription_raw)).
     pub fn open_subscription_merged<T>(
         &self,
-        uris: &[&str],
+        first: &str,
+        rest: &[&str],
         stream_id: i32,
-    ) -> Result<UnboundedReceiver<(BPosition, T)>, LogError>
+    ) -> Result<TypedSubscription<T>, LogError>
     where
-        T: rkyv::Archive + Send + 'static,
-        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-            + for<'a> rkyv::bytecheck::CheckBytes<
-                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
-            >,
+        T: crate::codec::WireMessage,
     {
-        if uris.is_empty() {
-            return Err(LogError::Aeron(
-                "open_subscription_merged requires at least one URI".into(),
-            ));
+        let (frames_tx, frames_rx) = unbounded_channel();
+        for uri in std::iter::once(first).chain(rest.iter().copied()) {
+            self.open_subscription_sink(uri, stream_id, FrameSink::Tokio(frames_tx.clone()))?;
         }
-        let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
-        for uri in uris {
-            self.open_subscription_with_deliver(uri, stream_id, typed_deliver(msg_tx.clone()))?;
-        }
-        Ok(msg_rx)
+        Ok(TypedSubscription::new(frames_rx))
     }
 
     /// Like [`open_subscription`](Self::open_subscription), but also
@@ -328,73 +412,252 @@ impl AeronRuntime {
     /// with [`add_destination`](Self::add_destination). Open the
     /// subscription on a `control-mode=manual` channel to make it
     /// multi-destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the subscription
+    /// (see [`open_subscription_raw`](Self::open_subscription_raw)).
     pub fn open_subscription_with_id<T>(
         &self,
         uri: &str,
         stream_id: i32,
-    ) -> Result<(u32, UnboundedReceiver<(BPosition, T)>), LogError>
+    ) -> Result<(u32, TypedSubscription<T>), LogError>
     where
-        T: rkyv::Archive + Send + 'static,
-        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-            + for<'a> rkyv::bytecheck::CheckBytes<
-                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
-            >,
+        T: crate::codec::WireMessage,
     {
-        let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
-        let sub_id = self.open_subscription_with_deliver(uri, stream_id, typed_deliver(msg_tx))?;
-        Ok((sub_id, msg_rx))
+        let (sub_id, rx) = self.open_subscription_raw(uri, stream_id)?;
+        Ok((sub_id, TypedSubscription::new(rx)))
     }
 
-    /// Open a tx_data subscription yielding `(TxDataLoc, TxEnvelope)`,
+    /// Open a `tx_data` subscription yielding `(TxDataLoc, TxEnvelope)`,
     /// pairing each envelope with its Aeron publisher `session_id`. The
     /// session id keeps concurrent (active/active) ingress publishers on
     /// one shard distinct. It is what the sequencer stamps into
     /// `TxRef.tx_data_session_id`, and what the executor keys its join
     /// buffer on. With a single publisher, every fragment carries the same
-    /// session id, so behavior is unchanged.
+    /// session id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the subscription
+    /// (see [`open_subscription_raw`](Self::open_subscription_raw)).
     pub fn open_tx_data_subscription(
         &self,
         uri: &str,
         stream_id: i32,
-    ) -> Result<UnboundedReceiver<(TxDataLoc, TxEnvelope)>, LogError> {
-        let (msg_tx, msg_rx) = unbounded_channel::<(TxDataLoc, TxEnvelope)>();
-        let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition, session: i32| {
-            match codec::materialize::<TxEnvelope>(bytes) {
-                Ok(v) => {
-                    let _ = msg_tx.send((TxDataLoc::new(session, pos), v));
-                }
-                Err(e) => {
-                    error!(error = %e, "decode failed on tx_data subscription delivery");
-                }
-            }
-        });
-        self.open_subscription_with_deliver(uri, stream_id, deliver)?;
-        Ok(msg_rx)
+    ) -> Result<TxDataSubscription, LogError> {
+        let (_sub_id, rx) = self.open_subscription_raw(uri, stream_id)?;
+        Ok(TxDataSubscription { rx })
     }
 }
 
-/// Build the standard typed deliver closure: decode each fragment as `T`
-/// and forward `(BPosition, T)` into `msg_tx`. A send error means the
-/// subscriber dropped its receiver; this is ignored, and the subscription
-/// keeps draining. Shared by [`AeronRuntime::open_subscription_merged`]
-/// and [`AeronRuntime::open_subscription_with_id`], so the decode/forward
-/// behavior cannot drift between them.
-fn typed_deliver<T>(msg_tx: tokio::sync::mpsc::UnboundedSender<(BPosition, T)>) -> DeliverFn
+/// Drain `rx` until `decode` yields a value or the channel closes.
+/// `decode` reports "skip and keep waiting" via `ControlFlow::Continue`
+/// for a malformed frame, so one bad fragment never ends the
+/// subscription: a decode error is skipped, not surfaced to the caller.
+async fn recv_decoded<T>(
+    rx: &mut UnboundedReceiver<RawFrame>,
+    mut decode: impl FnMut(&RawFrame) -> ControlFlow<T>,
+) -> Option<T> {
+    let mut out = None;
+    while out.is_none() {
+        out = decode(&rx.recv().await?).break_value();
+    }
+    out
+}
+
+/// Non-blocking twin of [`recv_decoded`], for `try_recv`. Keeps trying the
+/// next already-buffered frame, if any, past one `decode` skips.
+fn try_recv_decoded<T>(
+    rx: &mut UnboundedReceiver<RawFrame>,
+    mut decode: impl FnMut(&RawFrame) -> ControlFlow<T>,
+) -> Option<T> {
+    std::iter::from_fn(|| rx.try_recv().ok()).find_map(|f| decode(&f).break_value())
+}
+
+/// Blocking twin of [`recv_decoded`], for a caller off the tokio runtime.
+fn blocking_recv_decoded<T>(
+    rx: &mut UnboundedReceiver<RawFrame>,
+    mut decode: impl FnMut(&RawFrame) -> ControlFlow<T>,
+) -> Option<T> {
+    let mut out = None;
+    while out.is_none() {
+        out = decode(&rx.blocking_recv()?).break_value();
+    }
+    out
+}
+
+/// Decode one [`RawFrame`] as `T`. A malformed frame logs and reports
+/// "keep waiting" instead of ending the subscription or surfacing an
+/// error to the consumer.
+fn decode_typed_frame<T>(frame: &RawFrame) -> ControlFlow<(BPosition, T)>
 where
-    T: rkyv::Archive + Send + 'static,
-    T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+    T: crate::codec::WireMessage,
 {
-    Box::new(move |bytes: &[u8], pos: BPosition, _session: i32| {
-        match codec::materialize::<T>(bytes) {
-            Ok(v) => {
-                let _ = msg_tx.send((pos, v));
-            }
-            Err(e) => {
-                error!(error = %e, "decode failed on subscription delivery");
-            }
+    match codec::materialize::<T>(&frame.bytes) {
+        Ok(v) => ControlFlow::Break((frame.pos, v)),
+        Err(e) => {
+            error!(error = %e, "decode failed on subscription delivery");
+            ControlFlow::Continue(())
         }
-    })
+    }
+}
+
+/// Decoded receiver for one subscription (or several merged ones, see
+/// [`AeronRuntime::open_subscription_merged`]): wraps the raw frame
+/// stream and decodes each frame as `T` on `recv`/`try_recv`.
+///
+/// `PhantomData<fn() -> T>` rather than `PhantomData<T>`: this type never
+/// stores a `T`, so it must not inherit a `T: Send`/`T: Sync` bound it
+/// does not need.
+pub struct TypedSubscription<T> {
+    rx: UnboundedReceiver<RawFrame>,
+    _msg: PhantomData<fn() -> T>,
+}
+
+impl<T> TypedSubscription<T> {
+    fn new(rx: UnboundedReceiver<RawFrame>) -> Self {
+        Self {
+            rx,
+            _msg: PhantomData,
+        }
+    }
+}
+
+impl<T: crate::codec::WireMessage> TypedSubscription<T> {
+    pub async fn recv(&mut self) -> Option<(BPosition, T)> {
+        recv_decoded(&mut self.rx, decode_typed_frame).await
+    }
+
+    pub fn try_recv(&mut self) -> Option<(BPosition, T)> {
+        try_recv_decoded(&mut self.rx, decode_typed_frame)
+    }
+}
+
+/// Decode one `tx_data` fragment as a `TxEnvelope`, pairing it with a
+/// [`TxDataLoc`] built from the frame's position and publisher session.
+fn decode_tx_data_frame(frame: &RawFrame) -> ControlFlow<(TxDataLoc, TxEnvelope)> {
+    match codec::materialize::<TxEnvelope>(&frame.bytes) {
+        Ok(v) => ControlFlow::Break((TxDataLoc::new(frame.session, frame.pos), v)),
+        Err(e) => {
+            error!(error = %e, "decode failed on tx_data subscription delivery");
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+/// [`AeronRuntime::open_tx_data_subscription`]'s receiver: like
+/// [`TypedSubscription`], but decoding into `(TxDataLoc, TxEnvelope)`
+/// instead of `(BPosition, T)`, since `tx_data` also needs the publisher
+/// session id.
+pub struct TxDataSubscription {
+    rx: UnboundedReceiver<RawFrame>,
+}
+
+impl TxDataSubscription {
+    pub async fn recv(&mut self) -> Option<(TxDataLoc, TxEnvelope)> {
+        recv_decoded(&mut self.rx, decode_tx_data_frame).await
+    }
+
+    pub fn try_recv(&mut self) -> Option<(TxDataLoc, TxEnvelope)> {
+        try_recv_decoded(&mut self.rx, decode_tx_data_frame)
+    }
+
+    /// Blocking receive, for a caller off the tokio runtime (for example
+    /// a dedicated reader thread). Delegates to
+    /// `UnboundedReceiver::blocking_recv`, which parks the OS thread
+    /// until a frame arrives or the channel closes; unlike
+    /// [`PollRecv::poll_recv`], this has no timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from within a tokio runtime context (the same
+    /// restriction `UnboundedReceiver::blocking_recv` itself has).
+    pub fn blocking_recv(&mut self) -> Option<(TxDataLoc, TxEnvelope)> {
+        blocking_recv_decoded(&mut self.rx, decode_tx_data_frame)
+    }
+
+    /// Frames currently queued, not yet received. For a queue-depth
+    /// gauge; the channel is unbounded, so this is not a backlog bound.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rx.len()
+    }
+
+    /// Whether [`Self::len`] is 0.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rx.is_empty()
+    }
+}
+
+/// A subscription receiver that can be polled by hand, for a caller
+/// driving its own timeout on a thread with no tokio runtime entered
+/// (`crate::refetch`'s replay client is the one consumer today —
+/// tokio's `UnboundedReceiver` offers only `blocking_recv`, with no
+/// timeout, and async `recv`, which needs a runtime). Implemented by
+/// [`TypedSubscription`] and [`TxDataSubscription`].
+pub trait PollRecv {
+    type Item;
+    fn poll_recv(&mut self, cx: &mut std::task::Context<'_>)
+    -> std::task::Poll<Option<Self::Item>>;
+}
+
+/// Shared poll loop behind both [`PollRecv`] impls: keep polling the raw
+/// channel past frames `decode` reports "keep waiting" on, and stop at the
+/// first decoded item, end of stream, or pending. This is the manual-poll
+/// twin of [`recv_decoded`]/[`try_recv_decoded`].
+fn poll_recv_decoded<T>(
+    rx: &mut UnboundedReceiver<RawFrame>,
+    cx: &mut std::task::Context<'_>,
+    mut decode: impl FnMut(&RawFrame) -> ControlFlow<T>,
+) -> std::task::Poll<Option<T>> {
+    loop {
+        match poll_one(rx, cx, &mut decode) {
+            ControlFlow::Break(outcome) => return outcome,
+            ControlFlow::Continue(()) => {}
+        }
+    }
+}
+
+/// One raw poll. `Break` carries the outcome [`poll_recv_decoded`] should
+/// return: a decoded item, end of stream, or pending. `Continue` means
+/// `decode` skipped a malformed frame, so the caller polls again.
+fn poll_one<T>(
+    rx: &mut UnboundedReceiver<RawFrame>,
+    cx: &mut std::task::Context<'_>,
+    decode: &mut impl FnMut(&RawFrame) -> ControlFlow<T>,
+) -> ControlFlow<std::task::Poll<Option<T>>> {
+    match rx.poll_recv(cx) {
+        std::task::Poll::Ready(Some(frame)) => match decode(&frame) {
+            ControlFlow::Break(v) => ControlFlow::Break(std::task::Poll::Ready(Some(v))),
+            ControlFlow::Continue(()) => ControlFlow::Continue(()),
+        },
+        std::task::Poll::Ready(None) => ControlFlow::Break(std::task::Poll::Ready(None)),
+        std::task::Poll::Pending => ControlFlow::Break(std::task::Poll::Pending),
+    }
+}
+
+impl<T: crate::codec::WireMessage> PollRecv for TypedSubscription<T> {
+    type Item = (BPosition, T);
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        poll_recv_decoded(&mut self.rx, cx, decode_typed_frame::<T>)
+    }
+}
+
+impl PollRecv for TxDataSubscription {
+    type Item = (TxDataLoc, TxEnvelope);
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        poll_recv_decoded(&mut self.rx, cx, decode_tx_data_frame)
+    }
 }
 
 /// Routes Aeron C-client errors through `tracing` instead of the client's
@@ -421,7 +684,7 @@ impl rusteron_client::AeronErrorHandlerCallback for TracingErrorHandler {
     }
 }
 
-fn build_aeron(ctx: rusteron_client::AeronContext) -> Result<Rc<AeronClient>, LogError> {
+fn build_aeron(ctx: &rusteron_client::AeronContext) -> Result<Rc<AeronClient>, LogError> {
     let handler = rusteron_client::Handler::leak(TracingErrorHandler);
     ctx.set_error_handler(Some(&handler))
         .map_err(|e| LogError::Aeron(format!("set_error_handler: {e}")))?;
@@ -429,7 +692,7 @@ fn build_aeron(ctx: rusteron_client::AeronContext) -> Result<Rc<AeronClient>, Lo
     // lifetime. Forgetting the wrapper suppresses its drop-time
     // release()-was-never-called complaint.
     std::mem::forget(handler);
-    let aeron = AeronClient::new(&ctx).map_err(|e| LogError::Aeron(format!("Aeron::new: {e}")))?;
+    let aeron = AeronClient::new(ctx).map_err(|e| LogError::Aeron(format!("Aeron::new: {e}")))?;
     aeron
         .start()
         .map_err(|e| LogError::Aeron(format!("Aeron::start: {e}")))?;
@@ -452,6 +715,11 @@ impl PubHandle {
     /// Blocking publish with `BPosition` ack. Waits [`ACK_TIMEOUT`] for the
     /// Aeron thread's reply. See that constant for why the ack always
     /// resolves first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron offer fails or times out, or if the
+    /// command round trip to the Aeron thread itself times out.
     pub fn publish_bytes(&self, bytes: AlignedVec) -> Result<BPosition, LogError> {
         let pub_id = self.pub_id;
         request(
@@ -470,6 +738,11 @@ impl PubHandle {
     }
 
     /// Encode a typed message and publish blockingly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `msg` fails to encode, or if the publish
+    /// itself fails (see [`publish_bytes`](Self::publish_bytes)).
     pub fn publish<T>(&self, msg: &T) -> Result<BPosition, LogError>
     where
         T: for<'a> rkyv::Serialize<
@@ -482,5 +755,43 @@ impl PubHandle {
     {
         let bytes = codec::encode(msg)?;
         self.publish_bytes(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `TypedSubscription` decodes on read, off the Aeron thread. A
+    /// malformed frame is skipped, not surfaced as an error or an end of
+    /// stream, and the next well-formed frame still decodes. This needs
+    /// no Aeron media driver, unlike the rest of this module's behavior.
+    #[test]
+    fn typed_subscription_skips_a_malformed_frame_and_decodes_the_next() {
+        let (tx, rx) = unbounded_channel();
+        let mut sub: TypedSubscription<u64> = TypedSubscription::new(rx);
+
+        tx.send(RawFrame {
+            bytes: vec![0xFF; 3],
+            pos: BPosition::default(),
+            session: 0,
+        })
+        .unwrap();
+        tx.send(RawFrame {
+            bytes: codec::encode(&42u64).unwrap().to_vec(),
+            pos: BPosition::default(),
+            session: 0,
+        })
+        .unwrap();
+
+        let (pos, v) = sub
+            .try_recv()
+            .expect("skips the malformed frame, decodes the next");
+        assert_eq!(v, 42);
+        assert_eq!(pos, BPosition::default());
+        assert!(
+            sub.try_recv().is_none(),
+            "only one well-formed frame was sent"
+        );
     }
 }

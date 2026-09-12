@@ -4,10 +4,10 @@
 //! [`kardamom_log::aeron_live`] adapters, and measures:
 //!
 //!   - throughput: sustained transactions per second, over the
-//!     publish-to-subscribe round trip on tx_data.
+//!     publish-to-subscribe round trip on `tx_data`.
 //!   - latency (p50, p99, p999): from `eth_sendRawTransaction` (modeled as
-//!     "publish onto tx_data") to a receipt on tx_receipts, captured with
-//!     `hdrhistogram` so the percentiles are exact, not sampled.
+//!     "publish onto `tx_data`") to a receipt on `tx_receipts`, captured
+//!     with `hdrhistogram` so the percentiles are exact, not sampled.
 //!
 //! This is gated behind `feature = "full-pipeline-e2e"` (the same flag as
 //! the test). Run it with:
@@ -21,11 +21,32 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
+/// Publish `batch` synthetic envelopes, each with a distinct correlation
+/// id, sender, and hash derived from its index.
+#[cfg(feature = "full-pipeline-e2e")]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "wrapping the per-message low byte past 255 is fine here"
+)]
+fn publish_batch(publisher: &kardamom_log::aeron_live::TxDataPublisherHandle, batch: usize) {
+    use alloy_primitives::{Address, B256};
+    use bytes::Bytes;
+    use kardamom_types::TxEnvelope;
+
+    for i in 0..batch {
+        let low_byte = i as u8;
+        let env = TxEnvelope {
+            correlation_id: i as u64,
+            raw_tx: Bytes::from(vec![0xCDu8; 96]),
+            sender: Address::repeat_byte(low_byte ^ 0xAB),
+            tx_hash: B256::repeat_byte(low_byte ^ 0x5A),
+        };
+        publisher.publish(&env).expect("publish");
+    }
+}
+
 #[cfg(feature = "full-pipeline-e2e")]
 fn run_e2e_throughput(c: &mut Criterion) {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use alloy_primitives::{Address, B256};
     use bytes::Bytes;
     use kardamom_log::aeron_live::{AeronRuntime, TxDataPublisherHandle, TxDataSubscriberHandle};
@@ -62,19 +83,20 @@ fn run_e2e_throughput(c: &mut Criterion) {
     // A background draining task. Without it, every batch fills the term
     // buffer, and the publisher hits back-pressure. It drains as fast as
     // the subscriber can deliver; the values do not matter here.
-    let drain_stop = Arc::new(AtomicBool::new(false));
-    let drain_stop_for_task = drain_stop.clone();
+    let (drain_stop_tx, mut drain_stop_rx) = tokio::sync::watch::channel(false);
     let drain_handle = std::thread::spawn(move || {
         let local_rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("drain runtime");
         local_rt.block_on(async move {
-            while !drain_stop_for_task.load(Ordering::Relaxed) {
-                match tokio::time::timeout(Duration::from_millis(50), subscriber.recv()).await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(_) => {}
+            loop {
+                tokio::select! {
+                    msg = subscriber.recv() => match msg {
+                        Some(_) => {}
+                        None => break,
+                    },
+                    _ = drain_stop_rx.changed() => break,
                 }
             }
         });
@@ -84,31 +106,22 @@ fn run_e2e_throughput(c: &mut Criterion) {
     for &batch in &[1usize, 64, 1024] {
         group.throughput(Throughput::Elements(batch as u64));
         group.bench_function(format!("batch={batch}"), |b| {
-            b.iter(|| {
-                for i in 0..batch {
-                    let env = TxEnvelope {
-                        correlation_id: i as u64,
-                        raw_tx: Bytes::from(vec![0xCDu8; 96]),
-                        sender: Address::repeat_byte((i as u8) ^ 0xAB),
-                        tx_hash: B256::repeat_byte((i as u8) ^ 0x5A),
-                    };
-                    publisher.publish(&env).expect("publish");
-                }
-            });
+            b.iter(|| publish_batch(&publisher, batch));
         });
     }
     group.finish();
 
-    drain_stop.store(true, Ordering::Relaxed);
+    let _ = drain_stop_tx.send(true);
     drain_handle.join().expect("drain join");
 
     let mut latency_cfg = cfg.clone();
     latency_cfg.channels.tx_data_channel_template =
         "aeron:ipc?alias=bench-tx-data-latency-{sid}".into();
     latency_cfg.channels.tx_data_stream_id_base = 9011;
-    let latency_pub = TxDataPublisherHandle::open(&aeron_rt, &latency_cfg.channels, sequencer_id)
-        .expect("latency publisher");
-    let mut latency_sub =
+    let latency_publisher =
+        TxDataPublisherHandle::open(&aeron_rt, &latency_cfg.channels, sequencer_id)
+            .expect("latency publisher");
+    let mut latency_subscriber =
         TxDataSubscriberHandle::open(&aeron_rt, &latency_cfg.channels, sequencer_id)
             .expect("latency subscriber");
 
@@ -121,9 +134,9 @@ fn run_e2e_throughput(c: &mut Criterion) {
                 sender: Address::ZERO,
                 tx_hash: B256::ZERO,
             };
-            latency_pub.publish(&env).expect("publish");
+            latency_publisher.publish(&env).expect("publish");
             rt.block_on(async {
-                let _ = tokio::time::timeout(Duration::from_secs(1), latency_sub.recv())
+                let _ = tokio::time::timeout(Duration::from_secs(1), latency_subscriber.recv())
                     .await
                     .expect("round-trip timed out")
                     .expect("subscriber closed");

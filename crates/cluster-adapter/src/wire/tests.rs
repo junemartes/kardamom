@@ -6,8 +6,11 @@
 use alloy_primitives::{Address, B256, U256};
 use kardamom_types::epoch::EpochRecord;
 use kardamom_types::xchain::{Callback, RemoteEpochRecord};
-use kardamom_types::{BPosition, Deposit, DepositRef, TxOrderingMessage, TxRef};
+use kardamom_types::{
+    BPosition, BlockBoundaryStart, Deposit, DepositRef, TxOrderingMessage, TxRef,
+};
 
+use super::ingress::decode_replay_request;
 use super::*;
 
 fn txref() -> TxRef {
@@ -32,7 +35,7 @@ fn depositref() -> DepositRef {
 }
 
 /// Ingress, then the service relays from the canonical ID, then egress,
-/// then decode: this reproduces the TxRef. The guard header is consumed,
+/// then decode: this reproduces the `TxRef`. The guard header is consumed,
 /// not relayed.
 #[test]
 fn txref_ingress_relay_egress_roundtrip() {
@@ -43,14 +46,14 @@ fn txref_ingress_relay_egress_roundtrip() {
     // Mirror the Java service: parse the id, relay from the canonical id.
     let (cid, relayed) = split_ingress(&ingress).unwrap();
     assert_eq!(cid, r.tx_hash.0);
-    let egress = encode_egress_record(5, relayed);
-    match decode_egress(&egress).unwrap() {
-        EgressItem::Record { index, msg } => {
-            assert_eq!(index, 5);
-            assert_eq!(msg, TxOrderingMessage::TxRef(r));
+    let egress = encode_egress_record(5, relayed).unwrap();
+    assert_eq!(
+        EgressItem::decode(&egress).unwrap(),
+        EgressItem::Record {
+            index: 5,
+            msg: TxOrderingMessage::TxRef(r)
         }
-        other => panic!("expected Record, got {other:?}"),
-    }
+    );
 }
 
 #[test]
@@ -61,27 +64,28 @@ fn depositref_ingress_relay_egress_roundtrip() {
     assert_eq!(ingress_sender_nonce(&ingress).unwrap(), (Address::ZERO, 0));
     let (cid, relayed) = split_ingress(&ingress).unwrap();
     assert_eq!(cid, r.source_hash.0);
-    let egress = encode_egress_record(8, relayed);
-    match decode_egress(&egress).unwrap() {
-        EgressItem::Record { index, msg } => {
-            assert_eq!(index, 8);
-            assert_eq!(msg, TxOrderingMessage::DepositRef(r));
+    let egress = encode_egress_record(8, relayed).unwrap();
+    assert_eq!(
+        EgressItem::decode(&egress).unwrap(),
+        EgressItem::Record {
+            index: 8,
+            msg: TxOrderingMessage::DepositRef(r)
         }
-        other => panic!("expected Record, got {other:?}"),
-    }
+    );
 }
 
 #[test]
 fn boundary_roundtrip() {
     let egress = encode_egress_boundary(12, 100, 1_700_000_000_250, 0);
-    match decode_egress(&egress).unwrap() {
-        EgressItem::Boundary(b) => {
-            assert_eq!(b.block_number, 12);
-            assert_eq!(b.end_tx_idx.as_index(), 100);
-            assert_eq!(b.l2_timestamp, 1_700_000_000_250);
-        }
-        other => panic!("expected Boundary, got {other:?}"),
-    }
+    assert_eq!(
+        EgressItem::decode(&egress).unwrap(),
+        EgressItem::Boundary(BlockBoundaryStart {
+            block_number: 12,
+            end_tx_idx: BPosition::from_index(100),
+            l2_timestamp: 1_700_000_000_250,
+            l1_origin: 0,
+        })
+    );
 }
 
 #[test]
@@ -106,13 +110,13 @@ fn ingress_layout_is_kind_sender_nonce_id_then_fields() {
 }
 
 fn remote_epoch() -> kardamom_types::xchain::RemoteEpochRecord {
-    use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
+    use kardamom_types::xchain::{NonEmptyVec, RemoteEpochRecord, XChainMessage};
     RemoteEpochRecord {
         origin_chain_id: 412_346,
         anchor_number: 0x0011_2233_4455_6677,
         anchor_hash: B256::repeat_byte(0x5A),
         first_seq: 9,
-        messages: vec![
+        messages: NonEmptyVec::new(
             XChainMessage {
                 source_hash: B256::repeat_byte(0xE1),
                 seq: 9,
@@ -123,17 +127,17 @@ fn remote_epoch() -> kardamom_types::xchain::RemoteEpochRecord {
                 input: (&[0xCAu8, 0xFE][..]).into(),
                 callback: None,
             },
-            XChainMessage {
+            vec![XChainMessage {
                 source_hash: B256::repeat_byte(0xE2),
                 seq: 10,
                 origin_sender: Address::repeat_byte(0xA1),
                 target: Address::repeat_byte(0xB3),
                 value: 5,
                 gas_limit: 100_000,
-                input: Default::default(),
+                input: (&[][..]).into(),
                 callback: None,
-            },
-        ],
+            }],
+        ),
     }
 }
 
@@ -209,15 +213,15 @@ fn remote_epoch_ingress_relay_egress_roundtrip() {
     relayed.extend_from_slice(&cid);
     relayed.extend_from_slice(&ingress[69..]);
 
-    match decode_egress(&encode_egress_record(11, &relayed)).unwrap() {
-        EgressItem::Record { index, msg } => {
-            assert_eq!(index, 11);
-            assert_eq!(msg, TxOrderingMessage::RemoteEpoch(rec.clone()));
-        }
-        other => panic!("expected Record, got {other:?}"),
-    }
     assert_eq!(
-        u32::from_le_bytes(ingress[49..53].try_into().unwrap()) as u64,
+        EgressItem::decode(&encode_egress_record(11, &relayed).unwrap()).unwrap(),
+        EgressItem::Record {
+            index: 11,
+            msg: TxOrderingMessage::RemoteEpoch(rec.clone())
+        }
+    );
+    assert_eq!(
+        u64::from(u32::from_le_bytes(ingress[49..53].try_into().unwrap())),
         remote_epoch_slots(&rec),
     );
 }
@@ -226,23 +230,19 @@ fn remote_epoch_ingress_relay_egress_roundtrip() {
 fn contiguity_reject_roundtrip() {
     let sender = Address::repeat_byte(0x99);
     let b = encode_contiguity_reject(sender, 12, 8);
-    match decode_egress(&b).unwrap() {
+    assert_eq!(
+        EgressItem::decode(&b).unwrap(),
         EgressItem::ContiguityReject {
-            sender: s,
-            nonce,
-            expected,
-        } => {
-            assert_eq!(s, sender);
-            assert_eq!(nonce, 12);
-            assert_eq!(expected, 8);
+            sender,
+            nonce: 12,
+            expected: 8,
         }
-        other => panic!("expected ContiguityReject, got {other:?}"),
-    }
+    );
 }
 
 /// The header anchor is bound by the canonical id. A relayed body whose
 /// anchor differs from the id the sealer deduped on is rejected by the
-/// consumer, so a forged header cannot poison a peer's lane (audit H3).
+/// consumer, so a forged header cannot poison a peer's lane.
 #[test]
 fn remote_epoch_body_anchor_is_bound_by_the_canonical_id() {
     let rec = remote_epoch();
@@ -255,14 +255,20 @@ fn remote_epoch_body_anchor_is_bound_by_the_canonical_id() {
     relayed.push(RT_REMOTE_EPOCH);
     relayed.extend_from_slice(&body);
     assert!(matches!(
-        decode_egress(&encode_egress_record(0, &relayed)),
+        EgressItem::decode(&encode_egress_record(0, &relayed).unwrap()),
         Err(WireError::BadRemoteEpoch(_))
     ));
 }
 
 #[test]
 fn remote_origin_reject_roundtrip() {
-    let b = encode_remote_origin_reject(412_346, 7, 5, REMOTE_ORIGIN_REJECT_SEQ_MISMATCH);
+    let b = RemoteOriginReject {
+        origin_chain_id: 412_346,
+        first_seq: 7,
+        expected_next_seq: 5,
+        reason: RemoteOriginRejectReason::SeqMismatch,
+    }
+    .encode();
     assert_eq!(b[0], EGRESS_KIND_REMOTE_ORIGIN_REJECT);
     assert_eq!(
         b[0], 6,
@@ -273,7 +279,7 @@ fn remote_origin_reject_roundtrip() {
     assert_eq!(u64::from_le_bytes(b[9..17].try_into().unwrap()), 7);
     assert_eq!(u64::from_le_bytes(b[17..25].try_into().unwrap()), 5);
     assert_eq!(b[25], 1);
-    match decode_egress(&b).unwrap() {
+    match EgressItem::decode(&b).unwrap() {
         EgressItem::RemoteOriginReject {
             origin_chain_id,
             first_seq,
@@ -283,16 +289,38 @@ fn remote_origin_reject_roundtrip() {
             assert_eq!(origin_chain_id, 412_346);
             assert_eq!(first_seq, 7);
             assert_eq!(expected_next_seq, 5);
-            assert_eq!(reason, REMOTE_ORIGIN_REJECT_SEQ_MISMATCH);
-            assert_eq!(remote_origin_reject_reason(reason), "seq_mismatch");
+            assert_eq!(reason, RemoteOriginRejectReason::SeqMismatch);
+            assert_eq!(reason.as_str(), "seq_mismatch");
         }
         other => panic!("expected RemoteOriginReject, got {other:?}"),
     }
     assert!(matches!(
-        decode_egress(&b[..25]),
+        EgressItem::decode(&b[..25]),
         Err(WireError::TooShort { at: 25, .. })
     ));
-    assert_eq!(remote_origin_reject_reason(0xFF), "unknown");
+}
+
+/// A reject reason byte a newer sealer added and this build does not name
+/// yet still decodes the whole frame, instead of failing it: the wire
+/// stays forward compatible.
+#[test]
+fn remote_origin_reject_unknown_reason_round_trips() {
+    let mut b = RemoteOriginReject {
+        origin_chain_id: 412_346,
+        first_seq: 7,
+        expected_next_seq: 5,
+        reason: RemoteOriginRejectReason::SeqMismatch,
+    }
+    .encode();
+    b[25] = 0xFF; // a code no named variant claims
+    match EgressItem::decode(&b).unwrap() {
+        EgressItem::RemoteOriginReject { reason, .. } => {
+            assert_eq!(reason, RemoteOriginRejectReason::Unknown(0xFF));
+            assert_eq!(reason.as_str(), "unknown");
+            assert_eq!(reason.to_u8(), 0xFF);
+        }
+        other => panic!("expected RemoteOriginReject, got {other:?}"),
+    }
 }
 
 #[test]
@@ -307,47 +335,58 @@ fn replay_request_roundtrip() {
 #[test]
 fn replay_unavailable_roundtrip() {
     let b = encode_replay_unavailable(100, 7);
-    match decode_egress(&b).unwrap() {
+    assert_eq!(
+        EgressItem::decode(&b).unwrap(),
         EgressItem::ReplayUnavailable {
-            oldest_index,
-            oldest_block,
-        } => {
-            assert_eq!(oldest_index, 100);
-            assert_eq!(oldest_block, 7);
+            oldest_index: 100,
+            oldest_block: 7,
         }
-        other => panic!("expected ReplayUnavailable, got {other:?}"),
-    }
+    );
 }
 
 #[test]
 fn bad_kind_and_record_type_error() {
-    assert_eq!(decode_egress(&[9, 0, 0]), Err(WireError::BadEgressKind(9)));
+    assert_eq!(
+        EgressItem::decode(&[9, 0, 0]),
+        Err(WireError::BadEgressKind(9))
+    );
     // A relayed payload with an unknown record type.
     let mut payload = vec![0u8; 32];
     payload.push(7); // record_type 7
-    let egress = encode_egress_record(0, &payload);
-    assert_eq!(decode_egress(&egress), Err(WireError::BadRecordType(7)));
+    let egress = encode_egress_record(0, &payload).unwrap();
+    assert_eq!(
+        EgressItem::decode(&egress),
+        Err(WireError::BadRecordType(7))
+    );
 }
 
 #[test]
 fn truncated_egress_errors_cleanly() {
     assert!(matches!(
-        decode_egress(&[EGRESS_KIND_RELAYED, 0, 0]),
+        EgressItem::decode(&[EGRESS_KIND_RELAYED, 0, 0]),
         Err(WireError::TooShort { .. })
     ));
-    assert!(decode_egress(&[]).is_err());
+    assert!(EgressItem::decode(&[]).is_err());
 }
 
 /// A remote epoch whose first message carries a callback: the `Some` arm of
 /// the archived `Option<Callback>`, which no other wire test covers.
 fn remote_epoch_with_callback() -> RemoteEpochRecord {
-    let mut rec = remote_epoch();
-    rec.messages[0].callback = Some(Callback {
+    let rec = remote_epoch();
+    // `NonEmptyVec` has no mutable indexing (nothing that reads one needs
+    // to check its length, so nothing writes into it either); rebuild the
+    // first message with a callback instead of mutating in place.
+    let mut first = rec.messages.first().clone();
+    first.callback = Some(Callback {
         target: Address::repeat_byte(0xC1),
         gas_limit: 90_000,
         context: B256::repeat_byte(0xC2),
     });
-    rec
+    let rest = rec.messages.iter().skip(1).cloned().collect();
+    RemoteEpochRecord {
+        messages: kardamom_types::xchain::NonEmptyVec::new(first, rest),
+        ..rec
+    }
 }
 
 /// An L1 epoch with one deposit: the archived `Deposit` carries a `u128`
@@ -379,28 +418,30 @@ fn relay_origin_record(ingress: &[u8], header_len: usize) -> Vec<u8> {
 }
 
 fn decode_record(buf: &[u8]) -> TxOrderingMessage {
-    match decode_egress(buf).unwrap() {
+    match EgressItem::decode(buf).unwrap() {
         EgressItem::Record { msg, .. } => msg,
         other => panic!("expected Record, got {other:?}"),
     }
 }
 
 /// The decoder copies each rkyv body into a 16-aligned buffer before it
-/// reads it (audit 2026-09-03, L2). This test walks the input through every
-/// offset mod 16, so the decode never depends on where the allocator placed
-/// the frame. Both epoch kinds carry a `u128`-bearing archived type.
+/// reads it. This test walks the input through every offset mod 16, so the
+/// decode never depends on where the allocator placed the frame. Both
+/// epoch kinds carry a `u128`-bearing archived type.
 #[test]
 fn epoch_bodies_decode_from_every_input_offset() {
     let remote = remote_epoch_with_callback();
     let remote_frame = encode_egress_record(
         1,
         &relay_origin_record(&encode_ingress_remote_epoch(&remote).unwrap(), 36),
-    );
+    )
+    .unwrap();
     let epoch = epoch_with_deposit();
     let epoch_frame = encode_egress_record(
         2,
         &relay_origin_record(&encode_ingress_epoch(&epoch).unwrap(), 12),
-    );
+    )
+    .unwrap();
 
     for shift in 0..16usize {
         let mut buf = vec![0u8; shift];

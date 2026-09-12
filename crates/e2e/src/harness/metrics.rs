@@ -7,43 +7,48 @@
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 /// One scraped /metrics body.
-pub struct Scrape(pub String);
+pub struct Scrape(String);
 
 impl Scrape {
     /// Sum every sample of `name` across label sets. Returns `None` when
     /// the metric is absent, which differs from a genuine 0 sample.
+    #[must_use]
     pub fn value(&self, name: &str) -> Option<f64> {
-        let mut found = false;
-        let mut sum = 0.0;
-        for line in self.0.lines() {
-            if line.starts_with('#') || !line.starts_with(name) {
-                continue;
-            }
-            // This is an exact-name match. The next character must end the
-            // metric name (a label block or a sample separator), so `foo`
-            // never matches `foo_total`.
-            let rest = &line[name.len()..];
-            if !(rest.starts_with('{') || rest.starts_with(' ')) {
-                continue;
-            }
-            if let Some(v) = line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()) {
-                found = true;
-                sum += v;
-            }
-        }
-        found.then_some(sum)
+        self.0
+            .lines()
+            .filter(|line| !line.starts_with('#') && line.starts_with(name))
+            .filter_map(|line| {
+                // This is an exact-name match. The next character must end
+                // the metric name (a label block or a sample separator), so
+                // `foo` never matches `foo_total`.
+                let rest = &line[name.len()..];
+                if !(rest.starts_with('{') || rest.starts_with(' ')) {
+                    return None;
+                }
+                line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok())
+            })
+            .reduce(|a, b| a + b)
     }
 }
 
 /// Scrape `http://addr/metrics` with a plain HTTP/1.0 GET. This needs no
 /// client library: the exporter answers with a non-chunked HTTP/1.0 body
 /// and closes the connection.
-pub fn scrape_blocking(addr: SocketAddr, timeout: Duration) -> Result<Scrape> {
+///
+/// # Errors
+/// Returns an error when the connection fails, when a read or write times
+/// out, when the response is not valid UTF-8, when the response has no
+/// header/body separator, or when the status line is not `200`. A caller
+/// depends on this: `*_metric_opt`'s `Ok(None)` means the scrape
+/// succeeded and the counter is genuinely absent, so any other failure
+/// (a dead port, an unregistered exporter, a non-metrics server on that
+/// port) must surface as `Err`, not as an empty or partial body.
+fn scrape_blocking(addr: SocketAddr, timeout: Duration) -> Result<Scrape> {
     let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)
         .with_context(|| format!("connect {addr}"))?;
     stream.set_read_timeout(Some(timeout))?;
@@ -55,14 +60,25 @@ pub fn scrape_blocking(addr: SocketAddr, timeout: Duration) -> Result<Scrape> {
     stream
         .read_to_string(&mut buf)
         .context("read scrape response")?;
-    let body = buf
+    let (head, body) = buf
         .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_string())
-        .unwrap_or(buf);
-    Ok(Scrape(body))
+        .with_context(|| format!("{addr}: scrape response has no header/body separator"))?;
+    let status_line = head
+        .lines()
+        .next()
+        .with_context(|| format!("{addr}: scrape response has no status line"))?;
+    anyhow::ensure!(
+        status_line.split_whitespace().nth(1) == Some("200"),
+        "{addr}: scrape returned {status_line:?}, not 200 OK"
+    );
+    Ok(Scrape(body.to_string()))
 }
 
 /// Async wrapper for [`scrape_blocking`].
+///
+/// # Errors
+/// Returns an error under the same conditions as [`scrape_blocking`], or
+/// when the blocking task panics or is cancelled.
 pub async fn scrape(addr: SocketAddr) -> Result<Scrape> {
     tokio::task::spawn_blocking(move || scrape_blocking(addr, Duration::from_secs(5)))
         .await
@@ -72,24 +88,24 @@ pub async fn scrape(addr: SocketAddr) -> Result<Scrape> {
 /// Poll `f` every `interval` until it returns `Some(v)`, or until
 /// `timeout` passes. On timeout, this fails with `what` as the message.
 /// Callers should put context in `what`.
-pub async fn poll_until<T, F, Fut>(
-    what: &str,
-    timeout: Duration,
-    interval: Duration,
-    mut f: F,
-) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<Option<T>>>,
-{
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(v) = f().await? {
-            return Ok(v);
-        }
-        if Instant::now() >= deadline {
-            anyhow::bail!("timed out ({timeout:?}) waiting for {what}");
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
+///
+/// Re-exported from [`kardamom_obs::testkit`], the shared home for this
+/// helper across the workspace.
+///
+/// # Errors
+/// Returns an error when `f` itself errors, or when `timeout` passes
+/// before `f` returns `Some(v)`.
+pub use kardamom_obs::testkit::poll_until;
+
+/// Blocking analog of [`poll_until`], for code that runs off the tokio
+/// runtime (a spawned OS thread, or a sync bring-up path). Poll `f` every
+/// `interval` until it returns `Some(v)`, or until `timeout` passes. On
+/// timeout, this fails with `what` as the message.
+///
+/// Re-exported from [`kardamom_obs::testkit`], the shared home for this
+/// helper across the workspace.
+///
+/// # Errors
+/// Returns an error when `f` itself errors, or when `timeout` passes
+/// before `f` returns `Some(v)`.
+pub use kardamom_obs::testkit::poll_sync;

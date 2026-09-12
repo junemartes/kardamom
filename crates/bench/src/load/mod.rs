@@ -15,29 +15,33 @@
 pub mod accounting;
 pub mod config;
 pub mod defi;
-pub mod engine;
+pub(crate) mod engine;
 mod feed;
 pub mod plan;
-pub mod scrape;
+pub(crate) mod scrape;
 mod tracker;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alloy_primitives::{Address, U256};
-use jsonrpsee::core::client::ClientT;
-use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use jsonrpsee::rpc_params;
+use alloy_primitives::Address;
+use jsonrpsee::http_client::HttpClient;
 use tokio::sync::Semaphore;
 
-use crate::config::{MAX_IN_FLIGHT_SLACK, REQUEST_TIMEOUT};
+use crate::config::{preflight_chain_id, rpc_client};
 use crate::load::accounting::{EvalInput, evaluate, print_report, step_gap_ok, step_seq_clean};
-use crate::load::engine::{Queues, SubmitMode, Tracker, drain, join_submit_tasks, pacer};
+use crate::load::engine::{
+    Queues, RunHandles, SubmitMode, SubmitOpts, Tracker, join_submit_tasks, pacer,
+};
 use crate::load::feed::receipt_feed_task;
-use crate::load::scrape::Scraper;
+use crate::load::plan::{PlannedTx, TxPlanParams};
+use crate::load::scrape::{MetricsSnapshot, Scraper};
+use crate::signers::{DerivedSigner, SignerSet};
 
-pub use config::{ANVIL_MNEMONIC, Completeness, LoadConfig, LoadReport, RampStep, Workload};
+pub use config::{
+    ANVIL_MNEMONIC, Completeness, LoadConfig, LoadReport, RampStep, SenderRange, Workload,
+};
 
 /// Parse a `0x`-prefixed JSON-RPC hex quantity into a `u64`.
 pub(crate) fn hex_u64(s: &str) -> Option<u64> {
@@ -48,17 +52,6 @@ pub(crate) fn hex_u64(s: &str) -> Option<u64> {
 /// missing, or non-string value.
 pub(crate) fn json_hex_u64(v: &serde_json::Value) -> Option<u64> {
     v.as_str().and_then(hex_u64)
-}
-
-async fn preflight_chain_id(client: &HttpClient) -> anyhow::Result<u64> {
-    let v: U256 = client
-        .request("eth_chainId", rpc_params![])
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!("eth_chainId failed (is ingress up at the --rpc url?): {e}")
-        })?;
-    v.try_into()
-        .map_err(|e| anyhow::anyhow!("chain_id overflow: {e}"))
 }
 
 fn build_scraper(cfg: &LoadConfig) -> Scraper {
@@ -75,20 +68,330 @@ fn build_scraper(cfg: &LoadConfig) -> Scraper {
     }
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn per_sender_estimate(cfg: &LoadConfig) -> usize {
-    let ramp_steps = if cfg.chaos_mode || cfg.fixed_rate {
-        0
-    } else {
-        u64::from(cfg.target_tps.div_ceil(cfg.ramp_step_tps.max(1)))
+/// [`LoadConfig::build_queues`]'s result: the presigned per-sender
+/// submit queues, plus any `DeFi` deployment transactions to land
+/// first.
+struct BuiltQueues {
+    queues: Queues,
+    defi_deploys: Option<Vec<PlannedTx>>,
+}
+
+impl LoadConfig {
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "an estimated queue depth stays far under usize::MAX for any run this harness drives"
+    )]
+    fn per_sender_estimate(&self) -> usize {
+        let ramp_steps = if self.chaos_mode || self.fixed_rate {
+            0
+        } else {
+            u64::from(self.target_tps.get().div_ceil(self.ramp_step_tps.get()))
+        };
+        let total_secs = ramp_steps
+            .saturating_mul(self.ramp_step_secs.get())
+            .saturating_add(self.duration.as_secs());
+        let est_total = u64::from(self.target_tps.get()).saturating_mul(total_secs);
+        ((est_total as f64 * 1.2 / f64::from(self.sender_range.count().get())).ceil() as usize)
+            .saturating_add(64)
+    }
+
+    /// Build the presigned per-sender queues for `self.workload`, and
+    /// the `DeFi` deployment transactions to land first, if the
+    /// workload needs them.
+    fn build_queues(
+        &self,
+        signers: &SignerSet,
+        chain_id: u64,
+        per_sender: usize,
+    ) -> anyhow::Result<BuiltQueues> {
+        let plan_params = TxPlanParams {
+            chain_id,
+            nonce_start: self.nonce_start,
+            gas_price: self.gas_price,
+        };
+        let (queues_vec, defi_deploys) = match self.workload {
+            Workload::Transfers => (
+                plan::pregenerate(signers, self.to, self.value, per_sender, plan_params)?,
+                None,
+            ),
+            Workload::Defi => {
+                let dep = defi::deployment_txs(signers, plan_params)?;
+                tracing::info!(
+                    pool = %dep.contracts.pool,
+                    vault = %dep.contracts.vault,
+                    clob = %dep.contracts.clob,
+                    "defi workload: deploying bench contracts"
+                );
+                let queues =
+                    defi::pregenerate_defi(signers, &dep.contracts, per_sender, plan_params)?;
+                (queues, Some(dep.txs))
+            }
+        };
+        Ok(BuiltQueues {
+            queues: Queues::new(queues_vec),
+            defi_deploys,
+        })
+    }
+}
+
+/// The result of [`LoadRun::spawn_receipt_feed`].
+struct ReceiptFeed {
+    /// Whether the pacer should trust the feed instead of a
+    /// per-transaction re-fetch.
+    confirm: bool,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// The result of `settle_and_snapshot`.
+struct Settled {
+    fin: MetricsSnapshot,
+    recheck: Option<MetricsSnapshot>,
+}
+
+/// One run's config, handles, and tracker: the settle, report-building,
+/// and ramp steps at the end of [`run`] are methods on this struct.
+struct LoadRun<'a> {
+    cfg: &'a LoadConfig,
+    tracker: &'a Arc<Tracker>,
+    client: &'a Arc<HttpClient>,
+    scraper: &'a Scraper,
+}
+
+impl LoadRun<'_> {
+    /// Start the receipt feed, if the mode needs it: subscribe mode
+    /// always needs it, and blocking mode needs it only when
+    /// `feed_confirm` replaces the per-transaction re-fetch. Returns
+    /// whether the pacer should trust the feed (`feed_confirm`)
+    /// alongside its handle.
+    ///
+    /// Receipts arrive on one multiplexed WebSocket feed, filtered to
+    /// this run's senders. In subscribe mode, this replaces each
+    /// submit's parked connection. In blocking mode (`feed_confirm`),
+    /// it replaces a per-transaction re-fetch after each accepted
+    /// submit. The feed runs for the whole ramp and soak, and stops
+    /// after the drain.
+    fn spawn_receipt_feed(&self, signers: &[DerivedSigner]) -> ReceiptFeed {
+        let confirm = self.cfg.feed_confirm_on();
+        let task = if self.cfg.subscribe || confirm {
+            let ws_url = self.cfg.rpc.replacen("http", "ws", 1);
+            let addrs: Vec<Address> = signers.iter().map(|s| s.address).collect();
+            Some(tokio::spawn(receipt_feed_task(
+                ws_url,
+                addrs,
+                Arc::clone(self.tracker),
+            )))
+        } else {
+            None
+        };
+        ReceiptFeed { confirm, task }
+    }
+
+    /// After the soak or fixed-rate phase ends: join every in-flight
+    /// submit task, drain unconfirmed receipts to the drain timeout's
+    /// tail, stop the feed and sweeper, then snapshot metrics after a
+    /// short settle time.
+    ///
+    /// A chaos-restarted executor's block gauge resets to 0, so
+    /// `final - base` can be zero or negative while it is replaying in a
+    /// healthy way. In chaos mode, take a recheck sample a few seconds
+    /// later, so `evaluate` can tell RECOVERING, where the gauge moves
+    /// again, from FROZEN.
+    async fn settle_and_snapshot(
+        &self,
+        tasks: &mut tokio::task::JoinSet<()>,
+        feed: Option<tokio::task::JoinHandle<()>>,
+        sweeper: Option<tokio::task::JoinHandle<()>>,
+    ) -> Settled {
+        let deadline = Instant::now() + self.cfg.drain_timeout;
+        join_submit_tasks(tasks, deadline).await;
+        engine::Drainer::new(Arc::clone(self.client), Arc::clone(self.tracker))
+            .drain(deadline)
+            .await;
+        if let Some(feed) = feed {
+            feed.abort();
+        }
+        if let Some(sweeper) = sweeper {
+            sweeper.abort();
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let fin = self.scraper.snapshot().await;
+        let recheck = if self.cfg.chaos_mode {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Some(self.scraper.snapshot().await)
+        } else {
+            None
+        };
+        Settled { fin, recheck }
+    }
+
+    /// Build the verdict from the tracker's final counts and the
+    /// metric snapshots taken before and after the soak.
+    fn build_verdict(
+        &self,
+        base: &MetricsSnapshot,
+        fin: &MetricsSnapshot,
+        recheck: Option<&MetricsSnapshot>,
+    ) -> accounting::Verdict {
+        let counts = self.tracker.counts();
+        let pending = self.tracker.remaining_pending();
+        // `sample_pending` reads the same map `pending`'s counts came
+        // from, so it yields nothing when there is nothing left
+        // pending: no separate empty check is needed here.
+        self.tracker.sample_pending(32).into_iter().for_each(|s| {
+            tracing::warn!(
+                hash = %s.hash,
+                accepted = s.accepted,
+                age_secs = s.age.as_secs(),
+                "UNRESOLVED pending tx (forensics: query per replica)"
+            );
+        });
+        // In `Offered` mode, an unlanded transaction, one that was
+        // offered but never receipted, is also a must-deliver
+        // violation. Fold it into `missing` for the gate.
+        let missing_gate = if self.cfg.completeness == Completeness::Offered {
+            pending.missing + pending.unlanded
+        } else {
+            pending.missing
+        };
+        evaluate(&EvalInput {
+            counts,
+            missing: missing_gate,
+            unlanded: pending.unlanded,
+            base,
+            fin,
+            recheck,
+            max_gap: self.cfg.max_gap,
+            assert_all_delivered: self.cfg.assert_all_delivered,
+            ack_proves_receipt: !self.cfg.subscribe,
+            chaos_mode: self.cfg.chaos_mode,
+        })
+    }
+
+    /// Assemble the final [`LoadReport`] from the run's timing, the
+    /// tracker's latency percentiles and gas total, and the verdict.
+    fn build_report(
+        &self,
+        verdict: accounting::Verdict,
+        ramp: Vec<RampStep>,
+        discovered_max: u32,
+        soak_rate: u32,
+    ) -> LoadReport {
+        let lat = self.tracker.latency_us();
+        LoadReport {
+            mode: if self.cfg.chaos_mode {
+                "chaos"
+            } else if self.cfg.fixed_rate {
+                "fixed"
+            } else {
+                "soak"
+            }
+            .to_string(),
+            target_tps: self.cfg.target_tps.get(),
+            discovered_max_tps: discovered_max,
+            soak_rate_tps: soak_rate,
+            duration_secs: self.cfg.duration.as_secs_f64(),
+            ramp,
+            lat_p50_us: lat.p50,
+            lat_p95_us: lat.p95,
+            lat_p99_us: lat.p99,
+            lat_max_us: lat.max,
+            total_gas: self.tracker.total_gas(),
+            workload: self.cfg.workload.to_string(),
+            verdict,
+        }
+    }
+
+    /// Write the report as pretty JSON to `cfg.output`, if set.
+    fn write_report_json(&self, report: &LoadReport) -> anyhow::Result<()> {
+        let Some(path) = &self.cfg.output else {
+            return Ok(());
+        };
+        crate::report::write_json_pretty(path, report)?;
+        tracing::info!("wrote report to {}", path.display());
+        Ok(())
+    }
+
+    /// Ramp `handles`/`queues` up in `self.cfg.ramp_step_tps`
+    /// increments, appending each step's record to `ramp`, and return
+    /// the highest sustainable rate found.
+    async fn ramp_to_max(
+        &self,
+        handles: &RunHandles,
+        tasks: &mut tokio::task::JoinSet<()>,
+        queues: &mut Queues,
+        ramp: &mut Vec<RampStep>,
+    ) -> std::num::NonZeroU32 {
+        let mut run = RampRun {
+            cfg: self.cfg,
+            handles,
+            tasks,
+            scraper: self.scraper,
+            queues,
+            ramp,
+            mode: self.cfg.submit_mode(),
+            step_dur: Duration::from_secs(self.cfg.ramp_step_secs.get()),
+        };
+        let mut discovered: Option<std::num::NonZeroU32> = None;
+        let mut rate = self.cfg.ramp_step_tps;
+        while rate.get() <= self.cfg.target_tps.get() {
+            let Some(next) = run.ramp_step(rate).await else {
+                break;
+            };
+            (discovered, rate) = (Some(rate), next);
+        }
+        // No step ran (the first step size already exceeds
+        // `target_tps`), or none was sustainable: fall back to the
+        // smallest step size.
+        discovered.unwrap_or(self.cfg.ramp_step_tps)
+    }
+}
+
+/// What `run` needs before the ramp and soak: a connected client, the
+/// validated sender set, and the pre-signed submit queues, with any
+/// `DeFi` setup already landed.
+struct RunSetup {
+    client: Arc<HttpClient>,
+    signers: SignerSet,
+    queues: Queues,
+}
+
+/// Connect, derive signers, pre-generate the submit queues, and land
+/// any `DeFi` setup transactions before any load starts. Every
+/// workload call targets their computed addresses; a call that
+/// arrives before its contract exists would revert and spoil the
+/// verdict.
+async fn prepare_run(cfg: &LoadConfig) -> anyhow::Result<RunSetup> {
+    let client = Arc::new(rpc_client(&cfg.rpc, cfg.max_in_flight.get())?);
+
+    let chain_id = match cfg.chain_id {
+        Some(c) => c,
+        None => preflight_chain_id(&client).await?,
     };
-    let total_secs = ramp_steps * cfg.ramp_step_secs + cfg.duration.as_secs();
-    let est_total = u64::from(cfg.target_tps) * total_secs;
-    ((est_total as f64 * 1.2 / f64::from(cfg.senders.max(1))).ceil() as usize) + 64
+
+    let signers = crate::mnemonic::derive_signers(&cfg.mnemonic, cfg.sender_range.derive_count())?;
+    let signers = SignerSet::new(signers[cfg.sender_range.offset() as usize..].to_vec())?;
+
+    let per_sender = cfg.per_sender_estimate();
+    tracing::info!(
+        senders = cfg.sender_range.count(),
+        per_sender,
+        target_tps = cfg.target_tps.get(),
+        chaos = cfg.chaos_mode,
+        "kardamom-load: pre-generating {} txs",
+        per_sender.saturating_mul(signers.len())
+    );
+    let built = cfg.build_queues(&signers, chain_id, per_sender)?;
+    if let Some(deploys) = built.defi_deploys {
+        defi::deploy_and_confirm(&client, &deploys).await?;
+    }
+
+    Ok(RunSetup {
+        client,
+        signers,
+        queues: built.queues,
+    })
 }
 
 /// Run the harness. Returns whether the verdict passed.
@@ -99,105 +402,39 @@ fn per_sender_estimate(cfg: &LoadConfig) -> usize {
 /// failing verdict is not an error: this function returns `Ok(false)`
 /// so the caller can choose the exit code.
 pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
-    let client = Arc::new(
-        HttpClientBuilder::default()
-            .request_timeout(REQUEST_TIMEOUT)
-            .max_concurrent_requests(cfg.max_in_flight as usize + MAX_IN_FLIGHT_SLACK)
-            .build(&cfg.rpc)?,
-    );
-
-    let chain_id = match cfg.chain_id {
-        Some(c) => c,
-        None => preflight_chain_id(&client).await?,
-    };
-
-    let signers = crate::mnemonic::derive_signers(&cfg.mnemonic, cfg.sender_offset + cfg.senders)?;
-    let signers = &signers[cfg.sender_offset as usize..];
-
-    let per_sender = per_sender_estimate(&cfg);
-    tracing::info!(
-        senders = cfg.senders,
-        per_sender,
-        target_tps = cfg.target_tps,
-        chaos = cfg.chaos_mode,
-        "kardamom-load: pre-generating {} txs",
-        per_sender * signers.len()
-    );
-    let (queues_vec, defi_deploys) = match cfg.workload {
-        Workload::Transfers => (
-            plan::pregenerate(
-                signers,
-                chain_id,
-                cfg.to,
-                cfg.value,
-                per_sender,
-                cfg.nonce_start,
-                cfg.gas_price,
-            )?,
-            None,
-        ),
-        Workload::Defi => {
-            let (deploys, contracts) =
-                defi::deployment_txs(signers, chain_id, cfg.nonce_start, cfg.gas_price)?;
-            tracing::info!(
-                pool = %contracts.pool,
-                vault = %contracts.vault,
-                clob = %contracts.clob,
-                "defi workload: deploying bench contracts"
-            );
-            let queues = defi::pregenerate_defi(
-                signers,
-                chain_id,
-                &contracts,
-                per_sender,
-                cfg.nonce_start,
-                cfg.gas_price,
-            )?;
-            (queues, Some(deploys))
-        }
-    };
-    let mut queues = Queues::new(queues_vec);
-
-    // DeFi setup: land the three deployments before any load starts.
-    // Every workload call targets their computed addresses. A call
-    // that arrives before its contract exists would revert and
-    // spoil the verdict.
-    if let Some(deploys) = defi_deploys {
-        defi::deploy_and_confirm(&client, &deploys).await?;
-    }
+    let RunSetup {
+        client,
+        signers,
+        mut queues,
+    } = prepare_run(&cfg).await?;
 
     let scraper = build_scraper(&cfg);
     let tracker = Arc::new(Tracker::new()?);
-    let sem = Arc::new(Semaphore::new(cfg.max_in_flight.max(1) as usize));
+    let sem = Arc::new(Semaphore::new(cfg.max_in_flight.get() as usize));
+    let handles = RunHandles {
+        client: Arc::clone(&client),
+        sem: Arc::clone(&sem),
+        tracker: Arc::clone(&tracker),
+    };
     let mut tasks = tokio::task::JoinSet::new();
     // Outside chaos mode, the ingress receipt cache is stable, with no
     // restarts. So an accepted transaction whose receipt cannot be
     // re-fetched is a real must-deliver violation, not restart noise.
     // Verify it independently.
     let verify_receipts = !cfg.chaos_mode;
-    let mode = if cfg.subscribe {
-        SubmitMode::Subscribe
-    } else {
-        SubmitMode::Blocking
+    let mode = cfg.submit_mode();
+
+    let run = LoadRun {
+        cfg: &cfg,
+        tracker: &tracker,
+        client: &client,
+        scraper: &scraper,
     };
 
-    // Receipts arrive on one multiplexed WebSocket feed, filtered to this
-    // run's senders. In subscribe mode, this replaces each submit's
-    // parked connection. In blocking mode (feed_confirm), it replaces a
-    // per-transaction re-fetch after each accepted submit. The feed runs
-    // for the whole ramp and soak, and stops after the drain.
-    let feed_confirm = cfg.feed_confirm && !cfg.subscribe;
-    let feed = if cfg.subscribe || feed_confirm {
-        let ws_url = cfg.rpc.replacen("http", "ws", 1);
-        let addrs: Vec<Address> = signers.iter().map(|s| s.address).collect();
-        Some(tokio::spawn(receipt_feed_task(
-            ws_url,
-            addrs,
-            Arc::clone(&tracker),
-        )))
-    } else {
-        None
-    };
+    let ReceiptFeed {
+        confirm: feed_confirm,
+        task: feed,
+    } = run.spawn_receipt_feed(&signers);
     // Back up the feed with a live sweeper. An entry the feed misses is
     // re-fetched within 2 to 7 seconds, instead of waiting for the
     // end-of-run drain. Keep this cadence well inside the ingress receipt
@@ -205,205 +442,112 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     // 4,800 tx/s with the default 128k capacity). Eviction order is
     // arbitrary, so a late poll can miss even a younger entry.
     let sweeper = feed.as_ref().map(|_| {
-        engine::spawn_pending_sweeper(
+        Arc::new(engine::Drainer::new(
             Arc::clone(&client),
             Arc::clone(&tracker),
-            Duration::from_secs(5),
-            Duration::from_secs(2),
-        )
+        ))
+        .spawn_pending_sweeper(Duration::from_secs(5), Duration::from_secs(2))
     });
 
     // --- ramp (soak mode only) -------------------------------------------
     let mut ramp = Vec::new();
-    let discovered_max = if cfg.chaos_mode || cfg.fixed_rate {
+    let discovered_max: std::num::NonZeroU32 = if cfg.chaos_mode || cfg.fixed_rate {
         cfg.target_tps
     } else {
-        ramp_to_max(
-            &cfg,
-            &client,
-            &sem,
-            &tracker,
-            &mut tasks,
-            &scraper,
-            &mut queues,
-            &mut ramp,
-        )
-        .await
+        run.ramp_to_max(&handles, &mut tasks, &mut queues, &mut ramp)
+            .await
     };
 
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
+        clippy::cast_sign_loss,
+        reason = "a discovered tx/s rate stays far under i64::MAX, rounded for the soak target"
     )]
-    let soak_rate = if cfg.chaos_mode || cfg.fixed_rate {
+    let soak_rate: std::num::NonZeroU32 = if cfg.chaos_mode || cfg.fixed_rate {
         cfg.target_tps
     } else {
-        ((f64::from(discovered_max) * cfg.soak_fraction).round() as u32)
-            .clamp(1, cfg.target_tps.max(1))
+        let rate = ((f64::from(discovered_max.get()) * cfg.soak_fraction).round() as u32)
+            .clamp(1, cfg.target_tps.get());
+        std::num::NonZeroU32::new(rate)
+            .ok_or_else(|| anyhow::anyhow!("discovered soak rate rounds to zero"))?
     };
 
     // --- soak ------------------------------------------------------------
-    tracing::info!(soak_rate, discovered_max, "kardamom-load: soaking");
+    tracing::info!(
+        soak_rate = soak_rate.get(),
+        discovered_max = discovered_max.get(),
+        "kardamom-load: soaking"
+    );
     let base = scraper.snapshot().await;
     pacer(
-        Arc::clone(&client),
-        Arc::clone(&sem),
-        Arc::clone(&tracker),
+        &handles,
         &mut tasks,
         &mut queues,
         soak_rate,
         cfg.duration,
-        cfg.retry_submit,
-        verify_receipts,
-        mode,
-        feed_confirm,
+        SubmitOpts {
+            retry: cfg.retry_submit,
+            verify_receipts,
+            mode,
+            feed_confirm,
+        },
     )
     .await;
 
-    // Join the in-flight submit tasks, so the tail is classified and not
-    // left as merely "offered". Then drain the receipt tail, and wait a
-    // short settle time before the final read.
-    let deadline = Instant::now() + cfg.drain_timeout;
-    join_submit_tasks(&mut tasks, deadline).await;
-    drain(Arc::clone(&client), Arc::clone(&tracker), deadline).await;
-    if let Some(feed) = feed {
-        feed.abort();
-    }
-    if let Some(sweeper) = sweeper {
-        sweeper.abort();
-    }
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let fin = scraper.snapshot().await;
-    // A chaos-restarted executor's block gauge resets to 0. So
-    // `final - base` can be zero or negative while it is replaying in a
-    // healthy way. Take a recheck sample a few seconds later, so
-    // `evaluate` can tell RECOVERING, where the gauge moves again, from
-    // FROZEN.
-    let recheck = if cfg.chaos_mode {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        Some(scraper.snapshot().await)
-    } else {
-        None
-    };
+    let settled = run.settle_and_snapshot(&mut tasks, feed, sweeper).await;
 
-    // --- verdict ---------------------------------------------------------
-    let counts = tracker.counts();
-    let (missing, unlanded) = tracker.remaining_pending();
-    if missing + unlanded > 0 {
-        for (hash, accepted, age) in tracker.sample_pending(32) {
-            tracing::warn!(
-                %hash,
-                accepted,
-                age_secs = age.as_secs(),
-                "UNRESOLVED pending tx (forensics: query per replica)"
-            );
-        }
-    }
-    // In `Offered` mode, an unlanded transaction, one that was offered but
-    // never receipted, is also a must-deliver violation. Fold it into
-    // `missing` for the gate.
-    let missing_gate = if cfg.completeness == Completeness::Offered {
-        missing + unlanded
-    } else {
-        missing
-    };
-    let verdict = evaluate(&EvalInput {
-        counts,
-        missing: missing_gate,
-        unlanded,
-        base: &base,
-        fin: &fin,
-        recheck: recheck.as_ref(),
-        max_gap: cfg.max_gap,
-        assert_all_delivered: cfg.assert_all_delivered,
-        ack_proves_receipt: !cfg.subscribe,
-        chaos_mode: cfg.chaos_mode,
-    });
-    let (p50, p95, p99, max) = tracker.latency_us();
-
-    let report = LoadReport {
-        mode: if cfg.chaos_mode {
-            "chaos"
-        } else if cfg.fixed_rate {
-            "fixed"
-        } else {
-            "soak"
-        }
-        .to_string(),
-        target_tps: cfg.target_tps,
-        discovered_max_tps: discovered_max,
-        soak_rate_tps: soak_rate,
-        duration_secs: cfg.duration.as_secs_f64(),
-        ramp,
-        lat_p50_us: p50,
-        lat_p95_us: p95,
-        lat_p99_us: p99,
-        lat_max_us: max,
-        total_gas: tracker.total_gas(),
-        workload: match cfg.workload {
-            Workload::Transfers => "transfers".to_string(),
-            Workload::Defi => "defi".to_string(),
-        },
-        verdict,
-    };
+    let verdict = run.build_verdict(&base, &settled.fin, settled.recheck.as_ref());
+    let report = run.build_report(verdict, ramp, discovered_max.get(), soak_rate.get());
 
     print_report(&report);
-    if let Some(path) = &cfg.output {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
-        tracing::info!("wrote report to {}", path.display());
-    }
+    run.write_report_json(&report)?;
 
     Ok(report.verdict.pass)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn ramp_to_max(
-    cfg: &LoadConfig,
-    client: &Arc<HttpClient>,
-    sem: &Arc<Semaphore>,
-    tracker: &Arc<Tracker>,
-    tasks: &mut tokio::task::JoinSet<()>,
-    scraper: &Scraper,
-    queues: &mut Queues,
-    ramp: &mut Vec<RampStep>,
-) -> u32 {
-    let step_dur = Duration::from_secs(cfg.ramp_step_secs.max(1));
-    let mode = if cfg.subscribe {
-        SubmitMode::Subscribe
-    } else {
-        SubmitMode::Blocking
-    };
-    let mut discovered = 0u32;
-    let mut rate = cfg.ramp_step_tps.max(1);
-    while rate <= cfg.target_tps {
-        let before = tracker.counts();
-        let s0 = scraper.snapshot().await;
+/// The state one ramp-to-max run needs across every step: the fixed
+/// config and handles, plus the ramp record each step appends to.
+struct RampRun<'a> {
+    cfg: &'a LoadConfig,
+    handles: &'a RunHandles,
+    tasks: &'a mut tokio::task::JoinSet<()>,
+    scraper: &'a Scraper,
+    queues: &'a mut Queues,
+    ramp: &'a mut Vec<RampStep>,
+    mode: SubmitMode,
+    step_dur: Duration,
+}
+
+impl RampRun<'_> {
+    /// Pace at `rate` tx/s for one step, and measure whether the
+    /// ingress kept pace and the cluster stayed clean.
+    async fn run_step(&mut self, rate: std::num::NonZeroU32) -> RampStep {
+        let before = self.handles.tracker.counts();
+        let s0 = self.scraper.snapshot().await;
         pacer(
-            Arc::clone(client),
-            Arc::clone(sem),
-            Arc::clone(tracker),
-            tasks,
-            queues,
+            self.handles,
+            self.tasks,
+            self.queues,
             rate,
-            step_dur,
-            cfg.retry_submit,
-            !cfg.chaos_mode,
-            mode,
-            cfg.feed_confirm && !cfg.subscribe,
+            self.step_dur,
+            SubmitOpts {
+                retry: self.cfg.retry_submit,
+                verify_receipts: !self.cfg.chaos_mode,
+                mode: self.mode,
+                feed_confirm: self.cfg.feed_confirm_on(),
+            },
         )
         .await;
-        let after = tracker.counts();
-        let s1 = scraper.snapshot().await;
+        let after = self.handles.tracker.counts();
+        let s1 = self.scraper.snapshot().await;
 
         let offered = after.offered - before.offered;
         let accepted = after.accepted - before.accepted;
-        #[allow(clippy::cast_precision_loss)]
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "an offered/accepted count over one ramp step stays far under 2^52"
+        )]
         let accept_ratio = if offered > 0 {
             accepted as f64 / offered as f64
         } else {
@@ -414,50 +558,59 @@ async fn ramp_to_max(
         // drain rate, because admission stays at 1.0 while receipts queue
         // up. Require receipts to keep pace with offers within the step,
         // with slack for the in-flight tail at the step boundary.
-        #[allow(clippy::cast_precision_loss)]
-        let recv_ok = if mode == SubmitMode::Subscribe && offered > 0 {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "an offered/receipted count over one ramp step stays far under 2^52"
+        )]
+        let recv_ok = if self.mode == SubmitMode::Subscribe && offered > 0 {
             let receipted = after.receipted - before.receipted;
             receipted as f64 / offered as f64 >= 0.95
         } else {
             true
         };
-        let gap_ok = step_gap_ok(&s0, &s1, cfg.max_gap);
+        let gap_ok = step_gap_ok(&s0, &s1, self.cfg.max_gap);
         let seq_clean = step_seq_clean(&s0, &s1);
         let sustainable = accept_ratio >= 0.99 && recv_ok && gap_ok && seq_clean;
-        let (lat_p50_us, lat_p95_us, lat_p99_us) = tracker.take_step_latency_us();
-        let gas_used = tracker.take_step_gas();
-        let mgas_s = gas_used as f64 / 1e6 / cfg.ramp_step_secs.max(1) as f64;
+        let lat = self.handles.tracker.take_step_latency_us();
+        let gas_used = self.handles.tracker.take_step_gas();
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "a per-step gas total stays far under 2^52"
+        )]
+        let mgas_s = gas_used as f64 / 1e6 / self.cfg.ramp_step_secs.get() as f64;
         tracing::info!(
-            rate,
+            rate = rate.get(),
             offered,
             accepted,
             accept_ratio = format!("{accept_ratio:.3}"),
-            p50_ms = lat_p50_us / 1000,
-            p95_ms = lat_p95_us / 1000,
-            p99_ms = lat_p99_us / 1000,
+            p50_ms = lat.p50 / 1000,
+            p95_ms = lat.p95 / 1000,
+            p99_ms = lat.p99 / 1000,
             mgas_s = format!("{mgas_s:.1}"),
             gap_ok,
             seq_clean,
             sustainable,
             "ramp step"
         );
-        ramp.push(RampStep {
-            rate,
+        RampStep {
+            rate: rate.get(),
             accept_ratio,
             gap_ok,
             seq_clean,
             sustainable,
-            lat_p50_us,
-            lat_p95_us,
-            lat_p99_us,
+            lat_p50_us: lat.p50,
+            lat_p95_us: lat.p95,
             gas_used,
-        });
-        if sustainable {
-            discovered = rate;
-        } else {
-            break;
+            lat_p99_us: lat.p99,
         }
-        rate = rate.saturating_add(cfg.ramp_step_tps.max(1));
     }
-    discovered.max(cfg.ramp_step_tps.max(1))
+
+    /// Run one ramp step at `rate`, record it, and return the next
+    /// rate to try if it was sustainable, else `None` to stop ramping.
+    async fn ramp_step(&mut self, rate: std::num::NonZeroU32) -> Option<std::num::NonZeroU32> {
+        let step = self.run_step(rate).await;
+        let sustainable = step.sustainable;
+        self.ramp.push(step);
+        sustainable.then(|| rate.saturating_add(self.cfg.ramp_step_tps.get()))
+    }
 }

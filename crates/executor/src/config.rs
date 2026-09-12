@@ -1,30 +1,28 @@
 //! TOML configuration that the `kardamom-executor` binary deserializes.
 //!
-//! In the past, the executor took all runtime tuning through CLI flags. It
-//! only checked that `--config` was present. This module adds the top-level
-//! config that the binary reads from that TOML file. Every field has a
-//! default, so an empty config file (the current deployment shape) still
-//! parses. The first real field is the `[cluster]` section. Cluster mode is
-//! the only mode, so this section must be filled in before the binary can
-//! connect. An empty section fails at cluster connect time with a config
-//! error.
+//! The binary reads this top-level config from the `--config` TOML file.
+//! Every field has a default, so an empty config file (the current
+//! deployment shape) still parses. The first real field is the
+//! `[cluster]` section. Cluster mode is the only mode, so this section
+//! must be filled in before the binary can connect. An empty section
+//! fails at cluster connect time with a config error.
 //!
-//! Note: this differs from [`crate::ExecutorConfig`] (in `actor.rs`), which
-//! is the in-process runtime tuning passed to [`crate::Executor::run`]. This
-//! struct is the target for deserializing the operator-supplied TOML file.
+//! Note: this differs from [`kardamom_engine::ExecutorConfig`], which is
+//! the in-process runtime tuning passed to [`kardamom_engine::Executor::run`].
+//! This struct is the target for deserializing the operator-supplied TOML
+//! file.
 
 use serde::Deserialize;
 
 // The `[cluster]` section type lives next to the cluster reader in the
-// engine (the validator parses the same section). It is re-exported here so
-// existing `kardamom_executor::config::ClusterConfig` paths still resolve.
+// engine (the validator parses the same section).
 pub use kardamom_engine::reader::cluster::ClusterConfig;
 
 /// Top-level config the `kardamom-executor` binary deserializes from `--config`.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ExecutorFileConfig {
-    /// Aeron Cluster (Raft) sealer client config. tx_ordering always comes
+    /// Aeron Cluster (Raft) sealer client config. `tx_ordering` always comes
     /// from the cluster egress. There is no other path.
     pub cluster: ClusterConfig,
 }
@@ -61,8 +59,8 @@ mod tests {
         assert_eq!(cfg.cluster.ingress_endpoints, "0=h0:9000,1=h1:9001");
         // Stream ID and keep-alive defaults fill in when they are omitted.
         let c = cfg.cluster.defaults_applied();
-        assert_eq!(c.ingress_stream_id, 101);
-        assert_eq!(c.egress_stream_id, 102);
-        assert_eq!(c.keep_alive_interval_ms, 1000);
+        assert_eq!(c.ingress_stream_id, Some(101));
+        assert_eq!(c.egress_stream_id, Some(102));
+        assert_eq!(c.keep_alive_interval_ms.unwrap().get(), 1000);
     }
 }

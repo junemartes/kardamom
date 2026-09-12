@@ -102,12 +102,12 @@ fn overflow_then_expected_arrives_drains_full_run_no_wedge() {
     let mut st: PartitionState<u32> = PartitionState::new(4, TTL);
     // expected is 0; buffer the near run 1..=4 (fills capacity 4).
     for n in 1..=4u64 {
-        st.process(s(1), n, n as u32);
+        st.process(s(1), n, u32::try_from(n).unwrap());
     }
     // Flood far-future nonces. All are rejected, and the near run is untouched.
     for n in 50..70u64 {
         assert_eq!(
-            st.process(s(1), n, n as u32).outcome,
+            st.process(s(1), n, u32::try_from(n).unwrap()).outcome,
             NonceOutcome::RejectedTooFar { nonce: n }
         );
     }
@@ -118,7 +118,7 @@ fn overflow_then_expected_arrives_drains_full_run_no_wedge() {
         .iter()
         .filter_map(|a| match a {
             ProcessAction::Publish { nonce, .. } => Some(*nonce),
-            _ => None,
+            ProcessAction::ReportDuplicate { .. } => None,
         })
         .collect();
     assert_eq!(published, vec![0, 1, 2, 3, 4]);
@@ -138,7 +138,7 @@ fn full_buffer_backpressure_rebuffer_loses_nothing() {
     // Fill the buffer to capacity with the future run 1..=cap.
     for n in 1..=cap as u64 {
         assert!(matches!(
-            st.process(s(1), n, 100 + n as u32).outcome,
+            st.process(s(1), n, 100 + u32::try_from(n).unwrap()).outcome,
             NonceOutcome::Buffered
         ));
     }
@@ -147,7 +147,9 @@ fn full_buffer_backpressure_rebuffer_loses_nothing() {
     assert_eq!(out.actions.len(), cap + 1);
     // Simulate backpressure on the first publish. Rebuffer the whole
     // batch in reverse, exactly as `flush_drained` does.
-    let mut batch: Vec<(u64, u32)> = (0..=cap as u64).map(|n| (n, 100 + n as u32)).collect();
+    let mut batch: Vec<(u64, u32)> = (0..=cap as u64)
+        .map(|n| (n, 100 + u32::try_from(n).unwrap()))
+        .collect();
     while let Some((n, p)) = batch.pop() {
         st.reinsert_for_retry(s(1), n, p);
     }
@@ -179,7 +181,7 @@ fn advance_floor_drops_proven_and_advances() {
     // (executed). The replica buffered 3,4 (stale duplicates) and 5,6
     // (live traffic it must regain coverage of).
     for n in [3u64, 4, 5, 6] {
-        st.process(s(1), n, n as u32);
+        st.process(s(1), n, u32::try_from(n).unwrap());
     }
     let (from, dropped) = st.advance_floor(s(1), 5).expect("floor must advance");
     assert_eq!(from, 0);
@@ -233,7 +235,7 @@ fn parked_entry_expires_at_ttl() {
         NonceOutcome::Buffered
     );
     assert!(
-        st.sweep_expired(t0 + TTL - Duration::from_millis(1), 256)
+        st.sweep_expired(t0 + TTL.saturating_sub(Duration::from_millis(1)), 256)
             .is_empty(),
         "nothing expires before the deadline"
     );
@@ -323,7 +325,7 @@ fn sweep_is_bounded_per_call() {
     let mut st: PartitionState<u32> = PartitionState::new(8, TTL);
     let t0 = Instant::now();
     for n in 1..=5u64 {
-        st.process_at(t0, s(1), n, n as u32);
+        st.process_at(t0, s(1), n, u32::try_from(n).unwrap());
     }
     assert_eq!(st.sweep_expired(t0 + TTL, 2).len(), 2);
     assert_eq!(st.sweep_expired(t0 + TTL, 2).len(), 2);

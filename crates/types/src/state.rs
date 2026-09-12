@@ -19,15 +19,41 @@ pub trait StateDatabase: Send + Sync {
 
     /// Returns `Some((nonce, balance, code_hash))` for an existing account, or
     /// `None` if the account does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Self::Error` if the backend fails to read the account.
     fn basic(&self, address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error>;
+
+    /// Reads one storage slot. Returns `U256::ZERO` for an unset slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Self::Error` if the backend fails to read the slot.
     fn storage(&self, address: Address, key: B256) -> Result<U256, Self::Error>;
+
+    /// Reads contract code by its keccak hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Self::Error` if the backend fails to read the code, or if
+    /// no code is stored for `code_hash`.
     fn code_by_hash(&self, code_hash: B256) -> Result<Bytes, Self::Error>;
 
     /// Receipt lookup by canonical position.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Self::Error` if the backend fails to read the receipt table.
     fn get_receipt(&self, pos: BPosition) -> Result<Option<Receipt>, Self::Error>;
 
-    /// tx_hash to BPosition lookup. This is the `tx_hash_index` table the
+    /// `tx_hash` to `BPosition` lookup. This is the `tx_hash_index` table the
     /// state writer maintains.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Self::Error` if the backend fails to read the
+    /// `tx_hash_index` table.
     fn get_tx_position(&self, tx_hash: B256) -> Result<Option<BPosition>, Self::Error>;
 
     /// Open an independent read view anchored at the same state as `self`.

@@ -10,9 +10,19 @@ path = "src/bin/kardamom-sequencer/main.rs"
 
 [features]
 # In-memory fakes for downstream-crate unit tests. Enables the `fakes` modules
-# under `inbound` / `outbound`. On by default in this crate's `[dev-dependencies]`
-# pull-back; off in production.
-testing = []
+# under `inbound` / `outbound`, and the `testkit` module's signed-envelope
+# fixtures. On by default in this crate's `[dev-dependencies]` pull-back; off
+# in production.
+#
+# `testkit` needs `alloy-network` (the `TxSignerSync` trait) and
+# `alloy-signer-local` (`PrivateKeySigner`) as real, non-dev dependencies:
+# `tests/*.rs` and `benches/*.rs` link this crate through the
+# `[dev-dependencies]` self pull-back below, which builds the library with
+# `--features testing` but WITHOUT this crate's own `[dev-dependencies]` in
+# scope. A `testing`-gated item that named a dev-only crate would compile
+# under `cargo test --lib` (cfg(test) does see dev-deps) and fail for every
+# `tests/`/`benches/` binary.
+testing = ["dep:alloy-network", "dep:alloy-signer-local"]
 # Real-Aeron Docker e2e test gate. Implies `testing` for the harness import.
 docker-e2e = ["testing", "kardamom-log/docker-e2e"]
 
@@ -20,7 +30,11 @@ docker-e2e = ["testing", "kardamom-log/docker-e2e"]
 crossbeam-channel.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
+# `testkit`-only: see the `testing` feature doc above.
+alloy-network = { workspace = true, optional = true }
 alloy-rlp.workspace = true
+# `testkit`-only: see the `testing` feature doc above.
+alloy-signer-local = { workspace = true, optional = true }
 anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
@@ -43,9 +57,9 @@ toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# alloy-network and alloy-signer-local moved to [dependencies] (optional,
+# behind the `testing` feature): see that feature's doc comment.
 alloy-eips.workspace = true
-alloy-network.workspace = true
-alloy-signer-local.workspace = true
 criterion.workspace = true
 # DHAT heap profiling for the ignored-by-default allocation harness
 # (tests/alloc_profile.rs) — same setup as crates/bench/tests/alloc_profile.rs.
@@ -57,6 +71,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 kardamom-sequencer = { path = ".", features = ["testing"] }
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
+kardamom-obs = { path = "../obs", features = ["test-support"] }
 proptest = "1"
 rand = "0.9"
 

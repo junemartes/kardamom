@@ -31,28 +31,26 @@ fn boundary(block: u64) -> BlockBoundary {
     }
 }
 
-/// An independent oracle. Compute the canonical state root from a pure
-/// in-memory model of the accounts and slots, recomputing storage roots
-/// from scratch.
-fn model_root(
-    accounts: &BTreeMap<Address, (u64, U256, B256)>,
-    storage: &BTreeMap<Address, BTreeMap<B256, U256>>,
-) -> B256 {
-    trie::state_root(accounts.iter().map(|(addr, &(nonce, balance, code_hash))| {
-        let sroot = storage
-            .get(addr)
-            .map(|slots| trie::storage_root(slots.iter().map(|(k, v)| (*k, *v))))
-            .unwrap_or_else(trie::empty_root);
-        (
-            *addr,
-            trie::AccountTrieParts {
-                nonce,
-                balance,
-                code_hash,
-                storage_root: sroot,
+/// Fold one block's delta into the oracle model kept alongside a writer
+/// run.
+fn record_delta_in_model(
+    delta: &BlockDelta,
+    accts: &mut BTreeMap<Address, trie::BasicFields>,
+    stor: &mut BTreeMap<Address, BTreeMap<B256, U256>>,
+) {
+    for s in &delta.storage {
+        stor.entry(s.address).or_default().insert(s.key, s.value);
+    }
+    for a in &delta.accounts {
+        accts.insert(
+            a.address,
+            trie::BasicFields {
+                nonce: a.nonce,
+                balance: a.balance,
+                code_hash: a.code_hash,
             },
-        )
-    }))
+        );
+    }
 }
 
 #[test]
@@ -88,7 +86,7 @@ fn trie_writer_root_matches_model_and_persists() {
         },
     ];
 
-    let mut model_accts: BTreeMap<Address, (u64, U256, B256)> = BTreeMap::new();
+    let mut model_accts: BTreeMap<Address, trie::BasicFields> = BTreeMap::new();
     let mut model_stor: BTreeMap<Address, BTreeMap<B256, U256>> = BTreeMap::new();
 
     // Submit all blocks, then shut down. `shutdown()` drains every queued
@@ -100,15 +98,7 @@ fn trie_writer_root_matches_model_and_persists() {
             .unwrap();
         let mut handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
         for delta in &blocks {
-            for s in &delta.storage {
-                model_stor
-                    .entry(s.address)
-                    .or_default()
-                    .insert(s.key, s.value);
-            }
-            for a in &delta.accounts {
-                model_accts.insert(a.address, (a.nonce, a.balance, a.code_hash));
-            }
+            record_delta_in_model(delta, &mut model_accts, &mut model_stor);
             handle
                 .delta_tx
                 .send(WriteBatch::new(boundary(delta.block_number), delta.clone()))
@@ -126,7 +116,10 @@ fn trie_writer_root_matches_model_and_persists() {
     let snap = StateSnapshot::open(&env).unwrap();
     assert_eq!(snap.block_number(), 3);
     let persisted = snap.state_root().unwrap().expect("trie writer set a root");
-    assert_eq!(persisted, model_root(&model_accts, &model_stor));
+    assert_eq!(
+        persisted,
+        crate::testing::model_state_root(&model_accts, &model_stor)
+    );
     assert_ne!(persisted, trie::empty_root());
 }
 

@@ -2,6 +2,8 @@
 //! yield the original block frames. This mirrors the section 6 conformance
 //! hook.
 
+use std::num::NonZeroUsize;
+
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use kardamom_batcher::batch::{ClosedBlock, RecordedTx};
@@ -10,17 +12,16 @@ use kardamom_batcher::frame::{BlockFrame, TxFrame};
 use kardamom_batcher::recon::reconstruct;
 use kardamom_types::{BPosition, TxEnvelope};
 
-fn pos(o: i32) -> BPosition {
-    BPosition {
-        term_id: 0,
-        term_offset: o,
-    }
-}
-
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "n and the range below are always small literal test fixtures; the casts here \
+              never approach their target types' limits"
+)]
 fn closed(block_number: u64, n: usize) -> ClosedBlock {
     let txs: Vec<RecordedTx> = (0..n)
         .map(|i| RecordedTx {
-            position: pos((i * 64) as i32),
+            position: BPosition::from_index((i * 64) as u64),
             envelope: TxEnvelope {
                 correlation_id: i as u64,
                 raw_tx: Bytes::from(vec![0xAB; 100]),
@@ -32,7 +33,7 @@ fn closed(block_number: u64, n: usize) -> ClosedBlock {
     ClosedBlock {
         block_number,
         l2_timestamp: 1_700_000_000 + block_number,
-        end_tx_idx: pos((n as i32) * 64),
+        end_tx_idx: BPosition::from_index((n as u64) * 64),
         remote_epochs: Vec::new(),
         txs,
     }
@@ -81,9 +82,9 @@ fn roundtrip_one_block_uncompressed() {
 
 #[test]
 fn roundtrip_five_blocks_grouped() {
-    let blocks: Vec<ClosedBlock> = (10..15).map(|i| closed(i as u64, 2)).collect();
+    let blocks: Vec<ClosedBlock> = (10u64..15).map(|i| closed(i, 2)).collect();
     let cfg = BatcherConfig {
-        blocks_per_batch: 5,
+        blocks_per_batch: NonZeroUsize::new(5).unwrap(),
         ..Default::default()
     };
     let batch = pack_blocks(&cfg, &blocks).unwrap();
@@ -94,11 +95,13 @@ fn roundtrip_five_blocks_grouped() {
 }
 
 // ---------------------------------------------------------------------------
-// Remote-epoch (interop) DA representation — spec §16 Q8.
+// Remote-epoch (interop) DA representation: a record's messages travel by
+// value, including calldata, so every chain is self-reconstructible with
+// no dependency on a peer being alive.
 // ---------------------------------------------------------------------------
 
 /// Per-message calldata cap enforced by the origin Outbox
-/// (`contracts/src/L2/Outbox.sol` MAX_DATA_BYTES).
+/// (`contracts/src/L2/Outbox.sol` `MAX_DATA_BYTES`).
 const MAX_DATA_BYTES: usize = 65_536;
 
 fn remote_epoch(
@@ -107,28 +110,28 @@ fn remote_epoch(
     inputs: &[&[u8]],
     with_callback: bool,
 ) -> kardamom_types::xchain::RemoteEpochRecord {
-    use kardamom_types::xchain::{Callback, RemoteEpochRecord, XChainMessage, remote_source_hash};
-    let messages = inputs
-        .iter()
-        .enumerate()
-        .map(|(i, input)| {
-            let seq = first_seq + i as u64;
-            XChainMessage {
-                source_hash: remote_source_hash(origin, seq),
-                seq,
-                origin_sender: Address::repeat_byte(0xA1),
-                target: Address::repeat_byte(0xB2),
-                value: 0,
-                gas_limit: 150_000,
-                input: Bytes::copy_from_slice(input),
-                callback: with_callback.then(|| Callback {
-                    target: Address::repeat_byte(0xCB),
-                    gas_limit: 90_000,
-                    context: B256::repeat_byte(0x42),
-                }),
-            }
-        })
-        .collect();
+    use kardamom_types::xchain::{
+        Callback, NonEmptyVec, RemoteEpochRecord, XChainMessage, remote_source_hash,
+    };
+    let mut built = inputs.iter().enumerate().map(|(i, input)| {
+        let seq = first_seq + i as u64;
+        XChainMessage {
+            source_hash: remote_source_hash(origin, seq),
+            seq,
+            origin_sender: Address::repeat_byte(0xA1),
+            target: Address::repeat_byte(0xB2),
+            value: 0,
+            gas_limit: 150_000,
+            input: Bytes::copy_from_slice(input),
+            callback: with_callback.then(|| Callback {
+                target: Address::repeat_byte(0xCB),
+                gas_limit: 90_000,
+                context: B256::repeat_byte(0x42),
+            }),
+        }
+    });
+    let first = built.next().expect("fixture always carries a message");
+    let messages = NonEmptyVec::new(first, built.collect());
     RemoteEpochRecord {
         origin_chain_id: origin,
         anchor_number: 100 + first_seq,
@@ -158,7 +161,7 @@ fn roundtrip_remote_epochs_multi_message_record() {
     assert!(reconstructed[2].remote_epochs.is_empty());
 }
 
-/// A record whose messages carry the Outbox's MAX_DATA_BYTES calldata cap:
+/// A record whose messages carry the Outbox's `MAX_DATA_BYTES` calldata cap:
 /// two such messages exceed one blob's 126 976 usable bytes, so the payload
 /// must span blobs — the SAME multi-blob mechanism an oversized tx batch uses
 /// (`pack_to_blobs` slicing, `pack_blocks`' 6-blob ceiling as the guard) —
@@ -186,7 +189,11 @@ fn roundtrip_max_size_messages_span_blobs() {
     let reconstructed = reconstruct(&batch.blobs).unwrap();
     assert_eq!(reconstructed, expected_frames(&blocks));
     assert_eq!(
-        reconstructed[0].remote_epochs[0].messages[0].input.len(),
+        reconstructed[0].remote_epochs[0]
+            .messages
+            .first()
+            .input
+            .len(),
         MAX_DATA_BYTES
     );
 }
@@ -215,7 +222,7 @@ fn records_commitment_binds_remote_epochs() {
 
     // The commitment binds the message content and the pair.
     let mut other_msg = led.clone();
-    other_msg[1].remote_epochs[0].messages[0].input = Bytes::from_static(&[0xCA, 0xFF]);
+    other_msg[1].remote_epochs[0].messages.first_mut().input = Bytes::from_static(&[0xCA, 0xFF]);
     assert_ne!(
         pack_blocks(&cfg, &other_msg).unwrap().records_commitment,
         led_batch.records_commitment
@@ -263,12 +270,12 @@ fn accumulator_attributes_remote_epochs_to_the_block_they_lead() {
     let boundary = |n: u64| BlockBoundaryStart {
         block_number: n,
         l2_timestamp: 1_700_000_000 + n,
-        end_tx_idx: pos(0),
+        end_tx_idx: BPosition::from_index(0),
         l1_origin: 0,
     };
 
     // Block 1 closes with no interop traffic.
-    let b1 = acc.observe_boundary(boundary(1));
+    let b1 = acc.observe_boundary(&boundary(1));
     assert!(b1.remote_epochs.is_empty());
 
     // A record leads block 2: observed right after boundary 1, before the
@@ -277,12 +284,12 @@ fn accumulator_attributes_remote_epochs_to_the_block_they_lead() {
     acc.observe_remote_epoch(rec.clone());
     let tx = closed(0, 1).txs.remove(0);
     acc.observe_tx(tx.envelope, tx.position);
-    let b2 = acc.observe_boundary(boundary(2));
+    let b2 = acc.observe_boundary(&boundary(2));
     assert_eq!(b2.remote_epochs, vec![rec]);
     assert_eq!(b2.txs.len(), 1);
 
     // Drained: block 3 carries none.
-    let b3 = acc.observe_boundary(boundary(3));
+    let b3 = acc.observe_boundary(&boundary(3));
     assert!(b3.remote_epochs.is_empty());
 }
 

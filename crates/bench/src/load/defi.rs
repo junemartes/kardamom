@@ -1,4 +1,4 @@
-//! This is the DeFi bench workload: CLOB updates, Uniswap-style swaps,
+//! This is the `DeFi` bench workload: CLOB updates, Uniswap-style swaps,
 //! and vault flows.
 //!
 //! The contracts live in `bench-contracts/src/BenchDefi.sol`, its own
@@ -21,19 +21,19 @@
 //! round trip, and sender 0's operation queue simply starts three
 //! nonces later.
 
+use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
-use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
+use alloy_consensus::TxLegacy;
 use alloy_primitives::{Address, Bytes, TxKind, U256, keccak256};
+use anyhow::Context as _;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::rpc_params;
 
 use crate::load::hex_u64;
-use crate::load::plan::PlannedTx;
-use crate::signers::DerivedSigner;
+use crate::load::plan::{PlannedTx, TxPlanParams};
+use crate::signers::{DerivedSigner, SignerSet};
 
 include!("defi_bytecode.rs");
 
@@ -53,12 +53,22 @@ pub struct DefiContracts {
 impl DefiContracts {
     /// The addresses when `deployer` creates the pool, vault, and CLOB
     /// at `nonce_start`, `nonce_start + 1`, and `nonce_start + 2`.
-    pub fn at(deployer: Address, nonce_start: u64) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `nonce_start + 2` overflows `u64`.
+    pub fn at(deployer: Address, nonce_start: u64) -> anyhow::Result<Self> {
+        let n1 = nonce_start
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("nonce_start + 1 overflows u64"))?;
+        let n2 = nonce_start
+            .checked_add(2)
+            .ok_or_else(|| anyhow::anyhow!("nonce_start + 2 overflows u64"))?;
+        Ok(Self {
             pool: deployer.create(nonce_start),
-            vault: deployer.create(nonce_start + 1),
-            clob: deployer.create(nonce_start + 2),
-        }
+            vault: deployer.create(n1),
+            clob: deployer.create(n2),
+        })
     }
 }
 
@@ -75,11 +85,38 @@ fn call(selector_sig: &str, args: &[U256]) -> Bytes {
     Bytes::from(data)
 }
 
+/// A previous order ID to cancel, for churn. ID `0` never exists (the
+/// CLOB assigns IDs starting at 1), so a request for it floors to ID 1:
+/// still a cheap no-op cancel, never an out-of-range one.
+fn churn_id(seq: u64) -> U256 {
+    let id = if seq == 0 { 1 } else { seq };
+    U256::from(id)
+}
+
+/// The target contract and calldata one operation calls.
+struct OpCall {
+    to: Address,
+    input: Bytes,
+}
+
+/// The first operation in every sender's queue: `pool.seed()`, so swaps
+/// have balances to move. Every operation after that comes from [`op`].
+fn seed_or_op(contracts: &DefiContracts, sender: usize, i: u64) -> OpCall {
+    if i == 0 {
+        OpCall {
+            to: contracts.pool,
+            input: call("seed()", &[]),
+        }
+    } else {
+        op(contracts, sender, i)
+    }
+}
+
 /// The deterministic operation for `(sender, seq)`: the target contract
 /// and calldata. The mix is about 50% swaps, 25% vault operations
 /// (deposit and withdraw alternating), and 25% CLOB operations (7
 /// places for every 1 cancel).
-fn op(contracts: &DefiContracts, sender: usize, seq: u64) -> (Address, Bytes) {
+fn op(contracts: &DefiContracts, sender: usize, seq: u64) -> OpCall {
     // This is a cheap deterministic mixer, not a hash. It only decorrelates
     // the mix from the sequence, so every sender exercises all operations
     // in all phases.
@@ -90,18 +127,24 @@ fn op(contracts: &DefiContracts, sender: usize, seq: u64) -> (Address, Bytes) {
         0 | 1 => {
             let zero_for_one = U256::from(seq & 1);
             let amount_in = U256::from(10u128.pow(17) + u128::from(h % 100) * 10u128.pow(15));
-            (
-                contracts.pool,
-                call("swap(bool,uint256)", &[zero_for_one, amount_in]),
-            )
+            OpCall {
+                to: contracts.pool,
+                input: call("swap(bool,uint256)", &[zero_for_one, amount_in]),
+            }
         }
         2 => {
             if seq & 1 == 0 {
                 let assets = U256::from(10u128.pow(18) + u128::from(h % 1000) * 10u128.pow(15));
-                (contracts.vault, call("deposit(uint256)", &[assets]))
+                OpCall {
+                    to: contracts.vault,
+                    input: call("deposit(uint256)", &[assets]),
+                }
             } else {
                 let shares = U256::from(5u128 * 10u128.pow(17));
-                (contracts.vault, call("withdraw(uint256)", &[shares]))
+                OpCall {
+                    to: contracts.vault,
+                    input: call("withdraw(uint256)", &[shares]),
+                }
             }
         }
         _ => {
@@ -109,33 +152,44 @@ fn op(contracts: &DefiContracts, sender: usize, seq: u64) -> (Address, Bytes) {
                 // Cancel a recent-ish ID. A cancel of another user's order,
                 // or of a filled order, is a cheap no-op. This is realistic
                 // book churn.
-                let id = U256::from((seq.saturating_sub(1)).max(1));
-                (contracts.clob, call("cancel(uint256)", &[id]))
+                OpCall {
+                    to: contracts.clob,
+                    input: call("cancel(uint256)", &[churn_id(seq.saturating_sub(1))]),
+                }
             } else {
                 let bid = U256::from(seq & 1);
                 let price = U256::from(1_000 + h % 64);
                 let size = U256::from(1_000_000 + h % 1_000_000);
-                (
-                    contracts.clob,
-                    call("place(bool,uint256,uint96)", &[bid, price, size]),
-                )
+                OpCall {
+                    to: contracts.clob,
+                    input: call("place(bool,uint256,uint96)", &[bid, price, size]),
+                }
             }
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn sign(
-    s: &DerivedSigner,
-    chain_id: u64,
+/// The per-transaction fields `sign` needs, beyond the signer and the
+/// chain ID both callers already have in scope.
+struct SignSpec {
     nonce: u64,
     gas_price: u128,
     gas_limit: u64,
     to: TxKind,
     input: Bytes,
     sender: usize,
-) -> anyhow::Result<PlannedTx> {
-    let mut tx = TxLegacy {
+}
+
+fn sign(s: &DerivedSigner, chain_id: u64, spec: SignSpec) -> anyhow::Result<PlannedTx> {
+    let SignSpec {
+        nonce,
+        gas_price,
+        gas_limit,
+        to,
+        input,
+        sender,
+    } = spec;
+    let tx = TxLegacy {
         chain_id: Some(chain_id),
         nonce,
         gas_price,
@@ -144,58 +198,87 @@ fn sign(
         value: U256::ZERO,
         input,
     };
-    let sig = s
-        .signer
-        .sign_transaction_sync(&mut tx)
+    let signed = s
+        .sign_raw(tx)
         .map_err(|e| anyhow::anyhow!("signing defi tx (sender {sender} nonce {nonce}): {e}"))?;
-    let signed = tx.into_signed(sig);
-    let hash = *signed.hash();
-    let envelope: TxEnvelope = signed.into();
-    let mut bytes = Vec::with_capacity(200);
-    envelope.encode_2718(&mut bytes);
     Ok(PlannedTx {
-        raw: Bytes::from(bytes),
-        hash,
+        raw: signed.raw,
+        hash: signed.hash,
         sender,
         nonce,
     })
 }
 
-fn creation_bytes(hex: &str) -> Bytes {
-    Bytes::from(alloy_primitives::hex::decode(hex).expect("embedded bytecode hex"))
+fn creation_bytes(hex: &str) -> anyhow::Result<Bytes> {
+    Ok(Bytes::from(
+        alloy_primitives::hex::decode(hex).context("embedded bytecode hex")?,
+    ))
 }
 
-/// The three deployment transactions, signed by `signers[0]` at nonces
-/// `nonce_start` through `nonce_start + 2`. Submit and confirm these
-/// before starting load: every workload call targets their computed
-/// addresses.
-pub fn deployment_txs(
-    signers: &[DerivedSigner],
-    chain_id: u64,
-    nonce_start: u64,
-    gas_price: u128,
-) -> anyhow::Result<(Vec<PlannedTx>, DefiContracts)> {
-    let deployer = signers
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("at least one signer required"))?;
-    let contracts = DefiContracts::at(deployer.signer.address(), nonce_start);
+/// The three deployment transactions, and the contract addresses they
+/// create.
+pub struct Deployment {
+    pub txs: Vec<PlannedTx>,
+    pub contracts: DefiContracts,
+}
+
+/// The three deployment transactions, signed by the first signer at
+/// nonces `nonce_start` through `nonce_start + 2`. Submit and confirm
+/// these before starting load: every workload call targets their
+/// computed addresses.
+///
+/// # Errors
+///
+/// Returns an error if signing a deployment transaction fails.
+pub fn deployment_txs(signers: &SignerSet, params: TxPlanParams) -> anyhow::Result<Deployment> {
+    let deployer = signers.deployer();
+    let contracts = DefiContracts::at(deployer.signer.address(), params.nonce_start)?;
     let txs = [SWAPPOOL_CREATION_HEX, VAULT_CREATION_HEX, CLOB_CREATION_HEX]
         .iter()
         .enumerate()
         .map(|(i, hex)| {
+            let nonce = params
+                .nonce_start
+                .checked_add(i as u64)
+                .ok_or_else(|| anyhow::anyhow!("nonce_start + {i} overflows u64"))?;
             sign(
                 deployer,
-                chain_id,
-                nonce_start + i as u64,
-                gas_price,
-                CREATE_GAS_LIMIT,
-                TxKind::Create,
-                creation_bytes(hex),
-                0,
+                params.chain_id,
+                SignSpec {
+                    nonce,
+                    gas_price: params.gas_price,
+                    gas_limit: CREATE_GAS_LIMIT,
+                    to: TxKind::Create,
+                    input: creation_bytes(hex)?,
+                    sender: 0,
+                },
             )
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok((txs, contracts))
+    Ok(Deployment { txs, contracts })
+}
+
+// This is a liveness bound, expressed as one. `deploy_and_confirm`'s
+// wait stage starts the moment the transfer soak's verdict lands, so
+// the chain is still draining that backlog, with the deploy queued
+// behind it. How long that takes is a property of the runner, not of
+// the code under test. A fixed wall-clock deadline would race the
+// drain instead.
+//
+// So `deploy_and_confirm` waits as long as the chain is advancing, and
+// fails only when it stops. A stalled pipeline is caught in seconds; a
+// merely slow one is waited out. The overall cap stays as a backstop
+// against waiting forever on a chain that advances but never includes
+// the transaction.
+const STALL_LIMIT: Duration = Duration::from_secs(60);
+const HARD_CAP: Duration = Duration::from_secs(600);
+
+async fn head_block(client: &HttpClient) -> Option<u64> {
+    client
+        .request::<String, _>("eth_blockNumber", rpc_params![])
+        .await
+        .ok()
+        .and_then(|h| hex_u64(&h))
 }
 
 /// Submit the deployment transactions and wait until each is mined
@@ -207,121 +290,160 @@ pub fn deployment_txs(
 /// Returns an error if a submit is rejected, a deployment reverts, the
 /// chain stops advancing while a deployment is unmined, or an accepted
 /// deployment is never included within the hard cap.
-pub async fn deploy_and_confirm(client: &HttpClient, deploys: &[PlannedTx]) -> anyhow::Result<()> {
+pub(crate) async fn deploy_and_confirm(
+    client: &HttpClient,
+    deploys: &[PlannedTx],
+) -> anyhow::Result<()> {
     for d in deploys {
         let _: alloy_primitives::B256 = client
             .request("eth_sendRawTransaction", rpc_params![d.raw.clone()])
             .await
             .map_err(|e| anyhow::anyhow!("defi deploy submit (nonce {}): {e}", d.nonce))?;
     }
-    // This is a liveness bound, expressed as one. This stage starts the
-    // moment the transfer soak's verdict lands, so the chain is still
-    // draining that backlog, with the deploy queued behind it. How long
-    // that takes is a property of the runner, not of the code under test.
-    // A fixed wall-clock deadline would race the drain instead.
-    //
-    // So this code waits as long as the chain is advancing, and fails
-    // only when it stops. A stalled pipeline is caught in seconds; a
-    // merely slow one is waited out. The overall cap stays as a backstop
-    // against waiting forever on a chain that advances but never
-    // includes this transaction.
-    const STALL_LIMIT: Duration = Duration::from_secs(60);
-    const HARD_CAP: Duration = Duration::from_secs(600);
-    async fn head_block(client: &HttpClient) -> Option<u64> {
-        client
-            .request::<String, _>("eth_blockNumber", rpc_params![])
-            .await
-            .ok()
-            .and_then(|h| hex_u64(&h))
-    }
     let started = Instant::now();
     for d in deploys {
-        let mut last_block = head_block(client).await;
-        let mut last_progress = Instant::now();
-        loop {
-            let v: Option<serde_json::Value> = client
-                .request("eth_getTransactionReceipt", rpc_params![d.hash])
-                .await
-                .unwrap_or(None);
-            if let Some(r) = v {
-                anyhow::ensure!(
-                    r["status"].as_str() == Some("0x1"),
-                    "defi deploy reverted (nonce {}): {r}",
-                    d.nonce
-                );
-                break;
-            }
-            let now = head_block(client).await;
-            if now.is_some() && now != last_block {
-                last_block = now;
-                last_progress = Instant::now();
-            }
-            anyhow::ensure!(
-                last_progress.elapsed() < STALL_LIMIT,
-                "defi deploy not mined (nonce {}): chain STOPPED advancing — no new \
-                 block for {}s while waiting (head {:?})",
-                d.nonce,
-                STALL_LIMIT.as_secs(),
-                last_block
-            );
-            anyhow::ensure!(
-                started.elapsed() < HARD_CAP,
-                "defi deploy not mined (nonce {}) within {}s although the chain kept \
-                 advancing to {:?} — the tx was accepted but never included",
-                d.nonce,
-                HARD_CAP.as_secs(),
-                last_block
-            );
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        confirm_deploy(client, d, started).await?;
     }
     tracing::info!("defi contracts deployed + confirmed");
     Ok(())
 }
 
-/// Pre-sign per-sender queues of DeFi calls. Sender 0's nonces start
+/// [`confirm_deploy`]'s carried state across polls: the last seen head
+/// block, and when it last changed.
+struct ConfirmState {
+    last_block: Option<u64>,
+    last_progress: Instant,
+}
+
+/// Poll until `d`'s receipt lands, or fail if the chain stalls or the
+/// deploy takes too long overall from `started`.
+async fn confirm_deploy(
+    client: &HttpClient,
+    d: &PlannedTx,
+    started: Instant,
+) -> anyhow::Result<()> {
+    let mut state = ConfirmState {
+        last_block: head_block(client).await,
+        last_progress: Instant::now(),
+    };
+    loop {
+        let ControlFlow::Continue(()) =
+            confirm_tick_or_wait(client, d, started, &mut state).await?
+        else {
+            return Ok(());
+        };
+    }
+}
+
+/// One [`confirm_deploy`] poll. Returns [`ControlFlow::Break`] once
+/// [`confirm_tick`] sees the receipt land; otherwise sleeps the poll
+/// interval and returns [`ControlFlow::Continue`], so the caller's loop
+/// tries again.
+async fn confirm_tick_or_wait(
+    client: &HttpClient,
+    d: &PlannedTx,
+    started: Instant,
+    state: &mut ConfirmState,
+) -> anyhow::Result<ControlFlow<()>> {
+    let cf = confirm_tick(client, d, started, state).await?;
+    if cf.is_continue() {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(cf)
+}
+
+/// One [`confirm_tick_or_wait`] poll: check for a landed receipt, else
+/// update the stall clock and check both deadlines.
+async fn confirm_tick(
+    client: &HttpClient,
+    d: &PlannedTx,
+    started: Instant,
+    state: &mut ConfirmState,
+) -> anyhow::Result<ControlFlow<()>> {
+    let v: Option<serde_json::Value> = client
+        .request("eth_getTransactionReceipt", rpc_params![d.hash])
+        .await
+        .unwrap_or(None);
+    if let Some(r) = v {
+        anyhow::ensure!(
+            r["status"].as_str() == Some("0x1"),
+            "defi deploy reverted (nonce {}): {r}",
+            d.nonce
+        );
+        return Ok(ControlFlow::Break(()));
+    }
+    let now = head_block(client).await;
+    if now.is_some() && now != state.last_block {
+        state.last_block = now;
+        state.last_progress = Instant::now();
+    }
+    anyhow::ensure!(
+        state.last_progress.elapsed() < STALL_LIMIT,
+        "defi deploy not mined (nonce {}): chain STOPPED advancing — no new \
+         block for {}s while waiting (head {:?})",
+        d.nonce,
+        STALL_LIMIT.as_secs(),
+        state.last_block
+    );
+    anyhow::ensure!(
+        started.elapsed() < HARD_CAP,
+        "defi deploy not mined (nonce {}) within {}s although the chain kept \
+         advancing to {:?} — the tx was accepted but never included",
+        d.nonce,
+        HARD_CAP.as_secs(),
+        state.last_block
+    );
+    Ok(ControlFlow::Continue(()))
+}
+
+/// Pre-sign per-sender queues of `DeFi` calls. Sender 0's nonces start
 /// after the three deployments. Every sender's first operation is
 /// `pool.seed()`, so swaps have balances to move.
+///
+/// # Errors
+///
+/// Returns an error if signing a call fails.
 pub fn pregenerate_defi(
-    signers: &[DerivedSigner],
-    chain_id: u64,
+    signers: &SignerSet,
     contracts: &DefiContracts,
     per_sender: usize,
-    nonce_start: u64,
-    gas_price: u128,
+    params: TxPlanParams,
 ) -> anyhow::Result<Vec<Vec<PlannedTx>>> {
-    if signers.is_empty() {
-        anyhow::bail!("at least one signer is required");
-    }
-    let mut out = Vec::with_capacity(signers.len());
-    for (sender, s) in signers.iter().enumerate() {
-        let base = if sender == 0 {
-            nonce_start + 3 // This is after the deployments.
-        } else {
-            nonce_start
-        };
-        let mut queue = Vec::with_capacity(per_sender);
-        for i in 0..per_sender {
-            let nonce = base + i as u64;
-            let (to, input) = if i == 0 {
-                (contracts.pool, call("seed()", &[]))
+    signers
+        .iter()
+        .enumerate()
+        .map(|(sender, s)| {
+            let base = if sender == 0 {
+                // This is after the deployments.
+                params
+                    .nonce_start
+                    .checked_add(3)
+                    .ok_or_else(|| anyhow::anyhow!("nonce_start + 3 overflows u64"))?
             } else {
-                op(contracts, sender, i as u64)
+                params.nonce_start
             };
-            queue.push(sign(
-                s,
-                chain_id,
-                nonce,
-                gas_price,
-                CALL_GAS_LIMIT,
-                TxKind::Call(to),
-                input,
-                sender,
-            )?);
-        }
-        out.push(queue);
-    }
-    Ok(out)
+            (0..per_sender)
+                .map(|i| {
+                    let nonce = base
+                        .checked_add(i as u64)
+                        .ok_or_else(|| anyhow::anyhow!("base + {i} overflows u64"))?;
+                    let OpCall { to, input } = seed_or_op(contracts, sender, i as u64);
+                    sign(
+                        s,
+                        params.chain_id,
+                        SignSpec {
+                            nonce,
+                            gas_price: params.gas_price,
+                            gas_limit: CALL_GAS_LIMIT,
+                            to: TxKind::Call(to),
+                            input,
+                            sender,
+                        },
+                    )
+                })
+                .collect::<anyhow::Result<Vec<PlannedTx>>>()
+        })
+        .collect()
 }
 
 /// Pre-sign per-sender queues of a single operation family, for
@@ -330,8 +452,12 @@ pub fn pregenerate_defi(
 /// withdraw needing shares or cancel needing orders, interleaves a
 /// setup operation every 4th transaction, so the measured operation
 /// dominates.
+///
+/// # Errors
+///
+/// Returns an error if signing a call fails.
 pub fn pregenerate_family(
-    signers: &[DerivedSigner],
+    signers: &SignerSet,
     chain_id: u64,
     contracts: &DefiContracts,
     fam: &str,
@@ -339,135 +465,119 @@ pub fn pregenerate_family(
     nonce_start: u64,
     gas_price: u128,
 ) -> anyhow::Result<Vec<Vec<PlannedTx>>> {
-    let mut out = Vec::with_capacity(signers.len());
-    for (sender, s) in signers.iter().enumerate() {
-        let base = if sender == 0 {
-            nonce_start + 3
-        } else {
-            nonce_start
-        };
-        let mut queue = Vec::with_capacity(per_sender);
-        for i in 0..per_sender {
-            let nonce = base + i as u64;
-            let seq = i as u64;
-            let (to, input, gas) = match (fam, i) {
-                (_, 0) => (contracts.pool, call("seed()", &[]), CALL_GAS_LIMIT),
-                ("swap", _) => (
-                    contracts.pool,
-                    call(
-                        "swap(bool,uint256)",
-                        &[U256::from(seq & 1), U256::from(10u128.pow(17))],
-                    ),
-                    CALL_GAS_LIMIT,
-                ),
-                ("vault_deposit", _) => (
-                    contracts.vault,
-                    call("deposit(uint256)", &[U256::from(10u128.pow(18))]),
-                    CALL_GAS_LIMIT,
-                ),
-                ("vault_withdraw", n) if n % 4 == 1 => (
-                    contracts.vault,
-                    call("deposit(uint256)", &[U256::from(4u128 * 10u128.pow(18))]),
-                    CALL_GAS_LIMIT,
-                ),
-                ("vault_withdraw", _) => (
-                    contracts.vault,
-                    call("withdraw(uint256)", &[U256::from(10u128.pow(17))]),
-                    CALL_GAS_LIMIT,
-                ),
-                ("clob_place", _) => (
-                    contracts.clob,
-                    call(
-                        "place(bool,uint256,uint96)",
-                        &[
-                            U256::from(seq & 1),
-                            U256::from(1_000 + seq % 64),
-                            U256::from(1_000_000u64),
-                        ],
-                    ),
-                    CALL_GAS_LIMIT,
-                ),
-                ("clob_cancel", n) if n % 2 == 1 => (
-                    contracts.clob,
-                    call(
-                        "place(bool,uint256,uint96)",
-                        &[
-                            U256::from(0u64),
-                            U256::from(1_000u64),
-                            U256::from(1_000_000u64),
-                        ],
-                    ),
-                    CALL_GAS_LIMIT,
-                ),
-                ("clob_cancel", _) => (
-                    contracts.clob,
-                    call("cancel(uint256)", &[U256::from(seq.max(1))]),
-                    CALL_GAS_LIMIT,
-                ),
-                ("transfer", _) => (Address::repeat_byte(0xEE), Bytes::new(), 21_000),
-                (other, _) => anyhow::bail!("unknown profile family {other:?}"),
+    signers
+        .iter()
+        .enumerate()
+        .map(|(sender, s)| {
+            let base = if sender == 0 {
+                nonce_start
+                    .checked_add(3)
+                    .ok_or_else(|| anyhow::anyhow!("nonce_start + 3 overflows u64"))?
+            } else {
+                nonce_start
             };
-            queue.push(sign(
-                s,
+            let ctx = FamilyCtx {
+                contracts,
+                fam,
                 chain_id,
-                nonce,
+                base,
                 gas_price,
-                gas,
-                TxKind::Call(to),
-                input,
                 sender,
-            )?);
-        }
-        out.push(queue);
-    }
-    Ok(out)
+            };
+            (0..per_sender).map(|i| family_op_tx(s, &ctx, i)).collect()
+        })
+        .collect()
+}
+
+/// The per-sender constants [`family_op_tx`] needs.
+struct FamilyCtx<'a> {
+    contracts: &'a DefiContracts,
+    fam: &'a str,
+    chain_id: u64,
+    base: u64,
+    gas_price: u128,
+    sender: usize,
+}
+
+/// One profiling-family operation, at position `i` in the sender's
+/// queue: `i == 0` always seeds the pool, so every measured operation
+/// (`i >= 1`) has balances to move.
+fn family_op_tx(s: &DerivedSigner, ctx: &FamilyCtx<'_>, i: usize) -> anyhow::Result<PlannedTx> {
+    let nonce = ctx
+        .base
+        .checked_add(i as u64)
+        .ok_or_else(|| anyhow::anyhow!("base + {i} overflows u64"))?;
+    let seq = i as u64;
+    let (to, input, gas) = match (ctx.fam, i) {
+        (_, 0) => (ctx.contracts.pool, call("seed()", &[]), CALL_GAS_LIMIT),
+        ("swap", _) => (
+            ctx.contracts.pool,
+            call(
+                "swap(bool,uint256)",
+                &[U256::from(seq & 1), U256::from(10u128.pow(17))],
+            ),
+            CALL_GAS_LIMIT,
+        ),
+        ("vault_deposit", _) => (
+            ctx.contracts.vault,
+            call("deposit(uint256)", &[U256::from(10u128.pow(18))]),
+            CALL_GAS_LIMIT,
+        ),
+        ("vault_withdraw", n) if n % 4 == 1 => (
+            ctx.contracts.vault,
+            call("deposit(uint256)", &[U256::from(4u128 * 10u128.pow(18))]),
+            CALL_GAS_LIMIT,
+        ),
+        ("vault_withdraw", _) => (
+            ctx.contracts.vault,
+            call("withdraw(uint256)", &[U256::from(10u128.pow(17))]),
+            CALL_GAS_LIMIT,
+        ),
+        ("clob_place", _) => (
+            ctx.contracts.clob,
+            call(
+                "place(bool,uint256,uint96)",
+                &[
+                    U256::from(seq & 1),
+                    U256::from(1_000 + seq % 64),
+                    U256::from(1_000_000u64),
+                ],
+            ),
+            CALL_GAS_LIMIT,
+        ),
+        ("clob_cancel", n) if n % 2 == 1 => (
+            ctx.contracts.clob,
+            call(
+                "place(bool,uint256,uint96)",
+                &[
+                    U256::from(0u64),
+                    U256::from(1_000u64),
+                    U256::from(1_000_000u64),
+                ],
+            ),
+            CALL_GAS_LIMIT,
+        ),
+        ("clob_cancel", _) => (
+            ctx.contracts.clob,
+            call("cancel(uint256)", &[churn_id(seq)]),
+            CALL_GAS_LIMIT,
+        ),
+        ("transfer", _) => (Address::repeat_byte(0xEE), Bytes::new(), 21_000),
+        (other, _) => anyhow::bail!("unknown profile family {other:?}"),
+    };
+    sign(
+        s,
+        ctx.chain_id,
+        SignSpec {
+            nonce,
+            gas_price: ctx.gas_price,
+            gas_limit: gas,
+            to: TxKind::Call(to),
+            input,
+            sender: ctx.sender,
+        },
+    )
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::mnemonic;
-
-    const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
-
-    #[test]
-    fn op_mix_covers_all_contracts_and_is_deterministic() {
-        let c = DefiContracts::at(Address::repeat_byte(9), 0);
-        let mut hit = std::collections::HashSet::new();
-        for sender in 0..4 {
-            for seq in 1..64 {
-                let (to, data) = op(&c, sender, seq);
-                assert_eq!(op(&c, sender, seq), (to, data.clone()), "deterministic");
-                hit.insert(to);
-                assert!(data.len() >= 4);
-            }
-        }
-        assert!(hit.contains(&c.pool) && hit.contains(&c.vault) && hit.contains(&c.clob));
-    }
-
-    #[test]
-    fn deployment_addresses_match_planned_nonces() {
-        let signers = mnemonic::derive_signers(ANVIL_PHRASE, 2).unwrap();
-        let (txs, contracts) = deployment_txs(&signers, 412_346, 5, 1_000_000_000).unwrap();
-        assert_eq!(txs.len(), 3);
-        assert_eq!(txs[0].nonce, 5);
-        assert_eq!(txs[2].nonce, 7);
-        let expect = DefiContracts::at(signers[0].signer.address(), 5);
-        assert_eq!(contracts.pool, expect.pool);
-        assert_eq!(contracts.clob, expect.clob);
-    }
-
-    #[test]
-    fn sender_zero_queue_starts_after_deployments() {
-        let signers = mnemonic::derive_signers(ANVIL_PHRASE, 2).unwrap();
-        let c = DefiContracts::at(signers[0].signer.address(), 0);
-        let q = pregenerate_defi(&signers, 412_346, &c, 4, 0, 1_000_000_000).unwrap();
-        assert_eq!(q[0][0].nonce, 3, "sender 0 shifted past deployments");
-        assert_eq!(q[1][0].nonce, 0, "other senders start at nonce_start");
-        // Every sender's first operation is the pool seed, which funds
-        // swap balances.
-        for queue in &q {
-            assert!(!queue.is_empty());
-        }
-    }
-}
+pub(crate) mod tests;

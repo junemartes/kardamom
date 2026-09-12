@@ -63,14 +63,6 @@ archive_dir = "/opt/kardamom/archive"
 tx_data_archive_endpoints = ["192.168.56.31:8010", "192.168.56.32:8010"]
 tx_deposits_archive_endpoints = ["192.168.56.61:8010"]
 
-[quorum]
-# VESTIGIAL after the move to archive-at-the-sealer durability. There is no
-# longer a Q-of-N quorum aggregator; the single sealer archive's durable
-# position is THE watermark. Retained only so a channels.toml carrying a
-# [quorum] section still parses (deny_unknown_fields). n=q=1 = "one durable copy".
-n = 1
-q = 1
-
 [channels]
 # --- TxData: per-sequencer exclusive publisher of full TxEnvelope bytes. ------
 # One multicast group; stream id = base + sequencer_id distinguishes the seqs.
@@ -117,6 +109,7 @@ tx_ordering_stream_id = 1001
 # crates/ingress/src/receipt_cache.rs; no channel/flow-control change needed.
 tx_receipts_control_channel = ""
 tx_receipts_endpoint_host = ""
+# 0 means unset: receipts ride the multicast channel below, not MDS.
 tx_receipts_endpoint_base_port = 0
 tx_receipts_endpoint_interface = ""
 tx_receipts_executor_count = 3

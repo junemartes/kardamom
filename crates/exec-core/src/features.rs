@@ -18,16 +18,16 @@
 //! engine's boundary), the offline replay driver, and the stateless/zk guest
 //! shape. A block-close action implemented in only some of them causes a
 //! consensus divergence. [`apply_block_close_actions`] is the single
-//! implementation for all drivers. It takes only a state-read function as a
-//! parameter, so a driver adopts it in one line and cannot get the
-//! semantics subtly wrong.
-//!
-//! See `docs/specs/2026-08-16-l1-upgrade-feature-flags-design.md`.
+//! implementation for all drivers. It takes the block's mutable delta, the
+//! unsettled parent layer, and the read-only snapshot, so a driver calls it
+//! with its own three layers and cannot get the semantics subtly wrong.
 
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{B256, U256, keccak256};
+use kardamom_types::StateDatabase;
 use kardamom_types::upgrades::CHAIN_STATE;
 
-use crate::delta::PendingDelta;
+use crate::delta::{ParentState, PendingDelta};
+use crate::error::ExecutorError;
 
 /// Health check. This is the first feature, and it exercises the upgrade
 /// path itself. It must match `KardamomChainState.FEATURE_HEALTH_CHECK`.
@@ -45,6 +45,7 @@ pub const HEALTH_BEACON_SLOT: B256 = B256::new([
 /// Storage slot that holds `featureId`'s activation timestamp. This follows
 /// the Solidity mapping rule `keccak256(pad32(key) ++ pad32(slot))`, with the
 /// mapping at slot 0.
+#[must_use]
 pub fn activation_slot(feature_id: u64) -> B256 {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(&U256::from(feature_id).to_be_bytes::<32>());
@@ -64,25 +65,46 @@ pub fn activation_slot(feature_id: u64) -> B256 {
 /// check gives the same result on every replica. Using the header's own
 /// timestamp is what makes "active from the first block at or after T" a
 /// statement about the chain, not about execution plumbing.
+#[must_use]
 pub fn is_active(stored_activation: U256, header_ts_ms: u64) -> bool {
     !stored_activation.is_zero() && stored_activation <= U256::from(header_ts_ms)
 }
 
-/// Pack a health beacon into one word: `count | block << 64 | timestamp << 128`.
-///
-/// Fields saturate instead of wrapping, so an unlikely overflow can never
-/// corrupt a neighbor field. A wrapped count bleeding into the block-number
-/// field would look like a wildly wrong beacon, not a stuck counter. This
-/// mirrors `KardamomChainState.health()`.
-pub fn pack_beacon(count: u64, block_number: u64, timestamp_ms: u64) -> U256 {
-    U256::from(count) | (U256::from(block_number) << 64) | (U256::from(timestamp_ms) << 128)
+/// A health beacon: a heartbeat counter, the block it was last recorded
+/// at, and that block's header timestamp. Packed into one storage word
+/// as `count | block << 64 | timestamp << 128`, mirroring
+/// `KardamomChainState.health()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Beacon {
+    pub count: u64,
+    pub block_number: u64,
+    pub timestamp_ms: u64,
 }
 
-/// Inverse of [`pack_beacon`].
-pub fn unpack_beacon(word: U256) -> (u64, u64, u64) {
-    let mask = U256::from(u64::MAX);
-    let field = |shift: usize| -> u64 { ((word >> shift) & mask).to::<u64>() };
-    (field(0), field(64), field(128))
+impl Beacon {
+    /// Pack into one word. Each field is already a native `u64`, so it
+    /// fits its 64-bit lane exactly and cannot bleed into a neighbor:
+    /// the type is what bounds them, not a runtime saturate or wrap.
+    /// `64 + 128 < 256`, so all three lanes fit the `U256` word with
+    /// room to spare.
+    #[must_use]
+    pub fn pack(self) -> U256 {
+        U256::from(self.count)
+            | (U256::from(self.block_number) << 64)
+            | (U256::from(self.timestamp_ms) << 128)
+    }
+
+    /// Inverse of [`Beacon::pack`].
+    #[must_use]
+    pub fn unpack(word: U256) -> Self {
+        let mask = U256::from(u64::MAX);
+        let field = |shift: usize| -> u64 { ((word >> shift) & mask).to::<u64>() };
+        Self {
+            count: field(0),
+            block_number: field(64),
+            timestamp_ms: field(128),
+        }
+    }
 }
 
 /// What the block-close pass did, for logging and metrics. This is empty
@@ -100,10 +122,10 @@ pub struct BlockCloseOutcome {
 /// block's own writes (an upgrade deposit landing in this block activates a
 /// feature for this block), and their writes must go into the same delta.
 ///
-/// `read_slot` supplies the state layers this function cannot see: the
-/// caller's unsettled-parent layer, then its state snapshot, in that order.
-/// This function also reads the `delta` layer, so the full read order is
-/// `delta -> parent -> snapshot`, the same order the EVM uses. Reading the
+/// `parent` and `snapshot` supply the state layers this function cannot see
+/// on its own: the caller's unsettled-parent layer, then its state
+/// snapshot. Together with `delta`, [`ParentState`] gives the same
+/// `delta -> parent -> snapshot` read order the EVM uses. Reading the
 /// snapshot alone would be wrong for two reasons: it lags by up to K
 /// unsettled blocks, and it cannot hold the current block's own writes.
 ///
@@ -114,33 +136,32 @@ pub struct BlockCloseOutcome {
 /// cause a mismatch with a validator that recomputes claims from
 /// transactions. The write is still cross-checked between roles, because
 /// the validator compares the whole `BlockDelta`.
-pub fn apply_block_close_actions<E, F>(
+///
+/// # Errors
+///
+/// Returns `Err` when a `ParentState` read fails.
+pub fn apply_block_close_actions<S: StateDatabase>(
     delta: &mut PendingDelta,
     block_number: u64,
     header_ts_ms: u64,
-    mut read_slot: F,
-) -> Result<BlockCloseOutcome, E>
-where
-    F: FnMut(Address, B256) -> Result<U256, E>,
-{
+    parent: Option<&PendingDelta>,
+    snapshot: &S,
+) -> Result<BlockCloseOutcome, ExecutorError> {
     let mut out = BlockCloseOutcome::default();
 
-    // Read through delta first, so a feature scheduled by a deposit in
-    // this block is visible to this block's close.
-    let mut read = |addr: Address, slot: B256, delta: &PendingDelta| -> Result<U256, E> {
-        match delta.storage.get(&(addr, slot)) {
-            Some(v) => Ok(*v),
-            None => read_slot(addr, slot),
-        }
-    };
-
-    let activation = read(CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK), delta)?;
+    let read = ParentState::new(delta, parent, snapshot);
+    let activation = read.storage(CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK))?;
     if is_active(activation, header_ts_ms) {
-        let (beats, _, _) = unpack_beacon(read(CHAIN_STATE, HEALTH_BEACON_SLOT, delta)?);
-        let beat = beats.saturating_add(1);
+        let prior = Beacon::unpack(read.storage(CHAIN_STATE, HEALTH_BEACON_SLOT)?);
+        let beat = prior.count.saturating_add(1);
         delta.storage.insert(
             (CHAIN_STATE, HEALTH_BEACON_SLOT),
-            pack_beacon(beat, block_number, header_ts_ms),
+            Beacon {
+                count: beat,
+                block_number,
+                timestamp_ms: header_ts_ms,
+            }
+            .pack(),
         );
         out.health_beat = Some(beat);
     }
@@ -151,11 +172,49 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::convert::Infallible;
+    use crate::state::MockStateDatabase;
+    use alloy_primitives::Address;
 
-    /// A state with nothing in it. Every read misses.
-    fn empty(_a: Address, _s: B256) -> Result<U256, Infallible> {
-        Ok(U256::ZERO)
+    /// A snapshot that errors on every storage read, to exercise
+    /// `apply_block_close_actions`'s error path. `basic`, `code_by_hash`,
+    /// and the receipt lookups are never called here; each returns its own
+    /// error too, so a future caller cannot get a silent default instead.
+    #[derive(Debug, thiserror::Error)]
+    #[error("db down")]
+    struct DbDownError;
+
+    impl kardamom_types::StateError for DbDownError {}
+
+    struct FailingDb;
+
+    impl StateDatabase for FailingDb {
+        type Error = DbDownError;
+
+        fn basic(&self, _address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error> {
+            Err(DbDownError)
+        }
+
+        fn storage(&self, _address: Address, _key: B256) -> Result<U256, Self::Error> {
+            Err(DbDownError)
+        }
+
+        fn code_by_hash(&self, _code_hash: B256) -> Result<bytes::Bytes, Self::Error> {
+            Err(DbDownError)
+        }
+
+        fn get_receipt(
+            &self,
+            _pos: kardamom_types::BPosition,
+        ) -> Result<Option<kardamom_types::Receipt>, Self::Error> {
+            Err(DbDownError)
+        }
+
+        fn get_tx_position(
+            &self,
+            _tx_hash: B256,
+        ) -> Result<Option<kardamom_types::BPosition>, Self::Error> {
+            Err(DbDownError)
+        }
     }
 
     #[test]
@@ -191,20 +250,29 @@ mod tests {
 
     #[test]
     fn beacon_round_trips() {
-        let w = pack_beacon(42, 1234, 1_700_000_000_250);
-        assert_eq!(unpack_beacon(w), (42, 1234, 1_700_000_000_250));
+        let beacon = Beacon {
+            count: 42,
+            block_number: 1234,
+            timestamp_ms: 1_700_000_000_250,
+        };
+        assert_eq!(Beacon::unpack(beacon.pack()), beacon);
     }
 
     #[test]
     fn beacon_fields_do_not_bleed_at_maxima() {
-        let w = pack_beacon(u64::MAX, u64::MAX, u64::MAX);
-        assert_eq!(unpack_beacon(w), (u64::MAX, u64::MAX, u64::MAX));
+        let beacon = Beacon {
+            count: u64::MAX,
+            block_number: u64::MAX,
+            timestamp_ms: u64::MAX,
+        };
+        assert_eq!(Beacon::unpack(beacon.pack()), beacon);
     }
 
     #[test]
     fn dormant_feature_writes_nothing() {
         let mut delta = PendingDelta::new();
-        let out = apply_block_close_actions(&mut delta, 5, 1_000, empty).unwrap();
+        let snap = MockStateDatabase::builder().build();
+        let out = apply_block_close_actions(&mut delta, 5, 1_000, None, &snap).unwrap();
         assert_eq!(out.health_beat, None);
         assert!(
             delta.storage.is_empty(),
@@ -215,14 +283,14 @@ mod tests {
     #[test]
     fn scheduled_but_not_yet_reached_writes_nothing() {
         let mut delta = PendingDelta::new();
-        let read = |_a: Address, s: B256| -> Result<U256, Infallible> {
-            if s == activation_slot(FEATURE_HEALTH_CHECK) {
-                Ok(U256::from(2_000u64))
-            } else {
-                Ok(U256::ZERO)
-            }
-        };
-        let out = apply_block_close_actions(&mut delta, 5, 1_999, read).unwrap();
+        let snap = MockStateDatabase::builder()
+            .storage(
+                CHAIN_STATE,
+                activation_slot(FEATURE_HEALTH_CHECK),
+                U256::from(2_000u64),
+            )
+            .build();
+        let out = apply_block_close_actions(&mut delta, 5, 1_999, None, &snap).unwrap();
         assert_eq!(out.health_beat, None);
         assert!(delta.storage.is_empty());
     }
@@ -230,17 +298,24 @@ mod tests {
     #[test]
     fn active_feature_records_the_beacon() {
         let mut delta = PendingDelta::new();
-        let read = |_a: Address, s: B256| -> Result<U256, Infallible> {
-            if s == activation_slot(FEATURE_HEALTH_CHECK) {
-                Ok(U256::from(1_000u64))
-            } else {
-                Ok(U256::ZERO)
-            }
-        };
-        let out = apply_block_close_actions(&mut delta, 7, 1_500, read).unwrap();
+        let snap = MockStateDatabase::builder()
+            .storage(
+                CHAIN_STATE,
+                activation_slot(FEATURE_HEALTH_CHECK),
+                U256::from(1_000u64),
+            )
+            .build();
+        let out = apply_block_close_actions(&mut delta, 7, 1_500, None, &snap).unwrap();
         assert_eq!(out.health_beat, Some(1));
         let w = delta.storage[&(CHAIN_STATE, HEALTH_BEACON_SLOT)];
-        assert_eq!(unpack_beacon(w), (1, 7, 1_500));
+        assert_eq!(
+            Beacon::unpack(w),
+            Beacon {
+                count: 1,
+                block_number: 7,
+                timestamp_ms: 1_500
+            }
+        );
     }
 
     /// The layering that lets an immediate upgrade activate in its own
@@ -254,7 +329,8 @@ mod tests {
             U256::from(900u64),
         );
 
-        let out = apply_block_close_actions(&mut delta, 3, 1_000, empty).unwrap();
+        let snap = MockStateDatabase::builder().build();
+        let out = apply_block_close_actions(&mut delta, 3, 1_000, None, &snap).unwrap();
         assert_eq!(
             out.health_beat,
             Some(1),
@@ -265,18 +341,32 @@ mod tests {
     #[test]
     fn beat_count_continues_from_prior_state() {
         let mut delta = PendingDelta::new();
-        let read = |_a: Address, s: B256| -> Result<U256, Infallible> {
-            if s == activation_slot(FEATURE_HEALTH_CHECK) {
-                Ok(U256::from(1u64))
-            } else {
-                Ok(pack_beacon(9, 100, 500))
-            }
-        };
-        let out = apply_block_close_actions(&mut delta, 101, 750, read).unwrap();
+        let snap = MockStateDatabase::builder()
+            .storage(
+                CHAIN_STATE,
+                activation_slot(FEATURE_HEALTH_CHECK),
+                U256::from(1u64),
+            )
+            .storage(
+                CHAIN_STATE,
+                HEALTH_BEACON_SLOT,
+                Beacon {
+                    count: 9,
+                    block_number: 100,
+                    timestamp_ms: 500,
+                }
+                .pack(),
+            )
+            .build();
+        let out = apply_block_close_actions(&mut delta, 101, 750, None, &snap).unwrap();
         assert_eq!(out.health_beat, Some(10));
         assert_eq!(
-            unpack_beacon(delta.storage[&(CHAIN_STATE, HEALTH_BEACON_SLOT)]),
-            (10, 101, 750)
+            Beacon::unpack(delta.storage[&(CHAIN_STATE, HEALTH_BEACON_SLOT)]),
+            Beacon {
+                count: 10,
+                block_number: 101,
+                timestamp_ms: 750
+            }
         );
     }
 
@@ -290,22 +380,36 @@ mod tests {
             (CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK)),
             U256::from(1u64),
         );
-        delta
-            .storage
-            .insert((CHAIN_STATE, HEALTH_BEACON_SLOT), pack_beacon(4, 1, 1));
-        let read = |_a: Address, _s: B256| -> Result<U256, Infallible> {
-            // Stale backing value that must not win.
-            Ok(pack_beacon(99, 99, 99))
-        };
-        let out = apply_block_close_actions(&mut delta, 2, 2, read).unwrap();
+        delta.storage.insert(
+            (CHAIN_STATE, HEALTH_BEACON_SLOT),
+            Beacon {
+                count: 4,
+                block_number: 1,
+                timestamp_ms: 1,
+            }
+            .pack(),
+        );
+        // Stale backing value that must not win.
+        let snap = MockStateDatabase::builder()
+            .storage(
+                CHAIN_STATE,
+                HEALTH_BEACON_SLOT,
+                Beacon {
+                    count: 99,
+                    block_number: 99,
+                    timestamp_ms: 99,
+                }
+                .pack(),
+            )
+            .build();
+        let out = apply_block_close_actions(&mut delta, 2, 2, None, &snap).unwrap();
         assert_eq!(out.health_beat, Some(5));
     }
 
     #[test]
     fn read_errors_propagate() {
         let mut delta = PendingDelta::new();
-        let read = |_a: Address, _s: B256| -> Result<U256, &'static str> { Err("db down") };
-        let err = apply_block_close_actions(&mut delta, 1, 1, read).unwrap_err();
-        assert_eq!(err, "db down");
+        let err = apply_block_close_actions(&mut delta, 1, 1, None, &FailingDb).unwrap_err();
+        assert!(matches!(err, ExecutorError::State(_)), "got {err:?}");
     }
 }

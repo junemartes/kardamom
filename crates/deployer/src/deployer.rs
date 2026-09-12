@@ -172,6 +172,11 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     /// Make sure the kardamom factory is deployed on the connected chain.
     /// Anyone with gas can call this. The on-chain owner is set at initialize
     /// time.
+    ///
+    /// # Errors
+    /// Returns an error when the ERC-7955 factory is absent, an L1 call
+    /// fails, or the bootstrap transaction does not leave the factory
+    /// deployed.
     pub async fn ensure_factory(&self, operator: Address) -> Result<FactoryStatus, DeployError> {
         // (a) ERC-7955 factory must be present.
         if !self.code_present(ERC7955_FACTORY).await? {
@@ -221,6 +226,10 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     /// CREATE2 of the impl. The other specs reference the impl address,
     /// computed offline, through `target_impl`. So an upgrade of the same
     /// new impl across N L2s deploys the impl once, not N times.
+    ///
+    /// # Errors
+    /// Returns an error when the factory is not deployed, or the
+    /// `applyDeployments` transaction fails.
     pub async fn apply(&self, ops: &[Op], operator: Address) -> Result<TxHash, DeployError> {
         let factory_proxy = self.factory_address();
 
@@ -254,6 +263,9 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 
     /// Read the factory's on-chain registry. If `l2_chain_id` is `Some`, return
     /// entries for only that L2. Otherwise, return entries for all registered L2s.
+    ///
+    /// # Errors
+    /// Returns an error when an L1 call fails.
     pub async fn addresses(
         &self,
         l2_chain_id: Option<u64>,
@@ -264,40 +276,69 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
             return Err(DeployError::FactoryNotDeployed(factory_proxy));
         }
 
-        let factory = IKardamomFactory::new(factory_proxy, &self.provider);
-
         let l2s: Vec<u64> = if let Some(id) = l2_chain_id {
             vec![id]
         } else {
-            let count: U256 = factory.l2ChainIdCount().call().await?;
-            let count: u64 = count.to();
-            let mut out = Vec::with_capacity(count as usize);
-            for i in 0..count {
-                let v: U256 = factory.l2ChainIdAt(U256::from(i)).call().await?;
-                out.push(v.to());
-            }
-            out
+            self.all_l2_chain_ids().await?
         };
 
         let mut entries = Vec::new();
         for l2 in l2s {
-            let count: U256 = factory.idCount(U256::from(l2)).call().await?;
-            let count: u64 = count.to();
-            for i in 0..count {
-                let id: B256 = factory.idAt(U256::from(l2), U256::from(i)).call().await?;
-                let e: IKardamomFactory::Entry = factory.entry(U256::from(l2), id).call().await?;
-                entries.push(RegistryEntry {
-                    l2_chain_id: l2,
-                    id,
-                    proxy: e.proxy,
-                    current_impl: e.currentImpl,
-                    version: e.version,
-                    deployed_at: e.deployedAt,
-                    upgraded_at: e.upgradedAt,
-                });
-            }
+            entries.extend(self.entries_for_l2(l2).await?);
         }
         Ok(entries)
+    }
+
+    /// The `IKardamomFactory` binding at this deployer's owner-derived
+    /// proxy address.
+    fn factory(&self) -> IKardamomFactory::IKardamomFactoryInstance<&P> {
+        IKardamomFactory::new(self.factory_address(), &self.provider)
+    }
+
+    /// Read an L1 counter through `factory_count_u64`, and a `Vec`
+    /// pre-sized to hold that many items. A capacity hint only: `count`
+    /// from an L1 call exceeding `usize` (32-bit hosts only) just costs a
+    /// realloc, not correctness.
+    fn sized_output<T>(count: U256, field: &str) -> Result<(u64, Vec<T>), DeployError> {
+        let count = Self::factory_count_u64(count, field)?;
+        let out = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        Ok((count, out))
+    }
+
+    /// Enumerate `l2ChainIdAt(i)` for `i` in `0..l2ChainIdCount()`: every
+    /// L2 chain id the factory has registered.
+    async fn all_l2_chain_ids(&self) -> Result<Vec<u64>, DeployError> {
+        let factory = self.factory();
+        let (count, mut out) =
+            Self::sized_output(factory.l2ChainIdCount().call().await?, "l2ChainIdCount")?;
+        for i in 0..count {
+            let v: U256 = factory.l2ChainIdAt(U256::from(i)).call().await?;
+            out.push(v.to());
+        }
+        Ok(out)
+    }
+
+    /// Read all registry entries for one L2: enumerate `idAt(l2, i)` for
+    /// `i` in `0..idCount(l2)`, then fetch each entry. Its own method so
+    /// `addresses` iterates only its outer `l2s` loop.
+    async fn entries_for_l2(&self, l2: u64) -> Result<Vec<RegistryEntry>, DeployError> {
+        let factory = self.factory();
+        let (count, mut out) =
+            Self::sized_output(factory.idCount(U256::from(l2)).call().await?, "idCount")?;
+        for i in 0..count {
+            let id: B256 = factory.idAt(U256::from(l2), U256::from(i)).call().await?;
+            let e: IKardamomFactory::Entry = factory.entry(U256::from(l2), id).call().await?;
+            out.push(RegistryEntry {
+                l2_chain_id: l2,
+                id,
+                proxy: e.proxy,
+                current_impl: e.currentImpl,
+                version: e.version,
+                deployed_at: e.deployedAt,
+                upgraded_at: e.upgradedAt,
+            });
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -305,27 +346,44 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // -----------------------------------------------------------------------
 
     /// Check that each registry entry's `currentImpl` matches the proxy's ERC1967 impl slot.
+    ///
+    /// # Errors
+    /// Returns an error when [`Self::addresses`] or an L1 storage read fails.
     pub async fn verify(&self) -> Result<VerifyReport, DeployError> {
         let entries = self.addresses(None).await?;
-        let mut mismatches = Vec::new();
-        let slot_u256 = U256::from_be_bytes(*ERC1967_IMPL_SLOT);
-
-        for entry in &entries {
-            let raw_slot: U256 = self.provider.get_storage_at(entry.proxy, slot_u256).await?;
-            let erc1967_impl = Address::from_word(B256::from(raw_slot));
-            if erc1967_impl != entry.current_impl {
-                mismatches.push(VerifyMismatch {
-                    id: entry.id,
-                    proxy: entry.proxy,
-                    registry_impl: entry.current_impl,
-                    erc1967_impl,
-                });
-            }
-        }
+        let mismatches = self.find_impl_mismatches(&entries).await?;
         Ok(VerifyReport {
             entries,
             mismatches,
         })
+    }
+
+    /// Check each registry entry's ERC1967 storage slot against its
+    /// registered `currentImpl`, and collect the mismatches.
+    async fn find_impl_mismatches(
+        &self,
+        entries: &[RegistryEntry],
+    ) -> Result<Vec<VerifyMismatch>, DeployError> {
+        let slot_u256 = U256::from_be_bytes(*ERC1967_IMPL_SLOT);
+        // Read every proxy's ERC1967 impl slot first (one L1 call each, in
+        // registry order); the comparison against the registered impl is
+        // then a plain, synchronous filter.
+        let mut erc1967_impls = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let raw_slot: U256 = self.provider.get_storage_at(entry.proxy, slot_u256).await?;
+            erc1967_impls.push(Address::from_word(B256::from(raw_slot)));
+        }
+        Ok(entries
+            .iter()
+            .zip(erc1967_impls)
+            .filter(|(entry, erc1967_impl)| *erc1967_impl != entry.current_impl)
+            .map(|(entry, erc1967_impl)| VerifyMismatch {
+                id: entry.id,
+                proxy: entry.proxy,
+                registry_impl: entry.current_impl,
+                erc1967_impl,
+            })
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -370,31 +428,73 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         let receipt = self.send_and_confirm(tx).await?;
         Ok(receipt.transaction_hash())
     }
+
+    /// `count.try_into::<u64>()`, with a typed error instead of `U256::to`'s
+    /// panic on overflow. `field` names the factory getter this count came
+    /// from, for the error message.
+    fn factory_count_u64(count: U256, field: &str) -> Result<u64, DeployError> {
+        u64::try_from(count)
+            .map_err(|_| DeployError::Provider(format!("{field} does not fit in u64: {count}")))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
 
-/// Impl-dedup pass used by [`Deployer::apply`]. Within each `(id, impl_salt)`
+/// A dedup group's key: one `(id, impl_salt)` pair shares one impl
+/// deploy. Named instead of a bare tuple, so the map it keys reads as
+/// what it is.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ImplKey {
+    id: B256,
+    impl_salt: B256,
+}
+
+/// Impl-dedup pass used by [`Deployer::apply`]. Within each [`ImplKey`]
 /// group, the first spec keeps `target_impl = zero`, so the factory does a
 /// CREATE2 of the impl. The other specs reference the impl through
 /// `target_impl`, computed offline from the factory address and the spec's
 /// `impl_salt` and `impl_initcode`.
 fn dedup_impl_specs(factory: Address, specs: &mut [DeploymentSpec]) {
-    let mut seen_impl: std::collections::HashMap<(B256, B256), Address> =
-        std::collections::HashMap::new();
+    let mut dedup = ImplDedup::new(factory);
     for s in specs {
-        let key = (s.id, s.impl_salt);
-        if let Some(addr) = seen_impl.get(&key) {
-            s.target_impl = *addr;
-        } else {
-            let computed =
-                crate::addresses::app_impl_address(factory, s.impl_salt, &s.impl_initcode);
-            seen_impl.insert(key, computed);
-            // The first spec in the group keeps target_impl = zero.
-            // The factory does a CREATE2 for the impl.
+        dedup.resolve(s);
+    }
+}
+
+/// [`dedup_impl_specs`]'s state: the factory address every impl deploys
+/// through, and the impls already seen this pass.
+struct ImplDedup {
+    factory: Address,
+    seen: std::collections::HashMap<ImplKey, Address>,
+}
+
+impl ImplDedup {
+    fn new(factory: Address) -> Self {
+        Self {
+            factory,
+            seen: std::collections::HashMap::new(),
         }
+    }
+
+    /// One spec's impl-dedup step. The first spec for its [`ImplKey`]
+    /// keeps `target_impl = zero` — the factory does a CREATE2 of the
+    /// impl. Every later spec in the group references that impl through
+    /// `target_impl`, computed offline from the factory address and the
+    /// spec's `impl_salt` and `impl_initcode`.
+    fn resolve(&mut self, s: &mut DeploymentSpec) {
+        let key = ImplKey {
+            id: s.id,
+            impl_salt: s.impl_salt,
+        };
+        if let Some(addr) = self.seen.get(&key) {
+            s.target_impl = *addr;
+            return;
+        }
+        let computed =
+            crate::addresses::app_impl_address(self.factory, s.impl_salt, &s.impl_initcode);
+        self.seen.insert(key, computed);
     }
 }
 

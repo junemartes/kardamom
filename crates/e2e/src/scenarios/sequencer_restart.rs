@@ -21,7 +21,7 @@ use std::time::Duration;
 use alloy_primitives::Address;
 use anyhow::{Context, Result};
 
-use super::Target;
+use super::{Target, count_as_f64};
 use crate::harness::l2;
 use crate::harness::metrics::poll_until;
 
@@ -41,43 +41,66 @@ impl Default for Params {
     }
 }
 
+/// The recipient every transfer of this scenario pays.
+const TO: Address = Address::new([0x57u8; 20]);
+
+impl Params {
+    /// The scenario's sender.
+    fn signer(&self) -> Result<l2::DerivedSigner> {
+        let signers = l2::dev_signers_through(self.sender)?;
+        Ok(signers[self.sender].clone())
+    }
+}
+
 /// The sender the scenario uses, for the test to pick the sequencer.
+///
+/// # Errors
+/// Returns an error when the dev signers cannot be derived.
 pub fn sender_address(p: &Params) -> Result<Address> {
-    let signers = l2::dev_signers(p.sender as u32 + 1)?;
-    Ok(signers[p.sender].address)
+    Ok(p.signer()?.address)
 }
 
 /// Phase 1: land `established` transactions. Returns the executor's
 /// applied count after them.
+///
+/// # Errors
+/// Returns an error when a transaction fails to send, or when the
+/// executor does not apply them all in time.
 pub async fn phase_before_restart(t: &Target, p: &Params) -> Result<f64> {
-    let signers = l2::dev_signers(p.sender as u32 + 1)?;
-    let sender = &signers[p.sender];
-    let to = Address::from([0x57u8; 20]);
+    let sender = p.signer()?;
     let applied_start = t
-        .executor_metric(super::EXEC_TX_APPLIED)
-        .await
+        .executor_metric_opt(super::EXEC_TX_APPLIED)
+        .await?
         .unwrap_or(0.0);
     for n in 0..p.established {
-        let tx = l2::sign_transfer(sender, t.chain_id, n, to, 1)?;
-        let out = t.rpc.send_raw(&tx.raw).await;
-        out.result
-            .map_err(|e| anyhow::anyhow!("established nonce {n} failed: {e}"))?;
+        send_established(t, &sender, n).await?;
     }
-    let applied = applied_start + p.established as f64;
+    let applied = applied_start + count_as_f64(p.established);
     t.wait_executor_applied(applied, Duration::from_secs(15))
         .await
         .context("established transactions applied")?;
     Ok(applied)
 }
 
+/// One transaction of [`phase_before_restart`]'s loop.
+async fn send_established(t: &Target, sender: &l2::DerivedSigner, n: u64) -> Result<()> {
+    let tx = l2::sign_transfer(sender, t.chain_id, n, TO, 1)?;
+    let out = t.rpc.send_raw(&tx.raw).await;
+    out.result
+        .map_err(|e| anyhow::anyhow!("established nonce {n} failed: {e}"))?;
+    Ok(())
+}
+
 /// Phase 2: the next nonce lands on the cold replica through the lookup.
+///
+/// # Errors
+/// Returns an error when the transaction fails, takes the whole park
+/// bound, is not applied, or when no lookup ran.
 pub async fn phase_after_restart(t: &Target, p: &Params, applied_before: f64) -> Result<()> {
-    let signers = l2::dev_signers(p.sender as u32 + 1)?;
-    let sender = &signers[p.sender];
-    let to = Address::from([0x57u8; 20]);
+    let sender = p.signer()?;
     let lookups_start = t.sequencer_metric_sum(super::SEQ_NONCE_LOOKUPS).await?;
 
-    let tx = l2::sign_transfer(sender, t.chain_id, p.established, to, 1)?;
+    let tx = l2::sign_transfer(&sender, t.chain_id, p.established, TO, 1)?;
     let out = t.rpc.send_raw(&tx.raw).await;
     let hash = out.result.map_err(|e| {
         anyhow::anyhow!(

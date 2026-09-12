@@ -9,17 +9,23 @@
 //!    exactly as the legacy rule `keccak256(sender)[..8] % M` did. The
 //!    test `identity_matches_legacy_rule` pins this.
 //!
-//! A lane is a tx_data stream. The lane index is a `u8` on the wire
+//! A lane is a `tx_data` stream. The lane index is a `u8` on the wire
 //! (`TxRef::shard_id`).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
+use core::num::NonZeroU32;
 
 use alloy_primitives::{Address, keccak256};
 
+use crate::num::u32_to_usize;
+
 /// The number of virtual slots. The fixed level maps each sender to one.
 pub const VSLOT_COUNT: usize = 256;
+
+/// [`VSLOT_COUNT`] as the `u32` the lane arithmetic divides.
+const VSLOT_COUNT_U32: u32 = 256;
 
 /// The maximum number of lanes. A lane index is a `u8`.
 pub const LANE_CAP: u32 = 256;
@@ -33,17 +39,24 @@ pub const LANE_COUNT: u8 = 8;
 /// Validate a shard count `m` against the lane plane and the identity map.
 /// `m` must be between 1 and [`LANE_COUNT`], and must divide 256. So the
 /// valid values are 1, 2, 4, and 8. Returns `m` as a lane count.
+///
+/// # Errors
+///
+/// Returns [`ShardMapError::LaneCount`] for zero,
+/// [`ShardMapError::AboveLanePlane`] past [`LANE_COUNT`], and
+/// [`ShardMapError::NotADivisor`] when `m` does not divide 256.
 pub fn validate_shard_count(m: u32) -> Result<u8, ShardMapError> {
     if m == 0 {
         return Err(ShardMapError::LaneCount(m));
     }
-    if m > LANE_COUNT as u32 {
-        return Err(ShardMapError::AboveLanePlane(m));
-    }
-    if !(VSLOT_COUNT as u32).is_multiple_of(m) {
+    let lanes = u8::try_from(m)
+        .ok()
+        .filter(|lanes| *lanes <= LANE_COUNT)
+        .ok_or(ShardMapError::AboveLanePlane(m))?;
+    if !VSLOT_COUNT_U32.is_multiple_of(m) {
         return Err(ShardMapError::NotADivisor(m));
     }
-    Ok(m as u8)
+    Ok(lanes)
 }
 
 /// The first 8 bytes of `keccak256(sender)` as a big-endian `u64`.
@@ -53,10 +66,12 @@ fn sender_hash_prefix(sender: Address) -> u64 {
     u64::from_be_bytes(h[..8].try_into().expect("8 bytes"))
 }
 
-/// The fixed level. Returns the virtual slot of `sender`.
+/// The fixed level. Returns the virtual slot of `sender`: the low byte of
+/// the hash prefix, which is the prefix modulo [`VSLOT_COUNT`].
 #[inline]
+#[must_use]
 pub fn vslot_for(sender: Address) -> u8 {
-    (sender_hash_prefix(sender) % VSLOT_COUNT as u64) as u8
+    sender_hash_prefix(sender).to_be_bytes()[7]
 }
 
 /// The legacy rule: `keccak256(sender)[..8] % m`.
@@ -65,14 +80,18 @@ pub fn vslot_for(sender: Address) -> u8 {
 /// `vslot_for(sender)`. For any other `m`, the map layer does not apply,
 /// and this function computes the legacy rule directly.
 #[inline]
-pub fn partition_for(sender: Address, m: u32) -> u32 {
-    debug_assert!(m > 0, "partition count must be positive");
-    if m > 0 && (VSLOT_COUNT as u32).is_multiple_of(m) {
+#[must_use]
+pub fn partition_for(sender: Address, m: NonZeroU32) -> u32 {
+    if VSLOT_COUNT_U32.is_multiple_of(m.get()) {
         // Map v0: lane = vslot % m.
-        vslot_for(sender) as u32 % m
-    } else {
-        (sender_hash_prefix(sender) % m as u64) as u32
+        return u32::from(vslot_for(sender)) % m.get();
     }
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "prefix % u64::from(m) is below m, which is a u32"
+    )]
+    let lane = (sender_hash_prefix(sender) % u64::from(m.get())) as u32;
+    lane
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -98,26 +117,40 @@ pub struct ShardMap {
 
 impl ShardMap {
     /// Map v0: `lane = vslot % lanes`. `lanes` must divide 256.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardMapError::LaneCount`] for zero or more than
+    /// [`LANE_CAP`] lanes, and [`ShardMapError::NotADivisor`] when
+    /// `lanes` does not divide 256.
     pub fn identity(lanes: u32) -> Result<Self, ShardMapError> {
         if lanes == 0 || lanes > LANE_CAP {
             return Err(ShardMapError::LaneCount(lanes));
         }
-        if !(VSLOT_COUNT as u32).is_multiple_of(lanes) {
+        if !VSLOT_COUNT_U32.is_multiple_of(lanes) {
             return Err(ShardMapError::NotADivisor(lanes));
         }
-        let mut table = [0u8; VSLOT_COUNT];
-        for (vslot, lane) in table.iter_mut().enumerate() {
-            *lane = (vslot as u32 % lanes) as u8;
-        }
+        let lanes = u32_to_usize(lanes);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "vslot % lanes is below lanes, which is at most 256, and below 256 when lanes is 256"
+        )]
+        let table = core::array::from_fn(|vslot| (vslot % lanes) as u8);
         Ok(Self { version: 0, table })
     }
 
     /// A map from an explicit table.
+    #[must_use]
     pub const fn from_table(version: u32, table: [u8; VSLOT_COUNT]) -> Self {
         Self { version, table }
     }
 
     /// Check that every lane fits the lane plane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardMapError::LaneAbovePlane`] with the first lane at or
+    /// past [`LANE_COUNT`].
     pub fn validate(&self) -> Result<(), ShardMapError> {
         match self.table.iter().find(|l| **l >= LANE_COUNT) {
             Some(l) => Err(ShardMapError::LaneAbovePlane(*l)),
@@ -126,46 +159,53 @@ impl ShardMap {
     }
 
     /// The number of active lanes: the highest lane in the table plus one.
+    /// Saturates at `u8::MAX` for a table that uses lane 255.
+    #[must_use]
     pub fn active_lanes(&self) -> u8 {
-        self.table.iter().copied().max().map_or(0, |l| l + 1)
+        self.table
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |l| l.saturating_add(1))
     }
 
     /// The virtual slots of `lane`, as a set.
+    #[must_use]
     pub fn vslot_set(&self, lane: u8) -> VslotSet {
-        let mut set = VslotSet::EMPTY;
-        for v in self.vslots_of_lane(lane) {
-            set.insert(v);
-        }
-        set
+        self.vslots_of_lane(lane)
+            .fold(VslotSet::EMPTY, VslotSet::with)
     }
 
+    #[must_use]
     pub const fn version(&self) -> u32 {
         self.version
     }
 
+    #[must_use]
     pub const fn table(&self) -> &[u8; VSLOT_COUNT] {
         &self.table
     }
 
     /// The lane of one virtual slot.
     #[inline]
+    #[must_use]
     pub fn lane_of_vslot(&self, vslot: u8) -> u8 {
-        self.table[vslot as usize]
+        self.table[usize::from(vslot)]
     }
 
     /// The lane of `sender`: both levels applied.
     #[inline]
+    #[must_use]
     pub fn lane_for(&self, sender: Address) -> u8 {
         self.lane_of_vslot(vslot_for(sender))
     }
 
     /// The virtual slots that map to `lane`, in ascending order.
     pub fn vslots_of_lane(&self, lane: u8) -> impl Iterator<Item = u8> + '_ {
-        self.table
-            .iter()
-            .enumerate()
+        (0..=u8::MAX)
+            .zip(self.table.iter())
             .filter(move |(_, l)| **l == lane)
-            .map(|(vslot, _)| vslot as u8)
+            .map(|(vslot, _)| vslot)
     }
 }
 
@@ -215,53 +255,110 @@ pub enum VslotSetParseError {
     BadRange(String),
 }
 
+/// One `a` or `a-b` range of the text form, inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VslotRange {
+    lo: u8,
+    hi: u8,
+}
+
+impl VslotRange {
+    /// Parse one comma-separated part of the text form.
+    fn parse(part: &str) -> Result<Self, VslotSetParseError> {
+        let (a, b) = part.split_once('-').unwrap_or((part, part));
+        match (a.trim().parse::<u8>(), b.trim().parse::<u8>()) {
+            (Ok(lo), Ok(hi)) if lo <= hi => Ok(Self { lo, hi }),
+            _ => Err(VslotSetParseError::BadRange(String::from(part))),
+        }
+    }
+
+    /// The text form: `a` for a single slot, `a-b` otherwise.
+    fn write(self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.lo == self.hi {
+            write!(f, "{}", self.lo)
+        } else {
+            write!(f, "{}-{}", self.lo, self.hi)
+        }
+    }
+
+    /// Extend the range by `v` if `v` is the next slot, else start a new
+    /// range at `v` and hand back the finished one.
+    fn push(self, v: u8) -> (Self, Option<Self>) {
+        if self.hi.checked_add(1) == Some(v) {
+            (Self { lo: self.lo, hi: v }, None)
+        } else {
+            (Self { lo: v, hi: v }, Some(self))
+        }
+    }
+}
+
 impl VslotSet {
     pub const EMPTY: Self = Self { words: [0; 4] };
 
     /// Every virtual slot.
+    #[must_use]
     pub const fn full() -> Self {
         Self {
             words: [u64::MAX; 4],
         }
     }
 
+    /// The word and the bit of `vslot`.
+    #[inline]
+    const fn slot(vslot: u8) -> (usize, u64) {
+        ((vslot >> 6) as usize, 1u64 << (vslot & 63))
+    }
+
     pub fn insert(&mut self, vslot: u8) {
-        self.words[(vslot >> 6) as usize] |= 1u64 << (vslot & 63);
+        let (word, bit) = Self::slot(vslot);
+        self.words[word] |= bit;
+    }
+
+    /// `self` with `vslot` inserted. The by-value form of
+    /// [`Self::insert`], for folds.
+    #[must_use]
+    pub fn with(mut self, vslot: u8) -> Self {
+        self.insert(vslot);
+        self
     }
 
     pub fn remove(&mut self, vslot: u8) {
-        self.words[(vslot >> 6) as usize] &= !(1u64 << (vslot & 63));
+        let (word, bit) = Self::slot(vslot);
+        self.words[word] &= !bit;
     }
 
     #[inline]
+    #[must_use]
     pub fn contains(&self, vslot: u8) -> bool {
-        self.words[(vslot >> 6) as usize] & (1u64 << (vslot & 63)) != 0
+        let (word, bit) = Self::slot(vslot);
+        self.words[word] & bit != 0
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
-        self.words.iter().map(|w| w.count_ones() as usize).sum()
+        u32_to_usize(self.words.iter().map(|w| w.count_ones()).sum())
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.words.iter().all(|w| *w == 0)
     }
 
+    #[must_use]
     pub fn union(&self, other: &Self) -> Self {
-        let mut out = *self;
-        for (a, b) in out.words.iter_mut().zip(other.words.iter()) {
-            *a |= *b;
+        Self {
+            words: core::array::from_fn(|i| self.words[i] | other.words[i]),
         }
-        out
     }
 
+    #[must_use]
     pub fn difference(&self, other: &Self) -> Self {
-        let mut out = *self;
-        for (a, b) in out.words.iter_mut().zip(other.words.iter()) {
-            *a &= !*b;
+        Self {
+            words: core::array::from_fn(|i| self.words[i] & !other.words[i]),
         }
-        out
     }
 
+    #[must_use]
     pub fn is_subset_of(&self, other: &Self) -> bool {
         self.words
             .iter()
@@ -271,64 +368,68 @@ impl VslotSet {
 
     /// The slots, ascending.
     pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
-        (0..=255u8).filter(move |v| self.contains(*v))
+        (0..=u8::MAX).filter(move |v| self.contains(*v))
     }
 
     /// Parse the text form: comma-separated `a` or `a-b` ranges. Spaces
     /// are ignored. The empty string is the empty set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VslotSetParseError::BadRange`] for a part that is not
+    /// `a` or `a-b` with `a <= b` in `0..=255`.
     pub fn parse(text: &str) -> Result<Self, VslotSetParseError> {
-        let mut set = Self::EMPTY;
-        for part in text.split(',') {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
-            }
-            let (lo, hi) = match part.split_once('-') {
-                Some((a, b)) => (a.trim().parse::<u8>(), b.trim().parse::<u8>()),
-                None => (part.parse::<u8>(), part.parse::<u8>()),
-            };
-            match (lo, hi) {
-                (Ok(lo), Ok(hi)) if lo <= hi => {
-                    for v in lo..=hi {
-                        set.insert(v);
-                    }
-                }
-                _ => return Err(VslotSetParseError::BadRange(String::from(part))),
-            }
-        }
-        Ok(set)
+        text.split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(VslotRange::parse)
+            .try_fold(Self::EMPTY, |set, range| {
+                range.map(|r| (r.lo..=r.hi).fold(set, Self::with))
+            })
+    }
+
+    /// The ranges of the text form, ascending: maximal runs of adjacent
+    /// slots.
+    fn ranges(&self) -> Vec<VslotRange> {
+        let (mut out, open) = self.iter().fold((Vec::new(), None), |(out, open), v| {
+            Self::extend_runs(out, open, v)
+        });
+        out.extend(open);
+        out
+    }
+
+    /// One [`Self::ranges`] step: add `v` to the open run, or close the
+    /// run into `out` and open a new one at `v`.
+    fn extend_runs(
+        mut out: Vec<VslotRange>,
+        open: Option<VslotRange>,
+        v: u8,
+    ) -> (Vec<VslotRange>, Option<VslotRange>) {
+        let Some(open) = open else {
+            return (out, Some(VslotRange { lo: v, hi: v }));
+        };
+        let (open, done) = open.push(v);
+        out.extend(done);
+        (out, Some(open))
     }
 }
 
 impl fmt::Display for VslotSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut first = true;
-        let mut run: Option<(u8, u8)> = None;
-        let flush = |f: &mut fmt::Formatter<'_>, run: (u8, u8), first: &mut bool| {
-            if !*first {
-                f.write_str(",")?;
-            }
-            *first = false;
-            if run.0 == run.1 {
-                write!(f, "{}", run.0)
-            } else {
-                write!(f, "{}-{}", run.0, run.1)
-            }
-        };
-        for v in self.iter() {
-            run = match run {
-                Some((lo, hi)) if hi + 1 == v => Some((lo, v)),
-                Some(done) => {
-                    flush(f, done, &mut first)?;
-                    Some((v, v))
-                }
-                None => Some((v, v)),
-            };
+        self.ranges()
+            .into_iter()
+            .enumerate()
+            .try_for_each(|(i, range)| Self::write_range(f, i, range))
+    }
+}
+
+impl VslotSet {
+    /// One range of the text form, with its separator after the first.
+    fn write_range(f: &mut fmt::Formatter<'_>, i: usize, range: VslotRange) -> fmt::Result {
+        if i > 0 {
+            f.write_str(",")?;
         }
-        if let Some(done) = run {
-            flush(f, done, &mut first)?;
-        }
-        Ok(())
+        range.write(f)
     }
 }
 
@@ -362,6 +463,10 @@ impl<'de> serde::Deserialize<'de> for VslotSet {
 mod tests {
     use super::*;
     use alloy_primitives::address;
+
+    fn nz(m: u32) -> NonZeroU32 {
+        NonZeroU32::new(m).unwrap()
+    }
 
     #[test]
     fn vslot_set_round_trips_its_text_form() {
@@ -427,41 +532,47 @@ mod tests {
         })
     }
 
-    fn legacy_rule(sender: Address, m: u32) -> u32 {
+    fn legacy_rule(sender: Address, m: u32) -> u64 {
         let h = keccak256(sender.as_slice());
-        (u64::from_be_bytes(h[..8].try_into().unwrap()) % m as u64) as u32
+        u64::from_be_bytes(h[..8].try_into().unwrap()) % u64::from(m)
     }
 
     #[test]
     fn identity_matches_legacy_rule() {
         // The parity test from the spec, milestone 1. For M in {2, 8}, the
         // identity map assigns every sender exactly as the legacy rule.
-        for m in [2u32, 8] {
+        let cases = [2u32, 8]
+            .into_iter()
+            .flat_map(|m| addresses().map(move |a| (m, a)));
+        for (m, a) in cases {
             let map = ShardMap::identity(m).unwrap();
             assert_eq!(map.version(), 0);
-            for a in addresses() {
-                let legacy = legacy_rule(a, m);
-                assert_eq!(map.lane_for(a) as u32, legacy, "sender {a} m {m}");
-                assert_eq!(partition_for(a, m), legacy, "sender {a} m {m}");
-            }
+            let legacy = legacy_rule(a, m);
+            assert_eq!(u64::from(map.lane_for(a)), legacy, "sender {a} m {m}");
+            assert_eq!(
+                u64::from(partition_for(a, nz(m))),
+                legacy,
+                "sender {a} m {m}"
+            );
         }
     }
 
     #[test]
     fn identity_holds_for_every_divisor_of_256() {
-        for m in [1u32, 2, 4, 16, 32, 64, 128, 256] {
+        let cases = [1u32, 2, 4, 16, 32, 64, 128, 256]
+            .into_iter()
+            .flat_map(|m| addresses().take(512).map(move |a| (m, a)));
+        for (m, a) in cases {
             let map = ShardMap::identity(m).unwrap();
-            for a in addresses().take(512) {
-                assert_eq!(map.lane_for(a) as u32, legacy_rule(a, m));
-            }
+            assert_eq!(u64::from(map.lane_for(a)), legacy_rule(a, m));
         }
     }
 
     #[test]
     fn legacy_rule_still_applies_to_a_non_divisor() {
         for a in addresses().take(512) {
-            assert_eq!(partition_for(a, 3), legacy_rule(a, 3));
-            assert_eq!(partition_for(a, 7), legacy_rule(a, 7));
+            assert_eq!(u64::from(partition_for(a, nz(3))), legacy_rule(a, 3));
+            assert_eq!(u64::from(partition_for(a, nz(7))), legacy_rule(a, 7));
         }
     }
 
@@ -482,8 +593,8 @@ mod tests {
 
     #[test]
     fn shard_count_must_fit_the_lane_plane() {
-        for m in [1u32, 2, 4, 8] {
-            assert_eq!(validate_shard_count(m), Ok(m as u8));
+        for m in [1u8, 2, 4, 8] {
+            assert_eq!(validate_shard_count(u32::from(m)), Ok(m));
         }
         assert_eq!(validate_shard_count(0), Err(ShardMapError::LaneCount(0)));
         assert_eq!(validate_shard_count(3), Err(ShardMapError::NotADivisor(3)));
@@ -498,14 +609,14 @@ mod tests {
     fn identity_table_partitions_the_vslots() {
         let map = ShardMap::identity(8).unwrap();
         let mut seen = [false; VSLOT_COUNT];
-        for lane in 0u8..8 {
-            let slots: Vec<u8> = map.vslots_of_lane(lane).collect();
-            assert_eq!(slots.len(), 32);
-            for s in slots {
-                assert_eq!(s % 8, lane);
-                assert!(!seen[s as usize]);
-                seen[s as usize] = true;
-            }
+        let slots: Vec<(u8, u8)> = (0u8..8)
+            .flat_map(|lane| map.vslots_of_lane(lane).map(move |s| (lane, s)))
+            .collect();
+        assert_eq!(slots.len(), VSLOT_COUNT);
+        for (lane, s) in slots {
+            assert_eq!(s % 8, lane);
+            assert!(!seen[usize::from(s)]);
+            seen[usize::from(s)] = true;
         }
         assert!(seen.iter().all(|s| *s));
         assert_eq!(map.vslots_of_lane(8).count(), 0);
@@ -518,20 +629,19 @@ mod tests {
         let map = ShardMap::from_table(7, table);
         assert_eq!(map.version(), 7);
         assert_eq!(map.lane_of_vslot(5), 2);
-        assert_eq!(map.lane_of_vslot(6), 0);
-        assert_eq!(map.table(), &table);
+        assert_eq!(map.lane_of_vslot(4), 0);
+        assert_eq!(map.table()[5], 2);
+        assert_eq!(map.active_lanes(), 3);
     }
 
     #[test]
     fn known_vector_is_stable() {
-        // keccak256(0x00000000000000000000000000000000DeadBeef) =
-        // 0xbd174f45fb00f790_5ce254c0ef491691c955a15fdf10c5665b4493a591627fbe.
-        // The vslot is the low byte of the first 8 bytes: 0x90 = 144.
+        // Pins the fixed level: a change here changes every sender's lane.
         let a = address!("00000000000000000000000000000000DeadBeef");
         assert_eq!(vslot_for(a), 0x90);
-        assert_eq!(partition_for(a, 8), 0);
-        assert_eq!(partition_for(a, 2), 0);
-        assert_eq!(partition_for(a, 256), 0x90);
+        assert_eq!(partition_for(a, nz(8)), 0);
+        assert_eq!(partition_for(a, nz(2)), 0);
+        assert_eq!(partition_for(a, nz(256)), 0x90);
         assert_eq!(ShardMap::identity(16).unwrap().lane_for(a), 0);
     }
 }

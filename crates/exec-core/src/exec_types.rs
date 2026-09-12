@@ -8,11 +8,11 @@
 //! outcome. `kardamom_types::Receipt.status` is a single `bool` (success or
 //! failure). The executor converts the outcome before it publishes.
 
-use kardamom_types::{BlockBoundary, Receipt};
+use kardamom_types::{BPosition, BlockBoundary, Receipt};
 use revm::context::result::HaltReason;
 
-/// A global index of a tx in the canonical tx_ordering stream. The value
-/// increases with each tx. The executor's tx_ordering reader derives it
+/// A global index of a tx in the canonical `tx_ordering` stream. The value
+/// increases with each tx. The executor's `tx_ordering` reader derives it
 /// from the input order, starting at 0 for the first tx after genesis. The
 /// downstream `Receipt.tx_idx` uses `BPosition`, the canonical wire id. This
 /// `TxIndex` is only a local sanity counter for the executor.
@@ -21,12 +21,37 @@ pub struct TxIndex(pub u64);
 
 impl TxIndex {
     pub const ZERO: TxIndex = TxIndex(0);
-    pub fn next(self) -> TxIndex {
-        TxIndex(self.0 + 1)
+
+    /// The next counter value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ExecutorError::TxIndexOverflow`] on `u64` overflow. A
+    /// saturating add would be wrong here: it would repeat an id instead
+    /// of ending the chain.
+    pub fn next(self) -> Result<Self, crate::error::ExecutorError> {
+        self.0
+            .checked_add(1)
+            .map(TxIndex)
+            .ok_or(crate::error::ExecutorError::TxIndexOverflow)
     }
 }
 
-/// One published record on tx_receipts: a receipt or a sealed boundary.
+/// One tx's position and running gas total, threaded through every
+/// canonical-tx and derived-tx entry point (`Executor::execute_tx`,
+/// `execute_deposit_tx`, `execute_xchain_tx`, `skip_receipt`, and their
+/// callers). `tx_idx` is the local sanity counter; `tx_position` is the
+/// canonical wire id; `tx_index_in_block` and `cumulative_gas_used_before`
+/// feed the receipt's RPC-enrichment fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxSlot {
+    pub tx_idx: TxIndex,
+    pub tx_position: BPosition,
+    pub tx_index_in_block: u64,
+    pub cumulative_gas_used_before: u64,
+}
+
+/// One published record on `tx_receipts`: a receipt or a sealed boundary.
 #[derive(Debug, Clone)]
 pub enum CMessage {
     Receipt(Receipt),
@@ -44,6 +69,7 @@ pub enum ReceiptStatus {
 }
 
 impl ReceiptStatus {
+    #[must_use]
     pub fn is_success(&self) -> bool {
         matches!(self, ReceiptStatus::Success)
     }
@@ -52,11 +78,18 @@ impl ReceiptStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kardamom_types::BPosition;
 
     #[test]
     fn tx_index_next_increments() {
-        assert_eq!(TxIndex(5).next(), TxIndex(6));
+        assert_eq!(TxIndex(5).next().unwrap(), TxIndex(6));
+    }
+
+    #[test]
+    fn tx_index_next_stops_at_overflow() {
+        assert!(matches!(
+            TxIndex(u64::MAX).next(),
+            Err(crate::error::ExecutorError::TxIndexOverflow)
+        ));
     }
 
     #[test]

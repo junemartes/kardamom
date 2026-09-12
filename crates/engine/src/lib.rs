@@ -1,8 +1,8 @@
 //! Kardamom role-agnostic execution engine.
 //!
 //! This is the execution core for `kardamom-executor` and
-//! `kardamom-validator`. It has M per-sequencer **tx_data** readers and one
-//! canonical **tx_ordering** reader. The readers join by reference. The
+//! `kardamom-validator`. It has M per-sequencer **`tx_data`** readers and one
+//! canonical **`tx_ordering`** reader. The readers join by reference. The
 //! engine runs revm execution for each tx, and builds the write-set and
 //! `BlockDelta`. It manages the reader-to-exec-to-commit flow.
 //!
@@ -25,15 +25,16 @@ pub mod shadow;
 pub mod state;
 
 // The pure state-transition slice lives in `kardamom-exec-core` (a `no_std`,
-// zk-guest-linkable crate). These re-exports keep old paths working, such as
-// `kardamom_engine::executor::…` and `crate::delta::…`.
+// zk-guest-linkable crate). These re-exports make it resolve here too,
+// under `kardamom_engine::executor::…` and `crate::delta::…`.
 pub use kardamom_exec_core::{
     anchor, bal_ladder, block_env, delta, error, exec_types, executor, features, stateless, witness,
 };
 
 pub use actor::{
-    EngineWiring, Executor, ExecutorConfig, Inbound, Outbound, ResumePoint, RoleHooks, SnapshotDb,
-    StateWriterQueue, StateWriterSignal, TxReceiptsPublication,
+    BlockExecStrategy, Either, EngineWiring, ExecPorts, Executor, ExecutorConfig, Inbound,
+    NoBlockExec, Outbound, ResumePoint, RoleHooks, SnapshotDb, StateWriterQueue, StateWriterSignal,
+    TxReceiptsPublication,
 };
 pub use block_env::ExecEnv;
 pub use delta::{PendingDelta, WriteSet};
@@ -44,7 +45,7 @@ pub use kardamom_exec_core::{
 };
 pub use persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 pub use reader::{
-    EpochObserver, JoinBuffer, NoEpochCheck, ParentStorageReader, ReaderConfig, ReaderToExec,
+    EpochObserver, JoinBuffer, NoEpochCheck, NoRemoteEpochCheck, ReaderConfig, ReaderToExec,
     RemoteEpochObserver, TxDataSubscription, TxOrderingSubscription,
 };
 pub use replay::{ReplayBlock, ReplayError, ReplayOutcome, replay_blocks};

@@ -23,7 +23,7 @@ use crate::error::SequencerError;
 /// This path allocates nothing.
 ///
 /// It falls back to the full decode for any format it does not recognize.
-/// So acceptance matches the old behavior exactly. An equivalence test
+/// So acceptance matches the full decode exactly. An equivalence test
 /// runs both paths over every transaction type.
 pub(crate) fn decode_nonce(raw_tx: &bytes::Bytes) -> Result<u64, SequencerError> {
     if let Some(n) = peek_nonce(raw_tx.as_ref()) {
@@ -36,6 +36,10 @@ pub(crate) fn decode_nonce(raw_tx: &bytes::Bytes) -> Result<u64, SequencerError>
 
 /// Walk the RLP structure for the nonce. Returns `None` if the caller
 /// should fall back to the full decode.
+#[allow(
+    clippy::many_single_char_names,
+    reason = "short names (b, i, p, ll) name RLP header fields (byte, index, prefix byte, length-of-length) in a dense byte-walking decoder; longer names would not add information here"
+)]
 fn peek_nonce(b: &[u8]) -> Option<u64> {
     // (payload_start, skip_fields) for the list holding the nonce.
     let (mut i, skip) = match b.first()? {
@@ -66,17 +70,26 @@ fn peek_nonce(b: &[u8]) -> Option<u64> {
         if l > 0 && bytes[0] == 0 {
             return None; // non-canonical; let the full decode reject it
         }
-        let mut v = 0u64;
-        for &x in bytes {
-            v = (v << 8) | u64::from(x);
-        }
-        return Some(v);
+        return Some(bytes.iter().fold(0u64, |v, &x| (v << 8) | u64::from(x)));
     }
     None // the nonce cannot be a list or over 8 bytes; the full decode rejects it
 }
 
+/// Read a big-endian length from an RLP length-of-length field.
+fn be_len(bytes: &[u8]) -> usize {
+    bytes.iter().fold(0usize, |l, &x| (l << 8) | x as usize)
+}
+
 /// Advance past one RLP item that starts at `i`. Returns `None` if the
-/// data is truncated.
+/// data is truncated, or if the item's declared length would overflow
+/// `usize` (an attacker-controlled `l`, from [`be_len`] on the wire
+/// bytes, cannot be trusted to stay in range).
+///
+/// `i + 1`, `i + 1 + (p - 0x80)`, and `i + 1 + (p - 0xc0)` stay plain
+/// arithmetic: `i <= b.len()` (the `get(i)` above proved it) and the
+/// prefix-derived offset is bounded at 55, both far under `usize::MAX`.
+/// Only `i + 1 + ll + l` needs a checked add: `l` comes from `be_len` on
+/// wire bytes and is not bounded at all.
 fn skip_rlp_item(b: &[u8], i: usize) -> Option<usize> {
     let p = *b.get(i)?;
     Some(match p {
@@ -84,20 +97,14 @@ fn skip_rlp_item(b: &[u8], i: usize) -> Option<usize> {
         0x80..=0xb7 => i + 1 + (p - 0x80) as usize,
         0xb8..=0xbf => {
             let ll = (p - 0xb7) as usize;
-            let mut l = 0usize;
-            for &x in b.get(i + 1..i + 1 + ll)? {
-                l = (l << 8) | x as usize;
-            }
-            i + 1 + ll + l
+            let l = be_len(b.get(i + 1..i + 1 + ll)?);
+            (i + 1 + ll).checked_add(l)?
         }
         0xc0..=0xf7 => i + 1 + (p - 0xc0) as usize,
         0xf8..=0xff => {
             let ll = (p - 0xf7) as usize;
-            let mut l = 0usize;
-            for &x in b.get(i + 1..i + 1 + ll)? {
-                l = (l << 8) | x as usize;
-            }
-            i + 1 + ll + l
+            let l = be_len(b.get(i + 1..i + 1 + ll)?);
+            (i + 1 + ll).checked_add(l)?
         }
     })
 }
@@ -156,7 +163,7 @@ mod nonce_tests {
                 max_priority_fee_per_gas: 1,
                 to: TxKind::Call(Address::repeat_byte(9)),
                 value: U256::ZERO,
-                access_list: Default::default(),
+                access_list: alloy_eips::eip2930::AccessList::default(),
                 input: vec![0xBB; 260].into(),
             };
             let sig = signer.sign_transaction_sync(&mut t).unwrap();
@@ -173,8 +180,8 @@ mod nonce_tests {
                 gas_limit: 100_000,
                 to: TxKind::Call(Address::repeat_byte(9)),
                 value: U256::ZERO,
-                access_list: Default::default(),
-                input: Default::default(),
+                access_list: alloy_eips::eip2930::AccessList::default(),
+                input: alloy_primitives::Bytes::default(),
             };
             let sig = signer.sign_transaction_sync(&mut t).unwrap();
             let e: alloy_consensus::TxEnvelope = t.into_signed(sig).into();

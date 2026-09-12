@@ -1,9 +1,10 @@
 //! kardamom-deploy: stateless CLI for deploying and upgrading kardamom L1 contracts.
 
+use std::num::NonZeroU64;
 use std::str::FromStr;
 
 use alloy_primitives::{Address, Bytes};
-use alloy_provider::{DynProvider, Provider, ProviderBuilder};
+use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -39,7 +40,7 @@ enum Command {
     /// Bootstrap the factory if it is absent. Anyone can run this. The
     /// resulting factory is always owned by `--owner`.
     EnsureFactory {
-        /// Hex private key or "env:VAR_NAME". Pays for the bootstrap tx.
+        /// Hex private key or "`env:VAR_NAME`". Pays for the bootstrap tx.
         #[arg(long)]
         private_key: String,
     },
@@ -48,22 +49,24 @@ enum Command {
     /// ensure-factory. `--l2-chain-id` and `--l2-minter` are paired by
     /// position and repeat together.
     Deploy {
-        /// Hex private key or "env:VAR_NAME".
+        /// Hex private key or "`env:VAR_NAME`".
         #[arg(long)]
         private_key: String,
 
-        /// Contract IDs to deploy, for example ETHLockbox or
-        /// WithdrawalOutputOracle. The same id can repeat per L2.
+        /// Contract IDs to deploy, for example `ETHLockbox` or
+        /// `WithdrawalOutputOracle`. The same id can repeat per L2.
         #[arg(required = true)]
         ids: Vec<String>,
 
-        /// L2 chain IDs to target, one for each id-L2 combination.
+        /// L2 chain IDs to target, one for each id-L2 combination. Chain id
+        /// 0 is not valid: it feeds `ContractId::proxy_salt`, so a 0 would
+        /// give a valid but wrong CREATE2 salt.
         #[arg(long = "l2-chain-id", required = true)]
-        l2_chain_ids: Vec<u64>,
+        l2_chain_ids: Vec<NonZeroU64>,
 
         /// L2 minter addresses, paired by position with `--l2-chain-id`. The
-        /// count must match when you deploy ETHLockbox (its `_l2Minter` init
-        /// arg) or KardamomL2Settlement (reused as its `_l1Batcher` init arg).
+        /// count must match when you deploy `ETHLockbox` (its `_l2Minter` init
+        /// arg) or `KardamomL2Settlement` (reused as its `_l1Batcher` init arg).
         #[arg(long = "l2-minter")]
         l2_minters: Vec<Address>,
 
@@ -83,14 +86,16 @@ enum Command {
         challenger: Option<Address>,
 
         /// Finalization window (seconds) for WithdrawalOutputOracle.initialize.
-        #[arg(long, default_value_t = 86_400)]
-        finalization_window: u64,
+        /// The contract reverts with `ZeroWindow()` on 0; nonzero at the
+        /// type level checks this before the deploy tx spends gas.
+        #[arg(long, default_value = "86400")]
+        finalization_window: NonZeroU64,
     },
 
     /// Upgrade contracts to the next version, across one or more L2s, in one
     /// transaction.
     Upgrade {
-        /// Hex private key or "env:VAR_NAME".
+        /// Hex private key or "`env:VAR_NAME`".
         #[arg(long)]
         private_key: String,
 
@@ -98,7 +103,7 @@ enum Command {
         ids: Vec<String>,
 
         #[arg(long = "l2-chain-id", required = true)]
-        l2_chain_ids: Vec<u64>,
+        l2_chain_ids: Vec<NonZeroU64>,
     },
 
     /// Install the ERC-7955 CREATE2 factory runtime through `anvil_setCode`.
@@ -146,8 +151,7 @@ async fn main() -> Result<()> {
                 .filter_map(|id| match id {
                     ContractId::EthLockbox => Some("ETHLockbox"),
                     ContractId::KardamomL2Settlement => Some("KardamomL2Settlement"),
-                    ContractId::WithdrawalOutputOracle => None,
-                    ContractId::KardamomProofOracle => None,
+                    ContractId::WithdrawalOutputOracle | ContractId::KardamomProofOracle => None,
                 })
                 .collect();
             if !minter_consumers.is_empty() && l2_chain_ids.len() != l2_minters.len() {
@@ -158,18 +162,21 @@ async fn main() -> Result<()> {
                     minter_consumers.join(", ")
                 );
             }
-            run_deploy(
-                cli.rpc_url,
+            DeployArgs {
+                rpc_url: cli.rpc_url,
                 private_key,
-                cli.owner,
-                contract_ids,
+                owner: cli.owner,
+                ids: contract_ids,
                 l2_chain_ids,
                 l2_minters,
                 output_oracle,
-                attester,
-                challenger,
-                finalization_window,
-            )
+                oracle: OracleArgs {
+                    attester,
+                    challenger,
+                    finalization_window,
+                },
+            }
+            .run()
             .await
         }
         Command::Upgrade {
@@ -178,13 +185,11 @@ async fn main() -> Result<()> {
             l2_chain_ids,
         } => {
             let contract_ids = parse_ids(&ids)?;
-            run_upgrade(
-                cli.rpc_url,
-                private_key,
-                cli.owner,
-                contract_ids,
+            UpgradeArgs {
+                ids: contract_ids,
                 l2_chain_ids,
-            )
+            }
+            .run(cli.rpc_url, private_key, cli.owner)
             .await
         }
         Command::Bootstrap7955Anvil => {
@@ -208,33 +213,30 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Build a [`Deployer`] connected to `rpc_url`. If `key` is given, the
-/// provider signs with it, and this function returns the signer's address
-/// as the operator.
-fn deployer(
+/// Build a signed [`Deployer`] connected to `rpc_url`, for write paths.
+/// Returns the signer's own address, to use as the operator.
+fn signed_deployer(
     rpc_url: &str,
     owner: Address,
-    key: Option<&str>,
-) -> Result<(Deployer<DynProvider>, Option<Address>)> {
+    key: &str,
+) -> Result<(Deployer<impl Provider + Clone>, Address)> {
     let url = rpc_url.parse()?;
-    let (provider, operator) = match key {
-        Some(key) => {
-            let signer = parse_key(key)?;
-            let operator = signer.address();
-            let provider = ProviderBuilder::new()
-                .wallet(signer)
-                .connect_http(url)
-                .erased();
-            (provider, Some(operator))
-        }
-        None => (ProviderBuilder::new().connect_http(url).erased(), None),
-    };
+    let signer = parse_key(key)?;
+    let operator = signer.address();
+    let provider = ProviderBuilder::new().wallet(signer).connect_http(url);
     Ok((Deployer::new(provider, owner), operator))
 }
 
+/// Build a read-only [`Deployer`] connected to `rpc_url`, for `addresses`
+/// and `verify`; neither signs a transaction.
+fn readonly_deployer(rpc_url: &str, owner: Address) -> Result<Deployer<impl Provider + Clone>> {
+    let url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url);
+    Ok(Deployer::new(provider, owner))
+}
+
 async fn run_ensure_factory(rpc_url: String, private_key: String, owner: Address) -> Result<()> {
-    let (deployer, operator) = deployer(&rpc_url, owner, Some(&private_key))?;
-    let operator = operator.expect("operator is Some when a key is given");
+    let (deployer, operator) = signed_deployer(&rpc_url, owner, &private_key)?;
     let factory_addr = deployer.factory_address();
     match deployer.ensure_factory(operator).await? {
         FactoryStatus::AlreadyDeployed => {
@@ -247,144 +249,207 @@ async fn run_ensure_factory(rpc_url: String, private_key: String, owner: Address
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_deploy(
+/// Arguments for [`DeployArgs::run`], grouped from the CLI's `Deploy` subcommand.
+struct DeployArgs {
     rpc_url: String,
     private_key: String,
     owner: Address,
     ids: Vec<ContractId>,
-    l2_chain_ids: Vec<u64>,
+    l2_chain_ids: Vec<NonZeroU64>,
+    /// Minter addresses, paired by position with `l2_chain_ids`. Read only
+    /// for ids that consume a minter (`EthLockbox`, `KardamomL2Settlement`).
     l2_minters: Vec<Address>,
     output_oracle: Option<Address>,
-    attester: Option<Address>,
-    challenger: Option<Address>,
-    finalization_window: u64,
-) -> Result<()> {
-    let (deployer, operator) = deployer(&rpc_url, owner, Some(&private_key))?;
-    let operator = operator.expect("operator is Some when a key is given");
-
-    deployer.ensure_factory(operator).await?;
-
-    // Per-contract init args. For each id and L2 pair, emit one Op::Deploy
-    // with the contract-specific initialize calldata.
-    let deploying_oracle = ids.contains(&ContractId::WithdrawalOutputOracle);
-    let mut ops: Vec<Op> = Vec::new();
-    for id in &ids {
-        for (i, chain_id) in l2_chain_ids.iter().enumerate() {
-            let init_args = match id {
-                ContractId::EthLockbox => {
-                    let minter = l2_minters[i];
-                    // Pick the oracle address: the explicit flag, else the
-                    // oracle deployed in this same batch (predicted), else
-                    // zero for deposit-only mode.
-                    let oracle = match output_oracle {
-                        Some(a) => a,
-                        None if deploying_oracle => {
-                            let oargs =
-                                oracle_init_args(attester, challenger, finalization_window)?;
-                            deployer.predict_proxy_address(
-                                *chain_id,
-                                ContractId::WithdrawalOutputOracle,
-                                &oargs,
-                            )
-                        }
-                        None => Address::ZERO,
-                    };
-                    encode_address_pair(minter, oracle)
-                }
-                ContractId::WithdrawalOutputOracle => {
-                    oracle_init_args(attester, challenger, finalization_window)?
-                }
-                // Reuse the positional --l2-minter as the settlement
-                // contract's `_l1Batcher` init arg (documented on the flag).
-                // Add a dedicated --l1-batcher flag if the roles ever diverge.
-                ContractId::KardamomL2Settlement => encode_address_arg(l2_minters[i]),
-                // The proof oracle's init needs the SP1 verifier gateway,
-                // program vkey, and genesis root. The CLI does not model
-                // these parameters yet. Deploy it through the library API
-                // (`encode_proof_oracle_init_args`, as the e2e test does)
-                // until a dedicated flag set is added.
-                ContractId::KardamomProofOracle => bail!(
-                    "KardamomProofOracle CLI deployment needs --sp1-verifier/--program-vkey/\
-                     --genesis-root flags (not yet modeled); use the library API"
-                ),
-            };
-            ops.push(Op::Deploy {
-                l2_chain_id: *chain_id,
-                id: *id,
-                init_args,
-            });
-        }
-    }
-
-    let tx = deployer.apply(&ops, operator).await?;
-    println!("deployed in tx {tx}");
-
-    print_addresses(&deployer, None).await
+    oracle: OracleArgs,
 }
 
-async fn run_upgrade(
-    rpc_url: String,
-    private_key: String,
-    owner: Address,
-    ids: Vec<ContractId>,
-    l2_chain_ids: Vec<u64>,
-) -> Result<()> {
-    let (deployer, operator) = deployer(&rpc_url, owner, Some(&private_key))?;
-    let operator = operator.expect("operator is Some when a key is given");
+/// `WithdrawalOutputOracle.initialize` arguments, required only when
+/// deploying that contract.
+struct OracleArgs {
+    attester: Option<Address>,
+    challenger: Option<Address>,
+    finalization_window: NonZeroU64,
+}
 
-    let current_entries = deployer.addresses(None).await?;
-
-    let mut ops: Vec<Op> = Vec::new();
-    for id in &ids {
-        for chain_id in &l2_chain_ids {
-            let new_version = current_entries
-                .iter()
-                .find(|e| e.l2_chain_id == *chain_id && e.id == id.id())
-                .map(|e| e.version + 1)
-                .unwrap_or(2);
-            ops.push(Op::Upgrade {
-                l2_chain_id: *chain_id,
-                id: *id,
-                new_version,
-                init_args: Bytes::new(),
-            });
-        }
+impl DeployArgs {
+    /// The `--l2-minter` at position `i`, for the init args of the
+    /// contract named `for_id` (a display name, e.g. "`ETHLockbox`"). Both
+    /// `EthLockbox` and `KardamomL2Settlement` index into `l2_minters` by
+    /// position and need this same "count must match" error.
+    fn minter_at(&self, i: usize, for_id: &str) -> Result<Address> {
+        self.l2_minters.get(i).copied().with_context(|| {
+            format!("--l2-minter count must match --l2-chain-id when deploying {for_id}")
+        })
     }
 
-    let tx = deployer.apply(&ops, operator).await?;
-    println!("upgraded in tx {tx}");
+    /// The `Op::Deploy` entries for `id`, one per `l2_chain_ids` entry, in
+    /// order. Each entry independently errors when `id`'s init args need
+    /// `--l2-minter` but `l2_minters` is too short for that position (the
+    /// caller pre-validates lengths when any requested id consumes a
+    /// minter, but a per-position `.get` still guards against a future id
+    /// added here without updating that check), or when `id` is
+    /// `KardamomProofOracle` (not yet modeled by this CLI).
+    fn ops_for<P: Provider + Clone>(
+        &self,
+        id: ContractId,
+        deployer: &Deployer<P>,
+    ) -> Vec<Result<Op>> {
+        let deploying_oracle = self.ids.contains(&ContractId::WithdrawalOutputOracle);
+        self.l2_chain_ids
+            .iter()
+            .enumerate()
+            .map(|(i, chain_id)| -> Result<Op> {
+                let chain_id = chain_id.get();
+                let init_args = match id {
+                    ContractId::EthLockbox => {
+                        let minter = self.minter_at(i, "ETHLockbox")?;
+                        // Pick the oracle address: the explicit flag, else
+                        // the oracle deployed in this same batch
+                        // (predicted), else zero for deposit-only mode.
+                        let oracle = match self.output_oracle {
+                            Some(a) => a,
+                            None if deploying_oracle => {
+                                let oargs = self.oracle.init_args()?;
+                                deployer.predict_proxy_address(
+                                    chain_id,
+                                    ContractId::WithdrawalOutputOracle,
+                                    &oargs,
+                                )
+                            }
+                            None => Address::ZERO,
+                        };
+                        encode_address_pair(minter, oracle)
+                    }
+                    ContractId::WithdrawalOutputOracle => self.oracle.init_args()?,
+                    // Reuse the positional --l2-minter as the settlement
+                    // contract's `_l1Batcher` init arg (documented on the
+                    // flag). Add a dedicated --l1-batcher flag if the roles
+                    // ever diverge.
+                    ContractId::KardamomL2Settlement => {
+                        let minter = self.minter_at(i, "KardamomL2Settlement")?;
+                        encode_address_arg(minter)
+                    }
+                    // The proof oracle's init needs the SP1 verifier
+                    // gateway, program vkey, and genesis root. The CLI does
+                    // not model these parameters yet. Deploy it through the
+                    // library API (`ProofOracleInit::encode`, as the e2e
+                    // test does) until a dedicated flag set is added.
+                    ContractId::KardamomProofOracle => bail!(
+                        "KardamomProofOracle CLI deployment needs --sp1-verifier/--program-vkey/\
+                         --genesis-root flags (not yet modeled); use the library API"
+                    ),
+                };
+                Ok(Op::Deploy {
+                    l2_chain_id: chain_id,
+                    id,
+                    init_args,
+                })
+            })
+            .collect()
+    }
 
-    print_addresses(&deployer, None).await
+    /// Run the `Deploy` subcommand: ensure the factory, build one
+    /// `Op::Deploy` per (id, L2) pair, apply them, and print the result.
+    async fn run(self) -> Result<()> {
+        let (deployer, operator) = signed_deployer(&self.rpc_url, self.owner, &self.private_key)?;
+
+        deployer.ensure_factory(operator).await?;
+
+        // Per-contract init args. For each id and L2 pair, one Op::Deploy
+        // with the contract-specific initialize calldata.
+        let ops: Vec<Op> = self
+            .ids
+            .iter()
+            .flat_map(|id| self.ops_for(*id, &deployer))
+            .collect::<Result<Vec<Op>>>()?;
+
+        let tx = deployer.apply(&ops, operator).await?;
+        println!("deployed in tx {tx}");
+
+        print_addresses(&deployer, None).await
+    }
+}
+
+/// Arguments for [`UpgradeArgs::run`], grouped from the CLI's `Upgrade`
+/// subcommand.
+struct UpgradeArgs {
+    ids: Vec<ContractId>,
+    l2_chain_ids: Vec<NonZeroU64>,
+}
+
+impl UpgradeArgs {
+    /// The `Op::Upgrade` entries for `id`, one per `l2_chain_ids` entry.
+    /// Each entry's `new_version` is the current on-chain version plus
+    /// one, or 2 for a first upgrade with no existing entry. Errors on an
+    /// implausible version overflow rather than wrapping into a wrong
+    /// version number.
+    fn ops_for(&self, id: ContractId, current_entries: &[RegistryEntry]) -> Vec<Result<Op>> {
+        self.l2_chain_ids
+            .iter()
+            .map(|chain_id| -> Result<Op> {
+                let chain_id = chain_id.get();
+                let new_version = match current_entries
+                    .iter()
+                    .find(|e| e.l2_chain_id == chain_id && e.id == id.id())
+                {
+                    Some(e) => e
+                        .version
+                        .checked_add(1)
+                        .context("registry version overflowed u64")?,
+                    None => 2,
+                };
+                Ok(Op::Upgrade {
+                    l2_chain_id: chain_id,
+                    id,
+                    new_version,
+                    init_args: Bytes::new(),
+                })
+            })
+            .collect()
+    }
+
+    /// Run the `Upgrade` subcommand: read the current registry, build one
+    /// `Op::Upgrade` per (id, L2) pair, apply them, and print the result.
+    /// Takes the connection arguments separately from `self` because,
+    /// unlike `Deploy`, `Upgrade`'s own flags carry no rpc/key/owner state.
+    async fn run(self, rpc_url: String, private_key: String, owner: Address) -> Result<()> {
+        let (deployer, operator) = signed_deployer(&rpc_url, owner, &private_key)?;
+
+        let current_entries = deployer.addresses(None).await?;
+
+        let ops: Vec<Op> = self
+            .ids
+            .iter()
+            .flat_map(|id| self.ops_for(*id, &current_entries))
+            .collect::<Result<Vec<Op>>>()?;
+
+        let tx = deployer.apply(&ops, operator).await?;
+        println!("upgraded in tx {tx}");
+
+        print_addresses(&deployer, None).await
+    }
 }
 
 async fn run_addresses(rpc_url: String, owner: Address, l2_chain_id: Option<u64>) -> Result<()> {
-    let (deployer, _) = deployer(&rpc_url, owner, None)?;
+    let deployer = readonly_deployer(&rpc_url, owner)?;
     print_addresses(&deployer, l2_chain_id).await
 }
 
 async fn run_verify(rpc_url: String, owner: Address) -> Result<()> {
-    let (deployer, _) = deployer(&rpc_url, owner, None)?;
+    let deployer = readonly_deployer(&rpc_url, owner)?;
     let report = deployer.verify().await?;
     print_entries(&report.entries);
     if report.mismatches.is_empty() {
         println!("all entries match ERC1967 impl slot");
-    } else {
-        for m in &report.mismatches {
-            print_mismatch(m);
-        }
-        bail!("verify: {} mismatch(es) found", report.mismatches.len());
+        return Ok(());
     }
-    Ok(())
+    report.mismatches.iter().for_each(print_mismatch);
+    bail!("verify: {} mismatch(es) found", report.mismatches.len());
 }
 
 fn parse_key(key: &str) -> Result<PrivateKeySigner> {
-    let hex = if let Some(var_name) = key.strip_prefix("env:") {
-        std::env::var(var_name).with_context(|| format!("env var `{var_name}` not set"))?
-    } else {
-        key.to_string()
-    };
-    let hex = hex.strip_prefix("0x").unwrap_or(&hex);
+    let hex = kardamom_deployer::KeyFlag::new(key).resolve()?;
+    let hex = kardamom_deployer::strip_hex_prefix(&hex);
     PrivateKeySigner::from_str(hex).context("invalid private key")
 }
 
@@ -404,21 +469,32 @@ fn parse_contract_id(s: &str) -> Result<ContractId> {
     }
 }
 
-/// Encode `WithdrawalOutputOracle.initialize(attester, challenger, window)`.
-/// The attester and challenger flags are required.
-fn oracle_init_args(
-    attester: Option<Address>,
-    challenger: Option<Address>,
-    window: u64,
-) -> Result<Bytes> {
-    let attester = attester.context("--attester required to deploy WithdrawalOutputOracle")?;
-    let challenger =
-        challenger.context("--challenger required to deploy WithdrawalOutputOracle")?;
-    Ok(encode_oracle_init_args(attester, challenger, window))
+impl OracleArgs {
+    /// Encode `WithdrawalOutputOracle.initialize(attester, challenger,
+    /// window)`. The attester and challenger flags are required.
+    ///
+    /// # Errors
+    /// Returns an error when `--attester` or `--challenger` is missing.
+    fn init_args(&self) -> Result<Bytes> {
+        let attester = self
+            .attester
+            .context("--attester required to deploy WithdrawalOutputOracle")?;
+        let challenger = self
+            .challenger
+            .context("--challenger required to deploy WithdrawalOutputOracle")?;
+        Ok(encode_oracle_init_args(
+            attester,
+            challenger,
+            self.finalization_window.get(),
+        ))
+    }
 }
 
 /// Fetch registry entries, optionally filtered by L2, and print them.
-async fn print_addresses(deployer: &Deployer<DynProvider>, l2_chain_id: Option<u64>) -> Result<()> {
+async fn print_addresses<P: Provider + Clone>(
+    deployer: &Deployer<P>,
+    l2_chain_id: Option<u64>,
+) -> Result<()> {
     print_entries(&deployer.addresses(l2_chain_id).await?);
     Ok(())
 }

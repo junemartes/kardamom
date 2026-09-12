@@ -58,9 +58,8 @@ pub struct Deposit {
     pub value: U256,
     /// Gas limit for the inner EVM call. The deposit itself pays no fee.
     pub gas_limit: u64,
-    /// OP system-transaction flag. v0 only canonicalizes user deposits, so
-    /// this is always `false`. The L1-attributes system transaction
-    /// (`true`) is reserved for later work.
+    /// OP system-transaction flag: `true` for an upgrade system
+    /// transaction, `false` for a user deposit.
     pub is_system_transaction: bool,
     /// Calldata for the inner EVM call.
     #[rkyv(with = wire::BytesVec)]
@@ -87,6 +86,7 @@ pub struct DepositRef {
 }
 
 impl DepositRef {
+    #[must_use]
     pub fn new(source_hash: B256, deposit_position: BPosition) -> Self {
         Self {
             source_hash,

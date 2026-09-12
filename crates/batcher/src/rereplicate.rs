@@ -25,6 +25,7 @@
 //! the copy, because it holds the catalog open. The chaos case, or the
 //! runbook, stops the `aeron` job, runs this tool, then restarts it.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use crate::error::BatcherError;
@@ -32,6 +33,24 @@ use crate::error::BatcherError;
 /// The one non-`.rec` file the mirror transplants. The mark file
 /// (`archive-mark.dat`) is deliberately not copied. See the module doc.
 const CATALOG_FILE: &str = "archive.catalog";
+
+/// Every `.rec` segment file directly under `dir`, in `read_dir` order. A
+/// `read_dir` error on `dir` itself fails eagerly; a per-entry read error
+/// surfaces from the returned iterator instead of being dropped silently.
+///
+/// # Errors
+/// Returns an error when `dir` cannot be listed.
+fn rec_entries(
+    dir: &Path,
+) -> Result<impl Iterator<Item = Result<std::fs::DirEntry, BatcherError>>, BatcherError> {
+    Ok(std::fs::read_dir(dir)?.filter_map(|entry| match entry {
+        Ok(entry) => {
+            let path = entry.path();
+            (path.is_file() && path.extension().is_some_and(|x| x == "rec")).then_some(Ok(entry))
+        }
+        Err(e) => Some(Err(e.into())),
+    }))
+}
 
 /// What a [`mirror_archive`] run copied.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -61,6 +80,10 @@ pub struct MirrorReport {
 /// The destination archive daemon must be stopped first. This returns an
 /// error if the source holds no `.rec` segments. That likely means the path
 /// is wrong.
+///
+/// # Errors
+/// Returns an error when `dest_dir` cannot be created, when the source
+/// holds no `.rec` segments, or when reading or writing a file fails.
 pub fn mirror_archive(source_dir: &Path, dest_dir: &Path) -> Result<MirrorReport, BatcherError> {
     std::fs::create_dir_all(dest_dir)?;
     let mut report = MirrorReport::default();
@@ -72,16 +95,15 @@ pub fn mirror_archive(source_dir: &Path, dest_dir: &Path) -> Result<MirrorReport
         report.catalog_copied = true;
     }
 
-    for entry in std::fs::read_dir(source_dir)? {
+    rec_entries(source_dir)?.try_for_each(|entry| -> Result<(), BatcherError> {
         let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() || !path.extension().is_some_and(|x| x == "rec") {
-            continue;
-        }
-        let bytes = std::fs::copy(&path, dest_dir.join(entry.file_name()))?;
+        let bytes = std::fs::copy(entry.path(), dest_dir.join(entry.file_name()))?;
         report.segments_copied += 1;
-        report.bytes_copied += bytes;
-    }
+        // A report field, not a control value: saturate rather than wrap
+        // on an implausible multi-exabyte total.
+        report.bytes_copied = report.bytes_copied.saturating_add(bytes);
+        Ok(())
+    })?;
 
     if report.segments_copied == 0 {
         return Err(BatcherError::Reconstruct(format!(
@@ -96,13 +118,13 @@ pub fn mirror_archive(source_dir: &Path, dest_dir: &Path) -> Result<MirrorReport
 /// Catalog writes come in event-driven bursts (recording start or stop),
 /// not a steady stream. Two identical consecutive reads normally happen on
 /// the first try.
-const STABLE_READ_ATTEMPTS: usize = 10;
+const STABLE_READ_ATTEMPTS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
 
 /// Read `path` until two consecutive snapshots are byte-identical. Returns
 /// the stable bytes. Returns a `Corruption` error if the file never
 /// stabilizes: the caller is copying from something busier than a catalog
 /// should ever be.
-fn read_stable(path: &Path, attempts: usize) -> Result<Vec<u8>, BatcherError> {
+fn read_stable(path: &Path, attempts: NonZeroUsize) -> Result<Vec<u8>, BatcherError> {
     read_stable_with(attempts, || std::fs::read(path).map_err(BatcherError::from)).map_err(|e| {
         match e {
             BatcherError::Corruption(_) => BatcherError::Corruption(format!(
@@ -114,21 +136,39 @@ fn read_stable(path: &Path, attempts: usize) -> Result<Vec<u8>, BatcherError> {
     })
 }
 
-/// Core of [`read_stable`], parameterized over the reader for testability.
-fn read_stable_with<F>(attempts: usize, mut read: F) -> Result<Vec<u8>, BatcherError>
+/// One [`read_stable_with`] attempt after the first: read again, and
+/// either stop — with the read's error, or with the now-stable bytes —
+/// or keep going with the new bytes as the next comparison baseline.
+fn one_attempt<F>(
+    read: &mut F,
+    prev: &[u8],
+) -> std::ops::ControlFlow<Result<Vec<u8>, BatcherError>, Vec<u8>>
 where
     F: FnMut() -> Result<Vec<u8>, BatcherError>,
 {
-    let mut prev = read()?;
-    for _ in 1..attempts.max(2) {
-        let next = read()?;
-        if next == prev {
-            return Ok(next);
+    match read() {
+        Err(e) => std::ops::ControlFlow::Break(Err(e)),
+        Ok(next) if next == prev => std::ops::ControlFlow::Break(Ok(next)),
+        Ok(next) => {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::ops::ControlFlow::Continue(next)
         }
-        prev = next;
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    Err(BatcherError::Corruption("unstable read".into()))
+}
+
+/// Core of [`read_stable`], parameterized over the reader for testability.
+/// `attempts` is the total number of reads to make; fewer than 2 cannot
+/// confirm stability, so it fails immediately rather than silently reading
+/// twice anyway.
+fn read_stable_with<F>(attempts: NonZeroUsize, mut read: F) -> Result<Vec<u8>, BatcherError>
+where
+    F: FnMut() -> Result<Vec<u8>, BatcherError>,
+{
+    let first = read()?;
+    match (1..attempts.get()).try_fold(first, |prev, _| one_attempt(&mut read, &prev)) {
+        std::ops::ControlFlow::Break(result) => result,
+        std::ops::ControlFlow::Continue(_) => Err(BatcherError::Corruption("unstable read".into())),
+    }
 }
 
 /// Verify that `dest_dir` mirrors `source_dir`: every source `.rec` must
@@ -138,6 +178,10 @@ where
 /// divergence returns `BatcherError::Corruption`, naming every differing
 /// segment. `aeron-archive verify` (CRC-armed) still decides which side is
 /// corrupt; a mirror mismatch only proves that one side is.
+///
+/// # Errors
+/// Returns [`BatcherError::Corruption`] when a segment diverges from its
+/// mirror copy, and other errors when a file cannot be read.
 pub fn verify_mirror(source_dir: &Path, dest_dir: &Path) -> Result<usize, BatcherError> {
     let diff = diff_mirror(source_dir, dest_dir)?;
     if !diff.is_clean() {
@@ -151,12 +195,11 @@ pub fn verify_mirror(source_dir: &Path, dest_dir: &Path) -> Result<usize, Batche
                 .join(", ")
         )));
     }
-    let mut verified = 0usize;
-    for entry in std::fs::read_dir(source_dir)? {
-        if entry?.path().extension().is_some_and(|x| x == "rec") {
-            verified += 1;
-        }
-    }
+    let verified = std::fs::read_dir(source_dir)?
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|entry| entry.path().extension().is_some_and(|x| x == "rec"))
+        .count();
     Ok(verified)
 }
 
@@ -179,37 +222,38 @@ pub struct MirrorDiff {
 }
 
 impl MirrorDiff {
+    #[must_use]
     pub fn is_clean(&self) -> bool {
         self.diverged.is_empty() && self.dest_only.is_empty()
     }
 }
 
+///
+/// # Errors
+/// Returns an error when a directory cannot be listed or a file cannot be
+/// read.
 pub fn diff_mirror(source_dir: &Path, dest_dir: &Path) -> Result<MirrorDiff, BatcherError> {
     let mut diff = MirrorDiff::default();
     let mut source_names = std::collections::HashSet::new();
-    for entry in std::fs::read_dir(source_dir)? {
+    rec_entries(source_dir)?.try_for_each(|entry| -> Result<(), BatcherError> {
         let entry = entry?;
         let path = entry.path();
-        if !path.extension().is_some_and(|x| x == "rec") {
-            continue;
-        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let dest = dest_dir.join(entry.file_name());
         if !dest.is_file() || files_differ(&path, &dest)? {
             diff.diverged.push(name.clone());
         }
         source_names.insert(name);
-    }
-    for entry in std::fs::read_dir(dest_dir)? {
+        Ok(())
+    })?;
+    rec_entries(dest_dir)?.try_for_each(|entry| -> Result<(), BatcherError> {
         let entry = entry?;
-        if !entry.path().extension().is_some_and(|x| x == "rec") {
-            continue;
-        }
         let name = entry.file_name().to_string_lossy().into_owned();
         if !source_names.contains(&name) {
             diff.dest_only.push(name);
         }
-    }
+        Ok(())
+    })?;
     diff.diverged.sort();
     diff.dest_only.sort();
     Ok(diff)
@@ -226,16 +270,31 @@ fn files_differ(a: &Path, b: &Path) -> Result<bool, BatcherError> {
     let mut fb = std::io::BufReader::new(std::fs::File::open(b)?);
     let mut ba = vec![0u8; 64 * 1024];
     let mut bb = vec![0u8; 64 * 1024];
-    loop {
-        let n = fa.read(&mut ba)?;
-        if n == 0 {
-            return Ok(false);
-        }
-        fb.read_exact(&mut bb[..n])?;
-        if ba[..n] != bb[..n] {
-            return Ok(true);
-        }
-    }
+    // One chunk per `Some`; `None` at EOF ends the iterator. Each item is
+    // that chunk's `chunk_differs` result, so `find_map` below stops at
+    // the first differing chunk or the first read error, whichever comes
+    // first.
+    std::iter::from_fn(|| match fa.read(&mut ba) {
+        Ok(0) => None,
+        Ok(n) => Some(chunk_differs(&mut fb, &ba[..n], &mut bb[..n])),
+        Err(e) => Some(Err(e.into())),
+    })
+    .find_map(|differs| match differs {
+        Ok(false) => None,
+        stop => Some(stop),
+    })
+    .unwrap_or(Ok(false))
+}
+
+/// Read the next `bb.len()` bytes of `fb` into `bb`, and compare against
+/// `ba`.
+fn chunk_differs(
+    fb: &mut impl std::io::Read,
+    ba: &[u8],
+    bb: &mut [u8],
+) -> Result<bool, BatcherError> {
+    fb.read_exact(bb)?;
+    Ok(ba != bb)
 }
 
 /// What a [`heal_from_mirror`] run repaired.
@@ -253,6 +312,11 @@ pub struct HealReport {
 ///
 /// This has the same operational constraint as the full mirror: the
 /// destination archive daemon must be stopped during the copy.
+///
+/// # Errors
+/// Returns an error when `segments` is empty, a name is not a bare `.rec`
+/// file name, a named segment is missing from `source_dir`, or the copy
+/// fails.
 pub fn heal_from_mirror(
     source_dir: &Path,
     dest_dir: &Path,
@@ -264,9 +328,29 @@ pub fn heal_from_mirror(
         ));
     }
     let mut report = HealReport::default();
-    for name in segments {
+    segments
+        .iter()
+        .try_for_each(|name| report.heal_segment(source_dir, dest_dir, name))?;
+    Ok(report)
+}
+
+impl HealReport {
+    /// Copy one named `.rec` segment from `source_dir` into `dest_dir`,
+    /// and record it in `self`. `name` must be a bare `.rec` file name.
+    fn heal_segment(
+        &mut self,
+        source_dir: &Path,
+        dest_dir: &Path,
+        name: &str,
+    ) -> Result<(), BatcherError> {
         // Accept only bare `.rec` file names. Reject anything path-like.
-        if name.contains('/') || name.contains('\\') || !name.ends_with(".rec") {
+        #[allow(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = "archive names are produced by this crate in lower case; a \
+                      case-insensitive match would accept foreign files"
+        )]
+        let has_rec_extension = name.ends_with(".rec");
+        if name.contains('/') || name.contains('\\') || !has_rec_extension {
             return Err(BatcherError::Reconstruct(format!(
                 "invalid segment name {name:?} — expected a bare *.rec file name"
             )));
@@ -278,10 +362,14 @@ pub fn heal_from_mirror(
                 source_dir.display()
             )));
         }
-        report.bytes_copied += std::fs::copy(&src, dest_dir.join(name))?;
-        report.segments_healed += 1;
+        // A report field, not a control value: saturate rather than wrap
+        // on an implausible multi-exabyte total.
+        self.bytes_copied = self
+            .bytes_copied
+            .saturating_add(std::fs::copy(&src, dest_dir.join(name))?);
+        self.segments_healed += 1;
+        Ok(())
     }
-    Ok(report)
 }
 
 #[cfg(test)]
@@ -328,14 +416,15 @@ mod tests {
     #[test]
     fn stable_read_returns_first_repeated_snapshot() {
         let mut reads = vec![b"v1".to_vec(), b"v2".to_vec(), b"v2".to_vec()].into_iter();
-        let got = read_stable_with(10, || Ok(reads.next().unwrap())).unwrap();
+        let got =
+            read_stable_with(NonZeroUsize::new(10).unwrap(), || Ok(reads.next().unwrap())).unwrap();
         assert_eq!(got, b"v2");
     }
 
     #[test]
     fn stable_read_gives_up_on_a_churning_file() {
         let mut n = 0u8;
-        let err = read_stable_with(4, || {
+        let err = read_stable_with(NonZeroUsize::new(4).unwrap(), || {
             n += 1;
             Ok(vec![n])
         })

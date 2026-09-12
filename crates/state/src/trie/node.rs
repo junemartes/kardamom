@@ -18,7 +18,8 @@ use crate::error::StateError;
 
 const TRIE_NODE: &str = "trie_node";
 
-pub fn encode_branch_node(n: &BranchNodeCompact) -> Vec<u8> {
+#[must_use]
+pub(crate) fn encode_branch_node(n: &BranchNodeCompact) -> Vec<u8> {
     let mut out = Vec::with_capacity(6 + 1 + 32 + 2 + n.hashes.len() * 32);
     out.extend_from_slice(&n.state_mask.get().to_be_bytes());
     out.extend_from_slice(&n.tree_mask.get().to_be_bytes());
@@ -30,14 +31,23 @@ pub fn encode_branch_node(n: &BranchNodeCompact) -> Vec<u8> {
         }
         None => out.push(0),
     }
-    out.extend_from_slice(&(n.hashes.len() as u16).to_be_bytes());
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a branch node has at most 16 children (one per nibble), well under u16::MAX"
+    )]
+    let hashes_len = n.hashes.len() as u16;
+    out.extend_from_slice(&hashes_len.to_be_bytes());
     for h in n.hashes.iter() {
         out.extend_from_slice(h.as_slice());
     }
     out
 }
 
-pub fn decode_branch_node(bytes: &[u8]) -> Result<BranchNodeCompact, StateError> {
+/// # Errors
+///
+/// Returns [`StateError::BadEncoding`] if `bytes` is shorter than the
+/// fixed layout the header fields declare.
+pub(crate) fn decode_branch_node(bytes: &[u8]) -> Result<BranchNodeCompact, StateError> {
     let mut cur = Reader { b: bytes, pos: 0 };
     let state_mask = TrieMask::new(cur.u16()?);
     let tree_mask = TrieMask::new(cur.u16()?);
@@ -48,10 +58,7 @@ pub fn decode_branch_node(bytes: &[u8]) -> Result<BranchNodeCompact, StateError>
         None
     };
     let len = cur.u16()? as usize;
-    let mut hashes = Vec::with_capacity(len);
-    for _ in 0..len {
-        hashes.push(cur.b256()?);
-    }
+    let hashes: Vec<B256> = (0..len).map(|_| cur.b256()).collect::<Result<_, _>>()?;
     Ok(BranchNodeCompact::new(
         state_mask, tree_mask, hash_mask, hashes, root_hash,
     ))

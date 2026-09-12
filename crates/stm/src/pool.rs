@@ -4,19 +4,11 @@
 //! now serves every fan-out in the workspace that wants to run a function
 //! over N chunks on W persistent threads: the STM commit tail's
 //! hash-and-validate lanes, the sharded-admission lanes, and the
-//! validator's BAL-seeded batch execution (which used to spawn one OS
-//! thread per batch per block).
+//! validator's BAL-seeded batch execution.
 //!
-//! History: these threads used to be `std::thread::scope` spawns, one set
-//! per block. Once the consensus witness got cheap, the spawn and join
-//! cost became 0.5ms of a 1.9ms tail — 36% of the overlap scope, pure
-//! overhead. Two cheaper ideas were tested and rejected first: 128KB
-//! stacks made no difference, and letting the tail thread take a chunk was
-//! worse, because the caller cores are shared with the harness and writer,
-//! so that chunk lagged behind.
-//!
-//! The fix: create the threads once per pool and hand them work. Workers
-//! park between jobs and can be pinned to cores.
+//! The threads are created once per pool and handed work; they park
+//! between jobs and can be pinned to cores. This avoids the spawn and
+//! join cost of a fresh `std::thread::scope` per block.
 //!
 //! Safety model. `run` publishes a pointer to the caller's closure, wakes
 //! the workers, and does not return until every worker has finished with
@@ -28,14 +20,11 @@
 //!
 //! Panic containment. A panic inside the closure is caught at the worker,
 //! recorded, and surfaced as [`PoolPanic`] from `run`. The worker keeps
-//! draining chunks and the pool survives for the next job. (The private
-//! predecessor let the unwind kill the lane thread. After that, the
-//! completion counter never drained and `run` deadlocked. Callers that
-//! treat a panic as fatal now fail loudly instead.)
+//! draining chunks and the pool survives for the next job.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// A chunk closure panicked. Carries the first panic observed (worker,
 /// chunk, and the panic payload rendered best-effort). Every chunk still
@@ -67,6 +56,17 @@ struct Job {
     call: unsafe fn(*const (), usize, usize),
 }
 
+/// One [`Shared::poll_job_or_park`] step's outcome.
+enum JobWait<'a> {
+    /// A job newer than the caller's last one is ready.
+    Ready(Job),
+    /// Shutdown is set and no job is waiting.
+    Shutdown,
+    /// Neither yet; the caller parked on the condvar and must poll
+    /// again with this guard.
+    Retry(MutexGuard<'a, Option<Job>>),
+}
+
 // SAFETY: the pointer targets a closure the caller owns and keeps alive
 // across the whole `run` call (it blocks until every worker is done). The
 // closure is `Sync`, so concurrent calls are sound.
@@ -95,20 +95,9 @@ struct Shared {
     shutdown: AtomicBool,
 }
 
-/// Persistent worker pool: W threads created once, jobs handed to them as
-/// `(worker_idx, chunk_idx)` closure calls. See the module docs for the
-/// safety model.
-pub struct WorkerPool {
-    shared: Arc<Shared>,
-    threads: Vec<std::thread::JoinHandle<()>>,
-    workers: usize,
-}
-
-impl WorkerPool {
-    /// Spawn `workers` persistent threads, pinned round-robin over
-    /// `pin_cores` when it is non-empty.
-    pub fn new(workers: usize, pin_cores: Vec<usize>) -> Self {
-        let shared = Arc::new(Shared {
+impl Shared {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
             job: Mutex::new(None),
             wake: Condvar::new(),
             done: Condvar::new(),
@@ -119,75 +108,157 @@ impl WorkerPool {
             active: AtomicUsize::new(0),
             panic: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+        })
+    }
+
+    /// One persistent lane thread's whole life: pin to a core (if any
+    /// are given), then wait for a job newer than the last one this
+    /// lane ran, claim chunks by index until the job is exhausted, and
+    /// signal the caller once every lane has drained the current job.
+    /// Exits when `shutdown` is set and no job is waiting.
+    fn lane_loop(self: Arc<Self>, li: usize, pins: &[usize]) {
+        let _ = crate::pin_current(li, pins);
+        let mut seen = 0u64;
+        loop {
+            let Some(job) = self.wait_for_next_job(&mut seen) else {
+                return;
+            };
+            self.run_job(li, job);
+        }
+    }
+
+    /// Run every chunk this lane claims from `job`, then signal the
+    /// caller once every lane has drained it. The `loop` in
+    /// [`Self::lane_loop`] stays free of a branch.
+    fn run_job(&self, li: usize, job: Job) {
+        self.run_lane_chunks(li, job);
+        self.signal_if_last();
+    }
+
+    /// Wait for a job newer than `seen`, updating it in place. Returns
+    /// `None` once `shutdown` is set and no job is waiting. The `loop`
+    /// in [`Self::lane_loop`] stays free of a branch.
+    fn wait_for_next_job(&self, seen: &mut u64) -> Option<Job> {
+        let mut g = self.job.lock().expect("worker job poisoned");
+        loop {
+            match self.poll_job_or_park(seen, g) {
+                JobWait::Ready(job) => return Some(job),
+                JobWait::Shutdown => return None,
+                JobWait::Retry(g2) => g = g2,
+            }
+        }
+    }
+
+    /// One wait step: [`JobWait::Shutdown`], [`JobWait::Ready`] once a
+    /// job newer than `seen` is ready, or [`JobWait::Retry`] after
+    /// parking on the condvar (call again). The `loop` in
+    /// [`Self::wait_for_next_job`] stays free of a branch.
+    fn poll_job_or_park<'a>(
+        &'a self,
+        seen: &mut u64,
+        g: MutexGuard<'a, Option<Job>>,
+    ) -> JobWait<'a> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return JobWait::Shutdown;
+        }
+        let g_now = self.generation.load(Ordering::Acquire);
+        if g_now != *seen
+            && let Some(job) = *g
+        {
+            *seen = g_now;
+            return JobWait::Ready(job);
+        }
+        let g = self.wake.wait(g).expect("worker job poisoned");
+        JobWait::Retry(g)
+    }
+
+    /// Signal the caller once every lane has drained the current job:
+    /// the fetch-sub result of 1 means this call is the last lane out.
+    fn signal_if_last(&self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Last one out wakes the caller.
+            let _g = self.done_lock.lock().expect("worker done poisoned");
+            self.done.notify_all();
+        }
+    }
+
+    /// Claim and run chunks by index until the job is exhausted,
+    /// containing any panic into `self.panic` (first one wins) instead
+    /// of letting it unwind the lane thread.
+    fn run_lane_chunks(&self, li: usize, job: Job) {
+        let n = self.n_chunks.load(Ordering::Acquire);
+        loop {
+            let Some(i) = self.claim_chunk(n) else {
+                return;
+            };
+            self.run_one_chunk(li, job, i);
+        }
+    }
+
+    /// Claim the next chunk index, or `None` once `n` chunks are
+    /// exhausted. The `loop` in [`Self::run_lane_chunks`] stays free of
+    /// a branch.
+    fn claim_chunk(&self, n: usize) -> Option<usize> {
+        let i = self.next_chunk.fetch_add(1, Ordering::AcqRel);
+        (i < n).then_some(i)
+    }
+
+    /// Run chunk `i`, containing any panic into `self.panic` (first one
+    /// wins) instead of letting it unwind the lane thread. The `loop` in
+    /// [`Self::run_lane_chunks`] stays free of a branch.
+    fn run_one_chunk(&self, li: usize, job: Job, i: usize) {
+        // SAFETY: `run` keeps the closure alive until `active`
+        // drains, and each index is handed out once.
+        let r = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+            (job.call)(job.data, li, i);
+        }));
+        let Err(p) = r else { return };
+        let msg = p
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".into());
+        let mut slot = self.panic.lock().expect("worker panic poisoned");
+        // First panic wins; the rest are drained.
+        slot.get_or_insert(PoolPanic {
+            worker: li,
+            chunk: i,
+            message: msg,
         });
-        let mut threads = Vec::with_capacity(workers);
-        for li in 0..workers {
-            let sh = shared.clone();
-            let pins = pin_cores.clone();
-            threads.push(
+    }
+}
+
+/// Persistent worker pool: W threads created once, jobs handed to them as
+/// `(worker_idx, chunk_idx)` closure calls. See the module docs for the
+/// safety model.
+pub struct WorkerPool {
+    shared: Arc<Shared>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    workers: std::num::NonZeroUsize,
+}
+
+impl WorkerPool {
+    /// Spawn `workers` persistent threads, pinned round-robin over
+    /// `pin_cores` when it is non-empty.
+    ///
+    /// # Panics
+    /// Panics if spawning a worker thread fails (see
+    /// `std::thread::Builder::spawn`).
+    #[must_use]
+    pub fn new(workers: std::num::NonZeroUsize, pin_cores: &[usize]) -> Self {
+        let workers_usize = workers.get();
+        let shared = Shared::new();
+        let threads: Vec<std::thread::JoinHandle<()>> = (0..workers_usize)
+            .map(|li| {
+                let sh = shared.clone();
+                let pins = pin_cores.to_vec();
                 std::thread::Builder::new()
                     // Keep this name: ops tooling greps for stm-lane-*.
                     .name(format!("stm-lane-{li}"))
-                    .spawn(move || {
-                        if !pins.is_empty() {
-                            let _ = core_affinity::set_for_current(core_affinity::CoreId {
-                                id: pins[li % pins.len()],
-                            });
-                        }
-                        let mut seen = 0u64;
-                        loop {
-                            // Wait for a job newer than the last one we ran.
-                            let job = {
-                                let mut g = sh.job.lock().expect("worker job poisoned");
-                                loop {
-                                    if sh.shutdown.load(Ordering::Acquire) {
-                                        return;
-                                    }
-                                    let g_now = sh.generation.load(Ordering::Acquire);
-                                    if g_now != seen && g.is_some() {
-                                        seen = g_now;
-                                        break g.expect("checked");
-                                    }
-                                    g = sh.wake.wait(g).expect("worker job poisoned");
-                                }
-                            };
-                            let n = sh.n_chunks.load(Ordering::Acquire);
-                            loop {
-                                let i = sh.next_chunk.fetch_add(1, Ordering::AcqRel);
-                                if i >= n {
-                                    break;
-                                }
-                                // SAFETY: `run` keeps the closure alive until
-                                // `active` drains, and each index is handed out
-                                // once.
-                                let r = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
-                                    (job.call)(job.data, li, i)
-                                }));
-                                if let Err(p) = r {
-                                    let msg = p
-                                        .downcast_ref::<&str>()
-                                        .map(|s| (*s).to_string())
-                                        .or_else(|| p.downcast_ref::<String>().cloned())
-                                        .unwrap_or_else(|| "non-string panic payload".into());
-                                    let mut slot = sh.panic.lock().expect("worker panic poisoned");
-                                    // First panic wins; the rest are drained.
-                                    slot.get_or_insert(PoolPanic {
-                                        worker: li,
-                                        chunk: i,
-                                        message: msg,
-                                    });
-                                }
-                            }
-                            if sh.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-                                // Last one out wakes the caller.
-                                let _g = sh.done_lock.lock().expect("worker done poisoned");
-                                sh.done.notify_all();
-                            }
-                        }
-                    })
-                    .expect("worker spawn"),
-            );
-        }
+                    .spawn(move || sh.lane_loop(li, &pins))
+                    .expect("worker spawn")
+            })
+            .collect();
         Self {
             shared,
             threads,
@@ -195,7 +266,8 @@ impl WorkerPool {
         }
     }
 
-    pub fn workers(&self) -> usize {
+    #[must_use]
+    pub fn workers(&self) -> std::num::NonZeroUsize {
         self.workers
     }
 
@@ -207,20 +279,28 @@ impl WorkerPool {
     ///
     /// A contained closure panic surfaces as `Err(PoolPanic)` after every
     /// chunk has been drained. The pool stays usable.
+    ///
+    /// # Errors
+    /// Returns `Err(PoolPanic)` if any chunk's closure call panicked
+    /// (the first such panic; every chunk still runs).
+    ///
+    /// # Panics
+    /// Panics if the pool's internal locks are poisoned (a worker
+    /// thread panicked outside a chunk call, which should not happen).
     pub fn run<F>(&self, n_chunks: usize, f: &F) -> Result<(), PoolPanic>
     where
         F: Fn(usize, usize) + Sync,
     {
+        unsafe fn trampoline<F: Fn(usize, usize)>(data: *const (), lane: usize, i: usize) {
+            // SAFETY: `data` came from `&F` in `run`, which outlives this call.
+            let f = unsafe { &*data.cast::<F>() };
+            f(lane, i);
+        }
         if n_chunks == 0 {
             return Ok(());
         }
-        unsafe fn trampoline<F: Fn(usize, usize)>(data: *const (), lane: usize, i: usize) {
-            // SAFETY: `data` came from `&F` in `run`, which outlives this call.
-            let f = unsafe { &*(data as *const F) };
-            f(lane, i);
-        }
         let job = Job {
-            data: f as *const F as *const (),
+            data: std::ptr::from_ref::<F>(f).cast::<()>(),
             call: trampoline::<F>,
         };
         self.shared
@@ -230,34 +310,16 @@ impl WorkerPool {
             .take();
         self.shared.n_chunks.store(n_chunks, Ordering::Release);
         self.shared.next_chunk.store(0, Ordering::Release);
-        self.shared.active.store(self.workers, Ordering::Release);
+        self.shared
+            .active
+            .store(self.workers.get(), Ordering::Release);
         {
             let mut g = self.shared.job.lock().expect("worker job poisoned");
             *g = Some(job);
             self.shared.generation.fetch_add(1, Ordering::AcqRel);
         }
         self.shared.wake.notify_all();
-        // Wait out the workers: a short spin catches the common case where
-        // the chunks take tens of microseconds, then block. Never spin
-        // forever, since the workers may share this thread's core.
-        let mut spins = 0u32;
-        while self.shared.active.load(Ordering::Acquire) != 0 {
-            spins += 1;
-            if spins < 256 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let mut g = self.shared.done_lock.lock().expect("worker done poisoned");
-            while self.shared.active.load(Ordering::Acquire) != 0 {
-                let (ng, _) = self
-                    .shared
-                    .done
-                    .wait_timeout(g, std::time::Duration::from_micros(200))
-                    .expect("worker done poisoned");
-                g = ng;
-            }
-            break;
-        }
+        self.wait_for_workers();
         // Drop the job so a spurious wake cannot re-run it.
         {
             let mut g = self.shared.job.lock().expect("worker job poisoned");
@@ -272,6 +334,34 @@ impl WorkerPool {
         {
             Some(p) => Err(p),
             None => Ok(()),
+        }
+    }
+
+    /// Wait out the workers: a short spin catches the common case where
+    /// the chunks take tens of microseconds, then block. Never spin
+    /// forever, since the workers may share this thread's core.
+    fn wait_for_workers(&self) {
+        let mut spins = 0u32;
+        while spins < 256 && self.shared.active.load(Ordering::Acquire) != 0 {
+            std::hint::spin_loop();
+            spins += 1;
+        }
+        if self.shared.active.load(Ordering::Acquire) != 0 {
+            self.block_for_workers();
+        }
+    }
+
+    /// The blocking half of [`Self::wait_for_workers`], once the spin
+    /// budget is spent.
+    fn block_for_workers(&self) {
+        let mut g = self.shared.done_lock.lock().expect("worker done poisoned");
+        while self.shared.active.load(Ordering::Acquire) != 0 {
+            let (ng, _) = self
+                .shared
+                .done
+                .wait_timeout(g, std::time::Duration::from_micros(200))
+                .expect("worker done poisoned");
+            g = ng;
         }
     }
 }
@@ -289,10 +379,15 @@ impl Drop for WorkerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
+
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("test worker count is never 0")
+    }
 
     #[test]
     fn every_chunk_runs_exactly_once() {
-        let pool = WorkerPool::new(4, Vec::new());
+        let pool = WorkerPool::new(nz(4), &[]);
         for round in 0..200 {
             let n = 1 + round % 37;
             let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
@@ -300,16 +395,23 @@ mod tests {
                 counts[i].fetch_add(1, Ordering::Relaxed);
             })
             .expect("no panic");
-            for (i, c) in counts.iter().enumerate() {
-                assert_eq!(c.load(Ordering::Relaxed), 1, "chunk {i} in round {round}");
-            }
+            assert_each_chunk_ran_once(&counts, round);
+        }
+    }
+
+    /// Every chunk in `counts` ran exactly once. The `for` loop over
+    /// rounds in [`every_chunk_runs_exactly_once`] stays free of a
+    /// nested loop.
+    fn assert_each_chunk_ran_once(counts: &[AtomicUsize], round: usize) {
+        for (i, c) in counts.iter().enumerate() {
+            assert_eq!(c.load(Ordering::Relaxed), 1, "chunk {i} in round {round}");
         }
     }
 
     #[test]
     fn results_are_visible_to_the_caller_after_run() {
         // The completion wait must publish the workers' writes to the caller.
-        let pool = WorkerPool::new(3, Vec::new());
+        let pool = WorkerPool::new(nz(3), &[]);
         for round in 0..200usize {
             let n = 64;
             let out: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
@@ -317,19 +419,27 @@ mod tests {
                 out[i].store(i * round + 1, Ordering::Relaxed);
             })
             .expect("no panic");
-            for (i, v) in out.iter().enumerate() {
-                assert_eq!(
-                    v.load(Ordering::Relaxed),
-                    i * round + 1,
-                    "chunk {i} round {round}"
-                );
-            }
+            assert_each_chunk_wrote_its_result(&out, round);
+        }
+    }
+
+    /// Every chunk in `out` wrote the value `pool.run`'s closure computed
+    /// for it. The `for` loop over rounds in
+    /// [`results_are_visible_to_the_caller_after_run`] stays free of a
+    /// nested loop.
+    fn assert_each_chunk_wrote_its_result(out: &[AtomicUsize], round: usize) {
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(
+                v.load(Ordering::Relaxed),
+                i * round + 1,
+                "chunk {i} round {round}"
+            );
         }
     }
 
     #[test]
     fn back_to_back_jobs_do_not_bleed() {
-        let pool = WorkerPool::new(4, Vec::new());
+        let pool = WorkerPool::new(nz(4), &[]);
         let hits = AtomicUsize::new(0);
         for _ in 0..500 {
             pool.run(8, &|_, _| {
@@ -342,14 +452,12 @@ mod tests {
 
     #[test]
     fn a_panicking_chunk_is_contained_and_the_pool_survives() {
-        let pool = WorkerPool::new(4, Vec::new());
+        let pool = WorkerPool::new(nz(4), &[]);
         let ran: Vec<AtomicUsize> = (0..16).map(|_| AtomicUsize::new(0)).collect();
         let err = pool
             .run(16, &|_, i: usize| {
                 ran[i].fetch_add(1, Ordering::Relaxed);
-                if i == 7 {
-                    panic!("chunk 7 exploded");
-                }
+                assert!(i != 7, "chunk 7 exploded");
             })
             .expect_err("chunk 7 must surface");
         assert_eq!(err.chunk, 7);
@@ -369,7 +477,7 @@ mod tests {
 
     #[test]
     fn worker_idx_is_in_range_and_stable_per_run() {
-        let pool = WorkerPool::new(3, Vec::new());
+        let pool = WorkerPool::new(nz(3), &[]);
         let seen: Vec<AtomicUsize> = (0..64).map(|_| AtomicUsize::new(usize::MAX)).collect();
         pool.run(64, &|lane, i: usize| {
             assert!(lane < 3, "worker idx out of range: {lane}");

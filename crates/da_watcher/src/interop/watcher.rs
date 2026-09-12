@@ -26,12 +26,13 @@
 //! never tell, since a message that was never derived leaves no evidence.
 //! Hence: derive, or stop.
 
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
-use kardamom_types::xchain::{XChainError, check_anchor, derive_remote_epoch};
+use kardamom_types::xchain::{XChainError, derive_remote_epoch};
 
 use crate::interop::cursor::CursorFile;
 use crate::interop::publisher::{PublishError, RemoteEpochPublisher};
@@ -74,6 +75,12 @@ pub enum InteropError {
     /// The publisher transport is permanently closed; the watcher must exit.
     #[error("remote epoch publisher closed")]
     PublisherClosed,
+    /// The batch's last seq is `u64::MAX`: advancing the cursor past it
+    /// would wrap to 0, which would look like a fresh pair and rewind the
+    /// lane's dedup and reorder checks. Effectively unreachable; a real
+    /// peer feed never produces this many messages.
+    #[error("interop cursor overflowed u64 after publishing seq {last_seq}")]
+    CursorOverflow { last_seq: u64 },
 }
 
 /// One processing pass: take the next origin block's batch, derive its record,
@@ -93,6 +100,8 @@ pub enum InteropError {
 /// - [`InteropError::Lagged`] if the feed floor is above the cursor. Cursor
 ///   unchanged; the caller must STOP.
 /// - [`InteropError::PublisherClosed`] if the sink is shut.
+/// - [`InteropError::CursorOverflow`] if advancing the cursor past the
+///   published batch would wrap `u64`.
 pub async fn process_once<S, P>(
     publisher: &P,
     source: &mut S,
@@ -110,28 +119,37 @@ where
     })?;
 
     // The anchor is a pure function of (origin, block). The feed must not
-    // choose it, so recompute it here and reject a message that differs
-    // (audit M4). Terminal for the pair, like every derivation fault.
-    for m in &batch {
-        check_anchor(origin, m).map_err(InteropError::Derive)?;
-    }
+    // choose it, so recompute it here and reject a message that differs.
+    // Terminal for the pair, like every derivation fault.
+    batch
+        .iter()
+        .try_for_each(|m| m.check_anchor(origin))
+        .map_err(InteropError::Derive)?;
 
     // The batch goes in verbatim: ordering, gap, duplicate, multi-block and
     // foreign-destination verdicts all belong to the shared rule, which the
     // destination's verifier re-runs against the resulting record.
     let record = derive_remote_epoch(self_chain_id, origin, *cursor, &batch)
         .map_err(InteropError::Derive)?;
-    let messages = record.messages.len();
+    let messages = record.messages.len().get();
     let last_seq = record.last_seq();
 
     match publisher.publish(&record) {
         Ok(pos) => {
-            *cursor = last_seq + 1;
+            *cursor = last_seq
+                .checked_add(1)
+                .ok_or(InteropError::CursorOverflow { last_seq })?;
             let origin_label = origin.to_string();
             ::metrics::counter!(metrics::REMOTE_EPOCHS_PUBLISHED_TOTAL, "origin" => origin_label.clone())
                 .increment(1);
             ::metrics::counter!(metrics::REMOTE_MESSAGES_TOTAL, "origin" => origin_label.clone())
                 .increment(messages as u64);
+            // Metric value; f64 precision loss only above 2^52, never
+            // reached by a per-pair cursor.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "metric value; never nears 2^52 for a per-pair cursor"
+            )]
             ::metrics::gauge!(metrics::REMOTE_CURSOR_SEQ, "origin" => origin_label)
                 .set(*cursor as f64);
             debug!(
@@ -191,7 +209,7 @@ where
 /// completing without a shutdown signal is the pair's halt signal.
 pub fn spawn<S, P>(
     publisher: P,
-    mut source: S,
+    source: S,
     config: InteropWatcherConfig,
     cursor_file: Option<CursorFile>,
 ) -> WatcherHandle
@@ -199,122 +217,24 @@ where
     S: RemoteChainSource,
     P: RemoteEpochPublisher,
 {
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let origin = source.origin_chain_id();
-    let origin_label = origin.to_string();
+    let mut interop_loop = InteropLoop {
+        cursor_file,
+        origin,
+        origin_label: origin.to_string(),
+        retry_interval: config.retry_interval,
+        publisher,
+        source,
+        self_chain_id: config.self_chain_id,
+        shutdown_rx,
+    };
     let task = tokio::spawn(async move {
         let mut cursor = config.start_seq;
         loop {
-            let cursor_before = cursor;
-            let outcome = tokio::select! {
-                biased;
-                _ = &mut shutdown_rx => {
-                    info!(target: "da_watcher::interop", origin, "shutting down");
-                    break;
-                }
-                // Cancelled mid-pass only by the shutdown branch above; the
-                // dropped future can cost at most an un-consumed feed item,
-                // which the cursor-authoritative resume replays.
-                r = process_once(&publisher, &mut source, config.self_chain_id, &mut cursor) => r,
-            };
-            // THE WRITE SITE. Persist strictly AFTER a successful publish
-            // (the only thing that advances `cursor`), never before. The two
-            // failure directions are not symmetric: a cursor that dies STALE
-            // here is harmless — the restart re-derives byte-identical
-            // records and cluster dedup on `canonical_id` absorbs the
-            // re-publish — while a cursor persisted AHEAD of a publish would
-            // be a permanent lane hole no retry can fill (the record between
-            // the two positions was never published and never will be). A
-            // FAILED persist therefore only degrades restart to the stale
-            // case, so it is logged loudly and the pair keeps flowing.
-            if cursor != cursor_before
-                && let Some(cf) = &cursor_file
-                && let Err(e) = cf.persist(cursor)
-            {
-                ::metrics::counter!(
-                    metrics::REMOTE_CURSOR_PERSIST_FAILURES_TOTAL,
-                    "origin" => origin_label.clone()
-                )
-                .increment(1);
-                warn!(
-                    target: "da_watcher::interop",
-                    origin,
-                    cursor,
-                    error = %e,
-                    "cursor persist failed; a restart before the next successful persist \
-                     resumes STALE (harmless: dedup absorbs the re-publish)"
-                );
-            }
-            match outcome {
-                Ok(_) => {
-                    ::metrics::counter!(
-                        metrics::REMOTE_WATCHER_TICK_TOTAL,
-                        "origin" => origin_label.clone(),
-                        "outcome" => "ok"
-                    )
-                    .increment(1);
-                }
-                Err(InteropError::Source(e)) => {
-                    ::metrics::counter!(
-                        metrics::REMOTE_WATCHER_TICK_TOTAL,
-                        "origin" => origin_label.clone(),
-                        "outcome" => "feed_error"
-                    )
-                    .increment(1);
-                    warn!(
-                        target: "da_watcher::interop",
-                        origin,
-                        cursor,
-                        error = %e,
-                        "outbox feed unavailable; the pair stalls until it recovers"
-                    );
-                    tokio::time::sleep(config.retry_interval).await;
-                }
-                Err(InteropError::PublisherClosed) => {
-                    ::metrics::counter!(
-                        metrics::REMOTE_WATCHER_TICK_TOTAL,
-                        "origin" => origin_label.clone(),
-                        "outcome" => "publisher_closed"
-                    )
-                    .increment(1);
-                    warn!(target: "da_watcher::interop", origin, "publisher closed; exiting");
-                    break;
-                }
-                Err(InteropError::Derive(e)) => {
-                    ::metrics::counter!(
-                        metrics::REMOTE_WATCHER_TICK_TOTAL,
-                        "origin" => origin_label.clone(),
-                        "outcome" => "fault"
-                    )
-                    .increment(1);
-                    error!(
-                        target: "da_watcher::interop",
-                        origin,
-                        cursor,
-                        error = %e,
-                        "remote epoch derivation fault; STOPPING this pair (a feed gap is \
-                         never skipped — operator intervention required)"
-                    );
-                    break;
-                }
-                Err(InteropError::Lagged { cursor: at, floor }) => {
-                    ::metrics::counter!(
-                        metrics::REMOTE_WATCHER_TICK_TOTAL,
-                        "origin" => origin_label.clone(),
-                        "outcome" => "fault"
-                    )
-                    .increment(1);
-                    error!(
-                        target: "da_watcher::interop",
-                        origin,
-                        cursor = at,
-                        floor,
-                        "remote feed lagged; STOPPING this pair (the feed cannot serve the \
-                         cursor; reset the cursor or backfill from DA — operator \
-                         intervention required)"
-                    );
-                    break;
-                }
+            match interop_loop.tick(&mut cursor).await {
+                ControlFlow::Break(()) => break,
+                ControlFlow::Continue(()) => {}
             }
         }
     });
@@ -324,563 +244,155 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
+/// Per-pair loop state: the cursor file, the origin chain id (for
+/// logging), the retryable-error backoff, and the seams `tick` owns for
+/// its whole task lifetime (`publisher`, `source`, `self_chain_id`,
+/// `shutdown_rx`).
+struct InteropLoop<S, P> {
+    cursor_file: Option<CursorFile>,
+    origin: u64,
+    origin_label: String,
+    retry_interval: Duration,
+    publisher: P,
+    source: S,
+    self_chain_id: u64,
+    shutdown_rx: oneshot::Receiver<()>,
+}
 
-    use alloy_primitives::{Address, B256, Bytes};
-    use kardamom_types::xchain::{
-        OutboxMessage, RemoteEpochRecord, remote_source_hash, xchain_anchor_hash,
-    };
-
-    use super::*;
-    use crate::interop::mock::MockInteropFeed;
-    use crate::interop::publisher::fakes::InMemoryRemoteEpochPublisher;
-    use crate::interop::source::WsRemoteChainSource;
-
-    const SELF: u64 = 412_347;
-    const ORIGIN: u64 = 412_346;
-
-    fn msg(seq: u64, block: u64) -> OutboxMessage {
-        OutboxMessage {
-            origin_block_number: block,
-            origin_block_hash: xchain_anchor_hash(ORIGIN, block),
-            dest_chain_id: SELF,
-            seq,
-            sender: Address::repeat_byte(0xA1),
-            target: Address::repeat_byte(0xB2),
-            value: 0,
-            gas_limit: 200_000,
-            data: Bytes::from_static(&[0xCA, 0xFE]),
-            callback: None,
-        }
-    }
-
-    /// The watcher under test, wired to a real WebSocket against the scripted
-    /// feed — the transport in the test is the transport that ships.
-    async fn spawn_against(
-        feed: &MockInteropFeed,
-    ) -> (InMemoryRemoteEpochPublisher, WatcherHandle) {
-        let publisher = InMemoryRemoteEpochPublisher::default();
-        let handle = spawn_resuming(feed, publisher.clone(), 0, None).await;
-        (publisher, handle)
-    }
-
-    /// [`spawn_against`] with an explicit resume position and (optionally) a
-    /// durable cursor — the restart-shaped variant.
-    async fn spawn_resuming(
-        feed: &MockInteropFeed,
-        publisher: InMemoryRemoteEpochPublisher,
-        start_seq: u64,
-        cursor_file: Option<CursorFile>,
-    ) -> WatcherHandle {
-        let source = WsRemoteChainSource::new(ORIGIN, SELF, feed.url())
-            .with_reconnect(Duration::from_millis(20), 50);
-        spawn(
-            publisher,
-            source,
-            InteropWatcherConfig {
-                self_chain_id: SELF,
-                start_seq,
-                retry_interval: Duration::from_millis(20),
-            },
-            cursor_file,
+impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropLoop<S, P> {
+    /// One [`spawn`] pass: run `process_once` (or handle shutdown),
+    /// persist the cursor when it advanced, then apply the outcome.
+    /// `Break` ends the task: shutdown, or a fail-stop outcome.
+    async fn tick(&mut self, cursor: &mut u64) -> ControlFlow<()> {
+        let cursor_before = *cursor;
+        let outcome = tokio::select! {
+            biased;
+            _ = &mut self.shutdown_rx => {
+                info!(target: "da_watcher::interop", origin = self.origin, "shutting down");
+                return ControlFlow::Break(());
+            }
+            // Cancelled mid-pass only by the shutdown branch above; the
+            // dropped future can cost at most an un-consumed feed item,
+            // which the cursor-authoritative resume replays.
+            r = process_once(&self.publisher, &mut self.source, self.self_chain_id, cursor) => r,
+        };
+        self.persist_cursor(*cursor, cursor_before);
+        // Takes the specific fields it needs, not `&self`: `self` also
+        // carries `source`/`publisher`, and `tokio::spawn` requires the
+        // whole task future to be `Send`, which a `&self` held across
+        // this `.await` would need `S: Sync`/`P: Sync` for, with no
+        // reason to require that of either trait.
+        Self::handle_outcome(
+            self.origin,
+            &self.origin_label,
+            self.retry_interval,
+            outcome,
+            *cursor,
         )
+        .await
     }
 
-    async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !cond() {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    /// Persist the cursor after a pass that advanced it. Never called
+    /// before the publish it records: a cursor that dies STALE (crash
+    /// before this call) is harmless, because the restart re-derives a
+    /// byte-identical record and cluster dedup on `canonical_id` absorbs
+    /// the re-publish. A cursor persisted AHEAD of its publish would be a
+    /// permanent lane hole instead, so this only runs when `cursor`
+    /// actually moved past `cursor_before`.
+    fn persist_cursor(&self, cursor: u64, cursor_before: u64) {
+        if cursor == cursor_before {
+            return;
+        }
+        let Some(cf) = self.cursor_file.as_ref() else {
+            return;
+        };
+        if let Err(e) = cf.persist(cursor) {
+            ::metrics::counter!(
+                metrics::REMOTE_CURSOR_PERSIST_FAILURES_TOTAL,
+                "origin" => self.origin_label.clone()
+            )
+            .increment(1);
+            warn!(
+                target: "da_watcher::interop",
+                origin = self.origin,
+                cursor,
+                error = %e,
+                "cursor persist failed; a restart before the next successful persist \
+                 resumes STALE (harmless: dedup absorbs the re-publish)"
+            );
         }
     }
 
-    /// The watcher halted of its own accord (fail-stop) rather than being
-    /// asked to. The shutdown sender is held alive across the await on
-    /// purpose: dropping it IS a shutdown request, which would make this
-    /// assertion pass for the wrong reason.
-    async fn assert_halted(handle: WatcherHandle) {
-        let WatcherHandle { task, shutdown } = handle;
-        let outcome = tokio::time::timeout(Duration::from_secs(10), task).await;
-        drop(shutdown);
-        outcome
-            .expect("watcher should have halted on the derivation fault")
-            .expect("watcher task must not panic");
+    /// Record the tick outcome and, for a retryable feed error, pace the
+    /// retry. Returns [`ControlFlow::Break`] when the loop must stop: the
+    /// publisher closed, or the batch broke the derivation rule (a
+    /// fail-stop fault).
+    async fn handle_outcome(
+        origin: u64,
+        origin_label: &str,
+        retry_interval: Duration,
+        outcome: Result<usize, InteropError>,
+        cursor: u64,
+    ) -> ControlFlow<()> {
+        match outcome {
+            Ok(_) => {
+                record_tick(origin_label, "ok");
+                ControlFlow::Continue(())
+            }
+            Err(InteropError::Source(e)) => {
+                record_tick(origin_label, "feed_error");
+                warn!(
+                    target: "da_watcher::interop",
+                    origin,
+                    cursor,
+                    error = %e,
+                    "outbox feed unavailable; the pair stalls until it recovers"
+                );
+                tokio::time::sleep(retry_interval).await;
+                ControlFlow::Continue(())
+            }
+            Err(InteropError::PublisherClosed) => {
+                record_tick(origin_label, "publisher_closed");
+                warn!(target: "da_watcher::interop", origin, "publisher closed; exiting");
+                ControlFlow::Break(())
+            }
+            Err(InteropError::Lagged { cursor: at, floor }) => {
+                record_tick(origin_label, "fault");
+                error!(
+                    target: "da_watcher::interop",
+                    origin,
+                    cursor = at,
+                    floor,
+                    "remote feed lagged; STOPPING this pair (the feed cannot serve the \
+                     cursor; reset the cursor or backfill from DA — operator intervention \
+                     required)"
+                );
+                ControlFlow::Break(())
+            }
+            Err(e @ (InteropError::Derive(_) | InteropError::CursorOverflow { .. })) => {
+                record_tick(origin_label, "fault");
+                error!(
+                    target: "da_watcher::interop",
+                    origin,
+                    cursor,
+                    error = %e,
+                    "remote epoch derivation fault; STOPPING this pair (a feed gap is never \
+                     skipped; operator intervention required)"
+                );
+                ControlFlow::Break(())
+            }
+        }
     }
+}
 
-    /// A record the sink would not take must not advance the cursor: the next
-    /// pass re-derives the same batch, and re-derivation being byte-identical
-    /// is what makes the retry safe even if the first attempt did land.
-    #[tokio::test]
-    async fn a_declined_publish_holds_the_cursor() {
-        use crate::interop::source::fakes::ScriptedRemoteSource;
-
-        let publisher = InMemoryRemoteEpochPublisher::default();
-        *publisher.fail_with_backpressure.lock().unwrap() = true;
-        let mut source = ScriptedRemoteSource::new(ORIGIN);
-        source.push_batch(Ok(vec![msg(0, 100)]));
-        source.push_batch(Ok(vec![msg(0, 100)]));
-        let mut cursor = 0u64;
-
-        let n = process_once(&publisher, &mut source, SELF, &mut cursor)
-            .await
-            .unwrap();
-        assert_eq!(n, 0);
-        assert_eq!(cursor, 0, "cursor must not pass an unpublished record");
-
-        *publisher.fail_with_backpressure.lock().unwrap() = false;
-        let n = process_once(&publisher, &mut source, SELF, &mut cursor)
-            .await
-            .unwrap();
-        assert_eq!(n, 1);
-        assert_eq!(cursor, 1);
-        assert_eq!(source.cursors, vec![0, 0], "the retry re-reads from 0");
-    }
-
-    /// A feed failure stalls the pair; it does not fault it. The distinction
-    /// is the whole per-pair posture: an unreachable peer recovers by itself,
-    /// a broken sequence does not.
-    #[tokio::test]
-    async fn a_feed_failure_is_retryable_not_a_fault() {
-        use crate::interop::source::RemoteSourceError;
-        use crate::interop::source::fakes::ScriptedRemoteSource;
-
-        let publisher = InMemoryRemoteEpochPublisher::default();
-        let mut source = ScriptedRemoteSource::new(ORIGIN);
-        source.push_batch(Err(RemoteSourceError::Transport("peer down".into())));
-        let mut cursor = 7u64;
-
-        let err = process_once(&publisher, &mut source, SELF, &mut cursor)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, InteropError::Source(_)), "got {err:?}");
-        assert_eq!(cursor, 7);
-    }
-
-    /// Messages group by ORIGIN BLOCK, not by arrival: three messages across
-    /// two blocks are two records, cut where the origin cut them.
-    #[tokio::test]
-    async fn one_record_per_origin_block() {
-        let feed = MockInteropFeed::new(ORIGIN).await;
-        let (publisher, handle) = spawn_against(&feed).await;
-
-        feed.push_message(msg(0, 100));
-        feed.push_message(msg(1, 100));
-        feed.push_message(msg(2, 101));
-        // A block cannot be known complete until a later one appears, so the
-        // sentinel is what closes block 101 — the tail-latency property the
-        // source's module docs call out.
-        feed.push_message(msg(3, 102));
-
-        wait_until(|| publisher.records().len() >= 2, "two records").await;
-        let _ = handle.shutdown.send(());
-
-        let records = publisher.records();
-        assert_eq!(records.len(), 2, "one record per origin block, no more");
-
-        assert_eq!(records[0].anchor_number, 100);
-        assert_eq!(records[0].first_seq, 0);
-        assert_eq!(records[0].last_seq(), 1);
-        assert_eq!(
-            records[0]
-                .messages
-                .iter()
-                .map(|m| m.source_hash)
-                .collect::<Vec<_>>(),
-            vec![remote_source_hash(ORIGIN, 0), remote_source_hash(ORIGIN, 1)],
-        );
-
-        assert_eq!(records[1].anchor_number, 101);
-        assert_eq!(records[1].first_seq, 2);
-        assert_eq!(records[1].last_seq(), 2);
-        assert_eq!(
-            records[1].messages[0].source_hash,
-            remote_source_hash(ORIGIN, 2)
-        );
-
-        // The cursor is not directly observable; the record sequence is its
-        // shadow — dense, contiguous, and starting where the last one ended.
-        assert_eq!(records[0].last_seq() + 1, records[1].first_seq);
-    }
-
-    /// A feed that drops an item must stall the pair, not step over the hole.
-    #[tokio::test]
-    async fn a_feed_gap_halts_the_pair() {
-        let feed = MockInteropFeed::new(ORIGIN).await;
-        let (publisher, handle) = spawn_against(&feed).await;
-
-        feed.push_message(msg(0, 100));
-        feed.gap_next(1);
-        feed.push_message(msg(1, 100)); // swallowed by the feed
-        feed.push_message(msg(2, 101));
-        feed.push_message(msg(3, 102));
-
-        assert_halted(handle).await;
-        let records = publisher.records();
-        assert_eq!(records.len(), 1, "only the pre-gap record may exist");
-        assert_eq!(records[0].last_seq(), 0);
-
-        // Nothing lands after the halt, even though the feed keeps serving.
-        feed.push_message(msg(4, 103));
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(publisher.records().len(), 1);
-    }
-
-    /// Audit M4: a feed that serves its own anchor is a fault of the feed.
-    /// The watcher recomputes the anchor and stops the pair.
-    #[tokio::test]
-    async fn a_feed_chosen_anchor_halts_the_pair() {
-        let feed = MockInteropFeed::new(ORIGIN).await;
-        let (publisher, handle) = spawn_against(&feed).await;
-
-        let mut forged = msg(0, 100);
-        forged.origin_block_hash = B256::repeat_byte(0xEE);
-        feed.push_message(forged);
-        feed.push_message(msg(1, 101));
-
-        assert_halted(handle).await;
-        assert!(
-            publisher.records().is_empty(),
-            "a batch with a forged anchor must not be published"
-        );
-    }
-
-    /// Audit M4: a batch that spans two origin blocks is rejected by the
-    /// shared rule. The scripted source hands over such a batch directly.
-    #[tokio::test]
-    async fn a_multi_block_batch_is_a_fault() {
-        use crate::interop::source::fakes::ScriptedRemoteSource;
-
-        let publisher = InMemoryRemoteEpochPublisher::default();
-        let mut source = ScriptedRemoteSource::new(ORIGIN);
-        source.push_batch(Ok(vec![msg(0, 100), msg(1, 101)]));
-        let mut cursor = 0u64;
-
-        let err = process_once(&publisher, &mut source, SELF, &mut cursor)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                InteropError::Derive(XChainError::MultiBlockBatch {
-                    first_block: 100,
-                    found_block: 101
-                })
-            ),
-            "got {err:?}"
-        );
-        assert_eq!(cursor, 0);
-        assert!(publisher.records().is_empty());
-    }
-
-    /// Two messages at one seq: an equivocating origin, not a retry.
-    #[tokio::test]
-    async fn a_duplicate_seq_halts_the_pair() {
-        let feed = MockInteropFeed::new(ORIGIN).await;
-        let (publisher, handle) = spawn_against(&feed).await;
-
-        feed.push_message(msg(0, 100));
-        let mut twin = msg(0, 100);
-        twin.target = Address::repeat_byte(0xEE);
-        feed.push_message(twin);
-        feed.push_message(msg(1, 101));
-
-        assert_halted(handle).await;
-        assert!(
-            publisher.records().is_empty(),
-            "the faulty batch must not be published"
-        );
-    }
-
-    /// A message addressed to another chain is a fault of the feed, and
-    /// silently dropping it would hide that.
-    #[tokio::test]
-    async fn a_foreign_destination_halts_the_pair() {
-        let feed = MockInteropFeed::new(ORIGIN).await;
-        let (publisher, handle) = spawn_against(&feed).await;
-
-        let mut stray = msg(0, 100);
-        stray.dest_chain_id = SELF + 1;
-        feed.push_message(stray);
-        feed.push_message(msg(1, 101));
-
-        assert_halted(handle).await;
-        assert!(publisher.records().is_empty());
-    }
-
-    /// A dropped session must re-subscribe from the watcher's own cursor and
-    /// produce records the racing/uninterrupted run would also have produced —
-    /// equal `canonical_id`s, which is what lets cluster dedup collapse them.
-    #[tokio::test]
-    async fn a_reconnect_reproduces_byte_identical_records() {
-        let feed = MockInteropFeed::new(ORIGIN).await;
-        let (publisher, handle) = spawn_against(&feed).await;
-
-        feed.push_message(msg(0, 100));
-        feed.push_message(msg(1, 100));
-        wait_until(|| feed.subscription_count() >= 1, "the first subscription").await;
-
-        // Drop the session mid-block: block 100 is open, its messages are
-        // already streamed but not yet a record.
-        feed.close_sessions();
-        wait_until(|| feed.subscription_count() >= 2, "a re-subscription").await;
-
-        feed.push_message(msg(2, 101));
-        feed.push_message(msg(3, 102));
-        wait_until(|| publisher.records().len() >= 2, "two records").await;
-        let _ = handle.shutdown.send(());
-
-        let records = publisher.records();
-        assert_eq!(records.len(), 2, "the replay must not duplicate a record");
-
-        let expected: Vec<RemoteEpochRecord> = vec![
-            derive_remote_epoch(SELF, ORIGIN, 0, &[msg(0, 100), msg(1, 100)]).unwrap(),
-            derive_remote_epoch(SELF, ORIGIN, 2, &[msg(2, 101)]).unwrap(),
-        ];
-        assert_eq!(records, expected, "records must be byte-identical");
-        assert_eq!(
-            records.iter().map(|r| r.canonical_id()).collect::<Vec<_>>(),
-            expected
-                .iter()
-                .map(|r| r.canonical_id())
-                .collect::<Vec<_>>(),
-        );
-    }
-
-    /// Restart continuity, through the DURABLE cursor: a watcher that
-    /// persisted its position and died resumes exactly where it stopped —
-    /// same records, no repeat, no hole — with the resume seq coming from
-    /// the file, not from the CLI seed (which deliberately lies here).
-    #[tokio::test]
-    async fn a_restart_resumes_exactly_from_the_persisted_cursor() {
-        let dir = tempfile::tempdir().unwrap();
-        let cursor_file = CursorFile::open(dir.path().join("pair.cursor")).unwrap();
-
-        let feed = MockInteropFeed::new(ORIGIN).await;
-        let publisher = InMemoryRemoteEpochPublisher::default();
-        let handle = spawn_resuming(&feed, publisher.clone(), 0, Some(cursor_file.clone())).await;
-
-        feed.push_message(msg(0, 100));
-        feed.push_message(msg(1, 100));
-        feed.push_message(msg(2, 101));
-        feed.push_message(msg(3, 102)); // sentinel: closes 101
-        wait_until(|| publisher.records().len() >= 2, "two records").await;
-        let _ = handle.shutdown.send(());
-        handle.task.await.unwrap();
-        assert_eq!(
-            cursor_file.load().unwrap(),
-            Some(3),
-            "the persisted cursor must be one past the last PUBLISHED seq \
-             (seq 3's block is still open, so it is not published yet)"
-        );
-
-        // "Restart": a fresh watcher over the same publisher, seeded with a
-        // deliberately wrong CLI value — the file must win.
-        let resumed = cursor_file.load().unwrap().expect("cursor persisted");
-        let handle =
-            spawn_resuming(&feed, publisher.clone(), resumed, Some(cursor_file.clone())).await;
-        feed.push_message(msg(4, 103)); // closes 102
-        feed.push_message(msg(5, 104)); // closes 103
-        wait_until(|| publisher.records().len() >= 4, "four records").await;
-        let _ = handle.shutdown.send(());
-        handle.task.await.unwrap();
-
-        let seqs: Vec<u64> = publisher
-            .records()
-            .iter()
-            .flat_map(|r| r.messages.iter().map(|m| m.seq))
-            .collect();
-        assert_eq!(
-            seqs,
-            vec![0, 1, 2, 3, 4],
-            "no loss, no repeat across the restart"
-        );
-        assert_eq!(
-            publisher.deduped_count(),
-            0,
-            "a clean restart re-publishes nothing"
-        );
-        assert_eq!(cursor_file.load().unwrap(), Some(5));
-    }
-
-    /// The crash window the write ordering exists for: die AFTER the publish,
-    /// BEFORE the persist. The restart resumes STALE, re-derives the same
-    /// batch, re-publishes it — and the duplicate is absorbed by dedup on
-    /// `canonical_id`, proving end to end that the stale side of the
-    /// asymmetry really is harmless.
-    #[tokio::test]
-    async fn a_crash_between_publish_and_persist_resumes_stale_and_dedup_absorbs() {
-        use crate::interop::source::fakes::ScriptedRemoteSource;
-
-        let dir = tempfile::tempdir().unwrap();
-        let cursor_file = CursorFile::open(dir.path().join("pair.cursor")).unwrap();
-        let publisher = InMemoryRemoteEpochPublisher::default();
-
-        // First life: publish succeeds, then the process dies before the
-        // persist (simulated by simply never calling it).
-        let mut source = ScriptedRemoteSource::new(ORIGIN);
-        source.push_batch(Ok(vec![msg(0, 100), msg(1, 100)]));
-        let mut cursor = cursor_file.load().unwrap().unwrap_or(0);
-        let n = process_once(&publisher, &mut source, SELF, &mut cursor)
-            .await
-            .unwrap();
-        assert_eq!(n, 1);
-        assert_eq!(cursor, 2, "in-memory cursor advanced past the publish");
-        drop(source); // the crash: no persist happened
-        assert_eq!(cursor_file.load().unwrap(), None, "nothing durable yet");
-
-        // Second life: resume from the (stale) durable state, which replays
-        // the SAME feed prefix — byte-identical derivation by construction.
-        let mut source = ScriptedRemoteSource::new(ORIGIN);
-        source.push_batch(Ok(vec![msg(0, 100), msg(1, 100)]));
-        source.push_batch(Ok(vec![msg(2, 101)]));
-        let mut cursor = cursor_file.load().unwrap().unwrap_or(0);
-        assert_eq!(cursor, 0, "resumed stale — the harmless side");
-        let n = process_once(&publisher, &mut source, SELF, &mut cursor)
-            .await
-            .unwrap();
-        assert_eq!(
-            n, 1,
-            "the re-publish is reported successful to the producer"
-        );
-        cursor_file.persist(cursor).unwrap();
-        let n = process_once(&publisher, &mut source, SELF, &mut cursor)
-            .await
-            .unwrap();
-        assert_eq!(n, 1);
-        cursor_file.persist(cursor).unwrap();
-
-        // The duplicate was absorbed, not executed twice: one copy of each
-        // record, one dedup hit, and the lane is dense.
-        let records = publisher.records();
-        assert_eq!(
-            records.len(),
-            2,
-            "the replayed record must not appear twice"
-        );
-        assert_eq!(
-            publisher.deduped_count(),
-            1,
-            "the replay was absorbed by canonical_id dedup"
-        );
-        assert_eq!(records[0].first_seq, 0);
-        assert_eq!(records[0].last_seq(), 1);
-        assert_eq!(records[1].first_seq, 2);
-        assert_eq!(cursor_file.load().unwrap(), Some(3));
-    }
-
-    /// `Lagged` says the feed cannot serve our cursor. Reading on would
-    /// skip, and a re-subscribe gets the same answer: the pair halts, and
-    /// nothing past the floor is published.
-    #[tokio::test]
-    async fn a_lagged_marker_halts_the_pair() {
-        let feed = MockInteropFeed::new(ORIGIN).await;
-        feed.push_message(msg(0, 100));
-        feed.push_message(msg(1, 100));
-        feed.push_message(msg(2, 101));
-        feed.push_message(msg(3, 102));
-        // Seqs 0-1 aged out of the feed before the watcher started.
-        feed.set_floor(2);
-        let (publisher, handle) = spawn_against(&feed).await;
-
-        assert_halted(handle).await;
-        assert!(
-            publisher.records().is_empty(),
-            "nothing past the floor may be published"
-        );
-        assert_eq!(
-            feed.subscription_count(),
-            1,
-            "a lag marker must not trigger a re-subscribe loop"
-        );
-    }
-
-    /// The bound itself: `next_batch` returns the terminal error in bounded
-    /// time, from one subscription, instead of looping on re-subscribe.
-    #[tokio::test]
-    async fn a_lagged_marker_terminates_next_batch() {
-        use crate::interop::source::RemoteSourceError;
-
-        let feed = MockInteropFeed::new(ORIGIN).await;
-        feed.push_message(msg(3, 102));
-        feed.set_floor(3);
-        let mut source = WsRemoteChainSource::new(ORIGIN, SELF, feed.url())
-            .with_reconnect(Duration::from_millis(20), 50);
-
-        let err = tokio::time::timeout(Duration::from_secs(5), source.next_batch(0))
-            .await
-            .expect("next_batch must return, not loop")
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                RemoteSourceError::Lagged {
-                    cursor: 0,
-                    floor: 3,
-                    floor_block: Some(102)
-                }
-            ),
-            "got {err:?}"
-        );
-        assert_eq!(feed.subscription_count(), 1);
-
-        // Through `process_once`: the terminal variant, cursor unchanged.
-        let publisher = InMemoryRemoteEpochPublisher::default();
-        let mut cursor = 0u64;
-        let err = process_once(&publisher, &mut source, SELF, &mut cursor)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                InteropError::Lagged {
-                    cursor: 0,
-                    floor: 3
-                }
-            ),
-            "got {err:?}"
-        );
-        assert_eq!(cursor, 0);
-        // A cursor at the floor is served; the head closes the block.
-        feed.push_head(103);
-        let batch = tokio::time::timeout(Duration::from_secs(5), source.next_batch(3))
-            .await
-            .expect("the batch must close on the head")
-            .unwrap();
-        assert_eq!(batch.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![3]);
-    }
-
-    /// A lane with one message delivers: the origin's `head` event closes
-    /// the block, no later message on the lane is needed.
-    #[tokio::test]
-    async fn a_head_event_closes_a_single_message_block() {
-        let feed = MockInteropFeed::new(ORIGIN).await;
-        let (publisher, handle) = spawn_against(&feed).await;
-
-        feed.push_message(msg(0, 100));
-        feed.push_head(100); // at the open block: not a close
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(publisher.records().is_empty(), "block 100 is still open");
-        feed.push_head(101);
-        wait_until(|| !publisher.records().is_empty(), "one record").await;
-
-        // The next message starts a new block; a later head closes it too.
-        feed.push_message(msg(1, 105));
-        feed.push_head(106);
-        wait_until(|| publisher.records().len() >= 2, "two records").await;
-        let _ = handle.shutdown.send(());
-
-        let records = publisher.records();
-        assert_eq!(records[0].anchor_number, 100);
-        assert_eq!(records[0].first_seq, 0);
-        assert_eq!(records[0].last_seq(), 0);
-        assert_eq!(records[1].anchor_number, 105);
-        assert_eq!(records[1].first_seq, 1);
-        assert_eq!(
-            publisher.deduped_count(),
-            0,
-            "a head close must not replay the batch"
-        );
-    }
+/// Record the tick outcome. A pure metrics helper with no loop state
+/// (just the two strings), so it stays a free function rather than a
+/// method on [`InteropLoop`].
+fn record_tick(origin_label: &str, outcome: &'static str) {
+    ::metrics::counter!(
+        metrics::REMOTE_WATCHER_TICK_TOTAL,
+        "origin" => origin_label.to_string(),
+        "outcome" => outcome
+    )
+    .increment(1);
 }

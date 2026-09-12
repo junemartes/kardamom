@@ -1,12 +1,11 @@
-//! Target-agnostic chain-semantics scenario drivers.
+//! `Target`-agnostic chain-semantics scenario drivers.
 //!
 //! Each scenario proves one part of the spec
 //! (`docs/agents/chain-semantics-e2e-suite-spec.md`) through external seams
 //! only: the ingress JSON-RPC and the per-service Prometheus endpoints.
 //! Nothing here knows how the pipeline started. So the same drivers run
-//! against the Target-L local stack today, and later against the Target-C
-//! `ci-cluster.sh` DinD cluster (PR-4 swaps the metrics transport for
-//! docker-exec probes behind this same struct).
+//! against the `Target`-L local stack, and also against the `Target`-C
+//! `ci-cluster.sh` `DinD` cluster, unchanged.
 
 pub mod bridge;
 pub mod consistency;
@@ -24,6 +23,7 @@ pub mod sequencer_restart;
 pub mod upgrade;
 pub mod xchain;
 pub mod xchain_da_parity;
+mod xchain_skipped_seq;
 pub mod xchain_two_stacks;
 
 use std::net::SocketAddr;
@@ -33,7 +33,7 @@ use std::time::Duration;
 use alloy_primitives::{B256, U256};
 use anyhow::{Context, Result};
 
-use crate::harness::l2::L2Client;
+use crate::harness::l2::{L2Client, SignedTransfer};
 use crate::harness::metrics::{self, Scrape};
 
 /// JSON-RPC error codes the ingress contract pins
@@ -43,6 +43,15 @@ pub const CODE_INVALID: i32 = -32602;
 pub const CODE_INTERNAL: i32 = -32603;
 
 /// Metric names asserted across scenarios.
+///
+/// `EXEC_TX_APPLIED`'s literal duplicates `crates/engine/src/metrics.rs::
+/// TX_APPLIED_TOTAL`, unlike `INGRESS_QUEUE_DEPTH` below: `e2e` does not
+/// otherwise depend on `kardamom-engine` (a production execution-engine
+/// crate pulling in `revm`, `kardamom-state`, and
+/// `kardamom-cluster-adapter`), and adding that dependency to this test
+/// harness for one string constant is a worse trade than the
+/// duplication. Flagged for the coordinator; see `status-e2e.md`'s Final
+/// pass follow-up section.
 pub const EXEC_TX_APPLIED: &str = "kardamom_executor_tx_applied_total";
 pub const EXEC_BLOCK_NUMBER: &str = "kardamom_executor_block_number";
 pub const SEQ_DROPPED_PAST: &str = "kardamom_sequencer_tx_dropped_past_total";
@@ -54,7 +63,7 @@ pub const SEQ_PENDING_DEPTH: &str = "kardamom_sequencer_pending_depth";
 pub const SEQ_REMOTE_EPOCHS_RELAYED: &str = "kardamom_sequencer_remote_epochs_relayed_total";
 pub const SEQ_REMOTE_MESSAGES_RELAYED: &str = "kardamom_sequencer_remote_messages_relayed_total";
 pub const SEQ_REMOTE_ORIGIN_REJECT: &str = "kardamom_sequencer_remote_origin_reject_total";
-pub const INGRESS_QUEUE_DEPTH: &str = "kardamom_ingress_queue_depth";
+pub const INGRESS_QUEUE_DEPTH: &str = kardamom_ingress::metrics::QUEUE_DEPTH;
 pub const VALIDATOR_COMMITTED_BLOCK: &str = "validator_committed_block";
 pub const VALIDATOR_BLOCKS_VERIFIED: &str = "validator_blocks_verified_total";
 pub const VALIDATOR_BAL_MISSING: &str = "validator_bal_missing_total";
@@ -63,6 +72,63 @@ pub const VALIDATOR_EPOCH_FAULTS: &str = "validator_epoch_faults_total";
 pub const VALIDATOR_DIVERGENCE: &str = "validator_divergence_total";
 pub const TRIE_SHADOW_CHECKS: &str = "kardamom_state_trie_shadow_checks_total";
 pub const TRIE_SHADOW_MISMATCH: &str = "kardamom_state_trie_shadow_mismatch_total";
+
+/// A `u64` as one left-padded 32-byte word (`u64_word`), and its inverse
+/// (`word_u64`): the `abi.encode` of a `uint64`, and the value form of a
+/// `uint64` event topic. Re-exported from `kardamom_types::xchain`, the
+/// one shared copy — contracts, the validator, and these scenarios all
+/// need the same packing.
+pub(crate) use kardamom_types::xchain::{u64_word, word_u64};
+
+/// A count as a metric value, for a comparison against a scraped counter.
+/// Every count this crate compares is far below 2^52, so the `f64`
+/// mantissa holds it exactly.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "every count this crate compares stays far below 2^52, where f64 is exact"
+)]
+pub fn count_as_f64(n: u64) -> f64 {
+    n as f64
+}
+
+/// Convert a scraped metric value to the `u64` every counter and gauge
+/// this crate reads really is. A scraped value that fails this check
+/// (negative, non-integral, or too large) is a real error: the metric is
+/// not the one the caller expected, so truncating past it would hide the
+/// mismatch instead of reporting it.
+///
+/// # Errors
+/// Returns an error when `v` is not finite, is negative, is not a whole
+/// number, or is larger than `u64::MAX`.
+pub fn metric_u64(v: f64) -> Result<u64> {
+    anyhow::ensure!(v.is_finite(), "metric value {v} is not finite");
+    anyhow::ensure!(v >= 0.0, "metric value {v} is negative");
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact equality is the intended check: a genuine counter or block number \
+                   never carries a fractional part, so any fraction is a sign this is the \
+                   wrong metric"
+    )]
+    let is_integral = v.fract() == 0.0;
+    anyhow::ensure!(is_integral, "metric value {v} is not a whole number");
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "u64::MAX is not exactly representable in f64 (it rounds up to 2^64), but \
+                   every value this crate reads is a block number or a small counter, far \
+                   below either bound; the rounding only widens the accepted range, so it \
+                   cannot let a truly out-of-range value through"
+    )]
+    let u64_max_f64 = u64::MAX as f64;
+    anyhow::ensure!(v <= u64_max_f64, "metric value {v} exceeds u64::MAX");
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "proven by the checks above: v is finite, non-negative, integral, and at \
+                   most u64::MAX"
+    )]
+    Ok(v as u64)
+}
 
 /// One pipeline under test, reduced to its observable seams.
 pub struct Target {
@@ -79,29 +145,126 @@ pub struct Target {
 }
 
 impl Target {
+    /// Scrape `addr` and read `name`. `Ok(None)` means the scrape
+    /// succeeded but the counter has not appeared yet (a genuinely absent
+    /// counter); `Err` means the scrape itself failed (the service is
+    /// unreachable or dead). Callers that fold both cases into "0" cannot
+    /// tell a dead service from an idle counter — see `executor_metric`
+    /// and its `_opt` counterpart below.
+    async fn metric_opt(addr: SocketAddr, name: &str) -> Result<Option<f64>> {
+        let s = metrics::scrape(addr).await?;
+        Ok(s.value(name))
+    }
+
+    /// # Errors
+    /// Returns an error when the scrape fails, or when `name` is absent
+    /// from the executor's metrics.
     pub async fn executor_metric(&self, name: &str) -> Result<f64> {
-        let s = metrics::scrape(self.executor_metrics).await?;
-        s.value(name)
+        Self::metric_opt(self.executor_metrics, name)
+            .await?
             .with_context(|| format!("executor metric {name} absent"))
     }
 
+    /// Like [`Self::executor_metric`], but a genuinely absent counter reads
+    /// `Ok(None)` instead of failing. A scrape failure still returns `Err`.
+    ///
+    /// # Errors
+    /// Returns an error when the scrape fails.
+    pub async fn executor_metric_opt(&self, name: &str) -> Result<Option<f64>> {
+        Self::metric_opt(self.executor_metrics, name).await
+    }
+
+    /// # Errors
+    /// Returns an error when the target has no validator, when the
+    /// scrape fails, or when `name` is absent from its metrics.
     pub async fn validator_metric(&self, name: &str) -> Result<f64> {
-        let addr = self
-            .validator_metrics
-            .context("target has no validator (StackConfig::validator)")?;
-        let s = metrics::scrape(addr).await?;
-        s.value(name)
+        self.validator_metric_opt(name)
+            .await?
             .with_context(|| format!("validator metric {name} absent"))
     }
 
+    /// Like [`Self::validator_metric`], but a genuinely absent counter
+    /// reads `Ok(None)` instead of failing. A scrape failure still returns
+    /// `Err`.
+    ///
+    /// # Errors
+    /// Returns an error when the target has no validator, or when the
+    /// scrape fails.
+    pub async fn validator_metric_opt(&self, name: &str) -> Result<Option<f64>> {
+        let addr = self
+            .validator_metrics
+            .context("target has no validator (StackConfig::validator)")?;
+        Self::metric_opt(addr, name).await
+    }
+
+    /// # Errors
+    /// Returns an error when the scrape fails, or when `name` is absent
+    /// from the ingress's metrics.
     pub async fn ingress_metric(&self, name: &str) -> Result<f64> {
-        let s = metrics::scrape(self.ingress_metrics).await?;
-        s.value(name)
+        Self::metric_opt(self.ingress_metrics, name)
+            .await?
             .with_context(|| format!("ingress metric {name} absent"))
+    }
+
+    /// Like [`Self::ingress_metric`], but a genuinely absent counter reads
+    /// `Ok(None)` instead of failing. A scrape failure still returns `Err`.
+    ///
+    /// # Errors
+    /// Returns an error when the scrape fails.
+    pub async fn ingress_metric_opt(&self, name: &str) -> Result<Option<f64>> {
+        Self::metric_opt(self.ingress_metrics, name).await
+    }
+
+    /// Poll the validator's `name` until it exceeds `floor`, treating a
+    /// missing sample as 0. `what` names the poll, for its log line.
+    ///
+    /// # Errors
+    /// Returns an error when the target has no validator, when a scrape
+    /// fails, or when the metric does not pass `floor` within `timeout`.
+    pub async fn wait_validator_metric_above(
+        &self,
+        name: &str,
+        floor: f64,
+        timeout: Duration,
+        interval: Duration,
+        what: &str,
+    ) -> Result<f64> {
+        metrics::poll_until(what, timeout, interval, || async {
+            let v = self.validator_metric_opt(name).await?.unwrap_or(0.0);
+            Ok((v > floor).then_some(v))
+        })
+        .await
+    }
+
+    /// Poll the executor's block number until it reaches `at_least`,
+    /// treating a missing sample as 0.
+    ///
+    /// # Errors
+    /// Returns an error when a scrape fails, or when the executor does
+    /// not reach `at_least` within `timeout`.
+    pub async fn wait_executor_block(
+        &self,
+        at_least: u64,
+        timeout: Duration,
+        interval: Duration,
+        what: &str,
+    ) -> Result<u64> {
+        metrics::poll_until(what, timeout, interval, || async {
+            let v = self
+                .executor_metric_opt(EXEC_BLOCK_NUMBER)
+                .await?
+                .unwrap_or(0.0);
+            let v = metric_u64(v)?;
+            Ok((v >= at_least).then_some(v))
+        })
+        .await
     }
 
     /// Sum of `name` across every sequencer replica. A missing value counts
     /// as 0, because a counter appears only after its first increase.
+    ///
+    /// # Errors
+    /// Returns an error when a scrape fails.
     pub async fn sequencer_metric_sum(&self, name: &str) -> Result<f64> {
         let mut sum = 0.0;
         for addr in &self.sequencer_metrics {
@@ -118,6 +281,11 @@ impl Target {
     /// dead validator times out here with its metrics port refusing), it
     /// must have VERIFIED blocks (non-vacuity), and it must have proven no
     /// divergence.
+    ///
+    /// # Errors
+    /// Returns an error when the target has no validator, when a scrape
+    /// fails, when the validator does not catch up within 90s, when it
+    /// recorded a divergence, or when it verified no blocks.
     pub async fn assert_validator_verdict(&self, what: &str) -> Result<()> {
         let addr = self
             .validator_metrics
@@ -150,18 +318,73 @@ impl Target {
     }
 
     /// Wait until the executor's applied-tx counter reaches `at_least`.
+    ///
+    /// # Errors
+    /// Returns an error when the counter does not reach `at_least` within
+    /// `timeout`.
     pub async fn wait_executor_applied(&self, at_least: f64, timeout: Duration) -> Result<f64> {
         metrics::poll_until(
             &format!("executor {EXEC_TX_APPLIED} >= {at_least}"),
             timeout,
             Duration::from_millis(200),
             || async {
-                let v = self.executor_metric(EXEC_TX_APPLIED).await.unwrap_or(0.0);
+                let v = self
+                    .executor_metric_opt(EXEC_TX_APPLIED)
+                    .await?
+                    .unwrap_or(0.0);
                 Ok((v >= at_least).then_some(v))
             },
         )
         .await
     }
+}
+
+/// Warm the validator (wait for it to verify at least one block), then
+/// require it had not already diverged. `what` names the reason for the
+/// check that follows, for the divergence message.
+///
+/// # Errors
+/// Returns an error when the target has no validator, when a scrape
+/// fails, when the validator verifies no block within 60s, or when it
+/// had already diverged.
+pub(crate) async fn assert_validator_warm(t: &Target, what: &str) -> Result<()> {
+    t.wait_validator_metric_above(
+        VALIDATOR_BLOCKS_VERIFIED,
+        0.0,
+        Duration::from_secs(60),
+        Duration::from_millis(250),
+        "validator verifying (warmup)",
+    )
+    .await?;
+    let divergence = t
+        .validator_metric_opt(VALIDATOR_DIVERGENCE)
+        .await?
+        .unwrap_or(0.0);
+    anyhow::ensure!(divergence == 0.0, "diverged before {what}");
+    Ok(())
+}
+
+/// Spawn one task per transaction in `txs`, submit them all concurrently,
+/// and fail on the first rejected result.
+///
+/// # Errors
+/// Returns an error when a submit task panics or is cancelled, or when
+/// any transaction is rejected.
+pub(crate) async fn submit_all(t: &Target, txs: Vec<SignedTransfer>) -> Result<()> {
+    let mut set = tokio::task::JoinSet::new();
+    for tx in txs {
+        let rpc = t.rpc.clone();
+        set.spawn(async move {
+            let out = rpc.send_raw(&tx.raw).await;
+            (tx, out)
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        let (tx, out) = joined.context("submit join")?;
+        out.result
+            .map_err(|e| anyhow::anyhow!("sender {} nonce {}: {e}", tx.sender, tx.nonce))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +394,9 @@ impl Target {
 
 /// Wait for the L2 receipt of `hash`, which for a deposit is its
 /// `source_hash`.
+///
+/// # Errors
+/// Returns an error when no receipt appears within 60s.
 pub async fn await_l2_receipt(t: &Target, hash: B256, what: &str) -> Result<serde_json::Value> {
     metrics::poll_until(
         &format!("L2 receipt for {what}"),
@@ -182,22 +408,40 @@ pub async fn await_l2_receipt(t: &Target, hash: B256, what: &str) -> Result<serd
 }
 
 /// A string field of receipt `r` (`"status"`, `"blockNumber"`, …).
+#[must_use]
 pub fn receipt_field<'a>(r: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     r.get(key).and_then(|v| v.as_str())
 }
 
-/// Where the chain placed the receipt's transaction, as
-/// `(blockNumber, transactionIndex)`. Both values are hex-parsed.
-pub fn receipt_placement(r: &serde_json::Value) -> Result<(u64, u64)> {
+/// Where the chain placed a receipt's transaction: the block it landed
+/// in, and its index within that block.
+#[derive(Debug, Clone, Copy)]
+pub struct Placement {
+    pub block: u64,
+    pub index: u64,
+}
+
+/// Where the chain placed the receipt's transaction. Both fields are
+/// hex-parsed.
+///
+/// # Errors
+/// Returns an error when a field is absent or does not parse as hex.
+pub fn receipt_placement(r: &serde_json::Value) -> Result<Placement> {
     let hex_u64 = |key: &str| -> Result<u64> {
         let s = receipt_field(r, key).with_context(|| format!("receipt has no {key}: {r}"))?;
         u64::from_str_radix(s.trim_start_matches("0x"), 16)
             .with_context(|| format!("parse receipt {key} {s:?}"))
     };
-    Ok((hex_u64("blockNumber")?, hex_u64("transactionIndex")?))
+    Ok(Placement {
+        block: hex_u64("blockNumber")?,
+        index: hex_u64("transactionIndex")?,
+    })
 }
 
 /// The transaction behind receipt `r` executed successfully (`status == 0x1`).
+///
+/// # Errors
+/// Returns an error when the receipt's status is not `0x1`.
 pub fn assert_receipt_ok(r: &serde_json::Value, what: &str) -> Result<()> {
     anyhow::ensure!(
         receipt_field(r, "status") == Some("0x1"),
@@ -228,6 +472,9 @@ pub(crate) fn open_state_ro(dir: &Path) -> Result<kardamom_state::StateEnv> {
 /// real withdrawer faces: it cannot get the `stateRoot` argument that
 /// `finalizeWithdrawal` needs. This is the parity target: an
 /// independent computation, not a value the DA path produced.
+///
+/// # Errors
+/// Returns an error when the state dir cannot be opened or snapshotted.
 pub fn read_validator_state_root(state_dir: &Path) -> Result<Option<B256>> {
     let env = open_state_ro(state_dir)?;
     let snap = kardamom_state::StateSnapshot::open(&env).context("snapshot validator state")?;
@@ -250,14 +497,15 @@ pub struct ChainStateView {
     /// Raw activation timestamp (ms) of the health-check feature. 0 means
     /// the feature is never scheduled.
     pub activation: U256,
-    /// Health beacon, unpacked: `(beats, block_number, timestamp_ms)`.
-    pub beacon: (u64, u64, u64),
+    /// Health beacon, unpacked from its storage word.
+    pub beacon: kardamom_exec_core::features::Beacon,
 }
 
 impl ChainStateView {
     /// Beats recorded so far.
+    #[must_use]
     pub fn beats(&self) -> u64 {
-        self.beacon.0
+        self.beacon.count
     }
 }
 
@@ -266,9 +514,13 @@ impl ChainStateView {
 /// This reads mdbx directly, not RPC, because the ingress serves neither
 /// `eth_call` nor `eth_getStorageAt`. The read is read-only and MVCC, so it
 /// never blocks the running node's writer.
+///
+/// # Errors
+/// Returns an error when the state dir cannot be opened or snapshotted,
+/// or when a slot read fails.
 pub fn read_chain_state(state_dir: &Path) -> Result<ChainStateView> {
     use kardamom_exec_core::features::{
-        FEATURE_HEALTH_CHECK, HEALTH_BEACON_SLOT, activation_slot, unpack_beacon,
+        Beacon, FEATURE_HEALTH_CHECK, HEALTH_BEACON_SLOT, activation_slot,
     };
     use kardamom_types::StateDatabase;
     use kardamom_types::upgrades::CHAIN_STATE;
@@ -279,7 +531,7 @@ pub fn read_chain_state(state_dir: &Path) -> Result<ChainStateView> {
     let activation = snap
         .storage(CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK))
         .context("read activation slot")?;
-    let beacon = unpack_beacon(
+    let beacon = Beacon::unpack(
         snap.storage(CHAIN_STATE, HEALTH_BEACON_SLOT)
             .context("read beacon slot")?,
     );
@@ -298,6 +550,8 @@ pub struct SeqCounters {
 }
 
 impl SeqCounters {
+    /// # Errors
+    /// Returns an error when a sequencer scrape fails.
     pub async fn snapshot(t: &Target) -> Result<Self> {
         Ok(Self {
             dropped_past: t.sequencer_metric_sum(SEQ_DROPPED_PAST).await?,
@@ -305,20 +559,30 @@ impl SeqCounters {
         })
     }
 
+    /// # Errors
+    /// Returns an error when a sequencer scrape fails, or when either
+    /// counter grew since `self` was snapshotted.
     pub async fn assert_flat(&self, t: &Target, context: &str) -> Result<()> {
         let now = Self::snapshot(t).await?;
-        anyhow::ensure!(
-            now.dropped_past == self.dropped_past,
-            "{context}: sequencer dropped_past grew {} -> {}",
-            self.dropped_past,
-            now.dropped_past
-        );
-        anyhow::ensure!(
-            now.evictions == self.evictions,
-            "{context}: sequencer pending evictions grew {} -> {}",
-            self.evictions,
-            now.evictions
-        );
+        #[allow(
+            clippy::float_cmp,
+            reason = "exact equality is the intended check: a counter that did not grow \
+                       scrapes back bit-identical"
+        )]
+        {
+            anyhow::ensure!(
+                now.dropped_past == self.dropped_past,
+                "{context}: sequencer dropped_past grew {} -> {}",
+                self.dropped_past,
+                now.dropped_past
+            );
+            anyhow::ensure!(
+                now.evictions == self.evictions,
+                "{context}: sequencer pending evictions grew {} -> {}",
+                self.evictions,
+                now.evictions
+            );
+        }
         Ok(())
     }
 }

@@ -1,7 +1,7 @@
 //! `kardamom-perf` is the cluster performance pipeline CLI.
 //!
 //! It automates the saturation campaign: bring the deploy and cluster
-//! DinD stack up fresh, ramp offered load to the sustainable edge,
+//! `DinD` stack up fresh, ramp offered load to the sustainable edge,
 //! hold a steady soak while async-profiler samples the sealer Raft
 //! leader, and fold everything into a report directory
 //! (`load-report.json`, `flame.html`, `flame.svg`, `stacks.collapsed`,
@@ -17,18 +17,34 @@
 //! through 15 drive the profiled soak. Accounts 0 and 16 belong to the
 //! deploy's smoke gates. Rerunning against a used chain needs a fresh
 //! `up` first, since nonces are managed locally and ingress has no
-//! eth_getTransactionCount.
+//! `eth_getTransactionCount`.
 
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use alloy_primitives::{Address, U256};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
 
-use kardamom_bench::load::{self, ANVIL_MNEMONIC, Completeness, LoadConfig};
+use kardamom_bench::load::{self, LoadConfig, SenderRange};
 use kardamom_bench::perf::{OutDir, cluster, profile, report};
+
+/// Default `--chain-id`.
+const DEFAULT_CHAIN_ID: NonZeroU64 = NonZeroU64::new(412_346).unwrap();
+/// Default `--ceiling`.
+const DEFAULT_CEILING: NonZeroU32 = NonZeroU32::new(4000).unwrap();
+/// Default `--ramp-step`.
+const DEFAULT_RAMP_STEP: NonZeroU32 = NonZeroU32::new(250).unwrap();
+/// Default `--ramp-step-secs`.
+const DEFAULT_RAMP_STEP_SECS: NonZeroU64 = NonZeroU64::new(12).unwrap();
+/// `load_cfg`'s fixed `max_in_flight`: the perf suite runs on
+/// dedicated hardware, well above `kardamom-load`'s default.
+const PERF_MAX_IN_FLIGHT: NonZeroU32 = NonZeroU32::new(1024).unwrap();
+/// The ramp phase's sender-range width (accounts 1 through 15;
+/// accounts 16 and 17 are the deploy gates' re-smoke accounts).
+const RAMP_SENDER_RANGE_WIDTH: NonZeroU32 = NonZeroU32::new(15).unwrap();
+/// The soak phase's sender-range width (accounts 18 through 33).
+const SOAK_SENDER_RANGE_WIDTH: NonZeroU32 = NonZeroU32::new(16).unwrap();
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,7 +75,7 @@ enum Cmd {
     Run(RunArgs),
     /// Re-render summary.md from an existing run directory.
     Report {
-        /// A directory that `kardamom-perf run` previously produced.
+        /// A directory `kardamom-perf run` produces.
         #[arg(long)]
         dir: PathBuf,
     },
@@ -85,17 +101,18 @@ struct RunArgs {
     #[arg(long, default_value = "transfers", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<kardamom_bench::load::Workload>().map_err(|e| e.to_string())))]
     workload: kardamom_bench::load::Workload,
     /// The L2 chain ID for the deploy and cluster genesis.
-    #[arg(long, default_value_t = 412346)]
-    chain_id: u64,
-    /// The ramp ceiling, in tx/s, for edge discovery.
-    #[arg(long, default_value_t = 4000)]
-    ceiling: u32,
+    #[arg(long, default_value_t = DEFAULT_CHAIN_ID)]
+    chain_id: NonZeroU64,
+    /// The ramp ceiling, in tx/s, for edge discovery. Non-zero: it is
+    /// a `clamp` and a `while` ceiling in `load::ramp_to_max`.
+    #[arg(long, default_value_t = DEFAULT_CEILING)]
+    ceiling: NonZeroU32,
     /// The ramp increment for each step, in tx/s.
-    #[arg(long, default_value_t = 250)]
-    ramp_step: u32,
+    #[arg(long, default_value_t = DEFAULT_RAMP_STEP)]
+    ramp_step: NonZeroU32,
     /// The number of seconds held at each ramp step.
-    #[arg(long, default_value_t = 12)]
-    ramp_step_secs: u64,
+    #[arg(long, default_value_t = DEFAULT_RAMP_STEP_SECS)]
+    ramp_step_secs: NonZeroU64,
     /// The profiled soak rate, as a fraction of the discovered maximum.
     #[arg(long, default_value_t = 0.8)]
     soak_fraction: f64,
@@ -106,9 +123,9 @@ struct RunArgs {
     /// The collapsed-capture length within the soak.
     #[arg(long, default_value_t = 60)]
     profile_secs: u64,
-    /// Drive load through kardamom_sendRawTransactionAsync and a
+    /// Drive load through `kardamom_sendRawTransactionAsync` and a
     /// WebSocket receipt subscription, so an in-flight transaction
-    /// holds no connection, instead of the parked eth_sendRawTransaction.
+    /// holds no connection, instead of the parked `eth_sendRawTransaction`.
     #[arg(long, default_value_t = false)]
     subscribe: bool,
     /// The output base directory. The code creates a timestamped subdirectory.
@@ -118,9 +135,7 @@ struct RunArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    kardamom_obs::bin::init_tracing();
     match Args::parse().cmd {
         Cmd::Up {
             skip_build,
@@ -133,55 +148,44 @@ async fn main() -> anyhow::Result<()> {
 
 /// The settings shared by both load phases. Senders, offset, rate, and
 /// shape vary between phases.
-#[allow(clippy::too_many_arguments)]
+///
+/// Every field this run needs to differ from [`LoadConfig::default`]'s
+/// sensible defaults is set explicitly below; `sender_range` is left at
+/// its placeholder default, since both call sites overwrite it before
+/// `load::run` ever reads it, and the node-topology, mnemonic, and
+/// transfer-sink fields the perf suite shares with `kardamom-load`'s own
+/// defaults come along for free.
 fn load_cfg(a: &RunArgs, out: PathBuf) -> LoadConfig {
     LoadConfig {
         workload: a.workload,
         rpc: a.rpc.clone(),
-        chain_id: Some(a.chain_id),
+        chain_id: Some(a.chain_id.get()),
         duration: Duration::from_secs(0),
-        target_tps: 0,
-        senders: 0,
-        sender_offset: 0,
-        nonce_start: 0,
-        mnemonic: ANVIL_MNEMONIC.to_string(),
-        to: "0x000000000000000000000000000000000000dEaD"
-            .parse::<Address>()
-            .unwrap(),
-        value: U256::from(1),
-        gas_price: 1_000_000_000,
-        max_in_flight: 1024,
-        max_gap: 5,
-        drain_timeout: Duration::from_secs(90),
-        retry_submit: 2,
+        target_tps: NonZeroU32::MIN,
+        max_in_flight: PERF_MAX_IN_FLIGHT,
         ramp_step_tps: a.ramp_step,
         ramp_step_secs: a.ramp_step_secs,
         soak_fraction: a.soak_fraction,
-        completeness: Completeness::Accepted,
         assert_all_delivered: true,
-        chaos_mode: false,
         // The perf suite exists for edge discovery on dedicated hardware.
-        // Always ramp.
-        fixed_rate: false,
+        // Always ramp, and scrape the sequencer too (unlike
+        // `kardamom-load`'s default, which does not).
         scrape: vec!["executor".into(), "ingress".into(), "sequencer".into()],
-        metrics_via_docker: true,
         subscribe: a.subscribe,
         // Blocking runs confirm through the WebSocket feed: one HTTP call
         // per transaction instead of two. The per-transaction receipt
         // re-fetch alone would be another full-rate request stream
         // through the proxy and ingress.
         feed_confirm: true,
-        executor_nodes: vec![
-            "kardamom-executor-0".into(),
-            "kardamom-executor-1".into(),
-            "kardamom-executor-2".into(),
-        ],
-        ingress_node: "kardamom-ingress-0".into(),
-        sequencer_nodes: vec!["kardamom-sequencer-0".into(), "kardamom-sequencer-1".into()],
         output: Some(out),
+        ..LoadConfig::default()
     }
 }
 
+#[allow(
+    clippy::format_collect,
+    reason = "one format! per container reads more directly here than a write! fold into a growing String"
+)]
 async fn run(a: RunArgs) -> anyhow::Result<()> {
     if a.fresh {
         cluster::up(&a.repo_root, a.skip_build)?;
@@ -201,8 +205,7 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     println!("==> phase 1: ramp to the edge (ceiling {} tx/s)", a.ceiling);
     let mut cfg = load_cfg(&a, out.path("discovery-report.json"));
     cfg.target_tps = a.ceiling;
-    cfg.senders = 15;
-    cfg.sender_offset = 1;
+    cfg.sender_range = SenderRange::new(1, RAMP_SENDER_RANGE_WIDTH)?;
     cfg.duration = Duration::from_secs(1);
     // Discovery probes past the edge on purpose. A retried submit whose
     // first attempt landed shows up there as a past-nonce drop. Strict
@@ -211,9 +214,21 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     cfg.assert_all_delivered = false;
     load::run(cfg).await.context("discovery ramp")?;
     let discovery = report::read_load_report(&out.path("discovery-report.json"))?;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a discovered tx/s rate stays far under i64::MAX, rounded for display"
+    )]
     let soak_rate =
-        ((f64::from(discovery.discovered_max_tps) * a.soak_fraction).round() as u32).max(1);
+        NonZeroU32::new((f64::from(discovery.discovered_max_tps) * a.soak_fraction).round() as u32)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "discovery found {} tx/s, which rounds to 0 at --soak-fraction {}; \
+                     the profiled soak has nothing to run at",
+                    discovery.discovered_max_tps,
+                    a.soak_fraction
+                )
+            })?;
     println!(
         "==> discovered max {} tx/s → profiled soak at {} tx/s",
         discovery.discovered_max_tps, soak_rate
@@ -226,8 +241,7 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     // rate is established.
     let mut cfg = load_cfg(&a, out.path("load-report.json"));
     cfg.target_tps = soak_rate;
-    cfg.senders = 16;
-    cfg.sender_offset = 18;
+    cfg.sender_range = SenderRange::new(18, SOAK_SENDER_RANGE_WIDTH)?;
     cfg.chaos_mode = true;
     cfg.duration = Duration::from_secs(a.soak_secs);
     let load_task = tokio::spawn(load::run(cfg));

@@ -17,6 +17,10 @@ use alloy_provider::ProviderBuilder;
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use clap::Parser;
+use kardamom_batcher::error::BatcherError;
+use std::ops::ControlFlow;
+
+use kardamom_batcher::live::poll::{PollLoop, Retry, parse_interval_secs};
 use kardamom_batcher::{SubmitOutcome, submit_next_proof};
 
 #[derive(Debug, Parser)]
@@ -35,8 +39,8 @@ struct Args {
     #[arg(long, env = "KARDAMOM_PROOFS_DIR")]
     proofs_dir: PathBuf,
     /// Poll interval in seconds. 0 = submit once and exit.
-    #[arg(long, default_value_t = 30)]
-    interval_secs: u64,
+    #[arg(long, default_value = "30", value_parser = parse_interval_secs)]
+    interval_secs: Option<Duration>,
 }
 
 #[tokio::main]
@@ -48,23 +52,46 @@ async fn main() -> Result<()> {
         .wallet(signer)
         .connect_http(args.l1_rpc_url.parse().context("parse --l1-rpc-url")?);
 
-    loop {
-        match submit_next_proof(provider.clone(), args.oracle, &args.proofs_dir).await {
-            Ok(SubmitOutcome::Submitted { batch_index }) => {
-                tracing::info!(batch_index, "proof submitted; root advanced");
-                continue; // immediately try the next batch
-            }
-            Ok(SubmitOutcome::NoBatchPosted { batch_index }) => {
-                tracing::debug!(batch_index, "batch not posted yet");
-            }
-            Ok(SubmitOutcome::ProofNotReady { batch_index }) => {
-                tracing::debug!(batch_index, "proof files not ready yet");
-            }
-            Err(e) => tracing::error!(error = %e, "submission attempt failed"),
-        }
-        if args.interval_secs == 0 {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_secs(args.interval_secs)).await;
+    let submitter = Submitter {
+        oracle: args.oracle,
+        proofs_dir: args.proofs_dir,
+        gate: PollLoop::new(args.interval_secs),
+    };
+    while let ControlFlow::Continue(()) = submitter.tick(&provider).await {}
+    Ok(())
+}
+
+/// One `kardamom-proof-submitter` reactor tick: submit the next batch's
+/// proof when it is ready, then gate the next tick on the outcome.
+struct Submitter {
+    oracle: Address,
+    proofs_dir: PathBuf,
+    gate: PollLoop,
+}
+
+impl Submitter {
+    async fn tick(&self, provider: &(impl alloy_provider::Provider + Clone)) -> ControlFlow<()> {
+        let outcome = submit_next_proof(provider.clone(), self.oracle, &self.proofs_dir).await;
+        self.gate.gate(report_submit_outcome(outcome)).await
     }
+}
+
+/// Log one [`submit_next_proof`] attempt's outcome. Retry immediately on a
+/// successful submit, to try the next batch without waiting out the poll
+/// interval.
+fn report_submit_outcome(outcome: Result<SubmitOutcome, BatcherError>) -> Retry {
+    match outcome {
+        Ok(SubmitOutcome::Submitted { batch_index }) => {
+            tracing::info!(batch_index, "proof submitted; root advanced");
+            return Retry::Now;
+        }
+        Ok(SubmitOutcome::NoBatchPosted { batch_index }) => {
+            tracing::debug!(batch_index, "batch not posted yet");
+        }
+        Ok(SubmitOutcome::ProofNotReady { batch_index }) => {
+            tracing::debug!(batch_index, "proof files not ready yet");
+        }
+        Err(e) => tracing::error!(error = %e, "submission attempt failed"),
+    }
+    Retry::AfterInterval
 }

@@ -10,150 +10,107 @@
 //! zk-host batch round trip covers guest-side public-values authenticity.
 //! This test owns the cursor-alignment plumbing between them.
 
-use std::path::PathBuf;
+use std::num::NonZeroU64;
+use std::path::{Path, PathBuf};
 
-use alloy_node_bindings::Anvil;
-use alloy_primitives::{Address, B256, U256, address};
-use alloy_provider::{Provider, ProviderBuilder};
-use alloy_sol_types::sol;
+use alloy_primitives::{Address, B256, U256};
+use alloy_provider::Provider;
 use kardamom_batcher::BatchAccumulator;
 use kardamom_batcher::batcher::pack_blocks;
 use kardamom_batcher::prover_submit::{IKardamomProofOracle, SubmitOutcome, submit_next_proof};
 use kardamom_batcher::settlement::IKardamomL2Settlement;
-use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
-use kardamom_deployer::{
-    ContractId, Deployer, Op, encode_address_arg, encode_proof_oracle_init_args,
-};
-use kardamom_types::{
-    BPosition, BatchPublicOutputs, BlockBoundaryStart, TxEnvelope, batch_records_commitment,
-};
+use kardamom_batcher::testkit::{AcceptingVerifier, BATCHER, DEV_OWNER, L2_CHAIN_ID, env_tx};
+use kardamom_deployer::Deployer;
+use kardamom_deployer::testkit::{AnvilRig, Funding, OracleInitArgs};
+use kardamom_types::{BPosition, BatchPublicOutputs, BlockBoundaryStart, batch_records_commitment};
 
-sol!(
-    #[sol(rpc)]
-    AcceptingVerifier,
-    concat!(
-        env!("CARGO_WORKSPACE_DIR"),
-        "/contracts/out/KardamomProofOracle.t.sol/AcceptingVerifier.json"
-    )
-);
-
-const DEV_OWNER: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-const BATCHER: Address = address!("00000000000000000000000000000000000000BA");
-const L2_CHAIN_ID: u64 = 412346;
 const VKEY: B256 = B256::repeat_byte(0x5E);
 const GENESIS_ROOT: B256 = B256::repeat_byte(0x99);
 const POST_ROOT: B256 = B256::repeat_byte(0xAB);
 
-fn env_tx(i: u64) -> TxEnvelope {
-    TxEnvelope {
-        correlation_id: i,
-        raw_tx: vec![0xF0u8, i as u8, 0xBA, 0x12].into(),
-        sender: Address::repeat_byte(0x11),
-        tx_hash: B256::repeat_byte(i as u8 + 1),
-    }
+/// A window this test's minimum-legal proof oracle deploys with. The
+/// validity path (`submitBatchProof`) never reads `challengeWindow` — see
+/// `KardamomProofOracle.sol` — so this test's timing is unaffected by the
+/// value. Nonzero at the type level because a zero window would finalize
+/// an optimistic claim with no dispute period; this validity-mode test
+/// never waits on it.
+const MINIMAL_WINDOW: NonZeroU64 = NonZeroU64::new(1).unwrap();
+
+/// Anvil, a funded owner/batcher pair, and a deployed settlement plus a
+/// proof oracle (accepting verifier, no bond, minimal window) —
+/// validity-mode finalizes purely by proof, so there is no dispute period
+/// to wait out.
+struct Scenario<P: Provider + Clone> {
+    _anvil: alloy_node_bindings::AnvilInstance,
+    provider: P,
+    oracle: IKardamomProofOracle::IKardamomProofOracleInstance<P>,
+    oracle_addr: Address,
+    settlement_addr: Address,
+    proofs_dir: tempfile::TempDir,
 }
 
-#[tokio::test]
-async fn posted_batch_proof_advances_the_oracle_root_chain() {
-    let Some(anvil) = Anvil::new().try_spawn().ok() else {
-        eprintln!("SKIP: anvil unavailable");
-        return;
-    };
-    let provider = ProviderBuilder::new()
-        .disable_recommended_fillers()
-        .connect_http(anvil.endpoint_url());
-    let bytes_hex = format!("0x{ERC7955_RUNTIME_HEX}");
-    for req in [
-        (
-            "anvil_setCode",
-            serde_json::json!([ERC7955_FACTORY, bytes_hex]),
-        ),
-        (
-            "anvil_setBalance",
-            serde_json::json!([DEV_OWNER, U256::from(10u128.pow(21))]),
-        ),
-        (
-            "anvil_setBalance",
-            serde_json::json!([BATCHER, U256::from(10u128.pow(21))]),
-        ),
-        ("anvil_impersonateAccount", serde_json::json!([DEV_OWNER])),
-        ("anvil_impersonateAccount", serde_json::json!([BATCHER])),
-    ] {
-        let _: serde_json::Value = provider
-            .raw_request(req.0.into(), req.1)
-            .await
-            .expect("anvil setup");
-    }
-
-    // --- Deploy: settlement (factory), accepting verifier (plain), oracle
-    // (factory, wired to both).
-    let deployer = Deployer::new(provider.clone(), DEV_OWNER);
-    deployer.ensure_factory(DEV_OWNER).await.unwrap();
-    deployer
-        .apply(
-            &[Op::Deploy {
-                l2_chain_id: L2_CHAIN_ID,
-                id: ContractId::KardamomL2Settlement,
-                init_args: encode_address_arg(BATCHER),
-            }],
-            DEV_OWNER,
-        )
-        .await
-        .expect("deploy settlement");
-    let settlement_addr = deployer.addresses(Some(L2_CHAIN_ID)).await.unwrap()[0].proxy;
-
-    let verifier = AcceptingVerifier::deploy(provider.clone())
+async fn setup() -> Option<Scenario<impl Provider + Clone>> {
+    let rig = AnvilRig::spawn(
+        alloy_node_bindings::Anvil::new(),
+        &[
+            (DEV_OWNER, Funding::FundAndImpersonate),
+            (BATCHER, Funding::FundAndImpersonate),
+        ],
+    )
+    .await?;
+    let deployer = Deployer::new(rig.provider.clone(), DEV_OWNER);
+    let verifier = AcceptingVerifier::deploy(rig.provider.clone())
         .await
         .expect("deploy accepting verifier");
-    deployer
-        .apply(
-            &[Op::Deploy {
-                l2_chain_id: L2_CHAIN_ID,
-                id: ContractId::KardamomProofOracle,
-                init_args: encode_proof_oracle_init_args(
-                    settlement_addr,
-                    *verifier.address(),
-                    VKEY,
-                    VKEY, // block vkey (mock verifier ignores both)
-                    GENESIS_ROOT,
-                    0, // window 0: validity-mode e2e finalizes by proof
-                    U256::ZERO,
-                ),
-            }],
+    let deployment = deployer
+        .deploy_settlement_and_oracle(
             DEV_OWNER,
+            L2_CHAIN_ID,
+            BATCHER,
+            OracleInitArgs {
+                verifier: *verifier.address(),
+                batch_vkey: VKEY,
+                block_vkey: VKEY, // mock verifier ignores both
+                genesis_root: GENESIS_ROOT,
+                challenge_window_secs: MINIMAL_WINDOW,
+                min_bond_wei: U256::ZERO,
+            },
         )
-        .await
-        .expect("deploy proof oracle");
-    let oracle_addr = deployer
-        .addresses(Some(L2_CHAIN_ID))
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|e| e.id == ContractId::KardamomProofOracle.id())
-        .expect("oracle entry")
-        .proxy;
+        .await;
+    let oracle = IKardamomProofOracle::new(deployment.oracle, rig.provider.clone());
+    Some(Scenario {
+        _anvil: rig.anvil,
+        provider: rig.provider,
+        oracle,
+        oracle_addr: deployment.oracle,
+        settlement_addr: deployment.settlement,
+        proofs_dir: tempfile::tempdir().unwrap(),
+    })
+}
 
-    let proofs_dir = tempfile::tempdir().unwrap();
+/// A real batch (blocks 7..8) plus the commitment the guest side would
+/// independently compute for it, cross-checked against the batcher's.
+struct RealBatch {
+    l2_block_start: u64,
+    l2_block_end: u64,
+    records_commitment: B256,
+}
 
-    // Prover and batcher both lagging: nothing posted, nothing to do.
-    let out = submit_next_proof(provider.clone(), oracle_addr, proofs_dir.path())
-        .await
-        .unwrap();
-    assert_eq!(out, SubmitOutcome::NoBatchPosted { batch_index: 1 });
-
-    // --- A real batch through the accumulator: two blocks, three txs. The
-    // records commitment comes out of the production close path.
+/// Pack blocks 7..8 through the accumulator, the same shape
+/// `optimistic_e2e.rs` uses, and check the batcher's records commitment
+/// agrees with an independent guest-side computation.
+fn build_real_batch() -> RealBatch {
     let mut acc = BatchAccumulator::new();
     acc.observe_tx(env_tx(0), BPosition::from_index(0));
     acc.observe_tx(env_tx(1), BPosition::from_index(1));
-    let b1 = acc.observe_boundary(BlockBoundaryStart {
+    let b1 = acc.observe_boundary(&BlockBoundaryStart {
         block_number: 7,
         end_tx_idx: BPosition::from_index(2),
         l2_timestamp: 1_700_000_007,
         l1_origin: 0,
     });
     acc.observe_tx(env_tx(2), BPosition::from_index(2));
-    let b2 = acc.observe_boundary(BlockBoundaryStart {
+    let b2 = acc.observe_boundary(&BlockBoundaryStart {
         block_number: 8,
         end_tx_idx: BPosition::from_index(3),
         l2_timestamp: 1_700_000_008,
@@ -166,7 +123,61 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
     .expect("pack batch");
     assert_eq!((batch.l2_block_start, batch.l2_block_end), (7, 8));
 
-    let settlement = IKardamomL2Settlement::new(settlement_addr, provider.clone());
+    let expected_commitment = batch_records_commitment([7u64, 8].map(|n| {
+        let mut d = kardamom_types::BlockRecordsDigest::new(n);
+        match n {
+            7 => {
+                d.add_tx(&env_tx(0).raw_tx);
+                d.add_tx(&env_tx(1).raw_tx);
+            }
+            _ => d.add_tx(&env_tx(2).raw_tx),
+        }
+        d.finish()
+    }));
+    assert_eq!(
+        batch.records_commitment, expected_commitment,
+        "batcher and guest-side commitment must agree"
+    );
+    RealBatch {
+        l2_block_start: batch.l2_block_start,
+        l2_block_end: batch.l2_block_end,
+        records_commitment: expected_commitment,
+    }
+}
+
+/// Write the prover's batch output files (zk-host batch layout) claiming
+/// `POST_ROOT` for `batch`.
+fn write_batch_proof_files(proofs_dir: &Path, batch: &RealBatch) {
+    let pv = BatchPublicOutputs {
+        pre_state_root: GENESIS_ROOT,
+        post_state_root: POST_ROOT,
+        first_block: batch.l2_block_start,
+        last_block: batch.l2_block_end,
+        records_commitment: batch.records_commitment,
+    };
+    let dir: PathBuf = proofs_dir.join("batch-7-8");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("public-values.bin"), pv.encode()).unwrap();
+    std::fs::write(dir.join("proof.bin"), b"mock-proof").unwrap();
+}
+
+#[tokio::test]
+async fn posted_batch_proof_advances_the_oracle_root_chain() {
+    // ----- setup -----
+    let Some(s) = setup().await else {
+        eprintln!("SKIP: anvil unavailable");
+        return;
+    };
+    let settlement = IKardamomL2Settlement::new(s.settlement_addr, s.provider.clone());
+    let batch = build_real_batch();
+
+    // ----- act: nothing posted yet -----
+    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
+        .await
+        .unwrap();
+    assert_eq!(out, SubmitOutcome::NoBatchPosted { batch_index: 1 });
+
+    // ----- act: the batcher posts the batch -----
     let receipt = settlement
         .postBatch(
             0,
@@ -184,56 +195,72 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
         .expect("postBatch receipt");
     assert!(receipt.status());
 
-    // Batch posted, but the prover has not produced files yet.
-    let out = submit_next_proof(provider.clone(), oracle_addr, proofs_dir.path())
+    // ----- act + assert: batch posted, but the prover has not produced
+    // files yet -----
+    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::ProofNotReady { batch_index: 1 });
 
-    // --- The prover's output files (zk-host batch layout). The public
-    // values must carry the same commitment the batcher posted. This is
-    // cross-computed here with the shared primitives, exactly as the batch
-    // guest commits.
-    let expected_commitment = batch_records_commitment([7u64, 8].map(|n| {
-        let mut d = kardamom_types::BlockRecordsDigest::new(n);
-        match n {
-            7 => {
-                d.add_tx(&env_tx(0).raw_tx);
-                d.add_tx(&env_tx(1).raw_tx);
-            }
-            _ => d.add_tx(&env_tx(2).raw_tx),
-        }
-        d.finish()
-    }));
-    assert_eq!(
-        batch.records_commitment, expected_commitment,
-        "batcher and guest-side commitment must agree"
-    );
-    let pv = BatchPublicOutputs {
-        pre_state_root: GENESIS_ROOT,
-        post_state_root: POST_ROOT,
-        first_block: 7,
-        last_block: 8,
-        records_commitment: expected_commitment,
-    };
-    let dir: PathBuf = proofs_dir.path().join("batch-7-8");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("public-values.bin"), pv.encode()).unwrap();
-    std::fs::write(dir.join("proof.bin"), b"mock-proof").unwrap();
+    // ----- act: the prover's output files land -----
+    write_batch_proof_files(s.proofs_dir.path(), &batch);
 
-    // --- Submit: the oracle's root chain advances.
-    let out = submit_next_proof(provider.clone(), oracle_addr, proofs_dir.path())
+    // ----- act + assert: submit advances the oracle's root chain -----
+    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::Submitted { batch_index: 1 });
-    let oracle = IKardamomProofOracle::new(oracle_addr, provider.clone());
-    assert_eq!(oracle.stateRoot().call().await.unwrap(), POST_ROOT);
-    assert_eq!(oracle.lastFinalizedBatch().call().await.unwrap(), 1);
+    assert_eq!(s.oracle.stateRoot().call().await.unwrap(), POST_ROOT);
+    assert_eq!(s.oracle.lastFinalizedBatch().call().await.unwrap(), 1);
 
-    // Idempotence at the cursor: batch 2 is not posted, so this returns
-    // NoBatchPosted.
-    let out = submit_next_proof(provider.clone(), oracle_addr, proofs_dir.path())
+    // ----- act + assert: idempotence at the cursor — batch 2 is not
+    // posted, so this returns NoBatchPosted -----
+    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::NoBatchPosted { batch_index: 2 });
+}
+
+/// A `public-values.bin` file with no matching `proof.bin` must report
+/// `ProofNotReady`, not submit an empty proof to the oracle.
+#[tokio::test]
+async fn missing_proof_file_reports_not_ready() {
+    let Some(s) = setup().await else {
+        eprintln!("SKIP: anvil unavailable");
+        return;
+    };
+    let settlement = IKardamomL2Settlement::new(s.settlement_addr, s.provider.clone());
+    let batch = build_real_batch();
+    settlement
+        .postBatch(
+            0,
+            vec![B256::repeat_byte(0xA1)],
+            batch.l2_block_start,
+            batch.l2_block_end,
+            batch.records_commitment,
+        )
+        .from(BATCHER)
+        .send()
+        .await
+        .expect("postBatch")
+        .get_receipt()
+        .await
+        .expect("postBatch receipt");
+
+    let pv = BatchPublicOutputs {
+        pre_state_root: GENESIS_ROOT,
+        post_state_root: POST_ROOT,
+        first_block: batch.l2_block_start,
+        last_block: batch.l2_block_end,
+        records_commitment: batch.records_commitment,
+    };
+    let dir: PathBuf = s.proofs_dir.path().join("batch-7-8");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("public-values.bin"), pv.encode()).unwrap();
+
+    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
+        .await
+        .unwrap();
+    assert_eq!(out, SubmitOutcome::ProofNotReady { batch_index: 1 });
+    assert_eq!(s.oracle.lastFinalizedBatch().call().await.unwrap(), 0);
 }

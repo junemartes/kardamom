@@ -7,12 +7,9 @@
 //! the same time, and no abort storms happen. Parallelism comes from the
 //! real structure of the workload (distinct pools, books, or senders).
 //! Cold or unpredictable transactions run in the serial `Tail` lane at the
-//! end of the block.
-//!
-//! This crate is an offline milestone: the engine and its A/B
-//! validation harness. It is not wired into the live executor yet. That
-//! wiring uses the `--parallel-execution` flag, the determinism suite,
-//! and the in-stack validator.
+//! end of the block. The `--parallel-execution` flag wires this engine
+//! into the live executor; the determinism suite and the in-stack
+//! validator both check its output.
 //!
 //! Correctness rules (spec invariants):
 //! 1. Receipts and the delta must be byte-identical to sequential
@@ -35,14 +32,14 @@
 /// Fast `BuildHasher` for the engine's internal maps.
 ///
 /// The keys (addresses, slot hashes, domain tuples) are already
-/// high-entropy. SipHash's defense against adversarial input costs real
+/// high-entropy. `SipHash`'s defense against adversarial input costs real
 /// time and buys nothing here: the hottest path in the engine probes
 /// these caches about 7 times per transaction. A hash collision costs
 /// lookup time only. It never affects correctness.
 #[derive(Default, Clone, Copy)]
-pub struct FnvBuild;
+pub(crate) struct FnvBuild;
 
-pub struct Fnv(u64);
+pub(crate) struct Fnv(u64);
 
 impl std::hash::BuildHasher for FnvBuild {
     type Hasher = Fnv;
@@ -61,13 +58,12 @@ impl std::hash::Hasher for Fnv {
         h ^= h >> 29;
         h
     }
-    /// Hashes 8 bytes at a time.
+    /// Hashes 8 bytes at a time; keys are high-entropy.
     ///
     /// The keys this map family sees (addresses, slot hashes, and
     /// (address, slot) pairs) are already high-entropy, so a per-8-byte
-    /// multiply-xorshift mixes them well. This replaces a byte-at-a-time
-    /// FNV loop that cost about 50 cycles per 20-byte key and ran twice
-    /// per upsert. The remaining tail bytes fold in as one word.
+    /// multiply-xorshift mixes them well. The remaining tail bytes fold
+    /// in as one word.
     fn write(&mut self, bytes: &[u8]) {
         const K: u64 = 0x9E37_79B9_7F4A_7C15;
         let (chunks, rem) = bytes.as_chunks::<8>();
@@ -94,7 +90,32 @@ impl std::hash::Hasher for Fnv {
 }
 
 /// Hash map using [`FnvBuild`].
-pub type FastMap<K, V> = std::collections::HashMap<K, V, FnvBuild>;
+pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, FnvBuild>;
+
+/// A fresh vector of `n` empty, `RwLock`-guarded shards, the fnv-hashed
+/// map every sharded table in this crate uses. Shared by `mv::Shards::new`
+/// and `execute::view::BaseCache::new`, which only differ in what each
+/// shard's map holds.
+pub(crate) fn shard_vec<K, V>(n: usize) -> Vec<std::sync::RwLock<FastMap<K, V>>> {
+    (0..n)
+        .map(|_| std::sync::RwLock::new(FastMap::with_hasher(FnvBuild)))
+        .collect()
+}
+
+/// Pin the calling thread to `pins[i % pins.len()]`, if `pins` is
+/// non-empty. Every persistent per-index thread this crate spawns (a
+/// worker pool thread, or one of [`pool::WorkerPool`]'s lanes) pins its
+/// own core exactly this way at spawn. `None` means `pins` was empty
+/// (no pinning configured); `Some` carries whether the OS call
+/// succeeded, for a caller that wants to log a failure.
+pub(crate) fn pin_current(i: usize, pins: &[usize]) -> Option<bool> {
+    if pins.is_empty() {
+        return None;
+    }
+    Some(core_affinity::set_for_current(core_affinity::CoreId {
+        id: pins[i % pins.len()],
+    }))
+}
 
 pub mod execute;
 pub mod pool;
@@ -103,7 +124,7 @@ pub mod pool;
 /// `execute::execute_block_sequential_decoded`).
 pub use kardamom_exec_core::executor::DecodedTx;
 pub mod mv;
-pub mod schedule;
+pub(crate) mod schedule;
 
 /// The fee sink the accumulator marks (mirrors
 /// `kardamom_exec_core::block_env`: beneficiary = address(0), basefee = 0 —

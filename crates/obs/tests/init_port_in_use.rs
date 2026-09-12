@@ -11,6 +11,8 @@
 //! vars are process-global, so both halves live in one test body (cargo
 //! runs tests in threads).
 
+mod common;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn init_retries_addr_in_use_then_fails_or_recovers() {
     // SAFETY: no other test in this binary reads these vars at the same time.
@@ -50,18 +52,9 @@ async fn init_retries_addr_in_use_then_fails_or_recovers() {
         .await
         .expect("init must recover once the squatter releases the port");
     releaser.await.unwrap();
-    let body = tokio::task::spawn_blocking(move || {
-        std::io::Read::read_to_string(
-            &mut std::net::TcpStream::connect(addr2)
-                .map(|mut s| {
-                    std::io::Write::write_all(&mut s, b"GET /metrics HTTP/1.0\r\n\r\n").unwrap();
-                    s
-                })
-                .unwrap(),
-            &mut String::new(),
-        )
-    });
     // Connectivity is enough proof: the recorder installed, and the
-    // listener owns the port the squatter vacated.
-    let _ = body.await;
+    // listener owns the port the squatter vacated. `init` already
+    // returned `Ok`, so this should connect right away; the budget only
+    // covers the exporter's own async bind-to-serving window.
+    let _ = common::scrape(addr2, std::time::Duration::from_secs(5)).await;
 }

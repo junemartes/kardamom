@@ -21,7 +21,7 @@ pub trait ClusterIngress: Send {
     fn offer(&mut self, payload: &[u8]) -> OfferOutcome;
 }
 
-/// Receive app messages from cluster egress (used by the tx_ordering
+/// Receive app messages from cluster egress (used by the `tx_ordering`
 /// subscription). `recv` blocks until the next payload arrives. It returns
 /// `None` when the session or stream closes.
 pub trait ClusterEgress: Send {
@@ -33,6 +33,7 @@ pub mod fakes {
     //! In-memory `ClusterIngress`/`ClusterEgress` fakes.
 
     use std::collections::VecDeque;
+    use std::ops::ControlFlow;
     use std::sync::{Arc, Mutex};
 
     use super::{ClusterEgress, ClusterIngress, OfferOutcome};
@@ -46,15 +47,23 @@ pub mod fakes {
     }
 
     impl FakeIngress {
+        #[must_use]
         pub fn new() -> Self {
             Self {
                 accepted: Arc::new(Mutex::new(Vec::new())),
                 outcome: Arc::new(Mutex::new(OfferOutcome::Accepted)),
             }
         }
+        /// # Panics
+        ///
+        /// Panics if the outcome mutex is poisoned.
         pub fn set_outcome(&self, o: OfferOutcome) {
             *self.outcome.lock().unwrap() = o;
         }
+        /// # Panics
+        ///
+        /// Panics if the accepted-payloads mutex is poisoned.
+        #[must_use]
         pub fn accepted(&self) -> Vec<Vec<u8>> {
             self.accepted.lock().unwrap().clone()
         }
@@ -80,16 +89,24 @@ pub mod fakes {
     }
 
     impl FakeEgress {
+        #[must_use]
         pub fn new() -> Self {
             Self {
                 queue: Arc::new(Mutex::new(VecDeque::new())),
                 closed: Arc::new(Mutex::new(false)),
             }
         }
+        /// # Panics
+        ///
+        /// Panics if the queue mutex is poisoned.
         pub fn push(&self, payload: Vec<u8>) {
             self.queue.lock().unwrap().push_back(payload);
         }
         /// Mark the stream closed. Once the queue drains, `recv` returns `None`.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the closed-flag mutex is poisoned.
         pub fn close(&self) {
             *self.closed.lock().unwrap() = true;
         }
@@ -98,17 +115,30 @@ pub mod fakes {
     impl ClusterEgress for FakeEgress {
         fn recv(&mut self) -> Option<Vec<u8>> {
             loop {
-                if let Some(v) = self.queue.lock().unwrap().pop_front() {
-                    return Some(v);
+                match self.poll_once() {
+                    ControlFlow::Break(result) => return result,
+                    ControlFlow::Continue(()) => {}
                 }
-                if *self.closed.lock().unwrap() {
-                    return None;
-                }
-                // Deterministic tests always close before the queue drains.
-                // This code path runs only on misuse. Yield to avoid a hot
-                // spin.
-                std::thread::yield_now();
             }
+        }
+    }
+
+    impl FakeEgress {
+        /// One [`ClusterEgress::recv`] poll. `Break` carries the answer: the
+        /// next queued payload, or `None` once closed and empty. `Continue`
+        /// means the caller polls again after a yield.
+        fn poll_once(&mut self) -> ControlFlow<Option<Vec<u8>>> {
+            if let Some(v) = self.queue.lock().unwrap().pop_front() {
+                return ControlFlow::Break(Some(v));
+            }
+            if *self.closed.lock().unwrap() {
+                return ControlFlow::Break(None);
+            }
+            // Deterministic tests always close before the queue drains.
+            // This code path runs only on misuse. Yield to avoid a hot
+            // spin.
+            std::thread::yield_now();
+            ControlFlow::Continue(())
         }
     }
 }

@@ -35,3 +35,12 @@ pub enum BatcherError {
     )]
     BlockTooLarge { block_number: u64, blobs: usize },
 }
+
+impl BatcherError {
+    /// True for the blob-ceiling overflow of a group that a shorter prefix
+    /// can still fit.
+    #[must_use]
+    pub fn is_blob_overflow(&self) -> bool {
+        matches!(self, Self::Blob(_))
+    }
+}

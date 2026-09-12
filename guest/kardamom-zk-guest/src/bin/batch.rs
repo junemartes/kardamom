@@ -14,92 +14,106 @@
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 
-use alloy_rlp::Decodable;
-use kardamom_exec_core::block_env::ExecEnv;
-use kardamom_exec_core::exec_types::TxIndex;
-use kardamom_exec_core::stateless::{BufferedRecord, execute_block_anchored};
-use kardamom_types::{
-    BatchProverInput, BatchPublicOutputs, BlockRecordsDigest, ProverRecord,
-    batch_records_commitment,
-};
+use alloy_primitives::B256;
+use kardamom_types::{batch_records_commitment, BatchProverInput, BatchPublicOutputs, ProverInput};
 
+/// The batch's block list, proven non-empty at construction — a panic
+/// here is the guest's fail-closed posture. This replaces four separate
+/// emptiness checks (the assert this used to be, plus three
+/// `.expect("nonempty")` calls on `first`/`last`) with the one here.
+struct NonEmptyBatch(Vec<ProverInput>);
+
+impl NonEmptyBatch {
+    fn new(blocks: Vec<ProverInput>) -> Self {
+        assert!(!blocks.is_empty(), "empty batch");
+        Self(blocks)
+    }
+
+    fn first(&self) -> &ProverInput {
+        &self.0[0]
+    }
+
+    fn last(&self) -> &ProverInput {
+        &self.0[self.0.len() - 1]
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl IntoIterator for NonEmptyBatch {
+    type Item = ProverInput;
+    type IntoIter = std::vec::IntoIter<ProverInput>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// Validate that `batch`'s blocks are numbered contiguously from
+/// `first_block`, in one pass over the whole range. This is input
+/// validation (unlike [`check_root_chain`]), so it runs once here instead
+/// of once per iteration in the execution loop below.
+///
+/// `first_block` and every `block_number` are untrusted rkyv input, and
+/// the guest release profile sets no `overflow-checks`, so a plain `+`
+/// would let a wrapped range pass this check. `checked_add` turns that
+/// into an explicit panic instead.
+fn ensure_contiguous(batch: &NonEmptyBatch, first_block: u64) {
+    for (i, block) in batch.0.iter().enumerate() {
+        let number = block.boundary.block_number;
+        let expected = first_block
+            .checked_add(i as u64)
+            .expect("batch block number overflowed u64");
+        assert_eq!(number, expected, "batch blocks must be contiguous");
+    }
+}
+
+/// Check the inductive root chain: this block's claimed `pre_state_root`
+/// must equal the running root the prior block's post-state produced.
+/// This is a real invariant of execution order, not input validation — it
+/// cannot move to a constructor, because `running_root` comes from
+/// execution, not from the input alone.
+fn check_root_chain(block: &ProverInput, running_root: B256) {
+    assert_eq!(
+        block.witness.pre_state_root,
+        Some(running_root),
+        "root chain broken at block {}",
+        block.boundary.block_number
+    );
+}
+
+/// # Panics
+///
+/// Panics (the guest's fail-closed posture) when `input_bytes` fails to
+/// decode as a [`BatchProverInput`], when the batch is empty, when the
+/// blocks are not numbered contiguously, when the root chain breaks
+/// between blocks, when a published BAL frame fails to decode, or when
+/// anchored stateless execution fails for any block.
 pub fn main() {
     let input_bytes = sp1_zkvm::io::read_vec();
     let input: BatchProverInput =
         rkyv::from_bytes::<BatchProverInput, rkyv::rancor::Error>(&input_bytes)
             .expect("batch prover input frame");
-    assert!(!input.blocks.is_empty(), "empty batch");
-
-    let first_block = input.blocks.first().expect("nonempty").boundary.block_number;
-    let last_block = input.blocks.last().expect("nonempty").boundary.block_number;
-    let batch_pre_root = input
-        .blocks
+    let batch = NonEmptyBatch::new(input.blocks);
+    let first_block = batch.first().boundary.block_number;
+    let last_block = batch.last().boundary.block_number;
+    let batch_pre_root = batch
         .first()
-        .expect("nonempty")
         .witness
         .pre_state_root
         .expect("anchored input");
+    ensure_contiguous(&batch, first_block);
 
     let mut running_root = batch_pre_root;
-    let mut block_digests = Vec::with_capacity(input.blocks.len());
-    for (i, block) in input.blocks.into_iter().enumerate() {
-        let number = block.boundary.block_number;
-        assert_eq!(
-            number,
-            first_block + i as u64,
-            "batch blocks must be contiguous"
-        );
-        assert_eq!(
-            block.witness.pre_state_root,
-            Some(running_root),
-            "root chain broken at block {number}"
-        );
+    let mut block_digests = Vec::with_capacity(batch.len());
+    for block in batch {
+        check_root_chain(&block, running_root);
 
-        let mut digest = BlockRecordsDigest::new(number);
-        let records: Vec<BufferedRecord> = block
-            .records
-            .into_iter()
-            .map(|r| match r {
-                ProverRecord::Tx {
-                    tx_idx,
-                    envelope,
-                    position,
-                } => {
-                    digest.add_tx(&envelope.raw_tx);
-                    BufferedRecord::Tx {
-                        tx_idx: TxIndex(tx_idx),
-                        envelope,
-                        position,
-                    }
-                }
-                ProverRecord::Deposit {
-                    tx_idx,
-                    deposit,
-                    position,
-                } => BufferedRecord::Deposit {
-                    tx_idx: TxIndex(tx_idx),
-                    deposit,
-                    position,
-                },
-            })
-            .collect();
-        block_digests.push(digest.finish());
-
-        let env = ExecEnv::new(block.chain_id, &block.boundary);
-        let mut bal_slice: &[u8] = &block.bal_rlp;
-        let expected_bal = alloy_eip7928::BlockAccessList::decode(&mut bal_slice)
-            .expect("published BAL frame decodes");
-        let anchored = execute_block_anchored(
-            &block.witness,
-            &block.proofs,
-            None,
-            &records,
-            env,
-            &expected_bal,
-            block.granularity,
-        )
-        .expect("anchored stateless execution");
-        running_root = anchored.post_state_root;
+        let run = kardamom_zk_guest::GuestBlock::run(block);
+        block_digests.push(run.records_digest);
+        running_root = run.anchored.post_state_root;
     }
 
     let outputs = BatchPublicOutputs {

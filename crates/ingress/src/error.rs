@@ -48,6 +48,17 @@ pub enum IngressError {
     UnsupportedTxType(u8),
 }
 
+impl IngressError {
+    /// Builds an `Internal` error from a context label and the
+    /// underlying error's `Display`. The many `.map_err(|e|
+    /// IngressError::Internal(format!("...: {e}")))` call sites across
+    /// this crate, wrapping a bind, open, or merge failure, share this
+    /// one format.
+    pub(crate) fn internal(ctx: impl std::fmt::Display, e: impl std::fmt::Display) -> Self {
+        Self::Internal(format!("{ctx}: {e}"))
+    }
+}
+
 impl From<IngressError> for ErrorObjectOwned {
     fn from(err: IngressError) -> Self {
         let code = match &err {

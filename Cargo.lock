@@ -774,15 +774,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "arc-swap"
-version = "1.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
-dependencies = [
- "rustversion",
-]
-
-[[package]]
 name = "ark-bls12-381"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2235,16 +2226,17 @@ dependencies = [
  "clap",
  "criterion 0.5.1",
  "crossbeam-channel",
+ "futures",
  "hdrhistogram",
  "hex",
  "jsonrpsee",
  "kardamom-batcher",
- "kardamom-bench",
  "kardamom-da-watcher",
  "kardamom-deployer",
  "kardamom-exec-core",
  "kardamom-ingress",
  "kardamom-log",
+ "kardamom-obs",
  "kardamom-sequencer",
  "kardamom-state",
  "kardamom-types",
@@ -3707,6 +3699,7 @@ dependencies = [
  "bytes",
  "clap",
  "criterion 0.7.0",
+ "kardamom-batcher",
  "kardamom-deployer",
  "kardamom-engine",
  "kardamom-log",
@@ -3732,6 +3725,7 @@ name = "kardamom-bench"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eip7928",
  "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-primitives",
@@ -3741,6 +3735,7 @@ dependencies = [
  "anyhow",
  "clap",
  "core_affinity",
+ "crossbeam-channel",
  "dhat",
  "hdrhistogram",
  "humantime",
@@ -3748,6 +3743,7 @@ dependencies = [
  "kardamom-engine",
  "kardamom-footprint",
  "kardamom-ingress",
+ "kardamom-obs",
  "kardamom-state",
  "kardamom-stm",
  "kardamom-types",
@@ -3805,6 +3801,7 @@ dependencies = [
  "bytes",
  "clap",
  "jsonrpsee",
+ "kardamom-da-watcher",
  "kardamom-interop-feed",
  "kardamom-log",
  "kardamom-obs",
@@ -3826,6 +3823,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",
+ "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-node-bindings",
  "alloy-primitives",
@@ -3835,7 +3833,9 @@ dependencies = [
  "alloy-sol-types",
  "anyhow",
  "clap",
+ "kardamom-deployer",
  "kardamom-types",
+ "rand 0.8.6",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -3931,7 +3931,6 @@ dependencies = [
  "metrics",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
- "reqwest 0.13.4",
  "revm",
  "rkyv",
  "serde",
@@ -3974,6 +3973,7 @@ dependencies = [
  "jsonrpsee",
  "k256",
  "kardamom-cluster-adapter",
+ "kardamom-ingress",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-types",
@@ -4010,6 +4010,7 @@ name = "kardamom-log"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "anyhow",
  "bytes",
  "crossbeam-channel",
  "futures",
@@ -4058,6 +4059,7 @@ dependencies = [
  "kardamom-batcher",
  "kardamom-deployer",
  "kardamom-engine",
+ "kardamom-reconstruct",
  "kardamom-state",
  "kardamom-types",
  "serde_json",
@@ -4111,7 +4113,6 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
- "arc-swap",
  "bytes",
  "criterion 0.7.0",
  "crossbeam-channel",
@@ -4184,9 +4185,11 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "jsonrpsee",
+ "kardamom-cluster-adapter",
  "kardamom-da-watcher",
  "kardamom-deployer",
  "kardamom-engine",
+ "kardamom-exec-core",
  "kardamom-interop-feed",
  "kardamom-log",
  "kardamom-obs",
@@ -4194,6 +4197,7 @@ dependencies = [
  "kardamom-stm",
  "kardamom-types",
  "metrics",
+ "reqwest 0.13.4",
  "revm",
  "rkyv",
  "serde",

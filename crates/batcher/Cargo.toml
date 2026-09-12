@@ -10,6 +10,9 @@ default = []
 # Real Aeron container e2e. Implies the in-memory testing helpers from
 # `log` because the harness re-uses some of them.
 docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
+# Exposes the anvil e2e test scaffold (`testkit`) to this crate's own
+# integration tests, each of which cargo treats as a separate crate.
+test-support = []
 
 [dependencies]
 kardamom-types.workspace = true
@@ -62,8 +65,14 @@ clap.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
 toml.workspace = true
 
+[build-dependencies]
+anyhow.workspace = true
+
 [dev-dependencies]
 kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-deployer = { path = "../deployer", features = ["test-support"] }
+kardamom-batcher = { path = ".", features = ["test-support"] }
+kardamom-obs = { path = "../obs", features = ["test-support"] }
 tempfile.workspace = true
 proptest = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

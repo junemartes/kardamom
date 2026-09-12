@@ -1,26 +1,25 @@
 //! Differential test: the actor's receipt for each tx must match a
 //! naive single-threaded `revm` loop's receipt for the same tx.
 //!
-//! v0 corpus: transfers, a contract `SSTORE`, and a revert. A
-//! mainnet-vector corpus is a v1 follow-up.
+//! The corpus covers transfers, a contract `SSTORE`, and a revert.
 //!
-//! Wiring after the join-buffer architecture update: M=1 tx_data, plus one
-//! tx_ordering. The demux does not affect determinism, but the public
-//! `Executor::run` signature changed.
+//! The topology is M=1 `tx_data`, plus one `tx_ordering`. The demux
+//! shape does not affect determinism.
+//!
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "indices here are bounded by the small fixed test corpus, never near a truncation or wrap boundary"
+)]
 
-use std::thread;
-use std::time::Duration;
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_eips::eip2718::Decodable2718;
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::{
-    Address, Bytes as AlloyBytes, TxKind as APTxKind, U256, address, keccak256,
-};
+use alloy_primitives::{Address, Bytes as AlloyBytes, U256, address};
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
-use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::context::result::ExecutionResult;
 use revm::context::{BlockEnv, CfgEnv, TxEnv};
 use revm::database::CacheDB;
@@ -28,69 +27,24 @@ use revm::primitives::{KECCAK_EMPTY, TxKind};
 use revm::state::Bytecode;
 use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 
+use kardamom_engine::actor::fixtures::{ChannelHarness, HarnessInput, LegacyTx};
 use kardamom_engine::executor::SnapshotRef;
 use kardamom_engine::{
-    BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
-    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ResumePoint,
-    RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
-    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, ExecutorConfig, MockStateDatabase, TxEnvelope,
+    TxOrderingMessage, TxRef,
 };
+
+const QUEUE_DEPTH_8: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+
+/// A `tx_data` input stream: [`HarnessInput::tx_data`]'s type.
+type TxDataVec = Vec<(BPosition, TxEnvelope)>;
+/// A `tx_ordering` input stream: [`HarnessInput::tx_ordering`]'s type.
+type TxOrderingVec = Vec<(BPosition, TxOrderingMessage)>;
 
 // Minimal: PUSH1 0x42; PUSH1 0x00; SSTORE; STOP
 const SSTORE_42_AT_0: [u8; 6] = [0x60, 0x42, 0x60, 0x00, 0x55, 0x00];
 // PUSH1 0x00; PUSH1 0x00; REVERT
 const REVERT_CODE: [u8; 5] = [0x60, 0x00, 0x60, 0x00, 0xfd];
-
-struct ChanTxDataSub {
-    sequencer_id: u8,
-    rx: Receiver<(BPosition, KtTxEnvelope)>,
-}
-impl TxDataSubscription for ChanTxDataSub {
-    fn sequencer_id(&self) -> u8 {
-        self.sequencer_id
-    }
-    fn next(&mut self) -> Result<(kardamom_types::TxDataLoc, KtTxEnvelope), ExecutorError> {
-        self.rx
-            .recv()
-            .map(|(pos, env)| (kardamom_types::TxDataLoc::new(0, pos), env))
-            .map_err(|_| ExecutorError::TxDataClosed {
-                sequencer_id: self.sequencer_id,
-            })
-    }
-}
-struct ChanTxOrderingSub(Receiver<(BPosition, TxOrderingMessage)>);
-impl TxOrderingSubscription for ChanTxOrderingSub {
-    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
-        self.0.recv().map_err(|_| ExecutorError::TxOrderingClosed)
-    }
-}
-struct ChanReceiptsPub(Sender<CMessage>);
-impl TxReceiptsPublication for ChanReceiptsPub {
-    fn publish(&mut self, m: CMessage) -> Result<(), ExecutorError> {
-        self.0.send(m).map_err(|_| ExecutorError::TxReceiptsClosed)
-    }
-}
-struct Imm;
-impl StateWriterSignal for Imm {
-    fn committed(&mut self) -> Result<u64, ExecutorError> {
-        Ok(u64::MAX)
-    }
-    fn wait_committed(&mut self, b: u64) -> Result<u64, ExecutorError> {
-        Ok(b)
-    }
-}
-
-/// Port types for this test's channel-backed fakes.
-struct TestWiring;
-impl EngineWiring for TestWiring {
-    type TxData = ChanTxDataSub;
-    type TxOrdering = ChanTxOrderingSub;
-    type TxReceipts = ChanReceiptsPub;
-    type Snapshots = MutatingSnapshotSource;
-    type WriterSignal = Imm;
-    type WriterQueue = WriterApplyingQueue;
-    type Epoch = NoEpochCheck;
-}
 
 fn bpos(off: i32) -> BPosition {
     BPosition {
@@ -99,89 +53,100 @@ fn bpos(off: i32) -> BPosition {
     }
 }
 
-/// Build a proxy-style `kardamom_types::TxEnvelope` (with raw_tx,
-/// sender, and tx_hash filled in). The naive reference decodes it back
-/// to alloy for revm.
-fn legacy(
-    signer: &PrivateKeySigner,
-    to: APTxKind,
-    nonce: u64,
-    value: u64,
-    data: AlloyBytes,
-    gas: u64,
-) -> KtTxEnvelope {
-    let mut tx = TxLegacy {
-        chain_id: Some(1),
-        nonce,
-        gas_price: 0,
-        gas_limit: gas,
-        to,
-        value: U256::from(value),
-        input: data,
+/// One transaction and the sender address it commits under, for
+/// [`naive_reference`] and the actor comparison in
+/// `actor_receipts_match_naive_reference`.
+#[derive(Clone)]
+struct TxWithSender {
+    env: TxEnvelope,
+    sender: Address,
+}
+
+/// One transaction's outcome: whether it succeeded, and its gas used.
+/// [`naive_reference`] and the actor path both produce a `Vec` of
+/// these, compared entry by entry.
+#[derive(Debug, PartialEq, Eq)]
+struct TxResult {
+    status: bool,
+    gas_used: u64,
+}
+
+/// Run one transaction from `entry` against `cache`, and return its
+/// outcome.
+fn run_one_naive(
+    cache: &mut CacheDB<SnapshotRef<'_, MockStateDatabase>>,
+    entry: &TxWithSender,
+) -> TxResult {
+    use alloy_consensus::Transaction;
+    let mut slice: &[u8] = entry.env.raw_tx.as_ref();
+    let env = alloy_consensus::TxEnvelope::decode_2718(&mut slice).expect("decode raw_tx");
+    let tx_env = TxEnv {
+        caller: entry.sender,
+        chain_id: env.chain_id(),
+        nonce: env.nonce(),
+        gas_limit: env.gas_limit(),
+        value: env.value(),
+        data: env.input().clone(),
+        kind: match env.to() {
+            Some(a) => TxKind::Call(a),
+            None => TxKind::Create,
+        },
+        gas_price: env.gas_price().unwrap_or_else(|| env.max_fee_per_gas()),
+        ..Default::default()
     };
-    let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-    let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
-    let raw_tx = Bytes::from(alloy_env.encoded_2718());
-    let tx_hash = keccak256(&raw_tx);
-    KtTxEnvelope {
-        correlation_id: 0,
-        raw_tx,
-        sender: signer.address(),
-        tx_hash,
+    #[allow(
+        clippy::field_reassign_with_default,
+        reason = "CfgEnv has many fields; building the default then setting chain_id is clearer than a full literal"
+    )]
+    let cfg: CfgEnv = {
+        let mut c = CfgEnv::default();
+        c.chain_id = 1;
+        c
+    };
+    let blk = BlockEnv {
+        number: U256::from(1u64),
+        timestamp: U256::from(1_700_000_000u64),
+        gas_limit: 30_000_000,
+        basefee: 0,
+        prevrandao: Some(alloy_primitives::B256::default()),
+        ..Default::default()
+    };
+    let mut evm = Context::mainnet()
+        .with_db(cache)
+        .with_block(blk)
+        .with_cfg(cfg)
+        .build_mainnet();
+    let r = evm.transact_commit(tx_env).expect("commit");
+    TxResult {
+        status: matches!(r, ExecutionResult::Success { .. }),
+        gas_used: r.gas().tx_gas_used(),
     }
 }
 
-fn naive_reference(snap: MockStateDatabase, txs: &[(KtTxEnvelope, Address)]) -> Vec<(bool, u64)> {
-    use alloy_consensus::Transaction;
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "each call constructs a fresh snapshot and has no further use for it"
+)]
+fn naive_reference(snap: MockStateDatabase, txs: &[TxWithSender]) -> Vec<TxResult> {
     let snap_ref = SnapshotRef { inner: &snap };
     let mut cache: CacheDB<SnapshotRef<'_, MockStateDatabase>> = CacheDB::new(snap_ref);
-    let mut out = Vec::new();
-    for (kt_env, signer) in txs {
-        let mut slice: &[u8] = kt_env.raw_tx.as_ref();
-        let env = alloy_consensus::TxEnvelope::decode_2718(&mut slice).expect("decode raw_tx");
-        let tx_env = TxEnv {
-            caller: *signer,
-            chain_id: env.chain_id(),
-            nonce: env.nonce(),
-            gas_limit: env.gas_limit(),
-            value: env.value(),
-            data: env.input().clone(),
-            kind: match env.to() {
-                Some(a) => TxKind::Call(a),
-                None => TxKind::Create,
-            },
-            gas_price: env.gas_price().unwrap_or_else(|| env.max_fee_per_gas()),
-            ..Default::default()
-        };
-        #[allow(clippy::field_reassign_with_default)]
-        let cfg: CfgEnv = {
-            let mut c = CfgEnv::default();
-            c.chain_id = 1;
-            c
-        };
-        let blk = BlockEnv {
-            number: U256::from(1u64),
-            timestamp: U256::from(1_700_000_000u64),
-            gas_limit: 30_000_000,
-            basefee: 0,
-            prevrandao: Some(Default::default()),
-            ..Default::default()
-        };
-        let mut evm = Context::mainnet()
-            .with_db(&mut cache)
-            .with_block(blk)
-            .with_cfg(cfg)
-            .build_mainnet();
-        let r = evm.transact_commit(tx_env).expect("commit");
-        let gas_used = r.gas().tx_gas_used();
-        let ok = matches!(r, ExecutionResult::Success { .. });
-        out.push((ok, gas_used));
-    }
-    out
+    txs.iter()
+        .map(|entry| run_one_naive(&mut cache, entry))
+        .collect()
 }
 
-#[test]
-fn actor_receipts_match_naive_reference() {
+/// Two snapshots of the same fixture accounts (a funded sender, an
+/// `SSTORE` contract, and a reverting contract), plus the
+/// three-transaction corpus every diff-reference test runs. The
+/// reference path mutates its `CacheDB` in place; a second snapshot
+/// keeps that out of the actor's reads.
+struct DiffFixture {
+    snap_ref: MockStateDatabase,
+    snap_actor: MockStateDatabase,
+    pairs: Vec<TxWithSender>,
+}
+
+fn build_diff_fixture() -> DiffFixture {
     let signer = PrivateKeySigner::random();
     let from = signer.address();
     let to = address!("00000000000000000000000000000000000ABCDE");
@@ -193,69 +158,85 @@ fn actor_receipts_match_naive_reference() {
     let sstore_hash = Bytecode::new_raw(sstore_code.clone()).hash_slow();
     let revert_hash = Bytecode::new_raw(revert_code.clone()).hash_slow();
 
-    // Reference fixture: independent snapshot the naive loop uses.
-    let snap_ref = MockStateDatabase::builder()
-        .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
-        .account(sstore_addr, U256::ZERO, 1, sstore_hash)
-        .account(revert_addr, U256::ZERO, 1, revert_hash)
-        .code(sstore_hash, Bytes::copy_from_slice(sstore_code.as_ref()))
-        .code(revert_hash, Bytes::copy_from_slice(revert_code.as_ref()))
-        .build();
-    // Actor fixture: a separate snapshot, so the in-place CacheDB that
-    // the reference path mutates cannot bleed into the actor's reads.
-    let snap_actor = MockStateDatabase::builder()
-        .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
-        .account(sstore_addr, U256::ZERO, 1, sstore_hash)
-        .account(revert_addr, U256::ZERO, 1, revert_hash)
-        .code(sstore_hash, Bytes::copy_from_slice(sstore_code.as_ref()))
-        .code(revert_hash, Bytes::copy_from_slice(revert_code.as_ref()))
-        .build();
+    let build_snap = || {
+        MockStateDatabase::builder()
+            .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
+            .account(sstore_addr, U256::ZERO, 1, sstore_hash)
+            .account(revert_addr, U256::ZERO, 1, revert_hash)
+            .code(sstore_hash, Bytes::copy_from_slice(sstore_code.as_ref()))
+            .code(revert_hash, Bytes::copy_from_slice(revert_code.as_ref()))
+            .build()
+    };
 
-    let txs: [KtTxEnvelope; 3] = [
-        legacy(
-            &signer,
-            APTxKind::Call(to),
-            0,
-            10,
-            AlloyBytes::new(),
-            21_000,
-        ),
-        legacy(
-            &signer,
-            APTxKind::Call(sstore_addr),
-            1,
-            0,
-            AlloyBytes::new(),
-            100_000,
-        ),
-        legacy(
-            &signer,
-            APTxKind::Call(revert_addr),
-            2,
-            0,
-            AlloyBytes::new(),
-            100_000,
-        ),
+    let txs: [TxEnvelope; 3] = [
+        LegacyTx {
+            chain_id: 1,
+            to,
+            nonce: 0,
+            value: 10,
+            gas_limit: 21_000,
+            gas_price: 0,
+        }
+        .sign(&signer),
+        LegacyTx {
+            chain_id: 1,
+            to: sstore_addr,
+            nonce: 1,
+            value: 0,
+            gas_limit: 100_000,
+            gas_price: 0,
+        }
+        .sign(&signer),
+        LegacyTx {
+            chain_id: 1,
+            to: revert_addr,
+            nonce: 2,
+            value: 0,
+            gas_limit: 100_000,
+            gas_price: 0,
+        }
+        .sign(&signer),
     ];
-    let pairs: Vec<(KtTxEnvelope, Address)> = txs.iter().cloned().map(|t| (t, from)).collect();
+    let pairs: Vec<TxWithSender> = txs
+        .iter()
+        .cloned()
+        .map(|env| TxWithSender { env, sender: from })
+        .collect();
 
-    let reference = naive_reference(snap_ref, &pairs);
-
-    // Now drive the actor.
-    let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>(8);
-    let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>(8);
-    let (c_tx, c_rx) = bounded::<CMessage>(8);
-    for (i, (env, _sg)) in pairs.iter().enumerate() {
-        let tx_data_position = bpos((i as i32) * 200);
-        let tx_hash = env.tx_hash;
-        a_tx.send((tx_data_position, env.clone())).unwrap();
-        b_tx.send((
-            bpos(i as i32),
-            TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position, 0)),
-        ))
-        .unwrap();
+    DiffFixture {
+        snap_ref: build_snap(),
+        snap_actor: build_snap(),
+        pairs,
     }
-    b_tx.send((
+}
+
+/// Append `entry`'s `tx_data` record and `tx_ordering` ref, at index
+/// `i`, to `tx_data`/`tx_ordering`.
+fn publish_one(
+    tx_data: &mut TxDataVec,
+    tx_ordering: &mut TxOrderingVec,
+    i: usize,
+    entry: &TxWithSender,
+) {
+    let tx_data_position = bpos((i as i32) * 200);
+    let tx_hash = entry.env.tx_hash;
+    tx_data.push((tx_data_position, entry.env.clone()));
+    tx_ordering.push((
+        bpos(i as i32),
+        TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position, 0)),
+    ));
+}
+
+/// Build `tx_data`/`tx_ordering` input for `pairs`, then the closing
+/// boundary.
+fn build_replay_input(pairs: &[TxWithSender]) -> (TxDataVec, TxOrderingVec) {
+    let mut tx_data = Vec::new();
+    let mut tx_ordering = Vec::new();
+    pairs
+        .iter()
+        .enumerate()
+        .for_each(|(i, entry)| publish_one(&mut tx_data, &mut tx_ordering, i, entry));
+    tx_ordering.push((
         bpos(pairs.len() as i32),
         TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
             block_number: 1,
@@ -266,53 +247,48 @@ fn actor_receipts_match_naive_reference() {
             l2_timestamp: 1_700_000_000,
             l1_origin: 0,
         }),
-    ))
-    .unwrap();
-    drop(a_tx);
-    drop(b_tx);
+    ));
+    (tx_data, tx_ordering)
+}
 
-    let writer_q = WriterApplyingQueue::new(snap_actor.clone());
-    let snapshots = MutatingSnapshotSource(snap_actor);
-    let tx_data_subs = vec![ChanTxDataSub {
-        sequencer_id: 0,
-        rx: a_rx,
-    }];
-    let h = thread::spawn(move || {
-        Executor::run::<TestWiring>(
-            ExecutorConfig {
-                chain_id: 1,
-                receipt_queue_depth: 8,
-                ..Default::default()
-            },
-            Inbound {
-                tx_data: tx_data_subs,
-                tx_ordering: ChanTxOrderingSub(b_rx),
-                join_recovery: None,
-            },
-            Outbound {
-                tx_receipts: ChanReceiptsPub(c_tx),
-                snapshots,
-                writer_signal: Imm,
-                writer_queue: writer_q,
-            },
-            ResumePoint::GENESIS,
-            RoleHooks::none(),
-        )
-    });
-
-    let mut actor = Vec::new();
-    while let Ok(m) = c_rx.recv_timeout(Duration::from_secs(5)) {
-        if let CMessage::Receipt(r) = m {
-            actor.push((r.status, r.gas_used));
-        }
+/// `m`'s receipt as a [`TxResult`], or `None` if `m` is a boundary.
+fn receipt_to_result(m: CMessage) -> Option<TxResult> {
+    match m {
+        CMessage::Receipt(r) => Some(TxResult {
+            status: r.status,
+            gas_used: r.gas_used,
+        }),
+        CMessage::BlockBoundary(_) => None,
     }
-    h.join().expect("no panic").expect("ok");
+}
+
+#[test]
+fn actor_receipts_match_naive_reference() {
+    let fixture = build_diff_fixture();
+    let reference = naive_reference(fixture.snap_ref, &fixture.pairs);
+
+    let (tx_data, tx_ordering) = build_replay_input(&fixture.pairs);
+    let cfg = ExecutorConfig {
+        chain_id: NonZeroU64::MIN,
+        receipt_queue_depth: QUEUE_DEPTH_8,
+        ..Default::default()
+    };
+    let outcome = ChannelHarness::run(HarnessInput {
+        cfg,
+        tx_data,
+        tx_ordering,
+        snap: fixture.snap_actor,
+    });
+    outcome.result.expect("ok");
+
+    let actor: Vec<TxResult> = outcome
+        .receipts
+        .into_iter()
+        .filter_map(receipt_to_result)
+        .collect();
 
     assert_eq!(actor.len(), reference.len());
     for (i, (a, r)) in actor.iter().zip(reference.iter()).enumerate() {
         assert_eq!(a, r, "diff at idx {i}: actor={a:?} reference={r:?}");
     }
 }
-
-// TODO(v1): import a mainnet-style tx corpus (historical Uniswap swaps,
-// USDC transfers) and re-run this assertion.

@@ -13,14 +13,15 @@ use crate::wire;
 pub const TX_TYPE_LEGACY: u8 = 0x00;
 /// EIP-2718 type byte for an L1-originated deposit. This is the OP-stack value.
 pub const TX_TYPE_DEPOSIT: u8 = 0x7E;
-/// EIP-2718 type byte for a cross-chain message from another Kardamom chain
-/// (`docs/specs/interop-outbox-messaging-spec.md`). One below the deposit
-/// type; shares its fee-free, nonce-less execution shape.
+/// EIP-2718 type byte for a cross-chain message from another Kardamom
+/// chain. One below the deposit type; shares its fee-free, nonce-less
+/// execution shape.
 pub const TX_TYPE_XCHAIN: u8 = 0x7D;
 
 /// The EIP-2718 type byte of a raw encoded transaction. For a typed
 /// envelope, the leading byte is the type (`0x00..=0x7f`). Any byte above
 /// that range is the first byte of a legacy RLP list.
+#[must_use]
 pub fn tx_type_of(raw_tx: &[u8]) -> u8 {
     match raw_tx.first() {
         Some(&b) if b <= 0x7f => b,
@@ -85,8 +86,9 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
-    /// Stable snake_case name — the metrics label and (later) the RPC
+    /// Stable `snake_case` name — the metrics label and (later) the RPC
     /// string for this reason.
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             SkipReason::Undecodable => "undecodable",
@@ -104,12 +106,12 @@ impl SkipReason {
 }
 
 /// Per-transaction execution receipt. Executor replicas publish this on
-/// tx_receipts.
+/// `tx_receipts`.
 ///
 /// Carries every field the ingress needs to answer
 /// `eth_getTransactionReceipt` without a join against the state DB. The
 /// ingress keeps an in-memory index, `tx_hash → Receipt` and
-/// `(sender, nonce) → Receipt`, from the tx_receipts subscription. So the
+/// `(sender, nonce) → Receipt`, from the `tx_receipts` subscription. So the
 /// JSON-RPC handler reads straight from RAM.
 ///
 /// This struct does not carry `block_hash` in v0. The slim `BlockBoundary`
@@ -125,12 +127,8 @@ pub struct Receipt {
     ///
     /// This field matters beyond RPC fidelity. A deposit carries no L2
     /// nonce; the `nonce` field below is a filler `0`. So a consumer that
-    /// reasons about nonces must branch on this field, not on `nonce == 0`.
-    /// Before this field existed, a deposit and a genuine nonce-0
-    /// transaction looked the same on the wire. This forced the sequencer's
-    /// publish-confirmation ledger to ignore all nonce-0 receipts. That left
-    /// a one-transaction sender's nonce-0 reference unconfirmable. It was
-    /// re-offered on every confirm timeout, forever.
+    /// reasons about nonces must branch on this field, not on `nonce == 0`,
+    /// or it cannot tell a deposit from a genuine nonce-0 transaction.
     pub tx_type: u8,
     /// Copied from `TxEnvelope.tx_hash`. The executor never recomputes it.
     #[rkyv(with = wire::B256Bytes)]
@@ -161,7 +159,7 @@ pub struct Receipt {
     pub effective_gas_price: u128,
     /// Block that included this transaction.
     pub block_number: u64,
-    /// Zero-based index within the block. This differs from `tx_idx`'s BPosition.
+    /// Zero-based index within the block. This differs from `tx_idx`'s `BPosition`.
     pub transaction_index: u64,
     /// Running sum of `gas_used` for all transactions in the block, up to
     /// and including this one.
@@ -194,20 +192,16 @@ impl Receipt {
     /// validation keeps its mint pre-credit. The mint is committed before
     /// the inner call and is durable no matter the outcome. Such a
     /// receipt carries the mint in its write set, and nothing else.
+    #[must_use]
     pub fn is_invalid_skip(&self) -> bool {
         !self.status && self.gas_used == 0
     }
 
     /// Returns true if this receipt is for an L1-originated deposit. A
     /// deposit consumes no L2 nonce; see [`Receipt::tx_type`].
+    #[must_use]
     pub fn is_deposit(&self) -> bool {
         self.tx_type == TX_TYPE_DEPOSIT
-    }
-
-    /// Whether this receipt is for a cross-chain message from another
-    /// Kardamom chain (fee-free and nonce-less, like a deposit).
-    pub fn is_xchain(&self) -> bool {
-        self.tx_type == TX_TYPE_XCHAIN
     }
 }
 

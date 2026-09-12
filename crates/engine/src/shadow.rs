@@ -39,7 +39,7 @@ use kardamom_types::TxEnvelope;
 /// So conflict analysis excludes it. This
 /// mirrors `kardamom_exec_core::block_env`: beneficiary = address(0),
 /// basefee = 0, the documented V0 burn.
-pub const FEE_SINK: Address = Address::ZERO;
+pub(crate) const FEE_SINK: Address = Address::ZERO;
 
 /// Pair-grading cap per block. Grading does O(n²) set intersections. CI-scale
 /// blocks have at most ~600 txs; saturated dev-host blocks have ~2,700. This
@@ -51,40 +51,91 @@ const GRADE_CAP: usize = 2_048;
 /// cost: the envelope's byte payload is refcounted, and cell extraction is
 /// one pass over the small `WriteSet`.
 pub struct ShadowTxCapture {
-    pub envelope: TxEnvelope,
-    pub gas_used: u64,
-    pub touches: TouchSet,
-    pub write_cells: Vec<Cell>,
+    pub(crate) envelope: TxEnvelope,
+    pub(crate) gas_used: u64,
+    pub(crate) touches: TouchSet,
+    pub(crate) write_cells: Vec<Cell>,
 }
 
 /// One block's handoff.
 pub struct ShadowBlock {
-    pub block_number: u64,
-    pub captures: Vec<ShadowTxCapture>,
+    pub(crate) block_number: u64,
+    pub(crate) captures: Vec<ShadowTxCapture>,
     /// Count of serial-lane records (deposits) in the block. The predictor
     /// does not model these (they use the serial barrier lane). This
     /// count lets block totals match in the summary line.
-    pub serial_records: u32,
+    pub(crate) serial_records: u32,
+}
+
+impl ShadowBlock {
+    /// Turn this block's captures into graded observations, one per tx, in
+    /// capture order. Read and write cells are sorted and deduped, for
+    /// parity with the offline yardstick.
+    fn into_observations(self) -> Vec<TxObs> {
+        self.captures
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let kardamom_footprint::EnvelopeView {
+                    to,
+                    selector,
+                    args,
+                    has_value,
+                } = envelope_view(&c.envelope.raw_tx);
+                // Account reads (BALANCE/EXTCODE* subjects) stay out of the
+                // conflict cells, for parity with the offline yardstick. See
+                // the note on `kardamom_footprint::Cell`.
+                let mut reads: Vec<Cell> = c
+                    .touches
+                    .slot_reads
+                    .iter()
+                    .map(|(a, k)| Cell::Slot(*a, *k))
+                    .collect();
+                reads.sort_unstable();
+                reads.dedup();
+                let mut writes = c.write_cells;
+                writes.sort_unstable();
+                writes.dedup();
+                TxObs {
+                    index: i as u64,
+                    block: self.block_number,
+                    sender: c.envelope.sender,
+                    to,
+                    selector,
+                    args,
+                    gas: c.gas_used,
+                    has_value,
+                    reads,
+                    writes,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Extract the write cells of one tx from its `WriteSet`. This is the same
 /// cell model the offline capture used: one `Account` cell per written account,
 /// one `Slot` cell per storage write. Reads come in through [`TouchSet`].
-pub fn write_cells(ws: &WriteSet) -> Vec<Cell> {
-    let mut cells = Vec::with_capacity(ws.accounts.len() + ws.storage.len());
-    for (addr, _) in ws.accounts.iter() {
-        cells.push(Cell::Account(*addr));
-    }
-    for ((addr, key), _) in ws.storage.iter() {
-        cells.push(Cell::Slot(*addr, *key));
-    }
-    cells
+pub(crate) fn write_cells(ws: &WriteSet) -> Vec<Cell> {
+    ws.accounts
+        .iter()
+        .map(|(addr, _)| Cell::Account(*addr))
+        .chain(
+            ws.storage
+                .iter()
+                .map(|((addr, key), _)| Cell::Slot(*addr, *key)),
+        )
+        .collect()
 }
 
 /// Read `KARDAMOM_FOOTPRINT_SHADOW`. If it is `1`, spawn the shadow thread
 /// and return the exec side's sender. The thread exits when the executor
 /// drops the sender. No join handle is needed, because the thread owns no
 /// state that anything waits for.
+///
+/// # Panics
+///
+/// Panics if the OS refuses to spawn the thread.
 pub fn spawn_from_env() -> Option<Sender<ShadowBlock>> {
     if std::env::var("KARDAMOM_FOOTPRINT_SHADOW").ok().as_deref() != Some("1") {
         return None;
@@ -92,108 +143,130 @@ pub fn spawn_from_env() -> Option<Sender<ShadowBlock>> {
     let (tx, rx) = bounded::<ShadowBlock>(8);
     std::thread::Builder::new()
         .name("footprint-shadow".into())
-        .spawn(move || run_shadow(rx))
+        .spawn(move || Shadow::new().run(&rx))
         .expect("spawn footprint-shadow");
     tracing::info!(target: "kardamom_executor::shadow", "footprint shadow ENABLED (measurement only; execution stays sequential)");
     Some(tx)
 }
 
-fn run_shadow(rx: Receiver<ShadowBlock>) {
-    let mut stats = Stats::default();
-    let mut exclude = HashSet::new();
-    exclude.insert(Cell::Account(FEE_SINK));
-    while let Ok(block) = rx.recv() {
-        process_block(block, &mut stats, &exclude);
+/// One graded block's outcome: everything the metrics emission and the
+/// summary log line need, gathered so neither takes it as loose
+/// parameters.
+struct GradedBlock {
+    block_number: u64,
+    g: kardamom_footprint::grade::BlockGrade,
+    serial_records: u32,
+    accumulator_reads: usize,
+}
+
+impl GradedBlock {
+    /// Emit the grade's metrics: prediction hit rate, false-independent
+    /// and false-edge counts, cold txs, the Accumulator-guard read count,
+    /// and the predicted-vs-oracle wave shape.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "per-block DAG counts stay far below 2^52"
+    )]
+    fn emit_metrics(&self) {
+        let g = &self.g;
+        metrics::counter!(crate::metrics::FOOTPRINT_BLOCKS_TOTAL, "outcome" => "graded")
+            .increment(1);
+        metrics::gauge!(crate::metrics::FOOTPRINT_PREDICTION_HIT_RATE).set(g.hit_rate());
+        metrics::counter!(crate::metrics::FOOTPRINT_FALSE_INDEPENDENT_TOTAL)
+            .increment(g.missed_pairs as u64);
+        metrics::counter!(crate::metrics::FOOTPRINT_FALSE_EDGE_TOTAL)
+            .increment(g.false_pairs as u64);
+        metrics::counter!(crate::metrics::FOOTPRINT_COLD_TX_TOTAL).increment(g.cold_txs as u64);
+        metrics::counter!(crate::metrics::FOOTPRINT_ACCUMULATOR_READ_TOTAL)
+            .increment(self.accumulator_reads as u64);
+        metrics::gauge!(crate::metrics::FOOTPRINT_PREDICTED_WAVES).set(g.predicted_waves as f64);
+        metrics::gauge!(crate::metrics::FOOTPRINT_PREDICTED_WIDTH).set(g.predicted_width as f64);
+        metrics::gauge!(crate::metrics::FOOTPRINT_PREDICTED_EDGES).set(g.predicted_edges as f64);
+        metrics::gauge!(crate::metrics::FOOTPRINT_PREDICTED_CP_RATIO).set(g.predicted_cp_ratio());
+        metrics::gauge!(crate::metrics::FOOTPRINT_ORACLE_CP_RATIO).set(g.oracle_cp_ratio());
+    }
+
+    /// Log one summary line for the graded block.
+    fn log_summary(&self) {
+        let g = &self.g;
+        tracing::info!(
+            target: "kardamom_executor::shadow",
+            block = self.block_number,
+            txs = g.txs,
+            graded = g.graded,
+            serial = self.serial_records,
+            cold = g.cold_txs,
+            hit_rate = format!("{:.4}", g.hit_rate()),
+            waves = g.predicted_waves,
+            width = g.predicted_width,
+            pred_edges = g.predicted_edges,
+            true_edges = g.true_edges,
+            false_independent = g.missed_pairs,
+            over_merge = g.false_pairs,
+            cp_pred = format!("{:.2}", g.predicted_cp_ratio()),
+            cp_oracle = format!("{:.2}", g.oracle_cp_ratio()),
+            accumulator_reads = self.accumulator_reads,
+            "footprint shadow block graded"
+        );
     }
 }
 
-/// Grade one block, emit its metrics and summary line, then train. This is
-/// crate-public so the actor tests can call it without a thread.
-pub(crate) fn process_block(block: ShadowBlock, stats: &mut Stats, exclude: &HashSet<Cell>) {
-    let block_number = block.block_number;
-    // This is the Accumulator-guard signal. A BALANCE-opcode read against
-    // the accumulator-marked fee sink would force materialization at
-    // runtime. This should almost never happen. It is measured here to
-    // track the price of the guard.
-    let accumulator_reads = block
-        .captures
-        .iter()
-        .filter(|c| c.touches.account_reads.contains(&FEE_SINK))
-        .count();
+/// Grading state: the classifier stats trained across blocks, and the
+/// grading exclusion set (the Accumulator boundary). One instance serves
+/// the shadow thread's whole life; test code builds one instance to grade
+/// a block without a thread.
+pub(crate) struct Shadow {
+    stats: Stats,
+    exclude: HashSet<Cell>,
+}
 
-    let obs: Vec<TxObs> = block
-        .captures
-        .into_iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let (to, selector, args, has_value) = envelope_view(&c.envelope.raw_tx);
-            let mut reads: Vec<Cell> = c
-                .touches
-                .slot_reads
-                .iter()
-                .map(|(a, k)| Cell::Slot(*a, *k))
-                .collect();
-            // Account reads (BALANCE/EXTCODE* subjects) stay out of the
-            // conflict cells, for parity with the offline yardstick. See the note
-            // on `kardamom_footprint::Cell`.
-            reads.sort_unstable();
-            reads.dedup();
-            let mut writes = c.write_cells;
-            writes.sort_unstable();
-            writes.dedup();
-            TxObs {
-                index: i as u64,
-                block: block_number,
-                sender: c.envelope.sender,
-                to,
-                selector,
-                args,
-                gas: c.gas_used,
-                has_value,
-                reads,
-                writes,
-            }
-        })
-        .collect();
+impl Shadow {
+    pub(crate) fn new() -> Self {
+        Self {
+            stats: Stats::default(),
+            exclude: HashSet::from([Cell::Account(FEE_SINK)]),
+        }
+    }
 
-    let g = grade_block(stats, &obs, exclude, GRADE_CAP);
+    fn run(mut self, rx: &Receiver<ShadowBlock>) {
+        for block in rx {
+            self.process_block(block);
+        }
+    }
 
-    metrics::counter!(crate::metrics::FOOTPRINT_BLOCKS_TOTAL, "outcome" => "graded").increment(1);
-    metrics::gauge!(crate::metrics::FOOTPRINT_PREDICTION_HIT_RATE).set(g.hit_rate());
-    metrics::counter!(crate::metrics::FOOTPRINT_FALSE_INDEPENDENT_TOTAL)
-        .increment(g.missed_pairs as u64);
-    metrics::counter!(crate::metrics::FOOTPRINT_FALSE_EDGE_TOTAL).increment(g.false_pairs as u64);
-    metrics::counter!(crate::metrics::FOOTPRINT_COLD_TX_TOTAL).increment(g.cold_txs as u64);
-    metrics::counter!(crate::metrics::FOOTPRINT_ACCUMULATOR_READ_TOTAL)
-        .increment(accumulator_reads as u64);
-    metrics::gauge!(crate::metrics::FOOTPRINT_PREDICTED_WAVES).set(g.predicted_waves as f64);
-    metrics::gauge!(crate::metrics::FOOTPRINT_PREDICTED_WIDTH).set(g.predicted_width as f64);
-    metrics::gauge!(crate::metrics::FOOTPRINT_PREDICTED_EDGES).set(g.predicted_edges as f64);
-    metrics::gauge!(crate::metrics::FOOTPRINT_PREDICTED_CP_RATIO).set(g.predicted_cp_ratio());
-    metrics::gauge!(crate::metrics::FOOTPRINT_ORACLE_CP_RATIO).set(g.oracle_cp_ratio());
+    /// Grade one block, emit its metrics and summary line, then train.
+    pub(crate) fn process_block(&mut self, block: ShadowBlock) {
+        let block_number = block.block_number;
+        let serial_records = block.serial_records;
+        // This is the Accumulator-guard signal. A BALANCE-opcode read
+        // against the accumulator-marked fee sink would force
+        // materialization at runtime. This should almost never happen. It
+        // is measured here to track the price of the guard.
+        let accumulator_reads = block
+            .captures
+            .iter()
+            .filter(|c| c.touches.account_reads.contains(&FEE_SINK))
+            .count();
 
-    tracing::info!(
-        target: "kardamom_executor::shadow",
-        block = block_number,
-        txs = g.txs,
-        graded = g.graded,
-        serial = block.serial_records,
-        cold = g.cold_txs,
-        hit_rate = format!("{:.4}", g.hit_rate()),
-        waves = g.predicted_waves,
-        width = g.predicted_width,
-        pred_edges = g.predicted_edges,
-        true_edges = g.true_edges,
-        false_independent = g.missed_pairs,
-        over_merge = g.false_pairs,
-        cp_pred = format!("{:.2}", g.predicted_cp_ratio()),
-        cp_oracle = format!("{:.2}", g.oracle_cp_ratio()),
-        accumulator_reads,
-        "footprint shadow block graded"
-    );
+        let obs = block.into_observations();
+        let g = grade_block(&self.stats, &obs, &self.exclude, GRADE_CAP);
 
-    // Train after grading. The next block's prediction includes this one.
-    for o in &obs {
-        stats.learn_obs(o);
+        let graded = GradedBlock {
+            block_number,
+            g,
+            serial_records,
+            accumulator_reads,
+        };
+        graded.emit_metrics();
+        graded.log_summary();
+
+        // Train after grading. The next block's prediction includes this one.
+        self.train(&obs);
+    }
+
+    fn train(&mut self, obs: &[TxObs]) {
+        for o in obs {
+            self.stats.learn_obs(o);
+        }
     }
 }

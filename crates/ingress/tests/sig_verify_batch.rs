@@ -1,7 +1,13 @@
 //! The batch verifier's contract: every submitted transaction gets its own
 //! correct answer regardless of how the ring is chunked, and the recovery
 //! work does not run on the async runtime's threads.
+//!
+//! The casts to `f64` here convert small counters and nanosecond
+//! durations for printed rates; none approach the mantissa's precision
+//! limit.
+#![allow(clippy::cast_precision_loss)]
 
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use kardamom_ingress::sig_verify::BatchVerifier;
@@ -15,7 +21,7 @@ mod fixtures {
 
     /// A signed legacy tx (decoded, as the verifier takes it), its RLP
     /// bytes, and the address that signed it.
-    pub fn signed(nonce: u64) -> (AlloyEnvelope, Bytes, Address) {
+    pub(crate) fn signed(nonce: u64) -> (AlloyEnvelope, Bytes, Address) {
         let signer = PrivateKeySigner::random();
         let addr = signer.address();
         let tx = TxLegacy {
@@ -25,7 +31,7 @@ mod fixtures {
             gas_limit: 21_000,
             to: TxKind::Call(Address::ZERO),
             value: U256::ZERO,
-            input: Default::default(),
+            input: Bytes::default(),
         };
         let (sig, rid): (k256::ecdsa::Signature, RecoveryId) = signer
             .credential()
@@ -46,23 +52,26 @@ mod fixtures {
 async fn every_caller_gets_its_own_sender() {
     for n in [1usize, 3, 8, 64, 100, 200] {
         let v = std::sync::Arc::new(BatchVerifier::with_parallelism(
-            64,
+            NonZeroUsize::new(64).unwrap(),
             Duration::from_micros(50),
-            4,
+            NonZeroUsize::new(4).unwrap(),
         ));
         let cases: Vec<_> = (0..n as u64).map(fixtures::signed).collect();
-        let mut handles = Vec::new();
-        for (env, raw, addr) in cases {
-            let v = v.clone();
-            handles.push(tokio::spawn(async move {
-                let (sender, hash) = v.recover(env, raw.clone()).await.unwrap();
-                assert_eq!(sender, addr, "recovered the wrong signer at n={n}");
-                assert_eq!(hash, alloy_primitives::keccak256(raw.as_ref()));
-            }));
-        }
-        for h in handles {
-            h.await.unwrap();
-        }
+        let handles: Vec<_> = cases
+            .into_iter()
+            .map(|(env, raw, addr)| {
+                let v = v.clone();
+                tokio::spawn(async move {
+                    let (sender, hash) = v.recover(env, raw.clone()).await.unwrap();
+                    assert_eq!(sender, addr, "recovered the wrong signer at n={n}");
+                    assert_eq!(hash, alloy_primitives::keccak256(raw.as_ref()));
+                })
+            })
+            .collect();
+        futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .for_each(|result| result.unwrap());
     }
 }
 
@@ -70,9 +79,9 @@ async fn every_caller_gets_its_own_sender() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batched_callers_never_cross_answers() {
     let v = std::sync::Arc::new(BatchVerifier::with_parallelism(
-        8,
+        NonZeroUsize::new(8).unwrap(),
         Duration::from_micros(50),
-        1,
+        NonZeroUsize::new(1).unwrap(),
     ));
     let (good_env, good_raw, good_addr) = fixtures::signed(1);
     let (bad_env, bad_raw, bad_addr) = fixtures::signed(2);
@@ -98,8 +107,12 @@ fn thread_cpu_ns() -> u64 {
         tv_nsec: 0,
     };
     // SAFETY: writes one timespec the C way; no aliasing beyond the call.
-    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut ts) };
+    // Thread CPU time never runs before the epoch, so both fields are
+    // non-negative in practice.
+    #[allow(clippy::cast_sign_loss)]
+    let ns = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+    ns
 }
 
 /// The recovery work must not run on the async runtime's thread.
@@ -111,11 +124,11 @@ fn thread_cpu_ns() -> u64 {
 /// task) runs recovery inline, that CPU lands on this thread and the
 /// count jumps past the bound every time.
 ///
-/// Two calibrations, both learned from CI failures (issue #252):
-/// - Use CPU time, not wall clock. The old timer assert measured the OS
-///   scheduler. On a loaded 2-core host, the OS deschedules the runtime
-///   thread for 1-16 ms with the work fully off-thread. Time spent
-///   descheduled does not add to thread CPU time.
+/// Two present rules:
+/// - Use CPU time, not wall clock. Wall clock measures the OS scheduler.
+///   On a loaded 2-core host, the OS deschedules the runtime thread for
+///   1-16 ms with the work fully off-thread. Time spent descheduled does
+///   not add to thread CPU time.
 /// - Use HALF of this build's own measured inline cost as the bound,
 ///   not a constant. Recovery costs ~10.7 ms in release and ~130 ms in
 ///   debug. The healthy bookkeeping costs ~2 ms and ~5-8 ms. No
@@ -136,9 +149,9 @@ async fn recovery_does_not_block_the_reactor() {
     let bound_ns = inline_cost_ns / 2;
 
     let v = std::sync::Arc::new(BatchVerifier::with_parallelism(
-        64,
+        NonZeroUsize::new(64).unwrap(),
         Duration::from_micros(50),
-        4,
+        NonZeroUsize::new(4).unwrap(),
     ));
     let cpu0 = thread_cpu_ns();
     let mut handles = Vec::new();
@@ -181,36 +194,40 @@ async fn fanning_out_a_full_ring_scales_with_cores() {
     const RING: usize = 256;
 
     let txs: Vec<_> = (0..RING).map(|_| fixtures::signed(0)).collect();
-    let width = std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(1);
+    let width = std::thread::available_parallelism().map_or(NonZeroUsize::new(1).unwrap(), |n| {
+        n.min(NonZeroUsize::new(8).unwrap())
+    });
 
     let mut timings = Vec::new();
-    for parallelism in [1usize, width] {
+    for parallelism in [NonZeroUsize::new(1).unwrap(), width] {
         let v = std::sync::Arc::new(BatchVerifier::with_parallelism(
-            RING,
+            NonZeroUsize::new(RING).unwrap(),
             Duration::from_micros(50),
             parallelism,
         ));
         let start = std::time::Instant::now();
-        let mut handles = Vec::with_capacity(RING);
-        for (env, raw, addr) in txs.iter().cloned() {
-            let v = v.clone();
-            handles.push(tokio::spawn(async move {
-                let (sender, _hash) = v.recover(env, raw).await.expect("recover");
-                assert_eq!(sender, addr, "caller got another transaction's sender");
-            }));
-        }
-        for h in handles {
-            h.await.expect("verify task");
-        }
+        let handles: Vec<_> = txs
+            .iter()
+            .cloned()
+            .map(|(env, raw, addr)| {
+                let v = v.clone();
+                tokio::spawn(async move {
+                    let (sender, _hash) = v.recover(env, raw).await.expect("recover");
+                    assert_eq!(sender, addr, "caller got another transaction's sender");
+                })
+            })
+            .collect();
+        futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .for_each(|result| result.expect("verify task"));
         let elapsed = start.elapsed();
         let rate = RING as f64 / elapsed.as_secs_f64();
         eprintln!("sig-verify ring={RING} parallelism={parallelism}: {elapsed:?} ({rate:.0} tx/s)");
         timings.push(rate);
     }
 
-    if width > 1 {
+    if width.get() > 1 {
         eprintln!(
             "sig-verify fan-out speedup at width {width}: {:.2}x",
             timings[1] / timings[0]

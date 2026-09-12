@@ -16,68 +16,27 @@
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 
-use alloy_rlp::Decodable;
-use kardamom_exec_core::block_env::ExecEnv;
-use kardamom_exec_core::exec_types::TxIndex;
-use kardamom_exec_core::stateless::{BufferedRecord, execute_block_anchored};
-use kardamom_types::{BlockRecordsDigest, ProverInput, ProverRecord, PublicOutputs};
+use kardamom_types::{ProverInput, PublicOutputs};
 
+/// # Panics
+///
+/// Panics (the guest's fail-closed posture) when `input_bytes` fails to
+/// decode as a [`ProverInput`], when the published BAL frame fails to
+/// decode, or when anchored stateless execution fails (identity forgery,
+/// witness incompleteness, or BAL inequality).
 pub fn main() {
     let input_bytes = sp1_zkvm::io::read_vec();
     let input: ProverInput = rkyv::from_bytes::<ProverInput, rkyv::rancor::Error>(&input_bytes)
         .expect("prover input frame");
 
-    let mut digest = BlockRecordsDigest::new(input.boundary.block_number);
-    let records: Vec<BufferedRecord> = input
-        .records
-        .into_iter()
-        .map(|r| match r {
-            ProverRecord::Tx {
-                tx_idx,
-                envelope,
-                position,
-            } => {
-                digest.add_tx(&envelope.raw_tx);
-                BufferedRecord::Tx {
-                    tx_idx: TxIndex(tx_idx),
-                    envelope,
-                    position,
-                }
-            }
-            ProverRecord::Deposit {
-                tx_idx,
-                deposit,
-                position,
-            } => BufferedRecord::Deposit {
-                tx_idx: TxIndex(tx_idx),
-                deposit,
-                position,
-            },
-        })
-        .collect();
-
-    let env = ExecEnv::new(input.chain_id, &input.boundary);
-    let mut bal_slice: &[u8] = &input.bal_rlp;
-    let expected_bal = alloy_eip7928::BlockAccessList::decode(&mut bal_slice)
-        .expect("published BAL frame decodes");
-
-    let anchored = execute_block_anchored(
-        &input.witness,
-        &input.proofs,
-        None,
-        &records,
-        env,
-        &expected_bal,
-        input.granularity,
-    )
-    .expect("anchored stateless execution");
+    let run = kardamom_zk_guest::GuestBlock::run(input);
 
     let outputs = PublicOutputs {
-        pre_state_root: anchored.pre_state_root,
-        post_state_root: anchored.post_state_root,
-        block_number: anchored.block_number,
-        records_digest: digest.finish(),
-        bal_commitment: anchored.bal_commitment,
+        pre_state_root: run.anchored.pre_state_root,
+        post_state_root: run.anchored.post_state_root,
+        block_number: run.anchored.block_number,
+        records_digest: run.records_digest,
+        bal_commitment: run.anchored.bal_commitment,
     };
     sp1_zkvm::io::commit_slice(&outputs.encode());
 }

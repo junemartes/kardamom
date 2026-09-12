@@ -1,45 +1,19 @@
 //! End-to-end latency. The path is: client, proxy, mock executor, receipt.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
-use alloy_primitives::{Address, B256, Bytes, Signature, TxKind, U256};
-use alloy_rlp::Encodable;
+use alloy_primitives::Bytes;
 use alloy_signer_local::PrivateKeySigner;
 use criterion::{Criterion, criterion_group, criterion_main};
-use k256::ecdsa::{RecoveryId, signature::hazmat::PrehashSigner};
 
 use kardamom_ingress::config::IngressConfig;
+use kardamom_ingress::test_support::{sign_legacy, spawn_fake_executor};
 use kardamom_ingress::{IngressProxy, MockChannels};
-use kardamom_types::{BPosition, QuorumWatermark, Receipt};
 
-fn sign(s: &PrivateKeySigner, nonce: u64) -> Bytes {
-    let tx = TxLegacy {
-        chain_id: Some(1),
-        nonce,
-        gas_price: 1_000_000_000,
-        gas_limit: 21_000,
-        to: TxKind::Call(Address::ZERO),
-        value: U256::ZERO,
-        input: Default::default(),
-    };
-    let (sig, rid): (k256::ecdsa::Signature, RecoveryId) = s
-        .credential()
-        .sign_prehash(tx.signature_hash().as_slice())
-        .unwrap();
-    let alloy_sig = Signature::from_signature_and_parity(sig, rid.is_y_odd());
-    let env: TxEnvelope = tx.into_signed(alloy_sig).into();
-    let mut buf = Vec::new();
-    env.encode(&mut buf);
-    Bytes::from(buf)
-}
-
-fn nonce_of(raw: &bytes::Bytes) -> u64 {
-    use alloy_consensus::transaction::Transaction;
-    use alloy_rlp::Decodable;
-    TxEnvelope::decode(&mut raw.as_ref()).unwrap().nonce()
-}
+const SHARDS: NonZeroU32 = NonZeroU32::new(8).unwrap();
+const MOCK_SHARDS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(8).unwrap();
 
 fn bench_e2e_latency(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -50,47 +24,22 @@ fn bench_e2e_latency(c: &mut Criterion) {
 
     let proxy = rt.block_on(async {
         let cfg = IngressConfig {
-            partition_count_m: 8,
+            partition_count_m: SHARDS,
             pending_receipt_timeout: Duration::from_secs(2),
             ..IngressConfig::default()
         };
-        let (mock, mut rx_vec) = MockChannels::new(8);
+        let (mock, rx_vec) = MockChannels::new(MOCK_SHARDS);
         let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
-        for (i, mut rx) in rx_vec.drain(..).enumerate() {
-            let receipt_bus = mock.receipt_bus.clone();
-            let watermark_bus = mock.watermark_bus.clone();
-            tokio::spawn(async move {
-                let mut local: i32 = 0;
-                while let Some(envelope) = rx.recv().await {
-                    local += 1;
-                    let pos = BPosition {
-                        term_id: i as i32,
-                        term_offset: local,
-                    };
-                    let nonce = nonce_of(&envelope.raw_tx);
-                    let receipt = Receipt {
-                        tx_idx: pos,
-                        tx_hash: envelope.tx_hash,
-                        status: true,
-                        gas_used: 21_000,
-                        logs: Vec::new(),
-                        write_set_hash: B256::ZERO,
-                        from: envelope.sender,
-                        nonce,
-                        ..Default::default()
-                    };
-                    let _ = receipt_bus.send(receipt);
-                    let _ = watermark_bus.send(QuorumWatermark { position: pos });
-                }
-            });
-        }
+        // One shared position space across shards, so no receipt parks
+        // above a watermark that a later shard moves backward.
+        let _echo_tasks = spawn_fake_executor(&mock, rx_vec);
         proxy
     });
 
     // Sign 1000 unique-sender txs ahead of time, so signing is not on the
     // hot path.
     let pre: Vec<Bytes> = (0..1000)
-        .map(|_| sign(&PrivateKeySigner::random(), 0))
+        .map(|_| sign_legacy(&PrivateKeySigner::random(), 0))
         .collect();
     let mut idx = 0usize;
 

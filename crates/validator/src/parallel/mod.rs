@@ -1,5 +1,4 @@
-//! Seeded parallel batch re-execution, v3.
-//! See docs/agents/bal-attribution-parallel-validation-spec.md.
+//! Seeded parallel batch re-execution.
 //!
 //! # Why this can run fully in parallel
 //!
@@ -35,9 +34,7 @@ mod engine;
 #[cfg(test)]
 mod engine_tests;
 
-pub use claims::{ClaimIndex, ClaimSlice, batch_ranges};
+pub use claims::{BatchSize, ClaimIndex};
 pub(crate) use dump::{claims_json, records_json};
-pub use engine::{
-    BatchOutcome, BlockOutcome, build_seed, execute_batch, execute_block_parallel,
-    execute_block_parallel_scoped, execute_block_sequential, parallel_block_exec,
-};
+pub(crate) use engine::execute_block_sequential;
+pub use engine::{BlockInputs, ParallelBlockExec, execute_block_parallel, parallel_block_exec};

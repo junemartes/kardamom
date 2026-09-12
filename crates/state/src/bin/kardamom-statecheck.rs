@@ -40,6 +40,21 @@ fn open(dir: &str) -> kardamom_state::StateEnv {
     }
 }
 
+/// Runs [`integrity::sweep`] over `dir`'s already-open `env`, printing the
+/// report, or exits the process on a sweep error. Both the primary
+/// directory and `--compare`'s other directory share this.
+fn sweep_or_exit(dir: &str, env: &kardamom_state::StateEnv) -> integrity::IntegrityReport {
+    let r = match integrity::sweep(env) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("statecheck: sweep {dir}: {e}");
+            std::process::exit(1);
+        }
+    };
+    report(dir, &r);
+    r
+}
+
 fn report(dir: &str, r: &integrity::IntegrityReport) {
     println!(
         "statecheck {dir}: block={} headers={} receipts={} accounts={} slots={} root={}",
@@ -49,45 +64,70 @@ fn report(dir: &str, r: &integrity::IntegrityReport) {
         r.accounts,
         r.storage_slots,
         r.state_root
-            .map(|h| h.to_string())
-            .unwrap_or_else(|| "none".into()),
+            .map_or_else(|| "none".into(), |h| h.to_string()),
     );
     for p in &r.problems {
         println!("statecheck {dir}: PROBLEM: {p}");
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut dir: Option<String> = None;
-    let mut compare: Option<String> = None;
-    let mut expect_root: Option<String> = None;
-    let mut it = args.into_iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--compare" => compare = Some(it.next().unwrap_or_else(|| usage())),
-            "--expect-root" => expect_root = Some(it.next().unwrap_or_else(|| usage())),
+/// Parsed command-line arguments.
+struct Args {
+    dir: String,
+    compare: Option<String>,
+    expect_root: Option<String>,
+}
+
+/// Accumulates [`Args`]'s fields while [`parse_args`] walks the argument
+/// list, so the loop body is one call to [`Self::take`] instead of the
+/// match living inline in the loop.
+#[derive(Default)]
+struct ArgsBuilder {
+    dir: Option<String>,
+    compare: Option<String>,
+    expect_root: Option<String>,
+}
+
+impl ArgsBuilder {
+    /// Consume one argument `a`, pulling its value from `it` when `a` is
+    /// a flag that takes one. Exits the process via [`usage`] on an
+    /// unrecognized or misplaced argument.
+    fn take(&mut self, a: &str, it: &mut impl Iterator<Item = String>) {
+        match a {
+            "--compare" => self.compare = Some(it.next().unwrap_or_else(|| usage())),
+            "--expect-root" => self.expect_root = Some(it.next().unwrap_or_else(|| usage())),
             "--help" | "-h" => usage(),
-            _ if dir.is_none() => dir = Some(a),
+            _ if self.dir.is_none() => self.dir = Some(a.to_string()),
             _ => usage(),
         }
     }
-    let Some(dir) = dir else { usage() };
 
-    let env = open(&dir);
-    let mut failed = false;
-
-    let r = match integrity::sweep(&env) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("statecheck: sweep {dir}: {e}");
-            std::process::exit(1);
+    /// Finish parsing. Exits via [`usage`] if no positional `dir` was
+    /// given.
+    fn build(self) -> Args {
+        let Some(dir) = self.dir else { usage() };
+        Args {
+            dir,
+            compare: self.compare,
+            expect_root: self.expect_root,
         }
-    };
-    report(&dir, &r);
-    failed |= !r.is_clean();
+    }
+}
 
-    if let Some(expect) = expect_root {
+fn parse_args() -> Args {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut it = args.into_iter();
+    let mut parsed = ArgsBuilder::default();
+    while let Some(a) = it.next() {
+        parsed.take(&a, &mut it);
+    }
+    parsed.build()
+}
+
+impl Args {
+    /// Checks the swept report's persisted state root against
+    /// `--expect-root`. Returns true if the comparison found a problem.
+    fn check_root(&self, r: &integrity::IntegrityReport, expect: &str) -> bool {
         let want: alloy_primitives::B256 = match expect.parse() {
             Ok(h) => h,
             Err(e) => {
@@ -96,37 +136,42 @@ fn main() {
             }
         };
         match r.state_root {
-            Some(got) if got == want => println!("statecheck {dir}: root matches {want}"),
+            Some(got) if got == want => {
+                println!("statecheck {}: root matches {want}", self.dir);
+                false
+            }
             Some(got) => {
-                println!("statecheck {dir}: PROBLEM: root {got} != expected {want}");
-                failed = true;
+                println!(
+                    "statecheck {}: PROBLEM: root {got} != expected {want}",
+                    self.dir
+                );
+                true
             }
             None => {
-                println!("statecheck {dir}: PROBLEM: no persisted root to compare");
-                failed = true;
+                println!(
+                    "statecheck {}: PROBLEM: no persisted root to compare",
+                    self.dir
+                );
+                true
             }
         }
     }
 
-    if let Some(other) = compare {
-        let env_b = open(&other);
-        let rb = match integrity::sweep(&env_b) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("statecheck: sweep {other}: {e}");
-                std::process::exit(1);
-            }
-        };
-        report(&other, &rb);
-        failed |= !rb.is_clean();
-        match integrity::deep_compare(&env, &env_b) {
+    /// Sweeps `other`, then runs [`integrity::deep_compare`] against `env`
+    /// (this run's already-open env). Returns true if a problem was found.
+    fn compare_dirs(&self, env: &kardamom_state::StateEnv, other: &str) -> bool {
+        let env_b = open(other);
+        let rb = sweep_or_exit(other, &env_b);
+        let mut failed = !rb.is_clean();
+        match integrity::deep_compare(env, &env_b) {
             Ok(diffs) if diffs.is_empty() => {
-                println!("statecheck: {dir} and {other} hold identical chain state");
+                println!(
+                    "statecheck: {} and {other} hold identical chain state",
+                    self.dir
+                );
             }
             Ok(diffs) => {
-                for d in &diffs {
-                    println!("statecheck: DIFF: {d}");
-                }
+                print_diffs(&diffs);
                 failed = true;
             }
             Err(e) => {
@@ -134,7 +179,33 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        failed
+    }
+}
+
+/// Print every table diff, one line each.
+fn print_diffs(diffs: &[String]) {
+    for d in diffs {
+        println!("statecheck: DIFF: {d}");
+    }
+}
+
+fn main() {
+    let args = parse_args();
+
+    let env = open(&args.dir);
+    let mut failed = false;
+
+    let r = sweep_or_exit(&args.dir, &env);
+    failed |= !r.is_clean();
+
+    if let Some(expect) = &args.expect_root {
+        failed |= args.check_root(&r, expect);
     }
 
-    std::process::exit(if failed { 1 } else { 0 });
+    if let Some(other) = &args.compare {
+        failed |= args.compare_dirs(&env, other);
+    }
+
+    std::process::exit(i32::from(failed));
 }

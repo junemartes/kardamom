@@ -9,13 +9,51 @@
 //!   running" panic. A plain `#[test]` cannot await an async fn. So the
 //!   runtime-less case uses the `Handle` contract inside `init` instead.
 //!
-//! The scrape below uses a raw std TcpStream on purpose, on a blocking
-//! task. It does not use an HTTP client. So the test depends only on the
-//! exporter listener.
+//! The scrape (`common::scrape`) uses a raw std `TcpStream` on purpose, on
+//! a blocking task. It does not use an HTTP client. So the test depends
+//! only on the exporter listener.
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::time::{Duration, Instant};
+mod common;
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+/// Bind port 0 with a throwaway listener, to pick a free port, then run
+/// `kardamom_obs::init` on it. The pick-then-rebind window is racy:
+/// another process can grab the port in between, and the exporter binds
+/// eagerly, so init fails if it does. Retry with a fresh port in that
+/// case. A bind failure happens before the global recorder installs, so
+/// calling init again is safe.
+///
+/// # Panics
+///
+/// Panics if `init` never succeeds within 5 attempts.
+async fn init_on_a_free_port() -> SocketAddr {
+    let mut last_err = None;
+    for _ in 0..5 {
+        match try_init_on_a_free_port().await {
+            Ok(free) => return free,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    panic!(
+        "init never succeeded on a freshly-picked free port: {:#}",
+        last_err.expect("at least one attempt records an error")
+    );
+}
+
+/// One [`init_on_a_free_port`] attempt: pick a free port, then run `init`
+/// on it. Returns the port on success, so the caller does not need to
+/// re-derive it.
+async fn try_init_on_a_free_port() -> anyhow::Result<SocketAddr> {
+    let free: SocketAddr = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    kardamom_obs::init("obs-test", free, "runtime-host", "0.0.0", "deadbeef")
+        .await
+        .map(|()| free)
+}
 
 #[test]
 fn init_and_scrape_on_current_thread_runtime() {
@@ -24,56 +62,14 @@ fn init_and_scrape_on_current_thread_runtime() {
         .build()
         .unwrap();
     rt.block_on(async {
-        // Bind port 0 with a throwaway listener, to pick a free port, then
-        // reuse it. The pick-then-rebind window is racy: another process
-        // can grab the port in between, and the exporter binds eagerly, so
-        // init fails if it does. Retry with a fresh port in that case. A
-        // bind failure happens before the global recorder installs, so
-        // calling init again is safe.
-        let mut free: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let mut last_err = None;
-        for _ in 0..5 {
-            free = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap();
-            match kardamom_obs::init("obs-test", free, "runtime-host", "0.0.0", "deadbeef").await {
-                Ok(()) => {
-                    last_err = None;
-                    break;
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        if let Some(e) = last_err {
-            panic!("init never succeeded on a freshly-picked free port: {e:#}");
-        }
+        let free = init_on_a_free_port().await;
 
         metrics::gauge!("kardamom_obs_test_gauge").set(42.0);
 
         // The listener is bound once init returns; poll briefly for the
         // accept loop to start serving. The scrape blocks, so it runs on a
         // blocking task while this runtime keeps driving the exporter.
-        let body = tokio::task::spawn_blocking(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                match TcpStream::connect(free) {
-                    Ok(mut s) => {
-                        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                        write!(s, "GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
-                        let mut out = String::new();
-                        s.read_to_string(&mut out).unwrap();
-                        break out;
-                    }
-                    Err(_) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(e) => panic!("exporter never came up on {free}: {e}"),
-                }
-            }
-        })
-        .await
-        .unwrap();
+        let body = common::scrape(free, Duration::from_secs(10)).await;
 
         assert!(
             body.contains("kardamom_obs_test_gauge"),

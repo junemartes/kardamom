@@ -25,7 +25,32 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# Only pulled in under the `test-support` feature (below): the crate
+# depends on itself as a dev-dependency with that feature enabled, so
+# `src/lib.rs`'s `test_support` module — signed transfers, a funded-EOA
+# genesis, closed-block builders, and an oracle replay helper — compiles
+# for both this crate's own unit tests and the external
+# `tests/reconstruct_l1_e2e.rs` binary. `cfg(test)` alone only reaches
+# this crate's own tests, not an external integration-test crate.
+alloy-consensus = { workspace = true, optional = true }
+alloy-eips = { workspace = true, features = ["kzg"], optional = true }
+alloy-network = { workspace = true, optional = true }
+alloy-signer-local = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+
+[features]
+test-support = [
+    "dep:alloy-consensus",
+    "dep:alloy-eips",
+    "dep:alloy-network",
+    "dep:alloy-signer-local",
+    "dep:bytes",
+    "dep:tempfile",
+]
+
 [dev-dependencies]
+kardamom-reconstruct = { path = ".", features = ["test-support"] }
 kardamom-deployer = { path = "../deployer" }
 alloy-consensus.workspace = true
 alloy-eips = { workspace = true, features = ["kzg"] }
