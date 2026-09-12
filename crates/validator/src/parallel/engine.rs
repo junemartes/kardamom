@@ -259,26 +259,34 @@ fn verify_units(
     let computed_idx = ClaimIndex::from_alloy(&computed_alloy);
     if granularity.get() == 1 {
         return (first_index..=last_index).try_for_each(|unit| {
-            let claimed = claims.claims_in_range(unit, unit);
-            let mut computed = computed_idx.claims_in_range(unit, unit);
-            computed.drop_wire_deduped(&claimed, claims, unit);
-            if claimed != computed {
-                return Err(ExecutorError::Divergence(format!(
-                    "tx {unit}: {}",
-                    claimed.diff_summary(&computed)
-                )));
-            }
-            Ok(())
+            verify_claim_range(claims, &computed_idx, unit, format!("tx {unit}"))
         });
     }
     let k = std::num::NonZeroU64::from(granularity);
     let chunk = kardamom_engine::bal_ladder::chunk_of(first_index, k);
-    let claimed = claims.claims_in_range(chunk, chunk);
-    let mut computed = computed_idx.claims_in_range(chunk, chunk);
-    computed.drop_wire_deduped(&claimed, claims, chunk);
+    verify_claim_range(
+        claims,
+        &computed_idx,
+        chunk,
+        format!("chunk {chunk} (txs {first_index}..={last_index})"),
+    )
+}
+
+/// Checks one recomputed unit's writes against its wire claim, at `at`
+/// (a tx index, or a chunk index at the block's wire granularity).
+/// Returns [`ExecutorError::Divergence`] naming `label` when they differ.
+fn verify_claim_range(
+    claims: &ClaimIndex,
+    computed_idx: &ClaimIndex,
+    at: u64,
+    label: impl std::fmt::Display,
+) -> Result<(), ExecutorError> {
+    let claimed = claims.claims_in_range(at, at);
+    let mut computed = computed_idx.claims_in_range(at, at);
+    computed.drop_wire_deduped(&claimed, claims, at);
     if claimed != computed {
         return Err(ExecutorError::Divergence(format!(
-            "chunk {chunk} (txs {first_index}..={last_index}): {}",
+            "{label}: {}",
             claimed.diff_summary(&computed)
         )));
     }

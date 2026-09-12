@@ -406,16 +406,25 @@ impl ResyncWiring {
             return Ok((None, None));
         }
         let (requester, rx) = LookupRequester::channel();
-        let task = feeds::NonceLookupFeed::new(cfg.lookup.clone(), cfg.partition_index, floor_tx)
-            .context("nonce lookup: http client build failed")?
-            .spawn(rx, shutdown.clone());
+        let task = feeds::NonceLookupFeed::new(
+            cfg.lookup.clone(),
+            cfg.partition_index,
+            rx,
+            shutdown.clone(),
+            floor_tx,
+        )
+        .context("nonce lookup: http client build failed")?
+        .spawn();
         Ok((Some(requester), Some(task)))
     }
 }
 
-/// The three publish-loop handles, plus the cluster session guard they
-/// depend on.
+/// The three publish-loop handles, the guard that signals shutdown to
+/// them, and the cluster session guard they depend on.
 struct SpawnedLoops {
+    /// Dropping this signals every loop to stop; see
+    /// [`Self::join_all`].
+    stop: tokio_util::sync::DropGuard,
     #[allow(
         dead_code,
         reason = "never read; kept alive until join_all returns for its Drop impl (see SpawnedLoops::join_all)"
@@ -438,12 +447,16 @@ impl SpawnedLoops {
         }
     }
 
-    /// Await every publish loop, in order, then let `cluster_guard` fall
-    /// out of scope. This also closes the egress channel, which unblocks
-    /// the watermark feed. The feed also checks the shutdown token on
-    /// each tick. The receipts task exits on the token, or on the closed
-    /// floor channel after the main loop ends.
+    /// Signal shutdown, then await every publish loop, in order, then let
+    /// `cluster_guard` fall out of scope. This also closes the egress
+    /// channel, which unblocks the watermark feed. The feed also checks
+    /// the shutdown token on each tick. The receipts task exits on the
+    /// token, or on the closed floor channel after the main loop ends.
     async fn join_all(self) {
+        // The block scope ends the guard, which signals every loop.
+        {
+            let _signal = self.stop;
+        }
         Self::join_one(self.main, "main loop", "task").await;
         Self::join_one(self.deposits, "epoch pump", "epoch task").await;
         Self::join_one(self.remote_epochs, "remote-epoch pump", "remote-epoch task").await;
@@ -568,6 +581,7 @@ async fn main() -> anyhow::Result<()> {
     }
     .spawn();
     let loops = SpawnedLoops {
+        stop: shutdown.guard(),
         cluster_guard,
         main: join_main,
         deposits: join_deposits,
@@ -576,12 +590,12 @@ async fn main() -> anyhow::Result<()> {
 
     wait_for_shutdown().await;
     tracing::info!("kardamom-sequencer: shutdown signal received");
-    shutdown.signal();
-    // The cluster session (`cluster_guard`) stays alive until every
-    // publish loop has stopped; `join_all` drops it as soon as it
-    // returns. `resync.feeds.join()` then awaits the two resync feed
-    // tasks and, when it returns, drops `rt` — before `receipts_rt`,
-    // still a local here, drops at the end of `main`.
+    // `join_all` signals the loops, then joins them. The cluster session
+    // (`cluster_guard`) stays alive until every publish loop has
+    // stopped; `join_all` drops it as soon as it returns.
+    // `resync.feeds.join()` then awaits the two resync feed tasks and,
+    // when it returns, drops `rt` — before `receipts_rt`, still a local
+    // here, drops at the end of `main`.
     loops.join_all().await;
     resync.feeds.join().await;
     Ok(())
