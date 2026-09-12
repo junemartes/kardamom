@@ -12,6 +12,30 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+/// Ask the kernel to `SIGKILL` this child when the parent dies, and
+/// guard against the race where the parent already died before this
+/// call runs.
+///
+/// Runs as a `pre_exec` hook: between `fork` and `exec`, in the child,
+/// before any other code.
+#[cfg(target_os = "linux")]
+fn set_pdeathsig() -> std::io::Result<()> {
+    // SAFETY: `prctl`, `getppid`, and `raise` are each one
+    // async-signal-safe syscall, the only kind of call allowed here.
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Guard against the race where the parent died between fork and
+        // here. Without this check, the child would keep running with no
+        // signal pending, exactly the leak PDEATHSIG exists to prevent.
+        if libc::getppid() == 1 {
+            libc::raise(libc::SIGKILL);
+        }
+        Ok(())
+    }
+}
+
 /// A supervised child process. This is killed (SIGKILL) and reaped on
 /// drop, so a panicking test never leaks JVMs or service binaries.
 pub struct Proc {
@@ -40,23 +64,13 @@ impl Proc {
             .with_context(|| format!("create log file {}", log_path.display()))?;
         let log_err = log.try_clone().context("clone log handle")?;
         #[cfg(target_os = "linux")]
-        unsafe {
+        {
             use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
-                // SAFETY: this is one async-signal-safe syscall, the only kind
-                // of call allowed between fork and exec.
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // Guard against the race where the parent died between fork
-                // and here. Without this check, the child would keep
-                // running with no signal pending, exactly the leak
-                // PDEATHSIG exists to prevent.
-                if libc::getppid() == 1 {
-                    libc::raise(libc::SIGKILL);
-                }
-                Ok(())
-            });
+            // SAFETY: `pre_exec` runs `set_pdeathsig` between fork and exec,
+            // in the child, before any other code.
+            unsafe {
+                cmd.pre_exec(set_pdeathsig);
+            }
         }
         let child = cmd
             .stdin(Stdio::null())

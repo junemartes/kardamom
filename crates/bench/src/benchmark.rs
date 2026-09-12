@@ -171,18 +171,14 @@ impl<W: BenchWorkflow> Benchmark<W> {
         let client = Arc::clone(client);
         let workflow = Arc::clone(workflow);
         let timeout = self.timeout;
-        let mut counts = TaskCounts {
+        let counts = TaskCounts {
             ok: 0,
             err: 0,
             histograms: empty_histograms(methods)?,
         };
-        Ok(tokio::spawn(async move {
-            tokio::select! {
-                () = counts.send_all(&*workflow, &client, work) => {}
-                () = tokio::time::sleep(timeout) => {}
-            }
-            counts
-        }))
+        Ok(tokio::spawn(
+            counts.race_send_all(workflow, client, work, timeout),
+        ))
     }
 
     /// Stage 3: the measured window. This method spawns one sender task
@@ -307,6 +303,26 @@ struct TaskCounts {
 }
 
 impl TaskCounts {
+    /// Race [`Self::send_all`] against `timeout`, and return `self`
+    /// either way.
+    ///
+    /// A timeout drops only the in-flight `send_all` future; every
+    /// result already folded into `self` survives and is still
+    /// returned.
+    async fn race_send_all<W: BenchWorkflow>(
+        mut self,
+        workflow: Arc<W>,
+        client: Arc<HttpClient>,
+        work: Vec<W::Item>,
+        timeout: Duration,
+    ) -> Self {
+        tokio::select! {
+            () = self.send_all(&*workflow, &client, work) => {}
+            () = tokio::time::sleep(timeout) => {}
+        }
+        self
+    }
+
     /// Send every item in `work`, in order, one request in flight at a
     /// time, and fold each result into `self`.
     ///
