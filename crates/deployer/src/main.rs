@@ -118,7 +118,7 @@ enum Command {
         #[arg(long = "l2-chain-id")]
         l2_chain_id: Option<u64>,
 
-        /// Restrict results to a named contract, for example KardamomL2Settlement.
+        /// Restrict results to a named contract, for example `KardamomL2Settlement`.
         #[arg(long)]
         contract: Option<String>,
 
