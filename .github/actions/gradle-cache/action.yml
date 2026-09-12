@@ -1,0 +1,17 @@
+---
+name: gradle-cache
+description: >-
+  Restore the Gradle dependency cache that rusteron's build script fills
+  when it builds the Aeron C library. With the cache, a Maven Central
+  outage does not fail a job whose rust cache missed.
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: gradle-rusteron-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          gradle-rusteron-${{ runner.os }}-
