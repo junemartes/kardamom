@@ -39,6 +39,7 @@ pub(crate) fn tx(
         value,
         gas_limit: 300_000,
         gas_price: 0,
+        ..Default::default()
     }
     .sign(signer);
     BufferedRecord::Tx {

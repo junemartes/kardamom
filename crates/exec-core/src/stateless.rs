@@ -410,37 +410,19 @@ fn first_bal_difference(
 mod tests {
     use super::*;
     use alloy_primitives::{Address, B256};
+    use kardamom_test_support::{LegacyTx, anvil_signer_0};
 
     // A well-formed envelope for identity tests. It is signed with
     // anvil's dev key #0, which is public and for development only.
     fn honest_envelope() -> TxEnvelope {
-        use alloy_consensus::{SignableTransaction, TxLegacy};
-        use alloy_eips::eip2718::Encodable2718;
-        use alloy_network::TxSignerSync;
-        use alloy_signer_local::PrivateKeySigner;
-        let signer: PrivateKeySigner =
-            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-                .parse()
-                .unwrap();
-        let mut tx = TxLegacy {
-            chain_id: Some(412_346),
-            nonce: 0,
+        LegacyTx {
+            chain_id: 412_346,
+            to: Address::repeat_byte(0xdd),
+            value: 1,
             gas_price: 1_000_000_000,
-            gas_limit: 21_000,
-            to: alloy_primitives::TxKind::Call(Address::repeat_byte(0xdd)),
-            value: alloy_primitives::U256::from(1u64),
-            input: alloy_primitives::Bytes::default(),
-        };
-        let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-        let env = alloy_consensus::TxEnvelope::Legacy(tx.into_signed(sig));
-        let mut raw = Vec::new();
-        env.encode_2718(&mut raw);
-        TxEnvelope {
-            correlation_id: 0,
-            raw_tx: bytes::Bytes::from(raw),
-            sender: signer.address(),
-            tx_hash: *env.tx_hash(),
+            ..Default::default()
         }
+        .sign(&anvil_signer_0())
     }
 
     #[test]

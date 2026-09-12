@@ -42,11 +42,10 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
-# Only needed to sign a `LegacyTx` test fixture; optional, behind
-# `test-support`, so a production build of this crate never links a
-# signer.
-alloy-network = { workspace = true, optional = true }
-alloy-signer-local = { workspace = true, optional = true }
+# The signed-legacy-tx fixture `actor::fixtures` re-exports. Optional,
+# behind `test-support`, so a production build of this crate never links
+# a signer.
+kardamom-test-support = { workspace = true, optional = true }
 
 [features]
 # Exposes `actor::fixtures` (the signed-legacy-tx builder and the
@@ -54,9 +53,10 @@ alloy-signer-local = { workspace = true, optional = true }
 # another crate (`kardamom-validator`, `kardamom-executor`) can reach it
 # instead of copying it. Off by default: a production build never
 # compiles test fixtures in.
-test-support = ["dep:alloy-network", "dep:alloy-signer-local"]
+test-support = ["dep:kardamom-test-support"]
 
 [dev-dependencies]
+kardamom-test-support = { workspace = true }
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 alloy-signer-local.workspace = true
