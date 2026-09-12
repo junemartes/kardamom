@@ -107,15 +107,19 @@ pub fn serve_checkpoints(
     let listener = TcpListener::from_std(std_listener)?;
     let addr = listener.local_addr()?;
     info!(%addr, dir = %checkpoints_dir.display(), "serving checkpoints to peers");
-    let task = tokio::spawn(async move {
-        loop {
-            let Some(stream) = accept_logged(&listener).await else {
-                continue;
-            };
-            spawn_serve(stream, checkpoints_dir.clone());
-        }
-    });
+    let task = tokio::spawn(accept_forever(listener, checkpoints_dir));
     Ok(CheckpointServer { addr, task })
+}
+
+/// Accept connections forever, and serve each one on its own task. An
+/// accept error is logged and skipped, so the loop never ends.
+async fn accept_forever(listener: TcpListener, checkpoints_dir: PathBuf) {
+    loop {
+        let Some(stream) = accept_logged(&listener).await else {
+            continue;
+        };
+        spawn_serve(stream, checkpoints_dir.clone());
+    }
 }
 
 /// Accept one connection, logging and swallowing an accept error instead
@@ -395,16 +399,16 @@ impl<'a> CheckpointFetch<'a> {
         let mut head = String::new();
         loop {
             match self.read_head_line(&mut head)? {
-                HeadLine::Done => break,
-                HeadLine::TooLarge => {
-                    return Err(StateError::Recovery(
-                        "checkpoint peer response head too large".into(),
-                    ));
-                }
-                HeadLine::More => {}
+                HeadLine::Done => return Ok(head),
+                HeadLine::TooLarge => return Err(Self::head_too_large()),
+                HeadLine::More => (),
             }
         }
-        Ok(head)
+    }
+
+    /// The error that ends a response head longer than [`MAX_HEAD`].
+    fn head_too_large() -> StateError {
+        StateError::Recovery("checkpoint peer response head too large".into())
     }
 
     /// Read one line into `head`. `Done` at the blank line or EOF that
