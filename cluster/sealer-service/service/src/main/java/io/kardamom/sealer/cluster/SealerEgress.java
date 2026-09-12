@@ -148,9 +148,10 @@ final class SealerEgress {
      * consumers to freeze at their first record. Correctness matters more
      * than the leader-stall optimization that change was after. In
      * practice, the stall stays small: a wedged consumer costs one
-     * {@link #OFFER_DEADLINE_NS} on its first frame and is then closed
-     * (later offers return CLOSED and are skipped right away), and healthy
-     * consumers drain retained frames at line rate.</p>
+     * {@link #OFFER_DEADLINE_NS} on its first frame and is then closed.
+     * The close is asynchronous, so the offer loop skips the session while
+     * it is closing; the offer itself never returns CLOSED in that window.
+     * Healthy consumers drain retained frames at line rate.</p>
      */
     void handleReplayRequest(
             final ClientSession session,
