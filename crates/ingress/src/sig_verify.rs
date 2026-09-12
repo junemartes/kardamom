@@ -89,8 +89,14 @@ fn next_request(
 /// average), so this is the common path.
 const PARALLEL_THRESHOLD: usize = 4;
 
+/// Intake capacity, as a multiple of the ring depth. A full intake
+/// makes `recover` wait, so overload turns into backpressure on the RPC
+/// handlers instead of unbounded queue growth. Four rings of slack
+/// absorb a burst while one batch is on the blocking pool.
+const INTAKE_RINGS: usize = 4;
+
 pub struct BatchVerifier {
-    tx: mpsc::UnboundedSender<VerifyRequest>,
+    tx: mpsc::Sender<VerifyRequest>,
     _flush_task: JoinHandle<()>,
 }
 
@@ -102,7 +108,7 @@ pub struct BatchVerifier {
 /// inside a loop, means neither loop's body needs to thread the other's
 /// state through as loose parameters.
 struct FlushLoop {
-    rx: mpsc::UnboundedReceiver<VerifyRequest>,
+    rx: mpsc::Receiver<VerifyRequest>,
     depth: NonZeroUsize,
     flush_window: Duration,
     parallelism: NonZeroUsize,
@@ -185,7 +191,7 @@ impl BatchVerifier {
         flush_window: Duration,
         parallelism: NonZeroUsize,
     ) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(depth.get().saturating_mul(INTAKE_RINGS));
         let flush_task = tokio::spawn(
             FlushLoop {
                 rx,
@@ -266,7 +272,9 @@ impl BatchVerifier {
     }
 
     /// Submits a tx envelope, with its raw bytes, and awaits
-    /// `(sender, tx_hash)`.
+    /// `(sender, tx_hash)`. When the intake is full, this waits for a
+    /// slot, so an overloaded verifier slows its callers down instead of
+    /// growing a queue without bound.
     ///
     /// # Errors
     ///
@@ -284,6 +292,7 @@ impl BatchVerifier {
                 raw_tx,
                 respond: tx,
             })
+            .await
             .map_err(|_| IngressError::Internal("verifier dropped".into()))?;
         rx.await
             .map_err(|_| IngressError::Internal("verifier dropped".into()))?
