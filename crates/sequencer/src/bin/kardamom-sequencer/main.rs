@@ -406,9 +406,15 @@ impl ResyncWiring {
             return Ok((None, None));
         }
         let (requester, rx) = LookupRequester::channel();
-        let task = feeds::NonceLookupFeed::new(cfg.lookup.clone(), cfg.partition_index, floor_tx)
-            .context("nonce lookup: http client build failed")?
-            .spawn(rx, shutdown.clone());
+        let task = feeds::NonceLookupFeed::new(
+            cfg.lookup.clone(),
+            cfg.partition_index,
+            rx,
+            shutdown.clone(),
+            floor_tx,
+        )
+        .context("nonce lookup: http client build failed")?
+        .spawn();
         Ok((Some(requester), Some(task)))
     }
 }

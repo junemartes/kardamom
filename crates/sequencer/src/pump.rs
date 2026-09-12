@@ -6,7 +6,9 @@
 //! publish call, and whether a metric fires after a successful publish.
 //! [`Pump::step`] takes those three lane-specific pieces as parameters and
 //! owns the one piece of state every lane shares: the record popped off
-//! the subscription but not yet accepted by the cluster.
+//! the subscription but not yet accepted by the cluster. Each lane's
+//! record type implements [`OriginLane`] on its `Pump<T>` to name those
+//! three pieces once.
 
 use kardamom_types::BPosition;
 
@@ -18,6 +20,21 @@ use crate::error::SequencerError;
 pub struct Held<T> {
     pub pos: BPosition,
     pub record: T,
+}
+
+/// One origin lane's relay step: poll one record off `sub` and publish it
+/// through `publ`, with the one-slot retry state on `self`. Implemented
+/// once per record type on [`Pump<T>`].
+pub trait OriginLane<S, P> {
+    /// Relay one record. Returns `Ok(true)` if a record was processed,
+    /// `Ok(false)` if the subscription was idle and nothing was held.
+    ///
+    /// # Errors
+    ///
+    /// Returns the subscription's error if the poll fails, or the
+    /// publisher's error (including [`SequencerError::Backpressure`]) if
+    /// the publish fails.
+    fn relay(&mut self, sub: &mut S, publ: &mut P) -> Result<bool, SequencerError>;
 }
 
 /// Single-step origin-advancing pump. Owns the one-slot retry state

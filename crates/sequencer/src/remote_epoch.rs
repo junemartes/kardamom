@@ -31,7 +31,7 @@ use kardamom_types::xchain::RemoteEpochRecord;
 
 use crate::error::SequencerError;
 use crate::outbound::TxOrderingRefPublisher;
-use crate::pump::Pump;
+use crate::pump::{OriginLane, Pump};
 
 /// Subscription surface the remote-epoch pump reads from. Production wiring
 /// binds this to `kardamom_log`'s `TxRemoteEpochsSubscriberHandle`; tests use
@@ -56,48 +56,39 @@ impl RemoteEpochSubscriber for TxRemoteEpochsSubscriberHandle {
     }
 }
 
-/// Single-step remote-epoch pump: take the held record if there is one,
-/// else pull one record off the subscription, and forward it on
-/// `tx_ordering`. Returns `Ok(true)` if a record was processed (caller
-/// should keep going), `Ok(false)` if the subscription is idle.
+/// The remote-epoch lane: take the held record if there is one, else
+/// pull one record off the subscription, and forward it on
+/// `tx_ordering`.
 ///
-/// On `SequencerError::Backpressure` the record goes into `pump`'s held
-/// slot, and the next call retries the SAME record before it polls for a
-/// new one. The poll is destructive (`try_recv`), so without this slot a
+/// On `SequencerError::Backpressure` the record goes into the held slot,
+/// and the next call retries the SAME record before it polls for a new
+/// one. The poll is destructive (`try_recv`), so without this slot a
 /// backpressured record would be lost. The watcher persists its cursor
 /// after the media-driver ack, so it would never re-publish the record,
-/// and the pair's lane would have a permanent hole.
-/// `Backpressure` includes "not connected", so a leader election would
-/// otherwise drain every sequencer's backlog at once.
+/// and the pair's lane would have a permanent hole. `Backpressure`
+/// includes "not connected", so a leader election would otherwise drain
+/// every sequencer's backlog at once.
 ///
 /// This is [`Pump::step`] with an `on_relayed` hook that bumps the
-/// relayed-record metric (unlike epochs, see
-/// [`crate::epoch::process_epoch`], which have no such metric).
-///
-/// # Errors
-///
-/// Returns the subscription's error if the poll fails, or the
-/// publisher's error (including [`SequencerError::Backpressure`]) if the
-/// publish fails.
-pub fn process_remote_epoch<S, P>(
-    sub: &mut S,
-    b: &mut P,
-    pump: &mut Pump<RemoteEpochRecord>,
-) -> Result<bool, SequencerError>
+/// relayed-record metric (unlike epochs, see [`crate::epoch`], which
+/// have no such metric).
+impl<S, P> OriginLane<S, P> for Pump<RemoteEpochRecord>
 where
     S: RemoteEpochSubscriber,
     P: TxOrderingRefPublisher,
 {
-    pump.step(
-        || sub.poll(),
-        |record| b.try_publish_remote_epoch(record),
-        |record| {
-            crate::metrics::record_remote_epoch_relayed(
-                record.origin_chain_id,
-                record.messages.len().get(),
-            );
-        },
-    )
+    fn relay(&mut self, sub: &mut S, publ: &mut P) -> Result<bool, SequencerError> {
+        self.step(
+            || sub.poll(),
+            |record| publ.try_publish_remote_epoch(record),
+            |record| {
+                crate::metrics::record_remote_epoch_relayed(
+                    record.origin_chain_id,
+                    record.messages.len().get(),
+                );
+            },
+        )
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -158,7 +149,7 @@ mod tests {
         let r = record(412_346, 7, 3);
         sub.push(BPosition::default(), r.clone());
 
-        assert!(process_remote_epoch(&mut sub, &mut pubr, &mut Pump::default()).unwrap());
+        assert!(Pump::default().relay(&mut sub, &mut pubr).unwrap());
 
         let got = pubr.remote_epochs.lock().unwrap();
         assert_eq!(got.len(), 1);
@@ -177,7 +168,7 @@ mod tests {
         sub.push(BPosition::default(), record(412_346, 1, 1));
 
         for _ in 0..3 {
-            assert!(process_remote_epoch(&mut sub, &mut pubr, &mut Pump::default()).unwrap());
+            assert!(Pump::default().relay(&mut sub, &mut pubr).unwrap());
         }
         let got = pubr.remote_epochs.lock().unwrap();
         assert_eq!(
@@ -191,10 +182,6 @@ mod tests {
     /// contract every `ScriptedQueue<T>`-backed pump shares.
     #[test]
     fn remote_epoch_pump_honors_the_shared_contract() {
-        crate::fakes::pump_contract::run(
-            &record(412_346, 2, 1),
-            &record(412_346, 3, 2),
-            process_remote_epoch,
-        );
+        crate::fakes::pump_contract::run(&record(412_346, 2, 1), &record(412_346, 3, 2));
     }
 }
