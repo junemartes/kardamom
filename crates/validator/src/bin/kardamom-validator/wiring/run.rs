@@ -313,7 +313,7 @@ impl Ready {
         } = self;
 
         let join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
-            Executor::run::<ValidatorWiring>(
+            Executor::<ValidatorWiring>::new(
                 cfg,
                 inbound,
                 Outbound {
@@ -337,6 +337,7 @@ impl Ready {
                     remote_epoch_observer,
                 },
             )
+            .run()
         });
 
         Running {

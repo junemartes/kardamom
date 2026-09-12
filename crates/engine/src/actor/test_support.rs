@@ -23,8 +23,8 @@ use crate::reader::{NoEpochCheck, NoRemoteEpochCheck, ReaderToExec, RemoteEpochO
 use crate::state::MockStateDatabase;
 
 use super::{
-    BalHandoff, BlockExecStrategy, ExecHooks, ExecInputs, ExecPorts, ExecToCommit, ExecutorConfig,
-    NoBlockExec, ResumePoint, StateWriterQueue, StateWriterSignal, spawn_exec,
+    BalHandoff, BlockExecStrategy, ExecHooks, ExecInputs, ExecPorts, ExecState, ExecToCommit,
+    ExecutorConfig, NoBlockExec, ResumePoint, StateWriterQueue, StateWriterSignal,
 };
 
 pub(super) fn pos(off: i32) -> BPosition {
@@ -236,7 +236,7 @@ pub(super) fn remote_epoch_records(record: RemoteEpochRecord) -> Vec<ReaderToExe
 
 /// Feed `records` into a fresh unbounded channel, then close the sender.
 /// This is the reader-to-exec handoff shape every exec test drives: every
-/// record is queued before `spawn_exec` starts, and the closed sender
+/// record is queued before `ExecState::spawn` starts, and the closed sender
 /// signals end-of-stream once the exec thread drains them.
 pub(super) fn feed(records: Vec<ReaderToExec>) -> Receiver<ReaderToExec> {
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -247,7 +247,7 @@ pub(super) fn feed(records: Vec<ReaderToExec>) -> Receiver<ReaderToExec> {
 }
 
 /// Same as [`feed`], for the exec-to-commit channel: queue every message,
-/// then close the sender, so `spawn_commit` sees a clean end of stream
+/// then close the sender, so `CommitLoop` sees a clean end of stream
 /// after draining them.
 pub(super) fn feed_commits(messages: Vec<ExecToCommit>) -> Receiver<ExecToCommit> {
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -266,7 +266,7 @@ const RIG_COMMIT_CAPACITY: usize = 128;
 
 /// The exec-only port bundle every `ExecRig` names as its `W: ExecPorts`.
 /// A zero-sized marker: `ExecRig` owns the actual port values, this type
-/// only carries their types through to `spawn_exec`. Epoch checking is
+/// only carries their types through to `ExecState::spawn`. Epoch checking is
 /// always [`NoEpochCheck`], since no test in this crate supplies a
 /// non-trivial epoch observer.
 struct TestPorts<S, Q, P, R, B>(std::marker::PhantomData<(S, Q, P, R, B)>);
@@ -287,7 +287,7 @@ where
     type BlockExec = B;
 }
 
-/// Builder for `spawn_exec`'s test fixtures. Every exec test wires the same
+/// Builder for `ExecState::spawn`'s test fixtures. Every exec test wires the same
 /// twelve-argument call, with nine of the twelve almost always `None`. This
 /// collects them: `cfg` is always `ExecutorConfig::default()` and `start`
 /// is always `ResumePoint::GENESIS` in every current test, so both start
@@ -423,7 +423,7 @@ where
         Receiver<ExecToCommit>,
     ) {
         let rx_e2c = self.rx_e2c;
-        let h = spawn_exec::<TestPorts<S, Q, P, R, B>>(ExecInputs {
+        let h = ExecState::<TestPorts<S, Q, P, R, B>>::spawn(ExecInputs {
             cfg: ExecutorConfig::default(),
             rx,
             tx: self.tx_e2c,

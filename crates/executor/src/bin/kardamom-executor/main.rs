@@ -123,7 +123,7 @@ fn spawn_writer_and_bal(
     // thread hands each block's tx captures to a grading thread
     // (measurement only; execution stays sequential). It is `None`
     // when the env flag is unset, for zero cost.
-    let footprint_shadow = kardamom_engine::shadow::spawn_from_env();
+    let footprint_shadow = kardamom_engine::shadow::Shadow::spawn_from_env();
 
     Ok(WriterAdapters {
         writer,
@@ -284,7 +284,7 @@ async fn main() -> Result<()> {
     // Run it inside spawn_blocking so the runtime stays responsive for
     // shutdown handling.
     let join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
-        Executor::run::<ExecutorWiring>(
+        Executor::<ExecutorWiring>::new(
             cfg,
             Inbound {
                 tx_data: tx_data_subs,
@@ -317,6 +317,7 @@ async fn main() -> Result<()> {
                 remote_epoch_observer: None,
             },
         )
+        .run()
     });
 
     let engine_error = run_engine(rt, cluster_guard, shutdown, join).await;

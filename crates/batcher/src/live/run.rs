@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use kardamom_engine::bin_support;
 use kardamom_engine::reader::{
-    JoinBuffer, ReaderConfig, ReaderToExec, spawn_tx_data_reader, spawn_tx_ordering_reader,
+    JoinBuffer, ReaderConfig, ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader,
 };
 use kardamom_engine::{ExecutorError, TxIndex};
 use kardamom_log::aeron_live::AeronRuntime;
@@ -191,7 +191,7 @@ impl RunConfig {
         let join_buffer = JoinBuffer::new();
         let join_handles = tx_data_subs
             .into_iter()
-            .map(|sub| spawn_tx_data_reader(sub, join_buffer.clone()))
+            .map(|sub| TxDataReader::new(sub, join_buffer.clone()).spawn())
             .collect();
         // There is no tx_deposits reader. Deposits ride inside the epoch
         // record on the canonical stream, so there is nothing to join
@@ -208,14 +208,14 @@ impl RunConfig {
             join_timeout: bin_support::bounded_join_timeout(cursor.next_index > 0),
             ..ReaderConfig::default()
         };
-        let ordering_handle = spawn_tx_ordering_reader(
-            tx_ordering_sub,
-            join_buffer,
-            reader_cfg,
-            feed_tx,
-            TxIndex(cursor.next_index),
-            join_recovery,
-        );
+        let ordering_handle = TxOrderingReader::spawn(TxOrderingInputs {
+            sub: tx_ordering_sub,
+            buffer: join_buffer,
+            cfg: reader_cfg,
+            exec_out: feed_tx,
+            start_tx_idx: TxIndex(cursor.next_index),
+            recovery_factory: join_recovery,
+        });
 
         Ok(ReaderStack {
             handles: ReaderHandles {

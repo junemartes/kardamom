@@ -378,7 +378,7 @@ fn spawn_m_plus_one_executor(
     });
 
     let join = thread::spawn(move || {
-        Executor::run::<Wiring>(
+        Executor::<Wiring>::new(
             cfg,
             Inbound {
                 tx_data: tx_data_subs,
@@ -394,6 +394,7 @@ fn spawn_m_plus_one_executor(
             ResumePoint::GENESIS,
             RoleHooks::none(),
         )
+        .run()
     });
 
     RunHandles { c_rx, join }

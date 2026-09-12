@@ -255,7 +255,7 @@ impl ChannelHarness {
             rx: a_rx,
         }];
         let h = thread::spawn(move || -> Result<(), crate::ExecutorError> {
-            crate::Executor::run::<HarnessWiring>(
+            crate::Executor::<HarnessWiring>::new(
                 cfg,
                 crate::Inbound {
                     tx_data: tx_data_subs,
@@ -271,6 +271,7 @@ impl ChannelHarness {
                 crate::ResumePoint::GENESIS,
                 crate::RoleHooks::none(),
             )
+            .run()
         });
 
         let receipts: Vec<_> =

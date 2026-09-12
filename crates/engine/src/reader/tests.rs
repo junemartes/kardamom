@@ -132,7 +132,14 @@ fn run_ordering(
         queue: VecDeque::from(queue),
     };
     let (tx, rx) = bounded::<ReaderToExec>(8);
-    let h = spawn_tx_ordering_reader(b, buf, cfg, tx, TxIndex::ZERO, None);
+    let h = TxOrderingReader::spawn(TxOrderingInputs {
+        sub: b,
+        buffer: buf,
+        cfg,
+        exec_out: tx,
+        start_tx_idx: TxIndex::ZERO,
+        recovery_factory: None,
+    });
     h.join().expect("no panic")?;
     Ok(drain(&rx))
 }
@@ -148,7 +155,7 @@ fn channel_a_reader_drains_into_buffer() {
             Ok((loc(100), envelope(&signer, 1))),
         ]),
     };
-    let h = spawn_tx_data_reader(a, buf.clone());
+    let h = TxDataReader::new(a, buf.clone()).spawn();
     h.join().expect("no panic").expect("ok");
     assert_eq!(buf.len(), 2);
     assert!(buf.take(TxDataKey::new(3, 0, pos(0))).is_some());
@@ -416,7 +423,14 @@ fn channel_b_reader_tolerates_a_publisher_lag() {
         ))]),
     };
     let (tx, rx) = bounded::<ReaderToExec>(2);
-    let h = spawn_tx_ordering_reader(b, buf, cfg, tx, TxIndex::ZERO, None);
+    let h = TxOrderingReader::spawn(TxOrderingInputs {
+        sub: b,
+        buffer: buf,
+        cfg,
+        exec_out: tx,
+        start_tx_idx: TxIndex::ZERO,
+        recovery_factory: None,
+    });
     h.join().expect("no panic").expect("ok");
     a_inserter.join().unwrap();
 
@@ -563,7 +577,8 @@ fn reader_joins_two_sessions_at_same_position() {
             Ok((TxDataLoc::new(200, pos(0)), env_b.clone())),
         ]),
     };
-    spawn_tx_data_reader(a, buf.clone())
+    TxDataReader::new(a, buf.clone())
+        .spawn()
         .join()
         .expect("no panic")
         .expect("ok");
