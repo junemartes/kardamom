@@ -40,9 +40,19 @@ pub struct Alloc {
     pub node_name: String,
     #[serde(rename = "NodeID")]
     pub node_id: String,
-    /// Keyed by task name. The log endpoint needs the task name.
-    #[serde(rename = "TaskStates", default)]
+    /// Keyed by task name. The log endpoint needs the task name. A
+    /// pending allocation the client has not started yet lists an
+    /// explicit `null` here, which `default` alone does not cover.
+    #[serde(rename = "TaskStates", default, deserialize_with = "null_as_empty")]
     pub task_states: BTreeMap<String, serde_json::Value>,
+}
+
+/// Decode a map field whose value may be JSON `null` as an empty map.
+fn null_as_empty<'de, D>(d: D) -> Result<BTreeMap<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<BTreeMap<String, serde_json::Value>>::deserialize(d).map(Option::unwrap_or_default)
 }
 
 impl Alloc {
@@ -324,10 +334,16 @@ mod tests {
         let body = r#"[{"ID":"788914fb-2aa0","TaskGroup":"executor","ClientStatus":"running",
             "NodeName":"executor-2","NodeID":"2d99","TaskStates":{"executor":{"State":"running"}}},
             {"ID":"35f2b819-1111","TaskGroup":"executor","ClientStatus":"complete",
-            "NodeName":"executor-1","NodeID":"3653","TaskStates":{}}]"#;
+            "NodeName":"executor-1","NodeID":"3653","TaskStates":{}},
+            {"ID":"0f89a7f1-2222","TaskGroup":"executor","ClientStatus":"pending",
+            "NodeName":"executor-1","NodeID":"3653","TaskStates":null}]"#;
         let allocs: Vec<Alloc> = serde_json::from_str(body).unwrap();
         assert_eq!(allocs.iter().filter(|a| a.is_running()).count(), 1);
         assert_eq!(allocs[0].short_id(), "788914fb");
         assert_eq!(allocs[0].task_states.keys().next().unwrap(), "executor");
+        assert!(
+            allocs[2].task_states.is_empty(),
+            "a pending alloc has no task states"
+        );
     }
 }
