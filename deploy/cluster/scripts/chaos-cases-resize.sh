@@ -115,38 +115,122 @@ group_is_gone() { [ "$(count_running_group "$1" "$2")" = "0" ] && echo ok; }
 # executor addresses are blackholed. Lane 0's replica on node-0 is
 # hard-killed and comes back cold; its lookups for the pinned sender
 # fail (the failure outcomes count), the twin keeps the lane live, and
-# the log stays correct. Then the routes return, the replica is killed
-# once more, and its first park gets an answer (the ok outcome counts).
+# the log stays correct. Then the routes return, and the replica is
+# killed once more with only the receipt path blocked: the newborn's
+# first park is answered by the lookup (the ok outcome counts), the
+# parked transaction drains, and the lane makes progress.
+#
+# Why phase 2 blocks the receipt path: a receipt-proven floor makes the
+# sequencer skip the lookup by design, and with a live twin the first
+# receipt beats the first park often (measured: the newborn published
+# 23559 transactions with zero lookup requests). Receipts ride UDP
+# multicast from the executors; the lookup is TCP to the executors. An
+# iptables rule on the node drops the executors' UDP and passes the
+# TCP. In phase 1 the route blackhole blocks both: a receiver cannot
+# send status messages to a blackholed executor, so no receipt image
+# forms, and every park requests a lookup.
 case_lookup_blackout() {
   local node="kardamom-sequencer-0" ip="192.168.56.21" port=9001
   local executors="192.168.56.41 192.168.56.42 192.168.56.43"
-  local base_fail base_ok e
-  base_fail="$(seq_metric_where "${ip}" "${node}" "${port}" kardamom_sequencer_nonce_lookups_total 'outcome="timeout"' || true)"
-  base_fail=$(( ${base_fail:-0} + $(seq_metric_where "${ip}" "${node}" "${port}" kardamom_sequencer_nonce_lookups_total 'outcome="error"' || echo 0) ))
+  local e
+  # Both phases hard-kill the replica, and the replacement is a new
+  # process whose counters start at zero. So the baseline for each wait
+  # is zero, not the killed process's count. A baseline read from the
+  # old process fails the wait when it is 1 or more: an answered lookup
+  # is a one-off (the floor is known after it), so the newborn's "ok"
+  # count stays at exactly one and never rises past the old count.
+  #
+  # The twin stays up in both phases. The newborn's first park asks an
+  # executor at once, because the twin's receipts take longer than the
+  # first ingress envelope to arrive (measured: every park in the first
+  # seconds requests a lookup; no receipt sets the floor in that window).
   for e in ${executors}; do
     docker exec "${node}" ip route add blackhole "${e}/32" \
       || fail "lookup-blackout: could not blackhole ${e} on ${node}"
   done
   log "lookup-blackout: executors blackholed from ${node}; hard-killing lane 0's replica there"
   # The restore must happen even when an assert fails. chaos.sh owns the
-  # one EXIT trap, so this case restores on its own error path.
+  # one EXIT trap, so this case restores on its own error path. The
+  # asserts run in a subshell: `fail` exits the shell it runs in, so a
+  # subshell turns that exit into a non-zero status here, and the
+  # snapshot and the restore still run.
   restore_routes() { local x; for x in ${executors}; do docker exec "${node}" ip route del blackhole "${x}/32" 2>/dev/null || true; done; }
   local failed=0
-  {
+  (
     inject_hard "${node}" sequencer-0
     assert_progress
     assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
     wait_until "cold replica's lookups failed with no executor reachable" 120 \
-      lookups_failed_past "${ip}" "${node}" "${port}" "${base_fail}"
-  } || failed=1
+      lookups_failed_past "${ip}" "${node}" "${port}" 0
+  ) || failed=1
+  lookup_snapshot "${ip}" "${node}" "${port}" "lookup-blackout: blackout phase"
   restore_routes
   [ "${failed}" = "0" ] || fail "lookup-blackout: blackout phase failed"
-  log "lookup-blackout: routes restored; hard-killing the replica again for an answered lookup"
-  base_ok="$(seq_metric_where "${ip}" "${node}" "${port}" kardamom_sequencer_nonce_lookups_total 'outcome="ok"' || echo 0)"
-  inject_hard "${node}" sequencer-0
-  assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
-  wait_until "cold replica's lookup answered" 120 lookups_ok_past "${ip}" "${node}" "${port}" "${base_ok:-0}"
+  log "lookup-blackout: routes restored; dropping the executors' UDP on ${node} (receipts, not lookups), then hard-killing the replica again for an answered lookup"
+  for e in ${executors}; do
+    docker exec "${node}" iptables -w 5 -I INPUT -p udp -s "${e}" -j DROP \
+      || fail "lookup-blackout: could not drop UDP from ${e} on ${node}"
+  done
+  restore_udp() { local x; for x in ${executors}; do docker exec "${node}" iptables -w 5 -D INPUT -p udp -s "${x}" -j DROP 2>/dev/null || true; done; }
+  (
+    inject_hard "${node}" sequencer-0
+    assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
+    wait_until "cold replica's lookup answered" 120 lookups_ok_past "${ip}" "${node}" "${port}" 0
+  ) || failed=1
+  # The block is short: the lookup answers within seconds of the
+  # restart, and the node's other replica needs its receipts back.
+  restore_udp
+  lookup_snapshot "${ip}" "${node}" "${port}" "lookup-blackout: answered phase"
+  if [ "${failed}" != "0" ]; then
+    ingress_snapshot "lookup-blackout: answered phase"
+    replica_log_tail "${node}" sequencer-0 "lookup-blackout: answered phase"
+    load_tail "lookup-blackout: answered phase"
+    fail "lookup-blackout: answered-lookup phase failed"
+  fi
   assert_progress
+}
+# One log line of a replica's nonce and lookup counters. The waits above
+# watch one counter. On a red run, this line tells the cases apart: no
+# park at all (tx_ingested and tx_buffered_future stay at zero), a park
+# with the floor already known (requests stay at zero), or a lookup that
+# ran (requests and lookups rise). Never fails the case.
+lookup_snapshot() { # <ip> <node> <port> <ctx>
+  local body
+  body="$(fetch_metrics "$1" "$2" "$3" || true)"
+  [ -n "${body}" ] || { log "$4: no metrics from $2:$3"; return 0; }
+  log "$4: $(printf '%s\n' "${body}" | awk '
+    /^kardamom_sequencer_(tx_ingested|tx_buffered_future|tx_dropped_past|tx_published_to_b|pending_evictions|pending_expired|nonce_lookup_requests|nonce_lookups|wrong_shard_dropped|receipt_floor_advances)_total/ ||
+    /^kardamom_sequencer_(nonce_lookups_in_flight|pending_depth|receipt_floor_senders)[{ ]/ {
+      sub(/^kardamom_sequencer_/, "", $1); printf "%s=%s ", $1, $NF }')"
+}
+# One log line per ingress replica: received, accepted, and rejected by
+# reason. A stalled lane shows up here as timeouts or as
+# partition-unavailable rejects. Never fails the case.
+ingress_snapshot() { # <ctx>
+  local n body
+  for n in "${INGRESS_NODES[@]}"; do
+    body="$(fetch_metrics '' "${n}" "${INGRESS_PORT}" || true)"
+    log "$1: ${n}: $(printf '%s\n' "${body}" | awk '
+      /^kardamom_ingress_(tx_received|tx_accepted|tx_rejected)_total/ {
+        sub(/^kardamom_ingress_/, "", $1); printf "%s=%s ", $1, $NF }')"
+  done
+}
+# The tail of a replica's own log, through the node's docker. The
+# failure dump keeps only a short tail per allocation, and the newborn's
+# lines can fall out of it. Never fails the case.
+replica_log_tail() { # <node> <task-prefix> <ctx>
+  local inner
+  inner="$(inner_container "$1" "$2")"
+  [ -n "${inner}" ] || { log "$3: no inner $2 container on $1"; return 0; }
+  log "$3: log tail of ${inner} on $1"
+  timeout 20 docker exec "$1" docker logs --tail 40 "${inner}" 2>&1 || true
+}
+# The tail of the background load's log. `logf` is run_case's local,
+# visible here through bash's dynamic scope. Silent when unset.
+load_tail() { # <ctx>
+  [ -n "${logf:-}" ] && [ -r "${logf}" ] || return 0
+  log "$1: kardamom-load log tail (${logf})"
+  tail -n 40 "${logf}"
 }
 lookups_failed_past() { # <ip> <node> <port> <baseline>
   local t o
