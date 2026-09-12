@@ -3,6 +3,7 @@ package io.kardamom.sealer.cluster;
 import io.aeron.archive.Archive;
 import io.aeron.archive.ArchiveThreadingMode;
 import io.aeron.cluster.ClusterTool;
+import io.aeron.cluster.ElectionState;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.ClusteredServiceContainer;
@@ -110,6 +111,7 @@ public final class ClusterNode {
              ClusteredServiceContainer ignored2 = container) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
             startSnapshotScheduler(clusterDir, memberId);
+            startJoinWatchdog(driver.consensusModule().context().electionStateCounter(), memberId);
             barrier.await();
         }
     }
@@ -157,9 +159,67 @@ public final class ClusterNode {
             + " intervalS=" + intervalS);
     }
 
+    /**
+     * Exits the process when the member never joins the cluster
+     * ({@code -Dkardamom.cluster.joinWatchdogS}, default 60, 0 disables it).
+     *
+     * <p>A member can wedge inside its first election, after a successful
+     * launch, with no error and no exit. Aeron 1.44's
+     * {@code awaitLocalSocketsClosed} has no timeout, so the consensus
+     * module spins in {@code Election.init} forever while the container
+     * reports healthy to Nomad (issue #195). PR #257 removed the known
+     * trigger. This watchdog covers the shape itself: an election that
+     * stays in INIT past the window is a wedge, never a slow join. See
+     * {@link JoinWatchdog} for why INIT is the only state it acts on.</p>
+     *
+     * <p>The exit is {@link Runtime#halt}, not {@link System#exit}. A
+     * graceful close joins the stuck agent thread and can hang the same
+     * way. The relaunch then goes through the mark-file retry loop above,
+     * which is the expected path after a hard exit. Exit code 3 marks the
+     * cause in the alloc's exit event.</p>
+     */
+    private static void startJoinWatchdog(final org.agrona.concurrent.status.AtomicCounter electionState,
+        final int memberId) {
+        final long windowS = Long.getLong("kardamom.cluster.joinWatchdogS", 60L);
+        if (windowS <= 0) {
+            System.out.println("cluster join watchdog DISABLED memberId=" + memberId);
+            return;
+        }
+        final JoinWatchdog watchdog = new JoinWatchdog(windowS * 1000L);
+        final Thread t = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(JOIN_WATCHDOG_POLL_MS);
+                } catch (final InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (electionState.isClosed()) {
+                    return;
+                }
+                final long nowMs = System.currentTimeMillis();
+                final ElectionState state = ElectionState.get(electionState);
+                if (watchdog.observe(state, nowMs)) {
+                    System.out.println("cluster JOIN WEDGE memberId=" + memberId
+                        + " election stuck in INIT for " + watchdog.initForMs(nowMs) / 1000L
+                        + "s (window " + windowS + "s); exiting for a clean relaunch (issue #195)");
+                    System.out.flush();
+                    Runtime.getRuntime().halt(JOIN_WEDGE_EXIT_CODE);
+                }
+            }
+        }, "kardamom-join-watchdog");
+        t.setDaemon(true);
+        t.start();
+        System.out.println("cluster join watchdog up memberId=" + memberId + " windowS=" + windowS);
+    }
+
     /** Launch retries past the ~10s mark-file liveness window, with margin. */
     static final int MAX_LAUNCH_ATTEMPTS = 6;
     static final long LAUNCH_RETRY_DELAY_MS = 5_000;
+    /** How often the join watchdog samples the election state. */
+    static final long JOIN_WATCHDOG_POLL_MS = 1_000;
+    /** Process exit code when the join watchdog fires. */
+    static final int JOIN_WEDGE_EXIT_CODE = 3;
 
     /** Whether the launch failure is agrona's "active Mark file detected" guard. */
     static boolean isActiveMarkFile(final Throwable t) {
