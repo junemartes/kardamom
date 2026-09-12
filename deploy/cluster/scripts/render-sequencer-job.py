@@ -55,11 +55,12 @@ def port(text: str, key: str) -> int:
     return int(m.group(1))
 
 
-def node_class(text: str, name: str) -> tuple[int, int]:
-    m = re.search(rf"^\s{{2}}{name}:\s*\{{[^}}]*?\bcount:\s*(\d+)[^}}]*?\bip_start:\s*(\d+)", text, re.M)
+def node_class(text: str, name: str) -> int:
+    """The replica count of a node class."""
+    m = re.search(rf"^\s{{2}}{name}:\s*\{{[^}}]*?\bcount:\s*(\d+)", text, re.M)
     if not m:
         sys.exit(f"group_vars/all.yml: missing node_classes.{name}")
-    return int(m.group(1)), int(m.group(2))
+    return int(m.group(1))
 
 
 def parse_map(path: str) -> tuple[int, list[int]]:
@@ -132,8 +133,20 @@ variable "image_ref" {{
   default     = ""
 }}
 
+variable "datacenter" {{
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}}
+
+variable "executor_count" {{
+  type        = number
+  description = "The executor node count (node_classes.executor.count). The nonce lookups go to executor-<i>.node.<datacenter>.consul."
+  default     = {executor_count}
+}}
+
 job "sequencer" {{
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   # Sequencer-role nodes only.
@@ -217,7 +230,7 @@ GROUP = """
           "--tx-ttl-ms", "{tx_ttl_ms}",
           # The executor nonce query endpoints (node_classes.executor and
           # ports.executor_nonce_query in group_vars/all.yml).
-          "--executor-query-endpoints", "{query_endpoints}",
+          "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${{i}}.node.${{var.datacenter}}.consul:{query_port}"]),
           # This node's cluster-egress (response) endpoint, on the lane's
           # port. The node IP differs per replica, so it is injected here.
           "--cluster-egress-endpoint", "${{meta.node_ip}}:{egress_port}",
@@ -267,18 +280,14 @@ def render(gv: str, target: list[int], current: list[int] | None) -> str:
     image = f"{registry}/kardamom-sequencer:{scalar(gv, 'image_tag')}"
     tx_ttl_ms = scalar(gv, "tx_ttl_ms")
     egress_base = int(scalar(gv, "cluster_egress_port"))
-    ip_prefix = scalar(gv, "ip_prefix")
     query_port = port(gv, "executor_nonce_query")
-    exec_count, exec_start = node_class(gv, "executor")
-    query_endpoints = ",".join(
-        f"http://{ip_prefix}.{exec_start + i}:{query_port}" for i in range(exec_count)
-    )
+    exec_count = node_class(gv, "executor")
     target_sets = lane_sets(target)
     lanes = max(target) + 1
     current_sets = lane_sets(current) if current is not None else None
     current_lanes = max(current) + 1 if current is not None else lanes
 
-    out = [HEADER.format(egress_base=egress_base)]
+    out = [HEADER.format(egress_base=egress_base, executor_count=exec_count)]
     groups = sorted(set(target_sets) | (set(current_sets) if current_sets else set()))
     for lane in groups:
         resize_args = ""
@@ -320,7 +329,7 @@ def render(gv: str, target: list[int], current: list[int] | None) -> str:
                 vslots=ranges(vslots),
                 resize_args=resize_args,
                 tx_ttl_ms=tx_ttl_ms,
-                query_endpoints=query_endpoints,
+                query_port=query_port,
                 egress_port=egress_base + PORT_LANE_STEP * lane,
                 metrics_port=METRICS_BASE + PORT_LANE_STEP * lane,
                 mdc_ports=(

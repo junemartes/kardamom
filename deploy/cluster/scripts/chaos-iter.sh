@@ -16,7 +16,9 @@
 set -euo pipefail
 
 HALF="${1:?usage: chaos-iter.sh <a|b>}"
-export NOMAD_ADDR="http://192.168.56.10:4646"
+# shellcheck source=deploy/cluster/scripts/lib-topology.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-topology.sh"
+export NOMAD_ADDR="${NOMAD_ADDR:-$(nomad_addr)}"
 
 case "${HALF}" in
   # The halves track the CI shards' case lists. cluster-e2e.yml is the

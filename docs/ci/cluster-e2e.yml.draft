@@ -21,7 +21,7 @@
 name: cluster-e2e
 
 # Container-based cluster end-to-end (Ansible → Nomad → Consul). Brings up the
-# multi-node cluster as privileged systemd+DinD containers on a 192.168.56.0/24
+# multi-node cluster as privileged systemd+DinD containers on a Docker
 # bridge (the VM-less analogue of `make up`), provisions it with the UNMODIFIED
 # bootstrap.yml, deploys the Nomad jobs, and runs the pipeline smoke + sustained-load
 # + chaos suite. See deploy/cluster/terraform/containers, the container-*
@@ -140,11 +140,10 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # Trust the in-cluster registry (plain HTTP on the bridge IP).
-      - name: Configure host docker for the insecure registry
+      # Images are pushed from inside the control node (REGISTRY_PUSH_NODE
+      # in the Makefile), so the runner daemon trusts no registry address.
+      - name: Kernel modules for systemd-in-container
         run: |
-          echo '{ "insecure-registries": ["192.168.56.10:5000"] }' | sudo tee /etc/docker/daemon.json
-          sudo systemctl restart docker
           # cgroup v2 + systemd-in-container needs this on some runners.
           sudo modprobe ip_tables || true
 

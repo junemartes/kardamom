@@ -73,8 +73,8 @@ case_sequencer_replica_kill() {
   inject_hard kardamom-sequencer-0 sequencer-0
   assert_progress
   assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
-  # lane 0 on node-0: sequencer ip lane starts at .21, lane 0 metrics :9001.
-  assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
+  # lane 0 on node-0: lane 0 metrics :9001.
+  assert_replica_healthy kardamom-sequencer-0 "${NODE_IP[kardamom-sequencer-0]}" 9001
 }
 
 # sealer-graceful and sealer-hard are deleted. They targeted the

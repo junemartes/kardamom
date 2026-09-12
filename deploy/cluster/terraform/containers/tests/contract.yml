@@ -1,7 +1,6 @@
 # A small node-class model for the plan-time tests.
 ---
-ip_prefix: "10.99.0"
 node_classes:
-  control: { count: 1, ip_start: 10, tier: control }
-  worker: { count: 3, ip_start: 41, tier: worker }
-  aux: { count: 1, ip_start: 61, tier: worker }
+  control: { count: 1, tier: control }
+  worker: { count: 3, tier: worker }
+  aux: { count: 1, tier: worker }

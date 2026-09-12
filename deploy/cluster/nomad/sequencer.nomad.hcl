@@ -32,8 +32,20 @@ variable "image_ref" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
+variable "executor_count" {
+  type        = number
+  description = "The executor node count (node_classes.executor.count). The nonce lookups go to executor-<i>.node.<datacenter>.consul."
+  default     = 3
+}
+
 job "sequencer" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   # Sequencer-role nodes only.
@@ -86,7 +98,7 @@ job "sequencer" {
       driver = "docker"
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-sequencer:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-sequencer:dev"
         # force_pull stays on for both paths; see the ingress job's
         # comment. The :dev fallback needs it. On the pinned path, the
         # 1.9.5 driver pulls the tag but resolves the image by digest,
@@ -115,7 +127,7 @@ job "sequencer" {
           "--tx-ttl-ms", "30000",
           # The executor nonce query endpoints (node_classes.executor and
           # ports.executor_nonce_query in group_vars/all.yml).
-          "--executor-query-endpoints", "http://192.168.56.41:9024,http://192.168.56.42:9024,http://192.168.56.43:9024",
+          "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:9024"]),
           # This node's cluster-egress (response) endpoint, on the lane's
           # port. The node IP differs per replica, so it is injected here.
           "--cluster-egress-endpoint", "${meta.node_ip}:40210",
@@ -202,7 +214,7 @@ job "sequencer" {
       driver = "docker"
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-sequencer:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-sequencer:dev"
         # force_pull stays on for both paths; see the ingress job's
         # comment. The :dev fallback needs it. On the pinned path, the
         # 1.9.5 driver pulls the tag but resolves the image by digest,
@@ -231,7 +243,7 @@ job "sequencer" {
           "--tx-ttl-ms", "30000",
           # The executor nonce query endpoints (node_classes.executor and
           # ports.executor_nonce_query in group_vars/all.yml).
-          "--executor-query-endpoints", "http://192.168.56.41:9024,http://192.168.56.42:9024,http://192.168.56.43:9024",
+          "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:9024"]),
           # This node's cluster-egress (response) endpoint, on the lane's
           # port. The node IP differs per replica, so it is injected here.
           "--cluster-egress-endpoint", "${meta.node_ip}:40220",

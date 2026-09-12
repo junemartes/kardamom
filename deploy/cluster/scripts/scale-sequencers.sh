@@ -24,7 +24,7 @@
 #
 # Usage (from the host, like deploy.sh):
 #   deploy/cluster/scripts/scale-sequencers.sh <target-lanes>
-#   NOMAD_ADDR=http://192.168.56.10:4646 deploy/cluster/scripts/scale-sequencers.sh 3
+#   deploy/cluster/scripts/scale-sequencers.sh 3   # NOMAD_ADDR from the control node, or set it
 #   DRY_RUN=1 deploy/cluster/scripts/scale-sequencers.sh 3   # render only
 set -euo pipefail
 
@@ -47,18 +47,19 @@ fail() { echo "SCALE FAIL: $*" >&2; exit 1; }
 # --- contract values -------------------------------------------------------
 gv_scalar() { sed -n -E "s/^$1:[[:space:]]*([^#]+).*/\1/p" "${GV}" | head -1 | tr -d ' "'; }
 TX_TTL_MS="$(gv_scalar tx_ttl_ms)"
-IP_PREFIX="$(gv_scalar ip_prefix)"
-CONTROL_IP="$(gv_scalar control_ip)"
 NOMAD_HTTP="$(sed -n -E 's/^  nomad_http:[[:space:]]*([0-9]+).*/\1/p' "${GV}" | head -1)"
-export NOMAD_ADDR="${NOMAD_ADDR:-http://${CONTROL_IP}:${NOMAD_HTTP}}"
 SEQ_COUNT="$(sed -n -E 's/^  sequencer:[[:space:]]*\{[^}]*count:[[:space:]]*([0-9]+).*/\1/p' "${GV}" | head -1)"
-SEQ_IP_START="$(sed -n -E 's/^  sequencer:[[:space:]]*\{[^}]*ip_start:[[:space:]]*([0-9]+).*/\1/p' "${GV}" | head -1)"
-[[ -n "${TX_TTL_MS}" && -n "${IP_PREFIX}" && -n "${SEQ_COUNT}" && -n "${SEQ_IP_START}" ]] \
-  || fail "could not read tx_ttl_ms, ip_prefix, or node_classes.sequencer from ${GV}"
+[[ -n "${TX_TTL_MS}" && -n "${SEQ_COUNT}" ]] \
+  || fail "could not read tx_ttl_ms or node_classes.sequencer from ${GV}"
 TX_TTL_S=$(( (TX_TTL_MS + 999) / 1000 ))
 METRICS_BASE=9001
+# Addresses come from Docker (lib-topology.sh): this script runs on the
+# Docker host, outside the cluster resolver.
+# shellcheck source=deploy/cluster/scripts/lib-topology.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-topology.sh"
+export NOMAD_ADDR="${NOMAD_ADDR:-$(NOMAD_HTTP_PORT="${NOMAD_HTTP}" nomad_addr)}"
 SEQ_IPS=()
-for ((i = 0; i < SEQ_COUNT; i++)); do SEQ_IPS+=("${IP_PREFIX}.$((SEQ_IP_START + i))"); done
+for ((i = 0; i < SEQ_COUNT; i++)); do SEQ_IPS+=("$(node_address "kardamom-sequencer-${i}")"); done
 
 # --- image pin, as deploy.sh does --------------------------------------------
 # One digest per service. The sequencer job and the ingress job each

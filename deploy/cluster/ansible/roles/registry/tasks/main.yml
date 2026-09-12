@@ -33,3 +33,23 @@
       - "{{ registry_port }}:5000"
     volumes:
       - "{{ paths.base }}/registry:/var/lib/registry"
+
+# The registry is a Consul service: every node pulls from
+# registry.service.consul and no node names the control address.
+- name: Register the registry service with the local agent
+  ansible.builtin.copy:
+    dest: /etc/consul.d/registry.hcl
+    owner: consul
+    group: consul
+    mode: "0640"
+    content: |
+      # Managed by Ansible (roles/registry).
+      service {
+        name = "registry"
+        port = {{ registry_port }}
+        check {
+          tcp      = "127.0.0.1:{{ registry_port }}"
+          interval = "10s"
+        }
+      }
+  notify: Reload consul

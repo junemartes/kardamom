@@ -1,6 +1,5 @@
 # kardamom-ingress is the eth JSON-RPC proxy. It runs active/active:
-# count=2, one per ingress-role node (ingress-0@192.168.56.31,
-# ingress-1@192.168.56.32).
+# count=2, one per ingress-role node (ingress-0, ingress-1).
 #
 # Invocation:
 #   kardamom-ingress --config <ingress.toml> --log-config <channels.toml> \
@@ -44,8 +43,14 @@ variable "image_ref" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
 job "ingress" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {
@@ -117,7 +122,7 @@ job "ingress" {
         ulimit {
           nofile = "65536:65536"
         }
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-ingress:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-ingress:dev"
         # force_pull stays on for both paths. The mutable :dev
         # fallback needs it; a stale node-cached layer once caused a
         # crash-retry storm that stalled the deploy. On the
@@ -220,6 +225,20 @@ job "ingress" {
       resources {
         cpu    = 500
         memory = 512
+      }
+
+      # The RPC front door as a Consul service: the rpc-proxy pool is
+      # kardamom-ingress.service.consul.
+      service {
+        name     = "kardamom-ingress"
+        port     = "jsonrpc"
+        provider = "consul"
+        check {
+          type     = "tcp"
+          port     = "jsonrpc"
+          interval = "10s"
+          timeout  = "2s"
+        }
       }
 
       service {

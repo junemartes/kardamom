@@ -1,5 +1,19 @@
 # shellcheck shell=bash
 # Test stages sourced by run-tests.sh. Failures propagate to `make container-test`.
+#
+# Addresses come from Docker through lib-topology.sh. run-tests.sh calls
+# stages_resolve after topology_load: RPC_URL is ingress-0, L1_RPC the
+# anvil on the control node. Nothing here names an address.
+stages_resolve() {
+  RPC_URL="${RPC_URL:-http://${NODE_IP[ingress-0]}:8545}"
+  L1_RPC="${L1_RPC:-http://${NODE_IP[control-0]}:8546}"
+}
+# <port> <node>... -> "<addr>:<port>,<addr>:<port>" for the metrics flags.
+metrics_targets() {
+  local port="$1" out="" n; shift
+  for n in "$@"; do out="${out:+${out},}${NODE_IP[$n]}:${port}"; done
+  echo "${out}"
+}
 # Requires lib.sh, ROOT and LOAD_BIN. This library owns no deployment lifecycle.
 
 # --- 7. Sustained-load invariant gate (Rust harness: fixed-rate soak;
@@ -45,7 +59,7 @@ stage_load() {
   # would never execute. smoke.sh hardcodes 412346 for the same reason.
   # Sender offset 1 reserves account #0 for the single-tx smoke gate
   # above.
-  "${LOAD_BIN}" --rpc http://192.168.56.31:8545 --chain-id 412346 --fixed-rate \
+  "${LOAD_BIN}" --rpc "${RPC_URL}" --chain-id 412346 --fixed-rate \
     --duration "${LOAD_DURATION_S:-60}s" --target-tps "${LOAD_TARGET_TPS:-200}" \
     --senders "${LOAD_SENDERS:-6}" --sender-offset 1 --assert-all-delivered \
     --completeness accepted --max-gap "${LOAD_MAX_GAP:-5}" \
@@ -60,7 +74,7 @@ stage_load() {
   # nonce-start probing, since kardamom-load starts numbering at 0. This
   # keeps nonce bookkeeping simple.
   log "load test: kardamom-load DEFI stage (duration=${DEFI_DURATION_S:-45}s rate=${DEFI_TARGET_TPS:-100}tps)"
-  "${LOAD_BIN}" --rpc http://192.168.56.31:8545 --chain-id 412346 --fixed-rate \
+  "${LOAD_BIN}" --rpc "${RPC_URL}" --chain-id 412346 --fixed-rate \
     --workload defi \
     --duration "${DEFI_DURATION_S:-45}s" --target-tps "${DEFI_TARGET_TPS:-100}" \
     --senders "${DEFI_SENDERS:-6}" --sender-offset "$((1 + ${LOAD_SENDERS:-6}))" \
@@ -103,7 +117,7 @@ stage_semantics() {
       # Registry ids print as hashes. The settlement is the only
       # contract registered for this chain id (Ansible deployment Phase 2b), so
       # the first proxy line is the right one.
-      SETTLEMENT_ADDRESS="$("${DEPLOY_BIN}" --rpc-url http://192.168.56.10:8546 \
+      SETTLEMENT_ADDRESS="$("${DEPLOY_BIN}" --rpc-url "${L1_RPC}" \
         --owner 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
         addresses --l2-chain-id 412346 2>/dev/null \
         | awk '/proxy/ && !found {print $2; found=1}' || true)"
@@ -114,13 +128,13 @@ stage_semantics() {
     fi
     log "chain-semantics suite (Target C): ${SEMANTICS_CASES:-nonce-unordered,nonce-gap,rpc-liveness,rpc-vectors,consistency,l1-batch} (settlement ${SETTLEMENT_ADDRESS})"
     "${SEMANTICS_BIN}" \
-      --rpc http://192.168.56.31:8545 --chain-id 412346 \
-      --executor-metrics 192.168.56.41:9004,192.168.56.42:9004,192.168.56.43:9004 \
-      --sequencer-metrics 192.168.56.21:9001,192.168.56.22:9001,192.168.56.21:9011,192.168.56.22:9011 \
-      --validator-metrics 192.168.56.61:9006 \
+      --rpc "${RPC_URL}" --chain-id 412346 \
+      --executor-metrics "$(metrics_targets 9004 executor-0 executor-1 executor-2)" \
+      --sequencer-metrics "$(metrics_targets 9001 sequencer-0 sequencer-1),$(metrics_targets 9011 sequencer-0 sequencer-1)" \
+      --validator-metrics "$(metrics_targets 9006 aux-0)" \
       --pending-receipt-timeout-ms "${SEMANTICS_PARK_MS:-30000}" \
       --account-base "${SEMANTICS_ACCOUNT_BASE:-1}" \
-      --l1-rpc http://192.168.56.10:8546 \
+      --l1-rpc "${L1_RPC}" \
       --settlement "${SETTLEMENT_ADDRESS}" \
       --cases "${SEMANTICS_CASES:-nonce-unordered,nonce-gap,rpc-liveness,rpc-vectors,consistency,l1-batch}"
   else
@@ -211,8 +225,8 @@ stage_fallback_load() {
 #       tighten the Aeron image-liveness or no_unavailable_image
 #       handling until it passes.
 stage_ingress_churn() {
-  log "ingress-churn: stopping ingress-0 and re-smoking against ingress-1 (.32)"
-  docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
+  log "ingress-churn: stopping ingress-0 and re-smoking against ingress-1"
+  docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://control-0.node.consul:4646; \
     alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.NodeName}} {{.ID}}{{\"\n\"}}{{end}}{{end}}" ingress 2>/dev/null | awk "/ingress-0/{print \$2; exit}"); \
     [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
   sleep 5
@@ -222,5 +236,5 @@ stage_ingress_churn() {
   # fallback executor-churn (#17). No cross-stage nonce coordination is
   # needed, regardless of which branch above ran.
   PK="0xea6c44ac03bff858b476bba40716402b03e41b8e97e276d1baec7c37d42484a0" \
-    RPC_URL="http://192.168.56.32:8545" ./scripts/smoke.sh
+    RPC_URL="http://${NODE_IP[ingress-1]}:8545" ./scripts/smoke.sh
 }

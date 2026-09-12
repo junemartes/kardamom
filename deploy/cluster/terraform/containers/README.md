@@ -5,20 +5,21 @@ systemd and Docker-in-Docker container per node of the node-class model.
 
 ## Inputs
 
-The root reads `ip_prefix` and `node_classes` from
-`../../ansible/group_vars/all.yml` (`contract_file`). The model stays in one
-place; `scripts/check-contract.py` checks that this root reads it.
+The root reads `node_classes` from `../../ansible/group_vars/all.yml`
+(`contract_file`). The model stays in one place; `scripts/check-contract.py`
+checks that this root reads it. The network range is the `subnet` variable;
+Docker assigns every node address from it.
 
 ## Resources
 
 - `docker_network.this`: `kardamom-net` on the Linux bridge `kardamom-br0`
-  with the `/24` of `ip_prefix`.
+  with the `subnet` range.
 - `docker_image.node`: `kardamom-node:ci` from `../../docker/node.Dockerfile`.
   A change of the Dockerfile rebuilds the image and replaces every node.
 - `docker_volume.node`: `kardamom-<node>-docker` and
   `kardamom-<node>-containerd` for the inner Docker engine.
-- `docker_container.node`: `kardamom-<node>` at the static address of its
-  lane. Apply waits for `systemctl is-system-running` to report `running` or
+- `docker_container.node`: `kardamom-<node>` at the address the network
+  assigns; the contract reads it back. Apply waits for `systemctl is-system-running` to report `running` or
   `degraded` (`ready_timeout`, 180 s).
 
 ## Output
@@ -41,5 +42,5 @@ tofu test
 ```
 
 The tests use a mocked provider and a small model under `tests/`. They check
-the lane arithmetic, the container names, the static addresses, the health
-check and the refusal of overlapping lanes.
+the instance naming, the container names, the read-back addresses and the
+health check.

@@ -56,9 +56,6 @@ registry_host = scalar(gv, "registry_host")
 registry_port = scalar(gv, "registry_port")
 image_tag = scalar(gv, "image_tag")
 chain_id = scalar(gv, "chain_id")
-control_ip = scalar(gv, "control_ip")
-ingress_ip = scalar(gv, "ingress_ip")
-sealer_ip = scalar(gv, "sealer_ip")
 aeron_version = scalar(gv, "aeron_version")
 nomad_version = scalar(gv, "nomad_version")
 registry = f"{registry_host}:{registry_port}"
@@ -71,7 +68,6 @@ for k in ("ingress_rpc", "anvil_l1", "nomad_http"):
 ingress_rpc = ports.get("ingress_rpc", "")
 anvil_l1 = ports.get("anvil_l1", "")
 nomad_http = ports.get("nomad_http", "")
-nomad_addr = f"http://{control_ip}:{nomad_http}"
 
 # Node name -> ip from the legacy hand-enumerated cluster_nodes mapping (if any).
 nodes = dict(re.findall(r"^\s{2}(\w+):\n\s{4}ip:\s*([\d.]+)", gv, re.M))
@@ -152,7 +148,7 @@ must_contain(CLUSTER / "Makefile", "tofu -chdir=$(TF_CONTAINERS) apply", "contai
 
 # --- Makefile -----------------------------------------------------------------
 must_contain(CLUSTER / "Makefile", f"REGISTRY := {registry}", "registry host:port")
-must_contain(CLUSTER / "Makefile", f"NOMAD_ADDR := {nomad_addr}", "nomad HTTP API")
+must_contain(CLUSTER / "Makefile", f"NOMAD_HTTP := {nomad_http}", "nomad HTTP port; the address comes from the node contract")
 must_contain(CLUSTER / "Makefile", f"TAG := {image_tag}", "image tag")
 
 # --- Nomad job specs ------------------------------------------------------------
@@ -173,11 +169,13 @@ must_contain(
 # sidecar are gone, so the durable watermark ingress --ack-policy on-quorum gates
 # on now comes from cluster egress progress (ClusterWatermark).
 must_contain(jobs / "anvil.nomad.hcl", f'"{anvil_l1}"', "anvil L1 port")
-must_contain(
-    jobs / "da-watcher.nomad.hcl",
-    f"http://{control_ip}:{anvil_l1}",
-    "L1 RPC endpoint (anvil on the control node)",
-)
+for svc in ("da-watcher", "batcher"):
+    must_contain(
+        jobs / f"{svc}.nomad.hcl",
+        f'default     = "http://anvil.service.consul:{anvil_l1}"',
+        "L1 RPC endpoint (the anvil Consul service)",
+    )
+must_contain(jobs / "anvil.nomad.hcl", 'name     = "anvil"', "anvil registers its Consul service")
 must_contain(jobs / "ingress.nomad.hcl", f"static = {ingress_rpc}", "ingress RPC port")
 must_contain(jobs / "executor.nomad.hcl", f'"{chain_id}"', "L2 chain id")
 
@@ -416,15 +414,20 @@ must_contain(
     f'"--nonce-query-addr", "${{meta.node_ip}}:{nonce_query_port}"',
     "executor nonce query address",
 )
-m_exec_start = re.search(r"^\s{2}executor:\s*\{[^}]*?\bip_start:\s*(\d+)", gv, re.M)
 m_exec_count = re.search(r"^\s{2}executor:\s*\{[^}]*?\bcount:\s*(\d+)", gv, re.M)
-ip_prefix_for_exec = scalar(gv, "ip_prefix")
-if m_exec_start and m_exec_count and ip_prefix_for_exec and nonce_query_port:
-    urls = ",".join(
-        f"http://{ip_prefix_for_exec}.{int(m_exec_start.group(1)) + i}:{nonce_query_port}"
-        for i in range(int(m_exec_count.group(1)))
+if m_exec_count and nonce_query_port:
+    # The lookups go to executor-<i>.node.<datacenter>.consul; the jobs
+    # derive the list from executor_count, whose default is the class count.
+    for job_name in ("sequencer", "executor", "validator"):
+        must_contain(
+            jobs / f"{job_name}.nomad.hcl",
+            f"default     = {m_exec_count.group(1)}\n}}",
+            "executor_count default is node_classes.executor.count",
+        )
+    flag = (
+        '"--executor-query-endpoints", join(",", [for i in range(var.executor_count) : '
+        f'"http://executor-${{i}}.node.${{var.datacenter}}.consul:{nonce_query_port}"])'
     )
-    flag = f'"--executor-query-endpoints", "{urls}"'
     found = seq_job.count(flag)
     if found != 2:
         err(
@@ -498,8 +501,8 @@ must_contain(REPO / "chains" / "dev.toml", f"chain_id = {chain_id}", "dev chain 
 # --- scripts --------------------------------------------------------------------
 must_contain(
     CLUSTER / "scripts" / "smoke.sh",
-    f"http://{ingress_ip}:{ingress_rpc}",
-    "default ingress RPC URL",
+    f"http://$(node_address kardamom-ingress-0):{ingress_rpc}",
+    "default ingress RPC URL, resolved through Docker",
 )
 must_contain(
     CLUSTER / "scripts" / "smoke.sh", f"CHAIN_ID:-{chain_id}", "default chain id"
@@ -521,23 +524,17 @@ must_contain(
     f'NOMAD_VERSION := "{nomad_version}"',
     "Nomad version pin (cluster-bootstrap host CLI)",
 )
-must_contain(
-    REPO / "justfile",
-    registry,
-    "insecure-registry address in cluster-bootstrap/doctor",
-)
 
 # --- Aeron Cluster (Raft) sealer ------------------------------------------------
-# The 3-member cluster topology is the canonical contract here, but it is mirrored
-# as literals in four places that cannot read YAML:
-#   - nomad/cluster.nomad.hcl    : the -Dkardamom.cluster.members string + ingressStreamId
+# The 3-member cluster topology is the canonical contract here. The member
+# list in nomad/cluster.nomad.hcl is derived in HCL from sealer_count and the
+# datacenter (sealer-<i>.node.<datacenter>.consul), so the mirrors to check are
+# the count, the port list and the stream ids:
+#   - nomad/cluster.nomad.hcl    : sealer_count, member_ports, ingressStreamId
 #   - config/sequencer.toml.tpl  : the [cluster] ingress_endpoints + stream ids
 #   - config/executor.toml       : the [cluster] ingress_endpoints + stream ids
 #   - config/ingress.toml        : the [cluster] ingress_endpoints + stream ids
 #                                  (on-quorum watermark client)
-# Derive the expected member endpoints from node_classes.sealer (ip_start lane on
-# ip_prefix) + cluster_member_count + cluster_ports, then assert each mirror agrees.
-ip_prefix = scalar(gv, "ip_prefix")
 cluster_member_count = scalar(gv, "cluster_member_count")
 cluster_ingress_stream_id = scalar(gv, "cluster_ingress_stream_id")
 cluster_egress_stream_id = scalar(gv, "cluster_egress_stream_id")
@@ -554,11 +551,7 @@ for k in ("ingress", "consensus", "log", "catchup", "archive_control"):
     if k not in cluster_ports:
         err(f"group_vars/all.yml: missing cluster_ports.{k}")
 
-# sealer node-class ip_start lane (members at <ip_prefix>.<ip_start + i>).
-m_sealer = re.search(r"^\s{2}sealer:\s*\{[^}]*?\bip_start:\s*(\d+)", gv, re.M)
 m_sealer_count = re.search(r"^\s{2}sealer:\s*\{[^}]*?\bcount:\s*(\d+)", gv, re.M)
-if not m_sealer:
-    err("group_vars/all.yml: missing node_classes.sealer.ip_start")
 if m_sealer_count and cluster_member_count and m_sealer_count.group(1) != cluster_member_count:
     err(
         "group_vars/all.yml: node_classes.sealer.count "
@@ -566,76 +559,62 @@ if m_sealer_count and cluster_member_count and m_sealer_count.group(1) != cluste
         "— the cluster runs one Raft member per sealer node"
     )
 
-if (
-    ip_prefix
-    and m_sealer
-    and cluster_member_count.isdigit()
-    and all(k in cluster_ports for k in ("ingress", "consensus", "log", "catchup", "archive_control"))
+cluster_job = CLUSTER / "nomad" / "cluster.nomad.hcl"
+if cluster_member_count.isdigit() and all(
+    k in cluster_ports for k in ("ingress", "consensus", "log", "catchup", "archive_control")
 ):
-    n = int(cluster_member_count)
-    ip_start = int(m_sealer.group(1))
-    member_ips = [f"{ip_prefix}.{ip_start + i}" for i in range(n)]
     p = cluster_ports
-    # Expected -Dkardamom.cluster.members string (id,ingress,consensus,log,catchup,archive|...).
-    expected_members = "|".join(
-        ",".join(
-            [
-                str(i),
-                f"{ip}:{p['ingress']}",
-                f"{ip}:{p['consensus']}",
-                f"{ip}:{p['log']}",
-                f"{ip}:{p['catchup']}",
-                f"{ip}:{p['archive_control']}",
-            ]
-        )
-        for i, ip in enumerate(member_ips)
-    )
-    must_contain(
-        jobs / "cluster.nomad.hcl",
-        expected_members,
-        "cluster member endpoints (id,ingress,consensus,log,catchup,archive | per member)",
-    )
-    must_contain(
-        jobs / "cluster.nomad.hcl",
-        f"-Dkardamom.cluster.ingressStreamId={cluster_ingress_stream_id}",
-        "cluster ingress stream id",
-    )
-    # memberId is derived from the node's own IP (alloc index != node), so the job
-    # passes the per-node ${meta.node_ip} rather than a static index→IP mapping.
-    must_contain(
-        jobs / "cluster.nomad.hcl",
-        "-Dkardamom.cluster.nodeIp=${meta.node_ip}",
-        "per-node cluster memberId derivation (node IP, not alloc index)",
-    )
-    # Expected [cluster] ingress_endpoints: "id=ip:ingress,..." (client view).
-    expected_endpoints = ",".join(
-        f"{i}={ip}:{p['ingress']}" for i, ip in enumerate(member_ips)
-    )
-    for tpl in ("sequencer.toml.tpl", "executor.toml", "ingress.toml"):
-        must_contain(
-            CLUSTER / "config" / tpl,
-            f'ingress_endpoints = "{expected_endpoints}"',
-            f"[cluster] ingress_endpoints in {tpl}",
-        )
-        must_contain(
-            CLUSTER / "config" / tpl,
-            f"ingress_stream_id = {cluster_ingress_stream_id}",
-            f"[cluster] ingress_stream_id in {tpl}",
-        )
-        must_contain(
-            CLUSTER / "config" / tpl,
-            f"egress_stream_id = {cluster_egress_stream_id}",
-            f"[cluster] egress_stream_id in {tpl}",
-        )
-# Per-node egress endpoint is injected by the Nomad job (port differs only by
-# node IP), so assert the job carries the flag with the canonical egress port.
-# Ingress passes the same flag for its on-quorum watermark cluster client.
-for job in ("sequencer", "executor", "ingress"):
-    must_contain(
-        jobs / f"{job}.nomad.hcl",
-        f"${{meta.node_ip}}:{cluster_egress_port}",
-        f"per-node cluster egress endpoint (--cluster-egress-endpoint) in {job}",
-    )
+    must_contain(cluster_job, f"default     = {cluster_member_count}\n}}", "sealer_count default is cluster_member_count")
+    ports_literal = ", ".join(p[k] for k in ("ingress", "consensus", "log", "catchup", "archive_control"))
+    must_contain(cluster_job, f"member_ports = [{ports_literal}]", "member ports mirror cluster_ports in order")
+    must_contain(cluster_job, '"sealer-${i}.node.${var.datacenter}.consul:${p}"', "members are the sealer node records")
+    must_contain(cluster_job, "-Dkardamom.cluster.members=${local.members}", "the JVM reads the derived member list")
+    must_contain(cluster_job, "-Dkardamom.cluster.memberId=${meta.node_index}", "the member id is the node index")
+    if cluster_ingress_stream_id:
+        must_contain(cluster_job, f"ingressStreamId={cluster_ingress_stream_id}", "cluster ingress stream id")
+    # The clients name the members the same way, in the agent's own datacenter.
+    expected_ingress = ",".join(f"{i}=sealer-{i}.node.consul:{p['ingress']}" for i in range(int(cluster_member_count)))
+    for cfg in ("sequencer.toml.tpl", "executor.toml", "ingress.toml"):
+        must_contain(CLUSTER / "config" / cfg, f'ingress_endpoints = "{expected_ingress}"', "cluster ingress endpoints by node record")
+
+
+# --- no fixed address --------------------------------------------------------
+# Nothing that runs names an address. A node is <name>.node.<dc>.consul, a
+# service <name>.service.consul, and every node runs Consul as its resolver
+# (roles/consul). Loopback, the unspecified address, multicast groups and
+# network ranges are not addresses of a node. The Hetzner Terraform inputs
+# are the one place for addresses, and the Vagrant VM path keeps its
+# addresses in its own environment files, the Vagrantfile and inventory.ini.
+IPV4 = re.compile(r"(?<![\w.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\w.])")
+ADDRESS_FREE = [
+    *sorted((CLUSTER / "nomad").glob("*.hcl")),
+    *sorted(f for f in (CLUSTER / "config").rglob("*") if f.is_file()),
+    *sorted((CLUSTER / "scripts").glob("*.sh")),
+    *sorted((CLUSTER / "scripts").glob("*.py")),
+    *sorted(f for f in (CLUSTER / "ansible").rglob("*.yml") if "inventories" not in f.parts),
+    *sorted((CLUSTER / "ansible").rglob("*.j2")),
+    *sorted((CLUSTER / "terraform" / "containers").glob("*.tf")),
+    CLUSTER / "Makefile",
+    REPO / "justfile",
+    REPO / ".github" / "workflows" / "cluster-e2e.yml",
+]
+
+
+def names_an_address(line: str) -> bool:
+    for m in IPV4.finditer(line):
+        first = int(m.group(1))
+        if first in (0, 127) or 224 <= first <= 239:
+            continue
+        if line[m.end() : m.end() + 1] == "/":
+            continue
+        return True
+    return False
+
+
+for path in ADDRESS_FREE:
+    for n, line in enumerate(path.read_text().splitlines(), 1):
+        if names_an_address(line):
+            err(f"{path.relative_to(REPO)}:{n}: names an address; use a Consul record")
 
 if errors:
     print(f"check-contract: {len(errors)} mismatch(es) vs ansible/group_vars/all.yml:")

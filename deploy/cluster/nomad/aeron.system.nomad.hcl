@@ -4,7 +4,7 @@
 # driver must be local to every service that shares the tmpfs
 # aeron.dir.
 #
-# Image: 192.168.56.10:5000/kardamom-aeron:dev, built from
+# Image: registry.service.consul:5000/kardamom-aeron:dev, built from
 # crates/log/docker/aeron/Dockerfile. Its entrypoint starts
 # io.aeron.archive.ArchivingMediaDriver, with AERON_DIR=/aeron-mount/dir
 # and the archive under /aeron-mount/archive; see the image's ENV.
@@ -44,8 +44,14 @@ variable "image_ref" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
 job "aeron" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "system"
 
   # Keep the media driver off the control-plane node. cp1 runs only
@@ -90,7 +96,7 @@ job "aeron" {
       driver = "docker"
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-aeron:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-aeron:dev"
         # This has no force_pull, matching the pre-digest behavior.
         # The aeron image changes rarely, and the digest pin makes
         # staleness moot on the pinned path. The :dev fallback keeps

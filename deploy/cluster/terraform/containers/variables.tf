@@ -10,6 +10,12 @@ variable "network_name" {
   default     = "kardamom-net"
 }
 
+variable "subnet" {
+  description = "The range of the container network. Docker assigns every node address from it; the Aeron multicast groups are separate."
+  type        = string
+  default     = "192.168.56.0/24"
+}
+
 variable "bridge_name" {
   description = "The Linux bridge that backs the network. The host prep role tunes its multicast snooping."
   type        = string
