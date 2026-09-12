@@ -155,10 +155,17 @@ async fn verify_restored(h: &Harness, victim: &str) -> anyhow::Result<()> {
     let script = format!(
         "docker exec {daemon} bash -lc 'java --add-opens java.base/java.util.zip=ALL-UNNAMED -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool {ARCHIVE_DIR} {CRC_VERIFY} 2>&1'"
     );
+    // Three attempts, as the bash case ran: the verify itself runs
+    // under the streaming bound, since a CRC pass over a large archive
+    // on a slow runner takes well over the command bound.
     let last = RefCell::new(String::new());
     let (last_ref, script_ref) = (&last, script.as_str());
-    let outcome = poll::until(Budget::secs(10, 5), |_| async move {
-        let out = h.nodes.exec(victim, script_ref).await.unwrap_or_default();
+    let outcome = poll::until(Budget::secs(60, 5), |_| async move {
+        let out = h
+            .nodes
+            .exec_long(victim, script_ref)
+            .await
+            .unwrap_or_default();
         let ok = verify_is_clean(&out);
         *last_ref.borrow_mut() = out;
         Ok(ok.then_some(()))
@@ -166,7 +173,10 @@ async fn verify_restored(h: &Harness, victim: &str) -> anyhow::Result<()> {
     .await?;
     let last = last.into_inner();
     if outcome.or_fail(|_| anyhow::anyhow!("verify")).is_err() {
-        eprintln!("{}", tail(&last, 20));
+        crate::log(format!(
+            "archive-tx-data-wipe: verify output tail\n{}",
+            tail(&last, 20)
+        ));
         return Err(crate::chaos_fail!(
             "archive-tx-data-wipe: restored archive failed CRC-armed verify after retries"
         ));
@@ -198,9 +208,13 @@ fn verify_is_clean(out: &str) -> bool {
     !out.contains("Exception") && has_ok_recording(out) && other_err == 0
 }
 
+/// A line like `recordingId=3 ... OK`: the id, then `OK` later on the
+/// same line, wherever the tool puts it.
 fn has_ok_recording(out: &str) -> bool {
-    out.lines()
-        .any(|l| l.contains("recordingId=") && l.trim_end().ends_with("OK"))
+    out.lines().any(|l| {
+        l.find("recordingId=")
+            .is_some_and(|at| l[at..].contains("OK"))
+    })
 }
 
 fn tail(text: &str, n: usize) -> String {
@@ -322,7 +336,7 @@ impl ArchiveTool<'_> {
         );
         self.h
             .nodes
-            .exec(self.node, &script)
+            .exec_long(self.node, &script)
             .await
             .unwrap_or_default()
     }
@@ -549,4 +563,23 @@ async fn run_tool(tool: &Path, args: &[&str]) -> String {
             )
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_clean_verify_has_an_ok_recording_and_tolerates_stale_entries() {
+        let out = "recordingId=3 (checksum: Crc32) OK, length=4096\n\
+            ERR: recordingId=4 invalid Catalog checksum\n";
+        assert!(verify_is_clean(out));
+        assert!(!verify_is_clean(
+            "recordingId=3 ... OK\nERR: recordingId=5 file missing\n"
+        ));
+        assert!(!verify_is_clean(
+            "Exception in thread main\nrecordingId=3 OK\n"
+        ));
+        assert!(!verify_is_clean(""));
+    }
 }

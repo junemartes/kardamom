@@ -124,6 +124,20 @@ impl Nodes {
         Ok(())
     }
 
+    /// The stdout of a long shell script inside a node container, such
+    /// as a JVM archive tool over a large archive, under the streaming
+    /// bound rather than the command bound. The exit status is not
+    /// judged: a verify tool exits non-zero on the findings the caller
+    /// reads from the output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exec cannot run or exceeds the bound.
+    pub async fn exec_long(&self, node: &str, script: &str) -> anyhow::Result<String> {
+        let out = self.exec_bytes(node, script, i32::MAX).await?;
+        Ok(String::from_utf8_lossy(&out).trim().to_string())
+    }
+
     /// The raw stdout bytes of a shell script inside a node container.
     /// This is how a tar stream leaves a node.
     ///
