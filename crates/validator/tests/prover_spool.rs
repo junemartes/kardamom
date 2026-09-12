@@ -4,7 +4,7 @@
 //! the guest shape, and that names the exact post root the live
 //! trie-aware writer then commits for the same block.
 //!
-//! This drives `spool_block`, the per-block body of the async spool
+//! This drives `BlockSpooler::spool_block`, the per-block body of the async spool
 //! task, against a production `StateWriter` (`TrieMode::Incremental`) and
 //! the MVCC `StateSnapshot` pin: the live wiring, minus the tokio loop.
 //!
@@ -22,7 +22,7 @@ use kardamom_types::{
     AccountChange, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CodeEntry,
     ProverInput, PublicOutputs, StorageChange,
 };
-use kardamom_validator::prover::{PinnedPreState, spool_block};
+use kardamom_validator::prover::{BlockSpooler, PinnedPreState};
 
 mod common;
 use common::{CHAIN_ID, RECIPIENT, S0, S1, ZEROER, ZEROER_CODE, tx};
@@ -135,7 +135,9 @@ fn spool_and_guest_reverify(
         },
     );
     let pinned2 = PinnedPreState::new(snap1.clone(), 2).expect("snap1 pinned at block 1");
-    let outputs = spool_block(spool, CHAIN_ID, &pinned2, env2, &records).expect("spool block 2");
+    let outputs = BlockSpooler::new(spool.to_path_buf(), CHAIN_ID)
+        .spool_block(&pinned2, env2, &records)
+        .expect("spool block 2");
 
     // The spooled frame re-verifies one-shot in the guest shape.
     let bytes = std::fs::read(spool.join("block-2/prover-input.rkyv")).unwrap();
@@ -227,7 +229,9 @@ fn spool_block_3(
         },
     );
     let pinned3 = PinnedPreState::new(snap2, 3).expect("snap2 pinned at block 2");
-    spool_block(spool, CHAIN_ID, &pinned3, env3, &records3).expect("spool block 3")
+    BlockSpooler::new(spool.to_path_buf(), CHAIN_ID)
+        .spool_block(&pinned3, env3, &records3)
+        .expect("spool block 3")
 }
 
 #[test]

@@ -156,61 +156,82 @@ impl PinnedPreState {
     }
 }
 
-/// Capture, anchor, and spool one block against its pinned pre-state
-/// snapshot.
-///
-/// # Errors
-///
-/// Returns an error if capture or anchoring fails, or if writing the
-/// spooled frame fails.
-pub fn spool_block(
-    spool_dir: &std::path::Path,
+/// Writes one block's prover frame: the spool directory and the chain id
+/// every frame carries. The spool task owns one; the spool test drives
+/// one directly.
+pub struct BlockSpooler {
+    spool_dir: PathBuf,
     chain_id: u64,
-    pinned: &PinnedPreState,
-    env: ExecEnv,
-    records: &[BufferedRecord],
-) -> Result<PublicOutputs, ExecutorError> {
-    let snap = pinned.snap();
-    let block = pinned.block();
-    let (out, mut witness, bal) = capture_block_witness(snap, None, records, env)?;
-    let pre_root = pre_state_root(snap)?;
-    let txn = snap.ro_txn();
-    let tables = TrieTables::open(txn)
-        .map_err(|e| ExecutorError::State(format!("open trie tables: {e}")))?;
-    let (proofs, post_root) =
-        anchor_block_witness(txn, &tables, pre_root, &mut witness, &out.delta)?;
+}
 
-    let mut bal_rlp = Vec::new();
-    alloy_rlp::Encodable::encode(&bal, &mut bal_rlp);
-    let mut digest = kardamom_types::BlockRecordsDigest::new(block);
-    records
-        .iter()
-        .filter_map(|r| match r {
-            BufferedRecord::Tx { envelope, .. } => Some(envelope),
-            _ => None,
-        })
-        .for_each(|e| digest.add_tx(&e.raw_tx));
-    let outputs = PublicOutputs {
-        pre_state_root: pre_root,
-        post_state_root: post_root,
-        block_number: block,
-        records_digest: digest.finish(),
-        bal_commitment: keccak256(&bal_rlp),
-    };
-    let input = assemble_prover_input(ProverInputParts {
-        chain_id,
-        env,
-        witness,
-        proofs,
-        records,
-        bal_rlp,
-        granularity: std::num::NonZeroU16::MIN,
-    })?;
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&input)
-        .map_err(|e| ExecutorError::State(format!("serialize prover input: {e}")))?;
+impl BlockSpooler {
+    #[must_use]
+    pub fn new(spool_dir: PathBuf, chain_id: u64) -> Self {
+        Self {
+            spool_dir,
+            chain_id,
+        }
+    }
 
-    write_frame(&spool_dir.join(format!("block-{block}")), &bytes, &outputs)?;
-    Ok(outputs)
+    /// Capture, anchor, and spool one block against its pinned pre-state
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if capture or anchoring fails, or if writing the
+    /// spooled frame fails.
+    pub fn spool_block(
+        &self,
+        pinned: &PinnedPreState,
+        env: ExecEnv,
+        records: &[BufferedRecord],
+    ) -> Result<PublicOutputs, ExecutorError> {
+        let snap = pinned.snap();
+        let block = pinned.block();
+        let (out, mut witness, bal) = capture_block_witness(snap, None, records, env)?;
+        let pre_root = pre_state_root(snap)?;
+        let txn = snap.ro_txn();
+        let tables = TrieTables::open(txn)
+            .map_err(|e| ExecutorError::State(format!("open trie tables: {e}")))?;
+        let (proofs, post_root) =
+            anchor_block_witness(txn, &tables, pre_root, &mut witness, &out.delta)?;
+
+        let mut bal_rlp = Vec::new();
+        alloy_rlp::Encodable::encode(&bal, &mut bal_rlp);
+        let mut digest = kardamom_types::BlockRecordsDigest::new(block);
+        records
+            .iter()
+            .filter_map(|r| match r {
+                BufferedRecord::Tx { envelope, .. } => Some(envelope),
+                _ => None,
+            })
+            .for_each(|e| digest.add_tx(&e.raw_tx));
+        let outputs = PublicOutputs {
+            pre_state_root: pre_root,
+            post_state_root: post_root,
+            block_number: block,
+            records_digest: digest.finish(),
+            bal_commitment: keccak256(&bal_rlp),
+        };
+        let input = assemble_prover_input(ProverInputParts {
+            chain_id: self.chain_id,
+            env,
+            witness,
+            proofs,
+            records,
+            bal_rlp,
+            granularity: std::num::NonZeroU16::MIN,
+        })?;
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&input)
+            .map_err(|e| ExecutorError::State(format!("serialize prover input: {e}")))?;
+
+        write_frame(
+            &self.spool_dir.join(format!("block-{block}")),
+            &bytes,
+            &outputs,
+        )?;
+        Ok(outputs)
+    }
 }
 
 /// Read the pre-state's committed trie root.
@@ -284,64 +305,87 @@ fn assemble_prover_input(parts: ProverInputParts<'_>) -> Result<ProverInput, Exe
     })
 }
 
-/// Spawn the spool task. It waits on the writer's snapshot watch. For each
-/// published snapshot at block M, it tries to prove block M+1, with records
-/// from the flight ring, against that pinned snapshot. Blocks whose window
-/// was skipped are counted and dropped. The watch slot holds only the
-/// latest snapshot. A slow spool can still skip past older ones. The task
-/// wakes on each publish, not on a 100 ms timer.
-pub fn spawn_prover_spool(
-    spool_dir: PathBuf,
-    chain_id: u64,
-    snap_rx: SnapshotReceiver,
+/// The prover spool task's state: the frame writer, the flight ring the
+/// records come from, the writer's snapshot watch, and the pin cursor.
+pub struct ProverSpool {
+    spooler: BlockSpooler,
     flight: Arc<FlightRing>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut watch = snap_rx.watch();
-        let mut cursor = SpoolCursor::new();
-        loop {
-            // Writer gone => the chain is shutting down; exit the task.
-            let Ok(()) = watch.changed().await else {
-                return;
-            };
-            let Some(snap) = watch.borrow_and_update().clone() else {
-                continue;
-            };
-            let at = snap.block_number();
-            let PinOutcome::Ready(pinned) = cursor.pin(snap) else {
-                continue;
-            };
-            let next = pinned.block();
-            let Some((_, env, records)) = cursor.take_records(&flight, next, at) else {
-                continue;
-            };
-            record_spool_result(
-                next,
-                spool_block(&spool_dir, chain_id, &pinned, env, &records),
-            );
-            cursor.advance(next);
-        }
-    })
+    watch: tokio::sync::watch::Receiver<Option<StateSnapshot>>,
+    cursor: SpoolCursor,
 }
 
-/// Log one spooled block's outcome, and bump its metric. The spool is an
-/// observer, not a verifier seam: even an anchoring failure — a real
-/// integrity signal, one of the same classes the guest stops on — is
-/// logged loudly and the chain stays alive. The verification paths own
-/// the stop.
-fn record_spool_result(block: u64, result: Result<PublicOutputs, ExecutorError>) {
-    match result {
-        Ok(outputs) => {
-            crate::metrics::counter_prover_spooled();
-            tracing::info!(
-                block,
-                post_root = %outputs.post_state_root,
-                "prover spool: frame written"
-            );
+impl ProverSpool {
+    #[must_use]
+    pub fn new(
+        spool_dir: PathBuf,
+        chain_id: u64,
+        snap_rx: &SnapshotReceiver,
+        flight: Arc<FlightRing>,
+    ) -> Self {
+        Self {
+            spooler: BlockSpooler::new(spool_dir, chain_id),
+            flight,
+            watch: snap_rx.watch(),
+            cursor: SpoolCursor::new(),
         }
-        Err(e) => {
-            crate::metrics::counter_prover_failed();
-            tracing::error!(block, error = %e, "prover spool: block failed");
+    }
+
+    /// Spawn the spool task. It waits on the writer's snapshot watch. For
+    /// each published snapshot at block M, it tries to prove block M+1,
+    /// with records from the flight ring, against that pinned snapshot.
+    /// Blocks whose window was skipped are counted and dropped. The watch
+    /// slot holds only the latest snapshot. A slow spool can still skip
+    /// past older ones. The task wakes on each publish, not on a 100 ms
+    /// timer.
+    pub fn spawn(self) {
+        tokio::spawn(self.run());
+    }
+
+    /// One [`Self::step`] per snapshot publish, until the writer is gone.
+    async fn run(mut self) {
+        while self.step().await.is_some() {}
+    }
+
+    /// Wait for the next snapshot, then spool the next block if it is
+    /// pinned and its records are retained. Returns `None` once the
+    /// writer is gone (the chain is shutting down).
+    async fn step(&mut self) -> Option<()> {
+        self.watch.changed().await.ok()?;
+        let Some(snap) = self.watch.borrow_and_update().clone() else {
+            return Some(());
+        };
+        let at = snap.block_number();
+        let PinOutcome::Ready(pinned) = self.cursor.pin(snap) else {
+            return Some(());
+        };
+        let next = pinned.block();
+        let Some((_, env, records)) = self.cursor.take_records(&self.flight, next, at) else {
+            return Some(());
+        };
+        Self::record_spool_result(next, self.spooler.spool_block(&pinned, env, &records));
+        self.cursor.advance(next);
+        Some(())
+    }
+
+    /// Log one spooled block's outcome, and bump its metric. The spool is
+    /// an observer, not a verifier seam: even an anchoring failure — a
+    /// real integrity signal, one of the same classes the guest stops on
+    /// — is logged loudly and the chain stays alive. The verification
+    /// paths own the stop.
+    fn record_spool_result(block: u64, result: Result<PublicOutputs, ExecutorError>) {
+        match result {
+            Ok(outputs) => {
+                crate::metrics::counter_prover_spooled();
+                tracing::info!(
+                    block,
+                    post_root = %outputs.post_state_root,
+                    "prover spool: frame written"
+                );
+            }
+            Err(e) => {
+                crate::metrics::counter_prover_failed();
+                tracing::error!(block, error = %e, "prover spool: block failed");
+            }
         }
     }
 }

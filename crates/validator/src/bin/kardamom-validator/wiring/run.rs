@@ -60,15 +60,16 @@ impl Attested {
             None => Either::Right(tee),
         };
 
-        crate::pumps::spawn_commit_poller(
-            self.written.writer.writer.snapshot_rx.clone(),
+        crate::pumps::CommitPoller::new(
+            &self.written.writer.writer.snapshot_rx,
             self.attester_handle.clone(),
             streams
                 .interop_serve
                 .as_ref()
                 .map(|s| s.attestations.clone()),
             streams.pump_shutdown.clone(),
-        );
+        )
+        .spawn();
 
         Ready {
             attested: self,
@@ -176,7 +177,8 @@ impl Ready {
         let block_exec = build_block_exec(args, claims, flight.clone());
         if let Some(dir) = args.prove_batches.clone() {
             tracing::info!(spool = %dir.display(), "prover spool ENABLED (one frame per block)");
-            kardamom_validator::prover::spawn_prover_spool(dir, chain_id.get(), snap_rx, flight);
+            kardamom_validator::prover::ProverSpool::new(dir, chain_id.get(), &snap_rx, flight)
+                .spawn();
         }
 
         // Epoch verification. Sequence rules 1-2 are local and always
