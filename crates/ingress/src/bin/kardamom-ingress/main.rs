@@ -17,6 +17,7 @@
 //! a [`RunningIngress`] that owns everything needed to shut back down.
 
 mod recorders;
+mod watermark;
 
 use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
@@ -33,7 +34,6 @@ use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::LogConfig;
 use kardamom_obs::bin::wait_for_shutdown;
-use kardamom_types::QuorumWatermark;
 use tokio_util::sync::CancellationToken;
 
 use kardamom_types::shard_map::{LANE_COUNT, ShardMap, validate_shard_count};
@@ -331,7 +331,7 @@ impl IngressService {
         // tx_data publish and receipts work.
         let cluster_rt =
             AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
-        let (guard, mut observer) =
+        let (guard, observer) =
             cluster_watermark_observer(cluster_rt, live).context("connect cluster watermark")?;
         // A dedicated std thread runs a blocking egress poll, since the
         // observer holds the `!Send` cluster client. It sends the durable
@@ -339,19 +339,13 @@ impl IngressService {
         // the observer ends. The bus is a tokio `broadcast` channel, so the
         // send never blocks. A send with no live receiver is not an error
         // here.
-        let wm_tx = subscription.watermark_sender();
-        let wm_stop = self.stop.clone();
-        std::thread::Builder::new()
-            .name("cluster-watermark".into())
-            .spawn(move || {
-                while !wm_stop.is_cancelled() {
-                    let Some(position) = observer.next_position() else {
-                        break;
-                    };
-                    let _ = wm_tx.send(QuorumWatermark { position });
-                }
-            })
-            .context("spawn cluster watermark thread")?;
+        watermark::ClusterWatermarkPump::new(
+            observer,
+            subscription.watermark_sender(),
+            self.stop.clone(),
+        )
+        .spawn()
+        .context("spawn cluster watermark thread")?;
         tracing::info!("kardamom-ingress: on-quorum watermark via Aeron Cluster egress");
         Ok(guard)
     }

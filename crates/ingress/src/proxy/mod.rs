@@ -28,29 +28,39 @@ use crate::receipt_cache::ReceiptCache;
 use crate::sig_verify::BatchVerifier;
 use crate::tx_error_dedup::TxErrorDedup;
 
-/// Owns a `broadcast::Receiver<T>` and drains it. Skips `Lagged` and
-/// returns on `Closed`. The proxy's watcher tasks spawn [`Self::run`].
-pub(crate) struct BroadcastWatcher<T> {
-    rx: broadcast::Receiver<T>,
+/// One stream watcher's per-item step. Each watcher in `watchers` holds
+/// its own state and folds one item into it here.
+pub(crate) trait Watch<T> {
+    fn on_item(&mut self, item: T) -> impl Future<Output = ()> + Send;
 }
 
-impl<T> BroadcastWatcher<T>
+/// Owns a `broadcast::Receiver<T>` and the watcher it feeds. Drains the
+/// receiver into the watcher, skipping `Lagged`, until the sender side
+/// closes. The proxy's watcher tasks spawn [`Self::run`].
+pub(crate) struct BroadcastWatcher<T, W> {
+    rx: broadcast::Receiver<T>,
+    watcher: W,
+}
+
+impl<T, W> BroadcastWatcher<T, W>
 where
     T: Clone + Send + 'static,
+    W: Watch<T> + Send + 'static,
 {
-    pub(crate) fn new(rx: broadcast::Receiver<T>) -> Self {
-        Self { rx }
+    pub(crate) fn new(rx: broadcast::Receiver<T>, watcher: W) -> Self {
+        Self { rx, watcher }
     }
 
-    /// Drains `self`, calling `f` with each item, until the sender side
+    /// Start the drain on the runtime. It ends when the sender side
     /// closes.
-    pub(crate) async fn run<F>(mut self, mut f: F)
-    where
-        F: AsyncFnMut(T),
-    {
+    pub(crate) fn spawn(self) {
+        tokio::spawn(self.run());
+    }
+
+    async fn run(mut self) {
         loop {
             match self.rx.recv().await {
-                Ok(item) => f(item).await,
+                Ok(item) => self.watcher.on_item(item).await,
                 Err(broadcast::error::RecvError::Closed) => break,
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
             }
@@ -335,12 +345,12 @@ where
         #[cfg(feature = "binary-protocol")]
         {
             if let Some(addr) = self.cfg.binary_tcp_bind {
-                crate::binary::spawn_tcp_listener(self.clone(), addr);
+                crate::binary::Acceptor::spawn_tcp(self.clone(), addr);
             }
             if let Some(path) = self.cfg.binary_uds_path.clone() {
                 // This is a best-effort unlink of a stale socket.
                 let _ = std::fs::remove_file(&path);
-                crate::binary::spawn_uds_listener(self.clone(), &path)
+                crate::binary::Acceptor::spawn_uds(self.clone(), &path)
                     .map_err(|e| IngressError::internal("uds bind", e))?;
             }
         }
