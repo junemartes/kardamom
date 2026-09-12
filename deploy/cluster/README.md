@@ -38,7 +38,9 @@ no file in the tree names its address:
 ### Names, not addresses
 
 Every node runs its Consul agent as the node resolver (`roles/consul`: DNS
-on the loopback port 53, the host's previous resolvers as recursors). A
+on the loopback port 53, the host's previous resolvers as recursors, and
+`consul-resolver.service` restores `/etc/resolv.conf` at every boot, because
+Docker regenerates it when a node container restarts). A
 dedicated node is `<class>-<i>.node.<datacenter>.consul`; a service is
 `<service>.service.consul` (`registry`, `anvil`, `ingress-jsonrpc`). The
 Nomad jobs derive every peer list from a count and the datacenter, so a

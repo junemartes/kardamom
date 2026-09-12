@@ -120,16 +120,41 @@
 - name: Apply a changed configuration before the resolver switch
   ansible.builtin.meta: flush_handlers
 
-# /etc/resolv.conf is a bind mount in a node container, so the write is
-# in place. On a host it replaces the resolved stub link with a file.
+# The resolver file lives next to the agent configuration, and a boot
+# unit copies it over /etc/resolv.conf before Consul, Nomad and Docker
+# start. Docker regenerates /etc/resolv.conf when a node container
+# restarts; without the unit a restarted node lost its resolver.
+- name: Render the resolver file
+  ansible.builtin.template:
+    src: resolv.conf.j2
+    dest: /etc/consul.d/resolv.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install the resolver boot unit
+  ansible.builtin.template:
+    src: consul-resolver.service.j2
+    dest: /etc/systemd/system/consul-resolver.service
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable the resolver boot unit
+  ansible.builtin.systemd:
+    name: consul-resolver
+    enabled: true
+    daemon_reload: true
+
+# The live switch of this run. /etc/resolv.conf is a bind mount in a node
+# container, so the write is in place. On a host it replaces the resolved
+# stub link with a file.
 - name: Make the agent the node resolver
   when: not (image_build | default(false) | bool)
   ansible.builtin.copy:
+    src: /etc/consul.d/resolv.conf
     dest: /etc/resolv.conf
-    content: |
-      # Managed by Ansible (roles/consul): the local Consul agent resolves
-      # every name and forwards names outside .consul to the recursors.
-      nameserver 127.0.0.1
+    remote_src: true
     mode: "0644"
     unsafe_writes: true
 
