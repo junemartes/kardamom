@@ -23,39 +23,35 @@
 
 # rusteron-client and rusteron-archive each build their own Aeron C tree,
 # and the two libaeron.so differ. The service binaries link the archive
-# crate's build, so prefer its directories when they exist.
-- name: Select Aeron build outputs
+# crate's build, so prefer its directories when they exist. One cargo
+# target holds one archive build per feature set (the services, the load
+# harness and the semantics runner build it separately), so take the most
+# recent build of each library: the binaries carry no runpath, and every
+# build compiles the same pinned Aeron version.
+- name: Collect Aeron build outputs
   ansible.builtin.set_fact:
-    images_library_paths: >-
-      {{ (images_library_found | select('search', '/rusteron-archive-') | list)
+    images_library_candidates: >-
+      {{ (images_library_found | selectattr('path', 'search', '/rusteron-archive-') | list)
          or images_library_found }}
   vars:
     images_library_found: >-
-      {{ images_library_search.files | map(attribute='path')
-         | select('search', '/out/build/lib/libaeron[^/]*\.so$') | sort | list }}
+      {{ images_library_search.files
+         | selectattr('path', 'search', '/out/build/lib/libaeron[^/]*\.so$') | list }}
+
+- name: Select the most recent build of each Aeron library
+  ansible.builtin.set_fact:
+    images_library_paths: >-
+      {{ images_library_paths | default([])
+         + [(images_library_candidates | selectattr('path', 'search', '/' ~ (item | regex_escape) ~ '$')
+             | sort(attribute='mtime') | last).path] }}
+  loop: "{{ images_library_candidates | map(attribute='path') | map('basename') | unique | sort }}"
 
 - name: Require the Aeron runtime libraries
   ansible.builtin.assert:
     that:
-      - "'libaeron.so' in images_library_paths | map('basename') | list"
-      - "'libaeron_archive_c_client.so' in images_library_paths | map('basename') | list"
+      - "'libaeron.so' in images_library_paths | default([]) | map('basename') | list"
+      - "'libaeron_archive_c_client.so' in images_library_paths | default([]) | map('basename') | list"
     fail_msg: Build the Linux service binaries and Aeron shared libraries first.
-
-- name: Check library content for conflicting cached builds
-  ansible.builtin.stat:
-    path: "{{ item }}"
-    follow: true
-    checksum_algorithm: sha256
-  loop: "{{ images_library_paths }}"
-  register: images_library_checksums
-
-- name: Reject different libraries with the same filename
-  ansible.builtin.assert:
-    that: >-
-      images_library_checksums.results | selectattr('item', 'search', '/' ~ (item | regex_escape) ~ '$')
-      | map(attribute='stat.checksum') | unique | length == 1
-    fail_msg: "Conflicting cached {{ item }} builds; clean the release build artifacts before packaging."
-  loop: "{{ images_library_paths | map('basename') | unique | list }}"
 
 - name: Stage Aeron runtime libraries
   ansible.builtin.copy:

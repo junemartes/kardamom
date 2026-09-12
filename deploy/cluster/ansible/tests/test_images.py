@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ANSIBLE = Path(__file__).resolve().parents[1]
@@ -123,13 +124,25 @@ class ImageTest(unittest.TestCase):
                                 env=env, text=True, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_conflicting_cached_libraries_fail_before_building(self):
-        other = self.release / 'build/old-rusteron/out/build/lib'
-        other.mkdir(parents=True)
-        (other / 'libaeron.so').write_text('different Aeron ABI')
-        output = self.run_images(success=False)
-        self.assertIn('Conflicting cached', output)
-        self.assertFalse(any('buildx' in args for _, args in self.calls()))
+    def test_most_recent_cached_library_build_is_staged(self):
+        # One cargo target holds one rusteron-archive build per feature set.
+        # The newest build of each library is staged, and the client crate's
+        # own tree is never preferred over the archive crate's.
+        newer = self.release / 'build/rusteron-archive-bbbb/out/build/lib'
+        older = self.release / 'build/rusteron-archive-aaaa/out/build/lib'
+        client = self.release / 'build/rusteron-client-cccc/out/build/lib'
+        for path in (newer, older, client):
+            path.mkdir(parents=True)
+            for name in ('libaeron.so', 'libaeron_archive_c_client.so'):
+                (path / name).write_text(path.parts[-4])
+        now = time.time()
+        for path, age in ((older, 300), (newer, 100), (client, 0)):
+            for lib in path.iterdir():
+                os.utime(lib, (now - age, now - age))
+        output = self.run_images()
+        self.assertIn('rusteron-archive-bbbb/out/build/lib/libaeron.so', output)
+        self.assertNotIn('rusteron-archive-aaaa/out/build/lib/libaeron.so', output.split('Stage Aeron runtime libraries')[1])
+        self.assertNotIn('rusteron-client', output.split('Stage Aeron runtime libraries')[1])
 
     def test_missing_library_fails_before_building(self):
         (self.libs / 'libaeron.so').unlink()
