@@ -20,6 +20,9 @@
           | map(attribute='NodeID') | first) }}
   register: workloads_anvil_node_info
 
+# The node's advertised HTTP address is its node_ip. The fingerprinted
+# unique.network.ip-address is not: a node with a second network (the CI
+# runner attaches the default bridge too) fingerprints the other one.
 - name: Set the discovered L1 RPC
   ansible.builtin.set_fact:
-    workloads_l1_rpc: "http://{{ workloads_anvil_node_info.json.Attributes['unique.network.ip-address'] }}:{{ ports.anvil_l1 }}"
+    workloads_l1_rpc: "http://{{ workloads_anvil_node_info.json.HTTPAddr | regex_replace(':[0-9]+$', '') }}:{{ ports.anvil_l1 }}"

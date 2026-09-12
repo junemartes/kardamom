@@ -21,6 +21,12 @@ server {
 client {
   enabled = true
 
+  # The fingerprinted node address is node_ip's interface. Without this,
+  # a node with a second network (the CI runner attaches Docker's default
+  # bridge too) fingerprints the other one, and every Consul registration
+  # and port mapping follows it.
+  network_interface = "{{ '{{' }} GetAllInterfaces | include \"address\" \"{{ node_ip }}\" | attr \"name\" {{ '}}' }}"
+
   # Placement identity. node_class and node_pool carry the capacity pool
   # of an elastic node; a core node stays in the default pool. The
   # Autoscaler target selects nodes by node_class. A job selects a pool
