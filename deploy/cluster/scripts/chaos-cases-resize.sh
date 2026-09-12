@@ -115,8 +115,14 @@ group_is_gone() { [ "$(count_running_group "$1" "$2")" = "0" ] && echo ok; }
 # executor addresses are blackholed. Lane 0's replica on node-0 is
 # hard-killed and comes back cold; its lookups for the pinned sender
 # fail (the failure outcomes count), the twin keeps the lane live, and
-# the log stays correct. Then the routes return, the replica is killed
-# once more, and its first park gets an answer (the ok outcome counts).
+# the log stays correct. Then the routes return. The twin is frozen
+# (SIGSTOP) before the replica is killed once more, so no receipt can
+# prove the sender's floor for the newborn: a receipt-proven floor makes
+# the sequencer skip the lookup by design, and with a live twin the
+# receipt usually wins that race. With the twin frozen, the newborn's
+# first park is answered by the lookup (the ok outcome counts), the
+# parked transaction drains, and the lane makes progress on the lookup
+# alone. The twin is thawed afterwards.
 case_lookup_blackout() {
   local node="kardamom-sequencer-0" ip="192.168.56.21" port=9001
   local executors="192.168.56.41 192.168.56.42 192.168.56.43"
@@ -141,11 +147,24 @@ case_lookup_blackout() {
   } || failed=1
   restore_routes
   [ "${failed}" = "0" ] || fail "lookup-blackout: blackout phase failed"
-  log "lookup-blackout: routes restored; hard-killing the replica again for an answered lookup"
+  # Phase 2: freeze the twin, so the newborn cannot learn the sender's
+  # floor from a receipt and must ask an executor.
+  local twin_node="kardamom-sequencer-1" twin_ip="192.168.56.22" twin
+  twin="$(inner_container "${twin_node}" sequencer-0)"
+  [ -n "${twin}" ] || fail "lookup-blackout: no inner sequencer-0 container on ${twin_node}"
+  log "lookup-blackout: routes restored; freezing the twin ${twin} on ${twin_node}, then hard-killing the replica again for an answered lookup"
   base_ok="$(seq_metric_where "${ip}" "${node}" "${port}" kardamom_sequencer_nonce_lookups_total 'outcome="ok"' || echo 0)"
-  inject_hard "${node}" sequencer-0
-  assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
-  wait_until "cold replica's lookup answered" 120 lookups_ok_past "${ip}" "${node}" "${port}" "${base_ok:-0}"
+  freeze_verified "${twin_node}" "${twin}" "${port}" lookup-blackout "${twin_ip}"
+  failed=0
+  {
+    inject_hard "${node}" sequencer-0
+    # The frozen twin still counts as running for Nomad.
+    assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
+    wait_until "cold replica's lookup answered" 120 lookups_ok_past "${ip}" "${node}" "${port}" "${base_ok:-0}"
+  } || failed=1
+  thaw_container "${twin_node}" "${twin}" \
+    || log "lookup-blackout: SIGCONT on the twin failed (replaced mid-freeze?)"
+  [ "${failed}" = "0" ] || fail "lookup-blackout: answered-lookup phase failed"
   assert_progress
 }
 lookups_failed_past() { # <ip> <node> <port> <baseline>
