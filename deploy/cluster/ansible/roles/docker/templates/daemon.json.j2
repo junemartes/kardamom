@@ -1,3 +1,3 @@
 {
-  "insecure-registries": ["{{ registry_host }}:{{ registry_port }}"]
+  "insecure-registries": {{ docker_insecure_registries | to_json }}
 }

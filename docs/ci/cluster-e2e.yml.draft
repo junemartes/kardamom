@@ -23,7 +23,7 @@ name: cluster-e2e
 # Container-based cluster end-to-end (Ansible → Nomad → Consul). Brings up the
 # multi-node cluster as privileged systemd+DinD containers on a 192.168.56.0/24
 # bridge (the VM-less analogue of `make up`), provisions it with the UNMODIFIED
-# site.yml, deploys the Nomad jobs, and runs the pipeline smoke + sustained-load
+# bootstrap.yml, deploys the Nomad jobs, and runs the pipeline smoke + sustained-load
 # + chaos suite. See deploy/cluster/ansible/run.yml and scripts/chaos.sh.
 #
 # The deploy uses the CLUSTERED sealer (Phase 3): a 3-member Aeron Cluster (Raft)
