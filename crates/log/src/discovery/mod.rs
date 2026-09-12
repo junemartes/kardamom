@@ -18,6 +18,7 @@ pub mod catalog;
 pub mod consul;
 pub mod endpoint;
 pub mod memory;
+pub mod plane;
 pub mod reconcile;
 pub mod record;
 pub mod registration;
@@ -28,6 +29,7 @@ pub use endpoint::{
     MANUAL_SUBSCRIPTION_URI, PortAllocator, PortRange, advertise_ip, destination_uri,
     publication_uri,
 };
+pub use plane::{DiscoveredPublisher, DiscoveredSubscriber, StreamPlane};
 pub use reconcile::{DestinationPort, Plan, Reconciler};
 pub use record::{
     ARCHIVE_SERVICE, ArchiveRecord, CLUSTER_MEMBER_SERVICE, ClusterMemberRecord, DISCOVERY_VERSION,

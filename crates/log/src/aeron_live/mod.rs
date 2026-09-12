@@ -75,7 +75,9 @@ pub use handles::tx_receipts::{
     TxReceiptsSubscriberHandle,
 };
 pub use pending::IdleBackoff;
-pub use runtime::{AeronRuntime, PollRecv, PubHandle, TxDataSubscription, TypedSubscription};
+pub use runtime::{
+    AeronRuntime, Destinations, PollRecv, PubHandle, TxDataSubscription, TypedSubscription,
+};
 
 use std::time::Duration;
 

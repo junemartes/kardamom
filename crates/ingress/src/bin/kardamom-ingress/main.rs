@@ -32,6 +32,7 @@ use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
 use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::LogConfig;
+use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_types::QuorumWatermark;
 use tokio_util::sync::CancellationToken;
@@ -186,6 +187,7 @@ impl From<AckPolicyArg> for kardamom_types::AckPolicy {
 /// and `tx_receipts` subscription built on top of it.
 struct OpenedAeron {
     rt: AeronRuntime,
+    plane: StreamPlane,
     recorder_handles: Vec<std::thread::JoinHandle<()>>,
     publication: LiveIngressPublication,
     subscription: LiveIngressSubscription,
@@ -268,6 +270,9 @@ impl IngressService {
         let channels = &self.log_cfg.channels;
         let aeron_cfg = &self.log_cfg.aeron;
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+        let mut plane =
+            StreamPlane::from_config(&self.log_cfg, &format!("ingress-{}", args.ingress_id))
+                .context("build the stream plane")?;
 
         let (recorder_handles, recorder_ready) = if args.archive_durability {
             spawn_tx_data_recorders(
@@ -298,11 +303,12 @@ impl IngressService {
                 .context("archive durability requested but tx_data recorders failed to start")?;
         }
         let subscription =
-            LiveIngressSubscription::open(&rt, channels, args.recorder_id, executor_count)
+            LiveIngressSubscription::open(&rt, &mut plane, args.recorder_id, executor_count)
                 .context("open IngressSubscription")?;
 
         Ok(OpenedAeron {
             rt,
+            plane,
             recorder_handles,
             publication,
             subscription,
@@ -393,6 +399,7 @@ impl IngressService {
             drainer,
             drain_timeout,
             stop: self.stop,
+            plane: opened.plane,
             recorder_handles: opened.recorder_handles,
             // Declared before `_cluster_guard`: struct fields drop in
             // declaration order, so `_rt` drops before `_cluster_guard`
@@ -416,6 +423,9 @@ struct RunningIngress {
     /// How long the drain waits for parked submits: the park bound.
     drain_timeout: Duration,
     stop: CancellationToken,
+    /// The stream plane: shut down before `_rt` drops, so the discovery
+    /// tasks and registrations end first.
+    plane: StreamPlane,
     recorder_handles: Vec<std::thread::JoinHandle<()>>,
     /// See the field-order comment in [`IngressService::run`]: this must
     /// stay declared before `_cluster_guard`. Held only for its `Drop`
@@ -448,6 +458,7 @@ impl RunningIngress {
         for h in self.recorder_handles {
             let _ = h.join();
         }
+        self.plane.shutdown().await;
     }
 }
 

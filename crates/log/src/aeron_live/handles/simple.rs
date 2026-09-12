@@ -9,9 +9,50 @@
 
 use super::super::{AeronRuntime, PubHandle, TypedSubscription};
 use crate::config::ChannelsConfig;
+use crate::discovery::Topic;
+use crate::discovery::plane::{DiscoveredPublisher, DiscoveredSubscriber};
 use crate::error::LogError;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, EpochRecord, FsyncWatermark, TxError};
+
+/// Name the discovery topic and stream of one single-stream handle pair,
+/// so [`crate::discovery::StreamPlane`] can open it either way.
+macro_rules! discoverable {
+    ($pub_name:ident, $sub_name:ident, $msg:ty, $topic:expr, $stream:ident) => {
+        impl DiscoveredPublisher for $pub_name {
+            const TOPIC: Topic = $topic;
+
+            fn stream_id(ch: &ChannelsConfig) -> i32 {
+                ch.$stream
+            }
+
+            fn open_static(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+                Self::open(rt, ch)
+            }
+
+            fn from_publication(inner: PubHandle) -> Self {
+                Self::from_publication(inner)
+            }
+        }
+
+        impl DiscoveredSubscriber for $sub_name {
+            const TOPIC: Topic = $topic;
+            type Msg = $msg;
+
+            fn stream_id(ch: &ChannelsConfig) -> i32 {
+                ch.$stream
+            }
+
+            fn open_static(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+                Self::open(rt, ch)
+            }
+
+            fn from_subscription(rx: TypedSubscription<$msg>) -> Self {
+                Self::from_subscription(rx)
+            }
+        }
+    };
+}
 
 /// Declare a publisher/subscriber handle pair over one config-selected
 /// `(channel, stream_id)`:
@@ -51,9 +92,14 @@ macro_rules! declare_channel_handles {
                 $ch: &ChannelsConfig
                 $(, $arg: $argty)*
             ) -> Result<Self, LogError> {
-                Ok(Self {
-                    inner: rt.open_publication(&$channel, $stream)?,
-                })
+                Ok(Self::from_publication(rt.open_publication(&$channel, $stream)?))
+            }
+
+            /// Wrap a publication opened elsewhere, for example a
+            /// discovered dynamic MDC publication.
+            #[must_use]
+            pub fn from_publication(inner: PubHandle) -> Self {
+                Self { inner }
             }
 
             $($pub_methods)*
@@ -75,9 +121,14 @@ macro_rules! declare_channel_handles {
                 $ch: &ChannelsConfig
                 $(, $arg: $argty)*
             ) -> Result<Self, LogError> {
-                Ok(Self {
-                    rx: rt.open_subscription::<$msg>(&$channel, $stream)?,
-                })
+                Ok(Self::from_subscription(rt.open_subscription::<$msg>(&$channel, $stream)?))
+            }
+
+            /// Wrap a subscription opened elsewhere, for example a
+            /// discovered multi-destination subscription.
+            #[must_use]
+            pub fn from_subscription(rx: TypedSubscription<$msg>) -> Self {
+                Self { rx }
             }
 
             pub async fn recv(&mut self) -> Option<(BPosition, $msg)> {
@@ -123,9 +174,14 @@ macro_rules! declare_channel_handles {
                 $ch: &ChannelsConfig
                 $(, $arg: $argty)*
             ) -> Result<Self, LogError> {
-                Ok(Self {
-                    inner: rt.open_publication(&$channel, $stream)?,
-                })
+                Ok(Self::from_publication(rt.open_publication(&$channel, $stream)?))
+            }
+
+            /// Wrap a publication opened elsewhere, for example a
+            /// discovered dynamic MDC publication.
+            #[must_use]
+            pub fn from_publication(inner: PubHandle) -> Self {
+                Self { inner }
             }
 
             $($pub_methods)*
@@ -147,9 +203,14 @@ macro_rules! declare_channel_handles {
                 $ch: &ChannelsConfig
                 $(, $arg: $argty)*
             ) -> Result<Self, LogError> {
-                Ok(Self {
-                    rx: $subscribe(rt, &$channel, $stream)?,
-                })
+                Ok(Self::from_subscription($subscribe(rt, &$channel, $stream)?))
+            }
+
+            /// Wrap a subscription opened elsewhere, for example a
+            /// discovered multi-destination subscription.
+            #[must_use]
+            pub fn from_subscription(rx: $rxty) -> Self {
+                Self { rx }
             }
 
             pub async fn recv(&mut self) -> Option<$item> {
@@ -234,3 +295,25 @@ declare_channel_handles! {
         ch.fsync_watermark_stream_id
     );
 }
+
+discoverable!(
+    TxErrorsPublisherHandle,
+    TxErrorsSubscriberHandle,
+    TxError,
+    Topic::TxErrors,
+    tx_errors_stream_id
+);
+discoverable!(
+    TxDepositsPublisherHandle,
+    TxDepositsSubscriberHandle,
+    EpochRecord,
+    Topic::TxDeposits,
+    tx_deposits_stream_id
+);
+discoverable!(
+    TxRemoteEpochsPublisherHandle,
+    TxRemoteEpochsSubscriberHandle,
+    RemoteEpochRecord,
+    Topic::TxRemoteEpochs,
+    tx_remote_epochs_stream_id
+);

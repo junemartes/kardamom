@@ -23,6 +23,7 @@ use kardamom_log::aeron_live::{
     TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
+use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::lookup::LookupRequester;
@@ -248,7 +249,15 @@ struct Handles {
 
 impl Handles {
     /// Open every handle this sequencer needs, for the lanes of `cfg`.
-    fn open(rt: &AeronRuntime, channels: &ChannelsConfig, cfg: &SequencerConfig) -> Result<Self> {
+    /// `tx_errors` follows the plane's transport; the rest still open on
+    /// their static channels.
+    async fn open(
+        rt: &AeronRuntime,
+        plane: &mut StreamPlane,
+        cfg: &SequencerConfig,
+    ) -> Result<Self> {
+        let channels = plane.channels().clone();
+        let channels = &channels;
         let own = Self::open_lane(rt, channels, cfg.lane())?;
         let old = cfg
             .extra_lanes
@@ -261,7 +270,9 @@ impl Handles {
                 .context("open TxDepositsSubscriberHandle")?,
             remote_epochs_sub: TxRemoteEpochsSubscriberHandle::open(rt, channels)
                 .context("open TxRemoteEpochsSubscriberHandle")?,
-            errors_pub: TxErrorsPublisherHandle::open(rt, channels)
+            errors_pub: plane
+                .publisher::<TxErrorsPublisherHandle>(rt)
+                .await
                 .context("open TxErrorsPublisherHandle")?,
         })
     }
@@ -503,12 +514,13 @@ async fn main() -> anyhow::Result<()> {
         "kardamom-sequencer starting"
     );
 
-    let channels: ChannelsConfig = LogConfig::resolve(args.log_config.as_deref())
-        .context("resolve log config")?
-        .channels;
+    let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
+    let channels: ChannelsConfig = log_cfg.channels.clone();
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+    let mut plane = StreamPlane::from_config(&log_cfg, &format!("sequencer-{}", cfg.lane()))
+        .context("build the stream plane")?;
 
-    let handles = Handles::open(&rt, &channels, &cfg)?;
+    let handles = Handles::open(&rt, &mut plane, &cfg).await?;
 
     let shutdown = Shutdown::new();
 
@@ -583,6 +595,9 @@ async fn main() -> anyhow::Result<()> {
     // tasks and, when it returns, drops `rt` — before `receipts_rt`,
     // still a local here, drops at the end of `main`.
     loops.join_all().await;
+    // The plane's registrations and discovery tasks end before the
+    // runtime drops inside `resync.feeds.join()`.
+    plane.shutdown().await;
     resync.feeds.join().await;
     Ok(())
 }

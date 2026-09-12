@@ -17,6 +17,7 @@ use kardamom_log::aeron_live::{
     TxReceiptsBoundarySubscriberHandle, TxReceiptsReceiver, TxReceiptsSubscriberHandle,
 };
 use kardamom_log::config::ChannelsConfig;
+use kardamom_log::discovery::StreamPlane;
 use kardamom_types::{
     BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
 };
@@ -152,16 +153,22 @@ pub struct LiveIngressSubscription {
 }
 
 impl LiveIngressSubscription {
+    /// Open the four subscriber handles through `plane`: `tx_errors`
+    /// follows the plane's transport, the rest still open on their
+    /// static channels.
+    ///
     /// # Errors
     ///
     /// Returns `IngressError::Internal` if any of the four subscriber
     /// handles fails to open.
     pub fn open(
         rt: &AeronRuntime,
-        channels: &ChannelsConfig,
+        plane: &mut StreamPlane,
         recorder_id: u8,
         executor_count: Option<NonZeroU32>,
     ) -> Result<Self, IngressError> {
+        let channels = plane.channels().clone();
+        let channels = &channels;
         let (receipts_tx, _) = broadcast::channel::<Receipt>(BUS_CAPACITY);
         let (watermarks_tx, _) = broadcast::channel::<QuorumWatermark>(BUS_CAPACITY);
         let (local_fsync_tx, _) = broadcast::channel::<FsyncWatermark>(BUS_CAPACITY);
@@ -215,7 +222,8 @@ impl LiveIngressSubscription {
         spawn_pump(boundary_sub, block_boundaries_tx.clone());
 
         // This is the tx_errors to TxError fan-out.
-        let errors_sub = TxErrorsSubscriberHandle::open(rt, channels)
+        let errors_sub = plane
+            .subscriber::<TxErrorsSubscriberHandle>(rt)
             .map_err(|e| IngressError::internal("open tx_errors", e))?;
         spawn_pump(errors_sub, tx_errors_tx.clone());
 

@@ -429,6 +429,18 @@ impl AeronRuntime {
         Ok((sub_id, TypedSubscription::new(rx)))
     }
 
+    /// A command-only handle on the destinations of subscription
+    /// `sub_id`. Unlike an [`AeronRuntime`] clone it does not own the
+    /// Aeron thread, so a long-lived task can hold it without keeping the
+    /// runtime alive past the last owner's drop.
+    #[must_use]
+    pub fn destinations(&self, sub_id: u32) -> Destinations {
+        Destinations {
+            cmd_tx: self.cmd_tx.clone(),
+            sub_id,
+        }
+    }
+
     /// Open a `tx_data` subscription yielding `(TxDataLoc, TxEnvelope)`,
     /// pairing each envelope with its Aeron publisher `session_id`. The
     /// session id keeps concurrent (active/active) ingress publishers on
@@ -697,6 +709,49 @@ fn build_aeron(ctx: &rusteron_client::AeronContext) -> Result<Rc<AeronClient>, L
         .start()
         .map_err(|e| LogError::Aeron(format!("Aeron::start: {e}")))?;
     Ok(Rc::new(aeron))
+}
+
+/// The attach and detach commands of one multi-destination subscription,
+/// without ownership of the Aeron thread. See
+/// [`AeronRuntime::destinations`].
+#[derive(Clone)]
+pub struct Destinations {
+    cmd_tx: CbSender<RuntimeCmd>,
+    sub_id: u32,
+}
+
+impl Destinations {
+    /// Attach `uri`. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver rejects or times out the attach,
+    /// or if the Aeron thread is gone.
+    pub fn add(&self, uri: &str) -> Result<(), LogError> {
+        let uri = uri.to_string();
+        let sub_id = self.sub_id;
+        request(
+            &self.cmd_tx,
+            |ack| RuntimeCmd::SubAddDestination { sub_id, uri, ack },
+            "add_destination",
+        )
+    }
+
+    /// Detach `uri`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `uri` is not attached, or if the Aeron thread
+    /// is gone.
+    pub fn remove(&self, uri: &str) -> Result<(), LogError> {
+        let uri = uri.to_string();
+        let sub_id = self.sub_id;
+        request(
+            &self.cmd_tx,
+            |ack| RuntimeCmd::SubRemoveDestination { sub_id, uri, ack },
+            "remove_destination",
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
