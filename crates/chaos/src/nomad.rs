@@ -308,11 +308,7 @@ impl Nomad {
         enable: bool,
         deadline: Duration,
     ) -> anyhow::Result<()> {
-        let spec = if enable {
-            serde_json::json!({ "DrainSpec": { "Deadline": deadline.as_nanos() } })
-        } else {
-            serde_json::json!({ "DrainSpec": null })
-        };
+        let spec = drain_request(enable, deadline);
         let url = self.url(&format!("/v1/node/{node_id}/drain"));
         self.http
             .post(&url)
@@ -325,9 +321,32 @@ impl Nomad {
     }
 }
 
+/// The body of a drain update. Disabling the drain also marks the node
+/// eligible again, as `nomad node drain -disable` does: a drain leaves
+/// the node ineligible, and the API keeps it so unless told otherwise,
+/// in which case no job is placed on the node again and a system job
+/// never returns to it.
+fn drain_request(enable: bool, deadline: Duration) -> serde_json::Value {
+    if enable {
+        serde_json::json!({ "DrainSpec": { "Deadline": deadline.as_nanos() } })
+    } else {
+        serde_json::json!({ "DrainSpec": null, "MarkEligible": true })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabling_a_drain_marks_the_node_eligible() {
+        let on = drain_request(true, Duration::from_secs(120));
+        assert_eq!(on["DrainSpec"]["Deadline"], 120_000_000_000_u64);
+        assert!(on.get("MarkEligible").is_none());
+        let off = drain_request(false, Duration::ZERO);
+        assert!(off["DrainSpec"].is_null());
+        assert_eq!(off["MarkEligible"], true);
+    }
 
     #[test]
     fn decodes_an_allocation_listing() {
