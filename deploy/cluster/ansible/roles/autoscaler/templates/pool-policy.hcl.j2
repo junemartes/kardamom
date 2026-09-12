@@ -1,0 +1,73 @@
+# Managed by Ansible (roles/autoscaler). Node-capacity policy of the pool
+# {{ item.key }}, rendered from the pool contract. It adds a VM when the
+# pool's own clients run short of CPU or memory for allocations. Every
+# query is scoped to the pool's node_class. A Prometheus query with no
+# result is an evaluation error, not zero load: the check then takes no
+# action. The threshold strategy with an upper bound only never scales in;
+# the scale-in check below renders only when the drain contract is
+# enabled.
+{% set pool = item.value %}
+{% set cls = pool.node_class %}
+scaling "pool-{{ item.key }}" {
+  enabled = {{ autoscaler_policies_enabled | bool | lower }}
+  min     = {{ pool.min }}
+  max     = {{ pool.max }}
+
+  policy {
+    cooldown            = "{{ autoscaler_cooldown }}"
+    evaluation_interval = "{{ autoscaler_evaluation_interval }}"
+
+    check "cpu_pressure" {
+      source = "prometheus"
+      query  = "100 * sum(nomad_client_allocated_cpu{node_class=\"{{ cls }}\"}) / clamp_min(sum(nomad_client_allocated_cpu{node_class=\"{{ cls }}\"}) + sum(nomad_client_unallocated_cpu{node_class=\"{{ cls }}\"}), 1)"
+
+      strategy "threshold" {
+        upper_bound = {{ autoscaler_cpu_upper_bound }}
+        delta       = 1
+      }
+    }
+
+    check "memory_pressure" {
+      source = "prometheus"
+      query  = "100 * sum(nomad_client_allocated_memory{node_class=\"{{ cls }}\"}) / clamp_min(sum(nomad_client_allocated_memory{node_class=\"{{ cls }}\"}) + sum(nomad_client_unallocated_memory{node_class=\"{{ cls }}\"}), 1)"
+
+      strategy "threshold" {
+        upper_bound = {{ autoscaler_memory_upper_bound }}
+        delta       = 1
+      }
+    }
+{% if autoscaler_scale_in_enabled | bool %}
+
+    check "cpu_idle" {
+      source = "prometheus"
+      query  = "100 * sum(nomad_client_allocated_cpu{node_class=\"{{ cls }}\"}) / clamp_min(sum(nomad_client_allocated_cpu{node_class=\"{{ cls }}\"}) + sum(nomad_client_unallocated_cpu{node_class=\"{{ cls }}\"}), 1)"
+
+      strategy "threshold" {
+        lower_bound = {{ autoscaler_cpu_lower_bound }}
+        delta       = -1
+      }
+    }
+{% endif %}
+
+    target "hcloud-server" {
+      datacenter             = "{{ autoscaler_contract.datacenter }}"
+      node_class             = "{{ cls }}"
+      node_drain_deadline    = "{{ pool.node_drain_deadline }}"
+      node_purge             = "true"
+      node_selector_strategy = "least_busy"
+
+      hcloud_location        = "{{ autoscaler_contract.location }}"
+      hcloud_image           = "{{ autoscaler_contract.image }}"
+      hcloud_server_type     = "{{ pool.server_type }}"
+      hcloud_group_id        = "{{ pool.group_label.value }}"
+      hcloud_labels          = "{{ pool.labels | dict2items | map(attribute='key') | zip(pool.labels | dict2items | map(attribute='value')) | map('join', '=') | join(',') }}"
+      hcloud_networks        = "{{ autoscaler_contract.network_id }}"
+      hcloud_placement_group = "{{ pool.placement_group_id }}"
+      hcloud_firewalls       = "{{ pool.firewall_id }}"
+      hcloud_ssh_keys        = "{{ autoscaler_contract.ssh_keys | join(',') }}"
+      hcloud_user_data       = <<-USERDATA
+{{ pool.user_data | indent(8, first=true) }}
+      USERDATA
+    }
+  }
+}

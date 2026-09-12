@@ -1,0 +1,25 @@
+#cloud-config
+# The first-boot inputs of an elastic node. No credential is in here:
+# the bootstrap unit obtains the node credentials through enrollment. The
+# OS hostname keeps the Cloud server name, which the Autoscaler maps to
+# the Nomad node through unique.hostname.
+preserve_hostname: false
+write_files:
+  - path: /etc/kardamom/node.yml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      cluster_id: "${cluster_id}"
+      datacenter: "${datacenter}"
+      node_pool: "${pool_id}"
+      node_class: "${pool_id}"
+      role: "${role}"
+      tier: "${tier}"
+      private_interface: "${private_interface}"
+      bootstrap_revision: "${bootstrap_revision}"
+      consul_retry_join:
+%{ for name in consul_retry_join ~}
+        - "${name}"
+%{ endfor ~}
+runcmd:
+  - [systemctl, enable, --now, --no-block, kardamom-bootstrap.service]
