@@ -200,6 +200,32 @@ async fn proxy_parks_until_watermark_advances() {
 /// panic and no double ack, and the receipt cache must hold a single
 /// entry for the `tx_hash`. This drives the full proxy receipt watcher
 /// path, which is what the live ingress uses.
+/// Builds the receipt for one drained envelope, then fans it out
+/// `replicas` times, as N MDS executor replicas replaying the same
+/// canonical order would.
+fn fan_out_replica_receipt(
+    envelope: &kardamom_types::TxEnvelope,
+    pos: BPosition,
+    receipt_bus: &tokio::sync::broadcast::Sender<Receipt>,
+    replicas: usize,
+) {
+    let nonce = nonce_of(&envelope.raw_tx);
+    let receipt = Receipt {
+        tx_idx: pos,
+        tx_hash: envelope.tx_hash,
+        status: true,
+        gas_used: 21_000,
+        logs: Vec::new(),
+        write_set_hash: B256::ZERO,
+        from: envelope.sender,
+        nonce,
+        ..Default::default()
+    };
+    (0..replicas).for_each(|_| {
+        let _ = receipt_bus.send(receipt.clone());
+    });
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
     // Three "executor replicas" all emit the identical receipt for the
@@ -229,25 +255,11 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
     };
     let h = tokio::spawn(async move {
         let mut rx0 = rx0;
-        if let Some(envelope) = rx0.recv().await {
-            let nonce = nonce_of(&envelope.raw_tx);
-            let receipt = Receipt {
-                tx_idx: pos,
-                tx_hash: envelope.tx_hash,
-                status: true,
-                gas_used: 21_000,
-                logs: Vec::new(),
-                write_set_hash: B256::ZERO,
-                from: envelope.sender,
-                nonce,
-                ..Default::default()
-            };
-            // This is the fan-in: the same receipt arrives once per
-            // replica.
-            (0..REPLICAS).for_each(|_| {
-                let _ = receipt_bus.send(receipt.clone());
-            });
-        }
+        let Some(envelope) = rx0.recv().await else {
+            return;
+        };
+        // This is the fan-in: the same receipt arrives once per replica.
+        fan_out_replica_receipt(&envelope, pos, &receipt_bus, REPLICAS);
     });
 
     let signer = signer_for_shard(0, TWO_SHARDS);
@@ -290,6 +302,39 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
 /// overrides the earlier rejection. This drives the full proxy watcher
 /// pipeline, `tx_errors` bus to dedup to pending grace to receipt bus
 /// release, which is what the live ingress uses.
+/// Fans out two duplicate rejections for `envelope`, a 2x fan-out from
+/// both racing replicas, then lands the twin's receipt after a short
+/// delay, well inside the rejection-release grace.
+async fn race_rejection_then_receipt(
+    envelope: &kardamom_types::TxEnvelope,
+    pos: BPosition,
+    error_bus: &tokio::sync::broadcast::Sender<kardamom_types::TxError>,
+    receipt_bus: &tokio::sync::broadcast::Sender<Receipt>,
+) {
+    let nonce = nonce_of(&envelope.raw_tx);
+    (0..2).for_each(|_| {
+        let _ = error_bus.send(kardamom_types::TxError {
+            sender: envelope.sender,
+            nonce,
+            reason: kardamom_types::TxErrorReason::DuplicatedTx {
+                expected_nonce: nonce + 1,
+            },
+        });
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let _ = receipt_bus.send(Receipt {
+        tx_idx: pos,
+        tx_hash: envelope.tx_hash,
+        status: true,
+        gas_used: 21_000,
+        logs: Vec::new(),
+        write_set_hash: B256::ZERO,
+        from: envelope.sender,
+        nonce,
+        ..Default::default()
+    });
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn racing_replica_rejection_is_overridden_by_twin_success() {
     let cfg = IngressConfig {
@@ -311,34 +356,10 @@ async fn racing_replica_rejection_is_overridden_by_twin_success() {
     };
     let h = tokio::spawn(async move {
         let mut rx0 = rx0;
-        if let Some(envelope) = rx0.recv().await {
-            let nonce = nonce_of(&envelope.raw_tx);
-            // Replica A wrongly rejects. The rejection arrives from both
-            // replicas, a 2x fan-out, and before the twin's receipt.
-            (0..2).for_each(|_| {
-                let _ = error_bus.send(kardamom_types::TxError {
-                    sender: envelope.sender,
-                    nonce,
-                    reason: kardamom_types::TxErrorReason::DuplicatedTx {
-                        expected_nonce: nonce + 1,
-                    },
-                });
-            });
-            // The twin ordered it. The receipt lands shortly after, well
-            // inside the rejection-release grace.
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            let _ = receipt_bus.send(Receipt {
-                tx_idx: pos,
-                tx_hash: envelope.tx_hash,
-                status: true,
-                gas_used: 21_000,
-                logs: Vec::new(),
-                write_set_hash: B256::ZERO,
-                from: envelope.sender,
-                nonce,
-                ..Default::default()
-            });
-        }
+        let Some(envelope) = rx0.recv().await else {
+            return;
+        };
+        race_rejection_then_receipt(&envelope, pos, &error_bus, &receipt_bus).await;
     });
 
     let signer = signer_for_shard(0, TWO_SHARDS);

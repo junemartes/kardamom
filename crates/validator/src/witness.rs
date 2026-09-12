@@ -124,18 +124,29 @@ fn try_anchor_round(
             path,
             account,
             hash,
-        }) => {
-            if add_missing_target(acct_targets, slot_targets, path, account) {
-                Ok(None)
-            } else {
-                Err(EngineError::WitnessUnanchored(format!(
-                    "capture fixed point stalled: node {hash} at {path:?} \
-                     (account {account:?}) missing from its own walk"
-                )))
-            }
-        }
+        }) => resolve_missing_node(acct_targets, slot_targets, path, account, hash),
         Err(e) => Err(EngineError::from(e)),
     }
+}
+
+/// Grows the targets for the node named by `path`/`account`, for another
+/// round. Reports [`EngineError::WitnessUnanchored`] instead, if growing
+/// the targets found nothing new: the walk cannot supply what the
+/// recompute needs, even after this round.
+fn resolve_missing_node(
+    acct_targets: &mut BTreeSet<Nibbles>,
+    slot_targets: &mut BTreeMap<Address, BTreeSet<Nibbles>>,
+    path: Nibbles,
+    account: Option<Address>,
+    hash: B256,
+) -> Result<Option<B256>, EngineError> {
+    if add_missing_target(acct_targets, slot_targets, path, account) {
+        return Ok(None);
+    }
+    Err(EngineError::WitnessUnanchored(format!(
+        "capture fixed point stalled: node {hash} at {path:?} \
+         (account {account:?}) missing from its own walk"
+    )))
 }
 
 /// Build the initial account and storage-slot targets: the witness's read

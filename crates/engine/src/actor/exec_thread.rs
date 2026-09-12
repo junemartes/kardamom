@@ -20,7 +20,7 @@ use super::wiring::ExecPorts;
 // Re-exported so sibling arm modules (`exec_records`, `exec_markers`,
 // `exec_boundary`, `exec_settle`) can import both `ExecState` and `Flow`
 // from this one module, matching where the loop and the spawn live.
-pub(super) use super::exec_state::ExecState;
+pub(crate) use super::exec_state::ExecState;
 // Re-exported at crate visibility so `actor.rs` can, in turn, re-export
 // them to the test submodules that build `ExecInputs` directly.
 pub(crate) use super::exec_state::{ExecHooks, ExecInputs};
@@ -50,6 +50,21 @@ enum Recv {
 pub(super) enum Flow {
     Continue,
     Stop,
+}
+
+impl<W: ExecPorts + 'static> ExecState<W> {
+    /// Spawn the exec thread. The state is built on the spawned thread, so
+    /// the resume snapshot it opens stays thread-bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS refuses to spawn the thread.
+    pub(crate) fn spawn(inputs: ExecInputs<W>) -> JoinHandle<Result<(), ExecutorError>> {
+        thread::Builder::new()
+            .name("executor-exec".into())
+            .spawn(move || -> Result<(), ExecutorError> { Self::new(inputs).run() })
+            .expect("spawn exec")
+    }
 }
 
 impl<W: ExecPorts> ExecState<W> {
@@ -127,18 +142,4 @@ impl<W: ExecPorts> ExecState<W> {
             }
         }
     }
-}
-
-/// Spawn the exec thread.
-///
-/// # Panics
-///
-/// Panics if the OS refuses to spawn the thread.
-pub(crate) fn spawn_exec<W: ExecPorts + 'static>(
-    inputs: ExecInputs<W>,
-) -> JoinHandle<Result<(), ExecutorError>> {
-    thread::Builder::new()
-        .name("executor-exec".into())
-        .spawn(move || -> Result<(), ExecutorError> { ExecState::new(inputs).run() })
-        .expect("spawn exec")
 }
