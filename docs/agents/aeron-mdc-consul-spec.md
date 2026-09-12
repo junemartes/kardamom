@@ -130,10 +130,11 @@ Freeze these service names for infrastructure integration:
 | `kardamom-cluster-member` | Fixed Aeron Cluster member identities and their current endpoints. |
 
 Publisher records use a unique service ID per allocation/process incarnation,
-logical topic, shard and publication. The service address and port are the
+logical topic, lane and publication. The service address and port are the
 actual private control endpoint. Required metadata are string-valued:
 `discovery_version=1`, `cluster_id`, `chain_id`, `topic`, `stream_id`,
-`publisher_id`, and `shard_id` for sharded streams. Advertise session identity
+`publisher_id`, and `lane_id` for transaction-data lanes. The lane ID is the
+physical transport lane in the shard map, not a virtual-slot or node ordinal. Advertise session identity
 when available, but use received Aeron image metadata as the authority for
 transaction positions. Receiver reconcilers must distinguish replacement
 incarnations even when an endpoint is reused.
@@ -231,10 +232,12 @@ and final configuration schema exist. Do not claim an end-to-end deployment
 passes by substituting old multicast binaries.
 
 Sequencer node elasticity is a separate problem from transport discovery.
-Preserve two racing replicas per shard and independent placement. Increasing a
-node pool does not authorize changing `partition_count` or deriving shard IDs
-from ephemeral machine ordinals. Infrastructure must not enable automatic
-sequencer scale-in until shard coverage and drain rules are implemented.
+Current main already implements explicit lanes and virtual-slot ownership; see
+[dynamic sequencer sizing](../specs/dynamic-sequencer-sizing.md). Preserve that
+resize protocol, two racing replicas per lane and independent placement.
+Increasing a node pool does not authorize changing the shard map or deriving
+lane IDs from ephemeral machine ordinals. Infrastructure must verify lane
+coverage and drain rules before enabling automatic sequencer scale-in.
 
 ## Implementation sequence
 
