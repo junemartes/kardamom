@@ -283,18 +283,6 @@ pub struct ChannelsConfig {
     pub tx_data_channel_template: String,
     pub tx_data_stream_id_base: i32,
 
-    /// `TxOrdering`: the canonical orderer, carrying tiny `TxOrderingMessage`
-    /// records (`TxRef` plus sealer-emitted boundary markers). Recorded.
-    ///
-    /// In cluster-only mode, the live `tx_ordering` transport is the Aeron
-    /// Cluster (Raft) orderer, not this Aeron channel. `tx_ordering_channel`
-    /// and `tx_ordering_stream_id` remain because the sealer's MDC
-    /// publication still names this stream id, and the archive recorder
-    /// (`RecorderKind::TxOrdering`) records frames from it for the
-    /// durable-watermark path.
-    pub tx_ordering_channel: ChannelUri,
-    pub tx_ordering_stream_id: i32,
-
     /// `TxReceipts`: receipts and block boundaries. Not recorded.
     ///
     /// Single-host/IPC default: one shared channel (`tx_receipts_channel`)
@@ -386,22 +374,11 @@ pub struct ChannelsConfig {
     pub tx_bal_channel: ChannelUri,
     pub tx_bal_stream_id: i32,
 
-    /// `TxOrdering` per-recorder fsync watermark publication, parameterized
-    /// by `recorder_id`, for example "aeron:ipc?alias=fsync-wm-b-{rid}".
+    /// Per-recorder fsync watermark stream, parameterized by
+    /// `recorder_id`, for example "aeron:ipc?alias=fsync-wm-{rid}". The
+    /// ingress subscribes to it for the local-fsync ack policies.
     pub fsync_watermark_channel_template: String,
     pub fsync_watermark_stream_id: i32,
-
-    /// `TxData` per-sequencer fsync watermark publication. Each `tx_data` has
-    /// its own fsync sidecar, publishing `fsynced_tx_data_position[i]` to
-    /// its own watermark stream. The URI template substitutes `{sid}` with
-    /// the sequencer id. The stream id is
-    /// `fsync_watermark_tx_data_stream_id_base + sequencer_id`.
-    pub fsync_watermark_tx_data_channel_template: String,
-    pub fsync_watermark_tx_data_stream_id_base: i32,
-
-    /// Aggregated quorum watermark (`tx_ordering`).
-    pub quorum_watermark_channel: ChannelUri,
-    pub quorum_watermark_stream_id: i32,
 }
 
 impl ChannelsConfig {
@@ -435,9 +412,9 @@ impl ChannelsConfig {
     /// Returns an error if MDS is enabled and
     /// `tx_receipts_endpoint_base_port` is unset, or does not leave room
     /// for every replica's receipt and boundary port under 65535; or if
-    /// `tx_data_stream_id_base`, `fsync_watermark_tx_data_stream_id_base`,
-    /// or `tx_receipts_stream_id` sits too close to `i32::MAX` for its
-    /// `+ sequencer_id` or `+ 1` derived id to stay in range.
+    /// `tx_data_stream_id_base` or `tx_receipts_stream_id` sits too close
+    /// to `i32::MAX` for its `+ sequencer_id` or `+ 1` derived id to stay
+    /// in range.
     pub fn validate(&self) -> Result<(), String> {
         if self.tx_receipts_mds_enabled() {
             let Some(base) = self.tx_receipts_endpoint_base_port else {
@@ -459,21 +436,14 @@ impl ChannelsConfig {
                 ));
             }
         }
-        // `tx_data_stream_id`/`fsync_watermark_tx_data_stream_id` add a
-        // `u8` sequencer id (at most 255) to the base. Leaving 255 of
-        // headroom below `i32::MAX` means that add never overflows.
+        // `tx_data_stream_id` adds a `u8` sequencer id (at most 255) to
+        // the base. Leaving 255 of headroom below `i32::MAX` means that
+        // add never overflows.
         if self.tx_data_stream_id_base > i32::MAX - 255 {
             return Err(format!(
                 "tx_data_stream_id_base ({}) too close to i32::MAX: \
                  tx_data_stream_id(sequencer_id) would overflow",
                 self.tx_data_stream_id_base
-            ));
-        }
-        if self.fsync_watermark_tx_data_stream_id_base > i32::MAX - 255 {
-            return Err(format!(
-                "fsync_watermark_tx_data_stream_id_base ({}) too close to i32::MAX: \
-                 fsync_watermark_tx_data_stream_id(sequencer_id) would overflow",
-                self.fsync_watermark_tx_data_stream_id_base
             ));
         }
         // `tx_receipts_boundary_stream_id` adds 1 to `tx_receipts_stream_id`.
@@ -575,31 +545,11 @@ impl ChannelsConfig {
         self.tx_receipts_stream_id.saturating_add(1)
     }
 
-    /// Per-recorder `tx_ordering` fsync watermark URI (`{rid}` substituted).
+    /// Per-recorder fsync watermark URI (`{rid}` substituted).
     #[must_use]
     pub fn fsync_watermark_channel(&self, recorder_id: u8) -> String {
         self.fsync_watermark_channel_template
             .replace("{rid}", &recorder_id.to_string())
-    }
-
-    /// Per-sequencer `tx_data` fsync watermark URI (`{sid}` substituted).
-    #[must_use]
-    pub fn fsync_watermark_tx_data_channel(&self, sequencer_id: u8) -> String {
-        self.fsync_watermark_tx_data_channel_template
-            .replace("{sid}", &sequencer_id.to_string())
-    }
-
-    /// Per-sequencer `tx_data` fsync watermark stream id.
-    ///
-    /// `validate` proves `fsync_watermark_tx_data_stream_id_base <=
-    /// i32::MAX - 255` for a loaded config, so this add never overflows
-    /// there. A directly built `ChannelsConfig` (as in some tests) can
-    /// skip that check; `saturating_add` avoids silently wrapping into a
-    /// negative stream id.
-    #[must_use]
-    pub fn fsync_watermark_tx_data_stream_id(&self, sequencer_id: u8) -> i32 {
-        self.fsync_watermark_tx_data_stream_id_base
-            .saturating_add(i32::from(sequencer_id))
     }
 }
 
@@ -629,17 +579,13 @@ impl Default for ChannelsConfig {
     fn default() -> Self {
         // Defaults are all IPC, so single-host deployments (the
         // in-container test runs on Linux, the `just aeron-driver-up`
-        // path runs on macOS) work out of the box. Multi-host production
-        // deployments override the {tx_ordering, tx_receipts,
-        // fsync_watermark, quorum_watermark} channels to UDP unicast or
-        // UDP multicast, at the operator's discretion. macOS in
-        // particular cannot route UDP multicast over loopback, so the IPC
-        // defaults are required for local e2e.
+        // path runs on macOS) work out of the box. Multi-host
+        // deployments override the channels to UDP. macOS in particular
+        // cannot route UDP multicast over loopback, so the IPC defaults
+        // are required for local e2e.
         Self {
             tx_data_channel_template: "aeron:ipc?alias=a-{sid}".into(),
             tx_data_stream_id_base: 2000,
-            tx_ordering_channel: "aeron:ipc?alias=tx-ordering".into(),
-            tx_ordering_stream_id: 1001,
             tx_receipts_channel: "aeron:ipc?alias=tx-receipts".into(),
             tx_receipts_stream_id: 1002,
             // MDS is disabled by default (single-host IPC uses
@@ -663,7 +609,7 @@ impl Default for ChannelsConfig {
             tx_deposits_stream_id: 1016,
             // 1017 sits next to tx_deposits (1016), the stream it mirrors. It
             // stays clear of every other block: receipts (1002, 1003), BAL
-            // (1004), fsync (1010), tx_errors (1015), quorum (1020).
+            // (1004), fsync (1010), tx_errors (1015).
             tx_remote_epochs_channel: "aeron:ipc?alias=tx-remote-epochs".into(),
             tx_remote_epochs_stream_id: 1017,
             // 1004 sits in the free range between the receipt block
@@ -673,10 +619,6 @@ impl Default for ChannelsConfig {
             tx_bal_stream_id: 1004,
             fsync_watermark_channel_template: "aeron:ipc?alias=fsync-wm-{rid}".into(),
             fsync_watermark_stream_id: 1010,
-            fsync_watermark_tx_data_channel_template: "aeron:ipc?alias=fsync-wm-a-{sid}".into(),
-            fsync_watermark_tx_data_stream_id_base: 1030,
-            quorum_watermark_channel: "aeron:ipc?alias=quorum-watermark".into(),
-            quorum_watermark_stream_id: 1020,
         }
     }
 }

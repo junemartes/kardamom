@@ -34,17 +34,15 @@
 //!
 //! ## Handle set
 //!
-//! Maps the MDS channel topology onto Send-friendly handles:
-//! - `TxData{Publisher,Subscriber}Handle`: per-shard envelope channel. The
-//!   proxy/ingress publishes; sequencers, executors, and batchers
+//! Maps the channel topology onto Send-friendly handles:
+//! - `TxData{Publisher,Subscriber}Handle`: per-lane envelope channel. The
+//!   ingress publishes; sequencers, executors, validators, and batchers
 //!   subscribe.
-//! - `TxReceipts{Publisher,ReceiptSubscriber,BoundarySubscriber}Handle`:
+//! - `TxReceipts{Publisher,Subscriber,BoundarySubscriber}Handle`:
 //!   receipts plus slim boundaries (not recorded). The executor
-//!   publishes; the proxy/state writer subscribe.
-//! - `FsyncWatermark{Publisher,Subscriber}Handle`: per-recorder fsync
-//!   watermark streams; ingress subscribes and fans them out.
-//! - `Quorum{Publisher,Subscriber}Handle`: the single durable quorum
-//!   watermark.
+//!   publishes; the ingress, sequencers, and validators subscribe.
+//! - `TxErrors`, `TxDeposits`, `TxRemoteEpochs`, `FsyncWatermark`
+//!   publisher/subscriber pairs: one stream each (see `handles::simple`).
 //!
 //! This module has an unconditional dependency on rusteron.
 //!
@@ -67,10 +65,9 @@ mod runtime;
 mod thread;
 
 pub use handles::simple::{
-    FsyncWatermarkPublisherHandle, FsyncWatermarkSubscriberHandle, QuorumPublisherHandle,
-    QuorumSubscriberHandle, TxDepositsPublisherHandle, TxDepositsSubscriberHandle,
-    TxErrorsPublisherHandle, TxErrorsSubscriberHandle, TxRemoteEpochsPublisherHandle,
-    TxRemoteEpochsSubscriberHandle,
+    FsyncWatermarkPublisherHandle, FsyncWatermarkSubscriberHandle, TxDepositsPublisherHandle,
+    TxDepositsSubscriberHandle, TxErrorsPublisherHandle, TxErrorsSubscriberHandle,
+    TxRemoteEpochsPublisherHandle, TxRemoteEpochsSubscriberHandle,
 };
 pub use handles::tx_data::{TxDataPublisherHandle, TxDataSubscriberHandle};
 pub use handles::tx_receipts::{
@@ -192,6 +189,6 @@ const _: fn() = || {
     assert_send::<TxDepositsSubscriberHandle>();
     assert_send_sync::<FsyncWatermarkPublisherHandle>();
     assert_send::<FsyncWatermarkSubscriberHandle>();
-    assert_send_sync::<QuorumPublisherHandle>();
-    assert_send::<QuorumSubscriberHandle>();
+    assert_send_sync::<TxRemoteEpochsPublisherHandle>();
+    assert_send::<TxRemoteEpochsSubscriberHandle>();
 };

@@ -435,11 +435,9 @@ else:
     err("group_vars/all.yml: missing node_classes.executor ip_start/count")
 
 # --- config templates -----------------------------------------------------------
-# Cluster-only: tx_ordering is carried by the Aeron Cluster (Raft), not the
-# legacy MDC pub/sub, so the old sealer channel_b_mdc_control ⊆ tx_ordering_mdc_
-# publishers contract (and the standalone sealer.toml.tpl it read) are gone.
-# channels.toml.tpl is consumed via --log-config by every pipeline service;
-# spot-check the flag is actually wired.
+# tx_ordering is carried by the Aeron Cluster (Raft). channels.toml.tpl is
+# consumed via --log-config by every pipeline service; spot-check the flag is
+# actually wired.
 for job in ("ingress", "sequencer", "executor", "da-watcher"):
     must_contain(
         jobs / f"{job}.nomad.hcl",

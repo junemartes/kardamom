@@ -10,20 +10,11 @@
 # ingress.toml supplies the [cluster] Aeron Cluster (Raft) client
 # connection, for the on-quorum watermark observer. Other runtime
 # tuning goes through flags. channels.toml supplies the UDP multicast
-# channels. The on-quorum ack gate's durable watermark is no longer an
-# Aeron quorum_watermark stream. In the cluster-only topology, ingress
-# derives it from Aeron Cluster egress progress; see
-# crates/ingress/src/cluster.rs.
+# channels. The on-quorum ack gate's durable watermark comes from Aeron
+# Cluster egress progress; see crates/ingress/src/cluster.rs.
 #
-# tx_receipts MDS fan-in: channels.toml's tx_receipts_control_channel
-# and tx_receipts_executor_count drive ingress to open one
-# control-mode=manual subscription, and attach each executor replica's
-# per-replica endpoint (0 through N). It dedups the N identical receipt
-# copies by tx hash. executor_count comes from the log config; override
-# it at runtime with --executor-count or KARDAMOM_EXECUTOR_COUNT.
-# TODO(consul-watch): swap the static count for a Consul watch on an
-# `executor-receipts` service, so membership changes add or remove
-# destinations live.
+# tx_receipts: every ingress replica joins the shared multicast group and
+# dedups the N identical receipt copies by tx hash.
 #
 # This shares the node's Aeron media driver, through the bind-mounted
 # tmpfs aeron.dir. It uses host networking, so :8545 binds on the

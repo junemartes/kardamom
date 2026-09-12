@@ -36,10 +36,7 @@ fn empty_file_yields_defaults() {
     // Must match the built-in defaults exactly.
     let d = LogConfig::default();
     assert_eq!(cfg.recorder_id, d.recorder_id);
-    assert_eq!(
-        cfg.channels.tx_ordering_channel,
-        d.channels.tx_ordering_channel
-    );
+    assert_eq!(cfg.channels.tx_errors_channel, d.channels.tx_errors_channel);
     assert_eq!(cfg.aeron.file_sync_level, d.aeron.file_sync_level);
 }
 
@@ -49,14 +46,14 @@ fn partial_channels_section_inherits_other_fields() {
     let f = write_tmp(
         r#"
             [channels]
-            tx_ordering_channel = "aeron:udp?endpoint=239.192.56.11:40010"
-            tx_ordering_stream_id = 1001
+            tx_errors_channel = "aeron:udp?endpoint=239.192.56.17:40030"
+            tx_errors_stream_id = 1015
             "#,
     );
     let cfg = LogConfig::from_toml_path(f.path()).expect("load partial");
     assert_eq!(
-        cfg.channels.tx_ordering_channel,
-        "aeron:udp?endpoint=239.192.56.11:40010"
+        cfg.channels.tx_errors_channel,
+        "aeron:udp?endpoint=239.192.56.17:40030"
     );
     // Untouched channel fields fall back to IPC defaults.
     assert_eq!(
@@ -87,7 +84,7 @@ fn unknown_field_is_rejected() {
     let f = write_tmp(
         r#"
             [channels]
-            tx_ordering_channLE = "typo"
+            tx_errors_channLE = "typo"
             "#,
     );
     let err = LogConfig::from_toml_path(f.path()).expect_err("typo must be rejected");
@@ -105,8 +102,8 @@ fn missing_file_is_a_config_error() {
 fn resolve_none_is_default() {
     let cfg = LogConfig::resolve(None).expect("resolve none");
     assert_eq!(
-        cfg.channels.tx_ordering_channel,
-        LogConfig::default().channels.tx_ordering_channel
+        cfg.channels.tx_errors_channel,
+        LogConfig::default().channels.tx_errors_channel
     );
 }
 
@@ -117,7 +114,6 @@ fn tx_bal_defaults_present() {
     assert!(ch.tx_bal_channel.contains("tx-bal"));
     // Must not collide with the receipt block or other channels.
     for other in [
-        ch.tx_ordering_stream_id,
         ch.tx_receipts_stream_id,
         ch.tx_receipts_stream_id + 1,
         ch.tx_errors_stream_id,
@@ -136,14 +132,12 @@ fn tx_remote_epochs_defaults_present() {
     // collision silently delivers another stream's frames to be rkyv-decoded
     // as a RemoteEpochRecord.
     for other in [
-        ch.tx_ordering_stream_id,
         ch.tx_receipts_stream_id,
         ch.tx_receipts_stream_id + 1,
         ch.tx_bal_stream_id,
         ch.tx_errors_stream_id,
         ch.tx_deposits_stream_id,
         ch.fsync_watermark_stream_id,
-        ch.quorum_watermark_stream_id,
     ] {
         assert_ne!(ch.tx_remote_epochs_stream_id, other);
     }
@@ -159,8 +153,8 @@ fn round_trips_through_toml() {
     let f = write_tmp(&s);
     let back = LogConfig::from_toml_path(f.path()).expect("reparse");
     assert_eq!(
-        back.channels.quorum_watermark_stream_id,
-        original.channels.quorum_watermark_stream_id
+        back.channels.fsync_watermark_stream_id,
+        original.channels.fsync_watermark_stream_id
     );
     assert_eq!(
         back.aeron.archive_control_request_channel,
@@ -336,15 +330,6 @@ fn tx_data_stream_id_base_too_close_to_max_is_rejected() {
         "a base within 255 of i32::MAX must fail validate, since \
          tx_data_stream_id(255) would overflow"
     );
-}
-
-#[test]
-fn fsync_watermark_tx_data_stream_id_base_too_close_to_max_is_rejected() {
-    let ch = ChannelsConfig {
-        fsync_watermark_tx_data_stream_id_base: i32::MAX - 10,
-        ..Default::default()
-    };
-    assert!(ch.validate().is_err());
 }
 
 #[test]

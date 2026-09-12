@@ -1,5 +1,5 @@
-//! The five structurally identical single-stream handle pairs: `TxErrors`,
-//! `TxDeposits`, `TxRemoteEpochs`, `FsyncWatermark`, Quorum. Each is a publisher
+//! The four structurally identical single-stream handle pairs: `TxErrors`,
+//! `TxDeposits`, `TxRemoteEpochs`, `FsyncWatermark`. Each is a publisher
 //! wrapping one [`PubHandle`] plus a subscriber wrapping one typed receiver, differing
 //! only in message type, channel/stream selection, and the publisher's
 //! publish surface. [`declare_channel_handles!`] stamps out the
@@ -11,7 +11,7 @@ use super::super::{AeronRuntime, PubHandle, TypedSubscription};
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{BPosition, EpochRecord, FsyncWatermark, QuorumWatermark, TxError};
+use kardamom_types::{BPosition, EpochRecord, FsyncWatermark, TxError};
 
 /// Declare a publisher/subscriber handle pair over one config-selected
 /// `(channel, stream_id)`:
@@ -233,20 +233,4 @@ declare_channel_handles! {
         ch.fsync_watermark_channel(recorder_id),
         ch.fsync_watermark_stream_id
     );
-}
-
-declare_channel_handles! {
-    /// Aggregated quorum watermark publisher.
-    publisher QuorumPublisherHandle {
-        /// # Errors
-        ///
-        /// Returns an error if the underlying Aeron offer fails or times
-        /// out (see `PubHandle::publish`).
-        pub fn publish(&self, q: &QuorumWatermark) -> Result<(), LogError> {
-            self.inner.publish(q).map(|_| ())
-        }
-    }
-    /// Aggregated quorum watermark subscriber.
-    subscriber QuorumSubscriberHandle(QuorumWatermark);
-    open(ch) = (ch.quorum_watermark_channel, ch.quorum_watermark_stream_id);
 }
