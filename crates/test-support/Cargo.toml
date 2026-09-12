@@ -1,0 +1,19 @@
+[package]
+name = "kardamom-test-support"
+version.workspace = true
+edition.workspace = true
+
+# The one copy of the sign-and-wrap test fixture: sign a `TxLegacy`, encode
+# it as EIP-2718 bytes, keccak the bytes, and wrap the result in a
+# `kardamom_types::TxEnvelope`. A leaf crate: it depends on `kardamom-types`
+# and nothing above it, so every crate in the workspace can use it as a
+# dev-dependency without a cycle.
+
+[dependencies]
+kardamom-types = { workspace = true }
+alloy-consensus = { workspace = true }
+alloy-eips = { workspace = true }
+alloy-network = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-signer-local = { workspace = true }
+bytes = { workspace = true }

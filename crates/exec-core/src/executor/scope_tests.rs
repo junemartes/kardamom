@@ -3,36 +3,21 @@
 use super::*;
 use crate::executor::test_support::{boundary, run_once, slot};
 use crate::state::MockStateDatabase;
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::Bytes as AlloyBytes;
-use alloy_primitives::{B256, TxKind as APTxKind, U256, address, keccak256};
+use alloy_primitives::{B256, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
+use kardamom_test_support::LegacyTx;
 use kardamom_types::TxEnvelope as KtTxEnvelope;
 use revm::primitives::KECCAK_EMPTY;
 
 fn signed_transfer(from: &PrivateKeySigner, to: Address, value: u64, nonce: u64) -> KtTxEnvelope {
-    let mut tx = TxLegacy {
-        chain_id: Some(1),
+    LegacyTx {
+        to,
         nonce,
-        gas_price: 0,
-        gas_limit: 21_000,
-        to: APTxKind::Call(to),
-        value: U256::from(value),
-        input: AlloyBytes::new(),
-    };
-    let sig = from.sign_transaction_sync(&mut tx).expect("sign");
-    let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
-    let raw_tx = Bytes::from(alloy_env.encoded_2718());
-    let tx_hash = keccak256(&raw_tx);
-    KtTxEnvelope {
-        correlation_id: 0,
-        raw_tx,
-        sender: from.address(),
-        tx_hash,
+        value,
+        ..Default::default()
     }
+    .sign(from)
 }
 
 // -- Deterministically invalid canonical txs skip, never halt ---------

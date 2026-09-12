@@ -56,24 +56,20 @@ const SSTORE_42_AT_VAR_KEY: [u8; 8] = [
 
 fn signed_transfer(signer: &PrivateKeySigner, to: Address, nonce: u64) -> TxEnvelope {
     LegacyTx {
-        chain_id: 1,
         to,
         nonce,
         value: 1,
-        gas_limit: 21_000,
-        gas_price: 0,
+        ..Default::default()
     }
     .sign(signer)
 }
 
 fn signed_sstore_call(signer: &PrivateKeySigner, contract: Address, nonce: u64) -> TxEnvelope {
     LegacyTx {
-        chain_id: 1,
         to: contract,
         nonce,
-        value: 0,
         gas_limit: 100_000,
-        gas_price: 0,
+        ..Default::default()
     }
     .sign(signer)
 }

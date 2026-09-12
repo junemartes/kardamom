@@ -1,75 +1,22 @@
-//! The signed-legacy-transaction builder this crate's own fixtures use
-//! ([`LegacyTx`]), and the channel-backed [`ChannelHarness`] that drives a
-//! real [`crate::Executor::run`] pipeline in-process over channels
-//! standing in for the wire.
+//! The channel-backed [`ChannelHarness`] that drives a real
+//! [`crate::Executor::run`] pipeline in-process over channels, and a
+//! re-export of the signed-legacy-transaction fixture from
+//! `kardamom-test-support`.
 //!
-//! Most of `kardamom-validator` and `kardamom-executor`'s integration
-//! tests still carry their own copy of the sign-and-wrap shape (sign a
-//! `TxLegacy`, encode 2718, keccak the bytes, wrap in a `TxEnvelope`).
-//! The `test-support` feature exists so those crates can depend on this
-//! module instead; migrating each remaining copy is a follow-up, not
-//! done yet. `kardamom-validator`'s `forged_envelope_chaos` test already
-//! reaches [`ChannelHarness`] this way. This crate's own
-//! `actor::test_support::legacy` already builds on [`LegacyTx::sign`].
+//! [`LegacyTx`] and the signer helpers live in `kardamom-test-support`.
+//! This module re-exports them, so a caller that already imports
+//! `kardamom_engine::actor::fixtures` for the harness gets the fixture
+//! from the same path. `kardamom-validator` and `kardamom-executor`
+//! reach both through the `test-support` feature. This crate's own
+//! `actor::test_support::legacy` builds on [`LegacyTx::sign`].
 
 use std::thread;
 use std::time::Duration;
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, Bytes as AlloyBytes, TxKind as APTxKind, U256, keccak256};
-use alloy_signer_local::PrivateKeySigner;
-use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use kardamom_types::TxEnvelope as KtTxEnvelope;
 
-/// A legacy transfer's fixed fields, ready to sign.
-pub struct LegacyTx {
-    pub chain_id: u64,
-    pub to: Address,
-    pub nonce: u64,
-    pub value: u64,
-    pub gas_limit: u64,
-    pub gas_price: u128,
-}
-
-impl LegacyTx {
-    /// Sign this transaction with `signer`, wrapped as a
-    /// `kardamom_types::TxEnvelope`. This matches what the proxy hands
-    /// downstream, with `sender` and `tx_hash` stamped.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `signer` cannot sign the built transaction. A
-    /// `PrivateKeySigner` over a well-formed `TxLegacy` cannot fail this in
-    /// practice; a fixture builder is the right place for this to stay a
-    /// panic instead of a `Result` every caller must thread through.
-    #[must_use]
-    pub fn sign(self, signer: &PrivateKeySigner) -> KtTxEnvelope {
-        let mut tx = TxLegacy {
-            chain_id: Some(self.chain_id),
-            nonce: self.nonce,
-            gas_price: self.gas_price,
-            gas_limit: self.gas_limit,
-            to: APTxKind::Call(self.to),
-            value: U256::from(self.value),
-            input: AlloyBytes::new(),
-        };
-        let sig = signer
-            .sign_transaction_sync(&mut tx)
-            .expect("a PrivateKeySigner signs a well-formed TxLegacy");
-        let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
-        let raw_tx = Bytes::from(alloy_env.encoded_2718());
-        let tx_hash = keccak256(&raw_tx);
-        KtTxEnvelope {
-            correlation_id: 0,
-            raw_tx,
-            sender: signer.address(),
-            tx_hash,
-        }
-    }
-}
+pub use kardamom_test_support::{LegacyTx, anvil_signer_0, byte_signer, seeded_signer};
 
 // ---------------------------------------------------------------------------
 // Channel-backed engine harness.

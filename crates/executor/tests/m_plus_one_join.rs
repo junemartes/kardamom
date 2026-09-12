@@ -40,7 +40,7 @@ use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use revm::primitives::KECCAK_EMPTY;
 
-use kardamom_engine::actor::fixtures::{ChanReceiptsPub, Imm, LegacyTx, TestWiring};
+use kardamom_engine::actor::fixtures::{ChanReceiptsPub, Imm, LegacyTx, TestWiring, byte_signer};
 use kardamom_engine::{
     BPosition, BlockBoundaryStart, CMessage, Executor, ExecutorConfig, ExecutorError, Inbound,
     MockStateDatabase, MutatingSnapshotSource, Outbound, ReaderConfig, ResumePoint, RoleHooks,
@@ -160,12 +160,10 @@ type Wiring = TestWiring<FakeTxDataSubAdapter, FakeTxOrderingSubAdapter, ChanRec
 
 fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address) -> TxEnvelope {
     LegacyTx {
-        chain_id: 1,
         to,
         nonce,
         value: 1,
-        gas_limit: 21_000,
-        gas_price: 0,
+        ..Default::default()
     }
     .sign(signer)
 }
@@ -173,11 +171,7 @@ fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address) -> TxEnvelope {
 /// Build `m` signers and a snapshot that pre-funds every one of them,
 /// so transfers do not underflow.
 fn fund_m_signers(m: u8) -> (Vec<PrivateKeySigner>, MockStateDatabase) {
-    let signers: Vec<PrivateKeySigner> = (0..m)
-        .map(|i| {
-            PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(0xA0 + i)).unwrap()
-        })
-        .collect();
+    let signers: Vec<PrivateKeySigner> = (0..m).map(|i| byte_signer(0xA0 + i)).collect();
     let mut snap_builder = MockStateDatabase::builder();
     for s in &signers {
         snap_builder =

@@ -83,15 +83,13 @@ mod exec_pipeline_tests;
 mod exec_resume_tests;
 #[cfg(test)]
 mod exec_tests;
-/// The signed-legacy-transaction builder, [`fixtures::LegacyTx`], and the
-/// channel-backed [`fixtures::ChannelHarness`]. This crate's own
-/// `test_support::legacy` builds on `LegacyTx`, so this module also
-/// compiles under plain `cfg(test)`. `test-support` exposes it `pub`, so
-/// another crate's integration tests can reach it instead of copying it.
-/// `kardamom-validator`'s `forged_envelope_chaos` test already reaches
-/// `ChannelHarness` this way; migrating the remaining sign-and-wrap
-/// copies onto `LegacyTx` is a follow-up, not done yet. Off by default,
-/// so a production build never links a signer.
+/// The channel-backed [`fixtures::ChannelHarness`], and a re-export of
+/// the signed-legacy-transaction fixture [`fixtures::LegacyTx`] from
+/// `kardamom-test-support`. This crate's own `test_support::legacy`
+/// builds on `LegacyTx`, so this module also compiles under plain
+/// `cfg(test)`. `test-support` exposes it `pub`, so another crate's
+/// integration tests can reach it instead of copying it. Off by
+/// default, so a production build never links a signer.
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixtures;
 #[cfg(test)]

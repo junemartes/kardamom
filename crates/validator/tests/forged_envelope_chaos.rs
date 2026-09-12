@@ -62,6 +62,7 @@ fn envelope_claiming(signer: &PrivateKeySigner, sender: Address) -> KtTxEnvelope
         value: LOOT,
         gas_limit: 21_000,
         gas_price: 0,
+        ..Default::default()
     }
     .sign(signer);
     // The theft shape: keep the honestly-signed bytes and hash, but
