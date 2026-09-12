@@ -330,8 +330,11 @@ Residual effects:
 - **Nomad:** one job group per active lane, generated from the map version.
   Each group has `count = 2` and `distinct_hosts`. Replace the two
   hardcoded port pairs with a per-lane port lane. The metrics port is
-  `9001 + 10 * lane`. The egress port is `40210 + 10 * lane`. Document both
-  in `group_vars`. This supersedes the `--partition-offset` rotation. That
+  `9001 + 10 * lane`, documented in `group_vars`. The egress port is a
+  Nomad dynamic port per allocation: a fixed per-lane port sits in the
+  node's ephemeral range, and a replacement replica must not reuse the
+  endpoint of the replica it replaces on the node's shared media driver.
+  This supersedes the `--partition-offset` rotation. That
   formula guarantees cross-placement only when M equals the sequencer node
   count. Each group passes an explicit lane and vslot set instead.
 - **Ansible:** `node_classes.sequencer.count` follows the active lane

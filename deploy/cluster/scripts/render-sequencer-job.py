@@ -3,9 +3,11 @@
 
 One job group per active lane, `count = 2` (the racing replicas) with
 `distinct_hosts`. Each group passes an explicit `--lane` and `--vslots`.
-The ports form a lane: metrics `9001 + 10 * lane`, cluster egress
-`cluster_egress_port + 10 * lane`. Two lanes can share a node without a
-port clash. See docs/specs/dynamic-sequencer-sizing.md, section 3.8.
+The metrics port forms a lane: `9001 + 10 * lane`, so two lanes share
+a node without a clash. The cluster egress (response) port is a Nomad
+dynamic port: every allocation gets its own, so a replacement replica
+never reuses the endpoint of the replica it replaces on the node's shared
+media driver. See docs/specs/dynamic-sequencer-sizing.md, section 3.8.
 
 Modes:
 
@@ -110,9 +112,13 @@ HEADER = """\
 #
 # Each group passes an explicit --lane and --vslots, derived from
 # config/shard-map.toml (docs/specs/dynamic-sequencer-sizing.md, 3.2).
-# The ports form a lane: metrics 9001 + 10 * lane, cluster egress
-# {egress_base} + 10 * lane. Two lanes share a node without a clash.
-# Placement is by Nomad, not by node meta.
+# The metrics port forms a lane: 9001 + 10 * lane, so two lanes share a
+# node without a clash. The cluster egress (response) port is a Nomad
+# dynamic port, one per allocation: a fixed per-lane port sat in the
+# node's ephemeral range, where the shared media driver's port-0 sockets
+# could take it first, and a replacement replica reused the endpoint of
+# the replica it replaced, on which the cluster's egress publication was
+# already stale. Placement is by Nomad, not by node meta.
 #
 # Note for consumers: both replicas of a lane process the same tx
 # stream, so per-lane tx totals exist once per replica. Aggregate
@@ -195,6 +201,8 @@ GROUP = """
 
     network {{
       mode = "host"
+      # The cluster egress (response) port, unique per allocation.
+      port "egress" {{}}
     }}
 
     task "sequencer-{lane}" {{
@@ -231,9 +239,9 @@ GROUP = """
           # The executor nonce query endpoints (node_classes.executor and
           # ports.executor_nonce_query in group_vars/all.yml).
           "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${{i}}.node.${{var.datacenter}}.consul:{query_port}"]),
-          # This node's cluster-egress (response) endpoint, on the lane's
-          # port. The node IP differs per replica, so it is injected here.
-          "--cluster-egress-endpoint", "${{meta.node_ip}}:{egress_port}",
+          # This allocation's cluster-egress (response) endpoint: the
+          # node IP and the dynamic port, both known only at placement.
+          "--cluster-egress-endpoint", "${{meta.node_ip}}:${{NOMAD_HOST_PORT_egress}}",
         ]
       }}
 
@@ -279,7 +287,6 @@ def render(gv: str, target: list[int], current: list[int] | None) -> str:
     registry = f"{scalar(gv, 'registry_host')}:{scalar(gv, 'registry_port')}"
     image = f"{registry}/kardamom-sequencer:{scalar(gv, 'image_tag')}"
     tx_ttl_ms = scalar(gv, "tx_ttl_ms")
-    egress_base = int(scalar(gv, "cluster_egress_port"))
     query_port = port(gv, "executor_nonce_query")
     exec_count = node_class(gv, "executor")
     target_sets = lane_sets(target)
@@ -287,7 +294,7 @@ def render(gv: str, target: list[int], current: list[int] | None) -> str:
     current_sets = lane_sets(current) if current is not None else None
     current_lanes = max(current) + 1 if current is not None else lanes
 
-    out = [HEADER.format(egress_base=egress_base, executor_count=exec_count)]
+    out = [HEADER.format(executor_count=exec_count)]
     groups = sorted(set(target_sets) | (set(current_sets) if current_sets else set()))
     for lane in groups:
         resize_args = ""
@@ -330,7 +337,6 @@ def render(gv: str, target: list[int], current: list[int] | None) -> str:
                 resize_args=resize_args,
                 tx_ttl_ms=tx_ttl_ms,
                 query_port=query_port,
-                egress_port=egress_base + PORT_LANE_STEP * lane,
                 metrics_port=METRICS_BASE + PORT_LANE_STEP * lane,
                 mdc_ports=(
                     f"{MDC_PORT_BASE + PORT_LANE_STEP * lane}-"
