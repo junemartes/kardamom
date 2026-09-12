@@ -182,6 +182,14 @@ impl Granularity {
 /// Quantize an EIP-7928 access list into chunks of `k` txs. `k == 0` or
 /// `k == 1` returns the list unchanged (no chunking below 2 txs is
 /// possible or meaningful).
+///
+/// Capture stays at per-tx indices; this post-pass is the only place a
+/// chunk index appears. Passing a chunk index to revm's
+/// `Bal::update_account` instead would lose writes: revm's same-index
+/// rule pops the last entry when a later update's original value equals
+/// its new value, and under a shared index that original is the earlier
+/// chunk-mate's write. `chunk_index_capture_loses_a_chunk_mates_write`
+/// pins this. See issue #244.
 #[must_use]
 pub fn quantize(bal: alloy_eip7928::BlockAccessList, k: u16) -> alloy_eip7928::BlockAccessList {
     let mut out = bal;
@@ -201,6 +209,25 @@ mod tests {
     use super::*;
     use alloy_eip7928::{AccountChanges, BalanceChange, SlotChanges, StorageChange};
     use alloy_primitives::{Address, U256};
+
+    /// Why capture never uses a chunk index (issue #244). Two txs share
+    /// chunk 1. The first writes a slot 5 -> 7. The second only reads it,
+    /// so revm reports original 7, present 7 at the same index. revm's
+    /// same-index rule then pops the first tx's write, and the slot
+    /// degrades to a read. The per-tx capture plus [`quantize`] keeps the
+    /// write.
+    #[test]
+    fn chunk_index_capture_loses_a_chunk_mates_write() {
+        let mut chunked = revm::state::bal::BalWrites::<U256>::default();
+        chunked.update(1, &U256::from(5), U256::from(7));
+        chunked.update(1, &U256::from(7), U256::from(7));
+        assert!(chunked.writes.is_empty(), "the first write is gone");
+
+        let mut per_tx = revm::state::bal::BalWrites::<U256>::default();
+        per_tx.update(1, &U256::from(5), U256::from(7));
+        per_tx.update(2, &U256::from(7), U256::from(7));
+        assert_eq!(per_tx.writes, vec![(1, U256::from(7))]);
+    }
 
     #[test]
     fn quantize_collapses_within_chunks_and_keeps_last() {
