@@ -115,6 +115,22 @@ impl FakeExec {
         }
     }
 
+    /// Drains one shard's `tx_data` lane: assigns the arriving order as
+    /// `term`, and feeds each envelope to [`Self::observe_and_forward`].
+    /// Multiple ingress publishers fan into this single consumer.
+    async fn drain_shard(
+        self,
+        shard: usize,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>,
+        receipt_bus: tokio::sync::broadcast::Sender<Receipt>,
+    ) {
+        let mut term: i32 = 0;
+        while let Some(env) = rx.recv().await {
+            term += 1;
+            self.observe_and_forward(&receipt_bus, shard, &env, term);
+        }
+    }
+
     fn seen_count(&self) -> usize {
         self.inner.lock().unwrap().seen_count
     }
@@ -146,16 +162,11 @@ impl Cluster {
         let drains: Vec<_> = receivers
             .into_iter()
             .enumerate()
-            .map(|(shard, mut rx)| {
-                let exec = exec.clone();
-                let receipt_bus = mock.receipt_bus.clone();
-                tokio::spawn(async move {
-                    let mut term: i32 = 0;
-                    while let Some(env) = rx.recv().await {
-                        term += 1;
-                        exec.observe_and_forward(&receipt_bus, shard, &env, term);
-                    }
-                })
+            .map(|(shard, rx)| {
+                tokio::spawn(
+                    exec.clone()
+                        .drain_shard(shard, rx, mock.receipt_bus.clone()),
+                )
             })
             .collect();
 
