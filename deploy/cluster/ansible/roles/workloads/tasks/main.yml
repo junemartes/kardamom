@@ -5,8 +5,6 @@
 - name: Initialize deployment state
   ansible.builtin.set_fact:
     workloads_jobs: {}
-    workloads_system_count: >-
-      {{ node_classes | dict2items | rejectattr('value.tier', 'equalto', 'control') | map(attribute='value.count') | sum }}
 
 - name: Deploy Aeron and the development L1
   ansible.builtin.include_tasks: job.yml

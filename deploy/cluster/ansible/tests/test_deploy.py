@@ -54,7 +54,9 @@ class NomadAPI(BaseHTTPRequestHandler):
             allocs = []
             job = state['jobs'][name]
             for group in job['TaskGroups']:
-                count = 11 if job['Type'] == 'system' else group['Count']
+                # The scheduler places a system group on the nodes its
+                # constraints admit; the playbook must not assume a node count.
+                count = 8 if job['Type'] == 'system' else group['Count']
                 for i in range(count):
                     # Historical/stopping allocations must not satisfy readiness.
                     stale = state.get('missing_replica') == name and i > 0

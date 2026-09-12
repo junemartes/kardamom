@@ -12,13 +12,21 @@
     headers:
       X-Nomad-Token: "{{ workloads_nomad_token }}"
   register: workloads_allocations
+  # A service group is ready when Count allocations of the current version
+  # run. A system group is ready when every allocation the scheduler placed
+  # for the current version runs; the job's own constraints decide how many
+  # nodes that is, so no node count is derived here.
+  vars:
+    workloads_placed: >-
+      {{ workloads_allocations.json | default([])
+         | selectattr('TaskGroup', 'equalto', item.Name)
+         | selectattr('JobVersion', 'equalto', workloads_current_job.json.Version)
+         | selectattr('DesiredStatus', 'equalto', 'run') | list }}
+    workloads_system: "{{ workloads_jobs[workloads_wait_job].Type == 'system' }}"
+    workloads_desired: "{{ workloads_placed | length if workloads_system else item.Count }}"
   until: >-
-    (workloads_allocations.json | default([])
-     | selectattr('TaskGroup', 'equalto', item.Name)
-     | selectattr('JobVersion', 'equalto', workloads_current_job.json.Version)
-     | selectattr('DesiredStatus', 'equalto', 'run')
-     | selectattr('ClientStatus', 'equalto', 'running') | list | length)
-    >= (workloads_system_count | int if workloads_jobs[workloads_wait_job].Type == 'system' else item.Count | int)
+    (workloads_placed | selectattr('ClientStatus', 'equalto', 'running') | list | length) >= (workloads_desired | int)
+    and (workloads_desired | int > 0 or not workloads_system)
   retries: "{{ workloads_job.retries | default(workloads_poll_retries) }}"
   delay: "{{ workloads_poll_delay }}"
   loop: "{{ workloads_jobs[workloads_wait_job].TaskGroups }}"
