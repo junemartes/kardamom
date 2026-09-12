@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test gates only. ansible/run.yml owns provisioning, locking and teardown.
+# Test gates only. The Makefile container-* targets own provisioning and teardown.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"

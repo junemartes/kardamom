@@ -112,7 +112,7 @@ balance = "1000000000000000000000"
 
 # --- Anvil account #16 (dedicated to the ingress-churn failover re-smoke) -----
 # pk: 0xea6c44ac03bff858b476bba40716402b03e41b8e97e276d1baec7c37d42484a0
-# Used by ansible/run.yml's ingress-churn step so it owns its own nonce
+# Used by the run-tests.sh ingress-churn step so it owns its own nonce
 # chain (first tx at nonce 0) and never collides with the gate (#0), load
 # harness (#1..#6), or chaos cases (#7..#15) — no cross-stage nonce coordination.
 [[alloc]]

@@ -96,8 +96,8 @@ if nodes:
             f"container inventory entry for {name}",
         )
 else:
-    # node-class model: the Ansible topology role materialises nodes from
-    # `node_classes` at deploy time (names <class>-<i>, static IPs from each
+    # node-class model: terraform/containers materialises nodes from
+    # `node_classes` at apply time (names <class>-<i>, static IPs from each
     # class's ip_start lane), so there are no hand-written per-node IP mirrors to
     # cross-check here. Just assert the model is actually declared.
     if "node_classes:" not in gv:
@@ -132,6 +132,23 @@ for tf in sorted(TF_ROOT.glob("*.tf")):
     must_not_contain(tf, 'resource "hcloud_server"', "the Autoscaler owns the elastic VMs")
     must_not_contain(tf, "hcloud_token", "the API token is the HCLOUD_TOKEN environment variable, never a variable")
 must_contain(TF_ROOT / "outputs.tf", "version            = 1", "the pool contract is version 1")
+
+# --- the container Terraform root ---------------------------------------------
+# terraform/containers owns the node containers of the local profile and
+# reads the node-class model from group_vars/all.yml. The lifecycle around
+# it (converge, test, diagnose, destroy) is the Makefile's, so no root
+# runs a provisioner and no Ansible lifecycle playbook remains.
+TF_CONTAINERS = CLUSTER / "terraform" / "containers"
+must_contain(TF_CONTAINERS / "main.tf", 'yamldecode(file(local.contract_path))', "the root reads the node-class model of group_vars")
+must_contain(TF_CONTAINERS / "outputs.tf", "version = 1", "the node contract is version 1")
+for tf in sorted(TF_ROOT.glob("*.tf")) + sorted(TF_CONTAINERS.glob("*.tf")):
+    for provisioner in ("local-exec", "remote-exec"):
+        must_not_contain(tf, provisioner, "the Makefile owns the lifecycle, not a provisioner")
+if (ANSIBLE / "run.yml").exists():
+    err("ansible/run.yml exists: the container lifecycle is the Makefile's container-* targets")
+for f in ("containers.yml",):
+    must_contain(ANSIBLE / f, "node-contract.json", "the container playbook reads the node contract")
+must_contain(CLUSTER / "Makefile", "tofu -chdir=$(TF_CONTAINERS) apply", "container-up applies the container root")
 
 # --- Makefile -----------------------------------------------------------------
 must_contain(CLUSTER / "Makefile", f"REGISTRY := {registry}", "registry host:port")

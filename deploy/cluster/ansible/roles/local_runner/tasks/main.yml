@@ -47,12 +47,7 @@
           - >-
             local_runner_existing.container.Mounts | selectattr('Destination', 'equalto', '/work')
             | map(attribute='Source') | list == [local_runner_root]
-          - >-
-            local_runner_existing.container.Mounts | selectattr('Destination', 'equalto', '/tmp/kardamom-cluster-locks')
-            | map(attribute='Name', default='') | list == ['kardamom-lifecycle-locks']
-        fail_msg: >-
-          {{ local_runner_container }} uses another checkout or lacks the shared lock volume;
-          choose a new local_runner_container.
+        fail_msg: "{{ local_runner_container }} uses another checkout; choose a new local_runner_container."
       when:
         - local_runner_operation != 'build'
         - local_runner_existing.exists
@@ -66,7 +61,6 @@
         pid_mode: host
         volumes:
           - /var/run/docker.sock:/var/run/docker.sock
-          - kardamom-lifecycle-locks:/tmp/kardamom-cluster-locks
           - "{{ local_runner_root }}:/work"
         state: started
       when:
@@ -83,26 +77,77 @@
         - local_runner_operation != 'build'
         - local_runner_existing.exists
 
-    - name: Run Ansible lifecycle inside Linux controller
-      community.docker.docker_container_exec:
-        container: "{{ local_runner_container }}"
-        argv:
-          - ansible-playbook
-          - -i
-          - localhost,
-          - /work/deploy/cluster/ansible/run.yml
-          - --extra-vars
-          - "{{ local_runner_vars | combine({'cluster_run_operation': 'up' if local_runner_operation == 'all' else local_runner_operation}) | to_json }}"
-        env: "{{ local_runner_environment }}"
-      register: local_runner_result
-      failed_when: local_runner_result.rc != 0
+    # The lifecycle of the Makefile, run inside the controller: the
+    # Terraform state under /work is the record of the running cluster.
+    - name: Run the cluster lifecycle inside the Linux controller
       when:
         - local_runner_operation != 'build'
         - not ansible_check_mode
+      block:
+        - name: Destroy the previous cluster for reset or down
+          community.docker.docker_container_exec:
+            container: "{{ local_runner_container }}"
+            argv: [make, -C, /work/deploy/cluster, container-down]
+          when: local_runner_operation in ['reset', 'down']
 
-    - name: Show cluster lifecycle output
-      ansible.builtin.debug:
-        var: local_runner_result.stdout_lines
-      when:
-        - local_runner_operation != 'build'
-        - not ansible_check_mode
+        - name: Create, provision and deploy the cluster
+          community.docker.docker_container_exec:
+            container: "{{ local_runner_container }}"
+            argv:
+              - make
+              - -C
+              - /work/deploy/cluster
+              - container-up
+              - "CLUSTER_VARS={{ local_runner_vars | to_json if local_runner_vars else '' }}"
+            env: "{{ local_runner_environment }}"
+          register: local_runner_converge
+          when: local_runner_operation != 'down'
+
+        - name: Show convergence output
+          ansible.builtin.debug:
+            var: local_runner_converge.stdout_lines
+          when: local_runner_operation != 'down'
+
+        - name: Run the smoke, load and chaos gates
+          community.docker.docker_container_exec:
+            container: "{{ local_runner_container }}"
+            argv: [make, -C, /work/deploy/cluster, container-test]
+            env: "{{ local_runner_environment }}"
+          register: local_runner_verdict
+          when:
+            - local_runner_operation != 'down'
+            - local_runner_tests | bool
+
+        - name: Show test verdicts
+          ansible.builtin.debug:
+            var: local_runner_verdict.stdout_lines
+          when:
+            - local_runner_operation != 'down'
+            - local_runner_tests | bool
+      rescue:
+        - name: Save the original failure
+          ansible.builtin.set_fact:
+            local_runner_failure: "{{ ansible_failed_result }}"
+
+        - name: Collect diagnostics before teardown
+          community.docker.docker_container_exec:
+            container: "{{ local_runner_container }}"
+            argv: [make, -C, /work/deploy/cluster, container-diagnostics]
+          register: local_runner_diagnostics
+          failed_when: false
+
+        - name: Show failure diagnostics
+          ansible.builtin.debug:
+            var: local_runner_diagnostics.stdout_lines
+
+        - name: Report the original lifecycle failure
+          ansible.builtin.fail:
+            msg: "{{ local_runner_failure }}"
+      always:
+        - name: Destroy the cluster unless KEEP was requested
+          community.docker.docker_container_exec:
+            container: "{{ local_runner_container }}"
+            argv: [make, -C, /work/deploy/cluster, container-down]
+          when:
+            - not local_runner_keep | bool
+            - local_runner_operation != 'down'

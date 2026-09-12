@@ -91,11 +91,15 @@ jobs:
         run: python3 -m unittest discover -s deploy/cluster/ansible/tests -v
 
   terraform-validate:
-    name: tofu fmt + validate + test (hetzner root)
+    name: tofu fmt + validate + test (${{ matrix.root }} root)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        root: [hetzner, containers]
     defaults:
       run:
-        working-directory: deploy/cluster/terraform/hetzner
+        working-directory: deploy/cluster/terraform/${{ matrix.root }}
     steps:
       - uses: actions/checkout@v4
       - uses: opentofu/setup-opentofu@v1
