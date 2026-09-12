@@ -14,9 +14,9 @@ use tokio::sync::broadcast;
 
 use kardamom_log::aeron_live::{
     AeronRuntime, FsyncWatermarkSubscriberHandle, TxDataPublisherHandle, TxErrorsSubscriberHandle,
-    TxReceiptsBoundarySubscriberHandle, TxReceiptsReceiver, TxReceiptsSubscriberHandle,
+    TxReceiptsBoundarySubscriberHandle, TxReceiptsReceiver,
 };
-use kardamom_log::config::ChannelsConfig;
+use kardamom_log::discovery::StreamPlane;
 use kardamom_types::{
     BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
 };
@@ -43,17 +43,19 @@ impl LiveIngressPublication {
     ///
     /// Returns `IngressError::Internal` if any lane's `tx_data` handle
     /// fails to open.
-    pub fn open(
+    pub async fn open(
         rt: &AeronRuntime,
-        channels: &ChannelsConfig,
+        plane: &mut StreamPlane,
         lanes: NonZeroU8,
     ) -> Result<Self, IngressError> {
-        let tx_data = (0..lanes.get())
-            .map(|lane| {
-                TxDataPublisherHandle::open(rt, channels, lane)
-                    .map_err(|e| IngressError::internal(format!("open tx_data[{lane}]"), e))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut tx_data = Vec::with_capacity(usize::from(lanes.get()));
+        for lane in 0..lanes.get() {
+            let handle = plane
+                .tx_data_publisher(rt, lane)
+                .await
+                .map_err(|e| IngressError::internal(format!("open tx_data[{lane}]"), e))?;
+            tx_data.push(handle);
+        }
         Ok(Self { tx_data })
     }
 }
@@ -152,16 +154,22 @@ pub struct LiveIngressSubscription {
 }
 
 impl LiveIngressSubscription {
+    /// Open the four subscriber handles through `plane`: `tx_errors`,
+    /// receipts, and boundaries follow the plane's transport; the fsync
+    /// watermark still opens on its static channel.
+    ///
     /// # Errors
     ///
     /// Returns `IngressError::Internal` if any of the four subscriber
     /// handles fails to open.
     pub fn open(
         rt: &AeronRuntime,
-        channels: &ChannelsConfig,
+        plane: &mut StreamPlane,
         recorder_id: u8,
         executor_count: Option<NonZeroU32>,
     ) -> Result<Self, IngressError> {
+        let channels = plane.channels().clone();
+        let channels = &channels;
         let (receipts_tx, _) = broadcast::channel::<Receipt>(BUS_CAPACITY);
         let (watermarks_tx, _) = broadcast::channel::<QuorumWatermark>(BUS_CAPACITY);
         let (local_fsync_tx, _) = broadcast::channel::<FsyncWatermark>(BUS_CAPACITY);
@@ -177,17 +185,13 @@ impl LiveIngressSubscription {
             );
         }
 
-        // This is the tx_receipts to Receipt fan-out.
-        //
-        // MDS, the fan-in mode: this opens one control-mode=manual
-        // subscription on `tx_receipts_control_channel`, and attaches
-        // each executor replica's unicast endpoint, `0..executor_count`,
-        // as a destination. N executors replay the same canonical order
-        // and emit identical receipts, so the proxy dedups by tx hash
-        // downstream, first-wins. This layer only aggregates the streams.
-        // Legacy IPC uses a plain subscription on the shared
-        // `tx_receipts_channel` instead.
-        let receipts_sub = TxReceiptsSubscriberHandle::open_auto(rt, channels, executor_count)
+        // This is the tx_receipts to Receipt fan-out. N executors replay
+        // the same canonical order and emit identical receipts, so the
+        // proxy dedups by tx hash downstream, first-wins. This layer only
+        // aggregates the streams: every executor publisher the plane
+        // discovers, or the static channel's members.
+        let receipts_sub = plane
+            .tx_receipts_subscriber(rt, executor_count)
             .map_err(|e| IngressError::internal("open tx_receipts", e))?;
         // `into_receiver()`: the pump task must not hold an
         // `AeronRuntime` clone. Holding one would keep the runtime alive
@@ -205,17 +209,16 @@ impl LiveIngressSubscription {
         spawn_pump(fsync_sub, local_fsync_tx.clone());
 
         // This is the tx_receipts to BlockBoundary fan-out, the
-        // `tx_receipts_stream_id + 1` side stream. It uses the same MDS
-        // vs. IPC branch as the receipt stream above: it attaches the
-        // same per-replica executor endpoints to the boundary MDS
-        // subscription.
-        let boundary_sub =
-            TxReceiptsBoundarySubscriberHandle::open_auto(rt, channels, executor_count)
-                .map_err(|e| IngressError::internal("open tx_receipts boundaries", e))?;
+        // `tx_receipts_stream_id + 1` side stream, over the same
+        // publisher set as the receipt stream above.
+        let boundary_sub = plane
+            .tx_receipt_boundaries_subscriber(rt, executor_count)
+            .map_err(|e| IngressError::internal("open tx_receipts boundaries", e))?;
         spawn_pump(boundary_sub, block_boundaries_tx.clone());
 
         // This is the tx_errors to TxError fan-out.
-        let errors_sub = TxErrorsSubscriberHandle::open(rt, channels)
+        let errors_sub = plane
+            .subscriber::<TxErrorsSubscriberHandle>(rt)
             .map_err(|e| IngressError::internal("open tx_errors", e))?;
         spawn_pump(errors_sub, tx_errors_tx.clone());
 

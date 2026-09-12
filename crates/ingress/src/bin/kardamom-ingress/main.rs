@@ -32,12 +32,16 @@ use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
 use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::LogConfig;
+use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_types::QuorumWatermark;
 use tokio_util::sync::CancellationToken;
 
 use kardamom_types::shard_map::{LANE_COUNT, ShardMap, validate_shard_count};
-use recorders::{spawn_tx_data_recorders, wait_for_recorders};
+use recorders::{
+    spawn_discovered_tx_data_recorder, spawn_tx_data_recorders, wait_for_discovered_recorder,
+    wait_for_recorders,
+};
 
 /// The lane plane as the non-zero count the publisher and recorder
 /// openers take: every lane opens, whatever the active shard count.
@@ -186,6 +190,7 @@ impl From<AckPolicyArg> for kardamom_types::AckPolicy {
 /// and `tx_receipts` subscription built on top of it.
 struct OpenedAeron {
     rt: AeronRuntime,
+    plane: StreamPlane,
     recorder_handles: Vec<std::thread::JoinHandle<()>>,
     publication: LiveIngressPublication,
     subscription: LiveIngressSubscription,
@@ -268,17 +273,35 @@ impl IngressService {
         let channels = &self.log_cfg.channels;
         let aeron_cfg = &self.log_cfg.aeron;
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+        let mut plane =
+            StreamPlane::from_config(&self.log_cfg, &format!("ingress-{}", args.ingress_id))
+                .context("build the stream plane")?;
 
-        let (recorder_handles, recorder_ready) = if args.archive_durability {
-            spawn_tx_data_recorders(
+        // With discovery, one recorder thread follows every tx_data
+        // publisher the catalog lists. Without it, one static recorder
+        // thread per lane records the shared channel.
+        let discovered = args.archive_durability.then(|| {
+            spawn_discovered_tx_data_recorder(
                 args.aeron_dir.as_deref(),
-                channels,
                 aeron_cfg,
+                &mut plane,
                 LANE_PLANE,
                 &self.stop,
             )
-        } else {
-            (Vec::new(), Vec::new())
+        });
+        let (recorder_handles, recorder_ready, discovered_ready) = match discovered {
+            Some(Some((handle, ready))) => (vec![handle], Vec::new(), Some(ready)),
+            Some(None) => {
+                let (handles, ready) = spawn_tx_data_recorders(
+                    args.aeron_dir.as_deref(),
+                    channels,
+                    aeron_cfg,
+                    LANE_PLANE,
+                    &self.stop,
+                );
+                (handles, ready, None)
+            }
+            None => (Vec::new(), Vec::new(), None),
         };
 
         // tx_receipts MDS membership: prefer the CLI or env
@@ -287,22 +310,28 @@ impl IngressService {
         // proxy reads this only when MDS is enabled.
         let executor_count = args.executor_count.or(channels.tx_receipts_executor_count);
 
-        let publication = LiveIngressPublication::open(&rt, channels, LANE_PLANE)
+        let publication = LiveIngressPublication::open(&rt, &mut plane, LANE_PLANE)
+            .await
             .context("open IngressPublication")?;
 
         // This is the recorder barrier: with the tx_data publications now
         // open, every lane's recording can start.
-        if args.archive_durability {
+        if let Some(ready) = discovered_ready {
+            wait_for_discovered_recorder(ready)
+                .await
+                .context("archive durability requested but the tx_data recorder failed to start")?;
+        } else if args.archive_durability {
             wait_for_recorders(recorder_ready)
                 .await
                 .context("archive durability requested but tx_data recorders failed to start")?;
         }
         let subscription =
-            LiveIngressSubscription::open(&rt, channels, args.recorder_id, executor_count)
+            LiveIngressSubscription::open(&rt, &mut plane, args.recorder_id, executor_count)
                 .context("open IngressSubscription")?;
 
         Ok(OpenedAeron {
             rt,
+            plane,
             recorder_handles,
             publication,
             subscription,
@@ -320,9 +349,13 @@ impl IngressService {
     fn spawn_cluster_watermark(
         &self,
         subscription: &LiveIngressSubscription,
+        ingress_endpoints: Option<String>,
     ) -> Result<LiveCluster> {
         let args = &self.args;
         let mut live = self.file_cfg.cluster.to_live();
+        if let Some(endpoints) = ingress_endpoints {
+            live.ingress_endpoints = endpoints;
+        }
         if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
             live.egress_channel = format!("aeron:udp?endpoint={ep}");
         }
@@ -377,7 +410,8 @@ impl IngressService {
 
         let opened = self.open_aeron_side().await?;
         let cluster_guard = if cfg.ack_policy.requires_quorum() {
-            Some(self.spawn_cluster_watermark(&opened.subscription)?)
+            let members = opened.plane.cluster_ingress_endpoints().await?;
+            Some(self.spawn_cluster_watermark(&opened.subscription, members)?)
         } else {
             None
         };
@@ -393,6 +427,7 @@ impl IngressService {
             drainer,
             drain_timeout,
             stop: self.stop,
+            plane: opened.plane,
             recorder_handles: opened.recorder_handles,
             // Declared before `_cluster_guard`: struct fields drop in
             // declaration order, so `_rt` drops before `_cluster_guard`
@@ -416,6 +451,9 @@ struct RunningIngress {
     /// How long the drain waits for parked submits: the park bound.
     drain_timeout: Duration,
     stop: CancellationToken,
+    /// The stream plane: shut down before `_rt` drops, so the discovery
+    /// tasks and registrations end first.
+    plane: StreamPlane,
     recorder_handles: Vec<std::thread::JoinHandle<()>>,
     /// See the field-order comment in [`IngressService::run`]: this must
     /// stay declared before `_cluster_guard`. Held only for its `Drop`
@@ -448,6 +486,7 @@ impl RunningIngress {
         for h in self.recorder_handles {
             let _ = h.join();
         }
+        self.plane.shutdown().await;
     }
 }
 

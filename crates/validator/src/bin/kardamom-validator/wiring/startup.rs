@@ -8,7 +8,8 @@ use kardamom_cluster_adapter::LiveCluster;
 use kardamom_engine::ResumePoint;
 use kardamom_engine::bin_support;
 use kardamom_log::aeron_live::AeronRuntime;
-use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
+use kardamom_log::config::{AeronConfig, LogConfig};
+use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{StateEnv, StateEnvBuilder, read_recovery_point};
 use kardamom_validator::flight::FlightRing;
 use kardamom_validator::{BalBuffer, ClaimBuffer, Divergence, ReceiptBuffer};
@@ -20,9 +21,10 @@ use crate::args::{Args, ValidatorFileConfig};
 pub(crate) struct Startup {
     pub(super) args: Args,
     pub(super) file_cfg: ValidatorFileConfig,
-    pub(super) channels: ChannelsConfig,
     pub(super) aeron_cfg: AeronConfig,
     pub(super) rt: AeronRuntime,
+    /// The stream plane the verification subscriptions open through.
+    pub(super) plane: StreamPlane,
 }
 
 impl Startup {
@@ -61,7 +63,8 @@ impl Startup {
 
         let log_cfg =
             LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
-        let channels = log_cfg.channels;
+        let plane =
+            StreamPlane::from_config(&log_cfg, "validator").context("build the stream plane")?;
         let mut aeron_cfg = log_cfg.aeron;
         if let Some(dir) = args.aeron_dir.as_ref() {
             aeron_cfg.aeron_dir.clone_from(dir);
@@ -71,9 +74,9 @@ impl Startup {
         Ok(Self {
             args,
             file_cfg,
-            channels,
             aeron_cfg,
             rt,
+            plane,
         })
     }
 
@@ -184,8 +187,12 @@ impl Opened {
     /// Returns an error if any subscription fails to open, the cluster
     /// session fails to connect, or the resume block is `u64::MAX` (so
     /// naming the next block would overflow).
-    pub(crate) fn open_streams(self) -> Result<Streamed> {
+    pub(crate) async fn open_streams(mut self) -> Result<Streamed> {
         let args = &self.base.args;
+        let mut cluster_cfg = self.base.file_cfg.cluster.to_live();
+        if let Some(endpoints) = self.base.plane.cluster_ingress_endpoints().await? {
+            cluster_cfg.ingress_endpoints = endpoints;
+        }
         // The kardamom_sealer_* re-export is the executor's job. A
         // validator emitting a second, lagging copy of the series would
         // break sum()-style queries and contradict the documented
@@ -193,14 +200,14 @@ impl Opened {
         let (inbound, cluster_guard) =
             bin_support::open_inbound::<super::run::ValidatorWiring>(bin_support::InboundConfig {
                 rt: &self.base.rt,
-                channels: &self.base.channels,
+                plane: &mut self.base.plane,
                 aeron_cfg: &self.base.aeron_cfg,
                 aeron_dir: args.aeron_dir.as_deref(),
                 archive_control_response_endpoint: args
                     .archive_control_response_endpoint
                     .as_deref(),
                 replay_destination_endpoint: args.replay_destination_endpoint.as_deref(),
-                cluster_cfg: self.base.file_cfg.cluster.to_live(),
+                cluster_cfg,
                 cursor: bin_support::cluster_replay_cursor(&self.state.start),
                 bin_name: "kardamom-validator",
                 suppress_sealer_metrics: true,

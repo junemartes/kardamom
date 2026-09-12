@@ -1,11 +1,9 @@
 //! Drives an Aeron Archive instance to record a stream and exposes the
 //! current durable recording position.
 //!
-//! Topology: one `Recorder` with `RecorderKind::TxOrdering` next to the
-//! sealer records the sealer's `tx_ordering` MDC publication. Other recorders
-//! tail `TxData` and `TxDeposits` streams so the executor can replay full
-//! transaction and deposit envelopes on crash recovery (see
-//! [`Recorder::start_stream`]).
+//! Topology: the ingress records the `TxData` lanes and the DA watcher
+//! records `TxDeposits`, so the executor can replay full transaction and
+//! deposit envelopes on crash recovery (see [`Recorder::start_stream`]).
 //!
 //! This module has an unconditional dependency on rusteron.
 //!
@@ -157,15 +155,12 @@ pub fn connect_archive_with_timeout(
 
 /// Which logical stream a recorder is tailing.
 ///
-/// `TxOrdering` (recorded once, at the sealer) feeds the single durable
-/// watermark. `TxData` and `TxDeposits` are recorded so the executor can
-/// replay the full transaction and deposit envelopes on crash recovery (see
+/// `TxData` and `TxDeposits` are recorded so the executor can replay the
+/// full transaction and deposit envelopes on crash recovery (see
 /// [`crate::refetch`]). Without them, only the canonical order survives a
 /// restart, not the bytes needed to re-execute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecorderKind {
-    /// `TxOrdering` canonical-orderer recorder (carries tiny `TxRefs`).
-    TxOrdering,
     /// Per-sequencer `TxData` recorder (carries full `TxEnvelope` bytes).
     TxData { sequencer_id: u8 },
     /// `TxDeposits` recorder (carries full `Deposit` envelopes from the DA watcher).
@@ -178,7 +173,6 @@ impl RecorderKind {
     #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
-            RecorderKind::TxOrdering => "tx_ordering",
             RecorderKind::TxData { .. } => "tx_data",
             RecorderKind::TxDeposits => "tx_deposits",
         }
@@ -315,10 +309,9 @@ impl Recorder {
         // (the publisher is always co-located) and is what the single-host
         // e2e test relies on. But a spy never opens a network subscription
         // and never joins the multicast group. For the UDP channels in the
-        // multi-host cluster, where the publisher is on another node (for
-        // example tx_ordering, published by the sealer while the recorders
-        // run on separate hosts), LOCAL means the recording never appears.
-        // The recorder then logs "waiting for a publisher..." forever.
+        // multi-host cluster, where the publisher can be on another node,
+        // LOCAL means the recording never appears. The recorder then logs
+        // "waiting for a publisher..." forever.
         // Record UDP channels with REMOTE, so the archive opens a real
         // network subscription that joins the group. Multicast loopback
         // means REMOTE also works when the UDP publisher happens to be
@@ -361,10 +354,9 @@ impl Recorder {
     /// stream) is rejected, which is fine.
     ///
     /// The catalog descriptor only appears once a publisher connects to the
-    /// stream (Aeron lists in-progress recordings, not idle ones). In a
-    /// cluster the recorders come up before the sealer or sequencers
-    /// publish `tx_ordering`, so this waits indefinitely, until `stop`
-    /// cancels, instead of timing out. The process staying alive keeps the
+    /// stream (Aeron lists in-progress recordings, not idle ones). A
+    /// recorder can come up before its publisher, so this waits
+    /// indefinitely, until `stop` cancels, instead of timing out. The process staying alive keeps the
     /// Nomad alloc "running", so the rest of the pipeline can deploy and
     /// start publishing. Discovery uses `list_recordings_for_uri`, which
     /// matches by stream and no session id (the recorder does not know it),
@@ -500,8 +492,7 @@ impl Recorder {
 
     /// Return the id of the most recent recording for `stream_id`, if
     /// any. This adopts the recording that another recorder already
-    /// started for a shared stream (several recorders on one archive
-    /// recording `tx_ordering`, or a restart against a long-lived
+    /// started for a shared stream (a restart against a long-lived
     /// archive). It lists by stream plus an empty channel fragment
     /// (matches any channel) and takes the highest recording id.
     /// Recordings run for the process lifetime (`auto_stop=false`), so

@@ -6,10 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use kardamom_log::aeron_live::{
-    AeronRuntime, TxReceiptsReceiver, TxReceiptsSubscriberHandle, TypedSubscription,
-};
-use kardamom_log::config::{ChannelUri, ChannelsConfig};
+use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsReceiver, TypedSubscription};
+use kardamom_log::config::ChannelUri;
+use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{SnapshotReceiver, StateSnapshot};
 use kardamom_validator::attester::AttesterHandle;
 use kardamom_validator::{BalBuffer, ClaimBuffer, ReceiptBuffer, metrics};
@@ -19,25 +18,28 @@ use tokio_util::sync::CancellationToken;
 /// See [`spawn_bal_pump`] for why silence, not just absence, triggers it.
 const BAL_SILENCE_REOPEN: Duration = Duration::from_secs(60);
 
-/// `tx_bal`: per-block `BlockDelta` (BAL). This is a simple multicast or IPC
-/// subscription, wrapped in a silence watchdog. A multicast image that
-/// never joins, or silently dies, starves verification while everything
-/// else works, which shows up as `validator_blocks_verified_total == 0`
-/// for a whole run. Executors publish one BAL per committed block,
-/// including empty blocks, so 60s of silence on a progressing chain
-/// means a dead subscription, not an idle one: drop it and reopen it. On
-/// a genuinely idle cluster, the reopen is harmless no-op churn.
+/// `tx_bal`: per-block `BlockDelta` (BAL), wrapped in a silence watchdog.
+/// A static multicast image that never joins, or silently dies, starves
+/// verification while everything else works, which shows up as
+/// `validator_blocks_verified_total == 0` for a whole run. Executors
+/// publish one BAL per committed block, including empty blocks, so 60s
+/// of silence on a progressing chain means a dead subscription, not an
+/// idle one: drop it and reopen it. On a genuinely idle cluster, the
+/// reopen is harmless no-op churn. A discovered subscription is never
+/// reopened: its reconcile task re-attaches a restarted publisher, and
+/// a fresh image forms on the live subscription.
 ///
-/// The pump holds an `AeronRuntime` clone. It needs the clone to reopen the
-/// subscription. This is the documented SIGTERM deadlock trap (see the
-/// `tx_receipts` comment on [`spawn_receipts_pump`]). The runtime shuts down
-/// only when its last clone drops. The main path cancels the `shutdown`
-/// token before it drops `rt`. The `select!` below wakes at once, and this
-/// task releases its clone, so graceful shutdown completes. No wake tick
-/// is needed. Cancellation interrupts the `recv` directly.
+/// On the static path the pump holds an `AeronRuntime` clone. It needs
+/// the clone to reopen the subscription. This is the documented SIGTERM
+/// deadlock trap (see the `tx_receipts` comment on
+/// [`spawn_receipts_pump`]). The runtime shuts down only when its last
+/// clone drops. The main path cancels the `shutdown` token before it
+/// drops `rt`. The `select!` below wakes at once, and this task releases
+/// its clone, so graceful shutdown completes. No wake tick is needed.
+/// Cancellation interrupts the `recv` directly.
 pub(crate) fn spawn_bal_pump(
     rt: &AeronRuntime,
-    channels: &ChannelsConfig,
+    plane: &mut StreamPlane,
     bals: Arc<BalBuffer>,
     claims: Arc<ClaimBuffer>,
     // The interop outbox extractor's own claim buffer. The engine's
@@ -47,15 +49,21 @@ pub(crate) fn spawn_bal_pump(
     extract_claims: Option<Arc<ClaimBuffer>>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let bal_channel = channels.tx_bal_channel.clone();
-    let bal_stream_id = channels.tx_bal_stream_id;
-    let bal_rx = open_bal_sub(rt, bal_channel.as_str(), bal_stream_id)
+    let bal_rx = plane
+        .tx_bal_subscription(rt)
         .context("open tx_bal subscription")?;
+    let reopen = if plane.is_discovered() {
+        Reopen::Discovered
+    } else {
+        Reopen::Static {
+            rt: rt.clone(),
+            channel: plane.channels().tx_bal_channel.clone(),
+            stream_id: plane.channels().tx_bal_stream_id,
+        }
+    };
     let mut pump = BalPump {
         bal_rx,
-        reopen_rt: rt.clone(),
-        bal_channel,
-        bal_stream_id,
+        reopen,
         claims,
         extract_claims,
         bals,
@@ -64,14 +72,23 @@ pub(crate) fn spawn_bal_pump(
     Ok(())
 }
 
-/// The `tx_bal` pump's live subscription plus its fixed reopen target and
+/// How the pump answers a silent window: reopen the static subscription,
+/// or leave a discovered one to its reconcile task.
+enum Reopen {
+    Static {
+        rt: AeronRuntime,
+        channel: ChannelUri,
+        stream_id: i32,
+    },
+    Discovered,
+}
+
+/// The `tx_bal` pump's live subscription plus its reopen policy and
 /// insertion buffers. Grouped so [`Self::step`] takes `&mut self` instead
 /// of one argument per port.
 struct BalPump {
     bal_rx: TypedSubscription<kardamom_types::BalFrame>,
-    reopen_rt: AeronRuntime,
-    bal_channel: ChannelUri,
-    bal_stream_id: i32,
+    reopen: Reopen,
     claims: Arc<ClaimBuffer>,
     extract_claims: Option<Arc<ClaimBuffer>>,
     bals: Arc<BalBuffer>,
@@ -93,23 +110,7 @@ impl BalPump {
             Ok(Some((_pos, frame))) => frame,
             Ok(None) => return None, // The runtime is shutting down.
             Err(_) => {
-                metrics::counter_bal_sub_reopen();
-                tracing::warn!(
-                    silence_s = BAL_SILENCE_REOPEN.as_secs(),
-                    "tx_bal silent — reopening the subscription \
-                     (never-joined or dead multicast image, #144)"
-                );
-                match open_bal_sub(
-                    &self.reopen_rt,
-                    self.bal_channel.as_str(),
-                    self.bal_stream_id,
-                ) {
-                    Ok(rx) => self.bal_rx = rx,
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "tx_bal reopen failed; retrying after the next window"
-                    ),
-                }
+                self.on_silence();
                 return Some(());
             }
         };
@@ -119,10 +120,42 @@ impl BalPump {
     }
 }
 
-/// Open the `tx_bal` subscription: on startup, and again to reopen after
-/// prolonged silence. `BalFrame` is the merged delta plus the EIP-7928
-/// access list: the write-set check uses the merged section, and
-/// attribution drives the parallel engine.
+impl BalPump {
+    /// A silent window: reopen a static subscription, or report and
+    /// keep a discovered one.
+    fn on_silence(&mut self) {
+        let Reopen::Static {
+            rt,
+            channel,
+            stream_id,
+        } = &self.reopen
+        else {
+            tracing::warn!(
+                silence_s = BAL_SILENCE_REOPEN.as_secs(),
+                "tx_bal silent on a discovered subscription; the reconcile task owns its publishers"
+            );
+            return;
+        };
+        metrics::counter_bal_sub_reopen();
+        tracing::warn!(
+            silence_s = BAL_SILENCE_REOPEN.as_secs(),
+            "tx_bal silent — reopening the subscription \
+             (never-joined or dead multicast image, #144)"
+        );
+        match open_bal_sub(rt, channel.as_str(), *stream_id) {
+            Ok(rx) => self.bal_rx = rx,
+            Err(e) => tracing::warn!(
+                error = %e,
+                "tx_bal reopen failed; retrying after the next window"
+            ),
+        }
+    }
+}
+
+/// Open the static `tx_bal` subscription again after prolonged silence.
+/// `BalFrame` is the merged delta plus the EIP-7928 access list: the
+/// write-set check uses the merged section, and attribution drives the
+/// parallel engine.
 fn open_bal_sub(
     rt: &AeronRuntime,
     channel: &str,
@@ -173,7 +206,8 @@ fn index_claims(
     }
 }
 
-/// `tx_receipts`: the executor's published receipts (MDS fan-in in the cluster).
+/// `tx_receipts`: the executor's published receipts, over every publisher
+/// the plane discovers, or the static channel's members.
 ///
 /// Keep the `into_receiver()` call: it matters for shutdown. The handle
 /// carries an `AeronRuntime` clone, for MDS destination churn, and moving
@@ -182,14 +216,13 @@ fn index_claims(
 /// what ends `recv()`, and this task would hold the clone that blocks it.
 /// Without this, the validator would ignore SIGTERM entirely, since
 /// `drop(rt)` would become a no-op, leaving the engine's `tx_data`
-/// subscriptions open and the join below never returning. MDS
-/// destinations attach inside `open_tx_receipts`, so nothing needs the
-/// clone after this point. The `shutdown` token gives a second, explicit
-/// exit. The pump then stops at the same time as the others, instead of
-/// waiting for `recv` to see the runtime shut down.
+/// subscriptions open and the join below never returning. The `shutdown`
+/// token gives a second, explicit exit. The pump then stops at the same
+/// time as the others, instead of waiting for `recv` to see the runtime
+/// shut down.
 pub(crate) fn spawn_receipts_pump(
     rt: &AeronRuntime,
-    channels: &ChannelsConfig,
+    plane: &mut StreamPlane,
     executor_count_flag: Option<u32>,
     receipts: Arc<ReceiptBuffer>,
     shutdown: CancellationToken,
@@ -199,9 +232,10 @@ pub(crate) fn spawn_receipts_pump(
     // the channel config's own typed count carries forward unchanged.
     let executor_count = match executor_count_flag {
         Some(n) => std::num::NonZeroU32::new(n),
-        None => channels.tx_receipts_executor_count,
+        None => plane.channels().tx_receipts_executor_count,
     };
-    let rx = TxReceiptsSubscriberHandle::open_auto(rt, channels, executor_count)
+    let rx = plane
+        .tx_receipts_subscriber(rt, executor_count)
         .context("open tx_receipts")?
         .into_receiver();
     let mut pump = ReceiptsPump { rx, receipts };

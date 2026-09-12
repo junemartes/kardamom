@@ -1,14 +1,12 @@
-//! Kardamom canonical log: Aeron-backed channels B and C, and the
-//! archive-at-the-sealer durability path for `tx_ordering`.
+//! Kardamom canonical log: the Aeron-backed application channels, the
+//! archive recorders, and the archive refetch client.
 //!
 //! Durability model: the Aeron Archive daemon uses `fileSyncLevel=1`, so it
-//! runs fdatasync on each recorded frame inline. A single Aeron Archive next
-//! to the sealer records the sealer's `tx_ordering` MDC publication. Its
-//! `get_recording_position()` returns a position that is byte-durable on
-//! local storage. The sealer publishes that position as the single
-//! [`kardamom_types::QuorumWatermark`] on `quorum_watermark_channel`.
-//! Ingress gates its must-deliver ack on that position through the ingress
-//! cluster-egress observer.
+//! runs fdatasync on each recorded frame inline. The ingress archives
+//! record the `tx_data` lanes and the DA watcher's archive records
+//! `tx_deposits`. `get_recording_position()` returns a position that is
+//! byte-durable on local storage. The canonical order itself is durable in
+//! the Aeron Cluster; the ingress gates its ack on cluster egress progress.
 //!
 //! This crate owns the transport implementation only. Wire data types live
 //! in [`types`] (re-exported from there). Do not add new wire types
@@ -29,6 +27,7 @@ pub mod aeron_live;
 mod archive_catalog;
 pub mod codec;
 pub mod config;
+pub mod discovery;
 pub mod error;
 mod ffi;
 mod offer_retry;

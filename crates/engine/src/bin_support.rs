@@ -19,8 +19,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use kardamom_log::aeron_live::AeronRuntime;
-use kardamom_log::config::{AeronConfig, ChannelsConfig};
-use kardamom_log::refetch::RefetchConfig;
+use kardamom_log::config::AeronConfig;
+use kardamom_log::refetch::{EndpointSource, RefetchConfig};
 use kardamom_state::Durability;
 use kardamom_types::{AccountChange, CodeEntry, TxDataLoc, TxEnvelope};
 
@@ -192,15 +192,12 @@ impl TxDataSubscription for LiveTxDataSub {
 /// Returns `Err` when the Aeron subscription for a shard fails to open.
 pub fn open_tx_data_subs(
     rt: &AeronRuntime,
-    channels: &ChannelsConfig,
+    plane: &mut kardamom_log::discovery::StreamPlane,
 ) -> Result<Vec<LiveTxDataSub>> {
     (0..kardamom_types::shard_map::LANE_COUNT)
         .map(|shard_id| {
-            let rx = rt
-                .open_tx_data_subscription(
-                    &channels.tx_data_channel(shard_id),
-                    channels.tx_data_stream_id(shard_id),
-                )
+            let rx = plane
+                .tx_data_subscription(rt, shard_id)
                 .with_context(|| format!("open tx_data subscription lane={shard_id}"))?;
             Ok(LiveTxDataSub {
                 sequencer_id: shard_id,
@@ -221,15 +218,15 @@ pub fn open_tx_data_subs(
 /// factory, because its Aeron resources are thread-bound. Those resources
 /// are fully lazy: none exist until the first join miss.
 pub fn archive_join_recovery(
-    channels: &ChannelsConfig,
+    plane: &mut kardamom_log::discovery::StreamPlane,
     aeron_cfg: &AeronConfig,
     aeron_dir: Option<&Path>,
     response_endpoint: Option<&str>,
     replay_endpoint: Option<&str>,
 ) -> Option<JoinRecoveryFactory> {
-    if aeron_cfg.tx_data_archive_endpoints.is_empty()
-        && aeron_cfg.tx_deposits_archive_endpoints.is_empty()
-    {
+    let channels = plane.channels().clone();
+    let (tx_data_endpoints, tx_deposits_endpoints) = archive_endpoints(plane, aeron_cfg);
+    if !tx_data_endpoints.is_configured() && !tx_deposits_endpoints.is_configured() {
         return None;
     }
     let (Some(response_endpoint), Some(replay_endpoint)) = (response_endpoint, replay_endpoint)
@@ -242,8 +239,8 @@ pub fn archive_join_recovery(
         return None;
     };
     let cfg = RefetchConfig {
-        tx_data_endpoints: aeron_cfg.tx_data_archive_endpoints.clone(),
-        tx_deposits_endpoints: aeron_cfg.tx_deposits_archive_endpoints.clone(),
+        tx_data_endpoints,
+        tx_deposits_endpoints,
         response_endpoint: response_endpoint.to_string(),
         replay_endpoint: replay_endpoint.to_string(),
         aeron_dir: aeron_dir.map(std::path::Path::to_path_buf),
@@ -254,6 +251,30 @@ pub fn archive_join_recovery(
         tx_data_stream_base: channels.tx_data_stream_id_base,
         tx_deposits_stream_id: channels.tx_deposits_stream_id,
     })
+}
+
+/// The archive endpoint sources of the two refetched topics: the live
+/// archive records on a discovered plane, else the static lists.
+fn archive_endpoints(
+    plane: &mut kardamom_log::discovery::StreamPlane,
+    aeron_cfg: &AeronConfig,
+) -> (EndpointSource, EndpointSource) {
+    match plane.watch_archives() {
+        Some(archives) => (
+            EndpointSource::Discovered {
+                topic: kardamom_log::discovery::Topic::TxData,
+                archives: archives.clone(),
+            },
+            EndpointSource::Discovered {
+                topic: kardamom_log::discovery::Topic::TxDeposits,
+                archives,
+            },
+        ),
+        None => (
+            EndpointSource::Static(aeron_cfg.tx_data_archive_endpoints.clone()),
+            EndpointSource::Static(aeron_cfg.tx_deposits_archive_endpoints.clone()),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +373,9 @@ pub fn connect_cluster_ordering(
 /// eight-argument list.
 pub struct InboundConfig<'a> {
     pub rt: &'a AeronRuntime,
-    pub channels: &'a ChannelsConfig,
+    /// The plane the `tx_data` lanes open through. Its channels also feed
+    /// the refetch wiring.
+    pub plane: &'a mut kardamom_log::discovery::StreamPlane,
     pub aeron_cfg: &'a AeronConfig,
     pub aeron_dir: Option<&'a Path>,
     pub archive_control_response_endpoint: Option<&'a str>,
@@ -385,9 +408,9 @@ pub fn open_inbound<W>(
 where
     W: crate::EngineWiring<TxData = LiveTxDataSub, TxOrdering = LiveTxOrderingSub>,
 {
-    let tx_data = open_tx_data_subs(cfg.rt, cfg.channels)?;
+    let tx_data = open_tx_data_subs(cfg.rt, cfg.plane)?;
     let join_recovery = archive_join_recovery(
-        cfg.channels,
+        cfg.plane,
         cfg.aeron_cfg,
         cfg.aeron_dir,
         cfg.archive_control_response_endpoint,
@@ -627,11 +650,13 @@ mod tests {
     // client.
     #[test]
     fn recovery_factory_gates_on_config() {
-        let channels = ChannelsConfig::default();
+        let mut plane = kardamom_log::discovery::StreamPlane::static_only(
+            kardamom_log::config::ChannelsConfig::default(),
+        );
         let mut aeron = AeronConfig::default();
         assert!(
             archive_join_recovery(
-                &channels,
+                &mut plane,
                 &aeron,
                 None,
                 Some("10.0.0.1:40140"),
@@ -642,18 +667,20 @@ mod tests {
         );
         aeron.tx_data_archive_endpoints = vec!["192.168.56.31:8010".into()];
         assert!(
-            archive_join_recovery(&channels, &aeron, None, None, None).is_none(),
+            archive_join_recovery(&mut plane, &aeron, None, None, None).is_none(),
             "endpoints but no local transport ⇒ None"
         );
         let f = archive_join_recovery(
-            &channels,
+            &mut plane,
             &aeron,
             None,
             Some("10.0.0.1:40140"),
             Some("10.0.0.1:40130"),
+        )
+        .expect("endpoints plus local transport ⇒ Some");
+        assert_eq!(
+            f.cfg.tx_data_endpoints.current(),
+            vec!["192.168.56.31:8010".to_string()]
         );
-        assert!(f.is_some(), "fully configured ⇒ factory");
-        // The factory is safe to build without Aeron; it is fully lazy.
-        let _recovery = f.unwrap().build();
     }
 }

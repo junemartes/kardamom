@@ -63,11 +63,12 @@ pub(super) enum RuntimeCmd {
     /// Best-effort publish — no ack, errors logged.
     PublishBestEffort { pub_id: u32, bytes: AlignedVec },
     /// Register a new publication. The Aeron thread executes
-    /// `aeron.add_publication()` and replies with the assigned `pub_id`.
+    /// `aeron.add_publication()` and replies with the assigned `pub_id`
+    /// and the publication's Aeron session id.
     OpenPublication {
         uri: String,
         stream_id: i32,
-        ack: CbSender<Result<u32, LogError>>,
+        ack: CbSender<Result<(u32, i32), LogError>>,
     },
     /// Register a new subscription. The Aeron thread executes
     /// `aeron.add_subscription()`, stores it in the sub table, and sends
@@ -237,7 +238,7 @@ impl AeronRuntime {
     /// timeout elapsing), or if the command round trip itself times out.
     pub fn open_publication(&self, uri: &str, stream_id: i32) -> Result<PubHandle, LogError> {
         let uri = uri.to_string();
-        let pub_id = request(
+        let (pub_id, session_id) = request(
             &self.cmd_tx,
             |ack| RuntimeCmd::OpenPublication {
                 uri,
@@ -249,6 +250,7 @@ impl AeronRuntime {
         Ok(PubHandle {
             cmd_tx: self.cmd_tx.clone(),
             pub_id,
+            session_id,
         })
     }
 
@@ -429,6 +431,18 @@ impl AeronRuntime {
         Ok((sub_id, TypedSubscription::new(rx)))
     }
 
+    /// A command-only handle on the destinations of subscription
+    /// `sub_id`. Unlike an [`AeronRuntime`] clone it does not own the
+    /// Aeron thread, so a long-lived task can hold it without keeping the
+    /// runtime alive past the last owner's drop.
+    #[must_use]
+    pub fn destinations(&self, sub_id: u32) -> Destinations {
+        Destinations {
+            cmd_tx: self.cmd_tx.clone(),
+            sub_id,
+        }
+    }
+
     /// Open a `tx_data` subscription yielding `(TxDataLoc, TxEnvelope)`,
     /// pairing each envelope with its Aeron publisher `session_id`. The
     /// session id keeps concurrent (active/active) ingress publishers on
@@ -555,6 +569,12 @@ pub struct TxDataSubscription {
 }
 
 impl TxDataSubscription {
+    /// Wrap a raw frame stream opened elsewhere, for example a discovered
+    /// multi-destination subscription.
+    pub(crate) fn from_raw(rx: UnboundedReceiver<RawFrame>) -> Self {
+        Self { rx }
+    }
+
     pub async fn recv(&mut self) -> Option<(TxDataLoc, TxEnvelope)> {
         recv_decoded(&mut self.rx, decode_tx_data_frame).await
     }
@@ -699,6 +719,49 @@ fn build_aeron(ctx: &rusteron_client::AeronContext) -> Result<Rc<AeronClient>, L
     Ok(Rc::new(aeron))
 }
 
+/// The attach and detach commands of one multi-destination subscription,
+/// without ownership of the Aeron thread. See
+/// [`AeronRuntime::destinations`].
+#[derive(Clone)]
+pub struct Destinations {
+    cmd_tx: CbSender<RuntimeCmd>,
+    sub_id: u32,
+}
+
+impl Destinations {
+    /// Attach `uri`. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver rejects or times out the attach,
+    /// or if the Aeron thread is gone.
+    pub fn add(&self, uri: &str) -> Result<(), LogError> {
+        let uri = uri.to_string();
+        let sub_id = self.sub_id;
+        request(
+            &self.cmd_tx,
+            |ack| RuntimeCmd::SubAddDestination { sub_id, uri, ack },
+            "add_destination",
+        )
+    }
+
+    /// Detach `uri`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `uri` is not attached, or if the Aeron thread
+    /// is gone.
+    pub fn remove(&self, uri: &str) -> Result<(), LogError> {
+        let uri = uri.to_string();
+        let sub_id = self.sub_id;
+        request(
+            &self.cmd_tx,
+            |ack| RuntimeCmd::SubRemoveDestination { sub_id, uri, ack },
+            "remove_destination",
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Generic Send-able publish handle
 // ---------------------------------------------------------------------------
@@ -709,9 +772,17 @@ fn build_aeron(ctx: &rusteron_client::AeronContext) -> Result<Rc<AeronClient>, L
 pub struct PubHandle {
     cmd_tx: CbSender<RuntimeCmd>,
     pub_id: u32,
+    session_id: i32,
 }
 
 impl PubHandle {
+    /// The Aeron session id the driver assigned this publication. Every
+    /// image and archive recording of it carries the same id.
+    #[must_use]
+    pub fn session_id(&self) -> i32 {
+        self.session_id
+    }
+
     /// Blocking publish with `BPosition` ack. Waits [`ACK_TIMEOUT`] for the
     /// Aeron thread's reply. See that constant for why the ack always
     /// resolves first.

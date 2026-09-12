@@ -9,21 +9,13 @@
 #
 # ingress.toml supplies the [cluster] Aeron Cluster (Raft) client
 # connection, for the on-quorum watermark observer. Other runtime
-# tuning goes through flags. channels.toml supplies the UDP multicast
-# channels. The on-quorum ack gate's durable watermark is no longer an
-# Aeron quorum_watermark stream. In the cluster-only topology, ingress
-# derives it from Aeron Cluster egress progress; see
+# tuning goes through flags. channels.toml supplies the Aeron streams
+# and the discovery scope. The on-quorum ack gate's durable watermark
+# comes from Aeron Cluster egress progress; see
 # crates/ingress/src/cluster.rs.
 #
-# tx_receipts MDS fan-in: channels.toml's tx_receipts_control_channel
-# and tx_receipts_executor_count drive ingress to open one
-# control-mode=manual subscription, and attach each executor replica's
-# per-replica endpoint (0 through N). It dedups the N identical receipt
-# copies by tx hash. executor_count comes from the log config; override
-# it at runtime with --executor-count or KARDAMOM_EXECUTOR_COUNT.
-# TODO(consul-watch): swap the static count for a Consul watch on an
-# `executor-receipts` service, so membership changes add or remove
-# destinations live.
+# tx_receipts: every ingress replica joins every executor publisher the
+# catalog lists and dedups the N identical receipt copies by tx hash.
 #
 # This shares the node's Aeron media driver, through the bind-mounted
 # tmpfs aeron.dir. It uses host networking, so :8545 binds on the
@@ -194,6 +186,13 @@ job "ingress" {
         ]
       }
 
+      env {
+        # The UDP ports the discovered tx_data publications bind on this
+        # node: one control endpoint per lane. Uniqueness comes from the
+        # node IP; one ingress runs per node. See docs/aeron-discovery.md.
+        KARDAMOM_MDC_PORTS = "40300-40319"
+      }
+
       # Presence-checked config. Content lives in config/ingress.toml.
       template {
         destination = "local/ingress.toml"
@@ -206,12 +205,16 @@ job "ingress" {
         data        = file("config/shard-map.toml")
       }
 
-      # Cluster LogConfig (UDP multicast channels). Comes from one
+      # Cluster LogConfig (Aeron streams and discovery). Comes from one
       # source, config/channels.toml.tpl, and is read through
       # --log-config.
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }
 
       resources {

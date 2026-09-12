@@ -117,9 +117,11 @@ pub(super) fn run_aeron_thread(
 }
 
 /// Live MDS destination attachment, keyed by `(sub_id, uri)` for removal.
-/// `_handle`, the rusteron `AeronAsyncDestination`, removes its
+/// `handle`, the rusteron `AeronAsyncDestination`, removes its
 /// destination when dropped, so this must be retained for as long as the
-/// attachment should stay active.
+/// attachment should stay active. That drop passes the driver the raw
+/// pointer of `uri_c`, the C string the attach was made with, so `uri_c`
+/// must outlive `handle`: fields drop in declaration order.
 struct Destination {
     sub_id: u32,
     uri: String,
@@ -127,6 +129,8 @@ struct Destination {
     // command to the driver. The field is never read; its only purpose
     // is the drop.
     _handle: rusteron_client::AeronAsyncDestination,
+    // Read by the driver through `_handle`'s drop. Never read here.
+    _uri_c: std::ffi::CString,
 }
 
 /// The Aeron thread's whole state: every `!Send` rusteron object it owns,
@@ -137,9 +141,12 @@ struct AeronThread {
     aeron: Rc<AeronClient>,
     cmd_rx: CbReceiver<RuntimeCmd>,
     pubs: Vec<PubEntry>,
+    /// Declared before `subs`: a destination detaches through its
+    /// subscription, so every destination must drop while its
+    /// subscription is still open.
+    dests: Vec<Destination>,
     subs: Vec<SubEntry>,
     pending: VecDeque<PendingPublish>,
-    dests: Vec<Destination>,
     /// Escalating idle wait for the busy branch: base 100 microseconds (the
     /// established sub-poll/retry cadence), cap 1 ms (the empty-branch
     /// cadence), grace 10 (about 1 ms of consecutive emptiness before the
@@ -320,16 +327,19 @@ impl AeronThread {
     /// index. Also reads the publication's term layout once (its
     /// `position_bits_to_shift` and `initial_term_id`), so later offer
     /// decodes never re-derive it.
-    fn cmd_open_publication(&mut self, uri: &str, stream_id: i32) -> Result<u32, LogError> {
+    /// Open a publication and append it to `pubs`, replying with its
+    /// index and its Aeron session id.
+    fn cmd_open_publication(&mut self, uri: &str, stream_id: i32) -> Result<(u32, i32), LogError> {
         let publication = self.open_pub(uri, stream_id)?;
         let layout = TermLayout::from_publication(&publication)?;
+        let session_id = publication.session_id();
         let id = u32::try_from(self.pubs.len())
             .map_err(|_| LogError::Aeron("publication table exceeds u32::MAX entries".into()))?;
         self.pubs.push(PubEntry {
             publication,
             layout,
         });
-        Ok(id)
+        Ok((id, session_id))
     }
 
     /// Open a subscription behind a fragment assembler, and append it to
@@ -356,9 +366,9 @@ impl AeronThread {
     }
 
     /// Detach a source endpoint from an MDS subscription. Dropping the
-    /// retained `AeronAsyncDestination` issues the async remove command to
-    /// the driver. Best effort: a removed source's image also times out
-    /// on its own.
+    /// retained [`Destination`] issues the async remove command to the
+    /// driver. Best effort: a removed source's image also times out on
+    /// its own.
     fn cmd_remove_destination(&mut self, sub_id: u32, uri: &str) -> Result<(), LogError> {
         let before = self.dests.len();
         self.dests.retain(|d| !(d.sub_id == sub_id && d.uri == uri));
@@ -456,6 +466,7 @@ impl AeronThread {
             sub_id,
             uri: uri.to_string(),
             _handle: dest,
+            _uri_c: c,
         });
         Ok(())
     }

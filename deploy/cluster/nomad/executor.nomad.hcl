@@ -98,6 +98,9 @@ job "executor" {
       # chosen from data. This stays unset in normal operation, and is
       # harmless (log-only) when set.
       env {
+        # The UDP ports the discovered receipt, boundary, and BAL
+        # publications bind on this node. One executor runs per node.
+        KARDAMOM_MDC_PORTS = "40320-40329"
         # BAL attribution granularity. K=20 measured a 31% reduction
         # in frame bytes on contract workloads
         # (docs/agents/2026-08-01-bal-phase1-measurement and the DeFi
@@ -202,6 +205,10 @@ job "executor" {
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }
 
       # Presence-checked config. Content lives in config/executor.toml.

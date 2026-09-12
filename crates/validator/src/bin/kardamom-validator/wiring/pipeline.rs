@@ -16,10 +16,10 @@ impl Streamed {
     /// # Errors
     ///
     /// Returns an error if either subscription fails to open.
-    pub(crate) fn spawn_pumps(self) -> Result<Self> {
+    pub(crate) fn spawn_pumps(mut self) -> Result<Self> {
         crate::pumps::spawn_bal_pump(
             &self.opened.base.rt,
-            &self.opened.base.channels,
+            &mut self.opened.base.plane,
             self.streams.bals.clone(),
             self.streams.claims.clone(),
             self.streams
@@ -30,7 +30,7 @@ impl Streamed {
         )?;
         crate::pumps::spawn_receipts_pump(
             &self.opened.base.rt,
-            &self.opened.base.channels,
+            &mut self.opened.base.plane,
             self.opened.base.args.executor_count,
             self.streams.receipts.clone(),
             self.streams.pump_shutdown.clone(),

@@ -43,9 +43,12 @@ use kardamom_types::{BPosition, Deposit, TxDataLoc, TxEnvelope};
 use rusteron_archive::AeronArchiveReplayParams;
 use tracing::{info, warn};
 
+use tokio::sync::watch;
+
 use crate::aeron_live::{AeronRuntime, PollRecv, TxDataSubscription, TypedSubscription};
 use crate::archive_catalog::ArchiveCatalog;
 use crate::config::{AeronConfig, ChannelUri};
+use crate::discovery::{ArchiveRecord, Membership, Topic};
 use crate::error::LogError;
 use crate::recorder::{ArchiveSession, connect_archive_with_timeout};
 use crate::term_layout::TermLayout;
@@ -60,12 +63,52 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DRAIN_IDLE: Duration = Duration::from_millis(500);
 const DRAIN_CAP: Duration = Duration::from_secs(8);
 
+/// Where the refetch client reads the archive control endpoints of one
+/// topic: a static list from the config, or the live archive records the
+/// catalog lists. Read at every refetch, so a discovered archive that
+/// joins or leaves changes the next attempt, never the current one.
+pub enum EndpointSource {
+    Static(Vec<String>),
+    Discovered {
+        topic: Topic,
+        archives: watch::Receiver<Membership>,
+    },
+}
+
+impl EndpointSource {
+    /// The endpoints to try now, as `host:port`.
+    #[must_use]
+    pub fn current(&self) -> Vec<String> {
+        match self {
+            Self::Static(list) => list.clone(),
+            Self::Discovered { topic, archives } => archives
+                .borrow()
+                .entries
+                .values()
+                .filter_map(|e| ArchiveRecord::from_entry(e).ok())
+                .filter(|a| a.records(*topic))
+                .map(|a| a.control.to_string())
+                .collect(),
+        }
+    }
+
+    /// Whether this source can ever name an endpoint: a non-empty static
+    /// list, or any discovered source.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        match self {
+            Self::Static(list) => !list.is_empty(),
+            Self::Discovered { .. } => true,
+        }
+    }
+}
+
 /// Node-local transport config for the refetch client.
 pub struct RefetchConfig {
-    /// Remote archive control endpoints (`host:port`) recording `tx_data`.
-    pub tx_data_endpoints: Vec<String>,
-    /// Remote archive control endpoints (`host:port`) recording `tx_deposits`.
-    pub tx_deposits_endpoints: Vec<String>,
+    /// Remote archive control endpoints recording `tx_data`.
+    pub tx_data_endpoints: EndpointSource,
+    /// Remote archive control endpoints recording `tx_deposits`.
+    pub tx_deposits_endpoints: EndpointSource,
     /// This node's UDP endpoint (`host:port`) for archive control responses.
     pub response_endpoint: String,
     /// This node's UDP endpoint (`host:port`) that replayed fragments land
@@ -161,7 +204,7 @@ impl ArchiveRefetcher {
         from: BPosition,
         mut sink: impl FnMut(TxDataLoc, TxEnvelope),
     ) -> Result<u64, LogError> {
-        let endpoints = self.cfg.tx_data_endpoints.clone();
+        let endpoints = self.cfg.tx_data_endpoints.current();
         let recs = self.list_or_rotate(&endpoints, stream_id)?;
         let Some(rec) = FoundRecording::resolve_session(recs, session_id) else {
             self.rotate();
@@ -249,7 +292,7 @@ impl ArchiveRefetcher {
         from: BPosition,
         mut sink: impl FnMut(BPosition, Deposit),
     ) -> Result<u64, LogError> {
-        let endpoints = self.cfg.tx_deposits_endpoints.clone();
+        let endpoints = self.cfg.tx_deposits_endpoints.current();
         let recs = self.list_or_rotate(&endpoints, stream_id)?;
         if recs.is_empty() {
             self.rotate();

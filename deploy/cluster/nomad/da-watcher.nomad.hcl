@@ -109,11 +109,21 @@ job "da-watcher" {
         ]
       }
 
-      # Cluster LogConfig (UDP multicast channels), read through
+      env {
+        # The UDP ports the discovered tx_deposits and tx_remote_epochs
+        # publications bind on this node.
+        KARDAMOM_MDC_PORTS = "40330-40339"
+      }
+
+      # Cluster LogConfig (Aeron streams and discovery), read through
       # --log-config.
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }
 
       resources {
