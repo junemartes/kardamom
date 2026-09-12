@@ -16,7 +16,6 @@ use kardamom_log::aeron_live::{
     AeronRuntime, FsyncWatermarkSubscriberHandle, TxDataPublisherHandle, TxErrorsSubscriberHandle,
     TxReceiptsBoundarySubscriberHandle, TxReceiptsReceiver,
 };
-use kardamom_log::config::ChannelsConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_types::{
     BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
@@ -44,17 +43,19 @@ impl LiveIngressPublication {
     ///
     /// Returns `IngressError::Internal` if any lane's `tx_data` handle
     /// fails to open.
-    pub fn open(
+    pub async fn open(
         rt: &AeronRuntime,
-        channels: &ChannelsConfig,
+        plane: &mut StreamPlane,
         lanes: NonZeroU8,
     ) -> Result<Self, IngressError> {
-        let tx_data = (0..lanes.get())
-            .map(|lane| {
-                TxDataPublisherHandle::open(rt, channels, lane)
-                    .map_err(|e| IngressError::internal(format!("open tx_data[{lane}]"), e))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut tx_data = Vec::with_capacity(usize::from(lanes.get()));
+        for lane in 0..lanes.get() {
+            let handle = plane
+                .tx_data_publisher(rt, lane)
+                .await
+                .map_err(|e| IngressError::internal(format!("open tx_data[{lane}]"), e))?;
+            tx_data.push(handle);
+        }
         Ok(Self { tx_data })
     }
 }

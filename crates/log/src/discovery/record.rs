@@ -172,13 +172,24 @@ pub struct PublisherRecord {
     pub lane: Option<u8>,
     /// A human label of the publishing process, for logs.
     pub publisher_id: String,
-    /// The publication's Aeron session id, when known at registration.
-    /// The received image header is the authority for positions; this is
-    /// a hint for operators.
+    /// The publication's Aeron session id. The runtime always advertises
+    /// it; the recorder uses it to tell this incarnation's recording from
+    /// an earlier one on the same control port. `None` only in a record
+    /// written by another producer.
     pub session_id: Option<i32>,
 }
 
 impl PublisherRecord {
+    /// Whether this record was registered by the process with
+    /// `instance_id`; see [`super::Instance::service_id`].
+    #[must_use]
+    pub fn belongs_to(&self, instance_id: &str) -> bool {
+        self.id
+            .as_str()
+            .strip_prefix(instance_id)
+            .is_some_and(|rest| rest.starts_with(':'))
+    }
+
     /// The catalog entry this record registers as, under `scope`.
     #[must_use]
     pub fn entry(&self, scope: &Scope) -> ServiceEntry {

@@ -244,7 +244,7 @@ async fn main() -> Result<()> {
     // stay live always: the reader's join-miss refetch recovers any
     // down-window or lapse gap in-band, against the remote durability
     // archives.
-    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels)?;
+    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &mut plane)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,

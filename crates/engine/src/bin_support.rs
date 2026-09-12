@@ -192,15 +192,12 @@ impl TxDataSubscription for LiveTxDataSub {
 /// Returns `Err` when the Aeron subscription for a shard fails to open.
 pub fn open_tx_data_subs(
     rt: &AeronRuntime,
-    channels: &ChannelsConfig,
+    plane: &mut kardamom_log::discovery::StreamPlane,
 ) -> Result<Vec<LiveTxDataSub>> {
     (0..kardamom_types::shard_map::LANE_COUNT)
         .map(|shard_id| {
-            let rx = rt
-                .open_tx_data_subscription(
-                    &channels.tx_data_channel(shard_id),
-                    channels.tx_data_stream_id(shard_id),
-                )
+            let rx = plane
+                .tx_data_subscription(rt, shard_id)
                 .with_context(|| format!("open tx_data subscription lane={shard_id}"))?;
             Ok(LiveTxDataSub {
                 sequencer_id: shard_id,
@@ -352,7 +349,9 @@ pub fn connect_cluster_ordering(
 /// eight-argument list.
 pub struct InboundConfig<'a> {
     pub rt: &'a AeronRuntime,
-    pub channels: &'a ChannelsConfig,
+    /// The plane the `tx_data` lanes open through. Its channels also feed
+    /// the refetch wiring.
+    pub plane: &'a mut kardamom_log::discovery::StreamPlane,
     pub aeron_cfg: &'a AeronConfig,
     pub aeron_dir: Option<&'a Path>,
     pub archive_control_response_endpoint: Option<&'a str>,
@@ -385,9 +384,9 @@ pub fn open_inbound<W>(
 where
     W: crate::EngineWiring<TxData = LiveTxDataSub, TxOrdering = LiveTxOrderingSub>,
 {
-    let tx_data = open_tx_data_subs(cfg.rt, cfg.channels)?;
+    let tx_data = open_tx_data_subs(cfg.rt, cfg.plane)?;
     let join_recovery = archive_join_recovery(
-        cfg.channels,
+        cfg.plane.channels(),
         cfg.aeron_cfg,
         cfg.aeron_dir,
         cfg.archive_control_response_endpoint,

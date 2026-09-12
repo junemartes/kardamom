@@ -63,11 +63,12 @@ pub(super) enum RuntimeCmd {
     /// Best-effort publish — no ack, errors logged.
     PublishBestEffort { pub_id: u32, bytes: AlignedVec },
     /// Register a new publication. The Aeron thread executes
-    /// `aeron.add_publication()` and replies with the assigned `pub_id`.
+    /// `aeron.add_publication()` and replies with the assigned `pub_id`
+    /// and the publication's Aeron session id.
     OpenPublication {
         uri: String,
         stream_id: i32,
-        ack: CbSender<Result<u32, LogError>>,
+        ack: CbSender<Result<(u32, i32), LogError>>,
     },
     /// Register a new subscription. The Aeron thread executes
     /// `aeron.add_subscription()`, stores it in the sub table, and sends
@@ -237,7 +238,7 @@ impl AeronRuntime {
     /// timeout elapsing), or if the command round trip itself times out.
     pub fn open_publication(&self, uri: &str, stream_id: i32) -> Result<PubHandle, LogError> {
         let uri = uri.to_string();
-        let pub_id = request(
+        let (pub_id, session_id) = request(
             &self.cmd_tx,
             |ack| RuntimeCmd::OpenPublication {
                 uri,
@@ -249,6 +250,7 @@ impl AeronRuntime {
         Ok(PubHandle {
             cmd_tx: self.cmd_tx.clone(),
             pub_id,
+            session_id,
         })
     }
 
@@ -567,6 +569,12 @@ pub struct TxDataSubscription {
 }
 
 impl TxDataSubscription {
+    /// Wrap a raw frame stream opened elsewhere, for example a discovered
+    /// multi-destination subscription.
+    pub(crate) fn from_raw(rx: UnboundedReceiver<RawFrame>) -> Self {
+        Self { rx }
+    }
+
     pub async fn recv(&mut self) -> Option<(TxDataLoc, TxEnvelope)> {
         recv_decoded(&mut self.rx, decode_tx_data_frame).await
     }
@@ -764,9 +772,17 @@ impl Destinations {
 pub struct PubHandle {
     cmd_tx: CbSender<RuntimeCmd>,
     pub_id: u32,
+    session_id: i32,
 }
 
 impl PubHandle {
+    /// The Aeron session id the driver assigned this publication. Every
+    /// image and archive recording of it carries the same id.
+    #[must_use]
+    pub fn session_id(&self) -> i32 {
+        self.session_id
+    }
+
     /// Blocking publish with `BPosition` ack. Waits [`ACK_TIMEOUT`] for the
     /// Aeron thread's reply. See that constant for why the ack always
     /// resolves first.

@@ -12,7 +12,6 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -28,10 +27,7 @@ use super::record::{PUBLISHER_SERVICE, PublisherRecord, Scope, Topic};
 use super::registration::Registration;
 use super::watch::{Membership, MembershipWatch, WatchTiming};
 use super::{Instance, catalog_from_config, scope_from_config};
-use crate::aeron_live::{
-    AeronRuntime, Destinations, PubHandle, RawFrame, TxReceiptsBoundarySubscriberHandle,
-    TxReceiptsPublisherHandle, TxReceiptsSubscriberHandle, TypedSubscription,
-};
+use crate::aeron_live::{AeronRuntime, Destinations, PubHandle, RawFrame, TypedSubscription};
 use crate::codec::WireMessage;
 use crate::config::{ChannelsConfig, DiscoveryConfig, LogConfig};
 use crate::error::LogError;
@@ -70,14 +66,21 @@ pub struct StreamKey {
 impl StreamKey {
     /// The catalog filter of every publisher of this stream in `scope`.
     fn filter(self, scope: &Scope) -> BTreeMap<String, String> {
-        let mut meta = scope.meta();
-        meta.insert("topic".into(), self.topic.as_str().into());
+        let mut meta = topic_filter(self.topic, scope);
         meta.insert("stream_id".into(), self.stream_id.to_string());
         if let Some(lane) = self.lane {
             meta.insert("lane_id".into(), lane.to_string());
         }
         meta
     }
+}
+
+/// The catalog filter of every publisher of `topic` in `scope`, every
+/// stream and lane included.
+fn topic_filter(topic: Topic, scope: &Scope) -> BTreeMap<String, String> {
+    let mut meta = scope.meta();
+    meta.insert("topic".into(), topic.as_str().into());
+    meta
 }
 
 impl DestinationPort for Destinations {
@@ -124,7 +127,7 @@ impl Discovered {
             stream_id: key.stream_id,
             lane: key.lane,
             publisher_id: self.label.clone(),
-            session_id: None,
+            session_id: Some(publication.session_id()),
         };
         let spec = RegistrationSpec {
             entry: record.entry(&self.scope),
@@ -162,14 +165,22 @@ impl Discovered {
         Ok(rx)
     }
 
-    fn start_reconcile(&mut self, port: Destinations, key: StreamKey) {
+    /// Start a watch over the publisher records matching `filter`, and
+    /// return its membership receiver.
+    fn watch(&mut self, filter: BTreeMap<String, String>) -> watch::Receiver<Membership> {
         let (watch, membership) = MembershipWatch::new(
             self.catalog.clone(),
             PUBLISHER_SERVICE.into(),
-            key.filter(&self.scope),
+            filter,
             WatchTiming::from_config(&self.cfg),
             self.cancel.clone(),
         );
+        self.tasks.push(tokio::spawn(watch.run()));
+        membership
+    }
+
+    fn start_reconcile(&mut self, port: Destinations, key: StreamKey) {
+        let membership = self.watch(key.filter(&self.scope));
         let attach = ReconcileTask {
             key,
             membership,
@@ -181,7 +192,6 @@ impl Discovered {
             cancel: self.cancel.clone(),
             tick: self.cfg.removal_grace().max(Duration::from_millis(500)) / 2,
         };
-        self.tasks.push(tokio::spawn(watch.run()));
         self.tasks.push(tokio::spawn(attach.run()));
         info!(topic = %key.topic, stream_id = key.stream_id, "discovery: subscription open");
     }
@@ -270,6 +280,8 @@ impl ReconcileTask {
     }
 }
 
+mod streams;
+
 /// The seam every service opens its channels through. See the module
 /// doc.
 pub struct StreamPlane {
@@ -346,6 +358,29 @@ impl StreamPlane {
         self.discovered.is_some()
     }
 
+    /// The advertised address of a discovered plane, `None` on a static
+    /// one.
+    #[must_use]
+    pub fn local_ip(&self) -> Option<Ipv4Addr> {
+        self.discovered.as_ref().map(|d| d.ip)
+    }
+
+    /// The instance id every record of a discovered plane carries,
+    /// `None` on a static one.
+    #[must_use]
+    pub fn instance_id(&self) -> Option<&str> {
+        self.discovered.as_ref().map(|d| d.instance.id.as_str())
+    }
+
+    /// Watch every publisher of `topic` in this scope, every stream and
+    /// lane included. `None` on a static plane. A recorder uses this to
+    /// follow the publishers it must record.
+    pub fn watch_topic(&mut self, topic: Topic) -> Option<watch::Receiver<Membership>> {
+        let d = self.discovered.as_mut()?;
+        let filter = topic_filter(topic, &d.scope);
+        Some(d.watch(filter))
+    }
+
     /// Open publisher handle `H`.
     ///
     /// # Errors
@@ -386,93 +421,6 @@ impl StreamPlane {
             Some(d) => d
                 .open_subscription::<H::Msg>(rt, key)
                 .map(H::from_subscription),
-        }
-    }
-
-    /// The `tx_receipts` publisher: the receipt stream and the boundary
-    /// side-stream. Static: the per-replica MDS endpoint when the
-    /// channels enable MDS, else the shared channel. Discovered: two
-    /// dynamic MDC publications, each registered under its own topic.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if either publication fails to open or register.
-    pub async fn tx_receipts_publisher(
-        &mut self,
-        rt: &AeronRuntime,
-        replica_idx: u32,
-    ) -> Result<TxReceiptsPublisherHandle, LogError> {
-        let (receipts_key, boundaries_key) = (self.receipts_key(), self.boundaries_key());
-        let Some(d) = &mut self.discovered else {
-            return if self.channels.tx_receipts_mds_enabled() {
-                TxReceiptsPublisherHandle::open_mds(rt, &self.channels, replica_idx)
-            } else {
-                TxReceiptsPublisherHandle::open(rt, &self.channels)
-            };
-        };
-        let receipts = d.open_publication(rt, receipts_key).await?;
-        let boundaries = d.open_publication(rt, boundaries_key).await?;
-        Ok(TxReceiptsPublisherHandle::from_publications(
-            receipts, boundaries,
-        ))
-    }
-
-    /// The `tx_receipts` subscriber. Static: `open_auto` over the
-    /// channels, attaching `executor_count` replica endpoints under MDS.
-    /// Discovered: one multi-destination subscription the reconcile task
-    /// fills from the catalog, so `executor_count` is unused.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the subscription fails to open.
-    pub fn tx_receipts_subscriber(
-        &mut self,
-        rt: &AeronRuntime,
-        executor_count: Option<NonZeroU32>,
-    ) -> Result<TxReceiptsSubscriberHandle, LogError> {
-        let key = self.receipts_key();
-        match &mut self.discovered {
-            None => TxReceiptsSubscriberHandle::open_auto(rt, &self.channels, executor_count),
-            Some(d) => d
-                .open_raw_subscription(rt, key)
-                .map(|rx| TxReceiptsSubscriberHandle::from_raw(rx, rt)),
-        }
-    }
-
-    /// The block-boundary twin of [`Self::tx_receipts_subscriber`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the subscription fails to open.
-    pub fn tx_receipt_boundaries_subscriber(
-        &mut self,
-        rt: &AeronRuntime,
-        executor_count: Option<NonZeroU32>,
-    ) -> Result<TxReceiptsBoundarySubscriberHandle, LogError> {
-        let key = self.boundaries_key();
-        match &mut self.discovered {
-            None => {
-                TxReceiptsBoundarySubscriberHandle::open_auto(rt, &self.channels, executor_count)
-            }
-            Some(d) => d
-                .open_subscription(rt, key)
-                .map(|rx| TxReceiptsBoundarySubscriberHandle::from_subscription(rx, rt)),
-        }
-    }
-
-    fn receipts_key(&self) -> StreamKey {
-        StreamKey {
-            topic: Topic::TxReceipts,
-            stream_id: self.channels.tx_receipts_stream_id,
-            lane: None,
-        }
-    }
-
-    fn boundaries_key(&self) -> StreamKey {
-        StreamKey {
-            topic: Topic::TxReceiptBoundaries,
-            stream_id: self.channels.tx_receipts_boundary_stream_id(),
-            lane: None,
         }
     }
 

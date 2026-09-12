@@ -21,6 +21,7 @@ pub mod memory;
 pub mod plane;
 pub mod reconcile;
 pub mod record;
+pub mod recording;
 pub mod registration;
 pub mod watch;
 
@@ -35,6 +36,7 @@ pub use record::{
     ARCHIVE_SERVICE, ArchiveRecord, CLUSTER_MEMBER_SERVICE, ClusterMemberRecord, DISCOVERY_VERSION,
     PUBLISHER_SERVICE, PublisherRecord, Scope, ServiceEntry, ServiceId, Topic,
 };
+pub use recording::{DiscoveredRecorder, RecorderProgress};
 pub use registration::Registration;
 pub use watch::{CatalogHealth, Membership, MembershipWatch, WatchTiming};
 

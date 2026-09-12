@@ -19,10 +19,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
-    AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
+    AeronRuntime, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
     TxRemoteEpochsSubscriberHandle,
 };
-use kardamom_log::config::{ChannelsConfig, LogConfig};
+use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_sequencer::config::SequencerConfig;
@@ -258,11 +258,11 @@ impl Handles {
     ) -> Result<Self> {
         let channels = plane.channels().clone();
         let channels = &channels;
-        let own = Self::open_lane(rt, channels, cfg.lane())?;
+        let own = Self::open_lane(rt, plane, cfg.lane())?;
         let old = cfg
             .extra_lanes
             .iter()
-            .map(|lane| Self::open_lane(rt, channels, *lane))
+            .map(|lane| Self::open_lane(rt, plane, *lane))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             data_subs: LaneSubscriptions::new(own, old),
@@ -277,9 +277,10 @@ impl Handles {
         })
     }
 
-    /// Open the `tx_data` subscription of one lane.
-    fn open_lane(rt: &AeronRuntime, channels: &ChannelsConfig, lane: u8) -> Result<LaneSub> {
-        let handle = TxDataSubscriberHandle::open(rt, channels, lane)
+    /// Open the `tx_data` subscription of one lane through the plane.
+    fn open_lane(rt: &AeronRuntime, plane: &mut StreamPlane, lane: u8) -> Result<LaneSub> {
+        let handle = plane
+            .tx_data_subscriber(rt, lane)
             .with_context(|| format!("open TxDataSubscriberHandle lane={lane}"))?;
         Ok(LaneSub { lane, handle })
     }

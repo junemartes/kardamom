@@ -327,16 +327,19 @@ impl AeronThread {
     /// index. Also reads the publication's term layout once (its
     /// `position_bits_to_shift` and `initial_term_id`), so later offer
     /// decodes never re-derive it.
-    fn cmd_open_publication(&mut self, uri: &str, stream_id: i32) -> Result<u32, LogError> {
+    /// Open a publication and append it to `pubs`, replying with its
+    /// index and its Aeron session id.
+    fn cmd_open_publication(&mut self, uri: &str, stream_id: i32) -> Result<(u32, i32), LogError> {
         let publication = self.open_pub(uri, stream_id)?;
         let layout = TermLayout::from_publication(&publication)?;
+        let session_id = publication.session_id();
         let id = u32::try_from(self.pubs.len())
             .map_err(|_| LogError::Aeron("publication table exceeds u32::MAX entries".into()))?;
         self.pubs.push(PubEntry {
             publication,
             layout,
         });
-        Ok(id)
+        Ok((id, session_id))
     }
 
     /// Open a subscription behind a fragment assembler, and append it to

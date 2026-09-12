@@ -38,7 +38,10 @@ use kardamom_types::QuorumWatermark;
 use tokio_util::sync::CancellationToken;
 
 use kardamom_types::shard_map::{LANE_COUNT, ShardMap, validate_shard_count};
-use recorders::{spawn_tx_data_recorders, wait_for_recorders};
+use recorders::{
+    spawn_discovered_tx_data_recorder, spawn_tx_data_recorders, wait_for_discovered_recorder,
+    wait_for_recorders,
+};
 
 /// The lane plane as the non-zero count the publisher and recorder
 /// openers take: every lane opens, whatever the active shard count.
@@ -274,16 +277,31 @@ impl IngressService {
             StreamPlane::from_config(&self.log_cfg, &format!("ingress-{}", args.ingress_id))
                 .context("build the stream plane")?;
 
-        let (recorder_handles, recorder_ready) = if args.archive_durability {
-            spawn_tx_data_recorders(
+        // With discovery, one recorder thread follows every tx_data
+        // publisher the catalog lists. Without it, one static recorder
+        // thread per lane records the shared channel.
+        let discovered = args.archive_durability.then(|| {
+            spawn_discovered_tx_data_recorder(
                 args.aeron_dir.as_deref(),
-                channels,
                 aeron_cfg,
+                &mut plane,
                 LANE_PLANE,
                 &self.stop,
             )
-        } else {
-            (Vec::new(), Vec::new())
+        });
+        let (recorder_handles, recorder_ready, discovered_ready) = match discovered {
+            Some(Some((handle, ready))) => (vec![handle], Vec::new(), Some(ready)),
+            Some(None) => {
+                let (handles, ready) = spawn_tx_data_recorders(
+                    args.aeron_dir.as_deref(),
+                    channels,
+                    aeron_cfg,
+                    LANE_PLANE,
+                    &self.stop,
+                );
+                (handles, ready, None)
+            }
+            None => (Vec::new(), Vec::new(), None),
         };
 
         // tx_receipts MDS membership: prefer the CLI or env
@@ -292,12 +310,17 @@ impl IngressService {
         // proxy reads this only when MDS is enabled.
         let executor_count = args.executor_count.or(channels.tx_receipts_executor_count);
 
-        let publication = LiveIngressPublication::open(&rt, channels, LANE_PLANE)
+        let publication = LiveIngressPublication::open(&rt, &mut plane, LANE_PLANE)
+            .await
             .context("open IngressPublication")?;
 
         // This is the recorder barrier: with the tx_data publications now
         // open, every lane's recording can start.
-        if args.archive_durability {
+        if let Some(ready) = discovered_ready {
+            wait_for_discovered_recorder(ready)
+                .await
+                .context("archive durability requested but the tx_data recorder failed to start")?;
+        } else if args.archive_durability {
             wait_for_recorders(recorder_ready)
                 .await
                 .context("archive durability requested but tx_data recorders failed to start")?;

@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use kardamom_log::config::{AeronConfig, ChannelsConfig};
+use kardamom_log::discovery::{DiscoveredRecorder, RecorderProgress, StreamPlane, Topic};
 use kardamom_log::recorder::{RecorderKind, record_stream_until_stopped};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -78,6 +79,72 @@ pub(crate) fn spawn_tx_data_recorders(
             (handle, ready_rx)
         })
         .unzip()
+}
+
+/// Spawns the one discovery-driven recorder thread: it records every
+/// `tx_data` publisher the catalog lists, this ingress's own lanes and
+/// every other ingress's, on the local archive. Readiness is this
+/// instance's `lanes` publications all recording. Returns `None` on a
+/// static plane, where [`spawn_tx_data_recorders`] applies.
+pub(crate) fn spawn_discovered_tx_data_recorder(
+    aeron_dir: Option<&Path>,
+    aeron_cfg: &AeronConfig,
+    plane: &mut StreamPlane,
+    lanes: NonZeroU8,
+    stop: &CancellationToken,
+) -> Option<(
+    std::thread::JoinHandle<()>,
+    oneshot::Receiver<RecorderProgress>,
+)> {
+    let membership = plane.watch_topic(Topic::TxData)?;
+    let recorder = DiscoveredRecorder {
+        aeron_dir: aeron_dir.map(Path::to_path_buf),
+        aeron_cfg: aeron_cfg.clone(),
+        local_ip: plane.local_ip()?,
+        own_instance: plane.instance_id()?.to_string(),
+        expected_own: usize::from(lanes.get()),
+        membership,
+        stop: stop.clone(),
+        runtime: tokio::runtime::Handle::current(),
+    };
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let handle = std::thread::Builder::new()
+        .name("ingress-tx-data-recorder".into())
+        .spawn(move || {
+            if let Err(e) = recorder.run(|progress| {
+                let _ = ready_tx.send(progress);
+            }) {
+                tracing::error!(error = %e, "discovered tx_data recorder exited with error");
+            }
+        })
+        .expect("spawn discovered tx_data recorder thread");
+    Some((handle, ready_rx))
+}
+
+/// The barrier of [`spawn_discovered_tx_data_recorder`]: every own lane
+/// records, or the recorder reported a failure, or the budget ran out.
+pub(crate) async fn wait_for_discovered_recorder(
+    ready: oneshot::Receiver<RecorderProgress>,
+) -> Result<()> {
+    const READY_TIMEOUT: Duration = Duration::from_secs(60);
+    match tokio::time::timeout(READY_TIMEOUT, ready).await {
+        Ok(Ok(RecorderProgress::Ready { own_recordings })) => {
+            tracing::info!(
+                own_recordings,
+                "tx_data recordings confirmed active for every lane"
+            );
+            Ok(())
+        }
+        Ok(Ok(RecorderProgress::Failed(reason))) => {
+            anyhow::bail!("the discovered tx_data recorder failed to start: {reason}")
+        }
+        Ok(Err(_)) => {
+            anyhow::bail!("the discovered tx_data recorder thread exited before readiness")
+        }
+        Err(_) => anyhow::bail!(
+            "timed out ({READY_TIMEOUT:?}) waiting for every own tx_data recording to become active"
+        ),
+    }
 }
 
 /// Waits until every recorder thread reports readiness. Fails on the

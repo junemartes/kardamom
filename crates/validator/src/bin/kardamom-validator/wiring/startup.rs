@@ -190,7 +190,7 @@ impl Opened {
     /// Returns an error if any subscription fails to open, the cluster
     /// session fails to connect, or the resume block is `u64::MAX` (so
     /// naming the next block would overflow).
-    pub(crate) fn open_streams(self) -> Result<Streamed> {
+    pub(crate) fn open_streams(mut self) -> Result<Streamed> {
         let args = &self.base.args;
         // The kardamom_sealer_* re-export is the executor's job. A
         // validator emitting a second, lagging copy of the series would
@@ -199,7 +199,7 @@ impl Opened {
         let (inbound, cluster_guard) =
             bin_support::open_inbound::<super::run::ValidatorWiring>(bin_support::InboundConfig {
                 rt: &self.base.rt,
-                channels: &self.base.channels,
+                plane: &mut self.base.plane,
                 aeron_cfg: &self.base.aeron_cfg,
                 aeron_dir: args.aeron_dir.as_deref(),
                 archive_control_response_endpoint: args
