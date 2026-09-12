@@ -33,7 +33,7 @@
 //! is always a full, consistent snapshot.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -370,10 +370,7 @@ impl<'a> CheckpointFetch<'a> {
     /// Connect to `peer` (`host:port`) and send the checkpoint-fetch
     /// request.
     fn connect(peer: &'a str, expected_genesis: Option<B256>) -> Result<Self, StateError> {
-        let addr: SocketAddr = peer
-            .parse()
-            .map_err(|_| StateError::Recovery(format!("bad checkpoint peer address: {peer}")))?;
-        let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+        let mut stream = Self::open(peer)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         stream.write_all(b"GET /checkpoint/latest HTTP/1.0\r\n\r\n")?;
@@ -382,6 +379,26 @@ impl<'a> CheckpointFetch<'a> {
             reader: BufReader::new(stream),
             expected_genesis,
         })
+    }
+
+    /// Open a connection to the first address of `peer` that accepts one.
+    /// The host part may be a name, such as a Consul node record; every
+    /// address it resolves to is tried in order.
+    fn open(peer: &str) -> Result<TcpStream, StateError> {
+        let addrs = peer.to_socket_addrs().map_err(|e| {
+            StateError::Recovery(format!("bad checkpoint peer address {peer}: {e}"))
+        })?;
+        let mut refused = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => refused = Some(e),
+            }
+        }
+        Err(refused.map_or_else(
+            || StateError::Recovery(format!("checkpoint peer {peer} resolves to no address")),
+            StateError::from,
+        ))
     }
 
     /// Read and parse the response head.

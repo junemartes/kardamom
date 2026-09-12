@@ -3,8 +3,14 @@
 # (`make check-contract` verifies the mirrors below stay in sync).
 
 SHELL := /bin/bash
-REGISTRY := 192.168.56.10:5000
-NOMAD_ADDR := http://192.168.56.10:4646
+# The registry is a Consul service; every node resolves the name. The host
+# pushes through the control node (REGISTRY_PUSH_NODE), where it resolves.
+REGISTRY := registry.service.consul:5000
+NOMAD_HTTP := 4646
+# The control node address comes from the node contract of the container
+# root at run time. Nothing in this tree names an address.
+NODE_CONTRACT := terraform/containers/node-contract.json
+NOMAD_ADDR ?= http://$(shell python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nodes"]["control-0"]["ip"])' $(NODE_CONTRACT) 2>/dev/null):$(NOMAD_HTTP)
 TAG := dev
 # Per-deploy image digest manifest (attested-identity P0.1): written at push
 # time by ansible/images.yml, read by ansible/deploy.yml to pin every job's
@@ -47,10 +53,9 @@ deploy:
 smoke:
 	./scripts/smoke.sh
 
-## status: cluster + job health (Nomad binds the VM IP, not localhost, so the
-## CLI inside the VM needs NOMAD_ADDR pointed at it)
+## status: cluster + job health, from the control node's own agents
 status:
-	vagrant ssh control-0 -c 'export NOMAD_ADDR=$(NOMAD_ADDR); nomad node status && echo && nomad job status && echo && consul members'
+	vagrant ssh control-0 -c 'nomad node status && echo && nomad job status && echo && consul members'
 
 ## validate: static checks (run on a host with the toolchain; CI runs these too)
 validate:
@@ -84,7 +89,9 @@ clean:
 # lifecycle: apply, converge, test, diagnose, destroy. CI runs these targets
 # as workflow steps; ansible/local.yml runs them inside the orchestrator.
 TF_CONTAINERS := terraform/containers
-NODE_CONTRACT := $(TF_CONTAINERS)/node-contract.json
+# Images are pushed from inside the control node, where the registry name
+# resolves; the host daemon needs no insecure-registry entry.
+export REGISTRY_PUSH_NODE ?= control-0
 # Extra vars for ansible/cluster.yml, as one JSON object without a single quote.
 CLUSTER_VARS :=
 CLUSTER_VARS_ARG = $(if $(CLUSTER_VARS),--extra-vars '$(CLUSTER_VARS)')
@@ -96,7 +103,8 @@ container-up:
 	tofu -chdir=$(TF_CONTAINERS) init -input=false
 	tofu -chdir=$(TF_CONTAINERS) apply -auto-approve -input=false
 	tofu -chdir=$(TF_CONTAINERS) output -json node_contract > $(NODE_CONTRACT)
-	ansible-playbook -i localhost, ansible/cluster.yml $(CLUSTER_VARS_ARG)
+	NOMAD_ADDR=http://$$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nodes"]["control-0"]["ip"])' $(NODE_CONTRACT)):$(NOMAD_HTTP) \
+	  ansible-playbook -i localhost, ansible/cluster.yml $(CLUSTER_VARS_ARG)
 
 ## container-test: the smoke, load and chaos gates (RUN_LOAD, RUN_CHAOS, ...)
 container-test:

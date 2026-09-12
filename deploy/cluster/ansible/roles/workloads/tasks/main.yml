@@ -15,6 +15,13 @@
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
 
+- name: Discover the in-cluster L1 through the Nomad API
+  ansible.builtin.include_tasks: anvil.yml
+  when:
+    - workloads_l1_rpc | length == 0
+    - workloads_settlement_address | length == 0
+    - not ansible_check_mode
+
 - name: Resolve settlement before deploying its consumers
   ansible.builtin.import_tasks: settlement.yml
 
@@ -54,7 +61,7 @@
     - name: validator
       wait: false
       vars:
-        l1_rpc_url: "{{ 'http://' ~ workloads_aux_ip ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0 else '' }}"
+        l1_rpc_url: "{{ 'http://' ~ workloads_aux_host ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0 else '' }}"
         lockbox_address: "{{ workloads_lockbox_address if workloads_light_execution_rpc | length > 0 else '' }}"
     - name: da-watcher
       wait: false

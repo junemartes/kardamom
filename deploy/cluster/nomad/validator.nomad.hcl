@@ -54,8 +54,20 @@ variable "lockbox_address" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
+variable "executor_count" {
+  type        = number
+  description = "The executor node count (node_classes.executor.count). The checkpoint peers are executor-<i>.node.<datacenter>.consul."
+  default     = 3
+}
+
 job "validator" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {
@@ -112,7 +124,7 @@ job "validator" {
       driver = "docker"
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-validator:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-validator:dev"
         # force_pull stays on for both paths; see the ingress job's
         # comment. The :dev fallback needs it. On the pinned path, the
         # 1.9.5 driver pulls the tag but resolves the image by digest,
@@ -171,7 +183,7 @@ job "validator" {
           # the executors' serve endpoints, and adopt it on restart,
           # the same as the executors' recovery-D loop.
           "--checkpoint-dir", "/opt/kardamom/checkpoints",
-          "--checkpoint-peers", "192.168.56.41:9014,192.168.56.42:9014,192.168.56.43:9014",
+          "--checkpoint-peers", join(",", [for i in range(var.executor_count) : "executor-${i}.node.${var.datacenter}.consul:9014"]),
           # Shadow-check the node-incremental state trie against a
           # full rebuild every 8th block. A walker bug fail-stops the
           # validator (a dead alloc is a verdict failure), and bumps

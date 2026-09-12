@@ -118,8 +118,8 @@ group_is_gone() { [ "$(count_running_group "$1" "$2")" = "0" ] && echo ok; }
 # the log stays correct. Then the routes return, the replica is killed
 # once more, and its first park gets an answer (the ok outcome counts).
 case_lookup_blackout() {
-  local node="kardamom-sequencer-0" ip="192.168.56.21" port=9001
-  local executors="192.168.56.41 192.168.56.42 192.168.56.43"
+  local node="kardamom-sequencer-0" ip="${NODE_IP[kardamom-sequencer-0]}" port=9001
+  local executors="${NODE_IP[executor-0]} ${NODE_IP[executor-1]} ${NODE_IP[executor-2]}"
   local base_fail base_ok e
   base_fail="$(seq_metric_where "${ip}" "${node}" "${port}" kardamom_sequencer_nonce_lookups_total 'outcome="timeout"' || true)"
   base_fail=$(( ${base_fail:-0} + $(seq_metric_where "${ip}" "${node}" "${port}" kardamom_sequencer_nonce_lookups_total 'outcome="error"' || echo 0) ))

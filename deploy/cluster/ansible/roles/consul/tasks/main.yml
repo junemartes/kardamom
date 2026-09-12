@@ -49,6 +49,57 @@
     mode: "0640"
   notify: Restart consul
 
+# The recursors are the resolvers the host had before this role ran. The
+# resolved stub (127.0.0.53) is not a resolver; on a host that uses it,
+# the real upstreams are in /run/systemd/resolve/resolv.conf. Docker's
+# embedded DNS (127.0.0.11) is one: it resolves the container names of
+# the node network. The file is rendered once, so a later run does not
+# read back the agent this role installs at 127.0.0.1.
+- name: Check for the rendered recursor file
+  ansible.builtin.stat:
+    path: /etc/consul.d/dns.hcl
+  register: consul_dns_file
+
+- name: Read the host resolver files
+  ansible.builtin.slurp:
+    path: "{{ item }}"
+  loop: [/etc/resolv.conf, /run/systemd/resolve/resolv.conf]
+  register: consul_resolver_files
+  failed_when: false
+  when: not consul_dns_file.stat.exists
+
+- name: Parse the resolver files
+  ansible.builtin.set_fact:
+    consul_resolver_lists: >-
+      {{ consul_resolver_files.results | selectattr('content', 'defined') | map(attribute='content')
+         | map('b64decode') | map('regex_findall', '(?m)^nameserver\s+(\S+)') | list }}
+  when: not consul_dns_file.stat.exists
+
+# The first file with a resolver that is not this agent (127.0.0.1) and not
+# the resolved stub (127.0.0.53) wins.
+- name: Select the upstream resolvers
+  ansible.builtin.set_fact:
+    consul_recursors: >-
+      {{ consul_resolver_lists | map('reject', 'match', '^127\.0\.0\.(1|53)$') | map('list')
+         | reject('equalto', []) | first | default([]) }}
+  when: not consul_dns_file.stat.exists
+
+- name: Require an upstream resolver
+  ansible.builtin.assert:
+    that: consul_recursors | length > 0
+    fail_msg: No upstream resolver in /etc/resolv.conf or /run/systemd/resolve/resolv.conf.
+  when: not consul_dns_file.stat.exists
+
+- name: Render the recursors once
+  ansible.builtin.template:
+    src: dns.hcl.j2
+    dest: /etc/consul.d/dns.hcl
+    owner: consul
+    group: consul
+    mode: "0640"
+  when: not consul_dns_file.stat.exists
+  notify: Restart consul
+
 - name: Install the Consul systemd unit
   ansible.builtin.template:
     src: consul.service.j2
@@ -65,3 +116,29 @@
     enabled: true
     state: started
     daemon_reload: true
+
+- name: Apply a changed configuration before the resolver switch
+  ansible.builtin.meta: flush_handlers
+
+# /etc/resolv.conf is a bind mount in a node container, so the write is
+# in place. On a host it replaces the resolved stub link with a file.
+- name: Make the agent the node resolver
+  when: not (image_build | default(false) | bool)
+  ansible.builtin.copy:
+    dest: /etc/resolv.conf
+    content: |
+      # Managed by Ansible (roles/consul): the local Consul agent resolves
+      # every name and forwards names outside .consul to the recursors.
+      nameserver 127.0.0.1
+    mode: "0644"
+    unsafe_writes: true
+
+- name: Wait for the agent to answer its own name
+  when: not (image_build | default(false) | bool)
+  ansible.builtin.command:
+    argv: [getent, hosts, consul.service.consul]
+  register: consul_dns_ready
+  changed_when: false
+  until: consul_dns_ready.rc == 0
+  retries: 30
+  delay: 2

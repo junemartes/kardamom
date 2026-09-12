@@ -19,10 +19,10 @@
 //!
 //! ```text
 //! kardamom-semantics \
-//!   --rpc http://192.168.56.31:8545 --chain-id 412346 \
-//!   --executor-metrics 192.168.56.41:9004,192.168.56.42:9004,192.168.56.43:9004 \
-//!   --sequencer-metrics 192.168.56.21:9001,192.168.56.22:9001 \
-//!   --validator-metrics 192.168.56.61:9006 \
+//!   --rpc http://<ingress-0>:8545 --chain-id 412346 \
+//!   --executor-metrics <executor-0>:9004,<executor-1>:9004,<executor-2>:9004 \
+//!   --sequencer-metrics <sequencer-0>:9001,<sequencer-1>:9001 \
+//!   --validator-metrics <aux-0>:9006 \
 //!   --cases nonce-unordered,nonce-gap,rpc-liveness,consistency
 //! ```
 

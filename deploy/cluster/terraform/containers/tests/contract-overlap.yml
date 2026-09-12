@@ -1,6 +1,0 @@
-# Two lanes share .11: the root must refuse the model.
----
-ip_prefix: "10.99.0"
-node_classes:
-  control: { count: 2, ip_start: 10, tier: control }
-  worker: { count: 1, ip_start: 11, tier: worker }

@@ -6,16 +6,18 @@
 # workflow's post-step runs after this script's EXIT trap, too late to
 # help. This dump is best-effort; it must never mask the real exit code.
 # This is a raw-UDP multicast reachability check, from sealer-0
-# (192.168.56.51) to ingress-0 (192.168.56.31), on a throwaway group. It
+# to ingress-0, on a throwaway group. It
 # bypasses Aeron entirely. It prints how many of 30 sent packets
 # ingress-0 received. 0 means the bridge drops cross-node multicast, a
 # kernel or bridge issue. More than 0 means forwarding works, and any
 # remaining failure is specific to Aeron. python3 ships in the node
 # image.
 multicast_probe() {
-  local grp=239.192.99.99 port=45999 rip=192.168.56.31 sip=192.168.56.51
+  local grp=239.192.99.99 port=45999
   local rnode=kardamom-ingress-0  # worker node on the segment (receiver)
   local snode=kardamom-sealer-0    # worker on the segment (sender)
+  local rip sip
+  rip="$(node_address "${rnode}")"; sip="$(node_address "${snode}")"
   echo "===== multicast probe ${sip} -> ${rip} (grp ${grp}:${port}) ====="
   docker exec -d "${rnode}" python3 -c "
 import socket,struct
@@ -94,7 +96,7 @@ dump_diagnostics() {
     'udp and dst net 239.192.56.0/24' 2>/dev/null \
     | awk '{d=$4; sub(/:$/,"",d); print $2" -> "d}' | sort | uniq -c | sort -rn | head -40 \
     || echo "(tcpdump unavailable or no multicast captured)"
-  export NOMAD_ADDR="http://192.168.56.10:4646"
+  export NOMAD_ADDR="${NOMAD_ADDR:-$(nomad_addr)}"
   nomad job status 2>/dev/null || true
   # `validator` is included in this list. Its job going dead, when the
   # restart budget is exhausted after repeated fail-stops, is exactly

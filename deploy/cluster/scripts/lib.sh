@@ -9,9 +9,10 @@
 #
 # Overridable before sourcing:
 #   NOMAD_ADDR_INT   Nomad HTTP endpoint, as seen from the control node
+#                    (the control node record through its own resolver)
 #   CONTROL          control node container name
 
-NOMAD_ADDR_INT="${NOMAD_ADDR_INT:-http://192.168.56.10:4646}"
+NOMAD_ADDR_INT="${NOMAD_ADDR_INT:-http://control-0.node.consul:4646}"
 CONTROL="${CONTROL:-kardamom-control-0}"
 
 # This file defines shared log() and fail() functions. smoke.sh,

@@ -4,18 +4,19 @@
 # the nodes. ansible/containers.yml reads the node contract output and
 # provisions the nodes with bootstrap.yml.
 #
-# A change of the node image replaces every container and its root
-# filesystem. Use `tofu destroy` and `tofu apply` for a fresh chain.
+# The Docker network assigns every address; the model declares none. The
+# contract carries the assigned addresses for the provisioning run, and
+# every later lookup goes through Consul. A change of the node image
+# replaces every container and its root filesystem. Use `tofu destroy` and
+# `tofu apply` for a fresh chain.
 
 locals {
   contract_path = startswith(var.contract_file, "/") ? var.contract_file : "${path.module}/${var.contract_file}"
   docker_path   = startswith(var.docker_dir, "/") ? var.docker_dir : "${path.module}/${var.docker_dir}"
   contract      = yamldecode(file(local.contract_path))
-  ip_prefix     = local.contract.ip_prefix
   node_classes  = local.contract.node_classes
-  subnet        = "${local.ip_prefix}.0/24"
 
-  # <class>-<i> at ip_prefix.<ip_start + i>, the lane model of the contract.
+  # <class>-<i>, the instance model of the contract.
   nodes = merge([
     for class, spec in local.node_classes : {
       for i in range(spec.count) : "${class}-${i}" => {
@@ -24,16 +25,13 @@ locals {
         role          = class
         tier          = spec.tier
         index         = i
-        ip            = "${local.ip_prefix}.${spec.ip_start + i}"
         control_plane = class == "control"
       }
     }
   ]...)
 
-  lane_ends = [for class, spec in local.node_classes : spec.ip_start + spec.count]
-  addresses = [for n in values(local.nodes) : n.ip]
-  volumes   = toset(["docker", "containerd"])
-  ready     = "s=$(systemctl is-system-running); [ \"$s\" = running ] || [ \"$s\" = degraded ]"
+  volumes = toset(["docker", "containerd"])
+  ready   = "s=$(systemctl is-system-running); [ \"$s\" = running ] || [ \"$s\" = degraded ]"
 }
 
 resource "docker_network" "this" {
@@ -44,10 +42,11 @@ resource "docker_network" "this" {
     "com.docker.network.bridge.name" = var.bridge_name
   }
 
-  # The provider reads the gateway back into the set, so declare it.
+  # The provider reads the gateway back into the set, so declare it with
+  # the subnet.
   ipam_config {
-    subnet  = local.subnet
-    gateway = "${local.ip_prefix}.1"
+    subnet  = var.subnet
+    gateway = cidrhost(var.subnet, 1)
   }
 
   labels {
@@ -59,14 +58,6 @@ resource "docker_network" "this" {
     precondition {
       condition     = length(local.nodes) > 0
       error_message = "The node-class model declares no node."
-    }
-    precondition {
-      condition     = length(distinct(local.addresses)) == length(local.addresses)
-      error_message = "The node class lanes overlap."
-    }
-    precondition {
-      condition     = alltrue([for e in local.lane_ends : e <= 255])
-      error_message = "A node class lane runs past .254."
     }
   }
 }
@@ -130,8 +121,7 @@ resource "docker_container" "node" {
   }
 
   networks_advanced {
-    name         = docker_network.this.name
-    ipv4_address = each.value.ip
+    name = docker_network.this.name
   }
 
   labels {

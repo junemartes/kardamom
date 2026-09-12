@@ -58,7 +58,7 @@
 # ---------------------------------------------------------------------------
 # Environment variables (all optional, with reasonable defaults)
 # ---------------------------------------------------------------------------
-#   RPC_URL            ingress JSON-RPC          (default http://192.168.56.31:8545)
+#   RPC_URL            ingress JSON-RPC          (default ingress-0 from Docker, :8545)
 #   CHAIN_ID           L2 chain id               (default 412346)
 #   SMOKE_DURATION_S   send for this many seconds(default 60)
 #   SMOKE_TPS          target tx/sec             (default 5)
@@ -126,7 +126,7 @@ source "${SCRIPT_DIR}/lib-topology.sh"
 source "${SCRIPT_DIR}/lib-metrics.sh"
 
 # --- config -----------------------------------------------------------------
-RPC_URL="${RPC_URL:-http://192.168.56.31:8545}"
+RPC_URL="${RPC_URL:-http://$(node_address kardamom-ingress-0):8545}"
 CHAIN_ID="${CHAIN_ID:-412346}"
 SMOKE_DURATION_S="${SMOKE_DURATION_S:-60}"
 SMOKE_TPS="${SMOKE_TPS:-5}"
@@ -273,7 +273,7 @@ read_block_metric() {
 # Build a node-to-IP map, generated from the node-class model in
 # group_vars/all.yml, through lib-topology.sh's topology_load. This is
 # the same single source of truth run-tests.sh builds the cluster
-# from: <class>-<i> gets ip_prefix.<ip_start+i>. This map is only
+# from: the container network assigns <class>-<i> its address. This map is only
 # needed when METRICS_VIA_DOCKER=0, for direct bridge scrapes. An
 # unmappable node is a hard error there; falling back to 127.0.0.1
 # would scrape the wrong host and produce a bogus METRIC-MISSING.

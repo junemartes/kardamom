@@ -187,7 +187,7 @@ class DeployTest(unittest.TestCase):
         self.assertIn('l1-light-client', plans)
         self.assertTrue(all(job['Namespace'] == 'staging' for job in plans.values()))
         validator = json.dumps(plans['validator'])
-        self.assertIn('http://192.168.56.61:8548', validator)
+        self.assertIn('http://aux-0.node.dc1.consul:8548', validator)
         self.assertNotIn('http://execution.example', validator)
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertEqual(self.api.state['writes'], [])
