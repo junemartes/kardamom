@@ -103,6 +103,9 @@ source "${SCRIPT_DIR}/lib.sh"
 # ports, ...).
 # shellcheck source=deploy/cluster/scripts/lib-topology.sh
 source "${SCRIPT_DIR}/lib-topology.sh"
+# The cases index NODE_IP by node name. chaos.sh runs as its own process,
+# so it loads the arrays itself.
+topology_load
 # Scrape and parse (fetch_metrics bridge-first probe, prom_value).
 # shellcheck source=deploy/cluster/scripts/lib-metrics.sh
 source "${SCRIPT_DIR}/lib-metrics.sh"
