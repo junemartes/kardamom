@@ -1,15 +1,17 @@
 //! Machine-readable contract selection for Ansible settlement provisioning.
 use std::process::Command;
 
+use alloy_node_bindings::Anvil;
 use alloy_primitives::{Address, address};
-use kardamom_deployer::testkit::AnvilRig;
+use kardamom_deployer::testkit::{AnvilRig, Funding};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg};
 
 const OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
 
 #[tokio::test]
 async fn json_addresses_selects_contract_and_chain() {
-    let Some(rig) = AnvilRig::spawn(&[OWNER]).await else {
+    let Some(rig) = AnvilRig::spawn(Anvil::new(), &[(OWNER, Funding::FundAndImpersonate)]).await
+    else {
         eprintln!("SKIP: anvil unavailable");
         return;
     };
