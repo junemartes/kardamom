@@ -2,16 +2,16 @@
 # =============================================================================
 # lib-topology.sh — the node-class model, in one place.
 # =============================================================================
-# This file is sourced, never run directly, by chaos.sh, ci-cluster.sh, and
+# This file is sourced, never run directly, by chaos.sh, run-tests.sh, and
 # smoke-load.sh. It has two layers:
 #   1. Static mirrors of ansible/group_vars/all.yml: node names, bridge IPs,
-#      and metrics ports. Before this file, chaos.sh, ci-cluster.sh (§7c),
+#      and metrics ports. Before this file, chaos.sh, run-tests.sh (§7c),
 #      and smoke-load.sh each hardcoded these constants separately.
 #      group_vars is the canonical source; `make check-contract` checks the
 #      other mirrors against it.
 #   2. topology_load(): builds the full generated node list (NODES plus
 #      NODE_IP, NODE_ROLE, NODE_TIER). It parses group_vars node_classes
-#      with the same no-PyYAML regex that ci-cluster.sh and smoke-load.sh
+#      with the same no-PyYAML regex that run-tests.sh and smoke-load.sh
 #      each used to carry privately.
 #
 # This file does not depend on lib.sh, and defines no log() or fail().
@@ -19,7 +19,7 @@
 # parse. Callers decide what that means.
 
 # Resolve group_vars using this file's own location. A sourcing script may
-# run from any working directory. ci-cluster.sh changes to deploy/cluster,
+# run from any working directory. run-tests.sh changes to deploy/cluster,
 # but chaos.sh does not.
 _LIB_TOPOLOGY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOPOLOGY_GROUP_VARS="${TOPOLOGY_GROUP_VARS:-${_LIB_TOPOLOGY_DIR}/../ansible/group_vars/all.yml}"
@@ -67,7 +67,7 @@ SEALER_NODE="${SEALER_NODE:-kardamom-executor-0}"
 # are on port 9006 (the executor holds port 9004 elsewhere).
 VALIDATOR_NODE="${VALIDATOR_NODE:-kardamom-aux-0}"
 VALIDATOR_PORT="${VALIDATOR_PORT:-9006}"
-# Candidate list form. ci-cluster.sh's §7c liveness probe iterates this list.
+# Candidate list form. run-tests.sh's §7c liveness probe iterates this list.
 VALIDATOR_NODES=("${VALIDATOR_NODE}")
 
 # --- ingress (active/active: ingress count=2, ip_start=31) -------------------
@@ -89,11 +89,11 @@ declare -A NODE_IP=() NODE_ROLE=() NODE_TIER=()
 # Populate NODES and NODE_IP/NODE_ROLE/NODE_TIER from group_vars
 # node_classes. This function uses `declare -g` throughout. The function
 # body runs in its own scope, but the sourcing script's cleanup and
-# diagnostics code reads these arrays afterward (ci-cluster.sh's teardown
+# diagnostics code reads these arrays afterward (failure reporting
 # trap iterates NODES and indexes NODE_ROLE).
 #   NODES     : bare instance names (<class>-<i>), in deploy order
 #   NODE_IP   : keyed both ways — bare name and kardamom-<name> container
-#               name (ci-cluster.sh indexes by bare name, smoke-load.sh by
+#               name (run-tests.sh indexes by bare name, smoke-load.sh by
 #               prefixed name)
 #   NODE_ROLE / NODE_TIER : same dual keying
 # Returns 1 if group_vars is missing, or yields no nodes.

@@ -119,7 +119,7 @@ HEADER = """\
 # This shares the node's Aeron media driver, through the bind-mounted
 # tmpfs aeron.dir.
 
-# Digest-pinned image. scripts/deploy.sh passes the repo:tag@sha256:...
+# Digest-pinned image. ansible/deploy.yml passes the repo:tag@sha256:...
 # reference captured at push time (deploy/cluster/images.digests). Both
 # replicas of every lane run the same pinned bytes. The empty default
 # falls back to the mutable :dev tag in the task configs. That fallback

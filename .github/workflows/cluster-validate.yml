@@ -53,6 +53,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Ansible for isolated deployment tests
+        run: |
+          pip install ansible-core
+          ansible-galaxy collection install ansible.posix community.docker
       - name: Install Nomad (version from the cluster contract)
         run: |
           ver="$(sed -n 's/^nomad_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
@@ -80,3 +87,5 @@ jobs:
             nomad job validate "$j" || rc=1
           done
           exit $rc
+      - name: Test Ansible workloads, images, and signing in isolation
+        run: python3 -m unittest discover -s deploy/cluster/ansible/tests -v

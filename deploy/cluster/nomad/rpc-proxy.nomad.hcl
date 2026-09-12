@@ -14,12 +14,12 @@
 # the local registry.
 
 # Digest-pinned image. This job is not in
-# deploy.sh's default path; the haproxy image is pushed manually, as
+# Ansible deployment's default path; the haproxy image is pushed manually, as
 # described above. So there is no automatic manifest line for it. An
 # operator who wants the pin passes the digest of their own push, in
 # the combined repo:tag@digest form. Nomad 1.9.5's docker driver cannot
 # parse a bare repo@digest on a registry host with a port; see
-# ci-images.sh.
+# ansible/images.yml.
 # nomad job run -var image_ref=192.168.56.10:5000/haproxy:2.9-alpine@sha256:... rpc-proxy.nomad.hcl
 # The empty default falls back to the mutable :2.9-alpine tag. That is
 # a dev affordance, not a production path.

@@ -12,7 +12,7 @@
 #
 # This suite runs inside the orchestrator or runner, sharing the host
 # docker socket and reaching the cluster bridge, exactly like
-# ci-cluster.sh. The cluster runs Docker-in-Docker: each node is a
+# run-tests.sh. The cluster runs Docker-in-Docker: each node is a
 # privileged container `kardamom-<class>-<i>` running its own dockerd,
 # and the pipeline services are inner Nomad docker-driver tasks. So:
 #   * graceful kill  = `nomad alloc stop` (via control-0)         → restart
@@ -50,7 +50,7 @@
 #   lib.sh                        control-node helpers, log/fail
 #   lib-topology.sh               node-class model (nodes, IPs, ports)
 #   lib-metrics.sh                fetch_metrics, prom_value (scrape/parse)
-#   validator-verdict.sh          divergence-log scan, shared with ci-cluster.sh
+#   validator-verdict.sh          divergence-log scan, shared with run-tests.sh
 #   chaos-probes.sh               has_line/has_match, read-only probes
 #   chaos-asserts.sh              injectors, alloc-log evidence, assert_*
 #   chaos-cases-component.sh      graceful/hard-*, node-failure, restore drills
@@ -107,7 +107,7 @@ source "${SCRIPT_DIR}/lib-topology.sh"
 # shellcheck source=deploy/cluster/scripts/lib-metrics.sh
 source "${SCRIPT_DIR}/lib-metrics.sh"
 # Shared validator divergence-log scan (divergence_scan and
-# _dump_context). This is the one implementation that ci-cluster.sh's
+# _dump_context). This is the one implementation that run-tests.sh's
 # §7c verdict also uses. The cpu-squeeze case uses it with this suite's
 # fail() contract.
 # shellcheck source=deploy/cluster/scripts/validator-verdict.sh
@@ -153,7 +153,7 @@ LOAD_FLOW_TIMEOUT_S="${LOAD_FLOW_TIMEOUT_S:-60}"
 # Each case's steady load uses one dedicated funded account, with a
 # fresh nonce chain from 0. So cases never collide, and never leave
 # nonce gaps. Genesis funds Anvil accounts #0 through #15.
-# ci-cluster.sh reserves #0 for the gate and #1 through #6 for the load
+# run-tests.sh reserves #0 for the gate and #1 through #6 for the load
 # harness, leaving #7 through #15, up to 9 cases. CHAOS_ACCT advances
 # with each case.
 CHAOS_ACCT_BASE="${CHAOS_ACCT_BASE:-7}"

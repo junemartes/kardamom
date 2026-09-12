@@ -2,7 +2,7 @@
 # =============================================================================
 # lib.sh — shared control-node helpers for the cluster scripts.
 # =============================================================================
-# Both chaos.sh and ci-cluster.sh source this file. All commands here reach
+# Both chaos.sh and run-tests.sh source this file. All commands here reach
 # Nomad through the control node container, using docker exec. This is the
 # proven access pattern for the DinD cluster. The runner needs only the host
 # docker socket. It does not need a routable NOMAD_ADDR.
@@ -15,7 +15,7 @@ NOMAD_ADDR_INT="${NOMAD_ADDR_INT:-http://192.168.56.10:4646}"
 CONTROL="${CONTROL:-kardamom-control-0}"
 
 # This file defines shared log() and fail() functions. smoke.sh,
-# smoke-load.sh, and local-cluster.sh keep their own definitions. Their
+# smoke-load.sh, and ansible/local.yml keep their own definitions. Their
 # fail() output has a different format: "RESULT: FAIL — ..." is part of
 # their output contract. They do not source this file's log() or fail().
 #

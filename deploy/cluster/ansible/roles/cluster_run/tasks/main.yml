@@ -1,0 +1,110 @@
+---
+- name: Validate lifecycle operation
+  ansible.builtin.assert:
+    that: cluster_run_operation in ['up', 'reset', 'down']
+
+- name: Explain check mode
+  ansible.builtin.debug:
+    msg: "Would {{ cluster_run_operation }} the container cluster; lifecycle check mode performs no changes."
+  when: ansible_check_mode
+
+# Atomic acquisition happens outside the cleanup block: a contender cannot
+# tear down another run. Never force-unlock a live deployment.
+- name: Create lifecycle lock directory
+  ansible.builtin.file:
+    path: "{{ cluster_run_lock | dirname }}"
+    state: directory
+    mode: "0755"
+  when: not ansible_check_mode
+
+- name: Acquire exclusive cluster lifecycle lock
+  ansible.builtin.command:
+    argv: [mkdir, "{{ cluster_run_lock }}"]
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Manage cluster while holding the lock
+  when: not ansible_check_mode
+  block:
+    - name: Remove previous cluster for reset or down
+      ansible.builtin.include_role:
+        name: container_nodes
+        tasks_from: down
+      when: cluster_run_operation in ['reset', 'down']
+
+    # A child playbook preserves parallel node provisioning while this outer
+    # block guarantees diagnostics and cleanup across failures in ANY play.
+    - name: Converge substrate images and workloads
+      ansible.builtin.command:
+        argv:
+          - "{{ cluster_run_playbook_binary }}"
+          - -i
+          - localhost,
+          - "{{ playbook_dir }}/cluster.yml"
+          - --extra-vars
+          - "{{ cluster_run_vars | to_json }}"
+        chdir: "{{ cluster_run_dir }}"
+      changed_when: true
+      register: cluster_run_converge
+      when: cluster_run_operation != 'down'
+
+    - name: Show convergence output
+      ansible.builtin.debug:
+        var: cluster_run_converge.stdout_lines
+      when: cluster_run_operation != 'down'
+
+    - name: Run smoke load and chaos gates
+      ansible.builtin.command:
+        argv: [bash, "{{ cluster_run_dir }}/scripts/run-tests.sh"]
+        chdir: "{{ cluster_run_dir }}"
+      environment:
+        NOMAD_ADDR: "http://{{ control_ip }}:{{ ports.nomad_http }}"
+      changed_when: false
+      register: cluster_run_verdict
+      when:
+        - cluster_run_operation != 'down'
+        - cluster_run_tests | bool
+
+    - name: Show test verdicts
+      ansible.builtin.debug:
+        var: cluster_run_verdict.stdout_lines
+      when:
+        - cluster_run_operation != 'down'
+        - cluster_run_tests | bool
+  rescue:
+    - name: Save the original failure
+      ansible.builtin.set_fact:
+        cluster_run_failure: "{{ ansible_failed_result }}"
+
+    - name: Collect diagnostics before teardown
+      ansible.builtin.command:
+        argv: [bash, "{{ cluster_run_dir }}/scripts/ci-diagnostics.sh"]
+        chdir: "{{ cluster_run_dir }}"
+      environment:
+        NOMAD_ADDR: "http://{{ control_ip }}:{{ ports.nomad_http }}"
+      changed_when: false
+      failed_when: false
+      register: cluster_run_diagnostics
+
+    - name: Show failure diagnostics
+      ansible.builtin.debug:
+        var: cluster_run_diagnostics.stdout_lines
+
+    - name: Report original lifecycle failure
+      ansible.builtin.fail:
+        msg: "{{ cluster_run_failure }}"
+  always:
+    - name: Finish lifecycle and release lock even if teardown fails
+      block:
+        - name: Clean up unless KEEP was requested
+          ansible.builtin.include_role:
+            name: container_nodes
+            tasks_from: down
+          when:
+            - not cluster_run_keep | bool
+            - cluster_run_operation != 'down'
+      always:
+        - name: Release lifecycle lock
+          ansible.builtin.file:
+            path: "{{ cluster_run_lock }}"
+            state: absent

@@ -1,0 +1,8 @@
+---
+cosign_version: "{{ lookup('env', 'KARDAMOM_COSIGN_VERSION') | default(cosign_pinned_version, true) }}"
+cosign_sha256: "{{ lookup('env', 'KARDAMOM_COSIGN_SHA256') | default(cosign_pinned_sha256, true) }}"
+cosign_cache: >-
+  {{ lookup('env', 'KARDAMOM_COSIGN_CACHE') | default(
+     (lookup('env', 'XDG_CACHE_HOME') | default(lookup('env', 'HOME') ~ '/.cache', true)) ~ '/kardamom/cosign', true) }}
+# May be set explicitly for an installed binary. Otherwise use PATH or the pinned cache.
+cosign_binary: "{{ lookup('first_found', {'files': ['cosign'], 'paths': lookup('env', 'PATH').split(':'), 'skip': true}) | default('', true) }}"

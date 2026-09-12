@@ -1,0 +1,59 @@
+---
+- name: Build Linux builder and orchestrator images
+  community.docker.docker_image_build:
+    name: "kardamom-{{ item }}:latest"
+    path: "{{ local_runner_root }}/deploy/cluster/docker"
+    dockerfile: "{{ item }}.Dockerfile"
+    rebuild: always
+  loop: [local-build, orchestrator]
+
+- name: Create persistent Rust build caches
+  community.docker.docker_volume:
+    name: "{{ item }}"
+  loop: [kardamom-ltarget, kardamom-cargo-registry]
+
+- name: Allocate an isolated builder name
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: kardamom-builder-
+  register: local_runner_staging
+
+- name: Build and stage Linux outputs
+  block:
+    - name: Start ephemeral Linux builder
+      community.docker.docker_container:
+        name: "{{ local_runner_staging.path | basename }}"
+        image: kardamom-local-build:latest
+        command: [sleep, infinity]
+        volumes:
+          - "{{ local_runner_root }}:/work"
+          - kardamom-cargo-registry:/root/.cargo/registry
+          - kardamom-ltarget:/ltarget
+        state: started
+
+    - name: Add builder to inventory
+      ansible.builtin.add_host:
+        name: kardamom_build_controller
+        ansible_host: "{{ local_runner_staging.path | basename }}"
+        ansible_connection: community.docker.docker
+        ansible_docker_host: "{{ local_runner_docker_host }}"
+        ansible_user: root
+        ansible_python_interpreter: /usr/bin/python3
+
+    - name: Build artifacts in the Linux environment
+      ansible.builtin.include_tasks:
+        file: artifacts.yml
+        apply:
+          delegate_to: kardamom_build_controller
+          vars:
+            ansible_python_interpreter: /usr/bin/python3
+  always:
+    - name: Remove ephemeral builder
+      community.docker.docker_container:
+        name: "{{ local_runner_staging.path | basename }}"
+        state: absent
+        force_kill: true
+    - name: Remove temporary builder marker
+      ansible.builtin.file:
+        path: "{{ local_runner_staging.path }}"
+        state: absent

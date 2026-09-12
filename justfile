@@ -308,8 +308,7 @@ test-e2e-local: aeron-jar cluster-jar
 # These recipes install the tools needed on this machine to run
 # `cd deploy/cluster && make up`: Vagrant + a VM provider, Ansible (+ the
 # ansible.posix / community.docker collections), Docker with BuildKit, and the
-# Nomad CLI (deploy/cluster/scripts/deploy.sh drives the cluster's Nomad API
-# from the host). Nomad *servers/clients* and Consul run inside the VMs and
+# Nomad CLI (the Ansible workload role uses it to compile HCL locally). Nomad *servers/clients* and Consul run inside the VMs and
 # are installed by Ansible, not here. See deploy/cluster/README.md.
 # ---------------------------------------------------------------------------
 
@@ -321,7 +320,7 @@ NOMAD_VERSION := "1.9.5"
 cluster-bootstrap:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Pinned Nomad CLI matching the in-VM agents (deploy.sh needs it on PATH).
+    # Pinned Nomad CLI matching the in-VM agents (Ansible deployment needs it on PATH).
     install_nomad() {
         command -v nomad >/dev/null 2>&1 && return 0
         local ver="{{NOMAD_VERSION}}" os arch zip
@@ -417,7 +416,7 @@ cluster-doctor:
     chk ansible "run 'just cluster-bootstrap'"
     chk ansible-galaxy "ships with ansible"
     chk docker "run 'just cluster-bootstrap'"
-    chk nomad "run 'just cluster-bootstrap' — deploy.sh drives the cluster API from the host"
+    chk nomad "run 'just cluster-bootstrap' — Ansible uses Nomad to compile job specs"
     if have virsh || have VBoxManage; then
         echo "  ok    vm provider (libvirt or virtualbox)"
     else

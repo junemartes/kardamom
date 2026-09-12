@@ -3,13 +3,13 @@
 # lib-metrics.sh — shared Prometheus scrape + parse helpers.
 # =============================================================================
 # This file is sourced, never run directly, by chaos.sh (through
-# chaos-probes.sh), ci-cluster.sh, and smoke-load.sh. It replaces 10+
+# chaos-probes.sh), run-tests.sh, and smoke-load.sh. It replaces 10+
 # per-script scrape and parse sites. These sites had drifted into three
 # different awk metric-match patterns:
 #     chaos.sh       '"[{ ]"'        (val_metric/seqa_metric — matches most
 #                                     samples, but not a label-less bare-name
 #                                     sample line)
-#     ci-cluster.sh  '"([{ ])"'      (same limit)
+#     run-tests.sh  '"([{ ])"'      (same limit)
 #     smoke-load.sh  '"([{ ]|$)"'    (also matches label-less samples)
 # This file uses '"([{ ]|$)"' everywhere. This pattern also matches
 # label-less samples, so every consumer parses the exposition format the

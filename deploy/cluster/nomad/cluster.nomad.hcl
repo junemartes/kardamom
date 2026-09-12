@@ -20,7 +20,7 @@
 # Egress replay retention, in frames (-Dkardamom.cluster.retention).
 # The default matches the sealer's own DEFAULT_RETENTION (65536, about
 # 321s at 200 tps). The retention-overrun chaos case deploys a small
-# window; deploy.sh passes -var from KARDAMOM_CLUSTER_RETENTION. This
+# window; Ansible deployment passes -var from KARDAMOM_CLUSTER_RETENTION. This
 # lets a frozen consumer's cursor age out, and exercises recovery-D,
 # inside one chaos case.
 variable "cluster_retention" {
@@ -32,7 +32,7 @@ variable "cluster_retention" {
 # (-Dkardamom.cluster.snapshotIntervalS; 0 disables). Every member runs
 # the scheduler, but only the current leader's toggle fires, and the
 # snapshot action replicates through the log, so all members snapshot
-# at the same position. The chaos-cluster shard shortens this; deploy.sh
+# at the same position. The chaos-cluster shard shortens this; Ansible deployment
 # passes -var from KARDAMOM_CLUSTER_SNAPSHOT_S. This lets
 # cluster-member-rejoin wait for a snapshot inside one case.
 variable "cluster_snapshot_interval_s" {
@@ -47,14 +47,14 @@ variable "cluster_snapshot_interval_s" {
 # accept-or-reject in the replicated state machine, like the dedup
 # window. The default names the dev-interop peers the e2e suite uses
 # against the deployed 412346 chain: chain B (412347, S14) and the
-# simulated origin (412399, S12/S13). deploy.sh passes -var from
+# simulated origin (412399, S12/S13). Ansible deployment passes -var from
 # KARDAMOM_REMOTE_ORIGINS when set.
 variable "cluster_remote_origins" {
   type    = string
   default = "412347,412399"
 }
 
-# Digest-pinned image. scripts/deploy.sh
+# Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests). The empty default falls back to the
 # mutable :dev tag in the task config. That fallback is a dev

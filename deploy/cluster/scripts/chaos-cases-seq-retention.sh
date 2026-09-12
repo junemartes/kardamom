@@ -175,7 +175,7 @@ run_sequencer_lapse() {
 #
 # This case is meaningful only on a cluster deployed with a small
 # egress retention. KARDAMOM_CLUSTER_RETENTION must hold the same value
-# deploy.sh injected as -Dkardamom.cluster.retention; the chaos-retention
+# Ansible deployment injected as -Dkardamom.cluster.retention; the chaos-retention
 # CI shard sets one env var, and both read it. At the default 65536
 # frames, the freeze would need about 11 minutes of sustained 200 tps
 # to overrun. This is why this tier never ran before this case existed.
@@ -193,7 +193,7 @@ RETENTION_FREEZE_CAP_S="${RETENTION_FREEZE_CAP_S:-600}"
 run_retention_overrun() { # <executor|validator>
   local kind="$1" node port inner cid0
   [ -n "${KARDAMOM_CLUSTER_RETENTION}" ] \
-    || fail "retention-overrun(${kind}): KARDAMOM_CLUSTER_RETENTION is not set — this case only means something on a cluster deployed with a small -Dkardamom.cluster.retention (deploy.sh injects it from the same env var)"
+    || fail "retention-overrun(${kind}): KARDAMOM_CLUSTER_RETENTION is not set — this case only means something on a cluster deployed with a small -Dkardamom.cluster.retention (Ansible deployment injects it from the same env var)"
 
   if [ "${kind}" = "executor" ]; then
     node="${EXECUTOR_NODES[${RETENTION_VICTIM_EXEC_IDX}]}"; port="${EXECUTOR_PORT}"

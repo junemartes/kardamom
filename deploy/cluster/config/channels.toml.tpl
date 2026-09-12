@@ -95,7 +95,7 @@ tx_ordering_stream_id = 1001
 # subscriber-churn once froze images (killing one recorder froze every executor).
 # Ingress churn (a replica crash/restart leaving+rejoining the group) could
 # reintroduce that image-freeze for the surviving subscribers. The cluster-e2e
-# (.github/workflows/cluster-e2e.yml → scripts/ci-cluster.sh ingress-churn check)
+# (.github/workflows/cluster-e2e.yml → ansible/run.yml ingress-churn check)
 # exercises exactly this: kill one ingress while traffic flows and assert the
 # survivor keeps receiving receipts.
 #

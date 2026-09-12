@@ -89,3 +89,8 @@ The `bytecode-hash` CI job (in `.github/workflows/ci.yml`) compiles the factory 
 ERC-7955's factory is deployed by submitting an EIP-7702 transaction signed by a publicly-known deployer EOA. Anyone can submit it. The procedure is documented at https://github.com/safe-research/erc-7955 — running it costs ~100k gas. After it runs once on a chain, every kardamom user can `ensure-factory` permissionlessly.
 
 A `kardamom-deploy bootstrap-erc-7955` subcommand to automate this on chains that lack the factory is planned but not in this release.
+
+For automation, `addresses --l2-chain-id <id> --contract KardamomL2Settlement --json`
+returns a JSON array filtered by chain and contract. An absent registration is
+`[]`; RPC or factory lookup errors still fail. Omitting `--json` preserves the
+human-readable format.

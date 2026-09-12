@@ -1,0 +1,33 @@
+---
+# Container substrate only; run.yml owns locking and cleanup for full runs.
+- name: Create cluster nodes and inventory
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  vars_files: [group_vars/all.yml]
+  roles:
+    - topology
+    - container_nodes
+
+- name: Provision container substrate
+  ansible.builtin.import_playbook: site.yml
+  vars:
+    provision_hosts: container_nodes
+
+# Starting inner Docker daemons can enable bridge netfilter again. Reapply
+# host settings after provisioning, before workloads begin sending multicast.
+- name: Restore host multicast settings after Docker startup
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  tasks:
+    - name: Reapply host network settings
+      ansible.builtin.include_role:
+        name: container_nodes
+        tasks_from: host
