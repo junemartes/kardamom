@@ -202,7 +202,7 @@ fn verify_is_clean(out: &str) -> bool {
         .filter(|l| !l.contains("invalid Catalog checksum"))
         .filter(|l| {
             let u = l.to_ascii_uppercase();
-            u.contains("ERR ") || u.contains("FAILED")
+            u.contains("ERR:") || u.contains("ERR ") || u.contains("FAILED")
         })
         .count();
     !out.contains("Exception") && has_ok_recording(out) && other_err == 0
