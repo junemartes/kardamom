@@ -12,12 +12,8 @@ on:
       - 'justfile'
       - 'crates/log/docker/aeron/Dockerfile'
       - '.github/workflows/cluster-validate.yml'
+  # Both Terraform jobs are required checks, including on Rust-only PRs.
   pull_request:
-    paths:
-      - 'deploy/cluster/**'
-      - 'justfile'
-      - 'crates/log/docker/aeron/Dockerfile'
-      - '.github/workflows/cluster-validate.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
