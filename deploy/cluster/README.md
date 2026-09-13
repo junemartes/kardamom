@@ -1,22 +1,25 @@
 # kardamom multi-node cluster (Ansible → Nomad/Consul → Docker)
 
-A reproducible multi-node kardamom test/staging cluster. Two ways to
-materialise the nodes, sharing the same Ansible playbook and Nomad jobs:
+A reproducible multi-node kardamom cluster in two profiles that share one
+Ansible tree and one set of Nomad jobs:
 
-- **Containers (the path CI runs):** `terraform/containers` creates one
-  privileged systemd + Docker-in-Docker container per node on a Docker
-  bridge. The `container-*` Make targets drive the full
-  bring-up + smoke + load + chaos suite (`.github/workflows/cluster-e2e.yml`).
-- **VMs (Vagrant):** `make up` boots one VM per node (libvirt primary,
-  VirtualBox fallback) and provisions them with the same `bootstrap.yml`.
+- **`local`, the container profile (CI and a developer host):**
+  `terraform/containers` creates one privileged systemd + Docker-in-Docker
+  container per node on a Docker bridge. The `container-*` Make targets
+  drive the full bring-up + smoke + load + chaos suite
+  (`.github/workflows/cluster-e2e.yml`).
+- **`production`, the Hetzner profile:** `terraform/hetzner` owns the cloud
+  network, the pools and the public entry points; the Nomad Autoscaler
+  creates the elastic machines; `inventories/hetzner` holds the dedicated
+  core. See `terraform/hetzner/README.md`.
 
 See [`DESIGN.md`](./DESIGN.md) for the original design rationale and
 [`../../docs/failure-modes.md`](../../docs/failure-modes.md) for per-actor
 failure/recovery behavior and the chaos cases that verify it.
 
-> **Status.** The container path runs green in CI (`cluster-e2e`, sharded
-> across runners). The Vagrant path shares all of its Ansible/Nomad surface
-> with it but has not been exercised end-to-end on a real virtualization host.
+> **Status.** The container profile runs green in CI (`cluster-e2e`, sharded
+> across runners). The production profile shares the Ansible and Nomad
+> surface with it and has not been run on real machines yet.
 
 ## Topology
 
@@ -47,9 +50,8 @@ Nomad jobs derive every peer list from a count and the datacenter, so a
 job file, a config file or a script never names an address.
 `scripts/check-contract.py` rejects an address literal anywhere in
 `nomad/`, `config/`, `scripts/`, `ansible/`, the Makefile, the justfile
-and the e2e workflow. The two exceptions are environment files: the
-Terraform variables of a Hetzner deployment, and the Vagrantfile with
-`ansible/inventory.ini` for the VM path. An image build captures the
+and the e2e workflow. The one exception is an environment file: the
+Terraform variables of a Hetzner deployment. An image build captures the
 recursors of the build server, so every elastic node forwards to them.
 
 The test suite and the operator commands (`crates/chaos`) run on the
@@ -69,11 +71,11 @@ Q-of-N recorder design is preserved, marked superseded, in
 **Quickest path:** from the repo root, `just cluster-bootstrap` installs the
 host tools below for your platform, and `just cluster-doctor` verifies them.
 
-- For the **VM path**: [Vagrant](https://www.vagrantup.com/) + libvirt
-  (primary) or VirtualBox (fallback).
 - Ansible (`ansible-playbook`) + collections:
   `ansible-galaxy collection install ansible.posix community.docker`.
-- Docker (with the Buildx plugin) to build + push the service/Aeron images.
+- Docker (with the Buildx plugin) for the node containers and the image
+  builds. The daemon must run privileged containers; on macOS or Windows
+  that is Docker Desktop's Linux VM.
 - Images are pushed from inside the control node (`REGISTRY_PUSH_NODE`,
   the Makefile default), where the registry name `registry.service.consul`
   resolves. The host Docker daemon needs no insecure-registry entry.
@@ -85,35 +87,13 @@ host tools below for your platform, and `just cluster-doctor` verifies them.
   `(cd cluster/sealer-service && ./gradlew :service:shadowJar)` — `make
   images` / `make container-up` stage it into the `kardamom-cluster` image and
   fail loudly if it is missing.
-- **OpenTofu** (1.12.6, the version the CI pins) for the container path.
+- The **Rust service binaries** in `target/release` (`cargo build --release
+  --bins` of the service crates, or the artifact of `scripts/ci/stage-cluster-dist.sh`):
+  the image role wraps prebuilt binaries; nothing compiles inside an image.
+- **OpenTofu** (1.12.6, the version the CI pins).
 - Foundry's `cast` for the smoke tests (repo-level `just bootstrap`).
 
-## Quick start (VM path)
-
-```sh
-cd deploy/cluster
-make up        # vagrant up → ansible → build+push images → nomad run
-make smoke     # single-tx pipeline smoke against ingress
-make status    # nomad/consul/job health
-make down      # stop jobs + vagrant destroy
-```
-
-`make up` phases (each is an individual target too):
-
-1. `make vms` — `vagrant up` boots one VM per `node_classes` instance.
-2. `make provision` — `ansible-playbook bootstrap.yml` (inventory:
-   `ansible/inventory.ini`, kept in sync with `node_classes`) installs
-   Docker, Consul, Nomad, the registry, the tmpfs `aeron.dir`, and stamps
-   each Nomad node's meta (`role`, `tier`, `node_ip`, `node_index`).
-3. `make images` — build the service + Aeron + cluster images on the host and
-   push them to the in-cluster registry.
-4. `make deploy` — `ansible/deploy.yml` submits changed jobs in dependency order:
-   `aeron` (system) + `anvil` (+ the `KardamomL2Settlement` deploy against
-   it), then `cluster` (the Raft sealer), then `sequencer` / `ingress` /
-   `executor` / `validator` / `da-watcher`, then the live `batcher` service
-   (#39).
-
-### Container path (Linux)
+## Quick start
 
 ```sh
 cd deploy/cluster
@@ -177,38 +157,6 @@ on failure. A failed shard leaves the cluster up; the runner is ephemeral, so
 nothing destroys it after. Pass extra vars to `ansible/cluster.yml` with
 `CLUSTER_VARS='{"images_tag": "x"}'` (one JSON object, no single quote).
 `ansible/cluster.yml` is the convergence playbook; it expects the node contract.
-
-### Docker Desktop
-
-Build Linux artifacts and run the same lifecycle inside a privileged Linux
-controller:
-
-```sh
-KEEP=1 ansible-playbook -i localhost, deploy/cluster/ansible/local.yml
-```
-
-Install Ansible, `ansible.posix`, `community.docker`, and Python `requests` on
-the controller. The local playbook follows the active Docker context and requires
-a local Docker daemon with the checkout available for bind mounts. Its builder
-includes the sealer jar, services, deployer, load and semantics harnesses, and
-the orchestrator image carries OpenTofu and `make`.
-
-`local.yml` supports `-e local_runner_operation=all|build|up|reset|down`.
-`all` builds and deploys; `build` only builds; the other operations use existing
-artifacts. `reset` runs `container-down` before `container-up`. Set
-`-e local_runner_build=true` to rebuild with `reset`. After the run, the
-controller destroys the cluster unless `KEEP=1` (or `-e local_runner_keep=true`)
-is set; a failure first collects diagnostics. Use `-e local_runner_tests=false`
-to deploy without test gates. Extra vars for `cluster.yml` go in
-`local_runner_vars`, for example `-e '{"local_runner_vars":{"images_tag":"x"}}'`.
-`local_runner_container` defaults to `kardamom-orch`; use another name if an
-existing controller is bound to a different checkout. Controllers are reused
-without replacement; after changing the controller image, use a new controller
-name or remove the old idle controller before running again.
-
-The Terraform state under `/work/deploy/cluster/terraform/containers` is the
-lock: a second `container-up` against a running cluster converges it instead
-of creating a second one, and `tofu` refuses concurrent state writes.
 
 ## Ansible workload deployment
 
@@ -274,11 +222,8 @@ it creates and tears down its own development chain.
 Both image paths now share `ansible/images.yml`. From the repository root:
 
 ```sh
-# Docker builds each Rust service from source; the Java shadowJar must exist.
+# Wrap the prebuilt Linux binaries and Aeron libraries; the Java shadowJar must exist.
 ansible-playbook -i localhost, deploy/cluster/ansible/images.yml
-
-# Package Linux binaries and Aeron libraries already built by CI/local-build.
-ansible-playbook -i localhost, deploy/cluster/ansible/images.yml -e images_mode=prebuilt
 ```
 
 `make images` invokes source mode; the container CI runner invokes prebuilt mode.
@@ -295,7 +240,7 @@ on success or failure.
 Settings are in `roles/images/defaults/main.yml`. `REGISTRY`, `TAG`, and
 `DIGEST_MANIFEST` remain supported. A relative `DIGEST_MANIFEST` environment setting
 is resolved against `deploy/cluster/` by both image and workload playbooks.
-`REGISTRY_PUSH_NODE=control-0` preserves the Docker Desktop path: Ansible exports an
+`REGISTRY_PUSH_NODE=control-0` (the default) keeps the host daemon out of it: Ansible exports an
 image archive, copies it into `kardamom-control-0`, loads it into that node's Docker
 engine, and pushes from there. The temporary node archive is removed even when
 loading fails. This needs temporary disk space for one image archive on each side.
@@ -331,12 +276,12 @@ They do not replace a real Docker build and cluster smoke run.
 ```
 deploy/cluster/
   DESIGN.md                 design rationale (original; recorder tier since removed)
-  Vagrantfile               one VM per node_classes instance (VM path)
-  Makefile                  up / vms / provision / images / deploy / smoke /
-                            validate / check-contract / down
+  Makefile                  container-up / container-test / shard / container-down /
+                            images / deploy / smoke / validate / check-contract
   ansible/
-    ansible.cfg, inventory.ini   (static VM inventory — mirrors node_classes;
-                                  the container path generates its own)
+    ansible.cfg
+    containers.yml         inventory from the node contract, host preparation
+    cluster.yml            containers.yml + images.yml + deploy.yml
     group_vars/all.yml      ← canonical contract (classes, IPs, ports, versions,
                               deployment profile)
     bootstrap.yml          configure a host and join it to the substrate
@@ -347,13 +292,14 @@ deploy/cluster/
     roles/{profile,enroll,common,vswitch,netinfo,docker,firewall,consul,nomad,
            registry,workloads,images,cosign,elastic_image,autoscaler}/
     inventories/hetzner/   example production inventory + profile values
+  terraform/containers/     the local profile's nodes: bridge, image, volumes,
+                            one container per node, the node contract
   terraform/hetzner/        Cloud Network, vSwitch subnet, placement groups,
                             firewalls, DNS records, RPC load balancer, pool contract
   docker/
-    service.Dockerfile      multi-stage cargo build → slim runtime (VM path)
-    ci-service.Dockerfile   thin wrapper over prebuilt binaries (CI path)
+    ci-service.Dockerfile   thin wrapper over prebuilt binaries
     cluster.Dockerfile      Java Aeron Cluster node (shadowJar + JRE 17)
-    node.Dockerfile         systemd+DinD "node" container (CI path)
+    node.Dockerfile         systemd+DinD "node" container (local profile)
   nomad/
     aeron.system.nomad.hcl  ArchivingMediaDriver (driver+archive), all nodes
     cluster.nomad.hcl       3-member Aeron Cluster (Raft) sealer, .51/.52/.53
@@ -384,7 +330,7 @@ Operational integrity tooling lives in the private infra repo.
 
 | Profile | Hosts | Servers | Addresses | Security |
 |---------|-------|---------|-----------|----------|
-| `local` (default) | Vagrant VMs, or the CI node containers | one control node runs the Consul and Nomad servers | explicit `node_ip` per inventory host | plain-HTTP registry, no host firewall |
+| `local` (default) | the node containers of `terraform/containers` | one control node runs the Consul and Nomad servers | explicit `node_ip` per inventory host | plain-HTTP registry, no host firewall |
 | `production` | Hetzner dedicated core, plus elastic Cloud pools | three voting servers on the dedicated core | `roles/netinfo` resolves the address from the vSwitch VLAN or the private interface | gossip encryption, ACLs, agent TLS, `roles/firewall` |
 
 In both profiles the Nomad agents find their servers through the local
