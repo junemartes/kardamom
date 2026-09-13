@@ -4,12 +4,12 @@
 //! single-block proof files the prover made (`zk-host --prove` on the
 //! spooled frame).
 //!
-//! A thin driver over [`kardamom_batcher::watch_and_challenge`]. This makes
+//! A thin driver over [`kardamom_batcher::BatchWatcher`]. This makes
 //! the optimistic mode's liveness assumption concrete: at least one honest
 //! watcher runs. Slashing pays that watcher, so the assumption has an
 //! incentive behind it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy_primitives::Address;
@@ -21,7 +21,7 @@ use kardamom_batcher::error::BatcherError;
 use std::ops::ControlFlow;
 
 use kardamom_batcher::live::poll::{PollLoop, Retry, parse_interval_secs};
-use kardamom_batcher::{WatchOutcome, watch_and_challenge};
+use kardamom_batcher::{BatchWatcher, WatchOutcome};
 
 #[derive(Debug, Parser)]
 #[command(name = "kardamom-batch-watcher", version)]
@@ -50,59 +50,68 @@ async fn main() -> Result<()> {
         .wallet(signer)
         .connect_http(args.l1_rpc_url.parse().context("parse --l1-rpc-url")?);
 
-    let watcher = Watcher {
-        oracle: args.oracle,
-        spool_dir: args.spool_dir,
-        gate: PollLoop::new(args.interval_secs),
-    };
-    while let ControlFlow::Continue(()) = watcher.tick(&provider).await {}
+    Watcher::new(args.oracle, &args.spool_dir, args.interval_secs)
+        .run(&provider)
+        .await;
     Ok(())
 }
 
-/// One `kardamom-batch-watcher` reactor tick: compare the pending claim
-/// against the prover spool, challenge on divergence, then gate the next
-/// tick on the outcome.
+/// The `kardamom-batch-watcher` reactor: the challenge driver and the
+/// poll gate. Each tick compares the pending claim against the prover
+/// spool, challenges on divergence, then gates the next tick on the
+/// outcome.
 struct Watcher {
-    oracle: Address,
-    spool_dir: PathBuf,
+    watcher: BatchWatcher,
     gate: PollLoop,
 }
 
 impl Watcher {
+    fn new(oracle: Address, spool_dir: &Path, interval: Option<Duration>) -> Self {
+        Self {
+            watcher: BatchWatcher::new(oracle, spool_dir),
+            gate: PollLoop::new(interval),
+        }
+    }
+
+    /// Tick until the gate stops the loop.
+    async fn run(&self, provider: &(impl alloy_provider::Provider + Clone)) {
+        while let ControlFlow::Continue(()) = self.tick(provider).await {}
+    }
+
     async fn tick(&self, provider: &(impl alloy_provider::Provider + Clone)) -> ControlFlow<()> {
-        let outcome = watch_and_challenge(provider.clone(), self.oracle, &self.spool_dir).await;
-        report_watch_outcome(outcome);
+        let outcome = self.watcher.watch_and_challenge(provider.clone()).await;
+        Self::report(outcome);
         self.gate.gate(Retry::AfterInterval).await
     }
-}
 
-/// Log one [`watch_and_challenge`] attempt's outcome.
-fn report_watch_outcome(outcome: Result<WatchOutcome, BatcherError>) {
-    match outcome {
-        Ok(WatchOutcome::Challenged {
-            batch_index,
-            block_offset,
-        }) => {
-            tracing::warn!(
+    /// Log one watch attempt's outcome.
+    fn report(outcome: Result<WatchOutcome, BatcherError>) {
+        match outcome {
+            Ok(WatchOutcome::Challenged {
                 batch_index,
                 block_offset,
-                "CHALLENGE submitted — divergence proven"
-            );
-        }
-        Ok(WatchOutcome::ClaimHonest { batch_index }) => {
-            tracing::debug!(batch_index, "pending claim matches the spool");
-        }
-        Ok(WatchOutcome::ProofNotReady {
-            batch_index,
-            divergent_block,
-        }) => {
-            tracing::warn!(
+            }) => {
+                tracing::warn!(
+                    batch_index,
+                    block_offset,
+                    "CHALLENGE submitted — divergence proven"
+                );
+            }
+            Ok(WatchOutcome::ClaimHonest { batch_index }) => {
+                tracing::debug!(batch_index, "pending claim matches the spool");
+            }
+            Ok(WatchOutcome::ProofNotReady {
                 batch_index,
                 divergent_block,
-                "divergence detected — awaiting single-block proof (zk-host --prove)"
-            );
+            }) => {
+                tracing::warn!(
+                    batch_index,
+                    divergent_block,
+                    "divergence detected — awaiting single-block proof (zk-host --prove)"
+                );
+            }
+            Ok(WatchOutcome::NothingPending) => tracing::debug!("no pending claims"),
+            Err(e) => tracing::error!(error = %e, "watch attempt failed"),
         }
-        Ok(WatchOutcome::NothingPending) => tracing::debug!("no pending claims"),
-        Err(e) => tracing::error!(error = %e, "watch attempt failed"),
     }
 }

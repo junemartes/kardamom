@@ -44,12 +44,16 @@ fn bench_in_order(c: &mut Criterion) {
                 .unwrap();
                 (seq, rig)
             },
-            |(mut seq, mut rig)| {
-                while rig.step(&mut seq).unwrap() {}
-            },
+            run_to_completion,
             BatchSize::SmallInput,
         );
     });
+}
+
+/// Drain `rig` against `seq` until the queued batch is exhausted. This is
+/// the measured routine for [`bench_in_order`]'s `iter_batched` call.
+fn run_to_completion((mut seq, mut rig): (Sequencer, Rig)) {
+    while rig.step(&mut seq).unwrap() {}
 }
 
 criterion_group!(benches, bench_in_order);
