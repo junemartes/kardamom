@@ -17,29 +17,24 @@ impl Streamed {
     ///
     /// Returns an error if either subscription fails to open.
     pub(crate) fn spawn_pumps(mut self) -> Result<Self> {
-        crate::pumps::BalPump::new(
+        crate::pumps::spawn_bal_pump(
             &self.opened.base.rt,
             &mut self.opened.base.plane,
-            crate::pumps::BalSinks {
-                bals: self.streams.bals.clone(),
-                claims: self.streams.claims.clone(),
-                extract_claims: self
-                    .streams
-                    .interop_serve
-                    .as_ref()
-                    .map(|s| s.claims.clone()),
-            },
+            self.streams.bals.clone(),
+            self.streams.claims.clone(),
+            self.streams
+                .interop_serve
+                .as_ref()
+                .map(|s| s.claims.clone()),
             self.streams.pump_shutdown.clone(),
-        )?
-        .spawn();
-        crate::pumps::ReceiptsPump::new(
+        )?;
+        crate::pumps::spawn_receipts_pump(
             &self.opened.base.rt,
             &mut self.opened.base.plane,
             self.opened.base.args.executor_count,
             self.streams.receipts.clone(),
             self.streams.pump_shutdown.clone(),
-        )?
-        .spawn();
+        )?;
         Ok(self)
     }
 

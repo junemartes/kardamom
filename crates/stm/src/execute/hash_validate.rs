@@ -405,11 +405,10 @@ fn lanes_hash_and_validate<S: StateDatabase>(
         lane_metrics
             .commit_lane_ns
             .fetch_add(nanos(t_lane0.elapsed()), Ordering::Relaxed);
-        if local.is_empty() {
-            return;
+        if !local.is_empty() {
+            // SAFETY: `ci` is this lane's own chunk index.
+            unsafe { wounded_out.set(ci, local) };
         }
-        // SAFETY: `ci` is this lane's own chunk index.
-        unsafe { wounded_out.set(ci, local) };
     };
     std::thread::scope(|sc| {
         // One scoped thread only to drive the lanes, so the fold can

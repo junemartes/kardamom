@@ -5,10 +5,12 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use kardamom_cluster_adapter::LiveCluster;
 use kardamom_engine::bin_support;
 use kardamom_engine::{
     Either, EngineWiring, ExecPorts, Executor, ExecutorError, Outbound, RoleHooks,
 };
+use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_state::StateEnv;
 use kardamom_validator::flight::FlightRing;
 use kardamom_validator::{ClaimBuffer, Divergence, epoch_verify};
@@ -58,16 +60,15 @@ impl Attested {
             None => Either::Right(tee),
         };
 
-        crate::pumps::CommitPoller::new(
-            &self.written.writer.writer.snapshot_rx,
+        crate::pumps::spawn_commit_poller(
+            self.written.writer.writer.snapshot_rx.clone(),
             self.attester_handle.clone(),
             streams
                 .interop_serve
                 .as_ref()
                 .map(|s| s.attestations.clone()),
             streams.pump_shutdown.clone(),
-        )
-        .spawn();
+        );
 
         Ready {
             attested: self,
@@ -175,8 +176,7 @@ impl Ready {
         let block_exec = build_block_exec(args, claims, flight.clone());
         if let Some(dir) = args.prove_batches.clone() {
             tracing::info!(spool = %dir.display(), "prover spool ENABLED (one frame per block)");
-            kardamom_validator::prover::ProverSpool::new(dir, chain_id.get(), &snap_rx, flight)
-                .spawn();
+            kardamom_validator::prover::spawn_prover_spool(dir, chain_id.get(), snap_rx, flight);
         }
 
         // Epoch verification. Sequence rules 1-2 are local and always
@@ -298,7 +298,7 @@ impl Ready {
                                             inbound,
                                             cluster_guard,
                                             divergence,
-                                            stop,
+                                            pump_shutdown,
                                             ..
                                         },
                                 },
@@ -316,7 +316,7 @@ impl Ready {
         } = self;
 
         let join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
-            Executor::<ValidatorWiring>::new(
+            Executor::run::<ValidatorWiring>(
                 cfg,
                 inbound,
                 Outbound {
@@ -340,21 +340,14 @@ impl Ready {
                     remote_epoch_observer,
                 },
             )
-            .run()
         });
 
         Running {
             join,
-            // Field order is drop order: the stop guard cancels first, so
-            // the plane's discovery tasks and the tx_bal pump release
-            // their AeronRuntime clones, then the runtime and the cluster
-            // session end. The plane deregisters after that, in `wait`.
-            streams: bin_support::LiveStreams {
-                stop: stop.drop_guard(),
-                rt,
-                cluster_guard,
-            },
+            pump_shutdown,
+            rt,
             plane,
+            cluster_guard,
             writer,
             divergence,
             args,
@@ -369,8 +362,10 @@ impl Ready {
 /// `finish` needs to report the result.
 struct Running {
     join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
-    streams: bin_support::LiveStreams,
+    pump_shutdown: tokio_util::sync::CancellationToken,
+    rt: AeronRuntime,
     plane: kardamom_log::discovery::StreamPlane,
+    cluster_guard: LiveCluster,
     writer: kardamom_state::WriterHandle,
     divergence: Arc<Divergence>,
     args: Args,
@@ -384,8 +379,10 @@ impl Running {
     async fn shutdown_in_order(self) -> Result<()> {
         let engine_error = Shutdown {
             join: self.join,
-            streams: self.streams,
+            pumps: self.pump_shutdown,
+            rt: self.rt,
             plane: self.plane,
+            cluster_guard: self.cluster_guard,
             writer: self.writer,
             divergence: self.divergence.clone(),
         }
@@ -538,16 +535,18 @@ fn build_epoch_observer(
     ))
 }
 
-/// The four values [`Ready::run`] must hold onto until shutdown, gathered
+/// The six values [`Ready::run`] must hold onto until shutdown, gathered
 /// so `wait` reads no argument list of its own.
 struct Shutdown {
     join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
-    streams: bin_support::LiveStreams,
-    /// Its discovery tasks stop with the pumps, before the runtime drops:
-    /// the pump-stop token is a child of its token, which the stop guard
-    /// in `streams` cancels. Its registrations deregister once the
-    /// streams have ended.
+    /// The pump-stop token (named `pumps`, not `pump_shutdown`, so the
+    /// field name does not repeat this struct's own name).
+    pumps: tokio_util::sync::CancellationToken,
+    rt: AeronRuntime,
+    /// Its discovery tasks stop with the pumps, before `rt` drops; its
+    /// registrations deregister once the streams have ended.
     plane: kardamom_log::discovery::StreamPlane,
+    cluster_guard: LiveCluster,
     writer: kardamom_state::WriterHandle,
     divergence: Arc<Divergence>,
 }
@@ -559,22 +558,32 @@ impl Shutdown {
     async fn wait(self) -> EngineOutcome {
         let Self {
             join,
-            streams,
+            pumps,
+            rt,
             plane,
+            cluster_guard,
             mut writer,
             divergence,
         } = self;
+        let discovery = plane.cancellation();
         // Exit on whichever comes first: an operator shutdown signal, or
         // the engine loop finishing on its own (a divergence stop or a
         // stream error). Waiting only for SIGTERM would leave a halted
         // validator looking "alive", with metrics up and the chain
         // frozen, hiding the very stop signal the divergence machinery
-        // exists to surface. `streams` then ends in its field order: the
-        // pumps stop first, then the runtime, then the cluster session.
+        // exists to surface.
+        //
+        // Order matters: cancel the pumps first so the tx_bal pump
+        // releases its AeronRuntime clone, then release the runtime and
+        // the cluster session.
         let joined = bin_support::EngineShutdown {
             bin_name: "kardamom-validator",
             join,
-            streams,
+            streams: bin_support::LiveStreams { rt, cluster_guard },
+            before_drop: || {
+                pumps.cancel();
+                discovery.cancel();
+            },
         }
         .wait()
         .await;

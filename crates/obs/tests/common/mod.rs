@@ -37,24 +37,19 @@ pub(crate) async fn scrape(addr: SocketAddr, budget: Duration) -> String {
             &format!("exporter on {addr}"),
             budget,
             Duration::from_millis(100),
-            || Ok(scrape_once(addr)),
+            || {
+                let Ok(mut s) = TcpStream::connect(addr) else {
+                    return Ok(None);
+                };
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                write!(s, "GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
+                let mut out = String::new();
+                s.read_to_string(&mut out).unwrap();
+                Ok(Some(out))
+            },
         )
         .unwrap()
     })
     .await
     .expect("scrape task panicked")
-}
-
-/// One scrape attempt: connect and read the whole response body, or
-/// `None` if the connect itself fails (the exporter has not started
-/// listening yet).
-fn scrape_once(addr: SocketAddr) -> Option<String> {
-    let Ok(mut s) = TcpStream::connect(addr) else {
-        return None;
-    };
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    write!(s, "GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
-    Some(out)
 }

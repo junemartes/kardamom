@@ -96,10 +96,9 @@ pub async fn poll_until<T>(
 ) -> anyhow::Result<T> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let ControlFlow::Break(v) =
-            poll_until_step(f().await?, deadline, timeout, what, interval).await?
-        {
-            return Ok(v);
+        match poll_until_step(f().await?, deadline, timeout, what, interval).await? {
+            ControlFlow::Break(v) => return Ok(v),
+            ControlFlow::Continue(()) => {}
         }
     }
 }
@@ -135,8 +134,9 @@ pub fn poll_sync<T>(
 ) -> anyhow::Result<T> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let ControlFlow::Break(v) = poll_sync_step(f()?, deadline, timeout, what, interval)? {
-            return Ok(v);
+        match poll_sync_step(f()?, deadline, timeout, what, interval)? {
+            ControlFlow::Break(v) => return Ok(v),
+            ControlFlow::Continue(()) => {}
         }
     }
 }

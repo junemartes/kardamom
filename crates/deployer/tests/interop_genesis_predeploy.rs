@@ -44,7 +44,16 @@ impl Mode {
     fn artifact_runtime(self, workspace: &Path, contract: &str) -> Result<Option<Bytes>> {
         let artifact = workspace.join(format!("contracts/out/{contract}.sol/{contract}.json"));
         let Ok(raw) = std::fs::read_to_string(&artifact) else {
-            return self.handle_missing_artifact(&artifact);
+            return match self {
+                Mode::RequireArtifact => anyhow::bail!(
+                    "{} not built on CI; the drift guard must not pass without the artifact",
+                    artifact.display()
+                ),
+                Mode::SkipIfAbsent => {
+                    eprintln!("SKIP: {} not built (run forge build)", artifact.display());
+                    Ok(None)
+                }
+            };
         };
         let v: serde_json::Value =
             serde_json::from_str(&raw).with_context(|| format!("parse {}", artifact.display()))?;
@@ -55,22 +64,6 @@ impl Mode {
             format!("{}: deployedBytecode.object is not hex", artifact.display())
         })?;
         Ok(Some(Bytes::from(bytes)))
-    }
-
-    /// What to do when `artifact` does not exist: bail under
-    /// `RequireArtifact`, or skip (return `Ok(None)`) under
-    /// `SkipIfAbsent`.
-    fn handle_missing_artifact(self, artifact: &Path) -> Result<Option<Bytes>> {
-        match self {
-            Mode::RequireArtifact => anyhow::bail!(
-                "{} not built on CI; the drift guard must not pass without the artifact",
-                artifact.display()
-            ),
-            Mode::SkipIfAbsent => {
-                eprintln!("SKIP: {} not built (run forge build)", artifact.display());
-                Ok(None)
-            }
-        }
     }
 
     fn assert_predeploy(

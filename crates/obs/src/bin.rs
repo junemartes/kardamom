@@ -20,8 +20,14 @@ pub fn init_tracing() {
 pub async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
-        let Some(mut sigterm) = install_sigterm().await else {
-            return;
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGTERM handler; falling back to Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
         };
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("SIGTERM received"),
@@ -32,20 +38,5 @@ pub async fn wait_for_shutdown() {
     {
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("Ctrl-C received");
-    }
-}
-
-/// Install the SIGTERM handler. On failure, log and wait for Ctrl-C
-/// instead, then return `None`, so the caller does no further waiting.
-#[cfg(unix)]
-async fn install_sigterm() -> Option<tokio::signal::unix::Signal> {
-    use tokio::signal::unix::{SignalKind, signal};
-    match signal(SignalKind::terminate()) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::error!(error = %e, "failed to install SIGTERM handler; falling back to Ctrl-C only");
-            let _ = tokio::signal::ctrl_c().await;
-            None
-        }
     }
 }

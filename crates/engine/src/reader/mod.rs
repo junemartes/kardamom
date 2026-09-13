@@ -54,9 +54,7 @@ pub use ports::{
     NoRemoteEpochCheck, RemoteEpochObserver, SinkClosed, TxDataSubscription,
     TxOrderingSubscription,
 };
-pub use threads::{ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader};
+pub use threads::{ReaderToExec, spawn_tx_data_reader, spawn_tx_ordering_reader};
 
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod tests_remote;

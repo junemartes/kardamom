@@ -48,8 +48,9 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
     /// It skips malformed frames and logs them.
     pub fn next_position(&mut self) -> Option<BPosition> {
         loop {
-            if let ControlFlow::Break(result) = self.poll_position() {
-                return result;
+            match self.poll_position() {
+                ControlFlow::Break(result) => return result,
+                ControlFlow::Continue(()) => {}
             }
         }
     }

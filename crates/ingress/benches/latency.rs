@@ -47,17 +47,15 @@ fn bench_e2e_latency(c: &mut Criterion) {
         b.to_async(&rt).iter(|| {
             let raw = pre[idx % pre.len()].clone();
             idx = idx.wrapping_add(1);
-            submit_one(proxy.clone(), raw)
+            let proxy = proxy.clone();
+            async move {
+                let _ = proxy
+                    .submit_raw("127.0.0.1".parse().unwrap(), raw)
+                    .await
+                    .unwrap();
+            }
         });
     });
-}
-
-/// Submits one signed transaction and waits for its receipt.
-async fn submit_one(proxy: Arc<IngressProxy<MockChannels, MockChannels>>, raw: Bytes) {
-    let _ = proxy
-        .submit_raw("127.0.0.1".parse().unwrap(), raw)
-        .await
-        .unwrap();
 }
 
 criterion_group!(benches, bench_e2e_latency);

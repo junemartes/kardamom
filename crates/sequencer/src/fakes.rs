@@ -92,26 +92,32 @@ pub(crate) mod pump_contract {
     use super::ScriptedQueue;
     use crate::error::SequencerError;
     use crate::outbound::fakes::InMemoryTxOrderingRefPublisher;
-    use crate::pump::{OriginLane, Pump};
+    use crate::pump::Pump;
 
-    /// Run the shared assertions for one origin lane. `first` and `second`
-    /// stand in for two well-formed, distinct records; the lane is the
-    /// [`OriginLane`] impl on `Pump<T>`, over its own subscriber type via
-    /// `T`.
+    /// Run the shared assertions for one origin pump. `first` and `second`
+    /// stand in for two well-formed, distinct records; `process` is
+    /// [`crate::epoch::process_epoch`] or
+    /// [`crate::remote_epoch::process_remote_epoch`], closed over its own
+    /// subscriber type via `T`.
     ///
     /// # Panics
     ///
     /// Panics (via the assertions) when a pump under test does not honor
     /// the shared idle/closed/backpressure/retry contract.
-    pub(crate) fn run<T: Clone>(first: &T, second: &T)
-    where
-        Pump<T>: OriginLane<ScriptedQueue<T>, InMemoryTxOrderingRefPublisher>,
-    {
+    pub(crate) fn run<T: Clone>(
+        first: &T,
+        second: &T,
+        mut process: impl FnMut(
+            &mut ScriptedQueue<T>,
+            &mut InMemoryTxOrderingRefPublisher,
+            &mut Pump<T>,
+        ) -> Result<bool, SequencerError>,
+    ) {
         // Idle subscription reports no work.
         let mut sub = ScriptedQueue::<T>::default();
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
         let mut pump = Pump::default();
-        assert!(!pump.relay(&mut sub, &mut pubr).unwrap());
+        assert!(!process(&mut sub, &mut pubr, &mut pump).unwrap());
 
         // Closed subscription surfaces disconnect.
         let mut sub = ScriptedQueue::<T>::default();
@@ -119,7 +125,7 @@ pub(crate) mod pump_contract {
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
         let mut pump = Pump::default();
         assert!(matches!(
-            pump.relay(&mut sub, &mut pubr),
+            process(&mut sub, &mut pubr, &mut pump),
             Err(SequencerError::IngressDisconnected)
         ));
 
@@ -133,7 +139,7 @@ pub(crate) mod pump_contract {
         let mut pump = Pump::default();
         *pubr.fail_with_backpressure.lock().unwrap() = true;
         assert!(matches!(
-            pump.relay(&mut sub, &mut pubr),
+            process(&mut sub, &mut pubr, &mut pump),
             Err(SequencerError::Backpressure)
         ));
         assert!(pump.is_held(), "the popped record is held, not dropped");
@@ -143,7 +149,7 @@ pub(crate) mod pump_contract {
             "the second record stays queued while the first is held"
         );
         assert!(matches!(
-            pump.relay(&mut sub, &mut pubr),
+            process(&mut sub, &mut pubr, &mut pump),
             Err(SequencerError::Backpressure)
         ));
         assert_eq!(sub.len(), 1, "the retry does not poll past the held record");
@@ -151,9 +157,9 @@ pub(crate) mod pump_contract {
         // Once backpressure clears, the held record is relayed exactly
         // once, then the queue resumes with the second record.
         *pubr.fail_with_backpressure.lock().unwrap() = false;
-        assert!(pump.relay(&mut sub, &mut pubr).unwrap());
+        assert!(process(&mut sub, &mut pubr, &mut pump).unwrap());
         assert!(!pump.is_held(), "the slot empties on success");
-        assert!(pump.relay(&mut sub, &mut pubr).unwrap());
-        assert!(!pump.relay(&mut sub, &mut pubr).unwrap());
+        assert!(process(&mut sub, &mut pubr, &mut pump).unwrap());
+        assert!(!process(&mut sub, &mut pubr, &mut pump).unwrap());
     }
 }

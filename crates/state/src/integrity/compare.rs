@@ -227,14 +227,6 @@ impl<'a> TableCompare<'a> {
     }
 }
 
-/// Append one `name: a vs b` line to `fields` when the two field values
-/// differ. Equal values append nothing.
-fn push_diff<T: PartialEq + std::fmt::Debug>(fields: &mut Vec<String>, name: &str, a: &T, b: &T) {
-    if a != b {
-        fields.push(format!("{name}: {a:?} vs {b:?}"));
-    }
-}
-
 /// A field-level diff of two encoded receipts, for the deep-compare
 /// report.
 ///
@@ -247,7 +239,9 @@ fn receipt_field_diff(a: &[u8], b: &[u8]) -> Option<String> {
     let mut fields: Vec<String> = Vec::new();
     macro_rules! cmp {
         ($f:ident) => {
-            push_diff(&mut fields, stringify!($f), &ra.$f, &rb.$f)
+            if ra.$f != rb.$f {
+                fields.push(format!("{}: {:?} vs {:?}", stringify!($f), ra.$f, rb.$f));
+            }
         };
     }
     cmp!(tx_idx);

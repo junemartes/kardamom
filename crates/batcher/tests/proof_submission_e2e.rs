@@ -1,7 +1,7 @@
 //! An end-to-end anvil test of the closing contract: a real batch
 //! (accumulator, records commitment, `postBatch`) posted to the
 //! settlement, a batch proof's output files in the zk-host layout, and
-//! `ProofSubmitter::submit_next` advancing the `KardamomProofOracle`'s root chain.
+//! `submit_next_proof` advancing the `KardamomProofOracle`'s root chain.
 //! The batcher, settlement, prover queue, and oracle all align on the
 //! L1-as-truth cursor.
 //!
@@ -17,7 +17,7 @@ use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider;
 use kardamom_batcher::BatchAccumulator;
 use kardamom_batcher::batcher::pack_blocks;
-use kardamom_batcher::prover_submit::{IKardamomProofOracle, ProofSubmitter, SubmitOutcome};
+use kardamom_batcher::prover_submit::{IKardamomProofOracle, SubmitOutcome, submit_next_proof};
 use kardamom_batcher::settlement::IKardamomL2Settlement;
 use kardamom_batcher::testkit::{AcceptingVerifier, BATCHER, DEV_OWNER, L2_CHAIN_ID, env_tx};
 use kardamom_deployer::Deployer;
@@ -123,7 +123,17 @@ fn build_real_batch() -> RealBatch {
     .expect("pack batch");
     assert_eq!((batch.l2_block_start, batch.l2_block_end), (7, 8));
 
-    let expected_commitment = batch_records_commitment([7u64, 8].map(block_records_digest));
+    let expected_commitment = batch_records_commitment([7u64, 8].map(|n| {
+        let mut d = kardamom_types::BlockRecordsDigest::new(n);
+        match n {
+            7 => {
+                d.add_tx(&env_tx(0).raw_tx);
+                d.add_tx(&env_tx(1).raw_tx);
+            }
+            _ => d.add_tx(&env_tx(2).raw_tx),
+        }
+        d.finish()
+    }));
     assert_eq!(
         batch.records_commitment, expected_commitment,
         "batcher and guest-side commitment must agree"
@@ -133,20 +143,6 @@ fn build_real_batch() -> RealBatch {
         l2_block_end: batch.l2_block_end,
         records_commitment: expected_commitment,
     }
-}
-
-/// The guest-side records digest for block `n`, over the same envelope
-/// txs [`build_real_batch`] feeds to the accumulator for that block.
-fn block_records_digest(n: u64) -> B256 {
-    let mut d = kardamom_types::BlockRecordsDigest::new(n);
-    match n {
-        7 => {
-            d.add_tx(&env_tx(0).raw_tx);
-            d.add_tx(&env_tx(1).raw_tx);
-        }
-        _ => d.add_tx(&env_tx(2).raw_tx),
-    }
-    d.finish()
 }
 
 /// Write the prover's batch output files (zk-host batch layout) claiming
@@ -176,8 +172,7 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
     let batch = build_real_batch();
 
     // ----- act: nothing posted yet -----
-    let out = ProofSubmitter::new(s.oracle_addr, s.proofs_dir.path())
-        .submit_next(s.provider.clone())
+    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::NoBatchPosted { batch_index: 1 });
@@ -202,8 +197,7 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
 
     // ----- act + assert: batch posted, but the prover has not produced
     // files yet -----
-    let out = ProofSubmitter::new(s.oracle_addr, s.proofs_dir.path())
-        .submit_next(s.provider.clone())
+    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::ProofNotReady { batch_index: 1 });
@@ -212,8 +206,7 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
     write_batch_proof_files(s.proofs_dir.path(), &batch);
 
     // ----- act + assert: submit advances the oracle's root chain -----
-    let out = ProofSubmitter::new(s.oracle_addr, s.proofs_dir.path())
-        .submit_next(s.provider.clone())
+    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::Submitted { batch_index: 1 });
@@ -222,8 +215,7 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
 
     // ----- act + assert: idempotence at the cursor — batch 2 is not
     // posted, so this returns NoBatchPosted -----
-    let out = ProofSubmitter::new(s.oracle_addr, s.proofs_dir.path())
-        .submit_next(s.provider.clone())
+    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::NoBatchPosted { batch_index: 2 });
@@ -266,8 +258,7 @@ async fn missing_proof_file_reports_not_ready() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("public-values.bin"), pv.encode()).unwrap();
 
-    let out = ProofSubmitter::new(s.oracle_addr, s.proofs_dir.path())
-        .submit_next(s.provider.clone())
+    let out = submit_next_proof(s.provider.clone(), s.oracle_addr, s.proofs_dir.path())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::ProofNotReady { batch_index: 1 });

@@ -115,8 +115,9 @@ pub mod fakes {
     impl ClusterEgress for FakeEgress {
         fn recv(&mut self) -> Option<Vec<u8>> {
             loop {
-                if let ControlFlow::Break(result) = self.poll_once() {
-                    return result;
+                match self.poll_once() {
+                    ControlFlow::Break(result) => return result,
+                    ControlFlow::Continue(()) => {}
                 }
             }
         }

@@ -125,29 +125,6 @@ fn request<R>(
         .map_err(|_| LogError::Aeron(format!("{op} timed out")))?
 }
 
-/// The Aeron thread's whole body, run by [`AeronRuntime::spawn_with`] on
-/// its dedicated OS thread. Builds the client with `make_ctx`, reports the
-/// outcome on `started_tx`, then runs the poll/command loop until it exits.
-fn aeron_thread_main<F>(
-    make_ctx: F,
-    cmd_rx: crossbeam_channel::Receiver<RuntimeCmd>,
-    started_tx: &CbSender<Result<(), LogError>>,
-) where
-    F: FnOnce() -> Result<rusteron_client::AeronContext, LogError>,
-{
-    let aeron = match make_ctx().and_then(|ctx| build_aeron(&ctx)) {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = started_tx.send(Err(e));
-            return;
-        }
-    };
-    let _ = started_tx.send(Ok(()));
-    if let Err(e) = run_aeron_thread(aeron, cmd_rx) {
-        error!(error = %e, "aeron runtime thread exited with error");
-    }
-}
-
 impl AeronRuntime {
     /// Calls [`spawn_with_dir`](Self::spawn_with_dir) when a directory is
     /// given, or [`spawn_default`](Self::spawn_default) otherwise. This is
@@ -222,7 +199,19 @@ impl AeronRuntime {
 
         let join = std::thread::Builder::new()
             .name("kardamom-aeron".into())
-            .spawn(move || aeron_thread_main(make_ctx, cmd_rx, &started_tx))
+            .spawn(move || {
+                let aeron = match make_ctx().and_then(|ctx| build_aeron(&ctx)) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let _ = started_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let _ = started_tx.send(Ok(()));
+                if let Err(e) = run_aeron_thread(aeron, cmd_rx) {
+                    error!(error = %e, "aeron runtime thread exited with error");
+                }
+            })
             .map_err(|e| LogError::Aeron(format!("spawn aeron thread: {e}")))?;
 
         match started_rx.recv_timeout(Duration::from_secs(10)) {
@@ -684,8 +673,9 @@ fn poll_recv_decoded<T>(
     mut decode: impl FnMut(&RawFrame) -> ControlFlow<T>,
 ) -> std::task::Poll<Option<T>> {
     loop {
-        if let ControlFlow::Break(outcome) = poll_one(rx, cx, &mut decode) {
-            return outcome;
+        match poll_one(rx, cx, &mut decode) {
+            ControlFlow::Break(outcome) => return outcome,
+            ControlFlow::Continue(()) => {}
         }
     }
 }

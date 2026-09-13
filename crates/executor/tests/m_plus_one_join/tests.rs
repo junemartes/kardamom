@@ -165,7 +165,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
     };
 
     let join = thread::spawn(move || {
-        Executor::<Wiring>::new(
+        Executor::run::<Wiring>(
             cfg,
             Inbound {
                 tx_data: tx_data_subs,
@@ -181,7 +181,6 @@ fn tx_ref_arriving_before_envelope_still_joins() {
             ResumePoint::GENESIS,
             RoleHooks::none(),
         )
-        .run()
     });
 
     let (got_hashes, boundaries) = collect_single_seq_until_boundary(&c_rx);

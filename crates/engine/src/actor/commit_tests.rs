@@ -10,7 +10,7 @@ use crate::error::ExecutorError;
 use crate::exec_types::CMessage;
 
 use super::test_support::{feed_commits, pos};
-use super::{CommitLoop, ExecToCommit, TxReceiptsPublication};
+use super::{ExecToCommit, TxReceiptsPublication, spawn_commit};
 
 struct RecordPub(Arc<Mutex<Vec<CMessage>>>);
 impl TxReceiptsPublication for RecordPub {
@@ -55,7 +55,7 @@ fn commit_thread_preserves_order() {
         }),
     ]);
 
-    let h = CommitLoop::new(RecordPub(log.clone()), rx).spawn();
+    let h = spawn_commit(RecordPub(log.clone()), rx);
     h.join().expect("no panic").expect("ok");
 
     let l = log.lock().unwrap();
@@ -101,14 +101,13 @@ fn commit_thread_retries_until_delivered() {
     })]);
 
     // The publisher rejects the first 3 attempts, then accepts.
-    let h = CommitLoop::new(
+    let h = spawn_commit(
         FlakyPub {
             fails_left: 3,
             log: log.clone(),
         },
         rx,
-    )
-    .spawn();
+    );
     // This must return Ok. The thread survived the transient failures.
     h.join()
         .expect("no panic")
@@ -157,14 +156,13 @@ fn commit_thread_batches_queued_receipts_and_flushes_on_boundary() {
 
     let batches = Arc::new(Mutex::new(Vec::new()));
     let boundaries = Arc::new(Mutex::new(Vec::new()));
-    let h = CommitLoop::new(
+    let h = spawn_commit(
         BatchRecordPub {
             batches: batches.clone(),
             boundaries: boundaries.clone(),
         },
         rx,
-    )
-    .spawn();
+    );
     h.join().expect("no panic").expect("ok");
 
     let b = batches.lock().unwrap();
@@ -217,15 +215,14 @@ fn commit_thread_resumes_batch_at_failed_suffix() {
     );
 
     let delivered = Arc::new(Mutex::new(Vec::new()));
-    let h = CommitLoop::new(
+    let h = spawn_commit(
         PartialPub {
             accept: 2,
             fail_once: true,
             delivered: delivered.clone(),
         },
         rx,
-    )
-    .spawn();
+    );
     h.join().expect("no panic").expect("ok");
 
     let d = delivered.lock().unwrap();
@@ -258,7 +255,7 @@ fn commit_thread_fail_stops_on_divergence() {
         ..Default::default()
     })]);
 
-    let h = CommitLoop::new(DivergingPub, rx).spawn();
+    let h = spawn_commit(DivergingPub, rx);
     let res = h.join().expect("no panic");
     assert!(
         matches!(res, Err(ExecutorError::Divergence(_))),

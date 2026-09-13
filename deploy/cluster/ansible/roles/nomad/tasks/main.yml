@@ -36,10 +36,6 @@
     group: root
     mode: "0755"
     creates: /usr/local/bin/nomad
-  register: nomad_download
-  until: nomad_download is succeeded
-  retries: 5
-  delay: 10
 
 - name: Render the Nomad configuration
   # The rendered file carries tokens on the production profile; log nothing about it there.

@@ -168,6 +168,51 @@ impl Lifecycle {
         Ok(contract)
     }
 
+    /// Replace one node the way a cloud provider replaces a machine: the
+    /// container comes back with generation `generation`, on another
+    /// address and with empty volumes, and the contract file follows.
+    /// The node is unprovisioned after this; see
+    /// [`Self::provision_node`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a step exits non-zero, or if the contract the
+    /// apply wrote is invalid.
+    pub async fn replace_container(
+        &self,
+        name: &str,
+        generation: u32,
+    ) -> anyhow::Result<NodeContract> {
+        let target = format!("-replace=docker_container.node[\"{name}\"]");
+        let var = format!("-var=node_generation={{\"{name}\"={generation}}}");
+        self.tofu(&["init", "-input=false"]).await?;
+        self.tofu(&["apply", "-auto-approve", "-input=false", &target, &var])
+            .await?;
+        self.write_contract().await?;
+        self.contract()
+    }
+
+    /// Provision one node with the substrate playbook, limited to that
+    /// node: the play a new machine gets. The workloads are not
+    /// redeployed; Nomad places the lost allocations on the node once
+    /// its client joins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the playbook exits non-zero.
+    pub async fn provision_node(&self, name: &str) -> anyhow::Result<()> {
+        let contract = self.contract()?;
+        let nomad_addr = contract.nomad_addr(NOMAD_HTTP_PORT)?;
+        let env = vec![("NOMAD_ADDR", nomad_addr)];
+        let mut cmd = self.command("ansible-playbook", &env);
+        cmd.args(["-i", "localhost,", "ansible/containers.yml", "--limit"])
+            .arg(format!("localhost,{name}"));
+        if let Ok(extra) = std::env::var(CLUSTER_VARS_ENV) {
+            cmd.args(["--extra-vars", &extra]);
+        }
+        run_inheriting(cmd, "ansible-playbook ansible/containers.yml (one node)").await
+    }
+
     /// Destroy the node containers and their volumes, and remove the
     /// contract file.
     ///

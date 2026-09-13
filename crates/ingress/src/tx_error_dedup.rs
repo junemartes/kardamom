@@ -178,7 +178,12 @@ impl Inner {
     /// Drops entries older than `window`. Skips order-queue entries that
     /// were refreshed after they were enqueued.
     fn purge(&mut self, now: Instant, window: Duration) {
-        while self.purge_step(now, window).is_continue() {}
+        loop {
+            match self.purge_step(now, window) {
+                ControlFlow::Break(()) => return,
+                ControlFlow::Continue(()) => {}
+            }
+        }
     }
 
     /// One [`Self::purge`] step: drop the order queue's front entry if it

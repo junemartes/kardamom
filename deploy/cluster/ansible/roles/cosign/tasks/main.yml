@@ -40,7 +40,3 @@
         dest: "{{ cosign_resolved_binary }}"
         checksum: "sha256:{{ cosign_sha256 }}"
         mode: "0755"
-      register: cosign_download
-      until: cosign_download is succeeded
-      retries: 5
-      delay: 10

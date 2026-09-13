@@ -178,14 +178,6 @@ struct FoundRecording {
     term_layout: Result<TermLayout, String>,
 }
 
-/// Spawn the dedicated replay runtime, pointed at `aeron_dir` when given.
-fn spawn_runtime(aeron_dir: Option<&std::path::Path>) -> Result<AeronRuntime, LogError> {
-    match aeron_dir {
-        Some(dir) => AeronRuntime::spawn_with_dir(dir),
-        None => AeronRuntime::spawn_default(),
-    }
-}
-
 impl ArchiveRefetcher {
     #[must_use]
     pub fn new(cfg: RefetchConfig) -> Self {
@@ -405,7 +397,10 @@ impl ArchiveRefetcher {
         match &mut self.rt {
             Some(rt) => Ok(rt),
             slot @ None => {
-                let rt = spawn_runtime(self.cfg.aeron_dir.as_deref())?;
+                let rt = match &self.cfg.aeron_dir {
+                    Some(dir) => AeronRuntime::spawn_with_dir(dir)?,
+                    None => AeronRuntime::spawn_default()?,
+                };
                 Ok(slot.insert(rt))
             }
         }
@@ -619,11 +614,13 @@ impl ArchiveRefetcher {
         let deadline = Instant::now() + DRAIN_CAP;
         let mut delivered = 0u64;
         loop {
-            let ControlFlow::Continue(item) = drain_step(rx, deadline) else {
-                return delivered;
-            };
-            deliver(item);
-            delivered += 1;
+            match drain_step(rx, deadline) {
+                ControlFlow::Break(()) => return delivered,
+                ControlFlow::Continue(item) => {
+                    deliver(item);
+                    delivered += 1;
+                }
+            }
         }
     }
 }
@@ -722,8 +719,9 @@ fn recv_timeout<S: PollRecv>(
     let mut cx = Context::from_waker(&waker);
     let deadline = Instant::now() + timeout;
     loop {
-        if let ControlFlow::Break(result) = step(rx, &mut cx, deadline) {
-            return result;
+        match step(rx, &mut cx, deadline) {
+            ControlFlow::Break(result) => return result,
+            ControlFlow::Continue(()) => {}
         }
     }
 }
