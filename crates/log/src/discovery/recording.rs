@@ -207,31 +207,18 @@ impl<A: RecorderArchive> Recording<A> {
     }
 
     fn start_one(&mut self, uri: &str, record: &PublisherRecord) {
-        let subscription_id = match self.archive.start(uri, record.stream_id) {
-            Ok(id) => Some(id),
-            Err(e) => {
-                info!(%uri, error = %e, "discovered recorder: start_recording rejected; adopting the existing recording");
-                None
-            }
-        };
+        let mut started = Started::new(record, &self.spec.own_instance);
+        if let Err(e) = started.begin(&self.archive, uri) {
+            warn!(%uri, error = %e, "discovered recorder: no live recording after start failed; will retry");
+            return;
+        }
         info!(
             %uri,
             stream_id = record.stream_id,
             publisher = %record.publisher_id,
             "discovered recorder: recording publisher"
         );
-        self.started.insert(
-            uri.to_string(),
-            Started {
-                stream_id: record.stream_id,
-                fragment: format!("control={}", record.control),
-                subscription_id,
-                session_id: record.session_id,
-                recording_id: None,
-                own: record.belongs_to(&self.spec.own_instance),
-                absence: Absence::default(),
-            },
-        );
+        self.started.insert(uri.to_string(), started);
     }
 
     fn stop_one(&mut self, uri: &str) {
@@ -277,5 +264,37 @@ impl<A: RecorderArchive> Recording<A> {
                 own_recordings: own_live,
             });
         }
+    }
+}
+
+impl Started {
+    fn new(record: &PublisherRecord, own_instance: &str) -> Self {
+        Self {
+            stream_id: record.stream_id,
+            fragment: format!("control={}", record.control),
+            subscription_id: None,
+            session_id: record.session_id,
+            recording_id: None,
+            own: record.belongs_to(own_instance),
+            absence: Absence::default(),
+        }
+    }
+
+    /// A rejected start counts only when the archive proves a matching
+    /// live recording exists. Otherwise the caller retries the start.
+    fn begin<A: RecorderArchive>(&mut self, archive: &A, uri: &str) -> Result<(), LogError> {
+        match archive.start(uri, self.stream_id) {
+            Ok(id) => self.subscription_id = Some(id),
+            Err(e) => {
+                let id = archive.latest(self).ok_or(e)?;
+                self.recording_id = Some(id);
+                info!(%uri, recording_id = id, "discovered recorder: adopting a matching live recording");
+            }
+        }
+        Ok(())
+    }
+
+    fn matches_recording(&self, session: i32, stop_position: i64) -> bool {
+        stop_position < 0 && self.session_id.is_none_or(|expected| expected == session)
     }
 }
