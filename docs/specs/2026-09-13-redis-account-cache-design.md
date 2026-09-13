@@ -397,17 +397,27 @@ Add `eth_getBalance` next to `eth_getTransactionCount`, same wire shape, plus an
 
 ### 9.2 Chain semantics (`s17`)
 
-The ids `s14`, `s15` and `s16` were taken when PR 4 landed, so the scenarios are `s17`.
+The ids `s14`, `s15` and `s16` were taken when PR 4 landed, so the scenarios are `s17`. The
+local stack runs no Redis, so every scenario has a discriminator beyond "the submit landed":
+the ingress's `kardamom_cache_lookups_total` tells a served read from an admit-by-default,
+and the executor's own query tells a correct count from a plausible one.
 
-- `s17a_nonce_floor_cache_matches_executor_count`: the cached nonce equals or lags the
-  executor, never leads.
-- `s17b_resubmit_of_landed_still_returns_the_receipt`.
-- `s17c_cold_cache_admits_everything`.
-- `s17d_deposit_funded_sender_is_admitted_within_max_stale_txs`.
-- `s17e_forged_receipt_row_halts_the_validator`.
-- `s17f_get_balance_and_nonce_answer_or_degrade_promptly`.
-- `s17g_recipient_can_spend_within_one_batch`: A pays B, B submits at once, B is admitted
-  before the block boundary.
+- `s17a_ingress_count_matches_the_executor_and_a_retry_answers`: after three transfers the
+  ingress serves the count as a live hit, the executor's query agrees once the block
+  commits, a retry of the first transfer answers its hash (the S5 contract), and a
+  different transaction at a landed nonce is `-32602`.
+- `s17c_cold_ingress_admits_on_a_local_miss`: a restarted ingress admits the sender's next
+  nonce and counts the miss.
+- `s17e_validator_verifies_the_batch_rows`: the validator's `validator_rows_verified_total`
+  rises under traffic. The negative case, a forged row that halts, is unit coverage in
+  `kardamom_validator::seams`: the receipt cross-check runs first, so an injected frame
+  cannot reach the row check with a byte-identical receipt.
+- `s17g_recipient_spends_within_one_batch`: A pays a fresh B; on A's receipt the ingress
+  serves B's balance as a live hit, and B spends it at once.
+- Folded or dropped: `s17b` is the retry step of `s17a`; `s17d` (a deposit-funded sender)
+  adds the L1 bridge harness for no new property, since a deposit's rows reach the layer
+  like any other batch's; `s17f` (the RPCs answer promptly) is S5 and the RPC vectors since
+  PR 4.
 
 ### 9.3 Chaos (`chaos-cache` shard)
 
