@@ -5,10 +5,11 @@
 //! The admission checks read the local account layer, then Redis on a
 //! miss when `[cache]` is on. A miss in both admits: the executor query
 //! is never on this path, so a flood of cold senders costs the
-//! executors nothing. A past nonce asks the Redis receipt index before
-//! it rejects, so a retry of a landed tx gets its receipt across an
-//! ingress restart; otherwise it rejects as `Duplicate`, after the local
-//! receipt cache has had its say. An unfunded sender rejects as
+//! executors nothing. A past nonce answers from a receipt: the local
+//! receipt cache, then the Redis receipt index. The same tx gets its
+//! receipt, across an ingress restart when Redis holds it; another tx
+//! at the nonce is `Duplicate`. With no receipt in either index, it
+//! publishes and the sequencer decides. An unfunded sender rejects as
 //! `InsufficientFunds`, only when the balance is fresh.
 
 use std::net::IpAddr;
@@ -229,8 +230,10 @@ where
         let Some(state) = self.account_state(v.sender).await else {
             return Ok(None);
         };
-        if v.nonce < state.view.nonce {
-            return self.answer_past_nonce(v).await.map(Some);
+        if v.nonce < state.view.nonce
+            && let Some(receipt) = self.answer_past_nonce(v).await?
+        {
+            return Ok(Some(receipt));
         }
         v.check_balance(&state)?;
         Ok(None)
@@ -252,17 +255,32 @@ where
         })
     }
 
-    /// A past nonce: the Redis receipt index may hold the landed tx. The
+    /// A past nonce: a receipt index may hold the landed tx. The local
+    /// receipt cache is read again, since its receipt may have arrived
+    /// after the submit's first read, then the Redis receipt index. The
     /// same identity answers with its receipt, which also fills the local
-    /// cache. A different identity, or no index, is `Duplicate`.
-    async fn answer_past_nonce(&self, v: &ValidatedSubmission) -> Result<Receipt, IngressError> {
-        let indexed = match &self.redis {
-            Some(redis) => redis.receipt(v.sender, v.nonce).await,
-            None => None,
+    /// cache. A different identity is `Duplicate`.
+    ///
+    /// No receipt in either index is `None`: the submit publishes and the
+    /// sequencer decides. The account layer can lead both indexes. The
+    /// pump applies a batch's rows at once, the receipt bus drops
+    /// receipts for a lagging watcher, and the mirror is one more hop
+    /// from the same source. A reject there would answer a retry of a
+    /// landed tx with `Duplicate` for good.
+    async fn answer_past_nonce(
+        &self,
+        v: &ValidatedSubmission,
+    ) -> Result<Option<Receipt>, IngressError> {
+        let indexed = match (self.cache.lookup(v.sender, v.nonce), &self.redis) {
+            (Some(local), _) => Some(local),
+            (None, Some(redis)) => redis.receipt(v.sender, v.nonce).await,
+            (None, None) => None,
         };
         let Some(receipt) = indexed else {
-            count_reject("nonce-too-low");
-            return Err(IngressError::Duplicate((v.sender, v.nonce)));
+            // A receipt-index miss, not a degraded read: the chaos cases
+            // read the degraded count as "Redis is dark".
+            cache_metrics::record_lookup("receipt", "miss");
+            return Ok(None);
         };
         self.cache.insert(receipt.clone());
         if receipt.tx_hash != v.tx_hash {
@@ -270,7 +288,7 @@ where
             return Err(IngressError::Duplicate((v.sender, v.nonce)));
         }
         metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
-        Ok(receipt)
+        Ok(Some(receipt))
     }
 
     /// Publishes a validated envelope onto `tx_data[shard]`. The shard comes
