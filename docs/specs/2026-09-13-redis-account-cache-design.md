@@ -411,16 +411,24 @@ The ids `s14`, `s15` and `s16` were taken when PR 4 landed, so the scenarios are
 
 ### 9.3 Chaos (`chaos-cache` shard)
 
-- `redis-primary-kill`: Sentinel promotes; progress holds; `degraded_total` rises during the
-  election only.
-- `redis-freeze`: readers time out and admit; they recover on thaw.
-- `partition-ingress-redis`: the ingress admits with `outcome="timeout"`; the pipeline is
-  unaffected.
-- `mirror-kill-rebuild`: the restarted mirror rebuilds; the head catches up within the SLO.
-- `failover-head-regression`: a lagging replica is promoted; the mirror detects the regression
-  and rebuilds.
-- `lookup-blackout` extended: the sequencer still advances floors with every executor RPC
-  dark.
+Every case drives the reader counters with a cold-address `eth_getBalance` through the
+ingress: a local miss, so the read touches Redis. The pipeline must progress throughout.
+
+- `redis-partition-ingress`: `iptables DROP` of ingress-0's packets to Redis and the
+  sentinels. Its reads count `degraded_total`, its submits land, and it uses Redis again
+  when the rule is removed.
+- `redis-primary-kill`: `docker kill` of the primary. Nomad restarts it empty, or the
+  sentinels promote the replica first; either way the readers degrade, then recover, and
+  the mirror head advances.
+- `redis-primary-freeze`: SIGSTOP of the primary for 20 s, past the sentinels' 5 s
+  down-after. The readers degrade, the sentinels promote the replica, and after the thaw
+  the readers and the mirror use the promoted primary.
+- `mirror-kill-rebuild`: the three mirrors killed and the primary flushed. The restarted
+  mirrors find Redis cold and rebuild from the executors' newest checkpoint: the rebuild
+  counter rises, the head advances, and a genesis account no live batch touched has a row.
+- Deferred: `failover-head-regression` depends on replication lag at the moment of a
+  promotion, which this harness cannot arrange deterministically. The mirror's regression
+  rebuild is covered by its unit tests.
 
 ## 10. Implementation plan (stacked PRs)
 
@@ -534,6 +542,13 @@ Deviations from the design above, recorded as they land.
   files), the network is isolated, and a poisoned entry fails closed to `Duplicate` or to an
   admit. `requirepass`, `masterauth`, and the sentinel `auth-pass` land together with a
   secrets path, as one change to the image, the job, and the two reader configs.
+- **PR 6 (`chaos-cache` shard).** The cases are those of 9.3. The freeze case exposed a
+  gap in the reader: a frozen primary accepts a TCP connection and never answers the
+  handshake, so an unbounded reconnect waited for the thaw and never followed the
+  promotion. One connection attempt is now bounded by ten command timeouts. The reader
+  counters of the ingress (`kardamom_cache_degraded_total`, `kardamom_cache_lookups_total`)
+  and the mirror's head and rebuild counters (port 9007 on the executor nodes) are the
+  case observables.
 
 ## 12. Open questions
 

@@ -17,7 +17,7 @@ CONTROL_ADDRESS_CMD := python3 -c 'import json,sys; print(json.load(open(sys.arg
 CARGO_CHAOS := cargo test -p kardamom-chaos --release --features cluster-e2e --locked --test shards
 CLUSTER_BIN := cargo run --release -p kardamom-chaos --locked --bin kardamom-cluster --
 # The shard to run: load, semantics, chaos-executor, chaos-ingress,
-# chaos-sequencer, chaos-cluster, chaos-retention.
+# chaos-sequencer, chaos-cluster, chaos-retention, chaos-cache.
 SHARD ?= load
 SHARD_TEST = $(subst -,_,$(SHARD))
 TAG := dev

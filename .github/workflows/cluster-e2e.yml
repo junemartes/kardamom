@@ -61,7 +61,7 @@ jobs:
         # it SUPERSEDES the old chaos-sealer shard (the single-sealer SPOF is gone
         # now the deploy uses the clustered sealer — see "Configure shard").
         shard:
-          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-retention, semantics]
+          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-retention, chaos-cache, semantics]
     steps:
       - uses: actions/checkout@v4
 
