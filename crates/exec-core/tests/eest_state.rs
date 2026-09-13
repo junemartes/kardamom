@@ -333,6 +333,24 @@ impl PostCheck<'_> {
         Outcome::Pass
     }
 
+    /// Name one account's divergence from the fixture's post state, or
+    /// `None` when the two agree. An empty code hash normalizes to ZERO
+    /// on both sides, the way the state table stores "no code".
+    fn account_diff(
+        addr: &Address,
+        got: &AccountFields,
+        want: (u64, U256, B256),
+    ) -> Option<String> {
+        let norm = |h: B256| if h == KECCAK_EMPTY { B256::ZERO } else { h };
+        if (got.nonce, got.balance, norm(got.code_hash)) == (want.0, want.1, norm(want.2)) {
+            return None;
+        }
+        Some(format!(
+            "{addr}: got (nonce={}, bal={}, code={}), want (nonce={}, bal={}, code={})",
+            got.nonce, got.balance, got.code_hash, want.0, want.1, want.2
+        ))
+    }
+
     /// When the fixture ships its full `post_state`, name the differing
     /// accounts. This is far more useful for triage than two root
     /// hashes.
@@ -342,7 +360,6 @@ impl PostCheck<'_> {
             .post_state
             .iter()
             .filter_map(|(addr, want)| {
-                let got = self.alloc.accounts.get(addr);
                 let want_tuple = (
                     want.nonce,
                     want.balance,
@@ -352,20 +369,10 @@ impl PostCheck<'_> {
                         keccak256(&want.code)
                     },
                 );
-                match got {
-                    None => Some(format!("{addr}: missing (want {want_tuple:?})")),
-                    Some(g) => {
-                        let norm = |h: B256| if h == KECCAK_EMPTY { B256::ZERO } else { h };
-                        ((g.nonce, g.balance, norm(g.code_hash))
-                            != (want_tuple.0, want_tuple.1, norm(want_tuple.2)))
-                        .then(|| {
-                            format!(
-                                "{addr}: got (nonce={}, bal={}, code={}), want (nonce={}, bal={}, code={})",
-                                g.nonce, g.balance, g.code_hash, want_tuple.0, want_tuple.1, want_tuple.2
-                            )
-                        })
-                    }
-                }
+                let Some(got) = self.alloc.accounts.get(addr) else {
+                    return Some(format!("{addr}: missing (want {want_tuple:?})"));
+                };
+                Self::account_diff(addr, got, want_tuple)
             })
             .collect();
         format!(
