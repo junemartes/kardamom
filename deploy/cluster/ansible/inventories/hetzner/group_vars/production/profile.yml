@@ -1,7 +1,7 @@
 ---
 # The production profile values of the Hetzner deployment. This file
-# overrides ansible/group_vars/all.yml for the inventories/hetzner
-# inventory. It holds no secret: the gossip key and the agent tokens
+# belongs to the production child group, which overrides the shared all
+# group defaults for dedicated and elastic hosts. It holds no secret: the gossip key and the agent tokens
 # come from an encrypted vault file in this directory (see
 # secrets.example.yml).
 deployment_profile: "production"

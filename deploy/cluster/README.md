@@ -343,7 +343,7 @@ cannot join each other.
 `ansible/inventories/hetzner/` holds an example production inventory and
 the profile values. Copy it outside the repo, fill in the dedicated
 inventory, the vSwitch inputs and an encrypted vault file with the secret
-inputs, then run `ansible-playbook -i <copy> -u root ansible/bootstrap.yml`.
+inputs in `group_vars/production/vault.yml`, then run `ansible-playbook -i <copy> -u root ansible/bootstrap.yml`.
 `roles/profile` refuses a production run that lacks a security input.
 
 An elastic Cloud node has no inventory entry. At first boot its bootstrap
