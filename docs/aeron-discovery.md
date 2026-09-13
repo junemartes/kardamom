@@ -182,7 +182,7 @@ service carries the node role as a tag, and the template lists
 `aux.kardamom-aeron-archive` for `tx_deposits`. Every job renders the file
 with `change_mode = "noop"`: a change in the archive set rewrites the file,
 and the running process follows the catalog through discovery instead of
-restarting. `scripts/check-contract.py` checks the chain id mirror, the
+restarting. `ansible/contract.yml` checks the chain id mirror, the
 placeholders, the role tag, and the node meta the Nomad agent template
 stamps.
 

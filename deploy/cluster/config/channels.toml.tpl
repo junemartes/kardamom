@@ -38,7 +38,7 @@ consul_http_addr = "http://127.0.0.1:8500"
 # The discovery scope. cluster_id and datacenter come from the node:
 # roles/nomad stamps the profile's cluster_id as node meta, and the Nomad
 # datacenter is the profile's datacenter. chain_id mirrors
-# group_vars/all.yml chain_id; scripts/check-contract.py checks the mirror.
+# group_vars/all.yml chain_id; ansible/contract.yml checks the mirror.
 cluster_id = "{{ env "meta.cluster_id" }}"
 chain_id = 412346
 datacenter = "{{ env "node.datacenter" }}"

@@ -1,0 +1,13 @@
+---
+- name: Submit one phase of the routing resize
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Submit through the workload planner
+      ansible.builtin.include_role:
+        name: workloads
+        tasks_from: resize

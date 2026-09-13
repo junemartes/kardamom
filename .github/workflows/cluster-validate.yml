@@ -40,7 +40,7 @@ jobs:
       - name: ansible-lint
         run: ansible-lint ansible/
       - name: Contract drift check (group_vars/all.yml vs mirrors)
-        run: ./scripts/check-contract.py
+        run: ansible-playbook -i localhost, ansible/contract.yml
 
   nomad-validate:
     name: nomad job validate

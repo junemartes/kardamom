@@ -1,0 +1,11 @@
+---
+- name: Check {{ contract_mirror.path }}
+  vars:
+    contract_text: "{{ lookup('file', contract_repo_dir ~ '/' ~ contract_mirror.path) }}"
+  ansible.builtin.assert:
+    that:
+      - contract_mirror.required | reject('in', contract_text) | list | length == 0
+      - contract_mirror.forbidden | select('in', contract_text) | list | length == 0
+    fail_msg: >-
+      {{ contract_mirror.path }}: missing {{ contract_mirror.required | reject('in', contract_text) | list }};
+      forbidden {{ contract_mirror.forbidden | select('in', contract_text) | list }}.

@@ -1,0 +1,31 @@
+---
+- name: Render an initial shard map
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars_files:
+    - group_vars/all.yml
+  vars:
+    shard_map_output: "{{ playbook_dir | dirname }}/config/shard-map.toml"
+  tasks:
+    - name: Validate the identity lane count
+      ansible.builtin.assert:
+        that: partition_count in [1, 2, 4, 8]
+
+    - name: Inspect the destination
+      ansible.builtin.stat:
+        path: "{{ shard_map_output }}"
+      register: shard_map_stat
+
+    - name: Protect a map that has already participated in a resize
+      ansible.builtin.assert:
+        that: (lookup('file', shard_map_output) | community.general.from_toml).version == 0
+        fail_msg: Use the resize controller for a versioned map, or supply a new shard_map_output.
+      when: shard_map_stat.stat.exists
+
+    - name: Render the identity map
+      ansible.builtin.template:
+        src: shard-map.toml.j2
+        dest: "{{ shard_map_output }}"
+        mode: '0644'

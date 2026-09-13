@@ -17,10 +17,7 @@ use crate::probes::{Probed, SEQUENCER_LANE0_PORT};
 
 const MAP: &str = "config/shard-map.toml";
 const NEXT_MAP: &str = "config/shard-map.next.toml";
-const JOB: &str = "nomad/sequencer.nomad.hcl";
-const INGRESS_JOB: &str = "nomad/ingress.nomad.hcl";
 const GROUP_VARS: &str = "ansible/group_vars/all.yml";
-const DIGESTS: &str = "images.digests";
 /// Lane `n` exports on `9001 + 10n`.
 const LANE_STRIDE: u16 = 10;
 const MAX_LANES: u32 = 8;
@@ -132,10 +129,9 @@ impl Resize {
         }
         let version = next.version();
         self.run_job(
-            INGRESS_JOB,
             "ingress",
             &format!("ingress on map {version}"),
-            &[],
+            serde_json::json!({}),
         )
         .await?;
         self.wait_running("ingress").await?;
@@ -266,59 +262,44 @@ impl Resize {
         previous: Option<&ShardMap>,
         what: &str,
     ) -> anyhow::Result<()> {
-        let mut vars = vec![format!(
-            "shard_table={}",
-            serde_json::to_string(next.table().as_slice())?
-        )];
-        if let Some(previous) = previous {
-            vars.push(format!(
-                "previous_shard_table={}",
-                serde_json::to_string(previous.table().as_slice())?
-            ));
-        }
-        self.run_job(JOB, "sequencer", what, &vars).await
-    }
-
-    /// The pinned image of a service from the digest manifest, when the
-    /// deployment wrote one.
-    fn image_ref(&self, service: &str) -> Option<String> {
-        let manifest = std::fs::read_to_string(self.path(DIGESTS)).ok()?;
-        image_ref_in(&manifest, service)
+        let vars = serde_json::json!({
+            "shard_table": serde_json::to_string(next.table().as_slice())?,
+            "previous_shard_table": serde_json::to_string(previous.map_or(&[][..], |map| map.table().as_slice()))?,
+        });
+        self.run_job("sequencer", what, vars).await
     }
 
     async fn run_job(
         &self,
-        file: &str,
         service: &str,
         what: &str,
-        vars: &[String],
+        vars: serde_json::Value,
     ) -> anyhow::Result<()> {
-        let image = self
-            .image_ref(service)
-            .map(|r| format!("image_ref={r}"))
-            .into_iter()
-            .flat_map(|v| ["-var".to_string(), v]);
-        let args: Vec<String> = ["job".to_string(), "run".to_string()]
-            .into_iter()
-            .chain(image)
-            .chain(vars.iter().flat_map(|v| ["-var".to_string(), v.clone()]))
-            .chain(std::iter::once(file.to_string()))
-            .collect();
-        crate::log(format!("nomad {} ({what})", args.join(" ")));
+        crate::log(format!("ansible resize submission: {service} ({what})"));
         if self.dry_run {
             return Ok(());
         }
-        let status = tokio::process::Command::new("nomad")
-            .args(&args)
+        let extra = serde_json::json!({
+            "workloads_resize_job": service,
+            "workloads_resize_vars": vars,
+        });
+        let status = tokio::process::Command::new("ansible-playbook")
+            .args([
+                "-i",
+                "localhost,",
+                "ansible/resize.yml",
+                "--extra-vars",
+                &extra.to_string(),
+            ])
             .current_dir(&self.cluster_dir)
             .env("NOMAD_ADDR", &self.nomad_addr)
             .stdin(Stdio::null())
             .status()
             .await
-            .context("spawn nomad job run")?;
+            .context("spawn Ansible resize submission")?;
         anyhow::ensure!(
             status.success(),
-            "nomad job run {file} failed with {status}"
+            "resize submission for {service} failed with {status}"
         );
         Ok(())
     }
@@ -346,13 +327,13 @@ impl Resize {
     fn log_commit_advice(&self) {
         if matches!(self.target, 1 | 2 | 4 | 8) {
             crate::log(format!(
-                "commit together: {MAP}, {GROUP_VARS} (partition_count: {}), {INGRESS_JOB} (\"--shards\", \"{}\").",
-                self.target, self.target
+                "commit together: {MAP}, {GROUP_VARS} (partition_count: {}).",
+                self.target
             ));
             return;
         }
         crate::log(format!(
-            "{} lanes is a transient count: the contract accepts a steady count of 1, 2, 4, or 8. Resize again toward one of those before you commit the map and the job.",
+            "{} lanes is a transient count: the contract accepts a steady count of 1, 2, 4, or 8. Resize again toward one of those before you commit the map.",
             self.target
         ));
     }
@@ -391,18 +372,6 @@ fn tx_ttl_in(group_vars: &str) -> anyhow::Result<Duration> {
     Ok(Duration::from_secs(millis.div_ceil(1000)))
 }
 
-/// The last `<service> <ref>` line of the digest manifest.
-fn image_ref_in(manifest: &str, service: &str) -> Option<String> {
-    manifest
-        .lines()
-        .filter_map(|l| {
-            let mut fields = l.split_whitespace();
-            (fields.next()? == service).then(|| fields.next())?
-        })
-        .next_back()
-        .map(str::to_string)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,7 +397,7 @@ mod tests {
             original
         );
         assert!(!dir.path().join(NEXT_MAP).exists());
-        assert!(!dir.path().join(JOB).exists());
+        assert!(!dir.path().join("nomad/sequencer.nomad.hcl").exists());
     }
 
     #[test]
@@ -438,16 +407,5 @@ mod tests {
             Duration::from_secs(31)
         );
         assert!(tx_ttl_in("x: 1\n").is_err());
-    }
-
-    #[test]
-    fn the_last_manifest_line_of_a_service_wins() {
-        let manifest = "sequencer r@sha256:a\ningress r@sha256:b\nsequencer r@sha256:c\n";
-        assert_eq!(
-            image_ref_in(manifest, "sequencer").as_deref(),
-            Some("r@sha256:c")
-        );
-        assert!(image_ref_in(manifest, "executor").is_none());
-        assert_eq!(lane_port(2), 9021);
     }
 }

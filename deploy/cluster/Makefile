@@ -10,7 +10,7 @@ NOMAD_HTTP := 4646
 # The control node address comes from the node contract of the container
 # root at run time. Nothing in this tree names an address.
 NODE_CONTRACT := terraform/containers/node-contract.json
-CONTROL_ADDRESS_CMD := python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nodes"]["control-0"]["ip"])' $(NODE_CONTRACT)
+CONTROL_ADDRESS_CMD := jq -r '.nodes["control-0"].ip' $(NODE_CONTRACT)
 # The test suite and the operator commands are the kardamom-chaos crate.
 # A shard test brings its own cluster up; the container-* targets do the
 # same lifecycle by hand and run the gates against it (KARDAMOM_CHAOS_REUSE).
@@ -54,14 +54,14 @@ validate:
 	yamllint ansible/ || rc=1; \
 	ansible-lint ansible/ || rc=1; \
 	for j in nomad/*.hcl; do echo "== $$j =="; nomad job validate "$$j" || rc=1; done; \
-	./scripts/check-contract.py || rc=1; \
+	ansible-playbook -i localhost, ansible/contract.yml || rc=1; \
 	for r in terraform/*/; do echo "== $$r =="; tofu -chdir=$$r fmt -check -recursive . || rc=1; \
 	  tofu -chdir=$$r init -backend=false -input=false >/dev/null && tofu -chdir=$$r validate || rc=1; done; \
 	exit $$rc
 
 ## check-contract: verify the values mirrored from group_vars/all.yml agree
 check-contract:
-	./scripts/check-contract.py
+	ansible-playbook -i localhost, ansible/contract.yml
 
 ## clean: remove local built images (+ the staged cluster jar)
 clean:
