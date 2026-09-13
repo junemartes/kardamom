@@ -1,13 +1,15 @@
 # Hetzner hybrid infrastructure: dedicated core and elastic Cloud nodes
 
-- Status: Proposed; specification only.
+- Status: Implemented on `main` for the container profile and the Hetzner
+  Terraform root, by #281, #285, #286, #290, #288, #291, #293, #294 and #295
+  (merged 2026-09-13). The production profile has not run on real Hetzner
+  machines yet.
 - Date: 2026-09-11
 - Baseline: `main` at `fa6d04b9`.
 - Decision: Hetzner dedicated servers host the core; Hetzner Cloud VMs host
   elastic ingress and sequencer pools.
-- Dependency: [dynamic MDC and Consul discovery, PR #277](https://github.com/junemartes/kardamom/pull/277).
-  Transport implementation belongs to the separate MDC session. Rebase the
-  infrastructure implementation onto it before enabling application deployment.
+- Dependency: [dynamic MDC and Consul discovery](aeron-mdc-consul-spec.md),
+  implemented by #288. The infrastructure implementation is built on it.
 
 ## Problem and intended result
 
