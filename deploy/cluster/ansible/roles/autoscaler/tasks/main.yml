@@ -64,6 +64,10 @@
     dest: "/opt/nomad-autoscaler/nomad-autoscaler_{{ autoscaler_version }}.zip"
     checksum: "sha256:{{ autoscaler_release_url }}/nomad-autoscaler_{{ autoscaler_version }}_SHA256SUMS"
     mode: "0644"
+  register: autoscaler_release_download
+  until: autoscaler_release_download is succeeded
+  retries: 5
+  delay: 10
 
 - name: Install the Nomad Autoscaler binary
   ansible.builtin.unarchive:
@@ -83,6 +87,10 @@
     owner: nomad-autoscaler
     group: nomad-autoscaler
     mode: "0755"
+  register: autoscaler_plugin_download
+  until: autoscaler_plugin_download is succeeded
+  retries: 5
+  delay: 10
   notify: Restart nomad-autoscaler
 
 - name: Render the Autoscaler configuration

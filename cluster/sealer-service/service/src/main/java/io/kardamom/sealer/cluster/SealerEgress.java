@@ -148,9 +148,10 @@ final class SealerEgress {
      * consumers to freeze at their first record. Correctness matters more
      * than the leader-stall optimization that change was after. In
      * practice, the stall stays small: a wedged consumer costs one
-     * {@link #OFFER_DEADLINE_NS} on its first frame and is then closed
-     * (later offers return CLOSED and are skipped right away), and healthy
-     * consumers drain retained frames at line rate.</p>
+     * {@link #OFFER_DEADLINE_NS} on its first frame and is then closed.
+     * The close is asynchronous, so the offer loop skips the session while
+     * it is closing; the offer itself never returns CLOSED in that window.
+     * Healthy consumers drain retained frames at line rate.</p>
      */
     void handleReplayRequest(
             final ClientSession session,
@@ -372,9 +373,20 @@ final class SealerEgress {
      * the close event may never reach the client, because it rides the same
      * wedged egress. The client's delivered-frame liveness watchdog is the
      * actual recovery path.</p>
+     *
+     * <p>A session that is closing gets no offer. {@link ClientSession#close}
+     * only asks the consensus module to close the session; the session stays
+     * in {@link Cluster#clientSessions()} until the close comes back through
+     * the log, and its publication is still the wedged one. Without this
+     * guard every frame in between spins the full deadline on the same
+     * session again, so one dead session costs the service thread tens of
+     * seconds instead of one, and the boundary tick stops for that long.</p>
      */
     private boolean offerWithDeadline(
         final ClientSession session, final DirectBuffer buffer, final int length) {
+        if (session.isClosing()) {
+            return false;
+        }
         final long deadline = System.nanoTime() + OFFER_DEADLINE_NS;
         long result;
         do {

@@ -266,10 +266,19 @@ impl Target {
     /// # Errors
     /// Returns an error when a scrape fails.
     pub async fn sequencer_metric_sum(&self, name: &str) -> Result<f64> {
+        self.sequencer_metric_sum_where(name, "").await
+    }
+
+    /// Sum of `name` across every sequencer replica, over the samples
+    /// whose label block contains `label`. A missing value counts as 0.
+    ///
+    /// # Errors
+    /// Returns an error when a scrape fails.
+    pub async fn sequencer_metric_sum_where(&self, name: &str, label: &str) -> Result<f64> {
         let mut sum = 0.0;
         for addr in &self.sequencer_metrics {
             let s: Scrape = metrics::scrape(*addr).await?;
-            sum += s.value(name).unwrap_or(0.0);
+            sum += s.value_where(name, label).unwrap_or(0.0);
         }
         Ok(sum)
     }

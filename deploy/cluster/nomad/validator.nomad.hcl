@@ -14,8 +14,8 @@
 # chaos cases kill executor tasks and nodes (node-failure kills the
 # executor-2 node outright), and a validator co-located there would die
 # as collateral, indistinguishable from a fail-stop. Ports on the aux
-# node: cluster egress 40230, metrics 9006. No conflicts, since no
-# executor runs on the same node.
+# node: cluster egress on a Nomad dynamic port, metrics 9006. No
+# conflicts, since no executor runs on the same node.
 #
 # This job uses file() for its templates, so submit it from the
 # deploy/cluster/ directory. ansible/deploy.yml does this.
@@ -93,21 +93,27 @@ job "validator" {
     # recovery races the advancing retention floor: fetch checkpoint,
     # exit(1), restart, adopt, catch up. It only wins when
     #   recovery_latency < retention_window (= retention_frames / frame_rate).
-    # On the dev host, recovery takes about 42s. At retention 6144,
-    # that becomes a losing race above about 150 tps of frames. Each
-    # losing cycle takes about 80s, burns one restart attempt, and
-    # resolves nothing. mode=fail would then kill the job on the 5th
-    # attempt, even though the race self-resolves once load eases; the
-    # window widens to minutes at idle. A derived, off-hot-path service
-    # should wait that out, not die. mode=delay parks for the rest of
-    # the interval after the 5th attempt, and keeps trying. Treadmill
-    # cycles stay visible through
+    # A refused replay costs one revolution of the treadmill: fetch a
+    # peer checkpoint (about 4s for 256 MB), halt, wait the restart
+    # delay, adopt, ask for replay from the checkpoint's index. The
+    # checkpoint is up to 20s old (the executors' interval). At
+    # retention 6144 and 230 tps the window is 26s, so a revolution with
+    # a 15s delay lost the race every time, and the fifth loss parked
+    # the validator for the rest of the interval (seen in CI: "Exceeded
+    # allowed attempts, applying a delay - Task restarting in 7m36s",
+    # while the race had already resolved once load eased). A 5s delay
+    # keeps a revolution near 10s plus the checkpoint age, and ten
+    # attempts give the race room to resolve before the park. mode=fail
+    # would kill the job instead, even though the window widens to
+    # minutes at idle; a derived, off-hot-path service waits that out.
+    # Treadmill cycles stay visible through
     # validator_resync_total{outcome="peer-checkpoint"}, one increment
-    # per revolution; alert on its rate, not on job death.
+    # per revolution; alert on its rate, not on job death. The in-process
+    # adoption that removes the restart from the revolution is issue #298.
     restart {
-      attempts = 5
+      attempts = 10
       interval = "10m"
-      delay    = "15s"
+      delay    = "5s"
       mode     = "delay"
     }
 
@@ -118,6 +124,10 @@ job "validator" {
 
     network {
       mode = "host"
+      # The cluster egress (response) port, unique per allocation. A
+      # fixed port sat in the node's ephemeral range, where the shared
+      # media driver's port-0 discovery sockets could take it first.
+      port "egress" {}
     }
 
     task "validator" {
@@ -156,13 +166,10 @@ job "validator" {
           "--config", "/local/validator.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
-          # This node's cluster-egress (response) endpoint, for the
-          # validator's own cluster client session. Port 40230 stays
-          # distinct from 40210, the executors' egress port convention
-          # on their nodes. Nothing else binds either port on the aux
-          # node; distinct ports keep captures and debugging
-          # unambiguous.
-          "--cluster-egress-endpoint", "${meta.node_ip}:40230",
+          # This allocation's cluster-egress (response) endpoint, for
+          # the validator's own cluster client session: the node IP and
+          # a Nomad dynamic port.
+          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",
           # Use the validator's own state directory under the shared

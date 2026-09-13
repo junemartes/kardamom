@@ -9,9 +9,13 @@
 #
 # Each group passes an explicit --lane and --vslots, derived from
 # config/shard-map.toml (docs/specs/dynamic-sequencer-sizing.md, 3.2).
-# The ports form a lane: metrics 9001 + 10 * lane, cluster egress
-# 40210 + 10 * lane. Two lanes share a node without a clash.
-# Placement is by Nomad, not by node meta.
+# The metrics port forms a lane: 9001 + 10 * lane, so two lanes share a
+# node without a clash. The cluster egress (response) port is a Nomad
+# dynamic port, one per allocation: a fixed per-lane port sat in the
+# node's ephemeral range, where the shared media driver's port-0 sockets
+# could take it first, and a replacement replica reused the endpoint of
+# the replica it replaced, on which the cluster's egress publication was
+# already stale. Placement is by Nomad, not by node meta.
 #
 # Note for consumers: both replicas of a lane process the same tx
 # stream, so per-lane tx totals exist once per replica. Aggregate
@@ -92,6 +96,8 @@ job "sequencer" {
 
     network {
       mode = "host"
+      # The cluster egress (response) port, unique per allocation.
+      port "egress" {}
     }
 
     task "sequencer-0" {
@@ -128,9 +134,9 @@ job "sequencer" {
           # The executor nonce query endpoints (node_classes.executor and
           # ports.executor_nonce_query in group_vars/all.yml).
           "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:9024"]),
-          # This node's cluster-egress (response) endpoint, on the lane's
-          # port. The node IP differs per replica, so it is injected here.
-          "--cluster-egress-endpoint", "${meta.node_ip}:40210",
+          # This allocation's cluster-egress (response) endpoint: the
+          # node IP and the dynamic port, both known only at placement.
+          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
         ]
       }
 
@@ -208,6 +214,8 @@ job "sequencer" {
 
     network {
       mode = "host"
+      # The cluster egress (response) port, unique per allocation.
+      port "egress" {}
     }
 
     task "sequencer-1" {
@@ -244,9 +252,9 @@ job "sequencer" {
           # The executor nonce query endpoints (node_classes.executor and
           # ports.executor_nonce_query in group_vars/all.yml).
           "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:9024"]),
-          # This node's cluster-egress (response) endpoint, on the lane's
-          # port. The node IP differs per replica, so it is injected here.
-          "--cluster-egress-endpoint", "${meta.node_ip}:40220",
+          # This allocation's cluster-egress (response) endpoint: the
+          # node IP and the dynamic port, both known only at placement.
+          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
         ]
       }
 

@@ -100,6 +100,10 @@ job "executor" {
 
     network {
       mode = "host"
+      # The cluster egress (response) port, unique per allocation. A
+      # fixed port sat in the node's ephemeral range, where the shared
+      # media driver's port-0 discovery sockets could take it first.
+      port "egress" {}
     }
 
     task "executor" {
@@ -158,13 +162,12 @@ job "executor" {
           # so ${NOMAD_ALLOC_INDEX} stays stable at 0 through N, and
           # matches the co-located recorder's id.
           "--recorder-id", "${NOMAD_ALLOC_INDEX}",
-          # Cluster mode only: this node's cluster-egress (response)
-          # endpoint. The cluster client's egress_channel is per node,
-          # since the node IP differs, so it is injected here instead
-          # of baked into config/executor.toml. The port, 40210
-          # (cluster_egress_port), stays uniform; uniqueness comes
-          # from node_ip.
-          "--cluster-egress-endpoint", "${meta.node_ip}:40210",
+          # Cluster mode only: this allocation's cluster-egress
+          # (response) endpoint. The cluster client's egress_channel is
+          # per allocation (the node IP and the dynamic port are known
+          # only at placement), so it is injected here instead of baked
+          # into config/executor.toml.
+          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",
           # Join-miss archive refetch (tx_data and tx_deposits). When
