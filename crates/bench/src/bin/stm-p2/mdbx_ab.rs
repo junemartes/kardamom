@@ -24,7 +24,7 @@ use kardamom_engine::exec_types::TxIndex;
 use kardamom_footprint::classifier::Stats;
 use kardamom_state::WriteBatch;
 use kardamom_stm::execute::{PoolHandle, execute_block_sequential};
-use kardamom_types::{BPosition, TxEnvelope};
+use kardamom_types::{BPosition, Receipt, TxEnvelope};
 
 use kardamom_bench::stm::BlockAt;
 
@@ -204,24 +204,7 @@ fn execute_sequential_side(
     let (seq_receipts, seq_delta) = if stm_only {
         (Vec::new(), PendingDelta::new())
     } else if std::env::var_os("KARDAMOM_SEQ_ON_THREAD").is_some() {
-        // This is a discriminator: the pool's per-transaction cost is
-        // notably higher than sequential's for pure-interpreter work.
-        // Run the same sequential engine on a spawned thread pinned to
-        // a worker core. If it slows to the pool's rate, the tax is
-        // thread context: stack, arena, or placement. If it stays
-        // fast, the tax is in the pool's own execution path.
-        std::thread::scope(|sc| {
-            sc.spawn(|| {
-                let core: usize = std::env::var("KARDAMOM_SEQ_CORE")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(3);
-                let _ = core_affinity::set_for_current(core_affinity::CoreId { id: core });
-                execute_block_sequential(snapshot, None, e, recs)
-            })
-            .join()
-            .expect("seq thread")
-        })?
+        execute_sequential_pinned(snapshot, e, recs)?
     } else {
         let seq_txs: Vec<kardamom_stm::execute::SeqTx<'_>> = recs
             .iter()
@@ -245,6 +228,41 @@ fn execute_sequential_side(
         stm_only,
         alloc_before: a0,
     })
+}
+
+/// Run the sequential engine on a thread pinned to a worker core, and
+/// return its result.
+///
+/// This is a discriminator: the pool's per-transaction cost is notably
+/// higher than sequential's for pure-interpreter work. If pinned
+/// sequential slows to the pool's rate, the tax is thread context:
+/// stack, arena, or placement. If it stays fast, the tax is in the
+/// pool's own execution path.
+fn execute_sequential_pinned(
+    snapshot: &kardamom_state::StateSnapshot,
+    e: ExecEnv,
+    recs: &[(TxIndex, BPosition, TxEnvelope)],
+) -> anyhow::Result<(Vec<Receipt>, PendingDelta)> {
+    std::thread::scope(|sc| {
+        sc.spawn(|| run_sequential_on_pinned_core(snapshot, e, recs))
+            .join()
+            .expect("seq thread")
+    })
+}
+
+/// Pin this thread to the core named by `KARDAMOM_SEQ_CORE` (default
+/// core 3), then run the sequential engine on `recs`.
+fn run_sequential_on_pinned_core(
+    snapshot: &kardamom_state::StateSnapshot,
+    e: ExecEnv,
+    recs: &[(TxIndex, BPosition, TxEnvelope)],
+) -> anyhow::Result<(Vec<Receipt>, PendingDelta)> {
+    let core: usize = std::env::var("KARDAMOM_SEQ_CORE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let _ = core_affinity::set_for_current(core_affinity::CoreId { id: core });
+    Ok(execute_block_sequential(snapshot, None, e, recs)?)
 }
 
 /// A fresh mdbx environment's handles, plus the writer's initial

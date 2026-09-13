@@ -174,7 +174,7 @@ impl Harness {
         {
             match rig.step(seq) {
                 Ok(true) => any = true,
-                Ok(false) => {}
+                Ok(false) => (),
                 Err(e) => panic!("sequencer {i}: unexpected error {e:?}"),
             }
         }
