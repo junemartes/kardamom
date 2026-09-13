@@ -513,8 +513,10 @@ Deviations from the design above, recorded as they land.
   so: nonce 19 of a moved sender, right after the ingress restart. Before this stack, the
   same lost receipt was the known `s16` flake "did not land after 40 attempts". The door
   rejects a past nonce only on proof: a receipt for the (sender, nonce) with another hash.
-  A past nonce with no receipt counts `kardamom_cache_degraded_total{reason="past-nonce"}`. The chain-semantics scenarios of 9.2 ship with PR 5. The ingress query
-  client lives in `kardamom_cache::query`; the sequencer keeps its own until PR 4b.
+  A past nonce with no receipt counts `kardamom_cache_lookups_total{layer="receipt",
+  outcome="miss"}`, not a degraded read: Redis is not involved. The chain-semantics
+  scenarios of 9.2 ship with PR 5. The ingress query client lives in
+  `kardamom_cache::query`; the sequencer keeps its own until PR 4b.
 - **PR 4b (Redis readers behind `[cache]`).** The reader never stalls on Redis:
   `CacheReader::spawn` returns at once, a background task connects with a backoff and polls
   the mirror heads every 100 ms, and every read before the first connection, during a
@@ -525,8 +527,7 @@ Deviations from the design above, recorded as they land.
   receipt with another hash, so a stale-low balance is the only false reject. The Redis
   receipt index can lag the local layer, so a past nonce with no receipt in Redis publishes
   too; the local receipt cache is read again first, for a receipt that arrived after the
-  submit's first read. This deviates
-  from 5.4, which skipped both checks. The staleness unit is canonical records
+  submit's first read. This deviates from 5.4, which skipped both checks. The staleness unit is canonical records
   (`BPosition::as_index`, the sealer's republished record count), not bytes. The mirror
   count the reader polls is the executor count, passed by the binary, not a config knob.
   The sequencer's nonce lookup reads Redis inside the query task, then the executors; it
