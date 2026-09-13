@@ -119,11 +119,6 @@ ports:
   # sequencer.nomad.hcl --executor-query-endpoints (both groups).
   executor_nonce_query: 9024
   anvil_l1: 8546              # in-cluster L1 (anvil) for the smoke test
-  # Aeron archive control/response/replication (see aeron image EXPOSE).
-  aeron_archive_control: 8010
-  aeron_archive_control_response: 8011
-  aeron_archive_recording_events: 8020
-  aeron_archive_replication: 8021
   # Base UDP port for kardamom data/ordering channels; per-channel offsets
   # are assigned in config/channels.toml.tpl.
   aeron_channel_base: 40000
