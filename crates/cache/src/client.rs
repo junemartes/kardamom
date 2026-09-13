@@ -192,6 +192,13 @@ impl AccountCache {
         }
     }
 
+    /// Whether a reconnect is in flight. A reader skips its reads
+    /// meanwhile: each would pay the full timeout for nothing.
+    #[must_use]
+    pub fn reconnecting(&self) -> bool {
+        self.reconnecting.load(Ordering::Acquire)
+    }
+
     /// Replace the connection in the background, once per failure burst.
     fn reconnect_later(&self) {
         let claimed = self

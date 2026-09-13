@@ -504,8 +504,26 @@ Deviations from the design above, recorded as they land.
   never holds every account of the chain. A row window exists between the pump applying a
   batch's rows and the receipt watcher populating the receipt cache: a retry that lands in
   that window gets a bare `Duplicate` instead of its receipt. The Redis receipt index of PR
-  4b closes it. The chain-semantics scenarios of 9.2 ship with PR 5. The ingress query
-  client lives in `kardamom_cache::query`; the sequencer keeps its own until PR 4b.
+  4b narrows it (the mirror is one more hop from the same source, so it cannot close it).
+  The chain-semantics scenarios of 9.2 ship with PR 5. The ingress query client lives in
+  `kardamom_cache::query`; the sequencer keeps its own until PR 4b.
+- **PR 4b (Redis readers behind `[cache]`).** The reader never stalls on Redis:
+  `CacheReader::spawn` returns at once, a background task connects with a backoff and polls
+  the mirror heads every 100 ms, and every read before the first connection, during a
+  reconnect, past the timeout, or on an error answers "unknown" and counts a degraded read.
+  A read during a reconnect is skipped rather than paid, so an outage does not cost every
+  cold submit the full timeout. Only the balance check is gated on freshness: a committed
+  nonce from any layer is a lower bound on the truth, so a past-nonce reject from a stale
+  entry is still correct, and a stale-low balance is the only false reject. This deviates
+  from 5.4, which skipped both checks. The staleness unit is canonical records
+  (`BPosition::as_index`, the sealer's republished record count), not bytes. The mirror
+  count the reader polls is the executor count, passed by the binary, not a config knob.
+  The sequencer's nonce lookup reads Redis inside the query task, then the executors; it
+  now uses `kardamom_cache::ExecutorQuery`, and its Redis nonce needs no freshness gate.
+  There is no write-back of an executor answer into the layers: a query answers one field,
+  a row needs both, and the RPC is rate limited. `[cache]` lives in the TOML files
+  (`config/ingress.toml`, `config/sequencer.toml.tpl`, both static `file()` templates), so
+  the flag day edits those, not `render-sequencer-job.py`. `pending:<addr>` stays open.
 
 ## 12. Open questions
 

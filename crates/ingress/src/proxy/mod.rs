@@ -21,7 +21,7 @@ use std::time::Duration;
 use alloy_primitives::{Address, B256, U256};
 use tokio::sync::broadcast;
 
-use kardamom_cache::{AccountView, ExecutorQuery, LiveAccounts};
+use kardamom_cache::{AccountView, CacheReader, ExecutorQuery, LiveAccounts};
 use kardamom_types::{Receipt, TxError};
 
 use crate::channels::{IngressPublication, IngressSubscription};
@@ -91,19 +91,24 @@ pub fn ingress_id_of(correlation_id: u64) -> u16 {
 
 /// Output of the shared submit-path head: the identity of a decoded,
 /// verified submission, plus a receipt-cache hit if this is a
-/// resubmission, and what the admission checks need: the sender's
-/// latest local state and the tx's worst-case cost.
+/// resubmission, and the tx's worst-case cost for the balance check.
 struct ValidatedSubmission {
     sender: Address,
     nonce: u64,
     tx_hash: B256,
     cached: Option<Receipt>,
-    /// The sender's entry in the local layer. `None` with the checks
-    /// off, on a miss, or past the TTL: every one admits.
-    account: Option<AccountView>,
     /// `gas_limit * max_fee_per_gas + value`. `None` on overflow, which
     /// admits: the executor's own check is the bound.
     cost: Option<U256>,
+}
+
+/// What the admission checks read: the sender's latest known state, and
+/// whether its balance is fresh enough to reject on. A local entry is
+/// fresh by its TTL. A Redis entry is fresh by the head lag. A nonce is
+/// a lower bound at any lag, so it never needs `fresh`.
+struct AccountState {
+    view: AccountView,
+    fresh: bool,
 }
 
 /// Handle returned by `IngressProxy::start`. Drop it to shut down the
@@ -146,6 +151,9 @@ where
     /// config names no endpoint: a local miss is then an error, never a
     /// stall. The admission path never calls it.
     pub(crate) query: Option<ExecutorQuery>,
+    /// The Redis layer. `None` with `[cache]` off: no Redis call exists
+    /// on any path. See `kardamom_cache::reader`.
+    pub(crate) redis: Option<Arc<CacheReader>>,
     /// The highest `BlockBoundary.block_number` observed on `tx_receipts`.
     /// `eth_blockNumber` reads this. `AtomicU64` is enough here: the
     /// value only increases, one writer, the `BlockBoundary` watcher, sets
@@ -194,6 +202,7 @@ where
             correlation_seq: self.correlation_seq.clone(),
             live: self.live.clone(),
             query: self.query.clone(),
+            redis: self.redis.clone(),
             latest_block_number: self.latest_block_number.clone(),
             receipt_feed: self.receipt_feed.clone(),
             tx_error_feed: self.tx_error_feed.clone(),
@@ -222,6 +231,13 @@ where
         let tx_error_dedup = Arc::new(TxErrorDedup::default());
         let live = subscription.live_accounts();
         let query = ExecutorQuery::new(&cfg.executor_query);
+        let redis = cfg.cache.enabled().then(|| {
+            Arc::new(CacheReader::spawn(
+                &cfg.cache,
+                cfg.mirror_count,
+                live.clone(),
+            ))
+        });
         let me = Self {
             cfg,
             partition_count_m,
@@ -235,6 +251,7 @@ where
             correlation_seq: Arc::new(AtomicU64::new(0)),
             live,
             query,
+            redis,
             latest_block_number: Arc::new(AtomicU64::new(0)),
             receipt_feed: broadcast::channel(FEED_CAPACITY).0,
             tx_error_feed: broadcast::channel(FEED_CAPACITY).0,
@@ -251,6 +268,12 @@ where
         }
         me.spawn_block_boundary_watcher();
         me
+    }
+
+    /// Whether the Redis layer is on and connected. Tests wait on it.
+    #[must_use]
+    pub fn redis_connected(&self) -> bool {
+        self.redis.as_ref().is_some_and(|r| r.connected())
     }
 
     /// The highest `BlockBoundary.block_number` observed on `tx_receipts`.

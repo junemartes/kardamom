@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
-use kardamom_cache::{LiveAccounts, LiveAccountsWriter};
+use kardamom_cache::{
+    CacheReader, ExecutorQuery, ExecutorQueryConfig, LiveAccounts, LiveAccountsWriter, QueryError,
+};
 use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
@@ -36,7 +38,7 @@ use kardamom_log::aeron_live::{
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
-use kardamom_sequencer::lookup::{self, LookupConfig, LookupRequester};
+use kardamom_sequencer::lookup::{LookupConfig, LookupRequester};
 use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::pump::{OriginLane, Pump};
@@ -427,18 +429,19 @@ impl ReceiptFloorFeed {
 /// One lookup result, from a query task back to the drain.
 struct LookupDone {
     sender: Address,
-    result: Result<u64, String>,
+    result: Result<u64, QueryError>,
 }
 
 /// The nonce lookup task. It drains the core's requests, answers a
 /// resident sender from the local account layer, dedups the senders in
-/// flight, bounds the concurrency and the per-sender retry rate, queries
-/// the executors, and delivers each answer as a `FloorUpdate`. See
-/// `kardamom_sequencer::lookup`.
+/// flight, bounds the concurrency and the per-sender retry rate, asks
+/// Redis when `[cache]` is on, then the executors, and delivers each
+/// answer as a `FloorUpdate`. See `kardamom_sequencer::lookup`.
 ///
 /// One query runs on its own task, so a slow executor never blocks the
 /// drain. The endpoints rotate per query, and a query walks the list until
-/// one endpoint answers within the timeout.
+/// one endpoint answers within the timeout. A Redis nonce needs no
+/// freshness gate: like the executor's answer, it is a lower bound.
 pub(crate) struct NonceLookupFeed {
     cfg: LookupConfig,
     partition: u32,
@@ -448,23 +451,23 @@ pub(crate) struct NonceLookupFeed {
     floor_tx: crossbeam_channel::Sender<FloorUpdate>,
     /// The local account layer. A resident sender is answered from it.
     live: Arc<LiveAccounts>,
-    client: reqwest::Client,
-    endpoints: std::sync::Arc<[String]>,
+    /// The Redis layer. `None` with `[cache]` off.
+    redis: Option<Arc<CacheReader>>,
+    query: ExecutorQuery,
     done_tx: tokio::sync::mpsc::UnboundedSender<LookupDone>,
     done_rx: tokio::sync::mpsc::UnboundedReceiver<LookupDone>,
     in_flight: HashSet<Address>,
     /// The last request time per sender. It bounds the retry rate to one
     /// lookup per timeout per sender.
     recent: HashMap<Address, Instant>,
-    next_endpoint: usize,
 }
 
 impl NonceLookupFeed {
     /// The `recent` map is pruned once it holds this many senders.
     const RECENT_CAP: usize = 4096;
 
-    /// Build the feed over the core's request channel. Fails only when
-    /// the HTTP client cannot be built.
+    /// Build the feed over the core's request channel. `None` when the
+    /// config names no executor endpoint.
     pub(crate) fn new(
         cfg: LookupConfig,
         partition: u32,
@@ -472,24 +475,27 @@ impl NonceLookupFeed {
         shutdown: Shutdown,
         floor_tx: crossbeam_channel::Sender<FloorUpdate>,
         live: Arc<LiveAccounts>,
-    ) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder().timeout(cfg.timeout()).build()?;
-        let endpoints: std::sync::Arc<[String]> = cfg.executor_endpoints.clone().into();
+        redis: Option<Arc<CacheReader>>,
+    ) -> Option<Self> {
+        let query = ExecutorQuery::new(&ExecutorQueryConfig {
+            endpoints: cfg.executor_endpoints.clone(),
+            timeout_ms: cfg.timeout_ms,
+            max_in_flight: cfg.max_in_flight,
+        })?;
         let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
-        Ok(Self {
+        Some(Self {
             cfg,
             partition,
             rx,
             shutdown,
             floor_tx,
             live,
-            client,
-            endpoints,
+            redis,
+            query,
             done_tx,
             done_rx,
             in_flight: HashSet::new(),
             recent: HashMap::new(),
-            next_endpoint: 0,
         })
     }
 
@@ -586,87 +592,33 @@ impl NonceLookupFeed {
         self.spawn_query(sender);
     }
 
-    /// Start one query task for `sender`, rotating the first endpoint.
-    fn spawn_query(&mut self, sender: Address) {
-        let first = self.next_endpoint % self.endpoints.len();
-        self.next_endpoint = self.next_endpoint.wrapping_add(1);
-        let query = ExecutorQuery::new(self.client.clone(), self.endpoints.clone(), first, sender);
+    /// Start one query task for `sender`: Redis first when it is on, then
+    /// the executors.
+    fn spawn_query(&self, sender: Address) {
+        let query = self.query.clone();
+        let redis = self.redis.clone();
         let done_tx = self.done_tx.clone();
+        let partition = self.partition;
         tokio::spawn(async move {
-            let result = query.run().await;
+            let result = match redis_nonce(redis.as_deref(), sender).await {
+                Some(nonce) => {
+                    seq_metrics::record_nonce_lookup(partition, "redis");
+                    Ok(nonce)
+                }
+                None => query.nonce(sender).await.and_then(|answer| {
+                    u64::try_from(answer.value)
+                        .map_err(|e| QueryError::new(format!("nonce out of range: {e}"), false))
+                }),
+            };
             let _ = done_tx.send(LookupDone { sender, result });
         });
     }
 }
 
-/// One nonce query: the HTTP client, the executor endpoints, the
-/// rotation start, and the sender asked about. It walks the endpoints
-/// from `first` until one answers within the timeout.
-struct ExecutorQuery {
-    client: reqwest::Client,
-    endpoints: std::sync::Arc<[String]>,
-    first: usize,
-    sender: Address,
-}
-
-impl ExecutorQuery {
-    fn new(
-        client: reqwest::Client,
-        endpoints: std::sync::Arc<[String]>,
-        first: usize,
-        sender: Address,
-    ) -> Self {
-        Self {
-            client,
-            endpoints,
-            first,
-            sender,
-        }
-    }
-
-    /// Query the endpoints from `first` in rotation. The first answer
-    /// wins.
-    async fn run(self) -> Result<u64, String> {
-        let n = self.endpoints.len();
-        let mut last_err = String::from("no executor endpoints");
-        for endpoint in (0..n).map(|i| &self.endpoints[self.first.saturating_add(i) % n]) {
-            if let ControlFlow::Break(nonce) = self.query_endpoint(endpoint, &mut last_err).await {
-                return Ok(nonce);
-            }
-        }
-        Err(last_err)
-    }
-
-    /// One endpoint of [`Self::run`]'s rotation: `Break` carries the
-    /// answer; on failure the error lands in `last_err`.
-    async fn query_endpoint(&self, endpoint: &str, last_err: &mut String) -> ControlFlow<u64> {
-        match self.query_one(endpoint).await {
-            Ok(nonce) => ControlFlow::Break(nonce),
-            Err(e) => {
-                *last_err = format!("{endpoint}: {e}");
-                ControlFlow::Continue(())
-            }
-        }
-    }
-
-    async fn query_one(&self, endpoint: &str) -> Result<u64, String> {
-        let resp = self
-            .client
-            .post(endpoint)
-            .header("content-type", "application/json")
-            .body(lookup::request_body(self.sender))
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    "timed out".to_string()
-                } else {
-                    e.to_string()
-                }
-            })?;
-        let body = resp.text().await.map_err(|e| e.to_string())?;
-        lookup::parse_answer(&body)
-    }
+/// The sender's nonce from the Redis projection. `None` with the layer
+/// off, on a miss, and on every degraded read, which the reader counts.
+async fn redis_nonce(redis: Option<&CacheReader>, sender: Address) -> Option<u64> {
+    redis?.account(sender).await.map(|view| view.nonce)
 }
 
 pub(crate) type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;

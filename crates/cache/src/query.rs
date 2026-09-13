@@ -80,8 +80,25 @@ pub struct QueryAnswer {
 
 /// Why a query gave no answer. Every endpoint failed; the last reason.
 #[derive(Debug, thiserror::Error)]
-#[error("executor query failed: {0}")]
-pub struct QueryError(String);
+#[error("executor query failed: {reason}")]
+pub struct QueryError {
+    reason: String,
+    timed_out: bool,
+}
+
+impl QueryError {
+    /// A failure with its reason, and whether it was the timeout.
+    #[must_use]
+    pub fn new(reason: String, timed_out: bool) -> Self {
+        Self { reason, timed_out }
+    }
+
+    /// Whether the last endpoint failed on the timeout. A metric label.
+    #[must_use]
+    pub fn is_timeout(&self) -> bool {
+        self.timed_out
+    }
+}
 
 /// The client. Cheap to clone; every clone shares the connection pool,
 /// the rotation counter, and the in-flight bound.
@@ -147,12 +164,12 @@ impl ExecutorQuery {
         address: Address,
     ) -> Result<QueryAnswer, QueryError> {
         let Ok(_permit) = self.in_flight.try_acquire() else {
-            return Err(QueryError("in-flight bound reached".into()));
+            return Err(QueryError::new("in-flight bound reached".into(), false));
         };
         let n = self.endpoints.len();
         let first = self.next.fetch_add(1, Ordering::Relaxed) % n;
         let body = request_body(method, address);
-        let mut last_err = String::from("no executor endpoints");
+        let mut last_err = QueryError::new("no executor endpoints".into(), false);
         for endpoint in (0..n).map(|i| &self.endpoints[first.saturating_add(i) % n]) {
             if let ControlFlow::Break(answer) =
                 self.try_endpoint(endpoint, &body, &mut last_err).await
@@ -160,7 +177,7 @@ impl ExecutorQuery {
                 return Ok(answer);
             }
         }
-        Err(QueryError(last_err))
+        Err(last_err)
     }
 
     /// One endpoint of the rotation: `Break` carries the answer; on
@@ -169,18 +186,18 @@ impl ExecutorQuery {
         &self,
         endpoint: &str,
         body: &str,
-        last_err: &mut String,
+        last_err: &mut QueryError,
     ) -> ControlFlow<QueryAnswer> {
         match self.query_one(endpoint, body).await {
             Ok(answer) => ControlFlow::Break(answer),
             Err(e) => {
-                *last_err = format!("{endpoint}: {e}");
+                *last_err = QueryError::new(format!("{endpoint}: {}", e.reason), e.timed_out);
                 ControlFlow::Continue(())
             }
         }
     }
 
-    async fn query_one(&self, endpoint: &str, body: &str) -> Result<QueryAnswer, String> {
+    async fn query_one(&self, endpoint: &str, body: &str) -> Result<QueryAnswer, QueryError> {
         let resp = self
             .client
             .post(endpoint)
@@ -188,7 +205,7 @@ impl ExecutorQuery {
             .body(body.to_string())
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| QueryError::new(e.to_string(), e.is_timeout()))?;
         let header = |name: &str| {
             resp.headers()
                 .get(name)
@@ -198,8 +215,11 @@ impl ExecutorQuery {
         };
         let block = header("x-state-block");
         let tx_idx = header("x-state-tx-idx");
-        let text = resp.text().await.map_err(|e| e.to_string())?;
-        let value = parse_answer(&text)?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| QueryError::new(e.to_string(), e.is_timeout()))?;
+        let value = parse_answer(&text).map_err(|reason| QueryError::new(reason, false))?;
         Ok(QueryAnswer {
             value,
             block,

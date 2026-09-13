@@ -20,7 +20,10 @@ pub mod keys;
 pub mod live;
 pub mod metrics;
 pub mod query;
+pub mod reader;
 pub mod script;
+#[cfg(feature = "docker-e2e")]
+pub mod testing;
 
 mod client;
 
@@ -29,3 +32,4 @@ pub use config::{CacheConfig, LiveAccountsConfig};
 pub use error::CacheError;
 pub use live::{LiveAccounts, LiveAccountsWriter};
 pub use query::{ExecutorQuery, ExecutorQueryConfig, QueryAnswer, QueryError, QueryMethod};
+pub use reader::CacheReader;

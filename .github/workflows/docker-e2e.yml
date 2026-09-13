@@ -113,3 +113,12 @@ jobs:
             -p kardamom-cache \
             --features 'docker-e2e' \
             --test redis_e2e -- --ignored --nocapture
+
+      # The ingress admission checks and the receipt index with the Redis
+      # layer on: the case of an ingress that just restarted.
+      - name: kardamom-ingress admission over redis
+        run: |
+          cargo test \
+            -p kardamom-ingress \
+            --features 'docker-e2e,test-support' \
+            --test account_cache_redis_test -- --ignored --nocapture
