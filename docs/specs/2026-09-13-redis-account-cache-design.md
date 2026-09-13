@@ -372,8 +372,9 @@ Add `eth_getBalance` next to `eth_getTransactionCount`, same wire shape, plus an
 4. `LiveAccounts` ships with the admission checks and the RPCs, Redis off.
 5. Redis readers ship behind the `[cache]` presence flag, off by default.
 6. Flag day: sentinels configured in `config/ingress.toml` and the sequencer template. Roll
-   the ingress first (`max_parallel = 1`), then the sequencer lanes. Run the `chaos-cache`
-   shard against the flag-on configuration before the flag day is complete.
+   the ingress first (`max_parallel = 1`), then the sequencer lanes. The existing shards run
+   with the flag on and prove the flip is safe.
+7. The `chaos-cache` shard and the `s17` scenarios, against the flag-on configuration.
 
 ## 9. Test plan
 
@@ -431,8 +432,8 @@ The ids `s14`, `s15` and `s16` were taken when PR 4 landed, so the scenarios are
 | 3 | `kardamom-state-mirror`, Redis and mirror jobs, Ansible | cluster-e2e green; the mirror head tracks the executor |
 | 4 | `LiveAccounts` readers, admission checks, RPCs, Redis off | unit tests green; the existing chain-semantics shard holds the S5 retry contract |
 | 4b | Redis readers behind `[cache]` | flag off is byte-for-byte PR 4 |
-| 5 | `chaos-cache` shard, `s17a..s17g` | shard green |
-| 6 | flag day | `chaos-cache` green with the flag on |
+| 5 | flag day (config only) | every existing shard green with the flag on |
+| 6 | `chaos-cache` shard, `s17a..s17g` | shard green |
 
 ## 11. Implementation notes
 
@@ -524,6 +525,15 @@ Deviations from the design above, recorded as they land.
   a row needs both, and the RPC is rate limited. `[cache]` lives in the TOML files
   (`config/ingress.toml`, `config/sequencer.toml.tpl`, both static `file()` templates), so
   the flag day edits those, not `render-sequencer-job.py`. `pending:<addr>` stays open.
+- **PR 5 (flag day).** The flag day ships before the `chaos-cache` shard: a shard cannot test
+  a dark feature, and the seven existing shards running with `[cache]` on are the proof that
+  the flip is safe. The flip is config only: the sentinel list in `config/ingress.toml` and
+  `config/sequencer.toml.tpl`, the same three node records the mirror uses. The operator's
+  next `make up` applies it to production. Authentication stays deferred: the container
+  cluster has no secrets path for a Redis password (Nomad templates render from checked-in
+  files), the network is isolated, and a poisoned entry fails closed to `Duplicate` or to an
+  admit. `requirepass`, `masterauth`, and the sentinel `auth-pass` land together with a
+  secrets path, as one change to the image, the job, and the two reader configs.
 
 ## 12. Open questions
 

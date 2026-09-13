@@ -178,6 +178,18 @@ for svc in ("da-watcher", "batcher"):
     )
 must_contain(jobs / "anvil.nomad.hcl", 'name     = "anvil"', "anvil registers its Consul service")
 must_contain(jobs / "ingress.nomad.hcl", f"static = {ingress_rpc}", "ingress RPC port")
+
+# --- the Redis layer: every reader and the mirror name the same sentinels --------
+# The `[cache]` sentinel list is the flag: present, the readers use Redis.
+# The three files must agree on the sentinel port (ports.redis_sentinel).
+redis_sentinel = ports.get("redis_sentinel", "")
+if not redis_sentinel:
+    err("group_vars/all.yml: missing ports.redis_sentinel")
+for cfg in ("config/ingress.toml", "config/sequencer.toml.tpl"):
+    must_contain(CLUSTER / cfg, f'"redis://aux-0.node.consul:{redis_sentinel}"', "the readers' sentinel list")
+    must_contain(CLUSTER / cfg, 'master_name = "kardamom"', "the readers' sentinel master name")
+must_contain(jobs / "state-mirror.nomad.hcl", f".consul:{redis_sentinel}", "the mirror's sentinel list")
+must_contain(jobs / "redis.nomad.hcl", f"static = {redis_sentinel}", "the sentinel port")
 must_contain(jobs / "executor.nomad.hcl", f'"{chain_id}"', "L2 chain id")
 
 # --- shard count (M) and the lane plane ------------------------------------------
