@@ -1,0 +1,22 @@
+---
+local_runner_operation: all
+local_runner_container: kardamom-orch
+local_runner_build: "{{ local_runner_operation in ['all', 'build'] }}"
+local_runner_root: "{{ (playbook_dir ~ '/../../..') | realpath }}"
+local_runner_vars: {}
+local_runner_environment_keys:
+  - KEEP
+  - RUN_LOAD
+  - RUN_CHAOS
+  - RUN_SEMANTICS
+  - LOAD_DURATION_S
+  - LOAD_TARGET_TPS
+  - LOAD_SENDERS
+  - LOAD_MAX_GAP
+  - CHAOS_TPS
+  - CHAOS_CASE_S
+  - CHAOS_CASES
+  - CHAOS_RESTART_SLO_S
+  - CHAOS_RESCHEDULE_SLO_S
+  - CHAOS_LEADER_SLO_S
+  - KARDAMOM_CLUSTER_RETENTION

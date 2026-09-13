@@ -1,0 +1,72 @@
+---
+# The CLI is only an HCL compiler: -output does not submit a job. It resolves
+# file("config/...") on the controller; all mutations use the Nomad HTTP API.
+- name: Compile job and config payloads for {{ workloads_job.name }}
+  ansible.builtin.command:
+    argv: >-
+      {{ [workloads_nomad_binary, 'job', 'run', '-output']
+         + (workloads_job.vars | default({}) | dict2items | rejectattr('value', 'equalto', '')
+            | map(attribute='key') | zip(workloads_job.vars | default({}) | dict2items
+            | rejectattr('value', 'equalto', '') | map(attribute='value'))
+            | map('join', '=') | map('regex_replace', '^', '-var=') | list)
+         + (['-var=image_ref=' ~ workloads_image_refs[workloads_job.name]]
+            if workloads_job.name in workloads_image_refs else [])
+         + ['nomad/' ~ (workloads_job.file | default(workloads_job.name ~ '.nomad.hcl'))] }}
+    chdir: "{{ workloads_cluster_dir }}"
+  environment:
+    NOMAD_NAMESPACE: "{{ workloads_namespace }}"
+  register: workloads_compiled
+  changed_when: false
+  check_mode: false
+
+- name: Decode job for {{ workloads_job.name }}
+  ansible.builtin.set_fact:
+    workloads_job_definition: >-
+      {{ (workloads_compiled.stdout | from_json).Job | combine({'Namespace': workloads_namespace}) }}
+
+- name: Plan {{ workloads_job.name }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_job.name }}/plan?namespace={{ workloads_namespace | urlencode }}"
+    method: POST
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    body_format: json
+    body:
+      Job: "{{ workloads_job_definition }}"
+      Diff: true
+  register: workloads_plan
+  check_mode: false
+
+- name: Register changed job {{ workloads_job.name }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/jobs?namespace={{ workloads_namespace | urlencode }}"
+    method: POST
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    body_format: json
+    body:
+      Job: "{{ workloads_job_definition }}"
+      EnforceIndex: true
+      JobModifyIndex: "{{ workloads_plan.json.JobModifyIndex }}"
+  when:
+    - not ansible_check_mode
+    - workloads_plan.json.Diff.Type != 'None'
+  changed_when: true
+
+- name: Report planned change for {{ workloads_job.name }}
+  ansible.builtin.debug:
+    msg: "{{ workloads_plan.json.Diff.Type }}"
+  changed_when: workloads_plan.json.Diff.Type != 'None'
+  when: ansible_check_mode
+
+- name: Remember desired groups for readiness checks
+  ansible.builtin.set_fact:
+    workloads_jobs: "{{ workloads_jobs | combine({workloads_job.name: workloads_job_definition}) }}"
+
+- name: Wait for startup dependency {{ workloads_job.name }}
+  ansible.builtin.include_tasks: wait.yml
+  vars:
+    workloads_wait_job: "{{ workloads_job.name }}"
+  when:
+    - workloads_job.wait | default(true)
+    - not ansible_check_mode

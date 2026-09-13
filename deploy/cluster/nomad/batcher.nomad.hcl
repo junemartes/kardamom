@@ -17,7 +17,7 @@
 # cluster egress 40231, refetch 40133/40143, metrics 9002 (the
 # validator holds 40230/40131/40141/9006).
 #
-# scripts/deploy.sh deploys the settlement address, with
+# ansible/deploy.yml deploys the settlement address, with
 # kardamom-deploy against anvil, and injects it at submit time:
 #   nomad run -var 'settlement_address=0x<addr>' batcher.nomad.hcl
 # The batcher EOA is anvil dev account #2, pre-funded. Its key below is
@@ -26,7 +26,7 @@
 # deploy/cluster, and the spec flags it.
 #
 # This job uses file() for its templates, so submit it from the
-# deploy/cluster/ directory. scripts/deploy.sh does this.
+# deploy/cluster/ directory. ansible/deploy.yml does this.
 
 variable "settlement_address" {
   type = string
@@ -42,7 +42,7 @@ variable "batcher_key" {
   default = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
 }
 
-# Digest-pinned image. scripts/deploy.sh
+# Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests). The empty default falls back to the
 # mutable :dev tag in the task config. That fallback is a dev

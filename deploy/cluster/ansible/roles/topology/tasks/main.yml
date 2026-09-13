@@ -1,0 +1,36 @@
+---
+- name: Initialize container topology
+  ansible.builtin.set_fact:
+    topology_nodes: []
+
+- name: Expand node classes
+  ansible.builtin.include_tasks: class.yml
+  loop: "{{ node_classes | dict2items }}"
+  loop_control:
+    loop_var: topology_class
+
+- name: Validate unique addresses and nonempty topology
+  ansible.builtin.assert:
+    that:
+      - topology_nodes | length > 0
+      - topology_nodes | map(attribute='ip') | unique | length == topology_nodes | length
+    fail_msg: Node class IP lanes overlap or the topology is empty.
+
+- name: Add container nodes to in-memory inventory
+  ansible.builtin.add_host:
+    name: "{{ item.name }}"
+    groups: "{{ [item.role, 'container_nodes'] }}"
+    ansible_host: "kardamom-{{ item.name }}"
+    ansible_connection: community.docker.docker
+    ansible_user: root
+    ansible_python_interpreter: /usr/bin/python3
+    kardamom_in_container: true
+    kardamom_node: "{{ item.name }}"
+    node_ip: "{{ item.ip }}"
+    role: "{{ item.role }}"
+    tier: "{{ item.tier }}"
+    node_index: "{{ item.index }}"
+    control_plane: "{{ item.role == 'control' }}"
+  loop: "{{ topology_nodes }}"
+  loop_control:
+    label: "{{ item.name }}"

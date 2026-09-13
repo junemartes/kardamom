@@ -95,13 +95,8 @@ if nodes:
             f"{name} ansible_host=kardamom-{name}",
             f"container inventory entry for {name}",
         )
-        must_contain(
-            CLUSTER / "scripts" / "ci-cluster.sh",
-            f"[{name}]={ip}",
-            f"ci-cluster.sh static IP of {name}",
-        )
 else:
-    # node-class model: scripts/ci-cluster.sh materialises nodes from
+    # node-class model: the Ansible topology role materialises nodes from
     # `node_classes` at deploy time (names <class>-<i>, static IPs from each
     # class's ip_start lane), so there are no hand-written per-node IP mirrors to
     # cross-check here. Just assert the model is actually declared.
@@ -414,9 +409,6 @@ must_contain(
 must_contain(REPO / "chains" / "dev.toml", f"chain_id = {chain_id}", "dev chain id")
 
 # --- scripts --------------------------------------------------------------------
-must_contain(
-    CLUSTER / "scripts" / "deploy.sh", nomad_addr, "default NOMAD_ADDR"
-)
 must_contain(
     CLUSTER / "scripts" / "smoke.sh",
     f"http://{ingress_ip}:{ingress_rpc}",

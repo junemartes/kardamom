@@ -3,7 +3,7 @@
 A reproducible multi-node kardamom test/staging cluster. Two ways to
 materialise the nodes, sharing the same Ansible playbook and Nomad jobs:
 
-- **Containers (the path CI runs):** `scripts/ci-cluster.sh` boots one
+- **Containers (the path CI runs):** `ansible/run.yml` boots one
   privileged systemd + Docker-in-Docker container per node on a
   `192.168.56.0/24` bridge and drives the full bring-up + smoke + load +
   chaos suite (`.github/workflows/cluster-e2e.yml`).
@@ -50,16 +50,18 @@ host tools below for your platform, and `just cluster-doctor` verifies them.
   (primary) or VirtualBox (fallback).
 - Ansible (`ansible-playbook`) + collections:
   `ansible-galaxy collection install ansible.posix community.docker`.
-- Docker (with BuildKit) to build + push the service/Aeron images.
+- Docker (with the Buildx plugin) to build + push the service/Aeron images.
 - The **host Docker daemon must allow the in-cluster registry as insecure**
   (plain HTTP): add `{ "insecure-registries": ["192.168.56.10:5000"] }` to
   `/etc/docker/daemon.json` (Linux) or Docker Desktop → Settings → Docker
   Engine, then restart Docker. Pushes fail without this.
-- The **Nomad CLI** on the host — `scripts/deploy.sh` drives the cluster's
-  Nomad HTTP API from the host.
+- The **Nomad CLI** on the Ansible controller — used only to compile HCL
+  and embed local config files. Ansible submits jobs through the Nomad API.
+- For signed deployments, **cosign** on PATH, in the image builder's pinned
+  cache, or configured with `workloads_cosign_binary`.
 - **JDK 17 + Gradle wrapper** for the Java Aeron Cluster node jar:
   `(cd cluster/sealer-service && ./gradlew :service:shadowJar)` — `make
-  images` / `ci-cluster.sh` stage it into the `kardamom-cluster` image and
+  images` / `ansible/run.yml` stage it into the `kardamom-cluster` image and
   fail loudly if it is missing.
 - Foundry's `cast` for the smoke tests (repo-level `just bootstrap`).
 
@@ -82,15 +84,185 @@ make down      # stop jobs + vagrant destroy
    each Nomad node's meta (`role`, `tier`, `node_ip`, `node_index`).
 3. `make images` — build the service + Aeron + cluster images on the host and
    push them to the in-cluster registry.
-4. `make deploy` — `scripts/deploy.sh` submits the jobs in dependency order:
+4. `make deploy` — `ansible/deploy.yml` submits changed jobs in dependency order:
    `aeron` (system) + `anvil` (+ the `KardamomL2Settlement` deploy against
    it), then `cluster` (the Raft sealer), then `sequencer` / `ingress` /
    `executor` / `validator` / `da-watcher`, then the live `batcher` service
    (#39).
 
-The container path is one command: `deploy/cluster/scripts/ci-cluster.sh`
-(`KEEP=1` leaves the node containers up; `scripts/local-cluster.sh` wraps it
-for Docker Desktop hosts).
+The Linux container path is:
+
+```sh
+ansible-playbook -i localhost, deploy/cluster/ansible/run.yml
+```
+
+On Docker Desktop, build Linux artifacts and run the same lifecycle inside a
+privileged Linux controller:
+
+```sh
+KEEP=1 ansible-playbook -i localhost, deploy/cluster/ansible/local.yml
+```
+
+Install Ansible, `ansible.posix`, `community.docker`, and Python `requests` on
+the controller. The local playbook follows the active Docker context and requires
+a local Docker daemon with the checkout available for bind mounts. Its builder
+includes the sealer jar, services, deployer, load and semantics harnesses.
+
+`run.yml` supports `-e cluster_run_operation=up|reset|down`. `up` reuses existing
+nodes without replacing their root filesystems; changed node images take effect
+on an explicit `reset`. `reset` deletes node containers and their Docker storage
+volumes before creating a fresh chain. `down` deletes them without deploying.
+Labeled resources from removed topology classes are also cleaned up. Builder
+caches and the local controller remain available for reuse.
+
+CI collects failure diagnostics before cleanup. `KEEP=1` (or
+`-e cluster_run_keep=true`) retains the nodes on success or failure. Use
+`-e cluster_run_tests=false` to deploy without test gates. Extra image/workload
+settings for the child convergence playbook go in `cluster_run_vars`.
+
+`local.yml` supports `-e local_runner_operation=all|build|up|reset|down`.
+`all` builds and deploys; `build` only builds; the other operations use existing
+artifacts. Set `-e local_runner_build=true` to rebuild with `reset`.
+`local_runner_container` defaults to `kardamom-orch`; use another name if an
+existing controller is bound to a different checkout. Controllers are reused
+without replacement; after changing the controller image, use a new controller
+name or remove the old idle controller before running again.
+Pass lifecycle settings through `local_runner_vars`, for example
+`-e '{"local_runner_vars":{"cluster_run_keep":true}}'`.
+
+The lifecycle holds an atomic lock at `/tmp/kardamom-cluster-locks/deploy.lock.d`
+on the Linux controller. Local controllers share this directory through the
+`kardamom-lifecycle-locks` volume. Changing the controller name does not create
+a separate cluster. A competing run fails before any cleanup. Normal
+failures release it, including teardown failures. After a controller crash or
+SIGKILL, verify no deployment is running before manually removing a stale lock.
+There is no force override. `--check` on `run.yml` validates topology and reports
+the requested operation without provisioning, testing, or tearing down.
+
+Container inventory now comes directly from `node_classes` through Ansible's
+`add_host`; there is no generated INI file or shell YAML parser in provisioning.
+`cluster.yml` is the internal convergence playbook; use `run.yml` so deployment
+is covered by the lock, diagnostics and cleanup. The test runner
+`scripts/run-tests.sh` contains only smoke/load/chaos gates. Consul discovery
+migration follows separately; topology still assigns the existing IP lanes.
+
+## Ansible workload deployment
+
+From the repository root, deploy to an already provisioned cluster with built
+images:
+
+```sh
+ansible-playbook -i localhost, deploy/cluster/ansible/deploy.yml
+```
+
+The controller runs the playbook locally and connects to the Nomad HTTP API.
+It verifies the image manifest before changing jobs, compiles the existing HCL
+with `nomad job run -output`, plans changes, and registers only changed jobs.
+Registration uses Nomad's job modify index to reject concurrent edits. Readiness
+requires the current job version's running allocations for **every task group**,
+including every Aeron node and both racing sequencer groups. Allocation readiness
+is followed by the existing smoke/chaos application checks in CI.
+
+Configuration lives in `ansible/roles/workloads/defaults/main.yml`. Existing
+`NOMAD_ADDR`, `DIGEST_MANIFEST`, `KARDAMOM_REQUIRE_SIGNED`, settlement, light-client,
+and chaos-shard environment settings remain supported. Ansible extra variables
+can override the corresponding `workloads_*` settings directly. The topology and
+current Consul configuration are unchanged in this first migration.
+
+A settlement address or a newly built `kardamom-deploy` binary is required.
+Without a supplied address, the playbook bootstraps the development Anvil factory,
+queries `addresses --contract KardamomL2Settlement --json`, and deploys only if
+that chain has no settlement registration. It fails instead of starting a batcher
+with a placeholder. Supply an existing address to avoid development-chain bootstrap.
+Owner keys are passed to the CLI through the environment and hidden from task output.
+
+Signed mode requires a complete digest manifest and verifies the bundle and each
+image with cosign before any workload mutation. It never falls back to mutable
+tags. Local unsigned mode retains the explicit dev-tag fallback. Upstream Anvil
+and the optional light-client image retain their jobspec image policies.
+
+Plan an existing deployment without submitting jobs or changing contracts:
+
+```sh
+ansible-playbook -i localhost, deploy/cluster/ansible/deploy.yml --check \
+  -e workloads_settlement_address=0xYOUR_EXISTING_SETTLEMENT_ADDRESS
+```
+
+Check mode requires an existing settlement address and a reachable Nomad API.
+It compiles and plans all jobs, but does not wait for or create allocations.
+
+`deploy.sh` and the image build/signing shell helpers have been removed.
+Container creation and the test runner still use their existing scripts; those
+are subsequent migration steps.
+Load and chaos tests remain independent of the workload deployment role.
+
+The isolated deployment tests use the actual Ansible playbook and Nomad HCL
+compiler against a local simulated Nomad API:
+
+```sh
+python3 -m unittest discover -s deploy/cluster/ansible/tests -v
+```
+
+They require `ansible-playbook` and `nomad` on PATH. The settlement repeatability
+case additionally runs when Anvil and `target/debug/kardamom-deploy` are available;
+it creates and tears down its own development chain.
+
+## Ansible image builds
+
+Both image paths now share `ansible/images.yml`. From the repository root:
+
+```sh
+# Docker builds each Rust service from source; the Java shadowJar must exist.
+ansible-playbook -i localhost, deploy/cluster/ansible/images.yml
+
+# Package Linux binaries and Aeron libraries already built by CI/local-build.
+ansible-playbook -i localhost, deploy/cluster/ansible/images.yml -e images_mode=prebuilt
+```
+
+`make images` invokes source mode; the container CI runner invokes prebuilt mode.
+Both build Aeron, the six Rust services, and the Java cluster image. The playbook
+uses `community.docker.docker_image_build` and requires Docker Buildx and a builder
+that loads its result into the local Docker engine. Builds re-evaluate source
+changes while retaining BuildKit's layer cache.
+
+The prebuilt path stages binaries, libraries, and the cluster jar in a temporary
+build directory, leaving `target/release` untouched. Missing artifacts or conflicting
+cached Aeron libraries fail before any image build. Temporary contexts are cleaned
+on success or failure.
+
+Settings are in `roles/images/defaults/main.yml`. `REGISTRY`, `TAG`, and
+`DIGEST_MANIFEST` remain supported. A relative `DIGEST_MANIFEST` environment setting
+is resolved against `deploy/cluster/` by both image and workload playbooks.
+`REGISTRY_PUSH_NODE=control-0` preserves the Docker Desktop path: Ansible exports an
+image archive, copies it into `kardamom-control-0`, loads it into that node's Docker
+engine, and pushes from there. The temporary node archive is removed even when
+loading fails. This needs temporary disk space for one image archive on each side.
+
+Pushes use Docker's CLI through Ansible `command.argv`, without a shell. This
+preserves the digest of the exact push: the Docker push module returns a pre-push
+inspection and does not expose that digest. Each manifest entry retains the
+`repo:tag@sha256:...` format required by the existing Nomad jobs.
+
+CI OIDC enables keyless signing of every pushed digest and the completed manifest.
+The `cosign` role uses an installed executable or the pinned Linux amd64 download
+and checksum in `group_vars/all.yml`. Other controller platforms need an installed
+cosign when signing. Local builds skip signing. The playbook publishes the manifest
+only after every image and required signature succeeds, preserving the previous
+manifest on build/push/sign failure. Unsigned publication removes any old signature
+bundle. The signed bundle is installed before the manifest; a concurrent verifier
+may briefly reject a mismatched pair, but will never trust a partial manifest.
+
+`--check` reports the planned image set without building, pushing, signing, or
+changing files. Isolated image orchestration tests run the real Ansible roles and
+Docker Buildx module with test Docker/cosign executables:
+
+```sh
+python3 -m unittest discover -s deploy/cluster/ansible/tests -p 'test_images.py' -v
+```
+
+These tests exercise staging, both push paths, exact digest capture, signing order,
+failed transfers, failed signatures, and preservation of the previous manifest.
+They do not replace a real Docker build and cluster smoke run.
 
 ## Layout
 
@@ -104,8 +276,10 @@ deploy/cluster/
     ansible.cfg, inventory.ini   (static VM inventory — mirrors node_classes;
                                   the container path generates its own)
     group_vars/all.yml      ← canonical contract (classes, IPs, ports, versions)
-    site.yml
-    roles/{common,docker,consul,nomad,registry}/
+    site.yml               host provisioning
+    deploy.yml             workload deployment, signature and readiness gates
+    images.yml             build, push, sign, and publish an image manifest
+    roles/{common,docker,consul,nomad,registry,workloads,images,cosign}/
   docker/
     service.Dockerfile      multi-stage cargo build → slim runtime (VM path)
     ci-service.Dockerfile   thin wrapper over prebuilt binaries (CI path)
@@ -121,18 +295,16 @@ deploy/cluster/
                             channels.toml.tpl is the shared LogConfig
   scripts/
     lib.sh                  shared control-node helpers (nomad via docker exec)
-    deploy.sh               submit jobs in dependency order, wait for allocs
     smoke.sh                single-tx smoke test against ingress
     smoke-load.sh           bash sustained-load smoke (legacy fallback)
-    ci-cluster.sh           container-node bring-up + full CI suite
-    local-cluster.sh        ci-cluster.sh wrapper for Docker Desktop
+    run-tests.sh            smoke/load/chaos gates (no provisioning)
     chaos.sh                chaos suite (kill components under load)
     check-contract.py       fail if any mirror of group_vars/all.yml drifts
 ```
 
 The Nomad job specs pull their config payloads from `config/` with HCL2
-`file()`, so submit them **from `deploy/cluster/`** (`scripts/deploy.sh` and
-`make validate` already do).
+`file()`, so manual CLI submissions must run **from `deploy/cluster/`**.
+The Ansible deployment role sets this working directory itself.
 
 Operational integrity tooling lives in the private infra repo.
 

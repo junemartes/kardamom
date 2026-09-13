@@ -1,0 +1,63 @@
+---
+- name: Build service and test binaries
+  ansible.builtin.command:
+    argv: "{{ item }}"
+    chdir: /work
+  environment:
+    PATH: /root/.foundry/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    CARGO_TARGET_DIR: /ltarget
+    CARGO_NET_RETRY: "10"
+    CARGO_HTTP_MULTIPLEXING: "false"
+  loop:
+    - [cargo, build, --release, -p, kardamom-ingress, -p, kardamom-sequencer, -p, kardamom-executor,
+       -p, kardamom-validator, -p, kardamom-da-watcher, -p, kardamom-batcher, -p, kardamom-reconstruct, --bins]
+    - [cargo, build, --release, -p, kardamom-deployer, --bin, kardamom-deploy]
+    - [cargo, build, --release, -p, kardamom-bench, --bin, kardamom-load]
+    - [cargo, build, --release, -p, e2e, --features, full-pipeline-e2e, --bin, kardamom-semantics]
+  changed_when: true
+
+- name: Build sealer jar
+  ansible.builtin.command:
+    argv: [./gradlew, ':service:shadowJar', -q]
+    chdir: /work/cluster/sealer-service
+  changed_when: true
+
+- name: Create output staging directory
+  ansible.builtin.file:
+    path: /work/target/release
+    state: directory
+    mode: "0755"
+
+- name: Stage service and test binaries
+  ansible.builtin.copy:
+    src: "/ltarget/release/kardamom-{{ item }}"
+    dest: "/work/target/release/kardamom-{{ item }}"
+    remote_src: true
+    mode: "0755"
+  loop: [ingress, sequencer, executor, validator, da-watcher, batcher, reconstruct, deploy, load, semantics]
+
+# Preserve separate cached build directories so the image role can detect
+# conflicting copies of the same library instead of silently choosing one.
+- name: Find Aeron shared libraries
+  ansible.builtin.find:
+    paths: /ltarget/release/build
+    recurse: true
+    file_type: any
+    patterns: 'libaeron*.so'
+  register: local_runner_libraries
+
+- name: Remove previously staged Aeron libraries
+  ansible.builtin.file:
+    path: /work/target/release/build/aeronstage
+    state: absent
+
+- name: Stage each Aeron build output
+  ansible.builtin.include_tasks:
+    file: library.yml
+    apply:
+      delegate_to: kardamom_build_controller
+      vars:
+        ansible_python_interpreter: /usr/bin/python3
+  loop: "{{ local_runner_libraries.files | selectattr('path', 'search', '/out/build/lib/libaeron[^/]*[.]so$') | list }}"
+  loop_control:
+    loop_var: local_runner_library

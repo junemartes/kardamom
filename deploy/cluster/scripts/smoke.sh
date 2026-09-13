@@ -23,7 +23,7 @@ TO="${TO:-0x000000000000000000000000000000000000dEaD}"
 VALUE="${VALUE:-1}"   # wei
 # The nonce is always 0. Every caller submits from its own dedicated
 # funded account: the gate, each load/chaos case, and the churn
-# re-smokes. See the account-budget note in ci-cluster.sh. So each
+# re-smokes. See the account-budget note in run-tests.sh. So each
 # account's first and only tx has nonce 0. The ingress JSON-RPC does not
 # implement eth_getTransactionCount on purpose (deferred to the state
 # writer; see crates/ingress/src/json_rpc.rs). So cast cannot auto-fill

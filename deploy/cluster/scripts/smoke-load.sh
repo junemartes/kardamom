@@ -45,7 +45,7 @@
 #    127.0.0.1 inside their service container, which runs with host
 #    networking inside the node container (Nomad docker driver, DinD).
 #    So they are reachable from the node container's loopback. This
-#    script scrapes them the same way smoke.sh and ci-cluster.sh reach
+#    script scrapes them the same way smoke.sh and run-tests.sh reach
 #    nodes: `docker exec kardamom-<node> curl 127.0.0.1:<port>`.
 #    Defaults, from the binaries' --metrics-addr defaults:
 #       executor  kardamom-executor-0  127.0.0.1:9004  kardamom_executor_block_number
@@ -101,7 +101,7 @@ set -euo pipefail
 
 # This script uses associative arrays (declare -A), which need bash 4
 # or later. The CI orchestrator, the Linux runner that runs
-# ci-cluster.sh and has cast, docker, and nomad, ships bash 5.x, so
+# run-tests.sh and has cast, docker, and nomad, ships bash 5.x, so
 # this is satisfied there. macOS' stock /bin/bash is 3.2. If you run
 # this locally on a Mac, use Homebrew bash (`brew install bash`). Fail
 # fast with a clear message, instead of a cryptic
@@ -272,7 +272,7 @@ read_block_metric() {
 
 # Build a node-to-IP map, generated from the node-class model in
 # group_vars/all.yml, through lib-topology.sh's topology_load. This is
-# the same single source of truth ci-cluster.sh builds the cluster
+# the same single source of truth run-tests.sh builds the cluster
 # from: <class>-<i> gets ip_prefix.<ip_start+i>. This map is only
 # needed when METRICS_VIA_DOCKER=0, for direct bridge scrapes. An
 # unmappable node is a hard error there; falling back to 127.0.0.1

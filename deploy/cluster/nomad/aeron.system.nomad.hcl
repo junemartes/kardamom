@@ -32,7 +32,7 @@
 # control/response/recording-events/replication UDP ports
 # (8010/8011/8020/8021) directly.
 
-# Digest-pinned image. scripts/deploy.sh
+# Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests). The empty default falls back to the
 # mutable :dev tag in the task config. That fallback is a dev

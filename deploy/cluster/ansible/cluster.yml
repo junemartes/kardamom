@@ -1,0 +1,12 @@
+---
+# Internal convergence playbook. run.yml owns the lock and failure cleanup.
+- name: Create and provision cluster containers
+  ansible.builtin.import_playbook: containers.yml
+
+- name: Publish prebuilt service images
+  ansible.builtin.import_playbook: images.yml
+  vars:
+    images_mode: prebuilt
+
+- name: Deploy workloads
+  ansible.builtin.import_playbook: deploy.yml

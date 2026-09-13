@@ -2,11 +2,11 @@
 # =============================================================================
 # validator-verdict.sh — the validator divergence/sync verdict, in one place.
 # =============================================================================
-# This file is sourced, never run directly, by both ci-cluster.sh and
+# This file is sourced, never run directly, by both run-tests.sh and
 # chaos.sh. The divergence-log scan (divergence_scan and
 # divergence_dump_context) is the one shared fail-stop evidence check.
-# It used to be duplicated between ci-cluster.sh §7c and the chaos
-# cpu-squeeze case. run_validator_verdict is ci-cluster.sh's §7c stage;
+# It used to be duplicated between run-tests.sh §7c and the chaos
+# cpu-squeeze case. run_validator_verdict is run-tests.sh's §7c stage;
 # chaos.sh sources this file but does not call it. This file must not
 # install traps; the sourcing entry script owns the single EXIT trap. It
 # needs lib.sh (log, on_control, all_allocs), lib-topology.sh
@@ -89,7 +89,7 @@ executor_block() {
   return 1
 }
 
-# --- ci-cluster.sh §7c: the full validator verdict ---------------------------
+# --- run-tests.sh §7c: the full validator verdict ---------------------------
 
 # The validator (validator.nomad.hcl, one alloc on the aux node, kept
 # out of the executor-chaos blast radius) follows everything the shard

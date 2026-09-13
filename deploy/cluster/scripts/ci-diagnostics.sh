@@ -1,14 +1,5 @@
 # shellcheck shell=bash
-# =============================================================================
-# ci-diagnostics.sh — failure diagnostics for ci-cluster.sh.
-# =============================================================================
-# This file is sourced into ci-cluster.sh's shell, never run as a child
-# process. The dumpers read NODES and NODE_ROLE from lib-topology.sh's
-# topology_load, and BRIDGE_NAME from the entry script. dump_diagnostics
-# runs from the entry script's EXIT trap, on failure. This file must not
-# install its own traps; ci-cluster.sh owns the single EXIT trap. It
-# needs lib.sh (for log) and lib-topology.sh.
-
+# Best-effort diagnostics invoked by ansible/run.yml before teardown.
 # On failure, dump every job's status and each allocation's stdout and
 # stderr before teardown. Otherwise, the container removal in the entry
 # script's cleanup erases the only evidence of why an alloc failed. The
@@ -175,3 +166,14 @@ dump_diagnostics() {
       docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar io.aeron.cluster.ClusterTool /opt/kardamom/cluster list-members 2>&1 | tail -3' 2>/dev/null || true
   done
 }
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  CLUSTER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  ROOT="$(cd "${CLUSTER_DIR}/../.." && pwd)"
+  source "${SCRIPT_DIR}/lib.sh"
+  source "${SCRIPT_DIR}/lib-topology.sh"
+  topology_load
+  BRIDGE_NAME=kardamom-br0
+  dump_diagnostics
+fi

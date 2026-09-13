@@ -7,7 +7,7 @@ on:
   # Cluster sealer + per-test media drivers, observed through JSON-RPC and
   # /metrics only. Runs on every PR; opt out with the `skip-chain-semantics`
   # label for changes that cannot affect the pipeline (e.g. docs-only PRs).
-  # Target C (the same drivers on the ci-cluster.sh DinD cluster) lands as a
+  # Target C (the same drivers on the ansible/run.yml DinD cluster) lands as a
   # cluster-e2e shard separately.
   pull_request:
   push:

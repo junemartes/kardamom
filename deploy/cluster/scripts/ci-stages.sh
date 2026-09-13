@@ -1,49 +1,6 @@
 # shellcheck shell=bash
-# =============================================================================
-# ci-stages.sh — inventory generation + the env-gated pipeline stages of
-# ci-cluster.sh.
-# =============================================================================
-# This file is sourced into ci-cluster.sh's shell, never run as a child
-# process. Stage failures must abort the one ci-cluster process, through
-# set -e or an explicit exit. The RUN_LOAD, RUN_SEMANTICS, and RUN_CHAOS
-# stage gating stays in the entry script, so the shard semantics stay
-# readable there. This file must not install traps; ci-cluster.sh owns
-# the single EXIT trap (see the sampler note in stage_load). It needs
-# lib.sh (log, running_alloc, on_control) and the entry script's
-# ROOT/LOAD_BIN.
-
-# Generate the Ansible container inventory from the topology_load
-# instances. One group exists per role (site.yml provisions `all` and
-# `control`). Every host carries its node_ip (the consul/nomad
-# bind_addr) and role (Nomad node meta for ${meta.role} placement). This
-# writes to a temp file, so the repo carries no hand-maintained
-# container inventory.
-CONTAINER_INVENTORY="/tmp/kardamom-inventory.containers.ini"
-gen_container_inventory() {
-  : >"${CONTAINER_INVENTORY}"
-  local roles_seen=() r n extra
-  for n in "${NODES[@]}"; do
-    r="${NODE_ROLE[$n]}"
-    [[ " ${roles_seen[*]} " == *" ${r} "* ]] || roles_seen+=("${r}")
-  done
-  for r in "${roles_seen[@]}"; do
-    echo "[${r}]" >>"${CONTAINER_INVENTORY}"
-    for n in "${NODES[@]}"; do
-      [[ "${NODE_ROLE[$n]}" == "${r}" ]] || continue
-      extra=""; [[ "${r}" == "control" ]] && extra=" control_plane=true"
-      # node_index is the <i> in <class>-<i>: the node's 0-based index
-      # within its class, stamped as Nomad node meta (see nomad.hcl.j2).
-      echo "${n} ansible_host=kardamom-${n} kardamom_node=${n} node_ip=${NODE_IP[$n]} role=${r} tier=${NODE_TIER[$n]} node_index=${n##*-}${extra}" >>"${CONTAINER_INVENTORY}"
-    done
-    echo "" >>"${CONTAINER_INVENTORY}"
-  done
-  cat >>"${CONTAINER_INVENTORY}" <<EOF
-[all:vars]
-ansible_connection=community.docker.docker
-ansible_python_interpreter=/usr/bin/python3
-kardamom_in_container=true
-EOF
-}
+# Test stages sourced by run-tests.sh. Failures propagate to ansible/run.yml.
+# Requires lib.sh, ROOT and LOAD_BIN. This library owns no deployment lifecycle.
 
 # --- 7. Sustained-load invariant gate (Rust harness: fixed-rate soak;
 # must-deliver, drop accounting, keep-pace).
@@ -64,8 +21,8 @@ stage_load() {
     done
   ) &
   LOADAVG_SAMPLER_PID=$!
-  # This function sets no EXIT trap here; that would overwrite on_exit's
-  # teardown trap. The sampler is killed explicitly after the load
+  # This function sets no EXIT trap here; that would overwrite the test runner's
+  # traps. The sampler is killed explicitly after the load
   # stages. On a mid-load failure exit, the CI job's process cleanup
   # reaps the orphan.
 
@@ -132,19 +89,19 @@ stage_load() {
 #
 # Accounts: this shard runs no load or chaos, so only the smoke gate
 # (#0) has been used. The semantics cases own #1 through #15. See the
-# ledger in ci-cluster.sh.
+# ledger in run-tests.sh.
 stage_semantics() {
   local SEMANTICS_BIN="${ROOT}/target/release/kardamom-semantics"
   if [[ -x "${SEMANTICS_BIN}" ]]; then
     # The l1-batch case checks the live batcher's L2-to-L1 round trip
     # against the in-cluster anvil. The settlement proxy address is
-    # deterministic on-chain state. Resolve it the same way deploy.sh's
+    # deterministic on-chain state. Resolve it the same way Ansible deployment's
     # Phase 2b does, instead of passing it through a file.
     local SETTLEMENT_ADDRESS="${SETTLEMENT_ADDRESS:-}"
     local DEPLOY_BIN="${ROOT}/target/release/kardamom-deploy"
     if [[ -z "${SETTLEMENT_ADDRESS}" && -x "${DEPLOY_BIN}" ]]; then
       # Registry ids print as hashes. The settlement is the only
-      # contract registered for this chain id (deploy.sh Phase 2b), so
+      # contract registered for this chain id (Ansible deployment Phase 2b), so
       # the first proxy line is the right one.
       SETTLEMENT_ADDRESS="$("${DEPLOY_BIN}" --rpc-url http://192.168.56.10:8546 \
         --owner 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \

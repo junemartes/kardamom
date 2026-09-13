@@ -1,0 +1,35 @@
+---
+- name: Apply Aeron socket buffers on the Linux host
+  become: true
+  ansible.posix.sysctl:
+    name: "net.core.{{ item }}"
+    value: "16777216"
+    sysctl_file: /etc/sysctl.d/99-kardamom-container-host.conf
+    sysctl_set: true
+    reload: true
+  loop: [rmem_max, wmem_max, rmem_default, wmem_default]
+
+# The module may be built in or unavailable in Docker Desktop's controller.
+- name: Try loading bridge netfilter support
+  become: true
+  ansible.builtin.command:
+    argv: [modprobe, br_netfilter]
+  changed_when: false
+  failed_when: false
+
+- name: Detect bridge netfilter controls
+  ansible.builtin.stat:
+    path: "/proc/sys/net/bridge/bridge-nf-call-{{ item }}"
+  loop: [iptables, ip6tables]
+  register: container_nodes_bridge_controls
+
+- name: Let bridged multicast bypass host packet filtering
+  become: true
+  ansible.posix.sysctl:
+    name: "net.bridge.bridge-nf-call-{{ item.item }}"
+    value: "0"
+    sysctl_file: /etc/sysctl.d/99-kardamom-container-host.conf
+    sysctl_set: true
+    reload: true
+  loop: "{{ container_nodes_bridge_controls.results }}"
+  when: item.stat.exists

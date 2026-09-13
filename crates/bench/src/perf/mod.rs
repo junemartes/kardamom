@@ -3,7 +3,7 @@
 //! load, and produces a report.
 //!
 //! The pipeline drives the same deploy and cluster `DinD` stack the
-//! cluster-e2e CI uses, through `ci-cluster.sh` from the orchestrator
+//! cluster-e2e CI uses, through `ansible/run.yml` from the orchestrator
 //! container, and reuses the `kardamom-load` harness as a library for
 //! the load phases. Profiling attaches async-profiler, in itimer mode
 //! so no `perf_events` are needed inside the nested containers, to the

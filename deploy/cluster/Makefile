@@ -7,18 +7,15 @@ REGISTRY := 192.168.56.10:5000
 NOMAD_ADDR := http://192.168.56.10:4646
 TAG := dev
 # Per-deploy image digest manifest (attested-identity P0.1): written at push
-# time by scripts/push-image.sh, read by scripts/deploy.sh to pin every job's
+# time by ansible/images.yml, read by ansible/deploy.yml to pin every job's
 # image_ref variable to repo@sha256:... . Gitignored (audit record, not source).
 DIGEST_MANIFEST := images.digests
-# Workspace root (this file lives in deploy/cluster/).
-ROOT := $(abspath ../..)
+export REGISTRY TAG DIGEST_MANIFEST
 # The Rust service binaries that get their own image. There is NO kardamom-
 # sealer binary (canonical ordering is the Java Aeron Cluster — see the
 # `cluster` image below) and NO kardamom-recorder (durability is archive-at-
 # the-sealer, folded into the cluster members).
 SERVICES := ingress sequencer executor validator da-watcher batcher
-# Java Aeron Cluster node jar (built by gradle; see images target).
-CLUSTER_JAR := $(ROOT)/cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar
 
 .PHONY: up vms provision images deploy smoke status down clean validate check-contract
 
@@ -40,35 +37,11 @@ provision:
 ## NOTE: pushing needs $(REGISTRY) in the HOST Docker daemon's
 ## insecure-registries (see README "Host prerequisites").
 images:
-	@rm -f $(DIGEST_MANIFEST)
-	docker build -f $(ROOT)/crates/log/docker/aeron/Dockerfile \
-		-t $(REGISTRY)/kardamom-aeron:$(TAG) $(ROOT)/crates/log/docker/aeron
-	./scripts/push-image.sh aeron $(REGISTRY)/kardamom-aeron:$(TAG) $(DIGEST_MANIFEST)
-	@for svc in $(SERVICES); do \
-		echo "==> building kardamom-$$svc"; \
-		docker build -f docker/service.Dockerfile \
-			--build-arg BIN=kardamom-$$svc \
-			-t $(REGISTRY)/kardamom-$$svc:$(TAG) $(ROOT) || exit 1; \
-		./scripts/push-image.sh $$svc $(REGISTRY)/kardamom-$$svc:$(TAG) $(DIGEST_MANIFEST) || exit 1; \
-	done
-	@# Java Aeron Cluster node (cluster.nomad.hcl pulls kardamom-cluster:$(TAG)).
-	@# The jar must be built first — fail loudly, or deploy.sh fails pulling.
-	@if [ ! -f "$(CLUSTER_JAR)" ]; then \
-		echo "ERROR: cluster jar not found at $(CLUSTER_JAR)"; \
-		echo "       Build it first: (cd $(ROOT)/cluster/sealer-service && ./gradlew :service:shadowJar)"; \
-		exit 1; \
-	fi
-	cp $(CLUSTER_JAR) docker/kardamom-cluster-node.jar
-	docker build -f docker/cluster.Dockerfile \
-		-t $(REGISTRY)/kardamom-cluster:$(TAG) docker
-	./scripts/push-image.sh cluster $(REGISTRY)/kardamom-cluster:$(TAG) $(DIGEST_MANIFEST)
-	@# P0.5: sign the COMPLETED manifest (keyless, CI-with-OIDC only; a clear
-	@# skip line locally). Must stay the LAST step of this target.
-	./scripts/sign-manifest.sh $(DIGEST_MANIFEST)
+	ansible-playbook -i localhost, ansible/images.yml
 
-## deploy: run the Aeron system job, then the service jobs (sealer first — it
+## deploy: converge workload jobs and settlement through Ansible
 deploy:
-	./scripts/deploy.sh
+	ansible-playbook -i localhost, ansible/deploy.yml
 
 ## smoke: submit transfers through ingress and assert receipts
 smoke:
@@ -95,7 +68,6 @@ check-contract:
 
 ## down: stop jobs and destroy VMs
 down:
-	-vagrant ssh control-0 -c 'export NOMAD_ADDR=$(NOMAD_ADDR); for j in $$(nomad job status -short 2>/dev/null | awk "NR>1{print \$$1}"); do nomad job stop -purge $$j; done' || true
 	vagrant destroy -f
 
 ## clean: remove local built images (+ the staged cluster jar)
@@ -104,3 +76,16 @@ clean:
 	-docker image rm $(REGISTRY)/kardamom-cluster:$(TAG)
 	-rm -f docker/kardamom-cluster-node.jar
 	-@for svc in $(SERVICES); do docker image rm $(REGISTRY)/kardamom-$$svc:$(TAG); done
+
+.PHONY: container-up container-down container-reset
+## Container lifecycle (Linux controller; prebuilt artifacts required).
+container-up:
+	ansible-playbook -i localhost, ansible/run.yml -e cluster_run_keep=true
+container-down:
+	ansible-playbook -i localhost, ansible/run.yml -e cluster_run_operation=down
+container-reset:
+	ansible-playbook -i localhost, ansible/run.yml -e cluster_run_operation=reset -e cluster_run_keep=true
+
+.PHONY: local
+local:
+	ansible-playbook -i localhost, ansible/local.yml

@@ -5,7 +5,7 @@
 # "test test test test test test test test test test test junk") so the
 # transfers smoke test (scripts/smoke.sh) has funded signers. Account #0 is the
 # canonical kardamom dev account; #0..#17 each get 1000 ETH (#16/#17 are
-# dedicated to the ci-cluster.sh ingress-/executor-churn re-smokes).
+# dedicated to the run-tests.sh ingress-/executor-churn re-smokes).
 #
 # Shipped to the executor alloc via the Nomad `template` stanza in
 # nomad/executor.nomad.hcl and passed with `--chain`.
@@ -112,7 +112,7 @@ balance = "1000000000000000000000"
 
 # --- Anvil account #16 (dedicated to the ingress-churn failover re-smoke) -----
 # pk: 0xea6c44ac03bff858b476bba40716402b03e41b8e97e276d1baec7c37d42484a0
-# Used by scripts/ci-cluster.sh's ingress-churn step so it owns its own nonce
+# Used by ansible/run.yml's ingress-churn step so it owns its own nonce
 # chain (first tx at nonce 0) and never collides with the gate (#0), load
 # harness (#1..#6), or chaos cases (#7..#15) — no cross-stage nonce coordination.
 [[alloc]]
@@ -121,7 +121,7 @@ balance = "1000000000000000000000"
 
 # --- Anvil account #17 (dedicated to the fallback executor-churn re-smoke) -----
 # pk: 0x689af8efa8c651a91ad287602527f3af2fe9f6501a7ac4b061667b5a93e037fd
-# Used by ci-cluster.sh's legacy/fallback executor-churn re-smoke so it too sends
+# Used by run-tests.sh's legacy/fallback executor-churn re-smoke so it too sends
 # nonce 0 from its own account, letting smoke.sh drop the NONCE knob entirely.
 [[alloc]]
 address = "0xbDA5747bFD65F08deb54cb465eB87D40e51B197E"
@@ -129,7 +129,7 @@ balance = "1000000000000000000000"
 
 # --- Anvil accounts #18..#33: the perf harness's soak-sender block
 # (kardamom-perf uses #1..#15 for the ramp and #18..#33 for the profiled
-# soak; see the account budget in ci-cluster.sh). Sixteen senders keep the
+# soak; see the account budget in run-tests.sh). Sixteen senders keep the
 # per-sender in-flight depth at a 10k tx/s soak (~rate/senders × latency)
 # comfortably inside the sequencer's max_pending_per_sender=16 reorder
 # window — with fewer senders the harness's own nonce reordering trips
