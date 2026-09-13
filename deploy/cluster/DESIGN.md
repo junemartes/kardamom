@@ -1,3 +1,8 @@
+> **Historical.** This is the original design of the cluster. The Vagrant
+> VM path it describes is retired: the container root (`terraform/containers`)
+> is the local profile and `terraform/hetzner` the production profile. The
+> Ansible, Nomad and failure-model sections still apply.
+
 # Nomad + Ansible Deployment Backend — Design
 
 - **Date:** 2026-05-29

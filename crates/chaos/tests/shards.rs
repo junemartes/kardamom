@@ -17,12 +17,9 @@
 //! list, `KARDAMOM_CHAOS_GATE_ACCOUNT` the smoke gate's funded account,
 //! and `CHAOS_ACCT_BASE` the first case account, so a reuse run on a used
 //! chain takes unused accounts. `KARDAMOM_CHAOS_CLUSTER_VARS` passes extra Ansible variables to
-//! the convergence playbook as one JSON object. `KARDAMOM_CHAOS_CONTROLLER`
-//! names a running `kardamom-orchestrator` container (the checkout at
-//! `/work`) to run tofu and Ansible in, where the host preparation has
-//! root. On a host without passwordless sudo and without the
-//! controller, set the host sysctls and the bridge's multicast snooping
-//! once by hand and pass `{"ansible_become": false}` in
+//! the convergence playbook as one JSON object. On a host without
+//! passwordless sudo, set the host sysctls and the bridge's multicast
+//! snooping once by hand and pass `{"ansible_become": false}` in
 //! `KARDAMOM_CHAOS_CLUSTER_VARS`: the host preparation then reads the
 //! settings it would have written.
 

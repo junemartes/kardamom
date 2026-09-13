@@ -6,8 +6,6 @@
 
 - name: Publish prebuilt service images
   ansible.builtin.import_playbook: images.yml
-  vars:
-    images_mode: prebuilt
 
 - name: Deploy workloads
   ansible.builtin.import_playbook: deploy.yml
