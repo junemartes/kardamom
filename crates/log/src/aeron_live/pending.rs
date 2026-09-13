@@ -119,27 +119,40 @@ pub(super) struct PendingPublish {
 /// back-pressured publish from starving a subscription image (see
 /// [`PendingPublish`]).
 pub(super) fn drain_pending(pubs: &[PubEntry], pending: &mut VecDeque<PendingPublish>) {
-    drain_pending_inner(pending, Instant::now(), |item| {
-        match pubs.get(item.pub_id as usize) {
-            None => OfferResult::UnknownPub,
-            Some(entry) => {
-                let code = entry.publication.offer(
-                    item.bytes.as_slice(),
-                    rusteron_client::Handlers::no_reserved_value_supplier_handler(),
-                );
-                if code >= 0 {
-                    OfferResult::Delivered(
-                        entry
-                            .layout
-                            .decode(code)
-                            .map_err(|e| LogError::Aeron(format!("aeron offer: {e}"))),
-                    )
-                } else {
-                    OfferResult::Status(code)
-                }
-            }
+    drain_pending_inner(pending, Instant::now(), |item| item.offer_on(pubs));
+}
+
+impl PendingPublish {
+    /// Attempt one offer against this item's entry in `pubs`. Reports
+    /// [`OfferResult::UnknownPub`] when `pub_id` has no entry. Otherwise
+    /// reports the raw Aeron status, or the decoded position on success.
+    fn offer_on(&self, pubs: &[PubEntry]) -> OfferResult {
+        let Some(entry) = pubs.get(self.pub_id as usize) else {
+            return OfferResult::UnknownPub;
+        };
+        let code = entry.publication.offer(
+            self.bytes.as_slice(),
+            rusteron_client::Handlers::no_reserved_value_supplier_handler(),
+        );
+        if code < 0 {
+            return OfferResult::Status(code);
         }
-    });
+        OfferResult::Delivered(
+            entry
+                .layout
+                .decode(code)
+                .map_err(|e| LogError::Aeron(format!("aeron offer: {e}"))),
+        )
+    }
+
+    /// Ack a delivered offer's decoded position. A best effort publish
+    /// carries no ack sender and takes no action.
+    fn ack_delivered(&mut self, decoded: Result<BPosition, LogError>) {
+        let Some(ack) = self.ack.take() else {
+            return;
+        };
+        let _ = ack.send(decoded);
+    }
 }
 
 /// Outcome of attempting one offer for a [`PendingPublish`].
@@ -176,46 +189,79 @@ fn fail_item(item: &mut PendingPublish, msg: String) {
 /// FIFO, deadline, and back-pressure decisions are unit-testable without a
 /// media driver. `now` is threaded in for the same reason (deterministic
 /// deadline checks).
-fn drain_pending_inner<F>(pending: &mut VecDeque<PendingPublish>, now: Instant, mut offer: F)
+fn drain_pending_inner<F>(pending: &mut VecDeque<PendingPublish>, now: Instant, offer: F)
 where
     F: FnMut(&PendingPublish) -> OfferResult,
 {
     if pending.is_empty() {
         return;
     }
-    // Publications that already back-pressured this pass. Their remaining
-    // frames wait, so a stream is never delivered out of order.
-    let mut blocked: HashSet<u32> = HashSet::new();
-
+    let mut drainer = Drainer::new(now, offer);
     // `retain_mut` visits entries front-to-back exactly once, the same
-    // order the old pop-front loop used, and lets each closure call mutate
-    // an entry (to take its ack) before deciding to keep or drop it. That
-    // is the FIFO, deadline, and back-pressure decision this function
-    // makes, with no second `VecDeque` to rebuild.
-    pending.retain_mut(|item| {
-        if blocked.contains(&item.pub_id) {
-            // Deadlines are enforced on every retained entry each pass, not
-            // only when an entry reaches the head. Otherwise frames parked
-            // behind a blocked head would expire one by one (about
-            // OFFER_TIMEOUT each), so a caller two or more deep could hit
-            // its ack timeout while its frame was still queued, and then
-            // have the frame delivered late once the subscriber connected,
-            // after the caller already treated the publish as failed (and
-            // possibly resubmitted). Expiring on time here (OFFER_TIMEOUT
-            // is shorter than publish_bytes's ack timeout) means every ack
-            // resolves before its caller gives up, so a reported-failed
-            // publish is never delivered afterwards.
-            if now >= item.deadline {
-                fail_item(
-                    item,
-                    "aeron offer failed: expired while queued behind a blocked publication"
-                        .to_string(),
-                );
-                return false;
-            }
+    // order the old pop-front loop used, and lets each call mutate an
+    // entry (to take its ack) before deciding to keep or drop it. That is
+    // the FIFO, deadline, and back-pressure decision this function makes,
+    // with no second `VecDeque` to rebuild.
+    pending.retain_mut(|item| drainer.process(item));
+}
+
+/// One [`drain_pending_inner`] pass's state: the injected offer, and the
+/// publications that already back-pressured this pass. Their remaining
+/// frames wait, so a stream is never delivered out of order.
+struct Drainer<F> {
+    now: Instant,
+    offer: F,
+    blocked: HashSet<u32>,
+}
+
+impl<F> Drainer<F>
+where
+    F: FnMut(&PendingPublish) -> OfferResult,
+{
+    fn new(now: Instant, offer: F) -> Self {
+        Self {
+            now,
+            offer,
+            blocked: HashSet::new(),
+        }
+    }
+
+    /// Decide `item`'s fate for [`drain_pending_inner`]'s `retain_mut`:
+    /// `true` keeps it queued, `false` drops it (delivered, expired, or
+    /// unknown).
+    fn process(&mut self, item: &mut PendingPublish) -> bool {
+        if self.blocked.contains(&item.pub_id) {
+            return self.retain_if_live(item);
+        }
+        self.handle_offer(item)
+    }
+
+    /// A frame parked behind a blocked head: retained unless its own
+    /// deadline has passed. Deadlines are enforced on every retained entry
+    /// each pass, not only when an entry reaches the head. Otherwise
+    /// frames parked behind a blocked head would expire one by one (about
+    /// `OFFER_TIMEOUT` each). Then a caller two or more deep could hit its
+    /// ack timeout while its frame was still queued. The frame could then
+    /// arrive late, once the subscriber connects, after the caller already
+    /// treated the publish as failed (and possibly resubmitted). Expiring
+    /// on time here matters: `OFFER_TIMEOUT` is shorter than
+    /// `publish_bytes`'s ack timeout. So every ack resolves before its
+    /// caller gives up. A reported-failed publish is never delivered
+    /// afterwards.
+    fn retain_if_live(&self, item: &mut PendingPublish) -> bool {
+        if self.now < item.deadline {
             return true;
         }
-        match offer(item) {
+        fail_item(
+            item,
+            "aeron offer failed: expired while queued behind a blocked publication".to_string(),
+        );
+        false
+    }
+
+    /// A frame not yet blocked: attempt one offer and act on its outcome.
+    fn handle_offer(&mut self, item: &mut PendingPublish) -> bool {
+        match (self.offer)(item) {
             OfferResult::UnknownPub => {
                 // Fail or log immediately; never retry.
                 let msg = format!("publish: unknown pub_id {}", item.pub_id);
@@ -226,12 +272,10 @@ where
                 // Delivered. Ack the decoded position; best effort needs
                 // no ack. Do not block this pub_id: a later frame for it
                 // may also go now.
-                if let Some(ack) = item.ack.take() {
-                    let _ = ack.send(decoded);
-                }
+                item.ack_delivered(decoded);
                 false
             }
-            OfferResult::Status(code) if now >= item.deadline => {
+            OfferResult::Status(code) if self.now >= item.deadline => {
                 // Gave up, for example on a subscriber that never joined.
                 // Surface the error, so an acknowledged must-deliver caller
                 // can decide to resubmit.
@@ -243,11 +287,11 @@ where
                 // Transient NOT_CONNECTED or BACK_PRESSURED: hold this
                 // frame and every later frame on the same publication;
                 // retry next iteration.
-                blocked.insert(item.pub_id);
+                self.blocked.insert(item.pub_id);
                 true
             }
         }
-    });
+    }
 }
 
 // ---------------------------------------------------------------------------

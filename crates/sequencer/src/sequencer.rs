@@ -844,28 +844,29 @@ impl Sequencer {
                 self.hot.evictions.increment(1);
                 self.report_evicted(rc, sender, rejected);
             }
-            NonceOutcome::Past => {
-                // Two different things surface as `Past`, and must stay
-                // distinct:
-                //
-                // - A receipt-proven skip (`proven_executed`): the resync
-                //   mechanism absorbing a duplicate. This is routine for a
-                //   twin that falls slightly behind under load. It is not
-                //   sequencer dirt (`dropped_past` stays flat, and
-                //   seq_clean holds), and not a client error (the
-                //   transaction succeeded; a DuplicatedTx notice would be
-                //   spurious and could race the receipt at ingress).
-                // - An ordinary client double-submit or stale nonce: no
-                //   floor proof. Count it, and report it.
-                if self.proven_executed(sender, nonce) {
-                    metrics::record_resync_skip(self.cfg.partition_index, 1);
-                } else {
-                    self.hot.dropped_past.increment(1);
-                }
-            }
+            NonceOutcome::Past => self.record_past_outcome(sender, nonce),
         }
 
         self.collect_publishes(rc, sender, result.actions)
+    }
+
+    /// Record bookkeeping for a `Past` outcome. Two different things
+    /// surface here, and must stay distinct:
+    ///
+    /// - A receipt-proven skip (`proven_executed`): the resync mechanism
+    ///   absorbing a duplicate. This is routine for a twin that falls
+    ///   slightly behind under load. It is not sequencer dirt
+    ///   (`dropped_past` stays flat, and `seq_clean` holds), and not a
+    ///   client error (the transaction succeeded; a `DuplicatedTx` notice
+    ///   would be spurious and could race the receipt at ingress).
+    /// - An ordinary client double-submit or stale nonce: no floor proof.
+    ///   Count it, and report it.
+    fn record_past_outcome(&mut self, sender: alloy_primitives::Address, nonce: u64) {
+        if self.proven_executed(sender, nonce) {
+            metrics::record_resync_skip(self.cfg.partition_index, 1);
+        } else {
+            self.hot.dropped_past.increment(1);
+        }
     }
 
     /// Turn one process result's actions into the `(sender, nonce,
@@ -909,19 +910,33 @@ impl Sequencer {
             ProcessAction::ReportDuplicate {
                 nonce: n,
                 expected_nonce,
-            } => {
-                if !self.proven_executed(sender, n) {
-                    self.publish_error(
-                        rc,
-                        TxError {
-                            sender,
-                            nonce: n,
-                            reason: TxErrorReason::DuplicatedTx { expected_nonce },
-                        },
-                    );
-                }
-            }
+            } => self.report_duplicate_if_unproven(rc, sender, n, expected_nonce),
         }
+    }
+
+    /// Report a duplicate submission on `rc`, unless a receipt already
+    /// proves this sender and nonce executed. A proven duplicate is
+    /// routine and stays silent.
+    fn report_duplicate_if_unproven<R>(
+        &self,
+        rc: &mut R,
+        sender: alloy_primitives::Address,
+        nonce: u64,
+        expected_nonce: u64,
+    ) where
+        R: TxErrorPublisher,
+    {
+        if self.proven_executed(sender, nonce) {
+            return;
+        }
+        self.publish_error(
+            rc,
+            TxError {
+                sender,
+                nonce,
+                reason: TxErrorReason::DuplicatedTx { expected_nonce },
+            },
+        );
     }
 
     /// Pin this thread to the configured core (if any) and loop until
@@ -967,15 +982,11 @@ impl Sequencer {
         match self.run_once(ports) {
             Ok(true) => {
                 backoff.reset();
-                if let Some(r) = self.resync.as_mut() {
-                    r.note_publish_ok();
-                }
+                self.resync_note_publish_ok();
                 Ok(true)
             }
             Ok(false) => {
-                if let Some(r) = self.resync.as_mut() {
-                    r.note_publish_ok();
-                }
+                self.resync_note_publish_ok();
                 std::thread::sleep(backoff.idle_wait());
                 Ok(true)
             }
@@ -983,14 +994,28 @@ impl Sequencer {
                 // Sustained backpressure (including a not-yet-reconnected
                 // cluster session, which maps here) is the publish-stall
                 // resync trigger.
-                if let Some(r) = self.resync.as_mut() {
-                    r.note_publish_stall(Instant::now());
-                }
+                self.resync_note_publish_stall();
                 std::thread::sleep(Duration::from_micros(10));
                 Ok(true)
             }
             Err(SequencerError::IngressDisconnected) => Ok(false),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Tell the resync controller, if one is wired, that a publish
+    /// succeeded this tick.
+    fn resync_note_publish_ok(&mut self) {
+        if let Some(r) = self.resync.as_mut() {
+            r.note_publish_ok();
+        }
+    }
+
+    /// Tell the resync controller, if one is wired, that a publish
+    /// stalled on backpressure this tick.
+    fn resync_note_publish_stall(&mut self) {
+        if let Some(r) = self.resync.as_mut() {
+            r.note_publish_stall(Instant::now());
         }
     }
 }

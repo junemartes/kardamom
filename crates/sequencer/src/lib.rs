@@ -54,9 +54,9 @@ pub mod testkit;
 mod unconfirmed;
 
 pub use config::{BackpressurePolicy, SequencerConfig};
-pub use epoch::{EpochSubscriber, process_epoch};
+pub use epoch::EpochSubscriber;
 pub use error::SequencerError;
-pub use remote_epoch::{RemoteEpochSubscriber, process_remote_epoch};
+pub use remote_epoch::RemoteEpochSubscriber;
 pub use sequencer::{Sequencer, Shutdown};
 
 // Re-export shared types so external callers can write

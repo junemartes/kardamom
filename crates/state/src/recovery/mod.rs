@@ -64,20 +64,8 @@ pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> 
             .unwrap_or(BPosition::ZERO);
     let last_fsynced_b_position =
         read_meta_b_position(&txn, meta, KEY_LAST_FSYNCED_B_POSITION)?.unwrap_or(BPosition::ZERO);
-    // The committed block's header row is written in the same transaction
-    // as the meta cursors. So a present cursor with an absent header means
-    // a corrupt env. Report this error instead of defaulting: a wrong
-    // timestamp would silently diverge state.
     let last_committed_l2_timestamp = if last_committed_block > 0 {
-        let headers = txn.open_db(Some(TABLE_HEADERS))?;
-        match txn.get::<Vec<u8>>(headers.dbi(), &encode_block_key(last_committed_block))? {
-            Some(b) => decode_header_value(&b)?.l2_timestamp,
-            None => {
-                return Err(StateError::Recovery(format!(
-                    "meta cursor says block {last_committed_block} committed but its headers row is missing"
-                )));
-            }
-        }
+        read_committed_l2_timestamp(&txn, last_committed_block)?
     } else {
         0
     };
@@ -88,6 +76,30 @@ pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> 
         last_fsynced_b_position,
         last_committed_l2_timestamp,
     })
+}
+
+/// The L2 timestamp of block `block`, read from its header row.
+///
+/// The committed block's header row is written in the same transaction as
+/// the meta cursors. So a present cursor with an absent header means a
+/// corrupt env. This reports that error instead of defaulting: a wrong
+/// timestamp would silently diverge state.
+///
+/// # Errors
+///
+/// Returns [`StateError::Recovery`] if the header row is missing, and
+/// [`StateError`] if the table read or the decode fails.
+fn read_committed_l2_timestamp<K: signet_libmdbx::TransactionKind>(
+    txn: &signet_libmdbx::tx::Tx<K>,
+    block: u64,
+) -> Result<u64, StateError> {
+    let headers = txn.open_db(Some(TABLE_HEADERS))?;
+    let Some(b) = txn.get::<Vec<u8>>(headers.dbi(), &encode_block_key(block))? else {
+        return Err(StateError::Recovery(format!(
+            "meta cursor says block {block} committed but its headers row is missing"
+        )));
+    };
+    Ok(decode_header_value(&b)?.l2_timestamp)
 }
 
 /// Whether the env carries a populated trie: a hashed mirror plus stored

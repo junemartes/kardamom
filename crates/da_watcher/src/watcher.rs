@@ -8,6 +8,7 @@
 //! `docs/agents/l1-origin-deposit-derivation-spec.md`.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use alloy_primitives::Address;
@@ -31,14 +32,32 @@ pub struct DaWatcherConfig {
     pub poll_interval: Duration,
 }
 
-/// Handle to a running watcher task. Drop `shutdown`, or send `()` on it, to
-/// ask the loop to exit. `task` is the underlying tokio `JoinHandle`.
+/// Handle to a running watcher task. [`WatcherHandle::join`] asks the
+/// loop to exit and waits for it. Dropping the handle also asks the loop
+/// to exit, without the wait. `task` is the underlying tokio `JoinHandle`.
 pub struct WatcherHandle {
-    /// Underlying tokio task. `.await` this after sending `shutdown`, to join.
+    /// Underlying tokio task. Tests read `is_finished` on it, and hold
+    /// `shutdown` while they await it, to see a fail-stop.
     pub task: JoinHandle<()>,
-    /// Cooperative shutdown signal. Send `()`, or drop this, to ask the
-    /// watcher loop to exit at the next tick boundary.
+    /// Cooperative shutdown signal. Dropping this asks the watcher loop
+    /// to exit at the next tick boundary.
     pub shutdown: oneshot::Sender<()>,
+}
+
+impl WatcherHandle {
+    /// Ask the loop to exit, then wait for the task. Ending the sender is
+    /// the request; the block scope ends it before the await.
+    ///
+    /// # Errors
+    ///
+    /// Returns the join error when the watcher task panicked.
+    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
+        let Self { task, shutdown } = self;
+        {
+            let _request = shutdown;
+        }
+        task.await
+    }
 }
 
 /// Errors the watcher's tick loop reports up. A `Tip` or `Logs` error means
@@ -79,7 +98,7 @@ struct TickRange {
     by_block: BTreeMap<u64, Vec<LockboxLog>>,
 }
 
-/// What [`Tick::publish_one_epoch`] did with one block.
+/// What [`L1Watcher::publish_one_epoch`] did with one block.
 enum PublishStep {
     /// Published; the caller's count and the cursor both advance.
     Published,
@@ -88,17 +107,159 @@ enum PublishStep {
     Halt,
 }
 
-/// One tick's state: the L1 source, the epoch publisher, the lockbox
-/// address, and the durable cursor. Bundled so [`Tick::read_range`] and
-/// [`Tick::publish_one_epoch`] take no loose parameters of their own.
-struct Tick<'a, S, P> {
-    source: &'a S,
-    publisher: &'a P,
+/// The L1 watcher's state: the L1 source, the epoch publisher, the
+/// lockbox address, the poll cadence, and the durable cursor (the last
+/// L1 block whose epoch was published; `None` until the first tick seeds
+/// it at the finalized tip).
+pub struct L1Watcher<S, P> {
+    source: S,
+    publisher: P,
     lockbox: Address,
-    cursor: &'a mut Option<u64>,
+    poll_interval: Duration,
+    cursor: Option<u64>,
 }
 
-impl<S: L1Source, P: EpochPublisher> Tick<'_, S, P> {
+impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
+    #[must_use]
+    pub fn new(publisher: P, source: S, config: DaWatcherConfig) -> Self {
+        Self {
+            source,
+            publisher,
+            lockbox: config.lockbox,
+            poll_interval: config.poll_interval,
+            cursor: None,
+        }
+    }
+
+    /// Seed the cursor, instead of letting the first tick seed it at the
+    /// finalized tip. Unit tests use this to start a pass mid-chain.
+    #[must_use]
+    pub fn resume_at(mut self, cursor: Option<u64>) -> Self {
+        self.cursor = cursor;
+        self
+    }
+
+    /// The last L1 block whose epoch was published, or `None` before the
+    /// first seed.
+    #[must_use]
+    pub fn cursor(&self) -> Option<u64> {
+        self.cursor
+    }
+
+    /// The L1 source. Unit tests script the next tick through it.
+    pub fn source(&self) -> &S {
+        &self.source
+    }
+
+    /// Spawn the watcher loop. Return a [`WatcherHandle`] that owns the
+    /// task and a cooperative shutdown channel.
+    pub fn spawn(publisher: P, source: S, config: DaWatcherConfig) -> WatcherHandle {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(Self::new(publisher, source, config).run(shutdown_rx));
+        WatcherHandle {
+            task,
+            shutdown: shutdown_tx,
+        }
+    }
+
+    /// The tick loop. `shutdown` stays outside the state, so the select
+    /// in [`Self::step`] can wait on it while the pass borrows `self`.
+    async fn run(mut self, mut shutdown: oneshot::Receiver<()>) {
+        // `interval` fires immediately on the first `tick().await`. This
+        // is what we want: it seeds the cursor as soon as the task starts.
+        let mut interval = tokio::time::interval(self.poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        while let ControlFlow::Continue(()) = self.step(&mut shutdown, &mut interval).await {}
+    }
+
+    /// Wait for the next tick or the shutdown signal, then run one pass
+    /// and report it. `Break` ends the loop: shutdown, or a closed
+    /// publisher.
+    async fn step(
+        &mut self,
+        shutdown: &mut oneshot::Receiver<()>,
+        interval: &mut tokio::time::Interval,
+    ) -> ControlFlow<()> {
+        tokio::select! {
+            biased;
+            _ = shutdown => {
+                info!(target: "da_watcher", "shutting down");
+                return ControlFlow::Break(());
+            }
+            _ = interval.tick() => {}
+        }
+        Self::report(self.process_once().await)
+    }
+
+    /// Count and log one pass's outcome. Only a closed publisher stops
+    /// the loop; every other error retries on the next tick.
+    fn report(outcome: Result<usize, MonitorError>) -> ControlFlow<()> {
+        match outcome {
+            Ok(0) => {
+                ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
+            }
+            Ok(n) => {
+                ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
+                info!(target: "da_watcher", published = n, "epochs published");
+            }
+            Err(MonitorError::NotFinalized) => {
+                ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
+                debug!(target: "da_watcher", "L1 has no finalized block yet");
+            }
+            Err(MonitorError::PublisherClosed) => {
+                warn!(target: "da_watcher", "publisher closed; exiting");
+                return ControlFlow::Break(());
+            }
+            Err(
+                ref e @ (MonitorError::Tip(L1SourceError::Decode(_))
+                | MonitorError::Logs(L1SourceError::Decode(_))),
+            ) => {
+                ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "parse_error").increment(1);
+                warn!(target: "da_watcher", error = %e, "tick failed (parse error)");
+            }
+            Err(e) => {
+                ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "rpc_error").increment(1);
+                warn!(target: "da_watcher", error = %e, "tick failed");
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// One processing pass. This is public, so unit tests can call it
+    /// directly, with no timer or thread.
+    ///
+    /// On success, return `Ok(n)`, where `n` is the number of epochs
+    /// published this pass. `n` is zero on a seed or idle tick. The cursor
+    /// advances per published block, so a partial pass resumes exactly
+    /// where it stopped.
+    ///
+    /// On `Err`, the cursor is unchanged.
+    ///
+    /// # Errors
+    /// Returns [`MonitorError`] on any read or publish failure; see
+    /// [`Self::read_range`] and [`Self::publish_one_epoch`] for which
+    /// variant means what.
+    ///
+    /// A publish backpressure event is logged. The cursor stays at the
+    /// last block that did publish, so the next tick retries from the one
+    /// that did not.
+    pub async fn process_once(&mut self) -> Result<usize, MonitorError> {
+        let Some(mut range) = self.read_range().await? else {
+            return Ok(0);
+        };
+
+        let mut published_count = 0usize;
+        for number in range.from_block..=range.tip {
+            match self.publish_block(&mut range.by_block, number).await? {
+                PublishStep::Published => published_count += 1,
+                PublishStep::Halt => return Ok(published_count),
+            }
+        }
+
+        self.cursor = Some(range.tip);
+        Ok(published_count)
+    }
+
     /// Read the finalized tip and, when the cursor already has new blocks
     /// behind it, fetch this tick's lockbox logs. `Ok(None)` means the
     /// tick only seeded the cursor or found nothing new; the caller
@@ -123,10 +284,10 @@ impl<S: L1Source, P: EpochPublisher> Tick<'_, S, P> {
         )]
         ::metrics::gauge!(metrics::L1_FINALIZED).set(tip as f64);
 
-        let from_block = match *self.cursor {
+        let from_block = match self.cursor {
             None => {
                 // Seed the cursor. Skip historical deposits, per the spec's Non-Goals section.
-                *self.cursor = Some(tip);
+                self.cursor = Some(tip);
                 return Ok(None);
             }
             Some(c) if tip <= c => return Ok(None),
@@ -155,7 +316,7 @@ impl<S: L1Source, P: EpochPublisher> Tick<'_, S, P> {
     }
 
     /// Take block `number`'s logs out of `by_block` (empty when the block
-    /// had none) and publish its epoch. For [`process_once`]'s loop.
+    /// had none) and publish its epoch. For [`Self::process_once`]'s loop.
     ///
     /// # Errors
     /// Same as [`Self::publish_one_epoch`].
@@ -199,7 +360,7 @@ impl<S: L1Source, P: EpochPublisher> Tick<'_, S, P> {
                 // failure halfway through must not re-publish already-accepted
                 // epochs. Dedup would absorb a repeat, but the cursor also
                 // drives the origin-lag signal, and it should not go backwards.
-                *self.cursor = Some(number);
+                self.cursor = Some(number);
                 ::metrics::counter!(metrics::EPOCHS_PUBLISHED_TOTAL).increment(1);
                 ::metrics::counter!(metrics::DEPOSITS_DETECTED_TOTAL).increment(deposits as u64);
                 // Metric value; f64 precision loss only above 2^52,
@@ -243,114 +404,5 @@ impl<S: L1Source, P: EpochPublisher> Tick<'_, S, P> {
                 Ok(PublishStep::Halt)
             }
         }
-    }
-}
-
-/// One processing pass. This is public, so unit tests can call it directly,
-/// with no timer or thread.
-///
-/// On success, return `Ok(n)`, where `n` is the number of epochs published
-/// this pass. `n` is zero on a seed or idle tick. The `cursor` advances per
-/// published block, so a partial pass resumes exactly where it stopped.
-///
-/// On `Err`, the cursor is unchanged.
-///
-/// # Errors
-/// Returns [`MonitorError`] on any read or publish failure; see
-/// [`Tick::read_range`] and [`Tick::publish_one_epoch`] for which variant
-/// means what.
-///
-/// A publish backpressure event is logged. The cursor stays at the last
-/// block that did publish, so the next tick retries from the one that did
-/// not.
-pub async fn process_once<S, P>(
-    publisher: &P,
-    source: &S,
-    lockbox: Address,
-    cursor: &mut Option<u64>,
-) -> Result<usize, MonitorError>
-where
-    S: L1Source,
-    P: EpochPublisher,
-{
-    let mut tick = Tick {
-        source,
-        publisher,
-        lockbox,
-        cursor,
-    };
-    let Some(mut range) = tick.read_range().await? else {
-        return Ok(0);
-    };
-
-    let mut published_count = 0usize;
-    for number in range.from_block..=range.tip {
-        match tick.publish_block(&mut range.by_block, number).await? {
-            PublishStep::Published => published_count += 1,
-            PublishStep::Halt => return Ok(published_count),
-        }
-    }
-
-    *tick.cursor = Some(range.tip);
-    Ok(published_count)
-}
-
-/// Spawn the watcher loop. Return a [`WatcherHandle`] that owns the task
-/// and a cooperative shutdown channel.
-pub fn spawn<S, P>(publisher: P, source: S, config: DaWatcherConfig) -> WatcherHandle
-where
-    S: L1Source + 'static,
-    P: EpochPublisher + 'static,
-{
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-    let task = tokio::spawn(async move {
-        // `interval` fires immediately on the first `tick().await`. This is
-        // what we want: it seeds the cursor as soon as the task starts.
-        let mut interval = tokio::time::interval(config.poll_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut cursor: Option<u64> = None;
-
-        loop {
-            tokio::select! {
-                            biased;
-                            _ = &mut shutdown_rx => {
-                                info!(target: "da_watcher", "shutting down");
-                                break;
-                            }
-                            _ = interval.tick() => {
-                                match process_once(&publisher, &source, config.lockbox, &mut cursor).await {
-                                    Ok(0) => {
-                                        ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
-                                    }
-                                    Ok(n) => {
-                                        ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
-                                        info!(target: "da_watcher", published = n, "epochs published");
-                                    }
-                                    Err(MonitorError::NotFinalized) => {
-                                        ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
-                                        debug!(target: "da_watcher", "L1 has no finalized block yet");
-                                    }
-                                    Err(MonitorError::PublisherClosed) => {
-                                        warn!(target: "da_watcher", "publisher closed; exiting");
-                                        break;
-                                    }
-                                    Err(ref e @
-            (MonitorError::Tip(L1SourceError::Decode(_)) |
-            MonitorError::Logs(L1SourceError::Decode(_)))) => {
-                                        ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "parse_error").increment(1);
-                                        warn!(target: "da_watcher", error = %e, "tick failed (parse error)");
-                                    }
-                                    Err(e) => {
-                                        ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "rpc_error").increment(1);
-                                        warn!(target: "da_watcher", error = %e, "tick failed");
-                                    }
-                                }
-                            }
-                        }
-        }
-    });
-    WatcherHandle {
-        task,
-        shutdown: shutdown_tx,
     }
 }

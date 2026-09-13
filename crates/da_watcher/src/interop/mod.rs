@@ -9,7 +9,7 @@
 //! |---|---|
 //! | [`crate::source::L1Source`] | [`source::RemoteChainSource`] |
 //! | [`crate::publisher::EpochPublisher`] | [`publisher::RemoteEpochPublisher`] |
-//! | [`crate::watcher::process_once`] | [`watcher::process_once`] |
+//! | [`crate::watcher::L1Watcher`] | [`watcher::InteropWatcher`] |
 //! | `kardamom_types::epoch::derive_epoch` | `kardamom_types::xchain::derive_remote_epoch` |
 //! | one epoch per finalized L1 block | one record per ORIGIN BLOCK that carried messages |
 //!
@@ -44,4 +44,4 @@ pub use reconcile::{
     ReconcileRetry, RpcDestinationReader,
 };
 pub use source::{RemoteChainSource, RemoteSourceError, WsRemoteChainSource};
-pub use watcher::{InteropError, InteropWatcherConfig, process_once, spawn};
+pub use watcher::{InteropError, InteropWatcher, InteropWatcherConfig};

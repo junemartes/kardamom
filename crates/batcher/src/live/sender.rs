@@ -14,7 +14,7 @@ use crate::batcher::{PostedBatch, metric_names};
 use crate::da_store::FsBlobStore;
 use crate::l1::post_batch;
 
-use super::cursor::{BatchCursor, read_l1_truth};
+use super::cursor::{BatchCursor, L1Truth, read_l1_truth};
 use super::live_metric_names;
 
 /// A streaming L1 sender. It posts one packed group at a time, strictly
@@ -150,22 +150,7 @@ impl<P: Provider> LiveSender<P> {
         let next_index = self.next_index()?;
         match truth {
             Ok(t) if t.last_batch_index == next_index => {
-                if t.covered_through_block == batch.l2_block_end {
-                    info!(
-                        batch_index = t.last_batch_index,
-                        "post reconciled on-chain as ours after send error"
-                    );
-                    self.prev_index = next_index;
-                    return Ok(true);
-                }
-                bail!(
-                    "lastBatchIndex advanced to {} covering block {} but our batch \
-                     ends at {} — a second batcher is writing; refusing to continue \
-                     (send error was: {e})",
-                    t.last_batch_index,
-                    t.covered_through_block,
-                    batch.l2_block_end,
-                );
+                return self.reconcile_matched_index(t, next_index, batch, e);
             }
             Ok(t) if t.last_batch_index > next_index => bail!(
                 "lastBatchIndex jumped from {} to {} — a second batcher is writing; \
@@ -177,6 +162,34 @@ impl<P: Provider> LiveSender<P> {
             Err(re) => warn!(error = %format!("{re:#}"), "reconcile read failed"),
         }
         Ok(false)
+    }
+
+    /// Handle the reconcile case where L1's `lastBatchIndex` now equals
+    /// what this sender expected to post next: the failed send may have
+    /// landed as ours. Returns `Ok(true)` when it did.
+    fn reconcile_matched_index(
+        &mut self,
+        t: L1Truth,
+        next_index: u64,
+        batch: &PostedBatch,
+        e: &crate::error::BatcherError,
+    ) -> Result<bool> {
+        if t.covered_through_block != batch.l2_block_end {
+            bail!(
+                "lastBatchIndex advanced to {} covering block {} but our batch \
+                 ends at {} — a second batcher is writing; refusing to continue \
+                 (send error was: {e})",
+                t.last_batch_index,
+                t.covered_through_block,
+                batch.l2_block_end,
+            );
+        }
+        info!(
+            batch_index = t.last_batch_index,
+            "post reconciled on-chain as ours after send error"
+        );
+        self.prev_index = next_index;
+        Ok(true)
     }
 
     /// `self.prev_index + 1`, the batch index this sender's next post must

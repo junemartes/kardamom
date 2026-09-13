@@ -340,6 +340,16 @@ impl BlockGen<'_> {
     }
 }
 
+/// The first five nibbles of the hashed key of `a`. The high nibble of a
+/// byte comes first.
+fn nibs5(a: &Address) -> [u8; 5] {
+    let hash = keccak256(a);
+    std::array::from_fn(|i| {
+        let byte = hash[i / 2];
+        if i % 2 == 0 { byte >> 4 } else { byte & 0x0f }
+    })
+}
+
 /// This test constructs, deterministically, the exact geometry that an
 /// earlier removal scheme missed. It mines addresses whose hashed keys
 /// share nibble prefixes:
@@ -363,13 +373,6 @@ impl BlockGen<'_> {
               comment above names; renaming them would make the two disagree"
 )]
 fn extension_collapse_regrow_no_stale_orphans() {
-    fn nibs5(a: &Address) -> [u8; 5] {
-        let h = keccak256(a);
-        std::array::from_fn(|i| {
-            let b = h[i / 2];
-            if i % 2 == 0 { b >> 4 } else { b & 0x0f }
-        })
-    }
     // Mine an address whose first five hashed-key nibbles satisfy `pred`.
     // A salted address never collides with `a` below, because its tail
     // bytes are non-zero.
