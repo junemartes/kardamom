@@ -125,6 +125,9 @@ job "da-watcher" {
         # The UDP ports the discovered tx_deposits and tx_remote_epochs
         # publications bind on this node.
         KARDAMOM_MDC_PORTS = "40330-40339"
+        # Bind the exporter on the node, not loopback, so the monitoring
+        # job scrapes it off-node.
+        KARDAMOM_METRICS_ADDR = "0.0.0.0:9005"
       }
 
       # Cluster LogConfig (Aeron streams and discovery), read through

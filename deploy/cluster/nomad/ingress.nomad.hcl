@@ -196,6 +196,10 @@ job "ingress" {
         # node: one control endpoint per lane. Uniqueness comes from the
         # node IP; one ingress runs per node. See docs/aeron-discovery.md.
         KARDAMOM_MDC_PORTS = "40300-40319"
+        # Bind the exporter on the node, not loopback, so the monitoring
+        # job scrapes it off-node. The port is the ingress convention,
+        # 9006 (the validator uses the same number on the aux node).
+        KARDAMOM_METRICS_ADDR = "0.0.0.0:9006"
       }
 
       # Presence-checked config. Content lives in config/ingress.toml.
