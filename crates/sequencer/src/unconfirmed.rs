@@ -138,7 +138,7 @@ impl<T> UnconfirmedLedger<T> {
             match self.expire_step(now, timeout) {
                 ControlFlow::Break(()) => break,
                 ControlFlow::Continue(Some(key)) => stale.push(key),
-                ControlFlow::Continue(None) => {}
+                ControlFlow::Continue(None) => (),
             }
         }
         self.take_descending(stale)

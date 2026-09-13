@@ -81,27 +81,28 @@ async fn drain_receipts(
 fn record_receipt_item(item: Result<serde_json::Value, serde_json::Error>, tracker: &Tracker) {
     let Ok(v) = item else { return };
     match v["type"].as_str() {
-        Some("receipt") => {
-            let r = &v["receipt"];
-            let Some(hash) = r["transactionHash"]
-                .as_str()
-                .and_then(|s| s.parse::<alloy_primitives::B256>().ok())
-            else {
-                return;
-            };
-            let status = json_hex_u64(&r["status"]).unwrap_or(0);
-            let gas = json_hex_u64(&r["gasUsed"]).unwrap_or(0);
-            tracker.confirm_from_feed(hash, status, gas);
-        }
-        Some("txError") => {
-            tracing::warn!(payload = %v, "receipt feed: sequencer rejection");
-        }
-        Some("lagged") => {
-            tracing::warn!(
-                payload = %v,
-                "receipt feed: lagged — drain will settle the gap"
-            );
-        }
+        Some("receipt") => record_receipt(&v, tracker),
+        Some("txError") => tracing::warn!(payload = %v, "receipt feed: sequencer rejection"),
+        Some("lagged") => tracing::warn!(
+            payload = %v,
+            "receipt feed: lagged — drain will settle the gap"
+        ),
         _ => {}
     }
+}
+
+/// Confirm one `receipt`-type feed item into `tracker`.
+///
+/// Does nothing for a receipt with no parseable `transactionHash`.
+fn record_receipt(v: &serde_json::Value, tracker: &Tracker) {
+    let r = &v["receipt"];
+    let Some(hash) = r["transactionHash"]
+        .as_str()
+        .and_then(|s| s.parse::<alloy_primitives::B256>().ok())
+    else {
+        return;
+    };
+    let status = json_hex_u64(&r["status"]).unwrap_or(0);
+    let gas = json_hex_u64(&r["gasUsed"]).unwrap_or(0);
+    tracker.confirm_from_feed(hash, status, gas);
 }
