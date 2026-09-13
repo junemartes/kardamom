@@ -182,9 +182,9 @@ struct Args {
         value_delimiter = ','
     )]
     executor_query_endpoints: Vec<String>,
-    /// Whether the submit path rejects a past nonce and an unfunded
-    /// sender from the local account layer. `false` publishes every
-    /// submit, as before the layer existed.
+    /// Whether the submit path rejects an unfunded sender from the local
+    /// account layer. `false` publishes every submit, as before the
+    /// layer existed.
     #[arg(
         long = "admission-checks",
         env = "KARDAMOM_ADMISSION_CHECKS",

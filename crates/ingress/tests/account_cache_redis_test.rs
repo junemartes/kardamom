@@ -136,17 +136,18 @@ async fn an_unfunded_sender_rejects_only_while_the_head_is_fresh() {
 
 #[tokio::test]
 #[ignore = "requires Docker; run with `cargo test --features docker-e2e -- --ignored`"]
-async fn a_past_nonce_with_no_indexed_receipt_is_a_duplicate() {
+async fn a_past_nonce_with_no_indexed_receipt_publishes() {
     let (_c, cfg) = kardamom_cache::testing::redis().await;
     let f = Fixture::new(&cfg).await;
     let signer = PrivateKeySigner::random();
     f.seed(signer.address(), 3, LEGACY_COST * 10).await;
-    let err = f
-        .proxy
+    // The projection knows nonce 3, but no index holds a receipt for
+    // nonce 2: the receipt index can lag the account rows. The sequencer
+    // decides.
+    f.proxy
         .submit_raw_async(IP, sign_legacy(&signer, 2))
         .await
-        .unwrap_err();
-    assert!(matches!(err, IngressError::Duplicate(_)), "{err:?}");
+        .expect("a past nonce with no receipt publishes");
     // An unknown sender admits, with Redis on as with it off.
     let other = PrivateKeySigner::random();
     f.proxy

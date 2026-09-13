@@ -24,8 +24,8 @@ The ingress and the sequencer have no shared view of the account state.
 The ingress and the sequencer are stateless and scale horizontally today. Redis does not add
 scale. It adds capability:
 
-1. Admission checks at the door. The ingress rejects nonce-too-low and insufficient funds
-   before the sequencer and the sealer see the transaction.
+1. Admission checks at the door. The ingress rejects insufficient funds, and a transaction
+   at a nonce a receipt proves taken, before the sequencer and the sealer see it.
 2. The ingress serves `eth_getTransactionCount` and `eth_getBalance`.
 3. The sequencer's cold-sender lookup becomes one GET, not an mdbx snapshot per call.
 4. Retry answers survive an ingress restart and are shared across replicas.
@@ -222,10 +222,12 @@ needed: admission reads one sender.
   entry in every layer means unknown, and unknown admits. The nonce check runs first, and
   it is free for a warm sender. On `nonce < stored.nonce`, consult the local receipt cache,
   then the Redis `rcpt` key. Answer with the receipt through the existing `tx_hash` identity
-  guard, or with `IngressError::Duplicate` (`-32602`) when no receipt exists. The receipt
-  index is what makes the nonce-too-low reject safe for a retry: a client that resubmits a
-  landed transaction gets its receipt, on any replica, after any restart. This keeps the S5
-  retry contract and makes it faster. `nonce >= stored.nonce` always publishes.
+  guard: the same hash gets its receipt, another hash is `IngressError::Duplicate`
+  (`-32602`). With no receipt in either index, publish: the account layer can lead the
+  receipt indexes (see the PR 4 note in section 11). A client that resubmits a landed
+  transaction gets its receipt, on any replica, after any restart, when an index holds it.
+  This keeps the S5 retry contract and makes it faster. `nonce >= stored.nonce` always
+  publishes.
   `balance < cost` rejects as `IngressError::InsufficientFunds`, code `-32000`, message
   `insufficient funds for gas * price + value`. `cost = gas_limit * max_fee_per_gas + value`
   with `checked_mul` and `checked_add` on `U256`. A legacy envelope uses `gas_price`. An
@@ -387,7 +389,7 @@ Add `eth_getBalance` next to `eth_getTransactionCount`, same wire shape, plus an
   `republished_prefix_carries_identical_rows`.
 - Validator: `validator_halts_on_a_forged_row`.
 - Ingress: `cache_miss_admits`, `receipt_cache_answers_before_nonce_floor_rejects`,
-  `nonce_too_low_maps_to_32602`, `future_nonce_is_never_rejected`,
+  `past_nonce_without_a_receipt_publishes`, `future_nonce_is_never_rejected`,
   `stale_head_skips_both_checks`, `insufficient_funds_rejects_when_fresh`,
   `cache_error_admits`, `local_hit_makes_no_redis_call`,
   `receipt_release_happens_after_rows_apply`.
@@ -501,20 +503,29 @@ Deviations from the design above, recorded as they land.
   layer's capacity bounds resident accounts, not writes, and defaults to 2^18 (about 30 MB)
   so the layer holds every account touched within the TTL at the load-shard rate. The
   sequencer applies only the rows of its own vslots, the same filter as its receipts, so it
-  never holds every account of the chain. A row window exists between the pump applying a
-  batch's rows and the receipt watcher populating the receipt cache: a retry that lands in
-  that window gets a bare `Duplicate` instead of its receipt. The Redis receipt index of PR
-  4b narrows it (the mirror is one more hop from the same source, so it cannot close it).
-  The chain-semantics scenarios of 9.2 ship with PR 5. The ingress query client lives in
-  `kardamom_cache::query`; the sequencer keeps its own until PR 4b.
+  never holds every account of the chain. **A past nonce publishes.** The read rule's
+  `Duplicate` for a past nonce with no receipt conflicts with the fallback rule, and the
+  fallback rule wins. The layer can know a nonce whose receipt this ingress never caches:
+  the pump applies a batch's rows at once, while the receipts travel a bounded broadcast
+  bus that drops them for a lagging watcher (and before the watcher subscribes). A reject
+  there answers a retry of a landed transaction with `Duplicate` for good, where the
+  sequencer path lets the client's retries find the receipt. `s16` on #309 failed exactly
+  so: nonce 19 of a moved sender, right after the ingress restart. Before this stack, the
+  same lost receipt was the known `s16` flake "did not land after 40 attempts". The door
+  rejects a past nonce only on proof: a receipt for the (sender, nonce) with another hash.
+  A past nonce with no receipt counts `kardamom_cache_degraded_total{reason="past-nonce"}`. The chain-semantics scenarios of 9.2 ship with PR 5. The ingress query
+  client lives in `kardamom_cache::query`; the sequencer keeps its own until PR 4b.
 - **PR 4b (Redis readers behind `[cache]`).** The reader never stalls on Redis:
   `CacheReader::spawn` returns at once, a background task connects with a backoff and polls
   the mirror heads every 100 ms, and every read before the first connection, during a
   reconnect, past the timeout, or on an error answers "unknown" and counts a degraded read.
   A read during a reconnect is skipped rather than paid, so an outage does not cost every
   cold submit the full timeout. Only the balance check is gated on freshness: a committed
-  nonce from any layer is a lower bound on the truth, so a past-nonce reject from a stale
-  entry is still correct, and a stale-low balance is the only false reject. This deviates
+  nonce from any layer is a lower bound on the truth, and a past nonce rejects only on a
+  receipt with another hash, so a stale-low balance is the only false reject. The Redis
+  receipt index can lag the local layer, so a past nonce with no receipt in Redis publishes
+  too; the local receipt cache is read again first, for a receipt that arrived after the
+  submit's first read. This deviates
   from 5.4, which skipped both checks. The staleness unit is canonical records
   (`BPosition::as_index`, the sealer's republished record count), not bytes. The mirror
   count the reader polls is the executor count, passed by the binary, not a config knob.
