@@ -25,7 +25,7 @@ use kardamom_types::{BPosition, EpochRecord};
 
 use crate::error::SequencerError;
 use crate::outbound::TxOrderingRefPublisher;
-use crate::pump::Pump;
+use crate::pump::{OriginLane, Pump};
 
 /// Subscription surface that the epoch pump reads from. Production wiring
 /// binds this to the real `log::TxDepositsSubscriber`. Tests use the
@@ -50,38 +50,28 @@ impl EpochSubscriber for TxDepositsSubscriberHandle {
     }
 }
 
-/// Single-step epoch pump. Takes the held epoch if there is one, else
-/// pulls one epoch off the subscription, and forwards it on `tx_ordering`.
-/// Returns `Ok(true)` if it processed an epoch (the caller should keep
-/// going), or `Ok(false)` if the subscription is idle.
+/// The epoch lane. Takes the held epoch if there is one, else pulls one
+/// epoch off the subscription, and forwards it on `tx_ordering`.
 ///
-/// On `SequencerError::Backpressure` the epoch goes into `pump`'s held
-/// slot, and the next call retries the SAME epoch before it polls for a
-/// new one. The poll is destructive (`try_recv`), so without this slot a
+/// On `SequencerError::Backpressure` the epoch goes into the held slot,
+/// and the next call retries the SAME epoch before it polls for a new
+/// one. The poll is destructive (`try_recv`), so without this slot a
 /// backpressured epoch would be lost, and the L1 origin sequence would
 /// have a permanent hole. `Backpressure` includes "not connected", so a
 /// leader election would otherwise drain every sequencer's backlog at
 /// once.
 ///
 /// Epochs carry no metric to bump on relay (unlike remote epochs, see
-/// [`crate::remote_epoch::process_remote_epoch`]), so this is
-/// [`Pump::step`] with a no-op `on_relayed` hook.
-///
-/// # Errors
-///
-/// Returns the subscription's error if the poll fails, or the
-/// publisher's error (including [`SequencerError::Backpressure`]) if the
-/// publish fails.
-pub fn process_epoch<S, P>(
-    sub: &mut S,
-    b: &mut P,
-    pump: &mut Pump<EpochRecord>,
-) -> Result<bool, SequencerError>
+/// [`crate::remote_epoch`]), so this is [`Pump::step`] with a no-op
+/// `on_relayed` hook.
+impl<S, P> OriginLane<S, P> for Pump<EpochRecord>
 where
     S: EpochSubscriber,
     P: TxOrderingRefPublisher,
 {
-    pump.step(|| sub.poll(), |epoch| b.try_publish_epoch(epoch), |_| {})
+    fn relay(&mut self, sub: &mut S, publ: &mut P) -> Result<bool, SequencerError> {
+        self.step(|| sub.poll(), |epoch| publ.try_publish_epoch(epoch), |_| {})
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -133,7 +123,7 @@ mod tests {
         let e = epoch(100, 3);
         sub.push(BPosition::default(), e.clone());
 
-        assert!(process_epoch(&mut sub, &mut pubr, &mut Pump::default()).unwrap());
+        assert!(Pump::default().relay(&mut sub, &mut pubr).unwrap());
 
         let got = pubr.epochs.lock().unwrap();
         assert_eq!(got.len(), 1);
@@ -148,7 +138,7 @@ mod tests {
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
         sub.push(BPosition::default(), epoch(101, 0));
 
-        assert!(process_epoch(&mut sub, &mut pubr, &mut Pump::default()).unwrap());
+        assert!(Pump::default().relay(&mut sub, &mut pubr).unwrap());
         assert_eq!(pubr.epochs.lock().unwrap().len(), 1);
     }
 
@@ -157,6 +147,6 @@ mod tests {
     /// contract every `ScriptedQueue<T>`-backed pump shares.
     #[test]
     fn epoch_pump_honors_the_shared_contract() {
-        crate::fakes::pump_contract::run(&epoch(102, 1), &epoch(103, 0), process_epoch);
+        crate::fakes::pump_contract::run(&epoch(102, 1), &epoch(103, 0));
     }
 }

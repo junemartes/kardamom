@@ -1,0 +1,21 @@
+# Managed by Ansible (roles/autoscaler).
+[Unit]
+Description=Nomad Autoscaler
+Documentation=https://developer.hashicorp.com/nomad/tools/autoscaling
+Wants=nomad.service
+After=nomad.service network-online.target
+Requires=network-online.target
+ConditionFileNotEmpty={{ autoscaler_config_dir }}/autoscaler.hcl
+
+[Service]
+User=nomad-autoscaler
+Group=nomad-autoscaler
+ExecStart=/usr/local/bin/nomad-autoscaler agent -config {{ autoscaler_config_dir }}/autoscaler.hcl
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

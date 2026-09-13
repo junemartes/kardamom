@@ -8,7 +8,7 @@
 //! Otherwise it reports "not yet", and the caller retries later. Submission
 //! is permissionless on the contract; the proof is the authorization.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use alloy_primitives::Address;
 use alloy_provider::Provider;
@@ -44,80 +44,98 @@ pub enum SubmitOutcome {
     ProofNotReady { batch_index: u64 },
 }
 
-/// Submit the next unproven batch's proof, if the batch and its proof
-/// files both exist. `proofs_dir` holds the zk-host layout:
-/// `batch-<first>-<last>/{public-values.bin, proof.bin}`.
-///
-/// # Errors
-/// Returns an error when an L1 call fails, when `public-values.bin` is
-/// malformed or disagrees with the settlement's stored entry, or when
-/// `submitBatchProof` reverts.
-pub async fn submit_next_proof<P: Provider>(
-    provider: P,
-    oracle_addr: Address,
-    proofs_dir: &Path,
-) -> Result<SubmitOutcome, BatcherError> {
-    let oracle = IKardamomProofOracle::new(oracle_addr, &provider);
-    let last_finalized = oracle
-        .lastFinalizedBatch()
-        .call()
-        .await
-        .map_err(|e| BatcherError::L1(format!("lastFinalizedBatch: {e}")))?;
-    let next = last_finalized
-        .checked_add(1)
-        .ok_or_else(|| BatcherError::L1("lastFinalizedBatch overflowed u64".into()))?;
+/// The proof submitter: the proof oracle it submits to, and the zk-host
+/// output directory it reads proofs from.
+pub struct ProofSubmitter {
+    oracle: Address,
+    proofs_dir: PathBuf,
+}
 
-    let settlement_addr = oracle
-        .settlement()
-        .call()
-        .await
-        .map_err(|e| BatcherError::L1(format!("oracle.settlement: {e}")))?;
-    let settlement = IKardamomL2Settlement::new(settlement_addr, &provider);
-    let entry = settlement
-        .batches(next)
-        .call()
-        .await
-        .map_err(|e| BatcherError::L1(format!("settlement.batches({next}): {e}")))?;
-    if entry.recordsCommitment == alloy_primitives::B256::ZERO {
-        return Ok(SubmitOutcome::NoBatchPosted { batch_index: next });
+impl ProofSubmitter {
+    #[must_use]
+    pub fn new(oracle: Address, proofs_dir: &Path) -> Self {
+        Self {
+            oracle,
+            proofs_dir: proofs_dir.to_path_buf(),
+        }
     }
 
-    let dir = proofs_dir.join(format!("batch-{}-{}", entry.l2BlockStart, entry.l2BlockEnd));
-    let Ok(pv) = std::fs::read(dir.join("public-values.bin")) else {
-        return Ok(SubmitOutcome::ProofNotReady { batch_index: next });
-    };
-    let Ok(proof) = std::fs::read(dir.join("proof.bin")) else {
-        return Ok(SubmitOutcome::ProofNotReady { batch_index: next });
-    };
+    /// Submit the next unproven batch's proof, if the batch and its proof
+    /// files both exist. The proofs directory holds the zk-host layout:
+    /// `batch-<first>-<last>/{public-values.bin, proof.bin}`.
+    ///
+    /// # Errors
+    /// Returns an error when an L1 call fails, when `public-values.bin` is
+    /// malformed or disagrees with the settlement's stored entry, or when
+    /// `submitBatchProof` reverts.
+    pub async fn submit_next<P: Provider>(
+        &self,
+        provider: P,
+    ) -> Result<SubmitOutcome, BatcherError> {
+        let oracle = IKardamomProofOracle::new(self.oracle, &provider);
+        let last_finalized = oracle
+            .lastFinalizedBatch()
+            .call()
+            .await
+            .map_err(|e| BatcherError::L1(format!("lastFinalizedBatch: {e}")))?;
+        let next = last_finalized
+            .checked_add(1)
+            .ok_or_else(|| BatcherError::L1("lastFinalizedBatch overflowed u64".into()))?;
 
-    // Fail fast on the client side for anything the contract would reject.
-    // This is cheaper than a revert, and gives a precise error instead of a
-    // raw one.
-    let decoded = BatchPublicOutputs::decode(&pv)
-        .ok_or_else(|| BatcherError::L1("malformed public-values.bin".into()))?;
-    if decoded.first_block != entry.l2BlockStart
-        || decoded.last_block != entry.l2BlockEnd
-        || decoded.records_commitment != entry.recordsCommitment
-    {
-        return Err(BatcherError::L1(format!(
-            "proof files for batch {next} do not match the posted entry \
+        let settlement_addr = oracle
+            .settlement()
+            .call()
+            .await
+            .map_err(|e| BatcherError::L1(format!("oracle.settlement: {e}")))?;
+        let settlement = IKardamomL2Settlement::new(settlement_addr, &provider);
+        let entry = settlement
+            .batches(next)
+            .call()
+            .await
+            .map_err(|e| BatcherError::L1(format!("settlement.batches({next}): {e}")))?;
+        if entry.recordsCommitment == alloy_primitives::B256::ZERO {
+            return Ok(SubmitOutcome::NoBatchPosted { batch_index: next });
+        }
+
+        let dir = self
+            .proofs_dir
+            .join(format!("batch-{}-{}", entry.l2BlockStart, entry.l2BlockEnd));
+        let Ok(pv) = std::fs::read(dir.join("public-values.bin")) else {
+            return Ok(SubmitOutcome::ProofNotReady { batch_index: next });
+        };
+        let Ok(proof) = std::fs::read(dir.join("proof.bin")) else {
+            return Ok(SubmitOutcome::ProofNotReady { batch_index: next });
+        };
+
+        // Fail fast on the client side for anything the contract would reject.
+        // This is cheaper than a revert, and gives a precise error instead of a
+        // raw one.
+        let decoded = BatchPublicOutputs::decode(&pv)
+            .ok_or_else(|| BatcherError::L1("malformed public-values.bin".into()))?;
+        if decoded.first_block != entry.l2BlockStart
+            || decoded.last_block != entry.l2BlockEnd
+            || decoded.records_commitment != entry.recordsCommitment
+        {
+            return Err(BatcherError::L1(format!(
+                "proof files for batch {next} do not match the posted entry \
              (range {}..={} vs {}..={})",
-            decoded.first_block, decoded.last_block, entry.l2BlockStart, entry.l2BlockEnd
-        )));
-    }
+                decoded.first_block, decoded.last_block, entry.l2BlockStart, entry.l2BlockEnd
+            )));
+        }
 
-    let receipt = oracle
-        .submitBatchProof(next, pv.into(), proof.into())
-        .send()
-        .await
-        .map_err(|e| BatcherError::L1(format!("submitBatchProof({next}): {e}")))?
-        .get_receipt()
-        .await
-        .map_err(|e| BatcherError::L1(format!("submitBatchProof({next}) receipt: {e}")))?;
-    if !receipt.status() {
-        return Err(BatcherError::L1(format!(
-            "submitBatchProof({next}) reverted on-chain"
-        )));
+        let receipt = oracle
+            .submitBatchProof(next, pv.into(), proof.into())
+            .send()
+            .await
+            .map_err(|e| BatcherError::L1(format!("submitBatchProof({next}): {e}")))?
+            .get_receipt()
+            .await
+            .map_err(|e| BatcherError::L1(format!("submitBatchProof({next}) receipt: {e}")))?;
+        if !receipt.status() {
+            return Err(BatcherError::L1(format!(
+                "submitBatchProof({next}) reverted on-chain"
+            )));
+        }
+        Ok(SubmitOutcome::Submitted { batch_index: next })
     }
-    Ok(SubmitOutcome::Submitted { batch_index: next })
 }

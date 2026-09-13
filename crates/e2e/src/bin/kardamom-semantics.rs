@@ -19,10 +19,10 @@
 //!
 //! ```text
 //! kardamom-semantics \
-//!   --rpc http://192.168.56.31:8545 --chain-id 412346 \
-//!   --executor-metrics 192.168.56.41:9004,192.168.56.42:9004,192.168.56.43:9004 \
-//!   --sequencer-metrics 192.168.56.21:9001,192.168.56.22:9001 \
-//!   --validator-metrics 192.168.56.61:9006 \
+//!   --rpc http://<ingress-0>:8545 --chain-id 412346 \
+//!   --executor-metrics <executor-0>:9004,<executor-1>:9004,<executor-2>:9004 \
+//!   --sequencer-metrics <sequencer-0>:9001,<sequencer-1>:9001 \
+//!   --validator-metrics <aux-0>:9006 \
 //!   --cases nonce-unordered,nonce-gap,rpc-liveness,consistency
 //! ```
 
@@ -243,6 +243,16 @@ async fn l1_batch_case(t: &Target, l1: Option<(&str, alloy_primitives::Address)>
     l1_batch::l1_batch(t, rpc, settlement).await
 }
 
+/// Print a note when ingress `/metrics` is unreachable.
+///
+/// Only the queue-depth probe needs ingress metrics, and Target L
+/// already covers it.
+fn warn_if_no_ingress_metrics(have_ingress_metrics: bool) {
+    if !have_ingress_metrics {
+        println!("    (ingress /metrics not reachable — queue-depth probe skipped)");
+    }
+}
+
 async fn run_case(
     case: &str,
     t: &Target,
@@ -265,11 +275,7 @@ async fn run_case(
             .await
         }
         "rpc-liveness" => {
-            if !have_ingress_metrics {
-                // Only the queue-depth probe needs ingress metrics, and
-                // Target L already covers it.
-                println!("    (ingress /metrics not reachable — queue-depth probe skipped)");
-            }
+            warn_if_no_ingress_metrics(have_ingress_metrics);
             rpc_liveness::run(
                 t,
                 rpc_liveness::Params {

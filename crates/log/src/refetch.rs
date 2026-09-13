@@ -34,7 +34,6 @@
 //! so a dead archive node (for example the chaos suite killing an ingress
 //! driver) costs one short attempt before the mirror serves the range.
 
-use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -43,9 +42,12 @@ use kardamom_types::{BPosition, Deposit, TxDataLoc, TxEnvelope};
 use rusteron_archive::AeronArchiveReplayParams;
 use tracing::{info, warn};
 
-use crate::aeron_live::{AeronRuntime, PollRecv, TxDataSubscription, TypedSubscription};
+use tokio::sync::watch;
+
+use crate::aeron_live::{AeronRuntime, PollRecv};
 use crate::archive_catalog::ArchiveCatalog;
 use crate::config::{AeronConfig, ChannelUri};
+use crate::discovery::{ArchiveRecord, Membership, Topic};
 use crate::error::LogError;
 use crate::recorder::{ArchiveSession, connect_archive_with_timeout};
 use crate::term_layout::TermLayout;
@@ -59,13 +61,64 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// cap still applies.
 const DRAIN_IDLE: Duration = Duration::from_millis(500);
 const DRAIN_CAP: Duration = Duration::from_secs(8);
+/// The first replay stream id. Stream ids are scoped to a channel, and the
+/// replay endpoint is this client's own, so the range only has to stay
+/// clear of the live stream ids on the same driver, which sit far below.
+const REPLAY_STREAM_BASE: i32 = 1 << 30;
+
+/// The channel one replay lands on: the replay endpoint, pinned to the
+/// recorded session id. The subscription and the archive's replay
+/// publication use the same string.
+fn replay_sub_uri(endpoint: &str, session_id: i32) -> String {
+    format!("aeron:udp?endpoint={endpoint}|session-id={session_id}")
+}
+
+/// Where the refetch client reads the archive control endpoints of one
+/// topic: a static list from the config, or the live archive records the
+/// catalog lists. Read at every refetch, so a discovered archive that
+/// joins or leaves changes the next attempt, never the current one.
+pub enum EndpointSource {
+    Static(Vec<String>),
+    Discovered {
+        topic: Topic,
+        archives: watch::Receiver<Membership>,
+    },
+}
+
+impl EndpointSource {
+    /// The endpoints to try now, as `host:port`.
+    #[must_use]
+    pub fn current(&self) -> Vec<String> {
+        match self {
+            Self::Static(list) => list.clone(),
+            Self::Discovered { topic, archives } => archives
+                .borrow()
+                .entries
+                .values()
+                .filter_map(|e| ArchiveRecord::from_entry(e).ok())
+                .filter(|a| a.records(*topic))
+                .map(|a| a.control.to_string())
+                .collect(),
+        }
+    }
+
+    /// Whether this source can ever name an endpoint: a non-empty static
+    /// list, or any discovered source.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        match self {
+            Self::Static(list) => !list.is_empty(),
+            Self::Discovered { .. } => true,
+        }
+    }
+}
 
 /// Node-local transport config for the refetch client.
 pub struct RefetchConfig {
-    /// Remote archive control endpoints (`host:port`) recording `tx_data`.
-    pub tx_data_endpoints: Vec<String>,
-    /// Remote archive control endpoints (`host:port`) recording `tx_deposits`.
-    pub tx_deposits_endpoints: Vec<String>,
+    /// Remote archive control endpoints recording `tx_data`.
+    pub tx_data_endpoints: EndpointSource,
+    /// Remote archive control endpoints recording `tx_deposits`.
+    pub tx_deposits_endpoints: EndpointSource,
     /// This node's UDP endpoint (`host:port`) for archive control responses.
     pub response_endpoint: String,
     /// This node's UDP endpoint (`host:port`) that replayed fragments land
@@ -92,13 +145,9 @@ pub struct ArchiveRefetcher {
     /// disagree.
     live: Option<Live>,
     next_endpoint: usize,
-    /// Replay subscriptions per `(stream_id, publisher session)`. The
-    /// runtime has no close-subscription call, so entries are reused across
-    /// refetches: a new bounded replay onto the same channel forms a fresh
-    /// image on the same subscription. This map stays small, bounded by
-    /// publisher restarts.
-    tx_data_subs: HashMap<(i32, i32), TxDataSubscription>,
-    deposit_subs: HashMap<(i32, i32), TypedSubscription<Deposit>>,
+    /// The replays started so far. Each one runs on its own replay
+    /// stream id and its own subscription; see [`Self::replay_stream_id`].
+    replays: u32,
 }
 
 /// A live archive control session and the endpoint it is connected to.
@@ -129,6 +178,14 @@ struct FoundRecording {
     term_layout: Result<TermLayout, String>,
 }
 
+/// Spawn the dedicated replay runtime, pointed at `aeron_dir` when given.
+fn spawn_runtime(aeron_dir: Option<&std::path::Path>) -> Result<AeronRuntime, LogError> {
+    match aeron_dir {
+        Some(dir) => AeronRuntime::spawn_with_dir(dir),
+        None => AeronRuntime::spawn_default(),
+    }
+}
+
 impl ArchiveRefetcher {
     #[must_use]
     pub fn new(cfg: RefetchConfig) -> Self {
@@ -137,9 +194,25 @@ impl ArchiveRefetcher {
             rt: None,
             live: None,
             next_endpoint: 0,
-            tx_data_subs: HashMap::new(),
-            deposit_subs: HashMap::new(),
+            replays: 0,
         }
+    }
+
+    /// The stream id of the next bounded replay, and the count moves on.
+    ///
+    /// Every replay is a new publication on the archive, pinned to the
+    /// recorded session id so the frames keep their recorded session.
+    /// Two replays of one recording on one stream id therefore share a
+    /// publication key on the archive and an image key on this driver:
+    /// the archive refuses the second while the first still lingers, and
+    /// the driver folds its first frames into the lingering image, where
+    /// they read as old data and are never delivered. A stream id of its
+    /// own gives every replay its own publication and its own image; the
+    /// archive patches the stream id into the replayed frames.
+    fn replay_stream_id(&mut self) -> i32 {
+        let id = REPLAY_STREAM_BASE.wrapping_add(i32::try_from(self.replays).unwrap_or(0));
+        self.replays = self.replays.wrapping_add(1);
+        id
     }
 
     /// Refetch `tx_data` envelopes for `stream_id` on publisher session
@@ -161,7 +234,7 @@ impl ArchiveRefetcher {
         from: BPosition,
         mut sink: impl FnMut(TxDataLoc, TxEnvelope),
     ) -> Result<u64, LogError> {
-        let endpoints = self.cfg.tx_data_endpoints.clone();
+        let endpoints = self.cfg.tx_data_endpoints.current();
         let recs = self.list_or_rotate(&endpoints, stream_id)?;
         let Some(rec) = FoundRecording::resolve_session(recs, session_id) else {
             self.rotate();
@@ -176,31 +249,22 @@ impl ArchiveRefetcher {
         // The subscription must exist before the replay starts: Aeron does
         // not replay pre-subscription history, so a subscription opened
         // after the remote archive begins streaming can miss its earliest
-        // frames. Take it out of the map (or open a fresh one) rather
-        // than look it up in place, since `ensure_session` below also
-        // needs `&mut self`, and a live borrow from `HashMap::entry`/
-        // `get_mut` cannot overlap that. Put it back once done, on
-        // every path, so a subscription is never silently dropped.
-        let key = (stream_id, rec.session_id);
-        let mut rx = if let Some(rx) = self.tx_data_subs.remove(&key) {
-            rx
-        } else {
-            let sub_uri = format!(
-                "aeron:udp?endpoint={}|session-id={}",
-                plan.endpoint, rec.session_id
-            );
-            self.ensure_runtime()?
-                .open_tx_data_subscription(&sub_uri, stream_id)?
-        };
+        // frames. It is this replay's own, on this replay's stream id,
+        // and closes once the drain ends.
+        let replay_stream = self.replay_stream_id();
+        let sub_uri = replay_sub_uri(&plan.endpoint, rec.session_id);
+        let (sub_id, mut rx) = self
+            .ensure_runtime()?
+            .open_tx_data_subscription_with_id(&sub_uri, replay_stream)?;
 
         let session = self.ensure_session(&endpoints)?;
-        let replay_result = Self::start_bounded_replay(session, &rec, stream_id, &plan);
+        let replay_result = Self::start_bounded_replay(session, &rec, replay_stream, &plan);
         let delivered = if replay_result.is_ok() {
             Self::drain(&mut rx, |(loc, env)| sink(loc, env))
         } else {
             0
         };
-        self.tx_data_subs.insert(key, rx);
+        self.close_replay_subscription(sub_id);
         if let Err(e) = replay_result {
             warn!(error = %e, "refetch: replay start failed; rotating endpoint");
             self.rotate();
@@ -249,7 +313,7 @@ impl ArchiveRefetcher {
         from: BPosition,
         mut sink: impl FnMut(BPosition, Deposit),
     ) -> Result<u64, LogError> {
-        let endpoints = self.cfg.tx_deposits_endpoints.clone();
+        let endpoints = self.cfg.tx_deposits_endpoints.current();
         let recs = self.list_or_rotate(&endpoints, stream_id)?;
         if recs.is_empty() {
             self.rotate();
@@ -280,8 +344,7 @@ impl ArchiveRefetcher {
 
         let mut delivered = 0u64;
         for (rec, plan) in plans.into_iter().filter(|(_, plan)| plan.len > 0) {
-            delivered +=
-                self.replay_one_deposit_recording(stream_id, &endpoints, &rec, &plan, &mut sink)?;
+            delivered += self.replay_one_deposit_recording(&endpoints, &rec, &plan, &mut sink)?;
         }
         info!(stream_id, delivered, "tx_deposits refetch drained");
         Ok(delivered)
@@ -294,35 +357,27 @@ impl ArchiveRefetcher {
     /// the error.
     fn replay_one_deposit_recording(
         &mut self,
-        stream_id: i32,
         endpoints: &[String],
         rec: &FoundRecording,
         plan: &ReplayPlan,
         sink: &mut impl FnMut(BPosition, Deposit),
     ) -> Result<u64, LogError> {
         // Subscription before replay start; see the matching comment in
-        // `fetch_tx_data`. Take it out of the map (or open a fresh one),
-        // and put it back once done, on every path.
-        let key = (stream_id, rec.session_id);
-        let mut rx = if let Some(rx) = self.deposit_subs.remove(&key) {
-            rx
-        } else {
-            let sub_uri = format!(
-                "aeron:udp?endpoint={}|session-id={}",
-                plan.endpoint, rec.session_id
-            );
-            self.ensure_runtime()?
-                .open_subscription::<Deposit>(&sub_uri, stream_id)?
-        };
+        // `fetch_tx_data`. This replay's own, closed once the drain ends.
+        let replay_stream = self.replay_stream_id();
+        let sub_uri = replay_sub_uri(&plan.endpoint, rec.session_id);
+        let (sub_id, mut rx) = self
+            .ensure_runtime()?
+            .open_subscription_with_id::<Deposit>(&sub_uri, replay_stream)?;
 
         let session = self.ensure_session(endpoints)?;
-        let replay_result = Self::start_bounded_replay(session, rec, stream_id, plan);
+        let replay_result = Self::start_bounded_replay(session, rec, replay_stream, plan);
         let delivered = if replay_result.is_ok() {
             Self::drain(&mut rx, |(pos, dep)| sink(pos, dep))
         } else {
             0
         };
-        self.deposit_subs.insert(key, rx);
+        self.close_replay_subscription(sub_id);
         if let Err(e) = replay_result {
             warn!(error = %e, "refetch: deposit replay start failed; rotating endpoint");
             self.rotate();
@@ -333,15 +388,24 @@ impl ArchiveRefetcher {
 
     // ---- internals --------------------------------------------------------
 
+    /// Close one replay's subscription. Best effort: a close that fails
+    /// leaves the row in the runtime's table, which is the state every
+    /// replay left behind before subscriptions closed at all.
+    fn close_replay_subscription(&self, sub_id: u32) {
+        let Some(rt) = self.rt.as_ref() else {
+            return;
+        };
+        if let Err(e) = rt.close_subscription(sub_id) {
+            warn!(sub_id, error = %e, "refetch: replay subscription did not close");
+        }
+    }
+
     /// Make sure the dedicated replay runtime is spawned, and return it.
     fn ensure_runtime(&mut self) -> Result<&AeronRuntime, LogError> {
         match &mut self.rt {
             Some(rt) => Ok(rt),
             slot @ None => {
-                let rt = match &self.cfg.aeron_dir {
-                    Some(dir) => AeronRuntime::spawn_with_dir(dir)?,
-                    None => AeronRuntime::spawn_default()?,
-                };
+                let rt = spawn_runtime(self.cfg.aeron_dir.as_deref())?;
                 Ok(slot.insert(rt))
             }
         }
@@ -521,27 +585,24 @@ impl ArchiveRefetcher {
     }
 
     /// Start a bounded replay of `[plan.from_raw, plan.from_raw +
-    /// plan.len)` onto `plan.endpoint`, pinning the original session id
-    /// so replayed frames keep their recorded headers. Returns the
-    /// replay session id.
+    /// plan.len)` onto `plan.endpoint` and `replay_stream`, pinning the
+    /// original session id so replayed frames keep their recorded
+    /// session. Returns the replay session id.
     fn start_bounded_replay(
         session: &ArchiveSession,
         rec: &FoundRecording,
-        stream_id: i32,
+        replay_stream: i32,
         plan: &ReplayPlan,
     ) -> Result<i64, LogError> {
         let params = AeronArchiveReplayParams::new(0, i32::MAX, plan.from_raw, plan.len, 0, 0)
             .map_err(|e| LogError::Aeron(format!("replay params: {e}")))?;
         let channel = crate::ffi::c_uri(
-            &format!(
-                "aeron:udp?endpoint={}|session-id={}",
-                plan.endpoint, rec.session_id
-            ),
+            &replay_sub_uri(&plan.endpoint, rec.session_id),
             "replay channel",
         )?;
         session
             .archive
-            .start_replay(rec.recording_id, &channel, stream_id, &params)
+            .start_replay(rec.recording_id, &channel, replay_stream, &params)
             .map_err(|e| LogError::Aeron(format!("start_replay: {e}")))
     }
 
@@ -558,13 +619,11 @@ impl ArchiveRefetcher {
         let deadline = Instant::now() + DRAIN_CAP;
         let mut delivered = 0u64;
         loop {
-            match drain_step(rx, deadline) {
-                ControlFlow::Break(()) => return delivered,
-                ControlFlow::Continue(item) => {
-                    deliver(item);
-                    delivered += 1;
-                }
-            }
+            let ControlFlow::Continue(item) = drain_step(rx, deadline) else {
+                return delivered;
+            };
+            deliver(item);
+            delivered += 1;
         }
     }
 }
@@ -663,9 +722,8 @@ fn recv_timeout<S: PollRecv>(
     let mut cx = Context::from_waker(&waker);
     let deadline = Instant::now() + timeout;
     loop {
-        match step(rx, &mut cx, deadline) {
-            ControlFlow::Break(result) => return result,
-            ControlFlow::Continue(()) => {}
+        if let ControlFlow::Break(result) = step(rx, &mut cx, deadline) {
+            return result;
         }
     }
 }

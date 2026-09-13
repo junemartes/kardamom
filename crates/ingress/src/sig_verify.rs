@@ -64,13 +64,34 @@ impl VerifyRequest {
     }
 }
 
-/// Takes the next request off the shared cursor. The lock guard dies
-/// with this call, before the caller starts recovery, so a worker never
-/// holds the shared cursor lock across the 42µs of ECDSA work.
-fn next_request(
-    cursor: &std::sync::Mutex<std::vec::IntoIter<VerifyRequest>>,
-) -> Option<VerifyRequest> {
-    cursor.lock_ignore_poison().next()
+/// One batch's shared work cursor. Every blocking worker pulls from the
+/// same iterator, so each request moves exactly once and a worker that
+/// starts late simply takes fewer requests.
+struct RequestCursor {
+    requests: std::sync::Mutex<std::vec::IntoIter<VerifyRequest>>,
+}
+
+impl RequestCursor {
+    fn new(batch: Vec<VerifyRequest>) -> Self {
+        Self {
+            requests: std::sync::Mutex::new(batch.into_iter()),
+        }
+    }
+
+    /// Take the next request off the cursor. The lock guard dies with
+    /// this call, before the caller starts recovery, so a worker never
+    /// holds the shared cursor lock across the 42µs of ECDSA work.
+    fn next(&self) -> Option<VerifyRequest> {
+        self.requests.lock_ignore_poison().next()
+    }
+
+    /// One worker's whole life: recover requests until the cursor runs
+    /// dry.
+    fn drain(&self) {
+        while let Some(req) = self.next() {
+            req.recover_and_respond();
+        }
+    }
 }
 
 /// A recovery ring with a bounded depth and a flush window.
@@ -89,8 +110,14 @@ fn next_request(
 /// average), so this is the common path.
 const PARALLEL_THRESHOLD: usize = 4;
 
+/// Intake capacity, as a multiple of the ring depth. A full intake
+/// makes `recover` wait, so overload turns into backpressure on the RPC
+/// handlers instead of unbounded queue growth. Four rings of slack
+/// absorb a burst while one batch is on the blocking pool.
+const INTAKE_RINGS: usize = 4;
+
 pub struct BatchVerifier {
-    tx: mpsc::UnboundedSender<VerifyRequest>,
+    tx: mpsc::Sender<VerifyRequest>,
     _flush_task: JoinHandle<()>,
 }
 
@@ -102,13 +129,27 @@ pub struct BatchVerifier {
 /// inside a loop, means neither loop's body needs to thread the other's
 /// state through as loose parameters.
 struct FlushLoop {
-    rx: mpsc::UnboundedReceiver<VerifyRequest>,
+    rx: mpsc::Receiver<VerifyRequest>,
     depth: NonZeroUsize,
     flush_window: Duration,
     parallelism: NonZeroUsize,
 }
 
 impl FlushLoop {
+    fn new(
+        rx: mpsc::Receiver<VerifyRequest>,
+        depth: NonZeroUsize,
+        flush_window: Duration,
+        parallelism: NonZeroUsize,
+    ) -> Self {
+        Self {
+            rx,
+            depth,
+            flush_window,
+            parallelism,
+        }
+    }
+
     /// Drains the channel into batches, one flush per loop iteration.
     ///
     /// `recv_many` blocks until at least one request arrives, then grabs
@@ -119,12 +160,7 @@ impl FlushLoop {
     /// of the window. This ends when the channel closes, which happens
     /// when the owning `BatchVerifier` drops.
     async fn run(mut self) {
-        loop {
-            match self.run_one_batch().await {
-                ControlFlow::Break(()) => return,
-                ControlFlow::Continue(()) => {}
-            }
-        }
+        while self.run_one_batch().await.is_continue() {}
     }
 
     /// One [`Self::run`] pass: fill a batch (racing the flush window once
@@ -139,8 +175,65 @@ impl FlushLoop {
         if buf.len() < depth {
             self.fill_until_deadline(&mut buf).await;
         }
-        BatchVerifier::process_batch(buf, self.parallelism).await;
+        self.process_batch(buf).await;
         ControlFlow::Continue(())
+    }
+
+    /// Recovers a batch off the async runtime, fanned out across the
+    /// blocking pool.
+    ///
+    /// Recovery costs 42µs of pure CPU per transaction. Running it inline
+    /// on the flush task would block a tokio worker that also serves RPC
+    /// connections. The work parallelizes easily: 23.3k tx/s on one
+    /// thread, 45.3k on two, 85.7k on four (see `tests/stage_costs.rs`).
+    ///
+    /// The ECDSA math itself cannot be batched. Recovery produces a
+    /// distinct public key for each signature, so there is no
+    /// random-linear-combination trick like Ed25519 batch verification
+    /// or BLS aggregation uses. Parallelism is the only gain available
+    /// here.
+    async fn process_batch(&self, batch: Vec<VerifyRequest>) {
+        let Some(batch_len) = NonZeroUsize::new(batch.len()) else {
+            return;
+        };
+        // Below the threshold, splitting costs more than it saves: one
+        // chunk is 42µs of work against the cost of a spawn_blocking hop.
+        let workers = if batch.len() < PARALLEL_THRESHOLD || self.parallelism == NonZeroUsize::MIN {
+            1
+        } else {
+            self.parallelism.min(batch_len).get()
+        };
+        if workers == 1 {
+            let _ = tokio::task::spawn_blocking(move || {
+                batch
+                    .into_iter()
+                    .for_each(VerifyRequest::recover_and_respond);
+            })
+            .await;
+            return;
+        }
+        // This uses a shared cursor, not a split. `split_off` reallocates
+        // and copies the remaining tail once per chunk. Handing every
+        // worker the same iterator moves each request exactly once, and
+        // allocates one Arc for the whole batch. It also load-balances:
+        // recovery costs the same per signature, but the blocking pool's
+        // threads do not start at the same time, so a worker that starts
+        // late simply takes fewer requests.
+        //
+        // Lock cost does not matter here: one uncontended acquire per
+        // request, against 42µs of ECDSA work on the other side of it.
+        let cursor = Arc::new(RequestCursor::new(batch));
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let cursor = cursor.clone();
+                tokio::task::spawn_blocking(move || cursor.drain())
+            })
+            .collect();
+        for h in handles {
+            // A panicking worker drops its senders, so the awaiting
+            // callers see the verifier as gone, instead of hanging.
+            let _ = h.await;
+        }
     }
 
     /// Races the flush window's deadline against further arrivals until
@@ -157,14 +250,13 @@ impl FlushLoop {
         };
         loop {
             let remaining = depth - buf.len();
-            tokio::select! {
+            let filled = tokio::select! {
                 biased;
                 () = tokio::time::sleep_until(deadline) => return,
-                n = self.rx.recv_many(buf, remaining) => {
-                    if n == 0 || buf.len() >= depth {
-                        return;
-                    }
-                }
+                n = self.rx.recv_many(buf, remaining) => n,
+            };
+            if filled == 0 || buf.len() >= depth {
+                return;
             }
         }
     }
@@ -185,88 +277,18 @@ impl BatchVerifier {
         flush_window: Duration,
         parallelism: NonZeroUsize,
     ) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let flush_task = tokio::spawn(
-            FlushLoop {
-                rx,
-                depth,
-                flush_window,
-                parallelism,
-            }
-            .run(),
-        );
+        let (tx, rx) = mpsc::channel(depth.get().saturating_mul(INTAKE_RINGS));
+        let flush_task = tokio::spawn(FlushLoop::new(rx, depth, flush_window, parallelism).run());
         Self {
             tx,
             _flush_task: flush_task,
         }
     }
 
-    /// Recovers a batch off the async runtime, fanned out across the
-    /// blocking pool.
-    ///
-    /// Recovery costs 42µs of pure CPU per transaction. Running it inline
-    /// on the flush task would block a tokio worker that also serves RPC
-    /// connections. The work parallelizes easily: 23.3k tx/s on one
-    /// thread, 45.3k on two, 85.7k on four (see `tests/stage_costs.rs`).
-    ///
-    /// The ECDSA math itself cannot be batched. Recovery produces a
-    /// distinct public key for each signature, so there is no
-    /// random-linear-combination trick like Ed25519 batch verification
-    /// or BLS aggregation uses. Parallelism is the only gain available
-    /// here.
-    async fn process_batch(batch: Vec<VerifyRequest>, parallelism: NonZeroUsize) {
-        let Some(batch_len) = NonZeroUsize::new(batch.len()) else {
-            return;
-        };
-        // Below the threshold, splitting costs more than it saves: one
-        // chunk is 42µs of work against the cost of a spawn_blocking hop.
-        let workers = if batch.len() < PARALLEL_THRESHOLD || parallelism == NonZeroUsize::MIN {
-            1
-        } else {
-            parallelism.min(batch_len).get()
-        };
-        if workers == 1 {
-            let _ = tokio::task::spawn_blocking(move || Self::recover_chunk(batch)).await;
-            return;
-        }
-        // This uses a shared cursor, not a split. `split_off` reallocates
-        // and copies the remaining tail once per chunk. Handing every
-        // worker the same iterator moves each request exactly once, and
-        // allocates one Arc for the whole batch. It also load-balances:
-        // recovery costs the same per signature, but the blocking pool's
-        // threads do not start at the same time, so a worker that starts
-        // late simply takes fewer requests.
-        //
-        // Lock cost does not matter here: one uncontended acquire per
-        // request, against 42µs of ECDSA work on the other side of it.
-        let cursor = Arc::new(std::sync::Mutex::new(batch.into_iter()));
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                let cursor = cursor.clone();
-                tokio::task::spawn_blocking(move || {
-                    while let Some(req) = next_request(&cursor) {
-                        req.recover_and_respond();
-                    }
-                })
-            })
-            .collect();
-        for h in handles {
-            // A panicking worker drops its senders, so the awaiting
-            // callers see the verifier as gone, instead of hanging.
-            let _ = h.await;
-        }
-    }
-
-    /// The synchronous core. Recovers each request and answers its
-    /// caller.
-    fn recover_chunk(batch: Vec<VerifyRequest>) {
-        for req in batch {
-            req.recover_and_respond();
-        }
-    }
-
     /// Submits a tx envelope, with its raw bytes, and awaits
-    /// `(sender, tx_hash)`.
+    /// `(sender, tx_hash)`. When the intake is full, this waits for a
+    /// slot, so an overloaded verifier slows its callers down instead of
+    /// growing a queue without bound.
     ///
     /// # Errors
     ///
@@ -284,6 +306,7 @@ impl BatchVerifier {
                 raw_tx,
                 respond: tx,
             })
+            .await
             .map_err(|_| IngressError::Internal("verifier dropped".into()))?;
         rx.await
             .map_err(|_| IngressError::Internal("verifier dropped".into()))?

@@ -1,0 +1,10 @@
+---
+- name: Deploy the kardamom workload pipeline
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars_files:
+    - group_vars/all.yml
+  roles:
+    - workloads

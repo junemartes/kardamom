@@ -38,6 +38,7 @@ use kardamom_engine::{
 use kardamom_executor::ExecutorFileConfig;
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::LogConfig;
+use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{StateWriter, seed_genesis};
 
 use args::Args;
@@ -62,12 +63,12 @@ struct WriterAdapters {
 /// Seed genesis into `env` if not already seeded, spawn the state
 /// writer and its adapters, open the `tx_bal` publication, and start the
 /// BAL publisher thread.
-fn spawn_writer_and_bal(
+async fn spawn_writer_and_bal(
     args: &Args,
     env: kardamom_state::StateEnv,
     genesis: Option<&kardamom_types::Genesis>,
     rt_pub: &AeronRuntime,
-    channels: &kardamom_log::config::ChannelsConfig,
+    plane: &mut StreamPlane,
 ) -> Result<WriterAdapters> {
     // Seed genesis once into a fresh env (a no-op if already seeded, for
     // example on recovery). This must run before `StateWriter::spawn`, so
@@ -103,8 +104,9 @@ fn spawn_writer_and_bal(
     // validators can cross-check their re-execution. This publishes on
     // the isolated publication runtime (`rt_pub`), like receipts, so it
     // never stalls the subscription poll.
-    let bal_pub = rt_pub
-        .open_publication(&channels.tx_bal_channel, channels.tx_bal_stream_id)
+    let bal_pub = plane
+        .tx_bal_publisher(rt_pub)
+        .await
         .context("open tx_bal publication")?;
     // EIP-7928 BAL publisher. The exec thread hands off each block's
     // captured Bal and receipts-free delta. This thread encodes and
@@ -114,16 +116,15 @@ fn spawn_writer_and_bal(
     // property. The channel has a bounded depth, so a wedged publisher
     // back-pressures exec instead of dropping state transitions.
     let (bal_tx, bal_rx) = crossbeam_channel::bounded(8);
-    let bal_publisher = std::thread::Builder::new()
-        .name("bal-publisher".into())
-        .spawn(move || kardamom_executor::bal::run_bal_publisher(bal_rx, bal_pub))
+    let bal_publisher = kardamom_executor::bal::BalPublisher::new(bal_rx, bal_pub)
+        .spawn()
         .context("spawn BAL publisher")?;
 
     // Footprint shadow. Behind `KARDAMOM_FOOTPRINT_SHADOW=1`, the exec
     // thread hands each block's tx captures to a grading thread
     // (measurement only; execution stays sequential). It is `None`
     // when the env flag is unset, for zero cost.
-    let footprint_shadow = kardamom_engine::shadow::spawn_from_env();
+    let footprint_shadow = kardamom_engine::shadow::Shadow::spawn_from_env();
 
     Ok(WriterAdapters {
         writer,
@@ -159,6 +160,87 @@ fn load_file_config(args: &Args) -> Result<ExecutorFileConfig> {
     Ok(file_cfg)
 }
 
+/// The resolved log config, the stream plane, and the two Aeron
+/// runtimes: everything [`main`] opens before it touches state.
+struct Transport {
+    aeron_cfg: kardamom_log::config::AeronConfig,
+    plane: StreamPlane,
+    rt: AeronRuntime,
+    rt_pub: AeronRuntime,
+}
+
+/// Resolve the log config and open the stream plane and the runtimes.
+///
+/// The archive-replay recovery connects its own archive client. It needs
+/// the archive control channels and media-driver dir from the
+/// `AeronConfig`, so the CLI `--aeron-dir` overrides it when given, and
+/// recovery joins the same driver as the runtime.
+///
+/// `rt_pub` is a separate Aeron runtime and thread for the `tx_receipts`
+/// publication. One Aeron thread would otherwise service both the
+/// `tx_ordering` subscription poll and the per-tx receipt and boundary
+/// publishes. Under sustained load, the publish work delays the
+/// `tx_ordering` poll past Aeron's flow-control Status-Message deadline.
+/// Then the sealer drops this subscriber, its image dies, and the
+/// executor freezes (the reader stops, and exec blocks on reading).
+/// Isolating the publisher on its own thread keeps the subscription poll
+/// timely no matter the receipt load.
+fn open_transport(args: &Args) -> Result<Transport> {
+    let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
+    let plane = StreamPlane::from_config(&log_cfg, &format!("executor-{}", args.recorder_id))
+        .context("build the stream plane")?;
+    let mut aeron_cfg = log_cfg.aeron;
+    if let Some(dir) = args.aeron_dir.as_ref() {
+        aeron_cfg.aeron_dir.clone_from(dir);
+    }
+    let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+    let rt_pub =
+        AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
+    Ok(Transport {
+        aeron_cfg,
+        plane,
+        rt,
+        rt_pub,
+    })
+}
+
+/// The one `tx_ordering` subscription, always the Aeron Cluster (Raft)
+/// egress. The cluster has already deduped and totally ordered the
+/// stream, and exposes a blocking `next()`, so no async-to-sync bridge is
+/// needed. Leader failover and reconnect, including crash-recovery replay
+/// of the canonical stream, are handled inside the cluster client, so the
+/// reader never sees an image rotation. The executor's skip-count and
+/// `DedupWindow` give idempotency across any reconnect overlap. The
+/// cluster-session guard (`LiveCluster`) must outlive the executor loop,
+/// so [`bin_support::LiveStreams`] holds it. It drops only after the
+/// shutdown wait ends.
+///
+/// The member ingress endpoints come from the catalog when discovery
+/// lists them, else from the static `[cluster]` section. The executor is
+/// the chosen emitter of the `kardamom_sealer_*` re-export, on by default
+/// in the shared subscription.
+async fn connect_cluster(
+    args: &Args,
+    file_cfg: &ExecutorFileConfig,
+    plane: &StreamPlane,
+    start: &kardamom_engine::ResumePoint,
+) -> Result<(
+    kardamom_cluster_adapter::LiveCluster,
+    bin_support::LiveTxOrderingSub,
+)> {
+    let mut cluster_cfg = file_cfg.cluster.to_live();
+    if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
+        cluster_cfg.ingress_endpoints = endpoints;
+    }
+    let connected = bin_support::connect_cluster_ordering(
+        args.aeron_dir.as_deref(),
+        cluster_cfg,
+        bin_support::cluster_replay_cursor(start),
+    )?;
+    tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
+    Ok(connected)
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     bin_support::init_tracing();
@@ -173,29 +255,12 @@ async fn main() -> Result<()> {
         "kardamom-executor starting"
     );
 
-    let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
-    let channels = log_cfg.channels;
-    // Archive-replay recovery (below) connects its own archive client. It
-    // needs the archive control channels and media-driver dir from the
-    // AeronConfig. Use the CLI `--aeron-dir` when given, so it joins the
-    // same driver as the runtime.
-    let mut aeron_cfg = log_cfg.aeron;
-    if let Some(dir) = args.aeron_dir.as_ref() {
-        aeron_cfg.aeron_dir = dir.clone();
-    }
-    let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-
-    // Separate Aeron runtime and thread for the tx_receipts publication.
-    // The executor's single Aeron thread would otherwise service both the
-    // tx_ordering subscription poll and the per-tx receipt and boundary
-    // publishes. Under sustained load, the publish work delays the
-    // tx_ordering poll past Aeron's flow-control Status-Message deadline.
-    // Then the sealer drops this subscriber from the tx_ordering MDC, its
-    // image dies, and the executor freezes (the reader stops, and exec
-    // blocks on reading). Isolating the publisher on its own thread keeps
-    // the subscription poll timely no matter the receipt load.
-    let rt_pub =
-        AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
+    let Transport {
+        aeron_cfg,
+        mut plane,
+        rt,
+        rt_pub,
+    } = open_transport(&args)?;
 
     // --- State backend and crash-recovery decision. This runs before the
     // subscriptions, because the tx_ordering subscription branches on
@@ -203,7 +268,8 @@ async fn main() -> Result<()> {
     // Load genesis (its chain_id is adopted when present).
     let (genesis, chain_id) = bin_support::resolve_genesis(args.chain.as_deref(), args.chain_id)?;
     let expected_genesis = bin_support::expected_genesis_digest(genesis.as_ref());
-    // Cancelled on the way out; stops the periodic checkpointer task.
+    // The guard in `LiveStreams` cancels this token on the way out; that
+    // stops the periodic checkpointer task.
     let shutdown = tokio_util::sync::CancellationToken::new();
     let state::PreparedState { env, start } =
         state::prepare_state(&args, expected_genesis, shutdown.clone())?;
@@ -213,40 +279,19 @@ async fn main() -> Result<()> {
     // stay live always: the reader's join-miss refetch recovers any
     // down-window or lapse gap in-band, against the remote durability
     // archives.
-    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels)?;
+    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &mut plane)?;
     let join_recovery = bin_support::archive_join_recovery(
-        &channels,
+        &mut plane,
         &aeron_cfg,
         args.aeron_dir.as_deref(),
         args.archive_control_response_endpoint.as_deref(),
         args.replay_destination_endpoint.as_deref(),
     );
 
-    // One tx_ordering subscription, always the Aeron Cluster (Raft)
-    // egress. The cluster has already deduped and totally ordered the
-    // stream, and exposes a blocking `next()`, so no async-to-sync bridge
-    // is needed. Leader failover and reconnect, including crash-recovery
-    // replay of the canonical stream, are handled inside the cluster
-    // client, so the reader never sees an image rotation. The executor's
-    // skip-count and `DedupWindow` give idempotency across any reconnect
-    // overlap. (The single-sealer restart `BoundaryMisaligned` case
-    // cannot occur here: the cluster continues the committed count and
-    // block across leader failover.) The cluster-session guard
-    // (`LiveCluster`) must outlive the executor loop, so bind the guard
-    // in the outer scope. It is dropped only after the `join` await
-    // below.
-    let (cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
-        args.aeron_dir.as_deref(),
-        file_cfg.cluster.to_live(),
-        bin_support::cluster_replay_cursor(&start),
-    )?;
-    tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
-    // The executor is the chosen emitter of the kardamom_sealer_*
-    // re-export (on by default in the shared subscription; the validator
-    // suppresses it).
-    let tx_ordering_sub = cluster_sub;
+    let (cluster_guard, tx_ordering_sub) =
+        connect_cluster(&args, &file_cfg, &plane, &start).await?;
 
-    let tx_receipts_pub = wiring::open_tx_receipts_pub(&rt_pub, &channels, &args)?;
+    let tx_receipts_pub = wiring::open_tx_receipts_pub(&rt_pub, &mut plane, &args).await?;
 
     let WriterAdapters {
         mut writer,
@@ -257,7 +302,7 @@ async fn main() -> Result<()> {
         footprint_shadow,
         _bal_publisher,
         _nonce_query,
-    } = spawn_writer_and_bal(&args, env, genesis.as_ref(), &rt_pub, &channels)?;
+    } = spawn_writer_and_bal(&args, env, genesis.as_ref(), &rt_pub, &mut plane).await?;
 
     // `verify_record_identity` stays off here by decision, not omission.
     // With the validator checking every record, a forged envelope
@@ -284,7 +329,7 @@ async fn main() -> Result<()> {
     // Run it inside spawn_blocking so the runtime stays responsive for
     // shutdown handling.
     let join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
-        Executor::run::<ExecutorWiring>(
+        Executor::<ExecutorWiring>::new(
             cfg,
             Inbound {
                 tx_data: tx_data_subs,
@@ -317,9 +362,12 @@ async fn main() -> Result<()> {
                 remote_epoch_observer: None,
             },
         )
+        .run()
     });
 
-    let engine_error = run_engine(rt, cluster_guard, shutdown, join).await;
+    let engine_error = wait_for_engine(rt, cluster_guard, shutdown, join).await;
+    // The plane's registrations deregister once the engine has stopped.
+    plane.shutdown().await;
     // Stop the state writer thread (this closes the delta channel, joins
     // it, and surfaces its final result). The executor task has finished,
     // so its adapter clones of the delta sender are already dropped.
@@ -351,77 +399,40 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Cancels the shutdown token when this drops, so a struct that holds
-/// one can end it as a normal field drop, with no `drop()` call.
-struct CancelOnDrop(tokio_util::sync::CancellationToken);
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
-
-/// The runtime and cluster guards `run_engine` holds. Rust drops
-/// struct fields in declaration order, so dropping this struct ends
-/// `rt` first, then cancels `shutdown`, then drops `cluster_guard`,
-/// the fixed order this module's own doc describes.
-#[allow(
-    dead_code,
-    reason = "each field is held only for its RAII drop order and never read"
-)]
-struct EngineHandles {
-    rt: AeronRuntime,
-    shutdown: CancelOnDrop,
-    cluster_guard: kardamom_cluster_adapter::LiveCluster,
-}
-
 /// Wait for whichever comes first: an operator shutdown signal, or the
-/// engine loop finishing on its own (a fatal stream or join error).
-/// Exiting on the first of the two, instead of only on SIGTERM, avoids
-/// an errored executor lingering "alive": metrics up, pipeline dead,
-/// instead of exiting so the orchestrator restarts it into the
-/// crash-recovery path.
-///
-/// This function owns `rt` and `cluster_guard` and drops them in a
-/// fixed order once the wait ends. Dropping the `AeronRuntime` closes
-/// every subscription's sender, so the reader threads' `blocking_recv`
-/// returns `None` and the executor sees `TxDataClosed`. In cluster
-/// mode, the `tx_ordering` reader blocks on cluster egress `recv()`,
-/// which returns `None` only once the `LiveCluster` guard drops, so the
-/// reader sees `TxOrderingClosed` next.
-async fn run_engine(
+/// engine loop finishing on its own. Then end the streams, in
+/// [`bin_support::LiveStreams`] field order, and log the outcome. Returns
+/// the engine error when the loop returned one. A panic leaves no error
+/// value.
+async fn wait_for_engine(
     rt: AeronRuntime,
     cluster_guard: kardamom_cluster_adapter::LiveCluster,
     shutdown: tokio_util::sync::CancellationToken,
-    mut join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
+    join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
 ) -> Option<ExecutorError> {
-    let handles = EngineHandles {
-        rt,
-        shutdown: CancelOnDrop(shutdown),
-        cluster_guard,
-    };
-    let engine_result = tokio::select! {
-        () = bin_support::wait_for_shutdown() => {
-            tracing::info!("kardamom-executor: shutdown signal received; dropping runtime");
+    let joined = bin_support::EngineShutdown {
+        bin_name: "kardamom-executor",
+        join,
+        streams: bin_support::LiveStreams {
+            stop: shutdown.drop_guard(),
+            rt,
+            cluster_guard,
+        },
+    }
+    .wait()
+    .await;
+    match joined {
+        Ok(Ok(())) => {
+            tracing::info!("executor main loop returned cleanly");
             None
         }
-        res = &mut join => Some(res),
-    };
-    {
-        let _released = handles;
-    }
-    let joined = match engine_result {
-        Some(r) => r,
-        None => join.await,
-    };
-    let mut engine_error: Option<ExecutorError> = None;
-    match joined {
-        Ok(Ok(())) => tracing::info!("executor main loop returned cleanly"),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "executor main loop returned an error");
-            engine_error = Some(e);
+            Some(e)
         }
-        Err(e) => tracing::error!(error = %e, "executor task panicked"),
+        Err(e) => {
+            tracing::error!(error = %e, "executor task panicked");
+            None
+        }
     }
-    engine_error
 }

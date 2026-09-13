@@ -66,8 +66,14 @@ variable "rpc_port" {
   default = 8548
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
 job "l1-light-client" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {

@@ -41,6 +41,7 @@ dashmap = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 toml = { workspace = true }
 # Only needed to sign a `LegacyTx` test fixture; optional, behind
 # `test-support`, so a production build of this crate never links a

@@ -36,8 +36,15 @@
     group: root
     mode: "0755"
     creates: /usr/local/bin/nomad
+  register: nomad_download
+  until: nomad_download is succeeded
+  retries: 5
+  delay: 10
 
 - name: Render the Nomad configuration
+  # The rendered file carries tokens on the production profile; log nothing about it there.
+  no_log: "{{ deployment_profile == 'production' }}"
+  when: not (image_build | default(false) | bool)
   ansible.builtin.template:
     src: nomad.hcl.j2
     dest: /etc/nomad.d/nomad.hcl
@@ -56,6 +63,7 @@
   notify: Restart nomad
 
 - name: Enable and start Nomad
+  when: not (image_build | default(false) | bool)
   ansible.builtin.systemd:
     name: nomad
     enabled: true

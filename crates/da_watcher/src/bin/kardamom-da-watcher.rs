@@ -21,7 +21,7 @@
 
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -37,7 +37,8 @@ use kardamom_log::aeron_live::{
     AeronRuntime, TxDepositsPublisherHandle, TxRemoteEpochsPublisherHandle,
 };
 use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
-use kardamom_log::recorder::{RecorderKind, record_stream_until_stopped};
+use kardamom_log::discovery::{DiscoveredRecorder, RecorderProgress, StreamPlane, Topic};
+use kardamom_log::recorder::{RecorderKind, RecorderThreads, record_stream_until_stopped};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -306,18 +307,22 @@ impl Args {
     /// is never treated as 0), or `--interop-start-seq` on first boot.
     fn interop_start_seq(&self, cursor_file: &CursorFile) -> anyhow::Result<u64> {
         match cursor_file.load().context("load --interop-cursor-file")? {
-            Some(persisted) => {
-                if self.interop_start_seq != 0 && self.interop_start_seq != persisted {
-                    tracing::info!(
-                        persisted,
-                        flag = self.interop_start_seq,
-                        "cursor file exists; ignoring --interop-start-seq"
-                    );
-                }
-                Ok(persisted)
-            }
+            Some(persisted) => Ok(self.resolve_persisted_start_seq(persisted)),
             None => Ok(self.interop_start_seq),
         }
+    }
+
+    /// Log when `--interop-start-seq` conflicts with a persisted cursor.
+    /// Return the value to use: the persisted cursor always wins.
+    fn resolve_persisted_start_seq(&self, persisted: u64) -> u64 {
+        if self.interop_start_seq != 0 && self.interop_start_seq != persisted {
+            tracing::info!(
+                persisted,
+                flag = self.interop_start_seq,
+                "cursor file exists; ignoring --interop-start-seq"
+            );
+        }
+        persisted
     }
 }
 
@@ -340,7 +345,7 @@ async fn main() -> anyhow::Result<()> {
     kardamom_da_watcher::metrics::describe();
 
     let resolved = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
-    serve(args, l1, interop, resolved.channels, resolved.aeron).await
+    serve(args, l1, interop, resolved).await
 }
 
 /// Run both origin watchers to completion. The Aeron runtime is scoped to
@@ -350,18 +355,21 @@ async fn serve(
     args: Args,
     l1: Option<L1Path>,
     interop: Option<InteropPath>,
-    channels: ChannelsConfig,
-    aeron_cfg: AeronConfig,
+    log_cfg: LogConfig,
 ) -> anyhow::Result<()> {
     let aeron_rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-    let service = DaWatcherService {
+    let plane =
+        StreamPlane::from_config(&log_cfg, "da-watcher").context("build the stream plane")?;
+    let mut service = DaWatcherService {
         aeron_rt,
-        channels,
-        aeron_cfg,
+        channels: log_cfg.channels,
+        aeron_cfg: log_cfg.aeron,
         aeron_dir: args.aeron_dir.clone(),
+        plane,
     };
-    let (tx_deposits_pub, tx_remote_epochs_pub) =
-        service.open_publishers(l1.is_some(), interop.is_some())?;
+    let (tx_deposits_pub, tx_remote_epochs_pub) = service
+        .open_publishers(l1.is_some(), interop.is_some())
+        .await?;
 
     // --archive-durability records tx_deposits specifically; with no L1 path
     // there is no such publication, and starting a recording on a stream this
@@ -370,11 +378,10 @@ async fn serve(
         anyhow::bail!("--archive-durability records tx_deposits and requires the L1 path");
     }
 
-    let stop = CancellationToken::new();
-    let recorder_handle = if args.archive_durability {
-        Some(service.start_deposits_recorder(&stop).await?)
+    let recorders = if args.archive_durability {
+        service.start_deposits_recorder().await?
     } else {
-        None
+        RecorderThreads::new()
     };
 
     let watchers = Watchers::spawn(
@@ -386,31 +393,29 @@ async fn serve(
     )
     .await?;
     // A panicked watcher task or an all-fail-stopped exit both return `Err`
-    // here and skip the cleanup below, exactly as a bare early return would:
-    // the recorder thread is left running, detached, for the process exit
-    // to reap.
+    // here. That return drops `recorders` in place, which stops and joins
+    // the recorder thread. The thread is past startup, so it wakes at
+    // once from its park on the stop token.
     watchers.await_shutdown_or_fail_stop().await?;
 
-    stop.cancel();
-    if let Some(h) = recorder_handle {
-        // The recorder thread polls the stop flag; joining it blocks, so
-        // move the join off the runtime workers.
-        let _ = tokio::task::spawn_blocking(move || h.join()).await;
-    }
+    // Joining the recorder thread blocks, so move the join off the
+    // runtime workers.
+    let _ = tokio::task::spawn_blocking(move || recorders.join()).await;
+    service.plane.shutdown().await;
     Ok(())
 }
 
 /// The setup state `serve` builds once and both `open_publishers` and
 /// `start_deposits_recorder` read from: the Aeron runtime and directory,
-/// and the resolved channels/Aeron config. `spawn_watchers` and
-/// `await_shutdown_or_fail_stop` need none of this — they operate purely
-/// on the watcher handles and paths passed to them — so they stay free
-/// functions rather than methods here.
+/// and the resolved channels/Aeron config. The watcher lifecycle needs
+/// none of this; it lives on `Watchers`.
 struct DaWatcherService {
     aeron_rt: AeronRuntime,
     channels: ChannelsConfig,
     aeron_cfg: AeronConfig,
     aeron_dir: Option<PathBuf>,
+    /// The plane both publications open through.
+    plane: StreamPlane,
 }
 
 impl DaWatcherService {
@@ -418,22 +423,34 @@ impl DaWatcherService {
     /// opens only when the L1 path is set, `tx_remote_epochs` only when
     /// interop is; opening either unconditionally would advertise a
     /// publication this process may never write to.
-    fn open_publishers(
-        &self,
+    async fn open_publishers(
+        &mut self,
         want_l1: bool,
         want_interop: bool,
     ) -> anyhow::Result<(
         Option<TxDepositsPublisherHandle>,
         Option<TxRemoteEpochsPublisherHandle>,
     )> {
-        let tx_deposits_pub = want_l1
-            .then(|| TxDepositsPublisherHandle::open(&self.aeron_rt, &self.channels))
-            .transpose()
-            .context("open TxDepositsPublisherHandle")?;
-        let tx_remote_epochs_pub = want_interop
-            .then(|| TxRemoteEpochsPublisherHandle::open(&self.aeron_rt, &self.channels))
-            .transpose()
-            .context("open TxRemoteEpochsPublisherHandle")?;
+        let tx_deposits_pub = if want_l1 {
+            Some(
+                self.plane
+                    .publisher::<TxDepositsPublisherHandle>(&self.aeron_rt)
+                    .await
+                    .context("open TxDepositsPublisherHandle")?,
+            )
+        } else {
+            None
+        };
+        let tx_remote_epochs_pub = if want_interop {
+            Some(
+                self.plane
+                    .publisher::<TxRemoteEpochsPublisherHandle>(&self.aeron_rt)
+                    .await
+                    .context("open TxRemoteEpochsPublisherHandle")?,
+            )
+        } else {
+            None
+        };
         Ok((tx_deposits_pub, tx_remote_epochs_pub))
     }
 
@@ -441,8 +458,9 @@ impl DaWatcherService {
     /// an active recording before returning.
     ///
     /// The thread stays a std thread: it holds an Aeron archive session,
-    /// which is `!Send`. The seam to the async shell uses `stop` for
-    /// shutdown and a `oneshot` channel for readiness.
+    /// which is `!Send`. The seam to the async shell is the stop token
+    /// inside the returned [`RecorderThreads`], and a `oneshot` channel
+    /// for readiness. Dropping the returned value stops the thread.
     ///
     /// The watcher loop must not publish a single deposit before the
     /// recording is confirmed active. Recovery replays from record 0 and
@@ -450,41 +468,24 @@ impl DaWatcherService {
     /// permanently break executor crash recovery. The operator asked for
     /// `--archive-durability`, so returning before the recording is live
     /// would run without it while claiming otherwise.
-    async fn start_deposits_recorder(
-        &self,
-        stop: &CancellationToken,
-    ) -> anyhow::Result<std::thread::JoinHandle<()>> {
+    async fn start_deposits_recorder(&mut self) -> anyhow::Result<RecorderThreads> {
+        if let Some(membership) = self.plane.watch_topic(Topic::TxDeposits) {
+            return self.start_discovered_recorder(membership).await;
+        }
         let aeron_dir = self.aeron_dir.clone();
         let aeron_cfg = self.aeron_cfg.clone();
         let channels = self.channels.clone();
-        let stop = stop.clone();
         let (ready_tx, ready_rx) = oneshot::channel::<Result<i64, String>>();
-        let handle = std::thread::Builder::new()
-            .name("da-watcher-tx-deposits-recorder".into())
-            .spawn(move || {
-                // Shared recorder-thread body (kardamom_log::recorder):
-                // connect a thread-confined archive session, record
-                // tx_deposits, report the startup outcome on `ready`, and
-                // hold until `stop`.
-                if let Err(e) = record_stream_until_stopped(
+        let mut recorders = RecorderThreads::new();
+        recorders
+            .spawn("da-watcher-tx-deposits-recorder".into(), move |stop| {
+                Self::run_tx_deposits_recorder(
                     aeron_dir.as_deref(),
                     &aeron_cfg,
-                    &channels.tx_deposits_channel,
-                    channels.tx_deposits_stream_id,
-                    RecorderKind::TxDeposits,
+                    &channels,
                     &stop,
-                    |outcome| {
-                        if let Ok(recording_id) = &outcome {
-                            tracing::info!(
-                                recording_id = *recording_id,
-                                "da-watcher: recording tx_deposits"
-                            );
-                        }
-                        let _ = ready_tx.send(outcome);
-                    },
-                ) {
-                    tracing::error!(error = %e, "tx_deposits recorder exited with error");
-                }
+                    ready_tx,
+                );
             })
             .context("spawn tx_deposits recorder thread")?;
         // This budget is generous: normally one catalog-poll tick is about
@@ -505,6 +506,108 @@ impl DaWatcherService {
                  active within 60s"
             ),
         }
-        Ok(handle)
+        Ok(recorders)
+    }
+
+    /// Run the shared recorder-thread body (`kardamom_log::recorder`):
+    /// connect a thread-confined archive session, record `tx_deposits`,
+    /// report the startup outcome on `ready_tx`, and hold until `stop`.
+    fn run_tx_deposits_recorder(
+        aeron_dir: Option<&Path>,
+        aeron_cfg: &AeronConfig,
+        channels: &ChannelsConfig,
+        stop: &CancellationToken,
+        ready_tx: oneshot::Sender<Result<i64, String>>,
+    ) {
+        if let Err(e) = record_stream_until_stopped(
+            aeron_dir,
+            aeron_cfg,
+            &channels.tx_deposits_channel,
+            channels.tx_deposits_stream_id,
+            RecorderKind::TxDeposits,
+            stop,
+            move |outcome| Self::report_deposit_recording_ready(outcome, ready_tx),
+        ) {
+            tracing::error!(error = %e, "tx_deposits recorder exited with error");
+        }
+    }
+
+    /// Log a successful recording start, then report the startup
+    /// outcome on `ready_tx`.
+    fn report_deposit_recording_ready(
+        outcome: Result<i64, String>,
+        ready_tx: oneshot::Sender<Result<i64, String>>,
+    ) {
+        if let Ok(recording_id) = &outcome {
+            tracing::info!(
+                recording_id = *recording_id,
+                "da-watcher: recording tx_deposits"
+            );
+        }
+        let _ = ready_tx.send(outcome);
+    }
+
+    /// The discovered twin of [`Self::start_deposits_recorder`]: one
+    /// thread records this watcher's own dynamic MDC publication through
+    /// its control endpoint, and readiness is that recording going live.
+    async fn start_discovered_recorder(
+        &self,
+        membership: tokio::sync::watch::Receiver<kardamom_log::discovery::Membership>,
+    ) -> anyhow::Result<RecorderThreads> {
+        let mut recorders = RecorderThreads::new();
+        let recorder = DiscoveredRecorder {
+            aeron_dir: self.aeron_dir.clone(),
+            aeron_cfg: self.aeron_cfg.clone(),
+            local_ip: self
+                .plane
+                .local_ip()
+                .context("discovered plane has an address")?,
+            own_instance: self
+                .plane
+                .instance_id()
+                .context("discovered plane has an instance")?
+                .to_string(),
+            expected_own: 1,
+            membership,
+            stop: recorders.stop_token(),
+            runtime: tokio::runtime::Handle::current(),
+        };
+        let (ready_tx, ready_rx) = oneshot::channel::<RecorderProgress>();
+        recorders
+            .spawn("da-watcher-tx-deposits-recorder".into(), move |_stop| {
+                Self::run_discovered_recorder(recorder, ready_tx);
+            })
+            .context("spawn tx_deposits recorder thread")?;
+        match tokio::time::timeout(Duration::from_secs(60), ready_rx).await {
+            Ok(Ok(RecorderProgress::Ready { .. })) => {
+                tracing::info!("tx_deposits recording confirmed active");
+            }
+            Ok(Ok(RecorderProgress::Failed(reason))) => anyhow::bail!(
+                "archive durability requested but the tx_deposits recorder failed to start: {reason}"
+            ),
+            Ok(Err(_)) => anyhow::bail!(
+                "archive durability requested but the tx_deposits recorder thread exited before \
+                 reporting readiness"
+            ),
+            Err(_) => anyhow::bail!(
+                "archive durability requested but the tx_deposits recording did not become \
+                 active within 60s"
+            ),
+        }
+        Ok(recorders)
+    }
+
+    /// Run the discovery-driven recorder on its thread, and report its
+    /// progress on `ready_tx`. The recorder holds the threads' stop token.
+    fn run_discovered_recorder(
+        recorder: DiscoveredRecorder,
+        ready_tx: oneshot::Sender<RecorderProgress>,
+    ) {
+        let outcome = recorder.run(|progress| {
+            let _ = ready_tx.send(progress);
+        });
+        if let Err(e) = outcome {
+            tracing::error!(error = %e, "tx_deposits recorder exited with error");
+        }
     }
 }

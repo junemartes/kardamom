@@ -1,0 +1,14 @@
+# Managed by Ansible (roles/vswitch). The vSwitch VLAN of this dedicated
+# host, with the route to the Cloud Network.
+network:
+  version: 2
+  vlans:
+    {{ vswitch_parent }}.{{ vswitch_vlan_id }}:
+      id: {{ vswitch_vlan_id }}
+      link: {{ vswitch_parent }}
+      mtu: {{ vswitch_mtu }}
+      addresses:
+        - {{ vswitch_address }}/{{ vswitch_prefix_len }}
+      routes:
+        - to: {{ cloud_network_cidr }}
+          via: {{ vswitch_gateway }}
