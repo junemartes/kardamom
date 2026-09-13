@@ -247,13 +247,20 @@ fn a_missing_block_is_told_apart_from_an_unreachable_l1() {
     // The retry loop's verdict depends on this distinction: "L1 does
     // not have this block" is a statement about the chain (rule 4, a
     // fault). "L1 did not answer" is about the network, a coverage gap.
-    assert!(is_missing_block(&anyhow::anyhow!(
-        "L1 provider error: finalized L1 block 52 not found"
-    )));
-    assert!(!is_missing_block(&anyhow::anyhow!(
-        "L1 provider error: connection refused"
-    )));
-    assert!(!is_missing_block(&anyhow::anyhow!("timed out")));
+    let e52 = derive_epoch(52, B256::repeat_byte(0x52), &[]).unwrap();
+    let verdict = |msg: &str| Verifier::<FakeL1>::give_up(&e52, 8, &anyhow::anyhow!("{msg}"));
+    assert!(matches!(
+        verdict("L1 provider error: finalized L1 block 52 not found"),
+        VerifyVerdict::Fault(EpochFault::BlockBeyondFinality {
+            l1_number: 52,
+            attempts: 8
+        })
+    ));
+    assert!(matches!(
+        verdict("L1 provider error: connection refused"),
+        VerifyVerdict::Unverified
+    ));
+    assert!(matches!(verdict("timed out"), VerifyVerdict::Unverified));
 }
 
 #[test]
@@ -268,6 +275,7 @@ fn beyond_finality_message_names_the_block_and_the_effort() {
 
 /// A fake L1 whose blocks are whatever the test says they are. This is
 /// the shape a lying or buggy endpoint takes.
+#[derive(Clone)]
 struct FakeL1 {
     blocks: std::collections::BTreeMap<u64, (B256, B256)>,
 }
@@ -294,6 +302,20 @@ fn lockbox() -> Address {
     address!("0000000000000000000000000000000000C0DE01")
 }
 
+/// A verifier over `l1` with `anchor` as its last verified epoch. The
+/// queue and the divergence sink are unused by `verify_one`.
+fn verifier(l1: FakeL1, anchor: Option<Anchor>) -> Verifier<FakeL1> {
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let mut v = Verifier::new(
+        std::sync::Arc::new(l1),
+        lockbox(),
+        std::sync::Arc::new(Divergence::default()),
+        rx,
+    );
+    v.anchor = anchor;
+    v
+}
+
 #[tokio::test]
 async fn a_properly_chained_pair_of_epochs_verifies() {
     let (h7, h8) = (B256::repeat_byte(0x77), B256::repeat_byte(0x88));
@@ -305,17 +327,16 @@ async fn a_properly_chained_pair_of_epochs_verifies() {
     let e7 = derive_epoch(7, h7, &[]).unwrap();
     let e8 = derive_epoch(8, h8, &[]).unwrap();
 
-    assert!(verify_one(&l1, lockbox(), &e7, None).await.is_ok());
+    assert!(verifier(l1.clone(), None).verify_one(&e7).await.is_ok());
     assert!(
-        verify_one(
-            &l1,
-            lockbox(),
-            &e8,
+        verifier(
+            l1,
             Some(Anchor {
                 number: 7,
                 hash: h7
             })
         )
+        .verify_one(&e8)
         .await
         .is_ok()
     );
@@ -335,18 +356,17 @@ async fn an_epoch_that_does_not_descend_from_its_predecessor_is_caught() {
     let e8 = derive_epoch(8, h8, &[]).unwrap();
 
     // Without an anchor, the epoch passes: there is nothing to chain against.
-    assert!(verify_one(&l1, lockbox(), &e8, None).await.is_ok());
+    assert!(verifier(l1.clone(), None).verify_one(&e8).await.is_ok());
 
     // With an anchor, the break is caught.
-    let err = verify_one(
-        &l1,
-        lockbox(),
-        &e8,
+    let err = verifier(
+        l1,
         Some(Anchor {
             number: 7,
             hash: h7,
         }),
     )
+    .verify_one(&e8)
     .await
     .unwrap_err();
     match err {
@@ -379,15 +399,14 @@ async fn chaining_is_skipped_across_a_gap_in_the_anchor() {
 
     // The anchor is block 7, this is block 9: not adjacent, so no chain check.
     assert!(
-        verify_one(
-            &l1,
-            lockbox(),
-            &e9,
+        verifier(
+            l1,
             Some(Anchor {
                 number: 7,
                 hash: B256::repeat_byte(0x77),
             }),
         )
+        .verify_one(&e9)
         .await
         .is_ok()
     );

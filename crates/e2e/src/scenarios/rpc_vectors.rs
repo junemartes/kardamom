@@ -103,16 +103,14 @@ impl RpcVectorCase<'_> {
         let outcome = t.rpc.raw_call(method, &params).await;
         let actual = match outcome.result {
             Ok(v) => json!({ "result": v }),
-            Err(RpcError::Call { code, message }) => {
-                json!({ "error": { "code": code, "message": message } })
-            }
-            Err(RpcError::Transport(e)) => {
-                bail!(
-                    "{}[{}] {method}: transport error (the contract forbids these): {e}",
-                    self.file,
-                    self.index
-                )
-            }
+            Err(RpcError::Call { code, message }) => json!({
+                "error": { "code": code, "message": message }
+            }),
+            Err(RpcError::Transport(e)) => bail!(
+                "{}[{}] {method}: transport error (the contract forbids these): {e}",
+                self.file,
+                self.index
+            ),
         };
         matches(&self.expect, &actual)
             .with_context(|| format!("{}[{}] {method}: got {actual}", self.file, self.index))
@@ -276,16 +274,12 @@ impl VectorParser {
 /// `${HEX}` are not in the map, so they survive into [`matches`].
 fn substitute(v: Value, subs: &BTreeMap<String, Value>) -> Value {
     match v {
-        Value::String(s) => {
-            if let Some(sub) = s
-                .strip_prefix("${")
-                .and_then(|r| r.strip_suffix('}'))
-                .and_then(|name| subs.get(name))
-            {
-                return sub.clone();
-            }
-            Value::String(s)
-        }
+        Value::String(s) => s
+            .strip_prefix("${")
+            .and_then(|r| r.strip_suffix('}'))
+            .and_then(|name| subs.get(name))
+            .cloned()
+            .unwrap_or_else(|| Value::String(s)),
         Value::Array(items) => {
             Value::Array(items.into_iter().map(|i| substitute(i, subs)).collect())
         }
@@ -328,13 +322,19 @@ fn matches(expect: &Value, actual: &Value) -> Result<()> {
                 e.len(),
                 a.len()
             );
-            e.iter().zip(a).enumerate().try_for_each(|(i, (ev, av))| {
-                matches(ev, av).with_context(|| format!("at index {i}"))
-            })
+            e.iter()
+                .zip(a)
+                .enumerate()
+                .try_for_each(|(i, (ev, av))| match_at_index(i, ev, av))
         }
         _ => {
             ensure!(expect == actual, "want {expect}, got {actual}");
             Ok(())
         }
     }
+}
+
+/// Match one array element, with its index attached to any error.
+fn match_at_index(i: usize, ev: &Value, av: &Value) -> Result<()> {
+    matches(ev, av).with_context(|| format!("at index {i}"))
 }

@@ -85,24 +85,7 @@ impl VerifiedL1 {
         let (fault, fault_rx) = tokio::sync::watch::channel(Fault::None);
         let served = Arc::new(AtomicU64::new(0));
 
-        let task = tokio::spawn({
-            let served = served.clone();
-            async move {
-                loop {
-                    let Ok((sock, _)) = listener.accept().await else {
-                        return;
-                    };
-                    tokio::spawn(
-                        Conn {
-                            client: client.clone(),
-                            fault_rx: fault_rx.clone(),
-                            served: served.clone(),
-                        }
-                        .serve(sock),
-                    );
-                }
-            }
-        });
+        let task = tokio::spawn(accept_loop(listener, client, fault_rx, served.clone()));
 
         Ok(Self {
             addr,
@@ -129,6 +112,47 @@ impl VerifiedL1 {
     pub fn served(&self) -> u64 {
         self.served.load(Ordering::Relaxed)
     }
+}
+
+/// Accept connections on `listener` until it errors, spawning one
+/// [`Conn::serve`] task per connection.
+async fn accept_loop(
+    listener: TcpListener,
+    client: HttpClient,
+    fault_rx: tokio::sync::watch::Receiver<Fault>,
+    served: Arc<AtomicU64>,
+) {
+    loop {
+        if accept_one(&listener, &client, &fault_rx, &served)
+            .await
+            .is_break()
+        {
+            return;
+        }
+    }
+}
+
+/// Accept one connection on `listener`, and spawn [`Conn::serve`] for
+/// it. Returns `Break` when the listener itself failed: the loop's exit
+/// condition.
+async fn accept_one(
+    listener: &TcpListener,
+    client: &HttpClient,
+    fault_rx: &tokio::sync::watch::Receiver<Fault>,
+    served: &Arc<AtomicU64>,
+) -> std::ops::ControlFlow<()> {
+    let Ok((sock, _)) = listener.accept().await else {
+        return std::ops::ControlFlow::Break(());
+    };
+    tokio::spawn(
+        Conn {
+            client: client.clone(),
+            fault_rx: fault_rx.clone(),
+            served: served.clone(),
+        }
+        .serve(sock),
+    );
+    std::ops::ControlFlow::Continue(())
 }
 
 /// One accepted connection's serving state: the upstream client, the
@@ -242,7 +266,7 @@ async fn read_until<T>(
         match read_chunk_into(sock, buf, &mut done).await? {
             ReadStep::Done(t) => return Ok(Some(t)),
             ReadStep::ConnectionClosed => return Ok(None),
-            ReadStep::Pending => {}
+            ReadStep::Pending => (),
         }
     }
 }

@@ -85,7 +85,7 @@ impl<S: StateDatabase> PoolShared<S> {
                 // its threads here). `poll_hot` already ran the spin
                 // before returning this, so there is nothing left to
                 // do but poll again.
-                HotCtx::Spin => {}
+                HotCtx::Spin => (),
             }
         }
     }
@@ -269,7 +269,7 @@ impl<S: super::StmBackend> PoolThreads<S> {
         let deadline = std::time::Instant::now() + STALL_TIMEOUT;
         while !(ctx.aborted.load(Ordering::SeqCst) || ctx.drained()) {
             match Self::drain_step(ctx, deadline) {
-                DrainStep::Continue => {}
+                DrainStep::Continue => (),
                 DrainStep::Stalled(err) => return Some(err),
             }
         }
