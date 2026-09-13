@@ -1,11 +1,12 @@
 # Aeron MDC with Consul discovery
 
-- Status: Proposed; implementation belongs to the MDC session.
+- Status: Implemented by #288 (dynamic MDC transport with Consul discovery),
+  merged to `main` on 2026-09-13 with the Hetzner infrastructure stack.
 - Date: 2026-09-11
 - Scope: Replace every active UDP multicast application channel with Aeron
   Multi-Destination-Cast (MDC), with membership discovered through Consul.
-- Companion work: Infrastructure is developed separately against this contract
-  and will be rebased onto the MDC implementation. This document adds no runtime code.
+- Companion work: the [Hetzner infrastructure](hetzner-hybrid-infra-spec.md) is
+  built on this transport. This document adds no runtime code.
 
 ## Problem and decision
 
