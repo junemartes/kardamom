@@ -116,16 +116,15 @@ async fn spawn_writer_and_bal(
     // property. The channel has a bounded depth, so a wedged publisher
     // back-pressures exec instead of dropping state transitions.
     let (bal_tx, bal_rx) = crossbeam_channel::bounded(8);
-    let bal_publisher = std::thread::Builder::new()
-        .name("bal-publisher".into())
-        .spawn(move || kardamom_executor::bal::run_bal_publisher(bal_rx, bal_pub))
+    let bal_publisher = kardamom_executor::bal::BalPublisher::new(bal_rx, bal_pub)
+        .spawn()
         .context("spawn BAL publisher")?;
 
     // Footprint shadow. Behind `KARDAMOM_FOOTPRINT_SHADOW=1`, the exec
     // thread hands each block's tx captures to a grading thread
     // (measurement only; execution stays sequential). It is `None`
     // when the env flag is unset, for zero cost.
-    let footprint_shadow = kardamom_engine::shadow::spawn_from_env();
+    let footprint_shadow = kardamom_engine::shadow::Shadow::spawn_from_env();
 
     Ok(WriterAdapters {
         writer,
@@ -213,7 +212,8 @@ fn open_transport(args: &Args) -> Result<Transport> {
 /// reader never sees an image rotation. The executor's skip-count and
 /// `DedupWindow` give idempotency across any reconnect overlap. The
 /// cluster-session guard (`LiveCluster`) must outlive the executor loop,
-/// so the caller binds it in its outer scope.
+/// so [`bin_support::LiveStreams`] holds it. It drops only after the
+/// shutdown wait ends.
 ///
 /// The member ingress endpoints come from the catalog when discovery
 /// lists them, else from the static `[cluster]` section. The executor is
@@ -268,7 +268,8 @@ async fn main() -> Result<()> {
     // Load genesis (its chain_id is adopted when present).
     let (genesis, chain_id) = bin_support::resolve_genesis(args.chain.as_deref(), args.chain_id)?;
     let expected_genesis = bin_support::expected_genesis_digest(genesis.as_ref());
-    // Cancelled on the way out; stops the periodic checkpointer task.
+    // The guard in `LiveStreams` cancels this token on the way out; that
+    // stops the periodic checkpointer task.
     let shutdown = tokio_util::sync::CancellationToken::new();
     let state::PreparedState { env, start } =
         state::prepare_state(&args, expected_genesis, shutdown.clone())?;
@@ -328,7 +329,7 @@ async fn main() -> Result<()> {
     // Run it inside spawn_blocking so the runtime stays responsive for
     // shutdown handling.
     let join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
-        Executor::run::<ExecutorWiring>(
+        Executor::<ExecutorWiring>::new(
             cfg,
             Inbound {
                 tx_data: tx_data_subs,
@@ -361,9 +362,10 @@ async fn main() -> Result<()> {
                 remote_epoch_observer: None,
             },
         )
+        .run()
     });
 
-    let engine_error = run_engine(rt, cluster_guard, shutdown, join).await;
+    let engine_error = wait_for_engine(rt, cluster_guard, shutdown, join).await;
     // The plane's registrations deregister once the engine has stopped.
     plane.shutdown().await;
     // Stop the state writer thread (this closes the delta channel, joins
@@ -397,77 +399,40 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Cancels the shutdown token when this drops, so a struct that holds
-/// one can end it as a normal field drop, with no `drop()` call.
-struct CancelOnDrop(tokio_util::sync::CancellationToken);
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
-
-/// The runtime and cluster guards `run_engine` holds. Rust drops
-/// struct fields in declaration order, so dropping this struct ends
-/// `rt` first, then cancels `shutdown`, then drops `cluster_guard`,
-/// the fixed order this module's own doc describes.
-#[allow(
-    dead_code,
-    reason = "each field is held only for its RAII drop order and never read"
-)]
-struct EngineHandles {
-    rt: AeronRuntime,
-    shutdown: CancelOnDrop,
-    cluster_guard: kardamom_cluster_adapter::LiveCluster,
-}
-
 /// Wait for whichever comes first: an operator shutdown signal, or the
-/// engine loop finishing on its own (a fatal stream or join error).
-/// Exiting on the first of the two, instead of only on SIGTERM, avoids
-/// an errored executor lingering "alive": metrics up, pipeline dead,
-/// instead of exiting so the orchestrator restarts it into the
-/// crash-recovery path.
-///
-/// This function owns `rt` and `cluster_guard` and drops them in a
-/// fixed order once the wait ends. Dropping the `AeronRuntime` closes
-/// every subscription's sender, so the reader threads' `blocking_recv`
-/// returns `None` and the executor sees `TxDataClosed`. In cluster
-/// mode, the `tx_ordering` reader blocks on cluster egress `recv()`,
-/// which returns `None` only once the `LiveCluster` guard drops, so the
-/// reader sees `TxOrderingClosed` next.
-async fn run_engine(
+/// engine loop finishing on its own. Then end the streams, in
+/// [`bin_support::LiveStreams`] field order, and log the outcome. Returns
+/// the engine error when the loop returned one. A panic leaves no error
+/// value.
+async fn wait_for_engine(
     rt: AeronRuntime,
     cluster_guard: kardamom_cluster_adapter::LiveCluster,
     shutdown: tokio_util::sync::CancellationToken,
-    mut join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
+    join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
 ) -> Option<ExecutorError> {
-    let handles = EngineHandles {
-        rt,
-        shutdown: CancelOnDrop(shutdown),
-        cluster_guard,
-    };
-    let engine_result = tokio::select! {
-        () = bin_support::wait_for_shutdown() => {
-            tracing::info!("kardamom-executor: shutdown signal received; dropping runtime");
+    let joined = bin_support::EngineShutdown {
+        bin_name: "kardamom-executor",
+        join,
+        streams: bin_support::LiveStreams {
+            stop: shutdown.drop_guard(),
+            rt,
+            cluster_guard,
+        },
+    }
+    .wait()
+    .await;
+    match joined {
+        Ok(Ok(())) => {
+            tracing::info!("executor main loop returned cleanly");
             None
         }
-        res = &mut join => Some(res),
-    };
-    {
-        let _released = handles;
-    }
-    let joined = match engine_result {
-        Some(r) => r,
-        None => join.await,
-    };
-    let mut engine_error: Option<ExecutorError> = None;
-    match joined {
-        Ok(Ok(())) => tracing::info!("executor main loop returned cleanly"),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "executor main loop returned an error");
-            engine_error = Some(e);
+            Some(e)
         }
-        Err(e) => tracing::error!(error = %e, "executor task panicked"),
+        Err(e) => {
+            tracing::error!(error = %e, "executor task panicked");
+            None
+        }
     }
-    engine_error
 }

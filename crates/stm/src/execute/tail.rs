@@ -235,16 +235,7 @@ impl<S: StateDatabase + Sync> Tail<S> {
                 })
             })?;
         let sink_final = match &b0.sink_start {
-            Some(a) => {
-                let mut a = a.clone();
-                a.balance = b0.sink_start_balance.checked_add(fee_sum).ok_or_else(|| {
-                    ExecutorError::State(format!(
-                        "stm: block {} fee sink balance overflowed U256 (start={}, fee_sum={fee_sum})",
-                        self.ctx.env.block_number, b0.sink_start_balance
-                    ))
-                })?;
-                Some(a)
-            }
+            Some(a) => Some(self.sink_credited(a, b0.sink_start_balance, fee_sum)?),
             None if fee_sum > U256::ZERO => Some(AccountInfo {
                 nonce: 0,
                 balance: fee_sum,
@@ -260,6 +251,26 @@ impl<S: StateDatabase + Sync> Tail<S> {
             sink_final,
         });
         Ok(())
+    }
+
+    /// The fee sink's account once this block's fee credits land on it.
+    ///
+    /// # Errors
+    /// Returns an error when `start` plus `fee_sum` overflows `U256`.
+    fn sink_credited(
+        &self,
+        sink_start: &AccountInfo,
+        start: U256,
+        fee_sum: U256,
+    ) -> Result<AccountInfo, ExecutorError> {
+        let mut a = sink_start.clone();
+        a.balance = start.checked_add(fee_sum).ok_or_else(|| {
+            ExecutorError::State(format!(
+                "stm: block {} fee sink balance overflowed U256 (start={}, fee_sum={fee_sum})",
+                self.ctx.env.block_number, start
+            ))
+        })?;
+        Ok(a)
     }
 
     /// Canonical-order commit, phase 1 (serial, fast per transaction):

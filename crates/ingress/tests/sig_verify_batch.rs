@@ -48,6 +48,20 @@ mod fixtures {
 /// Every caller gets the sender that signed ITS transaction — chunking must
 /// never cross responses. Run at several batch sizes so both the
 /// single-chunk path and the fanned-out path are covered.
+/// Recovers one tx and checks the caller got back the sender that
+/// signed it, so chunking never crosses answers across callers.
+async fn assert_own_sender(
+    v: std::sync::Arc<BatchVerifier>,
+    env: alloy_consensus::TxEnvelope,
+    raw: alloy_primitives::Bytes,
+    addr: alloy_primitives::Address,
+    n: usize,
+) {
+    let (sender, hash) = v.recover(env, raw.clone()).await.unwrap();
+    assert_eq!(sender, addr, "recovered the wrong signer at n={n}");
+    assert_eq!(hash, alloy_primitives::keccak256(raw.as_ref()));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_caller_gets_its_own_sender() {
     for n in [1usize, 3, 8, 64, 100, 200] {
@@ -59,14 +73,7 @@ async fn every_caller_gets_its_own_sender() {
         let cases: Vec<_> = (0..n as u64).map(fixtures::signed).collect();
         let handles: Vec<_> = cases
             .into_iter()
-            .map(|(env, raw, addr)| {
-                let v = v.clone();
-                tokio::spawn(async move {
-                    let (sender, hash) = v.recover(env, raw.clone()).await.unwrap();
-                    assert_eq!(sender, addr, "recovered the wrong signer at n={n}");
-                    assert_eq!(hash, alloy_primitives::keccak256(raw.as_ref()));
-                })
-            })
+            .map(|(env, raw, addr)| tokio::spawn(assert_own_sender(v.clone(), env, raw, addr, n)))
             .collect();
         futures::future::join_all(handles)
             .await
@@ -189,6 +196,18 @@ async fn recovery_does_not_block_the_reactor() {
 /// single-core CI runner there is nothing to win, and a timing threshold
 /// would be a flake. The correctness assertion — every caller gets its own
 /// sender — holds either way.
+/// Recovers one tx from the ring and checks the caller got its own
+/// sender back, not another caller's.
+async fn assert_recovered_sender(
+    v: std::sync::Arc<BatchVerifier>,
+    env: alloy_consensus::TxEnvelope,
+    raw: alloy_primitives::Bytes,
+    addr: alloy_primitives::Address,
+) {
+    let (sender, _hash) = v.recover(env, raw).await.expect("recover");
+    assert_eq!(sender, addr, "caller got another transaction's sender");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fanning_out_a_full_ring_scales_with_cores() {
     const RING: usize = 256;
@@ -210,11 +229,7 @@ async fn fanning_out_a_full_ring_scales_with_cores() {
             .iter()
             .cloned()
             .map(|(env, raw, addr)| {
-                let v = v.clone();
-                tokio::spawn(async move {
-                    let (sender, _hash) = v.recover(env, raw).await.expect("recover");
-                    assert_eq!(sender, addr, "caller got another transaction's sender");
-                })
+                tokio::spawn(assert_recovered_sender(v.clone(), env, raw, addr))
             })
             .collect();
         futures::future::join_all(handles)

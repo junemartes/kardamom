@@ -3,12 +3,12 @@
 //! `kardamom-proof-submitter`): run one step, then retry immediately or
 //! after an interval, or stop.
 //!
-//! Each binary defines a struct holding its own step's fixed inputs (an
-//! oracle address, a spool directory, ...) plus a [`PollLoop`], with a
-//! `tick(&self, provider: &P) -> ControlFlow<()>` method whose body is
-//! `report_*_outcome(step(provider).await)` followed by
-//! `self.gate.gate(retry).await`. `main` then drives it with
-//! `while let ControlFlow::Continue(()) = ticker.tick(&provider).await {}`
+//! Each binary defines a struct holding its own step driver (a
+//! `BatchClaimer`, a `BatchWatcher`, a `ProofSubmitter`) plus a
+//! [`PollLoop`], with a `tick(&self, provider: &P) -> ControlFlow<()>`
+//! method whose body is `Self::report(step(provider).await)` followed by
+//! `self.gate.gate(retry).await`. Its `run` drives it with
+//! `while let ControlFlow::Continue(()) = self.tick(provider).await {}`
 //! — the whole reactor, one line, with no nested loop or branch.
 
 use std::ops::ControlFlow;

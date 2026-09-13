@@ -233,7 +233,7 @@ impl<'a> JoinWait<'a> {
             match self.poll_once() {
                 JoinStep::GiveUp => return None,
                 JoinStep::Take(env) => return Some(env),
-                JoinStep::Retry => {}
+                JoinStep::Retry => (),
             }
         }
     }
@@ -331,7 +331,7 @@ impl<'a> JoinWait<'a> {
             match self.wait_step(deadline) {
                 JoinStep::Take(env) => return Some(env),
                 JoinStep::GiveUp => return None,
-                JoinStep::Retry => {}
+                JoinStep::Retry => (),
             }
         }
     }
