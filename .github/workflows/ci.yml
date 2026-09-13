@@ -39,6 +39,9 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: v1.7.1
+      # forge build downloads the pinned solc on a cold host; the cache
+      # keeps that download off binaries.soliditylang.org.
+      - uses: ./.github/actions/solc-cache
       - name: Install system build deps
         run: |
           sudo apt-get update -qq
@@ -79,6 +82,9 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: v1.7.1
+      # forge build downloads the pinned solc on a cold host; the cache
+      # keeps that download off binaries.soliditylang.org.
+      - uses: ./.github/actions/solc-cache
       - name: Install system build deps
         run: |
           sudo apt-get update -qq
@@ -103,6 +109,9 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: v1.7.1
+      # forge build downloads the pinned solc on a cold host; the cache
+      # keeps that download off binaries.soliditylang.org.
+      - uses: ./.github/actions/solc-cache
       - name: Install system build deps
         run: |
           sudo apt-get update -qq
@@ -210,6 +219,9 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: v1.7.1
+      # forge build downloads the pinned solc on a cold host; the cache
+      # keeps that download off binaries.soliditylang.org.
+      - uses: ./.github/actions/solc-cache
       - name: Install system build deps
         run: |
           sudo apt-get update -qq
@@ -246,6 +258,9 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: v1.7.1
+      # forge build downloads the pinned solc on a cold host; the cache
+      # keeps that download off binaries.soliditylang.org.
+      - uses: ./.github/actions/solc-cache
       - name: Install system build deps
         run: |
           sudo apt-get update -qq
@@ -284,6 +299,9 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: v1.7.1
+      # forge build downloads the pinned solc on a cold host; the cache
+      # keeps that download off binaries.soliditylang.org.
+      - uses: ./.github/actions/solc-cache
       - name: Install contract dependencies
         run: |
           forge install --no-git --shallow \
@@ -303,6 +321,9 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: v1.7.1
+      # forge build downloads the pinned solc on a cold host; the cache
+      # keeps that download off binaries.soliditylang.org.
+      - uses: ./.github/actions/solc-cache
       - name: Install contract dependencies
         run: |
           forge install --no-git --shallow \
@@ -322,6 +343,9 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: v1.7.1
+      # forge build downloads the pinned solc on a cold host; the cache
+      # keeps that download off binaries.soliditylang.org.
+      - uses: ./.github/actions/solc-cache
       - run: forge fmt --check
 
   solhint:
@@ -350,6 +374,9 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: v1.7.1
+      # forge build downloads the pinned solc on a cold host; the cache
+      # keeps that download off binaries.soliditylang.org.
+      - uses: ./.github/actions/solc-cache
       - name: Install contract dependencies
         working-directory: contracts
         run: |
