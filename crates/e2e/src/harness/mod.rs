@@ -94,6 +94,8 @@ impl LocalStack {
             ingress_metrics: self.ingress.metrics_addr,
             executor_metrics: self.executor.metrics_addr,
             sequencer_metrics: self.sequencers.iter().map(|s| s.metrics_addr).collect(),
+            // The local stack runs one sequencer per shard, no racing twin.
+            sequencer_replicas: std::num::NonZeroU32::MIN,
             validator_metrics: self.validator.as_ref().map(|v| v.metrics_addr),
         })
     }

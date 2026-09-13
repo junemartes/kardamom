@@ -27,6 +27,7 @@
 //! ```
 
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -57,6 +58,13 @@ struct Args {
     /// counters.
     #[arg(long, value_delimiter = ',')]
     sequencer_metrics: Vec<SocketAddr>,
+    /// Racing replicas per sequencer shard (P in
+    /// `deploy/cluster/ansible/group_vars/all.yml`). Every replica of a
+    /// shard ingests the same stream, so a summed counter counts each
+    /// event this many times. The nonce-gap case waits for every replica
+    /// of the shard to expire the parked pair before the late fill.
+    #[arg(long, default_value_t = NonZeroU32::MIN)]
+    sequencer_replicas: NonZeroU32,
     /// Validator `/metrics` address. Required for the `consistency` case.
     #[arg(long)]
     validator_metrics: Option<SocketAddr>,
@@ -134,6 +142,7 @@ async fn main() -> Result<()> {
         ingress_metrics: args.ingress_metrics.unwrap_or(executor),
         executor_metrics: executor,
         sequencer_metrics: args.sequencer_metrics.clone(),
+        sequencer_replicas: args.sequencer_replicas,
         validator_metrics: args.validator_metrics,
     };
 

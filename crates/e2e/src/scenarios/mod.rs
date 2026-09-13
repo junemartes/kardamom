@@ -27,6 +27,7 @@ mod xchain_skipped_seq;
 pub mod xchain_two_stacks;
 
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::time::Duration;
 
@@ -140,6 +141,12 @@ pub struct Target {
     pub ingress_metrics: SocketAddr,
     pub executor_metrics: SocketAddr,
     pub sequencer_metrics: Vec<SocketAddr>,
+    /// Racing replicas per sequencer shard. Every replica of a shard
+    /// ingests the same stream, so a stream-derived counter summed over
+    /// `sequencer_metrics` counts each event this many times. A wait on
+    /// such a sum must scale its floor by this value, or it returns when
+    /// one replica is done while its twin is not.
+    pub sequencer_replicas: NonZeroU32,
     /// Present when the stack runs a validator.
     pub validator_metrics: Option<SocketAddr>,
 }

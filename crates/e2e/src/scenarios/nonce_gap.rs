@@ -224,12 +224,15 @@ impl<'a> GapRun<'a> {
 
     /// Step 3a: the parked pair expired on the sequencer. The sequencer's
     /// `tx_ttl` equals the ingress park. Every replica of the shard
-    /// expires the pair a few ms after the ingress timed out, so the
-    /// counter sums to at least 2 (one replica) across the shard's
-    /// replicas. Wait for it before the late fill, so the fill cannot race
-    /// the sweep.
+    /// buffers the pair and expires it after the ingress timed out, so
+    /// the counter rises by 2 on each replica of the shard, and by 0 on
+    /// the other shards. Wait for the whole shard before the late fill:
+    /// a floor of one replica's share lets the fill race the twin's
+    /// sweep, and the twin then publishes the pair it should have
+    /// dropped. That is the "expired nonce has a receipt" failure seen
+    /// on the cluster under load.
     async fn assert_pair_expired(&self) -> Result<()> {
-        let floor = self.expired_start + 2.0;
+        let floor = self.expired_start + 2.0 * f64::from(self.t.sequencer_replicas.get());
         poll_until(
             "sequencer expired the parked pair",
             Duration::from_secs(10),
