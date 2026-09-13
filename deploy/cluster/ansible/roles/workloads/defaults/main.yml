@@ -3,7 +3,7 @@
 workloads_cluster_dir: "{{ playbook_dir | dirname }}"
 workloads_nomad_binary: nomad
 # The Nomad API. A controller outside the cluster passes NOMAD_ADDR (the
-# Makefile derives it from the node contract); a controller on a node
+# justfile derives it from the node contract); a controller on a node
 # reaches its local agent.
 workloads_nomad_addr: "{{ lookup('env', 'NOMAD_ADDR') | default('http://127.0.0.1:' ~ ports.nomad_http, true) }}"
 workloads_nomad_token: "{{ lookup('env', 'NOMAD_TOKEN') }}"

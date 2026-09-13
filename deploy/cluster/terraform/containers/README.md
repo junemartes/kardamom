@@ -32,9 +32,9 @@ with `name`, `container`, `role`, `tier`, `index`, `ip` and `control_plane`.
 
 ## Use
 
-`make container-up` in `deploy/cluster` runs `init`, `apply`, writes the
-contract and converges the cluster. `make container-down` runs `destroy`.
-Do not run `tofu apply` while a `make container-up` is in progress; the
+`just container-up` in `deploy/cluster` runs `init`, `apply`, writes the
+contract and converges the cluster. `just container-down` runs `destroy`.
+Do not run `tofu apply` while a `just container-up` is in progress; the
 state lock refuses it.
 
 ## Tests

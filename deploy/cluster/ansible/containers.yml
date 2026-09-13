@@ -1,6 +1,6 @@
 ---
 # Container substrate: reads the node contract of terraform/containers and
-# provisions the nodes. `make container-up` applies the root, writes the
+# provisions the nodes. `just container-up` applies the root, writes the
 # contract and runs this playbook through cluster.yml.
 - name: Read the node contract and prepare the host
   hosts: localhost

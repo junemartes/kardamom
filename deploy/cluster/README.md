@@ -49,14 +49,14 @@ dedicated node is `<class>-<i>.node.<datacenter>.consul`; a service is
 Nomad jobs derive every peer list from a count and the datacenter, so a
 job file, a config file or a script never names an address.
 `ansible/contract.yml` rejects an address literal anywhere in
-`nomad/`, `config/`, `ansible/`, the Makefile, the justfile
+`nomad/`, `config/`, `ansible/`, the cluster and root justfiles
 and the e2e workflow. The one exception is an environment file: the
 Terraform variables of a Hetzner deployment. An image build captures the
 recursors of the build server, so every elastic node forwards to them.
 
 The test suite and the operator commands (`crates/chaos`) run on the
 Docker host, outside the cluster resolver; they read every node address
-from the node contract, and the Makefile reads the control node address
+from the node contract, and the justfile reads the control node address
 from it too.
 
 Every non-control node also runs the Aeron `ArchivingMediaDriver` (the `aeron`
@@ -77,15 +77,15 @@ host tools below for your platform, and `just cluster-doctor` verifies them.
   builds. The daemon must run privileged containers; on macOS or Windows
   that is Docker Desktop's Linux VM.
 - Images are pushed from inside the control node (`REGISTRY_PUSH_NODE`,
-  the Makefile default), where the registry name `registry.service.consul`
+  the justfile default), where the registry name `registry.service.consul`
   resolves. The host Docker daemon needs no insecure-registry entry.
 - The **Nomad CLI** on the Ansible controller — used only to compile HCL
   and embed local config files. Ansible submits jobs through the Nomad API.
 - For signed deployments, **cosign** on PATH, in the image builder's pinned
   cache, or configured with `workloads_cosign_binary`.
 - **JDK 17 + Gradle wrapper** for the Java Aeron Cluster node jar:
-  `(cd cluster/sealer-service && ./gradlew :service:shadowJar)` — `make
-  images` / `make container-up` stage it into the `kardamom-cluster` image and
+  `(cd cluster/sealer-service && ./gradlew :service:shadowJar)` — `just
+  images` / `just container-up` stage it into the `kardamom-cluster` image and
   fail loudly if it is missing.
 - The **Rust service binaries** in `target/release` (`cargo build --release
   --bins` of the service crates, or the artifact of `scripts/ci/stage-cluster-dist.sh`):
@@ -95,13 +95,16 @@ host tools below for your platform, and `just cluster-doctor` verifies them.
 
 ## Quick start
 
+Requires `just` 1.49.0 or newer. From the repository root, use
+`just --justfile deploy/cluster/justfile <recipe>`, or run in this directory:
+
 ```sh
 cd deploy/cluster
-make container-up      # tofu apply → node contract → ansible/cluster.yml
-make container-test    # one shard's gates against that cluster (SHARD=load)
-make container-down    # tofu destroy: containers and their volumes
-make container-reset   # destroy, then a fresh chain
-make shard SHARD=chaos-executor   # one shard end to end, the way CI runs it
+just container-up      # tofu apply → node contract → ansible/cluster.yml
+just container-test    # one shard's gates against that cluster (default: load)
+just container-down    # tofu destroy: containers and their volumes
+just container-reset   # destroy, then a fresh chain
+just shard chaos-executor   # one shard end to end, the way CI runs it
 ```
 
 The gates are the `kardamom-chaos` crate: one `#[ignore]` test per shard in
@@ -128,7 +131,7 @@ so the node-class model has one source. It creates:
   on `systemctl is-system-running`.
 
 `tofu apply` returns when systemd in every node is ready. `tofu output
-node_contract` is the version 1 node contract. `make container-up` writes it
+node_contract` is the version 1 node contract. `just container-up` writes it
 to `terraform/containers/node-contract.json`, and `ansible/containers.yml`
 builds the in-memory inventory from it, prepares the host network
 (`roles/host_prep`: socket buffers, bridge netfilter, multicast snooping)
@@ -136,9 +139,9 @@ and runs `bootstrap.yml` on the `container_nodes` group.
 
 Terraform replaces a container when its image changes, which discards the
 root filesystem of that node. A change to `node.Dockerfile` therefore gives
-a fresh chain on the next `make container-up`. The Terraform state in
+a fresh chain on the next `just container-up`. The Terraform state in
 `terraform/containers/` is the record of the running cluster; a second
-`make container-up` is a no-op apply followed by a convergence run.
+`just container-up` is a no-op apply followed by a convergence run.
 Containers that an older harness left behind under the same names block the
 first apply. Remove them once:
 
@@ -152,7 +155,7 @@ Remove the old volumes too: Terraform adopts an existing volume by name, and
 an old `kardamom-<node>-docker` volume would carry stale inner Docker state
 into the new node.
 
-CI runs `make shard SHARD=<name>` per matrix entry, and `container-diagnostics`
+CI runs `just shard <name>` per matrix entry, and `container-diagnostics`
 on failure. A failed shard leaves the cluster up; the runner is ephemeral, so
 nothing destroys it after. Pass extra vars to `ansible/cluster.yml` with
 `CLUSTER_VARS='{"images_tag": "x"}'` (one JSON object, no single quote).
@@ -226,8 +229,7 @@ Both image paths now share `ansible/images.yml`. From the repository root:
 ansible-playbook -i localhost, deploy/cluster/ansible/images.yml
 ```
 
-`make images` invokes source mode; the container CI runner invokes prebuilt mode.
-Both build Aeron, the six Rust services, and the Java cluster image. The playbook
+`just images` and the container CI runner both use prebuilt artifacts to build Aeron, the six Rust services, and the Java cluster image. The playbook
 uses `community.docker.docker_image_build` and requires Docker Buildx and a builder
 that loads its result into the local Docker engine. Builds re-evaluate source
 changes while retaining BuildKit's layer cache.
@@ -276,7 +278,7 @@ They do not replace a real Docker build and cluster smoke run.
 ```
 deploy/cluster/
   DESIGN.md                 design rationale (original; recorder tier since removed)
-  Makefile                  container-up / container-test / shard / container-down /
+  justfile                  container-up / container-test / shard / container-down /
                             images / deploy / smoke / validate / check-contract
   ansible/
     ansible.cfg
@@ -470,6 +472,6 @@ drain, the controller submits the target table alone. A dry run writes no files.
 
 For manual sequencer submissions, pass the current table as the `shard_table`
 Nomad variable. Omitting it selects the two-lane development identity map.
-Use `make check-contract` for the Ansible contract assertions. Routing hashes,
+Use `just check-contract` for the Ansible contract assertions. Routing hashes,
 rebalance behavior, and funded-account coverage are checked by Rust tests.
 The Python files under `ansible/tests` remain isolated test fixtures and runners.
