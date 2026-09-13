@@ -35,7 +35,7 @@ RUN python3 -m venv /opt/ansible && \
 ENV PATH=/opt/ansible/bin:${PATH}
 
 # Same connection plugin the cluster-e2e workflow installs.
-RUN ansible-galaxy collection install ansible.posix community.docker >/dev/null
+RUN ansible-galaxy collection install ansible.posix community.docker community.general >/dev/null
 
 # Nomad CLI — keep the version in sync with ansible/group_vars/all.yml
 # (nomad_version). Arch-dynamic so the image builds on amd64 and arm64.

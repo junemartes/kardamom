@@ -72,7 +72,7 @@ host tools below for your platform, and `just cluster-doctor` verifies them.
 - For the **VM path**: [Vagrant](https://www.vagrantup.com/) + libvirt
   (primary) or VirtualBox (fallback).
 - Ansible (`ansible-playbook`) + collections:
-  `ansible-galaxy collection install ansible.posix community.docker`.
+  `ansible-galaxy collection install ansible.posix community.docker community.general`.
 - Docker (with the Buildx plugin) to build + push the service/Aeron images.
 - Images are pushed from inside the control node (`REGISTRY_PUSH_NODE`,
   the Makefile default), where the registry name `registry.service.consul`

@@ -6,6 +6,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::Context;
+use kardamom_types::shard_map::ShardMap;
 
 use crate::contract::NodeContract;
 use crate::lifecycle::NOMAD_HTTP_PORT;
@@ -20,7 +21,6 @@ const JOB: &str = "nomad/sequencer.nomad.hcl";
 const INGRESS_JOB: &str = "nomad/ingress.nomad.hcl";
 const GROUP_VARS: &str = "ansible/group_vars/all.yml";
 const DIGESTS: &str = "images.digests";
-const RENDER_JOB: &str = "scripts/render-sequencer-job.py";
 /// Lane `n` exports on `9001 + 10n`.
 const LANE_STRIDE: u16 = 10;
 const MAX_LANES: u32 = 8;
@@ -97,7 +97,8 @@ impl Resize {
             !self.path(NEXT_MAP).exists(),
             "a resize is in flight ({NEXT_MAP} exists); finish or remove it first"
         );
-        let current = lanes_of_map(&std::fs::read_to_string(&map)?)?;
+        let previous: ShardMap = toml::from_str(&std::fs::read_to_string(&map)?)?;
+        let current = u32::from(previous.active_lanes());
         anyhow::ensure!(current != self.target, "already at {} lanes", self.target);
         self.preflight(current).await?;
         crate::log(format!(
@@ -105,24 +106,38 @@ impl Resize {
             self.target,
             self.tx_ttl.as_secs()
         ));
-        let next =
-            toml::from_str::<kardamom_types::shard_map::ShardMap>(&std::fs::read_to_string(&map)?)?
-                .rebalance(self.target)?;
-        std::fs::write(self.path(NEXT_MAP), toml::to_string(&next)?)?;
-        self.render(RENDER_JOB, &["--map", NEXT_MAP, "--from", MAP], JOB)?;
-        let gaining = gaining_lanes(&std::fs::read_to_string(self.path(JOB))?, self.target);
+        let next = previous.rebalance(self.target)?;
+        if !self.dry_run {
+            std::fs::write(self.path(NEXT_MAP), toml::to_string(&next)?)?;
+        }
+        let gaining: Vec<u32> = (0..next.active_lanes())
+            .filter(|lane| {
+                !next
+                    .vslot_set(*lane)
+                    .difference(&previous.vslot_set(*lane))
+                    .is_empty()
+            })
+            .map(u32::from)
+            .collect();
         crate::log(format!(
             "lanes that gain vslots (shadow first): {}",
             join(&gaining)
         ));
-        self.run_job(JOB, "sequencer", "overlap: new lanes in shadow mode")
+        self.run_sequencer(&next, Some(&previous), "overlap: new lanes in shadow mode")
             .await?;
         self.wait_running("sequencer").await?;
         self.wait_lanes(&gaining, SHADOW, "warm-up").await?;
-        std::fs::copy(self.path(NEXT_MAP), &map).context("promote the next map")?;
-        let version = map_version(&std::fs::read_to_string(&map)?);
-        self.run_job(INGRESS_JOB, "ingress", &format!("ingress on map {version}"))
-            .await?;
+        if !self.dry_run {
+            std::fs::copy(self.path(NEXT_MAP), &map).context("promote the next map")?;
+        }
+        let version = next.version();
+        self.run_job(
+            INGRESS_JOB,
+            "ingress",
+            &format!("ingress on map {version}"),
+            &[],
+        )
+        .await?;
         self.wait_running("ingress").await?;
         crate::log(format!(
             "drain: waiting tx_ttl ({}s)",
@@ -133,11 +148,12 @@ impl Resize {
         }
         let old: Vec<u32> = (0..current).collect();
         self.wait_lanes(&old, PENDING, "drain").await?;
-        self.render(RENDER_JOB, &["--map", MAP], JOB)?;
-        self.run_job(JOB, "sequencer", "steady: final vslot sets")
+        self.run_sequencer(&next, None, "steady: final vslot sets")
             .await?;
         self.wait_running("sequencer").await?;
-        std::fs::remove_file(self.path(NEXT_MAP)).context("remove the next map")?;
+        if !self.dry_run {
+            std::fs::remove_file(self.path(NEXT_MAP)).context("remove the next map")?;
+        }
         crate::log(format!("done: {} active lanes.", self.target));
         self.log_commit_advice();
         Ok(())
@@ -244,22 +260,23 @@ impl Resize {
         Ok(())
     }
 
-    /// Run a generator and write its output to `out` under the cluster
-    /// directory.
-    fn render(&self, script: &str, args: &[&str], out: &str) -> anyhow::Result<()> {
-        let output = std::process::Command::new("python3")
-            .arg(self.path(script))
-            .args(args)
-            .current_dir(&self.cluster_dir)
-            .stdin(Stdio::null())
-            .output()
-            .with_context(|| format!("run {script}"))?;
-        anyhow::ensure!(
-            output.status.success(),
-            "{script} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        std::fs::write(self.path(out), output.stdout).with_context(|| format!("write {out}"))
+    async fn run_sequencer(
+        &self,
+        next: &ShardMap,
+        previous: Option<&ShardMap>,
+        what: &str,
+    ) -> anyhow::Result<()> {
+        let mut vars = vec![format!(
+            "shard_table={}",
+            serde_json::to_string(next.table().as_slice())?
+        )];
+        if let Some(previous) = previous {
+            vars.push(format!(
+                "previous_shard_table={}",
+                serde_json::to_string(previous.table().as_slice())?
+            ));
+        }
+        self.run_job(JOB, "sequencer", what, &vars).await
     }
 
     /// The pinned image of a service from the digest manifest, when the
@@ -269,7 +286,13 @@ impl Resize {
         image_ref_in(&manifest, service)
     }
 
-    async fn run_job(&self, file: &str, service: &str, what: &str) -> anyhow::Result<()> {
+    async fn run_job(
+        &self,
+        file: &str,
+        service: &str,
+        what: &str,
+        vars: &[String],
+    ) -> anyhow::Result<()> {
         let image = self
             .image_ref(service)
             .map(|r| format!("image_ref={r}"))
@@ -278,6 +301,7 @@ impl Resize {
         let args: Vec<String> = ["job".to_string(), "run".to_string()]
             .into_iter()
             .chain(image)
+            .chain(vars.iter().flat_map(|v| ["-var".to_string(), v.clone()]))
             .chain(std::iter::once(file.to_string()))
             .collect();
         crate::log(format!("nomad {} ({what})", args.join(" ")));
@@ -322,7 +346,7 @@ impl Resize {
     fn log_commit_advice(&self) {
         if matches!(self.target, 1 | 2 | 4 | 8) {
             crate::log(format!(
-                "commit together: {MAP}, {JOB}, {GROUP_VARS} (partition_count: {}), {INGRESS_JOB} (\"--shards\", \"{}\").",
+                "commit together: {MAP}, {GROUP_VARS} (partition_count: {}), {INGRESS_JOB} (\"--shards\", \"{}\").",
                 self.target, self.target
             ));
             return;
@@ -356,50 +380,6 @@ fn join(lanes: &[u32]) -> String {
         .join(" ")
 }
 
-/// The active lane count of a shard map: the highest lane in the table
-/// plus one.
-///
-/// # Errors
-///
-/// Returns an error if the map has no table.
-pub fn lanes_of_map(toml: &str) -> anyhow::Result<u32> {
-    let start = toml.find("table").context("shard map has no table")?;
-    let body = &toml[start..];
-    let open = body.find('[').context("shard map table has no [")?;
-    let close = body.find(']').context("shard map table has no ]")?;
-    let max = body[open.saturating_add(1)..close]
-        .split(',')
-        .filter_map(|s| s.trim().parse::<u32>().ok())
-        .max()
-        .context("shard map table is empty")?;
-    Ok(max.saturating_add(1))
-}
-
-/// The `version = N` line of a shard map.
-fn map_version(toml: &str) -> String {
-    toml.lines()
-        .find_map(|l| l.strip_prefix("version = "))
-        .unwrap_or("?")
-        .trim()
-        .to_string()
-}
-
-/// The lanes whose group in the rendered job carries `--shadow-vslots`.
-fn gaining_lanes(job: &str, target: u32) -> Vec<u32> {
-    (0..target)
-        .filter(|lane| group_block(job, *lane).is_some_and(|b| b.contains("\"--shadow-vslots\"")))
-        .collect()
-}
-
-/// The text of `group "seq-<lane>"` up to its closing brace at two
-/// spaces of indentation.
-fn group_block(job: &str, lane: u32) -> Option<&str> {
-    let start = job.find(&format!("group \"seq-{lane}\""))?;
-    let rest = &job[start..];
-    let end = rest.find("\n  }").unwrap_or(rest.len());
-    Some(&rest[..end])
-}
-
 /// The transaction TTL of the deployment, rounded up to whole seconds.
 fn tx_ttl_in(group_vars: &str) -> anyhow::Result<Duration> {
     let millis: u64 = group_vars
@@ -427,19 +407,28 @@ fn image_ref_in(manifest: &str, service: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_map_gives_its_lane_count_and_version() {
-        let map = "version = 2\ntable = [\n  0, 1, 2, 0,\n]\n";
-        assert_eq!(lanes_of_map(map).unwrap(), 3);
-        assert_eq!(map_version(map), "2");
-        assert!(lanes_of_map("nothing").is_err());
-    }
-
-    #[test]
-    fn a_lane_gains_when_its_group_runs_in_shadow_mode() {
-        let job = "  group \"seq-0\" {\n    args = [\"--vslots\", \"1\"]\n  }\n  group \"seq-1\" {\n    args = [\"--shadow-vslots\", \"3\"]\n  }\n";
-        assert_eq!(gaining_lanes(job, 2), vec![1]);
-        assert_eq!(gaining_lanes(job, 1), Vec::<u32>::new());
+    #[tokio::test]
+    async fn dry_run_preserves_the_map_and_creates_no_resize_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("config")).unwrap();
+        let original = toml::to_string(&ShardMap::identity(2).unwrap()).unwrap();
+        std::fs::write(dir.path().join(MAP), &original).unwrap();
+        let resize = Resize {
+            cluster_dir: dir.path().to_path_buf(),
+            nomad_addr: "http://127.0.0.1:1".to_string(),
+            sequencers: Vec::new(),
+            tx_ttl: Duration::from_secs(1),
+            target: 3,
+            dry_run: true,
+            scrape: Scrape::new(),
+        };
+        resize.run().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(MAP)).unwrap(),
+            original
+        );
+        assert!(!dir.path().join(NEXT_MAP).exists());
+        assert!(!dir.path().join(JOB).exists());
     }
 
     #[test]
