@@ -49,6 +49,8 @@ consul_client_addr: "0.0.0.0"
 consul_gossip_key: ""
 consul_acl_enabled: false
 consul_agent_token: ""
+# Authorizes local DNS and tokenless reads; policy grants service/node read only.
+consul_dns_token: ""
 nomad_acl_enabled: false
 nomad_consul_token: ""
 # The directory with the agent TLS material on each host: ca.pem,
