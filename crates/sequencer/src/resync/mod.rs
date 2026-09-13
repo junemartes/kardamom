@@ -652,6 +652,7 @@ impl ResyncController {
             return;
         }
         self.active = true;
+        metrics::record_resync_mode(self.partition, true);
         metrics::record_resync_enter(self.partition);
         // This is a stable grep target for the chaos suite. Keep the
         // "sequencer RESYNC enter" prefix in lockstep with
