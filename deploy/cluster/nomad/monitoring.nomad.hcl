@@ -1,17 +1,19 @@
 # kardamom-monitoring: Prometheus and Grafana on the aux node.
 #
 # Prometheus scrapes every service's metrics endpoint by its Consul node
-# name, rendered from the node-class counts: no address in this file.
-# Grafana provisions the Prometheus datasource by the Consul service
-# name and the dashboards from deploy/grafana (one source for every
-# profile). The autoscaler's Prometheus APM reads the same service.
+# name, rendered from the node-class counts: no address in this file. It
+# evaluates the alert rules of deploy/alerts.yml. Grafana provisions the
+# Prometheus datasource by the Consul service name and the dashboards
+# from deploy/grafana/provisioning/dashboards-json. This job is the one
+# monitoring stack of every profile. The autoscaler's Prometheus APM
+# reads the same service.
 #
 # Placement: the aux node, next to the validator and the da-watcher,
 # outside the chaos suite's blast radius. Ports on the aux node:
 # Prometheus 9090, Grafana 3000.
 #
-# This job uses file() for its dashboards, so submit it from
-# deploy/cluster (the workloads role does).
+# This job uses file() for its dashboards and alert rules, so submit it
+# from deploy/cluster (the workloads role does).
 
 variable "datacenter" {
   type        = string
@@ -80,6 +82,7 @@ locals {
   dashboards = [
     "kardamom-overview", "kardamom-ingress", "kardamom-sequencer",
     "kardamom-executor", "kardamom-sealer", "kardamom-batcher", "kardamom-da-watcher",
+    "kardamom-validator",
   ]
 }
 
@@ -169,8 +172,22 @@ job "monitoring" {
           global:
             scrape_interval: 1s
             evaluation_interval: 5s
+          # Prometheus evaluates the rules and shows firing alerts on its
+          # /alerts page. No Alertmanager is wired; route the alerts there
+          # when a pager exists.
+          rule_files:
+            - /local/alerts.yml
           ${local.targets_yaml}
         EOT
+      }
+
+      # The alert rules carry Prometheus's own {{ }} templates, so the
+      # consul-template delimiters move out of their way.
+      template {
+        destination     = "local/alerts.yml"
+        data            = file("../alerts.yml")
+        left_delimiter  = "[[["
+        right_delimiter = "]]]"
       }
 
       resources {
