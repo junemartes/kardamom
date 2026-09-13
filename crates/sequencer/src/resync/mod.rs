@@ -402,13 +402,20 @@ fn drain_bounded_step<T>(
         Ok(item) => ControlFlow::Continue(item),
         Err(TryRecvError::Empty) => ControlFlow::Break(()),
         Err(TryRecvError::Disconnected) => {
-            if !*dead {
-                *dead = true;
-                tracing::warn!(partition, "{}", on_dead);
-            }
+            warn_once_dead(dead, partition, on_dead);
             ControlFlow::Break(())
         }
     }
+}
+
+/// Log the channel-dead warning once. A later call after `dead` is set
+/// stays silent, so a closed channel does not spam the log on every poll.
+fn warn_once_dead(dead: &mut bool, partition: u32, on_dead: &str) {
+    if *dead {
+        return;
+    }
+    *dead = true;
+    tracing::warn!(partition, "{}", on_dead);
 }
 
 /// One drain of the receipts channel: `(raised_floors, confirmations)`.
@@ -584,29 +591,42 @@ impl ResyncController {
             self.enter(EnterReason::BoundarySilence { silent_ms: gap_ms });
         }
         if w != self.last_watermark {
-            // Record the gauge only on change. observe runs every loop
-            // iteration, and the metrics macro allocates its label each call.
-            metrics::record_canonical_watermark(self.partition, w);
-            if w >= self.last_watermark {
-                let jump = w - self.last_watermark;
-                if self.watermark_seen && jump >= self.enter_threshold.get() {
-                    self.enter(EnterReason::WatermarkJump { gap: jump });
-                }
-            } else {
-                // The canonical count must never go backwards. Log this
-                // instead of silently clamping the jump to 0: a
-                // regression is a sealer fault, not a routine event.
-                tracing::warn!(
-                    partition = self.partition,
-                    previous = self.last_watermark,
-                    observed = w,
-                    "canonical watermark regressed; this should never happen (sealer fault?)"
-                );
-            }
-            self.last_watermark = w;
-            self.watermark_seen = true;
+            self.observe_watermark_change(w);
         }
         self.maybe_exit(now);
+    }
+
+    /// Handle a canonical-watermark change from `self.last_watermark` to
+    /// `w`. Records the gauge, enters resync on too large a jump, and
+    /// warns on a regression (a sealer fault). Updates `last_watermark`
+    /// either way.
+    fn observe_watermark_change(&mut self, w: u64) {
+        // Record the gauge only on change. observe runs every loop
+        // iteration, and the metrics macro allocates its label each call.
+        metrics::record_canonical_watermark(self.partition, w);
+        if w >= self.last_watermark {
+            self.check_watermark_jump(w - self.last_watermark);
+        } else {
+            // The canonical count must never go backwards. Log this
+            // instead of silently clamping the jump to 0: a regression is
+            // a sealer fault, not a routine event.
+            tracing::warn!(
+                partition = self.partition,
+                previous = self.last_watermark,
+                observed = w,
+                "canonical watermark regressed; this should never happen (sealer fault?)"
+            );
+        }
+        self.last_watermark = w;
+        self.watermark_seen = true;
+    }
+
+    /// Enter resync if `jump`, the amount the canonical watermark
+    /// advanced this tick, crosses the configured threshold.
+    fn check_watermark_jump(&mut self, jump: u64) {
+        if self.watermark_seen && jump >= self.enter_threshold.get() {
+            self.enter(EnterReason::WatermarkJump { gap: jump });
+        }
     }
 
     /// The publish path hit backpressure (or a not-connected session) with
