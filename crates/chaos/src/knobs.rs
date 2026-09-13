@@ -24,6 +24,35 @@ pub struct Squeeze {
 }
 
 /// The suite settings. See the module doc for the defaults.
+/// One fixed-rate run of the sustained-load stage.
+#[derive(Debug, Clone)]
+pub struct SoakRun {
+    pub duration: Duration,
+    pub tps: NonZeroU32,
+    pub senders: NonZeroU32,
+}
+
+/// The chain-semantics stage: which cases, how long a receipt may park,
+/// the first funded account, and a settlement address when known.
+#[derive(Debug, Clone)]
+pub struct Semantics {
+    pub cases: String,
+    pub park: Duration,
+    pub account_base: u32,
+    pub settlement: Option<String>,
+}
+
+/// The values of the non-chaos stages: the two load runs, the semantics
+/// suite, and the validator verdict.
+#[derive(Debug, Clone)]
+pub struct Stages {
+    pub transfers: SoakRun,
+    pub defi: SoakRun,
+    pub semantics: Semantics,
+    pub validator_lag_max: i64,
+    pub validator_sync_timeout: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct Knobs {
     /// The L2 chain id. The ingress `eth_chainId` returns a default that
@@ -71,6 +100,8 @@ pub struct Knobs {
     /// Whether the load stage ran on this cluster, which decides whether
     /// the resize case may take a load-reserve account.
     pub run_load: bool,
+    /// The values of the non-chaos stages.
+    pub stages: Stages,
 }
 
 /// The setting source: the process environment first, then the shard's
@@ -112,6 +143,38 @@ impl Source<'_> {
     fn u32(&self, name: &str, default: u32) -> anyhow::Result<u32> {
         u32::try_from(self.u64(name, u64::from(default))?)
             .with_context(|| format!("{name} does not fit a u32"))
+    }
+
+    fn i64(&self, name: &str, default: i64) -> anyhow::Result<i64> {
+        self.or(name, &default.to_string())
+            .parse()
+            .with_context(|| format!("{name} is not a number"))
+    }
+
+    fn stages(&self) -> anyhow::Result<Stages> {
+        Ok(Stages {
+            transfers: SoakRun {
+                duration: self.secs("LOAD_DURATION_S", 60)?,
+                tps: self.nonzero_u32("LOAD_TARGET_TPS", 200)?,
+                senders: self.nonzero_u32("LOAD_SENDERS", 6)?,
+            },
+            defi: SoakRun {
+                duration: self.secs("DEFI_DURATION_S", 45)?,
+                tps: self.nonzero_u32("DEFI_TARGET_TPS", 100)?,
+                senders: self.nonzero_u32("DEFI_SENDERS", 6)?,
+            },
+            semantics: Semantics {
+                cases: self.or(
+                    "SEMANTICS_CASES",
+                    "nonce-unordered,nonce-gap,rpc-liveness,rpc-vectors,consistency,l1-batch",
+                ),
+                park: Duration::from_millis(self.u64("SEMANTICS_PARK_MS", 30_000)?),
+                account_base: self.u32("SEMANTICS_ACCOUNT_BASE", 1)?,
+                settlement: self.get("SETTLEMENT_ADDRESS").filter(|s| !s.is_empty()),
+            },
+            validator_lag_max: self.i64("VALIDATOR_LAG_MAX", 10)?,
+            validator_sync_timeout: self.secs("VALIDATOR_SYNC_TIMEOUT_S", 180)?,
+        })
     }
 }
 
@@ -168,6 +231,7 @@ impl Knobs {
                 release: env.secs("SQUEEZE_RELEASE_S", 30)?,
             },
             run_load: env.or("RUN_LOAD", "1") == "1",
+            stages: env.stages()?,
         })
     }
 
@@ -197,5 +261,15 @@ mod tests {
         assert_eq!(knobs.cluster_retention.map(NonZeroU64::get), Some(6144));
         assert_eq!(knobs.reschedule_slo, Duration::from_secs(200));
         assert!(Knobs::read(&[("CHAOS_TPS", "0")]).is_err());
+    }
+
+    #[test]
+    fn the_load_shard_values_reach_the_stages() {
+        let knobs = Knobs::read(&[("LOAD_DURATION_S", "300"), ("LOAD_TARGET_TPS", "300")]).unwrap();
+        assert_eq!(knobs.stages.transfers.duration, Duration::from_secs(300));
+        assert_eq!(knobs.stages.transfers.tps.get(), 300);
+        assert_eq!(knobs.stages.defi.tps.get(), 100);
+        assert_eq!(knobs.stages.semantics.account_base, 1);
+        assert!(knobs.stages.semantics.settlement.is_none());
     }
 }

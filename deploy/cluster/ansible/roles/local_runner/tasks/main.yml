@@ -108,11 +108,20 @@
             var: local_runner_converge.stdout_lines
           when: local_runner_operation != 'down'
 
-        - name: Run the smoke, load and chaos gates
+        # The orchestrator has no Rust toolchain: the builder staged the
+        # shard test executable, and the runner executes it against the
+        # cluster container-up made.
+        - name: Run the shard's gates
           community.docker.docker_container_exec:
             container: "{{ local_runner_container }}"
-            argv: [make, -C, /work/deploy/cluster, container-test]
-            env: "{{ local_runner_environment }}"
+            argv:
+              - /work/target/release/kardamom-chaos-shards
+              - --ignored
+              - --exact
+              - "{{ local_runner_shard | replace('-', '_') }}"
+              - --nocapture
+            chdir: /work/deploy/cluster
+            env: "{{ local_runner_environment | combine({'KARDAMOM_CHAOS_REUSE': '1'}) }}"
           register: local_runner_verdict
           when:
             - local_runner_operation != 'down'
@@ -132,7 +141,8 @@
         - name: Collect diagnostics before teardown
           community.docker.docker_container_exec:
             container: "{{ local_runner_container }}"
-            argv: [make, -C, /work/deploy/cluster, container-diagnostics]
+            argv: [/work/target/release/kardamom-cluster, diagnostics]
+            chdir: /work/deploy/cluster
           register: local_runner_diagnostics
           failed_when: false
 

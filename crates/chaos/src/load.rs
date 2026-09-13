@@ -14,7 +14,8 @@ use kardamom_bench::load::{self, Completeness, LoadConfig, SenderRange, Workload
 use serde::Deserialize;
 
 /// The burn address of every load transfer.
-const SINK: Address = address!("000000000000000000000000000000000000dEaD");
+/// The burn address of every load transfer.
+pub const SINK: Address = address!("000000000000000000000000000000000000dEaD");
 
 /// The verdict fields the suite reads back from the report.
 #[derive(Debug, Clone, Deserialize)]
@@ -104,11 +105,18 @@ impl LoadRun {
     ///
     /// Returns an error if the configuration is invalid.
     pub fn start(spec: &LoadSpec) -> anyhow::Result<Self> {
-        let cfg = spec.config()?;
-        Ok(Self {
+        Ok(Self::from_config(spec.config()?, spec.report_path.clone()))
+    }
+
+    /// Start a run from a full configuration, for the stages whose shape
+    /// [`LoadSpec`] does not express: a fixed rate, many senders, defi.
+    /// `report_path` is where `cfg.output` writes the report.
+    #[must_use]
+    pub fn from_config(cfg: LoadConfig, report_path: PathBuf) -> Self {
+        Self {
             task: tokio::spawn(load::run(cfg)),
-            report_path: spec.report_path.clone(),
-        })
+            report_path,
+        }
     }
 
     /// Whether the load task has already ended, which before the window

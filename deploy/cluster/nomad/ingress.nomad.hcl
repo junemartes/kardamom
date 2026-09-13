@@ -152,7 +152,7 @@ job "ingress" {
           "--shards", "2",
           # The versioned vslot-to-lane map (config/shard-map.toml). A
           # resize re-renders it and rolls this job; see
-          # scripts/scale-sequencers.sh.
+          # `kardamom-cluster scale-sequencers`.
           "--shard-map", "/local/shard-map.toml",
           "--jsonrpc-bind", "0.0.0.0:8545",
           # The submit park bound. It equals the sequencer transaction

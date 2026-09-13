@@ -27,6 +27,7 @@ pub mod accounts;
 pub mod asserts;
 pub mod cases;
 pub mod contract;
+pub mod diagnostics;
 pub mod evidence;
 pub mod harness;
 pub mod inject;
@@ -39,7 +40,9 @@ pub mod nomad;
 pub mod poll;
 pub mod probes;
 pub mod rpc;
+pub mod scale;
 pub mod shard;
+pub mod stages;
 
 pub use contract::{Node, NodeContract};
 pub use harness::Harness;

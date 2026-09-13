@@ -8,6 +8,10 @@ description = "The container cluster chaos suite: lifecycle, probes, injectors, 
 name = "kardamom_chaos"
 path = "src/lib.rs"
 
+[[bin]]
+name = "kardamom-cluster"
+path = "src/bin/kardamom-cluster.rs"
+
 [features]
 default = []
 # Gates the shard tests under tests/. They bring a container cluster up
@@ -22,6 +26,7 @@ alloy-eips.workspace = true
 alloy-network.workspace = true
 alloy-primitives.workspace = true
 anyhow.workspace = true
+clap.workspace = true
 kardamom-bench = { path = "../bench" }
 reqwest.workspace = true
 serde.workspace = true

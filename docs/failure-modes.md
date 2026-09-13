@@ -2,7 +2,7 @@
 
 How each kardamom actor fails, what it costs, how it recovers, and where that
 behavior is verified. Grounded in the failover specs (`docs/agents/`), the
-chaos suite (`deploy/cluster/scripts/chaos.sh` — case names appear like
+chaos suite (`crates/chaos`, one case per function — case names appear like
 `cluster-leader-kill` throughout; most run in CI via
 `.github/workflows/cluster-e2e.yml`), and the recovery code itself.
 

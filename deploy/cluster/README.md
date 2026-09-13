@@ -52,9 +52,10 @@ Terraform variables of a Hetzner deployment, and the Vagrantfile with
 `ansible/inventory.ini` for the VM path. An image build captures the
 recursors of the build server, so every elastic node forwards to them.
 
-Scripts that run on the Docker host, outside the cluster resolver, ask
-Docker for a container's address (`node_address` in `lib-topology.sh`),
-and the Makefile reads the control node address from the node contract.
+The test suite and the operator commands (`crates/chaos`) run on the
+Docker host, outside the cluster resolver; they read every node address
+from the node contract, and the Makefile reads the control node address
+from it too.
 
 Every non-control node also runs the Aeron `ArchivingMediaDriver` (the `aeron`
 Nomad system job). There is **no standalone sealer binary and no
@@ -117,10 +118,22 @@ make down      # stop jobs + vagrant destroy
 ```sh
 cd deploy/cluster
 make container-up      # tofu apply → node contract → ansible/cluster.yml
-make container-test    # smoke, load and chaos gates (RUN_LOAD, RUN_CHAOS, ...)
+make container-test    # one shard's gates against that cluster (SHARD=load)
 make container-down    # tofu destroy: containers and their volumes
 make container-reset   # destroy, then a fresh chain
+make shard SHARD=chaos-executor   # one shard end to end, the way CI runs it
 ```
+
+The gates are the `kardamom-chaos` crate: one `#[ignore]` test per shard in
+`crates/chaos/tests/shards.rs` (`load`, `semantics`, `chaos-executor`,
+`chaos-ingress`, `chaos-sequencer`, `chaos-cluster`, `chaos-retention`). A
+shard test brings the cluster up itself; `container-test` runs it with
+`KARDAMOM_CHAOS_REUSE=1` against the cluster `container-up` made.
+`KARDAMOM_CHAOS_CASES="graceful-executor"` narrows a chaos shard to some
+cases; the other knobs (`CHAOS_TPS`, `LOAD_DURATION_S`, ...) are the
+environment variables `crates/chaos/src/knobs.rs` reads. The operator
+commands are `kardamom-cluster smoke | diagnostics | scale-sequencers`
+(`cargo run -p kardamom-chaos --bin kardamom-cluster -- ...`).
 
 `terraform/containers` is the Terraform root that owns the node containers.
 It reads `ip_prefix` and `node_classes` from `ansible/group_vars/all.yml`,
@@ -159,9 +172,9 @@ Remove the old volumes too: Terraform adopts an existing volume by name, and
 an old `kardamom-<node>-docker` volume would carry stale inner Docker state
 into the new node.
 
-CI runs the same targets as workflow steps: `container-up`, `container-test`,
-and `container-diagnostics` on failure. The runner is ephemeral, so CI does
-not destroy the cluster. Pass extra vars to `ansible/cluster.yml` with
+CI runs `make shard SHARD=<name>` per matrix entry, and `container-diagnostics`
+on failure. A failed shard leaves the cluster up; the runner is ephemeral, so
+nothing destroys it after. Pass extra vars to `ansible/cluster.yml` with
 `CLUSTER_VARS='{"images_tag": "x"}'` (one JSON object, no single quote).
 `ansible/cluster.yml` is the convergence playbook; it expects the node contract.
 
@@ -212,7 +225,7 @@ with `nomad job run -output`, plans changes, and registers only changed jobs.
 Registration uses Nomad's job modify index to reject concurrent edits. Readiness
 requires the current job version's running allocations for **every task group**,
 including every Aeron node and both racing sequencer groups. Allocation readiness
-is followed by the existing smoke/chaos application checks in CI.
+is followed by the smoke, load and chaos gates of `crates/chaos` in CI.
 
 Configuration lives in `ansible/roles/workloads/defaults/main.yml`. Existing
 `NOMAD_ADDR`, `DIGEST_MANIFEST`, `KARDAMOM_REQUIRE_SIGNED`, settlement, light-client,
@@ -350,13 +363,13 @@ deploy/cluster/
   config/                   *.toml(.tpl) pulled into the job specs via file();
                             channels.toml.tpl is the shared LogConfig
   scripts/
-    lib.sh                  shared control-node helpers (nomad via docker exec)
-    smoke.sh                single-tx smoke test against ingress
-    smoke-load.sh           bash sustained-load smoke (legacy fallback)
-    run-tests.sh            smoke/load/chaos gates (no provisioning)
-    chaos.sh                chaos suite (kill components under load)
     check-contract.py       fail if any mirror of group_vars/all.yml drifts
+    render-shard-map.py     the vslot-to-lane map generator
+    render-sequencer-job.py the sequencer job generator (one group per lane)
 ```
+
+The gates, the chaos cases and the operator commands are Rust:
+`crates/chaos` (`tests/shards.rs`, `src/cases/`, `src/bin/kardamom-cluster.rs`).
 
 The Nomad job specs pull their config payloads from `config/` with HCL2
 `file()`, so manual CLI submissions must run **from `deploy/cluster/`**.
@@ -488,11 +501,11 @@ across runners** (each shard brings up its own container cluster):
 | `chaos-sequencer` | graceful + hard kill + **sequencer-replica-kill** (racing-twin failover, restarted replica must regain coverage) + **validator-lapse** |
 | `chaos-cluster` | Raft sealer: **leader-kill** / **follower-kill** / **quorum-loss-recover** |
 
-`kardamom-load` is the harness (`crates/bench/src/load/`); `chaos.sh` injects
-the failures under steady load and asserts Nomad auto-recovery + pipeline
-progress + the load verdict. The old single-sealer `sealer-hard` SPOF case
-([#58]) is superseded by the Raft cluster cases (a `sealer-hard` arm is kept
-in `chaos.sh` only for legacy single-sealer deploys). Remaining untested
-surface is tracked in `docs/failure-modes.md` ("Known gaps").
+`kardamom-load` is the harness (`crates/bench/src/load/`, run in process);
+`crates/chaos` injects the failures under steady load and asserts Nomad
+auto-recovery + pipeline progress + the load verdict. The old single-sealer
+`sealer-hard` SPOF case ([#58]) is superseded by the Raft cluster cases.
+Remaining untested surface is tracked in `docs/failure-modes.md` ("Known
+gaps").
 
 [#58]: https://github.com/junemartes/kardamom/issues/58

@@ -10,6 +10,7 @@ use anyhow::Context;
 use crate::accounts::ACCT_VSLOT;
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
+use crate::scale::Resize;
 
 const LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
 
@@ -96,40 +97,19 @@ impl MapFiles {
     }
 }
 
-/// Run `scripts/scale-sequencers.sh <lanes>` to completion, capturing
-/// its output.
-async fn scale(cluster_dir: &Path, lanes: u32) -> anyhow::Result<String> {
-    let out = tokio::process::Command::new("./scripts/scale-sequencers.sh")
-        .arg(lanes.to_string())
-        .current_dir(cluster_dir)
-        .output()
-        .await
-        .context("run scale-sequencers.sh")?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    anyhow::ensure!(
-        out.status.success(),
-        "scale-sequencers.sh {lanes} failed:\n{}",
-        tail(&text, 40)
-    );
-    Ok(text)
+/// The in-process resize to `lanes`, the rollout `scale-sequencers`
+/// runs for an operator.
+fn resize(h: &Harness, cluster_dir: &Path, lanes: u32) -> anyhow::Result<Resize> {
+    Resize::new(cluster_dir, &h.contract, lanes, false)
 }
 
 /// Print the lane report of every sequencer replica of `lanes` lanes:
-/// the evidence behind a refused scale step, since the guard in the
-/// script samples each replica once and stops at the first hit.
+/// the evidence behind a refused scale step, since the pre-flight guard
+/// samples each replica once and stops at the first hit.
 async fn report_lanes(h: &Harness, lanes: u8) {
     for line in h.probes.sequencer_lane_report(lanes).await {
         crate::log(format!("resize: {line}"));
     }
-}
-
-fn tail(text: &str, n: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 async fn map_version_is(h: &Harness, ingress: usize, want: i64) -> bool {
@@ -172,10 +152,9 @@ pub(crate) async fn scale_out_in(h: &mut Harness) -> anyhow::Result<()> {
 }
 
 async fn scale_out_in_body(h: &mut Harness, cluster_dir: &Path) -> anyhow::Result<()> {
-    let dir = cluster_dir.to_path_buf();
-    let scale_out = tokio::spawn(async move { scale(&dir, 3).await });
-    let (hs, scale_ref): (&Harness, &tokio::task::JoinHandle<anyhow::Result<String>>) =
-        (h, &scale_out);
+    let to_three = resize(h, cluster_dir, 3)?;
+    let scale_out = tokio::spawn(async move { to_three.run().await });
+    let (hs, scale_ref): (&Harness, &tokio::task::JoinHandle<anyhow::Result<()>>) = (h, &scale_out);
     let outcome = poll::until(Budget::secs(300, 3), |_| async move {
         anyhow::ensure!(
             !scale_ref.is_finished(),
@@ -206,21 +185,15 @@ async fn scale_out_in_body(h: &mut Harness, cluster_dir: &Path) -> anyhow::Resul
     let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
     h.inject_hard(&refs, "sequencer-2").await?;
     h.assert_count("sequencer", 6, h.knobs.restart_slo).await?;
-    let out_log = match scale_out.await.context("join the scale-out task")? {
-        Ok(log) => log,
-        Err(e) => {
-            report_lanes(h, 3).await;
-            return Err(crate::chaos_fail!("resize: scale-out failed: {e}"));
-        }
-    };
-    crate::log(format!(
-        "resize: scale-out 2 -> 3 done ({} steps)",
-        out_log.lines().filter(|l| l.starts_with("==>")).count()
-    ));
+    if let Err(e) = scale_out.await.context("join the scale-out task")? {
+        report_lanes(h, 3).await;
+        return Err(crate::chaos_fail!("resize: scale-out failed: {e}"));
+    }
+    crate::log("resize: scale-out 2 -> 3 done");
     wait_map_version(h, 0, 1).await?;
     wait_map_version(h, 1, 1).await?;
     h.assert_progress().await?;
-    if let Err(e) = scale(cluster_dir, 2).await {
+    if let Err(e) = resize(h, cluster_dir, 2)?.run().await {
         report_lanes(h, 3).await;
         return Err(crate::chaos_fail!("resize: scale-in failed: {e}"));
     }

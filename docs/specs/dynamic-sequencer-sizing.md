@@ -340,7 +340,7 @@ Residual effects:
   map, the port lanes, the `tx_ttl` mirror, and the `ACCT_SHARD` table in
   `chaos.sh`. Outside a resize, the ingress table must equal the union of
   the sequencer vslot sets.
-- **Runbook:** a `scale-sequencers.sh` that runs the seven steps of
+- **Runbook:** a `kardamom-cluster scale-sequencers` command that runs the seven steps of
   section 3.5. It refuses to start a second resize while one is in flight.
   It refuses to start a resize while sealer backpressure is active. The
   runbook owns the overlap window. The contract check owns the steady
@@ -374,7 +374,7 @@ Residual effects:
    take-over.
 6. **Deploy.** Generated Nomad groups, port lanes, the ingress graceful
    drain and `kill_timeout`, the ingress re-render and roll,
-   `scale-sequencers.sh`, and the contract checks.
+   `kardamom-cluster scale-sequencers`, and the contract checks.
 7. **Verification.** An e2e resize-under-load scenario with nonce-gap
    assertions for moved senders. A chaos case: kill a new-shard replica
    during the overlap. A chaos case: all executors unreachable during a

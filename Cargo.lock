@@ -3779,6 +3779,7 @@ dependencies = [
  "alloy-network",
  "alloy-primitives",
  "anyhow",
+ "clap",
  "kardamom-bench",
  "reqwest 0.13.4",
  "serde",

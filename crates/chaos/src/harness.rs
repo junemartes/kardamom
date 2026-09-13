@@ -20,7 +20,8 @@ use crate::poll::{self, Budget};
 use crate::probes::Probes;
 
 /// The port of the ingress JSON-RPC.
-const INGRESS_RPC_PORT: u16 = 8545;
+/// The eth JSON-RPC port of every ingress node.
+pub const INGRESS_RPC_PORT: u16 = 8545;
 
 pub struct Harness {
     pub contract: NodeContract,

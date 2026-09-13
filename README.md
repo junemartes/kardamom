@@ -138,5 +138,6 @@ targets:
 Spec and current coverage: `docs/agents/chain-semantics-e2e-suite-spec.md`.
 
 **Chaos** — *does the pipeline survive faults under load?*
-`deploy/cluster/scripts/chaos.sh`, run by the other `cluster-e2e.yml` shards.
+`crates/chaos` (one test per shard in `tests/shards.rs`), run by the other
+`cluster-e2e.yml` shards.
 Failure modes and where each is verified: `docs/failure-modes.md`.
