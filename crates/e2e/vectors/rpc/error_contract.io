@@ -9,12 +9,15 @@
 >> {"method": "eth_sendRawTransaction", "params": ["${RAW_TX_BADSIG}"]}
 << {"error": {"code": -32602, "message": "signature verification failed"}}
 
-# Deferred state endpoints (S6 pending): clean internal error with the exact
-# documented message — NOT "method not found", NOT a hang.
+# Account state endpoints: the local account layer, then one executor
+# query. The sender is a funded dev account at nonce 0 (submit_receipt runs
+# after this file). Only the head block is served: history is invalid params.
 >> {"method": "eth_getBalance", "params": ["${SENDER}", "latest"]}
-<< {"error": {"code": -32603, "message": "internal server error: eth_getBalance deferred to S6 state writer"}}
+<< {"result": "${HEX}"}
 >> {"method": "eth_getTransactionCount", "params": ["${SENDER}", "latest"]}
-<< {"error": {"code": -32603, "message": "internal server error: eth_getTransactionCount deferred to S6 state writer"}}
+<< {"result": "0x0"}
+>> {"method": "eth_getBalance", "params": ["${SENDER}", "earliest"]}
+<< {"error": {"code": -32602, "message": "${ANY}"}}
 
 # Unknown tx hash → null, not an error.
 >> {"method": "eth_getTransactionReceipt", "params": ["0x00000000000000000000000000000000000000000000000000000000000000aa"]}
