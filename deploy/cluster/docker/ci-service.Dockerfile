@@ -30,7 +30,7 @@ RUN apt-get update && \
         ca-certificates libbsd0 libuuid1 libstdc++6 && \
     rm -rf /var/lib/apt/lists/*
 
-# The binaries link Aeron dynamically; ansible/run.yml stages libaeron.so /
+# The binaries link Aeron dynamically; ansible/images.yml stages libaeron.so /
 # libaeron_archive_c_client.so (from the cargo build dir) into _aeronlibs/ in
 # the build context. Install them where the dynamic linker looks, else the
 # binary aborts at startup with "libaeron.so: cannot open shared object file".

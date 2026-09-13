@@ -1,4 +1,6 @@
 ---
+# Host settings for the container substrate. Runs on the Linux host that
+# owns the node containers, after the Terraform root created the bridge.
 - name: Apply Aeron socket buffers on the Linux host
   become: true
   ansible.posix.sysctl:
@@ -21,7 +23,7 @@
   ansible.builtin.stat:
     path: "/proc/sys/net/bridge/bridge-nf-call-{{ item }}"
   loop: [iptables, ip6tables]
-  register: container_nodes_bridge_controls
+  register: host_prep_bridge_controls
 
 - name: Let bridged multicast bypass host packet filtering
   become: true
@@ -31,5 +33,22 @@
     sysctl_file: /etc/sysctl.d/99-kardamom-container-host.conf
     sysctl_set: true
     reload: true
-  loop: "{{ container_nodes_bridge_controls.results }}"
+  loop: "{{ host_prep_bridge_controls.results }}"
   when: item.stat.exists
+
+- name: Read bridge multicast snooping
+  ansible.builtin.command:
+    argv: [cat, "/sys/class/net/{{ host_prep_bridge }}/bridge/multicast_snooping"]
+  register: host_prep_snooping
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Enable multicast flooding on the isolated test bridge
+  become: true
+  ansible.builtin.command:
+    argv: [tee, "/sys/class/net/{{ host_prep_bridge }}/bridge/multicast_snooping"]
+    stdin: "0"
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - host_prep_snooping.stdout | trim != '0'

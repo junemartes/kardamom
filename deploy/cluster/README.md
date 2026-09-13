@@ -3,10 +3,10 @@
 A reproducible multi-node kardamom test/staging cluster. Two ways to
 materialise the nodes, sharing the same Ansible playbook and Nomad jobs:
 
-- **Containers (the path CI runs):** `ansible/run.yml` boots one
+- **Containers (the path CI runs):** `terraform/containers` creates one
   privileged systemd + Docker-in-Docker container per node on a
-  `192.168.56.0/24` bridge and drives the full bring-up + smoke + load +
-  chaos suite (`.github/workflows/cluster-e2e.yml`).
+  `192.168.56.0/24` bridge. The `container-*` Make targets drive the full
+  bring-up + smoke + load + chaos suite (`.github/workflows/cluster-e2e.yml`).
 - **VMs (Vagrant):** `make up` boots one VM per node (libvirt primary,
   VirtualBox fallback) and provisions them with the same `bootstrap.yml`.
 
@@ -61,8 +61,9 @@ host tools below for your platform, and `just cluster-doctor` verifies them.
   cache, or configured with `workloads_cosign_binary`.
 - **JDK 17 + Gradle wrapper** for the Java Aeron Cluster node jar:
   `(cd cluster/sealer-service && ./gradlew :service:shadowJar)` — `make
-  images` / `ansible/run.yml` stage it into the `kardamom-cluster` image and
+  images` / `make container-up` stage it into the `kardamom-cluster` image and
   fail loudly if it is missing.
+- **OpenTofu** (1.12.6, the version the CI pins) for the container path.
 - Foundry's `cast` for the smoke tests (repo-level `just bootstrap`).
 
 ## Quick start (VM path)
@@ -90,14 +91,62 @@ make down      # stop jobs + vagrant destroy
    `executor` / `validator` / `da-watcher`, then the live `batcher` service
    (#39).
 
-The Linux container path is:
+### Container path (Linux)
 
 ```sh
-ansible-playbook -i localhost, deploy/cluster/ansible/run.yml
+cd deploy/cluster
+make container-up      # tofu apply → node contract → ansible/cluster.yml
+make container-test    # smoke, load and chaos gates (RUN_LOAD, RUN_CHAOS, ...)
+make container-down    # tofu destroy: containers and their volumes
+make container-reset   # destroy, then a fresh chain
 ```
 
-On Docker Desktop, build Linux artifacts and run the same lifecycle inside a
-privileged Linux controller:
+`terraform/containers` is the Terraform root that owns the node containers.
+It reads `ip_prefix` and `node_classes` from `ansible/group_vars/all.yml`,
+so the node-class model has one source. It creates:
+
+- the `kardamom-net` bridge network on `kardamom-br0` with the `/24` of
+  `ip_prefix`;
+- the `kardamom-node:ci` image from `docker/node.Dockerfile`;
+- two named volumes per node for the inner Docker engine;
+- one privileged systemd container per node, `kardamom-<class>-<i>`, at
+  its static address, with a health check on `systemctl is-system-running`.
+
+`tofu apply` returns when systemd in every node is ready. `tofu output
+node_contract` is the version 1 node contract. `make container-up` writes it
+to `terraform/containers/node-contract.json`, and `ansible/containers.yml`
+builds the in-memory inventory from it, prepares the host network
+(`roles/host_prep`: socket buffers, bridge netfilter, multicast snooping)
+and runs `bootstrap.yml` on the `container_nodes` group.
+
+Terraform replaces a container when its image changes, which discards the
+root filesystem of that node. A change to `node.Dockerfile` therefore gives
+a fresh chain on the next `make container-up`. The Terraform state in
+`terraform/containers/` is the record of the running cluster; a second
+`make container-up` is a no-op apply followed by a convergence run.
+Containers that an older harness left behind under the same names block the
+first apply. Remove them once:
+
+```sh
+docker rm -f $(docker ps -aq --filter name=kardamom-)
+docker volume rm $(docker volume ls -q --filter name=kardamom-)
+docker network rm kardamom-net
+```
+
+Remove the old volumes too: Terraform adopts an existing volume by name, and
+an old `kardamom-<node>-docker` volume would carry stale inner Docker state
+into the new node.
+
+CI runs the same targets as workflow steps: `container-up`, `container-test`,
+and `container-diagnostics` on failure. The runner is ephemeral, so CI does
+not destroy the cluster. Pass extra vars to `ansible/cluster.yml` with
+`CLUSTER_VARS='{"images_tag": "x"}'` (one JSON object, no single quote).
+`ansible/cluster.yml` is the convergence playbook; it expects the node contract.
+
+### Docker Desktop
+
+Build Linux artifacts and run the same lifecycle inside a privileged Linux
+controller:
 
 ```sh
 KEEP=1 ansible-playbook -i localhost, deploy/cluster/ansible/local.yml
@@ -106,45 +155,25 @@ KEEP=1 ansible-playbook -i localhost, deploy/cluster/ansible/local.yml
 Install Ansible, `ansible.posix`, `community.docker`, and Python `requests` on
 the controller. The local playbook follows the active Docker context and requires
 a local Docker daemon with the checkout available for bind mounts. Its builder
-includes the sealer jar, services, deployer, load and semantics harnesses.
-
-`run.yml` supports `-e cluster_run_operation=up|reset|down`. `up` reuses existing
-nodes without replacing their root filesystems; changed node images take effect
-on an explicit `reset`. `reset` deletes node containers and their Docker storage
-volumes before creating a fresh chain. `down` deletes them without deploying.
-Labeled resources from removed topology classes are also cleaned up. Builder
-caches and the local controller remain available for reuse.
-
-CI collects failure diagnostics before cleanup. `KEEP=1` (or
-`-e cluster_run_keep=true`) retains the nodes on success or failure. Use
-`-e cluster_run_tests=false` to deploy without test gates. Extra image/workload
-settings for the child convergence playbook go in `cluster_run_vars`.
+includes the sealer jar, services, deployer, load and semantics harnesses, and
+the orchestrator image carries OpenTofu and `make`.
 
 `local.yml` supports `-e local_runner_operation=all|build|up|reset|down`.
 `all` builds and deploys; `build` only builds; the other operations use existing
-artifacts. Set `-e local_runner_build=true` to rebuild with `reset`.
+artifacts. `reset` runs `container-down` before `container-up`. Set
+`-e local_runner_build=true` to rebuild with `reset`. After the run, the
+controller destroys the cluster unless `KEEP=1` (or `-e local_runner_keep=true`)
+is set; a failure first collects diagnostics. Use `-e local_runner_tests=false`
+to deploy without test gates. Extra vars for `cluster.yml` go in
+`local_runner_vars`, for example `-e '{"local_runner_vars":{"images_tag":"x"}}'`.
 `local_runner_container` defaults to `kardamom-orch`; use another name if an
 existing controller is bound to a different checkout. Controllers are reused
 without replacement; after changing the controller image, use a new controller
 name or remove the old idle controller before running again.
-Pass lifecycle settings through `local_runner_vars`, for example
-`-e '{"local_runner_vars":{"cluster_run_keep":true}}'`.
 
-The lifecycle holds an atomic lock at `/tmp/kardamom-cluster-locks/deploy.lock.d`
-on the Linux controller. Local controllers share this directory through the
-`kardamom-lifecycle-locks` volume. Changing the controller name does not create
-a separate cluster. A competing run fails before any cleanup. Normal
-failures release it, including teardown failures. After a controller crash or
-SIGKILL, verify no deployment is running before manually removing a stale lock.
-There is no force override. `--check` on `run.yml` validates topology and reports
-the requested operation without provisioning, testing, or tearing down.
-
-Container inventory now comes directly from `node_classes` through Ansible's
-`add_host`; there is no generated INI file or shell YAML parser in provisioning.
-`cluster.yml` is the internal convergence playbook; use `run.yml` so deployment
-is covered by the lock, diagnostics and cleanup. The test runner
-`scripts/run-tests.sh` contains only smoke/load/chaos gates. Consul discovery
-migration follows separately; topology still assigns the existing IP lanes.
+The Terraform state under `/work/deploy/cluster/terraform/containers` is the
+lock: a second `container-up` against a running cluster converges it instead
+of creating a second one, and `tofu` refuses concurrent state writes.
 
 ## Ansible workload deployment
 
@@ -192,8 +221,6 @@ Check mode requires an existing settlement address and a reachable Nomad API.
 It compiles and plans all jobs, but does not wait for or create allocations.
 
 `deploy.sh` and the image build/signing shell helpers have been removed.
-Container creation and the test runner still use their existing scripts; those
-are subsequent migration steps.
 Load and chaos tests remain independent of the workload deployment role.
 
 The isolated deployment tests use the actual Ansible playbook and Nomad HCL

@@ -417,6 +417,7 @@ cluster-doctor:
     chk ansible-galaxy "ships with ansible"
     chk docker "run 'just cluster-bootstrap'"
     chk nomad "run 'just cluster-bootstrap' — Ansible uses Nomad to compile job specs"
+    chk tofu "install OpenTofu 1.12.6 — terraform/containers creates the node containers"
     if have virsh || have VBoxManage; then
         echo "  ok    vm provider (libvirt or virtualbox)"
     else

@@ -60,6 +60,8 @@ validate:
 	for s in scripts/*.sh; do bash -n "$$s" || rc=1; done; \
 	for j in nomad/*.hcl; do echo "== $$j =="; nomad job validate "$$j" || rc=1; done; \
 	./scripts/check-contract.py || rc=1; \
+	for r in terraform/*/; do echo "== $$r =="; tofu -chdir=$$r fmt -check -recursive . || rc=1; \
+	  tofu -chdir=$$r init -backend=false -input=false >/dev/null && tofu -chdir=$$r validate || rc=1; done; \
 	exit $$rc
 
 ## check-contract: verify the values mirrored from group_vars/all.yml agree
@@ -77,14 +79,41 @@ clean:
 	-rm -f docker/kardamom-cluster-node.jar
 	-@for svc in $(SERVICES); do docker image rm $(REGISTRY)/kardamom-$$svc:$(TAG); done
 
-.PHONY: container-up container-down container-reset
-## Container lifecycle (Linux controller; prebuilt artifacts required).
+# --- container path (Linux controller; prebuilt artifacts required) ---------
+# terraform/containers owns the node containers. The Makefile owns the
+# lifecycle: apply, converge, test, diagnose, destroy. CI runs these targets
+# as workflow steps; ansible/local.yml runs them inside the orchestrator.
+TF_CONTAINERS := terraform/containers
+NODE_CONTRACT := $(TF_CONTAINERS)/node-contract.json
+# Extra vars for ansible/cluster.yml, as one JSON object without a single quote.
+CLUSTER_VARS :=
+CLUSTER_VARS_ARG = $(if $(CLUSTER_VARS),--extra-vars '$(CLUSTER_VARS)')
+
+.PHONY: container-up container-test container-diagnostics container-down container-reset
+## container-up: create the node containers, provision them, publish the
+## prebuilt images and deploy the workloads.
 container-up:
-	ansible-playbook -i localhost, ansible/run.yml -e cluster_run_keep=true
+	tofu -chdir=$(TF_CONTAINERS) init -input=false
+	tofu -chdir=$(TF_CONTAINERS) apply -auto-approve -input=false
+	tofu -chdir=$(TF_CONTAINERS) output -json node_contract > $(NODE_CONTRACT)
+	ansible-playbook -i localhost, ansible/cluster.yml $(CLUSTER_VARS_ARG)
+
+## container-test: the smoke, load and chaos gates (RUN_LOAD, RUN_CHAOS, ...)
+container-test:
+	NOMAD_ADDR=$(NOMAD_ADDR) bash ./scripts/run-tests.sh
+
+## container-diagnostics: collect node and job state after a failure
+container-diagnostics:
+	NOMAD_ADDR=$(NOMAD_ADDR) bash ./scripts/ci-diagnostics.sh
+
+## container-down: destroy the node containers and their volumes
 container-down:
-	ansible-playbook -i localhost, ansible/run.yml -e cluster_run_operation=down
-container-reset:
-	ansible-playbook -i localhost, ansible/run.yml -e cluster_run_operation=reset -e cluster_run_keep=true
+	tofu -chdir=$(TF_CONTAINERS) init -input=false
+	tofu -chdir=$(TF_CONTAINERS) destroy -auto-approve -input=false
+	rm -f $(NODE_CONTRACT)
+
+## container-reset: destroy, then create a fresh chain
+container-reset: container-down container-up
 
 .PHONY: local
 local:

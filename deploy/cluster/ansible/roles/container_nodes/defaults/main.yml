@@ -1,7 +1,0 @@
----
-container_nodes_network: kardamom-net
-container_nodes_bridge: kardamom-br0
-container_nodes_subnet: "{{ ip_prefix }}.0/24"
-container_nodes_image: kardamom-node:ci
-container_nodes_docker_dir: "{{ playbook_dir }}/../docker"
-container_nodes_label: io.kardamom.cluster

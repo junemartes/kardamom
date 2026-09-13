@@ -8,7 +8,7 @@
 # the chaos-executor and chaos-ingress shard cases. Half `b` runs
 # chaos-sequencer and chaos-cluster. Each half purges every Nomad job, wipes
 # all durable cluster state for a fresh chain with nonce-0 accounts, then
-# runs the unmodified ansible/run.yml with the CI settings: bring-up, smoke
+# runs the unmodified Make lifecycle with the CI settings: bring-up, smoke
 # gate, chaos cases, ingress-churn re-smoke, and validator verdict.
 #
 # Run inside the orchestrator: bash /work/deploy/cluster/scripts/chaos-iter.sh a
@@ -32,5 +32,5 @@ echo "==> [iter] resetting cluster and testing half ${HALF}"
 RUN_LOAD=0 RUN_CHAOS=1 \
   CHAOS_CASES="${CASES}" \
   CHAOS_TPS=200 CHAOS_CASE_S=120 CHAOS_RESCHEDULE_SLO_S=200 CHAOS_LEADER_SLO_S=45 \
-  KEEP=1 REGISTRY_PUSH_NODE=control-0 \
-  ansible-playbook -i localhost, /work/deploy/cluster/ansible/run.yml -e cluster_run_operation=reset
+  REGISTRY_PUSH_NODE=control-0 \
+  make -C /work/deploy/cluster container-reset container-test

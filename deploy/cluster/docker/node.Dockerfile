@@ -8,13 +8,13 @@
 # and Nomad's docker driver can run workloads via Docker-in-Docker. It is the
 # CI analogue of a VM; it is NOT a production pattern.
 #
-# Requirements at run time (set by ansible/run.yml):
+# Requirements at run time (set by terraform/containers):
 #   * --privileged (systemd + an inner dockerd need it)
 #   * cgroup v2 mount, tmpfs /run + /run/lock
 #   * a user-defined bridge network with the node's static 192.168.56.x IP
 #
 # Ansible reaches these over the community.docker connection plugin (via the
-# container inventory ansible/run.yml generates from node_classes at run time),
+# container inventory ansible/containers.yml builds from the node contract),
 # so no SSH is installed.
 
 # geerlingguy's image is the de-facto base for testing Ansible against systemd

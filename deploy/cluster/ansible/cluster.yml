@@ -1,5 +1,6 @@
 ---
-# Internal convergence playbook. run.yml owns the lock and failure cleanup.
+# Convergence playbook: substrate, images, workloads. `make container-up`
+# applies terraform/containers first and writes the node contract it reads.
 - name: Create and provision cluster containers
   ansible.builtin.import_playbook: containers.yml
 

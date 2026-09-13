@@ -60,7 +60,7 @@ pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
     let vars = serde_json::json!({
         "local_runner_operation": "reset",
         "local_runner_build": !skip_build,
-        "local_runner_vars": { "cluster_run_keep": true },
+        "local_runner_keep": true,
     });
     let out = Command::new("ansible-playbook")
         .args(["-i", "localhost,"])

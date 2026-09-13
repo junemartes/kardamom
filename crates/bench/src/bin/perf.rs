@@ -59,7 +59,7 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Bring the cluster up fresh: build images and binaries, purge the
-    /// previous deployment, wipe state, and run ansible/run.yml with
+    /// previous deployment, wipe state, and run `make container-reset` with
     /// KEEP=1 and no load or chaos stages.
     Up {
         /// Skip the builder-image and binary build. Reuse the staged
