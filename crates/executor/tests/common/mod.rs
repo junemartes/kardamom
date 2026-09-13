@@ -65,6 +65,7 @@ impl<'a> Corpus<'a> {
             value: 1,
             gas_limit: 21_000,
             gas_price: 0,
+            ..Default::default()
         }
         .sign(self.signer);
         let tx_hash = env.tx_hash;
