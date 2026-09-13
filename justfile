@@ -398,11 +398,9 @@ cluster-bootstrap:
     ansible-galaxy collection install ansible.posix community.docker
     echo ">> cluster-bootstrap complete. Verify with: just cluster-doctor"
     echo
-    echo "   MANUAL STEP: 'make images' pushes over plain HTTP to the in-cluster"
-    echo "   registry, so this HOST's Docker daemon must list it as insecure:"
-    echo "       { \"insecure-registries\": [\"192.168.56.10:5000\"] }"
-    echo "   (Linux: /etc/docker/daemon.json + restart docker; Docker Desktop:"
-    echo "   Settings > Docker Engine.) 'just cluster-doctor' checks this."
+    echo "   Images are pushed from inside the control node (REGISTRY_PUSH_NODE),"
+    echo "   where the registry name registry.service.consul resolves. This host's"
+    echo "   Docker daemon needs no insecure-registry entry."
 
 # Check that the HOST has everything deploy/cluster needs.
 cluster-doctor:
@@ -430,18 +428,12 @@ cluster-doctor:
             echo "  MISS  ansible collection $col — run 'just cluster-bootstrap'"; rc=1
         fi
     done
-    # Pushing images needs the in-cluster registry allowed as insecure (HTTP)
-    # in THIS host's Docker daemon. 192.168.56.10:5000 mirrors registry_host/
-    # registry_port in deploy/cluster/ansible/group_vars/all.yml.
+    # Images are pushed from inside the control node, so this host's daemon
+    # needs no insecure-registry entry; it only has to run.
     if docker info >/dev/null 2>&1; then
-        if docker info 2>/dev/null | grep -qE '^\s*192\.168\.56\.10:5000$'; then
-            echo "  ok    docker insecure-registry 192.168.56.10:5000"
-        else
-            echo "  MISS  docker insecure-registry 192.168.56.10:5000 — add to the daemon's"
-            echo "        insecure-registries and restart Docker (see cluster-bootstrap notes)"; rc=1
-        fi
+        echo "  ok    docker daemon running"
     else
-        echo "  WARN  docker daemon not running — cannot check insecure-registries"
+        echo "  WARN  docker daemon not running"
     fi
     # Smoke test (scripts/smoke.sh) prefers foundry's cast; non-fatal.
     if have cast; then

@@ -1,0 +1,15 @@
+# Managed by Ansible (roles/consul).
+[Unit]
+Description=Make the Consul agent the node resolver
+# Docker regenerates /etc/resolv.conf when a node container restarts,
+# so the file is restored at every boot, before anything resolves a name.
+Before=consul.service nomad.service docker.service
+ConditionFileNotEmpty=/etc/consul.d/resolv.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/cp /etc/consul.d/resolv.conf /etc/resolv.conf
+
+[Install]
+WantedBy=multi-user.target

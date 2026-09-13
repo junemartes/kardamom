@@ -1,6 +1,6 @@
 # kardamom-executor replays the canonical order and applies state. It
 # embeds the libmdbx StateWriter. It runs on its own node, exec1
-# (192.168.56.31). It used to be co-located with sequencer #0 and
+# (executor-0). It used to be co-located with sequencer #0 and
 # ingress.
 #
 # Invocation (from crates/e2e/tests/multiprocess_e2e.rs):
@@ -38,8 +38,20 @@ variable "image_ref" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
+variable "executor_count" {
+  type        = number
+  description = "The executor node count (node_classes.executor.count). The checkpoint peers are executor-<i>.node.<datacenter>.consul."
+  default     = 3
+}
+
 job "executor" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {
@@ -114,7 +126,7 @@ job "executor" {
       }
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-executor:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-executor:dev"
         # force_pull stays on for both paths; see the ingress job's
         # comment. The :dev fallback needs it. On the pinned path, the
         # 1.9.5 driver pulls the tag but resolves the image by digest,
@@ -186,7 +198,7 @@ job "executor" {
           # The account nonce query for the sequencers
           # (ports.executor_nonce_query in group_vars/all.yml).
           "--nonce-query-addr", "${meta.node_ip}:9024",
-          "--checkpoint-peers", "192.168.56.41:9014,192.168.56.42:9014,192.168.56.43:9014",
+          "--checkpoint-peers", join(",", [for i in range(var.executor_count) : "executor-${i}.node.${var.datacenter}.consul:9014"]),
           # Bind the Prometheus exporter on all interfaces; the
           # default is loopback. The chaos suite probes it directly
           # over the cluster bridge (http://<node_ip>:9004/metrics),
@@ -194,7 +206,7 @@ job "executor" {
           # kill of a privileged sibling node can stall docker exec
           # runner-wide for minutes, which reads as "block 0 -> 0"
           # while executors were healthy. The bridge is the isolated
-          # 192.168.56.0/24 test segment; loopback scrapes (docker exec
+          # cluster network; loopback scrapes (docker exec
           # curl 127.0.0.1:9004) keep working too.
           "--metrics-addr", "0.0.0.0:9004",
         ]

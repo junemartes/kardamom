@@ -11,6 +11,7 @@ source "${SCRIPT_DIR}/lib-metrics.sh"
 source "${SCRIPT_DIR}/ci-stages.sh"
 source "${SCRIPT_DIR}/validator-verdict.sh"
 topology_load
+stages_resolve
 
 log "smoke test (gate: single-tx must pass before load smoke runs)"
 ./scripts/smoke.sh

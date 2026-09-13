@@ -10,6 +10,12 @@ variable "network_name" {
   default     = "kardamom-net"
 }
 
+variable "subnet" {
+  description = "The range of the container network. Docker assigns every node address from it; the Aeron multicast groups are separate."
+  type        = string
+  default     = "192.168.56.0/24"
+}
+
 variable "bridge_name" {
   description = "The Linux bridge that backs the network. The host prep role tunes its multicast snooping."
   type        = string
@@ -38,4 +44,15 @@ variable "ready_timeout" {
   description = "Seconds to wait for systemd inside a node to report running or degraded."
   type        = number
   default     = 180
+}
+
+variable "address_offset" {
+  type        = number
+  description = "The host number of the first node address in the subnet; the nodes follow in name order."
+  default     = 10
+
+  validation {
+    condition     = var.address_offset >= 2
+    error_message = "address_offset must leave the gateway (host 1) free."
+  }
 }

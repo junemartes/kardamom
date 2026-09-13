@@ -9,7 +9,7 @@
 # subscription connections open.
 #
 # Image: pull haproxy upstream once on the orchestrator, and push it to
-# the in-cluster registry as 192.168.56.10:5000/haproxy:2.9-alpine.
+# the in-cluster registry as registry.service.consul:5000/haproxy:2.9-alpine.
 # This is the same flow as the service images; DinD nodes trust only
 # the local registry.
 
@@ -20,7 +20,7 @@
 # the combined repo:tag@digest form. Nomad 1.9.5's docker driver cannot
 # parse a bare repo@digest on a registry host with a port; see
 # ansible/images.yml.
-# nomad job run -var image_ref=192.168.56.10:5000/haproxy:2.9-alpine@sha256:... rpc-proxy.nomad.hcl
+# nomad job run -var image_ref=registry.service.consul:5000/haproxy:2.9-alpine@sha256:... rpc-proxy.nomad.hcl
 # The empty default falls back to the mutable :2.9-alpine tag. That is
 # a dev affordance, not a production path.
 variable "image_ref" {
@@ -29,8 +29,14 @@ variable "image_ref" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
 job "rpc-proxy" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {
@@ -58,7 +64,7 @@ job "rpc-proxy" {
       driver = "docker"
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/haproxy:2.9-alpine"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/haproxy:2.9-alpine"
         # This skips readonly_rootfs on
         # purpose. haproxy writes runtime state into the rootfs
         # (master and worker sockets, plus pid, under /run, and
@@ -92,6 +98,10 @@ defaults
   # Long-lived WebSocket subscriptions (kardamom_subscribeReceipts).
   timeout tunnel  1h
 
+resolvers consul
+  nameserver local 127.0.0.1:53
+  hold valid 5s
+
 frontend rpc
   bind *:8545
   default_backend ingress
@@ -108,8 +118,10 @@ backend ingress
   # TCP-connect liveness, which is correct here: a replica that
   # accepts connections serves traffic, and the conn-cap wedge class
   # is gone with subscribe mode.
-  server ingress0 192.168.56.31:8545 check
-  server ingress1 192.168.56.32:8545 check
+  # The ingress replicas come from the ingress-jsonrpc Consul service
+  # through the node resolver, so a new replica joins the pool without a
+  # job change. The slot count bounds the pool.
+  server-template ingress 8 ingress-jsonrpc.service.consul:8545 resolvers consul resolve-prefer ipv4 init-addr none check
 EOF
       }
 

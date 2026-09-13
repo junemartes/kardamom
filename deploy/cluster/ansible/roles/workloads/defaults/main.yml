@@ -2,7 +2,10 @@
 # Environment compatibility for existing CI shards. Ansible extra vars take precedence.
 workloads_cluster_dir: "{{ playbook_dir | dirname }}"
 workloads_nomad_binary: nomad
-workloads_nomad_addr: "{{ lookup('env', 'NOMAD_ADDR') | default('http://' ~ control_ip ~ ':' ~ ports.nomad_http, true) }}"
+# The Nomad API. A controller outside the cluster passes NOMAD_ADDR (the
+# Makefile derives it from the node contract); a controller on a node
+# reaches its local agent.
+workloads_nomad_addr: "{{ lookup('env', 'NOMAD_ADDR') | default('http://127.0.0.1:' ~ ports.nomad_http, true) }}"
 workloads_nomad_token: "{{ lookup('env', 'NOMAD_TOKEN') }}"
 workloads_namespace: "{{ lookup('env', 'NOMAD_NAMESPACE') | default('default', true) }}"
 workloads_manifest: "{{ [workloads_cluster_dir, lookup('env', 'DIGEST_MANIFEST') | default('images.digests', true)] | path_join }}"
@@ -18,7 +21,15 @@ workloads_cert_identity: >-
      default('^https://github\.com/junemartes/kardamom/\.github/workflows/[^@]+@refs/', true) }}
 workloads_cert_issuer: "{{ lookup('env', 'KARDAMOM_CERT_OIDC_ISSUER') | default('https://token.actions.githubusercontent.com', true) }}"
 workloads_image_services: [aeron, cluster, sequencer, ingress, executor, validator, da-watcher, batcher]
-workloads_l1_rpc: "{{ lookup('env', 'L1_RPC') | default('http://' ~ control_ip ~ ':' ~ ports.anvil_l1, true) }}"
+# The variables every job derives its placement and its peer lists from.
+# A job receives the ones its file declares (tasks/job.yml).
+workloads_common_vars:
+  datacenter: "{{ datacenter }}"
+  executor_count: "{{ node_classes.executor.count }}"
+  sealer_count: "{{ node_classes.sealer.count }}"
+# The L1 RPC the controller uses for the settlement bootstrap. Empty means
+# discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
+workloads_l1_rpc: "{{ lookup('env', 'L1_RPC') }}"
 workloads_settlement_address: "{{ lookup('env', 'SETTLEMENT_ADDRESS') }}"
 workloads_lockbox_address: "{{ lookup('env', 'LOCKBOX_ADDRESS') }}"
 workloads_deploy_binary: "{{ lookup('env', 'DEPLOY_BIN') | default(workloads_cluster_dir ~ '/../../target/release/kardamom-deploy', true) }}"
@@ -34,7 +45,8 @@ workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC'
 workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"
 workloads_light_checkpoint: "{{ lookup('env', 'L1_LIGHT_CLIENT_CHECKPOINT') }}"
 workloads_light_network: "{{ lookup('env', 'L1_LIGHT_CLIENT_NETWORK') | default('mainnet', true) }}"
-workloads_aux_ip: "{{ lookup('env', 'AUX_IP') | default(ip_prefix ~ '.' ~ node_classes.aux.ip_start, true) }}"
+# The aux node by its Consul record; the light client listens there.
+workloads_aux_host: "{{ lookup('env', 'AUX_HOST') | default('aux-0.node.' ~ datacenter ~ '.consul', true) }}"
 workloads_light_port: "{{ lookup('env', 'L1_LIGHT_CLIENT_PORT') | default('8548', true) }}"
 workloads_poll_delay: 3
 workloads_poll_retries: 80

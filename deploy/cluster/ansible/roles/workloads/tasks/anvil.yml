@@ -1,0 +1,28 @@
+---
+# The controller may run outside the cluster, where Consul names do not
+# resolve. It discovers the in-cluster anvil through the Nomad API: the
+# node that runs the anvil allocation, then that node's address.
+- name: Read the anvil allocations
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/anvil/allocations?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_anvil_allocations
+
+- name: Read the node that runs anvil
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/node/{{ workloads_anvil_node }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  vars:
+    workloads_anvil_node: >-
+      {{ (workloads_anvil_allocations.json | selectattr('ClientStatus', 'equalto', 'running')
+          | map(attribute='NodeID') | first) }}
+  register: workloads_anvil_node_info
+
+# The node's advertised HTTP address is its node_ip. The fingerprinted
+# unique.network.ip-address is not: a node with a second network (the CI
+# runner attaches the default bridge too) fingerprints the other one.
+- name: Set the discovered L1 RPC
+  ansible.builtin.set_fact:
+    workloads_l1_rpc: "http://{{ workloads_anvil_node_info.json.HTTPAddr | regex_replace(':[0-9]+$', '') }}:{{ ports.anvil_l1 }}"
