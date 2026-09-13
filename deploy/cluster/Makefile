@@ -32,25 +32,10 @@ export REGISTRY TAG DIGEST_MANIFEST
 # the-sealer, folded into the cluster members).
 SERVICES := ingress sequencer executor validator da-watcher batcher
 
-.PHONY: up vms provision images deploy smoke status down clean validate check-contract
+.PHONY: images deploy smoke clean validate check-contract
 
-## up: full bring-up — VMs, provisioning, images, deploy. Run `make smoke`
-## separately to exercise the pipeline once the jobs settle.
-up: vms provision images deploy
-	@echo
-	@echo "==> Cluster is up. Run 'make smoke' to exercise the pipeline."
-
-## vms: boot the VMs (one per node_classes instance)
-vms:
-	vagrant up
-
-## provision: install docker/nomad/consul/registry via Ansible
-provision:
-	ansible-playbook -i ansible/inventory.ini ansible/bootstrap.yml
-
-## images: build service + aeron images on the host and push to the registry.
-## NOTE: pushing needs $(REGISTRY) in the HOST Docker daemon's
-## insecure-registries (see README "Host prerequisites").
+## images: wrap the prebuilt service binaries and the sealer jar into images
+## and push them to the in-cluster registry through REGISTRY_PUSH_NODE.
 images:
 	ansible-playbook -i localhost, ansible/images.yml
 
@@ -62,10 +47,6 @@ deploy:
 ## (RPC_URL overrides the ingress-0 address of the node contract)
 smoke:
 	$(CLUSTER_BIN) smoke $(if $(RPC_URL),--rpc $(RPC_URL))
-
-## status: cluster + job health, from the control node's own agents
-status:
-	vagrant ssh control-0 -c 'nomad node status && echo && nomad job status && echo && consul members'
 
 ## validate: static checks (run on a host with the toolchain; CI runs these too)
 validate:
@@ -82,10 +63,6 @@ validate:
 check-contract:
 	./scripts/check-contract.py
 
-## down: stop jobs and destroy VMs
-down:
-	vagrant destroy -f
-
 ## clean: remove local built images (+ the staged cluster jar)
 clean:
 	-docker image rm $(REGISTRY)/kardamom-aeron:$(TAG)
@@ -96,7 +73,7 @@ clean:
 # --- container path (Linux controller; prebuilt artifacts required) ---------
 # terraform/containers owns the node containers. The Makefile owns the
 # lifecycle: apply, converge, test, diagnose, destroy. CI runs these targets
-# as workflow steps; ansible/local.yml runs them inside the orchestrator.
+# as workflow steps.
 TF_CONTAINERS := terraform/containers
 # On the container path, images are pushed from inside the control node,
 # where the registry name resolves; the host daemon needs no
@@ -138,7 +115,3 @@ container-down:
 
 ## container-reset: destroy, then create a fresh chain
 container-reset: container-down container-up
-
-.PHONY: local
-local:
-	ansible-playbook -i localhost, ansible/local.yml
