@@ -1,0 +1,45 @@
+---
+- name: Check that all expected images were pushed
+  ansible.builtin.assert:
+    that: images_records | length == images_services | length + 2
+
+- name: Write the completed manifest in staging
+  ansible.builtin.template:
+    src: images.digests.j2
+    dest: "{{ images_staging.path }}/images.digests"
+    mode: "0644"
+
+- name: Sign the completed manifest
+  ansible.builtin.command:
+    argv:
+      - "{{ cosign_resolved_binary }}"
+      - sign-blob
+      - --yes
+      - --bundle
+      - "{{ images_staging.path }}/images.digests.sigbundle"
+      - "{{ images_staging.path }}/images.digests"
+  changed_when: true
+  when: images_sign | bool
+
+# Install the bundle first and the manifest last. Readers can temporarily see
+# a mismatched pair (verification fails closed), but never a partial manifest.
+- name: Publish the manifest signature bundle
+  ansible.builtin.copy:
+    src: "{{ images_staging.path }}/images.digests.sigbundle"
+    dest: "{{ images_manifest }}.sigbundle"
+    remote_src: true
+    mode: "0644"
+  when: images_sign | bool
+
+- name: Remove a previous signature when publishing an unsigned release
+  ansible.builtin.file:
+    path: "{{ images_manifest }}.sigbundle"
+    state: absent
+  when: not (images_sign | bool)
+
+- name: Atomically publish the complete image manifest
+  ansible.builtin.copy:
+    src: "{{ images_staging.path }}/images.digests"
+    dest: "{{ images_manifest }}"
+    remote_src: true
+    mode: "0644"

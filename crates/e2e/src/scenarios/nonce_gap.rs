@@ -26,6 +26,8 @@ use std::time::Duration;
 use alloy_primitives::Address;
 use anyhow::{Context, Result};
 
+use kardamom_types::shard_map::vslot_for;
+
 use super::{CODE_TIMEOUT, Target};
 use crate::harness::l2::{self, RpcError, RpcOutcome, SignedTransfer};
 use crate::harness::metrics::poll_until;
@@ -222,25 +224,34 @@ impl<'a> GapRun<'a> {
         Ok(())
     }
 
-    /// Step 3a: the parked pair expired on the sequencer. The sequencer's
-    /// `tx_ttl` equals the ingress park. Every replica of the shard
-    /// expires the pair a few ms after the ingress timed out, so the
-    /// counter sums to at least 2 (one replica) across the shard's
-    /// replicas. Wait for it before the late fill, so the fill cannot race
-    /// the sweep.
+    /// Step 3a: the parked pair expired on every replica of the shard.
+    /// The sequencer's `tx_ttl` equals the ingress park, and each replica
+    /// counts the lifetime from the moment it consumed the entry, so a
+    /// replica that lagged behind its twin expires the pair later. The
+    /// expiry counter proves at least one replica swept the pair (a sum of
+    /// at least 2). The pending-depth gauge for the sender's vslot then
+    /// proves no replica still holds it: a late fill that raced a lagging
+    /// replica's sweep would execute nonces 4 and 5 there, and the executor
+    /// would publish their receipts.
     async fn assert_pair_expired(&self) -> Result<()> {
         let floor = self.expired_start + 2.0;
+        let vslot = format!("vslot=\"{}\"", vslot_for(self.signer.address));
         poll_until(
-            "sequencer expired the parked pair",
+            "every sequencer replica expired the parked pair",
             Duration::from_secs(10),
             Duration::from_millis(200),
             || async {
                 let n = self.t.sequencer_metric_sum(super::SEQ_EXPIRED).await?;
-                Ok((n >= floor).then_some(()))
+                let held = self
+                    .t
+                    .sequencer_metric_sum_where(super::SEQ_PENDING_DEPTH, &vslot)
+                    .await?;
+                // Depths are whole numbers, so "below one" is "zero".
+                Ok((n >= floor && held < 1.0).then_some(()))
             },
         )
         .await
-        .context("nonces 4/5 must expire after tx_ttl")
+        .context("nonces 4/5 must expire after tx_ttl on every replica")
     }
 
     /// Step 3b: late fill. Nonce 3 lands alone: the expired pair stays

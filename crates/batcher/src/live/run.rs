@@ -19,7 +19,8 @@ use kardamom_engine::reader::{
 };
 use kardamom_engine::{ExecutorError, TxIndex};
 use kardamom_log::aeron_live::AeronRuntime;
-use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
+use kardamom_log::config::{AeronConfig, LogConfig};
+use kardamom_log::discovery::StreamPlane;
 
 use crate::da_store::FsBlobStore;
 
@@ -127,8 +128,9 @@ impl LiveArgs {
 /// resolved from `--config` and the CLI overrides.
 struct RunConfig {
     file_cfg: BatcherFileConfig,
-    channels: ChannelsConfig,
     aeron_cfg: AeronConfig,
+    /// The plane the `tx_data` lanes open through.
+    plane: StreamPlane,
 }
 
 impl RunConfig {
@@ -144,29 +146,39 @@ impl RunConfig {
         }
         let log_cfg =
             LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
-        let channels = log_cfg.channels;
+        let plane =
+            StreamPlane::from_config(&log_cfg, "batcher").context("build the stream plane")?;
         let mut aeron_cfg = log_cfg.aeron;
         if let Some(dir) = args.aeron_dir.as_ref() {
             aeron_cfg.aeron_dir.clone_from(dir);
         }
         Ok(Self {
             file_cfg,
-            channels,
             aeron_cfg,
+            plane,
         })
     }
 
     /// Open the `tx_data` and cluster `tx_ordering` subscriptions, and
     /// spawn their reader threads.
+    /// Replace the static `[cluster]` ingress endpoints with the members
+    /// the catalog lists, when discovery is on and lists any.
+    async fn resolve_cluster_ingress(&mut self) -> Result<()> {
+        if let Some(endpoints) = self.plane.cluster_ingress_endpoints().await? {
+            self.file_cfg.cluster.ingress_endpoints = endpoints;
+        }
+        Ok(())
+    }
+
     fn spawn_reader_stack(
-        &self,
+        &mut self,
         args: &LiveArgs,
         cursor: BatchCursor,
     ) -> Result<ReaderStack<impl Send + use<>>> {
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-        let tx_data_subs = bin_support::open_tx_data_subs(&rt, &self.channels)?;
+        let tx_data_subs = bin_support::open_tx_data_subs(&rt, &mut self.plane)?;
         let join_recovery = bin_support::archive_join_recovery(
-            &self.channels,
+            &mut self.plane,
             &self.aeron_cfg,
             args.aeron_dir.as_deref(),
             args.archive_control_response_endpoint.as_deref(),
@@ -297,7 +309,8 @@ impl<G> ReaderHandles<G> {
 /// reader stack fails to start, or when the feed loop exits with a failure.
 pub async fn run(args: LiveArgs) -> Result<()> {
     let l1 = args.start_l1_side().await?;
-    let run_cfg = RunConfig::resolve(&args)?;
+    let mut run_cfg = RunConfig::resolve(&args)?;
+    run_cfg.resolve_cluster_ingress().await?;
     let ReaderStack { handles, feed_rx } = run_cfg.spawn_reader_stack(&args, l1.cursor)?;
 
     let sender = LiveSender::new(
@@ -322,6 +335,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
             // Exit cleanly. The cursor is reconciled against L1 truth on
             // every restart, so tearing down mid-batch loses nothing.
             info!("shutdown signal received; stopping live batcher");
+            run_cfg.plane.shutdown().await;
             return Ok(());
         }
     };

@@ -1,0 +1,10 @@
+---
+- name: Build and run the cluster through a Linux Docker controller
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  roles:
+    - local_runner

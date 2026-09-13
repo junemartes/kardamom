@@ -14,4 +14,7 @@ pub enum LogError {
 
     #[error("config: {0}")]
     Config(String),
+
+    #[error("discovery: {0}")]
+    Discovery(String),
 }

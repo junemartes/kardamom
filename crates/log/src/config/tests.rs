@@ -36,10 +36,7 @@ fn empty_file_yields_defaults() {
     // Must match the built-in defaults exactly.
     let d = LogConfig::default();
     assert_eq!(cfg.recorder_id, d.recorder_id);
-    assert_eq!(
-        cfg.channels.tx_ordering_channel,
-        d.channels.tx_ordering_channel
-    );
+    assert_eq!(cfg.channels.tx_errors_channel, d.channels.tx_errors_channel);
     assert_eq!(cfg.aeron.file_sync_level, d.aeron.file_sync_level);
 }
 
@@ -49,14 +46,14 @@ fn partial_channels_section_inherits_other_fields() {
     let f = write_tmp(
         r#"
             [channels]
-            tx_ordering_channel = "aeron:udp?endpoint=239.192.56.11:40010"
-            tx_ordering_stream_id = 1001
+            tx_errors_channel = "aeron:udp?endpoint=239.192.56.17:40030"
+            tx_errors_stream_id = 1015
             "#,
     );
     let cfg = LogConfig::from_toml_path(f.path()).expect("load partial");
     assert_eq!(
-        cfg.channels.tx_ordering_channel,
-        "aeron:udp?endpoint=239.192.56.11:40010"
+        cfg.channels.tx_errors_channel,
+        "aeron:udp?endpoint=239.192.56.17:40030"
     );
     // Untouched channel fields fall back to IPC defaults.
     assert_eq!(
@@ -87,7 +84,7 @@ fn unknown_field_is_rejected() {
     let f = write_tmp(
         r#"
             [channels]
-            tx_ordering_channLE = "typo"
+            tx_errors_channLE = "typo"
             "#,
     );
     let err = LogConfig::from_toml_path(f.path()).expect_err("typo must be rejected");
@@ -105,8 +102,8 @@ fn missing_file_is_a_config_error() {
 fn resolve_none_is_default() {
     let cfg = LogConfig::resolve(None).expect("resolve none");
     assert_eq!(
-        cfg.channels.tx_ordering_channel,
-        LogConfig::default().channels.tx_ordering_channel
+        cfg.channels.tx_errors_channel,
+        LogConfig::default().channels.tx_errors_channel
     );
 }
 
@@ -117,7 +114,6 @@ fn tx_bal_defaults_present() {
     assert!(ch.tx_bal_channel.contains("tx-bal"));
     // Must not collide with the receipt block or other channels.
     for other in [
-        ch.tx_ordering_stream_id,
         ch.tx_receipts_stream_id,
         ch.tx_receipts_stream_id + 1,
         ch.tx_errors_stream_id,
@@ -136,14 +132,12 @@ fn tx_remote_epochs_defaults_present() {
     // collision silently delivers another stream's frames to be rkyv-decoded
     // as a RemoteEpochRecord.
     for other in [
-        ch.tx_ordering_stream_id,
         ch.tx_receipts_stream_id,
         ch.tx_receipts_stream_id + 1,
         ch.tx_bal_stream_id,
         ch.tx_errors_stream_id,
         ch.tx_deposits_stream_id,
         ch.fsync_watermark_stream_id,
-        ch.quorum_watermark_stream_id,
     ] {
         assert_ne!(ch.tx_remote_epochs_stream_id, other);
     }
@@ -159,8 +153,8 @@ fn round_trips_through_toml() {
     let f = write_tmp(&s);
     let back = LogConfig::from_toml_path(f.path()).expect("reparse");
     assert_eq!(
-        back.channels.quorum_watermark_stream_id,
-        original.channels.quorum_watermark_stream_id
+        back.channels.fsync_watermark_stream_id,
+        original.channels.fsync_watermark_stream_id
     );
     assert_eq!(
         back.aeron.archive_control_request_channel,
@@ -339,15 +333,6 @@ fn tx_data_stream_id_base_too_close_to_max_is_rejected() {
 }
 
 #[test]
-fn fsync_watermark_tx_data_stream_id_base_too_close_to_max_is_rejected() {
-    let ch = ChannelsConfig {
-        fsync_watermark_tx_data_stream_id_base: i32::MAX - 10,
-        ..Default::default()
-    };
-    assert!(ch.validate().is_err());
-}
-
-#[test]
 fn tx_receipts_stream_id_at_max_is_rejected() {
     let ch = ChannelsConfig {
         tx_receipts_stream_id: i32::MAX,
@@ -372,12 +357,112 @@ fn tx_receipts_boundary_stream_id_is_one_past_the_receipt_stream() {
 #[test]
 fn the_deployed_channels_template_loads() {
     // `deploy/cluster/config/channels.toml.tpl` is what every service in
-    // the container cluster reads. It must parse with this crate's types,
-    // zero sentinels included.
+    // the container cluster reads. Nomad renders it on the node, filling
+    // the placeholders from the node meta and datacenter; this test fills
+    // them the same way, and fails on a placeholder it does not know, so
+    // the set of node inputs the template depends on stays explicit. The
+    // result must parse with this crate's types, zero sentinels included.
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../deploy/cluster/config/channels.toml.tpl"
     );
-    let cfg = LogConfig::from_toml_path(Path::new(path)).expect("deployed channels.toml.tpl loads");
+    let template = std::fs::read_to_string(path).expect("read channels.toml.tpl");
+    let node = [
+        ("meta.cluster_id", "kardamom-dev"),
+        ("node.datacenter", "dc1"),
+        ("meta.node_ip", "192.168.56.31"),
+    ];
+    let rendered = node.iter().fold(template, |text, (key, value)| {
+        text.replace(&format!("{{{{ env \"{key}\" }}}}"), value)
+    });
+    let rendered = render_service_ranges(&rendered, "192.168.56.41", 8010);
+    assert!(
+        !rendered.contains("{{"),
+        "channels.toml.tpl has a placeholder this test does not fill"
+    );
+    let cfg = load(&rendered).expect("rendered channels.toml.tpl loads");
     assert_eq!(cfg.channels.tx_receipts_endpoint_base_port, None);
+    assert_eq!(cfg.discovery.cluster_id, "kardamom-dev");
+    assert_eq!(
+        cfg.discovery
+            .advertise_interface
+            .map(String::from)
+            .as_deref(),
+        Some("192.168.56.31/32")
+    );
+    assert_eq!(cfg.aeron.tx_data_archive_endpoints, ["192.168.56.41:8010"]);
+    assert_eq!(
+        cfg.aeron.tx_deposits_archive_endpoints,
+        ["192.168.56.41:8010"]
+    );
+    assert!(
+        cfg.channels
+            .tx_data_channel(0)
+            .contains("interface=192.168.56.31/32")
+    );
+}
+
+/// Expand every `{{ range service "..." }}...{{ end }}` block of a Nomad
+/// template as Consul would for one instance at `address:port`.
+fn render_service_ranges(template: &str, address: &str, port: u16) -> String {
+    const OPEN: &str = "{{ range service \"";
+    const NAME_CLOSE: &str = "\" }}";
+    const END: &str = "{{ end }}";
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + OPEN.len()..];
+        let body_start =
+            after_open.find(NAME_CLOSE).expect("service name closes") + NAME_CLOSE.len();
+        let body_end = body_start
+            + after_open[body_start..]
+                .find(END)
+                .expect("range block ends");
+        let body = &after_open[body_start..body_end];
+        out.push_str(
+            &body
+                .replace("{{ .Address }}", address)
+                .replace("{{ .Port }}", &port.to_string()),
+        );
+        rest = &after_open[body_end + END.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn discovery_section_parses_and_validates() {
+    let cfg = load(
+        r#"
+            [discovery]
+            enabled = true
+            cluster_id = "dev"
+            chain_id = 412346
+            advertise_interface = "192.168.56.0/24"
+            "#,
+    )
+    .expect("a complete discovery section loads");
+    assert!(cfg.discovery.enabled);
+    assert_eq!(
+        cfg.discovery.advertise_interface,
+        Some(InterfaceSelector::Network {
+            net: "192.168.56.0".parse().unwrap(),
+            prefix: 24
+        })
+    );
+    assert_eq!(cfg.discovery.consul_http_addr, "http://127.0.0.1:8500");
+}
+
+#[test]
+fn enabled_discovery_needs_a_cluster_id_and_an_interface() {
+    let no_cluster = load("[discovery]\nenabled = true\nadvertise_interface = \"eth1\"\n");
+    assert!(matches!(no_cluster, Err(LogError::Config(_))));
+    let no_interface = load("[discovery]\nenabled = true\ncluster_id = \"dev\"\n");
+    assert!(matches!(no_interface, Err(LogError::Config(_))));
+    let bad_prefix = load("[discovery]\nadvertise_interface = \"10.0.0.0/40\"\n");
+    assert!(matches!(bad_prefix, Err(LogError::Config(_))));
+    let disabled =
+        load("[discovery]\nenabled = false\n").expect("a disabled section needs nothing");
+    assert!(!disabled.discovery.enabled);
 }

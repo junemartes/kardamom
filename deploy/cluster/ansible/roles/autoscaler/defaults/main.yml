@@ -1,0 +1,39 @@
+---
+# Pinned Nomad Autoscaler release. The checksum comes from HashiCorp's
+# SHA256SUMS file of the same release.
+autoscaler_version: "0.5.0"
+# The hcloud-server target plugin, built from the reviewed revision. The
+# operator builds it, publishes the artifact, and records its URL and
+# checksum; both are required:
+#   git clone https://github.com/AndrewChubatiuk/nomad-hcloud-autoscaler
+#   git -C nomad-hcloud-autoscaler checkout <revision>
+#   (cd nomad-hcloud-autoscaler && CGO_ENABLED=0 go build -o hcloud-server .)
+#   sha256sum hcloud-server
+autoscaler_hcloud_plugin_revision: "9fff034a224511eb4a535ff0cfbf95577446e3d7"
+autoscaler_hcloud_plugin_url: ""
+autoscaler_hcloud_plugin_sha256: ""
+# The pool contract that terraform/hetzner exports (tofu output -json
+# pool_contract). Required.
+autoscaler_pool_contract_file: ""
+# The Prometheus server that scrapes the Nomad clients and the services.
+# Required.
+autoscaler_prometheus_addr: ""
+autoscaler_nomad_addr: "http://127.0.0.1:4646"
+# Protected inputs. The Hetzner token lives only on the Autoscaler host.
+autoscaler_hcloud_token: ""
+autoscaler_nomad_token: ""
+# Every policy renders disabled. Enable after the substrate tests and the
+# measured signals exist. Scale-in stays off until the drain contract is
+# proven; then it is enabled separately.
+autoscaler_policies_enabled: false
+autoscaler_scale_in_enabled: false
+autoscaler_ingress_policy_enabled: false
+autoscaler_cooldown: "10m"
+autoscaler_evaluation_interval: "1m"
+autoscaler_cpu_upper_bound: 80
+autoscaler_memory_upper_bound: 80
+autoscaler_cpu_lower_bound: 30
+autoscaler_ingress_cpu_target: 60
+autoscaler_ingress_min: 2
+autoscaler_config_dir: /etc/nomad-autoscaler.d
+autoscaler_plugin_dir: /opt/nomad-autoscaler/plugins

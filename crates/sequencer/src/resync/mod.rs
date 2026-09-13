@@ -655,7 +655,7 @@ impl ResyncController {
         metrics::record_resync_enter(self.partition);
         // This is a stable grep target for the chaos suite. Keep the
         // "sequencer RESYNC enter" prefix in lockstep with
-        // deploy/cluster/scripts/chaos.sh.
+        // crates/chaos.
         tracing::info!(
             partition = self.partition,
             reason = ?reason,

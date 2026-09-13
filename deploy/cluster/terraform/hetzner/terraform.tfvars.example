@@ -1,0 +1,38 @@
+# Example inputs of the Hetzner root. Copy to a file outside the repo.
+# The API token comes from the HCLOUD_TOKEN environment variable.
+cluster_id          = "kardamom-prod"
+location            = "fsn1"
+network_zone        = "eu-central"
+network_cidr        = "10.10.0.0/16"
+cloud_subnet_cidr   = "10.10.0.0/24"
+vswitch_subnet_cidr = "10.10.1.0/24"
+vswitch_id          = 12345
+dns_zone            = "kardamom.internal"
+consul_servers = {
+  "consul-0.core" = "10.10.1.10"
+  "consul-1.core" = "10.10.1.11"
+  "consul-2.core" = "10.10.1.12"
+}
+ssh_keys = {
+  operator = "ssh-ed25519 AAAA... operator"
+}
+ssh_allowed_cidrs    = ["203.0.113.0/24"]
+elastic_image        = "kardamom-elastic-2026-09-12"
+bootstrap_revision   = "9a5a545f"
+rpc_proxy_target_ips = ["203.0.113.10", "203.0.113.11"]
+pools = {
+  ingress = {
+    role        = "ingress"
+    tier        = "worker"
+    server_type = "ccx23"
+    min         = 2
+    max         = 6
+  }
+  sequencer = {
+    role        = "sequencer"
+    tier        = "sequencer"
+    server_type = "ccx33"
+    min         = 2
+    max         = 8
+  }
+}

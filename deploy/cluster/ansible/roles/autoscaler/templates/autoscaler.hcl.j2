@@ -1,0 +1,57 @@
+# Managed by Ansible (roles/autoscaler). Rendered from the pool contract.
+log_level  = "INFO"
+plugin_dir = "{{ autoscaler_plugin_dir }}"
+
+http {
+  bind_address = "127.0.0.1"
+  bind_port    = 8080
+}
+
+nomad {
+  address = "{{ autoscaler_nomad_addr }}"
+{% if autoscaler_nomad_token | length > 0 %}
+  token   = "{{ autoscaler_nomad_token }}"
+{% endif %}
+}
+
+policy {
+  dir              = "{{ autoscaler_config_dir }}/policies"
+  default_cooldown = "{{ autoscaler_cooldown }}"
+}
+
+# One active controller per pool. The Autoscaler instances on the core
+# hosts take a lock in Nomad; only the holder evaluates policies, and a
+# new holder waits lock_delay before its first mutation, so a fenced
+# instance cannot race it.
+high_availability {
+  enabled        = true
+  lock_namespace = "default"
+  lock_path      = "nomad-autoscaler/lock/{{ cluster_id }}"
+  lock_ttl       = "60s"
+  lock_delay     = "30s"
+}
+
+apm "prometheus" {
+  driver = "prometheus"
+  config = {
+    address = "{{ autoscaler_prometheus_addr }}"
+  }
+}
+
+strategy "threshold" {
+  driver = "threshold"
+}
+
+strategy "target-value" {
+  driver = "target-value"
+}
+
+# The Hetzner token stays in this file, mode 0640, on this host only.
+target "hcloud-server" {
+  driver = "hcloud-server"
+  config = {
+    hcloud_token                   = "{{ autoscaler_hcloud_token }}"
+    hcloud_group_id_label_selector = "{{ (autoscaler_contract.pools.values() | first).group_label.key }}"
+    hcloud_node_attr_id            = "unique.hostname"
+  }
+}
