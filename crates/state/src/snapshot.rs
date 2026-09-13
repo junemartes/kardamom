@@ -21,8 +21,8 @@ use signet_libmdbx::{Database, Environment};
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::{
-    KEY_LAST_COMMITTED_BLOCK, KEY_STATE_ROOT, encode_b_position, get_decoded, read_meta_b256,
-    read_meta_u64,
+    KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_STATE_ROOT,
+    encode_b_position, get_decoded, read_meta_b_position, read_meta_b256, read_meta_u64,
 };
 use crate::schema::{
     TABLE_ACCOUNTS, TABLE_CODE, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX,
@@ -124,6 +124,20 @@ impl StateSnapshot {
     pub fn state_root(&self) -> Result<Option<B256>, StateError> {
         let meta = self.inner.txn.open_db(Some(TABLE_META))?;
         read_meta_b256(&self.inner.txn, meta, KEY_STATE_ROOT)
+    }
+
+    /// The canonical end position of the last block committed at this
+    /// snapshot. Zero at genesis.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if the `meta` table open or read fails.
+    pub fn end_tx_position(&self) -> Result<BPosition, StateError> {
+        let meta = self.inner.txn.open_db(Some(TABLE_META))?;
+        Ok(
+            read_meta_b_position(&self.inner.txn, meta, KEY_LAST_COMMITTED_END_TX_POSITION)?
+                .unwrap_or(BPosition::ZERO),
+        )
     }
 }
 
