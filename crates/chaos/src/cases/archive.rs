@@ -401,21 +401,21 @@ async fn pick_clean_segment(tool: &ArchiveTool<'_>, mirror: &str) -> anyhow::Res
     ))
 }
 
-/// Whether one candidate qualifies. Recording ids are per-archive, so a
-/// victim-only segment cannot be healed from the mirror. A candidate
-/// that fails the probe verify gets its state put back.
+/// Whether one candidate qualifies. Recording ids are per-archive: after
+/// a wipe and a re-replication the mirror's `40-0.rec` can hold another
+/// stream than the victim's, and a heal from it writes foreign frames
+/// (seen in CI: post-heal verify found streamId=2000 where the victim's
+/// recording is stream 2001). So the mirror's segment must be byte-identical
+/// to the victim's before the flip; then the heal restores exactly the bytes
+/// the flip destroyed. A candidate that fails the probe verify gets its
+/// state put back.
 async fn qualify(
     tool: &ArchiveTool<'_>,
     mirror: &str,
     name: String,
 ) -> anyhow::Result<Option<Segment>> {
     let rid = name.split('-').next().unwrap_or("").to_string();
-    let on_mirror = tool
-        .h
-        .nodes
-        .exec_status(mirror, &format!("test -f {ARCHIVE_DIR}/{name}"))
-        .await?;
-    if !on_mirror {
+    if !same_bytes_on_mirror(tool.h, tool.node, mirror, &name).await {
         return Ok(None);
     }
     let out = tool.verify(&rid).await;
@@ -425,6 +425,14 @@ async fn qualify(
     }
     let flip_at = frame_payload_offset(tool.h, tool.node, &name).await;
     Ok((flip_at >= 0).then_some(Segment { name, rid, flip_at }))
+}
+
+/// Whether `name` exists on the mirror with the victim's exact bytes.
+async fn same_bytes_on_mirror(h: &Harness, victim: &str, mirror: &str, name: &str) -> bool {
+    let script = format!("sha256sum {ARCHIVE_DIR}/{name} 2>/dev/null | cut -d' ' -f1");
+    let here = h.nodes.exec(victim, &script).await.unwrap_or_default();
+    let there = h.nodes.exec(mirror, &script).await.unwrap_or_default();
+    !here.trim().is_empty() && here.trim() == there.trim()
 }
 
 /// A byte offset inside the payload of the largest data frame of a
