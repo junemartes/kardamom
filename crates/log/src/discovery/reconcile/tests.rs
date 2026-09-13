@@ -187,3 +187,46 @@ fn malformed_records_are_skipped() {
     let plan = r.plan(&m, Instant::now());
     assert_eq!(plan.attach, vec![uri(41000)]);
 }
+
+#[test]
+fn an_outage_during_removal_grace_requires_fresh_confirmation() {
+    let mut r = Reconciler::new(LOCAL, GRACE);
+    let port = RecordingPort::default();
+    let present = membership(5, vec![publisher("a", 41000)]);
+    let t0 = Instant::now();
+    let initial = r.plan(&present, t0);
+    r.apply(&initial, &port, &present);
+    let missing = membership(6, vec![]);
+    assert!(
+        r.plan(&missing, t0 + Duration::from_secs(1))
+            .detach
+            .is_empty()
+    );
+    let mut degraded = missing.clone();
+    degraded.health = CatalogHealth::Degraded {
+        consecutive_errors: 1,
+    };
+    assert_eq!(r.plan(&degraded, t0 + GRACE * 2), Plan::default());
+    assert_eq!(r.attached(), vec![uri(41000)]);
+    assert!(r.plan(&missing, t0 + GRACE * 3).detach.is_empty());
+    assert_eq!(r.plan(&missing, t0 + GRACE * 4).detach, vec![uri(41000)]);
+}
+
+#[test]
+fn a_publisher_present_after_an_outage_keeps_its_destination() {
+    let mut r = Reconciler::new(LOCAL, GRACE);
+    let port = RecordingPort::default();
+    let present = membership(5, vec![publisher("a", 41000)]);
+    let t0 = Instant::now();
+    let initial = r.plan(&present, t0);
+    r.apply(&initial, &port, &present);
+    let missing = membership(6, vec![]);
+    let _ = r.plan(&missing, t0 + Duration::from_secs(1));
+    let mut degraded = missing;
+    degraded.health = CatalogHealth::Degraded {
+        consecutive_errors: 2,
+    };
+    assert_eq!(r.plan(&degraded, t0 + GRACE * 2), Plan::default());
+    assert_eq!(r.plan(&present, t0 + GRACE * 3), Plan::default());
+    assert_eq!(r.attached(), vec![uri(41000)]);
+}
