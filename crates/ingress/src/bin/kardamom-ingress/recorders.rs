@@ -115,6 +115,7 @@ pub(crate) fn spawn_discovered_tx_data_recorder(
         local_ip,
         own_instance: own_instance.to_string(),
         expected_own: usize::from(lanes.get()),
+        removal_grace: plane.removal_grace(),
         membership,
         stop: recorders.stop_token(),
         runtime: tokio::runtime::Handle::current(),
