@@ -88,7 +88,7 @@ impl Harness {
         crate::log(format!(
             "================= CHAOS CASE: {name} ================="
         ));
-        let account = self.pick_account(case).await?;
+        let account = self.pick_account(case)?;
         let window = case.window(&self.knobs);
         let rx0 = self.probes.ingress_received().await.unwrap_or(0);
         let load = LoadRun::start(&self.load_spec(case, account, window))?;
@@ -110,19 +110,15 @@ impl Harness {
         self.assert_executors_converged(case.name()).await
     }
 
-    async fn pick_account(&mut self, case: Case) -> anyhow::Result<u32> {
+    fn pick_account(&mut self, case: Case) -> anyhow::Result<u32> {
         let moves = match case.pin() {
-            Pin::MovesOnScaleOut => self.moved_accounts().await?,
+            Pin::MovesOnScaleOut => {
+                crate::cases::resize::moved_accounts(self.lifecycle.cluster_dir())?
+            }
             Pin::Any | Pin::Shard0 => Vec::new(),
         };
         self.accounts
             .take(case.pin(), case.name(), |a| moves.contains(&a))
-    }
-
-    /// The funded accounts whose vslot moves under the next map, from
-    /// the shard-map renderer's fewest-moves render to three lanes.
-    async fn moved_accounts(&self) -> anyhow::Result<Vec<u32>> {
-        crate::cases::resize::moved_accounts(self.lifecycle.cluster_dir()).await
     }
 
     fn load_spec(&self, case: Case, account: u32, window: Duration) -> LoadSpec {
