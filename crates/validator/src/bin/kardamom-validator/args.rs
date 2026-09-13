@@ -36,7 +36,7 @@ pub(crate) struct ValidatorFileConfig {
     pub(crate) cluster: ClusterConfig,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(
     name = "kardamom-validator",
     version,

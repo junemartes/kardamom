@@ -248,9 +248,13 @@ impl Victim {
 /// Freeze a running consumer until the cluster's bounded egress
 /// retention rolls past its cursor, so on thaw its replay is refused
 /// and it must repair itself: fetch a peer checkpoint, park the stale
-/// state, restart, restore or adopt, and rejoin. The freeze also
-/// crosses the cluster session timeout, so the resume goes through a
-/// fresh session.
+/// state, restore or adopt it in-process, and rejoin. The repair burns
+/// no orchestrator restart (issue #298): the process that logged the
+/// refusal is the one that logs the restore. The freeze itself does
+/// cost one restart, before the refusal: a SIGSTOP longer than the Aeron
+/// client's service interval makes the client exit on resume, and Nomad
+/// restarts the task. The freeze also crosses the cluster session
+/// timeout, so the resume goes through a fresh session.
 pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow::Result<()> {
     let kind = victim.kind();
     let ctx = format!("retention-overrun({kind})");
@@ -272,10 +276,13 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         .inner_container(&node, kind)
         .await
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no inner {kind} container on {node}"))?;
-    let cid0 = h.nodes.inner_cid(&node, &inner).await;
     let donor = h.container("executor-0")?;
     super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
     require_live_victim(h, victim, &ctx).await?;
+    // Only log lines after this point count as this case's evidence: a
+    // reused cluster may carry an earlier run's repair in the same
+    // allocation log.
+    let mark = h.nomad.job_logs(kind, Streams::Both).await?.len();
     let need = i64::try_from(retention.get().saturating_mul(2)).unwrap_or(i64::MAX);
     let rx_freeze = h.probes.ingress_received().await.unwrap_or(0);
     crate::log(format!(
@@ -296,15 +303,7 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
             "{ctx}: SIGCONT failed (container may have been replaced mid-freeze); the log asserts below own the verdict"
         ));
     }
-    await_repair_chain(h, victim, &ctx, delta, elapsed).await?;
-    let cid_now = h.nodes.inner_cid(&node, &inner).await;
-    anyhow::ensure!(
-        cid_now.is_some() && cid_now != cid0,
-        "{}: {ctx}: victim container was not restarted (cid {} -> {}) — the park/exit/restore loop did not complete",
-        crate::FAIL_PREFIX,
-        cid0.as_deref().unwrap_or("?"),
-        cid_now.as_deref().unwrap_or("gone")
-    );
+    await_repair_chain(h, victim, &ctx, mark, delta, elapsed).await?;
     match victim {
         Victim::Executor => h.assert_executor_progress(Duration::from_secs(180)).await,
         Victim::Validator => await_verifying_resumed(h).await,
@@ -369,12 +368,16 @@ async fn overrun_window(
     }
 }
 
-/// The recovery evidence splits across container generations, so the
-/// only stream holding both halves is the allocation's own Nomad log.
+/// The recovery evidence splits across container generations (the
+/// freeze costs one restart before the refusal), so the only stream
+/// holding every part is the allocation's own Nomad log. Once every
+/// needle is there, the log must also show the repair ran in-process:
+/// see [`in_process_repair`].
 async fn await_repair_chain(
     h: &Harness,
     victim: Victim,
     ctx: &str,
+    mark: usize,
     delta: i64,
     frozen: Duration,
 ) -> anyhow::Result<()> {
@@ -384,6 +387,7 @@ async fn await_repair_chain(
     let seen_ref = &seen;
     let outcome = poll::until(Budget::secs(300, 6), |_| async move {
         let logs = h.nomad.job_logs(kind, Streams::Both).await?;
+        let logs = since_mark(&logs, mark);
         let s = (
             logs.contains("cluster replay unavailable"),
             logs.contains("resync prepared: peer checkpoint staged"),
@@ -400,10 +404,52 @@ async fn await_repair_chain(
             return Err(repair_failure(seen, ctx, delta, frozen, restored));
         }
     };
+    let logs = h.nomad.job_logs(kind, Streams::Both).await?;
+    in_process_repair(since_mark(&logs, mark), kind, restored).map_err(|why| {
+        crate::chaos_fail!(
+            "{ctx}: the repair went through an orchestrator restart, not in-process: {why}"
+        )
+    })?;
     crate::log(format!(
-        "{ctx}: REPLAY_UNAVAILABLE -> fetch -> park -> restart -> restore observed ({}s after thaw)",
+        "{ctx}: REPLAY_UNAVAILABLE -> fetch -> park -> in-process restore observed ({}s after thaw)",
         elapsed.as_secs()
     ));
+    Ok(())
+}
+
+/// The log lines written after `mark`, the log's length before the
+/// freeze. The whole log when the mark does not fall on a line start,
+/// which a restart's reordering of the allocation listing can cause.
+fn since_mark(logs: &str, mark: usize) -> &str {
+    match logs.get(mark..) {
+        Some(tail) if mark == 0 || logs.as_bytes().get(mark - 1) == Some(&b'\n') => tail,
+        _ => logs,
+    }
+}
+
+/// Whether the last repair in `logs` ran in-process: after the last
+/// `resync prepared` line, the consumer logs its revolution line and then
+/// the restore needle, with no `kardamom-<kind> starting` line in
+/// between. A start line there means the process exited and the
+/// orchestrator's restart did the restore.
+fn in_process_repair(logs: &str, kind: &str, restored: &str) -> Result<(), String> {
+    let prepared = logs
+        .rfind("resync prepared: peer checkpoint staged")
+        .ok_or("no 'resync prepared' line")?;
+    let tail = &logs[prepared..];
+    let restored_at = tail
+        .find(restored)
+        .ok_or_else(|| format!("no '{restored}' line after the last 'resync prepared'"))?;
+    let between = &tail[..restored_at];
+    let start = format!("kardamom-{kind} starting");
+    if between.contains(&start) {
+        return Err(format!(
+            "'{start}' logged between 'resync prepared' and '{restored}'"
+        ));
+    }
+    if !between.contains("the pipeline starts again in-process") {
+        return Err("no 'the pipeline starts again in-process' line before the restore".into());
+    }
     Ok(())
 }
 
@@ -426,7 +472,7 @@ fn repair_failure(
         );
     }
     crate::chaos_fail!(
-        "{ctx}: resync prepared but the restarted consumer never logged '{restored}'"
+        "{ctx}: resync prepared but the consumer's next revolution never logged '{restored}'"
     )
 }
 
@@ -462,6 +508,19 @@ async fn await_verifying_resumed(h: &Harness) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn since_mark_keeps_the_lines_after_the_mark() {
+        let logs = "old line\nnew line\n";
+        assert_eq!(since_mark(logs, 9), "new line\n");
+        assert_eq!(since_mark(logs, 0), logs);
+        assert_eq!(
+            since_mark(logs, 4),
+            logs,
+            "a mark inside a line means the log was reordered"
+        );
+        assert_eq!(since_mark(logs, 99), logs);
+    }
 
     #[test]
     fn a_sample_counts_only_when_a_scrape_succeeded() {

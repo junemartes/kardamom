@@ -241,26 +241,118 @@ async fn connect_cluster(
     Ok(connected)
 }
 
+/// What one process sets up once: tracing, the metrics exporter, the
+/// parsed configs, the checkpoint server, and the shutdown signal. Every
+/// revolution of the pipeline starts from this.
+struct Boot {
+    args: Args,
+    file_cfg: ExecutorFileConfig,
+    /// Serves this node's checkpoints to peers for the process lifetime;
+    /// held only for its bound socket. `None` without a checkpoint dir
+    /// or serve address.
+    _checkpoints: Option<kardamom_state::CheckpointServer>,
+    /// Cancelled on the operator's shutdown signal. A revolution checks
+    /// it before it starts, so a signal that lands during the repair
+    /// between two revolutions ends the process instead of being lost.
+    stop: tokio_util::sync::CancellationToken,
+}
+
+impl Boot {
+    async fn init(args: Args) -> Result<Self> {
+        bin_support::init_tracing();
+        kardamom_obs::init_service!("executor", args.metrics_addr, &args.host_id).await?;
+        kardamom_engine::metrics::describe();
+        let file_cfg = load_file_config(&args)?;
+        tracing::info!(
+            lanes = kardamom_types::shard_map::LANE_COUNT,
+            chain_id = args.chain_id,
+            "kardamom-executor starting"
+        );
+        // Serve this node's checkpoints to peers (the other side of the
+        // peer fetch in `state`). This is best-effort infrastructure. But
+        // a bad bind address is a deploy bug, so fail startup loudly.
+        let checkpoints = match (args.checkpoint_dir.as_ref(), args.checkpoint_serve_addr) {
+            (Some(dir), Some(addr)) => Some(
+                kardamom_state::serve_checkpoints(addr, dir.clone())
+                    .context("bind checkpoint serve address")?,
+            ),
+            _ => None,
+        };
+        let stop = tokio_util::sync::CancellationToken::new();
+        let signal = stop.clone();
+        tokio::spawn(async move {
+            bin_support::wait_for_shutdown().await;
+            signal.cancel();
+        });
+        Ok(Self {
+            args,
+            file_cfg,
+            _checkpoints: checkpoints,
+            stop,
+        })
+    }
+}
+
+/// What the process does after one revolution of the pipeline.
+enum Verdict {
+    /// The engine returned cleanly: the operator asked for shutdown.
+    Done,
+    /// A peer checkpoint is staged and the stale state parked: run the
+    /// pipeline again, which restores it.
+    Revolve,
+    /// The pipeline failed and the process cannot repair it.
+    Failed(ExecutorError),
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
-    bin_support::init_tracing();
-    let args = Args::parse();
-    kardamom_obs::init_service!("executor", args.metrics_addr, &args.host_id).await?;
-    kardamom_engine::metrics::describe();
-    let file_cfg = load_file_config(&args)?;
+    let boot = Boot::init(Args::parse()).await?;
+    // Each turn runs the whole pipeline once. A refused replay stages a
+    // peer checkpoint and comes back here for the next turn, which
+    // restores it in-process, with no orchestrator restart in between
+    // (issue #298); every other end leaves the loop.
+    let mut revolutions = 0u32;
+    while turn(&boot, &mut revolutions).await?.is_continue() {}
+    Ok(())
+}
 
+/// One turn of the process loop: a revolution, then its verdict.
+/// `Continue` means run again; `Break` means the process is done. A
+/// failure the process cannot repair returns `Err`, so the process exits
+/// non-zero: the orchestrator tells a dead pipeline from a clean shutdown
+/// by the exit status, which the whole "fail loudly, resume from the
+/// cursor" loop relies on.
+async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<std::ops::ControlFlow<()>> {
+    match Box::pin(run_once(boot)).await? {
+        Verdict::Done => return Ok(std::ops::ControlFlow::Break(())),
+        Verdict::Failed(e) => anyhow::bail!("executor pipeline failed: {e}"),
+        Verdict::Revolve => (),
+    }
+    if boot.stop.is_cancelled() {
+        tracing::info!("shutdown signal received during the resync repair; not revolving");
+        return Ok(std::ops::ControlFlow::Break(()));
+    }
+    *revolutions += 1;
     tracing::info!(
-        lanes = kardamom_types::shard_map::LANE_COUNT,
-        chain_id = args.chain_id,
-        "kardamom-executor starting"
+        revolutions,
+        "resync: the pipeline starts again in-process and restores the staged peer checkpoint"
     );
+    Ok(std::ops::ControlFlow::Continue(()))
+}
 
+/// One revolution: open the transport and the state, run the engine to
+/// its end, repair a refused replay, and return the verdict. Every
+/// handle, the nonce query server's clone of the state env included, is
+/// gone before the repair parks the state.
+async fn run_once(boot: &Boot) -> Result<Verdict> {
+    let args = &boot.args;
+    let file_cfg = &boot.file_cfg;
     let Transport {
         aeron_cfg,
         mut plane,
         rt,
         rt_pub,
-    } = open_transport(&args)?;
+    } = open_transport(args)?;
 
     // --- State backend and crash-recovery decision. This runs before the
     // subscriptions, because the tx_ordering subscription branches on
@@ -272,7 +364,7 @@ async fn main() -> Result<()> {
     // stops the periodic checkpointer task.
     let shutdown = tokio_util::sync::CancellationToken::new();
     let state::PreparedState { env, start } =
-        state::prepare_state(&args, expected_genesis, shutdown.clone())?;
+        state::prepare_state(args, expected_genesis, shutdown.clone())?;
 
     // M tx_data subscriptions, plus tx_deposits, bridged from async to
     // sync (shared with the validator binary; see `bin_support`). These
@@ -288,10 +380,9 @@ async fn main() -> Result<()> {
         args.replay_destination_endpoint.as_deref(),
     );
 
-    let (cluster_guard, tx_ordering_sub) =
-        connect_cluster(&args, &file_cfg, &plane, &start).await?;
+    let (cluster_guard, tx_ordering_sub) = connect_cluster(args, file_cfg, &plane, &start).await?;
 
-    let tx_receipts_pub = wiring::open_tx_receipts_pub(&rt_pub, &mut plane, &args).await?;
+    let tx_receipts_pub = wiring::open_tx_receipts_pub(&rt_pub, &mut plane, args).await?;
 
     let WriterAdapters {
         mut writer,
@@ -301,8 +392,8 @@ async fn main() -> Result<()> {
         bal_tx,
         footprint_shadow,
         _bal_publisher,
-        _nonce_query,
-    } = spawn_writer_and_bal(&args, env, genesis.as_ref(), &rt_pub, &mut plane).await?;
+        _nonce_query: nonce_query,
+    } = spawn_writer_and_bal(args, env, genesis.as_ref(), &rt_pub, &mut plane).await?;
 
     // `verify_record_identity` stays off here by decision, not omission.
     // With the validator checking every record, a forged envelope
@@ -323,7 +414,7 @@ async fn main() -> Result<()> {
     // resume's.
     cfg.reader.join_timeout = bin_support::bounded_join_timeout(start.is_resume());
 
-    let block_exec = wiring::build_block_exec(&args);
+    let block_exec = wiring::build_block_exec(args);
 
     // The executor's main loop is sync (std::thread spawns underneath).
     // Run it inside spawn_blocking so the runtime stays responsive for
@@ -374,29 +465,49 @@ async fn main() -> Result<()> {
     if let Err(e) = writer.shutdown() {
         tracing::error!(error = %e, "state writer shutdown returned an error");
     }
-    // Replay-window overrun: repair before exiting, so the restart
-    // resumes from a fetched peer checkpoint instead of crash-looping on
-    // the same refused `REPLAY_FROM`. See
+    // End the nonce query server before the repair: it holds a clone of
+    // the state env, and the repair parks that env.
+    stop_nonce_query(nonce_query).await;
+    // Replay-window overrun: repair between revolutions, so the next one
+    // restores a fetched peer checkpoint instead of re-requesting the
+    // same refused `REPLAY_FROM`. See
     // `bin_support::replay_unavailable_fallback`.
-    if let Some(outcome) = bin_support::replay_unavailable_fallback(
+    let repaired = bin_support::replay_unavailable_fallback(
         engine_error.as_ref(),
         args.checkpoint_dir.as_deref(),
         &args.checkpoint_peers,
         &args.state_dir,
         expected_genesis,
         false,
-    )? {
+    )?;
+    if let Some(outcome) = repaired {
         metrics::counter!(kardamom_engine::metrics::RESYNC_TOTAL, "outcome" => outcome)
             .increment(1);
     }
-    // A non-zero exit lets the orchestrator tell a failed recovery or
-    // dead pipeline from a clean shutdown. The exit status is the
-    // restart signal that the whole "fail loudly, resume from the
-    // cursor" loop relies on.
-    if let Some(e) = engine_error {
-        anyhow::bail!("executor pipeline failed: {e}");
+    Ok(verdict(engine_error, repaired))
+}
+
+/// The verdict for one engine result and the repair's result. `repaired`
+/// is the resync outcome label the fallback returned, or `None` when the
+/// error was not a refused replay, or the fallback is not configured.
+fn verdict(engine_error: Option<ExecutorError>, repaired: Option<&str>) -> Verdict {
+    match (engine_error, repaired) {
+        (None, _) => Verdict::Done,
+        (Some(_), Some("peer-checkpoint")) => Verdict::Revolve,
+        (Some(e), _) => Verdict::Failed(e),
     }
-    Ok(())
+}
+
+/// End the nonce query server, when one runs, and wait until its task is
+/// gone: an abort only schedules the cancel, and the port is free only
+/// once the task has dropped its listener. The next revolution binds the
+/// same address.
+async fn stop_nonce_query(server: Option<kardamom_state::NonceQueryServer>) {
+    let Some(mut server) = server else {
+        return;
+    };
+    server.task.abort();
+    let _ = (&mut server.task).await;
 }
 
 /// Wait for whichever comes first: an operator shutdown signal, or the
@@ -434,5 +545,29 @@ async fn wait_for_engine(
             tracing::error!(error = %e, "executor task panicked");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdict_revolves_only_on_a_staged_checkpoint() {
+        let refused = || ExecutorError::ClusterReplayUnavailable {
+            from_index: 10,
+            oldest_index: 500,
+            oldest_block: 7,
+        };
+        assert!(matches!(
+            verdict(Some(refused()), Some("peer-checkpoint")),
+            Verdict::Revolve
+        ));
+        assert!(matches!(
+            verdict(Some(refused()), Some("unrecoverable")),
+            Verdict::Failed(_)
+        ));
+        assert!(matches!(verdict(Some(refused()), None), Verdict::Failed(_)));
+        assert!(matches!(verdict(None, None), Verdict::Done));
     }
 }
