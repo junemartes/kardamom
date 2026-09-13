@@ -1,12 +1,12 @@
 # kardamom-da-watcher polls L1 for deposits, and publishes Deposit
-# envelopes onto tx_deposits. It runs on dawatcher1 (192.168.56.34).
+# envelopes onto tx_deposits. It runs on the aux node.
 #
 # Invocation (from crates/e2e/tests/multiprocess_e2e.rs):
-#   kardamom-da-watcher --l1-rpc http://192.168.56.10:8546 --lockbox <addr> \
+#   kardamom-da-watcher --l1-rpc http://anvil.service.consul:8546 --lockbox <addr> \
 #       --aeron-dir <dir> --poll-interval-secs 1
 #
-# --l1-rpc points at the in-cluster anvil on r1 (control_ip:anvil_l1 =
-# 192.168.56.10:8546). --lockbox is the chain-specific Lockbox
+# --l1-rpc points at the in-cluster anvil by its Consul service record
+# (var.l1_rpc). --lockbox is the chain-specific Lockbox
 # contract address. It is not known until the deployer deploys it, so
 # it is exposed as the HCL variable `lockbox_address` below, with a
 # clearly marked placeholder default. Override it at submit time:
@@ -23,7 +23,7 @@ variable "lockbox_address" {
   default = "0x0000000000000000000000000000000000000000"
 }
 
-# Digest-pinned image. scripts/deploy.sh
+# Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests). The empty default falls back to the
 # mutable :dev tag in the task config. That fallback is a dev
@@ -35,8 +35,20 @@ variable "image_ref" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
+variable "l1_rpc" {
+  type        = string
+  description = "The L1 JSON-RPC endpoint. The default is the in-cluster anvil by its Consul service record."
+  default     = "http://anvil.service.consul:8546"
+}
+
 job "da-watcher" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {
@@ -81,7 +93,7 @@ job "da-watcher" {
       driver = "docker"
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-da-watcher:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-da-watcher:dev"
         # force_pull stays on for both paths; see the ingress job's
         # comment. The :dev fallback needs it. On the pinned path, the
         # 1.9.5 driver pulls the tag but resolves the image by digest,
@@ -97,7 +109,7 @@ job "da-watcher" {
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
         ]
         args = [
-          "--l1-rpc", "http://192.168.56.10:8546",
+          "--l1-rpc", var.l1_rpc,
           "--lockbox", "${var.lockbox_address}",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
@@ -109,11 +121,21 @@ job "da-watcher" {
         ]
       }
 
-      # Cluster LogConfig (UDP multicast channels), read through
+      env {
+        # The UDP ports the discovered tx_deposits and tx_remote_epochs
+        # publications bind on this node.
+        KARDAMOM_MDC_PORTS = "40330-40339"
+      }
+
+      # Cluster LogConfig (Aeron streams and discovery), read through
       # --log-config.
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }
 
       resources {

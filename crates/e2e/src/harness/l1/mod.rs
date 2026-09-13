@@ -28,6 +28,11 @@ use kardamom_deployer::{ContractId, Deployer, Op, encode_address_pair, encode_or
 
 pub use contracts::*;
 
+/// The L1 block interval in seconds. Anvil seals a block this often
+/// with no explicit mining, and [`L1::resume_block_production`] restores
+/// this interval.
+const BLOCK_INTERVAL_SECS: u64 = 1;
+
 /// A short finalization window, so a scenario can warp past it quickly
 /// (the production default is `86_400`).
 pub(crate) const FINALIZATION_WINDOW: u64 = 60;
@@ -212,7 +217,7 @@ impl L1 {
     /// predicted before the deploy.
     pub async fn launch(l2_chain_id: u64) -> Result<Option<Self>> {
         let anvil = alloy_node_bindings::Anvil::new()
-            .block_time(1)
+            .block_time(BLOCK_INTERVAL_SECS)
             .arg("--slots-in-an-epoch")
             .arg("1");
         // Funds and impersonates DEV_OWNER, funds the batcher EOA only (it
@@ -489,15 +494,19 @@ impl L1 {
         Ok(out)
     }
 
-    /// `evm_setAutomine`, the single switch behind
+    /// `evm_setIntervalMining`, the single switch behind
     /// [`pause_block_production`](Self::pause_block_production) and
-    /// [`resume_block_production`](Self::resume_block_production).
-    async fn set_automine(&self, on: bool) -> Result<()> {
+    /// [`resume_block_production`](Self::resume_block_production). Anvil
+    /// runs in interval mode (`block_time(1)`), and `evm_setAutomine(false)`
+    /// does not touch that mode: the interval timer keeps sealing a block
+    /// every second (checked against anvil 1.7.1). Only an interval of 0
+    /// stops it.
+    async fn set_interval_mining(&self, secs: u64) -> Result<()> {
         let _: serde_json::Value = self
             .provider()?
-            .raw_request("evm_setAutomine".into(), (on,))
+            .raw_request("evm_setIntervalMining".into(), (secs,))
             .await
-            .with_context(|| format!("evm_setAutomine({on})"))?;
+            .with_context(|| format!("evm_setIntervalMining({secs})"))?;
         Ok(())
     }
 
@@ -507,17 +516,17 @@ impl L1 {
     /// [`resume_block_production`](Self::resume_block_production).
     ///
     /// # Errors
-    /// Returns an error when the `evm_setAutomine` RPC call fails.
+    /// Returns an error when the `evm_setIntervalMining` RPC call fails.
     pub async fn pause_block_production(&self) -> Result<()> {
-        self.set_automine(false).await
+        self.set_interval_mining(0).await
     }
 
-    /// Resume automatic L1 block production.
+    /// Resume the one-second L1 block interval.
     ///
     /// # Errors
-    /// Returns an error when the `evm_setAutomine` RPC call fails.
+    /// Returns an error when the `evm_setIntervalMining` RPC call fails.
     pub async fn resume_block_production(&self) -> Result<()> {
-        self.set_automine(true).await
+        self.set_interval_mining(BLOCK_INTERVAL_SECS).await
     }
 
     /// The latest finalized L1 block number, the same view the da-watcher

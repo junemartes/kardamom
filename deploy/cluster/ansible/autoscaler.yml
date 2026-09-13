@@ -1,0 +1,18 @@
+---
+# Install and configure the Nomad Autoscaler on the core hosts of the
+# autoscaler group, with the hcloud-server target and the pool policies
+# rendered from the pool contract that terraform/hetzner exports:
+#   tofu output -json pool_contract > pool-contract.json
+#   ansible-playbook -i <inventory> autoscaler.yml \
+#     -e autoscaler_pool_contract_file=/path/pool-contract.json \
+#     -e autoscaler_hcloud_plugin_url=... -e autoscaler_hcloud_plugin_sha256=... \
+#     -e autoscaler_prometheus_addr=http://... -e @vault.yml
+# Every policy renders disabled; see roles/autoscaler/defaults.
+
+- name: Install the Nomad Autoscaler on the core hosts
+  hosts: autoscaler
+  become: true
+  roles:
+    - profile
+    - common
+    - autoscaler

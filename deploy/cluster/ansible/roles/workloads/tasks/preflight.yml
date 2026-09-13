@@ -1,0 +1,138 @@
+---
+- name: Validate optional L1 light client configuration
+  ansible.builtin.assert:
+    that:
+      - >-
+        (workloads_light_execution_rpc | length == 0 and workloads_light_consensus_rpc | length == 0)
+        or (workloads_light_execution_rpc | length > 0 and workloads_light_consensus_rpc | length > 0
+        and workloads_light_checkpoint | length > 0 and workloads_lockbox_address | length > 0)
+    fail_msg: The L1 light client requires execution RPC, consensus RPC, checkpoint and lockbox address.
+
+- name: Read the image manifest
+  ansible.builtin.stat:
+    path: "{{ workloads_manifest }}"
+  register: workloads_manifest_stat
+
+- name: Require a signed manifest when verification is enabled
+  ansible.builtin.assert:
+    that: workloads_manifest_stat.stat.exists
+    fail_msg: Signed deployment requires an image manifest; refusing to deploy.
+  when: workloads_require_signed | bool
+
+- name: Parse manifest records
+  ansible.builtin.set_fact:
+    workloads_manifest_lines: >-
+      {{ (lookup('file', workloads_manifest) if workloads_manifest_stat.stat.exists else '').splitlines()
+         | map('trim') | reject('equalto', '') | reject('match', '^#') | list }}
+    workloads_image_refs: {}
+
+- name: Validate every manifest record before submitting any job
+  ansible.builtin.assert:
+    that: item is match('^[a-z0-9-]+ +[a-z0-9./:-]+@sha256:[0-9a-f]{64}$')
+    fail_msg: Malformed image manifest; refusing to deploy.
+  loop: "{{ workloads_manifest_lines }}"
+
+- name: Index image references by service
+  ansible.builtin.set_fact:
+    workloads_image_refs: "{{ workloads_image_refs | combine({item.split()[0]: item.split()[1]}) }}"
+  loop: "{{ workloads_manifest_lines }}"
+
+- name: Require complete image coverage for signed deployments
+  ansible.builtin.assert:
+    that:
+      - workloads_image_services | difference(workloads_image_refs.keys() | list) | length == 0
+    fail_msg: Signed deployment cannot fall back to mutable image tags; refusing to deploy.
+  when: workloads_require_signed | bool
+
+- name: Explain local development image policy
+  ansible.builtin.debug:
+    msg: >-
+      Unsigned local deployment. Services without manifest entries use mutable dev tags:
+      {{ workloads_image_services | difference(workloads_image_refs.keys() | list) }}.
+  when: not (workloads_require_signed | bool)
+
+- name: Inspect the manifest signature bundle
+  ansible.builtin.stat:
+    path: "{{ workloads_manifest }}.sigbundle"
+  register: workloads_bundle_stat
+  when: workloads_require_signed | bool
+
+- name: Require the manifest signature bundle
+  ansible.builtin.assert:
+    that: workloads_bundle_stat.stat.exists
+    fail_msg: Missing signature bundle; refusing to deploy.
+  when: workloads_require_signed | bool
+
+- name: Verify the manifest signature before any deployment mutation
+  ansible.builtin.command:
+    argv:
+      - "{{ workloads_cosign_binary }}"
+      - verify-blob
+      - --bundle
+      - "{{ workloads_manifest }}.sigbundle"
+      - --certificate-identity-regexp
+      - "{{ workloads_cert_identity }}"
+      - --certificate-oidc-issuer
+      - "{{ workloads_cert_issuer }}"
+      - "{{ workloads_manifest }}"
+  changed_when: false
+  check_mode: false
+  when: workloads_require_signed | bool
+
+- name: Verify every manifest image signature
+  ansible.builtin.command:
+    argv:
+      - "{{ workloads_cosign_binary }}"
+      - verify
+      - --allow-http-registry
+      - --certificate-identity-regexp
+      - "{{ workloads_cert_identity }}"
+      - --certificate-oidc-issuer
+      - "{{ workloads_cert_issuer }}"
+      - "{{ item.value }}"
+  loop: "{{ workloads_image_refs | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  changed_when: false
+  check_mode: false
+  when: workloads_require_signed | bool
+
+- name: Check the settlement deployer when no address was supplied
+  ansible.builtin.stat:
+    path: "{{ workloads_deploy_binary }}"
+  register: workloads_deployer_stat
+  when: workloads_settlement_address | length == 0
+
+- name: Require a settlement address or the contract deployer
+  ansible.builtin.assert:
+    that: workloads_deployer_stat.stat.executable | default(false)
+    fail_msg: Build kardamom-deploy or supply workloads_settlement_address; the batcher needs a real settlement.
+  when: workloads_settlement_address | length == 0
+
+- name: Check contract deployer automation support
+  ansible.builtin.command:
+    argv: ["{{ workloads_deploy_binary }}", --owner, "{{ workloads_l1_owner }}", addresses, --help]
+  register: workloads_deployer_help
+  changed_when: false
+  check_mode: false
+  when: workloads_settlement_address | length == 0
+
+- name: Require a current contract deployer before changing jobs
+  ansible.builtin.assert:
+    that:
+      - "'--json' in workloads_deployer_help.stdout"
+      - "'--contract' in workloads_deployer_help.stdout"
+    fail_msg: Rebuild kardamom-deploy; this playbook requires addresses --contract --json.
+  when: workloads_settlement_address | length == 0
+
+- name: Explain the dev lockbox placeholder
+  ansible.builtin.debug:
+    msg: No lockbox address configured; the da-watcher deposit path is disabled by its placeholder.
+  when: workloads_lockbox_address | length == 0
+
+- name: Validate a supplied settlement before changing any jobs
+  ansible.builtin.assert:
+    that:
+      - workloads_settlement_address is match('^0x[0-9a-fA-F]{40}$')
+      - workloads_settlement_address != '0x0000000000000000000000000000000000000000'
+  when: workloads_settlement_address | length > 0

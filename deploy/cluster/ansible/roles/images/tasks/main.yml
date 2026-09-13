@@ -1,0 +1,110 @@
+---
+- name: Validate image build mode
+  ansible.builtin.assert:
+    that:
+      - images_mode in ['source', 'prebuilt']
+      - images_registry is match('^[a-z0-9.:-]+$')
+      - images_tag is match('^[a-z0-9][a-z0-9.-]*$')
+    fail_msg: Choose source or prebuilt mode and a valid registry/tag.
+
+# A check run must not build, push, sign, or replace a completed manifest.
+- name: Explain image check mode
+  ansible.builtin.debug:
+    msg: "Would build and push {{ images_services + ['aeron', 'cluster'] }} ({{ images_mode }}), then publish {{ images_manifest }}."
+  when: ansible_check_mode
+
+- name: Build a complete image release
+  when: not ansible_check_mode
+  block:
+    - name: Check the Java cluster artifact before any build
+      ansible.builtin.stat:
+        path: "{{ images_cluster_jar }}"
+      register: images_jar_stat
+
+    - name: Require the Java cluster artifact
+      ansible.builtin.assert:
+        that: images_jar_stat.stat.isreg | default(false)
+        fail_msg: Build the cluster shadowJar before running the image playbook.
+
+    - name: Resolve the current Docker context
+      ansible.builtin.command:
+        argv: ["{{ images_docker_binary }}", context, show]
+      register: images_context
+      changed_when: false
+
+    - name: Prepare the signing tool when CI OIDC signing is enabled
+      ansible.builtin.include_role:
+        name: cosign
+      when: images_sign | bool
+
+    - name: Explain local unsigned builds
+      ansible.builtin.debug:
+        msg: No CI OIDC token; image and manifest signing are skipped for this local build.
+      when: not (images_sign | bool)
+
+    - name: Allocate a private build staging directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: kardamom-images-
+      register: images_staging
+
+    - name: Build, push and publish using temporary artifacts
+      block:
+        - name: Initialize release manifest records
+          ansible.builtin.set_fact:
+            images_records: []
+
+        - name: Create the Java build context
+          ansible.builtin.file:
+            path: "{{ images_staging.path }}/cluster"
+            state: directory
+            mode: "0755"
+
+        - name: Stage the Java cluster jar
+          ansible.builtin.copy:
+            src: "{{ images_cluster_jar }}"
+            dest: "{{ images_staging.path }}/cluster/kardamom-cluster-node.jar"
+            remote_src: true
+            mode: "0644"
+
+        - name: Stage prebuilt Linux services and Aeron libraries
+          ansible.builtin.include_tasks: prebuilt.yml
+          when: images_mode == 'prebuilt'
+
+        - name: Build and push Aeron
+          ansible.builtin.include_tasks: image.yml
+          vars:
+            images_item:
+              name: aeron
+              path: "{{ images_root }}/crates/log/docker/aeron"
+              dockerfile: Dockerfile
+
+        - name: Build and push Rust services
+          ansible.builtin.include_tasks: image.yml
+          loop: "{{ images_services }}"
+          loop_control:
+            loop_var: images_service
+          vars:
+            images_item:
+              name: "{{ images_service }}"
+              path: "{{ images_staging.path ~ '/services' if images_mode == 'prebuilt' else images_root }}"
+              dockerfile: "{{ images_cluster_dir }}/docker/{{ 'ci-service' if images_mode == 'prebuilt' else 'service' }}.Dockerfile"
+              args:
+                BIN: "kardamom-{{ images_service }}"
+
+        - name: Build and push the Java cluster image
+          ansible.builtin.include_tasks: image.yml
+          vars:
+            images_item:
+              name: cluster
+              path: "{{ images_staging.path }}/cluster"
+              dockerfile: "{{ images_cluster_dir }}/docker/cluster.Dockerfile"
+
+        - name: Publish the completed digest manifest
+          ansible.builtin.include_tasks: manifest.yml
+
+      always:
+        - name: Remove temporary build contexts and image archives
+          ansible.builtin.file:
+            path: "{{ images_staging.path }}"
+            state: absent

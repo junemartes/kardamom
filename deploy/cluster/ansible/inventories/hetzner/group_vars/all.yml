@@ -1,0 +1,39 @@
+---
+# The production profile values of the Hetzner deployment. This file
+# overrides ansible/group_vars/all.yml for the inventories/hetzner
+# inventory. It holds no secret: the gossip key and the agent tokens
+# come from an encrypted vault file in this directory (see
+# secrets.example.yml).
+deployment_profile: "production"
+cluster_id: "kardamom-prod"
+datacenter: "dc1"
+nomad_region: "global"
+
+# Infrastructure DNS names of the three dedicated Consul servers. The
+# Terraform root of the Hetzner deployment publishes these records.
+consul_retry_join:
+  - "consul-0.core.kardamom.internal"
+  - "consul-1.core.kardamom.internal"
+  - "consul-2.core.kardamom.internal"
+consul_server_expect: 3
+nomad_server_expect: 3
+# The HTTP and DNS listeners stay on the loopback. The local Nomad agent
+# and the applications use them; nothing reaches them over the network.
+consul_client_addr: "127.0.0.1"
+
+consul_acl_enabled: true
+nomad_acl_enabled: true
+consul_tls_dir: "/etc/consul.d/tls"
+nomad_tls_dir: "/etc/nomad.d/tls"
+
+# The Cloud Network range: the cloud subnet of the elastic pools and the
+# vswitch subnet of the dedicated core.
+private_cidrs:
+  - "10.10.0.0/16"
+# Replace with the operator ranges.
+ssh_allowed_cidrs:
+  - "0.0.0.0/0"
+
+# The TLS registry that holds the signed application images.
+registry_host: "registry.kardamom.internal"
+registry_port: 443

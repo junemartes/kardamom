@@ -4,7 +4,7 @@
 # driver must be local to every service that shares the tmpfs
 # aeron.dir.
 #
-# Image: 192.168.56.10:5000/kardamom-aeron:dev, built from
+# Image: registry.service.consul:5000/kardamom-aeron:dev, built from
 # crates/log/docker/aeron/Dockerfile. Its entrypoint starts
 # io.aeron.archive.ArchivingMediaDriver, with AERON_DIR=/aeron-mount/dir
 # and the archive under /aeron-mount/archive; see the image's ENV.
@@ -32,7 +32,7 @@
 # control/response/recording-events/replication UDP ports
 # (8010/8011/8020/8021) directly.
 
-# Digest-pinned image. scripts/deploy.sh
+# Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests). The empty default falls back to the
 # mutable :dev tag in the task config. That fallback is a dev
@@ -44,8 +44,14 @@ variable "image_ref" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
 job "aeron" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "system"
 
   # Keep the media driver off the control-plane node. cp1 runs only
@@ -78,6 +84,10 @@ job "aeron" {
   group "aeron" {
     network {
       mode = "host"
+      # The archive control endpoint, registered below.
+      port "archive_control" {
+        static = 8010
+      }
     }
 
     # Persistent archive segment volume on the VM disk. Recorders use
@@ -86,7 +96,7 @@ job "aeron" {
       driver = "docker"
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-aeron:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-aeron:dev"
         # This has no force_pull, matching the pre-digest behavior.
         # The aeron image changes rarely, and the digest pin makes
         # staleness moot on the pinned path. The :dev fallback keeps
@@ -132,6 +142,35 @@ job "aeron" {
         # small heap is plenty. The JVM honors _JAVA_OPTIONS
         # regardless of the image entrypoint.
         _JAVA_OPTIONS = "-Xmx160m"
+      }
+
+      # The archive record of the discovery contract
+      # (docs/aeron-discovery.md): the consumers' refetch client reads
+      # the archive control endpoints from these records, filtered by
+      # the topics each node's archive records. `archive_topics` is
+      # node meta the Nomad agent template stamps per node class
+      # (ansible/roles/nomad/templates/nomad.hcl.j2): the ingress nodes
+      # record tx_data, the aux node records tx_deposits, every other
+      # node records nothing and lists no topic. Nomad owns this record;
+      # the runtime never registers an archive. The record outlives every
+      # publisher, so retained recordings stay discoverable.
+      service {
+        name     = "kardamom-aeron-archive"
+        port     = "archive_control"
+        address  = "${meta.node_ip}"
+        provider = "consul"
+        # The node role, so a template can select the archives of one
+        # role: config/channels.toml.tpl renders its fallback archive
+        # lists from `ingress.kardamom-aeron-archive` and
+        # `aux.kardamom-aeron-archive`.
+        tags = ["${meta.role}"]
+        meta {
+          discovery_version = "1"
+          cluster_id        = "${meta.cluster_id}"
+          chain_id          = "412346"
+          archive_id        = "${node.unique.name}"
+          topics            = "${meta.archive_topics}"
+        }
       }
 
       # Trimmed from 768 MB. One media driver runs on every

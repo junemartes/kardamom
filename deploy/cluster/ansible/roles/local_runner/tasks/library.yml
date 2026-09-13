@@ -1,0 +1,13 @@
+---
+- name: Create library output directory
+  ansible.builtin.file:
+    path: "{{ local_runner_library.path | dirname | replace('/ltarget/release/build', '/work/target/release/build/aeronstage') }}"
+    state: directory
+    mode: "0755"
+
+- name: Stage library
+  ansible.builtin.copy:
+    src: "{{ local_runner_library.path }}"
+    dest: "{{ local_runner_library.path | replace('/ltarget/release/build', '/work/target/release/build/aeronstage') }}"
+    remote_src: true
+    mode: "0755"

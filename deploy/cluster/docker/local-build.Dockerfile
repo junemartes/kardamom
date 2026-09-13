@@ -20,7 +20,7 @@
 # A bare ubuntu:24.04 has none of these, so building locally (or anywhere that
 # isn't the GitHub runner image) fails one dependency at a time. This image
 # captures the FULL set so the build is reproducible off-runner. Used by
-# deploy/cluster/scripts/local-cluster.sh.
+# deploy/cluster/ansible/local.yml.
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config curl ca-certificates git \
         uuid-dev libbsd-dev libssl-dev \
         clang libclang-dev \
-        default-jdk \
+        default-jdk python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Aeron 1.45 needs cmake >= 3.30; ubuntu noble apt has 3.28. Install the upstream

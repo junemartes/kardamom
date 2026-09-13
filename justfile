@@ -308,8 +308,7 @@ test-e2e-local: aeron-jar cluster-jar
 # These recipes install the tools needed on this machine to run
 # `cd deploy/cluster && make up`: Vagrant + a VM provider, Ansible (+ the
 # ansible.posix / community.docker collections), Docker with BuildKit, and the
-# Nomad CLI (deploy/cluster/scripts/deploy.sh drives the cluster's Nomad API
-# from the host). Nomad *servers/clients* and Consul run inside the VMs and
+# Nomad CLI (the Ansible workload role uses it to compile HCL locally). Nomad *servers/clients* and Consul run inside the VMs and
 # are installed by Ansible, not here. See deploy/cluster/README.md.
 # ---------------------------------------------------------------------------
 
@@ -321,7 +320,7 @@ NOMAD_VERSION := "1.9.5"
 cluster-bootstrap:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Pinned Nomad CLI matching the in-VM agents (deploy.sh needs it on PATH).
+    # Pinned Nomad CLI matching the in-VM agents (Ansible deployment needs it on PATH).
     install_nomad() {
         command -v nomad >/dev/null 2>&1 && return 0
         local ver="{{NOMAD_VERSION}}" os arch zip
@@ -399,11 +398,9 @@ cluster-bootstrap:
     ansible-galaxy collection install ansible.posix community.docker
     echo ">> cluster-bootstrap complete. Verify with: just cluster-doctor"
     echo
-    echo "   MANUAL STEP: 'make images' pushes over plain HTTP to the in-cluster"
-    echo "   registry, so this HOST's Docker daemon must list it as insecure:"
-    echo "       { \"insecure-registries\": [\"192.168.56.10:5000\"] }"
-    echo "   (Linux: /etc/docker/daemon.json + restart docker; Docker Desktop:"
-    echo "   Settings > Docker Engine.) 'just cluster-doctor' checks this."
+    echo "   Images are pushed from inside the control node (REGISTRY_PUSH_NODE),"
+    echo "   where the registry name registry.service.consul resolves. This host's"
+    echo "   Docker daemon needs no insecure-registry entry."
 
 # Check that the HOST has everything deploy/cluster needs.
 cluster-doctor:
@@ -417,7 +414,8 @@ cluster-doctor:
     chk ansible "run 'just cluster-bootstrap'"
     chk ansible-galaxy "ships with ansible"
     chk docker "run 'just cluster-bootstrap'"
-    chk nomad "run 'just cluster-bootstrap' — deploy.sh drives the cluster API from the host"
+    chk nomad "run 'just cluster-bootstrap' — Ansible uses Nomad to compile job specs"
+    chk tofu "install OpenTofu 1.12.6 — terraform/containers creates the node containers"
     if have virsh || have VBoxManage; then
         echo "  ok    vm provider (libvirt or virtualbox)"
     else
@@ -430,24 +428,12 @@ cluster-doctor:
             echo "  MISS  ansible collection $col — run 'just cluster-bootstrap'"; rc=1
         fi
     done
-    # Pushing images needs the in-cluster registry allowed as insecure (HTTP)
-    # in THIS host's Docker daemon. 192.168.56.10:5000 mirrors registry_host/
-    # registry_port in deploy/cluster/ansible/group_vars/all.yml.
+    # Images are pushed from inside the control node, so this host's daemon
+    # needs no insecure-registry entry; it only has to run.
     if docker info >/dev/null 2>&1; then
-        if docker info 2>/dev/null | grep -qE '^\s*192\.168\.56\.10:5000$'; then
-            echo "  ok    docker insecure-registry 192.168.56.10:5000"
-        else
-            echo "  MISS  docker insecure-registry 192.168.56.10:5000 — add to the daemon's"
-            echo "        insecure-registries and restart Docker (see cluster-bootstrap notes)"; rc=1
-        fi
+        echo "  ok    docker daemon running"
     else
-        echo "  WARN  docker daemon not running — cannot check insecure-registries"
-    fi
-    # Smoke test (scripts/smoke.sh) prefers foundry's cast; non-fatal.
-    if have cast; then
-        echo "  ok    cast — $(cast --version 2>&1 | head -1)"
-    else
-        echo "  WARN  cast not found — 'make smoke' needs foundry (repo: 'just bootstrap')"
+        echo "  WARN  docker daemon not running"
     fi
     if [[ "$rc" == "0" ]]; then
         echo ">> all good — 'cd deploy/cluster && make up'"

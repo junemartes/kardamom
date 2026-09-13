@@ -282,7 +282,10 @@ impl Ready {
                                 Streamed {
                                     opened:
                                         Opened {
-                                            base: Startup { args, rt, .. },
+                                            base:
+                                                Startup {
+                                                    args, rt, plane, ..
+                                                },
                                             state:
                                                 OpenedState {
                                                     expected_genesis,
@@ -295,7 +298,7 @@ impl Ready {
                                             inbound,
                                             cluster_guard,
                                             divergence,
-                                            pump_shutdown,
+                                            stop,
                                             ..
                                         },
                                 },
@@ -342,14 +345,16 @@ impl Ready {
 
         Running {
             join,
-            // Field order is drop order: the pump-stop guard cancels
-            // first, so the tx_bal pump releases its AeronRuntime clone,
-            // then the runtime and the cluster session end.
+            // Field order is drop order: the stop guard cancels first, so
+            // the plane's discovery tasks and the tx_bal pump release
+            // their AeronRuntime clones, then the runtime and the cluster
+            // session end. The plane deregisters after that, in `wait`.
             streams: bin_support::LiveStreams {
-                stop: pump_shutdown.drop_guard(),
+                stop: stop.drop_guard(),
                 rt,
                 cluster_guard,
             },
+            plane,
             writer,
             divergence,
             args,
@@ -365,6 +370,7 @@ impl Ready {
 struct Running {
     join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
     streams: bin_support::LiveStreams,
+    plane: kardamom_log::discovery::StreamPlane,
     writer: kardamom_state::WriterHandle,
     divergence: Arc<Divergence>,
     args: Args,
@@ -379,6 +385,7 @@ impl Running {
         let engine_error = Shutdown {
             join: self.join,
             streams: self.streams,
+            plane: self.plane,
             writer: self.writer,
             divergence: self.divergence.clone(),
         }
@@ -536,6 +543,11 @@ fn build_epoch_observer(
 struct Shutdown {
     join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
     streams: bin_support::LiveStreams,
+    /// Its discovery tasks stop with the pumps, before the runtime drops:
+    /// the pump-stop token is a child of its token, which the stop guard
+    /// in `streams` cancels. Its registrations deregister once the
+    /// streams have ended.
+    plane: kardamom_log::discovery::StreamPlane,
     writer: kardamom_state::WriterHandle,
     divergence: Arc<Divergence>,
 }
@@ -548,6 +560,7 @@ impl Shutdown {
         let Self {
             join,
             streams,
+            plane,
             mut writer,
             divergence,
         } = self;
@@ -565,6 +578,7 @@ impl Shutdown {
         }
         .wait()
         .await;
+        plane.shutdown().await;
         let engine_error = classify_engine_result(joined, &divergence);
         if let Err(e) = writer.shutdown() {
             tracing::error!(error = %e, "state writer shutdown returned an error");
