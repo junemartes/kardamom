@@ -513,8 +513,10 @@ Deviations from the design above, recorded as they land.
   so: nonce 19 of a moved sender, right after the ingress restart. Before this stack, the
   same lost receipt was the known `s16` flake "did not land after 40 attempts". The door
   rejects a past nonce only on proof: a receipt for the (sender, nonce) with another hash.
-  A past nonce with no receipt counts `kardamom_cache_degraded_total{reason="past-nonce"}`. The chain-semantics scenarios of 9.2 ship with PR 5. The ingress query
-  client lives in `kardamom_cache::query`; the sequencer keeps its own until PR 4b.
+  A past nonce with no receipt counts `kardamom_cache_lookups_total{layer="receipt",
+  outcome="miss"}`, not a degraded read: Redis is not involved. The chain-semantics
+  scenarios of 9.2 ship with PR 5. The ingress query client lives in
+  `kardamom_cache::query`; the sequencer keeps its own until PR 4b.
 
 ## 12. Open questions
 

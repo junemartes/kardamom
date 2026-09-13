@@ -320,7 +320,10 @@ impl ValidatedSubmission {
             return Ok(());
         };
         if self.nonce < account.nonce {
-            cache_metrics::record_degraded("past-nonce");
+            // A receipt-index miss, not a degraded read: Redis is not
+            // involved, and the chaos cases read the degraded count as
+            // "Redis is dark".
+            cache_metrics::record_lookup("receipt", "miss");
         }
         if let Some(want) = self.cost
             && account.balance < want
