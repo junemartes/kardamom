@@ -12,6 +12,8 @@
 //! A lane is a `tx_data` stream. The lane index is a `u8` on the wire
 //! (`TxRef::shard_id`).
 
+mod rebalance;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -98,6 +100,8 @@ pub fn partition_for(sender: Address, m: NonZeroU32) -> u32 {
 pub enum ShardMapError {
     #[error("shard map table must have {VSLOT_COUNT} entries, got {0}")]
     TableLength(usize),
+    #[error("shard map version is exhausted")]
+    VersionExhausted,
     #[error("shard map lane {0} is above the lane plane of {LANE_COUNT} lanes")]
     LaneAbovePlane(u8),
     #[error("lane count must be between 1 and 256, got {0}")]
