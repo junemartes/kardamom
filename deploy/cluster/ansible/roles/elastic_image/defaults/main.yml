@@ -1,0 +1,15 @@
+---
+# Pinned ansible-core and collections inside the image.
+elastic_image_ansible_core_version: "2.17.14"
+elastic_image_collections:
+  - "ansible.posix:2.2.0"
+  - "community.docker:5.2.1"
+# The image's playbook tree, virtualenv and collections.
+elastic_image_ansible_root: /opt/kardamom/ansible
+# The profile values the image carries (nonsecret): the inventory group
+# vars of the production profile.
+elastic_image_profile_vars_file: "{{ playbook_dir }}/inventories/hetzner/group_vars/all.yml"
+# The enrollment client the image carries, and its argument vector. Empty
+# means no enrollment: the node then fails closed at first boot on the
+# production profile.
+elastic_image_enrollment_argv: []

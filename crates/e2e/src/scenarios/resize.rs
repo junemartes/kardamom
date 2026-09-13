@@ -70,8 +70,17 @@ const THREE_SHARDS: NonZeroU32 = NonZeroU32::new(3).unwrap();
 /// The recipient every transfer of this scenario pays.
 const TO: Address = Address::new([0x58u8; 20]);
 
-/// How many times [`Lander::land`] resubmits before it gives up.
+/// How many park timeouts [`Lander::land`] rides out before it gives up.
+/// Each one costs a park plus a receipt wait, so this is minutes of a
+/// transaction that the chain keeps refusing to sequence.
 const LAND_ATTEMPTS: u32 = 40;
+
+/// How long [`Lander::land`] keeps resubmitting through transport errors.
+/// The ingress restart of step 3 refuses connections until the new
+/// process listens, which the harness bounds at 60 s; a slow runner
+/// spends most of that. A transport error costs a quarter second, so a
+/// count shared with the park timeouts gave up after 10 s.
+const TRANSPORT_BUDGET: Duration = Duration::from_secs(90);
 
 /// The dev signers the sender pool draws from, past `sender_base`.
 const POOL_SIZE: usize = 64;
@@ -126,24 +135,38 @@ impl Lander {
         }
     }
 
-    /// Submit `tx` until a receipt exists for it.
+    /// Submit `tx` until a receipt exists for it. Park timeouts are
+    /// counted ([`LAND_ATTEMPTS`]); transport errors are timed
+    /// ([`TRANSPORT_BUDGET`]), since one lasts a quarter second and an
+    /// ingress restart lasts seconds.
     async fn land(&mut self, tx: &l2::SignedTransfer) -> Result<()> {
-        for _ in 0..LAND_ATTEMPTS {
-            if let ControlFlow::Break(()) = self.attempt(tx).await? {
-                self.report.landed = self.report.landed.saturating_add(1);
-                return Ok(());
+        let started = Instant::now();
+        let mut timeouts = 0u32;
+        let mut transports = 0u64;
+        while timeouts < LAND_ATTEMPTS && started.elapsed() < TRANSPORT_BUDGET {
+            match self.attempt(tx).await? {
+                ControlFlow::Break(()) => {
+                    self.report.landed = self.report.landed.saturating_add(1);
+                    return Ok(());
+                }
+                ControlFlow::Continue(Retry::Timeout) => timeouts = timeouts.saturating_add(1),
+                ControlFlow::Continue(Retry::Transport) => {
+                    transports = transports.saturating_add(1);
+                }
             }
         }
         anyhow::bail!(
-            "nonce {} of {} did not land after {LAND_ATTEMPTS} attempts",
+            "nonce {} of {} did not land after {timeouts} park timeouts and {transports} \
+             transport errors in {:?}",
             tx.nonce,
-            tx.sender
+            tx.sender,
+            started.elapsed()
         )
     }
 
     /// One submit of [`Self::land`]'s loop. `Break` means the transaction
-    /// landed; `Continue` means retry.
-    async fn attempt(&mut self, tx: &l2::SignedTransfer) -> Result<ControlFlow<()>> {
+    /// landed; `Continue` names the retry reason.
+    async fn attempt(&mut self, tx: &l2::SignedTransfer) -> Result<ControlFlow<(), Retry>> {
         let out = self.rpc.send_raw(&tx.raw).await;
         match out.result {
             Ok(h) => {
@@ -157,10 +180,10 @@ impl Lander {
 
     /// The ingress restarted under this submit. The envelope may or may
     /// not have gone out. A resubmit is idempotent.
-    async fn on_transport_error(&mut self) -> Result<ControlFlow<()>> {
+    async fn on_transport_error(&mut self) -> Result<ControlFlow<(), Retry>> {
         self.report.transport_retries = self.report.transport_retries.saturating_add(1);
         tokio::time::sleep(Duration::from_millis(250)).await;
-        Ok(ControlFlow::Continue(()))
+        Ok(ControlFlow::Continue(Retry::Transport))
     }
 
     /// A park timeout (a single-replica shard restarted under this
@@ -172,7 +195,7 @@ impl Lander {
         tx: &l2::SignedTransfer,
         code: i32,
         message: &str,
-    ) -> Result<ControlFlow<()>> {
+    ) -> Result<ControlFlow<(), Retry>> {
         let lower = message.to_ascii_lowercase();
         anyhow::ensure!(
             !lower.contains("expired") && !lower.contains("evicted"),
@@ -190,8 +213,16 @@ impl Lander {
             tx.sender
         );
         self.report.timeout_retries = self.report.timeout_retries.saturating_add(1);
-        Ok(ControlFlow::Continue(()))
+        Ok(ControlFlow::Continue(Retry::Timeout))
     }
+}
+
+/// Why one [`Lander::attempt`] asks for another.
+enum Retry {
+    /// The submit failed below JSON-RPC: the ingress is restarting.
+    Transport,
+    /// The park timed out and no receipt followed.
+    Timeout,
 }
 
 /// True when a receipt for `hash` appears within `within`.

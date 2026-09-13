@@ -36,7 +36,7 @@ max_pending_per_sender = 512
 backpressure_policy = "return_immediately"
 
 [cluster]
-ingress_endpoints = "0=192.168.56.51:40200,1=192.168.56.52:40200,2=192.168.56.53:40200"
+ingress_endpoints = "0=sealer-0.node.consul:40200,1=sealer-1.node.consul:40200,2=sealer-2.node.consul:40200"
 initial_leader_member_id = 0
 ingress_stream_id = 101
 egress_stream_id = 102

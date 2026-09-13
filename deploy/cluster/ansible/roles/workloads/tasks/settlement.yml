@@ -1,0 +1,129 @@
+---
+- name: Require an existing settlement for a read-only deployment plan
+  ansible.builtin.assert:
+    that: workloads_settlement_address | length > 0
+    fail_msg: Check mode cannot create contracts. Supply workloads_settlement_address to plan all jobs.
+  when: ansible_check_mode
+
+- name: Bootstrap and resolve the development settlement
+  when:
+    - workloads_settlement_address | length == 0
+    - not ansible_check_mode
+  vars:
+    workloads_address_argv:
+      - "{{ workloads_deploy_binary }}"
+      - --rpc-url
+      - "{{ workloads_l1_rpc }}"
+      - --owner
+      - "{{ workloads_l1_owner }}"
+      - addresses
+      - --l2-chain-id
+      - "{{ workloads_chain_id | string }}"
+      - --contract
+      - KardamomL2Settlement
+      - --json
+
+  block:
+    - name: Wait for L1 JSON-RPC
+      ansible.builtin.uri:
+        url: "{{ workloads_l1_rpc }}"
+        method: POST
+        body_format: json
+        body: {jsonrpc: '2.0', id: 1, method: eth_chainId, params: []}
+      register: workloads_l1_status
+      until: workloads_l1_status.json.result is defined
+      retries: "{{ workloads_poll_retries }}"
+      delay: "{{ workloads_poll_delay }}"
+
+    - name: Inspect the ERC-7955 factory
+      ansible.builtin.uri:
+        url: "{{ workloads_l1_rpc }}"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: '2.0'
+          id: 1
+          method: eth_getCode
+          params: ['0xC0DEb853af168215879d284cc8B4d0A645fA9b0E', latest]
+      register: workloads_factory_code
+      failed_when: workloads_factory_code.json.result is not defined
+
+    - name: Bootstrap ERC-7955 on the development Anvil chain
+      ansible.builtin.command:
+        argv:
+          - "{{ workloads_deploy_binary }}"
+          - --rpc-url
+          - "{{ workloads_l1_rpc }}"
+          - --owner
+          - "{{ workloads_l1_owner }}"
+          - bootstrap-7955-anvil
+      when: workloads_factory_code.json.result == '0x'
+      changed_when: true
+
+    - name: Ensure the owner factory exists
+      ansible.builtin.command:
+        argv:
+          - "{{ workloads_deploy_binary }}"
+          - --rpc-url
+          - "{{ workloads_l1_rpc }}"
+          - --owner
+          - "{{ workloads_l1_owner }}"
+          - ensure-factory
+          - --private-key
+          - env:KARDAMOM_DEPLOY_OWNER_KEY
+      environment:
+        KARDAMOM_DEPLOY_OWNER_KEY: "{{ workloads_l1_owner_key }}"
+      register: workloads_factory
+      changed_when: "'factory already deployed' not in workloads_factory.stdout"
+      no_log: true
+
+    - name: Read existing settlement registration
+      ansible.builtin.command:
+        argv: "{{ workloads_address_argv }}"
+      register: workloads_existing_settlement
+      changed_when: false
+
+    - name: Deploy settlement only when absent from the registry
+      ansible.builtin.command:
+        argv:
+          - "{{ workloads_deploy_binary }}"
+          - --rpc-url
+          - "{{ workloads_l1_rpc }}"
+          - --owner
+          - "{{ workloads_l1_owner }}"
+          - deploy
+          - --private-key
+          - env:KARDAMOM_DEPLOY_OWNER_KEY
+          - KardamomL2Settlement
+          - --l2-chain-id
+          - "{{ workloads_chain_id | string }}"
+          - --l2-minter
+          - "{{ workloads_batcher_eoa }}"
+      environment:
+        KARDAMOM_DEPLOY_OWNER_KEY: "{{ workloads_l1_owner_key }}"
+      when: workloads_existing_settlement.stdout | from_json | length == 0
+      changed_when: true
+      no_log: true
+
+    - name: Read the deployed settlement registration
+      ansible.builtin.command:
+        argv: "{{ workloads_address_argv }}"
+      register: workloads_registered_settlement
+      changed_when: false
+
+    - name: Require exactly one settlement for this chain
+      ansible.builtin.assert:
+        that: workloads_registered_settlement.stdout | from_json | length == 1
+
+
+- name: Resolve settlement address
+  ansible.builtin.set_fact:
+    workloads_resolved_settlement: >-
+      {{ workloads_settlement_address if workloads_settlement_address | length > 0
+         else (workloads_registered_settlement.stdout | from_json | first).proxy }}
+
+- name: Validate settlement address
+  ansible.builtin.assert:
+    that:
+      - workloads_resolved_settlement is match('^0x[0-9a-fA-F]{40}$')
+      - workloads_resolved_settlement != '0x0000000000000000000000000000000000000000'

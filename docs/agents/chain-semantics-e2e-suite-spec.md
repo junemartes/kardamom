@@ -11,7 +11,7 @@
 
 ## Background / current state
 
-The **chaos suite** (`deploy/cluster/scripts/chaos.sh`, `cluster-e2e.yml`, 5 DinD shards) answers "does the pipeline survive faults under load?". Nothing today answers "does the chain **mean** the right thing?" end-to-end:
+The **chaos suite** (`crates/chaos`, `cluster-e2e.yml`, 5 DinD shards) answers "does the pipeline survive faults under load?". Nothing today answers "does the chain **mean** the right thing?" end-to-end:
 
 - The functional pipeline e2e (`crates/e2e/tests/{full_pipeline_e2e,multiprocess_e2e}.rs` — including `anvil_pipeline_e2e_l1_deposit_and_l2_round_trip`) was **deleted in the #67 cluster-only migration** because it spawned the removed standalone Rust sealer. `justfile:246` (`test-e2e-local`) still points at those deleted targets — the local e2e entrypoint is broken. The `e2e` crate skeleton and all its dev-deps (anvil bindings, jsonrpsee, deployer/da-watcher/executor/ingress/sequencer/state) survived.
 - Crate-level anvil tests are healthy but siloed: `deployer/tests/deploy_e2e.rs`, `batcher/tests/{anvil_e2e,reconstruct_l1_e2e,section6_conformance}.rs`, `validator/tests/withdrawal_e2e.rs`. None of them run the live pipeline.
