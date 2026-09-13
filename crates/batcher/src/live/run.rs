@@ -15,16 +15,17 @@ use tracing::{info, warn};
 
 use kardamom_engine::bin_support;
 use kardamom_engine::reader::{
-    JoinBuffer, ReaderConfig, ReaderToExec, spawn_tx_data_reader, spawn_tx_ordering_reader,
+    JoinBuffer, ReaderConfig, ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader,
 };
 use kardamom_engine::{ExecutorError, TxIndex};
 use kardamom_log::aeron_live::AeronRuntime;
-use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
+use kardamom_log::config::{AeronConfig, LogConfig};
+use kardamom_log::discovery::StreamPlane;
 
 use crate::da_store::FsBlobStore;
 
 use super::cursor::{BatchCursor, L1Truth, read_l1_truth, reconcile};
-use super::feed::{FeedConfig, run_feed};
+use super::feed::{FeedConfig, FeedLoop};
 use super::sender::LiveSender;
 
 /// Top-level config the batcher reads from `--config` in live mode. It uses
@@ -127,8 +128,9 @@ impl LiveArgs {
 /// resolved from `--config` and the CLI overrides.
 struct RunConfig {
     file_cfg: BatcherFileConfig,
-    channels: ChannelsConfig,
     aeron_cfg: AeronConfig,
+    /// The plane the `tx_data` lanes open through.
+    plane: StreamPlane,
 }
 
 impl RunConfig {
@@ -144,29 +146,39 @@ impl RunConfig {
         }
         let log_cfg =
             LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
-        let channels = log_cfg.channels;
+        let plane =
+            StreamPlane::from_config(&log_cfg, "batcher").context("build the stream plane")?;
         let mut aeron_cfg = log_cfg.aeron;
         if let Some(dir) = args.aeron_dir.as_ref() {
             aeron_cfg.aeron_dir.clone_from(dir);
         }
         Ok(Self {
             file_cfg,
-            channels,
             aeron_cfg,
+            plane,
         })
     }
 
     /// Open the `tx_data` and cluster `tx_ordering` subscriptions, and
     /// spawn their reader threads.
+    /// Replace the static `[cluster]` ingress endpoints with the members
+    /// the catalog lists, when discovery is on and lists any.
+    async fn resolve_cluster_ingress(&mut self) -> Result<()> {
+        if let Some(endpoints) = self.plane.cluster_ingress_endpoints().await? {
+            self.file_cfg.cluster.ingress_endpoints = endpoints;
+        }
+        Ok(())
+    }
+
     fn spawn_reader_stack(
-        &self,
+        &mut self,
         args: &LiveArgs,
         cursor: BatchCursor,
     ) -> Result<ReaderStack<impl Send + use<>>> {
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-        let tx_data_subs = bin_support::open_tx_data_subs(&rt, &self.channels)?;
+        let tx_data_subs = bin_support::open_tx_data_subs(&rt, &mut self.plane)?;
         let join_recovery = bin_support::archive_join_recovery(
-            &self.channels,
+            &mut self.plane,
             &self.aeron_cfg,
             args.aeron_dir.as_deref(),
             args.archive_control_response_endpoint.as_deref(),
@@ -191,7 +203,7 @@ impl RunConfig {
         let join_buffer = JoinBuffer::new();
         let join_handles = tx_data_subs
             .into_iter()
-            .map(|sub| spawn_tx_data_reader(sub, join_buffer.clone()))
+            .map(|sub| TxDataReader::new(sub, join_buffer.clone()).spawn())
             .collect();
         // There is no tx_deposits reader. Deposits ride inside the epoch
         // record on the canonical stream, so there is nothing to join
@@ -208,14 +220,14 @@ impl RunConfig {
             join_timeout: bin_support::bounded_join_timeout(cursor.next_index > 0),
             ..ReaderConfig::default()
         };
-        let ordering_handle = spawn_tx_ordering_reader(
-            tx_ordering_sub,
-            join_buffer,
-            reader_cfg,
-            feed_tx,
-            TxIndex(cursor.next_index),
-            join_recovery,
-        );
+        let ordering_handle = TxOrderingReader::spawn(TxOrderingInputs {
+            sub: tx_ordering_sub,
+            buffer: join_buffer,
+            cfg: reader_cfg,
+            exec_out: feed_tx,
+            start_tx_idx: TxIndex(cursor.next_index),
+            recovery_factory: join_recovery,
+        });
 
         Ok(ReaderStack {
             handles: ReaderHandles {
@@ -297,7 +309,8 @@ impl<G> ReaderHandles<G> {
 /// reader stack fails to start, or when the feed loop exits with a failure.
 pub async fn run(args: LiveArgs) -> Result<()> {
     let l1 = args.start_l1_side().await?;
-    let run_cfg = RunConfig::resolve(&args)?;
+    let mut run_cfg = RunConfig::resolve(&args)?;
+    run_cfg.resolve_cluster_ingress().await?;
     let ReaderStack { handles, feed_rx } = run_cfg.spawn_reader_stack(&args, l1.cursor)?;
 
     let sender = LiveSender::new(
@@ -315,13 +328,14 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         flush: Duration::from_millis(args.flush_ms.get()),
         skip_through_block: l1.skip_through_block,
     };
-    let mut feed = tokio::spawn(run_feed(feed_rx, sender, feed_cfg));
+    let mut feed = tokio::spawn(FeedLoop::new(feed_rx, sender, feed_cfg).run());
     let feed_result = tokio::select! {
         r = &mut feed => r.context("feed task panicked")?,
         () = bin_support::wait_for_shutdown() => {
             // Exit cleanly. The cursor is reconciled against L1 truth on
             // every restart, so tearing down mid-batch loses nothing.
             info!("shutdown signal received; stopping live batcher");
+            run_cfg.plane.shutdown().await;
             return Ok(());
         }
     };

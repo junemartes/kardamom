@@ -1,0 +1,8 @@
+---
+# The enrollment client writes the node credentials here: consul_gossip_key,
+# consul_agent_token and nomad_consul_token as YAML, and the TLS material
+# into consul_tls_dir and nomad_tls_dir.
+enroll_secrets_file: /etc/kardamom/secrets.yml
+# The bound of one enrollment attempt, in seconds. The bootstrap unit
+# retries a failed run a bounded number of times.
+enroll_timeout_s: 120

@@ -17,6 +17,7 @@
 //! a [`RunningIngress`] that owns everything needed to shut back down.
 
 mod recorders;
+mod watermark;
 
 use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
@@ -25,19 +26,30 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use kardamom_cluster_adapter::LiveCluster;
 use kardamom_ingress::aeron_adapters::{LiveIngressPublication, LiveIngressSubscription};
 use kardamom_ingress::cluster::cluster_watermark_observer;
 use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
 use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::LogConfig;
+use kardamom_log::discovery::StreamPlane;
+use kardamom_log::recorder::RecorderThreads;
 use kardamom_obs::bin::wait_for_shutdown;
-use kardamom_types::QuorumWatermark;
-use tokio_util::sync::CancellationToken;
 
 use kardamom_types::shard_map::{LANE_COUNT, ShardMap, validate_shard_count};
-use recorders::{spawn_tx_data_recorders, wait_for_recorders};
+use recorders::{
+    spawn_discovered_tx_data_recorder, spawn_tx_data_recorders, wait_for_discovered_recorder,
+    wait_for_recorders,
+};
+
+/// What [`IngressService::spawn_recorders`] returns: the threads, the
+/// per-lane readiness receivers of the static recorders, and the one
+/// receiver of the discovered recorder.
+type SpawnedRecorders = (
+    RecorderThreads,
+    Vec<recorders::RecorderReady>,
+    Option<tokio::sync::oneshot::Receiver<kardamom_log::discovery::RecorderProgress>>,
+);
 
 /// The lane plane as the non-zero count the publisher and recorder
 /// openers take: every lane opens, whatever the active shard count.
@@ -186,7 +198,8 @@ impl From<AckPolicyArg> for kardamom_types::AckPolicy {
 /// and `tx_receipts` subscription built on top of it.
 struct OpenedAeron {
     rt: AeronRuntime,
-    recorder_handles: Vec<std::thread::JoinHandle<()>>,
+    plane: StreamPlane,
+    recorders: RecorderThreads,
     publication: LiveIngressPublication,
     subscription: LiveIngressSubscription,
 }
@@ -198,7 +211,6 @@ struct IngressService {
     args: Args,
     log_cfg: LogConfig,
     file_cfg: IngressFileConfig,
-    stop: CancellationToken,
 }
 
 impl IngressService {
@@ -207,7 +219,6 @@ impl IngressService {
             args,
             log_cfg,
             file_cfg,
-            stop: CancellationToken::new(),
         }
     }
 
@@ -246,6 +257,35 @@ impl IngressService {
         Ok(Some(map))
     }
 
+    /// The recorder threads, when archive durability is on. With
+    /// discovery, one thread follows every `tx_data` publisher the
+    /// catalog lists. Without it, one static thread per lane records the
+    /// shared channel. Returns the threads and the readiness receivers of
+    /// the path taken: per lane for the static recorders, or one for the
+    /// discovered recorder.
+    fn spawn_recorders(&self, plane: &mut StreamPlane) -> Result<SpawnedRecorders> {
+        let args = &self.args;
+        if !args.archive_durability {
+            return Ok((RecorderThreads::new(), Vec::new(), None));
+        }
+        let discovered = spawn_discovered_tx_data_recorder(
+            args.aeron_dir.as_deref(),
+            &self.log_cfg.aeron,
+            plane,
+            LANE_PLANE,
+        )?;
+        if let Some((recorders, ready)) = discovered {
+            return Ok((recorders, Vec::new(), Some(ready)));
+        }
+        let (recorders, ready) = spawn_tx_data_recorders(
+            args.aeron_dir.as_deref(),
+            &self.log_cfg.channels,
+            &self.log_cfg.aeron,
+            LANE_PLANE,
+        )?;
+        Ok((recorders, ready, None))
+    }
+
     /// Opens the Aeron runtime, the `tx_data` archive recorders, and the
     /// `tx_data` publication and `tx_receipts` subscription.
     ///
@@ -266,20 +306,12 @@ impl IngressService {
     async fn open_aeron_side(&self) -> Result<OpenedAeron> {
         let args = &self.args;
         let channels = &self.log_cfg.channels;
-        let aeron_cfg = &self.log_cfg.aeron;
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+        let mut plane =
+            StreamPlane::from_config(&self.log_cfg, &format!("ingress-{}", args.ingress_id))
+                .context("build the stream plane")?;
 
-        let (recorder_handles, recorder_ready) = if args.archive_durability {
-            spawn_tx_data_recorders(
-                args.aeron_dir.as_deref(),
-                channels,
-                aeron_cfg,
-                LANE_PLANE,
-                &self.stop,
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let (recorders, recorder_ready, discovered_ready) = self.spawn_recorders(&mut plane)?;
 
         // tx_receipts MDS membership: prefer the CLI or env
         // `--executor-count`, and fall back to the log-config field, or
@@ -287,23 +319,29 @@ impl IngressService {
         // proxy reads this only when MDS is enabled.
         let executor_count = args.executor_count.or(channels.tx_receipts_executor_count);
 
-        let publication = LiveIngressPublication::open(&rt, channels, LANE_PLANE)
+        let publication = LiveIngressPublication::open(&rt, &mut plane, LANE_PLANE)
+            .await
             .context("open IngressPublication")?;
 
         // This is the recorder barrier: with the tx_data publications now
         // open, every lane's recording can start.
-        if args.archive_durability {
+        if let Some(ready) = discovered_ready {
+            wait_for_discovered_recorder(ready)
+                .await
+                .context("archive durability requested but the tx_data recorder failed to start")?;
+        } else if args.archive_durability {
             wait_for_recorders(recorder_ready)
                 .await
                 .context("archive durability requested but tx_data recorders failed to start")?;
         }
         let subscription =
-            LiveIngressSubscription::open(&rt, channels, args.recorder_id, executor_count)
+            LiveIngressSubscription::open(&rt, &mut plane, args.recorder_id, executor_count)
                 .context("open IngressSubscription")?;
 
         Ok(OpenedAeron {
             rt,
-            recorder_handles,
+            plane,
+            recorders,
             publication,
             subscription,
         })
@@ -315,14 +353,18 @@ impl IngressService {
     /// is the source of it: a record or boundary on egress is a
     /// Raft-quorum-durability signal.
     ///
-    /// Returns the `LiveCluster` guard; the caller must keep it alive for as
-    /// long as the returned watermark thread runs.
+    /// Returns the running thread's handle. Dropping it stops the thread
+    /// and ends the cluster session.
     fn spawn_cluster_watermark(
         &self,
         subscription: &LiveIngressSubscription,
-    ) -> Result<LiveCluster> {
+        ingress_endpoints: Option<String>,
+    ) -> Result<watermark::ClusterWatermark> {
         let args = &self.args;
         let mut live = self.file_cfg.cluster.to_live();
+        if let Some(endpoints) = ingress_endpoints {
+            live.ingress_endpoints = endpoints;
+        }
         if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
             live.egress_channel = format!("aeron:udp?endpoint={ep}");
         }
@@ -331,29 +373,20 @@ impl IngressService {
         // tx_data publish and receipts work.
         let cluster_rt =
             AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
-        let (guard, mut observer) =
+        let (guard, observer) =
             cluster_watermark_observer(cluster_rt, live).context("connect cluster watermark")?;
         // A dedicated std thread runs a blocking egress poll, since the
         // observer holds the `!Send` cluster client. It sends the durable
-        // count to the bus. The thread stops on the shutdown token, or when
-        // the observer ends. The bus is a tokio `broadcast` channel, so the
-        // send never blocks. A send with no live receiver is not an error
-        // here.
-        let wm_tx = subscription.watermark_sender();
-        let wm_stop = self.stop.clone();
-        std::thread::Builder::new()
-            .name("cluster-watermark".into())
-            .spawn(move || {
-                while !wm_stop.is_cancelled() {
-                    let Some(position) = observer.next_position() else {
-                        break;
-                    };
-                    let _ = wm_tx.send(QuorumWatermark { position });
-                }
-            })
-            .context("spawn cluster watermark thread")?;
+        // count to the bus. The thread stops when the returned handle
+        // drops, or when the observer ends. The bus is a tokio `broadcast`
+        // channel, so the send never blocks. A send with no live receiver
+        // is not an error here.
+        let running =
+            watermark::ClusterWatermarkPump::new(observer, subscription.watermark_sender())
+                .spawn(guard)
+                .context("spawn cluster watermark thread")?;
         tracing::info!("kardamom-ingress: on-quorum watermark via Aeron Cluster egress");
-        Ok(guard)
+        Ok(running)
     }
 
     /// Builds the config, opens Aeron, optionally starts the cluster
@@ -376,8 +409,9 @@ impl IngressService {
         );
 
         let opened = self.open_aeron_side().await?;
-        let cluster_guard = if cfg.ack_policy.requires_quorum() {
-            Some(self.spawn_cluster_watermark(&opened.subscription)?)
+        let cluster_watermark = if cfg.ack_policy.requires_quorum() {
+            let members = opened.plane.cluster_ingress_endpoints().await?;
+            Some(self.spawn_cluster_watermark(&opened.subscription, members)?)
         } else {
             None
         };
@@ -392,47 +426,48 @@ impl IngressService {
             handle,
             drainer,
             drain_timeout,
-            stop: self.stop,
-            recorder_handles: opened.recorder_handles,
-            // Declared before `_cluster_guard`: struct fields drop in
-            // declaration order, so `_rt` drops before `_cluster_guard`
-            // when `RunningIngress::shutdown` consumes `self`. This
-            // matches the original `main`'s explicit `drop(rt)` before
-            // `_cluster_guard` went out of scope.
+            plane: opened.plane,
+            _recorders: opened.recorders,
             _rt: opened.rt,
-            _cluster_guard: cluster_guard,
+            _cluster_watermark: cluster_watermark,
         })
     }
 }
 
-/// A started ingress process: the JSON-RPC handle, the shutdown token,
-/// the recorder thread handles, the Aeron runtime, and the optional
-/// cluster watermark guard. [`Self::shutdown`] waits for the shutdown
-/// signal and tears everything down in the right order.
+/// A started ingress process: the JSON-RPC handle, the recorder threads,
+/// the Aeron runtime, and the optional cluster watermark thread.
+/// [`Self::shutdown`] waits for the shutdown signal, drains, and then
+/// lets `self` drop. Field order is drop order: the recorders stop and
+/// join first, then the Aeron runtime ends, then the watermark thread's
+/// stop token cancels and its cluster session ends. This matches the
+/// original `main`'s explicit `drop(rt)` before the cluster guard went
+/// out of scope.
 struct RunningIngress {
     handle: IngressHandle,
     /// A proxy clone for the graceful drain at shutdown.
     drainer: IngressProxy<LiveIngressPublication, LiveIngressSubscription>,
     /// How long the drain waits for parked submits: the park bound.
     drain_timeout: Duration,
-    stop: CancellationToken,
-    recorder_handles: Vec<std::thread::JoinHandle<()>>,
-    /// See the field-order comment in [`IngressService::run`]: this must
-    /// stay declared before `_cluster_guard`. Held only for its `Drop`
-    /// side effect (closing the Aeron runtime); the leading underscore
-    /// marks it never read, not that it is unused — dropping it is the
-    /// point.
+    /// The stream plane. [`Self::shutdown`] ends it before `self` drops,
+    /// so the discovery tasks and registrations end before the runtime.
+    plane: StreamPlane,
+    /// Held only for its `Drop` side effect (stopping and joining the
+    /// recorder threads); never read. The join is short: a recorder past
+    /// startup wakes at once from its park on the stop token.
+    _recorders: RecorderThreads,
+    /// Held only for its `Drop` side effect (closing the Aeron runtime);
+    /// the leading underscore marks it never read, not that it is unused.
+    /// Dropping it is the point.
     _rt: AeronRuntime,
     /// Held only for its `Drop` side effect; never read.
-    _cluster_guard: Option<LiveCluster>,
+    _cluster_watermark: Option<watermark::ClusterWatermark>,
 }
 
 impl RunningIngress {
-    /// Waits for the shutdown signal, drains the parked submits, stops the
-    /// JSON-RPC server, cancels the recorder stop token, and joins the
-    /// recorder threads. `self` is consumed here, so `_rt` and
-    /// `_cluster_guard` drop at the end of this call, in field declaration
-    /// order: `_rt` first, then `_cluster_guard`.
+    /// Waits for the shutdown signal, drains the parked submits, and
+    /// stops the JSON-RPC server. `self` is consumed here, so the
+    /// recorders, the runtime, and the watermark thread end at the end of
+    /// this call, in field declaration order.
     async fn shutdown(self) {
         wait_for_shutdown().await;
         tracing::info!("kardamom-ingress: shutdown signal received");
@@ -444,10 +479,7 @@ impl RunningIngress {
         tracing::info!(still_parked, "kardamom-ingress: drain finished");
         self.handle.jsonrpc_handle.stop().ok();
         self.handle.jsonrpc_handle.stopped().await;
-        self.stop.cancel();
-        for h in self.recorder_handles {
-            let _ = h.join();
-        }
+        self.plane.shutdown().await;
     }
 }
 

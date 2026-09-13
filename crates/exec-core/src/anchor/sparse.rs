@@ -236,30 +236,32 @@ impl<'s, 'p> Walk<'s, 'p> {
         let rest = self.path.slice(depth..);
         match node {
             Node::Unresolved(_) => unreachable!("resolved above"),
-            Node::Leaf { key, value } => {
-                if *key == rest {
-                    Ok(Lookup::Found(value.clone()))
-                } else {
-                    Ok(Lookup::Absent)
-                }
+            Node::Leaf { key, value } if *key == rest => Ok(Lookup::Found(value.clone())),
+            Node::Extension { key, child } if rest.starts_with(key) => {
+                self.lookup_in(child, depth + key.len())
             }
-            Node::Extension { key, child } => {
-                if rest.starts_with(key) {
-                    self.lookup_in(child, depth + key.len())
-                } else {
-                    Ok(Lookup::Absent)
-                }
-            }
-            Node::Branch { children } => {
-                let Some(nibble) = rest.first() else {
-                    return Err(AnchorError::Malformed("key exhausted at a branch"));
-                };
-                match children[nibble as usize].as_mut() {
-                    Some(child) => self.lookup_in(child, depth + 1),
-                    None => Ok(Lookup::Absent),
-                }
-            }
+            Node::Branch { children } => self.lookup_in_branch(children, &rest, depth),
+            // A leaf under a different key, or an extension whose prefix
+            // the key does not share, is the exclusion proof itself.
+            Node::Leaf { .. } | Node::Extension { .. } => Ok(Lookup::Absent),
         }
+    }
+
+    /// Look up below a branch. The key's next nibble picks the child
+    /// slot. An empty slot proves the key absent.
+    fn lookup_in_branch(
+        &self,
+        children: &mut [Option<Box<Node>>; 16],
+        rest: &Nibbles,
+        depth: usize,
+    ) -> Result<Lookup, AnchorError> {
+        let Some(nibble) = rest.first() else {
+            return Err(AnchorError::Malformed("key exhausted at a branch"));
+        };
+        let Some(child) = children[nibble as usize].as_mut() else {
+            return Ok(Lookup::Absent);
+        };
+        self.lookup_in(child, depth + 1)
     }
 
     fn insert_in(
@@ -275,30 +277,31 @@ impl<'s, 'p> Walk<'s, 'p> {
         };
         match &mut node {
             Node::Unresolved(_) => unreachable!("resolved above"),
+            // The same key: overwrite the value in place.
             Node::Leaf {
                 key,
                 value: existing,
-            } => {
-                if *key == rest {
-                    *existing = value;
-                    return Ok(node);
-                }
-                Ok(Node::split_leaf(
-                    key,
-                    core::mem::take(existing),
-                    &rest,
-                    value,
-                ))
+            } if *key == rest => {
+                *existing = value;
+                Ok(node)
             }
-            Node::Extension { key, child } => {
-                if rest.starts_with(key) {
-                    let klen = key.len();
-                    let taken = core::mem::replace(child.as_mut(), Node::placeholder());
-                    **child = self.insert_in(Some(taken), depth + klen, value)?;
-                    return Ok(node);
-                }
-                Ok(Node::split_extension(key, child, &rest, value))
+            Node::Leaf {
+                key,
+                value: existing,
+            } => Ok(Node::split_leaf(
+                key,
+                core::mem::take(existing),
+                &rest,
+                value,
+            )),
+            // The key runs through this extension: insert below it.
+            Node::Extension { key, child } if rest.starts_with(key) => {
+                let klen = key.len();
+                let taken = core::mem::replace(child.as_mut(), Node::placeholder());
+                **child = self.insert_in(Some(taken), depth + klen, value)?;
+                Ok(node)
             }
+            Node::Extension { key, child } => Ok(Node::split_extension(key, child, &rest, value)),
             Node::Branch { children } => {
                 self.descend_branch(children, &rest, depth, value)?;
                 Ok(node)
@@ -330,39 +333,47 @@ impl<'s, 'p> Walk<'s, 'p> {
         let rest = self.path.slice(depth..);
         match node {
             Node::Unresolved(_) => unreachable!("resolved above"),
-            Node::Leaf { key, value } => {
-                if key == rest {
-                    Ok(None)
-                } else {
-                    // Not this key. Removing an absent key is a no-op.
-                    Ok(Some(Node::Leaf { key, value }))
-                }
-            }
+            Node::Leaf { key, value } => Ok(Self::remove_in_leaf(key, value, &rest)),
             Node::Extension { key, child } => self.remove_under_extension(key, child, &rest, depth),
-            Node::Branch { mut children } => {
-                let Some(nibble) = rest.first() else {
-                    return Err(AnchorError::Malformed("key exhausted at a branch"));
-                };
-                let idx = nibble as usize;
-                match children[idx].take() {
-                    None => {
-                        // Removing an absent key: keep the branch untouched.
-                        return Ok(Some(Node::Branch { children }));
-                    }
-                    Some(child) => {
-                        if let Some(kept) = self.remove_in(*child, depth + 1)? {
-                            children[idx] = Some(Box::new(kept));
-                            return Ok(Some(Node::Branch { children }));
-                        }
-                    }
-                }
-                // The child vanished. Two or more survivors keep the
-                // branch. Exactly one survivor collapses it. This is the
-                // deletion shape whose sibling the capture fixed point
-                // must have supplied.
-                self.collapse_branch(children, depth)
-            }
+            Node::Branch { children } => self.remove_under_branch(children, &rest, depth),
         }
+    }
+
+    /// Removal at a leaf. The leaf vanishes when it holds the key.
+    /// A leaf under another key stays: removing an absent key is a
+    /// no-op.
+    fn remove_in_leaf(key: Nibbles, value: Vec<u8>, rest: &Nibbles) -> Option<Node> {
+        if key == *rest {
+            return None;
+        }
+        Some(Node::Leaf { key, value })
+    }
+
+    /// Removal below a branch. The key's next nibble picks the child
+    /// slot. An empty slot keeps the branch untouched, since removing an
+    /// absent key is a no-op. A child that vanishes collapses the branch
+    /// through [`Self::collapse_branch`].
+    fn remove_under_branch(
+        &self,
+        mut children: [Option<Box<Node>>; 16],
+        rest: &Nibbles,
+        depth: usize,
+    ) -> Result<Option<Node>, AnchorError> {
+        let Some(nibble) = rest.first() else {
+            return Err(AnchorError::Malformed("key exhausted at a branch"));
+        };
+        let idx = nibble as usize;
+        let Some(child) = children[idx].take() else {
+            return Ok(Some(Node::Branch { children }));
+        };
+        if let Some(kept) = self.remove_in(*child, depth + 1)? {
+            children[idx] = Some(Box::new(kept));
+            return Ok(Some(Node::Branch { children }));
+        }
+        // The child vanished. Two or more survivors keep the branch.
+        // Exactly one survivor collapses it. This is the deletion shape
+        // whose sibling the capture fixed point must have supplied.
+        self.collapse_branch(children, depth)
     }
 
     /// Removal below an extension. A miss (the removed key does not share

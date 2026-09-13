@@ -1,6 +1,6 @@
 # kardamom-cluster is the 3-member Aeron Cluster (Raft) sealer. Each
 # alloc is one Raft member. Members run on the sealer node class
-# (192.168.56.51/.52/.53, constraint ${meta.role} == sealer), with
+# (sealer-0, sealer-1, sealer-2; constraint ${meta.role} == sealer), with
 # distinct_hosts so one member lands on each sealer node. memberId
 # comes from the node's own IP (${meta.node_ip}), not
 # ${NOMAD_ALLOC_INDEX}. distinct_hosts spreads allocs across the 3
@@ -20,7 +20,7 @@
 # Egress replay retention, in frames (-Dkardamom.cluster.retention).
 # The default matches the sealer's own DEFAULT_RETENTION (65536, about
 # 321s at 200 tps). The retention-overrun chaos case deploys a small
-# window; deploy.sh passes -var from KARDAMOM_CLUSTER_RETENTION. This
+# window; Ansible deployment passes -var from KARDAMOM_CLUSTER_RETENTION. This
 # lets a frozen consumer's cursor age out, and exercises recovery-D,
 # inside one chaos case.
 variable "cluster_retention" {
@@ -32,7 +32,7 @@ variable "cluster_retention" {
 # (-Dkardamom.cluster.snapshotIntervalS; 0 disables). Every member runs
 # the scheduler, but only the current leader's toggle fires, and the
 # snapshot action replicates through the log, so all members snapshot
-# at the same position. The chaos-cluster shard shortens this; deploy.sh
+# at the same position. The chaos-cluster shard shortens this; Ansible deployment
 # passes -var from KARDAMOM_CLUSTER_SNAPSHOT_S. This lets
 # cluster-member-rejoin wait for a snapshot inside one case.
 variable "cluster_snapshot_interval_s" {
@@ -47,14 +47,14 @@ variable "cluster_snapshot_interval_s" {
 # accept-or-reject in the replicated state machine, like the dedup
 # window. The default names the dev-interop peers the e2e suite uses
 # against the deployed 412346 chain: chain B (412347, S14) and the
-# simulated origin (412399, S12/S13). deploy.sh passes -var from
+# simulated origin (412399, S12/S13). Ansible deployment passes -var from
 # KARDAMOM_REMOTE_ORIGINS when set.
 variable "cluster_remote_origins" {
   type    = string
   default = "412347,412399"
 }
 
-# Digest-pinned image. scripts/deploy.sh
+# Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests). The empty default falls back to the
 # mutable :dev tag in the task config. That fallback is a dev
@@ -69,8 +69,32 @@ variable "image_ref" {
 # This is a pure JVM image. cluster.Dockerfile launches
 # io.kardamom.sealer.cluster.ClusterNode.
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
+variable "sealer_count" {
+  type        = number
+  description = "The sealer node count (node_classes.sealer.count and cluster_member_count). Member i runs on sealer-<i>."
+  default     = 3
+}
+
+# One Raft member per sealer node, addressed by its Consul node record.
+# The member id is the node index (meta.node_index), so a member never
+# has to find itself by address. The port list mirrors cluster_ports in
+# group_vars/all.yml: ingress, consensus, log, catchup, archive_control.
+locals {
+  member_ports = [40200, 40201, 40202, 40203, 40204]
+  members = join("|", [
+    for i in range(var.sealer_count) :
+    "${i},${join(",", [for p in local.member_ports : "sealer-${i}.node.${var.datacenter}.consul:${p}"])}"
+  ])
+}
+
 job "cluster" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {
@@ -112,10 +136,35 @@ job "cluster" {
 
     network {
       mode = "host"
+      # The client-facing ingress endpoint, registered below.
+      port "ingress" {
+        static = 40200
+      }
     }
 
     task "cluster" {
       driver = "docker"
+
+      # The cluster member record of the discovery contract
+      # (docs/aeron-discovery.md): every cluster client resolves the
+      # member ingress endpoints from these records at startup. The
+      # member id equals the node index of the sealer class, which is
+      # the order ClusterNode derives its member id from the node IP.
+      # Nomad owns this record. Discovering a member never changes the
+      # voting set: the membership stays the static list in
+      # JAVA_TOOL_OPTIONS below.
+      service {
+        name     = "kardamom-cluster-member"
+        port     = "ingress"
+        address  = "${meta.node_ip}"
+        provider = "consul"
+        meta {
+          discovery_version = "1"
+          cluster_id        = "${meta.cluster_id}"
+          chain_id          = "412346"
+          member_id         = "${meta.node_index}"
+        }
+      }
 
       # These are JVM options for the image ENTRYPOINT
       # (java -Xmx384m -cp ... ClusterNode). They must go through env,
@@ -128,11 +177,11 @@ job "cluster" {
       # same mechanism as the aeron job's _JAVA_OPTIONS. ${meta.node_ip}
       # interpolates in env exactly as it would in args.
       env {
-        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.members=0,192.168.56.51:40200,192.168.56.51:40201,192.168.56.51:40202,192.168.56.51:40203,192.168.56.51:40204|1,192.168.56.52:40200,192.168.56.52:40201,192.168.56.52:40202,192.168.56.52:40203,192.168.56.52:40204|2,192.168.56.53:40200,192.168.56.53:40201,192.168.56.53:40202,192.168.56.53:40203,192.168.56.53:40204 -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins}"
+        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins}"
       }
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-cluster:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-cluster:dev"
         # force_pull stays on for both paths; see the ingress job's
         # comment. The :dev fallback needs it. On the pinned path, the
         # 1.9.5 driver pulls the tag but resolves the image by digest,

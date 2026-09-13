@@ -19,10 +19,11 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
-    AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
-    TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
+    AeronRuntime, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
+    TxRemoteEpochsSubscriberHandle,
 };
-use kardamom_log::config::{ChannelsConfig, LogConfig};
+use kardamom_log::config::LogConfig;
+use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::lookup::LookupRequester;
@@ -248,27 +249,38 @@ struct Handles {
 
 impl Handles {
     /// Open every handle this sequencer needs, for the lanes of `cfg`.
-    fn open(rt: &AeronRuntime, channels: &ChannelsConfig, cfg: &SequencerConfig) -> Result<Self> {
-        let own = Self::open_lane(rt, channels, cfg.lane())?;
+    /// `tx_errors` follows the plane's transport; the rest still open on
+    /// their static channels.
+    async fn open(
+        rt: &AeronRuntime,
+        plane: &mut StreamPlane,
+        cfg: &SequencerConfig,
+    ) -> Result<Self> {
+        let own = Self::open_lane(rt, plane, cfg.lane())?;
         let old = cfg
             .extra_lanes
             .iter()
-            .map(|lane| Self::open_lane(rt, channels, *lane))
+            .map(|lane| Self::open_lane(rt, plane, *lane))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             data_subs: LaneSubscriptions::new(own, old),
-            deposits_sub: TxDepositsSubscriberHandle::open(rt, channels)
+            deposits_sub: plane
+                .subscriber::<TxDepositsSubscriberHandle>(rt)
                 .context("open TxDepositsSubscriberHandle")?,
-            remote_epochs_sub: TxRemoteEpochsSubscriberHandle::open(rt, channels)
+            remote_epochs_sub: plane
+                .subscriber::<TxRemoteEpochsSubscriberHandle>(rt)
                 .context("open TxRemoteEpochsSubscriberHandle")?,
-            errors_pub: TxErrorsPublisherHandle::open(rt, channels)
+            errors_pub: plane
+                .publisher::<TxErrorsPublisherHandle>(rt)
+                .await
                 .context("open TxErrorsPublisherHandle")?,
         })
     }
 
-    /// Open the `tx_data` subscription of one lane.
-    fn open_lane(rt: &AeronRuntime, channels: &ChannelsConfig, lane: u8) -> Result<LaneSub> {
-        let handle = TxDataSubscriberHandle::open(rt, channels, lane)
+    /// Open the `tx_data` subscription of one lane through the plane.
+    fn open_lane(rt: &AeronRuntime, plane: &mut StreamPlane, lane: u8) -> Result<LaneSub> {
+        let handle = plane
+            .tx_data_subscriber(rt, lane)
             .with_context(|| format!("open TxDataSubscriberHandle lane={lane}"))?;
         Ok(LaneSub { lane, handle })
     }
@@ -326,7 +338,7 @@ impl ResyncWiring {
         main_rt: AeronRuntime,
         cluster_egress: kardamom_cluster_adapter::LiveEgress,
         receipts_rt: &AeronRuntime,
-        channels: &ChannelsConfig,
+        plane: &mut StreamPlane,
         executor_count: Option<NonZeroU32>,
         shutdown: &Shutdown,
     ) -> Result<Self> {
@@ -358,17 +370,13 @@ impl ResyncWiring {
         )
         .spawn(cluster_egress, shutdown.clone());
 
-        // Note: in MDS mode, each attached destination binds its UDP
-        // socket, so two sequencer replicas on one host would collide. MDS
-        // receipts with co-located replicas needs per-group endpoint bases
-        // before this can be enabled here. The cluster deploy rides the
-        // shared multicast channel instead.
-        let receipts_sub = TxReceiptsSubscriberHandle::open_auto(
-            receipts_rt,
-            channels,
-            executor_count.or(channels.tx_receipts_executor_count),
-        )
-        .context("open tx_receipts")?;
+        // The receipts subscription follows the plane's transport. A
+        // discovered subscription receives on OS-chosen ports, so
+        // co-located replicas never collide.
+        let executor_count = executor_count.or(plane.channels().tx_receipts_executor_count);
+        let receipts_sub = plane
+            .tx_receipts_subscriber(receipts_rt, executor_count)
+            .context("open tx_receipts")?;
         let vslots = cfg.vslot_set().context("vslots")?;
         let receipts_task = feeds::ReceiptFloorFeed::new(vslots, floor_tx.clone())
             .spawn(receipts_sub, shutdown.clone());
@@ -406,16 +414,25 @@ impl ResyncWiring {
             return Ok((None, None));
         }
         let (requester, rx) = LookupRequester::channel();
-        let task = feeds::NonceLookupFeed::new(cfg.lookup.clone(), cfg.partition_index, floor_tx)
-            .context("nonce lookup: http client build failed")?
-            .spawn(rx, shutdown.clone());
+        let task = feeds::NonceLookupFeed::new(
+            cfg.lookup.clone(),
+            cfg.partition_index,
+            rx,
+            shutdown.clone(),
+            floor_tx,
+        )
+        .context("nonce lookup: http client build failed")?
+        .spawn();
         Ok((Some(requester), Some(task)))
     }
 }
 
-/// The three publish-loop handles, plus the cluster session guard they
-/// depend on.
+/// The three publish-loop handles, the guard that signals shutdown to
+/// them, and the cluster session guard they depend on.
 struct SpawnedLoops {
+    /// Dropping this signals every loop to stop; see
+    /// [`Self::join_all`].
+    stop: tokio_util::sync::DropGuard,
     #[allow(
         dead_code,
         reason = "never read; kept alive until join_all returns for its Drop impl (see SpawnedLoops::join_all)"
@@ -438,12 +455,16 @@ impl SpawnedLoops {
         }
     }
 
-    /// Await every publish loop, in order, then let `cluster_guard` fall
-    /// out of scope. This also closes the egress channel, which unblocks
-    /// the watermark feed. The feed also checks the shutdown token on
-    /// each tick. The receipts task exits on the token, or on the closed
-    /// floor channel after the main loop ends.
+    /// Signal shutdown, then await every publish loop, in order, then let
+    /// `cluster_guard` fall out of scope. This also closes the egress
+    /// channel, which unblocks the watermark feed. The feed also checks
+    /// the shutdown token on each tick. The receipts task exits on the
+    /// token, or on the closed floor channel after the main loop ends.
     async fn join_all(self) {
+        // The block scope ends the guard, which signals every loop.
+        {
+            let _signal = self.stop;
+        }
         Self::join_one(self.main, "main loop", "task").await;
         Self::join_one(self.deposits, "epoch pump", "epoch task").await;
         Self::join_one(self.remote_epochs, "remote-epoch pump", "remote-epoch task").await;
@@ -503,12 +524,12 @@ async fn main() -> anyhow::Result<()> {
         "kardamom-sequencer starting"
     );
 
-    let channels: ChannelsConfig = LogConfig::resolve(args.log_config.as_deref())
-        .context("resolve log config")?
-        .channels;
+    let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+    let mut plane = StreamPlane::from_config(&log_cfg, &format!("sequencer-{}", cfg.lane()))
+        .context("build the stream plane")?;
 
-    let handles = Handles::open(&rt, &channels, &cfg)?;
+    let handles = Handles::open(&rt, &mut plane, &cfg).await?;
 
     let shutdown = Shutdown::new();
 
@@ -524,10 +545,14 @@ async fn main() -> anyhow::Result<()> {
     // subscription on the main `rt`.
     let cluster_rt =
         AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
+    let mut cluster_cfg = cfg.cluster.to_live();
+    if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
+        cluster_cfg.ingress_endpoints = endpoints;
+    }
     let (cluster_guard, cluster_pub, cluster_egress) =
         kardamom_sequencer::outbound::cluster::cluster_ref_publisher_with_egress(
             cluster_rt,
-            cfg.cluster.to_live(),
+            cluster_cfg,
         )
         .context("connect cluster ref publisher")?;
     tracing::info!("kardamom-sequencer: tx_ordering via Aeron Cluster");
@@ -544,7 +569,7 @@ async fn main() -> anyhow::Result<()> {
         rt,
         cluster_egress,
         &receipts_rt,
-        &channels,
+        &mut plane,
         args.executor_count,
         &shutdown,
     )?;
@@ -568,6 +593,7 @@ async fn main() -> anyhow::Result<()> {
     }
     .spawn();
     let loops = SpawnedLoops {
+        stop: shutdown.guard(),
         cluster_guard,
         main: join_main,
         deposits: join_deposits,
@@ -576,13 +602,16 @@ async fn main() -> anyhow::Result<()> {
 
     wait_for_shutdown().await;
     tracing::info!("kardamom-sequencer: shutdown signal received");
-    shutdown.signal();
-    // The cluster session (`cluster_guard`) stays alive until every
-    // publish loop has stopped; `join_all` drops it as soon as it
-    // returns. `resync.feeds.join()` then awaits the two resync feed
-    // tasks and, when it returns, drops `rt` — before `receipts_rt`,
-    // still a local here, drops at the end of `main`.
+    // `join_all` signals the loops, then joins them. The cluster session
+    // (`cluster_guard`) stays alive until every publish loop has
+    // stopped; `join_all` drops it as soon as it returns.
+    // `resync.feeds.join()` then awaits the two resync feed tasks and,
+    // when it returns, drops `rt` — before `receipts_rt`, still a local
+    // here, drops at the end of `main`.
     loops.join_all().await;
+    // The plane's registrations and discovery tasks end before the
+    // runtime drops inside `resync.feeds.join()`.
+    plane.shutdown().await;
     resync.feeds.join().await;
     Ok(())
 }

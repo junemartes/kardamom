@@ -1,0 +1,11 @@
+---
+# Convergence playbook: substrate, images, workloads. `make container-up`
+# applies terraform/containers first and writes the node contract it reads.
+- name: Create and provision cluster containers
+  ansible.builtin.import_playbook: containers.yml
+
+- name: Publish prebuilt service images
+  ansible.builtin.import_playbook: images.yml
+
+- name: Deploy workloads
+  ansible.builtin.import_playbook: deploy.yml

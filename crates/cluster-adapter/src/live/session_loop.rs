@@ -13,13 +13,13 @@ use kardamom_log::aeron_live::{AeronRuntime, IdleBackoff, PubHandle, RawFrame};
 use super::endpoints::{now_ms, now_ms_i64, open_leader_pub, open_next_member_pub, to_aligned};
 use super::{LiveClusterConfig, OfferReq, ReplayOnConnect};
 use crate::gateway::OfferOutcome;
+use crate::wire::{EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE};
 
 // Replay-request resend state. The request is published on the cluster
 // ingress, which is often still not connected right after a (re)connect.
 // A single best-effort send can be silently lost, and the consumer then
 // waits forever for a replay nobody asked for. Resend every
-// REPLAY_RESEND_MS until the consumer's cursor advances (progress means
-// frames are flowing again).
+// REPLAY_RESEND_MS until the leader's answer arrives (see `ReplayAsk`).
 const REPLAY_RESEND_MS: u64 = 3_000;
 // Egress-liveness watchdog (canonical-stream consumers only). If the
 // session is connected but no egress frame has arrived for this long,
@@ -100,6 +100,52 @@ impl Resend {
     }
 }
 
+/// The replay request's resend gate. The leader answers every request it
+/// receives: `REPLAY_DONE` after the retained frames, or
+/// `REPLAY_UNAVAILABLE`. So the request is resent on the
+/// [`REPLAY_RESEND_MS`] cadence until one of those markers arrives on
+/// this session's egress, and never after. The consumer's delivery
+/// cursor is not the signal: it moves at the consumer's own pace, and an
+/// executor that waits on a join miss holds it still for ten seconds
+/// while the replay is already in flight. Resending on a still cursor
+/// made the leader serve the same thousands of retained frames up to
+/// three times per request, which is the egress load behind the
+/// back-pressure closes of issue #292.
+struct ReplayAsk {
+    resend: Resend,
+    answered: bool,
+}
+
+impl ReplayAsk {
+    fn new() -> Self {
+        Self {
+            resend: Resend::new(REPLAY_RESEND_MS),
+            answered: false,
+        }
+    }
+
+    /// A new session: the next [`ReplayAsk::due`] fires at once, and an
+    /// answer to the previous session's request no longer counts.
+    fn rearm(&mut self) {
+        self.resend.rearm();
+        self.answered = false;
+    }
+
+    /// Note the kind byte of one egress payload for this session. The
+    /// two replay markers close the ask; live frames do not.
+    fn on_payload(&mut self, kind: u8) {
+        if kind == EGRESS_KIND_REPLAY_DONE || kind == EGRESS_KIND_REPLAY_UNAVAILABLE {
+            self.answered = true;
+        }
+    }
+
+    /// Whether to (re)send the request now. Records the send time when
+    /// it fires.
+    fn due(&mut self, now: u64) -> bool {
+        !self.answered && self.resend.due(now)
+    }
+}
+
 /// The four channel and stop seams that connect the session thread to
 /// its owner: egress frames in from the Aeron subscription, offer
 /// requests in from [`LiveIngress`](super::LiveIngress) clones,
@@ -169,8 +215,7 @@ struct SessionLoop {
     // Current watchdog window. It doubles on each fruitless reset, up to
     // EGRESS_SILENCE_RESET_MAX_MS, and snaps back on any real egress frame.
     egress_silence_reset_ms: u64,
-    replay_resend: Resend,
-    replay_cursor_at_send: (u64, u64),
+    replay_ask: ReplayAsk,
     subscribe_resend: Resend,
     subscribe_confirmed: bool,
     // Whether an egress consumer (a `LiveEgress`) is still attached. A
@@ -262,8 +307,7 @@ impl SessionLoop {
             stop: seams.stop,
             egress_alive_at_ms: now_ms(),
             egress_silence_reset_ms: EGRESS_SILENCE_RESET_MS,
-            replay_resend: Resend::new(REPLAY_RESEND_MS),
-            replay_cursor_at_send: (u64::MAX, u64::MAX),
+            replay_ask: ReplayAsk::new(),
             subscribe_resend: Resend::new(SUBSCRIBE_RESEND_MS),
             subscribe_confirmed: false,
             egress_alive: true,
@@ -305,37 +349,17 @@ impl SessionLoop {
 
     fn on_driver_event(&mut self, ev: DriverEvent) {
         match ev {
-            DriverEvent::AppMessage(payload) => {
-                self.subscribe_confirmed = true;
-                let wanted = self
-                    .egress_kind_filter
-                    .as_ref()
-                    .is_none_or(|ks| payload.first().is_some_and(|k| ks.contains(k)));
-                if wanted && self.egress_alive && self.out_tx.send(payload).is_err() {
-                    self.egress_alive = false;
-                }
-            }
+            DriverEvent::AppMessage(payload) => self.on_app_message(payload),
             DriverEvent::Reconnect {
                 leader_member_id,
                 ingress_endpoints,
-            } => {
-                if let Some(p) = open_leader_pub(
-                    &self.rt,
-                    &ingress_endpoints,
-                    leader_member_id,
-                    self.cfg.ingress_stream_id,
-                ) {
-                    self.ingress = p;
-                    self.endpoints = ingress_endpoints;
-                    self.target_member = leader_member_id;
-                }
-            }
+            } => self.on_reconnect(leader_member_id, ingress_endpoints),
             DriverEvent::Connected { cluster_session_id } => {
                 tracing::info!(cluster_session_id, "cluster session opened");
                 // Canonical-stream consumers request replay from their
                 // delivery cursor on every establishment. Force an
                 // immediate (re)send below.
-                self.replay_resend.rearm();
+                self.replay_ask.rearm();
                 self.subscribe_resend.rearm();
                 self.subscribe_confirmed = false;
                 self.egress_alive_at_ms = now_ms();
@@ -343,6 +367,43 @@ impl SessionLoop {
             DriverEvent::Failed(reason) => {
                 tracing::error!(%reason, "cluster session failed");
             }
+        }
+    }
+
+    /// One app payload from egress. The session filter already passed, so
+    /// this confirms the subscribe. The kind filter then decides whether the
+    /// consumer sees the payload. A closed consumer channel ends the egress
+    /// direction.
+    fn on_app_message(&mut self, payload: Vec<u8>) {
+        self.subscribe_confirmed = true;
+        // The replay gate reads the kind byte before the egress filter:
+        // a REPLAY_DONE or REPLAY_UNAVAILABLE marker ends the resends
+        // even when the consumer does not want the frame.
+        if let Some(&kind) = payload.first() {
+            self.replay_ask.on_payload(kind);
+        }
+        let wanted = self
+            .egress_kind_filter
+            .as_ref()
+            .is_none_or(|ks| payload.first().is_some_and(|k| ks.contains(k)));
+        if wanted && self.egress_alive && self.out_tx.send(payload).is_err() {
+            self.egress_alive = false;
+        }
+    }
+
+    /// Re-point ingress at a new leader. The endpoints and the target member
+    /// move together with the publication, so a failed open keeps all three
+    /// on the old leader.
+    fn on_reconnect(&mut self, leader_member_id: i32, ingress_endpoints: String) {
+        if let Some(p) = open_leader_pub(
+            &self.rt,
+            &ingress_endpoints,
+            leader_member_id,
+            self.cfg.ingress_stream_id,
+        ) {
+            self.ingress = p;
+            self.endpoints = ingress_endpoints;
+            self.target_member = leader_member_id;
         }
     }
 
@@ -411,47 +472,43 @@ impl SessionLoop {
     /// silently lost.
     fn send_replay(&mut self) {
         let Some(r) = &self.replay else { return };
-        if !self.driver.is_connected() {
+        if !self.driver.is_connected() || !self.replay_ask.due(now_ms()) {
             return;
         }
         let cursor = (
             r.next_index.load(std::sync::atomic::Ordering::Relaxed),
             r.next_block.load(std::sync::atomic::Ordering::Relaxed),
         );
-        let now = now_ms();
-        let progressed = cursor != self.replay_cursor_at_send;
-        if progressed && self.replay_resend.last_ms.is_some() {
-            // Frames are flowing. Move the checkpoint so a future stall is
-            // measured from the most recent progress, not the last send.
-            self.replay_cursor_at_send = cursor;
-            self.replay_resend.last_ms = Some(now);
-        } else if self.replay_resend.due(now) {
-            let req = crate::wire::encode_replay_request(cursor.0, cursor.1);
-            if let Some(framed) = self.driver.wrap_app(&req, now_ms_i64(now)) {
-                // This is a retrying publish, not best-effort. This rare,
-                // critical message is sent exactly when the ingress
-                // publication is at its busiest (mass reconnects under
-                // churn). A best-effort deadline would drop it every 3s, in
-                // lockstep with the backpressure that caused the stall.
-                // This call runs inline on this loop, not on a helper
-                // thread, to keep client-side ordering in the replay path
-                // correct. The ack wait is bounded (10s), and the 90s
-                // cluster session timeout tolerates it. The `Result` is
-                // still checked, not discarded.
-                if let Err(e) = self.ingress.publish_bytes(to_aligned(&framed)) {
-                    tracing::warn!(
-                        error = %e,
-                        "cluster replay request publish failed (will resend)"
-                    );
-                }
-                tracing::info!(
-                    next_index = cursor.0,
-                    next_block = cursor.1,
-                    "cluster replay requested"
-                );
-                self.replay_cursor_at_send = cursor;
-            }
+        self.publish_replay_request(cursor, now_ms());
+    }
+
+    /// Send one replay request for `cursor`. The driver drops the request
+    /// while the session is not established, and the gate then resends it.
+    fn publish_replay_request(&mut self, cursor: (u64, u64), now: u64) {
+        let req = crate::wire::encode_replay_request(cursor.0, cursor.1);
+        let Some(framed) = self.driver.wrap_app(&req, now_ms_i64(now)) else {
+            return;
+        };
+        // This is a retrying publish, not best-effort. This rare, critical
+        // message is sent exactly when the ingress publication is at its
+        // busiest (mass reconnects under churn). A best-effort deadline
+        // would drop it every 3s, in lockstep with the backpressure that
+        // caused the stall. This call runs inline on this loop, not on a
+        // helper thread, to keep client-side ordering in the replay path
+        // correct. The ack wait is bounded (10s), and the 90s cluster
+        // session timeout tolerates it. The `Result` is still checked, not
+        // discarded.
+        if let Err(e) = self.ingress.publish_bytes(to_aligned(&framed)) {
+            tracing::warn!(
+                error = %e,
+                "cluster replay request publish failed (will resend)"
+            );
         }
+        tracing::info!(
+            next_index = cursor.0,
+            next_block = cursor.1,
+            "cluster replay requested"
+        );
     }
 
     /// Duty 2: connect and keep-alive frames. The driver self-heals: it
@@ -563,5 +620,36 @@ impl SessionLoop {
         if let Some(close_frame) = self.driver.force_reconnect("shutdown") {
             self.ingress.publish_best_effort(to_aligned(&close_frame));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::{EGRESS_KIND_BOUNDARY, EGRESS_KIND_RELAYED};
+
+    #[test]
+    fn replay_ask_resends_until_the_leader_answers() {
+        let mut ask = ReplayAsk::new();
+        assert!(ask.due(1_000), "a fresh session asks at once");
+        assert!(!ask.due(1_000 + REPLAY_RESEND_MS - 1));
+        ask.on_payload(EGRESS_KIND_RELAYED);
+        ask.on_payload(EGRESS_KIND_BOUNDARY);
+        assert!(
+            ask.due(1_000 + REPLAY_RESEND_MS),
+            "live frames are not an answer: a lost request is resent"
+        );
+        ask.on_payload(EGRESS_KIND_REPLAY_DONE);
+        assert!(
+            !ask.due(1_000 + 10 * REPLAY_RESEND_MS),
+            "an answered ask never resends"
+        );
+        ask.rearm();
+        assert!(
+            ask.due(1_000 + 10 * REPLAY_RESEND_MS),
+            "a new session asks again"
+        );
+        ask.on_payload(EGRESS_KIND_REPLAY_UNAVAILABLE);
+        assert!(!ask.due(1_000 + 20 * REPLAY_RESEND_MS));
     }
 }

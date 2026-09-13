@@ -1,6 +1,5 @@
 # kardamom-ingress is the eth JSON-RPC proxy. It runs active/active:
-# count=2, one per ingress-role node (ingress-0@192.168.56.31,
-# ingress-1@192.168.56.32).
+# count=2, one per ingress-role node (ingress-0, ingress-1).
 #
 # Invocation:
 #   kardamom-ingress --config <ingress.toml> --log-config <channels.toml> \
@@ -9,28 +8,20 @@
 #
 # ingress.toml supplies the [cluster] Aeron Cluster (Raft) client
 # connection, for the on-quorum watermark observer. Other runtime
-# tuning goes through flags. channels.toml supplies the UDP multicast
-# channels. The on-quorum ack gate's durable watermark is no longer an
-# Aeron quorum_watermark stream. In the cluster-only topology, ingress
-# derives it from Aeron Cluster egress progress; see
+# tuning goes through flags. channels.toml supplies the Aeron streams
+# and the discovery scope. The on-quorum ack gate's durable watermark
+# comes from Aeron Cluster egress progress; see
 # crates/ingress/src/cluster.rs.
 #
-# tx_receipts MDS fan-in: channels.toml's tx_receipts_control_channel
-# and tx_receipts_executor_count drive ingress to open one
-# control-mode=manual subscription, and attach each executor replica's
-# per-replica endpoint (0 through N). It dedups the N identical receipt
-# copies by tx hash. executor_count comes from the log config; override
-# it at runtime with --executor-count or KARDAMOM_EXECUTOR_COUNT.
-# TODO(consul-watch): swap the static count for a Consul watch on an
-# `executor-receipts` service, so membership changes add or remove
-# destinations live.
+# tx_receipts: every ingress replica joins every executor publisher the
+# catalog lists and dedups the N identical receipt copies by tx hash.
 #
 # This shares the node's Aeron media driver, through the bind-mounted
 # tmpfs aeron.dir. It uses host networking, so :8545 binds on the
 # ingress1 VM IP.
 #
 # This job uses file() for its templates, so submit it from the
-# deploy/cluster/ directory. scripts/deploy.sh does this.
+# deploy/cluster/ directory. ansible/deploy.yml does this.
 
 variable "ack_policy" {
   type        = string
@@ -38,7 +29,7 @@ variable "ack_policy" {
   default     = "on-offer"
 }
 
-# Digest-pinned image. scripts/deploy.sh
+# Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests), so the task runs exactly the bytes
 # that deploy pushed. The empty default falls back to the mutable :dev
@@ -52,8 +43,14 @@ variable "image_ref" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
 job "ingress" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {
@@ -125,7 +122,7 @@ job "ingress" {
         ulimit {
           nofile = "65536:65536"
         }
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-ingress:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-ingress:dev"
         # force_pull stays on for both paths. The mutable :dev
         # fallback needs it; a stale node-cached layer once caused a
         # crash-retry storm that stalled the deploy. On the
@@ -155,7 +152,7 @@ job "ingress" {
           "--shards", "2",
           # The versioned vslot-to-lane map (config/shard-map.toml). A
           # resize re-renders it and rolls this job; see
-          # scripts/scale-sequencers.sh.
+          # `kardamom-cluster scale-sequencers`.
           "--shard-map", "/local/shard-map.toml",
           "--jsonrpc-bind", "0.0.0.0:8545",
           # The submit park bound. It equals the sequencer transaction
@@ -194,6 +191,13 @@ job "ingress" {
         ]
       }
 
+      env {
+        # The UDP ports the discovered tx_data publications bind on this
+        # node: one control endpoint per lane. Uniqueness comes from the
+        # node IP; one ingress runs per node. See docs/aeron-discovery.md.
+        KARDAMOM_MDC_PORTS = "40300-40319"
+      }
+
       # Presence-checked config. Content lives in config/ingress.toml.
       template {
         destination = "local/ingress.toml"
@@ -206,12 +210,16 @@ job "ingress" {
         data        = file("config/shard-map.toml")
       }
 
-      # Cluster LogConfig (UDP multicast channels). Comes from one
+      # Cluster LogConfig (Aeron streams and discovery). Comes from one
       # source, config/channels.toml.tpl, and is read through
       # --log-config.
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }
 
       resources {
@@ -219,6 +227,8 @@ job "ingress" {
         memory = 512
       }
 
+      # The RPC front door as a Consul service: the rpc-proxy pool is
+      # ingress-jsonrpc.service.consul.
       service {
         name     = "ingress-jsonrpc"
         port     = "jsonrpc"

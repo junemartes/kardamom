@@ -350,7 +350,13 @@ impl LocalStack {
             cfg,
         };
 
-        stack.await_ready().await?;
+        if let Err(e) = stack.await_ready().await {
+            // The readiness barrier is the one place a wedged bring-up
+            // shows. Without the tails, a CI failure here names a timeout
+            // and nothing else.
+            stack.dump_tails();
+            return Err(e);
+        }
         Ok(stack)
     }
 

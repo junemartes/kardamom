@@ -1,6 +1,7 @@
 package io.kardamom.sealer.cluster;
 
 import io.aeron.Aeron;
+import io.aeron.Publication;
 import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
 import java.util.ArrayList;
@@ -29,6 +30,10 @@ final class ClusterStubs {
         final long id;
         final List<byte[]> offered = new ArrayList<>();
         boolean closed;
+        /** How many times the service asked to close this session. */
+        int closes;
+        /** When set, every offer reports {@link Publication#BACK_PRESSURED}. */
+        boolean backPressured;
 
         StubSession(final long id) {
             this.id = id;
@@ -52,6 +57,7 @@ final class ClusterStubs {
 
         public void close() {
             closed = true;
+            closes++;
         }
 
         public boolean isClosing() {
@@ -59,6 +65,9 @@ final class ClusterStubs {
         }
 
         public long offer(final DirectBuffer buffer, final int offset, final int length) {
+            if (backPressured) {
+                return Publication.BACK_PRESSURED;
+            }
             final byte[] copy = new byte[length];
             buffer.getBytes(offset, copy);
             offered.add(copy);

@@ -115,17 +115,22 @@ impl<P: TxReceiptsPublication> AttestingReceiptSink<P> {
         self.handle
             .submit_leaves(b, leaves.into_iter().map(|(_, leaf)| leaf).collect());
     }
+
+    /// Buffers `r`'s withdrawal leaves for a later flush. Does nothing if
+    /// the receipt has no withdrawal leaves.
+    fn buffer_withdrawals(&mut self, r: &Receipt) {
+        let leaves = receipt_withdrawal_leaves(r);
+        if leaves.is_empty() {
+            return;
+        }
+        self.pending.push_all(r.block_number, leaves);
+    }
 }
 
 impl<P: TxReceiptsPublication> TxReceiptsPublication for AttestingReceiptSink<P> {
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         match &msg {
-            CMessage::Receipt(r) => {
-                let leaves = receipt_withdrawal_leaves(r);
-                if !leaves.is_empty() {
-                    self.pending.push_all(r.block_number, leaves);
-                }
-            }
+            CMessage::Receipt(r) => self.buffer_withdrawals(r),
             CMessage::BlockBoundary(b) => self.flush_through(b.block_number),
         }
         self.inner.publish(msg)

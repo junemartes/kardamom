@@ -124,47 +124,56 @@ fn op(contracts: &DefiContracts, sender: usize, seq: u64) -> OpCall {
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9));
     match h % 4 {
-        0 | 1 => {
-            let zero_for_one = U256::from(seq & 1);
-            let amount_in = U256::from(10u128.pow(17) + u128::from(h % 100) * 10u128.pow(15));
-            OpCall {
-                to: contracts.pool,
-                input: call("swap(bool,uint256)", &[zero_for_one, amount_in]),
-            }
+        0 | 1 => swap_op(contracts, h, seq),
+        2 => vault_op(contracts, h, seq),
+        _ => clob_op(contracts, h, seq),
+    }
+}
+
+/// A pool swap, in either direction.
+fn swap_op(contracts: &DefiContracts, h: u64, seq: u64) -> OpCall {
+    let zero_for_one = U256::from(seq & 1);
+    let amount_in = U256::from(10u128.pow(17) + u128::from(h % 100) * 10u128.pow(15));
+    OpCall {
+        to: contracts.pool,
+        input: call("swap(bool,uint256)", &[zero_for_one, amount_in]),
+    }
+}
+
+/// A vault operation: deposit and withdraw alternate by `seq` parity.
+fn vault_op(contracts: &DefiContracts, h: u64, seq: u64) -> OpCall {
+    if seq & 1 == 0 {
+        let assets = U256::from(10u128.pow(18) + u128::from(h % 1000) * 10u128.pow(15));
+        OpCall {
+            to: contracts.vault,
+            input: call("deposit(uint256)", &[assets]),
         }
-        2 => {
-            if seq & 1 == 0 {
-                let assets = U256::from(10u128.pow(18) + u128::from(h % 1000) * 10u128.pow(15));
-                OpCall {
-                    to: contracts.vault,
-                    input: call("deposit(uint256)", &[assets]),
-                }
-            } else {
-                let shares = U256::from(5u128 * 10u128.pow(17));
-                OpCall {
-                    to: contracts.vault,
-                    input: call("withdraw(uint256)", &[shares]),
-                }
-            }
+    } else {
+        let shares = U256::from(5u128 * 10u128.pow(17));
+        OpCall {
+            to: contracts.vault,
+            input: call("withdraw(uint256)", &[shares]),
         }
-        _ => {
-            if h % 8 == 7 {
-                // Cancel a recent-ish ID. A cancel of another user's order,
-                // or of a filled order, is a cheap no-op. This is realistic
-                // book churn.
-                OpCall {
-                    to: contracts.clob,
-                    input: call("cancel(uint256)", &[churn_id(seq.saturating_sub(1))]),
-                }
-            } else {
-                let bid = U256::from(seq & 1);
-                let price = U256::from(1_000 + h % 64);
-                let size = U256::from(1_000_000 + h % 1_000_000);
-                OpCall {
-                    to: contracts.clob,
-                    input: call("place(bool,uint256,uint96)", &[bid, price, size]),
-                }
-            }
+    }
+}
+
+/// A CLOB operation: 1 cancel for every 7 places.
+fn clob_op(contracts: &DefiContracts, h: u64, seq: u64) -> OpCall {
+    if h % 8 == 7 {
+        // Cancel a recent-ish ID. A cancel of another user's order,
+        // or of a filled order, is a cheap no-op. This is realistic
+        // book churn.
+        OpCall {
+            to: contracts.clob,
+            input: call("cancel(uint256)", &[churn_id(seq.saturating_sub(1))]),
+        }
+    } else {
+        let bid = U256::from(seq & 1);
+        let price = U256::from(1_000 + h % 64);
+        let size = U256::from(1_000_000 + h % 1_000_000);
+        OpCall {
+            to: contracts.clob,
+            input: call("place(bool,uint256,uint96)", &[bid, price, size]),
         }
     }
 }

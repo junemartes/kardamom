@@ -17,9 +17,7 @@ use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider;
 use kardamom_batcher::BatchAccumulator;
 use kardamom_batcher::batcher::pack_blocks;
-use kardamom_batcher::optimistic::{
-    ClaimOutcome, WatchOutcome, claim_next_batch, watch_and_challenge,
-};
+use kardamom_batcher::optimistic::{BatchClaimer, BatchWatcher, ClaimOutcome, WatchOutcome};
 use kardamom_batcher::prover_submit::IKardamomProofOracle;
 use kardamom_batcher::settlement::IKardamomL2Settlement;
 use kardamom_batcher::testkit::{
@@ -187,7 +185,8 @@ async fn scenario_a_honest_claim_and_finalize<P: Provider + Clone>(
     s: &Scenario<P>,
     batch: &RealBatch,
 ) {
-    let out = claim_next_batch(s.provider.clone(), s.oracle_addr, s.spool())
+    let out = BatchClaimer::new(s.oracle_addr, s.spool())
+        .claim_next(s.provider.clone())
         .await
         .unwrap();
     assert_eq!(out, ClaimOutcome::NoBatchPosted { batch_index: 1 });
@@ -208,12 +207,14 @@ async fn scenario_a_honest_claim_and_finalize<P: Provider + Clone>(
         .await
         .unwrap();
 
-    let out = claim_next_batch(s.provider.clone(), s.oracle_addr, s.spool())
+    let out = BatchClaimer::new(s.oracle_addr, s.spool())
+        .claim_next(s.provider.clone())
         .await
         .unwrap();
     assert_eq!(out, ClaimOutcome::Claimed { batch_index: 1 });
 
-    let out = watch_and_challenge(s.provider.clone(), s.oracle_addr, s.spool())
+    let out = BatchWatcher::new(s.oracle_addr, s.spool())
+        .watch_and_challenge(s.provider.clone())
         .await
         .unwrap();
     assert_eq!(out, WatchOutcome::ClaimHonest { batch_index: 1 });
@@ -273,7 +274,8 @@ async fn lying_claim_is_challenged_and_rewound<P: Provider + Clone>(
 
     // ----- act + assert: the watcher sees the divergence, but the proof
     // is not ready yet -----
-    let out = watch_and_challenge(s.provider.clone(), s.oracle_addr, s.spool())
+    let out = BatchWatcher::new(s.oracle_addr, s.spool())
+        .watch_and_challenge(s.provider.clone())
         .await
         .unwrap();
     assert_eq!(
@@ -288,7 +290,8 @@ async fn lying_claim_is_challenged_and_rewound<P: Provider + Clone>(
     // zk-host --prove shape); the watcher challenges -----
     write_single_block_proof_files(s.spool(), batch.d8);
 
-    let out = watch_and_challenge(s.provider.clone(), s.oracle_addr, s.spool())
+    let out = BatchWatcher::new(s.oracle_addr, s.spool())
+        .watch_and_challenge(s.provider.clone())
         .await
         .unwrap();
 
@@ -310,7 +313,8 @@ async fn lying_claim_is_challenged_and_rewound<P: Provider + Clone>(
 /// the window elapses.
 async fn honest_reclaim_finalizes<P: Provider + Clone>(s: &Scenario<P>) {
     // ----- act -----
-    let out = claim_next_batch(s.provider.clone(), s.oracle_addr, s.spool())
+    let out = BatchClaimer::new(s.oracle_addr, s.spool())
+        .claim_next(s.provider.clone())
         .await
         .unwrap();
     assert_eq!(out, ClaimOutcome::Claimed { batch_index: 2 });

@@ -33,7 +33,7 @@
 //! is always a full, consistent snapshot.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -107,15 +107,19 @@ pub fn serve_checkpoints(
     let listener = TcpListener::from_std(std_listener)?;
     let addr = listener.local_addr()?;
     info!(%addr, dir = %checkpoints_dir.display(), "serving checkpoints to peers");
-    let task = tokio::spawn(async move {
-        loop {
-            let Some(stream) = accept_logged(&listener).await else {
-                continue;
-            };
-            spawn_serve(stream, checkpoints_dir.clone());
-        }
-    });
+    let task = tokio::spawn(accept_forever(listener, checkpoints_dir));
     Ok(CheckpointServer { addr, task })
+}
+
+/// Accept connections forever, and serve each one on its own task. An
+/// accept error is logged and skipped, so the loop never ends.
+async fn accept_forever(listener: TcpListener, checkpoints_dir: PathBuf) {
+    loop {
+        let Some(stream) = accept_logged(&listener).await else {
+            continue;
+        };
+        spawn_serve(stream, checkpoints_dir.clone());
+    }
 }
 
 /// Accept one connection, logging and swallowing an accept error instead
@@ -370,10 +374,7 @@ impl<'a> CheckpointFetch<'a> {
     /// Connect to `peer` (`host:port`) and send the checkpoint-fetch
     /// request.
     fn connect(peer: &'a str, expected_genesis: Option<B256>) -> Result<Self, StateError> {
-        let addr: SocketAddr = peer
-            .parse()
-            .map_err(|_| StateError::Recovery(format!("bad checkpoint peer address: {peer}")))?;
-        let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+        let mut stream = Self::open(peer)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         stream.write_all(b"GET /checkpoint/latest HTTP/1.0\r\n\r\n")?;
@@ -382,6 +383,26 @@ impl<'a> CheckpointFetch<'a> {
             reader: BufReader::new(stream),
             expected_genesis,
         })
+    }
+
+    /// Open a connection to the first address of `peer` that accepts one.
+    /// The host part may be a name, such as a Consul node record; every
+    /// address it resolves to is tried in order.
+    fn open(peer: &str) -> Result<TcpStream, StateError> {
+        let addrs = peer.to_socket_addrs().map_err(|e| {
+            StateError::Recovery(format!("bad checkpoint peer address {peer}: {e}"))
+        })?;
+        let mut refused = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => refused = Some(e),
+            }
+        }
+        Err(refused.map_or_else(
+            || StateError::Recovery(format!("checkpoint peer {peer} resolves to no address")),
+            StateError::from,
+        ))
     }
 
     /// Read and parse the response head.
@@ -395,16 +416,16 @@ impl<'a> CheckpointFetch<'a> {
         let mut head = String::new();
         loop {
             match self.read_head_line(&mut head)? {
-                HeadLine::Done => break,
-                HeadLine::TooLarge => {
-                    return Err(StateError::Recovery(
-                        "checkpoint peer response head too large".into(),
-                    ));
-                }
-                HeadLine::More => {}
+                HeadLine::Done => return Ok(head),
+                HeadLine::TooLarge => return Err(Self::head_too_large()),
+                HeadLine::More => (),
             }
         }
-        Ok(head)
+    }
+
+    /// The error that ends a response head longer than [`MAX_HEAD`].
+    fn head_too_large() -> StateError {
+        StateError::Recovery("checkpoint peer response head too large".into())
     }
 
     /// Read one line into `head`. `Done` at the blank line or EOF that
