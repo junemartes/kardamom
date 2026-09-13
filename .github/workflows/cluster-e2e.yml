@@ -73,7 +73,7 @@ jobs:
             ansible
 
       - name: Ansible docker connection plugin
-        run: ansible-galaxy collection install ansible.posix community.docker
+        run: ansible-galaxy collection install ansible.posix community.docker community.general
 
       # The runner image puts pipx's ansible-core first on PATH, and its venv
       # has no requests. community.docker's container and network modules run

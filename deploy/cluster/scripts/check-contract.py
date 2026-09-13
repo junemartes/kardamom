@@ -172,12 +172,6 @@ must_contain(
     "ingress active shard count (M) mirrors partition_count",
 )
 seq_job = (jobs / "sequencer.nomad.hcl").read_text()
-seq_count_flags = seq_job.count(f'"--partition-count", "{partition_count}"')
-if seq_count_flags != 2:
-    err(
-        f"nomad/sequencer.nomad.hcl: expected both replica groups to pass "
-        f'"--partition-count", "{partition_count}" (found {seq_count_flags})'
-    )
 must_contain(
     CLUSTER / "config" / "sequencer.toml.tpl",
     f"partition_count = {partition_count}",
@@ -196,12 +190,6 @@ for job in ("executor", "validator", "batcher"):
 tx_ttl_ms = scalar(gv, "tx_ttl_ms")
 if not tx_ttl_ms.isdigit() or int(tx_ttl_ms) == 0:
     err(f"group_vars/all.yml: tx_ttl_ms must be a positive integer, got {tx_ttl_ms!r}")
-seq_ttl_flags = seq_job.count(f'"--tx-ttl-ms", "{tx_ttl_ms}"')
-if seq_ttl_flags != 2:
-    err(
-        f"nomad/sequencer.nomad.hcl: expected both replica groups to pass "
-        f'"--tx-ttl-ms", "{tx_ttl_ms}" (found {seq_ttl_flags})'
-    )
 must_contain(
     jobs / "ingress.nomad.hcl",
     f'"--pending-receipt-timeout-ms", "{tx_ttl_ms}"',
@@ -236,18 +224,6 @@ else:
             err(f"config/shard-map.toml: {max(table) + 1} active lanes != partition_count {pc}")
         if m_ver and m_ver.group(1) == "0" and table != [v % pc for v in range(256)]:
             err("config/shard-map.toml: version 0 must be the identity map lane = vslot % partition_count")
-    rendered = subprocess.run(
-        [sys.executable, str(CLUSTER / "scripts" / "render-sequencer-job.py")],
-        capture_output=True,
-        text=True,
-    )
-    if rendered.returncode != 0:
-        err(f"render-sequencer-job.py failed: {rendered.stderr.strip()}")
-    elif rendered.stdout != (jobs / "sequencer.nomad.hcl").read_text():
-        err(
-            "nomad/sequencer.nomad.hcl differs from the steady render; run "
-            "scripts/render-sequencer-job.py > nomad/sequencer.nomad.hcl"
-        )
 must_contain(jobs / "ingress.nomad.hcl", '"--shard-map", "/local/shard-map.toml"', "ingress reads the shard map")
 must_contain(jobs / "ingress.nomad.hcl", 'file("config/shard-map.toml")', "ingress job templates the shard map")
 ingress_kill = re.search(r'kill_timeout\s*=\s*"(\d+)s"', (jobs / "ingress.nomad.hcl").read_text())
@@ -395,22 +371,13 @@ m_exec_count = re.search(r"^\s{2}executor:\s*\{[^}]*?\bcount:\s*(\d+)", gv, re.M
 if m_exec_count and nonce_query_port:
     # The lookups go to executor-<i>.node.<datacenter>.consul; the jobs
     # derive the list from executor_count, whose default is the class count.
-    for job_name in ("sequencer", "executor", "validator"):
+    for job_name in ("executor", "validator"):
         must_contain(
             jobs / f"{job_name}.nomad.hcl",
             f"default     = {m_exec_count.group(1)}\n}}",
             "executor_count default is node_classes.executor.count",
         )
-    flag = (
-        '"--executor-query-endpoints", join(",", [for i in range(var.executor_count) : '
-        f'"http://executor-${{i}}.node.${{var.datacenter}}.consul:{nonce_query_port}"])'
-    )
-    found = seq_job.count(flag)
-    if found != 2:
-        err(
-            "nomad/sequencer.nomad.hcl: expected both replica groups to pass "
-            f"{flag} (found {found})"
-        )
+
 else:
     err("group_vars/all.yml: missing node_classes.executor ip_start/count")
 

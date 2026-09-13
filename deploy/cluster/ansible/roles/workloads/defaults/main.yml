@@ -25,6 +25,8 @@ workloads_image_services: [aeron, cluster, sequencer, ingress, executor, validat
 # A job receives the ones its file declares (tasks/job.yml).
 workloads_common_vars:
   datacenter: "{{ datacenter }}"
+  tx_ttl_ms: "{{ tx_ttl_ms }}"
+  executor_query_port: "{{ ports.executor_nonce_query }}"
   executor_count: "{{ node_classes.executor.count }}"
   sealer_count: "{{ node_classes.sealer.count }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means

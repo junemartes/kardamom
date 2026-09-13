@@ -36,7 +36,10 @@
         cluster_retention: "{{ workloads_cluster_retention }}"
         cluster_snapshot_interval_s: "{{ workloads_cluster_snapshot_s }}"
         cluster_remote_origins: "{{ workloads_remote_origins }}"
-    - {name: sequencer, wait: false}
+    - name: sequencer
+      wait: false
+      vars:
+        shard_table: "{{ (lookup('file', workloads_cluster_dir ~ '/config/shard-map.toml') | community.general.from_toml).table | to_json }}"
     - {name: ingress}
     - {name: executor, wait: false}
   loop_control:

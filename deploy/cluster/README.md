@@ -72,7 +72,7 @@ Q-of-N recorder design is preserved, marked superseded, in
 host tools below for your platform, and `just cluster-doctor` verifies them.
 
 - Ansible (`ansible-playbook`) + collections:
-  `ansible-galaxy collection install ansible.posix community.docker`.
+  `ansible-galaxy collection install ansible.posix community.docker community.general`.
 - Docker (with the Buildx plugin) for the node containers and the image
   builds. The daemon must run privileged containers; on macOS or Windows
   that is Docker Desktop's Linux VM.

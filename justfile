@@ -379,7 +379,7 @@ cluster-bootstrap:
     esac
     # Ansible Galaxy collections the playbook depends on.
     echo ">> installing ansible collections (ansible.posix, community.docker)"
-    ansible-galaxy collection install ansible.posix community.docker
+    ansible-galaxy collection install ansible.posix community.docker community.general
     echo ">> cluster-bootstrap complete. Verify with: just cluster-doctor"
     echo
     echo "   Images are pushed from inside the control node (REGISTRY_PUSH_NODE),"
