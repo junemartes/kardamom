@@ -277,7 +277,9 @@ where
             (None, None) => None,
         };
         let Some(receipt) = indexed else {
-            cache_metrics::record_degraded("past-nonce");
+            // A receipt-index miss, not a degraded read: the chaos cases
+            // read the degraded count as "Redis is dark".
+            cache_metrics::record_lookup("receipt", "miss");
             return Ok(None);
         };
         self.cache.insert(receipt.clone());
