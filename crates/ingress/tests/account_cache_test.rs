@@ -67,7 +67,7 @@ async fn an_unknown_sender_is_admitted() {
 }
 
 #[tokio::test]
-async fn a_past_nonce_is_a_duplicate_and_the_current_one_publishes() {
+async fn a_past_nonce_without_a_receipt_publishes() {
     let f = Fixture::new();
     let (p, mock) = (&f.proxy, &f.mock);
     let signer = PrivateKeySigner::random();
@@ -75,14 +75,12 @@ async fn a_past_nonce_is_a_duplicate_and_the_current_one_publishes() {
         BPosition::from_index(10),
         &[row(signer.address(), 3, LEGACY_COST * 10)],
     );
-    let err = p
-        .submit_raw_async(IP, sign_legacy(&signer, 2))
+    // The layer knows nonce 3, but no receipt proves who holds nonce 2:
+    // the receipt may never reach this ingress's cache. The sequencer
+    // decides.
+    p.submit_raw_async(IP, sign_legacy(&signer, 2))
         .await
-        .unwrap_err();
-    assert!(
-        matches!(err, IngressError::Duplicate((a, 2)) if a == signer.address()),
-        "{err:?}"
-    );
+        .expect("a past nonce with no receipt publishes");
     p.submit_raw_async(IP, sign_legacy(&signer, 3))
         .await
         .expect("the next nonce publishes");
@@ -135,14 +133,19 @@ async fn an_expired_entry_admits() {
     let f = Fixture::with(IngressConfig::default(), &live);
     let (p, mock) = (&f.proxy, &f.mock);
     let signer = PrivateKeySigner::random();
+    // A live, unfunded entry rejects; the same entry past its TTL does
+    // not.
     let _ = mock.apply_rows(BPosition::from_index(10), &[row(signer.address(), 3, 0)]);
     let err = p
-        .submit_raw_async(IP, sign_legacy(&signer, 0))
+        .submit_raw_async(IP, sign_legacy(&signer, 3))
         .await
         .unwrap_err();
-    assert!(matches!(err, IngressError::Duplicate(_)), "{err:?}");
+    assert!(
+        matches!(err, IngressError::InsufficientFunds { .. }),
+        "{err:?}"
+    );
     tokio::time::sleep(Duration::from_millis(60)).await;
-    p.submit_raw_async(IP, sign_legacy(&signer, 0))
+    p.submit_raw_async(IP, sign_legacy(&signer, 3))
         .await
         .expect("past the TTL the entry proves nothing");
 }
@@ -168,7 +171,7 @@ async fn the_receipt_cache_answers_a_retry_before_the_nonce_check() {
         .expect("the S5 retry contract: a landed tx answers with its receipt");
     assert_eq!(got, tx_hash);
     // A different tx at the landed nonce is a duplicate, from the
-    // receipt cache's identity guard and from the nonce check alike.
+    // receipt cache's identity guard: the receipt proves the conflict.
     let err = p
         .submit_raw_async(IP, sign_legacy_value(&signer, 0, 1))
         .await
@@ -193,7 +196,7 @@ fn sign_legacy_value(signer: &PrivateKeySigner, nonce: u64, value: u64) -> alloy
 }
 
 #[tokio::test]
-async fn checks_off_admits_a_past_nonce_and_an_unfunded_sender() {
+async fn checks_off_admits_an_unfunded_sender() {
     let cfg = IngressConfig {
         admission_checks: false,
         ..IngressConfig::default()
