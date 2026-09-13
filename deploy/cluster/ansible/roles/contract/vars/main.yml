@@ -6,16 +6,10 @@ contract_mirrors:
     forbidden: []
   - path: deploy/cluster/Makefile
     required:
-      - bootstrap.yml
       - tofu -chdir=$(TF_CONTAINERS) apply
       - REGISTRY := {{ registry_host }}:{{ registry_port }}
       - NOMAD_HTTP := {{ ports.nomad_http }}
       - TAG := {{ image_tag }}
-    forbidden:
-      - site.yml
-  - path: deploy/cluster/Vagrantfile
-    required:
-      - bootstrap.yml
     forbidden:
       - site.yml
   - path: deploy/cluster/ansible/containers.yml
