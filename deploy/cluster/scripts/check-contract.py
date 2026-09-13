@@ -123,6 +123,16 @@ profile = scalar(gv, "deployment_profile")
 if profile != "local":
     err(f"group_vars/all.yml: deployment_profile must default to local, got {profile!r}")
 
+# --- the Hetzner Terraform root -----------------------------------------------------
+# Terraform owns the network, the placement groups, the firewalls, the DNS
+# records and the pool bounds. The Nomad Autoscaler owns the elastic VMs,
+# so the root declares no server resource and no provider token variable.
+TF_ROOT = CLUSTER / "terraform" / "hetzner"
+for tf in sorted(TF_ROOT.glob("*.tf")):
+    must_not_contain(tf, 'resource "hcloud_server"', "the Autoscaler owns the elastic VMs")
+    must_not_contain(tf, "hcloud_token", "the API token is the HCLOUD_TOKEN environment variable, never a variable")
+must_contain(TF_ROOT / "outputs.tf", "version            = 1", "the pool contract is version 1")
+
 # --- Makefile -----------------------------------------------------------------
 must_contain(CLUSTER / "Makefile", f"REGISTRY := {registry}", "registry host:port")
 must_contain(CLUSTER / "Makefile", f"NOMAD_ADDR := {nomad_addr}", "nomad HTTP API")

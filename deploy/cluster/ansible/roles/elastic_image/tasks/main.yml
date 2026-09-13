@@ -1,0 +1,167 @@
+---
+# Turn a clean Cloud server into the elastic node image: the pinned
+# ansible-core and collections, the playbook release, the first-boot
+# inventory and profile values, and the bootstrap unit. Then remove every
+# machine identity, so each VM from the image boots as a new node.
+
+# bootstrap_revision is the git revision of the playbook release. The
+# bootstrap unit refuses a node whose pool expects another release.
+- name: Check the image inputs
+  ansible.builtin.assert:
+    that:
+      - bootstrap_revision is defined
+      - bootstrap_revision | length > 0
+    fail_msg: "image.yml needs bootstrap_revision (the git revision of the playbook release)"
+
+- name: Install the Python tooling
+  ansible.builtin.apt:
+    name:
+      - python3-venv
+      - python3-pip
+    state: present
+
+- name: Create the image directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ elastic_image_ansible_root }}"
+    - "{{ elastic_image_ansible_root }}/collections"
+    - /etc/kardamom
+    - /etc/kardamom/group_vars/all
+
+- name: Install the pinned ansible-core into a virtualenv
+  ansible.builtin.pip:
+    name: "ansible-core=={{ elastic_image_ansible_core_version }}"
+    virtualenv: "{{ elastic_image_ansible_root }}/venv"
+    virtualenv_command: "python3 -m venv"
+
+- name: Install the pinned collections
+  ansible.builtin.command:
+    argv:
+      - "{{ elastic_image_ansible_root }}/venv/bin/ansible-galaxy"
+      - collection
+      - install
+      - --collections-path
+      - "{{ elastic_image_ansible_root }}/collections"
+      - "{{ item }}"
+  loop: "{{ elastic_image_collections }}"
+  register: elastic_image_galaxy
+  changed_when: "'was installed successfully' in elastic_image_galaxy.stdout"
+
+- name: Copy the playbook release
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/"
+    dest: "{{ elastic_image_ansible_root }}/release/"
+    owner: root
+    group: root
+    mode: "u=rwX,go=rX"
+
+- name: Record the playbook release
+  ansible.builtin.copy:
+    dest: "{{ elastic_image_ansible_root }}/RELEASE"
+    content: "{{ bootstrap_revision }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Write the first-boot inventory
+  ansible.builtin.copy:
+    dest: /etc/kardamom/inventory.ini
+    content: |
+      # Managed by the elastic image. The node configures itself.
+      [elastic]
+      localhost ansible_connection=local ansible_python_interpreter=/usr/bin/python3
+    owner: root
+    group: root
+    mode: "0644"
+
+# group_vars/all is a directory: Ansible merges every file in it into the
+# vars of the all group, so the profile values and the enrollment vector
+# stay separate files.
+- name: Copy the profile values
+  ansible.builtin.copy:
+    src: "{{ elastic_image_profile_vars_file }}"
+    dest: /etc/kardamom/group_vars/all/profile.yml
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Write the enrollment client argument vector
+  ansible.builtin.copy:
+    dest: /etc/kardamom/group_vars/all/enrollment.yml
+    content: "{{ {'enrollment_argv': elastic_image_enrollment_argv} | to_nice_yaml }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: elastic_image_enrollment_argv | length > 0
+
+- name: Install the bootstrap unit
+  ansible.builtin.template:
+    src: kardamom-bootstrap.service.j2
+    dest: /etc/systemd/system/kardamom-bootstrap.service
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Keep the bootstrap unit disabled inside the image
+  ansible.builtin.systemd:
+    name: kardamom-bootstrap
+    enabled: false
+    daemon_reload: true
+
+- name: Keep the agents disabled inside the image
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+  loop:
+    - consul
+    - nomad
+
+- name: Remove the agent data of the build server
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /opt/consul
+    - /opt/nomad
+
+- name: Recreate the empty agent data directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "0750"
+  loop:
+    - { path: /opt/consul, owner: consul }
+    - { path: /opt/nomad, owner: nomad }
+
+- name: Clean the apt cache
+  ansible.builtin.apt:
+    clean: true
+
+- name: Remove the machine identity of the build server
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  with_fileglob:
+    - /etc/ssh/ssh_host_*
+    - /root/.ssh/authorized_keys
+    - /var/lib/dbus/machine-id
+
+- name: Empty the machine id
+  ansible.builtin.copy:
+    dest: /etc/machine-id
+    content: ""
+    owner: root
+    group: root
+    mode: "0444"
+
+- name: Reset cloud-init so the next boot is a first boot
+  ansible.builtin.command:
+    argv: [cloud-init, clean, --logs, --seed]
+  changed_when: true

@@ -280,9 +280,13 @@ deploy/cluster/
     bootstrap.yml          configure a host and join it to the substrate
     deploy.yml             workload deployment, signature and readiness gates
     images.yml             build, push, sign, and publish an image manifest
+    image.yml              prepare the elastic node image (Hetzner snapshot)
+    autoscaler.yml         install the Nomad Autoscaler and the pool policies
     roles/{profile,enroll,common,vswitch,netinfo,docker,firewall,consul,nomad,
-           registry,workloads,images,cosign}/
+           registry,workloads,images,cosign,elastic_image,autoscaler}/
     inventories/hetzner/   example production inventory + profile values
+  terraform/hetzner/        Cloud Network, vSwitch subnet, placement groups,
+                            firewalls, DNS records, RPC load balancer, pool contract
   docker/
     service.Dockerfile      multi-stage cargo build → slim runtime (VM path)
     ci-service.Dockerfile   thin wrapper over prebuilt binaries (CI path)
@@ -340,6 +344,42 @@ cloud-init wrote. `roles/enroll` runs the enrollment client the image
 carries and loads the credentials it produced; without them the agents
 stay disabled. The target design is the Hetzner hybrid infrastructure
 specification, [PR #278](https://github.com/junemartes/kardamom/pull/278).
+
+## Elastic pools (Hetzner Cloud)
+
+The elastic ingress and sequencer pools follow the pool contract of
+[`terraform/hetzner`](./terraform/hetzner/README.md). Terraform owns the
+network, one spread placement group and one public firewall per pool, the
+Consul bootstrap DNS records and the RPC load balancer. It owns no VM.
+
+1. `ansible-playbook ansible/image.yml -e bootstrap_revision=<git rev>
+   -e image_ssh_key=<key>` prepares the elastic node image: the pinned
+   `ansible-core`, the collections, the playbook release, the first-boot
+   inventory and profile values, the bootstrap unit, and no machine
+   identity. The token comes from `HCLOUD_TOKEN`.
+2. `tofu apply` in `terraform/hetzner`, then
+   `tofu output -json pool_contract > pool-contract.json`.
+3. `ansible-playbook -i <inventory> ansible/autoscaler.yml
+   -e autoscaler_pool_contract_file=.../pool-contract.json ...` installs
+   the Nomad Autoscaler on the `autoscaler` hosts with the `hcloud-server`
+   target (a pinned revision and checksum the operator supplies) and
+   renders one node-capacity policy per pool plus the ingress allocation
+   policy from the contract.
+
+Every policy renders disabled. The node-capacity policies use the
+threshold strategy with an upper bound only, so they scale out and never
+in; the scale-in check renders only with `autoscaler_scale_in_enabled`,
+after the drain contract of the spec is proven. A Prometheus query with no
+result is an evaluation error, not zero load. The ingress allocation
+policy stays disabled until the workload deployment preserves the count
+the Autoscaler sets.
+
+At first boot a VM from the image reads `/etc/kardamom/node.yml` that
+cloud-init wrote from the pool's user data, starts
+`kardamom-bootstrap.service`, and runs `bootstrap.yml` against itself. A
+failed bootstrap leaves the agents disabled and the unit failed; the VM
+still counts toward the pool bound, so a broken image cannot cause
+unbounded creation.
 
 ## Aeron-in-Docker
 

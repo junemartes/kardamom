@@ -89,3 +89,23 @@ jobs:
           exit $rc
       - name: Test Ansible workloads, images, and signing in isolation
         run: python3 -m unittest discover -s deploy/cluster/ansible/tests -v
+
+  terraform-validate:
+    name: tofu fmt + validate + test (hetzner root)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/cluster/terraform/hetzner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.12.6
+      - name: tofu fmt
+        run: tofu fmt -check -recursive .
+      - name: tofu init (provider schema only, no backend)
+        run: tofu init -backend=false -input=false
+      - name: tofu validate
+        run: tofu validate
+      - name: tofu test (mocked provider)
+        run: tofu test

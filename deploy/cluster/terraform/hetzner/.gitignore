@@ -1,0 +1,5 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+pool-contract.json
