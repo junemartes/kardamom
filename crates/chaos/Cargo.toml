@@ -27,6 +27,8 @@ alloy-network.workspace = true
 alloy-primitives.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+kardamom-types = { path = "../types" }
+toml.workspace = true
 kardamom-bench = { path = "../bench" }
 reqwest.workspace = true
 serde.workspace = true
