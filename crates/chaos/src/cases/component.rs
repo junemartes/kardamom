@@ -148,7 +148,8 @@ pub(crate) async fn node_replace_executor(h: &mut Harness) -> anyhow::Result<()>
     h.lifecycle.provision_node(name).await?;
     h.follow(contract)?;
     consul_has_address(h, &control, name, &new.ip.to_string()).await?;
-    h.assert_count("executor", 3, h.knobs.reschedule_slo).await?;
+    h.assert_count("executor", 3, h.knobs.reschedule_slo)
+        .await?;
     h.assert_executor_progress(Duration::from_secs(180)).await?;
     crate::log(format!(
         "node-replace: executor placed on the new {name}; waiting for it to catch up from empty disks"
