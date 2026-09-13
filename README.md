@@ -105,7 +105,7 @@ features; launch your editor from a shell where `JAVA_HOME` is set so the
 | `just check-aeron`       | Targeted check that just the Aeron bindings compile. |
 | `just aeron-driver-up`   | Start a host-native Aeron Media Driver (jar cached locally). |
 | `just aeron-driver-down` | Stop the Media Driver started by `aeron-driver-up`. |
-| `just cluster-bootstrap` | Install the HOST tools for the `deploy/cluster/` workflow (Vagrant, Ansible, Docker…). |
+| `just cluster-bootstrap` | Install the HOST tools for the `deploy/cluster/` workflow (Ansible, Docker, OpenTofu, the Nomad CLI). |
 | `just cluster-doctor`    | Check the host has everything `deploy/cluster/` needs. |
 
 All build/test recipes set `JAVA_HOME` to a detected JDK 17+ automatically.
