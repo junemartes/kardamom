@@ -57,6 +57,31 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
             }
         }
     }
+
+    /// Encode many refs as one batch frame and offer it. Returns the
+    /// accepted count and, on failure, the error for the whole batch.
+    fn offer_batch(
+        &mut self,
+        many: &[(TxRef, alloy_primitives::Address, u64)],
+    ) -> (usize, Option<SequencerError>) {
+        let entries: Vec<Vec<u8>> = many
+            .iter()
+            .map(|(r, sender, nonce)| wire::encode_ingress_txref(r, *sender, *nonce))
+            .collect();
+        let frame = match wire::encode_ingress_batch(&entries) {
+            Ok(frame) => frame,
+            Err(err) => {
+                return (
+                    0,
+                    Some(SequencerError::EncodeFailed(format!("batch: {err}"))),
+                );
+            }
+        };
+        match self.offer(&frame) {
+            Ok(()) => (many.len(), None),
+            Err(e) => (0, Some(e)),
+        }
+    }
 }
 
 impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I> {
@@ -80,22 +105,7 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
                 Ok(()) => (1, None),
                 Err(e) => (0, Some(e)),
             },
-            many => {
-                let entries: Vec<Vec<u8>> = many
-                    .iter()
-                    .map(|(r, sender, nonce)| wire::encode_ingress_txref(r, *sender, *nonce))
-                    .collect();
-                match wire::encode_ingress_batch(&entries) {
-                    Ok(frame) => match self.offer(&frame) {
-                        Ok(()) => (many.len(), None),
-                        Err(e) => (0, Some(e)),
-                    },
-                    Err(err) => (
-                        0,
-                        Some(SequencerError::EncodeFailed(format!("batch: {err}"))),
-                    ),
-                }
-            }
+            many => self.offer_batch(many),
         }
     }
 

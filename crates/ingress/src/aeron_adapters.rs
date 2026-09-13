@@ -96,15 +96,31 @@ trait PumpSource: Send + 'static {
     fn next_item(&mut self) -> impl Future<Output = Option<Self::Item>> + Send;
 }
 
-/// Spawns one broadcast fan-out pump. Drains `source` into `tx` until the
-/// source closes, on `AeronRuntime` shutdown. A lagging or absent receiver
-/// is the broadcast channel's concern, so this ignores the send result.
-fn spawn_pump<S: PumpSource>(mut source: S, tx: broadcast::Sender<S::Item>) {
-    tokio::spawn(async move {
-        while let Some(item) = source.next_item().await {
-            let _ = tx.send(item);
+/// One broadcast fan-out pump: the pull source and the bus it drains
+/// into.
+struct Pump<S: PumpSource> {
+    source: S,
+    tx: broadcast::Sender<S::Item>,
+}
+
+impl<S: PumpSource> Pump<S> {
+    fn new(source: S, tx: broadcast::Sender<S::Item>) -> Self {
+        Self { source, tx }
+    }
+
+    /// Start the pump on the runtime. It ends when the source closes, on
+    /// `AeronRuntime` shutdown.
+    fn spawn(self) {
+        tokio::spawn(self.run());
+    }
+
+    /// Drain the source into the bus. A lagging or absent receiver is the
+    /// broadcast channel's concern, so this ignores the send result.
+    async fn run(mut self) {
+        while let Some(item) = self.source.next_item().await {
+            let _ = self.tx.send(item);
         }
-    });
+    }
 }
 
 /// Generic `PumpSource` over a raw tokio `UnboundedReceiver<(BPosition,
@@ -192,7 +208,7 @@ impl LiveIngressSubscription {
         // `into_receiver()`: the pump task must not hold an
         // `AeronRuntime` clone. Holding one would keep the runtime alive
         // forever; see `TxReceiptsSubscriberHandle::into_receiver`.
-        spawn_pump(receipts_sub.into_receiver(), receipts_tx.clone());
+        Pump::new(receipts_sub.into_receiver(), receipts_tx.clone()).spawn();
 
         // Quorum and durable watermark: in the cluster-only topology,
         // there is no Aeron `quorum_watermark` subscription here. The
@@ -202,7 +218,7 @@ impl LiveIngressSubscription {
         // This is the per-recorder fsync watermark.
         let fsync_sub = FsyncWatermarkSubscriberHandle::open(rt, channels, recorder_id)
             .map_err(|e| IngressError::internal("open fsync watermark", e))?;
-        spawn_pump(fsync_sub, local_fsync_tx.clone());
+        Pump::new(fsync_sub, local_fsync_tx.clone()).spawn();
 
         // This is the tx_receipts to BlockBoundary fan-out, the
         // `tx_receipts_stream_id + 1` side stream. It uses the same MDS
@@ -212,12 +228,12 @@ impl LiveIngressSubscription {
         let boundary_sub =
             TxReceiptsBoundarySubscriberHandle::open_auto(rt, channels, executor_count)
                 .map_err(|e| IngressError::internal("open tx_receipts boundaries", e))?;
-        spawn_pump(boundary_sub, block_boundaries_tx.clone());
+        Pump::new(boundary_sub, block_boundaries_tx.clone()).spawn();
 
         // This is the tx_errors to TxError fan-out.
         let errors_sub = TxErrorsSubscriberHandle::open(rt, channels)
             .map_err(|e| IngressError::internal("open tx_errors", e))?;
-        spawn_pump(errors_sub, tx_errors_tx.clone());
+        Pump::new(errors_sub, tx_errors_tx.clone()).spawn();
 
         Ok(Self {
             receipts: receipts_tx,
@@ -276,7 +292,7 @@ mod tests {
             let (bus, _) = broadcast::channel::<u64>(16);
             let sub_a = bus.subscribe();
             let sub_b = bus.subscribe();
-            spawn_pump(src_rx, bus.clone());
+            Pump::new(src_rx, bus.clone()).spawn();
 
             let pos = BPosition {
                 term_id: 0,
