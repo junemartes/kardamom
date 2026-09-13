@@ -6,6 +6,7 @@
 mod churn;
 mod semantics;
 mod soak;
+mod state;
 mod verdict;
 
 use std::time::Duration;
@@ -14,7 +15,6 @@ use crate::harness::Harness;
 use crate::rpc::Rpc;
 
 pub use churn::CHURN_ACCOUNT;
-pub use verdict::VerdictMode;
 
 /// The funded account of the smoke gate.
 pub const GATE_ACCOUNT: u32 = 0;

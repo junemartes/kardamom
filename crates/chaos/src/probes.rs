@@ -217,6 +217,22 @@ impl Probes {
         metrics::sum(&body, INGRESS_RECEIVED_METRIC)
     }
 
+    /// A baseline includes both ingress replicas. An absent received counter
+    /// is zero only when the same scrape has the initialized shard-map gauge.
+    pub(crate) async fn ingress_baseline(&self) -> Option<i64> {
+        let mut total = 0_i64;
+        for node in &self.ingresses {
+            total = total.checked_add(self.ingress_baseline_node(node).await?)?;
+        }
+        (!self.ingresses.is_empty()).then_some(total)
+    }
+
+    async fn ingress_baseline_node(&self, node: &Probed) -> Option<i64> {
+        let body = self.scrape.fetch(&self.ingress_target(node)).await?;
+        metrics::first(&body, "kardamom_ingress_shard_map_version")?;
+        Some(metrics::sum(&body, INGRESS_RECEIVED_METRIC).unwrap_or(0))
+    }
+
     /// One validator metric, first sample. `None` on a failed scrape.
     pub async fn val_metric(&self, metric: &str) -> Option<i64> {
         let body = self.scrape.fetch(&self.validator_target()).await?;

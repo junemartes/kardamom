@@ -9,7 +9,9 @@ use anyhow::Context;
 use serde::Deserialize;
 
 mod job;
+mod saved_job;
 pub(crate) use job::Job;
+pub(crate) use saved_job::SavedJob;
 
 /// The log streams to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +153,7 @@ impl Nomad {
             .allocations(job)
             .await?
             .into_iter()
-            .filter(Alloc::is_running)
+            .filter(|a| a.is_running() && a.desired_status == "run")
             .collect())
     }
 
