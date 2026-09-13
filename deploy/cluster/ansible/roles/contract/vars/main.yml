@@ -4,12 +4,12 @@ contract_mirrors:
     required:
       - provision_hosts | default('all')
     forbidden: []
-  - path: deploy/cluster/Makefile
+  - path: deploy/cluster/justfile
     required:
-      - tofu -chdir=$(TF_CONTAINERS) apply
-      - REGISTRY := {{ registry_host }}:{{ registry_port }}
-      - NOMAD_HTTP := {{ ports.nomad_http }}
-      - TAG := {{ image_tag }}
+      - tofu -chdir="$TF_CONTAINERS" apply
+      - export REGISTRY := env('REGISTRY', '{{ registry_host }}:{{ registry_port }}')
+      - export NOMAD_HTTP := env('NOMAD_HTTP', '{{ ports.nomad_http }}')
+      - export TAG := env('TAG', '{{ image_tag }}')
     forbidden:
       - site.yml
   - path: deploy/cluster/ansible/containers.yml

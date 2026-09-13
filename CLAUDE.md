@@ -4,6 +4,11 @@ An Ethereum rollup framework. The Rust workspace is under `crates/`, the zk gues
 `guest/`, the Java sealer under `cluster/sealer-service/`, Solidity under `contracts/`.
 See `README.md` for the build and `docs/failure-modes.md` for the failure model.
 
+## Task commands
+
+Use justfiles for repository task commands. Do not add Makefiles or invoke make
+for repository tasks. External native dependencies may require Make through CMake.
+
 ## Style
 
 Every change follows `docs/STYLE.md`. Read it before you write code. The sixteen rules
