@@ -3,7 +3,7 @@
 
 use kardamom_da_watcher::publisher::fakes::InMemoryEpochPublisher;
 use kardamom_da_watcher::source::fakes::MockL1Source;
-use kardamom_da_watcher::{L1SourceError, LockboxLog, MonitorError, process_once};
+use kardamom_da_watcher::{DaWatcherConfig, L1SourceError, L1Watcher, LockboxLog, MonitorError};
 
 use alloy_primitives::U256;
 use alloy_primitives::{Address, B256, address};
@@ -13,6 +13,25 @@ use kardamom_types::epoch::{
 
 fn lockbox() -> Address {
     address!("0000000000000000000000000000000000C0DE01")
+}
+
+/// A watcher over the scripted source, resumed at `cursor`. The
+/// publisher is cloned in, so the test keeps its own handle on the
+/// published records.
+fn watcher(
+    pub_: &InMemoryEpochPublisher,
+    src: MockL1Source,
+    cursor: Option<u64>,
+) -> L1Watcher<MockL1Source, InMemoryEpochPublisher> {
+    L1Watcher::new(
+        pub_.clone(),
+        src,
+        DaWatcherConfig {
+            lockbox: lockbox(),
+            poll_interval: std::time::Duration::from_secs(1),
+        },
+    )
+    .resume_at(cursor)
 }
 
 /// A log in L1 block `number`, whose hash is the mock's filler for that
@@ -46,12 +65,10 @@ async fn seed_call_returns_zero_and_advances_cursor() {
     let pub_ = InMemoryEpochPublisher::default();
     let src = MockL1Source::new();
     src.push_tip(Ok(100));
-    let mut cursor = None;
-    let n = process_once(&pub_, &src, lockbox(), &mut cursor)
-        .await
-        .unwrap();
+    let mut w = watcher(&pub_, src, None);
+    let n = w.process_once().await.unwrap();
     assert_eq!(n, 0);
-    assert_eq!(cursor, Some(100));
+    assert_eq!(w.cursor(), Some(100));
     assert!(pub_.published.lock().unwrap().is_empty());
 }
 
@@ -64,11 +81,9 @@ async fn an_upgrade_log_becomes_a_system_deposit_in_its_epoch() {
     let src = MockL1Source::new();
     src.push_tip(Ok(201));
     src.push_logs(Ok(vec![upg_log(201, 0, 1, 0)]));
-    let mut cursor = Some(200);
+    let mut w = watcher(&pub_, src, Some(200));
 
-    let n = process_once(&pub_, &src, lockbox(), &mut cursor)
-        .await
-        .unwrap();
+    let n = w.process_once().await.unwrap();
 
     assert_eq!(n, 1);
     let v = pub_.published.lock().unwrap();
@@ -98,11 +113,9 @@ async fn deposits_and_upgrades_share_one_epoch_in_log_order() {
         upg_log(301, 1, 7, 1_700_000_000_250),
         dep_log(301, 0, 100),
     ]));
-    let mut cursor = Some(300);
+    let mut w = watcher(&pub_, src, Some(300));
 
-    process_once(&pub_, &src, lockbox(), &mut cursor)
-        .await
-        .unwrap();
+    w.process_once().await.unwrap();
 
     let v = pub_.published.lock().unwrap();
     let kinds: Vec<bool> = v[0]
@@ -131,14 +144,12 @@ async fn one_epoch_per_l1_block_with_deposits_grouped_by_block() {
         dep_log(151, 1, 200),
         dep_log(153, 5, 300),
     ]));
-    let mut cursor = Some(150);
+    let mut w = watcher(&pub_, src, Some(150));
 
-    let n = process_once(&pub_, &src, lockbox(), &mut cursor)
-        .await
-        .unwrap();
+    let n = w.process_once().await.unwrap();
 
     assert_eq!(n, 3, "one epoch per block in (150, 153]");
-    assert_eq!(cursor, Some(153));
+    assert_eq!(w.cursor(), Some(153));
     let v = pub_.published.lock().unwrap();
     assert_eq!(
         v.iter().map(|e| e.l1_number).collect::<Vec<_>>(),
@@ -173,11 +184,9 @@ async fn depositless_range_still_emits_every_epoch() {
     let src = MockL1Source::new();
     src.push_tip(Ok(105));
     src.push_logs(Ok(vec![]));
-    let mut cursor = Some(100);
+    let mut w = watcher(&pub_, src, Some(100));
 
-    let n = process_once(&pub_, &src, lockbox(), &mut cursor)
-        .await
-        .unwrap();
+    let n = w.process_once().await.unwrap();
 
     assert_eq!(n, 5);
     let v = pub_.published.lock().unwrap();
@@ -193,12 +202,10 @@ async fn not_finalized_surfaces_distinct_error_no_cursor_advance() {
     let pub_ = InMemoryEpochPublisher::default();
     let src = MockL1Source::new();
     src.push_tip(Err(L1SourceError::NotFinalized));
-    let mut cursor = None;
-    let err = process_once(&pub_, &src, lockbox(), &mut cursor)
-        .await
-        .unwrap_err();
+    let mut w = watcher(&pub_, src, None);
+    let err = w.process_once().await.unwrap_err();
     assert!(matches!(err, MonitorError::NotFinalized));
-    assert!(cursor.is_none());
+    assert!(w.cursor().is_none());
 }
 
 #[tokio::test]
@@ -206,12 +213,10 @@ async fn tip_below_cursor_is_noop() {
     let pub_ = InMemoryEpochPublisher::default();
     let src = MockL1Source::new();
     src.push_tip(Ok(50));
-    let mut cursor = Some(100);
-    let n = process_once(&pub_, &src, lockbox(), &mut cursor)
-        .await
-        .unwrap();
+    let mut w = watcher(&pub_, src, Some(100));
+    let n = w.process_once().await.unwrap();
     assert_eq!(n, 0);
-    assert_eq!(cursor, Some(100));
+    assert_eq!(w.cursor(), Some(100));
 }
 
 #[tokio::test]
@@ -221,12 +226,10 @@ async fn backpressure_holds_cursor_so_next_tick_retries() {
     let src = MockL1Source::new();
     src.push_tip(Ok(200));
     src.push_logs(Ok(vec![dep_log(200, 0, 100)]));
-    let mut cursor = Some(150);
-    let n = process_once(&pub_, &src, lockbox(), &mut cursor)
-        .await
-        .unwrap();
+    let mut w = watcher(&pub_, src, Some(150));
+    let n = w.process_once().await.unwrap();
     assert_eq!(n, 0); // The first publish was backpressured, so the loop returned early.
-    assert_eq!(cursor, Some(150)); // The cursor did not advance.
+    assert_eq!(w.cursor(), Some(150)); // The cursor did not advance.
 }
 
 /// Once `published` reaches 2 entries, trip `flag` and report done.
@@ -250,7 +253,7 @@ async fn partial_range_resumes_at_the_first_unpublished_block() {
     let src = MockL1Source::new();
     src.push_tip(Ok(104));
     src.push_logs(Ok(vec![]));
-    let mut cursor = Some(100);
+    let mut w = watcher(&pub_, src, Some(100));
 
     // Let 101 and 102 through, then jam the transport.
     let flag = pub_.fail_with_backpressure.clone();
@@ -263,13 +266,11 @@ async fn partial_range_resumes_at_the_first_unpublished_block() {
             || Ok(trip_backpressure_once_published(&published, &flag).then_some(())),
         );
     });
-    let n = process_once(&pub_, &src, lockbox(), &mut cursor)
-        .await
-        .unwrap();
+    let n = w.process_once().await.unwrap();
 
     assert!((1..=4).contains(&n));
     // Whatever it managed, the cursor names the last block it published.
-    assert_eq!(cursor, Some(100 + n as u64));
+    assert_eq!(w.cursor(), Some(100 + n as u64));
 }
 
 /// A log whose block hash disagrees with the hash fetched for that block
@@ -290,14 +291,12 @@ async fn log_disagreeing_with_the_block_hash_is_rejected() {
         gas_limit: 100,
         data: alloy_primitives::Bytes::new(),
     })]));
-    let mut cursor = Some(150);
+    let mut w = watcher(&pub_, src, Some(150));
 
-    let err = process_once(&pub_, &src, lockbox(), &mut cursor)
-        .await
-        .unwrap_err();
+    let err = w.process_once().await.unwrap_err();
 
     assert!(matches!(err, MonitorError::Derive(_)));
-    assert_eq!(cursor, Some(150), "cursor must not pass a bad epoch");
+    assert_eq!(w.cursor(), Some(150), "cursor must not pass a bad epoch");
     assert!(pub_.published.lock().unwrap().is_empty());
 }
 
@@ -308,12 +307,10 @@ async fn block_hash_failure_stops_the_range() {
     src.push_tip(Ok(151));
     src.push_logs(Ok(vec![]));
     *src.block_hash_fails.lock().unwrap() = true;
-    let mut cursor = Some(150);
+    let mut w = watcher(&pub_, src, Some(150));
 
-    let err = process_once(&pub_, &src, lockbox(), &mut cursor)
-        .await
-        .unwrap_err();
+    let err = w.process_once().await.unwrap_err();
 
     assert!(matches!(err, MonitorError::BlockHash(_)));
-    assert_eq!(cursor, Some(150));
+    assert_eq!(w.cursor(), Some(150));
 }

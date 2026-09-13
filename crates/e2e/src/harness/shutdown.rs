@@ -156,18 +156,8 @@ impl LocalStack {
         else {
             return Ok(false);
         };
-        let val_block = match val_addr {
-            // No validator: treat its half as already settled.
-            None => exec_block,
-            Some(addr) => {
-                let Some(v) = super::metrics::scrape(addr)
-                    .await?
-                    .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK)
-                else {
-                    return Ok(false);
-                };
-                v
-            }
+        let Some(val_block) = self.validator_block(val_addr, exec_block).await? else {
+            return Ok(false);
         };
         #[allow(
             clippy::float_cmp,
@@ -179,6 +169,23 @@ impl LocalStack {
         *last_exec = exec_block;
         *last_val = val_block;
         Ok(stable && val_block >= exec_block)
+    }
+
+    /// The validator's committed-block gauge, or `exec_block` when
+    /// `val_addr` is `None` (no validator: its half is already
+    /// settled). `None` when the validator's metric has not registered
+    /// yet.
+    async fn validator_block(
+        &self,
+        val_addr: Option<SocketAddr>,
+        exec_block: f64,
+    ) -> Result<Option<f64>> {
+        let Some(addr) = val_addr else {
+            return Ok(Some(exec_block));
+        };
+        Ok(super::metrics::scrape(addr)
+            .await?
+            .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK))
     }
 
     pub(super) fn dump_tails(&self) {

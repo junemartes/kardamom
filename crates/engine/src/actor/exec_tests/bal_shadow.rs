@@ -114,5 +114,5 @@ fn exec_hands_off_shadow_captures_at_boundary() {
 
     // The handed-off shape feeds the grading path end-to-end. Native
     // transfers are tier-1 (never cold); the same sender gives one chain.
-    crate::shadow::Shadow::new().process_block(blk);
+    crate::shadow::Shadow::new(crossbeam_channel::bounded(1).1).process_block(blk);
 }

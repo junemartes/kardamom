@@ -16,7 +16,7 @@ use super::wiring::{ExecPorts, SnapshotDb};
 
 /// The optional role-specific hooks `ExecState` carries: BAL capture,
 /// footprint-shadow capture, a whole-block execution strategy, and the two
-/// epoch observers. Grouped so `ExecInputs` and `spawn_exec` pass one value
+/// epoch observers. Grouped so `ExecInputs` and `ExecState::spawn` pass one value
 /// instead of five loose parameters.
 pub(crate) struct ExecHooks<W: ExecPorts> {
     pub(super) bal_tx: Option<Sender<BalHandoff>>,
@@ -26,7 +26,7 @@ pub(crate) struct ExecHooks<W: ExecPorts> {
     pub(super) remote_epoch_observer: Option<W::RemoteEpoch>,
 }
 
-/// Every input [`ExecState::new`] and `spawn_exec` need: the config, the
+/// Every input [`ExecState::new`] and [`ExecState::spawn`] need: the config, the
 /// two channels, the three storage ports, the resume cursor, and the
 /// optional hooks. `Executor::run` builds one of these from the grouped
 /// `Outbound`/`RoleHooks` it already destructures, instead of forwarding
@@ -42,10 +42,10 @@ pub(crate) struct ExecInputs<W: ExecPorts> {
     pub(super) hooks: ExecHooks<W>,
 }
 
-/// The exec thread's mutable loop state. Each `spawn_exec` thread has one
+/// The exec thread's mutable loop state. Each [`ExecState::spawn`] thread has one
 /// instance. Each `ReaderToExec` arm is one method, split across
 /// `exec_records.rs`, `exec_markers.rs`, and `exec_boundary.rs`.
-pub(super) struct ExecState<W: ExecPorts> {
+pub(crate) struct ExecState<W: ExecPorts> {
     pub(super) cfg: ExecutorConfig,
     pub(super) rx: Receiver<ReaderToExec>,
     pub(super) tx: Sender<ExecToCommit>,
