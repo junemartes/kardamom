@@ -228,9 +228,13 @@ impl Opened {
         let interop_serve = self.open_interop_serve(feed_resume_block);
 
         // One token stops every pump. It is cancelled BEFORE `rt` drops
-        // (see `pumps::spawn_bal_pump` for the runtime-clone deadlock it
-        // prevents).
-        let pump_shutdown = tokio_util::sync::CancellationToken::new();
+        // (see `pumps::BalPump` for the runtime-clone deadlock it
+        // prevents). It is a child of the plane's discovery token, so the
+        // one stop guard in `run` ends the discovery tasks and the pumps
+        // together. A static plane hands out a private parent nothing
+        // else listens to.
+        let stop = self.base.plane.cancellation();
+        let pump_shutdown = stop.child_token();
 
         // Flight ring: recent block inputs for the receipt-divergence
         // dump. Always on, since the receipt check runs on the sequential
@@ -247,6 +251,7 @@ impl Opened {
                 claims,
                 receipts,
                 interop_serve,
+                stop,
                 pump_shutdown,
                 flight,
             },
@@ -300,6 +305,9 @@ pub(crate) struct StreamsState {
     pub(super) claims: Arc<ClaimBuffer>,
     pub(super) receipts: Arc<ReceiptBuffer>,
     pub(super) interop_serve: Option<InteropServe>,
+    /// The parent of `pump_shutdown`: the plane's discovery token. The
+    /// stop guard in `run` cancels it, and the pumps stop with it.
+    pub(super) stop: tokio_util::sync::CancellationToken,
     pub(super) pump_shutdown: tokio_util::sync::CancellationToken,
     pub(super) flight: Arc<FlightRing>,
 }

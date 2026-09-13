@@ -17,6 +17,7 @@ use std::time::Instant;
 use kardamom_types::{BlockBoundary, SnapshotSource};
 use tracing::debug;
 
+use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 
 use super::exec_thread::{ExecState, Flow};
@@ -71,15 +72,24 @@ impl<W: ExecPorts> ExecState<W> {
                 "{msg}"
             );
             self.snapshot = self.snapshots.snapshot_after(n);
-            self.parent = self.inflight.iter().fold(None, |acc, (_, d)| match acc {
-                None => Some(d.clone()),
-                Some(mut m) => {
-                    m.merge_from(d);
-                    Some(m)
-                }
-            });
+            self.parent = self
+                .inflight
+                .iter()
+                .fold(None, |acc, (_, d)| Some(Self::merge_into_parent(acc, d)));
         }
         Flow::Continue
+    }
+
+    /// Merges one unsettled delta into the rebuilt parent accumulator.
+    ///
+    /// Returns the accumulator with `d` merged in. The first delta clones
+    /// into a fresh accumulator. Every later delta merges into the clone.
+    fn merge_into_parent(acc: Option<PendingDelta>, d: &PendingDelta) -> PendingDelta {
+        let Some(mut merged) = acc else {
+            return d.clone();
+        };
+        merged.merge_from(d);
+        merged
     }
 
     /// Forward `b` to the commit thread. Returns its block number on

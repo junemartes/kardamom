@@ -112,14 +112,33 @@ enum Drained {
     Closed,
 }
 
-/// Drains the exec-to-commit channel into adaptive receipt batches, and
-/// must-deliver publishes each one on `tx_receipts`.
-struct CommitLoop<C> {
+/// The commit thread's state: the `tx_receipts` publication and the
+/// exec-to-commit channel it drains into adaptive receipt batches.
+pub(crate) struct CommitLoop<C> {
     tx_receipts_pub: C,
     rx: Receiver<ExecToCommit>,
 }
 
-impl<C: TxReceiptsPublication> CommitLoop<C> {
+impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
+    pub(crate) fn new(tx_receipts_pub: C, rx: Receiver<ExecToCommit>) -> Self {
+        Self {
+            tx_receipts_pub,
+            rx,
+        }
+    }
+
+    /// Spawn the commit thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS refuses to spawn the thread.
+    pub(crate) fn spawn(self) -> JoinHandle<Result<(), ExecutorError>> {
+        thread::Builder::new()
+            .name("executor-commit".into())
+            .spawn(move || self.run())
+            .expect("spawn commit")
+    }
+
     /// Block for the next message. Then drain any other queued messages
     /// into one batch (adaptive batching). The batch size matches the
     /// arrivals during the previous publish: 1 at a low rate, larger under
@@ -231,28 +250,4 @@ impl<C: TxReceiptsPublication> CommitLoop<C> {
         }
         Ok(batch.closed)
     }
-}
-
-/// Spawn the commit thread.
-///
-/// # Panics
-///
-/// Panics if the OS refuses to spawn the thread.
-pub(crate) fn spawn_commit<C>(
-    tx_receipts_pub: C,
-    rx: Receiver<ExecToCommit>,
-) -> JoinHandle<Result<(), ExecutorError>>
-where
-    C: TxReceiptsPublication + 'static,
-{
-    thread::Builder::new()
-        .name("executor-commit".into())
-        .spawn(move || {
-            CommitLoop {
-                tx_receipts_pub,
-                rx,
-            }
-            .run()
-        })
-        .expect("spawn commit")
 }

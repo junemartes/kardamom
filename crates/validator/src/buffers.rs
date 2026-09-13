@@ -329,7 +329,7 @@ impl ClaimBuffer {
     /// validator's view of the ladder must come from the wire, from what
     /// the executor actually produced, never from local config. Zero is
     /// never a legal granularity; the caller parses it once, at the wire
-    /// boundary (`bin/kardamom-validator/pumps.rs::index_claims`), so it
+    /// boundary (`bin/kardamom-validator/pumps.rs`, `BalPump::index_claims`), so it
     /// is already a `NonZeroU16` by the time it reaches here.
     pub fn insert(&self, block: u64, granularity: NonZeroU16, claims: crate::parallel::ClaimIndex) {
         self.core.insert(block, (granularity, Arc::new(claims)));
