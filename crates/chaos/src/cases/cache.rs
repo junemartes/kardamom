@@ -9,6 +9,9 @@
 //! read through the ingress RPC is one such miss, so the cases drive the
 //! reader counters with a probe read per poll step, and never depend on
 //! the load's senders missing the local layer.
+//!
+//! The primary moves: a promotion leaves it on the replica's node. Every
+//! case asks the sentinels where the primary is before it acts.
 
 use std::time::Duration;
 
@@ -25,13 +28,18 @@ const LOOKUPS: &str = "kardamom_cache_lookups_total";
 const REDIS_LAYER: &str = "layer=\"redis\"";
 const MIRROR_HEAD: &str = "kardamom_state_mirror_head_tx_idx";
 const MIRROR_REBUILDS: &str = "kardamom_state_mirror_rebuilds_total";
-/// Longer than the sentinels' `down-after-milliseconds` (5 s) plus the
-/// election, so a freeze forces a promotion.
-const PRIMARY_FREEZE: Duration = Duration::from_secs(20);
+/// How long the sentinels get to promote the replica of a frozen
+/// primary: their `down-after-milliseconds` (5 s), the election, and
+/// slack. The freeze lasts until the promotion is observed.
+const PROMOTION_BUDGET: Duration = Duration::from_secs(60);
 /// The redis job: one primary, one replica, three sentinels.
 const REDIS_ALLOCS: usize = 5;
 /// The mirror job: one mirror per executor node.
 const MIRROR_ALLOCS: usize = 3;
+/// The ports ingress-0 drops in the partition case: Redis, then the
+/// sentinels. One rule per port; a multiport match needs a kernel
+/// module the host may lack.
+const REDIS_PORTS: [u16; 2] = [6379, 26379];
 
 /// The reader counters of the ingress pair: degraded reads and Redis
 /// lookups of any outcome.
@@ -197,27 +205,37 @@ async fn wait_mirror_advances(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The aux node, which runs the primary and one sentinel.
+/// The aux node, which runs one sentinel: the cases' Redis console.
 fn aux(h: &Harness) -> String {
     h.probes.validator.container.clone()
 }
 
-/// The primary's inner container on the aux node.
-async fn primary_container(h: &Harness, ctx: &str) -> anyhow::Result<String> {
-    h.nodes
-        .inner_cid(&aux(h), "redis-")
-        .await
-        .ok_or_else(|| crate::chaos_fail!("{ctx}: no inner redis container on {}", aux(h)))
+/// A `redis-cli` call through the aux node's sentinel container.
+fn redis_cli(args: &str) -> String {
+    format!("docker exec $(docker ps --filter name=sentinel- -q | head -1) redis-cli {args}")
 }
 
-/// Ask the aux node's sentinel who the primary is: the host of
-/// `SENTINEL get-master-addr-by-name`.
+/// Ask the sentinels who the primary is: the host of
+/// `SENTINEL get-master-addr-by-name`, such as `aux-0.node.dc1.consul`
+/// (the sentinels announce hostnames).
 async fn sentinel_master(h: &Harness) -> anyhow::Result<String> {
-    let script = "docker exec $(docker ps --filter name=sentinel- -q | head -1) \
-                  redis-cli -p 26379 SENTINEL get-master-addr-by-name kardamom | head -1";
-    let host = h.nodes.exec(&aux(h), script).await?;
+    let script = redis_cli("-p 26379 SENTINEL get-master-addr-by-name kardamom | head -1");
+    let host = h.nodes.exec(&aux(h), &script).await?;
     anyhow::ensure!(!host.is_empty(), "the sentinel named no primary");
     Ok(host)
+}
+
+/// The primary's node container and inner container, from the host the
+/// sentinels name: its first label is the node name.
+async fn primary_on(h: &Harness, ctx: &str, master: &str) -> anyhow::Result<(String, String)> {
+    let name = master.split('.').next().unwrap_or(master);
+    let node = h.container(name)?;
+    let cid = h
+        .nodes
+        .inner_cid(&node, "redis-")
+        .await
+        .ok_or_else(|| crate::chaos_fail!("{ctx}: no inner redis container on {node}"))?;
+    Ok((node, cid))
 }
 
 /// The primary frozen past the sentinels' down-after: the readers
@@ -227,18 +245,17 @@ async fn sentinel_master(h: &Harness) -> anyhow::Result<String> {
 pub(crate) async fn redis_primary_freeze(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "redis-primary-freeze";
     wait_readers_connected(h, ctx).await?;
-    let node = aux(h);
-    let primary = primary_container(h, ctx).await?;
     let master0 = sentinel_master(h).await?;
+    let (node, primary) = primary_on(h, ctx, &master0).await?;
     crate::log(format!(
-        "{ctx}: primary {master0} ({primary} on {node}); freezing it for {}s",
-        PRIMARY_FREEZE.as_secs()
+        "{ctx}: primary {master0} ({primary} on {node}); frozen until the sentinels promote (budget {}s)",
+        PROMOTION_BUDGET.as_secs()
     ));
     h.nodes
         .inner_signal(&node, &primary, crate::nodes::Signal::Stop)
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: SIGSTOP failed: {e}"))?;
-    let frozen = frozen_phase(h, ctx, &master0).await;
+    let frozen = frozen_phase(h, ctx, &node, &primary, &master0).await;
     let _ = h
         .nodes
         .inner_signal(&node, &primary, crate::nodes::Signal::Cont)
@@ -251,12 +268,17 @@ pub(crate) async fn redis_primary_freeze(h: &mut Harness) -> anyhow::Result<()> 
 
 /// The frozen half of [`redis_primary_freeze`]: the freeze took, the
 /// readers degrade, the pipeline progresses, the sentinels promote.
-async fn frozen_phase(h: &Harness, ctx: &str, master0: &str) -> anyhow::Result<()> {
-    let primary = primary_container(h, ctx).await?;
+async fn frozen_phase(
+    h: &Harness,
+    ctx: &str,
+    node: &str,
+    primary: &str,
+    master0: &str,
+) -> anyhow::Result<()> {
     let answers = h
         .nodes
         .exec_status(
-            &aux(h),
+            node,
             &format!("timeout 2 docker exec {primary} redis-cli ping"),
         )
         .await?;
@@ -267,7 +289,7 @@ async fn frozen_phase(h: &Harness, ctx: &str, master0: &str) -> anyhow::Result<(
     wait_readers_degraded(h, ctx).await?;
     h.assert_progress().await?;
     let outcome = poll::until(
-        Budget::new(PRIMARY_FREEZE * 3, Duration::from_secs(3)),
+        Budget::new(PROMOTION_BUDGET, Duration::from_secs(3)),
         |_| async move {
             let master = sentinel_master(h).await?;
             Ok::<_, anyhow::Error>((master != master0).then_some(master))
@@ -293,7 +315,9 @@ async fn frozen_phase(h: &Harness, ctx: &str, master0: &str) -> anyhow::Result<(
 pub(crate) async fn redis_primary_kill(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "redis-primary-kill";
     wait_readers_connected(h, ctx).await?;
-    let node = aux(h);
+    let master = sentinel_master(h).await?;
+    let (node, _) = primary_on(h, ctx, &master).await?;
+    crate::log(format!("{ctx}: primary {master} on {node}"));
     h.inject_hard(&[&node], "redis-").await?;
     wait_readers_degraded(h, ctx).await?;
     h.assert_progress().await?;
@@ -304,9 +328,10 @@ pub(crate) async fn redis_primary_kill(h: &mut Harness) -> anyhow::Result<()> {
     h.assert_progress().await
 }
 
-/// The iptables rule that drops ingress-0's packets to the primary,
-/// the replica, and the sentinels.
-const REDIS_DROP: &str = "OUTPUT -p tcp -m multiport --dports 6379,26379 -j DROP";
+/// The iptables rule that drops ingress-0's packets to `port`.
+fn drop_rule(port: u16) -> String {
+    format!("OUTPUT -p tcp --dport {port} -j DROP")
+}
 
 /// Ingress-0 partitioned from Redis: its reads time out and count as
 /// degraded, its submits still land, and it recovers when the
@@ -315,18 +340,22 @@ pub(crate) async fn redis_partition_ingress(h: &mut Harness) -> anyhow::Result<(
     let ctx = "redis-partition-ingress";
     wait_readers_connected(h, ctx).await?;
     let node = h.probes.ingresses[0].container.clone();
-    h.nodes
-        .exec(&node, &format!("iptables -w 5 -I {REDIS_DROP}"))
-        .await
-        .map_err(|e| crate::chaos_fail!("{ctx}: could not install the drop rule on {node}: {e}"))?;
+    for port in REDIS_PORTS {
+        h.nodes
+            .exec(&node, &format!("iptables -w 5 -I {}", drop_rule(port)))
+            .await
+            .map_err(|e| crate::chaos_fail!("{ctx}: could not drop port {port} on {node}: {e}"))?;
+    }
     crate::log(format!(
         "{ctx}: {node} dropping its Redis and sentinel packets"
     ));
     let partitioned = partitioned_phase(h, ctx).await;
-    let _ = h
-        .nodes
-        .exec(&node, &format!("iptables -w 5 -D {REDIS_DROP}"))
-        .await;
+    for port in REDIS_PORTS {
+        let _ = h
+            .nodes
+            .exec(&node, &format!("iptables -w 5 -D {}", drop_rule(port)))
+            .await;
+    }
     partitioned?;
     crate::log(format!("{ctx}: partition healed on {node}"));
     wait_readers_recovered(h, ctx).await?;
@@ -340,9 +369,9 @@ async fn partitioned_phase(h: &Harness, ctx: &str) -> anyhow::Result<()> {
 
 /// The three mirrors hard-killed and the projection flushed: the
 /// restarted mirrors find Redis cold, rebuild from the executors'
-/// newest checkpoint, and the head advances again. The genesis account
-/// of the smoke transfers proves the rebuild wrote the checkpoint's
-/// accounts, not only the live rows.
+/// newest checkpoint, and the head advances again. The first chaos
+/// account, funded at genesis because the load spends it, proves the
+/// rebuild wrote the checkpoint's accounts, not only the live rows.
 pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "mirror-kill-rebuild";
     wait_readers_connected(h, ctx).await?;
@@ -363,10 +392,7 @@ pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
     h.nodes
         .exec(
             &aux(h),
-            &format!(
-                "docker exec $(docker ps --filter name=sentinel- -q | head -1) \
-                 redis-cli -h {master} -p 6379 FLUSHALL"
-            ),
+            &redis_cli(&format!("-h {master} -p 6379 FLUSHALL")),
         )
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: FLUSHALL on {master} failed: {e}"))?;
@@ -385,27 +411,29 @@ pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
         elapsed.as_secs()
     ));
     wait_mirror_advances(h, ctx).await?;
-    assert_genesis_account_projected(h, ctx, &master).await?;
+    assert_chaos_account_projected(h, ctx, &master).await?;
     wait_readers_recovered(h, ctx).await?;
     h.assert_progress().await
 }
 
-/// The first genesis account has a projected row: the rebuild scanned
-/// the checkpoint, so an account no live batch touched is present.
-async fn assert_genesis_account_projected(
+/// The first chaos account has a projected row: the rebuild scanned
+/// the checkpoint, so an account the flush emptied is present again.
+async fn assert_chaos_account_projected(
     h: &Harness,
     ctx: &str,
     master: &str,
 ) -> anyhow::Result<()> {
-    let address = derive_signers(ANVIL_MNEMONIC, 1)?
+    let count = h
+        .knobs
+        .account_base
+        .checked_add(1)
+        .ok_or_else(|| crate::chaos_fail!("{ctx}: the chaos account index overflows"))?;
+    let address = derive_signers(ANVIL_MNEMONIC, count)?
         .pop()
-        .ok_or_else(|| crate::chaos_fail!("{ctx}: no genesis signer"))?
+        .ok_or_else(|| crate::chaos_fail!("{ctx}: no chaos signer"))?
         .signer
         .address();
-    let script = format!(
-        "docker exec $(docker ps --filter name=sentinel- -q | head -1) \
-         redis-cli -h {master} -p 6379 HLEN acct:{address}"
-    );
+    let script = redis_cli(&format!("-h {master} -p 6379 HLEN acct:{address}"));
     let script = &script;
     let outcome = poll::until(Budget::secs(120, 5), |_| async move {
         let fields: i64 = h
@@ -421,7 +449,7 @@ async fn assert_genesis_account_projected(
     outcome
         .or_fail(|t| {
             crate::chaos_fail!(
-                "{ctx}: genesis account {address} has no projected row within {}s of the rebuild",
+                "{ctx}: chaos account {address} has no projected row within {}s of the rebuild",
                 t.as_secs()
             )
         })
