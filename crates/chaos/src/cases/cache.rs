@@ -216,8 +216,10 @@ fn redis_cli(args: &str) -> String {
 }
 
 /// Ask the sentinels who the primary is: the host of
-/// `SENTINEL get-master-addr-by-name`, such as `aux-0.node.dc1.consul`
-/// (the sentinels announce hostnames).
+/// `SENTINEL get-master-addr-by-name`. The first primary is the node
+/// record the sentinels monitor, `aux-0.node.dc1.consul`. A promoted
+/// replica is the address it replicated from, an IP, because the
+/// replica announces no hostname.
 async fn sentinel_master(h: &Harness) -> anyhow::Result<String> {
     let script = redis_cli("-p 26379 SENTINEL get-master-addr-by-name kardamom | head -1");
     let host = h.nodes.exec(&aux(h), &script).await?;
@@ -225,11 +227,10 @@ async fn sentinel_master(h: &Harness) -> anyhow::Result<String> {
     Ok(host)
 }
 
-/// The primary's node container and inner container, from the host the
-/// sentinels name: its first label is the node name.
+/// The primary's node container and inner container, from the address
+/// the sentinels name: a node record or a cluster IP.
 async fn primary_on(h: &Harness, ctx: &str, master: &str) -> anyhow::Result<(String, String)> {
-    let name = master.split('.').next().unwrap_or(master);
-    let node = h.container(name)?;
+    let node = h.contract.node_at(master)?.container.clone();
     let cid = h
         .nodes
         .inner_cid(&node, "redis-")
