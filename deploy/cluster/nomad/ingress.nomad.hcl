@@ -191,13 +191,6 @@ job "ingress" {
         ]
       }
 
-      env {
-        # The UDP ports the discovered tx_data publications bind on this
-        # node: one control endpoint per lane. Uniqueness comes from the
-        # node IP; one ingress runs per node. See docs/aeron-discovery.md.
-        KARDAMOM_MDC_PORTS = "40300-40319"
-      }
-
       # Presence-checked config. Content lives in config/ingress.toml.
       template {
         destination = "local/ingress.toml"

@@ -121,12 +121,6 @@ job "da-watcher" {
         ]
       }
 
-      env {
-        # The UDP ports the discovered tx_deposits and tx_remote_epochs
-        # publications bind on this node.
-        KARDAMOM_MDC_PORTS = "40330-40339"
-      }
-
       # Cluster LogConfig (Aeron streams and discovery), read through
       # --log-config.
       template {
