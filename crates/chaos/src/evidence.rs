@@ -126,7 +126,7 @@ impl Evidence {
     }
 
     async fn leader_once(&self) -> anyhow::Result<Option<u32>> {
-        let allocs = self.nomad.allocations(CLUSTER_TASK).await?;
+        let allocs = self.nomad.running(CLUSTER_TASK).await?;
         let mut leader = None;
         for alloc in &allocs {
             leader = leader.or(self.leader_of(alloc).await?);

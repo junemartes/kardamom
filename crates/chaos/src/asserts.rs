@@ -111,7 +111,10 @@ impl Harness {
     ///
     /// Returns an error if the gauge never advances.
     pub async fn assert_executor_progress(&self, timeout: Duration) -> anyhow::Result<()> {
-        let e0 = self.probes.executor_progress().await.unwrap_or(0);
+        let e0 = self
+            .progress_sample()
+            .await
+            .ok_or_else(|| crate::chaos_fail!("no executor baseline before progress window"))?;
         let outcome = poll::after_sleep(
             Budget::new(timeout, Duration::from_secs(5)),
             |_| async move {
@@ -148,10 +151,10 @@ impl Harness {
         let outcome = poll::until(budget, |_| async move {
             let (head, standings) = self.fleet_standings().await;
             *last_ref.borrow_mut() = describe(head, &standings);
-            Ok(standings
-                .iter()
-                .all(|s| *s == Standing::Converged)
-                .then_some(head))
+            Ok(
+                (head.is_some() && standings.iter().all(|s| *s == Standing::Converged))
+                    .then_some(head),
+            )
         })
         .await?;
         let (head, elapsed) = outcome.or_fail(|t| {
@@ -245,7 +248,7 @@ impl Harness {
             crate::chaos_fail!("stall assert: no executor gauge scrapeable AFTER the window — cannot observe the stall")
         })?;
         anyhow::ensure!(
-            e1 <= e0,
+            e1 == e0,
             "{}: pipeline UNEXPECTEDLY progressed while quorum lost (executor block {e0} -> {e1})",
             crate::FAIL_PREFIX
         );

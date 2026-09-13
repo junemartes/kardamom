@@ -90,7 +90,11 @@ impl Harness {
         ));
         let account = self.pick_account(case).await?;
         let window = case.window(&self.knobs);
-        let rx0 = self.probes.ingress_received().await.unwrap_or(0);
+        let rx0 = self
+            .probes
+            .ingress_baseline()
+            .await
+            .ok_or_else(|| crate::chaos_fail!("no ingress baseline before load"))?;
         let load = LoadRun::start(&self.load_spec(case, account, window))?;
         let outcome = self.run_body(case, &load, rx0).await;
         if let Err(e) = outcome {
@@ -99,6 +103,8 @@ impl Harness {
         }
         let verdict = load.finish().await?;
         case.judge_load(&verdict)?;
+        self.assert_executors_converged(case.name()).await?;
+        self.validator_verdict().await?;
         crate::log(format!("CHAOS CASE {name}: PASS"));
         Ok(())
     }
@@ -202,34 +208,20 @@ impl Case {
         }
     }
 
-    /// The load verdict by case family. A Raft member kill under load
-    /// causes a brief ordering hiccup: some past-nonce transactions are
-    /// rejected before acceptance, so the cluster cases assert gapless
-    /// delivery of every accepted transaction and tolerate the drops.
-    /// Every other case keeps the strict verdict.
+    /// Chaos mode already tolerates duplicate-submit drops. Every other
+    /// load failure remains fatal, including bad receipts and replica lag.
     fn judge_load(self, verdict: &Verdict) -> anyhow::Result<()> {
-        let name = self.name();
-        if name.starts_with("cluster-") {
-            anyhow::ensure!(
-                verdict.missing == 0,
-                "{}: accepted txs NOT all delivered (missing={}) for case {name}: {:?}",
-                crate::FAIL_PREFIX,
-                verdict.missing,
-                verdict.failures
-            );
-            crate::log(format!(
-                "load OK for case {name}: every ACCEPTED tx receipted (missing=0); seq_dropped {:?} tolerated",
-                verdict.seq_dropped
-            ));
-            return Ok(());
-        }
         anyhow::ensure!(
-            verdict.pass,
-            "{}: load verdict not PASS for case {name}: {:?}",
+            verdict.pass && verdict.missing == 0,
+            "{}: load verdict not PASS for case {}: {:?} (missing={})",
             crate::FAIL_PREFIX,
-            verdict.failures
+            self.name(),
+            verdict.failures,
+            verdict.missing
         );
-        crate::log(format!("load verdict PASS for case {name}"));
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

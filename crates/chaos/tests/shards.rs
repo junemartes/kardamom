@@ -26,7 +26,6 @@
 #![cfg(feature = "cluster-e2e")]
 
 use kardamom_chaos::lifecycle::DeployVars;
-use kardamom_chaos::stages::VerdictMode;
 use kardamom_chaos::{Harness, Knobs, Lifecycle, Shard};
 
 /// The funded account of the smoke gate. A reuse run on a used chain
@@ -110,7 +109,8 @@ async fn run_shard(shard: Shard) -> anyhow::Result<()> {
     }
     kardamom_chaos::log(format!("chaos suite PASSED ({})", cases.join(" ")));
     harness.ingress_churn().await?;
-    harness.validator_verdict(VerdictMode::Progress).await?;
+    harness.validator_verdict().await?;
+    harness.assert_persisted_state().await?;
     kardamom_chaos::log("cluster-e2e PASSED");
     if !reuse() {
         lifecycle.down().await?;
@@ -130,7 +130,8 @@ async fn run_stage(stage: Stage) -> anyhow::Result<()> {
     harness.smoke_gate(gate_account()?).await?;
     stage.run(&harness).await?;
     harness.ingress_churn().await?;
-    harness.validator_verdict(VerdictMode::Sync).await?;
+    harness.validator_verdict().await?;
+    harness.assert_persisted_state().await?;
     kardamom_chaos::log("cluster-e2e PASSED");
     if !reuse() {
         lifecycle.down().await?;

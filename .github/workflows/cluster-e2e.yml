@@ -181,3 +181,14 @@ jobs:
       - name: Collect diagnostics
         if: failure()
         run: make -C deploy/cluster container-diagnostics
+
+      - name: Preserve state and load evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-evidence-${{ matrix.shard }}
+          path: |
+            /tmp/chaos-state-*/**
+            /tmp/chaos-*.json
+          if-no-files-found: ignore
+          retention-days: 3
