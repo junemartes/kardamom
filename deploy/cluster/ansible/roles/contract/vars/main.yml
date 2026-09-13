@@ -1,0 +1,173 @@
+---
+contract_mirrors:
+  - path: deploy/cluster/ansible/bootstrap.yml
+    required:
+      - provision_hosts | default('all')
+    forbidden: []
+  - path: deploy/cluster/Makefile
+    required:
+      - bootstrap.yml
+      - tofu -chdir=$(TF_CONTAINERS) apply
+      - REGISTRY := {{ registry_host }}:{{ registry_port }}
+      - NOMAD_HTTP := {{ ports.nomad_http }}
+      - TAG := {{ image_tag }}
+    forbidden:
+      - site.yml
+  - path: deploy/cluster/Vagrantfile
+    required:
+      - bootstrap.yml
+    forbidden:
+      - site.yml
+  - path: deploy/cluster/ansible/containers.yml
+    required:
+      - bootstrap.yml
+      - node-contract.json
+    forbidden:
+      - site.yml
+  - path: deploy/cluster/ansible/roles/nomad/templates/nomad.hcl.j2
+    required:
+      - server_auto_join
+      - client_auto_join
+      - auto_advertise
+      - server_service_name = "{% raw %}{{ cluster_id }}{% endraw %}-nomad"
+      - '    cluster_id '
+      - '    node_ip '
+      - '    archive_topics '
+    forbidden:
+      - "\n  servers"
+  - path: deploy/cluster/terraform/hetzner/outputs.tf
+    required:
+      - version            = 1
+    forbidden: []
+  - path: deploy/cluster/terraform/containers/main.tf
+    required:
+      - yamldecode(file(local.contract_path))
+    forbidden: []
+  - path: deploy/cluster/terraform/containers/outputs.tf
+    required:
+      - version = 1
+    forbidden: []
+  - path: deploy/cluster/nomad/ingress.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-ingress:{{ image_tag }}'
+      - static = {{ ports.ingress_rpc }}
+      - '"--shards", format("%d", var.partition_count)'
+      - '"--pending-receipt-timeout-ms", format("%d", var.tx_ttl_ms)'
+      - '"--shard-map", "/local/shard-map.toml"'
+      - file("config/shard-map.toml")
+      - --log-config
+      - kill_timeout = format("%ds", ceil(var.tx_ttl_ms / 1000) + 10)
+    forbidden: []
+  - path: deploy/cluster/nomad/sequencer.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-sequencer:{{ image_tag }}'
+      - --log-config
+    forbidden: []
+  - path: deploy/cluster/nomad/executor.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-executor:{{ image_tag }}'
+      - '"{{ chain_id }}"'
+      - '"--nonce-query-addr", "${meta.node_ip}:${var.executor_query_port}"'
+      - 'default     = {{ node_classes.executor.count }}
+
+        }'
+      - --log-config
+    forbidden:
+      - '"--shards"'
+  - path: deploy/cluster/nomad/cluster.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-cluster:{{ image_tag }}'
+      - chain_id          = "{{ chain_id }}"
+      - cluster_id        = "${meta.cluster_id}"
+      - 'default     = {{ cluster_member_count }}
+
+        }'
+      - member_ports = [{{ cluster_ports.ingress }}, {{ cluster_ports.consensus }}, {{ cluster_ports.log }}, {{ cluster_ports.catchup
+        }}, {{ cluster_ports.archive_control }}]
+      - '"sealer-${i}.node.${var.datacenter}.consul:${p}"'
+      - -Dkardamom.cluster.members=${local.members}
+      - -Dkardamom.cluster.memberId=${meta.node_index}
+      - ingressStreamId={{ cluster_ingress_stream_id }}
+    forbidden: []
+  - path: deploy/cluster/nomad/da-watcher.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-da-watcher:{{ image_tag }}'
+      - default     = "http://anvil.service.consul:{{ ports.anvil_l1 }}"
+      - --log-config
+    forbidden: []
+  - path: deploy/cluster/nomad/batcher.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-batcher:{{ image_tag }}'
+      - default     = "http://anvil.service.consul:{{ ports.anvil_l1 }}"
+    forbidden:
+      - '"--shards"'
+  - path: deploy/cluster/nomad/aeron.system.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-aeron:{{ image_tag }}'
+      - tags = ["${meta.role}"]
+      - chain_id          = "{{ chain_id }}"
+      - cluster_id        = "${meta.cluster_id}"
+    forbidden: []
+  - path: deploy/cluster/nomad/anvil.nomad.hcl
+    required:
+      - '"{{ ports.anvil_l1 }}"'
+      - name     = "anvil"
+    forbidden: []
+  - path: deploy/cluster/config/sequencer.toml.tpl
+    required:
+      - ingress_endpoints = "{{ contract_ingress_endpoints }}"
+    forbidden: []
+  - path: deploy/cluster/nomad/validator.nomad.hcl
+    required:
+      - 'default     = {{ node_classes.executor.count }}
+
+        }'
+    forbidden:
+      - '"--shards"'
+  - path: crates/chaos/src/knobs.rs
+    required:
+      - '"SEMANTICS_PARK_MS", {{ "{:_}".format(tx_ttl_ms | int) }}'
+      - '"CHAIN_ID", {{ "{:_}".format(chain_id | int) }}'
+    forbidden: []
+  - path: crates/chaos/src/shard.rs
+    required:
+      - ("RUN_LOAD", "0")
+    forbidden: []
+  - path: deploy/cluster/config/channels.toml.tpl
+    required:
+      - chain_id = {{ chain_id }}
+      - cluster_id = "{% raw %}{{ env "meta.cluster_id" }}{% endraw %}"
+      - datacenter = "{% raw %}{{ env "node.datacenter" }}{% endraw %}"
+      - advertise_interface = "{% raw %}{{ env "meta.node_ip" }}{% endraw %}/32"
+      - tx_data_archive_endpoints = [{% raw %}{{ range service "ingress.kardamom-aeron-archive" }}{% endraw %}
+      - tx_deposits_archive_endpoints = [{% raw %}{{ range service "aux.kardamom-aeron-archive" }}{% endraw %}
+    forbidden: []
+  - path: deploy/cluster/config/genesis/dev.toml
+    required:
+      - chain_id = {{ chain_id }}
+    forbidden: []
+  - path: chains/dev.toml
+    required:
+      - chain_id = {{ chain_id }}
+    forbidden: []
+  - path: crates/chaos/src/harness.rs
+    required:
+      - 'INGRESS_RPC_PORT: u16 = {{ ports.ingress_rpc }};'
+    forbidden: []
+  - path: justfile
+    required:
+      - AERON_JAR_VERSION := "{{ aeron_version }}"
+      - NOMAD_VERSION := "{{ nomad_version }}"
+    forbidden: []
+  - path: crates/log/docker/aeron/Dockerfile
+    required:
+      - ARG AERON_VERSION={{ aeron_version }}
+    forbidden: []
+  - path: deploy/cluster/config/executor.toml
+    required:
+      - ingress_endpoints = "{{ contract_ingress_endpoints }}"
+    forbidden: []
+  - path: deploy/cluster/config/ingress.toml
+    required:
+      - ingress_endpoints = "{{ contract_ingress_endpoints }}"
+    forbidden: []

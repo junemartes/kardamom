@@ -51,7 +51,7 @@ code survey found these facts:
 - The code default is M=8. The deploy runs M=2. A service that starts
   without the explicit flag opens the wrong fan.
 - Six copies of the value "2" exist across `group_vars`, the sequencer TOML
-  template, and five Nomad jobs. The script `check-contract.py` checks none
+  template, and five Nomad jobs. The original contract checker checks none
   of them. The script `chaos.sh` has a precomputed `keccak % 2` account
   table.
 - The Java sealer does not depend on M. It keys on the sender and on the
@@ -339,10 +339,10 @@ Residual effects:
   count. Each group passes an explicit lane and vslot set instead.
 - **Ansible:** `node_classes.sequencer.count` follows the active lane
   count. The hcloud path from the hybrid-fleet plan adds machines.
-- **Contract:** extend `check-contract.py`. It checks every mirror of the
-  map, the port lanes, the `tx_ttl` mirror, and the `ACCT_SHARD` table in
-  `chaos.sh`. Outside a resize, the ingress table must equal the union of
-  the sequencer vslot sets.
+- **Contract:** `ansible/contract.yml` checks configuration mirrors and map
+  bounds. Compiled Nomad job tests check port lanes and overlap arguments.
+  Rust tests check rebalance behavior and funded-account routing. Outside a
+  resize, the ingress table equals the union of the sequencer vslot sets.
 - **Runbook:** a `kardamom-cluster scale-sequencers` command that runs the seven steps of
   section 3.5. It refuses to start a second resize while one is in flight.
   It refuses to start a resize while sealer backpressure is active. The
@@ -427,7 +427,7 @@ The implementation follows this spec with these deviations:
   follow the active lane count. Two lanes share a node through the port
   lane, and a resize adds no machines. The count only needs to stay at 2 or
   more, so both replicas of a lane land on distinct nodes.
-- **Least-moves map (3.2).** `render-shard-map.py` moves slots only to the
+- **Least-moves map (3.2).** `ShardMap::rebalance` moves slots only to the
   lanes that gain. A lane that gains nothing runs through the resize with
   no shadow phase, and the overlap job leaves its arguments byte-identical,
   so Nomad does not restart it.

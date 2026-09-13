@@ -8,7 +8,7 @@
 /// The shard of each funded account at shard map version 0: the first
 /// 8 bytes of `keccak256(address)` as a big-endian u64, modulo the
 /// partition count of 2. Fixed addresses and a fixed hash keep this
-/// table stable. `check-contract.py` recomputes it.
+/// table stable. Tests recompute it against the checked-in shard map.
 pub const ACCT_SHARD: [u8; 16] = [0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1];
 
 /// The vslot of each funded account: `keccak256(address)[7]`. The shard
@@ -159,3 +159,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "accounts_contract_tests.rs"]
+mod contract_tests;

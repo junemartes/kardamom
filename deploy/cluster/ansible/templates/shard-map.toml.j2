@@ -1,0 +1,7 @@
+# The virtual slot is the low byte of the sender hash prefix.
+version = 0
+table = [
+{% for slot in range(256) %}
+  {{ slot % partition_count }},
+{% endfor %}
+]

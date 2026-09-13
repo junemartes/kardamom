@@ -1,0 +1,21 @@
+---
+- name: Validate the resize submission
+  ansible.builtin.assert:
+    that:
+      - workloads_resize_job in ['sequencer', 'ingress']
+      - tx_ttl_ms is integer and tx_ttl_ms > 0
+
+- name: Verify image provenance before a resize submission
+  ansible.builtin.import_tasks: provenance.yml
+
+- name: Initialize resize submission state
+  ansible.builtin.set_fact:
+    workloads_jobs: {}
+
+- name: Plan and submit the resize job
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job:
+      name: "{{ workloads_resize_job }}"
+      wait: false
+      vars: "{{ workloads_resize_vars | default({}) }}"

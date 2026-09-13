@@ -34,35 +34,26 @@ pub(crate) fn moved_accounts(cluster_dir: &Path) -> anyhow::Result<Vec<u32>> {
         .collect())
 }
 
-/// The two files a resize rewrites in the checkout, restored when the
-/// case ends so the next run starts from map version 0.
-struct MapFiles {
-    paths: [PathBuf; 2],
-    contents: [Vec<u8>; 2],
+/// The map is restored after the case so the next run starts from version zero.
+struct MapFile {
+    path: PathBuf,
+    contents: Vec<u8>,
 }
 
-impl MapFiles {
+impl MapFile {
     fn snapshot(cluster_dir: &Path) -> anyhow::Result<Self> {
-        let paths = [
-            cluster_dir.join("config/shard-map.toml"),
-            cluster_dir.join("nomad/sequencer.nomad.hcl"),
-        ];
-        let contents = [
-            std::fs::read(&paths[0]).context("read shard-map.toml")?,
-            std::fs::read(&paths[1]).context("read sequencer.nomad.hcl")?,
-        ];
-        Ok(Self { paths, contents })
+        let path = cluster_dir.join("config/shard-map.toml");
+        let contents = std::fs::read(&path).context("read shard-map.toml")?;
+        Ok(Self { path, contents })
     }
 
     fn restore(&self) {
-        self.paths.iter().zip(&self.contents).for_each(|(p, c)| {
-            if let Err(e) = std::fs::write(p, c) {
-                crate::log(format!(
-                    "resize: WARNING could not restore {}: {e}",
-                    p.display()
-                ));
-            }
-        });
+        if let Err(e) = std::fs::write(&self.path, &self.contents) {
+            crate::log(format!(
+                "resize: WARNING could not restore {}: {e}",
+                self.path.display()
+            ));
+        }
     }
 }
 
@@ -114,7 +105,7 @@ pub(crate) async fn scale_out_in(h: &mut Harness) -> anyhow::Result<()> {
         "{}: resize: ingress-0 does not run map version 0 before the case",
         crate::FAIL_PREFIX
     );
-    let files = MapFiles::snapshot(&cluster_dir)?;
+    let files = MapFile::snapshot(&cluster_dir)?;
     let result = scale_out_in_body(h, &cluster_dir).await;
     files.restore();
     result
