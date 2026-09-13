@@ -268,8 +268,8 @@ pub(crate) async fn corruption(h: &mut Harness) -> anyhow::Result<()> {
     };
     let seg = pick_clean_segment(&tool, &mirror).await?;
     crate::log(format!(
-        "archive-corruption: flipping payload bytes at {} in {} (recording {})",
-        seg.flip_at, seg.name, seg.rid
+        "archive-corruption: flipping payload bytes at {} in {} (recording {}; mirror {})",
+        seg.flip_at, seg.name, seg.rid, seg.mirror_name
     ));
     h.nodes
         .exec(
@@ -296,7 +296,7 @@ pub(crate) async fn corruption(h: &mut Harness) -> anyhow::Result<()> {
         tail(&pre, 20)
     );
     crate::log("archive-corruption: corruption detected by CRC-armed verify");
-    heal_on_runner(h, &rerep, &victim, &mirror, &seg.name).await?;
+    heal_on_runner(h, &rerep, &victim, &mirror, &seg).await?;
     tool.mark_valid(&seg.rid).await;
     let post = tool.verify(&seg.rid).await;
     anyhow::ensure!(
@@ -366,33 +366,68 @@ fn recording_err(out: &str, rid: &str) -> bool {
     })
 }
 
-/// A victim segment: present on both archives, clean at baseline, with
-/// a usable data frame to flip inside.
+/// A victim segment: clean at baseline, with a usable data frame to flip
+/// inside, and the name of the mirror segment that holds the same bytes.
 struct Segment {
     name: String,
+    /// Recording ids are per archive. A recording that started after an
+    /// adoption has a different id on each node, so the mirror can hold
+    /// the victim's bytes under another name.
+    mirror_name: String,
     rid: String,
     flip_at: i64,
 }
 
-/// The 48 largest segments on the victim, by name. Only the active
-/// lanes carry data frames, so the window covers idle lanes and every
-/// per-restart session.
-async fn candidates(h: &Harness, victim: &str) -> anyhow::Result<Vec<String>> {
-    let listing = h
-        .nodes
-        .exec(
-            victim,
-            &format!("ls -S {ARCHIVE_DIR}/*.rec 2>/dev/null | head -48 | xargs -rn1 basename"),
+/// The sha256 and name of archive segments on one node, in listing order.
+struct SegmentHashes(Vec<(String, String)>);
+
+impl SegmentHashes {
+    /// Hash the segments `listing` names, a shell word list run in the
+    /// archive directory.
+    async fn read(h: &Harness, node: &str, listing: &str) -> Self {
+        let script = format!("cd {ARCHIVE_DIR} && {listing} | xargs -r sha256sum");
+        let out = h.nodes.exec(node, &script).await.unwrap_or_default();
+        Self::parse(&out)
+    }
+
+    fn parse(out: &str) -> Self {
+        Self(
+            out.lines()
+                .filter_map(|l| l.split_once("  "))
+                .map(|(hash, name)| (hash.to_string(), name.to_string()))
+                .collect(),
         )
-        .await
-        .unwrap_or_default();
-    Ok(listing.lines().map(str::to_string).collect())
+    }
+
+    /// The name of a segment with `hash`: `name` itself when it matches,
+    /// or else the first other segment with those bytes.
+    fn name_for(&self, hash: &str, name: &str) -> Option<String> {
+        let same: Vec<&String> = self
+            .0
+            .iter()
+            .filter(|(h, _)| h == hash)
+            .map(|(_, n)| n)
+            .collect();
+        let exact = same.iter().find(|n| n.as_str() == name);
+        exact.or(same.first()).map(|n| (*n).clone())
+    }
 }
 
+/// The first of the victim's 48 largest segments that the mirror holds
+/// byte-identical, that carries a data frame, and that verifies clean.
+/// Only the active lanes carry data frames, so the window covers idle
+/// lanes and every per-restart session. The mirror match is by content:
+/// an adopted recording keeps its id but its catalog entry checksum is
+/// stale, so it fails verify, and a recording made after the adoption
+/// verifies clean under a different id on each node.
 async fn pick_clean_segment(tool: &ArchiveTool<'_>, mirror: &str) -> anyhow::Result<Segment> {
-    let names = candidates(tool.h, tool.node).await?;
-    for name in names {
-        if let Some(seg) = qualify(tool, mirror, name).await? {
+    let victim = SegmentHashes::read(tool.h, tool.node, "ls -S *.rec 2>/dev/null | head -48").await;
+    let mirror = SegmentHashes::read(tool.h, mirror, "ls *.rec 2>/dev/null").await;
+    for (hash, name) in victim.0 {
+        let Some(mirror_name) = mirror.name_for(&hash, &name) else {
+            continue;
+        };
+        if let Some(seg) = qualify(tool, name, mirror_name).await {
             return Ok(seg);
         }
     }
@@ -409,30 +444,26 @@ async fn pick_clean_segment(tool: &ArchiveTool<'_>, mirror: &str) -> anyhow::Res
 /// to the victim's before the flip; then the heal restores exactly the bytes
 /// the flip destroyed. A candidate that fails the probe verify gets its
 /// state put back.
-async fn qualify(
-    tool: &ArchiveTool<'_>,
-    mirror: &str,
-    name: String,
-) -> anyhow::Result<Option<Segment>> {
-    let rid = name.split('-').next().unwrap_or("").to_string();
-    if !same_bytes_on_mirror(tool.h, tool.node, mirror, &name).await {
-        return Ok(None);
+/// `name` as a victim segment, when it carries a data frame and its
+/// recording verifies clean. The frame check runs first: it is a cheap
+/// read, and it skips the idle lanes before a verify starts a JVM.
+async fn qualify(tool: &ArchiveTool<'_>, name: String, mirror_name: String) -> Option<Segment> {
+    let flip_at = frame_payload_offset(tool.h, tool.node, &name).await;
+    if flip_at < 0 {
+        return None;
     }
+    let rid = name.split('-').next().unwrap_or("").to_string();
     let out = tool.verify(&rid).await;
     if !recording_ok(&out, &rid) || out.contains(") ERR") {
         tool.mark_valid(&rid).await;
-        return Ok(None);
+        return None;
     }
-    let flip_at = frame_payload_offset(tool.h, tool.node, &name).await;
-    Ok((flip_at >= 0).then_some(Segment { name, rid, flip_at }))
-}
-
-/// Whether `name` exists on the mirror with the victim's exact bytes.
-async fn same_bytes_on_mirror(h: &Harness, victim: &str, mirror: &str, name: &str) -> bool {
-    let script = format!("sha256sum {ARCHIVE_DIR}/{name} 2>/dev/null | cut -d' ' -f1");
-    let here = h.nodes.exec(victim, &script).await.unwrap_or_default();
-    let there = h.nodes.exec(mirror, &script).await.unwrap_or_default();
-    !here.trim().is_empty() && here.trim() == there.trim()
+    Some(Segment {
+        name,
+        mirror_name,
+        rid,
+        flip_at,
+    })
 }
 
 /// A byte offset inside the payload of the largest data frame of a
@@ -463,13 +494,15 @@ print(best + 40 if best >= 0 else -1)
 }
 
 /// Stage both archives on the runner, require `--diff` to name the
-/// segment, heal it, and write only the healed segment back.
+/// segment, heal it, and write only the healed segment back. The staged
+/// mirror copy holds the mirror's bytes under the victim's name first,
+/// because the heal tool pairs segments by name.
 async fn heal_on_runner(
     h: &Harness,
     rerep: &Path,
     victim: &str,
     mirror: &str,
-    seg: &str,
+    segment: &Segment,
 ) -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("staging dir")?;
     for (node, sub) in [(victim, "victim"), (mirror, "mirror")] {
@@ -477,6 +510,11 @@ async fn heal_on_runner(
     }
     let source = tmp.path().join("mirror/dir");
     let dest = tmp.path().join("victim/dir");
+    let seg = segment.name.as_str();
+    if segment.mirror_name != segment.name {
+        std::fs::copy(source.join(&segment.mirror_name), source.join(seg))
+            .context("stage the mirror segment under the victim's name")?;
+    }
     let diff = run_tool(
         rerep,
         &[
@@ -576,6 +614,25 @@ async fn run_tool(tool: &Path, args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mirror_segment_is_found_by_its_bytes() {
+        let mirror =
+            SegmentHashes::parse("aaa  0-0.rec\nzero  1-0.rec\nbbb  16-0.rec\nzero  2-0.rec\n");
+        assert_eq!(
+            mirror.name_for("aaa", "0-0.rec").as_deref(),
+            Some("0-0.rec")
+        );
+        assert_eq!(
+            mirror.name_for("bbb", "24-0.rec").as_deref(),
+            Some("16-0.rec")
+        );
+        assert_eq!(
+            mirror.name_for("zero", "2-0.rec").as_deref(),
+            Some("2-0.rec")
+        );
+        assert_eq!(mirror.name_for("ccc", "24-0.rec"), None);
+    }
 
     #[test]
     fn a_clean_verify_has_an_ok_recording_and_tolerates_stale_entries() {
