@@ -10,37 +10,28 @@ use kardamom_engine::{
     MdbxWriterSignal, NoEpochCheck, NoRemoteEpochCheck, TxReceiptsPublication,
 };
 use kardamom_executor::parallel::StmBlockExec;
-use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsPublisherHandle};
-use kardamom_log::config::ChannelsConfig;
+use kardamom_log::aeron_live::AeronRuntime;
+use kardamom_log::discovery::StreamPlane;
 use kardamom_state::StateSnapshot;
 
 use crate::args::Args;
 
-/// `tx_receipts` publication. With MDS (fan-in) enabled, this replica
-/// publishes the receipt stream and the boundary side-stream to its own
-/// per-replica unicast endpoint (chosen by `--recorder-id`). Ingress
-/// combines every replica's endpoint into one multi-destination
-/// subscription. Without MDS (the IPC default), the code falls back to the
-/// shared single-channel path, so single-host and local behavior stays the
-/// same. Either way, the commit thread's must-deliver retry drives the same
-/// `publish_receipt` and `publish_boundary` surface.
-pub(crate) fn open_tx_receipts_pub(
+/// `tx_receipts` publication: the receipt stream and the boundary
+/// side-stream, opened through the stream plane. With discovery, this
+/// replica publishes two dynamic MDC publications. Without it, the
+/// plane picks the per-replica MDS endpoint (chosen by `--recorder-id`)
+/// or the shared channel from the static config. Either way, the commit
+/// thread's must-deliver retry drives the same `publish_receipt` and
+/// `publish_boundary` surface.
+pub(crate) async fn open_tx_receipts_pub(
     rt_pub: &AeronRuntime,
-    channels: &ChannelsConfig,
+    plane: &mut StreamPlane,
     args: &Args,
 ) -> Result<LiveTxReceiptsPub> {
-    let handle = if channels.tx_receipts_mds_enabled() {
-        tracing::info!(
-            replica_idx = args.recorder_id,
-            endpoint = channels.tx_receipts_endpoint(args.recorder_id).as_deref(),
-            "tx_receipts MDS publish (per-replica endpoint)"
-        );
-        TxReceiptsPublisherHandle::open_mds(rt_pub, channels, args.recorder_id)
-            .context("open TxReceiptsPublisherHandle (MDS)")?
-    } else {
-        TxReceiptsPublisherHandle::open(rt_pub, channels)
-            .context("open TxReceiptsPublisherHandle")?
-    };
+    let handle = plane
+        .tx_receipts_publisher(rt_pub, args.recorder_id)
+        .await
+        .context("open TxReceiptsPublisherHandle")?;
     Ok(LiveTxReceiptsPub { handle })
 }
 
@@ -106,7 +97,7 @@ impl EngineWiring for ExecutorWiring {
 }
 
 pub(crate) struct LiveTxReceiptsPub {
-    handle: TxReceiptsPublisherHandle,
+    handle: kardamom_log::aeron_live::TxReceiptsPublisherHandle,
 }
 
 impl TxReceiptsPublication for LiveTxReceiptsPub {

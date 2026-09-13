@@ -1,0 +1,31 @@
+# Managed by Ansible (roles/autoscaler). The ingress allocation policy:
+# it asks Nomad for more or fewer ingress replicas from the measured
+# allocation CPU. It keeps at least {{ autoscaler_ingress_min }} replicas, and never more
+# than the ingress pool holds. A job redeployment must preserve the count
+# this policy sets; deploy.sh does not, so the policy stays disabled until
+# the Ansible deployment path lands.
+{% set ingress_pools = autoscaler_contract.pools.values() | selectattr('role', 'equalto', 'ingress') | list %}
+scaling "ingress-allocs" {
+  enabled = {{ (autoscaler_ingress_policy_enabled | bool and ingress_pools | length > 0) | lower }}
+  min     = {{ autoscaler_ingress_min }}
+  max     = {{ (ingress_pools | map(attribute='max') | list | max) if ingress_pools | length > 0 else autoscaler_ingress_min }}
+
+  policy {
+    cooldown            = "5m"
+    evaluation_interval = "30s"
+
+    check "cpu" {
+      source = "prometheus"
+      query  = "avg(nomad_client_allocs_cpu_total_percent{exported_job=\"ingress\", task=\"ingress\"})"
+
+      strategy "target-value" {
+        target = {{ autoscaler_ingress_cpu_target }}
+      }
+    }
+
+    target "nomad" {
+      Job   = "ingress"
+      Group = "ingress"
+    }
+  }
+}

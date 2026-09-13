@@ -19,6 +19,15 @@ impl Scrape {
     /// the metric is absent, which differs from a genuine 0 sample.
     #[must_use]
     pub fn value(&self, name: &str) -> Option<f64> {
+        self.value_where(name, "")
+    }
+
+    /// Sum every sample of `name` whose label block contains `label`
+    /// (for example `vslot="7"`). An empty `label` matches every sample.
+    /// Returns `None` when no sample matches, which differs from a
+    /// genuine 0 sample.
+    #[must_use]
+    pub fn value_where(&self, name: &str, label: &str) -> Option<f64> {
         self.0
             .lines()
             .filter(|line| !line.starts_with('#') && line.starts_with(name))
@@ -27,7 +36,7 @@ impl Scrape {
                 // the metric name (a label block or a sample separator), so
                 // `foo` never matches `foo_total`.
                 let rest = &line[name.len()..];
-                if !(rest.starts_with('{') || rest.starts_with(' ')) {
+                if !(rest.starts_with('{') || rest.starts_with(' ')) || !rest.contains(label) {
                     return None;
                 }
                 line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok())
@@ -109,3 +118,33 @@ pub use kardamom_obs::testkit::poll_until;
 /// Returns an error when `f` itself errors, or when `timeout` passes
 /// before `f` returns `Some(v)`.
 pub use kardamom_obs::testkit::poll_sync;
+
+#[cfg(test)]
+mod tests {
+    use super::Scrape;
+
+    const BODY: &str = "# HELP kardamom_sequencer_pending_depth parked entries\n\
+        kardamom_sequencer_pending_depth{partition=\"0\",vslot=\"7\"} 2\n\
+        kardamom_sequencer_pending_depth{partition=\"1\",vslot=\"7\"} 1\n\
+        kardamom_sequencer_pending_depth{partition=\"0\",vslot=\"8\"} 5\n\
+        kardamom_sequencer_pending_depth_total 9\n";
+
+    #[test]
+    fn value_sums_every_label_set_of_the_exact_name() {
+        let s = Scrape(BODY.to_string());
+        assert_eq!(s.value("kardamom_sequencer_pending_depth"), Some(8.0));
+    }
+
+    #[test]
+    fn value_where_sums_only_the_matching_label_sets() {
+        let s = Scrape(BODY.to_string());
+        assert_eq!(
+            s.value_where("kardamom_sequencer_pending_depth", "vslot=\"7\""),
+            Some(3.0)
+        );
+        assert_eq!(
+            s.value_where("kardamom_sequencer_pending_depth", "vslot=\"9\""),
+            None
+        );
+    }
+}

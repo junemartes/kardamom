@@ -12,7 +12,7 @@
 //! `AeronArchive` is a foreign type (`rusteron_archive` owns it): the
 //! orphan rule blocks an inherent `impl` on it from this crate.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::ops::ControlFlow;
 
 use rusteron_archive::{
@@ -39,6 +39,21 @@ pub(crate) trait ArchiveCatalog {
     fn for_each_recording_of_stream(
         &self,
         stream_id: i32,
+        on_desc: impl FnMut(&AeronArchiveRecordingDescriptor),
+    ) -> Result<(), LogError>;
+
+    /// [`Self::for_each_recording_of_stream`] narrowed to recordings whose
+    /// original channel contains `channel_fragment`, for example the
+    /// `control=<ip>:<port>` of one dynamic MDC publisher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `channel_fragment` contains a NUL byte, or if
+    /// `list_recordings_for_uri` fails on any page.
+    fn for_each_recording_of_channel(
+        &self,
+        stream_id: i32,
+        channel_fragment: &str,
         on_desc: impl FnMut(&AeronArchiveRecordingDescriptor),
     ) -> Result<(), LogError>;
 }
@@ -113,15 +128,23 @@ impl ArchiveCatalog for AeronArchive {
     fn for_each_recording_of_stream(
         &self,
         stream_id: i32,
-        mut on_desc: impl FnMut(&AeronArchiveRecordingDescriptor),
+        on_desc: impl FnMut(&AeronArchiveRecordingDescriptor),
     ) -> Result<(), LogError> {
         // An empty channel fragment matches any channel; stream_id narrows
-        // the match to the caller's stream. This never fails: an empty
-        // string has no NUL byte.
-        let any_channel = CString::new("").expect("empty fragment has no NUL");
+        // the match to the caller's stream.
+        self.for_each_recording_of_channel(stream_id, "", on_desc)
+    }
+
+    fn for_each_recording_of_channel(
+        &self,
+        stream_id: i32,
+        channel_fragment: &str,
+        mut on_desc: impl FnMut(&AeronArchiveRecordingDescriptor),
+    ) -> Result<(), LogError> {
+        let fragment = crate::ffi::c_uri(channel_fragment, "channel fragment")?;
         let mut from_record_id: i64 = 0;
         loop {
-            match fetch_page(self, &mut on_desc, stream_id, &any_channel, from_record_id)? {
+            match fetch_page(self, &mut on_desc, stream_id, &fragment, from_record_id)? {
                 ControlFlow::Break(()) => break,
                 ControlFlow::Continue(next) => from_record_id = next,
             }

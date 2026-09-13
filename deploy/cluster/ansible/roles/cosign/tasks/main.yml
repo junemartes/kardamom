@@ -1,0 +1,42 @@
+---
+- name: Resolve installed cosign or its pinned cache path
+  ansible.builtin.set_fact:
+    cosign_resolved_binary: "{{ cosign_binary | default(cosign_cache ~ '/' ~ cosign_version ~ '/cosign', true) }}"
+
+- name: Inspect cosign executable
+  ansible.builtin.stat:
+    path: "{{ cosign_resolved_binary }}"
+  register: cosign_installed
+
+- name: Require an executable when cosign_binary is explicitly configured
+  ansible.builtin.assert:
+    that: cosign_installed.stat.executable | default(false)
+    fail_msg: The configured cosign binary is missing or not executable.
+  when: cosign_binary | length > 0
+
+- name: Install pinned cosign when no binary is available
+  when: not (cosign_installed.stat.executable | default(false))
+  block:
+    - name: Identify controller platform
+      ansible.builtin.setup:
+        gather_subset: ["!all"]
+
+    - name: Require a supported platform for the pinned download
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.system == 'Linux'
+          - ansible_facts.architecture == 'x86_64'
+        fail_msg: Automatic cosign installation covers Linux amd64; install cosign on PATH for this platform.
+
+    - name: Create the cosign cache directory
+      ansible.builtin.file:
+        path: "{{ cosign_resolved_binary | dirname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download and checksum-verify cosign
+      ansible.builtin.get_url:
+        url: "https://github.com/sigstore/cosign/releases/download/{{ cosign_version }}/cosign-linux-amd64"
+        dest: "{{ cosign_resolved_binary }}"
+        checksum: "sha256:{{ cosign_sha256 }}"
+        mode: "0755"

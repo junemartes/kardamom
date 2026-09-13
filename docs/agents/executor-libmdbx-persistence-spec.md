@@ -200,7 +200,7 @@ live — without double-applying or losing state.
   against replayed envelopes unchanged; the reader **join timeout is relaxed to 30 s while
   resuming** (the streams replay independently and catch up at different rates) (M2.2, done).
 - `cluster-e2e` persistence validation: the cluster job's **chaos suite**
-  (`deploy/cluster/scripts/chaos.sh`, cases `graceful-executor` / `hard-executor`) kills an
+  (`crates/chaos`, cases `graceful-executor` / `hard-executor`) kills an
   executor under steady `--assert-all-delivered` load and asserts it auto-restarts AND every
   accepted tx still receipts. On the same-node restart the executor reopens its persistent
   `/opt/kardamom/state` and runs this Phase-2 recovery — so a broken recovery surfaces as a

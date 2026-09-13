@@ -3,9 +3,11 @@
 
 One job group per active lane, `count = 2` (the racing replicas) with
 `distinct_hosts`. Each group passes an explicit `--lane` and `--vslots`.
-The ports form a lane: metrics `9001 + 10 * lane`, cluster egress
-`cluster_egress_port + 10 * lane`. Two lanes can share a node without a
-port clash. See docs/specs/dynamic-sequencer-sizing.md, section 3.8.
+The metrics port forms a lane: `9001 + 10 * lane`, so two lanes share
+a node without a clash. The cluster egress (response) port is a Nomad
+dynamic port: every allocation gets its own, so a replacement replica
+never reuses the endpoint of the replica it replaces on the node's shared
+media driver. See docs/specs/dynamic-sequencer-sizing.md, section 3.8.
 
 Modes:
 
@@ -21,7 +23,7 @@ Modes:
       render, so it serves through the overlap.
 
 The checked-in job file must equal the steady render for the checked-in
-map. scripts/check-contract.py checks that. scripts/scale-sequencers.sh
+map. scripts/check-contract.py checks that. `kardamom-cluster scale-sequencers`
 drives the two renders of a resize.
 """
 
@@ -38,6 +40,7 @@ DEFAULT_MAP = os.path.join(CLUSTER, "config", "shard-map.toml")
 VSLOT_COUNT = 256
 METRICS_BASE = 9001
 PORT_LANE_STEP = 10
+MDC_PORT_BASE = 40340
 
 
 def scalar(text: str, key: str) -> str:
@@ -54,11 +57,12 @@ def port(text: str, key: str) -> int:
     return int(m.group(1))
 
 
-def node_class(text: str, name: str) -> tuple[int, int]:
-    m = re.search(rf"^\s{{2}}{name}:\s*\{{[^}}]*?\bcount:\s*(\d+)[^}}]*?\bip_start:\s*(\d+)", text, re.M)
+def node_class(text: str, name: str) -> int:
+    """The replica count of a node class."""
+    m = re.search(rf"^\s{{2}}{name}:\s*\{{[^}}]*?\bcount:\s*(\d+)", text, re.M)
     if not m:
         sys.exit(f"group_vars/all.yml: missing node_classes.{name}")
-    return int(m.group(1)), int(m.group(2))
+    return int(m.group(1))
 
 
 def parse_map(path: str) -> tuple[int, list[int]]:
@@ -108,9 +112,13 @@ HEADER = """\
 #
 # Each group passes an explicit --lane and --vslots, derived from
 # config/shard-map.toml (docs/specs/dynamic-sequencer-sizing.md, 3.2).
-# The ports form a lane: metrics 9001 + 10 * lane, cluster egress
-# {egress_base} + 10 * lane. Two lanes share a node without a clash.
-# Placement is by Nomad, not by node meta.
+# The metrics port forms a lane: 9001 + 10 * lane, so two lanes share a
+# node without a clash. The cluster egress (response) port is a Nomad
+# dynamic port, one per allocation: a fixed per-lane port sat in the
+# node's ephemeral range, where the shared media driver's port-0 sockets
+# could take it first, and a replacement replica reused the endpoint of
+# the replica it replaced, on which the cluster's egress publication was
+# already stale. Placement is by Nomad, not by node meta.
 #
 # Note for consumers: both replicas of a lane process the same tx
 # stream, so per-lane tx totals exist once per replica. Aggregate
@@ -119,7 +127,7 @@ HEADER = """\
 # This shares the node's Aeron media driver, through the bind-mounted
 # tmpfs aeron.dir.
 
-# Digest-pinned image. scripts/deploy.sh passes the repo:tag@sha256:...
+# Digest-pinned image. ansible/deploy.yml passes the repo:tag@sha256:...
 # reference captured at push time (deploy/cluster/images.digests). Both
 # replicas of every lane run the same pinned bytes. The empty default
 # falls back to the mutable :dev tag in the task configs. That fallback
@@ -131,8 +139,20 @@ variable "image_ref" {{
   default     = ""
 }}
 
+variable "datacenter" {{
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}}
+
+variable "executor_count" {{
+  type        = number
+  description = "The executor node count (node_classes.executor.count). The nonce lookups go to executor-<i>.node.<datacenter>.consul."
+  default     = {executor_count}
+}}
+
 job "sequencer" {{
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   # Sequencer-role nodes only.
@@ -181,6 +201,8 @@ GROUP = """
 
     network {{
       mode = "host"
+      # The cluster egress (response) port, unique per allocation.
+      port "egress" {{}}
     }}
 
     task "sequencer-{lane}" {{
@@ -216,10 +238,10 @@ GROUP = """
           "--tx-ttl-ms", "{tx_ttl_ms}",
           # The executor nonce query endpoints (node_classes.executor and
           # ports.executor_nonce_query in group_vars/all.yml).
-          "--executor-query-endpoints", "{query_endpoints}",
-          # This node's cluster-egress (response) endpoint, on the lane's
-          # port. The node IP differs per replica, so it is injected here.
-          "--cluster-egress-endpoint", "${{meta.node_ip}}:{egress_port}",
+          "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${{i}}.node.${{var.datacenter}}.consul:{query_port}"]),
+          # This allocation's cluster-egress (response) endpoint: the
+          # node IP and the dynamic port, both known only at placement.
+          "--cluster-egress-endpoint", "${{meta.node_ip}}:${{NOMAD_HOST_PORT_egress}}",
         ]
       }}
 
@@ -228,13 +250,20 @@ GROUP = """
         # lane's metrics port. The host id names the node and the lane.
         KARDAMOM_METRICS_ADDR = "0.0.0.0:{metrics_port}"
         KARDAMOM_HOST_ID      = "node${{meta.node_index}}-seq-{lane}"
+        # The UDP ports the discovered tx_errors publication binds, on
+        # the lane's range, so two lanes can share a node.
+        KARDAMOM_MDC_PORTS    = "{mdc_ports}"
       }}
 
-      # Cluster LogConfig (UDP multicast channels), read through
+      # Cluster LogConfig (Aeron streams and discovery), read through
       # --log-config.
       template {{
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }}
 
       # This comes from one source, config/sequencer.toml.tpl. The
@@ -258,19 +287,14 @@ def render(gv: str, target: list[int], current: list[int] | None) -> str:
     registry = f"{scalar(gv, 'registry_host')}:{scalar(gv, 'registry_port')}"
     image = f"{registry}/kardamom-sequencer:{scalar(gv, 'image_tag')}"
     tx_ttl_ms = scalar(gv, "tx_ttl_ms")
-    egress_base = int(scalar(gv, "cluster_egress_port"))
-    ip_prefix = scalar(gv, "ip_prefix")
     query_port = port(gv, "executor_nonce_query")
-    exec_count, exec_start = node_class(gv, "executor")
-    query_endpoints = ",".join(
-        f"http://{ip_prefix}.{exec_start + i}:{query_port}" for i in range(exec_count)
-    )
+    exec_count = node_class(gv, "executor")
     target_sets = lane_sets(target)
     lanes = max(target) + 1
     current_sets = lane_sets(current) if current is not None else None
     current_lanes = max(current) + 1 if current is not None else lanes
 
-    out = [HEADER.format(egress_base=egress_base)]
+    out = [HEADER.format(executor_count=exec_count)]
     groups = sorted(set(target_sets) | (set(current_sets) if current_sets else set()))
     for lane in groups:
         resize_args = ""
@@ -312,9 +336,12 @@ def render(gv: str, target: list[int], current: list[int] | None) -> str:
                 vslots=ranges(vslots),
                 resize_args=resize_args,
                 tx_ttl_ms=tx_ttl_ms,
-                query_endpoints=query_endpoints,
-                egress_port=egress_base + PORT_LANE_STEP * lane,
+                query_port=query_port,
                 metrics_port=METRICS_BASE + PORT_LANE_STEP * lane,
+                mdc_ports=(
+                    f"{MDC_PORT_BASE + PORT_LANE_STEP * lane}-"
+                    f"{MDC_PORT_BASE + PORT_LANE_STEP * lane + PORT_LANE_STEP - 1}"
+                ),
             )
         )
     out.append("}\n")
