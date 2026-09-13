@@ -118,6 +118,12 @@ ports:
   # by scripts/check-contract.py: executor.nomad.hcl --nonce-query-addr,
   # sequencer.nomad.hcl --executor-query-endpoints (both groups).
   executor_nonce_query: 9024
+  # The account-state projection cache (nomad/redis.nomad.hcl): the primary
+  # and the replica on `redis`, the three sentinels on `redis_sentinel`. The
+  # state mirror's Prometheus exporter, on the executor nodes.
+  redis: 6379
+  redis_sentinel: 26379
+  state_mirror_metrics: 9007
   anvil_l1: 8546              # in-cluster L1 (anvil) for the smoke test
   # Aeron archive control/response/replication (see aeron image EXPOSE).
   aeron_archive_control: 8010
@@ -135,6 +141,7 @@ paths:
   archive_dir: /opt/kardamom/archive       # recorder Archive segments (persistent)
   state_dir: /opt/kardamom/state           # executor StateWriter (libmdbx) data
   checkpoints_dir: /opt/kardamom/checkpoints # executor state checkpoints (fast recovery)
+  mirror_dir: /opt/kardamom/mirror         # state mirror head file + rebuild scratch
   batcher_dir: /opt/kardamom/batcher       # live batcher cursor file + DA blob store (#39)
   config_dir: /opt/kardamom/config         # rendered service configs + genesis
 
@@ -188,7 +195,7 @@ node_classes:
   ingress: { count: 2, tier: worker } # active/active
   executor: { count: 3, tier: worker } # 3 state-machine replicas
   sealer: { count: 3, tier: worker } # 3-member Aeron Cluster (Raft) sealer
-  aux: { count: 1, tier: worker } # validator + da_watcher + batcher
+  aux: { count: 1, tier: worker } # validator + da_watcher + batcher + redis primary
 
 # Aeron Cluster (Raft) sealer member ports (uniform per role; unique by node IP).
 cluster_member_count: 3

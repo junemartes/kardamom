@@ -46,3 +46,10 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["host.docker.internal:9006"]
+
+  # The state mirror, the Redis projection writer. One per executor node
+  # in the cluster; a single one in a local stack.
+  - job_name: kardamom-state-mirror
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9007"]

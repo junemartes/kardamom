@@ -10,7 +10,7 @@
 # A check run must not build, push, sign, or replace a completed manifest.
 - name: Explain image check mode
   ansible.builtin.debug:
-    msg: "Would build and push {{ images_services + ['aeron', 'cluster'] }} ({{ images_mode }}), then publish {{ images_manifest }}."
+    msg: "Would build and push {{ images_services + ['aeron', 'redis', 'cluster'] }} ({{ images_mode }}), then publish {{ images_manifest }}."
   when: ansible_check_mode
 
 - name: Build a complete image release
@@ -77,6 +77,14 @@
             images_item:
               name: aeron
               path: "{{ images_root }}/crates/log/docker/aeron"
+              dockerfile: Dockerfile
+
+        - name: Build and push Redis
+          ansible.builtin.include_tasks: image.yml
+          vars:
+            images_item:
+              name: redis
+              path: "{{ images_cluster_dir }}/docker/redis"
               dockerfile: Dockerfile
 
         - name: Build and push Rust services

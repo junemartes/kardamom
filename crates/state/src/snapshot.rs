@@ -10,6 +10,7 @@
 //! server) can read the same MVCC view without each opening a new
 //! transaction slot.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, U256};
@@ -24,6 +25,7 @@ use crate::meta::{
     KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_STATE_ROOT,
     encode_b_position, get_decoded, read_meta_b_position, read_meta_b256, read_meta_u64,
 };
+use crate::schema::for_each_row;
 use crate::schema::{
     TABLE_ACCOUNTS, TABLE_CODE, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX,
     decode_account_value, decode_receipt_value, decode_storage_value, decode_tx_hash_value,
@@ -138,6 +140,24 @@ impl StateSnapshot {
             read_meta_b_position(&self.inner.txn, meta, KEY_LAST_COMMITTED_END_TX_POSITION)?
                 .unwrap_or(BPosition::ZERO),
         )
+    }
+
+    /// Walk every account in address order and call `f(address, nonce,
+    /// balance)` for each. The state mirror's rebuild scans a checkpoint
+    /// this way. `f` returns `Break` to stop early.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] on a cursor or decode failure, or the error
+    /// `f` returns.
+    pub fn for_each_account(
+        &self,
+        mut f: impl FnMut(Address, u64, U256) -> Result<ControlFlow<()>, StateError>,
+    ) -> Result<(), StateError> {
+        for_each_row(&self.inner.txn, self.inner.accounts_db, |key, value| {
+            let account = decode_account_value(&value)?;
+            f(Address::from_slice(&key), account.nonce, account.balance)
+        })
     }
 }
 

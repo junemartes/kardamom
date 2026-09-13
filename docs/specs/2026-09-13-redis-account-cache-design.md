@@ -473,6 +473,18 @@ Deviations from the design above, recorded as they land.
   and swaps the connection through an `ArcSwap`, no lock. The executor query gained
   `eth_getBalance` and the `x-state-tx-idx` header; a request with no params is now
   `-32602` for both methods.
+- **PR 3 (`kardamom-state-mirror`, Redis and mirror jobs).** The mirror subscribes to
+  `tx_receipts` and applies each batch: rows and receipts in one pipeline each, then the
+  head, then `WAIT` for one replica. A failed batch write retries until it lands; an outage
+  past 10 s schedules a rebuild, because frames may have been lost behind the mirror. On
+  start the mirror resumes when any live head is at or beyond its local head file, and
+  rebuilds when Redis carries no live head (cold) or a head below the local one
+  (regression). A daily audit rebuild is the default. The rebuild restores the executor's
+  newest checkpoint into the mirror's own directory with the same verified path the
+  executor uses, and opens that copy read only; the checkpoints mount is read only. The
+  Redis image, primary, replica, and sentinels ship without `requirepass` or ACLs in the
+  container cluster: the network is isolated, and authentication is the flag-day item of
+  the trust rule. Redis `INFO` metrics are not exported yet; the mirror's own counters are.
 - **Not covered by rows.** Block-close writes without a receipt (the health beacon, system
   upgrades) produce no rows. Those predeploy accounts stay stale in the projection until a
   rebuild. None is a sender, so admission is unaffected.
