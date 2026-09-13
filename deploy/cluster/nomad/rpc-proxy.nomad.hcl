@@ -8,7 +8,7 @@
 # haproxy's http mode unchanged; the timeout tunnel keeps long-lived
 # subscription connections open.
 #
-# Image: pull haproxy upstream once on the orchestrator, and push it to
+# Image: pull haproxy upstream once on the controller host, and push it to
 # the in-cluster registry as registry.service.consul:5000/haproxy:2.9-alpine.
 # This is the same flow as the service images; DinD nodes trust only
 # the local registry.
