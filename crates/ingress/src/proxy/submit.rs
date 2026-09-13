@@ -1,14 +1,22 @@
 //! The client-facing submit path. `submit_raw` blocks and parks until a
 //! receipt arrives. `submit_raw_async` acks on publish. Both share the
-//! validate, cache-answer, and publish stages.
+//! validate, cache-answer, admission-check, and publish stages.
+//!
+//! The admission checks read the local account layer only. A miss
+//! admits: the executor query is never on this path, so a flood of cold
+//! senders costs the executors nothing. A past nonce rejects as
+//! `Duplicate`, after the receipt cache has had its say, so a retry of
+//! a landed tx still gets its receipt. An unfunded sender rejects as
+//! `InsufficientFunds`.
 
 use std::net::IpAddr;
 
 use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
-use alloy_primitives::{B256, Bytes as AlloyBytes};
+use alloy_primitives::{B256, Bytes as AlloyBytes, U256};
 use alloy_rlp::Decodable;
 
+use kardamom_cache::{AccountView, metrics as cache_metrics};
 use kardamom_types::{Receipt, TxEnvelope};
 
 use crate::channels::{IngressPublication, IngressSubscription};
@@ -41,6 +49,7 @@ where
         if let Some(answer) = v.answer_from_cache() {
             return answer.map(|receipt| ReceiptResponse { receipt });
         }
+        v.check_account()?;
 
         // Park before publishing. Under load, the receipt can arrive on
         // the cache channel before this code would otherwise register the
@@ -117,13 +126,16 @@ where
         if let Some(answer) = v.answer_from_cache() {
             return answer.map(|receipt| receipt.tx_hash);
         }
+        v.check_account()?;
         self.publish_validated(&v, raw_tx).await?;
         metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
         Ok(v.tx_hash)
     }
 
     /// Shared head of both submit paths: rate-limit, decode, batch
-    /// sig-verify, and receipt-cache lookup. Does not publish.
+    /// sig-verify, receipt-cache lookup, and the local account read.
+    /// Does not publish and rejects nothing on account state; see
+    /// [`ValidatedSubmission::check_account`].
     async fn validate_submission(
         &self,
         client_ip: IpAddr,
@@ -166,6 +178,7 @@ where
         env.check_protocol_limits()?;
 
         let nonce = env.nonce();
+        let cost = env.worst_case_cost();
 
         // Identity guarantee: the proxy is the only place that computes
         // `sender` and `tx_hash`. This code stamps both fields into the
@@ -185,12 +198,26 @@ where
             })?;
 
         let cached = self.cache.lookup(sender, nonce);
+        let account = self
+            .cfg
+            .admission_checks
+            .then(|| self.local_account(sender))
+            .flatten();
         Ok(ValidatedSubmission {
             sender,
             nonce,
             tx_hash,
             cached,
+            account,
+            cost,
         })
+    }
+
+    /// The sender's local entry, counted as a hit or a miss.
+    fn local_account(&self, sender: alloy_primitives::Address) -> Option<AccountView> {
+        let view = self.live.get(sender);
+        cache_metrics::record_lookup("live", if view.is_some() { "hit" } else { "miss" });
+        view
     }
 
     /// Publishes a validated envelope onto `tx_data[shard]`. The shard comes
@@ -227,11 +254,22 @@ where
 /// over the per-tx gas cap. `ConsensusEnvelope` (`alloy_consensus::TxEnvelope`)
 /// is foreign, so this attaches the check as a local extension trait
 /// instead of a free function taking the envelope as a loose parameter.
+/// The worst-case cost lives here for the same reason.
 trait CheckProtocolLimits {
     fn check_protocol_limits(&self) -> Result<(), IngressError>;
+    /// `gas_limit * max_fee_per_gas + value`, the most the tx can take
+    /// from the sender. `max_fee_per_gas` is `gas_price` on a legacy
+    /// envelope. `None` on overflow.
+    fn worst_case_cost(&self) -> Option<U256>;
 }
 
 impl CheckProtocolLimits for ConsensusEnvelope {
+    fn worst_case_cost(&self) -> Option<U256> {
+        U256::from(self.gas_limit())
+            .checked_mul(U256::from(self.max_fee_per_gas()))
+            .and_then(|gas| gas.checked_add(self.value()))
+    }
+
     fn check_protocol_limits(&self) -> Result<(), IngressError> {
         if let Self::Eip4844(_) = self {
             count_reject("unsupported-type");
@@ -263,5 +301,33 @@ impl ValidatedSubmission {
         // Count it, so received == accepted + rejected holds on every path.
         metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
         Some(Ok(prev.clone()))
+    }
+
+    /// The admission checks against the sender's local entry, after the
+    /// receipt cache missed. A nonce below the entry's is a past nonce:
+    /// `Duplicate`, the same error the sequencer's rejection becomes,
+    /// so a client sees one shape for one condition. A balance below the
+    /// worst-case cost is `InsufficientFunds`. No entry, an expired one,
+    /// or a cost overflow admits: the executor's own checks are the
+    /// bound, as before the layer existed.
+    fn check_account(&self) -> Result<(), IngressError> {
+        let Some(account) = &self.account else {
+            return Ok(());
+        };
+        if self.nonce < account.nonce {
+            count_reject("nonce-too-low");
+            return Err(IngressError::Duplicate((self.sender, self.nonce)));
+        }
+        if let Some(want) = self.cost
+            && account.balance < want
+        {
+            count_reject("insufficient-funds");
+            return Err(IngressError::InsufficientFunds {
+                address: self.sender,
+                have: account.balance,
+                want,
+            });
+        }
+        Ok(())
     }
 }

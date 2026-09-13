@@ -6,7 +6,7 @@
 //! 1. [`LiveAccounts`], an in-process map fed by the account rows on the
 //!    `tx_receipts` batch frame. A warm sender never touches the network.
 //! 2. [`AccountCache`], the Redis projection the state mirror writes.
-//! 3. The executor query, on a Redis miss. The reader owns that call.
+//! 3. [`ExecutorQuery`], one JSON-RPC call to an executor, on a miss.
 //!
 //! Every layer applies one monotone write rule: a row applies only when
 //! its batch end position is greater than the stored one. On an equal
@@ -19,6 +19,7 @@ pub mod error;
 pub mod keys;
 pub mod live;
 pub mod metrics;
+pub mod query;
 pub mod script;
 
 mod client;
@@ -27,3 +28,4 @@ pub use client::{AccountCache, AccountView, RowsWritten};
 pub use config::{CacheConfig, LiveAccountsConfig};
 pub use error::CacheError;
 pub use live::{LiveAccounts, LiveAccountsWriter};
+pub use query::{ExecutorQuery, ExecutorQueryConfig, QueryAnswer, QueryError, QueryMethod};

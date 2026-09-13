@@ -26,6 +26,9 @@ arc-swap = { workspace = true }
 # await: DashMap, the same reason the executor's join buffer uses it.
 dashmap = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+# The executor query client (`query`): one JSON-RPC POST per cold address.
+reqwest = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
