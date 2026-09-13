@@ -568,6 +568,7 @@ impl DaWatcherService {
                 .context("discovered plane has an instance")?
                 .to_string(),
             expected_own: 1,
+            removal_grace: self.plane.removal_grace(),
             membership,
             stop: recorders.stop_token(),
             runtime: tokio::runtime::Handle::current(),

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
+use super::absence::Absence;
 use super::endpoint::destination_uri;
 use super::record::{PublisherRecord, ServiceId};
 use super::watch::{CatalogHealth, Membership};
@@ -48,11 +49,11 @@ pub struct Plan {
 }
 
 /// One attached destination and the incarnations behind it.
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 struct Attached {
     ids: BTreeSet<ServiceId>,
     /// Set while the last successful read no longer lists any of `ids`.
-    missing_since: Option<Instant>,
+    absence: Absence,
 }
 
 pub struct Reconciler {
@@ -88,7 +89,7 @@ impl Reconciler {
             // start a full removal grace before any destination can detach.
             self.attached
                 .values_mut()
-                .for_each(|attached| attached.missing_since = None);
+                .for_each(|attached| attached.absence.clear());
             return Plan::default();
         }
         if !membership.is_known() {
@@ -135,7 +136,7 @@ impl Reconciler {
                     uri.to_string(),
                     Attached {
                         ids: ids.cloned().unwrap_or_default(),
-                        missing_since: None,
+                        absence: Absence::default(),
                     },
                 );
             }
@@ -179,12 +180,9 @@ impl Reconciler {
         now: Instant,
         grace: Duration,
     ) -> Option<String> {
-        if desired.is_some() {
-            att.missing_since = None;
-            return None;
-        }
-        let since = *att.missing_since.get_or_insert(now);
-        (now.duration_since(since) >= grace).then(|| uri.to_string())
+        att.absence
+            .expired(desired.is_some(), now, grace)
+            .then(|| uri.to_string())
     }
 
     /// Log a replacement incarnation behind an attached endpoint, and
