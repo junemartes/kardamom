@@ -95,6 +95,12 @@ pub(super) enum RuntimeCmd {
         uri: String,
         ack: CbSender<Result<(), LogError>>,
     },
+    /// Close a subscription: drop its destinations, its handlers, and the
+    /// Aeron subscription itself. Its `sub_id` is never reused.
+    CloseSubscription {
+        sub_id: u32,
+        ack: CbSender<Result<(), LogError>>,
+    },
     /// Stop the loop, drop everything.
     Shutdown,
 }
@@ -365,6 +371,24 @@ impl AeronRuntime {
         )
     }
 
+    /// Close a subscription opened by one of the `open_subscription*`
+    /// methods. The driver releases its images; the receiver side of the
+    /// frame channel sees the end of the stream. A short-lived
+    /// subscription, such as one bounded archive replay, closes here
+    /// rather than stay in the thread's table for the process lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `sub_id` is unknown or already closed, or if
+    /// the command round trip times out.
+    pub fn close_subscription(&self, sub_id: u32) -> Result<(), LogError> {
+        request(
+            &self.cmd_tx,
+            |ack| RuntimeCmd::CloseSubscription { sub_id, ack },
+            "close_subscription",
+        )
+    }
+
     /// Open a typed subscription, returning a [`TypedSubscription`] that
     /// decodes each fragment as `T` when the consumer calls
     /// `recv`/`try_recv`.
@@ -473,6 +497,22 @@ impl AeronRuntime {
     ) -> Result<TxDataSubscription, LogError> {
         let (_sub_id, rx) = self.open_subscription_raw(uri, stream_id)?;
         Ok(TxDataSubscription { rx })
+    }
+
+    /// [`open_tx_data_subscription`](Self::open_tx_data_subscription),
+    /// also returning the `sub_id` that [`close_subscription`](Self::close_subscription)
+    /// takes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Aeron thread fails to add the subscription.
+    pub fn open_tx_data_subscription_with_id(
+        &self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<(u32, TxDataSubscription), LogError> {
+        let (sub_id, rx) = self.open_subscription_raw(uri, stream_id)?;
+        Ok((sub_id, TxDataSubscription { rx }))
     }
 }
 

@@ -153,7 +153,9 @@ struct AeronThread {
     /// subscription, so every destination must drop while its
     /// subscription is still open.
     dests: Vec<Destination>,
-    subs: Vec<SubEntry>,
+    /// Indexed by `sub_id`. A closed subscription leaves a `None` slot,
+    /// so the ids of the open ones stay valid.
+    subs: Vec<Option<SubEntry>>,
     pending: VecDeque<PendingPublish>,
     /// Escalating idle wait for the busy branch: base 100 microseconds (the
     /// established sub-poll/retry cadence), cap 1 ms (the empty-branch
@@ -212,7 +214,7 @@ impl AeronThread {
         // 4. Idle. Block only when there is genuinely nothing to do:
         //    nothing to poll and nothing pending. Otherwise wait at the
         //    poll/retry cadence without busy-spinning a core.
-        if self.subs.is_empty() && self.pending.is_empty() {
+        if self.subs.iter().flatten().next().is_none() && self.pending.is_empty() {
             return match self.wait_for_cmd(Duration::from_millis(1)) {
                 ControlFlow::Break(()) => ControlFlow::Break(()),
                 ControlFlow::Continue(_) => ControlFlow::Continue(()),
@@ -294,7 +296,7 @@ impl AeronThread {
     /// cannot short-circuit on the first one that has work.
     fn poll_subscriptions(&mut self) -> bool {
         let mut worked = false;
-        for entry in &mut self.subs {
+        for entry in self.subs.iter_mut().flatten() {
             worked |= entry.poll_once();
         }
         worked
@@ -369,13 +371,28 @@ impl AeronThread {
                 .map_err(|e| LogError::Aeron(format!("fragment assembler: {e:?}")))?;
         let id = u32::try_from(self.subs.len())
             .map_err(|_| LogError::Aeron("subscription table exceeds u32::MAX entries".into()))?;
-        self.subs.push(SubEntry {
+        self.subs.push(Some(SubEntry {
             sub,
             assembler,
             inner,
             poll_failed: false,
-        });
+        }));
         Ok(id)
+    }
+
+    /// Close a subscription: its destinations drop first (they detach
+    /// through it), then the row itself, which releases the handlers and
+    /// closes the Aeron subscription. The slot stays `None`.
+    fn cmd_close_subscription(&mut self, sub_id: u32) -> Result<(), LogError> {
+        let slot = self.subs.get_mut(sub_id as usize).ok_or_else(|| {
+            LogError::Aeron(format!("close subscription: unknown sub_id {sub_id}"))
+        })?;
+        let entry = slot.take().ok_or_else(|| {
+            LogError::Aeron(format!("close subscription: sub_id {sub_id} is closed"))
+        })?;
+        self.dests.retain(|d| d.sub_id != sub_id);
+        drop(entry);
+        Ok(())
     }
 
     /// Detach a source endpoint from an MDS subscription. Dropping the
@@ -423,6 +440,9 @@ impl AeronThread {
             RuntimeCmd::SubRemoveDestination { sub_id, uri, ack } => {
                 let _ = ack.send(self.cmd_remove_destination(sub_id, &uri));
             }
+            RuntimeCmd::CloseSubscription { sub_id, ack } => {
+                let _ = ack.send(self.cmd_close_subscription(sub_id));
+            }
             RuntimeCmd::Shutdown => {}
         }
     }
@@ -458,6 +478,7 @@ impl AeronThread {
         let sub = self
             .subs
             .get(sub_id as usize)
+            .and_then(Option::as_ref)
             .ok_or_else(|| LogError::Aeron(format!("add destination: unknown sub_id {sub_id}")))?;
         if self
             .dests

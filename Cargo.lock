@@ -3771,6 +3771,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-chaos"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-primitives",
+ "anyhow",
+ "kardamom-bench",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "kardamom-cluster-adapter"
 version = "0.1.0"
 dependencies = [

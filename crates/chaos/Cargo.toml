@@ -1,0 +1,33 @@
+[package]
+name = "kardamom-chaos"
+version.workspace = true
+edition.workspace = true
+description = "The container cluster chaos suite: lifecycle, probes, injectors, and the cases."
+
+[lib]
+name = "kardamom_chaos"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Gates the shard tests under tests/. They bring a container cluster up
+# through terraform/containers and ansible/cluster.yml, so they need
+# Docker, OpenTofu, Ansible, and the prebuilt service artifacts. Off by
+# default so `cargo test` works without them.
+cluster-e2e = []
+
+[dependencies]
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-network.workspace = true
+alloy-primitives.workspace = true
+anyhow.workspace = true
+kardamom-bench = { path = "../bench" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
