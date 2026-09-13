@@ -42,7 +42,7 @@ Vagrant.configure("2") do |config|
   config.vm.box = "generic/ubuntu2204"
 
   # Use the shared Vagrant insecure key on every VM instead of per-machine
-  # generated keys: ansible/site.yml is run ONCE against all hosts (see the
+  # generated keys: ansible/bootstrap.yml is run ONCE against all hosts (see the
   # provisioner below and `make provision`), and a single run can only
   # authenticate everywhere if all hosts accept the same key
   # (~/.vagrant.d/insecure_private_key, wired up in ansible/ansible.cfg).
@@ -67,7 +67,7 @@ Vagrant.configure("2") do |config|
       # sees the whole inventory in a single run.
       if idx == NODES.size - 1
         vm.vm.provision :ansible do |ansible|
-          ansible.playbook       = "ansible/site.yml"
+          ansible.playbook       = "ansible/bootstrap.yml"
           ansible.inventory_path = "ansible/inventory.ini"
           ansible.limit          = "all"
           ansible.compatibility_mode = "2.0"

@@ -4,7 +4,7 @@
 # =============================================================================
 #
 # EXPERIMENTAL. This replaces a Vagrant VM with a privileged systemd container
-# so the SAME Ansible playbook (site.yml) can provision Docker + Consul + Nomad
+# so the SAME Ansible playbook (bootstrap.yml) can provision Docker + Consul + Nomad
 # and Nomad's docker driver can run workloads via Docker-in-Docker. It is the
 # CI analogue of a VM; it is NOT a production pattern.
 #

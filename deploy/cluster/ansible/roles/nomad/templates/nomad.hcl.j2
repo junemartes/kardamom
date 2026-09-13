@@ -1,5 +1,6 @@
 # Managed by Ansible (roles/nomad). Derives from group_vars/all.yml.
-datacenter = "dc1"
+region     = "{{ nomad_region }}"
+datacenter = "{{ datacenter }}"
 data_dir   = "/opt/nomad"
 
 bind_addr = "{{ node_ip }}"
@@ -9,49 +10,92 @@ advertise {
   rpc  = "{{ node_ip }}"
   serf = "{{ node_ip }}"
 }
+{% if control_plane | default(false) | bool %}
 
 server {
-  enabled          = {{ 'true' if inventory_hostname in groups['control'] else 'false' }}
-  bootstrap_expect = 1
+  enabled          = true
+  bootstrap_expect = {{ nomad_server_expect }}
 }
+{% endif %}
 
 client {
-  enabled    = true
-  servers    = ["{{ control_ip }}:{{ ports.nomad_rpc }}"]
+  enabled = true
 
-  # Pin the CPU fingerprint. Nomad derives a node's total CPU compute from
-  # /proc/cpuinfo's "cpu MHz", which is ABSENT on arm64 (Apple Silicon under
-  # Docker Desktop) — so the fingerprint collapses to ~0 and every task's `cpu`
-  # reservation "exhausts" the node ("Dimension cpu exhausted"). A fixed compute
-  # budget lets the scheduler place the collocated jobs; over-subscription across
-  # the co-resident node containers is fine (the kernel time-shares the cores).
+  # Placement identity. node_class and node_pool carry the capacity pool
+  # of an elastic node; a core node stays in the default pool. The
+  # Autoscaler target selects nodes by node_class. A job selects a pool
+  # with node_pool, so a core job cannot land on an elastic node.
+  node_class = "{{ node_class | default(role) }}"
+  node_pool  = "{{ node_pool | default('default') }}"
+{% if deployment_profile == 'local' %}
+
+  # Pin the CPU fingerprint on the local profile. Nomad derives a node's
+  # total CPU compute from /proc/cpuinfo's "cpu MHz", which is ABSENT on
+  # arm64 (Apple Silicon under Docker Desktop), so the fingerprint
+  # collapses to ~0 and every task's `cpu` reservation "exhausts" the
+  # node ("Dimension cpu exhausted"). A fixed compute budget lets the
+  # scheduler place the collocated jobs; over-subscription across the
+  # co-resident node containers is fine (the kernel time-shares the
+  # cores). A production host reports its real capacity.
   cpu_total_compute = 16000
+{% endif %}
 
   # role  = node class (unique placement: ${meta.role} == ingress, …)
-  # tier  = coarse group (collocation/exclusion: recorders + aeron target
-  #         ${meta.tier} == worker; aeron excludes ${meta.tier} == control).
-  # Per-replica identity (recorder_id) comes from ${NOMAD_ALLOC_INDEX} in the
-  # count-based jobs; the sequencer job instead derives its partition from
-  # ${meta.node_index} (deterministic replica-group cross-placement).
+  # tier  = coarse group (collocation/exclusion: aeron excludes
+  #         ${meta.tier} == control).
+  # node_ip and node_index feed the jobs that still form an endpoint or
+  # a host id from the node. Their removal belongs to the dynamic MDC
+  # cutover; until then every profile stamps them.
   meta {
     kardamom_node = "{{ kardamom_node }}"
+    cluster_id    = "{{ cluster_id }}"
     role          = "{{ role }}"
     tier          = "{{ tier }}"
-    # node_ip: this node's cluster IP. Used by sequencer.nomad.hcl / sealer to
-    # form the tx_ordering MDC control endpoint <node_ip>:{{ tx_ordering_mdc_port }}.
+    pool          = "{{ node_pool | default('default') }}"
+    # node_ip: this node's private address. sequencer.nomad.hcl and
+    # executor.nomad.hcl form the cluster egress endpoint <node_ip>:402x0
+    # from it.
     node_ip       = "{{ node_ip }}"
     # node_index: this node's 0-based index within its class (the <i> of
-    # kardamom-<class>-<i>, or the inventory's explicit node_index/sequencer_id
-    # var). Gives jobs a DETERMINISTIC node-derived identity —
-    # sequencer.nomad.hcl uses it as the partition index so its two replica
-    # groups cross-place shards without depending on alloc-index luck.
+    # <class>-<i>). sequencer.nomad.hcl forms KARDAMOM_HOST_ID from it.
     node_index    = "{{ node_index | default(sequencer_id | default('0')) }}"
   }
 }
 
 consul {
   address = "127.0.0.1:{{ ports.consul_http }}"
+  # Nomad servers and clients find each other through the local Consul
+  # agent. There is no static server list. The service names carry the
+  # cluster_id, so two clusters in one Consul datacenter cannot join.
+  auto_advertise      = true
+  server_auto_join    = true
+  client_auto_join    = true
+  server_service_name = "{{ cluster_id }}-nomad"
+  client_service_name = "{{ cluster_id }}-nomad-client"
+{% if nomad_consul_token | length > 0 %}
+  token               = "{{ nomad_consul_token }}"
+{% endif %}
 }
+{% if nomad_acl_enabled | bool %}
+
+acl {
+  enabled = true
+}
+{% endif %}
+{% if nomad_tls_dir | length > 0 %}
+
+tls {
+  http = true
+  rpc  = true
+
+  ca_file   = "{{ nomad_tls_dir }}/ca.pem"
+  cert_file = "{{ nomad_tls_dir }}/cert.pem"
+  key_file  = "{{ nomad_tls_dir }}/key.pem"
+
+  verify_server_hostname = true
+  verify_https_client    = false
+}
+{% endif %}
 
 # volumes.enabled is REQUIRED: it defaults to false, and every kardamom job
 # bind-mounts host paths (the shared Aeron tmpfs, archive/state dirs) via the

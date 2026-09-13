@@ -8,7 +8,7 @@ materialise the nodes, sharing the same Ansible playbook and Nomad jobs:
   `192.168.56.0/24` bridge and drives the full bring-up + smoke + load +
   chaos suite (`.github/workflows/cluster-e2e.yml`).
 - **VMs (Vagrant):** `make up` boots one VM per node (libvirt primary,
-  VirtualBox fallback) and provisions them with the same `site.yml`.
+  VirtualBox fallback) and provisions them with the same `bootstrap.yml`.
 
 See [`DESIGN.md`](./DESIGN.md) for the original design rationale and
 [`../../docs/failure-modes.md`](../../docs/failure-modes.md) for per-actor
@@ -78,7 +78,7 @@ make down      # stop jobs + vagrant destroy
 `make up` phases (each is an individual target too):
 
 1. `make vms` — `vagrant up` boots one VM per `node_classes` instance.
-2. `make provision` — `ansible-playbook site.yml` (inventory:
+2. `make provision` — `ansible-playbook bootstrap.yml` (inventory:
    `ansible/inventory.ini`, kept in sync with `node_classes`) installs
    Docker, Consul, Nomad, the registry, the tmpfs `aeron.dir`, and stamps
    each Nomad node's meta (`role`, `tier`, `node_ip`, `node_index`).
@@ -275,11 +275,14 @@ deploy/cluster/
   ansible/
     ansible.cfg, inventory.ini   (static VM inventory — mirrors node_classes;
                                   the container path generates its own)
-    group_vars/all.yml      ← canonical contract (classes, IPs, ports, versions)
-    site.yml               host provisioning
+    group_vars/all.yml      ← canonical contract (classes, IPs, ports, versions,
+                              deployment profile)
+    bootstrap.yml          configure a host and join it to the substrate
     deploy.yml             workload deployment, signature and readiness gates
     images.yml             build, push, sign, and publish an image manifest
-    roles/{common,docker,consul,nomad,registry,workloads,images,cosign}/
+    roles/{profile,enroll,common,vswitch,netinfo,docker,firewall,consul,nomad,
+           registry,workloads,images,cosign}/
+    inventories/hetzner/   example production inventory + profile values
   docker/
     service.Dockerfile      multi-stage cargo build → slim runtime (VM path)
     ci-service.Dockerfile   thin wrapper over prebuilt binaries (CI path)
@@ -307,6 +310,36 @@ The Nomad job specs pull their config payloads from `config/` with HCL2
 The Ansible deployment role sets this working directory itself.
 
 Operational integrity tooling lives in the private infra repo.
+
+## Deployment profiles
+
+`bootstrap.yml` serves two profiles. `deployment_profile` in
+`ansible/group_vars/all.yml` selects one; the roles read it.
+
+| Profile | Hosts | Servers | Addresses | Security |
+|---------|-------|---------|-----------|----------|
+| `local` (default) | Vagrant VMs, or the CI node containers | one control node runs the Consul and Nomad servers | explicit `node_ip` per inventory host | plain-HTTP registry, no host firewall |
+| `production` | Hetzner dedicated core, plus elastic Cloud pools | three voting servers on the dedicated core | `roles/netinfo` resolves the address from the vSwitch VLAN or the private interface | gossip encryption, ACLs, agent TLS, `roles/firewall` |
+
+In both profiles the Nomad agents find their servers through the local
+Consul agent (`server_auto_join`, `client_auto_join`). There is no static
+server list. The Consul agents join `consul_retry_join`: the control node
+in the local profile, infrastructure DNS names in production. The Nomad
+service names carry `cluster_id`, so two clusters in one Consul datacenter
+cannot join each other.
+
+`ansible/inventories/hetzner/` holds an example production inventory and
+the profile values. Copy it outside the repo, fill in the dedicated
+inventory, the vSwitch inputs and an encrypted vault file with the secret
+inputs, then run `ansible-playbook -i <copy> -u root ansible/bootstrap.yml`.
+`roles/profile` refuses a production run that lacks a security input.
+
+An elastic Cloud node has no inventory entry. At first boot its bootstrap
+unit runs the same `bootstrap.yml` against the local host with the inputs
+cloud-init wrote. `roles/enroll` runs the enrollment client the image
+carries and loads the credentials it produced; without them the agents
+stay disabled. The target design is the Hetzner hybrid infrastructure
+specification, [PR #278](https://github.com/junemartes/kardamom/pull/278).
 
 ## Aeron-in-Docker
 

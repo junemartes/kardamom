@@ -103,6 +103,26 @@ else:
     if "node_classes:" not in gv:
         err("group_vars/all.yml: neither cluster_nodes nor node_classes is defined")
 
+# --- the one bootstrap entry point ---------------------------------------------
+# bootstrap.yml is the only host configuration playbook. Every caller (the
+# Makefile, the Vagrantfile, containers.yml) runs it, and the Nomad agents
+# find their servers through Consul, never through a static server list.
+ANSIBLE = CLUSTER / "ansible"
+if (ANSIBLE / "site.yml").exists():
+    err("ansible/site.yml exists: bootstrap.yml is the one entry point; delete site.yml")
+must_contain(ANSIBLE / "bootstrap.yml", "provision_hosts | default('all')", "the bootstrap playbook configures every host")
+for caller in ("Makefile", "Vagrantfile", "ansible/containers.yml"):
+    must_contain(CLUSTER / caller, "bootstrap.yml", "runs the one bootstrap playbook")
+    must_not_contain(CLUSTER / caller, "site.yml", "site.yml is replaced by bootstrap.yml")
+NOMAD_TPL = ANSIBLE / "roles" / "nomad" / "templates" / "nomad.hcl.j2"
+must_not_contain(NOMAD_TPL, "\n  servers", "Nomad clients discover servers through Consul")
+for key in ("server_auto_join", "client_auto_join", "auto_advertise"):
+    must_contain(NOMAD_TPL, key, "Consul-based Nomad join")
+must_contain(NOMAD_TPL, 'server_service_name = "{{ cluster_id }}-nomad"', "Nomad service names carry cluster_id")
+profile = scalar(gv, "deployment_profile")
+if profile != "local":
+    err(f"group_vars/all.yml: deployment_profile must default to local, got {profile!r}")
+
 # --- Makefile -----------------------------------------------------------------
 must_contain(CLUSTER / "Makefile", f"REGISTRY := {registry}", "registry host:port")
 must_contain(CLUSTER / "Makefile", f"NOMAD_ADDR := {nomad_addr}", "nomad HTTP API")

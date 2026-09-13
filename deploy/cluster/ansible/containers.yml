@@ -13,7 +13,7 @@
     - container_nodes
 
 - name: Provision container substrate
-  ansible.builtin.import_playbook: site.yml
+  ansible.builtin.import_playbook: bootstrap.yml
   vars:
     provision_hosts: container_nodes
 

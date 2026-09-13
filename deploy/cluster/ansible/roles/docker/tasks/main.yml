@@ -1,6 +1,7 @@
 ---
-# Install Docker CE from the official apt repo and point it at the insecure
-# local registry on the control node. Values derive from group_vars/all.yml.
+# Install Docker CE from the official apt repo. The local profile trusts
+# the plain-HTTP registry on the control node and adds the vagrant user to
+# the docker group. Values derive from group_vars/all.yml.
 
 - name: Ensure apt keyrings directory exists
   ansible.builtin.file:
@@ -41,7 +42,7 @@
     state: present
     update_cache: true
 
-- name: Configure Docker daemon (insecure local registry)
+- name: Configure the Docker daemon (trusted plain-HTTP registries)
   ansible.builtin.template:
     src: daemon.json.j2
     dest: /etc/docker/daemon.json
@@ -51,6 +52,7 @@
   notify: Restart docker
 
 - name: Add the vagrant user to the docker group
+  when: deployment_profile == 'local'
   ansible.builtin.user:
     name: vagrant
     groups: docker

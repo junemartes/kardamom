@@ -31,7 +31,7 @@ vms:
 
 ## provision: install docker/nomad/consul/registry via Ansible
 provision:
-	ansible-playbook -i ansible/inventory.ini ansible/site.yml
+	ansible-playbook -i ansible/inventory.ini ansible/bootstrap.yml
 
 ## images: build service + aeron images on the host and push to the registry.
 ## NOTE: pushing needs $(REGISTRY) in the HOST Docker daemon's
