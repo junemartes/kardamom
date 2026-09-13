@@ -40,6 +40,7 @@ variable "ack_policy" {
 variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count). The account RPCs' executor queries go to executor-<i>.node.<datacenter>.consul."
+  default     = 3
 }
 
 variable "image_ref" {
