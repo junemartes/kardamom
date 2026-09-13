@@ -73,9 +73,9 @@ pub struct IngressConfig {
     /// touched, kept for the TTL. Feeds the admission checks and the two
     /// account RPCs. See `kardamom_cache::LiveAccounts`.
     pub live_accounts: LiveAccountsConfig,
-    /// Whether the submit path rejects a past nonce and an unfunded
-    /// sender from the local layer. Off, every submit publishes as
-    /// before the layer existed. The reads for the RPCs stay on.
+    /// Whether the submit path rejects an unfunded sender from the local
+    /// layer. Off, every submit publishes as before the layer existed.
+    /// The reads for the RPCs stay on.
     pub admission_checks: bool,
     /// The executor query, the read layer behind the local one for the
     /// two account RPCs. Off when the endpoint list is empty: a cold

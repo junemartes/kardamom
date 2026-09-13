@@ -4,10 +4,10 @@
 //!
 //! The admission checks read the local account layer only. A miss
 //! admits: the executor query is never on this path, so a flood of cold
-//! senders costs the executors nothing. A past nonce rejects as
-//! `Duplicate`, after the receipt cache has had its say, so a retry of
-//! a landed tx still gets its receipt. An unfunded sender rejects as
-//! `InsufficientFunds`.
+//! senders costs the executors nothing. An unfunded sender rejects as
+//! `InsufficientFunds`. A past nonce publishes: the door rejects it only
+//! with a receipt that proves another tx holds the nonce, which is the
+//! receipt cache's identity guard.
 
 use std::net::IpAddr;
 
@@ -304,19 +304,23 @@ impl ValidatedSubmission {
     }
 
     /// The admission checks against the sender's local entry, after the
-    /// receipt cache missed. A nonce below the entry's is a past nonce:
-    /// `Duplicate`, the same error the sequencer's rejection becomes,
-    /// so a client sees one shape for one condition. A balance below the
-    /// worst-case cost is `InsufficientFunds`. No entry, an expired one,
-    /// or a cost overflow admits: the executor's own checks are the
-    /// bound, as before the layer existed.
+    /// receipt cache missed. A balance below the worst-case cost is
+    /// `InsufficientFunds`. No entry, an expired one, or a cost overflow
+    /// admits: the executor's own checks are the bound, as before the
+    /// layer existed.
+    ///
+    /// A nonce below the entry's publishes, and the sequencer decides as
+    /// before the layer existed. The rows reach the layer before the
+    /// receipts reach the receipt cache, and the receipt bus drops
+    /// receipts for a lagging watcher, so the layer can know a nonce
+    /// whose receipt this ingress never caches. A reject there would
+    /// answer a retry of a landed tx with `Duplicate` for good.
     fn check_account(&self) -> Result<(), IngressError> {
         let Some(account) = &self.account else {
             return Ok(());
         };
         if self.nonce < account.nonce {
-            count_reject("nonce-too-low");
-            return Err(IngressError::Duplicate((self.sender, self.nonce)));
+            cache_metrics::record_degraded("past-nonce");
         }
         if let Some(want) = self.cost
             && account.balance < want
