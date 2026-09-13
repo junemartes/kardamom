@@ -127,13 +127,20 @@ job "sequencer" {
         # lane's metrics port. The host id names the node and the lane.
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9001"
         KARDAMOM_HOST_ID      = "node${meta.node_index}-seq-0"
+        # The UDP ports the discovered tx_errors publication binds, on
+        # the lane's range, so two lanes can share a node.
+        KARDAMOM_MDC_PORTS    = "40340-40349"
       }
 
-      # Cluster LogConfig (UDP multicast channels), read through
+      # Cluster LogConfig (Aeron streams and discovery), read through
       # --log-config.
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }
 
       # This comes from one source, config/sequencer.toml.tpl. The
@@ -236,13 +243,20 @@ job "sequencer" {
         # lane's metrics port. The host id names the node and the lane.
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9011"
         KARDAMOM_HOST_ID      = "node${meta.node_index}-seq-1"
+        # The UDP ports the discovered tx_errors publication binds, on
+        # the lane's range, so two lanes can share a node.
+        KARDAMOM_MDC_PORTS    = "40350-40359"
       }
 
-      # Cluster LogConfig (UDP multicast channels), read through
+      # Cluster LogConfig (Aeron streams and discovery), read through
       # --log-config.
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }
 
       # This comes from one source, config/sequencer.toml.tpl. The

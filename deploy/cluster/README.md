@@ -417,8 +417,10 @@ unbounded creation.
 - **Host networking:** all Aeron + service containers run
   `network_mode = "host"`, so Aeron UDP channel endpoints are just the node
   IP — no Docker port mapping.
-- **Channels:** one shared `config/channels.toml.tpl` (UDP multicast; stream
-  ids distinguish publishers) consumed by every service via `--log-config`.
+- **Channels:** one shared `config/channels.toml.tpl` (dynamic Aeron MDC
+  with Consul discovery; stream ids distinguish streams, control endpoints
+  distinguish publishers) consumed by every service via `--log-config`. See
+  `docs/aeron-discovery.md`.
 - **Durability:** the sealer's Aeron Cluster members archive the canonical
   log (`archive-at-the-sealer`); executors persist state in libmdbx under
   `/opt/kardamom/state` and crash-recover by archive replay-merge.

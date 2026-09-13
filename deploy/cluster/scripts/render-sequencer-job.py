@@ -38,6 +38,7 @@ DEFAULT_MAP = os.path.join(CLUSTER, "config", "shard-map.toml")
 VSLOT_COUNT = 256
 METRICS_BASE = 9001
 PORT_LANE_STEP = 10
+MDC_PORT_BASE = 40340
 
 
 def scalar(text: str, key: str) -> str:
@@ -228,13 +229,20 @@ GROUP = """
         # lane's metrics port. The host id names the node and the lane.
         KARDAMOM_METRICS_ADDR = "0.0.0.0:{metrics_port}"
         KARDAMOM_HOST_ID      = "node${{meta.node_index}}-seq-{lane}"
+        # The UDP ports the discovered tx_errors publication binds, on
+        # the lane's range, so two lanes can share a node.
+        KARDAMOM_MDC_PORTS    = "{mdc_ports}"
       }}
 
-      # Cluster LogConfig (UDP multicast channels), read through
+      # Cluster LogConfig (Aeron streams and discovery), read through
       # --log-config.
       template {{
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }}
 
       # This comes from one source, config/sequencer.toml.tpl. The
@@ -315,6 +323,10 @@ def render(gv: str, target: list[int], current: list[int] | None) -> str:
                 query_endpoints=query_endpoints,
                 egress_port=egress_base + PORT_LANE_STEP * lane,
                 metrics_port=METRICS_BASE + PORT_LANE_STEP * lane,
+                mdc_ports=(
+                    f"{MDC_PORT_BASE + PORT_LANE_STEP * lane}-"
+                    f"{MDC_PORT_BASE + PORT_LANE_STEP * lane + PORT_LANE_STEP - 1}"
+                ),
             )
         )
     out.append("}\n")

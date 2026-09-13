@@ -17,10 +17,17 @@
 #      the changed groups one replica at a time, and stops a leaving lane.
 #
 # The script refuses to start while a resize is in flight (the marker
-# file config/shard-map.next.toml exists), and while any sequencer replica
-# is in resync mode or holds parked entries (sealer backpressure). It
-# leaves config/shard-map.toml and nomad/sequencer.nomad.hcl updated in
-# the working tree; commit them.
+# file config/shard-map.next.toml exists). It waits up to tx_ttl + 60 s
+# for every sequencer replica to leave resync mode and to drain its
+# parked entries, and refuses when one never does (sealer backpressure).
+# The wait, not a single read: a replica that restarted seconds ago is in
+# resync mode for a few seconds, and a sender's nonce gap parks that
+# sender's later transactions on every replica of its lane until the gap
+# fills or the entries expire at tx_ttl. Measured under a chaos case
+# load, the parked depth reads nonzero in about one second in twenty and
+# clears within twelve seconds. Both are ordinary; a replica that stays
+# parked past tx_ttl is not. It leaves config/shard-map.toml and
+# nomad/sequencer.nomad.hcl updated in the working tree; commit them.
 #
 # Usage (from the host, like deploy.sh):
 #   deploy/cluster/scripts/scale-sequencers.sh <target-lanes>
@@ -131,14 +138,26 @@ wait_running() { # <job> <timeout-s>
 [[ ! -f "${NEXT_MAP}" ]] || fail "a resize is in flight (${NEXT_MAP} exists); finish or remove it first"
 CURRENT="$(map_lanes "${MAP}")"
 [[ "${CURRENT}" != "${TARGET}" ]] || fail "already at ${TARGET} lanes"
+# A replica is idle when both gauges read 0. An unreachable exporter
+# reads empty and counts as idle: not every node runs every lane.
+replica_idle() { # <ip> <port>
+  local r p
+  r="$(metric "$1" "$2" kardamom_sequencer_resync_mode || true)"
+  p="$(metric "$1" "$2" kardamom_sequencer_pending_depth || true)"
+  [[ -z "${r}" || "${r}" == "0" ]] && [[ -z "${p}" || "${p}" == "0" ]]
+}
+wait_replica_idle() { # <ip> <port> <timeout-s>
+  local t=0
+  until replica_idle "$1" "$2"; do
+    (( t >= $3 )) && fail "replica $1:$2 is in resync mode or holds parked entries after $3s (sealer backpressure); not resizing"
+    sleep 2; t=$(( t + 2 ))
+  done
+}
 if [[ "${DRY_RUN}" != "1" ]]; then
   for ((lane = 0; lane < CURRENT; lane++)); do
     port=$(( METRICS_BASE + 10 * lane ))
     for ip in "${SEQ_IPS[@]}"; do
-      v="$(metric "${ip}" "${port}" kardamom_sequencer_resync_mode || true)"
-      [[ -z "${v}" || "${v}" == "0" ]] || fail "replica ${ip}:${port} is in resync mode (sealer backpressure); not resizing"
-      v="$(metric "${ip}" "${port}" kardamom_sequencer_pending_depth || true)"
-      [[ -z "${v}" || "${v}" == "0" ]] || fail "replica ${ip}:${port} holds ${v} parked entries; not resizing"
+      wait_replica_idle "${ip}" "${port}" $(( TX_TTL_S + 60 ))
     done
   done
 fi

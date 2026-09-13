@@ -112,10 +112,35 @@ job "cluster" {
 
     network {
       mode = "host"
+      # The client-facing ingress endpoint, registered below.
+      port "ingress" {
+        static = 40200
+      }
     }
 
     task "cluster" {
       driver = "docker"
+
+      # The cluster member record of the discovery contract
+      # (docs/aeron-discovery.md): every cluster client resolves the
+      # member ingress endpoints from these records at startup. The
+      # member id equals the node index of the sealer class, which is
+      # the order ClusterNode derives its member id from the node IP.
+      # Nomad owns this record. Discovering a member never changes the
+      # voting set: the membership stays the static list in
+      # JAVA_TOOL_OPTIONS below.
+      service {
+        name     = "kardamom-cluster-member"
+        port     = "ingress"
+        address  = "${meta.node_ip}"
+        provider = "consul"
+        meta {
+          discovery_version = "1"
+          cluster_id        = "${meta.cluster_id}"
+          chain_id          = "412346"
+          member_id         = "${meta.node_index}"
+        }
+      }
 
       # These are JVM options for the image ENTRYPOINT
       # (java -Xmx384m -cp ... ClusterNode). They must go through env,
