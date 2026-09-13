@@ -102,6 +102,11 @@ job "ingress" {
       port "jsonrpc" {
         static = 8545
       }
+      # The cluster egress (response) port of the on-quorum watermark
+      # client, unique per allocation. A fixed port sat in the node's
+      # ephemeral range, where the shared media driver's port-0
+      # discovery sockets could take it first.
+      port "egress" {}
     }
 
     task "ingress" {
@@ -180,10 +185,9 @@ job "ingress" {
           "--chain-id", "412346",
           # Cluster mode: this node's cluster-egress (response)
           # endpoint, for the on-quorum watermark observer's Aeron
-          # Cluster client. The port, 40210 (cluster_egress_port),
-          # stays uniform; uniqueness comes from the ingress node_ip.
-          # This is consulted only when --ack-policy gates on quorum.
-          "--cluster-egress-endpoint", "${meta.node_ip}:40210",
+          # Cluster client, on this allocation's dynamic port. This is
+          # consulted only when --ack-policy gates on quorum.
+          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
           # Record each per-shard tx_data publication to the archive,
           # so a restarted executor can replay full transaction
           # envelopes (Phase 2 crash recovery).
