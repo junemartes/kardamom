@@ -99,7 +99,7 @@ pub mod fixtures;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use ports::{Either, StateWriterQueue, StateWriterSignal, TxReceiptsPublication};
+pub use ports::{Either, StateWriterQueue, StateWriterSignal, TxReceiptsPublication, publish_each};
 pub use types::{
     BalHandoff, BlockExecOutput, BlockExecStrategy, BufferedRecord, ExecutorConfig, NoBlockExec,
     ResumePoint,

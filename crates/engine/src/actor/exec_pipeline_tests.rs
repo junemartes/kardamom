@@ -53,7 +53,8 @@ fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
     let kinds: Vec<String> = rx_e2c
         .try_iter()
         .map(|m| match m {
-            ExecToCommit::Receipt(r) => {
+            ExecToCommit::Receipt(item) => {
+                let r = &item.receipt;
                 assert!(r.status, "every tx must succeed (parent layer visible)");
                 format!("R{}", r.block_number)
             }
