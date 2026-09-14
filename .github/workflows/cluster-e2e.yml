@@ -192,9 +192,9 @@ jobs:
           # cgroup v2 + systemd-in-container needs this on some runners.
           sudo modprobe ip_tables || true
 
-      - uses: opentofu/setup-opentofu@v1
+      - uses: ./.github/actions/tofu-providers
         with:
-          tofu_version: 1.12.6
+          root: deploy/cluster/terraform/containers
 
       - name: Install Nomad CLI
         run: |
