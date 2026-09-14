@@ -244,6 +244,7 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, keccak256};
     use bytes::Bytes;
+    use kardamom_test_support::{LegacyTx, anvil_signer_0};
 
     fn envelope(sender: Address) -> TxEnvelope {
         // Raw bytes that fail 2718 decode give a selector-less view:
@@ -302,34 +303,14 @@ mod tests {
     #[test]
     fn cold_tx_is_a_barrier_at_its_position() {
         // Cold means a CALL with a selector no stats have seen.
-        let cold_env = {
-            use alloy_consensus::{SignableTransaction, TxLegacy};
-            use alloy_eips::eip2718::Encodable2718;
-            use alloy_network::TxSignerSync;
-            let s: alloy_signer_local::PrivateKeySigner =
-                "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-                    .parse()
-                    .unwrap();
-            let mut tx = TxLegacy {
-                chain_id: Some(1),
-                nonce: 0,
-                gas_price: 1,
-                gas_limit: 100_000,
-                to: alloy_primitives::TxKind::Call(addr(9)),
-                value: alloy_primitives::U256::ZERO,
-                input: alloy_primitives::Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
-            };
-            let sig = s.sign_transaction_sync(&mut tx).unwrap();
-            let env = alloy_consensus::TxEnvelope::Legacy(tx.into_signed(sig));
-            let mut raw = Vec::new();
-            env.encode_2718(&mut raw);
-            TxEnvelope {
-                correlation_id: 0,
-                raw_tx: Bytes::from(raw),
-                sender: s.address(),
-                tx_hash: *env.tx_hash(),
-            }
-        };
+        let cold_env = LegacyTx {
+            to: addr(9),
+            gas_limit: 100_000,
+            gas_price: 1,
+            input: alloy_primitives::Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+            ..Default::default()
+        }
+        .sign(&anvil_signer_0());
         let envs = vec![
             envelope(addr(1)), // 0: warm
             envelope(addr(2)), // 1: warm

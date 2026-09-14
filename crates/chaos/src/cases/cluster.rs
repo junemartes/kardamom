@@ -4,6 +4,7 @@
 //! them.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::evidence::CountWait;
@@ -114,19 +115,13 @@ pub(crate) async fn follower_kill(h: &mut Harness) -> anyhow::Result<()> {
 /// observed at wipe time. A position that never moves is a join wedge,
 /// not slow replay.
 pub(crate) async fn member_rejoin(h: &mut Harness) -> anyhow::Result<()> {
+    let ctx = "cluster-member-rejoin";
     let leader = h.evidence.cluster_leader(h.knobs.leader_slo).await?;
     let follower = a_follower(leader);
-    let fresh = format!("sealer state FRESH at genesis memberId={follower}");
-    let f0 = h
-        .evidence
-        .count_lines(CLUSTER_TASK, &fresh, Streams::StdoutOnly)
-        .await?;
-    let head_at_wipe = h.probes.executor_progress().await.filter(|h| *h > 0).ok_or_else(|| {
-        crate::chaos_fail!("cluster-member-rejoin: could not read the executor head before the wipe — refusing to run: the catch-up proof needs a real target position or it proves nothing")
-    })?;
+    let before = Blank::observe(h, follower, ctx).await?;
     let node = sealer(h, follower)?;
     crate::log(format!(
-        "cluster-member-rejoin: leader=memberId={leader}; killing FOLLOWER memberId={follower} and WIPING its cluster + archive dirs"
+        "{ctx}: leader=memberId={leader}; killing FOLLOWER memberId={follower} and WIPING its cluster + archive dirs"
     ));
     h.inject_hard(&[&node], CLUSTER_TASK).await?;
     h.nodes
@@ -135,34 +130,119 @@ pub(crate) async fn member_rejoin(h: &mut Harness) -> anyhow::Result<()> {
             "rm -rf /opt/kardamom/cluster/* /opt/kardamom/archive/*",
         )
         .await
-        .map_err(|e| {
-            crate::chaos_fail!(
-                "cluster-member-rejoin: could not wipe memberId={follower} state: {e}"
-            )
-        })?;
+        .map_err(|e| crate::chaos_fail!("{ctx}: could not wipe memberId={follower} state: {e}"))?;
     h.assert_executor_progress(Duration::from_secs(60)).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.restart_slo).await?;
-    let track = RefCell::new(Catchup::default());
-    let (hs, track_ref, fresh_ref): (&Harness, &RefCell<Catchup>, &str) = (h, &track, &fresh);
-    let budget = Budget::new(hs.knobs.rejoin_slo, Duration::from_secs(10));
-    let outcome = poll::until(budget, |_| async move {
-        let logs = hs.evidence.cluster_logs().await?;
-        let f1 = logs.lines().filter(|l| l.contains(fresh_ref)).count();
-        let mut track = track_ref.borrow_mut();
-        track.observe(catchup_block(&logs, follower), f1);
-        Ok((f1 > f0 && track.block >= head_at_wipe).then_some(f1))
-    })
-    .await?;
-    let track = track.into_inner();
-    let (f1, elapsed) = outcome.or_fail(|t| track.failure(f0, head_at_wipe, t))?;
-    let now = h.evidence.cluster_leader(h.knobs.leader_slo).await.ok();
+    before.await_caught_up(h).await
+}
+
+/// The machine-replacement drill for a Raft member: a follower's sealer
+/// node is replaced through the Terraform root, on another address with
+/// empty volumes. The other members name it by its Consul node record,
+/// so they must reach the new address; the quorum of two keeps
+/// committing meanwhile; Nomad places the member on the new node; and
+/// the blank member must replay to the head observed before the
+/// replacement, the same positional proof as `cluster-member-rejoin`.
+pub(crate) async fn node_replace_sealer(h: &mut Harness) -> anyhow::Result<()> {
+    let ctx = "node-replace-sealer";
+    let leader = h.evidence.cluster_leader(h.knobs.leader_slo).await?;
+    let follower = a_follower(leader);
+    let before = Blank::observe(h, follower, ctx).await?;
     crate::log(format!(
-        "cluster-member-rejoin: memberId={follower} rejoined blank via full log replay (fresh {f0}->{f1}, replayed to block {} >= head-at-wipe {head_at_wipe}, {}s); leader now memberId={}",
-        track.block,
-        elapsed.as_secs(),
-        now.map_or("?".to_string(), |m| m.to_string())
+        "{ctx}: leader=memberId={leader}; replacing the node of FOLLOWER memberId={follower}"
     ));
-    Ok(())
+    h.replace_node(&format!("sealer-{follower}"), ctx).await?;
+    h.assert_executor_progress(Duration::from_secs(60)).await?;
+    h.assert_count(CLUSTER_TASK, 3, h.knobs.reschedule_slo)
+        .await?;
+    before.await_caught_up(h).await
+}
+
+/// The state a blank-member proof starts from: the member, the count of
+/// its fresh-at-genesis lines per allocation, and the executor head,
+/// read before the member loses its state. The count is kept per
+/// allocation because a member restarted in place logs into its own
+/// allocation, while a member on a replaced node logs into a new one and
+/// the lost allocation's logs are gone with the node.
+struct Blank {
+    ctx: &'static str,
+    member: u32,
+    fresh: String,
+    before: HashMap<String, usize>,
+    head: i64,
+}
+
+impl Blank {
+    async fn observe(h: &Harness, member: u32, ctx: &'static str) -> anyhow::Result<Self> {
+        let fresh = format!("sealer state FRESH at genesis memberId={member}");
+        let (before, _) = Self::fresh_by_alloc(h, &fresh).await?;
+        let head = h.probes.executor_progress().await.filter(|h| *h > 0).ok_or_else(|| {
+            crate::chaos_fail!("{ctx}: could not read the executor head before the member lost its state — refusing to run: the catch-up proof needs a real target position or it proves nothing")
+        })?;
+        Ok(Self {
+            ctx,
+            member,
+            fresh,
+            before,
+            head,
+        })
+    }
+
+    /// The count of `needle` in each reachable cluster allocation, and
+    /// those allocations' logs. A lost allocation is skipped: its node is
+    /// gone, and so are its logs.
+    async fn fresh_by_alloc(
+        h: &Harness,
+        needle: &str,
+    ) -> anyhow::Result<(HashMap<String, usize>, String)> {
+        let allocs = h.nomad.allocations(CLUSTER_TASK).await?;
+        let mut counts = HashMap::new();
+        let mut logs = String::new();
+        for alloc in allocs.iter().filter(|a| a.client_status != "lost") {
+            let text = h.nomad.alloc_logs(alloc, Streams::StdoutOnly).await?;
+            counts.insert(
+                alloc.id.clone(),
+                text.lines().filter(|l| l.contains(needle)).count(),
+            );
+            logs.push_str(&text);
+        }
+        Ok((counts, logs))
+    }
+
+    /// Some allocation logged a fresh-at-genesis line it had not logged
+    /// before: the member started blank.
+    fn started_blank(&self, now: &HashMap<String, usize>) -> bool {
+        now.iter()
+            .any(|(id, n)| *n > self.before.get(id).copied().unwrap_or(0))
+    }
+
+    /// The member started blank and its latest post-blank snapshot
+    /// reached the head read before.
+    async fn await_caught_up(self, h: &Harness) -> anyhow::Result<()> {
+        let track = RefCell::new(Catchup::default());
+        let budget = Budget::new(h.knobs.rejoin_slo, Duration::from_secs(10));
+        let (track_ref, me) = (&track, &self);
+        let outcome = poll::until(budget, |_| async move {
+            let (now, logs) = Self::fresh_by_alloc(h, &me.fresh).await?;
+            let mut track = track_ref.borrow_mut();
+            track.observe(catchup_block(&logs, me.member), me.started_blank(&now));
+            Ok((track.blank && track.block >= me.head).then_some(()))
+        })
+        .await?;
+        let track = track.into_inner();
+        let ((), elapsed) = outcome.or_fail(|t| track.failure(&self, t))?;
+        let now = h.evidence.cluster_leader(h.knobs.leader_slo).await.ok();
+        crate::log(format!(
+            "{}: memberId={} rejoined blank via full log replay (replayed to block {} >= head {}, {}s); leader now memberId={}",
+            self.ctx,
+            self.member,
+            track.block,
+            self.head,
+            elapsed.as_secs(),
+            now.map_or("?".to_string(), |m| m.to_string())
+        ));
+        Ok(())
+    }
 }
 
 /// The replay position of a wiped member: the block of its latest
@@ -196,35 +276,35 @@ struct Catchup {
     block: i64,
     first: i64,
     moved: bool,
-    fresh: usize,
+    blank: bool,
 }
 
 impl Catchup {
-    fn observe(&mut self, block: i64, fresh: usize) {
+    fn observe(&mut self, block: i64, blank: bool) {
         self.block = block;
-        self.fresh = fresh;
+        self.blank = blank;
         if block > 0 && self.first == 0 {
             self.first = block;
         }
         self.moved |= block > self.first;
     }
 
-    fn failure(&self, f0: usize, head: i64, t: Duration) -> anyhow::Error {
-        let secs = t.as_secs();
-        if self.fresh <= f0 {
+    fn failure(&self, blank: &Blank, t: Duration) -> anyhow::Error {
+        let (ctx, head, secs) = (blank.ctx, blank.head, t.as_secs());
+        if !self.blank {
             return crate::chaos_fail!(
-                "cluster-member-rejoin: restarted member did not start blank (fresh-at-genesis count {f0} -> {}) — the wipe did not take, this run proved nothing about empty-state rejoin",
-                self.fresh
+                "{ctx}: restarted member did not start blank (no allocation logged a new '{}' line) — the state loss did not take, this run proved nothing about empty-state rejoin",
+                blank.fresh
             );
         }
         if !self.moved {
             return crate::chaos_fail!(
-                "cluster-member-rejoin: blank member FROZE at block {} (head at wipe {head}) — its replay position never advanced once in {secs}s, so this is a JOIN WEDGE, not slow replay: the member stays INACTIVE after a partial replay while reporting healthy to Nomad",
+                "{ctx}: blank member FROZE at block {} (head before {head}) — its replay position never advanced once in {secs}s, so this is a JOIN WEDGE, not slow replay: the member stays INACTIVE after a partial replay while reporting healthy to Nomad",
                 self.block
             );
         }
         crate::chaos_fail!(
-            "cluster-member-rejoin: blank member replayed to block {} of head-at-wipe {head} in {secs}s — the position DID keep advancing, so this is slow catch-up: blank-member replay is O(lifetime log) and the log is never purged",
+            "{ctx}: blank member replayed to block {} of head-before {head} in {secs}s — the position DID keep advancing, so this is slow catch-up: blank-member replay is O(lifetime log) and the log is never purged",
             self.block
         )
     }
@@ -273,10 +353,34 @@ mod tests {
         assert_eq!(catchup_block(logs, 1), 60);
         assert_eq!(catchup_block(logs, 2), 0);
         let mut track = Catchup::default();
-        track.observe(0, 1);
-        track.observe(30, 2);
+        track.observe(0, false);
+        track.observe(30, true);
         assert!(!track.moved);
-        track.observe(60, 2);
+        assert!(track.blank);
+        track.observe(60, true);
         assert!(track.moved);
+    }
+
+    #[test]
+    fn a_blank_start_is_a_new_fresh_line_in_any_allocation() {
+        let blank = Blank {
+            ctx: "test",
+            member: 1,
+            fresh: String::new(),
+            before: HashMap::from([("old".to_string(), 1), ("peer".to_string(), 0)]),
+            head: 1,
+        };
+        let same = HashMap::from([("old".to_string(), 1), ("peer".to_string(), 0)]);
+        assert!(!blank.started_blank(&same), "no new line anywhere");
+        let in_place = HashMap::from([("old".to_string(), 2), ("peer".to_string(), 0)]);
+        assert!(
+            blank.started_blank(&in_place),
+            "a restart inside the old allocation"
+        );
+        let replaced = HashMap::from([("new".to_string(), 1), ("peer".to_string(), 0)]);
+        assert!(
+            blank.started_blank(&replaced),
+            "a new allocation on a replaced node"
+        );
     }
 }

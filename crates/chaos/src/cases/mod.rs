@@ -27,11 +27,13 @@ pub enum Case {
     HardSequencer,
     SequencerReplicaKill,
     NodeFailureExecutor,
+    NodeReplaceExecutor,
     StateCheckpointRestore,
     ReplayWindowResync,
     ClusterLeaderKill,
     ClusterFollowerKill,
     ClusterMemberRejoin,
+    NodeReplaceSealer,
     ClusterQuorumLossRecover,
     ArchiveDriverLoss,
     ArchiveTxDataWipe,
@@ -46,7 +48,7 @@ pub enum Case {
     LookupBlackout,
 }
 
-const ALL: [Case; 25] = [
+const ALL: [Case; 27] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -55,11 +57,13 @@ const ALL: [Case; 25] = [
     Case::HardSequencer,
     Case::SequencerReplicaKill,
     Case::NodeFailureExecutor,
+    Case::NodeReplaceExecutor,
     Case::StateCheckpointRestore,
     Case::ReplayWindowResync,
     Case::ClusterLeaderKill,
     Case::ClusterFollowerKill,
     Case::ClusterMemberRejoin,
+    Case::NodeReplaceSealer,
     Case::ClusterQuorumLossRecover,
     Case::ArchiveDriverLoss,
     Case::ArchiveTxDataWipe,
@@ -99,11 +103,13 @@ impl Case {
             Self::HardSequencer => "hard-sequencer",
             Self::SequencerReplicaKill => "sequencer-replica-kill",
             Self::NodeFailureExecutor => "node-failure-executor",
+            Self::NodeReplaceExecutor => "node-replace-executor",
             Self::StateCheckpointRestore => "state-checkpoint-restore",
             Self::ReplayWindowResync => "replay-window-resync",
             Self::ClusterLeaderKill => "cluster-leader-kill",
             Self::ClusterFollowerKill => "cluster-follower-kill",
             Self::ClusterMemberRejoin => "cluster-member-rejoin",
+            Self::NodeReplaceSealer => "node-replace-sealer",
             Self::ClusterQuorumLossRecover => "cluster-quorum-loss-recover",
             Self::ArchiveDriverLoss => "archive-driver-loss",
             Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
@@ -147,6 +153,10 @@ impl Case {
             }
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
             Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_secs(300),
+            Self::NodeReplaceExecutor => inject + k.reschedule_slo + Duration::from_secs(420),
+            Self::NodeReplaceSealer => {
+                inject + k.reschedule_slo + k.rejoin_slo + Duration::from_secs(300)
+            }
             Self::CpuSqueeze => {
                 let cycle = k.squeeze.window + k.squeeze.release;
                 inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
@@ -181,11 +191,13 @@ impl Case {
             Self::HardSequencer => component::hard_sequencer(h).await,
             Self::SequencerReplicaKill => component::sequencer_replica_kill(h).await,
             Self::NodeFailureExecutor => component::node_failure_executor(h).await,
+            Self::NodeReplaceExecutor => component::node_replace_executor(h).await,
             Self::StateCheckpointRestore => component::state_checkpoint_restore(h).await,
             Self::ReplayWindowResync => component::replay_window_resync(h).await,
             Self::ClusterLeaderKill => cluster::leader_kill(h).await,
             Self::ClusterFollowerKill => cluster::follower_kill(h).await,
             Self::ClusterMemberRejoin => cluster::member_rejoin(h).await,
+            Self::NodeReplaceSealer => cluster::node_replace_sealer(h).await,
             Self::ClusterQuorumLossRecover => cluster::quorum_loss_recover(h).await,
             Self::ArchiveDriverLoss => archive::driver_loss(h).await,
             Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
