@@ -215,16 +215,38 @@ impl Proc {
         ControlFlow::Continue(())
     }
 
+    /// The last `n` lines of the log, without backtrace frames. A service
+    /// that exits with an error prints the error report, then a backtrace
+    /// of 30 or more lines (`RUST_BACKTRACE=1`). Without the filter, a
+    /// short tail shows only frames, and the error that ended the process
+    /// is cut off.
     #[must_use]
     pub fn log_tail(&self, n: usize) -> String {
         match std::fs::read_to_string(&self.log_path) {
-            Ok(s) => {
-                let lines: Vec<&str> = s.lines().collect();
-                let start = lines.len().saturating_sub(n);
-                lines[start..].join("\n")
-            }
+            Ok(s) => Self::tail_without_frames(&s, n),
             Err(e) => format!("<unreadable log {}: {e}>", self.log_path.display()),
         }
+    }
+
+    fn tail_without_frames(log: &str, n: usize) -> String {
+        let lines: Vec<&str> = log
+            .lines()
+            .filter(|l| !Self::is_backtrace_frame(l))
+            .collect();
+        let start = lines.len().saturating_sub(n);
+        lines[start..].join("\n")
+    }
+
+    /// A backtrace frame line: an indented `N: symbol` or `at path:line`.
+    /// Service log lines start with a timestamp, never with a space.
+    fn is_backtrace_frame(line: &str) -> bool {
+        let Some(body) = line.strip_prefix(' ').map(str::trim_start) else {
+            return false;
+        };
+        let numbered = body.split_once(": ").is_some_and(|(index, _)| {
+            !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())
+        });
+        numbered || body.starts_with("at ")
     }
 }
 
@@ -343,5 +365,39 @@ impl AsRef<std::ffi::OsStr> for ExistingFile {
 impl std::fmt::Display for ExistingFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0.display())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Proc;
+
+    #[test]
+    fn a_tail_keeps_the_error_report_and_drops_backtrace_frames() {
+        let log = "2026-09-14T14:25:09Z  INFO kardamom_executor: starting\n\
+            Error: join timeout: TxRef not found within 30000 ms\n\
+            \n\
+            Stack backtrace:\n   \
+            0: <anyhow::Error>::msg\n             \
+            at /rustc/abc/library/std/src/rt.rs:206:18\n  \
+            19: std::rt::lang_start_internal\n  \
+            29: main\n";
+        let tail = Proc::tail_without_frames(log, 3);
+        assert_eq!(
+            tail,
+            "Error: join timeout: TxRef not found within 30000 ms\n\nStack backtrace:"
+        );
+    }
+
+    #[test]
+    fn a_log_line_with_a_colon_is_not_a_frame() {
+        assert!(!Proc::is_backtrace_frame(
+            "2026-09-14T14:25:09Z  WARN x: 12: y"
+        ));
+        assert!(!Proc::is_backtrace_frame("Caused by: timed out"));
+        assert!(Proc::is_backtrace_frame("   7: std::panicking::try"));
+        assert!(Proc::is_backtrace_frame(
+            "             at ./src/main.rs:10:5"
+        ));
     }
 }
