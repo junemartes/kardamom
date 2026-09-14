@@ -68,7 +68,8 @@ jobs:
       - name: Cache the aeron-all jar
         run: |
           mkdir -p /tmp/kardamom-aeron-local
-          curl -fsSL "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_JAR_VERSION}/aeron-all-${AERON_JAR_VERSION}.jar" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+            "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_JAR_VERSION}/aeron-all-${AERON_JAR_VERSION}.jar" \
             -o "/tmp/kardamom-aeron-local/aeron-all-${AERON_JAR_VERSION}.jar"
 
       # Every binary a scenario spawns or shells out to: the pipeline three,
