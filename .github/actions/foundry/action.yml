@@ -1,0 +1,34 @@
+---
+name: foundry
+description: >-
+  Install Foundry v1.7.1 (forge, cast, anvil, chisel) from its release
+  tarball, pinned by SHA-256 and kept in the Actions cache. foundryup
+  downloaded the release from GitHub in every job, and one 504 from
+  GitHub failed every job that needs forge.
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@v4
+      id: cache
+      with:
+        path: ~/.foundry/bin
+        key: foundry-v1.7.1-${{ runner.os }}-cf7e688ed0c4c48a
+    # The SHA-256 is the digest GitHub lists for the release asset
+    # foundry_v1.7.1_linux_amd64.tar.gz. A new version needs a new URL,
+    # hash and cache key together.
+    - name: Download Foundry v1.7.1
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p "$HOME/.foundry/bin"
+        curl -fsSL --retry 8 --retry-all-errors --retry-delay 10 --connect-timeout 20 \
+          -o "$RUNNER_TEMP/foundry.tar.gz" \
+          https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_amd64.tar.gz
+        echo "cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b  $RUNNER_TEMP/foundry.tar.gz" \
+          | sha256sum -c -
+        tar -xzf "$RUNNER_TEMP/foundry.tar.gz" -C "$HOME/.foundry/bin"
+    - name: Put Foundry on the PATH
+      shell: bash
+      run: |
+        echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+        "$HOME/.foundry/bin/forge" --version
