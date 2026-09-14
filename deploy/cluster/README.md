@@ -36,7 +36,7 @@ no file in the tree names its address:
 | `ingress` | 2 | active/active JSON-RPC front door (:8545) |
 | `executor` | 3 | state-machine replica appliers (libmdbx state) |
 | `sealer` | 3 | **3-member Aeron Cluster (Raft)** — the Java `cluster` job: canonical ordering + archive-at-the-sealer durability folded into the Raft log |
-| `aux` | 1 | validator, da_watcher, batcher (off the chaos blast radius) |
+| `aux` | 1 | validator, da_watcher, batcher, monitoring (off the chaos blast radius) |
 
 ### Names, not addresses
 
@@ -433,6 +433,19 @@ profiled soak from #7..#15 (#0/#16 belong to the deploy's smoke gates), so a
 (ingress has no `eth_getTransactionCount`). `run --fresh` does both in one
 go; profiling knobs (`--ceiling`, `--soak-fraction`, `--profile-secs`, ...)
 are documented in `--help`.
+
+## Monitoring
+
+The `monitoring` job (`nomad/monitoring.nomad.hcl`) runs Prometheus and
+Grafana on the aux node. Prometheus scrapes every service's metrics port by
+its Consul node name, rendered from the node-class counts; Grafana
+provisions the Prometheus datasource by the `prometheus` Consul service and
+the dashboards from `deploy/grafana/provisioning/dashboards-json`, the one
+source for every profile. From the host, read the node contract for the
+aux node's address: Prometheus on port 9090, Grafana on port 3000
+(anonymous viewer; admin `admin` with the `grafana_admin_password` job
+variable, `kardamom` on the local profile). The autoscaler's Prometheus APM
+reads the same service.
 
 ## Sustained-load + chaos suite
 

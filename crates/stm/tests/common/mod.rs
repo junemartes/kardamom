@@ -13,9 +13,6 @@
 //! or interleaving. Prediction quality may only ever cost throughput
 //! (fallback), never bytes.
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
 use alloy_primitives::{Address, B256, Bytes as AlloyBytes, TxKind, U256, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_exec_core::block_env::ExecEnv;
@@ -24,6 +21,7 @@ use kardamom_exec_core::exec_types::TxIndex;
 use kardamom_exec_core::state::MockStateDatabase;
 use kardamom_footprint::classifier::Stats;
 use kardamom_footprint::{Cell, TxObs};
+use kardamom_test_support::{LegacyTx, seeded_signer};
 use kardamom_types::{BPosition, TxEnvelope};
 
 pub(crate) const CHAIN_ID: u64 = 412_346;
@@ -42,17 +40,13 @@ pub(crate) const COUNTER_CODE: [u8; 10] =
     [0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00];
 pub(crate) const COUNTER_SEL: [u8; 4] = [0xAA, 0xBB, 0xCC, 0xDD];
 
+/// `n` deterministic dev keys, seeded 1 through `n`. Test-only.
 pub(crate) fn signers(n: usize) -> Vec<PrivateKeySigner> {
-    // Deterministic dev keys: index-derived, test-only.
-    (0..n)
-        .map(|i| {
-            let mut seed = [0u8; 32];
-            seed[31] = i as u8 + 1;
-            PrivateKeySigner::from_bytes(&B256::from(seed)).unwrap()
-        })
-        .collect()
+    (1..=n as u64).map(seeded_signer).collect()
 }
 
+/// A signed call or contract creation on [`CHAIN_ID`]. The gas price is
+/// nonzero, so every tx credits the fee sink.
 pub(crate) fn tx(
     signer: &PrivateKeySigner,
     nonce: u64,
@@ -60,24 +54,19 @@ pub(crate) fn tx(
     value: u64,
     input: &[u8],
 ) -> TxEnvelope {
-    let mut t = TxLegacy {
-        chain_id: Some(CHAIN_ID),
+    let legacy = LegacyTx {
+        chain_id: CHAIN_ID,
+        to: to.to().copied().unwrap_or(Address::ZERO),
         nonce,
-        gas_price: 1_000_000_000, // nonzero: every tx credits the fee sink
+        value,
         gas_limit: 500_000,
-        to,
-        value: U256::from(value),
+        gas_price: 1_000_000_000,
         input: AlloyBytes::copy_from_slice(input),
+        ..Default::default()
     };
-    let sig = signer.sign_transaction_sync(&mut t).unwrap();
-    let env = alloy_consensus::TxEnvelope::Legacy(t.into_signed(sig));
-    let mut raw = Vec::new();
-    env.encode_2718(&mut raw);
-    TxEnvelope {
-        correlation_id: 0,
-        raw_tx: bytes::Bytes::from(raw),
-        sender: signer.address(),
-        tx_hash: *env.tx_hash(),
+    match to {
+        TxKind::Call(_) => legacy.sign(signer),
+        TxKind::Create => legacy.sign_create(signer),
     }
 }
 
