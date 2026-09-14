@@ -383,10 +383,12 @@ struct SegmentHashes(Vec<(String, String)>);
 
 impl SegmentHashes {
     /// Hash the segments `listing` names, a shell word list run in the
-    /// archive directory.
+    /// archive directory. Hashing every preallocated segment takes longer
+    /// than the short exec bound after a few cases (about 25 s for 4.6 GB
+    /// on a host run), so this read uses the long bound.
     async fn read(h: &Harness, node: &str, listing: &str) -> Self {
         let script = format!("cd {ARCHIVE_DIR} && {listing} | xargs -r sha256sum");
-        let out = h.nodes.exec(node, &script).await.unwrap_or_default();
+        let out = h.nodes.exec_long(node, &script).await.unwrap_or_default();
         Self::parse(&out)
     }
 
@@ -413,16 +415,22 @@ impl SegmentHashes {
     }
 }
 
-/// The first of the victim's 48 largest segments that the mirror holds
-/// byte-identical, that carries a data frame, and that verifies clean.
-/// Only the active lanes carry data frames, so the window covers idle
-/// lanes and every per-restart session. The mirror match is by content:
+/// The first victim segment that the mirror holds byte-identical, that
+/// carries a data frame, and that verifies clean. Every segment is a
+/// candidate: all segment files share one preallocated length, and a
+/// restored segment is fully allocated on disk, so neither length nor disk
+/// use ranks the segments that carry data. The mirror match is by content:
 /// an adopted recording keeps its id but its catalog entry checksum is
 /// stale, so it fails verify, and a recording made after the adoption
 /// verifies clean under a different id on each node.
 async fn pick_clean_segment(tool: &ArchiveTool<'_>, mirror: &str) -> anyhow::Result<Segment> {
-    let victim = SegmentHashes::read(tool.h, tool.node, "ls -S *.rec 2>/dev/null | head -48").await;
+    let victim = SegmentHashes::read(tool.h, tool.node, "ls *.rec 2>/dev/null").await;
     let mirror = SegmentHashes::read(tool.h, mirror, "ls *.rec 2>/dev/null").await;
+    crate::log(format!(
+        "archive-corruption: {} victim candidates, {} mirror segments",
+        victim.0.len(),
+        mirror.0.len()
+    ));
     for (hash, name) in victim.0 {
         let Some(mirror_name) = mirror.name_for(&hash, &name) else {
             continue;
