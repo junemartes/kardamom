@@ -13,11 +13,14 @@ output "node_contract" {
       name = docker_image.node.name
       id   = docker_image.node.image_id
     }
-    # The address is the one Docker assigned; it is read back after
-    # creation and changes on every replacement of the container.
+    # The address is the one this root assigned (the subnet, the offset,
+    # the name order and the generation), read back from the container
+    # after creation. A restart keeps it; a replacement with a higher
+    # generation moves it.
     nodes = {
       for k, n in local.nodes : k => merge(n, {
-        ip = one([for net in docker_container.node[k].network_data : net.ip_address if net.network_name == docker_network.this.name])
+        ip         = one([for net in docker_container.node[k].network_data : net.ip_address if net.network_name == docker_network.this.name])
+        generation = local.generation[k]
       })
     }
   }
