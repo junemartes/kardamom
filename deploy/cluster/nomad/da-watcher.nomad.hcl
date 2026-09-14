@@ -41,9 +41,16 @@ variable "datacenter" {
   default     = "dc1"
 }
 
+# The L1 endpoint the watcher derives epochs from. The default is the
+# in-cluster anvil by its Consul service record. When the L1 light client
+# is deployed (l1-light-client.nomad.hcl), the workloads role points this
+# at the light client, the same as the validator. The watcher is the
+# epoch SOURCE, so a lying endpoint here produces bad epochs at the
+# source rather than false halts (issue #163). Routing it through a
+# verifying client closes that.
 variable "l1_rpc" {
   type        = string
-  description = "The L1 JSON-RPC endpoint. The default is the in-cluster anvil by its Consul service record."
+  description = "The L1 JSON-RPC endpoint the watcher derives epochs from. Default: the in-cluster anvil by its Consul service record. Point it at the light client on a real network."
   default     = "http://anvil.service.consul:8546"
 }
 
@@ -122,9 +129,9 @@ job "da-watcher" {
       }
 
       env {
-        # The UDP ports the discovered tx_deposits and tx_remote_epochs
-        # publications bind on this node.
-        KARDAMOM_MDC_PORTS = "40330-40339"
+        # Bind the exporter on the node, not loopback, so the monitoring
+        # job scrapes it off-node.
+        KARDAMOM_METRICS_ADDR = "0.0.0.0:9005"
       }
 
       # Cluster LogConfig (Aeron streams and discovery), read through

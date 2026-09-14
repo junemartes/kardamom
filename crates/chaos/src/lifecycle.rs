@@ -24,17 +24,6 @@ const REGISTRY_PUSH_NODE: &str = "control-0";
 /// `workloads_deploy_binary` at prebuilt artifacts with it.
 const CLUSTER_VARS_ENV: &str = "KARDAMOM_CHAOS_CLUSTER_VARS";
 
-/// The name of a controller container to run the lifecycle commands
-/// in: the privileged `kardamom-orchestrator` container of
-/// `ansible/local.yml`, with the checkout mounted at `/work` and the
-/// host Docker socket. The host preparation role writes host sysctls
-/// and bridge settings as root, which the controller has and a plain
-/// user session does not. Unset, the commands run on the host.
-const CONTROLLER_ENV: &str = "KARDAMOM_CHAOS_CONTROLLER";
-
-/// The checkout mount inside the controller.
-const CONTROLLER_WORK: &str = "/work";
-
 /// The deploy-time settings a shard passes to the workloads. Ansible
 /// reads them from the environment, and a case reads the same values
 /// from its knobs, so one setting drives both sides.
@@ -62,7 +51,6 @@ impl DeployVars {
 #[derive(Debug, Clone)]
 pub struct Lifecycle {
     cluster_dir: PathBuf,
-    controller: Option<String>,
 }
 
 impl Lifecycle {
@@ -71,27 +59,15 @@ impl Lifecycle {
     pub fn new(repo_root: &Path) -> Self {
         Self {
             cluster_dir: repo_root.join("deploy").join("cluster"),
-            controller: std::env::var(CONTROLLER_ENV).ok().filter(|c| !c.is_empty()),
         }
     }
 
-    /// A command of `program` that runs in the controller container when
-    /// one is configured, else on the host. Inside the controller the
-    /// working directory is the checkout's `deploy/cluster` under
-    /// `/work`, and every environment pair is passed through.
+    /// A command of `program` in the checkout's `deploy/cluster`, with
+    /// every environment pair passed through.
     fn command(&self, program: &str, env: &[(&str, String)]) -> Command {
-        let Some(controller) = &self.controller else {
-            let mut cmd = Command::new(program);
-            cmd.current_dir(&self.cluster_dir);
-            cmd.envs(env.iter().map(|(k, v)| (*k, v.as_str())));
-            return cmd;
-        };
-        let mut cmd = Command::new("docker");
-        cmd.args(["exec", "-w", &format!("{CONTROLLER_WORK}/deploy/cluster")]);
-        for (k, v) in env {
-            cmd.args(["-e", &format!("{k}={v}")]);
-        }
-        cmd.arg(controller).arg(program);
+        let mut cmd = Command::new(program);
+        cmd.current_dir(&self.cluster_dir);
+        cmd.envs(env.iter().map(|(k, v)| (*k, v.as_str())));
         cmd
     }
 
@@ -118,8 +94,7 @@ impl Lifecycle {
         self.cluster_dir.join("terraform").join("containers")
     }
 
-    /// The `-chdir` argument of tofu: relative to `deploy/cluster`, so
-    /// it resolves on the host and in the controller alike.
+    /// The `-chdir` argument of tofu, relative to `deploy/cluster`.
     fn tofu_chdir() -> &'static str {
         "-chdir=terraform/containers"
     }
