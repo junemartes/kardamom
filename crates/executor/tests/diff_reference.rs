@@ -176,6 +176,7 @@ fn build_diff_fixture() -> DiffFixture {
             value: 10,
             gas_limit: 21_000,
             gas_price: 0,
+            ..Default::default()
         }
         .sign(&signer),
         LegacyTx {
@@ -185,6 +186,7 @@ fn build_diff_fixture() -> DiffFixture {
             value: 0,
             gas_limit: 100_000,
             gas_price: 0,
+            ..Default::default()
         }
         .sign(&signer),
         LegacyTx {
@@ -194,6 +196,7 @@ fn build_diff_fixture() -> DiffFixture {
             value: 0,
             gas_limit: 100_000,
             gas_price: 0,
+            ..Default::default()
         }
         .sign(&signer),
     ];

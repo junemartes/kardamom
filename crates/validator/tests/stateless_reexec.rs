@@ -14,12 +14,9 @@
 
 use std::num::NonZeroU16;
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, B256, TxKind, U256, address, keccak256};
-use alloy_signer_local::PrivateKeySigner;
+use alloy_primitives::{Address, B256, U256, address, keccak256};
 use kardamom_engine::actor::BufferedRecord;
+use kardamom_engine::actor::fixtures::{LegacyTx, anvil_signer_0};
 use kardamom_engine::{ExecEnv, MockStateDatabase, PendingDelta};
 use kardamom_exec_core::delta::AccountFields;
 use kardamom_state::{AccountTrieParts, state_root, storage_root};
@@ -42,34 +39,17 @@ const DECOY: Address = address!("00000000000000000000000000000000000000dd");
 const DEP_FROM: Address = address!("1111111111111111111111111111111111112222");
 const DEP_TO: Address = address!("00000000000000000000000000000000000000eE");
 
-fn signer() -> PrivateKeySigner {
-    // This is Anvil dev key #0: public, for dev use only.
-    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-        .parse()
-        .unwrap()
-}
-
 fn signed_tx(nonce: u64, to: Address, value: u64, gas_limit: u64) -> TxEnvelope {
-    let s = signer();
-    let mut tx = TxLegacy {
-        chain_id: Some(CHAIN_ID),
+    LegacyTx {
+        chain_id: CHAIN_ID,
+        to,
         nonce,
-        gas_price: 1_000_000_000,
+        value,
         gas_limit,
-        to: TxKind::Call(to),
-        value: U256::from(value),
-        input: alloy_primitives::Bytes::default(),
-    };
-    let sig = s.sign_transaction_sync(&mut tx).unwrap();
-    let env = alloy_consensus::TxEnvelope::Legacy(tx.into_signed(sig));
-    let mut raw = Vec::new();
-    env.encode_2718(&mut raw);
-    TxEnvelope {
-        correlation_id: 0,
-        raw_tx: bytes::Bytes::from(raw),
-        sender: s.address(),
-        tx_hash: *env.tx_hash(),
+        gas_price: 1_000_000_000,
+        ..Default::default()
     }
+    .sign(&anvil_signer_0())
 }
 
 fn eth(n: u64) -> U256 {
@@ -80,7 +60,7 @@ fn genesis() -> MockStateDatabase {
     let code_hash = keccak256(CONTRACT_CODE);
     MockStateDatabase::builder()
         // Genesis convention: EOAs seeded with code_hash = ZERO.
-        .account(signer().address(), eth(1000), 0, B256::ZERO)
+        .account(anvil_signer_0().address(), eth(1000), 0, B256::ZERO)
         .account(DECOY, eth(1000), 0, B256::ZERO)
         .account(CONTRACT, U256::ZERO, 1, code_hash)
         .code(code_hash, bytes::Bytes::from_static(&CONTRACT_CODE))
@@ -134,7 +114,7 @@ fn oracle_root(delta: &PendingDelta) -> B256 {
     // This is the genesis account set the mock was built from.
     let code_hash = keccak256(CONTRACT_CODE);
     let mut accounts: std::collections::BTreeMap<Address, AccountFields> = [
-        (signer().address(), (0, eth(1000), B256::ZERO)),
+        (anvil_signer_0().address(), (0, eth(1000), B256::ZERO)),
         (DECOY, (0, eth(1000), B256::ZERO)),
         (CONTRACT, (1, U256::ZERO, code_hash)),
     ]
@@ -304,7 +284,7 @@ fn incomplete_witness_fails_closed() {
     let mut tampered = witness.clone();
     tampered
         .accounts
-        .retain(|a| a.address != signer().address());
+        .retain(|a| a.address != anvil_signer_0().address());
     let err = reexecute_stateless(&tampered, None, &recs, env(), &bal, PER_TX);
     assert!(err.is_err(), "replay over an incomplete witness must fail");
 
