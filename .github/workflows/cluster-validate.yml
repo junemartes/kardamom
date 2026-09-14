@@ -12,12 +12,11 @@ on:
       - 'justfile'
       - 'crates/log/docker/aeron/Dockerfile'
       - '.github/workflows/cluster-validate.yml'
+  # Every pull request, with no path filter: the main ruleset requires the
+  # tofu checks, and a filtered workflow never reports them on a pull
+  # request that leaves deploy/cluster alone, so that pull request could
+  # never merge.
   pull_request:
-    paths:
-      - 'deploy/cluster/**'
-      - 'justfile'
-      - 'crates/log/docker/aeron/Dockerfile'
-      - '.github/workflows/cluster-validate.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

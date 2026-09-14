@@ -44,6 +44,7 @@ fn tx_record(
         value,
         gas_limit: 100_000,
         gas_price: REAL_GAS_PRICE,
+        ..Default::default()
     }
     .sign(signer);
     BufferedRecord::Tx {
