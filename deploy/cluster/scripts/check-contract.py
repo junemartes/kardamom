@@ -513,7 +513,6 @@ must_contain(
 cluster_member_count = scalar(gv, "cluster_member_count")
 cluster_ingress_stream_id = scalar(gv, "cluster_ingress_stream_id")
 cluster_egress_stream_id = scalar(gv, "cluster_egress_stream_id")
-cluster_egress_port = scalar(gv, "cluster_egress_port")
 
 # cluster_ports: indented `key: int` entries under the `cluster_ports:` block.
 cp_block = re.search(r"^cluster_ports:\n((?:\s{2}\w+:.*\n?)+)", gv, re.M)
