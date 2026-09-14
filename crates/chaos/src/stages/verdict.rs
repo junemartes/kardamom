@@ -183,7 +183,7 @@ impl Harness {
 
     async fn dump_validator_tails(&self) {
         eprintln!("----- validator alloc log tails -----");
-        let Ok(allocs) = self.nomad.allocations("validator").await else {
+        let Ok(allocs) = self.nomad.allocations_with_logs("validator").await else {
             return;
         };
         for alloc in &allocs {
