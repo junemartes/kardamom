@@ -2,7 +2,7 @@
 """Verify that values mirrored from ansible/group_vars/all.yml stay in sync.
 
 group_vars/all.yml is the canonical cluster contract, but several artifacts
-cannot read YAML (Vagrantfile, Makefile, Nomad job specs, shell scripts) and
+cannot read YAML (Makefile, Nomad job specs, scripts) and
 mirror its values as literals. This script extracts the contract with plain
 regexes (no YAML dependency) and fails if any mirror drifts.
 
@@ -70,45 +70,21 @@ ingress_rpc = ports.get("ingress_rpc", "")
 anvil_l1 = ports.get("anvil_l1", "")
 nomad_http = ports.get("nomad_http", "")
 
-# Node name -> ip from the legacy hand-enumerated cluster_nodes mapping (if any).
-nodes = dict(re.findall(r"^\s{2}(\w+):\n\s{4}ip:\s*([\d.]+)", gv, re.M))
-if nodes:
-    # --- legacy cluster_nodes model: Vagrantfile + inventory mirror node IPs ---
-    EXPECTED_NODES = [
-        "batcher1", "cp1", "dawatcher1", "exec1", "ingress1",
-        "r1", "r2", "r3", "sealer1", "sq1", "sq2",
-    ]
-    if sorted(nodes) != EXPECTED_NODES:
-        err(f"group_vars/all.yml: unexpected cluster_nodes set: {sorted(nodes)}")
-    for name, ip in nodes.items():
-        must_contain(CLUSTER / "Vagrantfile", f'"{ip}"', f"static IP of {name}")
-        must_contain(
-            CLUSTER / "ansible" / "inventory.ini",
-            f"{name} ansible_host={ip}",
-            f"inventory entry for {name}",
-        )
-        must_contain(
-            CLUSTER / "ansible" / "inventory.containers.ini",
-            f"{name} ansible_host=kardamom-{name}",
-            f"container inventory entry for {name}",
-        )
-else:
-    # node-class model: terraform/containers materialises nodes from
-    # `node_classes` at apply time (names <class>-<i>, static IPs from each
-    # class's ip_start lane), so there are no hand-written per-node IP mirrors to
-    # cross-check here. Just assert the model is actually declared.
-    if "node_classes:" not in gv:
-        err("group_vars/all.yml: neither cluster_nodes nor node_classes is defined")
+# The node-class model: terraform/containers materialises nodes from
+# `node_classes` at apply time, so there is no hand-written per-node mirror
+# to cross-check. Assert the model is declared.
+if "node_classes:" not in gv:
+    err("group_vars/all.yml: node_classes is not defined")
 
 # --- the one bootstrap entry point ---------------------------------------------
 # bootstrap.yml is the only host configuration playbook. Every caller (the
-# Makefile, the Vagrantfile, containers.yml) runs it, and the Nomad agents
+# Makefile, containers.yml) runs it, and the Nomad agents
 # find their servers through Consul, never through a static server list.
 ANSIBLE = CLUSTER / "ansible"
 if (ANSIBLE / "site.yml").exists():
     err("ansible/site.yml exists: bootstrap.yml is the one entry point; delete site.yml")
 must_contain(ANSIBLE / "bootstrap.yml", "provision_hosts | default('all')", "the bootstrap playbook configures every host")
-for caller in ("Makefile", "Vagrantfile", "ansible/containers.yml"):
+for caller in ("ansible/containers.yml",):
     must_contain(CLUSTER / caller, "bootstrap.yml", "runs the one bootstrap playbook")
     must_not_contain(CLUSTER / caller, "site.yml", "site.yml is replaced by bootstrap.yml")
 NOMAD_TPL = ANSIBLE / "roles" / "nomad" / "templates" / "nomad.hcl.j2"
@@ -537,7 +513,6 @@ must_contain(
 cluster_member_count = scalar(gv, "cluster_member_count")
 cluster_ingress_stream_id = scalar(gv, "cluster_ingress_stream_id")
 cluster_egress_stream_id = scalar(gv, "cluster_egress_stream_id")
-cluster_egress_port = scalar(gv, "cluster_egress_port")
 
 # cluster_ports: indented `key: int` entries under the `cluster_ports:` block.
 cp_block = re.search(r"^cluster_ports:\n((?:\s{2}\w+:.*\n?)+)", gv, re.M)
@@ -582,8 +557,7 @@ if cluster_member_count.isdigit() and all(
 # service <name>.service.consul, and every node runs Consul as its resolver
 # (roles/consul). Loopback, the unspecified address, multicast groups and
 # network ranges are not addresses of a node. The Hetzner Terraform inputs
-# are the one place for addresses, and the Vagrant VM path keeps its
-# addresses in its own environment files, the Vagrantfile and inventory.ini.
+# are the one place for addresses.
 IPV4 = re.compile(r"(?<![\w.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\w.])")
 ADDRESS_FREE = [
     *sorted((CLUSTER / "nomad").glob("*.hcl")),
