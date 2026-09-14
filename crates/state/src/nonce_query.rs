@@ -59,6 +59,15 @@ pub struct NonceQueryServer {
     pub task: tokio::task::JoinHandle<()>,
 }
 
+impl Drop for NonceQueryServer {
+    /// End the accept loop, which frees the port and the server's clone
+    /// of the state env. A process that opens its state again in place
+    /// (a resync revolution) binds a new server on the same address.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Serve account nonce queries on `addr`, forever. Binding happens before
 /// the task spawns, so a bad address fails startup with a clear error.
 /// Call this inside a tokio runtime.
