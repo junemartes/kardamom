@@ -14,8 +14,17 @@ CONTROL_ADDRESS_CMD := python3 -c 'import json,sys; print(json.load(open(sys.arg
 # The test suite and the operator commands are the kardamom-chaos crate.
 # A shard test brings its own cluster up; the container-* targets do the
 # same lifecycle by hand and run the gates against it (KARDAMOM_CHAOS_REUSE).
-CARGO_CHAOS := cargo test -p kardamom-chaos --release --features cluster-e2e --locked --test shards
+# KARDAMOM_STAGED=1 runs the binaries a build already staged under
+# target/release (scripts/ci/stage-cluster-dist.sh): the shard test
+# executable as kardamom-chaos-shards and the operator binary. CI's shard
+# runners carry no toolchain. Unset, cargo builds and runs them.
+ifdef KARDAMOM_STAGED
+RUN_SHARDS := ../../target/release/kardamom-chaos-shards
+CLUSTER_BIN := ../../target/release/kardamom-cluster
+else
+RUN_SHARDS := cargo test -p kardamom-chaos --release --features cluster-e2e --locked --test shards --
 CLUSTER_BIN := cargo run --release -p kardamom-chaos --locked --bin kardamom-cluster --
+endif
 # The shard to run: load, semantics, chaos-executor, chaos-ingress,
 # chaos-sequencer, chaos-cluster, chaos-retention.
 SHARD ?= load
@@ -96,12 +105,12 @@ container-up:
 ## container-test: run one shard's gates (SHARD=...) against the cluster
 ## container-up made; KARDAMOM_CHAOS_CASES narrows a chaos shard's cases.
 container-test:
-	KARDAMOM_CHAOS_REUSE=1 $(CARGO_CHAOS) -- --ignored --exact $(SHARD_TEST) --nocapture
+	KARDAMOM_CHAOS_REUSE=1 $(RUN_SHARDS) --ignored --exact $(SHARD_TEST) --nocapture
 
 ## shard: one shard end to end, the way CI runs it: the test brings the
 ## cluster up, runs its gates, and destroys the cluster on success.
 shard:
-	$(CARGO_CHAOS) -- --ignored --exact $(SHARD_TEST) --nocapture
+	$(RUN_SHARDS) --ignored --exact $(SHARD_TEST) --nocapture
 
 ## container-diagnostics: collect node and job state after a failure
 container-diagnostics:
