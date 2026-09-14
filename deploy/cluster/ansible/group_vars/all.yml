@@ -1,5 +1,5 @@
 # Canonical cluster contract — single source of truth for the whole deploy.
-# Vagrantfile, Ansible roles, Nomad job templates, and config templates all
+# The Terraform roots, Ansible roles, Nomad job templates, and config templates all
 # derive their values from here (or mirror it; see deploy/cluster/README.md).
 ---
 # --- versions -------------------------------------------------------------
@@ -14,8 +14,8 @@ cosign_pinned_version: "v3.1.3"
 cosign_pinned_sha256: "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71"
 
 # --- deployment profile ---------------------------------------------------
-# One playbook, two profiles. `local` is the Vagrant VM path and the
-# container CI path: one control node, a plain-HTTP registry, and an
+# One playbook, two profiles. `local` is the container path (CI and a
+# developer host): one control node, a plain-HTTP registry, and an
 # explicit node_ip on every inventory host. `production` is the Hetzner
 # profile: three voting Consul and Nomad servers on the dedicated core, a
 # private interface selector in place of fixed addresses, gossip
@@ -31,8 +31,8 @@ cluster_id: "kardamom-dev"
 datacenter: "dc1"
 nomad_region: "global"
 # Consul join names. The container profile joins the control node by its
-# container name (Docker DNS resolves it); the Vagrant inventory and the
-# production profile join infrastructure DNS names of the Consul servers.
+# container name (Docker DNS resolves it); the production profile joins
+# infrastructure DNS names of the Consul servers.
 # Consul never bootstraps through its own service records, and no join
 # entry is an address.
 consul_retry_join: ["kardamom-control-0"]
@@ -119,11 +119,6 @@ ports:
   # sequencer.nomad.hcl --executor-query-endpoints (both groups).
   executor_nonce_query: 9024
   anvil_l1: 8546              # in-cluster L1 (anvil) for the smoke test
-  # Aeron archive control/response/replication (see aeron image EXPOSE).
-  aeron_archive_control: 8010
-  aeron_archive_control_response: 8011
-  aeron_archive_recording_events: 8020
-  aeron_archive_replication: 8021
   # Base UDP port for kardamom data/ordering channels; per-channel offsets
   # are assigned in config/channels.toml.tpl.
   aeron_channel_base: 40000
@@ -200,4 +195,3 @@ cluster_ports:
   archive_control: 40204
 cluster_ingress_stream_id: 101
 cluster_egress_stream_id: 102
-cluster_egress_port: 40210   # egress response port of the ingress client (on its node IP); every other cluster client takes a Nomad dynamic port
