@@ -297,14 +297,7 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         ));
     }
     await_repair_chain(h, victim, &ctx, delta, elapsed).await?;
-    let cid_now = h.nodes.inner_cid(&node, &inner).await;
-    anyhow::ensure!(
-        cid_now.is_some() && cid_now != cid0,
-        "{}: {ctx}: victim container was not restarted (cid {} -> {}) — the park/exit/restore loop did not complete",
-        crate::FAIL_PREFIX,
-        cid0.as_deref().unwrap_or("?"),
-        cid_now.as_deref().unwrap_or("gone")
-    );
+    await_restarted_container(h, &node, &inner, cid0.as_deref(), &ctx).await?;
     match victim {
         Victim::Executor => h.assert_executor_progress(Duration::from_secs(180)).await,
         Victim::Validator => await_verifying_resumed(h).await,
@@ -367,6 +360,37 @@ async fn overrun_window(
             ))
         }
     }
+}
+
+/// Wait for the victim's running container to differ from `cid0`. The
+/// restore line can log while the task restarts once more, so for a moment
+/// no container of the task is running, and a single `docker ps` read
+/// right after the repair chain can find none.
+async fn await_restarted_container(
+    h: &Harness,
+    node: &str,
+    inner: &str,
+    cid0: Option<&str>,
+    ctx: &str,
+) -> anyhow::Result<()> {
+    let outcome = poll::until(Budget::secs(90, 3), |_| async move {
+        let now = h.nodes.inner_cid(node, inner).await;
+        Ok(now.filter(|cid| Some(cid.as_str()) != cid0))
+    })
+    .await?;
+    let (cid, waited) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: victim container was not restarted within {}s (cid {} -> no new running container) — the park/exit/restore loop did not complete",
+            t.as_secs(),
+            cid0.unwrap_or("?")
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: victim container restarted (cid {} -> {cid}, {}s after the restore line)",
+        cid0.unwrap_or("?"),
+        waited.as_secs()
+    ));
+    Ok(())
 }
 
 /// The recovery evidence splits across container generations, so the
