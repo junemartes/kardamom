@@ -152,9 +152,17 @@ Remove the old volumes too: Terraform adopts an existing volume by name, and
 an old `kardamom-<node>-docker` volume would carry stale inner Docker state
 into the new node.
 
-CI runs `make shard SHARD=<name>` per matrix entry, and `container-diagnostics`
-on failure. A failed shard leaves the cluster up; the runner is ephemeral, so
-nothing destroys it after. Pass extra vars to `ansible/cluster.yml` with
+CI builds once: a `build` job compiles the service binaries, the shard test
+executable, the operator binary and the sealer jar, and stages them as one
+artifact (`scripts/ci/stage-cluster-dist.sh`, the checkout's own layout). A
+shard runner unpacks it and runs `make shard SHARD=<name> KARDAMOM_STAGED=1`,
+with no Rust toolchain, JDK or Foundry, and `container-diagnostics` on
+failure. `KARDAMOM_STAGED=1` makes the Makefile run
+`target/release/kardamom-chaos-shards` and `target/release/kardamom-cluster`
+instead of `cargo`. The Aeron C library is compiled for x86-64-v3 through the
+`scripts/ci/cc-x86-64-v3.sh` wrapper, so the artifact runs on any runner. A
+failed shard leaves the cluster up; the runner is ephemeral, so nothing
+destroys it after. Pass extra vars to `ansible/cluster.yml` with
 `CLUSTER_VARS='{"images_tag": "x"}'` (one JSON object, no single quote).
 `ansible/cluster.yml` is the convergence playbook; it expects the node contract.
 
@@ -450,7 +458,8 @@ reads the same service.
 ## Sustained-load + chaos suite
 
 The `cluster-e2e` workflow runs the full suite on every trigger, **sharded
-across runners** (each shard brings up its own container cluster):
+across runners** (each shard brings up its own container cluster from the
+binaries one `build` job staged):
 
 | Shard | Exercises |
 |-------|-----------|
