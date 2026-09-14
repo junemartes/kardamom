@@ -464,7 +464,7 @@ binaries one `build` job staged):
 | Shard | Exercises |
 |-------|-----------|
 | `load` | 5-min sustained soak (`kardamom-load` ramp→soak; must-deliver + drop accounting + keep-pace) |
-| `chaos-executor` | graceful + hard kill + **node-failure** (degrade to 2/3, node returns) |
+| `chaos-executor` | graceful + hard kill + **node-failure** (degrade to 2/3, node returns) + **node-replace** (the node comes back through the Terraform root on a new address with empty disks) |
 | `chaos-ingress` | graceful + hard kill + **archive-driver-loss** (Aeron substrate kill under ingress-0) |
 | `chaos-sequencer` | graceful + hard kill + **sequencer-replica-kill** (racing-twin failover, restarted replica must regain coverage) + **validator-lapse** |
 | `chaos-cluster` | Raft sealer: **leader-kill** / **follower-kill** / **quorum-loss-recover** |

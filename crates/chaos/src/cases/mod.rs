@@ -27,6 +27,7 @@ pub enum Case {
     HardSequencer,
     SequencerReplicaKill,
     NodeFailureExecutor,
+    NodeReplaceExecutor,
     StateCheckpointRestore,
     ReplayWindowResync,
     ClusterLeaderKill,
@@ -46,7 +47,7 @@ pub enum Case {
     LookupBlackout,
 }
 
-const ALL: [Case; 25] = [
+const ALL: [Case; 26] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -55,6 +56,7 @@ const ALL: [Case; 25] = [
     Case::HardSequencer,
     Case::SequencerReplicaKill,
     Case::NodeFailureExecutor,
+    Case::NodeReplaceExecutor,
     Case::StateCheckpointRestore,
     Case::ReplayWindowResync,
     Case::ClusterLeaderKill,
@@ -99,6 +101,7 @@ impl Case {
             Self::HardSequencer => "hard-sequencer",
             Self::SequencerReplicaKill => "sequencer-replica-kill",
             Self::NodeFailureExecutor => "node-failure-executor",
+            Self::NodeReplaceExecutor => "node-replace-executor",
             Self::StateCheckpointRestore => "state-checkpoint-restore",
             Self::ReplayWindowResync => "replay-window-resync",
             Self::ClusterLeaderKill => "cluster-leader-kill",
@@ -147,6 +150,7 @@ impl Case {
             }
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
             Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_secs(300),
+            Self::NodeReplaceExecutor => inject + k.reschedule_slo + Duration::from_secs(420),
             Self::CpuSqueeze => {
                 let cycle = k.squeeze.window + k.squeeze.release;
                 inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
@@ -181,6 +185,7 @@ impl Case {
             Self::HardSequencer => component::hard_sequencer(h).await,
             Self::SequencerReplicaKill => component::sequencer_replica_kill(h).await,
             Self::NodeFailureExecutor => component::node_failure_executor(h).await,
+            Self::NodeReplaceExecutor => component::node_replace_executor(h).await,
             Self::StateCheckpointRestore => component::state_checkpoint_restore(h).await,
             Self::ReplayWindowResync => component::replay_window_resync(h).await,
             Self::ClusterLeaderKill => cluster::leader_kill(h).await,
