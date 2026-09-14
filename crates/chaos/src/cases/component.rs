@@ -118,67 +118,14 @@ pub(crate) async fn node_failure_executor(h: &mut Harness) -> anyhow::Result<()>
 /// moves. A restarted node (`node-failure-executor`) keeps its address
 /// and its disks; this case is the path that loses both.
 pub(crate) async fn node_replace_executor(h: &mut Harness) -> anyhow::Result<()> {
-    let name = "executor-2";
-    let old = h.contract.node(name)?.clone();
-    let generation = old.generation.saturating_add(1);
-    crate::log(format!(
-        "node-replace: replacing {name} (generation {} -> {generation}, was {})",
-        old.generation, old.ip
-    ));
-    let contract = h.lifecycle.replace_container(name, generation).await?;
-    let new = contract.node(name)?.clone();
-    anyhow::ensure!(
-        new.ip != old.ip,
-        "{}: node-replace: {name} came back on its old address {}",
-        crate::FAIL_PREFIX,
-        old.ip
-    );
-    crate::log(format!(
-        "node-replace: {name} is a new container on {}; forgetting the old Consul record, then provisioning",
-        new.ip
-    ));
-    // The replacement has a fresh node id under the old name. Consul
-    // treats that as a name conflict while the old record stands, so the
-    // control node forgets it first.
-    let control = h.container("control-0")?;
-    let _ = h
-        .nodes
-        .exec(&control, &format!("consul force-leave -prune {name}"))
-        .await;
-    h.lifecycle.provision_node(name).await?;
-    h.follow(contract)?;
-    consul_has_address(h, &control, name, &new.ip.to_string()).await?;
+    h.replace_node("executor-2", "node-replace").await?;
     h.assert_count("executor", 3, h.knobs.reschedule_slo)
         .await?;
     h.assert_executor_progress(Duration::from_secs(180)).await?;
-    crate::log(format!(
-        "node-replace: executor placed on the new {name}; waiting for it to catch up from empty disks"
-    ));
+    crate::log(
+        "node-replace: executor placed on the new executor-2; waiting for it to catch up from empty disks",
+    );
     h.assert_executors_converged("node-replace").await
-}
-
-/// The Consul catalog on the control node lists `name` at `address`.
-async fn consul_has_address(
-    h: &Harness,
-    control: &str,
-    name: &str,
-    address: &str,
-) -> anyhow::Result<()> {
-    let script = format!("curl -sf http://127.0.0.1:8500/v1/catalog/node/{name}");
-    let needle = format!("\"Address\":\"{address}\"");
-    let outcome = poll::until(Budget::secs(120, 5), |_| async {
-        let body = h.nodes.exec(control, &script).await.unwrap_or_default();
-        Ok::<_, anyhow::Error>(body.contains(&needle).then_some(()))
-    })
-    .await?;
-    outcome
-        .or_fail(|t| {
-            crate::chaos_fail!(
-                "node-replace: Consul still has no record of {name} at {address} after {}s",
-                t.as_secs()
-            )
-        })
-        .map(|_| ())
 }
 
 /// The data-loss drill: wipe executor-0's state and checkpoints, then

@@ -33,6 +33,7 @@ pub enum Case {
     ClusterLeaderKill,
     ClusterFollowerKill,
     ClusterMemberRejoin,
+    NodeReplaceSealer,
     ClusterQuorumLossRecover,
     ArchiveDriverLoss,
     ArchiveTxDataWipe,
@@ -47,7 +48,7 @@ pub enum Case {
     LookupBlackout,
 }
 
-const ALL: [Case; 26] = [
+const ALL: [Case; 27] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -62,6 +63,7 @@ const ALL: [Case; 26] = [
     Case::ClusterLeaderKill,
     Case::ClusterFollowerKill,
     Case::ClusterMemberRejoin,
+    Case::NodeReplaceSealer,
     Case::ClusterQuorumLossRecover,
     Case::ArchiveDriverLoss,
     Case::ArchiveTxDataWipe,
@@ -107,6 +109,7 @@ impl Case {
             Self::ClusterLeaderKill => "cluster-leader-kill",
             Self::ClusterFollowerKill => "cluster-follower-kill",
             Self::ClusterMemberRejoin => "cluster-member-rejoin",
+            Self::NodeReplaceSealer => "node-replace-sealer",
             Self::ClusterQuorumLossRecover => "cluster-quorum-loss-recover",
             Self::ArchiveDriverLoss => "archive-driver-loss",
             Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
@@ -151,6 +154,9 @@ impl Case {
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
             Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_secs(300),
             Self::NodeReplaceExecutor => inject + k.reschedule_slo + Duration::from_secs(420),
+            Self::NodeReplaceSealer => {
+                inject + k.reschedule_slo + k.rejoin_slo + Duration::from_secs(300)
+            }
             Self::CpuSqueeze => {
                 let cycle = k.squeeze.window + k.squeeze.release;
                 inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
@@ -191,6 +197,7 @@ impl Case {
             Self::ClusterLeaderKill => cluster::leader_kill(h).await,
             Self::ClusterFollowerKill => cluster::follower_kill(h).await,
             Self::ClusterMemberRejoin => cluster::member_rejoin(h).await,
+            Self::NodeReplaceSealer => cluster::node_replace_sealer(h).await,
             Self::ClusterQuorumLossRecover => cluster::quorum_loss_recover(h).await,
             Self::ArchiveDriverLoss => archive::driver_loss(h).await,
             Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
