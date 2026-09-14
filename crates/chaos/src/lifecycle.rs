@@ -24,17 +24,6 @@ const REGISTRY_PUSH_NODE: &str = "control-0";
 /// `workloads_deploy_binary` at prebuilt artifacts with it.
 const CLUSTER_VARS_ENV: &str = "KARDAMOM_CHAOS_CLUSTER_VARS";
 
-/// The name of a controller container to run the lifecycle commands
-/// in: the privileged `kardamom-orchestrator` container of
-/// `ansible/local.yml`, with the checkout mounted at `/work` and the
-/// host Docker socket. The host preparation role writes host sysctls
-/// and bridge settings as root, which the controller has and a plain
-/// user session does not. Unset, the commands run on the host.
-const CONTROLLER_ENV: &str = "KARDAMOM_CHAOS_CONTROLLER";
-
-/// The checkout mount inside the controller.
-const CONTROLLER_WORK: &str = "/work";
-
 /// The deploy-time settings a shard passes to the workloads. Ansible
 /// reads them from the environment, and a case reads the same values
 /// from its knobs, so one setting drives both sides.
@@ -62,7 +51,6 @@ impl DeployVars {
 #[derive(Debug, Clone)]
 pub struct Lifecycle {
     cluster_dir: PathBuf,
-    controller: Option<String>,
 }
 
 impl Lifecycle {
@@ -71,27 +59,15 @@ impl Lifecycle {
     pub fn new(repo_root: &Path) -> Self {
         Self {
             cluster_dir: repo_root.join("deploy").join("cluster"),
-            controller: std::env::var(CONTROLLER_ENV).ok().filter(|c| !c.is_empty()),
         }
     }
 
-    /// A command of `program` that runs in the controller container when
-    /// one is configured, else on the host. Inside the controller the
-    /// working directory is the checkout's `deploy/cluster` under
-    /// `/work`, and every environment pair is passed through.
+    /// A command of `program` in the checkout's `deploy/cluster`, with
+    /// every environment pair passed through.
     fn command(&self, program: &str, env: &[(&str, String)]) -> Command {
-        let Some(controller) = &self.controller else {
-            let mut cmd = Command::new(program);
-            cmd.current_dir(&self.cluster_dir);
-            cmd.envs(env.iter().map(|(k, v)| (*k, v.as_str())));
-            return cmd;
-        };
-        let mut cmd = Command::new("docker");
-        cmd.args(["exec", "-w", &format!("{CONTROLLER_WORK}/deploy/cluster")]);
-        for (k, v) in env {
-            cmd.args(["-e", &format!("{k}={v}")]);
-        }
-        cmd.arg(controller).arg(program);
+        let mut cmd = Command::new(program);
+        cmd.current_dir(&self.cluster_dir);
+        cmd.envs(env.iter().map(|(k, v)| (*k, v.as_str())));
         cmd
     }
 
@@ -118,8 +94,7 @@ impl Lifecycle {
         self.cluster_dir.join("terraform").join("containers")
     }
 
-    /// The `-chdir` argument of tofu: relative to `deploy/cluster`, so
-    /// it resolves on the host and in the controller alike.
+    /// The `-chdir` argument of tofu, relative to `deploy/cluster`.
     fn tofu_chdir() -> &'static str {
         "-chdir=terraform/containers"
     }
@@ -166,6 +141,51 @@ impl Lifecycle {
         }
         run_inheriting(cmd, "ansible-playbook ansible/cluster.yml").await?;
         Ok(contract)
+    }
+
+    /// Replace one node the way a cloud provider replaces a machine: the
+    /// container comes back with generation `generation`, on another
+    /// address and with empty volumes, and the contract file follows.
+    /// The node is unprovisioned after this; see
+    /// [`Self::provision_node`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a step exits non-zero, or if the contract the
+    /// apply wrote is invalid.
+    pub async fn replace_container(
+        &self,
+        name: &str,
+        generation: u32,
+    ) -> anyhow::Result<NodeContract> {
+        let target = format!("-replace=docker_container.node[\"{name}\"]");
+        let var = format!("-var=node_generation={{\"{name}\"={generation}}}");
+        self.tofu(&["init", "-input=false"]).await?;
+        self.tofu(&["apply", "-auto-approve", "-input=false", &target, &var])
+            .await?;
+        self.write_contract().await?;
+        self.contract()
+    }
+
+    /// Provision one node with the substrate playbook, limited to that
+    /// node: the play a new machine gets. The workloads are not
+    /// redeployed; Nomad places the lost allocations on the node once
+    /// its client joins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the playbook exits non-zero.
+    pub async fn provision_node(&self, name: &str) -> anyhow::Result<()> {
+        let contract = self.contract()?;
+        let nomad_addr = contract.nomad_addr(NOMAD_HTTP_PORT)?;
+        let env = vec![("NOMAD_ADDR", nomad_addr)];
+        let mut cmd = self.command("ansible-playbook", &env);
+        cmd.args(["-i", "localhost,", "ansible/containers.yml", "--limit"])
+            .arg(format!("localhost,{name}"));
+        if let Ok(extra) = std::env::var(CLUSTER_VARS_ENV) {
+            cmd.args(["--extra-vars", &extra]);
+        }
+        run_inheriting(cmd, "ansible-playbook ansible/containers.yml (one node)").await
     }
 
     /// Destroy the node containers and their volumes, and remove the

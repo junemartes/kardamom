@@ -14,8 +14,17 @@ CONTROL_ADDRESS_CMD := python3 -c 'import json,sys; print(json.load(open(sys.arg
 # The test suite and the operator commands are the kardamom-chaos crate.
 # A shard test brings its own cluster up; the container-* targets do the
 # same lifecycle by hand and run the gates against it (KARDAMOM_CHAOS_REUSE).
-CARGO_CHAOS := cargo test -p kardamom-chaos --release --features cluster-e2e --locked --test shards
+# KARDAMOM_STAGED=1 runs the binaries a build already staged under
+# target/release (scripts/ci/stage-cluster-dist.sh): the shard test
+# executable as kardamom-chaos-shards and the operator binary. CI's shard
+# runners carry no toolchain. Unset, cargo builds and runs them.
+ifdef KARDAMOM_STAGED
+RUN_SHARDS := ../../target/release/kardamom-chaos-shards
+CLUSTER_BIN := ../../target/release/kardamom-cluster
+else
+RUN_SHARDS := cargo test -p kardamom-chaos --release --features cluster-e2e --locked --test shards --
 CLUSTER_BIN := cargo run --release -p kardamom-chaos --locked --bin kardamom-cluster --
+endif
 # The shard to run: load, semantics, chaos-executor, chaos-ingress,
 # chaos-sequencer, chaos-cluster, chaos-retention.
 SHARD ?= load
@@ -32,25 +41,10 @@ export REGISTRY TAG DIGEST_MANIFEST
 # the-sealer, folded into the cluster members).
 SERVICES := ingress sequencer executor validator da-watcher batcher
 
-.PHONY: up vms provision images deploy smoke status down clean validate check-contract
+.PHONY: images deploy smoke clean validate check-contract
 
-## up: full bring-up — VMs, provisioning, images, deploy. Run `make smoke`
-## separately to exercise the pipeline once the jobs settle.
-up: vms provision images deploy
-	@echo
-	@echo "==> Cluster is up. Run 'make smoke' to exercise the pipeline."
-
-## vms: boot the VMs (one per node_classes instance)
-vms:
-	vagrant up
-
-## provision: install docker/nomad/consul/registry via Ansible
-provision:
-	ansible-playbook -i ansible/inventory.ini ansible/bootstrap.yml
-
-## images: build service + aeron images on the host and push to the registry.
-## NOTE: pushing needs $(REGISTRY) in the HOST Docker daemon's
-## insecure-registries (see README "Host prerequisites").
+## images: wrap the prebuilt service binaries and the sealer jar into images
+## and push them to the in-cluster registry through REGISTRY_PUSH_NODE.
 images:
 	ansible-playbook -i localhost, ansible/images.yml
 
@@ -62,10 +56,6 @@ deploy:
 ## (RPC_URL overrides the ingress-0 address of the node contract)
 smoke:
 	$(CLUSTER_BIN) smoke $(if $(RPC_URL),--rpc $(RPC_URL))
-
-## status: cluster + job health, from the control node's own agents
-status:
-	vagrant ssh control-0 -c 'nomad node status && echo && nomad job status && echo && consul members'
 
 ## validate: static checks (run on a host with the toolchain; CI runs these too)
 validate:
@@ -82,10 +72,6 @@ validate:
 check-contract:
 	./scripts/check-contract.py
 
-## down: stop jobs and destroy VMs
-down:
-	vagrant destroy -f
-
 ## clean: remove local built images (+ the staged cluster jar)
 clean:
 	-docker image rm $(REGISTRY)/kardamom-aeron:$(TAG)
@@ -96,7 +82,7 @@ clean:
 # --- container path (Linux controller; prebuilt artifacts required) ---------
 # terraform/containers owns the node containers. The Makefile owns the
 # lifecycle: apply, converge, test, diagnose, destroy. CI runs these targets
-# as workflow steps; ansible/local.yml runs them inside the orchestrator.
+# as workflow steps.
 TF_CONTAINERS := terraform/containers
 # On the container path, images are pushed from inside the control node,
 # where the registry name resolves; the host daemon needs no
@@ -119,12 +105,12 @@ container-up:
 ## container-test: run one shard's gates (SHARD=...) against the cluster
 ## container-up made; KARDAMOM_CHAOS_CASES narrows a chaos shard's cases.
 container-test:
-	KARDAMOM_CHAOS_REUSE=1 $(CARGO_CHAOS) -- --ignored --exact $(SHARD_TEST) --nocapture
+	KARDAMOM_CHAOS_REUSE=1 $(RUN_SHARDS) --ignored --exact $(SHARD_TEST) --nocapture
 
 ## shard: one shard end to end, the way CI runs it: the test brings the
 ## cluster up, runs its gates, and destroys the cluster on success.
 shard:
-	$(CARGO_CHAOS) -- --ignored --exact $(SHARD_TEST) --nocapture
+	$(RUN_SHARDS) --ignored --exact $(SHARD_TEST) --nocapture
 
 ## container-diagnostics: collect node and job state after a failure
 container-diagnostics:
@@ -138,7 +124,3 @@ container-down:
 
 ## container-reset: destroy, then create a fresh chain
 container-reset: container-down container-up
-
-.PHONY: local
-local:
-	ansible-playbook -i localhost, ansible/local.yml

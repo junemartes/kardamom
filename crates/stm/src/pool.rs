@@ -368,7 +368,18 @@ impl WorkerPool {
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        self.shared.shutdown.store(true, Ordering::Release);
+        // Set the flag under the job lock, as `run` publishes a job. A
+        // lane checks the flag and parks while it holds this lock, so the
+        // flag and the notify can no longer fall between its check and its
+        // park. A poisoned lock still guards the flag, so shutdown proceeds.
+        {
+            let _g = self
+                .shared
+                .job
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.shared.shutdown.store(true, Ordering::Release);
+        }
         self.shared.wake.notify_all();
         for t in self.threads.drain(..) {
             let _ = t.join();
@@ -383,6 +394,21 @@ mod tests {
 
     fn nz(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).expect("test worker count is never 0")
+    }
+
+    /// A pool dropped while its lanes start up must still join. Drop
+    /// once set the shutdown flag without the job lock, so a lane could
+    /// read the flag as false, miss the notify, and park forever.
+    #[test]
+    fn a_pool_dropped_at_once_joins_its_lanes() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            (0..2_000).for_each(|_| drop(WorkerPool::new(nz(4), &[])));
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("every dropped pool joined its lanes");
     }
 
     #[test]

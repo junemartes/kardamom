@@ -72,7 +72,7 @@ pub(crate) struct Args {
     /// This node's cluster-egress endpoint `ip:port` (cluster mode). It sets
     /// or overrides the `[cluster]` `egress_channel` as
     /// `aeron:udp?endpoint=<ip:port>`. The Nomad job injects it per node as
-    /// `${meta.node_ip}:<cluster_egress_port>`.
+    /// `${meta.node_ip}:${NOMAD_HOST_PORT_egress}`.
     #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
     pub(crate) cluster_egress_endpoint: Option<String>,
     /// L2 chain id (used for revm).
