@@ -27,6 +27,8 @@ workloads_common_vars:
   datacenter: "{{ datacenter }}"
   executor_count: "{{ node_classes.executor.count }}"
   sealer_count: "{{ node_classes.sealer.count }}"
+  sequencer_count: "{{ node_classes.sequencer.count }}"
+  ingress_count: "{{ node_classes.ingress.count }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 workloads_l1_rpc: "{{ lookup('env', 'L1_RPC') }}"

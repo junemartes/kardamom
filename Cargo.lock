@@ -3984,6 +3984,7 @@ dependencies = [
  "kardamom-log",
  "kardamom-obs",
  "kardamom-state",
+ "kardamom-test-support",
  "kardamom-types",
  "metrics",
  "revm",
@@ -4011,6 +4012,7 @@ dependencies = [
  "alloy-trie",
  "bytes",
  "hashbrown 0.15.5",
+ "kardamom-test-support",
  "kardamom-types",
  "metrics",
  "revm",
@@ -4183,6 +4185,7 @@ dependencies = [
  "kardamom-engine",
  "kardamom-reconstruct",
  "kardamom-state",
+ "kardamom-test-support",
  "kardamom-types",
  "serde_json",
  "tempfile",
@@ -4277,7 +4280,6 @@ version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
- "alloy-network",
  "alloy-primitives",
  "alloy-signer-local",
  "bytes",
@@ -4285,10 +4287,24 @@ dependencies = [
  "crossbeam-queue",
  "kardamom-exec-core",
  "kardamom-footprint",
+ "kardamom-test-support",
  "kardamom-types",
  "revm",
  "smallvec",
  "tracing",
+]
+
+[[package]]
+name = "kardamom-test-support"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer-local",
+ "bytes",
+ "kardamom-types",
 ]
 
 [[package]]
