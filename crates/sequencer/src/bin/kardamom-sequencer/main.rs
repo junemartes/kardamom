@@ -107,7 +107,7 @@ struct Args {
     /// This node's cluster-egress endpoint `ip:port` (cluster mode). Sets
     /// or overrides the `[cluster] egress_channel` as
     /// `aeron:udp?endpoint=<ip:port>`. The Nomad job injects this per node
-    /// as `${meta.node_ip}:<cluster_egress_port>`.
+    /// as `${meta.node_ip}:${NOMAD_HOST_PORT_egress}`.
     #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
     cluster_egress_endpoint: Option<String>,
     /// Address for the Prometheus /metrics HTTP listener.

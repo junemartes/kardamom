@@ -188,7 +188,10 @@ impl LocalStack {
             .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK))
     }
 
-    pub(super) fn dump_tails(&self) {
+    /// Print the last lines of every process log of the stack: the
+    /// ingress, the executor, the validator, the da-watcher, the
+    /// sequencers, the sealer members and the media driver.
+    pub fn dump_tails(&self) {
         eprintln!("=== stack log tails ({}) ===", self.root.path().display());
         let procs: Vec<&super::proc::Proc> = std::iter::once(&self.ingress.proc)
             .chain(std::iter::once(&self.executor.proc))

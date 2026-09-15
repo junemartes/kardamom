@@ -44,7 +44,7 @@ class ImageTest(unittest.TestCase):
                    KARDAMOM_IMAGE_TEST_DIR=str(self.root), KARDAMOM_IMAGE_TEST_FAIL=fail,
                    ANSIBLE_NOCOLOR='1', ANSIBLE_STDOUT_CALLBACK='default',
                    OBJC_DISABLE_INITIALIZE_FORK_SAFETY='YES')
-        settings = {'images_mode': 'prebuilt', 'images_manifest': str(self.manifest),
+        settings = {'images_manifest': str(self.manifest),
                     'images_cluster_jar': str(self.jar), 'images_release_dir': str(self.release),
                     'images_registry': 'registry.example:5000', 'images_tag': 'test',
                     'images_push_node': '', 'images_sign': False,
@@ -73,8 +73,8 @@ class ImageTest(unittest.TestCase):
         pushes = [args[-1] for tool, args in self.calls() if args[0] == 'push']
         self.assertEqual(pushes, [r.split()[1].split('@')[0] for r in records])
 
-    def test_source_builds_and_node_push_with_signing(self):
-        self.run_images({'images_mode': 'source', 'images_push_node': 'control-0', 'images_sign': True})
+    def test_node_push_with_signing(self):
+        self.run_images({'images_push_node': 'control-0', 'images_sign': True})
         calls = self.calls()
         self.assertEqual(self.bundle.read_text(), self.manifest.read_text())
         signatures = [args for tool, args in calls if tool == 'cosign']

@@ -56,3 +56,18 @@ variable "address_offset" {
     error_message = "address_offset must leave the gateway (host 1) free."
   }
 }
+
+# A replaced node is a new machine: it comes back on another address with
+# empty disks, the way a cloud provider replaces a server. The chaos
+# suite's node-replace case raises a node's generation and applies with
+# -replace on its container.
+variable "node_generation" {
+  type        = map(number)
+  description = "The replacement generation of a node by name (default 0). A higher generation moves the node's address and renames its volumes, so it starts empty."
+  default     = {}
+
+  validation {
+    condition     = alltrue([for g in values(var.node_generation) : g >= 0 && floor(g) == g])
+    error_message = "node_generation values must be whole numbers of 0 or more."
+  }
+}

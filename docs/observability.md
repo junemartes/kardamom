@@ -2,7 +2,8 @@
 
 Kardamom's cluster services each export Prometheus metrics, and the
 `kardamom-bench` load generator drives traffic so the dashboard panels move.
-The local stack — Prometheus + Grafana — is wired up with `docker compose`.
+Prometheus and Grafana run as the `monitoring` Nomad job of the cluster
+(`deploy/cluster/nomad/monitoring.nomad.hcl`), on the aux node.
 
 ## Metrics
 
@@ -33,7 +34,7 @@ so per-shard totals keep their pre-replication meaning.
 The sealer no longer appears here: canonical ordering runs as a Java
 clustered service inside an Aeron Cluster (`cluster/sealer-service/`), which
 has no Prometheus endpoint of its own — there is no `kardamom-sealer` binary,
-no `:9003` listener, and no sealer scrape job in `deploy/prometheus.yml`.
+no `:9003` listener, and no sealer scrape job in the monitoring job.
 Instead, each **executor re-exports the sealer's output** as it decodes
 cluster egress: every boundary frame bumps
 `kardamom_sealer_boundaries_emitted_total` and sets
@@ -47,11 +48,9 @@ All binaries read the same `KARDAMOM_METRICS_ADDR` env var, so a value
 shared across colocated services makes them race for one socket — prefer the
 per-service `--metrics-addr` flag when overriding more than one service.
 
-The services bind loopback by default. The compose-managed Prometheus scrapes
-them through `host.docker.internal`, which works as-is on Docker Desktop
-(macOS/Windows); on Linux that name resolves to the bridge gateway, so each
-service must be started with `--metrics-addr 0.0.0.0:<port>` (or another
-non-loopback bind) to be reachable.
+The services bind loopback by default. The cluster jobs bind every exporter on
+the node (`0.0.0.0:<port>`), and the monitoring job's Prometheus scrapes each
+one by its Consul node name, `<class>-<i>.node.<datacenter>.consul:<port>`.
 
 In the **cluster deploy** the executor job binds `0.0.0.0:9004` deliberately:
 the chaos suite probes executors directly over the cluster bridge
@@ -86,10 +85,17 @@ observed from cluster egress (see above).
 
 ### Scaling to multiple hosts
 
-Each scrape job in `deploy/prometheus.yml` is a static-targets list. To add a
-second host running every service, append `host-2:<port>` to each of the
-target lists. Every metric is already labelled with `host_id`, so dashboards
-group by host without relabel rules.
+The monitoring job renders its scrape targets from the node-class counts
+(`executor_count`, `sequencer_count`, `ingress_count`), which the workloads
+role passes from `node_classes` in `group_vars/all.yml`. A larger class gets
+its targets on the next deploy. Every metric is already labelled with
+`host_id`, so dashboards group by host without relabel rules.
+
+### Alerts
+
+`deploy/alerts.yml` holds the Prometheus alert rules. The monitoring job loads
+them as `rule_files`; firing alerts show on Prometheus's `/alerts` page. Check
+the rules with `promtool check rules deploy/alerts.yml`.
 
 ### Rename map (historical — the metrics-namespace migration)
 
@@ -155,16 +161,22 @@ sustained growth means the cursor file is not being persisted).
 
 ## Quick start
 
-Bring up the observability stack:
+Bring up the cluster; its deploy includes the monitoring job (see
+`deploy/cluster/README.md`, "Monitoring"):
 
 ```sh
-cd deploy && docker compose up
+cd deploy/cluster && make container-up
 ```
 
-Start the cluster (see `deploy/cluster/` — canonical ordering lives in the
-Aeron Cluster sealer, which only runs there, so that is the full-pipeline
-path; individual Rust services can still be run locally against a native
-Aeron media driver — `just aeron-driver-up`).
+Prometheus answers on port 9090 and Grafana on port 3000 of the aux node.
+Read the aux node's address from the node contract:
+
+```sh
+python3 -c 'import json; print(json.load(open("deploy/cluster/terraform/containers/node-contract.json"))["nodes"]["aux-0"]["ip"])'
+```
+
+Grafana allows anonymous viewing; the admin login is `admin` with the
+`grafana_admin_password` job variable (`kardamom` on the local profile).
 Then drive load at the ingress JSON-RPC endpoint with the bench. `transfers` is
 the write-path workload (`eth_sendRawTransaction`); the chain it targets must
 already prefund the signer EOAs the workflow uses (see "Workflows + signer
