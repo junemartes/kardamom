@@ -47,9 +47,7 @@ jobs:
       # out to it to embed contract bytecode, and `-p e2e --tests` builds the
       # deployer. Pinned concrete version (stable/latest hit the GitHub
       # releases API and 403 under the runner's unauthenticated rate limit).
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.7.1
+      - uses: ./.github/actions/foundry
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
