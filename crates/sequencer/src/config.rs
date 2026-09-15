@@ -3,7 +3,7 @@
 use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
-use kardamom_cache::LiveAccountsConfig;
+use kardamom_cache::{CacheConfig, LiveAccountsConfig};
 use kardamom_types::shard_map::{LANE_COUNT, VslotSet};
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +79,11 @@ pub struct SequencerConfig {
     /// a resident sender is answered from it, with no executor query.
     #[serde(default)]
     pub live_accounts: LiveAccountsConfig,
+    /// The Redis layer, between the local layer and the executor query
+    /// of the nonce lookup. Off when no address is configured: no Redis
+    /// call exists on any path.
+    #[serde(default)]
+    pub cache: CacheConfig,
     /// The own `tx_data` lane. `None` means `sequencer_id`. A ref for an
     /// envelope on this lane carries this lane. See
     /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.2.
@@ -136,6 +141,7 @@ impl Default for SequencerConfig {
             resync: crate::resync::ResyncConfig::default(),
             lookup: crate::lookup::LookupConfig::default(),
             live_accounts: LiveAccountsConfig::default(),
+            cache: CacheConfig::default(),
             lane: None,
             vslots: None,
             extra_lanes: Vec::new(),

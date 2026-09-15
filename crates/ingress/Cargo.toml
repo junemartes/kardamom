@@ -11,7 +11,7 @@ binary-protocol = []
 # Gates a Docker-backed e2e test (real Aeron via kardamom-log testcontainers
 # harness). Off by default so `cargo test` works without Docker. Implies
 # `kardamom-log/docker-e2e` for the AeronTestCluster harness.
-docker-e2e = ["kardamom-log/docker-e2e"]
+docker-e2e = ["kardamom-log/docker-e2e", "kardamom-cache/docker-e2e"]
 # Exposes `test_support`: signing, receipt-building, and in-process-server
 # helpers shared by this crate's own tests, its `tests/`, and crates/bench.
 # No new dependency crate: `alloy-signer-local` and `k256` move here from

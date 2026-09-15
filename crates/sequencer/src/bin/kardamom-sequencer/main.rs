@@ -381,13 +381,23 @@ impl ResyncWiring {
         // The local account layer: the receipts feed writes the rows of
         // this replica's vslots, the lookup task reads them.
         let (live, live_writer) = kardamom_cache::LiveAccounts::new(&cfg.live_accounts);
+        // The Redis layer, when `[cache]` names an address. The mirror ids
+        // are the executor indexes; one when no count is known.
+        let redis = cfg.cache.enabled().then(|| {
+            let mirrors = executor_count.unwrap_or(NonZeroU32::MIN);
+            std::sync::Arc::new(kardamom_cache::CacheReader::spawn(
+                &cfg.cache,
+                mirrors,
+                live.clone(),
+            ))
+        });
         let receipts_task = feeds::ReceiptFloorFeed::new(vslots, floor_tx.clone(), live_writer)
             .spawn(receipts_sub, shutdown.clone());
 
         // The nonce lookup task. It shares the floor channel with the
         // receipts feed: an executor's committed nonce is floor evidence
         // of the same kind as a receipt.
-        let (lookup, lookup_task) = Self::spawn_lookup(cfg, floor_tx, shutdown, live)?;
+        let (lookup, lookup_task) = Self::spawn_lookup(cfg, floor_tx, shutdown, live, redis);
 
         Ok(Self {
             controller,
@@ -413,22 +423,21 @@ impl ResyncWiring {
         floor_tx: crossbeam_channel::Sender<kardamom_sequencer::resync::FloorUpdate>,
         shutdown: &Shutdown,
         live: std::sync::Arc<kardamom_cache::LiveAccounts>,
-    ) -> Result<(Option<LookupRequester>, Option<tokio::task::JoinHandle<()>>)> {
-        if !cfg.lookup.enabled() {
-            return Ok((None, None));
-        }
+        redis: Option<std::sync::Arc<kardamom_cache::CacheReader>>,
+    ) -> (Option<LookupRequester>, Option<tokio::task::JoinHandle<()>>) {
         let (requester, rx) = LookupRequester::channel();
-        let task = feeds::NonceLookupFeed::new(
+        let Some(feed) = feeds::NonceLookupFeed::new(
             cfg.lookup.clone(),
             cfg.partition_index,
             rx,
             shutdown.clone(),
             floor_tx,
             live,
-        )
-        .context("nonce lookup: http client build failed")?
-        .spawn();
-        Ok((Some(requester), Some(task)))
+            redis,
+        ) else {
+            return (None, None);
+        };
+        (Some(requester), Some(feed.spawn()))
     }
 }
 

@@ -517,6 +517,25 @@ Deviations from the design above, recorded as they land.
   outcome="miss"}`, not a degraded read: Redis is not involved. The chain-semantics
   scenarios of 9.2 ship with PR 5. The ingress query client lives in
   `kardamom_cache::query`; the sequencer keeps its own until PR 4b.
+- **PR 4b (Redis readers behind `[cache]`).** The reader never stalls on Redis:
+  `CacheReader::spawn` returns at once, a background task connects with a backoff and polls
+  the mirror heads every 100 ms, and every read before the first connection, during a
+  reconnect, past the timeout, or on an error answers "unknown" and counts a degraded read.
+  A read during a reconnect is skipped rather than paid, so an outage does not cost every
+  cold submit the full timeout. Only the balance check is gated on freshness: a committed
+  nonce from any layer is a lower bound on the truth, and a past nonce rejects only on a
+  receipt with another hash, so a stale-low balance is the only false reject. The Redis
+  receipt index can lag the local layer, so a past nonce with no receipt in Redis publishes
+  too; the local receipt cache is read again first, for a receipt that arrived after the
+  submit's first read. This deviates from 5.4, which skipped both checks. The staleness unit is canonical records
+  (`BPosition::as_index`, the sealer's republished record count), not bytes. The mirror
+  count the reader polls is the executor count, passed by the binary, not a config knob.
+  The sequencer's nonce lookup reads Redis inside the query task, then the executors; it
+  now uses `kardamom_cache::ExecutorQuery`, and its Redis nonce needs no freshness gate.
+  There is no write-back of an executor answer into the layers: a query answers one field,
+  a row needs both, and the RPC is rate limited. `[cache]` lives in the TOML files
+  (`config/ingress.toml`, `config/sequencer.toml.tpl`, both static `file()` templates), so
+  the flag day edits those, not `render-sequencer-job.py`. `pending:<addr>` stays open.
 
 ## 12. Open questions
 

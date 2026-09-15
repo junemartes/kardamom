@@ -276,11 +276,23 @@ impl IngressService {
                 endpoints: args.executor_query_endpoints.clone(),
                 ..ExecutorQueryConfig::default()
             },
+            cache: self.file_cfg.cache.clone(),
+            // The mirror ids are the executor indexes. One when no count
+            // is known: the Redis reader then polls `head:0` only.
+            mirror_count: self.executor_count().unwrap_or(NonZeroU32::MIN),
             ..IngressConfig::default()
         };
         cfg.binary_tcp_bind = None;
         cfg.binary_uds_path = None;
         Ok(cfg)
+    }
+
+    /// The executor count: the CLI or env `--executor-count`, else the
+    /// log config's `tx_receipts_executor_count`, else unknown.
+    fn executor_count(&self) -> Option<NonZeroU32> {
+        self.args
+            .executor_count
+            .or(self.log_cfg.channels.tx_receipts_executor_count)
     }
 
     /// The local layer config: the defaults, with the two CLI overrides.
@@ -355,7 +367,6 @@ impl IngressService {
     /// would be a silent lie.
     async fn open_aeron_side(&self, live_cfg: &LiveAccountsConfig) -> Result<OpenedAeron> {
         let args = &self.args;
-        let channels = &self.log_cfg.channels;
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
         let mut plane =
             StreamPlane::from_config(&self.log_cfg, &format!("ingress-{}", args.ingress_id))
@@ -363,11 +374,10 @@ impl IngressService {
 
         let (recorders, recorder_ready, discovered_ready) = self.spawn_recorders(&mut plane)?;
 
-        // tx_receipts MDS membership: prefer the CLI or env
-        // `--executor-count`, and fall back to the log-config field, or
-        // `None` (no known executor count) when neither is set. The
-        // proxy reads this only when MDS is enabled.
-        let executor_count = args.executor_count.or(channels.tx_receipts_executor_count);
+        // tx_receipts MDS membership: the CLI or env `--executor-count`,
+        // else the log-config field, else `None` (no known executor
+        // count). The proxy reads this only when MDS is enabled.
+        let executor_count = self.executor_count();
 
         let publication = LiveIngressPublication::open(&rt, &mut plane, LANE_PLANE)
             .await

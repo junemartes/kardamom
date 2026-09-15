@@ -24,6 +24,26 @@ use crate::config::CacheConfig;
 use crate::error::CacheError;
 use crate::{keys, metrics, script};
 
+/// The bound of one connection attempt is this many command timeouts.
+/// A frozen primary accepts the TCP connection and never answers the
+/// handshake; without a bound the reconnect would wait for the thaw, and
+/// the reader would never follow a sentinel failover.
+const CONNECT_TIMEOUTS: u32 = 10;
+
+fn connect_timeout(cfg: &CacheConfig) -> Duration {
+    cfg.timeout().saturating_mul(CONNECT_TIMEOUTS)
+}
+
+/// One connection attempt within `bound`.
+async fn connect_within(
+    source: &Source,
+    bound: Duration,
+) -> Result<MultiplexedConnection, CacheError> {
+    tokio::time::timeout(bound, source.connect())
+        .await
+        .map_err(|_| CacheError::Timeout)?
+}
+
 /// One account as the cache holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountView {
@@ -93,6 +113,8 @@ pub struct AccountCache {
     source: Arc<Source>,
     reconnecting: Arc<AtomicBool>,
     timeout: Duration,
+    /// The bound of one connection attempt, sentinel lookup included.
+    connect_timeout: Duration,
     receipt_ttl: Duration,
     head_ttl: Duration,
     apply_row: Arc<Script>,
@@ -109,13 +131,14 @@ impl AccountCache {
     /// fails.
     pub async fn connect(cfg: &CacheConfig) -> Result<Self, CacheError> {
         let source = Self::source(cfg)?;
-        let conn = source.connect().await?;
+        let conn = connect_within(&source, connect_timeout(cfg)).await?;
         info!(sentinel = !cfg.sentinels.is_empty(), "cache connected");
         Ok(Self {
             conn: Arc::new(ArcSwap::from_pointee(conn)),
             source: Arc::new(source),
             reconnecting: Arc::new(AtomicBool::new(false)),
             timeout: cfg.timeout(),
+            connect_timeout: connect_timeout(cfg),
             receipt_ttl: Duration::from_secs(cfg.receipt_ttl_secs.get()),
             head_ttl: Duration::from_secs(cfg.head_ttl_secs.get()),
             apply_row: Arc::new(Script::new(script::APPLY_ROW)),
@@ -192,6 +215,13 @@ impl AccountCache {
         }
     }
 
+    /// Whether a reconnect is in flight. A reader skips its reads
+    /// meanwhile: each would pay the full timeout for nothing.
+    #[must_use]
+    pub fn reconnecting(&self) -> bool {
+        self.reconnecting.load(Ordering::Acquire)
+    }
+
     /// Replace the connection in the background, once per failure burst.
     fn reconnect_later(&self) {
         let claimed = self
@@ -203,7 +233,7 @@ impl AccountCache {
         }
         let this = self.clone();
         tokio::spawn(async move {
-            match this.source.connect().await {
+            match connect_within(&this.source, this.connect_timeout).await {
                 Ok(conn) => {
                     this.conn.store(Arc::new(conn));
                     info!("cache reconnected");

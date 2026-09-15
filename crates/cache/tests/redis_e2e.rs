@@ -5,29 +5,17 @@
 
 #![cfg(feature = "docker-e2e")]
 
-use std::num::NonZeroU64;
+use std::num::NonZeroU32;
+use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
-use kardamom_cache::{AccountCache, CacheConfig, RowsWritten};
+use kardamom_cache::{AccountCache, CacheReader, LiveAccounts, LiveAccountsConfig, RowsWritten};
 use kardamom_types::{AccountRow, BPosition, Receipt};
-use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage};
 
 /// A Redis container and a client on it.
 async fn redis() -> (ContainerAsync<GenericImage>, AccountCache) {
-    let container = GenericImage::new("redis", "7-alpine")
-        .with_exposed_port(6379_u16.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-        .start()
-        .await
-        .expect("redis container");
-    let port = container.get_host_port_ipv4(6379).await.expect("port");
-    let cfg = CacheConfig {
-        url: Some(format!("redis://127.0.0.1:{port}")),
-        receipt_ttl_secs: NonZeroU64::new(2).unwrap(),
-        ..CacheConfig::default()
-    };
+    let (container, cfg) = kardamom_cache::testing::redis().await;
     let cache = AccountCache::connect(&cfg).await.expect("connect");
     (container, cache)
 }
@@ -164,4 +152,53 @@ async fn heads_and_pending_round_trip() {
     assert_eq!(cache.pending(a).await.unwrap(), Some(8));
     // No replica is attached: WAIT reports zero without an error.
     assert_eq!(cache.wait_replica().await.unwrap(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker; run with `cargo test --features docker-e2e -- --ignored`"]
+async fn reader_connects_lazily_and_gates_freshness_on_the_head() {
+    let (_c, cfg) = kardamom_cache::testing::redis().await;
+    let cache = AccountCache::connect(&cfg).await.unwrap();
+    let (live, mut writer) = LiveAccounts::new(&LiveAccountsConfig::default());
+    let reader = CacheReader::spawn(&cfg, NonZeroU32::new(3).unwrap(), live.clone());
+    // The reader is usable at once and answers nothing until connected.
+    let a = Address::repeat_byte(0xaa);
+    let mut waited = 0;
+    while !reader.connected() && waited < 50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waited += 1;
+    }
+    assert!(reader.connected(), "the reader connects in the background");
+
+    cache
+        .write_rows(BPosition::from_index(10), &[row(0xaa, 4, 9)])
+        .await
+        .unwrap();
+    let view = reader.account(a).await.expect("hit");
+    assert_eq!((view.nonce, view.tx_idx), (4, 10));
+    assert!(reader.account(Address::repeat_byte(0xbb)).await.is_none());
+
+    // No live head: not fresh. A head within the bound: fresh. The local
+    // layer far beyond the head: stale.
+    assert!(!reader.fresh());
+    cache.set_head(1, BPosition::from_index(10)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(reader.head(), Some(10));
+    assert!(reader.fresh());
+    writer.apply(BPosition::from_index(10 + 20_000), &[]);
+    assert!(!reader.fresh(), "the local head is beyond max_stale_txs");
+
+    let receipt = Receipt {
+        tx_idx: BPosition::from_index(10),
+        tx_hash: B256::repeat_byte(0x11),
+        from: a,
+        nonce: 4,
+        ..Receipt::default()
+    };
+    cache
+        .write_receipts(std::slice::from_ref(&receipt))
+        .await
+        .unwrap();
+    assert_eq!(reader.receipt(a, 4).await, Some(receipt));
+    assert!(reader.receipt(a, 5).await.is_none());
 }

@@ -1,5 +1,6 @@
 //! The account reads behind `eth_getTransactionCount` and
-//! `eth_getBalance`: the local layer first, then the executor query.
+//! `eth_getBalance`: the local layer, then Redis when `[cache]` is on,
+//! then the executor query.
 //!
 //! The ingress holds no history, so a block tag other than the head is
 //! an invalid parameter. The reads take the per-IP rate limit like a
@@ -10,7 +11,7 @@ use std::net::IpAddr;
 
 use alloy_primitives::{Address, U256};
 use alloy_rpc_types_eth::BlockNumberOrTag;
-use kardamom_cache::{QueryAnswer, metrics as cache_metrics};
+use kardamom_cache::{AccountView, QueryAnswer, metrics as cache_metrics};
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::error::IngressError;
@@ -24,13 +25,22 @@ pub enum AccountField {
     Balance,
 }
 
+impl AccountField {
+    fn of(self, view: &AccountView) -> U256 {
+        match self {
+            Self::Nonce => U256::from(view.nonce),
+            Self::Balance => view.balance,
+        }
+    }
+}
+
 impl<P, S> IngressProxy<P, S>
 where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
 {
     /// The value of `field` for `address` at `block`: the local layer,
-    /// then one executor query on a miss.
+    /// then Redis, then one executor query on a miss.
     ///
     /// # Errors
     ///
@@ -48,14 +58,9 @@ where
             return Err(IngressError::RateLimited(client_ip.to_string()));
         }
         self.check_block_tag(block)?;
-        if let Some(view) = self.live.get(address) {
-            cache_metrics::record_lookup("live", "hit");
-            return Ok(match field {
-                AccountField::Nonce => U256::from(view.nonce),
-                AccountField::Balance => view.balance,
-            });
+        if let Some(view) = self.cached_view(address).await {
+            return Ok(field.of(&view));
         }
-        cache_metrics::record_lookup("live", "miss");
         let Some(query) = &self.query else {
             return Err(IngressError::StateUnavailable(
                 "no local entry and no executor query configured".into(),
@@ -68,6 +73,16 @@ where
         answer
             .map(|QueryAnswer { value, .. }| value)
             .map_err(|e| IngressError::StateUnavailable(e.to_string()))
+    }
+
+    /// The two cache layers, each counted: the local layer, then Redis.
+    async fn cached_view(&self, address: Address) -> Option<AccountView> {
+        if let Some(view) = self.live.get(address) {
+            cache_metrics::record_lookup("live", "hit");
+            return Some(view);
+        }
+        cache_metrics::record_lookup("live", "miss");
+        self.redis.as_ref()?.account(address).await
     }
 
     /// The ingress serves only the head. `latest`, `pending`, `safe`,
