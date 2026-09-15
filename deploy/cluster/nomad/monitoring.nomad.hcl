@@ -57,8 +57,10 @@ locals {
   ])
   executor_targets = [for i in range(var.executor_count) : "executor-${i}.node.${local.dc}.consul:9004"]
   ingress_targets  = [for i in range(var.ingress_count) : "ingress-${i}.node.${local.dc}.consul:9006"]
-  aux              = "aux-0.node.${local.dc}.consul"
-  targets_yaml = <<-EOT
+  # One state mirror per executor node (nomad/state-mirror.nomad.hcl).
+  state_mirror_targets = [for i in range(var.executor_count) : "executor-${i}.node.${local.dc}.consul:9007"]
+  aux                  = "aux-0.node.${local.dc}.consul"
+  targets_yaml         = <<-EOT
     scrape_configs:
       - job_name: kardamom-sequencer
         static_configs:
@@ -69,6 +71,9 @@ locals {
       - job_name: kardamom-ingress
         static_configs:
           - targets: ${jsonencode(local.ingress_targets)}
+      - job_name: kardamom-state-mirror
+        static_configs:
+          - targets: ${jsonencode(local.state_mirror_targets)}
       - job_name: kardamom-validator
         static_configs:
           - targets: ["${local.aux}:9006"]
@@ -82,7 +87,7 @@ locals {
   dashboards = [
     "kardamom-overview", "kardamom-ingress", "kardamom-sequencer",
     "kardamom-executor", "kardamom-sealer", "kardamom-batcher", "kardamom-da-watcher",
-    "kardamom-validator",
+    "kardamom-validator", "kardamom-state-mirror",
   ]
 }
 
@@ -208,12 +213,12 @@ job "monitoring" {
       }
 
       env {
-        GF_SECURITY_ADMIN_USER       = "admin"
-        GF_SECURITY_ADMIN_PASSWORD   = var.grafana_admin_password
-        GF_AUTH_ANONYMOUS_ENABLED    = "true"
-        GF_AUTH_ANONYMOUS_ORG_ROLE   = "Viewer"
-        GF_USERS_DEFAULT_THEME       = "dark"
-        GF_PATHS_DATA                = "/alloc/data/grafana"
+        GF_SECURITY_ADMIN_USER     = "admin"
+        GF_SECURITY_ADMIN_PASSWORD = var.grafana_admin_password
+        GF_AUTH_ANONYMOUS_ENABLED  = "true"
+        GF_AUTH_ANONYMOUS_ORG_ROLE = "Viewer"
+        GF_USERS_DEFAULT_THEME     = "dark"
+        GF_PATHS_DATA              = "/alloc/data/grafana"
       }
 
       template {

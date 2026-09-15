@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use alloy_primitives::B256;
-use kardamom_types::{BlockBoundary, Receipt};
+use kardamom_types::{BlockBoundary, Receipt, ReceiptRows};
 
 use crate::error::ExecutorError;
 use crate::exec_types::CMessage;
@@ -20,8 +20,8 @@ impl TxReceiptsPublication for RecordPub {
     }
 }
 
-fn receipt(tag: u8, offset: i32) -> Receipt {
-    Receipt {
+fn receipt(tag: u8, offset: i32) -> Box<ReceiptRows> {
+    Box::new(ReceiptRows::bare(Receipt {
         tx_idx: pos(offset),
         tx_hash: B256::repeat_byte(tag),
         status: true,
@@ -29,7 +29,7 @@ fn receipt(tag: u8, offset: i32) -> Receipt {
         logs: Vec::new(),
         write_set_hash: B256::ZERO,
         ..Default::default()
-    }
+    }))
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn commit_thread_preserves_order() {
     let pos0 = pos(0);
 
     let rx = feed_commits(vec![
-        ExecToCommit::Receipt(Receipt {
+        ExecToCommit::Receipt(Box::new(ReceiptRows::bare(Receipt {
             tx_idx: pos0,
             tx_hash: B256::repeat_byte(0xAA),
             status: true,
@@ -46,7 +46,7 @@ fn commit_thread_preserves_order() {
             logs: Vec::new(),
             write_set_hash: B256::ZERO,
             ..Default::default()
-        }),
+        }))),
         ExecToCommit::Boundary(BlockBoundary {
             block_number: 1,
             end_tx_idx: pos0,
@@ -90,15 +90,17 @@ impl TxReceiptsPublication for FlakyPub {
 fn commit_thread_retries_until_delivered() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let pos0 = pos(0);
-    let rx = feed_commits(vec![ExecToCommit::Receipt(Receipt {
-        tx_idx: pos0,
-        tx_hash: B256::repeat_byte(0xAB),
-        status: true,
-        gas_used: 21_000,
-        logs: Vec::new(),
-        write_set_hash: B256::ZERO,
-        ..Default::default()
-    })]);
+    let rx = feed_commits(vec![ExecToCommit::Receipt(Box::new(ReceiptRows::bare(
+        Receipt {
+            tx_idx: pos0,
+            tx_hash: B256::repeat_byte(0xAB),
+            status: true,
+            gas_used: 21_000,
+            logs: Vec::new(),
+            write_set_hash: B256::ZERO,
+            ..Default::default()
+        },
+    )))]);
 
     // The publisher rejects the first 3 attempts, then accepts.
     let h = CommitLoop::new(
@@ -134,9 +136,10 @@ impl TxReceiptsPublication for BatchRecordPub {
         }
         Ok(())
     }
-    fn publish_receipts(&mut self, receipts: &[Receipt]) -> (usize, Option<ExecutorError>) {
-        self.batches.lock().unwrap().push(receipts.to_vec());
-        (receipts.len(), None)
+    fn publish_receipts(&mut self, items: &[ReceiptRows]) -> (usize, Option<ExecutorError>) {
+        let receipts = items.iter().map(|i| i.receipt.clone()).collect();
+        self.batches.lock().unwrap().push(receipts);
+        (items.len(), None)
     }
 }
 
@@ -191,7 +194,8 @@ impl TxReceiptsPublication for PartialPub {
     fn publish(&mut self, _msg: CMessage) -> Result<(), ExecutorError> {
         Ok(())
     }
-    fn publish_receipts(&mut self, receipts: &[Receipt]) -> (usize, Option<ExecutorError>) {
+    fn publish_receipts(&mut self, items: &[ReceiptRows]) -> (usize, Option<ExecutorError>) {
+        let receipts: Vec<Receipt> = items.iter().map(|i| i.receipt.clone()).collect();
         if self.fail_once {
             self.fail_once = false;
             let n = self.accept.min(receipts.len());
@@ -201,7 +205,7 @@ impl TxReceiptsPublication for PartialPub {
                 .extend_from_slice(&receipts[..n]);
             return (n, Some(ExecutorError::TxReceiptsClosed));
         }
-        self.delivered.lock().unwrap().extend_from_slice(receipts);
+        self.delivered.lock().unwrap().extend_from_slice(&receipts);
         (receipts.len(), None)
     }
 }
@@ -253,10 +257,12 @@ impl TxReceiptsPublication for DivergingPub {
 // immediately.
 #[test]
 fn commit_thread_fail_stops_on_divergence() {
-    let rx = feed_commits(vec![ExecToCommit::Receipt(Receipt {
-        tx_idx: pos(0),
-        ..Default::default()
-    })]);
+    let rx = feed_commits(vec![ExecToCommit::Receipt(Box::new(ReceiptRows::bare(
+        Receipt {
+            tx_idx: pos(0),
+            ..Default::default()
+        },
+    )))]);
 
     let h = CommitLoop::new(DivergingPub, rx).spawn();
     let res = h.join().expect("no panic");

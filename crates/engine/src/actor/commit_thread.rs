@@ -9,7 +9,7 @@ use std::time::Duration;
 use crossbeam_channel::Receiver;
 use tracing::warn;
 
-use kardamom_types::{BlockBoundary, Receipt};
+use kardamom_types::{BlockBoundary, ReceiptRows};
 
 use crate::error::ExecutorError;
 use crate::exec_types::CMessage;
@@ -65,10 +65,10 @@ impl MustDeliver {
     }
 }
 
-/// One drained batch: the receipts, an optional closing boundary, and
-/// whether the channel closed while draining.
+/// One drained batch: the receipts with their account rows, an optional
+/// closing boundary, and whether the channel closed while draining.
 struct Batch {
-    receipts: Vec<Receipt>,
+    receipts: Vec<ReceiptRows>,
     boundary: Option<BlockBoundary>,
     closed: bool,
 }
@@ -88,7 +88,7 @@ impl Batch {
     fn absorb(&mut self, drained: Drained) -> ControlFlow<()> {
         match drained {
             Drained::Receipt(r) => {
-                self.receipts.push(r);
+                self.receipts.push(*r);
                 ControlFlow::Continue(())
             }
             Drained::Boundary(b) => {
@@ -106,7 +106,7 @@ impl Batch {
 
 /// One non-blocking receive result from the exec-to-commit channel.
 enum Drained {
-    Receipt(Receipt),
+    Receipt(Box<ReceiptRows>),
     Boundary(BlockBoundary),
     Empty,
     Closed,
@@ -148,7 +148,7 @@ impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
     fn collect_batch(&self) -> Option<Batch> {
         let mut batch = Batch::new();
         match self.rx.recv() {
-            Ok(ExecToCommit::Receipt(r)) => batch.receipts.push(r),
+            Ok(ExecToCommit::Receipt(r)) => batch.receipts.push(*r),
             Ok(ExecToCommit::Boundary(b)) => batch.boundary = Some(b),
             Err(_) => return None,
         }
@@ -189,7 +189,7 @@ impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
     ///
     /// Deploy order brings the ingress up first, so this usually succeeds
     /// on the first attempt.
-    fn publish_batch(&mut self, receipts: &[Receipt]) -> Result<(), ExecutorError> {
+    fn publish_batch(&mut self, receipts: &[ReceiptRows]) -> Result<(), ExecutorError> {
         let mut retry = MustDeliver::new();
         // `from` carries the must-deliver resume point across retries: each
         // retry starts at the first unpublished receipt. A slice iterator
@@ -207,7 +207,7 @@ impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
     /// loop in [`Self::publish_batch`] stays free of a branch.
     fn publish_batch_step(
         &mut self,
-        receipts: &[Receipt],
+        receipts: &[ReceiptRows],
         from: usize,
         retry: &mut MustDeliver,
     ) -> Result<usize, ExecutorError> {

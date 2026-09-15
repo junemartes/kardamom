@@ -8,7 +8,7 @@
 //! optional layers compose as `Either<Outer<Either<Inner<P>, P>>,
 //! Either<Inner<P>, P>>`; nesting further composes the same way.
 
-use kardamom_types::{BlockBoundary, BlockDelta, Receipt};
+use kardamom_types::{BlockBoundary, BlockDelta, ReceiptRows};
 
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
@@ -28,28 +28,41 @@ pub trait TxReceiptsPublication: Send {
     /// verifying sink, when the message diverges from the expected value.
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError>;
 
-    /// Publish a batch of receipts. Where the transport supports it, this
-    /// cuts the per-publish overhead.
+    /// Publish a batch of receipts, each with the account rows its
+    /// transaction wrote. Where the transport supports it, this cuts the
+    /// per-publish overhead.
     ///
-    /// Returns `(published, error)`. The first `published` receipts are
+    /// Returns `(published, error)`. The first `published` items are
     /// handed off. An error applies to the rest, so the caller's
     /// must-deliver retry resumes at the failed suffix.
     ///
-    /// The default implementation publishes one receipt at a time. The
-    /// validator's verifying sink relies on this to keep its exact
-    /// per-receipt divergence behavior. The live transport instead packs
-    /// the whole slice into one `Vec<Receipt>` wire frame, so a batch pays
-    /// one encode and one blocking ack instead of one ack per receipt.
-    fn publish_receipts(&mut self, receipts: &[Receipt]) -> (usize, Option<ExecutorError>) {
-        let failed_at = receipts.iter().enumerate().find_map(|(i, r)| {
-            self.publish(CMessage::Receipt(r.clone()))
-                .err()
-                .map(|e| (i, e))
-        });
-        match failed_at {
-            Some((i, e)) => (i, Some(e)),
-            None => (receipts.len(), None),
-        }
+    /// The default implementation publishes one receipt at a time through
+    /// [`publish`](Self::publish) and drops the rows. The live transport
+    /// instead merges the whole slice into one `ReceiptBatch` wire frame,
+    /// so a batch pays one encode and one blocking ack instead of one ack
+    /// per receipt. The validator's verifying sink overrides this to check
+    /// the rows.
+    fn publish_receipts(&mut self, items: &[ReceiptRows]) -> (usize, Option<ExecutorError>) {
+        publish_each(items, |item| {
+            self.publish(CMessage::Receipt(item.receipt.clone()))
+        })
+    }
+}
+
+/// Run `publish_one` over `items` in order and stop at the first error.
+/// Returns the `(published, error)` pair the must-deliver retry expects:
+/// the count before the failure, and the failure itself.
+pub fn publish_each(
+    items: &[ReceiptRows],
+    mut publish_one: impl FnMut(&ReceiptRows) -> Result<(), ExecutorError>,
+) -> (usize, Option<ExecutorError>) {
+    let failed_at = items
+        .iter()
+        .enumerate()
+        .find_map(|(i, item)| publish_one(item).err().map(|e| (i, e)));
+    match failed_at {
+        Some((i, e)) => (i, Some(e)),
+        None => (items.len(), None),
     }
 }
 
@@ -107,10 +120,10 @@ impl<A: TxReceiptsPublication, B: TxReceiptsPublication> TxReceiptsPublication f
         }
     }
 
-    fn publish_receipts(&mut self, receipts: &[Receipt]) -> (usize, Option<ExecutorError>) {
+    fn publish_receipts(&mut self, items: &[ReceiptRows]) -> (usize, Option<ExecutorError>) {
         match self {
-            Self::Left(a) => a.publish_receipts(receipts),
-            Self::Right(b) => b.publish_receipts(receipts),
+            Self::Left(a) => a.publish_receipts(items),
+            Self::Right(b) => b.publish_receipts(items),
         }
     }
 }

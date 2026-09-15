@@ -14,6 +14,8 @@ pub const EXECUTOR_BLOCK_METRIC: &str = "kardamom_executor_block_number";
 pub const SEALER_BOUNDARIES_METRIC: &str = "kardamom_sealer_boundaries_emitted_total";
 pub const INGRESS_RECEIVED_METRIC: &str = "kardamom_ingress_tx_received_total";
 pub const EXECUTOR_PORT: u16 = 9004;
+/// The state mirror's exporter, on every executor node.
+pub const MIRROR_PORT: u16 = 9007;
 /// The ingress and the validator share this port on different nodes.
 pub const INGRESS_PORT: u16 = 9006;
 pub const VALIDATOR_PORT: u16 = 9006;
@@ -102,6 +104,24 @@ impl Probes {
     pub fn executor_target(&self, i: usize) -> Target {
         let e = &self.executors[i];
         Target::bridged(e.ip, &e.container, EXECUTOR_PORT)
+    }
+
+    /// The state mirror target on executor node `i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is not an executor index of this cluster.
+    #[must_use]
+    pub fn mirror_target(&self, i: usize) -> Target {
+        let e = &self.executors[i];
+        Target::bridged(e.ip, &e.container, MIRROR_PORT)
+    }
+
+    /// The first-sample value of `metric` on the mirror of executor
+    /// node `i`. `None` when the exporter does not answer.
+    pub async fn mirror_metric(&self, i: usize, metric: &str) -> Option<i64> {
+        let body = self.scrape.fetch(&self.mirror_target(i)).await?;
+        metrics::first(&body, metric)
     }
 
     /// The validator's loopback target.

@@ -106,6 +106,24 @@ impl NodeContract {
             .ok_or_else(|| anyhow::anyhow!("node contract has no control-plane node"))
     }
 
+    /// The node a service address names: its cluster IP, its bare name,
+    /// or a Consul node record such as `aux-0.node.dc1.consul`, whose
+    /// first label is the bare name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no node matches.
+    pub fn node_at(&self, address: &str) -> anyhow::Result<&Node> {
+        if let Ok(ip) = address.parse::<Ipv4Addr>() {
+            return self
+                .nodes
+                .values()
+                .find(|n| n.ip == ip)
+                .ok_or_else(|| anyhow::anyhow!("node contract has no node at {ip}"));
+        }
+        self.node(address.split('.').next().unwrap_or(address))
+    }
+
     /// The Nomad HTTP address on the control node, as the Docker host
     /// reaches it.
     ///
@@ -156,6 +174,19 @@ mod tests {
             "192.168.56.12"
         );
         assert!(contract.node("aux-0").is_err());
+    }
+
+    #[test]
+    fn finds_a_node_by_ip_name_or_node_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node-contract.json");
+        std::fs::write(&path, SAMPLE).unwrap();
+        let contract = NodeContract::load(&path).unwrap();
+        for address in ["192.168.56.12", "executor-1", "executor-1.node.dc1.consul"] {
+            assert_eq!(contract.node_at(address).unwrap().name, "executor-1");
+        }
+        assert!(contract.node_at("192.168.56.99").is_err());
+        assert!(contract.node_at("aux-0.node.dc1.consul").is_err());
     }
 
     #[test]

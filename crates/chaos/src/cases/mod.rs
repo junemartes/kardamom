@@ -9,6 +9,7 @@ use crate::harness::Harness;
 use crate::knobs::Knobs;
 
 pub(crate) mod archive;
+pub(crate) mod cache;
 pub(crate) mod cluster;
 pub(crate) mod component;
 pub(crate) mod resize;
@@ -46,9 +47,13 @@ pub enum Case {
     CpuSqueeze,
     ResizeScaleOutIn,
     LookupBlackout,
+    RedisPrimaryFreeze,
+    RedisPrimaryKill,
+    RedisPartitionIngress,
+    MirrorKillRebuild,
 }
 
-const ALL: [Case; 27] = [
+const ALL: [Case; 31] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -76,6 +81,10 @@ const ALL: [Case; 27] = [
     Case::CpuSqueeze,
     Case::ResizeScaleOutIn,
     Case::LookupBlackout,
+    Case::RedisPrimaryFreeze,
+    Case::RedisPrimaryKill,
+    Case::RedisPartitionIngress,
+    Case::MirrorKillRebuild,
 ];
 
 impl Case {
@@ -122,6 +131,10 @@ impl Case {
             Self::CpuSqueeze => "cpu-squeeze",
             Self::ResizeScaleOutIn => "resize-scale-out-in",
             Self::LookupBlackout => "lookup-blackout",
+            Self::RedisPrimaryFreeze => "redis-primary-freeze",
+            Self::RedisPrimaryKill => "redis-primary-kill",
+            Self::RedisPartitionIngress => "redis-partition-ingress",
+            Self::MirrorKillRebuild => "mirror-kill-rebuild",
         }
     }
 
@@ -153,6 +166,12 @@ impl Case {
             }
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
             Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_secs(300),
+            // The freeze, the election, and the recovery polls.
+            Self::RedisPrimaryFreeze | Self::RedisPrimaryKill | Self::RedisPartitionIngress => {
+                inject + k.restart_slo + Duration::from_secs(300)
+            }
+            // The mirrors restart, wait for a checkpoint, and rebuild.
+            Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_secs(600),
             Self::NodeReplaceExecutor => inject + k.reschedule_slo + Duration::from_secs(420),
             Self::NodeReplaceSealer => {
                 inject + k.reschedule_slo + k.rejoin_slo + Duration::from_secs(300)
@@ -214,6 +233,10 @@ impl Case {
             Self::CpuSqueeze => squeeze::cpu_squeeze(h).await,
             Self::ResizeScaleOutIn => resize::scale_out_in(h).await,
             Self::LookupBlackout => resize::lookup_blackout(h).await,
+            Self::RedisPrimaryFreeze => cache::redis_primary_freeze(h).await,
+            Self::RedisPrimaryKill => cache::redis_primary_kill(h).await,
+            Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,
+            Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
         }
     }
 }
@@ -230,6 +253,7 @@ mod tests {
             crate::Shard::Sequencer,
             crate::Shard::Cluster,
             crate::Shard::Retention,
+            crate::Shard::Cache,
         ] {
             shard
                 .cases()

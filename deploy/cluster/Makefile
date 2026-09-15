@@ -26,7 +26,7 @@ RUN_SHARDS := cargo test -p kardamom-chaos --release --features cluster-e2e --lo
 CLUSTER_BIN := cargo run --release -p kardamom-chaos --locked --bin kardamom-cluster --
 endif
 # The shard to run: load, semantics, chaos-executor, chaos-ingress,
-# chaos-sequencer, chaos-cluster, chaos-retention.
+# chaos-sequencer, chaos-cluster, chaos-retention, chaos-cache.
 SHARD ?= load
 SHARD_TEST = $(subst -,_,$(SHARD))
 TAG := dev

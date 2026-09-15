@@ -106,7 +106,7 @@ jobs:
           cargo build --release \
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
             -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
-            -p kardamom-reconstruct \
+            -p kardamom-reconstruct -p kardamom-state-mirror \
             --bins
           # Settlement-contract deploy for the live batcher (Ansible deployment Phase 2b).
           cargo build --release -p kardamom-deployer --bin kardamom-deploy
@@ -150,7 +150,7 @@ jobs:
         # it SUPERSEDES the old chaos-sealer shard (the single-sealer SPOF is gone
         # now the deploy uses the clustered sealer — see "Configure shard").
         shard:
-          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-retention, semantics]
+          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-retention, chaos-cache, semantics]
     steps:
       - uses: actions/checkout@v4
 

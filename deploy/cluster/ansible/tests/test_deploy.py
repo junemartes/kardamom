@@ -17,7 +17,8 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ANSIBLE = Path(__file__).resolve().parents[1]
-SERVICES = ['aeron', 'cluster', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher', 'batcher']
+SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher',
+            'batcher', 'state-mirror']
 
 
 class NomadAPI(BaseHTTPRequestHandler):
@@ -107,8 +108,8 @@ class DeployTest(unittest.TestCase):
 
     def test_deploy_order_pinning_and_repeat(self):
         self.run_deploy()
-        expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'ingress', 'executor',
-                    'validator', 'da-watcher', 'monitoring', 'batcher']
+        expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
+                    'state-mirror', 'validator', 'da-watcher', 'monitoring', 'batcher']
         self.assertEqual(self.api.state['writes'], expected)
         for name in SERVICES:
             tasks = [t for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']]

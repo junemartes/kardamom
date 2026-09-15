@@ -1,13 +1,95 @@
-//! Per-tx execution receipt.
+//! Per-tx execution receipt, and the `tx_receipts` batch frame that
+//! carries receipts together with the account rows they wrote.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
 use rkyv::{Archive, Deserialize, Serialize, with::Map};
 
 use crate::position::BPosition;
 use crate::wire;
+
+/// The post-state of one account after a transaction: the fields an
+/// admission check or an `eth_getTransactionCount` answer needs. Storage
+/// and code stay off the receipt stream.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
+pub struct AccountRow {
+    #[rkyv(with = wire::AddressBytes)]
+    pub address: Address,
+    pub nonce: u64,
+    #[rkyv(with = wire::U256Bytes)]
+    pub balance: U256,
+}
+
+/// One executed transaction's receipt with the account rows its write set
+/// produced. The exec thread builds one per transaction. The live
+/// publisher merges a batch of these into one [`ReceiptBatch`] frame.
+///
+/// The parallel block executor has no per-transaction write sets. It
+/// attaches the block's merged rows to the block's last receipt and empty
+/// rows to the others, so a row is never tagged with a position before
+/// the writes it carries.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReceiptRows {
+    pub receipt: Receipt,
+    pub accounts: Vec<AccountRow>,
+}
+
+impl ReceiptRows {
+    /// A receipt with no account rows.
+    #[must_use]
+    pub fn bare(receipt: Receipt) -> Self {
+        Self {
+            receipt,
+            accounts: Vec::new(),
+        }
+    }
+}
+
+/// The `tx_receipts` wire frame: a batch of receipts, in canonical order,
+/// plus the merged post-batch row of every account the batch touched.
+///
+/// `accounts` is sorted by address. Where several transactions in the
+/// batch wrote one account, the last one in canonical order wins, so a row
+/// is the account's state after the batch's last receipt. The batch's end
+/// position is the last receipt's `tx_idx`; a batch with no receipts is
+/// never published.
+///
+/// This type has no version, by choice: the wire format may still change
+/// while the chain is at v0.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
+pub struct ReceiptBatch {
+    pub receipts: Vec<Receipt>,
+    pub accounts: Vec<AccountRow>,
+}
+
+impl ReceiptBatch {
+    /// Merge per-transaction rows into one frame. `items` must be in
+    /// canonical order, so the later write wins.
+    #[must_use]
+    pub fn merge(items: &[ReceiptRows]) -> Self {
+        let merged: BTreeMap<Address, AccountRow> = items
+            .iter()
+            .flat_map(|item| item.accounts.iter())
+            .map(|row| (row.address, row.clone()))
+            .collect();
+        Self {
+            receipts: items.iter().map(|item| item.receipt.clone()).collect(),
+            accounts: merged.into_values().collect(),
+        }
+    }
+
+    /// The position of the batch's last receipt. `None` only for an empty
+    /// batch, which the publisher never sends.
+    #[must_use]
+    pub fn end_tx_idx(&self) -> Option<BPosition> {
+        self.receipts.last().map(|r| r.tx_idx)
+    }
+}
 
 /// EIP-2718 type byte for a legacy (untyped, RLP-list) transaction.
 pub const TX_TYPE_LEGACY: u8 = 0x00;
@@ -208,6 +290,44 @@ impl Receipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(byte: u8, nonce: u64) -> AccountRow {
+        AccountRow {
+            address: Address::repeat_byte(byte),
+            nonce,
+            balance: U256::from(nonce),
+        }
+    }
+
+    fn item(offset: i32, rows: Vec<AccountRow>) -> ReceiptRows {
+        ReceiptRows {
+            receipt: Receipt {
+                tx_idx: BPosition {
+                    term_id: 0,
+                    term_offset: offset,
+                },
+                ..Receipt::default()
+            },
+            accounts: rows,
+        }
+    }
+
+    #[test]
+    fn merge_keeps_the_last_write_in_address_order() {
+        let batch = ReceiptBatch::merge(&[
+            item(0, vec![row(0xBB, 1), row(0xAA, 5)]),
+            item(64, vec![row(0xBB, 2)]),
+        ]);
+        assert_eq!(batch.accounts, vec![row(0xAA, 5), row(0xBB, 2)]);
+        assert_eq!(batch.receipts.len(), 2);
+    }
+
+    #[test]
+    fn end_position_is_the_last_receipt() {
+        assert_eq!(ReceiptBatch::default().end_tx_idx(), None);
+        let batch = ReceiptBatch::merge(&[item(0, Vec::new()), item(64, Vec::new())]);
+        assert_eq!(batch.end_tx_idx().map(|p| p.term_offset), Some(64));
+    }
 
     #[test]
     fn invalid_skip_marker_boundaries() {

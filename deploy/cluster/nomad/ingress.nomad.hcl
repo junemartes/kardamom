@@ -37,6 +37,12 @@ variable "ack_policy" {
 # `nomad job run` during debugging, not a production path. A mutable
 # tag lets anyone with registry push access change what the next
 # restart runs.
+variable "executor_count" {
+  type        = number
+  description = "The executor node count (node_classes.executor.count). The account RPCs' executor queries go to executor-<i>.node.<datacenter>.consul."
+  default     = 3
+}
+
 variable "image_ref" {
   type        = string
   description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
@@ -192,6 +198,11 @@ job "ingress" {
           # so a restarted executor can replay full transaction
           # envelopes (Phase 2 crash recovery).
           "--archive-durability",
+          # The executor account query (executor_nonce_query port):
+          # eth_getBalance and eth_getTransactionCount ask one executor
+          # when the local account layer misses. Never on the submit
+          # path. Same list as the sequencer's nonce lookup.
+          "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:9024"]),
         ]
       }
 
