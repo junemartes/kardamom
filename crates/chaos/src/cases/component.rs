@@ -108,6 +108,26 @@ pub(crate) async fn node_failure_executor(h: &mut Harness) -> anyhow::Result<()>
     h.assert_count("executor", 3, h.knobs.reschedule_slo).await
 }
 
+/// The machine-replacement drill: executor-2's node is replaced the way
+/// a cloud provider replaces a server. The container comes back with a
+/// higher generation, on another address and with empty volumes, and
+/// gets the substrate play a new machine gets. Consul must forget the
+/// old record, Nomad must place the lost executor on the new client,
+/// and the executor must catch up from nothing: the chain resolves the
+/// node by name, so nothing but the address plan of the Terraform root
+/// moves. A restarted node (`node-failure-executor`) keeps its address
+/// and its disks; this case is the path that loses both.
+pub(crate) async fn node_replace_executor(h: &mut Harness) -> anyhow::Result<()> {
+    h.replace_node("executor-2", "node-replace").await?;
+    h.assert_count("executor", 3, h.knobs.reschedule_slo)
+        .await?;
+    h.assert_executor_progress(Duration::from_secs(180)).await?;
+    crate::log(
+        "node-replace: executor placed on the new executor-2; waiting for it to catch up from empty disks",
+    );
+    h.assert_executors_converged("node-replace").await
+}
+
 /// The data-loss drill: wipe executor-0's state and checkpoints, then
 /// restore one checkpoint from executor-1. Replicas are deterministic
 /// state machines at the same block, so a peer checkpoint is a valid
