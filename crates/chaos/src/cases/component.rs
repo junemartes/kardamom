@@ -287,14 +287,26 @@ async fn copy_checkpoint_once(
     h.nodes
         .exec(victim, "rm -rf /opt/kardamom/checkpoints/*")
         .await?;
-    let tar = h
+    // The donor's writer can prune the picked checkpoint while tar reads
+    // it ("Cannot stat"). That is the same race as a torn copy, so it
+    // takes the same retry with a fresh pick.
+    let tar = match h
         .nodes
         .exec_bytes(
             donor,
             &format!("tar -C /opt/kardamom --warning=no-file-changed -cf - checkpoints/{name}"),
             1,
         )
-        .await?;
+        .await
+    {
+        Ok(tar) => tar,
+        Err(e) => {
+            crate::log(format!(
+                "state-checkpoint-restore: read of {name} on the donor failed (pruned mid-copy?); retrying: {e}"
+            ));
+            return Ok(None);
+        }
+    };
     // Extract into a staging directory and rename into place, as the
     // checkpoint writer does: the restarted executor may start while the
     // copy is in flight, and a visible but partial checkpoint would be
