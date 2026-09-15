@@ -19,6 +19,7 @@ use alloy_primitives::Address;
 use kardamom_bench::mnemonic::derive_signers;
 
 use crate::harness::Harness;
+use crate::nomad::Streams;
 use crate::poll::{self, Budget};
 use crate::probes::Probed;
 use crate::rpc::{ANVIL_MNEMONIC, Rpc};
@@ -27,7 +28,10 @@ const DEGRADED: &str = "kardamom_cache_degraded_total";
 const LOOKUPS: &str = "kardamom_cache_lookups_total";
 const REDIS_LAYER: &str = "layer=\"redis\"";
 const MIRROR_HEAD: &str = "kardamom_state_mirror_head_tx_idx";
-const MIRROR_REBUILDS: &str = "kardamom_state_mirror_rebuilds_total";
+/// The log line of a finished rebuild. The case counts these lines, not
+/// the rebuild counter: the kill restarts every mirror process, and a
+/// counter in a new process starts again at zero.
+const REBUILD_DONE: &str = "rebuild: done";
 /// How long the sentinels get to promote the replica of a frozen
 /// primary: their `down-after-milliseconds` (5 s), the election, and
 /// slack. The freeze lasts until the promotion is observed.
@@ -172,17 +176,12 @@ async fn mirror_head(h: &Harness) -> Option<i64> {
     best
 }
 
-/// The rebuild count summed over the mirrors.
-async fn mirror_rebuilds(h: &Harness) -> i64 {
-    let mut total = 0;
-    for i in 0..h.probes.executors.len() {
-        total += h
-            .probes
-            .mirror_metric(i, MIRROR_REBUILDS)
-            .await
-            .unwrap_or(0);
-    }
-    total
+/// The finished rebuilds in the mirror job's logs. A task log survives
+/// an in-place restart, so the count only grows.
+async fn mirror_rebuilds(h: &Harness) -> anyhow::Result<usize> {
+    h.evidence
+        .count_lines("state-mirror", REBUILD_DONE, Streams::Both)
+        .await
 }
 
 /// The mirror head advances: the projection follows the chain again.
@@ -376,33 +375,33 @@ async fn partitioned_phase(h: &Harness, ctx: &str) -> anyhow::Result<()> {
 pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "mirror-kill-rebuild";
     wait_readers_connected(h, ctx).await?;
-    let rebuilds0 = mirror_rebuilds(h).await;
+    let rebuilds0 = mirror_rebuilds(h).await?;
     let nodes: Vec<String> = h
         .probes
         .executors
         .iter()
         .map(|e| e.container.clone())
         .collect();
-    for node in &nodes[1..] {
+    let mut mirrors = Vec::with_capacity(nodes.len());
+    for node in &nodes {
         if let Some(cid) = h.nodes.inner_cid(node, "state-mirror").await {
-            h.nodes.inner_kill(node, &cid).await?;
+            mirrors.push((node.clone(), cid));
         }
     }
+    let flushed = freeze_and_flush(h, ctx, &mirrors).await;
+    for (node, cid) in mirrors.iter().filter(|(node, _)| *node != nodes[0]) {
+        h.nodes.inner_kill(node, cid).await?;
+    }
     h.inject_hard(&[&nodes[0]], "state-mirror").await?;
-    let master = sentinel_master(h).await?;
-    h.nodes
-        .exec(
-            &aux(h),
-            &redis_cli(&format!("-h {master} -p 6379 FLUSHALL")),
-        )
-        .await
-        .map_err(|e| crate::chaos_fail!("{ctx}: FLUSHALL on {master} failed: {e}"))?;
-    crate::log(format!("{ctx}: mirrors killed and {master} flushed"));
+    let master = flushed?;
+    crate::log(format!(
+        "{ctx}: mirrors frozen, {master} flushed, mirrors killed"
+    ));
     h.assert_count("state-mirror", MIRROR_ALLOCS, h.knobs.restart_slo)
         .await?;
     let hs: &Harness = h;
     let outcome = poll::until(Budget::secs(300, 5), |_| async move {
-        Ok::<_, anyhow::Error>(Some(mirror_rebuilds(hs).await).filter(|n| *n > rebuilds0))
+        Ok::<_, anyhow::Error>(Some(mirror_rebuilds(hs).await?).filter(|n| *n > rebuilds0))
     })
     .await?;
     let (rebuilds, elapsed) = outcome
@@ -415,6 +414,36 @@ pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
     assert_chaos_account_projected(h, ctx, &master).await?;
     wait_readers_recovered(h, ctx).await?;
     h.assert_progress().await
+}
+
+/// Freeze every mirror with SIGSTOP, then flush the primary. A frozen
+/// mirror writes nothing, and Nomad does not restart it. Thus Redis
+/// stays cold until the kill that follows. A kill before the flush
+/// races it: Nomad restarts a mirror after 5 s, and a mirror that starts
+/// before the flush finds the live heads and resumes with no rebuild.
+/// Returns the flushed primary.
+async fn freeze_and_flush(
+    h: &Harness,
+    ctx: &str,
+    mirrors: &[(String, String)],
+) -> anyhow::Result<String> {
+    for (node, cid) in mirrors {
+        h.nodes
+            .inner_signal(node, cid, crate::nodes::Signal::Stop)
+            .await
+            .map_err(|e| {
+                crate::chaos_fail!("{ctx}: SIGSTOP of the mirror on {node} failed: {e}")
+            })?;
+    }
+    let master = sentinel_master(h).await?;
+    h.nodes
+        .exec(
+            &aux(h),
+            &redis_cli(&format!("-h {master} -p 6379 FLUSHALL")),
+        )
+        .await
+        .map_err(|e| crate::chaos_fail!("{ctx}: FLUSHALL on {master} failed: {e}"))?;
+    Ok(master)
 }
 
 /// The first chaos account has a projected row: the rebuild scanned

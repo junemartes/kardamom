@@ -14,7 +14,7 @@ use crate::nodes::Nodes;
 use crate::nomad::{Alloc, Nomad, Streams};
 use crate::stages::{head_lines, matching_lines, tail_lines};
 
-const JOBS: [&str; 10] = [
+const JOBS: [&str; 12] = [
     "aeron",
     "anvil",
     "cluster",
@@ -25,6 +25,8 @@ const JOBS: [&str; 10] = [
     "ingress",
     "batcher",
     "da-watcher",
+    "redis",
+    "state-mirror",
 ];
 /// A throwaway group and port, so the probe never collides with the
 /// media driver's sockets.
@@ -39,17 +41,20 @@ const FLOWS_SHOWN: usize = 40;
 const LOG_HEAD: usize = 30;
 const LOG_TAIL: usize = 40;
 const CLUSTER_LOG_TAIL: usize = 200;
-/// Cluster session lifecycle lines, from the sealer and from every client.
-/// A tail alone hides them: a stuck sequencer fills its last 40 lines with
-/// rewind warnings, and the session events that explain it happened
+/// Lifecycle lines: cluster sessions from the sealer and every client, and
+/// the state mirror's starts and rebuilds. A tail alone hides them: a
+/// stuck sequencer fills its last 40 lines with rewind warnings, a mirror
+/// with Redis write retries, and the events that explain it happened
 /// minutes earlier.
-const SESSION_MARKERS: &[&str] = &[
+const LIFECYCLE_MARKERS: &[&str] = &[
     "cluster SESSION",
     "cluster session",
     "cluster egress silent",
     "RESYNC",
+    "kardamom-state-mirror starting",
+    "rebuild:",
 ];
-const SESSION_EVENTS: usize = 60;
+const LIFECYCLE_EVENTS: usize = 60;
 const AERON_ERRORS: &str = "for f in /opt/kardamom/cluster/*error*.log /opt/kardamom/aeron-mount/cluster-dir/*error*.log; do [ -f \"$f\" ] && { echo \"--- $f ---\"; cat \"$f\"; }; done";
 const CLUSTER_TOOL: &str = r#"inner="$(docker ps --format "{{.Names}}" | grep -m1 "^cluster-")"
 [ -n "$inner" ] || { echo "(no inner cluster container running)"; exit 0; }
@@ -256,10 +261,13 @@ impl Diagnostics {
         );
         println!("{}", tail_lines(&logs, tail));
         println!(
-            "----- {job} alloc {}: session events (last {SESSION_EVENTS}) -----",
+            "----- {job} alloc {}: lifecycle events (last {LIFECYCLE_EVENTS}) -----",
             alloc.short_id()
         );
-        println!("{}", matching_lines(&logs, SESSION_MARKERS, SESSION_EVENTS));
+        println!(
+            "{}",
+            matching_lines(&logs, LIFECYCLE_MARKERS, LIFECYCLE_EVENTS)
+        );
     }
 
     async fn sealer_section(&self, node: &Node) {
