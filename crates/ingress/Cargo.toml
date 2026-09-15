@@ -39,6 +39,9 @@ kardamom-log = { workspace = true, features = ["testing"] }
 # Cluster (Raft) transport adapter: the ingress on-quorum ack gate derives its
 # durable watermark from cluster egress progress (ClusterWatermark).
 kardamom-cluster-adapter = { path = "../cluster-adapter" }
+# The local account layer and the executor query client: the read layers
+# behind the admission checks and the account RPCs.
+kardamom-cache = { workspace = true }
 kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true
 metrics.workspace = true

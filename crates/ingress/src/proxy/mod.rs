@@ -3,20 +3,25 @@
 //! single process.
 //!
 //! Module layout: this file owns the struct, construction, and accessors.
-//! [`submit`] owns the client-facing submit path. [`watchers`] owns the
+//! [`submit`] owns the client-facing submit path. [`accounts`] owns the
+//! account reads behind the two account RPCs. [`watchers`] owns the
 //! background stream watchers that [`IngressProxy::new`] spawns.
 
+mod accounts;
 mod submit;
 mod watchers;
+
+pub use accounts::AccountField;
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use tokio::sync::broadcast;
 
+use kardamom_cache::{AccountView, ExecutorQuery, LiveAccounts};
 use kardamom_types::{Receipt, TxError};
 
 use crate::channels::{IngressPublication, IngressSubscription};
@@ -86,12 +91,19 @@ pub fn ingress_id_of(correlation_id: u64) -> u16 {
 
 /// Output of the shared submit-path head: the identity of a decoded,
 /// verified submission, plus a receipt-cache hit if this is a
-/// resubmission.
+/// resubmission, and what the admission checks need: the sender's
+/// latest local state and the tx's worst-case cost.
 struct ValidatedSubmission {
     sender: Address,
     nonce: u64,
     tx_hash: B256,
     cached: Option<Receipt>,
+    /// The sender's entry in the local layer. `None` with the checks
+    /// off, on a miss, or past the TTL: every one admits.
+    account: Option<AccountView>,
+    /// `gas_limit * max_fee_per_gas + value`. `None` on overflow, which
+    /// admits: the executor's own check is the bound.
+    cost: Option<U256>,
 }
 
 /// Handle returned by `IngressProxy::start`. Drop it to shut down the
@@ -127,6 +139,13 @@ where
     pub(crate) publication: P,
     pub(crate) subscription: S,
     pub(crate) correlation_seq: Arc<AtomicU64>,
+    /// The local account layer the subscription feeds. The admission
+    /// checks and the account RPCs read it. See `kardamom_cache::live`.
+    pub(crate) live: Arc<LiveAccounts>,
+    /// The executor query behind the account RPCs. `None` when the
+    /// config names no endpoint: a local miss is then an error, never a
+    /// stall. The admission path never calls it.
+    pub(crate) query: Option<ExecutorQuery>,
     /// The highest `BlockBoundary.block_number` observed on `tx_receipts`.
     /// `eth_blockNumber` reads this. `AtomicU64` is enough here: the
     /// value only increases, one writer, the `BlockBoundary` watcher, sets
@@ -173,6 +192,8 @@ where
             publication: self.publication.clone(),
             subscription: self.subscription.clone(),
             correlation_seq: self.correlation_seq.clone(),
+            live: self.live.clone(),
+            query: self.query.clone(),
             latest_block_number: self.latest_block_number.clone(),
             receipt_feed: self.receipt_feed.clone(),
             tx_error_feed: self.tx_error_feed.clone(),
@@ -199,6 +220,8 @@ where
         let pending = Arc::new(PendingReceipts::new(cfg.ack_policy));
         let cache = Arc::new(ReceiptCache::new(cfg.receipt_cache_capacity));
         let tx_error_dedup = Arc::new(TxErrorDedup::default());
+        let live = subscription.live_accounts();
+        let query = ExecutorQuery::new(&cfg.executor_query);
         let me = Self {
             cfg,
             partition_count_m,
@@ -210,6 +233,8 @@ where
             publication,
             subscription,
             correlation_seq: Arc::new(AtomicU64::new(0)),
+            live,
+            query,
             latest_block_number: Arc::new(AtomicU64::new(0)),
             receipt_feed: broadcast::channel(FEED_CAPACITY).0,
             tx_error_feed: broadcast::channel(FEED_CAPACITY).0,

@@ -687,7 +687,13 @@ pub fn spawn_ingress_at(
             &opts.rpc_max_connections.to_string(),
         ])
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
-        .args(["--host-id", "e2e-ingress"]);
+        .args(["--host-id", "e2e-ingress"])
+        // The account RPCs ask the executor on a local miss, as the
+        // sequencers' nonce lookup does.
+        .args([
+            "--executor-query-endpoints",
+            &format!("http://{}", spec.executor_query),
+        ]);
     with_log_config(&mut cmd, spec);
     // The ingress is the tx_data recorder. With this flag, the shared
     // archive records every shard's publication. This is what makes a

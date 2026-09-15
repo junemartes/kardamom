@@ -21,9 +21,11 @@ mod steps;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
+use kardamom_cache::{LiveAccounts, LiveAccountsWriter};
 use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
@@ -43,6 +45,7 @@ use kardamom_sequencer::resync::{
 };
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
 use kardamom_types::shard_map::{VslotSet, vslot_for};
+use kardamom_types::{AccountRow, ReceiptBatch};
 
 /// One `tx_data` lane subscription: the lane index the sequencer stamps
 /// into every ref off it, and the handle that reads it.
@@ -286,21 +289,33 @@ impl EgressWatermarkFeed {
 /// The `tx_receipts`-to-per-sender executed-truth floor feed. Only the
 /// senders of this replica's vslots reach the floor channel. The set is
 /// the replica's whole set, shadow slots included: floors must advance
-/// for the incoming senders during the warm-up too.
+/// for the incoming senders during the warm-up too. The batch frame's
+/// account rows of the same vslots go into the local account layer,
+/// before the receipts forward.
 ///
 /// The receipts handle already fans in over a tokio unbounded channel. The
 /// Aeron poll thread is the producer. So this is a plain async task. It
-/// awaits `recv()` and `Shutdown::cancelled`, with no idle-sleep polling.
-/// `floor_tx` stays a std channel, because its consumer is the sync
-/// `ResyncController` in the publish loop.
+/// awaits `recv_batch()` and `Shutdown::cancelled`, with no idle-sleep
+/// polling. `floor_tx` stays a std channel, because its consumer is the
+/// sync `ResyncController` in the publish loop.
 pub(crate) struct ReceiptFloorFeed {
     vslots: VslotSet,
     floor_tx: crossbeam_channel::Sender<FloorUpdate>,
+    /// The local account layer's one writer.
+    writer: LiveAccountsWriter,
 }
 
 impl ReceiptFloorFeed {
-    pub(crate) fn new(vslots: VslotSet, floor_tx: crossbeam_channel::Sender<FloorUpdate>) -> Self {
-        Self { vslots, floor_tx }
+    pub(crate) fn new(
+        vslots: VslotSet,
+        floor_tx: crossbeam_channel::Sender<FloorUpdate>,
+        writer: LiveAccountsWriter,
+    ) -> Self {
+        Self {
+            vslots,
+            floor_tx,
+            writer,
+        }
     }
 
     /// Spawn as a plain async task. The handle reduces to its receiver
@@ -317,7 +332,11 @@ impl ReceiptFloorFeed {
         tokio::spawn(self.run(rx, shutdown))
     }
 
-    async fn run(self, mut rx: kardamom_log::aeron_live::TxReceiptsReceiver, shutdown: Shutdown) {
+    async fn run(
+        mut self,
+        mut rx: kardamom_log::aeron_live::TxReceiptsReceiver,
+        shutdown: Shutdown,
+    ) {
         loop {
             match self.tick(&mut rx, &shutdown).await {
                 ControlFlow::Break(()) => return,
@@ -326,25 +345,45 @@ impl ReceiptFloorFeed {
         }
     }
 
-    /// One [`Self::run`] pass: wait for the next receipt or shutdown,
-    /// then forward it. `Break` means the task should stop: shutdown,
-    /// the subscription closed, or the publish loop is gone.
+    /// One [`Self::run`] pass: wait for the next batch or shutdown,
+    /// then apply its rows and forward its receipts. `Break` means the
+    /// task should stop: shutdown, the subscription closed, or the
+    /// publish loop is gone.
     async fn tick(
-        &self,
+        &mut self,
         rx: &mut kardamom_log::aeron_live::TxReceiptsReceiver,
         shutdown: &Shutdown,
     ) -> ControlFlow<()> {
-        let receipt = tokio::select! {
+        let batch = tokio::select! {
             biased;
             () = shutdown.cancelled() => return ControlFlow::Break(()),
-            msg = rx.recv() => match msg {
-                Some((_pos, receipt)) => receipt,
+            msg = rx.recv_batch() => match msg {
+                Some((_pos, batch)) => batch,
                 // The subscription closed. The runtime shut down.
                 // Nothing more to feed.
                 None => return ControlFlow::Break(()),
             },
         };
-        self.forward_one_receipt(&receipt)
+        self.forward_batch(batch)
+    }
+
+    /// The rows of this replica's vslots into the local layer at the
+    /// batch's end position, then every receipt through the floor
+    /// filter. The rows go first, so a lookup request the receipt's
+    /// park raises finds the entry.
+    fn forward_batch(&mut self, batch: ReceiptBatch) -> ControlFlow<()> {
+        if let Some(end) = batch.end_tx_idx() {
+            let rows: Vec<AccountRow> = batch
+                .accounts
+                .into_iter()
+                .filter(|row| self.vslots.contains(vslot_for(row.address)))
+                .collect();
+            self.writer.apply(end, &rows);
+        }
+        for receipt in &batch.receipts {
+            self.forward_one_receipt(receipt)?;
+        }
+        ControlFlow::Continue(())
     }
 
     /// Filter, build, and forward one receipt, for [`Self::tick`].
@@ -391,10 +430,11 @@ struct LookupDone {
     result: Result<u64, String>,
 }
 
-/// The nonce lookup task. It drains the core's requests, dedups the
-/// senders in flight, bounds the concurrency and the per-sender retry
-/// rate, queries the executors, and delivers each answer as a
-/// `FloorUpdate`. See `kardamom_sequencer::lookup`.
+/// The nonce lookup task. It drains the core's requests, answers a
+/// resident sender from the local account layer, dedups the senders in
+/// flight, bounds the concurrency and the per-sender retry rate, queries
+/// the executors, and delivers each answer as a `FloorUpdate`. See
+/// `kardamom_sequencer::lookup`.
 ///
 /// One query runs on its own task, so a slow executor never blocks the
 /// drain. The endpoints rotate per query, and a query walks the list until
@@ -406,6 +446,8 @@ pub(crate) struct NonceLookupFeed {
     rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
     shutdown: Shutdown,
     floor_tx: crossbeam_channel::Sender<FloorUpdate>,
+    /// The local account layer. A resident sender is answered from it.
+    live: Arc<LiveAccounts>,
     client: reqwest::Client,
     endpoints: std::sync::Arc<[String]>,
     done_tx: tokio::sync::mpsc::UnboundedSender<LookupDone>,
@@ -429,6 +471,7 @@ impl NonceLookupFeed {
         rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
         shutdown: Shutdown,
         floor_tx: crossbeam_channel::Sender<FloorUpdate>,
+        live: Arc<LiveAccounts>,
     ) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder().timeout(cfg.timeout()).build()?;
         let endpoints: std::sync::Arc<[String]> = cfg.executor_endpoints.clone().into();
@@ -439,6 +482,7 @@ impl NonceLookupFeed {
             rx,
             shutdown,
             floor_tx,
+            live,
             client,
             endpoints,
             done_tx,
@@ -487,13 +531,18 @@ impl NonceLookupFeed {
         };
         seq_metrics::record_nonce_lookup(self.partition, "ok");
         tracing::debug!(sender = ?done.sender, nonce, "nonce lookup answered");
-        // A committed nonce `c` proves every nonce below it executed.
-        // Nonce 0 proves nothing.
+        self.floor_from_committed(done.sender, nonce)
+    }
+
+    /// A committed nonce `c` proves every nonce below it executed, so it
+    /// is floor evidence of the same kind as a receipt. Nonce 0 proves
+    /// nothing. `Break` means the publish loop is gone.
+    fn floor_from_committed(&self, sender: Address, nonce: u64) -> ControlFlow<()> {
         let Some(executed_nonce) = nonce.checked_sub(1) else {
             return ControlFlow::Continue(());
         };
         let update = FloorUpdate {
-            sender: done.sender,
+            sender,
             executed_nonce,
             skip_reason: None,
             deposit: false,
@@ -504,10 +553,17 @@ impl NonceLookupFeed {
         }
     }
 
-    /// One request from the core: drop it if the sender is in flight or
-    /// asked within the last timeout, shed it at the concurrency bound,
-    /// else start a query task.
+    /// One request from the core: answer it from the local layer when
+    /// the sender is resident, else drop it if the sender is in flight
+    /// or asked within the last timeout, shed it at the concurrency
+    /// bound, else start a query task.
     fn on_request(&mut self, sender: Address) {
+        if let Some(view) = self.live.get(sender) {
+            seq_metrics::record_nonce_lookup(self.partition, "local");
+            // A gone publish loop ends the drain on its next tick.
+            let _ = self.floor_from_committed(sender, view.nonce);
+            return;
+        }
         let now = Instant::now();
         let timeout = self.cfg.timeout();
         let asked_recently = self

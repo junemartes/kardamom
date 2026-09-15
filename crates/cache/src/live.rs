@@ -42,7 +42,7 @@ impl LiveAccounts {
     #[must_use]
     pub fn new(cfg: &LiveAccountsConfig) -> (Arc<Self>, LiveAccountsWriter) {
         let shared = Arc::new(Self {
-            map: DashMap::with_capacity(cfg.capacity.get()),
+            map: DashMap::new(),
             head: AtomicU64::new(0),
             ttl: cfg.ttl(),
         });
@@ -129,12 +129,18 @@ impl LiveAccountsWriter {
         true
     }
 
-    /// Drop expired entries, then the oldest beyond capacity. An address
-    /// rewritten since its queue entry keeps its newer value.
+    /// Drop expired entries, then the oldest while the map is beyond
+    /// capacity. The queue holds one entry per write, so an address
+    /// rewritten since its queue entry keeps its newer value and the
+    /// stale queue entry is skipped. The queue itself is bounded by the
+    /// TTL and, under a write burst, by four times the capacity.
     fn evict(&mut self, now: Instant) {
         let ttl = self.shared.ttl;
+        let capacity = self.capacity.get();
         while let Some(&(at, address)) = self.order.front()
-            && (now.duration_since(at) > ttl || self.order.len() > self.capacity.get())
+            && (now.duration_since(at) > ttl
+                || self.shared.map.len() > capacity
+                || self.order.len() > capacity.saturating_mul(4))
         {
             self.order.pop_front();
             self.shared

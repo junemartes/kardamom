@@ -24,8 +24,8 @@ The ingress and the sequencer have no shared view of the account state.
 The ingress and the sequencer are stateless and scale horizontally today. Redis does not add
 scale. It adds capability:
 
-1. Admission checks at the door. The ingress rejects nonce-too-low and insufficient funds
-   before the sequencer and the sealer see the transaction.
+1. Admission checks at the door. The ingress rejects insufficient funds, and a transaction
+   at a nonce a receipt proves taken, before the sequencer and the sealer see it.
 2. The ingress serves `eth_getTransactionCount` and `eth_getBalance`.
 3. The sequencer's cold-sender lookup becomes one GET, not an mdbx snapshot per call.
 4. Retry answers survive an ingress restart and are shared across replicas.
@@ -222,10 +222,12 @@ needed: admission reads one sender.
   entry in every layer means unknown, and unknown admits. The nonce check runs first, and
   it is free for a warm sender. On `nonce < stored.nonce`, consult the local receipt cache,
   then the Redis `rcpt` key. Answer with the receipt through the existing `tx_hash` identity
-  guard, or with `IngressError::Duplicate` (`-32602`) when no receipt exists. The receipt
-  index is what makes the nonce-too-low reject safe for a retry: a client that resubmits a
-  landed transaction gets its receipt, on any replica, after any restart. This keeps the S5
-  retry contract and makes it faster. `nonce >= stored.nonce` always publishes.
+  guard: the same hash gets its receipt, another hash is `IngressError::Duplicate`
+  (`-32602`). With no receipt in either index, publish: the account layer can lead the
+  receipt indexes (see the PR 4 note in section 11). A client that resubmits a landed
+  transaction gets its receipt, on any replica, after any restart, when an index holds it.
+  This keeps the S5 retry contract and makes it faster. `nonce >= stored.nonce` always
+  publishes.
   `balance < cost` rejects as `IngressError::InsufficientFunds`, code `-32000`, message
   `insufficient funds for gas * price + value`. `cost = gas_limit * max_fee_per_gas + value`
   with `checked_mul` and `checked_add` on `U256`. A legacy envelope uses `gas_price`. An
@@ -292,7 +294,8 @@ in `Drop`.
 - `validate_submission`: after recovery, read `LiveAccounts`, then
   `AccountCache::account(sender)` on a miss. On `nonce < stored.nonce`, consult the local
   receipt cache, then `receipt(sender, nonce)` from Redis, and answer per the read rule. On
-  `nonce >= stored.nonce`, apply the balance check and publish.
+  `nonce >= stored.nonce`, apply the balance check and publish. The admission path never
+  calls the executor query (see section 11, PR 4).
 - `aeron_adapters.rs`: the batch hook applies rows to `LiveAccounts` before the receipts fan
   out to the watcher that releases parked clients.
 - `IngressError::InsufficientFunds` maps to `-32000`.
@@ -386,23 +389,25 @@ Add `eth_getBalance` next to `eth_getTransactionCount`, same wire shape, plus an
   `republished_prefix_carries_identical_rows`.
 - Validator: `validator_halts_on_a_forged_row`.
 - Ingress: `cache_miss_admits`, `receipt_cache_answers_before_nonce_floor_rejects`,
-  `nonce_too_low_maps_to_32602`, `future_nonce_is_never_rejected`,
+  `past_nonce_without_a_receipt_publishes`, `future_nonce_is_never_rejected`,
   `stale_head_skips_both_checks`, `insufficient_funds_rejects_when_fresh`,
   `cache_error_admits`, `local_hit_makes_no_redis_call`,
   `receipt_release_happens_after_rows_apply`.
 - Sequencer: `cached_floor_never_exceeds_executor_floor`, `a_leading_floor_never_seals_a_gap`,
   `pending_floor_is_never_read_back`.
 
-### 9.2 Chain semantics (`s14`)
+### 9.2 Chain semantics (`s17`)
 
-- `s14a_nonce_floor_cache_matches_executor_count`: the cached nonce equals or lags the
+The ids `s14`, `s15` and `s16` were taken when PR 4 landed, so the scenarios are `s17`.
+
+- `s17a_nonce_floor_cache_matches_executor_count`: the cached nonce equals or lags the
   executor, never leads.
-- `s14b_resubmit_of_landed_still_returns_the_receipt`.
-- `s14c_cold_cache_admits_everything`.
-- `s14d_deposit_funded_sender_is_admitted_within_max_stale_txs`.
-- `s14e_forged_receipt_row_halts_the_validator`.
-- `s14f_get_balance_and_nonce_answer_or_degrade_promptly`.
-- `s14g_recipient_can_spend_within_one_batch`: A pays B, B submits at once, B is admitted
+- `s17b_resubmit_of_landed_still_returns_the_receipt`.
+- `s17c_cold_cache_admits_everything`.
+- `s17d_deposit_funded_sender_is_admitted_within_max_stale_txs`.
+- `s17e_forged_receipt_row_halts_the_validator`.
+- `s17f_get_balance_and_nonce_answer_or_degrade_promptly`.
+- `s17g_recipient_can_spend_within_one_batch`: A pays B, B submits at once, B is admitted
   before the block boundary.
 
 ### 9.3 Chaos (`chaos-cache` shard)
@@ -426,9 +431,9 @@ Add `eth_getBalance` next to `eth_getTransactionCount`, same wire shape, plus an
 | 2a | `ReceiptBatch` rows (5.1) | chain semantics green; validator row check passes on the load shard; bandwidth recorded here |
 | 2b | `kardamom-cache`, `eth_getBalance`, `x-state-tx-idx` | unit tests with `testcontainers` pass |
 | 3 | `kardamom-state-mirror`, Redis and mirror jobs, Ansible | cluster-e2e green; the mirror head tracks the executor |
-| 4 | `LiveAccounts` readers, admission checks, RPCs, Redis off | `s14a..s14d` green; executor query rate is the cold-sender rate |
+| 4 | `LiveAccounts` readers, admission checks, RPCs, Redis off | unit tests green; the existing chain-semantics shard holds the S5 retry contract |
 | 4b | Redis readers behind `[cache]` | flag off is byte-for-byte PR 4 |
-| 5 | `chaos-cache` shard, `s14e..s14g` | shard green |
+| 5 | `chaos-cache` shard, `s17a..s17g` | shard green |
 | 6 | flag day | `chaos-cache` green with the flag on |
 
 ## 11. Implementation notes
@@ -488,6 +493,30 @@ Deviations from the design above, recorded as they land.
 - **Not covered by rows.** Block-close writes without a receipt (the health beacon, system
   upgrades) produce no rows. Those predeploy accounts stay stale in the projection until a
   rebuild. None is a sender, so admission is unaffected.
+- **PR 4 (`LiveAccounts` readers, Redis off).** The admission path reads the local layer
+  only. It never calls the executor query: a flood of fresh senders would turn every miss
+  into an mdbx snapshot on an executor. A local miss admits. The executor query serves the
+  two account RPCs and the sequencer's cold-sender lookup. The two RPCs take the per-IP
+  rate limit like a submit, and the query client bounds its in-flight requests, so a read
+  flood is shed at the ingress. The RPCs serve the head only: `latest`, `pending`, `safe`
+  and `finalized` are the same block, a number other than the head is `-32602`. The local
+  layer's capacity bounds resident accounts, not writes, and defaults to 2^18 (about 30 MB)
+  so the layer holds every account touched within the TTL at the load-shard rate. The
+  sequencer applies only the rows of its own vslots, the same filter as its receipts, so it
+  never holds every account of the chain. **A past nonce publishes.** The read rule's
+  `Duplicate` for a past nonce with no receipt conflicts with the fallback rule, and the
+  fallback rule wins. The layer can know a nonce whose receipt this ingress never caches:
+  the pump applies a batch's rows at once, while the receipts travel a bounded broadcast
+  bus that drops them for a lagging watcher (and before the watcher subscribes). A reject
+  there answers a retry of a landed transaction with `Duplicate` for good, where the
+  sequencer path lets the client's retries find the receipt. `s16` on #309 failed exactly
+  so: nonce 19 of a moved sender, right after the ingress restart. Before this stack, the
+  same lost receipt was the known `s16` flake "did not land after 40 attempts". The door
+  rejects a past nonce only on proof: a receipt for the (sender, nonce) with another hash.
+  A past nonce with no receipt counts `kardamom_cache_lookups_total{layer="receipt",
+  outcome="miss"}`, not a degraded read: Redis is not involved. The chain-semantics
+  scenarios of 9.2 ship with PR 5. The ingress query client lives in
+  `kardamom_cache::query`; the sequencer keeps its own until PR 4b.
 
 ## 12. Open questions
 

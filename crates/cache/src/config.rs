@@ -91,7 +91,8 @@ impl CacheConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct LiveAccountsConfig {
     /// The bound on resident accounts. At capacity the oldest entry is
-    /// evicted. Never zero.
+    /// evicted. Never zero. The default, 2^18 accounts, is about 30 MB
+    /// and holds every account touched within the TTL at 4,800 tx/s.
     pub capacity: NonZeroUsize,
     /// How long an entry stays after its last write, in ms. This also
     /// bounds the damage of a missed frame: a stale entry expires. Never
@@ -102,7 +103,7 @@ pub struct LiveAccountsConfig {
 impl Default for LiveAccountsConfig {
     fn default() -> Self {
         Self {
-            capacity: NonZeroUsize::new(65_536).unwrap(),
+            capacity: NonZeroUsize::new(1 << 18).unwrap(),
             ttl_ms: NonZeroU64::new(30_000).unwrap(),
         }
     }

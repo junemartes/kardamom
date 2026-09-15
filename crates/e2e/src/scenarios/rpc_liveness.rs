@@ -11,8 +11,8 @@
 //! - an unknown-hash receipt lookup: `null`, fast.
 //! - `eth_chainId` (with the correct value) and `eth_blockNumber` stay
 //!   fast while a nonce-gap submit is parked on the same server.
-//! - the deferred read endpoints (`eth_getBalance`,
-//!   `eth_getTransactionCount`) fail cleanly with `-32603`, and never hang.
+//! - the account read endpoints (`eth_getBalance`,
+//!   `eth_getTransactionCount`) answer promptly, and never hang.
 //!
 //! Two probes need dedicated stacks, so they live as separate drivers
 //! below: [`connection_cap_refusal`] (a small `--rpc-max-connections`
@@ -28,7 +28,7 @@ use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bytes, Signature, U256};
 use anyhow::{Context, Result};
 
-use super::{CODE_INTERNAL, CODE_INVALID, Target};
+use super::{CODE_INVALID, Target};
 use crate::harness::l2::{self, L2Client, RpcError, RpcOutcome};
 use crate::harness::metrics::poll_until;
 
@@ -189,16 +189,17 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("eth_blockNumber #{i}: {e}"))?;
     }
 
-    // Deferred read endpoints: clean error, never a hang.
+    // The account read endpoints answer promptly, never a hang. The
+    // sender is a funded dev account, so both have a value: the local
+    // layer or one executor query serves it.
     let out = t.rpc.get_balance(sender.address).await;
-    expect_fast_error(&out, CODE_INTERNAL, fast, "eth_getBalance (deferred)")?;
+    assert_fast(&out, fast, "eth_getBalance under parked load")?;
+    out.result
+        .map_err(|e| anyhow::anyhow!("eth_getBalance: {e}"))?;
     let out = t.rpc.get_transaction_count(sender.address).await;
-    expect_fast_error(
-        &out,
-        CODE_INTERNAL,
-        fast,
-        "eth_getTransactionCount (deferred)",
-    )?;
+    assert_fast(&out, fast, "eth_getTransactionCount under parked load")?;
+    out.result
+        .map_err(|e| anyhow::anyhow!("eth_getTransactionCount: {e}"))?;
 
     // The parked submit resolves with the server timeout, which is bounded.
     let out = parked.await.context("parked submit join")?;

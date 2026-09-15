@@ -378,13 +378,16 @@ impl ResyncWiring {
             .tx_receipts_subscriber(receipts_rt, executor_count)
             .context("open tx_receipts")?;
         let vslots = cfg.vslot_set().context("vslots")?;
-        let receipts_task = feeds::ReceiptFloorFeed::new(vslots, floor_tx.clone())
+        // The local account layer: the receipts feed writes the rows of
+        // this replica's vslots, the lookup task reads them.
+        let (live, live_writer) = kardamom_cache::LiveAccounts::new(&cfg.live_accounts);
+        let receipts_task = feeds::ReceiptFloorFeed::new(vslots, floor_tx.clone(), live_writer)
             .spawn(receipts_sub, shutdown.clone());
 
         // The nonce lookup task. It shares the floor channel with the
         // receipts feed: an executor's committed nonce is floor evidence
         // of the same kind as a receipt.
-        let (lookup, lookup_task) = Self::spawn_lookup(cfg, floor_tx, shutdown)?;
+        let (lookup, lookup_task) = Self::spawn_lookup(cfg, floor_tx, shutdown, live)?;
 
         Ok(Self {
             controller,
@@ -409,6 +412,7 @@ impl ResyncWiring {
         cfg: &SequencerConfig,
         floor_tx: crossbeam_channel::Sender<kardamom_sequencer::resync::FloorUpdate>,
         shutdown: &Shutdown,
+        live: std::sync::Arc<kardamom_cache::LiveAccounts>,
     ) -> Result<(Option<LookupRequester>, Option<tokio::task::JoinHandle<()>>)> {
         if !cfg.lookup.enabled() {
             return Ok((None, None));
@@ -420,6 +424,7 @@ impl ResyncWiring {
             rx,
             shutdown.clone(),
             floor_tx,
+            live,
         )
         .context("nonce lookup: http client build failed")?
         .spawn();
