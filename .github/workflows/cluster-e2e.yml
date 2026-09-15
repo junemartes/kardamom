@@ -154,7 +154,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # GitHub's artifact service answers 403 or 5xx now and then, and
+      # download-artifact does not retry, so one bad answer failed a whole
+      # shard before it started. Two more attempts follow a failure, each
+      # after a pause.
       - uses: actions/download-artifact@v4
+        id: artifact-1
+        continue-on-error: true
+        with:
+          name: cluster-dist
+      - name: Wait before the second artifact download
+        if: steps.artifact-1.outcome == 'failure'
+        run: sleep 30
+      - uses: actions/download-artifact@v4
+        id: artifact-2
+        if: steps.artifact-1.outcome == 'failure'
+        continue-on-error: true
+        with:
+          name: cluster-dist
+      - name: Wait before the third artifact download
+        if: steps.artifact-1.outcome == 'failure' && steps.artifact-2.outcome == 'failure'
+        run: sleep 90
+      - uses: actions/download-artifact@v4
+        if: steps.artifact-1.outcome == 'failure' && steps.artifact-2.outcome == 'failure'
         with:
           name: cluster-dist
 
