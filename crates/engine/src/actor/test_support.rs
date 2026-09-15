@@ -95,6 +95,7 @@ pub(crate) fn legacy(
         value,
         gas_limit: 21_000,
         gas_price: 0,
+        ..Default::default()
     }
     .sign(signer)
 }
