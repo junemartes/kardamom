@@ -36,9 +36,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.7.1
+      - uses: ./.github/actions/foundry
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
@@ -59,9 +57,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.7.1
+      - uses: ./.github/actions/foundry
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
@@ -78,9 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.7.1
+      - uses: ./.github/actions/foundry
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
@@ -166,9 +160,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.7.1
+      - uses: ./.github/actions/foundry
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
@@ -185,9 +177,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.7.1
+      - uses: ./.github/actions/foundry
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
@@ -206,9 +196,7 @@ jobs:
         working-directory: contracts
     steps:
       - uses: actions/checkout@v4
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.7.1
+      - uses: ./.github/actions/foundry
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
@@ -228,9 +216,7 @@ jobs:
         working-directory: contracts
     steps:
       - uses: actions/checkout@v4
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.7.1
+      - uses: ./.github/actions/foundry
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
@@ -250,9 +236,7 @@ jobs:
         working-directory: contracts
     steps:
       - uses: actions/checkout@v4
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.7.1
+      - uses: ./.github/actions/foundry
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
@@ -281,9 +265,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.7.1
+      - uses: ./.github/actions/foundry
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache

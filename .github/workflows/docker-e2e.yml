@@ -50,12 +50,7 @@ jobs:
       # out to it to embed contract bytecode — `-p e2e --tests` builds the
       # deployer) and `anvil` for the L1-backed deposit round-trip. Without
       # anvil that test skips itself and passes vacuously.
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          # Pin a concrete version: `stable`/`latest` make foundryup hit the
-          # GitHub releases API, which 403s under the unauthenticated per-IP
-          # rate limit on Actions runners. A concrete tag downloads directly.
-          version: v1.7.1
+      - uses: ./.github/actions/foundry
       # forge build downloads the pinned solc on a cold host; the cache
       # keeps that download off binaries.soliditylang.org.
       - uses: ./.github/actions/solc-cache
