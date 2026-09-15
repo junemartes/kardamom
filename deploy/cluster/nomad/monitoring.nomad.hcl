@@ -87,7 +87,7 @@ locals {
   dashboards = [
     "kardamom-overview", "kardamom-ingress", "kardamom-sequencer",
     "kardamom-executor", "kardamom-sealer", "kardamom-batcher", "kardamom-da-watcher",
-    "kardamom-validator",
+    "kardamom-validator", "kardamom-state-mirror",
   ]
 }
 
