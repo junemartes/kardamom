@@ -39,6 +39,7 @@ impl Shard {
                 "graceful-executor",
                 "hard-executor",
                 "node-failure-executor",
+                "node-replace-executor",
                 "state-checkpoint-restore",
                 "replay-window-resync",
             ],
@@ -63,6 +64,7 @@ impl Shard {
                 "cluster-leader-kill",
                 "cluster-follower-kill",
                 "cluster-member-rejoin",
+                "node-replace-sealer",
                 "cluster-quorum-loss-recover",
                 "cpu-squeeze",
             ],
@@ -137,7 +139,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 29);
+        assert_eq!(all.len(), 31);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")

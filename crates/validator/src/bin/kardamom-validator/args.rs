@@ -110,7 +110,7 @@ pub(crate) struct Args {
     pub(crate) archive_control_response_endpoint: Option<String>,
     /// This node's cluster-egress endpoint `ip:port`. Sets or overrides the
     /// `[cluster]` `egress_channel` as `aeron:udp?endpoint=<ip:port>`. The
-    /// Nomad job injects this per node as `${meta.node_ip}:<cluster_egress_port>`.
+    /// Nomad job injects this per node as `${meta.node_ip}:${NOMAD_HOST_PORT_egress}`.
     #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
     pub(crate) cluster_egress_endpoint: Option<String>,
     /// Address for the Prometheus /metrics HTTP listener. Port 9007, since

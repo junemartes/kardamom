@@ -24,8 +24,13 @@ pub struct Node {
     pub tier: String,
     pub index: u32,
     pub control_plane: bool,
-    /// The address Docker assigned on the cluster network.
+    /// The address the root assigned on the cluster network.
     pub ip: Ipv4Addr,
+    /// The replacement generation: 0 for the node as first created, one
+    /// more for each replacement through the root (a new address, empty
+    /// volumes). Absent in a contract written before the field existed.
+    #[serde(default)]
+    pub generation: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

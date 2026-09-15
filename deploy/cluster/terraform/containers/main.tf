@@ -36,6 +36,10 @@ locals {
   # root is the one place that assigns addresses; everything else reads
   # the node contract or resolves a name.
   names = sort(keys(local.nodes))
+  # A node's replacement generation moves its address past every
+  # generation-0 address, and renames its volumes.
+  generation = { for name in local.names : name => lookup(var.node_generation, name, 0) }
+  address    = { for name in local.names : name => cidrhost(var.subnet, var.address_offset + index(local.names, name) + local.generation[name] * length(local.names)) }
 
   volumes = toset(["docker", "containerd"])
   ready   = "s=$(systemctl is-system-running); [ \"$s\" = running ] || [ \"$s\" = degraded ]"
@@ -87,7 +91,9 @@ resource "docker_image" "node" {
 resource "docker_volume" "node" {
   for_each = { for pair in setproduct(keys(local.nodes), local.volumes) : "${pair[0]}-${pair[1]}" => pair }
 
-  name = "kardamom-${each.key}"
+  # A generation above 0 names a fresh volume, so a replaced node starts
+  # with empty disks.
+  name = local.generation[each.value[0]] == 0 ? "kardamom-${each.key}" : "kardamom-${each.key}-g${local.generation[each.value[0]]}"
 
   labels {
     label = var.label
@@ -129,7 +135,7 @@ resource "docker_container" "node" {
 
   networks_advanced {
     name         = docker_network.this.name
-    ipv4_address = cidrhost(var.subnet, var.address_offset + index(local.names, each.key))
+    ipv4_address = local.address[each.key]
   }
 
   labels {
