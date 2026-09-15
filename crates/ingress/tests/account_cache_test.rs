@@ -126,9 +126,12 @@ async fn an_unfunded_sender_is_rejected_and_a_funded_one_admitted() {
 
 #[tokio::test]
 async fn an_expired_entry_admits() {
+    // The TTL must outlast the first submit, which recovers a signature
+    // and runs admission. A loaded CI runner took more than 20ms for
+    // that, and the entry expired before the check it was meant to fail.
     let live = LiveAccountsConfig {
         capacity: NonZeroUsize::new(16).unwrap(),
-        ttl_ms: NonZeroU64::new(20).unwrap(),
+        ttl_ms: NonZeroU64::new(1_000).unwrap(),
     };
     let f = Fixture::with(IngressConfig::default(), &live);
     let (p, mock) = (&f.proxy, &f.mock);
@@ -144,7 +147,7 @@ async fn an_expired_entry_admits() {
         matches!(err, IngressError::InsufficientFunds { .. }),
         "{err:?}"
     );
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
     p.submit_raw_async(IP, sign_legacy(&signer, 3))
         .await
         .expect("past the TTL the entry proves nothing");
