@@ -86,3 +86,21 @@ jobs:
             -p kardamom-log \
             --features 'docker-e2e' \
             --test aeron_live_e2e -- --ignored --nocapture
+
+      # The account cache against a real Redis container: the monotone
+      # write rule, the account and receipt reads, and the mirror heads.
+      - name: kardamom-cache redis round trips
+        run: |
+          cargo test \
+            -p kardamom-cache \
+            --features 'docker-e2e' \
+            --test redis_e2e -- --ignored --nocapture
+
+      # The ingress admission checks and the receipt index with the Redis
+      # layer on: the case of an ingress that just restarted.
+      - name: kardamom-ingress admission over redis
+        run: |
+          cargo test \
+            -p kardamom-ingress \
+            --features 'docker-e2e,test-support' \
+            --test account_cache_redis_test -- --ignored --nocapture

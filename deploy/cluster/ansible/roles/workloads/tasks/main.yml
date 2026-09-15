@@ -37,8 +37,12 @@
         cluster_snapshot_interval_s: "{{ workloads_cluster_snapshot_s }}"
         cluster_remote_origins: "{{ workloads_remote_origins }}"
     - {name: sequencer, wait: false}
+    # The cache before its readers and its writer: the ingress reads it,
+    # the state mirror writes it.
+    - {name: redis}
     - {name: ingress}
     - {name: executor, wait: false}
+    - {name: state-mirror, wait: false}
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
@@ -87,7 +91,7 @@
 
 - name: Wait for pipeline followers
   ansible.builtin.include_tasks: wait.yml
-  loop: [sequencer, executor, validator, da-watcher, monitoring]
+  loop: [sequencer, executor, state-mirror, validator, da-watcher, monitoring]
   loop_control:
     loop_var: workloads_wait_job
   when: not ansible_check_mode

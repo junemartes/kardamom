@@ -5,6 +5,7 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use kardamom_cache::{CacheConfig, ExecutorQueryConfig, LiveAccountsConfig};
 use kardamom_types::AckPolicy;
 
 /// Static configuration for an `IngressProxy` instance.
@@ -68,6 +69,28 @@ pub struct IngressConfig {
     /// pins its connection and its sender's later nonces. A depth of 0
     /// sheds everything, as a test hook.
     pub pending_shed_depth: usize,
+    /// The local account layer: the accounts the `tx_receipts` batch rows
+    /// touched, kept for the TTL. Feeds the admission checks and the two
+    /// account RPCs. See `kardamom_cache::LiveAccounts`.
+    pub live_accounts: LiveAccountsConfig,
+    /// Whether the submit path rejects an unfunded sender from the local
+    /// layer. Off, every submit publishes as before the layer existed.
+    /// The reads for the RPCs stay on.
+    pub admission_checks: bool,
+    /// The executor query, the read layer behind the local one for the
+    /// two account RPCs. Off when the endpoint list is empty: a cold
+    /// address then gets an error, not an answer.
+    pub executor_query: ExecutorQueryConfig,
+    /// The Redis layer, between the local layer and the executor query.
+    /// Off when no address is configured: no Redis call exists on any
+    /// path. On, the submit path reads the account projection on a
+    /// local miss and the receipt index on a past nonce, and the RPCs
+    /// read the projection before the executor query.
+    pub cache: CacheConfig,
+    /// The number of mirror heads the Redis reader polls: the mirror ids
+    /// are the executor indexes, so this is the executor count. Read
+    /// only with `cache` on.
+    pub mirror_count: NonZeroU32,
 }
 
 impl IngressConfig {
@@ -108,6 +131,11 @@ impl Default for IngressConfig {
             ack_policy: AckPolicy::default(),
             rpc_max_connections: 8192,
             pending_shed_depth: 16_384,
+            live_accounts: LiveAccountsConfig::default(),
+            admission_checks: true,
+            executor_query: ExecutorQueryConfig::default(),
+            cache: CacheConfig::default(),
+            mirror_count: nonzero!(1u32),
         }
     }
 }
@@ -122,6 +150,8 @@ pub struct IngressFileConfig {
     /// Aeron Cluster (Raft) sealer client config. The on-quorum ack gate
     /// derives its durable watermark from this cluster's egress progress.
     pub cluster: ClusterConfig,
+    /// The `[cache]` section: the Redis layer. Absent means off.
+    pub cache: CacheConfig,
 }
 
 // The `[cluster]` TOML section has one definition. It mirrors the
