@@ -382,21 +382,21 @@ pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
         .iter()
         .map(|e| e.container.clone())
         .collect();
-    for node in &nodes[1..] {
+    let mut mirrors = Vec::with_capacity(nodes.len());
+    for node in &nodes {
         if let Some(cid) = h.nodes.inner_cid(node, "state-mirror").await {
-            h.nodes.inner_kill(node, &cid).await?;
+            mirrors.push((node.clone(), cid));
         }
     }
+    let flushed = freeze_and_flush(h, ctx, &mirrors).await;
+    for (node, cid) in mirrors.iter().filter(|(node, _)| *node != nodes[0]) {
+        h.nodes.inner_kill(node, cid).await?;
+    }
     h.inject_hard(&[&nodes[0]], "state-mirror").await?;
-    let master = sentinel_master(h).await?;
-    h.nodes
-        .exec(
-            &aux(h),
-            &redis_cli(&format!("-h {master} -p 6379 FLUSHALL")),
-        )
-        .await
-        .map_err(|e| crate::chaos_fail!("{ctx}: FLUSHALL on {master} failed: {e}"))?;
-    crate::log(format!("{ctx}: mirrors killed and {master} flushed"));
+    let master = flushed?;
+    crate::log(format!(
+        "{ctx}: mirrors frozen, {master} flushed, mirrors killed"
+    ));
     h.assert_count("state-mirror", MIRROR_ALLOCS, h.knobs.restart_slo)
         .await?;
     let hs: &Harness = h;
@@ -414,6 +414,36 @@ pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
     assert_chaos_account_projected(h, ctx, &master).await?;
     wait_readers_recovered(h, ctx).await?;
     h.assert_progress().await
+}
+
+/// Freeze every mirror with SIGSTOP, then flush the primary. A frozen
+/// mirror writes nothing, and Nomad does not restart it. Thus Redis
+/// stays cold until the kill that follows. A kill before the flush
+/// races it: Nomad restarts a mirror after 5 s, and a mirror that starts
+/// before the flush finds the live heads and resumes with no rebuild.
+/// Returns the flushed primary.
+async fn freeze_and_flush(
+    h: &Harness,
+    ctx: &str,
+    mirrors: &[(String, String)],
+) -> anyhow::Result<String> {
+    for (node, cid) in mirrors {
+        h.nodes
+            .inner_signal(node, cid, crate::nodes::Signal::Stop)
+            .await
+            .map_err(|e| {
+                crate::chaos_fail!("{ctx}: SIGSTOP of the mirror on {node} failed: {e}")
+            })?;
+    }
+    let master = sentinel_master(h).await?;
+    h.nodes
+        .exec(
+            &aux(h),
+            &redis_cli(&format!("-h {master} -p 6379 FLUSHALL")),
+        )
+        .await
+        .map_err(|e| crate::chaos_fail!("{ctx}: FLUSHALL on {master} failed: {e}"))?;
+    Ok(master)
 }
 
 /// The first chaos account has a projected row: the rebuild scanned
