@@ -63,6 +63,21 @@ impl Harness {
         })
     }
 
+    /// Follow a new node contract: the probes and the RPC URL read the
+    /// addresses again. The Nomad client keeps its address, since the
+    /// control node is never replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the contract lacks a node the probes need.
+    pub fn follow(&mut self, contract: NodeContract) -> anyhow::Result<()> {
+        self.probes = Probes::new(&contract)?;
+        let ingress0 = contract.node("ingress-0")?;
+        self.rpc_url = format!("http://{}:{INGRESS_RPC_PORT}", ingress0.ip);
+        self.contract = contract;
+        Ok(())
+    }
+
     /// The host container name of a node, `kardamom-<name>`.
     ///
     /// # Errors

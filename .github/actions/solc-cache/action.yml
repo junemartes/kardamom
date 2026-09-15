@@ -1,0 +1,14 @@
+---
+name: solc-cache
+description: >-
+  Restore forge's solc cache (~/.svm). The deployer crate's build script
+  runs forge build, which downloads the pinned solc from
+  binaries.soliditylang.org; with the cache, a reset connection there
+  does not fail a job.
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@v4
+      with:
+        path: ~/.svm
+        key: solc-${{ runner.os }}-${{ hashFiles('contracts/foundry.toml') }}

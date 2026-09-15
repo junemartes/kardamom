@@ -99,48 +99,30 @@ pub fn reconstruct_state(
 /// itself, with that feature enabled.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
-    use alloy_consensus::{SignableTransaction, TxLegacy};
-    use alloy_eips::eip2718::Encodable2718;
-    use alloy_network::TxSignerSync;
-    use alloy_primitives::{Address, TxKind, U256, keccak256};
+    use alloy_primitives::{Address, U256, keccak256};
     use alloy_signer_local::PrivateKeySigner;
-    use bytes::Bytes;
     use kardamom_batcher::batch::{ClosedBlock, RecordedTx};
     use kardamom_engine::{ReplayBlock, ReplayOutcome, replay_blocks};
     use kardamom_state::{Durability, StateEnvBuilder};
+    use kardamom_test_support::LegacyTx;
     use kardamom_types::{AccountChange, BPosition, CodeEntry, TxEnvelope};
 
     /// The dev/test L2 chain id every reconstruction fixture below uses.
     pub const CHAIN_ID: u64 = 412_346;
 
     /// A signed legacy transfer from `signer` to `to`, on [`CHAIN_ID`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if signing fails. `signer` is always a freshly generated
-    /// in-process key in every caller, so this never happens in
-    /// practice.
+    /// The `correlation_id` is the nonce.
     #[must_use]
     pub fn transfer(signer: &PrivateKeySigner, to: Address, nonce: u64, value: u64) -> TxEnvelope {
-        let mut tx = TxLegacy {
-            chain_id: Some(CHAIN_ID),
+        LegacyTx {
+            chain_id: CHAIN_ID,
+            to,
             nonce,
-            gas_price: 0,
-            gas_limit: 21_000,
-            to: TxKind::Call(to),
-            value: U256::from(value),
-            input: alloy_primitives::Bytes::new(),
-        };
-        let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-        let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
-        let raw_tx = Bytes::from(alloy_env.encoded_2718());
-        let tx_hash = keccak256(&raw_tx);
-        TxEnvelope {
+            value,
             correlation_id: nonce,
-            raw_tx,
-            sender: signer.address(),
-            tx_hash,
+            ..Default::default()
         }
+        .sign(signer)
     }
 
     /// A funded EOA genesis: one account with a large starting balance
