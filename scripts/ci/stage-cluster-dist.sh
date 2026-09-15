@@ -13,10 +13,10 @@ set -euo pipefail
 dist=${1:?dist dir}
 rel=target/release
 mkdir -p "$dist/$rel/build" "$dist/cluster/sealer-service/service/build/libs"
-# The services the images wrap, the settlement deployer and the semantics
-# runner the stages spawn, the operator binary, and the archive tool the
-# archive-corruption case runs on the host.
-for bin in ingress sequencer executor validator da-watcher batcher reconstruct deploy semantics cluster archive-rereplicate; do
+# The services the images wrap (the state mirror included), the settlement
+# deployer and the semantics runner the stages spawn, the operator binary,
+# and the archive tool the archive-corruption case runs on the host.
+for bin in ingress sequencer executor validator da-watcher batcher state-mirror reconstruct deploy semantics cluster archive-rereplicate; do
   cp "$rel/kardamom-$bin" "$dist/$rel/"
 done
 # The shard test executable carries a build hash; the newest one is this build's.
