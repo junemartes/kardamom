@@ -65,6 +65,10 @@ struct Args {
     /// skipped.
     #[arg(long)]
     ingress_metrics: Option<SocketAddr>,
+    /// The executor's account query address. Defaults to the chosen
+    /// executor's host on the deploy's query port (9024).
+    #[arg(long)]
+    executor_query: Option<SocketAddr>,
     /// The ingress's `--pending-receipt-timeout-ms` value. The nonce-gap
     /// case derives its latency limits from this value. It must match the
     /// deployment (30 s unless the job sets another value).
@@ -94,6 +98,10 @@ struct Args {
     #[arg(long)]
     settlement: Option<alloy_primitives::Address>,
 }
+
+/// The executor's account query port in the deploy
+/// (`ports.executor_nonce_query` in `group_vars/all.yml`).
+const EXECUTOR_QUERY_PORT: u16 = 9024;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
@@ -132,6 +140,9 @@ async fn main() -> Result<()> {
         // struct stays valid. The cases that read ingress metrics are
         // skipped below.
         ingress_metrics: args.ingress_metrics.unwrap_or(executor),
+        executor_query: args
+            .executor_query
+            .unwrap_or_else(|| SocketAddr::new(executor.ip(), EXECUTOR_QUERY_PORT)),
         executor_metrics: executor,
         sequencer_metrics: args.sequencer_metrics.clone(),
         validator_metrics: args.validator_metrics,

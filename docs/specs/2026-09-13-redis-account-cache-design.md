@@ -399,30 +399,48 @@ Add `eth_getBalance` next to `eth_getTransactionCount`, same wire shape, plus an
 
 ### 9.2 Chain semantics (`s17`)
 
-The ids `s14`, `s15` and `s16` were taken when PR 4 landed, so the scenarios are `s17`.
+The ids `s14`, `s15` and `s16` were taken when PR 4 landed, so the scenarios are `s17`. The
+local stack runs no Redis, so every scenario has a discriminator beyond "the submit landed":
+the ingress's `kardamom_cache_lookups_total` tells a served read from an admit-by-default,
+and the executor's own query tells a correct count from a plausible one.
 
-- `s17a_nonce_floor_cache_matches_executor_count`: the cached nonce equals or lags the
-  executor, never leads.
-- `s17b_resubmit_of_landed_still_returns_the_receipt`.
-- `s17c_cold_cache_admits_everything`.
-- `s17d_deposit_funded_sender_is_admitted_within_max_stale_txs`.
-- `s17e_forged_receipt_row_halts_the_validator`.
-- `s17f_get_balance_and_nonce_answer_or_degrade_promptly`.
-- `s17g_recipient_can_spend_within_one_batch`: A pays B, B submits at once, B is admitted
-  before the block boundary.
+- `s17a_ingress_count_matches_the_executor_and_a_retry_answers`: after three transfers the
+  ingress serves the count as a live hit, the executor's query agrees once the block
+  commits, a retry of the first transfer answers its hash (the S5 contract), and a
+  different transaction at a landed nonce is `-32602`.
+- `s17c_cold_ingress_admits_on_a_local_miss`: a restarted ingress admits the sender's next
+  nonce and counts the miss.
+- `s17e_validator_verifies_the_batch_rows`: the validator's `validator_rows_verified_total`
+  rises under traffic. The negative case, a forged row that halts, is unit coverage in
+  `kardamom_validator::seams`: the receipt cross-check runs first, so an injected frame
+  cannot reach the row check with a byte-identical receipt.
+- `s17g_recipient_spends_within_one_batch`: A pays a fresh B; on A's receipt the ingress
+  serves B's balance as a live hit, and B spends it at once.
+- Folded or dropped: `s17b` is the retry step of `s17a`; `s17d` (a deposit-funded sender)
+  adds the L1 bridge harness for no new property, since a deposit's rows reach the layer
+  like any other batch's; `s17f` (the RPCs answer promptly) is S5 and the RPC vectors since
+  PR 4.
 
 ### 9.3 Chaos (`chaos-cache` shard)
 
-- `redis-primary-kill`: Sentinel promotes; progress holds; `degraded_total` rises during the
-  election only.
-- `redis-freeze`: readers time out and admit; they recover on thaw.
-- `partition-ingress-redis`: the ingress admits with `outcome="timeout"`; the pipeline is
-  unaffected.
-- `mirror-kill-rebuild`: the restarted mirror rebuilds; the head catches up within the SLO.
-- `failover-head-regression`: a lagging replica is promoted; the mirror detects the regression
-  and rebuilds.
-- `lookup-blackout` extended: the sequencer still advances floors with every executor RPC
-  dark.
+Every case drives the reader counters with a cold-address `eth_getBalance` through the
+ingress: a local miss, so the read touches Redis. The pipeline must progress throughout.
+
+- `redis-partition-ingress`: `iptables DROP` of ingress-0's packets to Redis and the
+  sentinels. Its reads count `degraded_total`, its submits land, and it uses Redis again
+  when the rule is removed.
+- `redis-primary-kill`: `docker kill` of the primary. Nomad restarts it empty, or the
+  sentinels promote the replica first; either way the readers degrade, then recover, and
+  the mirror head advances.
+- `redis-primary-freeze`: SIGSTOP of the primary for 20 s, past the sentinels' 5 s
+  down-after. The readers degrade, the sentinels promote the replica, and after the thaw
+  the readers and the mirror use the promoted primary.
+- `mirror-kill-rebuild`: the three mirrors killed and the primary flushed. The restarted
+  mirrors find Redis cold and rebuild from the executors' newest checkpoint: the rebuild
+  counter rises, the head advances, and a genesis account no live batch touched has a row.
+- Deferred: `failover-head-regression` depends on replication lag at the moment of a
+  promotion, which this harness cannot arrange deterministically. The mirror's regression
+  rebuild is covered by its unit tests.
 
 ## 10. Implementation plan (stacked PRs)
 
@@ -546,6 +564,13 @@ Deviations from the design above, recorded as they land.
   files), the network is isolated, and a poisoned entry fails closed to `Duplicate` or to an
   admit. `requirepass`, `masterauth`, and the sentinel `auth-pass` land together with a
   secrets path, as one change to the image, the job, and the two reader configs.
+- **PR 6 (`chaos-cache` shard).** The cases are those of 9.3. The freeze case exposed a
+  gap in the reader: a frozen primary accepts a TCP connection and never answers the
+  handshake, so an unbounded reconnect waited for the thaw and never followed the
+  promotion. One connection attempt is now bounded by ten command timeouts. The reader
+  counters of the ingress (`kardamom_cache_degraded_total`, `kardamom_cache_lookups_total`)
+  and the mirror's head and rebuild counters (port 9007 on the executor nodes) are the
+  case observables.
 
 ## 12. Open questions
 

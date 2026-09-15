@@ -106,7 +106,7 @@ make shard SHARD=chaos-executor   # one shard end to end, the way CI runs it
 
 The gates are the `kardamom-chaos` crate: one `#[ignore]` test per shard in
 `crates/chaos/tests/shards.rs` (`load`, `semantics`, `chaos-executor`,
-`chaos-ingress`, `chaos-sequencer`, `chaos-cluster`, `chaos-retention`). A
+`chaos-ingress`, `chaos-sequencer`, `chaos-cluster`, `chaos-retention`, `chaos-cache`). A
 shard test brings the cluster up itself; `container-test` runs it with
 `KARDAMOM_CHAOS_REUSE=1` against the cluster `container-up` made.
 `KARDAMOM_CHAOS_CASES="graceful-executor"` narrows a chaos shard to some
