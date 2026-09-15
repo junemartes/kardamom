@@ -60,6 +60,7 @@
     - "{{ paths.archive_dir }}"
     - "{{ paths.state_dir }}"
     - "{{ paths.checkpoints_dir }}"
+    - "{{ paths.mirror_dir }}"
     - "{{ paths.batcher_dir }}"
     - "{{ paths.config_dir }}"
 
