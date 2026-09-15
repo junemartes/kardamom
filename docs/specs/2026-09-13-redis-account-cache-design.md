@@ -131,29 +131,33 @@ sites that touch the batch frame.
 ```rust
 pub struct AccountRow { pub address: Address, pub nonce: u64, pub balance: U256 }
 
+/// One transaction's receipt with the rows its write set produced.
+/// The exec thread builds one per transaction.
+pub struct ReceiptRows { pub receipt: Receipt, pub accounts: Vec<AccountRow> }
+
 pub struct ReceiptBatch {
     pub receipts: Vec<Receipt>,
     /// Merged post-batch value of every account the batch touched,
     /// in address order. Last write wins in transaction order.
     pub accounts: Vec<AccountRow>,
-    /// The position of the last receipt in the batch.
-    pub end_tx_idx: BPosition,
 }
+// The end position is the last receipt's `tx_idx` (`end_tx_idx()`).
+// A batch with no receipts is never published.
 ```
 
-**Data flow.** The exec thread sends `ExecToCommit::Receipt(receipt, rows)`, where `rows`
-are the write set's account entries (`crates/engine/src/actor/exec_records.rs`,
-`exec_boundary.rs`). The commit thread merges rows into a `BTreeMap<Address, AccountRow>`
-while it collects the batch (`collect_batch`). A skip receipt adds no rows. A deposit adds the
-funded account's row. The batching policy does not change: adaptive, no timer,
-`RECEIPT_BATCH_MAX = 64`. The must-deliver retry resumes at the unpublished suffix as today.
-A suffix frame carries the full batch's merged rows and the same `end_tx_idx`. A reader that
-already applied them sees `==` and discards. The monotone rule absorbs the retry.
+**Data flow.** The exec thread sends `ExecToCommit::Receipt(ReceiptRows)`, with the rows of
+the transaction's own write set (`crates/engine/src/actor/exec_records.rs`). The commit thread
+batches these items as today. The executor's live publisher merges the items' rows into the
+frame at the wire edge (`ReceiptBatch::merge`), so the validator's sink still sees per-tx
+rows. A skip receipt adds no rows. A deposit adds the funded account's row. The batching
+policy does not change: adaptive, no timer, `RECEIPT_BATCH_MAX = 64`. The live publisher is
+all-or-nothing: a retry republishes the whole batch with its rows, and a reader that already
+applied them sees `==` and discards.
 
-**Subscriber.** The handle materializes the batch, hands `(accounts, end_tx_idx)` to a batch
-hook, then fans the receipts out as today. Sites: `crates/ingress/src/aeron_adapters.rs`,
-`crates/sequencer/src/bin/kardamom-sequencer/feeds.rs`, the validator pump,
-`crates/e2e/src/harness/shutdown.rs`, and the two `docker_e2e.rs` tests.
+**Subscriber.** The receiver keeps its per-receipt `recv`, which fans a frame out and drops
+the rows, so the ingress and the sequencer compile unchanged. A consumer that wants the rows
+(the validator pump, later the mirror and the readers' local layer) calls `recv_batch` and
+gets the whole frame. A receiver must use one of the two, never both.
 
 **Validator.** The pump buffers each frame's rows until the validator has executed through
 `end_tx_idx`, then checks each row against its own post-state at that position
@@ -427,7 +431,40 @@ Add `eth_getBalance` next to `eth_getTransactionCount`, same wire shape, plus an
 | 5 | `chaos-cache` shard, `s14e..s14g` | shard green |
 | 6 | flag day | `chaos-cache` green with the flag on |
 
-## 11. Open questions
+## 11. Implementation notes
+
+Deviations from the design above, recorded as they land.
+
+- **PR 2a (batch rows).** The frame is `ReceiptBatch { receipts, accounts }`. The end
+  position is the last receipt's `tx_idx`, not a field: a batch with no receipts is never
+  published. The merge of per-tx rows into the frame happens at the wire edge, in the
+  executor's live publisher, not in the commit thread. The commit thread carries
+  `ReceiptRows` (one receipt with its own rows) so the validator's sink sees per-tx rows.
+- **Parallel execution.** The Block-STM path has no per-tx write sets. It attaches the
+  block's merged rows to the block's last receipt and none to the others, so a row is never
+  tagged with a position before the writes it carries. Between boundaries, the readers see
+  no rows for such a block.
+- **Retry.** The live publisher is all-or-nothing. A retry republishes the whole batch with
+  its rows. The suffix resume exists only in the per-item default path and in tests.
+- **Validator row check, coverage.** The sink compares a published batch's rows against its
+  latest local values at the moment it processes the local receipt at the batch's end. It
+  checks only when that local receipt carries rows (under parallel validation, only a
+  block's last receipt does). A row for an account with no recorded local value is
+  unverified, counted, not a divergence. Rows whose frame arrives after the sink passed the
+  end position are dropped at insert and counted as unverified. Two counters report the
+  coverage: `validator_rows_verified_total` and `validator_rows_unverified_total`. Under
+  parallel validation nearly every mid-block batch counts as unverified by construction, so
+  a high unverified rate on a parallel validator is expected, not a fault. A history-based
+  check for late frames is a follow-up.
+- **Deploy constraint.** An old ingress or sequencer cannot decode the new frame, and its
+  parked clients would hang. The executors and every `tx_receipts` consumer roll together.
+  The Ansible full redeploy does this; a partial rollout must not split them.
+- **Bandwidth.** Not yet measured. The load shard run of PR 2a records the number here.
+- **Not covered by rows.** Block-close writes without a receipt (the health beacon, system
+  upgrades) produce no rows. Those predeploy accounts stay stale in the projection until a
+  rebuild. None is a sender, so admission is unaffected.
+
+## 12. Open questions
 
 - Producer attribution on `tx_receipts` (Aeron `session_id`) to turn "first row wins" into
   "two of three agree".

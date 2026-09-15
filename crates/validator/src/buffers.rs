@@ -27,7 +27,7 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use kardamom_types::{BPosition, BlockDelta, Receipt};
+use kardamom_types::{AccountRow, BPosition, BlockDelta, Receipt};
 
 /// Key of a verification buffer. It maps to the increasing index (block
 /// number or canonical record index) that the catch-up and pruning logic
@@ -92,10 +92,14 @@ impl<K: BufKey, V> KeyedBuffer<K, V> {
         }
     }
 
-    fn insert(&self, key: K, value: V) {
-        if self.insert_locked(key, value) {
+    /// Insert `value` under `key`. Returns whether the buffer took it: a
+    /// late arrival below the consumer's cursor is dropped.
+    fn insert(&self, key: K, value: V) -> bool {
+        let taken = self.insert_locked(key, value);
+        if taken {
             self.cv.notify_all();
         }
+        taken
     }
 
     /// Insert `value` under the lock, and release the lock when this
@@ -261,12 +265,19 @@ impl BalBuffer {
 /// `tx_receipts` subscriber task fills it; the commit thread drains it.
 pub struct ReceiptBuffer {
     core: KeyedBuffer<BPosition, Receipt>,
+    /// Published account rows, keyed by their batch's end position. Only a
+    /// batch end carries rows, so most positions have no entry. The rows
+    /// travel in the frame that carried the end receipt, so they are
+    /// present whenever that receipt is, and the commit thread takes them
+    /// with no wait.
+    rows: KeyedBuffer<BPosition, Vec<AccountRow>>,
 }
 
 impl Default for ReceiptBuffer {
     fn default() -> Self {
         Self {
             core: KeyedBuffer::new(Self::MAX_BUFFERED, Self::BACKLOG_LOOKBEHIND),
+            rows: KeyedBuffer::new(Self::MAX_BUFFERED, Self::BACKLOG_LOOKBEHIND),
         }
     }
 }
@@ -300,6 +311,22 @@ impl ReceiptBuffer {
     /// catch-up skip.
     pub fn take(&self, idx: BPosition, timeout: Duration) -> Option<Receipt> {
         self.core.take(idx, timeout)
+    }
+
+    /// Record a published batch's account rows under its end position. A
+    /// frame that arrives after the commit thread passed that position is
+    /// dropped, and its rows count as unverified.
+    pub fn insert_rows(&self, end: BPosition, rows: Vec<AccountRow>) {
+        if !self.rows.insert(end, rows) {
+            crate::metrics::counter_rows_unverified();
+        }
+    }
+
+    /// The published rows of a batch that ends at `idx`, when a frame
+    /// ending there has arrived. No wait: a frame that arrives later is
+    /// dropped as a late arrival, and its rows stay unverified.
+    pub fn take_rows(&self, idx: BPosition) -> Option<Vec<AccountRow>> {
+        self.rows.take(idx, Duration::ZERO)
     }
 }
 
