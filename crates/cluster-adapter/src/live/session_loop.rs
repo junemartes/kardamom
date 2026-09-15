@@ -433,16 +433,26 @@ impl SessionLoop {
     /// move together with the publication, so a failed open keeps all three
     /// on the old leader.
     fn on_reconnect(&mut self, leader_member_id: i32, ingress_endpoints: String) {
-        if let Some(p) = open_leader_pub(
+        let Some(p) = open_leader_pub(
             &self.rt,
             &ingress_endpoints,
             leader_member_id,
             self.cfg.ingress_stream_id,
-        ) {
-            self.ingress = p;
-            self.endpoints = ingress_endpoints;
-            self.target_member = leader_member_id;
-        }
+        ) else {
+            tracing::warn!(
+                leader_member_id,
+                "cluster session: could not open ingress to the new leader; keeping the old target"
+            );
+            return;
+        };
+        tracing::info!(
+            leader_member_id,
+            previous_member = self.target_member,
+            "cluster session: ingress re-pointed at the leader"
+        );
+        self.ingress = p;
+        self.endpoints = ingress_endpoints;
+        self.target_member = leader_member_id;
     }
 
     /// Duty 1a: egress-liveness watchdog (every session, see
