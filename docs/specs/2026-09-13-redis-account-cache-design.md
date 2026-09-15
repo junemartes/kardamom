@@ -460,6 +460,19 @@ Deviations from the design above, recorded as they land.
   parked clients would hang. The executors and every `tx_receipts` consumer roll together.
   The Ansible full redeploy does this; a partial rollout must not split them.
 - **Bandwidth.** Not yet measured. The load shard run of PR 2a records the number here.
+- **PR 2b (`kardamom-cache`).** The watermark rule of 5.2 and 5.3 is not computable from
+  the receipt stream: positions are not dense (a receipt's `tx_idx` is a stream position,
+  not a count), and a marker consumes a slot with no receipt. The head is therefore the
+  highest applied batch end position, monotone. Staleness is the newest position a reader
+  has seen minus the head. A missed frame is bounded by the local TTL (30 s) and by the
+  daily rebuild in Redis, and with three producers a hole needs all three copies lost.
+  The position tag in Redis is a zero-padded 20-digit decimal, compared as a string in
+  Lua, because a position index can exceed 2^53 and a Lua number is a double. The
+  `[cache]` section has a direct `url` for tests and single-node development; sentinels
+  take precedence. Failover heals on the next command: the client re-asks the sentinels
+  and swaps the connection through an `ArcSwap`, no lock. The executor query gained
+  `eth_getBalance` and the `x-state-tx-idx` header; a request with no params is now
+  `-32602` for both methods.
 - **Not covered by rows.** Block-close writes without a receipt (the health beacon, system
   upgrades) produce no rows. Those predeploy accounts stay stale in the projection until a
   rebuild. None is a sender, so admission is unaffected.

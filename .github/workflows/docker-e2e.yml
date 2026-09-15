@@ -86,3 +86,12 @@ jobs:
             -p kardamom-log \
             --features 'docker-e2e' \
             --test aeron_live_e2e -- --ignored --nocapture
+
+      # The account cache against a real Redis container: the monotone
+      # write rule, the account and receipt reads, and the mirror heads.
+      - name: kardamom-cache redis round trips
+        run: |
+          cargo test \
+            -p kardamom-cache \
+            --features 'docker-e2e' \
+            --test redis_e2e -- --ignored --nocapture
