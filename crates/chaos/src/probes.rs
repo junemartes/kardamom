@@ -237,9 +237,13 @@ impl Probes {
         IngressCounts(counts)
     }
 
+    /// The submit counter of one ingress. An exporter that answers
+    /// without the counter reports zero: a counter exports only after
+    /// its first increment, and the load drives one ingress. `None`
+    /// means the scrape failed.
     async fn ingress_sum(&self, node: &Probed) -> Option<i64> {
         let body = self.scrape.fetch(&self.ingress_target(node)).await?;
-        metrics::sum(&body, INGRESS_RECEIVED_METRIC)
+        Some(metrics::sum(&body, INGRESS_RECEIVED_METRIC).unwrap_or(0))
     }
 
     /// One validator metric, first sample. `None` on a failed scrape.
@@ -379,9 +383,9 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_ingress_never_reads_as_a_stalled_load() {
+    fn an_unreachable_ingress_never_reads_as_a_stalled_load() {
         let base = counts(&[("ingress-0", Some(10)), ("ingress-1", Some(20))]);
-        // The second ingress answers nothing, so the sum drops to 11.
+        // The second ingress fails its scrape, so the sum drops to 11.
         // The first ingress still counts more than its own baseline.
         let now = counts(&[("ingress-0", Some(11)), ("ingress-1", None)]);
         assert_eq!(now.rose_over(&base), Some(11));
