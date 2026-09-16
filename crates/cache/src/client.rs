@@ -145,6 +145,31 @@ impl AccountCache {
         })
     }
 
+    /// Connect per `cfg`, and keep trying every `retry` while the
+    /// Redis layer names no primary. After a failover the sentinels can
+    /// disagree for minutes, and a process that exits then spends its
+    /// Nomad restart budget in seconds: three exits inside one minute
+    /// stop the task for 40 s. A caller that must have Redis waits
+    /// instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Disabled`] when no address is configured,
+    /// and [`CacheError::MissingPassword`] when the password variable
+    /// is named but unset. Both are configuration faults, so neither
+    /// retries.
+    pub async fn connect_waiting(cfg: &CacheConfig, retry: Duration) -> Result<Self, CacheError> {
+        loop {
+            let error = match Self::connect(cfg).await {
+                Ok(cache) => return Ok(cache),
+                Err(e @ (CacheError::Disabled | CacheError::MissingPassword(_))) => return Err(e),
+                Err(e) => e,
+            };
+            warn!(error = %error, "cache not reachable yet; waiting");
+            tokio::time::sleep(retry).await;
+        }
+    }
+
     fn source(cfg: &CacheConfig) -> Result<Source, CacheError> {
         let password = cfg.password()?;
         let auth = |info: RedisConnectionInfo| {
@@ -462,6 +487,31 @@ fn parse_view(fields: &HashMap<String, String>) -> Result<AccountView, CacheErro
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn an_unreachable_cache_waits_instead_of_failing() {
+        let cfg = CacheConfig {
+            url: Some("redis://127.0.0.1:1/".to_string()),
+            ..CacheConfig::default()
+        };
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            AccountCache::connect_waiting(&cfg, Duration::from_millis(20)),
+        )
+        .await;
+        assert!(waited.is_err(), "the connect must keep waiting");
+    }
+
+    #[tokio::test]
+    async fn a_cache_with_no_address_fails_at_once() {
+        let outcome =
+            AccountCache::connect_waiting(&CacheConfig::default(), Duration::from_secs(60)).await;
+        let Err(error) = outcome else {
+            panic!("a cache with no address must fail");
+        };
+        assert!(matches!(error, CacheError::Disabled), "got {error:?}");
+    }
+
     use super::*;
 
     #[test]

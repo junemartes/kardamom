@@ -22,6 +22,7 @@ mod rebuild;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -34,6 +35,12 @@ use kardamom_obs::bin::wait_for_shutdown;
 use head::HeadFile;
 use mirror::{Mirror, MirrorInputs};
 use rebuild::Rebuild;
+
+/// How long the mirror waits between connection attempts at start. The
+/// sentinels can name no primary for minutes after a failover, and an
+/// exit spends the Nomad restart budget: three exits inside one minute
+/// stop the task for 40 s.
+const CACHE_CONNECT_RETRY: Duration = Duration::from_secs(2);
 
 /// The TOML the binary reads through `--config`: the `[cache]` section.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -108,7 +115,7 @@ async fn main() -> Result<()> {
     if !file_cfg.cache.enabled() {
         bail!("[cache] names no Redis address; the mirror has nothing to write to");
     }
-    let cache = AccountCache::connect(&file_cfg.cache)
+    let cache = AccountCache::connect_waiting(&file_cfg.cache, CACHE_CONNECT_RETRY)
         .await
         .context("connect to Redis")?;
 
