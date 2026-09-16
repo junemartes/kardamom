@@ -382,7 +382,15 @@ async fn prepare_run(cfg: &LoadConfig) -> anyhow::Result<RunSetup> {
         "kardamom-load: pre-generating {} txs",
         per_sender.saturating_mul(signers.len())
     );
-    let built = cfg.build_queues(&signers, chain_id, per_sender)?;
+    // Signing is CPU work, seconds to minutes for a long window. Keep
+    // it off the async worker the caller's tasks share.
+    let built = tokio::task::spawn_blocking({
+        let cfg = cfg.clone();
+        let signers = signers.clone();
+        move || cfg.build_queues(&signers, chain_id, per_sender)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("join the pre-generation: {e}"))??;
     if let Some(deploys) = built.defi_deploys {
         defi::deploy_and_confirm(&client, &deploys).await?;
     }
@@ -402,108 +410,142 @@ async fn prepare_run(cfg: &LoadConfig) -> anyhow::Result<RunSetup> {
 /// failing verdict is not an error: this function returns `Ok(false)`
 /// so the caller can choose the exit code.
 pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
-    let RunSetup {
-        client,
-        signers,
-        mut queues,
-    } = prepare_run(&cfg).await?;
+    prepare(cfg).await?.run().await
+}
 
-    let scraper = build_scraper(&cfg);
-    let tracker = Arc::new(Tracker::new()?);
-    let sem = Arc::new(Semaphore::new(cfg.max_in_flight.get() as usize));
-    let handles = RunHandles {
-        client: Arc::clone(&client),
-        sem: Arc::clone(&sem),
-        tracker: Arc::clone(&tracker),
-    };
-    let mut tasks = tokio::task::JoinSet::new();
-    // Outside chaos mode, the ingress receipt cache is stable, with no
-    // restarts. So an accepted transaction whose receipt cannot be
-    // re-fetched is a real must-deliver violation, not restart noise.
-    // Verify it independently.
-    let verify_receipts = !cfg.chaos_mode;
-    let mode = cfg.submit_mode();
+/// A load whose submit queues are signed: it starts to submit as soon
+/// as [`Prepared::run`] is called. A caller that must know when the
+/// submissions start prepares first and runs second, because signing a
+/// long window costs minutes of CPU.
+///
+/// # Errors
+///
+/// Returns the same errors as [`run`], except the verdict.
+pub async fn prepare(cfg: LoadConfig) -> anyhow::Result<Prepared> {
+    let setup = prepare_run(&cfg).await?;
+    Ok(Prepared { cfg, setup })
+}
 
-    let run = LoadRun {
-        cfg: &cfg,
-        tracker: &tracker,
-        client: &client,
-        scraper: &scraper,
-    };
+/// The signed queues and their configuration. See [`prepare`].
+pub struct Prepared {
+    cfg: LoadConfig,
+    setup: RunSetup,
+}
 
-    let ReceiptFeed {
-        confirm: feed_confirm,
-        task: feed,
-    } = run.spawn_receipt_feed(&signers);
-    // Back up the feed with a live sweeper. An entry the feed misses is
-    // re-fetched within 2 to 7 seconds, instead of waiting for the
-    // end-of-run drain. Keep this cadence well inside the ingress receipt
-    // cache's query horizon (capacity divided by rate, about 27 seconds at
-    // 4,800 tx/s with the default 128k capacity). Eviction order is
-    // arbitrary, so a late poll can miss even a younger entry.
-    let sweeper = feed.as_ref().map(|_| {
-        Arc::new(engine::Drainer::new(
-            Arc::clone(&client),
-            Arc::clone(&tracker),
-        ))
-        .spawn_pending_sweeper(Duration::from_secs(5), Duration::from_secs(2))
-    });
+impl Prepared {
+    /// Run the prepared harness. Returns whether the verdict passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on a submission-loop failure or a report write.
+    pub async fn run(self) -> anyhow::Result<bool> {
+        let Self {
+            cfg,
+            setup:
+                RunSetup {
+                    client,
+                    signers,
+                    mut queues,
+                },
+        } = self;
 
-    // --- ramp (soak mode only) -------------------------------------------
-    let mut ramp = Vec::new();
-    let discovered_max: std::num::NonZeroU32 = if cfg.chaos_mode || cfg.fixed_rate {
-        cfg.target_tps
-    } else {
-        run.ramp_to_max(&handles, &mut tasks, &mut queues, &mut ramp)
-            .await
-    };
+        let scraper = build_scraper(&cfg);
+        let tracker = Arc::new(Tracker::new()?);
+        let sem = Arc::new(Semaphore::new(cfg.max_in_flight.get() as usize));
+        let handles = RunHandles {
+            client: Arc::clone(&client),
+            sem: Arc::clone(&sem),
+            tracker: Arc::clone(&tracker),
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        // Outside chaos mode, the ingress receipt cache is stable, with no
+        // restarts. So an accepted transaction whose receipt cannot be
+        // re-fetched is a real must-deliver violation, not restart noise.
+        // Verify it independently.
+        let verify_receipts = !cfg.chaos_mode;
+        let mode = cfg.submit_mode();
 
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "a discovered tx/s rate stays far under i64::MAX, rounded for the soak target"
-    )]
-    let soak_rate: std::num::NonZeroU32 = if cfg.chaos_mode || cfg.fixed_rate {
-        cfg.target_tps
-    } else {
-        let rate = ((f64::from(discovered_max.get()) * cfg.soak_fraction).round() as u32)
-            .clamp(1, cfg.target_tps.get());
-        std::num::NonZeroU32::new(rate)
-            .ok_or_else(|| anyhow::anyhow!("discovered soak rate rounds to zero"))?
-    };
+        let run = LoadRun {
+            cfg: &cfg,
+            tracker: &tracker,
+            client: &client,
+            scraper: &scraper,
+        };
 
-    // --- soak ------------------------------------------------------------
-    tracing::info!(
-        soak_rate = soak_rate.get(),
-        discovered_max = discovered_max.get(),
-        "kardamom-load: soaking"
-    );
-    let base = scraper.snapshot().await;
-    pacer(
-        &handles,
-        &mut tasks,
-        &mut queues,
-        soak_rate,
-        cfg.duration,
-        SubmitOpts {
-            retry: cfg.retry_submit,
-            verify_receipts,
-            mode,
-            feed_confirm,
-        },
-    )
-    .await;
+        let ReceiptFeed {
+            confirm: feed_confirm,
+            task: feed,
+        } = run.spawn_receipt_feed(&signers);
+        // Back up the feed with a live sweeper. An entry the feed misses is
+        // re-fetched within 2 to 7 seconds, instead of waiting for the
+        // end-of-run drain. Keep this cadence well inside the ingress receipt
+        // cache's query horizon (capacity divided by rate, about 27 seconds at
+        // 4,800 tx/s with the default 128k capacity). Eviction order is
+        // arbitrary, so a late poll can miss even a younger entry.
+        let sweeper = feed.as_ref().map(|_| {
+            Arc::new(engine::Drainer::new(
+                Arc::clone(&client),
+                Arc::clone(&tracker),
+            ))
+            .spawn_pending_sweeper(Duration::from_secs(5), Duration::from_secs(2))
+        });
 
-    let settled = run.settle_and_snapshot(&mut tasks, feed, sweeper).await;
+        // --- ramp (soak mode only) -------------------------------------------
+        let mut ramp = Vec::new();
+        let discovered_max: std::num::NonZeroU32 = if cfg.chaos_mode || cfg.fixed_rate {
+            cfg.target_tps
+        } else {
+            run.ramp_to_max(&handles, &mut tasks, &mut queues, &mut ramp)
+                .await
+        };
 
-    let verdict = run.build_verdict(&base, &settled.fin, settled.recheck.as_ref());
-    let report = run.build_report(verdict, ramp, discovered_max.get(), soak_rate.get());
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a discovered tx/s rate stays far under i64::MAX, rounded for the soak target"
+        )]
+        let soak_rate: std::num::NonZeroU32 = if cfg.chaos_mode || cfg.fixed_rate {
+            cfg.target_tps
+        } else {
+            let rate = ((f64::from(discovered_max.get()) * cfg.soak_fraction).round() as u32)
+                .clamp(1, cfg.target_tps.get());
+            std::num::NonZeroU32::new(rate)
+                .ok_or_else(|| anyhow::anyhow!("discovered soak rate rounds to zero"))?
+        };
 
-    print_report(&report);
-    run.write_report_json(&report)?;
+        // --- soak ------------------------------------------------------------
+        tracing::info!(
+            soak_rate = soak_rate.get(),
+            discovered_max = discovered_max.get(),
+            "kardamom-load: soaking"
+        );
+        let base = scraper.snapshot().await;
+        pacer(
+            &handles,
+            &mut tasks,
+            &mut queues,
+            soak_rate,
+            cfg.duration,
+            SubmitOpts {
+                retry: cfg.retry_submit,
+                verify_receipts,
+                mode,
+                feed_confirm,
+            },
+        )
+        .await;
 
-    Ok(report.verdict.pass)
+        let settled = run.settle_and_snapshot(&mut tasks, feed, sweeper).await;
+
+        let verdict = run.build_verdict(&base, &settled.fin, settled.recheck.as_ref());
+        let report = run.build_report(verdict, ramp, discovered_max.get(), soak_rate.get());
+
+        print_report(&report);
+        run.write_report_json(&report)?;
+
+        Ok(report.verdict.pass)
+    }
 }
 
 /// The state one ramp-to-max run needs across every step: the fixed
