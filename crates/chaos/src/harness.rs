@@ -195,7 +195,7 @@ impl Harness {
             Ok(load.is_ready().then_some(()))
         })
         .await?;
-        let (_, elapsed) = outcome.or_fail(|t| {
+        let ((), elapsed) = outcome.or_fail(|t| {
             crate::chaos_fail!(
                 "{}: the load is still signing its queues after {}s",
                 case.name(),
