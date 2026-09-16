@@ -435,9 +435,11 @@ ingress: a local miss, so the read touches Redis. The pipeline must progress thr
 - `redis-primary-freeze`: SIGSTOP of the primary for 20 s, past the sentinels' 5 s
   down-after. The readers degrade, the sentinels promote the replica, and after the thaw
   the readers and the mirror use the promoted primary.
-- `mirror-kill-rebuild`: the three mirrors killed and the primary flushed. The restarted
-  mirrors find Redis cold and rebuild from the executors' newest checkpoint: the rebuild
-  counter rises, the head advances, and a genesis account no live batch touched has a row.
+- `mirror-kill-rebuild`: the three mirrors frozen, the primary flushed, then the mirrors
+  killed. The freeze keeps a restarted mirror from starting before the flush. The restarted
+  mirrors find Redis cold and rebuild from the executors' newest checkpoint: the
+  `rebuild: done` log lines rise, the head advances, and a genesis account no live batch
+  touched has a row.
 - Deferred: `failover-head-regression` depends on replication lag at the moment of a
   promotion, which this harness cannot arrange deterministically. The mirror's regression
   rebuild is covered by its unit tests.
