@@ -354,6 +354,19 @@ inventory, the vSwitch inputs and an encrypted vault file with the secret
 inputs in `group_vars/production/vault.yml`, then run `ansible-playbook -i <copy> -u root ansible/bootstrap.yml`.
 `roles/profile` refuses a production run that lacks a security input.
 
+Set `consul_dns_token` in the encrypted production vault or in the elastic
+node's enrollment result. Consul 1.20 uses this as its default token for
+DNS and tokenless local HTTP queries. Give it only the following policy;
+the separate agent and Nomad tokens retain their registration permissions:
+
+```hcl
+service_prefix "" { policy = "read" }
+node_prefix "" { policy = "read" }
+```
+
+The token is required on every production agent. The local profile keeps
+ACLs disabled and requires no DNS token.
+
 An elastic Cloud node has no inventory entry. At first boot its bootstrap
 unit runs the same `bootstrap.yml` against the local host with the inputs
 cloud-init wrote. `roles/enroll` runs the enrollment client the image
