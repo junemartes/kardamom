@@ -14,6 +14,8 @@ pub const EXECUTOR_BLOCK_METRIC: &str = "kardamom_executor_block_number";
 pub const SEALER_BOUNDARIES_METRIC: &str = "kardamom_sealer_boundaries_emitted_total";
 pub const INGRESS_RECEIVED_METRIC: &str = "kardamom_ingress_tx_received_total";
 pub const EXECUTOR_PORT: u16 = 9004;
+/// The state mirror's exporter, on every executor node.
+pub const MIRROR_PORT: u16 = 9007;
 /// The ingress and the validator share this port on different nodes.
 pub const INGRESS_PORT: u16 = 9006;
 pub const VALIDATOR_PORT: u16 = 9006;
@@ -102,6 +104,24 @@ impl Probes {
     pub fn executor_target(&self, i: usize) -> Target {
         let e = &self.executors[i];
         Target::bridged(e.ip, &e.container, EXECUTOR_PORT)
+    }
+
+    /// The state mirror target on executor node `i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is not an executor index of this cluster.
+    #[must_use]
+    pub fn mirror_target(&self, i: usize) -> Target {
+        let e = &self.executors[i];
+        Target::bridged(e.ip, &e.container, MIRROR_PORT)
+    }
+
+    /// The first-sample value of `metric` on the mirror of executor
+    /// node `i`. `None` when the exporter does not answer.
+    pub async fn mirror_metric(&self, i: usize, metric: &str) -> Option<i64> {
+        let body = self.scrape.fetch(&self.mirror_target(i)).await?;
+        metrics::first(&body, metric)
     }
 
     /// The validator's loopback target.
@@ -205,16 +225,25 @@ impl Probes {
     /// The submit counter summed across the ingress pair: the "is load
     /// flowing" signal. `None` when no ingress answers.
     pub async fn ingress_received(&self) -> Option<i64> {
-        let mut total = None;
-        for node in &self.ingresses {
-            total = add_option(total, self.ingress_sum(node).await);
-        }
-        total
+        self.ingress_counts().await.total()
     }
 
+    /// The submit counter of each ingress, one entry per ingress.
+    pub async fn ingress_counts(&self) -> IngressCounts {
+        let mut counts = Vec::with_capacity(self.ingresses.len());
+        for node in &self.ingresses {
+            counts.push((node.container.clone(), self.ingress_sum(node).await));
+        }
+        IngressCounts(counts)
+    }
+
+    /// The submit counter of one ingress. An exporter that answers
+    /// without the counter reports zero: a counter exports only after
+    /// its first increment, and the load drives one ingress. `None`
+    /// means the scrape failed.
     async fn ingress_sum(&self, node: &Probed) -> Option<i64> {
         let body = self.scrape.fetch(&self.ingress_target(node)).await?;
-        metrics::sum(&body, INGRESS_RECEIVED_METRIC)
+        Some(metrics::sum(&body, INGRESS_RECEIVED_METRIC).unwrap_or(0))
     }
 
     /// One validator metric, first sample. `None` on a failed scrape.
@@ -270,6 +299,52 @@ impl Probes {
     }
 }
 
+/// The submit counters of the ingresses, one entry per ingress. A
+/// `None` value is an ingress that did not answer the scrape.
+///
+/// The injection gate compares the parts, not only the sum: a sum that
+/// skips a silent ingress falls below its own baseline. That reads as a
+/// stalled load, even while the other ingress accepts traffic.
+#[derive(Debug, Clone, Default)]
+pub struct IngressCounts(Vec<(String, Option<i64>)>);
+
+impl IngressCounts {
+    /// The total across the ingresses that answered. `None` when none
+    /// answered.
+    #[must_use]
+    pub fn total(&self) -> Option<i64> {
+        self.0
+            .iter()
+            .fold(None, |total, (_, v)| add_option(total, *v))
+    }
+
+    /// The new total, when one ingress counts more submissions than the
+    /// same ingress did in `base`. `None` while every ingress that
+    /// answers is at or below its own baseline.
+    #[must_use]
+    pub fn rose_over(&self, base: &Self) -> Option<i64> {
+        let rose = self
+            .0
+            .iter()
+            .any(|(node, now)| base.of(node).zip(*now).is_some_and(|(b, n)| n > b));
+        rose.then(|| self.total()).flatten()
+    }
+
+    /// The counters as a log line. A `?` marks a failed scrape.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        self.0
+            .iter()
+            .map(|(node, v)| v.map_or_else(|| format!("{node}=?"), |n| format!("{node}={n}")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn of(&self, node: &str) -> Option<i64> {
+        self.0.iter().find(|(n, _)| n == node).and_then(|(_, v)| *v)
+    }
+}
+
 fn add_option(total: Option<i64>, value: Option<i64>) -> Option<i64> {
     match (total, value) {
         (None, v) => v,
@@ -288,5 +363,39 @@ mod tests {
         assert_eq!(add_option(None, Some(3)), Some(3));
         assert_eq!(add_option(Some(3), None), Some(3));
         assert_eq!(add_option(Some(3), Some(4)), Some(7));
+    }
+
+    fn counts(values: &[(&str, Option<i64>)]) -> IngressCounts {
+        IngressCounts(
+            values
+                .iter()
+                .map(|(node, v)| ((*node).to_string(), *v))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn one_ingress_that_counts_more_proves_the_load_flows() {
+        let base = counts(&[("ingress-0", Some(10)), ("ingress-1", Some(20))]);
+        let now = counts(&[("ingress-0", Some(11)), ("ingress-1", Some(20))]);
+        assert_eq!(now.rose_over(&base), Some(31));
+        assert_eq!(base.rose_over(&base), None);
+    }
+
+    #[test]
+    fn an_unreachable_ingress_never_reads_as_a_stalled_load() {
+        let base = counts(&[("ingress-0", Some(10)), ("ingress-1", Some(20))]);
+        // The second ingress fails its scrape, so the sum drops to 11.
+        // The first ingress still counts more than its own baseline.
+        let now = counts(&[("ingress-0", Some(11)), ("ingress-1", None)]);
+        assert_eq!(now.rose_over(&base), Some(11));
+        assert_eq!(now.describe(), "ingress-0=11 ingress-1=?");
+    }
+
+    #[test]
+    fn an_ingress_with_no_baseline_proves_nothing() {
+        let base = counts(&[("ingress-0", None), ("ingress-1", Some(20))]);
+        let now = counts(&[("ingress-0", Some(11)), ("ingress-1", Some(20))]);
+        assert_eq!(now.rose_over(&base), None);
     }
 }

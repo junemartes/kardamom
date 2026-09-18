@@ -7,6 +7,7 @@
 //! against the `Target`-L local stack, and also against the `Target`-C
 //! `ci-cluster.sh` `DinD` cluster, unchanged.
 
+pub mod account_layer;
 pub mod bridge;
 pub mod consistency;
 pub mod crash_recovery;
@@ -68,7 +69,6 @@ pub const VALIDATOR_COMMITTED_BLOCK: &str = "validator_committed_block";
 pub const VALIDATOR_BLOCKS_VERIFIED: &str = "validator_blocks_verified_total";
 pub const VALIDATOR_BAL_MISSING: &str = "validator_bal_missing_total";
 pub const VALIDATOR_EPOCHS_VERIFIED: &str = "validator_epochs_verified_total";
-pub const VALIDATOR_EPOCH_FAULTS: &str = "validator_epoch_faults_total";
 pub const VALIDATOR_DIVERGENCE: &str = "validator_divergence_total";
 pub const TRIE_SHADOW_CHECKS: &str = "kardamom_state_trie_shadow_checks_total";
 pub const TRIE_SHADOW_MISMATCH: &str = "kardamom_state_trie_shadow_mismatch_total";
@@ -138,6 +138,9 @@ pub struct Target {
     /// value.
     pub pending_receipt_timeout: Duration,
     pub ingress_metrics: SocketAddr,
+    /// The executor's account query, the source of truth behind the
+    /// ingress's account RPCs.
+    pub executor_query: SocketAddr,
     pub executor_metrics: SocketAddr,
     pub sequencer_metrics: Vec<SocketAddr>,
     /// Present when the stack runs a validator.
@@ -213,6 +216,16 @@ impl Target {
     /// Returns an error when the scrape fails.
     pub async fn ingress_metric_opt(&self, name: &str) -> Result<Option<f64>> {
         Self::metric_opt(self.ingress_metrics, name).await
+    }
+
+    /// The ingress's `name`, summed over the samples whose label block
+    /// contains `label`. `Ok(None)` when no sample matches.
+    ///
+    /// # Errors
+    /// Returns an error when the scrape fails.
+    pub async fn ingress_metric_where(&self, name: &str, label: &str) -> Result<Option<f64>> {
+        let s = metrics::scrape(self.ingress_metrics).await?;
+        Ok(s.value_where(name, label))
     }
 
     /// Poll the validator's `name` until it exceeds `floor`, treating a

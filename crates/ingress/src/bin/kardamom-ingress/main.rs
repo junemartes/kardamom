@@ -20,12 +20,13 @@ mod recorders;
 mod watermark;
 
 use std::net::SocketAddr;
-use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use kardamom_cache::{ExecutorQueryConfig, LiveAccountsConfig};
 use kardamom_ingress::aeron_adapters::{LiveIngressPublication, LiveIngressSubscription};
 use kardamom_ingress::cluster::cluster_watermark_observer;
 use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
@@ -171,6 +172,37 @@ struct Args {
         default_value_t = 30_000
     )]
     pending_receipt_timeout_ms: u64,
+    /// The executor query endpoints, `http://host:port`, comma
+    /// separated. `eth_getBalance` and `eth_getTransactionCount` ask one
+    /// of them when the local account layer misses. Empty means no
+    /// query: a cold address then gets an error.
+    #[arg(
+        long = "executor-query-endpoints",
+        env = "KARDAMOM_EXECUTOR_QUERY_ENDPOINTS",
+        value_delimiter = ','
+    )]
+    executor_query_endpoints: Vec<String>,
+    /// Whether the submit path rejects an unfunded sender from the local
+    /// account layer. `false` publishes every submit, as before the
+    /// layer existed.
+    #[arg(
+        long = "admission-checks",
+        env = "KARDAMOM_ADMISSION_CHECKS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    admission_checks: bool,
+    /// The bound on accounts resident in the local layer. Defaults to
+    /// `LiveAccountsConfig::default`.
+    #[arg(
+        long = "live-accounts-capacity",
+        env = "KARDAMOM_LIVE_ACCOUNTS_CAPACITY"
+    )]
+    live_accounts_capacity: Option<NonZeroUsize>,
+    /// How long a local account entry stays after its last write, in
+    /// ms. Defaults to `LiveAccountsConfig::default`.
+    #[arg(long = "live-accounts-ttl-ms", env = "KARDAMOM_LIVE_ACCOUNTS_TTL_MS")]
+    live_accounts_ttl_ms: Option<NonZeroU64>,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -238,11 +270,41 @@ impl IngressService {
             rpc_max_connections: args.rpc_max_connections,
             chain_id: args.chain_id,
             pending_receipt_timeout: Duration::from_millis(args.pending_receipt_timeout_ms),
+            live_accounts: self.live_accounts_config(),
+            admission_checks: args.admission_checks,
+            executor_query: ExecutorQueryConfig {
+                endpoints: args.executor_query_endpoints.clone(),
+                ..ExecutorQueryConfig::default()
+            },
+            cache: self.file_cfg.cache.clone(),
+            // The mirror ids are the executor indexes. One when no count
+            // is known: the Redis reader then polls `head:0` only.
+            mirror_count: self.executor_count().unwrap_or(NonZeroU32::MIN),
             ..IngressConfig::default()
         };
         cfg.binary_tcp_bind = None;
         cfg.binary_uds_path = None;
         Ok(cfg)
+    }
+
+    /// The executor count: the CLI or env `--executor-count`, else the
+    /// log config's `tx_receipts_executor_count`, else unknown.
+    fn executor_count(&self) -> Option<NonZeroU32> {
+        self.args
+            .executor_count
+            .or(self.log_cfg.channels.tx_receipts_executor_count)
+    }
+
+    /// The local layer config: the defaults, with the two CLI overrides.
+    fn live_accounts_config(&self) -> LiveAccountsConfig {
+        let defaults = LiveAccountsConfig::default();
+        LiveAccountsConfig {
+            capacity: self
+                .args
+                .live_accounts_capacity
+                .unwrap_or(defaults.capacity),
+            ttl_ms: self.args.live_accounts_ttl_ms.unwrap_or(defaults.ttl_ms),
+        }
     }
 
     /// Read and validate the `--shard-map` file, when one is given.
@@ -303,9 +365,8 @@ impl IngressService {
     /// executor crash recovery. A recorder startup failure is fatal: the
     /// operator asked for `--archive-durability`, so serving without it
     /// would be a silent lie.
-    async fn open_aeron_side(&self) -> Result<OpenedAeron> {
+    async fn open_aeron_side(&self, live_cfg: &LiveAccountsConfig) -> Result<OpenedAeron> {
         let args = &self.args;
-        let channels = &self.log_cfg.channels;
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
         let mut plane =
             StreamPlane::from_config(&self.log_cfg, &format!("ingress-{}", args.ingress_id))
@@ -313,11 +374,10 @@ impl IngressService {
 
         let (recorders, recorder_ready, discovered_ready) = self.spawn_recorders(&mut plane)?;
 
-        // tx_receipts MDS membership: prefer the CLI or env
-        // `--executor-count`, and fall back to the log-config field, or
-        // `None` (no known executor count) when neither is set. The
-        // proxy reads this only when MDS is enabled.
-        let executor_count = args.executor_count.or(channels.tx_receipts_executor_count);
+        // tx_receipts MDS membership: the CLI or env `--executor-count`,
+        // else the log-config field, else `None` (no known executor
+        // count). The proxy reads this only when MDS is enabled.
+        let executor_count = self.executor_count();
 
         let publication = LiveIngressPublication::open(&rt, &mut plane, LANE_PLANE)
             .await
@@ -334,9 +394,14 @@ impl IngressService {
                 .await
                 .context("archive durability requested but tx_data recorders failed to start")?;
         }
-        let subscription =
-            LiveIngressSubscription::open(&rt, &mut plane, args.recorder_id, executor_count)
-                .context("open IngressSubscription")?;
+        let subscription = LiveIngressSubscription::open(
+            &rt,
+            &mut plane,
+            args.recorder_id,
+            executor_count,
+            live_cfg,
+        )
+        .context("open IngressSubscription")?;
 
         Ok(OpenedAeron {
             rt,
@@ -408,7 +473,7 @@ impl IngressService {
             "kardamom-ingress starting"
         );
 
-        let opened = self.open_aeron_side().await?;
+        let opened = self.open_aeron_side(&cfg.live_accounts).await?;
         let cluster_watermark = if cfg.ack_policy.requires_quorum() {
             let members = opened.plane.cluster_ingress_endpoints().await?;
             Some(self.spawn_cluster_watermark(&opened.subscription, members)?)
@@ -489,6 +554,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     kardamom_obs::init_service!("ingress", args.metrics_addr, args.host_id.as_ref()).await?;
     kardamom_ingress::metrics::describe();
+    kardamom_cache::metrics::describe();
 
     // Runtime tunables come from defaults and CLI flags. The TOML file
     // supplies only the optional `[cluster]` section, the Aeron Cluster

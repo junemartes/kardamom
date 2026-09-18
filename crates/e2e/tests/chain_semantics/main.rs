@@ -27,8 +27,8 @@ use std::time::Duration;
 use e2e::harness::services::{IngressOptions, ParkTimeout};
 use e2e::harness::{LocalStack, StackConfig};
 use e2e::scenarios::{
-    bridge, consistency, crash_recovery, da_parity, derivation, divergence, nonce_gap,
-    nonce_unordered, resize, rpc_liveness, rpc_vectors, sequencer_restart, upgrade,
+    account_layer, bridge, consistency, crash_recovery, da_parity, derivation, divergence,
+    nonce_gap, nonce_unordered, resize, rpc_liveness, rpc_vectors, sequencer_restart, upgrade,
 };
 
 /// The two pending-receipt park bounds every tuned-park test in this
@@ -129,3 +129,4 @@ include!("bridge_da.rs");
 include!("derivation.rs");
 include!("upgrades.rs");
 include!("xchain.rs");
+include!("account_layer.rs");

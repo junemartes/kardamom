@@ -106,6 +106,10 @@ struct SenderReport {
     landed: u64,
     transport_retries: u64,
     timeout_retries: u64,
+    /// The text of the most recent transport error. A refused connection
+    /// (the ingress is down) and an HTTP error from a live ingress both
+    /// arrive as transport errors, and only the text tells them apart.
+    last_transport_error: String,
 }
 
 /// Submits transactions until a receipt exists for each. See the module
@@ -144,12 +148,13 @@ impl Lander {
         }
         anyhow::bail!(
             "nonce {} of {} did not land after {} park timeouts and {} \
-             transport errors in {:?}",
+             transport errors in {:?} (last transport error: {})",
             tx.nonce,
             tx.sender,
             budget.timeouts,
             budget.transports,
-            started.elapsed()
+            started.elapsed(),
+            self.report.last_transport_error
         )
     }
 
@@ -162,15 +167,16 @@ impl Lander {
                 anyhow::ensure!(h == tx.hash, "submit returned {h} != {}", tx.hash);
                 Ok(ControlFlow::Break(()))
             }
-            Err(RpcError::Transport(_)) => self.on_transport_error().await,
+            Err(RpcError::Transport(message)) => self.on_transport_error(message).await,
             Err(RpcError::Call { code, message }) => self.on_call_error(tx, code, &message).await,
         }
     }
 
     /// The ingress restarted under this submit. The envelope may or may
     /// not have gone out. A resubmit is idempotent.
-    async fn on_transport_error(&mut self) -> Result<ControlFlow<(), Retry>> {
+    async fn on_transport_error(&mut self, message: String) -> Result<ControlFlow<(), Retry>> {
         self.report.transport_retries = self.report.transport_retries.saturating_add(1);
+        self.report.last_transport_error = message;
         tokio::time::sleep(Duration::from_millis(250)).await;
         Ok(ControlFlow::Continue(Retry::Transport))
     }

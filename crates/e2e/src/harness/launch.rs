@@ -281,20 +281,28 @@ impl LocalStack {
             .context("create stack temp root")?;
         eprintln!("stack root: {}", root.path().display());
 
+        // The driver and the sealer must be spawned on a thread that lives
+        // as long as the stack. Every child gets PR_SET_PDEATHSIG(SIGKILL)
+        // (see `Proc::spawn`), and the kernel sends it when the spawning
+        // THREAD exits, not the process. A spawn_blocking thread exits after
+        // 10s idle, so a stack whose blocking pool went quiet lost its media
+        // driver and sealer mid-test, and every client then aborted on the
+        // driver keepalive (the s16 and chain-semantics "MediaDriver
+        // keepalive" flake). block_in_place runs the launch on this runtime
+        // thread, which lives until the runtime shuts down.
         let rootp = root.path().to_path_buf();
-        let (driver, sealer) = {
-            let repo = repo.clone();
-            let tick = cfg.cluster_tick_ms;
-            let members = cfg.sealer_members;
-            let remote_origins = cfg.remote_origins.clone();
-            tokio::task::spawn_blocking(move || -> Result<(MediaDriver, SealerCluster)> {
+        let (driver, sealer) =
+            tokio::task::block_in_place(|| -> Result<(MediaDriver, SealerCluster)> {
                 let driver = MediaDriver::launch(&rootp)?;
-                let sealer = SealerCluster::launch(&rootp, &repo, members, tick, &remote_origins)?;
+                let sealer = SealerCluster::launch(
+                    &rootp,
+                    &repo,
+                    cfg.sealer_members,
+                    cfg.cluster_tick_ms,
+                    &cfg.remote_origins,
+                )?;
                 Ok((driver, sealer))
-            })
-            .await
-            .context("bring-up join")??
-        };
+            })?;
 
         let stack_launch = StackLaunch::new(&cfg, root.path(), &driver, &sealer);
         let executor_query_port = stack_launch.executor_query_port();

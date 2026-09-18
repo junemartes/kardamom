@@ -9,7 +9,7 @@ import time
 import unittest
 
 ANSIBLE = Path(__file__).resolve().parents[1]
-SERVICES = ['ingress', 'sequencer', 'executor', 'validator', 'da-watcher', 'batcher']
+SERVICES = ['ingress', 'sequencer', 'executor', 'validator', 'da-watcher', 'batcher', 'state-mirror']
 
 
 @unittest.skipUnless(shutil.which('ansible-playbook'), 'ansible-playbook required')
@@ -64,7 +64,7 @@ class ImageTest(unittest.TestCase):
     def test_prebuilt_direct_push_and_unsigned_manifest(self):
         self.run_images()
         records = self.manifest.read_text().splitlines()
-        self.assertEqual([r.split()[0] for r in records], ['aeron'] + SERVICES + ['cluster'])
+        self.assertEqual([r.split()[0] for r in records], ['aeron', 'redis'] + SERVICES + ['cluster'])
         self.assertTrue(all('@sha256:' in r for r in records))
         self.assertFalse(self.bundle.exists(), 'an unsigned release must remove an old signature')
         self.assertFalse(any(tool == 'cosign' for tool, _ in self.calls()))
@@ -78,11 +78,12 @@ class ImageTest(unittest.TestCase):
         calls = self.calls()
         self.assertEqual(self.bundle.read_text(), self.manifest.read_text())
         signatures = [args for tool, args in calls if tool == 'cosign']
-        self.assertEqual(len(signatures), 9)
+        # One signature per image (Aeron, Redis, the services, cluster) plus the manifest.
+        self.assertEqual(len(signatures), len(SERVICES) + 4)
         self.assertTrue(all(args[0] == 'sign' for args in signatures[:-1]))
         self.assertEqual(signatures[-1][0], 'sign-blob')
         self.assertFalse(any(args[0] == 'push' for tool, args in calls))
-        self.assertEqual(sum(args[0] == 'exec' and args[2:4] == ['docker', 'push'] for _, args in calls), 8)
+        self.assertEqual(sum(args[0] == 'exec' and args[2:4] == ['docker', 'push'] for _, args in calls), len(SERVICES) + 3)
         self.assertEqual(list(self.root.glob('kardamom-images-*.tar')), [], 'node archives must be cleaned')
 
     def test_failed_digest_preserves_previous_release(self):
