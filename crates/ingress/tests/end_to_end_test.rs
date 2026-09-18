@@ -113,7 +113,13 @@ async fn draining_refuses_new_submits_and_reports_parked_count() {
         let proxy = proxy.clone();
         tokio::spawn(async move { proxy.submit_raw(ip, raw0).await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The spawned submit verifies the signature and admits before it
+    // parks. On a loaded runner that took longer than a fixed sleep, so
+    // wait for the park itself, within a bound.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while proxy.pending_len() == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(proxy.pending_len(), 1, "the first submit parked");
 
     proxy.begin_drain();
