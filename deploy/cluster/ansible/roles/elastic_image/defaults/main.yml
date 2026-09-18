@@ -8,7 +8,7 @@ elastic_image_collections:
 elastic_image_ansible_root: /opt/kardamom/ansible
 # The profile values the image carries (nonsecret): the inventory group
 # vars of the production profile.
-elastic_image_profile_vars_file: "{{ playbook_dir }}/inventories/hetzner/group_vars/all.yml"
+elastic_image_profile_vars_file: "{{ playbook_dir }}/inventories/hetzner/group_vars/production/profile.yml"
 # The enrollment client the image carries, and its argument vector. Empty
 # means no enrollment: the node then fails closed at first boot on the
 # production profile.

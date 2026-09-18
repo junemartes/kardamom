@@ -20,7 +20,7 @@ cosign_pinned_sha256: "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9
 # profile: three voting Consul and Nomad servers on the dedicated core, a
 # private interface selector in place of fixed addresses, gossip
 # encryption, ACLs, agent TLS and the host firewall.
-# inventories/hetzner/group_vars/all.yml sets the production values, and
+# inventories/hetzner/group_vars/production/profile.yml sets the production values, and
 # roles/profile checks them before any role changes a host.
 # See docs/agents/hetzner-hybrid-infra-spec.md.
 deployment_profile: "local"
