@@ -15,9 +15,9 @@ autoscaler_hcloud_plugin_sha256: ""
 # The pool contract that terraform/hetzner exports (tofu output -json
 # pool_contract). Required.
 autoscaler_pool_contract_file: ""
-# The Prometheus server that scrapes the Nomad clients and the services.
-# Required.
-autoscaler_prometheus_addr: ""
+# The Prometheus server that scrapes the Nomad clients and the services:
+# the monitoring job's Consul service (nomad/monitoring.nomad.hcl).
+autoscaler_prometheus_addr: "http://prometheus.service.consul:9090"
 autoscaler_nomad_addr: "http://127.0.0.1:4646"
 # Protected inputs. The Hetzner token lives only on the Autoscaler host.
 autoscaler_hcloud_token: ""

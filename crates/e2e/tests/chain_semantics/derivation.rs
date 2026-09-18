@@ -114,14 +114,13 @@ async fn s10e_every_l1_deposit_appears_exactly_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s11_forged_epoch_halts_validator() {
-    let stack = launch_l1_or_skip!(StackConfig {
+    let mut stack = launch_l1_or_skip!(StackConfig {
         l1: true,
         validator: true,
         ..StackConfig::default()
     });
     let t = target(&stack);
-    let l1 = stack.l1().expect("l1");
-    divergence::forged_epoch_halts_validator(&stack, &t, l1)
+    divergence::forged_epoch_halts_validator(&mut stack, &t)
         .await
         .expect("S11");
 }

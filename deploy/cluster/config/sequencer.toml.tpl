@@ -42,3 +42,16 @@ ingress_stream_id = 101
 egress_stream_id = 102
 keep_alive_interval_ms = 1000
 # egress_channel is set per-node by --cluster-egress-endpoint (the node IP differs).
+
+# The Redis layer (docs/specs/2026-09-13-redis-account-cache-design.md,
+# section 5.2 and section 6): the three sentinels by their node records,
+# the same list the state mirror uses. The readers are fail-open: with
+# Redis down, an admission check is skipped and counted, never a submit.
+# Authentication is deferred; see the spec's section 11 (flag day).
+[cache]
+sentinels = [
+  "redis://aux-0.node.consul:26379",
+  "redis://ingress-0.node.consul:26379",
+  "redis://ingress-1.node.consul:26379",
+]
+master_name = "kardamom"
