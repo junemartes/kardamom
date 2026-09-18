@@ -330,6 +330,14 @@ impl IngressCounts {
         rose.then(|| self.total()).flatten()
     }
 
+    /// The total when every ingress answered. A baseline that skips an
+    /// ingress cannot bound the traffic that flows past a frozen consumer.
+    #[must_use]
+    pub fn complete(&self) -> Option<i64> {
+        let all_answered = !self.0.is_empty() && self.0.iter().all(|(_, v)| v.is_some());
+        all_answered.then(|| self.total()).flatten()
+    }
+
     /// The counters as a log line. A `?` marks a failed scrape.
     #[must_use]
     pub fn describe(&self) -> String {
@@ -390,6 +398,15 @@ mod tests {
         let now = counts(&[("ingress-0", Some(11)), ("ingress-1", None)]);
         assert_eq!(now.rose_over(&base), Some(11));
         assert_eq!(now.describe(), "ingress-0=11 ingress-1=?");
+    }
+
+    #[test]
+    fn a_complete_baseline_needs_every_ingress() {
+        let all = counts(&[("ingress-0", Some(10)), ("ingress-1", Some(20))]);
+        assert_eq!(all.complete(), Some(30));
+        let one = counts(&[("ingress-0", Some(10)), ("ingress-1", None)]);
+        assert_eq!(one.complete(), None);
+        assert_eq!(counts(&[]).complete(), None);
     }
 
     #[test]

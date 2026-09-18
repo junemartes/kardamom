@@ -9,7 +9,9 @@ use anyhow::Context;
 use serde::Deserialize;
 
 mod job;
+mod saved_job;
 pub(crate) use job::Job;
+pub(crate) use saved_job::SavedJob;
 
 /// The log streams to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +69,13 @@ impl Alloc {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.client_status == "running"
+    }
+
+    /// Running, and meant to keep running: a stopping allocation still
+    /// reports `running` for a moment after the job asks it to stop.
+    #[must_use]
+    pub fn is_desired_running(&self) -> bool {
+        self.is_running() && self.desired_status == "run"
     }
 
     /// The short id CI logs show.
@@ -175,7 +184,7 @@ impl Nomad {
             .allocations(job)
             .await?
             .into_iter()
-            .filter(Alloc::is_running)
+            .filter(Alloc::is_desired_running)
             .collect())
     }
 

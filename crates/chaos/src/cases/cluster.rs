@@ -333,10 +333,9 @@ pub(crate) async fn quorum_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     h.assert_count(CLUSTER_TASK, 2, h.knobs.reschedule_slo)
         .await?;
     h.assert_executor_progress(Duration::from_secs(180)).await?;
-    // Restore the second node too, so later cases see a 3/3 cluster.
-    // Best effort, outside this case's SLO.
-    let _ = h.nodes.start(&victims[1]).await;
-    Ok(())
+    h.nodes.start(&victims[1]).await?;
+    h.assert_count(CLUSTER_TASK, 3, h.knobs.reschedule_slo)
+        .await
 }
 
 #[cfg(test)]

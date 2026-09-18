@@ -26,9 +26,7 @@ impl Job {
     pub(crate) fn running<'a>(&self, allocs: &'a [Alloc]) -> Option<Vec<&'a Alloc>> {
         let current: Vec<&Alloc> = allocs
             .iter()
-            .filter(|a| {
-                a.job_version == self.version && a.desired_status == "run" && a.is_running()
-            })
+            .filter(|a| a.job_version == self.version && a.is_desired_running())
             .collect();
         let complete = !self.groups.is_empty()
             && self.groups.iter().all(|g| g.satisfied(&current))

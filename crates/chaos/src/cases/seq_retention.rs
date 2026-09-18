@@ -1,11 +1,13 @@
 //! The sequencer lapse and the retention-overrun cases: a running
 //! consumer is frozen with SIGSTOP and must repair itself on thaw.
 
+mod repair;
+use repair::Repair;
+
 use std::cell::Cell;
 use std::time::Duration;
 
 use crate::harness::Harness;
-use crate::nomad::Streams;
 use crate::poll::{self, Budget};
 use crate::probes::EXECUTOR_BLOCK_METRIC;
 
@@ -276,8 +278,12 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
     let donor = h.container("executor-0")?;
     super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
     require_live_victim(h, victim, &ctx).await?;
+    let repair = Repair::capture(h, victim, &node).await?;
     let need = i64::try_from(retention.get().saturating_mul(2)).unwrap_or(i64::MAX);
-    let rx_freeze = h.probes.ingress_received().await.unwrap_or(0);
+    let rx_freeze =
+        h.probes.ingress_counts().await.complete().ok_or_else(|| {
+            crate::chaos_fail!("no complete ingress baseline for retention overrun")
+        })?;
     crate::log(format!(
         "{ctx}: freezing {inner} on {node} until {need} frames flow past it (retention={retention}, cap {}s)",
         h.knobs.retention_freeze_cap.as_secs()
@@ -296,7 +302,7 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
             "{ctx}: SIGCONT failed (container may have been replaced mid-freeze); the log asserts below own the verdict"
         ));
     }
-    await_repair_chain(h, victim, &ctx, delta, elapsed).await?;
+    await_repair_chain(h, victim, &ctx, delta, elapsed, &repair).await?;
     await_restarted_container(h, &node, &inner, cid0.as_deref(), &ctx).await?;
     match victim {
         Victim::Executor => h.assert_executor_progress(Duration::from_secs(180)).await,
@@ -313,10 +319,9 @@ async fn require_live_victim(h: &Harness, victim: Victim, ctx: &str) -> anyhow::
         let now = match victim {
             Victim::Executor => h.probes.exec_metric(2, EXECUTOR_BLOCK_METRIC).await,
             Victim::Validator => h.probes.val_metric("validator_committed_block").await,
-        }
-        .unwrap_or(0);
-        let live = prev_ref.get().is_some_and(|p| now > p);
-        prev_ref.set(Some(now));
+        };
+        let live = matches!((prev_ref.get(), now), (Some(p), Some(n)) if n > p);
+        prev_ref.set(now);
         Ok::<_, anyhow::Error>(live.then_some(now))
     })
     .await?;
@@ -401,18 +406,13 @@ async fn await_repair_chain(
     ctx: &str,
     delta: i64,
     frozen: Duration,
+    repair: &Repair,
 ) -> anyhow::Result<()> {
-    let kind = victim.kind();
     let restored = victim.restored_needle();
     let seen = Cell::new((false, false, false));
     let seen_ref = &seen;
     let outcome = poll::until(Budget::secs(300, 6), |_| async move {
-        let logs = h.nomad.job_logs(kind, Streams::Both).await?;
-        let s = (
-            logs.contains("cluster replay unavailable"),
-            logs.contains("resync prepared: peer checkpoint staged"),
-            logs.contains(restored),
-        );
+        let s = repair.seen(h).await?;
         seen_ref.set(s);
         Ok((s.0 && s.1 && s.2).then_some(()))
     })

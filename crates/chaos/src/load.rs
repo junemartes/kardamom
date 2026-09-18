@@ -155,7 +155,7 @@ impl LoadRun {
     /// Returns an error if the harness failed before a verdict, or the
     /// report is missing or unreadable.
     pub async fn finish(self) -> anyhow::Result<Verdict> {
-        let outcome = self.task.await.context("join the load task")?;
+        let outcome = self.task.await.context("join the load task")??;
         let report_text = std::fs::read_to_string(&self.report_path).with_context(|| {
             format!(
                 "load report {} missing (harness: {outcome:?})",
@@ -164,6 +164,10 @@ impl LoadRun {
         })?;
         let report: Report = serde_json::from_str(&report_text)
             .with_context(|| format!("decode {}", self.report_path.display()))?;
+        anyhow::ensure!(
+            outcome == report.verdict.pass,
+            "load return and report verdict disagree"
+        );
         Ok(report.verdict)
     }
 
@@ -186,5 +190,44 @@ mod tests {
         assert!(!report.verdict.pass);
         assert_eq!(report.verdict.missing, 1);
         assert_eq!(report.verdict.seq_dropped, Some(2));
+    }
+
+    /// A run whose load task is `task`, for the finish checks.
+    fn stub_run(
+        report_path: PathBuf,
+        task: impl std::future::Future<Output = anyhow::Result<bool>> + Send + 'static,
+    ) -> LoadRun {
+        let (_, ready) = tokio::sync::watch::channel(true);
+        LoadRun {
+            task: tokio::spawn(task),
+            report_path,
+            ready,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_load_cannot_reuse_a_stale_passing_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let report_path = directory.path().join("report.json");
+        std::fs::write(&report_path, r#"{"verdict":{"pass":true,"missing":0}}"#).unwrap();
+        let run = stub_run(report_path, async {
+            anyhow::bail!("load failed before report")
+        });
+        assert!(
+            run.finish()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("load failed before report")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_report_must_agree_with_the_load_return() {
+        let directory = tempfile::tempdir().unwrap();
+        let report_path = directory.path().join("report.json");
+        std::fs::write(&report_path, r#"{"verdict":{"pass":true,"missing":0}}"#).unwrap();
+        let run = stub_run(report_path, async { Ok(false) });
+        assert!(run.finish().await.is_err());
     }
 }

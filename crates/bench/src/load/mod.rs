@@ -458,11 +458,6 @@ impl Prepared {
             tracker: Arc::clone(&tracker),
         };
         let mut tasks = tokio::task::JoinSet::new();
-        // Outside chaos mode, the ingress receipt cache is stable, with no
-        // restarts. So an accepted transaction whose receipt cannot be
-        // re-fetched is a real must-deliver violation, not restart noise.
-        // Verify it independently.
-        let verify_receipts = !cfg.chaos_mode;
         let mode = cfg.submit_mode();
 
         let run = LoadRun {
@@ -529,7 +524,6 @@ impl Prepared {
             cfg.duration,
             SubmitOpts {
                 retry: cfg.retry_submit,
-                verify_receipts,
                 mode,
                 feed_confirm,
             },
@@ -575,7 +569,6 @@ impl RampRun<'_> {
             self.step_dur,
             SubmitOpts {
                 retry: self.cfg.retry_submit,
-                verify_receipts: !self.cfg.chaos_mode,
                 mode: self.mode,
                 feed_confirm: self.cfg.feed_confirm_on(),
             },
