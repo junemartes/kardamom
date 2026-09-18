@@ -37,7 +37,7 @@ jobs:
       - name: Install linters
         run: pip install yamllint ansible-lint
       - name: Install Ansible collections (module resolution for ansible-lint)
-        run: ansible-galaxy collection install ansible.posix community.docker
+        run: ansible-galaxy collection install ansible.posix community.docker community.general
       - name: yamllint
         run: yamllint ansible/
       - name: ansible-lint
@@ -56,7 +56,7 @@ jobs:
       - name: Install Ansible for isolated deployment tests
         run: |
           pip install ansible-core
-          ansible-galaxy collection install ansible.posix community.docker
+          ansible-galaxy collection install ansible.posix community.docker community.general
       - name: Install Nomad (version from the cluster contract)
         run: |
           ver="$(sed -n 's/^nomad_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
