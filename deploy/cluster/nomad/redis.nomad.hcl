@@ -64,6 +64,15 @@ job "redis" {
         args = [
           "redis-server", "/usr/local/etc/redis/redis.conf",
           "--dir", "/local",
+          # The node record this instance reports to its primary once a
+          # failover makes it a replica. The sentinels resolve and
+          # announce hostnames, so every instance must announce one too.
+          # Without it the sentinels learned the demoted primary a second
+          # time, under its IP from the new primary's INFO, and then held
+          # two identities for one instance: a failover promoted one and
+          # reconfigured the other as its replica, so the node replicated
+          # from itself and never served (issue #373).
+          "--replica-announce-ip", "aux-0.node.${var.datacenter}.consul",
         ]
       }
 
@@ -126,6 +135,10 @@ job "redis" {
           # The primary, by its node record. A sentinel failover
           # reconfigures this replica in place.
           "--replicaof", "aux-0.node.${var.datacenter}.consul", "6379",
+          # The node record this replica reports to its primary. See the
+          # primary task: the sentinels must know each instance by one
+          # name.
+          "--replica-announce-ip", "ingress-1.node.${var.datacenter}.consul",
         ]
       }
 

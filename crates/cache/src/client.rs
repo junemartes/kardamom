@@ -92,16 +92,49 @@ impl Source {
                 addrs,
                 master_name,
                 node,
-            } => {
-                let mut client = SentinelClient::build(
-                    addrs.clone(),
-                    master_name.clone(),
-                    Some(node.clone()),
-                    SentinelServerType::Master,
-                )?;
-                Ok(client.get_async_connection().await?)
+            } => Self::from_any_sentinel(addrs, master_name, node).await,
+        }
+    }
+
+    /// The primary as the first sentinel that names a live one sees it.
+    ///
+    /// The client library asks the sentinels in order and keeps the
+    /// answer of the first that replies, even when that answer names a
+    /// replica or a primary the sentinel has marked down. After two
+    /// failovers in 30 s one sentinel kept naming the demoted node for
+    /// ten minutes, so every connection failed while the other two
+    /// sentinels named the live primary. So ask each sentinel on its
+    /// own, and keep the first answer that a primary accepts.
+    async fn from_any_sentinel(
+        addrs: &[String],
+        master_name: &str,
+        node: &SentinelNodeConnectionInfo,
+    ) -> Result<MultiplexedConnection, CacheError> {
+        let mut last = None;
+        for addr in addrs {
+            match Self::from_sentinel(addr, master_name, node).await {
+                Ok(conn) => return Ok(conn),
+                Err(e) => {
+                    warn!(sentinel = addr, error = %e, "sentinel named no live primary");
+                    last = Some(e);
+                }
             }
         }
+        Err(last.unwrap_or(CacheError::Disabled))
+    }
+
+    async fn from_sentinel(
+        addr: &str,
+        master_name: &str,
+        node: &SentinelNodeConnectionInfo,
+    ) -> Result<MultiplexedConnection, CacheError> {
+        let mut client = SentinelClient::build(
+            vec![addr.to_string()],
+            master_name.to_string(),
+            Some(node.clone()),
+            SentinelServerType::Master,
+        )?;
+        Ok(client.get_async_connection().await?)
     }
 }
 
