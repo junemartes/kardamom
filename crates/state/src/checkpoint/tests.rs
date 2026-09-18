@@ -177,6 +177,66 @@ fn restore_refuses_an_unmanifested_image() {
     );
 }
 
+/// A reader of another process's checkpoint directory takes the
+/// next-newest checkpoint and leaves the directory as it found it. The
+/// writer prunes its own checkpoints, so an unreadable one is a race,
+/// not corruption.
+#[test]
+fn restore_newest_readable_skips_without_touching_the_directory() {
+    let src = tempfile::tempdir().unwrap();
+    let ckpt = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let addr = Address::from([0x25; 20]);
+    let env = seeded_env_with_blocks(src.path(), addr, 2);
+    let good = create_checkpoint(&env, ckpt.path()).unwrap();
+    commit_blocks(&env, addr, 5);
+    let torn = create_checkpoint(&env, ckpt.path()).unwrap();
+    drop(env);
+
+    // The newest one cannot be read back: its manifest never arrived.
+    std::fs::remove_file(manifest_path(&torn.path)).unwrap();
+
+    let (block, path) = restore_newest_readable(ckpt.path(), dst.path(), None)
+        .expect("an unreadable checkpoint is not an error")
+        .expect("the older readable checkpoint must restore");
+    assert_eq!(block, good.block);
+    assert_eq!(path, good.path);
+    // The writer's directory is untouched: the skipped checkpoint keeps
+    // its name, and nothing is quarantined.
+    assert!(torn.path.exists(), "the skipped checkpoint must stay put");
+    let hidden: Vec<_> = std::fs::read_dir(ckpt.path())
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('.'))
+        .collect();
+    assert!(hidden.is_empty(), "nothing may be renamed: {hidden:?}");
+}
+
+/// A checkpoint that the writer prunes between the listing and the read
+/// is skipped, and the reader still returns the next-newest.
+#[test]
+fn restore_newest_readable_skips_a_pruned_checkpoint() {
+    let src = tempfile::tempdir().unwrap();
+    let ckpt = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let addr = Address::from([0x26; 20]);
+    let env = seeded_env_with_blocks(src.path(), addr, 2);
+    let good = create_checkpoint(&env, ckpt.path()).unwrap();
+    commit_blocks(&env, addr, 5);
+    let pruned = create_checkpoint(&env, ckpt.path()).unwrap();
+    drop(env);
+
+    // The writer removed the newest one's contents, as a prune does.
+    std::fs::remove_dir_all(&pruned.path).unwrap();
+    std::fs::create_dir(&pruned.path).unwrap();
+
+    let (block, _) = restore_newest_readable(ckpt.path(), dst.path(), None)
+        .expect("a pruned checkpoint is not an error")
+        .expect("the older readable checkpoint must restore");
+    assert_eq!(block, good.block);
+}
+
 /// A bad newest checkpoint must cost one rung of the ladder, not wedge
 /// the node. `restore_best_checkpoint` quarantines it and restores the
 /// next-newest.
