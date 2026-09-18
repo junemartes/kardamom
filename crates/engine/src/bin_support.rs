@@ -449,7 +449,7 @@ struct ResyncFallback<'a> {
 
 impl ResyncFallback<'_> {
     /// Fetch a peer checkpoint at or above `oldest_block` and park the
-    /// stale state DB, so the next restart adopts it. Returns the
+    /// stale state DB, so the next revolution adopts it. Returns the
     /// checkpoint's block on success, or `None` when no peer has a
     /// qualifying checkpoint.
     ///
@@ -476,29 +476,35 @@ impl ResyncFallback<'_> {
             tracing::info!(
                 checkpoint_block,
                 "resync prepared: peer checkpoint staged, stale state parked; \
-                 restart will adopt it (blocks through the checkpoint are \
-                 UNVERIFIED by this validator)"
+                 the pipeline adopts it in-process now (blocks through the \
+                 checkpoint are UNVERIFIED by this validator)"
             );
         } else {
             tracing::info!(
                 checkpoint_block,
                 "resync prepared: peer checkpoint staged, stale state parked; \
-                 restart will restore and resume from it"
+                 the pipeline restores and resumes from it in-process now"
             );
         }
     }
 }
 
-/// Replay-window overrun repair, run at exit. The durable cursor fell
-/// below the cluster's retention floor, so resuming from it can never
-/// succeed. Every restart would re-request the same refused `REPLAY_FROM`,
-/// a deterministic crash loop. Repair before exiting: fetch a peer
-/// checkpoint at or above the floor, and park the stale DB. The next
-/// restart then takes the ordinary fresh-start restore path, and resumes
-/// from the fetched checkpoint. Repairing at exit, instead of looping
-/// in-process, keeps a single startup path and stays crash-safe at every
-/// step. The fetch is an atomic rename, and the DB is parked only after a
-/// qualifying checkpoint is already on disk.
+/// Replay-window overrun repair, run between two revolutions of the
+/// pipeline, after the engine and every state handle have ended. The
+/// durable cursor fell below the cluster's retention floor, so resuming
+/// from it can never succeed: every start would re-request the same
+/// refused `REPLAY_FROM`. Repair first: fetch a peer checkpoint at or
+/// above the floor, and park the stale DB. The next revolution then
+/// takes the ordinary fresh-start restore path, in the same process, and
+/// resumes from the fetched checkpoint. The startup path stays single:
+/// the revolution re-enters it. The repair stays crash-safe at every
+/// step: the fetch is an atomic rename, and the DB is parked only after
+/// a qualifying checkpoint is already on disk, so a crash mid-repair
+/// lands in a state the startup path already handles. Repairing
+/// in-process, instead of at exit, spares the orchestrator's restart
+/// delay and its restart budget: at a small retention and a high rate,
+/// a revolution races the retention window, and a lost race must cost
+/// one fetch, not one restart attempt (issue #298).
 ///
 /// `adopted_unverified` selects the validator's log wording, for its
 /// catch-up trust class (its adopted state is unverified through the

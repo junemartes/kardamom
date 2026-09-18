@@ -161,7 +161,9 @@ impl DepthReport {
     /// The report interval.
     const INTERVAL: Duration = Duration::from_secs(1);
 
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, partition: u32) -> Self {
+        // Readiness requires explicit zeros, even before the first transaction.
+        (0u8..=u8::MAX).for_each(|vslot| metrics::record_pending_depth(partition, vslot, 0));
         Self {
             at: now,
             depths: [0; 256],
@@ -232,6 +234,7 @@ impl Sequencer {
             until: now + cfg.shadow_warm(),
         });
         metrics::record_shadow_vslots(cfg.partition_index, cfg.shadow_vslots.len());
+        let depth = DepthReport::new(now, cfg.partition_index);
         Ok(Self {
             state: PartitionState::new(cap, cfg.tx_ttl()),
             cfg,
@@ -241,7 +244,7 @@ impl Sequencer {
             lookup: None,
             vslots,
             shadow,
-            depth: DepthReport::new(now),
+            depth,
         })
     }
 

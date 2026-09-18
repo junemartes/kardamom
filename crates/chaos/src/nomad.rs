@@ -8,6 +8,11 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::Deserialize;
 
+mod job;
+mod saved_job;
+pub(crate) use job::Job;
+pub(crate) use saved_job::SavedJob;
+
 /// The log streams to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Streams {
@@ -28,8 +33,25 @@ impl Streams {
 }
 
 /// One allocation of a job, as the listing returns it.
+/// How many transient (5xx) answers one task-log read absorbs before it
+/// fails, and the pause between the attempts.
+const LOG_READ_RETRIES: usize = 3;
+const LOG_READ_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// The outcome of one task-log read.
+enum LogRead {
+    /// The log text; empty for a log Nomad no longer has.
+    Text(String),
+    /// A 5xx answer from the client's fs endpoint.
+    Transient(reqwest::StatusCode),
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Alloc {
+    #[serde(rename = "JobVersion")]
+    pub job_version: u64,
+    #[serde(rename = "DesiredStatus")]
+    pub desired_status: String,
     #[serde(rename = "ID")]
     pub id: String,
     #[serde(rename = "TaskGroup")]
@@ -60,6 +82,13 @@ impl Alloc {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.client_status == "running"
+    }
+
+    /// Running, and meant to keep running: a stopping allocation still
+    /// reports `running` for a moment after the job asks it to stop.
+    #[must_use]
+    pub fn is_desired_running(&self) -> bool {
+        self.is_running() && self.desired_status == "run"
     }
 
     /// The short id CI logs show.
@@ -114,7 +143,15 @@ impl Nomad {
     /// Returns an error if the request fails or the body is not the
     /// allocation listing.
     pub async fn allocations(&self, job: &str) -> anyhow::Result<Vec<Alloc>> {
-        let url = self.url(&format!("/v1/job/{job}/allocations"));
+        self.read(&format!("/v1/job/{job}/allocations")).await
+    }
+
+    pub(crate) async fn job(&self, id: &str) -> anyhow::Result<Job> {
+        self.read(&format!("/v1/job/{id}")).await
+    }
+
+    async fn read<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        let url = self.url(path);
         self.http
             .get(&url)
             .send()
@@ -124,6 +161,30 @@ impl Nomad {
             .json()
             .await
             .with_context(|| format!("decode {url}"))
+    }
+
+    /// The allocations of `job` whose logs Nomad can serve: those on a
+    /// ready client node. A node that a replacement removed, or one that
+    /// is down, keeps its allocations in the listing, but a log read on
+    /// them fails with a server error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node or allocation listing fails.
+    pub async fn allocations_with_logs(&self, job: &str) -> anyhow::Result<Vec<Alloc>> {
+        let ready: std::collections::HashSet<String> = self
+            .nodes()
+            .await?
+            .into_iter()
+            .filter(|n| n.status == "ready")
+            .map(|n| n.id)
+            .collect();
+        Ok(self
+            .allocations(job)
+            .await?
+            .into_iter()
+            .filter(|a| ready.contains(&a.node_id))
+            .collect())
     }
 
     /// The running allocations of `job`.
@@ -136,7 +197,7 @@ impl Nomad {
             .allocations(job)
             .await?
             .into_iter()
-            .filter(Alloc::is_running)
+            .filter(Alloc::is_desired_running)
             .collect())
     }
 
@@ -199,32 +260,62 @@ impl Nomad {
         let url = self.url(&format!(
             "/v1/client/fs/logs/{alloc_id}?task={task}&type={stream}&plain=true&origin=start"
         ));
+        // The client's fs endpoint answers 5xx for a moment while the
+        // task's log file rotates. Evidence readers poll, so a read that
+        // fails once must not end the case; a read that keeps failing
+        // must, with the status in the error.
+        for _ in 0..LOG_READ_RETRIES {
+            match self.read_log_once(&url).await? {
+                LogRead::Text(text) => return Ok(text),
+                LogRead::Transient(status) => Self::retry_pause(&url, status).await,
+            }
+        }
+        match self.read_log_once(&url).await? {
+            LogRead::Text(text) => Ok(text),
+            LogRead::Transient(status) => anyhow::bail!("GET {url}: {status} after retries"),
+        }
+    }
+
+    /// Log a transient answer and wait before the next attempt.
+    async fn retry_pause(url: &str, status: reqwest::StatusCode) {
+        crate::log(format!("log read {url} answered {status}; retrying"));
+        tokio::time::sleep(LOG_READ_RETRY_DELAY).await;
+    }
+
+    /// One read of a task log. A missing log reads as empty text; a 5xx
+    /// answer is transient and left to the caller.
+    async fn read_log_once(&self, url: &str) -> anyhow::Result<LogRead> {
         let response = self
             .http
-            .get(&url)
+            .get(url)
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(String::new());
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(LogRead::Text(String::new()));
         }
-        response
+        if status.is_server_error() {
+            return Ok(LogRead::Transient(status));
+        }
+        let text = response
             .error_for_status()
             .with_context(|| format!("GET {url}"))?
             .text()
             .await
-            .with_context(|| format!("read {url}"))
+            .with_context(|| format!("read {url}"))?;
+        Ok(LogRead::Text(text))
     }
 
-    /// The concatenated logs of every allocation of `job`, running or
-    /// not, every task, in the streams asked for. This is the evidence
-    /// source for lines that straddle a task restart.
+    /// The concatenated logs of every allocation of `job` on a ready node,
+    /// running or not, every task, in the streams asked for. This is the
+    /// evidence source for lines that straddle a task restart.
     ///
     /// # Errors
     ///
     /// Returns an error if the listing or a log read fails.
     pub async fn job_logs(&self, job: &str, streams: Streams) -> anyhow::Result<String> {
-        let allocs = self.allocations(job).await?;
+        let allocs = self.allocations_with_logs(job).await?;
         let mut out = String::new();
         for alloc in &allocs {
             out.push_str(&self.alloc_logs(alloc, streams).await?);
@@ -351,11 +442,11 @@ mod tests {
     #[test]
     fn decodes_an_allocation_listing() {
         let body = r#"[{"ID":"788914fb-2aa0","TaskGroup":"executor","ClientStatus":"running",
-            "NodeName":"executor-2","NodeID":"2d99","TaskStates":{"executor":{"State":"running"}}},
+            "JobVersion":2,"DesiredStatus":"run","NodeName":"executor-2","NodeID":"2d99","TaskStates":{"executor":{"State":"running"}}},
             {"ID":"35f2b819-1111","TaskGroup":"executor","ClientStatus":"complete",
-            "NodeName":"executor-1","NodeID":"3653","TaskStates":{}},
+            "JobVersion":2,"DesiredStatus":"run","NodeName":"executor-1","NodeID":"3653","TaskStates":{}},
             {"ID":"0f89a7f1-2222","TaskGroup":"executor","ClientStatus":"pending",
-            "NodeName":"executor-1","NodeID":"3653","TaskStates":null}]"#;
+            "JobVersion":2,"DesiredStatus":"run","NodeName":"executor-1","NodeID":"3653","TaskStates":null}]"#;
         let allocs: Vec<Alloc> = serde_json::from_str(body).unwrap();
         assert_eq!(allocs.iter().filter(|a| a.is_running()).count(), 1);
         assert_eq!(allocs[0].short_id(), "788914fb");

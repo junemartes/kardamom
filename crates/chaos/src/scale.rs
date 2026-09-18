@@ -1,6 +1,7 @@
 //! A sequencer resize warms gaining lanes in shadow mode, switches the ingress
 //! map, drains old lanes for one transaction TTL, then installs the steady job.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -10,10 +11,13 @@ use kardamom_types::shard_map::ShardMap;
 
 use crate::contract::NodeContract;
 use crate::lifecycle::NOMAD_HTTP_PORT;
-use crate::metrics::{self, Scrape, Target};
+use crate::metrics::{Scrape, Target};
+
+mod readiness;
 use crate::nomad::Nomad;
 use crate::poll::{self, Budget};
 use crate::probes::{Probed, SEQUENCER_LANE0_PORT};
+use readiness::LaneReadiness;
 
 const MAP: &str = "config/shard-map.toml";
 const NEXT_MAP: &str = "config/shard-map.next.toml";
@@ -37,7 +41,7 @@ const SHADOW: &str = "kardamom_sequencer_shadow_vslots";
 pub struct Resize {
     cluster_dir: PathBuf,
     nomad_addr: String,
-    sequencers: Vec<Probed>,
+    sequencers: BTreeMap<String, Probed>,
     tx_ttl: Duration,
     target: u32,
     dry_run: bool,
@@ -70,9 +74,14 @@ impl Resize {
             sequencers: contract
                 .of_role("sequencer")
                 .into_iter()
-                .map(|n| Probed {
-                    container: n.container.clone(),
-                    ip: n.ip,
+                .map(|n| {
+                    (
+                        n.name.clone(),
+                        Probed {
+                            container: n.container.clone(),
+                            ip: n.ip,
+                        },
+                    )
                 })
                 .collect(),
             tx_ttl: tx_ttl_in(&group_vars)?,
@@ -163,100 +172,34 @@ impl Resize {
         self.cluster_dir.join(rel)
     }
 
-    async fn lane_metric(&self, replica: &Probed, lane: u32, metric: &str) -> Option<i64> {
-        let body = self.scrape.fetch(&lane_target(replica, lane)).await?;
-        metrics::sum(&body, metric)
-    }
-
-    /// No replica of an active lane may be resyncing or holding parked
-    /// entries. A replica parks entries for a few seconds while a
-    /// sender's nonce gap fills in, and resyncs for a few seconds after
-    /// a restart, so the guard waits one TTL plus a margin for both
-    /// gauges to read zero. A replica parked past that is the sealer
-    /// backpressure the guard exists for. A replica that does not answer
-    /// is not in the way: not every node runs every lane.
+    /// Every expected replica must prove both idle gauges in one scrape.
     async fn preflight(&self, current: u32) -> anyhow::Result<()> {
-        if self.dry_run {
-            return Ok(());
-        }
-        for lane in 0..current {
-            self.wait_lane_idle(lane).await?;
-        }
-        Ok(())
+        self.wait_ready(
+            &(0..current).collect::<Vec<_>>(),
+            &[RESYNC, PENDING],
+            "preflight",
+        )
+        .await
     }
 
-    async fn wait_lane_idle(&self, lane: u32) -> anyhow::Result<()> {
-        for replica in &self.sequencers {
-            self.wait_replica_idle(replica, lane).await?;
-        }
-        Ok(())
-    }
-
-    async fn replica_idle(&self, replica: &Probed, lane: u32) -> bool {
-        let resync = self.lane_metric(replica, lane, RESYNC).await.unwrap_or(0);
-        let pending = self.lane_metric(replica, lane, PENDING).await.unwrap_or(0);
-        resync == 0 && pending == 0
-    }
-
-    async fn wait_replica_idle(&self, replica: &Probed, lane: u32) -> anyhow::Result<()> {
-        let budget = Budget::new(self.tx_ttl.saturating_add(WAIT_MARGIN), METRIC_INTERVAL);
-        let outcome = poll::until(budget, |_| async {
-            Ok(self.replica_idle(replica, lane).await.then_some(()))
-        })
-        .await?;
-        outcome.or_fail(|t| {
-            anyhow::anyhow!(
-                "replica {}:{} is in resync mode or holds parked entries after {}s (sealer backpressure); not resizing",
-                replica.ip,
-                lane_port(lane),
-                t.as_secs()
-            )
-        })?;
-        Ok(())
-    }
-
-    /// Wait until `metric` reads zero on every replica of every lane
-    /// that exposes it.
     async fn wait_lanes(&self, lanes: &[u32], metric: &str, what: &str) -> anyhow::Result<()> {
+        self.wait_ready(lanes, &[metric], what).await
+    }
+
+    async fn wait_ready(&self, lanes: &[u32], metrics: &[&str], what: &str) -> anyhow::Result<()> {
         if self.dry_run {
             return Ok(());
         }
-        for lane in lanes {
-            self.wait_lane(*lane, metric, what).await?;
-        }
-        Ok(())
-    }
-
-    async fn wait_lane(&self, lane: u32, metric: &str, what: &str) -> anyhow::Result<()> {
-        for replica in &self.sequencers {
-            self.wait_replica(replica, lane, metric, what).await?;
-        }
-        Ok(())
-    }
-
-    async fn wait_replica(
-        &self,
-        replica: &Probed,
-        lane: u32,
-        metric: &str,
-        what: &str,
-    ) -> anyhow::Result<()> {
-        if self.lane_metric(replica, lane, metric).await.is_none() {
-            return Ok(());
-        }
+        let ready = LaneReadiness::new(self, lanes, metrics).await?;
         let budget = Budget::new(self.tx_ttl.saturating_add(WAIT_MARGIN), METRIC_INTERVAL);
         let outcome = poll::until(budget, |_| async {
-            Ok((self.lane_metric(replica, lane, metric).await == Some(0)).then_some(()))
+            Ok(ready.sample().await?.then_some(()))
         })
         .await?;
-        outcome.or_fail(|t| {
-            anyhow::anyhow!(
-                "{what} of lane {lane}: {}:{} {metric} is not 0 after {}s",
-                replica.ip,
-                lane_port(lane),
-                t.as_secs()
-            )
-        })?;
+        outcome.or_fail(|t| anyhow::anyhow!(
+            "{what}: every expected replica of lanes {} must answer {} with zero on the current job version within {}s",
+            join(lanes), metrics.join(", "), t.as_secs()
+        ))?;
         Ok(())
     }
 
@@ -323,20 +266,16 @@ impl Resize {
         Ok(())
     }
 
-    /// At least one allocation runs and none is pending.
+    /// Every desired group has its full count running on the current job version.
     async fn wait_running(&self, job: &str) -> anyhow::Result<()> {
         if self.dry_run {
             return Ok(());
         }
         let nomad = Nomad::new(&self.nomad_addr)?;
+        let desired = nomad.job(job).await?;
         let outcome = poll::until(Budget::secs(CONVERGE_SECS, 5), |_| async {
             let allocs = nomad.allocations(job).await?;
-            let running = allocs.iter().filter(|a| a.is_running()).count();
-            let pending = allocs
-                .iter()
-                .filter(|a| a.client_status == "pending")
-                .count();
-            Ok((running >= 1 && pending == 0).then_some(()))
+            Ok(desired.running(&allocs).map(|_| ()))
         })
         .await?;
         outcome.or_fail(|t| anyhow::anyhow!("job {job} did not converge in {}s", t.as_secs()))?;
@@ -416,7 +355,7 @@ mod tests {
         let resize = Resize {
             cluster_dir: dir.path().to_path_buf(),
             nomad_addr: "http://127.0.0.1:1".to_string(),
-            sequencers: Vec::new(),
+            sequencers: BTreeMap::new(),
             tx_ttl: Duration::from_secs(1),
             target: 3,
             dry_run: true,

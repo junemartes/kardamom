@@ -120,10 +120,12 @@ impl<W: ExecPorts> ExecState<W> {
         let (receipt, ws) = result?;
         self.cumulative_gas_used = receipt.cumulative_gas_used;
         self.tx_index_in_block += 1;
+        let accounts = ws.account_rows();
         self.delta.apply(ws);
         *self.block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
         self.block_receipts.push(receipt.clone());
-        if self.tx.send(ExecToCommit::Receipt(receipt)).is_err() {
+        let item = kardamom_types::ReceiptRows { receipt, accounts };
+        if self.tx.send(ExecToCommit::Receipt(Box::new(item))).is_err() {
             return Ok(Flow::Stop);
         }
         Ok(Flow::Continue)

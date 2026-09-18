@@ -104,6 +104,11 @@ job "executor" {
       # fixed port sat in the node's ephemeral range, where the shared
       # media driver's port-0 discovery sockets could take it first.
       port "egress" {}
+      # The join-miss refetch ports: replayed fragments and archive
+      # control responses. Nomad picks them per allocation, below the
+      # ephemeral range, so no other process on the node holds them.
+      port "replay" {}
+      port "archive_response" {}
     }
 
     task "executor" {
@@ -114,9 +119,6 @@ job "executor" {
       # chosen from data. This stays unset in normal operation, and is
       # harmless (log-only) when set.
       env {
-        # The UDP ports the discovered receipt, boundary, and BAL
-        # publications bind on this node. One executor runs per node.
-        KARDAMOM_MDC_PORTS = "40320-40329"
         # BAL attribution granularity. K=20 measured a 31% reduction
         # in frame bytes on contract workloads
         # (docs/agents/2026-08-01-bal-phase1-measurement and the DeFi
@@ -174,14 +176,13 @@ job "executor" {
           # the live multicast misses a canonical ref's envelope
           # (down-window, image lapse, blackout), it replays in-band
           # from the durability archives listed in channels.toml
-          # (ingress .31/.32; aux .61). Replayed fragments land on
-          # 40130, and archive-control responses land on 40140, both
-          # on this node's cluster NIC (${meta.node_ip}). One executor
-          # runs per node (distinct_hosts), so there is no
-          # cross-replica collision. tx_ordering recovery goes through
-          # the Aeron Cluster client's REPLAY_FROM.
-          "--replay-destination-endpoint", "${meta.node_ip}:40130",
-          "--archive-control-response-endpoint", "${meta.node_ip}:40140",
+          # (ingress .31/.32; aux .61). Replayed fragments and
+          # archive-control responses land on this node's cluster NIC
+          # (${meta.node_ip}), on the allocation's dynamic ports.
+          # tx_ordering recovery goes through the Aeron Cluster
+          # client's REPLAY_FROM.
+          "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
+          "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
           # Fast cold-start recovery: restore the newest checkpoint
           # into a wiped or empty state_dir before startup, replaying
           # only the tail, not from genesis. Write a checkpoint every

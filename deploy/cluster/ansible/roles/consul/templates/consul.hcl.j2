@@ -45,7 +45,9 @@ acl {
   enable_token_persistence = true
 
   tokens {
-    agent = "{{ consul_agent_token }}"
+    agent   = "{{ consul_agent_token }}"
+    # DNS requests carry no token. The default token authorizes their reads.
+    default = "{{ consul_dns_token }}"
   }
 }
 {% endif %}

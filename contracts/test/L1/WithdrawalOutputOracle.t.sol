@@ -239,3 +239,180 @@ contract WithdrawalOutputOracleTest is Test {
         assertEq(oracle.finalizationWindow(), 2 days);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Recovery: pause, rollback, and the settlement floor.
+// ---------------------------------------------------------------------------
+
+contract WithdrawalOutputOracleRecoveryTest is Test {
+    WithdrawalOutputOracle oracle;
+    address constant ATTESTER = address(0xA77E);
+    address constant CHALLENGER = address(0xC4A1);
+    address constant RECOVERY = address(0x4EC0);
+    uint64 constant WINDOW = 1 days;
+    address constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
+
+    event OutputDeleted(uint256 indexed index, bytes32 outputRoot);
+    event OutputsRolledBack(uint256 indexed fromIndex, uint256 count);
+    event FinalizationResumed(uint64 timestamp, uint256 restarted);
+
+    function setUp() public {
+        WithdrawalOutputOracle impl = new WithdrawalOutputOracle();
+        bytes memory initData = abi.encodeWithSelector(
+            WithdrawalOutputOracle.initialize.selector, ATTESTER, CHALLENGER, WINDOW
+        );
+        oracle = WithdrawalOutputOracle(address(new ERC1967Proxy(address(impl), initData)));
+        vm.warp(1_700_000_000);
+        vm.prank(FACTORY);
+        oracle.setRecovery(RECOVERY);
+    }
+
+    function propose(bytes32 root, uint64 l2Block) internal returns (uint256) {
+        vm.prank(ATTESTER);
+        return oracle.proposeOutput(root, l2Block);
+    }
+
+    function test_setRecovery_factory_only_and_zero_disables() public {
+        vm.expectRevert(KardamomUUPSBase.NotFactory.selector);
+        oracle.setRecovery(address(1));
+        vm.prank(RECOVERY);
+        vm.expectRevert(KardamomUUPSBase.NotFactory.selector);
+        oracle.setRecovery(address(1));
+
+        vm.prank(FACTORY);
+        oracle.setRecovery(address(0));
+        assertEq(oracle.recovery(), address(0));
+        vm.prank(RECOVERY);
+        vm.expectRevert(WithdrawalOutputOracle.NotRecovery.selector);
+        oracle.pause();
+    }
+
+    function test_recovery_functions_reject_strangers() public {
+        propose(keccak256("a"), 10);
+        vm.expectRevert(WithdrawalOutputOracle.NotRecovery.selector);
+        oracle.rollbackOutputs(0);
+        vm.prank(CHALLENGER);
+        vm.expectRevert(WithdrawalOutputOracle.NotRecovery.selector);
+        oracle.pause();
+        vm.prank(ATTESTER);
+        vm.expectRevert(WithdrawalOutputOracle.NotRecovery.selector);
+        oracle.unpause();
+    }
+
+    function test_rollback_deletes_the_unsettled_suffix() public {
+        propose(keccak256("a"), 10);
+        propose(keccak256("b"), 20);
+        propose(keccak256("c"), 30);
+
+        vm.expectEmit(true, false, false, true);
+        emit OutputDeleted(1, keccak256("b"));
+        vm.expectEmit(true, false, false, true);
+        emit OutputDeleted(2, keccak256("c"));
+        vm.expectEmit(true, false, false, true);
+        emit OutputsRolledBack(1, 2);
+        vm.prank(RECOVERY);
+        oracle.rollbackOutputs(1);
+
+        assertFalse(oracle.getOutput(0).deleted);
+        assertTrue(oracle.getOutput(1).deleted);
+        assertTrue(oracle.getOutput(2).deleted);
+        vm.warp(block.timestamp + WINDOW);
+        assertTrue(oracle.isFinalizable(0));
+        assertFalse(oracle.isFinalizable(1));
+        assertFalse(oracle.isFinalizable(2));
+
+        // The restored chain re-proposes below the discarded blocks.
+        uint256 idx = propose(keccak256("b2"), 15);
+        assertEq(idx, 3);
+    }
+
+    function test_rollback_refuses_a_settled_output() public {
+        propose(keccak256("a"), 10);
+        vm.warp(block.timestamp + WINDOW); // output 0 settles
+        propose(keccak256("b"), 20);
+
+        vm.prank(RECOVERY);
+        vm.expectRevert(
+            abi.encodeWithSelector(WithdrawalOutputOracle.BelowSettlementFloor.selector, 0)
+        );
+        oracle.rollbackOutputs(0);
+
+        // Above the floor it works.
+        vm.prank(RECOVERY);
+        oracle.rollbackOutputs(1);
+        assertTrue(oracle.getOutput(1).deleted);
+        assertFalse(oracle.getOutput(0).deleted);
+    }
+
+    function test_rollback_skips_already_deleted_and_rejects_unknown_index() public {
+        propose(keccak256("a"), 10);
+        propose(keccak256("b"), 20);
+        vm.prank(CHALLENGER);
+        oracle.deleteOutput(0);
+
+        vm.prank(RECOVERY);
+        vm.expectEmit(true, false, false, true);
+        emit OutputsRolledBack(0, 1);
+        oracle.rollbackOutputs(0);
+
+        vm.prank(RECOVERY);
+        vm.expectRevert(WithdrawalOutputOracle.UnknownOutput.selector);
+        oracle.rollbackOutputs(2);
+    }
+
+    function test_pause_blocks_finalization_and_stops_the_clock() public {
+        propose(keccak256("a"), 10);
+        vm.warp(block.timestamp + WINDOW - 100);
+        vm.prank(RECOVERY);
+        oracle.pause();
+        assertTrue(oracle.paused());
+
+        // The window would have ended during the pause. It does not settle.
+        vm.warp(block.timestamp + 10 days);
+        assertFalse(oracle.isFinalizable(0));
+        // So the challenger can still delete it, and recovery can still
+        // roll it back.
+        vm.prank(RECOVERY);
+        oracle.rollbackOutputs(0);
+        assertTrue(oracle.getOutput(0).deleted);
+
+        vm.prank(RECOVERY);
+        vm.expectRevert(WithdrawalOutputOracle.AlreadyPaused.selector);
+        oracle.pause();
+    }
+
+    function test_unpause_restarts_unsettled_clocks_only() public {
+        uint64 t0 = uint64(block.timestamp);
+        propose(keccak256("a"), 10); // settles before the pause
+        vm.warp(t0 + WINDOW);
+        propose(keccak256("b"), 20);
+        propose(keccak256("c"), 30);
+        vm.prank(CHALLENGER);
+        oracle.deleteOutput(2); // deleted: not restarted, not finalizable
+
+        vm.prank(RECOVERY);
+        oracle.pause();
+        uint64 tResume = t0 + WINDOW + 3 days;
+        vm.warp(tResume);
+
+        vm.expectEmit(false, false, false, true);
+        emit FinalizationResumed(tResume, 1);
+        vm.prank(RECOVERY);
+        oracle.unpause();
+        assertFalse(oracle.paused());
+
+        // Output 0 was settled: untouched, finalizable at once.
+        assertEq(oracle.getOutput(0).timestamp, t0);
+        assertTrue(oracle.isFinalizable(0));
+        // Output 1 waits a full window again.
+        assertEq(oracle.getOutput(1).timestamp, tResume);
+        assertFalse(oracle.isFinalizable(1));
+        vm.warp(tResume + WINDOW);
+        assertTrue(oracle.isFinalizable(1));
+        assertFalse(oracle.isFinalizable(2));
+
+        vm.prank(RECOVERY);
+        vm.expectRevert(WithdrawalOutputOracle.NotPaused.selector);
+        oracle.unpause();
+    }
+}

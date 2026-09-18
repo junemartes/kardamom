@@ -221,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = LoadConfig {
         workload: args.workload,
         rpc: args.rpc,
+        receipt_rpcs: Vec::new(),
         chain_id: args.chain_id,
         duration: args.duration,
         target_tps: args.target_tps,

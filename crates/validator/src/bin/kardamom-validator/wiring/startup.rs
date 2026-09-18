@@ -16,26 +16,28 @@ use kardamom_validator::{BalBuffer, ClaimBuffer, Divergence, ReceiptBuffer};
 
 use crate::args::{Args, ValidatorFileConfig};
 
-/// Started tracing and metrics, the resolved file config, and the main
-/// Aeron runtime. The first phase: nothing has opened state or streams yet.
-pub(crate) struct Startup {
-    pub(super) args: Args,
+/// What one process sets up once: tracing, the metrics exporter, the
+/// parsed configs, and the shutdown signal. Every revolution of the
+/// pipeline (see [`super::revolve`]) starts from a clone of this.
+pub(crate) struct Boot {
+    pub(crate) args: Args,
     pub(super) file_cfg: ValidatorFileConfig,
-    pub(super) aeron_cfg: AeronConfig,
-    pub(super) rt: AeronRuntime,
-    /// The stream plane the verification subscriptions open through.
-    pub(super) plane: StreamPlane,
+    pub(super) log_cfg: LogConfig,
+    /// Cancelled on the operator's shutdown signal. A revolution checks
+    /// it before it starts, so a signal that lands during the repair
+    /// between two revolutions ends the process instead of being lost.
+    pub(crate) stop: tokio_util::sync::CancellationToken,
 }
 
-impl Startup {
+impl Boot {
     /// Start tracing and metrics, load the file config (merging the
-    /// per-node cluster egress endpoint override), resolve the log
-    /// config, and spawn the main Aeron runtime.
+    /// per-node cluster egress endpoint override), and resolve the log
+    /// config.
     ///
     /// # Errors
     ///
-    /// Returns an error if metrics init, config read/parse, log config
-    /// resolve, or the Aeron runtime spawn fails.
+    /// Returns an error if metrics init, config read/parse, or the log
+    /// config resolve fails.
     pub(crate) async fn init(args: Args) -> Result<Self> {
         bin_support::init_tracing();
         kardamom_obs::init_service!("validator", args.metrics_addr, &args.host_id).await?;
@@ -63,17 +65,53 @@ impl Startup {
 
         let log_cfg =
             LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
-        let plane =
-            StreamPlane::from_config(&log_cfg, "validator").context("build the stream plane")?;
-        let mut aeron_cfg = log_cfg.aeron;
+        let stop = tokio_util::sync::CancellationToken::new();
+        let signal = stop.clone();
+        tokio::spawn(async move {
+            kardamom_obs::bin::wait_for_shutdown().await;
+            signal.cancel();
+        });
+        Ok(Self {
+            args,
+            file_cfg,
+            log_cfg,
+            stop,
+        })
+    }
+}
+
+/// The stream plane and the main Aeron runtime of one revolution, over
+/// the once-only [`Boot`]. The first phase: nothing has opened state or
+/// streams yet.
+pub(crate) struct Startup {
+    pub(super) args: Args,
+    pub(super) file_cfg: ValidatorFileConfig,
+    pub(super) aeron_cfg: AeronConfig,
+    pub(super) rt: AeronRuntime,
+    /// The stream plane the verification subscriptions open through.
+    pub(super) plane: StreamPlane,
+}
+
+impl Startup {
+    /// Build the stream plane and spawn the main Aeron runtime for one
+    /// revolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plane build or the Aeron runtime spawn
+    /// fails.
+    pub(crate) fn from_boot(boot: &Boot) -> Result<Self> {
+        let args = boot.args.clone();
+        let plane = StreamPlane::from_config(&boot.log_cfg, "validator")
+            .context("build the stream plane")?;
+        let mut aeron_cfg = boot.log_cfg.aeron.clone();
         if let Some(dir) = args.aeron_dir.as_ref() {
             aeron_cfg.aeron_dir.clone_from(dir);
         }
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-
         Ok(Self {
             args,
-            file_cfg,
+            file_cfg: boot.file_cfg.clone(),
             aeron_cfg,
             rt,
             plane,

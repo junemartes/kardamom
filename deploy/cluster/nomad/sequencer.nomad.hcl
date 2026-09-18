@@ -24,10 +24,6 @@ variable "metrics_base" {
   type    = number
   default = 9001
 }
-variable "mdc_base" {
-  type    = number
-  default = 40340
-}
 variable "shard_table" {
   type        = list(number)
   description = "The target map's 256 lane assignments. Empty uses the two-lane development identity map."
@@ -150,7 +146,6 @@ job "sequencer" {
           env {
             KARDAMOM_METRICS_ADDR = "0.0.0.0:${var.metrics_base + 10 * parseint(group.key, 10)}"
             KARDAMOM_HOST_ID      = "node${meta.node_index}-seq-${group.key}"
-            KARDAMOM_MDC_PORTS    = "${var.mdc_base + 10 * parseint(group.key, 10)}-${var.mdc_base + 10 * parseint(group.key, 10) + 9}"
           }
 
           template {

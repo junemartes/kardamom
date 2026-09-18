@@ -39,6 +39,7 @@ pub mod nodes;
 pub mod nomad;
 pub mod poll;
 pub mod probes;
+pub mod replace;
 pub mod rpc;
 pub mod scale;
 pub mod shard;

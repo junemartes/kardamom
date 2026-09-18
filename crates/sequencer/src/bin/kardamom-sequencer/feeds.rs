@@ -21,9 +21,13 @@ mod steps;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
+use kardamom_cache::{
+    CacheReader, ExecutorQuery, ExecutorQueryConfig, LiveAccounts, LiveAccountsWriter, QueryError,
+};
 use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
@@ -34,7 +38,7 @@ use kardamom_log::aeron_live::{
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
-use kardamom_sequencer::lookup::{self, LookupConfig, LookupRequester};
+use kardamom_sequencer::lookup::{LookupConfig, LookupRequester};
 use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::pump::{OriginLane, Pump};
@@ -43,6 +47,7 @@ use kardamom_sequencer::resync::{
 };
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
 use kardamom_types::shard_map::{VslotSet, vslot_for};
+use kardamom_types::{AccountRow, ReceiptBatch};
 
 /// One `tx_data` lane subscription: the lane index the sequencer stamps
 /// into every ref off it, and the handle that reads it.
@@ -286,21 +291,33 @@ impl EgressWatermarkFeed {
 /// The `tx_receipts`-to-per-sender executed-truth floor feed. Only the
 /// senders of this replica's vslots reach the floor channel. The set is
 /// the replica's whole set, shadow slots included: floors must advance
-/// for the incoming senders during the warm-up too.
+/// for the incoming senders during the warm-up too. The batch frame's
+/// account rows of the same vslots go into the local account layer,
+/// before the receipts forward.
 ///
 /// The receipts handle already fans in over a tokio unbounded channel. The
 /// Aeron poll thread is the producer. So this is a plain async task. It
-/// awaits `recv()` and `Shutdown::cancelled`, with no idle-sleep polling.
-/// `floor_tx` stays a std channel, because its consumer is the sync
-/// `ResyncController` in the publish loop.
+/// awaits `recv_batch()` and `Shutdown::cancelled`, with no idle-sleep
+/// polling. `floor_tx` stays a std channel, because its consumer is the
+/// sync `ResyncController` in the publish loop.
 pub(crate) struct ReceiptFloorFeed {
     vslots: VslotSet,
     floor_tx: crossbeam_channel::Sender<FloorUpdate>,
+    /// The local account layer's one writer.
+    writer: LiveAccountsWriter,
 }
 
 impl ReceiptFloorFeed {
-    pub(crate) fn new(vslots: VslotSet, floor_tx: crossbeam_channel::Sender<FloorUpdate>) -> Self {
-        Self { vslots, floor_tx }
+    pub(crate) fn new(
+        vslots: VslotSet,
+        floor_tx: crossbeam_channel::Sender<FloorUpdate>,
+        writer: LiveAccountsWriter,
+    ) -> Self {
+        Self {
+            vslots,
+            floor_tx,
+            writer,
+        }
     }
 
     /// Spawn as a plain async task. The handle reduces to its receiver
@@ -317,7 +334,11 @@ impl ReceiptFloorFeed {
         tokio::spawn(self.run(rx, shutdown))
     }
 
-    async fn run(self, mut rx: kardamom_log::aeron_live::TxReceiptsReceiver, shutdown: Shutdown) {
+    async fn run(
+        mut self,
+        mut rx: kardamom_log::aeron_live::TxReceiptsReceiver,
+        shutdown: Shutdown,
+    ) {
         loop {
             match self.tick(&mut rx, &shutdown).await {
                 ControlFlow::Break(()) => return,
@@ -326,25 +347,45 @@ impl ReceiptFloorFeed {
         }
     }
 
-    /// One [`Self::run`] pass: wait for the next receipt or shutdown,
-    /// then forward it. `Break` means the task should stop: shutdown,
-    /// the subscription closed, or the publish loop is gone.
+    /// One [`Self::run`] pass: wait for the next batch or shutdown,
+    /// then apply its rows and forward its receipts. `Break` means the
+    /// task should stop: shutdown, the subscription closed, or the
+    /// publish loop is gone.
     async fn tick(
-        &self,
+        &mut self,
         rx: &mut kardamom_log::aeron_live::TxReceiptsReceiver,
         shutdown: &Shutdown,
     ) -> ControlFlow<()> {
-        let receipt = tokio::select! {
+        let batch = tokio::select! {
             biased;
             () = shutdown.cancelled() => return ControlFlow::Break(()),
-            msg = rx.recv() => match msg {
-                Some((_pos, receipt)) => receipt,
+            msg = rx.recv_batch() => match msg {
+                Some((_pos, batch)) => batch,
                 // The subscription closed. The runtime shut down.
                 // Nothing more to feed.
                 None => return ControlFlow::Break(()),
             },
         };
-        self.forward_one_receipt(&receipt)
+        self.forward_batch(batch)
+    }
+
+    /// The rows of this replica's vslots into the local layer at the
+    /// batch's end position, then every receipt through the floor
+    /// filter. The rows go first, so a lookup request the receipt's
+    /// park raises finds the entry.
+    fn forward_batch(&mut self, batch: ReceiptBatch) -> ControlFlow<()> {
+        if let Some(end) = batch.end_tx_idx() {
+            let rows: Vec<AccountRow> = batch
+                .accounts
+                .into_iter()
+                .filter(|row| self.vslots.contains(vslot_for(row.address)))
+                .collect();
+            self.writer.apply(end, &rows);
+        }
+        for receipt in &batch.receipts {
+            self.forward_one_receipt(receipt)?;
+        }
+        ControlFlow::Continue(())
     }
 
     /// Filter, build, and forward one receipt, for [`Self::tick`].
@@ -388,17 +429,19 @@ impl ReceiptFloorFeed {
 /// One lookup result, from a query task back to the drain.
 struct LookupDone {
     sender: Address,
-    result: Result<u64, String>,
+    result: Result<u64, QueryError>,
 }
 
-/// The nonce lookup task. It drains the core's requests, dedups the
-/// senders in flight, bounds the concurrency and the per-sender retry
-/// rate, queries the executors, and delivers each answer as a
-/// `FloorUpdate`. See `kardamom_sequencer::lookup`.
+/// The nonce lookup task. It drains the core's requests, answers a
+/// resident sender from the local account layer, dedups the senders in
+/// flight, bounds the concurrency and the per-sender retry rate, asks
+/// Redis when `[cache]` is on, then the executors, and delivers each
+/// answer as a `FloorUpdate`. See `kardamom_sequencer::lookup`.
 ///
 /// One query runs on its own task, so a slow executor never blocks the
 /// drain. The endpoints rotate per query, and a query walks the list until
-/// one endpoint answers within the timeout.
+/// one endpoint answers within the timeout. A Redis nonce needs no
+/// freshness gate: like the executor's answer, it is a lower bound.
 pub(crate) struct NonceLookupFeed {
     cfg: LookupConfig,
     partition: u32,
@@ -406,46 +449,53 @@ pub(crate) struct NonceLookupFeed {
     rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
     shutdown: Shutdown,
     floor_tx: crossbeam_channel::Sender<FloorUpdate>,
-    client: reqwest::Client,
-    endpoints: std::sync::Arc<[String]>,
+    /// The local account layer. A resident sender is answered from it.
+    live: Arc<LiveAccounts>,
+    /// The Redis layer. `None` with `[cache]` off.
+    redis: Option<Arc<CacheReader>>,
+    query: ExecutorQuery,
     done_tx: tokio::sync::mpsc::UnboundedSender<LookupDone>,
     done_rx: tokio::sync::mpsc::UnboundedReceiver<LookupDone>,
     in_flight: HashSet<Address>,
     /// The last request time per sender. It bounds the retry rate to one
     /// lookup per timeout per sender.
     recent: HashMap<Address, Instant>,
-    next_endpoint: usize,
 }
 
 impl NonceLookupFeed {
     /// The `recent` map is pruned once it holds this many senders.
     const RECENT_CAP: usize = 4096;
 
-    /// Build the feed over the core's request channel. Fails only when
-    /// the HTTP client cannot be built.
+    /// Build the feed over the core's request channel. `None` when the
+    /// config names no executor endpoint.
     pub(crate) fn new(
         cfg: LookupConfig,
         partition: u32,
         rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
         shutdown: Shutdown,
         floor_tx: crossbeam_channel::Sender<FloorUpdate>,
-    ) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder().timeout(cfg.timeout()).build()?;
-        let endpoints: std::sync::Arc<[String]> = cfg.executor_endpoints.clone().into();
+        live: Arc<LiveAccounts>,
+        redis: Option<Arc<CacheReader>>,
+    ) -> Option<Self> {
+        let query = ExecutorQuery::new(&ExecutorQueryConfig {
+            endpoints: cfg.executor_endpoints.clone(),
+            timeout_ms: cfg.timeout_ms,
+            max_in_flight: cfg.max_in_flight,
+        })?;
         let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
-        Ok(Self {
+        Some(Self {
             cfg,
             partition,
             rx,
             shutdown,
             floor_tx,
-            client,
-            endpoints,
+            live,
+            redis,
+            query,
             done_tx,
             done_rx,
             in_flight: HashSet::new(),
             recent: HashMap::new(),
-            next_endpoint: 0,
         })
     }
 
@@ -487,13 +537,18 @@ impl NonceLookupFeed {
         };
         seq_metrics::record_nonce_lookup(self.partition, "ok");
         tracing::debug!(sender = ?done.sender, nonce, "nonce lookup answered");
-        // A committed nonce `c` proves every nonce below it executed.
-        // Nonce 0 proves nothing.
+        self.floor_from_committed(done.sender, nonce)
+    }
+
+    /// A committed nonce `c` proves every nonce below it executed, so it
+    /// is floor evidence of the same kind as a receipt. Nonce 0 proves
+    /// nothing. `Break` means the publish loop is gone.
+    fn floor_from_committed(&self, sender: Address, nonce: u64) -> ControlFlow<()> {
         let Some(executed_nonce) = nonce.checked_sub(1) else {
             return ControlFlow::Continue(());
         };
         let update = FloorUpdate {
-            sender: done.sender,
+            sender,
             executed_nonce,
             skip_reason: None,
             deposit: false,
@@ -504,10 +559,17 @@ impl NonceLookupFeed {
         }
     }
 
-    /// One request from the core: drop it if the sender is in flight or
-    /// asked within the last timeout, shed it at the concurrency bound,
-    /// else start a query task.
+    /// One request from the core: answer it from the local layer when
+    /// the sender is resident, else drop it if the sender is in flight
+    /// or asked within the last timeout, shed it at the concurrency
+    /// bound, else start a query task.
     fn on_request(&mut self, sender: Address) {
+        if let Some(view) = self.live.get(sender) {
+            seq_metrics::record_nonce_lookup(self.partition, "local");
+            // A gone publish loop ends the drain on its next tick.
+            let _ = self.floor_from_committed(sender, view.nonce);
+            return;
+        }
         let now = Instant::now();
         let timeout = self.cfg.timeout();
         let asked_recently = self
@@ -530,87 +592,33 @@ impl NonceLookupFeed {
         self.spawn_query(sender);
     }
 
-    /// Start one query task for `sender`, rotating the first endpoint.
-    fn spawn_query(&mut self, sender: Address) {
-        let first = self.next_endpoint % self.endpoints.len();
-        self.next_endpoint = self.next_endpoint.wrapping_add(1);
-        let query = ExecutorQuery::new(self.client.clone(), self.endpoints.clone(), first, sender);
+    /// Start one query task for `sender`: Redis first when it is on, then
+    /// the executors.
+    fn spawn_query(&self, sender: Address) {
+        let query = self.query.clone();
+        let redis = self.redis.clone();
         let done_tx = self.done_tx.clone();
+        let partition = self.partition;
         tokio::spawn(async move {
-            let result = query.run().await;
+            let result = match redis_nonce(redis.as_deref(), sender).await {
+                Some(nonce) => {
+                    seq_metrics::record_nonce_lookup(partition, "redis");
+                    Ok(nonce)
+                }
+                None => query.nonce(sender).await.and_then(|answer| {
+                    u64::try_from(answer.value)
+                        .map_err(|e| QueryError::new(format!("nonce out of range: {e}"), false))
+                }),
+            };
             let _ = done_tx.send(LookupDone { sender, result });
         });
     }
 }
 
-/// One nonce query: the HTTP client, the executor endpoints, the
-/// rotation start, and the sender asked about. It walks the endpoints
-/// from `first` until one answers within the timeout.
-struct ExecutorQuery {
-    client: reqwest::Client,
-    endpoints: std::sync::Arc<[String]>,
-    first: usize,
-    sender: Address,
-}
-
-impl ExecutorQuery {
-    fn new(
-        client: reqwest::Client,
-        endpoints: std::sync::Arc<[String]>,
-        first: usize,
-        sender: Address,
-    ) -> Self {
-        Self {
-            client,
-            endpoints,
-            first,
-            sender,
-        }
-    }
-
-    /// Query the endpoints from `first` in rotation. The first answer
-    /// wins.
-    async fn run(self) -> Result<u64, String> {
-        let n = self.endpoints.len();
-        let mut last_err = String::from("no executor endpoints");
-        for endpoint in (0..n).map(|i| &self.endpoints[self.first.saturating_add(i) % n]) {
-            if let ControlFlow::Break(nonce) = self.query_endpoint(endpoint, &mut last_err).await {
-                return Ok(nonce);
-            }
-        }
-        Err(last_err)
-    }
-
-    /// One endpoint of [`Self::run`]'s rotation: `Break` carries the
-    /// answer; on failure the error lands in `last_err`.
-    async fn query_endpoint(&self, endpoint: &str, last_err: &mut String) -> ControlFlow<u64> {
-        match self.query_one(endpoint).await {
-            Ok(nonce) => ControlFlow::Break(nonce),
-            Err(e) => {
-                *last_err = format!("{endpoint}: {e}");
-                ControlFlow::Continue(())
-            }
-        }
-    }
-
-    async fn query_one(&self, endpoint: &str) -> Result<u64, String> {
-        let resp = self
-            .client
-            .post(endpoint)
-            .header("content-type", "application/json")
-            .body(lookup::request_body(self.sender))
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    "timed out".to_string()
-                } else {
-                    e.to_string()
-                }
-            })?;
-        let body = resp.text().await.map_err(|e| e.to_string())?;
-        lookup::parse_answer(&body)
-    }
+/// The sender's nonce from the Redis projection. `None` with the layer
+/// off, on a miss, and on every degraded read, which the reader counts.
+async fn redis_nonce(redis: Option<&CacheReader>, sender: Address) -> Option<u64> {
+    redis?.account(sender).await.map(|view| view.nonce)
 }
 
 pub(crate) type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
