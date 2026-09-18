@@ -214,16 +214,43 @@ fn redis_cli(args: &str) -> String {
     format!("docker exec $(docker ps --filter name=sentinel- -q | head -1) redis-cli {args}")
 }
 
-/// Ask the sentinels who the primary is: the host of
-/// `SENTINEL get-master-addr-by-name`. The first primary is the node
-/// record the sentinels monitor, `aux-0.node.dc1.consul`. A promoted
-/// replica is the address it replicated from, an IP, because the
-/// replica announces no hostname.
+/// The nodes that run a sentinel: the aux node and the two ingresses.
+fn sentinel_nodes(h: &Harness) -> Vec<String> {
+    std::iter::once(aux(h))
+        .chain(h.probes.ingresses.iter().map(|n| n.container.clone()))
+        .collect()
+}
+
+/// Ask the sentinels who the primary is, and keep the first answer the
+/// named node confirms with `ROLE`. The address is a node record
+/// (`aux-0.node.dc1.consul`) for the first primary, and an IP for a
+/// promoted replica, which announces no hostname.
+///
+/// One sentinel alone is not enough. After two failovers in 30 s a
+/// sentinel kept naming the demoted node for ten minutes. The local
+/// soak run 0917T233447 asked that sentinel and flushed 192.168.56.10
+/// while 192.168.56.16 held the data, so the case flushed a replica.
 async fn sentinel_master(h: &Harness) -> anyhow::Result<String> {
-    let script = redis_cli("-p 26379 SENTINEL get-master-addr-by-name kardamom | head -1");
-    let host = h.nodes.exec(&aux(h), &script).await?;
-    anyhow::ensure!(!host.is_empty(), "the sentinel named no primary");
-    Ok(host)
+    let ask = redis_cli("-p 26379 SENTINEL get-master-addr-by-name kardamom | head -1");
+    for node in sentinel_nodes(h) {
+        let host = h.nodes.exec(&node, &ask).await.unwrap_or_default();
+        if !host.is_empty() && answers_as_master(h, &node, &host).await {
+            return Ok(host);
+        }
+        crate::log(format!(
+            "the sentinel on {node} named no live primary (\"{host}\")"
+        ));
+    }
+    anyhow::bail!("no sentinel named a live primary")
+}
+
+/// Whether `host` answers `ROLE` as a primary.
+async fn answers_as_master(h: &Harness, node: &str, host: &str) -> bool {
+    let script = redis_cli(&format!("-h {host} -p 6379 ROLE | head -1"));
+    h.nodes
+        .exec(node, &script)
+        .await
+        .is_ok_and(|role| role.trim() == "master")
 }
 
 /// The primary's node container and inner container, from the address
