@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use alloy_primitives::B256;
 use jsonrpsee::http_client::HttpClient;
 
-use super::{Tracker, receipt_status};
+use super::{ReceiptStatus, Tracker, receipt_status};
 
 /// Join one queued task, or time out at `deadline`. Returns
 /// [`ControlFlow::Break`] once the deadline hits with tasks still
@@ -54,13 +54,26 @@ pub(crate) async fn join_submit_tasks(tasks: &mut tokio::task::JoinSet<()>, dead
 /// caller-owned `JoinSet` with its own lifetime, so a `Drainer` would
 /// carry it as dead weight.
 pub(crate) struct Drainer {
-    client: Arc<HttpClient>,
+    /// The submit client first, then one client per fallback ingress.
+    clients: Vec<Arc<HttpClient>>,
     tracker: Arc<Tracker>,
 }
 
 impl Drainer {
-    pub(crate) fn new(client: Arc<HttpClient>, tracker: Arc<Tracker>) -> Self {
-        Self { client, tracker }
+    pub(crate) fn new(clients: Vec<Arc<HttpClient>>, tracker: Arc<Tracker>) -> Self {
+        Self { clients, tracker }
+    }
+
+    /// The receipt of `hash` from the first client that has it. The
+    /// submit client answers first; a fallback ingress answers for a
+    /// receipt that only lived in a replica that restarted.
+    async fn receipt_from_any(&self, hash: B256) -> Option<ReceiptStatus> {
+        for client in &self.clients {
+            if let Some(r) = receipt_status(client, hash).await {
+                return Some(r);
+            }
+        }
+        None
     }
 
     /// Sweep once over outstanding, un-confirmed transactions at least
@@ -83,7 +96,7 @@ impl Drainer {
     /// feed keeps confirming entries at the same time, so only the
     /// caller that actually removes the entry may count it.
     async fn settle_if_still_pending(&self, hash: B256, submit_ts: Instant) {
-        if let Some(r) = receipt_status(&self.client, hash).await
+        if let Some(r) = self.receipt_from_any(hash).await
             && self.tracker.remove_pending(&hash)
         {
             self.tracker

@@ -105,6 +105,7 @@ impl Harness {
         Ok(LoadConfig {
             workload: run.workload,
             rpc: self.rpc_url.clone(),
+            receipt_rpcs: self.receipt_rpcs(),
             chain_id: Some(self.knobs.chain_id),
             duration: run.values.duration,
             target_tps: run.values.tps,

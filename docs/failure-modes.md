@@ -95,8 +95,11 @@ with three distinct, tested modes:
   checkpoint over `--checkpoint-serve-addr` (:9014) and a node that hits the
   refusal — or cold-starts with no checkpoint at all — fetches the newest
   qualifying peer checkpoint (`--checkpoint-peers`), parks the stale DB under
-  `<state_dir>/stale/`, restores, and resumes from the checkpoint's cursor
-  (`kardamom_executor_resync_total` counts these by outcome). If no peer can
+  `<state_dir>/stale/`, restores, and resumes from the checkpoint's cursor,
+  all in-process: the pipeline runs again in the same process, so a
+  revolution costs the fetch and the restore, and burns no orchestrator
+  restart attempt (#298; `kardamom_executor_resync_total` counts these by
+  outcome). If no peer can
   offer a checkpoint at/above the floor, the node stays down and says so: the
   remaining paths are an operator-restored checkpoint or rebuild-from-L1
   (`kardamom-reconstruct`).
@@ -183,7 +186,10 @@ one.
 
 A replay-window overrun self-repairs like the executor's recovery-D loop
 (#143): fetch a peer checkpoint at/above the retention floor from an
-executor's serve endpoint, park the stale DB, exit; the restart adopts it —
+executor's serve endpoint, park the stale DB, and run the pipeline again in
+the same process; that revolution adopts it (#298, no exit and no
+orchestrator restart, so a lost race against the retention window costs one
+fetch, not one restart attempt) —
 including a marker-driven one-time hashed-mirror + trie bootstrap: executor
 checkpoints carry a trie FROZEN AT GENESIS (seeded into every env, never
 updated by the trie-off writer), so adoption must rebuild it wholesale — a

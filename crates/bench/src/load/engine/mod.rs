@@ -516,7 +516,7 @@ mod tests {
 
         // The drain re-polls it once, since the deadline is already due, and
         // still finds no receipt, so it stays pending as accepted.
-        Drainer::new(Arc::clone(&ingress.client), Arc::clone(&tracker))
+        Drainer::new(vec![Arc::clone(&ingress.client)], Arc::clone(&tracker))
             .drain(Instant::now())
             .await;
         let pending = tracker.remaining_pending();

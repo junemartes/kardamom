@@ -212,9 +212,10 @@ impl Ready {
     /// Returns an error if the interop feed server fails to bind, if
     /// `--l1-rpc-url` fails to parse, or if the final replay-window-
     /// overrun resync fails.
-    pub(crate) async fn run(self) -> Result<()> {
+    pub(crate) async fn run(self) -> Result<RunEnd> {
         let args = &self.attested.written.streamed.opened.base.args;
         let chain_id = self.attested.written.streamed.opened.state.chain_id;
+        let expected_genesis = self.attested.written.streamed.opened.state.expected_genesis;
         let interop_serve = self
             .attested
             .written
@@ -235,10 +236,11 @@ impl Ready {
             .state
             .feed_resume_block()?;
 
-        // Start the feed server (the interop serving surfaces). Dropping
-        // the handle stops the server, so the caller holds it for the
-        // process lifetime.
-        let _feed_server = start_interop_serving(
+        // Start the feed server (the interop serving surfaces). It holds
+        // a clone of the state env, so it is stopped, and its stop
+        // awaited, before this returns: a revolution parks and replaces
+        // that env next.
+        let feed_server = start_interop_serving(
             args,
             chain_id.get(),
             interop_serve,
@@ -248,7 +250,15 @@ impl Ready {
         .await?;
 
         let ports = self.run_ports();
-        self.execute(ports).await
+        let outcome = self.execute(ports).await;
+        if let Some(server) = feed_server {
+            let _ = server.stop();
+            server.stopped().await;
+        }
+        Ok(RunEnd {
+            outcome,
+            expected_genesis,
+        })
     }
 
     /// Run the engine loop to completion, then shut everything down in
@@ -257,7 +267,7 @@ impl Ready {
     /// sequential calls, [`Self::run_engine`] then
     /// [`Running::shutdown_in_order`], keep that order exactly — nothing
     /// here interleaves them.
-    async fn execute(self, ports: RunPorts) -> Result<()> {
+    async fn execute(self, ports: RunPorts) -> EngineOutcome {
         self.run_engine(ports).shutdown_in_order().await
     }
 
@@ -282,16 +292,8 @@ impl Ready {
                                 Streamed {
                                     opened:
                                         Opened {
-                                            base:
-                                                Startup {
-                                                    args, rt, plane, ..
-                                                },
-                                            state:
-                                                OpenedState {
-                                                    expected_genesis,
-                                                    start,
-                                                    ..
-                                                },
+                                            base: Startup { rt, plane, .. },
+                                            state: OpenedState { start, .. },
                                         },
                                     streams:
                                         StreamsState {
@@ -357,54 +359,53 @@ impl Ready {
             plane,
             writer,
             divergence,
-            args,
-            expected_genesis,
         }
     }
 }
 
 /// Everything [`Running::shutdown_in_order`] needs once
 /// [`Ready::run_engine`] has spawned the engine loop: the join handle,
-/// every value [`Shutdown::wait`]'s drop order depends on, and what
-/// `finish` needs to report the result.
+/// and every value [`Shutdown::wait`]'s drop order depends on.
 struct Running {
     join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
     streams: bin_support::LiveStreams,
     plane: kardamom_log::discovery::StreamPlane,
     writer: kardamom_state::WriterHandle,
     divergence: Arc<Divergence>,
-    args: Args,
-    expected_genesis: Option<alloy_primitives::B256>,
 }
 
 impl Running {
     /// Wait for the engine loop to finish, or a shutdown signal,
     /// whichever comes first, shutting down in the order
-    /// [`Shutdown::wait`] enforces, then report the result.
-    async fn shutdown_in_order(self) -> Result<()> {
-        let engine_error = Shutdown {
+    /// [`Shutdown::wait`] enforces, then report the outcome. A proven
+    /// divergence (the latch records before the engine surfaces it)
+    /// outranks the engine's own result.
+    async fn shutdown_in_order(self) -> EngineOutcome {
+        let divergence = self.divergence.clone();
+        let outcome = Shutdown {
             join: self.join,
             streams: self.streams,
             plane: self.plane,
             writer: self.writer,
-            divergence: self.divergence.clone(),
+            divergence: divergence.clone(),
         }
         .wait()
         .await;
-        finish(
-            &engine_error,
-            &self.divergence,
-            &self.args,
-            self.expected_genesis,
-        )
+        if !divergence.is_halted() {
+            return outcome;
+        }
+        if let Some(reason) = divergence.reason() {
+            tracing::error!(reason = %reason, "validator halted on divergence");
+        }
+        EngineOutcome::Diverged
     }
 }
 
 /// Start the interop feed server when `interop_serve` is configured.
-/// Dropping the returned handle stops the server, so the caller holds it
-/// for the process lifetime; a divergence halt exits the process and the
-/// sockets die with it — a validator whose verification halts must stop
-/// serving.
+/// The caller holds the returned handle for the revolution and stops the
+/// server when the engine ends, so a validator whose verification halts
+/// stops serving, and the server's clone of the state env is gone before
+/// a resync repair parks that env.
 async fn start_interop_serving(
     args: &Args,
     chain_id: u64,
@@ -592,13 +593,21 @@ impl Shutdown {
     }
 }
 
+/// How one run of the pipeline ended, and the genesis digest the repair
+/// step verifies a fetched checkpoint against.
+pub(crate) struct RunEnd {
+    pub(crate) outcome: EngineOutcome,
+    pub(crate) expected_genesis: Option<alloy_primitives::B256>,
+}
+
 /// The joined engine loop's outcome: a clean return, an engine-level
-/// failure (not necessarily a divergence), or a task panic (no error
-/// value survives a panic).
+/// failure (not necessarily a divergence), a task panic (no error value
+/// survives a panic), or a proven divergence.
 pub(crate) enum EngineOutcome {
     Clean,
     Failed(ExecutorError),
     Panicked,
+    Diverged,
 }
 
 /// Classify the joined engine loop's outcome. Latches a forged record
@@ -624,46 +633,4 @@ fn classify_engine_result(
             EngineOutcome::Panicked
         }
     }
-}
-
-/// The exit path: a proven divergence exits 2 (page the humans); any
-/// other engine failure repairs a replay-window overrun if needed, then
-/// exits 1 (an availability problem, for the orchestrator to restart).
-/// Returns cleanly only for [`EngineOutcome::Clean`].
-fn finish(
-    engine_error: &EngineOutcome,
-    divergence: &Divergence,
-    args: &Args,
-    expected_genesis: Option<alloy_primitives::B256>,
-) -> Result<()> {
-    // Exit 2 is reserved for a proven divergence (the latch records
-    // before the engine surfaces `Divergence`), the page-the-humans
-    // signal. Any other engine failure (a stream error, a replay-window
-    // overrun needing resync) is an availability problem, not an
-    // integrity one, and must not look like one: exit 1 and let the
-    // orchestrator restart.
-    if divergence.is_halted() {
-        if let Some(reason) = divergence.reason() {
-            tracing::error!(reason = %reason, "validator halted on divergence");
-        }
-        std::process::exit(2);
-    }
-    let cause = match engine_error {
-        EngineOutcome::Clean => return Ok(()),
-        EngineOutcome::Failed(e) => Some(e),
-        EngineOutcome::Panicked => None,
-    };
-    crate::adoption::resync_after_engine_error(
-        cause,
-        args.checkpoint_dir.as_deref(),
-        &args.checkpoint_peers,
-        &args.state_dir,
-        expected_genesis,
-    )?;
-    tracing::error!(
-        "validator halted on an engine error (NOT a proven divergence); if the \
-         cluster refused replay (resync required), rebuild state via \
-         kardamom-reconstruct or restore a checkpoint"
-    );
-    std::process::exit(1);
 }
