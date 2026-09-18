@@ -118,14 +118,11 @@ pub async fn corrupt_bal_halts_validator(stack: &mut LocalStack, t: &Target) -> 
 /// # Errors
 /// Returns an error when the validator does not warm up, when it had
 /// already diverged, when the stack has no DA watcher, when publishing
-/// the forged epoch fails, when the validator does not diverge on it, or
-/// when it diverges without recording an epoch fault.
-pub async fn forged_epoch_halts_validator(
-    stack: &LocalStack,
-    t: &Target,
-    l1: &crate::harness::l1::L1,
-) -> Result<()> {
+/// the forged epoch fails, when the validator does not fail-stop on it, or
+/// when it fail-stops for a reason other than an epoch fault.
+pub async fn forged_epoch_halts_validator(stack: &mut LocalStack, t: &Target) -> Result<()> {
     super::assert_validator_warm(t, "injection").await?;
+    let l1 = stack.l1().context("S11 needs an L1 (l1: true)")?;
 
     // Freeze the honest producer, so its epoch for this L1 block cannot race
     // the forgery. Then forge one origin past where the chain has reached
@@ -145,31 +142,28 @@ pub async fn forged_epoch_halts_validator(
     // through.
     l1.mine(12).await?;
 
-    poll_until(
-        "validator divergence on the forged epoch",
-        Duration::from_secs(60),
-        Duration::from_millis(500),
-        || async {
-            let d = t
-                .validator_metric_opt(super::VALIDATOR_DIVERGENCE)
-                .await?
-                .unwrap_or(0.0);
-            Ok((d > 0.0).then_some(()))
-        },
-    )
-    .await
-    .context("validator must reject an epoch L1 never produced")?;
+    // Check the exit code, not a metric. The fail-stop exits the process
+    // right after it counts the divergence, and its /metrics endpoint goes
+    // with it. A metric poll races that exit: a scrape that lands after it
+    // is refused and fails the scenario while the validator did exactly
+    // the right thing. Exit code 2 is the divergence fail-stop.
+    let code = stack
+        .wait_validator_exit(Duration::from_secs(60))
+        .context("validator must reject an epoch L1 never produced")?;
+    anyhow::ensure!(
+        code == Some(2),
+        "validator exited with {code:?}, expected the divergence fail-stop's exit 2"
+    );
 
-    // It must also be recorded as an epoch fault specifically. A
+    // It must also have halted on an epoch fault specifically. A
     // divergence from some unrelated check would pass the line above,
     // while proving nothing about epoch verification.
-    let faults = t
-        .validator_metric_opt(super::VALIDATOR_EPOCH_FAULTS)
-        .await?
-        .unwrap_or(0.0);
+    let log = stack
+        .validator_log()
+        .context("read validator log for the halt reason")?;
     anyhow::ensure!(
-        faults > 0.0,
-        "validator diverged but recorded no epoch fault — halted for another reason"
+        log.contains("epoch verification failed"),
+        "validator fail-stopped but not on an epoch fault — halted for another reason"
     );
     Ok(())
 }

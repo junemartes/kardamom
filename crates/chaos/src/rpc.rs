@@ -1,7 +1,8 @@
 //! One signed transfer through the ingress JSON-RPC, with a receipt
 //! poll: the mechanic every smoke gate and re-smoke uses. Each caller
-//! owns a dedicated funded account, so every transfer has nonce 0. The
-//! ingress does not implement `eth_getTransactionCount`, on purpose.
+//! owns a dedicated funded account, so every transfer has nonce 0, and
+//! no gate reads `eth_getTransactionCount`. The balance probe drives
+//! the ingress's account layers for the Redis cases.
 
 use std::time::Duration;
 
@@ -70,6 +71,23 @@ impl Rpc {
             .get("result")
             .cloned()
             .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// One `eth_getBalance` of `address` at the head. A cold address
+    /// misses the ingress's local layer, so the read touches Redis when
+    /// it is on, then the executor. The value is not the point; the
+    /// answer is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the call fails or answers an error.
+    pub async fn balance_probe(&self, address: Address) -> anyhow::Result<()> {
+        self.call(
+            "eth_getBalance",
+            serde_json::json!([format!("{address}"), "latest"]),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Sign a one-wei transfer from genesis account `account` at nonce 0,

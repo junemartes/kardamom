@@ -12,8 +12,7 @@
 //! receipt; see [`Tracker`] in `load::tracker`. A submit that errors is
 //! retried, after checking that the transaction did not already land,
 //! so a duplicate is not resubmitted. A post-phase drain confirms any
-//! transaction whose receipt did not land inline. With
-//! `verify_receipts` set, for a non-chaos soak, an accepted submit
+//! transaction whose receipt did not land inline. An accepted submit
 //! whose receipt cannot be re-fetched stays pending, and counts as
 //! `missing` if it never confirms. This is the independent must-deliver
 //! check.
@@ -113,7 +112,6 @@ async fn receipt_status(client: &HttpClient, hash: B256) -> Option<ReceiptStatus
 #[derive(Clone, Copy)]
 pub(crate) struct SubmitOpts {
     pub(crate) retry: u32,
-    pub(crate) verify_receipts: bool,
     pub(crate) mode: SubmitMode,
     pub(crate) feed_confirm: bool,
 }
@@ -214,22 +212,9 @@ async fn finalize_accepted(
     // Re-fetch it to check status and latency.
     match receipt_status(client, tx.hash).await {
         Some(r) => tracker.confirm_with_gas(r.status, t0.elapsed(), r.gas),
-        None if opts.verify_receipts => {
-            // In a non-chaos soak, independently verify the on-offer
-            // contract. No receipt for an accepted transaction means
-            // keep it pending. The drain re-polls it, and a
-            // never-confirmed leftover counts as `missing`, a
-            // must-deliver violation.
-            tracker.insert_pending(tx.hash, t0, true);
-        }
-        None => {
-            // In chaos mode, the ingress's in-memory receipt cache is
-            // volatile across a restart, so a failed re-fetch would
-            // wrongly flag an already-delivered transaction as
-            // "missing". Trust the on-offer ack, and count it
-            // delivered with success status.
-            tracker.confirm(1, t0.elapsed());
-        }
+        // A submit acknowledgement does not prove successful execution.
+        // Missing receipts stay pending across faults and must be recovered.
+        None => tracker.insert_pending(tx.hash, t0, true),
     }
 }
 
@@ -520,7 +505,6 @@ mod tests {
             permit().await,
             SubmitOpts {
                 retry: 0,
-                verify_receipts: true, // non-chaos soak
                 mode: SubmitMode::Blocking,
                 feed_confirm: false,
             },
@@ -558,32 +542,6 @@ mod tests {
         assert!(v.failures.iter().any(|f| f.contains("must-deliver")));
     }
 
-    /// In chaos mode, a failed post-accept re-fetch must not count as
-    /// missing, because the ingress receipt cache is volatile across the
-    /// restarts chaos injects. The on-offer ack is trusted, and the
-    /// transaction counts as delivered.
-    #[tokio::test]
-    async fn chaos_mode_trusts_on_offer_ack_when_receipt_refetch_fails() {
-        let ingress = mock_ingress(true, serde_json::Value::Null).await;
-        let tracker = Arc::new(Tracker::new().unwrap());
-        submit_task(
-            ingress.client,
-            Arc::clone(&tracker),
-            tx(0, 0),
-            permit().await,
-            SubmitOpts {
-                retry: 0,
-                verify_receipts: false,
-                mode: SubmitMode::Blocking,
-                feed_confirm: false,
-            },
-        )
-        .await;
-        let c = tracker.counts();
-        assert_eq!((c.accepted, c.receipted, c.bad_status), (1, 1, 0));
-        assert_eq!(tracker.remaining_pending(), PendingCounts::default());
-    }
-
     /// Regression test: a submit whose RPC errored, but whose transaction
     /// actually landed, with a receipt that exists, must not be
     /// resubmitted. A duplicate would be counted by the sequencer as a
@@ -599,7 +557,6 @@ mod tests {
             permit().await,
             SubmitOpts {
                 retry: 3,
-                verify_receipts: true,
                 mode: SubmitMode::Blocking,
                 feed_confirm: false,
             },

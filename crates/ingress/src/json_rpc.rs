@@ -6,8 +6,9 @@
 //!   watcher in the proxy.
 //! - `eth_sendRawTransaction`.
 //! - `eth_getTransactionReceipt`, a state-DB `tx_hash_index` lookup.
-//! - `eth_getBalance` and `eth_getTransactionCount` return a clear error,
-//!   "deferred to S6 state writer," instead of "method not found."
+//! - `eth_getBalance` and `eth_getTransactionCount`, served from the
+//!   local account layer, then from one executor query on a miss. Only
+//!   the head block is served.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -21,7 +22,7 @@ use tokio::sync::broadcast;
 
 use crate::channels::{IngressPublication, IngressSubscription, ProxyBackend};
 use crate::error::IngressError;
-use crate::proxy::IngressProxy;
+use crate::proxy::{AccountField, IngressProxy};
 use kardamom_types::{Receipt, TxError};
 
 tokio::task_local! {
@@ -129,16 +130,18 @@ impl<Backend: ProxyBackend> IngressEthApiServer for IngressHandlers<Backend> {
         Ok(U256::from(self.proxy.latest_block_number()))
     }
 
-    async fn balance(&self, _addr: Address, _block: BlockNumberOrTag) -> RpcResult<U256> {
-        Err(ErrorObjectOwned::from(IngressError::Internal(
-            "eth_getBalance deferred to S6 state writer".into(),
-        )))
+    async fn balance(&self, addr: Address, block: BlockNumberOrTag) -> RpcResult<U256> {
+        self.proxy
+            .account_field(client_ip(), addr, block, AccountField::Balance)
+            .await
+            .map_err(ErrorObjectOwned::from)
     }
 
-    async fn nonce(&self, _addr: Address, _block: BlockNumberOrTag) -> RpcResult<U256> {
-        Err(ErrorObjectOwned::from(IngressError::Internal(
-            "eth_getTransactionCount deferred to S6 state writer".into(),
-        )))
+    async fn nonce(&self, addr: Address, block: BlockNumberOrTag) -> RpcResult<U256> {
+        self.proxy
+            .account_field(client_ip(), addr, block, AccountField::Nonce)
+            .await
+            .map_err(ErrorObjectOwned::from)
     }
 
     async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256> {

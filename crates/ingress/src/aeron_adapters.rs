@@ -9,16 +9,19 @@
 
 use std::future::Future;
 use std::num::{NonZeroU8, NonZeroU32};
+use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
+use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_log::aeron_live::{
     AeronRuntime, FsyncWatermarkSubscriberHandle, TxDataPublisherHandle, TxErrorsSubscriberHandle,
     TxReceiptsBoundarySubscriberHandle, TxReceiptsReceiver,
 };
 use kardamom_log::discovery::StreamPlane;
 use kardamom_types::{
-    BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
+    BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, ReceiptBatch, TxEnvelope,
+    TxError,
 };
 
 use crate::channels::{BUS_CAPACITY, IngressPublication, IngressSubscription};
@@ -139,9 +142,9 @@ impl<T: Clone + Send + 'static> PumpSource
 
 /// Implements [`PumpSource`] for a subscriber handle whose `recv` returns
 /// `(BPosition, Item)`, dropping the position. The three concrete
-/// subscriber handles below, plus [`TxReceiptsReceiver`] (`into_receiver()`
-/// handles; see the `tx_receipts` comment in
-/// [`LiveIngressSubscription::open`]), share exactly this shape.
+/// subscriber handles below share exactly this shape. The receipts
+/// stream does not: its frame is a batch with account rows, so
+/// [`ReceiptBatchPump`] drains it.
 macro_rules! impl_pump_source {
     ($handle:ty, $item:ty) => {
         impl PumpSource for $handle {
@@ -156,13 +159,54 @@ macro_rules! impl_pump_source {
 impl_pump_source!(FsyncWatermarkSubscriberHandle, FsyncWatermark);
 impl_pump_source!(TxReceiptsBoundarySubscriberHandle, BlockBoundary);
 impl_pump_source!(TxErrorsSubscriberHandle, TxError);
-impl_pump_source!(TxReceiptsReceiver, Receipt);
+
+/// The `tx_receipts` pump: one batch frame in, its account rows into the
+/// local layer, then its receipts onto the bus, one by one. The rows go
+/// first, so a client its receipt releases sees the new state on its
+/// next submit. `TxReceiptsReceiver` has no constructor outside the log
+/// crate, so [`Self::on_batch`] is the testable step.
+struct ReceiptBatchPump {
+    writer: LiveAccountsWriter,
+    tx: broadcast::Sender<Receipt>,
+}
+
+impl ReceiptBatchPump {
+    fn new(writer: LiveAccountsWriter, tx: broadcast::Sender<Receipt>) -> Self {
+        Self { writer, tx }
+    }
+
+    /// Start the pump on the runtime. It ends when the source closes, on
+    /// `AeronRuntime` shutdown.
+    fn spawn(self, rx: TxReceiptsReceiver) {
+        tokio::spawn(self.run(rx));
+    }
+
+    async fn run(mut self, mut rx: TxReceiptsReceiver) {
+        while let Some((_pos, batch)) = rx.recv_batch().await {
+            self.on_batch(batch);
+        }
+    }
+
+    /// Apply the batch's rows at its end position, then fan its receipts
+    /// out. A batch with no receipt (a boundary-only frame) carries no
+    /// rows either. A lagging or absent receiver is the broadcast
+    /// channel's concern, so this ignores the send result.
+    fn on_batch(&mut self, batch: ReceiptBatch) {
+        if let Some(end) = batch.end_tx_idx() {
+            self.writer.apply(end, &batch.accounts);
+        }
+        for receipt in batch.receipts {
+            let _ = self.tx.send(receipt);
+        }
+    }
+}
 
 /// Live [`IngressSubscription`]. Per-stream pump tasks feed these
 /// broadcast buses.
 #[derive(Clone)]
 pub struct LiveIngressSubscription {
     receipts: broadcast::Sender<Receipt>,
+    live: Arc<LiveAccounts>,
     watermarks: broadcast::Sender<QuorumWatermark>,
     local_fsync: broadcast::Sender<FsyncWatermark>,
     block_boundaries: broadcast::Sender<BlockBoundary>,
@@ -183,10 +227,12 @@ impl LiveIngressSubscription {
         plane: &mut StreamPlane,
         recorder_id: u8,
         executor_count: Option<NonZeroU32>,
+        live_cfg: &LiveAccountsConfig,
     ) -> Result<Self, IngressError> {
         let channels = plane.channels().clone();
         let channels = &channels;
         let (receipts_tx, _) = broadcast::channel::<Receipt>(BUS_CAPACITY);
+        let (live, live_writer) = LiveAccounts::new(live_cfg);
         let (watermarks_tx, _) = broadcast::channel::<QuorumWatermark>(BUS_CAPACITY);
         let (local_fsync_tx, _) = broadcast::channel::<FsyncWatermark>(BUS_CAPACITY);
         let (block_boundaries_tx, _) = broadcast::channel::<BlockBoundary>(BUS_CAPACITY);
@@ -205,14 +251,15 @@ impl LiveIngressSubscription {
         // the same canonical order and emit identical receipts, so the
         // proxy dedups by tx hash downstream, first-wins. This layer only
         // aggregates the streams: every executor publisher the plane
-        // discovers, or the static channel's members.
+        // discovers, or the static channel's members. The batch frame's
+        // account rows feed the local layer on the way through.
         let receipts_sub = plane
             .tx_receipts_subscriber(rt, executor_count)
             .map_err(|e| IngressError::internal("open tx_receipts", e))?;
         // `into_receiver()`: the pump task must not hold an
         // `AeronRuntime` clone. Holding one would keep the runtime alive
         // forever; see `TxReceiptsSubscriberHandle::into_receiver`.
-        Pump::new(receipts_sub.into_receiver(), receipts_tx.clone()).spawn();
+        ReceiptBatchPump::new(live_writer, receipts_tx.clone()).spawn(receipts_sub.into_receiver());
 
         // Quorum and durable watermark: in the cluster-only topology,
         // there is no Aeron `quorum_watermark` subscription here. The
@@ -240,6 +287,7 @@ impl LiveIngressSubscription {
 
         Ok(Self {
             receipts: receipts_tx,
+            live,
             watermarks: watermarks_tx,
             local_fsync: local_fsync_tx,
             block_boundaries: block_boundaries_tx,
@@ -273,6 +321,9 @@ impl IngressSubscription for LiveIngressSubscription {
     }
     fn subscribe_tx_errors(&self) -> broadcast::Receiver<TxError> {
         self.tx_errors.subscribe()
+    }
+    fn live_accounts(&self) -> Arc<LiveAccounts> {
+        self.live.clone()
     }
 }
 
@@ -313,6 +364,42 @@ mod tests {
             sub_a.recv().await,
             Err(broadcast::error::RecvError::Closed)
         ));
+    }
+
+    // The receipts pump applies a batch's rows before it fans the
+    // receipts out: a subscriber that wakes on the receipt reads the new
+    // state. A boundary-only batch changes nothing.
+    #[tokio::test]
+    async fn receipt_batch_pump_applies_rows_before_receipts() {
+        use alloy_primitives::{Address, U256};
+        use kardamom_types::AccountRow;
+
+        let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
+        let (bus, mut sub) = broadcast::channel::<Receipt>(16);
+        let mut pump = ReceiptBatchPump::new(writer, bus);
+        let end = BPosition::from_index(7);
+        let receipt = Receipt {
+            tx_idx: end,
+            ..Receipt::default()
+        };
+        let row = AccountRow {
+            address: Address::repeat_byte(0xaa),
+            nonce: 3,
+            balance: U256::from(10u64),
+        };
+        pump.on_batch(ReceiptBatch {
+            receipts: vec![receipt],
+            accounts: vec![row],
+        });
+        let got = sub.recv().await.unwrap();
+        assert_eq!(got.tx_idx, end);
+        let view = live.get(Address::repeat_byte(0xaa)).unwrap();
+        assert_eq!((view.nonce, view.tx_idx), (3, 7));
+        pump.on_batch(ReceiptBatch {
+            receipts: Vec::new(),
+            accounts: Vec::new(),
+        });
+        assert_eq!(live.head(), 7);
     }
 
     // A shard index past the publication vector must give an Internal

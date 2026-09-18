@@ -31,7 +31,7 @@
     - "{{ elastic_image_ansible_root }}"
     - "{{ elastic_image_ansible_root }}/collections"
     - /etc/kardamom
-    - /etc/kardamom/group_vars/all
+    - /etc/kardamom/group_vars/production
 
 - name: Install the pinned ansible-core into a virtualenv
   ansible.builtin.pip:
@@ -75,24 +75,25 @@
       # Managed by the elastic image. The node configures itself.
       [elastic]
       localhost ansible_connection=local ansible_python_interpreter=/usr/bin/python3
+      [production:children]
+      elastic
     owner: root
     group: root
     mode: "0644"
 
-# group_vars/all is a directory: Ansible merges every file in it into the
-# vars of the all group, so the profile values and the enrollment vector
-# stay separate files.
+# Production is a child of all, so its profile and enrollment values
+# override the shared playbook defaults.
 - name: Copy the profile values
   ansible.builtin.copy:
     src: "{{ elastic_image_profile_vars_file }}"
-    dest: /etc/kardamom/group_vars/all/profile.yml
+    dest: /etc/kardamom/group_vars/production/profile.yml
     owner: root
     group: root
     mode: "0644"
 
 - name: Write the enrollment client argument vector
   ansible.builtin.copy:
-    dest: /etc/kardamom/group_vars/all/enrollment.yml
+    dest: /etc/kardamom/group_vars/production/enrollment.yml
     content: "{{ {'enrollment_argv': elastic_image_enrollment_argv} | to_nice_yaml }}"
     owner: root
     group: root
@@ -145,21 +146,7 @@
     clean: true
 
 - name: Remove the machine identity of the build server
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: absent
-  with_fileglob:
-    - /etc/ssh/ssh_host_*
-    - /root/.ssh/authorized_keys
-    - /var/lib/dbus/machine-id
-
-- name: Empty the machine id
-  ansible.builtin.copy:
-    dest: /etc/machine-id
-    content: ""
-    owner: root
-    group: root
-    mode: "0444"
+  ansible.builtin.include_tasks: identity.yml
 
 - name: Reset cloud-init so the next boot is a first boot
   ansible.builtin.command:

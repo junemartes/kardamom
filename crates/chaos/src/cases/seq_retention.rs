@@ -1,11 +1,13 @@
 //! The sequencer lapse and the retention-overrun cases: a running
 //! consumer is frozen with SIGSTOP and must repair itself on thaw.
 
+mod repair;
+use repair::Repair;
+
 use std::cell::Cell;
 use std::time::Duration;
 
 use crate::harness::Harness;
-use crate::nomad::Streams;
 use crate::poll::{self, Budget};
 use crate::probes::EXECUTOR_BLOCK_METRIC;
 
@@ -279,12 +281,12 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
     let donor = h.container("executor-0")?;
     super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
     require_live_victim(h, victim, &ctx).await?;
-    // Only log lines after this point count as this case's evidence: a
-    // reused cluster may carry an earlier run's repair in the same
-    // allocation log.
-    let mark = h.nomad.job_logs(kind, Streams::Both).await?.len();
+    let repair = Repair::capture(h, victim, &node).await?;
     let need = i64::try_from(retention.get().saturating_mul(2)).unwrap_or(i64::MAX);
-    let rx_freeze = h.probes.ingress_received().await.unwrap_or(0);
+    let rx_freeze =
+        h.probes.ingress_counts().await.complete().ok_or_else(|| {
+            crate::chaos_fail!("no complete ingress baseline for retention overrun")
+        })?;
     crate::log(format!(
         "{ctx}: freezing {inner} on {node} until {need} frames flow past it (retention={retention}, cap {}s)",
         h.knobs.retention_freeze_cap.as_secs()
@@ -303,7 +305,7 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
             "{ctx}: SIGCONT failed (container may have been replaced mid-freeze); the log asserts below own the verdict"
         ));
     }
-    await_repair_chain(h, victim, &ctx, mark, delta, elapsed).await?;
+    await_repair_chain(h, victim, &ctx, delta, elapsed, &repair).await?;
     match victim {
         Victim::Executor => h.assert_executor_progress(Duration::from_secs(180)).await,
         Victim::Validator => await_verifying_resumed(h).await,
@@ -319,10 +321,9 @@ async fn require_live_victim(h: &Harness, victim: Victim, ctx: &str) -> anyhow::
         let now = match victim {
             Victim::Executor => h.probes.exec_metric(2, EXECUTOR_BLOCK_METRIC).await,
             Victim::Validator => h.probes.val_metric("validator_committed_block").await,
-        }
-        .unwrap_or(0);
-        let live = prev_ref.get().is_some_and(|p| now > p);
-        prev_ref.set(Some(now));
+        };
+        let live = matches!((prev_ref.get(), now), (Some(p), Some(n)) if n > p);
+        prev_ref.set(now);
         Ok::<_, anyhow::Error>(live.then_some(now))
     })
     .await?;
@@ -372,27 +373,20 @@ async fn overrun_window(
 /// freeze costs one restart before the refusal), so the only stream
 /// holding every part is the allocation's own Nomad log. Once every
 /// needle is there, the log must also show the repair ran in-process:
-/// see [`in_process_repair`].
+/// see [`Repair::in_process`].
 async fn await_repair_chain(
     h: &Harness,
     victim: Victim,
     ctx: &str,
-    mark: usize,
     delta: i64,
     frozen: Duration,
+    repair: &Repair,
 ) -> anyhow::Result<()> {
-    let kind = victim.kind();
     let restored = victim.restored_needle();
     let seen = Cell::new((false, false, false));
     let seen_ref = &seen;
     let outcome = poll::until(Budget::secs(300, 6), |_| async move {
-        let logs = h.nomad.job_logs(kind, Streams::Both).await?;
-        let logs = since_mark(&logs, mark);
-        let s = (
-            logs.contains("cluster replay unavailable"),
-            logs.contains("resync prepared: peer checkpoint staged"),
-            logs.contains(restored),
-        );
+        let s = repair.seen(h).await?;
         seen_ref.set(s);
         Ok((s.0 && s.1 && s.2).then_some(()))
     })
@@ -404,8 +398,7 @@ async fn await_repair_chain(
             return Err(repair_failure(seen, ctx, delta, frozen, restored));
         }
     };
-    let logs = h.nomad.job_logs(kind, Streams::Both).await?;
-    in_process_repair(since_mark(&logs, mark), kind, restored).map_err(|why| {
+    repair.in_process(h).await?.map_err(|why| {
         crate::chaos_fail!(
             "{ctx}: the repair went through an orchestrator restart, not in-process: {why}"
         )
@@ -414,42 +407,6 @@ async fn await_repair_chain(
         "{ctx}: REPLAY_UNAVAILABLE -> fetch -> park -> in-process restore observed ({}s after thaw)",
         elapsed.as_secs()
     ));
-    Ok(())
-}
-
-/// The log lines written after `mark`, the log's length before the
-/// freeze. The whole log when the mark does not fall on a line start,
-/// which a restart's reordering of the allocation listing can cause.
-fn since_mark(logs: &str, mark: usize) -> &str {
-    match logs.get(mark..) {
-        Some(tail) if mark == 0 || logs.as_bytes().get(mark - 1) == Some(&b'\n') => tail,
-        _ => logs,
-    }
-}
-
-/// Whether the last repair in `logs` ran in-process: after the last
-/// `resync prepared` line, the consumer logs its revolution line and then
-/// the restore needle, with no `kardamom-<kind> starting` line in
-/// between. A start line there means the process exited and the
-/// orchestrator's restart did the restore.
-fn in_process_repair(logs: &str, kind: &str, restored: &str) -> Result<(), String> {
-    let prepared = logs
-        .rfind("resync prepared: peer checkpoint staged")
-        .ok_or("no 'resync prepared' line")?;
-    let tail = &logs[prepared..];
-    let restored_at = tail
-        .find(restored)
-        .ok_or_else(|| format!("no '{restored}' line after the last 'resync prepared'"))?;
-    let between = &tail[..restored_at];
-    let start = format!("kardamom-{kind} starting");
-    if between.contains(&start) {
-        return Err(format!(
-            "'{start}' logged between 'resync prepared' and '{restored}'"
-        ));
-    }
-    if !between.contains("the pipeline starts again in-process") {
-        return Err("no 'the pipeline starts again in-process' line before the restore".into());
-    }
     Ok(())
 }
 
@@ -508,19 +465,6 @@ async fn await_verifying_resumed(h: &Harness) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn since_mark_keeps_the_lines_after_the_mark() {
-        let logs = "old line\nnew line\n";
-        assert_eq!(since_mark(logs, 9), "new line\n");
-        assert_eq!(since_mark(logs, 0), logs);
-        assert_eq!(
-            since_mark(logs, 4),
-            logs,
-            "a mark inside a line means the log was reordered"
-        );
-        assert_eq!(since_mark(logs, 99), logs);
-    }
 
     #[test]
     fn a_sample_counts_only_when_a_scrape_succeeded() {

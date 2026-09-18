@@ -39,7 +39,16 @@ alloy-contract = "2.0"
 alloy-sol-types = { version = "1.6", features = ["json"] }
 alloy-node-bindings = "2.0"
 
+# The Redis client behind `kardamom-cache`: the account-state projection
+# and the receipt index the ingress and the sequencer read. Async over
+# tokio, a reconnecting connection manager for the direct-URL mode,
+# Sentinel discovery for the deployed primary, and Lua scripts for the
+# monotone write rule.
+redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager", "sentinel", "script"] }
+
 kardamom-types = { path = "crates/types" }
+kardamom-cache = { path = "crates/cache" }
+kardamom-test-support = { path = "crates/test-support" }
 kardamom-interop-feed = { path = "crates/interop-feed" }
 kardamom-exec-core = { path = "crates/exec-core" }
 kardamom-log = { path = "crates/log" }
@@ -50,7 +59,7 @@ rkyv = { version = "0.8", default-features = false, features = ["std", "bytechec
 # Linux release builds (rust-lld "undefined symbol: aeron_*"; the crate's own
 # build.rs flags static on Linux as unreliable). So we link Aeron DYNAMICALLY
 # and bundle libaeron.so / libaeron_archive_c_client.so into the runtime images
-# (see deploy/cluster/docker/ci-service.Dockerfile + scripts/ci-cluster.sh).
+# (see deploy/cluster/docker/ci-service.Dockerfile + .github/workflows/cluster-e2e.yml).
 rusteron-client = "0.1"
 rusteron-archive = "0.1"
 testcontainers = "0.20"

@@ -1,0 +1,25 @@
+---
+# The files belong to the managed build server, never the controller.
+- name: Find the build server SSH host keys
+  ansible.builtin.find:
+    paths: /etc/ssh
+    patterns: ssh_host_*
+    file_type: any
+    recurse: false
+  register: elastic_image_host_keys
+
+- name: Remove the build server host keys and fixed identities
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ (elastic_image_host_keys.files | map(attribute='path') | list)
+       + ['/root/.ssh/authorized_keys', '/var/lib/dbus/machine-id'] }}
+
+- name: Empty the machine id
+  ansible.builtin.copy:
+    dest: /etc/machine-id
+    content: ""
+    owner: root
+    group: root
+    mode: "0444"

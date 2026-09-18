@@ -1,16 +1,15 @@
 ---
-- name: Validate image build mode
+- name: Validate the image registry and tag
   ansible.builtin.assert:
     that:
-      - images_mode in ['source', 'prebuilt']
       - images_registry is match('^[a-z0-9.:-]+$')
       - images_tag is match('^[a-z0-9][a-z0-9.-]*$')
-    fail_msg: Choose source or prebuilt mode and a valid registry/tag.
+    fail_msg: Choose a valid registry/tag.
 
 # A check run must not build, push, sign, or replace a completed manifest.
 - name: Explain image check mode
   ansible.builtin.debug:
-    msg: "Would build and push {{ images_services + ['aeron', 'cluster'] }} ({{ images_mode }}), then publish {{ images_manifest }}."
+    msg: "Would build and push {{ images_services + ['aeron', 'redis', 'cluster'] }} from prebuilt binaries, then publish {{ images_manifest }}."
   when: ansible_check_mode
 
 - name: Build a complete image release
@@ -69,7 +68,6 @@
 
         - name: Stage prebuilt Linux services and Aeron libraries
           ansible.builtin.include_tasks: prebuilt.yml
-          when: images_mode == 'prebuilt'
 
         - name: Build and push Aeron
           ansible.builtin.include_tasks: image.yml
@@ -77,6 +75,14 @@
             images_item:
               name: aeron
               path: "{{ images_root }}/crates/log/docker/aeron"
+              dockerfile: Dockerfile
+
+        - name: Build and push Redis
+          ansible.builtin.include_tasks: image.yml
+          vars:
+            images_item:
+              name: redis
+              path: "{{ images_cluster_dir }}/docker/redis"
               dockerfile: Dockerfile
 
         - name: Build and push Rust services
@@ -87,8 +93,8 @@
           vars:
             images_item:
               name: "{{ images_service }}"
-              path: "{{ images_staging.path ~ '/services' if images_mode == 'prebuilt' else images_root }}"
-              dockerfile: "{{ images_cluster_dir }}/docker/{{ 'ci-service' if images_mode == 'prebuilt' else 'service' }}.Dockerfile"
+              path: "{{ images_staging.path }}/services"
+              dockerfile: "{{ images_cluster_dir }}/docker/ci-service.Dockerfile"
               args:
                 BIN: "kardamom-{{ images_service }}"
 

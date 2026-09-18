@@ -271,10 +271,12 @@ pub(crate) async fn lookup_blackout(h: &mut Harness) -> anyhow::Result<()> {
                 crate::chaos_fail!("lookup-blackout: could not blackhole {e} on {node}: {err}")
             })?;
     }
+    cache_traffic(h, &node, "-I").await?;
     crate::log(format!(
-        "lookup-blackout: executors blackholed from {node}; hard-killing lane 0's replica there"
+        "lookup-blackout: executors blackholed and the cache ports dropped on {node}; hard-killing lane 0's replica there"
     ));
     let phase1 = blackout_phase(h, &node).await;
+    let _ = cache_traffic(h, &node, "-D").await;
     for e in &executors {
         let _ = h
             .nodes
@@ -312,6 +314,30 @@ pub(crate) async fn lookup_blackout(h: &mut Harness) -> anyhow::Result<()> {
     lookup_snapshot(h, &node, "lookup-blackout: answered phase").await;
     phase2.map_err(|e| crate::chaos_fail!("lookup-blackout: answered-lookup phase failed: {e}"))?;
     h.assert_progress().await
+}
+
+/// The Redis and Sentinel ports of the cache layer.
+const CACHE_PORTS: [u16; 2] = [6379, 26379];
+
+/// Insert (`-I`) or delete (`-D`) the rules that drop this node's cache
+/// traffic. The blackout phase needs them: since the cache flag day a
+/// nonce lookup can be answered from Redis, and then no lookup reaches
+/// the blackholed executors and none fails. Run 35061276238 showed
+/// exactly that, with `outcome="redis"` and no timeout. The rules are
+/// TCP only, so the node keeps the Aeron traffic it needs, which is UDP.
+async fn cache_traffic(h: &Harness, node: &str, rule: &str) -> anyhow::Result<()> {
+    for port in CACHE_PORTS {
+        h.nodes
+            .exec(
+                node,
+                &format!("iptables -w 5 {rule} OUTPUT -p tcp --dport {port} -j DROP"),
+            )
+            .await
+            .map_err(|e| {
+                crate::chaos_fail!("lookup-blackout: iptables {rule} port {port} on {node}: {e}")
+            })?;
+    }
+    Ok(())
 }
 
 async fn blackout_phase(h: &mut Harness, node: &str) -> anyhow::Result<()> {

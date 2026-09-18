@@ -6,6 +6,13 @@ const DIVERGENCE_TOTAL: &str = "validator_divergence_total";
 const BLOCKS_VERIFIED_TOTAL: &str = "validator_blocks_verified_total";
 const BAL_MISSING_TOTAL: &str = "validator_bal_missing_total";
 const RECEIPT_MISSING_TOTAL: &str = "validator_receipt_missing_total";
+/// Published receipt batches whose account rows matched the local state
+/// at the batch's end position.
+const ROWS_VERIFIED_TOTAL: &str = "validator_rows_verified_total";
+/// Published batches whose rows could not be checked: a row for an
+/// account with no recorded local value, or rows at a position whose
+/// local receipt carried none. Not a fault.
+const ROWS_UNVERIFIED_TOTAL: &str = "validator_rows_unverified_total";
 const COMMITTED_BLOCK: &str = "validator_committed_block";
 const STATE_ROOT_BLOCK: &str = "validator_state_root_block";
 /// Epochs whose deposits were re-derived from L1 and matched.
@@ -51,6 +58,14 @@ pub fn describe() {
         "Receipts for which no published receipt arrived within the wait window"
     );
     metrics::describe_counter!(
+        ROWS_VERIFIED_TOTAL,
+        "Published receipt batches whose account rows matched the local state"
+    );
+    metrics::describe_counter!(
+        ROWS_UNVERIFIED_TOTAL,
+        "Published receipt batches whose account rows could not be checked (not a fault)"
+    );
+    metrics::describe_counter!(
         FEED_SUBSCRIPTION_REJECTED_TOTAL,
         "Feed subscriptions rejected because a subscription cap was hit"
     );
@@ -89,6 +104,14 @@ pub fn counter_bal_sub_reopen() {
 
 pub fn counter_divergence() {
     metrics::counter!(DIVERGENCE_TOTAL).increment(1);
+}
+
+pub fn counter_rows_verified() {
+    metrics::counter!(ROWS_VERIFIED_TOTAL).increment(1);
+}
+
+pub fn counter_rows_unverified() {
+    metrics::counter!(ROWS_UNVERIFIED_TOTAL).increment(1);
 }
 
 pub fn counter_epoch_verified() {

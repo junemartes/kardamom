@@ -46,6 +46,22 @@ pub enum IngressError {
         "unsupported transaction type {0:#04x}: blob (EIP-4844) transactions are not supported"
     )]
     UnsupportedTxType(u8),
+    /// The sender's latest known balance does not cover
+    /// `gas_limit * max_fee_per_gas + value`. geth's message shape, so a
+    /// wallet handles it as on L1.
+    #[error(
+        "insufficient funds for gas * price + value: address {address} have {have} want {want}"
+    )]
+    InsufficientFunds {
+        address: Address,
+        have: alloy_primitives::U256,
+        want: alloy_primitives::U256,
+    },
+    /// No read layer could answer an account query: the local layer
+    /// missed and no executor query is configured, or every endpoint
+    /// failed.
+    #[error("account state unavailable: {0}")]
+    StateUnavailable(String),
 }
 
 impl IngressError {
@@ -78,7 +94,9 @@ impl From<IngressError> for ErrorObjectOwned {
             IngressError::PartitionUnavailable(_)
             | IngressError::Timeout
             | IngressError::Evicted(_)
-            | IngressError::Expired(_) => -32000,
+            | IngressError::Expired(_)
+            | IngressError::InsufficientFunds { .. }
+            | IngressError::StateUnavailable(_) => -32000,
             // Internal error.
             IngressError::Internal(_) => -32603,
         };
@@ -107,6 +125,24 @@ mod tests {
     fn timeout_maps_to_server_error() {
         let rpc: ErrorObjectOwned = IngressError::Timeout.into();
         assert_eq!(rpc.code(), -32000);
+    }
+
+    #[test]
+    fn insufficient_funds_maps_to_server_error_in_geth_shape() {
+        let rpc: ErrorObjectOwned = IngressError::InsufficientFunds {
+            address: Address::repeat_byte(0x11),
+            have: alloy_primitives::U256::from(5u64),
+            want: alloy_primitives::U256::from(9u64),
+        }
+        .into();
+        assert_eq!(rpc.code(), -32000);
+        assert!(
+            rpc.message()
+                .starts_with("insufficient funds for gas * price + value"),
+            "{}",
+            rpc.message()
+        );
+        assert!(rpc.message().contains("have 5 want 9"), "{}", rpc.message());
     }
 
     #[test]

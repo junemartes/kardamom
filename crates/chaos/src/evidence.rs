@@ -126,7 +126,13 @@ impl Evidence {
     }
 
     async fn leader_once(&self) -> anyhow::Result<Option<u32>> {
-        let allocs = self.nomad.allocations(CLUSTER_TASK).await?;
+        let allocs: Vec<Alloc> = self
+            .nomad
+            .allocations_with_logs(CLUSTER_TASK)
+            .await?
+            .into_iter()
+            .filter(Alloc::is_desired_running)
+            .collect();
         let mut leader = None;
         for alloc in &allocs {
             leader = leader.or(self.leader_of(alloc).await?);
@@ -147,7 +153,7 @@ impl Evidence {
     ///
     /// Returns an error if the logs cannot be read.
     pub async fn divergence_scan(&self) -> anyhow::Result<Option<Divergence>> {
-        let allocs = self.nomad.allocations("validator").await?;
+        let allocs = self.nomad.allocations_with_logs("validator").await?;
         for alloc in &allocs {
             let logs = self.nomad.alloc_logs(alloc, Streams::Both).await?;
             if logs.contains("halted on divergence") {

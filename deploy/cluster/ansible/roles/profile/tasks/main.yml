@@ -41,6 +41,7 @@
       - consul_gossip_key | length > 0
       - consul_acl_enabled | bool
       - consul_agent_token | length > 0
+      - consul_dns_token | length > 0
       - nomad_acl_enabled | bool
       - nomad_consul_token | length > 0
       - consul_tls_dir | length > 0
@@ -52,7 +53,7 @@
       - not (kardamom_in_container | default(false) | bool)
     fail_msg: >-
       {{ inventory_hostname }}: the production profile requires
-      consul_gossip_key, consul_acl_enabled, consul_agent_token,
+      consul_gossip_key, consul_acl_enabled, consul_agent_token, consul_dns_token,
       nomad_acl_enabled, nomad_consul_token, consul_tls_dir, nomad_tls_dir,
       three expected servers, three or more consul_retry_join names and
       private_cidrs

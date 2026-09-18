@@ -136,16 +136,39 @@ impl<W: ExecPorts> ExecState<W> {
             }
             None => {}
         }
-        let flow = out.receipts.into_iter().try_for_each(|r| {
-            self.block_receipts.push(r.clone());
-            match self.tx.send(ExecToCommit::Receipt(r)) {
-                Ok(()) => ControlFlow::Continue(()),
-                Err(_) => ControlFlow::Break(()),
+        // The parallel path has no per-tx write sets. The block's merged
+        // rows ride the last receipt, so no row is tagged with a position
+        // before the writes it carries. The other receipts carry none.
+        let mut receipts = out.receipts;
+        let last = receipts.pop();
+        let head = receipts
+            .into_iter()
+            .try_for_each(|r| self.send_receipt(r, Vec::new()));
+        let flow = match (head, last) {
+            (ControlFlow::Continue(()), Some(r)) => {
+                let rows = self.delta.account_rows();
+                self.send_receipt(r, rows)
             }
-        });
+            (flow, _) => flow,
+        };
         match flow {
             ControlFlow::Continue(()) => Ok(Flow::Continue),
             ControlFlow::Break(()) => Ok(Flow::Stop),
+        }
+    }
+
+    /// Record one block-exec receipt and stream it, with `accounts`, to the
+    /// commit thread. `Break` means the commit thread is gone.
+    fn send_receipt(
+        &mut self,
+        receipt: kardamom_types::Receipt,
+        accounts: Vec<kardamom_types::AccountRow>,
+    ) -> ControlFlow<()> {
+        self.block_receipts.push(receipt.clone());
+        let item = kardamom_types::ReceiptRows { receipt, accounts };
+        match self.tx.send(ExecToCommit::Receipt(Box::new(item))) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(_) => ControlFlow::Break(()),
         }
     }
 
