@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 use super::endpoint::destination_uri;
 use super::record::{PublisherRecord, ServiceId};
-use super::watch::Membership;
+use super::watch::{CatalogHealth, Membership};
 use crate::error::LogError;
 
 /// The driver-side operations the reconciler drives. The Aeron runtime's
@@ -83,6 +83,14 @@ impl Reconciler {
     /// nothing.
     #[must_use]
     pub fn plan(&mut self, membership: &Membership, now: Instant) -> Plan {
+        if !matches!(membership.health, CatalogHealth::Fresh) {
+            // An outage cannot confirm continued absence. A fresh read must
+            // start a full removal grace before any destination can detach.
+            self.attached
+                .values_mut()
+                .for_each(|attached| attached.missing_since = None);
+            return Plan::default();
+        }
         if !membership.is_known() {
             return Plan::default();
         }
