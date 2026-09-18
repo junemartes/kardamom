@@ -33,6 +33,19 @@ impl Streams {
 }
 
 /// One allocation of a job, as the listing returns it.
+/// How many transient (5xx) answers one task-log read absorbs before it
+/// fails, and the pause between the attempts.
+const LOG_READ_RETRIES: usize = 3;
+const LOG_READ_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// The outcome of one task-log read.
+enum LogRead {
+    /// The log text; empty for a log Nomad no longer has.
+    Text(String),
+    /// A 5xx answer from the client's fs endpoint.
+    Transient(reqwest::StatusCode),
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Alloc {
     #[serde(rename = "JobVersion")]
@@ -247,21 +260,51 @@ impl Nomad {
         let url = self.url(&format!(
             "/v1/client/fs/logs/{alloc_id}?task={task}&type={stream}&plain=true&origin=start"
         ));
+        // The client's fs endpoint answers 5xx for a moment while the
+        // task's log file rotates. Evidence readers poll, so a read that
+        // fails once must not end the case; a read that keeps failing
+        // must, with the status in the error.
+        for _ in 0..LOG_READ_RETRIES {
+            match self.read_log_once(&url).await? {
+                LogRead::Text(text) => return Ok(text),
+                LogRead::Transient(status) => Self::retry_pause(&url, status).await,
+            }
+        }
+        match self.read_log_once(&url).await? {
+            LogRead::Text(text) => Ok(text),
+            LogRead::Transient(status) => anyhow::bail!("GET {url}: {status} after retries"),
+        }
+    }
+
+    /// Log a transient answer and wait before the next attempt.
+    async fn retry_pause(url: &str, status: reqwest::StatusCode) {
+        crate::log(format!("log read {url} answered {status}; retrying"));
+        tokio::time::sleep(LOG_READ_RETRY_DELAY).await;
+    }
+
+    /// One read of a task log. A missing log reads as empty text; a 5xx
+    /// answer is transient and left to the caller.
+    async fn read_log_once(&self, url: &str) -> anyhow::Result<LogRead> {
         let response = self
             .http
-            .get(&url)
+            .get(url)
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(String::new());
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(LogRead::Text(String::new()));
         }
-        response
+        if status.is_server_error() {
+            return Ok(LogRead::Transient(status));
+        }
+        let text = response
             .error_for_status()
             .with_context(|| format!("GET {url}"))?
             .text()
             .await
-            .with_context(|| format!("read {url}"))
+            .with_context(|| format!("read {url}"))?;
+        Ok(LogRead::Text(text))
     }
 
     /// The concatenated logs of every allocation of `job` on a ready node,
