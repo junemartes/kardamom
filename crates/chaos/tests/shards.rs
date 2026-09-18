@@ -140,6 +140,7 @@ async fn run_stage(stage: Stage) -> anyhow::Result<()> {
 }
 
 async fn stage_test(stage: Stage) {
+    install_tracing();
     if let Err(e) = run_stage(stage).await {
         eprintln!("{e:#}");
         panic!(
@@ -149,7 +150,21 @@ async fn stage_test(stage: Stage) {
     }
 }
 
+/// Route the harness libraries' `tracing` output to stderr, at `warn`
+/// unless `RUST_LOG` says otherwise. The load's forensics, such as the
+/// `UNRESOLVED pending tx` samples behind a `missing` count, are
+/// tracing events and are lost without a subscriber.
+fn install_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 async fn shard_test(shard: Shard) {
+    install_tracing();
     if let Err(e) = run_shard(shard).await {
         eprintln!("{e:#}");
         panic!(
