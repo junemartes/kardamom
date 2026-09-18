@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use kardamom_state::{StateEnvBuilder, deep_compare, sweep};
+use kardamom_state::{StateEnvBuilder, deep_compare_to, sweep};
 
 use crate::harness::Harness;
 use crate::nomad::SavedJob;
@@ -70,13 +70,15 @@ impl<'a> StateAudit<'a> {
         )
         .await?;
         let mut executors = Vec::new();
-        for node in heads.settled(&self.harness.probes.executors) {
+        for node in &self.harness.probes.executors {
             executors.push(self.copy_executor(&node.container, &directory).await?);
         }
+        let head = u64::try_from(heads.aligned().unwrap_or(0)).unwrap_or(0);
         tokio::task::spawn_blocking(move || {
             StateCopies {
                 validator,
                 executors,
+                head,
             }
             .verify()
         })
@@ -196,44 +198,41 @@ struct Heads {
 }
 
 impl Heads {
-    /// The settled head: the validator's committed block, nonzero, with
-    /// every executor at that block or one behind it, and at least one
-    /// executor at it. A stopped sealer job freezes the durability
-    /// watermark, so an executor that had the last block in flight can
-    /// never settle it; that replica is one behind, not divergent, and
-    /// [`Self::settled`] leaves it out of the compare.
+    /// The common head: the lowest committed block, nonzero, when every
+    /// consumer answers and none is more than one block past it. A
+    /// stopped sealer job freezes the durability watermark, so an
+    /// executor that had the last block in flight cannot settle it, and
+    /// the validator commits a boundary it received before the stop; a
+    /// consumer one block ahead holds one more empty block, which the
+    /// compare bounded at the common head tolerates.
     fn aligned(&self) -> Option<i64> {
-        self.validator.filter(|v| {
-            *v > 0
-                && self.executors.contains(&Some(*v))
-                && self
-                    .executors
-                    .iter()
-                    .all(|e| e.is_some_and(|e| e == *v || e + 1 == *v))
-        })
-    }
-
-    /// The executors at the settled head, in probe order.
-    fn settled<'a, T>(&self, nodes: &'a [T]) -> impl Iterator<Item = &'a T> {
-        let head = self.validator;
-        nodes
-            .iter()
-            .zip(&self.executors)
-            .filter(move |(_, e)| **e == head)
-            .map(|(node, _)| node)
-    }
-
-    /// How many executors sit one block behind the settled head.
-    fn tail_note(&self) -> String {
-        let behind = self
+        let all: Option<Vec<i64>> = self
             .executors
             .iter()
-            .filter(|e| **e != self.validator)
+            .copied()
+            .chain(std::iter::once(self.validator))
+            .collect();
+        let all = all?;
+        let low = all.iter().copied().min()?;
+        let high = all.iter().copied().max()?;
+        (low > 0 && high - low <= 1).then_some(low)
+    }
+
+    /// How many consumers sit one block past the common head.
+    fn tail_note(&self) -> String {
+        let Some(head) = self.aligned() else {
+            return "no common head".to_string();
+        };
+        let ahead = self
+            .executors
+            .iter()
+            .chain(std::iter::once(&self.validator))
+            .filter(|h| **h != Some(head))
             .count();
-        if behind == 0 {
-            "every executor at the head".to_string()
+        if ahead == 0 {
+            "every consumer at the head".to_string()
         } else {
-            format!("{behind} executor(s) one block behind, left out of the compare")
+            format!("{ahead} consumer(s) one empty block past it")
         }
     }
 }
@@ -254,6 +253,8 @@ impl std::fmt::Display for Heads {
 struct StateCopies {
     validator: PathBuf,
     executors: Vec<PathBuf>,
+    /// The common head the compare is bounded at.
+    head: u64,
 }
 
 impl StateCopies {
@@ -276,7 +277,7 @@ impl StateCopies {
         );
         self.executors
             .iter()
-            .try_for_each(|path| Self::compare(&validator, path))
+            .try_for_each(|path| self.compare(&validator, path))
     }
 
     fn open(path: &Path) -> anyhow::Result<kardamom_state::StateEnv> {
@@ -290,7 +291,7 @@ impl StateCopies {
             .with_context(|| format!("open {}", path.display()))
     }
 
-    fn compare(validator: &kardamom_state::StateEnv, path: &Path) -> anyhow::Result<()> {
+    fn compare(&self, validator: &kardamom_state::StateEnv, path: &Path) -> anyhow::Result<()> {
         let executor = Self::open(path)?;
         let report = sweep(&executor)?;
         anyhow::ensure!(
@@ -299,7 +300,7 @@ impl StateCopies {
             path.display(),
             report.problems
         );
-        let differences = deep_compare(&executor, validator)?;
+        let differences = deep_compare_to(&executor, validator, self.head)?;
         anyhow::ensure!(
             differences.is_empty(),
             "{} differs from validator: {}",

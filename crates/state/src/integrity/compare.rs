@@ -11,7 +11,7 @@ use crate::meta::{
 };
 use crate::schema::{
     TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE,
-    TABLE_TX_HASH_INDEX, decode_receipt_value,
+    TABLE_TX_HASH_INDEX, decode_receipt_value, encode_block_key,
 };
 
 /// One cursor row, or `None` at end of table.
@@ -49,13 +49,39 @@ const SHARED_TABLES: &[&str] = &[
 /// Returns [`StateError`] if either DB's transaction, table open, or
 /// cursor read fails.
 pub fn deep_compare(a: &StateEnv, b: &StateEnv) -> Result<Vec<String>, StateError> {
+    compare_bounded(a, b, None)
+}
+
+/// [`deep_compare`] up to block `head`: the two DBs must hold identical
+/// chain state through `head`, and any block past it must be empty.
+///
+/// A consumer stopped ahead of its peers by one empty block holds the
+/// same accounts, storage, code, receipts and index; only its `headers`
+/// row for that block and the two last-committed meta keys differ. Those
+/// are skipped here. A tail block that carries transactions changes the
+/// receipts, the index and the accounts it touches, and those tables
+/// are compared in full, so it still reads as a difference.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if either DB's transaction, table open, or
+/// cursor read fails.
+pub fn deep_compare_to(a: &StateEnv, b: &StateEnv, head: u64) -> Result<Vec<String>, StateError> {
+    compare_bounded(a, b, Some(head))
+}
+
+fn compare_bounded(
+    a: &StateEnv,
+    b: &StateEnv,
+    bound: Option<u64>,
+) -> Result<Vec<String>, StateError> {
     let ta = a.raw().begin_rw_sync()?;
     let tb = b.raw().begin_rw_sync()?;
     let mut diffs = Vec::new();
     for table in SHARED_TABLES {
-        diffs.extend(TableCompare::new(&ta, &tb, table).run()?);
+        diffs.extend(TableCompare::new(&ta, &tb, table, bound).run()?);
     }
-    diffs.extend(TableCompare::meta_keys(&ta, &tb)?);
+    diffs.extend(TableCompare::meta_keys(&ta, &tb, bound)?);
     Ok(diffs)
 }
 
@@ -66,17 +92,31 @@ struct TableCompare<'a> {
     ta: &'a RwTxSync,
     tb: &'a RwTxSync,
     table: &'a str,
+    /// The last block whose `headers` row counts; rows past it are the
+    /// empty tail [`deep_compare_to`] tolerates.
+    bound: Option<u64>,
     diffs: Vec<String>,
 }
 
 impl<'a> TableCompare<'a> {
-    fn new(ta: &'a RwTxSync, tb: &'a RwTxSync, table: &'a str) -> Self {
+    fn new(ta: &'a RwTxSync, tb: &'a RwTxSync, table: &'a str, bound: Option<u64>) -> Self {
         Self {
             ta,
             tb,
             table,
+            bound,
             diffs: Vec::new(),
         }
+    }
+
+    /// A `headers` row past the bound reads as the end of the table:
+    /// the keys are big-endian block numbers, so every later row is
+    /// past it too.
+    fn clip(&self, row: Row) -> Row {
+        let Some(bound) = self.bound.filter(|_| self.table == TABLE_HEADERS) else {
+            return row;
+        };
+        row.filter(|(key, _)| key.as_slice() <= encode_block_key(bound).as_slice())
     }
 
     fn push(&mut self, message: String) {
@@ -90,13 +130,13 @@ impl<'a> TableCompare<'a> {
         let db = self.tb.open_db(Some(self.table))?;
         let mut ca = self.ta.cursor(da)?;
         let mut cb = self.tb.cursor(db)?;
-        let mut ia = ca.first::<Vec<u8>, Vec<u8>>()?;
-        let mut ib = cb.first::<Vec<u8>, Vec<u8>>()?;
+        let mut ia = self.clip(ca.first::<Vec<u8>, Vec<u8>>()?);
+        let mut ib = self.clip(cb.first::<Vec<u8>, Vec<u8>>()?);
         while self.diffs.len() < MAX_DIFFS_PER_TABLE {
-            let Some(next) = self.compare_step(&mut ca, &mut cb, ia, ib)? else {
+            let Some((na, nb)) = self.compare_step(&mut ca, &mut cb, ia, ib)? else {
                 break;
             };
-            (ia, ib) = next;
+            (ia, ib) = (self.clip(na), self.clip(nb));
         }
         if self.diffs.len() >= MAX_DIFFS_PER_TABLE {
             self.push(format!("{}: further diffs truncated", self.table));
@@ -202,16 +242,27 @@ impl<'a> TableCompare<'a> {
 
     /// Compare the shared meta cursors. Per-node keys, such as the fsync
     /// watermark and `state_root`, are excluded by design.
-    fn meta_keys(ta: &'a RwTxSync, tb: &'a RwTxSync) -> Result<Vec<String>, StateError> {
+    /// With a bound, the two last-committed keys belong to the tail and
+    /// are left out.
+    fn meta_keys(
+        ta: &'a RwTxSync,
+        tb: &'a RwTxSync,
+        bound: Option<u64>,
+    ) -> Result<Vec<String>, StateError> {
         let mut diffs = Vec::new();
         let ma = ta.open_db(Some(TABLE_META))?;
         let mb = tb.open_db(Some(TABLE_META))?;
-        for key in [
+        let tail_keys: &[&[u8]] = &[KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION];
+        let keys: [&[u8]; 4] = [
             KEY_LAST_COMMITTED_BLOCK,
             KEY_LAST_COMMITTED_END_TX_POSITION,
             KEY_GENESIS_DIGEST,
             KEY_SCHEMA_VERSION,
-        ] {
+        ];
+        for key in keys
+            .into_iter()
+            .filter(|key| bound.is_none() || !tail_keys.contains(key))
+        {
             let va = ta.get::<Vec<u8>>(ma.dbi(), key)?;
             let vb = tb.get::<Vec<u8>>(mb.dbi(), key)?;
             if va != vb {
