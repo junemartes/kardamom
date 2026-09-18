@@ -130,8 +130,18 @@ mod tests {
         let in_process = "resync prepared\nthe pipeline starts again in-process\nrestored\n";
         assert_eq!(repair.ran_in_process(in_process), Ok(()));
         let restarted = "resync prepared\nkardamom-executor starting\nrestored\n";
-        assert!(repair.ran_in_process(restarted).unwrap_err().contains("starting"));
+        assert!(
+            repair
+                .ran_in_process(restarted)
+                .unwrap_err()
+                .contains("starting")
+        );
         let older = "resync prepared\nrestored\nresync prepared\n";
-        assert!(repair.ran_in_process(older).unwrap_err().contains("no 'restored'"));
+        assert!(
+            repair
+                .ran_in_process(older)
+                .unwrap_err()
+                .contains("no 'restored'")
+        );
     }
 }
