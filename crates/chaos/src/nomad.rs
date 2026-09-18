@@ -8,6 +8,9 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::Deserialize;
 
+mod job;
+pub(crate) use job::Job;
+
 /// The log streams to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Streams {
@@ -30,6 +33,10 @@ impl Streams {
 /// One allocation of a job, as the listing returns it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Alloc {
+    #[serde(rename = "JobVersion")]
+    pub job_version: u64,
+    #[serde(rename = "DesiredStatus")]
+    pub desired_status: String,
     #[serde(rename = "ID")]
     pub id: String,
     #[serde(rename = "TaskGroup")]
@@ -114,7 +121,15 @@ impl Nomad {
     /// Returns an error if the request fails or the body is not the
     /// allocation listing.
     pub async fn allocations(&self, job: &str) -> anyhow::Result<Vec<Alloc>> {
-        let url = self.url(&format!("/v1/job/{job}/allocations"));
+        self.read(&format!("/v1/job/{job}/allocations")).await
+    }
+
+    pub(crate) async fn job(&self, id: &str) -> anyhow::Result<Job> {
+        self.read(&format!("/v1/job/{id}")).await
+    }
+
+    async fn read<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        let url = self.url(path);
         self.http
             .get(&url)
             .send()
@@ -375,11 +390,11 @@ mod tests {
     #[test]
     fn decodes_an_allocation_listing() {
         let body = r#"[{"ID":"788914fb-2aa0","TaskGroup":"executor","ClientStatus":"running",
-            "NodeName":"executor-2","NodeID":"2d99","TaskStates":{"executor":{"State":"running"}}},
+            "JobVersion":2,"DesiredStatus":"run","NodeName":"executor-2","NodeID":"2d99","TaskStates":{"executor":{"State":"running"}}},
             {"ID":"35f2b819-1111","TaskGroup":"executor","ClientStatus":"complete",
-            "NodeName":"executor-1","NodeID":"3653","TaskStates":{}},
+            "JobVersion":2,"DesiredStatus":"run","NodeName":"executor-1","NodeID":"3653","TaskStates":{}},
             {"ID":"0f89a7f1-2222","TaskGroup":"executor","ClientStatus":"pending",
-            "NodeName":"executor-1","NodeID":"3653","TaskStates":null}]"#;
+            "JobVersion":2,"DesiredStatus":"run","NodeName":"executor-1","NodeID":"3653","TaskStates":null}]"#;
         let allocs: Vec<Alloc> = serde_json::from_str(body).unwrap();
         assert_eq!(allocs.iter().filter(|a| a.is_running()).count(), 1);
         assert_eq!(allocs[0].short_id(), "788914fb");
