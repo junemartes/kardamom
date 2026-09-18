@@ -250,9 +250,13 @@ impl Victim {
 /// Freeze a running consumer until the cluster's bounded egress
 /// retention rolls past its cursor, so on thaw its replay is refused
 /// and it must repair itself: fetch a peer checkpoint, park the stale
-/// state, restart, restore or adopt, and rejoin. The freeze also
-/// crosses the cluster session timeout, so the resume goes through a
-/// fresh session.
+/// state, restore or adopt it in-process, and rejoin. The repair burns
+/// no orchestrator restart (issue #298): the process that logged the
+/// refusal is the one that logs the restore. The freeze itself does
+/// cost one restart, before the refusal: a SIGSTOP longer than the Aeron
+/// client's service interval makes the client exit on resume, and Nomad
+/// restarts the task. The freeze also crosses the cluster session
+/// timeout, so the resume goes through a fresh session.
 pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow::Result<()> {
     let kind = victim.kind();
     let ctx = format!("retention-overrun({kind})");
@@ -274,7 +278,6 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         .inner_container(&node, kind)
         .await
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no inner {kind} container on {node}"))?;
-    let cid0 = h.nodes.inner_cid(&node, &inner).await;
     let donor = h.container("executor-0")?;
     super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
     require_live_victim(h, victim, &ctx).await?;
@@ -303,7 +306,6 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         ));
     }
     await_repair_chain(h, victim, &ctx, delta, elapsed, &repair).await?;
-    await_restarted_container(h, &node, &inner, cid0.as_deref(), &ctx).await?;
     match victim {
         Victim::Executor => h.assert_executor_progress(Duration::from_secs(180)).await,
         Victim::Validator => await_verifying_resumed(h).await,
@@ -367,39 +369,11 @@ async fn overrun_window(
     }
 }
 
-/// Wait for the victim's running container to differ from `cid0`. The
-/// restore line can log while the task restarts once more, so for a moment
-/// no container of the task is running, and a single `docker ps` read
-/// right after the repair chain can find none.
-async fn await_restarted_container(
-    h: &Harness,
-    node: &str,
-    inner: &str,
-    cid0: Option<&str>,
-    ctx: &str,
-) -> anyhow::Result<()> {
-    let outcome = poll::until(Budget::secs(90, 3), |_| async move {
-        let now = h.nodes.inner_cid(node, inner).await;
-        Ok(now.filter(|cid| Some(cid.as_str()) != cid0))
-    })
-    .await?;
-    let (cid, waited) = outcome.or_fail(|t| {
-        crate::chaos_fail!(
-            "{ctx}: victim container was not restarted within {}s (cid {} -> no new running container) — the park/exit/restore loop did not complete",
-            t.as_secs(),
-            cid0.unwrap_or("?")
-        )
-    })?;
-    crate::log(format!(
-        "{ctx}: victim container restarted (cid {} -> {cid}, {}s after the restore line)",
-        cid0.unwrap_or("?"),
-        waited.as_secs()
-    ));
-    Ok(())
-}
-
-/// The recovery evidence splits across container generations, so the
-/// only stream holding both halves is the allocation's own Nomad log.
+/// The recovery evidence splits across container generations (the
+/// freeze costs one restart before the refusal), so the only stream
+/// holding every part is the allocation's own Nomad log. Once every
+/// needle is there, the log must also show the repair ran in-process:
+/// see [`Repair::in_process`].
 async fn await_repair_chain(
     h: &Harness,
     victim: Victim,
@@ -424,8 +398,13 @@ async fn await_repair_chain(
             return Err(repair_failure(seen, ctx, delta, frozen, restored));
         }
     };
+    repair.in_process(h).await?.map_err(|why| {
+        crate::chaos_fail!(
+            "{ctx}: the repair went through an orchestrator restart, not in-process: {why}"
+        )
+    })?;
     crate::log(format!(
-        "{ctx}: REPLAY_UNAVAILABLE -> fetch -> park -> restart -> restore observed ({}s after thaw)",
+        "{ctx}: REPLAY_UNAVAILABLE -> fetch -> park -> in-process restore observed ({}s after thaw)",
         elapsed.as_secs()
     ));
     Ok(())
@@ -450,7 +429,7 @@ fn repair_failure(
         );
     }
     crate::chaos_fail!(
-        "{ctx}: resync prepared but the restarted consumer never logged '{restored}'"
+        "{ctx}: resync prepared but the consumer's next revolution never logged '{restored}'"
     )
 }
 

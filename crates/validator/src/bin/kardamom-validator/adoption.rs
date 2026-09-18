@@ -99,10 +99,12 @@ pub(crate) fn bootstrap_trie_if_adopted(state_dir: &Path, env: &StateEnv) -> Res
     Ok(())
 }
 
-/// Replay-window overrun: repair before exiting. Fetch a peer checkpoint
-/// at or above the retention floor, and park the stale DB, so the next
-/// restart takes the ordinary fresh-start restore path instead of a
-/// deterministic crash loop re-requesting the same refused `REPLAY_FROM`.
+/// Replay-window overrun: repair between two revolutions of the pipeline.
+/// Fetch a peer checkpoint at or above the retention floor, and park the
+/// stale DB, so the next revolution takes the ordinary fresh-start
+/// restore path instead of re-requesting the same refused `REPLAY_FROM`.
+/// Returns the resync outcome label, or `None` when `cause` is not a
+/// refused replay.
 ///
 /// The adopted state is unverified by this validator through the
 /// checkpoint block. This is an accepted tradeoff: the divergence latch
@@ -115,16 +117,17 @@ pub(crate) fn resync_after_engine_error(
     checkpoint_peers: &[String],
     state_dir: &Path,
     expected_genesis: Option<alloy_primitives::B256>,
-) -> Result<()> {
-    if let Some(outcome) = bin_support::replay_unavailable_fallback(
+) -> Result<Option<&'static str>> {
+    let outcome = bin_support::replay_unavailable_fallback(
         cause,
         checkpoint_dir,
         checkpoint_peers,
         state_dir,
         expected_genesis,
         true,
-    )? {
+    )?;
+    if let Some(outcome) = outcome {
         metrics::resync_counter(outcome).increment(1);
     }
-    Ok(())
+    Ok(outcome)
 }

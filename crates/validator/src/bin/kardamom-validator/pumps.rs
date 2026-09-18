@@ -1,6 +1,6 @@
 //! Verification-stream pump tasks: `tx_bal` (with its silence watchdog),
 //! `tx_receipts`, and the committed-block metrics/attester poller. Each runs
-//! on the binary's tokio runtime for the process lifetime.
+//! on the binary's tokio runtime for one revolution of the pipeline.
 
 use std::sync::Arc;
 use std::time::Duration;

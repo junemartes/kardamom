@@ -69,6 +69,11 @@ pub fn describe() {
         FEED_SUBSCRIPTION_REJECTED_TOTAL,
         "Feed subscriptions rejected because a subscription cap was hit"
     );
+    metrics::describe_counter!(
+        RESYNC_TOTAL,
+        "Replay-window-overrun resync outcomes (outcome=peer-checkpoint|unrecoverable); \
+         a peer-checkpoint increment is one in-process revolution of the pipeline"
+    );
     metrics::describe_gauge!(COMMITTED_BLOCK, "Highest block the validator has committed");
     metrics::describe_gauge!(
         STATE_ROOT_BLOCK,

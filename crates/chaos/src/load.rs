@@ -37,6 +37,9 @@ struct Report {
 #[derive(Debug, Clone)]
 pub struct LoadSpec {
     pub rpc_url: String,
+    /// The other ingress RPC URLs; the drain asks them for a receipt the
+    /// submit ingress no longer holds.
+    pub receipt_rpcs: Vec<String>,
     pub chain_id: u64,
     pub account: u32,
     pub duration: Duration,
@@ -60,6 +63,7 @@ impl LoadSpec {
         Ok(LoadConfig {
             workload: Workload::Transfers,
             rpc: self.rpc_url.clone(),
+            receipt_rpcs: self.receipt_rpcs.clone(),
             chain_id: Some(self.chain_id),
             duration: self.duration,
             target_tps: self.tps,
