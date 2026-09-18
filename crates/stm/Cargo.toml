@@ -22,8 +22,9 @@ smallvec.workspace = true
 
 [dev-dependencies]
 alloy-eips.workspace = true
-alloy-network.workspace = true
 alloy-signer-local.workspace = true
+# The signed-legacy-tx fixture the tests build envelopes with.
+kardamom-test-support = { workspace = true }
 
 [features]
 # Forwarded to exec-core (assembly keccak; native builds only).

@@ -133,14 +133,15 @@ impl L2Client {
         self.call("eth_blockNumber", rpc_params![]).await
     }
 
-    /// `eth_getBalance`. This is a deferred endpoint: it must answer with
-    /// a clean error, and never hang. Kept for the RPC liveness matrix.
+    /// `eth_getBalance`, at the head. The ingress serves it from its
+    /// account layers, then one executor query. Never a hang.
     pub async fn get_balance(&self, addr: Address) -> RpcOutcome<String> {
         self.call("eth_getBalance", rpc_params![format!("{addr}"), "latest"])
             .await
     }
 
-    /// `eth_getTransactionCount`. Has the same deferred-endpoint contract.
+    /// `eth_getTransactionCount`, at the head. Same contract as
+    /// [`Self::get_balance`].
     pub async fn get_transaction_count(&self, addr: Address) -> RpcOutcome<String> {
         self.call(
             "eth_getTransactionCount",

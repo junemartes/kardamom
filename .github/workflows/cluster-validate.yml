@@ -12,12 +12,11 @@ on:
       - 'justfile'
       - 'crates/log/docker/aeron/Dockerfile'
       - '.github/workflows/cluster-validate.yml'
+  # Every pull request, with no path filter: the main ruleset requires the
+  # tofu checks, and a filtered workflow never reports them on a pull
+  # request that leaves deploy/cluster alone, so that pull request could
+  # never merge.
   pull_request:
-    paths:
-      - 'deploy/cluster/**'
-      - 'justfile'
-      - 'crates/log/docker/aeron/Dockerfile'
-      - '.github/workflows/cluster-validate.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -100,9 +99,9 @@ jobs:
         working-directory: deploy/cluster/terraform/${{ matrix.root }}
     steps:
       - uses: actions/checkout@v4
-      - uses: opentofu/setup-opentofu@v1
+      - uses: ./.github/actions/tofu-providers
         with:
-          tofu_version: 1.12.6
+          root: deploy/cluster/terraform/${{ matrix.root }}
       - name: tofu fmt
         run: tofu fmt -check -recursive .
       - name: tofu init (provider schema only, no backend)

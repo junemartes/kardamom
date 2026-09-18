@@ -28,9 +28,9 @@
 # everywhere keeps one image and a uniform aeron.dir layout; the
 # workers' archive simply goes unused. To use a media-driver-only image
 # on workers instead, split this into two system jobs with role
-# constraints. Host networking exposes the archive
-# control/response/recording-events/replication UDP ports
-# (8010/8011/8020/8021) directly.
+# constraints. Host networking exposes the archive control, response
+# and replication UDP ports directly, on Nomad dynamic ports. Consumers
+# read the control port from the kardamom-aeron-archive record.
 
 # Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
@@ -84,10 +84,14 @@ job "aeron" {
   group "aeron" {
     network {
       mode = "host"
-      # The archive control endpoint, registered below.
-      port "archive_control" {
-        static = 8010
-      }
+      # The archive control endpoint, registered below. Consumers
+      # resolve it from the kardamom-aeron-archive record, so Nomad
+      # picks the port per allocation.
+      port "archive_control" {}
+      # The response and replication channels of the archive's own
+      # client context. Nothing outside the task connects to them.
+      port "archive_control_response" {}
+      port "archive_replication" {}
     }
 
     # Persistent archive segment volume on the VM disk. Recorders use
@@ -130,12 +134,16 @@ job "aeron" {
       # Override the image's /aeron-mount defaults, so the path
       # matches the services. See the volumes note above.
       env {
-        AERON_DIR                    = "/opt/kardamom/aeron-mount/dir"
-        AERON_ARCHIVE_MOUNT          = "/opt/kardamom/archive"
-        AERON_ARCHIVE_DIR            = "/opt/kardamom/archive/dir"
-        AERON_ARCHIVE_CLASS          = "io.aeron.archive.ArchivingMediaDriver"
-        AERON_TERM_BUFFER_LENGTH     = "4194304"
-        AERON_IPC_TERM_BUFFER_LENGTH = "4194304"
+        AERON_DIR           = "/opt/kardamom/aeron-mount/dir"
+        AERON_ARCHIVE_MOUNT = "/opt/kardamom/archive"
+        AERON_ARCHIVE_DIR   = "/opt/kardamom/archive/dir"
+        AERON_ARCHIVE_CLASS = "io.aeron.archive.ArchivingMediaDriver"
+        # The archive's UDP ports, as Nomad allocated them.
+        AERON_ARCHIVE_CONTROL_PORT          = "${NOMAD_HOST_PORT_archive_control}"
+        AERON_ARCHIVE_CONTROL_RESPONSE_PORT = "${NOMAD_HOST_PORT_archive_control_response}"
+        AERON_ARCHIVE_REPLICATION_PORT      = "${NOMAD_HOST_PORT_archive_replication}"
+        AERON_TERM_BUFFER_LENGTH            = "4194304"
+        AERON_IPC_TERM_BUFFER_LENGTH        = "4194304"
         # Cap the ArchivingMediaDriver JVM heap, so the task fits its
         # trimmed memory reservation below. The driver's hot data (4
         # MB term buffers) sits off-heap in the tmpfs aeron.dir, so a

@@ -213,9 +213,7 @@ fn sweep_stale_tmp(checkpoints_dir: &Path) -> Result<(), StateError> {
 /// # Errors
 ///
 /// Returns [`StateError`] if the directory listing fails partway through.
-pub(crate) fn latest_checkpoint(
-    checkpoints_dir: &Path,
-) -> Result<Option<CheckpointInfo>, StateError> {
+pub fn latest_checkpoint(checkpoints_dir: &Path) -> Result<Option<CheckpointInfo>, StateError> {
     let best = entry_names(checkpoints_dir)?
         .into_iter()
         .filter_map(|(name, path)| match CheckpointEntry::parse(&name) {

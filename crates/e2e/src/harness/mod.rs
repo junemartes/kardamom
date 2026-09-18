@@ -92,6 +92,7 @@ impl LocalStack {
             chain_id: self.cfg.chain_id.get(),
             pending_receipt_timeout: self.cfg.ingress.pending_receipt_timeout.as_duration(),
             ingress_metrics: self.ingress.metrics_addr,
+            executor_query: std::net::SocketAddr::from(([127, 0, 0, 1], self.executor_query_port)),
             executor_metrics: self.executor.metrics_addr,
             sequencer_metrics: self.sequencers.iter().map(|s| s.metrics_addr).collect(),
             validator_metrics: self.validator.as_ref().map(|v| v.metrics_addr),

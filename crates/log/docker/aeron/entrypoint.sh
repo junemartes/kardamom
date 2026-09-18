@@ -36,6 +36,12 @@ AERON_ARCHIVE_THREADING_MODE="${AERON_ARCHIVE_THREADING_MODE:-SHARED}"
 # check can't see it either). Crc32 is Aeron's own class, so the persisted
 # values stay comparable with `ArchiveTool checksum io.aeron.archive.checksum.Crc32`.
 AERON_ARCHIVE_CHECKSUM="${AERON_ARCHIVE_CHECKSUM:-io.aeron.archive.checksum.Crc32}"
+# The archive's UDP ports. The defaults serve the docker test rigs, which map
+# fixed container ports. The Nomad job passes the ports it allocated to this
+# task, so no archive port is fixed on a cluster node.
+AERON_ARCHIVE_CONTROL_PORT="${AERON_ARCHIVE_CONTROL_PORT:-8010}"
+AERON_ARCHIVE_CONTROL_RESPONSE_PORT="${AERON_ARCHIVE_CONTROL_RESPONSE_PORT:-8011}"
+AERON_ARCHIVE_REPLICATION_PORT="${AERON_ARCHIVE_REPLICATION_PORT:-8021}"
 
 java \
     --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
@@ -47,9 +53,9 @@ java \
     -Daeron.ipc.term.buffer.length=${AERON_IPC_TERM_BUFFER_LENGTH} \
     -Daeron.threading.mode=${AERON_THREADING_MODE} \
     -Daeron.archive.threading.mode=${AERON_ARCHIVE_THREADING_MODE} \
-    -Daeron.archive.control.channel=aeron:udp?endpoint=0.0.0.0:8010 \
-    -Daeron.archive.control.response.channel=aeron:udp?endpoint=0.0.0.0:8011 \
-    -Daeron.archive.replication.channel=aeron:udp?endpoint=0.0.0.0:8021 \
+    -Daeron.archive.control.channel=aeron:udp?endpoint=0.0.0.0:${AERON_ARCHIVE_CONTROL_PORT} \
+    -Daeron.archive.control.response.channel=aeron:udp?endpoint=0.0.0.0:${AERON_ARCHIVE_CONTROL_RESPONSE_PORT} \
+    -Daeron.archive.replication.channel=aeron:udp?endpoint=0.0.0.0:${AERON_ARCHIVE_REPLICATION_PORT} \
     -Daeron.archive.record.checksum=${AERON_ARCHIVE_CHECKSUM} \
     -Daeron.archive.replay.checksum=${AERON_ARCHIVE_CHECKSUM} \
     -cp /opt/aeron/aeron-all.jar \

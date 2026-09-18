@@ -26,7 +26,7 @@ use kardamom_types::BPosition;
 /// message, with multi-fragment messages (any frame larger than one Aeron
 /// MTU, about 1.4 KB) already reassembled. Without the assembler,
 /// `aeron_subscription_poll` hands over raw fragments, and every oversized
-/// frame (for example a `Vec<Receipt>` batch that crosses the MTU) fails
+/// frame (for example a `ReceiptBatch` that crosses the MTU) fails
 /// to decode at the consumer. The header passed through belongs to the
 /// final fragment. Both ends of a position-keyed stream (the `tx_data`
 /// join) go through this same path, so position derivation stays
