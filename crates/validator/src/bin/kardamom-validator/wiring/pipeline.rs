@@ -11,7 +11,7 @@ use super::startup::Streamed;
 
 impl Streamed {
     /// Spawn the BAL and receipts verification pumps. Both run for the
-    /// process lifetime, stopped only by `pump_shutdown` at shutdown.
+    /// revolution's lifetime, stopped only by `pump_shutdown` at shutdown.
     ///
     /// # Errors
     ///
