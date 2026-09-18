@@ -94,17 +94,35 @@ fn every_executor_is_checked_and_missing_state_fails() {
 }
 
 #[test]
-fn heads_align_only_on_one_nonzero_head_from_every_consumer() {
+fn heads_align_on_one_head_with_at_most_one_block_of_unsettled_tail() {
     let aligned = Heads {
         executors: vec![Some(870), Some(870), Some(870)],
         validator: Some(870),
     };
     assert_eq!(aligned.aligned(), Some(870));
-    let behind = Heads {
-        executors: vec![Some(870), Some(869), Some(870)],
-        validator: Some(870),
+    assert_eq!(aligned.tail_note(), "every executor at the head");
+    let tail = Heads {
+        executors: vec![Some(91), Some(90), Some(91)],
+        validator: Some(91),
     };
-    assert_eq!(behind.aligned(), None);
+    assert_eq!(tail.aligned(), Some(91));
+    let nodes = ["executor-0", "executor-1", "executor-2"];
+    let settled: Vec<&&str> = tail.settled(&nodes).collect();
+    assert_eq!(settled, vec![&"executor-0", &"executor-2"]);
+    assert_eq!(
+        tail.tail_note(),
+        "1 executor(s) one block behind, left out of the compare"
+    );
+    let all_behind = Heads {
+        executors: vec![Some(90), Some(90)],
+        validator: Some(91),
+    };
+    assert_eq!(all_behind.aligned(), None);
+    let far = Heads {
+        executors: vec![Some(91), Some(89)],
+        validator: Some(91),
+    };
+    assert_eq!(far.aligned(), None);
     let unreachable = Heads {
         executors: vec![Some(870), None, Some(870)],
         validator: Some(870),

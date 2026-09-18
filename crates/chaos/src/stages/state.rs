@@ -52,7 +52,7 @@ impl<'a> StateAudit<'a> {
 
     async fn run(&self) -> anyhow::Result<()> {
         self.cluster.stop().await?;
-        self.drain().await?;
+        let heads = self.drain().await?;
         self.executor.stop().await?;
         self.validator.stop().await?;
         let directory = tempfile::Builder::new()
@@ -70,7 +70,7 @@ impl<'a> StateAudit<'a> {
         )
         .await?;
         let mut executors = Vec::new();
-        for node in &self.harness.probes.executors {
+        for node in heads.settled(&self.harness.probes.executors) {
             executors.push(self.copy_executor(&node.container, &directory).await?);
         }
         tokio::task::spawn_blocking(move || {
@@ -124,7 +124,7 @@ impl<'a> StateAudit<'a> {
         Ok(())
     }
 
-    async fn drain(&self) -> anyhow::Result<()> {
+    async fn drain(&self) -> anyhow::Result<Heads> {
         let last = std::cell::RefCell::new(Heads::default());
         let last_ref = &last;
         let outcome = poll::until(
@@ -140,18 +140,19 @@ impl<'a> StateAudit<'a> {
             },
         )
         .await?;
+        let heads = last.into_inner();
         let (head, elapsed) = outcome.or_fail(|t| {
             anyhow::anyhow!(
-                "consumers did not drain to one nonzero head within {}s after ordering stopped ({})",
-                t.as_secs(),
-                last.borrow()
+                "consumers did not drain to one nonzero head within {}s after ordering stopped ({heads})",
+                t.as_secs()
             )
         })?;
         crate::log(format!(
-            "persisted-state: consumers drained to head {head} after {}s",
-            elapsed.as_secs()
+            "persisted-state: consumers drained to head {head} after {}s ({})",
+            elapsed.as_secs(),
+            heads.tail_note()
         ));
-        Ok(())
+        Ok(heads)
     }
 
     /// One sample of every consumer's own head gauge. A failed scrape
@@ -195,11 +196,45 @@ struct Heads {
 }
 
 impl Heads {
-    /// The one nonzero head every consumer reports, if they agree.
+    /// The settled head: the validator's committed block, nonzero, with
+    /// every executor at that block or one behind it, and at least one
+    /// executor at it. A stopped sealer job freezes the durability
+    /// watermark, so an executor that had the last block in flight can
+    /// never settle it; that replica is one behind, not divergent, and
+    /// [`Self::settled`] leaves it out of the compare.
     fn aligned(&self) -> Option<i64> {
         self.validator.filter(|v| {
-            *v > 0 && !self.executors.is_empty() && self.executors.iter().all(|e| *e == Some(*v))
+            *v > 0
+                && self.executors.contains(&Some(*v))
+                && self
+                    .executors
+                    .iter()
+                    .all(|e| e.is_some_and(|e| e == *v || e + 1 == *v))
         })
+    }
+
+    /// The executors at the settled head, in probe order.
+    fn settled<'a, T>(&self, nodes: &'a [T]) -> impl Iterator<Item = &'a T> {
+        let head = self.validator;
+        nodes
+            .iter()
+            .zip(&self.executors)
+            .filter(move |(_, e)| **e == head)
+            .map(|(node, _)| node)
+    }
+
+    /// How many executors sit one block behind the settled head.
+    fn tail_note(&self) -> String {
+        let behind = self
+            .executors
+            .iter()
+            .filter(|e| **e != self.validator)
+            .count();
+        if behind == 0 {
+            "every executor at the head".to_string()
+        } else {
+            format!("{behind} executor(s) one block behind, left out of the compare")
+        }
     }
 }
 
