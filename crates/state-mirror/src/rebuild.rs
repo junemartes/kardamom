@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use kardamom_cache::AccountCache;
 use kardamom_state::checkpoint::latest_checkpoint;
-use kardamom_state::{StateEnvBuilder, StateSnapshot, restore_best_checkpoint};
+use kardamom_state::{StateEnvBuilder, StateSnapshot, restore_newest_readable};
 use kardamom_types::{AccountRow, BPosition};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -30,9 +30,33 @@ const CHECKPOINT_POLL: Duration = Duration::from_secs(5);
 const WRITE_RETRY: Duration = Duration::from_millis(200);
 
 /// The rebuild inputs: where the checkpoints are, and where to restore.
+#[derive(Clone)]
 pub(crate) struct Rebuild {
     checkpoints_dir: PathBuf,
     scratch: PathBuf,
+}
+
+/// The checkpoint block a rebuild already restored. A restore copies
+/// and hashes the whole state image, which costs seconds to minutes
+/// with three mirrors on one disk. Restoring the same block again on
+/// every poll gains nothing, and the work starves the restores that
+/// would make progress.
+struct TriedCheckpoint {
+    block: Option<u64>,
+}
+
+impl TriedCheckpoint {
+    fn new() -> Self {
+        Self { block: None }
+    }
+
+    fn is_new(&self, block: u64) -> bool {
+        self.block.is_none_or(|tried| block > tried)
+    }
+
+    fn mark(&mut self, block: u64) {
+        self.block = Some(block);
+    }
 }
 
 impl Rebuild {
@@ -81,28 +105,48 @@ impl Rebuild {
         first_live: BPosition,
         shutdown: &CancellationToken,
     ) -> Result<StateSnapshot> {
+        let mut tried = TriedCheckpoint::new();
         loop {
-            if let Some(snapshot) = self.open_newest(first_live)? {
+            if let Some(snapshot) = self.try_newest(first_live, &mut tried).await? {
                 return Ok(snapshot);
             }
-            tokio::select! {
-                () = shutdown.cancelled() => anyhow::bail!("shutdown during the rebuild wait"),
-                () = tokio::time::sleep(CHECKPOINT_POLL) => {}
-            }
+            pause(shutdown, CHECKPOINT_POLL, "the rebuild wait").await?;
         }
     }
 
-    /// The newest checkpoint as a read-only snapshot, when it reaches
-    /// `first_live`. `None` when there is no checkpoint yet, or it is
-    /// still behind.
-    fn open_newest(&self, first_live: BPosition) -> Result<Option<StateSnapshot>> {
+    /// One attempt at the newest checkpoint, on a blocking thread. The
+    /// restore copies and hashes the whole image, so it must not run on
+    /// an async worker. A block this rebuild already restored is
+    /// skipped: only a newer one can carry the first live batch.
+    async fn try_newest(
+        &self,
+        first_live: BPosition,
+        tried: &mut TriedCheckpoint,
+    ) -> Result<Option<StateSnapshot>> {
         let Some(newest) = latest_checkpoint(&self.checkpoints_dir)? else {
             warn!(dir = %self.checkpoints_dir.display(), "rebuild: no checkpoint yet");
             return Ok(None);
         };
-        let _ = std::fs::remove_dir_all(&self.scratch);
-        std::fs::create_dir_all(&self.scratch).context("create the rebuild scratch dir")?;
-        let restored = restore_best_checkpoint(&self.checkpoints_dir, &self.scratch, None)?;
+        if !tried.is_new(newest.block) {
+            return Ok(None);
+        }
+        tried.mark(newest.block);
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.open_newest(newest.block, first_live))
+            .await
+            .context("join the checkpoint restore")?
+    }
+
+    /// The newest checkpoint as a read-only snapshot, when it reaches
+    /// `first_live`. `None` when no checkpoint reads back, or the
+    /// newest one is still behind. Runs on a blocking thread.
+    ///
+    /// This reads the executor's directory and never writes to it. The
+    /// executor prunes its old checkpoints, so one can vanish between
+    /// the listing and the read; `restore_newest_readable` skips such a
+    /// checkpoint instead of renaming it out of the executor's way.
+    fn open_newest(&self, newest: u64, first_live: BPosition) -> Result<Option<StateSnapshot>> {
+        let restored = restore_newest_readable(&self.checkpoints_dir, &self.scratch, None)?;
         let Some((block, _)) = restored else {
             warn!("rebuild: no restorable checkpoint");
             return Ok(None);
@@ -118,12 +162,19 @@ impl Rebuild {
                 block,
                 end = end.as_index(),
                 first_live = first_live.as_index(),
-                "rebuild: newest checkpoint {} is behind the first live batch; waiting",
-                newest.block
+                "rebuild: newest checkpoint {newest} is behind the first live batch; waiting"
             );
             return Ok(None);
         }
         Ok(Some(snapshot))
+    }
+}
+
+/// Sleep `wait`, or end the step when shutdown comes first.
+async fn pause(shutdown: &CancellationToken, wait: Duration, during: &str) -> Result<()> {
+    tokio::select! {
+        () = shutdown.cancelled() => anyhow::bail!("shutdown during {during}"),
+        () = tokio::time::sleep(wait) => Ok(()),
     }
 }
 
@@ -183,9 +234,27 @@ async fn write_chunk(
                 warn!(error = %e, "rebuild: write failed; retrying");
             }
         }
-        tokio::select! {
-            () = shutdown.cancelled() => anyhow::bail!("shutdown during the rebuild"),
-            () = tokio::time::sleep(WRITE_RETRY) => {}
-        }
+        pause(shutdown, WRITE_RETRY, "the rebuild").await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TriedCheckpoint;
+
+    /// A restore copies and hashes the whole state image. The wait loop
+    /// polls every five seconds, so it must restore one block once and
+    /// then wait for a newer one.
+    #[test]
+    fn a_checkpoint_is_tried_once_until_a_newer_one_appears() {
+        let mut tried = TriedCheckpoint::new();
+        assert!(tried.is_new(683), "the first checkpoint is always new");
+        tried.mark(683);
+        assert!(!tried.is_new(683), "the same block must not restore twice");
+        assert!(!tried.is_new(680), "an older block carries less, not more");
+        assert!(
+            tried.is_new(696),
+            "a newer block may carry the first live batch"
+        );
     }
 }
