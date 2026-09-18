@@ -186,11 +186,15 @@ impl Case {
     }
 
     /// The load's per-submit retry count. The resize case rolls the
-    /// ingress the load submits to, so it gets a wide retry.
+    /// ingress the load submits to, and the quorum-loss case stalls
+    /// ordering past the ingress's parked-submit timeout, so both get a
+    /// wide retry. A refused submit leaves a nonce hole, and every later
+    /// transaction of that sender then executes as failed; the verdict
+    /// would count those as bad receipts, not the stall.
     #[must_use]
     pub fn load_retry(self, k: &Knobs) -> u32 {
         match self {
-            Self::ResizeScaleOutIn => 60,
+            Self::ResizeScaleOutIn | Self::ClusterQuorumLossRecover => 60,
             _ => k.load_retry,
         }
     }
