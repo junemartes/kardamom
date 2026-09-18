@@ -227,6 +227,68 @@ pub fn latest_checkpoint(checkpoints_dir: &Path) -> Result<Option<CheckpointInfo
     Ok(best)
 }
 
+/// Every checkpoint in the directory, newest block first.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the directory listing fails.
+pub fn checkpoints_newest_first(checkpoints_dir: &Path) -> Result<Vec<CheckpointInfo>, StateError> {
+    let mut found: Vec<CheckpointInfo> = entry_names(checkpoints_dir)?
+        .into_iter()
+        .filter_map(|(name, path)| match CheckpointEntry::parse(&name) {
+            CheckpointEntry::Checkpoint(block) => Some(CheckpointInfo { block, path }),
+            CheckpointEntry::Tmp | CheckpointEntry::MdbxData | CheckpointEntry::Other => None,
+        })
+        .collect();
+    found.sort_by_key(|c| std::cmp::Reverse(c.block));
+    Ok(found)
+}
+
+/// Restore the newest checkpoint that reads back, into `state_dir`,
+/// without touching the checkpoint directory. Returns the restored
+/// block and its path, or `None` when none of them reads back.
+///
+/// A reader of another process's checkpoint directory needs this, not
+/// [`restore_best_checkpoint`]. The writer prunes its old checkpoints,
+/// so one can vanish between the listing and the read. That is a race,
+/// not corruption, and a reader must never rename another process's
+/// files: the rename leaves a `.rejected-` copy that nothing prunes,
+/// takes a checkpoint the writer still counts, and fails outright when
+/// the file is already gone.
+///
+/// `state_dir` must be empty before each attempt; this empties it.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the directory listing fails, or if the
+/// scratch directory cannot be cleared.
+pub fn restore_newest_readable(
+    checkpoints_dir: &Path,
+    state_dir: &Path,
+    expected_genesis: Option<B256>,
+) -> Result<Option<(u64, PathBuf)>, StateError> {
+    for ckpt in checkpoints_newest_first(checkpoints_dir)? {
+        clear_dir(state_dir)?;
+        match restore_checkpoint(&ckpt.path, state_dir, expected_genesis) {
+            Ok(block) => return Ok(Some((block, ckpt.path))),
+            Err(e) => warn!(
+                checkpoint = %ckpt.path.display(),
+                error = %e,
+                "checkpoint does not read back; trying the next-newest"
+            ),
+        }
+    }
+    Ok(None)
+}
+
+/// Empty `dir`, creating it when absent. A restore refuses a state dir
+/// that already holds a DB, so each attempt starts from an empty one.
+fn clear_dir(dir: &Path) -> Result<(), StateError> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir)?;
+    Ok(())
+}
+
 /// Delete every checkpoint older than the `keep_from` block, and keep
 /// newer ones. Returns how many were removed. This bounds checkpoint
 /// disk use.

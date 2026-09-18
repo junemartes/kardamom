@@ -23,7 +23,7 @@ mod compare;
 #[cfg(test)]
 mod tests;
 
-pub use compare::deep_compare;
+pub use compare::{deep_compare, deep_compare_to};
 
 use alloy_primitives::B256;
 

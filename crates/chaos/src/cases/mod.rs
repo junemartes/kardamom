@@ -186,11 +186,19 @@ impl Case {
     }
 
     /// The load's per-submit retry count. The resize case rolls the
-    /// ingress the load submits to, so it gets a wide retry.
+    /// ingress the load submits to, so it gets a wide retry. The
+    /// quorum-loss case stalls ordering for about a minute, past the
+    /// ingress's 30 s parked-submit timeout; a refused submit leaves a
+    /// nonce hole, and every later transaction of that sender then
+    /// executes as failed, which the verdict would count as bad receipts.
+    /// Each attempt parks up to 30 s at the ingress while the stall
+    /// lasts, so six attempts cover the stall; sixty made the case take
+    /// 23 minutes and the shard hit its job timeout.
     #[must_use]
     pub fn load_retry(self, k: &Knobs) -> u32 {
         match self {
             Self::ResizeScaleOutIn => 60,
+            Self::ClusterQuorumLossRecover => 6,
             _ => k.load_retry,
         }
     }
