@@ -92,3 +92,31 @@ fn every_executor_is_checked_and_missing_state_fails() {
     fixture.copies.executors.clear();
     assert!(fixture.copies.verify().is_err());
 }
+
+#[test]
+fn heads_align_only_on_one_nonzero_head_from_every_consumer() {
+    let aligned = Heads {
+        executors: vec![Some(870), Some(870), Some(870)],
+        validator: Some(870),
+    };
+    assert_eq!(aligned.aligned(), Some(870));
+    let behind = Heads {
+        executors: vec![Some(870), Some(869), Some(870)],
+        validator: Some(870),
+    };
+    assert_eq!(behind.aligned(), None);
+    let unreachable = Heads {
+        executors: vec![Some(870), None, Some(870)],
+        validator: Some(870),
+    };
+    assert_eq!(unreachable.aligned(), None);
+    assert_eq!(
+        unreachable.to_string(),
+        "executors=[870, unreachable, 870] validator=870"
+    );
+    let idle = Heads {
+        executors: vec![Some(0)],
+        validator: Some(0),
+    };
+    assert_eq!(idle.aligned(), None);
+}

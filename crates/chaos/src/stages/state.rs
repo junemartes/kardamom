@@ -125,24 +125,41 @@ impl<'a> StateAudit<'a> {
     }
 
     async fn drain(&self) -> anyhow::Result<()> {
+        let last = std::cell::RefCell::new(Heads::default());
+        let last_ref = &last;
         let outcome = poll::until(
             Budget::new(
                 self.harness.knobs.converge_slo,
                 std::time::Duration::from_secs(2),
             ),
-            |_| async { self.aligned_head().await },
+            |_| async move {
+                let heads = self.heads().await;
+                let aligned = heads.aligned();
+                *last_ref.borrow_mut() = heads;
+                Ok(aligned)
+            },
         )
         .await?;
-        outcome.or_fail(|_| {
-            anyhow::anyhow!("consumers did not drain to one nonzero head after ordering stopped")
+        let (head, elapsed) = outcome.or_fail(|t| {
+            anyhow::anyhow!(
+                "consumers did not drain to one nonzero head within {}s after ordering stopped ({})",
+                t.as_secs(),
+                last.borrow()
+            )
         })?;
+        crate::log(format!(
+            "persisted-state: consumers drained to head {head} after {}s",
+            elapsed.as_secs()
+        ));
         Ok(())
     }
 
-    async fn aligned_head(&self) -> anyhow::Result<Option<i64>> {
-        let mut blocks = Vec::new();
+    /// One sample of every consumer's own head gauge. A failed scrape
+    /// stays `None`: it is evidence, not zero.
+    async fn heads(&self) -> Heads {
+        let mut executors = Vec::new();
         for i in 0..self.harness.probes.executors.len() {
-            blocks.push(
+            executors.push(
                 self.harness
                     .probes
                     .exec_metric(i, EXECUTOR_BLOCK_METRIC)
@@ -154,8 +171,10 @@ impl<'a> StateAudit<'a> {
             .probes
             .val_metric("validator_committed_block")
             .await;
-        Ok(validator
-            .filter(|v| *v > 0 && !blocks.is_empty() && blocks.iter().all(|b| *b == Some(*v))))
+        Heads {
+            executors,
+            validator,
+        }
     }
 
     async fn restore(&self) -> anyhow::Result<()> {
@@ -164,6 +183,36 @@ impl<'a> StateAudit<'a> {
         let executor = self.executor.restore().await;
         let validator = self.validator.restore().await;
         cluster.and(executor).and(validator)
+    }
+}
+
+/// The consumers' head gauges at one sample: the executors' settled
+/// block and the validator's committed block.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Heads {
+    executors: Vec<Option<i64>>,
+    validator: Option<i64>,
+}
+
+impl Heads {
+    /// The one nonzero head every consumer reports, if they agree.
+    fn aligned(&self) -> Option<i64> {
+        self.validator.filter(|v| {
+            *v > 0 && !self.executors.is_empty() && self.executors.iter().all(|e| *e == Some(*v))
+        })
+    }
+}
+
+impl std::fmt::Display for Heads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let show = |h: &Option<i64>| h.map_or("unreachable".to_string(), |v| v.to_string());
+        let executors: Vec<String> = self.executors.iter().map(show).collect();
+        write!(
+            f,
+            "executors=[{}] validator={}",
+            executors.join(", "),
+            show(&self.validator)
+        )
     }
 }
 
