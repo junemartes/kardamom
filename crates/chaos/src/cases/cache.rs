@@ -223,8 +223,9 @@ fn sentinel_nodes(h: &Harness) -> Vec<String> {
 
 /// Ask the sentinels who the primary is, and keep the first answer the
 /// named node confirms with `ROLE`. The address is a node record
-/// (`aux-0.node.dc1.consul`) for the first primary, and an IP for a
-/// promoted replica, which announces no hostname. `None` while no
+/// (`aux-0.node.dc1.consul`, `ingress-1.node.dc1.consul`): every
+/// instance announces one, so a promoted replica keeps the name the
+/// sentinels learned it under. `None` while no
 /// sentinel names a node that answers as a primary: the sentinels do
 /// that for a few seconds in the middle of a failover, and a case that
 /// waits for the promotion polls through it.
