@@ -1,0 +1,41 @@
+---
+name: rust-build-cache
+description: >-
+  The Rust build cache of a CI job: sccache on the GitHub cache backend
+  for every rustc call (workspace crates included), rust-cache for the
+  registry and the dependency artifacts, and a fixed ISA for C objects.
+inputs:
+  key:
+    description: Appended to the job's rust-cache key (a job with another feature set keeps its own).
+    required: false
+    default: ""
+  shared-key:
+    description: A rust-cache key shared across the jobs of a workflow, in place of the job-based key.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    # rusteron's build.rs compiles the Aeron C library with -march=native.
+    # A cached object built on a wider-ISA runner SIGILLs on a narrower
+    # one, which is why every rust-cache key used to carry a CPU-flag
+    # hash. The compiler wrappers append -march=x86-64-v3 after it (GCC
+    # takes the last -march), so one key serves the whole fleet.
+    - name: Fix the ISA of C objects and route rustc through sccache
+      shell: bash
+      run: |
+        {
+          echo "CC=${GITHUB_WORKSPACE}/scripts/ci/cc-x86-64-v3.sh"
+          echo "CXX=${GITHUB_WORKSPACE}/scripts/ci/cxx-x86-64-v3.sh"
+          echo "RUSTC_WRAPPER=sccache"
+          echo "SCCACHE_GHA_ENABLED=true"
+        } >> "$GITHUB_ENV"
+    - uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: v1-rust-x86-64-v3
+        key: ${{ inputs.key }}
+        shared-key: ${{ inputs.shared-key }}
+    # rusteron builds the Aeron C library with Gradle on a cache miss;
+    # the Gradle cache keeps that build off Maven Central.
+    - uses: ./.github/actions/gradle-cache

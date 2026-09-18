@@ -1,14 +1,18 @@
 //! The validator's two engine seams: the block-close BAL write-set check
-//! ([`ValidatorWriterQueue`]) and the per-tx receipt check
-//! ([`ValidatorReceiptSink`]). Both use existing engine trait seams
-//! ([`StateWriterQueue`], [`TxReceiptsPublication`]) and stop the process via
-//! [`Divergence`] on a proven mismatch.
+//! ([`ValidatorWriterQueue`]) and the per-tx receipt check with the
+//! account-row check ([`ValidatorReceiptSink`]). Both use existing engine
+//! trait seams ([`StateWriterQueue`], [`TxReceiptsPublication`]) and stop
+//! the process via [`Divergence`] on a proven mismatch.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kardamom_engine::{CMessage, ExecutorError, StateWriterQueue, TxReceiptsPublication};
-use kardamom_types::{BlockBoundary, BlockDelta, Receipt};
+use alloy_primitives::Address;
+use kardamom_engine::{
+    CMessage, ExecutorError, StateWriterQueue, TxReceiptsPublication, publish_each,
+};
+use kardamom_types::{AccountRow, BPosition, BlockBoundary, BlockDelta, Receipt, ReceiptRows};
 
 use crate::buffers::{BalBuffer, ReceiptBuffer};
 use crate::{Divergence, metrics};
@@ -167,10 +171,57 @@ impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
 // ValidatorReceiptSink: checks tx_receipts; never publishes.
 // ---------------------------------------------------------------------------
 
+/// How far behind the newest local receipt a recorded account value stays
+/// available for a row check, in canonical positions. A published batch
+/// spans at most 64 receipts, so its rows reference writes within that
+/// reach; the margin covers a validator that lags the executors.
+const RECENT_LOOKBEHIND: u64 = 4096;
+
+/// The latest local post-state of recently written accounts. The sink
+/// records every local receipt's rows in canonical order, so at the moment
+/// it processes the receipt at position P, an entry is the account's state
+/// after P. That is what a published batch row tagged P claims.
+#[derive(Default)]
+struct RecentAccounts {
+    latest: HashMap<Address, (u64, AccountRow)>,
+    /// Write order, for eviction. An address repeats once per write.
+    order: VecDeque<(u64, Address)>,
+}
+
+impl RecentAccounts {
+    fn record(&mut self, at: BPosition, rows: &[AccountRow]) {
+        let idx = at.as_index();
+        for row in rows {
+            self.latest.insert(row.address, (idx, row.clone()));
+            self.order.push_back((idx, row.address));
+        }
+        self.evict_below(idx.saturating_sub(RECENT_LOOKBEHIND));
+    }
+
+    /// Drop entries last written before `below`. An address rewritten
+    /// since keeps its newer value.
+    fn evict_below(&mut self, below: u64) {
+        while let Some(&(idx, address)) = self.order.front()
+            && idx < below
+        {
+            self.order.pop_front();
+            if self.latest.get(&address).is_some_and(|(at, _)| *at == idx) {
+                self.latest.remove(&address);
+            }
+        }
+    }
+
+    /// The local value of `row`'s account, when one is recorded.
+    fn local(&self, row: &AccountRow) -> Option<&AccountRow> {
+        self.latest.get(&row.address).map(|(_, local)| local)
+    }
+}
+
 /// Implements [`TxReceiptsPublication`], but checks receipts instead of
 /// publishing them. It compares each recomputed receipt against the
-/// executor's published receipt for the same `tx_idx`, and stops the
-/// process on a mismatch.
+/// executor's published receipt for the same `tx_idx`, and the published
+/// account rows of a batch that ends there against the local state, and
+/// stops the process on a mismatch.
 pub struct ValidatorReceiptSink {
     receipts: Arc<ReceiptBuffer>,
     divergence: Arc<Divergence>,
@@ -179,6 +230,8 @@ pub struct ValidatorReceiptSink {
     /// fires after the block's records and claims are gone, so without this
     /// ring a mismatch leaves only a log line, with nothing to replay.
     flight: Option<Arc<crate::flight::FlightRing>>,
+    /// The local account state at the current position, for the row check.
+    recent: RecentAccounts,
 }
 
 impl ValidatorReceiptSink {
@@ -188,6 +241,7 @@ impl ValidatorReceiptSink {
             divergence,
             wait: RECEIPT_WAIT,
             flight: None,
+            recent: RecentAccounts::default(),
         }
     }
 
@@ -207,26 +261,95 @@ impl ValidatorReceiptSink {
 
 impl TxReceiptsPublication for ValidatorReceiptSink {
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
-        // Latch: once a divergence is proven, the sink keeps failing. The
-        // first failing publish took the published receipt out of the
-        // buffer. Without this latch, a retrying caller would find an
-        // empty buffer, land in the "unverified" arm, and commit past a
-        // proven mismatch.
-        if let Some(reason) = self
-            .divergence
-            .halt_reason("validator halted on divergence")
-        {
-            return Err(ExecutorError::Divergence(reason));
-        }
         match msg {
-            CMessage::Receipt(local) => self.check_receipt(&local),
+            CMessage::Receipt(local) => self.check_item(&ReceiptRows::bare(local)),
             // A block boundary carries no per-tx data to check.
-            CMessage::BlockBoundary(_) => Ok(()),
+            CMessage::BlockBoundary(_) => self.latched(),
         }
+    }
+
+    /// The engine's commit thread delivers receipts through this path,
+    /// each with the rows the local execution wrote. Every item is checked
+    /// in order, and the first failure stops the batch.
+    fn publish_receipts(&mut self, items: &[ReceiptRows]) -> (usize, Option<ExecutorError>) {
+        publish_each(items, |item| self.check_item(item))
     }
 }
 
 impl ValidatorReceiptSink {
+    /// The divergence latch: once a divergence is proven, the sink keeps
+    /// failing. The first failing publish took the published receipt out
+    /// of the buffer. Without this latch, a retrying caller would find an
+    /// empty buffer, land in the "unverified" arm, and commit past a
+    /// proven mismatch.
+    fn latched(&self) -> Result<(), ExecutorError> {
+        match self
+            .divergence
+            .halt_reason("validator halted on divergence")
+        {
+            Some(reason) => Err(ExecutorError::Divergence(reason)),
+            None => Ok(()),
+        }
+    }
+
+    /// Check one local receipt, then the published account rows of a
+    /// batch that ends at its position, when a frame ending there has
+    /// arrived.
+    fn check_item(&mut self, item: &ReceiptRows) -> Result<(), ExecutorError> {
+        self.latched()?;
+        self.check_receipt(&item.receipt)?;
+        self.recent.record(item.receipt.tx_idx, &item.accounts);
+        let Some(published) = self.receipts.take_rows(item.receipt.tx_idx) else {
+            return Ok(());
+        };
+        // Under parallel validation only a block's last receipt carries
+        // rows. A receipt with no rows is not at a position where the
+        // local state is known per position, so the rows stay unverified.
+        if item.accounts.is_empty() {
+            metrics::counter_rows_unverified();
+            return Ok(());
+        }
+        self.check_rows(&item.receipt, &published)
+    }
+
+    /// Compare published rows with the local state at the same position.
+    /// A row for an account with no recorded local value is unverified,
+    /// not a divergence: a cold start can begin inside a batch.
+    fn check_rows(&self, local: &Receipt, published: &[AccountRow]) -> Result<(), ExecutorError> {
+        let mismatch = published.iter().find_map(|row| {
+            self.recent
+                .local(row)
+                .filter(|l| *l != row)
+                .map(|l| (row, l))
+        });
+        let Some((row, local_row)) = mismatch else {
+            self.count_rows(published);
+            return Ok(());
+        };
+        let reason = format!(
+            "account row mismatch at tx_idx {:?}: {} local(nonce={}, balance={}) vs \
+             published(nonce={}, balance={}) [tx_hash={} block={}]",
+            local.tx_idx,
+            row.address,
+            local_row.nonce,
+            local_row.balance,
+            row.nonce,
+            row.balance,
+            local.tx_hash,
+            local.block_number,
+        );
+        Err(ExecutorError::Divergence(self.divergence.halt(reason)))
+    }
+
+    /// Count a batch with no mismatch: verified when every row had a
+    /// local value to compare with, unverified otherwise.
+    fn count_rows(&self, published: &[AccountRow]) {
+        if published.iter().all(|row| self.recent.local(row).is_some()) {
+            metrics::counter_rows_verified();
+        } else {
+            metrics::counter_rows_unverified();
+        }
+    }
     /// Cross-checks one local receipt against the executor's published
     /// receipt. `Ok` when they match, or when no published receipt
     /// turned up in time to compare (counted as `receipt_missing`).
@@ -316,6 +439,66 @@ mod tests {
             write_set_hash: B256::from([wsh; 32]),
             ..Default::default()
         }
+    }
+
+    fn row(byte: u8, nonce: u64) -> AccountRow {
+        AccountRow {
+            address: Address::from([byte; 20]),
+            nonce,
+            balance: U256::from(nonce),
+        }
+    }
+
+    fn item(idx: u64, rows: Vec<AccountRow>) -> ReceiptRows {
+        ReceiptRows {
+            receipt: receipt(idx, true, 21_000, 0xab),
+            accounts: rows,
+        }
+    }
+
+    /// A sink whose buffer already holds the published receipts 0 and 1.
+    fn sink_with_two_receipts() -> (Arc<ReceiptBuffer>, Arc<Divergence>, ValidatorReceiptSink) {
+        let buf = ReceiptBuffer::new();
+        let div = Divergence::new();
+        buf.insert(receipt(0, true, 21_000, 0xab));
+        buf.insert(receipt(1, true, 21_000, 0xab));
+        let sink = ValidatorReceiptSink::new(buf.clone(), div.clone())
+            .with_wait(Duration::from_millis(50));
+        (buf, div, sink)
+    }
+
+    #[test]
+    fn matching_rows_pass_and_a_forged_row_halts() {
+        let (buf, div, mut sink) = sink_with_two_receipts();
+        // The batch [0, 1] ends at 1. Account 0x11 was last written at 0,
+        // so its row is checked against the value recorded there.
+        buf.insert_rows(BPosition::from_index(1), vec![row(0x11, 1), row(0x22, 2)]);
+        let (n, err) =
+            sink.publish_receipts(&[item(0, vec![row(0x11, 1)]), item(1, vec![row(0x22, 2)])]);
+        assert_eq!((n, err.is_none()), (2, true));
+        assert!(!div.is_halted());
+
+        // A published row that disagrees with the local state at its
+        // position is a proven divergence.
+        buf.insert(receipt(2, true, 21_000, 0xab));
+        buf.insert_rows(BPosition::from_index(2), vec![row(0x11, 9)]);
+        let (n, err) = sink.publish_receipts(&[item(2, vec![row(0x22, 3)])]);
+        assert_eq!(n, 0);
+        assert!(matches!(err, Some(ExecutorError::Divergence(_))));
+        assert!(div.reason().unwrap().contains("account row mismatch"));
+    }
+
+    #[test]
+    fn unknown_account_and_bare_receipt_leave_rows_unverified() {
+        let (buf, div, mut sink) = sink_with_two_receipts();
+        // A row for an account this validator never wrote: unverified.
+        buf.insert_rows(BPosition::from_index(0), vec![row(0x33, 5)]);
+        // Rows at a position whose local receipt carries none (the
+        // parallel-validation shape): unverified, even when they differ.
+        buf.insert_rows(BPosition::from_index(1), vec![row(0x11, 9)]);
+        let (n, err) = sink.publish_receipts(&[item(0, vec![row(0x11, 1)]), item(1, Vec::new())]);
+        assert_eq!((n, err.is_none()), (2, true));
+        assert!(!div.is_halted());
     }
 
     /// Recording fake inner writer queue.

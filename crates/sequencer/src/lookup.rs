@@ -91,68 +91,9 @@ impl LookupConfig {
     }
 }
 
-/// The JSON-RPC request body for one lookup.
-#[must_use]
-pub fn request_body(sender: Address) -> String {
-    format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionCount","params":["{sender}","latest"]}}"#
-    )
-}
-
-/// Parse the JSON-RPC answer into the account nonce.
-///
-/// # Errors
-///
-/// Returns the reason as text when the body is not JSON, carries an
-/// `error` member, has no `result`, or the result is not a hex quantity.
-pub fn parse_answer(body: &str) -> Result<u64, String> {
-    #[derive(Deserialize)]
-    struct Reply {
-        result: Option<String>,
-        error: Option<serde_json::Value>,
-    }
-    let reply: Reply = serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
-    if let Some(e) = reply.error {
-        return Err(format!("rpc error: {e}"));
-    }
-    let hex = reply.result.ok_or_else(|| "no result".to_string())?;
-    let digits = hex
-        .strip_prefix("0x")
-        .ok_or_else(|| format!("result is not a hex quantity: {hex}"))?;
-    u64::from_str_radix(digits, 16).map_err(|e| format!("bad hex quantity {hex}: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn request_body_is_eth_get_transaction_count() {
-        let a = Address::repeat_byte(0x22);
-        let body = request_body(a);
-        assert!(body.contains("eth_getTransactionCount"));
-        assert!(body.contains(&format!("{a}")));
-        assert!(body.contains("latest"));
-    }
-
-    #[test]
-    fn parses_a_hex_quantity() {
-        assert_eq!(
-            parse_answer(r#"{"jsonrpc":"2.0","id":1,"result":"0x2a"}"#),
-            Ok(42)
-        );
-        assert_eq!(
-            parse_answer(r#"{"jsonrpc":"2.0","id":1,"result":"0x0"}"#),
-            Ok(0)
-        );
-    }
-
-    #[test]
-    fn rejects_errors_and_junk() {
-        assert!(parse_answer(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601}}"#).is_err());
-        assert!(parse_answer(r#"{"jsonrpc":"2.0","id":1,"result":"42"}"#).is_err());
-        assert!(parse_answer("not json").is_err());
-    }
 
     #[test]
     fn requester_delivers_to_the_task_side() {

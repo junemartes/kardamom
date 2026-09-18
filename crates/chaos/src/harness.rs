@@ -17,7 +17,7 @@ use crate::load::{LoadRun, LoadSpec, Verdict};
 use crate::nodes::Nodes;
 use crate::nomad::Nomad;
 use crate::poll::{self, Budget};
-use crate::probes::Probes;
+use crate::probes::{IngressCounts, Probes};
 
 /// The port of the ingress JSON-RPC.
 /// The eth JSON-RPC port of every ingress node.
@@ -63,6 +63,21 @@ impl Harness {
         })
     }
 
+    /// Follow a new node contract: the probes and the RPC URL read the
+    /// addresses again. The Nomad client keeps its address, since the
+    /// control node is never replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the contract lacks a node the probes need.
+    pub fn follow(&mut self, contract: NodeContract) -> anyhow::Result<()> {
+        self.probes = Probes::new(&contract)?;
+        let ingress0 = contract.node("ingress-0")?;
+        self.rpc_url = format!("http://{}:{INGRESS_RPC_PORT}", ingress0.ip);
+        self.contract = contract;
+        Ok(())
+    }
+
     /// The host container name of a node, `kardamom-<name>`.
     ///
     /// # Errors
@@ -90,13 +105,9 @@ impl Harness {
         ));
         let account = self.pick_account(case).await?;
         let window = case.window(&self.knobs);
-        let rx0 = self
-            .probes
-            .ingress_baseline()
-            .await
-            .ok_or_else(|| crate::chaos_fail!("no ingress baseline before load"))?;
+        let rx0 = self.probes.ingress_counts().await;
         let load = LoadRun::start(&self.load_spec(case, account, window))?;
-        let outcome = self.run_body(case, &load, rx0).await;
+        let outcome = self.run_body(case, &load, &rx0).await;
         if let Err(e) = outcome {
             load.abort();
             return Err(e);
@@ -109,7 +120,12 @@ impl Harness {
         Ok(())
     }
 
-    async fn run_body(&mut self, case: Case, load: &LoadRun, rx0: i64) -> anyhow::Result<()> {
+    async fn run_body(
+        &mut self,
+        case: Case,
+        load: &LoadRun,
+        rx0: &IngressCounts,
+    ) -> anyhow::Result<()> {
         self.inject_gate(case, load, rx0).await?;
         case.run(self).await?;
         case.assert_recovered_progress(self).await?;
@@ -164,8 +180,42 @@ impl Harness {
     /// The injection gate: the ingress received counter must move past
     /// its pre-load baseline within the flow timeout, or the case
     /// refuses to inject into an idle pipeline.
-    async fn inject_gate(&self, case: Case, load: &LoadRun, rx0: i64) -> anyhow::Result<()> {
+    /// Wait for the load to sign its queues. The load signs the whole
+    /// case window before its first submit: about 200,000 transactions
+    /// for the longest case, which took over 120 s on a CI runner. The
+    /// flow check below starts after this, so slow signing never reads
+    /// as an idle pipeline.
+    async fn wait_load_ready(&self, case: Case, load: &LoadRun) -> anyhow::Result<()> {
+        let budget = Budget::new(self.knobs.load_ready_timeout, Duration::from_secs(3));
+        let outcome = poll::until(budget, |_| async move {
+            anyhow::ensure!(
+                !load.is_finished(),
+                "{}: {}: the load exited before it signed its queues",
+                crate::FAIL_PREFIX,
+                case.name()
+            );
+            Ok(load.is_ready().then_some(()))
+        })
+        .await?;
+        let ((), elapsed) = outcome.or_fail(|t| {
+            crate::chaos_fail!(
+                "{}: the load is still signing its queues after {}s",
+                case.name(),
+                t.as_secs()
+            )
+        })?;
+        crate::log(format!("load ready after {}s", elapsed.as_secs()));
+        Ok(())
+    }
+
+    async fn inject_gate(
+        &self,
+        case: Case,
+        load: &LoadRun,
+        rx0: &IngressCounts,
+    ) -> anyhow::Result<()> {
         tokio::time::sleep(self.knobs.inject_delay).await;
+        self.wait_load_ready(case, load).await?;
         let budget = Budget::new(self.knobs.load_flow_timeout, Duration::from_secs(3));
         let outcome = poll::until(budget, |_| async move {
             anyhow::ensure!(
@@ -174,19 +224,25 @@ impl Harness {
                 crate::FAIL_PREFIX,
                 case.name()
             );
-            let rx1 = self.probes.ingress_received().await.unwrap_or(rx0);
-            Ok((rx1 > rx0).then_some(rx1))
+            Ok(self.probes.ingress_counts().await.rose_over(rx0))
         })
         .await?;
-        let (rx1, _) = outcome.or_fail(|t| {
-            crate::chaos_fail!(
-                "{}: load not flowing after {}s (ingress received {rx0} -> ?); refusing to inject into an idle pipeline",
-                case.name(),
-                t.as_secs()
-            )
-        })?;
+        let (rx1, _) = match outcome {
+            poll::Outcome::Ready { value, elapsed } => (value, elapsed),
+            poll::Outcome::TimedOut { elapsed } => {
+                let now = self.probes.ingress_counts().await;
+                return Err(crate::chaos_fail!(
+                    "{}: load not flowing after {}s (ingress received [{}] -> [{}]); refusing to inject into an idle pipeline",
+                    case.name(),
+                    elapsed.as_secs(),
+                    rx0.describe(),
+                    now.describe()
+                ));
+            }
+        };
         crate::log(format!(
-            "load flowing (ingress received {rx0} -> {rx1}); injecting"
+            "load flowing (ingress received [{}] -> {rx1}); injecting",
+            rx0.describe()
         ));
         Ok(())
     }

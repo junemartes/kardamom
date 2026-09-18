@@ -280,11 +280,10 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
     require_live_victim(h, victim, &ctx).await?;
     let repair = Repair::capture(h, victim, &node).await?;
     let need = i64::try_from(retention.get().saturating_mul(2)).unwrap_or(i64::MAX);
-    let rx_freeze = h
-        .probes
-        .ingress_baseline()
-        .await
-        .ok_or_else(|| crate::chaos_fail!("no ingress baseline for retention overrun"))?;
+    let rx_freeze =
+        h.probes.ingress_counts().await.complete().ok_or_else(|| {
+            crate::chaos_fail!("no complete ingress baseline for retention overrun")
+        })?;
     crate::log(format!(
         "{ctx}: freezing {inner} on {node} until {need} frames flow past it (retention={retention}, cap {}s)",
         h.knobs.retention_freeze_cap.as_secs()
@@ -304,14 +303,7 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         ));
     }
     await_repair_chain(h, victim, &ctx, delta, elapsed, &repair).await?;
-    let cid_now = h.nodes.inner_cid(&node, &inner).await;
-    anyhow::ensure!(
-        cid_now.is_some() && cid_now != cid0,
-        "{}: {ctx}: victim container was not restarted (cid {} -> {}) — the park/exit/restore loop did not complete",
-        crate::FAIL_PREFIX,
-        cid0.as_deref().unwrap_or("?"),
-        cid_now.as_deref().unwrap_or("gone")
-    );
+    await_restarted_container(h, &node, &inner, cid0.as_deref(), &ctx).await?;
     match victim {
         Victim::Executor => h.assert_executor_progress(Duration::from_secs(180)).await,
         Victim::Validator => await_verifying_resumed(h).await,
@@ -373,6 +365,37 @@ async fn overrun_window(
             ))
         }
     }
+}
+
+/// Wait for the victim's running container to differ from `cid0`. The
+/// restore line can log while the task restarts once more, so for a moment
+/// no container of the task is running, and a single `docker ps` read
+/// right after the repair chain can find none.
+async fn await_restarted_container(
+    h: &Harness,
+    node: &str,
+    inner: &str,
+    cid0: Option<&str>,
+    ctx: &str,
+) -> anyhow::Result<()> {
+    let outcome = poll::until(Budget::secs(90, 3), |_| async move {
+        let now = h.nodes.inner_cid(node, inner).await;
+        Ok(now.filter(|cid| Some(cid.as_str()) != cid0))
+    })
+    .await?;
+    let (cid, waited) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: victim container was not restarted within {}s (cid {} -> no new running container) — the park/exit/restore loop did not complete",
+            t.as_secs(),
+            cid0.unwrap_or("?")
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: victim container restarted (cid {} -> {cid}, {}s after the restore line)",
+        cid0.unwrap_or("?"),
+        waited.as_secs()
+    ));
+    Ok(())
 }
 
 /// The recovery evidence splits across container generations, so the

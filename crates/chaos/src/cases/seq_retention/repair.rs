@@ -41,7 +41,7 @@ impl Repair {
     }
 
     async fn counts(&self, h: &Harness) -> anyhow::Result<[usize; 3]> {
-        let allocs = h.nomad.allocations(self.job).await?;
+        let allocs = h.nomad.allocations_with_logs(self.job).await?;
         let mut logs = String::new();
         for alloc in allocs.iter().filter(|a| a.node_name == self.node) {
             logs.push_str(&h.nomad.alloc_logs(alloc, Streams::Both).await?);

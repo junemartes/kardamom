@@ -71,6 +71,13 @@ impl Alloc {
         self.client_status == "running"
     }
 
+    /// Running, and meant to keep running: a stopping allocation still
+    /// reports `running` for a moment after the job asks it to stop.
+    #[must_use]
+    pub fn is_desired_running(&self) -> bool {
+        self.is_running() && self.desired_status == "run"
+    }
+
     /// The short id CI logs show.
     #[must_use]
     pub fn short_id(&self) -> &str {
@@ -143,6 +150,30 @@ impl Nomad {
             .with_context(|| format!("decode {url}"))
     }
 
+    /// The allocations of `job` whose logs Nomad can serve: those on a
+    /// ready client node. A node that a replacement removed, or one that
+    /// is down, keeps its allocations in the listing, but a log read on
+    /// them fails with a server error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node or allocation listing fails.
+    pub async fn allocations_with_logs(&self, job: &str) -> anyhow::Result<Vec<Alloc>> {
+        let ready: std::collections::HashSet<String> = self
+            .nodes()
+            .await?
+            .into_iter()
+            .filter(|n| n.status == "ready")
+            .map(|n| n.id)
+            .collect();
+        Ok(self
+            .allocations(job)
+            .await?
+            .into_iter()
+            .filter(|a| ready.contains(&a.node_id))
+            .collect())
+    }
+
     /// The running allocations of `job`.
     ///
     /// # Errors
@@ -153,7 +184,7 @@ impl Nomad {
             .allocations(job)
             .await?
             .into_iter()
-            .filter(|a| a.is_running() && a.desired_status == "run")
+            .filter(Alloc::is_desired_running)
             .collect())
     }
 
@@ -233,15 +264,15 @@ impl Nomad {
             .with_context(|| format!("read {url}"))
     }
 
-    /// The concatenated logs of every allocation of `job`, running or
-    /// not, every task, in the streams asked for. This is the evidence
-    /// source for lines that straddle a task restart.
+    /// The concatenated logs of every allocation of `job` on a ready node,
+    /// running or not, every task, in the streams asked for. This is the
+    /// evidence source for lines that straddle a task restart.
     ///
     /// # Errors
     ///
     /// Returns an error if the listing or a log read fails.
     pub async fn job_logs(&self, job: &str, streams: Streams) -> anyhow::Result<String> {
-        let allocs = self.allocations(job).await?;
+        let allocs = self.allocations_with_logs(job).await?;
         let mut out = String::new();
         for alloc in &allocs {
             out.push_str(&self.alloc_logs(alloc, streams).await?);

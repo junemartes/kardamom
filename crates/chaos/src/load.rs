@@ -96,6 +96,9 @@ impl LoadSpec {
 pub struct LoadRun {
     task: tokio::task::JoinHandle<anyhow::Result<bool>>,
     report_path: PathBuf,
+    /// Flips to `true` when the queues are signed and the first submit
+    /// is next.
+    ready: tokio::sync::watch::Receiver<bool>,
 }
 
 impl LoadRun {
@@ -113,10 +116,27 @@ impl LoadRun {
     /// `report_path` is where `cfg.output` writes the report.
     #[must_use]
     pub fn from_config(cfg: LoadConfig, report_path: PathBuf) -> Self {
+        let (signal, ready) = tokio::sync::watch::channel(false);
+        // The load signs its whole window before the first submit:
+        // about 200,000 transactions for the longest case. The
+        // injection gate waits for this signal, because an ingress
+        // counter that stands still during the signing proves nothing.
+        let task = tokio::spawn(async move {
+            let prepared = load::prepare(cfg).await?;
+            signal.send_replace(true);
+            prepared.run().await
+        });
         Self {
-            task: tokio::spawn(load::run(cfg)),
+            task,
             report_path,
+            ready,
         }
+    }
+
+    /// Whether the load signed its queues and started to submit.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        *self.ready.borrow()
     }
 
     /// Whether the load task has already ended, which before the window
@@ -172,15 +192,27 @@ mod tests {
         assert_eq!(report.verdict.seq_dropped, Some(2));
     }
 
+    /// A run whose load task is `task`, for the finish checks.
+    fn stub_run(
+        report_path: PathBuf,
+        task: impl std::future::Future<Output = anyhow::Result<bool>> + Send + 'static,
+    ) -> LoadRun {
+        let (_, ready) = tokio::sync::watch::channel(true);
+        LoadRun {
+            task: tokio::spawn(task),
+            report_path,
+            ready,
+        }
+    }
+
     #[tokio::test]
     async fn a_failed_load_cannot_reuse_a_stale_passing_report() {
         let directory = tempfile::tempdir().unwrap();
         let report_path = directory.path().join("report.json");
         std::fs::write(&report_path, r#"{"verdict":{"pass":true,"missing":0}}"#).unwrap();
-        let run = LoadRun {
-            task: tokio::spawn(async { anyhow::bail!("load failed before report") }),
-            report_path,
-        };
+        let run = stub_run(report_path, async {
+            anyhow::bail!("load failed before report")
+        });
         assert!(
             run.finish()
                 .await
@@ -195,10 +227,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let report_path = directory.path().join("report.json");
         std::fs::write(&report_path, r#"{"verdict":{"pass":true,"missing":0}}"#).unwrap();
-        let run = LoadRun {
-            task: tokio::spawn(async { Ok(false) }),
-            report_path,
-        };
+        let run = stub_run(report_path, async { Ok(false) });
         assert!(run.finish().await.is_err());
     }
 }

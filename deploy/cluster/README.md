@@ -36,7 +36,7 @@ no file in the tree names its address:
 | `ingress` | 2 | active/active JSON-RPC front door (:8545) |
 | `executor` | 3 | state-machine replica appliers (libmdbx state) |
 | `sealer` | 3 | **3-member Aeron Cluster (Raft)** — the Java `cluster` job: canonical ordering + archive-at-the-sealer durability folded into the Raft log |
-| `aux` | 1 | validator, da_watcher, batcher (off the chaos blast radius) |
+| `aux` | 1 | validator, da_watcher, batcher, monitoring (off the chaos blast radius) |
 
 ### Names, not addresses
 
@@ -106,7 +106,7 @@ make shard SHARD=chaos-executor   # one shard end to end, the way CI runs it
 
 The gates are the `kardamom-chaos` crate: one `#[ignore]` test per shard in
 `crates/chaos/tests/shards.rs` (`load`, `semantics`, `chaos-executor`,
-`chaos-ingress`, `chaos-sequencer`, `chaos-cluster`, `chaos-retention`). A
+`chaos-ingress`, `chaos-sequencer`, `chaos-cluster`, `chaos-retention`, `chaos-cache`). A
 shard test brings the cluster up itself; `container-test` runs it with
 `KARDAMOM_CHAOS_REUSE=1` against the cluster `container-up` made.
 `KARDAMOM_CHAOS_CASES="graceful-executor"` narrows a chaos shard to some
@@ -152,9 +152,17 @@ Remove the old volumes too: Terraform adopts an existing volume by name, and
 an old `kardamom-<node>-docker` volume would carry stale inner Docker state
 into the new node.
 
-CI runs `make shard SHARD=<name>` per matrix entry, and `container-diagnostics`
-on failure. A failed shard leaves the cluster up; the runner is ephemeral, so
-nothing destroys it after. Pass extra vars to `ansible/cluster.yml` with
+CI builds once: a `build` job compiles the service binaries, the shard test
+executable, the operator binary and the sealer jar, and stages them as one
+artifact (`scripts/ci/stage-cluster-dist.sh`, the checkout's own layout). A
+shard runner unpacks it and runs `make shard SHARD=<name> KARDAMOM_STAGED=1`,
+with no Rust toolchain, JDK or Foundry, and `container-diagnostics` on
+failure. `KARDAMOM_STAGED=1` makes the Makefile run
+`target/release/kardamom-chaos-shards` and `target/release/kardamom-cluster`
+instead of `cargo`. The Aeron C library is compiled for x86-64-v3 through the
+`scripts/ci/cc-x86-64-v3.sh` wrapper, so the artifact runs on any runner. A
+failed shard leaves the cluster up; the runner is ephemeral, so nothing
+destroys it after. Pass extra vars to `ansible/cluster.yml` with
 `CLUSTER_VARS='{"images_tag": "x"}'` (one JSON object, no single quote).
 `ansible/cluster.yml` is the convergence playbook; it expects the node contract.
 
@@ -447,15 +455,29 @@ profiled soak from #7..#15 (#0/#16 belong to the deploy's smoke gates), so a
 go; profiling knobs (`--ceiling`, `--soak-fraction`, `--profile-secs`, ...)
 are documented in `--help`.
 
+## Monitoring
+
+The `monitoring` job (`nomad/monitoring.nomad.hcl`) runs Prometheus and
+Grafana on the aux node. Prometheus scrapes every service's metrics port by
+its Consul node name, rendered from the node-class counts; Grafana
+provisions the Prometheus datasource by the `prometheus` Consul service and
+the dashboards from `deploy/grafana/provisioning/dashboards-json`, the one
+source for every profile. From the host, read the node contract for the
+aux node's address: Prometheus on port 9090, Grafana on port 3000
+(anonymous viewer; admin `admin` with the `grafana_admin_password` job
+variable, `kardamom` on the local profile). The autoscaler's Prometheus APM
+reads the same service.
+
 ## Sustained-load + chaos suite
 
 The `cluster-e2e` workflow runs the full suite on every trigger, **sharded
-across runners** (each shard brings up its own container cluster):
+across runners** (each shard brings up its own container cluster from the
+binaries one `build` job staged):
 
 | Shard | Exercises |
 |-------|-----------|
 | `load` | 5-min sustained soak (`kardamom-load` ramp→soak; must-deliver + drop accounting + keep-pace) |
-| `chaos-executor` | graceful + hard kill + **node-failure** (degrade to 2/3, node returns) |
+| `chaos-executor` | graceful + hard kill + **node-failure** (degrade to 2/3, node returns) + **node-replace** (the node comes back through the Terraform root on a new address with empty disks) |
 | `chaos-ingress` | graceful + hard kill + **archive-driver-loss** (Aeron substrate kill under ingress-0) |
 | `chaos-sequencer` | graceful + hard kill + **sequencer-replica-kill** (racing-twin failover, restarted replica must regain coverage) + **validator-lapse** |
 | `chaos-cluster` | Raft sealer: **leader-kill** / **follower-kill** / **quorum-loss-recover** |
