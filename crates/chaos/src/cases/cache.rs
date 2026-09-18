@@ -224,24 +224,35 @@ fn sentinel_nodes(h: &Harness) -> Vec<String> {
 /// Ask the sentinels who the primary is, and keep the first answer the
 /// named node confirms with `ROLE`. The address is a node record
 /// (`aux-0.node.dc1.consul`) for the first primary, and an IP for a
-/// promoted replica, which announces no hostname.
+/// promoted replica, which announces no hostname. `None` while no
+/// sentinel names a node that answers as a primary: the sentinels do
+/// that for a few seconds in the middle of a failover, and a case that
+/// waits for the promotion polls through it.
 ///
 /// One sentinel alone is not enough. After two failovers in 30 s a
 /// sentinel kept naming the demoted node for ten minutes. The local
 /// soak run 0917T233447 asked that sentinel and flushed 192.168.56.10
 /// while 192.168.56.16 held the data, so the case flushed a replica.
-async fn sentinel_master(h: &Harness) -> anyhow::Result<String> {
+async fn sentinel_master(h: &Harness) -> anyhow::Result<Option<String>> {
     let ask = redis_cli("-p 26379 SENTINEL get-master-addr-by-name kardamom | head -1");
     for node in sentinel_nodes(h) {
         let host = h.nodes.exec(&node, &ask).await.unwrap_or_default();
         if !host.is_empty() && answers_as_master(h, &node, &host).await {
-            return Ok(host);
+            return Ok(Some(host));
         }
         crate::log(format!(
             "the sentinel on {node} named no live primary (\"{host}\")"
         ));
     }
-    anyhow::bail!("no sentinel named a live primary")
+    Ok(None)
+}
+
+/// The primary a case acts on. A case that freezes, kills or flushes
+/// the primary needs one now.
+async fn live_primary(h: &Harness, ctx: &str) -> anyhow::Result<String> {
+    sentinel_master(h)
+        .await?
+        .ok_or_else(|| crate::chaos_fail!("{ctx}: no sentinel named a live primary"))
 }
 
 /// Whether `host` answers `ROLE` as a primary.
@@ -272,7 +283,7 @@ async fn primary_on(h: &Harness, ctx: &str, master: &str) -> anyhow::Result<(Str
 pub(crate) async fn redis_primary_freeze(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "redis-primary-freeze";
     wait_readers_connected(h, ctx).await?;
-    let master0 = sentinel_master(h).await?;
+    let master0 = live_primary(h, ctx).await?;
     let (node, primary) = primary_on(h, ctx, &master0).await?;
     crate::log(format!(
         "{ctx}: primary {master0} ({primary} on {node}); frozen until the sentinels promote (budget {}s)",
@@ -315,14 +326,14 @@ async fn frozen_phase(
     );
     wait_readers_degraded(h, ctx).await?;
     h.assert_progress().await?;
-    let outcome = poll::until(
-        Budget::new(PROMOTION_BUDGET, Duration::from_secs(3)),
-        |_| async move {
-            let master = sentinel_master(h).await?;
-            Ok::<_, anyhow::Error>((master != master0).then_some(master))
-        },
-    )
-    .await?;
+    let outcome =
+        poll::until(
+            Budget::new(PROMOTION_BUDGET, Duration::from_secs(3)),
+            |_| async move {
+                Ok::<_, anyhow::Error>(sentinel_master(h).await?.filter(|m| m != master0))
+            },
+        )
+        .await?;
     let (master, elapsed) = outcome.or_fail(|t| {
         crate::chaos_fail!(
             "{ctx}: the sentinels did not promote a new primary within {}s",
@@ -342,7 +353,7 @@ async fn frozen_phase(
 pub(crate) async fn redis_primary_kill(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "redis-primary-kill";
     wait_readers_connected(h, ctx).await?;
-    let master = sentinel_master(h).await?;
+    let master = live_primary(h, ctx).await?;
     let (node, _) = primary_on(h, ctx, &master).await?;
     crate::log(format!("{ctx}: primary {master} on {node}"));
     h.inject_hard(&[&node], "redis-").await?;
@@ -462,7 +473,7 @@ async fn freeze_and_flush(
                 crate::chaos_fail!("{ctx}: SIGSTOP of the mirror on {node} failed: {e}")
             })?;
     }
-    let master = sentinel_master(h).await?;
+    let master = live_primary(h, ctx).await?;
     h.nodes
         .exec(
             &aux(h),
