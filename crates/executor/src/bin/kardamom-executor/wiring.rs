@@ -101,18 +101,24 @@ pub(crate) struct LiveTxReceiptsPub {
 }
 
 impl TxReceiptsPublication for LiveTxReceiptsPub {
-    /// One `Vec<Receipt>` wire frame per batch: one encode and one blocking
+    /// One `ReceiptBatch` wire frame per batch: one encode and one blocking
     /// ack round trip through the Aeron thread, instead of one per receipt.
-    /// Each frame is all-or-nothing. A transient failure reports 0
-    /// published, and the commit thread's must-deliver loop retries the
-    /// whole batch. The duplicates are harmless: `tx_receipts` delivers at
-    /// least once, and consumers dedupe on `tx_idx`.
+    /// The per-tx account rows merge into the frame here, at the wire
+    /// edge, so a row is the account's state after the batch's last
+    /// receipt. Each frame is all-or-nothing. A transient failure reports
+    /// 0 published, and the commit thread's must-deliver loop retries the
+    /// whole batch, rows included. The duplicates are harmless:
+    /// `tx_receipts` delivers at least once, and consumers dedupe on
+    /// `tx_idx`.
     fn publish_receipts(
         &mut self,
-        receipts: &[kardamom_types::Receipt],
+        items: &[kardamom_types::ReceiptRows],
     ) -> (usize, Option<ExecutorError>) {
-        match self.handle.publish_receipts(&receipts.to_vec()) {
-            Ok(_) => (receipts.len(), None),
+        match self
+            .handle
+            .publish_receipts(&kardamom_types::ReceiptBatch::merge(items))
+        {
+            Ok(_) => (items.len(), None),
             Err(e) => (
                 0,
                 Some(ExecutorError::State(format!("publish_receipts: {e}"))),

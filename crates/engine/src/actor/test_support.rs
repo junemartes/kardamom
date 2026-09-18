@@ -95,6 +95,7 @@ pub(crate) fn legacy(
         value,
         gas_limit: 21_000,
         gas_price: 0,
+        ..Default::default()
     }
     .sign(signer)
 }
@@ -156,7 +157,7 @@ pub(super) fn drain_commits(rx: &Receiver<ExecToCommit>) -> (Vec<u64>, Vec<u64>)
 /// loop in [`drain_commits`] stays free of a branch.
 fn push_commit(m: ExecToCommit, receipts: &mut Vec<u64>, boundaries: &mut Vec<u64>) {
     match m {
-        ExecToCommit::Receipt(r) => receipts.push(r.block_number),
+        ExecToCommit::Receipt(item) => receipts.push(item.receipt.block_number),
         ExecToCommit::Boundary(b) => boundaries.push(b.block_number),
     }
 }
