@@ -4091,6 +4091,7 @@ dependencies = [
  "bytes",
  "clap",
  "criterion 0.7.0",
+ "crossbeam-queue",
  "dashmap",
  "futures",
  "governor",

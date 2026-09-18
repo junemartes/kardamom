@@ -15,19 +15,41 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
+use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 
 use kardamom_types::Receipt;
 
-/// Bounded. Eviction order is arbitrary, because `DashMap` does not
-/// expose insertion order. An evicted sender resubmits, and the sequencer dedupes
-/// the resubmit through the past-nonce path. A lookup on
-/// `eth_getTransactionReceipt` for an evicted entry returns `null`. A
-/// future v1 fallback can query the state DB instead.
+/// Bounded, oldest first. The `order` ring holds one identity per
+/// insert. When the ring is full, the insert that fills it displaces
+/// the oldest identity, and that receipt leaves both indexes. So the
+/// newest `capacity` receipts are always present. An evicted sender
+/// resubmits, and the sequencer dedupes the resubmit through the
+/// past-nonce path. A lookup on `eth_getTransactionReceipt` for an
+/// evicted entry returns `null`. A future v1 fallback can query the
+/// state DB instead.
 pub(crate) struct ReceiptCache {
     by_sender_nonce: DashMap<(Address, u64), Arc<Receipt>>,
     by_tx_hash: DashMap<B256, Arc<Receipt>>,
-    capacity: NonZeroUsize,
+    order: ArrayQueue<Identity>,
+}
+
+/// One insert's identity in the eviction ring.
+#[derive(Clone, Copy)]
+struct Identity {
+    sender: Address,
+    nonce: u64,
+    tx_hash: B256,
+}
+
+impl Identity {
+    fn of(receipt: &Receipt) -> Self {
+        Self {
+            sender: receipt.from,
+            nonce: receipt.nonce,
+            tx_hash: receipt.tx_hash,
+        }
+    }
 }
 
 impl ReceiptCache {
@@ -36,44 +58,38 @@ impl ReceiptCache {
         Self {
             by_sender_nonce: DashMap::new(),
             by_tx_hash: DashMap::new(),
-            capacity,
+            order: ArrayQueue::new(capacity.get()),
         }
     }
 
-    /// Inserts one receipt into both indexes. Eviction order is
-    /// arbitrary, because `DashMap` does not expose insertion order. A
-    /// duplicate (sender, nonce) entry overwrites the older row. This is
-    /// one allocation shared by both indexes.
+    /// Inserts one receipt into both indexes, then retires the oldest
+    /// identity if the ring is full. A duplicate (sender, nonce) entry
+    /// overwrites the older row and takes one more ring slot, so it
+    /// shortens only its own horizon. The indexes fill before the ring
+    /// does: a concurrent insert that displaces this slot then finds
+    /// the rows to remove, and no row outlives its slot.
     pub(crate) fn insert(&self, receipt: Receipt) {
-        self.evict_if_full(&self.by_sender_nonce);
-        self.evict_if_full(&self.by_tx_hash);
+        let identity = Identity::of(&receipt);
         let receipt = Arc::new(receipt);
         self.by_sender_nonce
-            .insert((receipt.from, receipt.nonce), receipt.clone());
-        self.by_tx_hash.insert(receipt.tx_hash, receipt);
+            .insert((identity.sender, identity.nonce), receipt.clone());
+        self.by_tx_hash.insert(identity.tx_hash, receipt);
+        if let Some(oldest) = self.order.force_push(identity) {
+            self.retire(oldest);
+        }
     }
 
-    /// Evicts one entry from `map` if it has reached capacity.
-    ///
-    /// Picks an arbitrary key to evict. `DashMap`'s `Iter` holds a read
-    /// guard on the shard it is positioned on, and `remove()` needs that
-    /// shard's write guard. `victim` is computed in its own `let`
-    /// statement, not inlined into the `if let` condition below: a
-    /// temporary created in an `if let`'s condition is not dropped until
-    /// the end of the `if let` body, so an inlined
-    /// `if let Some(key) = map.iter().next()... { map.remove(&key) }`
-    /// would still hold the shard's read guard live while `remove()`
-    /// asks that same shard for its write guard — deadlock, on one
-    /// thread, against itself. Ending the `let` statement first drops
-    /// the iterator (and its guard) before `map.remove` ever runs.
-    fn evict_if_full<K: Eq + std::hash::Hash + Copy>(&self, map: &DashMap<K, Arc<Receipt>>) {
-        if map.len() < self.capacity.get() {
-            return;
-        }
-        let victim = map.iter().next().map(|e| *e.key());
-        if let Some(key) = victim {
-            map.remove(&key);
-        }
+    /// Removes the rows of a displaced identity. Each row goes only if
+    /// it still belongs to that identity: a newer receipt of the same
+    /// (sender, nonce) keeps its row and its own slot.
+    fn retire(&self, oldest: Identity) {
+        self.by_sender_nonce
+            .remove_if(&(oldest.sender, oldest.nonce), |_, r| {
+                r.tx_hash == oldest.tx_hash
+            });
+        self.by_tx_hash.remove_if(&oldest.tx_hash, |_, r| {
+            r.from == oldest.sender && r.nonce == oldest.nonce
+        });
     }
 
     pub(crate) fn lookup(&self, sender: Address, nonce: u64) -> Option<Receipt> {
@@ -110,11 +126,9 @@ mod tests {
         assert!(c.lookup_by_tx_hash(B256::repeat_byte(0x22)).is_none());
     }
 
-    // Inserting past capacity must evict an entry, not deadlock: see
-    // `evict_if_full`'s doc comment for the guard-ordering rule this
-    // guards.
+    // Inserting past capacity keeps the cache bounded and usable.
     #[tokio::test(flavor = "current_thread")]
-    async fn insert_past_capacity_evicts_without_deadlock() {
+    async fn insert_past_capacity_stays_bounded() {
         let cap = 64usize;
         let c = ReceiptCache::new(NonZeroUsize::new(cap).unwrap());
         // Insert well past capacity, with a distinct (sender, nonce,
@@ -128,8 +142,9 @@ mod tests {
                 i32::try_from(i).unwrap(),
             ));
         }
-        // Bounded: the cache never exceeds capacity, since eviction keeps
-        // it in check.
+        // Bounded: the cache never exceeds capacity. The hashes repeat
+        // every 251 inserts while the nonces do not, so the rows are not
+        // one per insert; the bound still holds.
         assert!(
             c.len() <= cap,
             "cache must stay bounded: {} > {cap}",
@@ -141,5 +156,57 @@ mod tests {
             c.lookup(Address::repeat_byte(((last % 251) as u8) ^ 0x5a), last)
                 .is_some()
         );
+    }
+
+    // The horizon is a lower bound for every entry: the newest
+    // `capacity` receipts are always present, and older ones are gone.
+    #[tokio::test]
+    async fn the_newest_capacity_receipts_always_survive() {
+        let cap = 256usize;
+        let c = ReceiptCache::new(NonZeroUsize::new(cap).unwrap());
+        let ident = |i: u64| {
+            let mut a = [0u8; 20];
+            a[..8].copy_from_slice(&i.to_be_bytes());
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&i.to_be_bytes());
+            (Address::from(a), B256::from(h))
+        };
+        let total = cap as u64 * 3;
+        for i in 0..total {
+            let (s, h) = ident(i);
+            c.insert(receipt(s, i, h, 0));
+        }
+        for i in 0..total {
+            let (s, h) = ident(i);
+            let kept = i >= total - cap as u64;
+            assert_eq!(
+                c.lookup_by_tx_hash(h).is_some(),
+                kept,
+                "hash of receipt {i}"
+            );
+            assert_eq!(c.lookup(s, i).is_some(), kept, "identity of receipt {i}");
+        }
+    }
+
+    // A newer receipt of the same (sender, nonce) keeps its row when
+    // the older one's slot retires.
+    #[tokio::test]
+    async fn a_retired_slot_does_not_remove_a_newer_row_of_its_identity() {
+        let c = ReceiptCache::new(NonZeroUsize::new(2).unwrap());
+        let s = Address::repeat_byte(0x33);
+        let old = B256::repeat_byte(0x11);
+        let new = B256::repeat_byte(0x22);
+        c.insert(receipt(s, 1, old, 1));
+        c.insert(receipt(s, 1, new, 2));
+        // This insert retires the slot of `old`.
+        c.insert(receipt(
+            Address::repeat_byte(0x44),
+            9,
+            B256::repeat_byte(0x99),
+            3,
+        ));
+        assert!(c.lookup_by_tx_hash(old).is_none());
+        assert_eq!(c.lookup(s, 1).unwrap().tx_hash, new);
+        assert_eq!(c.lookup_by_tx_hash(new).unwrap().tx_idx.term_offset, 2);
     }
 }
