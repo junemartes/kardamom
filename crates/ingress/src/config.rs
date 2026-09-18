@@ -48,7 +48,7 @@ pub struct IngressConfig {
     /// L2 chain id (returned by `eth_chainId`). EIP-155 forbids chain id
     /// 0.
     pub chain_id: NonZeroU64,
-    /// Receipt-cache capacity. Eviction order is arbitrary; see
+    /// Receipt-cache capacity. Eviction is oldest first; see
     /// [`crate::receipt_cache::ReceiptCache`].
     pub receipt_cache_capacity: NonZeroUsize,
     /// Which durability gate the proxy waits on before acking a tx. See
@@ -124,9 +124,8 @@ impl Default for IngressConfig {
             chain_id: nonzero!(1u64),
             // 128k gives about a 27s query horizon at 4,800 tx/s (about
             // 77MB across both indexes at bench-receipt sizes). Eviction
-            // order is arbitrary (DashMap), so the horizon is a lower
-            // bound for only part of the entries. Fallbacks must poll
-            // well inside it.
+            // is oldest first, so the horizon is a lower bound for every
+            // entry. Fallbacks must poll inside it.
             receipt_cache_capacity: nonzero!(128 * 1024usize),
             ack_policy: AckPolicy::default(),
             rpc_max_connections: 8192,
