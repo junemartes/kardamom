@@ -159,6 +159,7 @@ fn load_cfg(a: &RunArgs, out: PathBuf) -> LoadConfig {
     LoadConfig {
         workload: a.workload,
         rpc: a.rpc.clone(),
+        receipt_rpcs: Vec::new(),
         chain_id: Some(a.chain_id.get()),
         duration: Duration::from_secs(0),
         target_tps: NonZeroU32::MIN,

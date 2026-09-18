@@ -147,9 +147,22 @@ impl Harness {
         crate::cases::resize::moved_accounts(self.lifecycle.cluster_dir()).await
     }
 
+    /// The RPC URLs of the other ingresses. Every replica consumes the
+    /// same receipt fan-in, so a drain asks them for a receipt the submit
+    /// ingress no longer holds, for example after its restart.
+    pub(crate) fn receipt_rpcs(&self) -> Vec<String> {
+        self.probes
+            .ingresses
+            .iter()
+            .map(|n| format!("http://{}:{INGRESS_RPC_PORT}", n.ip))
+            .filter(|url| *url != self.rpc_url)
+            .collect()
+    }
+
     fn load_spec(&self, case: Case, account: u32, window: Duration) -> LoadSpec {
         LoadSpec {
             rpc_url: self.rpc_url.clone(),
+            receipt_rpcs: self.receipt_rpcs(),
             chain_id: self.knobs.chain_id,
             account,
             duration: window,

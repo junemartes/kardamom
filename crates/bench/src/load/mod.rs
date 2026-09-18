@@ -77,6 +77,18 @@ struct BuiltQueues {
 }
 
 impl LoadConfig {
+    /// The clients a drain asks for a receipt: `primary` first, then one
+    /// per `receipt_rpcs` entry.
+    fn receipt_clients(&self, primary: &Arc<HttpClient>) -> anyhow::Result<Vec<Arc<HttpClient>>> {
+        let fallbacks = self
+            .receipt_rpcs
+            .iter()
+            .map(|url| rpc_client(url, self.max_in_flight.get()).map(Arc::new));
+        std::iter::once(Ok(Arc::clone(primary)))
+            .chain(fallbacks)
+            .collect()
+    }
+
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -155,8 +167,10 @@ struct Settled {
 struct LoadRun<'a> {
     cfg: &'a LoadConfig,
     tracker: &'a Arc<Tracker>,
-    client: &'a Arc<HttpClient>,
     scraper: &'a Scraper,
+    /// The clients a drain asks for a receipt: the submit client first,
+    /// then one per `receipt_rpcs` entry.
+    receipt_clients: Vec<Arc<HttpClient>>,
 }
 
 impl LoadRun<'_> {
@@ -206,7 +220,7 @@ impl LoadRun<'_> {
     ) -> Settled {
         let deadline = Instant::now() + self.cfg.drain_timeout;
         join_submit_tasks(tasks, deadline).await;
-        engine::Drainer::new(Arc::clone(self.client), Arc::clone(self.tracker))
+        engine::Drainer::new(self.receipt_clients.clone(), Arc::clone(self.tracker))
             .drain(deadline)
             .await;
         if let Some(feed) = feed {
@@ -463,8 +477,8 @@ impl Prepared {
         let run = LoadRun {
             cfg: &cfg,
             tracker: &tracker,
-            client: &client,
             scraper: &scraper,
+            receipt_clients: cfg.receipt_clients(&client)?,
         };
 
         let ReceiptFeed {
@@ -475,11 +489,10 @@ impl Prepared {
         // re-fetched within 2 to 7 seconds, instead of waiting for the
         // end-of-run drain. Keep this cadence well inside the ingress receipt
         // cache's query horizon (capacity divided by rate, about 27 seconds at
-        // 4,800 tx/s with the default 128k capacity). Eviction order is
-        // arbitrary, so a late poll can miss even a younger entry.
+        // 4,800 tx/s with the default 128k capacity, oldest out first).
         let sweeper = feed.as_ref().map(|_| {
             Arc::new(engine::Drainer::new(
-                Arc::clone(&client),
+                run.receipt_clients.clone(),
                 Arc::clone(&tracker),
             ))
             .spawn_pending_sweeper(Duration::from_secs(5), Duration::from_secs(2))
