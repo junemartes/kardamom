@@ -238,7 +238,7 @@ fn a_bounded_compare_tolerates_one_empty_tail_block_only() {
     assert!(
         diffs
             .iter()
-            .any(|d| d.contains("tail block 3 past head 2 is not empty")),
+            .any(|d| d.starts_with("receipts: extra key in b")),
         "{diffs:?}"
     );
 }

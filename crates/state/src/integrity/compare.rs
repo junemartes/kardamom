@@ -11,7 +11,7 @@ use crate::meta::{
 };
 use crate::schema::{
     TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE,
-    TABLE_TX_HASH_INDEX, decode_header_value, decode_receipt_value, encode_block_key,
+    TABLE_TX_HASH_INDEX, decode_receipt_value, encode_block_key,
 };
 
 /// One cursor row, or `None` at end of table.
@@ -55,11 +55,12 @@ pub fn deep_compare(a: &StateEnv, b: &StateEnv) -> Result<Vec<String>, StateErro
 /// [`deep_compare`] up to block `head`: the two DBs must hold identical
 /// chain state through `head`, and any block past it must be empty.
 ///
-/// A consumer stopped behind its peers by one empty block holds the
+/// A consumer stopped ahead of its peers by one empty block holds the
 /// same accounts, storage, code, receipts and index; only its `headers`
 /// row for that block and the two last-committed meta keys differ. Those
-/// are skipped here, and a tail block that carries transactions is a
-/// difference in its own right.
+/// are skipped here. A tail block that carries transactions changes the
+/// receipts, the index and the accounts it touches, and those tables
+/// are compared in full, so it still reads as a difference.
 ///
 /// # Errors
 ///
@@ -81,34 +82,6 @@ fn compare_bounded(
         diffs.extend(TableCompare::new(&ta, &tb, table, bound).run()?);
     }
     diffs.extend(TableCompare::meta_keys(&ta, &tb, bound)?);
-    if let Some(head) = bound {
-        diffs.extend(empty_tail(&ta, head, "a")?);
-        diffs.extend(empty_tail(&tb, head, "b")?);
-    }
-    Ok(diffs)
-}
-
-/// The differences a non-empty block past `head` makes on one side: a
-/// header whose end position moved past the head's carries
-/// transactions.
-fn empty_tail(t: &RwTxSync, head: u64, side: &str) -> Result<Vec<String>, StateError> {
-    let meta = t.open_db(Some(TABLE_META))?;
-    let last = crate::meta::read_meta_u64(t, meta, KEY_LAST_COMMITTED_BLOCK)?.unwrap_or(0);
-    let headers = t.open_db(Some(TABLE_HEADERS))?;
-    let end_at = |block: u64| -> Result<Option<kardamom_types::BPosition>, StateError> {
-        t.get::<Vec<u8>>(headers.dbi(), &encode_block_key(block))?
-            .map(|v| decode_header_value(&v).map(|h| h.end_tx_idx))
-            .transpose()
-    };
-    let at_head = end_at(head)?;
-    let mut diffs = Vec::new();
-    for block in head.saturating_add(1)..=last {
-        if end_at(block)? != at_head {
-            diffs.push(format!(
-                "{side}: tail block {block} past head {head} is not empty"
-            ));
-        }
-    }
     Ok(diffs)
 }
 
