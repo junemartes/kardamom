@@ -14,6 +14,7 @@
 //! - [`reconcile`]: membership snapshots to attach and detach calls.
 //! - [`endpoint`]: the advertised address, ports, and URIs.
 
+mod absence;
 pub mod catalog;
 pub mod consul;
 pub mod endpoint;
