@@ -1,23 +1,33 @@
 //! The client-facing submit path. `submit_raw` blocks and parks until a
 //! receipt arrives. `submit_raw_async` acks on publish. Both share the
-//! validate, cache-answer, and publish stages.
+//! validate, cache-answer, admission-check, and publish stages.
+//!
+//! The admission checks read the local account layer, then Redis on a
+//! miss when `[cache]` is on. A miss in both admits: the executor query
+//! is never on this path, so a flood of cold senders costs the
+//! executors nothing. A past nonce answers from a receipt: the local
+//! receipt cache, then the Redis receipt index. The same tx gets its
+//! receipt, across an ingress restart when Redis holds it; another tx
+//! at the nonce is `Duplicate`. With no receipt in either index, it
+//! publishes and the sequencer decides. An unfunded sender rejects as
+//! `InsufficientFunds`, only when the balance is fresh.
 
 use std::net::IpAddr;
 
 use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
-use alloy_primitives::{B256, Bytes as AlloyBytes};
+use alloy_primitives::{B256, Bytes as AlloyBytes, U256};
 use alloy_rlp::Decodable;
 
+use kardamom_cache::metrics as cache_metrics;
 use kardamom_types::{Receipt, TxEnvelope};
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::error::IngressError;
 use crate::metrics::count_reject;
 use crate::pending::ReceiptResponse;
-use crate::routing::partition_for;
 
-use super::{IngressProxy, ValidatedSubmission};
+use super::{AccountState, IngressProxy, ValidatedSubmission};
 
 impl<P, S> IngressProxy<P, S>
 where
@@ -27,14 +37,23 @@ where
     /// Hot path for both JSON-RPC and binary submissions. Returns the
     /// receipt once both `(sender, nonce, receipt)` and the quorum watermark
     /// are satisfied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `IngressError` if the submission is rejected (rate
+    /// limit, decode, signature, protocol limits, overload) or times out
+    /// waiting for a receipt.
     pub async fn submit_raw(
         &self,
         client_ip: IpAddr,
         raw_tx: AlloyBytes,
     ) -> Result<ReceiptResponse, IngressError> {
         let v = self.validate_submission(client_ip, &raw_tx).await?;
-        if let Some(answer) = self.answer_from_cache(&v) {
+        if let Some(answer) = v.answer_from_cache() {
             return answer.map(|receipt| ReceiptResponse { receipt });
+        }
+        if let Some(receipt) = self.admit(&v).await? {
+            return Ok(ReceiptResponse { receipt });
         }
 
         // Park before publishing. Under load, the receipt can arrive on
@@ -64,12 +83,10 @@ where
         // Identity check on the fulfilled receipt. The pending map is
         // keyed by (sender, nonce). So, with racing replicas, or any
         // upstream receipt mix-up, the receipt that releases this waiter
-        // can belong to a different tx. Echoing its hash as the submit
-        // response is how issue #156 surfaced: an in-cluster
-        // nonce-unordered case where the returned hash did not match the
-        // locally computed hash. Instead, this code fails loudly and
-        // names both hashes, so the error attributes the mix-up to the
-        // component that produced it.
+        // can belong to a different tx. The response must never carry
+        // another tx's hash. This code fails loudly and names both
+        // hashes, so the error attributes the mix-up to the component
+        // that produced it.
         if let Ok(resp) = &result
             && resp.receipt.tx_hash != v.tx_hash
         {
@@ -94,47 +111,37 @@ where
     /// Fire-and-observe submission for subscription-mode clients
     /// (`kardamom_sendRawTransactionAsync`). This method validates and
     /// publishes exactly like [`Self::submit_raw`], but it acks with the tx
-    /// hash as soon as the envelope is on tx_data, instead of parking the
+    /// hash as soon as the envelope is on `tx_data`, instead of parking the
     /// caller until the receipt arrives. Receipt delivery happens
     /// separately, through `kardamom_subscribeReceipts` or by polling
     /// `eth_getTransactionReceipt`. On this path, "accepted" in the
     /// metrics means published, not receipted. The
     /// `received == accepted + rejected` invariant still holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `IngressError` if the submission is rejected. See
+    /// [`Self::submit_raw`].
     pub async fn submit_raw_async(
         &self,
         client_ip: IpAddr,
         raw_tx: AlloyBytes,
     ) -> Result<B256, IngressError> {
         let v = self.validate_submission(client_ip, &raw_tx).await?;
-        if let Some(answer) = self.answer_from_cache(&v) {
+        if let Some(answer) = v.answer_from_cache() {
             return answer.map(|receipt| receipt.tx_hash);
+        }
+        if let Some(receipt) = self.admit(&v).await? {
+            return Ok(receipt.tx_hash);
         }
         self.publish_validated(&v, raw_tx).await?;
         metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
         Ok(v.tx_hash)
     }
 
-    /// The one place for the cached-receipt identity rule (issue #156),
-    /// shared by both submit paths. `None` means no cache hit, so the
-    /// caller should continue to publish. On a hit, a resubmission counts
-    /// as a resubmission only if it is the same tx. The cache is keyed by
-    /// (sender, nonce), so a different tx that reuses a receipted nonce
-    /// would otherwise get answered with the previous tx's receipt, and
-    /// hash, as if it had landed. The submit response must never carry
-    /// another tx's identity.
-    fn answer_from_cache(&self, v: &ValidatedSubmission) -> Option<Result<Receipt, IngressError>> {
-        let prev = v.cached.as_ref()?;
-        if prev.tx_hash != v.tx_hash {
-            count_reject("nonce-conflict");
-            return Some(Err(IngressError::Duplicate((v.sender, v.nonce))));
-        }
-        // Count it, so received == accepted + rejected holds on every path.
-        metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
-        Some(Ok(prev.clone()))
-    }
-
     /// Shared head of both submit paths: rate-limit, decode, batch
-    /// sig-verify, and receipt-cache lookup. Does not publish.
+    /// sig-verify, and receipt-cache lookup. Does not publish and rejects
+    /// nothing on account state; see [`Self::admit`].
     async fn validate_submission(
         &self,
         client_ip: IpAddr,
@@ -145,14 +152,18 @@ where
         // Overload valve. When the pending registry reaches this depth,
         // the pipeline is not draining. This code sheds new submissions
         // with an explicit retryable error, instead of parking them into
-        // a backlog. Before issue #86 fixed this, parked submits pinned
-        // every connection slot and the ingress refused every client.
-        // This applies to both submit paths. A depth of 0 sheds
-        // everything, and tests use this.
+        // a backlog: a parked submit pins its connection, so parking
+        // more would only make the backlog worse. This applies to both
+        // submit paths. A depth of 0 sheds everything, and tests use
+        // this.
         let depth = self.pending.len();
         if depth >= self.cfg.pending_shed_depth {
             count_reject("overloaded");
             return Err(IngressError::Overloaded(depth));
+        }
+        if self.is_draining() {
+            count_reject("draining");
+            return Err(IngressError::Draining);
         }
 
         if let Err(e) = self.rate_limiter.check(client_ip) {
@@ -166,21 +177,14 @@ where
             IngressError::Decode(e.to_string())
         })?;
 
-        // Protocol-limit checks (W1b,
-        // docs/agents/l1-client-suite-port-spec.md) run before sig-verify.
-        // This way, a tx that can never execute gets a clear error, and
-        // does not cost a signature recovery or turn into a
-        // `status=false` skip receipt downstream.
-        if let ConsensusEnvelope::Eip4844(_) = env {
-            count_reject("unsupported-type");
-            return Err(IngressError::UnsupportedTxType(0x03));
-        }
-        if env.gas_limit() > kardamom_types::limits::TX_GAS_LIMIT_CAP {
-            count_reject("gas-cap");
-            return Err(IngressError::GasLimitExceedsCap(env.gas_limit()));
-        }
+        // Protocol-limit checks run before sig-verify, to save a
+        // recovery: a tx that can never execute gets a clear error
+        // instead of turning into a `status=false` skip receipt
+        // downstream.
+        env.check_protocol_limits()?;
 
         let nonce = env.nonce();
+        let cost = env.worst_case_cost();
 
         // Identity guarantee: the proxy is the only place that computes
         // `sender` and `tx_hash`. This code stamps both fields into the
@@ -205,10 +209,89 @@ where
             nonce,
             tx_hash,
             cached,
+            cost,
         })
     }
 
-    /// Publishes a validated envelope onto tx_data[shard]. The shard comes
+    /// The admission checks, after the local receipt cache missed. `Some`
+    /// carries the receipt the Redis index holds for a landed tx of the
+    /// same identity: the caller answers with it, as a cache hit. `Ok(None)`
+    /// admits: no known state, or the checks pass.
+    ///
+    /// A nonce below the known one is a past nonce: `Duplicate`, the same
+    /// error the sequencer's rejection becomes, so a client sees one shape
+    /// for one condition. A fresh balance below the worst-case cost is
+    /// `InsufficientFunds`. A stale balance, a cost overflow, or no entry
+    /// admits: the executor's own checks are the bound.
+    async fn admit(&self, v: &ValidatedSubmission) -> Result<Option<Receipt>, IngressError> {
+        if !self.cfg.admission_checks {
+            return Ok(None);
+        }
+        let Some(state) = self.account_state(v.sender).await else {
+            return Ok(None);
+        };
+        if v.nonce < state.view.nonce
+            && let Some(receipt) = self.answer_past_nonce(v).await?
+        {
+            return Ok(Some(receipt));
+        }
+        v.check_balance(&state)?;
+        Ok(None)
+    }
+
+    /// The sender's latest known state: the local layer, then Redis on a
+    /// miss. Each read is counted.
+    async fn account_state(&self, sender: alloy_primitives::Address) -> Option<AccountState> {
+        if let Some(view) = self.live.get(sender) {
+            cache_metrics::record_lookup("live", "hit");
+            return Some(AccountState { view, fresh: true });
+        }
+        cache_metrics::record_lookup("live", "miss");
+        let redis = self.redis.as_ref()?;
+        let view = redis.account(sender).await?;
+        Some(AccountState {
+            view,
+            fresh: redis.fresh(),
+        })
+    }
+
+    /// A past nonce: a receipt index may hold the landed tx. The local
+    /// receipt cache is read again, since its receipt may have arrived
+    /// after the submit's first read, then the Redis receipt index. The
+    /// same identity answers with its receipt, which also fills the local
+    /// cache. A different identity is `Duplicate`.
+    ///
+    /// No receipt in either index is `None`: the submit publishes and the
+    /// sequencer decides. The account layer can lead both indexes. The
+    /// pump applies a batch's rows at once, the receipt bus drops
+    /// receipts for a lagging watcher, and the mirror is one more hop
+    /// from the same source. A reject there would answer a retry of a
+    /// landed tx with `Duplicate` for good.
+    async fn answer_past_nonce(
+        &self,
+        v: &ValidatedSubmission,
+    ) -> Result<Option<Receipt>, IngressError> {
+        let indexed = match (self.cache.lookup(v.sender, v.nonce), &self.redis) {
+            (Some(local), _) => Some(local),
+            (None, Some(redis)) => redis.receipt(v.sender, v.nonce).await,
+            (None, None) => None,
+        };
+        let Some(receipt) = indexed else {
+            // A receipt-index miss, not a degraded read: the chaos cases
+            // read the degraded count as "Redis is dark".
+            cache_metrics::record_lookup("receipt", "miss");
+            return Ok(None);
+        };
+        self.cache.insert(receipt.clone());
+        if receipt.tx_hash != v.tx_hash {
+            count_reject("nonce-conflict");
+            return Err(IngressError::Duplicate((v.sender, v.nonce)));
+        }
+        metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
+        Ok(Some(receipt))
+    }
+
+    /// Publishes a validated envelope onto `tx_data[shard]`. The shard comes
     /// from the sender-address hash, `partition_for(sender, K)`, so every
     /// tx from a given sender lands on the same shard's A stream. This
     /// lets the P sequencers per shard nonce-order them consistently. The
@@ -219,7 +302,7 @@ where
         v: &ValidatedSubmission,
         raw_tx: AlloyBytes,
     ) -> Result<(), IngressError> {
-        let shard = partition_for(v.sender, self.cfg.partition_count_m) as usize;
+        let shard = kardamom_types::num::u32_to_usize(self.cfg.lane_for(v.sender));
         let correlation_id = self.next_correlation_id();
         self.publication
             .publish_tx_data(
@@ -235,5 +318,81 @@ where
             .inspect_err(|_| {
                 count_reject("partition-unavailable");
             })
+    }
+}
+
+/// Rejects a tx this proxy can never execute: an EIP-4844 blob tx, or one
+/// over the per-tx gas cap. `ConsensusEnvelope` (`alloy_consensus::TxEnvelope`)
+/// is foreign, so this attaches the check as a local extension trait
+/// instead of a free function taking the envelope as a loose parameter.
+/// The worst-case cost lives here for the same reason.
+trait CheckProtocolLimits {
+    fn check_protocol_limits(&self) -> Result<(), IngressError>;
+    /// `gas_limit * max_fee_per_gas + value`, the most the tx can take
+    /// from the sender. `max_fee_per_gas` is `gas_price` on a legacy
+    /// envelope. `None` on overflow.
+    fn worst_case_cost(&self) -> Option<U256>;
+}
+
+impl CheckProtocolLimits for ConsensusEnvelope {
+    fn worst_case_cost(&self) -> Option<U256> {
+        U256::from(self.gas_limit())
+            .checked_mul(U256::from(self.max_fee_per_gas()))
+            .and_then(|gas| gas.checked_add(self.value()))
+    }
+
+    fn check_protocol_limits(&self) -> Result<(), IngressError> {
+        if let Self::Eip4844(_) = self {
+            count_reject("unsupported-type");
+            return Err(IngressError::UnsupportedTxType(0x03));
+        }
+        if self.gas_limit() > kardamom_types::limits::TX_GAS_LIMIT_CAP {
+            count_reject("gas-cap");
+            return Err(IngressError::GasLimitExceedsCap(self.gas_limit()));
+        }
+        Ok(())
+    }
+}
+
+impl ValidatedSubmission {
+    /// The one place for the cached-receipt identity rule, shared by
+    /// both submit paths. `None` means no cache hit, so the
+    /// caller should continue to publish. On a hit, a resubmission counts
+    /// as a resubmission only if it is the same tx. The cache is keyed by
+    /// (sender, nonce), so a different tx that reuses a receipted nonce
+    /// would otherwise get answered with the previous tx's receipt, and
+    /// hash, as if it had landed. The submit response must never carry
+    /// another tx's identity.
+    fn answer_from_cache(&self) -> Option<Result<Receipt, IngressError>> {
+        let prev = self.cached.as_ref()?;
+        if prev.tx_hash != self.tx_hash {
+            count_reject("nonce-conflict");
+            return Some(Err(IngressError::Duplicate((self.sender, self.nonce))));
+        }
+        // Count it, so received == accepted + rejected holds on every path.
+        metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
+        Some(Ok(prev.clone()))
+    }
+
+    /// The balance check against a known state. A stale balance admits
+    /// and counts a degraded check: a stale-low balance would reject a
+    /// funded sender.
+    fn check_balance(&self, state: &AccountState) -> Result<(), IngressError> {
+        let Some(want) = self.cost else {
+            return Ok(());
+        };
+        if !state.fresh {
+            cache_metrics::record_degraded("stale");
+            return Ok(());
+        }
+        if state.view.balance < want {
+            count_reject("insufficient-funds");
+            return Err(IngressError::InsufficientFunds {
+                address: self.sender,
+                have: state.view.balance,
+                want,
+            });
+        }
+        Ok(())
     }
 }

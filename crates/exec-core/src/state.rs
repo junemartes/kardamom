@@ -15,10 +15,10 @@
 //! writes.
 //!
 //! For tests that do not drive multiple blocks, `StaticSnapshotSource`
-//! keeps the old behavior of returning an immutable snapshot.
+//! returns an immutable snapshot.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
@@ -53,32 +53,58 @@ pub struct MockStateDatabase {
 
 #[derive(Debug, Default)]
 struct MockInner {
-    /// Address to (nonce, balance, code_hash). Matches the wire shape of
+    /// Address to (nonce, balance, `code_hash`). Matches the wire shape of
     /// `StateDatabase::basic`.
     accounts: BTreeMap<Address, (u64, U256, B256)>,
     /// Storage keyed by (address, slot).
     storage: BTreeMap<(Address, B256), U256>,
-    /// Code keyed by code_hash.
+    /// Code keyed by `code_hash`.
     code: BTreeMap<B256, Bytes>,
     /// Receipts by canonical position. Tests that exercise the
     /// `get_receipt` path populate this. It is empty by default.
     receipts: BTreeMap<BPosition, Receipt>,
-    /// Maps tx_hash to a `BPosition` index. Tests populate this. It is
+    /// Maps `tx_hash` to a `BPosition` index. Tests populate this. It is
     /// empty by default.
     tx_index: BTreeMap<B256, BPosition>,
 }
 
 impl MockStateDatabase {
+    #[must_use]
     pub fn builder() -> MockStateDatabaseBuilder {
         MockStateDatabaseBuilder::default()
+    }
+
+    /// Take the read lock on the inner state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lock is poisoned (a prior writer thread panicked
+    /// while holding it).
+    fn read(&self) -> RwLockReadGuard<'_, MockInner> {
+        self.inner.read().expect("MockStateDatabase poisoned")
+    }
+
+    /// Take the write lock on the inner state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lock is poisoned (a prior writer thread panicked
+    /// while holding it).
+    fn write(&self) -> RwLockWriteGuard<'_, MockInner> {
+        self.inner.write().expect("MockStateDatabase poisoned")
     }
 
     /// Apply a finalized `BlockDelta` to the inner state. The
     /// `WriterApplyingQueue` uses this. Receipts are also indexed by
     /// `tx_hash`, so the `get_tx_position` and `get_receipt` paths work
     /// after the writer commits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned (a prior writer thread
+    /// panicked while holding it).
     pub fn apply_block_delta(&self, delta: &BlockDelta) {
-        let mut g = self.inner.write().expect("MockStateDatabase poisoned");
+        let mut g = self.write();
         for AccountChange {
             address,
             nonce,
@@ -116,21 +142,25 @@ pub struct MockStateDatabaseBuilder {
 }
 
 impl MockStateDatabaseBuilder {
+    #[must_use]
     pub fn account(mut self, addr: Address, balance: U256, nonce: u64, code_hash: B256) -> Self {
         self.accounts.insert(addr, (nonce, balance, code_hash));
         self
     }
 
+    #[must_use]
     pub fn storage(mut self, addr: Address, key: B256, value: U256) -> Self {
         self.storage.insert((addr, key), value);
         self
     }
 
+    #[must_use]
     pub fn code(mut self, code_hash: B256, bytes: Bytes) -> Self {
         self.code.insert(code_hash, bytes);
         self
     }
 
+    #[must_use]
     pub fn receipt(mut self, pos: BPosition, r: Receipt) -> Self {
         let tx_hash = r.tx_hash;
         self.tx_index.insert(tx_hash, pos);
@@ -138,6 +168,7 @@ impl MockStateDatabaseBuilder {
         self
     }
 
+    #[must_use]
     pub fn build(self) -> MockStateDatabase {
         MockStateDatabase {
             inner: Arc::new(RwLock::new(MockInner {
@@ -163,17 +194,17 @@ impl StateDatabase for MockStateDatabase {
     }
 
     fn basic(&self, address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error> {
-        let g = self.inner.read().expect("MockStateDatabase poisoned");
+        let g = self.read();
         Ok(g.accounts.get(&address).copied())
     }
 
     fn code_by_hash(&self, code_hash: B256) -> Result<Bytes, Self::Error> {
-        let g = self.inner.read().expect("MockStateDatabase poisoned");
+        let g = self.read();
         Ok(g.code.get(&code_hash).cloned().unwrap_or_default())
     }
 
     fn storage(&self, address: Address, key: B256) -> Result<U256, Self::Error> {
-        let g = self.inner.read().expect("MockStateDatabase poisoned");
+        let g = self.read();
         Ok(g.storage
             .get(&(address, key))
             .copied()
@@ -181,12 +212,12 @@ impl StateDatabase for MockStateDatabase {
     }
 
     fn get_receipt(&self, pos: BPosition) -> Result<Option<Receipt>, Self::Error> {
-        let g = self.inner.read().expect("MockStateDatabase poisoned");
+        let g = self.read();
         Ok(g.receipts.get(&pos).cloned())
     }
 
     fn get_tx_position(&self, tx_hash: B256) -> Result<Option<BPosition>, Self::Error> {
-        let g = self.inner.read().expect("MockStateDatabase poisoned");
+        let g = self.read();
         Ok(g.tx_index.get(&tx_hash).copied())
     }
 }

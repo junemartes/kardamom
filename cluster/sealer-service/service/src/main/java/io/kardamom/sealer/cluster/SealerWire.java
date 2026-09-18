@@ -88,7 +88,7 @@ public final class SealerWire {
     /**
      * Remote-origin record — a batch of cross-chain messages a PEER chain
      * produced:
-     * {@code [kind:5][canonical_id:32][origin_chain_id:u64 LE][anchor_number:u64 LE][slot_count:u32 LE][payload…]}.
+     * {@code [kind:5][canonical_id:32][origin_chain_id:u64 LE][anchor_number:u64 LE][slot_count:u32 LE][first_seq:u64 LE][last_seq:u64 LE][payload…]}.
      *
      * <p>A distinct kind byte, not a record type inside a
      * {@link #KIND_ORIGIN_RECORD} payload: the service branches to its own
@@ -99,10 +99,15 @@ public final class SealerWire {
      * needs one, because there is exactly one L1 but any number of peers.</p>
      *
      * <p>Like {@link #KIND_ORIGIN_RECORD} it carries no guard header —
-     * cross-chain messages are not nonce-gated by an L2 sender — and its
+     * cross-chain messages are not nonce-gated by an L2 sender. Its
      * {@code slot_count} is {@code 1 + message count} (marker plus one slot per
-     * message), taken on trust and re-derived by consumers that do parse the
-     * payload. See {@code docs/specs/interop-outbox-messaging-spec.md} §7.</p>
+     * message). {@code first_seq} and {@code last_seq} are the batch's seq
+     * range. The service checks {@code slot_count == 2 + last_seq - first_seq}
+     * and keeps a lane cursor per origin: a record whose {@code first_seq} is
+     * not the cursor is rejected with {@link #EGRESS_KIND_REMOTE_ORIGIN_REJECT}.
+     * The Rust canonical id commits to every header field, so a header that
+     * lies about its body fails the consumer's cross-check. See
+     * {@code docs/specs/interop-outbox-messaging-spec.md} §7.</p>
      */
     public static final byte KIND_REMOTE_ORIGIN_RECORD = 5;
 
@@ -125,12 +130,16 @@ public final class SealerWire {
     static final int REMOTE_ANCHOR_OFFSET = REMOTE_CHAIN_ID_OFFSET + Long.BYTES;
     /** Offset of the u32 LE slot count within a {@link #KIND_REMOTE_ORIGIN_RECORD} frame. */
     static final int REMOTE_SLOT_COUNT_OFFSET = REMOTE_ANCHOR_OFFSET + Long.BYTES;
+    /** Offset of the u64 LE first seq within a {@link #KIND_REMOTE_ORIGIN_RECORD} frame. */
+    static final int REMOTE_FIRST_SEQ_OFFSET = REMOTE_SLOT_COUNT_OFFSET + Integer.BYTES;
+    /** Offset of the u64 LE last seq within a {@link #KIND_REMOTE_ORIGIN_RECORD} frame. */
+    static final int REMOTE_LAST_SEQ_OFFSET = REMOTE_FIRST_SEQ_OFFSET + Long.BYTES;
     /**
      * Minimum valid remote-origin length: kind + canonical id + chain id +
-     * anchor + slots. Eight bytes longer than {@link #MIN_ORIGIN_RECORD_LEN} —
-     * the second u64 is the whole header difference.
+     * anchor + slots + first seq + last seq. A frame from a producer that
+     * predates the seq range is 16 bytes short, and is dropped as malformed.
      */
-    static final int MIN_REMOTE_ORIGIN_RECORD_LEN = REMOTE_SLOT_COUNT_OFFSET + Integer.BYTES;
+    static final int MIN_REMOTE_ORIGIN_RECORD_LEN = REMOTE_LAST_SEQ_OFFSET + Long.BYTES;
 
     /** Minimum valid replay-request length: kind + from_index + from_block. */
     static final int MIN_REPLAY_REQUEST_LEN = Byte.BYTES + Long.BYTES + Long.BYTES;
@@ -151,6 +160,16 @@ public final class SealerWire {
      * records.
      */
     public static final byte EGRESS_KIND_CONTIGUITY_REJECT = 5;
+    /**
+     * Remote-origin reject:
+     * {@code [kind:6][origin_chain_id:u64 LE][first_seq:u64 LE][expected_next_seq:u64 LE][reason:u8]}.
+     * The service offers this only to the offering session, like the
+     * contiguity reject. {@code reason} is one of the
+     * {@code CanonicalSealerState.REMOTE_REJECT_*} codes. The sequencer logs
+     * and counts it. The watcher reconciles its cursor with the
+     * destination's {@code Inbox.nextSeq} at startup.
+     */
+    public static final byte EGRESS_KIND_REMOTE_ORIGIN_REJECT = 6;
 
     /** Bounded in-memory retention of framed egress bytes for client replay. */
     static final int DEFAULT_RETENTION = 65536;

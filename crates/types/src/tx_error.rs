@@ -1,4 +1,4 @@
-//! TxError: a rejection signal the sequencer emits when it cannot
+//! `TxError`: a rejection signal the sequencer emits when it cannot
 //! canonicalize an inbound transaction.
 //!
 //! This flows on the dedicated `tx_errors` Aeron channel (RAM-only, not
@@ -38,10 +38,14 @@ pub enum TxErrorReason {
     /// The sequencer's overload protection shed this transaction. Either it
     /// was the furthest-future buffered nonce, evicted to make room, or it
     /// arrived too far past the sender's next expected nonce while the
-    /// reorder buffer was full. The sequencer will never sequence it. The
-    /// client must resubmit once its nonce is back within the window. This
-    /// drop used to be silent: the parked submit waited for a receipt that
-    /// could never arrive. That was the cause of the permanent-nonce-gap
-    /// wedge.
+    /// reorder buffer was full. The sequencer never sequences this
+    /// transaction; the client must resubmit once its nonce is back within
+    /// the window.
     Evicted { expected_nonce: u64 },
+    /// The transaction waited on a nonce gap for longer than the
+    /// sequencer's `tx_ttl`. The sequencer dropped it from its pending
+    /// buffer. This is the explicit end of a transaction's lifetime. The
+    /// client must resubmit it after the gap fills. See
+    /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.3.
+    Expired { expected_nonce: u64 },
 }

@@ -1,15 +1,16 @@
 # kardamom-executor replays the canonical order and applies state. It
 # embeds the libmdbx StateWriter. It runs on its own node, exec1
-# (192.168.56.31). It used to be co-located with sequencer #0 and
+# (executor-0). It used to be co-located with sequencer #0 and
 # ingress.
 #
 # Invocation (from crates/e2e/tests/multiprocess_e2e.rs):
-#   kardamom-executor --config <executor.toml> --aeron-dir <dir> --shards 2 \
+#   kardamom-executor --config <executor.toml> --aeron-dir <dir> \
 #       --chain-id 412346 --chain <genesis.toml>
 #
 # executor.toml is presence-checked only. The genesis renders from
 # config/genesis/dev.toml, and passes through --chain. chain-id 412346
-# comes from group_vars/all.yml. shards 2 equals partition_count.
+# comes from group_vars/all.yml. The executor opens all 8 tx_data lanes.
+# It takes no shard count. See docs/specs/dynamic-sequencer-sizing.md.
 #
 # This mounts both the shared Aeron tmpfs aeron.dir and the persistent
 # state_dir (/opt/kardamom/state), for the libmdbx StateWriter, so
@@ -23,9 +24,9 @@
 # (--archive-durability on those jobs).
 #
 # This job uses file() for its templates, so submit it from the
-# deploy/cluster/ directory. scripts/deploy.sh does this.
+# deploy/cluster/ directory. ansible/deploy.yml does this.
 
-# Digest-pinned image. scripts/deploy.sh
+# Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests). The empty default falls back to the
 # mutable :dev tag in the task config. That fallback is a dev
@@ -37,8 +38,20 @@ variable "image_ref" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
+variable "executor_count" {
+  type        = number
+  description = "The executor node count (node_classes.executor.count). The checkpoint peers are executor-<i>.node.<datacenter>.consul."
+  default     = 3
+}
+
 job "executor" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {
@@ -87,6 +100,15 @@ job "executor" {
 
     network {
       mode = "host"
+      # The cluster egress (response) port, unique per allocation. A
+      # fixed port sat in the node's ephemeral range, where the shared
+      # media driver's port-0 discovery sockets could take it first.
+      port "egress" {}
+      # The join-miss refetch ports: replayed fragments and archive
+      # control responses. Nomad picks them per allocation, below the
+      # ephemeral range, so no other process on the node holds them.
+      port "replay" {}
+      port "archive_response" {}
     }
 
     task "executor" {
@@ -110,7 +132,7 @@ job "executor" {
       }
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-executor:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-executor:dev"
         # force_pull stays on for both paths; see the ingress job's
         # comment. The :dev fallback needs it. On the pinned path, the
         # 1.9.5 driver pulls the tag but resolves the image by digest,
@@ -142,28 +164,25 @@ job "executor" {
           # so ${NOMAD_ALLOC_INDEX} stays stable at 0 through N, and
           # matches the co-located recorder's id.
           "--recorder-id", "${NOMAD_ALLOC_INDEX}",
-          # Cluster mode only: this node's cluster-egress (response)
-          # endpoint. The cluster client's egress_channel is per node,
-          # since the node IP differs, so it is injected here instead
-          # of baked into config/executor.toml. The port, 40210
-          # (cluster_egress_port), stays uniform; uniqueness comes
-          # from node_ip.
-          "--cluster-egress-endpoint", "${meta.node_ip}:40210",
-          "--shards", "2",
+          # Cluster mode only: this allocation's cluster-egress
+          # (response) endpoint. The cluster client's egress_channel is
+          # per allocation (the node IP and the dynamic port are known
+          # only at placement), so it is injected here instead of baked
+          # into config/executor.toml.
+          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",
           # Join-miss archive refetch (tx_data and tx_deposits). When
           # the live multicast misses a canonical ref's envelope
           # (down-window, image lapse, blackout), it replays in-band
           # from the durability archives listed in channels.toml
-          # (ingress .31/.32; aux .61). Replayed fragments land on
-          # 40130, and archive-control responses land on 40140, both
-          # on this node's cluster NIC (${meta.node_ip}). One executor
-          # runs per node (distinct_hosts), so there is no
-          # cross-replica collision. tx_ordering recovery goes through
-          # the Aeron Cluster client's REPLAY_FROM.
-          "--replay-destination-endpoint", "${meta.node_ip}:40130",
-          "--archive-control-response-endpoint", "${meta.node_ip}:40140",
+          # (ingress .31/.32; aux .61). Replayed fragments and
+          # archive-control responses land on this node's cluster NIC
+          # (${meta.node_ip}), on the allocation's dynamic ports.
+          # tx_ordering recovery goes through the Aeron Cluster
+          # client's REPLAY_FROM.
+          "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
+          "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
           # Fast cold-start recovery: restore the newest checkpoint
           # into a wiped or empty state_dir before startup, replaying
           # only the tail, not from genesis. Write a checkpoint every
@@ -180,7 +199,10 @@ job "executor" {
           # peer list is harmless; its own checkpoint never satisfies
           # the floor.
           "--checkpoint-serve-addr", "${meta.node_ip}:9014",
-          "--checkpoint-peers", "192.168.56.41:9014,192.168.56.42:9014,192.168.56.43:9014",
+          # The account nonce query for the sequencers
+          # (ports.executor_nonce_query in group_vars/all.yml).
+          "--nonce-query-addr", "${meta.node_ip}:9024",
+          "--checkpoint-peers", join(",", [for i in range(var.executor_count) : "executor-${i}.node.${var.datacenter}.consul:9014"]),
           # Bind the Prometheus exporter on all interfaces; the
           # default is loopback. The chaos suite probes it directly
           # over the cluster bridge (http://<node_ip>:9004/metrics),
@@ -188,7 +210,7 @@ job "executor" {
           # kill of a privileged sibling node can stall docker exec
           # runner-wide for minutes, which reads as "block 0 -> 0"
           # while executors were healthy. The bridge is the isolated
-          # 192.168.56.0/24 test segment; loopback scrapes (docker exec
+          # cluster network; loopback scrapes (docker exec
           # curl 127.0.0.1:9004) keep working too.
           "--metrics-addr", "0.0.0.0:9004",
         ]
@@ -199,6 +221,10 @@ job "executor" {
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }
 
       # Presence-checked config. Content lives in config/executor.toml.

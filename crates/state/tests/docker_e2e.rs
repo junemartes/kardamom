@@ -3,8 +3,8 @@
 //! [`kardamom_log::testing::AeronTestCluster`] harness.
 //!
 //! The mock-based unit and integration tests in this crate stay in
-//! place (write_replay, snapshot_mvcc, snapshot_swap,
-//! concurrent_readers, recovery_midblock, compaction_smoke). This test
+//! place (`write_replay`, `snapshot_mvcc`, `snapshot_swap`,
+//! `concurrent_readers`, `recovery_midblock`, `compaction_smoke`). This test
 //! is additional coverage: it brings up the real Aeron container, so it
 //! can catch wire-format, IPC, and back-pressure bugs that the
 //! channel-less in-process writer cannot surface.
@@ -17,15 +17,15 @@
 //! libmdbx `StateWriter`, and asserts that the harness resolves its
 //! host ports, and that the writer can apply at least one local batch.
 //!
-//! The full round trip, from a tx_receipts subscription, through
+//! The full round trip, from a `tx_receipts` subscription, through
 //! building a `BlockDelta`, to the writer, needs a
 //! `TxReceiptsSubscriber` adapter that wraps `log`'s `aeron-live`
-//! tx_receipts async wrapper. `log` does not yet ship that high-level
+//! `tx_receipts` async wrapper. `log` does not yet ship that high-level
 //! wrapper; it exposes only the low-level rusteron primitives, plus the
 //! `testing::AeronTestCluster` harness.
 //!
 //! When that wrapper lands, this file will gain the full publish,
-//! writer, tx_hash_index round trip. The harness assertion below proves
+//! writer, `tx_hash_index` round trip. The harness assertion below proves
 //! that this crate's test target can already reach the Aeron container,
 //! which is the prerequisite that landing the wrapper depends on.
 
@@ -34,7 +34,6 @@
 use alloy_primitives::address;
 use kardamom_log::testing::AeronTestCluster;
 use kardamom_state::StateWriter;
-use kardamom_state::env::{Durability, StateEnvBuilder};
 use kardamom_types::StateDatabase;
 
 mod common;
@@ -55,10 +54,7 @@ async fn aeron_cluster_starts_and_state_writer_applies_batch() {
 
     // 2. Spin up a real libmdbx-backed StateWriter on a tempdir.
     let tmpdir = tempfile::tempdir().expect("tempdir");
-    let env = StateEnvBuilder::new(tmpdir.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .expect("env open");
+    let env = common::open_env(tmpdir.path());
     let mut writer = StateWriter::spawn(env).expect("writer spawn");
     // Drop the genesis snapshot.
     let _ = writer.snapshot_rx.recv();

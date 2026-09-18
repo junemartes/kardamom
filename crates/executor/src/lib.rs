@@ -11,7 +11,7 @@
 //!
 //! Two replicas can publish a `Receipt` with the same `tx_idx` but a
 //! different `write_set_hash`. This must halt the chain. The executor cannot
-//! detect this from its own output. The tx_receipts consumer detects it: it
+//! detect this from its own output. The `tx_receipts` consumer detects it: it
 //! dedupes by `tx_idx` and panics on a hash mismatch (see `kardamom-log`).
 //! Separately, a `kardamom-validator` re-executes the canonical order and
 //! checks the result against the executor's receipts and BAL.

@@ -18,23 +18,28 @@
 //! any time.
 
 pub mod aeron_adapters;
-pub mod binary;
+pub(crate) mod binary;
 pub mod channels;
 pub mod cluster;
 pub mod config;
 pub mod error;
 pub mod json_rpc;
 pub mod metrics;
-pub mod pending;
+pub(crate) mod pending;
 pub mod proxy;
-pub mod rate_limit;
-pub mod receipt_cache;
+pub(crate) mod rate_limit;
+pub(crate) mod receipt_cache;
 pub mod routing;
-pub mod seen_receipts;
+pub(crate) mod seen_receipts;
 pub mod sig_verify;
-pub mod tx_error_dedup;
+pub(crate) mod sync_util;
+/// Shared test and bench helpers. See the module doc for what it covers.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+pub(crate) mod tx_error_dedup;
 
 pub use channels::{IngressPublication, IngressSubscription, MockChannels};
 pub use config::IngressConfig;
 pub use error::IngressError;
+pub use pending::ReceiptResponse;
 pub use proxy::{IngressHandle, IngressProxy};

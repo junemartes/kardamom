@@ -51,7 +51,9 @@ fn multi_blob_payload_roundtrip() {
 #[test]
 fn varied_sizes_roundtrip() {
     for &size in &[0usize, 1, 30, 31, 32, 33, 1023, 1024, 1025] {
-        let payload: Vec<u8> = (0..size as u32).map(|i| (i & 0xFF) as u8).collect();
+        let payload: Vec<u8> = (0..u32::try_from(size).unwrap())
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
         let blobs = pack_to_blobs(&payload).unwrap();
         let back = unpack_from_blobs(&blobs).unwrap();
         assert_eq!(back, payload, "round-trip failed at size {size}");

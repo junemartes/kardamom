@@ -8,18 +8,35 @@ fn write_tmp(contents: &str) -> tempfile::NamedTempFile {
     f
 }
 
+/// Write `toml` to a temp file and load it. The `write_tmp` plus
+/// `from_toml_path` pair repeats across most tests in this module; this
+/// is the one place that owns the temp file's lifetime past the call.
+fn load(toml: &str) -> Result<LogConfig, LogError> {
+    LogConfig::from_toml_path(write_tmp(toml).path())
+}
+
+/// A minimal MDS `[channels]` block: fixed control channel and host,
+/// caller-chosen base port and executor count. Several tests differ from
+/// each other only in these two values.
+fn mds_toml(base_port: &str, count: u32) -> String {
+    format!(
+        r#"
+            [channels]
+            tx_receipts_control_channel = "aeron:udp?control-mode=manual"
+            tx_receipts_endpoint_host = "192.168.56.31"
+            tx_receipts_endpoint_base_port = {base_port}
+            tx_receipts_executor_count = {count}
+            "#
+    )
+}
+
 #[test]
 fn empty_file_yields_defaults() {
-    let f = write_tmp("");
-    let cfg = LogConfig::from_toml_path(f.path()).expect("load empty");
+    let cfg = load("").expect("load empty");
     // Must match the built-in defaults exactly.
     let d = LogConfig::default();
     assert_eq!(cfg.recorder_id, d.recorder_id);
-    assert_eq!(
-        cfg.channels.tx_ordering_channel,
-        d.channels.tx_ordering_channel
-    );
-    assert_eq!(cfg.quorum.n, d.quorum.n);
+    assert_eq!(cfg.channels.tx_errors_channel, d.channels.tx_errors_channel);
     assert_eq!(cfg.aeron.file_sync_level, d.aeron.file_sync_level);
 }
 
@@ -29,14 +46,14 @@ fn partial_channels_section_inherits_other_fields() {
     let f = write_tmp(
         r#"
             [channels]
-            tx_ordering_channel = "aeron:udp?endpoint=239.192.56.11:40010"
-            tx_ordering_stream_id = 1001
+            tx_errors_channel = "aeron:udp?endpoint=239.192.56.17:40030"
+            tx_errors_stream_id = 1015
             "#,
     );
     let cfg = LogConfig::from_toml_path(f.path()).expect("load partial");
     assert_eq!(
-        cfg.channels.tx_ordering_channel,
-        "aeron:udp?endpoint=239.192.56.11:40010"
+        cfg.channels.tx_errors_channel,
+        "aeron:udp?endpoint=239.192.56.17:40030"
     );
     // Untouched channel fields fall back to IPC defaults.
     assert_eq!(
@@ -46,23 +63,20 @@ fn partial_channels_section_inherits_other_fields() {
     assert_eq!(cfg.channels.tx_data_stream_id_base, 2000);
     // Untouched sections fall back wholesale.
     assert_eq!(cfg.recorder_id, 0);
-    assert_eq!(cfg.quorum, QuorumConfig::default());
 }
 
 #[test]
-fn recorder_id_and_quorum_override() {
-    let f = write_tmp(
-        r#"
-            recorder_id = 2
-            [quorum]
-            n = 5
-            q = 3
-            "#,
-    );
-    let cfg = LogConfig::from_toml_path(f.path()).expect("load");
+fn recorder_id_override() {
+    let cfg = load("recorder_id = 2\n").expect("load");
     assert_eq!(cfg.recorder_id, 2);
-    assert_eq!(cfg.quorum.n, 5);
-    assert_eq!(cfg.quorum.q, 3);
+}
+
+#[test]
+fn quorum_section_is_rejected() {
+    // `[quorum]` is not a config section. An unknown section must fail
+    // loudly, not load with the section ignored.
+    let err = load("[quorum]\nn = 5\nq = 3\n").expect_err("quorum section must be rejected");
+    assert!(matches!(err, LogError::Config(_)), "got {err:?}");
 }
 
 #[test]
@@ -70,7 +84,7 @@ fn unknown_field_is_rejected() {
     let f = write_tmp(
         r#"
             [channels]
-            tx_ordering_channLE = "typo"
+            tx_errors_channLE = "typo"
             "#,
     );
     let err = LogConfig::from_toml_path(f.path()).expect_err("typo must be rejected");
@@ -88,8 +102,8 @@ fn missing_file_is_a_config_error() {
 fn resolve_none_is_default() {
     let cfg = LogConfig::resolve(None).expect("resolve none");
     assert_eq!(
-        cfg.channels.tx_ordering_channel,
-        LogConfig::default().channels.tx_ordering_channel
+        cfg.channels.tx_errors_channel,
+        LogConfig::default().channels.tx_errors_channel
     );
 }
 
@@ -100,7 +114,6 @@ fn tx_bal_defaults_present() {
     assert!(ch.tx_bal_channel.contains("tx-bal"));
     // Must not collide with the receipt block or other channels.
     for other in [
-        ch.tx_ordering_stream_id,
         ch.tx_receipts_stream_id,
         ch.tx_receipts_stream_id + 1,
         ch.tx_errors_stream_id,
@@ -119,14 +132,12 @@ fn tx_remote_epochs_defaults_present() {
     // collision silently delivers another stream's frames to be rkyv-decoded
     // as a RemoteEpochRecord.
     for other in [
-        ch.tx_ordering_stream_id,
         ch.tx_receipts_stream_id,
         ch.tx_receipts_stream_id + 1,
         ch.tx_bal_stream_id,
         ch.tx_errors_stream_id,
         ch.tx_deposits_stream_id,
         ch.fsync_watermark_stream_id,
-        ch.quorum_watermark_stream_id,
     ] {
         assert_ne!(ch.tx_remote_epochs_stream_id, other);
     }
@@ -142,8 +153,8 @@ fn round_trips_through_toml() {
     let f = write_tmp(&s);
     let back = LogConfig::from_toml_path(f.path()).expect("reparse");
     assert_eq!(
-        back.channels.quorum_watermark_stream_id,
-        original.channels.quorum_watermark_stream_id
+        back.channels.fsync_watermark_stream_id,
+        original.channels.fsync_watermark_stream_id
     );
     assert_eq!(
         back.aeron.archive_control_request_channel,
@@ -163,7 +174,7 @@ fn tx_receipts_endpoint_offsets_port_by_replica() {
     let ch = ChannelsConfig {
         tx_receipts_control_channel: "aeron:udp?control-mode=manual".into(),
         tx_receipts_endpoint_host: "192.168.56.31".into(),
-        tx_receipts_endpoint_base_port: 40020,
+        tx_receipts_endpoint_base_port: Some(BasePort::try_from(40020).unwrap()),
         ..Default::default()
     };
     assert!(ch.tx_receipts_mds_enabled());
@@ -216,7 +227,10 @@ fn mds_contract_parses_from_toml_and_aligns_both_sides() {
         .expect("load MDS")
         .channels;
     assert!(ch.tx_receipts_mds_enabled());
-    assert_eq!(ch.tx_receipts_executor_count, 3);
+    assert_eq!(
+        ch.tx_receipts_executor_count,
+        Some(std::num::NonZeroU32::new(3).unwrap())
+    );
     // Executor side (replica 1) and ingress side (destination index 1)
     // resolve to the exact same endpoint: base + 2*1 = 40022 (receipts).
     assert_eq!(
@@ -235,20 +249,11 @@ fn mds_contract_parses_from_toml_and_aligns_both_sides() {
 
 #[test]
 fn mds_nonpositive_base_port_rejected() {
-    // A negative base used to wrap through `as u32` into a nonsense port.
-    // It must now fail at load time with a config error.
+    // A non-positive base must fail at load time with a config error, not
+    // wrap into a nonsense port through the unsigned endpoint arithmetic.
     for port in ["-40020", "0"] {
-        let f = write_tmp(&format!(
-            r#"
-                [channels]
-                tx_receipts_control_channel = "aeron:udp?control-mode=manual"
-                tx_receipts_endpoint_host = "192.168.56.31"
-                tx_receipts_endpoint_base_port = {port}
-                tx_receipts_executor_count = 3
-                "#
-        ));
-        let err = LogConfig::from_toml_path(f.path())
-            .expect_err("non-positive MDS base port must be rejected");
+        let err =
+            load(&mds_toml(port, 3)).expect_err("non-positive MDS base port must be rejected");
         assert!(matches!(err, LogError::Config(_)), "got {err:?}");
         assert!(
             err.to_string().contains("tx_receipts_endpoint_base_port"),
@@ -260,38 +265,204 @@ fn mds_nonpositive_base_port_rejected() {
 #[test]
 fn mds_base_port_overflowing_u16_rejected() {
     // Highest replica endpoint (base + 2*count + 1) must stay a valid port.
-    let f = write_tmp(
-        r#"
-            [channels]
-            tx_receipts_control_channel = "aeron:udp?control-mode=manual"
-            tx_receipts_endpoint_host = "192.168.56.31"
-            tx_receipts_endpoint_base_port = 65530
-            tx_receipts_executor_count = 3
-            "#,
-    );
-    LogConfig::from_toml_path(f.path()).expect_err("overflowing MDS base port rejected");
+    load(&mds_toml("65530", 3)).expect_err("overflowing MDS base port rejected");
 }
 
 #[test]
-fn mds_valid_base_port_accepted_and_non_mds_port_unchecked() {
+fn mds_valid_base_port_accepted() {
     // The deploy-shaped MDS config still loads.
-    let f = write_tmp(
-        r#"
-            [channels]
-            tx_receipts_control_channel = "aeron:udp?control-mode=manual"
-            tx_receipts_endpoint_host = "192.168.56.31"
-            tx_receipts_endpoint_base_port = 40020
-            tx_receipts_executor_count = 3
-            "#,
-    );
-    LogConfig::from_toml_path(f.path()).expect("valid MDS config loads");
-    // The base port is only validated when MDS is actually enabled.
-    let f = write_tmp("[channels]\ntx_receipts_endpoint_base_port = 0\n");
-    LogConfig::from_toml_path(f.path()).expect("port unchecked without MDS");
+    load(&mds_toml("40020", 3)).expect("valid MDS config loads");
 }
 
 #[test]
-fn executor_count_defaults_to_zero() {
+fn mds_executor_count_zero_is_rejected() {
+    // `tx_receipts_executor_count` is a `NonZeroU32` at the config
+    // boundary. A `0` in the file must fail to parse, not silently
+    // become "no executors".
+    let err = load(&mds_toml("40020", 0)).expect_err("a zero executor count must be rejected");
+    assert!(matches!(err, LogError::Config(_)), "got {err:?}");
+}
+
+#[test]
+fn non_mds_base_port_zero_loads_as_unset() {
+    // The deployed `channels.toml` renders `0` when MDS is off. It loads
+    // as `None`, the same as an absent key.
+    let f = write_tmp("[channels]\ntx_receipts_endpoint_base_port = 0\n");
+    let ch = LogConfig::from_toml_path(f.path())
+        .expect("a zero base port loads as unset")
+        .channels;
+    assert_eq!(ch.tx_receipts_endpoint_base_port, None);
+}
+
+#[test]
+fn non_mds_negative_base_port_is_rejected() {
+    // A garbage port value is an error, MDS on or off.
+    let err = load("[channels]\ntx_receipts_endpoint_base_port = -1\n")
+        .expect_err("a negative base port must be rejected");
+    assert!(matches!(err, LogError::Config(_)), "got {err:?}");
+}
+
+#[test]
+fn non_mds_base_port_absent_loads() {
+    // Omitting the field entirely (the common case: single-host IPC
+    // deployments never set it) still loads, defaulting to `None`.
+    let f = write_tmp("[channels]\n");
+    let ch = LogConfig::from_toml_path(f.path())
+        .expect("config without a base port loads")
+        .channels;
+    assert_eq!(ch.tx_receipts_endpoint_base_port, None);
+}
+
+#[test]
+fn executor_count_defaults_to_none() {
     // Default (IPC) config never attaches MDS destinations.
-    assert_eq!(ChannelsConfig::default().tx_receipts_executor_count, 0);
+    assert_eq!(ChannelsConfig::default().tx_receipts_executor_count, None);
+}
+
+#[test]
+fn tx_data_stream_id_base_too_close_to_max_is_rejected() {
+    let ch = ChannelsConfig {
+        tx_data_stream_id_base: i32::MAX - 10,
+        ..Default::default()
+    };
+    assert!(
+        ch.validate().is_err(),
+        "a base within 255 of i32::MAX must fail validate, since \
+         tx_data_stream_id(255) would overflow"
+    );
+}
+
+#[test]
+fn tx_receipts_stream_id_at_max_is_rejected() {
+    let ch = ChannelsConfig {
+        tx_receipts_stream_id: i32::MAX,
+        ..Default::default()
+    };
+    assert!(
+        ch.validate().is_err(),
+        "tx_receipts_stream_id == i32::MAX must fail validate, since \
+         tx_receipts_boundary_stream_id() would overflow"
+    );
+}
+
+#[test]
+fn tx_receipts_boundary_stream_id_is_one_past_the_receipt_stream() {
+    let ch = ChannelsConfig::default();
+    assert_eq!(
+        ch.tx_receipts_boundary_stream_id(),
+        ch.tx_receipts_stream_id + 1
+    );
+}
+
+#[test]
+fn the_deployed_channels_template_loads() {
+    // `deploy/cluster/config/channels.toml.tpl` is what every service in
+    // the container cluster reads. Nomad renders it on the node, filling
+    // the placeholders from the node meta and datacenter; this test fills
+    // them the same way, and fails on a placeholder it does not know, so
+    // the set of node inputs the template depends on stays explicit. The
+    // result must parse with this crate's types, zero sentinels included.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/cluster/config/channels.toml.tpl"
+    );
+    let template = std::fs::read_to_string(path).expect("read channels.toml.tpl");
+    let node = [
+        ("meta.cluster_id", "kardamom-dev"),
+        ("node.datacenter", "dc1"),
+        ("meta.node_ip", "192.168.56.31"),
+    ];
+    let rendered = node.iter().fold(template, |text, (key, value)| {
+        text.replace(&format!("{{{{ env \"{key}\" }}}}"), value)
+    });
+    let rendered = render_service_ranges(&rendered, "192.168.56.41", 8010);
+    assert!(
+        !rendered.contains("{{"),
+        "channels.toml.tpl has a placeholder this test does not fill"
+    );
+    let cfg = load(&rendered).expect("rendered channels.toml.tpl loads");
+    assert_eq!(cfg.channels.tx_receipts_endpoint_base_port, None);
+    assert_eq!(cfg.discovery.cluster_id, "kardamom-dev");
+    assert_eq!(
+        cfg.discovery
+            .advertise_interface
+            .map(String::from)
+            .as_deref(),
+        Some("192.168.56.31/32")
+    );
+    assert_eq!(cfg.aeron.tx_data_archive_endpoints, ["192.168.56.41:8010"]);
+    assert_eq!(
+        cfg.aeron.tx_deposits_archive_endpoints,
+        ["192.168.56.41:8010"]
+    );
+    assert!(
+        cfg.channels
+            .tx_data_channel(0)
+            .contains("interface=192.168.56.31/32")
+    );
+}
+
+/// Expand every `{{ range service "..." }}...{{ end }}` block of a Nomad
+/// template as Consul would for one instance at `address:port`.
+fn render_service_ranges(template: &str, address: &str, port: u16) -> String {
+    const OPEN: &str = "{{ range service \"";
+    const NAME_CLOSE: &str = "\" }}";
+    const END: &str = "{{ end }}";
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + OPEN.len()..];
+        let body_start =
+            after_open.find(NAME_CLOSE).expect("service name closes") + NAME_CLOSE.len();
+        let body_end = body_start
+            + after_open[body_start..]
+                .find(END)
+                .expect("range block ends");
+        let body = &after_open[body_start..body_end];
+        out.push_str(
+            &body
+                .replace("{{ .Address }}", address)
+                .replace("{{ .Port }}", &port.to_string()),
+        );
+        rest = &after_open[body_end + END.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn discovery_section_parses_and_validates() {
+    let cfg = load(
+        r#"
+            [discovery]
+            enabled = true
+            cluster_id = "dev"
+            chain_id = 412346
+            advertise_interface = "192.168.56.0/24"
+            "#,
+    )
+    .expect("a complete discovery section loads");
+    assert!(cfg.discovery.enabled);
+    assert_eq!(
+        cfg.discovery.advertise_interface,
+        Some(InterfaceSelector::Network {
+            net: "192.168.56.0".parse().unwrap(),
+            prefix: 24
+        })
+    );
+    assert_eq!(cfg.discovery.consul_http_addr, "http://127.0.0.1:8500");
+}
+
+#[test]
+fn enabled_discovery_needs_a_cluster_id_and_an_interface() {
+    let no_cluster = load("[discovery]\nenabled = true\nadvertise_interface = \"eth1\"\n");
+    assert!(matches!(no_cluster, Err(LogError::Config(_))));
+    let no_interface = load("[discovery]\nenabled = true\ncluster_id = \"dev\"\n");
+    assert!(matches!(no_interface, Err(LogError::Config(_))));
+    let bad_prefix = load("[discovery]\nadvertise_interface = \"10.0.0.0/40\"\n");
+    assert!(matches!(bad_prefix, Err(LogError::Config(_))));
+    let disabled =
+        load("[discovery]\nenabled = false\n").expect("a disabled section needs nothing");
+    assert!(!disabled.discovery.enabled);
 }

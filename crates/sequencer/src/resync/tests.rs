@@ -6,8 +6,13 @@ fn s(byte: u8) -> Address {
 }
 
 fn mk(cfg: ResyncConfig) -> (ResyncController, Sender<FloorUpdate>, SharedWatermark) {
-    let (c, tx, _reject_tx, w) = resync_channel(cfg, 0);
-    (c, tx, w)
+    let ResyncChannel {
+        controller,
+        floor_tx,
+        watermark,
+        ..
+    } = ResyncChannel::open(cfg, 0).unwrap();
+    (controller, floor_tx, watermark)
 }
 
 fn calm_down(c: &mut ResyncController, w: &SharedWatermark, t: &mut Instant) {
@@ -21,6 +26,18 @@ fn calm_down(c: &mut ResyncController, w: &SharedWatermark, t: &mut Instant) {
     assert!(!c.active(), "controller should have exited resync");
 }
 
+/// A controller already past startup and settled ([`calm_down`]), with
+/// its [`SharedWatermark`] and the clock instant `calm_down` left off at.
+/// Wraps `mk` + `calm_down` for every test that only cares about
+/// post-calm behavior (as opposed to `starts_in_resync_and_exits_when_calm`,
+/// which tests the calm-down transition itself).
+fn calm_controller() -> (ResyncController, SharedWatermark, Instant) {
+    let (mut c, _tx, w) = mk(ResyncConfig::default());
+    let mut t = Instant::now();
+    calm_down(&mut c, &w, &mut t);
+    (c, w, t)
+}
+
 #[test]
 fn starts_in_resync_and_exits_when_calm() {
     let (mut c, _tx, w) = mk(ResyncConfig::default());
@@ -31,9 +48,7 @@ fn starts_in_resync_and_exits_when_calm() {
 
 #[test]
 fn watermark_jump_enters() {
-    let (mut c, _tx, w) = mk(ResyncConfig::default());
-    let mut t = Instant::now();
-    calm_down(&mut c, &w, &mut t);
+    let (mut c, w, mut t) = calm_controller();
     // Jump past 25% of 2^17 = 32768.
     w.store(c.last_watermark + 40_000);
     t += Duration::from_millis(100);
@@ -43,14 +58,12 @@ fn watermark_jump_enters() {
 
 #[test]
 fn feed_lag_flag_enters_even_if_raised_while_loop_was_blocked() {
-    let (mut c, _tx, w) = mk(ResyncConfig::default());
-    let mut t = Instant::now();
-    calm_down(&mut c, &w, &mut t);
+    let (mut c, w, mut t) = calm_controller();
     // The FEED thread saw a 30 second boundary-arrival gap while the
     // publish loop was blocked in a session offer. The flag is sticky.
     // The loop consumes it on its next turn, however late that is.
     w.flag_lag(30_000);
-    t += Duration::from_millis(70_000);
+    t += Duration::from_secs(70);
     c.observe(t);
     assert!(c.active(), "sticky lag flag must enter resync");
     // A second, smaller gap flagged before consumption must not hide
@@ -65,9 +78,7 @@ fn idle_boundaries_do_not_thrash() {
     // Idle traffic: boundaries arrive, but the count never advances. The
     // controller must stay out of resync. Silence is judged by boundary
     // arrival in the feed thread, not by count changes here.
-    let (mut c, _tx, w) = mk(ResyncConfig::default());
-    let mut t = Instant::now();
-    calm_down(&mut c, &w, &mut t);
+    let (mut c, _w, mut t) = calm_controller();
     for _ in 0..10 {
         t += Duration::from_millis(10_000);
         c.observe(t); // count unchanged, no lag flag raised
@@ -77,9 +88,7 @@ fn idle_boundaries_do_not_thrash() {
 
 #[test]
 fn small_jump_stays_calm() {
-    let (mut c, _tx, w) = mk(ResyncConfig::default());
-    let mut t = Instant::now();
-    calm_down(&mut c, &w, &mut t);
+    let (mut c, w, mut t) = calm_controller();
     w.store(c.last_watermark + 100);
     t += Duration::from_millis(500);
     c.observe(t);
@@ -88,9 +97,7 @@ fn small_jump_stays_calm() {
 
 #[test]
 fn publish_stall_enters() {
-    let (mut c, _tx, w) = mk(ResyncConfig::default());
-    let mut t = Instant::now();
-    calm_down(&mut c, &w, &mut t);
+    let (mut c, _w, mut t) = calm_controller();
     c.note_publish_stall(t);
     assert!(!c.active(), "stall below threshold must not trigger");
     t += Duration::from_millis(10_001);
@@ -101,13 +108,7 @@ fn publish_stall_enters() {
 #[test]
 fn floor_updates_raise_and_report() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate {
-        deposit: false,
-        sender: s(1),
-        executed_nonce: 4,
-        skip_reason: None,
-    })
-    .unwrap();
+    tx.send(FloorUpdate::executed(s(1), 4)).unwrap();
     let (raised, confirmations) = c.drain_floor_updates();
     assert_eq!(raised, vec![(s(1), 5)]);
     assert_eq!(confirmations, vec![(s(1), 4)], "every receipt confirms");
@@ -124,12 +125,11 @@ fn skip_receipts_confirm_but_never_raise_floors() {
     // confirmation), while it proves no nonce was consumed. It is not
     // floor evidence.
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate {
-        deposit: false,
-        sender: s(1),
-        executed_nonce: 7,
-        skip_reason: Some(kardamom_types::SkipReason::NonceTooLow),
-    })
+    tx.send(FloorUpdate::skip(
+        s(1),
+        7,
+        kardamom_types::SkipReason::NonceTooLow,
+    ))
     .unwrap();
     let (raised, confirmations) = c.drain_floor_updates();
     assert!(raised.is_empty(), "skip is not floor evidence");
@@ -144,13 +144,7 @@ fn deposit_receipts_neither_confirm_nor_raise() {
     // floor. The code marks this by tx_type, not by inferring from the
     // nonce.
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate {
-        deposit: true,
-        sender: s(1),
-        executed_nonce: 0,
-        skip_reason: None,
-    })
-    .unwrap();
+    tx.send(FloorUpdate::deposit(s(1))).unwrap();
     let (raised, confirmations) = c.drain_floor_updates();
     assert!(raised.is_empty() && confirmations.is_empty());
 }
@@ -163,13 +157,7 @@ fn deposit_receipts_neither_confirm_nor_raise() {
 #[test]
 fn genuine_nonce_zero_tx_confirms_and_raises() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate {
-        deposit: false,
-        sender: s(1),
-        executed_nonce: 0,
-        skip_reason: None,
-    })
-    .unwrap();
+    tx.send(FloorUpdate::executed(s(1), 0)).unwrap();
     let (raised, confirmations) = c.drain_floor_updates();
     assert_eq!(
         confirmations,
@@ -184,12 +172,11 @@ fn genuine_nonce_zero_tx_confirms_and_raises() {
 #[test]
 fn nonce_zero_skip_confirms_without_raising() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate {
-        deposit: false,
-        sender: s(1),
-        executed_nonce: 0,
-        skip_reason: Some(kardamom_types::SkipReason::NonceTooLow),
-    })
+    tx.send(FloorUpdate::skip(
+        s(1),
+        0,
+        kardamom_types::SkipReason::NonceTooLow,
+    ))
     .unwrap();
     let (raised, confirmations) = c.drain_floor_updates();
     assert_eq!(confirmations, vec![(s(1), 0)]);
@@ -198,7 +185,11 @@ fn nonce_zero_skip_confirms_without_raising() {
 
 #[test]
 fn contiguity_rejects_split_drops_from_rewinds() {
-    let (mut c, _tx, reject_tx, _w) = resync_channel(ResyncConfig::default(), 0);
+    let ResyncChannel {
+        controller: mut c,
+        reject_tx,
+        ..
+    } = ResyncChannel::open(ResyncConfig::default(), 0).unwrap();
     // Gap rejects (nonce >= expected): a rejected batch produces one
     // reject per entry. The drain collapses them into one rewind per
     // sender, at the lowest expected value.
@@ -221,23 +212,75 @@ fn contiguity_rejects_split_drops_from_rewinds() {
 #[test]
 fn floors_are_monotonic() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate {
-        deposit: false,
-        sender: s(1),
-        executed_nonce: 9,
-        skip_reason: None,
-    })
-    .unwrap();
+    tx.send(FloorUpdate::executed(s(1), 9)).unwrap();
     // A lower receipt arriving later (a late multicast frame) must not
     // regress the floor.
-    tx.send(FloorUpdate {
-        deposit: false,
-        sender: s(1),
-        executed_nonce: 3,
-        skip_reason: None,
-    })
-    .unwrap();
+    tx.send(FloorUpdate::executed(s(1), 3)).unwrap();
     let (raised, _) = c.drain_floor_updates();
     assert_eq!(raised, vec![(s(1), 10)]);
     assert_eq!(c.floor(s(1)), Some(10));
+}
+
+#[test]
+fn channels_are_bounded_to_dedup_capacity() {
+    // The floor and reject channels must not grow without limit on a
+    // stall: they are bounded to the resync window (`dedup_capacity`),
+    // and the producer drops on overflow instead of blocking or growing.
+    let cfg = ResyncConfig {
+        dedup_capacity: NonZeroU64::new(2).unwrap(),
+        // Small enough that 2 * enter_percent / 100 stays nonzero; the
+        // enter threshold itself is not what this test checks.
+        enter_percent: NonZeroU64::new(100).unwrap(),
+        ..ResyncConfig::default()
+    };
+    // `controller` must stay bound (even if unused): it owns the
+    // receiver half of both channels below, and a receiver drop would
+    // disconnect the channel, making every `try_send` fail as
+    // `Disconnected` instead of demonstrating the `Full` bound this test
+    // checks.
+    let ResyncChannel {
+        controller: _controller,
+        floor_tx: tx,
+        reject_tx,
+        ..
+    } = ResyncChannel::open(cfg, 0).unwrap();
+
+    let one = FloorUpdate::executed(s(1), 0);
+    assert!(tx.try_send(one).is_ok());
+    assert!(tx.try_send(one).is_ok());
+    // The channel is now at its 2-entry capacity: a third send must not
+    // block, and must not be accepted.
+    assert!(matches!(
+        tx.try_send(one),
+        Err(crossbeam_channel::TrySendError::Full(_))
+    ));
+
+    assert!(reject_tx.try_send((s(1), 0, 0)).is_ok());
+    assert!(reject_tx.try_send((s(1), 0, 0)).is_ok());
+    assert!(matches!(
+        reject_tx.try_send((s(1), 0, 0)),
+        Err(crossbeam_channel::TrySendError::Full(_))
+    ));
+}
+
+#[test]
+fn enter_threshold_rejects_a_product_that_rounds_to_zero() {
+    // 2 * 25 / 100 == 0: neither `dedup_capacity` nor `enter_percent` is
+    // individually invalid (both are nonzero), but the pair yields a
+    // threshold of 0 records, which would mean "resync on every
+    // watermark tick". This must be a validation error, never rounded
+    // up to 1 in place.
+    let cfg = ResyncConfig {
+        dedup_capacity: NonZeroU64::new(2).unwrap(),
+        enter_percent: NonZeroU64::new(25).unwrap(),
+        ..ResyncConfig::default()
+    };
+    assert!(matches!(
+        cfg.enter_threshold(),
+        Err(ResyncConfigError::ThresholdTooSmall { .. })
+    ));
+    assert!(matches!(
+        cfg.validate(),
+        Err(ResyncConfigError::ThresholdTooSmall { .. })
+    ));
 }

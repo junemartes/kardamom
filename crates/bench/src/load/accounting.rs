@@ -11,7 +11,7 @@
 
 use serde::Serialize;
 
-use crate::load::config::LoadReport;
+use crate::load::config::{LoadReport, RampStep};
 use crate::load::engine::Counts;
 use crate::load::scrape::MetricsSnapshot;
 
@@ -26,15 +26,17 @@ pub struct KeepPace {
     pub final_block: Option<u64>,
     /// The blocks advanced over the window: `final - base`.
     pub advanced: Option<i64>,
-    /// The sealer-minus-executor block gap at the end, clamped to be at
-    /// least 0.
-    pub gap: Option<i64>,
+    /// The sealer-minus-executor block gap at the end. `sealer` and
+    /// `executor` are both cumulative block counters, so a negative gap
+    /// never arises; `saturating_sub` gives the same clamp-at-0 result
+    /// as a signed subtraction would, without the signed type.
+    pub gap: Option<u64>,
     /// One of `OK`, `FROZEN`, `RECOVERING`, `GAP>N`, or `METRIC-MISSING`.
     pub verdict: String,
 }
 
 /// The inputs to [`evaluate`].
-pub struct EvalInput<'a> {
+pub(crate) struct EvalInput<'a> {
     /// The final delivery counts from the tracker.
     pub counts: Counts,
     /// The transactions accepted but never receipted. These are hard
@@ -61,8 +63,7 @@ pub struct EvalInput<'a> {
     /// entry then means the receipt later became unservable, for
     /// example evicted from the bounded ingress cache, with the durable
     /// copy still in the executor state database, not that it was
-    /// undelivered. Direct mdbx inspection confirmed this for every
-    /// sampled "missing" hash. With this set, `missing` downgrades to
+    /// undelivered. With this set, `missing` downgrades to
     /// a warning, but only if every product drop counter scraped as
     /// exactly zero; a nonzero or unscraped counter keeps the hard
     /// failure. Async (subscribe) mode must not set this: its ack
@@ -113,13 +114,14 @@ pub struct Verdict {
     pub keep_pace: Vec<KeepPace>,
 }
 
+/// `b - a`, as a signed delta (a block count can regress across an
+/// executor restart, so this cannot use `saturating_sub`). Folds a
+/// counter too large for `i64` into `None`, the same channel an
+/// unscraped metric uses, instead of clamping it to a sentinel.
 fn delta(a: Option<u64>, b: Option<u64>) -> Option<i64> {
-    match (a, b) {
-        (Some(a), Some(b)) => {
-            Some(i64::try_from(b).unwrap_or(i64::MAX) - i64::try_from(a).unwrap_or(i64::MAX))
-        }
-        _ => None,
-    }
+    let a = i64::try_from(a?).ok()?;
+    let b = i64::try_from(b?).ok()?;
+    Some(b - a)
 }
 
 /// The block gauge for `node` in `snap`. Returns `None` if the code
@@ -131,87 +133,172 @@ fn executor_block(snap: &MetricsSnapshot, node: &str) -> Option<u64> {
         .and_then(|(_, b)| *b)
 }
 
-/// Evaluate the run into a [`Verdict`].
-#[must_use]
-pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
-    let mut failures = Vec::new();
-    let c = input.counts;
+/// The result of [`keep_pace_rows`]: one row per executor, plus the
+/// failure reasons found while building them. A reason names a frozen
+/// executor, an unreachable metric, or a gap over `input.max_gap`.
+struct KeepPaceResult {
+    rows: Vec<KeepPace>,
+    failures: Vec<String>,
+}
 
-    // --- keep-pace per executor -------------------------------------------
-    let sealer_base = input.base.sealer_block;
-    let sealer_fin = input.fin.sealer_block;
-    let sealer_adv = delta(sealer_base, sealer_fin).unwrap_or(0);
-    let mut keep_pace = Vec::new();
-    for (node, fin_blk) in &input.fin.executor_blocks {
+/// One executor's keep-pace verdict. `Display` renders the strings the
+/// printed table and the JSON report carry in `KeepPace.verdict`.
+enum PaceVerdict {
+    Ok,
+    MetricMissing,
+    Recovering,
+    Frozen,
+    Gap(u64),
+}
+
+impl std::fmt::Display for PaceVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok => write!(f, "OK"),
+            Self::MetricMissing => write!(f, "METRIC-MISSING"),
+            Self::Recovering => write!(f, "RECOVERING"),
+            Self::Frozen => write!(f, "FROZEN"),
+            Self::Gap(max_gap) => write!(f, "GAP>{max_gap}"),
+        }
+    }
+}
+
+/// The inputs every [`PaceInputs::row`] call shares: the eval input,
+/// and the sealer's own final block and advance over the window
+/// (computed once, not per executor).
+struct PaceInputs<'a> {
+    input: &'a EvalInput<'a>,
+    sealer_fin: Option<u64>,
+    sealer_adv: i64,
+}
+
+impl PaceInputs<'_> {
+    /// One executor's keep-pace row, and any failure it adds to
+    /// `failures` (a frozen executor, an unreachable metric, or a gap
+    /// over `input.max_gap`).
+    fn row(&self, node: &str, fin_blk: Option<u64>, failures: &mut Vec<String>) -> KeepPace {
+        let input = self.input;
         let base_blk = executor_block(input.base, node);
-        let advanced = delta(base_blk, *fin_blk);
-        let gap = match (sealer_fin, *fin_blk) {
-            (Some(s), Some(e)) => Some(
-                (i64::try_from(s).unwrap_or(i64::MAX) - i64::try_from(e).unwrap_or(i64::MAX))
-                    .max(0),
-            ),
+        let advanced = delta(base_blk, fin_blk);
+        let gap = match (self.sealer_fin, fin_blk) {
+            (Some(s), Some(e)) => Some(s.saturating_sub(e)),
             _ => None,
         };
-        let mut verdict = "OK".to_string();
+        let mut verdict = PaceVerdict::Ok;
         if fin_blk.is_none() {
-            verdict = "METRIC-MISSING".to_string();
+            verdict = PaceVerdict::MetricMissing;
             if !input.chaos_mode {
                 failures.push(format!("executor {node}: block metric unreachable"));
             }
-        } else if matches!(advanced, Some(a) if a <= 0) && sealer_adv > 0 {
+        } else if matches!(advanced, Some(a) if a <= 0) && self.sealer_adv > 0 {
             // A restarted executor's gauge resets to 0. So `advanced` at or
             // below 0 can mean "replaying after a kill", not frozen. If the
             // recheck sample shows the gauge moving past `fin`, it is recovering.
             let recheck_blk = input.recheck.and_then(|r| executor_block(r, node));
-            if matches!((recheck_blk, *fin_blk), (Some(r), Some(f)) if r > f) {
-                verdict = "RECOVERING".to_string();
+            if matches!((recheck_blk, fin_blk), (Some(r), Some(f)) if r > f) {
+                verdict = PaceVerdict::Recovering;
             } else {
-                verdict = "FROZEN".to_string();
+                verdict = PaceVerdict::Frozen;
+                let sealer_adv = self.sealer_adv;
                 failures.push(format!(
                     "executor {node}: FROZEN (advanced {advanced:?} while sealer advanced {sealer_adv})"
                 ));
             }
-        } else if matches!(gap, Some(g) if g > i64::try_from(input.max_gap).unwrap_or(i64::MAX)) {
-            verdict = format!("GAP>{}", input.max_gap);
+        } else if matches!(gap, Some(g) if g > input.max_gap) {
+            verdict = PaceVerdict::Gap(input.max_gap);
             if !input.chaos_mode {
                 failures.push(format!("executor {node}: gap {gap:?} > {}", input.max_gap));
             }
         }
-        keep_pace.push(KeepPace {
-            node: node.clone(),
+        KeepPace {
+            node: node.to_string(),
             base: base_blk,
-            final_block: *fin_blk,
+            final_block: fin_blk,
             advanced,
             gap,
-            verdict,
-        });
+            verdict: verdict.to_string(),
+        }
     }
+}
 
-    // --- drop accounting (diagnostics) ------------------------------------
+/// The keep-pace row for each executor, and the failure reasons found
+/// while building them. See [`PaceInputs::row`].
+fn keep_pace_rows(input: &EvalInput<'_>) -> KeepPaceResult {
+    let mut failures = Vec::new();
+    let sealer_fin = input.fin.sealer_block;
+    let sealer_adv = delta(input.base.sealer_block, sealer_fin).unwrap_or(0);
+    let pace = PaceInputs {
+        input,
+        sealer_fin,
+        sealer_adv,
+    };
+    let rows = input
+        .fin
+        .executor_blocks
+        .iter()
+        .map(|(node, fin_blk)| pace.row(node, *fin_blk, &mut failures))
+        .collect();
+    KeepPaceResult { rows, failures }
+}
+
+/// The drop-accounting diagnostics: the inferred ingress drop, and the
+/// sequencer's unambiguous drop, eviction, and backpressure counters.
+struct DropAccounting {
+    inferred_ingress_drop: Option<i64>,
+    seq_dropped: Option<i64>,
+    seq_evicted: Option<i64>,
+    seq_backpressure: Option<i64>,
+}
+
+fn drop_accounting(input: &EvalInput<'_>) -> DropAccounting {
     let d_received = delta(input.base.ingress_received, input.fin.ingress_received);
     let d_accepted = delta(input.base.ingress_accepted, input.fin.ingress_accepted);
     let d_rejected = delta(input.base.ingress_rejected, input.fin.ingress_rejected);
     let inferred_ingress_drop = match (d_received, d_accepted, d_rejected) {
         (Some(r), Some(a), Some(rj)) => {
             let queued = i64::try_from(input.fin.ingress_queue_depth.unwrap_or(0)).unwrap_or(0);
-            Some(r - a - rj - queued)
+            // This is a soft, noisy signal (see the module doc): the four
+            // counters are not read atomically, so the subtraction can run
+            // past an `i64` bound in a pathological case. Saturating keeps
+            // that a clamp, not a panic, on a diagnostic value.
+            Some(
+                r.saturating_sub(a)
+                    .saturating_sub(rj)
+                    .saturating_sub(queued),
+            )
         }
         _ => None,
     };
-    let seq_dropped = delta(input.base.seq_dropped_past, input.fin.seq_dropped_past);
-    let seq_evicted = delta(input.base.seq_evictions, input.fin.seq_evictions);
-    let seq_backpressure = delta(input.base.seq_backpressure, input.fin.seq_backpressure);
-
-    // --- service liveness at end ------------------------------------------
-    if !input.chaos_mode {
-        for (svc, up) in &input.fin.service_up {
-            if *up == Some(0) {
-                failures.push(format!("service {svc}: kardamom_service_up=0 at end"));
-            }
-        }
+    DropAccounting {
+        inferred_ingress_drop,
+        seq_dropped: delta(input.base.seq_dropped_past, input.fin.seq_dropped_past),
+        seq_evicted: delta(input.base.seq_evictions, input.fin.seq_evictions),
+        seq_backpressure: delta(input.base.seq_backpressure, input.fin.seq_backpressure),
     }
+}
 
-    // --- hard gates -------------------------------------------------------
+/// Every service reporting `kardamom_service_up=0` at the end of the
+/// window, unless the run is in chaos mode, where a down service is
+/// informational.
+fn liveness_failures(input: &EvalInput<'_>) -> Vec<String> {
+    if input.chaos_mode {
+        return Vec::new();
+    }
+    input
+        .fin
+        .service_up
+        .iter()
+        .filter(|(_, up)| *up == Some(0))
+        .map(|(svc, _)| format!("service {svc}: kardamom_service_up=0 at end"))
+        .collect()
+}
+
+/// The hard-gate failures: zero acceptance, an undelivered accepted
+/// transaction, a non-`0x1` receipt status, or an unambiguous
+/// sequencer drop.
+fn completeness_failures(input: &EvalInput<'_>, drops: &DropAccounting) -> Vec<String> {
+    let mut failures = Vec::new();
+    let c = input.counts;
     if c.accepted == 0 {
         failures.push("ingress accepted ZERO txs (pipeline not reachable)".to_string());
     }
@@ -223,10 +310,10 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
         // sweeper could observe it, and the durable copy is in the executor
         // state database. Downgrade to a warning only under that full proof.
         // A nonzero or unscraped counter keeps the hard failure.
-        let drops_proven_zero = inferred_ingress_drop == Some(0)
-            && seq_dropped == Some(0)
-            && seq_evicted == Some(0)
-            && seq_backpressure == Some(0);
+        let drops_proven_zero = drops.inferred_ingress_drop == Some(0)
+            && drops.seq_dropped == Some(0)
+            && drops.seq_evicted == Some(0)
+            && drops.seq_backpressure == Some(0);
         // The eviction explanation covers only a thin tail. If a material
         // fraction of accepted traffic is unresolved, "every counter reads
         // zero" points to a counter blind spot, not cache eviction. That
@@ -253,11 +340,26 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
     // noise, except under chaos. There, a submit retried across an ingress
     // restart can legitimately reach the sequencer twice, because the dedup
     // cache is volatile. The delta still appears in the verdict as a diagnostic.
-    if matches!(seq_dropped, Some(d) if d > 0) && !input.chaos_mode {
+    if matches!(drops.seq_dropped, Some(d) if d > 0) && !input.chaos_mode {
         failures.push(format!(
-            "sequencer dropped {seq_dropped:?} past-nonce tx(s)"
+            "sequencer dropped {:?} past-nonce tx(s)",
+            drops.seq_dropped
         ));
     }
+    failures
+}
+
+/// Evaluate the run into a [`Verdict`].
+#[must_use]
+pub(crate) fn evaluate(input: &EvalInput<'_>) -> Verdict {
+    let c = input.counts;
+    let KeepPaceResult {
+        rows: keep_pace,
+        mut failures,
+    } = keep_pace_rows(input);
+    let drops = drop_accounting(input);
+    failures.extend(liveness_failures(input));
+    failures.extend(completeness_failures(input, &drops));
 
     Verdict {
         pass: failures.is_empty(),
@@ -268,10 +370,10 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
         missing: input.missing,
         unlanded: input.unlanded,
         bad_status: c.bad_status,
-        inferred_ingress_drop,
-        seq_dropped,
-        seq_evicted,
-        seq_backpressure,
+        inferred_ingress_drop: drops.inferred_ingress_drop,
+        seq_dropped: drops.seq_dropped,
+        seq_evicted: drops.seq_evicted,
+        seq_backpressure: drops.seq_backpressure,
         keep_pace,
     }
 }
@@ -286,19 +388,34 @@ pub(crate) fn step_gap_ok(s0: &MetricsSnapshot, s1: &MetricsSnapshot, max_gap: u
         (Some(a), Some(b)) => b > a,
         _ => false,
     };
-    for (node, b1) in &s1.executor_blocks {
-        let b0 = executor_block(s0, node);
-        // A missing metric means the check cannot run, so stay lenient.
-        if let (Some(b0), Some(b1), Some(sealer)) = (b0, *b1, s1.sealer_block) {
-            if sealer_adv && b1 <= b0 {
-                return false; // The executor is frozen.
-            }
-            if sealer.saturating_sub(b1) > max_gap {
-                return false; // The executor is lagging.
-            }
-        }
+    s1.executor_blocks
+        .iter()
+        .all(|(node, b1)| step_gap_ok_one(s0, node, *b1, s1.sealer_block, sealer_adv, max_gap))
+}
+
+/// One executor's [`step_gap_ok`] check. Stays lenient when a metric
+/// is missing, since the check cannot run without it.
+fn step_gap_ok_one(
+    s0: &MetricsSnapshot,
+    node: &str,
+    b1: Option<u64>,
+    sealer_block: Option<u64>,
+    sealer_adv: bool,
+    max_gap: u64,
+) -> bool {
+    let Some(b0) = executor_block(s0, node) else {
+        return true;
+    };
+    let Some(b1) = b1 else {
+        return true;
+    };
+    let Some(sealer) = sealer_block else {
+        return true;
+    };
+    if sealer_adv && b1 <= b0 {
+        return false; // The executor is frozen.
     }
-    true
+    sealer.saturating_sub(b1) <= max_gap // The executor is not lagging.
 }
 
 /// A per-ramp-step version of [`evaluate`]'s sequencer-drop gate. Checks
@@ -309,7 +426,6 @@ pub(crate) fn step_seq_clean(s0: &MetricsSnapshot, s1: &MetricsSnapshot) -> bool
 }
 
 /// Render the report and verdict to stdout.
-#[allow(clippy::cast_precision_loss)]
 pub(crate) fn print_report(r: &LoadReport) {
     println!(
         "================= KARDAMOM-LOAD ({}) =================",
@@ -319,42 +435,85 @@ pub(crate) fn print_report(r: &LoadReport) {
         "target_tps={}  discovered_max={}  soak_rate={}  duration={:.0}s",
         r.target_tps, r.discovered_max_tps, r.soak_rate_tps, r.duration_secs
     );
-    if !r.ramp.is_empty() {
-        println!("---- ramp ----");
-        for s in &r.ramp {
-            println!(
-                "  rate={:<6} accept={:.3} p50={}ms p95={}ms p99={}ms step_mgas={:<8.1} gap_ok={:<5} seq_clean={:<5} {}",
-                s.rate,
-                s.accept_ratio,
-                s.lat_p50_us / 1000,
-                s.lat_p95_us / 1000,
-                s.lat_p99_us / 1000,
-                s.gas_used as f64 / 1e6,
-                s.gap_ok,
-                s.seq_clean,
-                if s.sustainable {
-                    "SUSTAINABLE"
-                } else {
-                    "UNSUSTAINABLE"
-                }
-            );
-        }
+    print_ramp(&r.ramp);
+    print_gas(r);
+    print_counts(r);
+    print_keep_pace(&r.verdict.keep_pace);
+    if r.verdict.pass {
+        println!("RESULT: PASS");
+    } else {
+        println!("RESULT: FAIL");
+        r.verdict
+            .failures
+            .iter()
+            .for_each(|f| println!("  FAIL: {f}"));
     }
-    let v = &r.verdict;
-    if r.total_gas > 0 && r.duration_secs > 0.0 {
-        // total_gas spans the ramp and the soak. The soak window's own gas
-        // is the total minus what the ramp steps drained into their counters.
-        let ramp_gas: u64 = r.ramp.iter().map(|s| s.gas_used).sum();
-        let soak_gas = r.total_gas.saturating_sub(ramp_gas);
+    println!("=====================================================");
+}
+
+/// The per-step ramp table, if the run had a ramp.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display-only gas totals stay far under 2^52"
+)]
+fn print_ramp(ramp: &[RampStep]) {
+    if ramp.is_empty() {
+        return;
+    }
+    println!("---- ramp ----");
+    for s in ramp {
         println!(
-            "gas: run_total={:.3} Ggas  soak={:.3} Ggas -> {:.4} Ggas/s ({:.1} Mgas/s) [{}]",
-            r.total_gas as f64 / 1e9,
-            soak_gas as f64 / 1e9,
-            soak_gas as f64 / 1e9 / r.duration_secs,
-            soak_gas as f64 / 1e6 / r.duration_secs,
-            r.workload,
+            "  rate={:<6} accept={:.3} p50={}ms p95={}ms p99={}ms step_mgas={:<8.1} gap_ok={:<5} seq_clean={:<5} {}",
+            s.rate,
+            s.accept_ratio,
+            s.lat_p50_us / 1000,
+            s.lat_p95_us / 1000,
+            s.lat_p99_us / 1000,
+            s.gas_used as f64 / 1e6,
+            s.gap_ok,
+            s.seq_clean,
+            sustainable_label(s.sustainable)
         );
     }
+}
+
+/// The ramp-step verdict word for its wire label.
+fn sustainable_label(sustainable: bool) -> &'static str {
+    if sustainable {
+        "SUSTAINABLE"
+    } else {
+        "UNSUSTAINABLE"
+    }
+}
+
+/// The run-total and soak-window gas throughput.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display-only gas totals stay far under 2^52"
+)]
+fn print_gas(r: &LoadReport) {
+    if !(r.total_gas > 0 && r.duration_secs > 0.0) {
+        return;
+    }
+    // total_gas spans the ramp and the soak. The soak window's own gas
+    // is the total minus what the ramp steps drained into their counters.
+    // Saturating: display-only, and a display value should never panic
+    // over a report-file quirk (a ramp step recorded twice, say).
+    let ramp_gas: u64 = r.ramp.iter().map(|s| s.gas_used).sum();
+    let soak_gas = r.total_gas.saturating_sub(ramp_gas);
+    println!(
+        "gas: run_total={:.3} Ggas  soak={:.3} Ggas -> {:.4} Ggas/s ({:.1} Mgas/s) [{}]",
+        r.total_gas as f64 / 1e9,
+        soak_gas as f64 / 1e9,
+        soak_gas as f64 / 1e9 / r.duration_secs,
+        soak_gas as f64 / 1e6 / r.duration_secs,
+        r.workload,
+    );
+}
+
+/// The delivery counts, drop accounting, and receipt latency.
+fn print_counts(r: &LoadReport) {
+    let v = &r.verdict;
     println!(
         "offered={}  accepted={}  receipted={}  missing={}  unlanded={}  bad_status={}",
         v.offered, v.accepted, v.receipted, v.missing, v.unlanded, v.bad_status
@@ -370,235 +529,18 @@ pub(crate) fn print_report(r: &LoadReport) {
         r.lat_p99_us / 1000,
         r.lat_max_us / 1000
     );
+}
+
+/// One line per node's keep-pace verdict.
+fn print_keep_pace(keep_pace: &[KeepPace]) {
     println!("---- keep-pace ----");
-    for k in &v.keep_pace {
+    for k in keep_pace {
         println!(
             "  {:<22} base={:?} final={:?} advanced={:?} gap={:?} {}",
             k.node, k.base, k.final_block, k.advanced, k.gap, k.verdict
         );
     }
-    if v.pass {
-        println!("RESULT: PASS");
-    } else {
-        println!("RESULT: FAIL");
-        for f in &v.failures {
-            println!("  FAIL: {f}");
-        }
-    }
-    println!("=====================================================");
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn snap(exec: &[(&str, u64)], sealer: u64) -> MetricsSnapshot {
-        MetricsSnapshot {
-            executor_blocks: exec
-                .iter()
-                .map(|(n, b)| ((*n).to_string(), Some(*b)))
-                .collect(),
-            sealer_block: Some(sealer),
-            ..Default::default()
-        }
-    }
-
-    fn counts(offered: u64, accepted: u64, receipted: u64, bad: u64) -> Counts {
-        Counts {
-            offered,
-            accepted,
-            receipted,
-            bad_status: bad,
-        }
-    }
-
-    #[test]
-    fn clean_run_passes() {
-        let base = snap(&[("exec-0", 10), ("exec-1", 10)], 10);
-        let fin = snap(&[("exec-0", 50), ("exec-1", 49)], 51);
-        let v = evaluate(&EvalInput {
-            counts: counts(300, 300, 300, 0),
-            missing: 0,
-            unlanded: 0,
-            base: &base,
-            fin: &fin,
-            recheck: None,
-            max_gap: 5,
-            assert_all_delivered: true,
-            ack_proves_receipt: false,
-            chaos_mode: false,
-        });
-        assert!(v.pass, "expected pass, failures: {:?}", v.failures);
-    }
-
-    #[test]
-    fn missing_receipt_fails_under_assert() {
-        let base = snap(&[("exec-0", 10)], 10);
-        let fin = snap(&[("exec-0", 50)], 50);
-        let v = evaluate(&EvalInput {
-            counts: counts(300, 300, 299, 0),
-            missing: 1,
-            unlanded: 0,
-            base: &base,
-            fin: &fin,
-            recheck: None,
-            max_gap: 5,
-            assert_all_delivered: true,
-            ack_proves_receipt: false,
-            chaos_mode: false,
-        });
-        assert!(!v.pass);
-        assert!(v.failures.iter().any(|f| f.contains("must-deliver")));
-    }
-
-    #[test]
-    fn frozen_executor_fails_even_in_chaos() {
-        let base = snap(&[("exec-0", 10), ("exec-1", 10)], 10);
-        // exec-1 never advances, while the sealer does.
-        let fin = snap(&[("exec-0", 50), ("exec-1", 10)], 50);
-        let v = evaluate(&EvalInput {
-            counts: counts(300, 300, 300, 0),
-            missing: 0,
-            unlanded: 0,
-            base: &base,
-            fin: &fin,
-            recheck: None,
-            max_gap: 5,
-            assert_all_delivered: true,
-            ack_proves_receipt: false,
-            chaos_mode: true,
-        });
-        assert!(!v.pass);
-        assert!(v.failures.iter().any(|f| f.contains("FROZEN")));
-    }
-
-    #[test]
-    fn gap_is_soft_in_chaos_hard_in_soak() {
-        let base = snap(&[("exec-0", 10)], 10);
-        // The executor advances but lags the sealer by 40, above max_gap of 5.
-        let fin = snap(&[("exec-0", 20)], 60);
-        let soak = evaluate(&EvalInput {
-            counts: counts(300, 300, 300, 0),
-            missing: 0,
-            unlanded: 0,
-            base: &base,
-            fin: &fin,
-            recheck: None,
-            max_gap: 5,
-            assert_all_delivered: true,
-            ack_proves_receipt: false,
-            chaos_mode: false,
-        });
-        assert!(!soak.pass, "gap should fail in soak mode");
-        let chaos = evaluate(&EvalInput {
-            counts: counts(300, 300, 300, 0),
-            missing: 0,
-            unlanded: 0,
-            base: &base,
-            fin: &fin,
-            recheck: None,
-            max_gap: 5,
-            assert_all_delivered: true,
-            ack_proves_receipt: false,
-            chaos_mode: true,
-        });
-        assert!(
-            chaos.pass,
-            "gap should be soft in chaos mode: {:?}",
-            chaos.failures
-        );
-    }
-
-    #[test]
-    fn restarted_executor_with_moving_recheck_is_recovering_not_frozen() {
-        // exec-1 was hard-killed: its gauge reset from 10 to 3, so advanced
-        // is negative. The recheck sample shows it replaying, from 3 to 8,
-        // so the verdict is RECOVERING, not FROZEN.
-        let base = snap(&[("exec-0", 10), ("exec-1", 10)], 10);
-        let fin = snap(&[("exec-0", 50), ("exec-1", 3)], 50);
-        let recheck = snap(&[("exec-0", 51), ("exec-1", 8)], 51);
-        let v = evaluate(&EvalInput {
-            counts: counts(300, 300, 300, 0),
-            missing: 0,
-            unlanded: 0,
-            base: &base,
-            fin: &fin,
-            recheck: Some(&recheck),
-            max_gap: 5,
-            assert_all_delivered: true,
-            ack_proves_receipt: false,
-            chaos_mode: true,
-        });
-        assert!(v.pass, "expected pass, failures: {:?}", v.failures);
-        let kp = v.keep_pace.iter().find(|k| k.node == "exec-1").unwrap();
-        assert_eq!(kp.verdict, "RECOVERING");
-    }
-
-    #[test]
-    fn restarted_executor_with_stalled_recheck_is_frozen() {
-        // The gauge reset, and did not move by the recheck sample: still FROZEN.
-        let base = snap(&[("exec-0", 10), ("exec-1", 10)], 10);
-        let fin = snap(&[("exec-0", 50), ("exec-1", 3)], 50);
-        let recheck = snap(&[("exec-0", 51), ("exec-1", 3)], 51);
-        let v = evaluate(&EvalInput {
-            counts: counts(300, 300, 300, 0),
-            missing: 0,
-            unlanded: 0,
-            base: &base,
-            fin: &fin,
-            recheck: Some(&recheck),
-            max_gap: 5,
-            assert_all_delivered: true,
-            ack_proves_receipt: false,
-            chaos_mode: true,
-        });
-        assert!(!v.pass);
-        assert!(v.failures.iter().any(|f| f.contains("FROZEN")));
-    }
-
-    #[test]
-    fn sequencer_drop_fails() {
-        let mut base = snap(&[("exec-0", 10)], 10);
-        base.seq_dropped_past = Some(0);
-        let mut fin = snap(&[("exec-0", 50)], 50);
-        fin.seq_dropped_past = Some(2);
-        let v = evaluate(&EvalInput {
-            counts: counts(300, 300, 300, 0),
-            missing: 0,
-            unlanded: 0,
-            base: &base,
-            fin: &fin,
-            recheck: None,
-            max_gap: 5,
-            assert_all_delivered: true,
-            ack_proves_receipt: false,
-            chaos_mode: false,
-        });
-        assert!(!v.pass);
-        assert!(v.failures.iter().any(|f| f.contains("sequencer dropped")));
-    }
-
-    #[test]
-    fn sequencer_drop_is_soft_in_chaos() {
-        // Retry noise across an ingress restart can double-submit. The drop
-        // delta is reported, but must not fail a chaos run.
-        let mut base = snap(&[("exec-0", 10)], 10);
-        base.seq_dropped_past = Some(0);
-        let mut fin = snap(&[("exec-0", 50)], 50);
-        fin.seq_dropped_past = Some(2);
-        let v = evaluate(&EvalInput {
-            counts: counts(300, 300, 300, 0),
-            missing: 0,
-            unlanded: 0,
-            base: &base,
-            fin: &fin,
-            recheck: None,
-            max_gap: 5,
-            assert_all_delivered: true,
-            ack_proves_receipt: false,
-            chaos_mode: true,
-        });
-        assert!(v.pass, "expected pass, failures: {:?}", v.failures);
-        assert_eq!(v.seq_dropped, Some(2), "delta still reported");
-    }
-}
+pub(crate) mod tests;

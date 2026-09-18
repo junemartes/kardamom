@@ -11,6 +11,9 @@ use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::error::IngressError;
 use kardamom_ingress::{IngressProxy, MockChannels};
 
+/// The shard count both tests in this file start `MockChannels` with.
+const SHARDS: std::num::NonZeroUsize = nonzero!(8usize);
+
 #[tokio::test]
 async fn third_call_from_same_ip_is_rate_limited() {
     let cfg = IngressConfig {
@@ -18,7 +21,7 @@ async fn third_call_from_same_ip_is_rate_limited() {
         rate_limit_burst: nonzero!(2u32),
         ..IngressConfig::default()
     };
-    let (mock, _rx) = MockChannels::new(8);
+    let (mock, _rx) = MockChannels::new(SHARDS);
     let proxy = IngressProxy::new(cfg, mock.clone(), mock);
 
     let ip = "10.0.0.7".parse().unwrap();
@@ -45,7 +48,7 @@ async fn other_ips_unaffected_by_first_ips_throttle() {
         rate_limit_burst: nonzero!(1u32),
         ..IngressConfig::default()
     };
-    let (mock, _rx) = MockChannels::new(8);
+    let (mock, _rx) = MockChannels::new(SHARDS);
     let proxy = IngressProxy::new(cfg, mock.clone(), mock);
     let garbage = Bytes::from(vec![0xc0u8]);
     let ip_a = "10.0.0.1".parse().unwrap();

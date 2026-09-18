@@ -7,8 +7,7 @@
 //! dispatch window. Ingress emits no `tracing` spans, so the code
 //! skips the tracing-flame SVG on purpose when it would be empty; see
 //! `harness::write_flame_output`. This test only confirms the wiring
-//! runs without error. A full in-process Aeron pipeline harness, with
-//! real execution and span-based flame graphs, is a follow-up item.
+//! runs without error.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -28,14 +27,14 @@ async fn harness_runs_against_inprocess_ingress() {
         // not running out of work, ends the dispatch, and the full
         // measurement window runs. It stays small enough that debug-build
         // ECDSA presigning is tolerable.
-        txs_per_task: 2_000,
+        txs_per_task: std::num::NonZeroU32::new(2_000).expect("2_000 != 0"),
         max_in_flight: 8,
         timeout: Duration::from_millis(800),
-        concurrency: 4,
+        concurrency: std::num::NonZeroU32::new(4).expect("4 != 0"),
     };
 
     Harness {
-        chain_id: 1,
+        chain_id: std::num::NonZeroU64::MIN,
         bench,
         flame_out: flame_out.clone(),
         report_json: None,

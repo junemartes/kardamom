@@ -73,4 +73,20 @@ final class ClusterNodeTest {
         assertThrows(IllegalStateException.class, () -> ClusterNode.memberIdForNodeIp(MEMBERS, null));
         assertThrows(IllegalStateException.class, () -> ClusterNode.memberIdForNodeIp(MEMBERS, ""));
     }
+
+    @Test
+    void parseRemoteOriginsAcceptsACommaListOfU64ChainIds() {
+        assertEquals(java.util.Set.of(), ClusterNode.parseRemoteOrigins(null));
+        assertEquals(java.util.Set.of(), ClusterNode.parseRemoteOrigins(""));
+        assertEquals(java.util.Set.of(), ClusterNode.parseRemoteOrigins(" , "));
+        assertEquals(
+            java.util.Set.of(412_347L, 412_399L),
+            ClusterNode.parseRemoteOrigins("412347, 412399,"));
+        // u64 values above Long.MAX_VALUE parse as unsigned.
+        assertEquals(
+            java.util.Set.of(-1L),
+            ClusterNode.parseRemoteOrigins("18446744073709551615"));
+        // A typo is fatal, never a silently disabled peer.
+        assertThrows(IllegalStateException.class, () -> ClusterNode.parseRemoteOrigins("412347,abc"));
+    }
 }

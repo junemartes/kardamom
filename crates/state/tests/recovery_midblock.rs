@@ -11,7 +11,6 @@
 mod common;
 
 use alloy_primitives::{U256, address};
-use kardamom_state::env::{Durability, StateEnvBuilder};
 use kardamom_state::{StateSnapshot, StateWriter, read_recovery_point};
 use kardamom_types::StateDatabase;
 
@@ -22,10 +21,7 @@ fn recovery_point_matches_last_committed_block() {
 
     // --- run 1: commit blocks 1..=3, then drop ---
     {
-        let env = StateEnvBuilder::new(dir.path())
-            .durability(Durability::SafeNoSync)
-            .open()
-            .unwrap();
+        let env = common::open_env(dir.path());
         let mut writer = StateWriter::spawn(env).unwrap();
         // Drain the genesis snapshot.
         let _ = writer.snapshot_rx.recv();
@@ -55,10 +51,7 @@ fn recovery_point_matches_last_committed_block() {
     }
 
     // --- run 2: reopen, and assert recovery point and snapshot consistency ---
-    let env = StateEnvBuilder::new(dir.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
+    let env = common::open_env(dir.path());
 
     let rp = read_recovery_point(&env).unwrap();
     // The writer may have committed block 4 before shutdown. Either 3 or

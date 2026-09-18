@@ -2,7 +2,7 @@
 
 How each kardamom actor fails, what it costs, how it recovers, and where that
 behavior is verified. Grounded in the failover specs (`docs/agents/`), the
-chaos suite (`deploy/cluster/scripts/chaos.sh` — case names appear like
+chaos suite (`crates/chaos`, one case per function — case names appear like
 `cluster-leader-kill` throughout; most run in CI via
 `.github/workflows/cluster-e2e.yml`), and the recovery code itself.
 
@@ -63,6 +63,15 @@ with three distinct, tested modes:
   keep progressing; the returned node rejoins to 3/3. Replicas are
   deterministic state machines, so one dead or lagging replica never blocks
   the others.
+- **Machine replacement** (`node-replace-executor`) — the node is replaced
+  through the Terraform root the way a cloud provider replaces a server: a
+  new address and empty volumes, then the substrate play a new machine
+  gets. Consul must forget the old record (the control node force-leaves
+  it), Nomad must place the lost executor on the new client, and the
+  executor must catch up from nothing. Nothing but the root's address plan
+  moves, since every peer resolves the node by name. A restarted node
+  (`node-failure-executor`) keeps its address and its disks; this is the
+  path that loses both.
 - **State-DB volume loss** (`state-checkpoint-restore`) — a *wiped* state DB
   (not just a process crash) would otherwise force a re-sync from genesis,
   replaying the entire canonical stream — unbounded as the chain ages. With

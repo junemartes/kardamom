@@ -17,7 +17,7 @@ sol! {
 /// ERC-7955 permissionless CREATE2 factory.
 /// This is the canonical address on every chain that supports EIP-7702
 /// (mainnet, since the Pectra upgrade).
-/// Spec: https://github.com/safe-research/erc-7955
+/// Spec: <https://github.com/safe-research/erc-7955>
 pub const ERC7955_FACTORY: Address = address!("C0DEb853af168215879d284cc8B4d0A645fA9b0E");
 
 /// ERC-7955 factory runtime bytecode (29 bytes). Tests inject this through
@@ -26,23 +26,23 @@ pub const ERC7955_RUNTIME_HEX: &str =
     "60203d3d3582360380843d373d34f5806019573d813d933efd5b3d52f33d52";
 
 /// Salt for the kardamom factory impl, deployed through ERC-7955.
-pub fn factory_impl_salt() -> B256 {
+pub(crate) fn factory_impl_salt() -> B256 {
     keccak256(b"kardamom.factory.impl.v1")
 }
 
 /// Salt for the kardamom factory proxy, deployed through ERC-7955.
-pub fn factory_proxy_salt() -> B256 {
+pub(crate) fn factory_proxy_salt() -> B256 {
     keccak256(b"kardamom.factory.proxy.v1")
 }
 
 /// Init calldata for the kardamom factory: `initialize(address owner)`.
-pub fn factory_init_data(owner: Address) -> Bytes {
+pub(crate) fn factory_init_data(owner: Address) -> Bytes {
     Bytes::from(initializeCall { owner }.abi_encode())
 }
 
 /// Build the full proxy initcode: `ERC1967Proxy.creationCode` plus
 /// `abi.encode(impl, initData)`.
-pub fn proxy_full_initcode(
+pub(crate) fn proxy_full_initcode(
     proxy_creation_code: &Bytes,
     impl_addr: Address,
     init_data: &Bytes,
@@ -72,7 +72,11 @@ pub fn factory_proxy_address(
 }
 
 /// App impl address, deployed through the kardamom factory, not through ERC-7955.
-pub fn app_impl_address(factory: Address, impl_salt: B256, impl_initcode: &Bytes) -> Address {
+pub(crate) fn app_impl_address(
+    factory: Address,
+    impl_salt: B256,
+    impl_initcode: &Bytes,
+) -> Address {
     factory.create2(impl_salt, keccak256(impl_initcode))
 }
 
@@ -84,7 +88,7 @@ pub fn app_impl_address(factory: Address, impl_salt: B256, impl_initcode: &Bytes
 ///
 /// The proxy address depends on `init_data`, since it is part of the proxy
 /// constructor args. Predict with the exact init data the deploy will use.
-pub fn app_proxy_address(
+pub(crate) fn app_proxy_address(
     factory: Address,
     proxy_creation_code: &Bytes,
     impl_addr: Address,

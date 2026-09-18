@@ -1,10 +1,11 @@
 //! Static configuration for an `IngressProxy` instance.
 
-use std::net::SocketAddr;
-use std::num::NonZeroU32;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use kardamom_cache::{CacheConfig, ExecutorQueryConfig, LiveAccountsConfig};
 use kardamom_types::AckPolicy;
 
 /// Static configuration for an `IngressProxy` instance.
@@ -18,8 +19,14 @@ pub struct IngressConfig {
     pub binary_tcp_bind: Option<SocketAddr>,
     /// Optional UDS path for the binary line protocol.
     pub binary_uds_path: Option<PathBuf>,
-    /// Number of sequencer partitions (M). Routes on `keccak(sender) % M`.
-    pub partition_count_m: u32,
+    /// Number of sequencer partitions (M). Routes on `keccak(sender) % M`
+    /// when `shard_map` is `None`.
+    pub partition_count_m: NonZeroU32,
+    /// The versioned vslot-to-lane map. `None` means the identity map
+    /// `lane = vslot % M`, the legacy rule. A resize installs a map
+    /// through the ingress config. See
+    /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.2.
+    pub shard_map: Option<kardamom_types::shard_map::ShardMap>,
     /// The stable identity of this ingress replica. An active/active
     /// deployment runs N replicas. This id namespaces `correlation_id`, so
     /// the `(replica, sequence)` pair stays unique:
@@ -32,17 +39,18 @@ pub struct IngressConfig {
     /// Per-IP token-bucket burst capacity.
     pub rate_limit_burst: NonZeroU32,
     /// Batched sig-verify ring depth (spec calls for 64).
-    pub sig_verify_batch_depth: usize,
+    pub sig_verify_batch_depth: NonZeroUsize,
     /// Batched sig-verify flush window (spec calls for 50µs).
     pub sig_verify_flush_window: Duration,
     /// Max time the proxy waits for a receipt and a watermark before it
     /// times out the client.
     pub pending_receipt_timeout: Duration,
-    /// L2 chain id (returned by `eth_chainId`).
-    pub chain_id: u64,
+    /// L2 chain id (returned by `eth_chainId`). EIP-155 forbids chain id
+    /// 0.
+    pub chain_id: NonZeroU64,
     /// Receipt-cache capacity. Eviction order is arbitrary; see
     /// [`crate::receipt_cache::ReceiptCache`].
-    pub receipt_cache_capacity: usize,
+    pub receipt_cache_capacity: NonZeroUsize,
     /// Which durability gate the proxy waits on before acking a tx. See
     /// [`kardamom_types::AckPolicy`] for the four modes.
     pub ack_policy: AckPolicy,
@@ -50,10 +58,9 @@ pub struct IngressConfig {
     /// submission's request until its receipt arrives. So, at steady
     /// state, concurrent connections are about the offered rate times the
     /// receipt latency, and this count grows most when the pipeline is
-    /// slowest. jsonrpsee's default of 100 capped end-to-end throughput at
-    /// 100 divided by latency, and turned overload into connection
-    /// refusals for every client of the replica. This value is sized so
-    /// the connection table is never the limit.
+    /// slowest. This value must exceed the offered rate times the receipt
+    /// latency, so the connection table is never the limit and a
+    /// replica never turns overload into connection refusals.
     pub rpc_max_connections: u32,
     /// Pending-registry depth. Past this depth, new submissions get an
     /// explicit retryable `Overloaded` error instead of being parked. A
@@ -62,36 +69,73 @@ pub struct IngressConfig {
     /// pins its connection and its sender's later nonces. A depth of 0
     /// sheds everything, as a test hook.
     pub pending_shed_depth: usize,
+    /// The local account layer: the accounts the `tx_receipts` batch rows
+    /// touched, kept for the TTL. Feeds the admission checks and the two
+    /// account RPCs. See `kardamom_cache::LiveAccounts`.
+    pub live_accounts: LiveAccountsConfig,
+    /// Whether the submit path rejects an unfunded sender from the local
+    /// layer. Off, every submit publishes as before the layer existed.
+    /// The reads for the RPCs stay on.
+    pub admission_checks: bool,
+    /// The executor query, the read layer behind the local one for the
+    /// two account RPCs. Off when the endpoint list is empty: a cold
+    /// address then gets an error, not an answer.
+    pub executor_query: ExecutorQueryConfig,
+    /// The Redis layer, between the local layer and the executor query.
+    /// Off when no address is configured: no Redis call exists on any
+    /// path. On, the submit path reads the account projection on a
+    /// local miss and the receipt index on a past nonce, and the RPCs
+    /// read the projection before the executor query.
+    pub cache: CacheConfig,
+    /// The number of mirror heads the Redis reader polls: the mirror ids
+    /// are the executor indexes, so this is the executor count. Read
+    /// only with `cache` on.
+    pub mirror_count: NonZeroU32,
+}
+
+impl IngressConfig {
+    /// The `tx_data` lane of `sender`: the shard map, or the identity rule
+    /// over `partition_count_m`.
+    #[inline]
+    #[must_use]
+    pub fn lane_for(&self, sender: alloy_primitives::Address) -> u32 {
+        match &self.shard_map {
+            Some(map) => u32::from(map.lane_for(sender)),
+            None => crate::routing::partition_for(sender, self.partition_count_m),
+        }
+    }
 }
 
 impl Default for IngressConfig {
     fn default() -> Self {
         use nonzero_ext::nonzero;
         Self {
-            jsonrpc_bind: "127.0.0.1:0".parse().unwrap(),
+            jsonrpc_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             binary_tcp_bind: None,
             binary_uds_path: None,
-            partition_count_m: 8,
+            partition_count_m: nonzero!(8u32),
+            shard_map: None,
             ingress_id: 0,
             rate_limit_per_ip_per_sec: nonzero!(10_000u32),
             rate_limit_burst: nonzero!(1_000u32),
-            sig_verify_batch_depth: 64,
+            sig_verify_batch_depth: nonzero!(64usize),
             sig_verify_flush_window: Duration::from_micros(50),
             pending_receipt_timeout: Duration::from_secs(30),
-            chain_id: 1,
+            chain_id: nonzero!(1u64),
             // 128k gives about a 27s query horizon at 4,800 tx/s (about
-            // 77MB across both indexes at bench-receipt sizes). 64k gave
-            // only 13.7s, shorter than any refetch fallback's reaction time
-            // at that rate. So the small share of confirmations the WS feed
-            // misses became permanently unqueryable, and looked like
-            // phantom must-deliver violations.
-            // Eviction order is arbitrary (DashMap), so the horizon is a
-            // lower bound for only part of the entries. Fallbacks must
-            // poll well inside it.
-            receipt_cache_capacity: 128 * 1024,
+            // 77MB across both indexes at bench-receipt sizes). Eviction
+            // order is arbitrary (DashMap), so the horizon is a lower
+            // bound for only part of the entries. Fallbacks must poll
+            // well inside it.
+            receipt_cache_capacity: nonzero!(128 * 1024usize),
             ack_policy: AckPolicy::default(),
             rpc_max_connections: 8192,
             pending_shed_depth: 16_384,
+            live_accounts: LiveAccountsConfig::default(),
+            admission_checks: true,
+            executor_query: ExecutorQueryConfig::default(),
+            cache: CacheConfig::default(),
+            mirror_count: nonzero!(1u32),
         }
     }
 }
@@ -106,6 +150,8 @@ pub struct IngressFileConfig {
     /// Aeron Cluster (Raft) sealer client config. The on-quorum ack gate
     /// derives its durable watermark from this cluster's egress progress.
     pub cluster: ClusterConfig,
+    /// The `[cache]` section: the Redis layer. Absent means off.
+    pub cache: CacheConfig,
 }
 
 // The `[cluster]` TOML section has one definition. It mirrors the
@@ -120,8 +166,8 @@ mod tests {
     #[test]
     fn default_matches_spec() {
         let cfg = IngressConfig::default();
-        assert_eq!(cfg.partition_count_m, 8);
-        assert_eq!(cfg.sig_verify_batch_depth, 64);
+        assert_eq!(cfg.partition_count_m.get(), 8);
+        assert_eq!(cfg.sig_verify_batch_depth.get(), 64);
         assert_eq!(cfg.sig_verify_flush_window, Duration::from_micros(50));
     }
 }

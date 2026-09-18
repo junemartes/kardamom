@@ -22,6 +22,7 @@
 //! tables byte-identical. The stream checks catch execution divergence; the
 //! table diff catches persistence divergence.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 
@@ -41,8 +42,8 @@ const TINY_INIT_CODE: &[u8] = &[0x60, 0x01, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 
 const PROBE_TXS: u64 = 5;
 
 pub struct Params {
-    pub senders: usize,
-    pub transfers_per_sender: usize,
+    pub senders: NonZeroUsize,
+    pub transfers_per_sender: NonZeroUsize,
     pub sender_base: usize,
     /// How many BALs the validator may miss for this scenario's own blocks.
     ///
@@ -58,164 +59,207 @@ pub struct Params {
     pub max_bal_missing: f64,
 }
 
+const DEFAULT_SENDERS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+const DEFAULT_TRANSFERS_PER_SENDER: NonZeroUsize = NonZeroUsize::new(24).unwrap();
+
 impl Default for Params {
     fn default() -> Self {
         Self {
-            senders: 4,
-            transfers_per_sender: 24,
+            senders: DEFAULT_SENDERS,
+            transfers_per_sender: DEFAULT_TRANSFERS_PER_SENDER,
             sender_base: 1,
             max_bal_missing: 0.0,
         }
     }
 }
 
+/// This scenario's target, params, and shared recipient. Every step below
+/// reads these as state instead of taking them as loose parameters.
+struct ConsistencyRun<'a> {
+    t: &'a Target,
+    p: &'a Params,
+    to: Address,
+}
+
+impl<'a> ConsistencyRun<'a> {
+    fn new(t: &'a Target, p: &'a Params, to: Address) -> Self {
+        Self { t, p, to }
+    }
+
+    /// One sender's run: `transfers_per_sender` dense transfers, then a
+    /// contract CREATE.
+    fn sign_sender_run(&self, signer: &l2::DerivedSigner) -> Result<Vec<SignedTransfer>> {
+        let transfers_per_sender = self.p.transfers_per_sender.get();
+        let mut run: Vec<SignedTransfer> = (0..transfers_per_sender)
+            .map(|n| l2::sign_transfer(signer, self.t.chain_id, n as u64, self.to, 1))
+            .collect::<Result<_>>()?;
+        run.push(l2::sign_create(
+            signer,
+            self.t.chain_id,
+            transfers_per_sender as u64,
+            TINY_INIT_CODE,
+        )?);
+        Ok(run)
+    }
+
+    /// A mixed workload: dense transfers, with the last nonce of each
+    /// sender a contract CREATE. This exercises the code and storage-trie
+    /// paths in both databases.
+    fn build_workload(&self, signers: &[l2::DerivedSigner]) -> Result<Vec<SignedTransfer>> {
+        let runs = signers
+            .iter()
+            .map(|signer| self.sign_sender_run(signer))
+            .collect::<Result<Vec<Vec<SignedTransfer>>>>()?;
+        Ok(runs.into_iter().flatten().collect())
+    }
+
+    /// Wait until the validator's committed cursor reaches the executor's
+    /// current block. The committed cursor chases a moving head, so poll
+    /// until it reaches the executor block sampled in the same round.
+    async fn await_validator_caught_up(&self) -> Result<()> {
+        poll_until(
+            "validator committed == executor block",
+            Duration::from_secs(30),
+            Duration::from_millis(250),
+            || async {
+                let exec = self.t.executor_metric(super::EXEC_BLOCK_NUMBER).await?;
+                let committed = self
+                    .t
+                    .validator_metric_opt(super::VALIDATOR_COMMITTED_BLOCK)
+                    .await?
+                    .unwrap_or(0.0);
+                Ok((committed >= exec).then_some(()))
+            },
+        )
+        .await
+    }
+
+    /// Verification probe. The bulk workload gets the validator behind. A
+    /// validator behind the head commits blocks unverified on purpose:
+    /// `BalBuffer`'s catch-up mode treats a BAL older than the backlog
+    /// lookbehind as unrecoverable, instead of crawling through it. So
+    /// this cannot ask "did verification happen?" of burst blocks. It
+    /// must ask fresh blocks instead, with the validator caught up
+    /// ([`Self::await_validator_caught_up`] guarantees that). A handful
+    /// of sequential transactions spans a few blocks, so one lost
+    /// multicast BAL cannot decide the outcome.
+    async fn run_verification_probe(&self, probe_signer: &l2::DerivedSigner) -> Result<()> {
+        let verified_before = self
+            .t
+            .validator_metric_opt(super::VALIDATOR_BLOCKS_VERIFIED)
+            .await?
+            .unwrap_or(0.0);
+        let missing_before = self
+            .t
+            .validator_metric_opt(super::VALIDATOR_BAL_MISSING)
+            .await?
+            .unwrap_or(0.0);
+        let applied_pre_probe = self.t.executor_metric(super::EXEC_TX_APPLIED).await?;
+        for i in 0..PROBE_TXS {
+            // `transfers_per_sender` is a Params count; the probe's nonce
+            // run continues right after it, so an overflowing sum must
+            // fail loudly.
+            let nonce = (self.p.transfers_per_sender.get() as u64)
+                .checked_add(1)
+                .and_then(|n| n.checked_add(i))
+                .context("probe nonce overflows")?;
+            let tx = l2::sign_transfer(probe_signer, self.t.chain_id, nonce, self.to, 1)?;
+            self.t
+                .rpc
+                .send_raw(&tx.raw)
+                .await
+                .result
+                .map_err(|e| anyhow::anyhow!("probe tx {i}: {e}"))?;
+        }
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "PROBE_TXS is a small constant (5), exactly representable in f64"
+        )]
+        let probe_txs_f64 = PROBE_TXS as f64;
+        self.t
+            .wait_executor_applied(applied_pre_probe + probe_txs_f64, Duration::from_secs(30))
+            .await?;
+        self.t
+            .wait_validator_metric_above(
+                super::VALIDATOR_BLOCKS_VERIFIED,
+                verified_before,
+                Duration::from_secs(60),
+                Duration::from_millis(500),
+                "validator verifies the probe blocks",
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "validator verified no fresh block while caught up (stuck at \
+                     {verified_before}) — every probe block was committed unverified"
+                )
+            })?;
+        let missing = self
+            .t
+            .validator_metric_opt(super::VALIDATOR_BAL_MISSING)
+            .await?
+            .unwrap_or(0.0);
+        let missed = missing - missing_before;
+        anyhow::ensure!(
+            missed <= self.p.max_bal_missing,
+            "validator missed {missed} BALs on the probe blocks (budget {}); a missing BAL \
+             leaves a block unverified — tolerated on lossy multicast, never on IPC",
+            self.p.max_bal_missing
+        );
+        Ok(())
+    }
+}
+
+/// # Errors
+/// Returns an error when a transaction fails to sign or send, when the
+/// executor or validator does not reach the expected state within its
+/// deadline, when the sequencer's health counters moved, when the
+/// validator reported a divergence or a trie shadow-check mismatch, or
+/// when the trie shadow-check never ran.
 pub async fn run(t: &Target, p: Params) -> Result<()> {
-    let signers = l2::dev_signers((p.sender_base + p.senders) as u32)?;
+    // This is a total signer count already (not a highest index), so it
+    // takes no `+ 1`.
+    let signers = l2::dev_signers_total(
+        p.sender_base
+            .checked_add(p.senders.get())
+            .context("sender_base + senders overflows")?,
+    )?;
     let to = Address::from([0x66u8; 20]);
     let baseline = SeqCounters::snapshot(t).await?;
     let applied_before = t
-        .executor_metric(super::EXEC_TX_APPLIED)
-        .await
+        .executor_metric_opt(super::EXEC_TX_APPLIED)
+        .await?
         .unwrap_or(0.0);
-    // Baselines for the validator counters. Every check below compares a
-    // delta over this scenario's workload, so a validator that started
-    // behind a running chain is judged on what it does now, not on the
-    // backlog it committed unverified while catching up.
-    let verified_before = t
-        .validator_metric(super::VALIDATOR_BLOCKS_VERIFIED)
-        .await
-        .unwrap_or(0.0);
-    let missing_before = t
-        .validator_metric(super::VALIDATOR_BAL_MISSING)
-        .await
-        .unwrap_or(0.0);
-
-    // A mixed workload: dense transfers, with the last nonce of each
-    // sender a contract CREATE. This exercises the code and storage-trie
-    // paths in both databases.
-    let mut planned: Vec<SignedTransfer> = Vec::new();
-    for signer in &signers[p.sender_base..] {
-        for n in 0..p.transfers_per_sender {
-            planned.push(l2::sign_transfer(signer, t.chain_id, n as u64, to, 1)?);
-        }
-        planned.push(l2::sign_create(
-            signer,
-            t.chain_id,
-            p.transfers_per_sender as u64,
-            TINY_INIT_CODE,
-        )?);
-    }
-    let total = planned.len();
-
-    let mut set = tokio::task::JoinSet::new();
-    for tx in planned {
-        let rpc = t.rpc.clone();
-        set.spawn(async move {
-            let out = rpc.send_raw(&tx.raw).await;
-            (tx, out)
-        });
-    }
-    while let Some(joined) = set.join_next().await {
-        let (tx, out) = joined.context("submit join")?;
-        out.result
-            .map_err(|e| anyhow::anyhow!("sender {} nonce {}: {e}", tx.sender, tx.nonce))?;
-    }
-    t.wait_executor_applied(applied_before + total as f64, Duration::from_secs(30))
+    let run_ctx = ConsistencyRun::new(t, &p, to);
+    let planned = run_ctx.build_workload(&signers[p.sender_base..])?;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a workload sized by test parameters, always small enough for f64 to \
+                   represent exactly"
+    )]
+    let total = planned.len() as f64;
+    super::submit_all(t, planned).await?;
+    t.wait_executor_applied(applied_before + total, Duration::from_secs(30))
         .await?;
     baseline.assert_flat(t, "consistency workload").await?;
 
     // Validator verdict: caught up, verifying, never diverged, and the
-    // shadow-check is active and clean. (The committed cursor chases a
-    // moving head, so poll until it reaches the executor block sampled in
-    // the same round.)
-    poll_until(
-        "validator committed == executor block",
-        Duration::from_secs(30),
-        Duration::from_millis(250),
-        || async {
-            let exec = t.executor_metric(super::EXEC_BLOCK_NUMBER).await?;
-            let committed = t
-                .validator_metric(super::VALIDATOR_COMMITTED_BLOCK)
-                .await
-                .unwrap_or(0.0);
-            Ok((committed >= exec).then_some(()))
-        },
-    )
-    .await?;
-    // Verification probe. The bulk workload above deliberately gets the
-    // validator behind. A validator behind the head commits blocks
-    // unverified on purpose: `BalBuffer`'s catch-up mode treats a BAL
-    // older than the backlog lookbehind as unrecoverable, instead of
-    // crawling through it. So this test cannot ask "did verification
-    // happen?" of burst blocks. It must ask fresh blocks instead, with the
-    // validator caught up (the poll above guarantees that). A handful of
-    // sequential transactions spans a few blocks, so one lost multicast
-    // BAL cannot decide the outcome.
-    let verified_before = t
-        .validator_metric(super::VALIDATOR_BLOCKS_VERIFIED)
-        .await
-        .unwrap_or(verified_before);
-    let missing_before = t
-        .validator_metric(super::VALIDATOR_BAL_MISSING)
-        .await
-        .unwrap_or(missing_before);
-    let probe_signer = &signers[p.sender_base];
-    let applied_pre_probe = t.executor_metric(super::EXEC_TX_APPLIED).await?;
-    for i in 0..PROBE_TXS {
-        let nonce = p.transfers_per_sender as u64 + 1 + i;
-        let tx = l2::sign_transfer(probe_signer, t.chain_id, nonce, to, 1)?;
-        t.rpc
-            .send_raw(&tx.raw)
-            .await
-            .result
-            .map_err(|e| anyhow::anyhow!("probe tx {i}: {e}"))?;
-    }
-    t.wait_executor_applied(
-        applied_pre_probe + PROBE_TXS as f64,
-        Duration::from_secs(30),
-    )
-    .await?;
-    let verified = poll_until(
-        "validator verifies the probe blocks",
-        Duration::from_secs(60),
-        Duration::from_millis(500),
-        || async {
-            let v = t
-                .validator_metric(super::VALIDATOR_BLOCKS_VERIFIED)
-                .await
-                .unwrap_or(0.0);
-            Ok((v > verified_before).then_some(v))
-        },
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "validator verified no fresh block while caught up (stuck at {verified_before}) — \
-             every probe block was committed unverified"
-        )
-    })?;
-    let missing = t
-        .validator_metric(super::VALIDATOR_BAL_MISSING)
-        .await
-        .unwrap_or(0.0);
-    let missed = missing - missing_before;
-    anyhow::ensure!(
-        missed <= p.max_bal_missing,
-        "validator missed {missed} BALs on the probe blocks (budget {}); a missing BAL leaves \
-         a block unverified — tolerated on lossy multicast, never on IPC",
-        p.max_bal_missing
-    );
-    let _ = verified;
+    // shadow-check is active and clean.
+    run_ctx.await_validator_caught_up().await?;
+    run_ctx
+        .run_verification_probe(&signers[p.sender_base])
+        .await?;
+
     let divergence = t
-        .validator_metric(super::VALIDATOR_DIVERGENCE)
-        .await
+        .validator_metric_opt(super::VALIDATOR_DIVERGENCE)
+        .await?
         .unwrap_or(0.0);
     anyhow::ensure!(divergence == 0.0, "validator reported divergence");
     let checks = t.validator_metric(super::TRIE_SHADOW_CHECKS).await?;
     anyhow::ensure!(checks > 0.0, "trie shadow-check never ran");
     let mismatch = t
-        .validator_metric(super::TRIE_SHADOW_MISMATCH)
-        .await
+        .validator_metric_opt(super::TRIE_SHADOW_MISMATCH)
+        .await?
         .unwrap_or(0.0);
     anyhow::ensure!(mismatch == 0.0, "trie shadow-check mismatched");
     Ok(())
@@ -225,6 +269,12 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
 /// state is byte-identical, and the validator holds a reproducible root.
 /// This needs cleanly closed databases (graceful shutdown, or copies of
 /// stopped services).
+///
+/// # Errors
+/// Returns an error when either database fails to open or sweep clean,
+/// when the two databases stopped at different blocks, when the workload
+/// produced no blocks, when the two state roots unexpectedly match, or
+/// when `deep_compare` finds a difference.
 pub fn verify_state_dirs(executor_dir: &Path, validator_dir: &Path) -> Result<()> {
     let exec_env = kardamom_state::StateEnvBuilder::new(executor_dir)
         .open()

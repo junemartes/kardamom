@@ -1,7 +1,7 @@
 //! End-to-end test through the Rust adapter chain:
 //!
 //! `ClusterRefPublisher`, then an in-Rust service mock that mirrors the Java
-//! `CanonicalSealerState` (dedup, canonical_count, boundary), then
+//! `CanonicalSealerState` (dedup, `canonical_count`, boundary), then
 //! `ClusterTxOrderingSubscription`.
 //!
 //! This checks the whole Rust path against the documented wire contract and
@@ -11,14 +11,16 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::Address;
 use kardamom_cluster_adapter::gateway::fakes::{FakeEgress, FakeIngress};
-use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record, split_ingress};
+use kardamom_cluster_adapter::wire::{
+    encode_egress_boundary, encode_egress_record, split_ingress, txref,
+};
 use kardamom_engine::reader::TxOrderingSubscription;
 use kardamom_engine::reader::cluster::ClusterTxOrderingSubscription;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::outbound::cluster::ClusterRefPublisher;
-use kardamom_types::{BPosition, TxOrderingMessage, TxRef};
+use kardamom_types::{BPosition, TxOrderingMessage};
 
 /// Mirrors the Java `CanonicalSealerState`. It does FIFO first-seen dedup,
 /// keeps a 0-based canonical index, and floors the boundary timer to 250
@@ -64,7 +66,7 @@ impl MockService {
         }
         let idx = self.count;
         self.count += 1;
-        Some(encode_egress_record(idx, relayed))
+        Some(encode_egress_record(idx, relayed).unwrap())
     }
 
     /// Stamp a boundary at `clock_ms`, and advance the block number.
@@ -73,18 +75,6 @@ impl MockService {
         self.block += 1;
         frame
     }
-}
-
-fn txref(tag: u8) -> TxRef {
-    TxRef::new(
-        B256::repeat_byte(tag),
-        1,
-        BPosition {
-            term_id: 0,
-            term_offset: tag as i32,
-        },
-        0,
-    )
 }
 
 #[test]

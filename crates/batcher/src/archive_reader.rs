@@ -1,15 +1,15 @@
 //! Offline Aeron Archive segment reader.
 //!
-//! Today, the batcher reads on-disk Aeron Archive segment files. It does not
-//! subscribe to tx_receipts. It does not talk to the live sequencer.
+//! The batcher reads on-disk Aeron Archive segment files. It does not
+//! subscribe to `tx_receipts`. It does not talk to the live sequencer.
 //!
 //! ## Architecture: split data and ordering
 //!
 //! The on-disk archives carry two different payload types:
 //!
-//! - **TxOrdering** segments carry [`TxOrderingMessage`] records (`TxRef +
+//! - **`TxOrdering`** segments carry [`TxOrderingMessage`] records (`TxRef +
 //!   BoundaryStart`). This is the canonical orderer data.
-//! - **Per-sequencer TxData** segments carry full [`TxEnvelope`] records.
+//! - **Per-sequencer `TxData`** segments carry full [`TxEnvelope`] records.
 //!   This is the bulk transaction data.
 //!
 //! The batcher uses a simplified on-disk frame format for v0: one
@@ -25,7 +25,7 @@
 //! ```
 //!
 //! The header does not depend on the payload type. The payload type depends
-//! on which archive the segment file came from (tx_ordering or tx_data[i]).
+//! on which archive the segment file came from (`tx_ordering` or `tx_data`[i]).
 //! The reader is generic over the payload type, so it can deserialize either
 //! one.
 //!
@@ -47,7 +47,7 @@ const FRAME_HEADER_LEN: usize = 4 + 4 + 4 + 4; // 16 bytes: length, reserved, te
 const FRAME_ALIGN: usize = 8;
 
 /// One decoded record from a typed segment file. The position is the start
-/// position of the fragment on the originating Aeron stream. For tx_data
+/// position of the fragment on the originating Aeron stream. For `tx_data`
 /// segments, this is the position a sequencer recorded in
 /// [`TxRef::tx_data_position`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,24 +56,42 @@ pub struct TypedRecord<T> {
     pub value: T,
 }
 
+/// An rkyv-archived payload a [`TypedSegmentReader`] can decode: archived,
+/// and deserializable and checkable through the high-level rkyv API this
+/// crate's frames use.
+pub trait ArchivedRecord:
+    Sized
+    + rkyv::Archive<
+        Archived: rkyv::Deserialize<Self, HighDeserializer<rancor::Error>>
+                      + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
+    >
+{
+}
+
+impl<T> ArchivedRecord for T where
+    T: rkyv::Archive<
+            Archived: rkyv::Deserialize<T, HighDeserializer<rancor::Error>>
+                          + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
+        >
+{
+}
+
 /// A generic offline reader for an archive segment file. The type parameter
 /// `T` is the rkyv-archived payload in every frame of this segment. Use
-/// `T = TxOrderingMessage` for tx_ordering archives. Use `T = TxEnvelope`
-/// for tx_data archives.
+/// `T = TxOrderingMessage` for `tx_ordering` archives. Use `T = TxEnvelope`
+/// for `tx_data` archives.
 pub struct TypedSegmentReader<T> {
     bytes: Vec<u8>,
     pos: usize,
     _marker: PhantomData<T>,
 }
 
-impl<T> TypedSegmentReader<T>
-where
-    T: rkyv::Archive,
-    T::Archived: rkyv::Deserialize<T, HighDeserializer<rancor::Error>>
-        + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
-{
+impl<T: ArchivedRecord> TypedSegmentReader<T> {
     /// Open a segment file. `segment_path` is the full path to the `.rec`
     /// file (typically `<archive_dir>/<recording_id>-<segmentBase>.rec`).
+    ///
+    /// # Errors
+    /// Returns an error when `segment_path` cannot be opened or read.
     pub fn open(segment_path: &Path) -> Result<Self, BatcherError> {
         let mut f = File::open(segment_path)?;
         let mut bytes = Vec::new();
@@ -87,17 +105,13 @@ where
 
     /// Compose the canonical segment file path:
     /// `<archive_dir>/<recording_id>-<segment_base_position>.rec`.
+    #[must_use]
     pub fn segment_path(archive_dir: &Path, recording_id: i64, segment_base: i64) -> PathBuf {
         archive_dir.join(format!("{recording_id}-{segment_base}.rec"))
     }
 }
 
-impl<T> Iterator for TypedSegmentReader<T>
-where
-    T: rkyv::Archive,
-    T::Archived: rkyv::Deserialize<T, HighDeserializer<rancor::Error>>
-        + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
-{
+impl<T: ArchivedRecord> Iterator for TypedSegmentReader<T> {
     type Item = Result<TypedRecord<T>, BatcherError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -158,40 +172,59 @@ where
     }
 }
 
-/// TxOrdering segment reader: yields [`TxOrderingMessage`] records (TxRef +
-/// BoundaryStart) in canonical order.
+/// `TxOrdering` segment reader: yields [`TxOrderingMessage`] records (`TxRef` +
+/// `BoundaryStart`) in canonical order.
 pub type TxOrderingSegmentReader = TypedSegmentReader<TxOrderingMessage>;
 
-/// TxData[i] segment reader: yields full [`TxEnvelope`] records in the
+/// `TxData`[i] segment reader: yields full [`TxEnvelope`] records in the
 /// order sequencer `i` wrote them.
 pub type TxDataSegmentReader = TypedSegmentReader<TxEnvelope>;
 
-fn access_owned<T>(bytes: &[u8]) -> Result<T, BatcherError>
-where
-    T: rkyv::Archive,
-    T::Archived: rkyv::Deserialize<T, HighDeserializer<rancor::Error>>
-        + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
-{
+/// # Errors
+/// Returns [`BatcherError::Codec`] when `bytes` does not decode as a valid
+/// archived `T`.
+fn access_owned<T: ArchivedRecord>(bytes: &[u8]) -> Result<T, BatcherError> {
     rkyv::from_bytes::<T, rancor::Error>(bytes).map_err(|e| BatcherError::Codec(e.to_string()))
 }
 
-/// Append one frame to `out`. Tests and the future writer-side adapter use
-/// this helper. It encodes one record in the simplified KAR1 segment format.
-///
-/// The frame does not depend on the type. The caller writes tx_data
-/// (`T = TxEnvelope`) and tx_ordering (`T = TxOrderingMessage`) the same way.
-pub fn append_frame<T>(out: &mut Vec<u8>, position: BPosition, value: &T)
-where
+/// A record type [`append_frame`] can encode into the simplified KAR1
+/// segment format, through the high-level rkyv serializer this crate uses.
+pub trait SegmentRecord:
+    for<'a> rkyv::Serialize<
+        rkyv::api::high::HighSerializer<
+            rkyv::util::AlignedVec,
+            rkyv::ser::allocator::ArenaHandle<'a>,
+            rancor::Error,
+        >,
+    >
+{
+}
+
+impl<T> SegmentRecord for T where
     T: for<'a> rkyv::Serialize<
             rkyv::api::high::HighSerializer<
                 rkyv::util::AlignedVec,
                 rkyv::ser::allocator::ArenaHandle<'a>,
                 rancor::Error,
             >,
-        >,
+        >
 {
+}
+
+/// Append one frame to `out`. This crate's tests and the writer-side
+/// adapter use this helper to encode one record in the simplified KAR1
+/// segment format.
+///
+/// The frame does not depend on the type. The caller writes `tx_data`
+/// (`T = TxEnvelope`) and `tx_ordering` (`T = TxOrderingMessage`) the same way.
+///
+/// # Panics
+/// Panics if rkyv encoding of `value` fails (an rkyv-internal allocation
+/// failure, not a data error, so there is no error to return), or if the
+/// encoded frame exceeds `u32::MAX` bytes (no real record does).
+pub fn append_frame<T: SegmentRecord>(out: &mut Vec<u8>, position: BPosition, value: &T) {
     let payload = rkyv::to_bytes::<rancor::Error>(value).expect("rkyv encode");
-    let total: u32 = (FRAME_HEADER_LEN + payload.len()) as u32;
+    let total = u32::try_from(FRAME_HEADER_LEN + payload.len()).expect("frame fits in u32 bytes");
     out.extend_from_slice(&total.to_le_bytes());
     out.extend_from_slice(&[0u8; 4]); // reserved
     out.extend_from_slice(&position.term_id.to_le_bytes());

@@ -1,0 +1,40 @@
+[package]
+name = "kardamom-cache"
+version = { workspace = true }
+edition = { workspace = true }
+license = "MIT"
+publish = false
+
+[lib]
+name = "kardamom_cache"
+path = "src/lib.rs"
+
+[features]
+# `docker-e2e`: the Redis round-trip tests under `tests/`, which start a
+# Redis container through testcontainers. Off by default, so a production
+# build never links the container runner.
+docker-e2e = ["dep:testcontainers"]
+
+[dependencies]
+kardamom-types = { workspace = true }
+alloy-primitives = { workspace = true }
+redis = { workspace = true }
+rkyv = { workspace = true }
+arc-swap = { workspace = true }
+# One writer (the receipt pump) and many readers (the RPC tasks) share the
+# local account map. Many readers + one writer, no lock held across an
+# await: DashMap, the same reason the executor's join buffer uses it.
+dashmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The executor query client (`query`): one JSON-RPC POST per cold address.
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "sync"] }
+testcontainers = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+toml = { workspace = true }

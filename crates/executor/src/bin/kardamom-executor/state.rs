@@ -1,6 +1,8 @@
 //! State backend startup: checkpoint serve/restore, env open, the durable
 //! cursor, the periodic checkpointer task, and the resume decision.
 
+use std::ops::ControlFlow;
+
 use anyhow::{Context, Result};
 use kardamom_engine::ResumePoint;
 use kardamom_state::checkpoint::{create_checkpoint, prune_checkpoints};
@@ -40,34 +42,7 @@ pub(crate) fn prepare_state(
             kardamom_state::serve_checkpoints(addr, ckpt_dir.clone())
                 .context("bind checkpoint serve address")?;
         }
-        // The state dir is fresh only if it has no mdbx data file. Check this
-        // without opening the env: opening would create the data file itself
-        // and defeat the restore.
-        let fresh = !kardamom_state::checkpoint::has_state_db(&args.state_dir)
-            .context("probe state dir")?;
-        if fresh {
-            let restored = kardamom_engine::bin_support::restore_or_fetch_checkpoint(
-                ckpt_dir,
-                &args.state_dir,
-                &args.checkpoint_peers,
-                expected_genesis,
-            )?;
-            match restored {
-                Some((block, path)) => {
-                    tracing::info!(
-                        restored_block = block,
-                        checkpoint = %path.display(),
-                        "restored state from checkpoint; will replay tail from here"
-                    );
-                }
-                None => tracing::info!(
-                    checkpoint_dir = %ckpt_dir.display(),
-                    "no checkpoint available locally or from peers; fresh start will \
-                     replay from genesis (refused if the chain outgrew the cluster \
-                     retention window — then a peer checkpoint or rebuild-from-L1 is required)"
-                ),
-            }
-        }
+        restore_if_fresh(args, ckpt_dir, expected_genesis)?;
     }
 
     // Open the libmdbx state env and read the durable cursor.
@@ -97,52 +72,153 @@ pub(crate) fn prepare_state(
     Ok(PreparedState { env, start })
 }
 
-/// Periodic checkpointing. It gives fast recovery for other nodes, and
-/// for this node after a future wipe. `compact_to` runs against an
-/// online read-only snapshot, so it never blocks the writer. This runs
-/// as a tokio interval task. Each tick runs the mdbx compaction on
-/// `spawn_blocking`, so the transaction stays on one thread for the
-/// whole call. It prunes to `checkpoint_keep`, and stops when
-/// `shutdown` is cancelled. Call this inside a tokio runtime.
-fn spawn_checkpointer(args: &Args, env: &StateEnv, shutdown: CancellationToken) {
-    let (Some(ckpt_dir), true) = (
-        args.checkpoint_dir.clone(),
-        args.checkpoint_interval_secs > 0,
-    ) else {
-        return;
-    };
-    let ckpt_env = env.clone();
-    let interval = std::time::Duration::from_secs(args.checkpoint_interval_secs);
-    let keep = args.checkpoint_keep;
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        // The first tick fires immediately; the old thread slept first.
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = ticker.tick() => {}
-            }
-            let env = ckpt_env.clone();
-            let dir = ckpt_dir.clone();
-            let ran = tokio::task::spawn_blocking(move || checkpoint_once(&env, &dir, keep)).await;
-            if let Err(e) = ran {
-                tracing::warn!(error = %e, "checkpointer task panicked");
-            }
-        }
-    });
+/// Restores from a checkpoint, but only on a fresh state dir. A non-fresh
+/// dir already has a chain to resume, so a restore here would overwrite
+/// it.
+fn restore_if_fresh(
+    args: &Args,
+    ckpt_dir: &std::path::Path,
+    expected_genesis: Option<alloy_primitives::B256>,
+) -> Result<()> {
+    // The state dir is fresh only if it has no mdbx data file. Check this
+    // without opening the env: opening would create the data file itself
+    // and defeat the restore.
+    let fresh =
+        !kardamom_state::checkpoint::has_state_db(&args.state_dir).context("probe state dir")?;
+    if !fresh {
+        return Ok(());
+    }
+    let restored = kardamom_engine::bin_support::restore_or_fetch_checkpoint(
+        ckpt_dir,
+        &args.state_dir,
+        &args.checkpoint_peers,
+        expected_genesis,
+    )?;
+    log_restore_outcome(ckpt_dir, restored);
+    Ok(())
 }
 
-/// One checkpoint + prune round; failures are logged, never fatal.
-fn checkpoint_once(env: &StateEnv, ckpt_dir: &std::path::Path, keep: u64) {
-    match create_checkpoint(env, ckpt_dir) {
-        Ok(info) => {
-            if info.block > keep
-                && let Err(e) = prune_checkpoints(ckpt_dir, info.block - keep + 1)
-            {
-                tracing::warn!(error = %e, "checkpoint prune failed");
-            }
+/// Logs whether the fresh-start restore found a checkpoint to replay from.
+fn log_restore_outcome(ckpt_dir: &std::path::Path, restored: Option<(u64, std::path::PathBuf)>) {
+    let Some((block, path)) = restored else {
+        tracing::info!(
+            checkpoint_dir = %ckpt_dir.display(),
+            "no checkpoint available locally or from peers; fresh start will \
+             replay from genesis (refused if the chain outgrew the cluster \
+             retention window — then a peer checkpoint or rebuild-from-L1 is required)"
+        );
+        return;
+    };
+    tracing::info!(
+        restored_block = block,
+        checkpoint = %path.display(),
+        "restored state from checkpoint; will replay tail from here"
+    );
+}
+
+/// Start periodic checkpointing, if the args ask for it. It gives fast
+/// recovery for other nodes, and for this node after a future wipe. Call
+/// this inside a tokio runtime.
+fn spawn_checkpointer(args: &Args, env: &StateEnv, shutdown: CancellationToken) {
+    let (Some(ckpt_dir), Some(interval_secs)) =
+        (args.checkpoint_dir.clone(), args.checkpoint_interval_secs.0)
+    else {
+        return;
+    };
+    let round = CheckpointRound {
+        env: env.clone(),
+        dir: ckpt_dir,
+        keep: args.checkpoint_keep.get(),
+    };
+    let interval = std::time::Duration::from_secs(interval_secs.get());
+    Checkpointer::new(round, interval, shutdown).spawn();
+}
+
+/// One checkpoint round's fixed inputs: the state env, the checkpoint
+/// directory, and how many past checkpoints to retain. Cloned into each
+/// round's blocking task, so the mdbx transaction stays on one thread for
+/// the whole call.
+#[derive(Clone)]
+struct CheckpointRound {
+    env: StateEnv,
+    dir: std::path::PathBuf,
+    keep: u64,
+}
+
+impl CheckpointRound {
+    /// One checkpoint + prune round; failures are logged, never fatal.
+    fn once(&self) {
+        match create_checkpoint(&self.env, &self.dir) {
+            Ok(info) => self.prune_stale(info.block),
+            Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
         }
-        Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
+    }
+
+    /// Prunes checkpoints that fall outside the retention window behind
+    /// `block`. Does nothing until the chain has produced more than
+    /// `self.keep` checkpoints. Failures are logged, never fatal.
+    fn prune_stale(&self, block: u64) {
+        if block <= self.keep {
+            return;
+        }
+        if let Err(e) = prune_checkpoints(&self.dir, block - self.keep + 1) {
+            tracing::warn!(error = %e, "checkpoint prune failed");
+        }
+    }
+}
+
+/// The periodic checkpoint task's state: the round inputs, the interval
+/// ticker, and the shutdown signal. `compact_to` runs against an online
+/// read-only snapshot, so it never blocks the writer.
+struct Checkpointer {
+    round: CheckpointRound,
+    ticker: tokio::time::Interval,
+    shutdown: CancellationToken,
+}
+
+impl Checkpointer {
+    fn new(
+        round: CheckpointRound,
+        interval: std::time::Duration,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            round,
+            ticker: tokio::time::interval(interval),
+            shutdown,
+        }
+    }
+
+    /// Start the interval task. It stops when `shutdown` is cancelled.
+    fn spawn(self) {
+        tokio::spawn(self.run());
+    }
+
+    /// The interval loop. The first tick fires immediately and is
+    /// skipped.
+    async fn run(mut self) {
+        self.ticker.tick().await;
+        loop {
+            let ControlFlow::Continue(()) = self.tick().await else {
+                return;
+            };
+        }
+    }
+
+    /// Wait for the next checkpoint tick, or the shutdown signal, then
+    /// run one checkpoint round if it was a tick. Returns
+    /// [`ControlFlow::Break`] once `shutdown` fires, so the caller's
+    /// loop stops.
+    async fn tick(&mut self) -> ControlFlow<()> {
+        tokio::select! {
+            () = self.shutdown.cancelled() => return ControlFlow::Break(()),
+            _ = self.ticker.tick() => {}
+        }
+        let round = self.round.clone();
+        let ran = tokio::task::spawn_blocking(move || round.once()).await;
+        if let Err(e) = ran {
+            tracing::warn!(error = %e, "checkpointer task panicked");
+        }
+        ControlFlow::Continue(())
     }
 }

@@ -12,8 +12,8 @@
 //!   [`kardamom_types::ExecutionWitness`] as a `StateDatabase`. It fails
 //!   closed: a read of any key the witness does not carry is an error
 //!   ([`WitnessError`]), never an empty default. An incomplete witness must
-//!   abort a stateless re-execution (and, in phase 3, a proof), not distort
-//!   it.
+//!   abort a stateless re-execution, and a zk proof built over it, not
+//!   distort either.
 //!
 //! Round-trip guarantee, asserted by the validator's stateless re-execution
 //! test: executing the same records over `WitnessDb::from_witness(capture)`
@@ -23,10 +23,11 @@ use alloc::collections::BTreeMap;
 
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
+#[cfg(feature = "std")]
 use kardamom_types::delta::CodeEntry;
-use kardamom_types::{
-    BPosition, ExecutionWitness, Receipt, StateDatabase, StateError, WitnessAccount, WitnessSlot,
-};
+use kardamom_types::{BPosition, ExecutionWitness, Receipt, StateDatabase, StateError};
+#[cfg(feature = "std")]
+use kardamom_types::{WitnessAccount, WitnessSlot};
 use revm::primitives::KECCAK_EMPTY;
 
 /// Error from [`WitnessDb`] when execution reads a key the witness does
@@ -55,6 +56,7 @@ pub struct WitnessDb {
 }
 
 impl WitnessDb {
+    #[must_use]
     pub fn from_witness(w: &ExecutionWitness) -> Self {
         let mut db = Self::default();
         for a in &w.accounts {
@@ -134,6 +136,26 @@ struct Recorded {
 }
 
 #[cfg(feature = "std")]
+impl Recorded {
+    /// First-touch-wins memoization: return the cached value for `key`
+    /// in `map` if present, otherwise fetch it with `f`, cache it, and
+    /// return it. `WitnessRecorder`'s `basic`/`storage`/`code_by_hash`
+    /// share this exact shape.
+    fn memo<K: Ord + Copy, V: Clone, E>(
+        map: &mut BTreeMap<K, V>,
+        key: K,
+        f: impl FnOnce() -> Result<V, E>,
+    ) -> Result<V, E> {
+        if let Some(v) = map.get(&key) {
+            return Ok(v.clone());
+        }
+        let v = f()?;
+        map.insert(key, v.clone());
+        Ok(v)
+    }
+}
+
+#[cfg(feature = "std")]
 impl<S: StateDatabase> WitnessRecorder<S> {
     pub fn new(inner: S) -> Self {
         Self {
@@ -143,6 +165,11 @@ impl<S: StateDatabase> WitnessRecorder<S> {
     }
 
     /// Drain the recording into a canonical [`ExecutionWitness`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner lock is poisoned (a prior writer thread
+    /// panicked while holding it).
     pub fn into_witness(self, block_number: u64) -> ExecutionWitness {
         let rec = self.rec.into_inner().expect("witness recorder poisoned");
         let accounts = rec
@@ -196,12 +223,7 @@ impl<S: StateDatabase> StateDatabase for WitnessRecorder<S> {
 
     fn basic(&self, address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error> {
         let mut g = self.rec.lock().expect("witness recorder poisoned");
-        if let Some(v) = g.accounts.get(&address) {
-            return Ok(*v);
-        }
-        let v = self.inner.basic(address)?;
-        g.accounts.insert(address, v);
-        Ok(v)
+        Recorded::memo(&mut g.accounts, address, || self.inner.basic(address))
     }
 
     fn code_by_hash(&self, code_hash: B256) -> Result<Bytes, Self::Error> {
@@ -211,22 +233,16 @@ impl<S: StateDatabase> StateDatabase for WitnessRecorder<S> {
             return Ok(Bytes::new());
         }
         let mut g = self.rec.lock().expect("witness recorder poisoned");
-        if let Some(c) = g.code.get(&code_hash) {
-            return Ok(c.clone());
-        }
-        let c = self.inner.code_by_hash(code_hash)?;
-        g.code.insert(code_hash, c.clone());
-        Ok(c)
+        Recorded::memo(&mut g.code, code_hash, || {
+            self.inner.code_by_hash(code_hash)
+        })
     }
 
     fn storage(&self, address: Address, key: B256) -> Result<U256, Self::Error> {
         let mut g = self.rec.lock().expect("witness recorder poisoned");
-        if let Some(v) = g.storage.get(&(address, key)) {
-            return Ok(*v);
-        }
-        let v = self.inner.storage(address, key)?;
-        g.storage.insert((address, key), v);
-        Ok(v)
+        Recorded::memo(&mut g.storage, (address, key), || {
+            self.inner.storage(address, key)
+        })
     }
 
     /// Pass through, unrecorded. Receipts are not pre-state.

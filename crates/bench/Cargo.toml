@@ -25,7 +25,7 @@ path = "src/bin/stm-p0.rs"
 
 [[bin]]
 name = "kardamom-stm-p2"
-path = "src/bin/stm-p2.rs"
+path = "src/bin/stm-p2/main.rs"
 
 [[bin]]
 name = "kardamom-perf"
@@ -33,8 +33,10 @@ path = "src/bin/perf.rs"
 
 [dependencies]
 core_affinity = "0.8"
+crossbeam-channel.workspace = true
 kardamom-types.workspace = true
 kardamom-footprint = { path = "../footprint" }
+kardamom-obs = { path = "../obs" }
 kardamom-stm = { path = "../stm" }
 # mdbx-backed A/B: the honest baseline, where a state read costs real work.
 kardamom-state = { path = "../state" }
@@ -73,6 +75,7 @@ kardamom-engine.workspace = true
 [dev-dependencies]
 revm.workspace = true
 kardamom-validator.workspace = true
+alloy-eip7928.workspace = true
 dhat = "0.3"
 kardamom-engine.workspace = true
 kardamom-types.workspace = true

@@ -6,9 +6,20 @@ use kardamom_cluster_adapter::wire::{
 };
 use kardamom_types::TxRef;
 
+/// Format one delivered record as a short tag, for order assertions.
+fn label((pos, msg): (BPosition, TxOrderingMessage)) -> String {
+    match msg {
+        TxOrderingMessage::TxRef(_) => format!("r{}", pos.as_index()),
+        TxOrderingMessage::BoundaryStart(b) => format!("b{}", b.block_number),
+        other => format!("?{other:?}"),
+    }
+}
+
 fn relayed_txref(shard: u8, off: i32) -> Vec<u8> {
     let r = TxRef::new(
-        B256::repeat_byte(off as u8),
+        B256::repeat_byte(
+            u8::try_from(off).expect("test fixture: off is a small non-negative offset"),
+        ),
         shard,
         BPosition {
             term_id: 0,
@@ -28,12 +39,18 @@ fn replay_gap_is_reordered_and_deduped() {
     // r0 r1 b1(end2) r2 r3 b2(end4) r4 r5.
     let egress = FakeEgress::new();
     // Live-ahead: record 5 and boundary 2 arrive before the replay.
-    egress.push(encode_egress_record(5, &relayed_txref(1, 5)));
+    egress.push(encode_egress_record(5, &relayed_txref(1, 5)).unwrap());
     egress.push(encode_egress_boundary(2, 4, 2_000, 0));
     // Replayed frames, in emission order. This includes a duplicate of
     // record 5's predecessor range, and both boundaries.
     for i in 0..5 {
-        egress.push(encode_egress_record(i, &relayed_txref(1, i as i32)));
+        egress.push(
+            encode_egress_record(
+                i,
+                &relayed_txref(1, i32::try_from(i).expect("small test fixture")),
+            )
+            .unwrap(),
+        );
     }
     egress.push(encode_egress_boundary(1, 2, 1_000, 0));
     egress.push(encode_egress_boundary(2, 4, 2_000, 0)); // duplicate boundary
@@ -41,15 +58,7 @@ fn replay_gap_is_reordered_and_deduped() {
     egress.close();
 
     let mut sub = ClusterTxOrderingSubscription::new(egress);
-    let mut got = Vec::new();
-    while let Ok((pos, msg)) = sub.next() {
-        let tag = match msg {
-            TxOrderingMessage::TxRef(_) => format!("r{}", pos.as_index()),
-            TxOrderingMessage::BoundaryStart(b) => format!("b{}", b.block_number),
-            other => format!("?{other:?}"),
-        };
-        got.push(tag);
-    }
+    let got: Vec<String> = std::iter::from_fn(|| sub.next().ok()).map(label).collect();
     assert_eq!(got, vec!["r0", "r1", "b1", "r2", "r3", "b2", "r4", "r5"]);
 }
 
@@ -71,9 +80,9 @@ fn boundary_first_stream_delivers_in_emission_order() {
 #[test]
 fn duplicates_below_cursor_are_skipped() {
     let egress = FakeEgress::new();
-    egress.push(encode_egress_record(0, &relayed_txref(1, 10)));
-    egress.push(encode_egress_record(0, &relayed_txref(1, 10))); // dup
-    egress.push(encode_egress_record(1, &relayed_txref(1, 11)));
+    egress.push(encode_egress_record(0, &relayed_txref(1, 10)).unwrap());
+    egress.push(encode_egress_record(0, &relayed_txref(1, 10)).unwrap()); // dup
+    egress.push(encode_egress_record(1, &relayed_txref(1, 11)).unwrap());
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::new(egress);
     assert_eq!(sub.next().unwrap().0, BPosition::from_index(0));
@@ -103,29 +112,28 @@ fn resume_cursor_skips_already_applied_range() {
     // the cursor are dropped. Delivery starts exactly at the cursor.
     let egress = FakeEgress::new();
     for i in 0..5 {
-        egress.push(encode_egress_record(i, &relayed_txref(1, i as i32)));
+        egress.push(
+            encode_egress_record(
+                i,
+                &relayed_txref(1, i32::try_from(i).expect("small test fixture")),
+            )
+            .unwrap(),
+        );
     }
     egress.push(encode_egress_boundary(1, 2, 1_000, 0)); // below cursor: dup
     egress.push(encode_egress_boundary(2, 5, 2_000, 0));
     egress.push(wire::encode_replay_done(5, 3));
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(3, 2));
-    let mut got = Vec::new();
-    while let Ok((pos, msg)) = sub.next() {
-        got.push(match msg {
-            TxOrderingMessage::TxRef(_) => format!("r{}", pos.as_index()),
-            TxOrderingMessage::BoundaryStart(b) => format!("b{}", b.block_number),
-            other => format!("?{other:?}"),
-        });
-    }
+    let got: Vec<String> = std::iter::from_fn(|| sub.next().ok()).map(label).collect();
     assert_eq!(got, vec!["r3", "r4", "b2"]);
 }
 
 #[test]
 fn yields_records_with_monotonic_bposition() {
     let egress = FakeEgress::new();
-    egress.push(encode_egress_record(0, &relayed_txref(1, 10)));
-    egress.push(encode_egress_record(1, &relayed_txref(2, 20)));
+    egress.push(encode_egress_record(0, &relayed_txref(1, 10)).unwrap());
+    egress.push(encode_egress_record(1, &relayed_txref(2, 20)).unwrap());
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::new(egress);
 
@@ -172,7 +180,7 @@ fn yields_boundary_with_fields_intact() {
 #[test]
 fn late_boundary_sealing_below_cursor_is_fatal() {
     let egress = FakeEgress::new();
-    egress.push(encode_egress_record(2, &relayed_txref(1, 2)));
+    egress.push(encode_egress_record(2, &relayed_txref(1, 2)).unwrap());
     egress.push(encode_egress_boundary(1, 2, 1_000, 0));
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(2, 1));

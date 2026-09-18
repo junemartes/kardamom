@@ -21,6 +21,9 @@
 
 extern crate alloc;
 
+mod abi;
+mod rlp;
+
 pub mod ack_policy;
 pub mod boundary;
 pub mod delta;
@@ -29,10 +32,13 @@ pub mod envelope;
 pub mod epoch;
 pub mod genesis;
 pub mod limits;
+pub mod num;
 pub mod position;
 pub mod prover;
 pub mod receipt;
+pub mod shard_map;
 pub mod state;
+pub mod time;
 pub mod tx_error;
 pub mod tx_ordering;
 pub mod txref;
@@ -55,9 +61,11 @@ pub use prover::{
     BatchProverInput, BatchPublicOutputs, BlockRecordsDigest, ProverInput, ProverRecord,
     PublicOutputs, batch_records_commitment,
 };
+pub use receipt::{AccountRow, ReceiptBatch, ReceiptRows};
 pub use receipt::{
     Receipt, SkipReason, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, TX_TYPE_XCHAIN, WireLog, tx_type_of,
 };
+pub use shard_map::{ShardMap, ShardMapError, vslot_for};
 pub use state::{SnapshotSource, StateDatabase, StateError};
 pub use tx_error::{TxError, TxErrorReason};
 pub use tx_ordering::TxOrderingMessage;

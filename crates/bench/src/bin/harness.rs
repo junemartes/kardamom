@@ -7,16 +7,17 @@
 //! and `mixed` need a full node, and are rejected with a clear error.
 //! See `kardamom_bench::harness` for the mechanism.
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use kardamom_bench::config::{
-    DEFAULT_CONCURRENCY, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TIMEOUT_STR, DEFAULT_TXS_PER_TASK,
-};
+use kardamom_bench::config::BenchArgs;
 use kardamom_bench::harness::Harness;
 use kardamom_bench::{BenchWorkflow, Benchmark, TransfersWorkflow};
+
+/// Default `--chain-id`.
+const DEFAULT_CHAIN_ID: NonZeroU64 = NonZeroU64::new(412_346).unwrap();
 
 #[derive(Parser, Debug)]
 #[command(
@@ -30,28 +31,11 @@ struct Args {
     flame_out: PathBuf,
 
     /// The chain ID for the in-process node.
-    #[arg(long, default_value_t = 412_346)]
-    chain_id: u64,
+    #[arg(long, default_value_t = DEFAULT_CHAIN_ID)]
+    chain_id: NonZeroU64,
 
-    /// A safety timeout for each phase. Warmup and dispatch each get
-    /// their own timeout. A sender also stops when its work vector is
-    /// drained.
-    #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_TIMEOUT_STR)]
-    timeout: Duration,
-
-    /// The number of sender tasks. This equals the number of derived
-    /// signers, one per task.
-    #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
-    concurrency: u32,
-
-    /// The number of pre-signed transactions in the queue of each
-    /// sender task.
-    #[arg(long = "txs-per-task", default_value_t = DEFAULT_TXS_PER_TASK)]
-    txs_per_task: u32,
-
-    /// The limit on outstanding requests for each sender task.
-    #[arg(long = "max-in-flight", default_value_t = DEFAULT_MAX_IN_FLIGHT)]
-    max_in_flight: u32,
+    #[command(flatten)]
+    bench: BenchArgs,
 
     /// Write the bench report as JSON to this path, in addition to stdout.
     #[arg(long)]
@@ -97,10 +81,10 @@ async fn main() -> anyhow::Result<()> {
 async fn harness_with<W: BenchWorkflow>(workflow: W, args: &Args) -> anyhow::Result<()> {
     let bench = Benchmark {
         workflow,
-        timeout: args.timeout,
-        concurrency: args.concurrency,
-        txs_per_task: args.txs_per_task,
-        max_in_flight: args.max_in_flight,
+        timeout: args.bench.timeout,
+        concurrency: args.bench.concurrency,
+        txs_per_task: args.bench.txs_per_task,
+        max_in_flight: args.bench.max_in_flight,
     };
     Harness {
         chain_id: args.chain_id,
@@ -111,4 +95,49 @@ async fn harness_with<W: BenchWorkflow>(workflow: W, args: &Args) -> anyhow::Res
     }
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use kardamom_bench::config::{
+        DEFAULT_CONCURRENCY, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TXS_PER_TASK,
+    };
+
+    use super::*;
+
+    #[test]
+    fn args_parse_with_only_defaults() {
+        let args = Args::parse_from(["kardamom-bench-harness", "transfers"]);
+        assert_eq!(args.flame_out, PathBuf::from("flame.svg"));
+        assert_eq!(args.chain_id, DEFAULT_CHAIN_ID);
+        assert_eq!(args.bench.timeout, Duration::from_secs(10));
+        assert_eq!(args.bench.concurrency, DEFAULT_CONCURRENCY);
+        assert_eq!(args.bench.txs_per_task, DEFAULT_TXS_PER_TASK);
+        assert_eq!(args.bench.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
+        assert!(args.report_json.is_none());
+        assert!(args.pprof_out.is_none());
+        assert!(matches!(args.workload, WorkloadCmd::Transfers));
+    }
+
+    #[test]
+    fn args_parse_overrides_every_bench_flag() {
+        let args = Args::parse_from([
+            "kardamom-bench-harness",
+            "--concurrency",
+            "4",
+            "--txs-per-task",
+            "9",
+            "--max-in-flight",
+            "3",
+            "--timeout",
+            "5s",
+            "transfers",
+        ]);
+        assert_eq!(args.bench.timeout, Duration::from_secs(5));
+        assert_eq!(args.bench.concurrency.get(), 4);
+        assert_eq!(args.bench.txs_per_task.get(), 9);
+        assert_eq!(args.bench.max_in_flight, 3);
+    }
 }

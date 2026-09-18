@@ -27,8 +27,15 @@ pub enum IngressError {
          once the nonce is within the reorder window"
     )]
     Evicted((Address, u64)),
+    #[error(
+        "expired: the sequencer dropped (sender, nonce) {0:?} after it waited on a \
+         nonce gap for tx_ttl — resubmit once the gap fills"
+    )]
+    Expired((Address, u64)),
     #[error("ingress overloaded: {0} submissions pending — retry with backoff")]
     Overloaded(usize),
+    #[error("ingress draining for shutdown — retry on another replica")]
+    Draining,
     #[error(
         "transaction gas limit {0} exceeds the EIP-7825 per-tx cap of \
          {cap} — the tx can never execute",
@@ -39,13 +46,42 @@ pub enum IngressError {
         "unsupported transaction type {0:#04x}: blob (EIP-4844) transactions are not supported"
     )]
     UnsupportedTxType(u8),
+    /// The sender's latest known balance does not cover
+    /// `gas_limit * max_fee_per_gas + value`. geth's message shape, so a
+    /// wallet handles it as on L1.
+    #[error(
+        "insufficient funds for gas * price + value: address {address} have {have} want {want}"
+    )]
+    InsufficientFunds {
+        address: Address,
+        have: alloy_primitives::U256,
+        want: alloy_primitives::U256,
+    },
+    /// No read layer could answer an account query: the local layer
+    /// missed and no executor query is configured, or every endpoint
+    /// failed.
+    #[error("account state unavailable: {0}")]
+    StateUnavailable(String),
+}
+
+impl IngressError {
+    /// Builds an `Internal` error from a context label and the
+    /// underlying error's `Display`. The many `.map_err(|e|
+    /// IngressError::Internal(format!("...: {e}")))` call sites across
+    /// this crate, wrapping a bind, open, or merge failure, share this
+    /// one format.
+    pub(crate) fn internal(ctx: impl std::fmt::Display, e: impl std::fmt::Display) -> Self {
+        Self::Internal(format!("{ctx}: {e}"))
+    }
 }
 
 impl From<IngressError> for ErrorObjectOwned {
     fn from(err: IngressError) -> Self {
         let code = match &err {
             // Limit exceeded, a server-specific and retryable overload class.
-            IngressError::RateLimited(_) | IngressError::Overloaded(_) => -32005,
+            IngressError::RateLimited(_) | IngressError::Overloaded(_) | IngressError::Draining => {
+                -32005
+            }
             // Invalid params.
             IngressError::Decode(_)
             | IngressError::SignatureInvalid
@@ -53,10 +89,14 @@ impl From<IngressError> for ErrorObjectOwned {
             | IngressError::GasLimitExceedsCap(_)
             | IngressError::UnsupportedTxType(_) => -32602,
             // Generic server error. Evicted is retryable once the sender's
-            // nonce is back within the reorder window.
+            // nonce is back within the reorder window. Expired is
+            // retryable once the nonce gap fills.
             IngressError::PartitionUnavailable(_)
             | IngressError::Timeout
-            | IngressError::Evicted(_) => -32000,
+            | IngressError::Evicted(_)
+            | IngressError::Expired(_)
+            | IngressError::InsufficientFunds { .. }
+            | IngressError::StateUnavailable(_) => -32000,
             // Internal error.
             IngressError::Internal(_) => -32603,
         };
@@ -85,6 +125,24 @@ mod tests {
     fn timeout_maps_to_server_error() {
         let rpc: ErrorObjectOwned = IngressError::Timeout.into();
         assert_eq!(rpc.code(), -32000);
+    }
+
+    #[test]
+    fn insufficient_funds_maps_to_server_error_in_geth_shape() {
+        let rpc: ErrorObjectOwned = IngressError::InsufficientFunds {
+            address: Address::repeat_byte(0x11),
+            have: alloy_primitives::U256::from(5u64),
+            want: alloy_primitives::U256::from(9u64),
+        }
+        .into();
+        assert_eq!(rpc.code(), -32000);
+        assert!(
+            rpc.message()
+                .starts_with("insufficient funds for gas * price + value"),
+            "{}",
+            rpc.message()
+        );
+        assert!(rpc.message().contains("have 5 want 9"), "{}", rpc.message());
     }
 
     #[test]

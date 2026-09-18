@@ -1,6 +1,8 @@
 //! Build `DeploymentSpec` values for `KardamomFactoryV1.applyDeployments`.
 
-use alloy_primitives::{Address, B256, Bytes};
+use std::num::NonZeroU64;
+
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::SolValue;
 
 use crate::ids::ContractId;
@@ -48,15 +50,13 @@ pub enum Op {
 impl Op {
     pub fn l2_chain_id(&self) -> u64 {
         match self {
-            Op::Deploy { l2_chain_id, .. } => *l2_chain_id,
-            Op::Upgrade { l2_chain_id, .. } => *l2_chain_id,
+            Op::Deploy { l2_chain_id, .. } | Op::Upgrade { l2_chain_id, .. } => *l2_chain_id,
         }
     }
 
     pub fn id(&self) -> ContractId {
         match self {
-            Op::Deploy { id, .. } => *id,
-            Op::Upgrade { id, .. } => *id,
+            Op::Deploy { id, .. } | Op::Upgrade { id, .. } => *id,
         }
     }
 
@@ -114,6 +114,7 @@ pub fn encode_init_calldata(id: ContractId, abi_encoded_args: &Bytes) -> Bytes {
 }
 
 /// Abi-encode a single address argument for `initialize(address)`.
+#[must_use]
 pub fn encode_address_arg(addr: Address) -> Bytes {
     let v = (addr,).abi_encode();
     Bytes::from(v)
@@ -121,41 +122,53 @@ pub fn encode_address_arg(addr: Address) -> Bytes {
 
 /// Abi-encode two address arguments, for example
 /// `ETHLockbox.initialize(l2Minter, outputOracle)`.
+#[must_use]
 pub fn encode_address_pair(a: Address, b: Address) -> Bytes {
     Bytes::from((a, b).abi_encode_params())
 }
 
 /// Abi-encode `WithdrawalOutputOracle.initialize(attester, challenger, window)`.
+#[must_use]
 pub fn encode_oracle_init_args(attester: Address, challenger: Address, window: u64) -> Bytes {
     Bytes::from((attester, challenger, window).abi_encode_params())
 }
 
-/// Build init args for the v2
-/// `KardamomProofOracle.initialize(address,address,bytes32,bytes32,bytes32,uint64,uint96)`.
-/// It takes two vkeys: a batch guest for validity mode, and a single-block
-/// guest for disputes. It also takes the challenge window and the bond.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_proof_oracle_init_args(
-    settlement: Address,
-    verifier: Address,
-    batch_vkey: alloy_primitives::B256,
-    block_vkey: alloy_primitives::B256,
-    genesis_root: alloy_primitives::B256,
-    challenge_window_secs: u64,
-    min_bond_wei: alloy_primitives::U256,
-) -> Bytes {
-    Bytes::from(
-        (
-            settlement,
-            verifier,
-            batch_vkey,
-            block_vkey,
-            genesis_root,
-            challenge_window_secs,
-            min_bond_wei,
+/// Arguments for [`encode_proof_oracle_init_args`]: the v2
+/// `KardamomProofOracle.initialize` call. `batch_vkey` is the batch guest,
+/// for validity mode; `block_vkey` is the single-block guest, for disputes.
+#[derive(Debug, Clone, Copy)]
+pub struct ProofOracleInit {
+    pub settlement: Address,
+    pub verifier: Address,
+    pub batch_vkey: B256,
+    pub block_vkey: B256,
+    pub genesis_root: B256,
+    /// The optimistic dispute period. `KardamomProofOracle.initialize`
+    /// does not reject 0 itself, and a zero window means a claim
+    /// finalizes at once with no dispute period at all — nonzero at the
+    /// type level so this crate cannot deploy that by accident.
+    pub challenge_window_secs: NonZeroU64,
+    pub min_bond_wei: U256,
+}
+
+impl ProofOracleInit {
+    /// Encode init args for the v2
+    /// `KardamomProofOracle.initialize(address,address,bytes32,bytes32,bytes32,uint64,uint96)`.
+    #[must_use]
+    pub fn encode(self) -> Bytes {
+        Bytes::from(
+            (
+                self.settlement,
+                self.verifier,
+                self.batch_vkey,
+                self.block_vkey,
+                self.genesis_root,
+                self.challenge_window_secs.get(),
+                self.min_bond_wei,
+            )
+                .abi_encode_params(),
         )
-            .abi_encode_params(),
-    )
+    }
 }
 
 #[cfg(test)]

@@ -25,7 +25,7 @@ fn build_db(dir: &std::path::Path) {
     for block in 1..=2u64 {
         let receipt = Receipt {
             tx_idx: BPosition::from_index(block),
-            tx_hash: B256::from(U256::from(0xBEEF00 + block)),
+            tx_hash: B256::from(U256::from(0x00BE_EF00 + block)),
             status: true,
             gas_used: 21_000,
             write_set_hash: B256::from(U256::from(7u64)),

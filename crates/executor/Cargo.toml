@@ -3,7 +3,6 @@ name = "kardamom-executor"
 version.workspace = true
 edition.workspace = true
 
-
 [dependencies]
 rkyv.workspace = true
 alloy-eip7928.workspace = true
@@ -11,7 +10,7 @@ alloy-rlp.workspace = true
 # Execution core (reader/join topology, revm execution, delta accumulation,
 # reader→exec→commit orchestration) lives in the shared engine crate.
 kardamom-engine = { workspace = true }
-# : shared types live in kardamom-types.
+# Shared types live in kardamom-types.
 kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
 # Cluster (Raft) transport adapter (`reader::cluster`). tx_ordering ALWAYS comes
@@ -20,7 +19,7 @@ kardamom-cluster-adapter = { path = "../cluster-adapter" }
 kardamom-obs = { path = "../obs" }
 # libmdbx-backed production state backend (StateWriter + snapshot-swap channel).
 kardamom-state = { path = "../state" }
-# Block-STM engine for --parallel-execution (scheduler unification B2).
+# Block-STM engine for --parallel-execution.
 kardamom-stm = { path = "../stm" }
 kardamom-footprint = { path = "../footprint" }
 revm.workspace = true
@@ -46,10 +45,14 @@ name = "kardamom-executor"
 path = "src/bin/kardamom-executor/main.rs"
 
 [dev-dependencies]
-# : hermetic unit tests use kardamom-log's in-memory fakes.
+# Hermetic unit tests use kardamom-log's in-memory fakes.
 # Real-Aeron e2e tests pull `docker-e2e` to bring in the testcontainers harness.
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
+# Exposes `actor::fixtures` (LegacyTx, TestWiring, ChannelHarness): the
+# signed-legacy-tx builder and the channel-backed engine harness every
+# in-process test and bench in this crate shares.
+kardamom-engine = { workspace = true, features = ["test-support"] }
 alloy-signer-local.workspace = true
 alloy-network.workspace = true
 alloy-eips.workspace = true
@@ -57,7 +60,7 @@ tempfile = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
 rand = "0.9"
 rand_chacha = "0.9"
-reqwest = { workspace = true }
+kardamom-obs = { path = "../obs", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [[bench]]

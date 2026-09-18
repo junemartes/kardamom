@@ -7,20 +7,29 @@
 //! expected nonce, waiting to drain as a contiguous run once the gap fills.
 //! The lowest buffered nonces are closest to `expected`, and most likely to
 //! become drainable soon. The highest are furthest away. Evicting the
-//! smallest nonce (the old behavior) punches a gap directly in front of the
-//! run. This wedges the sender permanently: every later nonce stays
-//! "future" forever, with no recovery path. Dropping the furthest-future
-//! nonce instead never breaks the low run. The dropped transaction is a
+//! smallest nonce would punch a gap directly in front of the run, and
+//! wedge the sender permanently: every later nonce would stay "future"
+//! forever, with no recovery path. Dropping the furthest-future nonce
+//! instead never breaks the low run. The dropped transaction is a
 //! far-future nonce that the client resubmits long before it is needed. So
 //! overflow degrades to transient shedding, not a permanent wedge.
 //!
 //! `drain_consecutive_from(start)` walks ascending keys, and yields the
 //! contiguous run that starts at `start`. The first gap stops the drain.
+//!
+//! Every fresh entry carries a deadline. An entry that waits on a nonce
+//! gap past its deadline expires. [`crate::state::PartitionState`] owns
+//! the deadline heap and the sweep. This buffer only stores the deadline,
+//! so the sweep can tell a live deadline from a stale one. See
+//! `docs/specs/dynamic-sequencer-sizing.md`, section 3.3.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+use std::num::NonZeroUsize;
+use std::time::Instant;
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum InsertOutcome {
+pub(crate) enum InsertOutcome {
     Inserted,
     Replaced,
     /// The buffer was full. The furthest-future buffered nonce
@@ -39,69 +48,86 @@ pub enum InsertOutcome {
     DroppedBufferDisabled,
 }
 
+/// One buffered entry. `deadline` is `Some` for a fresh future-nonce
+/// entry, and `None` for a rebuffered one. See [`PendingBuffer::reinsert`].
 #[derive(Debug)]
-pub struct PendingBuffer<T> {
-    capacity: usize,
-    inner: BTreeMap<u64, T>,
+struct Slot<T> {
+    deadline: Option<Instant>,
+    value: T,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingBuffer<T> {
+    /// `None` means the buffer is disabled (every insert is rejected as
+    /// [`InsertOutcome::DroppedBufferDisabled`]): a meaningful, valid
+    /// setting, not an error, so it is `Option<NonZeroUsize>` rather than
+    /// a `usize` with a `0` sentinel checked at each call site.
+    capacity: Option<NonZeroUsize>,
+    inner: BTreeMap<u64, Slot<T>>,
 }
 
 impl<T> PendingBuffer<T> {
-    pub fn new(capacity: usize) -> Self {
+    /// `capacity == 0` disables the buffer.
+    #[must_use]
+    pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            capacity,
+            capacity: NonZeroUsize::new(capacity),
             inner: BTreeMap::new(),
         }
     }
 
-    pub fn len(&self) -> usize {
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
         self.inner.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    pub fn contains(&self, nonce: u64) -> bool {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn contains(&self, nonce: u64) -> bool {
         self.inner.contains_key(&nonce)
     }
 
-    /// Lowest buffered nonce, if any.
-    pub fn lowest_nonce(&self) -> Option<u64> {
-        self.inner.keys().next().copied()
-    }
-
-    pub fn insert(&mut self, nonce: u64, value: T) -> InsertOutcome {
-        if self.capacity == 0 {
+    /// Buffer a fresh future-nonce entry. The entry expires at `deadline`
+    /// unless the gap below it fills first. An insert at an existing
+    /// nonce replaces the value and the deadline.
+    pub(crate) fn insert(&mut self, nonce: u64, value: T, deadline: Instant) -> InsertOutcome {
+        let Some(capacity) = self.capacity else {
             return InsertOutcome::DroppedBufferDisabled;
-        }
-        // Pre-compute these values. Then the match arms below do not need
-        // to re-borrow `self.inner` after taking an entry handle.
-        let already_present = self.inner.contains_key(&nonce);
-        let at_capacity = !already_present && self.inner.len() >= self.capacity;
-        if already_present {
-            self.inner.insert(nonce, value);
-            return InsertOutcome::Replaced;
-        }
-        if at_capacity {
+        };
+        let slot = Slot {
+            deadline: Some(deadline),
+            value,
+        };
+        // `Some(max)` means `nonce` is not already buffered, the buffer
+        // is full, and `max` is its highest buffered nonce: the capacity
+        // check itself yields the key it proves exists, so there is no
+        // second, fallible lookup.
+        let full_max = (!self.inner.contains_key(&nonce) && self.inner.len() >= capacity.get())
+            .then(|| self.inner.keys().next_back().copied())
+            .flatten();
+        if let Some(max) = full_max {
             // The buffer is full. Keep the lowest `capacity` nonces (the
             // drainable run). The furthest-future nonce loses: either an
             // already-buffered max, or this incoming nonce if it is the
             // new max.
-            let max = *self
-                .inner
-                .keys()
-                .next_back()
-                .expect("non-empty since len >= capacity >= 1");
             if nonce > max {
                 // The incoming nonce is the furthest future. Reject it, and keep the run.
                 return InsertOutcome::RejectedTooFar { nonce };
             }
             self.inner.remove(&max);
-            self.inner.insert(nonce, value);
+            self.inner.insert(nonce, slot);
             return InsertOutcome::EvictedFuture { evicted_nonce: max };
         }
-        self.inner.insert(nonce, value);
-        InsertOutcome::Inserted
+        match self.inner.entry(nonce) {
+            Entry::Occupied(mut e) => {
+                e.insert(slot);
+                InsertOutcome::Replaced
+            }
+            Entry::Vacant(e) => {
+                e.insert(slot);
+                InsertOutcome::Inserted
+            }
+        }
     }
 
     /// Insert without capacity enforcement, even for a disabled, capacity-0
@@ -114,8 +140,32 @@ impl<T> PendingBuffer<T> {
     /// the data loss the rebuffer exists to prevent. Any overshoot is
     /// transient and bounded to one drained batch; the next successful
     /// flush drains it back out.
-    pub fn reinsert(&mut self, nonce: u64, value: T) {
-        self.inner.insert(nonce, value);
+    ///
+    /// A rebuffered entry has no deadline. It does not wait on a nonce
+    /// gap. It waits on the publisher, and it lives until the publisher
+    /// recovers. A stale deadline from its earlier life as a future-nonce
+    /// entry no longer matches, so [`Self::expire`] ignores it.
+    pub(crate) fn reinsert(&mut self, nonce: u64, value: T) {
+        self.inner.insert(
+            nonce,
+            Slot {
+                deadline: None,
+                value,
+            },
+        );
+    }
+
+    /// Remove and return the entry at `nonce`, but only if it still
+    /// carries `deadline`. The expiry sweep calls this with the deadline it
+    /// popped from its heap. A mismatch means the entry was replaced,
+    /// rebuffered, drained, or dropped since. Then the popped deadline is
+    /// stale, and nothing happens.
+    pub(crate) fn expire(&mut self, nonce: u64, deadline: Instant) -> Option<T> {
+        let live = self
+            .inner
+            .get(&nonce)
+            .is_some_and(|slot| slot.deadline == Some(deadline));
+        live.then(|| self.remove(nonce)).flatten()
     }
 
     /// Drop every buffered entry with a nonce below `floor`. Returns how
@@ -124,7 +174,7 @@ impl<T> PendingBuffer<T> {
     /// below an executed-truth floor are proven duplicates of already
     /// executed transactions, so dropping them can never create a
     /// canonical gap.
-    pub fn drop_below(&mut self, floor: u64) -> usize {
+    pub(crate) fn drop_below(&mut self, floor: u64) -> usize {
         let keep = self.inner.split_off(&floor);
         let dropped = self.inner.len();
         self.inner = keep;
@@ -133,7 +183,7 @@ impl<T> PendingBuffer<T> {
 
     /// Drain the contiguous run of nonces starting at `start`. Stops at the
     /// first gap. Returned items are removed from the buffer.
-    pub fn drain_consecutive_from(&mut self, start: u64) -> DrainConsecutive<'_, T> {
+    pub(crate) fn drain_consecutive_from(&mut self, start: u64) -> DrainConsecutive<'_, T> {
         DrainConsecutive {
             buf: self,
             next: start,
@@ -141,12 +191,12 @@ impl<T> PendingBuffer<T> {
     }
 
     /// Remove and return the value at `nonce` if present.
-    pub fn remove(&mut self, nonce: u64) -> Option<T> {
-        self.inner.remove(&nonce)
+    pub(crate) fn remove(&mut self, nonce: u64) -> Option<T> {
+        self.inner.remove(&nonce).map(|slot| slot.value)
     }
 }
 
-pub struct DrainConsecutive<'a, T> {
+pub(crate) struct DrainConsecutive<'a, T> {
     buf: &'a mut PendingBuffer<T>,
     next: u64,
 }
@@ -154,29 +204,36 @@ pub struct DrainConsecutive<'a, T> {
 impl<T> Iterator for DrainConsecutive<'_, T> {
     type Item = (u64, T);
     fn next(&mut self) -> Option<Self::Item> {
-        let v = self.buf.inner.remove(&self.next)?;
+        let slot = self.buf.inner.remove(&self.next)?;
         let n = self.next;
         self.next = self.next.checked_add(1)?;
-        Some((n, v))
+        Some((n, slot.value))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// A deadline far in the future. These tests cover the buffer
+    /// mechanics; the expiry tests live with `PartitionState`.
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(3600)
+    }
 
     #[test]
     fn insert_under_capacity() {
         let mut b: PendingBuffer<u32> = PendingBuffer::new(4);
-        assert!(matches!(b.insert(10, 1), InsertOutcome::Inserted));
+        assert!(matches!(b.insert(10, 1, far()), InsertOutcome::Inserted));
         assert_eq!(b.len(), 1);
     }
 
     #[test]
     fn insert_existing_replaces() {
         let mut b: PendingBuffer<u32> = PendingBuffer::new(4);
-        assert!(matches!(b.insert(10, 1), InsertOutcome::Inserted));
-        assert!(matches!(b.insert(10, 2), InsertOutcome::Replaced));
+        assert!(matches!(b.insert(10, 1, far()), InsertOutcome::Inserted));
+        assert!(matches!(b.insert(10, 2, far()), InsertOutcome::Replaced));
         assert_eq!(b.len(), 1);
     }
 
@@ -185,9 +242,9 @@ mod tests {
         // Buffer holds {10,11}. Incoming 12 is the furthest future value,
         // so it is rejected. The low run {10,11} stays intact.
         let mut b: PendingBuffer<u32> = PendingBuffer::new(2);
-        assert!(matches!(b.insert(10, 1), InsertOutcome::Inserted));
-        assert!(matches!(b.insert(11, 2), InsertOutcome::Inserted));
-        let r = b.insert(12, 3);
+        assert!(matches!(b.insert(10, 1, far()), InsertOutcome::Inserted));
+        assert!(matches!(b.insert(11, 2, far()), InsertOutcome::Inserted));
+        let r = b.insert(12, 3, far());
         assert!(
             matches!(r, InsertOutcome::RejectedTooFar { nonce: 12 }),
             "got {r:?}"
@@ -203,9 +260,9 @@ mod tests {
         // drop 12 and keep {10,11}. Lowest-wins tightens the drainable run
         // toward `expected`.
         let mut b: PendingBuffer<u32> = PendingBuffer::new(2);
-        assert!(matches!(b.insert(10, 1), InsertOutcome::Inserted));
-        assert!(matches!(b.insert(12, 2), InsertOutcome::Inserted));
-        let r = b.insert(11, 3);
+        assert!(matches!(b.insert(10, 1, far()), InsertOutcome::Inserted));
+        assert!(matches!(b.insert(12, 2, far()), InsertOutcome::Inserted));
+        let r = b.insert(11, 3, far());
         assert!(
             matches!(r, InsertOutcome::EvictedFuture { evicted_nonce: 12 }),
             "got {r:?}"
@@ -226,13 +283,16 @@ mod tests {
         let cap = 4;
         let mut b: PendingBuffer<u32> = PendingBuffer::new(cap);
         // Buffer the run just above expected first...
-        for n in 10..10 + cap as u64 {
-            assert!(matches!(b.insert(n, n as u32), InsertOutcome::Inserted));
+        for n in 10..10 + u64::try_from(cap).unwrap() {
+            assert!(matches!(
+                b.insert(n, u32::try_from(n).unwrap(), far()),
+                InsertOutcome::Inserted
+            ));
         }
         // Then flood higher nonces. Every one is rejected, and the run is untouched.
         for n in 100..120u64 {
             assert!(matches!(
-                b.insert(n, n as u32),
+                b.insert(n, u32::try_from(n).unwrap(), far()),
                 InsertOutcome::RejectedTooFar { .. }
             ));
         }
@@ -244,9 +304,9 @@ mod tests {
     #[test]
     fn drain_yields_only_consecutive_run() {
         let mut b: PendingBuffer<u32> = PendingBuffer::new(8);
-        b.insert(5, 50);
-        b.insert(6, 60);
-        b.insert(8, 80); // gap at 7
+        b.insert(5, 50, far());
+        b.insert(6, 60, far());
+        b.insert(8, 80, far()); // gap at 7
         let drained: Vec<_> = b.drain_consecutive_from(5).collect();
         assert_eq!(drained, vec![(5, 50), (6, 60)]);
         assert!(b.contains(8));
@@ -256,17 +316,29 @@ mod tests {
     #[test]
     fn drain_empty_when_first_missing() {
         let mut b: PendingBuffer<u32> = PendingBuffer::new(4);
-        b.insert(5, 50);
+        b.insert(5, 50, far());
         let drained: Vec<_> = b.drain_consecutive_from(3).collect();
         assert!(drained.is_empty());
         assert_eq!(b.len(), 1);
     }
 
     #[test]
+    fn expire_removes_only_a_live_deadline() {
+        let mut b: PendingBuffer<u32> = PendingBuffer::new(4);
+        let d = far();
+        b.insert(10, 1, d);
+        assert_eq!(b.expire(10, far()), None, "a stale deadline is ignored");
+        assert_eq!(b.expire(10, d), Some(1));
+        b.reinsert(11, 2);
+        assert_eq!(b.expire(11, d), None, "a rebuffered entry never expires");
+        assert!(b.contains(11));
+    }
+
+    #[test]
     fn zero_capacity_disabled() {
         let mut b: PendingBuffer<u32> = PendingBuffer::new(0);
         assert!(matches!(
-            b.insert(10, 1),
+            b.insert(10, 1, far()),
             InsertOutcome::DroppedBufferDisabled
         ));
         assert_eq!(b.len(), 0);

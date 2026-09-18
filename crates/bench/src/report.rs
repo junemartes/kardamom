@@ -120,9 +120,10 @@ pub fn build_report(
 
     let measured_completions: u64 = methods.iter().map(|m| m.samples).sum();
     let measurement_secs = measurement_duration.as_secs_f64();
-    // This ratio is for display only. Precision loss above 2^53 completions
-    // does not matter for a wall-clock-bounded bench.
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "display-only ratio; precision loss above 2^53 completions does not matter for a wall-clock-bounded bench"
+    )]
     let throughput_rps = if measurement_secs > 0.0 {
         measured_completions as f64 / measurement_secs
     } else {
@@ -175,6 +176,24 @@ pub fn print_terminal(report: &BenchReport) {
     }
 }
 
+/// Serialize `v` as pretty JSON to `path`. This creates parent
+/// directories as needed.
+///
+/// # Errors
+///
+/// Returns an error if the code cannot create the parent directory,
+/// if JSON serialization fails, or if the write fails.
+pub fn write_json_pretty<T: serde::Serialize>(path: &Path, v: &T) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(v)?;
+    fs::write(path, text)?;
+    Ok(())
+}
+
 /// Serialize `report` as pretty JSON to `path`. This creates parent
 /// directories as needed.
 ///
@@ -183,20 +202,13 @@ pub fn print_terminal(report: &BenchReport) {
 /// Returns an error if the code cannot create the parent directory,
 /// if JSON serialization fails, or if the write fails.
 pub fn write_json(path: &Path, report: &BenchReport) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let text = serde_json::to_string_pretty(report)?;
-    fs::write(path, text)?;
-    Ok(())
+    write_json_pretty(path, report)
 }
 
-// This formatting is for display only. `u64` to `f64` precision loss
-// above 2^53 microseconds, about 285 years, does not matter for
-// latency samples.
-#[allow(clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display-only; precision loss above 2^53 microseconds (about 285 years) does not matter for latency samples"
+)]
 fn fmt_us(us: u64) -> String {
     if us >= 1_000_000 {
         format!("{:.1}s", us as f64 / 1_000_000.0)

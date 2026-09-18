@@ -4,10 +4,8 @@
 //! A record reaches egress only after the leader's replicated state machine
 //! processes it. This only happens once a Raft quorum commits the record. So
 //! a relayed record (or a boundary) on egress is a quorum-durability signal:
-//! the durable canonical count is the highest value seen so far. This
-//! replaces the old standalone sealer's archive-recording-position
-//! watermark. The message it sends to ingress is unchanged: a monotonic
-//! count.
+//! the durable canonical count is the highest value seen so far. The
+//! message it sends to ingress is a monotonic count.
 
 /// Monotonic durable-count watermark.
 #[derive(Debug, Clone, Default)]
@@ -16,6 +14,7 @@ pub struct ClusterWatermark {
 }
 
 impl ClusterWatermark {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -23,7 +22,9 @@ impl ClusterWatermark {
     /// Observe a relayed record's 0-based `index`. A record at index `i` means
     /// `i + 1` canonical records are now durable.
     pub fn observe_record(&mut self, index: u64) -> u64 {
-        self.durable_count = self.durable_count.max(index + 1);
+        // `index` is decoded wire data (`ingress/src/cluster.rs`); use
+        // `saturating_add` rather than a plain `+ 1` that could wrap.
+        self.durable_count = self.durable_count.max(index.saturating_add(1));
         self.durable_count
     }
 
@@ -34,6 +35,7 @@ impl ClusterWatermark {
     }
 
     /// Current durable canonical count (never regresses).
+    #[must_use]
     pub fn position(&self) -> u64 {
         self.durable_count
     }

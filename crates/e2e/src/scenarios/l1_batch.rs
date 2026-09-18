@@ -27,6 +27,11 @@ use crate::harness::metrics::poll_until;
 /// a few blocks. A value of 60 tolerates a slow L1 round trip under CI load.
 const COVERAGE_SLACK_BLOCKS: f64 = 60.0;
 
+/// # Errors
+/// Returns an error when the L1 RPC connection fails, when
+/// `lastBatchIndex` does not advance by 2 within 120s, when the posted
+/// batch history is not dense or has a gap, overlap, or empty blob set,
+/// or when L1 coverage lags the executor's head beyond the slack budget.
 pub async fn l1_batch(t: &Target, l1_rpc: &str, settlement: Address) -> Result<()> {
     let provider = ProviderBuilder::new()
         .connect(l1_rpc)
@@ -52,7 +57,13 @@ pub async fn l1_batch(t: &Target, l1_rpc: &str, settlement: Address) -> Result<(
                 .call()
                 .await
                 .context("poll lastBatchIndex")?;
-            Ok((v >= start + 2).then_some(v))
+            // `start` comes from the L1 contract read above; a bad or
+            // adversarial value must fail loudly, not silently wrap the
+            // comparison bound.
+            let threshold = start
+                .checked_add(2)
+                .context("lastBatchIndex start overflows")?;
+            Ok((v >= threshold).then_some(v))
         },
     )
     .await?;
@@ -94,14 +105,26 @@ pub async fn l1_batch(t: &Target, l1_rpc: &str, settlement: Address) -> Result<(
             "batch {} carries no blobs",
             d.index
         );
-        expect_start = d.l2_block_end + 1;
+        expect_start = d
+            .l2_block_end
+            .checked_add(1)
+            .with_context(|| format!("batch {} l2_block_end overflows", d.index))?;
     }
-    let covered = posted.last().map(|d| d.l2_block_end).unwrap_or(0);
+    let covered = posted
+        .last()
+        .with_context(|| format!("no BatchPosted events although lastBatchIndex={last}"))?
+        .l2_block_end;
 
     // 3. Coverage tracks the executed head.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "covered is an L2 block count, always small enough for f64 to represent \
+                   exactly"
+    )]
+    let covered_f64 = covered as f64;
     let exec_block = t.executor_metric(super::EXEC_BLOCK_NUMBER).await?;
     ensure!(
-        covered as f64 >= exec_block - COVERAGE_SLACK_BLOCKS,
+        covered_f64 >= exec_block - COVERAGE_SLACK_BLOCKS,
         "L1 coverage lags: covered through block {covered} but the executor is at {exec_block}"
     );
 

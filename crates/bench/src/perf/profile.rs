@@ -1,10 +1,10 @@
 //! This module attaches async-profiler to the sealer's JVM.
 //!
 //! The sealer runs as a Java Aeron Cluster node, inside an inner Docker
-//! container run by the Nomad docker driver, inside the DinD node
+//! container run by the Nomad docker driver, inside the `DinD` node
 //! container. So every interaction is a two-level `docker exec` and
 //! `docker cp` chain. Profiling uses itimer mode: it samples on-CPU
-//! time from a signal timer, and needs neither perf_events, which is
+//! time from a signal timer, and needs neither `perf_events`, which is
 //! unavailable in the nested containers, nor kernel symbols.
 
 use std::path::Path;
@@ -44,6 +44,11 @@ fn fetch_tarball(cache_dir: &Path) -> anyhow::Result<std::path::PathBuf> {
 
 /// Copy async-profiler into the sealer's inner `cluster-*` container.
 /// This is idempotent: re-staging over an existing copy is fine.
+///
+/// # Errors
+///
+/// Returns an error if downloading or extracting the profiler archive
+/// fails, or if `docker cp` into the container fails.
 pub fn stage(node: &str, cache_dir: &Path) -> anyhow::Result<()> {
     let tgz = fetch_tarball(cache_dir)?;
     sh(
@@ -65,56 +70,81 @@ docker exec "$cid" sh -c 'cd /tmp && tar xzf ap.tgz'"#,
     Ok(())
 }
 
+/// The node, async-profiler directory name, and output directory one
+/// [`run`] call's asprof passes share.
+struct AsprofPass<'a> {
+    node: &'a str,
+    ap: &'a str,
+    out_dir: &'a Path,
+}
+
+impl AsprofPass<'_> {
+    /// Run one asprof pass in the inner `cluster-*` container, then
+    /// copy the artifact it wrote at `remote` out to
+    /// `out_dir.join(out_name)`. `flags` is asprof's own argument
+    /// list, for example `-d 30 -e itimer -f /tmp/perf.html`; `remote`
+    /// is the absolute path asprof writes inside the inner container,
+    /// which is also where this reads it back from after the
+    /// inner-to-outer `docker cp`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the profiler cannot attach inside the
+    /// container, or if either `docker cp` fails.
+    fn run(&self, flags: &str, remote: &str, out_name: &str) -> anyhow::Result<()> {
+        let Self { node, ap, out_dir } = self;
+        docker_exec(
+            node,
+            &format!(
+                r#"cid=$(docker ps -q --filter name=cluster | head -1)
+pid=$(docker exec "$cid" sh -c 'pgrep -f java | head -1')
+docker exec "$cid" /tmp/{ap}/bin/asprof {flags} "$pid"
+docker cp "$cid":{remote} {remote}"#
+            ),
+        )
+        .with_context(|| format!("asprof pass on {node} ({remote})"))?;
+        sh(
+            "docker",
+            &[
+                "cp",
+                &format!("{node}:{remote}"),
+                out_dir.join(out_name).to_str().context("path utf-8")?,
+            ],
+        )?;
+        Ok(())
+    }
+}
+
 /// Profile the sealer JVM on `node` for `secs`. Writes the interactive
 /// HTML flame graph and the collapsed-stacks text into `out_dir`.
 /// Returns the collapsed stacks, one `frame;frame;... count` line for
 /// each unique stack.
+///
+/// # Errors
+///
+/// Returns an error if the profiler cannot attach inside the
+/// container, or if writing the output files fails.
 pub fn run(node: &str, secs: u64, out_dir: &Path) -> anyhow::Result<String> {
     let ap = ap_dirname();
     println!("==> profiling {node} for {secs}s (itimer)");
+    let pass = AsprofPass {
+        node,
+        ap: &ap,
+        out_dir,
+    };
     // asprof emits one output format per run. So this takes two passes
     // while the soak holds the rate steady: the full-length collapsed
     // capture, the report's source of truth, then a short HTML pass for
     // the interactive flame graph.
-    docker_exec(
-        node,
-        &format!(
-            r#"cid=$(docker ps -q --filter name=cluster | head -1)
-pid=$(docker exec "$cid" sh -c 'pgrep -f java | head -1')
-docker exec "$cid" /tmp/{ap}/bin/asprof -d {secs} -e itimer -o collapsed -f /tmp/perf.collapsed "$pid"
-docker cp "$cid":/tmp/perf.collapsed /tmp/perf.collapsed"#
-        ),
-    )
-    .with_context(|| format!("asprof collapsed pass on {node}"))?;
-    sh(
-        "docker",
-        &[
-            "cp",
-            &format!("{node}:/tmp/perf.collapsed"),
-            out_dir
-                .join("stacks.collapsed")
-                .to_str()
-                .context("path utf-8")?,
-        ],
+    pass.run(
+        &format!("-d {secs} -e itimer -o collapsed -f /tmp/perf.collapsed"),
+        "/tmp/perf.collapsed",
+        "stacks.collapsed",
     )?;
-
-    docker_exec(
-        node,
-        &format!(
-            r#"cid=$(docker ps -q --filter name=cluster | head -1)
-pid=$(docker exec "$cid" sh -c 'pgrep -f java | head -1')
-docker exec "$cid" /tmp/{ap}/bin/asprof -d 30 -e itimer -f /tmp/perf.html "$pid"
-docker cp "$cid":/tmp/perf.html /tmp/perf.html"#
-        ),
-    )
-    .with_context(|| format!("asprof html pass on {node}"))?;
-    sh(
-        "docker",
-        &[
-            "cp",
-            &format!("{node}:/tmp/perf.html"),
-            out_dir.join("flame.html").to_str().context("path utf-8")?,
-        ],
+    pass.run(
+        "-d 30 -e itimer -f /tmp/perf.html",
+        "/tmp/perf.html",
+        "flame.html",
     )?;
 
     let collapsed = std::fs::read_to_string(out_dir.join("stacks.collapsed"))?;
@@ -127,6 +157,11 @@ docker cp "$cid":/tmp/perf.html /tmp/perf.html"#
 /// Render a static SVG flame graph from collapsed stacks, if
 /// `flamegraph.pl`, or a local copy, is available. This is best-effort:
 /// the collapsed file and HTML exist either way.
+///
+/// # Errors
+///
+/// Returns an error if the collapsed-stacks file cannot be read, or
+/// the SVG cannot be written.
 pub fn render_svg(out_dir: &Path, title: &str) -> anyhow::Result<Option<std::path::PathBuf>> {
     let script = out_dir.join("flamegraph.pl");
     if !script.exists() {
@@ -138,8 +173,7 @@ pub fn render_svg(out_dir: &Path, title: &str) -> anyhow::Result<Option<std::pat
                 "https://raw.githubusercontent.com/brendangregg/FlameGraph/master/flamegraph.pl",
             ])
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         if !fetched {
             return Ok(None);
         }

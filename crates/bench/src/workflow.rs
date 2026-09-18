@@ -78,15 +78,22 @@ pub trait BenchWorkflow: Clone + Send + Sync + 'static {
         txs_per_task: u32,
     ) -> impl std::future::Future<Output = anyhow::Result<Prepared<Self::Item>>> + Send;
 
-    /// Dispatch one item against the RPC. Returns the histogram bucket key,
-    /// which must be one of `self.methods()`, and whether the call
-    /// succeeded. The dispatcher times the call outside this method.
-    /// Do not measure or record timing inside this method.
+    /// Dispatch one item against the RPC. The dispatcher times the call
+    /// outside this method. Do not measure or record timing inside this
+    /// method.
     fn dispatch(
         &self,
         client: &HttpClient,
         item: Self::Item,
-    ) -> impl std::future::Future<Output = (&'static str, bool)> + Send;
+    ) -> impl std::future::Future<Output = DispatchOutcome> + Send;
+}
+
+/// One dispatch call's result: the histogram bucket key, which must be
+/// one of the workflow's `methods()`, and whether the call succeeded.
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchOutcome {
+    pub method: &'static str,
+    pub success: bool,
 }
 
 /// Helper for the built-in workflows: 1000 ETH in wei, as a
@@ -94,6 +101,6 @@ pub trait BenchWorkflow: Clone + Send + Sync + 'static {
 ///
 /// This is a convenient default prefunding amount for derived signers.
 #[must_use]
-pub fn default_signer_balance() -> alloy_primitives::U256 {
+pub(crate) fn default_signer_balance() -> alloy_primitives::U256 {
     alloy_primitives::U256::from(10u64).pow(alloy_primitives::U256::from(21u64))
 }

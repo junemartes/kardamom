@@ -9,10 +9,8 @@
 //! recorded with `exists = false`. A storage slot the execution finds zero
 //! is recorded with `value = 0`. A stateless re-execution treats a key
 //! missing from the witness entirely as an error, an incomplete witness,
-//! never as empty. This is the fail-closed rule a prover needs. Phase 2
-//! witnesses are trusted, produced and consumed inside the validator.
-//! Phase 3 anchors `accounts` and `storage` to the pre-state root with MPT
-//! proofs.
+//! never as empty. This is the fail-closed rule a prover needs. Today the
+//! witness is trusted, produced and consumed inside the validator.
 
 use alloc::vec::Vec;
 
@@ -64,7 +62,7 @@ pub struct ExecutionWitness {
     /// Sorted by (address, key); unique.
     pub storage: Vec<WitnessSlot>,
     /// Bytecode for every non-empty code hash the execution loaded. Sorted by
-    /// code_hash; unique.
+    /// `code_hash`; unique.
     pub code: Vec<CodeEntry>,
     /// Effective gas price context is carried by the records themselves.
     /// The witness covers only state.
@@ -119,6 +117,18 @@ impl ExecutionWitness {
     ///   || per entry (hash asc): code_hash(32) || len(8 LE) || bytes
     /// "WHDR" || block_number(8 LE) || has_root(1) || root(32 or absent)
     /// ```
+    ///
+    /// The three `count_be_u32` prefixes truncate a `usize` length to
+    /// `u32`, which is the wire width the format above fixes. One block's
+    /// witness cannot hold anywhere near `u32::MAX` accounts, slots, or
+    /// code entries — the state DB and gas limits rule that out.
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the three count_be_u32 prefixes truncate a usize length to u32, the wire \
+                  width the format fixes; one block's witness cannot hold anywhere near \
+                  u32::MAX accounts, slots, or code entries"
+    )]
     pub fn digest(&self) -> B256 {
         let mut h = alloy_primitives::Keccak256::new();
         h.update(b"WACC");

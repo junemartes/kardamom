@@ -3,18 +3,25 @@
 //! single process.
 //!
 //! Module layout: this file owns the struct, construction, and accessors.
-//! [`submit`] owns the client-facing submit path. [`watchers`] owns the
+//! [`submit`] owns the client-facing submit path. [`accounts`] owns the
+//! account reads behind the two account RPCs. [`watchers`] owns the
 //! background stream watchers that [`IngressProxy::new`] spawns.
 
+mod accounts;
 mod submit;
 mod watchers;
 
+pub use accounts::AccountField;
+
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use tokio::sync::broadcast;
 
+use kardamom_cache::{AccountView, CacheReader, ExecutorQuery, LiveAccounts};
 use kardamom_types::{Receipt, TxError};
 
 use crate::channels::{IngressPublication, IngressSubscription};
@@ -23,52 +30,85 @@ use crate::error::IngressError;
 use crate::pending::PendingReceipts;
 use crate::rate_limit::PerIpLimiter;
 use crate::receipt_cache::ReceiptCache;
-use crate::routing::partition_for;
-use crate::seen_receipts::SeenReceipts;
 use crate::sig_verify::BatchVerifier;
 use crate::tx_error_dedup::TxErrorDedup;
 
-/// Drains a `broadcast::Receiver<T>` and forwards each item to `f`. Skips
-/// `Lagged` and exits on `Closed`. The four proxy watcher tasks use this.
-fn spawn_broadcast_watcher<T, F, Fut>(mut rx: broadcast::Receiver<T>, mut f: F)
+/// One stream watcher's per-item step. Each watcher in `watchers` holds
+/// its own state and folds one item into it here.
+pub(crate) trait Watch<T> {
+    fn on_item(&mut self, item: T) -> impl Future<Output = ()> + Send;
+}
+
+/// Owns a `broadcast::Receiver<T>` and the watcher it feeds. Drains the
+/// receiver into the watcher, skipping `Lagged`, until the sender side
+/// closes. The proxy's watcher tasks spawn [`Self::run`].
+pub(crate) struct BroadcastWatcher<T, W> {
+    rx: broadcast::Receiver<T>,
+    watcher: W,
+}
+
+impl<T, W> BroadcastWatcher<T, W>
 where
     T: Clone + Send + 'static,
-    F: FnMut(T) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send,
+    W: Watch<T> + Send + 'static,
 {
-    tokio::spawn(async move {
+    pub(crate) fn new(rx: broadcast::Receiver<T>, watcher: W) -> Self {
+        Self { rx, watcher }
+    }
+
+    /// Start the drain on the runtime. It ends when the sender side
+    /// closes.
+    pub(crate) fn spawn(self) {
+        tokio::spawn(self.run());
+    }
+
+    async fn run(mut self) {
         loop {
-            match rx.recv().await {
-                Ok(item) => f(item).await,
+            match self.rx.recv().await {
+                Ok(item) => self.watcher.on_item(item).await,
                 Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => (),
             }
         }
-    });
+    }
 }
 
 /// Packs a replica id and a per-replica sequence into a globally unique,
 /// opaque `correlation_id`: the top 16 bits are `ingress_id`, and the low
 /// 48 bits are `seq`. See [`IngressProxy::next_correlation_id`].
 #[inline]
-pub fn pack_correlation_id(ingress_id: u16, seq: u64) -> u64 {
-    ((ingress_id as u64) << 48) | (seq & 0x0000_FFFF_FFFF_FFFF)
+#[must_use]
+pub(crate) fn pack_correlation_id(ingress_id: u16, seq: u64) -> u64 {
+    (u64::from(ingress_id) << 48) | (seq & 0x0000_FFFF_FFFF_FFFF)
 }
 
 /// Extracts the originating `ingress_id` from a packed `correlation_id`.
 #[inline]
+#[must_use]
 pub fn ingress_id_of(correlation_id: u64) -> u16 {
     (correlation_id >> 48) as u16
 }
 
 /// Output of the shared submit-path head: the identity of a decoded,
 /// verified submission, plus a receipt-cache hit if this is a
-/// resubmission.
+/// resubmission, and the tx's worst-case cost for the balance check.
 struct ValidatedSubmission {
     sender: Address,
     nonce: u64,
     tx_hash: B256,
     cached: Option<Receipt>,
+    /// `gas_limit * max_fee_per_gas + value`. `None` on overflow, which
+    /// admits: the executor's own check is the bound.
+    cost: Option<U256>,
+}
+
+/// What the admission checks read: the sender's latest known state, and
+/// whether its balance is fresh enough to reject on. A local entry is
+/// fresh by its TTL. A Redis entry is fresh by the head lag. A nonce is
+/// a lower bound at any lag, so it never needs `fresh`.
+struct AccountState {
+    view: AccountView,
+    fresh: bool,
 }
 
 /// Handle returned by `IngressProxy::start`. Drop it to shut down the
@@ -88,16 +128,14 @@ where
     S: IngressSubscription + Clone,
 {
     pub(crate) cfg: IngressConfig,
+    /// A copy of `cfg.partition_count_m`, for `partition_for` to read
+    /// without going through `cfg`.
+    pub(crate) partition_count_m: NonZeroU32,
     pub(crate) rate_limiter: Arc<PerIpLimiter>,
     pub(crate) verifier: Arc<BatchVerifier>,
     pub(crate) pending: Arc<PendingReceipts>,
     pub(crate) cache: Arc<ReceiptCache>,
-    /// First-wins tx-hash dedup for the tx_receipts MDS fan-in. Drops the
-    /// duplicate receipt copies that the N executor replicas emit, so a
-    /// tx's must-deliver ack fires exactly once. This is a no-op on the
-    /// single-executor IPC path. See [`crate::seen_receipts`].
-    pub(crate) seen_receipts: Arc<SeenReceipts>,
-    /// Consumer-side tx_errors dedup for P racing sequencer replicas.
+    /// Consumer-side `tx_errors` dedup for P racing sequencer replicas.
     /// Drops the twin's duplicate copy of each per-tx rejection, and
     /// suppresses a rejection once a success for the same
     /// `(sender, nonce)` was observed. This is a no-op on a
@@ -106,12 +144,22 @@ where
     pub(crate) publication: P,
     pub(crate) subscription: S,
     pub(crate) correlation_seq: Arc<AtomicU64>,
-    /// The highest `BlockBoundary.block_number` observed on tx_receipts.
+    /// The local account layer the subscription feeds. The admission
+    /// checks and the account RPCs read it. See `kardamom_cache::live`.
+    pub(crate) live: Arc<LiveAccounts>,
+    /// The executor query behind the account RPCs. `None` when the
+    /// config names no endpoint: a local miss is then an error, never a
+    /// stall. The admission path never calls it.
+    pub(crate) query: Option<ExecutorQuery>,
+    /// The Redis layer. `None` with `[cache]` off: no Redis call exists
+    /// on any path. See `kardamom_cache::reader`.
+    pub(crate) redis: Option<Arc<CacheReader>>,
+    /// The highest `BlockBoundary.block_number` observed on `tx_receipts`.
     /// `eth_blockNumber` reads this. `AtomicU64` is enough here: the
-    /// value only increases, one writer, the BlockBoundary watcher, sets
+    /// value only increases, one writer, the `BlockBoundary` watcher, sets
     /// it, and many readers read it.
     pub(crate) latest_block_number: Arc<AtomicU64>,
-    /// Post-dedup receipt re-broadcast. The tx_receipts watcher forwards
+    /// Post-dedup receipt re-broadcast. The `tx_receipts` watcher forwards
     /// each first-seen receipt here, so `kardamom_subscribeReceipts`
     /// sessions see exactly one copy per tx, instead of the raw
     /// N-replica MDS fan-in.
@@ -119,16 +167,21 @@ where
     /// Post-dedup tx-error re-broadcast, the same pattern as
     /// `receipt_feed`.
     pub(crate) tx_error_feed: broadcast::Sender<TxError>,
+    /// The graceful drain flag. Once set, new submits get `Draining`,
+    /// and the parked ones keep waiting for their receipts. See
+    /// [`Self::begin_drain`].
+    pub(crate) draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Capacity of the deduped receipt and error re-broadcast feeds. A
 /// subscriber that lags more than this many items gets a `Lagged`
 /// notification, and must fall back to `eth_getTransactionReceipt` for
-/// the gap. At 8192, a subscriber stalled for about 1.7s at 4,800 tx/s
-/// overflowed the ring; this was the leading suspect for the small share
-/// of silent feed misses under sustained load. 32k tolerates about 7s at
-/// that rate, for about 10MB of buffered receipts.
+/// the gap. 32k holds about 7s of buffered receipts at 4,800 tx/s, about
+/// 10MB.
 const FEED_CAPACITY: usize = 32 * 1024;
+
+/// The graceful drain polls the parked count this often.
+const DRAIN_POLL: Duration = Duration::from_millis(50);
 
 impl<P, S> Clone for IngressProxy<P, S>
 where
@@ -138,18 +191,22 @@ where
     fn clone(&self) -> Self {
         Self {
             cfg: self.cfg.clone(),
+            partition_count_m: self.partition_count_m,
             rate_limiter: self.rate_limiter.clone(),
             verifier: self.verifier.clone(),
             pending: self.pending.clone(),
             cache: self.cache.clone(),
-            seen_receipts: self.seen_receipts.clone(),
             tx_error_dedup: self.tx_error_dedup.clone(),
             publication: self.publication.clone(),
             subscription: self.subscription.clone(),
             correlation_seq: self.correlation_seq.clone(),
+            live: self.live.clone(),
+            query: self.query.clone(),
+            redis: self.redis.clone(),
             latest_block_number: self.latest_block_number.clone(),
             receipt_feed: self.receipt_feed.clone(),
             tx_error_feed: self.tx_error_feed.clone(),
+            draining: self.draining.clone(),
         }
     }
 }
@@ -160,6 +217,7 @@ where
     S: IngressSubscription + Clone + 'static,
 {
     pub fn new(cfg: IngressConfig, publication: P, subscription: S) -> Self {
+        let partition_count_m = cfg.partition_count_m;
         let rate_limiter = Arc::new(PerIpLimiter::new(
             cfg.rate_limit_per_ip_per_sec,
             cfg.rate_limit_burst,
@@ -170,22 +228,34 @@ where
         ));
         let pending = Arc::new(PendingReceipts::new(cfg.ack_policy));
         let cache = Arc::new(ReceiptCache::new(cfg.receipt_cache_capacity));
-        let seen_receipts = Arc::new(SeenReceipts::default());
         let tx_error_dedup = Arc::new(TxErrorDedup::default());
+        let live = subscription.live_accounts();
+        let query = ExecutorQuery::new(&cfg.executor_query);
+        let redis = cfg.cache.enabled().then(|| {
+            Arc::new(CacheReader::spawn(
+                &cfg.cache,
+                cfg.mirror_count,
+                live.clone(),
+            ))
+        });
         let me = Self {
             cfg,
+            partition_count_m,
             rate_limiter,
             verifier,
             pending,
             cache,
-            seen_receipts,
             tx_error_dedup,
             publication,
             subscription,
             correlation_seq: Arc::new(AtomicU64::new(0)),
+            live,
+            query,
+            redis,
             latest_block_number: Arc::new(AtomicU64::new(0)),
             receipt_feed: broadcast::channel(FEED_CAPACITY).0,
             tx_error_feed: broadcast::channel(FEED_CAPACITY).0,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         me.spawn_tx_receipts_watcher();
         me.spawn_tx_errors_watcher();
@@ -200,7 +270,13 @@ where
         me
     }
 
-    /// The highest `BlockBoundary.block_number` observed on tx_receipts.
+    /// Whether the Redis layer is on and connected. Tests wait on it.
+    #[must_use]
+    pub fn redis_connected(&self) -> bool {
+        self.redis.as_ref().is_some_and(|r| r.connected())
+    }
+
+    /// The highest `BlockBoundary.block_number` observed on `tx_receipts`.
     /// Backs `eth_blockNumber`.
     #[inline]
     pub fn latest_block_number(&self) -> u64 {
@@ -224,9 +300,9 @@ where
         pack_correlation_id(self.cfg.ingress_id, seq)
     }
 
-    /// Looks up a receipt by `tx_hash` in the in-memory tx_receipts
+    /// Looks up a receipt by `tx_hash` in the in-memory `tx_receipts`
     /// index. The executor publishes the enriched `Receipt` onto
-    /// tx_receipts. Ingress subscribes, and answers
+    /// `tx_receipts`. Ingress subscribes, and answers
     /// `eth_getTransactionReceipt` straight from RAM, with no state-DB
     /// join. Returns `None` for a tx that has not yet been observed,
     /// including one evicted from the bounded cache.
@@ -250,7 +326,7 @@ where
     /// and tooling use this.
     #[inline]
     pub fn partition_for(&self, sender: alloy_primitives::Address) -> u32 {
-        partition_for(sender, self.cfg.partition_count_m)
+        self.cfg.lane_for(sender)
     }
 
     /// Read-only access to the configured `IngressConfig`.
@@ -261,6 +337,52 @@ where
 
     /// Starts every configured listener: jsonrpsee HTTP and WS, an
     /// optional TCP listener, and an optional UDS listener.
+    /// Start the graceful drain. New submits get `Draining` (a retryable
+    /// error: the client goes to the other replica). Parked submits keep
+    /// waiting for their receipts. Reads keep working. The deploy's
+    /// `kill_timeout` covers `tx_ttl`, so a parked submit resolves before
+    /// the process exits. See `docs/specs/dynamic-sequencer-sizing.md`,
+    /// section 3.6.
+    pub fn begin_drain(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(
+            pending = self.pending.len(),
+            "ingress: draining; new submits refused"
+        );
+    }
+
+    /// The number of parked submits.
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// True once [`Self::begin_drain`] ran.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until no submit is parked, or `timeout` passes. Returns the
+    /// number of submits still parked.
+    pub async fn drain(&self, timeout: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.parked_before(deadline) {
+            tokio::time::sleep(DRAIN_POLL).await;
+        }
+        self.pending.len()
+    }
+
+    /// True while a submit is still parked and `deadline` has not passed.
+    fn parked_before(&self, deadline: tokio::time::Instant) -> bool {
+        !self.pending.is_empty() && tokio::time::Instant::now() < deadline
+    }
+
+    ///
+    /// # Errors
+    ///
+    /// Returns `IngressError::Internal` if a listener fails to bind.
     pub async fn start(self) -> Result<IngressHandle, IngressError>
     where
         P: 'static,
@@ -271,13 +393,13 @@ where
         #[cfg(feature = "binary-protocol")]
         {
             if let Some(addr) = self.cfg.binary_tcp_bind {
-                crate::binary::spawn_tcp_listener(self.clone(), addr);
+                crate::binary::Acceptor::spawn_tcp(self.clone(), addr);
             }
             if let Some(path) = self.cfg.binary_uds_path.clone() {
                 // This is a best-effort unlink of a stale socket.
                 let _ = std::fs::remove_file(&path);
-                crate::binary::spawn_uds_listener(self.clone(), &path)
-                    .map_err(|e| IngressError::Internal(format!("uds bind: {e}")))?;
+                crate::binary::Acceptor::spawn_uds(self.clone(), &path)
+                    .map_err(|e| IngressError::internal("uds bind", e))?;
             }
         }
         Ok(IngressHandle {
@@ -300,12 +422,13 @@ mod tests {
         assert_eq!(pack_correlation_id(7, 0), 7u64 << 48);
         assert_eq!(pack_correlation_id(7, 5), (7u64 << 48) | 5);
         // This round-trips the replica id back out.
-        for id in [0u16, 1, 7, 256, u16::MAX] {
-            for seq in [0u64, 1, 1_000_000, (1u64 << 48) - 1] {
-                let c = pack_correlation_id(id, seq);
-                assert_eq!(ingress_id_of(c), id, "id={id} seq={seq}");
-                assert_eq!(c & 0x0000_FFFF_FFFF_FFFF, seq, "seq preserved");
-            }
+        let cases = [0u16, 1, 7, 256, u16::MAX]
+            .into_iter()
+            .flat_map(|id| [0u64, 1, 1_000_000, (1u64 << 48) - 1].map(move |seq| (id, seq)));
+        for (id, seq) in cases {
+            let c = pack_correlation_id(id, seq);
+            assert_eq!(ingress_id_of(c), id, "id={id} seq={seq}");
+            assert_eq!(c & 0x0000_FFFF_FFFF_FFFF, seq, "seq preserved");
         }
     }
 

@@ -3,100 +3,74 @@
 # (`make check-contract` verifies the mirrors below stay in sync).
 
 SHELL := /bin/bash
-REGISTRY := 192.168.56.10:5000
-NOMAD_ADDR := http://192.168.56.10:4646
+# The registry is a Consul service; every node resolves the name. The host
+# pushes through the control node (REGISTRY_PUSH_NODE), where it resolves.
+REGISTRY := registry.service.consul:5000
+NOMAD_HTTP := 4646
+# The control node address comes from the node contract of the container
+# root at run time. Nothing in this tree names an address.
+NODE_CONTRACT := terraform/containers/node-contract.json
+CONTROL_ADDRESS_CMD := python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nodes"]["control-0"]["ip"])' $(NODE_CONTRACT)
+# The test suite and the operator commands are the kardamom-chaos crate.
+# A shard test brings its own cluster up; the container-* targets do the
+# same lifecycle by hand and run the gates against it (KARDAMOM_CHAOS_REUSE).
+# KARDAMOM_STAGED=1 runs the binaries a build already staged under
+# target/release (scripts/ci/stage-cluster-dist.sh): the shard test
+# executable as kardamom-chaos-shards and the operator binary. CI's shard
+# runners carry no toolchain. Unset, cargo builds and runs them.
+ifdef KARDAMOM_STAGED
+RUN_SHARDS := ../../target/release/kardamom-chaos-shards
+CLUSTER_BIN := ../../target/release/kardamom-cluster
+else
+RUN_SHARDS := cargo test -p kardamom-chaos --release --features cluster-e2e --locked --test shards --
+CLUSTER_BIN := cargo run --release -p kardamom-chaos --locked --bin kardamom-cluster --
+endif
+# The shard to run: load, semantics, chaos-executor, chaos-ingress,
+# chaos-sequencer, chaos-cluster, chaos-retention, chaos-cache.
+SHARD ?= load
+SHARD_TEST = $(subst -,_,$(SHARD))
 TAG := dev
 # Per-deploy image digest manifest (attested-identity P0.1): written at push
-# time by scripts/push-image.sh, read by scripts/deploy.sh to pin every job's
+# time by ansible/images.yml, read by ansible/deploy.yml to pin every job's
 # image_ref variable to repo@sha256:... . Gitignored (audit record, not source).
 DIGEST_MANIFEST := images.digests
-# Workspace root (this file lives in deploy/cluster/).
-ROOT := $(abspath ../..)
+export REGISTRY TAG DIGEST_MANIFEST
 # The Rust service binaries that get their own image. There is NO kardamom-
 # sealer binary (canonical ordering is the Java Aeron Cluster — see the
 # `cluster` image below) and NO kardamom-recorder (durability is archive-at-
 # the-sealer, folded into the cluster members).
 SERVICES := ingress sequencer executor validator da-watcher batcher
-# Java Aeron Cluster node jar (built by gradle; see images target).
-CLUSTER_JAR := $(ROOT)/cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar
 
-.PHONY: up vms provision images deploy smoke status down clean validate check-contract
+.PHONY: images deploy smoke clean validate check-contract
 
-## up: full bring-up — VMs, provisioning, images, deploy. Run `make smoke`
-## separately to exercise the pipeline once the jobs settle.
-up: vms provision images deploy
-	@echo
-	@echo "==> Cluster is up. Run 'make smoke' to exercise the pipeline."
-
-## vms: boot the VMs (one per node_classes instance)
-vms:
-	vagrant up
-
-## provision: install docker/nomad/consul/registry via Ansible
-provision:
-	ansible-playbook -i ansible/inventory.ini ansible/site.yml
-
-## images: build service + aeron images on the host and push to the registry.
-## NOTE: pushing needs $(REGISTRY) in the HOST Docker daemon's
-## insecure-registries (see README "Host prerequisites").
+## images: wrap the prebuilt service binaries and the sealer jar into images
+## and push them to the in-cluster registry through REGISTRY_PUSH_NODE.
 images:
-	@rm -f $(DIGEST_MANIFEST)
-	docker build -f $(ROOT)/crates/log/docker/aeron/Dockerfile \
-		-t $(REGISTRY)/kardamom-aeron:$(TAG) $(ROOT)/crates/log/docker/aeron
-	./scripts/push-image.sh aeron $(REGISTRY)/kardamom-aeron:$(TAG) $(DIGEST_MANIFEST)
-	@for svc in $(SERVICES); do \
-		echo "==> building kardamom-$$svc"; \
-		docker build -f docker/service.Dockerfile \
-			--build-arg BIN=kardamom-$$svc \
-			-t $(REGISTRY)/kardamom-$$svc:$(TAG) $(ROOT) || exit 1; \
-		./scripts/push-image.sh $$svc $(REGISTRY)/kardamom-$$svc:$(TAG) $(DIGEST_MANIFEST) || exit 1; \
-	done
-	@# Java Aeron Cluster node (cluster.nomad.hcl pulls kardamom-cluster:$(TAG)).
-	@# The jar must be built first — fail loudly, or deploy.sh fails pulling.
-	@if [ ! -f "$(CLUSTER_JAR)" ]; then \
-		echo "ERROR: cluster jar not found at $(CLUSTER_JAR)"; \
-		echo "       Build it first: (cd $(ROOT)/cluster/sealer-service && ./gradlew :service:shadowJar)"; \
-		exit 1; \
-	fi
-	cp $(CLUSTER_JAR) docker/kardamom-cluster-node.jar
-	docker build -f docker/cluster.Dockerfile \
-		-t $(REGISTRY)/kardamom-cluster:$(TAG) docker
-	./scripts/push-image.sh cluster $(REGISTRY)/kardamom-cluster:$(TAG) $(DIGEST_MANIFEST)
-	@# P0.5: sign the COMPLETED manifest (keyless, CI-with-OIDC only; a clear
-	@# skip line locally). Must stay the LAST step of this target.
-	./scripts/sign-manifest.sh $(DIGEST_MANIFEST)
+	ansible-playbook -i localhost, ansible/images.yml
 
-## deploy: run the Aeron system job, then the service jobs (sealer first — it
+## deploy: converge workload jobs and settlement through Ansible
 deploy:
-	./scripts/deploy.sh
+	ansible-playbook -i localhost, ansible/deploy.yml
 
-## smoke: submit transfers through ingress and assert receipts
+## smoke: one signed transfer through the ingress, with a receipt poll
+## (RPC_URL overrides the ingress-0 address of the node contract)
 smoke:
-	./scripts/smoke.sh
-
-## status: cluster + job health (Nomad binds the VM IP, not localhost, so the
-## CLI inside the VM needs NOMAD_ADDR pointed at it)
-status:
-	vagrant ssh control-0 -c 'export NOMAD_ADDR=$(NOMAD_ADDR); nomad node status && echo && nomad job status && echo && consul members'
+	$(CLUSTER_BIN) smoke $(if $(RPC_URL),--rpc $(RPC_URL))
 
 ## validate: static checks (run on a host with the toolchain; CI runs these too)
 validate:
 	@rc=0; \
 	yamllint ansible/ || rc=1; \
 	ansible-lint ansible/ || rc=1; \
-	for s in scripts/*.sh; do bash -n "$$s" || rc=1; done; \
 	for j in nomad/*.hcl; do echo "== $$j =="; nomad job validate "$$j" || rc=1; done; \
 	./scripts/check-contract.py || rc=1; \
+	for r in terraform/*/; do echo "== $$r =="; tofu -chdir=$$r fmt -check -recursive . || rc=1; \
+	  tofu -chdir=$$r init -backend=false -input=false >/dev/null && tofu -chdir=$$r validate || rc=1; done; \
 	exit $$rc
 
 ## check-contract: verify the values mirrored from group_vars/all.yml agree
 check-contract:
 	./scripts/check-contract.py
-
-## down: stop jobs and destroy VMs
-down:
-	-vagrant ssh control-0 -c 'export NOMAD_ADDR=$(NOMAD_ADDR); for j in $$(nomad job status -short 2>/dev/null | awk "NR>1{print \$$1}"); do nomad job stop -purge $$j; done' || true
-	vagrant destroy -f
 
 ## clean: remove local built images (+ the staged cluster jar)
 clean:
@@ -104,3 +78,49 @@ clean:
 	-docker image rm $(REGISTRY)/kardamom-cluster:$(TAG)
 	-rm -f docker/kardamom-cluster-node.jar
 	-@for svc in $(SERVICES); do docker image rm $(REGISTRY)/kardamom-$$svc:$(TAG); done
+
+# --- container path (Linux controller; prebuilt artifacts required) ---------
+# terraform/containers owns the node containers. The Makefile owns the
+# lifecycle: apply, converge, test, diagnose, destroy. CI runs these targets
+# as workflow steps.
+TF_CONTAINERS := terraform/containers
+# On the container path, images are pushed from inside the control node,
+# where the registry name resolves; the host daemon needs no
+# insecure-registry entry. The VM path pushes from the host.
+container-up: export REGISTRY_PUSH_NODE ?= control-0
+# Extra vars for ansible/cluster.yml, as one JSON object without a single quote.
+CLUSTER_VARS :=
+CLUSTER_VARS_ARG = $(if $(CLUSTER_VARS),--extra-vars '$(CLUSTER_VARS)')
+
+.PHONY: container-up container-test shard container-diagnostics container-down container-reset
+## container-up: create the node containers, provision them, publish the
+## prebuilt images and deploy the workloads.
+container-up:
+	tofu -chdir=$(TF_CONTAINERS) init -input=false
+	tofu -chdir=$(TF_CONTAINERS) apply -auto-approve -input=false
+	tofu -chdir=$(TF_CONTAINERS) output -json node_contract > $(NODE_CONTRACT)
+	NOMAD_ADDR=http://$$($(CONTROL_ADDRESS_CMD)):$(NOMAD_HTTP) \
+	  ansible-playbook -i localhost, ansible/cluster.yml $(CLUSTER_VARS_ARG)
+
+## container-test: run one shard's gates (SHARD=...) against the cluster
+## container-up made; KARDAMOM_CHAOS_CASES narrows a chaos shard's cases.
+container-test:
+	KARDAMOM_CHAOS_REUSE=1 $(RUN_SHARDS) --ignored --exact $(SHARD_TEST) --nocapture
+
+## shard: one shard end to end, the way CI runs it: the test brings the
+## cluster up, runs its gates, and destroys the cluster on success.
+shard:
+	$(RUN_SHARDS) --ignored --exact $(SHARD_TEST) --nocapture
+
+## container-diagnostics: collect node and job state after a failure
+container-diagnostics:
+	$(CLUSTER_BIN) diagnostics
+
+## container-down: destroy the node containers and their volumes
+container-down:
+	tofu -chdir=$(TF_CONTAINERS) init -input=false
+	tofu -chdir=$(TF_CONTAINERS) destroy -auto-approve -input=false
+	rm -f $(NODE_CONTRACT)
+
+## container-reset: destroy, then create a fresh chain
+container-reset: container-down container-up

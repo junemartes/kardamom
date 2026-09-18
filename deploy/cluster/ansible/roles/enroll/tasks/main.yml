@@ -1,0 +1,31 @@
+---
+# Obtain the per-node credentials of an elastic node before any agent
+# starts. The enrollment client is a tool the image carries; enrollment_argv
+# is its argument vector. It authenticates the node to the deployment's
+# identity service and writes enroll_secrets_file. Nothing here talks
+# to Consul: the credentials are what Consul needs to start. A missing or
+# incomplete result fails the play, and the agents stay disabled.
+
+- name: Run the enrollment client
+  ansible.builtin.command:
+    argv: "{{ enrollment_argv }}"
+    creates: "{{ enroll_secrets_file }}"
+  timeout: "{{ enroll_timeout_s | int }}"
+  no_log: true
+
+- name: Check the enrolled credential file
+  ansible.builtin.stat:
+    path: "{{ enroll_secrets_file }}"
+  register: enroll_secrets
+
+- name: Refuse a node without credentials
+  ansible.builtin.assert:
+    that:
+      - enroll_secrets.stat.exists
+      - enroll_secrets.stat.mode == '0600'
+    fail_msg: "{{ inventory_hostname }}: enrollment produced no {{ enroll_secrets_file }} with mode 0600"
+
+- name: Load the enrolled credentials
+  ansible.builtin.include_vars:
+    file: "{{ enroll_secrets_file }}"
+  no_log: true

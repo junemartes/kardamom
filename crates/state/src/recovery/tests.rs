@@ -64,22 +64,12 @@ fn bootstrap_builds_trie_matching_oracle_on_trie_off_state() {
     // root is computed from its one slot.
     let storage_root = crate::trie::storage_root([(slot, slot_val)]);
     let want = crate::trie::state_root([
-        (
-            addr_a,
-            crate::trie::AccountTrieParts {
-                nonce: 3,
-                balance: U256::from(100u64),
-                code_hash: B256::ZERO,
-                storage_root: B256::ZERO,
-            },
-        ),
+        (addr_a, crate::testing::parts(3, 100)),
         (
             addr_b,
             crate::trie::AccountTrieParts {
-                nonce: 1,
-                balance: U256::from(55u64),
-                code_hash: B256::ZERO,
                 storage_root,
+                ..crate::testing::parts(1, 55)
             },
         ),
     ]);
@@ -117,50 +107,15 @@ fn bootstrap_corrects_genesis_stale_mirror_under_newer_state() {
 
     // Trie-off progress, what an executor does: A changes, and B appears.
     // Only the plain tables change; the mirror stays frozen at genesis.
-    {
-        let txn = env.raw().begin_rw_sync().unwrap();
-        let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS)).unwrap();
-        for (addr, nonce, bal) in [(addr_a, 7u64, 400u64), (addr_b, 2, 600)] {
-            let v = AccountValue {
-                nonce,
-                balance: U256::from(bal),
-                code_hash: B256::ZERO,
-                storage_root: B256::ZERO,
-            };
-            txn.put(
-                accounts_db,
-                encode_account_key(addr),
-                encode_account_value(&v),
-                WriteFlags::UPSERT,
-            )
-            .unwrap();
-        }
-        txn.commit().unwrap();
-    }
+    crate::testing::put_plain_accounts(&env, &[(addr_a, 7, 400), (addr_b, 2, 600)]);
     // The trap: the probe still reports the trie as present. It is
     // present, but stale.
     assert!(has_trie(&env).unwrap());
 
     let root = bootstrap_trie_from_state(&env).unwrap();
     let want = crate::trie::state_root([
-        (
-            addr_a,
-            crate::trie::AccountTrieParts {
-                nonce: 7,
-                balance: U256::from(400u64),
-                code_hash: B256::ZERO,
-                storage_root: B256::ZERO,
-            },
-        ),
-        (
-            addr_b,
-            crate::trie::AccountTrieParts {
-                nonce: 2,
-                balance: U256::from(600u64),
-                code_hash: B256::ZERO,
-                storage_root: B256::ZERO,
-            },
-        ),
+        (addr_a, crate::testing::parts(7, 400)),
+        (addr_b, crate::testing::parts(2, 600)),
     ]);
     assert_eq!(
         root, want,
@@ -181,24 +136,7 @@ fn incremental_block_on_bootstrapped_trie_matches_oracle() {
     let addr_a = Address::repeat_byte(0x11);
     let addr_c = Address::repeat_byte(0x33);
 
-    {
-        let txn = env.raw().begin_rw_sync().unwrap();
-        let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS)).unwrap();
-        let v = AccountValue {
-            nonce: 3,
-            balance: U256::from(100u64),
-            code_hash: B256::ZERO,
-            storage_root: B256::ZERO,
-        };
-        txn.put(
-            accounts_db,
-            encode_account_key(addr_a),
-            encode_account_value(&v),
-            WriteFlags::UPSERT,
-        )
-        .unwrap();
-        txn.commit().unwrap();
-    }
+    crate::testing::put_plain_accounts(&env, &[(addr_a, 3, 100)]);
     bootstrap_trie_from_state(&env).unwrap();
 
     // The next block: A's nonce increases, and C appears.
@@ -224,28 +162,12 @@ fn incremental_block_on_bootstrapped_trie_matches_oracle() {
     };
     let txn = env.raw().begin_rw_sync().unwrap();
     let tables = crate::trie::TrieTables::open(&txn).unwrap();
-    let root = crate::trie::update_for_block(&txn, &tables, &delta).unwrap();
+    let root = tables.update_for_block(&txn, &delta).unwrap();
     txn.commit().unwrap();
 
     let want = crate::trie::state_root([
-        (
-            addr_a,
-            crate::trie::AccountTrieParts {
-                nonce: 4,
-                balance: U256::from(90u64),
-                code_hash: B256::ZERO,
-                storage_root: B256::ZERO,
-            },
-        ),
-        (
-            addr_c,
-            crate::trie::AccountTrieParts {
-                nonce: 1,
-                balance: U256::from(10u64),
-                code_hash: B256::ZERO,
-                storage_root: B256::ZERO,
-            },
-        ),
+        (addr_a, crate::testing::parts(4, 90)),
+        (addr_c, crate::testing::parts(1, 10)),
     ]);
     assert_eq!(
         root, want,

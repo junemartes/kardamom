@@ -20,7 +20,6 @@
 //! witness capture is off the commit path.
 
 use alloy_primitives::B256;
-use alloy_rlp::Encodable;
 use alloy_trie::proof::ProofRetainer;
 use alloy_trie::{HashBuilder, Nibbles};
 use bytes::Bytes;
@@ -33,26 +32,29 @@ use crate::error::StateError;
 
 /// The retained proof nodes, plus the walked root as a cross-check,
 /// for the account trie at the given targets.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the walk's table reads fail.
 pub fn account_proof_nodes<K: ReadKind>(
     tx: &TxSync<K>,
     account_trie: signet_libmdbx::Database,
     hashed_accounts: signet_libmdbx::Database,
     targets: &[Nibbles],
 ) -> Result<(B256, Vec<Bytes>), StateError> {
-    let leaf = |p: &super::AccountTrieParts| {
-        let mut buf = Vec::new();
-        p.to_trie_account().encode(&mut buf);
-        buf
-    };
     let ps = PrefixSet::from_nibbles(targets.iter().copied());
     let mut hb = HashBuilder::default().with_proof_retainer(ProofRetainer::new(targets.to_vec()));
-    walker::walk_account_for_proofs(tx, account_trie, hashed_accounts, &ps, &mut hb, &leaf)?;
+    walker::walk_account_for_proofs(tx, account_trie, hashed_accounts, &ps, &mut hb)?;
     let root = hb.root();
     Ok((root, collect(hb)))
 }
 
 /// The retained proof nodes, plus the walked storage root, for one
 /// account's storage trie at the given targets.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the walk's table reads fail.
 pub fn storage_proof_nodes<K: ReadKind>(
     tx: &TxSync<K>,
     storage_trie: signet_libmdbx::Database,

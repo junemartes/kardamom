@@ -1,15 +1,14 @@
 //! Build a deterministic revm `BlockEnv` and `CfgEnv` for one executed tx.
 //!
-//! Spec invariant I3: every field is a pure function of the canonical
-//! tx_ordering input. There is no wall clock and no entropy.
+//! Every field is a pure function of the canonical `tx_ordering` input.
+//! There is no wall clock and no entropy.
 //!
-//! Every parameter here is a deliberate choice (see W1b in
-//! `docs/agents/l1-client-suite-port-spec.md`). Kardamom supports exactly one
-//! hardfork, the latest, pinned as [`SPEC_ID`]. No field uses a silent revm
-//! default. `BlockEnv` uses a full struct literal, so a revm upgrade that
-//! adds a field causes a compile error, not a silent default. `CfgEnv` is
-//! `#[non_exhaustive]`, so the `cfg_pinning` tests pin its effective values
-//! instead.
+//! Every parameter here is a deliberate choice. Kardamom supports exactly
+//! one hardfork, the latest, pinned as [`SPEC_ID`]. No field uses a silent
+//! revm default. `BlockEnv` uses a full struct literal, so a revm upgrade
+//! that adds a field causes a compile error, not a silent default. `CfgEnv`
+//! is `#[non_exhaustive]`, so the `cfg_pinning` tests pin its effective
+//! values instead.
 
 use alloy_primitives::{Address, B256, U256};
 use kardamom_types::BlockBoundaryStart;
@@ -36,14 +35,12 @@ use revm::primitives::hardfork::SpecId;
 /// the arkworks backend. Backend equivalence is part of revm's tested
 /// contract (shared c-kzg-4844 vectors), and the host side is EEST-attested.
 /// In-guest pairing cost is a performance question, not a soundness one.
-/// Revm's own doc comment on `Precompiles::cancun` still claims c-kzg
-/// gating; that comment is stale. The registration code is unconditional.
 pub const SPEC_ID: SpecId = SpecId::OSAKA;
 
 /// Fixed per-block gas limit. Version 0 has no dynamic adjustment.
 pub const BLOCK_GAS_LIMIT: u64 = 30_000_000;
 
-/// Per-block execution context, built from the sealer's BlockBoundaryStart.
+/// Per-block execution context, built from the sealer's `BlockBoundaryStart`.
 /// It stays the same for every tx in the block, and is rebuilt at each
 /// boundary.
 #[derive(Debug, Clone, Copy)]
@@ -54,6 +51,7 @@ pub struct ExecEnv {
 }
 
 impl ExecEnv {
+    #[must_use]
     pub fn new(chain_id: u64, boundary: &BlockBoundaryStart) -> Self {
         Self {
             chain_id,
@@ -62,6 +60,7 @@ impl ExecEnv {
         }
     }
 
+    #[must_use]
     pub fn block_env(&self) -> BlockEnv {
         // This is a full struct literal on purpose. See the module doc.
         // Do not add `..Default::default()` back. Silent defaults caused
@@ -107,6 +106,7 @@ impl ExecEnv {
     /// The `cfg_pinning` tests pin the effective values, including the
     /// spec-derived ones this code deliberately leaves as `None` (code-size
     /// limits).
+    #[must_use]
     pub fn cfg_env(&self) -> CfgEnv {
         // Use `new_with_spec`, not `default()` plus `c.spec = ...`. Revm
         // builds the per-opcode gas table from the spec at construction, and
@@ -138,17 +138,10 @@ mod tests {
     use super::*;
     use kardamom_types::BPosition;
 
-    fn pos(off: i32) -> BPosition {
-        BPosition {
-            term_id: 0,
-            term_offset: off,
-        }
-    }
-
     fn env() -> ExecEnv {
         let b = BlockBoundaryStart {
             block_number: 7,
-            end_tx_idx: pos(42),
+            end_tx_idx: BPosition::from_index(42),
             l2_timestamp: 1_700_000_000,
             l1_origin: 0,
         };

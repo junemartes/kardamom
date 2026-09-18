@@ -4,7 +4,9 @@ use kardamom_batcher::compress::{DEFAULT_LEVEL, decode_zstd, encode_zstd};
 
 #[test]
 fn roundtrip_arbitrary_bytes() {
-    let input: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+    // `& 0xFF` proves the truncation: this deliberately wraps to a
+    // repeating 0-255 byte pattern.
+    let input: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
     let z = encode_zstd(&input, DEFAULT_LEVEL).unwrap();
     let back = decode_zstd(&z).unwrap();
     assert_eq!(back, input);

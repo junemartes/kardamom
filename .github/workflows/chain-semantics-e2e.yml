@@ -7,7 +7,7 @@ on:
   # Cluster sealer + per-test media drivers, observed through JSON-RPC and
   # /metrics only. Runs on every PR; opt out with the `skip-chain-semantics`
   # label for changes that cannot affect the pipeline (e.g. docs-only PRs).
-  # Target C (the same drivers on the ci-cluster.sh DinD cluster) lands as a
+  # Target C (the same drivers on the cluster-e2e DinD cluster) lands as a
   # cluster-e2e shard separately.
   pull_request:
   push:
@@ -47,32 +47,17 @@ jobs:
       # out to it to embed contract bytecode, and `-p e2e --tests` builds the
       # deployer. Pinned concrete version (stable/latest hit the GitHub
       # releases API and 403 under the runner's unauthenticated rate limit).
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.7.1
+      - uses: ./.github/actions/foundry
+      # forge build downloads the pinned solc on a cold host; the cache
+      # keeps that download off binaries.soliditylang.org.
+      - uses: ./.github/actions/solc-cache
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      # rusteron's build.rs compiles the Aeron C library with -march=native
-      # (hardcoded, no opt-out); those objects land in target/ and travel in
-      # the rust cache. GitHub's runner fleet is CPU-heterogeneous, so a cache
-      # populated on a wider-ISA VM SIGILLs (exit 132, empty stderr) when
-      # restored on a narrower one — observed as multi-shard waves of
-      # sequencers crash-looping the moment they touched Aeron. Key the cache
-      # by the CPU's feature-flag set so native objects never cross ISAs.
-      - name: CPU microarch cache key
-        id: cpukey
-        # Key by the CPUID FEATURE FLAGS, not the model name: hypervisors mask
-        # feature bits per VM independently of the brand string, and the reroll
-        # SIGILL'd again on a full-match model-name cache (host runnervmvrwv9
-        # reports the same model as the fleet but a narrower ISA). The flags
-        # line is exactly the surface -march=native compiles against.
-        run: echo "cpu=$(grep -m1 '^flags' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rust-build-cache
         with:
           shared-key: chain-semantics-e2e
-          prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
 
       - name: Build the sealer jar
         working-directory: cluster/sealer-service
@@ -81,7 +66,8 @@ jobs:
       - name: Cache the aeron-all jar
         run: |
           mkdir -p /tmp/kardamom-aeron-local
-          curl -fsSL "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_JAR_VERSION}/aeron-all-${AERON_JAR_VERSION}.jar" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+            "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_JAR_VERSION}/aeron-all-${AERON_JAR_VERSION}.jar" \
             -o "/tmp/kardamom-aeron-local/aeron-all-${AERON_JAR_VERSION}.jar"
 
       # Every binary a scenario spawns or shells out to: the pipeline three,

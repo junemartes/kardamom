@@ -14,13 +14,13 @@
 # chaos cases kill executor tasks and nodes (node-failure kills the
 # executor-2 node outright), and a validator co-located there would die
 # as collateral, indistinguishable from a fail-stop. Ports on the aux
-# node: cluster egress 40230, metrics 9006. No conflicts, since no
-# executor runs on the same node.
+# node: cluster egress on a Nomad dynamic port, metrics 9006. No
+# conflicts, since no executor runs on the same node.
 #
 # This job uses file() for its templates, so submit it from the
-# deploy/cluster/ directory. scripts/deploy.sh does this.
+# deploy/cluster/ directory. ansible/deploy.yml does this.
 
-# Digest-pinned image. scripts/deploy.sh
+# Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests). The empty default falls back to the
 # mutable :dev tag in the task config. That fallback is a dev
@@ -54,8 +54,20 @@ variable "lockbox_address" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
+variable "executor_count" {
+  type        = number
+  description = "The executor node count (node_classes.executor.count). The checkpoint peers are executor-<i>.node.<datacenter>.consul."
+  default     = 3
+}
+
 job "validator" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {
@@ -81,21 +93,27 @@ job "validator" {
     # recovery races the advancing retention floor: fetch checkpoint,
     # exit(1), restart, adopt, catch up. It only wins when
     #   recovery_latency < retention_window (= retention_frames / frame_rate).
-    # On the dev host, recovery takes about 42s. At retention 6144,
-    # that becomes a losing race above about 150 tps of frames. Each
-    # losing cycle takes about 80s, burns one restart attempt, and
-    # resolves nothing. mode=fail would then kill the job on the 5th
-    # attempt, even though the race self-resolves once load eases; the
-    # window widens to minutes at idle. A derived, off-hot-path service
-    # should wait that out, not die. mode=delay parks for the rest of
-    # the interval after the 5th attempt, and keeps trying. Treadmill
-    # cycles stay visible through
+    # A refused replay costs one revolution of the treadmill: fetch a
+    # peer checkpoint (about 4s for 256 MB), halt, wait the restart
+    # delay, adopt, ask for replay from the checkpoint's index. The
+    # checkpoint is up to 20s old (the executors' interval). At
+    # retention 6144 and 230 tps the window is 26s, so a revolution with
+    # a 15s delay lost the race every time, and the fifth loss parked
+    # the validator for the rest of the interval (seen in CI: "Exceeded
+    # allowed attempts, applying a delay - Task restarting in 7m36s",
+    # while the race had already resolved once load eased). A 5s delay
+    # keeps a revolution near 10s plus the checkpoint age, and ten
+    # attempts give the race room to resolve before the park. mode=fail
+    # would kill the job instead, even though the window widens to
+    # minutes at idle; a derived, off-hot-path service waits that out.
+    # Treadmill cycles stay visible through
     # validator_resync_total{outcome="peer-checkpoint"}, one increment
-    # per revolution; alert on its rate, not on job death.
+    # per revolution; alert on its rate, not on job death. The in-process
+    # adoption that removes the restart from the revolution is issue #298.
     restart {
-      attempts = 5
+      attempts = 10
       interval = "10m"
-      delay    = "15s"
+      delay    = "5s"
       mode     = "delay"
     }
 
@@ -106,13 +124,22 @@ job "validator" {
 
     network {
       mode = "host"
+      # The cluster egress (response) port, unique per allocation. A
+      # fixed port sat in the node's ephemeral range, where the shared
+      # media driver's port-0 discovery sockets could take it first.
+      port "egress" {}
+      # The join-miss refetch ports: replayed fragments and archive
+      # control responses. Nomad picks them per allocation, below the
+      # ephemeral range, so no other process on the node holds them.
+      port "replay" {}
+      port "archive_response" {}
     }
 
     task "validator" {
       driver = "docker"
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-validator:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-validator:dev"
         # force_pull stays on for both paths; see the ingress job's
         # comment. The :dev fallback needs it. On the pinned path, the
         # 1.9.5 driver pulls the tag but resolves the image by digest,
@@ -144,14 +171,10 @@ job "validator" {
           "--config", "/local/validator.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
-          # This node's cluster-egress (response) endpoint, for the
-          # validator's own cluster client session. Port 40230 stays
-          # distinct from 40210, the executors' egress port convention
-          # on their nodes. Nothing else binds either port on the aux
-          # node; distinct ports keep captures and debugging
-          # unambiguous.
-          "--cluster-egress-endpoint", "${meta.node_ip}:40230",
-          "--shards", "2",
+          # This allocation's cluster-egress (response) endpoint, for
+          # the validator's own cluster client session: the node IP and
+          # a Nomad dynamic port.
+          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",
           # Use the validator's own state directory under the shared
@@ -161,18 +184,17 @@ job "validator" {
           # Join-miss archive refetch (tx_data and tx_deposits). When
           # the live multicast misses a canonical ref's envelope, it
           # replays in-band from the durability archives listed in
-          # channels.toml. Replayed fragments land on 40131, and
-          # archive-control responses land on 40141. The executor uses
-          # 40130/40140 on its own nodes; there is no co-residence, but
-          # keeping the ports distinct avoids confusion. tx_ordering
+          # channels.toml. Replayed fragments and archive-control
+          # responses land on the allocation's dynamic ports, so they
+          # never clash with the batcher's on the aux node. tx_ordering
           # recovery rides the cluster replay.
-          "--replay-destination-endpoint", "${meta.node_ip}:40131",
-          "--archive-control-response-endpoint", "${meta.node_ip}:40141",
+          "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
+          "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
           # Replay-unavailable fallback: fetch a peer checkpoint from
           # the executors' serve endpoints, and adopt it on restart,
           # the same as the executors' recovery-D loop.
           "--checkpoint-dir", "/opt/kardamom/checkpoints",
-          "--checkpoint-peers", "192.168.56.41:9014,192.168.56.42:9014,192.168.56.43:9014",
+          "--checkpoint-peers", join(",", [for i in range(var.executor_count) : "executor-${i}.node.${var.datacenter}.consul:9014"]),
           # Shadow-check the node-incremental state trie against a
           # full rebuild every 8th block. A walker bug fail-stops the
           # validator (a dead alloc is a verdict failure), and bumps
@@ -209,6 +231,10 @@ job "validator" {
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }
 
       # [cluster] ingress endpoints. Same contract as the executor's

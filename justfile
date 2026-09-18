@@ -11,7 +11,7 @@
 # `just bootstrap` installs all of the above for your platform.
 #
 # The multi-node cluster under `deploy/cluster/` needs a different set of HOST
-# tools (Vagrant + a VM provider, Ansible, Docker). `just cluster-bootstrap`
+# tools (Ansible, Docker, OpenTofu, the Nomad CLI). `just cluster-bootstrap`
 # installs those; `just cluster-doctor` checks them.
 
 _default:
@@ -147,6 +147,10 @@ check:
 # Lint with clippy across all features, mirroring CI (-D warnings).
 clippy:
     PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+# Mechanical style checks from docs/STYLE.md. Run before you open a PR.
+style:
+    PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" scripts/style-check.sh
 
 # Run the test suite across all features.
 test:
@@ -302,11 +306,11 @@ test-e2e-local: aeron-jar cluster-jar
 # Multi-node cluster (deploy/cluster) — HOST dependencies.
 #
 # These recipes install the tools needed on this machine to run
-# `cd deploy/cluster && make up`: Vagrant + a VM provider, Ansible (+ the
-# ansible.posix / community.docker collections), Docker with BuildKit, and the
-# Nomad CLI (deploy/cluster/scripts/deploy.sh drives the cluster's Nomad API
-# from the host). Nomad *servers/clients* and Consul run inside the VMs and
-# are installed by Ansible, not here. See deploy/cluster/README.md.
+# `cd deploy/cluster && make container-up`: Ansible (+ the ansible.posix /
+# community.docker collections), Docker with BuildKit, OpenTofu, and the
+# Nomad CLI (the Ansible workload role uses it to compile HCL locally). Nomad
+# *servers/clients* and Consul run inside the node containers and are
+# installed by Ansible, not here. See deploy/cluster/README.md.
 # ---------------------------------------------------------------------------
 
 # Host-side Nomad CLI version. Mirrors nomad_version in
@@ -317,7 +321,7 @@ NOMAD_VERSION := "1.9.5"
 cluster-bootstrap:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Pinned Nomad CLI matching the in-VM agents (deploy.sh needs it on PATH).
+    # Pinned Nomad CLI matching the in-VM agents (Ansible deployment needs it on PATH).
     install_nomad() {
         command -v nomad >/dev/null 2>&1 && return 0
         local ver="{{NOMAD_VERSION}}" os arch zip
@@ -338,52 +342,35 @@ cluster-bootstrap:
     case "$os" in
     Darwin)
         command -v brew >/dev/null 2>&1 || { echo "Homebrew required — https://brew.sh" >&2; exit 1; }
-        echo ">> installing Vagrant + VirtualBox + Docker + Ansible via brew"
-        # VirtualBox is the practical Vagrant provider on macOS (libvirt is
-        # Linux-only). Casks may prompt for sudo / a kernel-extension approval.
-        brew install --cask vagrant virtualbox docker || true
-        brew install ansible
+        echo ">> installing Docker + Ansible + OpenTofu via brew"
+        brew install --cask docker || true
+        brew install ansible opentofu
         install_nomad
-        echo "   NOTE: VirtualBox support on Apple Silicon is limited; a Linux"
-        echo "   host with libvirt/qemu is the best-supported environment."
-        echo "   Start Docker Desktop before running 'make up'."
+        echo "   NOTE: the container cluster needs a Linux Docker daemon with"
+        echo "   privileged containers; Docker Desktop's Linux VM serves that."
         ;;
     Linux)
         . /etc/os-release 2>/dev/null || true
         echo ">> installing cluster host deps (distro: ${ID:-unknown})"
         if command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update
-            # vagrant + libvirt/qemu provider, build deps for the
-            # vagrant-libvirt plugin (ruby-dev/libvirt-dev/gcc/make),
-            # ansible, and docker + buildx (BuildKit).
-            sudo apt-get install -y \
-                vagrant qemu-kvm libvirt-daemon-system libvirt-clients libvirt-dev \
-                dnsmasq-base ebtables ruby-dev gcc make \
-                ansible docker.io docker-buildx
+            sudo apt-get install -y ansible docker.io docker-buildx
         elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y vagrant @virtualization libvirt libvirt-devel qemu-kvm \
-                ansible docker gcc make ruby-devel
+            sudo dnf install -y ansible docker
         elif command -v pacman >/dev/null 2>&1; then
-            sudo pacman -S --needed --noconfirm vagrant libvirt qemu-full dnsmasq \
-                ansible docker
+            sudo pacman -S --needed --noconfirm ansible docker
         else
-            echo "Unsupported Linux distro. Install manually: vagrant, libvirt+qemu," >&2
-            echo "ansible, docker (see deploy/cluster/README.md)." >&2
+            echo "Unsupported Linux distro. Install manually: ansible, docker," >&2
+            echo "opentofu (see deploy/cluster/README.md)." >&2
             exit 1
         fi
-        # vagrant-libvirt provider plugin (idempotent).
-        if ! vagrant plugin list 2>/dev/null | grep -q vagrant-libvirt; then
-            echo ">> installing vagrant-libvirt plugin"
-            vagrant plugin install vagrant-libvirt
-        fi
         install_nomad
-        # Group membership so libvirt + docker work without sudo (needs re-login).
-        for grp in libvirt kvm docker; do
-            getent group "$grp" >/dev/null 2>&1 && sudo usermod -aG "$grp" "$USER" || true
-        done
-        sudo systemctl enable --now libvirtd docker 2>/dev/null || true
-        echo "   NOTE: log out/in (or run 'newgrp docker') so the libvirt/kvm/docker"
-        echo "   group memberships take effect."
+        command -v tofu >/dev/null 2>&1 || echo "   NOTE: install OpenTofu 1.12.6 (https://opentofu.org/docs/intro/install/)"
+        # Group membership so docker works without sudo (needs re-login).
+        getent group docker >/dev/null 2>&1 && sudo usermod -aG docker "$USER" || true
+        sudo systemctl enable --now docker 2>/dev/null || true
+        echo "   NOTE: log out/in (or run 'newgrp docker') so the docker group"
+        echo "   membership takes effect."
         ;;
     *)
         echo "Unsupported platform: $os. See deploy/cluster/README.md." >&2
@@ -395,11 +382,9 @@ cluster-bootstrap:
     ansible-galaxy collection install ansible.posix community.docker
     echo ">> cluster-bootstrap complete. Verify with: just cluster-doctor"
     echo
-    echo "   MANUAL STEP: 'make images' pushes over plain HTTP to the in-cluster"
-    echo "   registry, so this HOST's Docker daemon must list it as insecure:"
-    echo "       { \"insecure-registries\": [\"192.168.56.10:5000\"] }"
-    echo "   (Linux: /etc/docker/daemon.json + restart docker; Docker Desktop:"
-    echo "   Settings > Docker Engine.) 'just cluster-doctor' checks this."
+    echo "   Images are pushed from inside the control node (REGISTRY_PUSH_NODE),"
+    echo "   where the registry name registry.service.consul resolves. This host's"
+    echo "   Docker daemon needs no insecure-registry entry."
 
 # Check that the HOST has everything deploy/cluster needs.
 cluster-doctor:
@@ -409,16 +394,11 @@ cluster-doctor:
     have() { command -v "$1" >/dev/null 2>&1; }
     chk() { if have "$1"; then echo "  ok    $1 — $("$1" --version 2>&1 | head -1)"; else echo "  MISS  $1 ($2)"; rc=1; fi; }
     echo ">> deploy/cluster host dependencies:"
-    chk vagrant "run 'just cluster-bootstrap'"
     chk ansible "run 'just cluster-bootstrap'"
     chk ansible-galaxy "ships with ansible"
     chk docker "run 'just cluster-bootstrap'"
-    chk nomad "run 'just cluster-bootstrap' — deploy.sh drives the cluster API from the host"
-    if have virsh || have VBoxManage; then
-        echo "  ok    vm provider (libvirt or virtualbox)"
-    else
-        echo "  MISS  vm provider — install libvirt+qemu (Linux) or VirtualBox (macOS)"; rc=1
-    fi
+    chk nomad "run 'just cluster-bootstrap' — Ansible uses Nomad to compile job specs"
+    chk tofu "install OpenTofu 1.12.6 — terraform/containers creates the node containers"
     for col in ansible.posix community.docker; do
         if ansible-galaxy collection list 2>/dev/null | grep -q "^$col "; then
             echo "  ok    ansible collection $col"
@@ -426,24 +406,12 @@ cluster-doctor:
             echo "  MISS  ansible collection $col — run 'just cluster-bootstrap'"; rc=1
         fi
     done
-    # Pushing images needs the in-cluster registry allowed as insecure (HTTP)
-    # in THIS host's Docker daemon. 192.168.56.10:5000 mirrors registry_host/
-    # registry_port in deploy/cluster/ansible/group_vars/all.yml.
+    # Images are pushed from inside the control node, so this host's daemon
+    # needs no insecure-registry entry; it only has to run.
     if docker info >/dev/null 2>&1; then
-        if docker info 2>/dev/null | grep -qE '^\s*192\.168\.56\.10:5000$'; then
-            echo "  ok    docker insecure-registry 192.168.56.10:5000"
-        else
-            echo "  MISS  docker insecure-registry 192.168.56.10:5000 — add to the daemon's"
-            echo "        insecure-registries and restart Docker (see cluster-bootstrap notes)"; rc=1
-        fi
+        echo "  ok    docker daemon running"
     else
-        echo "  WARN  docker daemon not running — cannot check insecure-registries"
-    fi
-    # Smoke test (scripts/smoke.sh) prefers foundry's cast; non-fatal.
-    if have cast; then
-        echo "  ok    cast — $(cast --version 2>&1 | head -1)"
-    else
-        echo "  WARN  cast not found — 'make smoke' needs foundry (repo: 'just bootstrap')"
+        echo "  WARN  docker daemon not running"
     fi
     if [[ "$rc" == "0" ]]; then
         echo ">> all good — 'cd deploy/cluster && make up'"

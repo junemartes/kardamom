@@ -2,62 +2,43 @@
 //! the account was read from.
 //!
 //! Genesis-seeded EOAs carry `code_hash = B256::ZERO` in the state DB.
-//! Revm's CacheDB normalizes zero code hashes to KECCAK_EMPTY for
+//! Revm's `CacheDB` normalizes zero code hashes to `KECCAK_EMPTY` for
 //! accounts that pass through an execution scope, but a fresh scope reads
 //! the DB's value verbatim through `SnapshotRef`. The executor executes a
 //! block's txs in one scope, while the validator batches per BAL chunk.
 //! Before the normalization fix, a fresh account's second-ever tx hashed
-//! its sender row with KECCAK_EMPTY on the executor (a same-scope read)
-//! but B256::ZERO on the validator (a fresh-scope read), whenever the two
+//! its sender row with `KECCAK_EMPTY` on the executor (a same-scope read)
+//! but `B256::ZERO` on the validator (a fresh-scope read), whenever the two
 //! txs straddled a validator batch boundary. That gave a false receipt
 //! divergence and a validator fail-stop, over two spellings of "no code".
 //!
 //! This test drives the same two transfers through both batching shapes,
 //! and asserts identical write-set hashes.
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, B256, TxKind, U256, address};
-use alloy_signer_local::PrivateKeySigner;
+use alloy_primitives::{Address, B256, U256, address};
 use kardamom_exec_core::block_env::ExecEnv;
 use kardamom_exec_core::delta::{PendingDelta, WriteSet};
-use kardamom_exec_core::exec_types::TxIndex;
 use kardamom_exec_core::executor::Executor;
 use kardamom_exec_core::state::MockStateDatabase;
-use kardamom_types::{AccountChange, BPosition, BlockDelta, StorageChange, TxEnvelope};
+use kardamom_test_support::{LegacyTx, anvil_signer_0};
+use kardamom_types::{BlockDelta, TxEnvelope};
 
-const CHAIN_ID: u64 = 412346;
+mod common;
+use common::slot;
+
+const CHAIN_ID: u64 = 412_346;
 const RECIPIENT: Address = address!("000000000000000000000000000000000000dEaD");
 
-fn signer() -> PrivateKeySigner {
-    // Anvil dev key #0. Public, for development only.
-    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-        .parse()
-        .unwrap()
-}
-
 fn transfer(nonce: u64) -> TxEnvelope {
-    let s = signer();
-    let mut tx = TxLegacy {
-        chain_id: Some(CHAIN_ID),
+    LegacyTx {
+        chain_id: CHAIN_ID,
+        to: RECIPIENT,
         nonce,
+        value: 1,
         gas_price: 1_000_000_000,
-        gas_limit: 21_000,
-        to: TxKind::Call(RECIPIENT),
-        value: U256::from(1u64),
-        input: Default::default(),
-    };
-    let sig = s.sign_transaction_sync(&mut tx).unwrap();
-    let env = alloy_consensus::TxEnvelope::Legacy(tx.into_signed(sig));
-    let mut raw = Vec::new();
-    env.encode_2718(&mut raw);
-    TxEnvelope {
-        correlation_id: 0,
-        raw_tx: bytes::Bytes::from(raw),
-        sender: s.address(),
-        tx_hash: *env.tx_hash(),
+        ..Default::default()
     }
+    .sign(&anvil_signer_0())
 }
 
 /// A genesis-shaped mock. The sender is set up exactly as `bin_support`
@@ -66,7 +47,7 @@ fn transfer(nonce: u64) -> TxEnvelope {
 fn genesis_db() -> MockStateDatabase {
     MockStateDatabase::builder()
         .account(
-            signer().address(),
+            anvil_signer_0().address(),
             U256::from(1000u64) * U256::from(10u64).pow(U256::from(18)),
             0,
             B256::ZERO,
@@ -82,38 +63,14 @@ fn env() -> ExecEnv {
     }
 }
 
-fn pos(off: i32) -> BPosition {
-    BPosition {
-        term_id: 0,
-        term_offset: off,
-    }
-}
-
+/// `PendingDelta::apply` plus `finalize` already builds a `BlockDelta`
+/// from a `WriteSet` exactly this way; this is just that path with an
+/// empty receipt list, for a test that only cares about accounts and
+/// storage.
 fn delta_from(ws: &WriteSet, block_number: u64) -> BlockDelta {
-    BlockDelta {
-        block_number,
-        accounts: ws
-            .accounts
-            .iter()
-            .map(|(address, (nonce, balance, code_hash))| AccountChange {
-                address: *address,
-                nonce: *nonce,
-                balance: *balance,
-                code_hash: *code_hash,
-            })
-            .collect(),
-        storage: ws
-            .storage
-            .iter()
-            .map(|((address, key), value)| StorageChange {
-                address: *address,
-                key: *key,
-                value: *value,
-            })
-            .collect(),
-        code: Vec::new(),
-        receipts: Vec::new(),
-    }
+    let mut d = PendingDelta::new();
+    d.apply(ws.clone());
+    d.finalize(block_number, Vec::new())
 }
 
 #[test]
@@ -125,10 +82,10 @@ fn second_tx_write_set_is_scope_invariant() {
     let db_a = genesis_db();
     let mut scope = Executor::new(&db_a, None, env()).unwrap();
     let (r0_same, _ws0_same) = scope
-        .execute_tx(TxIndex(0), pos(0), &tx0, 0, 0, None, None)
+        .execute_tx(slot(0, 0, 0, 0), &tx0, None, None)
         .unwrap();
     let (r1_same, _ws1_same) = scope
-        .execute_tx(TxIndex(1), pos(1), &tx1, 1, r0_same.gas_used, None, None)
+        .execute_tx(slot(1, 1, 1, r0_same.gas_used), &tx1, None, None)
         .unwrap();
     assert!(r0_same.status && r1_same.status, "setup: txs must succeed");
 
@@ -141,11 +98,8 @@ fn second_tx_write_set_is_scope_invariant() {
         None,
         &PendingDelta::new(),
         env(),
-        TxIndex(0),
-        pos(0),
+        slot(0, 0, 0, 0),
         &tx0,
-        0,
-        0,
         None,
     )
     .unwrap();
@@ -156,11 +110,8 @@ fn second_tx_write_set_is_scope_invariant() {
         None,
         &PendingDelta::new(),
         env(),
-        TxIndex(1),
-        pos(1),
+        slot(1, 1, 1, r0_split.gas_used),
         &tx1,
-        1,
-        r0_split.gas_used,
         None,
     )
     .unwrap();
@@ -175,6 +126,6 @@ fn second_tx_write_set_is_scope_invariant() {
     // the fresh-scope row carried the DB's B256::ZERO: a false divergence.
     assert_eq!(
         r1_same.write_set_hash, r1_split.write_set_hash,
-        "second-tx write sets diverged between batching shapes (#159)"
+        "second-tx write sets diverged between batching shapes"
     );
 }

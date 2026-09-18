@@ -11,8 +11,21 @@
 # requires the quorum gate. egress_channel is set per-node by
 # --cluster-egress-endpoint (the ingress node IP differs from the cluster nodes).
 [cluster]
-ingress_endpoints = "0=192.168.56.51:40200,1=192.168.56.52:40200,2=192.168.56.53:40200"
+ingress_endpoints = "0=sealer-0.node.consul:40200,1=sealer-1.node.consul:40200,2=sealer-2.node.consul:40200"
 initial_leader_member_id = 0
 ingress_stream_id = 101
 egress_stream_id = 102
 keep_alive_interval_ms = 1000
+
+# The Redis layer (docs/specs/2026-09-13-redis-account-cache-design.md,
+# section 5.2 and section 6): the three sentinels by their node records,
+# the same list the state mirror uses. The readers are fail-open: with
+# Redis down, an admission check is skipped and counted, never a submit.
+# Authentication is deferred; see the spec's section 11 (flag day).
+[cache]
+sentinels = [
+  "redis://aux-0.node.consul:26379",
+  "redis://ingress-0.node.consul:26379",
+  "redis://ingress-1.node.consul:26379",
+]
+master_name = "kardamom"

@@ -1,8 +1,6 @@
 //! Offline integrity checks over a state DB, and a deep table-level
 //! comparison between two of them.
 //!
-//! This module supports the chain-semantics end-to-end test suite. See
-//! docs/agents/chain-semantics-e2e-suite-spec.md.
 //! After a test run, [`sweep`] proves that a single DB is internally
 //! coherent: every row decodes, the header chain is dense, the receipt
 //! index is bijective, and the persisted trie root reproduces from the
@@ -58,9 +56,17 @@ pub struct IntegrityReport {
 }
 
 impl IntegrityReport {
+    #[must_use]
     pub fn is_clean(&self) -> bool {
         self.problems.is_empty()
     }
+}
+
+/// The first up-to-8 bytes of `b`, for a problem or diff report line. A
+/// report only needs enough of a key to eyeball which row diverged, not
+/// the whole thing.
+pub(crate) fn head(b: &[u8]) -> &[u8] {
+    &b[..b.len().min(8)]
 }
 
 /// Run the full invariant sweep over one state DB.
@@ -69,18 +75,23 @@ impl IntegrityReport {
 /// order: meta, headers, receipts and index, accounts, storage, trie.
 /// The order is part of the contract. Tests check the report's counts,
 /// and downstream tooling consumes them.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the transaction or a table open fails. A
+/// row-level problem is reported in [`IntegrityReport::problems`], not
+/// as an error.
 pub fn sweep(env: &StateEnv) -> Result<IntegrityReport, StateError> {
     let txn = env.raw().begin_rw_sync()?;
-    let mut r = IntegrityReport::default();
-
     let meta = txn.open_db(Some(TABLE_META))?;
 
-    let meta_end_tx = checks::check_meta(&txn, meta, &mut r)?;
-    checks::check_headers(&txn, meta_end_tx, &mut r)?;
-    checks::check_receipts_index(&txn, meta_end_tx, &mut r)?;
-    checks::check_accounts(&txn, &mut r)?;
-    checks::check_storage(&txn, &mut r)?;
-    checks::check_trie(&txn, meta, &mut r)?;
+    let mut s = checks::Sweep::new(&txn, meta);
+    let meta_end_tx = s.meta()?;
+    s.headers(meta_end_tx)?;
+    s.receipts_index(meta_end_tx)?;
+    s.accounts()?;
+    s.storage()?;
+    s.trie()?;
 
-    Ok(r)
+    Ok(s.finish())
 }

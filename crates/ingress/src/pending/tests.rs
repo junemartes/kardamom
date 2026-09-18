@@ -1,24 +1,5 @@
 use super::*;
-use alloy_primitives::B256;
-
-fn dummy_receipt(pos: BPosition) -> Receipt {
-    Receipt {
-        tx_idx: pos,
-        tx_hash: B256::ZERO,
-        status: true,
-        gas_used: 21_000,
-        logs: Vec::new(),
-        write_set_hash: B256::ZERO,
-        ..Default::default()
-    }
-}
-
-fn pos(offset: i32) -> BPosition {
-    BPosition {
-        term_id: 0,
-        term_offset: offset,
-    }
-}
+use crate::test_support::{dummy_receipt, pos};
 
 // --- OnQuorum, the default and original behavior ----------------------
 
@@ -74,11 +55,8 @@ async fn tx_error_releases_parked_client_with_duplicate() {
 
 #[tokio::test]
 async fn eviction_releases_the_parked_wait_with_an_evicted_error() {
-    // This is the backlog fix. A sequencer overload-shed (Evicted) must
-    // error the parked submit, instead of leaving it waiting for a
-    // receipt that can never arrive. Before this fix, a silent evict
-    // permanently gapped the sender and pinned the connection until
-    // timeout.
+    // A sequencer overload-shed (Evicted) must error the parked submit,
+    // instead of leaving it waiting for a receipt that can never arrive.
     let p = Arc::new(PendingReceipts::new(AckPolicy::OnOffer));
     let sender = Address::repeat_byte(0x77);
     let nonce = 21u64;
@@ -96,6 +74,32 @@ async fn eviction_releases_the_parked_wait_with_an_evicted_error() {
             assert_eq!((s, n), (sender, nonce));
         }
         other => panic!("expected Evicted release, got {other:?}"),
+    }
+    assert_eq!(p.len(), 0, "entry removed on release");
+}
+
+#[tokio::test]
+async fn expiry_releases_the_parked_wait_with_an_expired_error() {
+    // A sequencer expiry (the transaction waited on a nonce gap for
+    // tx_ttl) must error the parked submit with an explicit reason. The
+    // client then knows to resubmit after the gap fills.
+    let p = Arc::new(PendingReceipts::new(AckPolicy::OnOffer));
+    let sender = Address::repeat_byte(0x78);
+    let nonce = 31u64;
+
+    let wait = p.register(sender, nonce);
+    let waiter = tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(5)).await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    p.on_tx_error(sender, nonce, TxErrorReason::Expired { expected_nonce: 28 })
+        .await;
+
+    let res = waiter.await.expect("join");
+    match res {
+        Err(IngressError::Expired((s, n))) => {
+            assert_eq!((s, n), (sender, nonce));
+        }
+        other => panic!("expected Expired release, got {other:?}"),
     }
     assert_eq!(p.len(), 0, "entry removed on release");
 }
@@ -354,7 +358,7 @@ async fn times_out_when_neither_event_arrives() {
     assert_eq!(p.len(), 0);
 }
 
-// --- Cancelled-future cleanup, the #81 follow-up ------------------------
+// --- Cancelled-future cleanup ------------------------
 
 #[tokio::test]
 async fn dropping_an_unresolved_wait_removes_its_entry() {

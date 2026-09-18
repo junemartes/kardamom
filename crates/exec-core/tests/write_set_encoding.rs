@@ -12,7 +12,12 @@ fn ws(
     code: &[(B256, bytes::Bytes)],
 ) -> WriteSet {
     let mut w = WriteSet::default();
-    w.accounts.extend_from_slice(accounts);
+    w.accounts.extend(accounts.iter().map(|(addr, fields)| {
+        (
+            *addr,
+            kardamom_exec_core::delta::AccountFields::from(*fields),
+        )
+    }));
     w.storage.extend_from_slice(storage);
     for c in code {
         w.code.push(c.clone());
@@ -37,7 +42,11 @@ fn buffered_and_streaming_paths_agree() {
         .map(|i| {
             (
                 addr(i),
-                (i as u64, U256::from(10u64).pow(U256::from(18)), B256::ZERO),
+                (
+                    u64::from(i),
+                    U256::from(10u64).pow(U256::from(18)),
+                    B256::ZERO,
+                ),
             )
         })
         .collect();
