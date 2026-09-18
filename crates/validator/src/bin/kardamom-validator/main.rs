@@ -37,21 +37,15 @@ use anyhow::Result;
 use clap::Parser;
 
 use args::Args;
-use wiring::Startup;
+use wiring::Boot;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
-    let args = Args::parse();
-    let ready = Startup::init(args)
-        .await?
-        .open_state()?
-        .open_streams()
-        .await?
-        .spawn_pumps()?
-        .spawn_writer()?
-        .spawn_attester()?
-        .build_sink();
-    // The run future carries every open handle by value, so it lives on
-    // the heap instead of the main task's stack.
-    Box::pin(ready.run()).await
+    let boot = Boot::init(Args::parse()).await?;
+    // Each turn runs the whole pipeline once. A refused replay stages a
+    // peer checkpoint and comes back here for the next turn, which
+    // adopts it; every other end leaves the loop.
+    let mut revolutions = 0u32;
+    while wiring::turn(&boot, &mut revolutions).await?.is_continue() {}
+    Ok(())
 }

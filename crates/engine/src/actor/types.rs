@@ -203,8 +203,11 @@ impl<D> BlockExecStrategy<D> for NoBlockExec {
     }
 }
 
-/// Internal envelope routed from the exec thread to the commit thread.
+/// Internal envelope routed from the exec thread to the commit thread. A
+/// receipt travels with the account rows its transaction wrote, so the
+/// `tx_receipts` frame can carry them. The receipt is boxed: it is an
+/// order of magnitude larger than a boundary, and the channel holds many.
 pub(crate) enum ExecToCommit {
-    Receipt(kardamom_types::Receipt),
+    Receipt(Box<kardamom_types::ReceiptRows>),
     Boundary(BlockBoundary),
 }

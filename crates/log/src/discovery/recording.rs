@@ -16,21 +16,25 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use super::absence::Absence;
 use super::endpoint::destination_uri;
 use super::record::PublisherRecord;
-use super::watch::Membership;
-use crate::archive_catalog::ArchiveCatalog;
+use super::watch::{CatalogHealth, Membership};
 use crate::config::AeronConfig;
 use crate::error::LogError;
 use crate::recorder::connect_archive;
 
-type Archive = rusteron_archive::AeronArchive;
+mod archive;
+use archive::RecorderArchive;
+
+#[cfg(test)]
+mod tests;
 
 /// How often the thread re-checks the catalog for recordings that have
 /// not appeared yet, between membership changes.
@@ -63,6 +67,7 @@ struct Started {
     recording_id: Option<i64>,
     /// Whether this process registered the publisher.
     own: bool,
+    absence: Absence,
 }
 
 pub struct DiscoveredRecorder {
@@ -73,6 +78,8 @@ pub struct DiscoveredRecorder {
     pub own_instance: String,
     /// How many own publications must record before ready.
     pub expected_own: usize,
+    /// How long a confirmed missing publisher keeps its recording.
+    pub removal_grace: Duration,
     pub membership: watch::Receiver<Membership>,
     pub stop: CancellationToken,
     /// The tokio runtime that drives the waits; the thread itself runs
@@ -81,9 +88,9 @@ pub struct DiscoveredRecorder {
 }
 
 /// The thread's whole state once the archive session is connected.
-struct Recording {
+struct Recording<A: RecorderArchive> {
     spec: DiscoveredRecorder,
-    archive: Archive,
+    archive: A,
     started: BTreeMap<String, Started>,
 }
 
@@ -126,7 +133,7 @@ impl DiscoveredRecorder {
     }
 }
 
-impl Recording {
+impl<A: RecorderArchive> Recording<A> {
     /// One pass: wait for a membership change, a tick, or stop; then
     /// start recordings for new publishers, stop them for departed ones,
     /// resolve pending recording ids, and report readiness. `false` ends
@@ -137,7 +144,7 @@ impl Recording {
         }
         let snapshot = self.spec.membership.borrow_and_update().clone();
         if snapshot.is_known() {
-            self.reconcile(&snapshot.publishers());
+            self.reconcile(&snapshot, Instant::now());
         }
         self.resolve_pending();
         self.report(ready);
@@ -159,10 +166,14 @@ impl Recording {
         })
     }
 
-    /// Start a recording for every publisher not yet recorded, and stop
-    /// the subscription of every recorded publisher the catalog no longer
-    /// lists.
-    fn reconcile(&mut self, publishers: &BTreeMap<super::record::ServiceId, PublisherRecord>) {
+    /// Start missing recordings and stop only publishers whose confirmed
+    /// absence lasts for the removal grace. An outage resets that proof.
+    fn reconcile(&mut self, membership: &Membership, now: Instant) {
+        if !matches!(membership.health, CatalogHealth::Fresh) {
+            self.started.values_mut().for_each(|s| s.absence.clear());
+            return;
+        }
+        let publishers = membership.publishers();
         let desired: BTreeMap<String, &PublisherRecord> = publishers
             .values()
             .map(|p| {
@@ -174,9 +185,13 @@ impl Recording {
             .collect();
         let departed: Vec<String> = self
             .started
-            .keys()
-            .filter(|uri| !desired.contains_key(*uri))
-            .cloned()
+            .iter_mut()
+            .filter_map(|(uri, started)| {
+                started
+                    .absence
+                    .expired(desired.contains_key(uri), now, self.spec.removal_grace)
+                    .then(|| uri.clone())
+            })
             .collect();
         for uri in &departed {
             self.stop_one(uri);
@@ -192,42 +207,18 @@ impl Recording {
     }
 
     fn start_one(&mut self, uri: &str, record: &PublisherRecord) {
-        let channel = match crate::ffi::c_uri(uri, "recording channel") {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(%uri, error = %e, "discovered recorder: bad channel; skipping");
-                return;
-            }
-        };
-        let subscription_id = match self.archive.start_recording(
-            &channel,
-            record.stream_id,
-            rusteron_archive::SOURCE_LOCATION_REMOTE,
-            false,
-        ) {
-            Ok(id) => Some(id),
-            Err(e) => {
-                info!(%uri, error = %e, "discovered recorder: start_recording rejected; adopting the existing recording");
-                None
-            }
-        };
+        let mut started = Started::new(record, &self.spec.own_instance);
+        if let Err(e) = started.begin(&self.archive, uri) {
+            warn!(%uri, error = %e, "discovered recorder: no live recording after start failed; will retry");
+            return;
+        }
         info!(
             %uri,
             stream_id = record.stream_id,
             publisher = %record.publisher_id,
             "discovered recorder: recording publisher"
         );
-        self.started.insert(
-            uri.to_string(),
-            Started {
-                stream_id: record.stream_id,
-                fragment: format!("control={}", record.control),
-                subscription_id,
-                session_id: record.session_id,
-                recording_id: None,
-                own: record.belongs_to(&self.spec.own_instance),
-            },
-        );
+        self.started.insert(uri.to_string(), started);
     }
 
     fn stop_one(&mut self, uri: &str) {
@@ -235,7 +226,7 @@ impl Recording {
             return;
         };
         if let Some(sub) = started.subscription_id
-            && let Err(e) = self.archive.stop_recording_subscription(sub)
+            && let Err(e) = self.archive.stop(sub)
         {
             warn!(%uri, error = %e, "discovered recorder: stop_recording_subscription failed");
         }
@@ -249,32 +240,7 @@ impl Recording {
         self.started
             .values_mut()
             .filter(|s| s.recording_id.is_none())
-            .for_each(|s| s.recording_id = Self::latest_recording(archive, s));
-    }
-
-    /// The highest recording id of the publisher's session on its
-    /// channel. After a restart the catalog also lists the earlier
-    /// incarnation's recording on the same port; the session id tells them
-    /// apart. Without an advertised session id, only a live recording (no
-    /// stop position yet) counts.
-    fn latest_recording(archive: &Archive, started: &Started) -> Option<i64> {
-        let mut latest = None;
-        let listed =
-            archive.for_each_recording_of_channel(started.stream_id, &started.fragment, |d| {
-                let matches = match started.session_id {
-                    Some(session) => d.session_id() == session,
-                    None => d.stop_position() < 0,
-                };
-                if !matches {
-                    return;
-                }
-                let id = d.recording_id();
-                latest = Some(latest.map_or(id, |cur: i64| cur.max(id)));
-            });
-        if let Err(e) = listed {
-            warn!(fragment = %started.fragment, error = %e, "discovered recorder: catalog listing failed; retrying");
-        }
-        latest
+            .for_each(|s| s.recording_id = archive.latest(s));
     }
 
     /// Fire `ready` once every own publication has a recording id.
@@ -298,5 +264,37 @@ impl Recording {
                 own_recordings: own_live,
             });
         }
+    }
+}
+
+impl Started {
+    fn new(record: &PublisherRecord, own_instance: &str) -> Self {
+        Self {
+            stream_id: record.stream_id,
+            fragment: format!("control={}", record.control),
+            subscription_id: None,
+            session_id: record.session_id,
+            recording_id: None,
+            own: record.belongs_to(own_instance),
+            absence: Absence::default(),
+        }
+    }
+
+    /// A rejected start counts only when the archive proves a matching
+    /// live recording exists. Otherwise the caller retries the start.
+    fn begin<A: RecorderArchive>(&mut self, archive: &A, uri: &str) -> Result<(), LogError> {
+        match archive.start(uri, self.stream_id) {
+            Ok(id) => self.subscription_id = Some(id),
+            Err(e) => {
+                let id = archive.latest(self).ok_or(e)?;
+                self.recording_id = Some(id);
+                info!(%uri, recording_id = id, "discovered recorder: adopting a matching live recording");
+            }
+        }
+        Ok(())
+    }
+
+    fn matches_recording(&self, session: i32, stop_position: i64) -> bool {
+        stop_position < 0 && self.session_id.is_none_or(|expected| expected == session)
     }
 }

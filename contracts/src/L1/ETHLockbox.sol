@@ -8,6 +8,7 @@ import {KardamomUUPSBase} from "../factory/KardamomUUPSBase.sol";
 interface IWithdrawalOutputOracle {
     function outputRootAt(uint256 index) external view returns (bytes32);
     function isFinalizable(uint256 index) external view returns (bool);
+    function finalizationWindow() external view returns (uint64);
 }
 
 /// @notice A minimal view of the factory's ownership. The lockbox reads this
@@ -22,7 +23,9 @@ interface IOwnable {
 /// @notice The L1 ETH bridge. It holds ETH deposited through `depositETH`
 ///         (the on-ramp). It releases ETH through `finalizeWithdrawal` (the
 ///         off-ramp) after a withdrawal proves inclusion in an attested,
-///         finalized output root.
+///         finalized output root. An egress cap bounds the value that
+///         leaves through the off-ramp per window, in total and per
+///         L2 account.
 contract ETHLockbox is KardamomUUPSBase {
     /// @notice An L2-to-L1 withdrawal, as recorded by the L2
     ///         `L2ToL1MessagePasser` contract. The leaf hash is
@@ -60,14 +63,32 @@ contract ETHLockbox is KardamomUUPSBase {
     /// @notice A counter that increases with each upgrade. It only helps
     ///         with observability and idempotence checks. The L2 side
     ///         dedups on the L1 log position, not on this counter.
-    /// @dev    This variable must stay last. `depositNonce` and `l2Minter`
-    ///         share slot 0, and `outputOracle` and `finalizedWithdrawals`
-    ///         follow them. A new variable inserted above would shift
-    ///         these slots and corrupt a live proxy's state on upgrade.
-    ///         Appending a variable is safe for storage layout, and a
-    ///         zero value is the correct start value, so this needs no
-    ///         `reinitializer`.
+    /// @dev    This variable must stay after `finalizedWithdrawals`.
+    ///         `depositNonce` and `l2Minter` share slot 0, and
+    ///         `outputOracle` and `finalizedWithdrawals` follow them. A new
+    ///         variable inserted above would shift these slots and corrupt
+    ///         a live proxy's state on upgrade. Appending a variable is safe
+    ///         for storage layout, and a zero value is the correct start
+    ///         value, so this needs no `reinitializer`. The egress cap
+    ///         variables are appended after this one.
     uint64 public upgradeNonce;
+
+    // -------------------------------------------------------------------------
+    // Egress cap. The variables below are appended after `upgradeNonce`.
+    // Every later addition must go after them.
+    // -------------------------------------------------------------------------
+
+    /// @notice The total value (wei) that can finalize per window (`E`).
+    ///         Zero disables the total cap.
+    uint256 public egressCapPerWindow;
+    /// @notice The value (wei) that one L2 account can finalize per window.
+    ///         This is the per-account share of `E`. Zero disables the
+    ///         per-account cap.
+    uint256 public egressAccountCapPerWindow;
+    /// @notice Value finalized per window id.
+    mapping(uint256 => uint256) public egressUsed;
+    /// @notice Value finalized per window id and L2 sender.
+    mapping(uint256 => mapping(address => uint256)) public egressUsedBy;
 
     event DepositInitiated(
         uint64 indexed depositNonce,
@@ -80,6 +101,7 @@ contract ETHLockbox is KardamomUUPSBase {
     event WithdrawalFinalized(
         bytes32 indexed withdrawalHash, address indexed target, uint256 value
     );
+    event EgressLimitsUpdated(uint256 capPerWindow, uint256 accountCapPerWindow);
 
     /// @notice The upgrade transaction. It is an L1-authorized instruction
     ///         that schedules an L2 feature flag. The DA watcher derives a
@@ -100,6 +122,7 @@ contract ETHLockbox is KardamomUUPSBase {
     error NotFinalizable();
     error TransferFailed();
     error NotUpgradeAuthority();
+    error EgressCapExceeded();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -126,6 +149,27 @@ contract ETHLockbox is KardamomUUPSBase {
 
     receive() external payable {
         revert();
+    }
+
+    /// @notice Set the egress caps. Only the Kardamom factory can call
+    ///         this. The caps are operator parameters of the trust set.
+    ///         The share rule is public: each L2 account can finalize at
+    ///         most `accountCapPerWindow` per window, and all accounts
+    ///         together at most `capPerWindow`. A withdrawal above a cap
+    ///         reverts and can retry in a later window. Zero disables a cap.
+    function setEgressLimits(uint256 capPerWindow, uint256 accountCapPerWindow) external {
+        if (msg.sender != FACTORY) revert NotFactory();
+        egressCapPerWindow = capPerWindow;
+        egressAccountCapPerWindow = accountCapPerWindow;
+        emit EgressLimitsUpdated(capPerWindow, accountCapPerWindow);
+    }
+
+    /// @notice The current egress window id. The window length is the
+    ///         oracle's finalization window, so the cap and the delay use
+    ///         one clock.
+    function egressWindowId() public view returns (uint256) {
+        uint64 window = IWithdrawalOutputOracle(outputOracle).finalizationWindow();
+        return block.timestamp / uint256(window);
     }
 
     // -------------------------------------------------------------------------
@@ -184,6 +228,11 @@ contract ETHLockbox is KardamomUUPSBase {
     ///         output is proposed, so a challenger has the full window to
     ///         delete a bad output before any withdrawal under it can
     ///         finalize.
+    ///
+    ///         The egress cap is checked last. A withdrawal that would push
+    ///         the window total or the L2 sender's total above its cap
+    ///         reverts with `EgressCapExceeded`. It is not consumed and can
+    ///         retry in a later window.
     function finalizeWithdrawal(
         WithdrawalTransaction calldata wtx,
         uint256 outputIndex,
@@ -205,6 +254,7 @@ contract ETHLockbox is KardamomUUPSBase {
         if (!IWithdrawalOutputOracle(outputOracle).isFinalizable(outputIndex)) {
             revert NotFinalizable();
         }
+        _recordEgress(wtx.sender, wtx.value);
 
         finalizedWithdrawals[wh] = true;
         // Paying an arbitrary target is this contract's purpose. The Merkle
@@ -216,6 +266,25 @@ contract ETHLockbox is KardamomUUPSBase {
         (bool ok,) = wtx.target.call{value: wtx.value}("");
         if (!ok) revert TransferFailed();
         emit WithdrawalFinalized(wh, wtx.target, wtx.value);
+    }
+
+    /// @dev Charge `value` against the window caps, or revert. Both caps
+    ///      disabled means no accounting and no storage writes.
+    function _recordEgress(address l2Sender, uint256 value) internal {
+        uint256 cap = egressCapPerWindow;
+        uint256 accountCap = egressAccountCapPerWindow;
+        if (cap == 0 && accountCap == 0) return;
+        uint256 windowId = egressWindowId();
+        if (cap != 0) {
+            uint256 used = egressUsed[windowId] + value;
+            if (used > cap) revert EgressCapExceeded();
+            egressUsed[windowId] = used;
+        }
+        if (accountCap != 0) {
+            uint256 usedBy = egressUsedBy[windowId][l2Sender] + value;
+            if (usedBy > accountCap) revert EgressCapExceeded();
+            egressUsedBy[windowId][l2Sender] = usedBy;
+        }
     }
 
     /// @notice The canonical withdrawal leaf hash. This matches

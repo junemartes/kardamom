@@ -13,7 +13,7 @@ use super::super::{AeronRuntime, PubHandle, RawFrame, TypedSubscription};
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
-use kardamom_types::{BPosition, BlockBoundary, Receipt};
+use kardamom_types::{BPosition, BlockBoundary, Receipt, ReceiptBatch};
 
 /// Attach replicas `0..executor_count` to an MDS fan-in subscription. This
 /// is the shared loop behind the receipts/boundary `open_auto`
@@ -238,31 +238,41 @@ impl TxReceiptsPublisherHandle {
         })
     }
 
-    /// Publish a batch of receipts as one wire frame (`Vec<Receipt>`,
-    /// rkyv-encoded). This is one encode, one offer, and one ack round
-    /// trip per batch, not per receipt, which keeps the executor's commit
-    /// thread off a blocking cross-thread ack round trip on every receipt
-    /// at thousands of receipts per second. The subscriber fans a batch
-    /// back out into individual `(BPosition, Receipt)` deliveries. Every
+    /// Publish a batch of receipts as one wire frame (a rkyv-encoded
+    /// [`ReceiptBatch`]: the receipts plus the merged account rows they
+    /// wrote). This is one encode, one offer, and one ack round trip per
+    /// batch, not per receipt, which keeps the executor's commit thread
+    /// off a blocking cross-thread ack round trip on every receipt at
+    /// thousands of receipts per second. The subscriber fans a batch back
+    /// out into individual `(BPosition, Receipt)` deliveries, or hands the
+    /// whole batch over with [`TxReceiptsReceiver::recv_batch`]. Every
     /// receipt in a batch shares the frame's stream position (consumers
     /// key on `Receipt.tx_idx`, not the stream position). All receipt
-    /// frames are batch frames; a single receipt
-    /// rides a batch of one.
+    /// frames are batch frames; a single receipt rides a batch of one.
+    ///
+    /// Frame size: Aeron caps a message at one eighth of the term length,
+    /// 2 MB on the UDP default. Sixty-four receipts with logs and rows
+    /// stay far inside that in any realistic block.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying Aeron offer fails or times
     /// out.
-    pub fn publish_receipts(&self, batch: &Vec<Receipt>) -> Result<BPosition, LogError> {
+    pub fn publish_receipts(&self, batch: &ReceiptBatch) -> Result<BPosition, LogError> {
         self.inner.publish(batch)
     }
 
+    /// Publish one receipt with no account rows, as a batch of one.
+    ///
     /// # Errors
     ///
     /// Returns an error if the underlying Aeron offer fails or times
     /// out (see [`publish_receipts`](Self::publish_receipts)).
     pub fn publish_receipt(&self, r: &Receipt) -> Result<BPosition, LogError> {
-        self.publish_receipts(&vec![r.clone()])
+        self.publish_receipts(&ReceiptBatch {
+            receipts: vec![r.clone()],
+            accounts: Vec::new(),
+        })
     }
 
     /// # Errors
@@ -332,6 +342,11 @@ impl TxReceiptsSubscriberHandle {
 
     pub fn try_recv(&mut self) -> Option<(BPosition, Receipt)> {
         self.receiver.try_recv()
+    }
+
+    /// See [`TxReceiptsReceiver::recv_batch`].
+    pub async fn recv_batch(&mut self) -> Option<(BPosition, ReceiptBatch)> {
+        self.receiver.recv_batch().await
     }
 
     /// The single-shared-channel subscriber (IPC default).
@@ -445,19 +460,37 @@ impl TxReceiptsReceiver {
         }
         self.pending.pop_front()
     }
+
+    /// The next whole batch frame, receipts and account rows together. A
+    /// consumer that reads batches must not also call [`recv`](Self::recv)
+    /// on the same receiver: `recv` fans a frame out into receipts and
+    /// drops its rows. A malformed frame is skipped.
+    pub async fn recv_batch(&mut self) -> Option<(BPosition, ReceiptBatch)> {
+        loop {
+            let frame = self.rx.recv().await?;
+            let Some(batch) = decode_batch(&frame) else {
+                continue;
+            };
+            return Some((frame.pos, batch));
+        }
+    }
+}
+
+/// Decode one `tx_receipts` batch frame. A malformed frame logs and
+/// yields `None`, so the caller tries the next frame instead of ending
+/// the subscription.
+fn decode_batch(frame: &RawFrame) -> Option<ReceiptBatch> {
+    codec::materialize::<ReceiptBatch>(&frame.bytes)
+        .inspect_err(|e| error!(error = %e, "decode failed on tx_receipts batch delivery"))
+        .ok()
 }
 
 /// Decode one `tx_receipts` batch frame into its individual receipts, in
-/// frame order. A malformed frame logs and yields no receipts, so the
-/// caller's loop tries the next frame instead of ending the subscription.
+/// frame order, dropping the account rows.
 fn decode_receipt_batch(frame: &RawFrame) -> VecDeque<(BPosition, Receipt)> {
-    match codec::materialize::<Vec<Receipt>>(&frame.bytes) {
-        Ok(batch) => batch.into_iter().map(|r| (frame.pos, r)).collect(),
-        Err(e) => {
-            error!(error = %e, "decode failed on tx_receipts batch delivery");
-            VecDeque::new()
-        }
-    }
+    decode_batch(frame)
+        .map(|b| b.receipts.into_iter().map(|r| (frame.pos, r)).collect())
+        .unwrap_or_default()
 }
 
 impl MdsSubscriber for TxReceiptsSubscriberHandle {
@@ -656,8 +689,12 @@ mod tests {
                 ..Default::default()
             },
         ];
+        let frame = ReceiptBatch {
+            receipts: batch.clone(),
+            accounts: Vec::new(),
+        };
         tx.send(RawFrame {
-            bytes: codec::encode(&batch).unwrap().to_vec(),
+            bytes: codec::encode(&frame).unwrap().to_vec(),
             pos,
             session: 0,
         })
@@ -672,5 +709,44 @@ mod tests {
             receiver.try_recv().is_none(),
             "every receipt in the one frame was already drained"
         );
+    }
+
+    /// `recv_batch` hands the whole frame over, rows included, and skips a
+    /// frame that does not decode.
+    #[tokio::test]
+    async fn recv_batch_keeps_the_rows_and_skips_a_bad_frame() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut receiver = TxReceiptsReceiver {
+            rx,
+            pending: VecDeque::new(),
+        };
+        let pos = BPosition {
+            term_id: 1,
+            term_offset: 2,
+        };
+        let frame = ReceiptBatch {
+            receipts: vec![Receipt::default()],
+            accounts: vec![kardamom_types::AccountRow {
+                address: alloy_primitives::Address::repeat_byte(0xAA),
+                nonce: 7,
+                balance: alloy_primitives::U256::from(9u64),
+            }],
+        };
+        tx.send(RawFrame {
+            bytes: vec![0xFF; 3],
+            pos,
+            session: 0,
+        })
+        .unwrap();
+        tx.send(RawFrame {
+            bytes: codec::encode(&frame).unwrap().to_vec(),
+            pos,
+            session: 0,
+        })
+        .unwrap();
+
+        let (got_pos, got) = receiver.recv_batch().await.expect("the good frame");
+        assert_eq!(got_pos, pos);
+        assert_eq!(got, frame);
     }
 }

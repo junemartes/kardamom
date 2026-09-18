@@ -4,7 +4,7 @@ images_root: "{{ images_cluster_dir }}/../.."
 images_registry: "{{ lookup('env', 'REGISTRY') | default(registry_host ~ ':' ~ registry_port, true) }}"
 images_tag: "{{ lookup('env', 'TAG') | default(image_tag, true) }}"
 images_manifest: "{{ [images_cluster_dir, lookup('env', 'DIGEST_MANIFEST') | default('images.digests', true)] | path_join }}"
-images_services: [ingress, sequencer, executor, validator, da-watcher, batcher]
+images_services: [ingress, sequencer, executor, validator, da-watcher, batcher, state-mirror]
 images_release_dir: "{{ images_root }}/target/release"
 images_cluster_jar: "{{ images_root }}/cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar"
 images_push_node: "{{ lookup('env', 'REGISTRY_PUSH_NODE') }}" # e.g. control-0; empty pushes directly

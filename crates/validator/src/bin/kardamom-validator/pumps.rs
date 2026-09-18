@@ -1,6 +1,6 @@
 //! Verification-stream pump tasks: `tx_bal` (with its silence watchdog),
 //! `tx_receipts`, and the committed-block metrics/attester poller. Each runs
-//! on the binary's tokio runtime for the process lifetime.
+//! on the binary's tokio runtime for one revolution of the pipeline.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -294,10 +294,21 @@ impl ReceiptsPump {
         let next = tokio::select! {
             biased;
             () = self.shutdown.cancelled() => return None,
-            r = self.rx.recv() => r,
+            r = self.rx.recv_batch() => r,
         };
-        let (_pos, r) = next?;
-        self.receipts.insert(r);
+        let (_pos, batch) = next?;
+        let end = batch.end_tx_idx();
+        let kardamom_types::ReceiptBatch { receipts, accounts } = batch;
+        // Rows first, so the commit thread finds them whenever it finds
+        // the batch's end receipt.
+        if let Some(end) = end
+            && !accounts.is_empty()
+        {
+            self.receipts.insert_rows(end, accounts);
+        }
+        for r in receipts {
+            self.receipts.insert(r);
+        }
         Some(())
     }
 }

@@ -21,11 +21,11 @@ use crate::wire::{EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE};
 // waits forever for a replay nobody asked for. Resend every
 // REPLAY_RESEND_MS until the leader's answer arrives (see `ReplayAsk`).
 const REPLAY_RESEND_MS: u64 = 3_000;
-// Egress-liveness watchdog (canonical-stream consumers only). If the
-// session is connected but no egress frame has arrived for this long,
-// the session's egress path is dead. The sealer broadcasts a boundary on
-// every tick (2s or less) to every session, so a connected consumer
-// should never legitimately see 10s of egress silence. This happens when
+// Egress-liveness watchdog (every session). If the session is connected
+// but no egress frame has arrived for this long, the session is dead.
+// The sealer broadcasts a boundary on every tick (2s or less) to every
+// session, publishers included, so a connected client should never
+// legitimately see 10s of egress silence. This happens when
 // the egress subscription's image dies under it (for example, an
 // unfillable gap after a poll stall over 2s: the image reaches
 // end-of-stream and, with no_unavailable_image_handler, is never
@@ -37,9 +37,15 @@ const REPLAY_RESEND_MS: u64 = 3_000;
 // a session re-establishment makes the cluster open a new egress
 // publication (a fresh image end-to-end), and the consumer's
 // replay-on-connect closes the gap from its cursor. This is the exact
-// recovery that REPLAY_FROM exists to make gapless. Publisher-only
-// clients (no `replay`) legitimately receive almost no egress, so the
-// watchdog runs only for consumers.
+// recovery that REPLAY_FROM exists to make gapless.
+//
+// A publisher-only client (the sequencer) needs the watchdog too. After
+// a quorum loss, a restarted leader can stop serving a surviving
+// session: no boundary reaches it again, and the consensus module drops
+// its offers without a reply, while the local publication still accepts
+// them. The client then offers into a void forever (the chaos-cluster
+// cpu-squeeze zero-accept, with the sealer's canonical count frozen).
+// A new session is the only way out, and a publisher needs no replay.
 const EGRESS_SILENCE_RESET_MS: u64 = 10_000;
 // Backoff cap for consecutive fruitless resets. A forced
 // re-establishment leaks its predecessor session on the server for up
@@ -146,6 +152,48 @@ impl ReplayAsk {
     }
 }
 
+/// The egress-silence window of one session (see
+/// [`EGRESS_SILENCE_RESET_MS`]). A frame for this session, or a new
+/// session, restarts the window. A fruitless reset doubles the window, up
+/// to [`EGRESS_SILENCE_RESET_MAX_MS`], and a real frame snaps it back.
+struct EgressWatch {
+    alive_at_ms: u64,
+    window_ms: u64,
+}
+
+impl EgressWatch {
+    fn new(now: u64) -> Self {
+        Self {
+            alive_at_ms: now,
+            window_ms: EGRESS_SILENCE_RESET_MS,
+        }
+    }
+
+    /// A frame for this session arrived: the path works.
+    fn on_frame(&mut self, now: u64) {
+        self.alive_at_ms = now;
+        self.window_ms = EGRESS_SILENCE_RESET_MS;
+    }
+
+    /// A session was (re)established. The window restarts, so a fresh
+    /// session is not reset before its first frame can arrive.
+    fn on_connect(&mut self, now: u64) {
+        self.alive_at_ms = now;
+    }
+
+    /// The silence to report when the window has passed, or `None`.
+    /// When it fires, the next window doubles and starts now.
+    fn expired(&mut self, now: u64) -> Option<u64> {
+        let silent_ms = now.saturating_sub(self.alive_at_ms);
+        if silent_ms < self.window_ms {
+            return None;
+        }
+        self.alive_at_ms = now;
+        self.window_ms = (self.window_ms * 2).min(EGRESS_SILENCE_RESET_MAX_MS);
+        Some(silent_ms)
+    }
+}
+
 /// The four channel and stop seams that connect the session thread to
 /// its owner: egress frames in from the Aeron subscription, offer
 /// requests in from [`LiveIngress`](super::LiveIngress) clones,
@@ -208,13 +256,7 @@ struct SessionLoop {
     req_rx_dead: bool,
     out_tx: Sender<Vec<u8>>,
     stop: Arc<AtomicBool>,
-    // Last time an egress frame arrived, or a session was (re)established.
-    // The silence window must restart on connect. Otherwise a fresh
-    // session would reset before its first frame had a chance to arrive.
-    egress_alive_at_ms: u64,
-    // Current watchdog window. It doubles on each fruitless reset, up to
-    // EGRESS_SILENCE_RESET_MAX_MS, and snaps back on any real egress frame.
-    egress_silence_reset_ms: u64,
+    egress_watch: EgressWatch,
     replay_ask: ReplayAsk,
     subscribe_resend: Resend,
     subscribe_confirmed: bool,
@@ -305,8 +347,7 @@ impl SessionLoop {
             req_rx_dead: false,
             out_tx: seams.out_tx,
             stop: seams.stop,
-            egress_alive_at_ms: now_ms(),
-            egress_silence_reset_ms: EGRESS_SILENCE_RESET_MS,
+            egress_watch: EgressWatch::new(now_ms()),
             replay_ask: ReplayAsk::new(),
             subscribe_resend: Resend::new(SUBSCRIBE_RESEND_MS),
             subscribe_confirmed: false,
@@ -337,10 +378,7 @@ impl SessionLoop {
         // reaps it at the 90s session timeout) returns no events, and
         // must not feed the watchdog: only session-filtered events do.
         if !events.is_empty() {
-            self.egress_alive_at_ms = now_ms();
-            // Real egress means the path works again. Reset the watchdog
-            // backoff so a future outage gets the fast first retry.
-            self.egress_silence_reset_ms = EGRESS_SILENCE_RESET_MS;
+            self.egress_watch.on_frame(now_ms());
         }
         for ev in events {
             self.on_driver_event(ev);
@@ -362,7 +400,7 @@ impl SessionLoop {
                 self.replay_ask.rearm();
                 self.subscribe_resend.rearm();
                 self.subscribe_confirmed = false;
-                self.egress_alive_at_ms = now_ms();
+                self.egress_watch.on_connect(now_ms());
             }
             DriverEvent::Failed(reason) => {
                 tracing::error!(%reason, "cluster session failed");
@@ -395,22 +433,32 @@ impl SessionLoop {
     /// move together with the publication, so a failed open keeps all three
     /// on the old leader.
     fn on_reconnect(&mut self, leader_member_id: i32, ingress_endpoints: String) {
-        if let Some(p) = open_leader_pub(
+        let Some(p) = open_leader_pub(
             &self.rt,
             &ingress_endpoints,
             leader_member_id,
             self.cfg.ingress_stream_id,
-        ) {
-            self.ingress = p;
-            self.endpoints = ingress_endpoints;
-            self.target_member = leader_member_id;
-        }
+        ) else {
+            tracing::warn!(
+                leader_member_id,
+                "cluster session: could not open ingress to the new leader; keeping the old target"
+            );
+            return;
+        };
+        tracing::info!(
+            leader_member_id,
+            previous_member = self.target_member,
+            "cluster session: ingress re-pointed at the leader"
+        );
+        self.ingress = p;
+        self.endpoints = ingress_endpoints;
+        self.target_member = leader_member_id;
     }
 
-    /// Duty 1a: egress-liveness watchdog (consumers only, see
+    /// Duty 1a: egress-liveness watchdog (every session, see
     /// [`EGRESS_SILENCE_RESET_MS`]). A connected session whose egress has
-    /// been silent past the window is dead in the egress direction, so
-    /// this forces a re-establishment. The close for the old session
+    /// been silent past the window is dead, so this forces a
+    /// re-establishment. The close for the old session
     /// goes best-effort on ingress (that direction still works: it kept
     /// delivering our replay requests), so the cluster reaps the zombie
     /// instead of keeping it alive on our keep-alives. The driver then
@@ -418,27 +466,21 @@ impl SessionLoop {
     /// the replay-on-connect below closes the canonical-stream gap from
     /// the cursor.
     fn watchdog(&mut self) {
-        if self.replay.is_none() || !self.driver.is_connected() {
+        if !self.driver.is_connected() {
             return;
         }
-        let now = now_ms();
-        let silent_ms = now.saturating_sub(self.egress_alive_at_ms);
-        if silent_ms < self.egress_silence_reset_ms {
+        let Some(silent_ms) = self.egress_watch.expired(now_ms()) else {
             return;
-        }
-        // Fruitless-reset backoff (reset on the next real frame).
-        let next_window_ms = (self.egress_silence_reset_ms * 2).min(EGRESS_SILENCE_RESET_MAX_MS);
+        };
         tracing::warn!(
             silent_ms,
-            next_window_ms,
+            next_window_ms = self.egress_watch.window_ms,
             "cluster egress silent while connected — forcing session \
              re-establishment (replay-on-connect will close the gap)"
         );
         if let Some(close_frame) = self.driver.force_reconnect("egress silent") {
             self.ingress.publish_best_effort(to_aligned(&close_frame));
         }
-        self.egress_alive_at_ms = now;
-        self.egress_silence_reset_ms = next_window_ms;
     }
 
     /// Duty 1a': egress-subscribe announcement (canonical-stream
@@ -627,6 +669,57 @@ impl SessionLoop {
 mod tests {
     use super::*;
     use crate::wire::{EGRESS_KIND_BOUNDARY, EGRESS_KIND_RELAYED};
+
+    #[test]
+    fn egress_watch_fires_after_silence_and_backs_off() {
+        let mut watch = EgressWatch::new(0);
+        assert_eq!(watch.expired(EGRESS_SILENCE_RESET_MS - 1), None);
+        assert_eq!(
+            watch.expired(EGRESS_SILENCE_RESET_MS),
+            Some(EGRESS_SILENCE_RESET_MS),
+            "a silent session resets after one window"
+        );
+        let t = EGRESS_SILENCE_RESET_MS;
+        assert_eq!(
+            watch.expired(t + EGRESS_SILENCE_RESET_MS),
+            None,
+            "a fruitless reset doubles the next window"
+        );
+        assert_eq!(
+            watch.expired(t + 2 * EGRESS_SILENCE_RESET_MS),
+            Some(2 * EGRESS_SILENCE_RESET_MS)
+        );
+        let t = t + 2 * EGRESS_SILENCE_RESET_MS;
+        (0..4).fold(t, |t, _| {
+            let next = t + watch.window_ms;
+            assert!(watch.expired(next).is_some());
+            next
+        });
+        assert_eq!(
+            watch.window_ms, EGRESS_SILENCE_RESET_MAX_MS,
+            "the window caps"
+        );
+    }
+
+    #[test]
+    fn egress_watch_restarts_on_frames_and_connects() {
+        let mut watch = EgressWatch::new(0);
+        assert!(watch.expired(EGRESS_SILENCE_RESET_MS).is_some());
+        let t = EGRESS_SILENCE_RESET_MS + 5;
+        watch.on_frame(t);
+        assert_eq!(
+            watch.window_ms, EGRESS_SILENCE_RESET_MS,
+            "a real frame snaps the window back"
+        );
+        assert_eq!(watch.expired(t + EGRESS_SILENCE_RESET_MS - 1), None);
+        let t = t + EGRESS_SILENCE_RESET_MS - 1;
+        watch.on_connect(t);
+        assert_eq!(
+            watch.expired(t + EGRESS_SILENCE_RESET_MS - 1),
+            None,
+            "a new session gets a full window for its first frame"
+        );
+    }
 
     #[test]
     fn replay_ask_resends_until_the_leader_answers() {

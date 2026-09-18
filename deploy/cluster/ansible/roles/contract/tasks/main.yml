@@ -7,6 +7,8 @@
       - partition_count in [1, 2, 4, 8]
       - tx_ttl_ms | int > 0
       - node_classes.sealer.count == cluster_member_count
+      # The Redis layer: the readers and the mirror share one sentinel port.
+      - ports.redis_sentinel | int > 0
 
 - name: Read the checked-in shard map
   ansible.builtin.set_fact:

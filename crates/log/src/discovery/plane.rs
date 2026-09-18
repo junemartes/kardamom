@@ -392,6 +392,15 @@ impl StreamPlane {
         self.discovered.as_ref().map(|d| d.ip)
     }
 
+    /// The removal grace shared by subscribers and archive recorders.
+    /// Static planes have no catalog-driven removals.
+    #[must_use]
+    pub fn removal_grace(&self) -> Duration {
+        self.discovered
+            .as_ref()
+            .map_or(Duration::ZERO, |d| d.cfg.removal_grace())
+    }
+
     /// The instance id every record of a discovered plane carries,
     /// `None` on a static one.
     #[must_use]

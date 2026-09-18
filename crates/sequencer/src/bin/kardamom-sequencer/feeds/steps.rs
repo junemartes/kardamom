@@ -6,6 +6,7 @@
 use alloy_primitives::Address;
 use std::ops::ControlFlow;
 
+use kardamom_cache::QueryError;
 use kardamom_sequencer::metrics as seq_metrics;
 
 use super::{EgressWatermarkFeed, NonceLookupFeed};
@@ -41,12 +42,8 @@ impl NonceLookupFeed {
 
     /// Record and log a failed lookup, for [`Self::on_done`]'s error arm.
     /// Always continues: a failed lookup does not end the drain.
-    pub(super) fn record_lookup_error(&self, sender: Address, e: &str) -> ControlFlow<()> {
-        let outcome = if e.contains("timed out") {
-            "timeout"
-        } else {
-            "error"
-        };
+    pub(super) fn record_lookup_error(&self, sender: Address, e: &QueryError) -> ControlFlow<()> {
+        let outcome = if e.is_timeout() { "timeout" } else { "error" };
         seq_metrics::record_nonce_lookup(self.partition, outcome);
         tracing::warn!(sender = ?sender, error = %e, "nonce lookup failed");
         ControlFlow::Continue(())

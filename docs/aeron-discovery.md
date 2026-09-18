@@ -186,12 +186,17 @@ restarting. `ansible/contract.yml` checks the chain id mirror, the
 placeholders, the role tag, and the node meta the Nomad agent template
 stamps.
 
-| Job | `KARDAMOM_MDC_PORTS` | Publications |
-| --- | --- | --- |
-| ingress | `40300-40319` | 8 `tx_data` lanes |
-| executor | `40320-40329` | receipts, boundaries, BAL |
-| da-watcher | `40330-40339` | deposits, remote epochs |
-| sequencer lane `n` | `40340+10n` to `40349+10n` | `tx_errors` |
+The Nomad jobs leave `KARDAMOM_MDC_PORTS` unset. The OS picks the
+control port of each publication, and the publisher record carries it. A
+fixed range sat in the node's ephemeral range, where a port-0 socket of
+the shared media driver could take a port first.
+
+| Job | Publications |
+| --- | --- |
+| ingress | 8 `tx_data` lanes |
+| executor | receipts, boundaries, BAL |
+| da-watcher | deposits, remote epochs |
+| sequencer lane `n` | `tx_errors` |
 
 The aeron system job registers the archive record with the node's
 `archive_topics` meta: `tx_data` on the ingress nodes, `tx_deposits` on

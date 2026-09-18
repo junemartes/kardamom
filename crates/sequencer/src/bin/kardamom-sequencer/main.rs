@@ -107,7 +107,7 @@ struct Args {
     /// This node's cluster-egress endpoint `ip:port` (cluster mode). Sets
     /// or overrides the `[cluster] egress_channel` as
     /// `aeron:udp?endpoint=<ip:port>`. The Nomad job injects this per node
-    /// as `${meta.node_ip}:<cluster_egress_port>`.
+    /// as `${meta.node_ip}:${NOMAD_HOST_PORT_egress}`.
     #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
     cluster_egress_endpoint: Option<String>,
     /// Address for the Prometheus /metrics HTTP listener.
@@ -378,13 +378,26 @@ impl ResyncWiring {
             .tx_receipts_subscriber(receipts_rt, executor_count)
             .context("open tx_receipts")?;
         let vslots = cfg.vslot_set().context("vslots")?;
-        let receipts_task = feeds::ReceiptFloorFeed::new(vslots, floor_tx.clone())
+        // The local account layer: the receipts feed writes the rows of
+        // this replica's vslots, the lookup task reads them.
+        let (live, live_writer) = kardamom_cache::LiveAccounts::new(&cfg.live_accounts);
+        // The Redis layer, when `[cache]` names an address. The mirror ids
+        // are the executor indexes; one when no count is known.
+        let redis = cfg.cache.enabled().then(|| {
+            let mirrors = executor_count.unwrap_or(NonZeroU32::MIN);
+            std::sync::Arc::new(kardamom_cache::CacheReader::spawn(
+                &cfg.cache,
+                mirrors,
+                live.clone(),
+            ))
+        });
+        let receipts_task = feeds::ReceiptFloorFeed::new(vslots, floor_tx.clone(), live_writer)
             .spawn(receipts_sub, shutdown.clone());
 
         // The nonce lookup task. It shares the floor channel with the
         // receipts feed: an executor's committed nonce is floor evidence
         // of the same kind as a receipt.
-        let (lookup, lookup_task) = Self::spawn_lookup(cfg, floor_tx, shutdown)?;
+        let (lookup, lookup_task) = Self::spawn_lookup(cfg, floor_tx, shutdown, live, redis);
 
         Ok(Self {
             controller,
@@ -409,21 +422,22 @@ impl ResyncWiring {
         cfg: &SequencerConfig,
         floor_tx: crossbeam_channel::Sender<kardamom_sequencer::resync::FloorUpdate>,
         shutdown: &Shutdown,
-    ) -> Result<(Option<LookupRequester>, Option<tokio::task::JoinHandle<()>>)> {
-        if !cfg.lookup.enabled() {
-            return Ok((None, None));
-        }
+        live: std::sync::Arc<kardamom_cache::LiveAccounts>,
+        redis: Option<std::sync::Arc<kardamom_cache::CacheReader>>,
+    ) -> (Option<LookupRequester>, Option<tokio::task::JoinHandle<()>>) {
         let (requester, rx) = LookupRequester::channel();
-        let task = feeds::NonceLookupFeed::new(
+        let Some(feed) = feeds::NonceLookupFeed::new(
             cfg.lookup.clone(),
             cfg.partition_index,
             rx,
             shutdown.clone(),
             floor_tx,
-        )
-        .context("nonce lookup: http client build failed")?
-        .spawn();
-        Ok((Some(requester), Some(task)))
+            live,
+            redis,
+        ) else {
+            return (None, None);
+        };
+        (Some(requester), Some(feed.spawn()))
     }
 }
 

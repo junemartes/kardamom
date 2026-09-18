@@ -42,6 +42,9 @@ core_affinity = "0.8"
 # Cluster (Raft) transport adapter (`outbound::cluster`). tx_ordering ALWAYS goes
 # to the cluster ingress — non-optional, there is no non-cluster path.
 kardamom-cluster-adapter = { path = "../cluster-adapter" }
+# The local account layer: the rows on the tx_receipts batch frame answer
+# a cold sender's floor before any executor query.
+kardamom-cache = { workspace = true }
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true

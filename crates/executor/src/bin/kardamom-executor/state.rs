@@ -1,4 +1,4 @@
-//! State backend startup: checkpoint serve/restore, env open, the durable
+//! State backend startup: checkpoint restore, env open, the durable
 //! cursor, the periodic checkpointer task, and the resume decision.
 
 use std::ops::ControlFlow;
@@ -33,15 +33,6 @@ pub(crate) fn prepare_state(
     shutdown: CancellationToken,
 ) -> Result<PreparedState> {
     if let Some(ckpt_dir) = args.checkpoint_dir.as_ref() {
-        // Serve this node's checkpoints to peers (the other side of the peer
-        // fetch below). This is best-effort infrastructure. But a bad bind
-        // address is a deploy bug, so fail startup loudly.
-        // Runs as a tokio task for the life of the process (called inside
-        // the runtime; the handle is not needed).
-        if let Some(addr) = args.checkpoint_serve_addr {
-            kardamom_state::serve_checkpoints(addr, ckpt_dir.clone())
-                .context("bind checkpoint serve address")?;
-        }
         restore_if_fresh(args, ckpt_dir, expected_genesis)?;
     }
 

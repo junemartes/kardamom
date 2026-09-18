@@ -20,7 +20,7 @@ cosign_pinned_sha256: "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9
 # profile: three voting Consul and Nomad servers on the dedicated core, a
 # private interface selector in place of fixed addresses, gossip
 # encryption, ACLs, agent TLS and the host firewall.
-# inventories/hetzner/group_vars/all.yml sets the production values, and
+# inventories/hetzner/group_vars/production/profile.yml sets the production values, and
 # roles/profile checks them before any role changes a host.
 # See docs/agents/hetzner-hybrid-infra-spec.md.
 deployment_profile: "local"
@@ -49,6 +49,8 @@ consul_client_addr: "0.0.0.0"
 consul_gossip_key: ""
 consul_acl_enabled: false
 consul_agent_token: ""
+# Authorizes local DNS and tokenless reads; policy grants service/node read only.
+consul_dns_token: ""
 nomad_acl_enabled: false
 nomad_consul_token: ""
 # The directory with the agent TLS material on each host: ca.pem,
@@ -116,12 +118,13 @@ ports:
   # by ansible/contract.yml: executor.nomad.hcl --nonce-query-addr,
   # sequencer.nomad.hcl --executor-query-endpoints (both groups).
   executor_nonce_query: 9024
+  # The account-state projection cache (nomad/redis.nomad.hcl): the primary
+  # and the replica on `redis`, the three sentinels on `redis_sentinel`. The
+  # state mirror's Prometheus exporter, on the executor nodes.
+  redis: 6379
+  redis_sentinel: 26379
+  state_mirror_metrics: 9007
   anvil_l1: 8546              # in-cluster L1 (anvil) for the smoke test
-  # Aeron archive control/response/replication (see aeron image EXPOSE).
-  aeron_archive_control: 8010
-  aeron_archive_control_response: 8011
-  aeron_archive_recording_events: 8020
-  aeron_archive_replication: 8021
   # Base UDP port for kardamom data/ordering channels; per-channel offsets
   # are assigned in config/channels.toml.tpl.
   aeron_channel_base: 40000
@@ -133,6 +136,7 @@ paths:
   archive_dir: /opt/kardamom/archive       # recorder Archive segments (persistent)
   state_dir: /opt/kardamom/state           # executor StateWriter (libmdbx) data
   checkpoints_dir: /opt/kardamom/checkpoints # executor state checkpoints (fast recovery)
+  mirror_dir: /opt/kardamom/mirror         # state mirror head file + rebuild scratch
   batcher_dir: /opt/kardamom/batcher       # live batcher cursor file + DA blob store (#39)
   config_dir: /opt/kardamom/config         # rendered service configs + genesis
 
@@ -186,7 +190,7 @@ node_classes:
   ingress: { count: 2, tier: worker } # active/active
   executor: { count: 3, tier: worker } # 3 state-machine replicas
   sealer: { count: 3, tier: worker } # 3-member Aeron Cluster (Raft) sealer
-  aux: { count: 1, tier: worker } # validator + da_watcher + batcher
+  aux: { count: 1, tier: worker } # validator + da_watcher + batcher + redis primary
 
 # Aeron Cluster (Raft) sealer member ports (uniform per role; unique by node IP).
 cluster_member_count: 3
@@ -198,4 +202,3 @@ cluster_ports:
   archive_control: 40204
 cluster_ingress_stream_id: 101
 cluster_egress_stream_id: 102
-cluster_egress_port: 40210   # egress response port of the ingress client (on its node IP); every other cluster client takes a Nomad dynamic port

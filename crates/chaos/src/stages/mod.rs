@@ -6,6 +6,7 @@
 mod churn;
 mod semantics;
 mod soak;
+mod state;
 mod verdict;
 
 use std::time::Duration;
@@ -14,7 +15,6 @@ use crate::harness::Harness;
 use crate::rpc::Rpc;
 
 pub use churn::CHURN_ACCOUNT;
-pub use verdict::VerdictMode;
 
 /// The funded account of the smoke gate.
 pub const GATE_ACCOUNT: u32 = 0;
@@ -44,6 +44,16 @@ pub fn tail_lines(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// The last `n` lines of `text` that contain any of `needles`.
+#[must_use]
+pub fn matching_lines(text: &str, needles: &[&str], n: usize) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| needles.iter().any(|needle| l.contains(needle)))
+        .collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
 /// The first `n` lines of `text`.
 #[must_use]
 pub fn head_lines(text: &str, n: usize) -> String {
@@ -60,5 +70,15 @@ mod tests {
         assert_eq!(head_lines(text, 2), "a\nb");
         assert_eq!(tail_lines(text, 3), "b\nc\nd");
         assert_eq!(tail_lines(text, 9), text);
+    }
+
+    #[test]
+    fn matching_lines_keep_the_last_matches_in_order() {
+        let text = "x RESYNC 1\nnoise\ncluster session opened 2\nnoise\nx RESYNC 3";
+        assert_eq!(
+            matching_lines(text, &["RESYNC", "cluster session"], 2),
+            "cluster session opened 2\nx RESYNC 3"
+        );
+        assert_eq!(matching_lines(text, &["absent"], 5), "");
     }
 }

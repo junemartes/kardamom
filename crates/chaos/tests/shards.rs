@@ -26,7 +26,6 @@
 #![cfg(feature = "cluster-e2e")]
 
 use kardamom_chaos::lifecycle::DeployVars;
-use kardamom_chaos::stages::VerdictMode;
 use kardamom_chaos::{Harness, Knobs, Lifecycle, Shard};
 
 /// The funded account of the smoke gate. A reuse run on a used chain
@@ -110,7 +109,8 @@ async fn run_shard(shard: Shard) -> anyhow::Result<()> {
     }
     kardamom_chaos::log(format!("chaos suite PASSED ({})", cases.join(" ")));
     harness.ingress_churn().await?;
-    harness.validator_verdict(VerdictMode::Progress).await?;
+    harness.validator_verdict().await?;
+    harness.assert_persisted_state().await?;
     kardamom_chaos::log("cluster-e2e PASSED");
     if !reuse() {
         lifecycle.down().await?;
@@ -130,7 +130,8 @@ async fn run_stage(stage: Stage) -> anyhow::Result<()> {
     harness.smoke_gate(gate_account()?).await?;
     stage.run(&harness).await?;
     harness.ingress_churn().await?;
-    harness.validator_verdict(VerdictMode::Sync).await?;
+    harness.validator_verdict().await?;
+    harness.assert_persisted_state().await?;
     kardamom_chaos::log("cluster-e2e PASSED");
     if !reuse() {
         lifecycle.down().await?;
@@ -139,6 +140,7 @@ async fn run_stage(stage: Stage) -> anyhow::Result<()> {
 }
 
 async fn stage_test(stage: Stage) {
+    install_tracing();
     if let Err(e) = run_stage(stage).await {
         eprintln!("{e:#}");
         panic!(
@@ -148,7 +150,21 @@ async fn stage_test(stage: Stage) {
     }
 }
 
+/// Route the harness libraries' `tracing` output to stderr, at `warn`
+/// unless `RUST_LOG` says otherwise. The load's forensics, such as the
+/// `UNRESOLVED pending tx` samples behind a `missing` count, are
+/// tracing events and are lost without a subscriber.
+fn install_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 async fn shard_test(shard: Shard) {
+    install_tracing();
     if let Err(e) = run_shard(shard).await {
         eprintln!("{e:#}");
         panic!(
@@ -198,4 +214,10 @@ async fn chaos_cluster() {
 #[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
 async fn chaos_retention() {
     shard_test(Shard::Retention).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
+async fn chaos_cache() {
+    shard_test(Shard::Cache).await;
 }

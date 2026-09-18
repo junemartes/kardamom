@@ -40,8 +40,12 @@
       wait: false
       vars:
         shard_table: "{{ (lookup('file', workloads_cluster_dir ~ '/config/shard-map.toml') | community.general.from_toml).table | to_json }}"
+    # The cache before its readers and its writer: the ingress reads it,
+    # the state mirror writes it.
+    - {name: redis}
     - {name: ingress}
     - {name: executor, wait: false}
+    - {name: state-mirror, wait: false}
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
@@ -66,17 +70,31 @@
       vars:
         l1_rpc_url: "{{ 'http://' ~ workloads_aux_host ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0 else '' }}"
         lockbox_address: "{{ workloads_lockbox_address if workloads_light_execution_rpc | length > 0 else '' }}"
+    # The watcher derives the epochs the validator checks. With the light
+    # client deployed it reads L1 through the same client, so the epoch
+    # source is verified too, not only the check against it (issue #163).
     - name: da-watcher
       wait: false
-      vars:
-        lockbox_address: "{{ workloads_lockbox_address }}"
+      vars: >-
+        {{ {'lockbox_address': workloads_lockbox_address}
+           | combine({'l1_rpc': 'http://' ~ workloads_aux_host ~ ':' ~ workloads_light_port}
+                     if workloads_light_execution_rpc | length > 0 else {}) }}
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
 
+# Prometheus scrapes every service by its Consul node name, so it comes
+# up after the services it scrapes; Grafana provisions the dashboards.
+- name: Deploy monitoring
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job:
+      name: monitoring
+      wait: false
+
 - name: Wait for pipeline followers
   ansible.builtin.include_tasks: wait.yml
-  loop: [sequencer, executor, validator, da-watcher]
+  loop: [sequencer, executor, state-mirror, validator, da-watcher, monitoring]
   loop_control:
     loop_var: workloads_wait_job
   when: not ansible_check_mode
