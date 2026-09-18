@@ -34,11 +34,7 @@ impl RecorderArchive for rusteron_archive::AeronArchive {
         let mut latest = None;
         let listed =
             self.for_each_recording_of_channel(started.stream_id, &started.fragment, |d| {
-                let matches = match started.session_id {
-                    Some(session) => d.session_id() == session,
-                    None => d.stop_position() < 0,
-                };
-                if !matches {
+                if !started.matches_recording(d.session_id(), d.stop_position()) {
                     return;
                 }
                 let id = d.recording_id();
