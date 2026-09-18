@@ -1,10 +1,5 @@
-//! The sequencer lane resize, the shadow-first overlap rollout of
-//! `docs/specs/dynamic-sequencer-sizing.md`: render the next map and the
-//! overlap job, let the gaining lanes warm up in shadow mode, move the
-//! ingress to the new map, drain the old lanes for one transaction TTL,
-//! then render the steady job. The renders stay in the two Python
-//! generators; this module runs the rollout and waits on the replicas'
-//! metrics.
+//! A sequencer resize warms gaining lanes in shadow mode, switches the ingress
+//! map, drains old lanes for one transaction TTL, then installs the steady job.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,7 +24,6 @@ const JOB: &str = "nomad/sequencer.nomad.hcl";
 const INGRESS_JOB: &str = "nomad/ingress.nomad.hcl";
 const GROUP_VARS: &str = "ansible/group_vars/all.yml";
 const DIGESTS: &str = "images.digests";
-const RENDER_MAP: &str = "scripts/render-shard-map.py";
 const RENDER_JOB: &str = "scripts/render-sequencer-job.py";
 /// Lane `n` exports on `9001 + 10n`.
 const LANE_STRIDE: u16 = 10;
@@ -106,7 +100,7 @@ impl Resize {
         let map = self.path(MAP);
         anyhow::ensure!(
             map.is_file(),
-            "no {MAP}; render one with {RENDER_MAP} --identity <lanes>"
+            "no {MAP}; deploy an initial shard map with Ansible"
         );
         anyhow::ensure!(
             !self.path(NEXT_MAP).exists(),
@@ -120,8 +114,10 @@ impl Resize {
             self.target,
             self.tx_ttl.as_secs()
         ));
-        let target = self.target.to_string();
-        self.render(RENDER_MAP, &["--from", MAP, "--lanes", &target], NEXT_MAP)?;
+        let next =
+            toml::from_str::<kardamom_types::shard_map::ShardMap>(&std::fs::read_to_string(&map)?)?
+                .rebalance(self.target)?;
+        std::fs::write(self.path(NEXT_MAP), toml::to_string(&next)?)?;
         self.render(RENDER_JOB, &["--map", NEXT_MAP, "--from", MAP], JOB)?;
         let gaining = gaining_lanes(&std::fs::read_to_string(self.path(JOB))?, self.target);
         crate::log(format!(

@@ -14,52 +14,21 @@ use crate::scale::Resize;
 
 const LOOKUPS: &str = "kardamom_sequencer_nonce_lookups_total";
 
-/// The vslot-to-lane table of a shard map file.
-fn table_of(toml: &str) -> anyhow::Result<Vec<u32>> {
-    let start = toml.find("table").context("shard map has no table")?;
-    let body = &toml[start..];
-    let open = body.find('[').context("shard map table has no [")?;
-    let close = body.find(']').context("shard map table has no ]")?;
-    body[open.saturating_add(1)..close]
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<u32>()
-                .with_context(|| format!("shard map entry {s}"))
-        })
-        .collect()
-}
-
-/// The funded accounts whose vslot moves to a new lane under the next
-/// map: the fewest-moves render of `render-shard-map.py` to three
-/// lanes, against the current `config/shard-map.toml`.
+/// The funded accounts whose slots move when the current map grows to three lanes.
 ///
 /// # Errors
 ///
-/// Returns an error if the renderer fails or a map does not parse.
-pub(crate) async fn moved_accounts(cluster_dir: &Path) -> anyhow::Result<Vec<u32>> {
-    let current_path = cluster_dir.join("config/shard-map.toml");
-    let current =
-        table_of(&std::fs::read_to_string(&current_path).context("read shard-map.toml")?)?;
-    let out = tokio::process::Command::new("python3")
-        .arg(cluster_dir.join("scripts/render-shard-map.py"))
-        .args(["--from", &current_path.to_string_lossy(), "--lanes", "3"])
-        .output()
-        .await
-        .context("run render-shard-map.py")?;
-    anyhow::ensure!(
-        out.status.success(),
-        "render-shard-map.py failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let next = table_of(&String::from_utf8_lossy(&out.stdout))?;
+/// Returns an error if the map cannot be read or rebalanced.
+pub(crate) fn moved_accounts(cluster_dir: &Path) -> anyhow::Result<Vec<u32>> {
+    let text = std::fs::read_to_string(cluster_dir.join("config/shard-map.toml"))?;
+    let current: kardamom_types::shard_map::ShardMap = toml::from_str(&text)?;
+    let next = current.rebalance(3)?;
     Ok(ACCT_VSLOT
         .iter()
         .enumerate()
         .filter(|(_, v)| {
             let v = usize::from(**v);
-            current.get(v) != next.get(v)
+            current.table()[v] != next.table()[v]
         })
         .map(|(i, _)| u32::try_from(i).unwrap_or(u32::MAX))
         .collect())
@@ -396,9 +365,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_a_shard_map_table() {
-        let toml = "version = 0\ntable = [\n  0, 1, 0, 1,\n  0, 1,\n]\n";
-        assert_eq!(table_of(toml).unwrap(), [0, 1, 0, 1, 0, 1]);
-        assert!(table_of("nothing").is_err());
+    fn selects_accounts_that_cross_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("config")).unwrap();
+        let map = kardamom_types::shard_map::ShardMap::identity(2).unwrap();
+        std::fs::write(
+            dir.path().join("config/shard-map.toml"),
+            toml::to_string(&map).unwrap(),
+        )
+        .unwrap();
+        let accounts = moved_accounts(dir.path()).unwrap();
+        assert!(!accounts.is_empty());
+        assert!(
+            accounts
+                .iter()
+                .all(|account| ACCT_VSLOT[usize::try_from(*account).unwrap()] < 86)
+        );
     }
 }
