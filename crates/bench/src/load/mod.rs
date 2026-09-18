@@ -485,18 +485,22 @@ impl Prepared {
             confirm: feed_confirm,
             task: feed,
         } = run.spawn_receipt_feed(&signers);
-        // Back up the feed with a live sweeper. An entry the feed misses is
+        // A live sweeper, in every mode. An entry the feed misses, or an
+        // accepted submit whose immediate re-fetch answered null, is
         // re-fetched within 2 to 7 seconds, instead of waiting for the
         // end-of-run drain. Keep this cadence well inside the ingress receipt
         // cache's query horizon (capacity divided by rate, about 27 seconds at
-        // 4,800 tx/s with the default 128k capacity, oldest out first).
-        let sweeper = feed.as_ref().map(|_| {
+        // 4,800 tx/s with the default 128k capacity, oldest out first), and
+        // inside the window in which a receipt is still on some ingress: a
+        // job update restarts every replica in turn, and a receipt that only
+        // the drain asks for is then on none of them.
+        let sweeper = Some(
             Arc::new(engine::Drainer::new(
                 run.receipt_clients.clone(),
                 Arc::clone(&tracker),
             ))
-            .spawn_pending_sweeper(Duration::from_secs(5), Duration::from_secs(2))
-        });
+            .spawn_pending_sweeper(Duration::from_secs(5), Duration::from_secs(2)),
+        );
 
         // --- ramp (soak mode only) -------------------------------------------
         let mut ramp = Vec::new();
