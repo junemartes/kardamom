@@ -11,6 +11,7 @@ pub enum Shard {
     Sequencer,
     Cluster,
     Retention,
+    Cache,
 }
 
 impl Shard {
@@ -23,6 +24,7 @@ impl Shard {
             Self::Sequencer => "chaos-sequencer",
             Self::Cluster => "chaos-cluster",
             Self::Retention => "chaos-retention",
+            Self::Cache => "chaos-cache",
         }
     }
 
@@ -37,6 +39,7 @@ impl Shard {
                 "graceful-executor",
                 "hard-executor",
                 "node-failure-executor",
+                "node-replace-executor",
                 "state-checkpoint-restore",
                 "replay-window-resync",
             ],
@@ -61,10 +64,18 @@ impl Shard {
                 "cluster-leader-kill",
                 "cluster-follower-kill",
                 "cluster-member-rejoin",
+                "node-replace-sealer",
                 "cluster-quorum-loss-recover",
                 "cpu-squeeze",
             ],
             Self::Retention => &["retention-overrun", "retention-overrun-validator"],
+            // The mirror rebuild runs last: it flushes the projection.
+            Self::Cache => &[
+                "redis-partition-ingress",
+                "redis-primary-kill",
+                "redis-primary-freeze",
+                "mirror-kill-rebuild",
+            ],
         }
     }
 
@@ -83,7 +94,7 @@ impl Shard {
                 cluster_snapshot_interval_s: None,
                 cluster_retention: Some(6144),
             },
-            Self::Executor | Self::Ingress | Self::Sequencer => DeployVars::default(),
+            Self::Executor | Self::Ingress | Self::Sequencer | Self::Cache => DeployVars::default(),
         }
     }
 
@@ -102,7 +113,7 @@ impl Shard {
                 ("SQUEEZE_CPUS_PER_NODE", "0.4"),
             ],
             Self::Retention => &[("RUN_LOAD", "0"), ("KARDAMOM_CLUSTER_RETENTION", "6144")],
-            Self::Executor | Self::Ingress | Self::Sequencer => &[("RUN_LOAD", "0")],
+            Self::Executor | Self::Ingress | Self::Sequencer | Self::Cache => &[("RUN_LOAD", "0")],
         }
     }
 }
@@ -119,6 +130,7 @@ mod tests {
             Shard::Sequencer,
             Shard::Cluster,
             Shard::Retention,
+            Shard::Cache,
         ]
         .iter()
         .flat_map(|s| s.cases().iter().copied())
@@ -127,7 +139,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 25);
+        assert_eq!(all.len(), 31);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")
@@ -138,6 +150,7 @@ mod tests {
             Shard::Sequencer,
             Shard::Cluster,
             Shard::Retention,
+            Shard::Cache,
         ] {
             assert!(
                 shard.env().contains(&("RUN_LOAD", "0")),

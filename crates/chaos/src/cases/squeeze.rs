@@ -54,7 +54,10 @@ pub(crate) async fn cpu_squeeze(h: &mut Harness) -> anyhow::Result<()> {
             warm_line(w)
         )
     })?;
-    let div = h.probes.val_metric(DIVERGENCE).await.unwrap_or(0);
+    let div = h
+        .probes
+        .val_metric_required(DIVERGENCE, "CPU recovery")
+        .await?;
     anyhow::ensure!(
         div == 0,
         "{}: cpu-squeeze: validator counted {div} divergence(s) under starvation",

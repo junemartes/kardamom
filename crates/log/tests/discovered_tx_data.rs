@@ -86,6 +86,7 @@ fn spawn_recorder(
         local_ip: Ipv4Addr::LOCALHOST,
         own_instance: "alloc-ingress-a".into(),
         expected_own,
+        removal_grace: cfg.discovery.removal_grace(),
         membership,
         stop: stop.clone(),
         runtime: tokio::runtime::Handle::current(),

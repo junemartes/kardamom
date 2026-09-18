@@ -79,6 +79,9 @@ pub struct Knobs {
     /// How long past `inject_delay` the load may take to reach the
     /// ingress before the case refuses to inject into an idle pipeline.
     pub load_flow_timeout: Duration,
+    /// How long the load may take to sign its queues, before the flow
+    /// check starts.
+    pub load_ready_timeout: Duration,
     /// The first funded account a case may use.
     pub account_base: u32,
     /// Which ingress replica the hard kill targets, 0 or 1.
@@ -215,6 +218,7 @@ impl Knobs {
             rejoin_slo: env.secs("CLUSTER_REJOIN_SLO_S", 360)?,
             inject_delay: env.secs("INJECT_DELAY", 10)?,
             load_flow_timeout: env.secs("LOAD_FLOW_TIMEOUT_S", 60)?,
+            load_ready_timeout: env.secs("LOAD_READY_TIMEOUT_S", 600)?,
             account_base: env.u32("CHAOS_ACCT_BASE", 7)?,
             ingress_victim: Self::ingress_victim(&env)?,
             converge_slo: env.secs("EXEC_CONVERGE_SLO_S", 150)?,

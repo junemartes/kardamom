@@ -1,0 +1,41 @@
+---
+name: tofu-providers
+description: >-
+  Install OpenTofu, serve its providers from a cache, and fill the cache
+  with retries. A provider download from GitHub releases fails often
+  enough on a runner to fail a whole job; with the cache, a shard's own
+  tofu init reads the providers from disk.
+inputs:
+  root:
+    description: The Terraform root whose providers the cache must hold.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: opentofu/setup-opentofu@v1
+      with:
+        tofu_version: 1.12.6
+    # Every later tofu init in the job reads this variable, the shard
+    # test's init included.
+    - name: Point OpenTofu at the plugin cache
+      shell: bash
+      run: |
+        mkdir -p "$HOME/.cache/tofu-plugins"
+        echo "TF_PLUGIN_CACHE_DIR=$HOME/.cache/tofu-plugins" >> "$GITHUB_ENV"
+    - uses: actions/cache@v4
+      with:
+        path: ~/.cache/tofu-plugins
+        key: tofu-plugins-1.12.6-${{ runner.os }}-${{ hashFiles('deploy/cluster/terraform/*/.terraform.lock.hcl') }}
+    # On a cache hit this reads the disk. On a miss it downloads, and a
+    # reset connection costs a retry, not the job.
+    - name: Fill the plugin cache
+      shell: bash
+      working-directory: ${{ inputs.root }}
+      run: |
+        for attempt in 1 2 3 4 5; do
+          if tofu init -backend=false -input=false; then
+            exit 0
+          fi
+          sleep $((attempt * 15))
+        done
+        exit 1

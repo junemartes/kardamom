@@ -94,6 +94,13 @@ pub const OUTBOX: Address = address!("0x42000000000000000000000000000000000000E0
 /// what makes delivery injection unforgeable by user txs.
 pub const INBOX: Address = address!("0x42000000000000000000000000000000000000E1");
 
+/// Canonical predeploy address of the `CheckpointMarker`. It emits the
+/// checkpoint markers for coordinated recovery lines and is the only valid
+/// origin sender of a marker message. The receiving predeploy accepts a
+/// marker only when the Inbox reports this address as the origin sender.
+/// Seeded into genesis like [`INBOX`].
+pub const CHECKPOINT_MARKER: Address = address!("0x42000000000000000000000000000000000000E2");
+
 /// Largest `gasLimit` the origin `Outbox` accepts for one message. This
 /// mirrors `Outbox.MAX_MESSAGE_GAS` (`contracts/src/L2/Outbox.sol`).
 /// [`derive_remote_epoch`] rejects a larger value, so an honest origin can

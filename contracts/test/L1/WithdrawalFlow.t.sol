@@ -16,6 +16,9 @@ contract WithdrawalFlowTest is Test {
 
     address constant ATTESTER = address(0xA77E);
     address constant CHALLENGER = address(0xC4A1);
+    address constant RECOVERY = address(0x4EC0);
+    /// Must match KardamomUUPSBase.FACTORY.
+    address constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
     address constant L2_MINTER = address(0xBEEF);
     uint64 constant WINDOW = 1 days;
 
@@ -51,6 +54,8 @@ contract WithdrawalFlowTest is Test {
                 ))
         );
         vm.warp(1_700_000_000);
+        vm.prank(FACTORY);
+        oracle.setRecovery(RECOVERY);
     }
 
     function _leaf(uint256 nonce, address l2sender, address l1target, uint256 value)
@@ -177,5 +182,58 @@ contract WithdrawalFlowTest is Test {
             ETHLockbox.WithdrawalTransaction(0, ALICE_L2, ALICE_L1, 1 ether);
         lockbox.finalizeWithdrawal(aTx, goodIdx, stateRoot, withdrawalsRoot, 0, new bytes32[](0));
         assertEq(ALICE_L1.balance, 6 ether); // 5 remaining + 1 withdrawn
+    }
+
+    /// Recovery path: a coordinated chain revert discards the L2 suffix
+    /// that posted output 0. The recovery account pauses, rolls the output
+    /// back, and resumes. A withdrawal proven against the discarded output
+    /// can never finalize. The restored chain re-attests a lower block, and
+    /// only a withdrawal in the restored history is paid.
+    function test_revert_rolls_back_outputs_and_blocks_discarded_withdrawals() public {
+        vm.deal(ALICE_L1, 10 ether);
+        vm.prank(ALICE_L1);
+        lockbox.depositETH{value: 5 ether}(ALICE_L2, 0, hex"");
+
+        // Discarded history: Alice withdraws 4 ether at L2 block 100.
+        bytes32 wlBad = _leaf(0, ALICE_L2, ALICE_L1, 4 ether);
+        bytes32 wlOther = _leaf(1, BOB_L2, BOB_L1, 1 wei);
+        bytes32 badRoot = _hashNode(_hashLeaf(wlBad), _hashLeaf(wlOther));
+        bytes32 badState = keccak256("discarded@100");
+        vm.prank(ATTESTER);
+        uint256 badIdx = oracle.proposeOutput(_outputRoot(badState, badRoot), 100);
+
+        // Incident: pause first, then the ceremony reverts to block 90.
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(RECOVERY);
+        oracle.pause();
+        vm.prank(RECOVERY);
+        oracle.rollbackOutputs(badIdx);
+        vm.prank(RECOVERY);
+        oracle.unpause();
+
+        // Restored history: Alice withdraws 1 ether at L2 block 95.
+        bytes32 wlGood = _leaf(0, ALICE_L2, ALICE_L1, 1 ether);
+        bytes32 goodRoot = _hashNode(_hashLeaf(wlGood), _hashLeaf(wlOther));
+        bytes32 goodState = keccak256("restored@95");
+        vm.prank(ATTESTER);
+        uint256 goodIdx = oracle.proposeOutput(_outputRoot(goodState, goodRoot), 95);
+        assertEq(goodIdx, badIdx + 1);
+
+        vm.warp(block.timestamp + WINDOW + 1);
+
+        // The discarded withdrawal is dead, even with a valid proof.
+        ETHLockbox.WithdrawalTransaction memory badTx =
+            ETHLockbox.WithdrawalTransaction(0, ALICE_L2, ALICE_L1, 4 ether);
+        bytes32[] memory proof = new bytes32[](1);
+        proof[0] = _hashLeaf(wlOther);
+        vm.expectRevert(ETHLockbox.NotFinalizable.selector);
+        lockbox.finalizeWithdrawal(badTx, badIdx, badState, badRoot, 0, proof);
+
+        // The restored withdrawal pays.
+        ETHLockbox.WithdrawalTransaction memory goodTx =
+            ETHLockbox.WithdrawalTransaction(0, ALICE_L2, ALICE_L1, 1 ether);
+        lockbox.finalizeWithdrawal(goodTx, goodIdx, goodState, goodRoot, 0, proof);
+        assertEq(ALICE_L1.balance, 5 ether + 1 ether);
+        assertEq(address(lockbox).balance, 4 ether);
     }
 }

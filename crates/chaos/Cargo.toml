@@ -27,6 +27,7 @@ alloy-network.workspace = true
 alloy-primitives.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+kardamom-state = { path = "../state" }
 kardamom-types = { path = "../types" }
 toml.workspace = true
 kardamom-bench = { path = "../bench" }
@@ -37,4 +38,6 @@ tempfile.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+kardamom-types.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+tracing-subscriber.workspace = true

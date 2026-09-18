@@ -74,3 +74,26 @@ run "contract" {
     error_message = "every node gets its own address, in name order from host 10"
   }
 }
+
+run "replacement" {
+  command = plan
+
+  variables {
+    node_generation = { "worker-1" = 1 }
+  }
+
+  assert {
+    condition     = one(docker_container.node["worker-1"].networks_advanced).ipv4_address == "10.99.0.18" && one(docker_container.node["worker-0"].networks_advanced).ipv4_address == "10.99.0.12"
+    error_message = "a replaced node moves past every generation-0 address (5 nodes: host 13 + 5); its neighbours keep theirs"
+  }
+
+  assert {
+    condition     = docker_volume.node["worker-1-docker"].name == "kardamom-worker-1-docker-g1" && docker_volume.node["worker-0-docker"].name == "kardamom-worker-0-docker"
+    error_message = "a replaced node's volumes are fresh; its neighbours keep theirs"
+  }
+
+  assert {
+    condition     = output.node_contract.nodes["worker-1"].generation == 1 && output.node_contract.nodes["worker-0"].generation == 0
+    error_message = "the contract carries the generation"
+  }
+}
