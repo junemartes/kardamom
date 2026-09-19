@@ -36,8 +36,15 @@ jobs:
           python-version: '3.12'
       - name: Install linters
         run: pip install yamllint ansible-lint
+      # Galaxy resets connections now and then; three tries cover it.
       - name: Install Ansible collections (module resolution for ansible-lint)
-        run: ansible-galaxy collection install ansible.posix community.docker community.general
+        run: |
+          n=0
+          until ansible-galaxy collection install ansible.posix community.docker community.general; do
+            n=$((n + 1))
+            [ "$n" -ge 3 ] && exit 1
+            sleep 15
+          done
       - name: yamllint
         run: yamllint ansible/
       - name: ansible-lint
@@ -56,7 +63,12 @@ jobs:
       - name: Install Ansible for isolated deployment tests
         run: |
           pip install ansible-core
-          ansible-galaxy collection install ansible.posix community.docker community.general
+          n=0
+          until ansible-galaxy collection install ansible.posix community.docker community.general; do
+            n=$((n + 1))
+            [ "$n" -ge 3 ] && exit 1
+            sleep 15
+          done
       - name: Install Nomad (version from the cluster contract)
         run: |
           ver="$(sed -n 's/^nomad_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
