@@ -64,6 +64,7 @@ pub(crate) async fn executor_fleet_loss_recover(h: &mut Harness) -> anyhow::Resu
     h.start_nodes(&nodes).await?;
     h.assert_count("executor", 3, h.knobs.reschedule_slo)
         .await?;
+    await_exporter_back(h, ctx).await?;
     h.assert_executor_progress(Duration::from_secs(180)).await
 }
 
@@ -94,6 +95,7 @@ pub(crate) async fn executor_fleet_wipe_recover(h: &mut Harness) -> anyhow::Resu
     h.start_nodes(&nodes).await?;
     h.assert_count("executor", 3, h.knobs.reschedule_slo)
         .await?;
+    await_exporter_back(h, ctx).await?;
     h.evidence
         .wait_count_reaches(
             &CountWait {
@@ -130,6 +132,28 @@ async fn await_exporters_dark(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     })?;
     crate::log(format!(
         "{ctx}: outage observed (every executor exporter dark after {}s)",
+        elapsed.as_secs()
+    ));
+    Ok(())
+}
+
+/// Wait until an executor exporter answers again. A returned node's
+/// allocation runs before its exporter binds, and the progress check
+/// needs a baseline from a live exporter.
+async fn await_exporter_back(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+    let outcome = poll::until(
+        Budget::new(h.knobs.reschedule_slo, Duration::from_secs(3)),
+        |_| async move { Ok(h.probes.executor_progress().await.map(|_| ())) },
+    )
+    .await?;
+    let ((), elapsed) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: no executor exporter answers {}s after the fleet returned",
+            t.as_secs()
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: an executor exporter answers again after {}s",
         elapsed.as_secs()
     ));
     Ok(())
