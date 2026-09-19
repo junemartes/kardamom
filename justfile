@@ -314,7 +314,7 @@ test-e2e-local: aeron-jar cluster-jar
 # ---------------------------------------------------------------------------
 
 # Host-side Nomad CLI version. Mirrors nomad_version in
-# deploy/cluster/ansible/group_vars/all.yml (checked by check-contract.py).
+# deploy/cluster/ansible/group_vars/all.yml (checked by ansible/contract.yml).
 NOMAD_VERSION := "1.9.5"
 
 # Install everything the HOST needs for the deploy/cluster workflow.

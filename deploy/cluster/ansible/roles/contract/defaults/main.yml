@@ -1,0 +1,6 @@
+---
+contract_cluster_dir: "{{ playbook_dir | dirname }}"
+contract_repo_dir: "{{ contract_cluster_dir | dirname | dirname }}"
+contract_ingress_endpoints: >-
+  {{ range(cluster_member_count) | map('string')
+     | map('regex_replace', '^(.*)$', '\1=sealer-\1.node.consul:' ~ cluster_ports.ingress) | join(',') }}

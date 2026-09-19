@@ -1,0 +1,10 @@
+---
+- name: Validate the cluster contract without contacting a cluster
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars_files:
+    - group_vars/all.yml
+  roles:
+    - contract

@@ -50,6 +50,11 @@ variable "executor_count" {
   default     = 3
 }
 
+variable "executor_query_port" {
+  type    = number
+  default = 9024
+}
+
 job "executor" {
   datacenters = [var.datacenter]
   type        = "service"
@@ -201,7 +206,7 @@ job "executor" {
           "--checkpoint-serve-addr", "${meta.node_ip}:9014",
           # The account nonce query for the sequencers
           # (ports.executor_nonce_query in group_vars/all.yml).
-          "--nonce-query-addr", "${meta.node_ip}:9024",
+          "--nonce-query-addr", "${meta.node_ip}:${var.executor_query_port}",
           "--checkpoint-peers", join(",", [for i in range(var.executor_count) : "executor-${i}.node.${var.datacenter}.consul:9014"]),
           # Bind the Prometheus exporter on all interfaces; the
           # default is loopback. The chaos suite probes it directly

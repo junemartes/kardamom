@@ -1,0 +1,92 @@
+---
+- name: Check cluster topology and runtime bounds
+  ansible.builtin.assert:
+    that:
+      - deployment_profile == 'local'
+      - node_classes is mapping
+      - partition_count in [1, 2, 4, 8]
+      - tx_ttl_ms | int > 0
+      - node_classes.sealer.count == cluster_member_count
+      # The Redis layer: the readers and the mirror share one sentinel port.
+      - ports.redis_sentinel | int > 0
+
+- name: Read the checked-in shard map
+  ansible.builtin.set_fact:
+    contract_map: "{{ lookup('file', contract_cluster_dir ~ '/config/shard-map.toml') | community.general.from_toml }}"
+    contract_identity: "{{ lookup('template', playbook_dir ~ '/templates/shard-map.toml.j2') | community.general.from_toml }}"
+
+- name: Check the shard map and its identity version
+  ansible.builtin.assert:
+    that:
+      - contract_map.version is integer and contract_map.version >= 0
+      - contract_map.table | length == 256
+      - contract_map.table | select('integer') | list | length == 256
+      - contract_map.table | min >= 0
+      - contract_map.table | max + 1 == partition_count
+      - contract_map.version != 0 or contract_map.table == contract_identity.table
+
+- name: Inspect forbidden lifecycle artifacts
+  ansible.builtin.stat:
+    path: "{{ contract_cluster_dir }}/{{ item }}"
+  loop: [config/shard-map.next.toml, ansible/site.yml, ansible/run.yml]
+  register: contract_artifacts
+
+- name: Require a completed resize and one bootstrap entry point
+  ansible.builtin.assert:
+    that: not item.stat.exists
+    fail_msg: "Unexpected artifact {{ item.item }}"
+  loop: "{{ contract_artifacts.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Check each configuration contract
+  ansible.builtin.include_tasks: mirror.yml
+  loop: "{{ contract_mirrors }}"
+  loop_control:
+    loop_var: contract_mirror
+    label: "{{ contract_mirror.path }}"
+
+- name: Require node-specific multicast interfaces
+  ansible.builtin.assert:
+    that: >-
+      lookup('file', contract_cluster_dir ~ '/config/channels.toml.tpl')
+      | regex_findall('interface=[^|"\\n]*[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+') | length == 0
+
+- name: Keep Terraform free of lifecycle provisioners and elastic servers
+  vars:
+    contract_tf_text: "{{ lookup('file', item) }}"
+  ansible.builtin.assert:
+    that:
+      - "'local-exec' not in contract_tf_text"
+      - "'remote-exec' not in contract_tf_text"
+      - "'/hetzner/' not in item or 'hcloud_token' not in contract_tf_text"
+      - "'/hetzner/' not in item or 'resource \"hcloud_server\"' not in contract_tf_text"
+  loop: >-
+    {{ query('fileglob', contract_cluster_dir ~ '/terraform/containers/*.tf')
+       + query('fileglob', contract_cluster_dir ~ '/terraform/hetzner/*.tf') }}
+  loop_control:
+    label: "{{ item | relpath(contract_cluster_dir) }}"
+
+- name: Find files that must use service discovery
+  ansible.builtin.find:
+    paths:
+      - "{{ contract_cluster_dir }}/nomad"
+      - "{{ contract_cluster_dir }}/config"
+      - "{{ contract_cluster_dir }}/ansible"
+      - "{{ contract_cluster_dir }}/terraform/containers"
+    recurse: true
+    patterns: ['*.hcl', '*.toml', '*.tpl', '*.yml', '*.j2', '*.tf']
+  register: contract_discovery_files
+
+- name: Reject node address literals outside inventories
+  vars:
+    contract_address_pattern: '(?<![\w.])(?!(?:0|127|22[4-9]|23[0-9])\.)(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![\w./])'
+  ansible.builtin.assert:
+    that: lookup('file', item) | regex_findall(contract_address_pattern) | length == 0
+    fail_msg: "{{ item }} names an address; use a Consul record."
+  loop: >-
+    {{ (contract_discovery_files.files | map(attribute='path') | reject('search', '/inventories/|/tests/') | list)
+       + [contract_cluster_dir ~ '/Makefile', contract_repo_dir ~ '/justfile',
+          contract_repo_dir ~ '/.github/workflows/cluster-e2e.yml'] }}
+  loop_control:
+    label: "{{ item | relpath(contract_repo_dir) }}"

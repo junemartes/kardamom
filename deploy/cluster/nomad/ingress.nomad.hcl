@@ -55,6 +55,16 @@ variable "datacenter" {
   default     = "dc1"
 }
 
+variable "partition_count" {
+  type    = number
+  default = 2
+}
+
+variable "tx_ttl_ms" {
+  type    = number
+  default = 30000
+}
+
 job "ingress" {
   datacenters = [var.datacenter]
   type        = "service"
@@ -121,7 +131,7 @@ job "ingress" {
       # The graceful drain: on stop, the ingress refuses new submits and
       # lets the parked ones finish within the park bound (tx_ttl_ms in
       # group_vars/all.yml). This gives it that long plus a margin.
-      kill_timeout = "40s"
+      kill_timeout = format("%ds", ceil(var.tx_ttl_ms / 1000) + 10)
 
       config {
         # This budget covers 8192 rpc connections, the WS feed,
@@ -159,8 +169,8 @@ job "ingress" {
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           # The active shard count (M). Mirrors partition_count in
           # group_vars/all.yml. The ingress opens all 8 lanes and routes
-          # to the first M. check-contract.py checks this mirror.
-          "--shards", "2",
+          # to the first M. ansible/contract.yml checks this mirror.
+          "--shards", format("%d", var.partition_count),
           # The versioned vslot-to-lane map (config/shard-map.toml). A
           # resize re-renders it and rolls this job; see
           # `kardamom-cluster scale-sequencers`.
@@ -168,7 +178,7 @@ job "ingress" {
           "--jsonrpc-bind", "0.0.0.0:8545",
           # The submit park bound. It equals the sequencer transaction
           # lifetime (tx_ttl_ms in group_vars/all.yml).
-          "--pending-receipt-timeout-ms", "30000",
+          "--pending-receipt-timeout-ms", format("%d", var.tx_ttl_ms),
           # Use a stable per-replica id (alloc index 0 or 1). This
           # namespaces correlation_id, so the two active/active
           # replicas never collide. See
@@ -219,7 +229,7 @@ job "ingress" {
         data        = file("config/ingress.toml")
       }
 
-      # The shard map, rendered by scripts/render-shard-map.py.
+      # The shard map, rendered by ansible/shard-map.yml.
       template {
         destination = "local/shard-map.toml"
         data        = file("config/shard-map.toml")

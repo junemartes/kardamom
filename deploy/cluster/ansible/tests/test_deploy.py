@@ -84,7 +84,7 @@ class DeployTest(unittest.TestCase):
         self.addCleanup(self.api.server_close)
         self.addCleanup(self.api.shutdown)
 
-    def run_deploy(self, extra=None, check=False, success=True):
+    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml"):
         variables = {
             'workloads_nomad_addr': f'http://127.0.0.1:{self.api.server_port}',
             'workloads_manifest': str(self.manifest),
@@ -99,7 +99,7 @@ class DeployTest(unittest.TestCase):
         env.update(ANSIBLE_NOCOLOR='1', ANSIBLE_STDOUT_CALLBACK='default',
                    ANSIBLE_LOCAL_TEMP=self.tmp.name + '/ansible',
                    OBJC_DISABLE_INITIALIZE_FORK_SAFETY='YES')
-        cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / 'deploy.yml'),
+        cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
         result = subprocess.run(cmd, cwd=ANSIBLE.parent, env=env, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
@@ -191,6 +191,36 @@ class DeployTest(unittest.TestCase):
         self.assertIn('http://aux-0.node.dc1.consul:8548', validator)
         self.assertNotIn('http://execution.example', validator)
         self.assertIn('8192', json.dumps(plans['cluster']))
+        self.assertEqual(self.api.state['writes'], [])
+
+    def test_resize_reuses_deployment_inputs_and_image_pins(self):
+        settings = {
+            'workloads_resize_job': 'sequencer',
+            'workloads_resize_vars': {'shard_table': json.dumps([v % 3 for v in range(256)])},
+            'tx_ttl_ms': 45001,
+            'datacenter': 'routing-test',
+        }
+        self.run_deploy(settings, playbook='resize.yml')
+        job = self.api.state['jobs']['sequencer']
+        self.assertEqual(job['Datacenters'], ['routing-test'])
+        self.assertEqual(len(job['TaskGroups']), 3)
+        for group in job['TaskGroups']:
+            task = group['Tasks'][0]
+            self.assertTrue(task['Config']['image'].endswith('@sha256:' + 'a' * 64))
+            args = task['Config']['args']
+            self.assertEqual(args[args.index('--tx-ttl-ms') + 1], '45001')
+        self.run_deploy(settings, playbook='resize.yml')
+        self.assertEqual(self.api.state['writes'], ['sequencer'])
+        self.run_deploy({'workloads_resize_job': 'ingress', 'tx_ttl_ms': 45001}, playbook='resize.yml')
+        task = self.api.state['jobs']['ingress']['TaskGroups'][0]['Tasks'][0]
+        args = task['Config']['args']
+        self.assertEqual(args[args.index('--pending-receipt-timeout-ms') + 1], '45001')
+        self.assertEqual(task['KillTimeout'], 56_000_000_000)
+
+    def test_resize_rejects_an_unverified_manifest_before_submission(self):
+        self.manifest.write_text('')
+        self.run_deploy({'workloads_resize_job': 'sequencer', 'workloads_require_signed': True},
+                        playbook='resize.yml', success=False)
         self.assertEqual(self.api.state['writes'], [])
 
     def test_outdated_deployer_fails_before_any_job(self):
