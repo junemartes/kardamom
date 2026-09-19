@@ -10,9 +10,9 @@ name: release
 #   tag v1.2.3     images tagged v1.2.3, and a GitHub release that carries
 #                  images.digests and images.digests.sigbundle
 #
-# The signing identity is this file at the ref that started the run. The
-# private infra repository pins that identity, so a rename of this file
-# breaks the verification there on purpose.
+# The signing identity is this file at the ref that started the run. A
+# verifier can pin that identity, so a rename of this file breaks each
+# such verification.
 #
 # The images role signs when the job has an OIDC token (id-token: write).
 # No input of this workflow turns the signing off.
