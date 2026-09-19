@@ -107,6 +107,12 @@ impl SenderRange {
 pub struct LoadConfig {
     /// The ingress JSON-RPC URL.
     pub rpc: String,
+    /// More ingress JSON-RPC URLs the drain asks for a receipt after
+    /// `rpc` answers `null`. Every ingress replica consumes the same
+    /// `tx_receipts` fan-in, so any replica answers any receipt query;
+    /// a receipt that only lived in a replica that restarted is still
+    /// on the others.
+    pub receipt_rpcs: Vec<String>,
     /// The L2 chain ID. When `None`, the code probes it with `eth_chainId`.
     pub chain_id: Option<u64>,
     /// The soak duration.
@@ -226,6 +232,7 @@ impl Default for LoadConfig {
     fn default() -> Self {
         Self {
             rpc: String::new(),
+            receipt_rpcs: Vec::new(),
             chain_id: None,
             duration: Duration::from_secs(300),
             target_tps: DEFAULT_TARGET_TPS,

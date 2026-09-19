@@ -1,15 +1,17 @@
-//! A read-only account nonce query on the executor node.
+//! A read-only account query on the executor node: the committed nonce
+//! or balance of one address.
 //!
 //! The sequencer asks an executor for the committed nonce of a cold
 //! sender. The answer is a lower bound on the sender's next nonce. An
 //! executor at any height gives a valid answer: a floor that lags the
 //! truth only parks a transaction a little longer. See
-//! `docs/specs/dynamic-sequencer-sizing.md`, section 3.4.
+//! `docs/specs/dynamic-sequencer-sizing.md`, section 3.4. The ingress and
+//! the state mirror ask for the balance too, on a cache miss; see
+//! `docs/specs/2026-09-13-redis-account-cache-design.md`.
 //!
 //! The wire format is Ethereum JSON-RPC over HTTP/1.0, one request per
 //! connection, with no HTTP dependency. This is the same shape as
-//! [`crate::checkpoint_transfer`]. The ingress can proxy
-//! `eth_getTransactionCount` to it later.
+//! [`crate::checkpoint_transfer`].
 //!
 //! ```text
 //! POST / HTTP/1.0
@@ -20,10 +22,15 @@
 //! HTTP/1.0 200 OK
 //! content-type: application/json
 //! x-state-block: <u64>
+//! x-state-tx-idx: <u64>
 //! content-length: <bytes>
 //!
 //! {"jsonrpc":"2.0","id":1,"result":"0x2a"}
 //! ```
+//!
+//! `x-state-tx-idx` is the canonical end position of the snapshot's last
+//! committed block, as an index. A cache writes the answer back tagged
+//! with it, so the answer never outranks a newer row.
 //!
 //! Each request opens a fresh [`StateSnapshot`] on `spawn_blocking` and
 //! drops it before the response goes out. A snapshot pins a read-only
@@ -34,7 +41,7 @@ use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use kardamom_types::StateDatabase;
 use kardamom_types::num::usize_to_u64;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -57,6 +64,15 @@ pub const NONCE_QUERIES: &str = "kardamom_state_nonce_queries_total";
 pub struct NonceQueryServer {
     pub addr: SocketAddr,
     pub task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for NonceQueryServer {
+    /// End the accept loop, which frees the port and the server's clone
+    /// of the state env. A process that opens its state again in place
+    /// (a resync revolution) binds a new server on the same address.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// Serve account nonce queries on `addr`, forever. Binding happens before
@@ -109,17 +125,69 @@ impl QueryServer {
     }
 }
 
-/// The committed nonce of `address`, and the block of the snapshot that
-/// answered. An unknown account has nonce 0.
+/// The committed state of one account, and where the snapshot that
+/// answered stands. An unknown account has nonce 0 and balance 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedAccount {
+    pub nonce: u64,
+    pub balance: U256,
+    /// The snapshot's block.
+    pub block: u64,
+    /// The canonical end position of the snapshot's last block, as an
+    /// index.
+    pub tx_idx: u64,
+}
+
+/// The committed state of `address`.
 ///
 /// # Errors
 ///
 /// Returns the state error when the snapshot cannot open or the read
 /// fails.
-pub fn committed_nonce(env: &StateEnv, address: Address) -> Result<(u64, u64), StateError> {
+pub fn committed_account(env: &StateEnv, address: Address) -> Result<CommittedAccount, StateError> {
     let snapshot = StateSnapshot::open(env)?;
-    let nonce = snapshot.basic(address)?.map_or(0, |(n, _, _)| n);
-    Ok((nonce, snapshot.block_number()))
+    let (nonce, balance) = snapshot
+        .basic(address)?
+        .map_or((0, U256::ZERO), |(n, b, _)| (n, b));
+    Ok(CommittedAccount {
+        nonce,
+        balance,
+        block: snapshot.block_number(),
+        tx_idx: snapshot.end_tx_position()?.as_index(),
+    })
+}
+
+/// The two methods the server answers, parsed once at the boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Method {
+    Nonce,
+    Balance,
+}
+
+impl Method {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "eth_getTransactionCount" => Some(Self::Nonce),
+            "eth_getBalance" => Some(Self::Balance),
+            _ => None,
+        }
+    }
+
+    /// The metrics label.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Nonce => "nonce",
+            Self::Balance => "balance",
+        }
+    }
+
+    /// The JSON-RPC result: a hex quantity.
+    fn result(self, account: &CommittedAccount) -> String {
+        match self {
+            Self::Nonce => format!("{:#x}", account.nonce),
+            Self::Balance => format!("{:#x}", account.balance),
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -133,11 +201,11 @@ struct Request {
 }
 
 /// The reply to one request: the HTTP status, the JSON body, and the
-/// snapshot block when a query ran.
+/// snapshot's block and end position when a query ran.
 struct Reply {
     status: &'static str,
     body: String,
-    block: Option<u64>,
+    state: Option<(u64, u64)>,
 }
 
 impl Reply {
@@ -159,7 +227,7 @@ impl Reply {
         Self {
             status,
             body,
-            block: None,
+            state: None,
         }
     }
 
@@ -185,30 +253,34 @@ impl Reply {
         Self::error("500 Internal Server Error", "error", id, -32603, message)
     }
 
-    /// The committed `nonce` at `block`.
-    fn ok(id: &serde_json::Value, nonce: u64, block: u64) -> Self {
-        metrics::counter!(NONCE_QUERIES, "outcome" => "ok").increment(1);
+    /// The committed value `method` asked for, with the snapshot's
+    /// position.
+    fn ok(id: &serde_json::Value, method: Method, account: &CommittedAccount) -> Self {
+        metrics::counter!(NONCE_QUERIES, "outcome" => "ok", "method" => method.label())
+            .increment(1);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": format!("{nonce:#x}"),
+            "result": method.result(account),
         })
         .to_string();
         Self {
             status: "200 OK",
             body,
-            block: Some(block),
+            state: Some((account.block, account.tx_idx)),
         }
     }
 
     /// Write the HTTP/1.0 response and close.
     async fn write<W: AsyncWriteExt + Unpin>(&self, wr: &mut W) -> std::io::Result<()> {
-        let block_header = self
-            .block
-            .map(|b| format!("x-state-block: {b}\r\n"))
+        let state_headers = self
+            .state
+            .map(|(block, tx_idx)| {
+                format!("x-state-block: {block}\r\nx-state-tx-idx: {tx_idx}\r\n")
+            })
             .unwrap_or_default();
         let head = format!(
-            "HTTP/1.0 {}\r\ncontent-type: application/json\r\n{block_header}\
+            "HTTP/1.0 {}\r\ncontent-type: application/json\r\n{state_headers}\
              content-length: {}\r\nconnection: close\r\n\r\n",
             self.status,
             self.body.len()
@@ -220,7 +292,7 @@ impl Reply {
     }
 }
 
-/// The address a well-formed `eth_getTransactionCount` request names.
+/// The address a well-formed request names.
 fn requested_address(request: &Request) -> Option<Address> {
     request
         .params
@@ -234,9 +306,9 @@ async fn answer(env: &StateEnv, body: &[u8]) -> Reply {
     let Ok(request) = serde_json::from_slice::<Request>(body) else {
         return Reply::bad_request(-32700, "parse error");
     };
-    if request.method != "eth_getTransactionCount" {
+    let Some(method) = Method::parse(&request.method) else {
         return Reply::rpc_error(&request.id, -32601, "method not found");
-    }
+    };
     let Some(address) = requested_address(&request) else {
         return Reply::rpc_error(
             &request.id,
@@ -245,11 +317,11 @@ async fn answer(env: &StateEnv, body: &[u8]) -> Reply {
         );
     };
     let env = env.clone();
-    let looked_up = tokio::task::spawn_blocking(move || committed_nonce(&env, address)).await;
+    let looked_up = tokio::task::spawn_blocking(move || committed_account(&env, address)).await;
     match looked_up {
-        Ok(Ok((nonce, block))) => Reply::ok(&request.id, nonce, block),
+        Ok(Ok(account)) => Reply::ok(&request.id, method, &account),
         Ok(Err(e)) => {
-            warn!(error = %e, %address, "nonce query: state read failed");
+            warn!(error = %e, %address, "account query: state read failed");
             Reply::internal(&request.id, "state read failed")
         }
         Err(e) => {
@@ -322,7 +394,7 @@ async fn serve_one(stream: TcpStream, env: StateEnv) -> std::io::Result<()> {
             return Reply {
                 status: "404 Not Found",
                 body: String::new(),
-                block: None,
+                state: None,
             }
             .write(&mut wr)
             .await;
@@ -360,17 +432,17 @@ mod tests {
         out
     }
 
-    fn query(addr: SocketAddr, address: Address) -> String {
+    fn query(addr: SocketAddr, method: &str, address: Address) -> String {
         post(
             addr,
             &format!(
-                r#"{{"jsonrpc":"2.0","id":5,"method":"eth_getTransactionCount","params":["{address}","latest"]}}"#
+                r#"{{"jsonrpc":"2.0","id":5,"method":"{method}","params":["{address}","latest"]}}"#
             ),
         )
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn serves_the_committed_nonce() {
+    async fn serves_the_committed_nonce_and_balance() {
         let dir = tempfile::tempdir().unwrap();
         let env = StateEnvBuilder::new(dir.path()).open().unwrap();
         let known = Address::repeat_byte(0x11);
@@ -379,7 +451,7 @@ mod tests {
             &[AccountChange {
                 address: known,
                 nonce: 7,
-                balance: U256::ZERO,
+                balance: U256::from(0x1f4u64),
                 code_hash: keccak256([]),
             }],
             &[],
@@ -388,18 +460,33 @@ mod tests {
         let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
         let addr = server.addr;
 
-        let known_reply = tokio::task::spawn_blocking(move || query(addr, known))
-            .await
-            .unwrap();
-        assert!(known_reply.starts_with("HTTP/1.0 200 OK"), "{known_reply}");
-        assert!(known_reply.contains("x-state-block: "), "{known_reply}");
-        assert!(known_reply.contains(r#""result":"0x7""#), "{known_reply}");
-        assert!(known_reply.contains(r#""id":5"#), "{known_reply}");
+        let nonce_reply =
+            tokio::task::spawn_blocking(move || query(addr, "eth_getTransactionCount", known))
+                .await
+                .unwrap();
+        assert!(nonce_reply.starts_with("HTTP/1.0 200 OK"), "{nonce_reply}");
+        assert!(nonce_reply.contains("x-state-block: "), "{nonce_reply}");
+        assert!(
+            nonce_reply.contains("x-state-tx-idx: 0\r\n"),
+            "{nonce_reply}"
+        );
+        assert!(nonce_reply.contains(r#""result":"0x7""#), "{nonce_reply}");
+        assert!(nonce_reply.contains(r#""id":5"#), "{nonce_reply}");
+
+        let balance_reply =
+            tokio::task::spawn_blocking(move || query(addr, "eth_getBalance", known))
+                .await
+                .unwrap();
+        assert!(
+            balance_reply.contains(r#""result":"0x1f4""#),
+            "{balance_reply}"
+        );
 
         let unknown = Address::repeat_byte(0x22);
-        let unknown_reply = tokio::task::spawn_blocking(move || query(addr, unknown))
-            .await
-            .unwrap();
+        let unknown_reply =
+            tokio::task::spawn_blocking(move || query(addr, "eth_getBalance", unknown))
+                .await
+                .unwrap();
         assert!(
             unknown_reply.contains(r#""result":"0x0""#),
             "{unknown_reply}"
@@ -416,12 +503,22 @@ mod tests {
         let wrong_method = tokio::task::spawn_blocking(move || {
             post(
                 addr,
-                r#"{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":[]}"#,
+                r#"{"jsonrpc":"2.0","id":1,"method":"eth_getCode","params":[]}"#,
             )
         })
         .await
         .unwrap();
         assert!(wrong_method.contains(r#""code":-32601"#), "{wrong_method}");
+
+        let no_params = tokio::task::spawn_blocking(move || {
+            post(
+                addr,
+                r#"{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":[]}"#,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(no_params.contains(r#""code":-32602"#), "{no_params}");
 
         let bad_params = tokio::task::spawn_blocking(move || {
             post(

@@ -164,3 +164,81 @@ fn deep_compare_identical_dbs_is_empty_and_divergent_is_not() {
         "diffs: {diffs:?}"
     );
 }
+
+/// Append block 3 to `dir`: empty when `receipts` is false, else one
+/// receipt with an account change.
+fn append_block_3(dir: &std::path::Path, receipts: bool) {
+    let env = StateEnvBuilder::new(dir)
+        .durability(Durability::SafeNoSync)
+        .open()
+        .unwrap();
+    let mut handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
+    let end = if receipts {
+        BPosition::from_index(3)
+    } else {
+        BPosition::from_index(2)
+    };
+    let delta = BlockDelta {
+        block_number: 3,
+        accounts: if receipts {
+            vec![kardamom_types::AccountChange {
+                address: Address::from([0xAA; 20]),
+                nonce: 3,
+                balance: U256::from(1_000_000 - 30u64),
+                code_hash: B256::ZERO,
+            }]
+        } else {
+            vec![]
+        },
+        storage: vec![],
+        code: vec![],
+        receipts: if receipts {
+            vec![Receipt {
+                tx_idx: BPosition::from_index(3),
+                tx_hash: B256::from(U256::from(0x00BE_EF03u64)),
+                status: true,
+                gas_used: 21_000,
+                write_set_hash: B256::from(U256::from(7u64)),
+                ..Default::default()
+            }]
+        } else {
+            vec![]
+        },
+    };
+    let boundary = BlockBoundary {
+        block_number: 3,
+        end_tx_idx: end,
+        l2_timestamp: 1_700_000_003,
+        l1_origin: 0,
+    };
+    handle
+        .delta_tx
+        .send(WriteBatch::new(boundary, delta))
+        .unwrap();
+    handle.shutdown().unwrap();
+}
+
+#[test]
+fn a_bounded_compare_tolerates_one_empty_tail_block_only() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    build_db(a.path());
+    build_db(b.path());
+    append_block_3(b.path(), false);
+    let ea = open(a.path());
+    let eb = open(b.path());
+    assert!(!deep_compare(&ea, &eb).unwrap().is_empty());
+    assert!(deep_compare_to(&ea, &eb, 2).unwrap().is_empty());
+    drop(eb);
+    let c = tempfile::tempdir().unwrap();
+    build_db(c.path());
+    append_block_3(c.path(), true);
+    let ec = open(c.path());
+    let diffs = deep_compare_to(&ea, &ec, 2).unwrap();
+    assert!(
+        diffs
+            .iter()
+            .any(|d| d.starts_with("receipts: extra key in b")),
+        "{diffs:?}"
+    );
+}

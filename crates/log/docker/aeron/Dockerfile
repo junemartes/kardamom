@@ -11,14 +11,23 @@ FROM eclipse-temurin:21-jre-jammy AS base
 
 ARG AERON_VERSION=1.45.0
 ENV AERON_VERSION=${AERON_VERSION}
+# The SHA-256 of aeron-all-1.45.0.jar. Maven Central publishes a SHA-1 for
+# it (4c303bbd2ff61f2ff8a74861f733f67416fd6d3f); a download that matched it
+# gave this SHA-256. A different AERON_VERSION needs its own hash.
+ARG AERON_JAR_SHA256=80899f3919fad64d5f572a8f7ebe549361eee723df9d28425c8501dea4ae1672
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
+# A reset connection to Maven Central costs a retry, not the build, and
+# -f keeps an HTTP error page from landing as the jar. The hash check
+# catches a truncated or substituted download.
 RUN mkdir -p /opt/aeron && \
-    curl -L "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_VERSION}/aeron-all-${AERON_VERSION}.jar" \
-        -o /opt/aeron/aeron-all.jar
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+        "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_VERSION}/aeron-all-${AERON_VERSION}.jar" \
+        -o /opt/aeron/aeron-all.jar && \
+    echo "${AERON_JAR_SHA256}  /opt/aeron/aeron-all.jar" | sha256sum -c -
 
 # `aeron.dir` lives in a subdir of a bind-mount root so Aeron can freely
 # rmdir + recreate `aeron.dir` on every start without touching the

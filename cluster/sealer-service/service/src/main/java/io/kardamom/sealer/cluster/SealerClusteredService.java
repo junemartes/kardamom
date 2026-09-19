@@ -162,6 +162,13 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onSessionOpen(ClientSession session, long timestamp) {
+        // Log every open and close. A client whose session the cluster
+        // closed without its knowledge offers into nothing, and these lines
+        // are the only record of when and why the cluster dropped it. Both
+        // callbacks are log-driven, so every member prints them, also on
+        // replay.
+        System.out.println("cluster SESSION open memberId=" + memberId
+            + " session=" + session.id());
         // Nothing session-specific to track: canonical state is global. But a
         // session opening is a log-driven moment where timer scheduling is
         // allowed, so use it to revive a dead boundary clock (see helper).
@@ -170,6 +177,8 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
+        System.out.println("cluster SESSION close memberId=" + memberId
+            + " session=" + session.id() + " reason=" + closeReason);
         egress.removeConsumer(session.id());
     }
 

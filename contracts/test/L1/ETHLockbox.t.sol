@@ -24,6 +24,12 @@ contract MockOracle is IWithdrawalOutputOracle {
     function isFinalizable(uint256 index) external view returns (bool) {
         return finalizable[index];
     }
+
+    uint64 public finalizationWindow = 1 days;
+
+    function setFinalizationWindow(uint64 w) external {
+        finalizationWindow = w;
+    }
 }
 
 contract ETHLockboxTest is Test {
@@ -394,5 +400,108 @@ contract ETHLockboxTest is Test {
         (bool ok,) = address(lockbox)
             .call(abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(newImpl), ""));
         assertFalse(ok, "non-factory upgrade must revert");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Egress cap: the total per window and the per-account share.
+// ---------------------------------------------------------------------------
+
+contract ETHLockboxEgressTest is Test {
+    ETHLockbox lockbox;
+    MockOracle oracle;
+    address constant L2_MINTER = address(0xBEEF);
+    /// Must match KardamomUUPSBase.FACTORY.
+    address constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
+    uint8 constant OUTPUT_VERSION = 0;
+    uint64 constant WINDOW = 1 days;
+
+    event EgressLimitsUpdated(uint256 capPerWindow, uint256 accountCapPerWindow);
+
+    function setUp() public {
+        oracle = new MockOracle();
+        oracle.setFinalizationWindow(WINDOW);
+        ETHLockbox impl = new ETHLockbox();
+        bytes memory initData =
+            abi.encodeWithSelector(ETHLockbox.initialize.selector, L2_MINTER, address(oracle));
+        lockbox = ETHLockbox(payable(address(new ERC1967Proxy(address(impl), initData))));
+        vm.deal(address(lockbox), 100 ether);
+        vm.warp(1_700_000_000);
+    }
+
+    function _hashLeaf(bytes32 wh) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(bytes1(0x00), wh));
+    }
+
+    /// Register a single-leaf tree for one withdrawal at output `index` and
+    /// finalize it.
+    function _finalize(uint256 index, uint256 nonce, address l2Sender, uint256 value) internal {
+        _finalize(index, nonce, l2Sender, value, false);
+    }
+
+    /// With `expectCapRevert`, the finalize call itself must revert with
+    /// `EgressCapExceeded`. The expectation is armed right before that call,
+    /// after the helper's own external calls.
+    function _finalize(
+        uint256 index,
+        uint256 nonce,
+        address l2Sender,
+        uint256 value,
+        bool expectCapRevert
+    ) internal {
+        ETHLockbox.WithdrawalTransaction memory wtx = ETHLockbox.WithdrawalTransaction({
+            nonce: nonce, sender: l2Sender, target: address(0x7777), value: value
+        });
+        bytes32 root = _hashLeaf(lockbox.hashWithdrawal(wtx));
+        bytes32 stateRoot = keccak256(abi.encode("state", index));
+        oracle.set(index, keccak256(abi.encodePacked(OUTPUT_VERSION, stateRoot, root)), true);
+        if (expectCapRevert) vm.expectRevert(ETHLockbox.EgressCapExceeded.selector);
+        lockbox.finalizeWithdrawal(wtx, index, stateRoot, root, 0, new bytes32[](0));
+    }
+
+    function test_setEgressLimits_factory_only() public {
+        vm.expectRevert(KardamomUUPSBase.NotFactory.selector);
+        lockbox.setEgressLimits(1 ether, 1 ether);
+
+        vm.expectEmit(false, false, false, true);
+        emit EgressLimitsUpdated(5 ether, 2 ether);
+        vm.prank(FACTORY);
+        lockbox.setEgressLimits(5 ether, 2 ether);
+        assertEq(lockbox.egressCapPerWindow(), 5 ether);
+        assertEq(lockbox.egressAccountCapPerWindow(), 2 ether);
+    }
+
+    function test_zero_caps_do_no_accounting() public {
+        _finalize(0, 0, address(0xA1), 50 ether);
+        assertEq(lockbox.egressUsed(lockbox.egressWindowId()), 0);
+    }
+
+    function test_account_share_is_enforced_per_window() public {
+        vm.prank(FACTORY);
+        lockbox.setEgressLimits(0, 2 ether);
+        _finalize(0, 0, address(0xA1), 2 ether);
+        _finalize(1, 1, address(0xA1), 1 wei, true);
+        // Another account has its own share.
+        _finalize(2, 2, address(0xA2), 2 ether);
+        // The next window starts fresh. The rejected withdrawal is not consumed.
+        vm.warp(block.timestamp + WINDOW);
+        _finalize(1, 1, address(0xA1), 1 wei);
+    }
+
+    function test_total_cap_is_enforced_across_accounts() public {
+        vm.prank(FACTORY);
+        lockbox.setEgressLimits(3 ether, 2 ether);
+        _finalize(0, 0, address(0xA1), 2 ether);
+        _finalize(1, 1, address(0xA2), 1 ether);
+        assertEq(lockbox.egressUsed(lockbox.egressWindowId()), 3 ether);
+        _finalize(2, 2, address(0xA3), 1 wei, true);
+        vm.warp(block.timestamp + WINDOW);
+        _finalize(2, 2, address(0xA3), 1 wei);
+    }
+
+    function test_window_id_follows_the_oracle_window() public {
+        assertEq(lockbox.egressWindowId(), block.timestamp / WINDOW);
+        oracle.setFinalizationWindow(2 hours);
+        assertEq(lockbox.egressWindowId(), block.timestamp / 2 hours);
     }
 }

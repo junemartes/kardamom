@@ -128,6 +128,11 @@ job "validator" {
       # fixed port sat in the node's ephemeral range, where the shared
       # media driver's port-0 discovery sockets could take it first.
       port "egress" {}
+      # The join-miss refetch ports: replayed fragments and archive
+      # control responses. Nomad picks them per allocation, below the
+      # ephemeral range, so no other process on the node holds them.
+      port "replay" {}
+      port "archive_response" {}
     }
 
     task "validator" {
@@ -179,13 +184,12 @@ job "validator" {
           # Join-miss archive refetch (tx_data and tx_deposits). When
           # the live multicast misses a canonical ref's envelope, it
           # replays in-band from the durability archives listed in
-          # channels.toml. Replayed fragments land on 40131, and
-          # archive-control responses land on 40141. The executor uses
-          # 40130/40140 on its own nodes; there is no co-residence, but
-          # keeping the ports distinct avoids confusion. tx_ordering
+          # channels.toml. Replayed fragments and archive-control
+          # responses land on the allocation's dynamic ports, so they
+          # never clash with the batcher's on the aux node. tx_ordering
           # recovery rides the cluster replay.
-          "--replay-destination-endpoint", "${meta.node_ip}:40131",
-          "--archive-control-response-endpoint", "${meta.node_ip}:40141",
+          "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
+          "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
           # Replay-unavailable fallback: fetch a peer checkpoint from
           # the executors' serve endpoints, and adopt it on restart,
           # the same as the executors' recovery-D loop.

@@ -8,8 +8,13 @@ export TAG := env('TAG', 'dev')
 export DIGEST_MANIFEST := env('DIGEST_MANIFEST', 'images.digests')
 export NODE_CONTRACT := env('NODE_CONTRACT', 'terraform/containers/node-contract.json')
 export TF_CONTAINERS := env('TF_CONTAINERS', 'terraform/containers')
-export CLUSTER_BIN := env('CLUSTER_BIN', 'cargo run --release -p kardamom-chaos --locked --bin kardamom-cluster --')
-export CARGO_CHAOS := env('CARGO_CHAOS', 'cargo test -p kardamom-chaos --release --features cluster-e2e --locked --test shards')
+# KARDAMOM_STAGED=1 runs the binaries a build already staged under
+# target/release (scripts/ci/stage-cluster-dist.sh): the shard test
+# executable as kardamom-chaos-shards and the operator binary. CI's shard
+# runners carry no toolchain. Unset, cargo builds and runs them.
+export KARDAMOM_STAGED := env('KARDAMOM_STAGED', '')
+export CLUSTER_BIN := env('CLUSTER_BIN', if KARDAMOM_STAGED != '' { '../../target/release/kardamom-cluster' } else { 'cargo run --release -p kardamom-chaos --locked --bin kardamom-cluster --' })
+export RUN_SHARDS := env('RUN_SHARDS', if KARDAMOM_STAGED != '' { '../../target/release/kardamom-chaos-shards' } else { 'cargo test -p kardamom-chaos --release --features cluster-e2e --locked --test shards --' })
 
 _default:
     @just --list
@@ -72,12 +77,14 @@ container-up:
     ansible-playbook -i localhost, ansible/cluster.yml "${args[@]}"
 
 # Run a shard against an existing cluster; KARDAMOM_CHAOS_CASES narrows cases.
+# Shards: load, semantics, chaos-executor, chaos-ingress, chaos-sequencer,
+# chaos-cluster, chaos-retention, chaos-cache.
 container-test $shard=env('SHARD', 'load'):
-    KARDAMOM_CHAOS_REUSE=1 $CARGO_CHAOS -- --ignored --exact "${shard//-/_}" --nocapture
+    KARDAMOM_CHAOS_REUSE=1 $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
 
 # Run a shard end to end, including its cluster lifecycle, as CI does.
 shard $shard=env('SHARD', 'load'):
-    $CARGO_CHAOS -- --ignored --exact "${shard//-/_}" --nocapture
+    $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
 
 # Collect node and job state after a failure.
 container-diagnostics:

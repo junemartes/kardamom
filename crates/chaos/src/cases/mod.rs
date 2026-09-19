@@ -9,6 +9,7 @@ use crate::harness::Harness;
 use crate::knobs::Knobs;
 
 pub(crate) mod archive;
+pub(crate) mod cache;
 pub(crate) mod cluster;
 pub(crate) mod component;
 pub(crate) mod resize;
@@ -27,11 +28,13 @@ pub enum Case {
     HardSequencer,
     SequencerReplicaKill,
     NodeFailureExecutor,
+    NodeReplaceExecutor,
     StateCheckpointRestore,
     ReplayWindowResync,
     ClusterLeaderKill,
     ClusterFollowerKill,
     ClusterMemberRejoin,
+    NodeReplaceSealer,
     ClusterQuorumLossRecover,
     ArchiveDriverLoss,
     ArchiveTxDataWipe,
@@ -44,9 +47,13 @@ pub enum Case {
     CpuSqueeze,
     ResizeScaleOutIn,
     LookupBlackout,
+    RedisPrimaryFreeze,
+    RedisPrimaryKill,
+    RedisPartitionIngress,
+    MirrorKillRebuild,
 }
 
-const ALL: [Case; 25] = [
+const ALL: [Case; 31] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -55,11 +62,13 @@ const ALL: [Case; 25] = [
     Case::HardSequencer,
     Case::SequencerReplicaKill,
     Case::NodeFailureExecutor,
+    Case::NodeReplaceExecutor,
     Case::StateCheckpointRestore,
     Case::ReplayWindowResync,
     Case::ClusterLeaderKill,
     Case::ClusterFollowerKill,
     Case::ClusterMemberRejoin,
+    Case::NodeReplaceSealer,
     Case::ClusterQuorumLossRecover,
     Case::ArchiveDriverLoss,
     Case::ArchiveTxDataWipe,
@@ -72,6 +81,10 @@ const ALL: [Case; 25] = [
     Case::CpuSqueeze,
     Case::ResizeScaleOutIn,
     Case::LookupBlackout,
+    Case::RedisPrimaryFreeze,
+    Case::RedisPrimaryKill,
+    Case::RedisPartitionIngress,
+    Case::MirrorKillRebuild,
 ];
 
 impl Case {
@@ -99,11 +112,13 @@ impl Case {
             Self::HardSequencer => "hard-sequencer",
             Self::SequencerReplicaKill => "sequencer-replica-kill",
             Self::NodeFailureExecutor => "node-failure-executor",
+            Self::NodeReplaceExecutor => "node-replace-executor",
             Self::StateCheckpointRestore => "state-checkpoint-restore",
             Self::ReplayWindowResync => "replay-window-resync",
             Self::ClusterLeaderKill => "cluster-leader-kill",
             Self::ClusterFollowerKill => "cluster-follower-kill",
             Self::ClusterMemberRejoin => "cluster-member-rejoin",
+            Self::NodeReplaceSealer => "node-replace-sealer",
             Self::ClusterQuorumLossRecover => "cluster-quorum-loss-recover",
             Self::ArchiveDriverLoss => "archive-driver-loss",
             Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
@@ -116,6 +131,10 @@ impl Case {
             Self::CpuSqueeze => "cpu-squeeze",
             Self::ResizeScaleOutIn => "resize-scale-out-in",
             Self::LookupBlackout => "lookup-blackout",
+            Self::RedisPrimaryFreeze => "redis-primary-freeze",
+            Self::RedisPrimaryKill => "redis-primary-kill",
+            Self::RedisPartitionIngress => "redis-partition-ingress",
+            Self::MirrorKillRebuild => "mirror-kill-rebuild",
         }
     }
 
@@ -147,6 +166,16 @@ impl Case {
             }
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
             Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_secs(300),
+            // The freeze, the election, and the recovery polls.
+            Self::RedisPrimaryFreeze | Self::RedisPrimaryKill | Self::RedisPartitionIngress => {
+                inject + k.restart_slo + Duration::from_secs(300)
+            }
+            // The mirrors restart, wait for a checkpoint, and rebuild.
+            Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_secs(600),
+            Self::NodeReplaceExecutor => inject + k.reschedule_slo + Duration::from_secs(420),
+            Self::NodeReplaceSealer => {
+                inject + k.reschedule_slo + k.rejoin_slo + Duration::from_secs(300)
+            }
             Self::CpuSqueeze => {
                 let cycle = k.squeeze.window + k.squeeze.release;
                 inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
@@ -157,11 +186,19 @@ impl Case {
     }
 
     /// The load's per-submit retry count. The resize case rolls the
-    /// ingress the load submits to, so it gets a wide retry.
+    /// ingress the load submits to, so it gets a wide retry. The
+    /// quorum-loss case stalls ordering for about a minute, past the
+    /// ingress's 30 s parked-submit timeout; a refused submit leaves a
+    /// nonce hole, and every later transaction of that sender then
+    /// executes as failed, which the verdict would count as bad receipts.
+    /// Each attempt parks up to 30 s at the ingress while the stall
+    /// lasts, so six attempts cover the stall; sixty made the case take
+    /// 23 minutes and the shard hit its job timeout.
     #[must_use]
     pub fn load_retry(self, k: &Knobs) -> u32 {
         match self {
             Self::ResizeScaleOutIn => 60,
+            Self::ClusterQuorumLossRecover => 6,
             _ => k.load_retry,
         }
     }
@@ -181,11 +218,13 @@ impl Case {
             Self::HardSequencer => component::hard_sequencer(h).await,
             Self::SequencerReplicaKill => component::sequencer_replica_kill(h).await,
             Self::NodeFailureExecutor => component::node_failure_executor(h).await,
+            Self::NodeReplaceExecutor => component::node_replace_executor(h).await,
             Self::StateCheckpointRestore => component::state_checkpoint_restore(h).await,
             Self::ReplayWindowResync => component::replay_window_resync(h).await,
             Self::ClusterLeaderKill => cluster::leader_kill(h).await,
             Self::ClusterFollowerKill => cluster::follower_kill(h).await,
             Self::ClusterMemberRejoin => cluster::member_rejoin(h).await,
+            Self::NodeReplaceSealer => cluster::node_replace_sealer(h).await,
             Self::ClusterQuorumLossRecover => cluster::quorum_loss_recover(h).await,
             Self::ArchiveDriverLoss => archive::driver_loss(h).await,
             Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
@@ -202,6 +241,10 @@ impl Case {
             Self::CpuSqueeze => squeeze::cpu_squeeze(h).await,
             Self::ResizeScaleOutIn => resize::scale_out_in(h).await,
             Self::LookupBlackout => resize::lookup_blackout(h).await,
+            Self::RedisPrimaryFreeze => cache::redis_primary_freeze(h).await,
+            Self::RedisPrimaryKill => cache::redis_primary_kill(h).await,
+            Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,
+            Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
         }
     }
 }
@@ -218,6 +261,7 @@ mod tests {
             crate::Shard::Sequencer,
             crate::Shard::Cluster,
             crate::Shard::Retention,
+            crate::Shard::Cache,
         ] {
             shard
                 .cases()

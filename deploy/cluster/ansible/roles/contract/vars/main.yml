@@ -110,6 +110,8 @@ contract_mirrors:
   - path: deploy/cluster/config/sequencer.toml.tpl
     required:
       - ingress_endpoints = "{{ contract_ingress_endpoints }}"
+      - '"redis://aux-0.node.consul:{{ ports.redis_sentinel }}"'
+      - master_name = "kardamom"
     forbidden: []
   - path: deploy/cluster/nomad/validator.nomad.hcl
     required:
@@ -135,6 +137,14 @@ contract_mirrors:
       - advertise_interface = "{% raw %}{{ env "meta.node_ip" }}{% endraw %}/32"
       - tx_data_archive_endpoints = [{% raw %}{{ range service "ingress.kardamom-aeron-archive" }}{% endraw %}
       - tx_deposits_archive_endpoints = [{% raw %}{{ range service "aux.kardamom-aeron-archive" }}{% endraw %}
+    forbidden: []
+  - path: deploy/cluster/nomad/state-mirror.nomad.hcl
+    required:
+      - .consul:{{ ports.redis_sentinel }}
+    forbidden: []
+  - path: deploy/cluster/nomad/redis.nomad.hcl
+    required:
+      - static = {{ ports.redis_sentinel }}
     forbidden: []
   - path: deploy/cluster/config/genesis/dev.toml
     required:
@@ -164,4 +174,6 @@ contract_mirrors:
   - path: deploy/cluster/config/ingress.toml
     required:
       - ingress_endpoints = "{{ contract_ingress_endpoints }}"
+      - '"redis://aux-0.node.consul:{{ ports.redis_sentinel }}"'
+      - master_name = "kardamom"
     forbidden: []

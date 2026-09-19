@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use alloy_primitives::{Address, B256, KECCAK256_EMPTY, U256};
 use bytes::Bytes;
 use kardamom_types::delta::CodeEntry as WireCodeEntry;
-use kardamom_types::{AccountChange, BlockDelta, StorageChange};
+use kardamom_types::{AccountChange, AccountRow, BlockDelta, StorageChange};
 
 /// One account's basic fields: nonce, balance, and code hash. This is
 /// the same triple [`kardamom_types::StateDatabase::basic`] returns, and
@@ -46,6 +46,19 @@ impl From<(u64, U256, B256)> for AccountFields {
 impl From<AccountFields> for (u64, U256, B256) {
     fn from(f: AccountFields) -> Self {
         (f.nonce, f.balance, f.code_hash)
+    }
+}
+
+impl AccountFields {
+    /// The `tx_receipts` projection of this account at `address`: nonce
+    /// and balance, no code hash.
+    #[must_use]
+    pub fn row(&self, address: Address) -> AccountRow {
+        AccountRow {
+            address,
+            nonce: self.nonce,
+            balance: self.balance,
+        }
     }
 }
 
@@ -83,6 +96,16 @@ impl WriteSet {
         self.accounts.sort_unstable_by_key(|(a, _)| *a);
         self.storage.sort_unstable_by_key(|(k, _)| *k);
         self.code.sort_unstable_by_key(|(h, _)| *h);
+    }
+
+    /// The post-state row of every account this write set touched, in
+    /// the set's order (address order once [`finish`](Self::finish) ran).
+    #[must_use]
+    pub fn account_rows(&self) -> Vec<AccountRow> {
+        self.accounts
+            .iter()
+            .map(|(address, fields)| fields.row(*address))
+            .collect()
     }
 
     /// Look up an account by key. This is a linear search, which is safe
@@ -353,6 +376,16 @@ impl PendingDelta {
         self.accounts.extend(ws.accounts);
         self.storage.extend(ws.storage);
         self.code.extend(ws.code);
+    }
+
+    /// The post-state row of every account this delta touched. The order
+    /// is the map's, which is nondeterministic; the consumer sorts.
+    #[must_use]
+    pub fn account_rows(&self) -> Vec<AccountRow> {
+        self.accounts
+            .iter()
+            .map(|(address, fields)| fields.row(*address))
+            .collect()
     }
 
     /// Merge another block's delta over this one. The other delta's writes

@@ -10,6 +10,11 @@
     args: "{{ images_item.args | default({}) }}"
     rebuild: always # Re-evaluate changed source; BuildKit still reuses unchanged layers.
   register: images_build
+  # A base-image pull reaches Docker Hub; a reset connection there is a
+  # transient fault of the network, not of the build.
+  until: images_build is succeeded
+  retries: 3
+  delay: 15
 
 - name: Require the build result in the local engine
   ansible.builtin.assert:

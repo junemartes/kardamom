@@ -14,8 +14,8 @@
 #
 # Placement: the aux node, next to the validator and da-watcher,
 # outside the chaos suite's blast radius. Ports on the aux node:
-# cluster egress on a Nomad dynamic port, refetch 40133/40143, metrics
-# 9002 (the validator holds 40131/40141/9006 and its own dynamic port).
+# cluster egress and refetch on Nomad dynamic ports, metrics 9002 (the
+# validator holds 9006 and its own dynamic ports).
 #
 # ansible/deploy.yml deploys the settlement address, with
 # kardamom-deploy against anvil, and injects it at submit time:
@@ -111,6 +111,11 @@ job "batcher" {
       # fixed port sat in the node's ephemeral range, where the shared
       # media driver's port-0 discovery sockets could take it first.
       port "egress" {}
+      # The join-miss refetch ports: replayed fragments and archive
+      # control responses. Nomad picks them per allocation, below the
+      # ephemeral range, so no other process on the node holds them.
+      port "replay" {}
+      port "archive_response" {}
     }
 
     task "batcher" {
@@ -148,10 +153,10 @@ job "batcher" {
           # on the same node.
           "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
           # Join-miss archive refetch (tx_data and tx_deposits). Same
-          # contract as the validator's flags, with distinct ports on
-          # the shared aux node.
-          "--replay-destination-endpoint", "${meta.node_ip}:40133",
-          "--archive-control-response-endpoint", "${meta.node_ip}:40143",
+          # contract as the validator's flags, on this allocation's
+          # dynamic ports.
+          "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
+          "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
           "--l1-rpc", var.l1_rpc,
           "--settlement", "${var.settlement_address}",
           "--da-store", "/opt/kardamom/batcher/da",

@@ -21,9 +21,12 @@ async fn s3_nonces_unordered_all_land() {
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn s16_scripted_resize_moves_senders_with_zero_loss() {
     let (mut stack, _t) = launch_with_park(PARK_4S, StackConfig::default()).await;
-    resize::run(&mut stack, resize::Params::default())
-        .await
-        .expect("S16");
+    // The scenario restarts the ingress and every shard; a failure names
+    // a symptom at the client, so the process logs go with it.
+    if let Err(e) = resize::run(&mut stack, resize::Params::default()).await {
+        stack.dump_tails();
+        panic!("S16: {e:#}");
+    }
 }
 
 /// F02.1: a restarted sequencer regains an established sender through the

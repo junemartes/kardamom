@@ -1,11 +1,13 @@
 //! The sequencer lapse and the retention-overrun cases: a running
 //! consumer is frozen with SIGSTOP and must repair itself on thaw.
 
+mod repair;
+use repair::Repair;
+
 use std::cell::Cell;
 use std::time::Duration;
 
 use crate::harness::Harness;
-use crate::nomad::Streams;
 use crate::poll::{self, Budget};
 use crate::probes::EXECUTOR_BLOCK_METRIC;
 
@@ -248,9 +250,13 @@ impl Victim {
 /// Freeze a running consumer until the cluster's bounded egress
 /// retention rolls past its cursor, so on thaw its replay is refused
 /// and it must repair itself: fetch a peer checkpoint, park the stale
-/// state, restart, restore or adopt, and rejoin. The freeze also
-/// crosses the cluster session timeout, so the resume goes through a
-/// fresh session.
+/// state, restore or adopt it in-process, and rejoin. The repair burns
+/// no orchestrator restart (issue #298): the process that logged the
+/// refusal is the one that logs the restore. The freeze itself does
+/// cost one restart, before the refusal: a SIGSTOP longer than the Aeron
+/// client's service interval makes the client exit on resume, and Nomad
+/// restarts the task. The freeze also crosses the cluster session
+/// timeout, so the resume goes through a fresh session.
 pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow::Result<()> {
     let kind = victim.kind();
     let ctx = format!("retention-overrun({kind})");
@@ -272,12 +278,15 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
         .inner_container(&node, kind)
         .await
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no inner {kind} container on {node}"))?;
-    let cid0 = h.nodes.inner_cid(&node, &inner).await;
     let donor = h.container("executor-0")?;
     super::component::wait_peer_checkpoint(h, &donor, &ctx).await?;
     require_live_victim(h, victim, &ctx).await?;
+    let repair = Repair::capture(h, victim, &node).await?;
     let need = i64::try_from(retention.get().saturating_mul(2)).unwrap_or(i64::MAX);
-    let rx_freeze = h.probes.ingress_received().await.unwrap_or(0);
+    let rx_freeze =
+        h.probes.ingress_counts().await.complete().ok_or_else(|| {
+            crate::chaos_fail!("no complete ingress baseline for retention overrun")
+        })?;
     crate::log(format!(
         "{ctx}: freezing {inner} on {node} until {need} frames flow past it (retention={retention}, cap {}s)",
         h.knobs.retention_freeze_cap.as_secs()
@@ -296,15 +305,7 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
             "{ctx}: SIGCONT failed (container may have been replaced mid-freeze); the log asserts below own the verdict"
         ));
     }
-    await_repair_chain(h, victim, &ctx, delta, elapsed).await?;
-    let cid_now = h.nodes.inner_cid(&node, &inner).await;
-    anyhow::ensure!(
-        cid_now.is_some() && cid_now != cid0,
-        "{}: {ctx}: victim container was not restarted (cid {} -> {}) — the park/exit/restore loop did not complete",
-        crate::FAIL_PREFIX,
-        cid0.as_deref().unwrap_or("?"),
-        cid_now.as_deref().unwrap_or("gone")
-    );
+    await_repair_chain(h, victim, &ctx, delta, elapsed, &repair).await?;
     match victim {
         Victim::Executor => h.assert_executor_progress(Duration::from_secs(180)).await,
         Victim::Validator => await_verifying_resumed(h).await,
@@ -320,10 +321,9 @@ async fn require_live_victim(h: &Harness, victim: Victim, ctx: &str) -> anyhow::
         let now = match victim {
             Victim::Executor => h.probes.exec_metric(2, EXECUTOR_BLOCK_METRIC).await,
             Victim::Validator => h.probes.val_metric("validator_committed_block").await,
-        }
-        .unwrap_or(0);
-        let live = prev_ref.get().is_some_and(|p| now > p);
-        prev_ref.set(Some(now));
+        };
+        let live = matches!((prev_ref.get(), now), (Some(p), Some(n)) if n > p);
+        prev_ref.set(now);
         Ok::<_, anyhow::Error>(live.then_some(now))
     })
     .await?;
@@ -369,26 +369,24 @@ async fn overrun_window(
     }
 }
 
-/// The recovery evidence splits across container generations, so the
-/// only stream holding both halves is the allocation's own Nomad log.
+/// The recovery evidence splits across container generations (the
+/// freeze costs one restart before the refusal), so the only stream
+/// holding every part is the allocation's own Nomad log. Once every
+/// needle is there, the log must also show the repair ran in-process:
+/// see [`Repair::in_process`].
 async fn await_repair_chain(
     h: &Harness,
     victim: Victim,
     ctx: &str,
     delta: i64,
     frozen: Duration,
+    repair: &Repair,
 ) -> anyhow::Result<()> {
-    let kind = victim.kind();
     let restored = victim.restored_needle();
     let seen = Cell::new((false, false, false));
     let seen_ref = &seen;
     let outcome = poll::until(Budget::secs(300, 6), |_| async move {
-        let logs = h.nomad.job_logs(kind, Streams::Both).await?;
-        let s = (
-            logs.contains("cluster replay unavailable"),
-            logs.contains("resync prepared: peer checkpoint staged"),
-            logs.contains(restored),
-        );
+        let s = repair.seen(h).await?;
         seen_ref.set(s);
         Ok((s.0 && s.1 && s.2).then_some(()))
     })
@@ -400,8 +398,13 @@ async fn await_repair_chain(
             return Err(repair_failure(seen, ctx, delta, frozen, restored));
         }
     };
+    repair.in_process(h).await?.map_err(|why| {
+        crate::chaos_fail!(
+            "{ctx}: the repair went through an orchestrator restart, not in-process: {why}"
+        )
+    })?;
     crate::log(format!(
-        "{ctx}: REPLAY_UNAVAILABLE -> fetch -> park -> restart -> restore observed ({}s after thaw)",
+        "{ctx}: REPLAY_UNAVAILABLE -> fetch -> park -> in-process restore observed ({}s after thaw)",
         elapsed.as_secs()
     ));
     Ok(())
@@ -426,7 +429,7 @@ fn repair_failure(
         );
     }
     crate::chaos_fail!(
-        "{ctx}: resync prepared but the restarted consumer never logged '{restored}'"
+        "{ctx}: resync prepared but the consumer's next revolution never logged '{restored}'"
     )
 }
 

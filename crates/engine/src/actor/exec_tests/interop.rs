@@ -58,7 +58,7 @@ fn remote_epoch_messages_execute_as_0x7d_receipts() {
     let receipts: Vec<_> = rx_e2c
         .try_iter()
         .filter_map(|m| match m {
-            ExecToCommit::Receipt(r) => Some(r),
+            ExecToCommit::Receipt(item) => Some(item.receipt),
             ExecToCommit::Boundary(_) => None,
         })
         .collect();
@@ -194,7 +194,7 @@ fn whole_block_strategy_receives_buffered_xchain_records() {
         seen: seen_kinds.clone(),
     };
 
-    let (rig, _writer_log) = ExecRig::recording(StaticSnapshotSource(snap), ImmediateCommit);
+    let (rig, writer_log) = ExecRig::recording(StaticSnapshotSource(snap), ImmediateCommit);
     let (h, rx_e2c) = rig.block_exec(strategy).spawn(rx_r2e);
     h.join().expect("no panic").expect("exec ok");
 
@@ -203,18 +203,43 @@ fn whole_block_strategy_receives_buffered_xchain_records() {
         vec!["xchain", "xchain"],
         "the strategy must receive the buffered 0x7D records (marker excluded)"
     );
-    let receipts: Vec<_> = rx_e2c
+    let items: Vec<_> = rx_e2c
         .try_iter()
         .filter_map(|m| match m {
-            ExecToCommit::Receipt(r) => Some(r),
+            ExecToCommit::Receipt(item) => Some(item),
             ExecToCommit::Boundary(_) => None,
         })
         .collect();
-    assert_eq!(receipts.len(), 2);
-    for (seq, r) in receipts.iter().enumerate() {
+    assert_eq!(items.len(), 2);
+    for (seq, item) in items.iter().enumerate() {
+        let r = &item.receipt;
         assert_eq!(r.tx_type, kardamom_types::TX_TYPE_XCHAIN);
         assert_eq!(r.tx_hash, xchain::remote_source_hash(origin, seq as u64));
     }
+    // The block-exec path has no per-tx write sets: the block's merged
+    // rows ride the last receipt, and the others carry none.
+    assert!(
+        items[0].accounts.is_empty(),
+        "no rows before the last receipt"
+    );
+    let mut rows = items[1].accounts.clone();
+    rows.sort_by_key(|row| row.address);
+    let log = writer_log.lock().unwrap();
+    let expected: Vec<_> = log[0]
+        .1
+        .accounts
+        .iter()
+        .map(|a| kardamom_types::AccountRow {
+            address: a.address,
+            nonce: a.nonce,
+            balance: a.balance,
+        })
+        .collect();
+    assert!(!expected.is_empty(), "the block wrote at least one account");
+    assert_eq!(
+        rows, expected,
+        "the block's merged rows ride the last receipt"
+    );
 }
 
 struct RejectingRemoteObserver;

@@ -12,11 +12,14 @@
 //! types.
 
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, mpsc};
 
+use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_types::{
-    BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
+    AccountRow, BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
+    TxError,
 };
 
 use crate::error::IngressError;
@@ -60,6 +63,11 @@ pub trait IngressSubscription: Send + Sync + 'static {
     /// duplicate. Drives early release of parked client submissions with
     /// a JSON-RPC error.
     fn subscribe_tx_errors(&self) -> broadcast::Receiver<TxError>;
+    /// The local account layer this subscription feeds: the account rows
+    /// of every `tx_receipts` batch, applied before the batch's receipts
+    /// fan out on [`Self::subscribe_receipts`]. So a client released by
+    /// its receipt sees the new state on its next submit.
+    fn live_accounts(&self) -> Arc<LiveAccounts>;
 }
 
 /// One name for the `(publisher, subscriber)` pair that every proxy
@@ -99,6 +107,11 @@ pub struct MockChannels {
     pub(crate) local_fsync_bus: broadcast::Sender<FsyncWatermark>,
     pub(crate) block_boundary_bus: broadcast::Sender<BlockBoundary>,
     pub tx_error_bus: broadcast::Sender<TxError>,
+    live: Arc<LiveAccounts>,
+    /// The local layer's one writer. A mutex is test-only plumbing: the
+    /// live adapter's pump owns its writer outright, but a test drives
+    /// the rows from any task through [`Self::apply_rows`].
+    live_writer: Arc<Mutex<LiveAccountsWriter>>,
 }
 
 impl MockChannels {
@@ -107,6 +120,16 @@ impl MockChannels {
     /// drains these.
     #[must_use]
     pub fn new(shards: std::num::NonZeroUsize) -> (Self, Vec<mpsc::UnboundedReceiver<TxEnvelope>>) {
+        Self::with_live_accounts(shards, &LiveAccountsConfig::default())
+    }
+
+    /// [`Self::new`] with an explicit local layer config, for the tests
+    /// that need a short TTL or a small capacity.
+    #[must_use]
+    pub fn with_live_accounts(
+        shards: std::num::NonZeroUsize,
+        live_cfg: &LiveAccountsConfig,
+    ) -> (Self, Vec<mpsc::UnboundedReceiver<TxEnvelope>>) {
         let (tx_vec, rx_vec): (Vec<_>, Vec<_>) =
             (0..shards.get()).map(|_| mpsc::unbounded_channel()).unzip();
         let (receipt_bus, _) = broadcast::channel(BUS_CAPACITY);
@@ -114,6 +137,7 @@ impl MockChannels {
         let (local_fsync_bus, _) = broadcast::channel(BUS_CAPACITY);
         let (block_boundary_bus, _) = broadcast::channel(BUS_CAPACITY);
         let (tx_error_bus, _) = broadcast::channel(BUS_CAPACITY);
+        let (live, writer) = LiveAccounts::new(live_cfg);
         (
             Self {
                 tx_data_tx: tx_vec,
@@ -122,9 +146,23 @@ impl MockChannels {
                 local_fsync_bus,
                 block_boundary_bus,
                 tx_error_bus,
+                live,
+                live_writer: Arc::new(Mutex::new(writer)),
             },
             rx_vec,
         )
+    }
+
+    /// Apply account rows to the local layer, as a batch that ends at
+    /// `end` would. Returns how many rows applied. A test calls this
+    /// before it sends the batch's receipts, in the live pump's order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a previous caller panicked while it held the writer.
+    #[must_use]
+    pub fn apply_rows(&self, end: BPosition, rows: &[AccountRow]) -> usize {
+        self.live_writer.lock().unwrap().apply(end, rows)
     }
 }
 
@@ -167,6 +205,9 @@ impl IngressSubscription for MockChannels {
     }
     fn subscribe_tx_errors(&self) -> broadcast::Receiver<TxError> {
         self.tx_error_bus.subscribe()
+    }
+    fn live_accounts(&self) -> Arc<LiveAccounts> {
+        self.live.clone()
     }
 }
 

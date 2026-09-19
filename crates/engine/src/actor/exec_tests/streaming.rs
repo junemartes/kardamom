@@ -111,9 +111,10 @@ fn deposit_credit_is_visible_to_later_txs_in_the_block() {
     // The transfer must execute (status true), not skip for missing funds.
     // This shows the deposit's credit reached the scope cache.
     let saw_transfer_success = rx_e2c.try_iter().any(|msg| {
-        if let ExecToCommit::Receipt(r) = msg
-            && r.tx_idx == pos(64)
+        if let ExecToCommit::Receipt(item) = msg
+            && item.receipt.tx_idx == pos(64)
         {
+            let r = &item.receipt;
             assert!(
                 r.status,
                 "transfer after same-block deposit must execute: {r:?}"
@@ -125,4 +126,44 @@ fn deposit_credit_is_visible_to_later_txs_in_the_block() {
         }
     });
     assert!(saw_transfer_success, "transfer receipt not observed");
+}
+
+/// Every streamed receipt carries the rows of its own write set: the
+/// sender's post-state nonce and balance, and the recipient's balance,
+/// in address order.
+#[test]
+fn streamed_receipts_carry_their_write_set_rows() {
+    let signer = PrivateKeySigner::random();
+    let from = signer.address();
+    let to = address!("00000000000000000000000000000000000ABCDE");
+    let snap = funded(&signer, 0);
+    let rx_r2e = feed(vec![
+        tx_msg(&signer, to, 0, 0, 100),
+        boundary_msg(1, 1, 1_700_000_000),
+    ]);
+
+    let (rig, _writer_log) = ExecRig::recording(StaticSnapshotSource(snap), ImmediateCommit);
+    let (h, rx_e2c) = rig.spawn(rx_r2e);
+    h.join().expect("no panic").expect("exec ok");
+
+    let items: Vec<_> = rx_e2c
+        .try_iter()
+        .filter_map(|m| match m {
+            ExecToCommit::Receipt(item) => Some(item),
+            ExecToCommit::Boundary(_) => None,
+        })
+        .collect();
+    assert_eq!(items.len(), 1);
+    let rows = &items[0].accounts;
+    let sender = rows.iter().find(|r| r.address == from).expect("sender row");
+    assert_eq!(sender.nonce, 1, "the row is the post-state nonce");
+    let recipient = rows
+        .iter()
+        .find(|r| r.address == to)
+        .expect("recipient row");
+    assert_eq!(recipient.balance, U256::from(100u64));
+    assert!(
+        rows.windows(2).all(|w| w[0].address < w[1].address),
+        "rows in address order"
+    );
 }

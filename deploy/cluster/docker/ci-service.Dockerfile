@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # =============================================================================
 # ci-service.Dockerfile — thin runtime image wrapping a PREBUILT kardamom
 # binary, for the container-based cluster e2e only.

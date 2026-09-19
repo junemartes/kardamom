@@ -29,7 +29,7 @@ if Path(sys.argv[0]).name == 'cosign':
     fail_at(args[0])
     if args[0] == 'sign-blob':
         manifest = Path(args[-1]).read_text()
-        assert len(manifest.splitlines()) == 8, manifest
+        assert len(manifest.splitlines()) == 10, manifest
         Path(args[args.index('--bundle') + 1]).write_text(manifest)
     sys.exit(0)
 

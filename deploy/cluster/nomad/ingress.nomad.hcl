@@ -37,6 +37,12 @@ variable "ack_policy" {
 # `nomad job run` during debugging, not a production path. A mutable
 # tag lets anyone with registry push access change what the next
 # restart runs.
+variable "executor_count" {
+  type        = number
+  description = "The executor node count (node_classes.executor.count). The account RPCs' executor queries go to executor-<i>.node.<datacenter>.consul."
+  default     = 3
+}
+
 variable "image_ref" {
   type        = string
   description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
@@ -112,6 +118,11 @@ job "ingress" {
       port "jsonrpc" {
         static = 8545
       }
+      # The cluster egress (response) port of the on-quorum watermark
+      # client, unique per allocation. A fixed port sat in the node's
+      # ephemeral range, where the shared media driver's port-0
+      # discovery sockets could take it first.
+      port "egress" {}
     }
 
     task "ingress" {
@@ -190,22 +201,26 @@ job "ingress" {
           "--chain-id", "412346",
           # Cluster mode: this node's cluster-egress (response)
           # endpoint, for the on-quorum watermark observer's Aeron
-          # Cluster client. The port, 40210 (cluster_egress_port),
-          # stays uniform; uniqueness comes from the ingress node_ip.
-          # This is consulted only when --ack-policy gates on quorum.
-          "--cluster-egress-endpoint", "${meta.node_ip}:40210",
+          # Cluster client, on this allocation's dynamic port. This is
+          # consulted only when --ack-policy gates on quorum.
+          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
           # Record each per-shard tx_data publication to the archive,
           # so a restarted executor can replay full transaction
           # envelopes (Phase 2 crash recovery).
           "--archive-durability",
+          # The executor account query (executor_nonce_query port):
+          # eth_getBalance and eth_getTransactionCount ask one executor
+          # when the local account layer misses. Never on the submit
+          # path. Same list as the sequencer's nonce lookup.
+          "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:9024"]),
         ]
       }
 
       env {
-        # The UDP ports the discovered tx_data publications bind on this
-        # node: one control endpoint per lane. Uniqueness comes from the
-        # node IP; one ingress runs per node. See docs/aeron-discovery.md.
-        KARDAMOM_MDC_PORTS = "40300-40319"
+        # Bind the exporter on the node, not loopback, so the monitoring
+        # job scrapes it off-node. The port is the ingress convention,
+        # 9006 (the validator uses the same number on the aux node).
+        KARDAMOM_METRICS_ADDR = "0.0.0.0:9006"
       }
 
       # Presence-checked config. Content lives in config/ingress.toml.

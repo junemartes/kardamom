@@ -14,7 +14,11 @@ run() { # <name> <dir> <test> <env...>
   # failure must show in the log. An earlier version sent stderr to
   # /dev/null, so a broken build failed the job with no output.
   if ! (cd "$dir" && env "$@" cargo test --test "$test" --release -- --ignored --nocapture) >"$raw" 2>&1; then
-    echo "== $name: HARNESS FAILED (cargo test exit != 0); last 40 lines:"
+    # The last 40 lines of a panicking test are its backtrace, so the
+    # panic itself scrolls away. Print the failure lines first.
+    echo "== $name: HARNESS FAILED (cargo test exit != 0); the failure lines:"
+    grep -nE "panicked at|assertion|^error(\[|:)|^thread .* panicked|FAILED" "$raw" | head -20 || true
+    echo "== $name: last 40 lines:"
     tail -40 "$raw"
     return 1
   fi

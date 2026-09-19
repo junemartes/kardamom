@@ -1,8 +1,10 @@
 //! Startup and shutdown wiring for the validator binary.
 //!
-//! `main` is exactly the chain
-//! `Startup::init(args).await?.open_state()?.open_streams()?.spawn_pumps()?
-//! .spawn_writer()?.spawn_attester()?.build_sink().run().await`. Each step
+//! One revolution of the pipeline is exactly the chain
+//! `Startup::from_boot(&boot)?.open_state()?.open_streams()?.spawn_pumps()?
+//! .spawn_writer()?.spawn_attester()?.build_sink().run().await`, over the
+//! once-only [`startup::Boot`]; `main` runs revolutions until [`revolve`]
+//! says the process is done. Each step
 //! is a method that reads only its own fields and returns the next phase;
 //! there is no argument list to keep in sync with the step before it. Each
 //! phase type nests the one before it as a single field, plus a small
@@ -18,10 +20,13 @@
 //! The chain splits across three modules, in the order it runs:
 //! [`startup`] (tracing/config through the open subscriptions), [`pipeline`]
 //! (the trie-aware writer and the optional attester), and [`run`] (the
-//! receipts sink, the engine loop, and shutdown).
+//! receipts sink, the engine loop, and shutdown). [`revolve`] wraps the
+//! chain in the process loop.
 
 mod pipeline;
+mod revolve;
 mod run;
 mod startup;
 
-pub(crate) use startup::Startup;
+pub(crate) use revolve::turn;
+pub(crate) use startup::Boot;
