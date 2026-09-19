@@ -306,7 +306,7 @@ test-e2e-local: aeron-jar cluster-jar
 # Multi-node cluster (deploy/cluster) — HOST dependencies.
 #
 # These recipes install the tools needed on this machine to run
-# `cd deploy/cluster && make container-up`: Ansible (+ the ansible.posix /
+# `cd deploy/cluster && just container-up`: Ansible (+ the ansible.posix /
 # community.docker collections), Docker with BuildKit, OpenTofu, and the
 # Nomad CLI (the Ansible workload role uses it to compile HCL locally). Nomad
 # *servers/clients* and Consul run inside the node containers and are
@@ -344,7 +344,7 @@ cluster-bootstrap:
         command -v brew >/dev/null 2>&1 || { echo "Homebrew required — https://brew.sh" >&2; exit 1; }
         echo ">> installing Docker + Ansible + OpenTofu via brew"
         brew install --cask docker || true
-        brew install ansible opentofu
+        brew install ansible opentofu jq
         install_nomad
         echo "   NOTE: the container cluster needs a Linux Docker daemon with"
         echo "   privileged containers; Docker Desktop's Linux VM serves that."
@@ -354,9 +354,9 @@ cluster-bootstrap:
         echo ">> installing cluster host deps (distro: ${ID:-unknown})"
         if command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update
-            sudo apt-get install -y ansible docker.io docker-buildx
+            sudo apt-get install -y ansible docker.io docker-buildx jq
         elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y ansible docker
+            sudo dnf install -y ansible docker jq
         elif command -v pacman >/dev/null 2>&1; then
             sudo pacman -S --needed --noconfirm ansible docker
         else
@@ -396,6 +396,7 @@ cluster-doctor:
     echo ">> deploy/cluster host dependencies:"
     chk ansible "run 'just cluster-bootstrap'"
     chk ansible-galaxy "ships with ansible"
+    chk jq "run 'just cluster-bootstrap'"
     chk docker "run 'just cluster-bootstrap'"
     chk nomad "run 'just cluster-bootstrap' — Ansible uses Nomad to compile job specs"
     chk tofu "install OpenTofu 1.12.6 — terraform/containers creates the node containers"
@@ -414,7 +415,7 @@ cluster-doctor:
         echo "  WARN  docker daemon not running"
     fi
     if [[ "$rc" == "0" ]]; then
-        echo ">> all good — 'cd deploy/cluster && make up'"
+        echo ">> all good — 'cd deploy/cluster && just container-up'"
     else
         echo ">> missing dependencies; run 'just cluster-bootstrap'" >&2
     fi

@@ -3,7 +3,7 @@
 workloads_cluster_dir: "{{ playbook_dir | dirname }}"
 workloads_nomad_binary: nomad
 # The Nomad API. A controller outside the cluster passes NOMAD_ADDR (the
-# Makefile derives it from the node contract); a controller on a node
+# justfile derives it from the node contract); a controller on a node
 # reaches its local agent.
 workloads_nomad_addr: "{{ lookup('env', 'NOMAD_ADDR') | default('http://127.0.0.1:' ~ ports.nomad_http, true) }}"
 workloads_nomad_token: "{{ lookup('env', 'NOMAD_TOKEN') }}"
@@ -20,7 +20,7 @@ workloads_cert_identity: >-
   {{ lookup('env', 'KARDAMOM_CERT_IDENTITY_RE') |
      default('^https://github\.com/junemartes/kardamom/\.github/workflows/[^@]+@refs/', true) }}
 workloads_cert_issuer: "{{ lookup('env', 'KARDAMOM_CERT_OIDC_ISSUER') | default('https://token.actions.githubusercontent.com', true) }}"
-workloads_image_services: [aeron, cluster, sequencer, ingress, executor, validator, da-watcher, batcher]
+workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, validator, da-watcher, batcher, state-mirror]
 # The variables every job derives its placement and its peer lists from.
 # A job receives the ones its file declares (tasks/job.yml).
 workloads_common_vars:
@@ -30,6 +30,8 @@ workloads_common_vars:
   executor_query_port: "{{ ports.executor_nonce_query }}"
   executor_count: "{{ node_classes.executor.count }}"
   sealer_count: "{{ node_classes.sealer.count }}"
+  sequencer_count: "{{ node_classes.sequencer.count }}"
+  ingress_count: "{{ node_classes.ingress.count }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 workloads_l1_rpc: "{{ lookup('env', 'L1_RPC') }}"

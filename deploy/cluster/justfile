@@ -1,0 +1,100 @@
+# Cluster orchestration. Defaults mirror ansible/group_vars/all.yml;
+# `just check-contract` verifies they stay in sync.
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+export REGISTRY := env('REGISTRY', 'registry.service.consul:5000')
+export NOMAD_HTTP := env('NOMAD_HTTP', '4646')
+export TAG := env('TAG', 'dev')
+export DIGEST_MANIFEST := env('DIGEST_MANIFEST', 'images.digests')
+export NODE_CONTRACT := env('NODE_CONTRACT', 'terraform/containers/node-contract.json')
+export TF_CONTAINERS := env('TF_CONTAINERS', 'terraform/containers')
+# KARDAMOM_STAGED=1 runs the binaries a build already staged under
+# target/release (scripts/ci/stage-cluster-dist.sh): the shard test
+# executable as kardamom-chaos-shards and the operator binary. CI's shard
+# runners carry no toolchain. Unset, cargo builds and runs them.
+export KARDAMOM_STAGED := env('KARDAMOM_STAGED', '')
+export CLUSTER_BIN := env('CLUSTER_BIN', if KARDAMOM_STAGED != '' { '../../target/release/kardamom-cluster' } else { 'cargo run --release -p kardamom-chaos --locked --bin kardamom-cluster --' })
+export RUN_SHARDS := env('RUN_SHARDS', if KARDAMOM_STAGED != '' { '../../target/release/kardamom-chaos-shards' } else { 'cargo test -p kardamom-chaos --release --features cluster-e2e --locked --test shards --' })
+
+_default:
+    @just --list
+
+# Wrap prebuilt service binaries and the sealer jar, then push their images.
+images:
+    ansible-playbook -i localhost, ansible/images.yml
+
+# Converge workload jobs and settlement through Ansible.
+deploy:
+    ansible-playbook -i localhost, ansible/deploy.yml
+
+# Submit a signed transfer; RPC_URL overrides the node contract address.
+smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=()
+    if [[ -n "${RPC_URL:-}" ]]; then args+=(--rpc "$RPC_URL"); fi
+    $CLUSTER_BIN smoke "${args[@]}"
+
+# Run all static deployment checks, reporting failures together.
+validate:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    rc=0
+    yamllint ansible/ || rc=1
+    ansible-lint ansible/ || rc=1
+    for job in nomad/*.hcl; do nomad job validate "$job" || rc=1; done
+    ansible-playbook -i localhost, ansible/contract.yml || rc=1
+    for root in terraform/*/; do
+        tofu -chdir="$root" fmt -check -recursive . || rc=1
+        tofu -chdir="$root" init -backend=false -input=false >/dev/null && tofu -chdir="$root" validate || rc=1
+    done
+    exit "$rc"
+
+# Verify values mirrored from group_vars/all.yml.
+check-contract:
+    ansible-playbook -i localhost, ansible/contract.yml
+
+# Remove local built images and the staged cluster jar.
+clean:
+    -docker image rm "$REGISTRY/kardamom-aeron:$TAG"
+    -docker image rm "$REGISTRY/kardamom-cluster:$TAG"
+    rm -f docker/kardamom-cluster-node.jar
+    for svc in ingress sequencer executor validator da-watcher batcher; do docker image rm "$REGISTRY/kardamom-$svc:$TAG" || true; done
+
+# Create nodes, provision them, publish prebuilt images and deploy workloads.
+# CLUSTER_VARS is a JSON object passed as a single Ansible extra-vars argument.
+container-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export REGISTRY_PUSH_NODE="${REGISTRY_PUSH_NODE:-control-0}"
+    tofu -chdir="$TF_CONTAINERS" init -input=false
+    tofu -chdir="$TF_CONTAINERS" apply -auto-approve -input=false
+    tofu -chdir="$TF_CONTAINERS" output -json node_contract > "$NODE_CONTRACT"
+    control_address=$(jq -er '.nodes["control-0"].ip' "$NODE_CONTRACT")
+    export NOMAD_ADDR="http://$control_address:$NOMAD_HTTP"
+    args=()
+    if [[ -n "${CLUSTER_VARS:-}" ]]; then args+=(--extra-vars "$CLUSTER_VARS"); fi
+    ansible-playbook -i localhost, ansible/cluster.yml "${args[@]}"
+
+# Run a shard against an existing cluster; KARDAMOM_CHAOS_CASES narrows cases.
+# Shards: load, semantics, chaos-executor, chaos-ingress, chaos-sequencer,
+# chaos-cluster, chaos-retention, chaos-cache.
+container-test $shard=env('SHARD', 'load'):
+    KARDAMOM_CHAOS_REUSE=1 $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
+
+# Run a shard end to end, including its cluster lifecycle, as CI does.
+shard $shard=env('SHARD', 'load'):
+    $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
+
+# Collect node and job state after a failure.
+container-diagnostics:
+    $CLUSTER_BIN diagnostics
+
+# Destroy node containers and their volumes.
+container-down:
+    tofu -chdir="$TF_CONTAINERS" init -input=false
+    tofu -chdir="$TF_CONTAINERS" destroy -auto-approve -input=false
+    rm -f "$NODE_CONTRACT"
+
+# Destroy, then create a fresh chain, in that order.
+container-reset: container-down container-up

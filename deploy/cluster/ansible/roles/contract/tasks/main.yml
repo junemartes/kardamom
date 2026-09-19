@@ -86,7 +86,7 @@
     fail_msg: "{{ item }} names an address; use a Consul record."
   loop: >-
     {{ (contract_discovery_files.files | map(attribute='path') | reject('search', '/inventories/|/tests/') | list)
-       + [contract_cluster_dir ~ '/Makefile', contract_repo_dir ~ '/justfile',
+       + [contract_cluster_dir ~ '/justfile', contract_repo_dir ~ '/justfile',
           contract_repo_dir ~ '/.github/workflows/cluster-e2e.yml'] }}
   loop_control:
     label: "{{ item | relpath(contract_repo_dir) }}"

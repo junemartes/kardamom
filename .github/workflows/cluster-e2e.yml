@@ -2,12 +2,12 @@ name: cluster-e2e
 
 # Container-based cluster end-to-end (Ansible → Nomad → Consul). Brings up the
 # multi-node cluster as privileged systemd+DinD containers on a Docker
-# bridge (the VM-less analogue of `make up`), provisions it through
+# bridge (the VM-less analogue of `just container-up`), provisions it through
 # ansible/cluster.yml, deploys the Nomad jobs, and runs the pipeline smoke +
 # sustained-load + chaos suite. Each shard is one test of crates/chaos
 # (tests/shards.rs); the test owns the lifecycle. See
 # deploy/cluster/terraform/containers and the container-* targets of
-# deploy/cluster/Makefile for the same lifecycle by hand.
+# deploy/cluster/justfile for the same lifecycle by hand.
 #
 # The deploy uses the CLUSTERED sealer (Phase 3): a 3-member Aeron Cluster (Raft)
 # replaces the single sealer. The cluster transport is unconditional in the Rust
@@ -58,6 +58,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: 1.49.0
 
       - name: Install system build deps (Aeron C client)
         run: |
@@ -203,7 +207,7 @@ jobs:
         run: pipx inject ansible-core requests
 
       # Images are pushed from inside the control node (REGISTRY_PUSH_NODE
-      # in the Makefile), so the runner daemon trusts no registry address.
+      # in the justfile), so the runner daemon trusts no registry address.
       - name: Kernel modules for systemd-in-container
         run: |
           # cgroup v2 + systemd-in-container needs this on some runners.
@@ -230,12 +234,22 @@ jobs:
       # (Shard::env, the stage table in tests/shards.rs), not here. A
       # failed shard leaves the cluster up for the diagnostics step; the
       # runner is ephemeral, so nothing destroys it after.
+      # The shard runner carries no toolchain; just is the one tool the
+      # recipes need.
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: 1.49.0
+
       - name: Run shard (${{ matrix.shard }})
-        run: make -C deploy/cluster shard SHARD=${{ matrix.shard }} KARDAMOM_STAGED=1
+        run: just --justfile deploy/cluster/justfile shard "${{ matrix.shard }}"
+        env:
+          KARDAMOM_STAGED: "1"
 
       - name: Collect diagnostics
         if: failure()
-        run: make -C deploy/cluster container-diagnostics KARDAMOM_STAGED=1
+        run: just --justfile deploy/cluster/justfile container-diagnostics
+        env:
+          KARDAMOM_STAGED: "1"
 
       - name: Preserve state and load evidence
         if: failure()
