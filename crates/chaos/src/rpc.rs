@@ -1,8 +1,9 @@
 //! One signed transfer through the ingress JSON-RPC, with a receipt
 //! poll: the mechanic every smoke gate and re-smoke uses. Each caller
-//! owns a dedicated funded account, so every transfer has nonce 0, and
-//! no gate reads `eth_getTransactionCount`. The balance probe drives
-//! the ingress's account layers for the Redis cases.
+//! owns a dedicated funded account, so every transfer has nonce 0. The
+//! recovery probe of a case reuses the case's account, so it reads the
+//! account's nonce first. The balance probe drives the ingress's
+//! account layers for the Redis cases.
 
 use std::time::Duration;
 
@@ -88,6 +89,33 @@ impl Rpc {
         )
         .await
         .map(|_| ())
+    }
+
+    /// The next nonce of genesis account `account`, from the latest
+    /// block the ingress serves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signer cannot derive or the call fails.
+    pub async fn nonce_of(&self, account: u32) -> anyhow::Result<u64> {
+        let address = derive_signers(
+            ANVIL_MNEMONIC,
+            account.checked_add(1).context("account index")?,
+        )?
+        .pop()
+        .context("derive the account")?
+        .address;
+        let nonce = self
+            .call(
+                "eth_getTransactionCount",
+                serde_json::json!([format!("{address:#x}"), "latest"]),
+            )
+            .await?;
+        let nonce = nonce
+            .as_str()
+            .context("eth_getTransactionCount returned no quantity")?;
+        u64::from_str_radix(nonce.trim_start_matches("0x"), 16)
+            .with_context(|| format!("parse the nonce {nonce}"))
     }
 
     /// Sign a one-wei transfer from genesis account `account` at nonce 0,

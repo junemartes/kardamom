@@ -47,16 +47,25 @@ with three distinct, tested modes:
   cluster *sessions* die (the outage exceeds the session timeout): re-election
   + session re-establishment + log replay takes ~50 s+ observed (SLO 180 s),
   then the backlog drains gaplessly. The second node returns last, and the
-  pipeline must progress again with all three members. The load window
-  outlasts both returns, so the verdict covers transactions submitted to the
-  recovered cluster and checks their receipts.
+  pipeline must progress again with all three members.
 - **Total loss** (`cluster-total-loss-recover`) — all three nodes killed: no
   member is left, the pipeline **must stall**. Every node returns with its
-  own log and snapshots, the members elect a leader among themselves, the
-  backlog drains, and the load keeps submitting to the recovered cluster.
+  own log and snapshots, the members elect a leader among themselves, and
+  the backlog drains.
   What this does not cover: all three members *wiped*. The failure model
   owns no in-cluster recovery for that; it is the rebuild-from-L1 backstop
   below.
+
+Every chaos case ends with a **recovery probe**: after the case load ended
+and the executors converged, a 30 s load at the case rate runs on the case's
+account from its next nonce. Every offered transaction must get a receipt,
+and the pipeline must accept at least a quarter of the rate. The case load
+cannot prove this: a submit refused during the outage leaves a nonce hole,
+every later submit of that sender parks and fails, and the chaos verdict
+does not count a failed submit. The executor block gauge cannot prove it
+either: it advances on empty blocks. The first fleet-shard run showed the
+gap: after the quorum loss, 1,282 of 1,524 submits never landed and the case
+still passed.
 
 ## Executor
 
@@ -77,8 +86,6 @@ with three distinct, tested modes:
   nodes killed at once, every exporter observed dark, then all three return.
   Each executor resumes from its own state directory and catches up on the
   backlog the sealers kept ordering, within the canonical retention window.
-  The load keeps submitting after the return, so the verdict covers the
-  recovered fleet's receipts.
 - **Whole-fleet state loss** (`executor-fleet-wipe-recover`) — all three
   executor nodes killed and every state DB wiped, with each node's own
   checkpoints kept. No peer is live to serve a checkpoint, so every executor

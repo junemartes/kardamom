@@ -18,11 +18,6 @@ pub(crate) mod seq_retention;
 pub(crate) mod squeeze;
 pub(crate) mod validator;
 
-/// The progress wait of a whole-fleet case (three minutes), plus the
-/// submit period the load must still run against the recovered fleet
-/// (two minutes).
-const FLEET_RECOVERY_LOAD: Duration = Duration::from_mins(5);
-
 /// Every case, by its CI name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Case {
@@ -194,16 +189,6 @@ impl Case {
             Self::CpuSqueeze => {
                 let cycle = k.squeeze.window + k.squeeze.release;
                 inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
-            }
-            // The stall check, the return of every node within the
-            // reschedule SLO, the progress wait, then a submit period
-            // against the recovered fleet.
-            Self::ClusterQuorumLossRecover | Self::ClusterTotalLossRecover => {
-                inject + Duration::from_secs(15) + k.reschedule_slo + FLEET_RECOVERY_LOAD
-            }
-            // The outage observation replaces the stall check.
-            Self::ExecutorFleetLossRecover | Self::ExecutorFleetWipeRecover => {
-                inject + Duration::from_secs(60) + k.reschedule_slo + FLEET_RECOVERY_LOAD
             }
             _ => Duration::ZERO,
         };
