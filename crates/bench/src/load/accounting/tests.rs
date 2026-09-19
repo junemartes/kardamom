@@ -17,6 +17,7 @@ fn counts(offered: u64, accepted: u64, receipted: u64, bad: u64) -> Counts {
         accepted,
         receipted,
         bad_status: bad,
+        bad_receipt: 0,
     }
 }
 
@@ -47,6 +48,22 @@ fn clean_run_passes() {
     let fin = snap(&[("exec-0", 50), ("exec-1", 49)], 51);
     let v = evaluate(&base_input(&base, &fin));
     assert!(v.pass, "expected pass, failures: {:?}", v.failures);
+}
+
+#[test]
+fn a_receipt_that_contradicts_its_transaction_fails() {
+    let base = snap(&[("exec-0", 10)], 10);
+    let fin = snap(&[("exec-0", 50)], 50);
+    let v = evaluate(&EvalInput {
+        counts: Counts {
+            bad_receipt: 1,
+            ..counts(300, 300, 300, 0)
+        },
+        ..base_input(&base, &fin)
+    });
+    assert!(!v.pass);
+    assert!(v.failures.iter().any(|f| f.contains("contradict")));
+    assert_eq!(v.bad_receipt, 1);
 }
 
 #[test]

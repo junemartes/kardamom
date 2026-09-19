@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use alloy_primitives::B256;
 use jsonrpsee::http_client::HttpClient;
 
-use super::{ReceiptStatus, Tracker, receipt_status};
+use super::{Tracker, receipt_status};
+use crate::load::tracker::ReceiptStatus;
 
 /// Join one queued task, or time out at `deadline`. Returns
 /// [`ControlFlow::Break`] once the deadline hits with tasks still
@@ -99,8 +100,7 @@ impl Drainer {
         if let Some(r) = self.receipt_from_any(hash).await
             && self.tracker.remove_pending(&hash)
         {
-            self.tracker
-                .confirm_with_gas(r.status, submit_ts.elapsed(), r.gas);
+            self.tracker.confirm(hash, &r, submit_ts.elapsed());
         }
     }
 
