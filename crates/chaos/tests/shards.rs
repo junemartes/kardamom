@@ -212,6 +212,12 @@ async fn chaos_cluster() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
+async fn chaos_fleet() {
+    shard_test(Shard::Fleet).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
 async fn chaos_retention() {
     shard_test(Shard::Retention).await;
 }

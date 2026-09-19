@@ -12,10 +12,16 @@ pub(crate) mod archive;
 pub(crate) mod cache;
 pub(crate) mod cluster;
 pub(crate) mod component;
+pub(crate) mod fleet;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
 pub(crate) mod squeeze;
 pub(crate) mod validator;
+
+/// The progress wait of a whole-fleet case (three minutes), plus the
+/// submit period the load must still run against the recovered fleet
+/// (two minutes).
+const FLEET_RECOVERY_LOAD: Duration = Duration::from_mins(5);
 
 /// Every case, by its CI name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +42,9 @@ pub enum Case {
     ClusterMemberRejoin,
     NodeReplaceSealer,
     ClusterQuorumLossRecover,
+    ClusterTotalLossRecover,
+    ExecutorFleetLossRecover,
+    ExecutorFleetWipeRecover,
     ArchiveDriverLoss,
     ArchiveTxDataWipe,
     ArchiveCorruption,
@@ -53,7 +62,7 @@ pub enum Case {
     MirrorKillRebuild,
 }
 
-const ALL: [Case; 31] = [
+const ALL: [Case; 34] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -70,6 +79,9 @@ const ALL: [Case; 31] = [
     Case::ClusterMemberRejoin,
     Case::NodeReplaceSealer,
     Case::ClusterQuorumLossRecover,
+    Case::ClusterTotalLossRecover,
+    Case::ExecutorFleetLossRecover,
+    Case::ExecutorFleetWipeRecover,
     Case::ArchiveDriverLoss,
     Case::ArchiveTxDataWipe,
     Case::ArchiveCorruption,
@@ -120,6 +132,9 @@ impl Case {
             Self::ClusterMemberRejoin => "cluster-member-rejoin",
             Self::NodeReplaceSealer => "node-replace-sealer",
             Self::ClusterQuorumLossRecover => "cluster-quorum-loss-recover",
+            Self::ClusterTotalLossRecover => "cluster-total-loss-recover",
+            Self::ExecutorFleetLossRecover => "executor-fleet-loss-recover",
+            Self::ExecutorFleetWipeRecover => "executor-fleet-wipe-recover",
             Self::ArchiveDriverLoss => "archive-driver-loss",
             Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
             Self::ArchiveCorruption => "archive-corruption",
@@ -180,6 +195,16 @@ impl Case {
                 let cycle = k.squeeze.window + k.squeeze.release;
                 inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
             }
+            // The stall check, the return of every node within the
+            // reschedule SLO, the progress wait, then a submit period
+            // against the recovered fleet.
+            Self::ClusterQuorumLossRecover | Self::ClusterTotalLossRecover => {
+                inject + Duration::from_secs(15) + k.reschedule_slo + FLEET_RECOVERY_LOAD
+            }
+            // The outage observation replaces the stall check.
+            Self::ExecutorFleetLossRecover | Self::ExecutorFleetWipeRecover => {
+                inject + Duration::from_secs(60) + k.reschedule_slo + FLEET_RECOVERY_LOAD
+            }
             _ => Duration::ZERO,
         };
         k.case_window.max(floor)
@@ -193,12 +218,19 @@ impl Case {
     /// executes as failed, which the verdict would count as bad receipts.
     /// Each attempt parks up to 30 s at the ingress while the stall
     /// lasts, so six attempts cover the stall; sixty made the case take
-    /// 23 minutes and the shard hit its job timeout.
+    /// 23 minutes and the shard hit its job timeout. A whole-fleet
+    /// outage lasts up to the reschedule SLO plus an election, so its
+    /// attempts cover that SLO in 30 s parks, plus two.
     #[must_use]
     pub fn load_retry(self, k: &Knobs) -> u32 {
         match self {
             Self::ResizeScaleOutIn => 60,
             Self::ClusterQuorumLossRecover => 6,
+            Self::ClusterTotalLossRecover
+            | Self::ExecutorFleetLossRecover
+            | Self::ExecutorFleetWipeRecover => {
+                u32::try_from(k.reschedule_slo.as_secs() / 30).unwrap_or(u32::MAX) + 2
+            }
             _ => k.load_retry,
         }
     }
@@ -226,6 +258,9 @@ impl Case {
             Self::ClusterMemberRejoin => cluster::member_rejoin(h).await,
             Self::NodeReplaceSealer => cluster::node_replace_sealer(h).await,
             Self::ClusterQuorumLossRecover => cluster::quorum_loss_recover(h).await,
+            Self::ClusterTotalLossRecover => fleet::cluster_total_loss_recover(h).await,
+            Self::ExecutorFleetLossRecover => fleet::executor_fleet_loss_recover(h).await,
+            Self::ExecutorFleetWipeRecover => fleet::executor_fleet_wipe_recover(h).await,
             Self::ArchiveDriverLoss => archive::driver_loss(h).await,
             Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
             Self::ArchiveCorruption => archive::corruption(h).await,
@@ -260,6 +295,7 @@ mod tests {
             crate::Shard::Ingress,
             crate::Shard::Sequencer,
             crate::Shard::Cluster,
+            crate::Shard::Fleet,
             crate::Shard::Retention,
             crate::Shard::Cache,
         ] {

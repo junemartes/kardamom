@@ -16,8 +16,9 @@ name: cluster-e2e
 #
 # The FULL suite runs on every trigger, SHARDED across runners (each shard brings
 # up its own cluster and runs one slice): one `load` shard (5-min soak), three
-# `chaos-*` component shards (executor/ingress/sequencer), and one `chaos-cluster`
-# shard for the Raft resilience cases. Splitting across runners keeps wall-clock
+# `chaos-*` component shards (executor/ingress/sequencer), one `chaos-cluster`
+# shard for the Raft resilience cases, and one `chaos-fleet` shard for the
+# whole-fleet outages. Splitting across runners keeps wall-clock
 # to ~one shard instead of running everything serially. Opt out with the
 # `skip-cluster-e2e` label for changes that can't affect the cluster.
 #
@@ -150,11 +151,14 @@ jobs:
       matrix:
         # `load` = the 5-min sustained-load soak. The `chaos-*` shards split the
         # chaos cases (each brings up its own cluster). chaos-cluster covers the
-        # 3-member Raft sealer (leader-kill / follower-kill / quorum-loss-recover);
+        # 3-member Raft sealer (leader-kill / follower-kill / member-rejoin);
         # it SUPERSEDES the old chaos-sealer shard (the single-sealer SPOF is gone
         # now the deploy uses the clustered sealer — see "Configure shard").
+        # chaos-fleet takes every replica of one role down at once: the sealer
+        # quorum, the whole sealer set, and the whole executor set, with and
+        # without their state databases.
         shard:
-          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-retention, chaos-cache, semantics]
+          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-fleet, chaos-retention, chaos-cache, semantics]
     steps:
       - uses: actions/checkout@v4
 
