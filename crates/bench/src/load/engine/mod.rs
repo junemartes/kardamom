@@ -28,8 +28,8 @@ use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::rpc_params;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::load::json_hex_u64;
 use crate::load::plan::PlannedTx;
+use crate::load::tracker::ReceiptStatus;
 
 pub(crate) use crate::load::tracker::{Counts, Tracker};
 
@@ -80,6 +80,11 @@ impl Queues {
         })
     }
 
+    /// Every queued transaction, for the tracker's expectations.
+    pub(crate) fn planned(&self) -> impl Iterator<Item = &PlannedTx> {
+        self.per_sender.iter().flatten()
+    }
+
     /// The total transactions still queued. Test-only: production code
     /// drains with `pop_next` until it returns `None`, and never needs
     /// the count.
@@ -89,22 +94,13 @@ impl Queues {
     }
 }
 
-/// A mined receipt's status code and gas used.
-struct ReceiptStatus {
-    status: u64,
-    gas: u64,
-}
-
-/// Look up a receipt's status and gas used. Returns `None` if not mined yet.
+/// Look up a receipt. Returns `None` if not mined yet.
 async fn receipt_status(client: &HttpClient, hash: B256) -> Option<ReceiptStatus> {
     let v: Option<serde_json::Value> = client
         .request("eth_getTransactionReceipt", rpc_params![hash])
         .await
         .ok()?;
-    let v = v?;
-    let status = json_hex_u64(&v["status"])?;
-    let gas = json_hex_u64(&v["gasUsed"]).unwrap_or(0);
-    Some(ReceiptStatus { status, gas })
+    ReceiptStatus::from_json(&v?)
 }
 
 /// A submit's fixed knobs: retry policy, receipt-confirmation strategy,
@@ -160,8 +156,7 @@ impl Attempt<'_> {
         // drop at the sequencer. So check for a receipt first, and stop
         // retrying if it is already there.
         if let Some(r) = receipt_status(self.client, self.tx.hash).await {
-            self.tracker
-                .confirm_with_gas(r.status, self.t0.elapsed(), r.gas);
+            self.tracker.confirm(self.tx.hash, &r, self.t0.elapsed());
             return ControlFlow::Break(RetryOutcome::LandedEarly);
         }
         tokio::time::sleep(Duration::from_millis(200 * (u64::from(attempt) + 1))).await;
@@ -211,7 +206,7 @@ async fn finalize_accepted(
     // already arrived: the transaction was executed and receipted.
     // Re-fetch it to check status and latency.
     match receipt_status(client, tx.hash).await {
-        Some(r) => tracker.confirm_with_gas(r.status, t0.elapsed(), r.gas),
+        Some(r) => tracker.confirm(tx.hash, &r, t0.elapsed()),
         // A submit acknowledgement does not prove successful execution.
         // Missing receipts stay pending across faults and must be recovered.
         None => tracker.insert_pending(tx.hash, t0, true),
@@ -224,7 +219,7 @@ async fn finalize_accepted(
 /// not `missing`, because it was never accepted.
 async fn finalize_unaccepted(client: &HttpClient, tracker: &Tracker, tx: &PlannedTx, t0: Instant) {
     match receipt_status(client, tx.hash).await {
-        Some(r) => tracker.confirm_with_gas(r.status, t0.elapsed(), r.gas),
+        Some(r) => tracker.confirm(tx.hash, &r, t0.elapsed()),
         None => {
             tracker.insert_pending(tx.hash, t0, false);
         }
