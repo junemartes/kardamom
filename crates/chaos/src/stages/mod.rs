@@ -4,6 +4,7 @@
 //! composes them; `run-tests.sh` used to.
 
 mod churn;
+mod rebuild;
 mod semantics;
 mod soak;
 mod state;

@@ -20,6 +20,7 @@ use alloy_provider::ProviderBuilder;
 use anyhow::{Context, bail};
 use clap::Parser;
 use kardamom_batcher::da_store::FsBlobStore;
+use kardamom_batcher::frame::BlockFrame;
 use kardamom_batcher::l1::{read_posted_batches, recover_blocks};
 use kardamom_reconstruct::reconstruct_state;
 use tracing::info;
@@ -58,6 +59,28 @@ struct Cli {
     /// (chaos-suite gate).
     #[arg(long)]
     expect_root: Option<B256>,
+
+    /// Optional last L2 block to re-execute. The posted batches must
+    /// reach it; later blocks are left out, so the root compares with a
+    /// state committed at that block.
+    #[arg(long)]
+    through_block: Option<u64>,
+}
+
+/// Keep the blocks through `through`, and refuse a batch set that ends
+/// before it.
+fn truncate(blocks: Vec<BlockFrame>, through: Option<u64>) -> anyhow::Result<Vec<BlockFrame>> {
+    let Some(through) = through else {
+        return Ok(blocks);
+    };
+    let end = blocks.iter().map(|b| b.block_number).max().unwrap_or(0);
+    if end < through {
+        bail!("posted batches end at block {end}, before block {through}");
+    }
+    Ok(blocks
+        .into_iter()
+        .filter(|b| b.block_number <= through)
+        .collect())
 }
 
 #[tokio::main]
@@ -93,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
 
     let store = FsBlobStore::open(&cli.da_store).context("open DA blob store")?;
     let blocks = recover_blocks(&descriptors, &store).context("recover blocks from DA store")?;
+    let blocks = truncate(blocks, cli.through_block)?;
     info!(
         blocks = blocks.len(),
         "recovered blocks from DA; re-executing"
@@ -124,4 +148,29 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(n: u64) -> BlockFrame {
+        BlockFrame {
+            block_number: n,
+            ..BlockFrame::default()
+        }
+    }
+
+    #[test]
+    fn truncate_keeps_the_blocks_through_the_target_and_refuses_a_short_set() {
+        let blocks = || vec![block(1), block(2), block(3)];
+        let kept = truncate(blocks(), Some(2)).unwrap();
+        assert_eq!(
+            kept.iter().map(|b| b.block_number).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(truncate(blocks(), None).unwrap().len(), 3);
+        let err = truncate(blocks(), Some(4)).unwrap_err().to_string();
+        assert!(err.contains("end at block 3, before block 4"), "{err}");
+    }
 }
