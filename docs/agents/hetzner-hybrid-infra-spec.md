@@ -157,6 +157,7 @@ Proposed entry points share roles across dedicated, Cloud and local environments
 ```text
 deploy/cluster/
   terraform/hetzner/          network, vSwitch attachment, edge and pool outputs
+                              (no longer part of this repository)
   ansible/bootstrap.yml       configure a host and join the substrate
   ansible/image.yml           prepare a clean, versioned elastic-node image
   ansible/deploy.yml          validate and converge Nomad workloads

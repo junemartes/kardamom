@@ -8,7 +8,7 @@
 #     -e bootstrap_revision=$(git rev-parse --short HEAD) \
 #     -e image_ssh_key=<hcloud ssh key name> [-e image_location=fsn1]
 # The snapshot's description is <cluster_id>-elastic-<bootstrap_revision>;
-# pass it as elastic_image to terraform/hetzner.
+# pass it as elastic_image to the Hetzner Terraform root.
 
 - name: Create the image build server
   hosts: localhost

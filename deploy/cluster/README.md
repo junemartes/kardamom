@@ -8,10 +8,11 @@ Ansible tree and one set of Nomad jobs:
   container per node on a Docker bridge. The `container-*` Make targets
   drive the full bring-up + smoke + load + chaos suite
   (`.github/workflows/cluster-e2e.yml`).
-- **`production`, the Hetzner profile:** `terraform/hetzner` owns the cloud
+- **`production`, the Hetzner profile:** the Hetzner Terraform root, which
+  is not part of this repository, owns the cloud
   network, the pools and the public entry points; the Nomad Autoscaler
   creates the elastic machines; `inventories/hetzner` holds the dedicated
-  core. See `terraform/hetzner/README.md`.
+  core.
 
 See [`DESIGN.md`](./DESIGN.md) for the original design rationale and
 [`../../docs/failure-modes.md`](../../docs/failure-modes.md) for per-actor
@@ -319,8 +320,6 @@ deploy/cluster/
     inventories/hetzner/   example production inventory + profile values
   terraform/containers/     the local profile's nodes: bridge, image, volumes,
                             one container per node, the node contract
-  terraform/hetzner/        Cloud Network, vSwitch subnet, placement groups,
-                            firewalls, DNS records, RPC load balancer, pool contract
   docker/
     ci-service.Dockerfile   thin wrapper over prebuilt binaries
     cluster.Dockerfile      Java Aeron Cluster node (shadowJar + JRE 17)
@@ -343,8 +342,6 @@ The gates, the chaos cases and the operator commands are Rust:
 The Nomad job specs pull their config payloads from `config/` with HCL2
 `file()`, so manual CLI submissions must run **from `deploy/cluster/`**.
 The Ansible deployment role sets this working directory itself.
-
-Operational integrity tooling lives in the private infra repo.
 
 ## Deployment profiles
 
@@ -392,7 +389,8 @@ specification, [PR #278](https://github.com/junemartes/kardamom/pull/278).
 ## Elastic pools (Hetzner Cloud)
 
 The elastic ingress and sequencer pools follow the pool contract of
-[`terraform/hetzner`](./terraform/hetzner/README.md). Terraform owns the
+the Hetzner Terraform root. That root is not part of this repository.
+Terraform owns the
 network, one spread placement group and one public firewall per pool, the
 Consul bootstrap DNS records and the RPC load balancer. It owns no VM.
 
@@ -401,7 +399,7 @@ Consul bootstrap DNS records and the RPC load balancer. It owns no VM.
    `ansible-core`, the collections, the playbook release, the first-boot
    inventory and profile values, the bootstrap unit, and no machine
    identity. The token comes from `HCLOUD_TOKEN`.
-2. `tofu apply` in `terraform/hetzner`, then
+2. `tofu apply` in the Hetzner Terraform root, then
    `tofu output -json pool_contract > pool-contract.json`.
 3. `ansible-playbook -i <inventory> ansible/autoscaler.yml
    -e autoscaler_pool_contract_file=.../pool-contract.json ...` installs

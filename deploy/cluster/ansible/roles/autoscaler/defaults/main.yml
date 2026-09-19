@@ -12,8 +12,8 @@ autoscaler_version: "0.5.0"
 autoscaler_hcloud_plugin_revision: "9fff034a224511eb4a535ff0cfbf95577446e3d7"
 autoscaler_hcloud_plugin_url: ""
 autoscaler_hcloud_plugin_sha256: ""
-# The pool contract that terraform/hetzner exports (tofu output -json
-# pool_contract). Required.
+# The pool contract that the Hetzner Terraform root exports
+# (tofu output -json pool_contract). Required.
 autoscaler_pool_contract_file: ""
 # The Prometheus server that scrapes the Nomad clients and the services:
 # the monitoring job's Consul service (nomad/monitoring.nomad.hcl).

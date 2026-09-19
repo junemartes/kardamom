@@ -1,7 +1,7 @@
 ---
 # Install and configure the Nomad Autoscaler on the core hosts of the
 # autoscaler group, with the hcloud-server target and the pool policies
-# rendered from the pool contract that terraform/hetzner exports:
+# rendered from the pool contract that the Hetzner Terraform root exports:
 #   tofu output -json pool_contract > pool-contract.json
 #   ansible-playbook -i <inventory> autoscaler.yml \
 #     -e autoscaler_pool_contract_file=/path/pool-contract.json \
