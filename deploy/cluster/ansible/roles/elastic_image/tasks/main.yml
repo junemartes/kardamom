@@ -11,7 +11,7 @@
     that:
       - bootstrap_revision is defined
       - bootstrap_revision | length > 0
-    fail_msg: "image.yml needs bootstrap_revision (the git revision of the playbook release)"
+    fail_msg: "The image build needs bootstrap_revision (the git revision of the playbook release)"
 
 - name: Install the Python tooling
   ansible.builtin.apt:

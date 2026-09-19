@@ -1,5 +1,5 @@
 ---
-# The production profile values of the Hetzner deployment. This file
+# The production profile values of a production deployment. This file
 # belongs to the production child group, which overrides the shared all
 # group defaults for dedicated and elastic hosts. It holds no secret: the gossip key and the agent tokens
 # come from an encrypted vault file in this directory (see
@@ -10,7 +10,7 @@ datacenter: "dc1"
 nomad_region: "global"
 
 # Infrastructure DNS names of the three dedicated Consul servers. The
-# Terraform root of the Hetzner deployment publishes these records.
+# Terraform root of the deployment publishes these records.
 consul_retry_join:
   - "consul-0.core.kardamom.internal"
   - "consul-1.core.kardamom.internal"
