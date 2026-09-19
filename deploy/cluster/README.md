@@ -269,6 +269,21 @@ manifest on build/push/sign failure. Unsigned publication removes any old signat
 bundle. The signed bundle is installed before the manifest; a concurrent verifier
 may briefly reject a mismatched pair, but will never trust a partial manifest.
 
+### Release images
+
+`.github/workflows/release.yml` runs the same playbook against GHCR. A push to
+`main` publishes `ghcr.io/<owner>/kardamom-<image>:main-<commit>`. A
+`vMAJOR.MINOR.PATCH` tag on `main` publishes `:vMAJOR.MINOR.PATCH` and makes a
+GitHub release. The release carries `images.digests`, `images.digests.sigbundle`
+and `SHA256SUMS`. A `main` run keeps the same files as the workflow artifact
+`images-main-<commit>`.
+
+The job signs each image and the manifest as
+`.github/workflows/release.yml@refs/heads/main` or `@refs/tags/<tag>`. A
+production deployment sets `DIGEST_MANIFEST` to the downloaded manifest,
+`KARDAMOM_REQUIRE_SIGNED=1`, and `KARDAMOM_CERT_IDENTITY_RE` to that identity.
+`REGISTRY` accepts a host, an optional port, and an optional namespace path.
+
 `--check` reports the planned image set without building, pushing, signing, or
 changing files. Isolated image orchestration tests run the real Ansible roles and
 Docker Buildx module with test Docker/cosign executables:

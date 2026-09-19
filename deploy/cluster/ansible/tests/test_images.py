@@ -73,6 +73,16 @@ class ImageTest(unittest.TestCase):
         pushes = [args[-1] for tool, args in self.calls() if args[0] == 'push']
         self.assertEqual(pushes, [r.split()[1].split('@')[0] for r in records])
 
+    def test_namespaced_registry_is_accepted(self):
+        self.run_images({'images_registry': 'ghcr.io/example-owner', 'images_tag': 'main-0123456789ab'})
+        records = self.manifest.read_text().splitlines()
+        self.assertTrue(all(r.split()[1].startswith(f'ghcr.io/example-owner/kardamom-{r.split()[0]}:main-0123456789ab@sha256:')
+                            for r in records), records)
+
+    def test_malformed_registry_is_refused(self):
+        self.run_images({'images_registry': 'ghcr.io/Owner/../x'}, success=False)
+        self.assertFalse(self.calls())
+
     def test_node_push_with_signing(self):
         self.run_images({'images_push_node': 'control-0', 'images_sign': True})
         calls = self.calls()
