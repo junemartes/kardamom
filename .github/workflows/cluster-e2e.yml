@@ -234,6 +234,12 @@ jobs:
       # (Shard::env, the stage table in tests/shards.rs), not here. A
       # failed shard leaves the cluster up for the diagnostics step; the
       # runner is ephemeral, so nothing destroys it after.
+      # The shard runner carries no toolchain; just is the one tool the
+      # recipes need.
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: 1.49.0
+
       - name: Run shard (${{ matrix.shard }})
         run: just --justfile deploy/cluster/justfile shard "${{ matrix.shard }}"
         env:
