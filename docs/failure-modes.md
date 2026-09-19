@@ -87,7 +87,7 @@ still passed.
   Each executor resumes from its own state directory and catches up on the
   backlog the sealers kept ordering, within the canonical retention window.
 - **Whole-fleet state loss** (`executor-fleet-wipe-recover`) — all three
-  executor nodes killed and every state DB wiped, with each node's own
+  executor tasks killed and every state DB wiped, with each node's own
   checkpoints kept. No peer is live to serve a checkpoint, so every executor
   must restore from its local checkpoint and replay the tail; the case
   requires one restore line per executor. All three wiped *with* their

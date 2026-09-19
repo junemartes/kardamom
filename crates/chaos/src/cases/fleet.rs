@@ -68,11 +68,12 @@ pub(crate) async fn executor_fleet_loss_recover(h: &mut Harness) -> anyhow::Resu
     h.assert_executor_progress(Duration::from_secs(180)).await
 }
 
-/// Kill all three executor nodes and wipe every state database. Each
-/// node keeps its own checkpoints, and no peer is live to serve one,
-/// so every executor must restore from its local checkpoint and replay
-/// the tail. Three restore lines prove that no executor re-synced from
-/// genesis or waited for a peer.
+/// Kill all three executor tasks and wipe every state database. The
+/// nodes stay up so the wipe can run; each node keeps its own
+/// checkpoints, and no peer is live to serve one, so every executor
+/// must restore from its local checkpoint and replay the tail. Three
+/// restore lines prove that no executor re-synced from genesis or
+/// waited for a peer.
 pub(crate) async fn executor_fleet_wipe_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "executor-fleet-wipe-recover";
     let nodes = executor_containers(h);
@@ -84,17 +85,17 @@ pub(crate) async fn executor_fleet_wipe_recover(h: &mut Harness) -> anyhow::Resu
         .count_lines("executor", RESTORED, Streams::Both)
         .await?;
     crate::log(format!(
-        "{ctx}: docker kill ALL executor nodes ({}) and wipe every state DB (checkpoints kept)",
+        "{ctx}: kill ALL executor tasks ({}) and wipe every state DB (checkpoints kept)",
         nodes.join(" ")
     ));
-    h.kill_nodes(&names(&nodes)).await?;
+    for node in &nodes {
+        h.inject_hard(&[node], "executor").await?;
+    }
     await_exporters_dark(h, ctx).await?;
     for node in &nodes {
         wipe_dirs(h, node, ctx, "rm -rf /opt/kardamom/state/*").await?;
     }
-    h.start_nodes(&nodes).await?;
-    h.assert_count("executor", 3, h.knobs.reschedule_slo)
-        .await?;
+    h.assert_count("executor", 3, h.knobs.restart_slo).await?;
     await_exporter_back(h, ctx).await?;
     h.evidence
         .wait_count_reaches(
