@@ -46,7 +46,26 @@ with three distinct, tested modes:
   One node returning restores quorum, but this is the one case where client
   cluster *sessions* die (the outage exceeds the session timeout): re-election
   + session re-establishment + log replay takes ~50 s+ observed (SLO 180 s),
-  then the backlog drains gaplessly.
+  then the backlog drains gaplessly. The second node returns last, and the
+  pipeline must progress again with all three members.
+- **Total loss** (`cluster-total-loss-recover`) — all three nodes killed: no
+  member is left, the pipeline **must stall**. Every node returns with its
+  own log and snapshots, the members elect a leader among themselves, and
+  the backlog drains.
+  What this does not cover: all three members *wiped*. The failure model
+  owns no in-cluster recovery for that; it is the rebuild-from-L1 backstop
+  below.
+
+Every chaos case ends with a **recovery probe**: after the case load ended
+and the executors converged, a 30 s load at the case rate runs on the case's
+account from its next nonce. Every offered transaction must get a receipt,
+and the pipeline must accept at least a quarter of the rate. The case load
+cannot prove this: a submit refused during the outage leaves a nonce hole,
+every later submit of that sender parks and fails, and the chaos verdict
+does not count a failed submit. The executor block gauge cannot prove it
+either: it advances on empty blocks. The first fleet-shard run showed the
+gap: after the quorum loss, 1,282 of 1,524 submits never landed and the case
+still passed.
 
 ## Executor
 
@@ -63,6 +82,17 @@ with three distinct, tested modes:
   keep progressing; the returned node rejoins to 3/3. Replicas are
   deterministic state machines, so one dead or lagging replica never blocks
   the others.
+- **Whole-fleet loss** (`executor-fleet-loss-recover`) — all three executor
+  nodes killed at once, every exporter observed dark, then all three return.
+  Each executor resumes from its own state directory and catches up on the
+  backlog the sealers kept ordering, within the canonical retention window.
+- **Whole-fleet state loss** (`executor-fleet-wipe-recover`) — all three
+  executor nodes killed and every state DB wiped, with each node's own
+  checkpoints kept. No peer is live to serve a checkpoint, so every executor
+  must restore from its local checkpoint and replay the tail; the case
+  requires one restore line per executor. All three wiped *with* their
+  checkpoints has no live source at all: that is the rebuild-from-L1
+  backstop.
 - **Machine replacement** (`node-replace-executor`) — the node is replaced
   through the Terraform root the way a cloud provider replaces a server: a
   new address and empty volumes, then the substrate play a new machine
@@ -397,6 +427,11 @@ check would pass against a feature that activated once and stopped.
 
 ## Known gaps (untested failure surface)
 
+- **Rebuild-from-L1 in the chaos suite** — `kardamom-reconstruct` proves
+  root parity in `reconstruct_l1_e2e` against anvil, but no chaos case runs
+  it against the container cluster's L1 and DA store, and no live surface
+  exposes the executor's state root to compare with. The all-wiped sealer
+  and executor fleets therefore have no chaos case.
 - **Archive *data* loss** — total loss has the rebuild-from-L1 path (above,
   `reconstruct_l1_e2e`); single-node `tx_data` archive loss has the
   re-replicate-from-peer path (`archive-tx-data-wipe` chaos case +

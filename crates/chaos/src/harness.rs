@@ -14,6 +14,11 @@ use crate::inject::Killed;
 use crate::knobs::Knobs;
 use crate::lifecycle::{Lifecycle, NOMAD_HTTP_PORT};
 use crate::load::{LoadRun, LoadSpec, Verdict};
+use crate::rpc::Rpc;
+use kardamom_bench::load::Completeness;
+
+/// The recovery probe's window.
+const PROBE_WINDOW: Duration = Duration::from_secs(30);
 use crate::nodes::Nodes;
 use crate::nomad::Nomad;
 use crate::poll::{self, Budget};
@@ -115,9 +120,59 @@ impl Harness {
         let verdict = load.finish().await?;
         case.judge_load(&verdict)?;
         self.assert_executors_converged(case.name()).await?;
+        self.probe_recovery(case, account).await?;
         self.validator_verdict().await?;
         crate::log(format!("CHAOS CASE {name}: PASS"));
         Ok(())
+    }
+
+    /// The recovery probe: a short load at the case rate, after the
+    /// case load ended and the executors converged, on the case's
+    /// account from its next nonce. Every offered transaction must get
+    /// a receipt, and the pipeline must accept at a fraction of the
+    /// rate. The case load cannot prove this: a submit refused during
+    /// the outage leaves a nonce hole, every later submit of the sender
+    /// then parks and fails, and the chaos verdict does not count a
+    /// failed submit. The executor block gauge cannot prove it either:
+    /// it advances on empty blocks.
+    async fn probe_recovery(&self, case: Case, account: u32) -> anyhow::Result<()> {
+        let rpc = Rpc::new(&self.rpc_url, self.knobs.chain_id)?;
+        let nonce = rpc.nonce_of(account).await?;
+        crate::log(format!(
+            "{}: recovery probe: {}s at {} tps on account #{account} from nonce {nonce}",
+            case.name(),
+            PROBE_WINDOW.as_secs(),
+            self.knobs.tps
+        ));
+        let verdict = LoadRun::start(&self.probe_spec(case, account, nonce))?
+            .finish()
+            .await?;
+        case.judge_probe(&verdict, self.probe_floor())?;
+        crate::log(format!(
+            "{}: recovery probe PASS: {} offered, {} accepted, all receipted",
+            case.name(),
+            verdict.offered,
+            verdict.accepted
+        ));
+        Ok(())
+    }
+
+    /// The least accepted submits a healthy pipeline lands in the probe
+    /// window: a quarter of the rate.
+    fn probe_floor(&self) -> u64 {
+        u64::from(self.knobs.tps.get()) * PROBE_WINDOW.as_secs() / 4
+    }
+
+    fn probe_spec(&self, case: Case, account: u32, nonce: u64) -> LoadSpec {
+        LoadSpec {
+            nonce_start: nonce,
+            completeness: Completeness::Offered,
+            fixed_rate: true,
+            duration: PROBE_WINDOW,
+            retry_submit: self.knobs.load_retry,
+            report_path: Self::report_path(&format!("{}-probe", case.name())),
+            ..self.load_spec(case, account, PROBE_WINDOW)
+        }
     }
 
     async fn run_body(
@@ -161,6 +216,9 @@ impl Harness {
             receipt_rpcs: self.receipt_rpcs(),
             chain_id: self.knobs.chain_id,
             account,
+            nonce_start: 0,
+            completeness: Completeness::Accepted,
+            fixed_rate: false,
             duration: window,
             tps: self.knobs.tps,
             retry_submit: case.load_retry(&self.knobs),
@@ -271,6 +329,31 @@ impl Case {
             }
             _ => h.assert_progress().await,
         }
+    }
+
+    /// The recovery probe must land every offered transaction and
+    /// accept at least `floor` of them: a recovered pipeline that
+    /// refuses or parks submits is not recovered.
+    fn judge_probe(self, verdict: &Verdict, floor: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            verdict.pass && verdict.missing == 0,
+            "{}: recovery probe not PASS for case {}: {:?} (missing={} of {} offered)",
+            crate::FAIL_PREFIX,
+            self.name(),
+            verdict.failures,
+            verdict.missing,
+            verdict.offered
+        );
+        anyhow::ensure!(
+            verdict.accepted >= floor,
+            "{}: recovery probe for case {} accepted {} submits in {}s, below the floor of {} — the pipeline refuses or parks new transactions after the recovery",
+            crate::FAIL_PREFIX,
+            self.name(),
+            verdict.accepted,
+            PROBE_WINDOW.as_secs(),
+            floor
+        );
+        Ok(())
     }
 
     /// Chaos mode already tolerates duplicate-submit drops. Every other

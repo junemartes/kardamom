@@ -14,7 +14,7 @@ use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 
 /// The sealer node that runs Raft member `id`.
-fn sealer(h: &Harness, id: u32) -> anyhow::Result<String> {
+pub(crate) fn sealer(h: &Harness, id: u32) -> anyhow::Result<String> {
     h.container(&format!("sealer-{id}"))
 }
 
@@ -313,7 +313,10 @@ impl Catchup {
 /// Kill two whole sealer nodes. Nomad on those nodes is gone too, so
 /// only one member is left and the quorum is lost: the pipeline must
 /// stall with no false progress. Then one node returns, the quorum is
-/// back, and progress resumes with no gaps.
+/// back, and progress resumes with no gaps. The second node returns
+/// last, and the pipeline must still progress with all three members.
+/// The load window outlasts both returns, so the verdict covers
+/// transactions submitted to the recovered cluster.
 pub(crate) async fn quorum_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     let victims = [sealer(h, 1)?, sealer(h, 2)?];
     crate::log(format!(
@@ -333,9 +336,14 @@ pub(crate) async fn quorum_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     h.assert_count(CLUSTER_TASK, 2, h.knobs.reschedule_slo)
         .await?;
     h.assert_executor_progress(Duration::from_secs(180)).await?;
+    crate::log(format!(
+        "cluster-quorum-loss-recover: docker start {} (all three members back)",
+        victims[1]
+    ));
     h.nodes.start(&victims[1]).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.reschedule_slo)
-        .await
+        .await?;
+    h.assert_executor_progress(Duration::from_secs(60)).await
 }
 
 #[cfg(test)]
