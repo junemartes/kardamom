@@ -197,8 +197,15 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends ansible
 
+      # Galaxy resets connections now and then; three tries cover it.
       - name: Ansible docker connection plugin
-        run: ansible-galaxy collection install ansible.posix community.docker community.general
+        run: |
+          n=0
+          until ansible-galaxy collection install ansible.posix community.docker community.general; do
+            n=$((n + 1))
+            [ "$n" -ge 3 ] && exit 1
+            sleep 15
+          done
 
       # The runner image puts pipx's ansible-core first on PATH, and its venv
       # has no requests. community.docker's container and network modules run
