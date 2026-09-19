@@ -72,11 +72,14 @@ impl Shard {
             // Every replica of one role down at once. Each case waits
             // for the whole fleet to return and then keeps the load on
             // it, so the shard runs its own cluster.
+            // The sealer total loss runs last: its recovery is the
+            // open product issue, and a failure there must not hide
+            // the executor cases.
             Self::Fleet => &[
-                "cluster-quorum-loss-recover",
-                "cluster-total-loss-recover",
                 "executor-fleet-loss-recover",
                 "executor-fleet-wipe-recover",
+                "cluster-quorum-loss-recover",
+                "cluster-total-loss-recover",
             ],
             Self::Retention => &["retention-overrun", "retention-overrun-validator"],
             // The mirror rebuild runs last: it flushes the projection.
