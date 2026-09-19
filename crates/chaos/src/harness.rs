@@ -346,7 +346,7 @@ impl Case {
         );
         anyhow::ensure!(
             verdict.accepted >= floor,
-            "{}: recovery probe for case {} accepted {} submits in {}s, below the floor of {} — the pipeline refuses or parks new transactions after the recovery",
+            "{}: recovery probe for case {} accepted {} submits in {}s, below the floor of {} — the case's sender cannot get new transactions through after the recovery (a stuck sender or a dead pipeline; the probe reuses the case's account, so it cannot tell which)",
             crate::FAIL_PREFIX,
             self.name(),
             verdict.accepted,
