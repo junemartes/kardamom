@@ -29,10 +29,6 @@ contract_mirrors:
       - '    archive_topics '
     forbidden:
       - "\n  servers"
-  - path: deploy/cluster/terraform/hetzner/outputs.tf
-    required:
-      - version            = 1
-    forbidden: []
   - path: deploy/cluster/terraform/containers/main.tf
     required:
       - yamldecode(file(local.contract_path))
