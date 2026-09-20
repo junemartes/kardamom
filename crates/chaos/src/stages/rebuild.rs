@@ -24,6 +24,10 @@ const DA_STORE: &str = "/opt/kardamom/batcher/da";
 /// reach the target block.
 const BATCHER_FIRST_FAILURES: usize = 20;
 
+/// What marks a failure line in the batcher log: the tracing levels,
+/// and the `Error:` line the process prints when it exits.
+const BATCHER_FAILURE_MARKERS: &[&str] = &["WARN", "ERROR", "Error:"];
+
 /// The genesis the cluster's services start from, in the checkout.
 const GENESIS: &str = "deploy/cluster/config/genesis/dev.toml";
 
@@ -161,10 +165,11 @@ impl Rebuild<'_> {
     /// only the head and the tail of its log. Best-effort: a failed log
     /// read prints its error and the stage keeps its own failure.
     async fn log_batcher_first_failures(&self) {
-        let shown = match self.harness.nomad.job_logs("batcher", Streams::Both).await {
-            Ok(logs) => first_matching_lines(&logs, &["WARN", "ERROR"], BATCHER_FIRST_FAILURES),
-            Err(e) => format!("(batcher log read failed: {e:#})"),
-        };
+        let logs = self.harness.nomad.job_logs("batcher", Streams::Both).await;
+        let shown = logs.map_or_else(
+            |e| format!("(batcher log read failed: {e:#})"),
+            |logs| first_matching_lines(&logs, BATCHER_FAILURE_MARKERS, BATCHER_FIRST_FAILURES),
+        );
         crate::log(format!(
             "rebuild-from-l1: the batcher's first warnings and errors:\n{shown}"
         ));
