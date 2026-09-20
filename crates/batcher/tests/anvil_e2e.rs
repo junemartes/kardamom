@@ -152,6 +152,7 @@ fn empty_block(block_number: u64, l2_timestamp: u64) -> kardamom_batcher::batch:
         block_number,
         l2_timestamp,
         end_tx_idx: kardamom_types::BPosition::from_index(0),
+        l1_origin: 0,
         remote_epochs: vec![],
         txs: vec![],
     }

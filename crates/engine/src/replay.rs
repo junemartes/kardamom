@@ -51,10 +51,27 @@ use kardamom_exec_core::executor::XChainDelivery;
 /// `remote_epochs`: each message's `source_hash` and `seq` carry over
 /// verbatim. Replay reproduces the bytes; verification is the validator's
 /// job.
+/// Where a block ends on the canonical stream and the L1 block it
+/// derives from, as the DA payload carries them. Neither enters the
+/// state trie, and neither is derivable from the block's items: an
+/// epoch marker and each of its deposits take a canonical slot and never
+/// reach the payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanonicalEnd {
+    /// The count of canonical records through the end of the block.
+    pub end_tx_idx: u64,
+    /// The L1 block number of the newest epoch at or before the block.
+    pub l1_origin: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ReplayBlock {
     pub block_number: u64,
     pub l2_timestamp: u64,
+    /// `None` for a block of a payload that predates the field. Replay
+    /// then counts its own items, and the produced cursor is too low for
+    /// a resume: it misses every slot an epoch took.
+    pub canonical_end: Option<CanonicalEnd>,
     /// Remote-epoch records leading this block. Their messages execute (as
     /// 0x7D txs, in record order then seq order) BEFORE `txs` — mirroring the
     /// live pipeline, where the sealer closes the open block on a remote
@@ -63,11 +80,28 @@ pub struct ReplayBlock {
     pub txs: Vec<TxEnvelope>,
 }
 
+impl ReplayBlock {
+    /// The canonical slots the block's items take: one per remote-epoch
+    /// marker, one per message, one per transaction.
+    fn slots(&self) -> u64 {
+        let remote: usize = self
+            .remote_epochs
+            .iter()
+            .map(|record| 1 + record.messages.iter().count())
+            .sum();
+        (remote + self.txs.len()) as u64
+    }
+}
+
 /// Result of a reconstruction run.
 #[derive(Clone, Copy, Debug)]
 pub struct ReplayOutcome {
     /// Highest block re-executed (0 if no blocks were applied).
     pub head_block: u64,
+    /// The canonical end index of `head_block`, when the payload carried
+    /// it: the cursor a consumer resumes from. `None` means the state is
+    /// correct but not resumable.
+    pub head_end_tx_idx: Option<u64>,
     /// Number of blocks applied.
     pub blocks_applied: u64,
     /// Number of transactions applied across all blocks.
@@ -93,6 +127,17 @@ pub enum ReplayError {
     /// way to reach this.
     #[error("cumulative gas overflow in block {block_number}")]
     GasOverflow { block_number: u64 },
+    /// The block's canonical end leaves no room for its own items after
+    /// the previous block's end. The payload's cursor is wrong.
+    #[error(
+        "block {block_number}: canonical end {end_tx_idx} minus its {slots} slots is below the previous end {previous_end}"
+    )]
+    CursorRegress {
+        block_number: u64,
+        end_tx_idx: u64,
+        slots: u64,
+        previous_end: u64,
+    },
 }
 
 /// Running counters threaded through [`drive_blocks`].
@@ -108,6 +153,31 @@ struct Counters {
     /// sequence gives the same reconstructed root. We keep them consistent so
     /// the per-tx receipts stay internally coherent.
     global_pos: u64,
+    /// The canonical end of the head block, when its payload carried it.
+    head_end_tx_idx: Option<u64>,
+}
+
+impl Counters {
+    /// Move both position counters to the first slot of `block`'s items.
+    /// Any epoch closes the open block before the sealer relays it, so the
+    /// items the payload carries are the tail of the block's index range,
+    /// and the slots before them belong to epoch markers and deposits.
+    fn anchor(&mut self, block: &ReplayBlock, end: CanonicalEnd) -> Result<(), ReplayError> {
+        let slots = block.slots();
+        let start = end
+            .end_tx_idx
+            .checked_sub(slots)
+            .filter(|start| *start >= self.global_pos)
+            .ok_or(ReplayError::CursorRegress {
+                block_number: block.block_number,
+                end_tx_idx: end.end_tx_idx,
+                slots,
+                previous_end: self.global_pos,
+            })?;
+        self.global_pos = start;
+        self.tx_idx = start;
+        Ok(())
+    }
 }
 
 /// Re-execute `blocks`, in canonical order, into the state DB at `env`.
@@ -169,6 +239,7 @@ where
 
     Ok(ReplayOutcome {
         head_block: counters.head,
+        head_end_tx_idx: counters.head_end_tx_idx,
         blocks_applied: counters.blocks_applied,
         txs_applied: counters.txs_applied,
         state_root,
@@ -334,16 +405,18 @@ impl<'a> Replay<'a> {
         let block_delta = acc.delta.finalize(block.block_number, acc.receipts);
         let boundary = BlockBoundary {
             block_number: block.block_number,
+            // After `Counters::anchor` and the block's items, the position
+            // counter stands on the payload's end index. Without the
+            // field it is the count of replayed items, and the origin is
+            // unknown.
             end_tx_idx: BPosition::from_index(self.counters.global_pos),
             l2_timestamp: block.l2_timestamp,
-            // Offline replay reconstructs from the DA payload, which does not
-            // carry the origin: reconstruction currently derives no deposits,
-            // so no block it builds has an epoch to point at.
-            l1_origin: 0,
+            l1_origin: block.canonical_end.map_or(0, |end| end.l1_origin),
         };
         self.queue.submit(boundary, block_delta)?;
         self.signal.wait_committed(block.block_number)?;
         self.counters.head = block.block_number;
+        self.counters.head_end_tx_idx = block.canonical_end.map(|end| end.end_tx_idx);
         self.counters.blocks_applied += 1;
         Ok(())
     }
@@ -355,6 +428,9 @@ impl<'a> Replay<'a> {
         // genesis for the first block. `wait_committed` below keeps the
         // published snapshot anchored at `self.counters.head`. So this is
         // exactly the pre-block state view.
+        if let Some(end) = block.canonical_end {
+            self.counters.anchor(block, end)?;
+        }
         let snapshot = self.source.snapshot_after(self.counters.head);
         let exec_env = ExecEnv {
             chain_id: self.chain_id,
@@ -433,16 +509,111 @@ mod tests {
             ReplayBlock {
                 block_number: 1,
                 l2_timestamp: 1_700_000_000,
+                canonical_end: None,
                 remote_epochs: Vec::new(),
                 txs: vec![transfer(signer, to1, 0, 100), transfer(signer, to2, 1, 50)],
             },
             ReplayBlock {
                 block_number: 2,
                 l2_timestamp: 1_700_000_001,
+                canonical_end: None,
                 remote_epochs: Vec::new(),
                 txs: vec![transfer(signer, to1, 2, 25)],
             },
         ]
+    }
+
+    /// The live chain of `two_blocks` with an epoch before each block:
+    /// an empty epoch takes one slot before block 1, and an epoch with
+    /// two deposits takes three before block 2. The payload carries
+    /// neither, only each block's end index and origin.
+    fn two_blocks_after_epochs(
+        signer: &PrivateKeySigner,
+        to1: Address,
+        to2: Address,
+    ) -> Vec<ReplayBlock> {
+        let ends = [
+            CanonicalEnd {
+                end_tx_idx: 3,
+                l1_origin: 40,
+            },
+            CanonicalEnd {
+                end_tx_idx: 7,
+                l1_origin: 41,
+            },
+        ];
+        two_blocks(signer, to1, to2)
+            .into_iter()
+            .zip(ends)
+            .map(|(block, end)| ReplayBlock {
+                canonical_end: Some(end),
+                ..block
+            })
+            .collect()
+    }
+
+    /// The rebuilt cursor, headers and receipt positions are the live
+    /// chain's, not a count of the replayed items, and the root is the
+    /// same with and without the field.
+    #[test]
+    fn a_payload_cursor_gives_the_live_positions_and_the_same_root() {
+        let signer = PrivateKeySigner::random();
+        let to1 = address!("00000000000000000000000000000000000A0001");
+        let to2 = address!("00000000000000000000000000000000000A0002");
+        let genesis = genesis_for(signer.address());
+
+        let (_plain_dir, plain_env) = fresh_env();
+        let plain = replay_blocks(
+            plain_env,
+            CHAIN_ID,
+            &genesis,
+            &[],
+            two_blocks(&signer, to1, to2),
+        )
+        .unwrap();
+        assert_eq!(plain.head_end_tx_idx, None);
+
+        let (_dir, env) = fresh_env();
+        let blocks = two_blocks_after_epochs(&signer, to1, to2);
+        let last_tx = blocks[1].txs[0].tx_hash;
+        let outcome = replay_blocks(env.clone(), CHAIN_ID, &genesis, &[], blocks).unwrap();
+
+        assert_eq!(outcome.state_root, plain.state_root);
+        assert_eq!(outcome.head_end_tx_idx, Some(7));
+        let snap = StateSnapshot::open(&env).unwrap();
+        assert_eq!(snap.end_tx_position().unwrap(), BPosition::from_index(7));
+        let point = kardamom_state::read_recovery_point(&env).unwrap();
+        assert_eq!(point.last_fsynced_b_position, BPosition::from_index(7));
+        // Block 2 is slots 3..7: the epoch marker and two deposits, then
+        // its one transaction in the last slot.
+        assert_eq!(
+            snap.get_tx_position(last_tx).unwrap(),
+            Some(BPosition::from_index(6))
+        );
+    }
+
+    #[test]
+    fn a_cursor_with_no_room_for_the_blocks_items_is_refused() {
+        let signer = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000A0001");
+        let mut blocks = two_blocks(&signer, to, to);
+        blocks[0].canonical_end = Some(CanonicalEnd {
+            end_tx_idx: 1,
+            l1_origin: 0,
+        });
+        let (_dir, env) = fresh_env();
+        let err =
+            replay_blocks(env, CHAIN_ID, &genesis_for(signer.address()), &[], blocks).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReplayError::CursorRegress {
+                    block_number: 1,
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[test]

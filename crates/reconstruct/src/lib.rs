@@ -25,7 +25,7 @@
 use std::path::Path;
 
 use kardamom_batcher::BlockFrame;
-use kardamom_engine::{ReplayBlock, ReplayOutcome, replay_blocks};
+use kardamom_engine::{CanonicalEnd, ReplayBlock, ReplayOutcome, replay_blocks};
 use kardamom_state::{Durability, StateEnvBuilder};
 use kardamom_types::{AccountChange, CodeEntry, TxEnvelope};
 
@@ -45,6 +45,10 @@ pub fn block_frame_to_replay(frame: &BlockFrame) -> ReplayBlock {
     ReplayBlock {
         block_number: frame.block_number,
         l2_timestamp: frame.l2_timestamp,
+        canonical_end: frame.cursor.map(|c| CanonicalEnd {
+            end_tx_idx: c.end_tx_idx,
+            l1_origin: c.l1_origin,
+        }),
         remote_epochs: frame.remote_epochs.clone(),
         txs: frame
             .txs
@@ -57,6 +61,22 @@ pub fn block_frame_to_replay(frame: &BlockFrame) -> ReplayBlock {
             })
             .collect(),
     }
+}
+
+/// Turn the verified state DB at `state_dir` into the image an executor
+/// resumes on: the trie, the hashed mirror and the stored root removed.
+/// An executor writes with the trie off, so all three would go stale at
+/// its first block. Call this only after the root check passed.
+///
+/// # Errors
+///
+/// Returns an error if the state env cannot open or a table clear fails.
+pub fn strip_to_executor_image(state_dir: &Path) -> Result<(), ReconstructError> {
+    let env = StateEnvBuilder::new(state_dir)
+        .durability(Durability::Durable)
+        .open()
+        .map_err(|e| ReconstructError(format!("open state env: {e}")))?;
+    kardamom_state::strip_trie(&env).map_err(|e| ReconstructError(format!("strip the trie: {e}")))
 }
 
 /// Re-execute DA-recovered `blocks` (in order) into a fresh durable state DB
@@ -75,14 +95,45 @@ pub fn reconstruct_state(
     genesis_code: &[CodeEntry],
     blocks: &[BlockFrame],
 ) -> Result<ReplayOutcome, ReconstructError> {
-    let env = StateEnvBuilder::new(state_dir)
-        .durability(Durability::Durable)
-        .open()
-        .map_err(|e| ReconstructError(format!("open state env: {e}")))?;
+    Reconstruction {
+        state_dir,
+        durability: Durability::Durable,
+    }
+    .run(chain_id, genesis_accounts, genesis_code, blocks)
+}
 
-    let replay = blocks.iter().map(block_frame_to_replay).collect::<Vec<_>>();
-    replay_blocks(env, chain_id, genesis_accounts, genesis_code, replay)
-        .map_err(|e| ReconstructError(e.to_string()))
+/// Where a reconstruction writes, and how hard each block commit syncs.
+pub struct Reconstruction<'a> {
+    pub state_dir: &'a Path,
+    /// `Durable` for a state an operator keeps. `SafeNoSync` only for a
+    /// check that reads the result on the same host after a clean exit
+    /// and then discards it: one fdatasync per block is most of the run
+    /// time on a slow disk, and such a check needs none of them.
+    pub durability: Durability,
+}
+
+impl Reconstruction<'_> {
+    /// Re-execute DA-recovered `blocks`, in order, into the state DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state env cannot open or the replay fails.
+    pub fn run(
+        &self,
+        chain_id: u64,
+        genesis_accounts: &[AccountChange],
+        genesis_code: &[CodeEntry],
+        blocks: &[BlockFrame],
+    ) -> Result<ReplayOutcome, ReconstructError> {
+        let env = StateEnvBuilder::new(self.state_dir)
+            .durability(self.durability)
+            .open()
+            .map_err(|e| ReconstructError(format!("open state env: {e}")))?;
+
+        let replay = blocks.iter().map(block_frame_to_replay).collect::<Vec<_>>();
+        replay_blocks(env, chain_id, genesis_accounts, genesis_code, replay)
+            .map_err(|e| ReconstructError(e.to_string()))
+    }
 }
 
 /// Shared test fixtures: signed transfers, a funded-EOA genesis, closed-
@@ -153,6 +204,7 @@ pub mod test_support {
             block_number: 1,
             l2_timestamp: 1_700_000_000,
             end_tx_idx: BPosition::from_index(2),
+            l1_origin: 0,
             remote_epochs: vec![],
             txs: vec![
                 RecordedTx {
@@ -169,6 +221,7 @@ pub mod test_support {
             block_number: 2,
             l2_timestamp: 1_700_000_001,
             end_tx_idx: BPosition::from_index(3),
+            l1_origin: 0,
             remote_epochs: vec![],
             txs: vec![RecordedTx {
                 position: BPosition::from_index(2),
@@ -243,12 +296,14 @@ mod tests {
             ReplayBlock {
                 block_number: 1,
                 l2_timestamp: 1_700_000_000,
+                canonical_end: None,
                 remote_epochs: vec![],
                 txs: block1.txs.iter().map(|t| t.envelope.clone()).collect(),
             },
             ReplayBlock {
                 block_number: 2,
                 l2_timestamp: 1_700_000_001,
+                canonical_end: None,
                 remote_epochs: vec![],
                 txs: block2.txs.iter().map(|t| t.envelope.clone()).collect(),
             },
@@ -328,6 +383,7 @@ mod tests {
                 block_number: 1,
                 l2_timestamp: 1_700_000_000,
                 end_tx_idx: BPosition::from_index(4),
+                l1_origin: 0,
                 remote_epochs: vec![record.clone()],
                 txs: vec![RecordedTx {
                     position: BPosition::from_index(3),
@@ -471,6 +527,7 @@ mod tests {
             vec![ReplayBlock {
                 block_number: 1,
                 l2_timestamp: 1_700_000_000,
+                canonical_end: None,
                 remote_epochs: vec![scenario.record],
                 txs: scenario
                     .block

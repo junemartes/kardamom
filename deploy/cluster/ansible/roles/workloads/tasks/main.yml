@@ -35,6 +35,7 @@
       vars:
         cluster_retention: "{{ workloads_cluster_retention }}"
         cluster_snapshot_interval_s: "{{ workloads_cluster_snapshot_s }}"
+        cluster_file_sync_level: "{{ workloads_cluster_file_sync_level }}"
         cluster_remote_origins: "{{ workloads_remote_origins }}"
     - name: sequencer
       wait: false

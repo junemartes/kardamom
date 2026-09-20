@@ -106,6 +106,16 @@ is left, or when the roles fail together:
   the sealer had ordered a reference to data that was lost with the nodes.
   The chain is wedged for good. It joins the shard with that fix.
 
+**Durability of the Raft log.** The kill-based cases above prove the
+restart logic, not the durability against a power loss: a process kill or a
+container kill leaves the host kernel and its page cache alive, so every
+member finds its whole log again. The sealer therefore syncs the Raft log and
+the archive to disk (`kardamom.cluster.fileSyncLevel`, deployed at 1: the
+data of every write batch). At level 0 an entry that a quorum acknowledged
+could exist only in the page caches of its members, and a rack-level power
+loss, the event `pipeline-blackout-recover` stands for, would drop it. Only
+a test that cuts the power of a VM can prove this end to end.
+
 ## Executor
 
 ![Executor failure states](img/states-executor.jpg)
@@ -132,6 +142,17 @@ is left, or when the roles fail together:
   requires one restore line per executor. All three wiped *with* their
   checkpoints has no live source at all: that is the rebuild-from-L1
   backstop.
+- **Whole-fleet total loss** (`executor-fleet-total-wipe-recover`) — the
+  executor job stopped, and every state DB **and every checkpoint** wiped: no
+  executor holds state and no peer can serve any. The harness rebuilds an
+  executor image from L1 and the DA store on the host
+  (`kardamom-reconstruct --through-block --executor-image`), installs it on
+  every executor node, and starts the job. Every executor must resume from
+  the image's cursor, with a replay request the sealer accepts and with no
+  checkpoint restore or peer fetch, and the fleet must catch up. The
+  end-of-shard audit then compares the resumed executors with the validator
+  table by table. The job is stopped, not killed: an executor that starts on
+  an empty directory of a young chain replays from genesis on its own.
 - **Machine replacement** (`node-replace-executor`) — the node is replaced
   through the Terraform root the way a cloud provider replaces a server: a
   new address and empty volumes, then the substrate play a new machine
@@ -353,6 +374,18 @@ the reconstructed root is byte-identical to the canonical one. The
 `reconstruct_l1_e2e` test proves the whole loop end-to-end against a real L1
 (anvil): post → discard the originals → read L1 → fetch blobs → re-execute →
 assert root parity.
+
+**The rebuilt state is resumable.** A KAR1 version 3 block carries its
+canonical end index and its L1 origin, which the rest of the payload cannot
+give: epoch markers and deposits take canonical slots and never reach the
+blob. So the rebuilt cursor, header rows and receipt positions equal the live
+chain's, and `--executor-image` writes the image an executor resumes on (the
+trie, the hashed mirror and the stored root removed, after the root check).
+The sealer refuses a resume whose index lies outside the block it names, so
+a wrong cursor is loud. A state rebuilt through a version 2 blob is correct
+and not resumable. See `docs/specs/2026-09-20-rejoin-from-l1-rebuild.md`,
+which also gives the flag-day procedure for a wiped sealer set and the seed
+hook that would replace it.
 
 Scope: L2 transactions. Deposits are absent from the DA payload (the batcher
 skips `DepositRef`s) but are independently re-derivable from L1 `DepositInitiated`

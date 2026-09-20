@@ -48,7 +48,7 @@ pub use reader::{
     EpochObserver, JoinBuffer, NoEpochCheck, NoRemoteEpochCheck, ReaderConfig, ReaderToExec,
     RemoteEpochObserver, TxDataSubscription, TxOrderingSubscription,
 };
-pub use replay::{ReplayBlock, ReplayError, ReplayOutcome, replay_blocks};
+pub use replay::{CanonicalEnd, ReplayBlock, ReplayError, ReplayOutcome, replay_blocks};
 pub use state::WriterApplyingQueue;
 // These types come from the `types` crate. Callers can use them through
 // `kardamom_engine::*` without a separate dependency line.

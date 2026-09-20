@@ -41,6 +41,7 @@ pub enum Case {
     ClusterTotalLossRecover,
     ExecutorFleetLossRecover,
     ExecutorFleetWipeRecover,
+    ExecutorFleetTotalWipeRecover,
     IngressPairLossRecover,
     SequencerLaneLossRecover,
     PipelineBlackoutRecover,
@@ -62,7 +63,7 @@ pub enum Case {
     MirrorKillRebuild,
 }
 
-const ALL: [Case; 38] = [
+const ALL: [Case; 39] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -82,6 +83,7 @@ const ALL: [Case; 38] = [
     Case::ClusterTotalLossRecover,
     Case::ExecutorFleetLossRecover,
     Case::ExecutorFleetWipeRecover,
+    Case::ExecutorFleetTotalWipeRecover,
     Case::IngressPairLossRecover,
     Case::SequencerLaneLossRecover,
     Case::PipelineBlackoutRecover,
@@ -139,6 +141,7 @@ impl Case {
             Self::ClusterTotalLossRecover => "cluster-total-loss-recover",
             Self::ExecutorFleetLossRecover => "executor-fleet-loss-recover",
             Self::ExecutorFleetWipeRecover => "executor-fleet-wipe-recover",
+            Self::ExecutorFleetTotalWipeRecover => "executor-fleet-total-wipe-recover",
             Self::IngressPairLossRecover => "ingress-pair-loss-recover",
             Self::SequencerLaneLossRecover => "sequencer-lane-loss-recover",
             Self::PipelineBlackoutRecover => "pipeline-blackout-recover",
@@ -196,11 +199,15 @@ impl Case {
             }
             // The mirrors restart, wait for a checkpoint, and rebuild.
             Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_secs(600),
-            // The node replacement; the Redis loss, the job's return, then
-            // three rebuilds; or the blackout and the return of every job.
+            // The node replacement; the Redis loss and three rebuilds; the
+            // total wipe, the rebuild from L1 and the install; or the
+            // blackout and the return of every job.
             Self::NodeReplaceExecutor
             | Self::RedisTotalLossRecover
-            | Self::PipelineBlackoutRecover => inject + k.reschedule_slo + Duration::from_secs(420),
+            | Self::ExecutorFleetTotalWipeRecover
+            | Self::PipelineBlackoutRecover => {
+                inject + k.reschedule_slo + Duration::from_secs(420)
+            }
             Self::NodeReplaceSealer => {
                 inject + k.reschedule_slo + k.rejoin_slo + Duration::from_secs(300)
             }
@@ -232,6 +239,7 @@ impl Case {
             Self::ClusterTotalLossRecover
             | Self::ExecutorFleetLossRecover
             | Self::ExecutorFleetWipeRecover
+            | Self::ExecutorFleetTotalWipeRecover
             | Self::IngressPairLossRecover
             | Self::SequencerLaneLossRecover
             | Self::PipelineBlackoutRecover => {
@@ -267,6 +275,9 @@ impl Case {
             Self::ClusterTotalLossRecover => fleet::cluster_total_loss_recover(h).await,
             Self::ExecutorFleetLossRecover => fleet::executor_fleet_loss_recover(h).await,
             Self::ExecutorFleetWipeRecover => fleet::executor_fleet_wipe_recover(h).await,
+            Self::ExecutorFleetTotalWipeRecover => {
+                fleet::executor_fleet_total_wipe_recover(h).await
+            }
             Self::IngressPairLossRecover => coordinated::ingress_pair_loss_recover(h).await,
             Self::SequencerLaneLossRecover => coordinated::sequencer_lane_loss_recover(h).await,
             Self::PipelineBlackoutRecover => coordinated::pipeline_blackout_recover(h).await,
