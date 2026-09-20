@@ -78,7 +78,7 @@ container-up:
 
 # Run a shard against an existing cluster; KARDAMOM_CHAOS_CASES narrows cases.
 # Shards: load, semantics, chaos-executor, chaos-ingress, chaos-sequencer,
-# chaos-cluster, chaos-fleet, chaos-retention, chaos-cache.
+# chaos-cluster, chaos-fleet, chaos-coordinated, chaos-retention, chaos-cache.
 container-test $shard=env('SHARD', 'load'):
     KARDAMOM_CHAOS_REUSE=1 $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
 

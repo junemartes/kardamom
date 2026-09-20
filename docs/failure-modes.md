@@ -65,15 +65,46 @@ with three distinct, tested modes:
   See `docs/specs/2026-09-13-redis-account-cache-design.md`, section 9.3.
 
 Every chaos case ends with a **recovery probe**: after the case load ended
-and the executors converged, a 30 s load at the case rate runs on the case's
-account from its next nonce. Every offered transaction must get a receipt,
-and the pipeline must accept at least a quarter of the rate. The case load
-cannot prove this: a submit refused during the outage leaves a nonce hole,
-every later submit of that sender parks and fails, and the chaos verdict
-does not count a failed submit. The executor block gauge cannot prove it
-either: it advances on empty blocks. The first fleet-shard run showed the
-gap: after the quorum loss, 1,282 of 1,524 submits never landed and the case
-still passed.
+and the executors converged, two 30 s loads run at once, each at half the
+case rate. The first runs on the case's account from its next nonce, through
+the ingress the case load used: the sender that had transactions in flight
+during the outage. The second runs on the smoke gate's account, which no
+case load spends, through the other ingress: a sender with nothing in
+flight. Every offered transaction of both must get a receipt, and each must
+be accepted at a quarter of its rate or more. A failure of the first alone
+is a stuck sender; a failure of the second is a pipeline, or an ingress,
+that did not recover. The case load cannot prove either: a submit refused
+during the outage leaves a nonce hole, every later submit of that sender
+parks and fails, and the chaos verdict does not count a failed submit. The
+executor block gauge cannot prove it either: it advances on empty blocks.
+The first fleet-shard run showed the gap: after the quorum loss, 1,282 of
+1,524 submits never landed and the case still passed.
+
+**Coordinated failures** (`chaos-coordinated` shard). The single-replica
+cases prove that a twin covers a loss; these prove the recovery when no twin
+is left, or when the roles fail together:
+
+- **Both ingresses** (`ingress-pair-loss-recover`) — both ingress tasks
+  hard-killed: the whole client edge is gone. Nomad restarts both, both
+  exporters must answer, the pipeline must progress, and the probe submits
+  through each ingress.
+- **A whole sequencer lane** (`sequencer-lane-loss-recover`) — both replicas
+  of lane 0 hard-killed, one on each sequencer node. The lane's senders are
+  unordered until a replica returns with empty state and learns each
+  sender's floor from the executors. Both replicas must come back healthy
+  and `kardamom_sequencer_ref_below_floor` must read zero on both.
+- **Pipeline blackout** (`pipeline-blackout-recover`) — every ingress,
+  sequencer, sealer, executor and aux node killed at once; only the control
+  node stays, with the orchestrator and the L1. All nodes start in one call,
+  with no arranged order. Every job must return to its count, the sealers
+  must elect a leader within 180 s, both ingresses must be live, and the
+  pipeline must progress. **The case exists and is not in the shard yet: it
+  fails on an open product defect.** After the blackout every job returns and
+  a leader is elected, and then all three executors crash-loop on one
+  canonical entry whose transaction data no archive can serve (`join
+  timeout: TxRef ... not found within 30000 ms`, the archive refetch failing):
+  the sealer had ordered a reference to data that was lost with the nodes.
+  The chain is wedged for good. It joins the shard with that fix.
 
 **Durability of the Raft log.** The kill-based cases above prove the
 restart logic, not the durability against a power loss: a process kill or a

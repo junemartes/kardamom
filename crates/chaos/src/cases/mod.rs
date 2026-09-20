@@ -12,6 +12,7 @@ pub(crate) mod archive;
 pub(crate) mod cache;
 pub(crate) mod cluster;
 pub(crate) mod component;
+pub(crate) mod coordinated;
 pub(crate) mod fleet;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
@@ -41,6 +42,9 @@ pub enum Case {
     ExecutorFleetLossRecover,
     ExecutorFleetWipeRecover,
     ExecutorFleetTotalWipeRecover,
+    IngressPairLossRecover,
+    SequencerLaneLossRecover,
+    PipelineBlackoutRecover,
     ArchiveDriverLoss,
     ArchiveTxDataWipe,
     ArchiveCorruption,
@@ -59,7 +63,7 @@ pub enum Case {
     MirrorKillRebuild,
 }
 
-const ALL: [Case; 36] = [
+const ALL: [Case; 39] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -80,6 +84,9 @@ const ALL: [Case; 36] = [
     Case::ExecutorFleetLossRecover,
     Case::ExecutorFleetWipeRecover,
     Case::ExecutorFleetTotalWipeRecover,
+    Case::IngressPairLossRecover,
+    Case::SequencerLaneLossRecover,
+    Case::PipelineBlackoutRecover,
     Case::ArchiveDriverLoss,
     Case::ArchiveTxDataWipe,
     Case::ArchiveCorruption,
@@ -135,6 +142,9 @@ impl Case {
             Self::ExecutorFleetLossRecover => "executor-fleet-loss-recover",
             Self::ExecutorFleetWipeRecover => "executor-fleet-wipe-recover",
             Self::ExecutorFleetTotalWipeRecover => "executor-fleet-total-wipe-recover",
+            Self::IngressPairLossRecover => "ingress-pair-loss-recover",
+            Self::SequencerLaneLossRecover => "sequencer-lane-loss-recover",
+            Self::PipelineBlackoutRecover => "pipeline-blackout-recover",
             Self::ArchiveDriverLoss => "archive-driver-loss",
             Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
             Self::ArchiveCorruption => "archive-corruption",
@@ -162,6 +172,7 @@ impl Case {
             | Self::SequencerLapse
             | Self::GracefulSequencer
             | Self::HardSequencer
+            | Self::SequencerLaneLossRecover
             | Self::LookupBlackout => Pin::Shard0,
             Self::ResizeScaleOutIn => Pin::MovesOnScaleOut,
             _ => Pin::Any,
@@ -188,13 +199,13 @@ impl Case {
             }
             // The mirrors restart, wait for a checkpoint, and rebuild.
             Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_secs(600),
-            // The node replacement; the Redis loss and three rebuilds; or
-            // the total wipe, the rebuild from L1 and the install.
+            // The node replacement; the Redis loss and three rebuilds; the
+            // total wipe, the rebuild from L1 and the install; or the
+            // blackout and the return of every job.
             Self::NodeReplaceExecutor
             | Self::RedisTotalLossRecover
-            | Self::ExecutorFleetTotalWipeRecover => {
-                inject + k.reschedule_slo + Duration::from_secs(420)
-            }
+            | Self::ExecutorFleetTotalWipeRecover
+            | Self::PipelineBlackoutRecover => inject + k.reschedule_slo + Duration::from_secs(420),
             Self::NodeReplaceSealer => {
                 inject + k.reschedule_slo + k.rejoin_slo + Duration::from_secs(300)
             }
@@ -226,7 +237,10 @@ impl Case {
             Self::ClusterTotalLossRecover
             | Self::ExecutorFleetLossRecover
             | Self::ExecutorFleetWipeRecover
-            | Self::ExecutorFleetTotalWipeRecover => {
+            | Self::ExecutorFleetTotalWipeRecover
+            | Self::IngressPairLossRecover
+            | Self::SequencerLaneLossRecover
+            | Self::PipelineBlackoutRecover => {
                 u32::try_from(k.reschedule_slo.as_secs() / 30).unwrap_or(u32::MAX) + 2
             }
             _ => k.load_retry,
@@ -262,6 +276,9 @@ impl Case {
             Self::ExecutorFleetTotalWipeRecover => {
                 fleet::executor_fleet_total_wipe_recover(h).await
             }
+            Self::IngressPairLossRecover => coordinated::ingress_pair_loss_recover(h).await,
+            Self::SequencerLaneLossRecover => coordinated::sequencer_lane_loss_recover(h).await,
+            Self::PipelineBlackoutRecover => coordinated::pipeline_blackout_recover(h).await,
             Self::ArchiveDriverLoss => archive::driver_loss(h).await,
             Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
             Self::ArchiveCorruption => archive::corruption(h).await,
@@ -298,6 +315,7 @@ mod tests {
             crate::Shard::Sequencer,
             crate::Shard::Cluster,
             crate::Shard::Fleet,
+            crate::Shard::Coordinated,
             crate::Shard::Retention,
             crate::Shard::Cache,
         ] {

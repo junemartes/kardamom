@@ -23,7 +23,7 @@ use crate::stages::rebuild::{Rebuild, Rebuilt, Target};
 /// the election takes longer on a long chain than the 45 s a live
 /// cluster needs after one leader kill. The failure model gives the
 /// whole recovery 180 s.
-const FULL_RESTART_ELECTION: Duration = Duration::from_secs(180);
+pub(crate) const FULL_RESTART_ELECTION: Duration = Duration::from_secs(180);
 
 /// The three sealer nodes, by member id.
 fn sealers(h: &Harness) -> anyhow::Result<Vec<String>> {
@@ -374,7 +374,7 @@ impl ResumeEvidence {
 
 /// Wait until no executor exporter answers. A node kill that leaves
 /// one exporter up proves nothing about the fleet.
-async fn await_exporters_dark(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+pub(crate) async fn await_exporters_dark(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     let outcome = poll::until(Budget::secs(60, 3), |_| async move {
         Ok(all_exporters_dark(h).await.then_some(()))
     })
@@ -395,7 +395,7 @@ async fn await_exporters_dark(h: &Harness, ctx: &str) -> anyhow::Result<()> {
 /// Wait until an executor exporter answers again. A returned node's
 /// allocation runs before its exporter binds, and the progress check
 /// needs a baseline from a live exporter.
-async fn await_exporter_back(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+pub(crate) async fn await_exporter_back(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     let outcome = poll::until(
         Budget::new(h.knobs.reschedule_slo, Duration::from_secs(3)),
         |_| async move { Ok(h.probes.executor_progress().await.map(|_| ())) },
