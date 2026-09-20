@@ -286,6 +286,18 @@ pruned by the consensus layer after ~18 days). The offline segment-file mode
 (`--channel-b-segment`, dry-run by default) remains for archive inspection
 and the corruption-heal tooling.
 
+**A skewed resume cursor is a refusal.** A consumer resumes at a record
+index and a block number, and the two select frames on separate axes. A
+pair that does not name one point of the stream would skip records or apply
+them twice, and no consumer-side check sees it, because the consumer seeds
+every counter from the same cursor. The sealer holds the boundaries, so it
+checks the index against the end of the block before the named one and the
+end of the named block, where it retains them, and answers
+`REPLAY_UNAVAILABLE` (`cluster REPLAY ... SKEWED`) for a pair outside. The
+refusal routes the consumer into its repair path. A cold start sends the
+block end exactly; a reconnect inside an open block sends an index between
+the two ends; a start from genesis has no boundary to check.
+
 ## Data-availability recovery (rebuild-from-L1)
 
 The bottom-of-the-stack backstop: even if **every** in-cluster durable copy is

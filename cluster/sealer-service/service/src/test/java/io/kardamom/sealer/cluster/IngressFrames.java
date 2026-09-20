@@ -93,6 +93,16 @@ final class IngressFrames {
         return buf;
     }
 
+    /** A {@code KIND_REPLAY_REQUEST} frame: {@code kind(1) | fromIndex(8 LE) | fromBlock(8 LE)}. */
+    static byte[] replayRequestFrame(final long fromIndex, final long fromBlock) {
+        return java.nio.ByteBuffer.allocate(1 + 2 * Long.BYTES)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .put(SealerWire.KIND_REPLAY_REQUEST)
+            .putLong(fromIndex)
+            .putLong(fromBlock)
+            .array();
+    }
+
     /** A one-byte {@code KIND_SUBSCRIBE} consumer announcement. */
     static byte[] subscribeFrame() {
         return new byte[] {SealerWire.KIND_SUBSCRIBE};
