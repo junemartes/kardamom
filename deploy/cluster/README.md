@@ -89,7 +89,7 @@ host tools below for your platform, and `just cluster-doctor` verifies them.
   images` / `just container-up` stage it into the `kardamom-cluster` image and
   fail loudly if it is missing.
 - The **Rust service binaries** in `target/release` (`cargo build --release
-  --bins` of the service crates, or the artifact of `scripts/ci/stage-cluster-dist.sh`):
+  --bins` of the service crates, or the artifact of `just stage-dist`):
   the image role wraps prebuilt binaries; nothing compiles inside an image.
 - **OpenTofu** (1.12.6, the version the CI pins).
 - Foundry's `cast` for the smoke tests (repo-level `just bootstrap`).
@@ -160,7 +160,7 @@ into the new node.
 
 CI builds once: a `build` job compiles the service binaries, the shard test
 executable, the operator binary and the sealer jar, and stages them as one
-artifact (`scripts/ci/stage-cluster-dist.sh`, the checkout's own layout). A
+artifact (`just stage-dist`, the checkout's own layout). A
 shard runner unpacks it and runs `just shard <name>` with `KARDAMOM_STAGED=1`,
 with no Rust toolchain, JDK or Foundry, and `container-diagnostics` on
 failure. `KARDAMOM_STAGED=1` makes the justfile run

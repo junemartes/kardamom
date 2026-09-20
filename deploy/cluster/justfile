@@ -9,7 +9,7 @@ export DIGEST_MANIFEST := env('DIGEST_MANIFEST', 'images.digests')
 export NODE_CONTRACT := env('NODE_CONTRACT', 'terraform/containers/node-contract.json')
 export TF_CONTAINERS := env('TF_CONTAINERS', 'terraform/containers')
 # KARDAMOM_STAGED=1 runs the binaries a build already staged under
-# target/release (scripts/ci/stage-cluster-dist.sh): the shard test
+# target/release (`just stage-dist`): the shard test
 # executable as kardamom-chaos-shards and the operator binary. CI's shard
 # runners carry no toolchain. Unset, cargo builds and runs them.
 export KARDAMOM_STAGED := env('KARDAMOM_STAGED', '')
