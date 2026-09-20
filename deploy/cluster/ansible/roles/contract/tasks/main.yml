@@ -52,18 +52,14 @@
       lookup('file', contract_cluster_dir ~ '/config/channels.toml.tpl')
       | regex_findall('interface=[^|"\\n]*[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+') | length == 0
 
-- name: Keep Terraform free of lifecycle provisioners and elastic servers
+- name: Keep Terraform free of lifecycle provisioners
   vars:
     contract_tf_text: "{{ lookup('file', item) }}"
   ansible.builtin.assert:
     that:
       - "'local-exec' not in contract_tf_text"
       - "'remote-exec' not in contract_tf_text"
-      - "'/hetzner/' not in item or 'hcloud_token' not in contract_tf_text"
-      - "'/hetzner/' not in item or 'resource \"hcloud_server\"' not in contract_tf_text"
-  loop: >-
-    {{ query('fileglob', contract_cluster_dir ~ '/terraform/containers/*.tf')
-       + query('fileglob', contract_cluster_dir ~ '/terraform/hetzner/*.tf') }}
+  loop: "{{ query('fileglob', contract_cluster_dir ~ '/terraform/containers/*.tf') }}"
   loop_control:
     label: "{{ item | relpath(contract_cluster_dir) }}"
 

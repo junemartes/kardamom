@@ -1,5 +1,5 @@
 ---
-# The host firewall of the production profile. A Hetzner Cloud Firewall
+# The host firewall of the production profile. A cloud firewall
 # filters the public interface only; private Network traffic reaches the
 # host unfiltered. This rule set accepts everything from the private
 # ranges (Consul, Nomad, Aeron UDP, the service ports), SSH from

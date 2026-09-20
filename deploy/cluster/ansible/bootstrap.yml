@@ -4,7 +4,7 @@
 # the base packages, the vSwitch VLAN on a dedicated host, the private
 # address, Docker, the host firewall, then the Consul and Nomad agents. The same roles serve the local profile
 # (the node containers) and the production profile
-# (Hetzner dedicated core and Cloud pools). The local Docker registry
+# (dedicated core and cloud pools). The local Docker registry
 # runs on the control node of the local profile only. All values derive
 # from group_vars/all.yml and the inventory of the profile.
 

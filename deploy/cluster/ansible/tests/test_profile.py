@@ -28,8 +28,8 @@ class ProfileTest(unittest.TestCase):
 
     def test_dedicated_inventory_and_vault_override_shared_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
-            inventory = Path(tmp) / 'hetzner'
-            shutil.copytree(ANSIBLE / 'inventories/hetzner', inventory)
+            inventory = Path(tmp) / 'production'
+            shutil.copytree(ANSIBLE / 'inventories/production', inventory)
             (inventory / 'group_vars/production/vault.yml').write_text('consul_agent_token: test-token\n')
             values = self.inventory(inventory / 'hosts.example.ini', 'sealer-0')
             self.assertEqual(values['consul_agent_token'], 'test-token')
@@ -47,7 +47,7 @@ class ProfileTest(unittest.TestCase):
             (root / 'inventory.ini').write_text(inventory)
             profile = root / Path(profile_dest).relative_to('/etc/kardamom')
             profile.parent.mkdir(parents=True)
-            shutil.copyfile(ANSIBLE / 'inventories/hetzner/group_vars/production/profile.yml', profile)
+            shutil.copyfile(ANSIBLE / 'inventories/production/group_vars/production/profile.yml', profile)
             (profile.parent / 'enrollment.yml').write_text('enrollment_argv: [enroll, --node]\n')
             values = self.inventory(root / 'inventory.ini', 'localhost')
             self.assertEqual(values['enrollment_argv'], ['enroll', '--node'])
