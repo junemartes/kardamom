@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use kardamom_state::{StateEnvBuilder, deep_compare_to, sweep};
 
-use super::rebuild::{Rebuild, RootAt};
+use super::rebuild::{Rebuild, Target};
 
 use crate::harness::Harness;
 use crate::nomad::SavedJob;
@@ -96,6 +96,7 @@ impl<'a> StateAudit<'a> {
             harness: self.harness,
             evidence: directory,
             target,
+            executor_image: false,
         })
     }
 
@@ -270,7 +271,7 @@ struct StateCopies {
 impl StateCopies {
     /// Compare every executor with the validator, and return the
     /// validator's committed root at its head.
-    fn verify(&self) -> anyhow::Result<RootAt> {
+    fn verify(&self) -> anyhow::Result<Target> {
         anyhow::ensure!(!self.executors.is_empty(), "no executor state to compare");
         let validator = Self::open(&self.validator)?;
         let report = sweep(&validator)?;
@@ -290,9 +291,11 @@ impl StateCopies {
         self.executors
             .iter()
             .try_for_each(|path| self.compare(&validator, path))?;
-        Ok(RootAt {
+        let cursor = kardamom_state::read_recovery_point(&validator)?;
+        Ok(Target {
             block: report.last_committed_block,
-            root,
+            root: Some(root),
+            end_tx_idx: Some(cursor.last_fsynced_b_position.as_index()),
         })
     }
 

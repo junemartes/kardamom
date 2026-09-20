@@ -23,9 +23,9 @@ const GENESIS: &str = "deploy/cluster/config/genesis/dev.toml";
 
 /// The report line of a successful attempt, or `None` with the failed
 /// attempt's reason kept in `last` for the final message.
-fn note_attempt(last: &RefCell<String>, attempt: Result<String, String>) -> Option<String> {
+fn note_attempt(last: &RefCell<String>, attempt: Result<Rebuilt, String>) -> Option<Rebuilt> {
     match attempt {
-        Ok(line) => Some(line),
+        Ok(rebuilt) => Some(rebuilt),
         Err(why) => {
             *last.borrow_mut() = why;
             None
@@ -33,11 +33,35 @@ fn note_attempt(last: &RefCell<String>, attempt: Result<String, String>) -> Opti
     }
 }
 
-/// A committed state root and the block it was committed at.
+/// What a rebuild must reach: the block, and what the state there must
+/// carry when the caller knows it.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RootAt {
+pub(crate) struct Target {
     pub(crate) block: u64,
-    pub(crate) root: B256,
+    /// The committed state root at the block. `None` when no stopped
+    /// writer gives one, in the middle of a case.
+    pub(crate) root: Option<B256>,
+    /// The resume cursor at the block: the canonical end index a
+    /// consumer's state holds there. `None` when the caller has none.
+    pub(crate) end_tx_idx: Option<u64>,
+}
+
+/// A rebuilt state: its directory, and the tool's report line.
+#[derive(Debug, Clone)]
+pub(crate) struct Rebuilt {
+    pub(crate) state_dir: PathBuf,
+    pub(crate) report: String,
+}
+
+impl Rebuilt {
+    /// The `end_tx_idx=` field of the report: the rebuilt resume cursor.
+    /// `None` when the payload of the last block carried none.
+    pub(crate) fn end_tx_idx(&self) -> Option<u64> {
+        self.report
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("end_tx_idx="))
+            .and_then(|value| value.parse().ok())
+    }
 }
 
 /// One rebuild-from-L1 run against `target`: copy the DA store, run
@@ -49,20 +73,54 @@ pub(crate) struct Rebuild<'a> {
     /// The evidence directory; the DA copy and the rebuilt state land
     /// under it.
     pub(crate) evidence: PathBuf,
-    pub(crate) target: RootAt,
+    pub(crate) target: Target,
+    /// Write the image an executor resumes on: the tool removes the
+    /// trie, the hashed mirror and the stored root after its checks.
+    pub(crate) executor_image: bool,
 }
 
 impl Rebuild<'_> {
-    /// Require the reconstructed root at the target block.
+    /// Require the reconstructed root at the target block, and the
+    /// validator's resume cursor: the payload carries each block's
+    /// canonical end index, so the state rebuilt from L1 must hold the
+    /// cursor the live chain holds.
     ///
     /// # Errors
     ///
     /// Returns an error if the reconstruction does not reach the target
-    /// block within the budget, or its root differs.
+    /// block within the budget, or its root or its cursor differs.
     pub(crate) async fn assert_parity(&self) -> anyhow::Result<()> {
+        let rebuilt = self.run().await?;
+        let (Some(live), rebuilt_end) = (self.target.end_tx_idx, rebuilt.end_tx_idx()) else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            rebuilt_end == Some(live),
+            "{}: rebuild-from-l1: the rebuilt resume cursor at block {} is {rebuilt_end:?}, the validator holds {live} — a consumer that resumed on the rebuilt state would skip records or apply them twice",
+            crate::FAIL_PREFIX,
+            self.target.block
+        );
         crate::log(format!(
-            "rebuild-from-l1: target block {} root {:#x}",
-            self.target.block, self.target.root
+            "rebuild-from-l1: the rebuilt resume cursor equals the validator's ({live})"
+        ));
+        Ok(())
+    }
+
+    /// Rebuild through the target block, within the budget. The batcher
+    /// posts a block within a few seconds of its seal, so the run retries
+    /// while the posted batches end before the target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no attempt reached the target block, or a
+    /// known root did not match.
+    pub(crate) async fn run(&self) -> anyhow::Result<Rebuilt> {
+        crate::log(format!(
+            "rebuild-from-l1: target block {} root {}",
+            self.target.block,
+            self.target
+                .root
+                .map_or("unknown".to_string(), |root| format!("{root:#x}"))
         ));
         let bin = self.harness.release_binary("kardamom-reconstruct")?;
         let settlement = self.harness.settlement_address().await?;
@@ -72,20 +130,20 @@ impl Rebuild<'_> {
             Ok(note_attempt(last_ref, self.attempt(bin, settlement).await?))
         })
         .await?;
-        let (line, elapsed) = outcome.or_fail(|t| {
+        let (rebuilt, elapsed) = outcome.or_fail(|t| {
             crate::chaos_fail!(
-                "rebuild-from-l1: no reconstruction reached block {} with root {:#x} within {}s; last: {}",
+                "rebuild-from-l1: no reconstruction reached block {} within {}s; last: {}",
                 self.target.block,
-                self.target.root,
                 t.as_secs(),
                 last.borrow().trim()
             )
         })?;
         crate::log(format!(
-            "rebuild-from-l1 PASS after {}s: {line}",
-            elapsed.as_secs()
+            "rebuild-from-l1 PASS after {}s: {}",
+            elapsed.as_secs(),
+            rebuilt.report
         ));
-        Ok(())
+        Ok(rebuilt)
     }
 
     /// One attempt: a fresh DA copy and a fresh state directory. The
@@ -96,7 +154,7 @@ impl Rebuild<'_> {
         &self,
         bin: &Path,
         settlement: &str,
-    ) -> anyhow::Result<Result<String, String>> {
+    ) -> anyhow::Result<Result<Rebuilt, String>> {
         let da = self.copy_da_store().await?;
         let state = tempfile::Builder::new()
             .prefix("rebuild-")
@@ -112,7 +170,7 @@ impl Rebuild<'_> {
             .arg("--state-dir")
             .arg(&state)
             .args(["--through-block", &self.target.block.to_string()])
-            .args(["--expect-root", &format!("{:#x}", self.target.root)])
+            .args(self.optional_args())
             .stdin(Stdio::null())
             .output()
             .await
@@ -124,7 +182,10 @@ impl Rebuild<'_> {
             .unwrap_or("")
             .to_string();
         if out.status.success() {
-            return Ok(Ok(report));
+            return Ok(Ok(Rebuilt {
+                state_dir: state,
+                report,
+            }));
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
         let why = stderr
@@ -133,6 +194,18 @@ impl Rebuild<'_> {
             .find(|l| !l.trim().is_empty())
             .unwrap_or("");
         Ok(Err(format!("{report} {why}").trim().to_string()))
+    }
+
+    /// The arguments that depend on what the caller knows and wants.
+    fn optional_args(&self) -> Vec<String> {
+        let root = self
+            .target
+            .root
+            .map(|root| vec!["--expect-root".to_string(), format!("{root:#x}")]);
+        let image = self
+            .executor_image
+            .then(|| vec!["--executor-image".to_string()]);
+        root.into_iter().chain(image).flatten().collect()
     }
 
     /// Copy the DA store off the aux node. A blob file is written once

@@ -101,6 +101,17 @@ still passed.
   requires one restore line per executor. All three wiped *with* their
   checkpoints has no live source at all: that is the rebuild-from-L1
   backstop.
+- **Whole-fleet total loss** (`executor-fleet-total-wipe-recover`) — the
+  executor job stopped, and every state DB **and every checkpoint** wiped: no
+  executor holds state and no peer can serve any. The harness rebuilds an
+  executor image from L1 and the DA store on the host
+  (`kardamom-reconstruct --through-block --executor-image`), installs it on
+  every executor node, and starts the job. Every executor must resume from
+  the image's cursor, with a replay request the sealer accepts and with no
+  checkpoint restore or peer fetch, and the fleet must catch up. The
+  end-of-shard audit then compares the resumed executors with the validator
+  table by table. The job is stopped, not killed: an executor that starts on
+  an empty directory of a young chain replays from genesis on its own.
 - **Machine replacement** (`node-replace-executor`) — the node is replaced
   through the Terraform root the way a cloud provider replaces a server: a
   new address and empty volumes, then the substrate play a new machine

@@ -471,7 +471,7 @@ binaries one `build` job staged):
 | `chaos-ingress` | graceful + hard kill + **archive-driver-loss** (Aeron substrate kill under ingress-0) |
 | `chaos-sequencer` | graceful + hard kill + **sequencer-replica-kill** (racing-twin failover, restarted replica must regain coverage) + **validator-lapse** |
 | `chaos-cluster` | Raft sealer: **leader-kill** / **follower-kill** / **member-rejoin** / **node-replace-sealer** / **cpu-squeeze** |
-| `chaos-fleet` | every replica of one role down at once: **cluster-quorum-loss-recover** (2 of 3 sealers) / **cluster-total-loss-recover** (all 3 sealers) / **executor-fleet-loss-recover** (all 3 executor nodes) / **executor-fleet-wipe-recover** (all 3 executor tasks, state DBs wiped, local checkpoints kept) / **redis-total-loss-recover** (the whole redis job stopped, then started empty; every mirror rebuilds from a checkpoint); every case ends with a recovery probe load that must land every transaction |
+| `chaos-fleet` | every replica of one role down at once: **cluster-quorum-loss-recover** (2 of 3 sealers) / **cluster-total-loss-recover** (all 3 sealers) / **executor-fleet-loss-recover** (all 3 executor nodes) / **executor-fleet-wipe-recover** (all 3 executor tasks, state DBs wiped, local checkpoints kept) / **executor-fleet-total-wipe-recover** (the executor job stopped, state DBs and checkpoints wiped, an executor image rebuilt from L1 installed on every node) / **redis-total-loss-recover** (the whole redis job stopped, then started empty; every mirror rebuilds from a checkpoint); every case ends with a recovery probe load that must land every transaction |
 
 `kardamom-load` is the harness (`crates/bench/src/load/`, run in process);
 `crates/chaos` injects the failures under steady load and asserts Nomad

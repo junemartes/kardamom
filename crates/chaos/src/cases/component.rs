@@ -9,7 +9,7 @@ use crate::nomad::Streams;
 use crate::poll::{self, Budget};
 
 pub(crate) const RESTORED: &str = "restored state from checkpoint";
-const FETCHED: &str = "fetched checkpoint from peer";
+pub(crate) const FETCHED: &str = "fetched checkpoint from peer";
 
 pub(crate) async fn graceful_executor(h: &mut Harness) -> anyhow::Result<()> {
     h.inject_graceful("executor").await?;
