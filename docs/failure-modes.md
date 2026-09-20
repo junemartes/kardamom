@@ -427,11 +427,13 @@ check would pass against a feature that activated once and stopped.
 
 ## Known gaps (untested failure surface)
 
-- **Rebuild-from-L1 in the chaos suite** — `kardamom-reconstruct` proves
-  root parity in `reconstruct_l1_e2e` against anvil, but no chaos case runs
-  it against the container cluster's L1 and DA store, and no live surface
-  exposes the executor's state root to compare with. The all-wiped sealer
-  and executor fleets therefore have no chaos case.
+- **All-wiped fleets** — the persisted-state stage of every shard now
+  rebuilds the state at the validator's drained head from L1 and the DA
+  store alone (`kardamom-reconstruct --through-block --expect-root`) and
+  requires the validator's committed root. No chaos case yet wipes all three
+  sealers or all three executors with their checkpoints and then rejoins
+  them from that rebuilt state: the executor resumes from a cluster cursor
+  the rebuilt database does not carry.
 - **Archive *data* loss** — total loss has the rebuild-from-L1 path (above,
   `reconstruct_l1_e2e`); single-node `tx_data` archive loss has the
   re-replicate-from-peer path (`archive-tx-data-wipe` chaos case +
