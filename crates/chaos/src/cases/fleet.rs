@@ -15,6 +15,13 @@ use crate::nomad::Streams;
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 
+/// How long three restarted members get to elect a leader. Each one
+/// restores its snapshot and replays the log tail before it votes, so
+/// the election takes longer on a long chain than the 45 s a live
+/// cluster needs after one leader kill. The failure model gives the
+/// whole recovery 180 s.
+const FULL_RESTART_ELECTION: Duration = Duration::from_secs(180);
+
 /// The three sealer nodes, by member id.
 fn sealers(h: &Harness) -> anyhow::Result<Vec<String>> {
     (0..3).map(|id| sealer(h, id)).collect()
@@ -42,7 +49,7 @@ pub(crate) async fn cluster_total_loss_recover(h: &mut Harness) -> anyhow::Resul
     h.start_nodes(&nodes).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.reschedule_slo)
         .await?;
-    let leader = h.evidence.cluster_leader(h.knobs.leader_slo).await?;
+    let leader = h.evidence.cluster_leader(FULL_RESTART_ELECTION).await?;
     crate::log(format!("{ctx}: members elected memberId={leader}"));
     h.assert_executor_progress(Duration::from_secs(180)).await
 }
