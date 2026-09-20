@@ -155,8 +155,8 @@ jobs:
         # it SUPERSEDES the old chaos-sealer shard (the single-sealer SPOF is gone
         # now the deploy uses the clustered sealer — see "Configure shard").
         # chaos-fleet takes every replica of one role down at once: the sealer
-        # quorum, the whole sealer set, and the whole executor set, with and
-        # without their state databases.
+        # quorum, the whole sealer set, the whole executor set, with and
+        # without their state databases, and the whole redis job.
         shard:
           [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-fleet, chaos-retention, chaos-cache, semantics]
     steps:

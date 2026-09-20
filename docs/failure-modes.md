@@ -56,6 +56,14 @@ with three distinct, tested modes:
   owns no in-cluster recovery for that; it is the rebuild-from-L1 backstop
   below.
 
+- **Redis total loss** (`redis-total-loss-recover`) — Redis is a cache with no
+  persistence; the executors' state is the truth. The whole redis job
+  (primary, replica, three sentinels) is stopped for 30 s: the readers
+  degrade to the executor query, the pipeline progresses, the mirrors retry
+  their writes. The job returns empty, the sentinels name a primary, and every
+  state mirror rebuilds the projection from its executor's newest checkpoint.
+  See `docs/specs/2026-09-13-redis-account-cache-design.md`, section 9.3.
+
 Every chaos case ends with a **recovery probe**: after the case load ended
 and the executors converged, a 30 s load at the case rate runs on the case's
 account from its next nonce. Every offered transaction must get a receipt,

@@ -1,6 +1,7 @@
 //! The Redis layer cases: the primary frozen past the sentinels'
 //! down-after, the primary hard-killed, an ingress partitioned from
-//! Redis, and the mirrors killed with the projection flushed. Every
+//! Redis, the mirrors killed with the projection flushed, and the
+//! whole Redis job stopped and started empty. Every
 //! case holds the fallback rule (the pipeline progresses while Redis is
 //! dark, and the readers count a degraded read instead of stalling) and
 //! the recovery (the readers use Redis again, the mirror head advances).
@@ -13,13 +14,13 @@
 //! The primary moves: a promotion leaves it on the replica's node. Every
 //! case asks the sentinels where the primary is before it acts.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 use kardamom_bench::mnemonic::derive_signers;
 
 use crate::harness::Harness;
-use crate::nomad::Streams;
+use crate::nomad::{SavedJob, Streams};
 use crate::poll::{self, Budget};
 use crate::probes::Probed;
 use crate::rpc::{ANVIL_MNEMONIC, Rpc};
@@ -28,6 +29,11 @@ const DEGRADED: &str = "kardamom_cache_degraded_total";
 const LOOKUPS: &str = "kardamom_cache_lookups_total";
 const REDIS_LAYER: &str = "layer=\"redis\"";
 const MIRROR_HEAD: &str = "kardamom_state_mirror_head_tx_idx";
+const MIRROR_WRITE_RETRIES: &str = "kardamom_state_mirror_write_retries_total";
+/// How long the whole Redis job stays stopped. The mirror schedules an
+/// outage rebuild for a write that retried past 10 s, so the loss
+/// lasts three times that.
+const TOTAL_LOSS: Duration = Duration::from_secs(30);
 /// The log line of a finished rebuild. The case counts these lines, not
 /// the rebuild counter: the kill restarts every mirror process, and a
 /// counter in a new process starts again at zero.
@@ -365,6 +371,121 @@ pub(crate) async fn redis_primary_kill(h: &mut Harness) -> anyhow::Result<()> {
     wait_readers_recovered(h, ctx).await?;
     wait_mirror_advances(h, ctx).await?;
     h.assert_progress().await
+}
+
+/// The mirror write retries summed over the executor nodes. A mirror
+/// that retries is alive and waits for Redis; a dark exporter counts
+/// as zero.
+async fn mirror_write_retries(h: &Harness) -> i64 {
+    let mut total = 0;
+    for i in 0..h.probes.executors.len() {
+        total += h
+            .probes
+            .mirror_metric(i, MIRROR_WRITE_RETRIES)
+            .await
+            .unwrap_or(0);
+    }
+    total
+}
+
+/// The whole Redis job stopped: the primary, the replica and the three
+/// sentinels. No reader can resolve a primary, so every cold read
+/// degrades, the pipeline progresses, and the mirrors retry their
+/// writes. The job then starts again with both instances empty, since
+/// Redis keeps nothing on disk. The sentinels name a primary, every
+/// mirror rebuilds the projection from its executor's newest
+/// checkpoint, and the readers use Redis again.
+pub(crate) async fn redis_total_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
+    let ctx = "redis-total-loss-recover";
+    wait_readers_connected(h, ctx).await?;
+    let rebuilds0 = mirror_rebuilds(h).await?;
+    let retries0 = mirror_write_retries(h).await;
+    let job = SavedJob::capture(&h.nomad, "redis").await?;
+    crate::log(format!(
+        "{ctx}: stop the whole redis job (primary, replica, three sentinels) for {}s",
+        TOTAL_LOSS.as_secs()
+    ));
+    job.stop().await?;
+    // The job starts again even when the outage checks fail.
+    let outage = total_loss_phase(h, ctx, retries0).await;
+    let restored = job.restore().await;
+    outage?;
+    restored?;
+    h.assert_count("redis", REDIS_ALLOCS, h.knobs.reschedule_slo)
+        .await?;
+    let master = wait_primary_named(h, ctx).await?;
+    wait_every_mirror_rebuilt(h, ctx, rebuilds0).await?;
+    wait_mirror_advances(h, ctx).await?;
+    assert_chaos_account_projected(h, ctx, &master).await?;
+    wait_readers_recovered(h, ctx).await?;
+    h.assert_progress().await
+}
+
+/// The dark half of [`redis_total_loss_recover`]: the readers degrade,
+/// the pipeline progresses, the mirrors retry, and the loss lasts its
+/// whole window.
+async fn total_loss_phase(h: &Harness, ctx: &str, retries0: i64) -> anyhow::Result<()> {
+    let dark = Instant::now();
+    wait_readers_degraded(h, ctx).await?;
+    h.assert_progress().await?;
+    let outcome = poll::until(Budget::secs(60, 3), |_| async move {
+        let now = mirror_write_retries(h).await;
+        Ok::<_, anyhow::Error>((now > retries0).then_some(now))
+    })
+    .await?;
+    let (retries, _) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: no mirror retried a write within {}s of the loss — the mirrors do not wait for Redis",
+            t.as_secs()
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: mirror write retries {retries0} -> {retries}"
+    ));
+    tokio::time::sleep(TOTAL_LOSS.saturating_sub(dark.elapsed())).await;
+    Ok(())
+}
+
+/// Wait until the restarted sentinels name a primary that answers as
+/// one.
+async fn wait_primary_named(h: &Harness, ctx: &str) -> anyhow::Result<String> {
+    let outcome = poll::until(
+        Budget::new(PROMOTION_BUDGET, Duration::from_secs(3)),
+        |_| async move { sentinel_master(h).await },
+    )
+    .await?;
+    let (master, elapsed) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: the restarted sentinels named no live primary within {}s",
+            t.as_secs()
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: sentinels name {master} after {}s",
+        elapsed.as_secs()
+    ));
+    Ok(master)
+}
+
+/// Every mirror finished a rebuild since `rebuilds0`: each one wrote
+/// into the empty Redis from its own executor's checkpoint.
+async fn wait_every_mirror_rebuilt(h: &Harness, ctx: &str, rebuilds0: usize) -> anyhow::Result<()> {
+    let target = rebuilds0 + MIRROR_ALLOCS;
+    let outcome = poll::until(Budget::secs(300, 5), |_| async move {
+        Ok::<_, anyhow::Error>(Some(mirror_rebuilds(h).await?).filter(|n| *n >= target))
+    })
+    .await?;
+    let (rebuilds, elapsed) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: not every mirror rebuilt within {}s of the restart (need {target} finished rebuilds)",
+            t.as_secs()
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: rebuilds {rebuilds0} -> {rebuilds} after {}s",
+        elapsed.as_secs()
+    ));
+    Ok(())
 }
 
 /// The iptables rule that drops ingress-0's packets to `port`.
