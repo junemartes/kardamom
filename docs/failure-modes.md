@@ -98,8 +98,13 @@ is left, or when the roles fail together:
   node stays, with the orchestrator and the L1. All nodes start in one call,
   with no arranged order. Every job must return to its count, the sealers
   must elect a leader within 180 s, both ingresses must be live, and the
-  pipeline must progress. The shard's persisted-state stage and its
-  rebuild-from-L1 then run on the recovered chain.
+  pipeline must progress. **The case exists and is not in the shard yet: it
+  fails on an open product defect.** After the blackout every job returns and
+  a leader is elected, and then all three executors crash-loop on one
+  canonical entry whose transaction data no archive can serve (`join
+  timeout: TxRef ... not found within 30000 ms`, the archive refetch failing):
+  the sealer had ordered a reference to data that was lost with the nodes.
+  The chain is wedged for good. It joins the shard with that fix.
 
 ## Executor
 
