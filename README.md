@@ -107,6 +107,17 @@ features; launch your editor from a shell where `JAVA_HOME` is set so the
 | `just aeron-driver-down` | Stop the Media Driver started by `aeron-driver-up`. |
 | `just cluster-bootstrap` | Install the HOST tools for the `deploy/cluster/` workflow (Ansible, Docker, OpenTofu, the Nomad CLI). |
 | `just cluster-doctor`    | Check the host has everything `deploy/cluster/` needs. |
+| `just container-up`      | Create and provision the container cluster, publish images, and deploy workloads. |
+| `just container-test [shard]` | Run a shard against the existing cluster (default: `SHARD` or `load`). |
+| `just shard [shard]`     | Run a shard with its full cluster lifecycle. |
+| `just container-diagnostics` | Collect node and job state after a failure. |
+| `just container-down`    | Destroy the cluster containers and their volumes. |
+| `just container-reset`   | Destroy the cluster, then create a fresh chain. |
+
+All [cluster recipes](deploy/cluster/README.md#quick-start) run directly from
+the repository root, including `just images`, `just deploy`, `just smoke`,
+`just validate`, `just check-contract`, and `just clean`. Their relative paths
+are resolved from `deploy/cluster/`.
 
 All build/test recipes set `JAVA_HOME` to a detected JDK 17+ automatically.
 
