@@ -8,7 +8,8 @@ name: release
 #
 #   push to main   images tagged main-<12 hex of the commit>
 #   tag v1.2.3     images tagged v1.2.3, and a GitHub release that carries
-#                  images.digests and images.digests.sigbundle
+#                  images.digests, the signed kardamom-deploy binary, and
+#                  SHA256SUMS
 #
 # The signing identity is this file at the ref that started the run. A
 # verifier can pin that identity, so a rename of this file breaks each
@@ -115,6 +116,9 @@ jobs:
             -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
             -p kardamom-state-mirror \
             --bins
+          # The settlement-contract deployer. A first deployment to an L1
+          # with no settlement contract runs it on the deploy host.
+          cargo build --release --locked -p kardamom-deployer --bin kardamom-deploy
 
       # The same Ansible setup as cluster-e2e.yml: the images role runs on
       # this controller in the two workflows.
@@ -133,6 +137,16 @@ jobs:
       # REGISTRY_PUSH_NODE: this runner pushes directly.
       - name: Build, push and sign the image set; sign the manifest
         run: ansible-playbook -i localhost, deploy/cluster/ansible/images.yml
+
+      # The images role installed the pinned cosign into its cache. The
+      # deployer gets the same keyless identity as the manifest.
+      - name: Sign the deployer binary
+        run: |
+          version="$(sed -n 's/^cosign_pinned_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
+          cosign="$(command -v cosign || echo "${HOME}/.cache/kardamom/cosign/${version}/cosign")"
+          assets="$(dirname "${DIGEST_MANIFEST}")"
+          cp target/release/kardamom-deploy "${assets}/kardamom-deploy"
+          "${cosign}" sign-blob --yes --bundle "${assets}/kardamom-deploy.sigbundle" "${assets}/kardamom-deploy"
 
       - name: Show the digest manifest
         run: |
@@ -172,7 +186,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          (cd assets && sha256sum images.digests images.digests.sigbundle > SHA256SUMS)
+          (cd assets && sha256sum images.digests images.digests.sigbundle kardamom-deploy kardamom-deploy.sigbundle > SHA256SUMS)
           # A release made in the UI pushes the tag and starts this run too.
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release upload "${GITHUB_REF_NAME}" assets/* --clobber

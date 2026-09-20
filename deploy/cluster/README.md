@@ -275,8 +275,9 @@ may briefly reject a mismatched pair, but will never trust a partial manifest.
 `.github/workflows/release.yml` runs the same playbook against GHCR. A push to
 `main` publishes `ghcr.io/<owner>/kardamom-<image>:main-<commit>`. A
 `vMAJOR.MINOR.PATCH` tag on `main` publishes `:vMAJOR.MINOR.PATCH` and makes a
-GitHub release. The release carries `images.digests`, `images.digests.sigbundle`
-and `SHA256SUMS`. A `main` run keeps the same files as the workflow artifact
+GitHub release. The release carries `images.digests`, `images.digests.sigbundle`,
+the signed settlement deployer (`kardamom-deploy`, `kardamom-deploy.sigbundle`)
+and `SHA256SUMS`. A deployment passes the deployer as `DEPLOY_BIN`. A `main` run keeps the same files as the workflow artifact
 `images-main-<commit>`.
 
 The job signs each image and the manifest as
