@@ -182,7 +182,9 @@ per sender — the rewind-floor discipline) and re-published: the cluster's firs
 absorbs committed copies, voided ones get ordered — no gap, no loss, and a fully-voided
 sender un-wedges by construction. Metrics: `ref_unconfirmed` gauge,
 `ref_republished_total` counter (sustained nonzero republish = offers landing in a void or
-receipts not flowing).
+receipts not flowing). The `ref_below_floor` gauge counts buffered refs below their
+sender's floor. It is zero by the floor rules; any other value means a rewind or a floor
+update stranded a ref and its sender is stuck, so alert on it.
 
 ## Config
 

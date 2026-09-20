@@ -164,6 +164,7 @@ impl DepthReport {
     fn new(now: Instant, partition: u32) -> Self {
         // Readiness requires explicit zeros, even before the first transaction.
         (0u8..=u8::MAX).for_each(|vslot| metrics::record_pending_depth(partition, vslot, 0));
+        metrics::record_refs_below_floor(partition, 0);
         Self {
             at: now,
             depths: [0; 256],
@@ -171,10 +172,11 @@ impl DepthReport {
     }
 
     /// Emit the changed vslots of `depths` for `partition`, if the interval
-    /// has passed, and remember them.
-    fn tick(&mut self, now: Instant, partition: u32, depths: &[u32; 256]) {
+    /// has passed, and remember them. Returns whether the report ran, so
+    /// the caller's other once-a-second gauges share the interval.
+    fn tick(&mut self, now: Instant, partition: u32, depths: &[u32; 256]) -> bool {
         if now.duration_since(self.at) < Self::INTERVAL {
-            return;
+            return false;
         }
         self.at = now;
         (0u8..=u8::MAX)
@@ -182,6 +184,7 @@ impl DepthReport {
             .filter(|(_, (new, old))| new != old)
             .for_each(|(vslot, (new, _))| metrics::record_pending_depth(partition, vslot, *new));
         self.depths = *depths;
+        true
     }
 }
 
@@ -667,7 +670,12 @@ impl Sequencer {
         }
         self.shadow_tick(now);
         let depths = self.state.pending_depth_by(vslot_for);
-        self.depth.tick(now, self.cfg.partition_index, &depths);
+        if self.depth.tick(now, self.cfg.partition_index, &depths) {
+            metrics::record_refs_below_floor(
+                self.cfg.partition_index,
+                self.state.refs_below_floor(),
+            );
+        }
     }
 
     /// One expired entry, for [`Self::expiry_tick`]'s loop: count it,

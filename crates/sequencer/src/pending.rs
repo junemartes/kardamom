@@ -81,6 +81,14 @@ impl<T> PendingBuffer<T> {
         self.inner.len()
     }
 
+    /// How many entries sit below `floor`. The drain starts at the floor
+    /// and an entry below it never expires, so the count is zero unless a
+    /// rewind left a ref behind.
+    #[must_use]
+    pub(crate) fn count_below(&self, floor: u64) -> usize {
+        self.inner.range(..floor).count()
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn contains(&self, nonce: u64) -> bool {
