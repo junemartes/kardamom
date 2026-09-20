@@ -143,7 +143,12 @@ jobs:
     # this glibc.
     runs-on: ubuntu-24.04
     # Each shard brings up its own cluster (~10 min) + runs its slice.
-    timeout-minutes: 60
+    # The longest shards (chaos-ingress, chaos-cache) run about 55 minutes
+    # since every case ends with a recovery probe and every shard ends with
+    # the persisted-state audit and the rebuild from L1. A 60-minute limit
+    # left five minutes of margin, and a slow runner cancelled a green
+    # shard in its last stage. 75 keeps a real hang bounded.
+    timeout-minutes: 75
     strategy:
       # Don't cancel the other shards if one fails — we want every shard's
       # result on a single run.
