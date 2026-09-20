@@ -110,7 +110,8 @@ just shard chaos-executor   # one shard end to end, the way CI runs it
 
 The gates are the `kardamom-chaos` crate: one `#[ignore]` test per shard in
 `crates/chaos/tests/shards.rs` (`load`, `semantics`, `chaos-executor`,
-`chaos-ingress`, `chaos-sequencer`, `chaos-cluster`, `chaos-fleet`, `chaos-retention`,
+`chaos-ingress`, `chaos-sequencer`, `chaos-cluster`, `chaos-fleet`, `chaos-coordinated`,
+`chaos-retention`,
 `chaos-cache`). A
 shard test brings the cluster up itself; `container-test` runs it with
 `KARDAMOM_CHAOS_REUSE=1` against the cluster `container-up` made.
@@ -472,6 +473,7 @@ binaries one `build` job staged):
 | `chaos-sequencer` | graceful + hard kill + **sequencer-replica-kill** (racing-twin failover, restarted replica must regain coverage) + **validator-lapse** |
 | `chaos-cluster` | Raft sealer: **leader-kill** / **follower-kill** / **member-rejoin** / **node-replace-sealer** / **cpu-squeeze** |
 | `chaos-fleet` | every replica of one role down at once: **cluster-quorum-loss-recover** (2 of 3 sealers) / **cluster-total-loss-recover** (all 3 sealers) / **executor-fleet-loss-recover** (all 3 executor nodes) / **executor-fleet-wipe-recover** (all 3 executor tasks, state DBs wiped, local checkpoints kept) / **redis-total-loss-recover** (the whole redis job stopped, then started empty; every mirror rebuilds from a checkpoint); every case ends with a recovery probe load that must land every transaction |
+| `chaos-coordinated` | failures that cross a role's redundancy or the roles: **ingress-pair-loss-recover** (both ingress tasks) / **sequencer-lane-loss-recover** (both replicas of lane 0; no ref may sit below a floor) / **pipeline-blackout-recover** (every ingress, sequencer, sealer, executor and aux node killed at once, then started together) |
 
 `kardamom-load` is the harness (`crates/bench/src/load/`, run in process);
 `crates/chaos` injects the failures under steady load and asserts Nomad
