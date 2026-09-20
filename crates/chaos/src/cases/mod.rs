@@ -40,6 +40,7 @@ pub enum Case {
     ClusterTotalLossRecover,
     ExecutorFleetLossRecover,
     ExecutorFleetWipeRecover,
+    ExecutorFleetTotalWipeRecover,
     ArchiveDriverLoss,
     ArchiveTxDataWipe,
     ArchiveCorruption,
@@ -58,7 +59,7 @@ pub enum Case {
     MirrorKillRebuild,
 }
 
-const ALL: [Case; 35] = [
+const ALL: [Case; 36] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -78,6 +79,7 @@ const ALL: [Case; 35] = [
     Case::ClusterTotalLossRecover,
     Case::ExecutorFleetLossRecover,
     Case::ExecutorFleetWipeRecover,
+    Case::ExecutorFleetTotalWipeRecover,
     Case::ArchiveDriverLoss,
     Case::ArchiveTxDataWipe,
     Case::ArchiveCorruption,
@@ -132,6 +134,7 @@ impl Case {
             Self::ClusterTotalLossRecover => "cluster-total-loss-recover",
             Self::ExecutorFleetLossRecover => "executor-fleet-loss-recover",
             Self::ExecutorFleetWipeRecover => "executor-fleet-wipe-recover",
+            Self::ExecutorFleetTotalWipeRecover => "executor-fleet-total-wipe-recover",
             Self::ArchiveDriverLoss => "archive-driver-loss",
             Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
             Self::ArchiveCorruption => "archive-corruption",
@@ -185,9 +188,11 @@ impl Case {
             }
             // The mirrors restart, wait for a checkpoint, and rebuild.
             Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_secs(600),
-            // The node replacement; or the Redis loss, the job's return,
-            // then three rebuilds.
-            Self::NodeReplaceExecutor | Self::RedisTotalLossRecover => {
+            // The node replacement; the Redis loss and three rebuilds; or
+            // the total wipe, the rebuild from L1 and the install.
+            Self::NodeReplaceExecutor
+            | Self::RedisTotalLossRecover
+            | Self::ExecutorFleetTotalWipeRecover => {
                 inject + k.reschedule_slo + Duration::from_secs(420)
             }
             Self::NodeReplaceSealer => {
@@ -220,7 +225,8 @@ impl Case {
             Self::ClusterQuorumLossRecover => 6,
             Self::ClusterTotalLossRecover
             | Self::ExecutorFleetLossRecover
-            | Self::ExecutorFleetWipeRecover => {
+            | Self::ExecutorFleetWipeRecover
+            | Self::ExecutorFleetTotalWipeRecover => {
                 u32::try_from(k.reschedule_slo.as_secs() / 30).unwrap_or(u32::MAX) + 2
             }
             _ => k.load_retry,
@@ -253,6 +259,9 @@ impl Case {
             Self::ClusterTotalLossRecover => fleet::cluster_total_loss_recover(h).await,
             Self::ExecutorFleetLossRecover => fleet::executor_fleet_loss_recover(h).await,
             Self::ExecutorFleetWipeRecover => fleet::executor_fleet_wipe_recover(h).await,
+            Self::ExecutorFleetTotalWipeRecover => {
+                fleet::executor_fleet_total_wipe_recover(h).await
+            }
             Self::ArchiveDriverLoss => archive::driver_loss(h).await,
             Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
             Self::ArchiveCorruption => archive::corruption(h).await,

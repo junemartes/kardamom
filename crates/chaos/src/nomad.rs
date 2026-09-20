@@ -34,9 +34,12 @@ impl Streams {
 
 /// One allocation of a job, as the listing returns it.
 /// How many transient (5xx) answers one task-log read absorbs before it
-/// fails, and the pause between the attempts.
-const LOG_READ_RETRIES: usize = 3;
-const LOG_READ_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// fails, and the pause between the attempts. A Nomad client answered 500
+/// for longer than six seconds while a task's log rotated under load, and
+/// three attempts two seconds apart failed a case that had not injected
+/// anything yet. Six attempts five seconds apart cover half a minute.
+const LOG_READ_RETRIES: usize = 6;
+const LOG_READ_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// The outcome of one task-log read.
 enum LogRead {

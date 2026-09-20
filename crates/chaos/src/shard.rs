@@ -78,6 +78,7 @@ impl Shard {
             Self::Fleet => &[
                 "executor-fleet-loss-recover",
                 "executor-fleet-wipe-recover",
+                "executor-fleet-total-wipe-recover",
                 "redis-total-loss-recover",
                 "cluster-quorum-loss-recover",
                 "cluster-total-loss-recover",
@@ -158,7 +159,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 35);
+        assert_eq!(all.len(), 36);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")

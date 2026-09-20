@@ -22,7 +22,8 @@ use clap::Parser;
 use kardamom_batcher::da_store::FsBlobStore;
 use kardamom_batcher::frame::BlockFrame;
 use kardamom_batcher::l1::{read_posted_batches, recover_blocks};
-use kardamom_reconstruct::reconstruct_state;
+use kardamom_reconstruct::Reconstruction;
+use kardamom_state::Durability;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -59,6 +60,15 @@ struct Cli {
     /// (chaos-suite gate).
     #[arg(long)]
     expect_root: Option<B256>,
+
+    /// Skip the fdatasync of each block commit. Only for a check that
+    /// reads the result on the same host after this process exits and then
+    /// discards it: one sync per block is most of the run time on a slow
+    /// disk. Never for a state an operator keeps: the tool refuses it
+    /// together with `--executor-image`, whose output outlives this
+    /// process.
+    #[arg(long, conflicts_with = "executor_image")]
+    no_sync: bool,
 
     /// Write the image an executor resumes on: after the root check,
     /// remove the trie, the hashed mirror and the stored root, which an
@@ -129,8 +139,17 @@ async fn main() -> anyhow::Result<()> {
         "recovered blocks from DA; re-executing"
     );
 
-    let outcome = reconstruct_state(&cli.state_dir, chain_id, &accounts, &code, &blocks)
-        .context("re-execute reconstructed blocks")?;
+    let durability = if cli.no_sync {
+        Durability::SafeNoSync
+    } else {
+        Durability::Durable
+    };
+    let outcome = Reconstruction {
+        state_dir: &cli.state_dir,
+        durability,
+    }
+    .run(chain_id, &accounts, &code, &blocks)
+    .context("re-execute reconstructed blocks")?;
 
     info!(
         head_block = outcome.head_block,
