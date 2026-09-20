@@ -75,6 +75,16 @@ either: it advances on empty blocks. The first fleet-shard run showed the
 gap: after the quorum loss, 1,282 of 1,524 submits never landed and the case
 still passed.
 
+**Durability of the Raft log.** The kill-based cases above prove the
+restart logic, not the durability against a power loss: a process kill or a
+container kill leaves the host kernel and its page cache alive, so every
+member finds its whole log again. The sealer therefore syncs the Raft log and
+the archive to disk (`kardamom.cluster.fileSyncLevel`, deployed at 1: the
+data of every write batch). At level 0 an entry that a quorum acknowledged
+could exist only in the page caches of its members, and a rack-level power
+loss, the event `pipeline-blackout-recover` stands for, would drop it. Only
+a test that cuts the power of a VM can prove this end to end.
+
 ## Executor
 
 ![Executor failure states](img/states-executor.jpg)
