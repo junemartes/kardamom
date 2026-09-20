@@ -464,7 +464,9 @@ impl Prepared {
         } = self;
 
         let scraper = build_scraper(&cfg);
-        let tracker = Arc::new(Tracker::new()?);
+        let mut tracker = Tracker::new()?;
+        tracker.expect(&signers, queues.planned());
+        let tracker = Arc::new(tracker);
         let sem = Arc::new(Semaphore::new(cfg.max_in_flight.get() as usize));
         let handles = RunHandles {
             client: Arc::clone(&client),

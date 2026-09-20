@@ -6,15 +6,93 @@
 //! accepted but never receipted, or `unlanded`, meaning the submit
 //! failed and never landed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use hdrhistogram::Histogram;
 
 use crate::config::{HIST_HIGH_US, HIST_LOW_US};
+use crate::load::json_hex_u64;
+use crate::load::plan::PlannedTx;
+use crate::signers::DerivedSigner;
+
+/// How many contradicting receipts get a full warning line. Past
+/// this, only the counter moves: one bad block wrongs every sender at
+/// once, and a warning per receipt would drown the report.
+const CONTRADICTION_SAMPLES: u64 = 32;
+
+/// The fields of a mined receipt the tracker reads: the status and
+/// gas for the counters, and the sender and block for the check that
+/// the receipt describes the transaction it was fetched for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReceiptStatus {
+    pub(crate) status: u64,
+    pub(crate) gas: u64,
+    pub(crate) from: Option<Address>,
+    pub(crate) block: Option<u64>,
+}
+
+impl ReceiptStatus {
+    /// Read a JSON receipt. `None` without a `status` field: that is a
+    /// null or malformed answer, not a mined receipt.
+    pub(crate) fn from_json(v: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            status: json_hex_u64(&v["status"])?,
+            gas: json_hex_u64(&v["gasUsed"]).unwrap_or(0),
+            from: v["from"].as_str().and_then(|s| s.parse().ok()),
+            block: json_hex_u64(&v["blockNumber"]),
+        })
+    }
+
+    /// A successful receipt with no sender or block, for a test that
+    /// only counts.
+    #[cfg(test)]
+    pub(crate) fn ok(gas: u64) -> Self {
+        Self {
+            status: 1,
+            gas,
+            from: None,
+            block: None,
+        }
+    }
+}
+
+/// What the receipt of a planned transaction must say: the signer,
+/// and the nonce the signer spent, which orders its block against the
+/// signer's other transactions.
+#[derive(Debug, Clone, Copy)]
+struct Expected {
+    sender: Address,
+    nonce: u64,
+}
+
+/// The blocks every confirmed transaction landed in, per sender by
+/// nonce. A sender's nonces execute in order, so its blocks must not
+/// decrease along the nonce sequence.
+#[derive(Default)]
+struct Placement {
+    by_sender: HashMap<Address, BTreeMap<u64, u64>>,
+}
+
+impl Placement {
+    /// Record `block` for `(sender, nonce)`, and return the neighbour
+    /// that contradicts it: a lower nonce in a later block, or a higher
+    /// nonce in an earlier block.
+    fn place(&mut self, e: Expected, block: u64) -> Option<(u64, u64)> {
+        let blocks = self.by_sender.entry(e.sender).or_default();
+        let before = blocks.range(..e.nonce).next_back();
+        let after = blocks.range(e.nonce + 1..).next();
+        let wrong = before
+            .filter(|(_, b)| **b > block)
+            .or(after.filter(|(_, b)| **b < block))
+            .map(|(n, b)| (*n, *b));
+        blocks.insert(e.nonce, block);
+        wrong
+    }
+}
 
 /// A poison-tolerant lock. A panicked submit task must not block the
 /// whole run's accounting, so this reads the data through the poison.
@@ -71,6 +149,9 @@ pub(crate) struct Counts {
     pub receipted: u64,
     /// The receipts with a status other than `0x1`.
     pub bad_status: u64,
+    /// The receipts that contradict their transaction: another sender,
+    /// no block, or a block out of order with the sender's other nonces.
+    pub bad_receipt: u64,
 }
 
 struct Pending {
@@ -93,6 +174,11 @@ pub(crate) struct Tracker {
     accepted: AtomicU64,
     receipted: AtomicU64,
     bad_status: AtomicU64,
+    bad_receipt: AtomicU64,
+    /// What each planned transaction's receipt must say, by hash.
+    /// Filled before the run, so the reads take no lock.
+    expected: HashMap<B256, Expected>,
+    placement: Mutex<Placement>,
     /// The total gas used by receipted transactions. This is the
     /// numerator for gas/s, a workload-independent throughput measure,
     /// unlike tx/s.
@@ -110,7 +196,7 @@ pub(crate) struct Tracker {
     /// In subscribe mode only: a receipt whose feed notification
     /// arrived before its submit task registered in `pending`. This
     /// handles the race between the feed and the ack.
-    early: Mutex<HashMap<B256, u64>>,
+    early: Mutex<HashMap<B256, ReceiptStatus>>,
 }
 
 impl Tracker {
@@ -124,6 +210,9 @@ impl Tracker {
             accepted: AtomicU64::new(0),
             receipted: AtomicU64::new(0),
             bad_status: AtomicU64::new(0),
+            bad_receipt: AtomicU64::new(0),
+            expected: HashMap::new(),
+            placement: Mutex::new(Placement::default()),
             gas_used: AtomicU64::new(0),
             step_gas: AtomicU64::new(0),
             lat_us: Mutex::new(crate::config::new_latency_hist()?),
@@ -131,6 +220,26 @@ impl Tracker {
             pending: Mutex::new(HashMap::new()),
             early: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Record what the receipt of each planned transaction must say.
+    /// `signers[tx.sender]` signed `tx`. A hash with no expectation is
+    /// confirmed without the check.
+    pub(crate) fn expect<'a>(
+        &mut self,
+        signers: &[DerivedSigner],
+        planned: impl Iterator<Item = &'a PlannedTx>,
+    ) {
+        self.expected.extend(planned.filter_map(|tx| {
+            let sender = signers.get(tx.sender)?.address;
+            Some((
+                tx.hash,
+                Expected {
+                    sender,
+                    nonce: tx.nonce,
+                },
+            ))
+        }));
     }
 
     /// Register an attempted submit.
@@ -182,14 +291,12 @@ impl Tracker {
     /// The feed-side confirmation, for subscribe mode. Settles the
     /// pending entry for `hash`, or stores the status if the submit
     /// task has not registered yet.
-    pub(crate) fn confirm_from_feed(&self, hash: B256, status: u64, gas: u64) {
-        self.gas_used.fetch_add(gas, Ordering::Relaxed);
-        self.step_gas.fetch_add(gas, Ordering::Relaxed);
+    pub(crate) fn confirm_from_feed(&self, hash: B256, receipt: &ReceiptStatus) {
         let settled = lock(&self.pending).remove(&hash);
         match settled {
-            Some(p) => self.confirm(status, p.submit_ts.elapsed()),
+            Some(p) => self.confirm(hash, receipt, p.submit_ts.elapsed()),
             None => {
-                lock(&self.early).insert(hash, status);
+                lock(&self.early).insert(hash, *receipt);
             }
         }
     }
@@ -200,9 +307,9 @@ impl Tracker {
     pub(crate) fn await_feed(&self, hash: B256, submit_ts: Instant) {
         self.insert_pending(hash, submit_ts, true);
         let early = lock(&self.early).remove(&hash);
-        let Some(status) = early else { return };
+        let Some(receipt) = early else { return };
         if self.remove_pending(&hash) {
-            self.confirm(status, submit_ts.elapsed());
+            self.confirm(hash, &receipt, submit_ts.elapsed());
         }
     }
 
@@ -214,6 +321,7 @@ impl Tracker {
             accepted: self.accepted.load(Ordering::Relaxed),
             receipted: self.receipted.load(Ordering::Relaxed),
             bad_status: self.bad_status.load(Ordering::Relaxed),
+            bad_receipt: self.bad_receipt.load(Ordering::Relaxed),
         }
     }
 
@@ -289,28 +397,58 @@ impl Tracker {
         q
     }
 
-    pub(crate) fn confirm(&self, status: u64, latency: Duration) {
-        self.confirm_with_gas(status, latency, 0);
-    }
-
-    /// Confirm with the receipt's gasUsed value. This is the HTTP
-    /// re-fetch path.
-    pub(crate) fn confirm_with_gas(&self, status: u64, latency: Duration, gas: u64) {
-        self.gas_used.fetch_add(gas, Ordering::Relaxed);
-        self.step_gas.fetch_add(gas, Ordering::Relaxed);
+    /// Confirm `hash` with its mined receipt: count the status and gas,
+    /// record the latency, and check that the receipt describes the
+    /// planned transaction.
+    pub(crate) fn confirm(&self, hash: B256, receipt: &ReceiptStatus, latency: Duration) {
+        self.gas_used.fetch_add(receipt.gas, Ordering::Relaxed);
+        self.step_gas.fetch_add(receipt.gas, Ordering::Relaxed);
         self.receipted.fetch_add(1, Ordering::Relaxed);
-        if status != 1 {
+        if receipt.status != 1 {
             self.bad_status.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(why) = self.contradiction(hash, receipt) {
+            let seen = self.bad_receipt.fetch_add(1, Ordering::Relaxed);
+            if seen < CONTRADICTION_SAMPLES {
+                tracing::warn!(%hash, "receipt contradicts its transaction: {why}");
+            }
         }
         let us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
         let _ = lock(&self.lat_us).record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
         let _ = lock(&self.step_lat_us).record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
+    }
+
+    /// Why `receipt` cannot be the receipt of `hash`: it names another
+    /// sender, it names no block, or its block is out of order with the
+    /// sender's other nonces. `None` for a receipt that fits, or for a
+    /// hash with no expectation.
+    fn contradiction(&self, hash: B256, receipt: &ReceiptStatus) -> Option<String> {
+        let e = *self.expected.get(&hash)?;
+        if receipt.from != Some(e.sender) {
+            return Some(format!(
+                "from {:?}, signed by {} nonce {}",
+                receipt.from, e.sender, e.nonce
+            ));
+        }
+        let Some(block) = receipt.block else {
+            return Some(format!(
+                "no block number, sender {} nonce {}",
+                e.sender, e.nonce
+            ));
+        };
+        let (nonce, other) = lock(&self.placement).place(e, block)?;
+        Some(format!(
+            "sender {} nonce {} in block {block}, but nonce {nonce} in block {other}",
+            e.sender, e.nonce
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::signers::SignerSet;
 
     /// Every accessor reads through the poison-tolerant `lock()` helper,
     /// so a poisoned mutex still records the sample.
@@ -324,10 +462,101 @@ mod tests {
         }));
         assert!(tracker.lat_us.is_poisoned());
 
-        tracker.confirm_with_gas(1, Duration::from_micros(500), 21_000);
+        tracker.confirm(
+            B256::ZERO,
+            &ReceiptStatus::ok(21_000),
+            Duration::from_micros(500),
+        );
 
         let lat = tracker.latency_us();
         assert!(lat.p50 > 0, "sample was dropped: p50 is 0");
         assert!(lat.max > 0, "sample was dropped: max is 0");
+    }
+
+    /// A tracker that expects two senders with two nonces each, and
+    /// the hash of `(sender, nonce)`.
+    fn expecting() -> (Tracker, SignerSet, impl Fn(usize, u64) -> B256) {
+        let signers = SignerSet::derive(crate::ANVIL_MNEMONIC, 2).expect("signers");
+        let hash = |sender: usize, nonce: u64| {
+            let slot =
+                u8::try_from(sender).expect("small") * 10 + u8::try_from(nonce).expect("small");
+            B256::with_last_byte(slot)
+        };
+        let planned: Vec<PlannedTx> = (0..2)
+            .flat_map(|s| (0..2).map(move |n| (s, n)))
+            .map(|(sender, nonce)| PlannedTx {
+                raw: alloy_primitives::Bytes::new(),
+                hash: hash(sender, nonce),
+                sender,
+                nonce,
+            })
+            .collect();
+        let mut tracker = Tracker::new().expect("tracker");
+        tracker.expect(&signers, planned.iter());
+        (tracker, signers, hash)
+    }
+
+    fn mined(from: Address, block: u64) -> ReceiptStatus {
+        ReceiptStatus {
+            status: 1,
+            gas: 21_000,
+            from: Some(from),
+            block: Some(block),
+        }
+    }
+
+    #[test]
+    fn a_receipt_of_another_sender_or_without_a_block_is_a_bad_receipt() {
+        let (tracker, signers, hash) = expecting();
+        let latency = Duration::from_millis(1);
+        tracker.confirm(hash(0, 0), &mined(signers[1].address, 5), latency);
+        tracker.confirm(hash(0, 1), &ReceiptStatus::ok(21_000), latency);
+        tracker.confirm(hash(1, 0), &mined(signers[1].address, 5), latency);
+        let c = tracker.counts();
+        assert_eq!((c.receipted, c.bad_status, c.bad_receipt), (3, 0, 2));
+    }
+
+    #[test]
+    fn a_lower_nonce_in_a_later_block_is_a_bad_receipt_whichever_confirms_first() {
+        let (tracker, signers, hash) = expecting();
+        let latency = Duration::from_millis(1);
+        let me = signers[0].address;
+        tracker.confirm(hash(0, 1), &mined(me, 7), latency);
+        tracker.confirm(hash(0, 0), &mined(me, 9), latency);
+        assert_eq!(tracker.counts().bad_receipt, 1, "nonce 0 after nonce 1");
+        let other = signers[1].address;
+        tracker.confirm(hash(1, 0), &mined(other, 9), latency);
+        tracker.confirm(hash(1, 1), &mined(other, 9), latency);
+        assert_eq!(
+            tracker.counts().bad_receipt,
+            1,
+            "one block holds both nonces"
+        );
+    }
+
+    #[test]
+    fn a_hash_without_an_expectation_is_never_checked() {
+        let (tracker, _, _) = expecting();
+        tracker.confirm(
+            B256::repeat_byte(0xEE),
+            &ReceiptStatus::ok(0),
+            Duration::ZERO,
+        );
+        assert_eq!(tracker.counts().bad_receipt, 0);
+    }
+
+    #[test]
+    fn the_feed_path_checks_the_receipt_on_both_sides_of_the_race() {
+        let (tracker, signers, hash) = expecting();
+        let wrong = mined(signers[1].address, 3);
+        // The feed first, then the submit task registers.
+        tracker.confirm_from_feed(hash(0, 0), &wrong);
+        tracker.await_feed(hash(0, 0), Instant::now());
+        // The submit task first, then the feed.
+        tracker.await_feed(hash(0, 1), Instant::now());
+        tracker.confirm_from_feed(hash(0, 1), &wrong);
+        let c = tracker.counts();
+        assert_eq!((c.receipted, c.bad_receipt), (2, 2));
+        assert_eq!(tracker.pending_len(), 0);
     }
 }

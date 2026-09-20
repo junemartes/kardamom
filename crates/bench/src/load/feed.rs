@@ -8,8 +8,7 @@ use std::time::Duration;
 use alloy_primitives::Address;
 use jsonrpsee::rpc_params;
 
-use crate::load::json_hex_u64;
-use crate::load::tracker::Tracker;
+use crate::load::tracker::{ReceiptStatus, Tracker};
 
 /// The subscribe-mode receipt feed: one WebSocket subscription, filtered
 /// to the run's senders, that confirms transactions into the shared
@@ -102,7 +101,9 @@ fn record_receipt(v: &serde_json::Value, tracker: &Tracker) {
     else {
         return;
     };
-    let status = json_hex_u64(&r["status"]).unwrap_or(0);
-    let gas = json_hex_u64(&r["gasUsed"]).unwrap_or(0);
-    tracker.confirm_from_feed(hash, status, gas);
+    let Some(receipt) = ReceiptStatus::from_json(r) else {
+        tracing::warn!(%hash, "receipt feed: item without a status");
+        return;
+    };
+    tracker.confirm_from_feed(hash, &receipt);
 }

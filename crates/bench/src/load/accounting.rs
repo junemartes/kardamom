@@ -99,6 +99,11 @@ pub struct Verdict {
     pub unlanded: u64,
     /// The receipts with a status other than `0x1`.
     pub bad_status: u64,
+    /// The receipts that contradict their transaction: another sender,
+    /// no block, or a block out of order with the sender's other
+    /// nonces. Absent from a report of an older harness.
+    #[serde(default)]
+    pub bad_receipt: u64,
     /// The inferred ingress drop:
     /// `Δreceived - Δaccepted - Δrejected - queue`. This is a soft
     /// signal, noisy within the in-flight window.
@@ -336,6 +341,12 @@ fn completeness_failures(input: &EvalInput<'_>, drops: &DropAccounting) -> Vec<S
     if c.bad_status > 0 {
         failures.push(format!("{} receipt(s) had non-0x1 status", c.bad_status));
     }
+    if c.bad_receipt > 0 {
+        failures.push(format!(
+            "{} receipt(s) contradict their transaction (sender, block, or block order)",
+            c.bad_receipt
+        ));
+    }
     // An unambiguous sequencer drop is a real failure, not just inference
     // noise, except under chaos. There, a submit retried across an ingress
     // restart can legitimately reach the sequencer twice, because the dedup
@@ -370,6 +381,7 @@ pub(crate) fn evaluate(input: &EvalInput<'_>) -> Verdict {
         missing: input.missing,
         unlanded: input.unlanded,
         bad_status: c.bad_status,
+        bad_receipt: c.bad_receipt,
         inferred_ingress_drop: drops.inferred_ingress_drop,
         seq_dropped: drops.seq_dropped,
         seq_evicted: drops.seq_evicted,
