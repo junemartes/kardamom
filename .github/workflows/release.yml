@@ -4,7 +4,9 @@ name: release
 # on each vMAJOR.MINOR.PATCH tag. It builds the service binaries and the
 # cluster jar one time, and ansible/images.yml wraps them into the image set.
 # The role pushes the set to ghcr.io/<owner> and signs each image and the
-# digest manifest (cosign keyless, public Rekor).
+# digest manifest (cosign keyless, public Rekor). The job also pushes one
+# release bundle, kardamom-release:<tag>: a tar file with the manifest, the
+# settlement deployer, and their signature bundles.
 #
 #   push to main   images tagged main-<12 hex of the commit>
 #   tag v1.2.3     images tagged v1.2.3, and a GitHub release that carries
@@ -147,6 +149,22 @@ jobs:
           assets="$(dirname "${DIGEST_MANIFEST}")"
           cp target/release/kardamom-deploy "${assets}/kardamom-deploy"
           "${cosign}" sign-blob --yes --bundle "${assets}/kardamom-deploy.sigbundle" "${assets}/kardamom-deploy"
+
+      # One artifact holds the deploy inputs of this build, so a deploy host
+      # reads them from the registry with the image tag and needs no other
+      # source. The members keep their own signatures.
+      - name: Push and sign the release bundle
+        run: |
+          version="$(sed -n 's/^cosign_pinned_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
+          cosign="$(command -v cosign || echo "${HOME}/.cache/kardamom/cosign/${version}/cosign")"
+          assets="$(dirname "${DIGEST_MANIFEST}")"
+          tar -C "${assets}" -cf "${RUNNER_TEMP}/kardamom-release.tar" \
+            images.digests images.digests.sigbundle kardamom-deploy kardamom-deploy.sigbundle
+          cd "${RUNNER_TEMP}"
+          "${cosign}" upload blob -f kardamom-release.tar "${REGISTRY}/kardamom-release:${TAG}" 2>&1 | tee upload.log
+          digest="$(grep -oE "kardamom-release@sha256:[0-9a-f]{64}" upload.log | tail -1 | cut -d@ -f2)"
+          test -n "${digest}"
+          "${cosign}" sign --yes "${REGISTRY}/kardamom-release@${digest}"
 
       - name: Show the digest manifest
         run: |

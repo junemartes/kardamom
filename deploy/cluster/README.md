@@ -277,7 +277,11 @@ may briefly reject a mismatched pair, but will never trust a partial manifest.
 `vMAJOR.MINOR.PATCH` tag on `main` publishes `:vMAJOR.MINOR.PATCH` and makes a
 GitHub release. The release carries `images.digests`, `images.digests.sigbundle`,
 the signed settlement deployer (`kardamom-deploy`, `kardamom-deploy.sigbundle`)
-and `SHA256SUMS`. A deployment passes the deployer as `DEPLOY_BIN`. A `main` run keeps the same files as the workflow artifact
+and `SHA256SUMS`. A deployment passes the deployer as `DEPLOY_BIN`.
+
+Each run also pushes the release bundle `ghcr.io/<owner>/kardamom-release:<tag>`.
+It is one tar file with `images.digests`, `kardamom-deploy`, and their signature
+bundles. A deploy host can read it from the registry with the image tag. A `main` run keeps the same files as the workflow artifact
 `images-main-<commit>`.
 
 The job signs each image and the manifest as
