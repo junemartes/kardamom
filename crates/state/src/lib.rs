@@ -31,7 +31,10 @@ pub use env::{Durability, StateEnv, StateEnvBuilder};
 pub use error::StateError;
 pub use genesis::{genesis_applied, genesis_digest, seed_genesis};
 pub use integrity::{IntegrityReport, deep_compare, deep_compare_to, sweep};
-pub use nonce_query::{CommittedAccount, NonceQueryServer, committed_account, serve_nonce_queries};
+pub use nonce_query::{
+    CommittedAccount, CommittedReceipt, NonceQueryServer, committed_account, committed_receipt,
+    serve_nonce_queries,
+};
 pub use recovery::{
     RecoveryPoint, bootstrap_trie_from_state, has_trie, read_all_headers, read_recovery_point,
 };
