@@ -172,8 +172,9 @@ impl<T> UnconfirmedLedger<T> {
     /// `(key, meta)` in descending nonce order. `reinsert_for_retry` sets
     /// the sender's rewind floor on every call, so the last call per sender
     /// must carry the lowest nonce (the same discipline as
-    /// `flush_drained`'s backpressure rebuffer). Ascending order would
-    /// strand the lower nonces beneath the floor forever.
+    /// `flush_drained`'s backpressure rebuffer). A bounded sweep splits a
+    /// deep ledger over two calls, the low nonces first, so the rewind
+    /// itself only lowers the floor.
     fn take_descending(&mut self, keys: Vec<UnconfirmedKey>) -> Vec<(UnconfirmedKey, T)> {
         keys.into_iter()
             .rev()
@@ -212,6 +213,26 @@ mod tests {
             l.sweep_expired(Duration::ZERO, Instant::now(), 256)
                 .is_empty()
         );
+    }
+
+    /// A ledger deeper than the sweep bound rewinds in two calls. The
+    /// first call carries the lowest nonces and the second only the
+    /// tail, so the caller's rewind must not let the last call set the
+    /// floor.
+    #[test]
+    fn a_bounded_sweep_splits_a_deep_ledger_low_nonces_first() {
+        let mut l = UnconfirmedLedger::new();
+        let a = addr(1);
+        for n in 0..6u64 {
+            l.record_published(a, n, n);
+        }
+        let first = l.sweep_expired(Duration::ZERO, Instant::now(), 4);
+        let second = l.sweep_expired(Duration::ZERO, Instant::now(), 4);
+        let nonces = |batch: &[(UnconfirmedKey, u64)]| -> Vec<u64> {
+            batch.iter().map(|((_, n), _)| *n).collect()
+        };
+        assert_eq!(nonces(&first), vec![3, 2, 1, 0]);
+        assert_eq!(nonces(&second), vec![5, 4]);
     }
 
     #[test]

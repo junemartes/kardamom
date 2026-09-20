@@ -110,7 +110,8 @@ just shard chaos-executor   # one shard end to end, the way CI runs it
 
 The gates are the `kardamom-chaos` crate: one `#[ignore]` test per shard in
 `crates/chaos/tests/shards.rs` (`load`, `semantics`, `chaos-executor`,
-`chaos-ingress`, `chaos-sequencer`, `chaos-cluster`, `chaos-retention`, `chaos-cache`). A
+`chaos-ingress`, `chaos-sequencer`, `chaos-cluster`, `chaos-fleet`, `chaos-retention`,
+`chaos-cache`). A
 shard test brings the cluster up itself; `container-test` runs it with
 `KARDAMOM_CHAOS_REUSE=1` against the cluster `container-up` made.
 `KARDAMOM_CHAOS_CASES="graceful-executor"` narrows a chaos shard to some
@@ -469,7 +470,8 @@ binaries one `build` job staged):
 | `chaos-executor` | graceful + hard kill + **node-failure** (degrade to 2/3, node returns) + **node-replace** (the node comes back through the Terraform root on a new address with empty disks) |
 | `chaos-ingress` | graceful + hard kill + **archive-driver-loss** (Aeron substrate kill under ingress-0) |
 | `chaos-sequencer` | graceful + hard kill + **sequencer-replica-kill** (racing-twin failover, restarted replica must regain coverage) + **validator-lapse** |
-| `chaos-cluster` | Raft sealer: **leader-kill** / **follower-kill** / **quorum-loss-recover** |
+| `chaos-cluster` | Raft sealer: **leader-kill** / **follower-kill** / **member-rejoin** / **node-replace-sealer** / **cpu-squeeze** |
+| `chaos-fleet` | every replica of one role down at once: **cluster-quorum-loss-recover** (2 of 3 sealers) / **cluster-total-loss-recover** (all 3 sealers) / **executor-fleet-loss-recover** (all 3 executor nodes) / **executor-fleet-wipe-recover** (all 3 executor tasks, state DBs wiped, local checkpoints kept); every case ends with a recovery probe load that must land every transaction |
 
 `kardamom-load` is the harness (`crates/bench/src/load/`, run in process);
 `crates/chaos` injects the failures under steady load and asserts Nomad
