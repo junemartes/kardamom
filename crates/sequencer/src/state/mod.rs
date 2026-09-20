@@ -223,9 +223,20 @@ impl<T> PartitionState<T> {
     /// whose ref did not actually land on B. This also marks the sender as
     /// "drain-pending", so a later call to [`Self::drain_pending`] can
     /// resume the publish without fresh ingress.
+    ///
+    /// The rewind only lowers the floor. A rewind arrives in batches: the
+    /// confirm-timeout sweep takes a bounded count per loop iteration, so
+    /// a deep ledger rewinds in two calls, the low nonces first. A second
+    /// batch that raised the floor to its own lowest nonce would strand
+    /// every ref of the first batch below it: never drained, never
+    /// expired, and every fresh submit at those nonces dropped as past.
     pub(crate) fn reinsert_for_retry(&mut self, sender: Address, nonce: u64, payload: T) {
-        // Rewind expected nonce so the retry treats it as a Match.
-        self.next.insert(sender, nonce);
+        // Rewind expected nonce so the retry treats it as a Match. A
+        // cold sender seeds at `nonce`, not at 0.
+        let floor = self
+            .next_nonce_known(sender)
+            .map_or(nonce, |next| next.min(nonce));
+        self.next.insert(sender, floor);
         let buf = self
             .pending
             .entry(sender)
