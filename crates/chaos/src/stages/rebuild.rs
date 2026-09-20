@@ -202,10 +202,20 @@ impl Rebuild<'_> {
             .target
             .root
             .map(|root| vec!["--expect-root".to_string(), format!("{root:#x}")]);
-        let image = self
-            .executor_image
-            .then(|| vec!["--executor-image".to_string()]);
-        root.into_iter().chain(image).flatten().collect()
+        // A parity check reads the result on this host after the tool
+        // exits and then discards it, so the per-block fdatasync buys
+        // nothing, and on a CI disk it turned a one-minute rebuild into
+        // nine. An executor image is installed on the executors and
+        // outlives the tool, so it keeps every sync.
+        let mode = if self.executor_image {
+            "--executor-image"
+        } else {
+            "--no-sync"
+        };
+        root.into_iter()
+            .chain(std::iter::once(vec![mode.to_string()]))
+            .flatten()
+            .collect()
     }
 
     /// Copy the DA store off the aux node. A blob file is written once

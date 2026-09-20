@@ -95,14 +95,45 @@ pub fn reconstruct_state(
     genesis_code: &[CodeEntry],
     blocks: &[BlockFrame],
 ) -> Result<ReplayOutcome, ReconstructError> {
-    let env = StateEnvBuilder::new(state_dir)
-        .durability(Durability::Durable)
-        .open()
-        .map_err(|e| ReconstructError(format!("open state env: {e}")))?;
+    Reconstruction {
+        state_dir,
+        durability: Durability::Durable,
+    }
+    .run(chain_id, genesis_accounts, genesis_code, blocks)
+}
 
-    let replay = blocks.iter().map(block_frame_to_replay).collect::<Vec<_>>();
-    replay_blocks(env, chain_id, genesis_accounts, genesis_code, replay)
-        .map_err(|e| ReconstructError(e.to_string()))
+/// Where a reconstruction writes, and how hard each block commit syncs.
+pub struct Reconstruction<'a> {
+    pub state_dir: &'a Path,
+    /// `Durable` for a state an operator keeps. `SafeNoSync` only for a
+    /// check that reads the result on the same host after a clean exit
+    /// and then discards it: one fdatasync per block is most of the run
+    /// time on a slow disk, and such a check needs none of them.
+    pub durability: Durability,
+}
+
+impl Reconstruction<'_> {
+    /// Re-execute DA-recovered `blocks`, in order, into the state DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state env cannot open or the replay fails.
+    pub fn run(
+        &self,
+        chain_id: u64,
+        genesis_accounts: &[AccountChange],
+        genesis_code: &[CodeEntry],
+        blocks: &[BlockFrame],
+    ) -> Result<ReplayOutcome, ReconstructError> {
+        let env = StateEnvBuilder::new(self.state_dir)
+            .durability(self.durability)
+            .open()
+            .map_err(|e| ReconstructError(format!("open state env: {e}")))?;
+
+        let replay = blocks.iter().map(block_frame_to_replay).collect::<Vec<_>>();
+        replay_blocks(env, chain_id, genesis_accounts, genesis_code, replay)
+            .map_err(|e| ReconstructError(e.to_string()))
+    }
 }
 
 /// Shared test fixtures: signed transfers, a funded-EOA genesis, closed-
