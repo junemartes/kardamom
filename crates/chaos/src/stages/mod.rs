@@ -55,6 +55,18 @@ pub fn matching_lines(text: &str, needles: &[&str], n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// The first `n` lines of `text` that contain any of `needles`. The
+/// first failure of a service explains the later ones, and a tail
+/// hides it.
+#[must_use]
+pub fn first_matching_lines(text: &str, needles: &[&str], n: usize) -> String {
+    text.lines()
+        .filter(|l| needles.iter().any(|needle| l.contains(needle)))
+        .take(n)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The first `n` lines of `text`.
 #[must_use]
 pub fn head_lines(text: &str, n: usize) -> String {
@@ -81,5 +93,15 @@ mod tests {
             "cluster session opened 2\nx RESYNC 3"
         );
         assert_eq!(matching_lines(text, &["absent"], 5), "");
+    }
+
+    #[test]
+    fn first_matching_lines_keep_the_first_matches_in_order() {
+        let text = "INFO up\nWARN a\nnoise\nERROR b\nWARN c";
+        assert_eq!(
+            first_matching_lines(text, &["WARN", "ERROR"], 2),
+            "WARN a\nERROR b"
+        );
+        assert_eq!(first_matching_lines(text, &["absent"], 5), "");
     }
 }

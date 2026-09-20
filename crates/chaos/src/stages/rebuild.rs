@@ -12,11 +12,17 @@ use anyhow::Context;
 use tokio::process::Command;
 
 use crate::harness::Harness;
-use crate::poll::{self, Budget};
+use crate::nomad::Streams;
+use crate::poll::{self, Budget, Outcome};
+use crate::stages::first_matching_lines;
 
 /// The DA blob store on the aux node, where the batcher writes every
 /// posted blob.
 const DA_STORE: &str = "/opt/kardamom/batcher/da";
+
+/// The batcher's first failures shown when the posted batches never
+/// reach the target block.
+const BATCHER_FIRST_FAILURES: usize = 20;
 
 /// The genesis the cluster's services start from, in the checkout.
 const GENESIS: &str = "deploy/cluster/config/genesis/dev.toml";
@@ -130,6 +136,9 @@ impl Rebuild<'_> {
             Ok(note_attempt(last_ref, self.attempt(bin, settlement).await?))
         })
         .await?;
+        if matches!(outcome, Outcome::TimedOut { .. }) {
+            self.log_batcher_first_failures().await;
+        }
         let (rebuilt, elapsed) = outcome.or_fail(|t| {
             crate::chaos_fail!(
                 "rebuild-from-l1: no reconstruction reached block {} within {}s; last: {}",
@@ -144,6 +153,21 @@ impl Rebuild<'_> {
             rebuilt.report
         ));
         Ok(rebuilt)
+    }
+
+    /// Print the batcher's first warnings and errors. A rebuild that
+    /// never reaches the target block means the batcher stopped posting;
+    /// its first failure names the cause, and the diagnostics dump shows
+    /// only the head and the tail of its log. Best-effort: a failed log
+    /// read prints its error and the stage keeps its own failure.
+    async fn log_batcher_first_failures(&self) {
+        let shown = match self.harness.nomad.job_logs("batcher", Streams::Both).await {
+            Ok(logs) => first_matching_lines(&logs, &["WARN", "ERROR"], BATCHER_FIRST_FAILURES),
+            Err(e) => format!("(batcher log read failed: {e:#})"),
+        };
+        crate::log(format!(
+            "rebuild-from-l1: the batcher's first warnings and errors:\n{shown}"
+        ));
     }
 
     /// One attempt: a fresh DA copy and a fresh state directory. The
