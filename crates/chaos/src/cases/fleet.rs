@@ -183,14 +183,9 @@ async fn install_rebuilt_image(
     nodes: &[String],
     head: u64,
 ) -> anyhow::Result<()> {
+    let mut owners = Vec::with_capacity(nodes.len());
     for node in nodes {
-        wipe_dirs(
-            h,
-            node,
-            ctx,
-            "rm -rf /opt/kardamom/state/* /opt/kardamom/checkpoints/*",
-        )
-        .await?;
+        owners.push(wipe_node(h, ctx, node).await?);
     }
     let evidence = tempfile::Builder::new()
         .prefix("chaos-total-wipe-")
@@ -221,70 +216,92 @@ async fn install_rebuilt_image(
     crate::log(format!(
         "{ctx}: rebuilt an executor image at block {head}, resume cursor {cursor}"
     ));
-    for node in nodes {
-        install_image(h, ctx, node, &rebuilt).await?;
+    for (node, owner) in nodes.iter().zip(&owners) {
+        install_image(h, ctx, node, owner, &rebuilt).await?;
     }
     Ok(())
 }
 
-/// The owner and the mode of a node's state directory, as `stat` prints
-/// them: what the executor's own writer left there.
-struct DirMeta {
-    owner: String,
-    mode: String,
+/// Record who owns the node's state database, then wipe its state and
+/// its checkpoints.
+async fn wipe_node(h: &Harness, ctx: &str, node: &str) -> anyhow::Result<StateOwner> {
+    let owner = StateOwner::read(h, ctx, node).await?;
+    wipe_dirs(
+        h,
+        node,
+        ctx,
+        "rm -rf /opt/kardamom/state/* /opt/kardamom/checkpoints/*",
+    )
+    .await?;
+    Ok(owner)
 }
 
-impl DirMeta {
-    const STATE: &'static str = "/opt/kardamom/state";
+/// Who owns an executor's database file, and the mode of its state
+/// directory, as `stat` prints them. The directory belongs to the node
+/// and is world-writable; the database file belongs to the user the
+/// executor runs as. A copy from the host carries the host's owner and
+/// the 0700 mode of a temp directory, and mdbx opens a database it cannot
+/// write as read-only, which the executor refuses. So both are read
+/// before the wipe and given to the installed image.
+struct StateOwner {
+    file_owner: String,
+    dir_mode: String,
+}
+
+impl StateOwner {
+    const DIR: &'static str = "/opt/kardamom/state";
 
     async fn read(h: &Harness, ctx: &str, node: &str) -> anyhow::Result<Self> {
-        let out = h
-            .nodes
-            .exec(node, &format!("stat -c '%u:%g %a' {}", Self::STATE))
-            .await
-            .map_err(|e| {
-                crate::chaos_fail!("{ctx}: could not stat the state dir on {node}: {e}")
-            })?;
+        let script = format!(
+            "stat -c '%u:%g' {dir}/mdbx.dat && stat -c '%a' {dir}",
+            dir = Self::DIR
+        );
+        let out = h.nodes.exec(node, &script).await.map_err(|e| {
+            crate::chaos_fail!("{ctx}: could not stat the state database on {node}: {e}")
+        })?;
         let mut fields = out.split_whitespace();
-        let (Some(owner), Some(mode)) = (fields.next(), fields.next()) else {
+        let (Some(file_owner), Some(dir_mode)) = (fields.next(), fields.next()) else {
             return Err(crate::chaos_fail!(
-                "{ctx}: unexpected stat output for the state dir on {node}: {out:?}"
+                "{ctx}: unexpected stat output for the state database on {node}: {out:?}"
             ));
         };
         Ok(Self {
-            owner: owner.to_string(),
-            mode: mode.to_string(),
+            file_owner: file_owner.to_string(),
+            dir_mode: dir_mode.to_string(),
         })
     }
 
-    /// The script that gives the installed image this owner and mode. A
-    /// copy from the host carries the host's owner and the 0700 mode of a
-    /// temp directory onto the state directory itself, and mdbx opens a
-    /// database it cannot write as read-only, which the executor refuses.
+    /// The script that makes the installed image the executor's own: the
+    /// writer's lock file removed, every file with the recorded owner, the
+    /// directory with its recorded mode.
     fn restore_script(&self) -> String {
         format!(
-            "rm -f {dir}/mdbx.lck && chown -R {owner} {dir} && chmod {mode} {dir} && chmod -R u+rwX {dir} && test -s {dir}/mdbx.dat",
-            dir = Self::STATE,
-            owner = self.owner,
-            mode = self.mode
+            "rm -f {dir}/mdbx.lck && chown -R {owner} {dir}/. && chmod {mode} {dir} && chmod -R u+rwX {dir}/. && test -s {dir}/mdbx.dat",
+            dir = Self::DIR,
+            owner = self.file_owner,
+            mode = self.dir_mode
         )
     }
 }
 
-/// Copy the image into the node's empty state directory, then give it
-/// the owner and the mode the directory had. The lock file belongs to
-/// the process that wrote the image, so it stays behind.
-async fn install_image(h: &Harness, ctx: &str, node: &str, image: &Rebuilt) -> anyhow::Result<()> {
-    let meta = DirMeta::read(h, ctx, node).await?;
+/// Copy the image into the node's empty state directory, then make it
+/// the executor's own.
+async fn install_image(
+    h: &Harness,
+    ctx: &str,
+    node: &str,
+    owner: &StateOwner,
+    image: &Rebuilt,
+) -> anyhow::Result<()> {
     let source = format!("{}/.", image.state_dir.display());
     h.nodes
-        .docker_ok(&["cp", &source, &format!("{node}:{}/", DirMeta::STATE)])
+        .docker_ok(&["cp", &source, &format!("{node}:{}/", StateOwner::DIR)])
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: could not copy the image to {node}: {e}"))?;
-    wipe_dirs(h, node, ctx, &meta.restore_script()).await?;
+    wipe_dirs(h, node, ctx, &owner.restore_script()).await?;
     crate::log(format!(
-        "{ctx}: image installed on {node} (owner {}, mode {})",
-        meta.owner, meta.mode
+        "{ctx}: image installed on {node} (file owner {}, dir mode {})",
+        owner.file_owner, owner.dir_mode
     ));
     Ok(())
 }
