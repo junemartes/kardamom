@@ -1,5 +1,5 @@
-//! A read-only account query on the executor node: the committed nonce
-//! or balance of one address.
+//! A read-only query on the executor node: the committed nonce or
+//! balance of one address, or the committed receipt of one transaction.
 //!
 //! The sequencer asks an executor for the committed nonce of a cold
 //! sender. The answer is a lower bound on the sender's next nonce. An
@@ -28,6 +28,15 @@
 //! {"jsonrpc":"2.0","id":1,"result":"0x2a"}
 //! ```
 //!
+//! The ingress asks for a receipt by hash when its own receipt cache
+//! misses. That cache lives in the memory of one ingress process, so a
+//! restarted ingress holds no receipt from before its start, and the
+//! state DB is the durable copy. The method is
+//! `eth_getTransactionReceipt` with `[hash]`. The result is `null`, or
+//! the rkyv bytes of the stored [`Receipt`] as `0x` hex, the format of
+//! the `receipts` table, so the two sides share one type and no second
+//! encoding.
+//!
 //! `x-state-tx-idx` is the canonical end position of the snapshot's last
 //! committed block, as an index. A cache writes the answer back tagged
 //! with it, so the answer never outranks a newer row.
@@ -41,9 +50,9 @@ use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use alloy_primitives::{Address, U256};
-use kardamom_types::StateDatabase;
+use alloy_primitives::{Address, B256, U256};
 use kardamom_types::num::usize_to_u64;
+use kardamom_types::{Receipt, StateDatabase};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -157,6 +166,67 @@ pub fn committed_account(env: &StateEnv, address: Address) -> Result<CommittedAc
     })
 }
 
+/// The committed receipt of one transaction, and where the snapshot
+/// that gave it stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedReceipt {
+    /// `None` when the state holds no transaction with that hash.
+    pub receipt: Option<Receipt>,
+    /// The snapshot's block.
+    pub block: u64,
+    /// The canonical end position of the snapshot's last block, as an
+    /// index.
+    pub tx_idx: u64,
+}
+
+/// Read the committed receipt of `tx_hash` from a fresh snapshot.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the snapshot cannot open or a read fails.
+pub fn committed_receipt(env: &StateEnv, tx_hash: B256) -> Result<CommittedReceipt, StateError> {
+    let snapshot = StateSnapshot::open(env)?;
+    let receipt = snapshot
+        .get_tx_position(tx_hash)?
+        .map(|position| snapshot.get_receipt(position))
+        .transpose()?
+        .flatten();
+    Ok(CommittedReceipt {
+        receipt,
+        block: snapshot.block_number(),
+        tx_idx: snapshot.end_tx_position()?.as_index(),
+    })
+}
+
+/// One request, parsed once at the boundary: an account method with its
+/// address, or a receipt lookup with its hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Query {
+    Account(Method, Address),
+    Receipt(B256),
+}
+
+/// The JSON-RPC name of the receipt lookup.
+const RECEIPT_METHOD: &str = "eth_getTransactionReceipt";
+
+impl Query {
+    /// The query of `request`, or the JSON-RPC error code and message.
+    fn parse(request: &Request) -> Result<Self, (i64, &'static str)> {
+        let first = request.params.first().and_then(serde_json::Value::as_str);
+        if request.method == RECEIPT_METHOD {
+            return first
+                .and_then(|s| s.parse::<B256>().ok())
+                .map(Self::Receipt)
+                .ok_or((-32602, "invalid params: expected [hash]"));
+        }
+        let method = Method::parse(&request.method).ok_or((-32601, "method not found"))?;
+        first
+            .and_then(|s| s.parse::<Address>().ok())
+            .map(|address| Self::Account(method, address))
+            .ok_or((-32602, "invalid params: expected [address, tag]"))
+    }
+}
+
 /// The two methods the server answers, parsed once at the boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Method {
@@ -253,6 +323,24 @@ impl Reply {
         Self::error("500 Internal Server Error", "error", id, -32603, message)
     }
 
+    /// The committed receipt as the hex of its stored bytes, or `null`,
+    /// with the snapshot's position.
+    fn receipt(id: &serde_json::Value, found: &CommittedReceipt) -> Self {
+        metrics::counter!(NONCE_QUERIES, "outcome" => "ok", "method" => "receipt").increment(1);
+        let result = found.receipt.as_ref().map(|r| {
+            format!(
+                "0x{}",
+                alloy_primitives::hex::encode(crate::schema::encode_receipt_value(r))
+            )
+        });
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
+        Self {
+            status: "200 OK",
+            body,
+            state: Some((found.block, found.tx_idx)),
+        }
+    }
+
     /// The committed value `method` asked for, with the snapshot's
     /// position.
     fn ok(id: &serde_json::Value, method: Method, account: &CommittedAccount) -> Self {
@@ -292,41 +380,53 @@ impl Reply {
     }
 }
 
-/// The address a well-formed request names.
-fn requested_address(request: &Request) -> Option<Address> {
-    request
-        .params
-        .first()
-        .and_then(serde_json::Value::as_str)
-        .and_then(|s| s.parse::<Address>().ok())
-}
-
 /// Answer one request body.
 async fn answer(env: &StateEnv, body: &[u8]) -> Reply {
     let Ok(request) = serde_json::from_slice::<Request>(body) else {
         return Reply::bad_request(-32700, "parse error");
     };
-    let Some(method) = Method::parse(&request.method) else {
-        return Reply::rpc_error(&request.id, -32601, "method not found");
-    };
-    let Some(address) = requested_address(&request) else {
-        return Reply::rpc_error(
-            &request.id,
-            -32602,
-            "invalid params: expected [address, tag]",
-        );
+    let query = match Query::parse(&request) {
+        Ok(query) => query,
+        Err((code, message)) => return Reply::rpc_error(&request.id, code, message),
     };
     let env = env.clone();
-    let looked_up = tokio::task::spawn_blocking(move || committed_account(&env, address)).await;
+    let looked_up = tokio::task::spawn_blocking(move || query.read(&env)).await;
     match looked_up {
-        Ok(Ok(account)) => Reply::ok(&request.id, method, &account),
+        Ok(Ok(found)) => found.reply(&request.id),
         Ok(Err(e)) => {
-            warn!(error = %e, %address, "account query: state read failed");
+            warn!(error = %e, ?query, "state query: state read failed");
             Reply::internal(&request.id, "state read failed")
         }
         Err(e) => {
-            warn!(error = %e, "nonce query: blocking task failed");
+            warn!(error = %e, "state query: blocking task failed");
             Reply::internal(&request.id, "internal error")
+        }
+    }
+}
+
+/// What a [`Query`] read from the state.
+enum Found {
+    Account(Method, CommittedAccount),
+    Receipt(CommittedReceipt),
+}
+
+impl Query {
+    /// Read the answer from a fresh snapshot. Blocking: mdbx reads.
+    fn read(self, env: &StateEnv) -> Result<Found, StateError> {
+        match self {
+            Self::Account(method, address) => {
+                committed_account(env, address).map(|account| Found::Account(method, account))
+            }
+            Self::Receipt(tx_hash) => committed_receipt(env, tx_hash).map(Found::Receipt),
+        }
+    }
+}
+
+impl Found {
+    fn reply(&self, id: &serde_json::Value) -> Reply {
+        match self {
+            Self::Account(method, account) => Reply::ok(id, *method, account),
+            Self::Receipt(found) => Reply::receipt(id, found),
         }
     }
 }
@@ -491,6 +591,91 @@ mod tests {
             unknown_reply.contains(r#""result":"0x0""#),
             "{unknown_reply}"
         );
+    }
+
+    /// A state DB with one committed block that holds one receipt.
+    fn env_with_receipt(dir: &std::path::Path, receipt: &Receipt) -> StateEnv {
+        use crate::writer::{StateWriter, TrieMode, WriteBatch};
+        use kardamom_types::{BPosition, BlockBoundary, BlockDelta};
+
+        let env = StateEnvBuilder::new(dir).open().unwrap();
+        seed_genesis(&env, &[], &[]).unwrap();
+        let mut handle = StateWriter::spawn_with_trie(env.clone(), TrieMode::Off).unwrap();
+        let delta = BlockDelta {
+            block_number: 1,
+            accounts: vec![],
+            storage: vec![],
+            code: vec![],
+            receipts: vec![receipt.clone()],
+        };
+        let boundary = BlockBoundary {
+            block_number: 1,
+            end_tx_idx: BPosition::from_index(receipt.tx_idx.as_index() + 1),
+            l2_timestamp: 1_700_000_001,
+            l1_origin: 0,
+        };
+        handle
+            .delta_tx
+            .send(WriteBatch::new(boundary, delta))
+            .unwrap();
+        handle.shutdown().unwrap();
+        env
+    }
+
+    /// The ingress holds a receipt only in the memory of one process.
+    /// After a restart it asks here, and the state DB is the durable
+    /// copy: the stored bytes come back, and an unknown hash is `null`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serves_the_committed_receipt_by_hash_and_null_for_an_unknown_hash() {
+        let receipt = Receipt {
+            tx_idx: kardamom_types::BPosition::from_index(4),
+            tx_hash: B256::repeat_byte(0xBE),
+            status: true,
+            gas_used: 21_000,
+            nonce: 9,
+            from: Address::repeat_byte(0x11),
+            block_number: 1,
+            ..Receipt::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_receipt(dir.path(), &receipt);
+        let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
+        let addr = server.addr;
+        let ask = move |hash: B256| {
+            post(
+                addr,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":5,"method":"eth_getTransactionReceipt","params":["{hash}"]}}"#
+                ),
+            )
+        };
+
+        let known = receipt.tx_hash;
+        let reply = tokio::task::spawn_blocking(move || ask(known))
+            .await
+            .unwrap();
+        assert!(reply.starts_with("HTTP/1.0 200 OK"), "{reply}");
+        assert!(reply.contains("x-state-block: 1\r\n"), "{reply}");
+        let stored = alloy_primitives::hex::encode(crate::schema::encode_receipt_value(&receipt));
+        assert!(
+            reply.contains(&format!(r#""result":"0x{stored}""#)),
+            "{reply}"
+        );
+
+        let unknown = tokio::task::spawn_blocking(move || ask(B256::repeat_byte(0x01)))
+            .await
+            .unwrap();
+        assert!(unknown.contains(r#""result":null"#), "{unknown}");
+
+        let malformed = tokio::task::spawn_blocking(move || {
+            post(
+                addr,
+                r#"{"jsonrpc":"2.0","id":5,"method":"eth_getTransactionReceipt","params":["0x12"]}"#,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(malformed.contains("-32602"), "{malformed}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

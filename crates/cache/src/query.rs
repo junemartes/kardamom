@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
+use kardamom_types::Receipt;
 use serde::{Deserialize, Serialize};
 
 /// The `[executor_query]` section. Off when the endpoint list is empty.
@@ -155,24 +156,51 @@ impl ExecutorQuery {
         self.query(QueryMethod::Balance, address).await
     }
 
-    /// Query the endpoints in rotation. The first answer wins. A query
-    /// over the in-flight bound is shed at once, so a flood of cold
-    /// addresses never queues on the executors.
+    /// The committed receipt of `tx_hash`, from an executor's state DB.
+    /// `None` when the executor that answered holds no such transaction.
+    /// The ingress asks on a miss of its own receipt cache: that cache
+    /// lives in one process, so a restarted ingress holds no receipt from
+    /// before its start.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryError`] when every endpoint failed, or when the
+    /// in-flight bound is reached.
+    pub async fn receipt(&self, tx_hash: B256) -> Result<Option<Receipt>, QueryError> {
+        let body = receipt_request_body(tx_hash);
+        let raw = self.rotate(&body).await?;
+        parse_receipt_answer(&raw.text).map_err(|reason| QueryError::new(reason, false))
+    }
+
+    /// An account query: the rotation, then the hex quantity.
     async fn query(
         &self,
         method: QueryMethod,
         address: Address,
     ) -> Result<QueryAnswer, QueryError> {
+        let raw = self.rotate(&request_body(method, address)).await?;
+        let value = parse_answer(&raw.text).map_err(|reason| QueryError::new(reason, false))?;
+        Ok(QueryAnswer {
+            value,
+            block: raw.block,
+            tx_idx: raw.tx_idx,
+        })
+    }
+
+    /// Send `body` to the endpoints in rotation. The first HTTP answer
+    /// wins. A query over the in-flight bound is shed at once, so a flood
+    /// of cold addresses, or of polls for receipts that do not exist yet,
+    /// never queues on the executors.
+    async fn rotate(&self, body: &str) -> Result<RawAnswer, QueryError> {
         let Ok(_permit) = self.in_flight.try_acquire() else {
             return Err(QueryError::new("in-flight bound reached".into(), false));
         };
         let n = self.endpoints.len();
         let first = self.next.fetch_add(1, Ordering::Relaxed) % n;
-        let body = request_body(method, address);
         let mut last_err = QueryError::new("no executor endpoints".into(), false);
         for endpoint in (0..n).map(|i| &self.endpoints[first.saturating_add(i) % n]) {
             if let ControlFlow::Break(answer) =
-                self.try_endpoint(endpoint, &body, &mut last_err).await
+                self.try_endpoint(endpoint, body, &mut last_err).await
             {
                 return Ok(answer);
             }
@@ -187,7 +215,7 @@ impl ExecutorQuery {
         endpoint: &str,
         body: &str,
         last_err: &mut QueryError,
-    ) -> ControlFlow<QueryAnswer> {
+    ) -> ControlFlow<RawAnswer> {
         match self.query_one(endpoint, body).await {
             Ok(answer) => ControlFlow::Break(answer),
             Err(e) => {
@@ -197,7 +225,7 @@ impl ExecutorQuery {
         }
     }
 
-    async fn query_one(&self, endpoint: &str, body: &str) -> Result<QueryAnswer, QueryError> {
+    async fn query_one(&self, endpoint: &str, body: &str) -> Result<RawAnswer, QueryError> {
         let resp = self
             .client
             .post(endpoint)
@@ -219,13 +247,56 @@ impl ExecutorQuery {
             .text()
             .await
             .map_err(|e| QueryError::new(e.to_string(), e.is_timeout()))?;
-        let value = parse_answer(&text).map_err(|reason| QueryError::new(reason, false))?;
-        Ok(QueryAnswer {
-            value,
+        Ok(RawAnswer {
+            text,
             block,
             tx_idx,
         })
     }
+}
+
+/// One HTTP answer before its result is parsed: the JSON-RPC body, and
+/// where the snapshot that gave it stands.
+struct RawAnswer {
+    text: String,
+    block: u64,
+    tx_idx: u64,
+}
+
+/// The JSON-RPC request body for a receipt lookup.
+#[must_use]
+pub fn receipt_request_body(tx_hash: B256) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":["{tx_hash}"]}}"#
+    )
+}
+
+/// Parse the JSON-RPC answer of a receipt lookup: `null`, or the rkyv
+/// bytes of the stored receipt as `0x` hex.
+///
+/// # Errors
+///
+/// Returns the reason as text when the body is not JSON, carries an
+/// `error` member, or the result does not decode as a receipt.
+pub fn parse_receipt_answer(body: &str) -> Result<Option<Receipt>, String> {
+    #[derive(Deserialize)]
+    struct Reply {
+        result: Option<String>,
+        error: Option<serde_json::Value>,
+    }
+    let reply: Reply = serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+    if let Some(e) = reply.error {
+        return Err(format!("rpc error: {e}"));
+    }
+    reply
+        .result
+        .map(|hex| {
+            let bytes =
+                alloy_primitives::hex::decode(&hex).map_err(|e| format!("bad receipt hex: {e}"))?;
+            rkyv::from_bytes::<Receipt, rkyv::rancor::Error>(&bytes)
+                .map_err(|e| format!("bad receipt bytes: {e}"))
+        })
+        .transpose()
 }
 
 /// The JSON-RPC request body for one query.
@@ -276,6 +347,41 @@ mod tests {
         );
         assert!(parse_answer(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602}}"#).is_err());
         assert!(parse_answer(r#"{"jsonrpc":"2.0","id":1,"result":"12"}"#).is_err());
+    }
+
+    /// The executor sends the stored bytes of the receipt, the format of
+    /// its `receipts` table, so the ingress decodes the same type it holds
+    /// in its own cache.
+    #[test]
+    fn a_receipt_answer_round_trips_and_null_is_none() {
+        let hash = B256::repeat_byte(0xBE);
+        let body = receipt_request_body(hash);
+        assert!(body.contains("eth_getTransactionReceipt"), "{body}");
+        assert!(body.contains(&format!("{hash}")), "{body}");
+
+        let receipt = Receipt {
+            tx_hash: hash,
+            status: true,
+            gas_used: 21_000,
+            nonce: 9,
+            from: Address::repeat_byte(0x11),
+            block_number: 7,
+            ..Receipt::default()
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&receipt).unwrap();
+        let answer = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":"0x{}"}}"#,
+            alloy_primitives::hex::encode(&bytes)
+        );
+        assert_eq!(parse_receipt_answer(&answer).unwrap(), Some(receipt));
+        assert_eq!(
+            parse_receipt_answer(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).unwrap(),
+            None
+        );
+        assert!(parse_receipt_answer(r#"{"jsonrpc":"2.0","id":1,"result":"0x00"}"#).is_err());
+        assert!(
+            parse_receipt_answer(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603}}"#).is_err()
+        );
     }
 
     #[test]
