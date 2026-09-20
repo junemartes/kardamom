@@ -153,12 +153,14 @@ fn assert_recovered_matches_oracle(
         ReplayBlock {
             block_number: 1,
             l2_timestamp: 1_700_000_000,
+            canonical_end: None,
             remote_epochs: vec![],
             txs: block1.txs.iter().map(|t| t.envelope.clone()).collect(),
         },
         ReplayBlock {
             block_number: 2,
             l2_timestamp: 1_700_000_001,
+            canonical_end: None,
             remote_epochs: vec![],
             txs: block2.txs.iter().map(|t| t.envelope.clone()).collect(),
         },
@@ -168,6 +170,11 @@ fn assert_recovered_matches_oracle(
 
     assert_eq!(recovered.head_block, 2);
     assert_eq!(recovered.txs_applied, 3);
+    // The batcher posted each block's canonical end, so the state rebuilt
+    // from L1 carries the cursor a consumer resumes from: block 2 ends at
+    // index 3. The oracle replayed bare blocks and has none.
+    assert_eq!(recovered.head_end_tx_idx, Some(3));
+    assert_eq!(oracle.head_end_tx_idx, None);
     assert_eq!(
         recovered.state_root, oracle.state_root,
         "state rebuilt purely from L1 data must match the canonical root"

@@ -8,7 +8,7 @@ use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use kardamom_batcher::batch::{ClosedBlock, RecordedTx};
 use kardamom_batcher::batcher::{BatcherConfig, pack_blocks};
-use kardamom_batcher::frame::{BlockFrame, TxFrame};
+use kardamom_batcher::frame::{BlockCursor, BlockFrame, TxFrame};
 use kardamom_batcher::recon::reconstruct;
 use kardamom_types::{BPosition, TxEnvelope};
 
@@ -34,6 +34,7 @@ fn closed(block_number: u64, n: usize) -> ClosedBlock {
         block_number,
         l2_timestamp: 1_700_000_000 + block_number,
         end_tx_idx: BPosition::from_index((n as u64) * 64),
+        l1_origin: 0,
         remote_epochs: Vec::new(),
         txs,
     }
@@ -45,6 +46,10 @@ fn expected_frames(blocks: &[ClosedBlock]) -> Vec<BlockFrame> {
         .map(|b| BlockFrame {
             block_number: b.block_number,
             l2_timestamp: b.l2_timestamp,
+            cursor: Some(BlockCursor {
+                end_tx_idx: b.end_tx_idx.as_index(),
+                l1_origin: b.l1_origin,
+            }),
             remote_epochs: b.remote_epochs.clone(),
             txs: b
                 .txs

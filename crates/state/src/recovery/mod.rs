@@ -129,6 +129,44 @@ pub fn has_trie(env: &StateEnv) -> Result<bool, StateError> {
     Ok(cur.first::<Vec<u8>, Vec<u8>>()?.is_some())
 }
 
+/// Remove the hashed-state mirror, the account and storage tries, and the
+/// stored state root: the shape a trie-off writer produces, which is the
+/// shape of an executor's state.
+///
+/// A state image rebuilt from L1 is trie-aware, because the rebuild
+/// proves its root. An executor resumes on it with the trie off, so the
+/// trie and the root would go stale at the first block. A stale root
+/// fails the integrity sweep, and a validator that adopts such an image
+/// as a checkpoint trusts the presence of the mirror ([`has_trie`]) and
+/// would skip its bootstrap. So verify the root first, then strip.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the transaction or a table clear fails.
+pub fn strip_trie(env: &StateEnv) -> Result<(), StateError> {
+    use crate::schema::{
+        TABLE_ACCOUNT_TRIE, TABLE_HASHED_ACCOUNTS, TABLE_HASHED_STORAGE, TABLE_META,
+        TABLE_STORAGE_TRIE,
+    };
+    let txn = env.raw().begin_rw_sync()?;
+    [
+        TABLE_ACCOUNT_TRIE,
+        TABLE_STORAGE_TRIE,
+        TABLE_HASHED_ACCOUNTS,
+        TABLE_HASHED_STORAGE,
+    ]
+    .into_iter()
+    .try_for_each(|table| -> Result<(), StateError> {
+        let db = txn.open_db(Some(table))?;
+        txn.clear_db(db)?;
+        Ok(())
+    })?;
+    let meta = txn.open_db(Some(TABLE_META))?;
+    crate::schema::del_if_present(&txn, meta, crate::meta::KEY_STATE_ROOT)?;
+    txn.commit()?;
+    Ok(())
+}
+
 /// Build the hashed-state mirror and the account and storage tries from
 /// the plain state tables. Returns the world-state root.
 ///

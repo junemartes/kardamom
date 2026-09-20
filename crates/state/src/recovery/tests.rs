@@ -174,3 +174,27 @@ fn incremental_block_on_bootstrapped_trie_matches_oracle() {
         "incremental block on a bootstrapped trie must match the oracle"
     );
 }
+
+/// A stripped image is the shape of an executor's state: no mirror, no
+/// stored root, and a clean integrity sweep. A validator that adopts it
+/// sees no trie and runs its bootstrap, which lands on the same root.
+#[test]
+fn a_stripped_image_has_no_trie_and_bootstraps_to_the_same_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = StateEnvBuilder::new(dir.path()).open().unwrap();
+    crate::testing::put_plain_accounts(&env, &[(Address::repeat_byte(0x11), 3, 100)]);
+    let root = bootstrap_trie_from_state(&env).unwrap();
+    assert!(has_trie(&env).unwrap());
+
+    strip_trie(&env).unwrap();
+
+    assert!(!has_trie(&env).unwrap());
+    assert_eq!(
+        crate::StateSnapshot::open(&env)
+            .unwrap()
+            .state_root()
+            .unwrap(),
+        None
+    );
+    assert_eq!(bootstrap_trie_from_state(&env).unwrap(), root);
+}

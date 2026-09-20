@@ -8,7 +8,7 @@ use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use kardamom_batcher::batch::{ClosedBlock, RecordedTx};
 use kardamom_batcher::batcher::{BatcherConfig, pack_blocks};
-use kardamom_batcher::frame::{BlockFrame, TxFrame};
+use kardamom_batcher::frame::{BlockCursor, BlockFrame, TxFrame};
 use kardamom_batcher::recon::reconstruct;
 use kardamom_types::{BPosition, TxEnvelope};
 use proptest::prelude::*;
@@ -37,7 +37,8 @@ fn arb_block(number: u64, n_txs: usize, raw_len: usize) -> ClosedBlock {
     ClosedBlock {
         block_number: number,
         l2_timestamp: 1_700_000_000 + number,
-        end_tx_idx: BPosition::from_index(0),
+        end_tx_idx: BPosition::from_index(number * 100),
+        l1_origin: number,
         remote_epochs: Vec::new(),
         txs,
     }
@@ -47,6 +48,10 @@ fn to_block_frame(b: &ClosedBlock) -> BlockFrame {
     BlockFrame {
         block_number: b.block_number,
         l2_timestamp: b.l2_timestamp,
+        cursor: Some(BlockCursor {
+            end_tx_idx: b.end_tx_idx.as_index(),
+            l1_origin: b.l1_origin,
+        }),
         remote_epochs: b.remote_epochs.clone(),
         txs: b
             .txs

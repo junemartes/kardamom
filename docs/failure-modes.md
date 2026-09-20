@@ -333,6 +333,18 @@ the reconstructed root is byte-identical to the canonical one. The
 (anvil): post → discard the originals → read L1 → fetch blobs → re-execute →
 assert root parity.
 
+**The rebuilt state is resumable.** A KAR1 version 3 block carries its
+canonical end index and its L1 origin, which the rest of the payload cannot
+give: epoch markers and deposits take canonical slots and never reach the
+blob. So the rebuilt cursor, header rows and receipt positions equal the live
+chain's, and `--executor-image` writes the image an executor resumes on (the
+trie, the hashed mirror and the stored root removed, after the root check).
+The sealer refuses a resume whose index lies outside the block it names, so
+a wrong cursor is loud. A state rebuilt through a version 2 blob is correct
+and not resumable. See `docs/specs/2026-09-20-rejoin-from-l1-rebuild.md`,
+which also gives the flag-day procedure for a wiped sealer set and the seed
+hook that would replace it.
+
 Scope: L2 transactions. Deposits are absent from the DA payload (the batcher
 skips `DepositRef`s) but are independently re-derivable from L1 `DepositInitiated`
 events via the `da_watcher` path — interleaving them into the reconstruction is
