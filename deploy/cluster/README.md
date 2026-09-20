@@ -68,11 +68,16 @@ Q-of-N recorder design is preserved, marked superseded, in
 
 ## Host prerequisites
 
-**Quickest path:** from the repo root, `just cluster-bootstrap` installs the
-host tools below for your platform, and `just cluster-doctor` verifies them.
+**Quickest path:** from the repo root, `mise trust` then `mise run setup`
+installs the pinned CLI tools and Ansible collections. See the root
+[quick start](../../README.md#quick-start) for shell activation and native
+prerequisites. Install and start Docker separately, then run
+`mise exec -- just cluster-doctor` to check the host.
+`just cluster-bootstrap` remains available for OS-level installation.
 
 - Ansible (`ansible-playbook`) + collections:
-  `ansible-galaxy collection install ansible.posix community.docker community.general`.
+  `ansible-galaxy collection install -r deploy/cluster/ansible/requirements.yml`
+  from the repository root.
 - Docker (with the Buildx plugin) for the node containers and the image
   builds. The daemon must run privileged containers; on macOS or Windows
   that is Docker Desktop's Linux VM.

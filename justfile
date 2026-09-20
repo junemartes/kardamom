@@ -378,8 +378,8 @@ cluster-bootstrap:
         ;;
     esac
     # Ansible Galaxy collections the playbook depends on.
-    echo ">> installing ansible collections (ansible.posix, community.docker)"
-    ansible-galaxy collection install ansible.posix community.docker community.general
+    echo ">> installing ansible collections (ansible.posix, community.docker, community.general)"
+    ansible-galaxy collection install -r deploy/cluster/ansible/requirements.yml
     echo ">> cluster-bootstrap complete. Verify with: just cluster-doctor"
     echo
     echo "   Images are pushed from inside the control node (REGISTRY_PUSH_NODE),"
@@ -400,7 +400,7 @@ cluster-doctor:
     chk docker "run 'just cluster-bootstrap'"
     chk nomad "run 'just cluster-bootstrap' — Ansible uses Nomad to compile job specs"
     chk tofu "install OpenTofu 1.12.6 — terraform/containers creates the node containers"
-    for col in ansible.posix community.docker; do
+    for col in ansible.posix community.docker community.general; do
         if ansible-galaxy collection list 2>/dev/null | grep -q "^$col "; then
             echo "  ok    ansible collection $col"
         else
