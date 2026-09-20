@@ -227,23 +227,65 @@ async fn install_rebuilt_image(
     Ok(())
 }
 
-/// Copy the image into the node's empty state directory, with the owner
-/// the directory has. The lock file belongs to the process that wrote
-/// the image, so it stays behind.
+/// The owner and the mode of a node's state directory, as `stat` prints
+/// them: what the executor's own writer left there.
+struct DirMeta {
+    owner: String,
+    mode: String,
+}
+
+impl DirMeta {
+    const STATE: &'static str = "/opt/kardamom/state";
+
+    async fn read(h: &Harness, ctx: &str, node: &str) -> anyhow::Result<Self> {
+        let out = h
+            .nodes
+            .exec(node, &format!("stat -c '%u:%g %a' {}", Self::STATE))
+            .await
+            .map_err(|e| {
+                crate::chaos_fail!("{ctx}: could not stat the state dir on {node}: {e}")
+            })?;
+        let mut fields = out.split_whitespace();
+        let (Some(owner), Some(mode)) = (fields.next(), fields.next()) else {
+            return Err(crate::chaos_fail!(
+                "{ctx}: unexpected stat output for the state dir on {node}: {out:?}"
+            ));
+        };
+        Ok(Self {
+            owner: owner.to_string(),
+            mode: mode.to_string(),
+        })
+    }
+
+    /// The script that gives the installed image this owner and mode. A
+    /// copy from the host carries the host's owner and the 0700 mode of a
+    /// temp directory onto the state directory itself, and mdbx opens a
+    /// database it cannot write as read-only, which the executor refuses.
+    fn restore_script(&self) -> String {
+        format!(
+            "rm -f {dir}/mdbx.lck && chown -R {owner} {dir} && chmod {mode} {dir} && chmod -R u+rwX {dir} && test -s {dir}/mdbx.dat",
+            dir = Self::STATE,
+            owner = self.owner,
+            mode = self.mode
+        )
+    }
+}
+
+/// Copy the image into the node's empty state directory, then give it
+/// the owner and the mode the directory had. The lock file belongs to
+/// the process that wrote the image, so it stays behind.
 async fn install_image(h: &Harness, ctx: &str, node: &str, image: &Rebuilt) -> anyhow::Result<()> {
+    let meta = DirMeta::read(h, ctx, node).await?;
     let source = format!("{}/.", image.state_dir.display());
     h.nodes
-        .docker_ok(&["cp", &source, &format!("{node}:/opt/kardamom/state/")])
+        .docker_ok(&["cp", &source, &format!("{node}:{}/", DirMeta::STATE)])
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: could not copy the image to {node}: {e}"))?;
-    wipe_dirs(
-        h,
-        node,
-        ctx,
-        "rm -f /opt/kardamom/state/mdbx.lck && chown -R \"$(stat -c %u:%g /opt/kardamom/state)\" /opt/kardamom/state && test -s /opt/kardamom/state/mdbx.dat",
-    )
-    .await?;
-    crate::log(format!("{ctx}: image installed on {node}"));
+    wipe_dirs(h, node, ctx, &meta.restore_script()).await?;
+    crate::log(format!(
+        "{ctx}: image installed on {node} (owner {}, mode {})",
+        meta.owner, meta.mode
+    ));
     Ok(())
 }
 
