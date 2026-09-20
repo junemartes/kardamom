@@ -100,6 +100,19 @@ impl<T> PartitionState<T> {
         self.next.get(&sender).copied()
     }
 
+    /// The buffered refs below their sender's floor, over every sender.
+    /// Such a ref is invisible: the drain starts at the floor, the entry
+    /// has no deadline, and a fresh submit at its nonce is a past nonce.
+    /// The floor rules keep this at zero; a nonzero value is a defect in
+    /// a rewind or a floor update, and the sender is stuck.
+    #[must_use]
+    pub(crate) fn refs_below_floor(&self) -> usize {
+        self.pending
+            .iter()
+            .map(|(sender, buf)| buf.count_below(self.next_nonce(*sender)))
+            .sum()
+    }
+
     pub(crate) fn seed_next_nonce(&mut self, sender: Address, n: u64) {
         self.next.insert(sender, n);
     }

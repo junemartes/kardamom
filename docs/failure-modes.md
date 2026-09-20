@@ -176,6 +176,13 @@ still passed.
   publication is durable can lose that tx. The `on-quorum` gate (ack only
   after the Raft cluster commits) exists for when that window matters.
 
+**Receipts across an ingress restart.** The receipt cache lives in the
+memory of one ingress process, so a restarted ingress holds no receipt from
+before its start. `eth_getTransactionReceipt` therefore asks an executor's
+state DB on a cache miss, and a receipt found there enters the cache. The
+`ingress-pair-loss-recover` chaos case kills both ingresses under load and
+requires every accepted transaction's receipt afterwards.
+
 ## Sequencer (2 shards × 2 racing replicas)
 
 Each shard is served by two active/active replicas on different nodes (Nomad
@@ -508,15 +515,18 @@ check would pass against a feature that activated once and stopped.
   `AttestingReceiptSink`, which tees leaves off the receipt stream (where the
   logs actually are) and flushes them per block boundary. Regression-tested
   end-to-end by `s2_bridge_withdrawal_round_trip`.
-- **The persisted `receipts` / `tx_hash_index` tables are always empty** —
-  same root cause, still open. Because `BlockDelta.receipts` is always empty,
-  the state writer never populates either table, so
-  `StateDatabase::{get_receipt, get_tx_position}` can only ever return `None`
-  and the documented "`eth_getTransactionReceipt(hash)` → `get_tx_position` →
-  `get_receipt`" read path cannot work. Receipts survive only in the ingress's
-  in-RAM cache, so a restart loses them. Populating the delta's receipts on
-  the executor's commit path would fix it, but it adds a per-tx clone to the
-  hot path — worth its own PR with a saturation run.
+- ~~**The persisted `receipts` / `tx_hash_index` tables are always empty**~~
+  — **CLOSED**. The executor's commit path fills the block delta's receipts
+  (`exec_boundary.rs`), so the state writer populates both tables; the
+  end-of-shard persisted-state audit requires a non-empty `receipts` table
+  and compares it across every executor and the validator. The read path
+  "`eth_getTransactionReceipt(hash)` → `get_tx_position` → `get_receipt`" is
+  live: the executor's query endpoint serves it, and the ingress falls back
+  to it when its own receipt cache misses. So a receipt survives an ingress
+  restart, and a client that got a hash from an accepted submit finds its
+  receipt afterwards. The fallback is bounded by the client's token bucket,
+  the query client's in-flight bound and its timeout; a shed query answers
+  `null`, the same as "not committed yet".
 - ~~**Validator ignores SIGTERM**~~ — **FIXED** (found by the
   chain-semantics suite's graceful-shutdown phase). The validator survived
   90 s+ of a single SIGTERM while the executor exited immediately from the

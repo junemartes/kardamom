@@ -253,6 +253,28 @@ fn a_second_rewind_batch_of_higher_nonces_keeps_the_lower_floor() {
 }
 
 #[test]
+fn refs_below_the_floor_count_only_what_a_drain_cannot_reach() {
+    let mut st: PartitionState<u32> = PartitionState::new(8, TTL);
+    for n in 0..4u64 {
+        st.process(s(1), n, 0);
+    }
+    for n in [3u64, 2, 1, 0] {
+        st.reinsert_for_retry(s(1), n, 0);
+    }
+    assert_eq!(
+        st.refs_below_floor(),
+        0,
+        "a rewound run drains from its floor"
+    );
+    // A floor seeded over the run is the defect the gauge exists for.
+    st.seed_next_nonce(s(1), 2);
+    assert_eq!(st.refs_below_floor(), 2);
+    // A future nonce of another sender is above its floor.
+    st.process(s(2), 5, 0);
+    assert_eq!(st.refs_below_floor(), 2);
+}
+
+#[test]
 fn a_rewind_of_a_cold_sender_seeds_the_floor_at_its_nonce() {
     let mut st: PartitionState<u32> = PartitionState::new(8, TTL);
     st.reinsert_for_retry(s(1), 7, 70);
