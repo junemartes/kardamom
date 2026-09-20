@@ -159,6 +159,21 @@ final class SealerEgress {
             final long fromBlock,
             final long upToIndex,
             final long upToBlock) {
+        final long lowerEnd = retainedBoundaryEnd(fromBlock - 1);
+        final long upperEnd = retainedBoundaryEnd(fromBlock);
+        if (!cursorInsideBlock(fromIndex, lowerEnd, upperEnd)) {
+            // A consumer resumes at a record index and a block number. The
+            // two select frames on separate axes, so a pair that does not
+            // name one point of the stream skips records, or applies them
+            // twice, and no consumer-side check can see it: the consumer
+            // seeds every counter from the same cursor. This member holds
+            // the boundaries, so it is the one place that can refuse.
+            System.out.println("cluster REPLAY memberId=" + memberId
+                + " session=" + session.id() + " from=(" + fromIndex + "," + fromBlock
+                + ") SKEWED block " + fromBlock + " spans (" + lowerEnd + "," + upperEnd + ")");
+            offerControl(session, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE, firstRetainedIndex, firstRetainedBlock);
+            return;
+        }
         if (fromIndex < firstRetainedIndex || fromBlock < firstRetainedBlock) {
             // Log to stdout, like the role lines, so the chaos suite can grep
             // it next to its other signals. The service has no other logger.
@@ -189,6 +204,37 @@ final class SealerEgress {
             + ") served=" + served + " dropped=" + dropped
             + " retained=" + retained.size());
         offerControl(session, SealerWire.EGRESS_KIND_REPLAY_DONE, upToIndex, upToBlock);
+    }
+
+    /** Byte offset of {@code endTxIdx} in a boundary frame: after the kind and the block number. */
+    private static final int BOUNDARY_END_OFFSET = Byte.BYTES + Long.BYTES;
+
+    /**
+     * The end index of the retained boundary of {@code block}, or -1 when
+     * this member does not retain it: block 0 has no boundary, an old one
+     * aged out, and the open block has none yet.
+     */
+    private long retainedBoundaryEnd(final long block) {
+        for (final RetainedFrame f : retained) {
+            if (f.boundary && f.key == block) {
+                return java.nio.ByteBuffer.wrap(f.frame)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .getLong(BOUNDARY_END_OFFSET);
+            }
+        }
+        return -1L;
+    }
+
+    /**
+     * Whether a resume at {@code fromIndex} lies inside the block it names.
+     * {@code lowerEnd} is the end index of the block before it, and
+     * {@code upperEnd} the end index of the block itself; -1 means this
+     * member does not retain that boundary, and that side is not checked.
+     * A cold start sends the lower end exactly. A reconnect inside an open
+     * block sends an index between the two.
+     */
+    static boolean cursorInsideBlock(final long fromIndex, final long lowerEnd, final long upperEnd) {
+        return (lowerEnd < 0 || fromIndex >= lowerEnd) && (upperEnd < 0 || fromIndex <= upperEnd);
     }
 
     /** Frame and offer a control message {@code kind(1) | a(8) | b(8)}. */
