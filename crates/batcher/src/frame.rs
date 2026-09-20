@@ -78,7 +78,11 @@ use kardamom_types::xchain::{Callback, NonEmptyVec, RemoteEpochRecord, XChainMes
 use crate::error::BatcherError;
 
 pub const MAGIC: [u8; 4] = *b"KAR1";
-pub const VERSION: u8 = 2;
+/// The current version. A block carries its [`BlockCursor`].
+pub const VERSION: u8 = 3;
+/// The version before the cursor. Old blobs on L1 stay readable; a
+/// state rebuilt through such a block has no resume cursor.
+pub const VERSION_NO_CURSOR: u8 = 2;
 pub const FLAG_ZSTD: u8 = 0x01;
 
 const HEADER_LEN: usize = 4 + 1 + 1 + 4 + 2;
@@ -91,10 +95,31 @@ pub struct TxFrame {
     pub raw_tx: Bytes,
 }
 
+/// Where a block ends on the canonical stream, and the L1 block it
+/// derives from. Neither enters the state trie, and neither is
+/// derivable from the rest of the payload: epoch markers and deposits
+/// take canonical slots and never reach the blob. A consumer resumes
+/// from the end index, so a state rebuilt from L1 needs the true one.
+///
+/// The field is not part of the records commitment, so L1 does not
+/// authenticate it. The sealer checks the index against its own
+/// boundary before it serves a resume, so a wrong value is a refusal
+/// and not a silent skip.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlockCursor {
+    /// The count of canonical records through the end of the block: the
+    /// boundary's exclusive end index.
+    pub end_tx_idx: u64,
+    /// The L1 block number of the newest epoch at or before the block.
+    pub l1_origin: u64,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BlockFrame {
     pub block_number: u64,
     pub l2_timestamp: u64,
+    /// `None` only for a block decoded from a version 2 blob.
+    pub cursor: Option<BlockCursor>,
     /// Remote-epoch records LEADING this block, in canonical-stream order.
     /// Their messages execute (as 0x7D txs) at the head of the block, before
     /// `txs` — the reconstruction replay preserves exactly that order.
@@ -111,6 +136,24 @@ pub struct Kar1Payload {
     pub compressed: bool,
 }
 
+impl Kar1Payload {
+    /// The version the blocks encode as: 3 when every block carries its
+    /// cursor, 2 when none does. One payload is one version.
+    fn version(&self) -> Result<u8, BatcherError> {
+        let with_cursor = self.blocks.iter().filter(|b| b.cursor.is_some()).count();
+        if with_cursor == self.blocks.len() {
+            return Ok(VERSION);
+        }
+        if with_cursor == 0 {
+            return Ok(VERSION_NO_CURSOR);
+        }
+        Err(BatcherError::Frame(format!(
+            "{with_cursor} of {} blocks carry a cursor; a payload is one version",
+            self.blocks.len()
+        )))
+    }
+}
+
 /// Encode a [`Kar1Payload`] to its KAR1 byte form.
 ///
 /// # Errors
@@ -121,9 +164,9 @@ pub fn encode(payload: &Kar1Payload) -> Result<Vec<u8>, BatcherError> {
         .len()
         .try_into()
         .map_err(|_| BatcherError::Frame("block_count overflows u32".into()))?;
-    let mut enc = FrameWriter::new(HEADER_LEN + payload.blocks.len() * 24);
+    let mut enc = FrameWriter::new(HEADER_LEN + payload.blocks.len() * 40);
     enc.0.extend_from_slice(&MAGIC);
-    enc.0.push(VERSION);
+    enc.0.push(payload.version()?);
     enc.0.push(if payload.compressed { FLAG_ZSTD } else { 0 });
     enc.0.extend_from_slice(&block_count.to_le_bytes());
     enc.0.extend_from_slice(&0u16.to_le_bytes());
@@ -160,6 +203,10 @@ impl FrameWriter {
             .map_err(|_| BatcherError::Frame("remote_epoch_count overflows u32".into()))?;
         self.0.extend_from_slice(&block.block_number.to_le_bytes());
         self.0.extend_from_slice(&block.l2_timestamp.to_le_bytes());
+        if let Some(cursor) = block.cursor {
+            self.0.extend_from_slice(&cursor.end_tx_idx.to_le_bytes());
+            self.0.extend_from_slice(&cursor.l1_origin.to_le_bytes());
+        }
         self.0.extend_from_slice(&remote_epoch_count.to_le_bytes());
         block
             .remote_epochs
@@ -268,11 +315,7 @@ pub fn decode(bytes: &[u8]) -> Result<Kar1Payload, BatcherError> {
         return Err(BatcherError::Frame(format!("bad magic: {magic:?}")));
     }
     let version = r.read_u8()?;
-    if version != VERSION {
-        return Err(BatcherError::Frame(format!(
-            "unsupported version: {version}"
-        )));
-    }
+    let layout = BlockLayout::of(version)?;
     let flags = r.read_u8()?;
     let compressed = (flags & FLAG_ZSTD) != 0;
     let block_count = r.read_u32_le()?;
@@ -281,11 +324,30 @@ pub fn decode(bytes: &[u8]) -> Result<Kar1Payload, BatcherError> {
     let blocks = (0..block_count).try_fold(
         Vec::with_capacity(r.capacity_hint(block_count, MIN_BLOCK_FRAME_BYTES)),
         |mut acc, _| -> Result<_, BatcherError> {
-            acc.push(r.decode_block_frame()?);
+            acc.push(r.decode_block_frame(layout)?);
             Ok(acc)
         },
     )?;
     Ok(Kar1Payload { blocks, compressed })
+}
+
+/// What a block header holds, by payload version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockLayout {
+    /// Version 2: block number and timestamp.
+    NoCursor,
+    /// Version 3: the cursor follows the timestamp.
+    WithCursor,
+}
+
+impl BlockLayout {
+    fn of(version: u8) -> Result<Self, BatcherError> {
+        match version {
+            VERSION => Ok(Self::WithCursor),
+            VERSION_NO_CURSOR => Ok(Self::NoCursor),
+            other => Err(BatcherError::Frame(format!("unsupported version: {other}"))),
+        }
+    }
 }
 
 /// Holds only the unread remainder of the buffer, so no position field
@@ -344,9 +406,10 @@ impl<'a> Reader<'a> {
     /// Decode one [`BlockFrame`]: its header, then its remote-epoch and
     /// tx sections. Its own method so [`decode`]'s block loop does not
     /// nest a loop inside a loop.
-    fn decode_block_frame(&mut self) -> Result<BlockFrame, BatcherError> {
+    fn decode_block_frame(&mut self, layout: BlockLayout) -> Result<BlockFrame, BatcherError> {
         let block_number = self.read_u64_le()?;
         let l2_timestamp = self.read_u64_le()?;
+        let cursor = self.decode_cursor(layout)?;
         let remote_epoch_count = self.read_u32_le()?;
         let remote_epochs = (0..remote_epoch_count).try_fold(
             Vec::with_capacity(
@@ -368,9 +431,21 @@ impl<'a> Reader<'a> {
         Ok(BlockFrame {
             block_number,
             l2_timestamp,
+            cursor,
             remote_epochs,
             txs,
         })
+    }
+
+    /// The block's cursor, when the version carries one.
+    fn decode_cursor(&mut self, layout: BlockLayout) -> Result<Option<BlockCursor>, BatcherError> {
+        if layout == BlockLayout::NoCursor {
+            return Ok(None);
+        }
+        Ok(Some(BlockCursor {
+            end_tx_idx: self.read_u64_le()?,
+            l1_origin: self.read_u64_le()?,
+        }))
     }
 
     /// Decode one [`TxFrame`]. Its own method so [`Self::decode_block_

@@ -34,6 +34,7 @@ pub use integrity::{IntegrityReport, deep_compare, deep_compare_to, sweep};
 pub use nonce_query::{CommittedAccount, NonceQueryServer, committed_account, serve_nonce_queries};
 pub use recovery::{
     RecoveryPoint, bootstrap_trie_from_state, has_trie, read_all_headers, read_recovery_point,
+    strip_trie,
 };
 pub use snapshot::StateSnapshot;
 pub use swap::{SnapshotHandle, SnapshotReceiver, channel as snapshot_channel};

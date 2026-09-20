@@ -35,6 +35,7 @@ fn make_block(n_txs: usize, raw_len: usize) -> ClosedBlock {
             term_id: 0,
             term_offset: 0,
         },
+        l1_origin: 0,
         remote_epochs: vec![],
         txs,
     }
