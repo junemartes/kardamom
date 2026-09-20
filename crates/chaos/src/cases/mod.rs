@@ -54,10 +54,11 @@ pub enum Case {
     RedisPrimaryFreeze,
     RedisPrimaryKill,
     RedisPartitionIngress,
+    RedisTotalLossRecover,
     MirrorKillRebuild,
 }
 
-const ALL: [Case; 34] = [
+const ALL: [Case; 35] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -91,6 +92,7 @@ const ALL: [Case; 34] = [
     Case::RedisPrimaryFreeze,
     Case::RedisPrimaryKill,
     Case::RedisPartitionIngress,
+    Case::RedisTotalLossRecover,
     Case::MirrorKillRebuild,
 ];
 
@@ -144,6 +146,7 @@ impl Case {
             Self::RedisPrimaryFreeze => "redis-primary-freeze",
             Self::RedisPrimaryKill => "redis-primary-kill",
             Self::RedisPartitionIngress => "redis-partition-ingress",
+            Self::RedisTotalLossRecover => "redis-total-loss-recover",
             Self::MirrorKillRebuild => "mirror-kill-rebuild",
         }
     }
@@ -182,7 +185,11 @@ impl Case {
             }
             // The mirrors restart, wait for a checkpoint, and rebuild.
             Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_secs(600),
-            Self::NodeReplaceExecutor => inject + k.reschedule_slo + Duration::from_secs(420),
+            // The node replacement; or the Redis loss, the job's return,
+            // then three rebuilds.
+            Self::NodeReplaceExecutor | Self::RedisTotalLossRecover => {
+                inject + k.reschedule_slo + Duration::from_secs(420)
+            }
             Self::NodeReplaceSealer => {
                 inject + k.reschedule_slo + k.rejoin_slo + Duration::from_secs(300)
             }
@@ -264,6 +271,7 @@ impl Case {
             Self::RedisPrimaryFreeze => cache::redis_primary_freeze(h).await,
             Self::RedisPrimaryKill => cache::redis_primary_kill(h).await,
             Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,
+            Self::RedisTotalLossRecover => cache::redis_total_loss_recover(h).await,
             Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
         }
     }
