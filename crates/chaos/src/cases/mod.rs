@@ -205,9 +205,7 @@ impl Case {
             Self::NodeReplaceExecutor
             | Self::RedisTotalLossRecover
             | Self::ExecutorFleetTotalWipeRecover
-            | Self::PipelineBlackoutRecover => {
-                inject + k.reschedule_slo + Duration::from_secs(420)
-            }
+            | Self::PipelineBlackoutRecover => inject + k.reschedule_slo + Duration::from_secs(420),
             Self::NodeReplaceSealer => {
                 inject + k.reschedule_slo + k.rejoin_slo + Duration::from_secs(300)
             }
