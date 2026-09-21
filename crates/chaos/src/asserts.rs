@@ -264,40 +264,54 @@ impl Harness {
         FleetSample { blocks }
     }
 
-    /// Both ingress exporters must answer: real liveness, not a Nomad
-    /// row count.
+    /// Both ingress exporters and both JSON-RPC listeners must answer: real
+    /// liveness, not a Nomad row count.
+    ///
+    /// The exporter alone is not enough. A restarted ingress starts its
+    /// exporter first and binds the JSON-RPC port after it connects to the
+    /// cluster, 27 s later in one CI run. The recovery probe calls the RPC
+    /// once, so a gate that reads only the exporter lets the probe meet a
+    /// refused connection.
     ///
     /// # Errors
     ///
-    /// Returns an error if a replica's exporter stays dark for 120s.
+    /// Returns an error if a replica's exporter or RPC stays dark for 120s.
     pub async fn assert_ingress_pair_live(&self, case: &str) -> anyhow::Result<()> {
         let outcome = poll::until(Budget::secs(120, 5), |_| async move {
-            Ok(self.dark_ingress().await.is_none().then_some(()))
+            Ok(self.dark_ingress().await?.is_none().then_some(()))
         })
         .await?;
         outcome.or_fail(|t| {
             crate::chaos_fail!(
-                "{case}: an ingress replica exporter is dark after {}s (pair not fully recovered)",
+                "{case}: an ingress replica exporter or JSON-RPC is dark after {}s (pair not fully recovered)",
                 t.as_secs()
             )
         })?;
-        crate::log(format!("{case}: both ingress exporters live"));
+        crate::log(format!("{case}: both ingress exporters and RPCs live"));
         Ok(())
     }
 
-    /// The first ingress replica whose exporter does not answer.
-    async fn dark_ingress(&self) -> Option<String> {
+    /// The first ingress replica whose exporter or JSON-RPC does not answer.
+    async fn dark_ingress(&self) -> anyhow::Result<Option<String>> {
         for node in &self.probes.ingresses {
-            if !self
-                .probes
-                .scrape()
-                .answers(&self.probes.ingress_target(node))
-                .await
-            {
-                return Some(node.container.clone());
+            if !self.ingress_answers(node).await? {
+                return Ok(Some(node.container.clone()));
             }
         }
-        None
+        Ok(None)
+    }
+
+    async fn ingress_answers(&self, node: &crate::probes::Probed) -> anyhow::Result<bool> {
+        let exporter = self
+            .probes
+            .scrape()
+            .answers(&self.probes.ingress_target(node))
+            .await;
+        let url = format!("http://{}:{}", node.ip, crate::harness::INGRESS_RPC_PORT);
+        let rpc = crate::rpc::Rpc::new(&url, self.knobs.chain_id)?
+            .answers()
+            .await;
+        Ok(exporter && rpc)
     }
 
     /// The must-not-progress check: the executor block gauge stays flat
