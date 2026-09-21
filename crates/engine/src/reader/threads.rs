@@ -448,6 +448,15 @@ where
             TxOrderingMessage::TxRef(tx_ref) => self.on_tx_ref(tx_ref, position),
             TxOrderingMessage::Epoch(epoch) => self.expand_epoch(epoch, position),
             TxOrderingMessage::RemoteEpoch(rec) => self.expand_remote_epoch(rec, position),
+            // This reader sends every entry it passes to the executor, so a
+            // void record that arrives here names an entry that this replica
+            // executed. The replica and the canonical order disagree. Stop.
+            // The sealer appends no void record until a reader can ask for
+            // one, and that reader also learns to drop the entry.
+            TxOrderingMessage::Void(void) => Err(ExecutorError::VoidOfExecutedEntry {
+                index: void.index,
+                tx_hash: void.tx_hash,
+            }),
             TxOrderingMessage::DepositRef(dep_ref) => {
                 // A ref here means the stream carries deposits outside an
                 // epoch record. This chain derives all deposits from

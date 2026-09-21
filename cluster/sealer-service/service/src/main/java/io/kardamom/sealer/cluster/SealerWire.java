@@ -110,6 +110,35 @@ public final class SealerWire {
      * {@code docs/specs/interop-outbox-messaging-spec.md} §7.</p>
      */
     public static final byte KIND_REMOTE_ORIGIN_RECORD = 5;
+    /**
+     * Void request:
+     * {@code [kind:6][voter_id:u8][index:u64 LE][tx_hash:32]}. A
+     * canonical-stream consumer sends it when the entry at {@code index} has
+     * no envelope and every archive refuses the range. The request is a
+     * vote. The service appends an {@link #RT_VOID} record only when every
+     * configured voter has asked for the same {@code (index, tx_hash)}. A
+     * session has no identity, so the frame carries the voter id. Matches
+     * Rust {@code KIND_VOID_REQUEST}.
+     */
+    public static final byte KIND_VOID_REQUEST = 6;
+
+    /** Offset of the u8 voter id within a {@link #KIND_VOID_REQUEST} frame. */
+    static final int VOID_VOTER_OFFSET = KIND_OFFSET + Byte.BYTES;
+    /** Offset of the u64 LE canonical index within a {@link #KIND_VOID_REQUEST} frame. */
+    static final int VOID_INDEX_OFFSET = VOID_VOTER_OFFSET + Byte.BYTES;
+    /** Offset of the 32-byte transaction hash within a {@link #KIND_VOID_REQUEST} frame. */
+    static final int VOID_HASH_OFFSET = VOID_INDEX_OFFSET + Long.BYTES;
+    /** Exact length of a {@link #KIND_VOID_REQUEST} frame. */
+    static final int MIN_VOID_REQUEST_LEN =
+        VOID_HASH_OFFSET + CanonicalSealerState.CANONICAL_ID_LEN;
+
+    /**
+     * Record type of a void record inside a relayed payload:
+     * {@code [tx_hash:32][record_type:4][index:u64 LE]}. The service
+     * generates this record itself. It removes the transaction reference at
+     * {@code index} from the chain. Matches Rust {@code RT_VOID}.
+     */
+    public static final byte RT_VOID = 4;
 
     /** Offset of the 32-byte canonical id in a {@link #KIND_ORIGIN_RECORD} frame. */
     static final int ORIGIN_ID_OFFSET = KIND_OFFSET + Byte.BYTES;
