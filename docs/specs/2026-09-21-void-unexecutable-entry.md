@@ -107,7 +107,7 @@ The validator uses the engine reader, so site 4 covers it. No change: the DA fra
 `kardamom-reconstruct`, the guest, the `Receipt` type.
 
 Wire changes: one ingress kind, one record type. The count of the match sites of
-`TxOrderingMessage` outside the tests is 25 lines in 8 files.
+`TxOrderingMessage` outside the tests is 23 lines in 6 files, plus 4 lines in 2 test kits.
 
 ## 5. Failure cases
 
