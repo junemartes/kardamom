@@ -106,6 +106,34 @@ is left, or when the roles fail together:
   the sealer had ordered a reference to data that was lost with the nodes.
   The chain is wedged for good. It joins the shard with that fix.
 
+**Removal of an entry that no consumer can execute (void).** The sealer
+orders a transaction reference before the archives make its data durable, so
+a failure such as the blackout above can leave an entry with no data. The
+sealer can remove such an entry with a canonical *void record*. The rule has
+no clock in it:
+
+- A consumer votes (`KIND_VOID_REQUEST`) only after the join budget ends and
+  every archive refuses the range. A consumer that has the data never votes.
+- The sealer appends the void record only when **every** configured voter has
+  voted for the same `(index, tx_hash)`. One voter that is down blocks the
+  void, and the chain waits for it. This is the safe side: that voter can be
+  the one that executed the entry.
+- On a void the sealer removes the hash from its dedup window and sets the
+  sender's expected nonce back, so the sender can submit the same bytes again.
+
+Three constants bound the rule. Every member must run the same values.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `kardamom.cluster.voidVoters` | empty | The voter ids. Empty refuses every vote, which is the behavior before this rule. |
+| `kardamom.cluster.voidWindow` | 65536 (the egress retention) | The newest indices that a void can name. An older entry cannot be removed. |
+| `MAX_OPEN_VOTES` | 1024 | The most indices with open votes. More are refused. |
+
+The order path pays one 52-byte copy for each reference and no allocation.
+The votes and the window are in the snapshot (version 6). Status: the sealer
+side exists. No consumer votes yet, so `pipeline-blackout-recover` still
+fails until the consumer side lands.
+
 **Durability of the Raft log.** The kill-based cases above prove the
 restart logic, not the durability against a power loss: a process kill or a
 container kill leaves the host kernel and its page cache alive, so every
