@@ -114,13 +114,18 @@ and blocks in `JoinWait`. The new reader does this at a lost entry `i`:
 - On `Void(i)` it removes the hash from `DedupWindow`, drops entry `i`, and drains the queue in
   order.
 - When the envelope arrives first, it executes entry `i` and drains the queue in order.
-- When the queue is full, the reader stops reading. The sealer sees back-pressure as it does
-  today for a slow consumer. The bound is a count of messages and is a new constant.
+- The reader must keep reading while it waits. If it stops, its position falls out of the
+  egress retention of the sealer (65536 frames), the sealer answers `REPLAY_UNAVAILABLE`, and
+  the consumer stops for a full resync. So the bound of the queue is the egress retention:
+  65536 messages, about 5 MB. When the queue is full, the reader exits as it does today on a
+  join timeout.
 
 Two rules complete the follower:
 
-- A dropped entry and its void record each take one canonical slot. The index counter of the
-  reader moves on for the two slots, so `end_tx_idx` of the block boundary stays correct.
+- A dropped entry and its void record each take one canonical slot. The executor counts every
+  slot (`expected_tx_idx`) and compares the count with `end_tx_idx` at each block boundary. So
+  the reader sends a new message with no transaction, `ReaderToExec::Vacant`, for each of the
+  two slots. The epoch marker is the template. The batcher feed ignores the message.
 - A void record for an index below the resume cursor of the consumer is ignored. The
   checkpoint of the consumer is already past that entry, and the reader cannot know whether the
   checkpoint has it. Step 7 of section 3.1 applies only to an entry that this process passed.
@@ -185,6 +190,13 @@ Wire changes: one ingress kind, one record type. The count of the match sites of
   exit. The fix is a peer envelope fetch: the voter that has the bytes serves them. It is a
   follow-up and is not in this design. The blackout case does not need it, because there no
   process has the bytes.
+- **The entry leaves the void window before the last vote.** The window is the newest 65536
+  indices. Sequencers keep ordering while the consumers wait. With live ingress at more than
+  about 1000 records per second and a 60 s join budget, entry `i` leaves the window before the
+  last vote, the sealer refuses the vote, and the chain stops as it does today. In the blackout
+  case the ingress is dead, so the rate is near zero. A wider window is not the fix: each entry
+  is 68 bytes in every snapshot (65536 entries are about 4.4 MB). The fix is a shorter join
+  budget on this path. See question 4.
 - **The ingress still has the transaction.** The chain drops the entry. The sender submits it
   again. A republish by the ingress is a possible later step and is not in this design.
 
@@ -205,7 +217,8 @@ Wire changes: one ingress kind, one record type. The count of the match sites of
    that sender from the windows. Option B needs a sender index in the void table. This design
    uses option A.
 4. **Stall target.** How long can the chain wait at a lost entry? The answer sets the join
-   budget on this path.
+   budget on this path. It also decides whether a void can occur with live ingress: the last
+   vote must arrive before 65536 more records are ordered.
 
 ## 7. Pull request plan (one stack)
 
