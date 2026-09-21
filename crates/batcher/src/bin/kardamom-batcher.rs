@@ -119,6 +119,13 @@ struct Cli {
     #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
     cluster_egress_endpoint: Option<String>,
 
+    /// This batcher's voter id at the sealer. With an id, the batcher asks
+    /// the sealer to void an entry whose `tx_data` every archive refuses.
+    /// With no id, it stops at such an entry. The id must be in the sealer's
+    /// `kardamom.cluster.voidVoters` list.
+    #[arg(long, env = "KARDAMOM_VOID_VOTER_ID")]
+    void_voter_id: Option<u8>,
+
     /// The UDP endpoint on this node where refetched `tx_data` and
     /// `tx_deposits` fragments land (join-miss recovery from the remote
     /// durability archives). If unset, refetch is disabled, and a lost
@@ -324,6 +331,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         log_config: cli.log_config.clone(),
         aeron_dir: cli.aeron_dir.clone(),
         cluster_egress_endpoint: cli.cluster_egress_endpoint.clone(),
+        void_voter_id: cli.void_voter_id,
         replay_destination_endpoint: cli.replay_destination_endpoint.clone(),
         archive_control_response_endpoint: cli.archive_control_response_endpoint.clone(),
         blocks_per_batch: cli.blocks_per_batch,

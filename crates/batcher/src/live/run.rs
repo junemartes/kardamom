@@ -75,6 +75,9 @@ pub struct LiveArgs {
     /// The L2 chain id. See [`BatcherConfig::chain_id`].
     pub chain_id: u64,
     pub cluster_egress_endpoint: Option<String>,
+    /// This batcher's voter id at the sealer; see
+    /// [`ReaderConfig::voter_id`]. `None` never votes.
+    pub void_voter_id: Option<u8>,
     pub replay_destination_endpoint: Option<String>,
     pub archive_control_response_endpoint: Option<String>,
     pub blocks_per_batch: NonZeroUsize,
@@ -218,6 +221,7 @@ impl RunConfig {
         // can fire.
         let reader_cfg = ReaderConfig {
             join_timeout: bin_support::bounded_join_timeout(cursor.next_index > 0),
+            voter_id: args.void_voter_id,
             ..ReaderConfig::default()
         };
         let ordering_handle = TxOrderingReader::spawn(TxOrderingInputs {

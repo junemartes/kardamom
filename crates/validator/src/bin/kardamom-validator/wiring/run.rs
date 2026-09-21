@@ -168,6 +168,7 @@ impl Ready {
         // divergence" log line. See `bounded_join_timeout` for why fresh
         // differs from resume.
         cfg.reader.join_timeout = bin_support::bounded_join_timeout(resuming);
+        cfg.reader.voter_id = args.void_voter_id;
 
         // Parallel validation strategy, opt-in: seeded batches driven by
         // the BAL. `None` keeps the engine's streaming per-tx path

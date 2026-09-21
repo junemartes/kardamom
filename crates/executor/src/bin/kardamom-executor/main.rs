@@ -413,6 +413,7 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     // `bounded_join_timeout` for why the fresh-start bound exceeds
     // resume's.
     cfg.reader.join_timeout = bin_support::bounded_join_timeout(start.is_resume());
+    cfg.reader.voter_id = args.void_voter_id;
 
     let block_exec = wiring::build_block_exec(args);
 
