@@ -32,6 +32,8 @@ public final class ClusterNode {
     static final int APP_VERSION = SemanticVersion.compose(0, 3, 0);
 
     public static void main(final String[] args) {
+        // Every stdout line carries its time from here on (see the class).
+        System.setOut(new TimestampedOut(System.out));
         // "0,ingressHost:port,consensusHost:port,logHost:port,catchupHost:port,archiveHost:port|1,...|2,..."
         final String clusterMembers = System.getProperty("kardamom.cluster.members");
         if (clusterMembers == null) throw new IllegalStateException("kardamom.cluster.members not set");
