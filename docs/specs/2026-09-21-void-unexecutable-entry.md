@@ -40,11 +40,13 @@ makes the decision. The sealer does not read an archive. It counts requests.
 3. When every archive refuses, the consumer sends `VOID_REQUEST(i, tx_hash, voter_id)` to the
    sealer on its cluster session. It sends the request again at an interval until step 6.
 4. The sealer keeps the requests for `i` in its canonical state. The state is in the snapshot.
+   The sealer refuses a request when `i` is not in its void table (section 3.4), when the hash
+   does not agree with the table, or when `i` already has a void record.
 5. When every configured voter has a request for `i`, the sealer appends a `Void(i, tx_hash)`
    record to the canonical order. The record takes one canonical slot, as an epoch record does.
-6. Each consumer reads ahead in the order stream while it waits at `i`. When it finds
-   `Void(i)`, it drops entry `i` and continues. When the envelope arrives first, it executes the
-   entry as usual.
+6. Each consumer reads ahead in the order stream while it waits at `i` (section 3.5). When it
+   finds `Void(i)`, it drops entry `i` and continues. When the envelope arrives first, it
+   executes the entry as usual.
 7. A consumer that finds `Void(i)` for an entry that it executed exits with an error. This
    state is a divergence. It must not be silent.
 
@@ -59,8 +61,15 @@ The voters are the consumers that make durable results from the entry:
 The batcher must be a voter. It posts the transaction bytes to L1. If it has the envelope, it
 never sends a request, so no void occurs, and L1 and the executors agree.
 
+The live batcher uses the engine join path (`crates/batcher/src/live/run.rs`, the same
+`bounded_join_timeout`). So it stops at a lost entry as an executor does, and it is a natural
+voter. The offline `multi_archive_reader.rs` returns an error for a missing envelope. It must
+learn to drop an entry that has a void record.
+
 The voter set is sealer configuration (`kardamom.sealer.void.voters`). A cluster session has no
-identity today, so the request carries the `voter_id`.
+identity today, so the request carries the `voter_id`. The sealer does not authenticate the id.
+One process on the cluster network can send every id. This is the trust level of a sequencer
+session today: the cluster network is the boundary.
 
 ### 3.3 What a void does to the chain
 
@@ -70,25 +79,63 @@ identity today, so the request carries the `voter_id`.
   slot is the same. `kardamom-reconstruct` and the prover read the blob, so they need no change.
 - The sealer must set the expected nonce of the sender back to the nonce of the void entry. If
   it does not, the sealer refuses the new submit with a contiguity reject.
+- The sender submits the same signed bytes again, so the hash is the same. Two dedup windows
+  use the hash as the key: `dedup` in `CanonicalSealerState`, and `DedupWindow` in the engine
+  reader (`first_seen(tx_ref.tx_hash)` runs before the join). A void must remove the hash from
+  the two windows. If it does not, the sealer and each executor drop the new submit as a
+  duplicate.
 - Later entries of the same sender that are already in the order fail the nonce check at
-  execution. This is the behavior for a nonce gap today.
+  execution. This is the behavior for a nonce gap today. Their hashes stay in the dedup
+  windows, so the sender cannot submit the same bytes again while the windows hold them.
+  Section 6 has the question.
 - The ingress must tell the sender. Section 6 has the question.
 
-### 3.4 Coherence property
+### 3.4 The void table in the sealer
+
+A `Relayed` record is `(index, payload)`. The sealer never reads the payload. It knows the
+sender and the nonce only when it orders the ingress record. `expectedNonce` is an LRU map by
+sender, not by index. The request cannot supply the sender or the nonce, because the consumer
+has no envelope.
+
+So the canonical state gets a bounded table: `index -> (canonical id, sender, nonce)`. The
+sealer adds a row for each ingress record (`KIND_INGRESS_RECORD`). Epoch, deposit and remote
+epoch records get no row, so a request for such a slot is refused. The bound is the egress
+retention. A request for an index below the table is refused, as a replay below the retention
+is refused today. The table is a snapshot field.
+
+### 3.5 The read-ahead in the reader
+
+This is the largest code change. Today the reader thread handles one order message at a time
+and blocks in `JoinWait`. The new reader does this at a lost entry `i`:
+
+- It parks entry `i`. It sends no later entry to the executor. The order is total, so no entry
+  of another sender can pass entry `i`.
+- It keeps reading the order stream into a bounded queue. It looks only for `Void(i)`.
+- On `Void(i)` it removes the hash from `DedupWindow`, drops entry `i`, and drains the queue in
+  order.
+- When the envelope arrives first, it executes entry `i` and drains the queue in order.
+- When the queue is full, the reader stops reading. The sealer sees back-pressure as it does
+  today for a slow consumer. The bound is a count of messages and is a new constant.
+
+A consumer that replays the order from before `i` finds `Void(i)` in the queue in milliseconds,
+because the replay frames arrive fast. So the replay path needs no wire change.
+
+### 3.6 Coherence property
 
 For each canonical index `i`, all consumers take the same action. Either all execute entry `i`,
 or all drop it. The proof: a consumer drops `i` only when it reads `Void(i)`. `Void(i)` is a
 canonical record. The sealer appends it only when no voter has executed `i`, because each voter
 said so itself. A consumer that starts later replays the same order and reads the same record.
 
-### 3.5 Cost on the hot path
+### 3.7 Cost on the hot path
 
 Zero. The sealer orders a `TxRef` as it does today. The new code runs only after a join budget
 ends, which means the chain is already stopped at that entry.
 
 The cost is on the failure path. The chain waits at entry `i` for: the join budget, plus one
 refetch round for each archive, plus the time for the slowest voter to send its request. The
-join budget in the cluster profile sets the floor. Section 6 asks for the target.
+join budget sets the floor: `bounded_join_timeout` gives 30 s on a resume and 60 s on a fresh
+start. So a lost entry stops the chain for more than 30 s today. Section 6 asks for the target.
 
 ## 4. Touched sites
 
@@ -96,9 +143,9 @@ join budget in the cluster profile sets the floor. Section 6 asks for the target
 |---|------|--------|
 | 1 | `crates/types/src/tx_ordering.rs` | new variant `Void`; the variant macro forces each match site |
 | 2 | `crates/cluster-adapter/src/wire` | `RT_VOID = 4`, `KIND_VOID_REQUEST = 6`, encoders, decoders |
-| 3 | `SealerWire.java`, `SealerClusteredService.java`, `CanonicalSealerState.java` | request table, voter set, append the record, nonce reset, snapshot field |
-| 4 | `crates/engine/src/reader` (`threads.rs`, `join.rs`, `cluster/mod.rs`) | send the request, read ahead, drop on void, error on a void of an executed entry |
-| 5 | `crates/batcher/src/multi_archive_reader.rs` | the same follower rule, and the batcher votes |
+| 3 | `SealerWire.java`, `SealerClusteredService.java`, `CanonicalSealerState.java` | request table, void table, voter set, append the record, nonce reset, dedup removal, two snapshot fields |
+| 4 | `crates/engine/src/reader` (`threads.rs`, `join.rs`, `cluster/mod.rs`) | send the request, read-ahead queue, drop on void, dedup removal, error on a void of an executed entry |
+| 5 | `crates/batcher/src` (`live/run.rs`, `multi_archive_reader.rs`) | the live batcher votes through the engine reader; the offline reader drops an entry that has a void record |
 | 6 | `crates/sequencer/src/outbound/cluster.rs` | decode the new variant (no action) |
 | 7 | `docs/failure-modes.md` | the void rule, the voter set, the two new constants |
 | 8 | `crates/chaos/src/shard.rs` | schedule `pipeline-blackout-recover` (38 to 39 cases) |
@@ -120,18 +167,31 @@ Wire changes: one ingress kind, one record type. The count of the match sites of
   request. No void occurs.
 - **The sealer restarts during a vote.** The request table is in the snapshot and in the log.
   Consumers send the request again at an interval, so a lost request is not a lost vote.
+- **One live voter has the envelope in memory, and every archive lost it.** That voter sends no
+  request, so no void occurs. The other voters cannot get the bytes, so the chain waits with no
+  exit. The fix is a peer envelope fetch: the voter that has the bytes serves them. It is a
+  follow-up and is not in this design. The blackout case does not need it, because there no
+  process has the bytes.
 - **The ingress still has the transaction.** The chain drops the entry. The sender submits it
   again. A republish by the ingress is a possible later step and is not in this design.
 
 ## 6. Questions for the owner
 
-1. **Notice to the sender.** Option A: the executor puts a `Voided(tx_hash)` notice on the
-   receipt stream, and the ingress answers the hash with a "dropped, submit again" error.
-   Option B: a failed receipt in the block. Option B changes the `Receipt` type, the DA frame,
-   reconstruct and the guest (13 files read `status`). This design uses option A.
+1. **Notice to the sender: a deviation, please confirm.** Option 2 as first given said "a
+   failed receipt". Option B, a failed receipt in the block, changes the `Receipt` type, the DA
+   frame, reconstruct and the guest (13 files read `status`), and it uses the nonce. This design
+   proposes option A: the executor puts a `Voided(tx_hash)` notice on the receipt stream, and
+   the ingress answers the hash with a "dropped, submit again" error. The limit of option A:
+   after a blackout the ingress lost its in-process receipt cache (#337), so the sender gets
+   "unknown" and a timeout, as today.
 2. **All voters, or a quorum.** This design needs all voters. A quorum is faster when a voter
    is down, but a voter that executed the entry and is down then diverges.
-3. **Stall target.** How long can the chain wait at a lost entry? The answer sets the join
+3. **Later entries of the sender.** After a void of nonce 5, the entries with nonce 6 and 7 fail
+   at execution, and their hashes stay in the dedup windows. Option A: leave it, the sender
+   signs again after the window passes. Option B: the void also removes the later hashes of
+   that sender from the windows. Option B needs a sender index in the void table. This design
+   uses option A.
+4. **Stall target.** How long can the chain wait at a lost entry? The answer sets the join
    budget on this path.
 
 ## 7. Pull request plan (one stack)
