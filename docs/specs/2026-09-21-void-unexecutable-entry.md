@@ -117,6 +117,19 @@ and blocks in `JoinWait`. The new reader does this at a lost entry `i`:
 - When the queue is full, the reader stops reading. The sealer sees back-pressure as it does
   today for a slow consumer. The bound is a count of messages and is a new constant.
 
+Two rules complete the follower:
+
+- A dropped entry and its void record each take one canonical slot. The index counter of the
+  reader moves on for the two slots, so `end_tx_idx` of the block boundary stays correct.
+- A void record for an index below the resume cursor of the consumer is ignored. The
+  checkpoint of the consumer is already past that entry, and the reader cannot know whether the
+  checkpoint has it. Step 7 of section 3.1 applies only to an entry that this process passed.
+
+The wire form of the record is `[tx_hash:32][record_type = 4][index:u64]`. The field that holds
+the canonical id in other records holds the hash of the removed transaction. The sealer makes
+the record itself. The relayed payload is a plain byte layout, not rkyv, so the Java service
+can write it.
+
 A consumer that replays the order from before `i` finds `Void(i)` in the queue in milliseconds,
 because the replay frames arrive fast. So the replay path needs no wire change.
 
