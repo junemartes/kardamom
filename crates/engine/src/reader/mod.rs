@@ -47,6 +47,7 @@ pub mod cluster;
 mod join;
 mod ports;
 mod threads;
+mod void;
 
 pub use join::{JoinBuffer, ReaderConfig};
 pub use ports::{
@@ -60,3 +61,5 @@ pub use threads::{ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader
 mod tests;
 #[cfg(test)]
 mod tests_remote;
+#[cfg(test)]
+mod tests_void;

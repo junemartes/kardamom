@@ -120,6 +120,7 @@ impl<W: ExecPorts> ExecState<W> {
                 message,
                 position,
             } => self.on_xchain(tx_idx, origin_chain_id, message, position),
+            ReaderToExec::Vacant { tx_idx, position } => self.on_vacant(tx_idx, position),
             ReaderToExec::Boundary(start) => self.on_boundary(&start),
         }
     }

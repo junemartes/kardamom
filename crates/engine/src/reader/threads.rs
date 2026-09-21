@@ -1,14 +1,15 @@
 //! The `ReaderToExec` message, the `tx_data` reader thread, and the
 //! `tx_ordering` reader thread.
 
+use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::thread::{self, JoinHandle};
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
 use kardamom_types::{
-    BPosition, BlockBoundaryStart, Deposit, EpochRecord, TxEnvelope, TxOrderingMessage,
+    BPosition, BlockBoundaryStart, Deposit, EpochRecord, TxEnvelope, TxOrderingMessage, VoidRecord,
 };
 
 use crate::error::ExecutorError;
@@ -18,6 +19,7 @@ use super::join::{DedupWindow, JoinBuffer, JoinOutcome, JoinWait, ReaderConfig, 
 use super::ports::{
     ExecSink, JoinRecovery, JoinRecoveryFactory, TxDataSubscription, TxOrderingSubscription,
 };
+use super::void::{ParkOutcome, ReadAhead, VoidPark};
 
 /// Message routed from the `tx_ordering` reader to the executor's exec thread.
 ///
@@ -67,6 +69,13 @@ pub enum ReaderToExec {
         tx_idx: TxIndex,
         origin_chain_id: u64,
         message: Box<XChainMessage>,
+        position: BPosition,
+    },
+    /// A canonical slot that carries no transaction: a voided entry, or the
+    /// void record that removed it. The executor only counts the slot, so its
+    /// record counter stays equal to the sealer's at each boundary.
+    Vacant {
+        tx_idx: TxIndex,
         position: BPosition,
     },
     Boundary(BlockBoundaryStart),
@@ -138,7 +147,7 @@ enum TxDataStep {
 
 /// Continue the loop, or stop cleanly because the exec sink closed. This
 /// mirrors `actor::exec_thread::Flow`, one layer down the pipeline.
-enum Flow {
+pub(super) enum Flow {
     Continue,
     Stop,
 }
@@ -161,6 +170,15 @@ pub struct TxOrderingReader<O, S> {
     exec_out: S,
     recovery: Option<JoinRecovery>,
     next_tx_idx: TxIndex,
+    /// The index this reader started at. A void record for an entry below it
+    /// names an entry that an earlier run of this consumer already passed.
+    start_tx_idx: TxIndex,
+    /// Messages that a void wait read ahead. The loop dispatches them, in
+    /// order, before it reads the subscription again.
+    backlog: ReadAhead,
+    /// Indices of entries this reader dropped, whose void record is still
+    /// in the backlog. The record's own slot counts when its turn comes.
+    dropped: BTreeSet<u64>,
     last_warn_len: usize,
     // Canonical-id dedup. Under the MDS topology, the P sequencers per
     // shard each republish the same `(tx_hash, shard, tx_data_position)`
@@ -218,7 +236,7 @@ where
 
     /// Build the loop state. Runs on the reader thread, so the recovery
     /// factory builds its Aeron resources there.
-    fn new(inputs: TxOrderingInputs<O, S>) -> Self {
+    pub(super) fn new(inputs: TxOrderingInputs<O, S>) -> Self {
         let TxOrderingInputs {
             sub,
             buffer,
@@ -236,6 +254,9 @@ where
             exec_out,
             recovery,
             next_tx_idx: start_tx_idx,
+            start_tx_idx,
+            backlog: ReadAhead::new(),
+            dropped: BTreeSet::new(),
             last_warn_len: 0,
             seen_canonical_ids,
         }
@@ -338,7 +359,7 @@ where
         let wait = JoinWait::new(&self.buffer, &mut self.recovery, &tx_ref, &self.cfg)?;
         let env = match wait.run() {
             JoinOutcome::Joined(env) => env,
-            JoinOutcome::Unjoinable => return Err(self.join_timeout(&tx_ref, true)),
+            JoinOutcome::Unjoinable => return self.on_unjoinable(&tx_ref, position),
             JoinOutcome::TimedOut => return Err(self.join_timeout(&tx_ref, false)),
         };
         self.warn_on_buffer_growth();
@@ -348,6 +369,64 @@ where
             envelope: env,
             position,
         }))
+    }
+
+    /// An entry whose `tx_data` every archive refused. A voter asks the
+    /// sealer to void it and waits for the void record; see [`VoidPark`].
+    /// Then the entry's slot goes to the executor as a vacant slot, and the
+    /// hash leaves the dedup window so the sender can submit it again. A
+    /// consumer that is no voter stops, as it did before the void rule.
+    pub(super) fn on_unjoinable(
+        &mut self,
+        tx_ref: &kardamom_types::TxRef,
+        position: BPosition,
+    ) -> Result<Flow, ExecutorError> {
+        let Some(voter_id) = self.cfg.voter_id else {
+            return Err(self.join_timeout(tx_ref, true));
+        };
+        let void = VoidRecord {
+            index: self.next_tx_idx.0,
+            tx_hash: tx_ref.tx_hash,
+        };
+        let park = VoidPark::new(
+            &mut self.sub,
+            &mut self.backlog,
+            voter_id,
+            void,
+            self.cfg.void_wait,
+        );
+        match park.run() {
+            Ok(ParkOutcome::Voided) => (),
+            Ok(ParkOutcome::GaveUp) => return Err(self.join_timeout(tx_ref, true)),
+            Err(ExecutorError::TxOrderingClosed) => return Ok(Flow::Stop),
+            Err(e) => return Err(e),
+        }
+        info!(
+            target: "kardamom_executor::reader",
+            index = void.index,
+            tx_hash = ?void.tx_hash,
+            "the sealer voided the entry: dropping it"
+        );
+        self.seen_canonical_ids.forget(&void.tx_hash);
+        self.dropped.insert(void.index);
+        let tx_idx = self.next_idx()?;
+        Ok(self.send(ReaderToExec::Vacant { tx_idx, position }))
+    }
+
+    /// A void record. Its entry is one this reader dropped, or one below the
+    /// start index that an earlier run passed: count the record's own slot.
+    /// Any other void record names an entry that this reader sent to the
+    /// executor. The replica and the canonical order then disagree. Stop.
+    fn on_void(&mut self, void: &VoidRecord, position: BPosition) -> Result<Flow, ExecutorError> {
+        let passed = self.dropped.remove(&void.index) || void.index < self.start_tx_idx.0;
+        if !passed {
+            return Err(ExecutorError::VoidOfExecutedEntry {
+                index: void.index,
+                tx_hash: void.tx_hash,
+            });
+        }
+        let tx_idx = self.next_idx()?;
+        Ok(self.send(ReaderToExec::Vacant { tx_idx, position }))
     }
 
     /// Periodic warning. If the join buffer keeps growing, either an
@@ -444,7 +523,7 @@ where
 
     /// The reader loop: one [`Self::step`] per message until the
     /// subscription closes or the exec sink stops.
-    fn run(mut self) -> Result<(), ExecutorError> {
+    pub(super) fn run(mut self) -> Result<(), ExecutorError> {
         while let Flow::Continue = self.step()? {}
         Ok(())
     }
@@ -454,7 +533,11 @@ where
     /// `tx_ordering` close. The loop in [`Self::run`] stays a plain
     /// dispatch on the result.
     fn step(&mut self) -> Result<Flow, ExecutorError> {
-        let (position, msg) = match self.sub.next() {
+        let read = match self.backlog.pop_front() {
+            Some(read) => Ok(read),
+            None => self.sub.next(),
+        };
+        let (position, msg) = match read {
             Ok(p) => p,
             Err(ExecutorError::TxOrderingClosed) => return Ok(Flow::Stop),
             Err(e) => return Err(e),
@@ -463,15 +546,7 @@ where
             TxOrderingMessage::TxRef(tx_ref) => self.on_tx_ref(tx_ref, position),
             TxOrderingMessage::Epoch(epoch) => self.expand_epoch(epoch, position),
             TxOrderingMessage::RemoteEpoch(rec) => self.expand_remote_epoch(rec, position),
-            // This reader sends every entry it passes to the executor, so a
-            // void record that arrives here names an entry that this replica
-            // executed. The replica and the canonical order disagree. Stop.
-            // The sealer appends no void record until a reader can ask for
-            // one, and that reader also learns to drop the entry.
-            TxOrderingMessage::Void(void) => Err(ExecutorError::VoidOfExecutedEntry {
-                index: void.index,
-                tx_hash: void.tx_hash,
-            }),
+            TxOrderingMessage::Void(void) => self.on_void(&void, position),
             TxOrderingMessage::DepositRef(dep_ref) => {
                 // A ref here means the stream carries deposits outside an
                 // epoch record. This chain derives all deposits from

@@ -39,6 +39,24 @@ impl<W: ExecPorts> ExecState<W> {
         Ok(Flow::Continue)
     }
 
+    /// A vacant slot: a voided entry, or the void record that removed it.
+    /// It consumes one slot and applies no tx, so the record counter stays
+    /// equal to the sealer's count at the next boundary.
+    pub(super) fn on_vacant(
+        &mut self,
+        tx_idx: TxIndex,
+        position: BPosition,
+    ) -> Result<Flow, ExecutorError> {
+        self.check_in_order("Vacant", tx_idx, position)?;
+        tracing::info!(
+            target: "kardamom_executor::exec",
+            block = self.current_block,
+            tx_idx = tx_idx.0,
+            "vacant slot: no transaction executes here"
+        );
+        Ok(Flow::Continue)
+    }
+
     pub(super) fn on_remote_epoch(
         &mut self,
         tx_idx: TxIndex,

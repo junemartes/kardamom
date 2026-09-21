@@ -122,6 +122,14 @@ pub struct ReaderConfig {
     /// miss the join, execute twice, or misalign the next boundary. The type
     /// makes that state unrepresentable.
     pub dedup_window: NonZeroUsize,
+    /// This consumer's voter id at the sealer, or `None` for a consumer that
+    /// never votes. A voter asks the sealer to void an entry when every
+    /// archive refuses the entry's `tx_data` range. The sealer counts only
+    /// the ids in its voter list, so each executing consumer has its own id.
+    pub voter_id: Option<u8>,
+    /// How long a voter waits for the void record after its first vote. The
+    /// sealer keeps the vote, so a restart after this wait loses nothing.
+    pub void_wait: Duration,
 }
 
 /// Default [`ReaderConfig::dedup_window`] capacity: 2^20 ids.
@@ -135,6 +143,8 @@ impl Default for ReaderConfig {
             join_poll_interval: Duration::from_micros(50),
             buffer_warn_threshold: 10_000,
             dedup_window: DEFAULT_DEDUP_WINDOW,
+            voter_id: None,
+            void_wait: Duration::from_secs(120),
         }
     }
 }
@@ -172,6 +182,13 @@ impl DedupWindow {
             self.seen.remove(&evicted);
         }
         true
+    }
+
+    /// Remove `id`, so a later entry with the same id passes as new. A voided
+    /// transaction can come again with the same hash. The queue entry stays
+    /// and leaves with the normal eviction.
+    pub(super) fn forget(&mut self, id: &alloy_primitives::B256) {
+        self.seen.remove(id);
     }
 }
 

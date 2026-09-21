@@ -139,7 +139,8 @@ impl<P: Provider> FeedLoop<P> {
             Ok(Some(
                 ReaderToExec::Deposit { .. }
                 | ReaderToExec::Epoch { .. }
-                | ReaderToExec::XChain { .. },
+                | ReaderToExec::XChain { .. }
+                | ReaderToExec::Vacant { .. },
             )) => {}
             // Remote-epoch records travel in DA. Unlike deposits, they
             // are not derivable again from this chain's L1 origin. So the

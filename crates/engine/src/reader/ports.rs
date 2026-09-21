@@ -3,9 +3,11 @@
 
 use crossbeam_channel::Sender;
 
+use kardamom_cluster_adapter::OfferOutcome;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{
     BPosition, Deposit, EpochRecord, StateDatabase, TxDataLoc, TxEnvelope, TxOrderingMessage,
+    VoidRecord,
 };
 
 use crate::delta::ParentState;
@@ -51,6 +53,13 @@ pub trait TxOrderingSubscription: Send {
     /// Returns `Err(ExecutorError::TxOrderingClosed)` when the subscription
     /// closes cleanly, or another `ExecutorError` on a transport failure.
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError>;
+
+    /// Ask the sealer to void `void`, as voter `voter_id`. The default has
+    /// no sealer to ask, so it reports no connection. Only the cluster
+    /// subscription has a session that carries the vote.
+    fn vote(&mut self, _voter_id: u8, _void: &VoidRecord) -> OfferOutcome {
+        OfferOutcome::NotConnected
+    }
 }
 
 /// Archive-backed envelope recovery for join misses.
