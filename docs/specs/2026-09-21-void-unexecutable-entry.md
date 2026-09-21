@@ -66,7 +66,12 @@ The live batcher uses the engine join path (`crates/batcher/src/live/run.rs`, th
 voter. The offline `multi_archive_reader.rs` returns an error for a missing envelope. It must
 learn to drop an entry that has a void record.
 
-The voter set is sealer configuration (`kardamom.sealer.void.voters`). A cluster session has no
+The voter set must equal the set of consumers that execute. This is a deployment invariant,
+not a tuning value. A consumer that is not in the set cannot stop a void. If it holds the
+envelope, it executes the entry, then reads the void record and stops with
+`VoidOfExecutedEntry`. The stop is correct, but the consumer is then lost until a resync.
+
+The voter set is sealer configuration (`kardamom.cluster.voidVoters`). A cluster session has no
 identity today, so the request carries the `voter_id`. The sealer does not authenticate the id.
 One process on the cluster network can send every id. This is the trust level of a sequencer
 session today: the cluster network is the boundary.
@@ -113,12 +118,17 @@ and blocks in `JoinWait`. The new reader does this at a lost entry `i`:
 - It keeps reading the order stream into a bounded queue. It looks only for `Void(i)`.
 - On `Void(i)` it removes the hash from `DedupWindow`, drops entry `i`, and drains the queue in
   order.
-- When the envelope arrives first, it executes entry `i` and drains the queue in order.
-- The reader must keep reading while it waits. If it stops, its position falls out of the
-  egress retention of the sealer (65536 frames), the sealer answers `REPLAY_UNAVAILABLE`, and
-  the consumer stops for a full resync. So the bound of the queue is the egress retention:
-  65536 messages, about 5 MB. When the queue is full, the reader exits as it does today on a
-  join timeout.
+- It does not look for the envelope again during the wait. The wait starts only after every
+  archive refused the range, and no publisher sends an old envelope again.
+- The read-ahead cannot lose the egress position. The session thread of the client drains the
+  egress into a channel with no bound, so a parked reader never causes `REPLAY_UNAVAILABLE`.
+  The bound of the queue is a memory bound only: 65536 messages, about 5 MB. The number is the
+  void window of the sealer: after that many records the sealer refuses the vote, so no void
+  record can come. When the queue is full, or after `void_wait` (120 s), the reader exits as
+  it does today on a join timeout. The sealer keeps the vote, so the restart loses nothing.
+- The reader sends the vote again each 20 boundaries (5 s). Each vote is one entry in the log
+  of the sealer, so the interval is not shorter. The boundary is the clock of the wait: the
+  sealer emits one each 250 ms also with no traffic.
 
 Two rules complete the follower:
 
@@ -200,6 +210,12 @@ Wire changes: one ingress kind, one record type. The count of the match sites of
 - **The ingress still has the transaction.** The chain drops the entry. The sender submits it
   again. A republish by the ingress is a possible later step and is not in this design.
 
+- **An archive leaves the discovered membership.** With discovered archive membership, an
+  archive that is down can leave the list. The remaining archives then all refuse, and the
+  consumer votes. The void is consistent on every replica, but the data possibly still exists
+  on the archive that is down. A fixed archive list does not have this case: an archive that
+  does not answer is not a refusal.
+
 ## 6. Questions for the owner
 
 1. **Notice to the sender: a deviation, please confirm.** Option 2 as first given said "a
@@ -218,7 +234,12 @@ Wire changes: one ingress kind, one record type. The count of the match sites of
    uses option A.
 4. **Stall target.** How long can the chain wait at a lost entry? The answer sets the join
    budget on this path. It also decides whether a void can occur with live ingress: the last
-   vote must arrive before 65536 more records are ordered.
+   vote must arrive before 65536 more records are ordered. Two costs depend on the answer:
+   - The reader waits at one lost entry at a time. A blackout that loses N entries costs N
+     join budgets in sequence. A possible rule: after the first refusal for a publisher
+     session that ended, the reader skips the wait for the later entries of that session.
+   - A consumer that restarts after a void meets `TxRef(i)` again. It uses one full join budget
+     before it finds `Void(i)` in the replay.
 
 ## 7. Pull request plan (one stack)
 
