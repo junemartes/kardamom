@@ -119,6 +119,12 @@ impl JoinRecovery {
             .fetch_tx_data(stream_id, session_id, from, sink)?)
     }
 
+    /// The `tx_data` archives that a refetch asks now, as `host:port`.
+    #[must_use]
+    pub fn tx_data_archives(&self) -> Vec<String> {
+        self.refetcher.tx_data_archives()
+    }
+
     /// Fetch `tx_deposits` recorded at or after `from`, from any publisher
     /// session. Feed each into `sink`. Return the number of deposits
     /// recovered.

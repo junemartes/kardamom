@@ -14,7 +14,7 @@ use kardamom_types::{
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
 
-use super::join::{DedupWindow, JoinBuffer, JoinWait, ReaderConfig, TxDataKey};
+use super::join::{DedupWindow, JoinBuffer, JoinOutcome, JoinWait, ReaderConfig, TxDataKey};
 use super::ports::{
     ExecSink, JoinRecovery, JoinRecoveryFactory, TxDataSubscription, TxOrderingSubscription,
 };
@@ -290,6 +290,34 @@ where
         }
     }
 
+    /// Log a join that used its whole budget, and make its error. The line
+    /// says whether every archive refused the range: then the data is gone
+    /// and a restart meets the same entry again, otherwise an archive was
+    /// unreachable and a restart can still recover.
+    fn join_timeout(
+        &self,
+        tx_ref: &kardamom_types::TxRef,
+        every_archive_refused: bool,
+    ) -> ExecutorError {
+        // `Duration::as_millis` already returns `u128`, so this needs no
+        // fallible narrowing to a smaller integer.
+        let timeout_ms = self.cfg.join_timeout.as_millis();
+        warn!(
+            target: "kardamom_executor::reader",
+            sequencer_id = tx_ref.shard_id,
+            session_id = tx_ref.tx_data_session_id,
+            tx_data_position = ?tx_ref.tx_data_position,
+            timeout_ms,
+            every_archive_refused,
+            "join timeout: TxRef has no envelope on tx_data (archive refetch exhausted); aborting"
+        );
+        ExecutorError::JoinTimeout {
+            sequencer_id: tx_ref.shard_id,
+            tx_data_position: tx_ref.tx_data_position,
+            timeout_ms,
+        }
+    }
+
     /// A `TxRef`: dedup, join against the buffer, warn on buffer growth,
     /// then dispatch the joined envelope.
     fn on_tx_ref(
@@ -308,23 +336,10 @@ where
             return Ok(Flow::Continue);
         }
         let wait = JoinWait::new(&self.buffer, &mut self.recovery, &tx_ref, &self.cfg)?;
-        let Some(env) = wait.run() else {
-            // `Duration::as_millis` already returns `u128`, so this needs no
-            // fallible narrowing to a smaller integer.
-            let timeout_ms = self.cfg.join_timeout.as_millis();
-            warn!(
-                target: "kardamom_executor::reader",
-                sequencer_id = tx_ref.shard_id,
-                session_id = tx_ref.tx_data_session_id,
-                tx_data_position = ?tx_ref.tx_data_position,
-                timeout_ms,
-                "join timeout: TxRef has no envelope on tx_data (archive refetch exhausted); aborting"
-            );
-            return Err(ExecutorError::JoinTimeout {
-                sequencer_id: tx_ref.shard_id,
-                tx_data_position: tx_ref.tx_data_position,
-                timeout_ms,
-            });
+        let env = match wait.run() {
+            JoinOutcome::Joined(env) => env,
+            JoinOutcome::Unjoinable => return Err(self.join_timeout(&tx_ref, true)),
+            JoinOutcome::TimedOut => return Err(self.join_timeout(&tx_ref, false)),
         };
         self.warn_on_buffer_growth();
         let tx_idx = self.next_idx()?;
