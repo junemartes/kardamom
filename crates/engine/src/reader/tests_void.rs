@@ -227,15 +227,26 @@ fn park<'a>(
 }
 
 #[test]
-fn the_voter_sends_its_vote_again_after_twenty_boundaries() {
-    let mut queue: Vec<TxOrderingMessage> = (1..=20).map(boundary).collect();
-    queue.push(void(0, LOST));
-    let mut sub = VotingSub::new(queue);
+fn the_voter_sends_its_vote_again_after_the_interval() {
+    let mut sub = VotingSub::new(vec![boundary(1), boundary(2), void(0, LOST)]);
+    let mut backlog = ReadAhead::new();
+    let mut wait = park(&mut sub, &mut backlog, 0);
+    // An interval of zero has elapsed at every message.
+    wait.revote_after = Duration::ZERO;
+    let outcome = wait.run().expect("voided");
+    assert!(matches!(outcome, ParkOutcome::Voided));
+    // The first vote, then one before each of the three messages.
+    assert_eq!(sub.votes.lock().unwrap().len(), 4);
+    assert_eq!(backlog.len(), 3);
+}
+
+#[test]
+fn the_voter_sends_one_vote_inside_the_interval() {
+    let mut sub = VotingSub::new(vec![boundary(1), boundary(2), void(0, LOST)]);
     let mut backlog = ReadAhead::new();
     let outcome = park(&mut sub, &mut backlog, 0).run().expect("voided");
     assert!(matches!(outcome, ParkOutcome::Voided));
-    assert_eq!(sub.votes.lock().unwrap().len(), 2);
-    assert_eq!(backlog.len(), 21);
+    assert_eq!(sub.votes.lock().unwrap().len(), 1);
 }
 
 #[test]

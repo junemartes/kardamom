@@ -31,11 +31,12 @@ use super::ports::TxOrderingSubscription;
 /// messages.
 pub(super) const MAX_READ_AHEAD: usize = 65_536;
 
-/// The reader sends its vote again after this many boundaries. The sealer
-/// emits one boundary each 250 ms, so the interval is 5 s. Each vote is one
+/// The reader sends its vote again after this interval. Each vote is one
 /// entry in the sealer's log, so a short interval costs the sealer work. A
-/// repeat covers a first vote that the session did not accept.
-const REVOTE_BOUNDARIES: u32 = 20;
+/// repeat covers a first vote that the session did not accept. The reader
+/// reads the clock at each message, and the sealer emits a boundary on a
+/// timer also with no traffic, so the interval holds on an idle chain.
+const REVOTE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Messages read from the canonical order, not yet dispatched.
 pub(super) type ReadAhead = VecDeque<(BPosition, TxOrderingMessage)>;
@@ -58,7 +59,8 @@ pub(super) struct VoidPark<'a, O> {
     void: VoidRecord,
     deadline: Instant,
     ahead: ReadAhead,
-    boundaries_since_vote: u32,
+    pub(super) revote_after: Duration,
+    last_vote: Instant,
     vote_refusal_logged: bool,
 }
 
@@ -77,7 +79,8 @@ impl<'a, O: TxOrderingSubscription> VoidPark<'a, O> {
             void,
             deadline: Instant::now() + wait,
             ahead: ReadAhead::new(),
-            boundaries_since_vote: 0,
+            revote_after: REVOTE_INTERVAL,
+            last_vote: Instant::now(),
             vote_refusal_logged: false,
         }
     }
@@ -111,34 +114,26 @@ impl<'a, O: TxOrderingSubscription> VoidPark<'a, O> {
 
     /// Read one message ahead. Returns the outcome when the wait is over.
     fn step(&mut self) -> Result<Option<ParkOutcome>, ExecutorError> {
-        if Instant::now() >= self.deadline || self.ahead.len() >= MAX_READ_AHEAD {
+        let now = Instant::now();
+        if now >= self.deadline || self.ahead.len() >= MAX_READ_AHEAD {
             return Ok(Some(ParkOutcome::GaveUp));
+        }
+        if now.duration_since(self.last_vote) >= self.revote_after {
+            self.vote();
         }
         let (position, msg) = match self.backlog.pop_front() {
             Some(read) => read,
             None => self.sub.next()?,
         };
         let voided = msg.as_void() == Some(&self.void);
-        if msg.is_boundary() {
-            self.on_boundary();
-        }
         self.ahead.push_back((position, msg));
         Ok(voided.then_some(ParkOutcome::Voided))
-    }
-
-    /// The boundary is the wait's clock: the sealer emits one on a timer
-    /// also when no transaction flows.
-    fn on_boundary(&mut self) {
-        self.boundaries_since_vote += 1;
-        if self.boundaries_since_vote >= REVOTE_BOUNDARIES {
-            self.vote();
-        }
     }
 
     /// Send the vote. A session that does not accept it is not an error:
     /// the next repeat sends the vote again.
     fn vote(&mut self) {
-        self.boundaries_since_vote = 0;
+        self.last_vote = Instant::now();
         let outcome = self.sub.vote(self.voter_id, &self.void);
         if outcome == OfferOutcome::Accepted || self.vote_refusal_logged {
             return;
