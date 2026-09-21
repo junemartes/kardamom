@@ -126,9 +126,11 @@ and blocks in `JoinWait`. The new reader does this at a lost entry `i`:
   void window of the sealer: after that many records the sealer refuses the vote, so no void
   record can come. When the queue is full, or after `void_wait` (120 s), the reader exits as
   it does today on a join timeout. The sealer keeps the vote, so the restart loses nothing.
-- The reader sends the vote again each 20 boundaries (5 s). Each vote is one entry in the log
-  of the sealer, so the interval is not shorter. The boundary is the clock of the wait: the
-  sealer emits one each 250 ms also with no traffic.
+- The reader sends the vote again each 5 s, by the clock. Each vote is one entry in the log of
+  the sealer, so the interval is not shorter. The reader reads the clock at each message. The
+  sealer emits a boundary on a timer also with no traffic, so the interval holds on an idle
+  chain. A boundary count is not the clock: the tick is 250 ms in production and 2000 ms in the
+  container profile.
 
 Two rules complete the follower:
 
