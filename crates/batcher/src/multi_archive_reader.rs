@@ -26,9 +26,17 @@
 //! up front from the segment file. So any position the B-walker meets is
 //! either present (it resolves) or truly missing (it errors). Tests cover
 //! both the in-order and out-of-order cases.
+//!
+//! One kind of ref has no envelope by design: an entry that the sealer
+//! voided (see [`kardamom_types::VoidRecord`]). The void record comes after
+//! the entry, so [`VoidedRefs`] reads the B segment once before the walk and
+//! finds the position of each voided entry. The walk drops those refs. A ref
+//! with no envelope and no void record is still an error.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+use alloy_primitives::B256;
 
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
@@ -130,12 +138,74 @@ impl MultiArchiveConfig {
 /// Built once per A-archive during [`MultiArchiveReader::open`].
 type PerASegmentIndex = HashMap<BPosition, TxEnvelope>;
 
+/// The B-positions of the refs that a void record removed.
+///
+/// A void record names its entry by hash, and the sealer lets the same hash
+/// enter the order again after the void. So a hash alone does not name one
+/// ref. The entry a void record removes is the newest ref with that hash
+/// before the record: the sealer's dedup window lets no second ref with the
+/// hash in between.
+#[derive(Default)]
+struct VoidedRefs {
+    /// The hashes that one void record or more names. Most segments have
+    /// none, and the second pass is then skipped.
+    hashes: HashSet<B256>,
+    /// The newest ref position seen for each hash in `hashes`.
+    newest_ref: HashMap<B256, BPosition>,
+    positions: HashSet<BPosition>,
+}
+
+impl VoidedRefs {
+    /// Read the B segment at `path` and find every voided ref.
+    fn scan(path: &Path) -> Result<Self, BatcherError> {
+        let mut voided = Self::default();
+        TxOrderingSegmentReader::open(path)?.try_for_each(|raw| {
+            voided.note_hash(&raw?.value);
+            Ok::<(), BatcherError>(())
+        })?;
+        if voided.hashes.is_empty() {
+            return Ok(voided);
+        }
+        TxOrderingSegmentReader::open(path)?.try_for_each(|raw| {
+            voided.note_position(&raw?);
+            Ok::<(), BatcherError>(())
+        })?;
+        Ok(voided)
+    }
+
+    /// First pass: collect the hash of each void record.
+    fn note_hash(&mut self, msg: &TxOrderingMessage) {
+        if let TxOrderingMessage::Void(void) = msg {
+            self.hashes.insert(void.tx_hash);
+        }
+    }
+
+    /// Second pass: follow the refs of the collected hashes, and mark the
+    /// newest one at each void record.
+    fn note_position(&mut self, rec: &TypedRecord<TxOrderingMessage>) {
+        match &rec.value {
+            TxOrderingMessage::TxRef(r) if self.hashes.contains(&r.tx_hash) => {
+                self.newest_ref.insert(r.tx_hash, rec.position);
+            }
+            TxOrderingMessage::Void(void) => {
+                self.positions.extend(self.newest_ref.remove(&void.tx_hash));
+            }
+            _ => (),
+        }
+    }
+
+    fn contains(&self, position: BPosition) -> bool {
+        self.positions.contains(&position)
+    }
+}
+
 /// M-archive offline reader. It walks `tx_ordering` in canonical order and
 /// resolves each `TxRef` against the per-sequencer A indexes.
 pub struct MultiArchiveReader {
     b_reader: TxOrderingSegmentReader,
     /// `sequencer_id -> (BPosition -> TxEnvelope)` index.
     a_indexes: HashMap<u8, PerASegmentIndex>,
+    voided: VoidedRefs,
 }
 
 impl MultiArchiveReader {
@@ -153,9 +223,11 @@ impl MultiArchiveReader {
             let idx = load_a_index(path)?;
             a_indexes.insert(*sid, idx);
         }
+        let voided = VoidedRefs::scan(&cfg.b_segment)?;
         Ok(Self {
             b_reader,
             a_indexes,
+            voided,
         })
     }
 
@@ -204,6 +276,7 @@ impl MultiArchiveReader {
     /// into the block it leads (mirrors `live.rs`).
     fn classify(
         a_indexes: &HashMap<u8, PerASegmentIndex>,
+        voided: &VoidedRefs,
         raw: Result<TypedRecord<TxOrderingMessage>, BatcherError>,
     ) -> Option<Result<ResolvedRecord, BatcherError>> {
         let rec = match raw {
@@ -212,6 +285,9 @@ impl MultiArchiveReader {
         };
         let position = rec.position;
         match rec.value {
+            // The sealer voided this entry: it is in no block, and its
+            // envelope is possibly in no archive.
+            TxOrderingMessage::TxRef(_) if voided.contains(position) => None,
             TxOrderingMessage::TxRef(r) => {
                 Some(Self::resolve(a_indexes, &r).map(|env| ResolvedRecord::Tx {
                     position,
@@ -243,10 +319,11 @@ impl Iterator for MultiArchiveReader {
         let Self {
             b_reader,
             a_indexes,
+            voided,
         } = self;
         b_reader
             .by_ref()
-            .find_map(|raw| Self::classify(a_indexes, raw))
+            .find_map(|raw| Self::classify(a_indexes, voided, raw))
     }
 }
 

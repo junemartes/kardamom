@@ -284,6 +284,44 @@ fn missing_a_position_surfaces_as_frame_error() {
     }
 }
 
+/// A voided ref has no envelope, and the walk drops it. The same hash then
+/// enters the order again with data, and that ref resolves.
+#[test]
+fn a_voided_ref_is_dropped_and_the_same_hash_resolves_later() {
+    let dir = TempDir::new().unwrap();
+    let hash = B256::repeat_byte(0xC1);
+    let a0 = write_segment(dir.path(), "a0.rec", &[(BPosition::from_index(7), tx(1))]);
+    let lost = TxRef::new(hash, 0, BPosition::from_index(9999), 0);
+    let again = TxRef::new(hash, 0, BPosition::from_index(7), 0);
+    let void = kardamom_types::VoidRecord {
+        index: 0,
+        tx_hash: hash,
+    };
+    let b = write_segment(
+        dir.path(),
+        "b.rec",
+        &[
+            (BPosition::from_index(0), TxOrderingMessage::TxRef(lost)),
+            (BPosition::from_index(1), TxOrderingMessage::Void(void)),
+            (BPosition::from_index(2), TxOrderingMessage::TxRef(again)),
+            boundary_at(3, 1, 1_700_000_000),
+        ],
+    );
+
+    let reader = MultiArchiveReader::open(&MultiArchiveConfig {
+        b_segment: b,
+        a_segments: HashMap::from([(0u8, a0)]),
+    })
+    .unwrap();
+    let records: Vec<ResolvedRecord> = reader.map(|r| r.expect("resolves")).collect();
+    assert_eq!(records.len(), 2);
+    assert!(matches!(
+        &records[0],
+        ResolvedRecord::Tx { position, .. } if *position == BPosition::from_index(2)
+    ));
+    assert!(matches!(&records[1], ResolvedRecord::Boundary { .. }));
+}
+
 #[test]
 fn parse_a_spec_accepts_well_formed_entries() {
     let parsed =
