@@ -1,4 +1,4 @@
-use super::{FoundRecording, RecordedLimit};
+use super::{FoundRecording, RecordedLimit, ReplayPlan};
 
 fn recording(start_position: i64) -> FoundRecording {
     FoundRecording {
@@ -53,4 +53,25 @@ fn a_position_before_the_recording_start_is_refused() {
     };
     let error = live.replay_len(&recording(4096), 1024).err();
     assert!(error.is_some_and(|e| e.to_string().contains("precedes recording 2 start 4096")));
+}
+
+/// A limit counter id of zero is a real counter: the archive then bounds the
+/// replay by its driver's total of bytes sent. Only `-1` means "no bound".
+#[test]
+fn the_replay_has_no_limit_counter() {
+    let plan = ReplayPlan {
+        from_raw: 5_818_304,
+        len: 32_480,
+        endpoint: "127.0.0.1:0".to_owned(),
+        limit: RecordedLimit {
+            position: 5_850_784,
+            active: false,
+        },
+    };
+    let params = plan.params().expect("params");
+    assert_eq!(params.bounding_limit_counter_id(), -1);
+    assert_eq!(params.replay_token(), -1);
+    assert_eq!(params.subscription_registration_id(), -1);
+    assert_eq!(params.position(), 5_818_304);
+    assert_eq!(params.length(), 32_480);
 }
