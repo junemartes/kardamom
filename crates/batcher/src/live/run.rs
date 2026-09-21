@@ -231,6 +231,7 @@ impl RunConfig {
 
         Ok(ReaderStack {
             handles: ReaderHandles {
+                rt,
                 cluster_guard,
                 join_handles,
                 ordering_handle,
@@ -251,6 +252,19 @@ struct ReaderStack<G> {
 /// guard (`G`, kept opaque so this module names no direct dependency on
 /// `kardamom-cluster-adapter`) must outlive the feed loop.
 struct ReaderHandles<G> {
+    // The `tx_data` runtime. Its Aeron thread owns the eight lane
+    // subscriptions, and ends when the last `AeronRuntime` clone drops:
+    // the discovery reconciler holds a command-only handle, which keeps
+    // nothing alive. Without this field the runtime ends when the setup
+    // function returns, every lane closes, and the batcher joins every
+    // TxRef through the archive refetch alone, which fails when an
+    // ingress archive is lost. Declared first so the lanes close before
+    // the cluster session does, the order `LiveStreams` uses. Never read.
+    #[allow(
+        dead_code,
+        reason = "held only for its Drop impl, which ends the Aeron thread"
+    )]
+    rt: AeronRuntime,
     // Held only for its Drop impl (closes the Aeron cluster session when
     // the handles are dropped after a feed failure); its value is never
     // read.

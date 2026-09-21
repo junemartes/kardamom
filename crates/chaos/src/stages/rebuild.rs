@@ -25,8 +25,9 @@ const DA_STORE: &str = "/opt/kardamom/batcher/da";
 const BATCHER_FIRST_FAILURES: usize = 20;
 
 /// What marks a failure line in the batcher log: the tracing levels,
-/// and the `Error:` line the process prints when it exits.
-const BATCHER_FAILURE_MARKERS: &[&str] = &["WARN", "ERROR", "Error:"];
+/// the `Error:` line the process prints when it exits, and a thread's
+/// panic line.
+const BATCHER_FAILURE_MARKERS: &[&str] = &["WARN", "ERROR", "Error:", "panicked"];
 
 /// The genesis the cluster's services start from, in the checkout.
 const GENESIS: &str = "deploy/cluster/config/genesis/dev.toml";
