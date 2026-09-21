@@ -130,7 +130,12 @@ Three constants bound the rule. Every member must run the same values.
 | `MAX_OPEN_VOTES` | 1024 | The most indices with open votes. More are refused. |
 
 The order path pays one 52-byte copy for each reference and no allocation.
-The votes and the window are in the snapshot (version 6). Status: the sealer
+The votes and the window are in the snapshot (version 6). With voters
+configured, a full window adds 65536 x 68 bytes (about 4.4 MB) to each
+snapshot. A void needs the last vote before `voidWindow` more records are
+ordered after the entry: with live ingress at more than about 1000 records
+per second and a 60 s join budget, the entry leaves the window first, and the
+chain stops as it did before this rule. Status: the sealer
 side exists. No consumer votes yet, so `pipeline-blackout-recover` still
 fails until the consumer side lands.
 
