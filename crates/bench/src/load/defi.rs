@@ -3,7 +3,7 @@
 //!
 //! The contracts live in `bench-contracts/src/BenchDefi.sol`, its own
 //! foundry project, kept apart from the pinned CREATE2-sensitive one.
-//! `bench-contracts/embed.sh` embeds the creation bytecode into
+//! `just bench-embed` embeds the creation bytecode into
 //! `defi_bytecode.rs`. The mix is chosen for its write-set profile as
 //! much as its gas profile:
 //!

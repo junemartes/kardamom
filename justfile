@@ -14,6 +14,12 @@
 # tools (Ansible, Docker, OpenTofu, the Nomad CLI). `just cluster-bootstrap`
 # installs those; `just cluster-doctor` checks them.
 
+# The only execution-spec-tests fixture pin. When you bump it, also update
+# `SPEC_ID` in crates/exec-core/src/block_env.rs and `FORK` in
+# crates/exec-core/tests/eest_state.rs. Follow the fork-bump procedure in
+# docs/agents/l1-client-suite-port-spec.md (hardfork-policy section).
+EEST_TAG := "tests@v20.0.1"
+
 _default:
     @just --list
 
@@ -148,9 +154,52 @@ check:
 clippy:
     PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+# The judgment rules (R1, R5, R6, R7, R9, R10, R14, R15, R16) are not
+# checked here. Read the diff against docs/STYLE.md for those.
 # Mechanical style checks from docs/STYLE.md. Run before you open a PR.
 style:
-    PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" scripts/style-check.sh
+    #!/usr/bin/env bash
+    set -uo pipefail
+    export PATH="$(just java-shim):$PATH"
+    export JAVA_HOME="$(just java-home)"
+    failed=0
+    step() {
+        echo "==> $1"
+        if ! "${@:2}"; then
+            echo "FAILED: $1" >&2
+            failed=1
+        fi
+    }
+    # R11, R2 (too_many_lines at the threshold in clippy.toml), R8 (unreachable_pub).
+    step "clippy pedantic" cargo clippy --workspace --all-targets --all-features --locked -- \
+        -D warnings -W clippy::pedantic -D unreachable_pub
+    step "rustfmt" cargo fmt --all -- --check
+    # R9, R13, R6, R11: patterns that a lint cannot express. Test files are exempt.
+    forbidden() {
+        local hits
+        hits="$(grep -rnE --include='*.rs' \
+            -e 'debug_assert!' -e '\.max\(1\)' -e '\bdyn\b' -e 'allow\(clippy::too_many_arguments\)' \
+            crates guest 2>/dev/null \
+            | grep -vE '/tests?/|_tests?\.rs:|/tests\.rs:|/test_support' || true)"
+        # `Box<` and `dyn` split over two lines by rustfmt: report the file and
+        # the line of the `Box<`.
+        local wrapped
+        wrapped="$(grep -rnE --include='*.rs' -A1 -e 'Box<$' crates guest 2>/dev/null \
+            | grep -E -B1 '^[^:]+-[0-9]+-\s*dyn ' \
+            | grep -E ':[0-9]+:' \
+            | grep -vE '/tests?/|_tests?\.rs:|/tests\.rs:|/test_support' || true)"
+        hits="${hits}${wrapped:+$'\n'$wrapped}"
+        if [ -n "$hits" ]; then
+            echo "$hits"
+            return 1
+        fi
+    }
+    step "forbidden patterns (debug_assert!, .max(1), dyn, allow(too_many_arguments))" forbidden
+    if [ "$failed" -ne 0 ]; then
+        echo "style check failed. See docs/STYLE.md." >&2
+        exit 1
+    fi
+    echo "style check passed."
 
 # Run the test suite across all features.
 test:
@@ -161,9 +210,140 @@ test:
 eest:
     #!/usr/bin/env bash
     set -euo pipefail
-    fixtures="$(scripts/fetch-eest-fixtures.sh | tail -1)"
+    fixtures="$(just eest-fixtures | tail -1)"
     KARDAMOM_EEST_FIXTURES="${fixtures}" \
         cargo test -p kardamom-exec-core --release --test eest_state -- --ignored --nocapture
+
+# The pinned execution-spec-tests release. CI reads it for its cache key.
+eest-tag:
+    @echo "{{ EEST_TAG }}"
+
+# It prints the fixture directory as the last line, and skips the download
+# when the files are already there.
+# Fetch the pinned EEST fixtures into <dest-root>/<tag>/ (default ~/.cache/kardamom/eest).
+eest-fixtures dest_root=(env('HOME') / ".cache/kardamom/eest"):
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="{{ dest_root }}/{{ EEST_TAG }}"
+    if [[ -d "${dest}/fixtures" ]]; then
+        echo "eest fixtures {{ EEST_TAG }} already present" >&2
+        echo "${dest}/fixtures"
+        exit 0
+    fi
+    # URL-encode '@' in the release-asset path.
+    tag="{{ EEST_TAG }}"
+    url="https://github.com/ethereum/execution-specs/releases/download/${tag/@/%40}/fixtures.tar.gz"
+    mkdir -p "${dest}"
+    echo "fetching ${url}" >&2
+    curl -fsSL --retry 3 "${url}" -o "${dest}/fixtures.tar.gz"
+    # Keep only state_tests and release metadata. The blockchain and engine
+    # formats need a header chain and an Engine API. Kardamom does not have
+    # these (see the spec's non-goals). The full download is about 8.1 GB.
+    # The filtered set is about 1.5 GB.
+    tar -xzf "${dest}/fixtures.tar.gz" -C "${dest}" \
+        "fixtures/state_tests" "fixtures/.meta"
+    rm "${dest}/fixtures.tar.gz"
+    [[ -d "${dest}/fixtures" ]] || {
+        echo "unexpected tarball layout under ${dest}" >&2
+        exit 1
+    }
+    echo "${dest}/fixtures"
+
+# It runs the three DHAT harnesses and fails when allocs/op or bytes/op
+# exceed their ceilings. Wall time prints for reference only: it depends on
+# the machine.
+# DHAT allocation ceilings (perf/alloc-baselines.env).
+alloc-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source perf/alloc-baselines.env
+    run() { # <name> <dir> <test> <env...>
+        local name=$1 dir=$2 test=$3; shift 3
+        local raw="/tmp/alloc-gate-$name.log"
+        # Keep the full cargo output, including stderr. A compile or runtime
+        # failure must show in the log.
+        if ! (cd "$dir" && env "$@" cargo test --test "$test" --release -- --ignored --nocapture) >"$raw" 2>&1; then
+            # The last 40 lines of a panicking test are its backtrace, so the
+            # panic itself scrolls away. Print the failure lines first.
+            echo "== $name: HARNESS FAILED (cargo test exit != 0); the failure lines:"
+            grep -nE "panicked at|assertion|^error(\[|:)|^thread .* panicked|FAILED" "$raw" | head -20 || true
+            echo "== $name: last 40 lines:"
+            tail -40 "$raw"
+            return 1
+        fi
+        local out
+        out=$(grep -E "allocs/(tx|op)|bytes/(tx|op)|wall/(tx|op)" "$raw" || true)
+        if [[ -z "$out" ]]; then
+            echo "== $name: NO MEASUREMENT LINES in harness output; last 40 lines:"
+            tail -40 "$raw"
+            return 1
+        fi
+        echo "== $name"; echo "$out"
+        local allocs bytes
+        allocs=$(echo "$out" | grep -E "allocs" | grep -oE "[0-9]+\.?[0-9]*" | head -1)
+        bytes=$(echo "$out" | grep -E "bytes" | grep -oE "[0-9]+" | head -1)
+        local max_a_var="${name^^}_MAX_ALLOCS" max_b_var="${name^^}_MAX_BYTES"
+        local max_a=${!max_a_var} max_b=${!max_b_var}
+        awk -v a="$allocs" -v ma="$max_a" -v b="$bytes" -v mb="$max_b" -v n="$name" 'BEGIN {
+            bad = 0
+            if (a+0 > ma+0) { printf "ALLOC REGRESSION: %s %.2f allocs/op > ceiling %.2f\n", n, a, ma; bad = 1 }
+            if (b+0 > mb+0) { printf "ALLOC REGRESSION: %s %d bytes/op > ceiling %d\n", n, b, mb; bad = 1 }
+            exit bad
+        }'
+    }
+    run engine    crates/bench     alloc_profile         KARDAMOM_PROFILE_OPS=mix
+    run sequencer crates/sequencer alloc_profile
+    run ingress   crates/bench     alloc_profile_ingress
+    echo "alloc gate: PASS (ceilings: perf/alloc-baselines.env)"
+
+# Run it after you change bench-contracts/src/BenchDefi.sol.
+# Regenerate crates/bench/src/load/defi_bytecode.rs from the compiled artifacts.
+bench-embed:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd bench-contracts
+    forge build >/dev/null
+    python3 - <<'EMBED'
+    import json
+    names = ["SwapPool", "Vault", "Clob"]
+    with open("../crates/bench/src/load/defi_bytecode.rs", "w") as f:
+        f.write("// This file is generated by `just bench-embed`. Do not edit it.\n")
+        f.write("// The source of truth is bench-contracts/src/BenchDefi.sol.\n\n")
+        for n in names:
+            j = json.load(open(f"out/BenchDefi.sol/{n}.json"))
+            code = j["bytecode"]["object"].removeprefix("0x")
+            f.write(f'pub const {n.upper()}_CREATION_HEX: &str = "{code}";\n')
+    print("ok")
+    EMBED
+
+# It mirrors the layout a checkout has: the service and operator binaries
+# under target/release, the shard test executable as kardamom-chaos-shards,
+# the Aeron shared libraries under their rusteron build directories, and the
+# sealer jar at its Gradle output path. A shard runner unpacks this over its
+# checkout and runs the cluster recipes with KARDAMOM_STAGED=1.
+# Stage everything a cluster-e2e shard runner needs into one directory.
+stage-dist dist:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dist="{{ dist }}"
+    rel=target/release
+    mkdir -p "$dist/$rel/build" "$dist/cluster/sealer-service/service/build/libs"
+    # The services the images wrap (the state mirror included), the settlement
+    # deployer and the semantics runner the stages spawn, the operator binary,
+    # and the archive tool the archive-corruption case runs on the host.
+    for bin in ingress sequencer executor validator da-watcher batcher state-mirror reconstruct deploy semantics cluster archive-rereplicate; do
+        cp "$rel/kardamom-$bin" "$dist/$rel/"
+    done
+    # The shard test executable carries a build hash; the newest one is this build's.
+    shards=$(ls -t "$rel"/deps/shards-* | grep -v '\.d$' | head -n 1)
+    cp "$shards" "$dist/$rel/kardamom-chaos-shards"
+    for lib in "$rel"/build/rusteron-archive-*/out/build/lib; do
+        build=$(basename "$(dirname "$(dirname "$(dirname "$lib")")")")
+        mkdir -p "$dist/$rel/build/$build/out/build/lib"
+        cp "$lib"/libaeron*.so "$dist/$rel/build/$build/out/build/lib/"
+    done
+    cp cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar "$dist/cluster/sealer-service/service/build/libs/"
+    find "$dist" -type f | sort
 
 # Targeted check that just the Aeron bindings compile.
 check-aeron:
