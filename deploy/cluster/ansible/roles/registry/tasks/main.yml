@@ -33,6 +33,12 @@
       - "{{ registry_port }}:5000"
     volumes:
       - "{{ paths.base }}/registry:/var/lib/registry"
+  register: registry_container
+  # The image pull reaches Docker Hub; a failed request there is a
+  # transient fault of the network, not of the registry role.
+  until: registry_container is succeeded
+  retries: 3
+  delay: 15
 
 # The registry is a Consul service: every node pulls from
 # registry.service.consul and no node names the control address.

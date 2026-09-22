@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use kardamom_state::{StateEnvBuilder, deep_compare_to, sweep};
 
+use super::rebuild::{Rebuild, Target};
+
 use crate::harness::Harness;
 use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
@@ -14,22 +16,26 @@ impl Harness {
     /// Stop ordering, drain the consumers to one head, stop their writers,
     /// and compare copies of all persisted state. Restore the jobs on both
     /// success and failure. Copies remain in the reported directory on failure.
+    /// Then rebuild the state at the validator's head from L1 alone, with
+    /// the jobs back up so the batcher posts through that head, and
+    /// require the validator's root.
     ///
     /// # Errors
     ///
     /// Returns an error on missing state, lag, corruption, replica differences,
-    /// or failure to stop or restore a job.
+    /// a rebuild that misses the root, or failure to stop or restore a job.
     pub async fn assert_persisted_state(&self) -> anyhow::Result<()> {
         let audit = StateAudit::new(self).await?;
         let outcome = audit.run().await;
         let restored = audit.restore().await;
-        match (outcome, restored) {
+        let rebuild = match (outcome, restored) {
             (Err(error), Err(restore)) => {
-                Err(error.context(format!("job restoration also failed: {restore:#}")))
+                return Err(error.context(format!("job restoration also failed: {restore:#}")));
             }
-            (Err(error), _) | (_, Err(error)) => Err(error),
-            (Ok(()), Ok(())) => Ok(()),
-        }
+            (Err(error), _) | (_, Err(error)) => return Err(error),
+            (Ok(rebuild), Ok(())) => rebuild,
+        };
+        rebuild.assert_parity().await
     }
 }
 
@@ -50,7 +56,7 @@ impl<'a> StateAudit<'a> {
         })
     }
 
-    async fn run(&self) -> anyhow::Result<()> {
+    async fn run(&self) -> anyhow::Result<Rebuild<'a>> {
         self.cluster.stop().await?;
         let heads = self.drain().await?;
         self.executor.stop().await?;
@@ -74,7 +80,7 @@ impl<'a> StateAudit<'a> {
             executors.push(self.copy_executor(&node.container, &directory).await?);
         }
         let head = u64::try_from(heads.aligned().unwrap_or(0)).unwrap_or(0);
-        tokio::task::spawn_blocking(move || {
+        let target = tokio::task::spawn_blocking(move || {
             StateCopies {
                 validator,
                 executors,
@@ -86,7 +92,12 @@ impl<'a> StateAudit<'a> {
         crate::log(
             "persisted-state PASS: all executors match validator accounts, storage, code, headers, receipts and indexes; validator root rebuild matches",
         );
-        Ok(())
+        Ok(Rebuild {
+            harness: self.harness,
+            evidence: directory,
+            target,
+            executor_image: false,
+        })
     }
 
     async fn copy_executor(&self, node: &str, directory: &Path) -> anyhow::Result<PathBuf> {
@@ -258,7 +269,9 @@ struct StateCopies {
 }
 
 impl StateCopies {
-    fn verify(&self) -> anyhow::Result<()> {
+    /// Compare every executor with the validator, and return the
+    /// validator's committed root at its head.
+    fn verify(&self) -> anyhow::Result<Target> {
         anyhow::ensure!(!self.executors.is_empty(), "no executor state to compare");
         let validator = Self::open(&self.validator)?;
         let report = sweep(&validator)?;
@@ -271,13 +284,19 @@ impl StateCopies {
             report.last_committed_block > 0 && report.receipts > 0,
             "state audit has no executed workload"
         );
-        anyhow::ensure!(
-            report.state_root.is_some() && report.state_root == report.rebuilt_root,
-            "validator has no reproducible state root"
-        );
+        let root = report
+            .state_root
+            .filter(|root| Some(*root) == report.rebuilt_root)
+            .context("validator has no reproducible state root")?;
         self.executors
             .iter()
-            .try_for_each(|path| self.compare(&validator, path))
+            .try_for_each(|path| self.compare(&validator, path))?;
+        let cursor = kardamom_state::read_recovery_point(&validator)?;
+        Ok(Target {
+            block: report.last_committed_block,
+            root: Some(root),
+            end_tx_idx: Some(cursor.last_fsynced_b_position.as_index()),
+        })
     }
 
     fn open(path: &Path) -> anyhow::Result<kardamom_state::StateEnv> {

@@ -12,6 +12,8 @@ pub(crate) mod archive;
 pub(crate) mod cache;
 pub(crate) mod cluster;
 pub(crate) mod component;
+pub(crate) mod coordinated;
+pub(crate) mod fleet;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
 pub(crate) mod squeeze;
@@ -36,6 +38,13 @@ pub enum Case {
     ClusterMemberRejoin,
     NodeReplaceSealer,
     ClusterQuorumLossRecover,
+    ClusterTotalLossRecover,
+    ExecutorFleetLossRecover,
+    ExecutorFleetWipeRecover,
+    ExecutorFleetTotalWipeRecover,
+    IngressPairLossRecover,
+    SequencerLaneLossRecover,
+    PipelineBlackoutRecover,
     ArchiveDriverLoss,
     ArchiveTxDataWipe,
     ArchiveCorruption,
@@ -50,10 +59,11 @@ pub enum Case {
     RedisPrimaryFreeze,
     RedisPrimaryKill,
     RedisPartitionIngress,
+    RedisTotalLossRecover,
     MirrorKillRebuild,
 }
 
-const ALL: [Case; 31] = [
+const ALL: [Case; 39] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -70,6 +80,13 @@ const ALL: [Case; 31] = [
     Case::ClusterMemberRejoin,
     Case::NodeReplaceSealer,
     Case::ClusterQuorumLossRecover,
+    Case::ClusterTotalLossRecover,
+    Case::ExecutorFleetLossRecover,
+    Case::ExecutorFleetWipeRecover,
+    Case::ExecutorFleetTotalWipeRecover,
+    Case::IngressPairLossRecover,
+    Case::SequencerLaneLossRecover,
+    Case::PipelineBlackoutRecover,
     Case::ArchiveDriverLoss,
     Case::ArchiveTxDataWipe,
     Case::ArchiveCorruption,
@@ -84,6 +101,7 @@ const ALL: [Case; 31] = [
     Case::RedisPrimaryFreeze,
     Case::RedisPrimaryKill,
     Case::RedisPartitionIngress,
+    Case::RedisTotalLossRecover,
     Case::MirrorKillRebuild,
 ];
 
@@ -120,6 +138,13 @@ impl Case {
             Self::ClusterMemberRejoin => "cluster-member-rejoin",
             Self::NodeReplaceSealer => "node-replace-sealer",
             Self::ClusterQuorumLossRecover => "cluster-quorum-loss-recover",
+            Self::ClusterTotalLossRecover => "cluster-total-loss-recover",
+            Self::ExecutorFleetLossRecover => "executor-fleet-loss-recover",
+            Self::ExecutorFleetWipeRecover => "executor-fleet-wipe-recover",
+            Self::ExecutorFleetTotalWipeRecover => "executor-fleet-total-wipe-recover",
+            Self::IngressPairLossRecover => "ingress-pair-loss-recover",
+            Self::SequencerLaneLossRecover => "sequencer-lane-loss-recover",
+            Self::PipelineBlackoutRecover => "pipeline-blackout-recover",
             Self::ArchiveDriverLoss => "archive-driver-loss",
             Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
             Self::ArchiveCorruption => "archive-corruption",
@@ -134,6 +159,7 @@ impl Case {
             Self::RedisPrimaryFreeze => "redis-primary-freeze",
             Self::RedisPrimaryKill => "redis-primary-kill",
             Self::RedisPartitionIngress => "redis-partition-ingress",
+            Self::RedisTotalLossRecover => "redis-total-loss-recover",
             Self::MirrorKillRebuild => "mirror-kill-rebuild",
         }
     }
@@ -146,6 +172,7 @@ impl Case {
             | Self::SequencerLapse
             | Self::GracefulSequencer
             | Self::HardSequencer
+            | Self::SequencerLaneLossRecover
             | Self::LookupBlackout => Pin::Shard0,
             Self::ResizeScaleOutIn => Pin::MovesOnScaleOut,
             _ => Pin::Any,
@@ -172,7 +199,13 @@ impl Case {
             }
             // The mirrors restart, wait for a checkpoint, and rebuild.
             Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_secs(600),
-            Self::NodeReplaceExecutor => inject + k.reschedule_slo + Duration::from_secs(420),
+            // The node replacement; the Redis loss and three rebuilds; the
+            // total wipe, the rebuild from L1 and the install; or the
+            // blackout and the return of every job.
+            Self::NodeReplaceExecutor
+            | Self::RedisTotalLossRecover
+            | Self::ExecutorFleetTotalWipeRecover
+            | Self::PipelineBlackoutRecover => inject + k.reschedule_slo + Duration::from_secs(420),
             Self::NodeReplaceSealer => {
                 inject + k.reschedule_slo + k.rejoin_slo + Duration::from_secs(300)
             }
@@ -193,12 +226,23 @@ impl Case {
     /// executes as failed, which the verdict would count as bad receipts.
     /// Each attempt parks up to 30 s at the ingress while the stall
     /// lasts, so six attempts cover the stall; sixty made the case take
-    /// 23 minutes and the shard hit its job timeout.
+    /// 23 minutes and the shard hit its job timeout. A whole-fleet
+    /// outage lasts up to the reschedule SLO plus an election, so its
+    /// attempts cover that SLO in 30 s parks, plus two.
     #[must_use]
     pub fn load_retry(self, k: &Knobs) -> u32 {
         match self {
             Self::ResizeScaleOutIn => 60,
             Self::ClusterQuorumLossRecover => 6,
+            Self::ClusterTotalLossRecover
+            | Self::ExecutorFleetLossRecover
+            | Self::ExecutorFleetWipeRecover
+            | Self::ExecutorFleetTotalWipeRecover
+            | Self::IngressPairLossRecover
+            | Self::SequencerLaneLossRecover
+            | Self::PipelineBlackoutRecover => {
+                u32::try_from(k.reschedule_slo.as_secs() / 30).unwrap_or(u32::MAX) + 2
+            }
             _ => k.load_retry,
         }
     }
@@ -226,6 +270,15 @@ impl Case {
             Self::ClusterMemberRejoin => cluster::member_rejoin(h).await,
             Self::NodeReplaceSealer => cluster::node_replace_sealer(h).await,
             Self::ClusterQuorumLossRecover => cluster::quorum_loss_recover(h).await,
+            Self::ClusterTotalLossRecover => fleet::cluster_total_loss_recover(h).await,
+            Self::ExecutorFleetLossRecover => fleet::executor_fleet_loss_recover(h).await,
+            Self::ExecutorFleetWipeRecover => fleet::executor_fleet_wipe_recover(h).await,
+            Self::ExecutorFleetTotalWipeRecover => {
+                fleet::executor_fleet_total_wipe_recover(h).await
+            }
+            Self::IngressPairLossRecover => coordinated::ingress_pair_loss_recover(h).await,
+            Self::SequencerLaneLossRecover => coordinated::sequencer_lane_loss_recover(h).await,
+            Self::PipelineBlackoutRecover => coordinated::pipeline_blackout_recover(h).await,
             Self::ArchiveDriverLoss => archive::driver_loss(h).await,
             Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
             Self::ArchiveCorruption => archive::corruption(h).await,
@@ -244,6 +297,7 @@ impl Case {
             Self::RedisPrimaryFreeze => cache::redis_primary_freeze(h).await,
             Self::RedisPrimaryKill => cache::redis_primary_kill(h).await,
             Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,
+            Self::RedisTotalLossRecover => cache::redis_total_loss_recover(h).await,
             Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
         }
     }
@@ -260,6 +314,8 @@ mod tests {
             crate::Shard::Ingress,
             crate::Shard::Sequencer,
             crate::Shard::Cluster,
+            crate::Shard::Fleet,
+            crate::Shard::Coordinated,
             crate::Shard::Retention,
             crate::Shard::Cache,
         ] {

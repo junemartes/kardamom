@@ -310,6 +310,47 @@ where
         self.cache.lookup_by_tx_hash(tx_hash)
     }
 
+    /// The receipt of `tx_hash`: the in-memory cache first, then one
+    /// query to an executor's state DB on a miss.
+    ///
+    /// The cache lives in this process, so a restarted ingress holds no
+    /// receipt from before its start, and an old receipt leaves the
+    /// bounded cache. The state DB is the durable copy: a client that
+    /// got a hash from an accepted submit must find its receipt after any
+    /// ingress restart. A receipt found there enters the cache, so the
+    /// next poll is a local hit.
+    ///
+    /// A poll for a transaction that has not executed yet also misses,
+    /// so the executor query is bounded three ways: the client's token
+    /// bucket, the query client's in-flight bound, which sheds at once,
+    /// and its timeout. A shed or failed query answers `None`, the same
+    /// as "not committed yet", and the client polls again.
+    pub async fn receipt_by_hash(
+        &self,
+        client_ip: std::net::IpAddr,
+        tx_hash: B256,
+    ) -> Option<Receipt> {
+        if let Some(receipt) = self.lookup_receipt_by_hash(tx_hash) {
+            kardamom_cache::metrics::record_lookup("receipt", "hit");
+            return Some(receipt);
+        }
+        let query = self.query.as_ref()?;
+        if self.rate_limiter.check(client_ip).is_err() {
+            kardamom_cache::metrics::record_lookup("receipt", "shed");
+            return None;
+        }
+        let found = query.receipt(tx_hash).await;
+        let outcome = match &found {
+            Ok(Some(_)) => "state_hit",
+            Ok(None) => "miss",
+            Err(_) => "state_error",
+        };
+        kardamom_cache::metrics::record_lookup("receipt", outcome);
+        let receipt = found.ok().flatten()?;
+        self.cache.insert(receipt.clone());
+        Some(receipt)
+    }
+
     /// Live feed of deduped receipts, one copy per tx, after MDS fan-in
     /// dedup. Backs `kardamom_subscribeReceipts`.
     pub fn subscribe_receipt_feed(&self) -> broadcast::Receiver<Receipt> {

@@ -55,6 +55,21 @@ const LIFECYCLE_MARKERS: &[&str] = &[
     "rebuild:",
 ];
 const LIFECYCLE_EVENTS: usize = 60;
+/// The sealer's consensus history: roles, leadership terms, snapshots,
+/// the boundary clock's heartbeat and its revivals. Session and
+/// contiguity lines flood a sealer's head and tail, and these few lines
+/// are the ones that tell which member led when and whether its clock
+/// ran. Each line carries its own time.
+const CONSENSUS_MARKERS: &[&str] = &[
+    "cluster role=",
+    "cluster TERM",
+    "cluster boundary-clock",
+    "sealer snapshot",
+    "sealer state",
+    "cluster node up",
+    "cluster JOIN WEDGE",
+];
+const CONSENSUS_EVENTS: usize = 120;
 const AERON_ERRORS: &str = "for f in /opt/kardamom/cluster/*error*.log /opt/kardamom/aeron-mount/cluster-dir/*error*.log; do [ -f \"$f\" ] && { echo \"--- $f ---\"; cat \"$f\"; }; done";
 const CLUSTER_TOOL: &str = r#"inner="$(docker ps --format "{{.Names}}" | grep -m1 "^cluster-")"
 [ -n "$inner" ] || { echo "(no inner cluster container running)"; exit 0; }
@@ -268,6 +283,16 @@ impl Diagnostics {
             "{}",
             matching_lines(&logs, LIFECYCLE_MARKERS, LIFECYCLE_EVENTS)
         );
+        if job == "cluster" {
+            println!(
+                "----- {job} alloc {}: consensus timeline (last {CONSENSUS_EVENTS}) -----",
+                alloc.short_id()
+            );
+            println!(
+                "{}",
+                matching_lines(&logs, CONSENSUS_MARKERS, CONSENSUS_EVENTS)
+            );
+        }
     }
 
     async fn sealer_section(&self, node: &Node) {
@@ -424,6 +449,20 @@ mod tests {
     fn groups_keep_only_the_cluster_range_sorted() {
         let maddr = "1:\tinet 224.0.0.1\n\tinet 239.192.56.13\n\tinet 239.192.56.12\n";
         assert_eq!(groups_in(maddr), "  239.192.56.12\n  239.192.56.13");
+    }
+
+    #[test]
+    fn the_consensus_timeline_drops_the_session_and_contiguity_flood() {
+        let logs = "2026-09-20T14:27:56Z cluster role=LEADER memberId=1\n\
+            2026-09-20T14:27:56Z cluster TERM memberId=1 leadershipTermId=7 leaderMemberId=1\n\
+            2026-09-20T14:27:57Z cluster SESSION open memberId=1 session=41\n\
+            2026-09-20T14:27:58Z cluster CONTIGUITY reject memberId=1\n\
+            2026-09-20T14:28:58Z cluster boundary-clock TICK memberId=1 block=764 role=LEADER\n\
+            2026-09-20T14:29:00Z sealer snapshot TAKEN memberId=1 block=765 canonicalCount=9\n";
+        let timeline = matching_lines(logs, CONSENSUS_MARKERS, CONSENSUS_EVENTS);
+        assert_eq!(timeline.lines().count(), 4);
+        assert!(!timeline.contains("SESSION"));
+        assert!(!timeline.contains("CONTIGUITY"));
     }
 
     #[test]

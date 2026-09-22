@@ -131,6 +131,7 @@ impl Acc {
             // synthesized timestamp finite instead of wrapping.
             l2_timestamp: 1_700_000_000u64.saturating_add(block_number),
             end_tx_idx: BPosition::from_index(end),
+            l1_origin: 0,
             remote_epochs: self.remote_epochs,
             txs: recorded,
         })
@@ -181,7 +182,30 @@ impl DerivedRecords {
             .map(|(block_number, acc)| acc.into_closed_block(block_number))
             .collect::<Result<Vec<_>>>()?;
         anyhow::ensure!(!blocks.is_empty(), "workload produced no blocks");
-        Ok(blocks)
+        Ok(Self::with_running_ends(blocks))
+    }
+
+    /// Give each block the running count of its records as its end
+    /// index, as on the live stream. The payload carries the end index,
+    /// and replay anchors a block's items to it, so a per-block count
+    /// would place a block before the end of the previous one. A record
+    /// takes one slot for its marker and one for each message.
+    fn with_running_ends(blocks: Vec<ClosedBlock>) -> Vec<ClosedBlock> {
+        blocks
+            .into_iter()
+            .scan(0u64, |end, block| {
+                let remote: usize = block
+                    .remote_epochs
+                    .iter()
+                    .map(|record| 1 + record.messages.iter().count())
+                    .sum();
+                *end += (remote + block.txs.len()) as u64;
+                Some(ClosedBlock {
+                    end_tx_idx: BPosition::from_index(*end),
+                    ..block
+                })
+            })
+            .collect()
     }
 }
 

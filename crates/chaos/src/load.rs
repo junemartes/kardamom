@@ -25,6 +25,10 @@ pub struct Verdict {
     pub failures: Vec<String>,
     pub missing: u64,
     #[serde(default)]
+    pub offered: u64,
+    #[serde(default)]
+    pub accepted: u64,
+    #[serde(default)]
     pub seq_dropped: Option<i64>,
 }
 
@@ -42,6 +46,15 @@ pub struct LoadSpec {
     pub receipt_rpcs: Vec<String>,
     pub chain_id: u64,
     pub account: u32,
+    /// The first nonce the load signs. A case load starts a fresh
+    /// account at 0; the recovery probe continues the case's account.
+    pub nonce_start: u64,
+    /// What must get a receipt: every accepted submit for a case load,
+    /// every offered one for the recovery probe.
+    pub completeness: Completeness,
+    /// A probe submits at the target rate from its first second, with
+    /// no ramp.
+    pub fixed_rate: bool,
     pub duration: Duration,
     pub tps: NonZeroU32,
     pub retry_submit: u32,
@@ -68,7 +81,7 @@ impl LoadSpec {
             duration: self.duration,
             target_tps: self.tps,
             sender_range,
-            nonce_start: 0,
+            nonce_start: self.nonce_start,
             mnemonic: ANVIL_MNEMONIC.to_string(),
             to: SINK,
             value: U256::from(1),
@@ -80,10 +93,10 @@ impl LoadSpec {
             ramp_step_tps,
             ramp_step_secs: NonZeroU64::new(15).context("ramp step secs")?,
             soak_fraction: 0.8,
-            completeness: Completeness::Accepted,
+            completeness: self.completeness,
             assert_all_delivered: true,
             chaos_mode: true,
-            fixed_rate: false,
+            fixed_rate: self.fixed_rate,
             scrape: vec!["executor".into(), "ingress".into(), "sequencer".into()],
             metrics_via_docker: true,
             subscribe: false,

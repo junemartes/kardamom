@@ -226,6 +226,62 @@ fn reinsert_for_retry_rewinds_next_nonce() {
     assert_eq!(st.next_nonce(s(1)), 1);
 }
 
+// A deep rewind arrives in two batches, the low nonces first: the
+// confirm-timeout sweep is bounded per loop iteration. The second batch
+// must not raise the floor over the first.
+#[test]
+fn a_second_rewind_batch_of_higher_nonces_keeps_the_lower_floor() {
+    let mut st: PartitionState<u32> = PartitionState::new(8, TTL);
+    for n in 0..6u64 {
+        st.process(s(1), n, u32::try_from(n).unwrap());
+    }
+    assert_eq!(st.next_nonce(s(1)), 6);
+    // Batch one: nonces 3..=0, descending. Batch two: nonces 5..=4.
+    for n in [3u64, 2, 1, 0] {
+        st.reinsert_for_retry(s(1), n, u32::try_from(n).unwrap());
+    }
+    for n in [5u64, 4] {
+        st.reinsert_for_retry(s(1), n, u32::try_from(n).unwrap());
+    }
+    assert_eq!(st.next_nonce(s(1)), 0, "batch two raised the floor");
+    let drained: Vec<u64> = st.drain_pending().iter().map(|(_, n, _)| *n).collect();
+    assert_eq!(
+        drained,
+        vec![0, 1, 2, 3, 4, 5],
+        "a ref stayed below the floor"
+    );
+}
+
+#[test]
+fn refs_below_the_floor_count_only_what_a_drain_cannot_reach() {
+    let mut st: PartitionState<u32> = PartitionState::new(8, TTL);
+    for n in 0..4u64 {
+        st.process(s(1), n, 0);
+    }
+    for n in [3u64, 2, 1, 0] {
+        st.reinsert_for_retry(s(1), n, 0);
+    }
+    assert_eq!(
+        st.refs_below_floor(),
+        0,
+        "a rewound run drains from its floor"
+    );
+    // A floor seeded over the run is the defect the gauge exists for.
+    st.seed_next_nonce(s(1), 2);
+    assert_eq!(st.refs_below_floor(), 2);
+    // A future nonce of another sender is above its floor.
+    st.process(s(2), 5, 0);
+    assert_eq!(st.refs_below_floor(), 2);
+}
+
+#[test]
+fn a_rewind_of_a_cold_sender_seeds_the_floor_at_its_nonce() {
+    let mut st: PartitionState<u32> = PartitionState::new(8, TTL);
+    st.reinsert_for_retry(s(1), 7, 70);
+    assert_eq!(st.next_nonce(s(1)), 7);
+    assert_eq!(st.drain_pending(), vec![(s(1), 7, 70)]);
+}
+
 #[test]
 fn parked_entry_expires_at_ttl() {
     let mut st: PartitionState<u32> = PartitionState::new(4, TTL);

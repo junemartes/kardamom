@@ -182,6 +182,7 @@ class DeployTest(unittest.TestCase):
             'workloads_namespace': 'staging',
             'workloads_cluster_retention': '8192',
             'workloads_cluster_snapshot_s': '60',
+            'workloads_cluster_file_sync_level': '2',
             'workloads_remote_origins': '412399',
         }, check=True)
         plans = self.api.state['plans']
@@ -191,6 +192,7 @@ class DeployTest(unittest.TestCase):
         self.assertIn('http://aux-0.node.dc1.consul:8548', validator)
         self.assertNotIn('http://execution.example', validator)
         self.assertIn('8192', json.dumps(plans['cluster']))
+        self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
         self.assertEqual(self.api.state['writes'], [])
 
     def test_resize_reuses_deployment_inputs_and_image_pins(self):

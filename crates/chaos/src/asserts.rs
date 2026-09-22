@@ -17,7 +17,66 @@ use crate::probes::EXECUTOR_BLOCK_METRIC;
 enum Standing {
     Unreachable(String),
     Lagging(String, i64),
+    /// Inside the lag bound, but at or below the block it showed in the
+    /// first sample that put the whole fleet inside the bound.
+    Stalled(String, i64),
     Converged,
+}
+
+/// One sample of every executor's own block gauge, in fleet order. A
+/// failed scrape stays `None`: it is evidence, not zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FleetSample {
+    blocks: Vec<Option<i64>>,
+}
+
+impl FleetSample {
+    fn head(&self) -> Option<i64> {
+        self.blocks.iter().flatten().copied().max()
+    }
+
+    /// Every replica answers and is within `lag` blocks of the head.
+    fn within(&self, lag: i64) -> bool {
+        let Some(head) = self.head() else {
+            return false;
+        };
+        self.blocks
+            .iter()
+            .all(|b| b.is_some_and(|b| head.saturating_sub(b) <= lag))
+    }
+
+    /// Each replica's standing. With a `base`, a replica inside the lag
+    /// bound is `Converged` only when its block is past its block in
+    /// `base`: a replica that stopped inside the bound reads as
+    /// `Stalled`, not as recovered.
+    fn standings(&self, nodes: &[String], lag: i64, base: Option<&Self>) -> Vec<Standing> {
+        let head = self.head();
+        let floors = base.map(|b| b.blocks.as_slice()).unwrap_or_default();
+        self.blocks
+            .iter()
+            .zip(nodes)
+            .enumerate()
+            .map(|(i, (block, node))| {
+                let floor = floors.get(i).copied().flatten();
+                Standing::of(node, *block, head, lag, floor)
+            })
+            .collect()
+    }
+}
+
+impl Standing {
+    fn of(node: &str, block: Option<i64>, head: Option<i64>, lag: i64, floor: Option<i64>) -> Self {
+        let (Some(block), Some(head)) = (block, head) else {
+            return Self::Unreachable(node.to_string());
+        };
+        if head.saturating_sub(block) > lag {
+            return Self::Lagging(node.to_string(), head.saturating_sub(block));
+        }
+        match floor {
+            Some(floor) if block <= floor => Self::Stalled(node.to_string(), block),
+            _ => Self::Converged,
+        }
+    }
 }
 
 impl Harness {
@@ -137,24 +196,47 @@ impl Harness {
     }
 
     /// The per-replica recovery verdict every case ends with: within the
-    /// convergence SLO, every executor's own gauge must be scrapeable
-    /// and within the lag bound of the fleet head. The fleet-maximum
-    /// probes hide a replica that never recovered; this does not.
+    /// convergence SLO, every executor's own gauge must be scrapeable,
+    /// within the lag bound of the fleet head, and past the block it
+    /// showed when the fleet first came inside the bound. The
+    /// fleet-maximum probes hide a replica that never recovered; this
+    /// does not. One sample inside the bound is not enough: a replica
+    /// that stalled less than the lag bound ago still reads as close to
+    /// the head, and the sealer stamps a block on every tick with or
+    /// without load, so a live replica always advances.
     ///
     /// # Errors
     ///
-    /// Returns an error naming the unreachable or lagging replicas.
+    /// Returns an error naming the unreachable, lagging or stalled
+    /// replicas.
     pub async fn assert_executors_converged(&self, case: &str) -> anyhow::Result<()> {
         let budget = Budget::new(self.knobs.converge_slo, Duration::from_secs(5));
+        let lag = i64::try_from(self.knobs.converge_lag).unwrap_or(i64::MAX);
+        let nodes: Vec<String> = self
+            .probes
+            .executors
+            .iter()
+            .map(|n| n.container.clone())
+            .collect();
+        let nodes = &nodes;
         let last = RefCell::new(String::new());
         let last_ref = &last;
+        let base: RefCell<Option<FleetSample>> = RefCell::new(None);
+        let base_ref = &base;
         let outcome = poll::until(budget, |_| async move {
-            let (head, standings) = self.fleet_standings().await;
-            *last_ref.borrow_mut() = describe(head, &standings);
-            Ok(
-                (head.is_some() && standings.iter().all(|s| *s == Standing::Converged))
-                    .then_some(head),
-            )
+            let sample = self.fleet_sample().await;
+            let standings = sample.standings(nodes, lag, base_ref.borrow().as_ref());
+            *last_ref.borrow_mut() = describe(sample.head(), &standings);
+            if base_ref.borrow().is_none() {
+                // The first sample inside the bound is the floor the next
+                // samples must pass; it is never the verdict itself.
+                base_ref.replace(sample.within(lag).then_some(sample));
+                return Ok(None);
+            }
+            Ok(standings
+                .iter()
+                .all(|s| *s == Standing::Converged)
+                .then_some(sample.head()))
         })
         .await?;
         let (head, elapsed) = outcome.or_fail(|t| {
@@ -165,7 +247,7 @@ impl Harness {
             )
         })?;
         crate::log(format!(
-            "{case}: all {} executors converged (head {}, per-replica lag <= {}) after {}s",
+            "{case}: all {} executors converged and advancing (head {}, per-replica lag <= {}) after {}s",
             self.probes.executors.len(),
             head.unwrap_or(0),
             self.knobs.converge_lag,
@@ -174,61 +256,62 @@ impl Harness {
         Ok(())
     }
 
-    async fn fleet_standings(&self) -> (Option<i64>, Vec<Standing>) {
+    async fn fleet_sample(&self) -> FleetSample {
         let mut blocks = Vec::new();
         for i in 0..self.probes.executors.len() {
             blocks.push(self.probes.exec_metric(i, EXECUTOR_BLOCK_METRIC).await);
         }
-        let head = blocks.iter().flatten().copied().max();
-        let lag = i64::try_from(self.knobs.converge_lag).unwrap_or(i64::MAX);
-        let standings = blocks
-            .iter()
-            .zip(&self.probes.executors)
-            .map(|(block, node)| match (block, head) {
-                (None, _) | (_, None) => Standing::Unreachable(node.container.clone()),
-                (Some(b), Some(h)) if h.saturating_sub(*b) > lag => {
-                    Standing::Lagging(node.container.clone(), h.saturating_sub(*b))
-                }
-                _ => Standing::Converged,
-            })
-            .collect();
-        (head, standings)
+        FleetSample { blocks }
     }
 
-    /// Both ingress exporters must answer: real liveness, not a Nomad
-    /// row count.
+    /// Both ingress exporters and both JSON-RPC listeners must answer: real
+    /// liveness, not a Nomad row count.
+    ///
+    /// The exporter alone is not enough. A restarted ingress starts its
+    /// exporter first and binds the JSON-RPC port after it connects to the
+    /// cluster, 27 s later in one CI run. The recovery probe calls the RPC
+    /// once, so a gate that reads only the exporter lets the probe meet a
+    /// refused connection.
     ///
     /// # Errors
     ///
-    /// Returns an error if a replica's exporter stays dark for 120s.
+    /// Returns an error if a replica's exporter or RPC stays dark for 120s.
     pub async fn assert_ingress_pair_live(&self, case: &str) -> anyhow::Result<()> {
         let outcome = poll::until(Budget::secs(120, 5), |_| async move {
-            Ok(self.dark_ingress().await.is_none().then_some(()))
+            Ok(self.dark_ingress().await?.is_none().then_some(()))
         })
         .await?;
         outcome.or_fail(|t| {
             crate::chaos_fail!(
-                "{case}: an ingress replica exporter is dark after {}s (pair not fully recovered)",
+                "{case}: an ingress replica exporter or JSON-RPC is dark after {}s (pair not fully recovered)",
                 t.as_secs()
             )
         })?;
-        crate::log(format!("{case}: both ingress exporters live"));
+        crate::log(format!("{case}: both ingress exporters and RPCs live"));
         Ok(())
     }
 
-    /// The first ingress replica whose exporter does not answer.
-    async fn dark_ingress(&self) -> Option<String> {
+    /// The first ingress replica whose exporter or JSON-RPC does not answer.
+    async fn dark_ingress(&self) -> anyhow::Result<Option<String>> {
         for node in &self.probes.ingresses {
-            if !self
-                .probes
-                .scrape()
-                .answers(&self.probes.ingress_target(node))
-                .await
-            {
-                return Some(node.container.clone());
+            if !self.ingress_answers(node).await? {
+                return Ok(Some(node.container.clone()));
             }
         }
-        None
+        Ok(None)
+    }
+
+    async fn ingress_answers(&self, node: &crate::probes::Probed) -> anyhow::Result<bool> {
+        let exporter = self
+            .probes
+            .scrape()
+            .answers(&self.probes.ingress_target(node))
+            .await;
+        let url = format!("http://{}:{}", node.ip, crate::harness::INGRESS_RPC_PORT);
+        let rpc = crate::rpc::Rpc::new(&url, self.knobs.chain_id)?
+            .answers()
+            .await;
+        Ok(exporter && rpc)
     }
 
     /// The must-not-progress check: the executor block gauge stays flat
@@ -312,6 +395,7 @@ fn describe(head: Option<i64>, standings: &[Standing]) -> String {
         .filter_map(|s| match s {
             Standing::Unreachable(n) => Some(format!("{n}=unreachable")),
             Standing::Lagging(n, lag) => Some(format!("{n}=lag:{lag}")),
+            Standing::Stalled(n, block) => Some(format!("{n}=stalled-at:{block}")),
             Standing::Converged => None,
         })
         .collect();
@@ -321,3 +405,6 @@ fn describe(head: Option<i64>, standings: &[Standing]) -> String {
         bad.join(" ")
     )
 }
+
+#[cfg(test)]
+mod tests;

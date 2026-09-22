@@ -440,6 +440,13 @@ ingress: a local miss, so the read touches Redis. The pipeline must progress thr
   mirrors find Redis cold and rebuild from the executors' newest checkpoint: the
   `rebuild: done` log lines rise, the head advances, and a genesis account no live batch
   touched has a row.
+- `redis-total-loss-recover` (in the `chaos-fleet` shard; the `chaos-cache` shard has no
+  time left): the whole redis job stopped for 30 s, so the primary, the replica and the three
+  sentinels are gone and no reader can resolve a primary. The readers degrade, the pipeline
+  progresses, and the mirrors retry their writes past the 10 s outage bound. The job starts
+  again with both instances empty. The sentinels name a primary, every mirror finishes a
+  rebuild from its executor's newest checkpoint, the head advances, a genesis account has a
+  row again, and the readers use Redis without a degraded read.
 - Deferred: `failover-head-regression` depends on replication lag at the moment of a
   promotion, which this harness cannot arrange deterministically. The mirror's regression
   rebuild is covered by its unit tests.

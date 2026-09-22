@@ -45,6 +45,7 @@ workloads_batcher_eoa: "{{ lookup('env', 'BATCHER_EOA') | default('0x3C44CdDdB6a
 workloads_chain_id: "{{ lookup('env', 'L2_CHAIN_ID') | default(chain_id, true) }}"
 workloads_cluster_retention: "{{ lookup('env', 'KARDAMOM_CLUSTER_RETENTION') }}"
 workloads_cluster_snapshot_s: "{{ lookup('env', 'KARDAMOM_CLUSTER_SNAPSHOT_S') }}"
+workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC_LEVEL') }}"
 workloads_remote_origins: "{{ lookup('env', 'KARDAMOM_REMOTE_ORIGINS') }}"
 workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC') }}"
 workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"

@@ -40,6 +40,17 @@ variable "cluster_snapshot_interval_s" {
   default = "300"
 }
 
+# File sync level of the Raft log and the archive
+# (-Dkardamom.cluster.fileSyncLevel): 0 leaves a write in the page cache,
+# 1 syncs the data of every write batch, 2 syncs data and metadata. At 0
+# an entry that a quorum acknowledged can exist only in page caches, and a
+# power loss that takes the members together drops it. Ansible deployment
+# passes -var from KARDAMOM_CLUSTER_FILE_SYNC_LEVEL.
+variable "cluster_file_sync_level" {
+  type    = string
+  default = "1"
+}
+
 # Remote-origin allowlist (-Dkardamom.cluster.remoteOrigins): the peer
 # chain ids whose cross-chain records (kind 5) this sealer seals. An
 # empty list disables interop, and the sealer rejects every kind-5
@@ -177,7 +188,7 @@ job "cluster" {
       # same mechanism as the aeron job's _JAVA_OPTIONS. ${meta.node_ip}
       # interpolates in env exactly as it would in args.
       env {
-        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins}"
+        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins}"
       }
 
       config {

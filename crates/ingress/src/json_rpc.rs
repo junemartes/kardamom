@@ -154,13 +154,14 @@ impl<Backend: ProxyBackend> IngressEthApiServer for IngressHandlers<Backend> {
     }
 
     async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>> {
-        // This is served from the in-memory `ReceiptCache`, populated
-        // off the tx_receipts stream, since the ingress holds no state
-        // DB. Returns `null`, by JSON-RPC convention, if not yet
-        // committed.
+        // The in-memory `ReceiptCache` first, populated off the
+        // tx_receipts stream; on a miss, one query to an executor's state
+        // DB, the durable copy. Returns `null`, by JSON-RPC convention,
+        // if not yet committed.
         Ok(self
             .proxy
-            .lookup_receipt_by_hash(hash)
+            .receipt_by_hash(client_ip(), hash)
+            .await
             .map(|r| RpcReceipt::from(&r).0))
     }
 }
