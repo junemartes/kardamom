@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use kardamom_types::{BPosition, Deposit, TxDataLoc, TxEnvelope};
 use rusteron_archive::AeronArchiveReplayParams;
+use rusteron_archive::bindings::{AERON_NULL_COUNTER_ID, AERON_NULL_VALUE};
 use tracing::{info, warn};
 
 use tokio::sync::watch;
@@ -166,6 +167,29 @@ struct ReplayPlan {
     /// The limit the plan was bounded with. It goes into a replay-start
     /// error, next to the limit the archive names in its refusal.
     limit: RecordedLimit,
+}
+
+impl ReplayPlan {
+    /// The archive's replay parameters for `[from_raw, from_raw + len)`.
+    ///
+    /// Every field that the plan does not use holds Aeron's null value,
+    /// `-1`. Zero is not null. A limit counter id of zero asks the archive
+    /// for a replay that counter 0 of its media driver bounds, and that
+    /// counter is the driver's total of bytes sent. The total starts again at
+    /// zero with the driver. After a node restart the archive then refused
+    /// every range above the new total ("must be less than the limit
+    /// position"), although the recording held the range.
+    fn params(&self) -> Result<AeronArchiveReplayParams, LogError> {
+        AeronArchiveReplayParams::new(
+            AERON_NULL_COUNTER_ID,
+            i32::MAX,
+            self.from_raw,
+            self.len,
+            i64::from(AERON_NULL_VALUE),
+            i64::from(AERON_NULL_VALUE),
+        )
+        .map_err(|e| LogError::Aeron(format!("replay params: {e}")))
+    }
 }
 
 /// How far a recording reaches on the connected archive: the recorded
@@ -672,8 +696,7 @@ impl ArchiveRefetcher {
         replay_stream: i32,
         plan: &ReplayPlan,
     ) -> Result<i64, LogError> {
-        let params = AeronArchiveReplayParams::new(0, i32::MAX, plan.from_raw, plan.len, 0, 0)
-            .map_err(|e| LogError::Aeron(format!("replay params: {e}")))?;
+        let params = plan.params()?;
         let channel = crate::ffi::c_uri(
             &replay_sub_uri(&plan.endpoint, rec.session_id),
             "replay channel",
