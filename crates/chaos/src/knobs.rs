@@ -84,6 +84,11 @@ pub struct Knobs {
     pub load_ready_timeout: Duration,
     /// The first funded account a case may use.
     pub account_base: u32,
+    /// The funded account of the smoke gate. No case load spends it, so
+    /// the recovery probe uses it as the sender with nothing in flight
+    /// during an outage. A reuse run on a used chain passes another,
+    /// unused, account through `KARDAMOM_CHAOS_GATE_ACCOUNT`.
+    pub gate_account: u32,
     /// Which ingress replica the hard kill targets, 0 or 1.
     pub ingress_victim: u32,
     /// The fleet convergence budget after every case.
@@ -220,6 +225,7 @@ impl Knobs {
             load_flow_timeout: env.secs("LOAD_FLOW_TIMEOUT_S", 60)?,
             load_ready_timeout: env.secs("LOAD_READY_TIMEOUT_S", 600)?,
             account_base: env.u32("CHAOS_ACCT_BASE", 7)?,
+            gate_account: env.u32("KARDAMOM_CHAOS_GATE_ACCOUNT", 0)?,
             ingress_victim: Self::ingress_victim(&env)?,
             converge_slo: env.secs("EXEC_CONVERGE_SLO_S", 150)?,
             converge_lag: env.u64("EXEC_CONVERGE_LAG", 50)?,

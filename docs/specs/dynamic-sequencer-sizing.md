@@ -338,7 +338,7 @@ Residual effects:
   formula guarantees cross-placement only when M equals the sequencer node
   count. Each group passes an explicit lane and vslot set instead.
 - **Ansible:** `node_classes.sequencer.count` follows the active lane
-  count. The hcloud path from the hybrid-fleet plan adds machines.
+  count. The cloud path from the hybrid-fleet plan adds machines.
 - **Contract:** `ansible/contract.yml` checks configuration mirrors and map
   bounds. Compiled Nomad job tests check port lanes and overlap arguments.
   Rust tests check rebalance behavior and funded-account routing. Outside a

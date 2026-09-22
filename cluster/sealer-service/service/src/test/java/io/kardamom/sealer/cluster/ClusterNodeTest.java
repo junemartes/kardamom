@@ -89,4 +89,24 @@ final class ClusterNodeTest {
         // A typo is fatal, never a silently disabled peer.
         assertThrows(IllegalStateException.class, () -> ClusterNode.parseRemoteOrigins("412347,abc"));
     }
+
+    @Test
+    void fileSyncLevelDefaultsToZeroAndRefusesAValueOutsideZeroToTwo() {
+        final String key = "kardamom.cluster.fileSyncLevel";
+        final String before = System.getProperty(key);
+        try {
+            System.clearProperty(key);
+            assertEquals(0, ClusterNode.fileSyncLevel());
+            System.setProperty(key, "2");
+            assertEquals(2, ClusterNode.fileSyncLevel());
+            System.setProperty(key, "3");
+            assertThrows(IllegalArgumentException.class, ClusterNode::fileSyncLevel);
+        } finally {
+            if (before == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, before);
+            }
+        }
+    }
 }

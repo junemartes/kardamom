@@ -80,7 +80,7 @@ impl Harness {
         ))
     }
 
-    fn release_binary(&self, name: &str) -> anyhow::Result<PathBuf> {
+    pub(crate) fn release_binary(&self, name: &str) -> anyhow::Result<PathBuf> {
         let path = self
             .lifecycle
             .repo_root()
@@ -91,7 +91,7 @@ impl Harness {
         Ok(path)
     }
 
-    async fn settlement_address(&self) -> anyhow::Result<String> {
+    pub(crate) async fn settlement_address(&self) -> anyhow::Result<String> {
         if let Some(explicit) = self.knobs.stages.semantics.settlement.clone() {
             return Ok(explicit);
         }

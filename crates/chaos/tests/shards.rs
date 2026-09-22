@@ -28,15 +28,6 @@
 use kardamom_chaos::lifecycle::DeployVars;
 use kardamom_chaos::{Harness, Knobs, Lifecycle, Shard};
 
-/// The funded account of the smoke gate. A reuse run on a used chain
-/// passes another, unused, account through `KARDAMOM_CHAOS_GATE_ACCOUNT`.
-fn gate_account() -> anyhow::Result<u32> {
-    std::env::var("KARDAMOM_CHAOS_GATE_ACCOUNT").map_or(Ok(0), |v| {
-        v.parse()
-            .map_err(|e| anyhow::anyhow!("KARDAMOM_CHAOS_GATE_ACCOUNT: {e}"))
-    })
-}
-
 /// The two shards without chaos: the sustained load, and the
 /// chain-semantics suite.
 #[derive(Debug, Clone, Copy)]
@@ -95,7 +86,7 @@ async fn run_shard(shard: Shard) -> anyhow::Result<()> {
         lifecycle.up(&shard.deploy_vars()).await?
     };
     let mut harness = Harness::new(contract, knobs, lifecycle.clone())?;
-    harness.smoke_gate(gate_account()?).await?;
+    harness.smoke_gate(harness.knobs.gate_account).await?;
     let cases = case_list(shard);
     kardamom_chaos::log(format!(
         "chaos suite: shard={} cases=[{}] tps={} case_s={}",
@@ -127,7 +118,7 @@ async fn run_stage(stage: Stage) -> anyhow::Result<()> {
         lifecycle.up(&DeployVars::default()).await?
     };
     let harness = Harness::new(contract, knobs, lifecycle.clone())?;
-    harness.smoke_gate(gate_account()?).await?;
+    harness.smoke_gate(harness.knobs.gate_account).await?;
     stage.run(&harness).await?;
     harness.ingress_churn().await?;
     harness.validator_verdict().await?;
@@ -208,6 +199,18 @@ async fn chaos_sequencer() {
 #[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
 async fn chaos_cluster() {
     shard_test(Shard::Cluster).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
+async fn chaos_fleet() {
+    shard_test(Shard::Fleet).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
+async fn chaos_coordinated() {
+    shard_test(Shard::Coordinated).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

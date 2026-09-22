@@ -131,6 +131,25 @@ impl Harness {
         Ok(())
     }
 
+    /// `docker start` whole node containers, in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a node does not start.
+    pub async fn start_nodes(&self, nodes: &[String]) -> anyhow::Result<()> {
+        for node in nodes {
+            self.start_node(node).await?;
+        }
+        Ok(())
+    }
+
+    async fn start_node(&self, node: &str) -> anyhow::Result<()> {
+        self.nodes
+            .start(node)
+            .await
+            .map_err(|e| crate::chaos_fail!("could not restart node {node}: {e}"))
+    }
+
     async fn await_node_exited(&self, node: &str) -> anyhow::Result<()> {
         let outcome = poll::until(Budget::secs(30, 2), |_| async move {
             Ok((self.nodes.running(node).await == Some(false)).then_some(()))

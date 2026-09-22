@@ -20,7 +20,7 @@ use crate::batch::{BatchAccumulator, ClosedBlock};
 use crate::blob::pack_to_blobs;
 use crate::compress::{DEFAULT_LEVEL, encode_zstd};
 use crate::error::BatcherError;
-use crate::frame::{BlockFrame, Kar1Payload, TxFrame, encode as frame_encode};
+use crate::frame::{BlockCursor, BlockFrame, Kar1Payload, TxFrame, encode as frame_encode};
 
 /// Metric names. Use `metrics::Recorder` to scrape them. The runtime sets up
 /// a Prometheus exporter with `metrics-exporter-prometheus`.
@@ -308,6 +308,10 @@ fn build_payload(blocks: &[ClosedBlock]) -> Kar1Payload {
         .map(|b| BlockFrame {
             block_number: b.block_number,
             l2_timestamp: b.l2_timestamp,
+            cursor: Some(BlockCursor {
+                end_tx_idx: b.end_tx_idx.as_index(),
+                l1_origin: b.l1_origin,
+            }),
             remote_epochs: b.remote_epochs.clone(),
             txs: b
                 .txs

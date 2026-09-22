@@ -32,6 +32,9 @@ pub struct ClosedBlock {
     pub block_number: u64,
     pub l2_timestamp: u64,
     pub end_tx_idx: BPosition,
+    /// The L1 block number of the newest epoch at or before this block,
+    /// from the boundary.
+    pub l1_origin: u64,
     /// Remote-epoch records leading this block (canonical-stream order).
     pub remote_epochs: Vec<RemoteEpochRecord>,
     pub txs: Vec<RecordedTx>,
@@ -72,6 +75,7 @@ impl BatchAccumulator {
             block_number: b.block_number,
             l2_timestamp: b.l2_timestamp,
             end_tx_idx: b.end_tx_idx,
+            l1_origin: b.l1_origin,
             remote_epochs,
             txs,
         }

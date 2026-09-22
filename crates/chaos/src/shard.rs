@@ -10,6 +10,8 @@ pub enum Shard {
     Ingress,
     Sequencer,
     Cluster,
+    Fleet,
+    Coordinated,
     Retention,
     Cache,
 }
@@ -23,6 +25,8 @@ impl Shard {
             Self::Ingress => "chaos-ingress",
             Self::Sequencer => "chaos-sequencer",
             Self::Cluster => "chaos-cluster",
+            Self::Fleet => "chaos-fleet",
+            Self::Coordinated => "chaos-coordinated",
             Self::Retention => "chaos-retention",
             Self::Cache => "chaos-cache",
         }
@@ -65,9 +69,28 @@ impl Shard {
                 "cluster-follower-kill",
                 "cluster-member-rejoin",
                 "node-replace-sealer",
-                "cluster-quorum-loss-recover",
                 "cpu-squeeze",
             ],
+            // Every replica of one role down at once. Each case waits
+            // for the whole fleet to return and then keeps the load on
+            // it, so the shard runs its own cluster.
+            // The sealer total loss runs last: its recovery is the
+            // open product issue, and a failure there must not hide
+            // the executor cases.
+            Self::Fleet => &[
+                "executor-fleet-loss-recover",
+                "executor-fleet-wipe-recover",
+                "executor-fleet-total-wipe-recover",
+                "redis-total-loss-recover",
+                "cluster-quorum-loss-recover",
+                "cluster-total-loss-recover",
+            ],
+            // Failures that cross the redundancy of a role. The case
+            // `pipeline-blackout-recover` exists and is not listed: after
+            // a kill of every pipeline node the executors crash-loop on a
+            // canonical entry whose transaction data no archive serves,
+            // an open product defect. It joins the list with that fix.
+            Self::Coordinated => &["ingress-pair-loss-recover", "sequencer-lane-loss-recover"],
             Self::Retention => &["retention-overrun", "retention-overrun-validator"],
             // The mirror rebuild runs last: it flushes the projection.
             Self::Cache => &[
@@ -94,7 +117,12 @@ impl Shard {
                 cluster_snapshot_interval_s: None,
                 cluster_retention: Some(6144),
             },
-            Self::Executor | Self::Ingress | Self::Sequencer | Self::Cache => DeployVars::default(),
+            Self::Executor
+            | Self::Ingress
+            | Self::Sequencer
+            | Self::Fleet
+            | Self::Coordinated
+            | Self::Cache => DeployVars::default(),
         }
     }
 
@@ -113,7 +141,12 @@ impl Shard {
                 ("SQUEEZE_CPUS_PER_NODE", "0.4"),
             ],
             Self::Retention => &[("RUN_LOAD", "0"), ("KARDAMOM_CLUSTER_RETENTION", "6144")],
-            Self::Executor | Self::Ingress | Self::Sequencer | Self::Cache => &[("RUN_LOAD", "0")],
+            Self::Executor
+            | Self::Ingress
+            | Self::Sequencer
+            | Self::Fleet
+            | Self::Coordinated
+            | Self::Cache => &[("RUN_LOAD", "0")],
         }
     }
 }
@@ -129,6 +162,8 @@ mod tests {
             Shard::Ingress,
             Shard::Sequencer,
             Shard::Cluster,
+            Shard::Fleet,
+            Shard::Coordinated,
             Shard::Retention,
             Shard::Cache,
         ]
@@ -139,7 +174,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 31);
+        assert_eq!(all.len(), 38);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")
@@ -149,6 +184,8 @@ mod tests {
             Shard::Ingress,
             Shard::Sequencer,
             Shard::Cluster,
+            Shard::Fleet,
+            Shard::Coordinated,
             Shard::Retention,
             Shard::Cache,
         ] {

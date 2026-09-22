@@ -50,6 +50,7 @@ fn block_of(block_number: u64, raw_len: usize) -> ClosedBlock {
         block_number,
         l2_timestamp: 1_700_000_000 + block_number,
         end_tx_idx: pos(i32::try_from(block_number * 64).unwrap()),
+        l1_origin: 0,
         remote_epochs: Vec::new(),
         txs: vec![RecordedTx {
             position: pos(0),
@@ -213,6 +214,7 @@ fn record_at_the_derivation_cap_fits_in_five_blobs() {
         block_number: 3,
         l2_timestamp: 1_700_000_003,
         end_tx_idx: pos(0),
+        l1_origin: 0,
         remote_epochs: vec![record],
         txs: Vec::new(),
     };
@@ -233,6 +235,7 @@ fn wire_constants_match_the_encoder() {
     let empty = BlockFrame {
         block_number: 1,
         l2_timestamp: 2,
+        cursor: None,
         remote_epochs: Vec::new(),
         txs: Vec::new(),
     };

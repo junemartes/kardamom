@@ -32,6 +32,8 @@ public final class ClusterNode {
     static final int APP_VERSION = SemanticVersion.compose(0, 3, 0);
 
     public static void main(final String[] args) {
+        // Every stdout line carries its time from here on (see the class).
+        System.setOut(new TimestampedOut(System.out));
         // "0,ingressHost:port,consensusHost:port,logHost:port,catchupHost:port,archiveHost:port|1,...|2,..."
         final String clusterMembers = System.getProperty("kardamom.cluster.members");
         if (clusterMembers == null) throw new IllegalStateException("kardamom.cluster.members not set");
@@ -233,6 +235,25 @@ public final class ClusterNode {
         return false;
     }
 
+    /**
+     * The file sync level of the Raft log and the archive
+     * ({@code -Dkardamom.cluster.fileSyncLevel}): 0 leaves a write in the
+     * page cache, 1 syncs the data of every write batch, 2 syncs the data
+     * and the file metadata. At level 0 an entry that a quorum
+     * acknowledged can exist only in the page caches of its members, and
+     * a power loss that takes them together drops it. A process kill, or
+     * a container kill, never shows this: the host kernel keeps the page
+     * cache.
+     */
+    static int fileSyncLevel() {
+        final int level = Integer.getInteger("kardamom.cluster.fileSyncLevel", 0);
+        if (level < 0 || level > 2) {
+            throw new IllegalArgumentException(
+                "kardamom.cluster.fileSyncLevel must be 0, 1 or 2, not " + level);
+        }
+        return level;
+    }
+
     private static MediaDriver.Context driverContext(final String aeronDir) {
         return new MediaDriver.Context()
             .aeronDirectoryName(aeronDir)
@@ -257,6 +278,9 @@ public final class ClusterNode {
             .controlChannel("aeron:udp?endpoint=" + me[4])
             .localControlChannel("aeron:ipc?term-length=64k")
             .replicationChannel("aeron:udp?endpoint=" + nodeHost + ":0")
+            // The catalog level must be at least the recording level.
+            .fileSyncLevel(fileSyncLevel())
+            .catalogFileSyncLevel(fileSyncLevel())
             .recordingEventsEnabled(false)
             .threadingMode(ArchiveThreadingMode.SHARED);
     }
@@ -270,6 +294,7 @@ public final class ClusterNode {
             .clusterMembers(clusterMembers)
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
+            .fileSyncLevel(fileSyncLevel())
             .ingressChannel("aeron:udp")
             // The cluster log uses Aeron's 64MB default term length. That
             // gives a 192MB log buffer for the log publication, plus 192MB

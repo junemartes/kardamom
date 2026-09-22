@@ -57,6 +57,11 @@ pub(crate) const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_water
 /// in a void (a dead-leader window), or receipts are not flowing.
 pub(crate) const REF_UNCONFIRMED: &str = "kardamom_sequencer_ref_unconfirmed";
 pub(crate) const REF_REPUBLISHED: &str = "kardamom_sequencer_ref_republished_total";
+/// A gauge for buffered refs below their sender's floor. It is zero
+/// unless a rewind or a floor update stranded a ref: no drain reaches
+/// it, it never expires, and its sender is stuck. Alert on any nonzero
+/// value.
+pub(crate) const REF_BELOW_FLOOR: &str = "kardamom_sequencer_ref_below_floor";
 
 /// Remote epochs, and the messages inside them, relayed from
 /// `tx_remote_epochs` onto the canonical stream. Labeled by origin chain,
@@ -205,6 +210,10 @@ pub(crate) fn record_canonical_watermark(partition: u32, count: u64) {
 
 pub(crate) fn record_unconfirmed_refs(partition: u32, n: usize) {
     set(REF_UNCONFIRMED, partition, gauge_value(n));
+}
+
+pub(crate) fn record_refs_below_floor(partition: u32, n: usize) {
+    set(REF_BELOW_FLOOR, partition, gauge_value(n));
 }
 
 pub(crate) fn record_ref_republished(partition: u32, n: usize) {

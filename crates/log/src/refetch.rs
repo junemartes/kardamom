@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use kardamom_types::{BPosition, Deposit, TxDataLoc, TxEnvelope};
 use rusteron_archive::AeronArchiveReplayParams;
+use rusteron_archive::bindings::{AERON_NULL_COUNTER_ID, AERON_NULL_VALUE};
 use tracing::{info, warn};
 
 use tokio::sync::watch;
@@ -163,6 +164,83 @@ struct ReplayPlan {
     from_raw: i64,
     len: i64,
     endpoint: String,
+    /// The limit the plan was bounded with. It goes into a replay-start
+    /// error, next to the limit the archive names in its refusal.
+    limit: RecordedLimit,
+}
+
+impl ReplayPlan {
+    /// The archive's replay parameters for `[from_raw, from_raw + len)`.
+    ///
+    /// Every field that the plan does not use holds Aeron's null value,
+    /// `-1`. Zero is not null. A limit counter id of zero asks the archive
+    /// for a replay that counter 0 of its media driver bounds, and that
+    /// counter is the driver's total of bytes sent. The total starts again at
+    /// zero with the driver. After a node restart the archive then refused
+    /// every range above the new total ("must be less than the limit
+    /// position"), although the recording held the range.
+    fn params(&self) -> Result<AeronArchiveReplayParams, LogError> {
+        AeronArchiveReplayParams::new(
+            AERON_NULL_COUNTER_ID,
+            i32::MAX,
+            self.from_raw,
+            self.len,
+            i64::from(AERON_NULL_VALUE),
+            i64::from(AERON_NULL_VALUE),
+        )
+        .map_err(|e| LogError::Aeron(format!("replay params: {e}")))
+    }
+}
+
+/// How far a recording reaches on the connected archive: the recorded
+/// position of a recording that is still written, or the stop position
+/// of one that ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordedLimit {
+    position: i64,
+    active: bool,
+}
+
+impl RecordedLimit {
+    fn read(archive: &rusteron_archive::AeronArchive, recording_id: i64) -> Result<Self, LogError> {
+        if let Ok(position) = archive.get_recording_position(recording_id)
+            && position >= 0
+        {
+            return Ok(Self {
+                position,
+                active: true,
+            });
+        }
+        let position = archive
+            .get_stop_position(recording_id)
+            .map_err(|e| LogError::Aeron(format!("get_stop_position: {e}")))?;
+        Ok(Self {
+            position,
+            active: false,
+        })
+    }
+
+    /// The length of the replay `[from_raw, limit)`. Zero or less means
+    /// that the recording holds nothing at or after `from_raw`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `from_raw` is before the recording's start.
+    fn replay_len(self, rec: &FoundRecording, from_raw: i64) -> Result<i64, LogError> {
+        if from_raw < rec.start_position {
+            return Err(LogError::Aeron(format!(
+                "refetch: position {from_raw} precedes recording {} start {} — range not recoverable",
+                rec.recording_id, rec.start_position
+            )));
+        }
+        Ok(self.position - from_raw)
+    }
+
+    /// The recording ended at or before `from_raw`. An ended recording
+    /// never grows, so this copy holds no byte of the range, now or later.
+    fn ended_before(self, from_raw: i64) -> bool {
+        !self.active && from_raw >= self.position
+    }
 }
 
 /// A recording resolved on the remote archive.
@@ -331,13 +409,14 @@ impl ArchiveRefetcher {
                 .raw_position(from)
                 .unwrap_or(rec.start_position)
                 .max(rec.start_position);
-            let (len, endpoint) = self.replay_bounds(&endpoints, &rec, from_raw)?;
+            let (len, limit) = self.replay_bounds(&endpoints, &rec, from_raw)?;
             plans.push((
                 rec,
                 ReplayPlan {
                     from_raw,
                     len,
-                    endpoint,
+                    endpoint: self.cfg.replay_endpoint.clone(),
+                    limit,
                 },
             ));
         }
@@ -512,7 +591,7 @@ impl ArchiveRefetcher {
         session_id: i32,
     ) -> Result<Option<ReplayPlan>, LogError> {
         let from_raw = rec.raw_position(from)?;
-        let (len, endpoint) = match self.replay_bounds(endpoints, rec, from_raw) {
+        let (len, limit) = match self.replay_bounds(endpoints, rec, from_raw) {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "refetch: replay bounds failed; rotating endpoint");
@@ -520,47 +599,51 @@ impl ArchiveRefetcher {
                 return Err(e);
             }
         };
+        if limit.ended_before(from_raw) {
+            // This was a silent "nothing recorded" before, and each retry
+            // of the join loop asked the same copy again. Name the copy
+            // and both positions, and move on to the other archive.
+            let archive = self.live.as_ref().map_or("?", |l| l.endpoint.as_str());
+            let e = LogError::Aeron(format!(
+                "refetch: recording {} of session {session_id} on archive {archive} ended at position {}, at or before the requested position {from_raw} — this copy holds no byte of the range",
+                rec.recording_id, limit.position
+            ));
+            warn!(error = %e, "refetch: the newest recording of the session ended before the range; rotating endpoint");
+            self.rotate();
+            return Err(e);
+        }
         if len <= 0 {
             info!(
                 stream_id,
-                session_id, from_raw, "refetch: nothing recorded at/after the requested position"
+                session_id,
+                from_raw,
+                recording_id = rec.recording_id,
+                recorded_position = limit.position,
+                "refetch: the live recording does not reach the requested position yet"
             );
             return Ok(None);
         }
         Ok(Some(ReplayPlan {
             from_raw,
             len,
-            endpoint,
+            endpoint: self.cfg.replay_endpoint.clone(),
+            limit,
         }))
     }
 
-    /// Bound the replay: `[from_raw, recorded-position)` on the connected
-    /// archive. Also returns the replay destination endpoint.
+    /// Bound the replay: `[from_raw, limit)` on the connected archive.
+    /// Returns the replay length and the limit it came from.
     fn replay_bounds(
         &mut self,
         endpoints: &[String],
         rec: &FoundRecording,
         from_raw: i64,
-    ) -> Result<(i64, String), LogError> {
+    ) -> Result<(i64, RecordedLimit), LogError> {
         // `ensure_session` returns the cached session when it is fresh.
         // This call is cheap; it does not reconnect.
         let session = self.ensure_session(endpoints)?;
-        let archive = &session.archive;
-        // An active recording uses the current recorded position; a stopped
-        // one uses its stop position.
-        let bound = match archive.get_recording_position(rec.recording_id) {
-            Ok(p) if p >= 0 => p,
-            _ => archive
-                .get_stop_position(rec.recording_id)
-                .map_err(|e| LogError::Aeron(format!("get_stop_position: {e}")))?,
-        };
-        if from_raw < rec.start_position {
-            return Err(LogError::Aeron(format!(
-                "refetch: position {from_raw} precedes recording {} start {} — range not recoverable",
-                rec.recording_id, rec.start_position
-            )));
-        }
-        Ok((bound - from_raw, self.cfg.replay_endpoint.clone()))
+        let limit = RecordedLimit::read(&session.archive, rec.recording_id)?;
+        Ok((limit.replay_len(rec, from_raw)?, limit))
     }
 
     /// List every recording for `stream_id` in the archive's catalog
@@ -594,16 +677,23 @@ impl ArchiveRefetcher {
         replay_stream: i32,
         plan: &ReplayPlan,
     ) -> Result<i64, LogError> {
-        let params = AeronArchiveReplayParams::new(0, i32::MAX, plan.from_raw, plan.len, 0, 0)
-            .map_err(|e| LogError::Aeron(format!("replay params: {e}")))?;
+        let params = plan.params()?;
         let channel = crate::ffi::c_uri(
             &replay_sub_uri(&plan.endpoint, rec.session_id),
             "replay channel",
         )?;
+        // The archive's refusal names the limit it holds. The plan's own
+        // numbers go next to it: the two limits came from one archive
+        // session, and a refusal means that they differ.
         session
             .archive
             .start_replay(rec.recording_id, &channel, replay_stream, &params)
-            .map_err(|e| LogError::Aeron(format!("start_replay: {e}")))
+            .map_err(|e| {
+                LogError::Aeron(format!(
+                    "start_replay of recording {} from {} for {} bytes (planned against limit {}, active={}): {e}",
+                    rec.recording_id, plan.from_raw, plan.len, plan.limit.position, plan.limit.active
+                ))
+            })
     }
 
     /// Drain a replay subscription: deliver until [`DRAIN_IDLE`] of
@@ -727,3 +817,6 @@ fn recv_timeout<S: PollRecv>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

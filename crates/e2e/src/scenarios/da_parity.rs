@@ -136,6 +136,7 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
         by_block.entry(e.block_number).or_default().push(e);
     }
     let mut blocks = Vec::with_capacity(by_block.len());
+    let mut end = 0u64;
     for (block_number, mut txs) in by_block {
         txs.sort_by_key(|e| e.transaction_index);
         let recorded: Vec<RecordedTx> = txs
@@ -153,7 +154,11 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
                 },
             })
             .collect();
-        let end = recorded.len() as u64;
+        // The payload carries each block's canonical end index now, and
+        // replay anchors the block's items to it. So the stand-in must be
+        // the running count of records, as on the live stream, and not a
+        // count for this block alone.
+        end += recorded.len() as u64;
         blocks.push(ClosedBlock {
             block_number,
             // This value is synthetic. See the module docs.
@@ -161,6 +166,7 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
             // synthesized timestamp finite instead of wrapping.
             l2_timestamp: 1_700_000_000u64.saturating_add(block_number),
             end_tx_idx: BPosition::from_index(end),
+            l1_origin: 0,
             remote_epochs: vec![],
             txs: recorded,
         });

@@ -65,6 +65,20 @@ impl Evidence {
     ///
     /// Returns the wait's failure message after the timeout.
     pub async fn wait_count_gt(&self, wait: &CountWait<'_>) -> anyhow::Result<()> {
+        self.wait_count_reaches(wait, wait.baseline + 1).await
+    }
+
+    /// Wait until the log count of `wait.needle` reaches `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `wait.fail_msg` with the counts if the target is not
+    /// reached within `wait.timeout`.
+    pub async fn wait_count_reaches(
+        &self,
+        wait: &CountWait<'_>,
+        target: usize,
+    ) -> anyhow::Result<()> {
         let last = Cell::new(0_usize);
         let last_ref = &last;
         let outcome = poll::until(Budget::new(wait.timeout, wait.interval), |_| async move {
@@ -72,12 +86,12 @@ impl Evidence {
                 .count_lines(wait.job, wait.needle, wait.streams)
                 .await?;
             last_ref.set(now);
-            Ok((now > wait.baseline).then_some(now))
+            Ok((now >= target).then_some(now))
         })
         .await?;
         let (now, elapsed) = outcome.or_fail(|t| {
             crate::chaos_fail!(
-                "{} (log count {} -> {} over {}s)",
+                "{} (log count {} -> {} over {}s, target {target})",
                 wait.fail_msg,
                 wait.baseline,
                 last.get(),

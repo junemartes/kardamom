@@ -8,8 +8,8 @@ use crate::harness::Harness;
 use crate::nomad::Streams;
 use crate::poll::{self, Budget};
 
-const RESTORED: &str = "restored state from checkpoint";
-const FETCHED: &str = "fetched checkpoint from peer";
+pub(crate) const RESTORED: &str = "restored state from checkpoint";
+pub(crate) const FETCHED: &str = "fetched checkpoint from peer";
 
 pub(crate) async fn graceful_executor(h: &mut Harness) -> anyhow::Result<()> {
     h.inject_graceful("executor").await?;
@@ -207,7 +207,7 @@ async fn self_heal_lines(h: &Harness, victim: &str) -> Option<(bool, bool)> {
     Some((logs.contains(FETCHED), logs.contains(RESTORED)))
 }
 
-fn executor_containers(h: &Harness) -> Vec<String> {
+pub(crate) fn executor_containers(h: &Harness) -> Vec<String> {
     h.probes
         .executors
         .iter()
@@ -229,12 +229,26 @@ pub(crate) async fn wait_peer_checkpoint(h: &Harness, node: &str, ctx: &str) -> 
         .map(|_| ())
 }
 
+/// Wipe the state DB and the checkpoints of `node`.
 async fn wipe_state(h: &Harness, node: &str, ctx: &str) -> anyhow::Result<()> {
+    wipe_dirs(
+        h,
+        node,
+        ctx,
+        "rm -rf /opt/kardamom/state/* /opt/kardamom/checkpoints/*",
+    )
+    .await
+}
+
+/// Run the wipe `script` on `node`.
+pub(crate) async fn wipe_dirs(
+    h: &Harness,
+    node: &str,
+    ctx: &str,
+    script: &str,
+) -> anyhow::Result<()> {
     h.nodes
-        .exec(
-            node,
-            "rm -rf /opt/kardamom/state/* /opt/kardamom/checkpoints/*",
-        )
+        .exec(node, script)
         .await
         .map(|_| ())
         .map_err(|e| crate::chaos_fail!("{ctx}: could not wipe {node} state: {e}"))

@@ -16,13 +16,12 @@ cosign_pinned_sha256: "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9
 # --- deployment profile ---------------------------------------------------
 # One playbook, two profiles. `local` is the container path (CI and a
 # developer host): one control node, a plain-HTTP registry, and an
-# explicit node_ip on every inventory host. `production` is the Hetzner
-# profile: three voting Consul and Nomad servers on the dedicated core, a
+# explicit node_ip on every inventory host. `production` is the dedicated core
+# and cloud profile: three voting Consul and Nomad servers on the dedicated core, a
 # private interface selector in place of fixed addresses, gossip
 # encryption, ACLs, agent TLS and the host firewall.
-# inventories/hetzner/group_vars/production/profile.yml sets the production values, and
+# inventories/production/group_vars/production/profile.yml sets the production values, and
 # roles/profile checks them before any role changes a host.
-# See docs/agents/hetzner-hybrid-infra-spec.md.
 deployment_profile: "local"
 # Deployment identity. Nomad registers its own Consul services under
 # cluster_id, so two clusters in one Consul datacenter cannot join each
@@ -155,7 +154,7 @@ aeron_tmpfs_size: "2g"
 # No file in this tree names a node address. A node is reached by its Consul
 # record, <class>-<i>.node.<datacenter>.consul, through the resolver every
 # node runs (roles/consul); a service by <service>.service.consul. The
-# Terraform variables of a Hetzner deployment are the one place that holds
+# Terraform variables of a production deployment are the one place that holds
 # addresses.
 #
 # Each worker-tier class runs ONE pipeline service. (The old standalone

@@ -67,6 +67,15 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private long lastBoundaryClockMs = 0L;
 
+    /**
+     * Boundary ticks this process applied, for the stdout heartbeat only.
+     * It is not part of the replicated state and is never snapshotted.
+     */
+    private long boundaryTicks = 0L;
+
+    /** One heartbeat line per this many boundary ticks (a minute at a 2 s tick). */
+    private static final long BOUNDARY_TICK_LOG_EVERY = 30L;
+
     /** Contiguity rejects emitted (logged at power-of-two counts). */
     private long rejectedFrameCount = 0;
 
@@ -158,6 +167,15 @@ public final class SealerClusteredService implements ClusteredService {
         // Re-arming with the same correlation id is idempotent: Aeron replaces
         // the pending timer instead of scheduling a second one.
         scheduleBoundaryTimer();
+        // Log-driven, so every member prints it, also on replay. With the
+        // role lines it gives the order of the elections: which member led
+        // which term, and where in the log the term began.
+        System.out.println("cluster TERM memberId=" + memberId
+            + " leadershipTermId=" + leadershipTermId
+            + " leaderMemberId=" + leaderMemberId
+            + " logPosition=" + logPosition
+            + " role=" + cluster.role()
+            + " block=" + state.blockNumber());
     }
 
     @Override
@@ -483,6 +501,15 @@ public final class SealerClusteredService implements ClusteredService {
         }
         final Boundary boundary = state.onTick(cluster.time());
         egress.offerBoundary(boundary);
+        boundaryTicks++;
+        if (boundaryTicks % BOUNDARY_TICK_LOG_EVERY == 0) {
+            // The proof that the boundary clock runs. A stall with a leader
+            // and no later TICK line is a dead clock; a stall with TICK
+            // lines is a block that does not reach the consumers.
+            System.out.println("cluster boundary-clock TICK memberId=" + memberId
+                + " block=" + state.blockNumber()
+                + " role=" + cluster.role());
+        }
         // Cluster timers are one-shot, so re-arm for the next tick.
         scheduleBoundaryTimer();
     }

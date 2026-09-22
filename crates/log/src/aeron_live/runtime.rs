@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::Sender as CbSender;
+use crossbeam_channel::{RecvTimeoutError, Sender as CbSender};
 use rkyv::util::AlignedVec;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::error;
@@ -120,9 +120,12 @@ fn request<R>(
     cmd_tx
         .send(mk(ack_tx))
         .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
-    ack_rx
-        .recv_timeout(ACK_TIMEOUT)
-        .map_err(|_| LogError::Aeron(format!("{op} timed out")))?
+    ack_rx.recv_timeout(ACK_TIMEOUT).map_err(|e| match e {
+        RecvTimeoutError::Timeout => LogError::Aeron(format!("{op} timed out")),
+        // The thread ended with this command still queued, and dropped
+        // its ack sender. No time passed; "timed out" would mislead.
+        RecvTimeoutError::Disconnected => LogError::Aeron("aeron thread dropped".into()),
+    })?
 }
 
 /// The Aeron thread's whole body, run by [`AeronRuntime::spawn_with`] on
