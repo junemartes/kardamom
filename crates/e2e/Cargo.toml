@@ -57,7 +57,6 @@ bytes.workspace = true
 futures.workspace = true
 rkyv.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 # Chain-semantics harness deps — optional, activated by `full-pipeline-e2e`
 # so the default build stays as light as before.
@@ -98,25 +97,19 @@ alloy-contract.workspace = true
 alloy-network.workspace = true
 alloy-node-bindings.workspace = true
 alloy-provider.workspace = true
-alloy-rlp.workspace = true
 alloy-signer-local.workspace = true
 alloy-sol-types.workspace = true
 anyhow.workspace = true
-async-trait = "0.1"
 criterion.workspace = true
-crossbeam-channel.workspace = true
 hex = "0.4"
 libc.workspace = true
-hdrhistogram.workspace = true
 jsonrpsee = { workspace = true, features = ["http-client"] }
 kardamom-da-watcher = { path = "../da_watcher" }
 kardamom-deployer = { path = "../deployer", features = ["test-support"] }
 kardamom-ingress = { path = "../ingress" }
-kardamom-sequencer = { path = "../sequencer", features = ["testing"] }
 kardamom-state = { path = "../state" }
 serde_json.workspace = true
 tempfile.workspace = true
-tracing-subscriber.workspace = true
 
 [[bench]]
 name = "e2e_throughput"
