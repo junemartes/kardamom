@@ -65,8 +65,7 @@ pub mod watcher;
 // The deposit-derivation rule lives in `kardamom_types::epoch`, so the
 // verifier shares it. A second copy would verify nothing.
 pub use kardamom_types::epoch::{
-    DepositLog, LockboxLog, UpgradeLog, alias_l1_address, deposit_from_log, source_hash,
-    source_hash_system, upgrade_from_log,
+    DepositLog, LockboxLog, UpgradeLog, alias_l1_address, source_hash, source_hash_system,
 };
 pub use publisher::{EpochPublisher, PublishError};
 pub use rpc_source::RpcL1Source;

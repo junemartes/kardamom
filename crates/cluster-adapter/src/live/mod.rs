@@ -210,20 +210,6 @@ pub fn connect_with(
         .spawn_thread()
 }
 
-/// [`connect_with`] with every option at its default: no announcement, no
-/// replay, no egress filter.
-///
-/// # Errors
-///
-/// Returns an error if `cfg` is invalid, or the initial ingress
-/// publication or egress subscription fails to open.
-pub fn connect(
-    rt: AeronRuntime,
-    cfg: LiveClusterConfig,
-) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
-    connect_with(rt, cfg, ConnectOptions::default())
-}
-
 /// Append a small term length to a cluster control channel, unless the
 /// URI already pins one. Used for both the egress channel
 /// ([`SessionConnect::open_egress`]) and every ingress publication

@@ -102,26 +102,6 @@ impl AeronTestCluster {
         let node = spawn_node().await?;
         Ok(Self { nodes: vec![node] })
     }
-
-    /// Bring up `n` Aeron nodes for multi-recorder tests. `n` cannot be
-    /// zero: an empty cluster is never a valid multi-recorder test, and
-    /// `NonZeroUsize` rules it out at the call site instead of panicking
-    /// later on an empty `nodes` index.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if building the Aeron Docker image fails, or
-    /// if any of the `n` containers fails to start.
-    pub async fn multi_node(n: std::num::NonZeroUsize) -> anyhow::Result<Self> {
-        ensure_image_built().await?;
-        let n = n.get();
-        let mut nodes = Vec::with_capacity(n);
-        for _ in 0..n {
-            nodes.push(spawn_node().await?);
-        }
-        Ok(Self { nodes })
-    }
-
     /// "host:port" the test should pass as the Aeron Archive control
     /// channel endpoint for node `i`. Container mode resolves the
     /// dynamically allocated host port. External mode returns the

@@ -2,8 +2,6 @@
 
 use alloc::string::String;
 
-use alloy_primitives::B256;
-
 use crate::exec_types::TxIndex;
 use kardamom_types::BPosition;
 
@@ -68,9 +66,6 @@ pub enum ExecutorError {
     #[error("tx_data[{sequencer_id}] subscription closed")]
     TxDataClosed { sequencer_id: u8 },
 
-    #[error("tx_deposits subscription closed")]
-    DepositsClosed,
-
     #[error("tx_receipts publication closed")]
     TxReceiptsClosed,
 
@@ -91,20 +86,6 @@ pub enum ExecutorError {
     JoinTimeout {
         sequencer_id: u8,
         tx_data_position: BPosition,
-        timeout_ms: u128,
-    },
-
-    /// Mirror of [`Self::JoinTimeout`] for the deposit path. The
-    /// `tx_ordering` reader pulled a [`kardamom_types::DepositRef`], but the
-    /// referenced [`kardamom_types::Deposit`] never landed on `tx_deposits`
-    /// within the join timeout. Either the DA watcher failed, or the
-    /// sequencer republished a ref to a position the watcher never wrote.
-    #[error(
-        "deposit join timeout: source_hash={source_hash:?} deposit_position={deposit_position:?} not found within {timeout_ms} ms"
-    )]
-    DepositJoinTimeout {
-        source_hash: B256,
-        deposit_position: BPosition,
         timeout_ms: u128,
     },
 }

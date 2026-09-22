@@ -11,19 +11,6 @@ use super::LocalStack;
 use super::services::{self, SequencerOptions, ServiceSpec, Spawned};
 
 impl LocalStack {
-    /// SIGSTOP the sealer, so it stops stamping block boundaries. The
-    /// chain settles on one final head and stays there. Scenarios that
-    /// must reason about "the current block" with no race (the
-    /// bridge-withdrawal test matches a withdrawal to the attested output
-    /// for its block) freeze the clock first. This suspends the sealer
-    /// instead of killing it. Killing it would make the consumers'
-    /// cluster clients retry forever and wedge shutdown.
-    pub fn freeze_block_clock(&self) {
-        for p in &self.sealer.procs {
-            p.suspend();
-        }
-    }
-
     /// SIGKILL the executor: an unclean crash, with no shutdown hooks and
     /// no final flush. What survives is exactly what mdbx committed.
     pub fn crash_executor(&mut self) {

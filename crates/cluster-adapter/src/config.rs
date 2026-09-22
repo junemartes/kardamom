@@ -26,7 +26,7 @@ const DEFAULT_KEEP_ALIVE_INTERVAL_MS: NonZeroU64 = NonZeroU64::new(1000).expect(
 /// Cluster mode is the only mode. Every service that parses this section
 /// always connects to the cluster. There is no `enabled` knob; unknown
 /// keys are ignored. An empty or missing section is rejected only when
-/// the connection actually opens: [`crate::live::connect`] fails startup
+/// the connection actually opens: [`crate::live::connect_with`] fails startup
 /// on an empty `ingress_endpoints` or `egress_channel`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(default)]

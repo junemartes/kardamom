@@ -9,7 +9,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use tokio::sync::Notify;
 
@@ -222,6 +221,3 @@ impl MemoryCatalog {
         Ok(None)
     }
 }
-
-/// The wait used in tests that never want a query to block.
-pub const NO_WAIT: Duration = Duration::from_millis(0);

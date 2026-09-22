@@ -5,7 +5,7 @@ use crossbeam_channel::Sender;
 
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{
-    BPosition, Deposit, EpochRecord, StateDatabase, TxDataLoc, TxEnvelope, TxOrderingMessage,
+    BPosition, EpochRecord, StateDatabase, TxDataLoc, TxEnvelope, TxOrderingMessage,
 };
 
 use crate::delta::ParentState;
@@ -75,7 +75,6 @@ pub trait TxOrderingSubscription: Send {
 pub struct JoinRecovery {
     refetcher: kardamom_log::refetch::ArchiveRefetcher,
     tx_data_stream_base: i32,
-    tx_deposits_stream_id: i32,
 }
 
 /// A join-miss archive recovery attempt failed.
@@ -118,23 +117,6 @@ impl JoinRecovery {
             .refetcher
             .fetch_tx_data(stream_id, session_id, from, sink)?)
     }
-
-    /// Fetch `tx_deposits` recorded at or after `from`, from any publisher
-    /// session. Feed each into `sink`. Return the number of deposits
-    /// recovered.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` on a transport or archive-query failure.
-    pub fn recover_deposits(
-        &mut self,
-        from: BPosition,
-        sink: impl FnMut(BPosition, Deposit),
-    ) -> Result<u64, JoinRecoveryError> {
-        Ok(self
-            .refetcher
-            .fetch_deposits(self.tx_deposits_stream_id, from, sink)?)
-    }
 }
 
 /// Builds the thread-bound [`JoinRecovery`] inside the reader thread. A
@@ -144,7 +126,6 @@ impl JoinRecovery {
 pub struct JoinRecoveryFactory {
     pub(crate) cfg: kardamom_log::refetch::RefetchConfig,
     pub(crate) tx_data_stream_base: i32,
-    pub(crate) tx_deposits_stream_id: i32,
 }
 
 impl JoinRecoveryFactory {
@@ -153,7 +134,6 @@ impl JoinRecoveryFactory {
         JoinRecovery {
             refetcher: kardamom_log::refetch::ArchiveRefetcher::new(self.cfg),
             tx_data_stream_base: self.tx_data_stream_base,
-            tx_deposits_stream_id: self.tx_deposits_stream_id,
         }
     }
 }

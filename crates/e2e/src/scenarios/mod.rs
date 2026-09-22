@@ -41,7 +41,6 @@ use crate::harness::metrics::{self, Scrape};
 /// (`crates/ingress/src/error.rs`).
 pub const CODE_TIMEOUT: i32 = -32000;
 pub const CODE_INVALID: i32 = -32602;
-pub const CODE_INTERNAL: i32 = -32603;
 
 /// Metric names asserted across scenarios.
 ///

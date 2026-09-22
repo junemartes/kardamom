@@ -594,13 +594,6 @@ pub fn spawn_validator(spec: &ServiceSpec<'_>, opts: &ValidatorOptions<'_>) -> R
 pub struct ParkTimeout(std::num::NonZeroU64);
 
 impl ParkTimeout {
-    /// A park timeout of `ms` milliseconds. The `NonZeroU64` argument
-    /// carries the nonzero guarantee, so this constructor cannot fail.
-    #[must_use]
-    pub const fn from_millis(ms: std::num::NonZeroU64) -> Self {
-        Self(ms)
-    }
-
     /// A park timeout of `secs` seconds. `NonZeroU64::saturating_mul` is
     /// a `const fn`: it cannot panic, and the result is already
     /// `NonZeroU64`, so this constructor cannot fail either.

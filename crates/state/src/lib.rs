@@ -40,7 +40,7 @@ pub use recovery::{
     strip_trie,
 };
 pub use snapshot::StateSnapshot;
-pub use swap::{SnapshotHandle, SnapshotReceiver, channel as snapshot_channel};
+pub use swap::{SnapshotHandle, SnapshotReceiver};
 pub use trie::{AccountTrieParts, empty_root, state_root, storage_root};
 // The proof-generation API works with any libmdbx transaction kind. Callers
 // (the validator's witness anchoring) need to name these types without
