@@ -32,13 +32,10 @@ clap.workspace = true
 metrics = { workspace = true }
 serde.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 tokio-util = { workspace = true }
 toml.workspace = true
 crossbeam-channel = "0.5"
-dashmap = { workspace = true }
 
 [[bin]]
 name = "kardamom-executor"
@@ -54,9 +51,7 @@ kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"]
 # in-process test and bench in this crate shares.
 kardamom-engine = { workspace = true, features = ["test-support"] }
 alloy-signer-local.workspace = true
-alloy-network.workspace = true
 alloy-eips.workspace = true
-tempfile = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
 rand = "0.9"
 rand_chacha = "0.9"
