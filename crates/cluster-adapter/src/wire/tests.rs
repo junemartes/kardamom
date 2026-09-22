@@ -7,7 +7,7 @@ use alloy_primitives::{Address, B256, U256};
 use kardamom_types::epoch::EpochRecord;
 use kardamom_types::xchain::{Callback, RemoteEpochRecord};
 use kardamom_types::{
-    BPosition, BlockBoundaryStart, Deposit, DepositRef, TxOrderingMessage, TxRef,
+    BPosition, BlockBoundaryStart, Deposit, DepositRef, TxOrderingMessage, TxRef, VoidRecord,
 };
 
 use super::ingress::decode_replay_request;
@@ -330,6 +330,51 @@ fn replay_request_roundtrip() {
     assert_eq!(decode_replay_request(&b).unwrap(), (1234, 56));
     // A record ingress message is not a replay request.
     assert!(decode_replay_request(&encode_ingress_txref(&txref(), Address::ZERO, 0)).is_err());
+}
+
+#[test]
+fn a_void_request_carries_the_voter_the_index_and_the_hash() {
+    let void = VoidRecord {
+        index: 0x0102_0304_0506_0708,
+        tx_hash: B256::repeat_byte(0xAB),
+    };
+    let b = encode_void_request(7, &void);
+    assert_eq!(b[0], KIND_VOID_REQUEST);
+    assert_eq!(b[1], 7, "voter id at offset 1 (Java VOID_VOTER_OFFSET)");
+    assert_eq!(
+        b[2..10],
+        void.index.to_le_bytes(),
+        "index is little-endian at offset 2 (Java VOID_INDEX_OFFSET)"
+    );
+    assert_eq!(&b[10..42], void.tx_hash.as_slice());
+    assert_eq!(b.len(), 42, "Java MIN_VOID_REQUEST_LEN");
+}
+
+#[test]
+fn a_relayed_void_record_decodes_to_the_index_and_the_hash() {
+    let tx_hash = B256::repeat_byte(0xCD);
+    let mut relayed = tx_hash.to_vec();
+    relayed.push(RT_VOID);
+    relayed.extend_from_slice(&41u64.to_le_bytes());
+    let frame = encode_egress_record(99, &relayed).unwrap();
+    assert_eq!(
+        EgressItem::decode(&frame).unwrap(),
+        EgressItem::Record {
+            index: 99,
+            msg: TxOrderingMessage::Void(VoidRecord { index: 41, tx_hash }),
+        }
+    );
+}
+
+#[test]
+fn a_void_record_with_no_index_is_too_short() {
+    let mut relayed = B256::ZERO.to_vec();
+    relayed.push(RT_VOID);
+    let frame = encode_egress_record(0, &relayed).unwrap();
+    assert!(matches!(
+        EgressItem::decode(&frame),
+        Err(WireError::TooShort { .. })
+    ));
 }
 
 #[test]

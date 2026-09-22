@@ -32,6 +32,7 @@ use crate::boundary::BlockBoundaryStart;
 use crate::deposit::DepositRef;
 use crate::epoch::EpochRecord;
 use crate::txref::TxRef;
+use crate::void::VoidRecord;
 use crate::xchain::RemoteEpochRecord;
 
 /// One `tx_ordering` wire record. Variants stay narrow. This keeps the "tiny
@@ -60,6 +61,10 @@ pub enum TxOrderingMessage {
     /// these records themselves, which keeps boundary size independent of the
     /// peer count.
     RemoteEpoch(RemoteEpochRecord),
+    /// The sealer's decision to remove the [`TxRef`] at an earlier canonical
+    /// index, because no consumer can get its transaction data. See
+    /// [`VoidRecord`].
+    Void(VoidRecord),
 }
 
 /// Generates one variant's `is_*`/`as_*` pair. `$other` lists every
@@ -93,7 +98,7 @@ impl TxOrderingMessage {
         "transaction reference",
         TxRef,
         TxRef,
-        [DepositRef, BoundaryStart, Epoch, RemoteEpoch]
+        [DepositRef, BoundaryStart, Epoch, RemoteEpoch, Void]
     );
     variant_accessor!(
         is_deposit_ref,
@@ -101,7 +106,7 @@ impl TxOrderingMessage {
         "deposit reference",
         DepositRef,
         DepositRef,
-        [TxRef, BoundaryStart, Epoch, RemoteEpoch]
+        [TxRef, BoundaryStart, Epoch, RemoteEpoch, Void]
     );
     variant_accessor!(
         is_boundary,
@@ -109,8 +114,22 @@ impl TxOrderingMessage {
         "block-boundary marker",
         BoundaryStart,
         BlockBoundaryStart,
-        [TxRef, DepositRef, Epoch, RemoteEpoch]
+        [TxRef, DepositRef, Epoch, RemoteEpoch, Void]
     );
+    variant_accessor!(
+        is_void,
+        as_void,
+        "void record",
+        Void,
+        VoidRecord,
+        [TxRef, DepositRef, BoundaryStart, Epoch, RemoteEpoch]
+    );
+}
+
+impl From<VoidRecord> for TxOrderingMessage {
+    fn from(v: VoidRecord) -> Self {
+        Self::Void(v)
+    }
 }
 
 impl From<RemoteEpochRecord> for TxOrderingMessage {

@@ -220,7 +220,10 @@ impl MultiArchiveReader {
                     env,
                 }))
             }
-            TxOrderingMessage::DepositRef(_) | TxOrderingMessage::Epoch(_) => None,
+            // A void record carries no transaction of its own.
+            TxOrderingMessage::DepositRef(_)
+            | TxOrderingMessage::Epoch(_)
+            | TxOrderingMessage::Void(_) => None,
             TxOrderingMessage::RemoteEpoch(rec) => Some(Ok(ResolvedRecord::RemoteEpoch {
                 position,
                 record: rec,

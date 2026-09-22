@@ -107,6 +107,13 @@ pub enum ExecutorError {
         deposit_position: BPosition,
         timeout_ms: u128,
     },
+
+    /// The canonical order removes an entry that this replica executed. A
+    /// void record is legal only while every voter still waits at the entry,
+    /// so the state of this replica is different from the state of its
+    /// peers. There is no local repair: the replica stops.
+    #[error("void record for executed entry: index={index} tx_hash={tx_hash:?}")]
+    VoidOfExecutedEntry { index: u64, tx_hash: B256 },
 }
 
 /// Role-agnostic alias for the engine error. New engine and validator code

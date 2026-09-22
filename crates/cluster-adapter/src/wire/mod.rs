@@ -55,7 +55,8 @@ pub use egress::{
 pub use ingress::encode_ingress_depositref;
 pub use ingress::{
     encode_ingress_batch, encode_ingress_epoch, encode_ingress_remote_epoch, encode_ingress_txref,
-    encode_replay_request, encode_subscribe, ingress_sender_nonce, split_ingress,
+    encode_replay_request, encode_subscribe, encode_void_request, ingress_sender_nonce,
+    split_ingress,
 };
 
 /// A `TxRef` fixture for wire and publish tests: distinct-enough bytes to
@@ -138,6 +139,16 @@ pub const KIND_ORIGIN_RECORD: u8 = 4;
 /// epoch is. Kind 5 because 0–4 are taken. Matches Java
 /// `KIND_REMOTE_ORIGIN_RECORD`.
 pub const KIND_REMOTE_ORIGIN_RECORD: u8 = 5;
+/// Ingress kind: a void request
+/// `[kind:u8 = 6][voter_id:u8][index:u64][tx_hash:32]`. A canonical-stream
+/// consumer sends it when the entry at `index` has no envelope on `tx_data`
+/// and every configured archive refuses the range. The request is a vote, not
+/// a command: the service appends an [`RT_VOID`] record only when every
+/// configured voter has asked for the same `(index, tx_hash)`. A consumer that
+/// holds the envelope never asks, so its silence blocks the void. The session
+/// has no identity, so the frame carries the `voter_id`. Kind 6 because 0–5
+/// are taken. Matches Java `KIND_VOID_REQUEST`.
+pub const KIND_VOID_REQUEST: u8 = 6;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >=
 /// from_index` or `boundary.block_number >= from_block`, to the
@@ -257,6 +268,11 @@ pub const RT_EPOCH: u8 = 2;
 /// batch, in seq order. Origin-advancing like `RT_EPOCH`, but tracked per
 /// peer in the sealer and never stamped into boundaries.
 pub const RT_REMOTE_EPOCH: u8 = 3;
+/// A void record, `[index:u64 LE]`: the service removes the `TxRef` at that
+/// canonical index. The payload's canonical-id field holds the hash of the
+/// removed transaction. The service generates this record itself and never
+/// relays it from a session. Matches Java `RT_VOID`.
+pub const RT_VOID: u8 = 4;
 
 /// How many canonical slots an epoch occupies. This is one slot for the
 /// epoch marker itself, plus one slot per deposit.

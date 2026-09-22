@@ -355,7 +355,8 @@ fn slot_width(msg: &TxOrderingMessage) -> u64 {
         TxOrderingMessage::RemoteEpoch(r) => wire::remote_epoch_slots(r),
         TxOrderingMessage::TxRef(_)
         | TxOrderingMessage::DepositRef(_)
-        | TxOrderingMessage::BoundaryStart(_) => 1,
+        | TxOrderingMessage::BoundaryStart(_)
+        | TxOrderingMessage::Void(_) => 1,
     }
 }
 

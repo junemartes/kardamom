@@ -8,6 +8,7 @@ use alloy_primitives::Address;
 #[cfg(any(test, feature = "testing"))]
 use kardamom_types::DepositRef;
 use kardamom_types::TxRef;
+use kardamom_types::VoidRecord;
 use kardamom_types::epoch::EpochRecord;
 use kardamom_types::xchain::RemoteEpochRecord;
 
@@ -16,8 +17,9 @@ use super::RT_DEPOSITREF;
 use super::{
     CANONICAL_ID_LEN, INGRESS_CANONICAL_ID_OFFSET, INGRESS_NONCE_OFFSET, INGRESS_SENDER_OFFSET,
     KIND_BATCH, KIND_INGRESS_RECORD, KIND_ORIGIN_RECORD, KIND_REMOTE_ORIGIN_RECORD,
-    KIND_REPLAY_REQUEST, KIND_SUBSCRIBE, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN,
-    WireError, encode_kind_2u64, epoch_slots, rd_slice, rd_u64, remote_epoch_slots, too_short,
+    KIND_REPLAY_REQUEST, KIND_SUBSCRIBE, KIND_VOID_REQUEST, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF,
+    SENDER_LEN, WireError, encode_kind_2u64, epoch_slots, rd_slice, rd_u64, remote_epoch_slots,
+    too_short,
 };
 
 // ── encode (ingress: Rust to cluster) ───────────────────────────────────────
@@ -167,6 +169,19 @@ pub fn encode_ingress_batch(entries: &[Vec<u8>]) -> Result<Vec<u8>, WireError> {
 #[must_use]
 pub fn encode_replay_request(from_index: u64, from_block: u64) -> Vec<u8> {
     encode_kind_2u64(KIND_REPLAY_REQUEST, from_index, from_block)
+}
+
+/// Encode a void request (ingress): this voter cannot get the envelope of the
+/// entry at `void.index` from the live stream or from any archive. See
+/// [`KIND_VOID_REQUEST`] for the vote rule.
+#[must_use]
+pub fn encode_void_request(voter_id: u8, void: &VoidRecord) -> Vec<u8> {
+    let mut b = Vec::with_capacity(1 + 1 + 8 + CANONICAL_ID_LEN);
+    b.push(KIND_VOID_REQUEST);
+    b.push(voter_id);
+    b.extend_from_slice(&void.index.to_le_bytes());
+    b.extend_from_slice(void.tx_hash.as_slice());
+    b
 }
 
 /// Decode a replay request. Used by tests and a Rust service mock. The
