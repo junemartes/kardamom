@@ -69,11 +69,16 @@ Q-of-N recorder design is preserved, marked superseded, in
 
 ## Host prerequisites
 
-**Quickest path:** from the repo root, `just cluster-bootstrap` installs the
-host tools below for your platform, and `just cluster-doctor` verifies them.
+**Quickest path:** from the repo root, `mise trust` then `mise run setup`
+installs the pinned CLI tools and Ansible collections. See the root
+[quick start](../../README.md#quick-start) for shell activation and native
+prerequisites. Install and start Docker separately, then run
+`mise exec -- just cluster-doctor` to check the host.
+`just cluster-bootstrap` remains available for OS-level installation.
 
 - Ansible (`ansible-playbook`) + collections:
-  `ansible-galaxy collection install ansible.posix community.docker community.general`.
+  `ansible-galaxy collection install -r deploy/cluster/ansible/requirements.yml`
+  from the repository root.
 - Docker (with the Buildx plugin) for the node containers and the image
   builds. The daemon must run privileged containers; on macOS or Windows
   that is Docker Desktop's Linux VM.
@@ -96,17 +101,22 @@ host tools below for your platform, and `just cluster-doctor` verifies them.
 
 ## Quick start
 
-Requires `just` 1.49.0 or newer. From the repository root, use
-`just --justfile deploy/cluster/justfile <recipe>`, or run in this directory:
+Requires `just` 1.49.0 or newer. Run these commands from the repository root
+or from this directory:
 
 ```sh
-cd deploy/cluster
 just container-up      # tofu apply → node contract → ansible/cluster.yml
 just container-test    # one shard's gates against that cluster (default: load)
 just container-down    # tofu destroy: containers and their volumes
 just container-reset   # destroy, then a fresh chain
 just shard chaos-executor   # one shard end to end, the way CI runs it
 ```
+
+All cluster recipes are also available from the root, including `just images`,
+`just deploy`, `just smoke`, `just validate`, `just check-contract`,
+`just container-diagnostics`, and `just clean`. The root shortcuts run in
+`deploy/cluster`, so relative paths and environment overrides behave the same
+as when invoked from this directory.
 
 The gates are the `kardamom-chaos` crate: one `#[ignore]` test per shard in
 `crates/chaos/tests/shards.rs` (`load`, `semantics`, `chaos-executor`,

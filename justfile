@@ -486,7 +486,7 @@ test-e2e-local: aeron-jar cluster-jar
 # Multi-node cluster (deploy/cluster) — HOST dependencies.
 #
 # These recipes install the tools needed on this machine to run
-# `cd deploy/cluster && just container-up`: Ansible (+ the ansible.posix /
+# `just container-up`: Ansible (+ the ansible.posix /
 # community.docker collections), Docker with BuildKit, OpenTofu, and the
 # Nomad CLI (the Ansible workload role uses it to compile HCL locally). Nomad
 # *servers/clients* and Consul run inside the node containers and are
@@ -558,8 +558,8 @@ cluster-bootstrap:
         ;;
     esac
     # Ansible Galaxy collections the playbook depends on.
-    echo ">> installing ansible collections (ansible.posix, community.docker)"
-    ansible-galaxy collection install ansible.posix community.docker community.general
+    echo ">> installing ansible collections (ansible.posix, community.docker, community.general)"
+    ansible-galaxy collection install -r deploy/cluster/ansible/requirements.yml
     echo ">> cluster-bootstrap complete. Verify with: just cluster-doctor"
     echo
     echo "   Images are pushed from inside the control node (REGISTRY_PUSH_NODE),"
@@ -580,7 +580,7 @@ cluster-doctor:
     chk docker "run 'just cluster-bootstrap'"
     chk nomad "run 'just cluster-bootstrap' — Ansible uses Nomad to compile job specs"
     chk tofu "install OpenTofu 1.12.6 — terraform/containers creates the node containers"
-    for col in ansible.posix community.docker; do
+    for col in ansible.posix community.docker community.general; do
         if ansible-galaxy collection list 2>/dev/null | grep -q "^$col "; then
             echo "  ok    ansible collection $col"
         else
@@ -595,8 +595,59 @@ cluster-doctor:
         echo "  WARN  docker daemon not running"
     fi
     if [[ "$rc" == "0" ]]; then
-        echo ">> all good — 'cd deploy/cluster && just container-up'"
+        echo ">> all good — 'just container-up'"
     else
         echo ">> missing dependencies; run 'just cluster-bootstrap'" >&2
     fi
     exit "$rc"
+
+# Cluster recipes run through their own justfile so paths and defaults stay
+# relative to deploy/cluster, whether invoked here or from that directory.
+
+# Wrap prebuilt service binaries and the sealer jar, then push their images.
+images:
+    @just --justfile deploy/cluster/justfile images
+
+# Converge workload jobs and settlement through Ansible.
+deploy:
+    @just --justfile deploy/cluster/justfile deploy
+
+# Submit a signed transfer; RPC_URL overrides the node contract address.
+smoke:
+    @just --justfile deploy/cluster/justfile smoke
+
+# Run all static deployment checks, reporting failures together.
+validate:
+    @just --justfile deploy/cluster/justfile validate
+
+# Verify values mirrored from group_vars/all.yml.
+check-contract:
+    @just --justfile deploy/cluster/justfile check-contract
+
+# Remove local built cluster images and the staged cluster jar.
+clean:
+    @just --justfile deploy/cluster/justfile clean
+
+# Create nodes, provision them, publish prebuilt images and deploy workloads.
+container-up:
+    @just --justfile deploy/cluster/justfile container-up
+
+# Run a shard against an existing cluster (default: SHARD or load).
+container-test $shard=env('SHARD', 'load'):
+    @just --justfile deploy/cluster/justfile container-test "$shard"
+
+# Run a shard end to end, including its cluster lifecycle, as CI does.
+shard $shard=env('SHARD', 'load'):
+    @just --justfile deploy/cluster/justfile shard "$shard"
+
+# Collect node and job state after a failure.
+container-diagnostics:
+    @just --justfile deploy/cluster/justfile container-diagnostics
+
+# Destroy node containers and their volumes.
+container-down:
+    @just --justfile deploy/cluster/justfile container-down
+
+# Destroy, then create a fresh chain, in that order.
+container-reset:
+    @just --justfile deploy/cluster/justfile container-reset
