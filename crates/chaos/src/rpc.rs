@@ -74,6 +74,14 @@ impl Rpc {
             .unwrap_or(serde_json::Value::Null))
     }
 
+    /// Whether the JSON-RPC listener answers. `eth_chainId` reads no state,
+    /// so a false answer means the listener, not the pipeline behind it.
+    pub async fn answers(&self) -> bool {
+        self.call("eth_chainId", serde_json::json!([]))
+            .await
+            .is_ok()
+    }
+
     /// One `eth_getBalance` of `address` at the head. A cold address
     /// misses the ingress's local layer, so the read touches Redis when
     /// it is on, then the executor. The value is not the point; the
