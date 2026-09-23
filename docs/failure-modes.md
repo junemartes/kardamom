@@ -125,7 +125,8 @@ a test that cuts the power of a VM can prove this end to end.
   `last_committed_end_tx_position`) and replays the canonical stream from the
   Aeron archives via a replay-merge, skip-counting past the durable cursor.
   State is committed durably per block, so there is no double-apply and no
-  genesis re-sync; the `DedupWindow` absorbs any reconnect overlap.
+  genesis re-sync; the cluster subscription's canonical-index cursor drops
+  any reconnect overlap.
 - **Whole-node loss** (`node-failure-executor`) — with `distinct_hosts` there
   is no spare node to reschedule onto: the fleet degrades 3/3 → 2/3 and must
   keep progressing; the returned node rejoins to 3/3. Replicas are

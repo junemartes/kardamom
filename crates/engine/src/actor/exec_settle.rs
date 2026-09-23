@@ -51,6 +51,7 @@ impl<W: ExecPorts> ExecState<W> {
         let mut newest_settled = None;
         let mut stopped = false;
         while let Some((b, _)) = self
+            .commits
             .inflight
             .pop_front_if(|(b, _)| b.block_number <= durable)
         {
@@ -68,11 +69,12 @@ impl<W: ExecPorts> ExecState<W> {
                 target: "executor",
                 durable,
                 through_block = n,
-                unsettled = self.inflight.len(),
+                unsettled = self.commits.inflight.len(),
                 "{msg}"
             );
-            self.snapshot = self.snapshots.snapshot_after(n);
-            self.parent = self
+            self.commits.snapshot = self.io.snapshots.snapshot_after(n);
+            self.commits.parent = self
+                .commits
                 .inflight
                 .iter()
                 .fold(None, |acc, (_, d)| Some(Self::merge_into_parent(acc, d)));
@@ -101,7 +103,8 @@ impl<W: ExecPorts> ExecState<W> {
         )]
         metrics::gauge!(crate::metrics::BLOCK_NUMBER).set(b.block_number as f64);
         let block_number = b.block_number;
-        self.tx
+        self.io
+            .tx
             .send(ExecToCommit::Boundary(b))
             .map(|()| block_number)
             .map_err(|_| SendFailed)
@@ -115,16 +118,17 @@ impl<W: ExecPorts> ExecState<W> {
     /// the writer is K full block intervals behind, and this
     /// back-pressure is correct.
     pub(super) fn settle_at_boundary(&mut self) -> Result<Flow, ExecutorError> {
-        let mut durable = self.sw_signal.committed()?;
-        if self.inflight.len() >= COMMIT_PIPELINE_DEPTH.get()
+        let mut durable = self.io.sw_signal.committed()?;
+        if self.commits.inflight.len() >= COMMIT_PIPELINE_DEPTH.get()
             && let Some(oldest) = self
+                .commits
                 .inflight
                 .front()
                 .filter(|(b, _)| b.block_number > durable)
                 .map(|(b, _)| b.block_number)
         {
             let commit_wait = Instant::now();
-            durable = self.sw_signal.wait_committed(oldest)?;
+            durable = self.io.sw_signal.wait_committed(oldest)?;
             metrics::histogram!(crate::metrics::STATE_COMMIT_DURATION_SECONDS)
                 .record(commit_wait.elapsed().as_secs_f64());
         }
@@ -144,10 +148,10 @@ impl<W: ExecPorts> ExecState<W> {
         // Between blocks, both are empty. This is the idle-tail case this
         // probe exists for. A mid-block gap simply defers to the next
         // boundary's sweep.
-        if self.scope.is_some() || !self.buffered.is_empty() {
+        if self.block.scope.is_some() || !self.block.buffered.is_empty() {
             return Ok(Flow::Continue);
         }
-        let durable = self.sw_signal.committed()?;
+        let durable = self.io.sw_signal.committed()?;
         Ok(self.settle_ready(
             durable,
             "pipelined commits settled on idle probe; snapshot swapped",
@@ -157,11 +161,11 @@ impl<W: ExecPorts> ExecState<W> {
     /// Clean end of stream. Settle every in-flight commit so the pipeline
     /// does not silently drop the final boundaries.
     pub(super) fn on_closed(&mut self) {
-        let Some((last, _)) = self.inflight.back() else {
+        let Some((last, _)) = self.commits.inflight.back() else {
             return;
         };
         let last_n = last.block_number;
-        if self.sw_signal.wait_committed(last_n).is_ok() {
+        if self.io.sw_signal.wait_committed(last_n).is_ok() {
             self.flush_inflight_boundaries();
         }
     }
@@ -170,8 +174,8 @@ impl<W: ExecPorts> ExecState<W> {
     /// is known durable. [`Self::on_closed`]'s branch stays free of a
     /// loop.
     fn flush_inflight_boundaries(&mut self) {
-        for (b, _) in self.inflight.drain(..) {
-            let _ = self.tx.send(ExecToCommit::Boundary(b));
+        for (b, _) in self.commits.inflight.drain(..) {
+            let _ = self.io.tx.send(ExecToCommit::Boundary(b));
         }
     }
 }

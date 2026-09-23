@@ -1,7 +1,6 @@
-//! The channel-backed [`ChannelHarness`] that drives a real
-//! [`crate::Executor::run`] pipeline in-process over channels, and a
-//! re-export of the signed-legacy-transaction fixture from
-//! `kardamom-test-support`.
+//! The channel-backed [`ChannelHarness`] that runs the real
+//! [`crate::Executor`] pipeline in-process over channels, and a re-export
+//! of the signed-legacy-transaction fixture from `kardamom-test-support`.
 //!
 //! [`LegacyTx`] and the signer helpers live in `kardamom-test-support`.
 //! This module re-exports them, so a caller that already imports
@@ -10,10 +9,9 @@
 //! reach both through the `test-support` feature. This crate's own
 //! `actor::test_support::legacy` builds on [`LegacyTx::sign`].
 
-use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use kardamom_types::TxEnvelope as KtTxEnvelope;
 
 pub use kardamom_test_support::{LegacyTx, anvil_signer_0, byte_signer, seeded_signer};
@@ -22,19 +20,11 @@ pub use kardamom_test_support::{LegacyTx, anvil_signer_0, byte_signer, seeded_si
 // Channel-backed engine harness.
 // ---------------------------------------------------------------------------
 //
-// `kardamom-validator`'s `forged_envelope_chaos.rs`, and
-// `kardamom-executor`'s `determinism.rs`, `diff_reference.rs`,
-// `replay_integration.rs`, `m_plus_one_join.rs`, and the
-// `sequential_throughput` bench, each carry their own copy of
-// `ChanTxDataSub`, `ChanTxOrderingSub`, `ChanReceiptsPub`, a commit signal
-// that reports every block as already durable, and the generic
-// `EngineWiring` over those three channel doubles. This module is the one
-// copy: [`Imm`] and [`TestWiring`] for a caller that drives the channels
-// itself (a multi-block test that streams input while the engine runs),
-// and [`ChannelHarness::run`] for a caller whose whole input is known
-// upfront (build the `tx_data` and `tx_ordering` records, get back the
-// engine result, the drained `tx_receipts` stream, and the shared state
-// DB).
+// Every in-process test and bench of the executor pipeline uses these
+// channel doubles and this one wiring. [`ChannelHarness`] owns the channels
+// and the spawned threads. [`TestWiring`] and [`Imm`] stay public for a
+// caller with its own subscription types, such as the wire-codec fakes of
+// `kardamom_log::testing`.
 
 /// A commit signal that reports every block as already durable. Every
 /// in-process test and bench runs against an in-memory writer queue, so
@@ -127,31 +117,34 @@ impl crate::TxReceiptsPublication for ChanReceiptsPub {
     }
 }
 
-/// The channel-backed wiring [`ChannelHarness::run`] drives.
+/// The channel-backed wiring [`ChannelHarness`] drives.
 type HarnessWiring = TestWiring<ChanTxDataSub, ChanTxOrderingSub, ChanReceiptsPub>;
 
-/// Send every item onto a fresh bounded channel, then close the sender so
-/// the reader sees EOF. The sender ends with this function.
-fn feed<T>(items: Vec<T>, what: &str) -> Receiver<T> {
-    let (tx, rx) = bounded(items.len() + 1);
-    for rec in items {
-        tx.send(rec)
-            .unwrap_or_else(|_| panic!("{what} receiver still open"));
-    }
-    rx
-}
+/// Depth of the `tx_receipts` channel. The test thread drains it while the
+/// engine runs, so this only bounds how far commit runs ahead of the drain.
+const RECEIPTS_DEPTH: usize = 64;
 
-/// Grouped input for [`ChannelHarness::run`]: the executor config, the two
-/// input streams in the order the engine must see them, and the starting
-/// state snapshot.
-pub struct HarnessInput {
+/// How long a drain waits for the next receipt before it stops.
+const RECEIPT_WAIT: Duration = Duration::from_secs(5);
+
+/// What a harness run starts from: the executor config, the resume cursor,
+/// and the starting state snapshot. The snapshot is also the shared
+/// post-run state.
+pub struct HarnessSetup {
     pub cfg: crate::ExecutorConfig,
-    pub tx_data: Vec<(crate::BPosition, KtTxEnvelope)>,
-    pub tx_ordering: Vec<(crate::BPosition, crate::TxOrderingMessage)>,
+    pub start: crate::ResumePoint,
     pub snap: crate::MockStateDatabase,
 }
 
-/// [`ChannelHarness::run`]'s result: the engine loop's outcome, every
+/// Input for [`ChannelHarness::run`]: one record list per `tx_data` lane
+/// (lane `i` carries `sequencer_id` `i`), and the `tx_ordering` records in
+/// the order the engine must see them.
+pub struct HarnessInput {
+    pub tx_data: Vec<Vec<(crate::BPosition, KtTxEnvelope)>>,
+    pub tx_ordering: Vec<(crate::BPosition, crate::TxOrderingMessage)>,
+}
+
+/// [`ChannelHarness::finish`]'s result: the engine's outcome, every
 /// `tx_receipts` message drained while it ran, and the shared state after
 /// the run.
 pub struct HarnessOutcome {
@@ -160,74 +153,160 @@ pub struct HarnessOutcome {
     pub state: crate::MockStateDatabase,
 }
 
-/// A whole-input-known-upfront run of the real [`crate::Executor::run`]
-/// pipeline over channel-backed subscriptions: one `tx_data` sequencer,
-/// one `tx_ordering`, one `tx_receipts`.
-pub struct ChannelHarness;
+/// A live run of the real [`crate::Executor`] pipeline over channel-backed
+/// subscriptions. [`Self::spawn`] starts the threads with every input
+/// channel open. A test feeds records at any time with
+/// [`Self::send_tx_data`] and [`Self::send_tx_ordering`], reads
+/// [`Self::tx_receipts`] while the engine runs, and ends the run with
+/// [`Self::finish`]. [`Self::run`] does all of this for an input known
+/// upfront.
+pub struct ChannelHarness {
+    tx_data: Vec<Sender<(crate::BPosition, KtTxEnvelope)>>,
+    tx_ordering: Sender<(crate::BPosition, crate::TxOrderingMessage)>,
+    tx_receipts: Receiver<crate::CMessage>,
+    threads: crate::Threads,
+    state: crate::MockStateDatabase,
+}
 
 impl ChannelHarness {
-    /// Feed `input.tx_data` and `input.tx_ordering` onto their channels,
-    /// close both, run the pipeline on its own thread with `input.snap` as
-    /// the starting and shared post-run state, and drain `tx_receipts`
-    /// until the engine loop returns.
-    ///
-    /// `tx_ordering` carries every `TxRef` and `BoundaryStart` the run
-    /// needs, in the order the engine must see them; a caller that wants
-    /// a resumed start, or more than one `tx_data` sequencer, drives
-    /// [`ChanTxDataSub`]/[`ChanTxOrderingSub`]/[`ChanReceiptsPub`] and
-    /// [`TestWiring`] directly instead.
+    /// Spawn the pipeline with `lanes` `tx_data` subscriptions (lane `i`
+    /// carries `sequencer_id` `i`), one `tx_ordering`, and one
+    /// `tx_receipts`. The input channels are unbounded, so a send never
+    /// blocks the test thread.
+    #[must_use]
+    pub fn spawn(setup: HarnessSetup, lanes: u8) -> Self {
+        let HarnessSetup { cfg, start, snap } = setup;
+        let (tx_data, tx_data_subs): (Vec<_>, Vec<_>) = (0..lanes)
+            .map(|sequencer_id| {
+                let (tx, rx) = unbounded();
+                (tx, ChanTxDataSub { sequencer_id, rx })
+            })
+            .unzip();
+        let (tx_ordering, b_rx) = unbounded();
+        let (c_tx, tx_receipts) = bounded(RECEIPTS_DEPTH);
+        let threads = crate::Executor::<HarnessWiring>::new(
+            cfg,
+            crate::Inbound {
+                tx_data: tx_data_subs,
+                tx_ordering: ChanTxOrderingSub(b_rx),
+                join_recovery: None,
+            },
+            crate::Outbound {
+                tx_receipts: ChanReceiptsPub(c_tx),
+                snapshots: crate::MutatingSnapshotSource(snap.clone()),
+                writer_signal: Imm,
+                writer_queue: crate::WriterApplyingQueue::new(snap.clone()),
+            },
+            start,
+            crate::RoleHooks::none(),
+        )
+        .spawn();
+        Self {
+            tx_data,
+            tx_ordering,
+            tx_receipts,
+            threads,
+            state: snap,
+        }
+    }
+
+    /// Feed every record of `input`, close the inputs, drain
+    /// `tx_receipts`, and join the pipeline. `input.tx_data` holds one list
+    /// per lane.
     ///
     /// # Panics
     ///
-    /// Panics if the engine loop's thread panics, or if the channel send
-    /// of a `tx_data`/`tx_ordering` record fails (the receiver dropping
-    /// before every record is sent would itself be a test bug).
+    /// Panics if `input.tx_data` has more than 255 lanes, if a record send
+    /// fails, or if a pipeline thread panics.
     #[must_use]
-    pub fn run(input: HarnessInput) -> HarnessOutcome {
+    pub fn run(setup: HarnessSetup, input: HarnessInput) -> HarnessOutcome {
         let HarnessInput {
-            cfg,
             tx_data,
             tx_ordering,
-            snap,
         } = input;
-        let writer_queue = crate::WriterApplyingQueue::new(snap.clone());
-        let snapshots = crate::MutatingSnapshotSource(snap.clone());
+        let lanes = u8::try_from(tx_data.len()).expect("test fixture: at most 255 lanes");
+        let harness = Self::spawn(setup, lanes);
+        tx_data
+            .into_iter()
+            .zip(0..lanes)
+            .flat_map(|(records, lane)| records.into_iter().map(move |rec| (lane, rec)))
+            .for_each(|(lane, rec)| harness.send_tx_data(lane, rec));
+        for rec in tx_ordering {
+            harness.send_tx_ordering(rec);
+        }
+        harness.finish()
+    }
 
-        let a_rx = feed(tx_data, "tx_data");
-        let b_rx = feed(tx_ordering, "tx_ordering");
-        let (c_tx, c_rx) = bounded(64);
+    /// Send one record onto `tx_data` lane `lane`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `lane` is not a spawned lane, or if its reader has exited.
+    pub fn send_tx_data(&self, lane: u8, rec: (crate::BPosition, KtTxEnvelope)) {
+        self.tx_data[usize::from(lane)]
+            .send(rec)
+            .expect("tx_data reader still running");
+    }
 
-        let tx_data_subs = vec![ChanTxDataSub {
-            sequencer_id: 0,
-            rx: a_rx,
-        }];
-        let h = thread::spawn(move || -> Result<(), crate::ExecutorError> {
-            crate::Executor::<HarnessWiring>::new(
-                cfg,
-                crate::Inbound {
-                    tx_data: tx_data_subs,
-                    tx_ordering: ChanTxOrderingSub(b_rx),
-                    join_recovery: None,
-                },
-                crate::Outbound {
-                    tx_receipts: ChanReceiptsPub(c_tx),
-                    snapshots,
-                    writer_signal: Imm,
-                    writer_queue,
-                },
-                crate::ResumePoint::GENESIS,
-                crate::RoleHooks::none(),
-            )
-            .run()
-        });
+    /// Send one record onto `tx_ordering`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `tx_ordering` reader has exited.
+    pub fn send_tx_ordering(&self, rec: (crate::BPosition, crate::TxOrderingMessage)) {
+        self.tx_ordering
+            .send(rec)
+            .expect("tx_ordering reader still running");
+    }
 
+    /// The `tx_receipts` stream, for a test that reads receipts while the
+    /// engine runs.
+    #[must_use]
+    pub fn tx_receipts(&self) -> &Receiver<crate::CMessage> {
+        &self.tx_receipts
+    }
+
+    /// Close every input, drain the rest of `tx_receipts`, and join the
+    /// pipeline in its safe order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a pipeline thread panics.
+    #[must_use]
+    pub fn finish(self) -> HarnessOutcome {
+        self.close_inputs().finish()
+    }
+
+    /// End every input sender, so each reader sees EOF once it drains what
+    /// was sent. The senders are the only fields that do not move out.
+    fn close_inputs(self) -> Draining {
+        Draining {
+            tx_receipts: self.tx_receipts,
+            threads: self.threads,
+            state: self.state,
+        }
+    }
+}
+
+/// A harness whose inputs are closed: what is left is draining the
+/// receipts and joining the threads.
+struct Draining {
+    tx_receipts: Receiver<crate::CMessage>,
+    threads: crate::Threads,
+    state: crate::MockStateDatabase,
+}
+
+impl Draining {
+    /// Drain `tx_receipts` until the commit thread closes it, then join.
+    /// The drain runs first: a commit thread blocked on a full channel
+    /// would never exit.
+    fn finish(self) -> HarnessOutcome {
         let receipts: Vec<_> =
-            std::iter::from_fn(|| c_rx.recv_timeout(Duration::from_secs(5)).ok()).collect();
-        let result = h.join().expect("engine thread did not panic");
+            std::iter::from_fn(|| self.tx_receipts.recv_timeout(RECEIPT_WAIT).ok()).collect();
         HarnessOutcome {
-            result,
+            result: self.threads.join(),
             receipts,
-            state: snap,
+            state: self.state,
         }
     }
 }

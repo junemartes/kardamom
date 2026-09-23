@@ -16,9 +16,8 @@ adapters over a Rust-native cluster client) — see
 - **`core/`** — `CanonicalSealerState`: the pure, deterministic state machine
   (dedup window + canonical count + boundary timer + snapshot). **No Aeron
   dependency**, so its JUnit tests run with only JUnit on the classpath. This is
-  a faithful port of the Rust sealer logic (`crates/sealer/src/emitter.rs`, the
-  republish loop in `crates/sealer/src/bin/kardamom-sealer.rs`) and the
-  executor `DedupWindow` (`crates/executor/src/reader.rs`).
+  the one dedup point of the pipeline: the executor trusts its relayed
+  stream and keeps no window of its own.
 - **`service/`** — `SealerClusteredService implements
   io.aeron.cluster.service.ClusteredService`: the thin Aeron plumbing
   (ingress decode, egress framing, boundary timer, snapshot I/O) that delegates

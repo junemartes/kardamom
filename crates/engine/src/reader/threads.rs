@@ -12,40 +12,31 @@ use kardamom_types::{
 };
 
 use crate::error::ExecutorError;
-use crate::exec_types::TxIndex;
 
-use super::join::{DedupWindow, JoinBuffer, JoinWait, ReaderConfig, TxDataKey};
+use super::join::{JoinBuffer, JoinWait, ReaderConfig, TxDataKey};
 use super::ports::{
     ExecSink, JoinRecovery, JoinRecoveryFactory, TxDataSubscription, TxOrderingSubscription,
 };
 
 /// Message routed from the `tx_ordering` reader to the executor's exec thread.
 ///
-/// `tx_idx` is the executor-local monotone counter, assigned in canonical
-/// (B-position) arrival order. `position` is the `tx_ordering` `BPosition`,
-/// the wire-level canonical id. The exec thread uses both: `tx_idx` as a
-/// sanity-check newtype, and `position` as the downstream-published
-/// `Receipt.tx_idx`.
+/// The channel is the only producer-to-consumer path, and it keeps order.
+/// So the exec thread numbers each record from its own counter as it
+/// arrives. A `Tx` carries its `tx_ordering` `BPosition`, the wire-level
+/// canonical id, which becomes the published `Receipt.tx_idx`. An expanded
+/// item (a deposit or a cross-chain message) has no wire position of its
+/// own: its slot index is its position.
 #[derive(Debug)]
 pub enum ReaderToExec {
     Tx {
-        tx_idx: TxIndex,
         envelope: TxEnvelope,
         position: BPosition,
     },
-    Deposit {
-        tx_idx: TxIndex,
-        deposit: Deposit,
-        position: BPosition,
-    },
+    Deposit(Deposit),
     /// An L1 epoch marker. It advances the block's L1 origin and consumes the
     /// first slot of the epoch's range. It applies no transaction; the epoch's
     /// deposits follow as their own [`ReaderToExec::Deposit`] messages.
-    Epoch {
-        tx_idx: TxIndex,
-        epoch: EpochRecord,
-        position: BPosition,
-    },
+    Epoch(EpochRecord),
     /// A remote-epoch marker (interop): advances the pair's origin cursor
     /// and consumes the first slot of the record's range. Applies NO
     /// transaction — the record's messages follow as their own
@@ -54,20 +45,14 @@ pub enum ReaderToExec {
     /// observes exactly what traveled the canonical stream; boxed (as is the
     /// message below) so the rare interop arms don't grow the hot enum every
     /// Tx dispatch moves.
-    RemoteEpoch {
-        tx_idx: TxIndex,
-        record: Box<RemoteEpochRecord>,
-        position: BPosition,
-    },
+    RemoteEpoch(Box<RemoteEpochRecord>),
     /// One derived cross-chain message — a 0x7D tx on this chain.
     /// `origin_chain_id` rides alongside because execution aliases the
     /// sender and authenticates the Inbox call per origin, and the message
     /// itself deliberately does not repeat the pair identity on the wire.
     XChain {
-        tx_idx: TxIndex,
         origin_chain_id: u64,
         message: Box<XChainMessage>,
-        position: BPosition,
     },
     Boundary(BlockBoundaryStart),
 }
@@ -143,41 +128,24 @@ enum Flow {
     Stop,
 }
 
-/// Why [`TxOrderingReader::send_expanded`]'s item loop stopped early: the exec
-/// sink closed (not an error), or the record counter overflowed (fatal).
-enum ExpandHalt {
-    Stopped,
-    Failed(ExecutorError),
-}
-
 /// The `tx_ordering` reader thread's state: the subscription, the join
-/// buffer and its optional archive recovery, the canonical-id dedup window,
-/// the executor-local record counter, and the exec sink. One instance lives
-/// for the reader thread's whole life.
+/// buffer and its optional archive recovery, and the exec sink. One
+/// instance lives for the reader thread's whole life.
+///
+/// The reader forwards every record it receives. The canonical stream is
+/// the sealer's egress, which is already deduplicated and totally
+/// ordered, and the cluster subscription drops any replay overlap by
+/// canonical index. So there is no dedup here.
 pub struct TxOrderingReader<O, S> {
     sub: O,
     buffer: JoinBuffer,
     cfg: ReaderConfig,
     exec_out: S,
     recovery: Option<JoinRecovery>,
-    next_tx_idx: TxIndex,
     last_warn_len: usize,
-    // Canonical-id dedup. Under the MDS topology, the P sequencers per
-    // shard each republish the same `(tx_hash, shard, tx_data_position)`
-    // TxRef onto tx_ordering. So this reader sees P duplicates per logical
-    // tx. The same happens for deposits: all M sequencers race to republish
-    // the same `DepositRef(source_hash, …)` onto tx_ordering. Only the
-    // first occurrence drives a join-buffer take and exec dispatch; the
-    // rest are silently dropped. `tx_hash` and `source_hash` share one flat
-    // namespace (both B256), so one window serves both.
-    seen_canonical_ids: DedupWindow,
 }
 
-/// Everything [`TxOrderingReader::spawn`] needs. `start_tx_idx` seeds the
-/// executor-local record counter: 0 on a fresh start, or the persisted
-/// cursor's record count on a resume. The canonical source delivers from
-/// the cursor onward, and downstream checks the indices this reader
-/// assigns against absolute boundary counts.
+/// Everything [`TxOrderingReader::spawn`] needs.
 ///
 /// `recovery_factory`, when wired, turns a join miss into an archive
 /// refetch instead of an immediate death; see [`JoinRecovery`]. The reader
@@ -188,7 +156,6 @@ pub struct TxOrderingInputs<O, S> {
     pub buffer: JoinBuffer,
     pub cfg: ReaderConfig,
     pub exec_out: S,
-    pub start_tx_idx: TxIndex,
     pub recovery_factory: Option<JoinRecoveryFactory>,
 }
 
@@ -224,34 +191,17 @@ where
             buffer,
             cfg,
             exec_out,
-            start_tx_idx,
             recovery_factory,
         } = inputs;
         let recovery = recovery_factory.map(JoinRecoveryFactory::build);
-        let seen_canonical_ids = DedupWindow::new(cfg.dedup_window);
         Self {
             sub,
             buffer,
             cfg,
             exec_out,
             recovery,
-            next_tx_idx: start_tx_idx,
             last_warn_len: 0,
-            seen_canonical_ids,
         }
-    }
-
-    /// Allot the next executor-local record index.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the counter would overflow `u64`. This reader
-    /// thread would need to process more than `u64::MAX` records first,
-    /// which cannot happen within a process lifetime.
-    fn next_idx(&mut self) -> Result<TxIndex, ExecutorError> {
-        let idx = self.next_tx_idx;
-        self.next_tx_idx = self.next_tx_idx.next()?;
-        Ok(idx)
     }
 
     /// Send one message to the exec sink. `Stop` means the exec thread is
@@ -264,49 +214,29 @@ where
     }
 
     /// Dispatch a marker's expanded items: an epoch's deposits, or a
-    /// remote epoch's messages. Each item gets its own slot position: the
-    /// record claimed the range, and the sealer reserved one slot per
-    /// item. The item's own count is its position, matching the offline
-    /// replay's `global_pos` assignment.
-    fn send_expanded<T>(
-        &mut self,
-        items: Vec<T>,
-        make: impl Fn(TxIndex, T) -> ReaderToExec,
-    ) -> Result<Flow, ExecutorError> {
-        let outcome = items.into_iter().try_for_each(|item| {
-            let tx_idx = match self.next_idx() {
-                Ok(idx) => idx,
-                Err(e) => return ControlFlow::Break(ExpandHalt::Failed(e)),
-            };
-            match self.send(make(tx_idx, item)) {
+    /// remote epoch's messages. The record claimed a contiguous slot
+    /// range, one slot per item, and the exec thread numbers the items in
+    /// this order.
+    fn send_expanded<T>(&self, items: Vec<T>, make: impl Fn(T) -> ReaderToExec) -> Flow {
+        let outcome = items
+            .into_iter()
+            .try_for_each(|item| match self.send(make(item)) {
                 Flow::Continue => ControlFlow::Continue(()),
-                Flow::Stop => ControlFlow::Break(ExpandHalt::Stopped),
-            }
-        });
+                Flow::Stop => ControlFlow::Break(()),
+            });
         match outcome {
-            ControlFlow::Continue(()) => Ok(Flow::Continue),
-            ControlFlow::Break(ExpandHalt::Stopped) => Ok(Flow::Stop),
-            ControlFlow::Break(ExpandHalt::Failed(e)) => Err(e),
+            ControlFlow::Continue(()) => Flow::Continue,
+            ControlFlow::Break(()) => Flow::Stop,
         }
     }
 
-    /// A `TxRef`: dedup, join against the buffer, warn on buffer growth,
-    /// then dispatch the joined envelope.
+    /// A `TxRef`: join against the buffer, warn on buffer growth, then
+    /// dispatch the joined envelope.
     fn on_tx_ref(
         &mut self,
         tx_ref: kardamom_types::TxRef,
         position: BPosition,
     ) -> Result<Flow, ExecutorError> {
-        if !self.seen_canonical_ids.first_seen(tx_ref.tx_hash) {
-            // Duplicate from racing sequencers. Drop it.
-            debug!(
-                target: "kardamom_executor::reader",
-                tx_hash = ?tx_ref.tx_hash,
-                shard_id = tx_ref.shard_id,
-                "skipping duplicate TxRef (MDS racing sequencers)"
-            );
-            return Ok(Flow::Continue);
-        }
         let wait = JoinWait::new(&self.buffer, &mut self.recovery, &tx_ref, &self.cfg)?;
         let Some(env) = wait.run() else {
             // `Duration::as_millis` already returns `u128`, so this needs no
@@ -327,17 +257,15 @@ where
             });
         };
         self.warn_on_buffer_growth();
-        let tx_idx = self.next_idx()?;
         Ok(self.send(ReaderToExec::Tx {
-            tx_idx,
             envelope: env,
             position,
         }))
     }
 
-    /// Periodic warning. If the join buffer keeps growing, either an
-    /// A-publisher is racing far ahead of B, a back-pressure issue, or
-    /// there is a leak.
+    /// Periodic warning. If the join buffer keeps growing, either the
+    /// `tx_data` publisher is racing far ahead of `tx_ordering`, a
+    /// back-pressure issue, or there is a leak.
     fn warn_on_buffer_growth(&mut self) {
         let cur = self.buffer.len();
         if cur >= self.cfg.buffer_warn_threshold && cur > self.last_warn_len * 2 {
@@ -345,85 +273,42 @@ where
                 target: "kardamom_executor::reader",
                 join_buffer_len = cur,
                 threshold = self.cfg.buffer_warn_threshold,
-                "join buffer growth: A-publisher likely outrunning B"
+                "join buffer growth: tx_data publisher likely outrunning tx_ordering"
             );
             self.last_warn_len = cur;
         }
     }
 
-    /// An L1 epoch: dedup, dispatch the marker, then dispatch its deposits.
-    /// An epoch claims a contiguous slot range: the marker, then one slot
-    /// per deposit (see `wire::epoch_slots`). Dispatching the marker first
+    /// An L1 epoch: dispatch the marker, then dispatch its deposits. An
+    /// epoch claims a contiguous slot range: the marker, then one slot per
+    /// deposit (see `wire::epoch_slots`). Dispatching the marker first
     /// keeps the exec side's per-record counter in step. This counter is
     /// the block-boundary alignment key. The marker itself gets no
     /// transaction. The deposits travel inside the epoch record. Unlike a
     /// `DepositRef`, there is no side-stream join to wait on; nothing here
     /// can time out or go missing.
-    fn expand_epoch(
-        &mut self,
-        epoch: EpochRecord,
-        position: BPosition,
-    ) -> Result<Flow, ExecutorError> {
-        if !self.seen_canonical_ids.first_seen(epoch.canonical_id()) {
-            debug!(
-                target: "kardamom_executor::reader",
-                l1_number = epoch.l1_number,
-                "skipping duplicate Epoch (MDS racing sequencers)"
-            );
-            return Ok(Flow::Continue);
-        }
+    fn expand_epoch(&self, epoch: EpochRecord) -> Flow {
         let deposits = epoch.deposits.clone();
-        let marker_idx = self.next_idx()?;
-        if let Flow::Stop = self.send(ReaderToExec::Epoch {
-            tx_idx: marker_idx,
-            epoch,
-            position,
-        }) {
-            return Ok(Flow::Stop);
+        if let Flow::Stop = self.send(ReaderToExec::Epoch(epoch)) {
+            return Flow::Stop;
         }
-        self.send_expanded(deposits, |tx_idx, deposit| ReaderToExec::Deposit {
-            tx_idx,
-            deposit,
-            position: BPosition::from_index(tx_idx.0),
-        })
+        self.send_expanded(deposits, ReaderToExec::Deposit)
     }
 
-    /// A remote epoch (interop): dedup, dispatch the marker, then dispatch
-    /// its messages. Same expansion contract as an L1 epoch: the record
-    /// claims a contiguous slot range — the marker, then one slot per
-    /// message (`wire::remote_epoch_slots`) — and racing sequencers
-    /// republish byte-identical records, collapsed here on `canonical_id`.
-    /// Messages travel inside the record, so as with epoch deposits there
-    /// is no side-stream join to wait on.
-    fn expand_remote_epoch(
-        &mut self,
-        rec: RemoteEpochRecord,
-        position: BPosition,
-    ) -> Result<Flow, ExecutorError> {
-        if !self.seen_canonical_ids.first_seen(rec.canonical_id()) {
-            debug!(
-                target: "kardamom_executor::reader",
-                origin_chain_id = rec.origin_chain_id,
-                first_seq = rec.first_seq,
-                "skipping duplicate RemoteEpoch (MDS racing sequencers)"
-            );
-            return Ok(Flow::Continue);
-        }
+    /// A remote epoch (interop): dispatch the marker, then dispatch its
+    /// messages. Same expansion contract as an L1 epoch: the record claims
+    /// a contiguous slot range, the marker, then one slot per message
+    /// (`wire::remote_epoch_slots`). Messages travel inside the record, so
+    /// as with epoch deposits there is no side-stream join to wait on.
+    fn expand_remote_epoch(&self, rec: RemoteEpochRecord) -> Flow {
         let origin_chain_id = rec.origin_chain_id;
         let messages: Vec<XChainMessage> = rec.messages.iter().cloned().collect();
-        let marker_idx = self.next_idx()?;
-        if let Flow::Stop = self.send(ReaderToExec::RemoteEpoch {
-            tx_idx: marker_idx,
-            record: Box::new(rec),
-            position,
-        }) {
-            return Ok(Flow::Stop);
+        if let Flow::Stop = self.send(ReaderToExec::RemoteEpoch(Box::new(rec))) {
+            return Flow::Stop;
         }
-        self.send_expanded(messages, |tx_idx, message| ReaderToExec::XChain {
-            tx_idx,
+        self.send_expanded(messages, |message| ReaderToExec::XChain {
             origin_chain_id,
             message: Box::new(message),
-            position: BPosition::from_index(tx_idx.0),
         })
     }
 
@@ -446,8 +331,8 @@ where
         };
         match msg {
             TxOrderingMessage::TxRef(tx_ref) => self.on_tx_ref(tx_ref, position),
-            TxOrderingMessage::Epoch(epoch) => self.expand_epoch(epoch, position),
-            TxOrderingMessage::RemoteEpoch(rec) => self.expand_remote_epoch(rec, position),
+            TxOrderingMessage::Epoch(epoch) => Ok(self.expand_epoch(epoch)),
+            TxOrderingMessage::RemoteEpoch(rec) => Ok(self.expand_remote_epoch(rec)),
             // This reader sends every entry it passes to the executor, so a
             // void record that arrives here names an entry that this replica
             // executed. The replica and the canonical order disagree. Stop.
