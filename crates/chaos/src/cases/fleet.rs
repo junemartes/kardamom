@@ -23,7 +23,7 @@ use crate::stages::rebuild::{Rebuild, Rebuilt, Target};
 /// the election takes longer on a long chain than the 45 s a live
 /// cluster needs after one leader kill. The failure model gives the
 /// whole recovery 180 s.
-pub(crate) const FULL_RESTART_ELECTION: Duration = Duration::from_secs(180);
+pub(crate) const FULL_RESTART_ELECTION: Duration = Duration::from_mins(3);
 
 /// The three sealer nodes, by member id.
 fn sealers(h: &Harness) -> anyhow::Result<Vec<String>> {
@@ -54,7 +54,7 @@ pub(crate) async fn cluster_total_loss_recover(h: &mut Harness) -> anyhow::Resul
         .await?;
     let leader = h.evidence.cluster_leader(FULL_RESTART_ELECTION).await?;
     crate::log(format!("{ctx}: members elected memberId={leader}"));
-    h.assert_executor_progress(Duration::from_secs(180)).await
+    h.assert_executor_progress(Duration::from_mins(3)).await
 }
 
 /// Kill all three executor nodes. Every exporter goes dark, so the
@@ -75,7 +75,7 @@ pub(crate) async fn executor_fleet_loss_recover(h: &mut Harness) -> anyhow::Resu
     h.assert_count("executor", 3, h.knobs.reschedule_slo)
         .await?;
     await_exporter_back(h, ctx).await?;
-    h.assert_executor_progress(Duration::from_secs(180)).await
+    h.assert_executor_progress(Duration::from_mins(3)).await
 }
 
 /// Kill all three executor tasks and wipe every state database. The
@@ -113,7 +113,7 @@ pub(crate) async fn executor_fleet_wipe_recover(h: &mut Harness) -> anyhow::Resu
                 job: "executor",
                 needle: RESTORED,
                 baseline,
-                timeout: Duration::from_secs(180),
+                timeout: Duration::from_mins(3),
                 interval: Duration::from_secs(6),
                 streams: Streams::Both,
                 fail_msg: "executor-fleet-wipe-recover: not every executor restored from its local checkpoint",
@@ -125,7 +125,7 @@ pub(crate) async fn executor_fleet_wipe_recover(h: &mut Harness) -> anyhow::Resu
         "{ctx}: all {} executors restored from their own checkpoints",
         nodes.len()
     ));
-    h.assert_executor_progress(Duration::from_secs(180)).await
+    h.assert_executor_progress(Duration::from_mins(3)).await
 }
 
 /// The executor's log line of a resume from its own state cursor.
@@ -172,7 +172,7 @@ pub(crate) async fn executor_fleet_total_wipe_recover(h: &mut Harness) -> anyhow
     baseline?
         .assert_resumed_from_the_image(h, ctx, nodes.len())
         .await?;
-    h.assert_executor_progress(Duration::from_secs(180)).await
+    h.assert_executor_progress(Duration::from_mins(3)).await
 }
 
 /// Wipe every executor node, rebuild an executor image through `head`
@@ -347,7 +347,7 @@ impl ResumeEvidence {
                     job: "executor",
                     needle: RESUMED,
                     baseline: self.resumed,
-                    timeout: Duration::from_secs(120),
+                    timeout: Duration::from_mins(2),
                     interval: Duration::from_secs(5),
                     streams: Streams::Both,
                     fail_msg: "executor-fleet-total-wipe-recover: not every executor resumed from the installed image's cursor",

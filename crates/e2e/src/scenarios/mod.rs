@@ -373,7 +373,7 @@ pub(crate) async fn assert_validator_warm(t: &Target, what: &str) -> Result<()> 
     t.wait_validator_metric_above(
         VALIDATOR_BLOCKS_VERIFIED,
         0.0,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         Duration::from_millis(250),
         "validator verifying (warmup)",
     )
@@ -422,7 +422,7 @@ pub(crate) async fn submit_all(t: &Target, txs: Vec<SignedTransfer>) -> Result<(
 pub async fn await_l2_receipt(t: &Target, hash: B256, what: &str) -> Result<serde_json::Value> {
     metrics::poll_until(
         &format!("L2 receipt for {what}"),
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         Duration::from_millis(250),
         || async { Ok(t.rpc.receipt(hash).await.result.ok().flatten()) },
     )

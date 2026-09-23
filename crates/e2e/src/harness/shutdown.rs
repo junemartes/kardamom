@@ -117,7 +117,7 @@ impl LocalStack {
         let mut last_val = -1.0f64;
         super::metrics::poll_until(
             "executor/validator to settle",
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             Duration::from_millis(500),
             async || {
                 let settled = self

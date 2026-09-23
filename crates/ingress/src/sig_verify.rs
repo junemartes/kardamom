@@ -363,7 +363,7 @@ mod batch_tests {
 
     #[tokio::test]
     async fn flushes_on_depth_without_waiting_for_timer() {
-        let v = BatchVerifier::new(depth(8), Duration::from_secs(60));
+        let v = BatchVerifier::new(depth(8), Duration::from_mins(1));
         let mut futs = Vec::new();
         for _ in 0..8 {
             let SignedTx { env, raw, .. } = sign_legacy_tx(&PrivateKeySigner::random(), 0);
@@ -385,7 +385,7 @@ mod batch_tests {
     // first `recv_many` call already sees a full ring.
     #[tokio::test]
     async fn flushes_at_depth_even_when_the_ring_fills_gradually() {
-        let v = BatchVerifier::new(depth(8), Duration::from_secs(60));
+        let v = BatchVerifier::new(depth(8), Duration::from_mins(1));
         let mut futs = Vec::new();
         for _ in 0..8 {
             let SignedTx { env, raw, .. } = sign_legacy_tx(&PrivateKeySigner::random(), 0);

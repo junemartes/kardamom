@@ -132,7 +132,7 @@ pub fn bounded_join_timeout(resuming: bool) -> Duration {
     if resuming {
         Duration::from_secs(30)
     } else {
-        Duration::from_secs(60)
+        Duration::from_mins(1)
     }
 }
 

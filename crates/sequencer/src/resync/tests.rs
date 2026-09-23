@@ -80,7 +80,7 @@ fn idle_boundaries_do_not_thrash() {
     // arrival in the feed thread, not by count changes here.
     let (mut c, _w, mut t) = calm_controller();
     for _ in 0..10 {
-        t += Duration::from_millis(10_000);
+        t += Duration::from_secs(10);
         c.observe(t); // count unchanged, no lag flag raised
         assert!(!c.active(), "idle must not re-enter resync");
     }

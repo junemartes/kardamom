@@ -34,7 +34,7 @@ pub(crate) async fn leader_kill(h: &mut Harness) -> anyhow::Result<()> {
         "cluster-leader-kill: current leader memberId={old} on {node}; hard-killing its cluster container"
     ));
     h.inject_hard(&[&node], CLUSTER_TASK).await?;
-    h.assert_executor_progress(Duration::from_secs(60)).await?;
+    h.assert_executor_progress(Duration::from_mins(1)).await?;
     let now = h.evidence.cluster_leader(h.knobs.leader_slo).await.ok();
     crate::log(format!(
         "cluster-leader-kill: pipeline resumed committing after leader kill (now leader memberId={})",
@@ -79,7 +79,7 @@ pub(crate) async fn follower_kill(h: &mut Harness) -> anyhow::Result<()> {
         "cluster-follower-kill: snapshot present (member {follower} restore count {baseline}); killing FOLLOWER memberId={follower} on {node}"
     ));
     h.inject_hard(&[&node], CLUSTER_TASK).await?;
-    h.assert_executor_progress(Duration::from_secs(60)).await?;
+    h.assert_executor_progress(Duration::from_mins(1)).await?;
     let still = h.evidence.cluster_leader(h.knobs.leader_slo).await?;
     if still == leader {
         crate::log(format!(
@@ -96,7 +96,7 @@ pub(crate) async fn follower_kill(h: &mut Harness) -> anyhow::Result<()> {
             job: CLUSTER_TASK,
             needle: &needle,
             baseline,
-            timeout: Duration::from_secs(180),
+            timeout: Duration::from_mins(3),
             interval: Duration::from_secs(10),
             streams: Streams::StdoutOnly,
             fail_msg: "cluster-follower-kill: restarted member never logged 'sealer snapshot RESTORED' — the snapshot restore path did not run on an intact-dir restart",
@@ -131,7 +131,7 @@ pub(crate) async fn member_rejoin(h: &mut Harness) -> anyhow::Result<()> {
         )
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: could not wipe memberId={follower} state: {e}"))?;
-    h.assert_executor_progress(Duration::from_secs(60)).await?;
+    h.assert_executor_progress(Duration::from_mins(1)).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.restart_slo).await?;
     before.await_caught_up(h).await
 }
@@ -152,7 +152,7 @@ pub(crate) async fn node_replace_sealer(h: &mut Harness) -> anyhow::Result<()> {
         "{ctx}: leader=memberId={leader}; replacing the node of FOLLOWER memberId={follower}"
     ));
     h.replace_node(&format!("sealer-{follower}"), ctx).await?;
-    h.assert_executor_progress(Duration::from_secs(60)).await?;
+    h.assert_executor_progress(Duration::from_mins(1)).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.reschedule_slo)
         .await?;
     before.await_caught_up(h).await
@@ -335,7 +335,7 @@ pub(crate) async fn quorum_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
         .map_err(|e| crate::chaos_fail!("could not restart node {}: {e}", victims[0]))?;
     h.assert_count(CLUSTER_TASK, 2, h.knobs.reschedule_slo)
         .await?;
-    h.assert_executor_progress(Duration::from_secs(180)).await?;
+    h.assert_executor_progress(Duration::from_mins(3)).await?;
     crate::log(format!(
         "cluster-quorum-loss-recover: docker start {} (all three members back)",
         victims[1]
@@ -343,7 +343,7 @@ pub(crate) async fn quorum_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     h.nodes.start(&victims[1]).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.reschedule_slo)
         .await?;
-    h.assert_executor_progress(Duration::from_secs(60)).await
+    h.assert_executor_progress(Duration::from_mins(1)).await
 }
 
 #[cfg(test)]

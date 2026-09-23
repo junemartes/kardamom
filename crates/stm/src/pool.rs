@@ -407,7 +407,7 @@ mod tests {
             let _ = done_tx.send(());
         });
         done_rx
-            .recv_timeout(std::time::Duration::from_secs(120))
+            .recv_timeout(std::time::Duration::from_mins(2))
             .expect("every dropped pool joined its lanes");
     }
 

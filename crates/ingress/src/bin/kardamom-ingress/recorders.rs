@@ -148,7 +148,7 @@ fn run_discovered_recorder(
 pub(crate) async fn wait_for_discovered_recorder(
     ready: oneshot::Receiver<RecorderProgress>,
 ) -> Result<()> {
-    const READY_TIMEOUT: Duration = Duration::from_secs(60);
+    const READY_TIMEOUT: Duration = Duration::from_mins(1);
     match tokio::time::timeout(READY_TIMEOUT, ready).await {
         Ok(Ok(RecorderProgress::Ready { own_recordings })) => {
             tracing::info!(
@@ -177,7 +177,7 @@ pub(crate) async fn wait_for_recorders(ready: Vec<RecorderReady>) -> Result<()> 
     // open, so the recording normally starts within one catalog-poll
     // tick (about 500ms). The timeout only bounds a stuck or
     // unreachable archive.
-    const RECORDER_READY_TIMEOUT: Duration = Duration::from_secs(60);
+    const RECORDER_READY_TIMEOUT: Duration = Duration::from_mins(1);
     let all = async {
         for rx in ready {
             report_ready(rx.await)?;

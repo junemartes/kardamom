@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn the_load_shard_values_reach_the_stages() {
         let knobs = Knobs::read(&[("LOAD_DURATION_S", "300"), ("LOAD_TARGET_TPS", "300")]).unwrap();
-        assert_eq!(knobs.stages.transfers.duration, Duration::from_secs(300));
+        assert_eq!(knobs.stages.transfers.duration, Duration::from_mins(5));
         assert_eq!(knobs.stages.transfers.tps.get(), 300);
         assert_eq!(knobs.stages.defi.tps.get(), 100);
         assert_eq!(knobs.stages.semantics.account_base, 1);

@@ -257,7 +257,7 @@ pub(crate) async fn corruption(h: &mut Harness) -> anyhow::Result<()> {
         "archive-corruption: draining ingress-0 node ({node_id})"
     ));
     h.nomad
-        .drain(&node_id, true, Duration::from_secs(120))
+        .drain(&node_id, true, Duration::from_mins(2))
         .await
         .map_err(|e| crate::chaos_fail!("archive-corruption: drain enable failed: {e}"))?;
     tokio::time::sleep(Duration::from_secs(5)).await;
