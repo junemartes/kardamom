@@ -295,7 +295,7 @@ impl StateCopies {
         Ok(Target {
             block: report.last_committed_block,
             root: Some(root),
-            end_tx_idx: Some(cursor.last_fsynced_b_position.as_index()),
+            end_tx_idx: Some(cursor.last_fsynced_reader_position.as_index()),
         })
     }
 

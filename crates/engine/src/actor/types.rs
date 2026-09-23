@@ -28,8 +28,8 @@ use crate::reader::ReaderConfig;
 ///   resumes against the state snapshot taken after `block`.
 /// - `record_count`: the cumulative count of canonical records (`TxRef` and
 ///   `DepositRef`) applied through `block`
-///   (`last_fsynced_b_position.as_index()`). The reader assigns this index
-///   to the first delivered record, so the boundary alignment check
+///   (`last_fsynced_reader_position.as_index()`). The reader assigns this
+///   index to the first delivered record, so the boundary alignment check
 ///   (absolute counts) still holds across the restart. `record_count` is
 ///   exactly the end count of `block`, so the resume boundary falls cleanly
 ///   between blocks. No partial block is ever half-replayed.
@@ -71,13 +71,13 @@ impl Default for ResumePoint {
 
 impl From<&kardamom_state::RecoveryPoint> for ResumePoint {
     /// Build the resume cursor from the state writer's persisted recovery
-    /// point. `record_count` reads `last_fsynced_b_position` as an absolute
-    /// canonical record count, matching how the reader and exec threads
-    /// key their counters.
+    /// point. `record_count` reads `last_fsynced_reader_position` as an
+    /// absolute canonical record count, matching how the reader and exec
+    /// threads key their counters.
     fn from(recovery: &kardamom_state::RecoveryPoint) -> Self {
         Self {
             block: recovery.last_committed_block,
-            record_count: recovery.last_fsynced_b_position.as_index(),
+            record_count: recovery.last_fsynced_reader_position.as_index(),
             l2_timestamp: recovery.last_committed_l2_timestamp,
         }
     }
