@@ -23,34 +23,21 @@ impl<W: ExecPorts> ExecState<W> {
     /// boundary, instead of executing it now. Returns the `Flow::Continue`
     /// the caller must return immediately, with no further work this call.
     fn defer(&mut self, rec: BufferedRecord) -> Flow {
-        self.buffered.push(rec);
+        self.block.buffered.push(rec);
         Flow::Continue
     }
 
-    /// Canonical-order check, shared by the Tx, Epoch, Deposit, `RemoteEpoch`,
-    /// and `XChain` arms. The record's absolute index must be exactly the
-    /// next expected index. On a match, the counter advances.
-    pub(super) fn check_in_order(
-        &mut self,
-        kind: &'static str,
-        tx_idx: TxIndex,
-        position: BPosition,
-    ) -> Result<(), ExecutorError> {
-        if tx_idx != self.expected_tx_idx {
-            tracing::error!(
-                block = self.current_block,
-                ?position,
-                ?tx_idx,
-                expected_tx_idx = ?self.expected_tx_idx,
-                "exec ERROR: OutOfOrderTx ({kind})"
-            );
-            return Err(ExecutorError::OutOfOrderTx {
-                got: tx_idx,
-                expected: self.expected_tx_idx,
-            });
-        }
-        self.expected_tx_idx = self.expected_tx_idx.next()?;
-        Ok(())
+    /// Allot the next absolute record index. Every arm calls this once per
+    /// record, in arrival order, so the counter is the canonical record
+    /// count the boundary check compares against.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the counter would overflow `u64`.
+    pub(super) fn next_idx(&mut self) -> Result<TxIndex, ExecutorError> {
+        let idx = self.cursor.next_tx_idx;
+        self.cursor.next_tx_idx = idx.next()?;
+        Ok(idx)
     }
 
     /// The block env. Every execution path derives its EVM environment
@@ -60,7 +47,7 @@ impl<W: ExecPorts> ExecState<W> {
         ExecEnv {
             chain_id: self.cfg.chain_id.get(),
             block_number,
-            l2_timestamp: self.current_l2_ts,
+            l2_timestamp: self.cursor.l2_ts,
         }
     }
 
@@ -110,22 +97,27 @@ impl<W: ExecPorts> ExecState<W> {
         apply_start: Instant,
     ) -> Result<Flow, ExecutorError> {
         if result.is_ok() {
-            self.tx_applied_ok.increment(1);
+            self.metrics.applied_ok.increment(1);
         } else {
-            self.tx_applied_error.increment(1);
+            self.metrics.applied_error.increment(1);
         }
         if let Err(ref e) = result {
-            tracing::error!(block = self.current_block, ?position, error = ?e, "exec ERROR: {what} failed");
+            tracing::error!(block = self.cursor.block, ?position, error = ?e, "exec ERROR: {what} failed");
         }
         let (receipt, ws) = result?;
-        self.cumulative_gas_used = receipt.cumulative_gas_used;
-        self.tx_index_in_block += 1;
+        self.block.cumulative_gas_used = receipt.cumulative_gas_used;
+        self.block.tx_index += 1;
         let accounts = ws.account_rows();
-        self.delta.apply(ws);
-        *self.block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
-        self.block_receipts.push(receipt.clone());
+        self.block.delta.apply(ws);
+        *self.block.apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
+        self.block.receipts.push(receipt.clone());
         let item = kardamom_types::ReceiptRows { receipt, accounts };
-        if self.tx.send(ExecToCommit::Receipt(Box::new(item))).is_err() {
+        if self
+            .io
+            .tx
+            .send(ExecToCommit::Receipt(Box::new(item)))
+            .is_err()
+        {
             return Ok(Flow::Stop);
         }
         Ok(Flow::Continue)
@@ -133,21 +125,20 @@ impl<W: ExecPorts> ExecState<W> {
 
     pub(super) fn on_tx(
         &mut self,
-        tx_idx: TxIndex,
         envelope: TxEnvelope,
         position: BPosition,
     ) -> Result<Flow, ExecutorError> {
-        self.check_in_order("Tx", tx_idx, position)?;
+        let tx_idx = self.next_idx()?;
         // One check point for both execution modes. The code checks this at
         // arrival, before the streaming or whole-block branch. So a forged
         // envelope cannot execute now, and cannot hide in the block buffer.
         if self.cfg.verify_record_identity
             && let Err(e) = crate::stateless::verify_record_identity(&envelope)
         {
-            tracing::error!(block = self.current_block, ?position, ?tx_idx, error = ?e, "exec ERROR: record identity forged");
+            tracing::error!(block = self.cursor.block, ?position, ?tx_idx, error = ?e, "exec ERROR: record identity forged");
             return Err(e);
         }
-        if self.block_exec.is_some() {
+        if self.hooks.block_exec.is_some() {
             // Whole-block strategy: defer to the boundary, so batches can
             // execute concurrently.
             return Ok(self.defer(BufferedRecord::Tx {
@@ -156,34 +147,36 @@ impl<W: ExecPorts> ExecState<W> {
                 position,
             }));
         }
-        let env = self.exec_env(self.current_block);
+        let env = self.exec_env(self.cursor.block);
         let apply_start = Instant::now();
         let sc = Self::scope_or_init(
-            &mut self.scope,
-            &self.snapshots,
-            self.parent.as_ref(),
-            &self.delta,
-            self.current_block,
+            &mut self.block.scope,
+            &self.io.snapshots,
+            self.commits.parent.as_ref(),
+            &self.block.delta,
+            self.cursor.block,
             env,
         )?;
         // Shadow read capture: build a default TouchSet only when the
         // shadow is on. The None path costs nothing.
         let mut touches = self
+            .hooks
             .shadow_tx
             .as_ref()
             .map(|_| crate::executor::TouchSet::default());
         let slot = TxSlot {
             tx_idx,
             tx_position: position,
-            tx_index_in_block: self.tx_index_in_block,
-            cumulative_gas_used_before: self.cumulative_gas_used,
+            tx_index_in_block: self.block.tx_index,
+            cumulative_gas_used_before: self.block.cumulative_gas_used,
         };
         let result = sc.execute_tx(
             slot,
             &envelope,
-            self.bal_tx
+            self.hooks
+                .bal_tx
                 .as_ref()
-                .map(|_| (&mut self.block_bal, self.tx_index_in_block + 1)),
+                .map(|_| (&mut self.block.bal, self.block.tx_index + 1)),
             touches.as_mut(),
         );
         // This log fires only for a successful tx. On error, the `if let
@@ -198,11 +191,11 @@ impl<W: ExecPorts> ExecState<W> {
     /// Log BAL capture progress every 512 txs, when a BAL publisher is
     /// attached.
     fn log_bal_progress(&self, ws: &WriteSet) {
-        if self.bal_tx.is_some() && self.tx_index_in_block.is_multiple_of(512) {
+        if self.hooks.bal_tx.is_some() && self.block.tx_index.is_multiple_of(512) {
             tracing::debug!(
-                block = self.current_block,
-                tx_index_in_block = self.tx_index_in_block,
-                bal_accounts = self.block_bal.accounts.len(),
+                block = self.cursor.block,
+                tx_index_in_block = self.block.tx_index,
+                bal_accounts = self.block.bal.accounts.len(),
                 ws_accounts = ws.accounts.len(),
                 "BAL capture progress"
             );
@@ -220,72 +213,74 @@ impl<W: ExecPorts> ExecState<W> {
         result: &Result<(kardamom_types::Receipt, WriteSet), ExecutorError>,
     ) {
         if let (Some(t), Ok((receipt, ws))) = (touches, result) {
-            self.shadow_captures.push(crate::shadow::ShadowTxCapture {
-                envelope: envelope.clone(),
-                gas_used: receipt.gas_used,
-                touches: t,
-                write_cells: crate::shadow::write_cells(ws),
-            });
+            self.block
+                .shadow_captures
+                .push(crate::shadow::ShadowTxCapture {
+                    envelope: envelope.clone(),
+                    gas_used: receipt.gas_used,
+                    touches: t,
+                    write_cells: crate::shadow::write_cells(ws),
+                });
         }
     }
 
-    pub(super) fn on_deposit(
-        &mut self,
-        tx_idx: TxIndex,
-        deposit: Deposit,
-        position: BPosition,
-    ) -> Result<Flow, ExecutorError> {
-        self.check_in_order("Deposit", tx_idx, position)?;
-        if self.block_exec.is_some() {
+    /// A deposit has no wire position of its own: its slot index is its
+    /// position, matching the offline replay's `global_pos` assignment.
+    pub(super) fn on_deposit(&mut self, deposit: Deposit) -> Result<Flow, ExecutorError> {
+        let tx_idx = self.next_idx()?;
+        let position = BPosition::from_index(tx_idx.0);
+        if self.hooks.block_exec.is_some() {
             return Ok(self.defer(BufferedRecord::Deposit {
                 tx_idx,
                 deposit,
                 position,
             }));
         }
-        let env = self.exec_env(self.current_block);
+        let env = self.exec_env(self.cursor.block);
         let apply_start = Instant::now();
         // Deposits run ON the block scope (same lazy init as `on_tx`): the
         // mint and the inner call commit into the block cache, so later
         // txs observe them with no fold-back layer.
         let sc = Self::scope_or_init(
-            &mut self.scope,
-            &self.snapshots,
-            self.parent.as_ref(),
-            &self.delta,
-            self.current_block,
+            &mut self.block.scope,
+            &self.io.snapshots,
+            self.commits.parent.as_ref(),
+            &self.block.delta,
+            self.cursor.block,
             env,
         )?;
         let slot = TxSlot {
             tx_idx,
             tx_position: position,
-            tx_index_in_block: self.tx_index_in_block,
-            cumulative_gas_used_before: self.cumulative_gas_used,
+            tx_index_in_block: self.block.tx_index,
+            cumulative_gas_used_before: self.block.cumulative_gas_used,
         };
         let result = sc.execute_deposit(
             slot,
             &deposit,
-            self.bal_tx
+            self.hooks
+                .bal_tx
                 .as_ref()
-                .map(|_| (&mut self.block_bal, self.tx_index_in_block + 1)),
+                .map(|_| (&mut self.block.bal, self.block.tx_index + 1)),
         );
         // Shadow: deposits take the serial barrier lane (spec strategy 1).
         // The code counts them; it does not model them.
-        if self.shadow_tx.is_some() && result.is_ok() {
-            self.shadow_serial += 1;
+        if self.hooks.shadow_tx.is_some() && result.is_ok() {
+            self.block.shadow_serial += 1;
         }
         self.record_applied("execute_deposit_tx", position, result, apply_start)
     }
 
+    /// A cross-chain message takes its slot index as its position, like a
+    /// deposit.
     pub(super) fn on_xchain(
         &mut self,
-        tx_idx: TxIndex,
         origin_chain_id: u64,
         message: Box<XChainMessage>,
-        position: BPosition,
     ) -> Result<Flow, ExecutorError> {
-        self.check_in_order("XChain", tx_idx, position)?;
-        if self.block_exec.is_some() {
+        let tx_idx = self.next_idx()?;
+        let position = BPosition::from_index(tx_idx.0);
+        if self.hooks.block_exec.is_some() {
             // Whole-block execution (the validator's parallel path): buffer
             // like a deposit — the strategy replays the block's records in
             // canonical order at the boundary, dispatching this arm through
@@ -297,32 +292,33 @@ impl<W: ExecPorts> ExecState<W> {
                 position,
             }));
         }
-        let env = self.exec_env(self.current_block);
+        let env = self.exec_env(self.cursor.block);
         let apply_start = Instant::now();
         let slot = TxSlot {
             tx_idx,
             tx_position: position,
-            tx_index_in_block: self.tx_index_in_block,
-            cumulative_gas_used_before: self.cumulative_gas_used,
+            tx_index_in_block: self.block.tx_index,
+            cumulative_gas_used_before: self.block.cumulative_gas_used,
         };
         let result = execute_xchain_tx(
-            &self.snapshot,
-            self.parent.as_ref(),
-            &self.delta,
+            &self.commits.snapshot,
+            self.commits.parent.as_ref(),
+            &self.block.delta,
             env,
             slot,
             XChainDelivery {
                 origin_chain_id,
                 message: &message,
             },
-            self.bal_tx
+            self.hooks
+                .bal_tx
                 .as_ref()
-                .map(|_| (&mut self.block_bal, self.tx_index_in_block + 1)),
+                .map(|_| (&mut self.block.bal, self.block.tx_index + 1)),
         );
         // Like deposits, the delivery runs outside the scope (own commit
         // semantics) — fold its writes into the block cache so later txs
         // in this block observe them.
-        if let (Some(sc), Ok((_, ws))) = (self.scope.as_mut(), &result) {
+        if let (Some(sc), Ok((_, ws))) = (self.block.scope.as_mut(), &result) {
             let mut layer = PendingDelta::new();
             layer.apply(ws.clone());
             sc.seed_layer(&layer)?;

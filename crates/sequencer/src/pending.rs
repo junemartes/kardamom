@@ -227,7 +227,7 @@ mod tests {
     /// A deadline far in the future. These tests cover the buffer
     /// mechanics; the expiry tests live with `PartitionState`.
     fn far() -> Instant {
-        Instant::now() + Duration::from_secs(3600)
+        Instant::now() + Duration::from_hours(1)
     }
 
     #[test]

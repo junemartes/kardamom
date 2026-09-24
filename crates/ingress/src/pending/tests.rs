@@ -380,7 +380,7 @@ async fn aborting_a_parked_await_cleans_up() {
     // disconnect.
     let p = Arc::new(PendingReceipts::new(AckPolicy::OnOffer));
     let wait = p.register(Address::repeat_byte(0xB2), 7);
-    let task = tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(60)).await });
+    let task = tokio::spawn(async move { wait.await_with_timeout(Duration::from_mins(1)).await });
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(p.len(), 1, "parked");
     task.abort();

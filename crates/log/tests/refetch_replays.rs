@@ -154,7 +154,7 @@ fn recordings(archive: &rusteron_archive::AeronArchive, stream_id: i32) -> Vec<(
 }
 
 async fn wait_recording_stopped(archive: &rusteron_archive::AeronArchive, stream: i32) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         let recs = recordings(archive, stream);
         if !recs.is_empty() && recs.iter().all(|(_, stop)| *stop >= 0) {

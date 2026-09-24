@@ -21,7 +21,6 @@ kardamom-log = { workspace = true }
 kardamom-state = { path = "../state" }
 kardamom-types = { workspace = true }
 kardamom-obs = { path = "../obs" }
-alloy-primitives = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 metrics = { workspace = true }

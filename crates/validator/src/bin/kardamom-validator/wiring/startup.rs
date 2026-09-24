@@ -147,7 +147,7 @@ impl Startup {
         let recovery = read_recovery_point(&env).context("read state recovery point")?;
         let start = ResumePoint {
             block: recovery.last_committed_block,
-            record_count: recovery.last_fsynced_b_position.as_index(),
+            record_count: recovery.last_fsynced_reader_position.as_index(),
             l2_timestamp: recovery.last_committed_l2_timestamp,
         };
         if start.is_resume() {

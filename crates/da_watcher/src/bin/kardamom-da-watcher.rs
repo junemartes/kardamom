@@ -490,7 +490,7 @@ impl DaWatcherService {
             .context("spawn tx_deposits recorder thread")?;
         // This budget is generous: normally one catalog-poll tick is about
         // 500ms. The timeout only bounds a stuck or unreachable archive.
-        match tokio::time::timeout(Duration::from_secs(60), ready_rx).await {
+        match tokio::time::timeout(Duration::from_mins(1), ready_rx).await {
             Ok(Ok(Ok(recording_id))) => {
                 tracing::info!(recording_id, "tx_deposits recording confirmed active");
             }
@@ -579,7 +579,7 @@ impl DaWatcherService {
                 Self::run_discovered_recorder(recorder, ready_tx);
             })
             .context("spawn tx_deposits recorder thread")?;
-        match tokio::time::timeout(Duration::from_secs(60), ready_rx).await {
+        match tokio::time::timeout(Duration::from_mins(1), ready_rx).await {
             Ok(Ok(RecorderProgress::Ready { .. })) => {
                 tracing::info!("tx_deposits recording confirmed active");
             }

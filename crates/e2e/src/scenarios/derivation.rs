@@ -455,7 +455,7 @@ pub async fn every_l1_deposit_appears_exactly_once(
     // runners ("the chain never adopted an L1 origin").
     let highest_origin = poll_until(
         "the chain to adopt an L1 origin (first epoch durable)",
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         Duration::from_millis(250),
         || async {
             Ok(read_block_origins(state_dir)?

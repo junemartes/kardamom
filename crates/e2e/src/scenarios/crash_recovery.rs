@@ -103,7 +103,7 @@ pub async fn phase_after_restart(t: &Target, p: &Params, pre_crash_block: u64) -
     // chain.
     t.wait_executor_block(
         pre_crash_block,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         Duration::from_millis(500),
         "restarted executor reaches its pre-crash block",
     )

@@ -315,7 +315,7 @@ impl Harness {
             drain_timeout: self
                 .knobs
                 .reschedule_slo
-                .saturating_add(Duration::from_secs(60)),
+                .saturating_add(Duration::from_mins(1)),
             report_path: Self::report_path(case.name()),
             executor_nodes: self
                 .probes
@@ -411,10 +411,10 @@ impl Case {
     async fn assert_recovered_progress(self, h: &Harness) -> anyhow::Result<()> {
         match self.name() {
             n if n.starts_with("cluster-") => {
-                h.assert_executor_progress(Duration::from_secs(60)).await
+                h.assert_executor_progress(Duration::from_mins(1)).await
             }
             n if n.starts_with("node-failure-") => {
-                h.assert_executor_progress(Duration::from_secs(180)).await
+                h.assert_executor_progress(Duration::from_mins(3)).await
             }
             _ => h.assert_progress().await,
         }

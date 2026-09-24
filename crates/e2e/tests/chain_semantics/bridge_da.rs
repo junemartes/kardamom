@@ -101,7 +101,7 @@ async fn s8_da_parity_batcher_matches_validator() {
     let val_dir = stack.validator_state_dir().expect("validator state dir");
     let expected_root = e2e::harness::metrics::poll_until(
         "validator root covering the workload",
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         Duration::from_millis(500),
         || async {
             let committed_f64 = t

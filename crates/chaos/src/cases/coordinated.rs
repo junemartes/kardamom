@@ -127,5 +127,5 @@ pub(crate) async fn pipeline_blackout_recover(h: &mut Harness) -> anyhow::Result
     crate::log(format!("{ctx}: members elected memberId={leader}"));
     await_exporter_back(h, ctx).await?;
     h.assert_ingress_pair_live(ctx).await?;
-    h.assert_executor_progress(Duration::from_secs(180)).await
+    h.assert_executor_progress(Duration::from_mins(3)).await
 }

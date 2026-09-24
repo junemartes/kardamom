@@ -201,7 +201,7 @@ impl<'a> SealerLaunch<'a> {
     /// one of them to report LEADER.
     fn await_ready(&mut self) -> Result<()> {
         for proc in &mut self.procs {
-            wait_for_log_line(proc, "cluster node up", Duration::from_secs(60))
+            wait_for_log_line(proc, "cluster node up", Duration::from_mins(1))
                 .context("sealer member startup")?;
         }
         self.await_leader()
@@ -212,7 +212,7 @@ impl<'a> SealerLaunch<'a> {
     fn await_leader(&self) -> Result<()> {
         super::metrics::poll_sync(
             "a sealer member to become LEADER",
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             Duration::from_millis(100),
             || Ok(self.any_member_is_leader().then_some(())),
         )

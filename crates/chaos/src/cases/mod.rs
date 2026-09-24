@@ -186,28 +186,28 @@ impl Case {
     pub fn window(self, k: &Knobs) -> Duration {
         let inject = k.inject_delay;
         let floor = match self {
-            Self::SequencerReplicaKill => inject + k.restart_slo + Duration::from_secs(60),
-            Self::SequencerLapse => inject + k.seq_lapse + Duration::from_secs(60),
+            Self::SequencerReplicaKill => inject + k.restart_slo + Duration::from_mins(1),
+            Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
             Self::RetentionOverrun | Self::RetentionOverrunValidator => {
-                inject + k.retention_freeze_cap + Duration::from_secs(120)
+                inject + k.retention_freeze_cap + Duration::from_mins(2)
             }
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
-            Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_secs(300),
+            Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_mins(5),
             // The freeze, the election, and the recovery polls.
             Self::RedisPrimaryFreeze | Self::RedisPrimaryKill | Self::RedisPartitionIngress => {
-                inject + k.restart_slo + Duration::from_secs(300)
+                inject + k.restart_slo + Duration::from_mins(5)
             }
             // The mirrors restart, wait for a checkpoint, and rebuild.
-            Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_secs(600),
+            Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_mins(10),
             // The node replacement; the Redis loss and three rebuilds; the
             // total wipe, the rebuild from L1 and the install; or the
             // blackout and the return of every job.
             Self::NodeReplaceExecutor
             | Self::RedisTotalLossRecover
             | Self::ExecutorFleetTotalWipeRecover
-            | Self::PipelineBlackoutRecover => inject + k.reschedule_slo + Duration::from_secs(420),
+            | Self::PipelineBlackoutRecover => inject + k.reschedule_slo + Duration::from_mins(7),
             Self::NodeReplaceSealer => {
-                inject + k.reschedule_slo + k.rejoin_slo + Duration::from_secs(300)
+                inject + k.reschedule_slo + k.rejoin_slo + Duration::from_mins(5)
             }
             Self::CpuSqueeze => {
                 let cycle = k.squeeze.window + k.squeeze.release;

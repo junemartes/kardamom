@@ -15,10 +15,15 @@ use crate::probes::EXECUTOR_BLOCK_METRIC;
 impl Harness {
     /// Stop ordering, drain the consumers to one head, stop their writers,
     /// and compare copies of all persisted state. Restore the jobs on both
-    /// success and failure. Copies remain in the reported directory on failure.
-    /// Then rebuild the state at the validator's head from L1 alone, with
-    /// the jobs back up so the batcher posts through that head, and
-    /// require the validator's root.
+    /// success and failure. Then rebuild the state at the validator's head
+    /// from L1 alone, with the jobs back up so the batcher posts through
+    /// that head, and require the validator's root.
+    ///
+    /// The copies remain in the reported directory on failure. A pass
+    /// removes them: they hold about 1.4 GB per case, and a soak that keeps
+    /// them fills the runner's disk (154 directories, 149 GB, on the
+    /// 2026-09-23 soak host, where `archive-corruption` then failed with
+    /// "No space left on device").
     ///
     /// # Errors
     ///
@@ -35,7 +40,10 @@ impl Harness {
             (Err(error), _) | (_, Err(error)) => return Err(error),
             (Ok(rebuild), Ok(())) => rebuild,
         };
-        rebuild.assert_parity().await
+        rebuild.assert_parity().await?;
+        tokio::fs::remove_dir_all(&rebuild.evidence)
+            .await
+            .with_context(|| format!("remove {}", rebuild.evidence.display()))
     }
 }
 
@@ -295,7 +303,7 @@ impl StateCopies {
         Ok(Target {
             block: report.last_committed_block,
             root: Some(root),
-            end_tx_idx: Some(cursor.last_fsynced_b_position.as_index()),
+            end_tx_idx: Some(cursor.last_fsynced_reader_position.as_index()),
         })
     }
 

@@ -66,7 +66,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
       - uses: ./.github/actions/rust-build-cache
-      - run: scripts/style-check.sh
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: 1.49.0
+      - run: just style
 
   build:
     name: build
@@ -135,23 +138,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: 1.49.0
       # A release build of one test: its own rust-cache key.
       - uses: ./.github/actions/rust-build-cache
         with:
           key: eest
       - name: Fixture tag
         id: eest
-        run: echo "tag=$(grep -m1 '^EEST_TAG=' scripts/fetch-eest-fixtures.sh | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+        run: echo "tag=$(just eest-tag)" >> "$GITHUB_OUTPUT"
       - name: Cache fixtures
         uses: actions/cache@v4
         with:
           path: ~/.cache/kardamom/eest
           key: eest-fixtures-${{ steps.eest.outputs.tag }}
       - name: Fetch fixtures
-        run: scripts/fetch-eest-fixtures.sh
+        run: just eest-fixtures
       - name: Run conformance
         run: |
-          KARDAMOM_EEST_FIXTURES="$(scripts/fetch-eest-fixtures.sh | tail -1)" \
+          KARDAMOM_EEST_FIXTURES="$(just eest-fixtures | tail -1)" \
             cargo test -p kardamom-exec-core --release --test eest_state --locked -- --ignored --nocapture
 
   test:
@@ -297,5 +303,8 @@ jobs:
       - uses: ./.github/actions/rust-build-cache
         with:
           key: alloc-gate
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: 1.49.0
       - name: DHAT allocation ceilings (perf/alloc-baselines.env)
-        run: bash deploy/ci/alloc-gate.sh
+        run: just alloc-gate

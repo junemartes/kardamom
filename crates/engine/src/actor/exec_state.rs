@@ -20,9 +20,18 @@ use super::wiring::{ExecPorts, SnapshotDb};
 /// instead of five loose parameters.
 pub(crate) struct ExecHooks<W: ExecPorts> {
     pub(super) bal_tx: Option<Sender<BalHandoff>>,
+    /// Footprint shadow handoff (`crate::shadow`), one per block. Only the
+    /// executor role uses this; it is `None` elsewhere. The whole-block
+    /// (validator) path ignores it: captures use the streaming arm instead.
     pub(super) shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
     pub(super) block_exec: Option<W::BlockExec>,
+    /// A role-specific epoch check, statically dispatched. See
+    /// [`crate::reader::EpochObserver`]. `None` means the code trusts the
+    /// ordered stream.
     pub(super) epoch_observer: Option<W::Epoch>,
+    /// The interop mirror of `epoch_observer`, invoked per `RemoteEpoch`
+    /// marker. `None` everywhere until the destination-validator
+    /// `RemoteEpochVerifier` lands.
     pub(super) remote_epoch_observer: Option<W::RemoteEpoch>,
 }
 
@@ -42,44 +51,23 @@ pub(crate) struct ExecInputs<W: ExecPorts> {
     pub(super) hooks: ExecHooks<W>,
 }
 
-/// The exec thread's mutable loop state. Each [`ExecState::spawn`] thread has one
-/// instance. Each `ReaderToExec` arm is one method, split across
-/// `exec_records.rs`, `exec_markers.rs`, and `exec_boundary.rs`.
-pub(crate) struct ExecState<W: ExecPorts> {
-    pub(super) cfg: ExecutorConfig,
+/// The exec thread's channels and storage ports: the reader channel in,
+/// the commit channel out, and the three writer-side seams.
+pub(super) struct ExecIo<W: ExecPorts> {
     pub(super) rx: Receiver<ReaderToExec>,
     pub(super) tx: Sender<ExecToCommit>,
     pub(super) snapshots: W::Snapshots,
     pub(super) sw_signal: W::WriterSignal,
     pub(super) sw_queue: W::WriterQueue,
-    pub(super) bal_tx: Option<Sender<BalHandoff>>,
-    /// Footprint shadow handoff (`crate::shadow`), one per block. Only the
-    /// executor role uses this; it is `None` elsewhere. The whole-block
-    /// (validator) path ignores it: captures use the streaming arm instead.
-    pub(super) shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
-    /// Shadow tx captures and the serial-lane count for the current block.
-    /// The code hands these off with `try_send` at each boundary; this never
-    /// blocks. Both stay empty when the shadow is off.
-    pub(super) shadow_captures: Vec<crate::shadow::ShadowTxCapture>,
-    pub(super) shadow_serial: u32,
-    pub(super) block_exec: Option<W::BlockExec>,
-    /// A role-specific epoch check, statically dispatched. See
-    /// [`crate::reader::EpochObserver`]. `None` means the code trusts the
-    /// ordered stream.
-    pub(super) epoch_observer: Option<W::Epoch>,
-    /// The interop mirror of `epoch_observer`, invoked per `RemoteEpoch`
-    /// marker. `None` everywhere until the destination-validator
-    /// `RemoteEpochVerifier` lands.
-    pub(super) remote_epoch_observer: Option<W::RemoteEpoch>,
-    /// The snapshot source returns owned snapshots keyed by block number:
-    /// the block just committed. This is the [`ResumePoint`]'s `block` field
-    /// (0 on a fresh start).
-    pub(super) snapshot: SnapshotDb<W>,
+}
+
+/// Everything that belongs to the block being executed. The boundary arm
+/// consumes or resets each field when it seals the block.
+pub(super) struct BlockState<W: ExecPorts> {
     pub(super) delta: PendingDelta,
-    /// EIP-7928 capture: the per-block Bal. The code resets it at each
-    /// boundary. It is maintained only when a publisher is attached
-    /// (executor role).
-    pub(super) block_bal: revm::state::bal::Bal,
+    /// EIP-7928 capture: the per-block Bal. It is maintained only when a
+    /// publisher is attached (executor role).
+    pub(super) bal: revm::state::bal::Bal,
     /// Whole-block buffer. Used only when a block-exec strategy is
     /// supplied (the validator parallel path).
     pub(super) buffered: Vec<BufferedRecord>,
@@ -92,55 +80,92 @@ pub(crate) struct ExecState<W: ExecPorts> {
     /// parent and anything already in the live delta, for example deposits
     /// that landed before the first tx.
     pub(super) scope: Option<crate::executor::Executor<SnapshotDb<W>>>,
-    /// Pipelined commit, at depth K. At each boundary, the code submits the
-    /// finalized delta to the writer, but does not wait for it. The next
-    /// block executes against the snapshot, then the merged unsettled layer,
-    /// then the delta. Completed commits settle opportunistically, through a
-    /// non-blocking probe at each boundary. The exec thread parks only when
-    /// the writer is a full K blocks behind.
-    ///
-    /// A single slow fsync does not touch execution at all: a blocking
-    /// `wait_committed` call runs only when the pipeline is at full depth.
-    ///
-    /// Durability semantics do not change. A boundary reaches `tx_receipts`
-    /// only after its block is durable. Receipts stream out before
-    /// durability, at least once: a crash replay re-publishes them, and
-    /// they are byte-identical.
-    ///
-    /// `parent` is the merged union of every unsettled block's writes. A
-    /// later block's write wins over an earlier one. This gives one layer
-    /// regardless of depth, so per-tx cache seeding stays O(one map). The
-    /// code rebuilds `parent` from the survivors when commits settle.
-    pub(super) parent: Option<PendingDelta>,
-    pub(super) inflight: VecDeque<(BlockBoundary, PendingDelta)>,
     /// Per-block receipts, in arrival order. The code drains this into the
     /// `BlockDelta` at each boundary, so the writer can persist the receipts
     /// and the `tx_hash_index` tables. Each tx's receipt is cloned once, to
     /// feed both this list and the streaming `tx_receipts` publisher. This
     /// clone cost is flagged for saturation validation.
-    pub(super) block_receipts: Vec<kardamom_types::Receipt>,
+    pub(super) receipts: Vec<kardamom_types::Receipt>,
+    /// Per-block RPC enrichment counters.
+    pub(super) tx_index: u64,
+    pub(super) cumulative_gas_used: u64,
+    /// Wall time spent executing the block's txs and deposits. This
+    /// excludes channel idle time between txs. The `BoundaryStart` handler
+    /// records this value when it closes the block. It is `None` for empty
+    /// blocks.
+    pub(super) apply_elapsed: Option<Duration>,
+    /// Shadow tx captures and the serial-lane count for the current block.
+    /// The code hands these off with `try_send` at each boundary; this never
+    /// blocks. Both stay empty when the shadow is off.
+    pub(super) shadow_captures: Vec<crate::shadow::ShadowTxCapture>,
+    pub(super) shadow_serial: u32,
+}
+
+impl<W: ExecPorts> BlockState<W> {
+    fn new() -> Self {
+        Self {
+            delta: PendingDelta::new(),
+            bal: revm::state::bal::Bal::new(),
+            buffered: Vec::new(),
+            scope: None,
+            receipts: Vec::new(),
+            tx_index: 0,
+            cumulative_gas_used: 0,
+            apply_elapsed: None,
+            shadow_captures: Vec::new(),
+            shadow_serial: 0,
+        }
+    }
+}
+
+/// Pipelined commit, at depth K. At each boundary, the code submits the
+/// finalized delta to the writer, but does not wait for it. The next
+/// block executes against the snapshot, then the merged unsettled layer,
+/// then the delta. Completed commits settle opportunistically, through a
+/// non-blocking probe at each boundary. The exec thread parks only when
+/// the writer is a full K blocks behind.
+///
+/// A single slow fsync does not touch execution at all: a blocking
+/// `wait_committed` call runs only when the pipeline is at full depth.
+///
+/// Durability semantics do not change. A boundary reaches `tx_receipts`
+/// only after its block is durable. Receipts stream out before
+/// durability, at least once: a crash replay re-publishes them, and
+/// they are byte-identical.
+pub(super) struct CommitPipeline<W: ExecPorts> {
+    /// The snapshot source returns owned snapshots keyed by block number:
+    /// the block just committed. This is the [`ResumePoint`]'s `block` field
+    /// (0 on a fresh start).
+    pub(super) snapshot: SnapshotDb<W>,
+    /// The merged union of every unsettled block's writes. A later block's
+    /// write wins over an earlier one. This gives one layer regardless of
+    /// depth, so per-tx cache seeding stays O(one map). The code rebuilds
+    /// `parent` from the survivors when commits settle.
+    pub(super) parent: Option<PendingDelta>,
+    pub(super) inflight: VecDeque<(BlockBoundary, PendingDelta)>,
+}
+
+/// Where the exec thread is in the chain. Seeded from the [`ResumePoint`]
+/// and advanced by the records and boundaries it consumes.
+pub(super) struct Cursor {
     /// Block-number bookkeeping. Blocks are 1-indexed; genesis is block 0.
     /// The exec thread assumes every block boundary it sees is for the
     /// current in-flight block. It does not re-derive block numbers on its
     /// own; it relies on the sealer.
-    pub(super) current_block: u64,
+    pub(super) block: u64,
     /// Block N's txs execute with boundary N-1's timestamp. On resume, the
     /// code already consumed that boundary before the restart. So its
     /// persisted value seeds the state. See [`ResumePoint::l2_timestamp`].
-    pub(super) current_l2_ts: u64,
-    /// Per-block RPC enrichment counters. The code resets these at each
-    /// `BoundaryStart`.
-    pub(super) tx_index_in_block: u64,
-    pub(super) cumulative_gas_used: u64,
-    /// The cumulative count of canonical records (`TxRef` and `DepositRef`)
-    /// this exec thread has folded into a receipt.
+    pub(super) l2_ts: u64,
+    /// The next absolute record index, which is also the cumulative count
+    /// of canonical records this exec thread has consumed.
     ///
     /// This is the boundary alignment key. `BlockBoundaryStart.end_tx_idx`
     /// carries the sealer's cumulative count of republished canonical
     /// records, encoded through `BPosition::from_index`. At each boundary,
-    /// the two counts must match. `expected_tx_idx` already tracks this
-    /// count: it advances once per applied Tx or Deposit, and never resets
-    /// across blocks. So the code compares against it directly.
+    /// the two counts must match. `next_tx_idx` advances once per record
+    /// in arrival order, and never resets across blocks. So the code
+    /// compares against it directly.
     ///
     /// The key is a count, not an Aeron byte position. A byte position is
     /// per-publication under the canonical-publisher MDC merge, and is
@@ -150,16 +175,27 @@ pub(crate) struct ExecState<W: ExecPorts> {
     /// The counter is seeded at the resume cursor. Boundary counts on the
     /// wire are absolute, and delivery resumes at the cursor, so the
     /// counter must start there too.
-    pub(super) expected_tx_idx: TxIndex,
-    /// Wall time spent executing the block's txs and deposits. This
-    /// excludes channel idle time between txs. The `BoundaryStart` handler
-    /// records this value when it closes the block. It is `None` for empty
-    /// blocks.
-    pub(super) block_apply_elapsed: Option<Duration>,
-    /// Pre-resolved counter handles. This loop is the executor's hottest
-    /// path, so the code skips the per-event registry lookup.
-    pub(super) tx_applied_ok: metrics::Counter,
-    pub(super) tx_applied_error: metrics::Counter,
+    pub(super) next_tx_idx: TxIndex,
+}
+
+/// Pre-resolved counter handles. The exec loop is the executor's hottest
+/// path, so the code skips the per-event registry lookup.
+pub(super) struct ExecMetrics {
+    pub(super) applied_ok: metrics::Counter,
+    pub(super) applied_error: metrics::Counter,
+}
+
+/// The exec thread's mutable loop state. Each [`ExecState::spawn`] thread has one
+/// instance. Each `ReaderToExec` arm is one method, split across
+/// `exec_records.rs`, `exec_markers.rs`, and `exec_boundary.rs`.
+pub(crate) struct ExecState<W: ExecPorts> {
+    pub(super) cfg: ExecutorConfig,
+    pub(super) io: ExecIo<W>,
+    pub(super) hooks: ExecHooks<W>,
+    pub(super) block: BlockState<W>,
+    pub(super) commits: CommitPipeline<W>,
+    pub(super) cursor: Cursor,
+    pub(super) metrics: ExecMetrics,
 }
 
 impl<W: ExecPorts> ExecState<W> {
@@ -180,49 +216,37 @@ impl<W: ExecPorts> ExecState<W> {
             sw_signal,
             sw_queue,
             start,
-            hooks:
-                ExecHooks {
-                    bal_tx,
-                    shadow_tx,
-                    block_exec,
-                    epoch_observer,
-                    remote_epoch_observer,
-                },
+            hooks,
         } = inputs;
         let snapshot = snapshots.snapshot_after(start.block);
         Self {
             cfg,
-            rx,
-            tx,
-            snapshots,
-            sw_signal,
-            sw_queue,
-            bal_tx,
-            shadow_tx,
-            shadow_captures: Vec::new(),
-            shadow_serial: 0,
-            block_exec,
-            epoch_observer,
-            remote_epoch_observer,
-            snapshot,
-            delta: PendingDelta::new(),
-            block_bal: revm::state::bal::Bal::new(),
-            buffered: Vec::new(),
-            scope: None,
-            parent: None,
-            inflight: VecDeque::new(),
-            block_receipts: Vec::new(),
-            // `start.block` is read from the persisted resume cursor; a
-            // corrupt value near `u64::MAX` must not wrap to block 0 and
-            // silently re-execute the chain from genesis.
-            current_block: start.block.saturating_add(1),
-            current_l2_ts: start.l2_timestamp,
-            tx_index_in_block: 0,
-            cumulative_gas_used: 0,
-            expected_tx_idx: TxIndex(start.record_count),
-            block_apply_elapsed: None,
-            tx_applied_ok: metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "ok"),
-            tx_applied_error: metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "error"),
+            io: ExecIo {
+                rx,
+                tx,
+                snapshots,
+                sw_signal,
+                sw_queue,
+            },
+            hooks,
+            block: BlockState::new(),
+            commits: CommitPipeline {
+                snapshot,
+                parent: None,
+                inflight: VecDeque::new(),
+            },
+            cursor: Cursor {
+                // `start.block` is read from the persisted resume cursor; a
+                // corrupt value near `u64::MAX` must not wrap to block 0 and
+                // silently re-execute the chain from genesis.
+                block: start.block.saturating_add(1),
+                l2_ts: start.l2_timestamp,
+                next_tx_idx: TxIndex(start.record_count),
+            },
+            metrics: ExecMetrics {
+                applied_ok: metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "ok"),
+                applied_error: metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "error"),
+            },
         }
     }
 }

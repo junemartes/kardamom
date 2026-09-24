@@ -39,9 +39,6 @@ pub enum ExecutorError {
     #[error("witness unanchored: {0}")]
     WitnessUnanchored(String),
 
-    #[error("out-of-order tx_idx: got {got:?}, expected {expected:?}")]
-    OutOfOrderTx { got: TxIndex, expected: TxIndex },
-
     #[error(
         "block boundary closes before observed end_tx_idx: end={end:?} last_seen={last_seen:?}"
     )]

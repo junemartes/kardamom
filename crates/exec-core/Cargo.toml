@@ -78,7 +78,6 @@ metrics = { version = "0.24", optional = true }
 
 [dev-dependencies]
 alloy-signer-local = { workspace = true }
-alloy-network = { workspace = true }
 # The signed-legacy-tx fixture the tests build envelopes with.
 kardamom-test-support = { workspace = true }
 # EEST conformance runner (`tests/eest_state.rs`): revm's statetest fixture

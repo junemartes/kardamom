@@ -6,11 +6,12 @@
 //! 2. Read the meta cursors with [`read_recovery_point`].
 //! 3. Open an initial snapshot.
 //! 4. Emit a [`RecoveryPoint`] that tells the executor where to resume
-//!    reading B from.
+//!    reading `tx_ordering` from.
 //!
 //! Recovery itself is read-only. No replay logic lives in this crate. The
-//! executor reads B starting at `recovery_point.last_fsynced_b_position`,
-//! and re-derives any blocks the writer never committed.
+//! executor reads `tx_ordering` starting at
+//! `recovery_point.last_fsynced_reader_position`, and re-derives any
+//! blocks the writer never committed.
 
 use kardamom_types::BPosition;
 
@@ -19,7 +20,7 @@ use std::ops::ControlFlow;
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::{
-    KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_LAST_FSYNCED_B_POSITION,
+    KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_LAST_FSYNCED_READER_POSITION,
     read_meta_b_position, read_meta_u64,
 };
 use crate::schema::{
@@ -32,7 +33,7 @@ use crate::schema::{
 pub struct RecoveryPoint {
     pub last_committed_block: u64,
     pub last_committed_end_tx_position: BPosition,
-    pub last_fsynced_b_position: BPosition,
+    pub last_fsynced_reader_position: BPosition,
     /// The committed block's boundary `l2_timestamp`, from its `headers` row.
     ///
     /// On a resume from cursor, the executor thread seeds its
@@ -62,8 +63,9 @@ pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> 
     let last_committed_end_tx_position =
         read_meta_b_position(&txn, meta, KEY_LAST_COMMITTED_END_TX_POSITION)?
             .unwrap_or(BPosition::ZERO);
-    let last_fsynced_b_position =
-        read_meta_b_position(&txn, meta, KEY_LAST_FSYNCED_B_POSITION)?.unwrap_or(BPosition::ZERO);
+    let last_fsynced_reader_position =
+        read_meta_b_position(&txn, meta, KEY_LAST_FSYNCED_READER_POSITION)?
+            .unwrap_or(BPosition::ZERO);
     let last_committed_l2_timestamp = if last_committed_block > 0 {
         read_committed_l2_timestamp(&txn, last_committed_block)?
     } else {
@@ -73,7 +75,7 @@ pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> 
     Ok(RecoveryPoint {
         last_committed_block,
         last_committed_end_tx_position,
-        last_fsynced_b_position,
+        last_fsynced_reader_position,
         last_committed_l2_timestamp,
     })
 }

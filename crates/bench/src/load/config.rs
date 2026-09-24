@@ -234,7 +234,7 @@ impl Default for LoadConfig {
             rpc: String::new(),
             receipt_rpcs: Vec::new(),
             chain_id: None,
-            duration: Duration::from_secs(300),
+            duration: Duration::from_mins(5),
             target_tps: DEFAULT_TARGET_TPS,
             sender_range: SenderRange::new(0, DEFAULT_SENDER_RANGE_WIDTH)
                 .expect("0 + 16 never overflows"),

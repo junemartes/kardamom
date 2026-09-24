@@ -47,5 +47,4 @@ serde_json.workspace = true
 alloy-node-bindings.workspace = true
 kardamom-types.workspace = true
 kardamom-deployer = { path = ".", features = ["test-support"] }
-tempfile = "3"
 toml.workspace = true

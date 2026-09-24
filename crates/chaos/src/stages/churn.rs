@@ -11,7 +11,7 @@ use crate::rpc::Rpc;
 /// load reserve holds #1..#15.
 pub const CHURN_ACCOUNT: u32 = 16;
 const SETTLE: Duration = Duration::from_secs(5);
-const SMOKE_BUDGET: Duration = Duration::from_secs(60);
+const SMOKE_BUDGET: Duration = Duration::from_mins(1);
 
 impl Harness {
     /// Stop the ingress-0 allocation and re-smoke through ingress-1.
