@@ -91,9 +91,39 @@ pub struct IngressConfig {
     /// are the executor indexes, so this is the executor count. Read
     /// only with `cache` on.
     pub mirror_count: NonZeroU32,
+    /// How far past the newest block boundary this proxy has seen it
+    /// stamps a transaction's `max_inclusion_block`. The sealer refuses an
+    /// offer once its own block number passes that deadline, which is what
+    /// makes its dedup window exact: an id leaves the window only when no
+    /// copy of it can be accepted again. See
+    /// `docs/agents/offer-inclusion-deadline-spec.md`.
+    pub inclusion_horizon_blocks: NonZeroU64,
 }
 
 impl IngressConfig {
+    /// The inclusion deadline to stamp on an envelope, given the newest
+    /// block boundary this proxy has seen.
+    ///
+    /// A proxy that lags behind the boundaries stamps an earlier deadline,
+    /// which is the safe direction: the transaction expires sooner and the
+    /// client hears about it. No proxy can stamp a deadline that lets a
+    /// stale copy into the canonical order. The addition saturates, so a
+    /// horizon at the top of the range means "no deadline".
+    ///
+    /// Block 0 is the one value that is not a lagging boundary but an
+    /// absent one: L2 blocks start at 1, so a zero means this proxy has
+    /// seen no boundary yet. A horizon measured from zero would expire
+    /// every transaction on a running chain, so a fresh proxy stamps no
+    /// deadline until its first boundary arrives.
+    #[inline]
+    #[must_use]
+    pub fn inclusion_deadline(&self, latest_block_number: u64) -> u64 {
+        if latest_block_number == 0 {
+            return u64::MAX;
+        }
+        latest_block_number.saturating_add(self.inclusion_horizon_blocks.get())
+    }
+
     /// The `tx_data` lane of `sender`: the shard map, or the identity rule
     /// over `partition_count_m`.
     #[inline]
@@ -135,6 +165,11 @@ impl Default for IngressConfig {
             executor_query: ExecutorQueryConfig::default(),
             cache: CacheConfig::default(),
             mirror_count: nonzero!(1u32),
+            // 64 blocks is 16 s at the 250 ms production tick, and 128 s
+            // at the 2000 ms container tick. Both leave room for a
+            // sequencer to drain its reorder buffer, and both are far
+            // below the stall that makes a re-offer a hazard.
+            inclusion_horizon_blocks: nonzero!(64u64),
         }
     }
 }
@@ -161,6 +196,16 @@ pub use kardamom_cluster_adapter::ClusterConfig;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_deadline_is_the_newest_boundary_plus_the_horizon() {
+        let cfg = IngressConfig::default();
+        assert_eq!(cfg.inclusion_deadline(500), 564);
+        // A proxy that has seen no boundary stamps no deadline.
+        assert_eq!(cfg.inclusion_deadline(0), u64::MAX);
+        // The horizon never wraps past the end of the range.
+        assert_eq!(cfg.inclusion_deadline(u64::MAX), u64::MAX);
+    }
 
     #[test]
     fn default_matches_spec() {

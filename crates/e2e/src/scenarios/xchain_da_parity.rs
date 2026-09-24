@@ -98,6 +98,7 @@ impl Acc {
                 raw_tx: bytes::Bytes::copy_from_slice(tx.raw.as_ref()),
                 sender: tx.sender,
                 tx_hash: tx.hash,
+                max_inclusion_block: u64::MAX,
             },
         ));
     }

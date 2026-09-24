@@ -27,7 +27,7 @@ fn relayed_txref(shard: u8, off: i32) -> Vec<u8> {
         },
         0,
     );
-    let ingress = encode_ingress_txref(&r, alloy_primitives::Address::ZERO, 0);
+    let ingress = encode_ingress_txref(&r, alloy_primitives::Address::ZERO, 0, u64::MAX);
     let (_cid, relayed) = split_ingress(&ingress).unwrap();
     relayed.to_vec()
 }

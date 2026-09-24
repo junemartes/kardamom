@@ -115,6 +115,7 @@ impl LegacyTx {
             raw_tx,
             sender: signer.address(),
             tx_hash,
+            max_inclusion_block: u64::MAX,
         }
     }
 }

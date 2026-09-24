@@ -28,6 +28,7 @@ fn arb_tx(correlation_id: u64, raw_len: usize) -> RecordedTx {
             raw_tx: Bytes::from(vec![correlation_id as u8; raw_len]),
             sender: Address::repeat_byte(correlation_id as u8),
             tx_hash: B256::repeat_byte((correlation_id ^ 0xFF) as u8),
+            max_inclusion_block: u64::MAX,
         },
     }
 }

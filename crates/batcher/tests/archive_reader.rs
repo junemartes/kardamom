@@ -16,6 +16,7 @@ fn tx(correlation: u64) -> TxEnvelope {
         raw_tx: Bytes::from_static(b"raw-payload"),
         sender: Address::repeat_byte(0xAA),
         tx_hash: B256::repeat_byte(0xBB),
+        max_inclusion_block: u64::MAX,
     }
 }
 

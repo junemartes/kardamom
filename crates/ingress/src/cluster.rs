@@ -67,15 +67,16 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
             Ok(EgressItem::Boundary(b)) => self.watermark.observe_boundary(b.end_tx_idx.as_index()),
             // Replay control frames are per-session responses to a
             // REPLAY_FROM request. The ingress never sends one; it
-            // derives a watermark only from live progress. Contiguity
-            // and remote-origin rejects go only to the offering
-            // sequencer session. None can arrive here, so this arm
-            // ignores them as a safeguard.
+            // derives a watermark only from live progress. Every reject
+            // goes only to the offering sequencer session. None can
+            // arrive here, so this arm ignores them as a safeguard.
             Ok(
                 EgressItem::ReplayDone { .. }
                 | EgressItem::ReplayUnavailable { .. }
                 | EgressItem::ContiguityReject { .. }
-                | EgressItem::RemoteOriginReject { .. },
+                | EgressItem::RemoteOriginReject { .. }
+                | EgressItem::PastDeadline { .. }
+                | EgressItem::WindowFull { .. },
             ) => return ControlFlow::Continue(()),
             Err(e) => {
                 // The cluster stream is authoritative, so this should
@@ -141,7 +142,7 @@ mod tests {
             },
             0,
         );
-        let ingress = encode_ingress_txref(&r, alloy_primitives::Address::ZERO, 0);
+        let ingress = encode_ingress_txref(&r, alloy_primitives::Address::ZERO, 0, u64::MAX);
         let (_cid, relayed) = split_ingress(&ingress).unwrap();
         encode_egress_record(index, relayed).unwrap()
     }

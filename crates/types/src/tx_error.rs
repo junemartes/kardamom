@@ -48,4 +48,16 @@ pub enum TxErrorReason {
     /// client must resubmit it after the gap fills. See
     /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.3.
     Expired { expected_nonce: u64 },
+    /// The sealer refused the offer because its own block number had passed
+    /// the transaction's `max_inclusion_block`. The transaction is not
+    /// ordered, and no copy of it can be ordered later: the deadline is a
+    /// property of the signed submission, not of the replica that offered
+    /// it. The client resubmits.
+    ///
+    /// This is not [`Self::Expired`], which is the sequencer's own
+    /// nonce-gap `tx_ttl`. See `docs/agents/offer-inclusion-deadline-spec.md`.
+    PastDeadline {
+        max_inclusion_block: u64,
+        at_block: u64,
+    },
 }

@@ -58,6 +58,10 @@ pub fn block_frame_to_replay(frame: &BlockFrame) -> ReplayBlock {
                 raw_tx: t.raw_tx.clone(),
                 sender: t.sender,
                 tx_hash: t.tx_hash,
+                // The DA frame carries no deadline, and a replay needs
+                // none: the sealer already decided inclusion, and
+                // execution never reads the field.
+                max_inclusion_block: u64::MAX,
             })
             .collect(),
     }

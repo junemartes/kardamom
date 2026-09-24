@@ -328,6 +328,9 @@ fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<
         kardamom_types::TxErrorReason::Expired { expected_nonce } => {
             ("expired".to_string(), Some(*expected_nonce))
         }
+        // The deadline names a block, not a nonce, so the nonce field of
+        // this wire shape stays empty.
+        kardamom_types::TxErrorReason::PastDeadline { .. } => ("past-deadline".to_string(), None),
     }
 }
 

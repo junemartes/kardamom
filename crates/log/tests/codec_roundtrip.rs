@@ -12,6 +12,7 @@ fn log_codec_access_and_materialize() {
         raw_tx: Bytes::from_static(b"raw"),
         sender: Address::repeat_byte(0xAA),
         tx_hash: B256::repeat_byte(0xBB),
+        max_inclusion_block: u64::MAX,
     };
     let bytes = encode(&v).unwrap();
 

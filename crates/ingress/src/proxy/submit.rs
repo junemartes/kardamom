@@ -312,6 +312,10 @@ where
                     raw_tx: raw_tx.0.clone(),
                     sender: v.sender,
                     tx_hash: v.tx_hash,
+                    // The deadline is read from the newest boundary this
+                    // proxy has seen, so the whole pipeline compares block
+                    // numbers from one clock: the sealer's own.
+                    max_inclusion_block: self.cfg.inclusion_deadline(self.latest_block_number()),
                 },
             )
             .await

@@ -104,6 +104,7 @@ pub fn envelope_with(
         raw_tx: Bytes::from(buf),
         sender: s.address(),
         tx_hash,
+        max_inclusion_block: u64::MAX,
     }
 }
 

@@ -92,6 +92,7 @@ fn undecodable_raw_tx_skips_with_marker_receipt() {
         raw_tx: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
         sender: signer.address(),
         tx_hash: keccak256([0xde, 0xad, 0xbe, 0xef]),
+        max_inclusion_block: u64::MAX,
     };
     let (receipt, ws) = run_once(
         &snap,

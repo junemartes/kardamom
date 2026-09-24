@@ -21,4 +21,15 @@ pub struct TxEnvelope {
     /// Downstream code never recomputes it. It propagates unchanged into `Receipt.tx_hash`.
     #[rkyv(with = wire::B256Bytes)]
     pub tx_hash: B256,
+    /// The last block the sealer may order this transaction into. The proxy
+    /// stamps it as `latest_block_number + inclusion_horizon_blocks`; the
+    /// sealer rejects an offer once its own block number passes it.
+    ///
+    /// The deadline rides on the envelope, not on the `TxRef`, so every
+    /// racing sequencer replica reads the same value from the one shared
+    /// `tx_data` record and relays it unchanged. The racing offers stay
+    /// byte-identical, which the sealer's first-wins dedup relies on.
+    ///
+    /// See `docs/agents/offer-inclusion-deadline-spec.md`.
+    pub max_inclusion_block: u64,
 }

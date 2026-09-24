@@ -626,6 +626,7 @@ mod tests {
                     raw_tx: vec![0xde, 0xad].into(),
                     sender: Address::from([0x11; 20]),
                     tx_hash: B256::from([0x22; 32]),
+                    max_inclusion_block: u64::MAX,
                 },
             }],
             None,

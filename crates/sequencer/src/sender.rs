@@ -35,6 +35,7 @@ mod tests {
             raw_tx: Bytes::from_static(b"raw"),
             sender,
             tx_hash: alloy_primitives::B256::default(),
+            max_inclusion_block: u64::MAX,
         }
     }
 

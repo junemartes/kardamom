@@ -56,6 +56,9 @@ impl PlannedTx {
             raw_tx: self.raw.clone().into(),
             sender,
             tx_hash: self.hash,
+            // The load submits through the proxy, which stamps the
+            // real deadline. This envelope never reaches the wire.
+            max_inclusion_block: u64::MAX,
         }
     }
 }

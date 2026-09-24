@@ -410,6 +410,14 @@ fn reason_to_error(sender: Address, nonce: u64, reason: &TxErrorReason) -> Ingre
         TxErrorReason::DuplicatedTx { .. } => IngressError::Duplicate((sender, nonce)),
         TxErrorReason::Evicted { .. } => IngressError::Evicted((sender, nonce)),
         TxErrorReason::Expired { .. } => IngressError::Expired((sender, nonce)),
+        TxErrorReason::PastDeadline {
+            max_inclusion_block,
+            at_block,
+        } => IngressError::PastDeadline {
+            sender_nonce: (sender, nonce),
+            max_inclusion_block: *max_inclusion_block,
+            at_block: *at_block,
+        },
     }
 }
 

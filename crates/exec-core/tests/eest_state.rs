@@ -238,6 +238,7 @@ impl PreparedCase {
             raw_tx: bytes::Bytes::from(decoded.txbytes.to_vec()),
             sender: decoded.sender,
             tx_hash: keccak256(decoded.txbytes),
+            max_inclusion_block: u64::MAX,
         };
         let (receipt, mut ws) = self
             .scope

@@ -18,8 +18,8 @@ use kardamom_cluster_adapter::wire::{
 };
 use kardamom_engine::reader::TxOrderingSubscription;
 use kardamom_engine::reader::cluster::ClusterTxOrderingSubscription;
-use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::outbound::cluster::ClusterRefPublisher;
+use kardamom_sequencer::outbound::{RefOffer, TxOrderingRefPublisher};
 use kardamom_types::{BPosition, TxOrderingMessage};
 
 /// Mirrors the Java `CanonicalSealerState`. It does FIFO first-seen dedup,
@@ -84,10 +84,38 @@ fn dedup_order_and_boundary_alignment_end_to_end() {
     let mut publisher = ClusterRefPublisher::new(ingress.clone());
     let (a, b, c) = (txref(0xA1), txref(0xB2), txref(0xC3));
     let sender = Address::repeat_byte(0x5A);
-    publisher.try_publish_ref(&a, sender, 0).unwrap();
-    publisher.try_publish_ref(&b, sender, 1).unwrap();
-    publisher.try_publish_ref(&a, sender, 0).unwrap(); // duplicate (republish)
-    publisher.try_publish_ref(&c, sender, 2).unwrap();
+    publisher
+        .try_publish_ref(&RefOffer {
+            tx_ref: a,
+            sender,
+            nonce: 0,
+            max_inclusion_block: u64::MAX,
+        })
+        .unwrap();
+    publisher
+        .try_publish_ref(&RefOffer {
+            tx_ref: b,
+            sender,
+            nonce: 1,
+            max_inclusion_block: u64::MAX,
+        })
+        .unwrap();
+    publisher
+        .try_publish_ref(&RefOffer {
+            tx_ref: a,
+            sender,
+            nonce: 0,
+            max_inclusion_block: u64::MAX,
+        })
+        .unwrap(); // duplicate (republish)
+    publisher
+        .try_publish_ref(&RefOffer {
+            tx_ref: c,
+            sender,
+            nonce: 2,
+            max_inclusion_block: u64::MAX,
+        })
+        .unwrap();
 
     // Run the service mock over the ingress, then stamp a boundary.
     let mut service = MockService::new(1024);

@@ -52,6 +52,7 @@ impl DerivedSigner {
             raw_tx: signed.raw.into(),
             sender: self.address,
             tx_hash: signed.hash,
+            max_inclusion_block: u64::MAX,
         })
     }
 

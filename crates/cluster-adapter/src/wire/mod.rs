@@ -5,12 +5,13 @@
 //!
 //! Ingress (Rust sequencer to cluster): one app message per record:
 //! ```text
-//!   [kind:u8 = 0][sender:20][nonce:u64 LE][canonical_id:32][record_type:u8][fields…]
+//!   [kind:u8 = 0][sender:20][nonce:u64 LE][deadline:u64 LE][canonical_id:32][record_type:u8][fields…]
 //!     TxRef       fields = [shard_id:u8][tx_data_position.term_id:i32][.term_offset:i32][tx_data_session_id:i32]
 //!     DepositRef  fields = [deposit_position.term_id:i32][.term_offset:i32]
 //! ```
 //! The Java service parses `sender` and `nonce` for the per-sender
-//! contiguity guard: a known sender's ref with a nonce other than the
+//! contiguity guard, and `deadline` for the inclusion check (see
+//! `docs/agents/offer-inclusion-deadline-spec.md`): a known sender's ref with a nonce other than the
 //! expected next one is rejected with [`EGRESS_KIND_CONTIGUITY_REJECT`],
 //! instead of silently sealing a canonical nonce gap. It also parses
 //! `canonical_id` (at its fixed offset) for dedup, then relays everything
@@ -45,18 +46,18 @@ mod ingress;
 #[cfg(test)]
 mod tests;
 
-#[cfg(any(test, feature = "testing"))]
-pub use egress::encode_contiguity_reject;
 pub use egress::{
     EgressItem, RemoteOriginReject, encode_egress_boundary, encode_egress_record,
     encode_replay_done, encode_replay_unavailable,
 };
 #[cfg(any(test, feature = "testing"))]
+pub use egress::{encode_contiguity_reject, encode_past_deadline, encode_window_full};
+#[cfg(any(test, feature = "testing"))]
 pub use ingress::encode_ingress_depositref;
 pub use ingress::{
     encode_ingress_batch, encode_ingress_epoch, encode_ingress_remote_epoch, encode_ingress_txref,
-    encode_replay_request, encode_subscribe, encode_void_request, ingress_sender_nonce,
-    split_ingress,
+    encode_replay_request, encode_subscribe, encode_void_request, ingress_deadline,
+    ingress_sender_nonce, split_ingress,
 };
 
 /// A `TxRef` fixture for wire and publish tests: distinct-enough bytes to
@@ -191,6 +192,21 @@ pub const EGRESS_KIND_CONTIGUITY_REJECT: u8 = 5;
 /// `EGRESS_KIND_REMOTE_ORIGIN_REJECT`.
 pub const EGRESS_KIND_REMOTE_ORIGIN_REJECT: u8 = 6;
 
+/// Egress kind: the sealer refused a record because its own block number
+/// had passed the record's inclusion deadline:
+/// `[kind:u8 = 7][sender:20][nonce:u64][max_inclusion_block:u64][at_block:u64]`.
+/// Offered only to the session that sent the record. The transaction is
+/// not ordered, and no later copy of it can be: the client resubmits.
+/// Matches Java `EGRESS_KIND_PAST_DEADLINE`.
+pub const EGRESS_KIND_PAST_DEADLINE: u8 = 7;
+
+/// Egress kind: the sealer refused a record because its dedup window is
+/// at capacity: `[kind:u8 = 8][sender:20][nonce:u64]`. This is
+/// back-pressure, not a verdict on the record: the window prunes on the
+/// next tick that passes a deadline, and the sequencer republishes.
+/// Matches Java `EGRESS_KIND_WINDOW_FULL`.
+pub const EGRESS_KIND_WINDOW_FULL: u8 = 8;
+
 /// Why the sealer refused a [`KIND_REMOTE_ORIGIN_RECORD`] frame. The wire
 /// byte (in an [`EGRESS_KIND_REMOTE_ORIGIN_REJECT`] frame) is the
 /// discriminant below. Matches the Java `REMOTE_ORIGIN_REJECT_*` constants.
@@ -321,7 +337,10 @@ pub const SENDER_LEN: usize = 20;
 /// `NONCE_OFFSET` / `CANONICAL_ID_OFFSET` in `SealerClusteredService`.
 pub const INGRESS_SENDER_OFFSET: usize = 1;
 pub const INGRESS_NONCE_OFFSET: usize = INGRESS_SENDER_OFFSET + SENDER_LEN;
-pub const INGRESS_CANONICAL_ID_OFFSET: usize = INGRESS_NONCE_OFFSET + 8;
+/// Byte offset of the inclusion deadline in a kind-0 ingress frame. The
+/// deadline is the last block the sealer may order the record into.
+pub const INGRESS_DEADLINE_OFFSET: usize = INGRESS_NONCE_OFFSET + 8;
+pub const INGRESS_CANONICAL_ID_OFFSET: usize = INGRESS_DEADLINE_OFFSET + 8;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WireError {
