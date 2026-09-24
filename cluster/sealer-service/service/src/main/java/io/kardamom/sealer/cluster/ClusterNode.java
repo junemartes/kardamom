@@ -11,6 +11,7 @@ import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
+import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.VoidLedger;
 import java.io.File;
 import java.util.EnumSet;
@@ -59,6 +60,12 @@ public final class ClusterNode {
         // the sizing math.
         final int dedupCapacity = Integer.getInteger(
             "kardamom.cluster.dedupCapacity", SealerWire.DEFAULT_DEDUP_CAPACITY);
+        // Replicated configuration, like the capacity above: it decides
+        // accept-or-reject inside the replicated state machine, so every
+        // member must be started with the same value.
+        final long inclusionHorizonBlocks = Long.getLong(
+            "kardamom.cluster.inclusionHorizonBlocks",
+            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS);
         // Remote-origin allowlist: the peer chain ids this sealer accepts
         // kind-5 records from. -Dkardamom.cluster.remoteOrigins wins over
         // the KARDAMOM_REMOTE_ORIGINS env var. Unset or empty disables
@@ -113,7 +120,8 @@ public final class ClusterNode {
                     consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, barrier));
                 container = ClusteredServiceContainer.launch(
                     serviceContext(
-                        aeronDir, clusterDir, dedupCapacity, tickMs, memberId, remoteOrigins,
+                        aeronDir, clusterDir, dedupCapacity, inclusionHorizonBlocks, tickMs,
+                        memberId, remoteOrigins,
                         voidConfig, barrier));
                 break;
             } catch (final RuntimeException e) {
@@ -474,7 +482,10 @@ public final class ClusterNode {
     }
 
     private static ClusteredServiceContainer.Context serviceContext(
-            final String aeronDir, final String clusterDir, final int dedupCapacity,
+            final String aeronDir,
+            final String clusterDir,
+            final int dedupCapacity,
+            final long inclusionHorizonBlocks,
             final long tickMs, final int memberId, final java.util.Set<Long> remoteOrigins,
             final VoidLedger.Config voidConfig, final ShutdownSignalBarrier barrier) {
         final ClusteredServiceContainer.Context ctx = new ClusteredServiceContainer.Context()
@@ -482,7 +493,8 @@ public final class ClusterNode {
             .clusterDir(new File(clusterDir))
             .appVersion(APP_VERSION)
             .clusteredService(new SealerClusteredService(
-                dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig));
+                dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig,
+                inclusionHorizonBlocks));
         // The clustered-service container has its own termination hook.
         // Instrumenting only the consensus module would still exit silently
         // when the container is the one that terminates.

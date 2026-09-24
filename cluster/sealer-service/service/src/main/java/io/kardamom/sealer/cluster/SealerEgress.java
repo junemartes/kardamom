@@ -271,6 +271,48 @@ final class SealerEgress {
     }
 
     /**
+     * Frame and offer a past-deadline reject to the offering session:
+     * {@code [kind:7][sender:20][nonce:u64 LE][max_inclusion_block:u64 LE][at_block:u64 LE]}.
+     */
+    void offerPastDeadline(
+            final ClientSession session,
+            final byte[] sender20,
+            final long nonce,
+            final long maxInclusionBlock,
+            final long atBlock) {
+        final MutableDirectBuffer buf = egressBuffer;
+        int pos = 0;
+        buf.putByte(pos, SealerWire.EGRESS_KIND_PAST_DEADLINE);
+        pos += Byte.BYTES;
+        buf.putBytes(pos, sender20);
+        pos += CanonicalSealerState.SENDER_LEN;
+        buf.putLong(pos, nonce, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, maxInclusionBlock, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, atBlock, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        offerToSession(session, pos);
+    }
+
+    /**
+     * Frame and offer a window-full reject to the offering session:
+     * {@code [kind:8][sender:20][nonce:u64 LE]}. Back-pressure, not a
+     * verdict: the sequencer republishes.
+     */
+    void offerWindowFull(final ClientSession session, final byte[] sender20, final long nonce) {
+        final MutableDirectBuffer buf = egressBuffer;
+        int pos = 0;
+        buf.putByte(pos, SealerWire.EGRESS_KIND_WINDOW_FULL);
+        pos += Byte.BYTES;
+        buf.putBytes(pos, sender20);
+        pos += CanonicalSealerState.SENDER_LEN;
+        buf.putLong(pos, nonce, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        offerToSession(session, pos);
+    }
+
+    /**
      * Frame and offer a remote-origin reject to the offering session:
      * {@code [kind:6][origin:u64 LE][first_seq:u64 LE][expected:u64 LE][reason:u8]}.
      */

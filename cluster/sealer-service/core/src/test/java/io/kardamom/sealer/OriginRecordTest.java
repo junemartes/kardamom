@@ -163,7 +163,7 @@ class OriginRecordTest {
         // Both versions mean origin 0, which matches the state of those chains.
         // So neither version needs a migration pass.
         CanonicalSealerState pre = new CanonicalSealerState(8);
-        pre.onRecord(id(1), sender(1), 0L, payload("tx"));
+        pre.onRecord(id(1), sender(1), 0L, pre.blockNumber() + 8, payload("tx"));
         pre.onTick(1_000L);
         long count = pre.canonicalCount();
         long block = pre.blockNumber();

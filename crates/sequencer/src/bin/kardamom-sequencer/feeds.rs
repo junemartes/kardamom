@@ -177,6 +177,9 @@ impl EgressWatermarkFeed {
         if self.on_remote_origin_reject_frame(frame) {
             return;
         }
+        if self.on_deadline_frame(frame) {
+            return;
+        }
         // Check the cheap kind byte first. Relayed records arrive at
         // full line rate on every replica, and fully decoding them
         // here, just to discard them, costs measurable CPU.
@@ -216,6 +219,56 @@ impl EgressWatermarkFeed {
         );
         self.forward_contiguity_reject(sender, nonce, expected);
         true
+    }
+
+    /// Handle one past-deadline or window-full frame. Returns `true` when
+    /// `frame` was either, so the caller does not also check it for a
+    /// boundary.
+    ///
+    /// Both travel the contiguity-reject channel, which is the publish
+    /// loop's rewind path:
+    ///
+    /// - A window-full reject asks for the same ref again once the window
+    ///   prunes, so it rewinds from its own nonce.
+    /// - A past-deadline reject can never be accepted again, so it takes
+    ///   the "already committed" branch (`nonce < expected`), which drops
+    ///   the ledger entry instead of republishing it forever.
+    fn on_deadline_frame(&mut self, frame: &[u8]) -> bool {
+        match frame.first() {
+            Some(&wire::EGRESS_KIND_PAST_DEADLINE) => {
+                if let Ok(EgressItem::PastDeadline {
+                    sender,
+                    nonce,
+                    max_inclusion_block,
+                    at_block,
+                }) = EgressItem::decode(frame)
+                {
+                    tracing::warn!(
+                        partition = self.partition,
+                        ?sender,
+                        nonce,
+                        max_inclusion_block,
+                        at_block,
+                        "sealer past-deadline reject received; dropping the ref"
+                    );
+                    self.forward_contiguity_reject(sender, nonce, nonce.saturating_add(1));
+                }
+                true
+            }
+            Some(&wire::EGRESS_KIND_WINDOW_FULL) => {
+                if let Ok(EgressItem::WindowFull { sender, nonce }) = EgressItem::decode(frame) {
+                    tracing::warn!(
+                        partition = self.partition,
+                        ?sender,
+                        nonce,
+                        "sealer window-full reject received; republishing the ref"
+                    );
+                    self.forward_contiguity_reject(sender, nonce, nonce);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Handle one remote-origin-reject frame. Returns `true` when
