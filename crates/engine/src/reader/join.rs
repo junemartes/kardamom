@@ -230,6 +230,44 @@ impl RefusedArchives {
     }
 }
 
+/// How a join ended.
+pub(super) enum JoinOutcome {
+    /// The envelope arrived, live or from an archive.
+    Joined(TxEnvelope),
+    /// The budget ended, and every `tx_data` archive answered that it does
+    /// not hold the range. No retry and no restart can recover the entry.
+    Unjoinable,
+    /// The budget ended, and one archive or more gave no definite answer.
+    /// The data can still exist, so a restart can still recover the entry.
+    TimedOut,
+}
+
+/// The archives that answered "not here" during one join.
+///
+/// Only [`kardamom_log::error::LogError::RangeAbsent`] counts. An archive
+/// that is down, slow, or corrupt gives another error and stays outside the
+/// set, so [`Self::covers`] stays false while any copy is still unknown.
+#[derive(Default)]
+pub(super) struct RefusedArchives(std::collections::BTreeSet<String>);
+
+impl RefusedArchives {
+    pub(super) fn note(&mut self, error: &JoinRecoveryError) {
+        if let JoinRecoveryError::Archive(kardamom_log::error::LogError::RangeAbsent {
+            archive,
+            ..
+        }) = error
+        {
+            self.0.insert(archive.clone());
+        }
+    }
+
+    /// True when `archives` is not empty and each of them refused. An empty
+    /// list means discovery knows no archive, which is no answer at all.
+    pub(super) fn covers(&self, archives: &[String]) -> bool {
+        !archives.is_empty() && archives.iter().all(|a| self.0.contains(a))
+    }
+}
+
 /// Joins one `TxRef` against the buffer with the full join budget, mixing
 /// in bounded archive-refetch attempts when a [`JoinRecovery`] is wired.
 ///

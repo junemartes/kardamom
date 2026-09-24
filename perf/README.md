@@ -19,7 +19,7 @@ CI's cluster shard logs Mgas/s per ramp step (transfer + DeFi stages).
   `KARDAMOM_PROFILE_OPS`), `crates/sequencer/tests/alloc_profile.rs`,
   `crates/bench/tests/alloc_profile_ingress.rs`. Run any of them:
   `cargo test -p <crate> --test <name> --release -- --ignored --nocapture`.
-- **CI gate**: `deploy/ci/alloc-gate.sh` (the `alloc-gate` job in
+- **CI gate**: `just alloc-gate` (the `alloc-gate` job in
   `ci.yml`) runs all three and FAILS on any allocs/op or bytes/op above
   the ceilings in `perf/alloc-baselines.env`. Allocation counts are
   deterministic, so the gate is tight (~15% headroom); wall time is
