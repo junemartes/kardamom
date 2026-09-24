@@ -98,13 +98,12 @@ is left, or when the roles fail together:
   node stays, with the orchestrator and the L1. All nodes start in one call,
   with no arranged order. Every job must return to its count, the sealers
   must elect a leader within 180 s, both ingresses must be live, and the
-  pipeline must progress. **The case exists and is not in the shard yet: it
-  fails on an open product defect.** After the blackout every job returns and
-  a leader is elected, and then all three executors crash-loop on one
-  canonical entry whose transaction data no archive can serve (`join
-  timeout: TxRef ... not found within 30000 ms`, the archive refetch failing):
-  the sealer had ordered a reference to data that was lost with the nodes.
-  The chain is wedged for good. It joins the shard with that fix.
+  pipeline must progress. The blackout can lose the transaction data of an
+  entry that the sealer already ordered. Before the void rule below, all
+  three executors then crash-looped on that entry (`join timeout: TxRef ...
+  not found within 30000 ms`) and the chain was wedged for good. Now every
+  consumer votes, the sealer voids the entry, and the chain moves again. The
+  case prints the number of void decisions as evidence.
 
 **Removal of an entry that no consumer can execute (void).** The sealer
 orders a transaction reference before the archives make its data durable, so
@@ -135,9 +134,17 @@ configured, a full window adds 65536 x 68 bytes (about 4.4 MB) to each
 snapshot. A void needs the last vote before `voidWindow` more records are
 ordered after the entry: with live ingress at more than about 1000 records
 per second and a 60 s join budget, the entry leaves the window first, and the
-chain stops as it did before this rule. Status: the sealer
-side exists. No consumer votes yet, so `pipeline-blackout-recover` still
-fails until the consumer side lands.
+chain stops as it did before this rule.
+
+The voter list must equal the set of consumers that execute. The deploy
+builds both sides from the executor count: executor `i` votes with id `i`
+(`--void-voter-id`, its allocation index), the validator with the next id,
+the batcher with the one after, and `cluster.nomad.hcl` gives the sealer the
+same range. A consumer outside the list cannot stop a void. If it executed
+the entry, it stops with `VoidOfExecutedEntry` when it reads the void record.
+A consumer waits 120 s for the void record and then restarts; the sealer
+keeps its vote. A sender gets no notice of a void yet: the receipt never
+comes, and the sender submits again.
 
 **Durability of the Raft log.** The kill-based cases above prove the
 restart logic, not the durability against a power loss: a process kill or a

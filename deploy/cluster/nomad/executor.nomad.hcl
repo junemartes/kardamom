@@ -169,6 +169,9 @@ job "executor" {
           # so ${NOMAD_ALLOC_INDEX} stays stable at 0 through N, and
           # matches the co-located recorder's id.
           "--recorder-id", "${NOMAD_ALLOC_INDEX}",
+          # The void voter id: the same stable index. The sealer's voter
+          # list (cluster.nomad.hcl) names every executor index.
+          "--void-voter-id", "${NOMAD_ALLOC_INDEX}",
           # Cluster mode only: this allocation's cluster-egress
           # (response) endpoint. The cluster client's egress_channel is
           # per allocation (the node IP and the dynamic port are known
