@@ -1,12 +1,49 @@
 # Offer Inclusion Deadline — Spec
 
 - **Date:** 2026-09-23
-- **Status:** Draft
+- **Status:** Implemented 2026-09-24 (#432, #433), except the chaos assertion; see Deviations
 - **Extends:** `sealer-aeron-cluster-failover-spec.md` (the cluster dedup window),
   `sequencer-lag-resync-spec.md` (the receipt-floor resync filter),
   `replicated-sequencer-shards-spec.md` (P racing replicas per shard)
 - **Follows:** the executor `DedupWindow` removal (#427). The executor now trusts the sealer's
   relayed stream. The sealer is the pipeline's one dedup point.
+
+## Deviations, as built
+
+The design landed in two pull requests: #432 (the envelope field, the wire, the
+proxy stamp) and #433 (the sealer rule, the window, the client notice, the
+deploy wiring). Five things differ from the design above.
+
+1. **The reason is `TxErrorReason::PastDeadline`, not `Expired`.** That name was
+   already taken by the sequencer's nonce-gap `tx_ttl`, a different event with a
+   different remedy.
+2. **The snapshot is version 7, not 6.** The void stack (#421) already took 6.
+3. **No frame-length compatibility branch.** The rollout in this document sniffs
+   the frame length so an old sequencer can talk to a new sealer. The chain has
+   no live deployment and #264 reset it, so the frame is a flag day and the
+   branch would be dead code.
+4. **Markers do not meet the window cap.** This document does not say what a full
+   window does to an epoch or a remote batch. Refusing one would stall that lane
+   rather than shed load, and markers are a trickle where transactions are a
+   flood. Every member takes the same branch, so the replicated state stays
+   identical.
+5. **Log lines, not Prometheus counters.** The sealer has no metrics endpoint;
+   the executor re-exports only its boundary stream. `PAST-DEADLINE` and
+   `WINDOW-FULL` print at power-of-two counts, like `CONTIGUITY-REJECT` and
+   `VOID-VOTE`, which is what the chaos suite greps.
+
+One addition is not in the design: the sealer **clamps** the stored deadline to
+`blockNumber + inclusionHorizonBlocks`. Without it, a proxy stamping a deadline
+far in the future would pin an id in the window for as long as it liked, and the
+window's bound would again be a promise rather than a property. The clamp only
+shortens, so it admits nothing the stamp would not.
+
+**Still open:** test-plan item 4. `sequencer-lapse` now reports how many
+re-offers the sealer refused for being late, but at the shard's 64-block horizon
+(128 s at the 2000 ms container tick) a 30 s freeze expires nothing, so the count
+reads zero. Making it the assertion this document asks for needs the shard's
+horizon set below its freeze length, on both the proxy and the sealer, and a
+cluster run to confirm the thawed backlog is refused rather than re-ordered.
 
 ## Goal
 
