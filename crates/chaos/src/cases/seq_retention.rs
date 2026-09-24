@@ -307,7 +307,7 @@ pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow
     }
     await_repair_chain(h, victim, &ctx, delta, elapsed, &repair).await?;
     match victim {
-        Victim::Executor => h.assert_executor_progress(Duration::from_secs(180)).await,
+        Victim::Executor => h.assert_executor_progress(Duration::from_mins(3)).await,
         Victim::Validator => await_verifying_resumed(h).await,
     }
 }
@@ -350,7 +350,7 @@ async fn overrun_window(
         let rx_now = h.probes.ingress_received().await.unwrap_or(rx_freeze);
         let d = rx_now.saturating_sub(rx_freeze);
         delta_ref.set(d);
-        let overrun = d >= need && elapsed >= Duration::from_secs(120);
+        let overrun = d >= need && elapsed >= Duration::from_mins(2);
         Ok::<_, anyhow::Error>(overrun.then_some(d))
     })
     .await?;

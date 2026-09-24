@@ -61,9 +61,9 @@ mod tests {
     #[test]
     fn mixed_retries_preserve_the_remaining_recovery_opportunity() {
         let mut budget = RetryBudget::default();
-        budget.record(Retry::Timeout, Duration::from_secs(60));
+        budget.record(Retry::Timeout, Duration::from_mins(1));
         budget.record(Retry::Transport, Duration::from_secs(30));
-        budget.record(Retry::Timeout, Duration::from_secs(60));
+        budget.record(Retry::Timeout, Duration::from_mins(1));
         budget.record(Retry::Transport, Duration::from_secs(59));
         assert!(budget.can_retry(), "the next attempt can still succeed");
         assert_eq!(budget.timeouts, 2);

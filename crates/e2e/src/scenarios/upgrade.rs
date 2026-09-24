@@ -82,7 +82,7 @@ fn assert_feature_dormant(state_dir: &Path) -> Result<()> {
 async fn state_at_or_past(state_dir: &Path, block: u64, what: &str) -> Result<ChainStateView> {
     poll_until(
         &format!("{what} committed through block {block}"),
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         Duration::from_millis(200),
         || async {
             let v = read_chain_state(state_dir)?;
@@ -145,7 +145,7 @@ async fn assert_validator_agrees(
     t.wait_validator_metric_above(
         VALIDATOR_BLOCKS_VERIFIED,
         0.0,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         Duration::from_millis(250),
         "validator verified past the activation block",
     )
@@ -320,7 +320,7 @@ pub async fn activates_at_timestamp(
     // --- Wait past T, then find the first block whose header reached it. --
     let v = poll_until(
         "a block closes at or after the activation time",
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         Duration::from_millis(200),
         || async {
             let v = read_chain_state(executor_state_dir)?;

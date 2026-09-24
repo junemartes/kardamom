@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Silence window on `tx_bal` before the pump reopens the subscription.
 /// See [`BalPump`] for why silence, not just absence, triggers it.
-const BAL_SILENCE_REOPEN: Duration = Duration::from_secs(60);
+const BAL_SILENCE_REOPEN: Duration = Duration::from_mins(1);
 
 /// The `tx_bal` pump: per-block `BlockDelta` (BAL), wrapped in a silence
 /// watchdog. A static multicast image that never joins, or silently dies,

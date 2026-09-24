@@ -583,7 +583,7 @@ mod tests {
         let snap = StateSnapshot::open(&env).unwrap();
         assert_eq!(snap.end_tx_position().unwrap(), BPosition::from_index(7));
         let point = kardamom_state::read_recovery_point(&env).unwrap();
-        assert_eq!(point.last_fsynced_b_position, BPosition::from_index(7));
+        assert_eq!(point.last_fsynced_reader_position, BPosition::from_index(7));
         // Block 2 is slots 3..7: the epoch marker and two deposits, then
         // its one transaction in the last slot.
         assert_eq!(

@@ -21,7 +21,6 @@ use super::threads::Flow;
 use super::void::{MAX_READ_AHEAD, ParkOutcome, ReadAhead, VoidPark};
 use super::*;
 use crate::error::ExecutorError;
-use crate::exec_types::TxIndex;
 
 type Votes = Arc<Mutex<Vec<(u8, VoidRecord)>>>;
 
@@ -33,9 +32,21 @@ struct VotingSub {
 }
 
 impl VotingSub {
-    fn new(queue: Vec<TxOrderingMessage>) -> Self {
+    /// The queue, numbered from `start` the way the cluster subscription
+    /// numbers its deliveries: each record takes one canonical index, and a
+    /// boundary carries the index of the record that follows it.
+    fn new(start: u64, queue: Vec<TxOrderingMessage>) -> Self {
+        let mut next = start;
+        let numbered = queue
+            .into_iter()
+            .map(|msg| {
+                let position = BPosition::from_index(next);
+                next += u64::from(msg.as_boundary().is_none());
+                (position, msg)
+            })
+            .collect();
         Self {
-            queue: queue.into_iter().map(|msg| (pos(0), msg)).collect(),
+            queue: numbered,
             votes: Votes::default(),
             outcome: OfferOutcome::Accepted,
         }
@@ -84,12 +95,11 @@ fn voter_cfg() -> ReaderConfig {
 
 type TestReader = TxOrderingReader<VotingSub, crossbeam_channel::Sender<ReaderToExec>>;
 
-/// A reader over `sub` that starts at `start`, with its exec sink's far end.
+/// A reader over `sub`, with its exec sink's far end.
 fn reader(
     sub: VotingSub,
     buffer: JoinBuffer,
     cfg: ReaderConfig,
-    start: u64,
 ) -> (TestReader, Receiver<ReaderToExec>) {
     let (exec_out, rx) = unbounded();
     let reader = TxOrderingReader::new(TxOrderingInputs {
@@ -97,19 +107,19 @@ fn reader(
         buffer,
         cfg,
         exec_out,
-        start_tx_idx: TxIndex(start),
         recovery_factory: None,
     });
     (reader, rx)
 }
 
 /// The slot kinds the executor received, in order: `V` for a vacant slot,
-/// `T` for a transaction, `B` for a boundary, each with its record index.
+/// `T` for a transaction, each with its canonical index, and `B` for a
+/// boundary with its block number.
 fn slots(rx: &Receiver<ReaderToExec>) -> Vec<(char, u64)> {
     rx.try_iter()
         .map(|msg| match msg {
-            ReaderToExec::Vacant { tx_idx, .. } => ('V', tx_idx.0),
-            ReaderToExec::Tx { tx_idx, .. } => ('T', tx_idx.0),
+            ReaderToExec::Vacant { position } => ('V', position.as_index()),
+            ReaderToExec::Tx { position, .. } => ('T', position.as_index()),
             ReaderToExec::Boundary(b) => ('B', b.block_number),
             other => panic!("unexpected message {other:?}"),
         })
@@ -126,14 +136,17 @@ fn a_voter_drops_the_entry_when_the_void_record_arrives() {
     buffer.insert(TxDataKey::new(0, 0, pos(90)), envelope(0));
     // Behind the lost entry at index 0: one entry, one boundary, the void
     // record, then the lost transaction again with data that exists.
-    let sub = VotingSub::new(vec![
-        TxOrderingMessage::TxRef(tx_ref(NEXT, 50)),
-        boundary(1),
-        void(0, LOST),
-        TxOrderingMessage::TxRef(tx_ref(LOST, 90)),
-    ]);
+    let sub = VotingSub::new(
+        1,
+        vec![
+            TxOrderingMessage::TxRef(tx_ref(NEXT, 50)),
+            boundary(1),
+            void(0, LOST),
+            TxOrderingMessage::TxRef(tx_ref(LOST, 90)),
+        ],
+    );
     let votes = sub.votes.clone();
-    let (mut reader, rx) = reader(sub, buffer, voter_cfg(), 0);
+    let (mut reader, rx) = reader(sub, buffer, voter_cfg());
 
     let flow = reader
         .on_unjoinable(&tx_ref(LOST, 10), pos(0))
@@ -159,9 +172,9 @@ fn a_voter_drops_the_entry_when_the_void_record_arrives() {
 
 #[test]
 fn a_consumer_that_is_no_voter_stops_as_before() {
-    let sub = VotingSub::new(vec![void(0, LOST)]);
+    let sub = VotingSub::new(1, vec![void(0, LOST)]);
     let votes = sub.votes.clone();
-    let (mut reader, _rx) = reader(sub, JoinBuffer::new(), ReaderConfig::default(), 0);
+    let (mut reader, _rx) = reader(sub, JoinBuffer::new(), ReaderConfig::default());
     let err = reader.on_unjoinable(&tx_ref(LOST, 10), pos(0)).err();
     assert!(matches!(err, Some(ExecutorError::JoinTimeout { .. })));
     assert!(votes.lock().unwrap().is_empty());
@@ -173,9 +186,9 @@ fn a_wait_that_ends_with_no_void_record_stops_the_reader() {
         void_wait: Duration::ZERO,
         ..voter_cfg()
     };
-    let sub = VotingSub::new(vec![void(0, LOST)]);
+    let sub = VotingSub::new(1, vec![void(0, LOST)]);
     let votes = sub.votes.clone();
-    let (mut reader, rx) = reader(sub, JoinBuffer::new(), cfg, 0);
+    let (mut reader, rx) = reader(sub, JoinBuffer::new(), cfg);
     let err = reader.on_unjoinable(&tx_ref(LOST, 10), pos(0)).err();
     assert!(matches!(err, Some(ExecutorError::JoinTimeout { .. })));
     // The vote went out before the wait ended: the sealer keeps it.
@@ -185,8 +198,8 @@ fn a_wait_that_ends_with_no_void_record_stops_the_reader() {
 
 #[test]
 fn a_void_record_for_another_entry_does_not_end_the_wait() {
-    let sub = VotingSub::new(vec![void(0, NEXT), void(7, LOST)]);
-    let (mut reader, rx) = reader(sub, JoinBuffer::new(), voter_cfg(), 0);
+    let sub = VotingSub::new(1, vec![void(0, NEXT), void(7, LOST)]);
+    let (mut reader, rx) = reader(sub, JoinBuffer::new(), voter_cfg());
     // The order closes before the right record comes: a clean stop.
     let flow = reader
         .on_unjoinable(&tx_ref(LOST, 10), pos(0))
@@ -197,8 +210,9 @@ fn a_void_record_for_another_entry_does_not_end_the_wait() {
 
 #[test]
 fn a_void_record_for_an_entry_the_reader_sent_is_fatal() {
-    let sub = VotingSub::new(vec![void(4, LOST)]);
-    let (reader, _rx) = reader(sub, JoinBuffer::new(), voter_cfg(), 2);
+    // The reader started at index 2, so it sent entry 4 to the executor.
+    let sub = VotingSub::new(2, vec![boundary(1), void(4, LOST)]);
+    let (reader, _rx) = reader(sub, JoinBuffer::new(), voter_cfg());
     let err = reader.run().err();
     assert!(matches!(
         err,
@@ -207,9 +221,9 @@ fn a_void_record_for_an_entry_the_reader_sent_is_fatal() {
 }
 
 #[test]
-fn a_void_record_below_the_start_index_counts_its_own_slot_only() {
-    let sub = VotingSub::new(vec![void(4, LOST), boundary(9)]);
-    let (reader, rx) = reader(sub, JoinBuffer::new(), voter_cfg(), 6);
+fn a_void_record_below_the_first_index_counts_its_own_slot_only() {
+    let sub = VotingSub::new(6, vec![void(4, LOST), boundary(9)]);
+    let (reader, rx) = reader(sub, JoinBuffer::new(), voter_cfg());
     reader.run().expect("clean close");
     assert_eq!(slots(&rx), vec![('V', 6), ('B', 9)]);
 }
@@ -228,7 +242,7 @@ fn park<'a>(
 
 #[test]
 fn the_voter_sends_its_vote_again_after_the_interval() {
-    let mut sub = VotingSub::new(vec![boundary(1), boundary(2), void(0, LOST)]);
+    let mut sub = VotingSub::new(0, vec![boundary(1), boundary(2), void(0, LOST)]);
     let mut backlog = ReadAhead::new();
     let mut wait = park(&mut sub, &mut backlog, 0);
     // An interval of zero has elapsed at every message.
@@ -242,7 +256,7 @@ fn the_voter_sends_its_vote_again_after_the_interval() {
 
 #[test]
 fn the_voter_sends_one_vote_inside_the_interval() {
-    let mut sub = VotingSub::new(vec![boundary(1), boundary(2), void(0, LOST)]);
+    let mut sub = VotingSub::new(0, vec![boundary(1), boundary(2), void(0, LOST)]);
     let mut backlog = ReadAhead::new();
     let outcome = park(&mut sub, &mut backlog, 0).run().expect("voided");
     assert!(matches!(outcome, ParkOutcome::Voided));
@@ -251,7 +265,7 @@ fn the_voter_sends_one_vote_inside_the_interval() {
 
 #[test]
 fn a_session_that_refuses_the_vote_does_not_stop_the_wait() {
-    let mut sub = VotingSub::new(vec![void(0, LOST)]);
+    let mut sub = VotingSub::new(0, vec![void(0, LOST)]);
     sub.outcome = OfferOutcome::NotConnected;
     let mut backlog = ReadAhead::new();
     let outcome = park(&mut sub, &mut backlog, 0).run().expect("voided");
@@ -266,7 +280,7 @@ fn the_wait_reads_the_backlog_first_and_keeps_the_canonical_order() {
         .into_iter()
         .map(|msg| (pos(0), msg))
         .collect();
-    let mut sub = VotingSub::new(vec![boundary(3)]);
+    let mut sub = VotingSub::new(0, vec![boundary(3)]);
     let outcome = park(&mut sub, &mut backlog, 5).run().expect("voided");
     assert!(matches!(outcome, ParkOutcome::Voided));
     let blocks: Vec<Option<u64>> = backlog
@@ -280,7 +294,7 @@ fn the_wait_reads_the_backlog_first_and_keeps_the_canonical_order() {
 #[test]
 fn the_read_ahead_has_a_bound() {
     let queue: Vec<TxOrderingMessage> = (0..=MAX_READ_AHEAD as u64).map(boundary).collect();
-    let mut sub = VotingSub::new(queue);
+    let mut sub = VotingSub::new(0, queue);
     let mut backlog = ReadAhead::new();
     let outcome = park(&mut sub, &mut backlog, 0).run().expect("bound");
     assert!(matches!(outcome, ParkOutcome::GaveUp));

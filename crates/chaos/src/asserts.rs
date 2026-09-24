@@ -147,7 +147,7 @@ impl Harness {
     /// Returns an error if the pipeline does not progress.
     pub async fn assert_progress(&self) -> anyhow::Result<()> {
         let Some(b0) = self.probes.sealer_boundaries().await else {
-            return self.assert_executor_progress(Duration::from_secs(60)).await;
+            return self.assert_executor_progress(Duration::from_mins(1)).await;
         };
         tokio::time::sleep(Duration::from_secs(10)).await;
         let b1 = self.probes.sealer_boundaries().await.unwrap_or(0);

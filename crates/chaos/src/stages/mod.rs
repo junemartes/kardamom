@@ -22,7 +22,7 @@ pub use churn::CHURN_ACCOUNT;
 pub const GATE_ACCOUNT: u32 = 0;
 
 /// The receipt budget of one smoke transfer.
-const SMOKE_BUDGET: Duration = Duration::from_secs(60);
+const SMOKE_BUDGET: Duration = Duration::from_mins(1);
 
 impl Harness {
     /// The smoke gate: one transfer from `account` through ingress-0 must

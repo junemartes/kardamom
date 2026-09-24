@@ -42,8 +42,8 @@ pub trait TxDataSubscription: Send {
 /// Subscription to `tx_ordering`, the canonical orderer.
 ///
 /// Yields tiny [`TxOrderingMessage`] records (`TxRef`, `DepositRef`, or
-/// `BoundaryStart`), each tagged with its canonical `BPosition`. The
-/// `BPosition` is the system's canonical L2 tx ordering (invariant I1).
+/// `BoundaryStart`), each tagged with its canonical `BPosition` — the
+/// system's canonical L2 tx order on `tx_ordering` (invariant I1).
 ///
 /// In production: `kardamom_log::TxOrderingSubscriber`, on a dedicated OS
 /// thread. In tests: see `kardamom_log::testing::FakeTxOrderingSubscription`.

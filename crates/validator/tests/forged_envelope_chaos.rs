@@ -28,10 +28,12 @@
 
 use alloy_primitives::{Address, U256, address};
 use alloy_signer_local::PrivateKeySigner;
-use kardamom_engine::actor::fixtures::{ChannelHarness, HarnessInput, HarnessOutcome, LegacyTx};
+use kardamom_engine::actor::fixtures::{
+    ChannelHarness, HarnessInput, HarnessOutcome, HarnessSetup, LegacyTx,
+};
 use kardamom_engine::{
     BPosition, BlockBoundaryStart, CMessage, ExecutorConfig, ExecutorError, MockStateDatabase,
-    StateDatabase, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxRef,
+    ResumePoint, StateDatabase, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxRef,
 };
 use kardamom_validator::{Divergence, latch_integrity_failure};
 use revm::primitives::KECCAK_EMPTY;
@@ -104,12 +106,17 @@ fn run_pipeline(
         verify_record_identity,
         ..Default::default()
     };
-    ChannelHarness::run(HarnessInput {
-        cfg,
-        tx_data,
-        tx_ordering,
-        snap,
-    })
+    ChannelHarness::run(
+        HarnessSetup {
+            cfg,
+            start: ResumePoint::GENESIS,
+            snap,
+        },
+        HarnessInput {
+            tx_data: vec![tx_data],
+            tx_ordering,
+        },
+    )
 }
 
 #[test]

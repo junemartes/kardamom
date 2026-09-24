@@ -46,7 +46,7 @@ fn register(catalog: &MemoryCatalog, name: &str, id: &str, port: u16, extra: &[(
             meta,
         },
         ttl: Duration::from_secs(10),
-        deregister_after: Duration::from_secs(60),
+        deregister_after: Duration::from_mins(1),
     };
     catalog.register(&spec).unwrap();
     catalog.pass(&spec.entry.id).unwrap();

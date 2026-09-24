@@ -14,7 +14,7 @@ use tokio::process::Command;
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(20);
 /// The bound on a streamed copy into or out of a node: an archive or a
 /// checkpoint can be gigabytes on a slow runner.
-const STREAM_TIMEOUT: Duration = Duration::from_secs(600);
+const STREAM_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// A signal `docker kill -s` sends to an inner container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
