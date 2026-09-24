@@ -10,11 +10,12 @@ import io.kardamom.sealer.CanonicalSealerState;
  * {@code crates/cluster-adapter/src/wire.rs}.
  *
  * <p><b>App envelope framing.</b> The Rust side defines the application envelope
- * as {@code { kind: u8, sender: 20B, nonce: u64 LE, canonical_id: 32B, payload }}.
- * The guard header ({@code sender}/{@code nonce}) and the 32-byte canonical id
- * sit at fixed offsets after the 1-byte {@code kind} tag. The opaque
- * {@code payload} follows. This class matches that layout: sender at
- * {@link #SENDER_OFFSET}, nonce at {@link #NONCE_OFFSET}, id at
+ * as {@code { kind: u8, sender: 20B, nonce: u64 LE, deadline: u64 LE,
+ * canonical_id: 32B, payload }}. The guard header ({@code sender},
+ * {@code nonce}, {@code deadline}) and the 32-byte canonical id sit at fixed
+ * offsets after the 1-byte {@code kind} tag. The opaque {@code payload}
+ * follows. This class matches that layout: sender at {@link #SENDER_OFFSET},
+ * nonce at {@link #NONCE_OFFSET}, deadline at {@link #DEADLINE_OFFSET}, id at
  * {@link #CANONICAL_ID_OFFSET}, relay from {@link #RELAY_OFFSET}.</p>
  *
  * <p>TODO(envelope): Keep this byte framing in step with the Rust app envelope
@@ -31,8 +32,14 @@ public final class SealerWire {
     public static final int SENDER_OFFSET = KIND_OFFSET + Byte.BYTES;
     /** Offset of the u64 LE nonce in the guard header. */
     public static final int NONCE_OFFSET = SENDER_OFFSET + CanonicalSealerState.SENDER_LEN;
+    /**
+     * Offset of the u64 LE inclusion deadline in the guard header: the last
+     * block number the sealer may order this record into. See
+     * {@code docs/agents/offer-inclusion-deadline-spec.md}.
+     */
+    public static final int DEADLINE_OFFSET = NONCE_OFFSET + Long.BYTES;
     /** Offset of the 32-byte canonical id within the app envelope. */
-    public static final int CANONICAL_ID_OFFSET = NONCE_OFFSET + Long.BYTES;
+    public static final int CANONICAL_ID_OFFSET = DEADLINE_OFFSET + Long.BYTES;
     /**
      * Offset from which the relayed payload is forwarded to egress.
      * It starts at the canonical id, not after it, so the relayed payload is
@@ -199,6 +206,19 @@ public final class SealerWire {
      * destination's {@code Inbox.nextSeq} at startup.
      */
     public static final byte EGRESS_KIND_REMOTE_ORIGIN_REJECT = 6;
+    /**
+     * The record's inclusion deadline had passed:
+     * {@code [kind:1][sender:20][nonce:u64][max_inclusion_block:u64][at_block:u64]}.
+     * Offered only to the offering session. No later copy of the record can be
+     * ordered, so the sequencer reports it instead of republishing.
+     */
+    public static final byte EGRESS_KIND_PAST_DEADLINE = 7;
+    /**
+     * The dedup window is at capacity, so the sealer took no decision:
+     * {@code [kind:1][sender:20][nonce:u64]}. Back-pressure; the sequencer
+     * republishes the record after the window prunes.
+     */
+    public static final byte EGRESS_KIND_WINDOW_FULL = 8;
 
     /** Bounded in-memory retention of framed egress bytes for client replay. */
     static final int DEFAULT_RETENTION = 65536;

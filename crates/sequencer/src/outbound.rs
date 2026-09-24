@@ -34,6 +34,18 @@ use kardamom_types::{EpochRecord, TxError, TxRef};
 
 use crate::error::SequencerError;
 
+/// One transaction ref offered to the canonical orderer, with the guard
+/// header the sealer reads: `sender` and `nonce` for its per-sender
+/// contiguity guard, and `max_inclusion_block` for its inclusion check.
+/// None of the three is part of the relayed record.
+#[derive(Clone, Copy, Debug)]
+pub struct RefOffer {
+    pub tx_ref: TxRef,
+    pub sender: Address,
+    pub nonce: u64,
+    pub max_inclusion_block: u64,
+}
+
 /// `TxOrdering` publisher contract, the canonical orderer. Publishes tiny
 /// [`TxRef`]s for L2 transactions (about 41 bytes) into Aeron's concurrent
 /// multi-publisher stream, plus whole [`EpochRecord`]s for L1 epochs and
@@ -43,20 +55,15 @@ use crate::error::SequencerError;
 /// A blocked transport must surface as `Err(SequencerError::Backpressure)`,
 /// so the state machine can rewind.
 pub trait TxOrderingRefPublisher: Send {
-    /// `sender` and `nonce` ride the ingress frame's guard header, for
-    /// the sealer's per-sender contiguity guard. They are not part of the
-    /// relayed record.
+    /// The offer's guard header rides the ingress frame, for the sealer's
+    /// per-sender contiguity guard and its inclusion check. It is not part
+    /// of the relayed record.
     ///
     /// # Errors
     ///
     /// Returns `Err(SequencerError::Backpressure)` if the transport is
     /// blocked.
-    fn try_publish_ref(
-        &mut self,
-        r: &TxRef,
-        sender: Address,
-        nonce: u64,
-    ) -> Result<(), SequencerError>;
+    fn try_publish_ref(&mut self, offer: &RefOffer) -> Result<(), SequencerError>;
 
     /// Publish a run of refs. This amortizes per-offer overhead where the
     /// transport supports it. Returns `(published, error)`: the first
@@ -65,12 +72,9 @@ pub trait TxOrderingRefPublisher: Send {
     /// transports keep exact semantics). The cluster transport packs the
     /// whole slice into one `KIND_BATCH` app message (all-or-nothing per
     /// call).
-    fn try_publish_ref_batch(
-        &mut self,
-        refs: &[(TxRef, Address, u64)],
-    ) -> (usize, Option<SequencerError>) {
-        for (i, (r, sender, nonce)) in refs.iter().enumerate() {
-            if let Err(e) = self.try_publish_ref(r, *sender, *nonce) {
+    fn try_publish_ref_batch(&mut self, refs: &[RefOffer]) -> (usize, Option<SequencerError>) {
+        for (i, offer) in refs.iter().enumerate() {
+            if let Err(e) = self.try_publish_ref(offer) {
                 return (i, Some(e));
             }
         }
@@ -138,7 +142,7 @@ pub mod fakes {
     use kardamom_types::xchain::RemoteEpochRecord;
     use kardamom_types::{EpochRecord, TxRef};
 
-    use super::{SequencerError, TxError, TxErrorPublisher, TxOrderingRefPublisher};
+    use super::{RefOffer, SequencerError, TxError, TxErrorPublisher, TxOrderingRefPublisher};
 
     /// In-memory `tx_ordering` publisher. Records every published `TxRef`,
     /// `EpochRecord`, and `RemoteEpochRecord` in arrival order, so tests
@@ -152,16 +156,11 @@ pub mod fakes {
     }
 
     impl TxOrderingRefPublisher for InMemoryTxOrderingRefPublisher {
-        fn try_publish_ref(
-            &mut self,
-            r: &TxRef,
-            _sender: alloy_primitives::Address,
-            _nonce: u64,
-        ) -> Result<(), SequencerError> {
+        fn try_publish_ref(&mut self, offer: &RefOffer) -> Result<(), SequencerError> {
             if *self.fail_with_backpressure.lock().unwrap() {
                 return Err(SequencerError::Backpressure);
             }
-            self.refs.lock().unwrap().push(*r);
+            self.refs.lock().unwrap().push(offer.tx_ref);
             Ok(())
         }
 
@@ -204,21 +203,26 @@ mod tests {
     use alloy_primitives::{Address, B256};
     use kardamom_types::{BPosition, TxError, TxErrorReason, TxRef};
 
+    /// A ref offer at `nonce`, with no deadline.
+    fn offer(nonce: u64) -> RefOffer {
+        RefOffer {
+            tx_ref: TxRef::new(
+                B256::ZERO,
+                u8::try_from(nonce).unwrap(),
+                BPosition::default(),
+                0,
+            ),
+            sender: Address::ZERO,
+            nonce,
+            max_inclusion_block: u64::MAX,
+        }
+    }
+
     #[test]
     fn fake_b_records_refs() {
         let mut p = InMemoryTxOrderingRefPublisher::default();
-        p.try_publish_ref(
-            &TxRef::new(B256::ZERO, 0, BPosition::default(), 0),
-            Address::ZERO,
-            0,
-        )
-        .unwrap();
-        p.try_publish_ref(
-            &TxRef::new(B256::ZERO, 1, BPosition::default(), 0),
-            Address::ZERO,
-            1,
-        )
-        .unwrap();
+        p.try_publish_ref(&offer(0)).unwrap();
+        p.try_publish_ref(&offer(1)).unwrap();
         assert_eq!(p.refs.lock().unwrap().len(), 2);
     }
 
@@ -227,11 +231,7 @@ mod tests {
         let mut p = InMemoryTxOrderingRefPublisher::default();
         *p.fail_with_backpressure.lock().unwrap() = true;
         assert!(matches!(
-            p.try_publish_ref(
-                &TxRef::new(B256::ZERO, 0, BPosition::default(), 0),
-                Address::ZERO,
-                0
-            ),
+            p.try_publish_ref(&offer(0)),
             Err(SequencerError::Backpressure)
         ));
     }

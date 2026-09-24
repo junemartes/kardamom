@@ -41,7 +41,7 @@ fn depositref() -> DepositRef {
 fn txref_ingress_relay_egress_roundtrip() {
     let r = txref();
     let sender = Address::repeat_byte(0x42);
-    let ingress = encode_ingress_txref(&r, sender, 7);
+    let ingress = encode_ingress_txref(&r, sender, 7, 4242);
     assert_eq!(ingress_sender_nonce(&ingress).unwrap(), (sender, 7));
     // Mirror the Java service: parse the id, relay from the canonical id.
     let (cid, relayed) = split_ingress(&ingress).unwrap();
@@ -89,10 +89,10 @@ fn boundary_roundtrip() {
 }
 
 #[test]
-fn ingress_layout_is_kind_sender_nonce_id_then_fields() {
+fn ingress_layout_is_kind_sender_nonce_deadline_id_then_fields() {
     let r = txref();
     let sender = Address::repeat_byte(0x42);
-    let b = encode_ingress_txref(&r, sender, 0x0102_0304_0506_0708);
+    let b = encode_ingress_txref(&r, sender, 0x0102_0304_0506_0708, 0x0A0B_0C0D_0E0F_1011);
     assert_eq!(b[0], KIND_INGRESS_RECORD);
     assert_eq!(&b[1..21], sender.as_slice());
     assert_eq!(
@@ -100,9 +100,14 @@ fn ingress_layout_is_kind_sender_nonce_id_then_fields() {
         0x0102_0304_0506_0708u64.to_le_bytes(),
         "nonce is little-endian at offset 21 (Java NONCE_OFFSET)"
     );
-    assert_eq!(&b[29..61], r.tx_hash.as_slice());
-    assert_eq!(b[61], RT_TXREF);
-    assert_eq!(b[62], 3); // shard_id
+    assert_eq!(
+        b[29..37],
+        0x0A0B_0C0D_0E0F_1011u64.to_le_bytes(),
+        "deadline is little-endian at offset 29 (Java DEADLINE_OFFSET)"
+    );
+    assert_eq!(&b[37..69], r.tx_hash.as_slice());
+    assert_eq!(b[69], RT_TXREF);
+    assert_eq!(b[70], 3); // shard_id
     // The relayed payload begins with the canonical ID. The guard header
     // never reaches the executors.
     let (_cid, relayed) = split_ingress(&b).unwrap();
@@ -242,6 +247,48 @@ fn contiguity_reject_roundtrip() {
     );
 }
 
+#[test]
+fn past_deadline_roundtrip() {
+    let sender = Address::repeat_byte(0x99);
+    let b = encode_past_deadline(sender, 12, 900, 901);
+    assert_eq!(
+        EgressItem::decode(&b).unwrap(),
+        EgressItem::PastDeadline {
+            sender,
+            nonce: 12,
+            max_inclusion_block: 900,
+            at_block: 901,
+        }
+    );
+}
+
+#[test]
+fn window_full_roundtrip() {
+    let sender = Address::repeat_byte(0x99);
+    let b = encode_window_full(sender, 12);
+    assert_eq!(
+        EgressItem::decode(&b).unwrap(),
+        EgressItem::WindowFull { sender, nonce: 12 }
+    );
+}
+
+/// The deadline rides the guard header, so it never reaches the relayed
+/// payload: an executor reads the same bytes whether a record carries a
+/// deadline or not.
+#[test]
+fn the_deadline_stays_out_of_the_relayed_payload() {
+    let r = txref();
+    let sender = Address::repeat_byte(0x42);
+    let early = encode_ingress_txref(&r, sender, 7, 100);
+    let late = encode_ingress_txref(&r, sender, 7, 900);
+    assert_eq!(ingress_deadline(&early).unwrap(), 100);
+    assert_eq!(ingress_deadline(&late).unwrap(), 900);
+    assert_eq!(
+        split_ingress(&early).unwrap().1,
+        split_ingress(&late).unwrap().1
+    );
+}
+
 /// The header anchor is bound by the canonical id. A relayed body whose
 /// anchor differs from the id the sealer deduped on is rejected by the
 /// consumer, so a forged header cannot poison a peer's lane.
@@ -331,7 +378,9 @@ fn replay_request_roundtrip() {
     assert_eq!(b[0], KIND_REPLAY_REQUEST);
     assert_eq!(decode_replay_request(&b).unwrap(), (1234, 56));
     // A record ingress message is not a replay request.
-    assert!(decode_replay_request(&encode_ingress_txref(&txref(), Address::ZERO, 0)).is_err());
+    assert!(
+        decode_replay_request(&encode_ingress_txref(&txref(), Address::ZERO, 0, u64::MAX)).is_err()
+    );
 }
 
 #[test]

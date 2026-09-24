@@ -15,8 +15,9 @@ use rkyv::api::high::{HighDeserializer, HighValidator};
 use rkyv::rancor;
 
 use super::{
-    CANONICAL_ID_LEN, EGRESS_KIND_BOUNDARY, EGRESS_KIND_CONTIGUITY_REJECT, EGRESS_KIND_RELAYED,
-    EGRESS_KIND_REMOTE_ORIGIN_REJECT, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
+    CANONICAL_ID_LEN, EGRESS_KIND_BOUNDARY, EGRESS_KIND_CONTIGUITY_REJECT,
+    EGRESS_KIND_PAST_DEADLINE, EGRESS_KIND_RELAYED, EGRESS_KIND_REMOTE_ORIGIN_REJECT,
+    EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE, EGRESS_KIND_WINDOW_FULL,
     RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF, RT_VOID, RemoteOriginRejectReason,
     SENDER_LEN, WireError, encode_kind_2u64, rd_i32, rd_len, rd_slice, rd_u8, rd_u64, too_short,
 };
@@ -45,6 +46,20 @@ pub enum EgressItem {
         nonce: u64,
         expected: u64,
     },
+    /// Past-deadline reject. The sealer refused `sender`'s ref at `nonce`,
+    /// because its own block number `at_block` had passed the record's
+    /// `max_inclusion_block`. No copy of the record can be ordered later.
+    /// The sequencer reports it to the client instead of republishing.
+    PastDeadline {
+        sender: Address,
+        nonce: u64,
+        max_inclusion_block: u64,
+        at_block: u64,
+    },
+    /// Window-full reject. The sealer's dedup window is at capacity, so it
+    /// took no decision on `sender`'s ref at `nonce`. This is
+    /// back-pressure: the sequencer republishes the ref.
+    WindowFull { sender: Address, nonce: u64 },
     /// Remote-origin reject. The sealer refused a kind-5 record from
     /// `origin_chain_id` at `first_seq`. `expected_next_seq` is the
     /// sealer's lane cursor for that origin (0 when the reason is not a
@@ -77,6 +92,8 @@ impl EgressItem {
                 up_to_block: rd_u64(buf, 9)?,
             }),
             EGRESS_KIND_CONTIGUITY_REJECT => Self::decode_contiguity_reject(buf),
+            EGRESS_KIND_PAST_DEADLINE => Self::decode_past_deadline(buf),
+            EGRESS_KIND_WINDOW_FULL => Self::decode_window_full(buf),
             EGRESS_KIND_REMOTE_ORIGIN_REJECT => Self::decode_remote_origin_reject(buf),
             other => Err(WireError::BadEgressKind(other)),
         }
@@ -115,6 +132,24 @@ impl EgressItem {
             sender: Address::from_slice(sender),
             nonce: rd_u64(buf, 1 + SENDER_LEN)?,
             expected: rd_u64(buf, 1 + SENDER_LEN + 8)?,
+        })
+    }
+
+    fn decode_past_deadline(buf: &[u8]) -> Result<Self, WireError> {
+        let sender = rd_slice(buf, 1, SENDER_LEN)?;
+        Ok(Self::PastDeadline {
+            sender: Address::from_slice(sender),
+            nonce: rd_u64(buf, 1 + SENDER_LEN)?,
+            max_inclusion_block: rd_u64(buf, 1 + SENDER_LEN + 8)?,
+            at_block: rd_u64(buf, 1 + SENDER_LEN + 16)?,
+        })
+    }
+
+    fn decode_window_full(buf: &[u8]) -> Result<Self, WireError> {
+        let sender = rd_slice(buf, 1, SENDER_LEN)?;
+        Ok(Self::WindowFull {
+            sender: Address::from_slice(sender),
+            nonce: rd_u64(buf, 1 + SENDER_LEN)?,
         })
     }
 
@@ -331,6 +366,38 @@ pub fn encode_contiguity_reject(sender: Address, nonce: u64, expected: u64) -> V
     b.extend_from_slice(sender.as_slice());
     b.extend_from_slice(&nonce.to_le_bytes());
     b.extend_from_slice(&expected.to_le_bytes());
+    b
+}
+
+/// Frame a past-deadline reject exactly as the Java service does. The
+/// real encoder is the Java service; this is a test and mock-server
+/// helper.
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn encode_past_deadline(
+    sender: Address,
+    nonce: u64,
+    max_inclusion_block: u64,
+    at_block: u64,
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(1 + SENDER_LEN + 8 + 8 + 8);
+    b.push(EGRESS_KIND_PAST_DEADLINE);
+    b.extend_from_slice(sender.as_slice());
+    b.extend_from_slice(&nonce.to_le_bytes());
+    b.extend_from_slice(&max_inclusion_block.to_le_bytes());
+    b.extend_from_slice(&at_block.to_le_bytes());
+    b
+}
+
+/// Frame a window-full reject exactly as the Java service does. The real
+/// encoder is the Java service; this is a test and mock-server helper.
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn encode_window_full(sender: Address, nonce: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(1 + SENDER_LEN + 8);
+    b.push(EGRESS_KIND_WINDOW_FULL);
+    b.extend_from_slice(sender.as_slice());
+    b.extend_from_slice(&nonce.to_le_bytes());
     b
 }
 

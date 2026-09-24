@@ -112,7 +112,7 @@ fn encoded(refs: &[TxRef]) -> Vec<Vec<u8>> {
     // Both replicas derive the same (sender, nonce) guard header from
     // the same envelope, so a fixed header keeps the byte equality meaningful.
     refs.iter()
-        .map(|r| wire::encode_ingress_txref(r, alloy_primitives::Address::ZERO, 0))
+        .map(|r| wire::encode_ingress_txref(r, alloy_primitives::Address::ZERO, 0, u64::MAX))
         .collect()
 }
 

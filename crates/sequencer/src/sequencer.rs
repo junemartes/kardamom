@@ -61,7 +61,7 @@ use crate::inbound::{Inbound, TxDataSubscriber};
 use crate::lookup::LookupRequester;
 use crate::metrics;
 use crate::nonce_decode::decode_nonce;
-use crate::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
+use crate::outbound::{RefOffer, TxErrorPublisher, TxOrderingRefPublisher};
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
 use crate::unconfirmed::{UnconfirmedKey, UnconfirmedLedger};
@@ -99,6 +99,11 @@ struct RefMetadata {
     /// `(shard, session, position)` stays unique under concurrent,
     /// active-active ingress publishers.
     tx_data_session_id: i32,
+    /// The last block the sealer may order this transaction into, copied
+    /// from the envelope. It rides the ingress frame's guard header. Every
+    /// racing replica reads the same envelope, so every replica offers the
+    /// same deadline for the same record.
+    max_inclusion_block: u64,
 }
 
 /// One `Sequencer::run_once` iteration's port set: the `tx_data`
@@ -405,17 +410,22 @@ impl Sequencer {
         // sequencer's per-transaction cost. The chunk must stay under one
         // Aeron MTU (about 1408 bytes): the hand-rolled cluster ingress
         // path does not survive fragmented session messages. With the
-        // guard header (sender 20 bytes, nonce 8 bytes), each entry is 75
-        // bytes plus a 4 byte length prefix. 16 x 79 + 3 is about 1.27 KB,
-        // which stays under the MTU with margin (20 x 79 + 3, about 1.58
-        // KB, would not). A 16:1 ratio still amortizes away the dominant
-        // per-offer cost.
-        const BATCH_MAX: usize = 16;
+        // guard header (sender 20 bytes, nonce 8 bytes, deadline 8 bytes),
+        // each entry is 83 bytes plus a 4 byte length prefix. 15 x 87 + 3
+        // is about 1.31 KB, which stays under the MTU with margin (16 x 87
+        // + 3 leaves only 13 bytes). A 15:1 ratio still amortizes away the
+        // dominant per-offer cost.
+        const BATCH_MAX: usize = 15;
         let chunk = BATCH_MAX.min(rest.len());
-        let refs: Vec<(kardamom_types::TxRef, alloy_primitives::Address, u64)> = rest
+        let refs: Vec<RefOffer> = rest
             .iter()
             .take(chunk)
-            .map(|(s, n, m)| (Self::make_txref(m), *s, *n))
+            .map(|(s, n, m)| RefOffer {
+                tx_ref: Self::make_txref(m),
+                sender: *s,
+                nonce: *n,
+                max_inclusion_block: m.max_inclusion_block,
+            })
             .collect();
         let (published, err) = b.try_publish_ref_batch(&refs);
         self.record_published_prefix(rest, published, ctx);
@@ -804,6 +814,7 @@ impl Sequencer {
             lane,
             tx_data_position: tx_data_loc.position,
             tx_data_session_id: tx_data_loc.session_id,
+            max_inclusion_block: envelope.max_inclusion_block,
         };
 
         let t0 = Instant::now();

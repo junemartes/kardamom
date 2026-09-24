@@ -7,11 +7,11 @@
 //! offer surfaces as `SequencerError::Backpressure`, so the existing
 //! rewind-and-retry path applies.
 
+use kardamom_types::EpochRecord;
 use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{EpochRecord, TxRef};
 
 use crate::SequencerError;
-use crate::outbound::TxOrderingRefPublisher;
+use crate::outbound::{RefOffer, TxOrderingRefPublisher};
 
 use kardamom_cluster_adapter::gateway::{ClusterIngress, OfferOutcome};
 use kardamom_cluster_adapter::wire;
@@ -60,13 +60,12 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
 
     /// Encode many refs as one batch frame and offer it. Returns the
     /// accepted count and, on failure, the error for the whole batch.
-    fn offer_batch(
-        &mut self,
-        many: &[(TxRef, alloy_primitives::Address, u64)],
-    ) -> (usize, Option<SequencerError>) {
+    fn offer_batch(&mut self, many: &[RefOffer]) -> (usize, Option<SequencerError>) {
         let entries: Vec<Vec<u8>> = many
             .iter()
-            .map(|(r, sender, nonce)| wire::encode_ingress_txref(r, *sender, *nonce))
+            .map(|o| {
+                wire::encode_ingress_txref(&o.tx_ref, o.sender, o.nonce, o.max_inclusion_block)
+            })
             .collect();
         let frame = match wire::encode_ingress_batch(&entries) {
             Ok(frame) => frame,
@@ -85,23 +84,20 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
 }
 
 impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I> {
-    fn try_publish_ref(
-        &mut self,
-        r: &TxRef,
-        sender: alloy_primitives::Address,
-        nonce: u64,
-    ) -> Result<(), SequencerError> {
-        let bytes = wire::encode_ingress_txref(r, sender, nonce);
+    fn try_publish_ref(&mut self, offer: &RefOffer) -> Result<(), SequencerError> {
+        let bytes = wire::encode_ingress_txref(
+            &offer.tx_ref,
+            offer.sender,
+            offer.nonce,
+            offer.max_inclusion_block,
+        );
         self.offer(&bytes)
     }
 
-    fn try_publish_ref_batch(
-        &mut self,
-        refs: &[(TxRef, alloy_primitives::Address, u64)],
-    ) -> (usize, Option<SequencerError>) {
+    fn try_publish_ref_batch(&mut self, refs: &[RefOffer]) -> (usize, Option<SequencerError>) {
         match refs {
             [] => (0, None),
-            [(one, sender, nonce)] => match self.try_publish_ref(one, *sender, *nonce) {
+            [one] => match self.try_publish_ref(one) {
                 Ok(()) => (1, None),
                 Err(e) => (0, Some(e)),
             },
@@ -180,13 +176,28 @@ mod tests {
     use kardamom_cluster_adapter::wire::{EgressItem, encode_egress_record, split_ingress, txref};
     use kardamom_types::TxOrderingMessage;
 
+    /// A ref offer with no deadline: these tests exercise the transport,
+    /// not the sealer's inclusion check.
+    fn offer(
+        tx_ref: kardamom_types::TxRef,
+        sender: alloy_primitives::Address,
+        nonce: u64,
+    ) -> RefOffer {
+        RefOffer {
+            tx_ref,
+            sender,
+            nonce,
+            max_inclusion_block: u64::MAX,
+        }
+    }
+
     #[test]
     fn publishes_txref_as_ingress_envelope() {
         let ingress = FakeIngress::new();
         let mut pubr = ClusterRefPublisher::new(ingress.clone());
         let r = txref(0x11);
         let sender = alloy_primitives::Address::repeat_byte(0x55);
-        pubr.try_publish_ref(&r, sender, 9).unwrap();
+        pubr.try_publish_ref(&offer(r, sender, 9)).unwrap();
         let sent = ingress.accepted();
         assert_eq!(sent.len(), 1);
         // The guard header carries the sender and nonce for the sealer.
@@ -283,7 +294,7 @@ mod tests {
         ingress.set_outcome(OfferOutcome::BackPressured);
         let mut pubr = ClusterRefPublisher::new(ingress.clone());
         assert!(matches!(
-            pubr.try_publish_ref(&txref(0x11), alloy_primitives::Address::ZERO, 0),
+            pubr.try_publish_ref(&offer(txref(0x11), alloy_primitives::Address::ZERO, 0)),
             Err(SequencerError::Backpressure)
         ));
         // Nothing was accepted by the gateway.
@@ -296,7 +307,7 @@ mod tests {
         ingress.set_outcome(OfferOutcome::NotConnected);
         let mut pubr = ClusterRefPublisher::new(ingress);
         assert!(matches!(
-            pubr.try_publish_ref(&txref(0x11), alloy_primitives::Address::ZERO, 0),
+            pubr.try_publish_ref(&offer(txref(0x11), alloy_primitives::Address::ZERO, 0)),
             Err(SequencerError::Backpressure)
         ));
     }
