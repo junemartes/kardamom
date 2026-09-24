@@ -225,6 +225,7 @@ mod tests {
             raw_tx: Bytes::new(),
             sender: Address::ZERO,
             tx_hash: B256::ZERO,
+            max_inclusion_block: u64::MAX,
         };
         mock.publish_tx_data(2, env.clone()).await.unwrap();
         let received = rx[2].recv().await.unwrap();

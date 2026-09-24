@@ -40,6 +40,7 @@ fn publish_batch(publisher: &kardamom_log::aeron_live::TxDataPublisherHandle, ba
             raw_tx: Bytes::from(vec![0xCDu8; 96]),
             sender: Address::repeat_byte(low_byte ^ 0xAB),
             tx_hash: B256::repeat_byte(low_byte ^ 0x5A),
+            max_inclusion_block: u64::MAX,
         };
         publisher.publish(&env).expect("publish");
     }
@@ -110,6 +111,7 @@ async fn round_trip_once(
         raw_tx: Bytes::from(vec![0u8; 64]),
         sender: Address::ZERO,
         tx_hash: B256::ZERO,
+        max_inclusion_block: u64::MAX,
     };
     latency_publisher.publish(&env).expect("publish");
     let _ = tokio::time::timeout(Duration::from_secs(1), latency_subscriber.recv())

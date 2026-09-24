@@ -25,6 +25,7 @@ fn make_block(n_txs: usize, raw_len: usize) -> ClosedBlock {
                 raw_tx: Bytes::from(vec![0xAB; raw_len]),
                 sender: Address::repeat_byte((i & 0xFF) as u8),
                 tx_hash: B256::repeat_byte(((i ^ 0x55) & 0xFF) as u8),
+                max_inclusion_block: u64::MAX,
             },
         })
         .collect();

@@ -24,6 +24,7 @@ pub(crate) fn tx_envelope(correlation_id: u64, fill: u8, raw_len: usize) -> TxEn
         raw_tx: Bytes::from(vec![fill; raw_len]),
         sender: Address::repeat_byte(fill),
         tx_hash: B256::repeat_byte(fill),
+        max_inclusion_block: u64::MAX,
     }
 }
 

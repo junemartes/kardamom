@@ -312,6 +312,7 @@ where
                     raw_tx: raw_tx.0.clone(),
                     sender: v.sender,
                     tx_hash: v.tx_hash,
+                    max_inclusion_block: u64::MAX,
                 },
             )
             .await

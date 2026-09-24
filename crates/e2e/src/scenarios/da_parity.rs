@@ -151,6 +151,7 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
                     raw_tx: bytes::Bytes::copy_from_slice(e.tx.raw.as_ref()),
                     sender: e.tx.sender,
                     tx_hash: e.tx.hash,
+                    max_inclusion_block: u64::MAX,
                 },
             })
             .collect();

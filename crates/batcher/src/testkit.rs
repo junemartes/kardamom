@@ -49,6 +49,7 @@ pub fn env_tx(i: u64) -> TxEnvelope {
         raw_tx: vec![0xF0u8, u8::try_from(i).unwrap(), 0xBA, 0x12].into(),
         sender: Address::repeat_byte(0x11),
         tx_hash: B256::repeat_byte(u8::try_from(i).unwrap() + 1),
+        max_inclusion_block: u64::MAX,
     }
 }
 
@@ -111,6 +112,7 @@ fn sequencer_frames(
                         .checked_add(u8::try_from(i).expect("fixture bound"))
                         .expect("fixture bound"),
                 ),
+                max_inclusion_block: u64::MAX,
             };
             (pos, env)
         })

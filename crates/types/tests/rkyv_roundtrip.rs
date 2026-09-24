@@ -46,6 +46,7 @@ fn tx_envelope_roundtrip() {
         raw_tx: Bytes::from_static(b"hello"),
         sender: Address::repeat_byte(0x11),
         tx_hash: B256::repeat_byte(0x22),
+        max_inclusion_block: u64::MAX,
     };
     let back = roundtrip(&v);
     assert_eq!(v.correlation_id, back.correlation_id);

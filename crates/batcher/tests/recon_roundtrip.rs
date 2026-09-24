@@ -27,6 +27,7 @@ fn closed(block_number: u64, n: usize) -> ClosedBlock {
                 raw_tx: Bytes::from(vec![0xAB; 100]),
                 sender: Address::repeat_byte(i as u8),
                 tx_hash: B256::repeat_byte(i as u8),
+                max_inclusion_block: u64::MAX,
             },
         })
         .collect();

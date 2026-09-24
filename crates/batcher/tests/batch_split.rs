@@ -60,6 +60,7 @@ fn block_of(block_number: u64, raw_len: usize) -> ClosedBlock {
                 raw_tx: Bytes::from(vec![u8::try_from(block_number).unwrap(); raw_len]),
                 sender: Address::repeat_byte(0x11),
                 tx_hash: B256::repeat_byte(0x22),
+                max_inclusion_block: u64::MAX,
             },
         }],
     }

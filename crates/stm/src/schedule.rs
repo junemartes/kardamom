@@ -254,6 +254,7 @@ mod tests {
         TxEnvelope {
             correlation_id: 0,
             tx_hash: keccak256(&raw),
+            max_inclusion_block: u64::MAX,
             raw_tx: raw,
             sender,
         }

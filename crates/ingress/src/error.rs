@@ -32,6 +32,16 @@ pub enum IngressError {
          nonce gap for tx_ttl — resubmit once the gap fills"
     )]
     Expired((Address, u64)),
+    #[error(
+        "past deadline: the sealer refused (sender, nonce) {sender_nonce:?} at block \
+         {at_block}, past the transaction's max inclusion block {max_inclusion_block} — \
+         resubmit"
+    )]
+    PastDeadline {
+        sender_nonce: (Address, u64),
+        max_inclusion_block: u64,
+        at_block: u64,
+    },
     #[error("ingress overloaded: {0} submissions pending — retry with backoff")]
     Overloaded(usize),
     #[error("ingress draining for shutdown — retry on another replica")]
@@ -90,11 +100,13 @@ impl From<IngressError> for ErrorObjectOwned {
             | IngressError::UnsupportedTxType(_) => -32602,
             // Generic server error. Evicted is retryable once the sender's
             // nonce is back within the reorder window. Expired is
-            // retryable once the nonce gap fills.
+            // retryable once the nonce gap fills. PastDeadline is
+            // retryable at once: the resubmission carries a new deadline.
             IngressError::PartitionUnavailable(_)
             | IngressError::Timeout
             | IngressError::Evicted(_)
             | IngressError::Expired(_)
+            | IngressError::PastDeadline { .. }
             | IngressError::InsufficientFunds { .. }
             | IngressError::StateUnavailable(_) => -32000,
             // Internal error.
